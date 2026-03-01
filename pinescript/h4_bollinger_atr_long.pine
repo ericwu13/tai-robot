@@ -1,0 +1,50 @@
+//@version=5
+strategy("H4 布林ATR型態多單策略", overlay=true, process_orders_on_close=true, default_qty_type=strategy.fixed, default_qty_value=1, initial_capital=1000000)
+
+// --- 1. 定義基礎參數 ---
+length = input.int(20, "布林通道期數")
+mult = input.float(2.0, "布林通道標準差")
+atr_length = input.int(14, "ATR期數")
+sl_mult = input.float(1.0, "停損ATR倍數", tooltip="進場K棒低點減去 ATR × 此倍數")
+tp_mult = input.float(0.5, "停利ATR倍數", tooltip="布林上軌減去 ATR × 此倍數")
+
+// --- 2. 計算布林指標 ---
+basis = ta.sma(close, length)
+dev = mult * ta.stdev(close, length)
+upper = basis + dev
+lower = basis - dev
+
+plot(basis, color=color.yellow, title="中線")
+plot(upper, color=color.red, title="上軌")
+plot(lower, color=color.green, title="下軌")
+
+// --- 3. 計算ATR ---
+atr_val = ta.atr(atr_length)
+
+// --- 4. 擷取 K 棒實體與影線數據 ---
+body = math.abs(close - open)
+// 設定 k_range 底限為 0.0001，避免遇到十字線時發生分母為 0 的運算錯誤
+k_range = (high - low) == 0 ? 0.0001 : (high - low)
+lower_shadow = math.min(close, open) - low
+
+// --- 5. 定義進場型態濾網 ---
+// 型態一：強勢突破 (收上中線、紅K、實體佔比 >= 2/3)
+cond_breakout = (close > basis) and (close > open) and (body >= k_range * 0.66)
+
+// 型態二：回檔測試 (低點破中線、收盤 >= 中線、實體小、下影線 >= 總長度 1/2)
+cond_pullback = (low < basis) and (close >= basis) and (body <= k_range * 0.34) and (lower_shadow >= k_range * 0.5)
+
+// 整合多單進場條件
+longCond = cond_breakout or cond_pullback
+
+// --- 6. 執行進出場邏輯 ---
+var float sl_price = na
+
+if longCond and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    // 停損：訊號 K 棒低點 - ATR × 倍數（自適應波動率）
+    sl_price := low - atr_val * sl_mult
+
+if strategy.position_size > 0
+    // 停利：動態追蹤上軌 - ATR × 倍數，停損為靜態鎖定價位
+    strategy.exit("Exit Long", "Long", limit=upper - atr_val * tp_mult, stop=sl_price)
