@@ -24,8 +24,11 @@ settings.yaml
 # Logs and data
 logs/
 *.log
-*.csv
 *.db
+backtest_trades_*.csv
+
+# Keep OHLC data files
+!data/*.csv
 
 # OS
 .DS_Store
