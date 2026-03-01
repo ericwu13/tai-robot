@@ -1,0 +1,56 @@
+//@version=5
+strategy("中線戰法多單 (絕對觸碰濾網版)", overlay=true, process_orders_on_close=true, default_qty_type=strategy.fixed, default_qty_value=1, initial_capital=1000000)
+
+// --- 1. 定義基礎參數 ---
+length = input.int(20, "布林通道期數")
+mult = input.float(2.0, "布林通道標準差")
+sl_offset = input.float(20, "停損退讓點數", tooltip="進場K棒低點 - 20點")
+tp_offset = input.float(50, "停利退讓點數", tooltip="布林上軌 - 50點")
+
+// --- 2. 計算布林指標 ---
+basis = ta.sma(close, length)
+dev = mult * ta.stdev(close, length)
+upper = basis + dev
+lower = basis - dev
+
+plot(basis, color=color.yellow, title="中線")
+plot(upper, color=color.red, title="上軌")
+plot(lower, color=color.green, title="下軌")
+
+// --- 3. 擷取 K 棒實體與影線數據 ---
+body = math.abs(close - open)
+// 設定 k_range 底限為 0.0001，避免十字線發生分母為 0 的運算錯誤
+k_range = (high - low) == 0 ? 0.0001 : (high - low)
+lower_shadow = math.min(close, open) - low
+
+// --- 4. 定義進場型態濾網 ---
+// 絕對觸碰濾網：最低價必須小於或等於中線 (確保進場點在中線附近，不追高)
+touch_filter = (low <= basis)
+
+// 條件1: 實體 K 棒完全站上布林中線 (開盤與收盤皆 > 中線)
+cond1 = (open > basis) and (close > basis)
+
+// 條件2: 實體 K 棒有下影線，穿透中線，但收盤不低於中線
+cond2 = (low < basis) and (close >= basis) and (lower_shadow > 0)
+
+// 條件3: 站上中線後，實體 K 棒至少占振幅的 2/3 (強勢突破)
+cond3 = (close > basis) and (body >= k_range * (2.0/3.0))
+
+// 條件4: 實體 K 棒小 (<=1/3)，但下影線很長 (>=1/2)，收盤不低於中線 (回檔測試)
+cond4 = (close >= basis) and (body <= k_range * (1.0/3.0)) and (lower_shadow >= k_range * 0.5)
+
+// 整合多單進場條件 (必須踩線 + 滿足任一型態)
+longCond = touch_filter and (cond1 or cond2 or cond3 or cond4)
+
+// --- 5. 執行進場與變數紀錄 ---
+var float sl_price = na
+
+if longCond and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    // 紀錄靜態停損點：訊號 K 棒低點 - 20 點
+    sl_price := low - sl_offset
+
+// --- 6. 執行出場邏輯 ---
+if strategy.position_size > 0
+    // 掛出觸價單：停利為布林上軌 - 50 點，停損為靜態鎖定價位
+    strategy.exit("Exit Long", "Long", limit=upper - tp_offset, stop=sl_price)

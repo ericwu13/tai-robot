@@ -35,6 +35,7 @@ from src.backtest.chart import plot_backtest, _MPF_AVAILABLE
 from src.strategy.examples.h4_bollinger_long import H4BollingerLongStrategy
 from src.strategy.examples.h4_bollinger_atr_long import H4BollingerAtrLongStrategy
 from src.strategy.examples.daily_bollinger_long import DailyBollingerLongStrategy
+from src.strategy.examples.h4_midline_touch_long import H4MidlineTouchLongStrategy
 
 # TradingView data feed (optional, for longer history)
 try:
@@ -56,6 +57,7 @@ STRATEGIES: dict[str, type[BacktestStrategy]] = {
     "H4 布林多單 H4 Bollinger Long": H4BollingerLongStrategy,
     "H4 布林ATR多單 H4 Bollinger ATR Long": H4BollingerAtrLongStrategy,
     "日線布林多單 Daily Bollinger Long": DailyBollingerLongStrategy,
+    "H4 中線戰法多單 H4 Midline Touch Long": H4MidlineTouchLongStrategy,
 }
 
 # ── COM setup (only if not using CSV mode) ──
