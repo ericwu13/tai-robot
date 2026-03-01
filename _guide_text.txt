@@ -1,0 +1,295 @@
+--- PAGE 1 ---
+群益Python API 
+群益Python API 支援3 大功能 
+ 
+ 
+ 
+ 
+以下每一個步驟解說，皆包含簡短程式碼，最後附上完整程式碼讓你
+可以直接複製貼上，即可開始使用，一點都不麻煩。 
+下面是解釋透過Python 開發使用群益API 時，需要了解有那些程
+序： 
+1.初始化群益COM 元件-工欲善其事，必先利其器。 
+2.使用Python 建立windows 視窗-規劃一個美美的個人化視窗吧。 
+3.啟動報價/抓歷史K-行情波動閃爍真迷人,心跳開始加速了嗎。 
+4.串接下單功能-配合報價資料，就可以來下單囉。 
+5.成果回報-立即來檢視一下獲利吧。 
+ 
+ 
+報價 
+歷史K 
+下單 
+回報 
+
+
+--- PAGE 2 ---
+更版記錄： 
+修改日期 
+元件版本
+編號 
+說明 
+2018/06/13 
+2.13.12 
+初版建立。 
+2019/11/02 
+2.13.19 
+⚫ 
+增加Python 範例使用說明 
+(國內證券帳務、國內期選下單及帳務、國內證期選智慧單功能、海外期
+選下單及帳務, 回報含智慧單、配合非同步委託回傳架構調整 
+⚫ 
+增加換版注意事項 
+2020/11/03 
+2.13.25 
+獨立註冊公告、SKCOM 換版注意事項單元 
+2023/8/15 
+2.13.44 
+Python : return values and list 
+ 
+如何使用python 串接SKCOM 及建立介面 
+ 
+1. 初使化群益元件 
+2. 建立視窗介面 
+3. 環境設定 
+4. 註冊公告 
+5. 換版注意事項 
+
+
+--- PAGE 3 ---
+6. 啟動報價 
+7. 群益下單功能 
+8. 回報功能介紹 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+群益API COM 元件由群益金融網下載，
+內含說明文件－教學你如何註冊。使用前
+及更新版本，需先註冊COM 元件。  
+群益API COM 底層是由C++編寫而成，有強大運算能力且擁有速度
+初始化群益元件 
+
+
+--- PAGE 4 ---
+上的優勢，而使用不同的程式語言必須要透過相關引用(安裝)，才能
+在Python 範例程式碼直接介接群益API COM 元件，以下為安裝套
+件後，介接x64 COM 範例： 
+ 
+# 先把API com 元件初始化 
+import comtypes.client 
+comtypes.client.GetModule(r'./x64/SKCOM.dll') 
+import comtypes.gen.SKCOMLib as sk 
+ 
+# 第一種讓群益API 元件可導入讓Python code 使用的方法 
+import win32com.client  
+from ctypes import WinDLL,byref 
+from ctypes.wintypes import MSG 
+SKCenterLib = win32com.client.Dispatch("{AC30BAB5-194A-4515-A8D3-6260749F8577}") 
+SKOrderLib = win32com.client.Dispatch("{54FE0E28-89B6-43A7-9F07-BE988BB40299}") 
+ 
+# 第二種讓群益API 元件可導入Python code 內用的物件宣告 
+skC = comtypes.client.CreateObject(sk.SKCenterLib,interface=sk.ISKCenterLib) 
+skO = comtypes.client.CreateObject(sk.SKOrderLib,interface=sk.ISKOrderLib) 
+skQ = comtypes.client.CreateObject(sk.SKQuoteLib,interface=sk.ISKQuoteLib) 
+skR = comtypes.client.CreateObject(sk.SKReplyLib,interface=sk.ISKReplyLib) 
+ 
+ 
+# 畫視窗用物件 
+from tkinter import * 
+from tkinter.ttk import * 
+from tkinter import messagebox,colorchooser,font,Button,Frame,Label 
+ 
+# 數學計算用物件 
+import math 
+ 
+# 顯示各功能狀態用的function 
+def WriteMessage(strMsg,listInformation): 
+    listInformation.insert('end', strMsg) 
+
+
+--- PAGE 5 ---
+    listInformation.see('end') 
+def SendReturnMessage(strType, nCode, strMessage,listInformation): 
+    GetMessage(strType, nCode, strMessage,listInformation) 
+def GetMessage(strType,nCode,strMessage,listInformation): 
+    strInfo = "" 
+    if (nCode != 0): 
+        strInfo ="【"+ skC.SKCenterLib_GetLastLogInfo()+ "】" 
+    WriteMessage("【" + strType + "】【" + strMessage + "】【" + 
+skC.SKCenterLib_GetReturnCodeMessage(nCode) + "】" + strInfo,listInformation) 
+以上程式碼的部分為初始化元件與主要相關功能宣告，未初始化是無
+法讓程式順利運作的，以上初始化的程式，不管在報價、下單或是回
+報都會用到，看不懂沒關係，別給自己太大壓力，有完整程式範例與
+環境設定，直接打開複製貼上或直接執行範例。 
+ 
+ 
+ 
+ 
+ 
+大部分Python 程式寫出來都是console 畫面，為了要讓各位看官方
+便使用，我們開發了一個視窗介面的範例，讓操作更容易，顯示資料
+較直接等等。 
+以下僅列出部分UI 介面設計相關的程式碼，方便大家參考。 
+#上半部登入框 
+class FrameLogin(Frame): 
+    def __init__(self, master = None): 
+使用Python 建立視窗介面 
+
+
+--- PAGE 6 ---
+        Frame.__init__(self, master) 
+        self.grid() 
+        #self.pack() 
+        self.place() 
+        self.FrameLogin = Frame(self) 
+        self.master["background"] = "#ffecec" 
+        self.FrameLogin.master["background"] = "#ffecec"  
+        self.createWidgets() 
+    def createWidgets(self): 
+        #帳號 
+        self.labelID = Label(self) 
+        self.labelID["text"] = "帳號：" 
+        self.labelID["background"] = "#ffecec" 
+        self.labelID["font"] = 20 
+        self.labelID.grid(column=0,row=0) 
+            #輸入框 
+        self.textID = Entry(self) 
+        self.textID["width"] = 50 
+        self.textID.grid(column = 1, row = 0) 
+ 
+        #密碼 
+        self.labelPassword = Label(self) 
+        self.labelPassword["text"] = "密碼：" 
+        self.labelPassword["background"] = "#ffecec" 
+        self.labelPassword["font"] = 20 
+        self.labelPassword.grid(column = 2, row = 0) 
+            #輸入框 
+        self.textPassword = Entry(self) 
+        self.textPassword["width"] = 50 
+        self.textPassword['show'] = '*' 
+        self.textPassword.grid(column = 3, row = 0) 
+         
+        #按鈕 
+        self.buttonLogin = Button(self) 
+        self.buttonLogin["text"] = "Login" 
+        self.buttonLogin["background"] = "#ff9797" 
+        self.buttonLogin["foreground"] = "#000000" 
+        self.buttonLogin["highlightbackground"] = "#ff0000" 
+
+
+--- PAGE 7 ---
+        self.buttonLogin["font"] = 20 
+        self.buttonLogin["command"] = self.buttonLogin_Click 
+        self.buttonLogin.grid(column = 4, row = 0) 
+ 
+        #ID 
+        self.labelID = Label(self) 
+        self.labelID["text"] = "<<ID>>" 
+        self.labelID["background"] = "#ffecec" 
+        self.labelID["font"] = 20 
+        self.labelID.grid(column = 5, row = 0) 
+ 
+        #訊息欄 
+        self.listInformation = Listbox(root, height=5) 
+        self.listInformation.grid(column = 0, row = 1, sticky = E + W) 
+ 
+        global GlobalListInformation,Global_ID 
+        GlobalListInformation = self.listInformation 
+        Global_ID = self.labelID 
+ 
+ 
+ 
+ 
+ 
+    # 這裡是登入按鈕,使用群益API 不管要幹嘛你都要先登入才行 
+    def buttonLogin_Click(self): 
+        try: 
+            m_nCode = skC.SKCenterLib_Login(self.textID.get().replace(' 
+',''),self.textPassword.get().replace(' ','')) 
+            if(m_nCode==0): 
+                Global_ID["text"] =  self.textID.get().replace(' ','') 
+                WriteMessage("登入成功",self.listInformation) 
+            else: 
+                WriteMessage(m_nCode,self.listInformation) 
+        except Exception as e: 
+            messagebox.showerror("error！",e)  
+上面黃色框線部分，是很重要的登入功能，黃色字體部份是關鍵的部
+
+
+--- PAGE 8 ---
+分－登入函式，其他都只是畫面顯示用的設定，看不懂沒關係，別給
+自己太大壓力，有完整程式範例與環境設定，直接打開複製貼上或直
+接執行範例。 
+註冊公告(必要項目) 
+在登入SKCenterLib_Login or SKCenterLib_LoginSetQuote 前，必須先註冊回報中的公告。 
+先建立SKReplyLib 物件及其事件SKReplyLib OnNotifyEvent 
+ 
+ 
+【策略王COM 元件使用說明】4-3-e OnReplyMessage 
+▼下方是SKReplyLibEvent class 中，處理公告通知OnReplyMessage 函式 的部分程式碼， 
+並指定回傳-1 
+ 
+
+
+--- PAGE 9 ---
+ 
+ 
+ 
+取得報價資訊分為兩個步驟： 
+1. 呼叫一個叫SKQuoteLib_EnterMonitor()的函式，這部分是連接群益報價
+主機，在範例程式大概是下面片段： 
+ 
+    def btnConnect_Click(self): 
+        try: 
+           m_nCode = skQ.SKQuoteLib_EnterMonitor() 
+           SendReturnMessage("Quote", m_nCode, 
+"startQuote",GlobalListInformation) 
+        except Exception as e: 
+            messagebox.showerror("error！",e) 
+     
+ 
+2. 接下來，想要什麼股票的報價，則必須透過
+SKQuoteLib_RequestStocks 函式送出商品的代號給API COM 元
+件： 
+…. 
+啟動報價 
+
+
+--- PAGE 10 ---
+def btnQueryStocks_Click(self): 
+        try: 
+            if(self.txtPageNo.get().replace(' ','') == ''): 
+                pn = 0 
+            else: 
+                pn = int(self.txtPageNo.get()) 
+            skQ.SKQuoteLib_RequestStocks(pn,self.txtStocks.get().replace(' ','')) 
+        except Exception as e: 
+            messagebox.showerror("error！",e) 
+…. 
+由於在前端我們會提供一個輸入框讓你輸入一串(一個以上)股票代號
+self.txtStocks.get().replace(' ','') 代表是從輸入端取得的股票代碼，例如：
+2330，其中pn 的作用說明如下，由於群益API 可在同一時間提供非常多商品
+報價，非常非常多，為了有效處理這麼多檔商品的報價資料進而方便使用者分
+類顯示，類似頁簽的概念，在自己寫的程式裡可以將報價分別放在不同分頁；
+假設以產業分類，在第一頁想看食品類20 檔報價，第二頁為光電類50 檔，這
+個pn 你可以填1 跟2，但初學者可以填1。 
+ex: skQ.SKQuoteLib_RequestStocks(1, "2330")  # 這樣就完成跟群益要台積
+電報價的程序了 
+3. 註冊完報價呢? 已註冊的股票報價資料會從下面片段程式，進行處
+理： 
+…… 
+    def OnNotifyQuote(self, sMarketNo, sStockidx): 
+        pStock = sk.SKSTOCK() 
+        skQ.SKQuoteLib_GetStockByIndex(sMarketNo, sStockidx, pStock) 
+        strMsg = '代碼:',pStock.bstrStockNo,'--名稱:',pStock.bstrStockName,'--開盤
+價:',pStock.nOpen/math.pow(10,pStock.sDecimal),'--最高:',pStock.nHigh/math.pow(10,pStock.sDecimal),'--最
+
+

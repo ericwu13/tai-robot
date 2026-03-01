@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# User config (contains credentials)
+settings.yaml
+
+# Logs and data
+logs/
+*.log
+*.csv
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Capital API SDK (large binaries - download separately)
+CapitalAPI_2.13.57/
+
+# Capital API logs
+CapitalLog_*/
+
+# pytest
+.pytest_cache/
+
+# comtypes generated cache
+comtypes_gen/

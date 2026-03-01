@@ -1,0 +1,41 @@
+# tai-robot configuration
+# Copy this file to settings.yaml and fill in your values.
+# settings.yaml is gitignored to protect credentials.
+
+credentials:
+  user_id: "USER_ID"
+  # Password is read from env var CAPITAL_API_PASSWORD or Windows keyring.
+  # To store in keyring: python -c "import keyring; keyring.set_password('tai-robot', 'YOUR_USER_ID', 'YOUR_PASSWORD')"
+  authority_flag: 2          # 0=production, 1=test+production, 2=test only
+
+account:
+  # Leave empty to auto-detect from login response
+  branch: ""
+  account: ""
+
+trading:
+  mode: "paper"              # paper | semi_auto | full_auto
+  symbol: "TXFD0"            # TAIEX futures front month
+  market_no: 2               # 2=T-session futures, 7=full-session futures
+  default_qty: 1
+  order_type: "2"            # "2"=auto new/close
+  trade_type: 0              # 0=ROD, 1=IOC, 2=FOK
+  price_flag: 0              # 0=market, 1=limit
+
+strategy:
+  name: "ma_crossover"
+  params:
+    fast_period: 5
+    slow_period: 20
+  bar_interval: 60           # seconds
+
+risk:
+  max_position: 2            # max contracts held
+  max_daily_loss: 20000      # TWD
+  max_drawdown_pct: 5.0      # percent of starting equity
+  order_rate_limit: 10       # max orders per minute
+
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  trade_csv: "logs/trades.csv"
