@@ -1,0 +1,18 @@
+[project]
+name = "tai-robot"
+version = "0.1.0"
+description = "Taiwan Futures Trading Bot using Capital API (SKCOM)"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+    "keyring>=24.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.scripts]
+tai-robot = "src.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
