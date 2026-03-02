@@ -63,6 +63,14 @@ class BrokerContext:
             limit=limit, stop=stop, from_entry=from_entry,
         ))
 
+    def close(self, from_entry: str, tag: str = "close") -> None:
+        """Market-close the position from the given entry. Fills at current bar's close.
+
+        Use this instead of exit() when you want an immediate close without
+        setting limit/stop prices (like TradingView's strategy.close()).
+        """
+        self._broker.queue_market_close(tag, from_entry)
+
 
 class SimulatedBroker:
     """Order matching engine for backtesting.
@@ -88,6 +96,7 @@ class SimulatedBroker:
 
         self._pending_entries: list[Order] = []
         self._pending_exits: list[Order] = []
+        self._pending_market_closes: list[tuple[str, str]] = []  # (tag, from_entry)
         self._bar_index: int = 0
         self._exit_bar_index: int = -1  # last bar an exit filled on
 
@@ -105,12 +114,25 @@ class SimulatedBroker:
         ]
         self._pending_exits.append(order)
 
-    def on_bar_close(self, bar_index: int, close: int) -> None:
-        """Process pending entry orders at bar close.
+    def queue_market_close(self, tag: str, from_entry: str) -> None:
+        """Queue a market close — fills at current bar's close."""
+        self._pending_market_closes.append((tag, from_entry))
 
+    def on_bar_close(self, bar_index: int, close: int) -> None:
+        """Process pending market closes and entry orders at bar close.
+
+        Order: market closes first, then entries.
         Skip entries if an exit happened on this same bar — prioritize exit.
         """
         self._bar_index = bar_index
+
+        # Process market closes first
+        for tag, from_entry in self._pending_market_closes:
+            if self.position_size > 0 and self.entry_tag == from_entry:
+                self._close_position(tag, close, bar_index)
+                break
+        self._pending_market_closes.clear()
+
         for order in self._pending_entries:
             if self.position_size == 0 and bar_index != self._exit_bar_index:
                 self.position_size = order.qty

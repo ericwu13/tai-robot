@@ -1,4 +1,4 @@
-"""Backtest GUI: Run backtest with results display.
+"""AI Strategy Workbench: Chat with Claude to generate, backtest, and export strategies.
 
 Data sources (in priority order):
   1. Capital API (COM) — if available and connected
@@ -11,8 +11,10 @@ Usage:
 
 import os
 import sys
+import threading
+import traceback
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog
+from tkinter import ttk, scrolledtext, filedialog, simpledialog
 from datetime import datetime, timedelta
 
 # Ensure src is importable
@@ -31,11 +33,21 @@ from src.backtest.data_loader import parse_kline_strings, load_bars_from_csv
 from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
-from src.backtest.chart import plot_backtest, _MPF_AVAILABLE
+from src.backtest.chart import plot_backtest, _LWC_AVAILABLE
 from src.strategy.examples.h4_bollinger_long import H4BollingerLongStrategy
 from src.strategy.examples.h4_bollinger_atr_long import H4BollingerAtrLongStrategy
 from src.strategy.examples.daily_bollinger_long import DailyBollingerLongStrategy
 from src.strategy.examples.h4_midline_touch_long import H4MidlineTouchLongStrategy
+
+# AI modules
+from src.ai.chat_client import ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS
+from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT
+from src.ai.code_sandbox import (
+    extract_python_code, load_strategy_from_source,
+    CodeValidationError, CodeExecutionError,
+)
+from src.ai.strategy_store import StrategyStore
+from src.ai.pine_exporter import export_to_pine
 
 # TradingView data feed (optional, for longer history)
 try:
@@ -102,8 +114,40 @@ def _load_settings():
             cfg["user_id"] = creds.get("user_id", "")
             cfg["password"] = creds.get("password", "")
             cfg["authority_flag"] = creds.get("authority_flag", 0)
+            # AI settings
+            ai = data.get("ai", {})
+            cfg["ai_provider"] = ai.get("provider", PROVIDER_ANTHROPIC)
+            cfg["anthropic_api_key"] = ai.get("anthropic_api_key", "")
+            cfg["google_api_key"] = ai.get("google_api_key", "")
+            cfg["ai_model"] = ai.get("model", "")
+            cfg["ai_max_tokens"] = ai.get("max_tokens", 16384)
             break
     return cfg
+
+
+def _save_ai_settings(provider: str = "", anthropic_key: str = "",
+                      google_key: str = "", model: str = "", max_tokens: int = 0):
+    """Persist AI settings to settings.yaml."""
+    if not yaml:
+        return
+    path = os.path.join(project_root, "settings.yaml")
+    data = {}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    ai = data.setdefault("ai", {})
+    if provider:
+        ai["provider"] = provider
+    if anthropic_key:
+        ai["anthropic_api_key"] = anthropic_key
+    if google_key:
+        ai["google_api_key"] = google_key
+    if model:
+        ai["model"] = model
+    if max_tokens:
+        ai["max_tokens"] = max_tokens
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
 
 INTERVAL_SECONDS = {
@@ -126,6 +170,25 @@ _CACHE_FILES = {
 }
 
 _app = None
+
+
+def should_reuse_bars(
+    raw_bars: list, raw_bars_key: tuple,
+    kline_type: int, kline_minute: int,
+) -> bool:
+    """Return True if raw_bars can be reused for the given timeframe."""
+    if not raw_bars:
+        return False
+    return raw_bars_key == (kline_type, kline_minute)
+
+
+def filter_bars_by_date(
+    bars: list, start_date: str, end_date: str,
+) -> list:
+    """Filter bars to [start_date, end_date] inclusive. Dates are YYYYMMDD strings."""
+    dt_start = datetime.strptime(start_date, "%Y%m%d")
+    dt_end = datetime.strptime(end_date, "%Y%m%d") + timedelta(days=1)
+    return [b for b in bars if dt_start <= b.dt < dt_end]
 
 
 def _log(msg):
@@ -206,9 +269,9 @@ class BacktestApp:
         _app = self
 
         self.root = root
-        self.root.title("tai-robot 回測系統 Backtest System")
-        self.root.geometry("1200x800")
-        self.root.minsize(1000, 650)
+        self.root.title("tai-robot AI 策略工作台 AI Strategy Workbench")
+        self.root.geometry("1500x900")
+        self.root.minsize(1200, 700)
 
         self._settings = _load_settings()
         self.kline_data: list[str] = []
@@ -221,19 +284,121 @@ class BacktestApp:
         self._fetch_minute_num: int = 0
         self._chunk_bar_count: int = 0
 
+        # AI state
+        self._chat_client: ChatClient | None = None
+        self._ai_strategy_source: str = ""
+        self._ai_strategy_cls: type[BacktestStrategy] | None = None
+        self._strategy_store = StrategyStore(os.path.join(project_root, "strategies"))
+
         self._build_ui()
+        self._load_saved_strategies()
 
         if _com_available:
             self.root.after(200, self._do_login)
         else:
-            # Always enable Run Backtest — will auto-load cached CSV
             self.btn_fetch.config(state=tk.NORMAL)
             self.status_var.set("就緒 Ready (cached data)")
 
+    # ══════════════════════════════════════════════════════════════
+    #  UI BUILD
+    # ══════════════════════════════════════════════════════════════
+
     def _build_ui(self):
-        # ── Control panel ──
-        ctrl = ttk.LabelFrame(self.root, text="回測設定 Backtest Settings", padding=8)
-        ctrl.pack(fill=tk.X, padx=8, pady=(8, 4))
+        # Main horizontal split
+        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # Left: Chat panel
+        left = ttk.Frame(paned)
+        paned.add(left, weight=2)
+        self._build_chat_panel(left)
+
+        # Right: Control panel + results notebook
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+        self._build_control_panel(right)
+        self._build_results_notebook(right)
+
+        self._last_result = None
+        self._last_bars: list[Bar] = []
+        self._raw_bars: list[Bar] = []  # unfiltered bars from any source, for re-running
+        self._raw_bars_key: tuple = ()  # (kline_type, kline_minute) of stored raw bars
+
+    def _build_chat_panel(self, parent):
+        # ── Header ──
+        header = ttk.Frame(parent)
+        header.pack(fill=tk.X, padx=4, pady=(4, 2))
+
+        ttk.Label(header, text="AI 策略工作台", font=("", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Button(header, text="New Chat", width=9, command=self._reset_chat).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(header, text="Settings", width=8, command=self._show_api_key_dialog).pack(side=tk.RIGHT, padx=2)
+
+        # ── Chat display ──
+        self.chat_display = scrolledtext.ScrolledText(
+            parent, wrap=tk.WORD, font=("Consolas", 10),
+            bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+            state=tk.DISABLED, relief=tk.FLAT, padx=8, pady=8,
+        )
+        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+
+        # Chat text tags for styling
+        self.chat_display.tag_configure("user", foreground="#569cd6", font=("Consolas", 10, "bold"))
+        self.chat_display.tag_configure("assistant", foreground="#d4d4d4")
+        self.chat_display.tag_configure("code", foreground="#ce9178", font=("Consolas", 9))
+        self.chat_display.tag_configure("error", foreground="#f44747")
+        self.chat_display.tag_configure("system", foreground="#6a9955")
+
+        # ── Input area ──
+        input_frame = ttk.Frame(parent)
+        input_frame.pack(fill=tk.X, padx=4, pady=2)
+
+        self.chat_input = tk.Text(
+            input_frame, height=3, font=("Consolas", 10),
+            bg="#252526", fg="#d4d4d4", insertbackground="white",
+            relief=tk.FLAT, padx=6, pady=4,
+        )
+        self.chat_input.pack(fill=tk.X, expand=True)
+        self.chat_input.bind("<Return>", self._on_chat_enter)
+        self.chat_input.bind("<Shift-Return>", lambda e: None)  # allow newline
+
+        # ── Action buttons ──
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, padx=4, pady=(2, 4))
+
+        self.btn_send = ttk.Button(btn_frame, text="Send", width=7, command=self._send_chat)
+        self.btn_send.pack(side=tk.LEFT, padx=2)
+
+        self.btn_generate = ttk.Button(btn_frame, text="Generate Strategy",
+                                        command=self._generate_strategy, state=tk.NORMAL)
+        self.btn_generate.pack(side=tk.LEFT, padx=2)
+
+        self.btn_pine = ttk.Button(btn_frame, text="Export Pine",
+                                    command=self._export_pine, state=tk.DISABLED)
+        self.btn_pine.pack(side=tk.LEFT, padx=2)
+
+        self.btn_save_strategy = ttk.Button(btn_frame, text="Save Strategy",
+                                             command=self._save_strategy, state=tk.DISABLED)
+        self.btn_save_strategy.pack(side=tk.LEFT, padx=2)
+
+        # ── Saved strategies dropdown ──
+        saved_frame = ttk.Frame(parent)
+        saved_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
+
+        ttk.Label(saved_frame, text="Saved:").pack(side=tk.LEFT, padx=2)
+        self.saved_var = tk.StringVar()
+        self.saved_combo = ttk.Combobox(saved_frame, textvariable=self.saved_var,
+                                         state="readonly", width=30)
+        self.saved_combo.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        self.saved_combo.bind("<<ComboboxSelected>>", lambda e: self._load_saved_strategy())
+
+        ttk.Button(saved_frame, text="Load", width=5,
+                   command=self._load_saved_strategy).pack(side=tk.LEFT, padx=2)
+        ttk.Button(saved_frame, text="Delete", width=6,
+                   command=self._delete_saved_strategy).pack(side=tk.LEFT, padx=2)
+
+    def _build_control_panel(self, parent):
+        ctrl = ttk.LabelFrame(parent, text="回測設定 Backtest Settings", padding=8)
+        ctrl.pack(fill=tk.X, padx=4, pady=(4, 2))
 
         # Row 0: Symbol + KLine type
         ttk.Label(ctrl, text="商品 Symbol:").grid(row=0, column=0, sticky=tk.W, padx=4)
@@ -242,8 +407,9 @@ class BacktestApp:
 
         ttk.Label(ctrl, text="策略 Strategy:").grid(row=0, column=2, sticky=tk.W, padx=4)
         self.strategy_var = tk.StringVar(value=list(STRATEGIES.keys())[0])
-        ttk.Combobox(ctrl, textvariable=self.strategy_var, width=22,
-                     state="readonly", values=list(STRATEGIES.keys())).grid(row=0, column=3, padx=4)
+        self.strategy_combo = ttk.Combobox(ctrl, textvariable=self.strategy_var, width=30,
+                                            state="readonly", values=list(STRATEGIES.keys()))
+        self.strategy_combo.grid(row=0, column=3, padx=4)
 
         ttk.Label(ctrl, text="初始資金 Balance:").grid(row=0, column=4, sticky=tk.W, padx=4)
         self.balance_var = tk.StringVar(value="1000000")
@@ -327,9 +493,9 @@ class BacktestApp:
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
         ttk.Label(btn_frame, textvariable=self.status_var, foreground="gray").pack(side=tk.LEFT, padx=16)
 
-        # ── Results area ──
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+    def _build_results_notebook(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
 
         # Metrics tab
         metrics_frame = ttk.Frame(notebook)
@@ -363,8 +529,435 @@ class BacktestApp:
         self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        self._last_result = None
-        self._last_bars: list[Bar] = []
+    # ══════════════════════════════════════════════════════════════
+    #  CHAT / AI METHODS
+    # ══════════════════════════════════════════════════════════════
+
+    def _ensure_chat_client(self) -> bool:
+        """Initialize ChatClient if needed. Returns True if ready."""
+        if self._chat_client is not None:
+            return True
+
+        provider = self._settings.get("ai_provider", PROVIDER_ANTHROPIC)
+        if provider == PROVIDER_GOOGLE:
+            api_key = self._settings.get("google_api_key", "")
+        else:
+            api_key = self._settings.get("anthropic_api_key", "")
+
+        if not api_key:
+            self._show_api_key_dialog()
+            # Re-read after dialog
+            provider = self._settings.get("ai_provider", PROVIDER_ANTHROPIC)
+            if provider == PROVIDER_GOOGLE:
+                api_key = self._settings.get("google_api_key", "")
+            else:
+                api_key = self._settings.get("anthropic_api_key", "")
+            if not api_key:
+                self._append_chat("error", "API key not set. Click Settings to configure.")
+                return False
+
+        model = self._settings.get("ai_model", "") or DEFAULT_MODELS.get(provider, "")
+        max_tokens = self._settings.get("ai_max_tokens", 16384)
+        self._chat_client = ChatClient(api_key, provider=provider, model=model, max_tokens=max_tokens)
+        self._chat_client.set_system_prompt(STRATEGY_SYSTEM_PROMPT)
+        self._append_chat("system", f"Using {provider} / {model}")
+        return True
+
+    def _on_chat_enter(self, event):
+        """Handle Enter key in chat input — send message (Shift+Enter for newline)."""
+        if not event.state & 0x1:  # not Shift
+            self._send_chat()
+            return "break"
+
+    def _send_chat(self):
+        """Send chat message to Claude in a background thread."""
+        text = self.chat_input.get("1.0", tk.END).strip()
+        if not text:
+            return
+        if not self._ensure_chat_client():
+            return
+
+        self.chat_input.delete("1.0", tk.END)
+        self._append_chat("user", text)
+
+        # Disable send while waiting
+        self.btn_send.config(state=tk.DISABLED)
+        self._append_chat("system", "Thinking...")
+
+        def _worker():
+            try:
+                response = self._chat_client.send_message(text)
+                self.root.after(0, lambda: self._on_chat_response(response))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_chat_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_chat_response(self, response: str):
+        """Handle Claude's response on the main thread."""
+        # Remove "Thinking..." line
+        self._remove_last_system_line()
+        self._append_chat("assistant", response)
+        self.btn_send.config(state=tk.NORMAL)
+
+    def _on_chat_error(self, error: str):
+        """Handle API error on the main thread."""
+        self._remove_last_system_line()
+        self._append_chat("error", f"Error: {error}")
+        self.btn_send.config(state=tk.NORMAL)
+
+    def _append_chat(self, role: str, text: str):
+        """Append a styled message to the chat display."""
+        self.chat_display.config(state=tk.NORMAL)
+
+        provider = self._settings.get("ai_provider", PROVIDER_ANTHROPIC)
+        ai_name = "Gemini" if provider == PROVIDER_GOOGLE else "Claude"
+        prefix_map = {
+            "user": "You: ",
+            "assistant": f"{ai_name}: ",
+            "error": "Error: " if not text.startswith("Error:") else "",
+            "system": "",
+            "code": "",
+        }
+        prefix = prefix_map.get(role, "")
+
+        self.chat_display.insert(tk.END, prefix + text + "\n\n", role)
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+
+    def _remove_last_system_line(self):
+        """Remove the last 'Thinking...' system message."""
+        self.chat_display.config(state=tk.NORMAL)
+        content = self.chat_display.get("1.0", tk.END)
+        idx = content.rfind("Thinking...\n")
+        if idx >= 0:
+            # Calculate line.col position
+            before = content[:idx]
+            line = before.count("\n") + 1
+            col = len(before) - before.rfind("\n") - 1
+            start = f"{line}.{col}"
+            # Find end of "Thinking...\n\n"
+            end_idx = idx + len("Thinking...\n\n")
+            after_before = content[:end_idx]
+            end_line = after_before.count("\n") + 1
+            end_col = len(after_before) - after_before.rfind("\n") - 1
+            end = f"{end_line}.{end_col}"
+            self.chat_display.delete(start, end)
+        self.chat_display.config(state=tk.DISABLED)
+
+    def _generate_strategy(self):
+        """Ask AI to generate strategy code based on the conversation so far."""
+        if not self._ensure_chat_client():
+            return
+
+        if not self._chat_client.conversation:
+            self._append_chat("error", "Chat with the AI first to discuss a strategy idea.")
+            return
+
+        # Send a code-generation request with API context injected
+        gen_msg = (
+            "Based on our discussion, please write the complete strategy code now.\n\n"
+            + STRATEGY_CODE_CONTEXT
+        )
+        self._append_chat("user", "Generate Strategy")
+        self.btn_send.config(state=tk.DISABLED)
+        self.btn_generate.config(state=tk.DISABLED)
+        self._append_chat("system", "Generating code...")
+
+        def _worker():
+            try:
+                response = self._chat_client.send_message(gen_msg)
+                self.root.after(0, lambda: self._on_generate_response(response))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_chat_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_generate_response(self, response: str, retries_left: int = 2):
+        """Handle code generation response — extract, validate, load.
+
+        On any error (missing code block, validation, execution), auto-retry
+        by sending the error back to the AI with code context, up to retries_left times.
+        """
+        self._remove_last_system_line()
+        self._append_chat("assistant", response)
+        self.btn_send.config(state=tk.NORMAL)
+        self.btn_generate.config(state=tk.NORMAL)
+
+        # Try to extract code
+        source = extract_python_code(response)
+        if not source:
+            self._generation_retry(
+                "Your response did not contain a ```python code block. "
+                "Please output the complete strategy class inside a single "
+                "```python ... ``` code block.",
+                retries_left,
+            )
+            return
+
+        # Try to validate and load
+        try:
+            strategy_cls = load_strategy_from_source(source)
+            self._on_strategy_generated(source, strategy_cls)
+        except (CodeValidationError, CodeExecutionError) as e:
+            self._generation_retry(
+                f"The generated code had errors:\n{e}\n\n"
+                "Please fix the code and output a corrected version.",
+                retries_left,
+            )
+        except Exception as e:
+            self._generation_retry(
+                f"Unexpected error loading strategy:\n{e}\n\n"
+                "Please fix the code and output a corrected version.",
+                retries_left,
+            )
+
+    def _generation_retry(self, error_msg: str, retries_left: int):
+        """Send error back to AI and retry code generation."""
+        self._append_chat("error", error_msg.split("\n")[0])
+
+        if retries_left <= 0 or not self._chat_client:
+            self._append_chat("error", "Auto-retry exhausted. Please fix manually and try again.")
+            return
+
+        self._append_chat("system", f"Auto-retrying... ({retries_left} left)")
+        self.btn_send.config(state=tk.DISABLED)
+        self.btn_generate.config(state=tk.DISABLED)
+
+        retry_msg = error_msg + "\n\n" + STRATEGY_CODE_CONTEXT
+        remaining = retries_left - 1
+
+        def _worker():
+            try:
+                resp = self._chat_client.send_message(retry_msg)
+                self.root.after(0, lambda: self._on_generate_response(resp, retries_left=remaining))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_chat_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_strategy_generated(self, source: str, strategy_cls: type[BacktestStrategy]):
+        """Register a successfully loaded AI strategy."""
+        self._ai_strategy_source = source
+        self._ai_strategy_cls = strategy_cls
+        name = f"AI: {strategy_cls.__name__}"
+
+        STRATEGIES[name] = strategy_cls
+        self.strategy_combo.config(values=list(STRATEGIES.keys()))
+        self.strategy_var.set(name)
+
+        self._append_chat("system",
+                          f"Strategy loaded: {strategy_cls.__name__}\n"
+                          f"Selected in dropdown: \"{name}\"\n"
+                          "Click 'Run Backtest' to test it.")
+
+        self.btn_generate.config(state=tk.NORMAL)
+        self.btn_pine.config(state=tk.NORMAL)
+        self.btn_save_strategy.config(state=tk.NORMAL)
+
+    def _export_pine(self):
+        """Export the current AI strategy to Pine Script in a popup."""
+        if not self._ai_strategy_source:
+            self._append_chat("error", "No AI strategy to export. Generate one first.")
+            return
+        if not self._ensure_chat_client():
+            return
+
+        self._append_chat("system", "Exporting to Pine Script...")
+        self.btn_pine.config(state=tk.DISABLED)
+
+        source = self._ai_strategy_source
+
+        def _worker():
+            try:
+                pine = export_to_pine(self._chat_client, source)
+                self.root.after(0, lambda: self._show_pine_popup(pine))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_pine_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_pine_popup(self, pine_code: str):
+        """Show Pine Script in a popup window with Copy button."""
+        self._remove_last_system_line()
+        self._append_chat("system", "Pine Script export complete.")
+        self.btn_pine.config(state=tk.NORMAL)
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Pine Script Export")
+        popup.geometry("700x600")
+
+        text = scrolledtext.ScrolledText(popup, wrap=tk.WORD, font=("Consolas", 10))
+        text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        text.insert(tk.END, pine_code)
+
+        btn_frame = ttk.Frame(popup)
+        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        def copy():
+            popup.clipboard_clear()
+            popup.clipboard_append(pine_code)
+            copy_btn.config(text="Copied!")
+            popup.after(2000, lambda: copy_btn.config(text="Copy to Clipboard"))
+
+        copy_btn = ttk.Button(btn_frame, text="Copy to Clipboard", command=copy)
+        copy_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT, padx=4)
+
+    def _on_pine_error(self, error: str):
+        self._remove_last_system_line()
+        self._append_chat("error", f"Pine export error: {error}")
+        self.btn_pine.config(state=tk.NORMAL)
+
+    def _save_strategy(self):
+        """Save the current AI strategy to the strategies/ directory."""
+        if not self._ai_strategy_source or not self._ai_strategy_cls:
+            return
+
+        class_name = self._ai_strategy_cls.__name__
+
+        # Ask for description
+        desc = simpledialog.askstring(
+            "Save Strategy",
+            f"Description for {class_name}:",
+            parent=self.root,
+        )
+        if desc is None:
+            return
+
+        path = self._strategy_store.save(class_name, self._ai_strategy_source, desc)
+        self._append_chat("system", f"Strategy saved: {path}")
+        self._refresh_saved_combo()
+
+    def _load_saved_strategies(self):
+        """Load saved strategy names into the combo on startup."""
+        self._refresh_saved_combo()
+
+    def _refresh_saved_combo(self):
+        entries = self._strategy_store.list_strategies()
+        names = [e["class_name"] for e in entries]
+        self.saved_combo.config(values=names)
+
+    def _load_saved_strategy(self):
+        """Load a saved strategy from the strategies/ directory."""
+        class_name = self.saved_var.get()
+        if not class_name:
+            return
+
+        source = self._strategy_store.load_source(class_name)
+        if not source:
+            self._append_chat("error", f"Could not load: {class_name}")
+            return
+
+        try:
+            strategy_cls = load_strategy_from_source(source)
+            self._on_strategy_generated(source, strategy_cls)
+            self._append_chat("system", f"Loaded saved strategy: {class_name}")
+        except (CodeValidationError, CodeExecutionError) as e:
+            self._append_chat("error", f"Failed to load {class_name}: {e}")
+
+    def _delete_saved_strategy(self):
+        """Delete a saved strategy."""
+        class_name = self.saved_var.get()
+        if not class_name:
+            return
+        self._strategy_store.delete(class_name)
+        self._refresh_saved_combo()
+        self.saved_var.set("")
+        self._append_chat("system", f"Deleted: {class_name}")
+
+    def _show_api_key_dialog(self):
+        """Show settings dialog with provider selection and API keys."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("AI Settings")
+        dialog.geometry("450x280")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Provider selection
+        ttk.Label(frame, text="Provider:", font=("", 10, "bold")).grid(
+            row=0, column=0, sticky=tk.W, pady=(0, 8))
+        provider_var = tk.StringVar(value=self._settings.get("ai_provider", PROVIDER_ANTHROPIC))
+        provider_combo = ttk.Combobox(frame, textvariable=provider_var, state="readonly",
+                                       values=[PROVIDER_ANTHROPIC, PROVIDER_GOOGLE], width=20)
+        provider_combo.grid(row=0, column=1, sticky=tk.W, pady=(0, 8), padx=(8, 0))
+
+        # Anthropic key
+        ttk.Label(frame, text="Anthropic API Key:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        anth_key = self._settings.get("anthropic_api_key", "")
+        anth_var = tk.StringVar(value=anth_key)
+        anth_entry = ttk.Entry(frame, textvariable=anth_var, width=38, show="*")
+        anth_entry.grid(row=1, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+
+        # Google key
+        ttk.Label(frame, text="Google Gemini Key:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        goog_key = self._settings.get("google_api_key", "")
+        goog_var = tk.StringVar(value=goog_key)
+        goog_entry = ttk.Entry(frame, textvariable=goog_var, width=38, show="*")
+        goog_entry.grid(row=2, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+
+        # Model override (optional)
+        ttk.Label(frame, text="Model (optional):").grid(row=3, column=0, sticky=tk.W, pady=4)
+        model_var = tk.StringVar(value=self._settings.get("ai_model", ""))
+        ttk.Entry(frame, textvariable=model_var, width=38).grid(
+            row=3, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+
+        # Default model hint
+        def _update_hint(*args):
+            p = provider_var.get()
+            hint_label.config(text=f"Default: {DEFAULT_MODELS.get(p, '')}")
+        hint_label = ttk.Label(frame, text="", foreground="gray")
+        hint_label.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
+        provider_var.trace_add("write", _update_hint)
+        _update_hint()
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=5, column=0, columnspan=2, pady=(16, 0))
+
+        def _save():
+            provider = provider_var.get()
+            ak = anth_var.get().strip()
+            gk = goog_var.get().strip()
+            model = model_var.get().strip()
+
+            self._settings["ai_provider"] = provider
+            self._settings["anthropic_api_key"] = ak
+            self._settings["google_api_key"] = gk
+            self._settings["ai_model"] = model
+
+            _save_ai_settings(provider=provider, anthropic_key=ak,
+                              google_key=gk, model=model)
+
+            # Reset client so it picks up new settings
+            if self._chat_client:
+                self._chat_client.close()
+                self._chat_client = None
+
+            self._append_chat("system", f"Settings saved. Provider: {provider}")
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="Save", width=10, command=_save).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_frame, text="Cancel", width=10, command=dialog.destroy).pack(side=tk.LEFT, padx=8)
+
+    def _reset_chat(self):
+        """Clear chat display and reset conversation."""
+        self.chat_display.config(state=tk.NORMAL)
+        self.chat_display.delete("1.0", tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+        if self._chat_client:
+            self._chat_client.reset()
+        self._append_chat("system",
+                          "New chat started. Describe your trading strategy idea.\n"
+                          "Example: '寫一個RSI反轉策略' or 'Create a dual MA crossover strategy'")
+
+    # ══════════════════════════════════════════════════════════════
+    #  EXISTING BACKTEST METHODS (unchanged logic)
+    # ══════════════════════════════════════════════════════════════
 
     def _set_period(self, days):
         self.end_var.set(datetime.now().strftime("%Y%m%d"))
@@ -421,6 +1014,16 @@ class BacktestApp:
     # ── Data fetch ──
 
     def _do_fetch(self):
+        # If we have previously downloaded bars matching this strategy's timeframe, reuse
+        strategy_cls = STRATEGIES.get(self.strategy_var.get())
+        if strategy_cls and should_reuse_bars(
+            self._raw_bars, self._raw_bars_key,
+            strategy_cls.kline_type, strategy_cls.kline_minute,
+        ):
+            _log("重新使用已下載資料 Re-using downloaded data with date filter")
+            self._execute_backtest(list(self._raw_bars))
+            return
+
         if not _com_available:
             self._run_backtest_cached()
             return
@@ -466,7 +1069,6 @@ class BacktestApp:
     def _fetch_next_chunk(self, symbol, kline_type, minute_num):
         """Fetch the next chunk of KLine data."""
         if self._fetch_chunk_idx >= len(self._fetch_chunks):
-            # All chunks done, run backtest
             _log(f"全部完成 All chunks fetched: {len(self.kline_data)} total KLine strings")
             self._run_backtest()
             return
@@ -479,7 +1081,6 @@ class BacktestApp:
         _log(f"請求K線 [{n}/{total}] {symbol} type={kline_type} "
              f"{chunk_start}~{chunk_end} min={minute_num}")
 
-        # Store params for callback
         self._fetch_symbol = symbol
         self._fetch_kline_type = kline_type
         self._fetch_minute_num = minute_num
@@ -540,7 +1141,6 @@ class BacktestApp:
                 self.btn_fetch.config(state=tk.NORMAL)
                 return
 
-            # Convert DataFrame to Bar list
             bars = []
             for dt_idx, row in df.iterrows():
                 bars.append(Bar(
@@ -568,11 +1168,9 @@ class BacktestApp:
         """Called after each KLine chunk completes. Fetches next chunk or runs backtest."""
         self._fetch_chunk_idx += 1
         if self._fetch_chunk_idx < len(self._fetch_chunks):
-            # Fetch next chunk
             self.root.after(500, lambda: self._fetch_next_chunk(
                 self._fetch_symbol, self._fetch_kline_type, self._fetch_minute_num))
         else:
-            # All chunks done
             self._run_backtest()
 
     def _get_strategy_interval(self) -> int:
@@ -584,13 +1182,7 @@ class BacktestApp:
         return INTERVAL_SECONDS.get((kt, km), 14400)
 
     def _merge_cached_data(self, bars: list[Bar], symbol: str, interval: int) -> list[Bar]:
-        """Merge API bars with cached data for longer history.
-
-        Priority: API data first. Cache fills gaps before/after API range.
-        API and cache may have different bar alignments, so they are NOT mixed
-        within the same time period — only stitched at boundaries.
-        Date filtering is handled later by _execute_backtest().
-        """
+        """Merge API bars with cached data for longer history."""
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
             return bars
@@ -613,7 +1205,6 @@ class BacktestApp:
              f"({cached_bars[0].dt} ~ {cached_bars[-1].dt})")
 
         if bars:
-            # Use cached BEFORE API range + API + cached AFTER API range
             api_start = bars[0].dt
             api_end = bars[-1].dt
             cached_before = [b for b in cached_bars if b.dt < api_start]
@@ -627,7 +1218,6 @@ class BacktestApp:
                 parts.append(f"{len(cached_after)} cached(after)")
             _log(f"合併完成 Merged: {' + '.join(parts)} = {len(merged)} total")
         else:
-            # No API data, use cache only
             merged = cached_bars
             _log(f"使用快取 Using cache only: {len(merged)} bars")
 
@@ -641,7 +1231,6 @@ class BacktestApp:
         _log(f"解析K線資料 Parsing {len(self.kline_data)} KLine strings...")
         bars = parse_kline_strings(self.kline_data, symbol=symbol, interval=interval)
 
-        # Deduplicate bars by datetime (overlapping chunks may return same bars)
         seen = set()
         unique_bars = []
         for b in bars:
@@ -657,7 +1246,6 @@ class BacktestApp:
         else:
             _log("API資料 Parsed 0 API bars")
 
-        # Merge with cached TradingView data for longer history
         bars = self._merge_cached_data(bars, symbol, interval)
 
         if bars:
@@ -677,23 +1265,27 @@ class BacktestApp:
         kt = strategy_cls.kline_type
         km = strategy_cls.kline_minute
         cache_file = _CACHE_FILES.get((kt, km))
-        if not cache_file:
-            self.status_var.set(f"無快取資料 No cached data for type={kt} min={km}")
+
+        # Try cached CSV first
+        if cache_file:
+            cache_path = os.path.join(_CACHE_DIR, cache_file)
+            if os.path.exists(cache_path):
+                symbol = self.symbol_var.get().strip()
+                interval = self._get_strategy_interval()
+                _log(f"載入快取 Loading cached data: {cache_file}")
+                bars = load_bars_from_csv(cache_path, symbol=symbol, interval=interval)
+                _log(f"載入完成 Loaded {len(bars)} bars from {cache_file}")
+                self._execute_backtest(bars)
+                return
+
+        # Fall back to previously downloaded data (e.g. from TV download)
+        if self._raw_bars:
+            _log("重新使用已下載資料 Re-using previously downloaded data")
+            self._execute_backtest(self._raw_bars)
             return
 
-        cache_path = os.path.join(_CACHE_DIR, cache_file)
-        if not os.path.exists(cache_path):
-            self.status_var.set(f"找不到資料 File not found: {cache_file}")
-            return
-
-        symbol = self.symbol_var.get().strip()
-        interval = self._get_strategy_interval()
-
-        _log(f"載入快取 Loading cached data: {cache_file}")
-        bars = load_bars_from_csv(cache_path, symbol=symbol, interval=interval)
-        _log(f"載入完成 Loaded {len(bars)} bars from {cache_file}")
-
-        self._execute_backtest(bars)
+        self.status_var.set(f"無資料 No data. Use 'TV Data' to download first.")
+        self.btn_fetch.config(state=tk.NORMAL)
 
     def _execute_backtest(self, bars: list[Bar]):
         if not bars:
@@ -701,12 +1293,18 @@ class BacktestApp:
             self.btn_fetch.config(state=tk.NORMAL)
             return
 
-        # Apply date filter from GUI (if bars span wider than requested range)
+        # Store raw bars for re-running with different date ranges
+        self._raw_bars = bars
+        strategy_cls = STRATEGIES.get(self.strategy_var.get())
+        if strategy_cls:
+            self._raw_bars_key = (strategy_cls.kline_type, strategy_cls.kline_minute)
+
+        # Apply date filter from GUI
         try:
-            dt_start = datetime.strptime(self.start_var.get().strip(), "%Y%m%d")
-            dt_end = datetime.strptime(self.end_var.get().strip(), "%Y%m%d") + timedelta(days=1)
+            start_str = self.start_var.get().strip()
+            end_str = self.end_var.get().strip()
             before = len(bars)
-            bars = [b for b in bars if dt_start <= b.dt < dt_end]
+            bars = filter_bars_by_date(bars, start_str, end_str)
             if bars and len(bars) < before:
                 _log(f"日期篩選 Date filter: {before} -> {len(bars)} bars "
                      f"({bars[0].dt} ~ {bars[-1].dt})")
@@ -740,8 +1338,12 @@ class BacktestApp:
             self.btn_fetch.config(state=tk.NORMAL)
             return
 
-        # Pass the right params based on strategy type
-        if strategy_cls is H4BollingerAtrLongStrategy:
+        # Instantiate strategy: AI strategies use defaults, built-in ones use GUI params
+        strategy_name = self.strategy_var.get()
+        if strategy_name.startswith("AI:"):
+            # AI-generated strategies have params baked into __init__ defaults
+            strategy = strategy_cls()
+        elif strategy_cls is H4BollingerAtrLongStrategy:
             strategy = strategy_cls(
                 bb_period=bb_period, bb_std=bb_std,
                 atr_period=atr_period, sl_mult=sl_mult, tp_mult=tp_mult,
@@ -757,7 +1359,15 @@ class BacktestApp:
              f"balance={initial_balance:,}, point_value={point_value}")
         self.status_var.set("回測中 Running backtest...")
 
-        result = engine.run(bars)
+        try:
+            result = engine.run(bars)
+        except Exception as e:
+            tb = traceback.format_exc()
+            _log(f"回測錯誤 Backtest error:\n{tb}")
+            self.status_var.set(f"回測錯誤 Backtest error: {e}")
+            self._append_chat("error", f"Backtest runtime error:\n{e}")
+            self.btn_fetch.config(state=tk.NORMAL)
+            return
 
         # Recalculate metrics with initial balance
         result.metrics = calculate_metrics(
@@ -769,7 +1379,7 @@ class BacktestApp:
 
         self.btn_fetch.config(state=tk.NORMAL)
         self.btn_export.config(state=tk.NORMAL)
-        if _MPF_AVAILABLE and result.trades:
+        if _LWC_AVAILABLE and result.trades:
             self.btn_chart.config(state=tk.NORMAL)
             self.btn_chart_all.config(state=tk.NORMAL)
         self.status_var.set(
@@ -791,7 +1401,6 @@ class BacktestApp:
             pnl_str = f"{t.pnl:+,}"
             row_tag = "win" if t.pnl > 0 else "loss"
 
-            # Look up bar datetimes
             entry_dt = ""
             exit_dt = ""
             if bars:
@@ -811,17 +1420,15 @@ class BacktestApp:
         _log(f"回測完成 Backtest complete: {result.metrics.total_trades} trades")
 
     def _get_selected_trade_index(self) -> int | None:
-        """Return 0-based trade index from selected row in trade_tree, or None."""
         sel = self.trade_tree.selection()
         if not sel:
             return None
         values = self.trade_tree.item(sel[0], "values")
         if values:
-            return int(values[0]) - 1  # column 0 is 1-based "#"
+            return int(values[0]) - 1
         return None
 
     def _chart_kwargs(self) -> dict:
-        """Common kwargs for plot_backtest calls."""
         try:
             bb_period = int(self.bb_period_var.get())
             bb_std = float(self.bb_std_var.get())
@@ -830,36 +1437,41 @@ class BacktestApp:
         return dict(bb_period=bb_period, bb_std=bb_std)
 
     def _show_chart(self):
-        """Show chart zoomed to the selected trade, or first trade if none selected."""
         if not self._last_result or not self._last_bars:
             return
-        try:
-            strategy_name = self.strategy_var.get()
-            focus = self._get_selected_trade_index()
-            if focus is None:
-                focus = 0  # default to first trade
-            plot_backtest(self._last_bars, self._last_result.trades,
-                          title=strategy_name, focus_trade_index=focus,
-                          **self._chart_kwargs())
-        except ImportError as e:
-            self.status_var.set(str(e))
-            _log(f"圖表錯誤 Chart error: {e}")
-        except Exception as e:
-            _log(f"圖表錯誤 Chart error: {e}")
-            self.status_var.set(f"圖表錯誤 Chart error: {e}")
+        strategy_name = self.strategy_var.get()
+        focus = self._get_selected_trade_index()
+        if focus is None:
+            focus = 0
+        kwargs = self._chart_kwargs()
+        bars = list(self._last_bars)
+        trades = list(self._last_result.trades)
+        threading.Thread(
+            target=self._run_chart, daemon=True,
+            args=(bars, trades, strategy_name, focus, kwargs),
+        ).start()
 
     def _show_chart_all(self):
-        """Show full chart with all bars and trades."""
         if not self._last_result or not self._last_bars:
             return
+        strategy_name = self.strategy_var.get()
+        kwargs = self._chart_kwargs()
+        bars = list(self._last_bars)
+        trades = list(self._last_result.trades)
+        threading.Thread(
+            target=self._run_chart, daemon=True,
+            args=(bars, trades, strategy_name, None, kwargs),
+        ).start()
+
+    def _run_chart(self, bars, trades, title, focus, kwargs):
         try:
-            strategy_name = self.strategy_var.get()
-            plot_backtest(self._last_bars, self._last_result.trades,
-                          title=strategy_name, **self._chart_kwargs())
+            plot_backtest(bars, trades, title=title,
+                          focus_trade_index=focus, **kwargs)
         except ImportError as e:
-            self.status_var.set(str(e))
+            self.root.after(0, lambda: self.status_var.set(str(e)))
             _log(f"圖表錯誤 Chart error: {e}")
         except Exception as e:
+            self.root.after(0, lambda: self.status_var.set(f"圖表錯誤 Chart error: {e}"))
             _log(f"圖表錯誤 Chart error: {e}")
             self.status_var.set(f"圖表錯誤 Chart error: {e}")
 
