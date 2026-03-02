@@ -19,36 +19,40 @@ def _make_bar(dt_str: str, close: int = 20000) -> Bar:
 class TestShouldReuseBars:
     """Tests for should_reuse_bars()."""
 
-    def test_same_timeframe_reuses(self):
+    def test_same_symbol_and_timeframe_reuses(self):
         bars = [_make_bar("2026-01-01 09:00")]
-        assert should_reuse_bars(bars, (0, 15), kline_type=0, kline_minute=15) is True
+        assert should_reuse_bars(bars, ("TX00", 0, 15), symbol="TX00", kline_type=0, kline_minute=15) is True
 
     def test_different_minute_no_reuse(self):
         bars = [_make_bar("2026-01-01 09:00")]
-        assert should_reuse_bars(bars, (0, 15), kline_type=0, kline_minute=60) is False
+        assert should_reuse_bars(bars, ("TX00", 0, 15), symbol="TX00", kline_type=0, kline_minute=60) is False
 
     def test_different_kline_type_no_reuse(self):
         bars = [_make_bar("2026-01-01 09:00")]
-        assert should_reuse_bars(bars, (0, 240), kline_type=4, kline_minute=240) is False
+        assert should_reuse_bars(bars, ("TX00", 0, 240), symbol="TX00", kline_type=4, kline_minute=240) is False
+
+    def test_different_symbol_no_reuse(self):
+        bars = [_make_bar("2026-01-01 09:00")]
+        assert should_reuse_bars(bars, ("TX00", 0, 240), symbol="MTX00", kline_type=0, kline_minute=240) is False
 
     def test_empty_bars_no_reuse(self):
-        assert should_reuse_bars([], (0, 15), kline_type=0, kline_minute=15) is False
+        assert should_reuse_bars([], ("TX00", 0, 15), symbol="TX00", kline_type=0, kline_minute=15) is False
 
     def test_h4_matches_h4(self):
         bars = [_make_bar("2026-01-01 09:00")]
-        assert should_reuse_bars(bars, (0, 240), kline_type=0, kline_minute=240) is True
+        assert should_reuse_bars(bars, ("TX00", 0, 240), symbol="TX00", kline_type=0, kline_minute=240) is True
 
     def test_daily_matches_daily(self):
         bars = [_make_bar("2026-01-01 09:00")]
-        assert should_reuse_bars(bars, (4, 0), kline_type=4, kline_minute=0) is True
+        assert should_reuse_bars(bars, ("TX00", 4, 0), symbol="TX00", kline_type=4, kline_minute=0) is True
 
     def test_daily_vs_weekly_no_reuse(self):
         bars = [_make_bar("2026-01-01 09:00")]
-        assert should_reuse_bars(bars, (4, 0), kline_type=5, kline_minute=0) is False
+        assert should_reuse_bars(bars, ("TX00", 4, 0), symbol="TX00", kline_type=5, kline_minute=0) is False
 
     def test_empty_key_no_reuse(self):
         bars = [_make_bar("2026-01-01 09:00")]
-        assert should_reuse_bars(bars, (), kline_type=0, kline_minute=15) is False
+        assert should_reuse_bars(bars, (), symbol="TX00", kline_type=0, kline_minute=15) is False
 
 
 class TestFilterBarsByDate:

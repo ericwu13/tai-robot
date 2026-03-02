@@ -1,9 +1,10 @@
 """AI Strategy Workbench: Chat with Claude to generate, backtest, and export strategies.
 
-Data sources (in priority order):
-  1. Capital API (COM) — if available and connected
-  2. Cached CSV from data/ — auto-selected by strategy timeframe
-  3. TradingView download — via TV Data button
+Two backtest buttons:
+  - API Backtest — fetches from Capital API (logs in on first use)
+  - TV Backtest  — local CSV first, then TradingView download as fallback
+
+Multi-symbol support via _SYMBOL_CONFIG (TX00, MTX00).
 
 Usage:
   python run_backtest.py
@@ -11,11 +12,14 @@ Usage:
 
 import os
 import sys
+import inspect
+import queue
 import threading
 import traceback
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, simpledialog
+from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # Ensure src is importable
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -27,7 +31,9 @@ try:
 except ImportError:
     yaml = None
 
-from src.market_data.models import Bar
+from src.market_data.models import Bar, Tick
+from src.market_data.bar_builder import BarBuilder
+from src.utils.time_utils import combine_sk_datetime
 from src.backtest.engine import BacktestEngine
 from src.backtest.data_loader import parse_kline_strings, load_bars_from_csv
 from src.backtest.report import format_report, export_trades_csv
@@ -38,6 +44,8 @@ from src.strategy.examples.h4_bollinger_long import H4BollingerLongStrategy
 from src.strategy.examples.h4_bollinger_atr_long import H4BollingerAtrLongStrategy
 from src.strategy.examples.daily_bollinger_long import DailyBollingerLongStrategy
 from src.strategy.examples.h4_midline_touch_long import H4MidlineTouchLongStrategy
+from src.strategy.examples.m1_bollinger_atr_long import M1BollingerAtrLongStrategy
+from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
 
 # AI modules
 from src.ai.chat_client import ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS
@@ -48,6 +56,9 @@ from src.ai.code_sandbox import (
 )
 from src.ai.strategy_store import StrategyStore
 from src.ai.pine_exporter import export_to_pine
+
+# Live trading modules
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, _taipei_now
 
 # TradingView data feed (optional, for longer history)
 try:
@@ -66,10 +77,12 @@ _TV_INTERVALS = {
 
 # Registry of available backtest strategies
 STRATEGIES: dict[str, type[BacktestStrategy]] = {
+    "1分K均線交叉 1m SMA Cross": M1SmaCrossStrategy,
     "H4 布林多單 H4 Bollinger Long": H4BollingerLongStrategy,
     "H4 布林ATR多單 H4 Bollinger ATR Long": H4BollingerAtrLongStrategy,
     "日線布林多單 Daily Bollinger Long": DailyBollingerLongStrategy,
     "H4 中線戰法多單 H4 Midline Touch Long": H4MidlineTouchLongStrategy,
+    "1分K布林ATR多單 1m Bollinger ATR Long": M1BollingerAtrLongStrategy,
 }
 
 # ── COM setup (only if not using CSV mode) ──
@@ -160,26 +173,59 @@ INTERVAL_SECONDS = {
     (4, 1): 86400,
 }
 
-# Cached data files (downloaded from TradingView)
 _CACHE_DIR = os.path.join(project_root, "data")
-_CACHE_FILES = {
-    (0, 15): "TXF1_15m.csv",
-    (0, 60): "TXF1_1H.csv",
-    (0, 240): "TXF1_H4.csv",
-    (4, 1): "TXF1_1D.csv",
+
+# Multi-symbol configuration: COM symbol -> (csv_prefix, tv_symbol, point_value)
+_SYMBOL_CONFIG = {
+    "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100},
+    "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100},
 }
 
+_CACHE_SUFFIXES = {
+    (0, 15): "_15m.csv",
+    (0, 60): "_1H.csv",
+    (0, 240): "_H4.csv",
+    (4, 1): "_1D.csv",
+}
+
+
+_LIVE_CHART_TIMEFRAMES = {
+    "Native": None,
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1H": 3600,
+    "4H": 14400,
+}
+
+
+def _get_cache_file(symbol: str, kline_key: tuple) -> str | None:
+    """Return the cache CSV filename for a given symbol and kline key, or None."""
+    cfg = _SYMBOL_CONFIG.get(symbol)
+    if not cfg:
+        return None
+    suffix = _CACHE_SUFFIXES.get(kline_key)
+    if not suffix:
+        return None
+    return cfg["prefix"] + suffix
+
 _app = None
+
+# Thread-safe queue for COM tick callbacks → main thread.
+# COM callbacks fire on background threads; touching Tkinter or most Python objects
+# from those threads crashes the GIL in Python 3.13. We put raw tick tuples into
+# this queue and drain them on the main thread via root.after().
+_tick_queue: queue.Queue = queue.Queue()
 
 
 def should_reuse_bars(
     raw_bars: list, raw_bars_key: tuple,
-    kline_type: int, kline_minute: int,
+    symbol: str, kline_type: int, kline_minute: int,
 ) -> bool:
-    """Return True if raw_bars can be reused for the given timeframe."""
+    """Return True if raw_bars can be reused for the given symbol and timeframe."""
     if not raw_bars:
         return False
-    return raw_bars_key == (kline_type, kline_minute)
+    return raw_bars_key == (symbol, kline_type, kline_minute)
 
 
 def filter_bars_by_date(
@@ -197,8 +243,11 @@ def _log(msg):
     print(line, flush=True)
     if _app and hasattr(_app, "log_text"):
         try:
-            _app.log_text.insert(tk.END, line + "\n")
-            _app.log_text.see(tk.END)
+            # Only touch Tkinter widgets from the main thread; COM callbacks
+            # run on background threads and touching Tk there crashes the GIL.
+            if threading.current_thread() is threading.main_thread():
+                _app.log_text.insert(tk.END, line + "\n")
+                _app.log_text.see(tk.END)
         except Exception:
             pass
 
@@ -213,15 +262,28 @@ class SKQuoteLibEvents:
         if _app:
             if nKind == 3003 and nCode == 0:
                 _app._quote_connected = True
-                _app.btn_fetch.config(state=tk.NORMAL)
+                _app.btn_api.config(state=tk.NORMAL)
+                _app.btn_deploy.config(state=tk.NORMAL)
+                _app.btn_login.config(state=tk.DISABLED)
                 _app.status_var.set("已連線 Connected - Ready")
+                _app.login_status_var.set("已連線 Connected")
             elif nKind == 3002 and nCode == 0 and not _app._quote_connected:
                 _app._quote_connected = True
-                _app.btn_fetch.config(state=tk.NORMAL)
+                _app.btn_api.config(state=tk.NORMAL)
+                _app.btn_deploy.config(state=tk.NORMAL)
+                _app.btn_login.config(state=tk.DISABLED)
                 _app.status_var.set("已連線 Connected (Quote) - Ready")
+                _app.login_status_var.set("已連線 Connected")
 
     def OnNotifyKLineData(self, bstrStockNo, bstrData):
-        if _app:
+        if not _app:
+            return
+        # Route data based on current mode
+        if _app._live_warmup_mode:
+            _app._live_warmup_data.append(bstrData)
+        elif _app._live_polling:
+            _app._live_poll_data.append(bstrData)
+        else:
             _app.kline_data.append(bstrData)
             _app._chunk_bar_count += 1
             n = len(_app.kline_data)
@@ -229,19 +291,38 @@ class SKQuoteLibEvents:
                 _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
 
     def OnKLineComplete(self, nCode):
-        chunk_n = _app._chunk_bar_count if _app else 0
-        total_n = len(_app.kline_data) if _app else 0
-        _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
-        if _app:
+        if not _app:
+            return
+        if _app._live_warmup_mode:
+            _log(f"暖機完成 Warmup KLine complete: {len(_app._live_warmup_data)} bars, code={nCode}")
+            _app.root.after(100, _app._on_live_warmup_complete)
+        elif _app._live_polling:
+            _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
+            _app.root.after(100, _app._on_live_poll_complete)
+        else:
+            chunk_n = _app._chunk_bar_count
+            total_n = len(_app.kline_data)
+            _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
             _app.root.after(100, _app._on_chunk_complete)
 
     def OnNotifyQuoteLONG(self, sMarketNo, nStockIdx):
         pass
 
-    def OnNotifyTicksLONG(self, sMarketNo, nStockIdx, nPtr):
-        pass
+    def OnNotifyHistoryTicksLONG(self, sMarketNo, nStockIdx, nPtr,
+                                lDate, lTimehms, lTimemillismicros,
+                                nBid, nAsk, nClose, nQty, nSimulate):
+        # Minimal work on COM thread — just enqueue raw data.
+        # Accessing Python objects (like _app) from COM thread crashes GIL in 3.13.
+        _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
+                                nBid, nAsk, nClose, nQty, nSimulate, True))
 
-    def OnNotifyBest5LONG(self, sMarketNo, nStockIdx):
+    def OnNotifyTicksLONG(self, sMarketNo, nStockIdx, nPtr,
+                          lDate, lTimehms, lTimemillismicros,
+                          nBid, nAsk, nClose, nQty, nSimulate):
+        _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
+                                nBid, nAsk, nClose, nQty, nSimulate, False))
+
+    def OnNotifyBest5LONG(self, *args):
         pass
 
     def OnNotifyServerTime(self, sHour, sMinute, sSecond, nTotal):
@@ -293,11 +374,7 @@ class BacktestApp:
         self._build_ui()
         self._load_saved_strategies()
 
-        if _com_available:
-            self.root.after(200, self._do_login)
-        else:
-            self.btn_fetch.config(state=tk.NORMAL)
-            self.status_var.set("就緒 Ready (cached data)")
+        self.status_var.set("就緒 Ready")
 
     # ══════════════════════════════════════════════════════════════
     #  UI BUILD
@@ -322,7 +399,24 @@ class BacktestApp:
         self._last_result = None
         self._last_bars: list[Bar] = []
         self._raw_bars: list[Bar] = []  # unfiltered bars from any source, for re-running
-        self._raw_bars_key: tuple = ()  # (kline_type, kline_minute) of stored raw bars
+        self._raw_bars_key: tuple = ()  # (symbol, kline_type, kline_minute) of stored raw bars
+        self._data_source: str = ""  # tracks where data came from for report
+        self._pending_api_fetch: bool = False  # triggers fetch after login completes
+
+        # Live trading state
+        self._live_runner: LiveRunner | None = None
+        self._live_poll_id = None  # root.after() id for cancellation
+        self._live_warmup_mode: bool = False
+        self._live_warmup_data: list[str] = []
+        self._live_polling: bool = False
+        self._live_poll_data: list[str] = []
+        # Tick-based live data feed
+        self._live_tick_active: bool = False
+        self._live_bar_builder: BarBuilder | None = None
+        self._live_tick_symbol: str = ""
+        self._live_history_done: bool = False
+        self._live_tick_count: int = 0
+        self._live_history_tick_count: int = 0
 
     def _build_chat_panel(self, parent):
         # ── Header ──
@@ -403,21 +497,25 @@ class BacktestApp:
         # Row 0: Symbol + KLine type
         ttk.Label(ctrl, text="商品 Symbol:").grid(row=0, column=0, sticky=tk.W, padx=4)
         self.symbol_var = tk.StringVar(value="TX00")
-        ttk.Entry(ctrl, textvariable=self.symbol_var, width=10).grid(row=0, column=1, padx=4)
+        self.symbol_combo = ttk.Combobox(ctrl, textvariable=self.symbol_var, width=8,
+                                          state="readonly", values=list(_SYMBOL_CONFIG.keys()))
+        self.symbol_combo.grid(row=0, column=1, padx=4)
+        self.symbol_combo.bind("<<ComboboxSelected>>", lambda e: self._on_symbol_changed())
 
         ttk.Label(ctrl, text="策略 Strategy:").grid(row=0, column=2, sticky=tk.W, padx=4)
         self.strategy_var = tk.StringVar(value=list(STRATEGIES.keys())[0])
         self.strategy_combo = ttk.Combobox(ctrl, textvariable=self.strategy_var, width=30,
                                             state="readonly", values=list(STRATEGIES.keys()))
         self.strategy_combo.grid(row=0, column=3, padx=4)
+        ttk.Button(ctrl, text="原始碼", width=6, command=self._show_strategy_source).grid(row=0, column=4, padx=2)
 
-        ttk.Label(ctrl, text="初始資金 Balance:").grid(row=0, column=4, sticky=tk.W, padx=4)
+        ttk.Label(ctrl, text="初始資金 Balance:").grid(row=0, column=5, sticky=tk.W, padx=4)
         self.balance_var = tk.StringVar(value="1000000")
-        ttk.Entry(ctrl, textvariable=self.balance_var, width=12).grid(row=0, column=5, padx=4)
+        ttk.Entry(ctrl, textvariable=self.balance_var, width=12).grid(row=0, column=6, padx=4)
 
-        ttk.Label(ctrl, text="每點價值 Pt Value:").grid(row=0, column=6, sticky=tk.W, padx=4)
+        ttk.Label(ctrl, text="每點價值 Pt Value:").grid(row=0, column=7, sticky=tk.W, padx=4)
         self.pv_var = tk.StringVar(value="200")
-        ttk.Entry(ctrl, textvariable=self.pv_var, width=6).grid(row=0, column=7, padx=4)
+        ttk.Entry(ctrl, textvariable=self.pv_var, width=6).grid(row=0, column=8, padx=4)
 
         # Row 1: Date range + quick period buttons
         ttk.Label(ctrl, text="起始 Start:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=4)
@@ -465,17 +563,32 @@ class BacktestApp:
         self.tp_mult_var = tk.StringVar(value="0.5")
         ttk.Entry(ctrl, textvariable=self.tp_mult_var, width=6).grid(row=3, column=5, padx=4, sticky=tk.W)
 
-        # Row 4: Action buttons
+        # Row 4: Login
+        ttk.Label(ctrl, text="帳號 User ID:").grid(row=4, column=0, sticky=tk.W, padx=4, pady=4)
+        self.login_user_var = tk.StringVar(value=self._settings.get("user_id", ""))
+        ttk.Entry(ctrl, textvariable=self.login_user_var, width=14).grid(row=4, column=1, padx=4, sticky=tk.W)
+
+        ttk.Label(ctrl, text="密碼 Password:").grid(row=4, column=2, sticky=tk.W, padx=4)
+        self.login_pass_var = tk.StringVar(value=self._settings.get("password", ""))
+        ttk.Entry(ctrl, textvariable=self.login_pass_var, width=14, show="*").grid(row=4, column=3, padx=4, sticky=tk.W)
+
+        self.btn_login = ttk.Button(ctrl, text="登入 Login", command=self._manual_login, width=10)
+        self.btn_login.grid(row=4, column=4, padx=4, sticky=tk.W)
+
+        self.login_status_var = tk.StringVar(value="")
+        ttk.Label(ctrl, textvariable=self.login_status_var, foreground="gray").grid(
+            row=4, column=5, columnspan=3, padx=4, sticky=tk.W)
+
+        # Row 5: Action buttons
         btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=4, column=0, columnspan=8, pady=(8, 0))
+        btn_frame.grid(row=5, column=0, columnspan=8, pady=(8, 0))
 
-        self.btn_fetch = ttk.Button(btn_frame, text="開始回測 Run Backtest",
-                                    command=self._do_fetch, state=tk.DISABLED)
-        self.btn_fetch.pack(side=tk.LEFT, padx=4)
+        self.btn_api = ttk.Button(btn_frame, text="API回測 API Backtest",
+                                   command=self._do_fetch_api, state=tk.DISABLED)
+        self.btn_api.pack(side=tk.LEFT, padx=4)
 
-        self.btn_tv = ttk.Button(btn_frame, text="TradingView資料 TV Data",
-                                 command=self._fetch_tradingview,
-                                 state=tk.NORMAL if _tv_available else tk.DISABLED)
+        self.btn_tv = ttk.Button(btn_frame, text="TV回測 TV Backtest",
+                                 command=self._do_fetch_tv, state=tk.NORMAL)
         self.btn_tv.pack(side=tk.LEFT, padx=4)
 
         self.btn_export = ttk.Button(btn_frame, text="匯出交易 Export Trades",
@@ -489,6 +602,19 @@ class BacktestApp:
         self.btn_chart_all = ttk.Button(btn_frame, text="全圖 Full Chart",
                                         command=self._show_chart_all, state=tk.DISABLED)
         self.btn_chart_all.pack(side=tk.LEFT, padx=4)
+
+        self.btn_deploy = ttk.Button(btn_frame, text="部署機器人 Deploy Bot",
+                                      command=self._toggle_live, state=tk.DISABLED)
+        self.btn_deploy.pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(btn_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(8, 2))
+        self.chart_tf_var = tk.StringVar(value="Native")
+        self.chart_tf_combo = ttk.Combobox(
+            btn_frame, textvariable=self.chart_tf_var,
+            values=list(_LIVE_CHART_TIMEFRAMES.keys()),
+            state=tk.DISABLED, width=7,
+        )
+        self.chart_tf_combo.pack(side=tk.LEFT, padx=2)
 
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
         ttk.Label(btn_frame, textvariable=self.status_var, foreground="gray").pack(side=tk.LEFT, padx=16)
@@ -522,6 +648,40 @@ class BacktestApp:
         self.trade_tree.configure(yscrollcommand=vsb.set)
         self.trade_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Live tab
+        live_frame = ttk.Frame(notebook)
+        notebook.add(live_frame, text="即時 Live")
+
+        # Status panel
+        status_panel = ttk.LabelFrame(live_frame, text="即時狀態 Live Status", padding=6)
+        status_panel.pack(fill=tk.X, padx=4, pady=(4, 2))
+
+        self.live_state_var = tk.StringVar(value="IDLE")
+        self.live_pos_var = tk.StringVar(value="Flat")
+        self.live_pnl_var = tk.StringVar(value="0")
+        self.live_bars_var = tk.StringVar(value="0 / 0")
+        self.live_market_var = tk.StringVar(value="--")
+
+        for i, (label, var) in enumerate([
+            ("狀態 State:", self.live_state_var),
+            ("持倉 Position:", self.live_pos_var),
+            ("損益 P&L:", self.live_pnl_var),
+            ("K棒 (即時/總計):", self.live_bars_var),
+            ("盤勢 Market:", self.live_market_var),
+        ]):
+            ttk.Label(status_panel, text=label).grid(row=0, column=i*2, sticky=tk.W, padx=4)
+            ttk.Label(status_panel, textvariable=var, font=("Consolas", 10, "bold")).grid(
+                row=0, column=i*2+1, sticky=tk.W, padx=(0, 12))
+
+        # Live event log
+        self.live_log = scrolledtext.ScrolledText(live_frame, wrap=tk.WORD, font=("Consolas", 9),
+                                                   bg="#1a1a2e", fg="#e0e0e0")
+        self.live_log.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        self.live_log.tag_configure("entry", foreground="#4caf50")
+        self.live_log.tag_configure("exit", foreground="#f44336")
+        self.live_log.tag_configure("bar", foreground="#90caf9")
+        self.live_log.tag_configure("status", foreground="#ffc107")
 
         # Log tab
         log_frame = ttk.Frame(notebook)
@@ -963,12 +1123,78 @@ class BacktestApp:
         self.end_var.set(datetime.now().strftime("%Y%m%d"))
         self.start_var.set((datetime.now() - timedelta(days=days)).strftime("%Y%m%d"))
 
+    def _on_symbol_changed(self):
+        """Auto-set point value when symbol changes and clear cached bars."""
+        symbol = self.symbol_var.get()
+        cfg = _SYMBOL_CONFIG.get(symbol)
+        if cfg:
+            self.pv_var.set(str(cfg["pv"]))
+        self._raw_bars = []
+
+    def _show_strategy_source(self):
+        """Show source code of the selected strategy in a popup window."""
+        name = self.strategy_var.get()
+        cls = STRATEGIES.get(name)
+        if not cls:
+            return
+        try:
+            source = inspect.getsource(cls)
+            filepath = inspect.getfile(cls)
+        except (OSError, TypeError):
+            messagebox.showerror("錯誤", f"無法取得 {name} 的原始碼")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"原始碼 — {name}")
+        win.geometry("800x600")
+        text = scrolledtext.ScrolledText(
+            win, wrap=tk.NONE, font=("Consolas", 10),
+            bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+        )
+        text.pack(fill=tk.BOTH, expand=True)
+        text.insert(tk.END, f"# {filepath}\n\n{source}")
+        text.config(state=tk.DISABLED)
+
+    def _enable_buttons(self):
+        """Re-enable buttons after a run completes."""
+        if self._quote_connected:
+            self.btn_api.config(state=tk.NORMAL)
+            self.btn_deploy.config(state=tk.NORMAL)
+        self.btn_tv.config(state=tk.NORMAL)
+
+    def _disable_buttons(self):
+        """Disable buttons during a run."""
+        self.btn_api.config(state=tk.DISABLED)
+        self.btn_tv.config(state=tk.DISABLED)
+        self.btn_deploy.config(state=tk.DISABLED)
+
     # ── COM Login ──
 
-    def _do_login(self):
+    def _manual_login(self):
+        """Login button handler — reads credentials from the form."""
+        if not _com_available:
+            self.login_status_var.set("COM不可用 COM unavailable")
+            return
+        if self._logged_in:
+            self.login_status_var.set("已登入 Already logged in")
+            return
+
+        user_id = self.login_user_var.get().strip()
+        password = self.login_pass_var.get().strip()
+        if not user_id or not password:
+            self.login_status_var.set("請輸入帳號密碼 Enter credentials")
+            return
+
+        self.btn_login.config(state=tk.DISABLED)
+        self._do_login(user_id, password)
+
+    def _do_login(self, user_id: str = "", password: str = ""):
+        """Perform COM login with given credentials."""
+        if not user_id:
+            user_id = self.login_user_var.get().strip()
+        if not password:
+            password = self.login_pass_var.get().strip()
+
         try:
-            user_id = self._settings["user_id"]
-            password = self._settings["password"]
             authority_flag = self._settings.get("authority_flag", 0)
 
             log_dir = os.path.join(project_root, "CapitalLog_Backtest")
@@ -979,15 +1205,21 @@ class BacktestApp:
 
             _log(f"登入中 Logging in as {user_id}...")
             self.status_var.set("登入中 Logging in...")
+            self.login_status_var.set("登入中...")
 
             code = skC.SKCenterLib_LoginSetQuote(user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
                 self.status_var.set(f"登入失敗 Login failed: {msg}")
+                self.login_status_var.set(f"登入失敗 {msg}")
+                self.btn_login.config(state=tk.NORMAL)
+                self._pending_api_fetch = False
+                self._enable_buttons()
                 return
             self._logged_in = True
             _log(f"登入成功 LOGIN OK (code={code})")
+            self.login_status_var.set("登入成功 Logged in")
 
             skR.SKReplyLib_ConnectByID(user_id)
             code = skQ.SKQuoteLib_EnterMonitorLONG()
@@ -998,14 +1230,24 @@ class BacktestApp:
         except Exception as e:
             _log(f"初始化錯誤 Init error: {e}")
             self.status_var.set(f"錯誤 Error: {e}")
+            self.login_status_var.set(f"錯誤 Error")
+            self.btn_login.config(state=tk.NORMAL)
+            self._pending_api_fetch = False
+            self._enable_buttons()
 
     def _check_connection(self):
         try:
             ic = skQ.SKQuoteLib_IsConnected()
             if ic == 1:
                 self._quote_connected = True
-                self.btn_fetch.config(state=tk.NORMAL)
+                self.btn_api.config(state=tk.NORMAL)
+                self.btn_deploy.config(state=tk.NORMAL)
+                self.btn_login.config(state=tk.DISABLED)
                 self.status_var.set("已連線 Connected - Ready")
+                self.login_status_var.set("已連線 Connected")
+                if self._pending_api_fetch:
+                    self._pending_api_fetch = False
+                    self.root.after(100, self._do_fetch_api)
             elif not self._quote_connected:
                 self.root.after(2000, self._check_connection)
         except Exception as e:
@@ -1013,19 +1255,13 @@ class BacktestApp:
 
     # ── Data fetch ──
 
-    def _do_fetch(self):
-        # If we have previously downloaded bars matching this strategy's timeframe, reuse
-        strategy_cls = STRATEGIES.get(self.strategy_var.get())
-        if strategy_cls and should_reuse_bars(
-            self._raw_bars, self._raw_bars_key,
-            strategy_cls.kline_type, strategy_cls.kline_minute,
-        ):
-            _log("重新使用已下載資料 Re-using downloaded data with date filter")
-            self._execute_backtest(list(self._raw_bars))
-            return
+    def _do_fetch_api(self):
+        """Fetch from Capital API. Requires login first."""
+        self._data_source = "API"
 
-        if not _com_available:
-            self._run_backtest_cached()
+        if not self._quote_connected:
+            self.status_var.set("請先登入 Please login first")
+            self.login_status_var.set("請先登入 Login required")
             return
 
         symbol = self.symbol_var.get().strip()
@@ -1040,7 +1276,7 @@ class BacktestApp:
         start_date = self.start_var.get().strip()
         end_date = self.end_var.get().strip()
 
-        # Split into 80-day chunks (API returns ~3 months max for intraday)
+        # Split into adaptive chunks (API returns max ~316 bars per request)
         try:
             dt_start = datetime.strptime(start_date, "%Y%m%d")
             dt_end = datetime.strptime(end_date, "%Y%m%d")
@@ -1048,7 +1284,20 @@ class BacktestApp:
             self.status_var.set("日期格式錯誤 Date format error (YYYYMMDD)")
             return
 
-        chunk_days = 80
+        # Estimate bars per trading day for each timeframe, then size chunks
+        # to stay well under the 316-bar API cap (target ~250 bars/chunk).
+        if kline_type == 4:       # Daily
+            bars_per_tday = 1
+        elif minute_num >= 240:   # H4
+            bars_per_tday = 6
+        elif minute_num >= 60:    # 1H
+            bars_per_tday = 14
+        elif minute_num >= 30:    # 30m
+            bars_per_tday = 28
+        else:                     # 15m or less
+            bars_per_tday = 56
+        trading_days = 250 // bars_per_tday
+        chunk_days = max(5, int(trading_days * 7 / 5))
         self._fetch_chunks = []
         cursor = dt_start
         while cursor < dt_end:
@@ -1058,7 +1307,7 @@ class BacktestApp:
 
         self.kline_data = []
         self._fetch_chunk_idx = 0
-        self.btn_fetch.config(state=tk.DISABLED)
+        self._disable_buttons()
 
         total_days = (dt_end - dt_start).days
         n_chunks = len(self._fetch_chunks)
@@ -1094,19 +1343,58 @@ class BacktestApp:
                 _log(f"請求結果 Result: code={code} {msg}")
                 if code >= 3000:
                     self.status_var.set(f"錯誤 Error: {msg}")
-                    self.btn_fetch.config(state=tk.NORMAL)
+                    self._enable_buttons()
                     return
 
         except Exception as e:
             _log(f"查詢錯誤 Fetch error: {e}")
-            self.btn_fetch.config(state=tk.NORMAL)
+            self._enable_buttons()
 
-    def _fetch_tradingview(self):
-        """Fetch historical data from TradingView (up to 5000 bars, ~3+ years for H4)."""
-        if not _tv_available:
-            self.status_var.set("需安裝 tvDatafeed: pip install tradingview-datafeed")
+    def _do_fetch_tv(self):
+        """Use TradingView data: local CSV first, re-use in-memory, or download live."""
+        strategy_cls = STRATEGIES.get(self.strategy_var.get())
+        if not strategy_cls:
+            self.status_var.set("請選擇策略 Select a strategy")
             return
 
+        # Fast re-run: reuse TV bars already in memory (e.g. date range change)
+        symbol = self.symbol_var.get().strip()
+        if (self._data_source.startswith("TradingView") and should_reuse_bars(
+            self._raw_bars, self._raw_bars_key,
+            symbol, strategy_cls.kline_type, strategy_cls.kline_minute,
+        )):
+            _log("重新使用TV資料 Re-using TV data with date filter")
+            self._execute_backtest(list(self._raw_bars))
+            return
+
+        kt = strategy_cls.kline_type
+        km = strategy_cls.kline_minute
+        symbol = self.symbol_var.get().strip()
+        cache_file = _get_cache_file(symbol, (kt, km))
+
+        # Try local CSV first
+        if cache_file:
+            cache_path = os.path.join(_CACHE_DIR, cache_file)
+            if os.path.exists(cache_path):
+                self._data_source = f"TradingView ({cache_file})"
+                interval = self._get_strategy_interval()
+                _log(f"載入快取 Loading cached data: {cache_file}")
+                bars = load_bars_from_csv(cache_path, symbol=symbol, interval=interval)
+                _log(f"載入完成 Loaded {len(bars)} bars from {cache_file}")
+                self._execute_backtest(bars)
+                return
+
+        # Fall back to live TradingView download
+        if _tv_available:
+            _log("本地無資料，從TradingView下載 No local data, fetching from TradingView...")
+            self._fetch_tradingview_live()
+            return
+
+        self.status_var.set("無資料 No local CSV and tvDatafeed not installed.")
+        self._enable_buttons()
+
+    def _fetch_tradingview_live(self):
+        """Download fresh data from TradingView API as fallback."""
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
             return
@@ -1116,15 +1404,18 @@ class BacktestApp:
         tv_interval_name = _TV_INTERVALS.get((kt, km))
         if not tv_interval_name:
             self.status_var.set(f"TradingView不支援此週期 Unsupported interval: type={kt} min={km}")
+            self._enable_buttons()
             return
 
         tv_interval = getattr(TvInterval, tv_interval_name)
-        symbol = self.symbol_var.get().strip().replace("TX00", "TXF1!")
+        raw_symbol = self.symbol_var.get().strip()
+        cfg = _SYMBOL_CONFIG.get(raw_symbol)
+        symbol = cfg["tv"] if cfg else raw_symbol
         exchange = "TAIFEX"
         interval = INTERVAL_SECONDS.get((kt, km), 14400)
 
-        self.btn_tv.config(state=tk.DISABLED)
-        self.btn_fetch.config(state=tk.DISABLED)
+        self._data_source = "TradingView (live)"
+        self._disable_buttons()
         self.status_var.set(f"從TradingView下載 Fetching from TradingView: {symbol} {tv_interval_name}...")
         self.root.update()
 
@@ -1137,8 +1428,7 @@ class BacktestApp:
             if df is None or df.empty:
                 _log("TradingView無資料 No data from TradingView")
                 self.status_var.set("TradingView無資料 No data")
-                self.btn_tv.config(state=tk.NORMAL)
-                self.btn_fetch.config(state=tk.NORMAL)
+                self._enable_buttons()
                 return
 
             bars = []
@@ -1153,14 +1443,12 @@ class BacktestApp:
             bars.sort(key=lambda b: b.dt)
 
             _log(f"TradingView完成 Got {len(bars)} bars: {bars[0].dt} ~ {bars[-1].dt}")
-            self.btn_tv.config(state=tk.NORMAL)
             self._execute_backtest(bars)
 
         except Exception as e:
             _log(f"TradingView錯誤 TV error: {e}")
             self.status_var.set(f"TradingView錯誤: {e}")
-            self.btn_tv.config(state=tk.NORMAL)
-            self.btn_fetch.config(state=tk.NORMAL)
+            self._enable_buttons()
 
     # ── Backtest execution ──
 
@@ -1180,48 +1468,6 @@ class BacktestApp:
         kt = strategy_cls.kline_type
         km = strategy_cls.kline_minute
         return INTERVAL_SECONDS.get((kt, km), 14400)
-
-    def _merge_cached_data(self, bars: list[Bar], symbol: str, interval: int) -> list[Bar]:
-        """Merge API bars with cached data for longer history."""
-        strategy_cls = STRATEGIES.get(self.strategy_var.get())
-        if not strategy_cls:
-            return bars
-
-        kt = strategy_cls.kline_type
-        km = strategy_cls.kline_minute
-        cache_file = _CACHE_FILES.get((kt, km))
-        if not cache_file:
-            return bars
-
-        cache_path = os.path.join(_CACHE_DIR, cache_file)
-        if not os.path.exists(cache_path):
-            return bars
-
-        cached_bars = load_bars_from_csv(cache_path, symbol=symbol, interval=interval)
-        if not cached_bars:
-            return bars
-
-        _log(f"快取資料 Cache: {len(cached_bars)} bars from {cache_file} "
-             f"({cached_bars[0].dt} ~ {cached_bars[-1].dt})")
-
-        if bars:
-            api_start = bars[0].dt
-            api_end = bars[-1].dt
-            cached_before = [b for b in cached_bars if b.dt < api_start]
-            cached_after = [b for b in cached_bars if b.dt > api_end]
-            merged = cached_before + bars + cached_after
-            parts = []
-            if cached_before:
-                parts.append(f"{len(cached_before)} cached(before)")
-            parts.append(f"{len(bars)} API")
-            if cached_after:
-                parts.append(f"{len(cached_after)} cached(after)")
-            _log(f"合併完成 Merged: {' + '.join(parts)} = {len(merged)} total")
-        else:
-            merged = cached_bars
-            _log(f"使用快取 Using cache only: {len(merged)} bars")
-
-        return merged
 
     def _run_backtest(self):
         """Called after all KLine data arrives from COM API."""
@@ -1246,58 +1492,20 @@ class BacktestApp:
         else:
             _log("API資料 Parsed 0 API bars")
 
-        bars = self._merge_cached_data(bars, symbol, interval)
-
-        if bars:
-            _log(f"最終資料 Final: {len(bars)} bars: {bars[0].dt} ~ {bars[-1].dt}")
-        else:
-            _log("無資料 No data available (API or cache)")
-
         self._execute_backtest(bars)
-
-    def _run_backtest_cached(self):
-        """Load cached CSV matching the selected strategy's timeframe and run backtest."""
-        strategy_cls = STRATEGIES.get(self.strategy_var.get())
-        if not strategy_cls:
-            self.status_var.set("請選擇策略 Select a strategy")
-            return
-
-        kt = strategy_cls.kline_type
-        km = strategy_cls.kline_minute
-        cache_file = _CACHE_FILES.get((kt, km))
-
-        # Try cached CSV first
-        if cache_file:
-            cache_path = os.path.join(_CACHE_DIR, cache_file)
-            if os.path.exists(cache_path):
-                symbol = self.symbol_var.get().strip()
-                interval = self._get_strategy_interval()
-                _log(f"載入快取 Loading cached data: {cache_file}")
-                bars = load_bars_from_csv(cache_path, symbol=symbol, interval=interval)
-                _log(f"載入完成 Loaded {len(bars)} bars from {cache_file}")
-                self._execute_backtest(bars)
-                return
-
-        # Fall back to previously downloaded data (e.g. from TV download)
-        if self._raw_bars:
-            _log("重新使用已下載資料 Re-using previously downloaded data")
-            self._execute_backtest(self._raw_bars)
-            return
-
-        self.status_var.set(f"無資料 No data. Use 'TV Data' to download first.")
-        self.btn_fetch.config(state=tk.NORMAL)
 
     def _execute_backtest(self, bars: list[Bar]):
         if not bars:
             self.status_var.set("無資料 No data")
-            self.btn_fetch.config(state=tk.NORMAL)
+            self._enable_buttons()
             return
 
         # Store raw bars for re-running with different date ranges
         self._raw_bars = bars
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if strategy_cls:
-            self._raw_bars_key = (strategy_cls.kline_type, strategy_cls.kline_minute)
+            sym = self.symbol_var.get().strip()
+            self._raw_bars_key = (sym, strategy_cls.kline_type, strategy_cls.kline_minute)
 
         # Apply date filter from GUI
         try:
@@ -1311,9 +1519,32 @@ class BacktestApp:
         except ValueError:
             pass
 
+        # Notify user if data range is shorter than requested
+        if bars:
+            actual_start = bars[0].dt.strftime("%Y%m%d")
+            actual_end = bars[-1].dt.strftime("%Y%m%d")
+            req_start = self.start_var.get().strip()
+            req_end = self.end_var.get().strip()
+            if actual_start != req_start or actual_end != req_end:
+                _log(f"資料範圍修正 Data range adjusted: {actual_start} ~ {actual_end}")
+                ok = messagebox.askokcancel(
+                    "資料範圍不足 Insufficient Data Range",
+                    f"要求範圍 Requested: {req_start} ~ {req_end}\n"
+                    f"實際範圍 Available: {actual_start} ~ {actual_end}\n"
+                    f"共 {len(bars)} bars\n\n"
+                    f"是否繼續回測？Continue with available data?",
+                )
+                if not ok:
+                    self.status_var.set("已取消 Cancelled")
+                    self._enable_buttons()
+                    return
+                # Update date fields so re-run won't show popup again
+                self.start_var.set(actual_start)
+                self.end_var.set(actual_end)
+
         if not bars:
             self.status_var.set("篩選後無資料 No data after date filter")
-            self.btn_fetch.config(state=tk.NORMAL)
+            self._enable_buttons()
             return
 
         # Read parameters
@@ -1329,13 +1560,13 @@ class BacktestApp:
             tp_mult = float(self.tp_mult_var.get())
         except ValueError as e:
             self.status_var.set(f"參數錯誤 Param error: {e}")
-            self.btn_fetch.config(state=tk.NORMAL)
+            self._enable_buttons()
             return
 
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
             self.status_var.set("請選擇策略 Select a strategy")
-            self.btn_fetch.config(state=tk.NORMAL)
+            self._enable_buttons()
             return
 
         # Instantiate strategy: AI strategies use defaults, built-in ones use GUI params
@@ -1343,16 +1574,19 @@ class BacktestApp:
         if strategy_name.startswith("AI:"):
             # AI-generated strategies have params baked into __init__ defaults
             strategy = strategy_cls()
-        elif strategy_cls is H4BollingerAtrLongStrategy:
+        elif strategy_cls in (H4BollingerAtrLongStrategy, M1BollingerAtrLongStrategy):
             strategy = strategy_cls(
                 bb_period=bb_period, bb_std=bb_std,
                 atr_period=atr_period, sl_mult=sl_mult, tp_mult=tp_mult,
             )
         else:
-            strategy = strategy_cls(
-                bb_period=bb_period, bb_std=bb_std,
-                sl_offset=sl_offset, tp_offset=tp_offset,
-            )
+            try:
+                strategy = strategy_cls(
+                    bb_period=bb_period, bb_std=bb_std,
+                    sl_offset=sl_offset, tp_offset=tp_offset,
+                )
+            except TypeError:
+                strategy = strategy_cls()
         engine = BacktestEngine(strategy, point_value=point_value)
 
         _log(f"開始回測 Running backtest: {len(bars)} bars, "
@@ -1366,7 +1600,7 @@ class BacktestApp:
             _log(f"回測錯誤 Backtest error:\n{tb}")
             self.status_var.set(f"回測錯誤 Backtest error: {e}")
             self._append_chat("error", f"Backtest runtime error:\n{e}")
-            self.btn_fetch.config(state=tk.NORMAL)
+            self._enable_buttons()
             return
 
         # Recalculate metrics with initial balance
@@ -1377,7 +1611,7 @@ class BacktestApp:
         self._last_bars = bars
         self._display_results(result, bars)
 
-        self.btn_fetch.config(state=tk.NORMAL)
+        self._enable_buttons()
         self.btn_export.config(state=tk.NORMAL)
         if _LWC_AVAILABLE and result.trades:
             self.btn_chart.config(state=tk.NORMAL)
@@ -1390,6 +1624,22 @@ class BacktestApp:
     def _display_results(self, result, bars: list[Bar] | None = None):
         # Metrics report
         self.metrics_text.delete("1.0", tk.END)
+
+        # Data source header
+        symbol = self.symbol_var.get().strip()
+        source = self._data_source or "unknown"
+        header_lines = [f" 商品 Symbol:  {symbol}", f" 資料來源 Source:  {source}"]
+        if bars:
+            header_lines.append(f" 資料範圍 Range:  {bars[0].dt.strftime('%Y-%m-%d %H:%M')} ~ "
+                                f"{bars[-1].dt.strftime('%Y-%m-%d %H:%M')}")
+            header_lines.append(f" K棒數量 Bars:  {len(bars)}")
+        # Show live-specific info
+        if self._live_runner and self._live_runner.state != LiveState.IDLE:
+            status = self._live_runner.get_status()
+            header_lines.append(f" 即時狀態 State:  {status['state']}")
+            header_lines.append(f" 1分K / 聚合K  1m/Agg:  {status['bars_1m']} / {status['bars_agg']}")
+        self.metrics_text.insert(tk.END, "\n".join(header_lines) + "\n\n")
+
         report = format_report(result.strategy_name, result.metrics)
         self.metrics_text.insert(tk.END, report)
 
@@ -1417,7 +1667,10 @@ class BacktestApp:
         self.trade_tree.tag_configure("win", foreground="green")
         self.trade_tree.tag_configure("loss", foreground="red")
 
-        _log(f"回測完成 Backtest complete: {result.metrics.total_trades} trades")
+        if self._live_runner and self._live_runner.state != LiveState.IDLE:
+            _log(f"即時結果更新 Live results: {result.metrics.total_trades} trades")
+        else:
+            _log(f"回測完成 Backtest complete: {result.metrics.total_trades} trades")
 
     def _get_selected_trade_index(self) -> int | None:
         sel = self.trade_tree.selection()
@@ -1437,54 +1690,566 @@ class BacktestApp:
         return dict(bb_period=bb_period, bb_std=bb_std)
 
     def _show_chart(self):
-        if not self._last_result or not self._last_bars:
+        bars, result, show_trades = self._get_chart_data()
+        if not result or not bars:
             return
         strategy_name = self.strategy_var.get()
-        focus = self._get_selected_trade_index()
-        if focus is None:
+        trades = list(result.trades) if show_trades else []
+        focus = self._get_selected_trade_index() if show_trades else None
+        if show_trades and focus is None:
             focus = 0
+        # Append timeframe label in live mode
+        if self._live_runner and self._live_runner.state in (LiveState.RUNNING, LiveState.STOPPED):
+            strategy_name = f"{strategy_name} [{self.chart_tf_var.get()}]"
         kwargs = self._chart_kwargs()
-        bars = list(self._last_bars)
-        trades = list(self._last_result.trades)
         threading.Thread(
             target=self._run_chart, daemon=True,
-            args=(bars, trades, strategy_name, focus, kwargs),
+            args=(list(bars), trades, strategy_name, focus, kwargs),
         ).start()
 
     def _show_chart_all(self):
-        if not self._last_result or not self._last_bars:
+        bars, result, show_trades = self._get_chart_data()
+        if not result or not bars:
             return
         strategy_name = self.strategy_var.get()
+        trades = list(result.trades) if show_trades else []
+        # Append timeframe label in live mode
+        if self._live_runner and self._live_runner.state in (LiveState.RUNNING, LiveState.STOPPED):
+            strategy_name = f"{strategy_name} [{self.chart_tf_var.get()}]"
         kwargs = self._chart_kwargs()
-        bars = list(self._last_bars)
-        trades = list(self._last_result.trades)
         threading.Thread(
             target=self._run_chart, daemon=True,
-            args=(bars, trades, strategy_name, None, kwargs),
+            args=(list(bars), trades, strategy_name, None, kwargs),
         ).start()
+
+    def _get_chart_data(self):
+        """Return (bars, result, show_trades) from live runner or backtest.
+
+        In live mode, the Chart TF dropdown selects the timeframe:
+        - "Native" = strategy-interval bars with trade markers
+        - Other = re-aggregated from 1m bars, no trade markers
+        """
+        if self._live_runner and self._live_runner.state in (LiveState.RUNNING, LiveState.STOPPED):
+            result = self._live_runner.get_result()
+            tf_label = self.chart_tf_var.get()
+            interval = _LIVE_CHART_TIMEFRAMES.get(tf_label)
+            if interval is None:
+                # Native — strategy-interval bars with trades
+                return self._live_runner.get_bars(), result, True
+            # Re-aggregated bars — no trade markers
+            return self._live_runner.get_bars_at_interval(interval), result, False
+        return self._last_bars, self._last_result, True
 
     def _run_chart(self, bars, trades, title, focus, kwargs):
         try:
+            _log(f"[CHART] Opening: {len(bars)} bars, {len(trades)} trades, focus={focus}")
+            if bars:
+                b = bars[0]
+                _log(f"[CHART] First bar: dt={b.dt} O={b.open} H={b.high} L={b.low} C={b.close} V={b.volume} interval={b.interval}")
+                b = bars[-1]
+                _log(f"[CHART] Last bar:  dt={b.dt} O={b.open} H={b.high} L={b.low} C={b.close} V={b.volume} interval={b.interval}")
             plot_backtest(bars, trades, title=title,
                           focus_trade_index=focus, **kwargs)
+            _log("[CHART] Chart closed normally")
         except ImportError as e:
             self.root.after(0, lambda: self.status_var.set(str(e)))
             _log(f"圖表錯誤 Chart error: {e}")
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f"圖表錯誤 Chart error: {e}"))
             _log(f"圖表錯誤 Chart error: {e}")
-            self.status_var.set(f"圖表錯誤 Chart error: {e}")
+            import traceback
+            _log(traceback.format_exc())
 
     def _do_export(self):
-        if not self._last_result or not self._last_result.trades:
+        result = self._live_runner.get_result() if self._live_runner and self._live_runner.state != LiveState.IDLE else self._last_result
+        if not result or not result.trades:
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".csv", filetypes=[("CSV", "*.csv")],
             initialfile=f"backtest_trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
         if path:
-            export_trades_csv(self._last_result.trades, path)
+            export_trades_csv(result.trades, path)
             self.status_var.set(f"已匯出 Exported: {path}")
             _log(f"匯出交易 Exported trades to {path}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  LIVE TRADING METHODS
+    # ══════════════════════════════════════════════════════════════
+
+    def _toggle_live(self):
+        """Toggle between Deploy Bot and Stop Bot."""
+        if self._live_runner and self._live_runner.state == LiveState.RUNNING:
+            self._stop_live()
+        else:
+            self._deploy_live()
+
+    def _deploy_live(self):
+        """Start live bot: create runner, fetch warmup, subscribe to ticks."""
+        if not self._quote_connected and not _tv_available:
+            self.status_var.set("請先登入 Please login first")
+            self.login_status_var.set("請先登入 Login required")
+            return
+
+        strategy_cls = STRATEGIES.get(self.strategy_var.get())
+        if not strategy_cls:
+            self.status_var.set("請選擇策略 Select a strategy")
+            return
+
+        symbol = self.symbol_var.get().strip()
+        if not symbol:
+            return
+
+        try:
+            point_value = int(self.pv_var.get())
+        except ValueError:
+            point_value = 200
+
+        # Instantiate strategy
+        strategy_name = self.strategy_var.get()
+        if strategy_name.startswith("AI:"):
+            strategy = strategy_cls()
+        else:
+            try:
+                bb_period = int(self.bb_period_var.get())
+                bb_std = float(self.bb_std_var.get())
+                atr_period = int(self.atr_period_var.get())
+                sl_mult = float(self.sl_mult_var.get())
+                tp_mult = float(self.tp_mult_var.get())
+                sl_offset = int(self.sl_offset_var.get())
+                tp_offset = int(self.tp_offset_var.get())
+            except ValueError:
+                bb_period, bb_std = 20, 2.0
+                atr_period, sl_mult, tp_mult = 14, 1.0, 0.5
+                sl_offset, tp_offset = 20, 50
+
+            from src.strategy.examples.h4_bollinger_atr_long import H4BollingerAtrLongStrategy
+            from src.strategy.examples.m1_bollinger_atr_long import M1BollingerAtrLongStrategy
+            if strategy_cls in (H4BollingerAtrLongStrategy, M1BollingerAtrLongStrategy):
+                strategy = strategy_cls(
+                    bb_period=bb_period, bb_std=bb_std,
+                    atr_period=atr_period, sl_mult=sl_mult, tp_mult=tp_mult,
+                )
+            else:
+                try:
+                    strategy = strategy_cls(
+                        bb_period=bb_period, bb_std=bb_std,
+                        sl_offset=sl_offset, tp_offset=tp_offset,
+                    )
+                except TypeError:
+                    strategy = strategy_cls()
+
+        log_dir = os.path.join(project_root, "data", "live")
+        self._live_runner = LiveRunner(
+            strategy, symbol, point_value=point_value, log_dir=log_dir,
+        )
+
+        # Register callbacks
+        self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
+        self._live_runner.on("on_decision", lambda d: self.root.after(0, self._on_live_decision, d))
+        self._live_runner.on("on_status", lambda s: self.root.after(0, self._live_log_msg, s, "status"))
+
+        # Set data source for live mode
+        self._data_source = "即時交易 Live (tick)"
+
+        # Disable controls while live bot is running
+        self.btn_api.config(state=tk.DISABLED)
+        self.btn_tv.config(state=tk.DISABLED)
+        self.btn_deploy.config(text="停止機器人 Stop Bot")
+        self.symbol_combo.config(state=tk.DISABLED)
+        self.strategy_combo.config(state=tk.DISABLED)
+        self.chart_tf_combo.config(state="readonly")
+        self.chart_tf_var.set("Native")
+
+        self._live_log_msg(f"部署中 Deploying: {strategy.name} on {symbol}", "status")
+        _log(f"部署即時機器人 Deploying live bot: {strategy.name} on {symbol}")
+
+        # Start warmup
+        self._start_live_warmup()
+
+    def _start_live_warmup(self):
+        """Fetch historical bars at strategy's native timeframe for warmup."""
+        runner = self._live_runner
+        if not runner:
+            return
+
+        params = runner.get_warmup_params()
+        kt = params["kline_type"]
+        km = params["kline_minute"]
+        days = params["days_back"]
+
+        symbol = runner.symbol
+        self._live_log_msg(f"暖機中 Warming up: fetching {days} days of data...", "status")
+
+        # Always fetch fresh data for live warmup
+        if _com_available and self._quote_connected:
+            self._live_warmup_via_com(kt, km, days)
+        elif _tv_available:
+            self._live_warmup_via_tv(kt, km)
+        else:
+            self._live_log_msg("無資料來源 No data source for warmup", "status")
+            self._stop_live()
+
+    def _live_warmup_via_com(self, kline_type, kline_minute, days):
+        """Fetch warmup data via COM API."""
+        self._live_warmup_mode = True
+        self._live_warmup_data = []
+
+        dt_end = _taipei_now()
+        dt_start = dt_end - timedelta(days=days)
+        start_str = dt_start.strftime("%Y%m%d")
+        end_str = dt_end.strftime("%Y%m%d")
+
+        symbol = self._live_runner.symbol
+        _log(f"COM暖機查詢 COM warmup fetch: {symbol} type={kline_type} "
+             f"min={kline_minute} {start_str}~{end_str}")
+
+        try:
+            code = skQ.SKQuoteLib_RequestKLineAMByDate(
+                symbol, kline_type, 1, 0, start_str, end_str, kline_minute)
+            if code != 0 and code >= 3000:
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                _log(f"暖機查詢失敗 Warmup fetch failed: {msg}")
+                self._live_warmup_mode = False
+                self._stop_live()
+        except Exception as e:
+            _log(f"暖機錯誤 Warmup error: {e}")
+            self._live_warmup_mode = False
+            self._stop_live()
+
+    def _live_warmup_via_tv(self, kline_type, kline_minute):
+        """Fetch warmup data via TradingView (in thread)."""
+        runner = self._live_runner
+        tv_interval_name = _TV_INTERVALS.get((kline_type, kline_minute))
+        if not tv_interval_name:
+            self._live_log_msg(f"TV不支援此週期 Unsupported interval for TV", "status")
+            self._stop_live()
+            return
+
+        cfg = _SYMBOL_CONFIG.get(runner.symbol)
+        tv_symbol = cfg["tv"] if cfg else runner.symbol
+        interval_sec = INTERVAL_SECONDS.get((kline_type, kline_minute), 14400)
+
+        self._live_log_msg(f"TradingView暖機 TV warmup: {tv_symbol}...", "status")
+
+        def _worker():
+            try:
+                tv_interval = getattr(TvInterval, tv_interval_name)
+                tv = TvDatafeed()
+                df = tv.get_hist(symbol=tv_symbol, exchange="TAIFEX",
+                                 interval=tv_interval, n_bars=5000)
+                if df is None or df.empty:
+                    self.root.after(0, lambda: self._live_log_msg("TV無資料 No TV data", "status"))
+                    self.root.after(0, self._stop_live)
+                    return
+
+                kline_strings = []
+                for dt_idx, row in df.iterrows():
+                    dt = dt_idx.to_pydatetime()
+                    kline_strings.append(
+                        f"{dt.strftime('%m/%d/%Y %H:%M')},"
+                        f"{round(row['open'])},{round(row['high'])},"
+                        f"{round(row['low'])},{round(row['close'])},"
+                        f"{int(row.get('volume', 0))}"
+                    )
+
+                def _finish():
+                    count = runner.feed_warmup_bars(kline_strings)
+                    self._live_log_msg(f"TV暖機完成 TV warmup done: {count} bars", "status")
+                    self._update_live_status()
+                    self._start_live_tick_subscription()
+
+                self.root.after(0, _finish)
+            except Exception as e:
+                self.root.after(0, lambda: self._live_log_msg(f"TV暖機錯誤: {e}", "status"))
+                self.root.after(0, self._stop_live)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_live_warmup_complete(self):
+        """Called when COM warmup KLine data is complete."""
+        self._live_warmup_mode = False
+
+        if not self._live_runner:
+            return
+
+        data = list(self._live_warmup_data)
+        self._live_warmup_data = []
+
+        count = self._live_runner.feed_warmup_bars(data)
+        self._live_log_msg(f"COM暖機完成 COM warmup done: {count} bars", "status")
+        self._update_live_status()
+        self._start_live_tick_subscription()
+
+    # ── Tick-based live data feed ──
+
+    def _start_live_tick_subscription(self):
+        """Subscribe to real-time ticks via COM and build 1-min bars."""
+        if not self._live_runner:
+            return
+
+        symbol = self._live_runner.symbol
+        self._live_tick_symbol = symbol
+        self._live_bar_builder = BarBuilder(symbol, interval=60)
+
+        if not _com_available or not self._quote_connected:
+            self._live_log_msg("未連線 Not connected, cannot subscribe to ticks", "status")
+            self._stop_live()
+            return
+
+        # Suppress strategy during history tick catchup — no trades on old data
+        self._live_runner.suppress_strategy = True
+
+        self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}...", "status")
+        try:
+            result = skQ.SKQuoteLib_RequestTicks(0, symbol)
+            # COM may return (code, stockIdx) tuple or just an int
+            if isinstance(result, (list, tuple)):
+                code = result[0]
+            else:
+                code = result
+            if code != 0 and code >= 3000:
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                self._live_log_msg(f"訂閱失敗 Tick subscribe failed: {msg}", "status")
+                self._stop_live()
+                return
+            self._live_tick_active = True
+            self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
+            _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
+        except Exception as e:
+            _log(f"報價訂閱錯誤 Tick subscribe error: {e}")
+            self._live_log_msg(f"訂閱錯誤 Subscribe error: {e}", "status")
+            self._stop_live()
+
+        # Start draining tick queue on main thread
+        self._drain_tick_queue()
+        # Schedule periodic status updates (every 30s)
+        self._schedule_status_update()
+
+    def _schedule_status_update(self):
+        """Periodically update the live status panel."""
+        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        self._update_live_status()
+        self._live_poll_id = self.root.after(30000, self._schedule_status_update)
+
+    def _drain_tick_queue(self):
+        """Drain pending ticks from _tick_queue on the main thread.
+
+        COM tick callbacks put raw tuples into _tick_queue from the COM thread.
+        This method is scheduled via root.after() and processes up to 500 ticks
+        per frame to keep the UI responsive, then reschedules itself.
+        """
+        if not self._live_tick_active:
+            # Drain any remaining ticks then stop polling
+            while not _tick_queue.empty():
+                try:
+                    _tick_queue.get_nowait()
+                except queue.Empty:
+                    break
+            return
+        count = 0
+        while count < 500:
+            try:
+                tick_data = _tick_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._on_com_tick(*tick_data)
+            count += 1
+        # Reschedule: 10ms if ticks still pending, 50ms otherwise
+        delay = 10 if not _tick_queue.empty() else 50
+        self.root.after(delay, self._drain_tick_queue)
+
+    def _on_com_tick(self, date: int, time_hms: int, time_millismicros: int,
+                     bid: int, ask: int, close: int, qty: int, simulate: int,
+                     is_history: bool = False):
+        """Process a COM tick callback — runs on Tkinter main thread.
+
+        Converts raw COM tick data to Tick, feeds to BarBuilder.
+        When a 1-min bar completes, routes to LiveRunner.
+        """
+        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        if not self._live_bar_builder:
+            return
+
+        self._live_tick_count += 1
+
+        # Detect transition from history to live ticks
+        if not is_history and not self._live_history_done:
+            self._live_history_done = True
+            self._live_history_tick_count = self._live_tick_count
+            # Enable strategy execution now that we're on live data
+            self._live_runner.suppress_strategy = False
+            status = self._live_runner.get_status()
+            self._live_log_msg(
+                f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "
+                f"{status['bars_1m']} 1m bars built. Now receiving live ticks.",
+                "status",
+            )
+            self._update_live_status()
+            self._update_live_results()
+
+        # Convert SK date/time integers to datetime (strip tz — bars are tz-naive)
+        try:
+            dt = combine_sk_datetime(date, time_hms, time_millismicros)
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+        except Exception:
+            return
+
+        # Skip ticks during closed market (settlement/reference data at 14:50 etc.)
+        if not is_market_open(dt):
+            return
+
+        # Scale tick prices to match KLine convention (COM ticks are 100x KLine)
+        cfg = _SYMBOL_CONFIG.get(self._live_tick_symbol, {})
+        divisor = cfg.get("tick_divisor", 1)
+        price = close // divisor
+        bid_scaled = bid // divisor
+        ask_scaled = ask // divisor
+
+        # Log first few live ticks to verify timestamp/price convention
+        if self._live_history_done and self._live_tick_count <= self._live_history_tick_count + 5:
+            _log(f"[DEBUG TICK] raw: date={date} time={time_hms} ms={time_millismicros} "
+                 f"-> dt={dt} price={close} scaled={price} qty={qty}")
+
+        tick = Tick(
+            symbol=self._live_tick_symbol,
+            dt=dt,
+            price=price,
+            qty=qty,
+            bid=bid_scaled,
+            ask=ask_scaled,
+            simulate=bool(simulate),
+        )
+
+        # Feed tick to BarBuilder — returns completed 1-min bar on boundary cross
+        completed_1m = self._live_bar_builder.on_tick(tick)
+
+        if completed_1m is not None:
+            # Feed completed 1-min bar to LiveRunner
+            agg_bar = self._live_runner.feed_1m_bar(completed_1m)
+
+            # Only log live 1m bars (not the flood of historical catchup)
+            if self._live_history_done:
+                self._live_log_msg(
+                    f"1分K 1m: {completed_1m.dt.strftime('%H:%M')} "
+                    f"O={completed_1m.open} C={completed_1m.close} V={completed_1m.volume}",
+                    "status",
+                )
+
+            if agg_bar is not None and self._live_history_done:
+                self._live_log_msg(
+                    f"聚合K棒 Aggregated bar: {agg_bar.dt.strftime('%H:%M')} "
+                    f"O={agg_bar.open} H={agg_bar.high} "
+                    f"L={agg_bar.low} C={agg_bar.close}",
+                    "bar",
+                )
+                self._update_live_results()
+                self._update_live_status()
+
+    # ── Live UI updates ──
+
+    def _on_live_bar(self, bar):
+        """Callback when an aggregated bar is processed."""
+        pass  # Status update handled in _on_live_poll_complete
+
+    def _on_live_decision(self, decision):
+        """Callback when a trading decision is made."""
+        action = decision["action"]
+        tag_map = {
+            "ENTRY": "entry", "ENTRY_FILL": "entry",
+            "EXIT_ORDER": "exit", "CLOSE": "exit",
+            "TRADE_CLOSE": "exit", "FORCE_CLOSE": "exit",
+        }
+        tag = tag_map.get(action, "status")
+
+        msg = (f"{decision['action']} {decision['side']} "
+               f"tag={decision['tag']} price={decision['price']:,} "
+               f"({decision['reason']})")
+        self._live_log_msg(msg, tag)
+
+    def _live_log_msg(self, msg, tag="status"):
+        """Append message to the Live tab log."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        self.live_log.insert(tk.END, line, tag)
+        self.live_log.see(tk.END)
+
+    def _update_live_status(self):
+        """Update the Live tab status panel."""
+        if not self._live_runner:
+            return
+        status = self._live_runner.get_status()
+        self.live_state_var.set(status["state"])
+        self.live_pos_var.set(status["position"])
+        self.live_pnl_var.set(f"{status['pnl']:+,}")
+        self.live_bars_var.set(f"{status['bars_1m']} 即時 / {status['bars_agg']} 總計")
+        self.live_market_var.set("開盤 Open" if status["market_open"] else "休市 Closed")
+
+    def _update_live_results(self):
+        """Update results tabs with live data for chart/trades."""
+        if not self._live_runner:
+            return
+        result = self._live_runner.get_result()
+        bars = self._live_runner.get_bars()
+
+        # Update result for chart buttons
+        self._last_result = result
+        self._last_bars = bars
+
+        # Enable chart/export buttons
+        if _LWC_AVAILABLE and bars:
+            self.btn_chart.config(state=tk.NORMAL)
+            self.btn_chart_all.config(state=tk.NORMAL)
+        if result.trades:
+            self.btn_export.config(state=tk.NORMAL)
+
+        # Update trade list and metrics
+        self._display_results(result, bars)
+
+    def _stop_live(self):
+        """Stop the live bot and restore UI."""
+        if self._live_poll_id:
+            self.root.after_cancel(self._live_poll_id)
+            self._live_poll_id = None
+
+        self._live_warmup_mode = False
+        self._live_polling = False
+        self._live_tick_active = False
+        self._live_bar_builder = None
+        self._live_tick_symbol = ""
+        self._live_history_done = False
+        self._live_tick_count = 0
+        self._live_history_tick_count = 0
+
+        if self._live_runner:
+            summary = self._live_runner.stop()
+            self._live_log_msg(
+                f"已停止 Stopped: {summary['trades']} trades, "
+                f"P&L={summary['pnl']:+,}, "
+                f"bars={summary['bars_1m']}(1m)/{summary['bars_agg']}(agg)",
+                "status",
+            )
+            _log(f"即時機器人已停止 Live bot stopped: {summary}")
+
+            # Update final results then clear runner so subsequent backtests
+            # use _last_bars/_last_result instead of stale live data.
+            self._update_live_results()
+            self._update_live_status()
+            self._live_runner = None
+
+        # Restore UI
+        self.btn_deploy.config(text="部署機器人 Deploy Bot")
+        self.chart_tf_combo.config(state=tk.DISABLED)
+        self.chart_tf_var.set("Native")
+        if self._quote_connected:
+            self.btn_api.config(state=tk.NORMAL)
+            self.btn_deploy.config(state=tk.NORMAL)
+        self.btn_tv.config(state=tk.NORMAL)
+        self.symbol_combo.config(state="readonly")
+        self.strategy_combo.config(state="readonly")
+        self.status_var.set("就緒 Ready")
 
 
 def main():

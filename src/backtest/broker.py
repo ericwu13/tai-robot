@@ -60,7 +60,9 @@ class BrokerContext:
     ) -> None:
         self._broker.queue_exit(Order(
             tag=tag, side=OrderSide.LONG, qty=0,
-            limit=limit, stop=stop, from_entry=from_entry,
+            limit=round(limit) if limit is not None else None,
+            stop=round(stop) if stop is not None else None,
+            from_entry=from_entry,
         ))
 
     def close(self, from_entry: str, tag: str = "close") -> None:

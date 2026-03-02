@@ -49,6 +49,8 @@ class MyStrategy(BacktestStrategy):
 - `broker.entry(tag: str, side: OrderSide, qty=1)` — queue entry, filled at bar close. Returns None.
   The `tag` is a string you define (e.g. "Long"). Use the SAME tag string in close()/exit() `from_entry`.
 - `broker.exit(tag, from_entry: str, limit=None, stop=None)` — sets limit/stop exit orders, checked on NEXT bar's OHLC
+  **exit() requires TWO string args**: `tag` (exit order name) AND `from_entry` (matching the entry tag).
+  Example: `broker.exit("exit_long", "Long", limit=21000, stop=19800)`
 - `broker.close(from_entry: str, tag="close")` — market close at current bar's close (use this for manual exit conditions)
 - **IMPORTANT**: `entry()` returns None — do NOT store its return value. Track position state with `broker.position_size` and use the tag string literal in close()/exit().
 - **IMPORTANT**: `exit()` REQUIRES limit and/or stop prices to work. exit() with no limit/stop does NOTHING.
@@ -59,6 +61,8 @@ class MyStrategy(BacktestStrategy):
 ## DataStore API
 - `data_store.get_bars(n=None)` -> list[Bar]
 - `data_store.get_closes(n=None)` -> list[int]
+- `data_store.get_highs(n=None)` -> list[int]
+- `data_store.get_lows(n=None)` -> list[int]
 - `len(data_store)` -> int
 
 ## Available Indicators
