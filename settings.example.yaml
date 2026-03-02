@@ -39,3 +39,10 @@ logging:
   level: "INFO"
   log_dir: "logs"
   trade_csv: "logs/trades.csv"
+
+ai:
+  provider: "anthropic"          # "anthropic" or "google"
+  anthropic_api_key: ""          # sk-ant-... (from console.anthropic.com)
+  google_api_key: ""             # AIza... (from aistudio.google.com/apikey)
+  model: ""                      # leave empty for default (Sonnet 4 / Gemini 2.5 Pro)
+  max_tokens: 4096
