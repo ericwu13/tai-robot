@@ -15,7 +15,7 @@ account:
 
 trading:
   mode: "paper"              # paper | semi_auto | full_auto
-  symbol: "TXFD0"            # TAIEX futures front month
+  symbol: "TXFD0"            # "TXFD0" for 大台指 (TXF, pv=200), "MTXFD0" for 小台指 (MTX, pv=50)
   market_no: 2               # 2=T-session futures, 7=full-session futures
   default_qty: 1
   order_type: "2"            # "2"=auto new/close

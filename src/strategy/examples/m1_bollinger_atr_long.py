@@ -1,12 +1,9 @@
-"""H4 Bollinger Bands ATR Long-Only Strategy (H4布林ATR型態多單策略).
+"""1-Min Bollinger Bands ATR Long-Only Strategy (1分K布林ATR多單策略).
 
-從 TradingView Pine Script 翻譯。週期：H4（240分鐘），全盤。
+從 H4 布林ATR多單改編。週期：1分鐘，全盤。
 方向：純做多，1口，不加碼。
 
-相較於 H4BollingerLong 的改進：使用 ATR 自適應停損停利取代固定點數，
-讓策略能隨波動率變化自動調整。出場後有冷卻期避免立即重新進場。
-
-進場型態（與原版相同）：
+進場型態（與H4版本相同邏輯）：
   1. 突破：收盤 > 中軌，陽線，實體 >= K棒振幅的66%
   2. 回踩：最低價刺穿中軌，收盤站回中軌上方，小實體，下影線 >= 50%
 
@@ -25,20 +22,20 @@ from ...backtest.strategy import BacktestStrategy
 from ...backtest.broker import BrokerContext, OrderSide
 
 
-class H4BollingerAtrLongStrategy(BacktestStrategy):
-    """H4布林ATR多單策略 — ATR自適應停損停利 + 冷卻期。"""
+class M1BollingerAtrLongStrategy(BacktestStrategy):
+    """1分K布林ATR多單策略 — ATR自適應停損停利 + 冷卻期。"""
 
-    kline_type = 0      # 分鐘K線
-    kline_minute = 240   # 4小時K
+    kline_type = 0   # 分鐘K線
+    kline_minute = 1  # 1分K
 
     def __init__(
         self,
-        bb_period: int = 20,       # 布林帶週期
-        bb_std: float = 2.0,       # 布林帶標準差倍數
-        atr_period: int = 14,      # ATR 週期
-        sl_mult: float = 1.0,      # 停損 ATR 倍數
-        tp_mult: float = 0.5,      # 停利 ATR 倍數
-        cooldown_bars: int = 6,    # 出場後冷卻K棒數
+        bb_period: int = 20,
+        bb_std: float = 2.0,
+        atr_period: int = 14,
+        sl_mult: float = 1.0,
+        tp_mult: float = 0.5,
+        cooldown_bars: int = 6,
     ):
         self.bb_period = bb_period
         self.bb_std = bb_std
@@ -46,9 +43,9 @@ class H4BollingerAtrLongStrategy(BacktestStrategy):
         self.sl_mult = sl_mult
         self.tp_mult = tp_mult
         self.cooldown_bars = cooldown_bars
-        self._sl_price: int = 0          # 當前停損價
+        self._sl_price: int = 0
         self._was_in_position: bool = False
-        self._bars_since_exit: int = 999  # 距上次出場的K棒數
+        self._bars_since_exit: int = 999
 
     def required_bars(self) -> int:
         return max(self.bb_period, self.atr_period + 1)
@@ -62,31 +59,31 @@ class H4BollingerAtrLongStrategy(BacktestStrategy):
         bb = bollinger_bands(closes, self.bb_period, self.bb_std)
         if bb is None:
             return
-        upper, basis, lower = bb  # 上軌、中軌、下軌
+        upper, basis, lower = bb
 
         atr_val = atr(highs, lows, closes, self.atr_period)
         if atr_val is None:
             return
 
-        # 追蹤冷卻期：偵測部位剛平倉
+        # Track cooldown: detect when position was just closed
         if self._was_in_position and broker.position_size == 0:
             self._bars_since_exit = 0
         elif broker.position_size == 0:
             self._bars_since_exit += 1
         self._was_in_position = broker.position_size > 0
 
-        body = abs(bar.close - bar.open)          # 實體長度
-        k_range = max(bar.high - bar.low, 1)      # K棒振幅
-        lower_shadow = min(bar.close, bar.open) - bar.low  # 下影線長度
+        body = abs(bar.close - bar.open)
+        k_range = max(bar.high - bar.low, 1)
+        lower_shadow = min(bar.close, bar.open) - bar.low
 
-        # 進場型態1 — 突破：收盤站上中軌，陽線，大實體
+        # Entry pattern 1 - Breakout
         breakout = (
             bar.close > basis
             and bar.close > bar.open
             and body >= k_range * 0.66
         )
 
-        # 進場型態2 — 回踩：刺穿中軌後收回，小實體，長下影線
+        # Entry pattern 2 - Pullback
         pullback = (
             bar.low < basis
             and bar.close >= basis
@@ -97,14 +94,13 @@ class H4BollingerAtrLongStrategy(BacktestStrategy):
         can_enter = (
             (breakout or pullback)
             and broker.position_size == 0
-            and self._bars_since_exit >= self.cooldown_bars  # 冷卻期已過
+            and self._bars_since_exit >= self.cooldown_bars
         )
 
         if can_enter:
             broker.entry("Long", OrderSide.LONG)
-            self._sl_price = round(bar.low - atr_val * self.sl_mult)  # 停損 = 低點 - ATR
+            self._sl_price = round(bar.low - atr_val * self.sl_mult)
 
-        # 每根K棒更新停利單（上軌 - ATR偏移）
         if broker.position_size > 0 or can_enter:
             tp_price = round(upper - atr_val * self.tp_mult)
             broker.exit("Exit Long", "Long", limit=tp_price, stop=self._sl_price)

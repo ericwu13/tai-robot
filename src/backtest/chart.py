@@ -111,9 +111,11 @@ def plot_backtest(
         wick_up_color='#26a69a', wick_down_color='#ef5350',
     )
 
-    # Build OHLCV DataFrame
+    # Build OHLCV DataFrame — convert datetimes to pandas Timestamp[ns] to avoid
+    # pandas 3.x microsecond resolution mismatch with lightweight-charts v2.1
+    # (lightweight-charts does astype('int64') // 10**9 which assumes nanoseconds)
     df = pd.DataFrame({
-        'time': [b.dt for b in bars],
+        'time': pd.to_datetime([b.dt for b in bars]).as_unit('ns'),
         'open': [b.open for b in bars],
         'high': [b.high for b in bars],
         'low': [b.low for b in bars],
@@ -122,8 +124,8 @@ def plot_backtest(
     })
     chart.set(df)
 
-    # Bollinger Bands as overlay lines
-    bb_times = [b.dt for b in bars]
+    # Bollinger Bands as overlay lines — use ns-resolution timestamps
+    bb_times = pd.to_datetime([b.dt for b in bars]).as_unit('ns')
 
     # Filter out NaN values for each band
     bb_upper_data = pd.DataFrame({

@@ -30,6 +30,15 @@ backtest_trades_*.csv
 # Keep OHLC data files
 !data/*.csv
 
+# Live runtime logs
+data/live/
+
+# Broker order dumps
+order_data.csv
+
+# AI-generated strategy store (runtime)
+strategies/
+
 # OS
 .DS_Store
 Thumbs.db

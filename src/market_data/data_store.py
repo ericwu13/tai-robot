@@ -65,6 +65,16 @@ class DataStore:
         bars = self.get_bars(n)
         return [b.close for b in bars]
 
+    def get_highs(self, n: int | None = None) -> list[int]:
+        """Return the last n high prices."""
+        bars = self.get_bars(n)
+        return [b.high for b in bars]
+
+    def get_lows(self, n: int | None = None) -> list[int]:
+        """Return the last n low prices."""
+        bars = self.get_bars(n)
+        return [b.low for b in bars]
+
     def __len__(self) -> int:
         return len(self._bars)
 
