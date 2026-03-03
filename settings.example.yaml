@@ -6,7 +6,7 @@ credentials:
   user_id: "USER_ID"
   # Password is read from env var CAPITAL_API_PASSWORD or Windows keyring.
   # To store in keyring: python -c "import keyring; keyring.set_password('tai-robot', 'YOUR_USER_ID', 'YOUR_PASSWORD')"
-  authority_flag: 2          # 0=production, 1=test+production, 2=test only
+  authority_flag: 0          # 0=production, 1=test+production, 2=test only
 
 account:
   # Leave empty to auto-detect from login response
