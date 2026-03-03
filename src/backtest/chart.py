@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import queue
+import threading
 
 from ..market_data.models import Bar
 from .broker import Trade, OrderSide
@@ -214,3 +216,262 @@ def _add_marker(chart, time_val, position: str, shape: str, color: str, text: st
         "color": color,
         "text": text,
     }
+
+
+def _compute_bb_point(
+    closes: list, period: int, num_std: float,
+) -> tuple[float, float, float] | None:
+    """Compute a single Bollinger Band point from the last *period* closes."""
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    mean = sum(window) / period
+    variance = sum((x - mean) ** 2 for x in window) / period
+    std = math.sqrt(max(0.0, variance))
+    return (mean + num_std * std, mean, mean - num_std * std)
+
+
+class LiveChart:
+    """Real-time updating chart for live trading.
+
+    Thread-safe: push_* methods can be called from any thread.
+    run() blocks (must be called in a dedicated thread).
+    """
+
+    def __init__(
+        self,
+        initial_bars: list[Bar],
+        initial_trades: list[Trade],
+        title: str = "",
+        bb_period: int = 20,
+        bb_std: float = 2.0,
+    ):
+        self._initial_bars = list(initial_bars)
+        self._initial_trades = list(initial_trades)
+        self._title = title
+        self._bb_period = bb_period
+        self._bb_std = bb_std
+        self._queue: queue.Queue = queue.Queue()
+        self._alive = False
+        # Track closes for incremental BB computation
+        self._closes: list[float] = [b.close for b in initial_bars]
+
+    # ── Thread-safe push API ──
+
+    def push_bar(self, bar: Bar) -> None:
+        """Enqueue a completed aggregated bar."""
+        if self._alive:
+            self._queue.put(("bar", bar))
+
+    def push_partial(self, bar: Bar) -> None:
+        """Enqueue a partial (forming) bar update."""
+        if self._alive:
+            self._queue.put(("partial", bar))
+
+    def push_trade(self, trade: Trade, index: int) -> None:
+        """Enqueue a new completed trade marker."""
+        if self._alive:
+            self._queue.put(("trade", trade, index))
+
+    def close(self) -> None:
+        """Signal chart to exit."""
+        self._queue.put(("close",))
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    # ── Blocking run (call in a daemon thread) ──
+
+    def run(self) -> None:
+        """Create chart, render initial data, start feeder, show chart (blocking)."""
+        if not _LWC_AVAILABLE:
+            return
+        if not self._initial_bars:
+            return
+
+        bars = self._initial_bars
+        trades = self._initial_trades
+
+        # Create chart
+        chart = Chart(title=self._title, width=1280, height=720)
+        chart.legend(visible=True)
+        chart.layout(background_color='#1e1e1e', text_color='#d4d4d4')
+        chart.grid(color='rgba(255,255,255,0.06)')
+        chart.candle_style(
+            up_color='#26a69a', down_color='#ef5350',
+            wick_up_color='#26a69a', wick_down_color='#ef5350',
+        )
+
+        # Set initial OHLCV data
+        df = pd.DataFrame({
+            'time': pd.to_datetime([b.dt for b in bars]).as_unit('ns'),
+            'open': [b.open for b in bars],
+            'high': [b.high for b in bars],
+            'low': [b.low for b in bars],
+            'close': [b.close for b in bars],
+            'volume': [b.volume for b in bars],
+        })
+        chart.set(df)
+
+        # Bollinger Bands
+        bb_upper, bb_middle, bb_lower = _compute_bollinger(
+            bars, self._bb_period, self._bb_std,
+        )
+        bb_times = pd.to_datetime([b.dt for b in bars]).as_unit('ns')
+
+        line_upper = chart.create_line('BB Upper', color='dodgerblue', width=1)
+        line_upper.set(pd.DataFrame({
+            'time': bb_times, 'BB Upper': bb_upper,
+        }).dropna())
+
+        line_middle = chart.create_line('BB Middle', color='orange', width=1)
+        line_middle.set(pd.DataFrame({
+            'time': bb_times, 'BB Middle': bb_middle,
+        }).dropna())
+
+        line_lower = chart.create_line('BB Lower', color='dodgerblue', width=1)
+        line_lower.set(pd.DataFrame({
+            'time': bb_times, 'BB Lower': bb_lower,
+        }).dropna())
+
+        # Initial trade markers
+        candle_times = chart.candle_data['time'].tolist()
+        n_candles = len(candle_times)
+
+        for i, t in enumerate(trades):
+            ei = t.entry_bar_index
+            xi = t.exit_bar_index
+
+            if 0 <= ei < n_candles:
+                if t.side == OrderSide.LONG:
+                    _add_marker(chart, candle_times[ei], 'belowBar', 'arrowUp',
+                                '#1565C0', f"#{i+1} Entry {t.side.value} | {t.tag}")
+                else:
+                    _add_marker(chart, candle_times[ei], 'aboveBar', 'arrowDown',
+                                '#E040FB', f"#{i+1} Entry {t.side.value} | {t.tag}")
+
+            if 0 <= xi < n_candles:
+                pnl_str = f"{t.pnl:+,}"
+                bars_held = xi - ei
+                if t.pnl >= 0:
+                    color = '#00BCD4'
+                elif t.side == OrderSide.LONG:
+                    color = '#E040FB'
+                else:
+                    color = '#FF5252'
+                if t.side == OrderSide.SHORT:
+                    _add_marker(chart, candle_times[xi], 'belowBar', 'arrowUp',
+                                color, f"#{i+1} Exit ({t.exit_tag}) P&L:{pnl_str} [{bars_held}bars]")
+                else:
+                    _add_marker(chart, candle_times[xi], 'aboveBar', 'arrowDown',
+                                color, f"#{i+1} Exit ({t.exit_tag}) P&L:{pnl_str} [{bars_held}bars]")
+
+        chart._update_markers()
+
+        # Start feeder thread, then block on chart display
+        self._alive = True
+        feeder = threading.Thread(
+            target=self._feeder_loop, daemon=True,
+            args=(chart, line_upper, line_middle, line_lower),
+        )
+        feeder.start()
+
+        chart.show(block=True)
+        self._alive = False
+
+    # ── Feeder loop (runs in its own daemon thread) ──
+
+    def _feeder_loop(self, chart, line_upper, line_middle, line_lower):
+        """Poll queue and apply updates to the live chart."""
+        while self._alive:
+            try:
+                msg = self._queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            kind = msg[0]
+
+            if kind == "close":
+                try:
+                    chart.exit()
+                except Exception:
+                    pass
+                break
+
+            try:
+                if kind == "bar":
+                    bar = msg[1]
+                    ts = pd.Timestamp(bar.dt).as_unit('ns')
+                    chart.update(pd.Series({
+                        'time': ts,
+                        'open': bar.open, 'high': bar.high,
+                        'low': bar.low, 'close': bar.close,
+                        'volume': bar.volume,
+                    }))
+                    self._closes.append(bar.close)
+                    bb = _compute_bb_point(
+                        self._closes, self._bb_period, self._bb_std,
+                    )
+                    if bb:
+                        u, m, l = bb
+                        line_upper.update(pd.Series({'time': ts, 'BB Upper': u}))
+                        line_middle.update(pd.Series({'time': ts, 'BB Middle': m}))
+                        line_lower.update(pd.Series({'time': ts, 'BB Lower': l}))
+
+                elif kind == "partial":
+                    bar = msg[1]
+                    if bar is None:
+                        continue
+                    ts = pd.Timestamp(bar.dt).as_unit('ns')
+                    chart.update(pd.Series({
+                        'time': ts,
+                        'open': bar.open, 'high': bar.high,
+                        'low': bar.low, 'close': bar.close,
+                        'volume': bar.volume,
+                    }))
+                    tentative = self._closes + [bar.close]
+                    bb = _compute_bb_point(
+                        tentative, self._bb_period, self._bb_std,
+                    )
+                    if bb:
+                        u, m, l = bb
+                        line_upper.update(pd.Series({'time': ts, 'BB Upper': u}))
+                        line_middle.update(pd.Series({'time': ts, 'BB Middle': m}))
+                        line_lower.update(pd.Series({'time': ts, 'BB Lower': l}))
+
+                elif kind == "trade":
+                    trade, index = msg[1], msg[2]
+                    candle_times = chart.candle_data['time'].tolist()
+                    n = len(candle_times)
+                    ei, xi = trade.entry_bar_index, trade.exit_bar_index
+
+                    if 0 <= ei < n:
+                        if trade.side == OrderSide.LONG:
+                            _add_marker(chart, candle_times[ei], 'belowBar', 'arrowUp',
+                                        '#1565C0', f"#{index+1} Entry {trade.side.value} | {trade.tag}")
+                        else:
+                            _add_marker(chart, candle_times[ei], 'aboveBar', 'arrowDown',
+                                        '#E040FB', f"#{index+1} Entry {trade.side.value} | {trade.tag}")
+
+                    if 0 <= xi < n:
+                        pnl_str = f"{trade.pnl:+,}"
+                        bars_held = xi - ei
+                        if trade.pnl >= 0:
+                            color = '#00BCD4'
+                        elif trade.side == OrderSide.LONG:
+                            color = '#E040FB'
+                        else:
+                            color = '#FF5252'
+                        if trade.side == OrderSide.SHORT:
+                            _add_marker(chart, candle_times[xi], 'belowBar', 'arrowUp',
+                                        color, f"#{index+1} Exit ({trade.exit_tag}) P&L:{pnl_str} [{bars_held}bars]")
+                        else:
+                            _add_marker(chart, candle_times[xi], 'aboveBar', 'arrowDown',
+                                        color, f"#{index+1} Exit ({trade.exit_tag}) P&L:{pnl_str} [{bars_held}bars]")
+
+                    chart._update_markers()
+
+            except Exception:
+                if not self._alive:
+                    break

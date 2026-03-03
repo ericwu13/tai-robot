@@ -51,6 +51,17 @@ class BarAggregator:
         self._start(bar_time, bar)
         return completed
 
+    def get_partial_bar(self) -> Bar | None:
+        """Return a snapshot copy of the current in-progress bar, or None."""
+        if self._current is None:
+            return None
+        c = self._current
+        return Bar(
+            symbol=c.symbol, dt=c.dt, open=c.open,
+            high=c.high, low=c.low, close=c.close,
+            volume=c.volume, interval=c.interval,
+        )
+
     def flush(self) -> Bar | None:
         """Force-finalize the current partial bar (e.g. at session end)."""
         if self._current is None:
