@@ -23,7 +23,6 @@ a = Analysis(
     pathex=[],
     binaries=dll_binaries,
     datas=[
-        ('data', 'data'),
         ('src', 'src'),
         ('strategies', 'strategies'),
         ('settings.example.yaml', '.'),
