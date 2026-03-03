@@ -21,10 +21,20 @@ from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Ensure src is importable
-project_root = os.path.dirname(os.path.abspath(__file__))
+# Ensure src is importable — handle PyInstaller frozen EXE
+if getattr(sys, 'frozen', False):
+    # --onedir: EXE is in dist/tai_backtest/, _MEIPASS == EXE dir
+    # --onefile: EXE extracts to temp _MEI dir
+    bundle_root = sys._MEIPASS
+    project_root = os.path.dirname(sys.executable)
+else:
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    bundle_root = project_root
+
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+if bundle_root not in sys.path:
+    sys.path.insert(0, bundle_root)
 
 try:
     import yaml
@@ -90,26 +100,82 @@ _com_available = False
 skC = skQ = skR = None
 
 def _init_com():
+    """Initialise Capital API COM objects (SKCOM).
+
+    DLL search path handling is critical for PyInstaller frozen EXEs:
+      - PyInstaller's bootloader calls SetDllDirectoryW(_MEIPASS), which
+        overrides the Windows DLL search order.
+      - COM's CoCreateInstance uses LoadLibrary (NOT LoadLibraryEx), so it
+        respects SetDllDirectoryW but ignores os.add_dll_directory().
+      - We must call SetDllDirectoryW(libs_path) so COM can find SKCOM.dll's
+        sibling DLLs, then restore with SetDllDirectoryW(None) so SKCOM's
+        runtime network calls can find system DLLs (WinHTTP, Schannel, etc.).
+    """
     global _com_available, skC, skQ, skR
     try:
+        import ctypes
         import comtypes
         import comtypes.client
 
-        libs_path = os.path.abspath(os.path.join(
+        frozen = getattr(sys, 'frozen', False)
+
+        # Locate DLL directory: bundled libs first (deployed EXE), SDK fallback (dev)
+        bundled_libs = os.path.join(bundle_root, "libs")
+        sdk_libs = os.path.abspath(os.path.join(
             project_root,
             "CapitalAPI_2.13.57", "CapitalAPI_2.13.57_PythonExample",
             "SKDLLPythonTester", "libs",
         ))
-        os.add_dll_directory(libs_path)
-        os.environ["PATH"] = libs_path + os.pathsep + os.environ.get("PATH", "")
 
+        if frozen and os.path.isdir(bundled_libs):
+            libs_path = bundled_libs
+        elif os.path.isdir(sdk_libs):
+            libs_path = sdk_libs
+        elif os.path.isdir(bundled_libs):
+            libs_path = bundled_libs
+        else:
+            print("COM not available: no SDK or bundled libs found")
+            return
+
+        # ── Phase 1: Configure DLL search paths ──
+        os.environ["PATH"] = libs_path + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(libs_path)
+        except (OSError, AttributeError):
+            pass
+        # SetDllDirectoryW — this is what COM's LoadLibrary actually uses.
+        # In frozen EXEs, PyInstaller set it to _MEIPASS; override to libs.
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetDllDirectoryW(libs_path)
+
+        # ── Phase 2: Load typelib and create COM objects ──
         dll_path = os.path.join(libs_path, "SKCOM.dll")
         comtypes.client.GetModule(dll_path)
         import comtypes.gen.SKCOMLib as sk
 
-        skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
+        try:
+            skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
+        except OSError:
+            # COM not registered — register from libs_path (requires admin once)
+            import subprocess
+            for dll_name in ("SKCOM.dll", "CTSecuritiesATL.dll"):
+                dll_to_reg = os.path.join(libs_path, dll_name)
+                if os.path.isfile(dll_to_reg):
+                    subprocess.run(["regsvr32", "/s", dll_to_reg], capture_output=True)
+            try:
+                skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
+            except OSError:
+                print("COM registration failed — run the EXE as Administrator once.")
+                raise
+
         skQ = comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib)
         skR = comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib)
+
+        # ── Phase 3: Restore default DLL search order ──
+        # None = default Windows search (app dir → System32 → Windows → PATH).
+        # This lets SKCOM's internal network calls find WinHTTP, Schannel, etc.
+        kernel32.SetDllDirectoryW(None)
+
         _com_available = True
     except Exception as e:
         print(f"COM not available: {e}")
@@ -118,8 +184,16 @@ def _init_com():
 
 def _load_settings():
     cfg = {"user_id": "", "password": "", "authority_flag": 0}
-    for name in ("settings.yaml", "settings.example.yaml"):
-        path = os.path.join(project_root, name)
+    # Check user-writable project_root first, then parent dir (for dist/), then bundle
+    search_paths = [
+        os.path.join(project_root, "settings.yaml"),
+        os.path.join(project_root, "settings.example.yaml"),
+    ]
+    if getattr(sys, 'frozen', False):
+        parent = os.path.dirname(project_root)
+        search_paths.insert(1, os.path.join(parent, "settings.yaml"))
+    search_paths.append(os.path.join(bundle_root, "settings.example.yaml"))
+    for path in search_paths:
         if os.path.exists(path) and yaml:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
@@ -749,7 +823,8 @@ class BacktestApp:
                 response = self._chat_client.send_message(text)
                 self.root.after(0, lambda: self._on_chat_response(response))
             except Exception as e:
-                self.root.after(0, lambda: self._on_chat_error(str(e)))
+                err_msg = str(e)
+                self.root.after(0, lambda: self._on_chat_error(err_msg))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -829,7 +904,8 @@ class BacktestApp:
                 response = self._chat_client.send_message(gen_msg)
                 self.root.after(0, lambda: self._on_generate_response(response))
             except Exception as e:
-                self.root.after(0, lambda: self._on_chat_error(str(e)))
+                err_msg = str(e)
+                self.root.after(0, lambda: self._on_chat_error(err_msg))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -892,7 +968,8 @@ class BacktestApp:
                 resp = self._chat_client.send_message(retry_msg)
                 self.root.after(0, lambda: self._on_generate_response(resp, retries_left=remaining))
             except Exception as e:
-                self.root.after(0, lambda: self._on_chat_error(str(e)))
+                err_msg = str(e)
+                self.root.after(0, lambda: self._on_chat_error(err_msg))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1198,6 +1275,7 @@ class BacktestApp:
             authority_flag = self._settings.get("authority_flag", 0)
 
             log_dir = os.path.join(project_root, "CapitalLog_Backtest")
+            os.makedirs(log_dir, exist_ok=True)
             skC.SKCenterLib_SetLogPath(log_dir)
 
             if authority_flag:
@@ -2268,4 +2346,15 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    # In frozen EXE, patch lightweight_charts INDEX to file:// URL.
+    # By default, pywebview starts a local HTTP server to serve the HTML.
+    # In frozen EXEs, this HTTP server can silently fail or have path issues.
+    # Using file:// bypasses the server entirely — WebView2 loads directly.
+    if getattr(sys, 'frozen', False) and _LWC_AVAILABLE:
+        import lightweight_charts.abstract as _lwc_abs
+        _js_dir = os.path.join(bundle_root, 'lightweight_charts', 'js')
+        _lwc_abs.INDEX = 'file:///' + os.path.join(
+            _js_dir, 'index.html').replace('\\', '/')
     main()
