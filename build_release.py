@@ -17,7 +17,7 @@ ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 
 # Files and directories to EXCLUDE from the release zip
 EXCLUDE_FILES = {"settings.yaml"}
-EXCLUDE_DIRS = {"CapitalLog_Backtest", "_comtypes_cache", "__pycache__"}
+EXCLUDE_DIRS = {"CapitalLog_Backtest", "_comtypes_cache", "__pycache__", "data", "live"}
 
 
 def build():

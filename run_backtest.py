@@ -169,14 +169,30 @@ def _init_com():
         except OSError:
             # COM not registered — register from libs_path (requires admin once)
             import subprocess
+            print(f"COM not registered. Attempting regsvr32 from: {libs_path}")
+            reg_ok = True
             for dll_name in ("SKCOM.dll", "CTSecuritiesATL.dll"):
                 dll_to_reg = os.path.join(libs_path, dll_name)
                 if os.path.isfile(dll_to_reg):
-                    subprocess.run(["regsvr32", "/s", dll_to_reg], capture_output=True)
+                    r = subprocess.run(
+                        ["regsvr32", "/s", dll_to_reg],
+                        capture_output=True, text=True,
+                    )
+                    if r.returncode != 0:
+                        print(f"  regsvr32 FAILED for {dll_name} (code {r.returncode})")
+                        reg_ok = False
+                    else:
+                        print(f"  regsvr32 OK: {dll_name}")
+                else:
+                    print(f"  WARNING: {dll_name} not found in {libs_path}")
+                    reg_ok = False
+            if not reg_ok:
+                print("COM registration failed — right-click the EXE > Run as administrator")
             try:
                 skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
             except OSError:
-                print("COM registration failed — run the EXE as Administrator once.")
+                print("COM CreateObject failed after registration attempt.")
+                print("Fix: right-click tai_backtest.exe > Run as administrator (once)")
                 raise
 
         skQ = comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib)
@@ -1300,6 +1316,9 @@ class BacktestApp:
             if code != 0 and not (2000 <= code < 3000):
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
+                if code == 1097:
+                    _log("提示: 請確認已安裝群益API憑證 (從券商網站下載安裝)")
+                    _log("Hint: Ensure Capital API certificate is installed (download from broker website)")
                 self.status_var.set(f"登入失敗 Login failed: {msg}")
                 self.login_status_var.set(f"登入失敗 {msg}")
                 self.btn_login.config(state=tk.NORMAL)

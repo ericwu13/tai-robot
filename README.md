@@ -80,12 +80,27 @@ Output: `dist/tai_backtest/tai_backtest.exe`
 
 ### First-time Setup (per machine)
 
-1. Copy the entire `dist/tai_backtest/` folder to the target machine
-2. Place your `settings.yaml` next to `tai_backtest.exe` (not inside `_internal/`)
-3. **Run `tai_backtest.exe` as Administrator once** (right-click > Run as administrator)
+1. Extract the release zip (or copy the `tai_backtest/` folder) to the target machine
+2. **Windows SmartScreen**: On first launch, Windows may block the EXE with "Windows protected your PC". Click **More info** → **Run anyway**. This only happens once.
+3. Place your `settings.yaml` next to `tai_backtest.exe` (not inside `_internal/`)
+4. **Run `tai_backtest.exe` as Administrator once** (right-click > Run as administrator)
    - This auto-registers the COM DLLs via `regsvr32`
+   - The console will show registration results — check for errors
    - Subsequent runs do not need admin
-4. Ensure the Capital API certificate is installed (from your broker's website)
+5. **Install the Capital API certificate** (required per machine)
+   - Download from your broker's website (群益證券)
+   - Install the `.pfx` or `.p12` certificate file
+   - Without the certificate, login will fail with error 1097
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "Windows protected your PC" | SmartScreen blocks unsigned EXE | Click **More info** → **Run anyway** |
+| EXE doesn't launch at all | Missing VC++ runtime | Install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+| Login error 1097 | Certificate not installed | Install API certificate from broker website |
+| COM registration failed | Not running as admin | Right-click EXE → Run as administrator (once) |
+| Blank chart window | WebView2 not installed | Install [WebView2 Runtime](https://go.microsoft.com/fwlink/p/?LinkId=2124703) |
 
 ### Directory Structure After Deployment
 
