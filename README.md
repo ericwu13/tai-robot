@@ -1,6 +1,6 @@
 # tai-robot - Taiwan Futures Trading Bot
 
-**Version: 1.0.1**
+**Version: 1.0.2**
 
 Trading bot for Taiwan futures (TAIEX Futures) using Capital API (SKCOM) v2.13.57.
 
@@ -148,6 +148,12 @@ PyInstaller's bootloader calls `SetDllDirectoryW(_MEIPASS)`, which overrides the
 `lightweight_charts` uses pywebview which starts a local HTTP server. In frozen EXEs, this server silently fails. The fix patches `abstract.INDEX` to a `file://` URL at **module level** (not inside `__main__`) so both the main process and the multiprocessing child process (where WebView2 runs) get the patch. `freeze_support()` intercepts child processes before any code after it runs.
 
 ## Changelog
+
+### v1.0.2 (2026-03-03)
+
+- Include settings.yaml with default values in release (no longer requires manual creation)
+- Include 必看安裝說明.txt (installation guide in Traditional Chinese) in release
+- Release notes in Traditional Chinese
 
 ### v1.0.1 (2026-03-03)
 

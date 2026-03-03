@@ -7,16 +7,17 @@ Usage:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DIST_DIR = os.path.join("dist", "tai_backtest")
 ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 
 # Files and directories to EXCLUDE from the release zip
-EXCLUDE_FILES = {"settings.yaml"}
+EXCLUDE_FILES = set()  # settings.yaml is now included with default values
 EXCLUDE_DIRS = {"CapitalLog_Backtest", "_comtypes_cache", "__pycache__", "data", "live"}
 
 
@@ -38,6 +39,17 @@ def package():
     if not os.path.isdir(DIST_DIR):
         print(f"ERROR: {DIST_DIR} not found. Run build first.")
         sys.exit(1)
+
+    # Copy extra files into dist before zipping
+    project = os.path.dirname(os.path.abspath(__file__)) or "."
+    extras = {
+        os.path.join(project, "settings.example.yaml"): os.path.join(DIST_DIR, "settings.yaml"),
+        os.path.join(project, "必看安裝說明.txt"): os.path.join(DIST_DIR, "必看安裝說明.txt"),
+    }
+    for src, dst in extras.items():
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+            print(f"  Copied {os.path.basename(src)} -> {os.path.basename(dst)}")
 
     zip_path = os.path.join("dist", ZIP_NAME)
     included = 0
