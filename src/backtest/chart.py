@@ -172,9 +172,19 @@ def plot_backtest(
         if 0 <= xi < n_candles:
             pnl_str = f"{t.pnl:+,}"
             bars_held = t.exit_bar_index - t.entry_bar_index
-            color = '#00BCD4' if t.pnl >= 0 else '#E040FB'
-            _add_marker(chart, candle_times[xi], 'aboveBar', 'arrowDown',
-                        color, f"#{i+1} Exit ({t.exit_tag}) P&L:{pnl_str} [{bars_held}bars]")
+            if t.pnl >= 0:
+                color = '#00BCD4'  # cyan — profit
+            elif t.side == OrderSide.LONG:
+                color = '#E040FB'  # purple — long loss
+            else:
+                color = '#FF5252'  # red — short loss
+            # Short exits buy back (arrow up, below bar); long exits sell (arrow down, above bar)
+            if t.side == OrderSide.SHORT:
+                _add_marker(chart, candle_times[xi], 'belowBar', 'arrowUp',
+                            color, f"#{i+1} Exit ({t.exit_tag}) P&L:{pnl_str} [{bars_held}bars]")
+            else:
+                _add_marker(chart, candle_times[xi], 'aboveBar', 'arrowDown',
+                            color, f"#{i+1} Exit ({t.exit_tag}) P&L:{pnl_str} [{bars_held}bars]")
 
     # Flush all markers to JS in one call
     chart._update_markers()

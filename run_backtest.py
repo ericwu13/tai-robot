@@ -50,6 +50,17 @@ from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
 from src.backtest.chart import plot_backtest, _LWC_AVAILABLE
+
+# In frozen EXE, patch lightweight_charts INDEX to file:// URL.
+# This MUST run at module level (not inside __main__) so the multiprocessing
+# child process (where the webview actually runs) also gets the patch.
+# pywebview's HTTP server can silently fail in frozen EXEs; file:// bypasses it.
+if getattr(sys, 'frozen', False) and _LWC_AVAILABLE:
+    import lightweight_charts.abstract as _lwc_abs
+    _js_dir = os.path.join(bundle_root, 'lightweight_charts', 'js')
+    _lwc_abs.INDEX = 'file:///' + os.path.join(
+        _js_dir, 'index.html').replace('\\', '/')
+
 from src.strategy.examples.h4_bollinger_long import H4BollingerLongStrategy
 from src.strategy.examples.h4_bollinger_atr_long import H4BollingerAtrLongStrategy
 from src.strategy.examples.daily_bollinger_long import DailyBollingerLongStrategy
@@ -2348,13 +2359,4 @@ def main():
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-    # In frozen EXE, patch lightweight_charts INDEX to file:// URL.
-    # By default, pywebview starts a local HTTP server to serve the HTML.
-    # In frozen EXEs, this HTTP server can silently fail or have path issues.
-    # Using file:// bypasses the server entirely — WebView2 loads directly.
-    if getattr(sys, 'frozen', False) and _LWC_AVAILABLE:
-        import lightweight_charts.abstract as _lwc_abs
-        _js_dir = os.path.join(bundle_root, 'lightweight_charts', 'js')
-        _lwc_abs.INDEX = 'file:///' + os.path.join(
-            _js_dir, 'index.html').replace('\\', '/')
     main()
