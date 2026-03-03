@@ -49,7 +49,7 @@ from src.backtest.data_loader import parse_kline_strings, load_bars_from_csv
 from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
-from src.backtest.chart import plot_backtest, _LWC_AVAILABLE
+from src.backtest.chart import plot_backtest, LiveChart, _LWC_AVAILABLE
 
 # In frozen EXE, patch lightweight_charts INDEX to file:// URL.
 # This MUST run at module level (not inside __main__) so the multiprocessing
@@ -505,6 +505,7 @@ class BacktestApp:
         self._pending_api_fetch: bool = False  # triggers fetch after login completes
 
         # Live trading state
+        self._live_chart: LiveChart | None = None
         self._live_runner: LiveRunner | None = None
         self._live_poll_id = None  # root.after() id for cancellation
         self._live_warmup_mode: bool = False
@@ -1798,6 +1799,11 @@ class BacktestApp:
         return dict(bb_period=bb_period, bb_std=bb_std)
 
     def _show_chart(self):
+        # Live-updating chart when bot is running on native TF
+        if (self._live_runner and self._live_runner.state == LiveState.RUNNING
+                and self.chart_tf_var.get() == "Native"):
+            self._show_live_chart()
+            return
         bars, result, show_trades = self._get_chart_data()
         if not result or not bars:
             return
@@ -1816,6 +1822,11 @@ class BacktestApp:
         ).start()
 
     def _show_chart_all(self):
+        # Live-updating chart when bot is running on native TF
+        if (self._live_runner and self._live_runner.state == LiveState.RUNNING
+                and self.chart_tf_var.get() == "Native"):
+            self._show_live_chart()
+            return
         bars, result, show_trades = self._get_chart_data()
         if not result or not bars:
             return
@@ -1867,6 +1878,46 @@ class BacktestApp:
             _log(f"圖表錯誤 Chart error: {e}")
             import traceback
             _log(traceback.format_exc())
+
+    def _show_live_chart(self):
+        """Open a live-updating chart for the running bot."""
+        # Close existing live chart if still open
+        if self._live_chart and self._live_chart.is_alive:
+            self._live_chart.close()
+            self._live_chart = None
+
+        bars = self._live_runner.get_bars()
+        result = self._live_runner.get_result()
+        trades = list(result.trades)
+        strategy_name = self.strategy_var.get()
+        kwargs = self._chart_kwargs()
+
+        self._live_chart = LiveChart(
+            initial_bars=bars,
+            initial_trades=trades,
+            title=f"{strategy_name} [Live]",
+            bb_period=kwargs.get('bb_period', 20),
+            bb_std=kwargs.get('bb_std', 2.0),
+        )
+        _log(f"[LIVE CHART] Opening: {len(bars)} bars, {len(trades)} trades")
+        threading.Thread(
+            target=self._run_live_chart, daemon=True,
+        ).start()
+
+    def _run_live_chart(self):
+        """Run the live chart (blocking, in a daemon thread)."""
+        try:
+            self._live_chart.run()
+            _log("[LIVE CHART] Chart closed normally")
+        except Exception as e:
+            _log(f"[LIVE CHART] Error: {e}")
+            _log(traceback.format_exc())
+        finally:
+            self.root.after(0, self._on_live_chart_closed)
+
+    def _on_live_chart_closed(self):
+        """Cleanup when live chart window is closed."""
+        self._live_chart = None
 
     def _do_export(self):
         result = self._live_runner.get_result() if self._live_runner and self._live_runner.state != LiveState.IDLE else self._last_result
@@ -2246,6 +2297,15 @@ class BacktestApp:
                     "status",
                 )
 
+            # Push updates to live chart
+            if self._live_history_done and self._live_chart and self._live_chart.is_alive:
+                if agg_bar is not None:
+                    self._live_chart.push_bar(agg_bar)
+                else:
+                    partial = self._live_runner.get_partial_bar()
+                    if partial:
+                        self._live_chart.push_partial(partial)
+
             if agg_bar is not None and self._live_history_done:
                 self._live_log_msg(
                     f"聚合K棒 Aggregated bar: {agg_bar.dt.strftime('%H:%M')} "
@@ -2276,6 +2336,12 @@ class BacktestApp:
                f"tag={decision['tag']} price={decision['price']:,} "
                f"({decision['reason']})")
         self._live_log_msg(msg, tag)
+
+        # Push trade marker to live chart on trade close
+        if action == "TRADE_CLOSE" and self._live_chart and self._live_chart.is_alive:
+            if self._live_runner and self._live_runner.broker.trades:
+                trades = self._live_runner.broker.trades
+                self._live_chart.push_trade(trades[-1], len(trades) - 1)
 
     def _live_log_msg(self, msg, tag="status"):
         """Append message to the Live tab log."""
@@ -2330,6 +2396,11 @@ class BacktestApp:
         self._live_history_done = False
         self._live_tick_count = 0
         self._live_history_tick_count = 0
+
+        # Close live chart before stopping runner
+        if self._live_chart and self._live_chart.is_alive:
+            self._live_chart.close()
+        self._live_chart = None
 
         if self._live_runner:
             summary = self._live_runner.stop()

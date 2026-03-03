@@ -370,6 +370,10 @@ class LiveRunner:
             bars_processed=len(self._aggregated_bars),
         )
 
+    def get_partial_bar(self) -> Bar | None:
+        """Return a snapshot of the current in-progress aggregated bar."""
+        return self.aggregator.get_partial_bar()
+
     def get_bars(self) -> list[Bar]:
         """Return all aggregated bars (warmup + live)."""
         return list(self._aggregated_bars)
