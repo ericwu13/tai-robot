@@ -206,6 +206,7 @@ def _init_com():
         _com_available = True
     except Exception as e:
         print(f"COM not available: {e}")
+        traceback.print_exc()
         _com_available = False
 
 
@@ -471,8 +472,12 @@ class BacktestApp:
 
         self._build_ui()
         self._load_saved_strategies()
+        self._auto_load_chat()
 
         self.status_var.set("就緒 Ready")
+
+        # Auto-save chat on window close
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
         # Start draining COM UI events on the main thread
         self._drain_ui_queue()
@@ -563,6 +568,8 @@ class BacktestApp:
 
         ttk.Label(header, text="AI 策略工作台", font=("", 13, "bold")).pack(side=tk.LEFT)
         ttk.Button(header, text="New Chat", width=9, command=self._reset_chat).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(header, text="Load Chat", width=9, command=self._load_chat_session).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(header, text="Save Chat", width=9, command=self._save_chat_session).pack(side=tk.RIGHT, padx=2)
         ttk.Button(header, text="Settings", width=8, command=self._show_api_key_dialog).pack(side=tk.RIGHT, padx=2)
 
         # ── Chat display ──
@@ -733,11 +740,7 @@ class BacktestApp:
                                      command=self._do_export, state=tk.DISABLED)
         self.btn_export.pack(side=tk.LEFT, padx=4)
 
-        self.btn_chart = ttk.Button(btn_frame, text="顯示圖表 Show Chart",
-                                    command=self._show_chart, state=tk.DISABLED)
-        self.btn_chart.pack(side=tk.LEFT, padx=4)
-
-        self.btn_chart_all = ttk.Button(btn_frame, text="全圖 Full Chart",
+        self.btn_chart_all = ttk.Button(btn_frame, text="K線圖 K Chart",
                                         command=self._show_chart_all, state=tk.DISABLED)
         self.btn_chart_all.pack(side=tk.LEFT, padx=4)
 
@@ -887,6 +890,7 @@ class BacktestApp:
                 response = self._chat_client.send_message(text)
                 self.root.after(0, lambda: self._on_chat_response(response))
             except Exception as e:
+                _log(f"Chat error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 err_msg = str(e)
                 self.root.after(0, lambda: self._on_chat_error(err_msg))
 
@@ -968,6 +972,7 @@ class BacktestApp:
                 response = self._chat_client.send_message(gen_msg)
                 self.root.after(0, lambda: self._on_generate_response(response))
             except Exception as e:
+                _log(f"Generate error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 err_msg = str(e)
                 self.root.after(0, lambda: self._on_chat_error(err_msg))
 
@@ -1006,6 +1011,7 @@ class BacktestApp:
                 retries_left,
             )
         except Exception as e:
+            _log(f"Strategy load error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._generation_retry(
                 f"Unexpected error loading strategy:\n{e}\n\n"
                 "Please fix the code and output a corrected version.",
@@ -1032,6 +1038,7 @@ class BacktestApp:
                 resp = self._chat_client.send_message(retry_msg)
                 self.root.after(0, lambda: self._on_generate_response(resp, retries_left=remaining))
             except Exception as e:
+                _log(f"Retry error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 err_msg = str(e)
                 self.root.after(0, lambda: self._on_chat_error(err_msg))
 
@@ -1074,6 +1081,7 @@ class BacktestApp:
                 pine = export_to_pine(self._chat_client, source)
                 self.root.after(0, lambda: self._show_pine_popup(pine))
             except Exception as e:
+                _log(f"Pine export error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 self.root.after(0, lambda: self._on_pine_error(str(e)))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -1256,6 +1264,135 @@ class BacktestApp:
                           "New chat started. Describe your trading strategy idea.\n"
                           "Example: '寫一個RSI反轉策略' or 'Create a dual MA crossover strategy'")
 
+    def _save_chat_session(self):
+        """Save current chat conversation to a JSON file."""
+        if not self._chat_client or not self._chat_client.conversation:
+            messagebox.showinfo("Save Chat", "No conversation to save.")
+            return
+
+        chat_dir = os.path.join("data", "chats")
+        os.makedirs(chat_dir, exist_ok=True)
+
+        default_name = f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path = filedialog.asksaveasfilename(
+            initialdir=chat_dir,
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+            initialfile=default_name,
+        )
+        if not path:
+            return
+
+        import json
+        session = {
+            "conversation": self._chat_client.conversation,
+            "display_text": self.chat_display.get("1.0", tk.END).rstrip(),
+            "provider": self._settings.get("ai_provider", "anthropic"),
+            "model": self._chat_client.model if self._chat_client else "",
+            "saved_at": datetime.now().isoformat(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(session, f, indent=2, ensure_ascii=False)
+        self.status_var.set(f"Chat saved: {os.path.basename(path)}")
+        _log(f"Chat session saved to {path}")
+
+    def _load_chat_session(self):
+        """Load a saved chat conversation from a JSON file."""
+        chat_dir = os.path.join("data", "chats")
+        os.makedirs(chat_dir, exist_ok=True)
+
+        path = filedialog.askopenfilename(
+            initialdir=chat_dir,
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+
+        import json
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                session = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            messagebox.showerror("Load Chat", f"Failed to load: {e}")
+            return
+
+        # Ensure chat client exists with matching provider
+        saved_provider = session.get("provider", "anthropic")
+        if not self._chat_client or self._settings.get("ai_provider") != saved_provider:
+            if not self._ensure_chat_client():
+                return
+
+        # Restore conversation history
+        self._chat_client.conversation = session.get("conversation", [])
+
+        # Restore display text
+        display_text = session.get("display_text", "")
+        self.chat_display.config(state=tk.NORMAL)
+        self.chat_display.delete("1.0", tk.END)
+        if display_text:
+            self.chat_display.insert(tk.END, display_text)
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+
+        self.status_var.set(f"Chat loaded: {os.path.basename(path)}")
+        _log(f"Chat session loaded from {path}")
+
+    _AUTO_CHAT_PATH = os.path.join("data", "chats", "_last_session.json")
+
+    def _auto_save_chat(self):
+        """Auto-save current conversation for next startup."""
+        if not self._chat_client or not self._chat_client.conversation:
+            return
+        import json
+        os.makedirs(os.path.dirname(self._AUTO_CHAT_PATH), exist_ok=True)
+        session = {
+            "conversation": self._chat_client.conversation,
+            "display_text": self.chat_display.get("1.0", tk.END).rstrip(),
+            "provider": self._settings.get("ai_provider", "anthropic"),
+            "model": self._chat_client.model if self._chat_client else "",
+            "saved_at": datetime.now().isoformat(),
+        }
+        try:
+            with open(self._AUTO_CHAT_PATH, "w", encoding="utf-8") as f:
+                json.dump(session, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _auto_load_chat(self):
+        """Auto-load last conversation on startup."""
+        if not os.path.exists(self._AUTO_CHAT_PATH):
+            return
+        import json
+        try:
+            with open(self._AUTO_CHAT_PATH, "r", encoding="utf-8") as f:
+                session = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+
+        conversation = session.get("conversation", [])
+        display_text = session.get("display_text", "")
+        if not conversation:
+            return
+
+        # Initialize chat client if needed
+        if not self._ensure_chat_client():
+            return
+
+        self._chat_client.conversation = conversation
+
+        self.chat_display.config(state=tk.NORMAL)
+        self.chat_display.delete("1.0", tk.END)
+        if display_text:
+            self.chat_display.insert(tk.END, display_text)
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+        _log(f"Auto-loaded last chat session ({len(conversation)} messages)")
+
+    def _on_closing(self):
+        """Handle window close: auto-save chat, then destroy."""
+        self._auto_save_chat()
+        self.root.destroy()
+
     # ══════════════════════════════════════════════════════════════
     #  EXISTING BACKTEST METHODS (unchanged logic)
     # ══════════════════════════════════════════════════════════════
@@ -1282,8 +1419,17 @@ class BacktestApp:
             source = inspect.getsource(cls)
             filepath = inspect.getfile(cls)
         except (OSError, TypeError):
-            messagebox.showerror("錯誤", f"無法取得 {name} 的原始碼")
-            return
+            # AI-generated: try saved file first, then memory
+            saved = self._strategy_store.load_source(cls.__name__)
+            if saved:
+                source = saved
+                filepath = f"(saved: strategies/{cls.__name__})"
+            elif self._ai_strategy_source and cls is self._ai_strategy_cls:
+                source = self._ai_strategy_source
+                filepath = "(AI generated — unsaved)"
+            else:
+                messagebox.showerror("錯誤", f"無法取得 {name} 的原始碼")
+                return
         win = tk.Toplevel(self.root)
         win.title(f"原始碼 — {name}")
         win.geometry("800x600")
@@ -1373,7 +1519,7 @@ class BacktestApp:
             self.root.after(3000, self._check_connection)
 
         except Exception as e:
-            _log(f"初始化錯誤 Init error: {e}")
+            _log(f"初始化錯誤 Init error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self.status_var.set(f"錯誤 Error: {e}")
             self.login_status_var.set(f"錯誤 Error")
             self.btn_login.config(state=tk.NORMAL)
@@ -1396,7 +1542,7 @@ class BacktestApp:
             elif not self._quote_connected:
                 self.root.after(2000, self._check_connection)
         except Exception as e:
-            _log(f"連線檢查錯誤: {e}")
+            _log(f"連線檢查錯誤: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
 
     # ── Data fetch ──
 
@@ -1492,7 +1638,7 @@ class BacktestApp:
                     return
 
         except Exception as e:
-            _log(f"查詢錯誤 Fetch error: {e}")
+            _log(f"查詢錯誤 Fetch error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._enable_buttons()
 
     def _do_fetch_tv(self):
@@ -1566,16 +1712,50 @@ class BacktestApp:
 
         _log(f"TradingView下載 Fetching {symbol}@{exchange} interval={tv_interval_name} n_bars=5000")
 
+        _NET_ERRORS = (ConnectionError, OSError, TimeoutError)
         try:
-            tv = TvDatafeed()
-            df = tv.get_hist(symbol=symbol, exchange=exchange,
-                             interval=tv_interval, n_bars=5000)
-            if df is None or df.empty:
-                _log("TradingView無資料 No data from TradingView")
-                self.status_var.set("TradingView無資料 No data")
+            import websocket
+            _NET_ERRORS = (ConnectionError, OSError, TimeoutError,
+                           websocket.WebSocketException)
+        except ImportError:
+            pass
+
+        max_retries = 3
+        df = None
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                tv = TvDatafeed()
+                df = tv.get_hist(symbol=symbol, exchange=exchange,
+                                 interval=tv_interval, n_bars=5000)
+                if df is not None and not df.empty:
+                    break
+                _log(f"TradingView第{attempt}次無資料 Attempt {attempt}/{max_retries}: no data")
+            except _NET_ERRORS as e:
+                last_err = e
+                _log(f"TradingView第{attempt}次連線失敗 Attempt {attempt}/{max_retries} "
+                     f"network error: [{type(e).__name__}] {e}")
+                if attempt < max_retries:
+                    import time
+                    time.sleep(2)
+            except Exception as e:
+                _log(f"TradingView錯誤 TV error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+                self.status_var.set(f"TradingView錯誤: {e}")
                 self._enable_buttons()
                 return
 
+        if df is None or df.empty:
+            if last_err:
+                _log(f"TradingView連線失敗（已重試{max_retries}次）Network error after "
+                     f"{max_retries} retries. 請確認網路連線 Please check internet connection.")
+                self.status_var.set("TradingView連線失敗 Connection failed (請確認網路)")
+            else:
+                _log("TradingView無資料 No data from TradingView")
+                self.status_var.set("TradingView無資料 No data")
+            self._enable_buttons()
+            return
+
+        try:
             bars = []
             for dt_idx, row in df.iterrows():
                 bars.append(Bar(
@@ -1591,7 +1771,7 @@ class BacktestApp:
             self._execute_backtest(bars)
 
         except Exception as e:
-            _log(f"TradingView錯誤 TV error: {e}")
+            _log(f"TradingView錯誤 TV error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self.status_var.set(f"TradingView錯誤: {e}")
             self._enable_buttons()
 
@@ -1759,7 +1939,6 @@ class BacktestApp:
         self._enable_buttons()
         self.btn_export.config(state=tk.NORMAL)
         if _LWC_AVAILABLE and result.trades:
-            self.btn_chart.config(state=tk.NORMAL)
             self.btn_chart_all.config(state=tk.NORMAL)
         self.status_var.set(
             f"完成 Done: {result.metrics.total_trades} trades, "
@@ -1834,29 +2013,6 @@ class BacktestApp:
             bb_period, bb_std = 20, 2.0
         return dict(bb_period=bb_period, bb_std=bb_std)
 
-    def _show_chart(self):
-        # Live-updating chart when bot is running on native TF
-        if (self._live_runner and self._live_runner.state == LiveState.RUNNING
-                and self.chart_tf_var.get() == "Native"):
-            self._show_live_chart()
-            return
-        bars, result, show_trades = self._get_chart_data()
-        if not result or not bars:
-            return
-        strategy_name = self.strategy_var.get()
-        trades = list(result.trades) if show_trades else []
-        focus = self._get_selected_trade_index() if show_trades else None
-        if show_trades and focus is None:
-            focus = 0
-        # Append timeframe label in live mode
-        if self._live_runner and self._live_runner.state in (LiveState.RUNNING, LiveState.STOPPED):
-            strategy_name = f"{strategy_name} [{self.chart_tf_var.get()}]"
-        kwargs = self._chart_kwargs()
-        threading.Thread(
-            target=self._run_chart, daemon=True,
-            args=(list(bars), trades, strategy_name, focus, kwargs),
-        ).start()
-
     def _show_chart_all(self):
         # Live-updating chart when bot is running on native TF
         if (self._live_runner and self._live_runner.state == LiveState.RUNNING
@@ -1908,12 +2064,10 @@ class BacktestApp:
             _log("[CHART] Chart closed normally")
         except ImportError as e:
             self.root.after(0, lambda: self.status_var.set(str(e)))
-            _log(f"圖表錯誤 Chart error: {e}")
+            _log(f"圖表錯誤 Chart error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f"圖表錯誤 Chart error: {e}"))
-            _log(f"圖表錯誤 Chart error: {e}")
-            import traceback
-            _log(traceback.format_exc())
+            _log(f"圖表錯誤 Chart error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
 
     def _show_live_chart(self):
         """Open a live-updating chart for the running bot."""
@@ -2107,7 +2261,7 @@ class BacktestApp:
                 self._live_warmup_mode = False
                 self._stop_live()
         except Exception as e:
-            _log(f"暖機錯誤 Warmup error: {e}")
+            _log(f"暖機錯誤 Warmup error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._live_warmup_mode = False
             self._stop_live()
 
@@ -2129,11 +2283,39 @@ class BacktestApp:
         def _worker():
             try:
                 tv_interval = getattr(TvInterval, tv_interval_name)
-                tv = TvDatafeed()
-                df = tv.get_hist(symbol=tv_symbol, exchange="TAIFEX",
-                                 interval=tv_interval, n_bars=5000)
+
+                _net_errors = (ConnectionError, OSError, TimeoutError)
+                try:
+                    import websocket
+                    _net_errors = (ConnectionError, OSError, TimeoutError,
+                                   websocket.WebSocketException)
+                except ImportError:
+                    pass
+
+                df = None
+                max_retries = 3
+                last_err = None
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        tv = TvDatafeed()
+                        df = tv.get_hist(symbol=tv_symbol, exchange="TAIFEX",
+                                         interval=tv_interval, n_bars=5000)
+                        if df is not None and not df.empty:
+                            break
+                    except _net_errors as e:
+                        last_err = e
+                        _log(f"TV暖機第{attempt}次連線失敗 TV warmup attempt {attempt}/{max_retries} "
+                             f"network error: [{type(e).__name__}] {e}")
+                        if attempt < max_retries:
+                            import time
+                            time.sleep(2)
+
                 if df is None or df.empty:
-                    self.root.after(0, lambda: self._live_log_msg("TV無資料 No TV data", "status"))
+                    if last_err:
+                        msg = f"TV連線失敗 Connection failed: {last_err}"
+                    else:
+                        msg = "TV無資料 No TV data"
+                    self.root.after(0, lambda m=msg: self._live_log_msg(m, "status"))
                     self.root.after(0, self._stop_live)
                     return
 
@@ -2155,6 +2337,7 @@ class BacktestApp:
 
                 self.root.after(0, _finish)
             except Exception as e:
+                _log(f"TV暖機錯誤: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 self.root.after(0, lambda: self._live_log_msg(f"TV暖機錯誤: {e}", "status"))
                 self.root.after(0, self._stop_live)
 
@@ -2211,7 +2394,7 @@ class BacktestApp:
             self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
             _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
         except Exception as e:
-            _log(f"報價訂閱錯誤 Tick subscribe error: {e}")
+            _log(f"報價訂閱錯誤 Tick subscribe error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._live_log_msg(f"訂閱錯誤 Subscribe error: {e}", "status")
             self._stop_live()
 
@@ -2410,7 +2593,6 @@ class BacktestApp:
 
         # Enable chart/export buttons
         if _LWC_AVAILABLE and bars:
-            self.btn_chart.config(state=tk.NORMAL)
             self.btn_chart_all.config(state=tk.NORMAL)
         if result.trades:
             self.btn_export.config(state=tk.NORMAL)

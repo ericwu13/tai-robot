@@ -36,7 +36,10 @@ a = Analysis(
         'comtypes', 'comtypes.client', 'comtypes.stream',
         'comtypes.client._code_cache', 'comtypes.client._generate',
         # TradingView data feed (optional)
-        'tvDatafeed',
+        'tvDatafeed', 'websocket', 'websocket._abnf', 'websocket._core',
+        'websocket._exceptions', 'websocket._http', 'websocket._logging',
+        'websocket._socket', 'websocket._ssl_compat', 'websocket._url',
+        'websocket._utils',
         # AI modules
         'src.ai', 'src.ai.chat_client', 'src.ai.prompts',
         'src.ai.code_sandbox', 'src.ai.strategy_store', 'src.ai.pine_exporter',
