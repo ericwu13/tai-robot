@@ -149,6 +149,17 @@ PyInstaller's bootloader calls `SetDllDirectoryW(_MEIPASS)`, which overrides the
 
 ## Changelog
 
+### v1.0.4 (2026-03-04)
+
+- 重構 AI 提示詞為可組合模組，加入 few-shot 語氣範例
+- 新增程式碼生成專用 persona，輸出結構化結果（程式碼 + Notes 說明）
+- 修復 Pine Script 匯出：`ta.bb()` / `ta.macd()` 解構語法（`[a,b,c]=` 而非 `(a,b,c)=`）
+- 新增 Pine Script 常見錯誤提示，防止 TradingView 語法錯誤
+
+### v1.0.3 (2026-03-04)
+
+- 新增聊天記錄持久化，修復 AI 策略原始碼檢視器
+
 ### v1.0.2 (2026-03-03)
 
 - Include settings.yaml with default values in release (no longer requires manual creation)
