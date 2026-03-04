@@ -317,6 +317,11 @@ _app = None
 # from those threads crashes the GIL in Python 3.13. We put raw tick tuples into
 # this queue and drain them on the main thread via root.after().
 _tick_queue: queue.Queue = queue.Queue()
+# Thread-safe queue for COM connection/UI events → main thread.
+# OnConnection fires on a true COM background thread (unlike KLine callbacks
+# which fire synchronously on the main thread). Neither Tkinter calls NOR
+# root.after() are safe from COM threads — only queue.put_nowait() is safe.
+_ui_queue: queue.Queue = queue.Queue()
 
 
 def should_reuse_bars(
@@ -359,22 +364,14 @@ class SKQuoteLibEvents:
     def OnConnection(self, nKind, nCode):
         kind_names = {3001: "Reply", 3002: "Quote", 3003: "Ready",
                       3021: "ConnError", 3033: "Abnormal"}
-        _log(f"報價連線 QUOTE CONN: {kind_names.get(nKind, nKind)} code={nCode}")
-        if _app:
-            if nKind == 3003 and nCode == 0:
-                _app._quote_connected = True
-                _app.btn_api.config(state=tk.NORMAL)
-                _app.btn_deploy.config(state=tk.NORMAL)
-                _app.btn_login.config(state=tk.DISABLED)
-                _app.status_var.set("已連線 Connected - Ready")
-                _app.login_status_var.set("已連線 Connected")
-            elif nKind == 3002 and nCode == 0 and not _app._quote_connected:
-                _app._quote_connected = True
-                _app.btn_api.config(state=tk.NORMAL)
-                _app.btn_deploy.config(state=tk.NORMAL)
-                _app.btn_login.config(state=tk.DISABLED)
-                _app.status_var.set("已連線 Connected (Quote) - Ready")
-                _app.login_status_var.set("已連線 Connected")
+        # Only queue.put_nowait() is safe from COM background threads.
+        # root.after() is NOT safe — it calls into Tcl/Tk C code which
+        # is not thread-safe and corrupts the GIL in Python 3.13.
+        _ui_queue.put_nowait(("log", f"報價連線 QUOTE CONN: {kind_names.get(nKind, nKind)} code={nCode}"))
+        if nKind == 3003 and nCode == 0:
+            _ui_queue.put_nowait(("conn", "ready"))
+        elif nKind == 3002 and nCode == 0:
+            _ui_queue.put_nowait(("conn", "quote"))
 
     def OnNotifyKLineData(self, bstrStockNo, bstrData):
         if not _app:
@@ -432,11 +429,11 @@ class SKQuoteLibEvents:
 
 class SKReplyLibEvent:
     def OnReplyMessage(self, bstrUserID, bstrMessage):
-        _log(f"回報 REPLY: {bstrMessage}")
+        _ui_queue.put_nowait(("log", f"回報 REPLY: {bstrMessage}"))
         return -1
 
     def OnConnect(self, bstrUserID, nErrorCode):
-        _log(f"回報連線 REPLY CONN: code={nErrorCode}")
+        _ui_queue.put_nowait(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
 
     def OnComplete(self, bstrUserID):
         pass
@@ -476,6 +473,45 @@ class BacktestApp:
         self._load_saved_strategies()
 
         self.status_var.set("就緒 Ready")
+
+        # Start draining COM UI events on the main thread
+        self._drain_ui_queue()
+
+    # ══════════════════════════════════════════════════════════════
+    #  COM → UI QUEUE DRAIN (main thread)
+    # ══════════════════════════════════════════════════════════════
+
+    def _drain_ui_queue(self):
+        """Drain COM connection/UI events on the main thread.
+
+        COM callbacks (OnConnection, OnReplyMessage, etc.) fire on background
+        threads. Neither Tkinter calls NOR root.after() are safe from those
+        threads. The only safe primitive is queue.put_nowait(). This method
+        runs on the main thread via root.after() and processes queued events.
+        """
+        try:
+            while True:
+                kind, data = _ui_queue.get_nowait()
+                if kind == "log":
+                    _log(data)
+                elif kind == "conn":
+                    if data == "ready":
+                        self._quote_connected = True
+                        self.btn_api.config(state=tk.NORMAL)
+                        self.btn_deploy.config(state=tk.NORMAL)
+                        self.btn_login.config(state=tk.DISABLED)
+                        self.status_var.set("已連線 Connected - Ready")
+                        self.login_status_var.set("已連線 Connected")
+                    elif data == "quote" and not self._quote_connected:
+                        self._quote_connected = True
+                        self.btn_api.config(state=tk.NORMAL)
+                        self.btn_deploy.config(state=tk.NORMAL)
+                        self.btn_login.config(state=tk.DISABLED)
+                        self.status_var.set("已連線 Connected (Quote) - Ready")
+                        self.login_status_var.set("已連線 Connected")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._drain_ui_queue)
 
     # ══════════════════════════════════════════════════════════════
     #  UI BUILD
