@@ -55,3 +55,10 @@
 問題：圖表空白
 原因：未安裝 WebView2 Runtime
 解法：下載安裝 https://go.microsoft.com/fwlink/p/?LinkId=2124703
+
+問題：開圖表時出現 Python.Runtime.dll 錯誤
+原因：.NET Framework 4.8 未安裝或未啟用
+解法：
+  1. 開啟「設定」→「應用程式」→「選用功能」→「更多 Windows 功能」
+  2. 勾選「.NET Framework 3.5」和「.NET Framework 4.8 Advanced Services」
+  3. 或下載安裝 https://dotnet.microsoft.com/download/dotnet-framework/net48

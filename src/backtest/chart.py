@@ -16,9 +16,30 @@ try:
 except ImportError:
     _LWC_AVAILABLE = False
 
+import sys
+
 # Bars of context to show before entry / after exit when zooming to a trade
 _PAD_BEFORE = 20
 _PAD_AFTER = 10
+
+
+def _check_dotnet() -> None:
+    """Verify pythonnet / .NET Framework is available (required by pywebview on Windows).
+
+    Called before opening a chart so we can raise a clear error instead of
+    silently crashing in the multiprocessing child process.
+    """
+    if sys.platform != 'win32' or not _LWC_AVAILABLE:
+        return
+    try:
+        import clr  # noqa: F401
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Chart requires .NET Framework 4.8.\n"
+            "Please enable it in Windows Settings → Apps → Optional features "
+            "→ More Windows features → '.NET Framework 4.8 Advanced Services',\n"
+            "or download from https://dotnet.microsoft.com/download/dotnet-framework/net48"
+        ) from exc
 
 
 def _compute_bollinger(
@@ -86,6 +107,8 @@ def plot_backtest(
             "lightweight-charts and pandas are required for charting. "
             "Install with: pip install lightweight-charts pandas"
         )
+
+    _check_dotnet()
 
     if not bars:
         return
@@ -287,6 +310,7 @@ class LiveChart:
         """Create chart, render initial data, start feeder, show chart (blocking)."""
         if not _LWC_AVAILABLE:
             return
+        _check_dotnet()
         if not self._initial_bars:
             return
 
