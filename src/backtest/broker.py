@@ -244,3 +244,54 @@ class SimulatedBroker:
         """Record equity point for bars without trades."""
         if len(self.equity_curve) == 0 or self.equity_curve[-1] != self._cumulative_pnl:
             pass  # equity only changes on trade close
+
+    def to_dict(self) -> dict:
+        """Serialize broker state for session persistence."""
+        return {
+            "point_value": self.point_value,
+            "position_size": self.position_size,
+            "position_side": self.position_side.value if self.position_side else None,
+            "entry_price": self.entry_price,
+            "entry_tag": self.entry_tag,
+            "entry_bar_index": self.entry_bar_index,
+            "trades": [
+                {
+                    "tag": t.tag, "side": t.side.value, "qty": t.qty,
+                    "entry_price": t.entry_price, "exit_price": t.exit_price,
+                    "entry_bar_index": t.entry_bar_index,
+                    "exit_bar_index": t.exit_bar_index,
+                    "pnl": t.pnl, "exit_tag": t.exit_tag,
+                }
+                for t in self.trades
+            ],
+            "equity_curve": list(self.equity_curve),
+            "_cumulative_pnl": self._cumulative_pnl,
+            "_bar_index": self._bar_index,
+            "_exit_bar_index": self._exit_bar_index,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SimulatedBroker":
+        """Restore broker state from a serialized dict."""
+        broker = cls(point_value=data.get("point_value", 1))
+        broker.position_size = data.get("position_size", 0)
+        side = data.get("position_side")
+        broker.position_side = OrderSide(side) if side else None
+        broker.entry_price = data.get("entry_price", 0)
+        broker.entry_tag = data.get("entry_tag", "")
+        broker.entry_bar_index = data.get("entry_bar_index", 0)
+        broker.trades = [
+            Trade(
+                tag=t["tag"], side=OrderSide(t["side"]), qty=t["qty"],
+                entry_price=t["entry_price"], exit_price=t["exit_price"],
+                entry_bar_index=t["entry_bar_index"],
+                exit_bar_index=t["exit_bar_index"],
+                pnl=t["pnl"], exit_tag=t.get("exit_tag", ""),
+            )
+            for t in data.get("trades", [])
+        ]
+        broker.equity_curve = list(data.get("equity_curve", []))
+        broker._cumulative_pnl = data.get("_cumulative_pnl", 0)
+        broker._bar_index = data.get("_bar_index", 0)
+        broker._exit_bar_index = data.get("_exit_bar_index", -1)
+        return broker

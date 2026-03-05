@@ -15,6 +15,7 @@ import sys
 import inspect
 import queue
 import threading
+import time
 import traceback
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
@@ -70,7 +71,7 @@ from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
 
 # AI modules
 from src.ai.chat_client import ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS
-from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT
+from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT, CHAT_RECAP_PROMPT
 from src.ai.code_sandbox import (
     extract_python_code, load_strategy_from_source,
     CodeValidationError, CodeExecutionError,
@@ -80,6 +81,7 @@ from src.ai.pine_exporter import export_to_pine
 
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, _taipei_now
+from src.live.session_store import load_session, session_summary
 
 # TradingView data feed (optional, for longer history)
 try:
@@ -373,6 +375,8 @@ class SKQuoteLibEvents:
             _ui_queue.put_nowait(("conn", "ready"))
         elif nKind == 3002 and nCode == 0:
             _ui_queue.put_nowait(("conn", "quote"))
+        elif nKind in (3021, 3033):
+            _ui_queue.put_nowait(("conn", "disconnected"))
 
     def OnNotifyKLineData(self, bstrStockNo, bstrData):
         if not _app:
@@ -450,8 +454,8 @@ class BacktestApp:
 
         self.root = root
         self.root.title("tai-robot AI 策略工作台 AI Strategy Workbench")
-        self.root.geometry("1500x900")
-        self.root.minsize(1200, 700)
+        self.root.geometry("1400x850")
+        self.root.minsize(1100, 650)
 
         self._settings = _load_settings()
         self.kline_data: list[str] = []
@@ -472,7 +476,7 @@ class BacktestApp:
 
         self._build_ui()
         self._load_saved_strategies()
-        self._auto_load_chat()
+        # Chat auto-load removed — user must explicitly use "Load Chat"
 
         self.status_var.set("就緒 Ready")
 
@@ -505,18 +509,181 @@ class BacktestApp:
                         self.btn_api.config(state=tk.NORMAL)
                         self.btn_deploy.config(state=tk.NORMAL)
                         self.btn_login.config(state=tk.DISABLED)
+                        self.btn_reconnect.config(state=tk.NORMAL)
                         self.status_var.set("已連線 Connected - Ready")
                         self.login_status_var.set("已連線 Connected")
+                        self._on_reconnected()
                     elif data == "quote" and not self._quote_connected:
                         self._quote_connected = True
                         self.btn_api.config(state=tk.NORMAL)
                         self.btn_deploy.config(state=tk.NORMAL)
                         self.btn_login.config(state=tk.DISABLED)
+                        self.btn_reconnect.config(state=tk.NORMAL)
                         self.status_var.set("已連線 Connected (Quote) - Ready")
                         self.login_status_var.set("已連線 Connected")
+                        self._on_reconnected()
+                    elif data == "disconnected":
+                        self._on_disconnected()
         except queue.Empty:
             pass
         self.root.after(100, self._drain_ui_queue)
+
+    # ══════════════════════════════════════════════════════════════
+    #  CONNECTION MONITORING & RECONNECTION
+    # ══════════════════════════════════════════════════════════════
+
+    _RECONNECT_DELAYS = [5, 10, 20, 30, 60]  # seconds, escalating backoff
+    _MAX_RECONNECT_ATTEMPTS = 10
+
+    def _on_disconnected(self):
+        """Handle connection loss: pause live feed, start auto-reconnect."""
+        if not self._quote_connected:
+            return  # already handling disconnect
+        self._quote_connected = False
+        self.status_var.set("斷線 Disconnected")
+        self.login_status_var.set("斷線 Disconnected")
+        self.btn_login.config(state=tk.NORMAL)
+        self.btn_reconnect.config(state=tk.NORMAL)
+        _log("斷線 Connection lost")
+
+        # Pause live tick feed (keep runner state intact)
+        if self._live_runner and self._live_tick_active:
+            self._live_tick_active = False
+            self._live_log_msg("斷線 Connection lost — pausing tick feed", "status")
+
+        # Start auto-reconnect
+        self._reconnect_attempt = 0
+        self._schedule_reconnect()
+
+    def _manual_reconnect(self):
+        """Manual reconnect triggered by user button click."""
+        # Cancel any pending auto-reconnect timer
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
+
+        self._quote_connected = False
+        self.btn_reconnect.config(state=tk.DISABLED)
+        self.status_var.set("手動重連中 Manual reconnecting...")
+        self.login_status_var.set("重連中 Reconnecting...")
+        _log("手動重連 Manual reconnect triggered")
+
+        # Reset attempt counter and try immediately
+        self._reconnect_attempt = 0
+        self._attempt_reconnect()
+
+    def _schedule_reconnect(self):
+        """Schedule the next reconnection attempt with exponential backoff."""
+        if self._reconnect_attempt >= self._MAX_RECONNECT_ATTEMPTS:
+            msg = "自動重連失敗 Auto-reconnect failed — use Reconnect or Login button"
+            self.btn_reconnect.config(state=tk.NORMAL)
+            self.status_var.set(msg)
+            _log(msg)
+            if self._live_runner:
+                self._live_log_msg(msg, "status")
+            return
+
+        idx = min(self._reconnect_attempt, len(self._RECONNECT_DELAYS) - 1)
+        delay = self._RECONNECT_DELAYS[idx]
+        self._reconnect_attempt += 1
+
+        msg = f"重連中 Reconnecting in {delay}s (attempt {self._reconnect_attempt}/{self._MAX_RECONNECT_ATTEMPTS})..."
+        self.status_var.set(msg)
+        _log(msg)
+        if self._live_runner:
+            self._live_log_msg(msg, "status")
+
+        self._reconnect_timer_id = self.root.after(delay * 1000, self._attempt_reconnect)
+
+    def _attempt_reconnect(self):
+        """Try to re-login and reconnect to quote service."""
+        self._reconnect_timer_id = None
+        if self._quote_connected:
+            return  # already reconnected (e.g. by manual login)
+
+        _log(f"嘗試重連 Attempting reconnect #{self._reconnect_attempt}")
+
+        try:
+            if not _com_available:
+                self._schedule_reconnect()
+                return
+
+            # Re-login
+            user_id = self.login_user_var.get().strip()
+            password = self.login_pass_var.get().strip()
+            if not user_id or not password:
+                _log("重連失敗 Reconnect failed: no credentials")
+                self._schedule_reconnect()
+                return
+
+            code = skC.SKCenterLib_LoginSetQuote(user_id, password, "Y")
+            if code != 0 and code < 2000:
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                _log(f"重連登入失敗 Reconnect login failed: {msg}")
+                self._schedule_reconnect()
+                return
+
+            self._logged_in = True
+            skR.SKReplyLib_ConnectByID(user_id)
+            skQ.SKQuoteLib_EnterMonitorLONG()
+
+            # Poll for connection (OnConnection callback will set _quote_connected)
+            self.root.after(3000, self._check_reconnection)
+
+        except Exception as e:
+            _log(f"重連異常 Reconnect error: {e}")
+            self._schedule_reconnect()
+
+    def _check_reconnection(self):
+        """Poll IsConnected after reconnect login attempt."""
+        if self._quote_connected:
+            return  # success, handled by _on_reconnected
+        try:
+            ic = skQ.SKQuoteLib_IsConnected()
+            if ic == 1:
+                self._quote_connected = True
+                self._on_reconnected()
+                return
+        except Exception:
+            pass
+        # Not connected yet — schedule next reconnect attempt
+        self._schedule_reconnect()
+
+    def _on_reconnected(self):
+        """Handle successful reconnection: re-subscribe ticks if live bot is running."""
+        self._reconnect_attempt = 0
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
+
+        if self._live_runner and self._live_runner.state == LiveState.RUNNING:
+            self._live_log_msg("已重連 Reconnected — resubscribing ticks", "status")
+            _log("已重連 Reconnected — resubscribing ticks for live bot")
+            self._resubscribe_ticks()
+
+    def _resubscribe_ticks(self):
+        """Re-subscribe to tick feed after reconnection."""
+        if not self._live_runner:
+            return
+        symbol = self.symbol_var.get().strip()
+        cfg = _SYMBOL_CONFIG.get(symbol)
+        com_symbol = cfg["prefix"] + "00" if cfg else symbol
+
+        try:
+            result = skQ.SKQuoteLib_RequestTicks(0, com_symbol)
+            code = result[0] if isinstance(result, (list, tuple)) else result
+            if code != 0 and code >= 3000:
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
+                return
+
+            self._live_tick_active = True
+            self._last_tick_time = time.time()
+            self._live_log_msg(f"已重新訂閱 Tick resubscription active for {com_symbol}", "status")
+            # Restart tick drain if not already running
+            self._drain_tick_queue()
+        except Exception as e:
+            self._live_log_msg(f"重新訂閱異常 Resubscribe error: {e}", "status")
 
     # ══════════════════════════════════════════════════════════════
     #  UI BUILD
@@ -548,6 +715,10 @@ class BacktestApp:
         # Live trading state
         self._live_chart: LiveChart | None = None
         self._live_runner: LiveRunner | None = None
+        # Reconnection state
+        self._reconnect_attempt: int = 0
+        self._reconnect_timer_id = None
+        self._last_tick_time: float = 0.0  # time.time() of last tick
         self._live_poll_id = None  # root.after() id for cancellation
         self._live_warmup_mode: bool = False
         self._live_warmup_data: list[str] = []
@@ -636,129 +807,151 @@ class BacktestApp:
                    command=self._delete_saved_strategy).pack(side=tk.LEFT, padx=2)
 
     def _build_control_panel(self, parent):
-        ctrl = ttk.LabelFrame(parent, text="回測設定 Backtest Settings", padding=8)
+        ctrl = ttk.Frame(parent)
         ctrl.pack(fill=tk.X, padx=4, pady=(4, 2))
 
-        # Row 0: Symbol + KLine type
-        ttk.Label(ctrl, text="商品 Symbol:").grid(row=0, column=0, sticky=tk.W, padx=4)
+        # ── Row 1: Symbol + Strategy ──
+        row1 = ttk.Frame(ctrl)
+        row1.pack(fill=tk.X, pady=(0, 1))
+
+        ttk.Label(row1, text="商品 Symbol:").grid(row=0, column=0, sticky=tk.W, padx=(4, 2))
         self.symbol_var = tk.StringVar(value="TX00")
-        self.symbol_combo = ttk.Combobox(ctrl, textvariable=self.symbol_var, width=8,
+        self.symbol_combo = ttk.Combobox(row1, textvariable=self.symbol_var, width=8,
                                           state="readonly", values=list(_SYMBOL_CONFIG.keys()))
-        self.symbol_combo.grid(row=0, column=1, padx=4)
+        self.symbol_combo.grid(row=0, column=1, padx=(0, 8))
         self.symbol_combo.bind("<<ComboboxSelected>>", lambda e: self._on_symbol_changed())
 
-        ttk.Label(ctrl, text="策略 Strategy:").grid(row=0, column=2, sticky=tk.W, padx=4)
+        ttk.Label(row1, text="策略 Strategy:").grid(row=0, column=2, sticky=tk.W, padx=(0, 2))
         self.strategy_var = tk.StringVar(value=list(STRATEGIES.keys())[0])
-        self.strategy_combo = ttk.Combobox(ctrl, textvariable=self.strategy_var, width=30,
+        self.strategy_combo = ttk.Combobox(row1, textvariable=self.strategy_var, width=28,
                                             state="readonly", values=list(STRATEGIES.keys()))
-        self.strategy_combo.grid(row=0, column=3, padx=4)
-        ttk.Button(ctrl, text="原始碼", width=6, command=self._show_strategy_source).grid(row=0, column=4, padx=2)
+        self.strategy_combo.grid(row=0, column=3, padx=(0, 4))
+        self.strategy_var.trace_add("write", self._on_strategy_changed)
+        ttk.Button(row1, text="原始碼 Source", command=self._show_strategy_source).grid(row=0, column=4, padx=2)
 
-        ttk.Label(ctrl, text="初始資金 Balance:").grid(row=0, column=5, sticky=tk.W, padx=4)
-        self.balance_var = tk.StringVar(value="1000000")
-        ttk.Entry(ctrl, textvariable=self.balance_var, width=12).grid(row=0, column=6, padx=4)
+        # ── Row 2: Login ──
+        row2 = ttk.Frame(ctrl)
+        row2.pack(fill=tk.X, pady=(1, 2))
 
-        ttk.Label(ctrl, text="每點價值 Pt Value:").grid(row=0, column=7, sticky=tk.W, padx=4)
-        self.pv_var = tk.StringVar(value="200")
-        ttk.Entry(ctrl, textvariable=self.pv_var, width=6).grid(row=0, column=8, padx=4)
-
-        # Row 1: Date range + quick period buttons
-        ttk.Label(ctrl, text="起始 Start:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=4)
-        default_start = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
-        self.start_var = tk.StringVar(value=default_start)
-        ttk.Entry(ctrl, textvariable=self.start_var, width=10).grid(row=1, column=1, padx=4)
-
-        ttk.Label(ctrl, text="結束 End:").grid(row=1, column=2, sticky=tk.W, padx=4)
-        self.end_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
-        ttk.Entry(ctrl, textvariable=self.end_var, width=10).grid(row=1, column=3, padx=4)
-
-        period_frame = ttk.Frame(ctrl)
-        period_frame.grid(row=1, column=4, columnspan=4, padx=4, sticky=tk.W)
-        for label, days in [("3月", 90), ("6月", 180), ("1年", 365), ("2年", 730), ("4年", 1461)]:
-            ttk.Button(period_frame, text=label, width=4,
-                       command=lambda d=days: self._set_period(d)).pack(side=tk.LEFT, padx=2)
-
-        # Row 2: Strategy params
-        ttk.Label(ctrl, text="BB週期:").grid(row=2, column=0, sticky=tk.W, padx=4, pady=4)
-        self.bb_period_var = tk.StringVar(value="20")
-        ttk.Entry(ctrl, textvariable=self.bb_period_var, width=6).grid(row=2, column=1, padx=4, sticky=tk.W)
-
-        ttk.Label(ctrl, text="BB Std:").grid(row=2, column=2, sticky=tk.W, padx=4)
-        self.bb_std_var = tk.StringVar(value="2.0")
-        ttk.Entry(ctrl, textvariable=self.bb_std_var, width=6).grid(row=2, column=3, padx=4, sticky=tk.W)
-
-        ttk.Label(ctrl, text="SL Offset:").grid(row=2, column=4, sticky=tk.W, padx=4)
-        self.sl_offset_var = tk.StringVar(value="20")
-        ttk.Entry(ctrl, textvariable=self.sl_offset_var, width=6).grid(row=2, column=5, padx=4, sticky=tk.W)
-
-        ttk.Label(ctrl, text="TP Offset:").grid(row=2, column=6, sticky=tk.W, padx=4)
-        self.tp_offset_var = tk.StringVar(value="50")
-        ttk.Entry(ctrl, textvariable=self.tp_offset_var, width=6).grid(row=2, column=7, padx=4, sticky=tk.W)
-
-        # Row 3: ATR strategy params
-        ttk.Label(ctrl, text="ATR期數:").grid(row=3, column=0, sticky=tk.W, padx=4, pady=4)
-        self.atr_period_var = tk.StringVar(value="14")
-        ttk.Entry(ctrl, textvariable=self.atr_period_var, width=6).grid(row=3, column=1, padx=4, sticky=tk.W)
-
-        ttk.Label(ctrl, text="SL×ATR:").grid(row=3, column=2, sticky=tk.W, padx=4)
-        self.sl_mult_var = tk.StringVar(value="1.0")
-        ttk.Entry(ctrl, textvariable=self.sl_mult_var, width=6).grid(row=3, column=3, padx=4, sticky=tk.W)
-
-        ttk.Label(ctrl, text="TP×ATR:").grid(row=3, column=4, sticky=tk.W, padx=4)
-        self.tp_mult_var = tk.StringVar(value="0.5")
-        ttk.Entry(ctrl, textvariable=self.tp_mult_var, width=6).grid(row=3, column=5, padx=4, sticky=tk.W)
-
-        # Row 4: Login
-        ttk.Label(ctrl, text="帳號 User ID:").grid(row=4, column=0, sticky=tk.W, padx=4, pady=4)
+        ttk.Label(row2, text="帳號 User ID:").grid(row=0, column=0, sticky=tk.W, padx=(4, 2))
         self.login_user_var = tk.StringVar(value=self._settings.get("user_id", ""))
-        ttk.Entry(ctrl, textvariable=self.login_user_var, width=14).grid(row=4, column=1, padx=4, sticky=tk.W)
+        ttk.Entry(row2, textvariable=self.login_user_var, width=14).grid(row=0, column=1, padx=(0, 4))
 
-        ttk.Label(ctrl, text="密碼 Password:").grid(row=4, column=2, sticky=tk.W, padx=4)
+        ttk.Label(row2, text="密碼 Password:").grid(row=0, column=2, sticky=tk.W, padx=(0, 2))
         self.login_pass_var = tk.StringVar(value=self._settings.get("password", ""))
-        ttk.Entry(ctrl, textvariable=self.login_pass_var, width=14, show="*").grid(row=4, column=3, padx=4, sticky=tk.W)
+        ttk.Entry(row2, textvariable=self.login_pass_var, width=14, show="*").grid(row=0, column=3, padx=(0, 4))
 
-        self.btn_login = ttk.Button(ctrl, text="登入 Login", command=self._manual_login, width=10)
-        self.btn_login.grid(row=4, column=4, padx=4, sticky=tk.W)
+        self.btn_login = ttk.Button(row2, text="登入 Login", command=self._manual_login)
+        self.btn_login.grid(row=0, column=4, padx=2)
+
+        self.btn_reconnect = ttk.Button(row2, text="重新連線 Reconnect", command=self._manual_reconnect,
+                                         state=tk.DISABLED)
+        self.btn_reconnect.grid(row=0, column=5, padx=2)
 
         self.login_status_var = tk.StringVar(value="")
-        ttk.Label(ctrl, textvariable=self.login_status_var, foreground="gray").grid(
-            row=4, column=5, columnspan=3, padx=4, sticky=tk.W)
+        ttk.Label(row2, textvariable=self.login_status_var, foreground="gray").grid(row=0, column=6, padx=4)
 
-        # Row 5: Action buttons
+        # ── Action buttons (grid layout — wraps gracefully) ──
         btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=5, column=0, columnspan=8, pady=(8, 0))
+        btn_frame.pack(fill=tk.X, pady=(2, 2))
+
+        self.btn_tv = ttk.Button(btn_frame, text="TV回測 TV Backtest",
+                                 command=self._do_fetch_tv)
+        self.btn_tv.grid(row=0, column=0, padx=3, pady=1, sticky=tk.W)
 
         self.btn_api = ttk.Button(btn_frame, text="API回測 API Backtest",
                                    command=self._do_fetch_api, state=tk.DISABLED)
-        self.btn_api.pack(side=tk.LEFT, padx=4)
-
-        self.btn_tv = ttk.Button(btn_frame, text="TV回測 TV Backtest",
-                                 command=self._do_fetch_tv, state=tk.NORMAL)
-        self.btn_tv.pack(side=tk.LEFT, padx=4)
-
-        self.btn_export = ttk.Button(btn_frame, text="匯出交易 Export Trades",
-                                     command=self._do_export, state=tk.DISABLED)
-        self.btn_export.pack(side=tk.LEFT, padx=4)
-
-        self.btn_chart_all = ttk.Button(btn_frame, text="K線圖 K Chart",
-                                        command=self._show_chart_all, state=tk.DISABLED)
-        self.btn_chart_all.pack(side=tk.LEFT, padx=4)
+        self.btn_api.grid(row=0, column=1, padx=3, pady=1, sticky=tk.W)
 
         self.btn_deploy = ttk.Button(btn_frame, text="部署機器人 Deploy Bot",
                                       command=self._toggle_live, state=tk.DISABLED)
-        self.btn_deploy.pack(side=tk.LEFT, padx=4)
+        self.btn_deploy.grid(row=0, column=2, padx=3, pady=1, sticky=tk.W)
 
-        ttk.Label(btn_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(8, 2))
+        self.btn_chart_all = ttk.Button(btn_frame, text="K線圖 K Chart",
+                                        command=self._show_chart_all, state=tk.DISABLED)
+        self.btn_chart_all.grid(row=0, column=3, padx=3, pady=1, sticky=tk.W)
+
+        self.btn_export = ttk.Button(btn_frame, text="匯出交易 Export Trades",
+                                     command=self._do_export, state=tk.DISABLED)
+        self.btn_export.grid(row=0, column=4, padx=3, pady=1, sticky=tk.W)
+
+        tf_frame = ttk.Frame(btn_frame)
+        tf_frame.grid(row=0, column=5, padx=3, pady=1, sticky=tk.W)
+        ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
         self.chart_tf_var = tk.StringVar(value="Native")
         self.chart_tf_combo = ttk.Combobox(
-            btn_frame, textvariable=self.chart_tf_var,
+            tf_frame, textvariable=self.chart_tf_var,
             values=list(_LIVE_CHART_TIMEFRAMES.keys()),
             state=tk.DISABLED, width=7,
         )
-        self.chart_tf_combo.pack(side=tk.LEFT, padx=2)
+        self.chart_tf_combo.pack(side=tk.LEFT)
 
+        self.btn_toggle_settings = ttk.Button(btn_frame, text="▶ 設定 Settings",
+                                               command=self._toggle_settings)
+        self.btn_toggle_settings.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
+
+        # Status on its own row so it never clips the buttons above
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
-        ttk.Label(btn_frame, textvariable=self.status_var, foreground="gray").pack(side=tk.LEFT, padx=16)
+        ttk.Label(ctrl, textvariable=self.status_var, foreground="gray",
+                  font=("", 9)).pack(fill=tk.X, padx=6, pady=(0, 1))
+
+        # ── Collapsible backtest settings ──
+        self._settings_visible = False
+        self._settings_frame = ttk.LabelFrame(ctrl, text="回測參數 Backtest Settings", padding=6)
+        # Hidden by default — toggled by _toggle_settings
+
+        sf = self._settings_frame
+
+        # Row 0: Balance + Point Value
+        row_a = ttk.Frame(sf)
+        row_a.pack(fill=tk.X, pady=2)
+        ttk.Label(row_a, text="初始資金 Balance:").pack(side=tk.LEFT, padx=(4, 2))
+        self.balance_var = tk.StringVar(value="1000000")
+        ttk.Entry(row_a, textvariable=self.balance_var, width=12).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(row_a, text="每點價值 Pt Value:").pack(side=tk.LEFT, padx=(0, 2))
+        self.pv_var = tk.StringVar(value="200")
+        ttk.Entry(row_a, textvariable=self.pv_var, width=6).pack(side=tk.LEFT, padx=(0, 4))
+
+        # Row 1: Start + End + Quick period buttons
+        row_b = ttk.Frame(sf)
+        row_b.pack(fill=tk.X, pady=2)
+        ttk.Label(row_b, text="起始 Start:").pack(side=tk.LEFT, padx=(4, 2))
+        default_start = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+        self.start_var = tk.StringVar(value=default_start)
+        ttk.Entry(row_b, textvariable=self.start_var, width=10).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row_b, text="結束 End:").pack(side=tk.LEFT, padx=(0, 2))
+        self.end_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
+        ttk.Entry(row_b, textvariable=self.end_var, width=10).pack(side=tk.LEFT, padx=(0, 8))
+        for label, days in [("3月", 90), ("6月", 180), ("1年", 365), ("2年", 730), ("4年", 1461)]:
+            ttk.Button(row_b, text=label, width=4,
+                       command=lambda d=days: self._set_period(d)).pack(side=tk.LEFT, padx=1)
+
+        # Row 2: BB + SL/TP params
+        row_c = ttk.Frame(sf)
+        row_c.pack(fill=tk.X, pady=2)
+        for lbl, var_name, val, w in [
+            ("BB週期:", "bb_period_var", "20", 6),
+            ("BB Std:", "bb_std_var", "2.0", 6),
+            ("SL Offset:", "sl_offset_var", "20", 6),
+            ("TP Offset:", "tp_offset_var", "50", 6),
+        ]:
+            ttk.Label(row_c, text=lbl).pack(side=tk.LEFT, padx=(8, 2))
+            sv = tk.StringVar(value=val)
+            setattr(self, var_name, sv)
+            ttk.Entry(row_c, textvariable=sv, width=w).pack(side=tk.LEFT, padx=(0, 4))
+
+        # Row 3: ATR params
+        row_d = ttk.Frame(sf)
+        row_d.pack(fill=tk.X, pady=2)
+        for lbl, var_name, val, w in [
+            ("ATR期數:", "atr_period_var", "14", 6),
+            ("SL×ATR:", "sl_mult_var", "1.0", 6),
+            ("TP×ATR:", "tp_mult_var", "0.5", 6),
+        ]:
+            ttk.Label(row_d, text=lbl).pack(side=tk.LEFT, padx=(8, 2))
+            sv = tk.StringVar(value=val)
+            setattr(self, var_name, sv)
+            ttk.Entry(row_d, textvariable=sv, width=w).pack(side=tk.LEFT, padx=(0, 4))
 
     def _build_results_notebook(self, parent):
         notebook = ttk.Notebook(parent)
@@ -793,6 +986,15 @@ class BacktestApp:
         # Live tab
         live_frame = ttk.Frame(notebook)
         notebook.add(live_frame, text="即時 Live")
+
+        # Bot name display (set via popup on Deploy)
+        bot_name_frame = ttk.Frame(live_frame)
+        bot_name_frame.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Label(bot_name_frame, text="機器人名稱 Bot Name:").pack(side=tk.LEFT, padx=(0, 4))
+        self.bot_name_var = tk.StringVar(value="(未設定 Not set)")
+        self.bot_name_label = ttk.Label(bot_name_frame, textvariable=self.bot_name_var,
+                                         font=("Consolas", 10, "bold"))
+        self.bot_name_label.pack(side=tk.LEFT, padx=(0, 8))
 
         # Status panel
         status_panel = ttk.LabelFrame(live_frame, text="即時狀態 Live Status", padding=6)
@@ -861,7 +1063,7 @@ class BacktestApp:
         max_tokens = self._settings.get("ai_max_tokens", 16384)
         self._chat_client = ChatClient(api_key, provider=provider, model=model, max_tokens=max_tokens)
         self._chat_client.set_system_prompt(STRATEGY_SYSTEM_PROMPT)
-        self._append_chat("system", f"Using {provider} / {model}")
+        self.status_var.set(f"AI: {provider} / {model}")
         return True
 
     def _on_chat_enter(self, event):
@@ -929,18 +1131,29 @@ class BacktestApp:
         self.chat_display.config(state=tk.DISABLED)
 
     def _remove_last_system_line(self):
-        """Remove the last 'Thinking...' system message."""
+        """Remove the last system message (Thinking..., Generating code..., Recapping..., etc)."""
         self.chat_display.config(state=tk.NORMAL)
         content = self.chat_display.get("1.0", tk.END)
-        idx = content.rfind("Thinking...\n")
+        # Search for known system message patterns (newest first)
+        markers = [
+            "Thinking...\n",
+            "Generating code...\n",
+            "正在回顧對話上下文 Recapping conversation context...\n",
+            "匯出中 Exporting to Pine Script...\n",
+        ]
+        idx = -1
+        marker_text = ""
+        for m in markers:
+            pos = content.rfind(m)
+            if pos > idx:
+                idx = pos
+                marker_text = m
         if idx >= 0:
-            # Calculate line.col position
             before = content[:idx]
             line = before.count("\n") + 1
             col = len(before) - before.rfind("\n") - 1
             start = f"{line}.{col}"
-            # Find end of "Thinking...\n\n"
-            end_idx = idx + len("Thinking...\n\n")
+            end_idx = idx + len(marker_text) + 1  # +1 for trailing \n
             after_before = content[:end_idx]
             end_line = after_before.count("\n") + 1
             end_col = len(after_before) - after_before.rfind("\n") - 1
@@ -1054,10 +1267,7 @@ class BacktestApp:
         self.strategy_combo.config(values=list(STRATEGIES.keys()))
         self.strategy_var.set(name)
 
-        self._append_chat("system",
-                          f"Strategy loaded: {strategy_cls.__name__}\n"
-                          f"Selected in dropdown: \"{name}\"\n"
-                          "Click 'Run Backtest' to test it.")
+        self.status_var.set(f"策略已載入 Strategy loaded: {strategy_cls.__name__}")
 
         self.btn_generate.config(state=tk.NORMAL)
         self.btn_pine.config(state=tk.NORMAL)
@@ -1071,7 +1281,7 @@ class BacktestApp:
         if not self._ensure_chat_client():
             return
 
-        self._append_chat("system", "Exporting to Pine Script...")
+        self.status_var.set("匯出中 Exporting to Pine Script...")
         self.btn_pine.config(state=tk.DISABLED)
 
         source = self._ai_strategy_source
@@ -1089,7 +1299,7 @@ class BacktestApp:
     def _show_pine_popup(self, pine_code: str):
         """Show Pine Script in a popup window with Copy button."""
         self._remove_last_system_line()
-        self._append_chat("system", "Pine Script export complete.")
+        self.status_var.set("Pine Script 匯出完成 Export complete.")
         self.btn_pine.config(state=tk.NORMAL)
 
         popup = tk.Toplevel(self.root)
@@ -1135,12 +1345,31 @@ class BacktestApp:
             return
 
         path = self._strategy_store.save(class_name, self._ai_strategy_source, desc)
-        self._append_chat("system", f"Strategy saved: {path}")
+        self.status_var.set(f"策略已儲存 Strategy saved: {os.path.basename(path)}")
         self._refresh_saved_combo()
 
     def _load_saved_strategies(self):
-        """Load saved strategy names into the combo on startup."""
+        """Auto-load all saved AI strategies into STRATEGIES on startup."""
         self._refresh_saved_combo()
+        entries = self._strategy_store.list_strategies()
+        loaded = 0
+        for entry in entries:
+            class_name = entry["class_name"]
+            name = f"AI: {class_name}"
+            if name in STRATEGIES:
+                continue  # already loaded
+            source = self._strategy_store.load_source(class_name)
+            if not source:
+                continue
+            try:
+                strategy_cls = load_strategy_from_source(source)
+                STRATEGIES[name] = strategy_cls
+                loaded += 1
+            except Exception:
+                _log(f"Failed to auto-load strategy: {class_name}")
+        if loaded:
+            self.strategy_combo.config(values=list(STRATEGIES.keys()))
+            _log(f"Auto-loaded {loaded} saved AI strategies")
 
     def _refresh_saved_combo(self):
         entries = self._strategy_store.list_strategies()
@@ -1161,7 +1390,7 @@ class BacktestApp:
         try:
             strategy_cls = load_strategy_from_source(source)
             self._on_strategy_generated(source, strategy_cls)
-            self._append_chat("system", f"Loaded saved strategy: {class_name}")
+            self.status_var.set(f"已載入策略 Loaded: {class_name}")
         except (CodeValidationError, CodeExecutionError) as e:
             self._append_chat("error", f"Failed to load {class_name}: {e}")
 
@@ -1173,7 +1402,7 @@ class BacktestApp:
         self._strategy_store.delete(class_name)
         self._refresh_saved_combo()
         self.saved_var.set("")
-        self._append_chat("system", f"Deleted: {class_name}")
+        self.status_var.set(f"已刪除 Deleted: {class_name}")
 
     def _show_api_key_dialog(self):
         """Show settings dialog with provider selection and API keys."""
@@ -1247,7 +1476,7 @@ class BacktestApp:
                 self._chat_client.close()
                 self._chat_client = None
 
-            self._append_chat("system", f"Settings saved. Provider: {provider}")
+            self.status_var.set(f"設定已儲存 Settings saved. Provider: {provider}")
             dialog.destroy()
 
         ttk.Button(btn_frame, text="Save", width=10, command=_save).pack(side=tk.LEFT, padx=8)
@@ -1286,7 +1515,7 @@ class BacktestApp:
         import json
         session = {
             "conversation": self._chat_client.conversation,
-            "display_text": self.chat_display.get("1.0", tk.END).rstrip(),
+            "display_text": self._build_display_text(),
             "provider": self._settings.get("ai_provider", "anthropic"),
             "model": self._chat_client.model if self._chat_client else "",
             "saved_at": datetime.now().isoformat(),
@@ -1325,19 +1554,82 @@ class BacktestApp:
         # Restore conversation history
         self._chat_client.conversation = session.get("conversation", [])
 
-        # Restore display text
-        display_text = session.get("display_text", "")
+        # Rebuild display from conversation (filters system messages)
+        display_text = self._build_display_text()
         self.chat_display.config(state=tk.NORMAL)
         self.chat_display.delete("1.0", tk.END)
         if display_text:
+            if not display_text.endswith("\n\n"):
+                display_text = display_text.rstrip("\n") + "\n\n"
             self.chat_display.insert(tk.END, display_text)
         self.chat_display.see(tk.END)
         self.chat_display.config(state=tk.DISABLED)
 
-        self.status_var.set(f"Chat loaded: {os.path.basename(path)}")
-        _log(f"Chat session loaded from {path}")
+        n_msgs = len(self._chat_client.conversation)
+        self.status_var.set(f"已載入對話 Chat loaded: {os.path.basename(path)} ({n_msgs} msgs)")
+        _log(f"Chat session loaded from {path} ({n_msgs} messages)")
+
+        # Ask AI to summarize its understanding of the conversation
+        if n_msgs > 0:
+            self._send_context_recap()
+
+    def _send_context_recap(self):
+        """After loading a chat session, ask the AI to summarize its understanding."""
+        if not self._chat_client:
+            return
+
+        self._append_chat("system", "正在回顧對話上下文 Recapping conversation context...")
+        self.btn_send.config(state=tk.DISABLED)
+
+        def _worker():
+            try:
+                response = self._chat_client.send_message(CHAT_RECAP_PROMPT)
+                # Remove the recap prompt from conversation so it doesn't pollute saves.
+                # send_message appends user + assistant, remove both and just keep assistant.
+                conv = self._chat_client.conversation
+                # Find and remove the recap user message (second to last)
+                if len(conv) >= 2 and conv[-2].get("role") == "user":
+                    conv.pop(-2)
+                self.root.after(0, lambda: self._on_recap_response(response))
+            except Exception as e:
+                _log(f"Recap error: {e}")
+                # Remove the failed user message too
+                conv = self._chat_client.conversation
+                if conv and conv[-1].get("role") == "user":
+                    conv.pop()
+                self.root.after(0, lambda: self._on_recap_error(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_recap_response(self, response: str):
+        """Handle the context recap response."""
+        self._remove_last_system_line()
+        self._append_chat("assistant", f"📋 對話回顧 Context Recap:\n{response}")
+        self.btn_send.config(state=tk.NORMAL)
+
+    def _on_recap_error(self, err: str):
+        """Handle recap error — not critical, just log it."""
+        self._remove_last_system_line()
+        self.status_var.set(f"Context recap failed: {err}")
+        self.btn_send.config(state=tk.NORMAL)
 
     _AUTO_CHAT_PATH = os.path.join("data", "chats", "_last_session.json")
+
+    def _build_display_text(self) -> str:
+        """Build display text from conversation history only (no system messages)."""
+        if not self._chat_client or not self._chat_client.conversation:
+            return ""
+        provider = self._settings.get("ai_provider", PROVIDER_ANTHROPIC)
+        ai_name = "Gemini" if provider == PROVIDER_GOOGLE else "Claude"
+        parts = []
+        for msg in self._chat_client.conversation:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                parts.append(f"You: {content}")
+            elif role == "assistant":
+                parts.append(f"{ai_name}: {content}")
+        return "\n\n".join(parts)
 
     def _auto_save_chat(self):
         """Auto-save current conversation for next startup."""
@@ -1347,7 +1639,7 @@ class BacktestApp:
         os.makedirs(os.path.dirname(self._AUTO_CHAT_PATH), exist_ok=True)
         session = {
             "conversation": self._chat_client.conversation,
-            "display_text": self.chat_display.get("1.0", tk.END).rstrip(),
+            "display_text": self._build_display_text(),
             "provider": self._settings.get("ai_provider", "anthropic"),
             "model": self._chat_client.model if self._chat_client else "",
             "saved_at": datetime.now().isoformat(),
@@ -1357,36 +1649,6 @@ class BacktestApp:
                 json.dump(session, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
-
-    def _auto_load_chat(self):
-        """Auto-load last conversation on startup."""
-        if not os.path.exists(self._AUTO_CHAT_PATH):
-            return
-        import json
-        try:
-            with open(self._AUTO_CHAT_PATH, "r", encoding="utf-8") as f:
-                session = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return
-
-        conversation = session.get("conversation", [])
-        display_text = session.get("display_text", "")
-        if not conversation:
-            return
-
-        # Initialize chat client if needed
-        if not self._ensure_chat_client():
-            return
-
-        self._chat_client.conversation = conversation
-
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.delete("1.0", tk.END)
-        if display_text:
-            self.chat_display.insert(tk.END, display_text)
-        self.chat_display.see(tk.END)
-        self.chat_display.config(state=tk.DISABLED)
-        _log(f"Auto-loaded last chat session ({len(conversation)} messages)")
 
     def _on_closing(self):
         """Handle window close: auto-save chat, then destroy."""
@@ -1400,6 +1662,21 @@ class BacktestApp:
     def _set_period(self, days):
         self.end_var.set(datetime.now().strftime("%Y%m%d"))
         self.start_var.set((datetime.now() - timedelta(days=days)).strftime("%Y%m%d"))
+
+    def _on_strategy_changed(self, *_args):
+        """Update UI when strategy selection changes."""
+        pass
+
+    def _toggle_settings(self):
+        """Show/hide backtest settings panel."""
+        if self._settings_visible:
+            self._settings_frame.pack_forget()
+            self.btn_toggle_settings.config(text="▶ 設定 Settings")
+            self._settings_visible = False
+        else:
+            self._settings_frame.pack(fill=tk.X, pady=(2, 0))
+            self.btn_toggle_settings.config(text="▼ 設定 Settings")
+            self._settings_visible = True
 
     def _on_symbol_changed(self):
         """Auto-set point value when symbol changes and clear cached bars."""
@@ -2125,6 +2402,129 @@ class BacktestApp:
     #  LIVE TRADING METHODS
     # ══════════════════════════════════════════════════════════════
 
+    def _show_bot_session_dialog(self, symbol: str, base_dir: str):
+        """Show dialog to pick existing bot session or create new one.
+
+        Returns (bot_name, resume_session) or None if cancelled.
+        resume_session is a dict (from session.json) or None for new bots.
+        """
+        # Scan for existing bot directories for this symbol
+        prefix = f"{symbol}_"
+        existing_bots = []  # [(bot_name, session_data_or_None)]
+        if os.path.isdir(base_dir):
+            for entry in sorted(os.listdir(base_dir)):
+                full = os.path.join(base_dir, entry)
+                if os.path.isdir(full) and entry.startswith(prefix):
+                    bot_name = entry[len(prefix):]
+                    if not bot_name:
+                        continue
+                    sess = load_session(os.path.join(full, "session.json"))
+                    existing_bots.append((bot_name, sess))
+
+        # Build dialog
+        dlg = tk.Toplevel(self.root)
+        dlg.title("選擇機器人 Select Bot Session")
+        dlg.geometry("500x400")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        result = [None]  # mutable container for return value
+
+        # Existing sessions list
+        if existing_bots:
+            ttk.Label(dlg, text="載入現有機器人 Load Existing Bot:",
+                      font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
+
+            list_frame = ttk.Frame(dlg)
+            list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
+
+            columns = ("name", "strategy", "trades", "pnl", "position", "saved")
+            tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=8)
+            for col, text, w in [
+                ("name", "名稱 Name", 100), ("strategy", "策略 Strategy", 120),
+                ("trades", "交易數 Trades", 60), ("pnl", "損益 P&L", 70),
+                ("position", "持倉 Position", 70), ("saved", "上次儲存 Last Saved", 130),
+            ]:
+                tree.heading(col, text=text)
+                tree.column(col, width=w, anchor=tk.W if col in ("name", "strategy") else tk.CENTER)
+
+            vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=vsb.set)
+            tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+            for bot_name, sess in existing_bots:
+                if sess:
+                    strat = sess.get("strategy", "?")
+                    broker = sess.get("broker", {})
+                    trades_count = len(broker.get("trades", []))
+                    pnl = broker.get("cumulative_pnl", 0)
+                    pos = broker.get("position_size", 0)
+                    pos_side = broker.get("position_side", "")
+                    pos_str = f"{pos_side} {pos}" if pos > 0 else "Flat"
+                    saved = sess.get("saved_at", "?")
+                else:
+                    strat = "?"
+                    trades_count, pnl, pos_str, saved = "?", "?", "?", "(no session)"
+                tree.insert("", tk.END, values=(bot_name, strat, trades_count, pnl, pos_str, saved))
+
+            def on_load():
+                sel = tree.selection()
+                if not sel:
+                    messagebox.showwarning("Select", "請選擇一個機器人 Please select a bot.", parent=dlg)
+                    return
+                idx = tree.index(sel[0])
+                name, sess = existing_bots[idx]
+                result[0] = (name, sess)
+                dlg.destroy()
+
+            ttk.Button(dlg, text="載入選取 Load Selected", command=on_load).pack(pady=(0, 8))
+
+            # Double-click to load
+            tree.bind("<Double-1>", lambda e: on_load())
+
+        else:
+            ttk.Label(dlg, text=f"沒有 {symbol} 的現有機器人 No existing bots for {symbol}.",
+                      foreground="gray").pack(anchor=tk.W, padx=10, pady=(10, 4))
+
+        # New bot section
+        ttk.Separator(dlg, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
+        ttk.Label(dlg, text="建立新機器人 Create New Bot:",
+                  font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(4, 4))
+
+        new_frame = ttk.Frame(dlg)
+        new_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Label(new_frame, text="名稱 Name:").pack(side=tk.LEFT, padx=(0, 4))
+        new_name_var = tk.StringVar(value=self.strategy_var.get().replace(" ", "_"))
+        new_entry = ttk.Entry(new_frame, textvariable=new_name_var, width=25)
+        new_entry.pack(side=tk.LEFT, padx=(0, 8))
+
+        existing_names = {b[0] for b in existing_bots}
+
+        def on_create():
+            name = new_name_var.get().strip()
+            if not name:
+                messagebox.showwarning("Name", "請輸入名稱 Please enter a name.", parent=dlg)
+                return
+            name = name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+            if name in existing_names:
+                messagebox.showerror("Name Conflict",
+                                     f"名稱 '{name}' 已存在 Name already exists.\n"
+                                     "請使用「載入」或輸入新名稱\n"
+                                     "Use 'Load' or enter a different name.", parent=dlg)
+                return
+            result[0] = (name, None)
+            dlg.destroy()
+
+        ttk.Button(new_frame, text="建立 Create", command=on_create).pack(side=tk.LEFT)
+
+        # Cancel
+        ttk.Button(dlg, text="取消 Cancel", command=dlg.destroy).pack(pady=(0, 10))
+
+        # Wait for dialog to close
+        self.root.wait_window(dlg)
+        return result[0]
+
     def _toggle_live(self):
         """Toggle between Deploy Bot and Stop Bot."""
         if self._live_runner and self._live_runner.state == LiveState.RUNNING:
@@ -2139,13 +2539,66 @@ class BacktestApp:
             self.login_status_var.set("請先登入 Login required")
             return
 
+        symbol = self.symbol_var.get().strip()
+        if not symbol:
+            return
+
+        # Show bot session picker dialog
+        base_dir = os.path.join(project_root, "data", "live")
+        result = self._show_bot_session_dialog(symbol, base_dir)
+        if result is None:  # cancelled
+            return
+        bot_name, resume_session = result
+        self.bot_name_var.set(bot_name)
+
+        # If resuming, restore strategy + symbol from saved session
+        if resume_session:
+            saved_strategy = resume_session.get("strategy", "")
+            saved_symbol = resume_session.get("symbol", "")
+            # Find matching strategy in dropdown
+            matched = False
+            for name in STRATEGIES:
+                if name == saved_strategy or name.endswith(saved_strategy):
+                    self.strategy_var.set(name)
+                    matched = True
+                    break
+            if not matched:
+                # Try AI strategies
+                for name in STRATEGIES:
+                    if name.startswith("AI:") and saved_strategy in name:
+                        self.strategy_var.set(name)
+                        matched = True
+                        break
+            if not matched:
+                messagebox.showerror("Strategy Not Found",
+                                     f"找不到策略 Strategy '{saved_strategy}' not found.\n"
+                                     "請確認策略已載入 Please ensure the strategy is loaded.")
+                return
+            if saved_symbol and saved_symbol in [v for v in self.symbol_combo['values']]:
+                self.symbol_var.set(saved_symbol)
+                self._on_symbol_changed()
+            # Restore point value from session
+            saved_pv = resume_session.get("point_value")
+            if saved_pv:
+                self.pv_var.set(str(saved_pv))
+
+        # Re-read strategy after potential update from session
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
             self.status_var.set("請選擇策略 Select a strategy")
             return
 
+        # Check for lock conflict (another instance using the same bot name)
         symbol = self.symbol_var.get().strip()
-        if not symbol:
+        bot_dir = LiveRunner.bot_dir_for(base_dir, symbol, bot_name)
+        is_locked, lock_pid = LiveRunner.check_lock(bot_dir)
+        if is_locked:
+            messagebox.showerror(
+                "Bot Name Conflict",
+                f"機器人名稱 '{bot_name}' 已被另一個程式佔用 (PID {lock_pid})。\n"
+                f"Bot name '{bot_name}' is already in use by another instance.\n\n"
+                "請使用不同的名稱 Please use a different name.",
+            )
             return
 
         try:
@@ -2189,8 +2642,16 @@ class BacktestApp:
 
         log_dir = os.path.join(project_root, "data", "live")
         self._live_runner = LiveRunner(
-            strategy, symbol, point_value=point_value, log_dir=log_dir,
+            strategy, symbol, point_value=point_value,
+            log_dir=log_dir, bot_name=bot_name,
+            strategy_display_name=self.strategy_var.get(),
         )
+        self._live_runner.acquire_lock()
+
+        # Restore previous session if resuming
+        if resume_session:
+            n = self._live_runner.restore_session(resume_session)
+            self._live_log_msg(f"恢復交易紀錄 Resumed session: {n} trades restored", "status")
 
         # Register callbacks
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
@@ -2209,8 +2670,8 @@ class BacktestApp:
         self.chart_tf_combo.config(state="readonly")
         self.chart_tf_var.set("Native")
 
-        self._live_log_msg(f"部署中 Deploying: {strategy.name} on {symbol}", "status")
-        _log(f"部署即時機器人 Deploying live bot: {strategy.name} on {symbol}")
+        self._live_log_msg(f"部署中 Deploying: {strategy.name} on {symbol} [{bot_name}]", "status")
+        _log(f"部署即時機器人 Deploying live bot: {strategy.name} on {symbol} [{bot_name}]")
 
         # Start warmup
         self._start_live_warmup()
@@ -2365,6 +2826,12 @@ class BacktestApp:
         if not self._live_runner:
             return
 
+        # Reload saved 1-min bars from CSV (for resumed sessions)
+        n_reloaded = self._live_runner.reload_1m_bars()
+        if n_reloaded > 0:
+            self._live_log_msg(
+                f"已載入歷史1分K Reloaded {n_reloaded} saved 1m bars from CSV", "status")
+
         symbol = self._live_runner.symbol
         self._live_tick_symbol = symbol
         self._live_bar_builder = BarBuilder(symbol, interval=60)
@@ -2391,6 +2858,7 @@ class BacktestApp:
                 self._stop_live()
                 return
             self._live_tick_active = True
+            self._last_tick_time = time.time()
             self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
             _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
         except Exception as e:
@@ -2403,12 +2871,36 @@ class BacktestApp:
         # Schedule periodic status updates (every 30s)
         self._schedule_status_update()
 
+    _TICK_WATCHDOG_TIMEOUT = 120  # seconds of no ticks before warning
+
     def _schedule_status_update(self):
-        """Periodically update the live status panel."""
+        """Periodically update the live status panel + tick watchdog."""
         if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
             return
         self._update_live_status()
+        self._check_tick_watchdog()
         self._live_poll_id = self.root.after(30000, self._schedule_status_update)
+
+    def _check_tick_watchdog(self):
+        """Warn if no ticks have arrived for too long during market hours."""
+        if not self._live_tick_active or not self._last_tick_time:
+            return
+        if not is_market_open():
+            return
+        elapsed = time.time() - self._last_tick_time
+        if elapsed > self._TICK_WATCHDOG_TIMEOUT:
+            mins = int(elapsed // 60)
+            self._live_log_msg(
+                f"警告 No ticks for {mins}m — connection may be lost", "status")
+            _log(f"Tick watchdog: no ticks for {mins}m, checking connection")
+            # Verify connection is still alive
+            if _com_available:
+                try:
+                    ic = skQ.SKQuoteLib_IsConnected()
+                    if ic != 1:
+                        self._on_disconnected()
+                except Exception:
+                    self._on_disconnected()
 
     def _drain_tick_queue(self):
         """Drain pending ticks from _tick_queue on the main thread.
@@ -2451,6 +2943,8 @@ class BacktestApp:
             return
 
         self._live_tick_count += 1
+        if not is_history:
+            self._last_tick_time = time.time()
 
         # Detect transition from history to live ticks
         if not is_history and not self._live_history_done:
@@ -2605,6 +3099,10 @@ class BacktestApp:
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
             self._live_poll_id = None
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
+        self._reconnect_attempt = 0
 
         self._live_warmup_mode = False
         self._live_polling = False
@@ -2646,6 +3144,7 @@ class BacktestApp:
         self.btn_tv.config(state=tk.NORMAL)
         self.symbol_combo.config(state="readonly")
         self.strategy_combo.config(state="readonly")
+        self.bot_name_var.set("(未設定 Not set)")
         self.status_var.set("就緒 Ready")
 
 

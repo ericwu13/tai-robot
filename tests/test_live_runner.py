@@ -157,7 +157,7 @@ class TestLiveRunnerFeed:
         runner.feed_1m_bars(lines)
         runner.stop()
 
-        assert (tmp_path / "TX00_1m_20260301.csv").exists()
+        assert (tmp_path / "bars_1m_20260301.csv").exists()
 
     def test_feed_1m_bar_accepts_bar_objects(self, tmp_path):
         """feed_1m_bar() accepts Bar objects directly (for tick-based feed)."""
@@ -486,3 +486,48 @@ class TestLiveRunner1mBars:
         assert bars_15m[0].dt == datetime(2026, 3, 1, 9, 0)
         assert bars_15m[0].interval == 900
         assert bars_15m[1].dt == datetime(2026, 3, 1, 9, 15)
+
+
+class TestLiveRunnerLock:
+    def test_acquire_and_release_lock(self, tmp_path):
+        strategy = NeverTradeStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path),
+                            bot_name="TestBot")
+        runner.acquire_lock()
+        assert os.path.isfile(runner._lock_path)
+
+        is_locked, pid = LiveRunner.check_lock(runner.bot_dir)
+        assert is_locked
+        assert pid == os.getpid()
+
+        runner.release_lock()
+        is_locked, _ = LiveRunner.check_lock(runner.bot_dir)
+        assert not is_locked
+
+    def test_stop_releases_lock(self, tmp_path):
+        strategy = NeverTradeStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path),
+                            bot_name="TestBot")
+        runner.acquire_lock()
+
+        warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+        runner.stop()
+
+        assert not os.path.isfile(runner._lock_path)
+
+    def test_dead_pid_not_locked(self, tmp_path):
+        """A lock file with a non-existent PID is not considered locked."""
+        bot_dir = os.path.join(str(tmp_path), "TX00_TestBot")
+        os.makedirs(bot_dir, exist_ok=True)
+        lock_path = os.path.join(bot_dir, ".lock")
+        with open(lock_path, "w") as f:
+            f.write("999999999")  # non-existent PID
+
+        is_locked, pid = LiveRunner.check_lock(bot_dir)
+        assert not is_locked
+        assert pid == 999999999
+
+    def test_bot_dir_for(self, tmp_path):
+        result = LiveRunner.bot_dir_for(str(tmp_path), "TX00", "MyBot")
+        assert result == os.path.join(str(tmp_path), "TX00_MyBot")
