@@ -201,3 +201,14 @@ PINE_EXPORT_SYSTEM_PROMPT = "\n\n".join([
     _TONE_RULES,
     _PINE_TASK_RULES,
 ])
+
+# Chat session recap — sent after loading a saved chat to get AI context summary
+CHAT_RECAP_PROMPT = (
+    "[系統：對話紀錄已恢復 System: conversation history restored]\n"
+    "請用繁體中文簡短回顧我們之前討論的內容，包括：\n"
+    "1. 我們在討論什麼策略？\n"
+    "2. 目前的進度或結論\n"
+    "3. 有什麼待辦事項嗎？\n"
+    "Please briefly recap our discussion: strategy name, current progress, "
+    "and pending items. Keep it concise (3-5 sentences)."
+)

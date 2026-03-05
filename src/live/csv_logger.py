@@ -15,10 +15,19 @@ from ..market_data.models import Bar
 
 
 class CsvLogger:
-    """Logs raw 1-min bars (daily rotation) and trade decisions (append-only)."""
+    """Logs raw 1-min bars (daily rotation) and trade decisions (append-only).
 
-    def __init__(self, base_dir: str, symbol: str):
-        self._base_dir = base_dir
+    Directory layout: ``{base_dir}/{symbol}_{bot_name}/``
+    Files:
+      - ``bars_1m_{YYYYMMDD}.csv``  (daily-rotated)
+      - ``decisions.csv``           (append-only)
+    """
+
+    def __init__(self, base_dir: str, symbol: str, bot_name: str = ""):
+        if bot_name:
+            self._base_dir = os.path.join(base_dir, f"{symbol}_{bot_name}")
+        else:
+            self._base_dir = base_dir
         self._symbol = symbol
         self._bar_file = None
         self._bar_writer = None
@@ -26,7 +35,7 @@ class CsvLogger:
         self._decision_file = None
         self._decision_writer = None
 
-        Path(base_dir).mkdir(parents=True, exist_ok=True)
+        Path(self._base_dir).mkdir(parents=True, exist_ok=True)
 
     def log_bar(self, bar: Bar) -> None:
         """Write a 1-min bar to the daily CSV file. Auto-rotates on date change."""
@@ -79,7 +88,7 @@ class CsvLogger:
         if self._bar_file:
             self._bar_file.close()
 
-        filename = f"{self._symbol}_1m_{date_str}.csv"
+        filename = f"bars_1m_{date_str}.csv"
         path = os.path.join(self._base_dir, filename)
         is_new = not os.path.exists(path)
 
@@ -92,7 +101,7 @@ class CsvLogger:
             self._bar_file.flush()
 
     def _open_decision_file(self) -> None:
-        filename = f"{self._symbol}_decisions.csv"
+        filename = "decisions.csv"
         path = os.path.join(self._base_dir, filename)
         is_new = not os.path.exists(path)
 

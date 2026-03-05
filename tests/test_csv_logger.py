@@ -26,8 +26,7 @@ class TestCsvLoggerBars:
             logger.log_bar(b)
         logger.close()
 
-        # Read back with data_loader
-        csv_path = tmp_path / "TX00_1m_20260301.csv"
+        csv_path = tmp_path / "bars_1m_20260301.csv"
         assert csv_path.exists()
 
         loaded = load_bars_from_csv(csv_path, symbol="TX00", interval=60)
@@ -43,11 +42,11 @@ class TestCsvLoggerBars:
         logger.log_bar(_bar("2026-03-02 09:00"))
         logger.close()
 
-        assert (tmp_path / "TX00_1m_20260301.csv").exists()
-        assert (tmp_path / "TX00_1m_20260302.csv").exists()
+        assert (tmp_path / "bars_1m_20260301.csv").exists()
+        assert (tmp_path / "bars_1m_20260302.csv").exists()
 
-        bars_d1 = load_bars_from_csv(tmp_path / "TX00_1m_20260301.csv")
-        bars_d2 = load_bars_from_csv(tmp_path / "TX00_1m_20260302.csv")
+        bars_d1 = load_bars_from_csv(tmp_path / "bars_1m_20260301.csv")
+        bars_d2 = load_bars_from_csv(tmp_path / "bars_1m_20260302.csv")
         assert len(bars_d1) == 1
         assert len(bars_d2) == 1
 
@@ -61,7 +60,7 @@ class TestCsvLoggerBars:
         logger2.log_bar(_bar("2026-03-01 09:01"))
         logger2.close()
 
-        loaded = load_bars_from_csv(tmp_path / "TX00_1m_20260301.csv")
+        loaded = load_bars_from_csv(tmp_path / "bars_1m_20260301.csv")
         assert len(loaded) == 2
 
     def test_creates_base_dir(self, tmp_path):
@@ -69,7 +68,17 @@ class TestCsvLoggerBars:
         logger = CsvLogger(nested, "TX00")
         logger.log_bar(_bar("2026-03-01 09:00"))
         logger.close()
-        assert os.path.exists(os.path.join(nested, "TX00_1m_20260301.csv"))
+        assert os.path.exists(os.path.join(nested, "bars_1m_20260301.csv"))
+
+    def test_bot_name_creates_subdirectory(self, tmp_path):
+        """bot_name creates a {symbol}_{bot_name} subdirectory."""
+        logger = CsvLogger(str(tmp_path), "TX00", bot_name="MyBot")
+        logger.log_bar(_bar("2026-03-01 09:00"))
+        logger.close()
+
+        bot_dir = tmp_path / "TX00_MyBot"
+        assert bot_dir.is_dir()
+        assert (bot_dir / "bars_1m_20260301.csv").exists()
 
 
 class TestCsvLoggerDecisions:
@@ -97,7 +106,7 @@ class TestCsvLoggerDecisions:
         )
         logger.close()
 
-        path = tmp_path / "TX00_decisions.csv"
+        path = tmp_path / "decisions.csv"
         assert path.exists()
 
         import csv
@@ -126,7 +135,7 @@ class TestCsvLoggerDecisions:
         logger2.close()
 
         import csv
-        with open(tmp_path / "TX00_decisions.csv", "r", encoding="utf-8") as f:
+        with open(tmp_path / "decisions.csv", "r", encoding="utf-8") as f:
             rows = list(csv.reader(f))
         # Header written only by first logger; second appends to existing file
         assert len(rows) == 3  # 1 header + 2 data rows
