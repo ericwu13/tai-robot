@@ -152,24 +152,26 @@ class ChatClient:
         self.conversation.append({"role": "assistant", "content": assistant_text})
         return assistant_text
 
-    def one_shot(self, user_message: str) -> str:
+    def one_shot(self, user_message: str, system_prompt: str | None = None) -> str:
         """Single API call without modifying conversation history.
 
-        Uses the same system prompt but does NOT append to self.conversation.
+        Uses the given system_prompt (or self.system_prompt if None).
+        Does NOT append to self.conversation.
         Useful for code generation where we don't want to bloat chat history.
         """
+        prompt = system_prompt if system_prompt is not None else self.system_prompt
         if self.provider == PROVIDER_GOOGLE:
-            return self._one_shot_google(user_message)
-        return self._one_shot_anthropic(user_message)
+            return self._one_shot_google(user_message, prompt)
+        return self._one_shot_anthropic(user_message, prompt)
 
-    def _one_shot_anthropic(self, user_message: str) -> str:
+    def _one_shot_anthropic(self, user_message: str, system_prompt: str = "") -> str:
         payload: dict = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [{"role": "user", "content": user_message}],
         }
-        if self.system_prompt:
-            payload["system"] = self.system_prompt
+        if system_prompt:
+            payload["system"] = system_prompt
 
         headers = {
             "x-api-key": self.api_key,
@@ -195,15 +197,15 @@ class ChatClient:
                 assistant_text += block["text"]
         return assistant_text
 
-    def _one_shot_google(self, user_message: str) -> str:
+    def _one_shot_google(self, user_message: str, system_prompt: str = "") -> str:
         contents = [{"role": "user", "parts": [{"text": user_message}]}]
 
         payload: dict = {
             "contents": contents,
             "generationConfig": {"maxOutputTokens": self.max_tokens},
         }
-        if self.system_prompt:
-            payload["system_instruction"] = {"parts": [{"text": self.system_prompt}]}
+        if system_prompt:
+            payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
 
         url = GOOGLE_API_URL.format(model=self.model) + f"?key={self.api_key}"
         headers = {"content-type": "application/json"}

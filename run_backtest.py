@@ -71,7 +71,7 @@ from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
 
 # AI modules
 from src.ai.chat_client import ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS
-from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT, CHAT_RECAP_PROMPT
+from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT, CODE_GEN_SYSTEM_PROMPT, CHAT_RECAP_PROMPT
 from src.ai.code_sandbox import (
     extract_python_code, load_strategy_from_source,
     CodeValidationError, CodeExecutionError,
@@ -1210,7 +1210,7 @@ class BacktestApp:
 
         def _worker():
             try:
-                response = client.one_shot(gen_msg)
+                response = client.one_shot(gen_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT)
                 self.root.after(0, lambda: self._on_generate_response(response))
             except Exception as e:
                 _log(f"Generate error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1276,7 +1276,7 @@ class BacktestApp:
 
         def _worker():
             try:
-                resp = self._chat_client.one_shot(retry_msg)
+                resp = self._chat_client.one_shot(retry_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT)
                 self.root.after(0, lambda: self._on_generate_response(resp, retries_left=remaining))
             except Exception as e:
                 _log(f"Retry error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
