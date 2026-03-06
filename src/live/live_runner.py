@@ -333,10 +333,11 @@ class LiveRunner:
             return
 
         ctx = self.broker.context
+        bar_dt = bar.dt.strftime("%Y-%m-%d %H:%M") if bar.dt else ""
 
         # Check exit orders against this bar
         if idx > 0:
-            self.broker.check_exits(idx, bar.open, bar.high, bar.low, bar.close)
+            self.broker.check_exits(idx, bar.open, bar.high, bar.low, bar.close, bar_dt)
             self._check_for_trade_close(bar, idx)
 
         # Run strategy if enough bars
@@ -363,7 +364,7 @@ class LiveRunner:
 
         # Fill entry orders and market closes at bar close
         trades_before = len(self.broker.trades)
-        self.broker.on_bar_close(idx, bar.close)
+        self.broker.on_bar_close(idx, bar.close, bar_dt)
         # Check for market close trades (broker.close() processed inside on_bar_close)
         if len(self.broker.trades) > trades_before:
             self._check_for_trade_close(bar, idx)
@@ -464,7 +465,8 @@ class LiveRunner:
         # Force close open position
         if self._aggregated_bars and self.broker.position_size > 0:
             last_bar = self._aggregated_bars[-1]
-            self.broker.force_close(self._bar_index, last_bar.close)
+            last_dt = last_bar.dt.strftime("%Y-%m-%d %H:%M") if last_bar.dt else ""
+            self.broker.force_close(self._bar_index, last_bar.close, last_dt)
             self._log_decision(
                 last_bar, "FORCE_CLOSE", self.broker.trades[-1].side.value if self.broker.trades else "",
                 "stop", last_bar.close, "live runner stopped",

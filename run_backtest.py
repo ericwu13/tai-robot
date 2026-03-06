@@ -2396,13 +2396,13 @@ class BacktestApp:
             pnl_str = f"{t.pnl:+,}"
             row_tag = "win" if t.pnl > 0 else "loss"
 
-            entry_dt = ""
-            exit_dt = ""
-            if bars:
-                if 0 <= t.entry_bar_index < len(bars):
-                    entry_dt = bars[t.entry_bar_index].dt.strftime("%Y-%m-%d %H:%M")
-                if 0 <= t.exit_bar_index < len(bars):
-                    exit_dt = bars[t.exit_bar_index].dt.strftime("%Y-%m-%d %H:%M")
+            # Prefer stored datetimes; fall back to bar index lookup
+            entry_dt = t.entry_dt or ""
+            exit_dt = t.exit_dt or ""
+            if not entry_dt and bars and 0 <= t.entry_bar_index < len(bars):
+                entry_dt = bars[t.entry_bar_index].dt.strftime("%Y-%m-%d %H:%M")
+            if not exit_dt and bars and 0 <= t.exit_bar_index < len(bars):
+                exit_dt = bars[t.exit_bar_index].dt.strftime("%Y-%m-%d %H:%M")
 
             self.trade_tree.insert("", tk.END, values=(
                 i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
