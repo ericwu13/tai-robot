@@ -1190,18 +1190,8 @@ class BacktestApp:
             self._append_chat("error", "Chat with the AI first to discuss a strategy idea.")
             return
 
-        # Build a condensed summary of the conversation for code generation.
-        # Only include the last few messages to keep the context focused.
-        summary_parts = []
-        recent = self._chat_client.conversation[-6:]  # last 3 exchanges max
-        for msg in recent:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            content = msg.get("content", "")
-            # Truncate very long messages (e.g. user-pasted code)
-            if len(content) > 800:
-                content = content[:800] + "\n...(truncated)"
-            summary_parts.append(f"{role}: {content}")
-        conversation_summary = "\n\n".join(summary_parts)
+        conversation_summary = ChatClient.build_summary(
+            self._chat_client.conversation)
 
         gen_msg = (
             "Based on this strategy discussion, write the complete strategy code.\n\n"
