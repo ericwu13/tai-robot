@@ -318,3 +318,142 @@ class TestChatClientGeneral:
 
         payload = client._client.post.call_args[1]["json"]
         assert "system" not in payload
+
+
+# ---------------------------------------------------------------------------
+# build_summary tests
+# ---------------------------------------------------------------------------
+
+class TestBuildSummary:
+
+    def test_empty_conversation(self):
+        assert ChatClient.build_summary([]) == ""
+
+    def test_short_conversation_full_context(self):
+        """4 messages or fewer: all are tier A, no truncation needed."""
+        conv = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+            {"role": "user", "content": "Write code"},
+            {"role": "assistant", "content": "Here is code"},
+        ]
+        summary = ChatClient.build_summary(conv)
+        assert "Hello" in summary
+        assert "Hi there" in summary
+        assert "Write code" in summary
+        assert "Here is code" in summary
+        assert "truncated" not in summary
+
+    def test_first_message_preserved_in_long_conversation(self):
+        """First message (original code) must survive even with many messages."""
+        original_code = "class MyStrategy:\n    pass\n" * 50  # long code
+        conv = [{"role": "user", "content": original_code}]
+        # Add 20 middle exchanges
+        for i in range(20):
+            conv.append({"role": "assistant", "content": f"suggestion {i}"})
+            conv.append({"role": "user", "content": f"ok {i}"})
+        # Final spec
+        conv.append({"role": "assistant", "content": "Final strategy spec " * 100})
+
+        summary = ChatClient.build_summary(conv)
+        # First message present (possibly truncated but not dropped)
+        assert "class MyStrategy" in summary
+        # Last message present
+        assert "Final strategy spec" in summary
+
+    def test_last_4_messages_preserved(self):
+        """Last 4 messages should always be included."""
+        conv = [{"role": "user", "content": "first"}]
+        for i in range(10):
+            conv.append({"role": "assistant", "content": f"mid {i}"})
+            conv.append({"role": "user", "content": f"mid reply {i}"})
+        conv.append({"role": "assistant", "content": "FINAL_SPEC"})
+        conv.append({"role": "user", "content": "GENERATE"})
+        conv.append({"role": "assistant", "content": "CLICK_BUTTON"})
+
+        summary = ChatClient.build_summary(conv)
+        assert "FINAL_SPEC" in summary
+        assert "GENERATE" in summary
+        assert "CLICK_BUTTON" in summary
+
+    def test_middle_messages_compressed_in_long_chat(self):
+        """With many middle messages, each gets less budget."""
+        conv = [{"role": "user", "content": "first msg"}]
+        long_middle = "x" * 5000  # each middle msg is 5000 chars
+        for i in range(30):
+            role = "user" if i % 2 == 0 else "assistant"
+            conv.append({"role": role, "content": long_middle})
+        conv.extend([
+            {"role": "assistant", "content": "last spec"},
+            {"role": "user", "content": "gen"},
+            {"role": "assistant", "content": "click btn"},
+            {"role": "user", "content": "ok"},
+        ])
+
+        summary = ChatClient.build_summary(conv)
+        # Total should be bounded, not 30 * 5000
+        assert len(summary) < 25000
+        # First and last messages still present
+        assert "first msg" in summary
+        assert "last spec" in summary
+
+    def test_middle_messages_dropped_when_budget_exhausted(self):
+        """If tier A uses the full budget, middle messages are skipped."""
+        conv = [{"role": "user", "content": "first"}]
+        for i in range(50):
+            conv.append({"role": "assistant", "content": f"mid {i}"})
+        conv.extend([
+            {"role": "user", "content": "last1"},
+            {"role": "assistant", "content": "last2"},
+            {"role": "user", "content": "last3"},
+            {"role": "assistant", "content": "last4"},
+        ])
+
+        # Very small budget — only tier A fits
+        summary = ChatClient.build_summary(conv, total_budget=5000, tier_a_limit=1000)
+        assert "first" in summary
+        assert "last4" in summary
+
+    def test_issue6_scenario(self):
+        """Reproduce issue #6: 8-message conversation where first msg has
+        strategy code and message 5 has full optimization spec.
+        The key identifier must appear AFTER 800 chars so that a naive
+        800-char truncation would lose it."""
+        # Pad the code so the class name appears after 800 chars
+        code = "# " + "x" * 900 + "\nclass RsiMomentumWithTwoPhaseExit(BacktestStrategy):\n" + "    pass\n" * 100
+        # Put key info after 800 chars in the optimization spec too
+        optimization_spec = "y" * 900 + "\nShort entry: RSI<20, SMA slope down\n" * 30
+        conv = [
+            {"role": "user", "content": code + "\n優化此策略"},
+            {"role": "assistant", "content": "四項優化建議：1. R/R比 2. 移動停利 3. 成交量 4. 空方"},
+            {"role": "user", "content": "好的"},
+            {"role": "assistant", "content": "請問要先針對哪一項？"},
+            {"role": "user", "content": "4個方向都優化"},
+            {"role": "assistant", "content": optimization_spec},
+            {"role": "user", "content": "請產生策略"},
+            {"role": "assistant", "content": "請點擊 Generate Strategy 按鈕"},
+        ]
+
+        summary = ChatClient.build_summary(conv)
+        # Original code class name (after 800 chars) must be present
+        assert "RsiMomentumWithTwoPhaseExit" in summary
+        # Short-side rules (after 800 chars in spec) must be present
+        assert "RSI<20" in summary
+        # Last message must be present
+        assert "Generate Strategy" in summary
+
+    def test_scales_with_50_messages(self):
+        """50-message conversation stays within reasonable bounds."""
+        conv = [{"role": "user", "content": "A" * 4000}]
+        for i in range(48):
+            role = "user" if i % 2 == 0 else "assistant"
+            conv.append({"role": role, "content": "B" * 2000})
+        conv.append({"role": "assistant", "content": "C" * 4000})
+
+        summary = ChatClient.build_summary(conv)
+        # First message preserved
+        assert "A" * 100 in summary
+        # Last message preserved
+        assert "C" * 100 in summary
+        # Total bounded (budget 8000 for tier A, middle messages get small slices)
+        assert len(summary) < 20000

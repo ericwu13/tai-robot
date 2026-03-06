@@ -229,6 +229,38 @@ class ChatClient:
                     assistant_text += part["text"]
         return assistant_text
 
+    @staticmethod
+    def build_summary(conversation: list[dict], total_budget: int = 8000,
+                      tier_a_limit: int = 3000) -> str:
+        """Build a condensed conversation summary within a character budget.
+
+        Prioritizes the first message (original context/code) and the last 4
+        messages (final spec + recent exchanges).  Middle messages split the
+        remaining budget equally and are dropped if budget is exhausted.
+        """
+        n = len(conversation)
+        if n == 0:
+            return ""
+
+        tier_a_indices = {0} | {i for i in range(max(1, n - 4), n)}
+        tier_b_count = n - len(tier_a_indices)
+
+        tier_a_used = min(total_budget, len(tier_a_indices) * tier_a_limit)
+        tier_b_budget = max(0, total_budget - tier_a_used)
+        tier_b_per_msg = (tier_b_budget // tier_b_count) if tier_b_count > 0 else 0
+
+        parts = []
+        for i, msg in enumerate(conversation):
+            role = "User" if msg["role"] == "user" else "Assistant"
+            content = msg.get("content", "")
+            max_len = tier_a_limit if i in tier_a_indices else tier_b_per_msg
+            if max_len <= 0:
+                continue
+            if len(content) > max_len:
+                content = content[:max_len] + "\n...(truncated)"
+            parts.append(f"{role}: {content}")
+        return "\n\n".join(parts)
+
     def reset(self) -> None:
         """Clear conversation history for a fresh start."""
         self.conversation.clear()

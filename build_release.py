@@ -12,7 +12,7 @@ import subprocess
 import sys
 import zipfile
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 DIST_DIR = os.path.join("dist", "tai_backtest")
 ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 
