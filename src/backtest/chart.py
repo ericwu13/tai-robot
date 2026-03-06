@@ -23,6 +23,28 @@ _PAD_BEFORE = 20
 _PAD_AFTER = 10
 
 
+def _strip_motw() -> None:
+    """Remove Mark-of-the-Web from Python.Runtime.dll if present.
+
+    When users download a ZIP from the internet, Windows tags every extracted
+    file with a Zone.Identifier NTFS alternate data stream.  .NET Framework
+    refuses to load assemblies marked as "internet zone", which makes
+    clr_loader's pyclr_get_function return NULL and raises
+    "Failed to resolve Python.Runtime.Loader.Initialize".
+    """
+    import os
+    try:
+        import pythonnet
+        dll = os.path.join(
+            os.path.dirname(pythonnet.__file__), "runtime", "Python.Runtime.dll"
+        )
+        zone = dll + ":Zone.Identifier"
+        if os.path.exists(zone):
+            os.remove(zone)
+    except Exception:
+        pass
+
+
 def _check_dotnet() -> None:
     """Verify pythonnet / .NET Framework is available (required by pywebview on Windows).
 
@@ -31,6 +53,7 @@ def _check_dotnet() -> None:
     """
     if sys.platform != 'win32' or not _LWC_AVAILABLE:
         return
+    _strip_motw()
     try:
         import clr  # noqa: F401
     except RuntimeError as exc:

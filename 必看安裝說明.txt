@@ -57,8 +57,10 @@
 解法：下載安裝 https://go.microsoft.com/fwlink/p/?LinkId=2124703
 
 問題：開圖表時出現 Python.Runtime.dll 錯誤
-原因：.NET Framework 4.8 未安裝或未啟用
+原因：下載的 zip 沒有先解除封鎖就解壓縮（最常見），或 .NET Framework 4.8 未啟用
 解法：
-  1. 開啟「設定」→「應用程式」→「選用功能」→「更多 Windows 功能」
-  2. 勾選「.NET Framework 3.5」和「.NET Framework 4.8 Advanced Services」
-  3. 或下載安裝 https://dotnet.microsoft.com/download/dotnet-framework/net48
+  1. 程式會自動嘗試解除封鎖，重新開圖表試試
+  2. 如果還是不行：刪除資料夾，回到步驟一重新解壓（記得先解除封鎖 zip）
+  3. 確認 .NET Framework 4.8 已啟用：
+     「設定」→「應用程式」→「選用功能」→「更多 Windows 功能」
+     → 勾選「.NET Framework 4.8 Advanced Services」
