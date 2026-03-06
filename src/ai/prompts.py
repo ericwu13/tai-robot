@@ -33,11 +33,11 @@ Assistant: "BB(20,2) 在台指期 15 分 K 上回測勝率約 52%，但配合 RS
 ATR(14) 的 1.5 倍。\""""
 
 _NO_CODE_RULE = """\
-**DO NOT output code unless the user explicitly asks for it** (e.g. "寫出來", \
-"generate it", "write the code"). Strategy advisor first, coder second.
-
-When the user asks for code, you will receive the code generation context \
-with API details at that point."""
+**NEVER output Python code in this conversation.** You are a strategy advisor, \
+not a coder. Discuss ideas, parameters, indicators, entry/exit logic in plain \
+language only. If the user asks you to write code or generate code, reply: \
+"請點擊 Generate Strategy 按鈕來產生程式碼。Please click the Generate Strategy \
+button to generate code." The button will handle code generation separately."""
 
 _CODE_GENERATION_PERSONA = """\
 [Code Generation Persona]

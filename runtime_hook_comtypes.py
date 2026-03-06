@@ -20,6 +20,20 @@ if getattr(sys, 'frozen', False):
     if os.path.isfile(_pydll):
         os.environ.setdefault('PYTHONNET_PYDLL', _pydll)
 
+    # Strip Mark-of-the-Web from Python.Runtime.dll.  When users download
+    # the release ZIP from the internet, Windows tags extracted files with a
+    # Zone.Identifier NTFS alternate data stream.  .NET Framework refuses to
+    # load assemblies from the "internet zone", causing pyclr_get_function to
+    # return NULL ("Failed to resolve Python.Runtime.Loader.Initialize").
+    _prt_dll = os.path.join(_bundle_dir, 'pythonnet', 'runtime',
+                            'Python.Runtime.dll')
+    _zone = _prt_dll + ':Zone.Identifier'
+    try:
+        if os.path.exists(_zone):
+            os.remove(_zone)
+    except OSError:
+        pass
+
     # Ensure _MEIPASS is on PATH so .NET CLR and cffi can find native DLLs
     _path = os.environ.get('PATH', '')
     if _bundle_dir not in _path:

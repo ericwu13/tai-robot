@@ -83,6 +83,12 @@ from src.ai.pine_exporter import export_to_pine
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, _taipei_now
 from src.live.session_store import load_session, session_summary
 
+# TAIFEX public data (no API key needed)
+from src.data_sources.taifex import fetch_futures_daily, parse_taifex_csv
+from src.data_sources.cache import (
+    get_cache_path, save_bars_csv, load_bars_csv, cache_covers_range,
+)
+
 # TradingView data feed (optional, for longer history)
 try:
     from tvDatafeed import TvDatafeed, Interval as TvInterval
@@ -281,8 +287,8 @@ _CACHE_DIR = os.path.join(project_root, "data")
 
 # Multi-symbol configuration: COM symbol -> (csv_prefix, tv_symbol, point_value)
 _SYMBOL_CONFIG = {
-    "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100},
-    "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100},
+    "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100, "taifex_id": "TX"},
+    "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100, "taifex_id": "MTX"},
 }
 
 _CACHE_SUFFIXES = {
@@ -637,11 +643,17 @@ class BacktestApp:
     def _check_reconnection(self):
         """Poll IsConnected after reconnect login attempt."""
         if self._quote_connected:
-            return  # success, handled by _on_reconnected
+            return  # success, handled by _on_reconnected via _drain_ui_queue
         try:
             ic = skQ.SKQuoteLib_IsConnected()
             if ic == 1:
                 self._quote_connected = True
+                self.btn_api.config(state=tk.NORMAL)
+                self.btn_deploy.config(state=tk.NORMAL)
+                self.btn_login.config(state=tk.DISABLED)
+                self.btn_reconnect.config(state=tk.NORMAL)
+                self.status_var.set("已連線 Connected - Ready")
+                self.login_status_var.set("已連線 Connected")
                 self._on_reconnected()
                 return
         except Exception:
@@ -665,9 +677,8 @@ class BacktestApp:
         """Re-subscribe to tick feed after reconnection."""
         if not self._live_runner:
             return
-        symbol = self.symbol_var.get().strip()
-        cfg = _SYMBOL_CONFIG.get(symbol)
-        com_symbol = cfg["prefix"] + "00" if cfg else symbol
+        # Use the stored COM symbol (e.g. "TX00"), same as initial subscription
+        com_symbol = self._live_runner.symbol
 
         try:
             result = skQ.SKQuoteLib_RequestTicks(0, com_symbol)
@@ -863,20 +874,24 @@ class BacktestApp:
                                    command=self._do_fetch_api, state=tk.DISABLED)
         self.btn_api.grid(row=0, column=1, padx=3, pady=1, sticky=tk.W)
 
+        self.btn_taifex = ttk.Button(btn_frame, text="TAIFEX回測 TAIFEX Backtest",
+                                      command=self._do_fetch_taifex)
+        self.btn_taifex.grid(row=0, column=2, padx=3, pady=1, sticky=tk.W)
+
         self.btn_deploy = ttk.Button(btn_frame, text="部署機器人 Deploy Bot",
                                       command=self._toggle_live, state=tk.DISABLED)
-        self.btn_deploy.grid(row=0, column=2, padx=3, pady=1, sticky=tk.W)
+        self.btn_deploy.grid(row=0, column=3, padx=3, pady=1, sticky=tk.W)
 
         self.btn_chart_all = ttk.Button(btn_frame, text="K線圖 K Chart",
                                         command=self._show_chart_all, state=tk.DISABLED)
-        self.btn_chart_all.grid(row=0, column=3, padx=3, pady=1, sticky=tk.W)
+        self.btn_chart_all.grid(row=0, column=4, padx=3, pady=1, sticky=tk.W)
 
         self.btn_export = ttk.Button(btn_frame, text="匯出交易 Export Trades",
                                      command=self._do_export, state=tk.DISABLED)
-        self.btn_export.grid(row=0, column=4, padx=3, pady=1, sticky=tk.W)
+        self.btn_export.grid(row=0, column=5, padx=3, pady=1, sticky=tk.W)
 
         tf_frame = ttk.Frame(btn_frame)
-        tf_frame.grid(row=0, column=5, padx=3, pady=1, sticky=tk.W)
+        tf_frame.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
         ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
         self.chart_tf_var = tk.StringVar(value="Native")
         self.chart_tf_combo = ttk.Combobox(
@@ -1162,7 +1177,12 @@ class BacktestApp:
         self.chat_display.config(state=tk.DISABLED)
 
     def _generate_strategy(self):
-        """Ask AI to generate strategy code based on the conversation so far."""
+        """Ask AI to generate strategy code based on the conversation so far.
+
+        Uses a SEPARATE one-shot API call with only a condensed summary of the
+        conversation, not the full chat history.  This avoids output truncation
+        when the conversation is long.
+        """
         if not self._ensure_chat_client():
             return
 
@@ -1170,19 +1190,37 @@ class BacktestApp:
             self._append_chat("error", "Chat with the AI first to discuss a strategy idea.")
             return
 
-        # Send a code-generation request with API context injected
+        # Build a condensed summary of the conversation for code generation.
+        # Only include the last few messages to keep the context focused.
+        summary_parts = []
+        recent = self._chat_client.conversation[-6:]  # last 3 exchanges max
+        for msg in recent:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            content = msg.get("content", "")
+            # Truncate very long messages (e.g. user-pasted code)
+            if len(content) > 800:
+                content = content[:800] + "\n...(truncated)"
+            summary_parts.append(f"{role}: {content}")
+        conversation_summary = "\n\n".join(summary_parts)
+
         gen_msg = (
-            "Based on our discussion, please write the complete strategy code now.\n\n"
+            "Based on this strategy discussion, write the complete strategy code.\n\n"
+            "## Conversation Summary\n"
+            + conversation_summary + "\n\n"
             + STRATEGY_CODE_CONTEXT
         )
+
         self._append_chat("user", "Generate Strategy")
         self.btn_send.config(state=tk.DISABLED)
         self.btn_generate.config(state=tk.DISABLED)
         self._append_chat("system", "Generating code...")
 
+        # Use a one-shot API call (not the chat conversation) to avoid bloat
+        client = self._chat_client
+
         def _worker():
             try:
-                response = self._chat_client.send_message(gen_msg)
+                response = client.one_shot(gen_msg)
                 self.root.after(0, lambda: self._on_generate_response(response))
             except Exception as e:
                 _log(f"Generate error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1248,7 +1286,7 @@ class BacktestApp:
 
         def _worker():
             try:
-                resp = self._chat_client.send_message(retry_msg)
+                resp = self._chat_client.one_shot(retry_msg)
                 self.root.after(0, lambda: self._on_generate_response(resp, retries_left=remaining))
             except Exception as e:
                 _log(f"Retry error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1724,11 +1762,13 @@ class BacktestApp:
             self.btn_api.config(state=tk.NORMAL)
             self.btn_deploy.config(state=tk.NORMAL)
         self.btn_tv.config(state=tk.NORMAL)
+        self.btn_taifex.config(state=tk.NORMAL)
 
     def _disable_buttons(self):
         """Disable buttons during a run."""
         self.btn_api.config(state=tk.DISABLED)
         self.btn_tv.config(state=tk.DISABLED)
+        self.btn_taifex.config(state=tk.DISABLED)
         self.btn_deploy.config(state=tk.DISABLED)
 
     # ── COM Login ──
@@ -1917,6 +1957,110 @@ class BacktestApp:
         except Exception as e:
             _log(f"查詢錯誤 Fetch error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._enable_buttons()
+
+    def _do_fetch_taifex(self):
+        """Fetch daily bars from TAIFEX public API (no account needed)."""
+        strategy_cls = STRATEGIES.get(self.strategy_var.get())
+        if not strategy_cls:
+            self.status_var.set("請選擇策略 Select a strategy")
+            return
+
+        symbol = self.symbol_var.get().strip()
+        cfg = _SYMBOL_CONFIG.get(symbol)
+        if not cfg or "taifex_id" not in cfg:
+            self.status_var.set(f"TAIFEX不支援此商品 Unsupported symbol: {symbol}")
+            return
+
+        commodity_id = cfg["taifex_id"]
+        prefix = cfg["prefix"]
+
+        # Warn if strategy uses intraday bars
+        if strategy_cls.kline_type != 4:
+            if not messagebox.askokcancel(
+                "TAIFEX僅有日K TAIFEX Daily Only",
+                f"TAIFEX僅提供日K線資料。\n"
+                f"目前策略使用 {strategy_cls.kline_minute} 分K。\n"
+                f"是否仍要使用日K回測？\n\n"
+                f"TAIFEX only provides daily bars.\n"
+                f"Current strategy uses {strategy_cls.kline_minute}-min bars.\n"
+                f"Continue with daily bars anyway?",
+            ):
+                return
+
+        # Parse date range from GUI
+        try:
+            start_str = self.start_var.get().strip()
+            end_str = self.end_var.get().strip()
+            start_date = datetime.strptime(start_str, "%Y%m%d").date()
+            end_date = datetime.strptime(end_str, "%Y%m%d").date()
+        except ValueError:
+            self.status_var.set("日期格式錯誤 Invalid date format (YYYYMMDD)")
+            return
+
+        # Reuse in-memory bars if same source + symbol
+        if (self._data_source.startswith("TAIFEX") and self._raw_bars
+                and self._raw_bars_key == (symbol, 4, 1)):
+            _log("重新使用TAIFEX資料 Re-using TAIFEX data with date filter")
+            self._execute_backtest(list(self._raw_bars))
+            return
+
+        # Check local cache
+        cache_path = get_cache_path("taifex", f"{commodity_id}_daily", ".csv")
+        if cache_covers_range(cache_path, start_date, end_date):
+            _log(f"載入TAIFEX快取 Loading cached: {cache_path.name}")
+            bars = load_bars_csv(cache_path, symbol=prefix, interval=86400)
+            if bars:
+                self._data_source = f"TAIFEX ({cache_path.name})"
+                self._raw_bars_key = (symbol, 4, 1)
+                _log(f"載入完成 Loaded {len(bars)} bars from cache")
+                self._execute_backtest(bars)
+                return
+
+        # Fetch from TAIFEX API in background thread
+        self._disable_buttons()
+        self.status_var.set(f"從TAIFEX下載中... Downloading from TAIFEX ({start_date} ~ {end_date})")
+        _log(f"開始下載TAIFEX資料 Fetching {commodity_id} from {start_date} to {end_date}")
+
+        def _fetch():
+            try:
+                def _progress(cur, total):
+                    self.root.after(0, lambda c=cur, t=total:
+                        self.status_var.set(f"TAIFEX下載中 {c}/{t} chunks..."))
+
+                bars = fetch_futures_daily(
+                    commodity_id, start_date, end_date,
+                    symbol=prefix, price_multiplier=1,
+                    on_progress=_progress,
+                )
+
+                def _done():
+                    if not bars:
+                        self.status_var.set("TAIFEX無資料 No data returned")
+                        self._enable_buttons()
+                        return
+                    # Save to cache (merge with existing)
+                    existing = load_bars_csv(cache_path, symbol=prefix, interval=86400)
+                    if existing:
+                        seen = {b.dt for b in bars}
+                        merged = bars + [b for b in existing if b.dt not in seen]
+                        merged.sort(key=lambda b: b.dt)
+                    else:
+                        merged = bars
+                    save_bars_csv(merged, cache_path)
+                    _log(f"TAIFEX下載完成 {len(bars)} bars fetched, {len(merged)} total cached")
+                    self._data_source = f"TAIFEX ({commodity_id})"
+                    self._raw_bars_key = (symbol, 4, 1)
+                    self._execute_backtest(merged)
+
+                self.root.after(0, _done)
+            except Exception as e:
+                self.root.after(0, lambda: [
+                    _log(f"TAIFEX錯誤 Error: {e}"),
+                    self.status_var.set(f"TAIFEX錯誤: {e}"),
+                    self._enable_buttons(),
+                ])
+
+        threading.Thread(target=_fetch, daemon=True).start()
 
     def _do_fetch_tv(self):
         """Use TradingView data: local CSV first, re-use in-memory, or download live."""
@@ -2889,6 +3033,17 @@ class BacktestApp:
             return
         elapsed = time.time() - self._last_tick_time
         if elapsed > self._TICK_WATCHDOG_TIMEOUT:
+            # If the gap spans a market-closed period (e.g. AM→PM transition),
+            # the stale _last_tick_time is from the previous session.  Reset
+            # and give the current session a fresh window instead of
+            # immediately triggering reconnection.
+            from datetime import datetime, timezone, timedelta
+            last_dt = datetime.fromtimestamp(self._last_tick_time, tz=_TZ_TAIPEI)
+            if not is_market_open(last_dt):
+                _log(f"Tick watchdog: last tick was during closed market, resetting timer")
+                self._last_tick_time = time.time()
+                return
+
             mins = int(elapsed // 60)
             self._live_log_msg(
                 f"警告 No ticks for {mins}m — connection may be lost", "status")

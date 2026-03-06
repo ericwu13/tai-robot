@@ -152,6 +152,83 @@ class ChatClient:
         self.conversation.append({"role": "assistant", "content": assistant_text})
         return assistant_text
 
+    def one_shot(self, user_message: str) -> str:
+        """Single API call without modifying conversation history.
+
+        Uses the same system prompt but does NOT append to self.conversation.
+        Useful for code generation where we don't want to bloat chat history.
+        """
+        if self.provider == PROVIDER_GOOGLE:
+            return self._one_shot_google(user_message)
+        return self._one_shot_anthropic(user_message)
+
+    def _one_shot_anthropic(self, user_message: str) -> str:
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": user_message}],
+        }
+        if self.system_prompt:
+            payload["system"] = self.system_prompt
+
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        }
+
+        response = self._client.post(ANTHROPIC_API_URL, json=payload, headers=headers)
+
+        if response.status_code != 200:
+            error_body = response.text
+            try:
+                err_json = response.json()
+                error_body = err_json.get("error", {}).get("message", response.text)
+            except Exception:
+                pass
+            raise RuntimeError(f"Anthropic API error {response.status_code}: {error_body}")
+
+        data = response.json()
+        assistant_text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                assistant_text += block["text"]
+        return assistant_text
+
+    def _one_shot_google(self, user_message: str) -> str:
+        contents = [{"role": "user", "parts": [{"text": user_message}]}]
+
+        payload: dict = {
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": self.max_tokens},
+        }
+        if self.system_prompt:
+            payload["system_instruction"] = {"parts": [{"text": self.system_prompt}]}
+
+        url = GOOGLE_API_URL.format(model=self.model) + f"?key={self.api_key}"
+        headers = {"content-type": "application/json"}
+
+        response = self._client.post(url, json=payload, headers=headers)
+
+        if response.status_code != 200:
+            error_body = response.text
+            try:
+                err_json = response.json()
+                error_body = err_json.get("error", {}).get("message", response.text)
+            except Exception:
+                pass
+            raise RuntimeError(f"Gemini API error {response.status_code}: {error_body}")
+
+        data = response.json()
+        assistant_text = ""
+        candidates = data.get("candidates", [])
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            for part in parts:
+                if "text" in part:
+                    assistant_text += part["text"]
+        return assistant_text
+
     def reset(self) -> None:
         """Clear conversation history for a fresh start."""
         self.conversation.clear()
