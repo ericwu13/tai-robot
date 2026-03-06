@@ -53,20 +53,23 @@ class BacktestEngine:
         for i, bar in enumerate(bars):
             self.data_store.add_bar(bar)
 
+            bar_dt = bar.dt.strftime("%Y-%m-%d %H:%M") if bar.dt else ""
+
             # Check exit orders from previous bar against this bar's OHLC
             if i > 0:
-                self.broker.check_exits(i, bar.open, bar.high, bar.low, bar.close)
+                self.broker.check_exits(i, bar.open, bar.high, bar.low, bar.close, bar_dt)
 
             # Run strategy once enough bars accumulated
             if len(self.data_store) >= required:
                 self.strategy.on_bar(bar, self.data_store, ctx)
 
             # Fill entry orders at this bar's close
-            self.broker.on_bar_close(i, bar.close)
+            self.broker.on_bar_close(i, bar.close, bar_dt)
 
         # Force close any open position at end of data
         if bars:
-            self.broker.force_close(len(bars) - 1, bars[-1].close)
+            last_dt = bars[-1].dt.strftime("%Y-%m-%d %H:%M") if bars[-1].dt else ""
+            self.broker.force_close(len(bars) - 1, bars[-1].close, last_dt)
 
         return BacktestResult(
             strategy_name=self.strategy.name,

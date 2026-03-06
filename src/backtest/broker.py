@@ -32,6 +32,8 @@ class Trade:
     exit_bar_index: int
     pnl: int = 0
     exit_tag: str = ""
+    entry_dt: str = ""   # ISO format datetime string
+    exit_dt: str = ""    # ISO format datetime string
 
 
 class BrokerContext:
@@ -91,6 +93,8 @@ class SimulatedBroker:
         self.entry_price: int = 0
         self.entry_tag: str = ""
         self.entry_bar_index: int = 0
+        self._entry_dt: str = ""
+        self._current_bar_dt: str = ""
 
         self.trades: list[Trade] = []
         self.equity_curve: list[int] = []
@@ -120,13 +124,14 @@ class SimulatedBroker:
         """Queue a market close — fills at current bar's close."""
         self._pending_market_closes.append((tag, from_entry))
 
-    def on_bar_close(self, bar_index: int, close: int) -> None:
+    def on_bar_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
         """Process pending market closes and entry orders at bar close.
 
         Order: market closes first, then entries.
         Skip entries if an exit happened on this same bar — prioritize exit.
         """
         self._bar_index = bar_index
+        self._current_bar_dt = bar_dt
 
         # Process market closes first
         for tag, from_entry in self._pending_market_closes:
@@ -142,11 +147,13 @@ class SimulatedBroker:
                 self.entry_price = close
                 self.entry_tag = order.tag
                 self.entry_bar_index = bar_index
+                self._entry_dt = bar_dt
         self._pending_entries.clear()
 
-    def check_exits(self, bar_index: int, open_: int, high: int, low: int, close: int) -> None:
+    def check_exits(self, bar_index: int, open_: int, high: int, low: int, close: int, bar_dt: str = "") -> None:
         """Check pending exit orders against this bar's OHLC."""
         self._bar_index = bar_index
+        self._current_bar_dt = bar_dt
         if self.position_size == 0 or not self._pending_exits:
             return
 
@@ -223,6 +230,8 @@ class SimulatedBroker:
             exit_bar_index=bar_index,
             pnl=pnl,
             exit_tag=tag,
+            entry_dt=self._entry_dt,
+            exit_dt=self._current_bar_dt,
         )
         self.trades.append(trade)
         self._cumulative_pnl += pnl
@@ -235,9 +244,10 @@ class SimulatedBroker:
         self._pending_exits.clear()
         self._exit_bar_index = bar_index
 
-    def force_close(self, bar_index: int, close: int) -> None:
+    def force_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
         """Force-close any open position at end of data."""
         if self.position_size > 0:
+            self._current_bar_dt = bar_dt
             self._close_position("force_close", close, bar_index)
 
     def record_equity(self) -> None:
@@ -261,6 +271,7 @@ class SimulatedBroker:
                     "entry_bar_index": t.entry_bar_index,
                     "exit_bar_index": t.exit_bar_index,
                     "pnl": t.pnl, "exit_tag": t.exit_tag,
+                    "entry_dt": t.entry_dt, "exit_dt": t.exit_dt,
                 }
                 for t in self.trades
             ],
@@ -287,6 +298,7 @@ class SimulatedBroker:
                 entry_bar_index=t["entry_bar_index"],
                 exit_bar_index=t["exit_bar_index"],
                 pnl=t["pnl"], exit_tag=t.get("exit_tag", ""),
+                entry_dt=t.get("entry_dt", ""), exit_dt=t.get("exit_dt", ""),
             )
             for t in data.get("trades", [])
         ]
