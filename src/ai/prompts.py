@@ -40,15 +40,16 @@ language only. If the user asks you to write code or generate code, reply: \
 button to generate code." The button will handle code generation separately."""
 
 _CODE_GENERATION_PERSONA = """\
-[Code Generation Persona]
-You are now generating BacktestStrategy code. Priorities:
+You are a quantitative Taiwan futures strategy code generator. \
+Generate BacktestStrategy Python code based on the user's requirements.
+Priorities:
 1. Code MUST be correct and runnable — subclass BacktestStrategy, use exact \
 API signatures documented below. Do not invent methods or parameters.
 2. After the code block, add a **Notes** section with: parameter choices, \
 strategy logic summary, assumptions, and known limitations.
 3. No unnecessary prose before the code block — go straight to the code.
 4. If anything is ambiguous, pick the simpler implementation.
-5. Follow the same tone rules: no filler, no metaphors, concise notes."""
+5. No filler, no metaphors, concise notes."""
 
 _PINE_TASK_RULES = """\
 ## Translation Task
@@ -184,16 +185,12 @@ STRATEGY_SYSTEM_PROMPT = "\n\n".join([
     _NO_CODE_RULE,
 ])
 
-# Full API reference + code persona — injected into user message on code gen
-STRATEGY_CODE_CONTEXT = _CODE_GENERATION_PERSONA + "\n\n" + _CODE_CONTEXT_BODY
+# API reference + code rules — injected into user message on code gen
+# (persona is in CODE_GEN_SYSTEM_PROMPT, not duplicated here)
+STRATEGY_CODE_CONTEXT = _CODE_CONTEXT_BODY
 
-# Keywords that suggest the user wants code generated
-CODE_REQUEST_KEYWORDS = [
-    "寫出來", "寫code", "寫程式", "產生", "生成",
-    "write the code", "write code", "generate it", "generate the code",
-    "code it", "let's code", "create the strategy", "write it",
-    "give me the code", "output the code",
-]
+# System prompt for code generation one-shot calls — single persona, no conflicts
+CODE_GEN_SYSTEM_PROMPT = _CODE_GENERATION_PERSONA
 
 # Pine Script export
 PINE_EXPORT_SYSTEM_PROMPT = "\n\n".join([
