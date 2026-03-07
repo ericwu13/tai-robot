@@ -68,9 +68,9 @@ Translate the given Python backtest strategy to TradingView Pine Script v5.
    - `sma(values, period)` -> `ta.sma(close, period)`
    - `ema(values, period)` -> `ta.ema(close, period)`
    - `rsi(values, period)` -> `ta.rsi(close, period)`
-   - `macd(values, fast, slow, signal)` -> Pine Script `ta.macd()` returns 3 separate values.
-     Correct: `[macdLine, signalLine, histLine] = ta.macd(close, fast, slow, signal)`
-     WRONG: `ta.macd(close, fast, slow, signal)` used as a single value
+   - `macd(values, fast_period, slow_period, signal_period)` -> Pine Script `ta.macd()` returns 3 separate values.
+     Correct: `[macdLine, signalLine, histLine] = ta.macd(close, fast_period, slow_period, signal_period)`
+     WRONG: `ta.macd(close, fast_period, slow_period, signal_period)` used as a single value
    - `bollinger_bands(values, period, std)` -> Pine Script `ta.bb()` returns 3 separate values.
      Correct: `[middle, upper, lower] = ta.bb(close, period, std)`
      WRONG: `ta.bb(close, period, std)` used as a single value or with parentheses around tuple
@@ -159,7 +159,7 @@ from src.strategy.indicators.atr import atr, true_range
 sma(values, period) -> float | None
 ema(values, period) -> float | None
 rsi(values, period=14) -> float | None           # 0-100
-macd(values, fast=12, slow=26, signal=9) -> (macd_line, signal_line, histogram) | None
+macd(values, fast_period=12, slow_period=26, signal_period=9) -> (macd_line, signal_line, histogram) | None
 bollinger_bands(values, period=20, num_std=2.0) -> (upper, middle, lower) | None
 atr(highs, lows, closes, period=14) -> float | None
 ```

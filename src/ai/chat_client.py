@@ -150,6 +150,11 @@ class ChatClient:
                     assistant_text += part["text"]
 
         self.conversation.append({"role": "assistant", "content": assistant_text})
+
+        # Check if response was truncated
+        if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
+            assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+
         return assistant_text
 
     def one_shot(self, user_message: str, system_prompt: str | None = None) -> str:
@@ -229,6 +234,11 @@ class ChatClient:
             for part in parts:
                 if "text" in part:
                     assistant_text += part["text"]
+
+        # Check if response was truncated
+        if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
+            assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+
         return assistant_text
 
     @staticmethod

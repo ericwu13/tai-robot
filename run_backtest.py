@@ -1230,6 +1230,9 @@ class BacktestApp:
         self.btn_send.config(state=tk.NORMAL)
         self.btn_generate.config(state=tk.NORMAL)
 
+        # Detect truncated response
+        truncated = "[WARNING: Response truncated" in response
+
         # Try to extract code
         source = extract_python_code(response)
         if not source:
@@ -1242,19 +1245,23 @@ class BacktestApp:
             return
 
         # Try to validate and load
+        truncation_hint = (
+            "Your previous response was truncated due to token limit. "
+            "Generate a SIMPLER strategy with fewer parameters and shorter code.\n\n"
+        ) if truncated else ""
         try:
             strategy_cls = load_strategy_from_source(source)
             self._on_strategy_generated(source, strategy_cls)
         except (CodeValidationError, CodeExecutionError) as e:
             self._generation_retry(
-                f"The generated code had errors:\n{e}\n\n"
+                f"{truncation_hint}The generated code had errors:\n{e}\n\n"
                 "Please fix the code and output a corrected version.",
                 retries_left,
             )
         except Exception as e:
             _log(f"Strategy load error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._generation_retry(
-                f"Unexpected error loading strategy:\n{e}\n\n"
+                f"{truncation_hint}Unexpected error loading strategy:\n{e}\n\n"
                 "Please fix the code and output a corrected version.",
                 retries_left,
             )
@@ -2329,16 +2336,18 @@ class BacktestApp:
              f"balance={initial_balance:,}, point_value={point_value}")
         self.status_var.set("回測中 Running backtest...")
 
-        try:
-            result = engine.run(bars)
-        except Exception as e:
-            tb = traceback.format_exc()
-            _log(f"回測錯誤 Backtest error:\n{tb}")
-            self.status_var.set(f"回測錯誤 Backtest error: {e}")
-            self._append_chat("error", f"Backtest runtime error:\n{e}")
-            self._enable_buttons()
-            return
+        def _backtest_worker():
+            try:
+                result = engine.run(bars)
+                self.root.after(0, lambda: self._on_backtest_done(result, bars, initial_balance))
+            except Exception as e:
+                tb = traceback.format_exc()
+                self.root.after(0, lambda: self._on_backtest_error(e, tb))
 
+        threading.Thread(target=_backtest_worker, daemon=True).start()
+
+    def _on_backtest_done(self, result, bars, initial_balance):
+        """Handle backtest completion on the main thread."""
         # Recalculate metrics with initial balance
         result.metrics = calculate_metrics(
             result.trades, result.equity_curve, initial_balance=initial_balance)
@@ -2355,6 +2364,13 @@ class BacktestApp:
             f"完成 Done: {result.metrics.total_trades} trades, "
             f"win rate {result.metrics.win_rate * 100:.1f}%, "
             f"P&L {result.metrics.total_pnl:+,}")
+
+    def _on_backtest_error(self, error, tb):
+        """Handle backtest error on the main thread."""
+        _log(f"回測錯誤 Backtest error:\n{tb}")
+        self.status_var.set(f"回測錯誤 Backtest error: {error}")
+        self._append_chat("error", f"Backtest runtime error:\n{error}")
+        self._enable_buttons()
 
     def _display_results(self, result, bars: list[Bar] | None = None):
         # Metrics report
@@ -3006,6 +3022,8 @@ class BacktestApp:
         self._schedule_status_update()
 
     _TICK_WATCHDOG_TIMEOUT = 120  # seconds of no ticks before warning
+    _TICK_RESUBSCRIBE_TIMEOUT = 300  # 5 min: force re-subscribe even if "connected"
+    _TICK_FORCE_RECONNECT_TIMEOUT = 600  # 10 min: force full reconnect
 
     def _schedule_status_update(self):
         """Periodically update the live status panel + tick watchdog."""
@@ -3044,6 +3062,18 @@ class BacktestApp:
                     ic = skQ.SKQuoteLib_IsConnected()
                     if ic != 1:
                         self._on_disconnected()
+                    elif elapsed > self._TICK_FORCE_RECONNECT_TIMEOUT:
+                        # Connected but no ticks for 10+ min — force full reconnect
+                        _log("Tick watchdog: connected but no ticks for 10+ min, forcing reconnect")
+                        self._live_log_msg(
+                            "強制重連 Force reconnect — connected but no ticks", "status")
+                        self._on_disconnected()
+                    elif elapsed > self._TICK_RESUBSCRIBE_TIMEOUT:
+                        # Connected but no ticks for 5+ min — try re-subscribing
+                        _log("Tick watchdog: connected but no ticks for 5+ min, re-subscribing")
+                        self._live_log_msg(
+                            "重新訂閱 Re-subscribing ticks — connected but stale", "status")
+                        self._resubscribe_ticks()
                 except Exception:
                     self._on_disconnected()
 
