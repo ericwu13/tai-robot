@@ -49,7 +49,9 @@ API signatures documented below. Do not invent methods or parameters.
 strategy logic summary, assumptions, and known limitations.
 3. No unnecessary prose before the code block — go straight to the code.
 4. If anything is ambiguous, pick the simpler implementation.
-5. No filler, no metaphors, concise notes."""
+5. No filler, no metaphors, concise notes.
+6. Keep code under 150 lines. Combine related conditions, avoid repetitive \
+blocks, use helper methods within the class to stay concise."""
 
 _PINE_TASK_RULES = """\
 ## Translation Task

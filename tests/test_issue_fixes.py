@@ -155,6 +155,28 @@ class TestIssue7_TruncatedResponse:
         result = client.send_message("test")
         assert "[WARNING: Response truncated" in result
 
+    def test_one_shot_max_tokens_passthrough_google(self):
+        """one_shot(max_tokens=N) should pass N to Gemini's maxOutputTokens."""
+        client = ChatClient(api_key="test", provider=PROVIDER_GOOGLE)
+        client._client = MagicMock()
+        client._client.post.return_value = _google_response_with_finish("ok", "STOP")
+
+        client.one_shot("test", max_tokens=65536)
+        call_args = client._client.post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert payload["generationConfig"]["maxOutputTokens"] == 65536
+
+    def test_one_shot_default_max_tokens(self):
+        """one_shot() without max_tokens should use the client default."""
+        client = ChatClient(api_key="test", provider=PROVIDER_GOOGLE, max_tokens=16384)
+        client._client = MagicMock()
+        client._client.post.return_value = _google_response_with_finish("ok", "STOP")
+
+        client.one_shot("test")
+        call_args = client._client.post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert payload["generationConfig"]["maxOutputTokens"] == 16384
+
     def test_truncated_code_extraction_with_syntax_error(self):
         """Truncated code (no closing ```, incomplete syntax) should be
         extractable but fail validation — reproducing issue #7's flow."""

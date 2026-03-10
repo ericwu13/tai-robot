@@ -81,6 +81,9 @@ from src.ai.code_sandbox import (
 from src.ai.strategy_store import StrategyStore
 from src.ai.pine_exporter import export_to_pine
 
+# Code generation uses higher token limit to avoid truncation (issue #7)
+_CODE_GEN_MAX_TOKENS = 65536
+
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, _taipei_now, _TZ_TAIPEI
 from src.live.session_store import load_session, session_summary
@@ -1219,7 +1222,8 @@ class BacktestApp:
 
         def _worker():
             try:
-                response = client.one_shot(gen_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT)
+                response = client.one_shot(gen_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                                          max_tokens=_CODE_GEN_MAX_TOKENS)
                 self.root.after(0, lambda: self._on_generate_response(response))
             except Exception as e:
                 _log(f"Generate error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1256,7 +1260,9 @@ class BacktestApp:
         # Try to validate and load
         truncation_hint = (
             "Your previous response was truncated due to token limit. "
-            "Generate a SIMPLER strategy with fewer parameters and shorter code.\n\n"
+            "Rewrite the SAME strategy more concisely: combine conditions, "
+            "reduce helper variables, keep under 150 lines. "
+            "Do NOT replace it with a different/simpler strategy.\n\n"
         ) if truncated else ""
         try:
             strategy_cls = load_strategy_from_source(source)
@@ -1292,7 +1298,8 @@ class BacktestApp:
 
         def _worker():
             try:
-                resp = self._chat_client.one_shot(retry_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT)
+                resp = self._chat_client.one_shot(retry_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                                                  max_tokens=_CODE_GEN_MAX_TOKENS)
                 self.root.after(0, lambda: self._on_generate_response(resp, retries_left=remaining))
             except Exception as e:
                 _log(f"Retry error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
