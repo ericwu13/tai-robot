@@ -80,7 +80,7 @@ from src.ai.strategy_store import StrategyStore
 from src.ai.pine_exporter import export_to_pine
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, _taipei_now
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, _taipei_now, _TZ_TAIPEI
 from src.live.session_store import load_session, session_summary
 
 # TAIFEX public data (no API key needed)
@@ -890,6 +890,10 @@ class BacktestApp:
                                      command=self._do_export, state=tk.DISABLED)
         self.btn_export.grid(row=0, column=5, padx=3, pady=1, sticky=tk.W)
 
+        self.btn_review = ttk.Button(btn_frame, text="AI檢視 AI Review",
+                                     command=self._review_trades, state=tk.DISABLED)
+        self.btn_review.grid(row=0, column=7, padx=3, pady=1, sticky=tk.W)
+
         tf_frame = ttk.Frame(btn_frame)
         tf_frame.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
         ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
@@ -985,13 +989,16 @@ class BacktestApp:
         columns = ("num", "tag", "side", "entry_time", "entry_price",
                    "exit_time", "exit_price", "pnl", "bars_held")
         self.trade_tree = ttk.Treeview(trades_frame, columns=columns, show="headings", height=20)
+        self._trade_sort_col = None
+        self._trade_sort_reverse = False
         for col, text, w in [
             ("num", "#", 40), ("tag", "標籤 Tag", 80), ("side", "方向 Side", 55),
             ("entry_time", "進場時間 Entry Time", 135), ("entry_price", "進場價 Entry", 80),
             ("exit_time", "出場時間 Exit Time", 135), ("exit_price", "出場價 Exit", 80),
             ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 60),
         ]:
-            self.trade_tree.heading(col, text=text)
+            self.trade_tree.heading(col, text=text,
+                                   command=lambda c=col: self._sort_trade_tree(c))
             self.trade_tree.column(col, width=w, anchor=tk.E if col != "tag" else tk.W)
         vsb = ttk.Scrollbar(trades_frame, orient="vertical", command=self.trade_tree.yview)
         self.trade_tree.configure(yscrollcommand=vsb.set)
@@ -1303,6 +1310,10 @@ class BacktestApp:
         self.strategy_var.set(name)
 
         self.status_var.set(f"策略已載入 Strategy loaded: {strategy_cls.__name__}")
+        self._append_chat("system",
+                          f"策略已載入 Strategy loaded: **{strategy_cls.__name__}**\n"
+                          f"已設為目前策略，可直接點選回測按鈕執行。\n"
+                          f"Strategy is ready. Click a backtest button to run.")
 
         self.btn_generate.config(state=tk.NORMAL)
         self.btn_pine.config(state=tk.NORMAL)
@@ -2358,6 +2369,8 @@ class BacktestApp:
 
         self._enable_buttons()
         self.btn_export.config(state=tk.NORMAL)
+        if result.trades:
+            self.btn_review.config(state=tk.NORMAL)
         if _LWC_AVAILABLE and result.trades:
             self.btn_chart_all.config(state=tk.NORMAL)
         self.status_var.set(
@@ -2431,6 +2444,53 @@ class BacktestApp:
         if values:
             return int(values[0]) - 1
         return None
+
+    def _sort_trade_tree(self, col: str):
+        """Sort trade tree by column header click (toggle ascending/descending)."""
+        if self._trade_sort_col == col:
+            self._trade_sort_reverse = not self._trade_sort_reverse
+        else:
+            self._trade_sort_col = col
+            self._trade_sort_reverse = False
+
+        # Numeric columns need numeric sorting
+        numeric_cols = {"num", "entry_price", "exit_price", "pnl", "bars_held"}
+
+        items = []
+        for iid in self.trade_tree.get_children():
+            values = self.trade_tree.item(iid, "values")
+            tags = self.trade_tree.item(iid, "tags")
+            items.append((iid, values, tags))
+
+        col_idx = list(self.trade_tree["columns"]).index(col)
+
+        def sort_key(item):
+            val = item[1][col_idx]
+            if col in numeric_cols:
+                # Strip commas and +/- formatting
+                cleaned = str(val).replace(",", "").replace("+", "")
+                try:
+                    return float(cleaned)
+                except ValueError:
+                    return 0
+            return str(val)
+
+        items.sort(key=sort_key, reverse=self._trade_sort_reverse)
+
+        for idx, (iid, values, tags) in enumerate(items):
+            self.trade_tree.move(iid, "", idx)
+
+        # Update heading to show sort direction
+        arrow = " ▼" if self._trade_sort_reverse else " ▲"
+        col_texts = {
+            "num": "#", "tag": "標籤 Tag", "side": "方向 Side",
+            "entry_time": "進場時間 Entry Time", "entry_price": "進場價 Entry",
+            "exit_time": "出場時間 Exit Time", "exit_price": "出場價 Exit",
+            "pnl": "損益 P&L", "bars_held": "持倉K棒 Bars",
+        }
+        for c, text in col_texts.items():
+            display = text + arrow if c == col else text
+            self.trade_tree.heading(c, text=display)
 
     def _chart_kwargs(self) -> dict:
         try:
@@ -2547,6 +2607,59 @@ class BacktestApp:
             export_trades_csv(result.trades, path)
             self.status_var.set(f"已匯出 Exported: {path}")
             _log(f"匯出交易 Exported trades to {path}")
+
+    def _review_trades(self):
+        """Feed backtest/live results into AI chat for strategy review."""
+        result = (self._live_runner.get_result()
+                  if self._live_runner and self._live_runner.state != LiveState.IDLE
+                  else self._last_result)
+        if not result or not result.trades:
+            self.status_var.set("無交易紀錄 No trades to review")
+            return
+        if not self._ensure_chat_client():
+            return
+
+        # Build trade summary for AI context
+        report = format_report(result.strategy_name, result.metrics)
+
+        # Include individual trade details (cap at 100 trades for token budget)
+        trade_lines = []
+        for i, t in enumerate(result.trades[:100], 1):
+            bars_held = t.exit_bar_index - t.entry_bar_index
+            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
+            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
+            trade_lines.append(
+                f"  {i}. {t.side.value} {t.tag}: "
+                f"entry={entry_dt} @{t.entry_price:,} → "
+                f"exit={exit_dt} @{t.exit_price:,} "
+                f"P&L={t.pnl:+,} ({bars_held} bars)"
+            )
+        if len(result.trades) > 100:
+            trade_lines.append(f"  ... ({len(result.trades) - 100} more trades omitted)")
+
+        context = (
+            f"以下是回測/實盤結果，請分析交易表現並提出優化建議。\n"
+            f"Below are the backtest/live results. Analyze the trading performance "
+            f"and suggest improvements.\n\n"
+            f"{report}\n\n"
+            f"交易明細 Trade Details:\n" + "\n".join(trade_lines)
+        )
+
+        # Send as user message to the AI
+        self._append_chat("user", "AI Review: 請分析以下交易紀錄\n" + context)
+        self.btn_send.config(state=tk.DISABLED)
+        self._append_chat("system", "Analyzing trades...")
+
+        def _worker():
+            try:
+                response = self._chat_client.send_message(context)
+                self.root.after(0, lambda: self._on_chat_response(response))
+            except Exception as e:
+                _log(f"Review error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+                err_msg = str(e)
+                self.root.after(0, lambda: self._on_chat_error(err_msg))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ══════════════════════════════════════════════════════════════
     #  LIVE TRADING METHODS
@@ -3045,7 +3158,6 @@ class BacktestApp:
             # the stale _last_tick_time is from the previous session.  Reset
             # and give the current session a fresh window instead of
             # immediately triggering reconnection.
-            from datetime import datetime, timezone, timedelta
             last_dt = datetime.fromtimestamp(self._last_tick_time, tz=_TZ_TAIPEI)
             if not is_market_open(last_dt):
                 _log(f"Tick watchdog: last tick was during closed market, resetting timer")
@@ -3265,6 +3377,7 @@ class BacktestApp:
             self.btn_chart_all.config(state=tk.NORMAL)
         if result.trades:
             self.btn_export.config(state=tk.NORMAL)
+            self.btn_review.config(state=tk.NORMAL)
 
         # Update trade list and metrics
         self._display_results(result, bars)
