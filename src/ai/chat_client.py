@@ -157,7 +157,8 @@ class ChatClient:
 
         return assistant_text
 
-    def one_shot(self, user_message: str, system_prompt: str | None = None) -> str:
+    def one_shot(self, user_message: str, system_prompt: str | None = None,
+                 max_tokens: int | None = None) -> str:
         """Single API call without modifying conversation history.
 
         Uses the given system_prompt (or self.system_prompt if None).
@@ -165,14 +166,16 @@ class ChatClient:
         Useful for code generation where we don't want to bloat chat history.
         """
         prompt = system_prompt if system_prompt is not None else self.system_prompt
+        tokens = max_tokens or self.max_tokens
         if self.provider == PROVIDER_GOOGLE:
-            return self._one_shot_google(user_message, prompt)
-        return self._one_shot_anthropic(user_message, prompt)
+            return self._one_shot_google(user_message, prompt, tokens)
+        return self._one_shot_anthropic(user_message, prompt, tokens)
 
-    def _one_shot_anthropic(self, user_message: str, system_prompt: str = "") -> str:
+    def _one_shot_anthropic(self, user_message: str, system_prompt: str = "",
+                            max_tokens: int = 0) -> str:
         payload: dict = {
             "model": self.model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens or self.max_tokens,
             "messages": [{"role": "user", "content": user_message}],
         }
         if system_prompt:
@@ -202,12 +205,13 @@ class ChatClient:
                 assistant_text += block["text"]
         return assistant_text
 
-    def _one_shot_google(self, user_message: str, system_prompt: str = "") -> str:
+    def _one_shot_google(self, user_message: str, system_prompt: str = "",
+                         max_tokens: int = 0) -> str:
         contents = [{"role": "user", "parts": [{"text": user_message}]}]
 
         payload: dict = {
             "contents": contents,
-            "generationConfig": {"maxOutputTokens": self.max_tokens},
+            "generationConfig": {"maxOutputTokens": max_tokens or self.max_tokens},
         }
         if system_prompt:
             payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
