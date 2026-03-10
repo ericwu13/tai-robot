@@ -10,6 +10,8 @@ Usage:
   python run_backtest.py
 """
 
+from version import APP_VERSION
+
 import os
 import sys
 import inspect
@@ -459,7 +461,7 @@ class BacktestApp:
         _app = self
 
         self.root = root
-        self.root.title("tai-robot AI 策略工作台 AI Strategy Workbench")
+        self.root.title(f"tai-robot AI 策略工作台 AI Strategy Workbench v{APP_VERSION}")
         self.root.geometry("1400x850")
         self.root.minsize(1100, 650)
 
