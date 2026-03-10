@@ -171,7 +171,8 @@ atr(highs, lows, closes, period=14) -> float | None
 src.market_data.models, src.market_data.data_store, src.strategy.indicators.*, math
 4. All prices are raw integers
 5. __init__ MUST accept **kwargs
-6. PascalCase class name, include docstring"""
+6. PascalCase class name, include docstring
+"""
 
 # ---------------------------------------------------------------------------
 # Public exports (same 4 names, same types — no consumer changes needed)
