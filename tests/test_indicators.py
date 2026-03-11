@@ -6,6 +6,8 @@ from src.strategy.indicators.ma import sma, ema
 from src.strategy.indicators.rsi import rsi
 from src.strategy.indicators.macd import macd
 from src.strategy.indicators.bollinger import bollinger_bands
+from src.strategy.indicators.adx import adx, plus_di, minus_di
+from src.strategy.indicators.stochastic import stochastic
 
 
 class TestSMA:
@@ -118,3 +120,120 @@ class TestBollingerBands:
         assert result is not None
         upper, middle, lower = result
         assert abs((upper - middle) - (middle - lower)) < 1e-10
+
+
+class TestADX:
+    """Tests for ADX, +DI, -DI indicators."""
+
+    def _trending_data(self, n=50):
+        """Generate strong uptrend data for testing."""
+        highs = [100 + i * 3 for i in range(n)]
+        lows = [95 + i * 3 for i in range(n)]
+        closes = [98 + i * 3 for i in range(n)]
+        return highs, lows, closes
+
+    def _sideways_data(self, n=50):
+        """Generate sideways/choppy data."""
+        highs = [105 + ((-1) ** i) * 2 for i in range(n)]
+        lows = [95 + ((-1) ** i) * 2 for i in range(n)]
+        closes = [100 + ((-1) ** i) * 1 for i in range(n)]
+        return highs, lows, closes
+
+    def test_insufficient_data(self):
+        highs = list(range(10))
+        lows = list(range(10))
+        closes = list(range(10))
+        assert adx(highs, lows, closes, 14) is None
+
+    def test_returns_float_in_range(self):
+        highs, lows, closes = self._trending_data()
+        result = adx(highs, lows, closes, 14)
+        assert result is not None
+        assert 0 <= result <= 100
+
+    def test_strong_trend_high_adx(self):
+        highs, lows, closes = self._trending_data(n=60)
+        result = adx(highs, lows, closes, 14)
+        assert result is not None
+        assert result > 25  # Strong trend should produce high ADX
+
+    def test_sideways_lower_adx(self):
+        highs, lows, closes = self._sideways_data(n=60)
+        trending_adx = adx(*self._trending_data(n=60), 14)
+        sideways_adx = adx(highs, lows, closes, 14)
+        assert trending_adx is not None and sideways_adx is not None
+        assert trending_adx > sideways_adx
+
+    def test_plus_di_minus_di(self):
+        highs, lows, closes = self._trending_data()
+        pdi = plus_di(highs, lows, closes, 14)
+        mdi = minus_di(highs, lows, closes, 14)
+        assert pdi is not None and mdi is not None
+        assert 0 <= pdi <= 100
+        assert 0 <= mdi <= 100
+
+    def test_uptrend_plus_di_greater(self):
+        highs, lows, closes = self._trending_data(n=60)
+        pdi = plus_di(highs, lows, closes, 14)
+        mdi = minus_di(highs, lows, closes, 14)
+        assert pdi is not None and mdi is not None
+        assert pdi > mdi  # In uptrend, +DI should exceed -DI
+
+
+class TestStochastic:
+    """Tests for Stochastic Oscillator."""
+
+    def test_insufficient_data(self):
+        assert stochastic([1, 2], [1, 2], [1, 2], k_period=14, d_period=3) is None
+
+    def test_returns_tuple(self):
+        n = 20
+        highs = [100 + i for i in range(n)]
+        lows = [90 + i for i in range(n)]
+        closes = [95 + i for i in range(n)]
+        result = stochastic(highs, lows, closes, k_period=14, d_period=3)
+        assert result is not None
+        k_val, d_val = result
+        assert isinstance(k_val, float)
+        assert isinstance(d_val, float)
+
+    def test_range_0_100(self):
+        n = 20
+        highs = [100 + i for i in range(n)]
+        lows = [90 + i for i in range(n)]
+        closes = [95 + i for i in range(n)]
+        result = stochastic(highs, lows, closes, k_period=14, d_period=3)
+        assert result is not None
+        k_val, d_val = result
+        assert 0 <= k_val <= 100
+        assert 0 <= d_val <= 100
+
+    def test_at_highest_high(self):
+        """When close == highest high, %K should be 100."""
+        n = 20
+        highs = [100] * n
+        lows = [90] * n
+        closes = [95] * (n - 1) + [100]  # Last close at highest high
+        result = stochastic(highs, lows, closes, k_period=14, d_period=1)
+        assert result is not None
+        assert result[0] == 100.0
+
+    def test_at_lowest_low(self):
+        """When close == lowest low, %K should be 0."""
+        n = 20
+        highs = [100] * n
+        lows = [90] * n
+        closes = [95] * (n - 1) + [90]  # Last close at lowest low
+        result = stochastic(highs, lows, closes, k_period=14, d_period=1)
+        assert result is not None
+        assert result[0] == 0.0
+
+    def test_zero_range(self):
+        """When high == low (no range), should return 50."""
+        n = 20
+        highs = [100] * n
+        lows = [100] * n
+        closes = [100] * n
+        result = stochastic(highs, lows, closes, k_period=14, d_period=3)
+        assert result is not None
+        assert result == (50.0, 50.0)

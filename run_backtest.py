@@ -1258,13 +1258,13 @@ class BacktestApp:
             self._append_chat("error", "Chat with the AI first to discuss a strategy idea.")
             return
 
-        conversation_summary = ChatClient.build_summary(
+        self._codegen_conversation_summary = ChatClient.build_summary(
             self._chat_client.conversation)
 
         gen_msg = (
             "Based on this strategy discussion, write the complete strategy code.\n\n"
             "## Conversation Summary\n"
-            + conversation_summary + "\n\n"
+            + self._codegen_conversation_summary + "\n\n"
             + STRATEGY_CODE_CONTEXT
         )
 
@@ -1349,7 +1349,13 @@ class BacktestApp:
         self.btn_send.config(state=tk.DISABLED)
         self.btn_generate.config(state=tk.DISABLED)
 
-        retry_msg = error_msg + "\n\n" + STRATEGY_CODE_CONTEXT
+        # Include conversation summary so the AI retains strategy context on retry
+        summary = getattr(self, "_codegen_conversation_summary", "")
+        summary_section = (
+            "## Conversation Summary (for context — generate the SAME strategy)\n"
+            + summary + "\n\n"
+        ) if summary else ""
+        retry_msg = summary_section + error_msg + "\n\n" + STRATEGY_CODE_CONTEXT
         remaining = retries_left - 1
 
         def _worker():
