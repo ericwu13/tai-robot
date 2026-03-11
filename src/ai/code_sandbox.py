@@ -19,7 +19,15 @@ ALLOWED_IMPORTS = {
     "src.strategy.indicators.macd",
     "src.strategy.indicators.bollinger",
     "src.strategy.indicators.atr",
+    "src.strategy.indicators.adx",
+    "src.strategy.indicators.stochastic",
     "math",
+}
+
+# All indicator names exported from src.strategy.indicators
+AVAILABLE_INDICATORS = {
+    "sma", "ema", "rsi", "macd", "bollinger_bands",
+    "atr", "true_range", "adx", "plus_di", "minus_di", "stochastic",
 }
 
 # Built-in names that are forbidden in AI-generated code
@@ -99,6 +107,18 @@ def validate_code(source: str) -> list[str]:
                 errors.append(f"Forbidden import: from {module}")
             if module in FORBIDDEN_MODULES:
                 errors.append(f"Dangerous module: {module}")
+
+            # Check for unsupported indicator names
+            if module == "src.strategy.indicators" or module.startswith("src.strategy.indicators."):
+                for alias in (node.names or []):
+                    name = alias.name
+                    if name != "*" and name not in AVAILABLE_INDICATORS:
+                        errors.append(
+                            f"Unsupported indicator: '{name}' is not available. "
+                            f"Available: {', '.join(sorted(AVAILABLE_INDICATORS))}. "
+                            f"Please create an issue at https://github.com/ericwu13/tai-robot/issues "
+                            f"to request support for '{name}'."
+                        )
 
     # 3. Check for forbidden built-in calls
     for node in ast.walk(tree):

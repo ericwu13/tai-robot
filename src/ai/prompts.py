@@ -77,6 +77,10 @@ Translate the given Python backtest strategy to TradingView Pine Script v5.
      Correct: `[middle, upper, lower] = ta.bb(close, period, std)`
      WRONG: `ta.bb(close, period, std)` used as a single value or with parentheses around tuple
    - `atr(highs, lows, closes, period)` -> `ta.atr(period)`
+   - `adx(highs, lows, closes, period)` -> `ta.adx(period)` (alias for `ta.dmi()` ADX output)
+   - `plus_di(highs, lows, closes, period)` -> use `ta.dmi()` +DI output
+   - `minus_di(highs, lows, closes, period)` -> use `ta.dmi()` -DI output
+   - `stochastic(highs, lows, closes, k_period, d_period)` -> `ta.stoch(close, high, low, k_period)` for %K, `ta.sma(%K, d_period)` for %D
 
 3. Map broker calls to Pine Script:
    - `broker.entry("tag", OrderSide.LONG)` -> `strategy.entry("tag", strategy.long)`
@@ -156,7 +160,9 @@ class MyStrategy(BacktestStrategy):
 ## Available Indicators
 ```python
 from src.strategy.indicators import sma, ema, rsi, macd, bollinger_bands
-from src.strategy.indicators.atr import atr, true_range
+from src.strategy.indicators import atr, true_range
+from src.strategy.indicators import adx, plus_di, minus_di
+from src.strategy.indicators import stochastic
 
 sma(values, period) -> float | None
 ema(values, period) -> float | None
@@ -164,7 +170,15 @@ rsi(values, period=14) -> float | None           # 0-100
 macd(values, fast_period=12, slow_period=26, signal_period=9) -> (macd_line, signal_line, histogram) | None
 bollinger_bands(values, period=20, num_std=2.0) -> (upper, middle, lower) | None
 atr(highs, lows, closes, period=14) -> float | None
+adx(highs, lows, closes, period=14) -> float | None   # 0-100, trend strength
+plus_di(highs, lows, closes, period=14) -> float | None  # +DI (0-100)
+minus_di(highs, lows, closes, period=14) -> float | None  # -DI (0-100)
+stochastic(highs, lows, closes, k_period=14, d_period=3) -> (k_value, d_value) | None  # %K, %D (0-100)
 ```
+
+**ONLY use indicators listed above.** Do NOT use any indicator function not in this list. \
+If the strategy discussion mentions an unavailable indicator, substitute with the closest \
+available one and explain the substitution in Notes.
 
 ## Code Rules
 1. Output exactly ONE code block starting with ```python (this exact tag is required for parsing)

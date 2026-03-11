@@ -191,3 +191,40 @@ class Good:
 '''
         errors = validate_code(source)
         assert errors == []
+
+    def test_new_indicator_imports_allowed(self):
+        source = '''
+from src.strategy.indicators import adx, plus_di, minus_di, stochastic
+
+class Good:
+    pass
+'''
+        errors = validate_code(source)
+        assert errors == []
+
+    def test_unsupported_indicator_error(self):
+        """Importing a non-existent indicator should produce a user-friendly error."""
+        source = '''
+from src.strategy.indicators import sma, vwap
+
+class Bad:
+    pass
+'''
+        errors = validate_code(source)
+        assert len(errors) == 1
+        assert "Unsupported indicator" in errors[0]
+        assert "'vwap'" in errors[0]
+        assert "github.com" in errors[0]
+
+    def test_unsupported_indicator_submodule(self):
+        """Importing from a non-existent indicator submodule should also be caught."""
+        source = '''
+from src.strategy.indicators.adx import adx, dmi_oscillator
+
+class Bad:
+    pass
+'''
+        errors = validate_code(source)
+        assert len(errors) == 1
+        assert "Unsupported indicator" in errors[0]
+        assert "'dmi_oscillator'" in errors[0]
