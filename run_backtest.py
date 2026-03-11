@@ -85,7 +85,7 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 65536
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, _taipei_now, _TZ_TAIPEI
 from src.live.session_store import load_session, session_summary
 
 # TAIFEX public data (no API key needed)
@@ -584,8 +584,30 @@ class BacktestApp:
         self._attempt_reconnect()
 
     def _schedule_reconnect(self):
-        """Schedule the next reconnection attempt with exponential backoff."""
+        """Schedule the next reconnection attempt with exponential backoff.
+
+        During off-market hours, defers reconnection until ~2 min before
+        the next session opens to avoid wasting attempts on idle connections
+        that the server will drop.
+        """
         if self._reconnect_attempt >= self._MAX_RECONNECT_ATTEMPTS:
+            # Check if we should defer to next market open instead of giving up
+            secs = seconds_until_market_open()
+            if secs > 0 and self._live_runner:
+                # Market closed — schedule one final attempt near market open
+                defer_secs = max(secs - 120, 60)  # 2 min before open, min 1 min
+                defer_mins = defer_secs // 60
+                self._reconnect_attempt = 0  # reset counter for fresh cycle
+                msg = (f"休市中 Market closed — reconnecting in ~{defer_mins}m "
+                       f"(before next session)")
+                self.btn_reconnect.config(state=tk.NORMAL)
+                self.status_var.set(msg)
+                _log(msg)
+                self._live_log_msg(msg, "status")
+                self._reconnect_timer_id = self.root.after(
+                    defer_secs * 1000, self._attempt_reconnect)
+                return
+
             msg = "自動重連失敗 Auto-reconnect failed — use Reconnect or Login button"
             self.btn_reconnect.config(state=tk.NORMAL)
             self.status_var.set(msg)
@@ -593,6 +615,21 @@ class BacktestApp:
             if self._live_runner:
                 self._live_log_msg(msg, "status")
             return
+
+        # During off-market hours, don't burn attempts — defer to near market open
+        if not is_market_open() and self._live_runner:
+            secs = seconds_until_market_open()
+            if secs > 300:  # more than 5 min until market open
+                defer_secs = max(secs - 120, 60)
+                defer_mins = defer_secs // 60
+                msg = (f"休市中 Market closed — deferring reconnect ~{defer_mins}m "
+                       f"(before next session)")
+                self.status_var.set(msg)
+                _log(msg)
+                self._live_log_msg(msg, "status")
+                self._reconnect_timer_id = self.root.after(
+                    defer_secs * 1000, self._attempt_reconnect)
+                return
 
         idx = min(self._reconnect_attempt, len(self._RECONNECT_DELAYS) - 1)
         delay = self._RECONNECT_DELAYS[idx]
@@ -678,12 +715,22 @@ class BacktestApp:
             _log("已重連 Reconnected — resubscribing ticks for live bot")
             self._resubscribe_ticks()
 
-    def _resubscribe_ticks(self):
+    _RESUBSCRIBE_MAX_RETRIES = 3
+    _RESUBSCRIBE_RETRY_DELAY = 5000  # ms
+
+    def _resubscribe_ticks(self, _retry: int = 0):
         """Re-subscribe to tick feed after reconnection."""
         if not self._live_runner:
             return
         # Use the stored COM symbol (e.g. "TX00"), same as initial subscription
         com_symbol = self._live_runner.symbol
+
+        # Reset history tracking so the history→live transition fires again
+        # and suppress_strategy gets re-enabled then cleared properly.
+        self._live_history_done = False
+        self._live_tick_count = 0
+        self._live_history_tick_count = 0
+        self._live_runner.suppress_strategy = True
 
         try:
             result = skQ.SKQuoteLib_RequestTicks(0, com_symbol)
@@ -691,10 +738,18 @@ class BacktestApp:
             if code != 0 and code >= 3000:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
+                if _retry < self._RESUBSCRIBE_MAX_RETRIES:
+                    self._live_log_msg(
+                        f"重試訂閱 Retrying tick subscribe in {self._RESUBSCRIBE_RETRY_DELAY // 1000}s "
+                        f"(attempt {_retry + 1}/{self._RESUBSCRIBE_MAX_RETRIES})...", "status")
+                    next_retry = _retry + 1
+                    self.root.after(self._RESUBSCRIBE_RETRY_DELAY,
+                                   lambda r=next_retry: self._resubscribe_ticks(r))
                 return
 
             self._live_tick_active = True
             self._last_tick_time = time.time()
+            self._reconnect_grace_until = time.time() + 30  # grace period for watchdog
             self._live_log_msg(f"已重新訂閱 Tick resubscription active for {com_symbol}", "status")
             # Restart tick drain if not already running
             self._drain_tick_queue()
@@ -735,6 +790,7 @@ class BacktestApp:
         self._reconnect_attempt: int = 0
         self._reconnect_timer_id = None
         self._last_tick_time: float = 0.0  # time.time() of last tick
+        self._reconnect_grace_until: float = 0.0  # watchdog grace period after reconnect
         self._live_poll_id = None  # root.after() id for cancellation
         self._live_warmup_mode: bool = False
         self._live_warmup_data: list[str] = []
@@ -2403,9 +2459,24 @@ class BacktestApp:
         source = self._data_source or "unknown"
         header_lines = [f" 商品 Symbol:  {symbol}", f" 資料來源 Source:  {source}"]
         if bars:
-            header_lines.append(f" 資料範圍 Range:  {bars[0].dt.strftime('%Y-%m-%d %H:%M')} ~ "
-                                f"{bars[-1].dt.strftime('%Y-%m-%d %H:%M')}")
-            header_lines.append(f" K棒數量 Bars:  {len(bars)}")
+            # For live mode, show only live-trading range (exclude warmup history)
+            is_live = self._live_runner and self._live_runner.state != LiveState.IDLE
+            if is_live:
+                live_bars = self._live_runner.get_live_bars()
+                if live_bars:
+                    header_lines.append(
+                        f" 資料範圍 Range:  {live_bars[0].dt.strftime('%Y-%m-%d %H:%M')} ~ "
+                        f"{live_bars[-1].dt.strftime('%Y-%m-%d %H:%M')}")
+                    header_lines.append(
+                        f" K棒數量 Bars:  {len(live_bars)} 即時 live + "
+                        f"{len(bars) - len(live_bars)} 暖機 warmup")
+                else:
+                    header_lines.append(f" K棒數量 Bars:  {len(bars)} (暖機中 warming up)")
+            else:
+                header_lines.append(
+                    f" 資料範圍 Range:  {bars[0].dt.strftime('%Y-%m-%d %H:%M')} ~ "
+                    f"{bars[-1].dt.strftime('%Y-%m-%d %H:%M')}")
+                header_lines.append(f" K棒數量 Bars:  {len(bars)}")
         # Show live-specific info
         if self._live_runner and self._live_runner.state != LiveState.IDLE:
             status = self._live_runner.get_status()
@@ -3161,6 +3232,9 @@ class BacktestApp:
             return
         if not is_market_open():
             return
+        # Grace period after reconnect — history ticks are replaying
+        if time.time() < self._reconnect_grace_until:
+            return
         elapsed = time.time() - self._last_tick_time
         if elapsed > self._TICK_WATCHDOG_TIMEOUT:
             # If the gap spans a market-closed period (e.g. AM→PM transition),
@@ -3239,8 +3313,13 @@ class BacktestApp:
             return
 
         self._live_tick_count += 1
+        now = time.time()
         if not is_history:
-            self._last_tick_time = time.time()
+            self._last_tick_time = now
+        elif not self._live_history_done:
+            # During history replay (initial or post-reconnect), keep
+            # watchdog timer alive so it doesn't false-trigger.
+            self._last_tick_time = now
 
         # Detect transition from history to live ticks
         if not is_history and not self._live_history_done:
