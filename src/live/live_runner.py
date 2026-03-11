@@ -91,6 +91,48 @@ def is_market_open(dt: datetime | None = None) -> bool:
     return False
 
 
+def seconds_until_market_open() -> int:
+    """Return seconds until the next market session opens, or 0 if already open.
+
+    Sessions: AM 08:45-13:45, PM/Night 15:00-05:00+1.
+    Reconnect should be scheduled ~2 min before open to allow login time.
+    """
+    now = _taipei_now()
+    if is_market_open(now):
+        return 0
+
+    weekday = now.weekday()
+    h, m = now.hour, now.minute
+    t = h * 60 + m
+
+    am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]   # 525
+    pm_open = _PM_OPEN[0] * 60 + _PM_OPEN[1]    # 900
+
+    # Sunday: next open is Monday 08:45
+    if weekday == 6:
+        return (24 * 60 - t + am_open) * 60
+
+    # Saturday after 05:00: next open is Monday 08:45
+    if weekday == 5:
+        return ((24 * 60 - t) + 24 * 60 + am_open) * 60
+
+    # Weekday gaps:
+    # 05:00-08:45 → next open at 08:45 (AM)
+    if 5 * 60 <= t < am_open:
+        return (am_open - t) * 60
+
+    # 13:45-15:00 → next open at 15:00 (PM/Night)
+    if _AM_CLOSE[0] * 60 + _AM_CLOSE[1] <= t < pm_open:
+        return (pm_open - t) * 60
+
+    # Monday 00:00-05:00 (closed, no Fri carryover)
+    if weekday == 0 and t < 5 * 60:
+        return (am_open - t) * 60
+
+    # Fallback: try AM open tomorrow
+    return (24 * 60 - t + am_open) * 60
+
+
 # Map (kline_type, kline_minute) to interval in seconds
 _INTERVAL_SECONDS = {
     (0, 240): 14400,
@@ -151,6 +193,7 @@ class LiveRunner:
         self._seen_1m_dts: set[datetime] = set()  # for dedup
         self._1m_bars: deque[Bar] = deque(maxlen=5000)  # raw 1-min bars
         self._aggregated_bars: list[Bar] = []  # all completed aggregated bars
+        self._warmup_bar_count: int = 0  # count of warmup bars in _aggregated_bars
         self._callbacks: dict[str, list] = {}
         self.suppress_strategy: bool = False  # suppress strategy during history catchup
 
@@ -252,6 +295,7 @@ class LiveRunner:
             self._bar_index += 1
 
         self._aggregated_bars.extend(bars)
+        self._warmup_bar_count = len(self._aggregated_bars)
 
         # For 1-min strategies, warmup bars are also 1-min — store for multi-TF charting
         if self.target_interval == 60:
@@ -437,6 +481,10 @@ class LiveRunner:
     def get_bars(self) -> list[Bar]:
         """Return all aggregated bars (warmup + live)."""
         return list(self._aggregated_bars)
+
+    def get_live_bars(self) -> list[Bar]:
+        """Return only live-trading aggregated bars (excluding warmup history)."""
+        return list(self._aggregated_bars[self._warmup_bar_count:])
 
     def get_1m_bars(self) -> list[Bar]:
         """Return snapshot of stored 1-min bars."""
