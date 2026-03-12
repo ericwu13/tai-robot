@@ -3143,6 +3143,7 @@ class BacktestApp:
                     count = runner.feed_warmup_bars(kline_strings)
                     self._live_log_msg(f"TV暖機完成 TV warmup done: {count} bars", "status")
                     self._update_live_status()
+                    self._update_live_results()  # enable chart button & populate _last_bars
                     self._start_live_tick_subscription()
 
                 self.root.after(0, _finish)
@@ -3166,6 +3167,7 @@ class BacktestApp:
         count = self._live_runner.feed_warmup_bars(data)
         self._live_log_msg(f"COM暖機完成 COM warmup done: {count} bars", "status")
         self._update_live_status()
+        self._update_live_results()  # enable chart button & populate _last_bars
         self._start_live_tick_subscription()
 
     # ── Tick-based live data feed ──
