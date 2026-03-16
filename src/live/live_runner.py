@@ -133,6 +133,37 @@ def seconds_until_market_open() -> int:
     return (24 * 60 - t + am_open) * 60
 
 
+def minutes_until_session_close() -> int | None:
+    """Return minutes until the current session closes, or None if market is closed.
+
+    Sessions: AM closes 13:45, Night closes 05:00.
+    Saturday night carryover closes at 05:00.
+    """
+    now = _taipei_now()
+    if not is_market_open(now):
+        return None
+
+    h, m = now.hour, now.minute
+    t = h * 60 + m
+
+    am_close = _AM_CLOSE[0] * 60 + _AM_CLOSE[1]  # 825
+    night_close = 5 * 60  # 300
+
+    # AM session (08:45-13:45)
+    if am_close > t >= _AM_OPEN[0] * 60 + _AM_OPEN[1]:
+        return am_close - t
+
+    # Night session (15:00-05:00+1)
+    if t >= _PM_OPEN[0] * 60 + _PM_OPEN[1]:
+        # After 15:00, close is at 05:00 next day = (24*60 - t) + 300
+        return (24 * 60 - t) + night_close
+    if t < night_close:
+        # After midnight, before 05:00
+        return night_close - t
+
+    return None
+
+
 # Map (kline_type, kline_minute) to interval in seconds
 _INTERVAL_SECONDS = {
     (0, 240): 14400,
@@ -196,6 +227,7 @@ class LiveRunner:
         self._warmup_bar_count: int = 0  # count of warmup bars in _aggregated_bars
         self._callbacks: dict[str, list] = {}
         self.suppress_strategy: bool = False  # suppress strategy during history catchup
+        self.trading_mode: str = "paper"  # "paper" or "semi_auto"
 
     # ── Lock file ──
 
@@ -548,6 +580,7 @@ class LiveRunner:
                 "bot_name": self.bot_name,
                 "point_value": self.point_value,
                 "target_interval": self.target_interval,
+                "trading_mode": self.trading_mode,
                 "started_at": self._started_at,
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "bar_index": self._bar_index,
