@@ -69,6 +69,14 @@ class BacktestEngine:
         # Force close any open position at end of data
         if bars:
             last_dt = bars[-1].dt.strftime("%Y-%m-%d %H:%M") if bars[-1].dt else ""
+            if (self.broker.position_size > 0
+                    and self.broker.entry_price > 0
+                    and bars[-1].close > 0):
+                pct = abs(bars[-1].close - self.broker.entry_price) / self.broker.entry_price
+                if pct > 0.20:
+                    print(f"[WARNING] force_close: price {bars[-1].close} deviates "
+                          f"{pct:.0%} from entry {self.broker.entry_price} at {last_dt} "
+                          f"— data may be corrupted")
             self.broker.force_close(len(bars) - 1, bars[-1].close, last_dt)
 
         return BacktestResult(

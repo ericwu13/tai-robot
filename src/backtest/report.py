@@ -54,10 +54,10 @@ def export_trades_csv(trades: list[Trade], path: str | Path) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "Tag", "Side", "Qty", "Entry Price", "Exit Price",
-            "Entry Bar", "Exit Bar", "P&L",
+            "Entry DT", "Exit DT", "Entry Bar", "Exit Bar", "P&L",
         ])
         for t in trades:
             writer.writerow([
                 t.tag, t.side.value, t.qty, t.entry_price, t.exit_price,
-                t.entry_bar_index, t.exit_bar_index, t.pnl,
+                t.entry_dt, t.exit_dt, t.entry_bar_index, t.exit_bar_index, t.pnl,
             ])

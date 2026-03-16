@@ -21,7 +21,7 @@ import time
 import traceback
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
 # Ensure src is importable — handle PyInstaller frozen EXE
@@ -85,7 +85,7 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 65536
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, _taipei_now, _TZ_TAIPEI
 from src.live.session_store import load_session, session_summary
 
 # TAIFEX public data (no API key needed)
@@ -121,7 +121,7 @@ STRATEGIES: dict[str, type[BacktestStrategy]] = {
 
 # ── COM setup (only if not using CSV mode) ──
 _com_available = False
-skC = skQ = skR = None
+skC = skQ = skR = skO = None
 
 def _init_com():
     """Initialise Capital API COM objects (SKCOM).
@@ -135,7 +135,7 @@ def _init_com():
         sibling DLLs, then restore with SetDllDirectoryW(None) so SKCOM's
         runtime network calls can find system DLLs (WinHTTP, Schannel, etc.).
     """
-    global _com_available, skC, skQ, skR
+    global _com_available, skC, skQ, skR, skO
     try:
         import ctypes
         import comtypes
@@ -210,6 +210,7 @@ def _init_com():
 
         skQ = comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib)
         skR = comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib)
+        skO = comtypes.client.CreateObject(sk.SKOrderLib, interface=sk.ISKOrderLib)
 
         # ── Phase 3: Restore default DLL search order ──
         # None = default Windows search (app dir → System32 → Windows → PATH).
@@ -292,8 +293,14 @@ _CACHE_DIR = os.path.join(project_root, "data")
 
 # Multi-symbol configuration: COM symbol -> (csv_prefix, tv_symbol, point_value)
 _SYMBOL_CONFIG = {
-    "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100, "taifex_id": "TX"},
-    "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100, "taifex_id": "MTX"},
+    "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100,
+             "taifex_id": "TX", "order_symbol": "TXFD0"},
+    "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100,
+              "taifex_id": "MTX", "order_symbol": "MTXFD0",
+              "kline_symbol": "TX00", "tick_symbol": "TX00"},
+    "TMF00": {"prefix": "IMF1", "tv": "IMF1!", "pv": 10, "tick_divisor": 100,
+              "taifex_id": "TMF", "order_symbol": "TMFD0",
+              "kline_symbol": "TX00", "tick_symbol": "TX00"},
 }
 
 _CACHE_SUFFIXES = {
@@ -358,8 +365,14 @@ def filter_bars_by_date(
 
 
 def _log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
-    line = f"[{ts}] {msg}"
+    tpe = _taipei_now()
+    local = datetime.now()
+    ts_tpe = tpe.strftime("%H:%M:%S")
+    ts_local = local.strftime("%H:%M:%S")
+    if ts_tpe == ts_local:
+        line = f"[{ts_tpe}] {msg}"
+    else:
+        line = f"[{ts_tpe} TPE / {ts_local} local] {msg}"
     print(line, flush=True)
     if _app and hasattr(_app, "log_text"):
         try:
@@ -458,6 +471,20 @@ class SKReplyLibEvent:
         pass
 
 
+class SKOrderLibEvents:
+    def OnAccount(self, bstrLogInID, bstrAccountData):
+        _ui_queue.put_nowait(("account", bstrAccountData))
+
+    def OnAsyncOrder(self, nThreadID, nCode, bstrMessage):
+        _ui_queue.put_nowait(("order_result", (nCode, bstrMessage)))
+
+    def OnOpenInterest(self, bstrData):
+        _ui_queue.put_nowait(("log", f"未平倉 OpenInterest: {bstrData}"))
+
+    def OnFutureRights(self, bstrData):
+        _ui_queue.put_nowait(("log", f"權益數 FutureRights: {bstrData}"))
+
+
 class BacktestApp:
     def __init__(self, root: tk.Tk):
         global _app
@@ -535,6 +562,24 @@ class BacktestApp:
                         self._on_reconnected()
                     elif data == "disconnected":
                         self._on_disconnected()
+                elif kind == "account":
+                    # Parse account data: "TF,branch,,account,..." format
+                    parts = data.split(",") if isinstance(data, str) else []
+                    if len(parts) >= 4 and parts[0] == "TF":
+                        acct = parts[1] + parts[3]
+                        self._futures_account = acct
+                        _log(f"期貨帳號 Futures account: {acct}")
+                elif kind == "order_result":
+                    code, msg = data
+                    if code == 0:
+                        _log(f"委託回報 Order OK: {msg}")
+                        if self._live_runner:
+                            self._live_log_msg(f"實單成功 Order OK: {msg}", "entry")
+                    else:
+                        err = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                        _log(f"委託失敗 Order FAILED: code={code} {err} {msg}")
+                        if self._live_runner:
+                            self._live_log_msg(f"實單失敗 Order FAILED: {err}", "exit")
         except queue.Empty:
             pass
         self.root.after(100, self._drain_ui_queue)
@@ -722,8 +767,8 @@ class BacktestApp:
         """Re-subscribe to tick feed after reconnection."""
         if not self._live_runner:
             return
-        # Use the stored COM symbol (e.g. "TX00"), same as initial subscription
-        com_symbol = self._live_runner.symbol
+        # Use the stored COM tick symbol (e.g. TX00 for MTX00/TMF00)
+        com_symbol = getattr(self, '_live_tick_com_symbol', self._live_runner.symbol)
 
         # Reset history tracking so the history→live transition fires again
         # and suppress_strategy gets re-enabled then cleared properly.
@@ -786,6 +831,11 @@ class BacktestApp:
         # Live trading state
         self._live_chart: LiveChart | None = None
         self._live_runner: LiveRunner | None = None
+        # Real trading state
+        self._trading_mode: str = "paper"  # "paper" or "semi_auto"
+        self._futures_account: str = ""  # full account for order submission
+        self._order_confirm_dlg = None  # active confirmation dialog
+        self._order_confirm_timer_id = None  # countdown timer
         # Reconnection state
         self._reconnect_attempt: int = 0
         self._reconnect_timer_id = None
@@ -800,6 +850,7 @@ class BacktestApp:
         self._live_tick_active: bool = False
         self._live_bar_builder: BarBuilder | None = None
         self._live_tick_symbol: str = ""
+        self._live_tick_com_symbol: str = ""
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -1911,6 +1962,16 @@ class BacktestApp:
             skR.SKReplyLib_ConnectByID(user_id)
             code = skQ.SKQuoteLib_EnterMonitorLONG()
             _log(f"進入報價監控 EnterMonitorLONG: code={code}")
+
+            # Initialize order service for real trading
+            if skO is not None:
+                try:
+                    skO.SKOrderLib_Initialize()
+                    skO.GetUserAccount()
+                    _log("委託服務初始化 Order service initialized")
+                except Exception as e:
+                    _log(f"委託服務初始化失敗 Order service init failed: {e}")
+
             self.status_var.set("連線中 Connecting...")
             self.root.after(3000, self._check_connection)
 
@@ -1981,8 +2042,12 @@ class BacktestApp:
             bars_per_tday = 14
         elif minute_num >= 30:    # 30m
             bars_per_tday = 28
-        else:                     # 15m or less
+        elif minute_num >= 15:    # 15m
             bars_per_tday = 56
+        elif minute_num >= 5:     # 5m
+            bars_per_tday = 60
+        else:                     # 1m
+            bars_per_tday = 300
         trading_days = 250 // bars_per_tday
         chunk_days = max(5, int(trading_days * 7 / 5))
         self._fetch_chunks = []
@@ -2014,7 +2079,11 @@ class BacktestApp:
         total = len(self._fetch_chunks)
         self.status_var.set(f"查詢中 Fetching chunk {n}/{total}: {chunk_start}~{chunk_end}")
         self._chunk_bar_count = 0
-        _log(f"請求K線 [{n}/{total}] {symbol} type={kline_type} "
+        # MTX00/TMF00 share TX00's KLine data (same TAIEX index, different point values)
+        cfg = _SYMBOL_CONFIG.get(symbol, {})
+        kline_sym = cfg.get("kline_symbol", symbol)
+        sym_note = f" (via {kline_sym})" if kline_sym != symbol else ""
+        _log(f"請求K線 [{n}/{total}] {symbol}{sym_note} type={kline_type} "
              f"{chunk_start}~{chunk_end} min={minute_num}")
 
         self._fetch_symbol = symbol
@@ -2023,7 +2092,7 @@ class BacktestApp:
 
         try:
             code = skQ.SKQuoteLib_RequestKLineAMByDate(
-                symbol, kline_type, 1, 0, chunk_start, chunk_end, minute_num)
+                kline_sym, kline_type, 1, 0, chunk_start, chunk_end, minute_num)
 
             if code != 0:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
@@ -2311,6 +2380,17 @@ class BacktestApp:
         if len(unique_bars) < len(bars):
             _log(f"去重 Deduplicated: {len(bars)} -> {len(unique_bars)} bars")
         bars = unique_bars
+
+        # Filter to AM session (08:45-13:44) — API may return full-session data
+        # despite requesting AM-only (session param=1)
+        if bars and self._data_source == "API":
+            am_start = dt_time(8, 45)
+            am_end = dt_time(13, 44)
+            am_bars = [b for b in bars if b.dt and am_start <= b.dt.time() <= am_end]
+            if len(am_bars) < len(bars):
+                _log(f"日盤過濾 AM session filter: {len(bars)} -> {len(am_bars)} bars "
+                     f"(removed {len(bars) - len(am_bars)} non-AM bars)")
+            bars = am_bars
 
         if bars:
             _log(f"API資料 Parsed {len(bars)} API bars: {bars[0].dt} ~ {bars[-1].dt}")
@@ -2773,7 +2853,7 @@ class BacktestApp:
         # Build dialog
         dlg = tk.Toplevel(self.root)
         dlg.title("選擇機器人 Select Bot Session")
-        dlg.geometry("500x400")
+        dlg.geometry("500x500")
         dlg.transient(self.root)
         dlg.grab_set()
 
@@ -2824,7 +2904,7 @@ class BacktestApp:
                     return
                 idx = tree.index(sel[0])
                 name, sess = existing_bots[idx]
-                result[0] = (name, sess)
+                result[0] = (name, sess, mode_var.get())
                 dlg.destroy()
 
             ttk.Button(dlg, text="載入選取 Load Selected", command=on_load).pack(pady=(0, 8))
@@ -2862,10 +2942,28 @@ class BacktestApp:
                                      "請使用「載入」或輸入新名稱\n"
                                      "Use 'Load' or enter a different name.", parent=dlg)
                 return
-            result[0] = (name, None)
+            result[0] = (name, None, mode_var.get())
             dlg.destroy()
 
         ttk.Button(new_frame, text="建立 Create", command=on_create).pack(side=tk.LEFT)
+
+        # Trading mode selector
+        ttk.Separator(dlg, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
+        mode_frame = ttk.LabelFrame(dlg, text="交易模式 Trading Mode")
+        mode_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        mode_var = tk.StringVar(value="paper")
+        ttk.Radiobutton(mode_frame, text="模擬 Paper (模擬交易，不下單)",
+                        variable=mode_var, value="paper").pack(anchor=tk.W, padx=10, pady=2)
+        semi_auto_rb = ttk.Radiobutton(
+            mode_frame,
+            text="半自動 Semi-Auto (模擬成交後確認下單，10秒未回應則跳過)",
+            variable=mode_var, value="semi_auto")
+        semi_auto_rb.pack(anchor=tk.W, padx=10, pady=2)
+        # Disable semi-auto if not connected or no account
+        if not (self._logged_in and self._futures_account):
+            semi_auto_rb.config(state=tk.DISABLED)
+            ttk.Label(mode_frame, text="  (需先登入才能使用半自動 Login required for semi-auto)",
+                      foreground="gray").pack(anchor=tk.W, padx=10)
 
         # Cancel
         ttk.Button(dlg, text="取消 Cancel", command=dlg.destroy).pack(pady=(0, 10))
@@ -2897,7 +2995,8 @@ class BacktestApp:
         result = self._show_bot_session_dialog(symbol, base_dir)
         if result is None:  # cancelled
             return
-        bot_name, resume_session = result
+        bot_name, resume_session, trading_mode = result
+        self._trading_mode = trading_mode
         self.bot_name_var.set(bot_name)
 
         # If resuming, restore strategy + symbol from saved session
@@ -2996,6 +3095,7 @@ class BacktestApp:
             strategy_display_name=self.strategy_var.get(),
         )
         self._live_runner.acquire_lock()
+        self._live_runner.trading_mode = trading_mode
 
         # Restore previous session if resuming
         if resume_session:
@@ -3019,8 +3119,15 @@ class BacktestApp:
         self.chart_tf_combo.config(state="readonly")
         self.chart_tf_var.set("Native")
 
-        self._live_log_msg(f"部署中 Deploying: {strategy.name} on {symbol} [{bot_name}]", "status")
-        _log(f"部署即時機器人 Deploying live bot: {strategy.name} on {symbol} [{bot_name}]")
+        mode_label = "模擬 Paper" if trading_mode == "paper" else "半自動 Semi-Auto"
+        self._live_log_msg(
+            f"部署中 Deploying: {strategy.name} on {symbol} [{bot_name}] "
+            f"模式={mode_label}", "status")
+        _log(f"部署即時機器人 Deploying live bot: {strategy.name} on {symbol} [{bot_name}] mode={trading_mode}")
+
+        if trading_mode == "semi_auto":
+            self._live_log_msg(
+                "*** 半自動模式 SEMI-AUTO MODE — 模擬成交後將提示下單確認 ***", "exit")
 
         # Start warmup
         self._start_live_warmup()
@@ -3059,12 +3166,15 @@ class BacktestApp:
         end_str = dt_end.strftime("%Y%m%d")
 
         symbol = self._live_runner.symbol
-        _log(f"COM暖機查詢 COM warmup fetch: {symbol} type={kline_type} "
+        # MTX00/TMF00 share TX00's KLine data (same TAIEX index)
+        cfg = _SYMBOL_CONFIG.get(symbol, {})
+        kline_sym = cfg.get("kline_symbol", symbol)
+        _log(f"COM暖機查詢 COM warmup fetch: {kline_sym} (for {symbol}) type={kline_type} "
              f"min={kline_minute} {start_str}~{end_str}")
 
         try:
             code = skQ.SKQuoteLib_RequestKLineAMByDate(
-                symbol, kline_type, 1, 0, start_str, end_str, kline_minute)
+                kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0 and code >= 3000:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"暖機查詢失敗 Warmup fetch failed: {msg}")
@@ -3184,7 +3294,11 @@ class BacktestApp:
                 f"已載入歷史1分K Reloaded {n_reloaded} saved 1m bars from CSV", "status")
 
         symbol = self._live_runner.symbol
-        self._live_tick_symbol = symbol
+        # MTX00/TMF00 use TX00 ticks (same TAIEX index prices)
+        cfg = _SYMBOL_CONFIG.get(symbol, {})
+        tick_sym = cfg.get("tick_symbol", symbol)
+        self._live_tick_symbol = symbol  # keep original for logging/orders
+        self._live_tick_com_symbol = tick_sym  # actual COM subscription symbol
         self._live_bar_builder = BarBuilder(symbol, interval=60)
 
         if not _com_available or not self._quote_connected:
@@ -3195,9 +3309,10 @@ class BacktestApp:
         # Suppress strategy during history tick catchup — no trades on old data
         self._live_runner.suppress_strategy = True
 
-        self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}...", "status")
+        sym_note = f" (via {tick_sym})" if tick_sym != symbol else ""
+        self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}{sym_note}...", "status")
         try:
-            result = skQ.SKQuoteLib_RequestTicks(0, symbol)
+            result = skQ.SKQuoteLib_RequestTicks(0, tick_sym)
             # COM may return (code, stockIdx) tuple or just an int
             if isinstance(result, (list, tuple)):
                 code = result[0]
@@ -3232,7 +3347,43 @@ class BacktestApp:
             return
         self._update_live_status()
         self._check_tick_watchdog()
+        self._check_session_end_close()
         self._live_poll_id = self.root.after(30000, self._schedule_status_update)
+
+    _SESSION_END_CLOSE_MINUTES = 2  # force close N minutes before session end
+
+    def _check_session_end_close(self):
+        """Force-close open positions before market session ends.
+
+        Prevents positions from staying open over weekends or overnight gaps.
+        Triggers 2 minutes before session close (13:43 AM, 04:58 night).
+        """
+        if not self._live_runner or self._live_runner.broker.position_size == 0:
+            return
+        mins = minutes_until_session_close()
+        if mins is None:
+            return
+        if mins > self._SESSION_END_CLOSE_MINUTES:
+            return
+
+        # Force close the position
+        runner = self._live_runner
+        bars = runner._aggregated_bars
+        if not bars:
+            return
+        last_bar = bars[-1]
+        last_dt = last_bar.dt.strftime("%Y-%m-%d %H:%M") if last_bar.dt else ""
+        side = runner.broker.trades[-1].side.value if runner.broker.trades else ""
+
+        self._live_log_msg(
+            f"盤前自動平倉 Session-end auto close: {mins}min to close, "
+            f"force closing position", "exit")
+        runner.broker.force_close(runner._bar_index, last_bar.close, last_dt)
+        runner._log_decision(
+            last_bar, "FORCE_CLOSE", side,
+            "session_end", last_bar.close, f"auto close {mins}min before session end",
+        )
+        runner._auto_save_session()
 
     def _check_tick_watchdog(self):
         """Warn if no ticks have arrived for too long during market hours."""
@@ -3439,10 +3590,226 @@ class BacktestApp:
                 trades = self._live_runner.broker.trades
                 self._live_chart.push_trade(trades[-1], len(trades) - 1)
 
+        # Semi-auto: prompt for real order on fills
+        if self._trading_mode == "semi_auto" and action in ("ENTRY_FILL", "TRADE_CLOSE", "FORCE_CLOSE"):
+            self._handle_semi_auto_order(decision)
+
+    # ── Semi-auto real order handling ──
+
+    def _handle_semi_auto_order(self, decision):
+        """Handle semi-auto order confirmation for a simulated fill."""
+        action = decision["action"]
+        side = decision["side"]
+        price = decision["price"]
+
+        # Determine real order side
+        if action == "ENTRY_FILL":
+            # Entry: same direction as simulated
+            buy_sell = 0 if side == "LONG" else 1  # 0=buy, 1=sell
+            order_desc = f"買進 BUY" if buy_sell == 0 else "賣出 SELL"
+            action_type = "entry"
+        else:
+            # Exit/close: reverse direction
+            buy_sell = 1 if side == "LONG" else 0  # close long=sell, close short=buy
+            order_desc = f"賣出 SELL" if buy_sell == 1 else "買進 BUY"
+            action_type = "exit"
+
+        symbol = self._live_runner.symbol if self._live_runner else "?"
+        cfg = _SYMBOL_CONFIG.get(symbol, {})
+        order_symbol = cfg.get("order_symbol", symbol)
+
+        if action in ("FORCE_CLOSE", "TRADE_CLOSE"):
+            # Exits auto-send: avoid dangling real positions
+            label = "強制平倉" if action == "FORCE_CLOSE" else "平倉"
+            self._live_log_msg(
+                f"{label}自動送單 Auto-sending {action.lower()}: {order_desc} {order_symbol}", "exit")
+            self._log_order_decision("REAL_ORDER_AUTO", f"{action.lower()} {order_desc} {order_symbol}")
+            self._send_real_order(buy_sell, order_symbol, action_type, price)
+            return
+
+        # Entry: show timed confirmation dialog
+        self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type)
+
+    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type):
+        """Show a non-blocking 10-second confirmation dialog for a real order."""
+        # Dismiss any existing dialog
+        self._dismiss_order_dialog("replaced")
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("確認下單 Confirm Order")
+        dlg.geometry("440x230")
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+
+        # Don't use grab_set — must not block main thread
+        self._order_confirm_dlg = dlg
+        countdown = [10]  # mutable for closure
+
+        # Header
+        color = "#228B22" if buy_sell == 0 else "#DC143C"
+        action_label = "進場 ENTRY" if action_type == "entry" else "出場 EXIT"
+        header = tk.Label(dlg, text=f"{action_label}: {order_desc}",
+                         font=("", 16, "bold"), fg=color)
+        header.pack(pady=(15, 5))
+
+        # Order details
+        symbol = self._live_runner.symbol if self._live_runner else "?"
+        cfg = _SYMBOL_CONFIG.get(symbol, {})
+        pv = cfg.get("pv", "?")
+        tk.Label(dlg, text=f"商品 Symbol: {order_symbol} ({symbol})  |  每點 PV: {pv} NTD",
+                font=("", 11)).pack(pady=2)
+        tk.Label(dlg, text=f"模擬價格 Sim Price: {price:,}  |  數量 Qty: 1 口",
+                font=("", 11)).pack(pady=2)
+        tk.Label(dlg, text="實單將以市價IOC送出 Will send as IOC market order",
+                font=("", 9), fg="gray").pack(pady=2)
+
+        countdown_label = tk.Label(dlg, text=f"自動跳過 Auto-skip in {countdown[0]}s",
+                                  font=("", 10), fg="orange")
+        countdown_label.pack(pady=5)
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(pady=10)
+
+        def on_confirm():
+            self._dismiss_order_dialog("confirmed")
+            self._send_real_order(buy_sell, order_symbol, action_type, price)
+
+        def on_skip():
+            self._dismiss_order_dialog("skipped")
+
+        ttk.Button(btn_frame, text="確認送出 Confirm", command=on_confirm).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="跳過 Skip", command=on_skip).pack(side=tk.LEFT, padx=10)
+
+        # Audio alert
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
+
+        # Countdown timer
+        def tick():
+            if not dlg.winfo_exists():
+                return
+            countdown[0] -= 1
+            if countdown[0] <= 0:
+                self._dismiss_order_dialog("timeout")
+                return
+            countdown_label.config(text=f"自動跳過 Auto-skip in {countdown[0]}s")
+            self._order_confirm_timer_id = dlg.after(1000, tick)
+
+        self._order_confirm_timer_id = dlg.after(1000, tick)
+
+        # Handle window close
+        dlg.protocol("WM_DELETE_WINDOW", on_skip)
+
+    def _dismiss_order_dialog(self, reason):
+        """Close the order confirmation dialog and log the outcome."""
+        if self._order_confirm_timer_id and self._order_confirm_dlg:
+            try:
+                self._order_confirm_dlg.after_cancel(self._order_confirm_timer_id)
+            except Exception:
+                pass
+            self._order_confirm_timer_id = None
+
+        if self._order_confirm_dlg:
+            try:
+                self._order_confirm_dlg.destroy()
+            except Exception:
+                pass
+            self._order_confirm_dlg = None
+
+        if reason == "timeout":
+            self._live_log_msg("實單跳過 Order skipped (timeout 10s)", "status")
+            self._log_order_decision("REAL_ORDER_TIMEOUT", "timeout 10s")
+        elif reason == "skipped":
+            self._live_log_msg("實單跳過 Order skipped by user", "status")
+            self._log_order_decision("REAL_ORDER_SKIPPED", "user skipped")
+        elif reason == "confirmed":
+            pass  # logged in _send_real_order
+        # "replaced" = new dialog replaced old one, no log needed
+
+    def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price):
+        """Build FUTUREORDER and send via COM SKOrderLib."""
+        if not _com_available or skO is None:
+            self._live_log_msg("實單失敗 Order FAILED: COM not available", "exit")
+            return
+        if not self._futures_account:
+            self._live_log_msg("實單失敗 Order FAILED: no futures account", "exit")
+            return
+
+        try:
+            import comtypes.gen.SKCOMLib as sk
+
+            oOrder = sk.FUTUREORDER()
+            oOrder.bstrFullAccount = self._futures_account
+            oOrder.bstrStockNo = order_symbol
+            oOrder.sBuySell = buy_sell
+            oOrder.sTradeType = 1     # IOC (immediate-or-cancel)
+            oOrder.sDayTrade = 0      # non-daytrade
+            oOrder.bstrPrice = "0"    # market price
+            oOrder.nQty = 1           # safety: max 1 contract
+            oOrder.sNewClose = 2      # auto new/close
+            oOrder.sReserved = 0      # during session
+
+            user_id = self.login_user_var.get().strip()
+            side_str = "BUY" if buy_sell == 0 else "SELL"
+            self._live_log_msg(
+                f"送出實單 Sending: {side_str} {order_symbol} x1 IOC MKT "
+                f"(模擬價={sim_price:,})", action_type)
+            _log(f"REAL ORDER: {side_str} {order_symbol} acct={self._futures_account} "
+                 f"sim_price={sim_price}")
+
+            # Synchronous send — returns immediately for IOC market orders
+            message, code = skO.SendFutureOrderCLR(user_id, False, oOrder)
+
+            if code == 0:
+                self._live_log_msg(f"實單已送出 Order sent: {message}", action_type)
+                _log(f"REAL ORDER OK: {message}")
+                self._log_order_decision(
+                    "REAL_ORDER_SENT",
+                    f"{side_str} {order_symbol} x1 MKT sim={sim_price}",
+                )
+            else:
+                err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                self._live_log_msg(f"實單失敗 Order FAILED: {err_msg}", "exit")
+                _log(f"REAL ORDER FAILED: code={code} {err_msg}")
+                self._log_order_decision(
+                    "REAL_ORDER_FAILED",
+                    f"code={code} {err_msg}",
+                )
+
+        except Exception as e:
+            self._live_log_msg(f"實單異常 Order error: {e}", "exit")
+            _log(f"REAL ORDER ERROR: {e}\n{traceback.format_exc()}")
+            self._log_order_decision("REAL_ORDER_ERROR", str(e))
+
+    def _log_order_decision(self, action: str, reason: str) -> None:
+        """Log a real-order event to the CSV decision log."""
+        if not self._live_runner or not self._live_runner.csv_logger:
+            return
+        now = _taipei_now()
+        self._live_runner.csv_logger.log_decision(
+            dt=now,
+            bar_dt=now,
+            strategy=self._live_runner.strategy_display_name,
+            action=action,
+            side="",
+            tag="",
+            price=0,
+            reason=reason,
+        )
+
     def _live_log_msg(self, msg, tag="status"):
         """Append message to the Live tab log."""
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}\n"
+        tpe = _taipei_now()
+        local = datetime.now()
+        ts_tpe = tpe.strftime("%H:%M:%S")
+        ts_local = local.strftime("%H:%M:%S")
+        if ts_tpe == ts_local:
+            line = f"[{ts_tpe}] {msg}\n"
+        else:
+            line = f"[{ts_tpe} TPE / {ts_local} local] {msg}\n"
         self.live_log.insert(tk.END, line, tag)
         self.live_log.see(tk.END)
 
@@ -3493,6 +3860,7 @@ class BacktestApp:
         self._live_tick_active = False
         self._live_bar_builder = None
         self._live_tick_symbol = ""
+        self._live_tick_com_symbol = ""
         self._live_history_done = False
         self._live_tick_count = 0
         self._live_history_tick_count = 0
@@ -3541,6 +3909,9 @@ def main():
         SKQuoteLibEventHandler = comtypes.client.GetEvents(skQ, SKQuoteEvent)
         SKReplyEvent = SKReplyLibEvent()
         SKReplyLibEventHandler = comtypes.client.GetEvents(skR, SKReplyEvent)
+        if skO is not None:
+            SKOrderEvent = SKOrderLibEvents()
+            SKOrderLibEventHandler = comtypes.client.GetEvents(skO, SKOrderEvent)
 
     root = tk.Tk()
     app = BacktestApp(root)
