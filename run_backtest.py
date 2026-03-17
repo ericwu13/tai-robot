@@ -299,9 +299,56 @@ _SYMBOL_CONFIG = {
               "taifex_id": "MTX", "order_symbol": "MTXFD0",
               "kline_symbol": "TX00", "tick_symbol": "TX00"},
     "TMF00": {"prefix": "IMF1", "tv": "IMF1!", "pv": 10, "tick_divisor": 100,
-              "taifex_id": "TMF", "order_symbol": "TMFD0",
+              "taifex_id": "TMF", "order_symbol": "TM0000",
               "kline_symbol": "TX00", "tick_symbol": "TX00"},
 }
+
+def _resolve_order_symbol(symbol: str) -> str:
+    """Resolve the order symbol for a given COM quote symbol."""
+    cfg = _SYMBOL_CONFIG.get(symbol, {})
+    order_sym = cfg.get("order_symbol", symbol)
+    if order_sym == "auto":
+        product_code = cfg.get("taifex_id", symbol)
+        order_sym = _get_near_month_symbol(product_code)
+    return order_sym
+
+
+_MONTH_CODES = "ABCDEFGHIJKL"  # A=Jan .. L=Dec
+
+
+def _get_near_month_symbol(product_code: str) -> str:
+    """Compute near-month futures order symbol like TMFC6.
+
+    Format: {product}{month_letter}{year_digit}
+    Month letters: A=Jan, B=Feb, C=Mar, D=Apr, ... L=Dec
+    Year digit: last digit of year (6=2026)
+
+    Taiwan futures settle on the 3rd Wednesday of the expiry month.
+    If today is past the 3rd Wednesday, use next month.
+    """
+    import calendar
+    now = _taipei_now()
+    year, month = now.year, now.month
+    # Find 3rd Wednesday of current month
+    cal = calendar.monthcalendar(year, month)
+    wed_count = 0
+    third_wed_day = None
+    for week in cal:
+        if week[2] != 0:  # Wednesday exists in this week
+            wed_count += 1
+            if wed_count == 3:
+                third_wed_day = week[2]
+                break
+    # If past settlement day, roll to next month
+    if now.day > third_wed_day:
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    month_letter = _MONTH_CODES[month - 1]
+    year_digit = year % 10
+    return f"{product_code}{month_letter}{year_digit}"
+
 
 _CACHE_SUFFIXES = {
     (0, 15): "_15m.csv",
@@ -364,6 +411,17 @@ def filter_bars_by_date(
     return [b for b in bars if dt_start <= b.dt < dt_end]
 
 
+def _fmt_money(val: str) -> str:
+    """Format a numeric string with comma separators."""
+    try:
+        n = float(val)
+        if n == int(n):
+            return f"{int(n):,}"
+        return f"{n:,.2f}"
+    except (ValueError, TypeError):
+        return val
+
+
 def _log(msg):
     tpe = _taipei_now()
     local = datetime.now()
@@ -388,6 +446,9 @@ def _log(msg):
 # ── COM Event handlers ──
 
 class SKQuoteLibEvents:
+    def OnNotifyStockList(self, sMarketNo, bstrStockData):
+        _ui_queue.put_nowait(("stock_list", (sMarketNo, bstrStockData)))
+
     def OnConnection(self, nKind, nCode):
         kind_names = {3001: "Reply", 3002: "Quote", 3003: "Ready",
                       3021: "ConnError", 3033: "Abnormal"}
@@ -479,10 +540,65 @@ class SKOrderLibEvents:
         _ui_queue.put_nowait(("order_result", (nCode, bstrMessage)))
 
     def OnOpenInterest(self, bstrData):
-        _ui_queue.put_nowait(("log", f"未平倉 OpenInterest: {bstrData}"))
+        _ui_queue.put_nowait(("open_interest", bstrData))
 
     def OnFutureRights(self, bstrData):
-        _ui_queue.put_nowait(("log", f"權益數 FutureRights: {bstrData}"))
+        _ui_queue.put_nowait(("future_rights", bstrData))
+
+
+def _parse_open_interest(bstr: str) -> dict | None:
+    """Parse OnOpenInterest callback data into a dict.
+
+    Returns None for error/empty codes (001, 970).
+    Fields: market, account, product, side(B/S), qty, daytrade_qty, avg_cost,
+            fee, tax_rate, login_id
+    """
+    vals = bstr.split(",")
+    if len(vals) < 10 or vals[0] in ("001", "970", "980"):
+        return None
+    try:
+        return {
+            "product": vals[2].strip(),
+            "side": vals[3].strip(),        # B=long, S=short
+            "qty": int(vals[4].strip() or 0),
+            "daytrade_qty": int(vals[5].strip() or 0),
+            "avg_cost": vals[6].strip(),
+            "fee": vals[7].strip(),
+            "tax_rate": vals[8].strip(),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_future_rights(bstr: str) -> dict | None:
+    """Parse OnFutureRights callback data into a dict.
+
+    Returns None for sentinel/error codes (##, 970, 980).
+    Key fields: balance, float_pnl, equity, excess_margin, unrealized,
+                orig_margin, maint_margin, maint_rate, currency, available
+    """
+    vals = bstr.split(",")
+    if len(vals) < 35 or vals[0].strip() in ("##", "970", "980"):
+        return None
+    try:
+        return {
+            "balance": vals[0].strip(),         # 帳戶餘額
+            "float_pnl": vals[1].strip(),       # 浮動損益
+            "realized_cost": vals[2].strip(),   # 已實現費用
+            "tax": vals[3].strip(),             # 交易稅
+            "equity": vals[6].strip(),          # 權益數
+            "excess_margin": vals[7].strip(),   # 超額保證金
+            "realized_pnl": vals[11].strip(),   # 期貨平倉損益
+            "unrealized": vals[12].strip(),     # 盤中未實現
+            "orig_margin": vals[13].strip(),    # 原始保證金
+            "maint_margin": vals[14].strip(),   # 維持保證金
+            "maint_rate": vals[24].strip(),     # 維持率
+            "currency": vals[25].strip(),       # 幣別
+            "available": vals[31].strip(),      # 可用餘額
+            "risk": vals[34].strip(),           # 風險指標
+        }
+    except (ValueError, IndexError):
+        return None
 
 
 class BacktestApp:
@@ -569,6 +685,48 @@ class BacktestApp:
                         acct = parts[1] + parts[3]
                         self._futures_account = acct
                         _log(f"期貨帳號 Futures account: {acct}")
+                elif kind == "stock_list":
+                    market_no, stock_data = data
+                    if market_no in (2, 7, 9):  # futures markets
+                        raw = stock_data or ""
+                        if self._live_runner:
+                            cfg = _SYMBOL_CONFIG.get(self._live_runner.symbol, {})
+                            pid = cfg.get("taifex_id", "")
+                            if pid and pid in raw:
+                                # Log raw entries containing the product ID
+                                entries = [e.strip() for e in raw.split(";") if e.strip()]
+                                matches = [e for e in entries if pid in e]
+                                if matches:
+                                    _log(f"期貨商品(mkt={market_no}) '{pid}': {matches[:20]}")
+                        else:
+                            entries = [e.strip() for e in raw.split(";") if e.strip()]
+                            _log(f"期貨商品列表(mkt={market_no}): {len(entries)} symbols")
+                elif kind == "open_interest":
+                    parsed = _parse_open_interest(data)
+                    if parsed:
+                        # Accumulate positions (callback fires once per position)
+                        self._real_positions.append(parsed)
+                        self._update_real_account_display()
+                    else:
+                        first = data.split(",")[0].strip() if data else ""
+                        if first == "001":
+                            # No open positions
+                            self._real_positions.clear()
+                            self.real_pos_var.set("Flat (無持倉)")
+                        # Ignore ## sentinel and error codes
+                    _log(f"未平倉 OpenInterest: {data}")
+                elif kind == "future_rights":
+                    parsed = _parse_future_rights(data)
+                    if parsed:
+                        self._real_rights = parsed
+                        try:
+                            self._update_real_account_display()
+                        except Exception as e:
+                            _log(f"帳戶顯示錯誤 Account display error: {e}")
+                        _log(f"帳戶資料 Account: equity={parsed.get('equity')} "
+                             f"available={parsed.get('available')} "
+                             f"float_pnl={parsed.get('float_pnl')}")
+                    _log(f"權益數 FutureRights: {data}")
                 elif kind == "order_result":
                     code, msg = data
                     if code == 0:
@@ -851,6 +1009,12 @@ class BacktestApp:
         self._live_bar_builder: BarBuilder | None = None
         self._live_tick_symbol: str = ""
         self._live_tick_com_symbol: str = ""
+        self._live_last_tick_price: int = 0
+        self._last_real_order_side: int | None = None  # 0=BUY, 1=SELL, None=unknown
+        # Real account data from API
+        self._real_positions: list[dict] = []
+        self._real_rights: dict = {}
+        self._real_account_poll_id = None
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -1150,6 +1314,64 @@ class BacktestApp:
             ttk.Label(status_panel, text=label).grid(row=0, column=i*2, sticky=tk.W, padx=4)
             ttk.Label(status_panel, textvariable=var, font=("Consolas", 10, "bold")).grid(
                 row=0, column=i*2+1, sticky=tk.W, padx=(0, 12))
+
+        # Manual order buttons
+        order_frame = ttk.LabelFrame(live_frame, text="手動下單 Manual Order", padding=4)
+        order_frame.pack(fill=tk.X, padx=4, pady=(2, 2))
+        self.btn_manual_buy = ttk.Button(order_frame, text="買進 BUY",
+                                          command=lambda: self._manual_order(0))
+        self.btn_manual_buy.pack(side=tk.LEFT, padx=4)
+        self.btn_manual_sell = ttk.Button(order_frame, text="賣出 SELL",
+                                           command=lambda: self._manual_order(1))
+        self.btn_manual_sell.pack(side=tk.LEFT, padx=4)
+        self.btn_manual_close = ttk.Button(order_frame, text="平倉 CLOSE",
+                                            command=self._manual_close)
+        self.btn_manual_close.pack(side=tk.LEFT, padx=4)
+        # Disable until live bot is running with semi-auto
+        for btn in (self.btn_manual_buy, self.btn_manual_sell, self.btn_manual_close):
+            btn.config(state=tk.DISABLED)
+
+        # Real account panel
+        acct_frame = ttk.LabelFrame(live_frame, text="實帳戶 Real Account", padding=4)
+        acct_frame.pack(fill=tk.X, padx=4, pady=(2, 2))
+
+        self.real_pos_var = tk.StringVar(value="--")
+        self.real_equity_var = tk.StringVar(value="--")
+        self.real_available_var = tk.StringVar(value="--")
+        self.real_pnl_var = tk.StringVar(value="--")
+        self.real_realized_var = tk.StringVar(value="--")
+        self.real_fees_var = tk.StringVar(value="--")
+        self.real_net_var = tk.StringVar(value="--")
+        self.real_maint_var = tk.StringVar(value="--")
+        self.real_fills_var = tk.StringVar(value="--")
+
+        row0 = ttk.Frame(acct_frame)
+        row0.pack(fill=tk.X, pady=(0, 2))
+        for label, var in [
+            ("持倉 Pos:", self.real_pos_var),
+            ("浮動 Float:", self.real_pnl_var),
+            ("平倉損益 Realized:", self.real_realized_var),
+            ("費用 Fee+Tax:", self.real_fees_var),
+            ("淨損益 Net:", self.real_net_var),
+        ]:
+            ttk.Label(row0, text=label).pack(side=tk.LEFT, padx=(4, 2))
+            lbl = ttk.Label(row0, textvariable=var, font=("Consolas", 10, "bold"))
+            lbl.pack(side=tk.LEFT, padx=(0, 8))
+
+        row1 = ttk.Frame(acct_frame)
+        row1.pack(fill=tk.X, pady=(0, 2))
+        for label, var in [
+            ("權益 Equity:", self.real_equity_var),
+            ("可用 Avail:", self.real_available_var),
+            ("維持率 Maint%:", self.real_maint_var),
+            ("今日成交 Trades:", self.real_fills_var),
+        ]:
+            ttk.Label(row1, text=label).pack(side=tk.LEFT, padx=(4, 2))
+            ttk.Label(row1, textvariable=var, font=("Consolas", 10, "bold")).pack(
+                side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(row1, text="刷新 Refresh", width=12,
+                   command=self._query_real_account).pack(side=tk.RIGHT, padx=4)
 
         # Live event log
         self.live_log = scrolledtext.ScrolledText(live_frame, wrap=tk.WORD, font=("Consolas", 9),
@@ -1967,8 +2189,9 @@ class BacktestApp:
             if skO is not None:
                 try:
                     skO.SKOrderLib_Initialize()
+                    skO.ReadCertByID(user_id)
                     skO.GetUserAccount()
-                    _log("委託服務初始化 Order service initialized")
+                    _log("委託服務初始化 Order service initialized (cert verified)")
                 except Exception as e:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
 
@@ -3097,6 +3320,20 @@ class BacktestApp:
         self._live_runner.acquire_lock()
         self._live_runner.trading_mode = trading_mode
 
+        # Debug: log resolved order symbol and query stock list
+        order_sym = _resolve_order_symbol(symbol)
+        _log(f"委託商品 Order symbol: {symbol} -> {order_sym}")
+        if _com_available and skQ and self._quote_connected:
+            try:
+                # Query multiple market types to find TMF order codes
+                # 2=期貨T盤, 7=期貨全盤, 9=客製化期貨
+                for mkt in (2, 7, 9):
+                    rc = skQ.SKQuoteLib_RequestStockList(mkt)
+                    if isinstance(rc, int) and rc != 0:
+                        _log(f"商品列表查詢 RequestStockList({mkt}) code={rc}")
+            except Exception as e:
+                _log(f"商品列表查詢失敗 RequestStockList error: {e}")
+
         # Restore previous session if resuming
         if resume_session:
             n = self._live_runner.restore_session(resume_session)
@@ -3118,6 +3355,7 @@ class BacktestApp:
         self.strategy_combo.config(state=tk.DISABLED)
         self.chart_tf_combo.config(state="readonly")
         self.chart_tf_var.set("Native")
+        self._update_manual_order_buttons()
 
         mode_label = "模擬 Paper" if trading_mode == "paper" else "半自動 Semi-Auto"
         self._live_log_msg(
@@ -3254,6 +3492,8 @@ class BacktestApp:
                     self._live_log_msg(f"TV暖機完成 TV warmup done: {count} bars", "status")
                     self._update_live_status()
                     self._update_live_results()  # enable chart button & populate _last_bars
+                    self._update_manual_order_buttons()
+                    self._start_account_polling()
                     self._start_live_tick_subscription()
 
                 self.root.after(0, _finish)
@@ -3278,6 +3518,8 @@ class BacktestApp:
         self._live_log_msg(f"COM暖機完成 COM warmup done: {count} bars", "status")
         self._update_live_status()
         self._update_live_results()  # enable chart button & populate _last_bars
+        self._update_manual_order_buttons()
+        self._start_account_polling()
         self._start_live_tick_subscription()
 
     # ── Tick-based live data feed ──
@@ -3513,6 +3755,7 @@ class BacktestApp:
         price = close // divisor
         bid_scaled = bid // divisor
         ask_scaled = ask // divisor
+        self._live_last_tick_price = price
 
         # Log first few live ticks to verify timestamp/price convention
         if self._live_history_done and self._live_tick_count <= self._live_history_tick_count + 5:
@@ -3616,7 +3859,7 @@ class BacktestApp:
 
         symbol = self._live_runner.symbol if self._live_runner else "?"
         cfg = _SYMBOL_CONFIG.get(symbol, {})
-        order_symbol = cfg.get("order_symbol", symbol)
+        order_symbol = _resolve_order_symbol(symbol)
 
         if action in ("FORCE_CLOSE", "TRADE_CLOSE"):
             # Exits auto-send: avoid dangling real positions
@@ -3630,7 +3873,7 @@ class BacktestApp:
         # Entry: show timed confirmation dialog
         self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type)
 
-    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type):
+    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source=""):
         """Show a non-blocking 10-second confirmation dialog for a real order."""
         # Dismiss any existing dialog
         self._dismiss_order_dialog("replaced")
@@ -3658,7 +3901,8 @@ class BacktestApp:
         pv = cfg.get("pv", "?")
         tk.Label(dlg, text=f"商品 Symbol: {order_symbol} ({symbol})  |  每點 PV: {pv} NTD",
                 font=("", 11)).pack(pady=2)
-        tk.Label(dlg, text=f"模擬價格 Sim Price: {price:,}  |  數量 Qty: 1 口",
+        src_label = f" ({price_source})" if price_source else ""
+        tk.Label(dlg, text=f"參考價格 Ref Price: {price:,}{src_label}  |  數量 Qty: 1 口",
                 font=("", 11)).pack(pady=2)
         tk.Label(dlg, text="實單將以市價IOC送出 Will send as IOC market order",
                 font=("", 9), fg="gray").pack(pady=2)
@@ -3747,9 +3991,9 @@ class BacktestApp:
             oOrder.sBuySell = buy_sell
             oOrder.sTradeType = 1     # IOC (immediate-or-cancel)
             oOrder.sDayTrade = 0      # non-daytrade
-            oOrder.bstrPrice = "0"    # market price
+            oOrder.bstrPrice = "M"    # market price (M=市價)
             oOrder.nQty = 1           # safety: max 1 contract
-            oOrder.sNewClose = 2      # auto new/close
+            oOrder.sNewClose = 2      # 自動 auto (API determines new/close)
             oOrder.sReserved = 0      # during session
 
             user_id = self.login_user_var.get().strip()
@@ -3759,21 +4003,28 @@ class BacktestApp:
                 f"(模擬價={sim_price:,})", action_type)
             _log(f"REAL ORDER: {side_str} {order_symbol} acct={self._futures_account} "
                  f"sim_price={sim_price}")
+            nc = oOrder.sNewClose
+            nc_label = {0: "new", 1: "close", 2: "auto"}.get(nc, str(nc))
+            _log(f"REAL ORDER PARAMS: acct={self._futures_account} stock={order_symbol} "
+                 f"buy_sell={buy_sell} trade_type=1(IOC) price=M(MKT) qty=1 newclose={nc}({nc_label}) reserved=0")
 
             # Synchronous send — returns immediately for IOC market orders
             message, code = skO.SendFutureOrderCLR(user_id, False, oOrder)
+            _log(f"REAL ORDER RESULT: code={code} message={message}")
 
             if code == 0:
                 self._live_log_msg(f"實單已送出 Order sent: {message}", action_type)
                 _log(f"REAL ORDER OK: {message}")
+                self._last_real_order_side = buy_sell  # track for close button
+                self.root.after(3000, self._query_real_account)  # refresh after fill
                 self._log_order_decision(
                     "REAL_ORDER_SENT",
                     f"{side_str} {order_symbol} x1 MKT sim={sim_price}",
                 )
             else:
                 err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
-                self._live_log_msg(f"實單失敗 Order FAILED: {err_msg}", "exit")
-                _log(f"REAL ORDER FAILED: code={code} {err_msg}")
+                self._live_log_msg(f"實單失敗 Order FAILED: code={code} {err_msg} | {message}", "exit")
+                _log(f"REAL ORDER FAILED: code={code} err={err_msg} msg={message}")
                 self._log_order_decision(
                     "REAL_ORDER_FAILED",
                     f"code={code} {err_msg}",
@@ -3783,6 +4034,172 @@ class BacktestApp:
             self._live_log_msg(f"實單異常 Order error: {e}", "exit")
             _log(f"REAL ORDER ERROR: {e}\n{traceback.format_exc()}")
             self._log_order_decision("REAL_ORDER_ERROR", str(e))
+
+    # ── Manual order buttons ──
+
+    def _get_latest_price(self) -> tuple[int, str]:
+        """Get the most recent price and its source label."""
+        if self._live_last_tick_price:
+            return self._live_last_tick_price, "即時 tick"
+        if self._live_runner:
+            bars_1m = self._live_runner._1m_bars
+            if bars_1m:
+                return bars_1m[-1].close, "1m bar"
+            if self._live_runner._aggregated_bars:
+                return self._live_runner._aggregated_bars[-1].close, "agg bar"
+        return 0, "N/A"
+
+    def _manual_order(self, buy_sell: int):
+        """Send a manual entry order (0=buy, 1=sell) with confirmation dialog."""
+        if not self._live_runner:
+            return
+        symbol = self._live_runner.symbol
+        order_symbol = _resolve_order_symbol(symbol)
+        order_desc = "買進 BUY" if buy_sell == 0 else "賣出 SELL"
+        price, price_src = self._get_latest_price()
+        self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type="entry", price_source=price_src)
+
+    def _manual_close(self):
+        """Send a manual close (flatten) order — reverse of current position."""
+        if not self._live_runner:
+            return
+        symbol = self._live_runner.symbol
+        order_symbol = _resolve_order_symbol(symbol)
+        # Priority: real API position > last real order > simulated broker
+        if self._real_positions:
+            # Use real position from API
+            pos = self._real_positions[0]
+            buy_sell = 1 if pos["side"] == "B" else 0  # B(long)→SELL, S(short)→BUY
+        elif self._last_real_order_side is not None:
+            buy_sell = 1 - self._last_real_order_side
+        elif self._live_runner.broker.position_size != 0:
+            side = self._live_runner.broker.trades[-1].side.value if self._live_runner.broker.trades else "LONG"
+            buy_sell = 1 if side == "LONG" else 0
+        else:
+            self._live_log_msg("無持倉紀錄 No position record — use BUY or SELL directly", "status")
+            return
+        order_desc = "平倉賣 CLOSE SELL" if buy_sell == 1 else "平倉買 CLOSE BUY"
+        price, price_src = self._get_latest_price()
+        self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type="exit", price_source=price_src)
+
+    def _update_manual_order_buttons(self):
+        """Enable/disable manual order buttons based on live state."""
+        if (self._live_runner
+                and self._live_runner.state == LiveState.RUNNING
+                and self._logged_in
+                and self._futures_account):
+            state = tk.NORMAL
+        else:
+            state = tk.DISABLED
+        for btn in (self.btn_manual_buy, self.btn_manual_sell, self.btn_manual_close):
+            btn.config(state=state)
+
+    def _query_real_account(self):
+        """Query real account positions, equity, and fills from Capital API."""
+        if not _com_available or skO is None or not self._logged_in or not self._futures_account:
+            return
+        user_id = self.login_user_var.get().strip()
+        try:
+            self._real_positions.clear()  # will be rebuilt from callbacks
+            skO.GetOpenInterestGW(user_id, self._futures_account, 1)
+            skO.GetFutureRights(user_id, self._futures_account, 1)  # 1=TWD
+            # Synchronous order/fill queries
+            try:
+                # GetOrderReport(5) = filled orders (已成) — has price/qty
+                orders_raw = skO.GetOrderReport(user_id, self._futures_account, 5)
+                self._parse_and_display_fills(orders_raw, "委託(已成)")
+                # Also get FulfillReport for comparison
+                fills_raw = skO.GetFulfillReport(user_id, self._futures_account, 4)
+                self._parse_and_display_fills(fills_raw, "成交(同商品)")
+            except Exception as e:
+                _log(f"成交查詢失敗 Fills query error: {e}")
+        except Exception as e:
+            _log(f"帳戶查詢失敗 Account query error: {e}")
+
+    def _start_account_polling(self):
+        """Start polling real account data every 30 seconds."""
+        if self._real_account_poll_id:
+            self.root.after_cancel(self._real_account_poll_id)
+        self._query_real_account()
+        self._real_account_poll_id = self.root.after(30000, self._start_account_polling)
+
+    def _stop_account_polling(self):
+        """Stop the account polling timer."""
+        if self._real_account_poll_id:
+            self.root.after_cancel(self._real_account_poll_id)
+            self._real_account_poll_id = None
+
+    def _update_real_account_display(self):
+        """Update the real account UI labels from parsed data."""
+        # Positions
+        if self._real_positions:
+            parts = []
+            for p in self._real_positions:
+                side = "LONG" if p["side"] == "B" else "SHORT"
+                parts.append(f"{side} x{p['qty']} {p['product']} @{p['avg_cost']}")
+            self.real_pos_var.set(" | ".join(parts))
+        # Equity / balance
+        r = self._real_rights
+        if r:
+            self.real_equity_var.set(f"{_fmt_money(r.get('equity', '--'))}")
+            self.real_available_var.set(f"{_fmt_money(r.get('available', '--'))}")
+            self.real_pnl_var.set(f"{_fmt_money(r.get('float_pnl', '--'))}")
+            self.real_realized_var.set(f"{_fmt_money(r.get('realized_pnl', '--'))}")
+            # Fee + Tax combined, and Net P&L
+            try:
+                realized = int(float(r.get('realized_pnl', '0') or '0'))
+                fee = int(float(r.get('realized_cost', '0') or '0'))
+                tax = int(float(r.get('tax', '0') or '0'))
+                float_pnl = int(float(r.get('float_pnl', '0') or '0'))
+                self.real_fees_var.set(f"{fee + tax:,} ({fee:,}+{tax:,})")
+                # Net = realized P&L - fees - tax + floating
+                net = realized - fee - tax + float_pnl
+                self.real_net_var.set(f"{net:+,}")
+            except (ValueError, TypeError):
+                self.real_fees_var.set(f"{r.get('realized_cost', '--')}+{r.get('tax', '--')}")
+                self.real_net_var.set("--")
+            maint = r.get("maint_rate", "--")
+            self.real_maint_var.set(f"{maint}%")
+
+    def _parse_and_display_fills(self, fills_raw, label="成交"):
+        """Parse GetFulfillReport/GetOrderReport result and display."""
+        # COM may return (string, code) tuple or just string
+        if isinstance(fills_raw, (tuple, list)):
+            fills_raw = fills_raw[0] if fills_raw else ""
+        if not fills_raw or not isinstance(fills_raw, str):
+            _log(f"{label}(raw type): {type(fills_raw)}")
+            return
+        lines = [l.strip() for l in fills_raw.split("\n") if l.strip()]
+        if not lines or lines[0].startswith("001") or lines[0].startswith("##"):
+            if "成交" in label:
+                self.real_fills_var.set("無成交 No trades today")
+            return
+        # Parse FulfillReport(4) fields: [8]=product [15]=B/S [19]=price [20]=qty [21]=N/O [22]=session [23]=date
+        parsed_fills = []
+        for line in lines:
+            fields = line.split(",")
+            if len(fields) >= 24:
+                side = fields[15].strip()
+                price = fields[19].strip()
+                qty = fields[20].strip()
+                new_close = fields[21].strip()  # N=new, O=close/offset
+                date = fields[23].strip()
+                side_str = "BUY" if side == "B" else "SELL"
+                nc_str = "開" if new_close == "N" else "平"
+                try:
+                    price_f = float(price)
+                    parsed_fills.append(f"{date} {side_str}{nc_str} x{qty} @{price_f:,.1f}")
+                except ValueError:
+                    parsed_fills.append(f"{date} {side_str}{nc_str} x{qty} @{price}")
+        if "成交" in label:
+            self.real_fills_var.set(f"{len(parsed_fills)} 筆 trades")
+        # Log new trades to live event log (only once, not on every poll)
+        count_key = f"_prev_{label}_count"
+        prev_count = getattr(self, count_key, 0)
+        if self._live_runner and len(parsed_fills) > prev_count:
+            for fill in parsed_fills[prev_count:]:
+                self._live_log_msg(f"實{label}: {fill}", "entry")
+        setattr(self, count_key, len(parsed_fills))
 
     def _log_order_decision(self, action: str, reason: str) -> None:
         """Log a real-order event to the CSV decision log."""
@@ -3847,6 +4264,7 @@ class BacktestApp:
 
     def _stop_live(self):
         """Stop the live bot and restore UI."""
+        self._stop_account_polling()
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
             self._live_poll_id = None
@@ -3861,6 +4279,7 @@ class BacktestApp:
         self._live_bar_builder = None
         self._live_tick_symbol = ""
         self._live_tick_com_symbol = ""
+        self._live_last_tick_price = 0
         self._live_history_done = False
         self._live_tick_count = 0
         self._live_history_tick_count = 0
@@ -3888,6 +4307,7 @@ class BacktestApp:
 
         # Restore UI
         self.btn_deploy.config(text="部署機器人 Deploy Bot")
+        self._update_manual_order_buttons()
         self.chart_tf_combo.config(state=tk.DISABLED)
         self.chart_tf_var.set("Native")
         if self._quote_connected:
