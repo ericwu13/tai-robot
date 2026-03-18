@@ -86,6 +86,7 @@ _CODE_GEN_MAX_TOKENS = 65536
 
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, _taipei_now, _TZ_TAIPEI
+from src.live.trading_guard import TradingGuard
 from src.live.session_store import load_session, session_summary
 
 # TAIFEX public data (no API key needed)
@@ -294,13 +295,13 @@ _CACHE_DIR = os.path.join(project_root, "data")
 # Multi-symbol configuration: COM symbol -> (csv_prefix, tv_symbol, point_value)
 _SYMBOL_CONFIG = {
     "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100,
-             "taifex_id": "TX", "order_symbol": "TXFD0"},
+             "taifex_id": "TX", "order_symbol": "TXFD0", "init_margin": 322000},
     "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100,
               "taifex_id": "MTX", "order_symbol": "MTXFD0",
-              "kline_symbol": "TX00", "tick_symbol": "TX00"},
+              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 80500},
     "TMF00": {"prefix": "IMF1", "tv": "IMF1!", "pv": 10, "tick_divisor": 100,
               "taifex_id": "TMF", "order_symbol": "TM0000",
-              "kline_symbol": "TX00", "tick_symbol": "TX00"},
+              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 16100},
 }
 
 def _resolve_order_symbol(symbol: str) -> str:
@@ -994,6 +995,7 @@ class BacktestApp:
         self._futures_account: str = ""  # full account for order submission
         self._order_confirm_dlg = None  # active confirmation dialog
         self._order_confirm_timer_id = None  # countdown timer
+        self._trading_guard = TradingGuard()  # safety checks for real orders
         # Reconnection state
         self._reconnect_attempt: int = 0
         self._reconnect_timer_id = None
@@ -1011,7 +1013,7 @@ class BacktestApp:
         self._live_tick_com_symbol: str = ""
         self._live_last_tick_price: int = 0
         self._last_real_order_side: int | None = None  # 0=BUY, 1=SELL, None=unknown
-        self._real_entry_confirmed: bool = False  # True when user confirmed a real entry
+        # Real position tracking and safety checks live in self._trading_guard
         # Real account data from API
         self._real_positions: list[dict] = []
         self._real_rights: dict = {}
@@ -1294,6 +1296,12 @@ class BacktestApp:
         self.bot_name_label = ttk.Label(bot_name_frame, textvariable=self.bot_name_var,
                                          font=("Consolas", 10, "bold"))
         self.bot_name_label.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(bot_name_frame, text="|").pack(side=tk.LEFT, padx=4)
+        ttk.Label(bot_name_frame, text="模式 Mode:").pack(side=tk.LEFT, padx=(0, 4))
+        self.trading_mode_var = tk.StringVar(value="--")
+        self.trading_mode_label = ttk.Label(bot_name_frame, textvariable=self.trading_mode_var,
+                                             font=("Consolas", 10, "bold"))
+        self.trading_mode_label.pack(side=tk.LEFT)
 
         # Status panel
         status_panel = ttk.LabelFrame(live_frame, text="即時狀態 Live Status", padding=6)
@@ -1345,6 +1353,7 @@ class BacktestApp:
         self.real_net_var = tk.StringVar(value="--")
         self.real_maint_var = tk.StringVar(value="--")
         self.real_fills_var = tk.StringVar(value="--")
+        self.real_loss_limit_var = tk.StringVar(value="--")
 
         row0 = ttk.Frame(acct_frame)
         row0.pack(fill=tk.X, pady=(0, 2))
@@ -1365,6 +1374,7 @@ class BacktestApp:
             ("權益 Equity:", self.real_equity_var),
             ("可用 Avail:", self.real_available_var),
             ("維持率 Maint%:", self.real_maint_var),
+            ("虧損上限 Loss Limit:", self.real_loss_limit_var),
             ("今日成交 Trades:", self.real_fills_var),
         ]:
             ttk.Label(row1, text=label).pack(side=tk.LEFT, padx=(4, 2))
@@ -3077,7 +3087,7 @@ class BacktestApp:
         # Build dialog
         dlg = tk.Toplevel(self.root)
         dlg.title("選擇機器人 Select Bot Session")
-        dlg.geometry("500x500")
+        dlg.geometry("680x520")
         dlg.transient(self.root)
         dlg.grab_set()
 
@@ -3091,12 +3101,13 @@ class BacktestApp:
             list_frame = ttk.Frame(dlg)
             list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
 
-            columns = ("name", "strategy", "trades", "pnl", "position", "saved")
+            columns = ("name", "strategy", "mode", "trades", "pnl", "position", "saved")
             tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=8)
             for col, text, w in [
-                ("name", "名稱 Name", 100), ("strategy", "策略 Strategy", 120),
-                ("trades", "交易數 Trades", 60), ("pnl", "損益 P&L", 70),
-                ("position", "持倉 Position", 70), ("saved", "上次儲存 Last Saved", 130),
+                ("name", "名稱 Name", 90), ("strategy", "策略 Strategy", 110),
+                ("mode", "模式 Mode", 70),
+                ("trades", "交易數 Trades", 55), ("pnl", "損益 P&L", 60),
+                ("position", "持倉 Position", 60), ("saved", "上次儲存 Last Saved", 120),
             ]:
                 tree.heading(col, text=text)
                 tree.column(col, width=w, anchor=tk.W if col in ("name", "strategy") else tk.CENTER)
@@ -3106,9 +3117,11 @@ class BacktestApp:
             tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
+            _MODE_SHORT = {"paper": "模擬", "semi_auto": "半自動", "auto": "全自動"}
             for bot_name, sess in existing_bots:
                 if sess:
                     strat = sess.get("strategy", "?")
+                    mode = _MODE_SHORT.get(sess.get("trading_mode", ""), "?")
                     broker = sess.get("broker", {})
                     trades_count = len(broker.get("trades", []))
                     pnl = broker.get("cumulative_pnl", 0)
@@ -3117,9 +3130,9 @@ class BacktestApp:
                     pos_str = f"{pos_side} {pos}" if pos > 0 else "Flat"
                     saved = sess.get("saved_at", "?")
                 else:
-                    strat = "?"
+                    strat, mode = "?", "?"
                     trades_count, pnl, pos_str, saved = "?", "?", "?", "(no session)"
-                tree.insert("", tk.END, values=(bot_name, strat, trades_count, pnl, pos_str, saved))
+                tree.insert("", tk.END, values=(bot_name, strat, mode, trades_count, pnl, pos_str, saved))
 
             def on_load():
                 sel = tree.selection()
@@ -3128,10 +3141,55 @@ class BacktestApp:
                     return
                 idx = tree.index(sel[0])
                 name, sess = existing_bots[idx]
-                result[0] = (name, sess, mode_var.get())
+                result[0] = (name, sess, mode_var.get(), loss_var.get())
                 dlg.destroy()
 
-            ttk.Button(dlg, text="載入選取 Load Selected", command=on_load).pack(pady=(0, 8))
+            btn_row = ttk.Frame(dlg)
+            btn_row.pack(pady=(0, 8))
+            ttk.Button(btn_row, text="載入選取 Load Selected", command=on_load).pack(side=tk.LEFT, padx=4)
+
+            def on_delete():
+                sel = tree.selection()
+                if not sel:
+                    messagebox.showwarning("Select", "請選擇一個機器人 Please select a bot.", parent=dlg)
+                    return
+                idx = tree.index(sel[0])
+                name, sess = existing_bots[idx]
+                if not messagebox.askyesno(
+                    "刪除機器人 Delete Bot",
+                    f"確定要刪除 '{name}' 嗎？所有資料將被移除。\n"
+                    f"Delete '{name}'? All data will be removed.",
+                    parent=dlg,
+                ):
+                    return
+                import shutil
+                bot_dir = os.path.join(base_dir, f"{prefix}{name}")
+                try:
+                    shutil.rmtree(bot_dir)
+                    tree.delete(sel[0])
+                    existing_bots.pop(idx)
+                    self._live_log_msg(f"已刪除機器人 Bot deleted: {name}", "status")
+                except Exception as e:
+                    messagebox.showerror("Error", f"刪除失敗: {e}", parent=dlg)
+
+            ttk.Button(btn_row, text="刪除 Delete", command=on_delete).pack(side=tk.LEFT, padx=4)
+
+            # Pre-select saved trading mode and loss limit when bot is selected
+            def on_select(event=None):
+                sel = tree.selection()
+                if not sel:
+                    return
+                idx = tree.index(sel[0])
+                _, sess = existing_bots[idx]
+                if sess:
+                    saved_mode = sess.get("trading_mode", "paper")
+                    if saved_mode in ("paper", "semi_auto", "auto"):
+                        mode_var.set(saved_mode)
+                    saved_limit = sess.get("daily_loss_limit")
+                    if saved_limit is not None:
+                        loss_var.set(str(saved_limit))
+
+            tree.bind("<<TreeviewSelect>>", on_select)
 
             # Double-click to load
             tree.bind("<Double-1>", lambda e: on_load())
@@ -3166,7 +3224,7 @@ class BacktestApp:
                                      "請使用「載入」或輸入新名稱\n"
                                      "Use 'Load' or enter a different name.", parent=dlg)
                 return
-            result[0] = (name, None, mode_var.get())
+            result[0] = (name, None, mode_var.get(), loss_var.get())
             dlg.destroy()
 
         ttk.Button(new_frame, text="建立 Create", command=on_create).pack(side=tk.LEFT)
@@ -3183,11 +3241,25 @@ class BacktestApp:
             text="半自動 Semi-Auto (模擬成交後確認下單，10秒未回應則跳過)",
             variable=mode_var, value="semi_auto")
         semi_auto_rb.pack(anchor=tk.W, padx=10, pady=2)
-        # Disable semi-auto if not connected or no account
+        auto_rb = ttk.Radiobutton(
+            mode_frame,
+            text="全自動 Auto (模擬成交後自動下單，無需確認)",
+            variable=mode_var, value="auto")
+        auto_rb.pack(anchor=tk.W, padx=10, pady=2)
+        # Disable real trading modes if not connected or no account
         if not (self._logged_in and self._futures_account):
             semi_auto_rb.config(state=tk.DISABLED)
-            ttk.Label(mode_frame, text="  (需先登入才能使用半自動 Login required for semi-auto)",
+            auto_rb.config(state=tk.DISABLED)
+            ttk.Label(mode_frame, text="  (需先登入才能使用半/全自動 Login required for semi/auto)",
                       foreground="gray").pack(anchor=tk.W, padx=10)
+
+        # Daily loss limit (semi-auto only)
+        loss_frame = ttk.Frame(mode_frame)
+        loss_frame.pack(anchor=tk.W, padx=30, pady=(0, 4))
+        ttk.Label(loss_frame, text="每日虧損上限 Daily Loss Limit (NTD):").pack(side=tk.LEFT)
+        loss_var = tk.StringVar(value="1000")
+        loss_entry = ttk.Entry(loss_frame, textvariable=loss_var, width=8)
+        loss_entry.pack(side=tk.LEFT, padx=4)
 
         # Cancel
         ttk.Button(dlg, text="取消 Cancel", command=dlg.destroy).pack(pady=(0, 10))
@@ -3219,9 +3291,17 @@ class BacktestApp:
         result = self._show_bot_session_dialog(symbol, base_dir)
         if result is None:  # cancelled
             return
-        bot_name, resume_session, trading_mode = result
+        bot_name, resume_session, trading_mode, loss_limit_str = result
         self._trading_mode = trading_mode
+        try:
+            loss_limit = max(0, int(loss_limit_str))
+        except (ValueError, TypeError):
+            loss_limit = 1000
+        self._trading_guard = TradingGuard(daily_loss_limit=loss_limit)
+        self._trading_guard.reset()
         self.bot_name_var.set(bot_name)
+        _MODE_LABELS = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto", "auto": "全自動 Auto"}
+        self.trading_mode_var.set(_MODE_LABELS.get(trading_mode, trading_mode))
 
         # If resuming, restore strategy + symbol from saved session
         if resume_session:
@@ -3273,6 +3353,41 @@ class BacktestApp:
             )
             return
 
+        # Semi-auto: check for pre-existing real positions before deploy
+        if trading_mode in ("semi_auto", "auto") and self._futures_account:
+            # Refresh real positions synchronously
+            try:
+                user_id = self.login_user_var.get().strip()
+                self._real_positions.clear()
+                skO.GetOpenInterestGW(user_id, self._futures_account, 1)
+                # Drain UI queue to process the callback
+                self.root.update_idletasks()
+                time.sleep(0.5)
+                self._drain_ui_queue()
+            except Exception as e:
+                _log(f"部署前持倉查詢失敗 Pre-deploy position check failed: {e}")
+
+            if self._real_positions:
+                pos_parts = []
+                for p in self._real_positions:
+                    side = "多 LONG" if p["side"] == "B" else "空 SHORT"
+                    pos_parts.append(f"{side} x{p['qty']} {p['product']}")
+                pos_str = ", ".join(pos_parts)
+                proceed = messagebox.askyesno(
+                    "帳戶有持倉 Existing Position",
+                    f"帳戶已有未平倉部位：{pos_str}\n"
+                    f"Account has open positions: {pos_str}\n\n"
+                    "半自動模式下，機器人不會送出實單，直到持倉清空。\n"
+                    "In semi-auto mode, the bot will NOT send real orders\n"
+                    "until existing positions are closed.\n\n"
+                    "是否仍要部署？（可用手動按鈕平倉後恢復）\n"
+                    "Deploy anyway? (Use manual buttons to close, then orders resume)",
+                )
+                if not proceed:
+                    return
+                # Deploy but guard.real_entry_confirmed stays False
+                # so no auto exits are sent for positions we didn't create
+
         try:
             point_value = int(self.pv_var.get())
         except ValueError:
@@ -3320,6 +3435,7 @@ class BacktestApp:
         )
         self._live_runner.acquire_lock()
         self._live_runner.trading_mode = trading_mode
+        self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
 
         # Debug: log resolved order symbol and query stock list
         order_sym = _resolve_order_symbol(symbol)
@@ -3367,6 +3483,9 @@ class BacktestApp:
         if trading_mode == "semi_auto":
             self._live_log_msg(
                 "*** 半自動模式 SEMI-AUTO MODE — 模擬成交後將提示下單確認 ***", "exit")
+        elif trading_mode == "auto":
+            self._live_log_msg(
+                "*** 全自動模式 AUTO MODE — 模擬成交後自動下單 ***", "exit")
 
         # Start warmup
         self._start_live_warmup()
@@ -3634,6 +3753,10 @@ class BacktestApp:
             return
         if not is_market_open():
             return
+        # Suppress near session close — thin volume is normal
+        mins_left = minutes_until_session_close()
+        if mins_left is not None and mins_left <= 10:
+            return
         # Grace period after reconnect — history ticks are replaying
         if time.time() < self._reconnect_grace_until:
             return
@@ -3834,63 +3957,62 @@ class BacktestApp:
                 trades = self._live_runner.broker.trades
                 self._live_chart.push_trade(trades[-1], len(trades) - 1)
 
-        # Semi-auto: prompt for real order on fills
-        if self._trading_mode == "semi_auto" and action in ("ENTRY_FILL", "TRADE_CLOSE", "FORCE_CLOSE"):
+        # Semi-auto / Auto: handle real orders on fills
+        if self._trading_mode in ("semi_auto", "auto") and action in ("ENTRY_FILL", "TRADE_CLOSE", "FORCE_CLOSE"):
             self._handle_semi_auto_order(decision)
 
     # ── Semi-auto real order handling ──
 
     def _handle_semi_auto_order(self, decision):
-        """Handle semi-auto order confirmation for a simulated fill.
+        """Handle semi-auto/auto order for a simulated fill.
 
-        Entry orders: show 10s confirmation dialog. If confirmed and order
-        succeeds, set _real_entry_confirmed = True.
-
-        Exit orders (TRADE_CLOSE, FORCE_CLOSE): auto-send ONLY if
-        _real_entry_confirmed is True. Otherwise skip — there is no real
-        position to close.  Uses sNewClose=1 (close-only) so the exchange
-        will reject the order rather than opening an unintended position.
+        Delegates the decision to TradingGuard.decide(), then executes
+        the result (send, skip, block, or show dialog).
         """
         action = decision["action"]
         side = decision["side"]
         price = decision["price"]
 
-        # Determine real order side
-        if action == "ENTRY_FILL":
-            # Entry: same direction as simulated
-            buy_sell = 0 if side == "LONG" else 1  # 0=buy, 1=sell
-            order_desc = f"買進 BUY" if buy_sell == 0 else "賣出 SELL"
-            action_type = "entry"
-        else:
-            # Exit/close: reverse direction
-            buy_sell = 1 if side == "LONG" else 0  # close long=sell, close short=buy
-            order_desc = f"賣出 SELL" if buy_sell == 1 else "買進 BUY"
-            action_type = "exit"
+        guard = self._trading_guard
+        verdict, details = guard.decide(self._trading_mode, action, side)
+        buy_sell = details["buy_sell"]
+        action_type = details["action_type"]
+        new_close = details["new_close"]
+        order_desc = ("買進 BUY" if buy_sell == 0 else "賣出 SELL")
 
         symbol = self._live_runner.symbol if self._live_runner else "?"
         order_symbol = _resolve_order_symbol(symbol)
 
-        if action in ("FORCE_CLOSE", "TRADE_CLOSE"):
-            # Only send exit if we actually have a real position
-            if not self._real_entry_confirmed:
-                self._live_log_msg(
-                    f"跳過平倉(無實倉) Skip {action.lower()} — no real position open", "status")
-                self._log_order_decision(
-                    "REAL_ORDER_SKIPPED",
-                    f"{action.lower()} — no real entry was confirmed",
-                )
-                return
-            # Auto-send exit with sNewClose=1 (close-only, never opens new position)
+        if verdict == guard.BLOCK_ENTRY:
+            self._live_log_msg(
+                f"實單暫停 Order blocked: {details['reason']}", "status")
+            return
+
+        if verdict == guard.SKIP_EXIT:
+            self._live_log_msg(
+                f"跳過平倉(無實倉) Skip: {details['reason']}", "status")
+            self._log_order_decision("REAL_ORDER_SKIPPED", details["reason"])
+            return
+
+        if verdict == guard.SEND_EXIT:
             label = "強制平倉" if action == "FORCE_CLOSE" else "平倉"
             self._live_log_msg(
                 f"{label}自動送單 Auto-sending {action.lower()}: {order_desc} {order_symbol}", "exit")
             self._log_order_decision("REAL_ORDER_AUTO", f"{action.lower()} {order_desc} {order_symbol}")
-            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=1)
-            self._real_entry_confirmed = False
+            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=new_close)
+            guard.on_exit_sent()
             return
 
-        # Entry: show timed confirmation dialog (new_close=0 = new position only)
-        self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type, new_close=0)
+        if verdict == guard.SEND_ENTRY:
+            self._live_log_msg(
+                f"自動進場 Auto-sending entry: {order_desc} {order_symbol}", "entry")
+            self._log_order_decision("REAL_ORDER_AUTO", f"entry {order_desc} {order_symbol}")
+            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=new_close)
+            return
+
+        if verdict == guard.CONFIRM_ENTRY:
+            self._show_order_confirm_dialog(
+                buy_sell, order_symbol, order_desc, price, action_type, new_close=new_close)
 
     def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source="", new_close=2):
         """Show a non-blocking 10-second confirmation dialog for a real order."""
@@ -4005,6 +4127,23 @@ class BacktestApp:
             self._live_log_msg("實單失敗 Order FAILED: no futures account", "exit")
             return
 
+        # Margin check for new positions (entries)
+        if action_type == "entry" and self._real_rights:
+            try:
+                available = float(self._real_rights.get("available", "0"))
+                symbol = self._live_runner.symbol if self._live_runner else ""
+                cfg = _SYMBOL_CONFIG.get(symbol, {})
+                required = cfg.get("init_margin", 0)
+                allowed, reason = TradingGuard.check_margin(available, required)
+                if not allowed:
+                    msg = f"保證金不足 {reason}"
+                    self._live_log_msg(msg, "exit")
+                    self._log_order_decision("REAL_ORDER_BLOCKED", msg)
+                    _log(f"REAL ORDER BLOCKED: {msg}")
+                    return
+            except (ValueError, TypeError):
+                pass  # can't parse — proceed with order, let exchange decide
+
         try:
             import comtypes.gen.SKCOMLib as sk
 
@@ -4012,7 +4151,8 @@ class BacktestApp:
             oOrder.bstrFullAccount = self._futures_account
             oOrder.bstrStockNo = order_symbol
             oOrder.sBuySell = buy_sell
-            oOrder.sTradeType = 1     # IOC (immediate-or-cancel)
+            # IOC for entries (cancel if no fill), ROD for exits (must fill)
+            oOrder.sTradeType = 1 if action_type == "entry" else 0  # 0=ROD, 1=IOC
             oOrder.sDayTrade = 0      # non-daytrade
             oOrder.bstrPrice = "M"    # market price (M=市價)
             oOrder.nQty = 1           # safety: max 1 contract
@@ -4021,8 +4161,9 @@ class BacktestApp:
 
             user_id = self.login_user_var.get().strip()
             side_str = "BUY" if buy_sell == 0 else "SELL"
+            order_type_str = "IOC" if action_type == "entry" else "ROD"
             self._live_log_msg(
-                f"送出實單 Sending: {side_str} {order_symbol} x1 IOC MKT "
+                f"送出實單 Sending: {side_str} {order_symbol} x1 {order_type_str} MKT "
                 f"(模擬價={sim_price:,})", action_type)
             _log(f"REAL ORDER: {side_str} {order_symbol} acct={self._futures_account} "
                  f"sim_price={sim_price}")
@@ -4040,9 +4181,9 @@ class BacktestApp:
                 _log(f"REAL ORDER OK: {message}")
                 self._last_real_order_side = buy_sell  # track for close button
                 if action_type == "entry":
-                    self._real_entry_confirmed = True
+                    self._trading_guard.on_entry_sent()
                 elif action_type == "exit":
-                    self._real_entry_confirmed = False
+                    self._trading_guard.on_exit_sent()
                 self.root.after(3000, self._query_real_account)  # refresh after fill
                 self._log_order_decision(
                     "REAL_ORDER_SENT",
@@ -4182,6 +4323,23 @@ class BacktestApp:
                 # Net = realized P&L - fees - tax + floating
                 net = realized - fee - tax + float_pnl
                 self.real_net_var.set(f"{net:+,}")
+                # Update daily loss limit display and check
+                guard = self._trading_guard
+                if self._trading_mode in ("semi_auto", "auto") and guard.daily_loss_limit > 0:
+                    if guard.paused:
+                        self.real_loss_limit_var.set(
+                            f"{net:+,} / -{guard.daily_loss_limit:,} [已暫停 PAUSED]")
+                    else:
+                        self.real_loss_limit_var.set(
+                            f"{net:+,} / -{guard.daily_loss_limit:,}")
+                    triggered = guard.update_pnl(net)
+                    if triggered:
+                        self._live_log_msg(
+                            f"已達每日虧損上限 Daily loss limit: net={net:+,} "
+                            f"< -{guard.daily_loss_limit:,} NTD — 實單暫停 orders paused",
+                            "exit")
+                else:
+                    self.real_loss_limit_var.set("--")
             except (ValueError, TypeError):
                 self.real_fees_var.set(f"{r.get('realized_cost', '--')}+{r.get('tax', '--')}")
                 self.real_net_var.set("--")
@@ -4319,8 +4477,8 @@ class BacktestApp:
         if self._live_runner:
             # Close real position before stopping if semi-auto has one open.
             # Must happen BEFORE runner.stop() which resets state asynchronously.
-            if (self._trading_mode == "semi_auto"
-                    and self._real_entry_confirmed
+            if (self._trading_mode in ("semi_auto", "auto")
+                    and self._trading_guard.real_entry_confirmed
                     and self._live_runner.broker.position_size > 0):
                 runner = self._live_runner
                 side_val = runner.broker.position_side.value if runner.broker.position_size > 0 else "LONG"
@@ -4332,7 +4490,7 @@ class BacktestApp:
                     f"停止平倉 Stop-close: {order_desc} {order_symbol}", "exit")
                 self._log_order_decision("REAL_ORDER_AUTO", f"stop_close {order_desc} {order_symbol}")
                 self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
-                self._real_entry_confirmed = False
+                self._trading_guard.on_exit_sent()
 
             summary = self._live_runner.stop()
             self._live_log_msg(
@@ -4348,7 +4506,7 @@ class BacktestApp:
             self._update_live_results()
             self._update_live_status()
             self._live_runner = None
-            self._real_entry_confirmed = False
+            self._trading_guard.reset()
 
         # Restore UI
         self.btn_deploy.config(text="部署機器人 Deploy Bot")
@@ -4362,6 +4520,7 @@ class BacktestApp:
         self.symbol_combo.config(state="readonly")
         self.strategy_combo.config(state="readonly")
         self.bot_name_var.set("(未設定 Not set)")
+        self.trading_mode_var.set("--")
         self.status_var.set("就緒 Ready")
 
 

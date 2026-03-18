@@ -1,0 +1,409 @@
+"""Tests for TradingGuard — the actual safety logic used by _handle_semi_auto_order.
+
+TradingGuard.decide() is the single decision function that controls whether
+_send_real_order is called. These tests verify that decide() returns the
+correct verdict for every scenario, ensuring real orders are only sent when
+all safety checks pass.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from unittest.mock import patch
+
+import pytest
+
+from src.live.live_runner import (
+    is_market_open,
+    minutes_until_session_close,
+    _TZ_TAIPEI,
+)
+from src.live.trading_guard import TradingGuard
+
+
+# ── Helper ──
+
+def _taipei_dt(year, month, day, hour, minute):
+    return datetime(year, month, day, hour, minute, tzinfo=_TZ_TAIPEI)
+
+
+def _patch_now(dt):
+    return patch("src.live.live_runner._taipei_now", return_value=dt)
+
+
+# ── minutes_until_session_close ──
+
+class TestMinutesUntilSessionClose:
+
+    def test_am_session_mid(self):
+        with _patch_now(_taipei_dt(2026, 3, 17, 10, 0)):
+            assert minutes_until_session_close() == 225
+
+    def test_am_session_near_close(self):
+        with _patch_now(_taipei_dt(2026, 3, 17, 13, 43)):
+            assert minutes_until_session_close() == 2
+
+    def test_night_session_early(self):
+        with _patch_now(_taipei_dt(2026, 3, 17, 15, 30)):
+            assert minutes_until_session_close() == 810
+
+    def test_night_session_after_midnight(self):
+        with _patch_now(_taipei_dt(2026, 3, 18, 2, 0)):
+            assert minutes_until_session_close() == 180
+
+    def test_night_near_close(self):
+        with _patch_now(_taipei_dt(2026, 3, 18, 4, 58)):
+            assert minutes_until_session_close() == 2
+
+    def test_market_closed_returns_none(self):
+        with _patch_now(_taipei_dt(2026, 3, 17, 6, 0)):
+            assert minutes_until_session_close() is None
+
+    def test_sunday_returns_none(self):
+        with _patch_now(_taipei_dt(2026, 3, 22, 12, 0)):
+            assert minutes_until_session_close() is None
+
+    def test_saturday_before_5am(self):
+        dt = _taipei_dt(2026, 3, 21, 3, 0)
+        with _patch_now(dt):
+            assert is_market_open(dt)
+            assert minutes_until_session_close() == 120
+
+    def test_between_am_and_pm(self):
+        with _patch_now(_taipei_dt(2026, 3, 17, 14, 0)):
+            assert minutes_until_session_close() is None
+
+
+# ── TradingGuard.decide() — the function _handle_semi_auto_order calls ──
+
+class TestDecideEntryBlocked:
+    """When daily loss limit is hit, decide() must return BLOCK_ENTRY for entries."""
+
+    def test_entry_blocked_when_paused_semi_auto(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        g.update_pnl(-1500)
+        verdict, details = g.decide("semi_auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_ENTRY
+        assert "daily loss limit" in details["reason"]
+
+    def test_entry_blocked_when_paused_auto(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        g.update_pnl(-2000)
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "SHORT")
+        assert verdict == g.BLOCK_ENTRY
+
+    def test_exit_not_blocked_when_paused(self):
+        """Even when paused, exits go through if real position exists."""
+        g = TradingGuard(daily_loss_limit=1000)
+        g.on_entry_sent()
+        g.update_pnl(-5000)
+        assert g.paused is True
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT  # NOT blocked
+
+
+class TestDecideExitSkipped:
+    """When no real entry was confirmed, decide() must return SKIP_EXIT."""
+
+    def test_trade_close_skipped_no_real_entry(self):
+        g = TradingGuard()
+        verdict, details = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SKIP_EXIT
+        assert "no real entry" in details["reason"]
+
+    def test_force_close_skipped_no_real_entry(self):
+        g = TradingGuard()
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "SHORT")
+        assert verdict == g.SKIP_EXIT
+
+    def test_exit_skipped_after_entry_was_skipped(self):
+        g = TradingGuard()
+        g.on_entry_skipped()  # user timed out
+        verdict, _ = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SKIP_EXIT
+
+
+class TestDecideExitSent:
+    """When real entry was confirmed, decide() must return SEND_EXIT."""
+
+    def test_trade_close_sent_with_real_entry(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        verdict, details = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+        assert details["buy_sell"] == 1  # sell to close long
+        assert details["new_close"] == 1  # close-only
+
+    def test_force_close_sent_with_real_entry(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        verdict, details = g.decide("auto", "FORCE_CLOSE", "SHORT")
+        assert verdict == g.SEND_EXIT
+        assert details["buy_sell"] == 0  # buy to close short
+        assert details["new_close"] == 1
+
+    def test_exit_resets_entry_flag_via_on_exit_sent(self):
+        """After SEND_EXIT, calling on_exit_sent() should block next exit."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+        g.on_exit_sent()
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SKIP_EXIT
+
+
+class TestDecideEntrySent:
+    """In auto mode, decide() must return SEND_ENTRY for entries."""
+
+    def test_auto_mode_sends_entry(self):
+        g = TradingGuard()
+        verdict, details = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+        assert details["buy_sell"] == 0  # buy for long
+        assert details["new_close"] == 0  # new position only
+
+    def test_auto_mode_sends_short_entry(self):
+        g = TradingGuard()
+        verdict, details = g.decide("auto", "ENTRY_FILL", "SHORT")
+        assert verdict == g.SEND_ENTRY
+        assert details["buy_sell"] == 1  # sell for short
+
+
+class TestDecideConfirmEntry:
+    """In semi-auto mode, decide() must return CONFIRM_ENTRY for entries."""
+
+    def test_semi_auto_shows_dialog(self):
+        g = TradingGuard()
+        verdict, details = g.decide("semi_auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.CONFIRM_ENTRY
+        assert details["buy_sell"] == 0
+        assert details["new_close"] == 0
+
+    def test_semi_auto_short_entry_shows_dialog(self):
+        g = TradingGuard()
+        verdict, details = g.decide("semi_auto", "ENTRY_FILL", "SHORT")
+        assert verdict == g.CONFIRM_ENTRY
+        assert details["buy_sell"] == 1
+
+
+class TestDecideBuySellDirection:
+    """Verify buy/sell direction is correct for all action/side combos."""
+
+    def test_entry_long_buys(self):
+        g = TradingGuard()
+        _, d = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert d["buy_sell"] == 0  # BUY
+
+    def test_entry_short_sells(self):
+        g = TradingGuard()
+        _, d = g.decide("auto", "ENTRY_FILL", "SHORT")
+        assert d["buy_sell"] == 1  # SELL
+
+    def test_close_long_sells(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        _, d = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert d["buy_sell"] == 1  # SELL to close long
+
+    def test_close_short_buys(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        _, d = g.decide("auto", "TRADE_CLOSE", "SHORT")
+        assert d["buy_sell"] == 0  # BUY to close short
+
+
+class TestDecideNewClose:
+    """Verify sNewClose is never 2 (auto) — always explicit 0 or 1."""
+
+    def test_entry_new_close_zero(self):
+        g = TradingGuard()
+        _, d = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert d["new_close"] == 0  # new position only
+
+    def test_exit_new_close_one(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        _, d = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert d["new_close"] == 1  # close only
+
+    def test_never_auto_newclose(self):
+        """No decide() call should ever return new_close=2."""
+        g = TradingGuard()
+        for mode in ("semi_auto", "auto"):
+            for action in ("ENTRY_FILL",):
+                _, d = g.decide(mode, action, "LONG")
+                assert d["new_close"] != 2, f"{mode}/{action}"
+
+        g.on_entry_sent()
+        for mode in ("semi_auto", "auto"):
+            for action in ("TRADE_CLOSE", "FORCE_CLOSE"):
+                _, d = g.decide(mode, action, "LONG")
+                assert d["new_close"] != 2, f"{mode}/{action}"
+
+
+# ── TradingGuard: margin check ──
+
+class TestGuardMargin:
+
+    def test_sufficient(self):
+        allowed, _ = TradingGuard.check_margin(20000, 16100)
+        assert allowed is True
+
+    def test_insufficient(self):
+        allowed, reason = TradingGuard.check_margin(15000, 16100)
+        assert allowed is False
+        assert "insufficient margin" in reason
+
+    def test_exact_amount_passes(self):
+        allowed, _ = TradingGuard.check_margin(16100, 16100)
+        assert allowed is True
+
+    def test_zero_requirement_always_passes(self):
+        allowed, _ = TradingGuard.check_margin(0, 0)
+        assert allowed is True
+
+    def test_negative_available_blocked(self):
+        allowed, _ = TradingGuard.check_margin(-5000, 16100)
+        assert allowed is False
+
+    def test_large_margin_tx(self):
+        allowed, _ = TradingGuard.check_margin(300000, 322000)
+        assert allowed is False
+
+    def test_large_margin_tx_sufficient(self):
+        allowed, _ = TradingGuard.check_margin(350000, 322000)
+        assert allowed is True
+
+
+# ── TradingGuard: daily loss limit via update_pnl ──
+
+class TestGuardDailyLoss:
+
+    def test_within_limit_not_paused(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        triggered = g.update_pnl(-500)
+        assert triggered is False
+        assert g.paused is False
+
+    def test_exceeds_limit_pauses(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        triggered = g.update_pnl(-1001)
+        assert triggered is True
+        assert g.paused is True
+
+    def test_at_limit_does_not_pause(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        triggered = g.update_pnl(-1000)
+        assert triggered is False
+        assert g.paused is False
+
+    def test_trigger_fires_once(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        assert g.update_pnl(-1500) is True
+        assert g.update_pnl(-2000) is False
+        assert g.update_pnl(-3000) is False
+
+    def test_zero_limit_never_pauses(self):
+        g = TradingGuard(daily_loss_limit=0)
+        g.update_pnl(-99999)
+        assert g.paused is False
+
+    def test_reset_clears_pause(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        g.update_pnl(-2000)
+        assert g.paused is True
+        g.reset()
+        assert g.paused is False
+
+
+# ── Integration: full scenario replays using decide() ──
+
+class TestScenarioIssue17:
+    """Replay the exact issue #17 sequence through decide() to verify
+    the guard prevents unintended orders."""
+
+    def test_skipped_entry_then_exit_blocked(self):
+        """The exact #17 bug: entry skipped → exit should NOT send."""
+        g = TradingGuard()
+
+        # 16:13 — user confirms entry
+        g.on_entry_sent()
+
+        # 16:13 — strategy closes, exit sent
+        verdict, _ = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+        g.on_exit_sent()
+
+        # 21:42 — new entry, user times out
+        g.on_entry_skipped()
+
+        # 21:42 — SL1 fires TRADE_CLOSE
+        verdict, details = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SKIP_EXIT
+        # ↑ Without the guard, _send_real_order would have been called here,
+        #   sending a SELL with sNewClose=2 that opened an unintended short!
+
+    def test_repeated_exits_all_blocked(self):
+        """After #17 bug, repeated TRADE_CLOSEs kept firing. All must be blocked."""
+        g = TradingGuard()
+        for _ in range(15):
+            verdict, _ = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
+            assert verdict == g.SKIP_EXIT
+
+    def test_issue_17_with_auto_mode(self):
+        """Same scenario in auto mode — still must block exit."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_exit_sent()
+        # Entry auto-sent but exchange rejects (simulated by not calling on_entry_sent again)
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SKIP_EXIT
+
+
+class TestScenarioAutoFullCycle:
+    """Auto mode full trade cycle."""
+
+    def test_entry_exit_clean(self):
+        g = TradingGuard()
+
+        verdict, d = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+        assert d["buy_sell"] == 0
+        assert d["new_close"] == 0
+        g.on_entry_sent()
+
+        verdict, d = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+        assert d["buy_sell"] == 1
+        assert d["new_close"] == 1
+        g.on_exit_sent()
+
+        assert g.real_entry_confirmed is False
+
+
+class TestScenarioLossLimitDuringTrade:
+    """Loss limit hit while holding a real position."""
+
+    def test_exit_still_works_when_paused(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        g.on_entry_sent()
+        g.update_pnl(-5000)  # massive loss
+        assert g.paused is True
+
+        # Exit must still work — can't leave position hanging
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+        # But next entry is blocked
+        g.on_exit_sent()
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_ENTRY
+
+    def test_force_close_works_when_paused(self):
+        g = TradingGuard(daily_loss_limit=1000)
+        g.on_entry_sent()
+        g.update_pnl(-9999)
+
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "SHORT")
+        assert verdict == g.SEND_EXIT

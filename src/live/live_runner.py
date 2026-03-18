@@ -227,7 +227,8 @@ class LiveRunner:
         self._warmup_bar_count: int = 0  # count of warmup bars in _aggregated_bars
         self._callbacks: dict[str, list] = {}
         self.suppress_strategy: bool = False  # suppress strategy during history catchup
-        self.trading_mode: str = "paper"  # "paper" or "semi_auto"
+        self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
+        self.daily_loss_limit: int = 1000  # NTD, for session persistence
 
     # ── Lock file ──
 
@@ -581,6 +582,7 @@ class LiveRunner:
                 "point_value": self.point_value,
                 "target_interval": self.target_interval,
                 "trading_mode": self.trading_mode,
+                "daily_loss_limit": self.daily_loss_limit,
                 "started_at": self._started_at,
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "bar_index": self._bar_index,
