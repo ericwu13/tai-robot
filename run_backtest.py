@@ -87,6 +87,7 @@ _CODE_GEN_MAX_TOKENS = 65536
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
+from src.live.tick_watchdog import TickWatchdog
 from src.live.session_store import load_session, session_summary
 
 # TAIFEX public data (no API key needed)
@@ -952,8 +953,8 @@ class BacktestApp:
                 return
 
             self._live_tick_active = True
-            self._last_tick_time = time.time()
-            self._reconnect_grace_until = time.time() + 30  # grace period for watchdog
+            self._tick_watchdog.on_tick()
+            self._tick_watchdog.set_grace(30)
             self._live_log_msg(f"已重新訂閱 Tick resubscription active for {com_symbol}", "status")
             # Restart tick drain if not already running
             self._drain_tick_queue()
@@ -999,8 +1000,7 @@ class BacktestApp:
         # Reconnection state
         self._reconnect_attempt: int = 0
         self._reconnect_timer_id = None
-        self._last_tick_time: float = 0.0  # time.time() of last tick
-        self._reconnect_grace_until: float = 0.0  # watchdog grace period after reconnect
+        self._tick_watchdog = TickWatchdog()  # tick health monitoring
         self._live_poll_id = None  # root.after() id for cancellation
         self._live_warmup_mode: bool = False
         self._live_warmup_data: list[str] = []
@@ -3686,7 +3686,8 @@ class BacktestApp:
                 self._stop_live()
                 return
             self._live_tick_active = True
-            self._last_tick_time = time.time()
+            self._tick_watchdog.on_tick()
+            self._tick_watchdog.active = True
             self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
             _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
         except Exception as e:
@@ -3699,9 +3700,7 @@ class BacktestApp:
         # Schedule periodic status updates (every 30s)
         self._schedule_status_update()
 
-    _TICK_WATCHDOG_TIMEOUT = 120  # seconds of no ticks before warning
-    _TICK_RESUBSCRIBE_TIMEOUT = 300  # 5 min: force re-subscribe even if "connected"
-    _TICK_FORCE_RECONNECT_TIMEOUT = 600  # 10 min: force full reconnect
+    # Tick watchdog thresholds now live in TickWatchdog class
 
     def _schedule_status_update(self):
         """Periodically update the live status panel + tick watchdog."""
@@ -3748,52 +3747,48 @@ class BacktestApp:
         runner._auto_save_session()
 
     def _check_tick_watchdog(self):
-        """Warn if no ticks have arrived for too long during market hours."""
-        if not self._live_tick_active or not self._last_tick_time:
-            return
-        if not is_market_open():
-            return
-        # Suppress near session close — thin volume is normal
-        mins_left = minutes_until_session_close()
-        if mins_left is not None and mins_left <= 10:
-            return
-        # Grace period after reconnect — history ticks are replaying
-        if time.time() < self._reconnect_grace_until:
-            return
-        elapsed = time.time() - self._last_tick_time
-        if elapsed > self._TICK_WATCHDOG_TIMEOUT:
-            # If the gap spans a market-closed period (e.g. AM→PM transition),
-            # the stale _last_tick_time is from the previous session.  Reset
-            # and give the current session a fresh window instead of
-            # immediately triggering reconnection.
-            last_dt = datetime.fromtimestamp(self._last_tick_time, tz=_TZ_TAIPEI)
-            if not is_market_open(last_dt):
-                _log(f"Tick watchdog: last tick was during closed market, resetting timer")
-                self._last_tick_time = time.time()
-                return
+        """Delegate tick health check to TickWatchdog and act on the result."""
+        wd = self._tick_watchdog
+        wd.active = self._live_tick_active
+        action = wd.check()
 
-            mins = int(elapsed // 60)
+        if action is None:
+            return
+
+        mins = wd.elapsed_minutes()
+
+        if action == "session_resubscribe":
+            _log("Tick watchdog: session transition — resubscribing for new session")
+            self._live_log_msg(
+                "新盤重新訂閱 New session — re-subscribing ticks", "status")
+            self._resubscribe_ticks()
+
+        elif action == "reconnect":
+            _log(f"Tick watchdog: no ticks for {mins}m, forcing full reconnect")
+            self._live_log_msg(
+                f"強制重連 Force reconnect — no ticks for {mins}m", "status")
+            if _com_available:
+                try:
+                    self._on_disconnected()
+                except Exception:
+                    self._on_disconnected()
+
+        elif action == "resubscribe":
+            _log(f"Tick watchdog: no ticks for {mins}m, re-subscribing")
+            self._live_log_msg(
+                f"重新訂閱 Re-subscribing ticks — no ticks for {mins}m", "status")
+            self._resubscribe_ticks()
+
+        elif action == "warn":
             self._live_log_msg(
                 f"警告 No ticks for {mins}m — connection may be lost", "status")
-            _log(f"Tick watchdog: no ticks for {mins}m, checking connection")
-            # Verify connection is still alive
+            _log(f"Tick watchdog: no ticks for {mins}m")
+            # Check if COM connection is alive
             if _com_available:
                 try:
                     ic = skQ.SKQuoteLib_IsConnected()
                     if ic != 1:
                         self._on_disconnected()
-                    elif elapsed > self._TICK_FORCE_RECONNECT_TIMEOUT:
-                        # Connected but no ticks for 10+ min — force full reconnect
-                        _log("Tick watchdog: connected but no ticks for 10+ min, forcing reconnect")
-                        self._live_log_msg(
-                            "強制重連 Force reconnect — connected but no ticks", "status")
-                        self._on_disconnected()
-                    elif elapsed > self._TICK_RESUBSCRIBE_TIMEOUT:
-                        # Connected but no ticks for 5+ min — try re-subscribing
-                        _log("Tick watchdog: connected but no ticks for 5+ min, re-subscribing")
-                        self._live_log_msg(
-                            "重新訂閱 Re-subscribing ticks — connected but stale", "status")
-                        self._resubscribe_ticks()
                 except Exception:
                     self._on_disconnected()
 
@@ -3838,13 +3833,9 @@ class BacktestApp:
             return
 
         self._live_tick_count += 1
-        now = time.time()
-        if not is_history:
-            self._last_tick_time = now
-        elif not self._live_history_done:
-            # During history replay (initial or post-reconnect), keep
-            # watchdog timer alive so it doesn't false-trigger.
-            self._last_tick_time = now
+        if not is_history or not self._live_history_done:
+            # Update watchdog: live ticks always, history ticks only during replay
+            self._tick_watchdog.on_tick()
 
         # Detect transition from history to live ticks
         if not is_history and not self._live_history_done:
@@ -4461,6 +4452,7 @@ class BacktestApp:
         self._live_warmup_mode = False
         self._live_polling = False
         self._live_tick_active = False
+        self._tick_watchdog.reset()
         self._live_bar_builder = None
         self._live_tick_symbol = ""
         self._live_tick_com_symbol = ""
