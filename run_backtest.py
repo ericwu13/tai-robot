@@ -1011,6 +1011,7 @@ class BacktestApp:
         self._live_tick_com_symbol: str = ""
         self._live_last_tick_price: int = 0
         self._last_real_order_side: int | None = None  # 0=BUY, 1=SELL, None=unknown
+        self._real_entry_confirmed: bool = False  # True when user confirmed a real entry
         # Real account data from API
         self._real_positions: list[dict] = []
         self._real_rights: dict = {}
@@ -3840,7 +3841,16 @@ class BacktestApp:
     # ── Semi-auto real order handling ──
 
     def _handle_semi_auto_order(self, decision):
-        """Handle semi-auto order confirmation for a simulated fill."""
+        """Handle semi-auto order confirmation for a simulated fill.
+
+        Entry orders: show 10s confirmation dialog. If confirmed and order
+        succeeds, set _real_entry_confirmed = True.
+
+        Exit orders (TRADE_CLOSE, FORCE_CLOSE): auto-send ONLY if
+        _real_entry_confirmed is True. Otherwise skip — there is no real
+        position to close.  Uses sNewClose=1 (close-only) so the exchange
+        will reject the order rather than opening an unintended position.
+        """
         action = decision["action"]
         side = decision["side"]
         price = decision["price"]
@@ -3858,22 +3868,31 @@ class BacktestApp:
             action_type = "exit"
 
         symbol = self._live_runner.symbol if self._live_runner else "?"
-        cfg = _SYMBOL_CONFIG.get(symbol, {})
         order_symbol = _resolve_order_symbol(symbol)
 
         if action in ("FORCE_CLOSE", "TRADE_CLOSE"):
-            # Exits auto-send: avoid dangling real positions
+            # Only send exit if we actually have a real position
+            if not self._real_entry_confirmed:
+                self._live_log_msg(
+                    f"跳過平倉(無實倉) Skip {action.lower()} — no real position open", "status")
+                self._log_order_decision(
+                    "REAL_ORDER_SKIPPED",
+                    f"{action.lower()} — no real entry was confirmed",
+                )
+                return
+            # Auto-send exit with sNewClose=1 (close-only, never opens new position)
             label = "強制平倉" if action == "FORCE_CLOSE" else "平倉"
             self._live_log_msg(
                 f"{label}自動送單 Auto-sending {action.lower()}: {order_desc} {order_symbol}", "exit")
             self._log_order_decision("REAL_ORDER_AUTO", f"{action.lower()} {order_desc} {order_symbol}")
-            self._send_real_order(buy_sell, order_symbol, action_type, price)
+            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=1)
+            self._real_entry_confirmed = False
             return
 
-        # Entry: show timed confirmation dialog
-        self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type)
+        # Entry: show timed confirmation dialog (new_close=0 = new position only)
+        self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type, new_close=0)
 
-    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source=""):
+    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source="", new_close=2):
         """Show a non-blocking 10-second confirmation dialog for a real order."""
         # Dismiss any existing dialog
         self._dismiss_order_dialog("replaced")
@@ -3916,7 +3935,7 @@ class BacktestApp:
 
         def on_confirm():
             self._dismiss_order_dialog("confirmed")
-            self._send_real_order(buy_sell, order_symbol, action_type, price)
+            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=new_close)
 
         def on_skip():
             self._dismiss_order_dialog("skipped")
@@ -3973,8 +3992,12 @@ class BacktestApp:
             pass  # logged in _send_real_order
         # "replaced" = new dialog replaced old one, no log needed
 
-    def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price):
-        """Build FUTUREORDER and send via COM SKOrderLib."""
+    def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price, new_close=2):
+        """Build FUTUREORDER and send via COM SKOrderLib.
+
+        new_close: 0=new position, 1=close position, 2=auto (exchange decides).
+        Semi-auto uses 0 for entries and 1 for exits; manual orders use 2.
+        """
         if not _com_available or skO is None:
             self._live_log_msg("實單失敗 Order FAILED: COM not available", "exit")
             return
@@ -3993,7 +4016,7 @@ class BacktestApp:
             oOrder.sDayTrade = 0      # non-daytrade
             oOrder.bstrPrice = "M"    # market price (M=市價)
             oOrder.nQty = 1           # safety: max 1 contract
-            oOrder.sNewClose = 2      # 自動 auto (API determines new/close)
+            oOrder.sNewClose = new_close  # 0=new, 1=close, 2=auto
             oOrder.sReserved = 0      # during session
 
             user_id = self.login_user_var.get().strip()
@@ -4016,6 +4039,10 @@ class BacktestApp:
                 self._live_log_msg(f"實單已送出 Order sent: {message}", action_type)
                 _log(f"REAL ORDER OK: {message}")
                 self._last_real_order_side = buy_sell  # track for close button
+                if action_type == "entry":
+                    self._real_entry_confirmed = True
+                elif action_type == "exit":
+                    self._real_entry_confirmed = False
                 self.root.after(3000, self._query_real_account)  # refresh after fill
                 self._log_order_decision(
                     "REAL_ORDER_SENT",
@@ -4290,6 +4317,23 @@ class BacktestApp:
         self._live_chart = None
 
         if self._live_runner:
+            # Close real position before stopping if semi-auto has one open.
+            # Must happen BEFORE runner.stop() which resets state asynchronously.
+            if (self._trading_mode == "semi_auto"
+                    and self._real_entry_confirmed
+                    and self._live_runner.broker.position_size > 0):
+                runner = self._live_runner
+                side_val = runner.broker.position_side.value if runner.broker.position_size > 0 else "LONG"
+                buy_sell = 1 if side_val == "LONG" else 0  # reverse to close
+                order_symbol = _resolve_order_symbol(runner.symbol)
+                price = runner._aggregated_bars[-1].close if runner._aggregated_bars else 0
+                order_desc = "賣出 SELL" if buy_sell == 1 else "買進 BUY"
+                self._live_log_msg(
+                    f"停止平倉 Stop-close: {order_desc} {order_symbol}", "exit")
+                self._log_order_decision("REAL_ORDER_AUTO", f"stop_close {order_desc} {order_symbol}")
+                self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
+                self._real_entry_confirmed = False
+
             summary = self._live_runner.stop()
             self._live_log_msg(
                 f"已停止 Stopped: {summary['trades']} trades, "
@@ -4304,6 +4348,7 @@ class BacktestApp:
             self._update_live_results()
             self._update_live_status()
             self._live_runner = None
+            self._real_entry_confirmed = False
 
         # Restore UI
         self.btn_deploy.config(text="部署機器人 Deploy Bot")
