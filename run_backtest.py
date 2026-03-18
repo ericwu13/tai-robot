@@ -3959,7 +3959,14 @@ class BacktestApp:
 
         Delegates the decision to TradingGuard.decide(), then executes
         the result (send, skip, block, or show dialog).
+
+        Note: callbacks fire via root.after(0) and may arrive after
+        _live_runner is cleared during stop. Guard against this.
         """
+        # Guard: callback may fire after runner is cleared during stop
+        if not self._live_runner:
+            return
+
         action = decision["action"]
         side = decision["side"]
         price = decision["price"]
@@ -4484,6 +4491,10 @@ class BacktestApp:
                 self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
                 self._trading_guard.on_exit_sent()
 
+            # Suppress strategy before stop — prevent new entries during shutdown.
+            # stop() flushes the aggregator's partial bar and runs _process_aggregated_bar,
+            # which would execute the strategy and potentially generate new entries.
+            self._live_runner.suppress_strategy = True
             summary = self._live_runner.stop()
             self._live_log_msg(
                 f"已停止 Stopped: {summary['trades']} trades, "
