@@ -6,7 +6,7 @@ on:
 
 jobs:
   autofix:
-    if: github.event.label.name == 'autofix'
+    if: github.event.label.name == 'autofix' || github.event.label.name == 'ultrathink'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -36,13 +36,24 @@ jobs:
         run: |
           cp settings.example.yaml settings.yaml
 
+      - name: Select model
+        id: model
+        run: |
+          if [ "${{ github.event.label.name }}" = "ultrathink" ]; then
+            echo "name=claude-opus-4-6" >> "$GITHUB_OUTPUT"
+            echo "Selected model: claude-opus-4-6"
+          else
+            echo "name=claude-sonnet-4-20250514" >> "$GITHUB_OUTPUT"
+            echo "Selected model: claude-sonnet-4-20250514"
+          fi
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
-            --model claude-sonnet-4-20250514
+            --model ${{ steps.model.outputs.name }}
             --allowedTools Bash,Read,Edit,Write,Glob,Grep
           prompt: |
             You are fixing a GitHub issue for the tai-robot project.
@@ -72,10 +83,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const label = '${{ github.event.label.name }}';
+            const model = '${{ steps.model.outputs.name }}';
             const result = '${{ steps.claude.outcome }}';
             const body = result === 'success'
-              ? '🤖 Auto-fix attempted. Check the PR linked above.'
-              : '🤖 Auto-fix failed. Manual intervention needed.';
+              ? `🤖 Auto-fix attempted with **${model}**. Check the PR linked above.`
+              : `🤖 Auto-fix with **${model}** failed. Manual intervention needed.`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
