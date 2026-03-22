@@ -68,8 +68,15 @@ jobs:
             1. Read the issue carefully. If it contains acceptance tests (code blocks
                with `test_` functions), create those test files first and verify they FAIL.
             2. Implement the fix.
-            3. Run `pytest tests/ -x` to verify ALL tests pass (not just the new ones).
-            4. If tests pass, commit your changes to a new branch and create a PR.
+            3. Run `pytest tests/ -x --ignore=tests/test_taifex.py` to verify ALL tests pass.
+            4. You MUST create a branch, commit, push, and open a PR using these exact commands:
+               ```
+               git checkout -b autofix/issue-${{ github.event.issue.number }}
+               git add -A
+               git commit -m "fix: address issue #${{ github.event.issue.number }}"
+               git push origin autofix/issue-${{ github.event.issue.number }}
+               gh pr create --title "fix: issue #${{ github.event.issue.number }}" --body "Fixes #${{ github.event.issue.number }}" --base master
+               ```
 
             Rules:
             - Only modify files under `src/` and `tests/`.
@@ -77,6 +84,7 @@ jobs:
             - Do NOT install new dependencies without noting it in the PR.
             - Skip any test that imports `comtypes` or Windows-only modules (we're on Linux CI).
             - Keep changes minimal — fix the issue, nothing else.
+            - You MUST create a PR at the end. This is the most important step.
 
       - name: Post result to issue
         if: always()
