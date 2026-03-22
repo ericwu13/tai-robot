@@ -2615,17 +2615,6 @@ class BacktestApp:
             _log(f"去重 Deduplicated: {len(bars)} -> {len(unique_bars)} bars")
         bars = unique_bars
 
-        # Filter to AM session (08:45-13:44) — API may return full-session data
-        # despite requesting AM-only (session param=1)
-        if bars and self._data_source == "API":
-            am_start = dt_time(8, 45)
-            am_end = dt_time(13, 44)
-            am_bars = [b for b in bars if b.dt and am_start <= b.dt.time() <= am_end]
-            if len(am_bars) < len(bars):
-                _log(f"日盤過濾 AM session filter: {len(bars)} -> {len(am_bars)} bars "
-                     f"(removed {len(bars) - len(am_bars)} non-AM bars)")
-            bars = am_bars
-
         if bars:
             _log(f"API資料 Parsed {len(bars)} API bars: {bars[0].dt} ~ {bars[-1].dt}")
         else:
@@ -3037,12 +3026,37 @@ class BacktestApp:
         if len(result.trades) > 100:
             trade_lines.append(f"  ... ({len(result.trades) - 100} more trades omitted)")
 
+        # Resolve strategy source code for AI context
+        strategy_source = ""
+        strategy_name = self.strategy_var.get()
+        strategy_cls = STRATEGIES.get(strategy_name)
+        if self._ai_strategy_source and strategy_name.startswith("AI:"):
+            strategy_source = self._ai_strategy_source
+        elif strategy_cls:
+            # Try saved strategies first, then built-in via inspect
+            source = self._strategy_store.load_source(strategy_cls.__name__)
+            if source:
+                strategy_source = source
+            else:
+                try:
+                    strategy_source = inspect.getsource(strategy_cls)
+                except (TypeError, OSError):
+                    pass
+
+        source_section = ""
+        if strategy_source:
+            source_section = (
+                f"\n\n策略原始碼 Strategy Source Code:\n"
+                f"```python\n{strategy_source}\n```"
+            )
+
         context = (
-            f"以下是回測/實盤結果，請分析交易表現並提出優化建議。\n"
+            f"以下是回測/實盤結果，請根據策略原始碼分析交易表現並提出優化建議。\n"
             f"Below are the backtest/live results. Analyze the trading performance "
-            f"and suggest improvements.\n\n"
+            f"based on the strategy source code and suggest improvements.\n\n"
             f"{report}\n\n"
             f"交易明細 Trade Details:\n" + "\n".join(trade_lines)
+            + source_section
         )
 
         # Send as user message to the AI
