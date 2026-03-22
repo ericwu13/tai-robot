@@ -1,0 +1,82 @@
+name: Auto-fix Issue
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  autofix:
+    if: github.event.label.name == 'autofix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml keyring httpx pytest
+          # Skip Windows-only deps (comtypes, lightweight-charts, pandas)
+          # Tests that need them will be skipped via conftest markers
+
+      - name: Create settings.yaml stub for tests
+        run: |
+          cp settings.example.yaml settings.yaml
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: "claude-sonnet-4-20250514"
+          allowed_tools: "Bash,Read,Edit,Write,Glob,Grep"
+          direct_prompt: |
+            You are fixing a GitHub issue for the tai-robot project.
+            Read CLAUDE.md first for project context.
+
+            ## Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+            ${{ github.event.issue.body }}
+
+            ## Instructions
+
+            1. Read the issue carefully. If it contains acceptance tests (code blocks
+               with `test_` functions), create those test files first and verify they FAIL.
+            2. Implement the fix.
+            3. Run `pytest tests/ -x` to verify ALL tests pass (not just the new ones).
+            4. If tests pass, commit your changes to a new branch and create a PR.
+
+            Rules:
+            - Only modify files under `src/` and `tests/`.
+            - Do NOT modify `run_backtest.py`, `settings.yaml`, or any config.
+            - Do NOT install new dependencies without noting it in the PR.
+            - Skip any test that imports `comtypes` or Windows-only modules (we're on Linux CI).
+            - Keep changes minimal — fix the issue, nothing else.
+
+      - name: Post result to issue
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = '${{ steps.claude.outcome }}';
+            const body = result === 'success'
+              ? '🤖 Auto-fix attempted. Check the PR linked above.'
+              : '🤖 Auto-fix failed. Manual intervention needed.';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });

@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install pyyaml keyring httpx pytest
+
+      - name: Create settings stub
+        run: cp settings.example.yaml settings.yaml
+
+      - name: Run tests
+        run: pytest tests/ -x --ignore=tests/test_taifex.py -v
