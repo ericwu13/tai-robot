@@ -40,9 +40,10 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: "claude-sonnet-4-20250514"
-          allowed_tools: "Bash,Read,Edit,Write,Glob,Grep"
-          direct_prompt: |
+          claude_args: |
+            --model claude-sonnet-4-20250514
+            --allowedTools Bash,Read,Edit,Write,Glob,Grep
+          prompt: |
             You are fixing a GitHub issue for the tai-robot project.
             Read CLAUDE.md first for project context.
 
