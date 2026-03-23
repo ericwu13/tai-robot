@@ -10,7 +10,7 @@ from __future__ import annotations
 class TradingGuard:
     """Validates orders against safety rules before they are sent.
 
-    Tracks real position state, daily P&L, and margin requirements.
+    Tracks real position state, daily P&L, fill confirmation, and margin.
     All mutating methods return a (allowed: bool, reason: str) tuple.
     """
 
@@ -20,11 +20,21 @@ class TradingGuard:
         self.paused: bool = False  # True when daily loss limit hit
         self._last_net_pnl: int = 0
 
+        # Fill confirmation gate (auto mode only)
+        self.fill_pending: bool = False
+        self.fill_pending_type: str = ""  # "entry" or "exit"
+        self.halted: bool = False
+        self.halt_reason: str = ""
+
     def reset(self) -> None:
         """Reset all state (called on new deploy)."""
         self.real_entry_confirmed = False
         self.paused = False
         self._last_net_pnl = 0
+        self.fill_pending = False
+        self.fill_pending_type = ""
+        self.halted = False
+        self.halt_reason = ""
 
     # ── Entry / exit gating ──
 
@@ -53,17 +63,48 @@ class TradingGuard:
     # ── State updates ──
 
     def on_entry_sent(self) -> None:
-        """Called when a real entry order is successfully sent."""
+        """Called when a real entry order is confirmed filled."""
         self.real_entry_confirmed = True
 
     def on_exit_sent(self) -> None:
-        """Called when a real exit order is successfully sent."""
+        """Called when a real exit order is confirmed filled."""
         self.real_entry_confirmed = False
 
     def on_entry_skipped(self) -> None:
         """Called when user skips/times out on entry confirmation."""
         # real_entry_confirmed stays False — exits won't auto-send
         pass
+
+    # ── Fill confirmation gate ──
+
+    def on_fill_pending(self, action_type: str) -> None:
+        """Called after a real order is accepted (code==0) in auto mode.
+
+        Blocks all new real orders until fill is confirmed or timeout.
+        """
+        self.fill_pending = True
+        self.fill_pending_type = action_type
+
+    def on_fill_confirmed(self) -> None:
+        """Called when GetFulfillReport shows a new fill."""
+        self.fill_pending = False
+        self.fill_pending_type = ""
+
+    def on_fill_timeout(self) -> None:
+        """Called when fill is not confirmed within the timeout.
+
+        Enters HALTED state — all orders permanently blocked until
+        manual intervention via clear_halt().
+        """
+        self.halted = True
+        self.halt_reason = f"{self.fill_pending_type} fill not confirmed"
+        self.fill_pending = False
+        self.fill_pending_type = ""
+
+    def clear_halt(self) -> None:
+        """Manual reset of halted state after human verification."""
+        self.halted = False
+        self.halt_reason = ""
 
     # ── Margin check ──
 
@@ -96,11 +137,13 @@ class TradingGuard:
     # ── Decision engine ──
 
     # Decision constants
-    BLOCK_ENTRY = "block_entry"      # daily loss limit
-    SKIP_EXIT = "skip_exit"          # no real position to close
-    SEND_EXIT = "send_exit"          # auto-send exit order
-    SEND_ENTRY = "send_entry"        # auto-send entry (auto mode)
-    CONFIRM_ENTRY = "confirm_entry"  # show dialog (semi-auto mode)
+    BLOCK_ENTRY = "block_entry"              # daily loss limit
+    SKIP_EXIT = "skip_exit"                  # no real position to close
+    SEND_EXIT = "send_exit"                  # auto-send exit order
+    SEND_ENTRY = "send_entry"                # auto-send entry (auto mode)
+    CONFIRM_ENTRY = "confirm_entry"          # show dialog (semi-auto mode)
+    BLOCK_FILL_PENDING = "block_fill_pending"  # waiting for prior fill
+    BLOCK_HALTED = "block_halted"            # system halted after fill timeout
 
     def decide(self, trading_mode: str, action: str, side: str) -> tuple[str, dict]:
         """Decide what to do with a simulated fill.
@@ -127,6 +170,18 @@ class TradingGuard:
             "action_type": action_type,
             "new_close": self.order_params(action_type)["new_close"],
         }
+
+        # Fill confirmation gate (blocks entries and normal exits)
+        # FORCE_CLOSE bypasses — user's emergency exit must not be blocked
+        if action != "FORCE_CLOSE":
+            if self.halted:
+                details["reason"] = f"system halted: {self.halt_reason}"
+                return self.BLOCK_HALTED, details
+
+            if self.fill_pending:
+                details["reason"] = (
+                    f"waiting for {self.fill_pending_type} fill confirmation")
+                return self.BLOCK_FILL_PENDING, details
 
         # Entry: check daily loss limit
         if action == "ENTRY_FILL":
