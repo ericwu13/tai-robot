@@ -13,6 +13,7 @@ ALLOWED_IMPORTS = {
     "src.backtest.broker",
     "src.market_data.models",
     "src.market_data.data_store",
+    "src.market_data.sessions",
     "src.strategy.indicators",
     "src.strategy.indicators.ma",
     "src.strategy.indicators.rsi",
