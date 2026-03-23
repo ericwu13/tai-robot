@@ -60,19 +60,23 @@ class TestMarketClose:
         assert broker.position_size == 1
         assert broker.entry_price == 20050
 
-    def test_close_no_entry_on_same_bar(self, broker, ctx):
-        """Entry on same bar as close should be skipped (exit priority)."""
+    def test_close_and_reentry_same_bar(self, broker, ctx):
+        """Close and re-entry on same bar allowed (TV semantics).
+
+        Exit fills first (at bar close), then entry fills (also at bar close).
+        In live trading, tick-level exit detection separates these naturally.
+        """
         ctx.entry("L1", OrderSide.LONG)
         broker.on_bar_close(0, 20000)
 
-        # Close and re-enter on same bar (allowed — matches TV semantics)
         ctx.close("L1")
         ctx.entry("L2", OrderSide.LONG)
         broker.on_bar_close(1, 20100)
 
-        # Close happened, then re-entry at bar close
         assert broker.position_size == 1  # re-entered
         assert len(broker.trades) == 1    # one closed trade
+        assert broker.entry_price == 20100
+        assert broker.entry_tag == "L2"
 
     def test_close_wrong_from_entry_is_ignored(self, broker, ctx):
         """close() with non-matching from_entry should not close the position."""
@@ -112,13 +116,10 @@ class TestMarketClose:
         """Multiple round-trips using close() should all record correctly."""
         for i in range(3):
             ctx.entry(f"L{i}", OrderSide.LONG)
-            broker.on_bar_close(i * 3, 20000 + i * 100)
+            broker.on_bar_close(i * 2, 20000 + i * 100)
 
             ctx.close(f"L{i}")
-            broker.on_bar_close(i * 3 + 1, 20050 + i * 100)
-
-            # Skip a bar to avoid same-bar entry block
-            broker.on_bar_close(i * 3 + 2, 20060 + i * 100)
+            broker.on_bar_close(i * 2 + 1, 20050 + i * 100)
 
         assert len(broker.trades) == 3
         assert all(t.pnl == 50 * 200 for t in broker.trades)
