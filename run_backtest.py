@@ -3348,7 +3348,7 @@ class BacktestApp:
 
     def _toggle_live(self):
         """Toggle between Deploy Bot and Stop Bot."""
-        if self._live_runner and self._live_runner.state == LiveState.RUNNING:
+        if self._live_runner and self._live_runner.state != LiveState.IDLE:
             self._stop_live()
         else:
             self._deploy_live()
@@ -3552,7 +3552,8 @@ class BacktestApp:
         self.chart_tf_var.set("Native")
         self._update_manual_order_buttons()
 
-        mode_label = "模擬 Paper" if trading_mode == "paper" else "半自動 Semi-Auto"
+        mode_labels = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto", "auto": "全自動 Auto"}
+        mode_label = mode_labels.get(trading_mode, trading_mode)
         self._live_log_msg(
             f"部署中 Deploying: {strategy.name} on {symbol} [{bot_name}] "
             f"模式={mode_label}", "status")
