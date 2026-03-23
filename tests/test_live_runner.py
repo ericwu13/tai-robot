@@ -26,6 +26,21 @@ class AlwaysLongStrategy(BacktestStrategy):
         return 2
 
 
+class LongWithExitStrategy(BacktestStrategy):
+    """Enter long and set TP/SL exit (for testing tick-level exits)."""
+    kline_type = 0
+    kline_minute = 15
+
+    def on_bar(self, bar: Bar, data_store: DataStore, broker: BrokerContext) -> None:
+        if broker.position_size == 0:
+            broker.entry("Long", OrderSide.LONG)
+        else:
+            broker.exit("Exit", "Long", limit=bar.close + 100, stop=bar.close - 50)
+
+    def required_bars(self) -> int:
+        return 2
+
+
 class NeverTradeStrategy(BacktestStrategy):
     """Does nothing (for testing warmup/feed without trades)."""
     kline_type = 0
@@ -531,3 +546,101 @@ class TestLiveRunnerLock:
     def test_bot_dir_for(self, tmp_path):
         result = LiveRunner.bot_dir_for(str(tmp_path), "TX00", "MyBot")
         assert result == os.path.join(str(tmp_path), "TX00_MyBot")
+
+
+class TestCheckTickExit:
+    """Tests for LiveRunner.check_tick_exit() — real-time TP/SL on every tick."""
+
+    def _make_runner_with_position(self, tmp_path, entry_price=22500,
+                                   tp_price=22600, sl_price=22450):
+        """Create a LiveRunner in RUNNING state with an open position and pending exits."""
+        strategy = LongWithExitStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200, log_dir=str(tmp_path))
+
+        # Warmup (transitions state to RUNNING)
+        warmup = [
+            _kline("2026-02-25 08:45", 22400, 22500, 22400, 22490, 100),
+            _kline("2026-02-25 09:00", 22490, 22510, 22480, 22500, 100),
+        ]
+        runner.feed_warmup_bars(warmup)
+        assert runner.state == LiveState.RUNNING
+
+        # Feed bars to trigger entry and exit order
+        bar1 = Bar(symbol="TX00", dt=datetime(2026, 2, 25, 9, 15),
+                   open=entry_price, high=entry_price+10,
+                   low=entry_price-10, close=entry_price,
+                   volume=100, interval=900)
+        runner._process_aggregated_bar(bar1)
+        assert runner.broker.position_size == 1
+
+        bar2 = Bar(symbol="TX00", dt=datetime(2026, 2, 25, 9, 30),
+                   open=entry_price+5, high=entry_price+10,
+                   low=entry_price-5, close=entry_price+5,
+                   volume=100, interval=900)
+        runner._process_aggregated_bar(bar2)
+        # Strategy queued exit with TP/SL on bar2
+        assert len(runner.broker._pending_exits) > 0
+
+        # Override exit prices for precise testing
+        runner.broker._pending_exits[0].limit = tp_price
+        runner.broker._pending_exits[0].stop = sl_price
+
+        return runner
+
+    def test_tp_fills_at_tick_price(self, tmp_path):
+        """Tick price >= TP limit should trigger immediate exit at TP price."""
+        runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
+
+        result = runner.check_tick_exit(22610, "2026-02-25 09:31:15")
+        assert result is not None
+        assert result["price"] == 22600  # fills at limit, not tick price
+        assert runner.broker.position_size == 0
+        assert runner.broker.trades[-1].pnl > 0
+
+    def test_sl_fills_at_tick_price(self, tmp_path):
+        """Tick price <= SL stop should trigger immediate exit at SL price."""
+        runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
+
+        result = runner.check_tick_exit(22440, "2026-02-25 09:31:30")
+        assert result is not None
+        assert result["price"] == 22450  # fills at stop, not tick price
+        assert runner.broker.position_size == 0
+        assert runner.broker.trades[-1].pnl < 0
+
+    def test_no_exit_when_price_between_tp_sl(self, tmp_path):
+        """Tick price between SL and TP should not trigger exit."""
+        runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
+
+        result = runner.check_tick_exit(22520, "2026-02-25 09:31:45")
+        assert result is None
+        assert runner.broker.position_size == 1
+
+    def test_no_exit_when_flat(self, tmp_path):
+        """check_tick_exit should return None when no position open."""
+        strategy = LongWithExitStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200, log_dir=str(tmp_path))
+        warmup = [
+            _kline("2026-02-25 08:45", 22400, 22500, 22400, 22490, 100),
+            _kline("2026-02-25 09:00", 22490, 22510, 22480, 22500, 100),
+        ]
+        runner.feed_warmup_bars(warmup)
+
+        result = runner.check_tick_exit(22500, "2026-02-25 09:00:00")
+        assert result is None
+
+    def test_no_exit_when_not_running(self, tmp_path):
+        """check_tick_exit should return None when runner is not RUNNING."""
+        strategy = LongWithExitStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200, log_dir=str(tmp_path))
+        assert runner.state == LiveState.IDLE
+
+        result = runner.check_tick_exit(22500)
+        assert result is None
+
+    def test_tick_exit_clears_pending_exits(self, tmp_path):
+        """After tick exit triggers, pending exits should be cleared."""
+        runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
+        assert len(runner.broker._pending_exits) > 0
+
+        runner.check_tick_exit(22610, "2026-02-25 09:32:00")
+        assert len(runner.broker._pending_exits) == 0
