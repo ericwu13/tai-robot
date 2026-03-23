@@ -175,23 +175,6 @@ class TaiRobot:
     def _on_order_data(self, event: Event) -> None:
         self.order_manager.on_order_data(event.data)
 
-    def change_symbol(self, new_symbol: str) -> None:
-        """Change the trading symbol and update quote subscriptions.
-
-        This updates the config and switches quote feed subscriptions to the new symbol.
-        Used when the user selects a different symbol in the GUI.
-
-        Args:
-            new_symbol: The new symbol to trade and subscribe to (e.g., "TMF", "TXFD0")
-        """
-        old_symbol = self.config.trading.symbol
-        self.config.trading.symbol = new_symbol
-
-        if self.quote_feed:
-            self.quote_feed.change_symbol(new_symbol)
-
-        logger.info("Changed trading symbol from %s to %s", old_symbol, new_symbol)
-
     def _on_connection(self, event: Event) -> None:
         d = event.data
         if d["code"] in (1, 2):  # disconnected / lost
@@ -199,9 +182,7 @@ class TaiRobot:
             if self.connection and self.connection.reconnect():
                 logger.info("Reconnected. Re-subscribing quotes...")
                 if self.quote_feed:
-                    # Ensure we're subscribed to the current symbol, not stale ones
-                    current_symbol = self.config.trading.symbol
-                    self.quote_feed.change_symbol(current_symbol)
+                    self.quote_feed.resubscribe_all()
 
 
 def main() -> None:

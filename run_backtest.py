@@ -824,7 +824,7 @@ class BacktestApp:
         # During off-market hours, don't burn attempts — defer to near market open
         if not is_market_open() and self._live_runner:
             secs = seconds_until_market_open()
-            if secs > 300:  # more than 5 min until market open
+            if secs > 120:  # more than 2 min until market open
                 defer_secs = max(secs - 120, 60)
                 defer_mins = defer_secs // 60
                 msg = (f"休市中 Market closed — deferring reconnect ~{defer_mins}m "
@@ -918,6 +918,14 @@ class BacktestApp:
         if self._live_runner and self._live_runner.state == LiveState.RUNNING:
             self._live_log_msg("已重連 Reconnected — resubscribing ticks", "status")
             _log("已重連 Reconnected — resubscribing ticks for live bot")
+            # Reload commodity data before resubscribing — required after fresh login
+            # (without this, RequestTicks succeeds but no ticks arrive)
+            if _com_available and skQ:
+                try:
+                    for mkt in (2, 7, 9):
+                        skQ.SKQuoteLib_RequestStockList(mkt)
+                except Exception:
+                    pass
             self._resubscribe_ticks()
 
     _RESUBSCRIBE_MAX_RETRIES = 3
@@ -955,7 +963,9 @@ class BacktestApp:
             self._live_tick_active = True
             self._tick_watchdog.on_tick()
             self._tick_watchdog.set_grace(30)
-            self._live_log_msg(f"已重新訂閱 Tick resubscription active for {com_symbol}", "status")
+            orig = getattr(self, '_live_tick_symbol', com_symbol)
+            label = f"{com_symbol} (for {orig})" if orig and orig != com_symbol else com_symbol
+            self._live_log_msg(f"已重新訂閱 Tick resubscription active for {label}", "status")
             # Restart tick drain if not already running
             self._drain_tick_queue()
         except Exception as e:

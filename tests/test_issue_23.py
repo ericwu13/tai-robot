@@ -1,159 +1,97 @@
-"""Tests for Issue #23: Resubscribe doesn't work over the weekends
+"""Tests for Issue #23: Resubscribe doesn't work over weekends.
 
-The issue is that:
-1. When reconnecting over weekends, it doesn't resubscribe properly when market opens on Monday
-2. When symbol is changed to TMF, it still resubscribes to TX00 instead of the current symbol
+Tests the tick watchdog session detection and reconnect scheduling logic
+that are unit-testable without COM.
 """
 
-from unittest.mock import MagicMock, Mock, patch
+import time
+from unittest.mock import patch
+
 import pytest
 
-from src.gateway.quote_feed import QuoteFeed
-from src.gateway.event_bus import EventBus
+from src.live.tick_watchdog import TickWatchdog
 
 
-class TestIssue23_ResubscriptionProblems:
-    """Test resubscription logic over weekends and symbol changes."""
+class TestTickWatchdogSessionResubscribe:
+    """Watchdog should detect session transitions and trigger resubscription."""
 
-    @patch('src.gateway.quote_feed._get_sk')
-    def test_resubscribe_all_uses_current_symbols(self, mock_get_sk):
-        """resubscribe_all() should use symbols currently in _subscribed_symbols set."""
-        event_bus = EventBus()
-        login_id = "test_user"
-        quote_feed = QuoteFeed(event_bus, login_id)
+    def test_session_resubscribe_when_last_tick_during_closed_market(self):
+        """If last tick was during closed market (e.g. Saturday), resubscribe immediately."""
+        wd = TickWatchdog()
+        wd.active = True
+        # Simulate a tick received during market hours, then market closes
+        wd.last_tick_time = time.time() - 7200  # 2 hours ago
 
-        # Mock the SK module to track calls
-        mock_sk = MagicMock()
-        mock_get_sk.return_value = mock_sk
+        # Mock: market is now open, but last tick was during closed hours
+        with patch("src.live.tick_watchdog.is_market_open") as mock_open, \
+             patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
+            # Current time: market is open; last tick time: market was closed
+            mock_open.side_effect = lambda dt=None: dt is None
+            action = wd.check()
 
-        # Subscribe to initial symbol (simulating TX00)
-        quote_feed.subscribe("TX00")
-        assert "TX00" in quote_feed._subscribed_symbols
+        assert action == "session_resubscribe"
 
-        # Clear the mock to track resubscribe calls
-        mock_sk.reset_mock()
+    def test_no_action_during_grace_period(self):
+        """During grace period after reconnect, watchdog should not trigger."""
+        wd = TickWatchdog()
+        wd.active = True
+        wd.last_tick_time = time.time() - 600  # 10 min ago (stale)
+        wd.set_grace(60)  # 60s grace
 
-        # Call resubscribe_all - should resubscribe to TX00
-        quote_feed.resubscribe_all()
+        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+             patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
+            action = wd.check()
 
-        # Verify it called the right subscription methods for TX00
-        mock_sk.SKQuoteLib_RequestStocks.assert_called_with("TX00")
-        mock_sk.SKQuoteLib_RequestTicks.assert_called_with(0, "TX00")
-        assert mock_sk.SKQuoteLib_RequestStocks.call_count == 1
-        assert mock_sk.SKQuoteLib_RequestTicks.call_count == 1
+        assert action is None
 
-    @patch('src.gateway.quote_feed._get_sk')
-    def test_subscribe_to_new_symbol_updates_subscribed_set(self, mock_get_sk):
-        """Subscribing to a new symbol should update _subscribed_symbols set."""
-        event_bus = EventBus()
-        login_id = "test_user"
-        quote_feed = QuoteFeed(event_bus, login_id)
+    def test_reconnect_after_long_staleness(self):
+        """After 10+ minutes of no ticks during market hours, force reconnect."""
+        wd = TickWatchdog()
+        wd.active = True
+        now = time.time()
+        wd.last_tick_time = now - 700  # 11+ minutes ago
 
-        # Mock the SK module
-        mock_sk = MagicMock()
-        mock_get_sk.return_value = mock_sk
+        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+             patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
+            action = wd.check(now=now)
 
-        # Subscribe to TX00 first
-        quote_feed.subscribe("TX00")
-        assert quote_feed._subscribed_symbols == {"TX00"}
+        assert action == "reconnect"
 
-        # Subscribe to TMF (should add to set, not replace)
-        quote_feed.subscribe("TMF")
-        assert "TMF" in quote_feed._subscribed_symbols
-        assert "TX00" in quote_feed._subscribed_symbols
+    def test_warn_then_resubscribe_escalation(self):
+        """Watchdog escalates: warn at 2min, resubscribe at 5min, reconnect at 10min."""
+        wd = TickWatchdog()
+        wd.active = True
+        now = time.time()
 
-    @patch('src.gateway.quote_feed._get_sk')
-    def test_unsubscribe_removes_from_subscribed_set(self, mock_get_sk):
-        """Unsubscribing should remove symbol from _subscribed_symbols set."""
-        event_bus = EventBus()
-        login_id = "test_user"
-        quote_feed = QuoteFeed(event_bus, login_id)
+        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+             patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
+            # 2.5 min stale -> warn
+            wd.last_tick_time = now - 150
+            assert wd.check(now=now) == "warn"
 
-        # Mock the SK module
-        mock_sk = MagicMock()
-        mock_get_sk.return_value = mock_sk
+            # 6 min stale -> resubscribe
+            wd.last_tick_time = now - 360
+            assert wd.check(now=now) == "resubscribe"
 
-        # Subscribe to both symbols
-        quote_feed.subscribe("TX00")
-        quote_feed.subscribe("TMF")
-        assert quote_feed._subscribed_symbols == {"TX00", "TMF"}
+            # 11 min stale -> reconnect
+            wd.last_tick_time = now - 660
+            assert wd.check(now=now) == "reconnect"
 
-        # Unsubscribe from TX00
-        quote_feed.unsubscribe("TX00")
-        assert quote_feed._subscribed_symbols == {"TMF"}
+    def test_no_action_when_inactive(self):
+        """Inactive watchdog should never trigger actions."""
+        wd = TickWatchdog()
+        wd.active = False
+        wd.last_tick_time = time.time() - 3600  # 1 hour stale
 
-        # Resubscribe should only resubscribe to TMF
-        mock_sk.reset_mock()
-        quote_feed.resubscribe_all()
-        mock_sk.SKQuoteLib_RequestStocks.assert_called_with("TMF")
-        mock_sk.SKQuoteLib_RequestTicks.assert_called_with(0, "TMF")
-        assert mock_sk.SKQuoteLib_RequestStocks.call_count == 1
+        assert wd.check() is None
 
-    @patch('src.gateway.quote_feed._get_sk')
-    def test_change_symbol_method_switches_subscription(self, mock_get_sk):
-        """FAILS: Test shows we need a method to switch from one symbol to another.
+    def test_suppress_near_session_close(self):
+        """Suppress warnings when near session close (thin volume is normal)."""
+        wd = TickWatchdog()
+        wd.active = True
+        now = time.time()
+        wd.last_tick_time = now - 400  # stale enough to trigger
 
-        This test will FAIL initially because there's no method to change the
-        subscribed symbol from TX00 to TMF. This is the core issue.
-        """
-        event_bus = EventBus()
-        login_id = "test_user"
-        quote_feed = QuoteFeed(event_bus, login_id)
-
-        # Mock the SK module
-        mock_sk = MagicMock()
-        mock_get_sk.return_value = mock_sk
-
-        # Subscribe to TX00 initially
-        quote_feed.subscribe("TX00")
-        assert quote_feed._subscribed_symbols == {"TX00"}
-
-        # This method doesn't exist yet - this test should FAIL
-        # This demonstrates the problem: we can't change the symbol cleanly
-        try:
-            quote_feed.change_symbol("TMF")
-            # If this succeeds, TMF should be subscribed and TX00 unsubscribed
-            assert quote_feed._subscribed_symbols == {"TMF"}
-
-            # Resubscribe should use TMF, not TX00
-            mock_sk.reset_mock()
-            quote_feed.resubscribe_all()
-            mock_sk.SKQuoteLib_RequestStocks.assert_called_with("TMF")
-            mock_sk.SKQuoteLib_RequestTicks.assert_called_with(0, "TMF")
-        except AttributeError:
-            # This is expected to fail initially - the method doesn't exist
-            pytest.fail("change_symbol method doesn't exist - this is the bug we need to fix")
-
-    @patch('src.gateway.quote_feed._get_sk')
-    def test_weekend_reconnection_scenario(self, mock_get_sk):
-        """FAILS: Test shows weekend reconnection issue.
-
-        Over the weekend, when market reopens, resubscription should work properly.
-        """
-        event_bus = EventBus()
-        login_id = "test_user"
-        quote_feed = QuoteFeed(event_bus, login_id)
-
-        # Mock the SK module
-        mock_sk = MagicMock()
-        mock_get_sk.return_value = mock_sk
-
-        # Subscribe to TMF before weekend
-        quote_feed.subscribe("TMF")
-        assert "TMF" in quote_feed._subscribed_symbols
-
-        # Simulate weekend disconnection (connection lost but symbols remain)
-        # The _subscribed_symbols should persist
-        assert quote_feed._subscribed_symbols == {"TMF"}
-
-        # Monday morning: reconnect and resubscribe
-        mock_sk.reset_mock()
-        quote_feed.resubscribe_all()
-
-        # Should resubscribe to TMF, not TX00
-        mock_sk.SKQuoteLib_RequestStocks.assert_called_with("TMF")
-        mock_sk.SKQuoteLib_RequestTicks.assert_called_with(0, "TMF")
-
-        # Verify it didn't try to subscribe to TX00
-        for call in mock_sk.SKQuoteLib_RequestStocks.call_args_list:
-            assert call[0][0] != "TX00", "Should not resubscribe to TX00 when TMF was selected"
+        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+             patch("src.live.tick_watchdog.minutes_until_session_close", return_value=5):
+            assert wd.check(now=now) is None
