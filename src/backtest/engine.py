@@ -41,9 +41,10 @@ class BacktestEngine:
         strategy: BacktestStrategy,
         point_value: int = 1,
         max_bars: int = 5000,
+        commission_per_contract: int = 0,
     ):
         self.strategy = strategy
-        self.broker = SimulatedBroker(point_value=point_value)
+        self.broker = SimulatedBroker(point_value=point_value, commission_per_contract=commission_per_contract)
         self.data_store = DataStore(max_bars=max_bars)
 
     def run(self, bars: list[Bar]) -> BacktestResult:

@@ -86,8 +86,9 @@ class SimulatedBroker:
     - End of data: force-close any open position at last bar's close
     """
 
-    def __init__(self, point_value: int = 1):
+    def __init__(self, point_value: int = 1, commission_per_contract: int = 0):
         self.point_value = point_value
+        self.commission_per_contract = commission_per_contract
         self.position_size: int = 0
         self.position_side: OrderSide | None = None
         self.entry_price: int = 0
@@ -216,9 +217,13 @@ class SimulatedBroker:
 
     def _close_position(self, tag: str, exit_price: int, bar_index: int) -> None:
         if self.position_side == OrderSide.LONG:
-            pnl = (exit_price - self.entry_price) * self.position_size * self.point_value
+            raw_pnl = (exit_price - self.entry_price) * self.position_size * self.point_value
         else:
-            pnl = (self.entry_price - exit_price) * self.position_size * self.point_value
+            raw_pnl = (self.entry_price - exit_price) * self.position_size * self.point_value
+
+        # Deduct commission: entry + exit commissions
+        commission = 2 * self.commission_per_contract * self.position_size
+        net_pnl = raw_pnl - commission
 
         trade = Trade(
             tag=self.entry_tag,
@@ -228,13 +233,13 @@ class SimulatedBroker:
             exit_price=exit_price,
             entry_bar_index=self.entry_bar_index,
             exit_bar_index=bar_index,
-            pnl=pnl,
+            pnl=net_pnl,
             exit_tag=tag,
             entry_dt=self._entry_dt,
             exit_dt=self._current_bar_dt,
         )
         self.trades.append(trade)
-        self._cumulative_pnl += pnl
+        self._cumulative_pnl += net_pnl
         self.equity_curve.append(self._cumulative_pnl)
 
         self.position_size = 0
@@ -259,6 +264,7 @@ class SimulatedBroker:
         """Serialize broker state for session persistence."""
         return {
             "point_value": self.point_value,
+            "commission_per_contract": self.commission_per_contract,
             "position_size": self.position_size,
             "position_side": self.position_side.value if self.position_side else None,
             "entry_price": self.entry_price,
@@ -284,7 +290,10 @@ class SimulatedBroker:
     @classmethod
     def from_dict(cls, data: dict) -> "SimulatedBroker":
         """Restore broker state from a serialized dict."""
-        broker = cls(point_value=data.get("point_value", 1))
+        broker = cls(
+            point_value=data.get("point_value", 1),
+            commission_per_contract=data.get("commission_per_contract", 0)
+        )
         broker.position_size = data.get("position_size", 0)
         side = data.get("position_side")
         broker.position_side = OrderSide(side) if side else None
