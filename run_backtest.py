@@ -2475,15 +2475,18 @@ class BacktestApp:
         """Detect the source timezone of tvDatafeed timestamps.
 
         All bar.dt must be naive Taiwan time (TWT/UTC+8).
-        Taiwan futures day session starts at 08:45 TWT.
 
-        Strategy: if bars at 08:45 exist, data is already TWT.
-        Otherwise, try known tvDatafeed timezones and pick the one
-        that converts a :45-minute bar to 08:45 Asia/Taipei.
-        Uses zoneinfo for proper DST handling — no hardcoded offsets.
+        Generalized detection using TAIFEX gap hours — no assumptions
+        about bar alignment, session start times, or minute offsets.
 
-        Returns a ZoneInfo object for the source timezone, or None if
-        already TWT.
+        TAIFEX has known gaps where no trading occurs (TWT):
+        - 05:01–08:44  (night close → day open)
+        - 13:46–14:59  (day close → night open)
+
+        Try candidate timezones.  The correct one produces ZERO bars
+        in gap hours after conversion to TWT.
+
+        Returns a ZoneInfo for the source timezone, or None if already TWT.
         """
         if df is None or df.empty:
             return None
@@ -2492,39 +2495,38 @@ class BacktestApp:
         _tz_taipei = ZoneInfo("Asia/Taipei")
 
         # Check for tz-aware index
-        sample = df.index[0].to_pydatetime()
-        if sample.tzinfo is not None:
+        if df.index[0].to_pydatetime().tzinfo is not None:
             return "tz-aware"
 
-        # Collect unique (hour, minute) pairs
-        bar_minutes = set()
-        for dt_idx in df.index:
-            bar_minutes.add((dt_idx.hour, dt_idx.minute))
+        def _in_gap(h, m):
+            """True if (h, m) in TWT falls in a TAIFEX no-trade gap."""
+            t = h * 60 + m
+            return (301 <= t <= 524) or (826 <= t <= 899)
 
-        # Already TWT?
-        if (8, 45) in bar_minutes:
-            return None
+        bar_dts = [dt.to_pydatetime() for dt in df.index]
 
-        # Find a :45-minute bar to test with
-        test_dt = None
-        for dt_idx in df.index:
-            if dt_idx.minute == 45:
-                test_dt = dt_idx.to_pydatetime()
-                break
-        if test_dt is None:
-            return None  # no :45 bars, can't detect
-
-        # Try common tvDatafeed source timezones
+        # None = already TWT, then known tvDatafeed server timezones
         candidates = [
+            None,
             ZoneInfo("America/Los_Angeles"),
             ZoneInfo("UTC"),
             ZoneInfo("America/New_York"),
             ZoneInfo("America/Chicago"),
         ]
+
         for tz in candidates:
-            converted = test_dt.replace(tzinfo=tz).astimezone(_tz_taipei)
-            if converted.hour == 8 and converted.minute == 45:
-                return tz
+            has_gap_bar = False
+            for dt in bar_dts:
+                if tz is None:
+                    h, m = dt.hour, dt.minute
+                else:
+                    c = dt.replace(tzinfo=tz).astimezone(_tz_taipei)
+                    h, m = c.hour, c.minute
+                if _in_gap(h, m):
+                    has_gap_bar = True
+                    break
+            if not has_gap_bar:
+                return tz  # None means already TWT
 
         return None  # can't detect — assume TWT
 
