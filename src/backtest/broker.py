@@ -160,6 +160,9 @@ class SimulatedBroker:
                 self.entry_tag = order.tag
                 self.entry_bar_index = bar_index
                 self._entry_dt = bar_dt
+                # Clear stale exit metadata from previous trade
+                self.last_exit_type = ""
+                self.last_exit_limit = None
         self._pending_entries.clear()
 
     def check_exits(self, bar_index: int, open_: int, high: int, low: int, close: int, bar_dt: str = "") -> None:
