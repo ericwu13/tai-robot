@@ -23,4 +23,4 @@ jobs:
         run: cp settings.example.yaml settings.yaml
 
       - name: Run tests
-        run: pytest tests/ -x --ignore=tests/test_taifex.py -v
+        run: pytest tests/ -x -v

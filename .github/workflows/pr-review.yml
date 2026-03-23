@@ -123,7 +123,7 @@ jobs:
 
             ## After making changes
 
-            1. Run `pytest tests/ -x --ignore=tests/test_taifex.py` to verify tests pass.
+            1. Run `pytest tests/ -x` to verify tests pass.
             2. Commit and push to this branch:
                ```
                git add -A
