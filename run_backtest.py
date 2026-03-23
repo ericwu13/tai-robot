@@ -3284,7 +3284,7 @@ class BacktestApp:
 
     def _toggle_live(self):
         """Toggle between Deploy Bot and Stop Bot."""
-        if self._live_runner and self._live_runner.state == LiveState.RUNNING:
+        if self._live_runner and self._live_runner.state != LiveState.IDLE:
             self._stop_live()
         else:
             self._deploy_live()
