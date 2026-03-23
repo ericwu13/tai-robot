@@ -4164,8 +4164,10 @@ class BacktestApp:
         src_label = f" ({price_source})" if price_source else ""
         tk.Label(dlg, text=f"參考價格 Ref Price: {price:,}{src_label}  |  數量 Qty: 1 口",
                 font=("", 11)).pack(pady=2)
-        tk.Label(dlg, text="實單將以市價IOC送出 Will send as IOC market order",
-                font=("", 9), fg="gray").pack(pady=2)
+        order_hint = ("實單將以市價IOC送出 Will send as IOC market order"
+                      if action_type == "entry" else
+                      "實單將以ROD限價送出 Will send as ROD limit order")
+        tk.Label(dlg, text=order_hint, font=("", 9), fg="gray").pack(pady=2)
 
         countdown_label = tk.Label(dlg, text=f"自動跳過 Auto-skip in {countdown[0]}s",
                                   font=("", 10), fg="orange")
@@ -4270,26 +4272,41 @@ class BacktestApp:
             oOrder.bstrFullAccount = self._futures_account
             oOrder.bstrStockNo = order_symbol
             oOrder.sBuySell = buy_sell
-            # IOC for entries (cancel if no fill), ROD for exits (must fill)
-            oOrder.sTradeType = 1 if action_type == "entry" else 0  # 0=ROD, 1=IOC
+            # Entries: IOC + market price — fill now or cancel
+            # Exits:  ROD + limit price with slippage — must fill to close position
+            _EXIT_SLIPPAGE = 100  # points of slippage buffer for ROD exit limit price
+            if action_type == "entry":
+                oOrder.sTradeType = 1  # IOC
+                oOrder.bstrPrice = "M"
+                price_label = "MKT"
+                type_label = "IOC"
+            else:
+                oOrder.sTradeType = 0  # ROD
+                # Set a generous limit price to ensure fill
+                if buy_sell == 0:  # BUY to close short → accept higher price
+                    limit_price = int(sim_price + _EXIT_SLIPPAGE)
+                else:              # SELL to close long → accept lower price
+                    limit_price = max(1, int(sim_price - _EXIT_SLIPPAGE))
+                oOrder.bstrPrice = str(limit_price)
+                price_label = f"LMT={limit_price}"
+                type_label = "ROD"
             oOrder.sDayTrade = 0      # non-daytrade
-            oOrder.bstrPrice = "M"    # market price (M=市價)
             oOrder.nQty = 1           # safety: max 1 contract
             oOrder.sNewClose = new_close  # 0=new, 1=close, 2=auto
             oOrder.sReserved = 0      # during session
 
             user_id = self.login_user_var.get().strip()
             side_str = "BUY" if buy_sell == 0 else "SELL"
-            order_type_str = "IOC" if action_type == "entry" else "ROD"
             self._live_log_msg(
-                f"送出實單 Sending: {side_str} {order_symbol} x1 {order_type_str} MKT "
+                f"送出實單 Sending: {side_str} {order_symbol} x1 {type_label} {price_label} "
                 f"(模擬價={sim_price:,})", action_type)
             _log(f"REAL ORDER: {side_str} {order_symbol} acct={self._futures_account} "
                  f"sim_price={sim_price}")
             nc = oOrder.sNewClose
             nc_label = {0: "new", 1: "close", 2: "auto"}.get(nc, str(nc))
             _log(f"REAL ORDER PARAMS: acct={self._futures_account} stock={order_symbol} "
-                 f"buy_sell={buy_sell} trade_type=1(IOC) price=M(MKT) qty=1 newclose={nc}({nc_label}) reserved=0")
+                 f"buy_sell={buy_sell} trade_type={oOrder.sTradeType}({type_label}) "
+                 f"price={oOrder.bstrPrice}({price_label}) qty=1 newclose={nc}({nc_label}) reserved=0")
 
             # Synchronous send — returns immediately for IOC market orders
             message, code = skO.SendFutureOrderCLR(user_id, False, oOrder)
