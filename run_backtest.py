@@ -1029,6 +1029,11 @@ class BacktestApp:
         self._real_positions: list[dict] = []
         self._real_rights: dict = {}
         self._real_account_poll_id = None
+        # Fill confirmation polling (auto mode)
+        self._fill_poll_timer_id = None
+        self._fill_poll_start_time: float = 0
+        self._fill_count_before_order: int = 0
+        self._fill_poll_action_type: str = ""
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -4104,6 +4109,18 @@ class BacktestApp:
         symbol = self._live_runner.symbol if self._live_runner else "?"
         order_symbol = _resolve_order_symbol(symbol)
 
+        if verdict == guard.BLOCK_HALTED:
+            self._live_log_msg(
+                f"系統已停止 HALTED: {details['reason']}", "exit")
+            self._log_order_decision("REAL_ORDER_HALTED", details["reason"])
+            return
+
+        if verdict == guard.BLOCK_FILL_PENDING:
+            self._live_log_msg(
+                f"等待確認中 Pending: {details['reason']}", "status")
+            self._log_order_decision("REAL_ORDER_PENDING_BLOCK", details["reason"])
+            return
+
         if verdict == guard.BLOCK_ENTRY:
             self._live_log_msg(
                 f"實單暫停 Order blocked: {details['reason']}", "status")
@@ -4122,7 +4139,8 @@ class BacktestApp:
             self._log_order_decision("REAL_ORDER_AUTO", f"{action.lower()} {order_desc} {order_symbol}")
             self._send_real_order(buy_sell, order_symbol, action_type, price,
                                  new_close=new_close, exit_type=exit_type, exit_limit=exit_limit)
-            guard.on_exit_sent()
+            # State transition deferred to _on_fill_confirmed (auto) or
+            # handled inside _send_real_order (semi_auto)
             return
 
         if verdict == guard.SEND_ENTRY:
@@ -4322,14 +4340,20 @@ class BacktestApp:
                 self._live_log_msg(f"實單已送出 Order sent: {message}", action_type)
                 _log(f"REAL ORDER OK: {message}")
                 self._last_real_order_side = buy_sell  # track for close button
-                if action_type == "entry":
-                    self._trading_guard.on_entry_sent()
-                elif action_type == "exit":
-                    self._trading_guard.on_exit_sent()
+                if self._trading_mode == "auto":
+                    # Auto mode: defer state transition until fill confirmed
+                    self._trading_guard.on_fill_pending(action_type)
+                    self._start_fill_polling(action_type)
+                else:
+                    # Semi-auto: immediate state transition (user oversight)
+                    if action_type == "entry":
+                        self._trading_guard.on_entry_sent()
+                    elif action_type == "exit":
+                        self._trading_guard.on_exit_sent()
                 self.root.after(3000, self._query_real_account)  # refresh after fill
                 self._log_order_decision(
                     "REAL_ORDER_SENT",
-                    f"{side_str} {order_symbol} x1 MKT sim={sim_price}",
+                    f"{side_str} {order_symbol} x1 {price_label} sim={sim_price}",
                 )
             else:
                 err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
@@ -4344,6 +4368,116 @@ class BacktestApp:
             self._live_log_msg(f"實單異常 Order error: {e}", "exit")
             _log(f"REAL ORDER ERROR: {e}\n{traceback.format_exc()}")
             self._log_order_decision("REAL_ORDER_ERROR", str(e))
+
+    # ── Fill confirmation polling (auto mode) ──
+
+    def _get_fill_count(self) -> int:
+        """Query GetFulfillReport and return the number of fill lines."""
+        if not _com_available or skO is None:
+            return -1
+        try:
+            user_id = self.login_user_var.get().strip()
+            raw = skO.GetFulfillReport(user_id, self._futures_account, 4)
+            if not raw or not raw.strip():
+                return 0
+            count = 0
+            for line in raw.strip().split("\n"):
+                fields = line.strip().split(",")
+                if len(fields) >= 20:
+                    count += 1
+            return count
+        except Exception as e:
+            _log(f"FILL COUNT ERROR: {e}")
+            return -1
+
+    def _start_fill_polling(self, action_type: str) -> None:
+        """Start polling GetFulfillReport for fill confirmation."""
+        baseline = self._get_fill_count()
+        if baseline < 0:
+            # COM unavailable — fall back to immediate state transition
+            _log("FILL POLL: COM unavailable, skipping fill confirmation")
+            self._trading_guard.on_fill_confirmed()
+            if action_type == "entry":
+                self._trading_guard.on_entry_sent()
+            elif action_type == "exit":
+                self._trading_guard.on_exit_sent()
+            return
+        self._fill_count_before_order = baseline
+        self._fill_poll_action_type = action_type
+        self._fill_poll_start_time = time.monotonic()
+        self._live_log_msg(
+            f"等待成交確認 Waiting for {action_type} fill confirmation "
+            f"(fills_before={self._fill_count_before_order})", "status")
+        _log(f"FILL POLL START: type={action_type} "
+             f"baseline_count={self._fill_count_before_order}")
+        self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
+
+    def _poll_fill_confirmation(self) -> None:
+        """Check if fill count increased since order was sent."""
+        if not self._trading_guard.fill_pending:
+            return  # already resolved (e.g., stopped)
+
+        elapsed = time.monotonic() - self._fill_poll_start_time
+        current_count = self._get_fill_count()
+
+        if current_count < 0:
+            # COM error — keep polling, don't confirm or timeout yet
+            _log(f"FILL POLL: COM error, retrying... ({elapsed:.1f}s)")
+            if elapsed < 30.0:
+                self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
+                return
+            # If COM still broken after 30s, fall through to timeout
+
+        if current_count > self._fill_count_before_order:
+            _log(f"FILL POLL: confirmed! count {self._fill_count_before_order} -> "
+                 f"{current_count} ({elapsed:.1f}s)")
+            self._on_fill_confirmed()
+            return
+
+        if elapsed >= 30.0:
+            _log(f"FILL POLL: TIMEOUT after {elapsed:.1f}s, "
+                 f"count still {current_count}")
+            self._on_fill_timeout()
+            return
+
+        # Keep polling
+        _log(f"FILL POLL: pending... count={current_count} "
+             f"({elapsed:.1f}s elapsed)")
+        self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
+
+    def _on_fill_confirmed(self) -> None:
+        """Called when fill is confirmed via GetFulfillReport."""
+        self._fill_poll_timer_id = None
+        action_type = self._fill_poll_action_type
+
+        self._trading_guard.on_fill_confirmed()
+        # NOW do the deferred state transition
+        if action_type == "entry":
+            self._trading_guard.on_entry_sent()
+        elif action_type == "exit":
+            self._trading_guard.on_exit_sent()
+
+        self._live_log_msg(
+            f"成交已確認 {action_type.upper()} fill confirmed", "entry")
+        self._log_order_decision("FILL_CONFIRMED", action_type)
+
+    def _on_fill_timeout(self) -> None:
+        """Called when fill confirmation times out after 30 seconds."""
+        self._fill_poll_timer_id = None
+        action_type = self._fill_poll_action_type
+
+        self._trading_guard.on_fill_timeout()
+        msg = (f"成交超時 HALTED: {action_type} fill not confirmed after 30s — "
+               f"all orders blocked. Check position manually.")
+        self._live_log_msg(msg, "exit")
+        self._log_order_decision("FILL_TIMEOUT_HALTED", f"{action_type} timeout 30s")
+        _log(f"FILL POLL HALTED: {msg}")
+
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONHAND)
+        except Exception:
+            pass
 
     # ── Manual order buttons ──
 
@@ -4603,6 +4737,13 @@ class BacktestApp:
         if self._warmup_timeout_id:
             self.root.after_cancel(self._warmup_timeout_id)
             self._warmup_timeout_id = None
+        if self._fill_poll_timer_id:
+            self.root.after_cancel(self._fill_poll_timer_id)
+            self._fill_poll_timer_id = None
+        if self._trading_guard.fill_pending:
+            self._live_log_msg(
+                f"警告: 停止時有未確認成交 WARNING: {self._fill_poll_action_type} "
+                f"fill pending during stop. Check position manually.", "exit")
         self._live_warmup_mode = False
         self._live_polling = False
         self._live_tick_active = False
@@ -4635,8 +4776,11 @@ class BacktestApp:
                 self._live_log_msg(
                     f"停止平倉 Stop-close: {order_desc} {order_symbol}", "exit")
                 self._log_order_decision("REAL_ORDER_AUTO", f"stop_close {order_desc} {order_symbol}")
+                # Force semi-auto path for stop-close (no fill gating — bot is stopping)
+                saved_mode = self._trading_mode
+                self._trading_mode = "semi_auto"
                 self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
-                self._trading_guard.on_exit_sent()
+                self._trading_mode = saved_mode
 
             # Suppress strategy before stop — prevent new entries during shutdown.
             # stop() flushes the aggregator's partial bar and runs _process_aggregated_bar,

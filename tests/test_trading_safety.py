@@ -407,3 +407,206 @@ class TestScenarioLossLimitDuringTrade:
 
         verdict, _ = g.decide("auto", "FORCE_CLOSE", "SHORT")
         assert verdict == g.SEND_EXIT
+
+
+# ── Fill confirmation gate ──
+
+class TestFillPendingBlocks:
+    """While fill_pending is True, all orders must be blocked."""
+
+    def test_fill_pending_blocks_entry(self):
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        verdict, details = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_FILL_PENDING
+        assert "waiting for entry fill" in details["reason"]
+
+    def test_fill_pending_blocks_exit(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        verdict, details = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.BLOCK_FILL_PENDING
+        assert "waiting for exit fill" in details["reason"]
+
+    def test_fill_pending_blocks_semi_auto_too(self):
+        """fill_pending is mode-agnostic — blocks semi_auto if ever set."""
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        verdict, _ = g.decide("semi_auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_FILL_PENDING
+
+    def test_force_close_bypasses_fill_pending(self):
+        """FORCE_CLOSE is an emergency exit — must not be blocked by fill gate."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT  # NOT blocked
+
+    def test_force_close_bypasses_halted(self):
+        """FORCE_CLOSE bypasses halted state too."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        g.on_fill_timeout()
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT  # NOT blocked
+
+
+class TestFillConfirmedResumes:
+    """After on_fill_confirmed(), orders should flow normally again."""
+
+    def test_confirmed_resumes_entry(self):
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        assert g.fill_pending is True
+        g.on_fill_confirmed()
+        assert g.fill_pending is False
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+
+    def test_confirmed_resumes_exit(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        g.on_fill_confirmed()
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+    def test_deferred_state_transition_entry(self):
+        """Simulate the full auto flow: pending → confirmed → on_entry_sent."""
+        g = TradingGuard()
+        # Order sent, enter pending
+        g.on_fill_pending("entry")
+        assert g.real_entry_confirmed is False  # NOT set yet
+        # Fill confirmed
+        g.on_fill_confirmed()
+        g.on_entry_sent()  # NOW set
+        assert g.real_entry_confirmed is True
+        # Exit should now work
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+    def test_deferred_state_transition_exit(self):
+        """Simulate: entry confirmed → exit sent → pending → confirmed → on_exit_sent."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        assert g.real_entry_confirmed is True
+        # Exit order sent, enter pending
+        g.on_fill_pending("exit")
+        assert g.real_entry_confirmed is True  # still True during pending
+        # Fill confirmed
+        g.on_fill_confirmed()
+        g.on_exit_sent()  # NOW cleared
+        assert g.real_entry_confirmed is False
+
+
+class TestHaltedBlocks:
+    """After fill timeout, halted=True blocks everything permanently."""
+
+    def test_halted_blocks_entry(self):
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.on_fill_timeout()
+        verdict, details = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_HALTED
+        assert "system halted" in details["reason"]
+
+    def test_halted_blocks_exit(self):
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        g.on_fill_timeout()
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.BLOCK_HALTED
+
+    def test_halted_takes_priority_over_paused(self):
+        """Halted overrides daily loss limit (stronger block)."""
+        g = TradingGuard(daily_loss_limit=1000)
+        g.update_pnl(-5000)
+        g.on_fill_pending("entry")
+        g.on_fill_timeout()
+        verdict, details = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_HALTED  # not BLOCK_ENTRY
+
+    def test_halted_survives_pnl_update(self):
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.on_fill_timeout()
+        g.update_pnl(9999)  # big profit shouldn't clear halt
+        assert g.halted is True
+
+    def test_clear_halt_resumes(self):
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.on_fill_timeout()
+        assert g.halted is True
+        g.clear_halt()
+        assert g.halted is False
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+
+    def test_fill_pending_cleared_on_timeout(self):
+        """on_fill_timeout clears fill_pending (only halted remains)."""
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        assert g.fill_pending is True
+        g.on_fill_timeout()
+        assert g.fill_pending is False
+        assert g.halted is True
+
+
+class TestResetClearsAll:
+    """reset() must clear fill_pending and halted."""
+
+    def test_reset_clears_fill_pending(self):
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.reset()
+        assert g.fill_pending is False
+        assert g.fill_pending_type == ""
+
+    def test_reset_clears_halted(self):
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.on_fill_timeout()
+        g.reset()
+        assert g.halted is False
+        assert g.halt_reason == ""
+
+
+class TestScenarioAutoFillGating:
+    """Full auto mode scenarios with fill gating."""
+
+    def test_entry_pending_then_exit_blocked(self):
+        """Entry sent but not filled → sim fires exit → must be blocked."""
+        g = TradingGuard()
+        # Auto mode sends entry, enters pending
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+        g.on_fill_pending("entry")
+        # Sim fires exit while entry pending
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.BLOCK_FILL_PENDING
+
+    def test_entry_confirmed_then_exit_allowed(self):
+        """Full cycle: entry → pending → confirmed → exit works."""
+        g = TradingGuard()
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+        g.on_fill_pending("entry")
+        g.on_fill_confirmed()
+        g.on_entry_sent()
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+    def test_timeout_blocks_everything(self):
+        """Entry timeout → both entry and exit blocked."""
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.on_fill_timeout()
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_HALTED
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.BLOCK_HALTED
