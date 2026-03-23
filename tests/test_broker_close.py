@@ -65,14 +65,14 @@ class TestMarketClose:
         ctx.entry("L1", OrderSide.LONG)
         broker.on_bar_close(0, 20000)
 
-        # Close and re-enter on same bar
+        # Close and re-enter on same bar (allowed — matches TV semantics)
         ctx.close("L1")
         ctx.entry("L2", OrderSide.LONG)
         broker.on_bar_close(1, 20100)
 
-        # Close should have happened, entry skipped (same bar as exit)
-        assert broker.position_size == 0
-        assert len(broker.trades) == 1
+        # Close happened, then re-entry at bar close
+        assert broker.position_size == 1  # re-entered
+        assert len(broker.trades) == 1    # one closed trade
 
     def test_close_wrong_from_entry_is_ignored(self, broker, ctx):
         """close() with non-matching from_entry should not close the position."""
