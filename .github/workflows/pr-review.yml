@@ -12,8 +12,31 @@ on:
     types: [submitted]
 
 jobs:
+  # Auto-merge when PR is approved
+  auto-merge:
+    if: |
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      startsWith(github.event.pull_request.head.ref, 'autofix/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              merge_method: 'squash'
+            });
+            console.log(`PR #${context.payload.pull_request.number} merged!`);
+
+  # Respond to @claude comments on PRs
   respond:
-    # Only run on PRs (not plain issues), and only on autofix branches
     if: |
       (github.event.issue.pull_request || github.event.pull_request) &&
       contains(github.event.comment.body || github.event.review.body || '', '@claude')
