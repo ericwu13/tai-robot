@@ -16,8 +16,8 @@ class Order:
     tag: str
     side: OrderSide
     qty: int = 1
-    limit: int | None = None
-    stop: int | None = None
+    limit: int | float | None = None
+    stop: int | float | None = None
     from_entry: str = ""
 
 
@@ -50,6 +50,11 @@ class BrokerContext:
     def position_size(self) -> int:
         return self._broker.position_size
 
+    @property
+    def trades(self) -> list:
+        """Read-only access to completed trades (for loss counting, etc.)."""
+        return list(self._broker.trades)
+
     def entry(self, tag: str, side: OrderSide, qty: int = 1) -> None:
         self._broker.queue_entry(Order(tag=tag, side=side, qty=qty))
 
@@ -62,8 +67,7 @@ class BrokerContext:
     ) -> None:
         self._broker.queue_exit(Order(
             tag=tag, side=OrderSide.LONG, qty=0,
-            limit=round(limit) if limit is not None else None,
-            stop=round(stop) if stop is not None else None,
+            limit=limit, stop=stop,
             from_entry=from_entry,
         ))
 
@@ -128,7 +132,9 @@ class SimulatedBroker:
         """Process pending market closes and entry orders at bar close.
 
         Order: market closes first, then entries.
-        Skip entries if an exit happened on this same bar — prioritize exit.
+        Same-bar re-entry is allowed (matches TradingView semantics):
+        exit fills intra-bar at TP/SL price, entry fills at bar close.
+        In live trading, tick-level exit detection separates these naturally.
         """
         self._bar_index = bar_index
         self._current_bar_dt = bar_dt
@@ -141,7 +147,7 @@ class SimulatedBroker:
         self._pending_market_closes.clear()
 
         for order in self._pending_entries:
-            if self.position_size == 0 and bar_index != self._exit_bar_index:
+            if self.position_size == 0:
                 self.position_size = order.qty
                 self.position_side = order.side
                 self.entry_price = close
@@ -214,7 +220,8 @@ class SimulatedBroker:
             return limit_fill
         return None
 
-    def _close_position(self, tag: str, exit_price: int, bar_index: int) -> None:
+    def _close_position(self, tag: str, exit_price: int | float, bar_index: int) -> None:
+        exit_price = int(round(exit_price))  # TAIFEX prices are integers
         if self.position_side == OrderSide.LONG:
             pnl = (exit_price - self.entry_price) * self.position_size * self.point_value
         else:

@@ -117,31 +117,36 @@ class TestBacktestEngine:
         assert len(result.trades) == 0
 
     def test_multiple_trades(self):
-        """Two round-trip trades: exit prioritized over same-bar re-entry.
+        """Three trades: same-bar re-entry allowed (matches TradingView).
 
-        With the same-bar re-entry prevention fix:
+        Exit fills intra-bar at TP/SL price, entry fills at bar close.
+        In live, tick-level exit detection separates these naturally.
         - Bar 0: enter at 20010
-        - Bar 1: TP hit at 20110 (exit) — re-entry SKIPPED (same bar as exit)
-        - Bar 2: re-enter at 20080 (next bar after exit)
+        - Bar 1: TP hit at 20110 (exit intra-bar), re-enter at 20150 (close)
+        - Bar 2: SL hit at 20100 (exit intra-bar), re-enter at 20080 (close)
         - Bar 3: force close at 20070
         """
         bars = [
             make_bar(0, 20000, 20050, 19980, 20010),   # enter at 20010, TP=20110 SL=19960
-            make_bar(1, 20020, 20200, 20000, 20150),    # TP hit at 20110, exit; no re-entry (same bar)
-            make_bar(2, 20140, 20160, 20050, 20080),    # re-enter at 20080
+            make_bar(1, 20020, 20200, 20000, 20150),    # TP hit at 20110, re-enter at 20150
+            make_bar(2, 20140, 20160, 20050, 20080),    # SL hit at 20100, re-enter at 20080
             make_bar(3, 20090, 20100, 20050, 20070),    # last bar, force close at 20070
         ]
         engine = BacktestEngine(AlwaysLongStrategy(), point_value=1)
         result = engine.run(bars)
 
-        assert len(result.trades) == 2
+        assert len(result.trades) == 3
         assert result.trades[0].entry_price == 20010
         assert result.trades[0].exit_price == 20110  # TP
         assert result.trades[0].pnl == 100
-        # Second entry delayed to bar 2 (bar 1 blocked by same-bar exit)
-        assert result.trades[1].entry_price == 20080
-        assert result.trades[1].exit_price == 20070  # force close
-        assert result.trades[1].pnl == -10
+        # Same-bar re-entry at bar 1 close
+        assert result.trades[1].entry_price == 20150
+        assert result.trades[1].exit_price == 20100  # SL on bar 2
+        assert result.trades[1].pnl == -50
+        # Same-bar re-entry at bar 2 close
+        assert result.trades[2].entry_price == 20080
+        assert result.trades[2].exit_price == 20070  # force close
+        assert result.trades[2].pnl == -10
 
     def test_result_has_metrics(self):
         bars = [

@@ -134,10 +134,15 @@ class MyStrategy(BacktestStrategy):
         pass
 ```
 
-## Bar: symbol, dt(datetime), open/high/low/close/volume(int), interval(int seconds)
+## Bar
+- Fields: symbol, dt(datetime), open/high/low/close/volume(int), interval(int seconds)
+- **bar.dt is in Taiwan time (TWT / UTC+8)** — never assume UTC
 
 ## BrokerContext API
 - `broker.position_size` -> int (0=flat, always >= 0, no direction info — track yourself)
+- `broker.trades` -> list[Trade] (read-only, completed trades). \
+Each Trade has: .tag, .side, .qty, .entry_price, .exit_price, .pnl(int), .entry_dt, .exit_dt. \
+Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.close vs entry_price.
 - `broker.entry(tag: str, side: OrderSide, qty=1)` — queue entry, filled at bar close. Returns None.
   The `tag` is a string you define (e.g. "Long"). Use the SAME tag string in close()/exit() `from_entry`.
 - `broker.exit(tag, from_entry: str, limit=None, stop=None)` — sets limit/stop exit orders, checked on NEXT bar's OHLC
@@ -149,6 +154,19 @@ class MyStrategy(BacktestStrategy):
   Use `close()` for immediate market exits (e.g. when checking bar.high >= target in on_bar).
 - OrderSide.LONG / OrderSide.SHORT
 - Prefer LONG-only unless asked for short
+
+## Session Utilities
+```python
+from src.market_data.sessions import is_last_bar_of_session
+
+is_last_bar_of_session(bar.dt, kline_minute=60) -> bool
+# Returns True if this bar is the last bar of a Taiwan futures session.
+# Day session: 08:45-13:45 TWT, Night session: 15:00-05:00+1 TWT
+# Works for any kline_minute (1, 5, 15, 60, 240, etc.)
+```
+**Use this for session close detection.** Do NOT hard-code session hours manually. \
+For day-trade strategies, close positions on the last bar: \
+`if is_last_bar_of_session(bar.dt, self.kline_minute): broker.close("Long", tag="Session Close")`
 
 ## DataStore API
 - `data_store.get_bars(n=None)` -> list[Bar]
@@ -184,7 +202,8 @@ available one and explain the substitution in Notes.
 1. Output exactly ONE code block starting with ```python (this exact tag is required for parsing)
 2. MUST subclass BacktestStrategy
 3. Only allowed imports: src.backtest.strategy, src.backtest.broker, \
-src.market_data.models, src.market_data.data_store, src.strategy.indicators.*, math
+src.market_data.models, src.market_data.data_store, src.market_data.sessions, \
+src.strategy.indicators.*, math
 4. All prices are raw integers
 5. __init__ MUST accept **kwargs
 6. PascalCase class name, include docstring

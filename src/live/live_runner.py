@@ -362,6 +362,65 @@ class LiveRunner:
                 completed_agg.append(agg)
         return completed_agg
 
+    def check_tick_exit(self, price: int, tick_dt: str = "") -> dict | None:
+        """Check if a tick price triggers a pending TP/SL exit.
+
+        Called on every tick during RUNNING state for real-time exit
+        detection.  This allows exits to fill at the exact tick price
+        instead of waiting for the aggregated bar to complete.
+
+        Returns a dict with trade info if an exit triggered, None otherwise.
+        """
+        if self.state != LiveState.RUNNING:
+            return None
+        if self.broker.position_size == 0 or not self.broker._pending_exits:
+            return None
+
+        from ..backtest.broker import OrderSide
+        side = self.broker.position_side
+
+        for order in list(self.broker._pending_exits):
+            limit = order.limit
+            stop = order.stop
+            fill_price = None
+
+            if side == OrderSide.LONG:
+                if limit is not None and price >= limit:
+                    fill_price = limit
+                elif stop is not None and price <= stop:
+                    fill_price = stop
+            elif side == OrderSide.SHORT:
+                if limit is not None and price <= limit:
+                    fill_price = limit
+                elif stop is not None and price >= stop:
+                    fill_price = stop
+
+            if fill_price is not None:
+                self.broker._current_bar_dt = tick_dt
+                self.broker._close_position(order.tag, fill_price, self._bar_index)
+                # Log and save
+                last_trade = self.broker.trades[-1]
+                # Create a minimal bar for logging (use TWT time)
+                log_bar = Bar(symbol=self.symbol,
+                              dt=datetime.now(_TZ_TAIPEI).replace(tzinfo=None),
+                              open=price, high=price, low=price, close=price,
+                              volume=0, interval=0)
+                self._log_decision(
+                    log_bar, "TRADE_CLOSE", last_trade.side.value,
+                    last_trade.exit_tag, fill_price,
+                    f"tick exit PnL={last_trade.pnl:+}",
+                )
+                self._auto_save_session()
+                self._emit("on_tick_exit", last_trade)
+                return {
+                    "tag": order.tag,
+                    "price": fill_price,
+                    "pnl": last_trade.pnl,
+                    "dt": tick_dt,
+                }
+
+        return None
+
     def feed_1m_bar(self, bar: Bar) -> Bar | None:
         """Process a single 1-min Bar object: dedup → log → aggregate → strategy.
 
