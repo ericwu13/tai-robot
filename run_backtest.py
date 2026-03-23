@@ -2461,34 +2461,75 @@ class BacktestApp:
             self._execute_backtest(list(self._raw_bars))
             return
 
-        kt = strategy_cls.kline_type
-        km = strategy_cls.kline_minute
-        symbol = self.symbol_var.get().strip()
-        cache_file = _get_cache_file(symbol, (kt, km))
-
-        # Try local CSV first
-        if cache_file:
-            cache_path = os.path.join(_CACHE_DIR, cache_file)
-            if os.path.exists(cache_path):
-                self._data_source = f"TradingView ({cache_file})"
-                interval = self._get_strategy_interval()
-                _log(f"載入快取 Loading cached data: {cache_file}")
-                bars = load_bars_from_csv(cache_path, symbol=symbol, interval=interval)
-                _log(f"載入完成 Loaded {len(bars)} bars from {cache_file}")
-                self._execute_backtest(bars)
-                return
-
-        # Fall back to live TradingView download
+        # Always fetch fresh data from TradingView (skip stale CSV cache)
         if _tv_available:
-            _log("本地無資料，從TradingView下載 No local data, fetching from TradingView...")
+            _log("從TradingView下載最新資料 Fetching fresh data from TradingView...")
             self._fetch_tradingview_live()
             return
 
         self.status_var.set("無資料 No local CSV and tvDatafeed not installed.")
         self._enable_buttons()
 
+    @staticmethod
+    def _detect_tv_source_tz(df):
+        """Detect the source timezone of tvDatafeed timestamps.
+
+        All bar.dt must be naive Taiwan time (TWT/UTC+8).
+        Taiwan futures day session starts at 08:45 TWT.
+
+        Strategy: if bars at 08:45 exist, data is already TWT.
+        Otherwise, try known tvDatafeed timezones and pick the one
+        that converts a :45-minute bar to 08:45 Asia/Taipei.
+        Uses zoneinfo for proper DST handling — no hardcoded offsets.
+
+        Returns a ZoneInfo object for the source timezone, or None if
+        already TWT.
+        """
+        if df is None or df.empty:
+            return None
+
+        from zoneinfo import ZoneInfo
+        _tz_taipei = ZoneInfo("Asia/Taipei")
+
+        # Check for tz-aware index
+        sample = df.index[0].to_pydatetime()
+        if sample.tzinfo is not None:
+            return "tz-aware"
+
+        # Collect unique (hour, minute) pairs
+        bar_minutes = set()
+        for dt_idx in df.index:
+            bar_minutes.add((dt_idx.hour, dt_idx.minute))
+
+        # Already TWT?
+        if (8, 45) in bar_minutes:
+            return None
+
+        # Find a :45-minute bar to test with
+        test_dt = None
+        for dt_idx in df.index:
+            if dt_idx.minute == 45:
+                test_dt = dt_idx.to_pydatetime()
+                break
+        if test_dt is None:
+            return None  # no :45 bars, can't detect
+
+        # Try common tvDatafeed source timezones
+        candidates = [
+            ZoneInfo("America/Los_Angeles"),
+            ZoneInfo("UTC"),
+            ZoneInfo("America/New_York"),
+            ZoneInfo("America/Chicago"),
+        ]
+        for tz in candidates:
+            converted = test_dt.replace(tzinfo=tz).astimezone(_tz_taipei)
+            if converted.hour == 8 and converted.minute == 45:
+                return tz
+
+        return None  # can't detect — assume TWT
+
     def _fetch_tradingview_live(self):
-        """Download fresh data from TradingView API as fallback."""
+        """Download fresh data from TradingView API."""
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
             return
@@ -2559,16 +2600,37 @@ class BacktestApp:
             return
 
         try:
+            # All bar.dt must be naive Taiwan time (TWT/UTC+8).
+            # tvDatafeed may return timestamps in a different timezone
+            # (commonly America/Los_Angeles).  Detect and convert per-bar
+            # to handle DST transitions correctly.
+            from zoneinfo import ZoneInfo
+            _tz_taipei = ZoneInfo("Asia/Taipei")
+            source_tz = self._detect_tv_source_tz(df)
+
             bars = []
             for dt_idx, row in df.iterrows():
+                dt_raw = dt_idx.to_pydatetime()
+                if dt_raw.tzinfo is not None:
+                    # tz-aware: convert directly
+                    dt_twt = dt_raw.astimezone(_tz_taipei).replace(tzinfo=None)
+                elif source_tz:
+                    # naive non-TWT: localize to source tz, convert to TWT
+                    dt_twt = dt_raw.replace(tzinfo=source_tz).astimezone(
+                        _tz_taipei).replace(tzinfo=None)
+                else:
+                    # already TWT
+                    dt_twt = dt_raw
                 bars.append(Bar(
-                    symbol=symbol, dt=dt_idx.to_pydatetime(),
+                    symbol=symbol, dt=dt_twt,
                     open=round(row["open"]), high=round(row["high"]),
                     low=round(row["low"]), close=round(row["close"]),
                     volume=int(row.get("volume", 0)),
                     interval=interval,
                 ))
             bars.sort(key=lambda b: b.dt)
+            if source_tz:
+                _log(f"時區校正 Timezone: detected {source_tz}, converted to Asia/Taipei")
 
             _log(f"TradingView完成 Got {len(bars)} bars: {bars[0].dt} ~ {bars[-1].dt}")
             self._execute_backtest(bars)
@@ -3900,6 +3962,17 @@ class BacktestApp:
             ask=ask_scaled,
             simulate=bool(simulate),
         )
+
+        # Real-time TP/SL check on every tick (fills at exact price)
+        if self._live_runner and self._live_history_done:
+            tick_dt = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+            result = self._live_runner.check_tick_exit(price, tick_dt)
+            if result:
+                self._live_log_msg(
+                    f"即時停損停利 Tick exit: {result['tag']} @ {result['price']} "
+                    f"PnL={result['pnl']:+}",
+                    "trade",
+                )
 
         # Feed tick to BarBuilder — returns completed 1-min bar on boundary cross
         completed_1m = self._live_bar_builder.on_tick(tick)

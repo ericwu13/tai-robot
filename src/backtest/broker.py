@@ -133,7 +133,9 @@ class SimulatedBroker:
         """Process pending market closes and entry orders at bar close.
 
         Order: market closes first, then entries.
-        Skip entries if an exit happened on this same bar — prioritize exit.
+        Same-bar re-entry is allowed (matches TradingView semantics):
+        exit fills intra-bar at TP/SL price, entry fills at bar close.
+        In live trading, tick-level exit detection separates these naturally.
         """
         self._bar_index = bar_index
         self._current_bar_dt = bar_dt
@@ -146,7 +148,7 @@ class SimulatedBroker:
         self._pending_market_closes.clear()
 
         for order in self._pending_entries:
-            if self.position_size == 0 and bar_index != self._exit_bar_index:
+            if self.position_size == 0:
                 self.position_size = order.qty
                 self.position_side = order.side
                 self.entry_price = close
