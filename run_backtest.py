@@ -1014,6 +1014,7 @@ class BacktestApp:
         self._live_poll_id = None  # root.after() id for cancellation
         self._live_warmup_mode: bool = False
         self._live_warmup_data: list[str] = []
+        self._warmup_timeout_id = None
         self._live_polling: bool = False
         self._live_poll_data: list[str] = []
         # Tick-based live data feed
@@ -3622,13 +3623,30 @@ class BacktestApp:
         try:
             code = skQ.SKQuoteLib_RequestKLineAMByDate(
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
-            if code != 0 and code >= 3000:
+            if code != 0:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
-                _log(f"暖機查詢失敗 Warmup fetch failed: {msg}")
+                _log(f"暖機查詢失敗 Warmup fetch failed: code={code} {msg}")
+                self._live_log_msg(
+                    f"暖機查詢失敗 Warmup failed: code={code} {msg}", "status")
                 self._live_warmup_mode = False
                 self._stop_live()
+                return
         except Exception as e:
             _log(f"暖機錯誤 Warmup error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+            self._live_warmup_mode = False
+            self._stop_live()
+            return
+
+        # Safety timeout — if OnKLineComplete never fires, stop gracefully
+        self._warmup_timeout_id = self.root.after(
+            30_000, self._warmup_timeout)
+
+    def _warmup_timeout(self):
+        """Safety net: stop the bot if warmup never completes."""
+        self._warmup_timeout_id = None
+        if self._live_warmup_mode:
+            _log("暖機逾時 Warmup timeout — no data received in 30s")
+            self._live_log_msg("暖機逾時 Warmup timeout (30s)", "status")
             self._live_warmup_mode = False
             self._stop_live()
 
@@ -3716,6 +3734,9 @@ class BacktestApp:
     def _on_live_warmup_complete(self):
         """Called when COM warmup KLine data is complete."""
         self._live_warmup_mode = False
+        if self._warmup_timeout_id:
+            self.root.after_cancel(self._warmup_timeout_id)
+            self._warmup_timeout_id = None
 
         if not self._live_runner:
             return
@@ -4556,6 +4577,9 @@ class BacktestApp:
             self._reconnect_timer_id = None
         self._reconnect_attempt = 0
 
+        if self._warmup_timeout_id:
+            self.root.after_cancel(self._warmup_timeout_id)
+            self._warmup_timeout_id = None
         self._live_warmup_mode = False
         self._live_polling = False
         self._live_tick_active = False
