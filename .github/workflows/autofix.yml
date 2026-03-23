@@ -122,7 +122,7 @@ jobs:
             1. Read the issue carefully. If it contains acceptance tests (code blocks
                with `test_` functions), create those test files first and verify they FAIL.
             2. Implement the fix.
-            3. Run `pytest tests/ -x --ignore=tests/test_taifex.py` to verify ALL tests pass.
+            3. Run `pytest tests/ -x` to verify ALL tests pass.
             4. You MUST create a branch, commit, push, and open a PR:
                ```
                git checkout -b autofix/issue-${{ github.event.issue.number }}
@@ -233,7 +233,7 @@ jobs:
             1. Read the issue carefully. If it contains acceptance tests (code blocks
                with `test_` functions), create those test files first and verify they FAIL.
             2. Implement the fix.
-            3. Run `pytest tests/ -x --ignore=tests/test_taifex.py` to verify ALL tests pass.
+            3. Run `pytest tests/ -x` to verify ALL tests pass.
             4. You MUST create a branch, commit, push, and open a PR:
                ```
                git checkout -b autofix/issue-${{ github.event.issue.number }}
