@@ -5,187 +5,8 @@ on:
     types: [labeled]
 
 jobs:
-  # Step 1: Cheap triage with Haiku to assess complexity
-  triage:
-    if: github.event.label.name == 'autofix'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-      id-token: write
-    outputs:
-      complexity: ${{ steps.classify.outputs.complexity }}
-    timeout-minutes: 5
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Classify issue complexity
-        id: classify
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: |
-            --model claude-haiku-4-5-20251001
-            --max-turns 3
-            --allowedTools Bash,Read,Glob,Grep
-          prompt: |
-            You are a triage agent. Assess the complexity of this GitHub issue for the tai-robot project (a Taiwan futures trading bot).
-
-            ## Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
-
-            ${{ github.event.issue.body }}
-
-            Read CLAUDE.md and browse the relevant source files to understand the scope.
-
-            Classify as ONE of:
-            - SIMPLE: Single file fix, clear bug, straightforward logic change, adding a test, typo fix
-            - COMPLEX: Multi-file changes, architecture changes, behavior differences requiring deep analysis, strategy logic bugs, backtest engine changes
-
-            You MUST run this exact command as your final action:
-            ```
-            echo "complexity=SIMPLE" >> "$GITHUB_OUTPUT"
-            ```
-            or
-            ```
-            echo "complexity=COMPLEX" >> "$GITHUB_OUTPUT"
-            ```
-
-      - name: Notify if complex
-        if: steps.classify.outputs.complexity == 'COMPLEX' || steps.classify.outputs.complexity == ''
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: [
-                '🤖 **Triage result: COMPLEX**',
-                '',
-                'This issue looks too complex for Sonnet 4 to handle reliably.',
-                'Options:',
-                '- Add the `ultrathink` label to use **Opus 4.6** (~$3-15)',
-                '- Fix it manually with Claude Code locally (free with Max plan)',
-              ].join('\n')
-            });
-
-  # Step 2: Fix with Sonnet (only runs if triage says SIMPLE)
-  autofix-sonnet:
-    needs: triage
-    if: needs.triage.outputs.complexity == 'SIMPLE'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      id-token: write
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install dependencies
-        run: |
-          pip install pyyaml keyring httpx pytest
-
-      - name: Create settings.yaml stub
-        run: cp settings.example.yaml settings.yaml
-
-      - name: Run Claude Code (Sonnet 4)
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: |
-            --model claude-sonnet-4-20250514
-            --allowedTools Bash,Read,Edit,Write,Glob,Grep
-          prompt: |
-            You are fixing a GitHub issue for the tai-robot project.
-            Read CLAUDE.md first for project context.
-
-            ## Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
-
-            ${{ github.event.issue.body }}
-
-            ## Instructions
-
-            1. Read the issue carefully. If it contains acceptance tests (code blocks
-               with `test_` functions), create those test files first and verify they FAIL.
-            2. Implement the fix.
-            3. Run `pytest tests/ -x` to verify ALL tests pass.
-            4. You MUST create a branch, commit, push, and open a PR:
-               ```
-               git checkout -b autofix/issue-${{ github.event.issue.number }}
-               git add -A
-               git commit -m "fix: address issue #${{ github.event.issue.number }}"
-               git push origin autofix/issue-${{ github.event.issue.number }}
-               ```
-            5. Create the PR with a DETAILED body using gh pr create. The body MUST include:
-               - **Root Cause**: What was the bug? Why did it happen?
-               - **Fix**: What did you change and why?
-               - **Files Changed**: List each file and what was modified
-               - **Testing**: What tests were added/modified and what they verify
-               - End with "Fixes #${{ github.event.issue.number }}"
-
-               Example:
-               ```
-               gh pr create --title "fix: address issue #${{ github.event.issue.number }}" --body "$(cat <<'PREOF'
-               ## Root Cause
-               The stop loss was using raw ATR instead of ATR/2...
-
-               ## Fix
-               Changed `sl_points = atr_val` to `sl_points = atr_val / 2` in...
-
-               ## Files Changed
-               - `src/strategy/indicators.py`: fixed ATR calculation
-               - `tests/test_issue_20.py`: added test for stop loss values
-
-               ## Testing
-               - Added test_stop_loss_uses_half_atr() — verifies SL = max(ATR/2, 60)
-               - All 44 existing tests pass
-
-               Fixes #${{ github.event.issue.number }}
-               PREOF
-               )" --base master
-               ```
-
-            Rules:
-            - Only modify files under `src/` and `tests/`.
-            - Do NOT modify `run_backtest.py`, `settings.yaml`, or any config.
-            - Do NOT install new dependencies without noting it in the PR.
-            - Skip any test that imports `comtypes` or Windows-only modules (we're on Linux CI).
-            - Keep changes minimal — fix the issue, nothing else.
-            - You MUST create a PR with a detailed analysis. This is the most important step.
-
-      - name: Post result
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const result = '${{ steps.claude.outcome }}';
-            const body = result === 'success'
-              ? '🤖 Auto-fix attempted with **Sonnet 4**. Check the PR linked above.'
-              : '🤖 Auto-fix with **Sonnet 4** failed. Manual intervention needed.';
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: body
-            });
-
-  # Step 3: Fix with Opus (triggered by ultrathink label, skips triage)
-  autofix-opus:
-    if: github.event.label.name == 'ultrathink'
+  autofix:
+    if: github.event.label.name == 'autofix' || github.event.label.name == 'ultrathink'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -206,19 +27,27 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: |
-          pip install pyyaml keyring httpx pytest
+        run: pip install pyyaml keyring httpx pytest
 
       - name: Create settings.yaml stub
         run: cp settings.example.yaml settings.yaml
 
-      - name: Run Claude Code (Opus 4.6)
+      - name: Select model
+        id: model
+        run: |
+          if [ "${{ github.event.label.name }}" = "ultrathink" ]; then
+            echo "name=claude-opus-4-6" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=claude-sonnet-4-20250514" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
-            --model claude-opus-4-6
+            --model ${{ steps.model.outputs.name }}
             --allowedTools Bash,Read,Edit,Write,Glob,Grep
           prompt: |
             You are fixing a GitHub issue for the tai-robot project.
@@ -283,10 +112,11 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const model = '${{ steps.model.outputs.name }}';
             const result = '${{ steps.claude.outcome }}';
             const body = result === 'success'
-              ? '🤖 Auto-fix attempted with **Opus 4.6**. Check the PR linked above.'
-              : '🤖 Auto-fix with **Opus 4.6** failed. Manual intervention needed.';
+              ? `🤖 Auto-fix attempted with **${model}**. Check the PR linked above.`
+              : `🤖 Auto-fix with **${model}** failed. Manual intervention needed.`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
