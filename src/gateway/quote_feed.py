@@ -68,6 +68,25 @@ class QuoteFeed:
         for symbol in list(self._subscribed_symbols):
             self.subscribe(symbol)
 
+    def change_symbol(self, new_symbol: str) -> None:
+        """Change subscription from current symbol(s) to a new symbol.
+
+        This unsubscribes from all currently subscribed symbols and subscribes
+        to the new symbol. Useful when the user changes the active symbol
+        and needs to update what gets resubscribed during reconnections.
+
+        Args:
+            new_symbol: The new symbol to subscribe to
+        """
+        # Unsubscribe from all current symbols
+        current_symbols = list(self._subscribed_symbols)
+        for symbol in current_symbols:
+            self.unsubscribe(symbol)
+
+        # Subscribe to the new symbol
+        self.subscribe(new_symbol)
+        logger.info("Changed symbol subscription from %s to %s", current_symbols, new_symbol)
+
     def _on_ticks(self, market_no: int, stock_no: str, ptr: int, date: int,
                   time_hms: int, time_millismicros: int, bid: int, ask: int,
                   close: int, qty: int, simulate: int) -> None:
