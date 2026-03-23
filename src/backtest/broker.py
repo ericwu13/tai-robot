@@ -110,6 +110,10 @@ class SimulatedBroker:
         self._bar_index: int = 0
         self._exit_bar_index: int = -1  # last bar an exit filled on
 
+        # Last exit metadata — read by live_runner to determine real order type
+        self.last_exit_type: str = ""  # "limit", "stop", "close", "force_close"
+        self.last_exit_limit: int | None = None  # strategy's original limit price
+
     @property
     def context(self) -> BrokerContext:
         return BrokerContext(self)
@@ -142,6 +146,8 @@ class SimulatedBroker:
         # Process market closes first
         for tag, from_entry in self._pending_market_closes:
             if self.position_size > 0 and self.entry_tag == from_entry:
+                self.last_exit_type = "close"
+                self.last_exit_limit = None
                 self._close_position(tag, close, bar_index)
                 break
         self._pending_market_closes.clear()
@@ -177,6 +183,18 @@ class SimulatedBroker:
                 open_, high, low, limit, stop, self.position_side,
             )
             if fill_price is not None:
+                # Determine if this was a limit (TP) or stop (SL) fill
+                if limit is not None and stop is None:
+                    self.last_exit_type = "limit"
+                elif stop is not None and limit is None:
+                    self.last_exit_type = "stop"
+                else:
+                    # Both set — check which side the fill is on
+                    if self.position_side == OrderSide.LONG:
+                        self.last_exit_type = "stop" if fill_price <= stop else "limit"
+                    else:
+                        self.last_exit_type = "stop" if fill_price >= stop else "limit"
+                self.last_exit_limit = int(limit) if limit is not None else None
                 self._close_position(order.tag, fill_price, bar_index)
                 break
 
@@ -255,6 +273,8 @@ class SimulatedBroker:
         """Force-close any open position at end of data."""
         if self.position_size > 0:
             self._current_bar_dt = bar_dt
+            self.last_exit_type = "force_close"
+            self.last_exit_limit = None
             self._close_position("force_close", close, bar_index)
 
     def record_equity(self) -> None:
