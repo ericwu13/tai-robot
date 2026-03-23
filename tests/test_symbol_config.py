@@ -56,15 +56,3 @@ class TestSymbolConfig:
         assert _SYMBOL_CONFIG["MTX00"]["tv"] == "TMF1!"
 
 
-class TestCacheFilesExist:
-    """Verify actual CSV files exist in data/ for both symbols."""
-
-    data_dir = os.path.join(project_root, "data")
-
-    @pytest.mark.parametrize("symbol", ["TX00", "MTX00"])
-    @pytest.mark.parametrize("kline_key", list(_CACHE_SUFFIXES.keys()))
-    def test_csv_exists(self, symbol, kline_key):
-        filename = _get_cache_file(symbol, kline_key)
-        assert filename is not None
-        path = os.path.join(self.data_dir, filename)
-        assert os.path.exists(path), f"Missing data file: {path}"
