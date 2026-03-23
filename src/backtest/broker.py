@@ -16,8 +16,8 @@ class Order:
     tag: str
     side: OrderSide
     qty: int = 1
-    limit: int | None = None
-    stop: int | None = None
+    limit: int | float | None = None
+    stop: int | float | None = None
     from_entry: str = ""
 
 
@@ -53,7 +53,7 @@ class BrokerContext:
     @property
     def trades(self) -> list:
         """Read-only access to completed trades (for loss counting, etc.)."""
-        return self._broker.trades
+        return list(self._broker.trades)
 
     def entry(self, tag: str, side: OrderSide, qty: int = 1) -> None:
         self._broker.queue_entry(Order(tag=tag, side=side, qty=qty))
@@ -67,8 +67,7 @@ class BrokerContext:
     ) -> None:
         self._broker.queue_exit(Order(
             tag=tag, side=OrderSide.LONG, qty=0,
-            limit=round(limit) if limit is not None else None,
-            stop=round(stop) if stop is not None else None,
+            limit=limit, stop=stop,
             from_entry=from_entry,
         ))
 
@@ -221,7 +220,8 @@ class SimulatedBroker:
             return limit_fill
         return None
 
-    def _close_position(self, tag: str, exit_price: int, bar_index: int) -> None:
+    def _close_position(self, tag: str, exit_price: int | float, bar_index: int) -> None:
+        exit_price = int(round(exit_price))  # TAIFEX prices are integers
         if self.position_side == OrderSide.LONG:
             pnl = (exit_price - self.entry_price) * self.position_size * self.point_value
         else:

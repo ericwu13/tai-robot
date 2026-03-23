@@ -400,8 +400,9 @@ class LiveRunner:
                 self.broker._close_position(order.tag, fill_price, self._bar_index)
                 # Log and save
                 last_trade = self.broker.trades[-1]
-                # Create a minimal bar for logging
-                log_bar = Bar(symbol=self.symbol, dt=datetime.now(),
+                # Create a minimal bar for logging (use TWT time)
+                log_bar = Bar(symbol=self.symbol,
+                              dt=datetime.now(_TZ_TAIPEI).replace(tzinfo=None),
                               open=price, high=price, low=price, close=price,
                               volume=0, interval=0)
                 self._log_decision(

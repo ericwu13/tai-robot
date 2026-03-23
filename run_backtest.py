@@ -2494,9 +2494,9 @@ class BacktestApp:
         from zoneinfo import ZoneInfo
         _tz_taipei = ZoneInfo("Asia/Taipei")
 
-        # Check for tz-aware index
+        # tz-aware index: caller handles conversion directly
         if df.index[0].to_pydatetime().tzinfo is not None:
-            return "tz-aware"
+            return None
 
         def _in_gap(h, m):
             """True if (h, m) in TWT falls in a TAIFEX no-trade gap."""
