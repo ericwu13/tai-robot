@@ -4091,6 +4091,8 @@ class BacktestApp:
         action = decision["action"]
         side = decision["side"]
         price = decision["price"]
+        exit_type = decision.get("exit_type", "")
+        exit_limit = decision.get("exit_limit")
 
         guard = self._trading_guard
         verdict, details = guard.decide(self._trading_mode, action, side)
@@ -4118,7 +4120,8 @@ class BacktestApp:
             self._live_log_msg(
                 f"{label}自動送單 Auto-sending {action.lower()}: {order_desc} {order_symbol}", "exit")
             self._log_order_decision("REAL_ORDER_AUTO", f"{action.lower()} {order_desc} {order_symbol}")
-            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=new_close)
+            self._send_real_order(buy_sell, order_symbol, action_type, price,
+                                 new_close=new_close, exit_type=exit_type, exit_limit=exit_limit)
             guard.on_exit_sent()
             return
 
@@ -4164,10 +4167,8 @@ class BacktestApp:
         src_label = f" ({price_source})" if price_source else ""
         tk.Label(dlg, text=f"參考價格 Ref Price: {price:,}{src_label}  |  數量 Qty: 1 口",
                 font=("", 11)).pack(pady=2)
-        order_hint = ("實單將以市價IOC送出 Will send as IOC market order"
-                      if action_type == "entry" else
-                      "實單將以ROD限價送出 Will send as ROD limit order")
-        tk.Label(dlg, text=order_hint, font=("", 9), fg="gray").pack(pady=2)
+        tk.Label(dlg, text="實單將以市價IOC送出 Will send as IOC market order",
+                font=("", 9), fg="gray").pack(pady=2)
 
         countdown_label = tk.Label(dlg, text=f"自動跳過 Auto-skip in {countdown[0]}s",
                                   font=("", 10), fg="orange")
@@ -4235,11 +4236,13 @@ class BacktestApp:
             pass  # logged in _send_real_order
         # "replaced" = new dialog replaced old one, no log needed
 
-    def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price, new_close=2):
+    def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price,
+                         new_close=2, exit_type="", exit_limit=None):
         """Build FUTUREORDER and send via COM SKOrderLib.
 
         new_close: 0=new position, 1=close position, 2=auto (exchange decides).
-        Semi-auto uses 0 for entries and 1 for exits; manual orders use 2.
+        exit_type: "limit" (TP), "stop" (SL), "close", "force_close", or "".
+        exit_limit: strategy's original limit price for take-profit exits.
         """
         if not _com_available or skO is None:
             self._live_log_msg("實單失敗 Order FAILED: COM not available", "exit")
@@ -4272,24 +4275,27 @@ class BacktestApp:
             oOrder.bstrFullAccount = self._futures_account
             oOrder.bstrStockNo = order_symbol
             oOrder.sBuySell = buy_sell
-            # Entries: IOC + market price — fill now or cancel
-            # Exits:  ROD + limit price with slippage — must fill to close position
-            _EXIT_SLIPPAGE = 100  # points of slippage buffer for ROD exit limit price
+            # Order type depends on intent:
+            #   Entry:          IOC + market — fill now or cancel
+            #   Take-profit:    ROD + strategy's limit price — get the intended price
+            #   Stop/close/etc: IOC + market — urgency, just get out
             if action_type == "entry":
                 oOrder.sTradeType = 1  # IOC
                 oOrder.bstrPrice = "M"
                 price_label = "MKT"
                 type_label = "IOC"
-            else:
+            elif exit_type == "limit" and exit_limit is not None:
+                # Take-profit: ROD at strategy's exact limit price
                 oOrder.sTradeType = 0  # ROD
-                # Set a generous limit price to ensure fill
-                if buy_sell == 0:  # BUY to close short → accept higher price
-                    limit_price = int(sim_price + _EXIT_SLIPPAGE)
-                else:              # SELL to close long → accept lower price
-                    limit_price = max(1, int(sim_price - _EXIT_SLIPPAGE))
-                oOrder.bstrPrice = str(limit_price)
-                price_label = f"LMT={limit_price}"
+                oOrder.bstrPrice = str(int(exit_limit))
+                price_label = f"LMT={int(exit_limit)}"
                 type_label = "ROD"
+            else:
+                # Stop-loss, market close, force close: IOC market
+                oOrder.sTradeType = 1  # IOC
+                oOrder.bstrPrice = "M"
+                price_label = "MKT"
+                type_label = "IOC"
             oOrder.sDayTrade = 0      # non-daytrade
             oOrder.nQty = 1           # safety: max 1 contract
             oOrder.sNewClose = new_close  # 0=new, 1=close, 2=auto
