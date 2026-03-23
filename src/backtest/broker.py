@@ -50,6 +50,11 @@ class BrokerContext:
     def position_size(self) -> int:
         return self._broker.position_size
 
+    @property
+    def trades(self) -> list:
+        """Read-only access to completed trades (for loss counting, etc.)."""
+        return self._broker.trades
+
     def entry(self, tag: str, side: OrderSide, qty: int = 1) -> None:
         self._broker.queue_entry(Order(tag=tag, side=side, qty=qty))
 
