@@ -924,8 +924,8 @@ class BacktestApp:
                 try:
                     for mkt in (2, 7, 9):
                         skQ.SKQuoteLib_RequestStockList(mkt)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log(f"商品資料重載失敗 Commodity reload failed: {e}")
             self._resubscribe_ticks()
 
     _RESUBSCRIBE_MAX_RETRIES = 3
