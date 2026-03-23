@@ -1,0 +1,114 @@
+name: PR Review Agent
+
+on:
+  # Respond to @claude mentions in PR comments
+  issue_comment:
+    types: [created]
+  # Respond to inline review comments
+  pull_request_review_comment:
+    types: [created]
+  # Respond to review submissions (approve/request changes)
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  respond:
+    # Only run on PRs (not plain issues), and only on autofix branches
+    if: |
+      (github.event.issue.pull_request || github.event.pull_request) &&
+      contains(github.event.comment.body || github.event.review.body || '', '@claude')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    timeout-minutes: 30
+
+    steps:
+      - name: Get PR info
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get PR number from either issue_comment or PR review event
+            const prNumber = context.payload.issue?.number || context.payload.pull_request?.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            // Extract linked issue number from PR body (looks for "Fixes #NN")
+            const issueMatch = pr.body?.match(/Fixes #(\d+)/i);
+            let issueContext = '';
+            if (issueMatch) {
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(issueMatch[1]),
+              });
+              issueContext = `## Original Issue #${issue.number}: ${issue.title}\n\n${issue.body}`;
+            }
+
+            core.setOutput('branch', pr.head.ref);
+            core.setOutput('issue_context', issueContext);
+            core.setOutput('pr_number', prNumber);
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml keyring httpx pytest
+
+      - name: Create settings.yaml stub
+        run: cp settings.example.yaml settings.yaml
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --model claude-sonnet-4-20250514
+            --allowedTools Bash,Read,Edit,Write,Glob,Grep
+
+          # This uses the action's built-in PR comment handling.
+          # It automatically picks up the comment that triggered it,
+          # sees the PR diff, and can push new commits.
+          prompt: |
+            You are working on a PR for the tai-robot project (Taiwan futures trading bot).
+            Read CLAUDE.md first for project context.
+
+            ${{ steps.pr.outputs.issue_context }}
+
+            ## Your task
+
+            A reviewer has commented on this PR. Read their feedback, understand what
+            needs to change, and implement the fix. You have the full PR context:
+            - The original issue (above)
+            - The current PR diff (use `git diff master` to see all changes)
+            - The reviewer's comment that triggered you
+
+            ## After making changes
+
+            1. Run `pytest tests/ -x --ignore=tests/test_taifex.py` to verify tests pass.
+            2. Commit and push to this branch:
+               ```
+               git add -A
+               git commit -m "fix: address review feedback on PR #${{ steps.pr.outputs.pr_number }}"
+               git push
+               ```
+
+            Rules:
+            - Only modify files under `src/` and `tests/`.
+            - Keep changes minimal — only fix what the reviewer asked for.
+            - You MUST push your changes. Do not just explain — implement the fix.
