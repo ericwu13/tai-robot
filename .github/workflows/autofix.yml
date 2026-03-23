@@ -123,13 +123,40 @@ jobs:
                with `test_` functions), create those test files first and verify they FAIL.
             2. Implement the fix.
             3. Run `pytest tests/ -x --ignore=tests/test_taifex.py` to verify ALL tests pass.
-            4. You MUST create a branch, commit, push, and open a PR using these exact commands:
+            4. You MUST create a branch, commit, push, and open a PR:
                ```
                git checkout -b autofix/issue-${{ github.event.issue.number }}
                git add -A
                git commit -m "fix: address issue #${{ github.event.issue.number }}"
                git push origin autofix/issue-${{ github.event.issue.number }}
-               gh pr create --title "fix: issue #${{ github.event.issue.number }}" --body "Fixes #${{ github.event.issue.number }}" --base master
+               ```
+            5. Create the PR with a DETAILED body using gh pr create. The body MUST include:
+               - **Root Cause**: What was the bug? Why did it happen?
+               - **Fix**: What did you change and why?
+               - **Files Changed**: List each file and what was modified
+               - **Testing**: What tests were added/modified and what they verify
+               - End with "Fixes #${{ github.event.issue.number }}"
+
+               Example:
+               ```
+               gh pr create --title "fix: address issue #${{ github.event.issue.number }}" --body "$(cat <<'PREOF'
+               ## Root Cause
+               The stop loss was using raw ATR instead of ATR/2...
+
+               ## Fix
+               Changed `sl_points = atr_val` to `sl_points = atr_val / 2` in...
+
+               ## Files Changed
+               - `src/strategy/indicators.py`: fixed ATR calculation
+               - `tests/test_issue_20.py`: added test for stop loss values
+
+               ## Testing
+               - Added test_stop_loss_uses_half_atr() — verifies SL = max(ATR/2, 60)
+               - All 44 existing tests pass
+
+               Fixes #${{ github.event.issue.number }}
+               PREOF
+               )" --base master
                ```
 
             Rules:
@@ -138,7 +165,7 @@ jobs:
             - Do NOT install new dependencies without noting it in the PR.
             - Skip any test that imports `comtypes` or Windows-only modules (we're on Linux CI).
             - Keep changes minimal — fix the issue, nothing else.
-            - You MUST create a PR at the end. This is the most important step.
+            - You MUST create a PR with a detailed analysis. This is the most important step.
 
       - name: Post result
         if: always()
@@ -207,13 +234,40 @@ jobs:
                with `test_` functions), create those test files first and verify they FAIL.
             2. Implement the fix.
             3. Run `pytest tests/ -x --ignore=tests/test_taifex.py` to verify ALL tests pass.
-            4. You MUST create a branch, commit, push, and open a PR using these exact commands:
+            4. You MUST create a branch, commit, push, and open a PR:
                ```
                git checkout -b autofix/issue-${{ github.event.issue.number }}
                git add -A
                git commit -m "fix: address issue #${{ github.event.issue.number }}"
                git push origin autofix/issue-${{ github.event.issue.number }}
-               gh pr create --title "fix: issue #${{ github.event.issue.number }}" --body "Fixes #${{ github.event.issue.number }}" --base master
+               ```
+            5. Create the PR with a DETAILED body using gh pr create. The body MUST include:
+               - **Root Cause**: What was the bug? Why did it happen?
+               - **Fix**: What did you change and why?
+               - **Files Changed**: List each file and what was modified
+               - **Testing**: What tests were added/modified and what they verify
+               - End with "Fixes #${{ github.event.issue.number }}"
+
+               Example:
+               ```
+               gh pr create --title "fix: address issue #${{ github.event.issue.number }}" --body "$(cat <<'PREOF'
+               ## Root Cause
+               The stop loss was using raw ATR instead of ATR/2...
+
+               ## Fix
+               Changed `sl_points = atr_val` to `sl_points = atr_val / 2` in...
+
+               ## Files Changed
+               - `src/strategy/indicators.py`: fixed ATR calculation
+               - `tests/test_issue_20.py`: added test for stop loss values
+
+               ## Testing
+               - Added test_stop_loss_uses_half_atr() — verifies SL = max(ATR/2, 60)
+               - All 44 existing tests pass
+
+               Fixes #${{ github.event.issue.number }}
+               PREOF
+               )" --base master
                ```
 
             Rules:
@@ -222,7 +276,7 @@ jobs:
             - Do NOT install new dependencies without noting it in the PR.
             - Skip any test that imports `comtypes` or Windows-only modules (we're on Linux CI).
             - Keep changes minimal — fix the issue, nothing else.
-            - You MUST create a PR at the end. This is the most important step.
+            - You MUST create a PR with a detailed analysis. This is the most important step.
 
       - name: Post result
         if: always()
