@@ -927,8 +927,12 @@ class BacktestApp:
         """Re-subscribe to tick feed after reconnection."""
         if not self._live_runner:
             return
-        # Use the stored COM tick symbol (e.g. TX00 for MTX00/TMF00)
-        com_symbol = getattr(self, '_live_tick_com_symbol', self._live_runner.symbol)
+        # Use current symbol from dropdown, not stored symbol (fixes issue #23)
+        current_symbol = self.symbol_var.get()
+        cfg = _SYMBOL_CONFIG.get(current_symbol, {})
+        com_symbol = cfg.get("tick_symbol", current_symbol)
+        # Update stored symbol for consistency
+        self._live_tick_com_symbol = com_symbol
 
         # Reset history tracking so the history→live transition fires again
         # and suppress_strategy gets re-enabled then cleared properly.
