@@ -512,9 +512,12 @@ class LiveRunner:
         """Check if a trade was just closed by check_exits."""
         if self.broker.trades and self.broker.trades[-1].exit_bar_index == idx:
             trade = self.broker.trades[-1]
+            exit_type = self.broker.last_exit_type or "close"
+            exit_limit = self.broker.last_exit_limit
             self._log_decision(
                 bar, "TRADE_CLOSE", trade.side.value, trade.exit_tag,
                 trade.exit_price, f"PnL={trade.pnl:+}",
+                exit_type=exit_type, exit_limit=exit_limit,
             )
             self._auto_save_session()
 
@@ -528,17 +531,23 @@ class LiveRunner:
             self._auto_save_session()
 
     def _log_decision(self, bar: Bar, action: str, side: str, tag: str,
-                      price: int, reason: str) -> None:
+                      price: int, reason: str, *,
+                      exit_type: str = "", exit_limit: int | None = None) -> None:
         now = datetime.now()
         self.csv_logger.log_decision(
             dt=now, bar_dt=bar.dt, strategy=self.strategy.name,
             action=action, side=side, tag=tag, price=price, reason=reason,
         )
-        self._emit("on_decision", {
+        decision = {
             "dt": now, "bar_dt": bar.dt, "strategy": self.strategy.name,
             "action": action, "side": side, "tag": tag,
             "price": price, "reason": reason,
-        })
+        }
+        if exit_type:
+            decision["exit_type"] = exit_type
+        if exit_limit is not None:
+            decision["exit_limit"] = exit_limit
+        self._emit("on_decision", decision)
 
     # ── Status & results ──
 
