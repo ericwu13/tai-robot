@@ -40,6 +40,10 @@ logging:
   log_dir: "logs"
   trade_csv: "logs/trades.csv"
 
+notifications:
+  discord_bot_token: ""          # Discord bot token for live trading alerts
+  discord_channel_id: ""         # Discord channel ID to send notifications to
+
 ai:
   provider: "anthropic"          # "anthropic" or "google"
   anthropic_api_key: ""          # sk-ant-... (from console.anthropic.com)
