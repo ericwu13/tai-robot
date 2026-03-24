@@ -252,6 +252,10 @@ def _load_settings():
             cfg["google_api_key"] = ai.get("google_api_key", "")
             cfg["ai_model"] = ai.get("model", "")
             cfg["ai_max_tokens"] = ai.get("max_tokens", 16384)
+            # Notifications
+            notif = data.get("notifications", {})
+            cfg["discord_bot_token"] = notif.get("discord_bot_token", "")
+            cfg["discord_channel_id"] = notif.get("discord_channel_id", "")
             break
     return cfg
 
@@ -381,6 +385,38 @@ def _get_cache_file(symbol: str, kline_key: tuple) -> str | None:
     return cfg["prefix"] + suffix
 
 _app = None
+_debug_log_file = None  # file handle for bot debug log
+_discord = None  # DiscordNotifier instance (set on deploy)
+
+
+def _open_debug_log(bot_dir: str) -> None:
+    """Open a daily-rotated debug log file in the bot directory."""
+    global _debug_log_file
+    _close_debug_log()
+    tpe = _taipei_now()
+    filename = f"debug_{tpe.strftime('%Y%m%d')}.log"
+    path = os.path.join(bot_dir, filename)
+    _debug_log_file = open(path, "a", encoding="utf-8")
+    _debug_log_file.write(f"\n{'='*60}\n")
+    _debug_log_file.write(f"Session started at {tpe.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    _debug_log_file.write(f"{'='*60}\n")
+    _debug_log_file.flush()
+
+
+def _close_debug_log() -> None:
+    """Close the debug log file if open."""
+    global _debug_log_file
+    if _debug_log_file:
+        try:
+            tpe = _taipei_now()
+            _debug_log_file.write(f"{'='*60}\n")
+            _debug_log_file.write(f"Session ended at {tpe.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            _debug_log_file.write(f"{'='*60}\n\n")
+            _debug_log_file.close()
+        except Exception:
+            pass
+        _debug_log_file = None
+
 
 # Thread-safe queue for COM tick callbacks → main thread.
 # COM callbacks fire on background threads; touching Tkinter or most Python objects
@@ -427,13 +463,19 @@ def _fmt_money(val: str) -> str:
 def _log(msg):
     tpe = _taipei_now()
     local = datetime.now()
-    ts_tpe = tpe.strftime("%H:%M:%S")
-    ts_local = local.strftime("%H:%M:%S")
+    ts_tpe = tpe.strftime("%Y-%m-%d %H:%M:%S")
+    ts_local = local.strftime("%Y-%m-%d %H:%M:%S")
     if ts_tpe == ts_local:
         line = f"[{ts_tpe}] {msg}"
     else:
         line = f"[{ts_tpe} TPE / {ts_local} local] {msg}"
     print(line, flush=True)
+    if _debug_log_file:
+        try:
+            _debug_log_file.write(line + "\n")
+            _debug_log_file.flush()
+        except Exception:
+            pass
     if _app and hasattr(_app, "log_text"):
         try:
             # Only touch Tkinter widgets from the main thread; COM callbacks
@@ -717,6 +759,9 @@ class BacktestApp:
                             self.real_pos_var.set("Flat (無持倉)")
                         # Ignore ## sentinel and error codes
                     _log(f"未平倉 OpenInterest: {data}")
+                    # Fill polling: track position from OI callbacks
+                    if self._trading_guard.fill_pending and self._live_runner:
+                        self._update_fill_poll_position(data, parsed)
                 elif kind == "future_rights":
                     parsed = _parse_future_rights(data)
                     if parsed:
@@ -1029,10 +1074,11 @@ class BacktestApp:
         self._real_positions: list[dict] = []
         self._real_rights: dict = {}
         self._real_account_poll_id = None
-        # Fill confirmation polling (auto mode)
+        # Fill confirmation polling (auto mode) — uses OpenInterest position change
         self._fill_poll_timer_id = None
         self._fill_poll_start_time: float = 0
-        self._fill_count_before_order: int = 0
+        self._fill_poll_pos_before: int = 0   # signed position qty before order
+        self._fill_poll_pos_current: int | None = None  # latest from OI callback
         self._fill_poll_action_type: str = ""
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
@@ -3531,6 +3577,23 @@ class BacktestApp:
         self._live_runner.trading_mode = trading_mode
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
 
+        # Open debug log file in bot directory
+        _open_debug_log(self._live_runner.bot_dir)
+
+        # Initialize Discord notifications
+        global _discord
+        from src.live.discord_notify import DiscordNotifier
+        bot_token = self._settings.get("discord_bot_token", "")
+        channel_id = self._settings.get("discord_channel_id", "")
+        _discord = DiscordNotifier(bot_token, channel_id,
+                                   bot_name=bot_name, symbol=symbol)
+        if _discord.enabled:
+            _discord.bot_deployed(
+                strategy=self.strategy_var.get(),
+                mode={"paper": "模擬", "semi_auto": "半自動", "auto": "全自動"}.get(trading_mode, trading_mode),
+            )
+            _log(f"Discord 通知已啟用 Discord notifications enabled")
+
         # Debug: log resolved order symbol and query stock list
         order_sym = _resolve_order_symbol(symbol)
         _log(f"委託商品 Order symbol: {symbol} -> {order_sym}")
@@ -4340,6 +4403,9 @@ class BacktestApp:
                 self._live_log_msg(f"實單已送出 Order sent: {message}", action_type)
                 _log(f"REAL ORDER OK: {message}")
                 self._last_real_order_side = buy_sell  # track for close button
+                if _discord and _discord.enabled:
+                    _discord.order_sent(side_str, order_symbol, price_label,
+                                        sim_price, str(message))
                 if self._trading_mode == "auto":
                     # Auto mode: defer state transition until fill confirmed
                     self._trading_guard.on_fill_pending(action_type)
@@ -4359,6 +4425,8 @@ class BacktestApp:
                 err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
                 self._live_log_msg(f"實單失敗 Order FAILED: code={code} {err_msg} | {message}", "exit")
                 _log(f"REAL ORDER FAILED: code={code} err={err_msg} msg={message}")
+                if _discord and _discord.enabled:
+                    _discord.order_failed(side_str, order_symbol, code, err_msg)
                 self._log_order_decision(
                     "REAL_ORDER_FAILED",
                     f"code={code} {err_msg}",
@@ -4369,32 +4437,81 @@ class BacktestApp:
             _log(f"REAL ORDER ERROR: {e}\n{traceback.format_exc()}")
             self._log_order_decision("REAL_ORDER_ERROR", str(e))
 
-    # ── Fill confirmation polling (auto mode) ──
+    # ── Fill confirmation via OpenInterest position change (auto mode) ──
+    #
+    # COM SKOrderLib has NO fill callback.  GetFulfillReport aggregates fills
+    # by side/product so line-count and qty-total comparisons both fail.
+    # Instead we poll GetOpenInterestGW — the OnOpenInterest callback reliably
+    # reflects position changes within a few seconds.
 
-    def _get_fill_count(self) -> int:
-        """Query GetFulfillReport and return the number of fill lines."""
-        if not _com_available or skO is None:
-            return -1
-        try:
-            user_id = self.login_user_var.get().strip()
-            raw = skO.GetFulfillReport(user_id, self._futures_account, 4)
-            if not raw or not raw.strip():
-                return 0
-            count = 0
-            for line in raw.strip().split("\n"):
-                fields = line.strip().split(",")
-                if len(fields) >= 20:
-                    count += 1
-            return count
-        except Exception as e:
-            _log(f"FILL COUNT ERROR: {e}")
-            return -1
+    _FILL_POLL_TIMEOUT = 10.0  # seconds to wait for fill confirmation
+
+    def _get_signed_position(self) -> int:
+        """Get the current signed position qty for the live symbol.
+
+        Positive = long, negative = short, 0 = flat.
+        Uses _real_positions which is populated by OnOpenInterest callbacks.
+        """
+        if not self._live_runner:
+            return 0
+        order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
+            "order_symbol", "")
+        # OpenInterest product is like "TM04", order symbol is "TM0000"
+        # Match on first 2 chars (e.g., "TM")
+        prefix = order_sym[:2] if order_sym else ""
+        if not prefix:
+            return 0
+        for p in self._real_positions:
+            if p.get("product", "").startswith(prefix):
+                qty = p.get("qty", 0)
+                return qty if p.get("side") == "B" else -qty
+        return 0  # flat
+
+    def _update_fill_poll_position(self, raw_data: str, parsed: dict | None) -> None:
+        """Track position changes from OnOpenInterest during fill polling.
+
+        Called from _drain_ui_queue for every open_interest event while
+        fill_pending is True.  Updates _fill_poll_pos_current and triggers
+        confirmation if position changed.
+        """
+        order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
+            "order_symbol", "")
+        prefix = order_sym[:2] if order_sym else ""
+
+        if parsed and parsed.get("product", "").startswith(prefix):
+            qty = parsed.get("qty", 0)
+            signed = qty if parsed.get("side") == "B" else -qty
+            self._fill_poll_pos_current = signed
+        elif raw_data.strip().startswith("001"):
+            # "查無資料" — no position at all
+            self._fill_poll_pos_current = 0
+
+        # Check for position change immediately
+        if self._fill_poll_pos_current is not None:
+            before = self._fill_poll_pos_before
+            current = self._fill_poll_pos_current
+            changed = False
+            if self._fill_poll_action_type == "entry":
+                changed = abs(current) > abs(before)
+            elif self._fill_poll_action_type == "exit":
+                changed = abs(current) < abs(before)
+
+            if changed:
+                elapsed = time.monotonic() - self._fill_poll_start_time
+                _log(f"FILL POLL: confirmed via OpenInterest! "
+                     f"position {before} -> {current} ({elapsed:.1f}s)")
+                # Cancel pending timer and confirm
+                if self._fill_poll_timer_id:
+                    self.root.after_cancel(self._fill_poll_timer_id)
+                self._on_fill_confirmed()
 
     def _start_fill_polling(self, action_type: str) -> None:
-        """Start polling GetFulfillReport for fill confirmation."""
-        baseline = self._get_fill_count()
-        if baseline < 0:
-            # COM unavailable — fall back to immediate state transition
+        """Start polling OpenInterest for position change after order sent.
+
+        OnOpenInterest reflects position changes within ~4 seconds,
+        much faster and more reliable than GetFulfillReport.
+        """
+        if not _com_available or skO is None or not self._futures_account:
             _log("FILL POLL: COM unavailable, skipping fill confirmation")
             self._trading_guard.on_fill_confirmed()
             if action_type == "entry":
@@ -4402,51 +4519,53 @@ class BacktestApp:
             elif action_type == "exit":
                 self._trading_guard.on_exit_sent()
             return
-        self._fill_count_before_order = baseline
+
+        self._fill_poll_pos_before = self._get_signed_position()
+        self._fill_poll_pos_current = None
         self._fill_poll_action_type = action_type
         self._fill_poll_start_time = time.monotonic()
+
         self._live_log_msg(
             f"等待成交確認 Waiting for {action_type} fill confirmation "
-            f"(fills_before={self._fill_count_before_order})", "status")
+            f"(position={self._fill_poll_pos_before:+d})", "status")
         _log(f"FILL POLL START: type={action_type} "
-             f"baseline_count={self._fill_count_before_order}")
+             f"position_before={self._fill_poll_pos_before}")
+
+        # First OI query after 2s (give exchange time to process IOC order)
         self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
 
     def _poll_fill_confirmation(self) -> None:
-        """Check if fill count increased since order was sent."""
+        """Request fresh OpenInterest and check for position change."""
         if not self._trading_guard.fill_pending:
-            return  # already resolved (e.g., stopped)
+            return  # already resolved (e.g., stopped or confirmed via callback)
 
         elapsed = time.monotonic() - self._fill_poll_start_time
-        current_count = self._get_fill_count()
 
-        if current_count < 0:
-            # COM error — keep polling, don't confirm or timeout yet
-            _log(f"FILL POLL: COM error, retrying... ({elapsed:.1f}s)")
-            if elapsed < 30.0:
-                self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
-                return
-            # If COM still broken after 30s, fall through to timeout
-
-        if current_count > self._fill_count_before_order:
-            _log(f"FILL POLL: confirmed! count {self._fill_count_before_order} -> "
-                 f"{current_count} ({elapsed:.1f}s)")
-            self._on_fill_confirmed()
-            return
-
-        if elapsed >= 30.0:
+        # Check timeout first
+        if elapsed >= self._FILL_POLL_TIMEOUT:
+            pos = self._fill_poll_pos_current
             _log(f"FILL POLL: TIMEOUT after {elapsed:.1f}s, "
-                 f"count still {current_count}")
+                 f"position: {self._fill_poll_pos_before} -> {pos}")
             self._on_fill_timeout()
             return
 
-        # Keep polling
-        _log(f"FILL POLL: pending... count={current_count} "
-             f"({elapsed:.1f}s elapsed)")
-        self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
+        # Request fresh position data — result arrives via OnOpenInterest
+        # callback → _drain_ui_queue → _update_fill_poll_position
+        try:
+            user_id = self.login_user_var.get().strip()
+            skO.GetOpenInterestGW(user_id, self._futures_account, 1)
+        except Exception as e:
+            _log(f"FILL POLL: GetOpenInterestGW error: {e}")
+
+        pos = self._fill_poll_pos_current
+        _log(f"FILL POLL: pending... position={pos} "
+             f"(baseline={self._fill_poll_pos_before}, {elapsed:.1f}s elapsed)")
+
+        # Schedule next poll
+        self._fill_poll_timer_id = self.root.after(3000, self._poll_fill_confirmation)
 
     def _on_fill_confirmed(self) -> None:
-        """Called when fill is confirmed via GetFulfillReport."""
+        """Called when fill is confirmed via OpenInterest position change."""
         self._fill_poll_timer_id = None
         action_type = self._fill_poll_action_type
 
@@ -4457,21 +4576,64 @@ class BacktestApp:
         elif action_type == "exit":
             self._trading_guard.on_exit_sent()
 
+        # Get actual fill price from OpenInterest
+        fill_price = ""
+        pos = self._fill_poll_pos_current
+        if pos is not None and pos != 0 and self._live_runner:
+            order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
+                "order_symbol", "")
+            prefix = order_sym[:2] if order_sym else ""
+            for p in self._real_positions:
+                if p.get("product", "").startswith(prefix):
+                    fill_price = p.get("avg_cost", "")
+                    break
+
+        price_str = f" @{float(fill_price):,.1f}" if fill_price else ""
         self._live_log_msg(
-            f"成交已確認 {action_type.upper()} fill confirmed", "entry")
-        self._log_order_decision("FILL_CONFIRMED", action_type)
+            f"成交已確認 {action_type.upper()} fill confirmed{price_str}", "entry")
+        self._log_order_decision("FILL_CONFIRMED", f"{action_type}{price_str}")
+        if _discord and _discord.enabled:
+            _discord.fill_confirmed(action_type, fill_price)
 
     def _on_fill_timeout(self) -> None:
-        """Called when fill confirmation times out after 30 seconds."""
+        """Called when fill confirmation times out.
+
+        Instead of halting (blocking all orders), fall back to semi-auto mode
+        so the strategy can still generate exit signals. New entries require
+        manual confirmation via dialog; exits auto-send if a real entry was
+        assumed to have filled.
+        """
         self._fill_poll_timer_id = None
         action_type = self._fill_poll_action_type
 
-        self._trading_guard.on_fill_timeout()
-        msg = (f"成交超時 HALTED: {action_type} fill not confirmed after 30s — "
-               f"all orders blocked. Check position manually.")
+        # Clear fill pending state — do NOT halt
+        self._trading_guard.fill_pending = False
+        self._trading_guard.fill_pending_type = ""
+
+        # Assume the order DID fill (conservative for position safety):
+        #   entry timeout → assume we have a position → allow exits
+        #   exit timeout  → assume we closed → prevent double exits
+        if action_type == "entry":
+            self._trading_guard.on_entry_sent()   # real_entry_confirmed = True
+        elif action_type == "exit":
+            self._trading_guard.on_exit_sent()     # real_entry_confirmed = False
+
+        # Downgrade to semi-auto: exits still auto-send, entries need confirmation
+        self._trading_mode = "semi_auto"
+        self.trading_mode_var.set("⚠ 半自動 Semi-Auto (降級 downgraded)")
+
+        timeout = self._FILL_POLL_TIMEOUT
+        msg = (f"成交超時 Fill timeout: {action_type} not confirmed after "
+               f"{timeout:.0f}s — 降級為半自動 downgraded to semi-auto. "
+               f"策略仍可出場 Strategy exits still active, "
+               f"新進場需手動確認 new entries require confirmation.")
         self._live_log_msg(msg, "exit")
-        self._log_order_decision("FILL_TIMEOUT_HALTED", f"{action_type} timeout 30s")
-        _log(f"FILL POLL HALTED: {msg}")
+        self._log_order_decision(
+            "FILL_TIMEOUT_DOWNGRADE",
+            f"{action_type} timeout {timeout:.0f}s → semi_auto")
+        _log(f"FILL POLL DOWNGRADE: {msg}")
+        if _discord and _discord.enabled:
+            _discord.fill_timeout_downgrade(action_type, timeout)
 
         try:
             import winsound
@@ -4614,6 +4776,8 @@ class BacktestApp:
                             f"已達每日虧損上限 Daily loss limit: net={net:+,} "
                             f"< -{guard.daily_loss_limit:,} NTD — 實單暫停 orders paused",
                             "exit")
+                        if _discord and _discord.enabled:
+                            _discord.daily_loss_limit(net, guard.daily_loss_limit)
                 else:
                     self.real_loss_limit_var.set("--")
             except (ValueError, TypeError):
@@ -4682,12 +4846,18 @@ class BacktestApp:
         """Append message to the Live tab log."""
         tpe = _taipei_now()
         local = datetime.now()
-        ts_tpe = tpe.strftime("%H:%M:%S")
-        ts_local = local.strftime("%H:%M:%S")
+        ts_tpe = tpe.strftime("%Y-%m-%d %H:%M:%S")
+        ts_local = local.strftime("%Y-%m-%d %H:%M:%S")
         if ts_tpe == ts_local:
             line = f"[{ts_tpe}] {msg}\n"
         else:
             line = f"[{ts_tpe} TPE / {ts_local} local] {msg}\n"
+        if _debug_log_file:
+            try:
+                _debug_log_file.write(f"[LIVE] {line}")
+                _debug_log_file.flush()
+            except Exception:
+                pass
         self.live_log.insert(tk.END, line, tag)
         self.live_log.see(tk.END)
 
@@ -4794,6 +4964,8 @@ class BacktestApp:
                 "status",
             )
             _log(f"即時機器人已停止 Live bot stopped: {summary}")
+            if _discord and _discord.enabled:
+                _discord.bot_stopped(summary['trades'], summary['pnl'])
 
             # Update final results then clear runner so subsequent backtests
             # use _last_bars/_last_result instead of stale live data.
@@ -4801,6 +4973,7 @@ class BacktestApp:
             self._update_live_status()
             self._live_runner = None
             self._trading_guard.reset()
+            _close_debug_log()
 
         # Restore UI
         self.btn_deploy.config(text="部署機器人 Deploy Bot")
