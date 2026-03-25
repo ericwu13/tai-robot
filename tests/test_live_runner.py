@@ -644,3 +644,73 @@ class TestCheckTickExit:
 
         runner.check_tick_exit(22610, "2026-02-25 09:32:00")
         assert len(runner.broker._pending_exits) == 0
+
+    def test_sl_with_float_stop_fills_at_integer_tick(self, tmp_path):
+        """ATR-computed float stop (e.g. 22450.7) must fill at the integer
+        tick price, not the rounded float. Regression test for #38."""
+        runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
+        # Simulate an ATR-based float stop level
+        runner.broker._pending_exits[0].stop = 22450.73
+
+        # Tick at 22450 triggers the stop (22450 <= 22450.73)
+        result = runner.check_tick_exit(22450, "2026-02-25 09:31:30")
+        assert result is not None
+        assert result["price"] == 22450  # actual tick, not 22451 (rounded float)
+        assert runner.broker.trades[-1].exit_price == 22450
+
+    def test_no_duplicate_trade_close_after_tick_exit(self, tmp_path):
+        """After a tick exit closes the position, the next aggregated bar
+        must NOT fire a duplicate TRADE_CLOSE. Regression test for #37/#38.
+
+        Root cause: check_tick_exit used _bar_index (next bar) instead of
+        _bar_index-1 (current bar), so _check_for_trade_close matched the
+        next bar and logged a ghost TRADE_CLOSE.
+        """
+        runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
+
+        decisions = []
+        runner.on("on_decision", lambda d: decisions.append(d))
+
+        # Tick exit closes the position
+        result = runner.check_tick_exit(22440, "2026-02-25 09:32:00")
+        assert result is not None
+        assert runner.broker.position_size == 0
+
+        trade_closes_before = len([d for d in decisions if d["action"] == "TRADE_CLOSE"])
+        assert trade_closes_before == 1  # one TRADE_CLOSE from tick exit
+
+        # Process the NEXT aggregated bar — must NOT fire another TRADE_CLOSE
+        bar3 = Bar(symbol="TX00", dt=datetime(2026, 2, 25, 9, 45),
+                   open=22440, high=22460, low=22430, close=22455,
+                   volume=100, interval=900)
+        runner._process_aggregated_bar(bar3)
+
+        trade_closes_after = len([d for d in decisions if d["action"] == "TRADE_CLOSE"])
+        assert trade_closes_after == 1, (
+            f"Expected 1 TRADE_CLOSE, got {trade_closes_after} — "
+            f"duplicate fired on next bar"
+        )
+
+    def test_strategy_can_enter_after_tick_exit_on_next_bar(self, tmp_path):
+        """After tick exit, strategy should be able to enter on the next bar
+        without interference from a ghost TRADE_CLOSE."""
+        runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
+
+        decisions = []
+        runner.on("on_decision", lambda d: decisions.append(d))
+
+        # Tick exit
+        runner.check_tick_exit(22440, "2026-02-25 09:32:00")
+        assert runner.broker.position_size == 0
+
+        # Next bar — strategy should enter (LongWithExitStrategy enters when flat)
+        bar3 = Bar(symbol="TX00", dt=datetime(2026, 2, 25, 9, 45),
+                   open=22450, high=22470, low=22440, close=22460,
+                   volume=100, interval=900)
+        runner._process_aggregated_bar(bar3)
+
+        # Should have: 1 TRADE_CLOSE (tick) + 1 ENTRY_FILL (new bar)
+        actions = [d["action"] for d in decisions]
+        assert actions.count("TRADE_CLOSE") == 1, f"Ghost TRADE_CLOSE: {actions}"
+        assert "ENTRY_FILL" in actions, f"Strategy didn't re-enter: {actions}"
+        assert runner.broker.position_size == 1
