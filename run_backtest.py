@@ -4,7 +4,7 @@ Two backtest buttons:
   - API Backtest — fetches from Capital API (logs in on first use)
   - TV Backtest  — local CSV first, then TradingView download as fallback
 
-Multi-symbol support via _SYMBOL_CONFIG (TX00, MTX00).
+Multi-symbol support via SYMBOL_CONFIG (TX00, MTX00).
 
 Usage:
   python run_backtest.py
@@ -48,7 +48,6 @@ from src.market_data.models import Bar, Tick
 from src.market_data.bar_builder import BarBuilder
 from src.utils.time_utils import combine_sk_datetime
 from src.backtest.engine import BacktestEngine
-from src.backtest.data_loader import parse_kline_strings, load_bars_from_csv
 from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
@@ -95,6 +94,16 @@ from src.live.connection_monitor import ConnectionMonitor
 from src.live.fill_poller import FillPoller
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
+from src.market_data.kline_config import (
+    TV_INTERVALS, INTERVAL_SECONDS, SYMBOL_CONFIG, CACHE_SUFFIXES,
+    LIVE_CHART_TIMEFRAMES, resolve_order_symbol, get_near_month_symbol,
+    get_cache_file, should_reuse_bars, filter_bars_by_date,
+)
+from src.market_data.kchart_fetcher import (
+    KChartFetcher, resolve_kline_symbol, resolve_tv_symbol,
+    tv_dataframe_to_bars, fetch_tv_dataframe,
+    tv_dataframe_to_kline_strings,
+)
 
 # TAIFEX public data (no API key needed)
 from src.data_sources.taifex import fetch_futures_daily, parse_taifex_csv
@@ -104,18 +113,11 @@ from src.data_sources.cache import (
 
 # TradingView data feed (optional, for longer history)
 try:
-    from tvDatafeed import TvDatafeed, Interval as TvInterval
+    from tvDatafeed import Interval as TvInterval
     _tv_available = True
 except ImportError:
     _tv_available = False
 
-# Map strategy kline params to tvDatafeed intervals
-_TV_INTERVALS = {
-    (0, 1): "in_1_minute", (0, 5): "in_5_minute", (0, 15): "in_15_minute",
-    (0, 30): "in_30_minute", (0, 60): "in_1_hour", (0, 120): "in_2_hour",
-    (0, 180): "in_3_hour", (0, 240): "in_4_hour",
-    (4, 1): "in_daily", (5, 1): "in_weekly", (6, 1): "in_monthly",
-}
 
 # Registry of available backtest strategies
 STRATEGIES: dict[str, type[BacktestStrategy]] = {
@@ -291,104 +293,7 @@ def _save_ai_settings(provider: str = "", anthropic_key: str = "",
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
 
-INTERVAL_SECONDS = {
-    (0, 240): 14400,
-    (0, 60): 3600,
-    (0, 30): 1800,
-    (0, 15): 900,
-    (0, 5): 300,
-    (0, 1): 60,
-    (4, 1): 86400,
-}
-
 _CACHE_DIR = os.path.join(project_root, "data")
-
-# Multi-symbol configuration: COM symbol -> (csv_prefix, tv_symbol, point_value)
-_SYMBOL_CONFIG = {
-    "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100,
-             "taifex_id": "TX", "order_symbol": "TXFD0", "init_margin": 322000},
-    "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100,
-              "taifex_id": "MTX", "order_symbol": "MTXFD0",
-              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 80500},
-    "TMF00": {"prefix": "IMF1", "tv": "IMF1!", "pv": 10, "tick_divisor": 100,
-              "taifex_id": "TMF", "order_symbol": "TM0000",
-              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 16100},
-}
-
-def _resolve_order_symbol(symbol: str) -> str:
-    """Resolve the order symbol for a given COM quote symbol."""
-    cfg = _SYMBOL_CONFIG.get(symbol, {})
-    order_sym = cfg.get("order_symbol", symbol)
-    if order_sym == "auto":
-        product_code = cfg.get("taifex_id", symbol)
-        order_sym = _get_near_month_symbol(product_code)
-    return order_sym
-
-
-_MONTH_CODES = "ABCDEFGHIJKL"  # A=Jan .. L=Dec
-
-
-def _get_near_month_symbol(product_code: str) -> str:
-    """Compute near-month futures order symbol like TMFC6.
-
-    Format: {product}{month_letter}{year_digit}
-    Month letters: A=Jan, B=Feb, C=Mar, D=Apr, ... L=Dec
-    Year digit: last digit of year (6=2026)
-
-    Taiwan futures settle on the 3rd Wednesday of the expiry month.
-    If today is past the 3rd Wednesday, use next month.
-    """
-    import calendar
-    now = _taipei_now()
-    year, month = now.year, now.month
-    # Find 3rd Wednesday of current month
-    cal = calendar.monthcalendar(year, month)
-    wed_count = 0
-    third_wed_day = None
-    for week in cal:
-        if week[2] != 0:  # Wednesday exists in this week
-            wed_count += 1
-            if wed_count == 3:
-                third_wed_day = week[2]
-                break
-    # If past settlement day, roll to next month
-    if now.day > third_wed_day:
-        month += 1
-        if month > 12:
-            month = 1
-            year += 1
-    month_letter = _MONTH_CODES[month - 1]
-    year_digit = year % 10
-    return f"{product_code}{month_letter}{year_digit}"
-
-
-_CACHE_SUFFIXES = {
-    (0, 15): "_15m.csv",
-    (0, 60): "_1H.csv",
-    (0, 240): "_H4.csv",
-    (4, 1): "_1D.csv",
-}
-
-
-_LIVE_CHART_TIMEFRAMES = {
-    "Native": None,
-    "1m": 60,
-    "5m": 300,
-    "15m": 900,
-    "1H": 3600,
-    "4H": 14400,
-}
-
-
-def _get_cache_file(symbol: str, kline_key: tuple) -> str | None:
-    """Return the cache CSV filename for a given symbol and kline key, or None."""
-    cfg = _SYMBOL_CONFIG.get(symbol)
-    if not cfg:
-        return None
-    suffix = _CACHE_SUFFIXES.get(kline_key)
-    if not suffix:
-        return None
-    return cfg["prefix"] + suffix
 
 _app = None
 _debug_log_file = None  # file handle for bot debug log
@@ -436,23 +341,6 @@ _tick_queue: queue.Queue = queue.Queue()
 _ui_queue: queue.Queue = queue.Queue()
 
 
-def should_reuse_bars(
-    raw_bars: list, raw_bars_key: tuple,
-    symbol: str, kline_type: int, kline_minute: int,
-) -> bool:
-    """Return True if raw_bars can be reused for the given symbol and timeframe."""
-    if not raw_bars:
-        return False
-    return raw_bars_key == (symbol, kline_type, kline_minute)
-
-
-def filter_bars_by_date(
-    bars: list, start_date: str, end_date: str,
-) -> list:
-    """Filter bars to [start_date, end_date] inclusive. Dates are YYYYMMDD strings."""
-    dt_start = datetime.strptime(start_date, "%Y%m%d")
-    dt_end = datetime.strptime(end_date, "%Y%m%d") + timedelta(days=1)
-    return [b for b in bars if dt_start <= b.dt < dt_end]
 
 
 
@@ -514,9 +402,8 @@ class SKQuoteLibEvents:
         elif _app._live_polling:
             _app._live_poll_data.append(bstrData)
         else:
-            _app.kline_data.append(bstrData)
-            _app._chunk_bar_count += 1
-            n = len(_app.kline_data)
+            _app._fetcher.on_kline_data(bstrData)
+            n = _app._fetcher.total_bar_count
             if n <= 3:
                 _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
 
@@ -530,8 +417,8 @@ class SKQuoteLibEvents:
             _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
             _app.root.after(100, _app._on_live_poll_complete)
         else:
-            chunk_n = _app._chunk_bar_count
-            total_n = len(_app.kline_data)
+            chunk_n = _app._fetcher.chunk_bar_count
+            total_n = _app._fetcher.total_bar_count
             _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
             _app.root.after(100, _app._on_chunk_complete)
 
@@ -603,15 +490,9 @@ class BacktestApp:
         self.root.minsize(1100, 650)
 
         self._settings = _load_settings()
-        self.kline_data: list[str] = []
+        self._fetcher = KChartFetcher()
         self._logged_in = False
         self._quote_connected = False
-        self._fetch_chunks: list[tuple[str, str]] = []
-        self._fetch_chunk_idx: int = 0
-        self._fetch_symbol: str = ""
-        self._fetch_kline_type: int = 0
-        self._fetch_minute_num: int = 0
-        self._chunk_bar_count: int = 0
 
         # AI state
         self._chat_client: ChatClient | None = None
@@ -681,7 +562,7 @@ class BacktestApp:
                     if market_no in (2, 7, 9):  # futures markets
                         raw = stock_data or ""
                         if self._live_runner:
-                            cfg = _SYMBOL_CONFIG.get(self._live_runner.symbol, {})
+                            cfg = SYMBOL_CONFIG.get(self._live_runner.symbol, {})
                             pid = cfg.get("taifex_id", "")
                             if pid and pid in raw:
                                 # Log raw entries containing the product ID
@@ -1070,7 +951,7 @@ class BacktestApp:
         ttk.Label(row1, text="商品 Symbol:").grid(row=0, column=0, sticky=tk.W, padx=(4, 2))
         self.symbol_var = tk.StringVar(value="TX00")
         self.symbol_combo = ttk.Combobox(row1, textvariable=self.symbol_var, width=8,
-                                          state="readonly", values=list(_SYMBOL_CONFIG.keys()))
+                                          state="readonly", values=list(SYMBOL_CONFIG.keys()))
         self.symbol_combo.grid(row=0, column=1, padx=(0, 8))
         self.symbol_combo.bind("<<ComboboxSelected>>", lambda e: self._on_symbol_changed())
 
@@ -1146,7 +1027,7 @@ class BacktestApp:
         self.chart_tf_var = tk.StringVar(value="Native")
         self.chart_tf_combo = ttk.Combobox(
             tf_frame, textvariable=self.chart_tf_var,
-            values=list(_LIVE_CHART_TIMEFRAMES.keys()),
+            values=list(LIVE_CHART_TIMEFRAMES.keys()),
             state=tk.DISABLED, width=7,
         )
         self.chart_tf_combo.pack(side=tk.LEFT)
@@ -2023,7 +1904,7 @@ class BacktestApp:
     def _on_symbol_changed(self):
         """Auto-set point value when symbol changes and clear cached bars."""
         symbol = self.symbol_var.get()
-        cfg = _SYMBOL_CONFIG.get(symbol)
+        cfg = SYMBOL_CONFIG.get(symbol)
         if cfg:
             self.pv_var.set(str(cfg["pv"]))
         self._raw_bars = []
@@ -2201,73 +2082,37 @@ class BacktestApp:
 
         # Split into adaptive chunks (API returns max ~316 bars per request)
         try:
-            dt_start = datetime.strptime(start_date, "%Y%m%d")
-            dt_end = datetime.strptime(end_date, "%Y%m%d")
+            chunks = self._fetcher.start_api_fetch(
+                symbol, kline_type, minute_num, start_date, end_date)
         except ValueError:
             self.status_var.set("日期格式錯誤 Date format error (YYYYMMDD)")
             return
 
-        # Estimate bars per trading day for each timeframe, then size chunks
-        # to stay well under the 316-bar API cap (target ~250 bars/chunk).
-        if kline_type == 4:       # Daily
-            bars_per_tday = 1
-        elif minute_num >= 240:   # H4
-            bars_per_tday = 6
-        elif minute_num >= 60:    # 1H
-            bars_per_tday = 14
-        elif minute_num >= 30:    # 30m
-            bars_per_tday = 28
-        elif minute_num >= 15:    # 15m
-            bars_per_tday = 56
-        elif minute_num >= 5:     # 5m
-            bars_per_tday = 60
-        else:                     # 1m
-            bars_per_tday = 300
-        trading_days = 250 // bars_per_tday
-        chunk_days = max(5, int(trading_days * 7 / 5))
-        self._fetch_chunks = []
-        cursor = dt_start
-        while cursor < dt_end:
-            chunk_end = min(cursor + timedelta(days=chunk_days), dt_end)
-            self._fetch_chunks.append((cursor.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")))
-            cursor = chunk_end + timedelta(days=1)
-
-        self.kline_data = []
-        self._fetch_chunk_idx = 0
         self._disable_buttons()
+        _log(f"分段查詢 Fetching in {len(chunks)} chunks: {start_date}~{end_date}")
+        self._fetch_next_chunk()
 
-        total_days = (dt_end - dt_start).days
-        n_chunks = len(self._fetch_chunks)
-        _log(f"分段查詢 Fetching in {n_chunks} chunks ({total_days} days, {chunk_days}d/chunk)")
-
-        self._fetch_next_chunk(symbol, kline_type, minute_num)
-
-    def _fetch_next_chunk(self, symbol, kline_type, minute_num):
-        """Fetch the next chunk of KLine data."""
-        if self._fetch_chunk_idx >= len(self._fetch_chunks):
-            _log(f"全部完成 All chunks fetched: {len(self.kline_data)} total KLine strings")
+    def _fetch_next_chunk(self):
+        """Fetch the next chunk of KLine data via COM API."""
+        chunk = self._fetcher.next_chunk()
+        if chunk is None:
+            _log(f"全部完成 All chunks fetched: {self._fetcher.total_bar_count} total KLine strings")
             self._run_backtest()
             return
 
-        chunk_start, chunk_end = self._fetch_chunks[self._fetch_chunk_idx]
-        n = self._fetch_chunk_idx + 1
-        total = len(self._fetch_chunks)
-        self.status_var.set(f"查詢中 Fetching chunk {n}/{total}: {chunk_start}~{chunk_end}")
-        self._chunk_bar_count = 0
-        # MTX00/TMF00 share TX00's KLine data (same TAIEX index, different point values)
-        cfg = _SYMBOL_CONFIG.get(symbol, {})
-        kline_sym = cfg.get("kline_symbol", symbol)
-        sym_note = f" (via {kline_sym})" if kline_sym != symbol else ""
-        _log(f"請求K線 [{n}/{total}] {symbol}{sym_note} type={kline_type} "
-             f"{chunk_start}~{chunk_end} min={minute_num}")
-
-        self._fetch_symbol = symbol
-        self._fetch_kline_type = kline_type
-        self._fetch_minute_num = minute_num
+        n = chunk.chunk_index + 1
+        total = chunk.total_chunks
+        self.status_var.set(f"查詢中 Fetching chunk {n}/{total}: {chunk.start_date}~{chunk.end_date}")
+        sym = self._fetcher.symbol
+        sym_note = f" (via {chunk.kline_symbol})" if chunk.kline_symbol != sym else ""
+        _log(f"請求K線 [{n}/{total}] {sym}{sym_note} type={chunk.kline_type} "
+             f"{chunk.start_date}~{chunk.end_date} min={chunk.minute_num}")
 
         try:
             code = skQ.SKQuoteLib_RequestKLineAMByDate(
-                kline_sym, kline_type, 1, 0, chunk_start, chunk_end, minute_num)
+                chunk.kline_symbol, chunk.kline_type, chunk.session,
+                chunk.trade_session, chunk.start_date, chunk.end_date,
+                chunk.minute_num)
 
             if code != 0:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
@@ -2289,7 +2134,7 @@ class BacktestApp:
             return
 
         symbol = self.symbol_var.get().strip()
-        cfg = _SYMBOL_CONFIG.get(symbol)
+        cfg = SYMBOL_CONFIG.get(symbol)
         if not cfg or "taifex_id" not in cfg:
             self.status_var.set(f"TAIFEX不支援此商品 Unsupported symbol: {symbol}")
             return
@@ -2411,65 +2256,6 @@ class BacktestApp:
         self.status_var.set("無資料 No local CSV and tvDatafeed not installed.")
         self._enable_buttons()
 
-    @staticmethod
-    def _detect_tv_source_tz(df):
-        """Detect the source timezone of tvDatafeed timestamps.
-
-        All bar.dt must be naive Taiwan time (TWT/UTC+8).
-
-        Generalized detection using TAIFEX gap hours — no assumptions
-        about bar alignment, session start times, or minute offsets.
-
-        TAIFEX has known gaps where no trading occurs (TWT):
-        - 05:01–08:44  (night close → day open)
-        - 13:46–14:59  (day close → night open)
-
-        Try candidate timezones.  The correct one produces ZERO bars
-        in gap hours after conversion to TWT.
-
-        Returns a ZoneInfo for the source timezone, or None if already TWT.
-        """
-        if df is None or df.empty:
-            return None
-
-        from zoneinfo import ZoneInfo
-        _tz_taipei = ZoneInfo("Asia/Taipei")
-
-        # tz-aware index: caller handles conversion directly
-        if df.index[0].to_pydatetime().tzinfo is not None:
-            return None
-
-        def _in_gap(h, m):
-            """True if (h, m) in TWT falls in a TAIFEX no-trade gap."""
-            t = h * 60 + m
-            return (301 <= t <= 524) or (826 <= t <= 899)
-
-        bar_dts = [dt.to_pydatetime() for dt in df.index]
-
-        # None = already TWT, then known tvDatafeed server timezones
-        candidates = [
-            None,
-            ZoneInfo("America/Los_Angeles"),
-            ZoneInfo("UTC"),
-            ZoneInfo("America/New_York"),
-            ZoneInfo("America/Chicago"),
-        ]
-
-        for tz in candidates:
-            has_gap_bar = False
-            for dt in bar_dts:
-                if tz is None:
-                    h, m = dt.hour, dt.minute
-                else:
-                    c = dt.replace(tzinfo=tz).astimezone(_tz_taipei)
-                    h, m = c.hour, c.minute
-                if _in_gap(h, m):
-                    has_gap_bar = True
-                    break
-            if not has_gap_bar:
-                return tz  # None means already TWT
-
-        return None  # can't detect — assume TWT
 
     def _fetch_tradingview_live(self):
         """Download fresh data from TradingView API."""
@@ -2479,7 +2265,7 @@ class BacktestApp:
 
         kt = strategy_cls.kline_type
         km = strategy_cls.kline_minute
-        tv_interval_name = _TV_INTERVALS.get((kt, km))
+        tv_interval_name = TV_INTERVALS.get((kt, km))
         if not tv_interval_name:
             self.status_var.set(f"TradingView不支援此週期 Unsupported interval: type={kt} min={km}")
             self._enable_buttons()
@@ -2487,94 +2273,35 @@ class BacktestApp:
 
         tv_interval = getattr(TvInterval, tv_interval_name)
         raw_symbol = self.symbol_var.get().strip()
-        cfg = _SYMBOL_CONFIG.get(raw_symbol)
-        symbol = cfg["tv"] if cfg else raw_symbol
-        exchange = "TAIFEX"
+        tv_symbol = resolve_tv_symbol(raw_symbol)
         interval = INTERVAL_SECONDS.get((kt, km), 14400)
 
         self._data_source = "TradingView (live)"
         self._disable_buttons()
-        self.status_var.set(f"從TradingView下載 Fetching from TradingView: {symbol} {tv_interval_name}...")
+        self.status_var.set(f"從TradingView下載 Fetching from TradingView: {tv_symbol} {tv_interval_name}...")
         self.root.update()
 
-        _log(f"TradingView下載 Fetching {symbol}@{exchange} interval={tv_interval_name} n_bars=5000")
+        _log(f"TradingView下載 Fetching {tv_symbol}@TAIFEX interval={tv_interval_name} n_bars=5000")
 
-        _NET_ERRORS = (ConnectionError, OSError, TimeoutError)
-        try:
-            import websocket
-            _NET_ERRORS = (ConnectionError, OSError, TimeoutError,
-                           websocket.WebSocketException)
-        except ImportError:
-            pass
-
-        max_retries = 3
-        df = None
-        last_err = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                tv = TvDatafeed()
-                df = tv.get_hist(symbol=symbol, exchange=exchange,
-                                 interval=tv_interval, n_bars=5000)
-                if df is not None and not df.empty:
-                    break
-                _log(f"TradingView第{attempt}次無資料 Attempt {attempt}/{max_retries}: no data")
-            except _NET_ERRORS as e:
-                last_err = e
-                _log(f"TradingView第{attempt}次連線失敗 Attempt {attempt}/{max_retries} "
-                     f"network error: [{type(e).__name__}] {e}")
-                if attempt < max_retries:
-                    import time
-                    time.sleep(2)
-            except Exception as e:
-                _log(f"TradingView錯誤 TV error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
-                self.status_var.set(f"TradingView錯誤: {e}")
-                self._enable_buttons()
-                return
-
-        if df is None or df.empty:
-            if last_err:
-                _log(f"TradingView連線失敗（已重試{max_retries}次）Network error after "
-                     f"{max_retries} retries. 請確認網路連線 Please check internet connection.")
-                self.status_var.set("TradingView連線失敗 Connection failed (請確認網路)")
-            else:
-                _log("TradingView無資料 No data from TradingView")
-                self.status_var.set("TradingView無資料 No data")
+        df, err = fetch_tv_dataframe(tv_symbol, "TAIFEX", tv_interval)
+        if err:
+            _log(f"TradingView錯誤 {err.message}")
+            self.status_var.set(f"TradingView錯誤 {err.message}")
             self._enable_buttons()
             return
 
         try:
-            # All bar.dt must be naive Taiwan time (TWT/UTC+8).
-            # tvDatafeed may return timestamps in a different timezone
-            # (commonly America/Los_Angeles).  Detect and convert per-bar
-            # to handle DST transitions correctly.
-            from zoneinfo import ZoneInfo
-            _tz_taipei = ZoneInfo("Asia/Taipei")
-            source_tz = self._detect_tv_source_tz(df)
+            result = tv_dataframe_to_bars(df, symbol=tv_symbol, interval=interval)
+            if not result.ok:
+                _log(f"TradingView無資料 {result.error}")
+                self.status_var.set("TradingView無資料 No data")
+                self._enable_buttons()
+                return
 
-            bars = []
-            for dt_idx, row in df.iterrows():
-                dt_raw = dt_idx.to_pydatetime()
-                if dt_raw.tzinfo is not None:
-                    # tz-aware: convert directly
-                    dt_twt = dt_raw.astimezone(_tz_taipei).replace(tzinfo=None)
-                elif source_tz:
-                    # naive non-TWT: localize to source tz, convert to TWT
-                    dt_twt = dt_raw.replace(tzinfo=source_tz).astimezone(
-                        _tz_taipei).replace(tzinfo=None)
-                else:
-                    # already TWT
-                    dt_twt = dt_raw
-                bars.append(Bar(
-                    symbol=symbol, dt=dt_twt,
-                    open=round(row["open"]), high=round(row["high"]),
-                    low=round(row["low"]), close=round(row["close"]),
-                    volume=int(row.get("volume", 0)),
-                    interval=interval,
-                ))
-            bars.sort(key=lambda b: b.dt)
-            if source_tz:
-                _log(f"時區校正 Timezone: detected {source_tz}, converted to Asia/Taipei")
+            if result.source_tz:
+                _log(f"時區校正 Timezone: detected {result.source_tz}, converted to Asia/Taipei")
 
+            bars = result.bars
             _log(f"TradingView完成 Got {len(bars)} bars: {bars[0].dt} ~ {bars[-1].dt}")
             self._execute_backtest(bars)
 
@@ -2587,10 +2314,9 @@ class BacktestApp:
 
     def _on_chunk_complete(self):
         """Called after each KLine chunk completes. Fetches next chunk or runs backtest."""
-        self._fetch_chunk_idx += 1
-        if self._fetch_chunk_idx < len(self._fetch_chunks):
-            self.root.after(500, lambda: self._fetch_next_chunk(
-                self._fetch_symbol, self._fetch_kline_type, self._fetch_minute_num))
+        self._fetcher.advance_chunk()
+        if not self._fetcher.chunks_done:
+            self.root.after(500, self._fetch_next_chunk)
         else:
             self._run_backtest()
 
@@ -2604,22 +2330,8 @@ class BacktestApp:
 
     def _run_backtest(self):
         """Called after all KLine data arrives from COM API."""
-        symbol = self.symbol_var.get().strip()
-        interval = self._get_strategy_interval()
-
-        _log(f"解析K線資料 Parsing {len(self.kline_data)} KLine strings...")
-        bars = parse_kline_strings(self.kline_data, symbol=symbol, interval=interval)
-
-        seen = set()
-        unique_bars = []
-        for b in bars:
-            if b.dt not in seen:
-                seen.add(b.dt)
-                unique_bars.append(b)
-        if len(unique_bars) < len(bars):
-            _log(f"去重 Deduplicated: {len(bars)} -> {len(unique_bars)} bars")
-        bars = unique_bars
-
+        _log(f"解析K線資料 Parsing {self._fetcher.total_bar_count} KLine strings...")
+        bars = self._fetcher.get_api_bars()
         if bars:
             _log(f"API資料 Parsed {len(bars)} API bars: {bars[0].dt} ~ {bars[-1].dt}")
         else:
@@ -2895,7 +2607,7 @@ class BacktestApp:
         if self._live_runner and self._live_runner.state in (LiveState.RUNNING, LiveState.STOPPED):
             result = self._live_runner.get_result()
             tf_label = self.chart_tf_var.get()
-            interval = _LIVE_CHART_TIMEFRAMES.get(tf_label)
+            interval = LIVE_CHART_TIMEFRAMES.get(tf_label)
             if interval is None:
                 # Native — strategy-interval bars with trades
                 return self._live_runner.get_bars(), result, True
@@ -3455,7 +3167,7 @@ class BacktestApp:
             _log(f"Discord 通知已啟用 Discord notifications enabled")
 
         # Debug: log resolved order symbol and query stock list
-        order_sym = _resolve_order_symbol(symbol)
+        order_sym = resolve_order_symbol(symbol)
         _log(f"委託商品 Order symbol: {symbol} -> {order_sym}")
         if _com_available and skQ and self._quote_connected:
             try:
@@ -3542,9 +3254,7 @@ class BacktestApp:
         end_str = dt_end.strftime("%Y%m%d")
 
         symbol = self._live_runner.symbol
-        # MTX00/TMF00 share TX00's KLine data (same TAIEX index)
-        cfg = _SYMBOL_CONFIG.get(symbol, {})
-        kline_sym = cfg.get("kline_symbol", symbol)
+        kline_sym = resolve_kline_symbol(symbol)
         _log(f"COM暖機查詢 COM warmup fetch: {kline_sym} (for {symbol}) type={kline_type} "
              f"min={kline_minute} {start_str}~{end_str}")
 
@@ -3581,72 +3291,32 @@ class BacktestApp:
     def _live_warmup_via_tv(self, kline_type, kline_minute):
         """Fetch warmup data via TradingView (in thread)."""
         runner = self._live_runner
-        tv_interval_name = _TV_INTERVALS.get((kline_type, kline_minute))
+        tv_interval_name = TV_INTERVALS.get((kline_type, kline_minute))
         if not tv_interval_name:
             self._live_log_msg(f"TV不支援此週期 Unsupported interval for TV", "status")
             self._stop_live()
             return
 
-        cfg = _SYMBOL_CONFIG.get(runner.symbol)
-        tv_symbol = cfg["tv"] if cfg else runner.symbol
-        interval_sec = INTERVAL_SECONDS.get((kline_type, kline_minute), 14400)
-
+        tv_symbol = resolve_tv_symbol(runner.symbol)
         self._live_log_msg(f"TradingView暖機 TV warmup: {tv_symbol}...", "status")
 
         def _worker():
             try:
                 tv_interval = getattr(TvInterval, tv_interval_name)
-
-                _net_errors = (ConnectionError, OSError, TimeoutError)
-                try:
-                    import websocket
-                    _net_errors = (ConnectionError, OSError, TimeoutError,
-                                   websocket.WebSocketException)
-                except ImportError:
-                    pass
-
-                df = None
-                max_retries = 3
-                last_err = None
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        tv = TvDatafeed()
-                        df = tv.get_hist(symbol=tv_symbol, exchange="TAIFEX",
-                                         interval=tv_interval, n_bars=5000)
-                        if df is not None and not df.empty:
-                            break
-                    except _net_errors as e:
-                        last_err = e
-                        _log(f"TV暖機第{attempt}次連線失敗 TV warmup attempt {attempt}/{max_retries} "
-                             f"network error: [{type(e).__name__}] {e}")
-                        if attempt < max_retries:
-                            import time
-                            time.sleep(2)
-
-                if df is None or df.empty:
-                    if last_err:
-                        msg = f"TV連線失敗 Connection failed: {last_err}"
-                    else:
-                        msg = "TV無資料 No TV data"
-                    self.root.after(0, lambda m=msg: self._live_log_msg(m, "status"))
+                df, err = fetch_tv_dataframe(tv_symbol, "TAIFEX", tv_interval)
+                if err:
+                    self.root.after(0, lambda: self._live_log_msg(
+                        f"TV暖機失敗 {err.message}", "status"))
                     self.root.after(0, self._stop_live)
                     return
 
-                kline_strings = []
-                for dt_idx, row in df.iterrows():
-                    dt = dt_idx.to_pydatetime()
-                    kline_strings.append(
-                        f"{dt.strftime('%m/%d/%Y %H:%M')},"
-                        f"{round(row['open'])},{round(row['high'])},"
-                        f"{round(row['low'])},{round(row['close'])},"
-                        f"{int(row.get('volume', 0))}"
-                    )
+                kline_strings = tv_dataframe_to_kline_strings(df)
 
                 def _finish():
                     count = runner.feed_warmup_bars(kline_strings)
                     self._live_log_msg(f"TV暖機完成 TV warmup done: {count} bars", "status")
                     self._update_live_status()
-                    self._update_live_results()  # enable chart button & populate _last_bars
+                    self._update_live_results()
                     self._update_manual_order_buttons()
                     self._start_account_polling()
                     self._start_live_tick_subscription()
@@ -3695,7 +3365,7 @@ class BacktestApp:
 
         symbol = self._live_runner.symbol
         # MTX00/TMF00 use TX00 ticks (same TAIEX index prices)
-        cfg = _SYMBOL_CONFIG.get(symbol, {})
+        cfg = SYMBOL_CONFIG.get(symbol, {})
         tick_sym = cfg.get("tick_symbol", symbol)
         self._live_tick_symbol = symbol  # keep original for logging/orders
         self._live_tick_com_symbol = tick_sym  # actual COM subscription symbol
@@ -3903,7 +3573,7 @@ class BacktestApp:
             return
 
         # Scale tick prices to match KLine convention (COM ticks are 100x KLine)
-        cfg = _SYMBOL_CONFIG.get(self._live_tick_symbol, {})
+        cfg = SYMBOL_CONFIG.get(self._live_tick_symbol, {})
         divisor = cfg.get("tick_divisor", 1)
         price = close // divisor
         bid_scaled = bid // divisor
@@ -4030,7 +3700,7 @@ class BacktestApp:
         order_desc = ("買進 BUY" if buy_sell == 0 else "賣出 SELL")
 
         symbol = self._live_runner.symbol if self._live_runner else "?"
-        order_symbol = _resolve_order_symbol(symbol)
+        order_symbol = resolve_order_symbol(symbol)
 
         if verdict == guard.BLOCK_HALTED:
             self._live_log_msg(
@@ -4101,7 +3771,7 @@ class BacktestApp:
 
         # Order details
         symbol = self._live_runner.symbol if self._live_runner else "?"
-        cfg = _SYMBOL_CONFIG.get(symbol, {})
+        cfg = SYMBOL_CONFIG.get(symbol, {})
         pv = cfg.get("pv", "?")
         tk.Label(dlg, text=f"商品 Symbol: {order_symbol} ({symbol})  |  每點 PV: {pv} NTD",
                 font=("", 11)).pack(pady=2)
@@ -4197,7 +3867,7 @@ class BacktestApp:
             try:
                 available = float(self._account_monitor.rights.get("available", "0"))
                 symbol = self._live_runner.symbol if self._live_runner else ""
-                cfg = _SYMBOL_CONFIG.get(symbol, {})
+                cfg = SYMBOL_CONFIG.get(symbol, {})
                 required = cfg.get("init_margin", 0)
                 allowed, reason = TradingGuard.check_margin(available, required)
                 if not allowed:
@@ -4308,14 +3978,14 @@ class BacktestApp:
         """Get the current signed position qty for the live symbol."""
         if not self._live_runner:
             return 0
-        order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
+        order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
             "order_symbol", "")
         prefix = order_sym[:2] if order_sym else ""
         return self._account_monitor.get_signed_position(prefix)
 
     def _update_fill_poll_position(self, raw_data: str, parsed: dict | None) -> None:
         """Track position changes from OnOpenInterest during fill polling."""
-        order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
+        order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
             "order_symbol", "")
         prefix = order_sym[:2] if order_sym else ""
 
@@ -4383,7 +4053,7 @@ class BacktestApp:
         fill_price = ""
         pos = self._fill_poller.pos_current
         if pos is not None and pos != 0 and self._live_runner:
-            order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
+            order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
                 "order_symbol", "")
             prefix = order_sym[:2] if order_sym else ""
             for p in self._account_monitor.positions:
@@ -4439,7 +4109,7 @@ class BacktestApp:
         if not self._live_runner:
             return
         symbol = self._live_runner.symbol
-        order_symbol = _resolve_order_symbol(symbol)
+        order_symbol = resolve_order_symbol(symbol)
         order_desc = "買進 BUY" if buy_sell == 0 else "賣出 SELL"
         price, price_src = self._get_latest_price()
         self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type="entry", price_source=price_src)
@@ -4449,7 +4119,7 @@ class BacktestApp:
         if not self._live_runner:
             return
         symbol = self._live_runner.symbol
-        order_symbol = _resolve_order_symbol(symbol)
+        order_symbol = resolve_order_symbol(symbol)
         # Priority: real API position > last real order > simulated broker
         if self._account_monitor.positions:
             # Use real position from API
@@ -4683,7 +4353,7 @@ class BacktestApp:
                 runner = self._live_runner
                 side_val = runner.broker.position_side.value if runner.broker.position_size > 0 else "LONG"
                 buy_sell = 1 if side_val == "LONG" else 0  # reverse to close
-                order_symbol = _resolve_order_symbol(runner.symbol)
+                order_symbol = resolve_order_symbol(runner.symbol)
                 price = runner._aggregated_bars[-1].close if runner._aggregated_bars else 0
                 order_desc = "賣出 SELL" if buy_sell == 1 else "買進 BUY"
                 self._live_log_msg(

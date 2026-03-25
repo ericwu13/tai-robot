@@ -1,23 +1,16 @@
-"""Tests for symbol configuration logic in run_backtest.py."""
+"""Tests for symbol configuration logic in kline_config."""
 
-import os
-import sys
 import pytest
 
-# Ensure project root is importable
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-from run_backtest import _SYMBOL_CONFIG, _CACHE_SUFFIXES, _get_cache_file
+from src.market_data.kline_config import SYMBOL_CONFIG, CACHE_SUFFIXES, get_cache_file
 
 
 class TestGetCacheFile:
     def test_tx00_h4(self):
-        assert _get_cache_file("TX00", (0, 240)) == "TXF1_H4.csv"
+        assert get_cache_file("TX00", (0, 240)) == "TXF1_H4.csv"
 
     def test_mtx00_h4(self):
-        assert _get_cache_file("MTX00", (0, 240)) == "TMF1_H4.csv"
+        assert get_cache_file("MTX00", (0, 240)) == "TMF1_H4.csv"
 
     def test_all_timeframes_tx00(self):
         expected = {
@@ -27,7 +20,7 @@ class TestGetCacheFile:
             (4, 1): "TXF1_1D.csv",
         }
         for key, filename in expected.items():
-            assert _get_cache_file("TX00", key) == filename
+            assert get_cache_file("TX00", key) == filename
 
     def test_all_timeframes_mtx00(self):
         expected = {
@@ -37,22 +30,22 @@ class TestGetCacheFile:
             (4, 1): "TMF1_1D.csv",
         }
         for key, filename in expected.items():
-            assert _get_cache_file("MTX00", key) == filename
+            assert get_cache_file("MTX00", key) == filename
 
     def test_unknown_symbol(self):
-        assert _get_cache_file("UNKNOWN", (0, 240)) is None
+        assert get_cache_file("UNKNOWN", (0, 240)) is None
 
     def test_unknown_timeframe(self):
-        assert _get_cache_file("TX00", (0, 999)) is None
+        assert get_cache_file("TX00", (0, 999)) is None
 
 
 class TestSymbolConfig:
     def test_point_values(self):
-        assert _SYMBOL_CONFIG["TX00"]["pv"] == 200
-        assert _SYMBOL_CONFIG["MTX00"]["pv"] == 50
+        assert SYMBOL_CONFIG["TX00"]["pv"] == 200
+        assert SYMBOL_CONFIG["MTX00"]["pv"] == 50
 
     def test_tv_symbols(self):
-        assert _SYMBOL_CONFIG["TX00"]["tv"] == "TXF1!"
-        assert _SYMBOL_CONFIG["MTX00"]["tv"] == "TMF1!"
+        assert SYMBOL_CONFIG["TX00"]["tv"] == "TXF1!"
+        assert SYMBOL_CONFIG["MTX00"]["tv"] == "TMF1!"
 
 
