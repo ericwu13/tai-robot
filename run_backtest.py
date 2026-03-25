@@ -1235,6 +1235,10 @@ class BacktestApp:
                                      command=self._review_trades, state=tk.DISABLED)
         self.btn_review.grid(row=0, column=7, padx=3, pady=1, sticky=tk.W)
 
+        self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
+                                     command=self._report_issue)
+        self.btn_report.grid(row=0, column=8, padx=3, pady=1, sticky=tk.W)
+
         tf_frame = ttk.Frame(btn_frame)
         tf_frame.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
         ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
@@ -3111,6 +3115,116 @@ class BacktestApp:
         """Cleanup when live chart window is closed."""
         self._live_chart = None
 
+    def _report_issue(self):
+        """Collect debug data into a zip and open GitHub new issue page."""
+        import zipfile
+        import webbrowser
+        import urllib.parse
+        import platform
+
+        from version import APP_VERSION
+
+        # Determine bot directory
+        bot_dir = None
+        if self._live_runner and hasattr(self._live_runner, "bot_dir"):
+            bot_dir = self._live_runner.bot_dir
+
+        # Collect files into zip
+        ts = _taipei_now().strftime("%Y%m%d_%H%M%S")
+        if bot_dir and os.path.isdir(bot_dir):
+            zip_path = os.path.join(bot_dir, f"bug_report_{ts}.zip")
+        else:
+            zip_path = os.path.join("data", f"bug_report_{ts}.zip")
+            os.makedirs("data", exist_ok=True)
+
+        files_added = 0
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Debug logs, decisions, bars, session from bot dir
+            if bot_dir and os.path.isdir(bot_dir):
+                for fname in os.listdir(bot_dir):
+                    fpath = os.path.join(bot_dir, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    if fname.endswith((".log", ".csv", ".json")) and not fname.startswith("bug_report"):
+                        zf.write(fpath, fname)
+                        files_added += 1
+
+            # Strategy code (if loaded)
+            if hasattr(self, "_strategy_code") and self._strategy_code:
+                zf.writestr("strategy_code.py", self._strategy_code)
+                files_added += 1
+
+        if files_added == 0:
+            messagebox.showinfo("Report Issue",
+                                "沒有可用的除錯資料\nNo debug data available.\n\n"
+                                "Deploy a bot first to generate logs.")
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+            return
+
+        # Build issue body
+        strategy = self.strategy_var.get() if hasattr(self, "strategy_var") else "N/A"
+        symbol = self._live_runner.symbol if self._live_runner else "N/A"
+        mode = getattr(self, "_trading_mode", "N/A")
+        position = self._get_signed_position() if self._live_runner else 0
+
+        # Last 30 lines of debug log
+        log_tail = ""
+        if _debug_log_file and hasattr(_debug_log_file, "name"):
+            try:
+                with open(_debug_log_file.name, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    log_tail = "".join(lines[-30:])
+            except Exception:
+                pass
+
+        body = f"""**Version**: v{APP_VERSION}
+**OS**: {platform.platform()}
+**Python**: {platform.python_version()}
+**Strategy**: {strategy}
+**Symbol**: {symbol}
+**Mode**: {mode}
+**Position**: {position:+d}
+
+## Description
+<!-- Describe what happened -->
+
+
+## Recent Log
+```
+{log_tail.strip()}
+```
+
+## Attachments
+Debug zip: `{os.path.basename(zip_path)}` ({files_added} files)
+Please drag-drop the zip file into this issue.
+"""
+
+        # GitHub new issue URL (truncate body if too long for URL)
+        title = f"[Bug] {strategy} on {symbol}"
+        max_body = 6000  # URL length safety
+        if len(body) > max_body:
+            body = body[:max_body] + "\n\n... (truncated, see attached zip)"
+
+        url = (f"https://github.com/ericwu13/tai-robot/issues/new?"
+               f"title={urllib.parse.quote(title)}&"
+               f"body={urllib.parse.quote(body)}")
+
+        # Open browser and file explorer
+        webbrowser.open(url)
+        # Open folder containing the zip so user can drag-drop
+        try:
+            os.startfile(os.path.dirname(os.path.abspath(zip_path)))
+        except Exception:
+            pass
+
+        _log(f"Bug report zip: {zip_path} ({files_added} files)")
+        self._live_log_msg(
+            f"已建立除錯包 Bug report created: {os.path.basename(zip_path)} "
+            f"({files_added} files)", "status")
+
     def _do_export(self):
         result = self._live_runner.get_result() if self._live_runner and self._live_runner.state != LiveState.IDLE else self._last_result
         if not result or not result.trades:
@@ -4486,17 +4600,21 @@ class BacktestApp:
             # "查無資料" — no position at all
             self._fill_poll_pos_current = 0
 
-        # Check for position change immediately
+        # Check expected end-state (NOT before/after comparison).
+        # IOC exits fill within milliseconds — baseline may already be 0
+        # before we capture it.  Check the target state directly:
+        #   entry → position != 0 (we have a position now)
+        #   exit  → position == 0 (we're flat now)
         if self._fill_poll_pos_current is not None:
             before = self._fill_poll_pos_before
             current = self._fill_poll_pos_current
-            changed = False
+            confirmed = False
             if self._fill_poll_action_type == "entry":
-                changed = abs(current) > abs(before)
+                confirmed = current != 0
             elif self._fill_poll_action_type == "exit":
-                changed = abs(current) < abs(before)
+                confirmed = current == 0
 
-            if changed:
+            if confirmed:
                 elapsed = time.monotonic() - self._fill_poll_start_time
                 _log(f"FILL POLL: confirmed via OpenInterest! "
                      f"position {before} -> {current} ({elapsed:.1f}s)")
@@ -4530,6 +4648,13 @@ class BacktestApp:
             f"(position={self._fill_poll_pos_before:+d})", "status")
         _log(f"FILL POLL START: type={action_type} "
              f"position_before={self._fill_poll_pos_before}")
+
+        # For exits: if position is already flat, the IOC filled before we
+        # could even read it — confirm immediately (no need to wait 2s)
+        if action_type == "exit" and self._fill_poll_pos_before == 0:
+            _log("FILL POLL: exit already flat — confirming immediately")
+            self._on_fill_confirmed()
+            return
 
         # First OI query after 2s (give exchange time to process IOC order)
         self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
