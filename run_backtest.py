@@ -93,6 +93,7 @@ from src.live.account_monitor import (
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.fill_poller import FillPoller
+from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
 
 # TAIFEX public data (no API key needed)
@@ -1190,32 +1191,6 @@ class BacktestApp:
             ttk.Button(row_b, text=label, width=4,
                        command=lambda d=days: self._set_period(d)).pack(side=tk.LEFT, padx=1)
 
-        # Row 2: BB + SL/TP params
-        row_c = ttk.Frame(sf)
-        row_c.pack(fill=tk.X, pady=2)
-        for lbl, var_name, val, w in [
-            ("BB週期:", "bb_period_var", "20", 6),
-            ("BB Std:", "bb_std_var", "2.0", 6),
-            ("SL Offset:", "sl_offset_var", "20", 6),
-            ("TP Offset:", "tp_offset_var", "50", 6),
-        ]:
-            ttk.Label(row_c, text=lbl).pack(side=tk.LEFT, padx=(8, 2))
-            sv = tk.StringVar(value=val)
-            setattr(self, var_name, sv)
-            ttk.Entry(row_c, textvariable=sv, width=w).pack(side=tk.LEFT, padx=(0, 4))
-
-        # Row 3: ATR params
-        row_d = ttk.Frame(sf)
-        row_d.pack(fill=tk.X, pady=2)
-        for lbl, var_name, val, w in [
-            ("ATR期數:", "atr_period_var", "14", 6),
-            ("SL×ATR:", "sl_mult_var", "1.0", 6),
-            ("TP×ATR:", "tp_mult_var", "0.5", 6),
-        ]:
-            ttk.Label(row_d, text=lbl).pack(side=tk.LEFT, padx=(8, 2))
-            sv = tk.StringVar(value=val)
-            setattr(self, var_name, sv)
-            ttk.Entry(row_d, textvariable=sv, width=w).pack(side=tk.LEFT, padx=(0, 4))
 
     def _build_results_notebook(self, parent):
         notebook = ttk.Notebook(parent)
@@ -2709,13 +2684,6 @@ class BacktestApp:
         try:
             point_value = int(self.pv_var.get())
             initial_balance = int(self.balance_var.get())
-            bb_period = int(self.bb_period_var.get())
-            bb_std = float(self.bb_std_var.get())
-            sl_offset = int(self.sl_offset_var.get())
-            tp_offset = int(self.tp_offset_var.get())
-            atr_period = int(self.atr_period_var.get())
-            sl_mult = float(self.sl_mult_var.get())
-            tp_mult = float(self.tp_mult_var.get())
         except ValueError as e:
             self.status_var.set(f"參數錯誤 Param error: {e}")
             self._enable_buttons()
@@ -2727,24 +2695,7 @@ class BacktestApp:
             self._enable_buttons()
             return
 
-        # Instantiate strategy: AI strategies use defaults, built-in ones use GUI params
-        strategy_name = self.strategy_var.get()
-        if strategy_name.startswith("AI:"):
-            # AI-generated strategies have params baked into __init__ defaults
-            strategy = strategy_cls()
-        elif strategy_cls in (H4BollingerAtrLongStrategy, M1BollingerAtrLongStrategy):
-            strategy = strategy_cls(
-                bb_period=bb_period, bb_std=bb_std,
-                atr_period=atr_period, sl_mult=sl_mult, tp_mult=tp_mult,
-            )
-        else:
-            try:
-                strategy = strategy_cls(
-                    bb_period=bb_period, bb_std=bb_std,
-                    sl_offset=sl_offset, tp_offset=tp_offset,
-                )
-            except TypeError:
-                strategy = strategy_cls()
+        strategy = strategy_cls()
         engine = BacktestEngine(strategy, point_value=point_value)
 
         _log(f"開始回測 Running backtest: {len(bars)} bars, "
@@ -2912,12 +2863,7 @@ class BacktestApp:
             self.trade_tree.heading(c, text=display)
 
     def _chart_kwargs(self) -> dict:
-        try:
-            bb_period = int(self.bb_period_var.get())
-            bb_std = float(self.bb_std_var.get())
-        except ValueError:
-            bb_period, bb_std = 20, 2.0
-        return dict(bb_period=bb_period, bb_std=bb_std)
+        return dict(bb_period=20, bb_std=2.0)
 
     def _show_chart_all(self):
         # Live-updating chart when bot is running on native TF
@@ -3017,113 +2963,45 @@ class BacktestApp:
 
     def _report_issue(self):
         """Collect debug data into a zip and open GitHub new issue page."""
-        import zipfile
         import webbrowser
-        import urllib.parse
-        import platform
-
         from version import APP_VERSION
 
-        # Determine bot directory
         bot_dir = None
         if self._live_runner and hasattr(self._live_runner, "bot_dir"):
             bot_dir = self._live_runner.bot_dir
 
-        # Collect files into zip
-        ts = _taipei_now().strftime("%Y%m%d_%H%M%S")
-        if bot_dir and os.path.isdir(bot_dir):
-            zip_path = os.path.join(bot_dir, f"bug_report_{ts}.zip")
-        else:
-            zip_path = os.path.join("data", f"bug_report_{ts}.zip")
-            os.makedirs("data", exist_ok=True)
-
-        files_added = 0
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Debug logs, decisions, bars, session from bot dir
-            if bot_dir and os.path.isdir(bot_dir):
-                for fname in os.listdir(bot_dir):
-                    fpath = os.path.join(bot_dir, fname)
-                    if not os.path.isfile(fpath):
-                        continue
-                    if fname.endswith((".log", ".csv", ".json")) and not fname.startswith("bug_report"):
-                        zf.write(fpath, fname)
-                        files_added += 1
-
-            # Strategy code (if loaded)
-            if hasattr(self, "_strategy_code") and self._strategy_code:
-                zf.writestr("strategy_code.py", self._strategy_code)
-                files_added += 1
-
-        if files_added == 0:
-            messagebox.showinfo("Report Issue",
-                                "沒有可用的除錯資料\nNo debug data available.\n\n"
-                                "Deploy a bot first to generate logs.")
-            try:
-                os.remove(zip_path)
-            except Exception:
-                pass
-            return
-
-        # Build issue body
         strategy = self.strategy_var.get() if hasattr(self, "strategy_var") else "N/A"
         symbol = self._live_runner.symbol if self._live_runner else "N/A"
         mode = getattr(self, "_trading_mode", "N/A")
         position = self._get_signed_position() if self._live_runner else 0
+        strategy_code = getattr(self, "_strategy_code", None)
 
-        # Last 30 lines of debug log
-        log_tail = ""
-        if _debug_log_file and hasattr(_debug_log_file, "name"):
-            try:
-                with open(_debug_log_file.name, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                    log_tail = "".join(lines[-30:])
-            except Exception:
-                pass
+        report = build_bug_report(
+            bot_dir=bot_dir,
+            strategy=strategy,
+            symbol=symbol,
+            mode=mode,
+            position=position,
+            strategy_code=strategy_code,
+            app_version=APP_VERSION,
+        )
 
-        body = f"""**Version**: v{APP_VERSION}
-**OS**: {platform.platform()}
-**Python**: {platform.python_version()}
-**Strategy**: {strategy}
-**Symbol**: {symbol}
-**Mode**: {mode}
-**Position**: {position:+d}
+        if report is None:
+            messagebox.showinfo("Report Issue",
+                                "沒有可用的除錯資料\nNo debug data available.\n\n"
+                                "Deploy a bot first to generate logs.")
+            return
 
-## Description
-<!-- Describe what happened -->
-
-
-## Recent Log
-```
-{log_tail.strip()}
-```
-
-## Attachments
-Debug zip: `{os.path.basename(zip_path)}` ({files_added} files)
-Please drag-drop the zip file into this issue.
-"""
-
-        # GitHub new issue URL (truncate body if too long for URL)
-        title = f"[Bug] {strategy} on {symbol}"
-        max_body = 6000  # URL length safety
-        if len(body) > max_body:
-            body = body[:max_body] + "\n\n... (truncated, see attached zip)"
-
-        url = (f"https://github.com/ericwu13/tai-robot/issues/new?"
-               f"title={urllib.parse.quote(title)}&"
-               f"body={urllib.parse.quote(body)}")
-
-        # Open browser and file explorer
-        webbrowser.open(url)
-        # Open folder containing the zip so user can drag-drop
+        webbrowser.open(report.issue_url)
         try:
-            os.startfile(os.path.dirname(os.path.abspath(zip_path)))
+            os.startfile(os.path.dirname(os.path.abspath(report.zip_path)))
         except Exception:
             pass
 
-        _log(f"Bug report zip: {zip_path} ({files_added} files)")
+        _log(f"Bug report zip: {report.zip_path} ({report.files_added} files)")
         self._live_log_msg(
-            f"已建立除錯包 Bug report created: {os.path.basename(zip_path)} "
-            f"({files_added} files)", "status")
+            f"已建立除錯包 Bug report created: {os.path.basename(report.zip_path)} "
+            f"({report.files_added} files)", "status")
 
     def _do_export(self):
         result = self._live_runner.get_result() if self._live_runner and self._live_runner.state != LiveState.IDLE else self._last_result
@@ -3547,39 +3425,7 @@ Please drag-drop the zip file into this issue.
         except ValueError:
             point_value = 200
 
-        # Instantiate strategy
-        strategy_name = self.strategy_var.get()
-        if strategy_name.startswith("AI:"):
-            strategy = strategy_cls()
-        else:
-            try:
-                bb_period = int(self.bb_period_var.get())
-                bb_std = float(self.bb_std_var.get())
-                atr_period = int(self.atr_period_var.get())
-                sl_mult = float(self.sl_mult_var.get())
-                tp_mult = float(self.tp_mult_var.get())
-                sl_offset = int(self.sl_offset_var.get())
-                tp_offset = int(self.tp_offset_var.get())
-            except ValueError:
-                bb_period, bb_std = 20, 2.0
-                atr_period, sl_mult, tp_mult = 14, 1.0, 0.5
-                sl_offset, tp_offset = 20, 50
-
-            from src.strategy.examples.h4_bollinger_atr_long import H4BollingerAtrLongStrategy
-            from src.strategy.examples.m1_bollinger_atr_long import M1BollingerAtrLongStrategy
-            if strategy_cls in (H4BollingerAtrLongStrategy, M1BollingerAtrLongStrategy):
-                strategy = strategy_cls(
-                    bb_period=bb_period, bb_std=bb_std,
-                    atr_period=atr_period, sl_mult=sl_mult, tp_mult=tp_mult,
-                )
-            else:
-                try:
-                    strategy = strategy_cls(
-                        bb_period=bb_period, bb_std=bb_std,
-                        sl_offset=sl_offset, tp_offset=tp_offset,
-                    )
-                except TypeError:
-                    strategy = strategy_cls()
+        strategy = strategy_cls()
 
         log_dir = os.path.join(project_root, "data", "live")
         self._live_runner = LiveRunner(
