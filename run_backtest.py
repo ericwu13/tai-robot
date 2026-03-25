@@ -88,6 +88,11 @@ _CODE_GEN_MAX_TOKENS = 65536
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
+from src.live.account_monitor import (
+    AccountMonitor, parse_open_interest, parse_future_rights,
+)
+from src.live.connection_monitor import ConnectionMonitor
+from src.live.fill_poller import FillPoller
 from src.live.session_store import load_session, session_summary
 
 # TAIFEX public data (no API key needed)
@@ -449,15 +454,7 @@ def filter_bars_by_date(
     return [b for b in bars if dt_start <= b.dt < dt_end]
 
 
-def _fmt_money(val: str) -> str:
-    """Format a numeric string with comma separators."""
-    try:
-        n = float(val)
-        if n == int(n):
-            return f"{int(n):,}"
-        return f"{n:,.2f}"
-    except (ValueError, TypeError):
-        return val
+
 
 
 def _log(msg):
@@ -590,59 +587,8 @@ class SKOrderLibEvents:
         _ui_queue.put_nowait(("future_rights", bstrData))
 
 
-def _parse_open_interest(bstr: str) -> dict | None:
-    """Parse OnOpenInterest callback data into a dict.
-
-    Returns None for error/empty codes (001, 970).
-    Fields: market, account, product, side(B/S), qty, daytrade_qty, avg_cost,
-            fee, tax_rate, login_id
-    """
-    vals = bstr.split(",")
-    if len(vals) < 10 or vals[0] in ("001", "970", "980"):
-        return None
-    try:
-        return {
-            "product": vals[2].strip(),
-            "side": vals[3].strip(),        # B=long, S=short
-            "qty": int(vals[4].strip() or 0),
-            "daytrade_qty": int(vals[5].strip() or 0),
-            "avg_cost": vals[6].strip(),
-            "fee": vals[7].strip(),
-            "tax_rate": vals[8].strip(),
-        }
-    except (ValueError, IndexError):
-        return None
-
-
-def _parse_future_rights(bstr: str) -> dict | None:
-    """Parse OnFutureRights callback data into a dict.
-
-    Returns None for sentinel/error codes (##, 970, 980).
-    Key fields: balance, float_pnl, equity, excess_margin, unrealized,
-                orig_margin, maint_margin, maint_rate, currency, available
-    """
-    vals = bstr.split(",")
-    if len(vals) < 35 or vals[0].strip() in ("##", "970", "980"):
-        return None
-    try:
-        return {
-            "balance": vals[0].strip(),         # 帳戶餘額
-            "float_pnl": vals[1].strip(),       # 浮動損益
-            "realized_cost": vals[2].strip(),   # 已實現費用
-            "tax": vals[3].strip(),             # 交易稅
-            "equity": vals[6].strip(),          # 權益數
-            "excess_margin": vals[7].strip(),   # 超額保證金
-            "realized_pnl": vals[11].strip(),   # 期貨平倉損益
-            "unrealized": vals[12].strip(),     # 盤中未實現
-            "orig_margin": vals[13].strip(),    # 原始保證金
-            "maint_margin": vals[14].strip(),   # 維持保證金
-            "maint_rate": vals[24].strip(),     # 維持率
-            "currency": vals[25].strip(),       # 幣別
-            "available": vals[31].strip(),      # 可用餘額
-            "risk": vals[34].strip(),           # 風險指標
-        }
-    except (ValueError, IndexError):
-        return None
+_parse_open_interest = parse_open_interest  # re-export from account_monitor
+_parse_future_rights = parse_future_rights  # re-export from account_monitor
 
 
 class BacktestApp:
@@ -748,16 +694,13 @@ class BacktestApp:
                 elif kind == "open_interest":
                     parsed = _parse_open_interest(data)
                     if parsed:
-                        # Accumulate positions (callback fires once per position)
-                        self._real_positions.append(parsed)
+                        self._account_monitor.add_position(parsed)
                         self._update_real_account_display()
                     else:
                         first = data.split(",")[0].strip() if data else ""
                         if first == "001":
-                            # No open positions
-                            self._real_positions.clear()
+                            self._account_monitor.set_flat()
                             self.real_pos_var.set("Flat (無持倉)")
-                        # Ignore ## sentinel and error codes
                     _log(f"未平倉 OpenInterest: {data}")
                     # Fill polling: track position from OI callbacks
                     if self._trading_guard.fill_pending and self._live_runner:
@@ -765,7 +708,7 @@ class BacktestApp:
                 elif kind == "future_rights":
                     parsed = _parse_future_rights(data)
                     if parsed:
-                        self._real_rights = parsed
+                        self._account_monitor.update_rights(parsed)
                         try:
                             self._update_real_account_display()
                         except Exception as e:
@@ -793,9 +736,6 @@ class BacktestApp:
     #  CONNECTION MONITORING & RECONNECTION
     # ══════════════════════════════════════════════════════════════
 
-    _RECONNECT_DELAYS = [5, 10, 20, 30, 60]  # seconds, escalating backoff
-    _MAX_RECONNECT_ATTEMPTS = 10
-
     def _on_disconnected(self):
         """Handle connection loss: pause live feed, start auto-reconnect."""
         if not self._quote_connected:
@@ -813,7 +753,7 @@ class BacktestApp:
             self._live_log_msg("斷線 Connection lost — pausing tick feed", "status")
 
         # Start auto-reconnect
-        self._reconnect_attempt = 0
+        self._conn_monitor.on_disconnected()
         self._schedule_reconnect()
 
     def _manual_reconnect(self):
@@ -825,73 +765,41 @@ class BacktestApp:
 
         self._quote_connected = False
         self.btn_reconnect.config(state=tk.DISABLED)
-        self.status_var.set("手動重連中 Manual reconnecting...")
+        action = self._conn_monitor.on_manual_reconnect()
+        self.status_var.set(action.message)
         self.login_status_var.set("重連中 Reconnecting...")
         _log("手動重連 Manual reconnect triggered")
 
-        # Reset attempt counter and try immediately
-        self._reconnect_attempt = 0
         self._attempt_reconnect()
 
     def _schedule_reconnect(self):
-        """Schedule the next reconnection attempt with exponential backoff.
+        """Schedule the next reconnection attempt via ConnectionMonitor."""
+        action = self._conn_monitor.schedule_next(
+            has_live_runner=bool(self._live_runner),
+            market_open=is_market_open(),
+            secs_until_open=seconds_until_market_open(),
+        )
+        self._execute_reconnect_action(action)
 
-        During off-market hours, defers reconnection until ~2 min before
-        the next session opens to avoid wasting attempts on idle connections
-        that the server will drop.
-        """
-        if self._reconnect_attempt >= self._MAX_RECONNECT_ATTEMPTS:
-            # Check if we should defer to next market open instead of giving up
-            secs = seconds_until_market_open()
-            if secs > 0 and self._live_runner:
-                # Market closed — schedule one final attempt near market open
-                defer_secs = max(secs - 120, 60)  # 2 min before open, min 1 min
-                defer_mins = defer_secs // 60
-                self._reconnect_attempt = 0  # reset counter for fresh cycle
-                msg = (f"休市中 Market closed — reconnecting in ~{defer_mins}m "
-                       f"(before next session)")
-                self.btn_reconnect.config(state=tk.NORMAL)
-                self.status_var.set(msg)
-                _log(msg)
-                self._live_log_msg(msg, "status")
-                self._reconnect_timer_id = self.root.after(
-                    defer_secs * 1000, self._attempt_reconnect)
-                return
+    def _execute_reconnect_action(self, action):
+        """Thin dispatcher: execute a ReconnectAction from ConnectionMonitor."""
+        self.status_var.set(action.message)
+        _log(action.message)
 
-            msg = "自動重連失敗 Auto-reconnect failed — use Reconnect or Login button"
+        if action.type == "give_up":
             self.btn_reconnect.config(state=tk.NORMAL)
-            self.status_var.set(msg)
-            _log(msg)
             if self._live_runner:
-                self._live_log_msg(msg, "status")
+                self._live_log_msg(action.message, "status")
             return
 
-        # During off-market hours, don't burn attempts — defer to near market open
-        if not is_market_open() and self._live_runner:
-            secs = seconds_until_market_open()
-            if secs > 120:  # more than 2 min until market open
-                defer_secs = max(secs - 120, 60)
-                defer_mins = defer_secs // 60
-                msg = (f"休市中 Market closed — deferring reconnect ~{defer_mins}m "
-                       f"(before next session)")
-                self.status_var.set(msg)
-                _log(msg)
-                self._live_log_msg(msg, "status")
-                self._reconnect_timer_id = self.root.after(
-                    defer_secs * 1000, self._attempt_reconnect)
-                return
-
-        idx = min(self._reconnect_attempt, len(self._RECONNECT_DELAYS) - 1)
-        delay = self._RECONNECT_DELAYS[idx]
-        self._reconnect_attempt += 1
-
-        msg = f"重連中 Reconnecting in {delay}s (attempt {self._reconnect_attempt}/{self._MAX_RECONNECT_ATTEMPTS})..."
-        self.status_var.set(msg)
-        _log(msg)
-        if self._live_runner:
-            self._live_log_msg(msg, "status")
-
-        self._reconnect_timer_id = self.root.after(delay * 1000, self._attempt_reconnect)
+        if action.type in ("defer_to_market", "attempt"):
+            if action.type == "defer_to_market":
+                self.btn_reconnect.config(state=tk.NORMAL)
+            if self._live_runner:
+                self._live_log_msg(action.message, "status")
+            self._reconnect_timer_id = self.root.after(
+                action.delay_seconds * 1000, self._attempt_reconnect)
+            return
 
     def _attempt_reconnect(self):
         """Try to re-login and reconnect to quote service."""
@@ -899,7 +807,7 @@ class BacktestApp:
         if self._quote_connected:
             return  # already reconnected (e.g. by manual login)
 
-        _log(f"嘗試重連 Attempting reconnect #{self._reconnect_attempt}")
+        _log(f"嘗試重連 Attempting reconnect #{self._conn_monitor.attempt}")
 
         try:
             if not _com_available:
@@ -955,7 +863,7 @@ class BacktestApp:
 
     def _on_reconnected(self):
         """Handle successful reconnection: re-subscribe ticks if live bot is running."""
-        self._reconnect_attempt = 0
+        self._conn_monitor.on_connected()
         if self._reconnect_timer_id:
             self.root.after_cancel(self._reconnect_timer_id)
             self._reconnect_timer_id = None
@@ -972,9 +880,6 @@ class BacktestApp:
                 except Exception as e:
                     _log(f"商品資料重載失敗 Commodity reload failed: {e}")
             self._resubscribe_ticks()
-
-    _RESUBSCRIBE_MAX_RETRIES = 3
-    _RESUBSCRIBE_RETRY_DELAY = 5000  # ms
 
     def _resubscribe_ticks(self, _retry: int = 0):
         """Re-subscribe to tick feed after reconnection."""
@@ -996,12 +901,11 @@ class BacktestApp:
             if code != 0 and code >= 3000:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
-                if _retry < self._RESUBSCRIBE_MAX_RETRIES:
-                    self._live_log_msg(
-                        f"重試訂閱 Retrying tick subscribe in {self._RESUBSCRIBE_RETRY_DELAY // 1000}s "
-                        f"(attempt {_retry + 1}/{self._RESUBSCRIBE_MAX_RETRIES})...", "status")
+                retry_action = self._conn_monitor.should_retry_resubscribe(_retry)
+                if retry_action:
+                    self._live_log_msg(retry_action.message, "status")
                     next_retry = _retry + 1
-                    self.root.after(self._RESUBSCRIBE_RETRY_DELAY,
+                    self.root.after(retry_action.delay_seconds * 1000,
                                    lambda r=next_retry: self._resubscribe_ticks(r))
                 return
 
@@ -1053,7 +957,7 @@ class BacktestApp:
         self._order_confirm_timer_id = None  # countdown timer
         self._trading_guard = TradingGuard()  # safety checks for real orders
         # Reconnection state
-        self._reconnect_attempt: int = 0
+        self._conn_monitor = ConnectionMonitor()
         self._reconnect_timer_id = None
         self._tick_watchdog = TickWatchdog()  # tick health monitoring
         self._live_poll_id = None  # root.after() id for cancellation
@@ -1071,15 +975,11 @@ class BacktestApp:
         self._last_real_order_side: int | None = None  # 0=BUY, 1=SELL, None=unknown
         # Real position tracking and safety checks live in self._trading_guard
         # Real account data from API
-        self._real_positions: list[dict] = []
-        self._real_rights: dict = {}
+        self._account_monitor = AccountMonitor()
         self._real_account_poll_id = None
         # Fill confirmation polling (auto mode) — uses OpenInterest position change
+        self._fill_poller = FillPoller(self._trading_guard)
         self._fill_poll_timer_id = None
-        self._fill_poll_start_time: float = 0
-        self._fill_poll_pos_before: int = 0   # signed position qty before order
-        self._fill_poll_pos_current: int | None = None  # latest from OI callback
-        self._fill_poll_action_type: str = ""
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -3612,7 +3512,7 @@ Please drag-drop the zip file into this issue.
             # Refresh real positions synchronously
             try:
                 user_id = self.login_user_var.get().strip()
-                self._real_positions.clear()
+                self._account_monitor.clear_positions()
                 skO.GetOpenInterestGW(user_id, self._futures_account, 1)
                 # Drain UI queue to process the callback
                 self.root.update_idletasks()
@@ -3621,9 +3521,9 @@ Please drag-drop the zip file into this issue.
             except Exception as e:
                 _log(f"部署前持倉查詢失敗 Pre-deploy position check failed: {e}")
 
-            if self._real_positions:
+            if self._account_monitor.positions:
                 pos_parts = []
-                for p in self._real_positions:
+                for p in self._account_monitor.positions:
                     side = "多 LONG" if p["side"] == "B" else "空 SHORT"
                     pos_parts.append(f"{side} x{p['qty']} {p['product']}")
                 pos_str = ", ".join(pos_parts)
@@ -4447,9 +4347,9 @@ Please drag-drop the zip file into this issue.
             return
 
         # Margin check for new positions (entries)
-        if action_type == "entry" and self._real_rights:
+        if action_type == "entry" and self._account_monitor.rights:
             try:
-                available = float(self._real_rights.get("available", "0"))
+                available = float(self._account_monitor.rights.get("available", "0"))
                 symbol = self._live_runner.symbol if self._live_runner else ""
                 cfg = _SYMBOL_CONFIG.get(symbol, {})
                 required = cfg.get("init_margin", 0)
@@ -4558,207 +4458,115 @@ Please drag-drop the zip file into this issue.
     # Instead we poll GetOpenInterestGW — the OnOpenInterest callback reliably
     # reflects position changes within a few seconds.
 
-    _FILL_POLL_TIMEOUT = 10.0  # seconds to wait for fill confirmation
-
     def _get_signed_position(self) -> int:
-        """Get the current signed position qty for the live symbol.
-
-        Positive = long, negative = short, 0 = flat.
-        Uses _real_positions which is populated by OnOpenInterest callbacks.
-        """
+        """Get the current signed position qty for the live symbol."""
         if not self._live_runner:
             return 0
         order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
             "order_symbol", "")
-        # OpenInterest product is like "TM04", order symbol is "TM0000"
-        # Match on first 2 chars (e.g., "TM")
         prefix = order_sym[:2] if order_sym else ""
-        if not prefix:
-            return 0
-        for p in self._real_positions:
-            if p.get("product", "").startswith(prefix):
-                qty = p.get("qty", 0)
-                return qty if p.get("side") == "B" else -qty
-        return 0  # flat
+        return self._account_monitor.get_signed_position(prefix)
 
     def _update_fill_poll_position(self, raw_data: str, parsed: dict | None) -> None:
-        """Track position changes from OnOpenInterest during fill polling.
-
-        Called from _drain_ui_queue for every open_interest event while
-        fill_pending is True.  Updates _fill_poll_pos_current and triggers
-        confirmation if position changed.
-        """
+        """Track position changes from OnOpenInterest during fill polling."""
         order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
             "order_symbol", "")
         prefix = order_sym[:2] if order_sym else ""
 
-        if parsed and parsed.get("product", "").startswith(prefix):
-            qty = parsed.get("qty", 0)
-            signed = qty if parsed.get("side") == "B" else -qty
-            self._fill_poll_pos_current = signed
-        elif raw_data.strip().startswith("001"):
-            # "查無資料" — no position at all
-            self._fill_poll_pos_current = 0
-
-        # Check expected end-state (NOT before/after comparison).
-        # IOC exits fill within milliseconds — baseline may already be 0
-        # before we capture it.  Check the target state directly:
-        #   entry → position != 0 (we have a position now)
-        #   exit  → position == 0 (we're flat now)
-        if self._fill_poll_pos_current is not None:
-            before = self._fill_poll_pos_before
-            current = self._fill_poll_pos_current
-            confirmed = False
-            if self._fill_poll_action_type == "entry":
-                confirmed = current != 0
-            elif self._fill_poll_action_type == "exit":
-                confirmed = current == 0
-
-            if confirmed:
-                elapsed = time.monotonic() - self._fill_poll_start_time
-                _log(f"FILL POLL: confirmed via OpenInterest! "
-                     f"position {before} -> {current} ({elapsed:.1f}s)")
-                # Cancel pending timer and confirm
+        signed = self._account_monitor.update_fill_poll_position(
+            raw_data, parsed, prefix)
+        if signed is not None:
+            result = self._fill_poller.on_position_update(signed)
+            if result and result.type == "confirmed":
+                _log(f"FILL POLL: confirmed via OpenInterest! {result.message}")
                 if self._fill_poll_timer_id:
                     self.root.after_cancel(self._fill_poll_timer_id)
                 self._on_fill_confirmed()
 
     def _start_fill_polling(self, action_type: str) -> None:
-        """Start polling OpenInterest for position change after order sent.
+        """Start polling OpenInterest for position change after order sent."""
+        com_ok = _com_available and skO is not None and bool(self._futures_account)
+        action = self._fill_poller.start(
+            action_type, self._get_signed_position(), com_available=com_ok)
 
-        OnOpenInterest reflects position changes within ~4 seconds,
-        much faster and more reliable than GetFulfillReport.
-        """
-        if not _com_available or skO is None or not self._futures_account:
-            _log("FILL POLL: COM unavailable, skipping fill confirmation")
-            self._trading_guard.on_fill_confirmed()
-            if action_type == "entry":
-                self._trading_guard.on_entry_sent()
-            elif action_type == "exit":
-                self._trading_guard.on_exit_sent()
+        if action.type == "no_com":
+            _log(f"FILL POLL: {action.message}")
             return
 
-        self._fill_poll_pos_before = self._get_signed_position()
-        self._fill_poll_pos_current = None
-        self._fill_poll_action_type = action_type
-        self._fill_poll_start_time = time.monotonic()
-
-        self._live_log_msg(
-            f"等待成交確認 Waiting for {action_type} fill confirmation "
-            f"(position={self._fill_poll_pos_before:+d})", "status")
+        self._live_log_msg(action.message, "status")
         _log(f"FILL POLL START: type={action_type} "
-             f"position_before={self._fill_poll_pos_before}")
+             f"position_before={self._fill_poller.pos_before}")
 
-        # For exits: if position is already flat, the IOC filled before we
-        # could even read it — confirm immediately (no need to wait 2s)
-        if action_type == "exit" and self._fill_poll_pos_before == 0:
+        if action.type == "already_confirmed":
             _log("FILL POLL: exit already flat — confirming immediately")
             self._on_fill_confirmed()
             return
 
-        # First OI query after 2s (give exchange time to process IOC order)
-        self._fill_poll_timer_id = self.root.after(2000, self._poll_fill_confirmation)
+        self._fill_poll_timer_id = self.root.after(
+            action.delay_ms, self._poll_fill_confirmation)
 
     def _poll_fill_confirmation(self) -> None:
         """Request fresh OpenInterest and check for position change."""
         if not self._trading_guard.fill_pending:
-            return  # already resolved (e.g., stopped or confirmed via callback)
+            return  # already resolved
 
-        elapsed = time.monotonic() - self._fill_poll_start_time
+        action = self._fill_poller.check_poll()
 
-        # Check timeout first
-        if elapsed >= self._FILL_POLL_TIMEOUT:
-            pos = self._fill_poll_pos_current
-            _log(f"FILL POLL: TIMEOUT after {elapsed:.1f}s, "
-                 f"position: {self._fill_poll_pos_before} -> {pos}")
+        if action.type == "timeout":
+            _log(f"FILL POLL: TIMEOUT — {action.message}")
             self._on_fill_timeout()
             return
 
-        # Request fresh position data — result arrives via OnOpenInterest
-        # callback → _drain_ui_queue → _update_fill_poll_position
+        # Request fresh position data via COM
         try:
             user_id = self.login_user_var.get().strip()
             skO.GetOpenInterestGW(user_id, self._futures_account, 1)
         except Exception as e:
             _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
-        pos = self._fill_poll_pos_current
-        _log(f"FILL POLL: pending... position={pos} "
-             f"(baseline={self._fill_poll_pos_before}, {elapsed:.1f}s elapsed)")
-
-        # Schedule next poll
-        self._fill_poll_timer_id = self.root.after(3000, self._poll_fill_confirmation)
+        _log(f"FILL POLL: {action.message}")
+        self._fill_poll_timer_id = self.root.after(
+            action.delay_ms, self._poll_fill_confirmation)
 
     def _on_fill_confirmed(self) -> None:
         """Called when fill is confirmed via OpenInterest position change."""
         self._fill_poll_timer_id = None
-        action_type = self._fill_poll_action_type
-
-        self._trading_guard.on_fill_confirmed()
-        # NOW do the deferred state transition
-        if action_type == "entry":
-            self._trading_guard.on_entry_sent()
-        elif action_type == "exit":
-            self._trading_guard.on_exit_sent()
+        result = self._fill_poller.confirm()
 
         # Get actual fill price from OpenInterest
         fill_price = ""
-        pos = self._fill_poll_pos_current
+        pos = self._fill_poller.pos_current
         if pos is not None and pos != 0 and self._live_runner:
             order_sym = _SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
                 "order_symbol", "")
             prefix = order_sym[:2] if order_sym else ""
-            for p in self._real_positions:
+            for p in self._account_monitor.positions:
                 if p.get("product", "").startswith(prefix):
                     fill_price = p.get("avg_cost", "")
                     break
 
         price_str = f" @{float(fill_price):,.1f}" if fill_price else ""
         self._live_log_msg(
-            f"成交已確認 {action_type.upper()} fill confirmed{price_str}", "entry")
-        self._log_order_decision("FILL_CONFIRMED", f"{action_type}{price_str}")
+            f"{result.message}{price_str}", "entry")
+        self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
         if _discord and _discord.enabled:
-            _discord.fill_confirmed(action_type, fill_price)
+            _discord.fill_confirmed(result.action_type, fill_price)
 
     def _on_fill_timeout(self) -> None:
-        """Called when fill confirmation times out.
-
-        Instead of halting (blocking all orders), fall back to semi-auto mode
-        so the strategy can still generate exit signals. New entries require
-        manual confirmation via dialog; exits auto-send if a real entry was
-        assumed to have filled.
-        """
+        """Called when fill confirmation times out — downgrade to semi-auto."""
         self._fill_poll_timer_id = None
-        action_type = self._fill_poll_action_type
+        result = self._fill_poller.timeout()
 
-        # Clear fill pending state — do NOT halt
-        self._trading_guard.fill_pending = False
-        self._trading_guard.fill_pending_type = ""
+        self._trading_mode = result.new_trading_mode
+        self.trading_mode_var.set("\u26a0 半自動 Semi-Auto (降級 downgraded)")
 
-        # Assume the order DID fill (conservative for position safety):
-        #   entry timeout → assume we have a position → allow exits
-        #   exit timeout  → assume we closed → prevent double exits
-        if action_type == "entry":
-            self._trading_guard.on_entry_sent()   # real_entry_confirmed = True
-        elif action_type == "exit":
-            self._trading_guard.on_exit_sent()     # real_entry_confirmed = False
-
-        # Downgrade to semi-auto: exits still auto-send, entries need confirmation
-        self._trading_mode = "semi_auto"
-        self.trading_mode_var.set("⚠ 半自動 Semi-Auto (降級 downgraded)")
-
-        timeout = self._FILL_POLL_TIMEOUT
-        msg = (f"成交超時 Fill timeout: {action_type} not confirmed after "
-               f"{timeout:.0f}s — 降級為半自動 downgraded to semi-auto. "
-               f"策略仍可出場 Strategy exits still active, "
-               f"新進場需手動確認 new entries require confirmation.")
-        self._live_log_msg(msg, "exit")
+        self._live_log_msg(result.message, "exit")
         self._log_order_decision(
             "FILL_TIMEOUT_DOWNGRADE",
-            f"{action_type} timeout {timeout:.0f}s → semi_auto")
-        _log(f"FILL POLL DOWNGRADE: {msg}")
+            f"{result.action_type} timeout {result.timeout_seconds:.0f}s → {result.new_trading_mode}")
+        _log(f"FILL POLL DOWNGRADE: {result.message}")
         if _discord and _discord.enabled:
-            _discord.fill_timeout_downgrade(action_type, timeout)
+            _discord.fill_timeout_downgrade(result.action_type, result.timeout_seconds)
 
         try:
             import winsound
@@ -4797,9 +4605,9 @@ Please drag-drop the zip file into this issue.
         symbol = self._live_runner.symbol
         order_symbol = _resolve_order_symbol(symbol)
         # Priority: real API position > last real order > simulated broker
-        if self._real_positions:
+        if self._account_monitor.positions:
             # Use real position from API
-            pos = self._real_positions[0]
+            pos = self._account_monitor.positions[0]
             buy_sell = 1 if pos["side"] == "B" else 0  # B(long)→SELL, S(short)→BUY
         elif self._last_real_order_side is not None:
             buy_sell = 1 - self._last_real_order_side
@@ -4831,7 +4639,7 @@ Please drag-drop the zip file into this issue.
             return
         user_id = self.login_user_var.get().strip()
         try:
-            self._real_positions.clear()  # will be rebuilt from callbacks
+            self._account_monitor.clear_positions()  # will be rebuilt from callbacks
             skO.GetOpenInterestGW(user_id, self._futures_account, 1)
             skO.GetFutureRights(user_id, self._futures_account, 1)  # 1=TWD
             # Synchronous order/fill queries
@@ -4861,95 +4669,59 @@ Please drag-drop the zip file into this issue.
             self._real_account_poll_id = None
 
     def _update_real_account_display(self):
-        """Update the real account UI labels from parsed data."""
-        # Positions
-        if self._real_positions:
-            parts = []
-            for p in self._real_positions:
-                side = "LONG" if p["side"] == "B" else "SHORT"
-                parts.append(f"{side} x{p['qty']} {p['product']} @{p['avg_cost']}")
-            self.real_pos_var.set(" | ".join(parts))
-        # Equity / balance
-        r = self._real_rights
-        if r:
-            self.real_equity_var.set(f"{_fmt_money(r.get('equity', '--'))}")
-            self.real_available_var.set(f"{_fmt_money(r.get('available', '--'))}")
-            self.real_pnl_var.set(f"{_fmt_money(r.get('float_pnl', '--'))}")
-            self.real_realized_var.set(f"{_fmt_money(r.get('realized_pnl', '--'))}")
-            # Fee + Tax combined, and Net P&L
-            try:
-                realized = int(float(r.get('realized_pnl', '0') or '0'))
-                fee = int(float(r.get('realized_cost', '0') or '0'))
-                tax = int(float(r.get('tax', '0') or '0'))
-                float_pnl = int(float(r.get('float_pnl', '0') or '0'))
-                self.real_fees_var.set(f"{fee + tax:,} ({fee:,}+{tax:,})")
-                # Net = realized P&L - fees - tax + floating
-                net = realized - fee - tax + float_pnl
-                self.real_net_var.set(f"{net:+,}")
-                # Update daily loss limit display and check
-                guard = self._trading_guard
-                if self._trading_mode in ("semi_auto", "auto") and guard.daily_loss_limit > 0:
-                    if guard.paused:
-                        self.real_loss_limit_var.set(
-                            f"{net:+,} / -{guard.daily_loss_limit:,} [已暫停 PAUSED]")
-                    else:
-                        self.real_loss_limit_var.set(
-                            f"{net:+,} / -{guard.daily_loss_limit:,}")
-                    triggered = guard.update_pnl(net)
-                    if triggered:
-                        self._live_log_msg(
-                            f"已達每日虧損上限 Daily loss limit: net={net:+,} "
-                            f"< -{guard.daily_loss_limit:,} NTD — 實單暫停 orders paused",
-                            "exit")
-                        if _discord and _discord.enabled:
-                            _discord.daily_loss_limit(net, guard.daily_loss_limit)
+        """Update the real account UI labels from AccountMonitor computed data."""
+        d = self._account_monitor.compute_display()
+        if d.position_text:
+            self.real_pos_var.set(d.position_text)
+        if not self._account_monitor.rights:
+            return
+        self.real_equity_var.set(d.equity)
+        self.real_available_var.set(d.available)
+        self.real_pnl_var.set(d.float_pnl)
+        self.real_realized_var.set(d.realized_pnl)
+        if d.valid:
+            self.real_fees_var.set(d.fees)
+            self.real_net_var.set(d.net_pnl)
+            # Daily loss limit display and check
+            guard = self._trading_guard
+            if self._trading_mode in ("semi_auto", "auto") and guard.daily_loss_limit > 0:
+                net = d.net_pnl_int
+                if guard.paused:
+                    self.real_loss_limit_var.set(
+                        f"{net:+,} / -{guard.daily_loss_limit:,} [已暫停 PAUSED]")
                 else:
-                    self.real_loss_limit_var.set("--")
-            except (ValueError, TypeError):
-                self.real_fees_var.set(f"{r.get('realized_cost', '--')}+{r.get('tax', '--')}")
-                self.real_net_var.set("--")
-            maint = r.get("maint_rate", "--")
-            self.real_maint_var.set(f"{maint}%")
+                    self.real_loss_limit_var.set(
+                        f"{net:+,} / -{guard.daily_loss_limit:,}")
+                triggered = guard.update_pnl(net)
+                if triggered:
+                    self._live_log_msg(
+                        f"已達每日虧損上限 Daily loss limit: net={net:+,} "
+                        f"< -{guard.daily_loss_limit:,} NTD — 實單暫停 orders paused",
+                        "exit")
+                    if _discord and _discord.enabled:
+                        _discord.daily_loss_limit(net, guard.daily_loss_limit)
+            else:
+                self.real_loss_limit_var.set("--")
+        else:
+            self.real_fees_var.set(d.fees)
+            self.real_net_var.set(d.net_pnl)
+        self.real_maint_var.set(d.maint_rate)
 
     def _parse_and_display_fills(self, fills_raw, label="成交"):
-        """Parse GetFulfillReport/GetOrderReport result and display."""
-        # COM may return (string, code) tuple or just string
-        if isinstance(fills_raw, (tuple, list)):
-            fills_raw = fills_raw[0] if fills_raw else ""
-        if not fills_raw or not isinstance(fills_raw, str):
+        """Parse fills and display via AccountMonitor."""
+        if not fills_raw:
             _log(f"{label}(raw type): {type(fills_raw)}")
             return
-        lines = [l.strip() for l in fills_raw.split("\n") if l.strip()]
-        if not lines or lines[0].startswith("001") or lines[0].startswith("##"):
+        result = self._account_monitor.parse_fills(fills_raw, label)
+        if result.count == 0:
             if "成交" in label:
                 self.real_fills_var.set("無成交 No trades today")
             return
-        # Parse FulfillReport(4) fields: [8]=product [15]=B/S [19]=price [20]=qty [21]=N/O [22]=session [23]=date
-        parsed_fills = []
-        for line in lines:
-            fields = line.split(",")
-            if len(fields) >= 24:
-                side = fields[15].strip()
-                price = fields[19].strip()
-                qty = fields[20].strip()
-                new_close = fields[21].strip()  # N=new, O=close/offset
-                date = fields[23].strip()
-                side_str = "BUY" if side == "B" else "SELL"
-                nc_str = "開" if new_close == "N" else "平"
-                try:
-                    price_f = float(price)
-                    parsed_fills.append(f"{date} {side_str}{nc_str} x{qty} @{price_f:,.1f}")
-                except ValueError:
-                    parsed_fills.append(f"{date} {side_str}{nc_str} x{qty} @{price}")
         if "成交" in label:
-            self.real_fills_var.set(f"{len(parsed_fills)} 筆 trades")
-        # Log new trades to live event log (only once, not on every poll)
-        count_key = f"_prev_{label}_count"
-        prev_count = getattr(self, count_key, 0)
-        if self._live_runner and len(parsed_fills) > prev_count:
-            for fill in parsed_fills[prev_count:]:
+            self.real_fills_var.set(f"{result.count} 筆 trades")
+        if self._live_runner and result.new_entries:
+            for fill in result.new_entries:
                 self._live_log_msg(f"實{label}: {fill}", "entry")
-        setattr(self, count_key, len(parsed_fills))
 
     def _log_order_decision(self, action: str, reason: str) -> None:
         """Log a real-order event to the CSV decision log."""
@@ -5027,7 +4799,7 @@ Please drag-drop the zip file into this issue.
         if self._reconnect_timer_id:
             self.root.after_cancel(self._reconnect_timer_id)
             self._reconnect_timer_id = None
-        self._reconnect_attempt = 0
+        self._conn_monitor.reset()
 
         if self._warmup_timeout_id:
             self.root.after_cancel(self._warmup_timeout_id)
@@ -5037,7 +4809,7 @@ Please drag-drop the zip file into this issue.
             self._fill_poll_timer_id = None
         if self._trading_guard.fill_pending:
             self._live_log_msg(
-                f"警告: 停止時有未確認成交 WARNING: {self._fill_poll_action_type} "
+                f"警告: 停止時有未確認成交 WARNING: {self._fill_poller.action_type} "
                 f"fill pending during stop. Check position manually.", "exit")
         self._live_warmup_mode = False
         self._live_polling = False

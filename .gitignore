@@ -27,11 +27,8 @@ logs/
 *.db
 backtest_trades_*.csv
 
-# Keep OHLC data files
-!data/*.csv
-
 # Live runtime logs
-data/live/
+data/
 
 # Broker order dumps
 order_data.csv

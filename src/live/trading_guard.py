@@ -209,7 +209,7 @@ class TradingGuard:
         """Return order parameters based on action type.
 
         - entry: IOC (cancel if no immediate fill), sNewClose=0 (new only)
-        - exit:  ROD (stay until filled), sNewClose=1 (close only)
+        - exit:  ROD (stay until filled), sNewClose=2 (auto — avoids 980 if already flat)
         """
         if action_type == "entry":
             return {"trade_type": 1, "new_close": 0}  # IOC, new
