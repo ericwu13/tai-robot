@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from run_backtest import BacktestApp
+from src.market_data.kline_config import detect_tv_source_tz
 
 
 def _make_df(datetimes, tz=None):
@@ -43,16 +43,16 @@ def _tz_bars(tz_name, *hm_pairs):
 
 class TestGuardCases:
     def test_none_df(self):
-        assert BacktestApp._detect_tv_source_tz(None) is None
+        assert detect_tv_source_tz(None) is None
 
     def test_empty_df(self):
         df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         df.index = pd.DatetimeIndex([])
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
     def test_single_row(self):
         df = _make_df([datetime(2026, 3, 16, 9, 0)])  # 09:00 TWT, valid
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result is None  # TWT passes (no gap bars)
 
 
@@ -62,12 +62,12 @@ class TestAlreadyTWT:
     def test_day_session_bars(self):
         """Bars at valid day session times should detect as TWT."""
         df = _make_df(_twt_bars((8, 45), (9, 45), (10, 45), (11, 45), (12, 45)))
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
     def test_night_session_bars(self):
         """Bars at valid night session times should detect as TWT."""
         df = _make_df(_twt_bars((15, 0), (16, 0), (20, 0), (23, 0), (0, 0), (3, 0), (4, 0)))
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
     def test_full_session(self):
         """Day + night session bars, all valid TWT."""
@@ -75,7 +75,7 @@ class TestAlreadyTWT:
             (8, 45), (9, 45), (10, 45), (11, 45), (12, 45),
             (15, 0), (16, 0), (20, 0), (0, 0), (4, 0),
         ))
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
 
 # ── Gap boundary edge cases ──────────────────────────────────────────────────
@@ -86,23 +86,23 @@ class TestGapBoundaries:
     def test_0500_not_in_gap(self):
         """05:00 TWT (t=300) is the night session close — NOT in gap."""
         df = _make_df(_twt_bars((4, 0), (5, 0)))  # valid night bars
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
     def test_0501_in_gap(self):
         """05:01 TWT (t=301) IS in gap — TWT candidate should fail."""
         df = _make_df([datetime(2026, 3, 16, 5, 1)])
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result is not None  # TWT fails
 
     def test_0845_not_in_gap(self):
         """08:45 TWT (t=525) is day session open — NOT in gap."""
         df = _make_df(_twt_bars((8, 45),))
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
     def test_0844_in_gap(self):
         """08:44 TWT (t=524) IS in gap."""
         df = _make_df([datetime(2026, 3, 16, 8, 44)])
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result is not None
 
     def test_1345_not_in_gap(self):
@@ -110,18 +110,18 @@ class TestGapBoundaries:
         df = _make_df(_twt_bars((12, 45), (13, 45)))
         # 13:45 is technically past the last bar open (12:45 for 60min)
         # but t=825 is NOT >= 826, so it passes
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
     def test_1346_in_gap(self):
         """13:46 TWT (t=826) IS in gap."""
         df = _make_df([datetime(2026, 3, 16, 13, 46)])
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result is not None
 
     def test_1500_not_in_gap(self):
         """15:00 TWT (t=900) is night session open — NOT in gap."""
         df = _make_df(_twt_bars((15, 0),))
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
 
 # ── America/Los_Angeles ──────────────────────────────────────────────────────
@@ -139,7 +139,7 @@ class TestLosAngeles:
             datetime(2026, 1, 6, 6, 0),     # -> 22:00 TWT — but 06:00 as TWT is in gap!
             datetime(2026, 1, 6, 7, 0),     # -> 23:00 TWT — but 07:00 as TWT is in gap!
         ])
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result == ZoneInfo("America/Los_Angeles")
 
     def test_pdt_summer(self):
@@ -149,7 +149,7 @@ class TestLosAngeles:
             datetime(2026, 7, 6, 18, 45),   # -> 09:45 TWT
             datetime(2026, 7, 7, 7, 0),     # -> 22:00 TWT — 07:00 as TWT is in gap
         ])
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result == ZoneInfo("America/Los_Angeles")
 
     def test_dst_spring_forward(self):
@@ -160,7 +160,7 @@ class TestLosAngeles:
             datetime(2026, 3, 8, 17, 45),   # PDT: 08:45 TWT Mar 9
             datetime(2026, 3, 9, 8, 0),     # PDT night bar — 08:00 as TWT is in gap
         ])
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result == ZoneInfo("America/Los_Angeles")
 
 
@@ -179,7 +179,7 @@ class TestUTC:
             datetime(2026, 3, 16, 1, 45),   # -> 09:45 TWT
             datetime(2026, 3, 16, 14, 30),  # fails TWT (gap) and LA (gap), passes UTC
         ])
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result == ZoneInfo("UTC")
 
     def test_utc_rejected_before_la(self):
@@ -188,7 +188,7 @@ class TestUTC:
         # 09:00 as TWT: valid. As LA→TWT: 09+16=25=01:00 TWT (valid).
         # As UTC→TWT: 09+8=17:00 (valid). TWT passes first.
         df = _make_df(_twt_bars((9, 0), (10, 0), (15, 0)))
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result is None  # TWT wins
 
 
@@ -201,7 +201,7 @@ class TestTzAware:
             [datetime(2026, 3, 16, 16, 45), datetime(2026, 3, 16, 17, 45)],
             tz="America/Los_Angeles",
         )
-        result = BacktestApp._detect_tv_source_tz(df)
+        result = detect_tv_source_tz(df)
         assert result is None
 
     def test_tz_aware_utc(self):
@@ -209,7 +209,7 @@ class TestTzAware:
             [datetime(2026, 3, 16, 0, 45)],
             tz="UTC",
         )
-        assert BacktestApp._detect_tv_source_tz(df) is None
+        assert detect_tv_source_tz(df) is None
 
 
 # ── Fallback ─────────────────────────────────────────────────────────────────
