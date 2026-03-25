@@ -386,18 +386,23 @@ class LiveRunner:
 
             if side == OrderSide.LONG:
                 if limit is not None and price >= limit:
-                    fill_price = limit
+                    fill_price = limit  # TP: fill at intended limit price
                 elif stop is not None and price <= stop:
-                    fill_price = stop
+                    fill_price = price  # SL: fill at actual tick (market price)
             elif side == OrderSide.SHORT:
                 if limit is not None and price <= limit:
-                    fill_price = limit
+                    fill_price = limit  # TP: fill at intended limit price
                 elif stop is not None and price >= stop:
-                    fill_price = stop
+                    fill_price = price  # SL: fill at actual tick (market price)
 
             if fill_price is not None:
                 self.broker._current_bar_dt = tick_dt
-                self.broker._close_position(order.tag, fill_price, self._bar_index)
+                # Use _bar_index - 1 (last processed bar's idx).
+                # _bar_index was already incremented past current bar;
+                # using it directly causes _check_for_trade_close to
+                # match the NEXT bar and fire a duplicate TRADE_CLOSE.
+                self.broker._close_position(
+                    order.tag, fill_price, self._bar_index - 1)
                 # Log and save
                 last_trade = self.broker.trades[-1]
                 # Create a minimal bar for logging (use TWT time)
