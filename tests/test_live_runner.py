@@ -598,12 +598,12 @@ class TestCheckTickExit:
         assert runner.broker.trades[-1].pnl > 0
 
     def test_sl_fills_at_tick_price(self, tmp_path):
-        """Tick price <= SL stop should trigger immediate exit at SL price."""
+        """Tick price <= SL stop should trigger exit at the actual tick price."""
         runner = self._make_runner_with_position(tmp_path, tp_price=22600, sl_price=22450)
 
         result = runner.check_tick_exit(22440, "2026-02-25 09:31:30")
         assert result is not None
-        assert result["price"] == 22450  # fills at stop, not tick price
+        assert result["price"] == 22440  # fills at tick (market) price, not stop level
         assert runner.broker.position_size == 0
         assert runner.broker.trades[-1].pnl < 0
 
