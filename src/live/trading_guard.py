@@ -214,4 +214,4 @@ class TradingGuard:
         if action_type == "entry":
             return {"trade_type": 1, "new_close": 0}  # IOC, new
         else:
-            return {"trade_type": 0, "new_close": 1}  # ROD, close
+            return {"trade_type": 0, "new_close": 2}  # ROD, auto (exchange decides)

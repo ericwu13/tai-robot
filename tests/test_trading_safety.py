@@ -132,7 +132,7 @@ class TestDecideExitSent:
         verdict, details = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
         assert verdict == g.SEND_EXIT
         assert details["buy_sell"] == 1  # sell to close long
-        assert details["new_close"] == 1  # close-only
+        assert details["new_close"] == 2  # auto (exchange decides)
 
     def test_force_close_sent_with_real_entry(self):
         g = TradingGuard()
@@ -140,7 +140,7 @@ class TestDecideExitSent:
         verdict, details = g.decide("auto", "FORCE_CLOSE", "SHORT")
         assert verdict == g.SEND_EXIT
         assert details["buy_sell"] == 0  # buy to close short
-        assert details["new_close"] == 1
+        assert details["new_close"] == 2  # auto
 
     def test_exit_resets_entry_flag_via_on_exit_sent(self):
         """After SEND_EXIT, calling on_exit_sent() should block next exit."""
@@ -225,21 +225,22 @@ class TestDecideNewClose:
         g = TradingGuard()
         g.on_entry_sent()
         _, d = g.decide("auto", "TRADE_CLOSE", "LONG")
-        assert d["new_close"] == 1  # close only
+        assert d["new_close"] == 2  # auto
 
-    def test_never_auto_newclose(self):
-        """No decide() call should ever return new_close=2."""
+    def test_entry_never_auto_newclose(self):
+        """Entry orders should always use new_close=0 (new position only)."""
         g = TradingGuard()
         for mode in ("semi_auto", "auto"):
-            for action in ("ENTRY_FILL",):
-                _, d = g.decide(mode, action, "LONG")
-                assert d["new_close"] != 2, f"{mode}/{action}"
+            _, d = g.decide(mode, "ENTRY_FILL", "LONG")
+            assert d["new_close"] == 0, f"{mode}/ENTRY_FILL"
 
+    def test_exit_uses_auto_newclose(self):
+        """Exit orders use new_close=2 (auto) to avoid 980 when already flat."""
+        g = TradingGuard()
         g.on_entry_sent()
-        for mode in ("semi_auto", "auto"):
-            for action in ("TRADE_CLOSE", "FORCE_CLOSE"):
-                _, d = g.decide(mode, action, "LONG")
-                assert d["new_close"] != 2, f"{mode}/{action}"
+        for action in ("TRADE_CLOSE", "FORCE_CLOSE"):
+            _, d = g.decide("auto", action, "LONG")
+            assert d["new_close"] == 2, f"auto/{action}"
 
 
 # ── TradingGuard: margin check ──
@@ -376,7 +377,7 @@ class TestScenarioAutoFullCycle:
         verdict, d = g.decide("auto", "TRADE_CLOSE", "LONG")
         assert verdict == g.SEND_EXIT
         assert d["buy_sell"] == 1
-        assert d["new_close"] == 1
+        assert d["new_close"] == 2  # auto
         g.on_exit_sent()
 
         assert g.real_entry_confirmed is False
