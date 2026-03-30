@@ -1,6 +1,7 @@
-"""Aggregate 1-min bars into N-min bars using time-aligned boundaries.
+"""Aggregate 1-min bars into N-min bars using session-aligned boundaries.
 
-Same midnight-based alignment as BarBuilder, but bar-to-bar instead of tick-to-bar.
+Uses session start (08:45 AM / 15:00 Night) as epoch instead of midnight,
+so bar boundaries align naturally with TAIFEX trading sessions.
 """
 
 from __future__ import annotations
@@ -8,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from ..market_data.models import Bar
+from ..market_data.sessions import session_align
 
 
 class BarAggregator:
@@ -28,11 +30,8 @@ class BarAggregator:
         self._current_start: datetime | None = None
 
     def _align_time(self, dt: datetime) -> datetime:
-        """Align datetime to the target bar boundary (midnight-based)."""
-        epoch = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        seconds = int((dt - epoch).total_seconds())
-        aligned = (seconds // self._interval) * self._interval
-        return epoch + timedelta(seconds=aligned)
+        """Align datetime to the target bar boundary (session-start-based)."""
+        return session_align(dt, self._interval)
 
     def on_bar(self, bar: Bar) -> Bar | None:
         """Process an incoming bar. Returns a completed aggregated bar if boundary crossed."""

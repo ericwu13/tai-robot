@@ -447,12 +447,12 @@ class TestAggregateBars:
         assert result[1].dt == datetime(2026, 3, 1, 9, 15)
 
     def test_aggregate_bars_1m_to_1h(self):
-        # 120 bars from 09:00-10:59 → 2 completed hourly bars
-        bars = _make_1m_bars("2026-03-01", 540, 120)
+        # 120 bars from 08:45-10:44 → session-aligned 1H boundaries at 08:45, 09:45
+        bars = _make_1m_bars("2026-03-02", 525, 120)  # 525 min = 08:45
         result = aggregate_bars(bars, 3600)
         assert len(result) == 2
-        assert result[0].dt == datetime(2026, 3, 1, 9, 0)
-        assert result[1].dt == datetime(2026, 3, 1, 10, 0)
+        assert result[0].dt == datetime(2026, 3, 2, 8, 45)
+        assert result[1].dt == datetime(2026, 3, 2, 9, 45)
 
 
 class TestLiveRunner1mBars:
