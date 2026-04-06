@@ -3661,11 +3661,20 @@ class BacktestApp:
                f"({decision['reason']})")
         self._live_log_msg(msg, tag)
 
-        # Push trade marker to live chart on trade close
-        if action == "TRADE_CLOSE" and self._live_chart and self._live_chart.is_alive:
+        # Push trade marker to live chart on trade close (including force close)
+        if action in ("TRADE_CLOSE", "FORCE_CLOSE") and self._live_chart and self._live_chart.is_alive:
             if self._live_runner and self._live_runner.broker.trades:
                 trades = self._live_runner.broker.trades
                 self._live_chart.push_trade(trades[-1], len(trades) - 1)
+
+        # Refresh trade detail tree on close events
+        if action in ("TRADE_CLOSE", "FORCE_CLOSE") and self._live_runner:
+            try:
+                result = self._live_runner.get_result()
+                bars = self._live_runner.get_bars()
+                self._display_results(result, bars)
+            except Exception:
+                pass
 
         # Semi-auto / Auto: handle real orders on fills
         if self._trading_mode in ("semi_auto", "auto") and action in ("ENTRY_FILL", "TRADE_CLOSE", "FORCE_CLOSE"):

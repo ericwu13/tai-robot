@@ -151,7 +151,9 @@ def plot_backtest(
 
     # Create chart
     chart = Chart(title=chart_title, width=1280, height=720)
-    chart.legend(visible=True)
+    chart.legend(visible=True, ohlc=True, percent=True, lines=True,
+                 font_size=13)
+    chart.precision(0)  # TAIFEX prices are integers
     chart.layout(background_color='#1e1e1e', text_color='#d4d4d4')
     chart.grid(color='rgba(255,255,255,0.06)')
     chart.candle_style(
@@ -342,7 +344,9 @@ class LiveChart:
 
         # Create chart
         chart = Chart(title=self._title, width=1280, height=720)
-        chart.legend(visible=True)
+        chart.legend(visible=True, ohlc=True, percent=True, lines=True,
+                     font_size=13)
+        chart.precision(0)  # TAIFEX prices are integers
         chart.layout(background_color='#1e1e1e', text_color='#d4d4d4')
         chart.grid(color='rgba(255,255,255,0.06)')
         chart.candle_style(
