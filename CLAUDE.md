@@ -48,6 +48,7 @@ python test_kline.py       # COM-based KLine history GUI
 - Trade sessions: 0=Full Session, 1=AM Session
 - KLine data format: "MM/DD/YYYY HH:MM, Open, High, Low, Close, Volume"
 - Data arrives synchronously within RequestKLineAMByDate call
+- **Bar timestamp convention**: COM API returns intraday N-min bars labeled by their CLOSE time (e.g. an AM 60-min bar covering 12:45–13:45 arrives as `13:45`). Everywhere else in this codebase (BarBuilder/BarAggregator/`is_last_bar_of_session`/strategies) `bar.dt` is the bar OPEN time. `parse_kline_strings()` auto-detects close-time labels and shifts them to open-time so downstream code sees a single convention. Do NOT undo this normalization without rewriting every consumer.
 
 ## Conventions
 - Python 3.13+ on Windows 11
