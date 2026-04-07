@@ -2741,6 +2741,39 @@ class BacktestApp:
         # Build trade summary for AI context
         report = format_report(result.strategy_name, result.metrics)
 
+        # Resolve strategy class early so we can include timeframe metadata
+        strategy_name = self.strategy_var.get()
+        strategy_cls = STRATEGIES.get(strategy_name)
+
+        # Build explicit timeframe header so the AI does not mis-infer the bar
+        # interval from session-aligned :45 timestamps (e.g. 09:45/10:45/13:45
+        # for 60-min AM bars look like 15-min bars to a naive reader).
+        timeframe_line = ""
+        if strategy_cls is not None:
+            kt = getattr(strategy_cls, "kline_type", 0)
+            km = getattr(strategy_cls, "kline_minute", 0)
+            if kt == 0 and km:
+                if km % 60 == 0:
+                    label = f"{km // 60}-hour ({km}-minute)"
+                else:
+                    label = f"{km}-minute"
+                timeframe_line = (
+                    f"策略時框 Strategy Timeframe: {label} bars "
+                    f"(kline_type={kt}, kline_minute={km})\n"
+                )
+            elif kt == 4:
+                timeframe_line = f"策略時框 Strategy Timeframe: Daily bars (kline_type={kt})\n"
+            elif kt == 5:
+                timeframe_line = f"策略時框 Strategy Timeframe: Weekly bars (kline_type={kt})\n"
+            elif kt == 6:
+                timeframe_line = f"策略時框 Strategy Timeframe: Monthly bars (kline_type={kt})\n"
+        timeframe_line += (
+            "時區 Timezone: 所有 entry/exit 時間皆為台灣時間 (TWT/UTC+8)。\n"
+            "All entry/exit timestamps are Taiwan time (TWT/UTC+8). "
+            "Bars are TAIFEX session-aligned, so 60-minute AM bars may carry "
+            ":45 timestamps (08:45–13:45 session) — these are NOT 15-minute bars.\n"
+        )
+
         # Include individual trade details (cap at 100 trades for token budget)
         trade_lines = []
         for i, t in enumerate(result.trades[:100], 1):
@@ -2758,8 +2791,6 @@ class BacktestApp:
 
         # Resolve strategy source code for AI context
         strategy_source = ""
-        strategy_name = self.strategy_var.get()
-        strategy_cls = STRATEGIES.get(strategy_name)
         if self._ai_strategy_source and strategy_name.startswith("AI:"):
             strategy_source = self._ai_strategy_source
         elif strategy_cls:
@@ -2785,6 +2816,7 @@ class BacktestApp:
             f"Below are the backtest/live results. Analyze the trading performance "
             f"based on the strategy source code and suggest improvements.\n\n"
             f"{report}\n\n"
+            f"{timeframe_line}\n"
             f"交易明細 Trade Details:\n" + "\n".join(trade_lines)
             + source_section
         )

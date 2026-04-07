@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import csv
+import logging
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..market_data.models import Bar
+
+_log = logging.getLogger(__name__)
 
 
 _DATE_FORMATS = [
@@ -20,6 +24,94 @@ _DATE_FORMATS = [
 ]
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
+
+# TAIFEX session boundaries in minutes-from-midnight TWT
+# (kept local to avoid a circular import with src.market_data.sessions)
+_DAY_OPEN = 8 * 60 + 45    # 08:45 = 525
+_DAY_CLOSE = 13 * 60 + 45  # 13:45 = 825
+_NIGHT_OPEN = 15 * 60      # 15:00 = 900
+_NIGHT_CLOSE = 5 * 60      # 05:00 = 300
+
+
+def _detect_label_convention(bars: list[Bar], interval_seconds: int) -> str:
+    """Detect whether intraday Bars are labeled by their open-time or close-time.
+
+    Capital's COM KLine API (SKQuoteLib_RequestKLineAMByDate) returns N-minute
+    bars whose timestamp is the bar's CLOSE time. The rest of this codebase
+    (BarBuilder, BarAggregator, is_last_bar_of_session, every test) assumes
+    bar.dt is the OPEN time. Without normalization, strategies that filter by
+    `bar.dt.hour` or call `is_last_bar_of_session()` end up off by one
+    interval on COM-API data.
+
+    Detection rule (unambiguous on TAIFEX):
+      - Any bar whose dt lands EXACTLY on a session OPEN  (08:45 or 15:00) → 'open'
+      - Any bar whose dt lands EXACTLY on a session CLOSE (13:45 or 05:00) → 'close'
+    Open-time labeled bars produce timestamps at session opens (08:45/15:00) and
+    NEVER at session closes (13:45/05:00); close-time labeled bars produce the
+    inverse. The two patterns cannot coexist for the same data source.
+
+    Args:
+        bars: parsed Bar list (any order, any count).
+        interval_seconds: bar interval in seconds (only intraday matters; daily
+            and above are returned as 'unknown' since they have no time-of-day).
+
+    Returns:
+        'open', 'close', or 'unknown'.
+    """
+    if interval_seconds <= 0 or interval_seconds >= 86400:
+        return "unknown"
+
+    saw_open = False
+    saw_close = False
+    for b in bars:
+        if b.dt is None:
+            continue
+        m = b.dt.hour * 60 + b.dt.minute
+        if m == _DAY_OPEN or m == _NIGHT_OPEN:
+            saw_open = True
+        elif m == _DAY_CLOSE or m == _NIGHT_CLOSE:
+            saw_close = True
+        # Early exit once both signals are found (the first one wins, but this
+        # also surfaces a contradiction for the warning below).
+        if saw_open and saw_close:
+            break
+
+    if saw_open and not saw_close:
+        return "open"
+    if saw_close and not saw_open:
+        return "close"
+    if saw_open and saw_close:
+        # Pathological: same data set has both open- and close-aligned bars.
+        # Refuse to guess; let the caller log + leave bars untouched.
+        _log.warning(
+            "KLine label convention is ambiguous (data has bars at BOTH "
+            "session opens AND session closes). Leaving timestamps unchanged."
+        )
+        return "unknown"
+    return "unknown"
+
+
+def normalize_bar_label_to_open(bars: list[Bar], interval_seconds: int) -> list[Bar]:
+    """Return *bars* with timestamps shifted to OPEN-time labeling if needed.
+
+    This is a no-op when the data is already open-time labeled or when the
+    convention can't be determined.
+    """
+    if not bars:
+        return bars
+    convention = _detect_label_convention(bars, interval_seconds)
+    if convention != "close":
+        return bars
+
+    delta = timedelta(seconds=interval_seconds)
+    shifted = [replace(b, dt=b.dt - delta) for b in bars]
+    _log.info(
+        "Normalized %d KLine bars from CLOSE-time to OPEN-time labeling "
+        "(interval=%ds). The COM API labels intraday N-minute bars by their "
+        "close time; this codebase expects bar.dt = bar open time.",
+        len(bars), interval_seconds,
+    )
+    return shifted
 
 
 def _detect_date_format(dt_str: str) -> str | None:
@@ -41,6 +133,9 @@ def parse_kline_strings(
     """Parse multiple KLine data strings into a sorted list of Bars.
 
     Auto-detects date format on first line, then reuses it for all lines.
+    Auto-normalizes Capital COM-API close-time labels to open-time labels so
+    that downstream code (BarAggregator, is_last_bar_of_session, strategies
+    that read bar.dt.hour) sees the same convention as live BarBuilder bars.
     """
     if not lines:
         return []
@@ -82,6 +177,7 @@ def parse_kline_strings(
                 print(f"[data_loader] FAILED to parse line {i}: {line!r}")
 
     bars.sort(key=lambda b: b.dt)
+    bars = normalize_bar_label_to_open(bars, interval)
     return bars
 
 
