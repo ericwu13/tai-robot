@@ -137,6 +137,14 @@ class MyStrategy(BacktestStrategy):
 ## Bar
 - Fields: symbol, dt(datetime), open/high/low/close/volume(int), interval(int seconds)
 - **bar.dt is in Taiwan time (TWT / UTC+8)** — never assume UTC
+- **bar.dt is the bar's OPEN time**, not its close. A 60-min AM bar with \
+  `bar.dt = 12:45` covers 12:45–13:45 (the LAST bar of the AM session). \
+  Hour-of-day filters must reason about open hours: \
+  to block "the last 2 hours of the AM session" use `bar.dt.hour in (11, 12)` \
+  (bars opening at 11:45 and 12:45), NOT `(12, 13)`. Same for night: the \
+  last 2 night bars open at 03:00 and 04:00, NOT 04:00 and 05:00. \
+  `is_last_bar_of_session(bar.dt, kline_minute)` is the safe way to detect \
+  the actual session-close bar without manual hour math.
 
 ## BrokerContext API
 - `broker.position_size` -> int (0=flat, always >= 0, no direction info — track yourself)
