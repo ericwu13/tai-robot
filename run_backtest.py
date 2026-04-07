@@ -2727,27 +2727,25 @@ class BacktestApp:
             self.status_var.set(f"已匯出 Exported: {path}")
             _log(f"匯出交易 Exported trades to {path}")
 
-    def _review_trades(self):
-        """Feed backtest/live results into AI chat for strategy review."""
-        result = (self._live_runner.get_result()
-                  if self._live_runner and self._live_runner.state != LiveState.IDLE
-                  else self._last_result)
-        if not result or not result.trades:
-            self.status_var.set("無交易紀錄 No trades to review")
-            return
-        if not self._ensure_chat_client():
-            return
+    # Threshold (characters) above which AI Review switches from a single-shot
+    # to multi-message chunked mode. 600_000 chars ≈ 150K tokens (≈ 4 chars/token),
+    # comfortable for 1M-context models (Gemini 2.5 Pro, Claude Opus/Sonnet 1M)
+    # with room for the strategy source, system prompt, and response.
+    # Covers every realistic backtest up to ~5000 trades in single-shot mode;
+    # beyond that, chunking automatically engages.
+    _REVIEW_SINGLE_SHOT_CHAR_LIMIT = 600_000
 
-        # Build trade summary for AI context
-        report = format_report(result.strategy_name, result.metrics)
+    # Trades per batch in chunked mode. Tuned so each batch is roughly
+    # 150K chars (37K tokens) — fits comfortably in even 200K-context models.
+    _REVIEW_CHUNK_BATCH_SIZE = 1500
 
-        # Resolve strategy class early so we can include timeframe metadata
-        strategy_name = self.strategy_var.get()
-        strategy_cls = STRATEGIES.get(strategy_name)
+    def _build_review_timeframe_line(self, strategy_cls) -> str:
+        """Return the Strategy Timeframe + Timezone note for AI Review prompts.
 
-        # Build explicit timeframe header so the AI does not mis-infer the bar
-        # interval from session-aligned :45 timestamps (e.g. 09:45/10:45/13:45
-        # for 60-min AM bars look like 15-min bars to a naive reader).
+        Explicit here so the AI does not mis-infer the bar interval from
+        session-aligned :45 timestamps (e.g. 09:45/10:45/13:45 for 60-min
+        AM bars can look like 15-min bars to a naive reader).
+        """
         timeframe_line = ""
         if strategy_cls is not None:
             kt = getattr(strategy_cls, "kline_type", 0)
@@ -2773,10 +2771,69 @@ class BacktestApp:
             "Bars are TAIFEX session-aligned, so 60-minute AM bars may carry "
             ":45 timestamps (08:45–13:45 session) — these are NOT 15-minute bars.\n"
         )
+        return timeframe_line
 
-        # Include individual trade details (cap at 100 trades for token budget)
+    def _resolve_strategy_source(self, strategy_name: str, strategy_cls) -> str:
+        """Resolve the strategy source code for the AI Review context."""
+        if self._ai_strategy_source and strategy_name.startswith("AI:"):
+            return self._ai_strategy_source
+        if strategy_cls:
+            source = self._strategy_store.load_source(strategy_cls.__name__)
+            if source:
+                return source
+            try:
+                return inspect.getsource(strategy_cls)
+            except (TypeError, OSError):
+                pass
+        return ""
+
+    def _review_trades(self):
+        """Feed backtest/live results into AI chat for strategy review.
+
+        Two delivery modes depending on data size:
+
+        - **Single-shot** (default): the entire review context (report +
+          timeframe + all trades + strategy source) is sent as one user
+          message. Used when the estimated context fits within
+          ``_REVIEW_SINGLE_SHOT_CHAR_LIMIT``, which covers every realistic
+          backtest up to ~5000 trades.
+
+        - **Chunked**: for backtests whose trade list would overflow the
+          single-shot budget (long-horizon 1-min strategies, etc.), trades
+          are split into batches of ``_REVIEW_CHUNK_BATCH_SIZE``. The AI
+          receives the report/strategy source + the first batch with an
+          instruction to acknowledge and wait, each middle batch with the
+          same acknowledge-and-wait pattern, and the final batch with an
+          explicit instruction to now analyze all trades together. This
+          preserves full context no matter how many trades there are.
+        """
+        result = (self._live_runner.get_result()
+                  if self._live_runner and self._live_runner.state != LiveState.IDLE
+                  else self._last_result)
+        if not result or not result.trades:
+            self.status_var.set("無交易紀錄 No trades to review")
+            return
+        if not self._ensure_chat_client():
+            return
+
+        # Build report + timeframe line + strategy source
+        report = format_report(result.strategy_name, result.metrics)
+        strategy_name = self.strategy_var.get()
+        strategy_cls = STRATEGIES.get(strategy_name)
+        timeframe_line = self._build_review_timeframe_line(strategy_cls)
+        strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
+
+        source_section = ""
+        if strategy_source:
+            source_section = (
+                f"\n\n策略原始碼 Strategy Source Code:\n"
+                f"```python\n{strategy_source}\n```"
+            )
+
+        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
+        # handle thousands of rows; chunked mode below handles the rest.
         trade_lines = []
-        for i, t in enumerate(result.trades[:100], 1):
+        for i, t in enumerate(result.trades, 1):
             bars_held = t.exit_bar_index - t.entry_bar_index
             entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
             exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
@@ -2786,45 +2843,54 @@ class BacktestApp:
                 f"exit={exit_dt} @{t.exit_price:,} "
                 f"P&L={t.pnl:+,} ({bars_held} bars)"
             )
-        if len(result.trades) > 100:
-            trade_lines.append(f"  ... ({len(result.trades) - 100} more trades omitted)")
 
-        # Resolve strategy source code for AI context
-        strategy_source = ""
-        if self._ai_strategy_source and strategy_name.startswith("AI:"):
-            strategy_source = self._ai_strategy_source
-        elif strategy_cls:
-            # Try saved strategies first, then built-in via inspect
-            source = self._strategy_store.load_source(strategy_cls.__name__)
-            if source:
-                strategy_source = source
-            else:
-                try:
-                    strategy_source = inspect.getsource(strategy_cls)
-                except (TypeError, OSError):
-                    pass
-
-        source_section = ""
-        if strategy_source:
-            source_section = (
-                f"\n\n策略原始碼 Strategy Source Code:\n"
-                f"```python\n{strategy_source}\n```"
-            )
-
-        context = (
+        preamble = (
             f"以下是回測/實盤結果，請根據策略原始碼分析交易表現並提出優化建議。\n"
             f"Below are the backtest/live results. Analyze the trading performance "
             f"based on the strategy source code and suggest improvements.\n\n"
             f"{report}\n\n"
             f"{timeframe_line}\n"
-            f"交易明細 Trade Details:\n" + "\n".join(trade_lines)
+        )
+
+        # Estimate context size to decide single-shot vs chunked mode
+        trade_block_chars = sum(len(line) + 1 for line in trade_lines)  # +1 for newline
+        estimated_total = (
+            len(preamble)
+            + len("交易明細 Trade Details (XXX trades):\n")
+            + trade_block_chars
+            + len(source_section)
+            + 256  # safety slack
+        )
+
+        if estimated_total <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
+            self._review_trades_single_shot(
+                preamble=preamble,
+                trade_lines=trade_lines,
+                source_section=source_section,
+                total_trades=len(result.trades),
+            )
+        else:
+            self._review_trades_chunked(
+                preamble=preamble,
+                trade_lines=trade_lines,
+                source_section=source_section,
+                total_trades=len(result.trades),
+                estimated_chars=estimated_total,
+            )
+
+    def _review_trades_single_shot(self, preamble: str, trade_lines: list[str],
+                                     source_section: str, total_trades: int) -> None:
+        """Send the full AI Review in a single API call."""
+        context = (
+            preamble
+            + f"交易明細 Trade Details ({total_trades} trades):\n"
+            + "\n".join(trade_lines)
             + source_section
         )
 
-        # Send as user message to the AI
         self._append_chat("user", "AI Review: 請分析以下交易紀錄\n" + context)
         self.btn_send.config(state=tk.DISABLED)
-        self._append_chat("system", "Analyzing trades...")
+        self._append_chat("system", f"Analyzing {total_trades} trades...")
 
         def _worker():
             try:
@@ -2832,6 +2898,128 @@ class BacktestApp:
                 self.root.after(0, lambda: self._on_chat_response(response))
             except Exception as e:
                 _log(f"Review error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+                err_msg = str(e)
+                self.root.after(0, lambda: self._on_chat_error(err_msg))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _review_trades_chunked(self, preamble: str, trade_lines: list[str],
+                                 source_section: str, total_trades: int,
+                                 estimated_chars: int) -> None:
+        """Send AI Review in multiple user messages when the trade list is too large.
+
+        Flow:
+        1. **Part 1** — preamble + timeframe + strategy source + trades 1..N +
+           "acknowledge and wait" instruction. The AI is told to reply with a
+           single fixed acknowledgement and not provide any analysis yet.
+        2. **Middle parts** — only the next batch of trades + the same
+           acknowledge-and-wait instruction.
+        3. **Final part** — the last batch of trades + an explicit instruction
+           that all data has been delivered and the AI should now analyze.
+
+        Only the final assistant response is rendered as the review output;
+        intermediate acknowledgements are logged briefly for visibility.
+        """
+        batch_size = self._REVIEW_CHUNK_BATCH_SIZE
+        batches = [
+            trade_lines[i:i + batch_size]
+            for i in range(0, len(trade_lines), batch_size)
+        ]
+        K = len(batches)
+
+        # GUI feedback: a single summary bubble rather than repeating every batch
+        summary_line = (
+            f"AI Review: 請分析以下交易紀錄 "
+            f"({total_trades} trades, ~{estimated_chars // 1000}K chars, "
+            f"split into {K} parts for API size safety)"
+        )
+        self._append_chat("user", summary_line)
+        self.btn_send.config(state=tk.DISABLED)
+        self._append_chat(
+            "system",
+            f"Sending {total_trades} trades to AI in {K} parts "
+            f"({batch_size} trades/part). Final analysis arrives after part {K}."
+        )
+
+        def _worker():
+            try:
+                for batch_idx, batch in enumerate(batches, 1):
+                    is_first = (batch_idx == 1)
+                    is_last = (batch_idx == K)
+                    start_n = (batch_idx - 1) * batch_size + 1
+                    end_n = min(batch_idx * batch_size, total_trades)
+                    batch_text = "\n".join(batch)
+
+                    if is_first:
+                        # First part carries ALL metadata (report + timeframe +
+                        # strategy source) so the AI has full context from turn 1.
+                        msg = (
+                            preamble
+                            + f"交易明細 Trade Details — Part {batch_idx}/{K} "
+                              f"(trades {start_n}–{end_n} of {total_trades}):\n"
+                            + batch_text
+                            + source_section
+                            + f"\n\n**重要 IMPORTANT — Multi-part AI Review**: "
+                            f"This is part {batch_idx} of {K}. I will send "
+                            f"{K - 1} more batch(es) of trade data before asking "
+                            f"for analysis. Please reply with EXACTLY this single "
+                            f"line and nothing else:\n"
+                            f"`Acknowledged part {batch_idx}/{K}, waiting for part "
+                            f"{batch_idx + 1}.`\n"
+                            f"Do NOT provide any analysis until you receive the "
+                            f"final part."
+                        )
+                    elif is_last:
+                        msg = (
+                            f"交易明細 Trade Details — Part {batch_idx}/{K} "
+                            f"(trades {start_n}–{end_n} of {total_trades}):\n"
+                            + batch_text
+                            + f"\n\n**最終批次 FINAL PART — Part {batch_idx}/{K}**. "
+                            f"You have now received all {total_trades} trades "
+                            f"across {K} parts.\n\n"
+                            f"Please provide your complete analysis based on:\n"
+                            f"1. The backtest report (performance metrics, sent in part 1)\n"
+                            f"2. The strategy source code (sent in part 1)\n"
+                            f"3. All {total_trades} individual trades (parts 1..{K})\n\n"
+                            f"請根據完整資料分析交易表現並提出優化建議。"
+                        )
+                    else:
+                        msg = (
+                            f"交易明細 Trade Details — Part {batch_idx}/{K} "
+                            f"(trades {start_n}–{end_n} of {total_trades}):\n"
+                            + batch_text
+                            + f"\n\n**中間批次 MIDDLE PART {batch_idx}/{K}**. "
+                            f"Please reply with EXACTLY this single line and "
+                            f"nothing else:\n"
+                            f"`Acknowledged part {batch_idx}/{K}, waiting for "
+                            f"part {batch_idx + 1}.`\n"
+                            f"Do NOT provide any analysis yet."
+                        )
+
+                    self.root.after(
+                        0,
+                        lambda b=batch_idx, k=K:
+                            self.status_var.set(f"AI Review: sending part {b}/{k}...")
+                    )
+
+                    response = self._chat_client.send_message(msg)
+
+                    if is_last:
+                        # Final response is the real analysis
+                        self.root.after(0, lambda r=response: self._on_chat_response(r))
+                    else:
+                        # Log a short ack line for visibility, no big chat bubble
+                        ack_preview = response.strip().split("\n", 1)[0][:120]
+                        self.root.after(
+                            0,
+                            lambda p=ack_preview, b=batch_idx, k=K:
+                                self._append_chat(
+                                    "system",
+                                    f"[AI Review part {b}/{k} ack] {p}",
+                                )
+                        )
+            except Exception as e:
+                _log(f"Review chunked error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 err_msg = str(e)
                 self.root.after(0, lambda: self._on_chat_error(err_msg))
 
