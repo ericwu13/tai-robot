@@ -34,7 +34,17 @@ class BarAggregator:
         return session_align(dt, self._interval)
 
     def on_bar(self, bar: Bar) -> Bar | None:
-        """Process an incoming bar. Returns a completed aggregated bar if boundary crossed."""
+        """Process an incoming bar. Returns a completed aggregated bar if boundary crossed.
+
+        Pass-through for 1-min target: the incoming 1-min bar IS already the
+        target size, so return it immediately. Without this fast path every
+        1-min bar would be held as _current and only emitted on the NEXT
+        bar's arrival, leaving the chart and strategy permanently 1 bar
+        behind real time (issue #44).
+        """
+        if self._interval == 60:
+            return bar
+
         bar_time = self._align_time(bar.dt)
 
         if self._current is None:

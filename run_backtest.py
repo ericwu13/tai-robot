@@ -2640,7 +2640,13 @@ class BacktestApp:
             self._live_chart.close()
             self._live_chart = None
 
-        bars = self._live_runner.get_bars()
+        bars = list(self._live_runner.get_bars())
+        # Include the aggregator's in-progress bar so the chart's latest bar
+        # reflects the CURRENT timeframe, not the one that last finalized
+        # (issue #44 — user saw H1 chart stuck an hour behind).
+        partial = self._live_runner.get_partial_bar()
+        if partial is not None:
+            bars.append(partial)
         result = self._live_runner.get_result()
         trades = list(result.trades)
         strategy_name = self.strategy_var.get()
@@ -3847,14 +3853,16 @@ class BacktestApp:
                     "status",
                 )
 
-            # Push updates to live chart
+            # Push updates to live chart.
+            # Always poll the aggregator's in-progress bar (if any) so the
+            # chart shows the NEW partial immediately after a boundary cross,
+            # not 1 minute later when the next 1-min bar arrives (issue #44).
             if self._live_history_done and self._live_chart and self._live_chart.is_alive:
                 if agg_bar is not None:
                     self._live_chart.push_bar(agg_bar)
-                else:
-                    partial = self._live_runner.get_partial_bar()
-                    if partial:
-                        self._live_chart.push_partial(partial)
+                partial = self._live_runner.get_partial_bar()
+                if partial is not None:
+                    self._live_chart.push_partial(partial)
 
             if agg_bar is not None and self._live_history_done:
                 self._live_log_msg(

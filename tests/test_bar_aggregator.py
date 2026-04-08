@@ -345,3 +345,76 @@ class TestBarAggregatorEdgeCases:
         agg.on_bar(_bar("2026-03-02 09:00"))
         result = agg.flush()
         assert result.interval == 3600
+
+
+# ── Regression: issue #44 — 1-min pass-through ──
+
+class TestBarAggregator1mPassThrough:
+    """Regression tests for issue #44.
+
+    Before the fix, BarAggregator(target_interval=60) held each incoming
+    1-min bar as ``_current`` and only returned it when the NEXT 1-min bar
+    arrived — leaving the live chart and strategy permanently 1 bar behind
+    real time. The fix passes 1-min bars through immediately.
+    """
+
+    def test_single_bar_returns_immediately(self):
+        """First 1-min bar must be returned on the same on_bar() call."""
+        agg = BarAggregator("TX00", 60)
+        bar = _bar("2026-03-02 09:00", o=100, h=110, l=90, c=105, v=10)
+        result = agg.on_bar(bar)
+        assert result is not None
+        assert result.dt == datetime(2026, 3, 2, 9, 0)
+        assert result.close == 105
+
+    def test_sequential_bars_all_returned_immediately(self):
+        """Each 1-min bar in sequence returns without lag."""
+        agg = BarAggregator("TX00", 60)
+        returned = []
+        for m in range(5):
+            bar = _bar(f"2026-03-02 09:{m:02d}", c=100 + m)
+            r = agg.on_bar(bar)
+            assert r is not None, f"bar {m} was held instead of emitted"
+            returned.append(r)
+        # Each bar returned matches the input (no lag)
+        assert [r.dt.minute for r in returned] == [0, 1, 2, 3, 4]
+        assert [r.close for r in returned] == [100, 101, 102, 103, 104]
+
+    def test_no_partial_after_passthrough(self):
+        """Pass-through keeps _current empty: get_partial_bar() is None."""
+        agg = BarAggregator("TX00", 60)
+        agg.on_bar(_bar("2026-03-02 09:00"))
+        assert agg.get_partial_bar() is None
+
+    def test_flush_is_noop_after_passthrough(self):
+        """Pass-through leaves nothing to flush."""
+        agg = BarAggregator("TX00", 60)
+        agg.on_bar(_bar("2026-03-02 09:00"))
+        agg.on_bar(_bar("2026-03-02 09:01"))
+        assert agg.flush() is None
+
+    def test_passthrough_preserves_data(self):
+        """The returned bar carries through the input bar's OHLCV intact."""
+        agg = BarAggregator("TX00", 60)
+        bar = _bar("2026-03-02 09:00", o=100, h=115, l=95, c=110, v=42)
+        result = agg.on_bar(bar)
+        assert result is not None
+        assert result.open == 100
+        assert result.high == 115
+        assert result.low == 95
+        assert result.close == 110
+        assert result.volume == 42
+
+    def test_h1_still_aggregates(self):
+        """Sanity: non-60s targets still aggregate as before (no regression)."""
+        agg = BarAggregator("TX00", 3600)
+        # First 1-min bar: held (not returned)
+        result = agg.on_bar(_bar("2026-03-02 08:45", c=100))
+        assert result is None
+        # Second 1-min bar in same H1 boundary: still held
+        result = agg.on_bar(_bar("2026-03-02 08:46", c=101))
+        assert result is None
+        # Partial is populated
+        partial = agg.get_partial_bar()
+        assert partial is not None
+        assert partial.close == 101
