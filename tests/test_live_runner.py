@@ -26,6 +26,21 @@ class AlwaysLongStrategy(BacktestStrategy):
         return 2
 
 
+class OneMinRecordingStrategy(BacktestStrategy):
+    """1-min strategy that records each bar it receives (for issue #44 test)."""
+    kline_type = 0
+    kline_minute = 1
+
+    def __init__(self) -> None:
+        self.seen_bars: list[Bar] = []
+
+    def on_bar(self, bar: Bar, data_store: DataStore, broker: BrokerContext) -> None:
+        self.seen_bars.append(bar)
+
+    def required_bars(self) -> int:
+        return 1
+
+
 class LongWithExitStrategy(BacktestStrategy):
     """Enter long and set TP/SL exit (for testing tick-level exits)."""
     kline_type = 0
@@ -714,3 +729,110 @@ class TestCheckTickExit:
         assert actions.count("TRADE_CLOSE") == 1, f"Ghost TRADE_CLOSE: {actions}"
         assert "ENTRY_FILL" in actions, f"Strategy didn't re-enter: {actions}"
         assert runner.broker.position_size == 1
+
+
+# ── Regression: issue #44 — 1-min strategy and chart lag ──
+
+class TestLiveRunner1mNoLagIssue44:
+    """Regression tests for issue #44.
+
+    Before the fix, BarAggregator held each 1-min bar as _current and only
+    emitted it when the NEXT 1-min bar arrived. For a 1-min strategy this
+    meant:
+      - Strategy ran on bar[N-1] when bar[N] arrived (1-min data staleness)
+      - get_bars() lagged 1 bar behind
+      - Live chart showed bar[N-2] when wall clock was on bar[N] (2 min lag)
+    """
+
+    def test_1m_strategy_runs_on_current_bar(self, tmp_path):
+        """Strategy must receive each 1-min bar immediately, not 1 bar late."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        assert runner.target_interval == 60
+
+        # feed_warmup_bars only seeds the data_store; it doesn't call
+        # strategy.on_bar. After warmup, state transitions IDLE→RUNNING so
+        # feed_1m_bar is accepted.
+        runner.feed_warmup_bars([_kline("2026-02-28 09:00", 22500)])
+        assert len(strategy.seen_bars) == 0  # warmup doesn't invoke strategy
+
+        # Feed 3 live 1-min bars
+        for i in range(3):
+            bar = Bar(
+                symbol="TX00", dt=datetime(2026, 3, 1, 9, i),
+                open=22500 + i, high=22510 + i, low=22490 + i,
+                close=22505 + i, volume=50, interval=60,
+            )
+            result = runner.feed_1m_bar(bar)
+            # Each 1-min bar must be returned as an aggregated bar (pass-through)
+            assert result is not None, (
+                f"bar {i} not emitted — 1-min aggregator is lagging")
+            assert result.dt == datetime(2026, 3, 1, 9, i)
+
+        # Strategy must have received all 3 live bars on the SAME iteration
+        # as the bar arrived — no 1-bar lag.
+        assert len(strategy.seen_bars) == 3
+        assert [b.dt.minute for b in strategy.seen_bars] == [0, 1, 2]
+        # Bar values are the current bar, not the previous one
+        assert strategy.seen_bars[-1].close == 22507
+
+    def test_1m_get_bars_includes_latest(self, tmp_path):
+        """get_bars() must include the just-fed 1-min bar, not lag by 1."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+
+        runner.feed_warmup_bars([_kline("2026-02-28 09:00", 22500)])
+        warmup_count = len(runner.get_bars())
+
+        # Feed a single live 1-min bar
+        bar = Bar(
+            symbol="TX00", dt=datetime(2026, 3, 1, 9, 0),
+            open=22600, high=22610, low=22590, close=22605,
+            volume=50, interval=60,
+        )
+        runner.feed_1m_bar(bar)
+
+        bars = runner.get_bars()
+        # Before fix: len(bars) == warmup_count (live bar held by aggregator)
+        # After fix:  len(bars) == warmup_count + 1
+        assert len(bars) == warmup_count + 1
+        assert bars[-1].dt == datetime(2026, 3, 1, 9, 0)
+        assert bars[-1].close == 22605
+
+    def test_h1_get_bars_at_interval_includes_partial(self, tmp_path):
+        """H1 strategy: get_bars_at_interval(3600) must include in-progress H1.
+
+        Issue #44 H1 manifestation: the in-progress H1 bar was never in the
+        chart's source list until the next H1 boundary, leaving chart ~60 min
+        behind wall clock mid-hour.
+        """
+        strategy = NeverTradeStrategy()  # kline_minute=240 (H4)
+        # Override to make it H1 for this test
+        strategy.kline_minute = 60
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        # Re-derive target_interval after class override
+        runner.target_interval = 3600
+        from src.live.bar_aggregator import BarAggregator as _BA
+        runner.aggregator = _BA("TX00", 3600)
+        # Force RUNNING state (tests skip full warmup flow)
+        runner.state = LiveState.RUNNING
+
+        # Feed 5 live 1-min bars mid-hour (09:45-09:49, in H1 boundary 09:45)
+        for m in range(5):
+            bar = Bar(
+                symbol="TX00", dt=datetime(2026, 3, 2, 9, 45 + m),
+                open=22500 + m, high=22510 + m, low=22490 + m,
+                close=22505 + m, volume=50, interval=60,
+            )
+            runner.feed_1m_bar(bar)
+
+        # _aggregated_bars is empty (no H1 boundary crossed yet)
+        # but get_bars_at_interval(3600) should include the partial H1
+        bars = runner.get_bars_at_interval(3600)
+        assert len(bars) == 1, "Partial H1 bar must be visible"
+        assert bars[-1].dt == datetime(2026, 3, 2, 9, 45)
+        # Partial contains aggregated data from the 5 1-min bars fed
+        assert bars[-1].close == 22509  # last 1-min close
