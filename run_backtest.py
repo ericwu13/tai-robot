@@ -3261,8 +3261,14 @@ class BacktestApp:
             loss_limit = max(0, int(loss_limit_str))
         except (ValueError, TypeError):
             loss_limit = 1000
-        self._trading_guard = TradingGuard(daily_loss_limit=loss_limit)
+        # Reconfigure the existing TradingGuard in place — do NOT rebind.
+        # self._fill_poller was constructed with a reference to this instance
+        # in __init__; rebinding would leave the poller clearing a stale
+        # guard while order decisions check a different one, which caused
+        # issue #43 (fill_pending stuck True forever, blocking exits).
+        self._trading_guard.daily_loss_limit = loss_limit
         self._trading_guard.reset()
+        self._fill_poller.reset()
         self.bot_name_var.set(bot_name)
         _MODE_LABELS = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto", "auto": "全自動 Auto"}
         self.trading_mode_var.set(_MODE_LABELS.get(trading_mode, trading_mode))

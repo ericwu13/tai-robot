@@ -301,3 +301,87 @@ class TestFullFlow:
         result = fp.timeout()
         assert result.new_trading_mode == "semi_auto"
         assert g.real_entry_confirmed  # assumed filled
+
+
+# ── Regression: issue #43 — stale guard reference ──
+
+class TestGuardIdentityIssue43:
+    """Regression tests for issue #43.
+
+    run_backtest.py used to rebind self._trading_guard on every Deploy
+    (``self._trading_guard = TradingGuard(daily_loss_limit=...)``) while
+    self._fill_poller was initialized once in __init__ with a reference
+    to the original guard instance. After Deploy, the two diverged:
+    fill confirmation cleared fill_pending on the OLD guard, but the
+    order-decision path checked the NEW guard, which stayed stuck with
+    fill_pending=True forever — blocking exit orders when the stop fired.
+
+    Fix: reconfigure daily_loss_limit in place and call reset() on the
+    existing guard so all holders of the reference stay in sync.
+    """
+
+    def test_rebinding_guard_leaves_fill_poller_stale(self):
+        """Demonstrates the bug: rebinding guard breaks fill_poller sync.
+
+        This is the anti-pattern — FillPoller.confirm() updates the OLD
+        guard, but a caller checking a NEW guard sees stale state.
+        """
+        old_guard = TradingGuard(daily_loss_limit=1000)
+        fp = FillPoller(old_guard)
+
+        # Buggy deploy pattern: create a new guard and rebind the "main"
+        # reference, while FillPoller still holds the old one.
+        new_guard = TradingGuard(daily_loss_limit=10000)
+
+        # Auto-mode entry flow on the NEW guard (what run_backtest.py uses)
+        new_guard.on_fill_pending("entry")
+        fp.start("entry", 0, com_available=True)
+
+        # OI callback reports fill → FillPoller.confirm() runs
+        result = fp.on_position_update(1)
+        assert result is not None and result.type == "confirmed"
+        fp.confirm()
+
+        # Old guard is cleared, but the new guard (used by decide())
+        # remains stuck — this reproduces issue #43.
+        assert old_guard.fill_pending is False
+        assert new_guard.fill_pending is True
+        verdict, _ = new_guard.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == new_guard.BLOCK_FILL_PENDING, (
+            "Expected BLOCK_FILL_PENDING on stale-reference anti-pattern")
+
+    def test_in_place_reconfigure_keeps_fill_poller_in_sync(self):
+        """The fix: update daily_loss_limit in place, keep guard identity.
+
+        Same scenario as the previous test but using the in-place pattern.
+        After fill confirmation, decide() must allow the exit to flow.
+        """
+        guard = TradingGuard(daily_loss_limit=1000)
+        fp = FillPoller(guard)
+        original_id = id(guard)
+
+        # Correct deploy pattern: mutate in place, do not rebind.
+        guard.daily_loss_limit = 10000
+        guard.reset()
+        fp.reset()
+
+        assert id(guard) == original_id
+        assert guard.daily_loss_limit == 10000
+
+        # Auto-mode entry flow
+        guard.on_fill_pending("entry")
+        fp.start("entry", 0, com_available=True)
+
+        # OI callback reports fill
+        result = fp.on_position_update(1)
+        assert result is not None and result.type == "confirmed"
+        fp.confirm()
+
+        # Same guard must be fully cleared
+        assert guard.fill_pending is False
+        assert guard.fill_pending_type == ""
+        assert guard.real_entry_confirmed is True
+
+        # Subsequent close signal must flow through (not blocked)
+        verdict, _ = guard.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == guard.SEND_EXIT
