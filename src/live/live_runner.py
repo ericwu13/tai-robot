@@ -599,11 +599,20 @@ class LiveRunner:
     def get_bars_at_interval(self, interval: int) -> list[Bar]:
         """Return bars at the given interval (seconds).
 
-        If interval matches the strategy's native timeframe, returns aggregated bars.
-        Otherwise, re-aggregates stored 1-min bars on demand.
+        If interval matches the strategy's native timeframe, returns aggregated
+        bars plus the aggregator's in-progress partial (if any). Otherwise,
+        re-aggregates stored 1-min bars on demand — aggregate_bars() already
+        includes the partial via flush() at the end.
+
+        Including the in-progress bar prevents the chart from showing stale
+        data when a multi-minute bar is mid-formation (issue #44).
         """
         if interval == self.target_interval:
-            return list(self._aggregated_bars)
+            bars = list(self._aggregated_bars)
+            partial = self.aggregator.get_partial_bar()
+            if partial is not None:
+                bars.append(partial)
+            return bars
         return aggregate_bars(list(self._1m_bars), interval)
 
     def stop(self) -> dict:
