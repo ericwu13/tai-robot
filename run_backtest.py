@@ -1087,7 +1087,7 @@ class BacktestApp:
         # Trade list tab
         trades_frame = ttk.Frame(notebook)
         notebook.add(trades_frame, text="交易明細 Trades")
-        columns = ("num", "tag", "side", "entry_time", "entry_price",
+        columns = ("num", "tag", "side", "entry_time", "entry_price", "real_entry",
                    "exit_time", "exit_price", "pnl", "bars_held")
         self.trade_tree = ttk.Treeview(trades_frame, columns=columns, show="headings", height=20)
         self._trade_sort_col = None
@@ -1095,6 +1095,7 @@ class BacktestApp:
         for col, text, w in [
             ("num", "#", 40), ("tag", "標籤 Tag", 80), ("side", "方向 Side", 55),
             ("entry_time", "進場時間 Entry Time", 135), ("entry_price", "進場價 Entry", 80),
+            ("real_entry", "實進場 Real Entry", 90),
             ("exit_time", "出場時間 Exit Time", 135), ("exit_price", "出場價 Exit", 80),
             ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 60),
         ]:
@@ -2505,8 +2506,15 @@ class BacktestApp:
             if not exit_dt and bars and 0 <= t.exit_bar_index < len(bars):
                 exit_dt = bars[t.exit_bar_index].dt.strftime("%Y-%m-%d %H:%M")
 
+            # Real entry price from auto/semi_auto fill confirmation.
+            # "--" for paper mode, force-closes, and race-dropped fills
+            # so they're visually distinct from valid zero prices.
+            real_entry_str = (f"{t.real_entry_price:,}"
+                              if t.real_entry_price > 0 else "--")
+
             self.trade_tree.insert("", tk.END, values=(
                 i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
+                real_entry_str,
                 exit_dt, f"{t.exit_price:,}", pnl_str, bars_held,
             ), tags=(row_tag,))
 
@@ -2536,7 +2544,8 @@ class BacktestApp:
             self._trade_sort_reverse = False
 
         # Numeric columns need numeric sorting
-        numeric_cols = {"num", "entry_price", "exit_price", "pnl", "bars_held"}
+        numeric_cols = {"num", "entry_price", "real_entry", "exit_price",
+                        "pnl", "bars_held"}
 
         items = []
         for iid in self.trade_tree.get_children():
@@ -2567,6 +2576,7 @@ class BacktestApp:
         col_texts = {
             "num": "#", "tag": "標籤 Tag", "side": "方向 Side",
             "entry_time": "進場時間 Entry Time", "entry_price": "進場價 Entry",
+            "real_entry": "實進場 Real Entry",
             "exit_time": "出場時間 Exit Time", "exit_price": "出場價 Exit",
             "pnl": "損益 P&L", "bars_held": "持倉K棒 Bars",
         }
@@ -4245,8 +4255,14 @@ class BacktestApp:
     def _start_fill_polling(self, action_type: str) -> None:
         """Start polling OpenInterest for position change after order sent."""
         com_ok = _com_available and skO is not None and bool(self._futures_account)
+        # Snapshot broker.entry_bar_index so _on_fill_confirmed can later
+        # verify that a late entry-fill callback still belongs to the
+        # CURRENT trade and not a previously closed one (issue #45 race).
+        entry_bar_idx = (self._live_runner.broker.entry_bar_index
+                         if self._live_runner else 0)
         action = self._fill_poller.start(
-            action_type, self._get_signed_position(), com_available=com_ok)
+            action_type, self._get_signed_position(), com_available=com_ok,
+            entry_bar_index=entry_bar_idx)
 
         if action.type == "no_com":
             _log(f"FILL POLL: {action.message}")
@@ -4290,6 +4306,11 @@ class BacktestApp:
     def _on_fill_confirmed(self) -> None:
         """Called when fill is confirmed via OpenInterest position change."""
         self._fill_poll_timer_id = None
+        # Capture the poller's per-order snapshot BEFORE confirm() clears
+        # _active/_action_type/_entry_bar_index — we need entry_bar_index
+        # for the issue #45 race guard below.
+        poller_action_type = self._fill_poller.action_type
+        poller_entry_idx = self._fill_poller.entry_bar_index
         result = self._fill_poller.confirm()
 
         # Get actual fill price from OpenInterest
@@ -4303,6 +4324,34 @@ class BacktestApp:
                 if p.get("product", "").startswith(prefix):
                     fill_price = p.get("avg_cost", "")
                     break
+
+        # Guarded write of real_entry_price onto the broker (issue #45).
+        # A late entry-fill callback arriving AFTER the sim position has
+        # already closed (or been replaced by a new trade) must NOT
+        # pollute the current broker state — otherwise the next trade's
+        # stop would be computed against the previous trade's real fill
+        # price. The broker's try_set_real_entry_price() enforces all
+        # race conditions; we just pass the snapshot and log if rejected.
+        if poller_action_type == "entry" and self._live_runner and fill_price:
+            broker = self._live_runner.broker
+            try:
+                price_int = int(round(float(fill_price)))
+            except (ValueError, TypeError):
+                price_int = 0
+            accepted = broker.try_set_real_entry_price(
+                price_int,
+                entry_bar_index=poller_entry_idx,
+                fill_dt=_taipei_now().isoformat(timespec="seconds"),
+            )
+            if not accepted:
+                self._log_order_decision(
+                    "FILL_RACE_SKIP",
+                    f"late entry confirmation dropped: pos={broker.position_size} "
+                    f"real={broker.real_entry_price} "
+                    f"sent_idx={poller_entry_idx} "
+                    f"current_idx={broker.entry_bar_index} "
+                    f"price={price_int}",
+                )
 
         price_str = f" @{float(fill_price):,.1f}" if fill_price else ""
         self._live_log_msg(
