@@ -385,3 +385,68 @@ class TestGuardIdentityIssue43:
         # Subsequent close signal must flow through (not blocked)
         verdict, _ = guard.decide("auto", "TRADE_CLOSE", "LONG")
         assert verdict == guard.SEND_EXIT
+
+
+# ── Regression: issue #45 — entry_bar_index snapshot ──
+
+class TestEntryBarIndexIssue45:
+    """Regression tests for issue #45.
+
+    FillPoller.start() now captures an ``entry_bar_index`` which the
+    GUI's ``_on_fill_confirmed`` reads to verify that a late entry-fill
+    callback still belongs to the currently-open trade. Without this
+    snapshot, a fill confirmation arriving AFTER the sim position has
+    closed would plant a stale ``real_entry_price`` onto the next
+    trade's broker state — placing the stop at the wrong level.
+
+    The FillPoller itself just stores and exposes the value; the
+    actual race guard lives in run_backtest._on_fill_confirmed. These
+    tests verify the storage + exposure + reset contract.
+    """
+
+    def test_entry_bar_index_defaults_to_zero(self):
+        fp, _ = _make_poller()
+        assert fp.entry_bar_index == 0
+
+    def test_start_captures_entry_bar_index(self):
+        fp, _ = _make_poller()
+        fp.start("entry", 0, com_available=True, entry_bar_index=12345)
+        assert fp.entry_bar_index == 12345
+
+    def test_reset_clears_entry_bar_index(self):
+        fp, _ = _make_poller()
+        fp.start("entry", 0, com_available=True, entry_bar_index=12345)
+        fp.reset()
+        assert fp.entry_bar_index == 0
+
+    def test_entry_bar_index_survives_confirm(self):
+        """confirm() should NOT clear entry_bar_index — the GUI reads
+        it AFTER confirm() to validate the late-arrival race guard.
+        """
+        fp, g = _make_poller()
+        fp.start("entry", 0, com_available=True, entry_bar_index=12345)
+        fp.on_position_update(1)
+        fp.confirm()
+        # Still readable — only _active was cleared
+        assert fp.entry_bar_index == 12345
+
+    def test_no_com_path_stores_entry_bar_index(self):
+        """The no_com short-circuit path should not crash on the new param."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        action = fp.start("entry", 0, com_available=False,
+                          entry_bar_index=12345)
+        assert action.type == "no_com"
+        # entry_bar_index was passed but not stored (no_com bypasses
+        # the _active block). Either 0 or stored is fine; the GUI
+        # won't read it because _on_fill_confirmed isn't called.
+
+    def test_exit_path_entry_bar_index_is_unused(self):
+        """Exit polling doesn't need entry_bar_index — pass 0 as default."""
+        fp, g = _make_poller()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        action = fp.start("exit", 1, com_available=True)
+        assert action.type == "start_polling"
+        # Default entry_bar_index=0 is fine for exits
+        assert fp.entry_bar_index == 0
