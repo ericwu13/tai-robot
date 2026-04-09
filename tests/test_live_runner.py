@@ -836,3 +836,252 @@ class TestLiveRunner1mNoLagIssue44:
         assert bars[-1].dt == datetime(2026, 3, 2, 9, 45)
         # Partial contains aggregated data from the 5 1-min bars fed
         assert bars[-1].close == 22509  # last 1-min close
+
+
+# ── Regression: issue #45 — CSV reload gap in live chart ──
+
+class TestReload1mBarsIssue45:
+    """Regression tests for issue #45.
+
+    Before the fix, ``reload_1m_bars`` populated only ``_1m_bars`` and
+    ``_seen_1m_dts`` but never ``_aggregated_bars``. For 1-min native
+    strategies this left the live chart (which draws from
+    ``_aggregated_bars``) with a ~10-hour gap between the warmup end
+    and the first live bar, because:
+
+    (a) The COM warmup API doesn't return bars for the currently
+        in-progress trading session.
+    (b) The historical tick-replay that SHOULD fill the gap rebuilds
+        those bars via ``BarBuilder``, but they get deduplicated
+        against ``_seen_1m_dts`` (populated by this same reload) and
+        silently dropped before reaching ``_aggregated_bars``.
+
+    The fix:
+    - ``feed_warmup_bars`` now populates ``_seen_1m_dts`` for 1-min
+      strategies so CSV/history bars overlapping warmup are deduped.
+    - ``reload_1m_bars`` now merges new CSV bars into
+      ``_aggregated_bars`` and rebuilds ``data_store`` in sorted order
+      for 1-min native strategies.
+    """
+
+    @staticmethod
+    def _write_bars_csv(path: str, bars: list[Bar]) -> None:
+        """Write bars to a CSV file in the format reload_1m_bars expects."""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("datetime,open,high,low,close,volume\n")
+            for b in bars:
+                f.write(
+                    f"{b.dt.strftime('%Y/%m/%d %H:%M')},"
+                    f"{b.open},{b.high},{b.low},{b.close},{b.volume}\n"
+                )
+
+    @staticmethod
+    def _make_1m_bar(dt: datetime, c: int = 22500) -> Bar:
+        return Bar(
+            symbol="TX00", dt=dt,
+            open=c, high=c + 10, low=c - 10, close=c,
+            volume=10, interval=60,
+        )
+
+    def test_feed_warmup_populates_seen_dts_for_1min(self, tmp_path):
+        """Warmup must track bar dts in _seen_1m_dts for 1-min strategies."""
+        strategy = OneMinRecordingStrategy()  # kline_minute=1
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        warmup = [
+            _kline("2026-02-28 09:00", 22500),
+            _kline("2026-02-28 09:01", 22510),
+            _kline("2026-02-28 09:02", 22520),
+        ]
+        runner.feed_warmup_bars(warmup)
+
+        assert len(runner._seen_1m_dts) == 3
+        assert datetime(2026, 2, 28, 9, 0) in runner._seen_1m_dts
+        assert datetime(2026, 2, 28, 9, 1) in runner._seen_1m_dts
+        assert datetime(2026, 2, 28, 9, 2) in runner._seen_1m_dts
+
+    def test_feed_warmup_leaves_seen_dts_empty_for_h4(self, tmp_path):
+        """H4 warmup must NOT populate _seen_1m_dts (H4 bars are not 1-min)."""
+        strategy = NeverTradeStrategy()  # kline_minute=240 (H4)
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        assert runner._seen_1m_dts == set()
+
+    def test_reload_fills_aggregated_bars_for_1min(self, tmp_path):
+        """CSV bars must be merged into _aggregated_bars for 1-min strategies.
+
+        Before the fix, _aggregated_bars only had warmup bars; the CSV
+        gap-fill lived in _1m_bars only, leaving a visible gap in the
+        live chart.
+        """
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        # Warmup: 3 bars at 09:00-09:02
+        warmup = [
+            _kline("2026-02-28 09:00", 22500),
+            _kline("2026-02-28 09:01", 22510),
+            _kline("2026-02-28 09:02", 22520),
+        ]
+        runner.feed_warmup_bars(warmup)
+        assert len(runner.get_bars()) == 3  # warmup only
+
+        # Write CSV with 2 new bars at 09:03 and 09:04
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        csv_bars = [
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 3), c=22530),
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 4), c=22540),
+        ]
+        self._write_bars_csv(csv_path, csv_bars)
+
+        count = runner.reload_1m_bars()
+
+        assert count == 2
+        # _aggregated_bars now has warmup + CSV bars (sorted)
+        agg = runner.get_bars()
+        assert len(agg) == 5
+        assert [b.dt.minute for b in agg] == [0, 1, 2, 3, 4]
+        assert agg[-1].close == 22540
+        # _warmup_bar_count bumped so get_live_bars() is still empty
+        assert runner._warmup_bar_count == 5
+        assert runner.get_live_bars() == []
+        # data_store was rebuilt in sorted order
+        store_bars = runner.data_store.get_bars()
+        assert [b.dt.minute for b in store_bars] == [0, 1, 2, 3, 4]
+
+    def test_reload_dedupes_overlap_with_warmup_for_1min(self, tmp_path):
+        """CSV bars already in warmup must NOT be re-added (would double-count)."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        # Warmup bars at 09:00-09:02 (explicit close via keyword arg)
+        warmup = [
+            _kline("2026-02-28 09:00", c=22500),
+            _kline("2026-02-28 09:01", c=22510),
+            _kline("2026-02-28 09:02", c=22520),
+        ]
+        runner.feed_warmup_bars(warmup)
+
+        # CSV has bars 09:01-09:04 (09:01 and 09:02 overlap warmup)
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        csv_bars = [
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 1), c=99),  # dup
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 2), c=99),  # dup
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 3), c=22530),
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 4), c=22540),
+        ]
+        self._write_bars_csv(csv_path, csv_bars)
+
+        count = runner.reload_1m_bars()
+
+        assert count == 2  # only 09:03 and 09:04 are new
+        agg = runner.get_bars()
+        assert len(agg) == 5
+        assert [b.dt.minute for b in agg] == [0, 1, 2, 3, 4]
+        # Warmup's 09:01/09:02 values survived — CSV's 99 did NOT overwrite
+        assert agg[1].close == 22510
+        assert agg[2].close == 22520
+        # _1m_bars also has no duplicates
+        assert len(runner._1m_bars) == 5
+
+    def test_reload_unchanged_for_h4(self, tmp_path):
+        """H4 strategies: reload must NOT touch _aggregated_bars.
+
+        For non-1-min strategies, multi-TF charting goes through
+        get_bars_at_interval() which re-aggregates _1m_bars on demand.
+        _aggregated_bars is the strategy's native-TF (H4) bars and must
+        not be contaminated by 1-min CSV reloads.
+        """
+        strategy = NeverTradeStrategy()  # kline_minute=240 (H4)
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+        agg_before = list(runner.get_bars())
+
+        # Write a 1-min CSV (different timeframe from the H4 strategy)
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260301.csv")
+        csv_bars = [
+            self._make_1m_bar(datetime(2026, 3, 1, 9, m), c=22500 + m)
+            for m in range(5)
+        ]
+        self._write_bars_csv(csv_path, csv_bars)
+
+        count = runner.reload_1m_bars()
+
+        assert count == 5
+        # _aggregated_bars unchanged (still H4 warmup bars only)
+        assert runner.get_bars() == agg_before
+        # But _1m_bars has the CSV bars so H1/H4 re-aggregation works
+        assert len(runner._1m_bars) == 5
+
+    def test_reload_preserves_sorted_order_with_older_csv(self, tmp_path):
+        """Merged _aggregated_bars must be sorted even if CSV has OLDER bars.
+
+        E.g. a CSV with data before the warmup range should produce a
+        sorted list with those older bars at the front.
+        """
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        # Warmup: 09:02-09:04 (mid-range) — explicit close via keyword
+        warmup = [
+            _kline("2026-02-28 09:02", c=22502),
+            _kline("2026-02-28 09:03", c=22503),
+            _kline("2026-02-28 09:04", c=22504),
+        ]
+        runner.feed_warmup_bars(warmup)
+
+        # CSV has 09:00, 09:01 (before warmup) AND 09:05 (after)
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        csv_bars = [
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 0), c=22500),
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 1), c=22501),
+            self._make_1m_bar(datetime(2026, 2, 28, 9, 5), c=22505),
+        ]
+        self._write_bars_csv(csv_path, csv_bars)
+
+        runner.reload_1m_bars()
+
+        agg = runner.get_bars()
+        assert len(agg) == 6
+        assert [b.dt.minute for b in agg] == [0, 1, 2, 3, 4, 5]
+        assert [b.close for b in agg] == [
+            22500, 22501, 22502, 22503, 22504, 22505]
+
+    def test_reload_no_csv_files_is_noop(self, tmp_path):
+        """If there are no CSV files, reload_1m_bars is a no-op."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        warmup = [_kline("2026-02-28 09:00", 22500)]
+        runner.feed_warmup_bars(warmup)
+        agg_before = list(runner.get_bars())
+
+        count = runner.reload_1m_bars()
+
+        assert count == 0
+        assert runner.get_bars() == agg_before
+
+    def test_reload_data_store_deque_bounded(self, tmp_path):
+        """Rebuilt data_store must respect the original maxlen."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        original_maxlen = runner.data_store._bars.maxlen
+
+        warmup = [_kline("2026-02-28 09:00", 22500)]
+        runner.feed_warmup_bars(warmup)
+
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        csv_bars = [
+            self._make_1m_bar(datetime(2026, 2, 28, 9, m), c=22500 + m)
+            for m in range(1, 5)
+        ]
+        self._write_bars_csv(csv_path, csv_bars)
+
+        runner.reload_1m_bars()
+
+        assert runner.data_store._bars.maxlen == original_maxlen
