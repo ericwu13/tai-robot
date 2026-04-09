@@ -59,6 +59,11 @@ class FillPoller:
         self._pos_before: int = 0
         self._pos_current: int | None = None
         self._start_time: float = 0
+        # Snapshot of broker.entry_bar_index at the moment the real
+        # entry order was sent. Used by the GUI's _on_fill_confirmed
+        # guard to reject a late entry-fill callback that arrives
+        # AFTER the original trade already closed (issue #45 race).
+        self._entry_bar_index: int = 0
 
     def reset(self) -> None:
         """Clear all state."""
@@ -67,6 +72,7 @@ class FillPoller:
         self._pos_before = 0
         self._pos_current = None
         self._start_time = 0
+        self._entry_bar_index = 0
 
     @property
     def active(self) -> bool:
@@ -84,16 +90,30 @@ class FillPoller:
     def pos_current(self) -> int | None:
         return self._pos_current
 
+    @property
+    def entry_bar_index(self) -> int:
+        """Broker bar index at which the real entry order was sent.
+
+        Used to match a late entry-fill confirmation to the trade
+        that actually triggered it (issue #45).
+        """
+        return self._entry_bar_index
+
     # ── Start polling ──
 
     def start(self, action_type: str, current_position: int,
-              com_available: bool = True) -> FillPollAction:
+              com_available: bool = True,
+              entry_bar_index: int = 0) -> FillPollAction:
         """Begin monitoring for a fill.
 
         Args:
             action_type: "entry" or "exit"
             current_position: signed position qty before the order
             com_available: False if COM is unavailable (auto-confirm)
+            entry_bar_index: broker bar index at order-send time;
+                stored so _on_fill_confirmed can verify a late
+                confirmation still belongs to the current trade
+                (issue #45)
 
         Returns FillPollAction telling the caller what to do next.
         """
@@ -115,6 +135,7 @@ class FillPoller:
         self._pos_before = current_position
         self._pos_current = None
         self._start_time = time.monotonic()
+        self._entry_bar_index = entry_bar_index
 
         # Exit already flat — IOC filled before we could even read position
         if action_type == "exit" and current_position == 0:

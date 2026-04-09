@@ -157,6 +157,13 @@ Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.c
   **exit() requires TWO string args**: `tag` (exit order name) AND `from_entry` (matching the entry tag).
   Example: `broker.exit("exit_long", "Long", limit=21000, stop=19800)`
 - `broker.close(from_entry: str, tag="close")` — market close at current bar's close (use this for manual exit conditions)
+- `broker.effective_entry_price()` -> int — best-available reference price for entry-relative stop calculations.
+  Returns the REAL broker-confirmed entry price in auto/semi_auto mode once the fill is confirmed;
+  otherwise falls back to the simulated entry price (paper mode, pre-confirmation window, or fill timeout).
+  Returns 0 when flat. ALWAYS use this — never hard-code `broker.entry_price` or `bar.close` for SL math.
+  Example: `stop = broker.effective_entry_price() - 50`
+- `broker.entry_price` -> int — the SIMULATED entry price (bar.close at signal time). Prefer
+  `effective_entry_price()` for stop math so your stops track the real fill in live mode.
 - **IMPORTANT**: `entry()` returns None — do NOT store its return value. Track position state with `broker.position_size` and use the tag string literal in close()/exit().
 - **IMPORTANT**: `exit()` REQUIRES limit and/or stop prices to work. exit() with no limit/stop does NOTHING.
   Use `close()` for immediate market exits (e.g. when checking bar.high >= target in on_bar).

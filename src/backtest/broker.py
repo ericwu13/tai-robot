@@ -34,6 +34,13 @@ class Trade:
     exit_tag: str = ""
     entry_dt: str = ""   # ISO format datetime string
     exit_dt: str = ""    # ISO format datetime string
+    # Real-order fill data (issue #45). Populated only in auto/semi_auto
+    # mode when the real broker confirms a fill. 0 / "" mean "not filled /
+    # paper mode / fill race dropped". See SimulatedBroker.real_entry_price.
+    real_entry_price: int = 0
+    real_entry_dt: str = ""
+    real_exit_price: int = 0    # Phase 2 — not yet captured
+    real_exit_dt: str = ""      # Phase 2 — not yet captured
 
 
 class BrokerContext:
@@ -54,6 +61,44 @@ class BrokerContext:
     def trades(self) -> list:
         """Read-only access to completed trades (for loss counting, etc.)."""
         return list(self._broker.trades)
+
+    @property
+    def entry_price(self) -> int:
+        """Simulated entry price of the current open position (0 if flat).
+
+        This is the price the strategy DECIDED to enter at (usually
+        ``bar.close`` at signal time). For stop-loss calculations in
+        live/auto mode prefer :meth:`effective_entry_price` so the
+        stop tracks the REAL fill price when available.
+        """
+        return self._broker.entry_price
+
+    @property
+    def real_entry_price(self) -> int:
+        """Real broker-confirmed entry price (0 if paper/unconfirmed).
+
+        Populated only in auto/semi_auto mode when OpenInterest
+        reports the position avg_cost. Use :meth:`effective_entry_price`
+        instead of reading this directly — it handles the fallback
+        to simulated entry price cleanly.
+        """
+        return self._broker.real_entry_price
+
+    def effective_entry_price(self) -> int:
+        """Best-available stop reference: real if confirmed, else simulated.
+
+        Use this in strategies for entry-relative stop calculations::
+
+            def on_bar(self, bar, data_store, broker):
+                if broker.position_size > 0:
+                    stop = broker.effective_entry_price() - 50
+                    broker.exit("exit", "Long", stop=stop)
+
+        In paper mode, during the pre-confirmation window, or if the
+        fill confirmation never arrives, this falls back to the
+        simulated ``entry_price`` — so the call is safe in all modes.
+        """
+        return self._broker.effective_entry_price()
 
     def entry(self, tag: str, side: OrderSide, qty: int = 1) -> None:
         self._broker.queue_entry(Order(tag=tag, side=side, qty=qty))
@@ -99,6 +144,12 @@ class SimulatedBroker:
         self.entry_bar_index: int = 0
         self._entry_dt: str = ""
         self._current_bar_dt: str = ""
+        # Real-fill tracking for the CURRENT open position (issue #45).
+        # Set by the GUI's _on_fill_confirmed when the real broker confirms
+        # an entry fill. 0 means "not confirmed yet / paper mode / no real
+        # order". Copied into Trade.real_entry_price on close, then reset.
+        self.real_entry_price: int = 0
+        self.real_entry_dt: str = ""
 
         self.trades: list[Trade] = []
         self.equity_curve: list[int] = []
@@ -163,6 +214,15 @@ class SimulatedBroker:
                 # Clear stale exit metadata from previous trade
                 self.last_exit_type = ""
                 self.last_exit_limit = None
+                # Belt-and-braces reset of real-fill state for the new
+                # position. Normally _close_position already cleared these
+                # when the previous trade closed, but a late OpenInterest
+                # callback for the previous trade could have slipped past
+                # the _on_fill_confirmed guard and planted a stale value.
+                # Clearing here guarantees the new trade starts clean
+                # (issue #45 late-arrival race).
+                self.real_entry_price = 0
+                self.real_entry_dt = ""
         self._pending_entries.clear()
 
     def check_exits(self, bar_index: int, open_: int, high: int, low: int, close: int, bar_dt: str = "") -> None:
@@ -260,6 +320,11 @@ class SimulatedBroker:
             exit_tag=tag,
             entry_dt=self._entry_dt,
             exit_dt=self._current_bar_dt,
+            # Snapshot the real-fill state for this position before reset.
+            # In paper mode or if the real fill never confirmed, these are
+            # 0/"" and the Trades tab will render them as "--".
+            real_entry_price=self.real_entry_price,
+            real_entry_dt=self.real_entry_dt,
         )
         self.trades.append(trade)
         self._cumulative_pnl += pnl
@@ -269,8 +334,63 @@ class SimulatedBroker:
         self.position_side = None
         self.entry_price = 0
         self.entry_tag = ""
+        # Reset real-fill state so the next trade starts clean. The
+        # late-arrival guard in _on_fill_confirmed also rejects writes
+        # when position_size == 0, so two layers of defense (issue #45).
+        self.real_entry_price = 0
+        self.real_entry_dt = ""
         self._pending_exits.clear()
         self._exit_bar_index = bar_index
+
+    def effective_entry_price(self) -> int:
+        """Return the best-available stop-reference price.
+
+        Returns the real fill price if it has been confirmed for the
+        current position, otherwise falls back to the simulated entry
+        price. Returns 0 when flat.
+
+        Strategies that place stops relative to the entry should use
+        this rather than ``self.entry_price`` directly so the stop
+        naturally tracks where the order REALLY filled in auto mode
+        (issue #45), while degrading gracefully in paper mode or
+        during the pre-confirmation window.
+        """
+        if self.real_entry_price > 0:
+            return self.real_entry_price
+        return self.entry_price
+
+    def try_set_real_entry_price(
+        self,
+        price: int,
+        entry_bar_index: int,
+        fill_dt: str = "",
+    ) -> bool:
+        """Guarded write of the real (broker-confirmed) entry fill price.
+
+        Race guard for issue #45. Rejects the write when any of the
+        following hold, leaving ``real_entry_price`` unchanged:
+
+        - position is flat (stale callback for an already-closed trade)
+        - ``real_entry_price`` already set (double confirmation / replay)
+        - ``entry_bar_index`` doesn't match the current position's
+          (late callback for a previous trade whose ``_close_position``
+          has already run)
+        - ``price <= 0`` (bad parse upstream)
+
+        Returns True if the write was accepted, False otherwise. Call
+        sites should log a ``FILL_RACE_SKIP`` diagnostic when rejected.
+        """
+        if price <= 0:
+            return False
+        if self.position_size == 0:
+            return False
+        if self.real_entry_price != 0:
+            return False
+        if self.entry_bar_index != entry_bar_index:
+            return False
+        self.real_entry_price = int(price)
+        self.real_entry_dt = fill_dt
+        return True
 
     def force_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
         """Force-close any open position at end of data."""
@@ -294,6 +414,8 @@ class SimulatedBroker:
             "entry_price": self.entry_price,
             "entry_tag": self.entry_tag,
             "entry_bar_index": self.entry_bar_index,
+            "real_entry_price": self.real_entry_price,
+            "real_entry_dt": self.real_entry_dt,
             "trades": [
                 {
                     "tag": t.tag, "side": t.side.value, "qty": t.qty,
@@ -302,6 +424,10 @@ class SimulatedBroker:
                     "exit_bar_index": t.exit_bar_index,
                     "pnl": t.pnl, "exit_tag": t.exit_tag,
                     "entry_dt": t.entry_dt, "exit_dt": t.exit_dt,
+                    "real_entry_price": t.real_entry_price,
+                    "real_entry_dt": t.real_entry_dt,
+                    "real_exit_price": t.real_exit_price,
+                    "real_exit_dt": t.real_exit_dt,
                 }
                 for t in self.trades
             ],
@@ -313,7 +439,11 @@ class SimulatedBroker:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SimulatedBroker":
-        """Restore broker state from a serialized dict."""
+        """Restore broker state from a serialized dict.
+
+        All new fields use ``.get()`` with safe defaults so old session
+        files (before issue #45) load without error.
+        """
         broker = cls(point_value=data.get("point_value", 1))
         broker.position_size = data.get("position_size", 0)
         side = data.get("position_side")
@@ -321,6 +451,8 @@ class SimulatedBroker:
         broker.entry_price = data.get("entry_price", 0)
         broker.entry_tag = data.get("entry_tag", "")
         broker.entry_bar_index = data.get("entry_bar_index", 0)
+        broker.real_entry_price = data.get("real_entry_price", 0)
+        broker.real_entry_dt = data.get("real_entry_dt", "")
         broker.trades = [
             Trade(
                 tag=t["tag"], side=OrderSide(t["side"]), qty=t["qty"],
@@ -329,6 +461,10 @@ class SimulatedBroker:
                 exit_bar_index=t["exit_bar_index"],
                 pnl=t["pnl"], exit_tag=t.get("exit_tag", ""),
                 entry_dt=t.get("entry_dt", ""), exit_dt=t.get("exit_dt", ""),
+                real_entry_price=t.get("real_entry_price", 0),
+                real_entry_dt=t.get("real_entry_dt", ""),
+                real_exit_price=t.get("real_exit_price", 0),
+                real_exit_dt=t.get("real_exit_dt", ""),
             )
             for t in data.get("trades", [])
         ]

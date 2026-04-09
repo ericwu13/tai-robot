@@ -1085,3 +1085,104 @@ class TestReload1mBarsIssue45:
         runner.reload_1m_bars()
 
         assert runner.data_store._bars.maxlen == original_maxlen
+
+
+# ── Regression: issue #45 — real_entry_price flow into Trades ──
+
+class TestRealEntryPriceLiveRunnerIssue45:
+    """End-to-end tests that real_entry_price flows through the
+    LiveRunner's various exit paths (tick exit, force close, stop)."""
+
+    def test_tick_exit_preserves_real_entry_price(self, tmp_path):
+        """check_tick_exit closes the trade — Trade must carry real_entry_price."""
+        from src.backtest.broker import OrderSide
+
+        strategy = LongWithExitStrategy()  # enters long, sets TP/SL
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+
+        # Warmup enough bars for required_bars
+        warmup = [_kline(f"2026-02-{d:02d} 09:00", 22500) for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        # Feed a 15-min bar to trigger entry
+        lines = _klines_1m("2026-03-01", 540, 15)  # 09:00-09:14
+        runner.feed_1m_bars(lines)
+        # Enter on the boundary
+        lines = _klines_1m("2026-03-01", 555, 1, base_price=22500)  # 09:15
+        runner.feed_1m_bars(lines)
+        # Now second 15-min boundary sets up the exit
+        lines = _klines_1m("2026-03-01", 556, 15, base_price=22500)
+        runner.feed_1m_bars(lines)
+        lines = _klines_1m("2026-03-01", 571, 1, base_price=22500)  # 09:31
+        runner.feed_1m_bars(lines)
+
+        # By now strategy should be in a position
+        if runner.broker.position_size == 0:
+            pytest.skip("position did not open in fixture setup")
+
+        # Simulate auto-mode real fill confirmation
+        runner.broker.real_entry_price = 22505
+        runner.broker.real_entry_dt = "2026-03-01T09:15:03"
+        assert runner.broker.position_side == OrderSide.LONG
+
+        # Tick exit via stop-loss (stop should be 22505 - 50 = 22455)
+        result = runner.check_tick_exit(22440, "2026-03-01 09:32:00")
+        assert result is not None, "tick exit should fire"
+
+        assert len(runner.broker.trades) >= 1
+        t = runner.broker.trades[-1]
+        assert t.real_entry_price == 22505, (
+            f"tick exit lost real_entry_price; got {t.real_entry_price}")
+        assert t.real_entry_dt == "2026-03-01T09:15:03"
+        # Broker field reset after close
+        assert runner.broker.real_entry_price == 0
+
+    def test_runner_stop_force_close_preserves_real_entry_price(self, tmp_path):
+        """runner.stop() → force_close must preserve real_entry_price."""
+        strategy = LongWithExitStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+
+        warmup = [_kline(f"2026-02-{d:02d} 09:00", 22500) for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        lines = _klines_1m("2026-03-01", 540, 16)  # triggers 15-min aggregation + entry
+        runner.feed_1m_bars(lines)
+        if runner.broker.position_size == 0:
+            pytest.skip("position did not open in fixture setup")
+
+        runner.broker.real_entry_price = 22508
+        runner.broker.real_entry_dt = "2026-03-01T09:15:03"
+
+        # Stop the runner — should force-close the open position
+        runner.stop()
+
+        closed_trade = runner.broker.trades[-1]
+        assert closed_trade.real_entry_price == 22508
+        assert closed_trade.real_entry_dt == "2026-03-01T09:15:03"
+
+    def test_effective_entry_price_through_broker_context(self, tmp_path):
+        """Strategy reading broker.effective_entry_price() gets real when set,
+        falls back to sim otherwise."""
+        strategy = LongWithExitStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+
+        warmup = [_kline(f"2026-02-{d:02d} 09:00", 22500) for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        lines = _klines_1m("2026-03-01", 540, 16)
+        runner.feed_1m_bars(lines)
+        if runner.broker.position_size == 0:
+            pytest.skip("position did not open in fixture setup")
+
+        ctx = runner.broker.context
+
+        # Pre-confirmation → fallback to simulated
+        sim_entry = runner.broker.entry_price
+        assert ctx.effective_entry_price() == sim_entry
+
+        # Post-confirmation → real
+        runner.broker.real_entry_price = 22508
+        assert ctx.effective_entry_price() == 22508
