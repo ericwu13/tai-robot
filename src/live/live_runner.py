@@ -330,10 +330,15 @@ class LiveRunner:
         self._aggregated_bars.extend(bars)
         self._warmup_bar_count = len(self._aggregated_bars)
 
-        # For 1-min strategies, warmup bars are also 1-min — store for multi-TF charting
+        # For 1-min strategies, warmup bars are also 1-min. Store them
+        # in _1m_bars for multi-TF charting AND track their dts in
+        # _seen_1m_dts so a subsequent reload_1m_bars / tick-history
+        # replay dedupes against them instead of adding duplicates
+        # (issue #45).
         if self.target_interval == 60:
             for bar in bars:
                 self._1m_bars.append(bar)
+                self._seen_1m_dts.add(bar.dt)
 
         self.state = LiveState.RUNNING
         self._auto_save_session()  # persist immediately on start
@@ -692,10 +697,22 @@ class LiveRunner:
         """Reload saved 1-min bar CSVs into _1m_bars and _seen_1m_dts.
 
         Call AFTER restore_session() and feed_warmup_bars().
+
         Populates the 1-min bar cache for multi-TF charting and prevents
         duplicate processing when tick history replays the same data.
 
-        Returns the number of 1-min bars loaded.
+        For 1-min NATIVE strategies, also merges the new CSV bars into
+        _aggregated_bars and rebuilds data_store in sorted order so the
+        live chart and strategy see a continuous bar history. Without
+        this merge the live chart (which draws from _aggregated_bars)
+        showed a visible gap between the warmup end and the first live
+        bar — the COM warmup API does not return bars for the currently
+        in-progress trading session, and the historical tick-replay
+        that happens during tick subscription rebuilds those missing
+        bars but then drops them via the _seen_1m_dts dedup before they
+        can reach _aggregated_bars (issue #45).
+
+        Returns the number of NEW 1-min bars loaded from CSV.
         """
         import csv
         import glob as glob_mod
@@ -705,7 +722,7 @@ class LiveRunner:
         if not csv_files:
             return 0
 
-        count = 0
+        new_bars: list[Bar] = []
         for path in csv_files:
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -718,6 +735,8 @@ class LiveRunner:
                             continue
                         try:
                             dt = datetime.strptime(row[0], "%Y/%m/%d %H:%M")
+                            if dt in self._seen_1m_dts:
+                                continue
                             bar = Bar(
                                 symbol=self.symbol,
                                 dt=dt,
@@ -728,15 +747,42 @@ class LiveRunner:
                                 volume=int(float(row[5])),
                                 interval=60,
                             )
-                            if dt not in self._seen_1m_dts:
-                                self._seen_1m_dts.add(dt)
-                                self._1m_bars.append(bar)
-                                count += 1
+                            self._seen_1m_dts.add(dt)
+                            self._1m_bars.append(bar)
+                            new_bars.append(bar)
                         except (ValueError, IndexError):
                             continue
             except OSError:
                 continue
-        return count
+
+        # For 1-min native strategies, the CSV bars ARE target-timeframe
+        # bars. Merge them into _aggregated_bars and rebuild data_store
+        # in sorted order so the live chart and strategy indicators see
+        # a continuous history without the gap between warmup end and
+        # live feed start (issue #45). Non-1-min strategies handle
+        # multi-TF charting via _1m_bars re-aggregation in
+        # get_bars_at_interval(), so their _aggregated_bars is left
+        # untouched here.
+        if self.target_interval == 60 and new_bars:
+            merged = sorted(
+                list(self._aggregated_bars) + new_bars,
+                key=lambda b: b.dt,
+            )
+            self._aggregated_bars[:] = merged
+            # Rebuild data_store in sorted order. The deque maxlen caps
+            # older history automatically so memory stays bounded.
+            from ..market_data.data_store import DataStore
+            maxlen = self.data_store._bars.maxlen or 5000
+            new_store = DataStore(max_bars=maxlen)
+            for b in merged:
+                new_store.add_bar(b)
+            self.data_store = new_store
+            # CSV-loaded bars are historical, not live — bump
+            # _warmup_bar_count so get_live_bars() continues to slice
+            # off the correct prefix.
+            self._warmup_bar_count = len(self._aggregated_bars)
+
+        return len(new_bars)
 
     @property
     def session_path(self) -> str:
