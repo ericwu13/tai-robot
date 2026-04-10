@@ -149,7 +149,10 @@ class MyStrategy(BacktestStrategy):
 ## BrokerContext API
 - `broker.position_size` -> int (0=flat, always >= 0, no direction info — track yourself)
 - `broker.trades` -> list[Trade] (read-only, completed trades). \
-Each Trade has: .tag, .side, .qty, .entry_price, .exit_price, .pnl(int), .entry_dt, .exit_dt. \
+Each Trade has: .tag, .side(OrderSide), .qty, .entry_price(int), .exit_price(int), .pnl(int), \
+.entry_dt(str "YYYY-MM-DD HH:MM"), .exit_dt(str "YYYY-MM-DD HH:MM"). \
+**entry_dt and exit_dt are STRINGS, not datetime objects** — do NOT call .date() or .hour on them. \
+For date comparison: `last_trade.exit_dt.startswith("2026-04-09")` or `last_trade.exit_dt[:10] == str(bar.dt.date())`. \
 Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.close vs entry_price.
 - `broker.entry(tag: str, side: OrderSide, qty=1)` — queue entry, filled at bar close. Returns None.
   The `tag` is a string you define (e.g. "Long"). Use the SAME tag string in close()/exit() `from_entry`.
