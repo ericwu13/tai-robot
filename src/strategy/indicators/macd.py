@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections import namedtuple
+
 from .ma import ema
+
+MacdResult = namedtuple("MacdResult", ["macd_line", "signal_line", "histogram"])
 
 
 def macd(
@@ -10,11 +14,12 @@ def macd(
     fast_period: int = 12,
     slow_period: int = 26,
     signal_period: int = 9,
-) -> tuple[float, float, float] | None:
+) -> MacdResult | None:
     """Calculate MACD line, signal line, and histogram.
 
-    Returns (macd_line, signal_line, histogram) or None if insufficient data.
-    Requires at least `slow_period + signal_period - 1` values.
+    Returns MacdResult(macd_line, signal_line, histogram) or None if
+    insufficient data. Supports both attribute access (``m.signal_line``)
+    and tuple unpacking (``line, signal, hist = macd(...)``).
     """
     if len(values) < slow_period + signal_period - 1:
         return None
@@ -37,4 +42,4 @@ def macd(
 
     macd_line = macd_series[-1]
     histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+    return MacdResult(macd_line, signal_line, histogram)
