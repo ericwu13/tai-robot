@@ -349,9 +349,9 @@ _ui_queue: queue.Queue = queue.Queue()
 def _log(msg):
     tpe = _taipei_now()
     local = datetime.now()
-    ts_tpe = tpe.strftime("%Y-%m-%d %H:%M:%S")
-    ts_local = local.strftime("%Y-%m-%d %H:%M:%S")
-    if ts_tpe == ts_local:
+    ts_tpe = tpe.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # milliseconds
+    ts_local = local.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    if ts_tpe[:19] == ts_local[:19]:
         line = f"[{ts_tpe}] {msg}"
     else:
         line = f"[{ts_tpe} TPE / {ts_local} local] {msg}"
@@ -4340,6 +4340,13 @@ class BacktestApp:
         # for the issue #45 race guard below.
         poller_action_type = self._fill_poller.action_type
         poller_entry_idx = self._fill_poller.entry_bar_index
+        _log(f"FILL CONFIRM START: type={poller_action_type} "
+             f"entry_bar_idx={poller_entry_idx} "
+             f"pos_before={self._fill_poller.pos_before} "
+             f"pos_current={self._fill_poller.pos_current} "
+             f"fill_pending={self._trading_guard.fill_pending} "
+             f"fill_pending_type={self._trading_guard.fill_pending_type} "
+             f"deferred_close={'yes' if self._trading_guard._deferred_close else 'no'}")
         result = self._fill_poller.confirm()
 
         # Get actual fill price from OpenInterest
@@ -4353,6 +4360,7 @@ class BacktestApp:
                 if p.get("product", "").startswith(prefix):
                     fill_price = p.get("avg_cost", "")
                     break
+        _log(f"FILL CONFIRM PRICE: fill_price={fill_price!r} pos={pos}")
 
         # Guarded write of real_entry_price onto the broker (issue #45).
         # A late entry-fill callback arriving AFTER the sim position has
@@ -4396,12 +4404,18 @@ class BacktestApp:
         if poller_action_type == "entry":
             deferred = self._trading_guard.pop_deferred_close()
             if deferred:
+                _log(f"DEFERRED CLOSE REPLAY: action={deferred.get('action')} "
+                     f"side={deferred.get('side')} price={deferred.get('price')} "
+                     f"fill_pending={self._trading_guard.fill_pending} "
+                     f"real_entry_confirmed={self._trading_guard.real_entry_confirmed}")
                 self._live_log_msg(
                     f"重送延遲平倉 Replaying deferred close: {deferred['action']}",
                     "exit")
                 self._log_order_decision(
                     "DEFERRED_CLOSE_REPLAY", deferred["action"])
                 self._handle_semi_auto_order(deferred)
+            else:
+                _log(f"FILL CONFIRM DONE: no deferred close to replay")
 
     def _on_fill_timeout(self) -> None:
         """Called when fill confirmation times out — downgrade to semi-auto."""
