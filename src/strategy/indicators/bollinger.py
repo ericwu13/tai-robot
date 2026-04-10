@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import math
+from collections import namedtuple
 
 from .ma import sma
+
+BollingerResult = namedtuple("BollingerResult", ["upper", "middle", "lower"])
 
 
 def bollinger_bands(
     values: list[int | float],
     period: int = 20,
     num_std: float = 2.0,
-) -> tuple[float, float, float] | None:
+) -> BollingerResult | None:
     """Calculate Bollinger Bands.
 
-    Returns (upper, middle, lower) or None if insufficient data.
+    Returns BollingerResult(upper, middle, lower) or None if insufficient
+    data. Supports both attribute access (``bb.middle``) and tuple
+    unpacking (``upper, mid, lower = bollinger_bands(...)``).
     """
     if len(values) < period:
         return None
@@ -27,4 +32,4 @@ def bollinger_bands(
 
     upper = middle + num_std * std_dev
     lower = middle - num_std * std_dev
-    return upper, middle, lower
+    return BollingerResult(upper, middle, lower)
