@@ -26,6 +26,12 @@ class TradingGuard:
         self.halted: bool = False
         self.halt_reason: str = ""
 
+        # Deferred close (issue #50). When a TRADE_CLOSE is blocked by
+        # BLOCK_FILL_PENDING, the decision is stored here. When
+        # _on_fill_confirmed("entry") fires, the caller pops and replays
+        # the deferred close so the real exit order isn't permanently lost.
+        self._deferred_close: dict | None = None
+
     def reset(self) -> None:
         """Reset all state (called on new deploy)."""
         self.real_entry_confirmed = False
@@ -35,6 +41,7 @@ class TradingGuard:
         self.fill_pending_type = ""
         self.halted = False
         self.halt_reason = ""
+        self._deferred_close = None
 
     # ── Entry / exit gating ──
 
@@ -100,6 +107,25 @@ class TradingGuard:
         self.halt_reason = f"{self.fill_pending_type} fill not confirmed"
         self.fill_pending = False
         self.fill_pending_type = ""
+        self._deferred_close = None  # discard — system is halting
+
+    # ── Deferred close (issue #50) ──
+
+    def defer_close(self, decision: dict) -> None:
+        """Store a close decision that was blocked by fill_pending.
+
+        Called when a TRADE_CLOSE is rejected with BLOCK_FILL_PENDING.
+        The caller retrieves it via pop_deferred_close() after the
+        entry fill is confirmed, so the exit order isn't permanently
+        lost.
+        """
+        self._deferred_close = decision
+
+    def pop_deferred_close(self) -> dict | None:
+        """Retrieve and clear the stored deferred close, if any."""
+        d = self._deferred_close
+        self._deferred_close = None
+        return d
 
     def clear_halt(self) -> None:
         """Manual reset of halted state after human verification."""

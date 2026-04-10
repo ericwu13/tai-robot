@@ -3787,28 +3787,49 @@ class BacktestApp:
             # Update watchdog: live ticks always, history ticks only during replay
             self._tick_watchdog.on_tick()
 
-        # Detect transition from history to live ticks
-        if not is_history and not self._live_history_done:
-            self._live_history_done = True
-            self._live_history_tick_count = self._live_tick_count
-            # Enable strategy execution now that we're on live data
-            self._live_runner.suppress_strategy = False
-            status = self._live_runner.get_status()
-            self._live_log_msg(
-                f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "
-                f"{status['bars_1m']} 1m bars built. Now receiving live ticks.",
-                "status",
-            )
-            self._update_live_status()
-            self._update_live_results()
-
-        # Convert SK date/time integers to datetime (strip tz — bars are tz-naive)
+        # Convert SK date/time integers to datetime FIRST — we need the
+        # timestamp for the staleness check below (issue #50 fix).
         try:
-            dt = combine_sk_datetime(date, time_hms, time_millismicros)
-            if dt.tzinfo is not None:
-                dt = dt.replace(tzinfo=None)
+            dt_aware = combine_sk_datetime(date, time_hms, time_millismicros)
+            dt = dt_aware.replace(tzinfo=None) if dt_aware.tzinfo else dt_aware
         except Exception:
             return
+
+        # Detect transition from history to live ticks.
+        # Issue #50: COM sometimes sends historical ticks via
+        # OnNotifyTicksLONG (is_history=False) instead of
+        # OnNotifyHistoryTicksLONG (is_history=True). If we blindly
+        # trust the flag, suppress_strategy gets cleared on the FIRST
+        # tick of the replay and the strategy runs on hours-old data,
+        # entering real trades at stale prices.
+        #
+        # Defense: also check whether the tick's datetime is "stale"
+        # (> 2 minutes behind wall-clock). If so, treat as history
+        # regardless of the is_history flag.
+        _HISTORY_STALENESS_SECONDS = 120  # 2 minutes
+        if not is_history and not self._live_history_done:
+            now = _taipei_now()
+            # dt is naive (tz stripped), now is aware — compare as naive
+            now_naive = now.replace(tzinfo=None)
+            tick_age = (now_naive - dt).total_seconds()
+            if tick_age > _HISTORY_STALENESS_SECONDS:
+                # COM lied about is_history — tick is old, keep suppressing
+                if self._live_tick_count <= 5:
+                    _log(f"[STALE TICK] is_history=False but tick is {tick_age:.0f}s old "
+                         f"(dt={dt}), keeping suppress_strategy=True")
+            else:
+                # Genuine live tick — safe to enable strategy
+                self._live_history_done = True
+                self._live_history_tick_count = self._live_tick_count
+                self._live_runner.suppress_strategy = False
+                status = self._live_runner.get_status()
+                self._live_log_msg(
+                    f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "
+                    f"{status['bars_1m']} 1m bars built. Now receiving live ticks.",
+                    "status",
+                )
+                self._update_live_status()
+                self._update_live_results()
 
         # Skip ticks during closed market (settlement/reference data at 14:50 etc.)
         if not is_market_open(dt):
@@ -3965,6 +3986,14 @@ class BacktestApp:
             self._live_log_msg(
                 f"等待確認中 Pending: {details['reason']}", "status")
             self._log_order_decision("REAL_ORDER_PENDING_BLOCK", details["reason"])
+            # Issue #50: store blocked TRADE_CLOSE so it can be replayed
+            # after _on_fill_confirmed("entry") clears fill_pending. Without
+            # this, the close decision is permanently lost and the real
+            # position stays open while the simulated broker is flat.
+            if action in ("TRADE_CLOSE", "FORCE_CLOSE"):
+                guard.defer_close(decision)
+                self._live_log_msg(
+                    f"延遲平倉已儲存 Deferred close stored: {action}", "status")
             return
 
         if verdict == guard.BLOCK_ENTRY:
@@ -4359,6 +4388,20 @@ class BacktestApp:
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
         if _discord and _discord.enabled:
             _discord.fill_confirmed(result.action_type, fill_price)
+
+        # Issue #50: replay any deferred close that was blocked by
+        # BLOCK_FILL_PENDING. Now that the entry fill is confirmed
+        # (fill_pending cleared, real_entry_confirmed set), the
+        # replayed TRADE_CLOSE should pass guard.decide() normally.
+        if poller_action_type == "entry":
+            deferred = self._trading_guard.pop_deferred_close()
+            if deferred:
+                self._live_log_msg(
+                    f"重送延遲平倉 Replaying deferred close: {deferred['action']}",
+                    "exit")
+                self._log_order_decision(
+                    "DEFERRED_CLOSE_REPLAY", deferred["action"])
+                self._handle_semi_auto_order(deferred)
 
     def _on_fill_timeout(self) -> None:
         """Called when fill confirmation times out — downgrade to semi-auto."""
