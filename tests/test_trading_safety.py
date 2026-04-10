@@ -611,3 +611,106 @@ class TestScenarioAutoFillGating:
         assert verdict == g.BLOCK_HALTED
         verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
         assert verdict == g.BLOCK_HALTED
+
+
+# ── Regression: issue #50 — deferred close after BLOCK_FILL_PENDING ──
+
+class TestDeferredCloseIssue50:
+    """Regression tests for the deferred close mechanism (issue #50).
+
+    When a TRADE_CLOSE is blocked by BLOCK_FILL_PENDING (entry fill
+    not yet confirmed), the decision is stored via defer_close(). When
+    _on_fill_confirmed("entry") fires, the caller pops and replays it
+    so the real exit order isn't permanently lost.
+
+    Without this fix, rapid-fire historical bar replay could enter a
+    trade AND close it within the same ~1-second burst. The close
+    gets blocked because the entry fill confirmation hasn't arrived
+    yet (takes ~3s via OpenInterest polling), and without the deferred
+    replay mechanism the real position is left open forever.
+    """
+
+    def test_defer_and_pop(self):
+        g = TradingGuard()
+        decision = {"action": "TRADE_CLOSE", "side": "LONG", "price": 35222}
+        g.defer_close(decision)
+        assert g.pop_deferred_close() == decision
+
+    def test_pop_clears_storage(self):
+        g = TradingGuard()
+        g.defer_close({"action": "TRADE_CLOSE"})
+        g.pop_deferred_close()
+        assert g.pop_deferred_close() is None
+
+    def test_pop_returns_none_when_empty(self):
+        g = TradingGuard()
+        assert g.pop_deferred_close() is None
+
+    def test_reset_clears_deferred(self):
+        g = TradingGuard()
+        g.defer_close({"action": "TRADE_CLOSE"})
+        g.reset()
+        assert g.pop_deferred_close() is None
+
+    def test_timeout_clears_deferred(self):
+        """Fill timeout → system halts, deferred close discarded."""
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.defer_close({"action": "TRADE_CLOSE"})
+        g.on_fill_timeout()
+        assert g.pop_deferred_close() is None
+
+    def test_deferred_close_replayed_after_entry_confirm(self):
+        """Full flow: entry pending → close blocked & deferred → entry
+        confirmed → deferred close popped → decide() allows exit."""
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+
+        # TRADE_CLOSE is blocked
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.BLOCK_FILL_PENDING
+
+        # Store the blocked decision
+        decision = {"action": "TRADE_CLOSE", "side": "LONG", "price": 35222}
+        g.defer_close(decision)
+
+        # Entry fill confirmed — clears fill_pending + sets real_entry_confirmed
+        g.on_fill_confirmed()
+        g.on_entry_sent()
+
+        # Pop and verify the deferred close is ready to replay
+        deferred = g.pop_deferred_close()
+        assert deferred is not None
+        assert deferred["action"] == "TRADE_CLOSE"
+
+        # Now the replayed close should pass decide()
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+    def test_entry_fill_not_deferred(self):
+        """ENTRY_FILL blocked by fill_pending should NOT be stored."""
+        g = TradingGuard()
+        g.on_fill_pending("exit")
+
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_FILL_PENDING
+        # Entry decisions are not deferred — only closes
+        assert g.pop_deferred_close() is None
+
+    def test_force_close_bypasses_fill_pending(self):
+        """FORCE_CLOSE bypasses the gate entirely, never needs deferral."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT  # not blocked
+        assert g.pop_deferred_close() is None  # nothing deferred
+
+    def test_second_defer_overwrites_first(self):
+        """If two closes are deferred (shouldn't happen normally), last wins."""
+        g = TradingGuard()
+        g.defer_close({"action": "TRADE_CLOSE", "tag": "first"})
+        g.defer_close({"action": "TRADE_CLOSE", "tag": "second"})
+        d = g.pop_deferred_close()
+        assert d["tag"] == "second"
