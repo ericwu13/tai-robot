@@ -204,7 +204,7 @@ sma(values, period) -> float | None
 ema(values, period) -> float | None
 rsi(values, period=14) -> float | None           # 0-100
 macd(values, fast_period=12, slow_period=26, signal_period=9) -> (macd_line, signal_line, histogram) | None
-bollinger_bands(values, period=20, num_std=2.0) -> (upper, middle, lower) | None
+bollinger_bands(values, period=20, num_std=2.0) -> (upper, middle, lower) | None  # MUST unpack: `bb_upper, bb_mid, bb_lower = bollinger_bands(...)` — do NOT use `.upper`/`.middle`/`.lower` attribute access
 atr(highs, lows, closes, period=14) -> float | None
 adx(highs, lows, closes, period=14) -> float | None   # 0-100, trend strength
 plus_di(highs, lows, closes, period=14) -> float | None  # +DI (0-100)
