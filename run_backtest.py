@@ -2421,7 +2421,9 @@ class BacktestApp:
                 self.root.after(0, lambda: self._on_backtest_done(result, bars, initial_balance))
             except Exception as e:
                 tb = traceback.format_exc()
-                self.root.after(0, lambda: self._on_backtest_error(e, tb))
+                # Capture via default args — Python 3.13 deletes `e` after
+                # the except block, so a bare lambda closure can't see it.
+                self.root.after(0, lambda err=e, tb=tb: self._on_backtest_error(err, tb))
 
         threading.Thread(target=_backtest_worker, daemon=True).start()
 
