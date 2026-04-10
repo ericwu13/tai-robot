@@ -177,6 +177,13 @@ class SimulatedBroker:
         self._pending_exits = [
             o for o in self._pending_exits if o.from_entry != order.from_entry
         ]
+        # Auto-round float prices to int (TAIFEX prices are integers).
+        # AI-generated strategies sometimes pass raw float calculations
+        # like limit=35307.30 which should be 35307.
+        if order.limit is not None:
+            order.limit = int(round(order.limit))
+        if order.stop is not None:
+            order.stop = int(round(order.stop))
         self._pending_exits.append(order)
 
     def queue_market_close(self, tag: str, from_entry: str) -> None:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections import namedtuple
+
+StochasticResult = namedtuple("StochasticResult", ["k", "d"])
+
 
 def stochastic(
     highs: list[int | float],
@@ -9,14 +13,16 @@ def stochastic(
     closes: list[int | float],
     k_period: int = 14,
     d_period: int = 3,
-) -> tuple[float, float] | None:
+) -> StochasticResult | None:
     """Calculate Stochastic Oscillator matching TradingView's ta.stoch().
 
     %K = 100 * (close - lowest_low(k_period)) / (highest_high(k_period) - lowest_low(k_period))
     %D = SMA(%K, d_period)
 
     Requires at least ``k_period + d_period - 1`` bars.
-    Returns ``(k_value, d_value)`` or ``None`` if insufficient data.
+    Returns ``StochasticResult(k, d)`` or ``None`` if insufficient data.
+    Supports both attribute access (``s.k``) and tuple unpacking
+    (``k_val, d_val = stochastic(...)``).
     If highest_high equals lowest_low (zero range), returns ``(50.0, 50.0)``.
     """
     min_length = k_period + d_period - 1
@@ -42,4 +48,4 @@ def stochastic(
 
     k_value = k_values[-1]
     d_value = sum(k_values) / d_period
-    return (k_value, d_value)
+    return StochasticResult(k_value, d_value)
