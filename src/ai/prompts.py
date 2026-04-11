@@ -163,19 +163,34 @@ Each Trade has: .tag, .side(OrderSide), .qty, .entry_price(int), .exit_price(int
 **entry_dt and exit_dt are STRINGS, not datetime objects** — do NOT call .date() or .hour on them. \
 For date comparison: `last_trade.exit_dt.startswith("2026-04-09")` or `last_trade.exit_dt[:10] == str(bar.dt.date())`. \
 Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.close vs entry_price.
-- `broker.entry(tag: str, side: OrderSide, qty=1)` — queue entry, filled at bar close. Returns None.
-  The `tag` is a string you define (e.g. "Long"). Use the SAME tag string in close()/exit() `from_entry`.
-- `broker.exit(tag, from_entry: str, limit=None, stop=None)` — sets limit/stop exit orders, checked on NEXT bar's OHLC
+- `broker.entry(tag: str, side: OrderSide, qty=1)` — queue an entry. In GUI
+  backtests entries fill at the NEXT bar's OPEN (next-bar-open fill model,
+  matches TradingView default), which means TP/SL exits queued on the same
+  on_bar call can trigger on the same bar the entry fills — a 0-bar trade
+  is possible. Returns None. `tag` is a string you define (e.g. "Long");
+  use the SAME tag in close()/exit() `from_entry`.
+- `broker.exit(tag, from_entry: str, limit=None, stop=None)` — sets limit/stop
+  exit orders. In GUI backtests the exit is checked against the FILL bar's
+  full OHLC, so a stop or target hit on the same bar the entry fills closes
+  the trade immediately (same-bar enter+exit). Design stops to survive the
+  gap between signal-bar close and fill-bar open.
   **exit() requires TWO string args**: `tag` (exit order name) AND `from_entry` (matching the entry tag).
   Example: `broker.exit("exit_long", "Long", limit=21000, stop=19800)`
 - `broker.close(from_entry: str, tag="close")` — market close at current bar's close (use this for manual exit conditions)
 - `broker.effective_entry_price()` -> int — best-available reference price for entry-relative stop calculations.
   Returns the REAL broker-confirmed entry price in auto/semi_auto mode once the fill is confirmed;
-  otherwise falls back to the simulated entry price (paper mode, pre-confirmation window, or fill timeout).
-  Returns 0 when flat. ALWAYS use this — never hard-code `broker.entry_price` or `bar.close` for SL math.
+  otherwise falls back to the simulated entry price. Returns 0 when flat.
+  **ALWAYS use this** — never cache `bar.close` at signal time as a proxy for the
+  entry price and never hard-code `broker.entry_price` for SL math. Under the
+  next-bar-open fill model the signal-bar close is NOT the entry price; only
+  `effective_entry_price()` tracks the real fill. Read it from inside the
+  `if broker.position_size > 0:` branch (one bar AFTER you queued the entry)
+  so the fill has already happened.
   Example: `stop = broker.effective_entry_price() - 50`
-- `broker.entry_price` -> int — the SIMULATED entry price (bar.close at signal time). Prefer
-  `effective_entry_price()` for stop math so your stops track the real fill in live mode.
+- `broker.entry_price` -> int — the SIMULATED entry price. In GUI backtests this
+  is the FILL bar's open (set by on_bar_open on the bar after the signal).
+  In live mode it's a transient placeholder that gets overwritten by the real
+  exchange fill via OpenInterest. Prefer `effective_entry_price()` for stop math.
 - **IMPORTANT**: `entry()` returns None — do NOT store its return value. Track position state with `broker.position_size` and use the tag string literal in close()/exit().
 - **IMPORTANT**: `exit()` REQUIRES limit and/or stop prices to work. exit() with no limit/stop does NOTHING.
   Use `close()` for immediate market exits (e.g. when checking bar.high >= target in on_bar).
