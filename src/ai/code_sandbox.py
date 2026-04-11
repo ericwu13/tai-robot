@@ -54,22 +54,51 @@ class CodeExecutionError(Exception):
     pass
 
 
+def _strip_trailing_markdown(code: str) -> str:
+    """Remove trailing markdown that leaked into extracted Python code.
+
+    AI models sometimes put the Notes section inside the code fence.
+    Lines like ``### **Notes**``, ``**Parameter Choices:**``, or
+    ``*   Description`` are valid markdown but invalid Python. Strip
+    them from the end so compilation doesn't fail.
+    """
+    lines = code.split("\n")
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped:
+            lines.pop()
+            continue
+        if (stripped.startswith("### ")
+                or stripped.startswith("## ")
+                or stripped.startswith("**")
+                or stripped.startswith("* ")
+                or stripped.startswith("*   ")
+                or stripped.startswith("- ")
+                or stripped.startswith("> ")):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines)
+
+
 def extract_python_code(response: str) -> str | None:
     """Extract the first ```python ... ``` code block from an AI response.
 
-    Also handles truncated responses where the closing ``` is missing.
+    Also handles truncated responses where the closing ``` is missing,
+    and strips trailing markdown notes that the AI sometimes includes
+    inside the code fence.
     """
     # Try complete code block first
     pattern = r"```python\s*\n(.*?)```"
     match = re.search(pattern, response, re.DOTALL)
     if match:
-        return match.group(1).strip()
+        return _strip_trailing_markdown(match.group(1).strip())
 
     # Handle truncated response (no closing ```)
     pattern_open = r"```python\s*\n(.*)"
     match = re.search(pattern_open, response, re.DOTALL)
     if match:
-        code = match.group(1).strip()
+        code = _strip_trailing_markdown(match.group(1).strip())
         if "class " in code and "def " in code:
             return code
 
