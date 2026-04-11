@@ -823,6 +823,7 @@ class BacktestApp:
         self._build_results_notebook(right)
 
         self._last_result = None
+        self._last_review_metrics: dict | None = None  # {pf, dd_pct} from previous AI Review
         self._last_bars: list[Bar] = []
         self._raw_bars: list[Bar] = []  # unfiltered bars from any source, for re-running
         self._raw_bars_key: tuple = ()  # (symbol, kline_type, kline_minute) of stored raw bars
@@ -2863,9 +2864,41 @@ class BacktestApp:
                 f"P&L={t.pnl:+,} ({bars_held} bars)"
             )
 
+        # Detect degradation vs previous review round
+        cur_pf = result.metrics.profit_factor
+        cur_dd = result.metrics.max_drawdown_pct
+        degradation_section = ""
+        if self._last_review_metrics is not None:
+            prev_pf = self._last_review_metrics["pf"]
+            prev_dd = self._last_review_metrics["dd_pct"]
+            pf_worse = cur_pf < prev_pf
+            dd_worse = cur_dd > prev_dd
+            if pf_worse or dd_worse:
+                degradation_section = (
+                    f"## ⚠ DEGRADATION DETECTED — REVERT FIRST ⚠\n"
+                    f"Previous review metrics: PF={prev_pf:.2f}, DD={prev_dd:.2f}%\n"
+                    f"Current metrics:         PF={cur_pf:.2f}, DD={cur_dd:.2f}%\n"
+                    f"{'  → Profit Factor DROPPED' if pf_worse else ''}"
+                    f"{'  → Max Drawdown INCREASED' if dd_worse else ''}\n\n"
+                    f"**MANDATORY**: The last change made things worse. Your ONLY "
+                    f"recommendation must be to REVERT the last change and return to "
+                    f"the previous version. Do NOT suggest new changes on top of a "
+                    f"degraded strategy. Do NOT try to fix the degradation by adding "
+                    f"more complexity. Say: \"上一次的修改使績效惡化，建議還原到修改前的版本。"
+                    f"The last change degraded performance — revert to the prior version "
+                    f"before attempting any new changes.\"\n"
+                    f"The ONLY exception is if you identify an obvious code BUG (e.g. "
+                    f"wrong operator, missing round()) that clearly caused the "
+                    f"degradation — in that case, suggest fixing that specific bug only.\n\n"
+                )
+
+        # Save current metrics for next review round comparison
+        self._last_review_metrics = {"pf": cur_pf, "dd_pct": cur_dd}
+
         preamble = (
             f"以下是回測/實盤結果，請根據策略原始碼分析交易表現。\n"
             f"Below are the backtest/live results. Analyze the trading performance.\n\n"
+            f"{degradation_section}"
             f"## Analysis rules (MUST FOLLOW)\n"
             f"1. **Identify what is WORKING first** — list 2-3 aspects that should NOT be changed.\n"
             f"2. **Suggest at most ONE change** — never multiple simultaneous changes. "
@@ -2873,9 +2906,14 @@ class BacktestApp:
             f"3. **Distinguish bugs from tuning** — a code bug (wrong comparison, missing round()) "
             f"is a fix. Changing parameters or adding filters is tuning. Fix bugs first; "
             f"tune ONE parameter at a time only.\n"
-            f"4. **Do NOT overfit** — if you suggest removing losing trades via a new filter, "
-            f"state how many WINNING trades the filter would also remove. "
-            f"A filter that removes 10 losers but also 8 winners is probably not worth it.\n"
+            f"4. **MANDATORY: winner/loser impact count** — before suggesting ANY filter, "
+            f"condition, or parameter change, you MUST scan the trade list and estimate:\n"
+            f"   - How many LOSING trades would the change remove/avoid?\n"
+            f"   - How many WINNING trades would the change also remove/avoid?\n"
+            f"   - Present this as: \"Estimated impact: removes ~N losers, ~M winners\"\n"
+            f"   - If you cannot estimate (e.g. insufficient data), say so explicitly "
+            f"and do NOT recommend the change. A suggestion without impact analysis is "
+            f"not allowed.\n"
             f"5. **Bias toward simplicity** — adding indicators, conditions, or parameters "
             f"rarely improves robustness. If the strategy has >4 entry conditions, "
             f"suggest REMOVING one before adding another.\n"
