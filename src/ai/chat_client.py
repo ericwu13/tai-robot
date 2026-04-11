@@ -40,7 +40,9 @@ class ChatClient:
         self.max_tokens = max_tokens
         self.system_prompt: str = ""
         self.conversation: list[dict] = []
-        self._client = httpx.Client(timeout=120.0)
+        self._client = httpx.Client(timeout=httpx.Timeout(
+            connect=30.0, read=300.0, write=30.0, pool=30.0,
+        ))
 
     def set_system_prompt(self, prompt: str) -> None:
         self.system_prompt = prompt
