@@ -66,10 +66,22 @@ class BrokerContext:
     def entry_price(self) -> int:
         """Simulated entry price of the current open position (0 if flat).
 
-        This is the price the strategy DECIDED to enter at (usually
-        ``bar.close`` at signal time). For stop-loss calculations in
-        live/auto mode prefer :meth:`effective_entry_price` so the
-        stop tracks the REAL fill price when available.
+        The exact value depends on the broker's fill_mode:
+
+        - ``on_close`` backtest: signal bar's close (the price the strategy
+          decided at; process_orders_on_close=true semantics).
+        - ``next_open`` backtest: the FILL bar's open — i.e. the bar AFTER
+          the signal bar. Under this mode the signal-bar close is NOT the
+          entry price, so any caching of ``bar.close`` at signal time as
+          a proxy will be off by one bar of price movement.
+        - live mode: a transient placeholder until the real exchange fill
+          confirms, then overwritten by ``try_set_real_entry_price``.
+
+        For stop-loss calculations always prefer :meth:`effective_entry_price`
+        so the stop tracks the REAL fill price when available and the fill
+        bar's open otherwise. Read it from within the ``if position_size > 0``
+        branch, one bar after you queued the entry — by then the fill has
+        happened and ``entry_price`` reflects the actual fill price.
         """
         return self._broker.entry_price
 
@@ -126,16 +138,55 @@ class BrokerContext:
 
 
 class SimulatedBroker:
-    """Order matching engine for backtesting.
+    """Order matching engine used by both backtest and live-runner.
 
-    Fill semantics (matching TradingView process_orders_on_close=true):
-    - Bar N: strategy on_bar() queues entry -> fills at bar N close
-    - Bar N+1 onward: exit limit/stop checked against each bar's OHLC
+    The ``fill_mode`` ctor arg means different things in the two contexts:
+
+    ``"on_close"`` (default)
+        BACKTEST: TradingView process_orders_on_close=true semantics.
+            Bar N: strategy queues entry -> entry fills at bar N's close.
+            Bar N+1 onward: exits checked against each bar's OHLC.
+            Minimum trade lifetime: 1 bar. Same-bar enter+exit NOT possible.
+            Legacy mode; tests pin behavior here via the default.
+
+        LIVE: NOT a fill model — a synchronous placeholder mechanism.
+            on_bar_close creates the simulated position immediately at the
+            bar's close price, giving the rest of the system consistent
+            state (position_size, entry_bar_index, entry_tag) the moment
+            the strategy decides. ~50ms later the real Capital API fill
+            confirms via OpenInterest and try_set_real_entry_price
+            overwrites the placeholder with the actual exchange fill price
+            (see issue #45 and effective_entry_price).
+
+            next_open would break this: the simulated position wouldn't
+            exist until the next bar arrives (up to 4 hours later for H4),
+            so try_set_real_entry_price would be rejected by the
+            position_size==0 guard and the real fill price would never be
+            recorded. Live therefore stays on on_close regardless of
+            whether TradingView parity is the goal.
+
+    ``"next_open"`` (BACKTEST only)
+        TradingView process_orders_on_close=false semantics. Bar N: strategy
+        queues entry. Bar N+1: entry fills at bar N+1's OPEN, then check_exits
+        runs against bar N+1's OHLC — so a TP/SL hit on bar N+1 closes the
+        trade on the same bar it opened (same-bar enter+exit). entry_price
+        reflects the fill bar's open, not the signal bar's close. Used by
+        BacktestEngine when the GUI runs a backtest.
+
+        Do NOT use in live: see the on_close/LIVE note above.
+
+    Common semantics (both modes):
     - Ambiguous bar (both SL and TP hit): open <= stop -> SL first; else TP first
     - End of data: force-close any open position at last bar's close
+    - ``broker.close()`` market-on-close exits always fill at the current bar's
+      close (a market-on-close order is close-fill by definition)
+    - Unknown fill_mode values degrade to close-fill (on_bar_close fills
+      entries whenever fill_mode != "next_open"), so a typo can't silently
+      drop all entry fills.
     """
 
-    def __init__(self, point_value: int = 1):
+    def __init__(self, point_value: int = 1, fill_mode: str = "on_close"):
+        self.fill_mode = fill_mode
         self.point_value = point_value
         self.position_size: int = 0
         self.position_side: OrderSide | None = None
@@ -190,18 +241,40 @@ class SimulatedBroker:
         """Queue a market close — fills at current bar's close."""
         self._pending_market_closes.append((tag, from_entry))
 
-    def on_bar_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
-        """Process pending market closes and entry orders at bar close.
+    def on_bar_open(self, bar_index: int, open_: int, bar_dt: str = "") -> None:
+        """Fill pending entry orders at this bar's open (next_open mode only).
 
-        Order: market closes first, then entries.
-        Same-bar re-entry is allowed (matches TradingView semantics):
-        exit fills intra-bar at TP/SL price, entry fills at bar close.
-        In live trading, tick-level exit detection separates these naturally.
+        In ``fill_mode="next_open"`` the engine calls this at the START of
+        each bar, BEFORE check_exits, so a position opened at this bar's
+        open can be closed intra-bar via TP/SL on the same bar — enabling
+        same-bar entry+exit, matching TradingView strategy.entry() default.
+
+        In ``fill_mode="on_close"`` this is a no-op; entries are filled by
+        on_bar_close at the signal bar's close instead.
+        """
+        self._bar_index = bar_index
+        self._current_bar_dt = bar_dt
+        if self.fill_mode == "next_open":
+            self._fill_pending_entries(bar_index, open_, bar_dt)
+
+    def on_bar_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
+        """Process pending market closes and (in on_close mode) entry orders.
+
+        Market closes ALWAYS fill at this bar's close in both modes —
+        ``broker.close()`` is a market-on-close order by definition.
+
+        In ``fill_mode="on_close"`` this also fills pending entries at
+        the bar's close (legacy semantics; same-bar re-entry supported:
+        exit fills intra-bar at TP/SL, entry fills at bar close).
+
+        In ``fill_mode="next_open"`` entries are NOT filled here; the
+        engine calls on_bar_open(bar_index+1, ...) on the next bar to
+        fill them at the next bar's open instead.
         """
         self._bar_index = bar_index
         self._current_bar_dt = bar_dt
 
-        # Process market closes first
+        # Process market closes first (fills at this bar's close — both modes)
         for tag, from_entry in self._pending_market_closes:
             if self.position_size > 0 and self.entry_tag == from_entry:
                 self.last_exit_type = "close"
@@ -210,11 +283,27 @@ class SimulatedBroker:
                 break
         self._pending_market_closes.clear()
 
+        # Legacy close-fill: fill pending entries at this bar's close.
+        # Written as `!= "next_open"` (not `== "on_close"`) so an unknown
+        # fill_mode value safely degrades to close-fill instead of silently
+        # dropping all entries — the only branch that opts OUT of filling
+        # here is the explicit next_open mode.
+        if self.fill_mode != "next_open":
+            self._fill_pending_entries(bar_index, close, bar_dt)
+
+    def _fill_pending_entries(self, bar_index: int, price: int, bar_dt: str) -> None:
+        """Fill all pending entry orders at the given price.
+
+        Shared by on_bar_open (next_open mode) and on_bar_close (on_close
+        mode). Only the first pending entry takes effect when flat — once
+        a position is open, subsequent pending entries are dropped (matches
+        TradingView's pyramiding=1 default).
+        """
         for order in self._pending_entries:
             if self.position_size == 0:
                 self.position_size = order.qty
                 self.position_side = order.side
-                self.entry_price = close
+                self.entry_price = price
                 self.entry_tag = order.tag
                 self.entry_bar_index = bar_index
                 self._entry_dt = bar_dt
@@ -416,6 +505,7 @@ class SimulatedBroker:
         """Serialize broker state for session persistence."""
         return {
             "point_value": self.point_value,
+            "fill_mode": self.fill_mode,
             "position_size": self.position_size,
             "position_side": self.position_side.value if self.position_side else None,
             "entry_price": self.entry_price,
@@ -451,7 +541,10 @@ class SimulatedBroker:
         All new fields use ``.get()`` with safe defaults so old session
         files (before issue #45) load without error.
         """
-        broker = cls(point_value=data.get("point_value", 1))
+        broker = cls(
+            point_value=data.get("point_value", 1),
+            fill_mode=data.get("fill_mode", "on_close"),
+        )
         broker.position_size = data.get("position_size", 0)
         side = data.get("position_side")
         broker.position_side = OrderSide(side) if side else None

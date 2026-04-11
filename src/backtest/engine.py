@@ -29,11 +29,24 @@ class BacktestResult:
 class BacktestEngine:
     """Replays a list of bars through a strategy and simulated broker.
 
-    Fill semantics match TradingView with process_orders_on_close=true:
-    1. Feed bar into DataStore
-    2. Check pending exit orders against this bar's OHLC
-    3. Run strategy.on_bar() which may queue new entry/exit orders
-    4. Process pending entry orders at this bar's close
+    Two fill modes (selectable via ``fill_mode`` ctor arg):
+
+    ``"on_close"`` (default — TradingView process_orders_on_close=true):
+        1. Feed bar into DataStore
+        2. Check pending exit orders against this bar's OHLC
+        3. Run strategy.on_bar() which may queue new entry/exit orders
+        4. Process pending entry orders at this bar's close
+        Minimum trade lifetime: 1 bar.
+
+    ``"next_open"`` (TradingView process_orders_on_close=false default):
+        1. Feed bar into DataStore
+        2. Fill pending entries (queued on prior bar) at THIS bar's open
+        3. Check pending exit orders against this bar's OHLC — INCLUDES
+           the position just opened by step 2, enabling same-bar enter+exit
+        4. Run strategy.on_bar() which may queue new entry/exit orders
+           for the NEXT bar's open
+        5. Process pending market closes at this bar's close
+        Minimum trade lifetime: 0 bars (enter+exit on the same bar).
     """
 
     def __init__(
@@ -41,9 +54,10 @@ class BacktestEngine:
         strategy: BacktestStrategy,
         point_value: int = 1,
         max_bars: int = 5000,
+        fill_mode: str = "on_close",
     ):
         self.strategy = strategy
-        self.broker = SimulatedBroker(point_value=point_value)
+        self.broker = SimulatedBroker(point_value=point_value, fill_mode=fill_mode)
         self.data_store = DataStore(max_bars=max_bars)
 
     def run(self, bars: list[Bar]) -> BacktestResult:
@@ -55,15 +69,21 @@ class BacktestEngine:
 
             bar_dt = bar.dt.strftime("%Y-%m-%d %H:%M") if bar.dt else ""
 
-            # Check exit orders from previous bar against this bar's OHLC
-            if i > 0:
+            # next_open mode: fill entries queued on the prior bar at THIS
+            # bar's open. on_close mode: no-op (entries fill in on_bar_close).
+            self.broker.on_bar_open(i, bar.open, bar_dt)
+
+            # Check exits against this bar's OHLC. In next_open mode this
+            # check sees any position just opened by on_bar_open above —
+            # that's how same-bar entry+exit becomes possible.
+            if i > 0 or self.broker.position_size > 0:
                 self.broker.check_exits(i, bar.open, bar.high, bar.low, bar.close, bar_dt)
 
             # Run strategy once enough bars accumulated
             if len(self.data_store) >= required:
                 self.strategy.on_bar(bar, self.data_store, ctx)
 
-            # Fill entry orders at this bar's close
+            # Process market closes (and, in on_close mode, fill entries)
             self.broker.on_bar_close(i, bar.close, bar_dt)
 
         # Force close any open position at end of data

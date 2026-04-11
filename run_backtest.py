@@ -2411,7 +2411,14 @@ class BacktestApp:
             return
 
         strategy = strategy_cls()
-        engine = BacktestEngine(strategy, point_value=point_value)
+        # next_open = entries fill at the next bar's open, so TP/SL can hit
+        # on the same bar as the entry (matches TV strategy.entry() default,
+        # enables same-bar enter+exit). Live mode is unaffected by this flag
+        # because LiveRunner constructs its own broker with the on_close
+        # default — live relies on on_close as a synchronous placeholder
+        # mechanism for the real_entry_price race, not as a fill model.
+        # See SimulatedBroker class docstring for the full model.
+        engine = BacktestEngine(strategy, point_value=point_value, fill_mode="next_open")
 
         _log(f"開始回測 Running backtest: {len(bars)} bars, "
              f"balance={initial_balance:,}, point_value={point_value}")
