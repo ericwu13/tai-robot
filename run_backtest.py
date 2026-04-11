@@ -1300,6 +1300,7 @@ class BacktestApp:
         self._remove_last_system_line()
         self._append_chat("error", f"Error: {error}")
         self.btn_send.config(state=tk.NORMAL)
+        self.btn_generate.config(state=tk.NORMAL)
 
     def _append_chat(self, role: str, text: str):
         """Append a styled message to the chat display."""
