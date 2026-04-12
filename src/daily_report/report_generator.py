@@ -20,21 +20,30 @@ _REPORTS_DIR = Path("data/daily-reports")
 
 
 def _trade_to_dict(t: Trade, point_value: int = 1) -> dict:
-    """Convert a Trade to a JSON-serializable dict with computed fields."""
+    """Convert a Trade to a JSON-serializable dict with computed fields.
+
+    Handles missing or default-valued fields gracefully so that trades from
+    any strategy (hand-written, AI-generated, live, backtest) produce valid
+    output even if optional fields were never populated.
+    """
+    side_val = t.side.value if hasattr(t.side, "value") else str(t.side)
+    pnl = getattr(t, "pnl", 0) or 0
+    entry_bar = getattr(t, "entry_bar_index", 0) or 0
+    exit_bar = getattr(t, "exit_bar_index", 0) or 0
     return {
-        "tag": t.tag,
-        "side": t.side.value,
-        "qty": t.qty,
-        "entry_price": t.entry_price,
-        "exit_price": t.exit_price,
-        "entry_dt": t.entry_dt,
-        "exit_dt": t.exit_dt,
-        "pnl": t.pnl,
-        "pnl_currency": t.pnl * point_value if point_value != 1 else t.pnl,
-        "bars_held": t.exit_bar_index - t.entry_bar_index,
-        "exit_tag": t.exit_tag,
-        "real_entry_price": t.real_entry_price or None,
-        "real_exit_price": t.real_exit_price or None,
+        "tag": getattr(t, "tag", ""),
+        "side": side_val,
+        "qty": getattr(t, "qty", 1),
+        "entry_price": getattr(t, "entry_price", 0),
+        "exit_price": getattr(t, "exit_price", 0),
+        "entry_dt": getattr(t, "entry_dt", ""),
+        "exit_dt": getattr(t, "exit_dt", ""),
+        "pnl": pnl,
+        "pnl_currency": pnl * point_value if point_value != 1 else pnl,
+        "bars_held": exit_bar - entry_bar,
+        "exit_tag": getattr(t, "exit_tag", ""),
+        "real_entry_price": getattr(t, "real_entry_price", 0) or None,
+        "real_exit_price": getattr(t, "real_exit_price", 0) or None,
     }
 
 
@@ -160,6 +169,64 @@ def generate_report_from_backtest(
         reports.append(report)
 
     return reports
+
+
+def generate_session_report(
+    broker,
+    data_store,
+    strategy_name: str = "",
+    strategy_params: dict | None = None,
+    point_value: int = 1,
+    symbol: str = "",
+    date: str = "",
+) -> dict | None:
+    """Generate a daily report from a live session's broker and data store.
+
+    This is the convenience entry point called by LiveRunner.stop().
+    Extracts trades and bar data from the live components and delegates to
+    generate_daily_report().
+
+    Returns the report dict, or None if there are no completed trades.
+    """
+    trades = list(getattr(broker, "trades", []))
+    if not trades:
+        return None
+
+    if not date:
+        # Use the exit date of the last trade, or today
+        last_exit = getattr(trades[-1], "exit_dt", "")
+        date = last_exit[:10] if last_exit else datetime.now().strftime("%Y-%m-%d")
+
+    # Extract bar data for regime classification (best-effort)
+    bars_highs = bars_lows = bars_closes = None
+    if data_store is not None:
+        try:
+            bars_highs = data_store.get_highs()
+            bars_lows = data_store.get_lows()
+            bars_closes = data_store.get_closes()
+        except Exception:
+            pass  # regime classification will be skipped
+
+    # Filter to trades that closed on this date
+    day_trades = [
+        t for t in trades
+        if getattr(t, "exit_dt", "")[:10] == date
+    ]
+    if not day_trades:
+        day_trades = trades  # fallback: include all trades
+
+    return generate_daily_report(
+        date=date,
+        trades=day_trades,
+        bars_highs=bars_highs,
+        bars_lows=bars_lows,
+        bars_closes=bars_closes,
+        strategy_name=strategy_name,
+        strategy_params=strategy_params,
+        point_value=point_value,
+        symbol=symbol,
+        save=True,
+    )
 
 
 def load_report(date: str) -> dict | None:

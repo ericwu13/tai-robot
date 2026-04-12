@@ -21,6 +21,7 @@ from src.daily_report.regime_classifier import (
 from src.daily_report.report_generator import (
     generate_daily_report,
     generate_report_from_backtest,
+    generate_session_report,
     load_report,
     list_reports,
     _group_trades_by_date,
@@ -545,3 +546,182 @@ class TestDiscordDailyReport:
 
         assert len(sent) == 1
         assert "trending" not in sent[0]  # no regime line
+
+
+# ---------------------------------------------------------------------------
+# Graceful field handling tests
+# ---------------------------------------------------------------------------
+
+class TestGracefulFieldHandling:
+    """Ensure _trade_to_dict handles missing/partial fields from any strategy."""
+
+    def test_standard_trade(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        report = generate_daily_report(
+            date="2026-04-11",
+            trades=[_make_trade()],
+            save=False,
+        )
+        td = report["trades"][0]
+        assert td["side"] == "LONG"
+        assert td["tag"] == "Long"
+
+    def test_trade_with_zero_pnl(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        t = _make_trade(pnl=0, entry_price=20000, exit_price=20000)
+        report = generate_daily_report(
+            date="2026-04-11", trades=[t], point_value=200, save=False,
+        )
+        td = report["trades"][0]
+        assert td["pnl"] == 0
+        assert td["pnl_currency"] == 0
+
+    def test_trade_with_no_real_prices(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        t = _make_trade()
+        assert t.real_entry_price == 0  # default
+        report = generate_daily_report(
+            date="2026-04-11", trades=[t], save=False,
+        )
+        td = report["trades"][0]
+        assert td["real_entry_price"] is None
+        assert td["real_exit_price"] is None
+
+    def test_short_side_trade(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        t = _make_trade(side=OrderSide.SHORT, tag="Short")
+        report = generate_daily_report(
+            date="2026-04-11", trades=[t], save=False,
+        )
+        assert report["trades"][0]["side"] == "SHORT"
+
+
+# ---------------------------------------------------------------------------
+# generate_session_report tests
+# ---------------------------------------------------------------------------
+
+class _FakeBroker:
+    """Minimal broker-like object for testing generate_session_report."""
+    def __init__(self, trades):
+        self.trades = trades
+
+
+class _FakeDataStore:
+    """Minimal data-store-like object with get_highs/lows/closes."""
+    def __init__(self, highs, lows, closes):
+        self._highs = highs
+        self._lows = lows
+        self._closes = closes
+
+    def get_highs(self):
+        return self._highs
+
+    def get_lows(self):
+        return self._lows
+
+    def get_closes(self):
+        return self._closes
+
+
+class TestGenerateSessionReport:
+    def test_basic_session_report(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [
+            _make_trade(pnl=100, exit_dt="2026-04-11 10:30"),
+            _make_trade(pnl=-30, exit_dt="2026-04-11 13:00"),
+        ]
+        broker = _FakeBroker(trades)
+
+        report = generate_session_report(
+            broker=broker,
+            data_store=None,
+            strategy_name="Test Strategy",
+            point_value=200,
+            symbol="TXF1",
+        )
+        assert report is not None
+        assert report["date"] == "2026-04-11"
+        assert report["symbol"] == "TXF1"
+        assert len(report["trades"]) == 2
+        assert report["market_regime"] is None  # no data store
+
+    def test_session_report_with_data_store(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [_make_trade(exit_dt="2026-04-11 10:30")]
+        broker = _FakeBroker(trades)
+        highs, lows, closes = _trending_up_bars(120)
+        ds = _FakeDataStore(highs, lows, closes)
+
+        report = generate_session_report(
+            broker=broker,
+            data_store=ds,
+            strategy_name="Trend Follower",
+            symbol="TXF1",
+        )
+        assert report is not None
+        assert report["market_regime"] is not None
+
+    def test_no_trades_returns_none(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        broker = _FakeBroker([])
+        assert generate_session_report(broker=broker, data_store=None) is None
+
+    def test_explicit_date(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [_make_trade(exit_dt="2026-04-11 10:30")]
+        broker = _FakeBroker(trades)
+
+        report = generate_session_report(
+            broker=broker, data_store=None, date="2026-04-10",
+        )
+        assert report is not None
+        # Explicit date overrides trade exit date
+        assert report["date"] == "2026-04-10"
+
+    def test_saves_to_disk(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [_make_trade(exit_dt="2026-04-11 10:30")]
+        broker = _FakeBroker(trades)
+
+        generate_session_report(broker=broker, data_store=None)
+        assert (tmp_path / "2026-04-11.json").exists()
+
+    def test_data_store_error_handled(self, tmp_path, monkeypatch):
+        """If data_store.get_highs() raises, regime is skipped (not crash)."""
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        class _BrokenDataStore:
+            def get_highs(self):
+                raise RuntimeError("broken")
+            def get_lows(self):
+                return []
+            def get_closes(self):
+                return []
+
+        trades = [_make_trade(exit_dt="2026-04-11 10:30")]
+        broker = _FakeBroker(trades)
+
+        report = generate_session_report(
+            broker=broker, data_store=_BrokenDataStore(),
+        )
+        assert report is not None
+        assert report["market_regime"] is None
