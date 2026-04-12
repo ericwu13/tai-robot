@@ -757,6 +757,7 @@ class LiveRunner:
             )
 
         self._auto_save_session()
+        self._generate_daily_report()
         self.csv_logger.close()
         self.release_lock()
         self.state = LiveState.STOPPED
@@ -794,6 +795,23 @@ class LiveRunner:
             save_session(self._session_path, data)
         except Exception:
             pass  # best-effort; don't crash the bot
+
+    def _generate_daily_report(self) -> None:
+        """Generate a daily report after session stop (best-effort)."""
+        try:
+            from ..daily_report.report_generator import generate_session_report
+            report = generate_session_report(
+                broker=self.broker,
+                data_store=self.data_store,
+                strategy_name=self.strategy_display_name,
+                strategy_params=getattr(self.strategy, "params", None),
+                point_value=self.point_value,
+                symbol=self.symbol,
+            )
+            if report is not None:
+                self._emit("on_daily_report", report)
+        except Exception:
+            pass  # best-effort; don't crash the bot on report failure
 
     def restore_session(self, session_data: dict) -> int:
         """Restore broker state from a saved session.
