@@ -194,6 +194,20 @@ Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.c
 - **IMPORTANT**: `entry()` returns None — do NOT store its return value. Track position state with `broker.position_size` and use the tag string literal in close()/exit().
 - **IMPORTANT**: `exit()` REQUIRES limit and/or stop prices to work. exit() with no limit/stop does NOTHING.
   Use `close()` for immediate market exits (e.g. when checking bar.high >= target in on_bar).
+- **CRITICAL — Always pair entry() with exit() on the SAME on_bar() call.** \
+  In live mode, TP/SL exits are checked on every tick between bars. If exit() \
+  is only called on the NEXT bar (after position_size > 0), the exit order \
+  doesn't exist yet and ticks that hit the TP/SL are missed for an entire bar \
+  period. Use `bar.close` as an initial TP/SL estimate alongside entry(), then \
+  refine with `effective_entry_price()` on subsequent bars:
+  ```
+  if broker.position_size == 0 and entry_condition:
+      broker.entry("Long", OrderSide.LONG)
+      broker.exit("exit", "Long", limit=bar.close + tp_pts, stop=bar.close - sl_pts)
+  if broker.position_size > 0:
+      ep = broker.effective_entry_price()
+      broker.exit("exit", "Long", limit=ep + tp_pts, stop=ep - sl_pts)
+  ```
 - OrderSide.LONG / OrderSide.SHORT
 - Prefer LONG-only unless asked for short
 

@@ -479,11 +479,17 @@ class LiveRunner:
             return
 
         ctx = self.broker.context
-        bar_dt = bar.dt.strftime("%Y-%m-%d %H:%M") if bar.dt else ""
+        # Use bar END time for fill timestamps (entry_dt, exit_dt) so they
+        # reflect actual fill time, not the bar's open. E.g. a 30-min bar
+        # 10:45-11:15 records fills at "11:15" not "10:45".
+        bar_close_dt = ""
+        if bar.dt:
+            bar_close_dt = (bar.dt + timedelta(seconds=bar.interval)
+                           ).strftime("%Y-%m-%d %H:%M")
 
         # Check exit orders against this bar
         if idx > 0:
-            self.broker.check_exits(idx, bar.open, bar.high, bar.low, bar.close, bar_dt)
+            self.broker.check_exits(idx, bar.open, bar.high, bar.low, bar.close, bar_close_dt)
             self._check_for_trade_close(bar, idx)
 
         # Run strategy if enough bars
@@ -508,9 +514,21 @@ class LiveRunner:
                 for tag, from_entry in self.broker._pending_market_closes[old_closes:]:
                     self._log_decision(bar, "CLOSE", "", tag, bar.close, f"from={from_entry}")
 
+            # Catch-up exit check: if strategy just queued new exits while a
+            # position is open, check them immediately against this bar's OHLC.
+            # Without this, strategies that set TP/SL one bar late (only when
+            # position_size > 0) miss an entire bar of exit resolution — both
+            # bar-level check_exits AND tick-level check_tick_exit are blind
+            # because _pending_exits was empty until now.
+            if (len(self.broker._pending_exits) > old_exits
+                    and self.broker.position_size > 0):
+                self.broker.check_exits(
+                    idx, bar.open, bar.high, bar.low, bar.close, bar_close_dt)
+                self._check_for_trade_close(bar, idx)
+
         # Fill entry orders and market closes at bar close
         trades_before = len(self.broker.trades)
-        self.broker.on_bar_close(idx, bar.close, bar_dt)
+        self.broker.on_bar_close(idx, bar.close, bar_close_dt)
         # Check for market close trades (broker.close() processed inside on_bar_close)
         if len(self.broker.trades) > trades_before:
             self._check_for_trade_close(bar, idx)
