@@ -63,6 +63,96 @@ def is_last_bar_of_session(dt: datetime, kline_minute: int = 60) -> bool:
     return False
 
 
+def minutes_until_close(dt: datetime) -> int | None:
+    """Return minutes until the current session closes, or None if outside hours.
+
+    Args:
+        dt: Time in Taiwan timezone (TWT/UTC+8), naive or aware.
+
+    Returns:
+        Minutes remaining in the current session, or None if the market
+        is closed (weekends, inter-session gaps).
+
+    Examples:
+        >>> minutes_until_close(datetime(2026, 3, 17, 13, 43))  # Tue 13:43
+        2
+        >>> minutes_until_close(datetime(2026, 3, 18,  4, 58))  # Wed 04:58
+        2
+        >>> minutes_until_close(datetime(2026, 3, 17,  6,  0))  # gap
+        >>> minutes_until_close(datetime(2026, 3, 22, 12,  0))  # Sunday
+    """
+    wd = dt.weekday()  # Mon=0, Sun=6
+    t = dt.hour * 60 + dt.minute
+
+    # Sunday: fully closed
+    if wd == 6:
+        return None
+
+    # Saturday: only Fri night carryover (00:00-05:00)
+    if wd == 5:
+        return (NIGHT_CLOSE - t) if t < NIGHT_CLOSE else None
+
+    # Monday before 05:00: closed (no Fri night carryover)
+    if wd == 0 and t < NIGHT_CLOSE:
+        return None
+
+    # AM session (08:45-13:45)
+    if DAY_OPEN <= t < DAY_CLOSE:
+        return DAY_CLOSE - t
+
+    # Night session before midnight (15:00-23:59)
+    if t >= NIGHT_OPEN:
+        return (24 * 60 - t) + NIGHT_CLOSE
+
+    # Night session after midnight (00:00-05:00)
+    if t < NIGHT_CLOSE:
+        return NIGHT_CLOSE - t
+
+    # Between sessions (05:00-08:45 or 13:45-15:00)
+    return None
+
+
+def is_last_n_bars_of_session(dt: datetime, kline_minute: int, n: int = 1) -> bool:
+    """Return True if *dt* is the start time of one of the last *n* bars.
+
+    Allows strategies to block new entries when approaching session close.
+    For 1-min with n=5, blocks last 5 minutes.  For 15-min with n=2,
+    blocks the last 30 minutes.
+
+    Args:
+        dt: Bar open time in Taiwan time (TWT/UTC+8).
+        kline_minute: Bar interval in minutes.
+        n: Number of bars from end to consider as "last".
+
+    Returns:
+        True if the bar is one of the final *n* bars of its session.
+
+    Examples:
+        >>> is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 44), 1, 1)
+        True
+        >>> is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 40), 1, 5)
+        True
+        >>> is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 39), 1, 5)
+        False
+    """
+    bar_start = dt.hour * 60 + dt.minute
+
+    # Day session: bar opens in [08:45, 13:45)
+    if DAY_OPEN <= bar_start < DAY_CLOSE:
+        return bar_start + n * kline_minute >= DAY_CLOSE
+
+    # Night session (after midnight, 00:00-05:00)
+    if bar_start < NIGHT_CLOSE:
+        return bar_start + n * kline_minute >= NIGHT_CLOSE
+
+    # Night session (before midnight, 15:00-23:59): compute cross-midnight
+    if bar_start >= NIGHT_OPEN:
+        mins_to_close = (24 * 60 - bar_start) + NIGHT_CLOSE
+        return n * kline_minute >= mins_to_close
+
+    return False
+
+
 def session_align(dt: datetime, interval_seconds: int) -> datetime:
     """Align *dt* to a bar boundary using the session start as epoch.
 

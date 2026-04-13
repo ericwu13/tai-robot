@@ -138,30 +138,12 @@ def minutes_until_session_close() -> int | None:
 
     Sessions: AM closes 13:45, Night closes 05:00.
     Saturday night carryover closes at 05:00.
+
+    Delegates to :func:`~src.market_data.sessions.minutes_until_close`
+    with the current Taipei time.
     """
-    now = _taipei_now()
-    if not is_market_open(now):
-        return None
-
-    h, m = now.hour, now.minute
-    t = h * 60 + m
-
-    am_close = _AM_CLOSE[0] * 60 + _AM_CLOSE[1]  # 825
-    night_close = 5 * 60  # 300
-
-    # AM session (08:45-13:45)
-    if am_close > t >= _AM_OPEN[0] * 60 + _AM_OPEN[1]:
-        return am_close - t
-
-    # Night session (15:00-05:00+1)
-    if t >= _PM_OPEN[0] * 60 + _PM_OPEN[1]:
-        # After 15:00, close is at 05:00 next day = (24*60 - t) + 300
-        return (24 * 60 - t) + night_close
-    if t < night_close:
-        # After midnight, before 05:00
-        return night_close - t
-
-    return None
+    from ..market_data.sessions import minutes_until_close
+    return minutes_until_close(_taipei_now())
 
 
 # Map (kline_type, kline_minute) to interval in seconds
@@ -801,6 +783,43 @@ class LiveRunner:
             self._warmup_bar_count = len(self._aggregated_bars)
 
         return len(new_bars)
+
+    # ── Session close management ──
+
+    def create_close_manager(self, **kwargs):
+        """Create a :class:`SessionCloseManager` configured for this runner.
+
+        The returned manager uses ``broker.force_close()`` as the default
+        force-close action.  The GUI can override ``force_close_fn`` via
+        *kwargs* to also send a real COM order.
+
+        Keyword args are forwarded to :class:`SessionCloseManager`.
+        """
+        from .session_close_manager import SessionCloseManager
+
+        def _default_force_close(attempt: int) -> bool:
+            if not self._aggregated_bars or self.broker.position_size == 0:
+                return True  # nothing to close
+            last_bar = self._aggregated_bars[-1]
+            last_dt = (
+                last_bar.dt.strftime("%Y-%m-%d %H:%M") if last_bar.dt else ""
+            )
+            side = (
+                self.broker.position_side.value
+                if self.broker.position_side
+                else ""
+            )
+            self.broker.force_close(self._bar_index, last_bar.close, last_dt)
+            self._log_decision(
+                last_bar, "FORCE_CLOSE", side, "session_end",
+                last_bar.close,
+                f"auto close attempt {attempt}",
+            )
+            self._auto_save_session()
+            return True
+
+        kwargs.setdefault("force_close_fn", _default_force_close)
+        return SessionCloseManager(**kwargs)
 
     @property
     def session_path(self) -> str:

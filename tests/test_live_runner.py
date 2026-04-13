@@ -1186,3 +1186,100 @@ class TestRealEntryPriceLiveRunnerIssue45:
         # Post-confirmation → real
         runner.broker.real_entry_price = 22508
         assert ctx.effective_entry_price() == 22508
+
+
+# ── SessionCloseManager wiring ──
+
+class TestCloseManagerWiring:
+    """LiveRunner.create_close_manager() wires dependencies correctly."""
+
+    def test_create_close_manager_returns_manager(self, tmp_path):
+        from src.live.session_close_manager import SessionCloseManager, CloseState
+        strategy = NeverTradeStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        mgr = runner.create_close_manager(
+            minutes_until_close_fn=lambda dt: 60,
+        )
+        assert isinstance(mgr, SessionCloseManager)
+        assert mgr.state == CloseState.NORMAL
+
+    def test_default_force_close_closes_position(self, tmp_path):
+        from src.live.session_close_manager import CloseState
+        strategy = AlwaysLongStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+
+        # Warmup + get a position
+        warmup = [
+            _kline("2026-02-28 09:00", 22000, 22100, 21900, 22050, 500),
+            _kline("2026-02-28 09:15", 22050, 22150, 22000, 22100, 400),
+        ]
+        runner.feed_warmup_bars(warmup)
+
+        # Feed enough bars to trigger entry
+        lines = _klines_1m("2026-03-01", 540, 16)
+        runner.feed_1m_bars(lines)
+        assert runner.broker.position_size > 0
+
+        mgr = runner.create_close_manager(
+            minutes_until_close_fn=lambda dt: 3,
+        )
+        # Tick should trigger force close (position open, < 5 min to close)
+        from datetime import datetime as dt_cls
+        mgr.tick(dt_cls(2026, 3, 1, 13, 42), runner.broker.position_size)
+        assert runner.broker.position_size == 0
+
+    def test_custom_force_close_fn_overrides_default(self, tmp_path):
+        from src.live.session_close_manager import CloseState
+        strategy = NeverTradeStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        calls = []
+        mgr = runner.create_close_manager(
+            force_close_fn=lambda attempt: calls.append(attempt) or True,
+            minutes_until_close_fn=lambda dt: 3,
+        )
+        from datetime import datetime as dt_cls
+        mgr.tick(dt_cls(2026, 3, 1, 13, 42), 1)  # simulate open position
+        assert calls == [1]
+
+    def test_restart_mid_session_picks_up(self, tmp_path):
+        """If user restarts at 13:30, manager detects approaching close."""
+        from src.live.session_close_manager import CloseState
+        strategy = NeverTradeStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        # Simulate starting at 13:40 (5 min to close)
+        mgr = runner.create_close_manager(
+            minutes_until_close_fn=lambda dt: 5,
+        )
+        from datetime import datetime as dt_cls
+        mgr.tick(dt_cls(2026, 3, 1, 13, 40), 0)
+        assert mgr.state == CloseState.APPROACHING_CLOSE
+        assert mgr.session_end_pending is True
+
+    def test_shutdown_resets_manager(self, tmp_path):
+        from src.live.session_close_manager import CloseState
+        strategy = NeverTradeStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
+        runner.feed_warmup_bars(warmup)
+
+        mgr = runner.create_close_manager(
+            minutes_until_close_fn=lambda dt: 3,
+        )
+        from datetime import datetime as dt_cls
+        mgr.tick(dt_cls(2026, 3, 1, 13, 42), 0)
+        assert mgr.session_end_pending is True
+
+        runner.stop()
+        mgr.reset()
+        assert mgr.state == CloseState.NORMAL
+        assert mgr.session_end_pending is False

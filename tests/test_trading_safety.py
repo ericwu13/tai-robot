@@ -714,3 +714,103 @@ class TestDeferredCloseIssue50:
         g.defer_close({"action": "TRADE_CLOSE", "tag": "second"})
         d = g.pop_deferred_close()
         assert d["tag"] == "second"
+
+
+# ── Session-end pending flag ──
+
+class TestSessionEndPending:
+    """Session-end pending blocks new entries but allows exits."""
+
+    def test_blocks_entry_when_set(self):
+        g = TradingGuard()
+        g.session_end_pending = True
+        verdict, details = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_SESSION_END
+        assert "session end" in details["reason"]
+
+    def test_blocks_entry_semi_auto(self):
+        g = TradingGuard()
+        g.session_end_pending = True
+        verdict, _ = g.decide("semi_auto", "ENTRY_FILL", "SHORT")
+        assert verdict == g.BLOCK_SESSION_END
+
+    def test_allows_exit_when_set(self):
+        """Exits must still work when session end is approaching."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.session_end_pending = True
+        verdict, _ = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+    def test_allows_force_close_when_set(self):
+        """FORCE_CLOSE bypasses session_end_pending."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.session_end_pending = True
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+    def test_entry_allowed_when_not_set(self):
+        g = TradingGuard()
+        g.session_end_pending = False
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+
+    def test_reset_clears_session_end_pending(self):
+        g = TradingGuard()
+        g.session_end_pending = True
+        g.reset()
+        assert g.session_end_pending is False
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.SEND_ENTRY
+
+    def test_session_end_takes_priority_over_loss_limit(self):
+        """Session-end check runs before daily loss limit check."""
+        g = TradingGuard(daily_loss_limit=1000)
+        g.session_end_pending = True
+        g.update_pnl(-5000)
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_SESSION_END  # not BLOCK_ENTRY
+
+    def test_halted_takes_priority_over_session_end(self):
+        """Halted state is checked before session_end_pending."""
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.on_fill_timeout()
+        g.session_end_pending = True
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_HALTED  # not BLOCK_SESSION_END
+
+    def test_fill_pending_takes_priority_over_session_end(self):
+        """fill_pending is checked before session_end_pending."""
+        g = TradingGuard()
+        g.on_fill_pending("entry")
+        g.session_end_pending = True
+        verdict, _ = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_FILL_PENDING
+
+
+# ── Deferred close cleared by force-close ──
+
+class TestDeferredCloseAndForceClose:
+    """Force-close should clear deferred close to prevent double-fire."""
+
+    def test_deferred_close_cleared_by_session_manager(self):
+        """When force-close starts, deferred close should be popped and discarded."""
+        g = TradingGuard()
+        g.defer_close({"action": "TRADE_CLOSE", "side": "LONG", "price": 22000})
+        # Simulate force-close clearing the deferred close
+        d = g.pop_deferred_close()
+        assert d is not None
+        # Now it's gone
+        assert g.pop_deferred_close() is None
+
+    def test_force_close_while_deferred_pending(self):
+        """FORCE_CLOSE bypasses all gates, even with deferred close stored."""
+        g = TradingGuard()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        g.defer_close({"action": "TRADE_CLOSE"})
+        # Force close bypasses fill_pending
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT

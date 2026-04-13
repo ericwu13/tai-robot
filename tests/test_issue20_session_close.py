@@ -19,7 +19,11 @@ from datetime import datetime
 import pytest
 
 from src.market_data.models import Bar
-from src.market_data.sessions import is_last_bar_of_session
+from src.market_data.sessions import (
+    is_last_bar_of_session,
+    is_last_n_bars_of_session,
+    minutes_until_close,
+)
 from src.backtest.engine import BacktestEngine
 from src.backtest.strategy import BacktestStrategy
 from src.backtest.broker import BrokerContext, OrderSide, SimulatedBroker
@@ -492,3 +496,175 @@ class TestIntegrationSessionClose:
         assert len(t) == 1
         assert t[0].exit_tag == "Session Close"
         assert "05:00" in t[0].exit_dt
+
+
+# ── is_last_n_bars_of_session tests ────────────────────────────────────────
+
+class TestIsLastNBarsOfSession:
+    """Tests for is_last_n_bars_of_session with various N and intervals."""
+
+    # ── 1-min bars, day session (close 13:45 = 825) ──
+
+    def test_1m_n1_last_bar(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 44), 1, 1) is True
+
+    def test_1m_n1_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 43), 1, 1) is False
+
+    def test_1m_n5_last_5(self):
+        for m in (40, 41, 42, 43, 44):
+            assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, m), 1, 5) is True
+
+    def test_1m_n5_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 39), 1, 5) is False
+
+    # ── 5-min bars, day session ──
+
+    def test_5m_n1_last_bar(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 40), 5, 1) is True
+
+    def test_5m_n1_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 35), 5, 1) is False
+
+    def test_5m_n2_last_2(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 35), 5, 2) is True
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 40), 5, 2) is True
+
+    def test_5m_n2_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 30), 5, 2) is False
+
+    # ── 15-min bars, day session ──
+
+    def test_15m_n1_last_bar(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 30), 15, 1) is True
+
+    def test_15m_n1_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, 15), 15, 1) is False
+
+    def test_15m_n3_last_3(self):
+        for m in (0, 15, 30):
+            assert is_last_n_bars_of_session(datetime(2026, 2, 4, 13, m), 15, 3) is True
+
+    def test_15m_n3_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 12, 45), 15, 3) is False
+
+    # ── 60-min bars, day session ──
+
+    def test_60m_n1_last_bar(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 12, 45), 60, 1) is True
+
+    def test_60m_n1_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 11, 45), 60, 1) is False
+
+    def test_60m_n2_last_2(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 11, 45), 60, 2) is True
+
+    # ── 240-min (4H) bars, day session ──
+
+    def test_240m_day_n1_last(self):
+        # Day session 4H: 08:45, 12:45.  12:45 is last.
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 12, 45), 240, 1) is True
+
+    def test_240m_day_n1_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 8, 45), 240, 1) is False
+
+    def test_240m_day_n2_both(self):
+        # Both 4H bars in day session are "last 2"
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 8, 45), 240, 2) is True
+
+    # ── Night session (after midnight, close 05:00 = 300) ──
+
+    def test_1m_night_n1_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 5, 4, 59), 1, 1) is True
+
+    def test_1m_night_n1_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 5, 4, 58), 1, 1) is False
+
+    def test_60m_night_n1_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 5, 4, 0), 60, 1) is True
+
+    def test_60m_night_n1_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 5, 3, 0), 60, 1) is False
+
+    def test_60m_night_n2(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 5, 3, 0), 60, 2) is True
+
+    # ── Night session (before midnight, 15:00-23:59) ──
+
+    def test_240m_night_before_midnight_not_last(self):
+        # 23:00 bar: mins_to_close = 60+300=360. 1*240=240 < 360 → False
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 23, 0), 240, 1) is False
+
+    def test_240m_night_before_midnight_n2(self):
+        # 23:00 bar: 2*240=480 >= 360 → True
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 23, 0), 240, 2) is True
+
+    def test_60m_night_2200_not_last(self):
+        # 22:00 bar: mins_to_close = 120+300=420. 1*60=60 < 420 → False
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 22, 0), 60, 1) is False
+
+    # ── Edge: first bar of session (never last for n=1) ──
+
+    def test_first_bar_day_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 8, 45), 60, 1) is False
+
+    def test_first_bar_night_not_last(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 15, 0), 60, 1) is False
+
+    # ── Edge: between sessions (should return False) ──
+
+    def test_between_sessions_false(self):
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 7, 0), 60, 1) is False
+        assert is_last_n_bars_of_session(datetime(2026, 2, 4, 14, 0), 60, 1) is False
+
+    # ── Consistency: n=1 matches is_last_bar_of_session ──
+
+    @pytest.mark.parametrize("dt,km", [
+        (datetime(2026, 2, 4, 12, 45), 60),
+        (datetime(2026, 2, 4, 13, 30), 15),
+        (datetime(2026, 2, 4, 13, 40), 5),
+        (datetime(2026, 2, 4, 13, 44), 1),
+        (datetime(2026, 2, 5, 4, 0), 60),
+        (datetime(2026, 2, 5, 4, 45), 15),
+        (datetime(2026, 2, 4, 11, 45), 60),
+        (datetime(2026, 2, 4, 10, 0), 60),
+    ])
+    def test_n1_matches_is_last_bar(self, dt, km):
+        assert is_last_n_bars_of_session(dt, km, 1) == is_last_bar_of_session(dt, km)
+
+
+# ── minutes_until_close tests ─────────────────────────────────────────────
+
+class TestMinutesUntilClose:
+    """Tests for the pure minutes_until_close function in sessions.py."""
+
+    def test_am_session_mid(self):
+        assert minutes_until_close(datetime(2026, 3, 17, 10, 0)) == 225
+
+    def test_am_session_near_close(self):
+        assert minutes_until_close(datetime(2026, 3, 17, 13, 43)) == 2
+
+    def test_night_session_early(self):
+        assert minutes_until_close(datetime(2026, 3, 17, 15, 30)) == 810
+
+    def test_night_after_midnight(self):
+        assert minutes_until_close(datetime(2026, 3, 18, 2, 0)) == 180
+
+    def test_night_near_close(self):
+        assert minutes_until_close(datetime(2026, 3, 18, 4, 58)) == 2
+
+    def test_between_sessions(self):
+        assert minutes_until_close(datetime(2026, 3, 17, 6, 0)) is None
+        assert minutes_until_close(datetime(2026, 3, 17, 14, 0)) is None
+
+    def test_sunday(self):
+        assert minutes_until_close(datetime(2026, 3, 22, 12, 0)) is None
+
+    def test_saturday_before_5am(self):
+        assert minutes_until_close(datetime(2026, 3, 21, 3, 0)) == 120
+
+    def test_saturday_after_5am(self):
+        assert minutes_until_close(datetime(2026, 3, 21, 6, 0)) is None
+
+    def test_monday_before_5am_closed(self):
+        assert minutes_until_close(datetime(2026, 3, 16, 3, 0)) is None
