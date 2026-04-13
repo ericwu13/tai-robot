@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from ..market_data.models import Bar
 from ..market_data.data_store import DataStore
 from .broker import SimulatedBroker
@@ -68,23 +70,44 @@ class BacktestEngine:
             self.data_store.add_bar(bar)
 
             bar_dt = bar.dt.strftime("%Y-%m-%d %H:%M") if bar.dt else ""
+            # Bar END time for fill timestamps: entries/exits record the
+            # actual fill time, not the bar's open.  E.g. a 30-min bar
+            # opening at 10:45 records fills at "11:15".
+            bar_close_dt = ""
+            if bar.dt and bar.interval:
+                bar_close_dt = (bar.dt + timedelta(seconds=bar.interval)
+                               ).strftime("%Y-%m-%d %H:%M")
+            else:
+                bar_close_dt = bar_dt
 
             # next_open mode: fill entries queued on the prior bar at THIS
             # bar's open. on_close mode: no-op (entries fill in on_bar_close).
+            # Keep bar_dt (open time) — next_open entries fill at bar open.
             self.broker.on_bar_open(i, bar.open, bar_dt)
 
             # Check exits against this bar's OHLC. In next_open mode this
             # check sees any position just opened by on_bar_open above —
             # that's how same-bar entry+exit becomes possible.
             if i > 0 or self.broker.position_size > 0:
-                self.broker.check_exits(i, bar.open, bar.high, bar.low, bar.close, bar_dt)
+                self.broker.check_exits(i, bar.open, bar.high, bar.low, bar.close, bar_close_dt)
 
             # Run strategy once enough bars accumulated
             if len(self.data_store) >= required:
+                old_exits = len(self.broker._pending_exits)
                 self.strategy.on_bar(bar, self.data_store, ctx)
 
+                # Catch-up exit check: if strategy just queued new exits
+                # while a position is open, check them immediately against
+                # this bar's OHLC.  Matches live_runner safety net so
+                # strategies that set TP/SL one bar late still resolve
+                # correctly on the signal bar.
+                if (len(self.broker._pending_exits) > old_exits
+                        and self.broker.position_size > 0):
+                    self.broker.check_exits(
+                        i, bar.open, bar.high, bar.low, bar.close, bar_close_dt)
+
             # Process market closes (and, in on_close mode, fill entries)
-            self.broker.on_bar_close(i, bar.close, bar_dt)
+            self.broker.on_bar_close(i, bar.close, bar_close_dt)
 
         # Force close any open position at end of data
         if bars:
