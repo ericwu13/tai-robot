@@ -26,6 +26,11 @@ class TradingGuard:
         self.halted: bool = False
         self.halt_reason: str = ""
 
+        # Session-end pending flag: blocks new entries when approaching
+        # session close.  Set by SessionCloseManager, cleared when a
+        # new session opens.
+        self.session_end_pending: bool = False
+
         # Deferred close (issue #50). When a TRADE_CLOSE is blocked by
         # BLOCK_FILL_PENDING, the decision is stored here. When
         # _on_fill_confirmed("entry") fires, the caller pops and replays
@@ -41,6 +46,7 @@ class TradingGuard:
         self.fill_pending_type = ""
         self.halted = False
         self.halt_reason = ""
+        self.session_end_pending = False
         self._deferred_close = None
 
     # ── Entry / exit gating ──
@@ -170,6 +176,7 @@ class TradingGuard:
     CONFIRM_ENTRY = "confirm_entry"          # show dialog (semi-auto mode)
     BLOCK_FILL_PENDING = "block_fill_pending"  # waiting for prior fill
     BLOCK_HALTED = "block_halted"            # system halted after fill timeout
+    BLOCK_SESSION_END = "block_session_end"  # session end approaching
 
     def decide(self, trading_mode: str, action: str, side: str) -> tuple[str, dict]:
         """Decide what to do with a simulated fill.
@@ -209,8 +216,12 @@ class TradingGuard:
                     f"waiting for {self.fill_pending_type} fill confirmation")
                 return self.BLOCK_FILL_PENDING, details
 
-        # Entry: check daily loss limit
+        # Entry: check session-end pending, then daily loss limit
         if action == "ENTRY_FILL":
+            if self.session_end_pending:
+                details["reason"] = "session end approaching, no new entries"
+                return self.BLOCK_SESSION_END, details
+
             allowed, reason = self.check_entry(trading_mode)
             if not allowed:
                 details["reason"] = reason
