@@ -415,10 +415,11 @@ class TestIntegrationSessionClose:
         engine = BacktestEngine(GeneralAtrBreakoutFixed(), point_value=200)
         result = engine.run(bars)
 
-        t = [t for t in result.trades if "11:45" in t.entry_dt]
-        assert len(t) == 1, f"Expected 1 trade entering at 11:45, got {len(t)}"
+        # entry_dt uses bar END time (fill time): 11:45 + 60min = 12:45
+        t = [t for t in result.trades if "12:45" in t.entry_dt]
+        assert len(t) == 1, f"Expected 1 trade entering at 12:45 (fill time), got {len(t)}"
         assert t[0].exit_tag == "Session Close"
-        assert "12:45" in t[0].exit_dt
+        assert "13:45" in t[0].exit_dt
         assert t[0].pnl == (33010 - 33000) * 200
 
     def test_buggy_misses_day_session_close(self):
@@ -457,10 +458,11 @@ class TestIntegrationSessionClose:
         engine = BacktestEngine(GeneralAtrBreakoutBuggy(), point_value=200)
         result = engine.run(bars)
 
+        # exit_dt uses bar END time: 20:00 + 60min = 21:00
         assert any(
-            t.exit_tag == "Session Close" and "20:00" in t.exit_dt
+            t.exit_tag == "Session Close" and "21:00" in t.exit_dt
             for t in result.trades
-        ), "Buggy code should falsely close at 20:00"
+        ), "Buggy code should falsely close at 21:00 (fill time for 20:00 bar)"
 
     def test_no_entry_on_session_close_bar(self):
         """Entry must be blocked on session-close bars (matching Pine)."""
@@ -472,7 +474,8 @@ class TestIntegrationSessionClose:
         result = engine.run(bars)
 
         for trade in result.trades:
-            assert "12:45" not in trade.entry_dt, \
+            # entry_dt uses bar END time: 12:45 + 60min = 13:45
+            assert "13:45" not in trade.entry_dt, \
                 "Should not enter on session-close bar"
 
     def test_night_session_close_at_0400(self):
@@ -484,7 +487,8 @@ class TestIntegrationSessionClose:
         engine = BacktestEngine(GeneralAtrBreakoutFixed(), point_value=200)
         result = engine.run(bars)
 
-        t = [t for t in result.trades if "03:00" in t.entry_dt]
+        # entry_dt uses bar END time: 03:00 + 60min = 04:00
+        t = [t for t in result.trades if "04:00" in t.entry_dt]
         assert len(t) == 1
         assert t[0].exit_tag == "Session Close"
-        assert "04:00" in t[0].exit_dt
+        assert "05:00" in t[0].exit_dt
