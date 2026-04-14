@@ -191,10 +191,18 @@ class TradingGuard:
             buy_sell = 1 if side == "LONG" else 0  # reverse to close
             action_type = "exit"
 
+        # Force-close: use sNewClose=1 (explicit close) instead of 2 (auto).
+        # We KNOW a position exists (caller checked position_side), and auto
+        # can misclassify close as open, causing error 980 (insufficient margin).
+        if action == "FORCE_CLOSE":
+            new_close = 1
+        else:
+            new_close = self.order_params(action_type)["new_close"]
+
         details = {
             "buy_sell": buy_sell,
             "action_type": action_type,
-            "new_close": self.order_params(action_type)["new_close"],
+            "new_close": new_close,
         }
 
         # Fill confirmation gate (blocks entries and normal exits)
