@@ -106,6 +106,15 @@ class DiscordNotifier:
             f"交易: {trades} 筆 | P&L: {pnl:+,}"
         )
 
+    def force_close_failed(self, symbol: str, attempts: int, last_error: str) -> None:
+        self._send(
+            f"{self._header()}\n"
+            f"🚨 **強制平倉失敗 FORCE CLOSE FAILED** 🚨\n"
+            f"商品: `{symbol}` | 重試: {attempts} 次\n"
+            f"最後錯誤: {last_error}\n"
+            f"**需要立即人工介入！Position may still be open!**"
+        )
+
     def daily_loss_limit(self, net_pnl: int, limit: int) -> None:
         self._send(
             f"{self._header()}\n"
