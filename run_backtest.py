@@ -3749,7 +3749,7 @@ class BacktestApp:
             return
         last_bar = bars[-1]
         last_dt = last_bar.dt.strftime("%Y-%m-%d %H:%M") if last_bar.dt else ""
-        side = runner.broker.trades[-1].side.value if runner.broker.trades else ""
+        side = runner.broker.position_side.value if runner.broker.position_side else ""
 
         self._live_log_msg(
             f"盤前自動平倉 Session-end auto close: {mins}min to close, "
@@ -4077,8 +4077,13 @@ class BacktestApp:
             self._live_log_msg(
                 f"{label}自動送單 Auto-sending {action.lower()}: {order_desc} {order_symbol}", "exit")
             self._log_order_decision("REAL_ORDER_AUTO", f"{action.lower()} {order_desc} {order_symbol}")
-            self._send_real_order(buy_sell, order_symbol, action_type, price,
-                                 new_close=new_close, exit_type=exit_type, exit_limit=exit_limit)
+            ok = self._send_real_order(buy_sell, order_symbol, action_type, price,
+                                       new_close=new_close, exit_type=exit_type, exit_limit=exit_limit)
+            # Force-close failure: schedule retries with escalating delays
+            if not ok and action == "FORCE_CLOSE":
+                self._retry_force_close(
+                    buy_sell, order_symbol, price,
+                    attempt=1, max_attempts=3, last_error="initial send failed")
             # State transition deferred to _on_fill_confirmed (auto) or
             # handled inside _send_real_order (semi_auto)
             return
@@ -4194,6 +4199,8 @@ class BacktestApp:
             pass  # logged in _send_real_order
         # "replaced" = new dialog replaced old one, no log needed
 
+    _FORCE_CLOSE_RETRY_DELAYS = [5000, 10000, 15000]  # ms
+
     def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price,
                          new_close=2, exit_type="", exit_limit=None):
         """Build FUTUREORDER and send via COM SKOrderLib.
@@ -4201,13 +4208,15 @@ class BacktestApp:
         new_close: 0=new position, 1=close position, 2=auto (exchange decides).
         exit_type: "limit" (TP), "stop" (SL), "close", "force_close", or "".
         exit_limit: strategy's original limit price for take-profit exits.
+
+        Returns True if order was accepted (code==0), False otherwise.
         """
         if not _com_available or skO is None:
             self._live_log_msg("實單失敗 Order FAILED: COM not available", "exit")
-            return
+            return False
         if not self._futures_account:
             self._live_log_msg("實單失敗 Order FAILED: no futures account", "exit")
-            return
+            return False
 
         # Margin check for new positions (entries)
         if action_type == "entry" and self._account_monitor.rights:
@@ -4222,7 +4231,7 @@ class BacktestApp:
                     self._live_log_msg(msg, "exit")
                     self._log_order_decision("REAL_ORDER_BLOCKED", msg)
                     _log(f"REAL ORDER BLOCKED: {msg}")
-                    return
+                    return False
             except (ValueError, TypeError):
                 pass  # can't parse — proceed with order, let exchange decide
 
@@ -4298,6 +4307,7 @@ class BacktestApp:
                     "REAL_ORDER_SENT",
                     f"{side_str} {order_symbol} x1 {price_label} sim={sim_price}",
                 )
+                return True
             else:
                 err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
                 self._live_log_msg(f"實單失敗 Order FAILED: code={code} {err_msg} | {message}", "exit")
@@ -4308,11 +4318,53 @@ class BacktestApp:
                     "REAL_ORDER_FAILED",
                     f"code={code} {err_msg}",
                 )
+                return False
 
         except Exception as e:
             self._live_log_msg(f"實單異常 Order error: {e}", "exit")
             _log(f"REAL ORDER ERROR: {e}\n{traceback.format_exc()}")
             self._log_order_decision("REAL_ORDER_ERROR", str(e))
+            return False
+
+    def _retry_force_close(self, buy_sell, order_symbol, sim_price,
+                           attempt, max_attempts, last_error):
+        """Retry a failed force-close order with escalating delays.
+
+        On retry, falls back to sNewClose=2 (auto) in case sNewClose=1 was
+        rejected. After all retries exhausted, emits loud alarm and does NOT
+        mark simulated broker as flat (prevents sim/real divergence).
+        """
+        if attempt > max_attempts:
+            # All retries exhausted — loud alarm
+            msg = (f"強制平倉全部失敗 FORCE CLOSE ALL RETRIES FAILED "
+                   f"({max_attempts} attempts) last_error={last_error}")
+            _log(f"CRITICAL: {msg}")
+            self._live_log_msg(f"🚨 {msg}", "exit")
+            print(f"\n{'='*60}")
+            print(f"CRITICAL: FORCE CLOSE FAILED — POSITION MAY STILL BE OPEN")
+            print(f"Symbol: {order_symbol} | Attempts: {max_attempts}")
+            print(f"Last error: {last_error}")
+            print(f"IMMEDIATE MANUAL INTERVENTION REQUIRED")
+            print(f"{'='*60}\n")
+            if _discord and _discord.enabled:
+                _discord.force_close_failed(order_symbol, max_attempts, last_error)
+            return
+
+        _log(f"FORCE CLOSE RETRY {attempt}/{max_attempts} for {order_symbol}")
+        self._live_log_msg(
+            f"強制平倉重試 Force close retry {attempt}/{max_attempts}", "exit")
+
+        # Retry with sNewClose=2 (auto) as fallback — sNewClose=1 may have
+        # been rejected if position was already partially closed
+        ok = self._send_real_order(
+            buy_sell, order_symbol, "exit", sim_price,
+            new_close=2, exit_type="force_close")
+
+        if not ok:
+            delay = self._FORCE_CLOSE_RETRY_DELAYS[attempt - 1] if attempt <= len(self._FORCE_CLOSE_RETRY_DELAYS) else 15000
+            self.root.after(delay, self._retry_force_close,
+                            buy_sell, order_symbol, sim_price,
+                            attempt + 1, max_attempts, last_error)
 
     # ── Fill confirmation via OpenInterest position change (auto mode) ──
     #
@@ -4542,7 +4594,7 @@ class BacktestApp:
         elif self._last_real_order_side is not None:
             buy_sell = 1 - self._last_real_order_side
         elif self._live_runner.broker.position_size != 0:
-            side = self._live_runner.broker.trades[-1].side.value if self._live_runner.broker.trades else "LONG"
+            side = self._live_runner.broker.position_side.value if self._live_runner.broker.position_side else "LONG"
             buy_sell = 1 if side == "LONG" else 0
         else:
             self._live_log_msg("無持倉紀錄 No position record — use BUY or SELL directly", "status")

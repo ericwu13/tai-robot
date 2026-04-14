@@ -140,7 +140,7 @@ class TestDecideExitSent:
         verdict, details = g.decide("auto", "FORCE_CLOSE", "SHORT")
         assert verdict == g.SEND_EXIT
         assert details["buy_sell"] == 0  # buy to close short
-        assert details["new_close"] == 2  # auto
+        assert details["new_close"] == 1  # explicit close (we KNOW position exists)
 
     def test_exit_resets_entry_flag_via_on_exit_sent(self):
         """After SEND_EXIT, calling on_exit_sent() should block next exit."""
@@ -235,12 +235,13 @@ class TestDecideNewClose:
             assert d["new_close"] == 0, f"{mode}/ENTRY_FILL"
 
     def test_exit_uses_auto_newclose(self):
-        """Exit orders use new_close=2 (auto) to avoid 980 when already flat."""
+        """Normal exits use new_close=2 (auto), force-close uses 1 (explicit)."""
         g = TradingGuard()
         g.on_entry_sent()
-        for action in ("TRADE_CLOSE", "FORCE_CLOSE"):
-            _, d = g.decide("auto", action, "LONG")
-            assert d["new_close"] == 2, f"auto/{action}"
+        _, d = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert d["new_close"] == 2, "TRADE_CLOSE uses auto"
+        _, d = g.decide("auto", "FORCE_CLOSE", "LONG")
+        assert d["new_close"] == 1, "FORCE_CLOSE uses explicit close"
 
 
 # ── TradingGuard: margin check ──
