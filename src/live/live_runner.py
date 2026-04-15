@@ -37,7 +37,8 @@ _TZ_TAIPEI = timezone(timedelta(hours=8))
 
 # Taiwan futures sessions (approximate)
 _AM_OPEN = (8, 45)   # 08:45
-_AM_CLOSE = (13, 45)  # 13:45
+_AM_CLOSE = (13, 45)  # 13:45 — back-month + non-settlement days
+_AM_CLOSE_SETTLEMENT = (13, 30)  # front-month on settlement day (3rd Wed)
 _PM_OPEN = (15, 0)    # 15:00
 # Night session closes at 05:00 next day
 
@@ -133,10 +134,33 @@ def seconds_until_market_open() -> int:
     return (24 * 60 - t + am_open) * 60
 
 
-def minutes_until_session_close() -> int | None:
+def _am_close_minutes(order_symbol: str | None = None,
+                      now: datetime | None = None) -> int:
+    """Return the AM-session close time as minutes-since-midnight.
+
+    Normally 13:45 (= 825). On settlement day (3rd Wed) for the
+    front-month contract, returns 13:30 (= 810) — TAIFEX force-settles
+    the expiring near-month at that time.
+
+    Back-month contracts and non-settlement days keep the standard 13:45.
+    """
+    if order_symbol:
+        from ..market_data.holidays import is_settlement_day, is_front_month_contract
+        if now is None:
+            now = _taipei_now()
+        if is_settlement_day(now) and is_front_month_contract(order_symbol, now):
+            return _AM_CLOSE_SETTLEMENT[0] * 60 + _AM_CLOSE_SETTLEMENT[1]
+    return _AM_CLOSE[0] * 60 + _AM_CLOSE[1]
+
+
+def minutes_until_session_close(order_symbol: str | None = None) -> int | None:
     """Return minutes until the current session closes, or None if market is closed.
 
-    Sessions: AM closes 13:45, Night closes 05:00.
+    Sessions: AM closes 13:45 (or 13:30 for front-month on settlement
+    day), Night closes 05:00.  Pass ``order_symbol`` (e.g. "TXFD6") so
+    the settlement-day adjustment can be applied for the front-month
+    contract.
+
     Saturday night carryover closes at 05:00.
     """
     now = _taipei_now()
@@ -146,10 +170,10 @@ def minutes_until_session_close() -> int | None:
     h, m = now.hour, now.minute
     t = h * 60 + m
 
-    am_close = _AM_CLOSE[0] * 60 + _AM_CLOSE[1]  # 825
+    am_close = _am_close_minutes(order_symbol, now)
     night_close = 5 * 60  # 300
 
-    # AM session (08:45-13:45)
+    # AM session (08:45-13:45 or 13:30 on settlement day)
     if am_close > t >= _AM_OPEN[0] * 60 + _AM_OPEN[1]:
         return am_close - t
 

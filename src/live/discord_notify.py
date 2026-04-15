@@ -51,6 +51,10 @@ class DiscordNotifier:
 
         threading.Thread(target=_post, daemon=True).start()
 
+    def notify(self, message: str) -> None:
+        """Public method to send a free-form notification with the bot header."""
+        self._send(f"{self._header()}\n{message}")
+
     def _header(self) -> str:
         ts = _taipei_now().strftime("%Y-%m-%d %H:%M:%S")
         parts = [f"**[{ts}]**"]

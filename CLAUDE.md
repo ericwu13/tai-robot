@@ -6,7 +6,7 @@ Two API approaches: DLL-based (ctypes via SKDLLPython.py) and COM-based (comtype
 
 ## Build & Test
 ```bash
-pip install pyyaml keyring comtypes
+pip install pyyaml keyring comtypes holidays
 pytest tests/ -x          # run all tests (44 tests)
 python test_connection.py  # DLL-based quote connection GUI
 python test_kline.py       # COM-based KLine history GUI
