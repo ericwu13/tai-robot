@@ -50,7 +50,7 @@ class TestBrokerSerialization:
         broker.queue_entry(
             __import__("src.backtest.broker", fromlist=["Order"]).Order(
                 tag="entry1", side=OrderSide.SHORT, qty=1))
-        broker.on_bar_close(5, 18000)
+        broker.on_bar_close(5, 18000, "2026-04-12 10:30")
 
         data = broker.to_dict()
         restored = SimulatedBroker.from_dict(data)
@@ -60,6 +60,25 @@ class TestBrokerSerialization:
         assert restored.entry_price == 18000
         assert restored.entry_tag == "entry1"
         assert restored.entry_bar_index == 5
+        # _entry_dt must survive roundtrip — otherwise a restart mid-trade
+        # produces an empty entry_dt on the closing Trade.
+        assert restored._entry_dt == "2026-04-12 10:30"
+
+    def test_from_dict_missing_entry_dt_defaults_to_empty(self):
+        """Backward compat: old session files (before _entry_dt persistence)
+        should load without error and default _entry_dt to empty string."""
+        data = {
+            "point_value": 50, "fill_mode": "on_close",
+            "position_size": 1, "position_side": "LONG",
+            "entry_price": 18000, "entry_tag": "entry1",
+            "entry_bar_index": 5,
+            # _entry_dt intentionally absent
+            "trades": [], "equity_curve": [],
+            "_cumulative_pnl": 0, "_bar_index": 5,
+        }
+        restored = SimulatedBroker.from_dict(data)
+        assert restored._entry_dt == ""
+        assert restored.entry_price == 18000  # other fields still load
 
 
 class TestSessionStore:

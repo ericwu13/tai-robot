@@ -14,7 +14,7 @@ class TradingGuard:
     All mutating methods return a (allowed: bool, reason: str) tuple.
     """
 
-    def __init__(self, daily_loss_limit: int = 1000):
+    def __init__(self, daily_loss_limit: int = 10000):
         self.daily_loss_limit: int = daily_loss_limit
         self.real_entry_confirmed: bool = False
         self.paused: bool = False  # True when daily loss limit hit

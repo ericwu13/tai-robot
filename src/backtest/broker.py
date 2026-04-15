@@ -488,6 +488,42 @@ class SimulatedBroker:
         self.real_entry_dt = fill_dt
         return True
 
+    def try_set_real_exit_price(
+        self,
+        price: int,
+        exit_bar_index: int,
+        fill_dt: str = "",
+    ) -> bool:
+        """Guarded write of the real (broker-confirmed) exit fill price.
+
+        Mirror of ``try_set_real_entry_price`` but for exits.  Updates
+        the most recent trade's ``real_exit_price`` and ``real_exit_dt``
+        in-place after the simulated exit has already created the Trade
+        record.  Race guards reject the write when:
+
+        - ``price <= 0`` (bad parse upstream)
+        - no trades exist yet (no Trade record to update)
+        - the latest trade already has ``real_exit_price`` set
+          (double-confirmation / replay)
+        - the latest trade's ``exit_bar_index`` does not match
+          (late callback for a previous trade whose exit has already
+          been confirmed; or off-by-one slip)
+
+        Returns True if the write was accepted, False otherwise.
+        """
+        if price <= 0:
+            return False
+        if not self.trades:
+            return False
+        last = self.trades[-1]
+        if last.real_exit_price != 0:
+            return False
+        if last.exit_bar_index != exit_bar_index:
+            return False
+        last.real_exit_price = int(price)
+        last.real_exit_dt = fill_dt
+        return True
+
     def force_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
         """Force-close any open position at end of data."""
         if self.position_size > 0:
@@ -511,6 +547,7 @@ class SimulatedBroker:
             "entry_price": self.entry_price,
             "entry_tag": self.entry_tag,
             "entry_bar_index": self.entry_bar_index,
+            "_entry_dt": self._entry_dt,
             "real_entry_price": self.real_entry_price,
             "real_entry_dt": self.real_entry_dt,
             "trades": [
@@ -551,6 +588,7 @@ class SimulatedBroker:
         broker.entry_price = data.get("entry_price", 0)
         broker.entry_tag = data.get("entry_tag", "")
         broker.entry_bar_index = data.get("entry_bar_index", 0)
+        broker._entry_dt = data.get("_entry_dt", "")
         broker.real_entry_price = data.get("real_entry_price", 0)
         broker.real_entry_dt = data.get("real_entry_dt", "")
         broker.trades = [
