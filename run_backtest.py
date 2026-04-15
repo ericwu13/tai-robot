@@ -3745,7 +3745,16 @@ class BacktestApp:
         self._update_live_results()  # enable chart button & populate _last_bars
         self._update_manual_order_buttons()
         self._start_account_polling()
-        self._notify_if_settlement_day()
+        # Issue #58: settlement-day detection must NEVER block tick
+        # subscription.  If holidays lookup raises (e.g. broken package
+        # bundling in a frozen EXE), the bot would silently hang after
+        # warmup.  Isolate the failure here as a belt-and-braces guard
+        # on top of the spec fix + defensive fallback in holidays.py.
+        try:
+            self._notify_if_settlement_day()
+        except Exception as e:
+            _log(f"結算日通知錯誤 Settlement notify failed (ignored): "
+                 f"[{type(e).__name__}] {e}")
         self._start_live_tick_subscription()
 
     # ── Tick-based live data feed ──
@@ -3828,15 +3837,25 @@ class BacktestApp:
           - today is the 3rd-Wed settlement day (or shifted by holiday)
           - order_symbol is the front-month contract (back-months unaffected)
           - we're within ``_SETTLEMENT_NO_ENTRY_MINUTES`` of the 13:30 close
+
+        Issue #58: if holidays lookup fails, return False — entries proceed
+        normally rather than being blocked by a broken check.  The fail-safe
+        for actual settlement-day protection is ``_check_session_end_close``
+        which force-closes before 13:30 anyway.
         """
-        from src.market_data.holidays import is_settlement_day, is_front_month_contract
-        now = _taipei_now()
-        if not is_settlement_day(now):
+        try:
+            from src.market_data.holidays import is_settlement_day, is_front_month_contract
+            now = _taipei_now()
+            if not is_settlement_day(now):
+                return False
+            if not is_front_month_contract(order_symbol, now):
+                return False
+            mins = minutes_until_session_close(order_symbol)
+            return mins is not None and mins <= self._SETTLEMENT_NO_ENTRY_MINUTES
+        except Exception as e:
+            _log(f"結算日進場檢查失敗 Settlement no-entry check failed (ignored): "
+                 f"[{type(e).__name__}] {e}")
             return False
-        if not is_front_month_contract(order_symbol, now):
-            return False
-        mins = minutes_until_session_close(order_symbol)
-        return mins is not None and mins <= self._SETTLEMENT_NO_ENTRY_MINUTES
 
     def _notify_if_settlement_day(self) -> None:
         """Log + Discord notify if today is settlement day for the front-month.
@@ -3878,9 +3897,16 @@ class BacktestApp:
         if mins is None:
             return
         # Larger buffer on settlement day for the front-month contract.
-        from src.market_data.holidays import is_settlement_day, is_front_month_contract
-        is_settlement = (is_settlement_day(_taipei_now())
-                         and is_front_month_contract(order_sym, _taipei_now()))
+        # Issue #58: if holidays detection fails, degrade to normal-day
+        # close buffer rather than breaking the force-close entirely.
+        try:
+            from src.market_data.holidays import is_settlement_day, is_front_month_contract
+            is_settlement = (is_settlement_day(_taipei_now())
+                             and is_front_month_contract(order_sym, _taipei_now()))
+        except Exception as e:
+            _log(f"結算日判斷失敗 Settlement check failed (ignored): "
+                 f"[{type(e).__name__}] {e}")
+            is_settlement = False
         threshold = (self._SETTLEMENT_END_CLOSE_MINUTES if is_settlement
                      else self._SESSION_END_CLOSE_MINUTES)
         if mins > threshold:

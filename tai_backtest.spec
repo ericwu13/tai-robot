@@ -3,10 +3,21 @@ import glob
 import os
 import importlib
 
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+
 # Collect lightweight_charts JS assets
 _lwc_pkg = importlib.import_module('lightweight_charts')
 _lwc_dir = os.path.dirname(_lwc_pkg.__file__)
 _lwc_js = os.path.join(_lwc_dir, 'js')
+
+# `holidays` package resolves country/financial classes lazily via
+# importlib.import_module — PyInstaller's static analysis cannot see
+# those, so we must force-include every submodule + data file.  Without
+# this, holidays.country_holidays("TW", ...) raises
+# ModuleNotFoundError in the frozen EXE and the bot silently hangs
+# right after warmup (issue #58).
+_holidays_submodules = collect_submodules('holidays')
+_holidays_datas = collect_data_files('holidays')
 
 # Collect SDK DLLs
 sdk_libs = os.path.join(
@@ -27,13 +38,15 @@ a = Analysis(
         ('strategies', 'strategies'),
         ('settings.example.yaml', '.'),
         (_lwc_js, 'lightweight_charts/js'),
+        *_holidays_datas,
     ],
     hiddenimports=[
         # GUI / core
         'lightweight_charts', 'pandas', 'yaml', 'tkinter',
         'httpx', 'httpcore', 'h11', 'certifi', 'anyio', 'sniffio',
         # TAIFEX settlement-day detection (3rd Wed early close)
-        'holidays',
+        # Must include ALL submodules — see note above about dynamic import.
+        *_holidays_submodules,
         # COM (Capital API) — include submodules PyInstaller's analysis misses
         'comtypes', 'comtypes.client', 'comtypes.stream',
         'comtypes.client._code_cache', 'comtypes.client._generate',
