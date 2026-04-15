@@ -228,7 +228,7 @@ class LiveRunner:
         self._callbacks: dict[str, list] = {}
         self.suppress_strategy: bool = False  # suppress strategy during history catchup
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
-        self.daily_loss_limit: int = 1000  # NTD, for session persistence
+        self.daily_loss_limit: int = 10000  # NTD, for session persistence
 
     # ── Lock file ──
 
@@ -479,13 +479,25 @@ class LiveRunner:
             return
 
         ctx = self.broker.context
-        # Use bar END time for fill timestamps (entry_dt, exit_dt) so they
-        # reflect actual fill time, not the bar's open. E.g. a 30-min bar
-        # 10:45-11:15 records fills at "11:15" not "10:45".
+        # Two timestamps:
+        #   bar_close_dt  — synthetic bar END time (bar.dt + interval) at
+        #                   second precision, used for bar-level exit
+        #                   resolution where the actual fill moment within
+        #                   the bar is unknown.
+        #   fill_dt       — actual wall-clock TPE moment we're processing
+        #                   the just-completed bar. This is the moment COM
+        #                   delivered the next-minute tick that triggered
+        #                   bar completion, i.e. the real entry/exit fill
+        #                   time in live mode. For 30-min bars opening
+        #                   10:45–11:15, fill_dt is when the 11:15 tick
+        #                   actually arrived (e.g. 11:15:01.234), not
+        #                   "11:15:00".
         bar_close_dt = ""
         if bar.dt:
             bar_close_dt = (bar.dt + timedelta(seconds=bar.interval)
-                           ).strftime("%Y-%m-%d %H:%M")
+                           ).strftime("%Y-%m-%d %H:%M:%S")
+        fill_dt = datetime.now(_TZ_TAIPEI).replace(tzinfo=None
+                  ).strftime("%Y-%m-%d %H:%M:%S")
 
         # Check exit orders against this bar
         if idx > 0:
@@ -522,13 +534,17 @@ class LiveRunner:
             # because _pending_exits was empty until now.
             if (len(self.broker._pending_exits) > old_exits
                     and self.broker.position_size > 0):
+                # Catch-up exit fired same bar as the strategy queued it —
+                # use wall-clock fill_dt to record the actual moment.
                 self.broker.check_exits(
-                    idx, bar.open, bar.high, bar.low, bar.close, bar_close_dt)
+                    idx, bar.open, bar.high, bar.low, bar.close, fill_dt)
                 self._check_for_trade_close(bar, idx)
 
-        # Fill entry orders and market closes at bar close
+        # Fill entry orders and market closes at bar close.
+        # Use wall-clock fill_dt (not synthetic bar boundary) so trade
+        # entry_dt/exit_dt reflect when COM actually delivered the bar.
         trades_before = len(self.broker.trades)
-        self.broker.on_bar_close(idx, bar.close, bar_close_dt)
+        self.broker.on_bar_close(idx, bar.close, fill_dt)
         # Check for market close trades (broker.close() processed inside on_bar_close)
         if len(self.broker.trades) > trades_before:
             self._check_for_trade_close(bar, idx)
@@ -595,6 +611,56 @@ class LiveRunner:
             "market_open": is_market_open(),
         }
 
+    def get_exit_info(self) -> dict | None:
+        """Return current exit target info for 1-min bar logging.
+
+        Works for ALL strategy timeframes (1m, 15m, 60m, H4 etc.) —
+        the caller fires this on every 1-min bar regardless of the
+        strategy's native timeframe.
+
+        Two sources merged (broker-level takes priority):
+
+        1. ``broker._pending_exits`` — for strategies using
+           ``broker.exit(limit=, stop=)``.  Persists between strategy
+           runs so values remain valid across 1-min bars even when the
+           strategy only runs every 15/60 minutes.
+
+        2. ``strategy.exit_levels()`` — optional opt-in for strategies
+           that manage exits internally via ``broker.close()`` (e.g.
+           trailing stops held in ``self.trailing_stop_price``).  Called
+           via ``getattr`` so strategies without this method are safely
+           ignored.
+
+        Returns None when flat.
+        """
+        if self.broker.position_size == 0:
+            return None
+        info: dict = {
+            "side": self.broker.position_side.value,
+            "entry_price": self.broker.entry_price,
+            "limit": None,
+            "stop": None,
+        }
+        # Source 1: broker pending exit orders
+        if self.broker._pending_exits:
+            order = self.broker._pending_exits[0]
+            if order.limit is not None:
+                info["limit"] = int(order.limit)
+            if order.stop is not None:
+                info["stop"] = int(order.stop)
+        # Source 2: strategy-reported levels (optional, via duck typing)
+        exit_levels_fn = getattr(self.strategy, "exit_levels", None)
+        if callable(exit_levels_fn):
+            try:
+                levels = exit_levels_fn() or {}
+                if info["limit"] is None and levels.get("limit") is not None:
+                    info["limit"] = int(levels["limit"])
+                if info["stop"] is None and levels.get("stop") is not None:
+                    info["stop"] = int(levels["stop"])
+            except Exception:
+                pass  # broken exit_levels() — silently fall back
+        return info
+
     def get_result(self) -> BacktestResult:
         """Return a BacktestResult compatible with chart/trade display."""
         return BacktestResult(
@@ -651,8 +717,10 @@ class LiveRunner:
         # Force close open position
         if self._aggregated_bars and self.broker.position_size > 0:
             last_bar = self._aggregated_bars[-1]
-            last_dt = last_bar.dt.strftime("%Y-%m-%d %H:%M") if last_bar.dt else ""
-            self.broker.force_close(self._bar_index, last_bar.close, last_dt)
+            # Use wall-clock time — manual stop fires mid-bar, so neither
+            # bar open nor bar end reflects the actual close moment.
+            last_close_dt = datetime.now(_TZ_TAIPEI).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+            self.broker.force_close(self._bar_index, last_bar.close, last_close_dt)
             self._log_decision(
                 last_bar, "FORCE_CLOSE", self.broker.trades[-1].side.value if self.broker.trades else "",
                 "stop", last_bar.close, "live runner stopped",

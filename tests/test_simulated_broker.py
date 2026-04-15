@@ -531,6 +531,95 @@ class TestTrySetRealEntryPriceRaceGuard:
         assert broker.trades[0].real_entry_price == 0
 
 
+class TestTrySetRealExitPriceRaceGuard:
+    """Phase 2: real exit price tracking, mirror of issue #45 entry guard.
+
+    ``try_set_real_exit_price`` updates the most recent trade's
+    ``real_exit_price``/``real_exit_dt`` after the simulated exit has
+    already created the Trade record.  Race guards reject stale or
+    invalid writes so a late callback for a previous trade cannot
+    leak onto the current one.
+    """
+
+    def _open_and_close(self, broker, entry_bar=5, exit_bar=6,
+                        entry_price=20000, exit_price=20100):
+        """Helper: open a long position and close it via stop exit."""
+        broker.queue_entry(Order(tag="Long", side=OrderSide.LONG, qty=1))
+        broker.on_bar_close(entry_bar, entry_price)
+        broker.queue_exit(Order(
+            tag="TP", side=OrderSide.LONG, from_entry="Long", limit=exit_price))
+        broker.check_exits(exit_bar, open_=entry_price + 50,
+                           high=exit_price + 10, low=entry_price - 10,
+                           close=exit_price)
+
+    def test_accepts_valid_write(self, broker):
+        self._open_and_close(broker, entry_bar=5, exit_bar=6)
+        assert broker.trades[-1].exit_bar_index == 6
+
+        ok = broker.try_set_real_exit_price(
+            20098, exit_bar_index=6, fill_dt="2026-04-14T11:57:01")
+
+        assert ok is True
+        assert broker.trades[-1].real_exit_price == 20098
+        assert broker.trades[-1].real_exit_dt == "2026-04-14T11:57:01"
+
+    def test_rejects_when_no_trades(self, broker):
+        """Late callback before any trade exists → no write."""
+        assert not broker.trades
+        ok = broker.try_set_real_exit_price(20003, exit_bar_index=6)
+        assert ok is False
+
+    def test_rejects_when_already_set(self, broker):
+        """Second confirmation (double-fire) must not overwrite."""
+        self._open_and_close(broker, entry_bar=5, exit_bar=6)
+        broker.try_set_real_exit_price(20098, exit_bar_index=6, fill_dt="first")
+
+        ok = broker.try_set_real_exit_price(99999, exit_bar_index=6, fill_dt="second")
+
+        assert ok is False
+        assert broker.trades[-1].real_exit_price == 20098
+        assert broker.trades[-1].real_exit_dt == "first"
+
+    def test_rejects_mismatched_exit_bar_index(self, broker):
+        """Late callback for previous trade (exit_bar_index mismatch) → dropped."""
+        self._open_and_close(broker, entry_bar=5, exit_bar=6)
+        # Open + close a second trade
+        self._open_and_close(broker, entry_bar=8, exit_bar=10,
+                             entry_price=21000, exit_price=21100)
+        assert broker.trades[-1].exit_bar_index == 10
+
+        # Late callback from the first trade (exit_bar_index=6)
+        ok = broker.try_set_real_exit_price(
+            99999, exit_bar_index=6, fill_dt="stale")
+
+        assert ok is False
+        assert broker.trades[-1].real_exit_price == 0  # stale write dropped
+        assert broker.trades[-1].real_exit_dt == ""
+        # First trade's record is also untouched (we only update last)
+        assert broker.trades[0].real_exit_price == 0
+
+    def test_rejects_zero_or_negative_price(self, broker):
+        self._open_and_close(broker, entry_bar=5, exit_bar=6)
+
+        assert broker.try_set_real_exit_price(0, exit_bar_index=6) is False
+        assert broker.try_set_real_exit_price(-100, exit_bar_index=6) is False
+        assert broker.trades[-1].real_exit_price == 0
+
+    def test_does_not_overwrite_via_force_close(self, broker):
+        """Force close sets up the trade; later real fill should write."""
+        broker.queue_entry(Order(tag="Long", side=OrderSide.LONG, qty=1))
+        broker.on_bar_close(5, 20000)
+        broker.force_close(7, 20100)
+        assert len(broker.trades) == 1
+        assert broker.trades[0].exit_bar_index == 7
+
+        ok = broker.try_set_real_exit_price(
+            20105, exit_bar_index=7, fill_dt="2026-04-14T11:58:00")
+
+        assert ok is True
+        assert broker.trades[0].real_exit_price == 20105
+
+
 class TestBrokerContextRealEntryAPI:
     """BrokerContext exposes entry_price, real_entry_price, effective_entry_price."""
 
