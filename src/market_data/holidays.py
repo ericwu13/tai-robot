@@ -13,10 +13,13 @@ adjustments not yet reflected in the ``holidays`` package.
 from __future__ import annotations
 
 import calendar
+import logging
 from datetime import date, datetime, timedelta
 
 import holidays as _holidays
 
+
+_logger = logging.getLogger(__name__)
 
 # Manual overrides — only add dates that disagree with the `holidays` package.
 # Keep small; they should be rare exceptions.
@@ -30,6 +33,32 @@ OVERRIDE_TRADING: frozenset[date] = frozenset({
 
 _MONTH_CODES = "ABCDEFGHIJKL"  # A=Jan .. L=Dec
 
+# Warn-once flag for a broken `holidays` package in the frozen EXE.
+_tw_holidays_broken: bool = False
+
+
+def _tw_public_holidays(year: int) -> frozenset[date]:
+    """Return TW public holidays for ``year`` as a set of dates.
+
+    Falls back to an empty set (weekends-only detection) if the
+    ``holidays`` package cannot resolve the TW country module — this
+    happens in poorly-bundled frozen EXEs where
+    ``holidays.countries.taiwan`` wasn't collected (issue #58).  A
+    single warning is logged so the operator sees the degradation.
+    """
+    global _tw_holidays_broken
+    try:
+        return frozenset(_holidays.country_holidays("TW", years=year))
+    except Exception as e:
+        if not _tw_holidays_broken:
+            _tw_holidays_broken = True
+            _logger.warning(
+                "TW holiday detection unavailable — falling back to "
+                "weekend-only check. Settlement days that coincide with "
+                "public holidays may be mis-dated. Cause: %s", e,
+            )
+        return frozenset()
+
 
 def is_taifex_holiday(d: date) -> bool:
     """True if TAIFEX is closed on ``d`` (weekend, public holiday, or override)."""
@@ -39,7 +68,7 @@ def is_taifex_holiday(d: date) -> bool:
         return True
     if d.weekday() >= 5:  # Saturday=5, Sunday=6
         return True
-    return d in _holidays.country_holidays("TW", years=d.year)
+    return d in _tw_public_holidays(d.year)
 
 
 def next_trading_day(d: date) -> date:
