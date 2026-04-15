@@ -3739,6 +3739,7 @@ class BacktestApp:
         self._update_live_results()  # enable chart button & populate _last_bars
         self._update_manual_order_buttons()
         self._start_account_polling()
+        self._notify_if_settlement_day()
         self._start_live_tick_subscription()
 
     # ── Tick-based live data feed ──
@@ -3810,20 +3811,73 @@ class BacktestApp:
         self._check_session_end_close()
         self._live_poll_id = self.root.after(30000, self._schedule_status_update)
 
-    _SESSION_END_CLOSE_MINUTES = 2  # force close N minutes before session end
+    _SESSION_END_CLOSE_MINUTES = 2          # normal session: close 2 min before
+    _SETTLEMENT_END_CLOSE_MINUTES = 5       # settlement day: close 5 min before
+    _SETTLEMENT_NO_ENTRY_MINUTES = 60       # settlement day: block entries 60 min before close
+
+    def _is_settlement_no_entry_window(self, order_symbol: str) -> bool:
+        """True if a new ENTRY should be blocked due to settlement-day rule.
+
+        Returns True only when ALL of:
+          - today is the 3rd-Wed settlement day (or shifted by holiday)
+          - order_symbol is the front-month contract (back-months unaffected)
+          - we're within ``_SETTLEMENT_NO_ENTRY_MINUTES`` of the 13:30 close
+        """
+        from src.market_data.holidays import is_settlement_day, is_front_month_contract
+        now = _taipei_now()
+        if not is_settlement_day(now):
+            return False
+        if not is_front_month_contract(order_symbol, now):
+            return False
+        mins = minutes_until_session_close(order_symbol)
+        return mins is not None and mins <= self._SETTLEMENT_NO_ENTRY_MINUTES
+
+    def _notify_if_settlement_day(self) -> None:
+        """Log + Discord notify if today is settlement day for the front-month.
+
+        Called once per session when warmup completes. Helps the user
+        plan around the early 13:30 close + the no-entry window.
+        """
+        if not self._live_runner:
+            return
+        from src.market_data.holidays import is_settlement_day, is_front_month_contract
+        now = _taipei_now()
+        if not is_settlement_day(now):
+            return
+        order_sym = resolve_order_symbol(self._live_runner.symbol)
+        if not is_front_month_contract(order_sym, now):
+            return
+        msg = (f"⚠️ 結算日 SETTLEMENT DAY for {order_sym}: "
+               f"AM session closes at 13:30 (not 13:45). "
+               f"New entries blocked from 12:30, force-close at 13:25.")
+        self._live_log_msg(msg, "exit")
+        if _discord and _discord.enabled:
+            try:
+                _discord.notify(msg)
+            except Exception:
+                pass
 
     def _check_session_end_close(self):
         """Force-close open positions before market session ends.
 
         Prevents positions from staying open over weekends or overnight gaps.
-        Triggers 2 minutes before session close (13:43 AM, 04:58 night).
+        Normal: triggers 2 min before close (13:43 AM, 04:58 night).
+        Settlement day (3rd Wed) + front-month: triggers 5 min before
+        the early 13:30 close (i.e. ~13:25), avoiding TAIFEX auto-settlement.
         """
         if not self._live_runner or self._live_runner.broker.position_size == 0:
             return
-        mins = minutes_until_session_close()
+        order_sym = resolve_order_symbol(self._live_runner.symbol)
+        mins = minutes_until_session_close(order_sym)
         if mins is None:
             return
-        if mins > self._SESSION_END_CLOSE_MINUTES:
+        # Larger buffer on settlement day for the front-month contract.
+        from src.market_data.holidays import is_settlement_day, is_front_month_contract
+        is_settlement = (is_settlement_day(_taipei_now())
+                         and is_front_month_contract(order_sym, _taipei_now()))
+        threshold = (self._SETTLEMENT_END_CLOSE_MINUTES if is_settlement
+                     else self._SESSION_END_CLOSE_MINUTES)
+        if mins > threshold:
             return
 
         # Force close the position
@@ -4168,6 +4222,17 @@ class BacktestApp:
         if verdict == guard.BLOCK_ENTRY:
             self._live_log_msg(
                 f"實單暫停 Order blocked: {details['reason']}", "status")
+            return
+
+        # Settlement-day rule: block NEW entries within 60 min of the
+        # 13:30 close for the front-month contract. Avoids getting trapped
+        # in a position that would be force-settled by the exchange.
+        if action == "ENTRY_FILL" and self._is_settlement_no_entry_window(order_symbol):
+            reason = (f"settlement day no-entry window "
+                      f"({self._SETTLEMENT_NO_ENTRY_MINUTES} min before 13:30)")
+            self._live_log_msg(
+                f"結算日禁止進場 Settlement-day entry blocked: {reason}", "exit")
+            self._log_order_decision("REAL_ORDER_BLOCKED", reason)
             return
 
         if verdict == guard.SKIP_EXIT:
