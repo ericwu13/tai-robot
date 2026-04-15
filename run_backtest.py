@@ -824,7 +824,13 @@ class BacktestApp:
                 return
 
             self._live_tick_active = True
-            self._tick_watchdog.on_tick()
+            # Record the resubscribe attempt (not a real tick). on_tick()
+            # must NOT be called here — it would reset last_tick_time and
+            # prevent the watchdog from ever escalating to reconnect when
+            # the quote session is zombie (RequestTicks succeeds but no
+            # ticks ever arrive). Only set_grace so we don't warn during
+            # the startup window after resubscribe.
+            self._tick_watchdog.on_resubscribe()
             self._tick_watchdog.set_grace(30)
             orig = getattr(self, '_live_tick_symbol', com_symbol)
             label = f"{com_symbol} (for {orig})" if orig and orig != com_symbol else com_symbol

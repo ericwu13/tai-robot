@@ -31,16 +31,33 @@ class TickWatchdog:
     WARN_TIMEOUT = 120           # 2 min: start warning
     RESUBSCRIBE_TIMEOUT = 300    # 5 min: re-subscribe ticks
     RECONNECT_TIMEOUT = 600      # 10 min: full reconnect (re-login)
+    RESUBSCRIBE_COOLDOWN = 180   # 3 min: don't retry resubscribe within this window
     NEAR_CLOSE_SUPPRESS = 10     # suppress within 10 min of session close
 
     def __init__(self):
         self.active: bool = False
         self.last_tick_time: float = 0.0
-        self.grace_until: float = 0.0  # suppress warnings until this time
+        self.grace_until: float = 0.0   # suppress warnings until this time
+        self.last_resubscribe: float = 0.0  # for cooldown
 
     def on_tick(self) -> None:
-        """Call when a tick is received (live or history)."""
+        """Call when a real tick is received (live or history).
+
+        Resets staleness + resubscribe cooldown — a real tick means the
+        connection is healthy.
+        """
         self.last_tick_time = time.time()
+        self.last_resubscribe = 0.0
+
+    def on_resubscribe(self) -> None:
+        """Call when a resubscribe attempt was issued.
+
+        Starts a cooldown so the watchdog doesn't loop-resubscribe every
+        30s.  Does NOT touch last_tick_time — the quote server may not
+        actually push ticks back (zombie session) and we need elapsed
+        to keep climbing toward RECONNECT_TIMEOUT.
+        """
+        self.last_resubscribe = time.time()
 
     def set_grace(self, seconds: int = 30) -> None:
         """Set a grace period after reconnect/resubscribe."""
@@ -51,6 +68,7 @@ class TickWatchdog:
         self.active = False
         self.last_tick_time = 0.0
         self.grace_until = 0.0
+        self.last_resubscribe = 0.0
 
     def check(self, now: float | None = None) -> str | None:
         """Check tick health and return the action needed.
@@ -94,9 +112,18 @@ class TickWatchdog:
         if elapsed <= self.WARN_TIMEOUT:
             return None
 
+        # Reconnect wins unconditionally once we hit the threshold —
+        # cooldown does NOT suppress escalation.
         if elapsed > self.RECONNECT_TIMEOUT:
             return "reconnect"
+
         if elapsed > self.RESUBSCRIBE_TIMEOUT:
+            # Suppress repeated resubscribes within the cooldown window
+            # so elapsed can keep climbing toward RECONNECT_TIMEOUT.
+            # Without this, a zombie COM session loop-resubscribes every
+            # 30s and never escalates to a full re-login.
+            if self.last_resubscribe and (now - self.last_resubscribe) < self.RESUBSCRIBE_COOLDOWN:
+                return "warn"
             return "resubscribe"
         return "warn"
 

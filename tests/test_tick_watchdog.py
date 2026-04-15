@@ -274,7 +274,101 @@ class TestReset:
         wd.active = True
         wd.last_tick_time = time.time()
         wd.grace_until = time.time() + 30
+        wd.last_resubscribe = time.time()
         wd.reset()
         assert wd.active is False
         assert wd.last_tick_time == 0.0
         assert wd.grace_until == 0.0
+        assert wd.last_resubscribe == 0.0
+
+
+class TestResubscribeCooldown:
+    """Regression: zombie COM session scenario from test123 bot.
+
+    Before the fix, _resubscribe_ticks called on_tick() which reset
+    last_tick_time, so elapsed never reached RECONNECT_TIMEOUT and the
+    bot loop-resubscribed every 5 minutes forever. The fix:
+      1. run_backtest._resubscribe_ticks calls on_resubscribe() (not on_tick())
+      2. check() suppresses repeated "resubscribe" within the cooldown window
+      3. reconnect still fires unconditionally at RECONNECT_TIMEOUT
+    """
+
+    def test_on_resubscribe_does_not_reset_last_tick_time(self):
+        wd = TickWatchdog()
+        original = time.time() - 400  # 400s ago
+        wd.last_tick_time = original
+        wd.on_resubscribe()
+        # last_tick_time unchanged — the quote server may not actually send
+        # ticks back, so elapsed must keep climbing.
+        assert wd.last_tick_time == original
+        assert wd.last_resubscribe > 0
+
+    def test_on_tick_resets_resubscribe_cooldown(self):
+        """A real tick means the connection is healthy — clear cooldown."""
+        wd = TickWatchdog()
+        wd.last_resubscribe = time.time() - 60
+        wd.on_tick()
+        assert wd.last_resubscribe == 0.0
+
+    def test_cooldown_suppresses_resubscribe_within_window(self):
+        """After resubscribe, check() should NOT return resubscribe
+        again within RESUBSCRIBE_COOLDOWN — must return 'warn' instead
+        so elapsed keeps climbing to reconnect threshold."""
+        wd = TickWatchdog()
+        wd.active = True
+        # Market is open — use a weekday AM time
+        fake_now_dt = _taipei_dt(2026, 3, 17, 10, 30)  # Tue 10:30 AM
+        # Last tick 350s ago (> RESUBSCRIBE 300 but < RECONNECT 600)
+        wd.last_tick_time = _ts(fake_now_dt) - 350
+        wd.last_resubscribe = _ts(fake_now_dt) - 60  # resubscribed 1 min ago (within 3-min cooldown)
+
+        with _patch_now(fake_now_dt):
+            action = wd.check(now=_ts(fake_now_dt))
+        assert action == "warn"  # suppressed by cooldown
+
+    def test_cooldown_expires_allows_new_resubscribe(self):
+        """After cooldown expires, resubscribe can fire again."""
+        wd = TickWatchdog()
+        wd.active = True
+        fake_now_dt = _taipei_dt(2026, 3, 17, 10, 30)
+        wd.last_tick_time = _ts(fake_now_dt) - 400  # stale
+        wd.last_resubscribe = _ts(fake_now_dt) - 200  # cooldown expired (> 180s)
+
+        with _patch_now(fake_now_dt):
+            action = wd.check(now=_ts(fake_now_dt))
+        assert action == "resubscribe"
+
+    def test_reconnect_fires_even_during_cooldown(self):
+        """Reconnect (>10min elapsed) must NOT be suppressed by resubscribe
+        cooldown — the whole point of the fix is to let elapsed climb to
+        RECONNECT_TIMEOUT without endless resubscribes stopping it."""
+        wd = TickWatchdog()
+        wd.active = True
+        fake_now_dt = _taipei_dt(2026, 3, 17, 10, 30)
+        wd.last_tick_time = _ts(fake_now_dt) - 700  # > RECONNECT_TIMEOUT (600)
+        wd.last_resubscribe = _ts(fake_now_dt) - 60  # in cooldown
+
+        with _patch_now(fake_now_dt):
+            action = wd.check(now=_ts(fake_now_dt))
+        assert action == "reconnect"
+
+    def test_zombie_session_eventually_escalates_to_reconnect(self):
+        """End-to-end zombie scenario: tick stops at T=0, resubscribes at
+        T=300 (fails silently), by T=700 we should reconnect."""
+        wd = TickWatchdog()
+        wd.active = True
+        fake_now_dt = _taipei_dt(2026, 3, 17, 10, 30)
+        base = _ts(fake_now_dt) - 700
+
+        # Real last tick at T=0 (700s before "now")
+        wd.last_tick_time = base
+        # Resubscribe fired at T=300 (400s before now) — this replicates
+        # the old buggy on_tick() call happening here would have reset
+        # last_tick_time to T=300. With the fix, only last_resubscribe
+        # moves.
+        wd.last_resubscribe = base + 300
+
+        with _patch_now(fake_now_dt):
+            action = wd.check(now=_ts(fake_now_dt))
+        # elapsed = 700 > RECONNECT_TIMEOUT (600) → reconnect
+        assert action == "reconnect"
