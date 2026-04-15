@@ -69,14 +69,14 @@ class BacktestEngine:
         for i, bar in enumerate(bars):
             self.data_store.add_bar(bar)
 
-            bar_dt = bar.dt.strftime("%Y-%m-%d %H:%M") if bar.dt else ""
-            # Bar END time for fill timestamps: entries/exits record the
-            # actual fill time, not the bar's open.  E.g. a 30-min bar
-            # opening at 10:45 records fills at "11:15".
+            # Second precision for entry/exit timestamps. Backtest bars are
+            # always minute-aligned so seconds are :00 by construction; the
+            # wider format keeps consistency with live mode timestamps.
+            bar_dt = bar.dt.strftime("%Y-%m-%d %H:%M:%S") if bar.dt else ""
             bar_close_dt = ""
             if bar.dt and bar.interval:
                 bar_close_dt = (bar.dt + timedelta(seconds=bar.interval)
-                               ).strftime("%Y-%m-%d %H:%M")
+                               ).strftime("%Y-%m-%d %H:%M:%S")
             else:
                 bar_close_dt = bar_dt
 

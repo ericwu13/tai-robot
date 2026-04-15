@@ -159,7 +159,7 @@ class MyStrategy(BacktestStrategy):
 - `broker.position_size` -> int (0=flat, always >= 0, no direction info — track yourself)
 - `broker.trades` -> list[Trade] (read-only, completed trades). \
 Each Trade has: .tag, .side(OrderSide), .qty, .entry_price(int), .exit_price(int), .pnl(int), \
-.entry_dt(str "YYYY-MM-DD HH:MM"), .exit_dt(str "YYYY-MM-DD HH:MM"). \
+.entry_dt(str "YYYY-MM-DD HH:MM:SS"), .exit_dt(str "YYYY-MM-DD HH:MM:SS"). \
 **entry_dt and exit_dt are STRINGS, not datetime objects** — do NOT call .date() or .hour on them. \
 For date comparison: `last_trade.exit_dt.startswith("2026-04-09")` or `last_trade.exit_dt[:10] == str(bar.dt.date())`. \
 Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.close vs entry_price.
@@ -210,6 +210,15 @@ Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.c
   ```
 - OrderSide.LONG / OrderSide.SHORT
 - Prefer LONG-only unless asked for short
+- **OPTIONAL `exit_levels()` — only if your strategy manages exits internally via `broker.close()`** \
+  (e.g. a trailing stop stored in `self.trailing_stop_price` that you compare against bar.low). \
+  Expose the current stop/limit so the live UI can log TP/SL on every 1-min bar: \
+  ```
+  def exit_levels(self) -> dict:
+      return {"stop": self.trailing_stop_price} if self.trailing_stop_price else {}
+  ```
+  Not required for correctness. Strategies that use `broker.exit(limit=, stop=)` already surface \
+  their levels via `broker._pending_exits` — no `exit_levels()` override needed.
 
 ## Session Utilities
 ```python

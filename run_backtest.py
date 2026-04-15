@@ -346,6 +346,38 @@ _ui_queue: queue.Queue = queue.Queue()
 
 
 
+def _redact_acct(s: str | None) -> str:
+    """Redact sensitive identifiers, keeping only the last 4 digits.
+
+    Examples:
+        "F1111111112222" -> "***9366"
+        "A12345"         -> "***2345"
+        "abc"            -> "***" (too short to keep any)
+        ""               -> ""
+    """
+    if not s:
+        return ""
+    s = str(s)
+    if len(s) <= 4:
+        return "***"
+    return f"***{s[-4:]}"
+
+
+def _redact_open_interest(data: str | None) -> str:
+    """Redact account ID embedded in raw OpenInterest data.
+
+    Format: "TF,F1111111112222,TM04,B,1,...".  Mask field 1 (account)
+    keeping only the last 4 digits.
+    """
+    if not data or not isinstance(data, str):
+        return str(data) if data is not None else ""
+    parts = data.split(",")
+    if len(parts) >= 2 and parts[0] in ("TF", "TS"):
+        parts[1] = _redact_acct(parts[1])
+        return ",".join(parts)
+    return data
+
+
 def _log(msg):
     tpe = _taipei_now()
     local = datetime.now()
@@ -556,7 +588,7 @@ class BacktestApp:
                     if len(parts) >= 4 and parts[0] == "TF":
                         acct = parts[1] + parts[3]
                         self._futures_account = acct
-                        _log(f"期貨帳號 Futures account: {acct}")
+                        _log(f"期貨帳號 Futures account: {_redact_acct(acct)}")
                 elif kind == "stock_list":
                     market_no, stock_data = data
                     if market_no in (2, 7, 9):  # futures markets
@@ -583,7 +615,7 @@ class BacktestApp:
                         if first == "001":
                             self._account_monitor.set_flat()
                             self.real_pos_var.set("Flat (無持倉)")
-                    _log(f"未平倉 OpenInterest: {data}")
+                    _log(f"未平倉 OpenInterest: {_redact_open_interest(data)}")
                     # Fill polling: track position from OI callbacks
                     if self._trading_guard.fill_pending and self._live_runner:
                         self._update_fill_poll_position(data, parsed)
@@ -1996,7 +2028,7 @@ class BacktestApp:
             if authority_flag:
                 skC.SKCenterLib_SetAuthority(authority_flag)
 
-            _log(f"登入中 Logging in as {user_id}...")
+            _log(f"登入中 Logging in as {_redact_acct(user_id)}...")
             self.status_var.set("登入中 Logging in...")
             self.login_status_var.set("登入中...")
 
@@ -3302,7 +3334,7 @@ class BacktestApp:
         loss_frame = ttk.Frame(mode_frame)
         loss_frame.pack(anchor=tk.W, padx=30, pady=(0, 4))
         ttk.Label(loss_frame, text="每日虧損上限 Daily Loss Limit (NTD):").pack(side=tk.LEFT)
-        loss_var = tk.StringVar(value="1000")
+        loss_var = tk.StringVar(value="10000")
         loss_entry = ttk.Entry(loss_frame, textvariable=loss_var, width=8)
         loss_entry.pack(side=tk.LEFT, padx=4)
 
@@ -3748,13 +3780,17 @@ class BacktestApp:
         if not bars:
             return
         last_bar = bars[-1]
-        last_dt = last_bar.dt.strftime("%Y-%m-%d %H:%M") if last_bar.dt else ""
+        # Use wall-clock time (Taiwan) for exit_dt — force_close fires
+        # mid-bar at ~2 min before session end, so neither bar open nor
+        # bar end time reflects the actual close moment.
+        now_tpe = _taipei_now().replace(tzinfo=None)
+        last_close_dt = now_tpe.strftime("%Y-%m-%d %H:%M:%S")
         side = runner.broker.position_side.value if runner.broker.position_side else ""
 
         self._live_log_msg(
             f"盤前自動平倉 Session-end auto close: {mins}min to close, "
             f"force closing position", "exit")
-        runner.broker.force_close(runner._bar_index, last_bar.close, last_dt)
+        runner.broker.force_close(runner._bar_index, last_bar.close, last_close_dt)
         runner._log_decision(
             last_bar, "FORCE_CLOSE", side,
             "session_end", last_bar.close, f"auto close {mins}min before session end",
@@ -3948,6 +3984,22 @@ class BacktestApp:
                     f"O={completed_1m.open} C={completed_1m.close} V={completed_1m.volume}",
                     "status",
                 )
+                # Log current TP/SL levels when a position is open.
+                # Only works for strategies using broker.exit(limit=, stop=).
+                exit_info = self._live_runner.get_exit_info()
+                if exit_info:
+                    tp = f"TP={exit_info['limit']:,}" if exit_info["limit"] else "TP=--"
+                    sl = f"SL={exit_info['stop']:,}" if exit_info["stop"] else "SL=--"
+                    ep = exit_info["entry_price"]
+                    cp = completed_1m.close
+                    side = exit_info["side"]
+                    pnl_pts = (cp - ep) if side == "LONG" else (ep - cp)
+                    pnl = pnl_pts * self._live_runner.broker.point_value
+                    self._live_log_msg(
+                        f"  持倉 {side}@{ep:,} | {tp} {sl} | "
+                        f"現價={cp:,} ({pnl_pts:+}pts {pnl:+,})",
+                        "status",
+                    )
 
             # Push updates to live chart.
             # Always poll the aggregator's in-progress bar (if any) so the
@@ -4273,11 +4325,12 @@ class BacktestApp:
             self._live_log_msg(
                 f"送出實單 Sending: {side_str} {order_symbol} x1 {type_label} {price_label} "
                 f"(模擬價={sim_price:,})", action_type)
-            _log(f"REAL ORDER: {side_str} {order_symbol} acct={self._futures_account} "
-                 f"sim_price={sim_price}")
+            _log(f"REAL ORDER: {side_str} {order_symbol} "
+                 f"acct={_redact_acct(self._futures_account)} sim_price={sim_price}")
             nc = oOrder.sNewClose
             nc_label = {0: "new", 1: "close", 2: "auto"}.get(nc, str(nc))
-            _log(f"REAL ORDER PARAMS: acct={self._futures_account} stock={order_symbol} "
+            _log(f"REAL ORDER PARAMS: acct={_redact_acct(self._futures_account)} "
+                 f"stock={order_symbol} "
                  f"buy_sell={buy_sell} trade_type={oOrder.sTradeType}({type_label}) "
                  f"price={oOrder.bstrPrice}({price_label}) qty=1 newclose={nc}({nc_label}) reserved=0")
 
@@ -4704,6 +4757,44 @@ class BacktestApp:
         if self._live_runner and result.new_entries:
             for fill in result.new_entries:
                 self._live_log_msg(f"實{label}: {fill}", "entry")
+            # Phase 2: capture real_exit_price from new close-side fills.
+            # Match by symbol prefix and apply the most recent close fill
+            # to the latest trade.  The broker's race guards reject stale
+            # writes (mismatched exit_bar_index / already-set / no trade).
+            self._apply_real_exit_fills(result.new_parsed)
+
+    def _apply_real_exit_fills(self, new_parsed: list[dict]) -> None:
+        """Apply close-side fills to the most recent trade's real_exit_price.
+
+        Called after each FulfillReport poll detects new fills.  Each close
+        fill (``new_close == "O"``) updates the latest trade in-place via
+        ``broker.try_set_real_exit_price``.  Race guards in the broker
+        handle late callbacks, double-writes, and bar-index mismatches.
+        """
+        if not self._live_runner or not new_parsed:
+            return
+        broker = self._live_runner.broker
+        if not broker.trades:
+            return
+        for fill in new_parsed:
+            if fill.get("new_close") != "O":
+                continue
+            price = fill.get("price")
+            if not price or price <= 0:
+                continue
+            last_trade = broker.trades[-1]
+            fill_dt = _taipei_now().replace(tzinfo=None
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            accepted = broker.try_set_real_exit_price(
+                int(round(price)),
+                exit_bar_index=last_trade.exit_bar_index,
+                fill_dt=fill_dt,
+            )
+            if accepted:
+                self._log_order_decision(
+                    "REAL_EXIT_CONFIRMED",
+                    f"price={int(round(price))} dt={fill_dt}",
+                )
 
     def _log_order_decision(self, action: str, reason: str) -> None:
         """Log a real-order event to the CSV decision log."""

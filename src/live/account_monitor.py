@@ -33,6 +33,13 @@ class FillsResult:
     count: int = 0
     entries: list[str] = field(default_factory=list)  # formatted fill strings
     new_entries: list[str] = field(default_factory=list)  # fills not seen before
+    # Structured fill records aligned with `entries` (same order, same length).
+    # Each dict has: side ("B"/"S"), qty (int), price (float), new_close
+    # ("N"=new/開, "O"=close/平), date (str). Used by Phase 2 real exit price
+    # tracking — callers pick fills with new_close == "O" and apply to the
+    # most recent trade via try_set_real_exit_price.
+    parsed: list[dict] = field(default_factory=list)
+    new_parsed: list[dict] = field(default_factory=list)
 
 
 # ── Pure parsing functions (moved from run_backtest.py) ──
@@ -228,13 +235,25 @@ class AccountMonitor:
                 date = fields[23].strip()
                 side_str = "BUY" if side == "B" else "SELL"
                 nc_str = "\u958b" if new_close == "N" else "\u5e73"
+                # Parse numeric fields once; store None on failure.
                 try:
                     price_f = float(price)
+                except (ValueError, TypeError):
+                    price_f = None
+                try:
+                    qty_i = int(qty)
+                except (ValueError, TypeError):
+                    qty_i = 0
+                if price_f is not None:
                     result.entries.append(
                         f"{date} {side_str}{nc_str} x{qty} @{price_f:,.1f}")
-                except ValueError:
+                else:
                     result.entries.append(
                         f"{date} {side_str}{nc_str} x{qty} @{price}")
+                result.parsed.append({
+                    "side": side, "qty": qty_i, "price": price_f,
+                    "new_close": new_close, "date": date,
+                })
 
         result.count = len(result.entries)
 
@@ -242,6 +261,7 @@ class AccountMonitor:
         prev_count = self._prev_fill_counts.get(label, 0)
         if result.count > prev_count:
             result.new_entries = result.entries[prev_count:]
+            result.new_parsed = result.parsed[prev_count:]
         self._prev_fill_counts[label] = result.count
 
         return result
