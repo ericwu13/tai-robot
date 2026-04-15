@@ -91,7 +91,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pyyaml keyring httpx pytest pandas
+          pip install pyyaml keyring httpx pytest pandas holidays
 
       - name: Create settings.yaml stub
         run: cp settings.example.yaml settings.yaml
