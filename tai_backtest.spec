@@ -32,6 +32,8 @@ a = Analysis(
         # GUI / core
         'lightweight_charts', 'pandas', 'yaml', 'tkinter',
         'httpx', 'httpcore', 'h11', 'certifi', 'anyio', 'sniffio',
+        # TAIFEX settlement-day detection (3rd Wed early close)
+        'holidays',
         # COM (Capital API) — include submodules PyInstaller's analysis misses
         'comtypes', 'comtypes.client', 'comtypes.stream',
         'comtypes.client._code_cache', 'comtypes.client._generate',
