@@ -145,11 +145,17 @@ def _am_close_minutes(order_symbol: str | None = None,
     Back-month contracts and non-settlement days keep the standard 13:45.
     """
     if order_symbol:
-        from ..market_data.holidays import is_settlement_day, is_front_month_contract
-        if now is None:
-            now = _taipei_now()
-        if is_settlement_day(now) and is_front_month_contract(order_symbol, now):
-            return _AM_CLOSE_SETTLEMENT[0] * 60 + _AM_CLOSE_SETTLEMENT[1]
+        # Issue #58: if holidays lookup fails (e.g. mis-bundled frozen
+        # EXE), degrade to normal close time rather than raising up the
+        # stack into the tick watchdog and hanging the bot.
+        try:
+            from ..market_data.holidays import is_settlement_day, is_front_month_contract
+            if now is None:
+                now = _taipei_now()
+            if is_settlement_day(now) and is_front_month_contract(order_symbol, now):
+                return _AM_CLOSE_SETTLEMENT[0] * 60 + _AM_CLOSE_SETTLEMENT[1]
+        except Exception:
+            pass
     return _AM_CLOSE[0] * 60 + _AM_CLOSE[1]
 
 
