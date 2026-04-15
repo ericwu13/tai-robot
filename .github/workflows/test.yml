@@ -17,7 +17,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: pip install pyyaml keyring httpx pytest pandas
+        run: pip install pyyaml keyring httpx pytest pandas holidays
 
       - name: Create settings stub
         run: cp settings.example.yaml settings.yaml
