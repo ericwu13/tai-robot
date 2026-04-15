@@ -972,6 +972,8 @@ class BacktestApp:
                    command=self._load_saved_strategy).pack(side=tk.LEFT, padx=2)
         ttk.Button(saved_frame, text="Delete", width=6,
                    command=self._delete_saved_strategy).pack(side=tk.LEFT, padx=2)
+        ttk.Button(saved_frame, text="匯入 Import", width=10,
+                   command=self._import_strategy_file).pack(side=tk.LEFT, padx=2)
 
     def _build_control_panel(self, parent):
         ctrl = ttk.Frame(parent)
@@ -1661,6 +1663,56 @@ class BacktestApp:
         self._refresh_saved_combo()
         self.saved_var.set("")
         self.status_var.set(f"已刪除 Deleted: {class_name}")
+
+    def _import_strategy_file(self):
+        """Pick a .py file, validate, and register it as a saved strategy.
+
+        Validation rules match AI-generated code (allowed imports, no
+        forbidden builtins, must subclass BacktestStrategy).  On success
+        the file is copied to strategies/ and added to index.json so it
+        appears in the Saved dropdown.
+        """
+        path = filedialog.askopenfilename(
+            title="匯入策略檔 Import Strategy File",
+            filetypes=[("Python", "*.py"), ("All", "*.*")],
+        )
+        if not path:
+            return
+
+        # Validate without copying so we can show the user what we found.
+        try:
+            info = self._strategy_store.preview_external_file(path)
+        except ValueError as e:
+            messagebox.showerror("驗證失敗 Validation Failed", str(e))
+            return
+
+        # Confirm + collect description (defaults to first line of docstring).
+        default_desc = info["docstring"].split("\n", 1)[0].strip() if info["docstring"] else ""
+        msg = (
+            f"類別 Class: {info['class_name']}\n"
+            f"時框 Timeframe: {info['kline_minute']}-min bars\n"
+            f"描述 Description: {default_desc or '(none)'}\n"
+        )
+        if info["exists"]:
+            msg += "\n警告 Warning: 同名策略已存在，將覆寫\n" \
+                   "Strategy with this name already exists — will be replaced.\n"
+        msg += "\n是否匯入? Import this strategy?"
+
+        if not messagebox.askyesno("確認匯入 Confirm Import", msg):
+            return
+
+        try:
+            cls, fname = self._strategy_store.import_external_file(
+                path, description=default_desc, overwrite=True)
+        except (ValueError, FileExistsError) as e:
+            messagebox.showerror("匯入失敗 Import Failed", str(e))
+            return
+
+        # Refresh dropdown and select the imported strategy.
+        self._refresh_saved_combo()
+        self.saved_var.set(cls)
+        self._load_saved_strategy()
+        self.status_var.set(f"已匯入 Imported: {cls} → {fname}")
 
     def _show_api_key_dialog(self):
         """Show settings dialog with provider selection and API keys."""
