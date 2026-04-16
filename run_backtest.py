@@ -47,6 +47,11 @@ except ImportError:
 from src.market_data.models import Bar, Tick
 from src.market_data.bar_builder import BarBuilder
 from src.utils.time_utils import combine_sk_datetime
+from src.utils.log_redact import (
+    redact_acct as _redact_acct,
+    redact_open_interest as _redact_open_interest,
+    redact_future_rights as _redact_future_rights,
+)
 from src.backtest.engine import BacktestEngine
 from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
@@ -347,38 +352,6 @@ _ui_queue: queue.Queue = queue.Queue()
 
 
 
-def _redact_acct(s: str | None) -> str:
-    """Redact sensitive identifiers, keeping only the last 4 digits.
-
-    Examples:
-        "F1111111112222" -> "***9366"
-        "A12345"         -> "***2345"
-        "abc"            -> "***" (too short to keep any)
-        ""               -> ""
-    """
-    if not s:
-        return ""
-    s = str(s)
-    if len(s) <= 4:
-        return "***"
-    return f"***{s[-4:]}"
-
-
-def _redact_open_interest(data: str | None) -> str:
-    """Redact account ID embedded in raw OpenInterest data.
-
-    Format: "TF,F1111111112222,TM04,B,1,...".  Mask field 1 (account)
-    keeping only the last 4 digits.
-    """
-    if not data or not isinstance(data, str):
-        return str(data) if data is not None else ""
-    parts = data.split(",")
-    if len(parts) >= 2 and parts[0] in ("TF", "TS"):
-        parts[1] = _redact_acct(parts[1])
-        return ",".join(parts)
-    return data
-
-
 def _log(msg):
     tpe = _taipei_now()
     local = datetime.now()
@@ -631,7 +604,7 @@ class BacktestApp:
                         _log(f"帳戶資料 Account: equity={parsed.get('equity')} "
                              f"available={parsed.get('available')} "
                              f"float_pnl={parsed.get('float_pnl')}")
-                    _log(f"權益數 FutureRights: {data}")
+                    _log(f"權益數 FutureRights: {_redact_future_rights(data)}")
                 elif kind == "order_result":
                     code, msg = data
                     if code == 0:
