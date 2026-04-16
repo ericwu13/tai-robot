@@ -93,6 +93,7 @@ from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
+from src.live.tick_flow_state import TickFlowState
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
 )
@@ -266,6 +267,7 @@ def _load_settings():
             cfg["google_api_key"] = ai.get("google_api_key", "")
             cfg["ai_model"] = ai.get("model", "")
             cfg["ai_max_tokens"] = ai.get("max_tokens", 16384)
+            cfg["enable_recap"] = ai.get("enable_recap", True)
             # Notifications
             notif = data.get("notifications", {})
             cfg["discord_bot_token"] = notif.get("discord_bot_token", "")
@@ -275,7 +277,8 @@ def _load_settings():
 
 
 def _save_ai_settings(provider: str = "", anthropic_key: str = "",
-                      google_key: str = "", model: str = "", max_tokens: int = 0):
+                      google_key: str = "", model: str = "", max_tokens: int = 0,
+                      enable_recap: bool | None = None):
     """Persist AI settings to settings.yaml."""
     if not yaml:
         return
@@ -295,6 +298,8 @@ def _save_ai_settings(provider: str = "", anthropic_key: str = "",
         ai["model"] = model
     if max_tokens:
         ai["max_tokens"] = max_tokens
+    if enable_recap is not None:
+        ai["enable_recap"] = enable_recap
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
@@ -778,10 +783,7 @@ class BacktestApp:
 
         # Reset history tracking so the history→live transition fires again
         # and suppress_strategy gets re-enabled then cleared properly.
-        self._live_history_done = False
-        self._live_tick_count = 0
-        self._live_history_tick_count = 0
-        self._live_stale_drops = 0
+        self._tick_flow.reset()
         self._live_runner.suppress_strategy = True
 
         try:
@@ -876,10 +878,7 @@ class BacktestApp:
         # Fill confirmation polling (auto mode) — uses OpenInterest position change
         self._fill_poller = FillPoller(self._trading_guard)
         self._fill_poll_timer_id = None
-        self._live_history_done: bool = False
-        self._live_tick_count: int = 0
-        self._live_history_tick_count: int = 0
-        self._live_stale_drops: int = 0
+        self._tick_flow = TickFlowState(log_fn=_log)
 
     def _build_chat_panel(self, parent):
         # ── Header ──
@@ -1700,7 +1699,7 @@ class BacktestApp:
         """Show settings dialog with provider selection and API keys."""
         dialog = tk.Toplevel(self.root)
         dialog.title("AI Settings")
-        dialog.geometry("450x280")
+        dialog.geometry("450x320")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1745,23 +1744,36 @@ class BacktestApp:
         provider_var.trace_add("write", _update_hint)
         _update_hint()
 
+        # Session recap toggle
+        recap_var = tk.BooleanVar(value=bool(self._settings.get("enable_recap", True)))
+        ttk.Checkbutton(
+            frame,
+            text="Enable session recap 啟用對話回顧",
+            variable=recap_var,
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=(16, 0))
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=(16, 0))
 
         def _save():
             provider = provider_var.get()
             ak = anth_var.get().strip()
             gk = goog_var.get().strip()
             model = model_var.get().strip()
+            enable_recap = bool(recap_var.get())
+            max_tokens = int(self._settings.get("ai_max_tokens", 0) or 0)
 
             self._settings["ai_provider"] = provider
             self._settings["anthropic_api_key"] = ak
             self._settings["google_api_key"] = gk
             self._settings["ai_model"] = model
+            self._settings["enable_recap"] = enable_recap
 
             _save_ai_settings(provider=provider, anthropic_key=ak,
-                              google_key=gk, model=model)
+                              google_key=gk, model=model,
+                              max_tokens=max_tokens,
+                              enable_recap=enable_recap)
 
             # Reset client so it picks up new settings
             if self._chat_client:
@@ -1862,7 +1874,7 @@ class BacktestApp:
         _log(f"Chat session loaded from {path} ({n_msgs} messages)")
 
         # Ask AI to summarize its understanding of the conversation
-        if n_msgs > 0:
+        if n_msgs > 0 and self._settings.get("enable_recap", True):
             self._send_context_recap()
 
     def _send_context_recap(self):
@@ -3997,8 +4009,10 @@ class BacktestApp:
         if not self._live_bar_builder:
             return
 
-        self._live_tick_count += 1
-        if not is_history or not self._live_history_done:
+        # Pre-classify bookkeeping: must happen BEFORE process() so the
+        # transition-tick snapshot (history_tick_count) includes this tick.
+        self._tick_flow.pre_classify()
+        if not is_history or not self._tick_flow.live_history_done:
             # Update watchdog: live ticks always, history ticks only during replay
             self._tick_watchdog.on_tick()
 
@@ -4024,20 +4038,18 @@ class BacktestApp:
         now_naive = _taipei_now().replace(tzinfo=None)
         tick_age = (now_naive - dt).total_seconds()
 
-        verdict = classify_tick(
+        verdict, should_unsuppress = self._tick_flow.process(
             tick_age_seconds=tick_age,
-            is_history_flag=is_history,
-            live_history_done=self._live_history_done,
+            is_history=is_history,
         )
 
         if verdict == "transition":
             # Genuine first live tick — enable strategy and log
-            self._live_history_done = True
-            self._live_history_tick_count = self._live_tick_count
-            self._live_runner.suppress_strategy = False
+            if should_unsuppress:
+                self._live_runner.suppress_strategy = False
             status = self._live_runner.get_status()
             self._live_log_msg(
-                f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "
+                f"歷史報價完成 History ticks done: {self._tick_flow.tick_count} ticks, "
                 f"{status['bars_1m']} 1m bars built. Now receiving live ticks.",
                 "status",
             )
@@ -4046,17 +4058,14 @@ class BacktestApp:
         elif verdict == "drop":
             # Stale replay tick after live transition (bot 271 scenario).
             # Dropping prevents BarBuilder from creating fake live bars.
-            self._live_stale_drops = getattr(self, "_live_stale_drops", 0) + 1
-            if self._live_stale_drops <= 5 or self._live_stale_drops % 1000 == 0:
-                _log(f"[STALE TICK DROPPED] live mode, tick is {tick_age:.0f}s old "
-                     f"(dt={dt}) — count={self._live_stale_drops}")
+            # TickFlowState already logged this drop.
             return
         else:
             # verdict == "keep"
             # Diagnostic for mis-labelled history ticks (issue #50).
-            if (not is_history and not self._live_history_done
+            if (not is_history and not self._tick_flow.live_history_done
                     and tick_age > HISTORY_STALENESS_SECONDS
-                    and self._live_tick_count <= 5):
+                    and self._tick_flow.tick_count <= 5):
                 _log(f"[STALE TICK] is_history=False but tick is {tick_age:.0f}s old "
                      f"(dt={dt}), keeping suppress_strategy=True")
 
@@ -4073,7 +4082,9 @@ class BacktestApp:
         self._live_last_tick_price = price
 
         # Log first few live ticks to verify timestamp/price convention
-        if self._live_history_done and self._live_tick_count <= self._live_history_tick_count + 5:
+        if (self._tick_flow.live_history_done
+                and self._tick_flow.tick_count
+                <= self._tick_flow.history_tick_count + 5):
             _log(f"[DEBUG TICK] raw: date={date} time={time_hms} ms={time_millismicros} "
                  f"-> dt={dt} price={close} scaled={price} qty={qty}")
 
@@ -4088,7 +4099,7 @@ class BacktestApp:
         )
 
         # Real-time TP/SL check on every tick (fills at exact price)
-        if self._live_runner and self._live_history_done:
+        if self._live_runner and self._tick_flow.live_history_done:
             tick_dt = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
             result = self._live_runner.check_tick_exit(price, tick_dt)
             if result:
@@ -4106,7 +4117,7 @@ class BacktestApp:
             agg_bar = self._live_runner.feed_1m_bar(completed_1m)
 
             # Only log live 1m bars (not the flood of historical catchup)
-            if self._live_history_done:
+            if self._tick_flow.live_history_done:
                 self._live_log_msg(
                     f"1分K 1m: {completed_1m.dt.strftime('%H:%M')} "
                     f"O={completed_1m.open} C={completed_1m.close} V={completed_1m.volume}",
@@ -4133,14 +4144,15 @@ class BacktestApp:
             # Always poll the aggregator's in-progress bar (if any) so the
             # chart shows the NEW partial immediately after a boundary cross,
             # not 1 minute later when the next 1-min bar arrives (issue #44).
-            if self._live_history_done and self._live_chart and self._live_chart.is_alive:
+            if (self._tick_flow.live_history_done
+                    and self._live_chart and self._live_chart.is_alive):
                 if agg_bar is not None:
                     self._live_chart.push_bar(agg_bar)
                 partial = self._live_runner.get_partial_bar()
                 if partial is not None:
                     self._live_chart.push_partial(partial)
 
-            if agg_bar is not None and self._live_history_done:
+            if agg_bar is not None and self._tick_flow.live_history_done:
                 self._live_log_msg(
                     f"聚合K棒 Aggregated bar: {agg_bar.dt.strftime('%H:%M')} "
                     f"O={agg_bar.open} H={agg_bar.high} "
@@ -5027,11 +5039,11 @@ class BacktestApp:
         # tick arrived, the "歷史報價完成" transition message was never
         # logged and the user may think deploy failed.  Explain what
         # actually happened.
-        if (self._live_tick_count > 0 and not self._live_history_done
+        if (self._tick_flow.tick_count > 0 and not self._tick_flow.live_history_done
                 and self._live_tick_active):
             self._live_log_msg(
                 f"歷史播放未完成 History replay not yet completed "
-                f"({self._live_tick_count} history ticks received, 0 live). "
+                f"({self._tick_flow.tick_count} history ticks received, 0 live). "
                 f"Deploy during market hours (AM 08:45-13:45 / Night 15:00-05:00) "
                 f"to see live tick flow.", "status")
         self._live_warmup_mode = False
@@ -5042,10 +5054,7 @@ class BacktestApp:
         self._live_tick_symbol = ""
         self._live_tick_com_symbol = ""
         self._live_last_tick_price = 0
-        self._live_history_done = False
-        self._live_tick_count = 0
-        self._live_history_tick_count = 0
-        self._live_stale_drops = 0
+        self._tick_flow.reset()
 
         # Close live chart before stopping runner
         if self._live_chart and self._live_chart.is_alive:
