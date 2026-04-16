@@ -82,7 +82,7 @@ a = Analysis(
         'src.backtest.report', 'src.backtest.metrics', 'src.backtest.strategy',
         # Live
         'src.live', 'src.live.bar_aggregator', 'src.live.csv_logger',
-        'src.live.live_runner',
+        'src.live.live_runner', 'src.live.tick_classifier',
         # Utils
         'src.utils.time_utils',
     ],
