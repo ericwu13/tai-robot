@@ -87,6 +87,7 @@ _CODE_GEN_MAX_TOKENS = 65536
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
+from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
 )
@@ -807,6 +808,7 @@ class BacktestApp:
         self._live_history_done = False
         self._live_tick_count = 0
         self._live_history_tick_count = 0
+        self._live_stale_drops = 0
         self._live_runner.suppress_strategy = True
 
         try:
@@ -904,6 +906,7 @@ class BacktestApp:
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
+        self._live_stale_drops: int = 0
 
     def _build_chat_panel(self, parent):
         # ── Header ──
@@ -4045,30 +4048,44 @@ class BacktestApp:
         # Defense: also check whether the tick's datetime is "stale"
         # (> 2 minutes behind wall-clock). If so, treat as history
         # regardless of the is_history flag.
-        _HISTORY_STALENESS_SECONDS = 120  # 2 minutes
-        if not is_history and not self._live_history_done:
-            now = _taipei_now()
-            # dt is naive (tz stripped), now is aware — compare as naive
-            now_naive = now.replace(tzinfo=None)
-            tick_age = (now_naive - dt).total_seconds()
-            if tick_age > _HISTORY_STALENESS_SECONDS:
-                # COM lied about is_history — tick is old, keep suppressing
-                if self._live_tick_count <= 5:
-                    _log(f"[STALE TICK] is_history=False but tick is {tick_age:.0f}s old "
-                         f"(dt={dt}), keeping suppress_strategy=True")
-            else:
-                # Genuine live tick — safe to enable strategy
-                self._live_history_done = True
-                self._live_history_tick_count = self._live_tick_count
-                self._live_runner.suppress_strategy = False
-                status = self._live_runner.get_status()
-                self._live_log_msg(
-                    f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "
-                    f"{status['bars_1m']} 1m bars built. Now receiving live ticks.",
-                    "status",
-                )
-                self._update_live_status()
-                self._update_live_results()
+        now_naive = _taipei_now().replace(tzinfo=None)
+        tick_age = (now_naive - dt).total_seconds()
+
+        verdict = classify_tick(
+            tick_age_seconds=tick_age,
+            is_history_flag=is_history,
+            live_history_done=self._live_history_done,
+        )
+
+        if verdict == "transition":
+            # Genuine first live tick — enable strategy and log
+            self._live_history_done = True
+            self._live_history_tick_count = self._live_tick_count
+            self._live_runner.suppress_strategy = False
+            status = self._live_runner.get_status()
+            self._live_log_msg(
+                f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "
+                f"{status['bars_1m']} 1m bars built. Now receiving live ticks.",
+                "status",
+            )
+            self._update_live_status()
+            self._update_live_results()
+        elif verdict == "drop":
+            # Stale replay tick after live transition (bot 271 scenario).
+            # Dropping prevents BarBuilder from creating fake live bars.
+            self._live_stale_drops = getattr(self, "_live_stale_drops", 0) + 1
+            if self._live_stale_drops <= 5 or self._live_stale_drops % 1000 == 0:
+                _log(f"[STALE TICK DROPPED] live mode, tick is {tick_age:.0f}s old "
+                     f"(dt={dt}) — count={self._live_stale_drops}")
+            return
+        else:
+            # verdict == "keep"
+            # Diagnostic for mis-labelled history ticks (issue #50).
+            if (not is_history and not self._live_history_done
+                    and tick_age > HISTORY_STALENESS_SECONDS
+                    and self._live_tick_count <= 5):
+                _log(f"[STALE TICK] is_history=False but tick is {tick_age:.0f}s old "
+                     f"(dt={dt}), keeping suppress_strategy=True")
 
         # Skip ticks during closed market (settlement/reference data at 14:50 etc.)
         if not is_market_open(dt):
@@ -5033,6 +5050,17 @@ class BacktestApp:
             self._live_log_msg(
                 f"警告: 停止時有未確認成交 WARNING: {self._fill_poller.action_type} "
                 f"fill pending during stop. Check position manually.", "exit")
+        # Help-hint (issue #59): if user stops the bot before any live
+        # tick arrived, the "歷史報價完成" transition message was never
+        # logged and the user may think deploy failed.  Explain what
+        # actually happened.
+        if (self._live_tick_count > 0 and not self._live_history_done
+                and self._live_tick_active):
+            self._live_log_msg(
+                f"歷史播放未完成 History replay not yet completed "
+                f"({self._live_tick_count} history ticks received, 0 live). "
+                f"Deploy during market hours (AM 08:45-13:45 / Night 15:00-05:00) "
+                f"to see live tick flow.", "status")
         self._live_warmup_mode = False
         self._live_polling = False
         self._live_tick_active = False
@@ -5044,6 +5072,7 @@ class BacktestApp:
         self._live_history_done = False
         self._live_tick_count = 0
         self._live_history_tick_count = 0
+        self._live_stale_drops = 0
 
         # Close live chart before stopping runner
         if self._live_chart and self._live_chart.is_alive:
