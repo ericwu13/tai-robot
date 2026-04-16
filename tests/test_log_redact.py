@@ -1,7 +1,8 @@
 """Tests for src.utils.log_redact — mask account/client IDs in logs.
 
-Covers real payload formats seen in production debug logs (issues from
-users reporting leaked IDs even after v2.7.1).
+All account/client IDs used in these tests are synthetic placeholders
+(all-9 / repeating patterns). Never paste real broker-issued IDs into
+source code.
 """
 
 from __future__ import annotations
@@ -16,9 +17,14 @@ from src.utils.log_redact import (
 )
 
 
+# Synthetic fixtures. Keep last-4-digits predictable so assertions are clear.
+FAKE_ACCT = "F1111111112222"   # ends in 2222
+FAKE_CLIENT = "L3333344444"    # ends in 4444
+
+
 class TestRedactAcct:
     def test_long_id_keeps_last_4(self):
-        assert redact_acct("F1111111112222") == "***9366"
+        assert redact_acct(FAKE_ACCT) == "***2222"
 
     def test_short_id_fully_masked(self):
         assert redact_acct("abc") == "***"
@@ -35,18 +41,18 @@ class TestRedactAcct:
 
 class TestScrubIds:
     def test_masks_f_prefix(self):
-        assert scrub_ids("acct=F1111111112222 open") == "acct=F***9366 open"
+        assert scrub_ids(f"acct={FAKE_ACCT} open") == "acct=F***2222 open"
 
     def test_masks_l_prefix(self):
-        assert scrub_ids("client=L3333344444 sent") == "client=L***3388 sent"
+        assert scrub_ids(f"client={FAKE_CLIENT} sent") == "client=L***4444 sent"
 
     def test_masks_multiple_ids_in_same_string(self):
-        text = "client=L3333344444, acct=F1111111112222"
+        text = f"client={FAKE_CLIENT}, acct={FAKE_ACCT}"
         out = scrub_ids(text)
-        assert "L3333344444" not in out
-        assert "F1111111112222" not in out
-        assert "L***3388" in out
-        assert "F***9366" in out
+        assert FAKE_CLIENT not in out
+        assert FAKE_ACCT not in out
+        assert "L***4444" in out
+        assert "F***2222" in out
 
     def test_does_not_mask_short_numeric_tokens(self):
         """5 digits minimum — words like LIVE, F4, L12 should not match."""
@@ -69,14 +75,14 @@ class TestScrubIds:
 
 class TestRedactOpenInterest:
     def test_masks_account_field(self):
-        raw = "TF,F1111111112222,TM04,B,1,0,37220.00,,,L3333344444"
+        raw = f"TF,{FAKE_ACCT},TM04,B,1,0,37220.00,,,{FAKE_CLIENT}"
         out = redact_open_interest(raw)
         # Both IDs should be masked somewhere in the output
-        assert "F1111111112222" not in out
-        assert "L3333344444" not in out
+        assert FAKE_ACCT not in out
+        assert FAKE_CLIENT not in out
         # Last 4 digits of each should still be visible
-        assert "9366" in out
-        assert "3388" in out
+        assert "2222" in out
+        assert "4444" in out
         # Structure preserved — same number of commas
         assert out.count(",") == raw.count(",")
 
@@ -97,17 +103,17 @@ class TestRedactOpenInterest:
 
 class TestRedactFutureRights:
     def test_masks_tail_ids(self):
-        # Real payload from v2.7.1 debug log — IDs at fields [-2] and [-1]
+        # Payload shape matching OnFutureRights format (synthetic IDs).
         raw = (
             "29951,130,105,49,0,0,30081,6231,0,0,0,-1490,130,23850,18300,"
             "23850,18300,0,6231,30081,0,0,31595,,126,NTD,23850,18300,6101,"
-            "0,0,6101,6101,0,125,0,0,0,0,L3333344444,F1111111112222"
+            f"0,0,6101,6101,0,125,0,0,0,0,{FAKE_CLIENT},{FAKE_ACCT}"
         )
         out = redact_future_rights(raw)
-        assert "L3333344444" not in out
-        assert "F1111111112222" not in out
-        assert "L***3388" in out
-        assert "F***9366" in out
+        assert FAKE_CLIENT not in out
+        assert FAKE_ACCT not in out
+        assert "L***4444" in out
+        assert "F***2222" in out
 
     def test_empty_sentinel_passthrough(self):
         assert redact_future_rights("##,,,,,,,,,,,") == "##,,,,,,,,,,,"
@@ -116,25 +122,22 @@ class TestRedactFutureRights:
         assert redact_future_rights(None) == ""
 
 
-class TestBugReportPayloads:
-    """Regression test using the exact payloads from the user's
-    complaint after v2.7.1."""
+class TestPartiallyRedactedPayloads:
+    """When an earlier redaction pass already masked field 1, any
+    L-prefix client ID in a later field must still get scrubbed."""
 
-    def test_open_interest_from_real_log(self):
-        raw = "TF,***9366,TM05,B,1,0,37220.00,,,L3333344444"
-        # The first field is already redacted (from an earlier run),
-        # but L3333344444 at the end must also be masked.
+    def test_open_interest_with_partial_redaction(self):
+        raw = f"TF,***2222,TM05,B,1,0,37220.00,,,{FAKE_CLIENT}"
         out = redact_open_interest(raw)
-        assert "L3333344444" not in out
-        assert "L***3388" in out
+        assert FAKE_CLIENT not in out
+        assert "L***4444" in out
 
-    def test_future_rights_from_real_log(self):
+    def test_future_rights_leaves_no_known_id_patterns(self):
         raw = (
             "29951,130,105,49,0,0,30081,6231,0,0,0,-1490,130,23850,18300,"
             "23850,18300,0,6231,30081,0,0,31595,,126,NTD,23850,18300,6101,"
-            "0,0,6101,6101,0,125,0,0,0,0,L3333344444,F1111111112222"
+            f"0,0,6101,6101,0,125,0,0,0,0,{FAKE_CLIENT},{FAKE_ACCT}"
         )
         out = redact_future_rights(raw)
-        # Both identifiable sequences must be gone
-        for leak in ("L3333344444", "F1111111112222"):
+        for leak in (FAKE_CLIENT, FAKE_ACCT):
             assert leak not in out, f"{leak} leaked in output: {out}"
