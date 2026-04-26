@@ -3801,6 +3801,7 @@ class BacktestApp:
         self._update_live_status()
         self._check_tick_watchdog()
         self._check_session_end_close()
+        self._check_session_end_report()
         self._live_poll_id = self.root.after(30000, self._schedule_status_update)
 
     _SESSION_END_CLOSE_MINUTES = 2          # normal session: close 2 min before
@@ -3911,6 +3912,33 @@ class BacktestApp:
             "session_end", last_bar.close, f"auto close {mins}min before session end",
         )
         runner._auto_save_session()
+
+    def _check_session_end_report(self):
+        """Fire the daily-report hook near each session close.
+
+        Runs on the same 30s cadence as ``_check_session_end_close`` and
+        mirrors its settlement-aware threshold (2 min normal, 5 min on
+        settlement day for the front-month). Fires regardless of
+        position state — flat bots still produce a report. Per-session
+        debounce lives inside ``LiveRunner._generate_daily_report``.
+        """
+        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        order_sym = resolve_order_symbol(self._live_runner.symbol)
+        mins = minutes_until_session_close(order_sym)
+        if mins is None:
+            return
+        try:
+            from src.market_data.holidays import is_settlement_day, is_front_month_contract
+            is_settlement = (is_settlement_day(_taipei_now())
+                             and is_front_month_contract(order_sym, _taipei_now()))
+        except Exception:
+            is_settlement = False
+        threshold = (self._SETTLEMENT_END_CLOSE_MINUTES if is_settlement
+                     else self._SESSION_END_CLOSE_MINUTES)
+        if mins > threshold:
+            return
+        self._live_runner._generate_daily_report()
 
     def _check_tick_watchdog(self):
         """Delegate tick health check to TickWatchdog and act on the result."""
