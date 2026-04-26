@@ -3562,6 +3562,7 @@ class BacktestApp:
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
         self._live_runner.on("on_decision", lambda d: self.root.after(0, self._on_live_decision, d))
         self._live_runner.on("on_status", lambda s: self.root.after(0, self._live_log_msg, s, "status"))
+        self._live_runner.on("on_daily_report", lambda r: self.root.after(0, self._on_live_daily_report, r))
 
         # Set data source for live mode
         self._data_source = "即時交易 Live (tick)"
@@ -4189,6 +4190,22 @@ class BacktestApp:
         # Semi-auto / Auto: handle real orders on fills
         if self._trading_mode in ("semi_auto", "auto") and action in ("ENTRY_FILL", "TRADE_CLOSE", "FORCE_CLOSE"):
             self._handle_semi_auto_order(decision)
+
+    def _on_live_daily_report(self, report: dict) -> None:
+        """Forward end-of-session daily report to Discord and the live log."""
+        date = report.get("date", "?")
+        summary = report.get("summary", {}) or {}
+        self._live_log_msg(
+            f"每日報告已產生 Daily report saved: data/daily-reports/{date}.json "
+            f"({summary.get('total_trades', 0)} trades, "
+            f"P&L {summary.get('total_pnl', 0):+,})",
+            "status",
+        )
+        if _discord is not None and _discord.enabled:
+            try:
+                _discord.daily_report(report)
+            except Exception:
+                pass  # best-effort; never block on notification failure
 
     # ── Semi-auto real order handling ──
 
