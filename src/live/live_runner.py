@@ -839,6 +839,8 @@ class LiveRunner:
                 strategy_params=getattr(self.strategy, "params", None),
                 point_value=self.point_value,
                 symbol=self.symbol,
+                bot_name=self.bot_name,
+                started_at=self._started_at,
             )
             if report is not None:
                 self._emit("on_daily_report", report)

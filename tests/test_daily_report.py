@@ -527,6 +527,55 @@ class TestDiscordDailyReport:
         assert "SMA Cross" in msg
         assert "trending-up" in msg
 
+    def test_daily_report_includes_session_line(self):
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier("fake-token", "fake-channel")
+        sent = []
+        notifier._send = lambda msg: sent.append(msg)
+
+        report = {
+            "date": "2026-04-11",
+            "summary": {"total_trades": 1, "total_pnl": 100,
+                        "win_rate": 1.0, "profit_factor": 0,
+                        "max_drawdown": 0},
+            "strategy": {"name": "Test"},
+            "market_regime": None,
+            "session": {
+                "bot_name": "tmf00_main",
+                "started_at": "2026-04-11T08:45:00",
+                "version": "2.7.3",
+            },
+        }
+        notifier.daily_report(report)
+
+        assert len(sent) == 1
+        msg = sent[0]
+        assert "tmf00_main" in msg
+        assert "v2.7.3" in msg
+        # Started timestamp trimmed to minute precision (no seconds, no T)
+        assert "2026-04-11 08:45" in msg
+        assert "2026-04-11T08:45:00" not in msg
+
+    def test_daily_report_without_session_field(self):
+        """Reports without a session sub-dict (older saves) still render."""
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier("fake-token", "fake-channel")
+        sent = []
+        notifier._send = lambda msg: sent.append(msg)
+
+        report = {
+            "date": "2026-04-11",
+            "summary": {"total_trades": 0, "total_pnl": 0,
+                        "win_rate": 0, "profit_factor": 0,
+                        "max_drawdown": 0},
+            "strategy": {"name": "Test"},
+            "market_regime": None,
+        }
+        notifier.daily_report(report)
+        assert len(sent) == 1  # didn't crash
+
     def test_daily_report_without_regime(self):
         from src.live.discord_notify import DiscordNotifier
 
@@ -679,6 +728,26 @@ class TestGenerateSessionReport:
 
         broker = _FakeBroker([])
         assert generate_session_report(broker=broker, data_store=None) is None
+
+    def test_session_metadata_propagates(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [_make_trade(exit_dt="2026-04-11 10:30")]
+        broker = _FakeBroker(trades)
+
+        report = generate_session_report(
+            broker=broker,
+            data_store=None,
+            symbol="TXF1",
+            bot_name="tmf00_main",
+            started_at="2026-04-11T08:45:00",
+        )
+        assert report is not None
+        assert report["session"]["bot_name"] == "tmf00_main"
+        assert report["session"]["started_at"] == "2026-04-11T08:45:00"
+        # version comes from version.APP_VERSION
+        assert report["session"]["version"]  # non-empty
 
     def test_explicit_date(self, tmp_path, monkeypatch):
         import src.daily_report.report_generator as rg

@@ -63,6 +63,14 @@ def _group_trades_by_date(trades: list[Trade]) -> dict[str, list[Trade]]:
     return grouped
 
 
+def _app_version() -> str:
+    try:
+        from version import APP_VERSION
+        return APP_VERSION
+    except Exception:
+        return ""
+
+
 def generate_daily_report(
     date: str,
     trades: list[Trade],
@@ -74,6 +82,8 @@ def generate_daily_report(
     strategy_params: dict | None = None,
     point_value: int = 1,
     symbol: str = "",
+    bot_name: str = "",
+    started_at: str = "",
     save: bool = True,
 ) -> dict:
     """Generate a structured daily report for the given date.
@@ -88,6 +98,8 @@ def generate_daily_report(
     strategy_params : current parameter dict
     point_value : contract multiplier (e.g. 200 for TX, 50 for MTX)
     symbol : trading symbol
+    bot_name : live bot session identifier (folder suffix), empty for backtests
+    started_at : ISO timestamp of when the live session started
     save : whether to write the report to disk
 
     Returns
@@ -112,6 +124,11 @@ def generate_daily_report(
         "date": date,
         "symbol": symbol,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "session": {
+            "bot_name": bot_name,
+            "started_at": started_at,
+            "version": _app_version(),
+        },
         "strategy": {
             "name": strategy_name,
             "version": strategy_version,
@@ -179,6 +196,8 @@ def generate_session_report(
     point_value: int = 1,
     symbol: str = "",
     date: str = "",
+    bot_name: str = "",
+    started_at: str = "",
 ) -> dict | None:
     """Generate a daily report from a live session's broker and data store.
 
@@ -225,6 +244,8 @@ def generate_session_report(
         strategy_params=strategy_params,
         point_value=point_value,
         symbol=symbol,
+        bot_name=bot_name,
+        started_at=started_at,
         save=True,
     )
 
