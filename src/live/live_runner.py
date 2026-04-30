@@ -260,6 +260,13 @@ class LiveRunner:
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
         self.daily_loss_limit: int = 10000  # NTD, for session persistence
 
+        # Daily-report dedupe key: (date_str, "DAY"|"NIGHT") of the last
+        # session for which a report was emitted. Prevents the 30s
+        # session-end poll from re-firing within the same close window
+        # and prevents a manual stop right after auto-fire from
+        # producing a duplicate report.
+        self._last_report_session: tuple[str, str] | None = None
+
     # ── Lock file ──
 
     def acquire_lock(self) -> None:
@@ -757,6 +764,7 @@ class LiveRunner:
             )
 
         self._auto_save_session()
+        self._generate_daily_report()
         self.csv_logger.close()
         self.release_lock()
         self.state = LiveState.STOPPED
@@ -794,6 +802,50 @@ class LiveRunner:
             save_session(self._session_path, data)
         except Exception:
             pass  # best-effort; don't crash the bot
+
+    def _session_key(self) -> tuple[str, str]:
+        """Return ``(YYYY-MM-DD, "DAY"|"NIGHT")`` for the current TPE moment.
+
+        DAY covers 08:45 ≤ hh:mm < 13:46 — one extra minute past the
+        13:45 close so a poll at 13:45:30 still classifies as DAY.
+        Everything else is NIGHT — the night session straddles midnight
+        (15:00–05:00 TPE), so "not DAY" is the correct partition.
+        """
+        now = _taipei_now()
+        minutes = now.hour * 60 + now.minute
+        # 525 = 08:45, 826 = 13:46 (one minute past day-session close).
+        slot = "DAY" if 525 <= minutes < 826 else "NIGHT"
+        return (now.strftime("%Y-%m-%d"), slot)
+
+    def _generate_daily_report(self) -> None:
+        """Generate a daily report after session stop (best-effort).
+
+        Debounced per ``(date, DAY|NIGHT)`` so that the same session is
+        never reported twice — the 30s session-end poll fires this
+        method repeatedly inside the close window, and a manual stop
+        right after auto-fire would otherwise produce a duplicate.
+        """
+        try:
+            key = self._session_key()
+            if key == self._last_report_session:
+                return
+            self._last_report_session = key
+
+            from ..daily_report.report_generator import generate_session_report
+            report = generate_session_report(
+                broker=self.broker,
+                data_store=self.data_store,
+                strategy_name=self.strategy_display_name,
+                strategy_params=getattr(self.strategy, "params", None),
+                point_value=self.point_value,
+                symbol=self.symbol,
+                bot_name=self.bot_name,
+                started_at=self._started_at,
+            )
+            if report is not None:
+                self._emit("on_daily_report", report)
+        except Exception:
+            pass  # best-effort; don't crash the bot on report failure
 
     def restore_session(self, session_data: dict) -> int:
         """Restore broker state from a saved session.
