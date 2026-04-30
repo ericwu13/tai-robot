@@ -16,8 +16,9 @@ def export_to_pine(chat_client: ChatClient, strategy_source: str) -> str:
         "Translate this Python backtest strategy to TradingView Pine Script v5:\n\n"
         f"```python\n{strategy_source}\n```"
     )
-    # Pine translation is mechanical — flash is enough.
-    pine_model = model_for_tier(chat_client.provider, "light")
+    # Pine translation needs the strategy logic preserved exactly — use the
+    # heavy tier so subtle entry/exit conditions don't get paraphrased away.
+    pine_model = model_for_tier(chat_client.provider, "heavy")
     response = chat_client.one_shot(
         prompt, system_prompt=PINE_EXPORT_SYSTEM_PROMPT,
         call_site="pine_export", model=pine_model,
