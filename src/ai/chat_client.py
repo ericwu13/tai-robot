@@ -137,6 +137,19 @@ def _log_token_usage(
         _log.debug("Failed to write AI usage log: %s", e)
 
 
+def _format_usage_line(input_tokens: int, output_tokens: int,
+                       reasoning_tokens: int, total_tokens: int) -> str:
+    """One-line token-usage summary appended to the assistant response so the
+    user can see per-call spend in the chat UI without leaving the window.
+
+    Returns ``""`` when total is 0 (e.g. test mocks without usage data).
+    """
+    if total_tokens <= 0:
+        return ""
+    return (f"\n\n📊 tokens: {input_tokens:,} in / {output_tokens:,} out / "
+            f"{reasoning_tokens:,} reasoning (total: {total_tokens:,})")
+
+
 def _extract_anthropic_usage(data: dict) -> tuple[int, int, int, int]:
     """Return (input, output, reasoning, total) for an Anthropic response.
 
@@ -291,7 +304,10 @@ class ChatClient:
             reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
 
+        # Conversation history holds the raw response — the usage line is
+        # caller-only so it doesn't bloat future API requests.
         self.conversation.append({"role": "assistant", "content": assistant_text})
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
         return assistant_text
 
     def _send_google(self, user_message: str, *, call_site: str, model: str | None) -> str:
@@ -354,11 +370,13 @@ class ChatClient:
             reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
 
+        # Conversation history holds the raw response — annotations
+        # (truncation warning, usage line) are caller-only.
         self.conversation.append({"role": "assistant", "content": assistant_text})
 
-        # Check if response was truncated
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
             assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
 
         return assistant_text
 
@@ -426,6 +444,7 @@ class ChatClient:
             input_tokens=in_tok, output_tokens=out_tok,
             reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
         return assistant_text
 
     def _one_shot_google(self, user_message: str, system_prompt: str = "",
@@ -471,9 +490,9 @@ class ChatClient:
             reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
 
-        # Check if response was truncated
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
             assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
 
         return assistant_text
 

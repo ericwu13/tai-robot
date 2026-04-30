@@ -3221,15 +3221,20 @@ class BacktestApp:
                         # Final response is the real analysis
                         self.root.after(0, lambda r=response: self._on_chat_response(r))
                     else:
-                        # Log a short ack line for visibility, no big chat bubble
-                        ack_preview = response.strip().split("\n", 1)[0][:120]
+                        # Log a short ack line for visibility, no big chat bubble.
+                        # chat_client appends a "📊 tokens: ..." footer to every
+                        # response — surface it here too so per-batch spend is
+                        # visible on intermediate acks, not just the final one.
+                        lines = response.strip().split("\n")
+                        ack_preview = lines[0][:120] if lines else ""
+                        token_line = next(
+                            (ln for ln in lines if ln.startswith("📊")), "")
+                        ack_display = f"[AI Review part {batch_idx}/{K} ack] {ack_preview}"
+                        if token_line:
+                            ack_display += f"  {token_line}"
                         self.root.after(
                             0,
-                            lambda p=ack_preview, b=batch_idx, k=K:
-                                self._append_chat(
-                                    "system",
-                                    f"[AI Review part {b}/{k} ack] {p}",
-                                )
+                            lambda d=ack_display: self._append_chat("system", d),
                         )
             except Exception as e:
                 _log(f"Review chunked error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
