@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import csv
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
 import httpx
 
 
@@ -19,6 +26,155 @@ DEFAULT_MODELS = {
     PROVIDER_ANTHROPIC: "claude-sonnet-4-20250514",
     PROVIDER_GOOGLE: "gemini-2.5-pro",
 }
+
+# Tiered Gemini models — used by callers that want to pick light vs heavy reasoning.
+GOOGLE_MODEL_PRO = "gemini-2.5-pro"
+GOOGLE_MODEL_FLASH = "gemini-2.5-flash"
+
+# Auto-truncate conversation when its total char size exceeds this threshold
+# in send_message().  The first message is always kept; the most recent N
+# messages that fit are kept, older ones in the middle are dropped.
+_CONVERSATION_CHAR_LIMIT = 200_000
+
+# CSV columns for the per-call usage log.  ``reasoning_tokens`` captures
+# Gemini 2.5's thoughtsTokenCount — these are billed at the output rate but
+# don't show up in candidatesTokenCount, so without this column the log
+# under-reports cost for any thinking-enabled model.
+_USAGE_LOG_HEADERS = [
+    "timestamp", "call_site", "provider", "model",
+    "input_tokens", "output_tokens", "reasoning_tokens", "total_tokens",
+]
+
+# Print one notice on the first write attempt so the user can confirm where
+# logging lives (or see the failure reason).  Toggled to True after first call.
+_usage_log_notified = False
+
+_log = logging.getLogger(__name__)
+
+
+def _resolve_usage_log_path() -> str:
+    """Where to append the per-call usage row.
+
+    Resolved at write time (not import time) so the path is robust against
+    cwd changes.  Override with TAI_AI_USAGE_LOG for tests/CI.
+    """
+    override = os.environ.get("TAI_AI_USAGE_LOG")
+    if override:
+        return override
+    # chat_client.py lives at <repo>/src/ai/chat_client.py
+    return str(Path(__file__).resolve().parents[2] / "data" / "ai_usage.csv")
+
+
+def model_for_tier(provider: str, tier: str) -> str | None:
+    """Return a tier-appropriate model override, or None to use the user default.
+
+    ``tier`` is ``"light"`` (cheap/fast: chat, recap) or ``"heavy"``
+    (quality matters: codegen, trade review).  For non-Google providers we
+    return None so the user-configured model is preserved (Anthropic users pick
+    their own model in settings).
+    """
+    if provider == PROVIDER_GOOGLE:
+        if tier == "light":
+            return GOOGLE_MODEL_FLASH
+        return GOOGLE_MODEL_PRO
+    return None
+
+
+def _log_token_usage(
+    *, call_site: str, provider: str, model: str,
+    input_tokens: int, output_tokens: int,
+    reasoning_tokens: int = 0, total_tokens: int = 0,
+) -> None:
+    """Append one row to ``data/ai_usage.csv``.  Best-effort — never raises.
+
+    ``total_tokens`` should be the provider's authoritative total when
+    available (Gemini's ``totalTokenCount`` already includes thinking).
+    Falls back to ``input + output + reasoning`` when zero.
+    """
+    global _usage_log_notified
+    path = _resolve_usage_log_path()
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        # If a pre-existing file uses an older/different header, archive it
+        # so we don't append rows with mismatched columns.
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                expected = ",".join(_USAGE_LOG_HEADERS)
+                if first_line and first_line != expected:
+                    os.rename(path, path + ".bak")
+            except OSError:
+                pass
+
+        new_file = not os.path.exists(path)
+        in_t = int(input_tokens or 0)
+        out_t = int(output_tokens or 0)
+        think_t = int(reasoning_tokens or 0)
+        tot_t = int(total_tokens or 0) or (in_t + out_t + think_t)
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(_USAGE_LOG_HEADERS)
+            w.writerow([
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                call_site, provider, model,
+                in_t, out_t, think_t, tot_t,
+            ])
+
+        if not _usage_log_notified:
+            print(f"[ai_usage] logging to {path}", file=sys.stderr)
+            _usage_log_notified = True
+    except Exception as e:
+        if not _usage_log_notified:
+            print(f"[ai_usage] WARNING: failed to write {path}: {e}",
+                  file=sys.stderr)
+            _usage_log_notified = True
+        _log.debug("Failed to write AI usage log: %s", e)
+
+
+def _format_usage_line(input_tokens: int, output_tokens: int,
+                       reasoning_tokens: int, total_tokens: int) -> str:
+    """One-line token-usage summary appended to the assistant response so the
+    user can see per-call spend in the chat UI without leaving the window.
+
+    Returns ``""`` when total is 0 (e.g. test mocks without usage data).
+    """
+    if total_tokens <= 0:
+        return ""
+    return (f"\n\n📊 tokens: {input_tokens:,} in / {output_tokens:,} out / "
+            f"{reasoning_tokens:,} reasoning (total: {total_tokens:,})")
+
+
+def _extract_anthropic_usage(data: dict) -> tuple[int, int, int, int]:
+    """Return (input, output, reasoning, total) for an Anthropic response.
+
+    Anthropic bills extended-thinking output as regular ``output_tokens``,
+    so reasoning is reported as 0 and total = input + output.
+    """
+    usage = data.get("usage") or {}
+    in_t = int(usage.get("input_tokens", 0))
+    out_t = int(usage.get("output_tokens", 0))
+    return in_t, out_t, 0, in_t + out_t
+
+
+def _extract_google_usage(data: dict) -> tuple[int, int, int, int]:
+    """Return (input, output, reasoning, total) for a Gemini response.
+
+    Gemini 2.5 reports thinking under ``thoughtsTokenCount`` separately from
+    ``candidatesTokenCount`` (visible output).  Both are billed at the output
+    rate.  ``totalTokenCount`` is the API's authoritative billed total.
+    """
+    meta = data.get("usageMetadata") or {}
+    in_t = int(meta.get("promptTokenCount", 0))
+    out_t = int(meta.get("candidatesTokenCount", 0))
+    think_t = int(meta.get("thoughtsTokenCount", 0))
+    tot_t = int(meta.get("totalTokenCount", 0)) or (in_t + out_t + think_t)
+    return in_t, out_t, think_t, tot_t
 
 
 class ChatClient:
@@ -47,27 +203,71 @@ class ChatClient:
     def set_system_prompt(self, prompt: str) -> None:
         self.system_prompt = prompt
 
-    def send_message(self, user_message: str) -> str:
+    def _enforce_conversation_size(self) -> None:
+        """If conversation chars exceed _CONVERSATION_CHAR_LIMIT, drop oldest
+        middle messages, keeping conversation[0] and the most recent tail.
+        """
+        conv = self.conversation
+        total = sum(len(m.get("content", "")) for m in conv)
+        if total <= _CONVERSATION_CHAR_LIMIT or len(conv) <= 2:
+            return
+
+        first = conv[0]
+        first_size = len(first.get("content", ""))
+        budget = _CONVERSATION_CHAR_LIMIT - first_size
+
+        kept_tail: list[dict] = []
+        running = 0
+        # Walk from the end, keep as many recent messages as fit.
+        for msg in reversed(conv[1:]):
+            size = len(msg.get("content", ""))
+            if running + size > budget and kept_tail:
+                break
+            kept_tail.append(msg)
+            running += size
+        kept_tail.reverse()
+
+        dropped = len(conv) - 1 - len(kept_tail)
+        if dropped <= 0:
+            return
+
+        new_conv = [first] + kept_tail
+        self.conversation = new_conv
+        _log.warning(
+            "ChatClient: conversation auto-truncated (%d chars > %d); "
+            "kept first message + last %d of %d, dropped %d middle messages.",
+            total, _CONVERSATION_CHAR_LIMIT, len(kept_tail), len(conv) - 1, dropped,
+        )
+
+    def send_message(
+        self,
+        user_message: str,
+        *,
+        call_site: str = "unknown",
+        model: str | None = None,
+    ) -> str:
         """Send a message and return the assistant's response text.
 
         Blocking call — run from a background thread when used with Tkinter.
         """
         self.conversation.append({"role": "user", "content": user_message})
+        self._enforce_conversation_size()
 
         try:
             if self.provider == PROVIDER_GOOGLE:
-                return self._send_google(user_message)
+                return self._send_google(user_message, call_site=call_site, model=model)
             else:
-                return self._send_anthropic(user_message)
+                return self._send_anthropic(user_message, call_site=call_site, model=model)
         except Exception:
             # Remove the user message on failure
             self.conversation.pop()
             raise
 
-    def _send_anthropic(self, user_message: str) -> str:
+    def _send_anthropic(self, user_message: str, *, call_site: str, model: str | None) -> str:
         """Send via Anthropic API."""
+        used_model = model or self.model
         payload: dict = {
-            "model": self.model,
+            "model": used_model,
             "max_tokens": self.max_tokens,
             "messages": self.conversation,
         }
@@ -97,11 +297,23 @@ class ChatClient:
             if block.get("type") == "text":
                 assistant_text += block["text"]
 
+        in_tok, out_tok, think_tok, tot_tok = _extract_anthropic_usage(data)
+        _log_token_usage(
+            call_site=call_site, provider=self.provider, model=used_model,
+            input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
+        )
+
+        # Conversation history holds the raw response — the usage line is
+        # caller-only so it doesn't bloat future API requests.
         self.conversation.append({"role": "assistant", "content": assistant_text})
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
         return assistant_text
 
-    def _send_google(self, user_message: str) -> str:
+    def _send_google(self, user_message: str, *, call_site: str, model: str | None) -> str:
         """Send via Google Gemini API."""
+        used_model = model or self.model
+
         # Build Gemini conversation format
         contents = []
 
@@ -128,7 +340,7 @@ class ChatClient:
         if system_instruction:
             payload["system_instruction"] = system_instruction
 
-        url = GOOGLE_API_URL.format(model=self.model) + f"?key={self.api_key}"
+        url = GOOGLE_API_URL.format(model=used_model) + f"?key={self.api_key}"
         headers = {"content-type": "application/json"}
 
         response = self._client.post(url, json=payload, headers=headers)
@@ -151,16 +363,32 @@ class ChatClient:
                 if "text" in part:
                     assistant_text += part["text"]
 
+        in_tok, out_tok, think_tok, tot_tok = _extract_google_usage(data)
+        _log_token_usage(
+            call_site=call_site, provider=self.provider, model=used_model,
+            input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
+        )
+
+        # Conversation history holds the raw response — annotations
+        # (truncation warning, usage line) are caller-only.
         self.conversation.append({"role": "assistant", "content": assistant_text})
 
-        # Check if response was truncated
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
             assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
 
         return assistant_text
 
-    def one_shot(self, user_message: str, system_prompt: str | None = None,
-                 max_tokens: int | None = None) -> str:
+    def one_shot(
+        self,
+        user_message: str,
+        system_prompt: str | None = None,
+        max_tokens: int | None = None,
+        *,
+        call_site: str = "unknown",
+        model: str | None = None,
+    ) -> str:
         """Single API call without modifying conversation history.
 
         Uses the given system_prompt (or self.system_prompt if None).
@@ -170,13 +398,17 @@ class ChatClient:
         prompt = system_prompt if system_prompt is not None else self.system_prompt
         tokens = max_tokens or self.max_tokens
         if self.provider == PROVIDER_GOOGLE:
-            return self._one_shot_google(user_message, prompt, tokens)
-        return self._one_shot_anthropic(user_message, prompt, tokens)
+            return self._one_shot_google(user_message, prompt, tokens,
+                                         call_site=call_site, model=model)
+        return self._one_shot_anthropic(user_message, prompt, tokens,
+                                        call_site=call_site, model=model)
 
     def _one_shot_anthropic(self, user_message: str, system_prompt: str = "",
-                            max_tokens: int = 0) -> str:
+                            max_tokens: int = 0, *, call_site: str = "unknown",
+                            model: str | None = None) -> str:
+        used_model = model or self.model
         payload: dict = {
-            "model": self.model,
+            "model": used_model,
             "max_tokens": max_tokens or self.max_tokens,
             "messages": [{"role": "user", "content": user_message}],
         }
@@ -205,10 +437,20 @@ class ChatClient:
         for block in data.get("content", []):
             if block.get("type") == "text":
                 assistant_text += block["text"]
+
+        in_tok, out_tok, think_tok, tot_tok = _extract_anthropic_usage(data)
+        _log_token_usage(
+            call_site=call_site, provider=self.provider, model=used_model,
+            input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
+        )
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
         return assistant_text
 
     def _one_shot_google(self, user_message: str, system_prompt: str = "",
-                         max_tokens: int = 0) -> str:
+                         max_tokens: int = 0, *, call_site: str = "unknown",
+                         model: str | None = None) -> str:
+        used_model = model or self.model
         contents = [{"role": "user", "parts": [{"text": user_message}]}]
 
         payload: dict = {
@@ -218,7 +460,7 @@ class ChatClient:
         if system_prompt:
             payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
 
-        url = GOOGLE_API_URL.format(model=self.model) + f"?key={self.api_key}"
+        url = GOOGLE_API_URL.format(model=used_model) + f"?key={self.api_key}"
         headers = {"content-type": "application/json"}
 
         response = self._client.post(url, json=payload, headers=headers)
@@ -241,9 +483,16 @@ class ChatClient:
                 if "text" in part:
                     assistant_text += part["text"]
 
-        # Check if response was truncated
+        in_tok, out_tok, think_tok, tot_tok = _extract_google_usage(data)
+        _log_token_usage(
+            call_site=call_site, provider=self.provider, model=used_model,
+            input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
+        )
+
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
             assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
 
         return assistant_text
 

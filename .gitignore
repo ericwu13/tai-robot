@@ -27,7 +27,7 @@ logs/
 *.db
 backtest_trades_*.csv
 
-# Live runtime logs
+# Live runtime logs (incl. data/ai_usage.csv — per-machine token spend log)
 data/
 
 # Broker order dumps
