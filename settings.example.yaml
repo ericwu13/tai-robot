@@ -50,3 +50,7 @@ ai:
   google_api_key: ""             # AIza... (from aistudio.google.com/apikey)
   model: ""                      # leave empty for default (Sonnet 4 / Gemini 2.5 Pro)
   max_tokens: 4096
+  # Skip the post-load context recap when the loaded conversation already has
+  # more than this many messages.  A recap re-sends the full history; on long
+  # sessions that's expensive and rarely worth it.
+  recap_token_gate: 30
