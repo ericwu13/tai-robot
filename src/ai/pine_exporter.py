@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .chat_client import ChatClient
+from .chat_client import ChatClient, model_for_tier
 from .prompts import PINE_EXPORT_SYSTEM_PROMPT
 
 
@@ -16,7 +16,13 @@ def export_to_pine(chat_client: ChatClient, strategy_source: str) -> str:
         "Translate this Python backtest strategy to TradingView Pine Script v5:\n\n"
         f"```python\n{strategy_source}\n```"
     )
-    response = chat_client.one_shot(prompt, system_prompt=PINE_EXPORT_SYSTEM_PROMPT)
+    # Pine translation needs the strategy logic preserved exactly — use the
+    # heavy tier so subtle entry/exit conditions don't get paraphrased away.
+    pine_model = model_for_tier(chat_client.provider, "heavy")
+    response = chat_client.one_shot(
+        prompt, system_prompt=PINE_EXPORT_SYSTEM_PROMPT,
+        call_site="pine_export", model=pine_model,
+    )
 
     # Extract Pine Script code block
     import re

@@ -76,7 +76,10 @@ from src.strategy.examples.m1_bollinger_atr_long import M1BollingerAtrLongStrate
 from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
 
 # AI modules
-from src.ai.chat_client import ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS
+from src.ai.chat_client import (
+    ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS,
+    model_for_tier,
+)
 from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT, CODE_GEN_SYSTEM_PROMPT, CHAT_RECAP_PROMPT
 from src.ai.code_sandbox import (
     extract_python_code, load_strategy_from_source,
@@ -85,8 +88,10 @@ from src.ai.code_sandbox import (
 from src.ai.strategy_store import StrategyStore
 from src.ai.pine_exporter import export_to_pine
 
-# Code generation uses higher token limit to avoid truncation (issue #7)
-_CODE_GEN_MAX_TOKENS = 65536
+# Code generation max output tokens.  Strategies are typically <300 lines,
+# so 16K output tokens is plenty.  Lower cap keeps the per-call price low
+# (Gemini bills generous output token budgets even when the response is short).
+_CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, _taipei_now, _TZ_TAIPEI
@@ -266,6 +271,7 @@ def _load_settings():
             cfg["google_api_key"] = ai.get("google_api_key", "")
             cfg["ai_model"] = ai.get("model", "")
             cfg["ai_max_tokens"] = ai.get("max_tokens", 16384)
+            cfg["recap_token_gate"] = ai.get("recap_token_gate", 30)
             # Notifications
             notif = data.get("notifications", {})
             cfg["discord_bot_token"] = notif.get("discord_bot_token", "")
@@ -1294,9 +1300,13 @@ class BacktestApp:
         self.btn_send.config(state=tk.DISABLED)
         self._append_chat("system", "Thinking...")
 
+        chat_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "light")
+
         def _worker():
             try:
-                response = self._chat_client.send_message(text)
+                response = self._chat_client.send_message(
+                    text, call_site="chat", model=chat_model)
                 self.root.after(0, lambda: self._on_chat_response(response))
             except Exception as e:
                 _log(f"Chat error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1400,11 +1410,16 @@ class BacktestApp:
 
         # Use a one-shot API call (not the chat conversation) to avoid bloat
         client = self._chat_client
+        codegen_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
 
         def _worker():
             try:
-                response = client.one_shot(gen_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
-                                          max_tokens=_CODE_GEN_MAX_TOKENS)
+                response = client.one_shot(
+                    gen_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                    max_tokens=_CODE_GEN_MAX_TOKENS,
+                    call_site="codegen", model=codegen_model,
+                )
                 self.root.after(0, lambda: self._on_generate_response(response))
             except Exception as e:
                 _log(f"Generate error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1482,11 +1497,16 @@ class BacktestApp:
         ) if summary else ""
         retry_msg = summary_section + error_msg + "\n\n" + STRATEGY_CODE_CONTEXT
         remaining = retries_left - 1
+        codegen_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
 
         def _worker():
             try:
-                resp = self._chat_client.one_shot(retry_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
-                                                  max_tokens=_CODE_GEN_MAX_TOKENS)
+                resp = self._chat_client.one_shot(
+                    retry_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                    max_tokens=_CODE_GEN_MAX_TOKENS,
+                    call_site="codegen_retry", model=codegen_model,
+                )
                 self.root.after(0, lambda: self._on_generate_response(resp, retries_left=remaining))
             except Exception as e:
                 _log(f"Retry error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1870,12 +1890,30 @@ class BacktestApp:
         if not self._chat_client:
             return
 
+        # Recap size gate: skip when the conversation is already large.  A
+        # recap re-sends the entire history just to get a summary back, so on
+        # long sessions the cost outweighs the benefit.
+        gate = int(self._settings.get("recap_token_gate", 30) or 30)
+        n_msgs = len(self._chat_client.conversation)
+        if n_msgs > gate:
+            self._append_chat(
+                "system",
+                f"略過上下文回顧 Skipping recap "
+                f"({n_msgs} messages > recap_token_gate={gate}; "
+                f"would be expensive on long sessions).",
+            )
+            return
+
         self._append_chat("system", "正在回顧對話上下文 Recapping conversation context...")
         self.btn_send.config(state=tk.DISABLED)
 
+        recap_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "light")
+
         def _worker():
             try:
-                response = self._chat_client.send_message(CHAT_RECAP_PROMPT)
+                response = self._chat_client.send_message(
+                    CHAT_RECAP_PROMPT, call_site="recap", model=recap_model)
                 # Remove the recap prompt from conversation so it doesn't pollute saves.
                 # send_message appends user + assistant, remove both and just keep assistant.
                 conv = self._chat_client.conversation
@@ -3039,9 +3077,21 @@ class BacktestApp:
         self.btn_send.config(state=tk.DISABLED)
         self._append_chat("system", f"Analyzing {total_trades} trades...")
 
+        review_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+
         def _worker():
             try:
-                response = self._chat_client.send_message(context)
+                response = self._chat_client.send_message(
+                    context, call_site="trade_review", model=review_model)
+                # Replace the trade-dump user turn with a stub so the trade
+                # data does not pollute future send_message() calls (issue: AI
+                # cost runaway because send_message re-sends full history).
+                conv = self._chat_client.conversation
+                if len(conv) >= 2 and conv[-2].get("role") == "user":
+                    conv[-2]["content"] = (
+                        f"[trade review payload — {total_trades} trades, trimmed to save tokens]"
+                    )
                 self.root.after(0, lambda: self._on_chat_response(response))
             except Exception as e:
                 _log(f"Review error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -3087,6 +3137,9 @@ class BacktestApp:
             f"Sending {total_trades} trades to AI in {K} parts "
             f"({batch_size} trades/part). Final analysis arrives after part {K}."
         )
+
+        review_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
 
         def _worker():
             try:
@@ -3149,21 +3202,39 @@ class BacktestApp:
                             self.status_var.set(f"AI Review: sending part {b}/{k}...")
                     )
 
-                    response = self._chat_client.send_message(msg)
+                    response = self._chat_client.send_message(
+                        msg, call_site=f"trade_review_chunk_{batch_idx}/{K}",
+                        model=review_model,
+                    )
+
+                    # Replace this batch's user turn with a stub so the giant
+                    # trade payload doesn't get re-sent on subsequent calls.
+                    conv = self._chat_client.conversation
+                    if len(conv) >= 2 and conv[-2].get("role") == "user":
+                        conv[-2]["content"] = (
+                            f"[trade review payload — part {batch_idx}/{K}, "
+                            f"trades {start_n}-{end_n} of {total_trades}, "
+                            f"trimmed to save tokens]"
+                        )
 
                     if is_last:
                         # Final response is the real analysis
                         self.root.after(0, lambda r=response: self._on_chat_response(r))
                     else:
-                        # Log a short ack line for visibility, no big chat bubble
-                        ack_preview = response.strip().split("\n", 1)[0][:120]
+                        # Log a short ack line for visibility, no big chat bubble.
+                        # chat_client appends a "📊 tokens: ..." footer to every
+                        # response — surface it here too so per-batch spend is
+                        # visible on intermediate acks, not just the final one.
+                        lines = response.strip().split("\n")
+                        ack_preview = lines[0][:120] if lines else ""
+                        token_line = next(
+                            (ln for ln in lines if ln.startswith("📊")), "")
+                        ack_display = f"[AI Review part {batch_idx}/{K} ack] {ack_preview}"
+                        if token_line:
+                            ack_display += f"  {token_line}"
                         self.root.after(
                             0,
-                            lambda p=ack_preview, b=batch_idx, k=K:
-                                self._append_chat(
-                                    "system",
-                                    f"[AI Review part {b}/{k} ack] {p}",
-                                )
+                            lambda d=ack_display: self._append_chat("system", d),
                         )
             except Exception as e:
                 _log(f"Review chunked error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
