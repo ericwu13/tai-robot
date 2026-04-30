@@ -125,3 +125,53 @@ class DiscordNotifier:
             f"🚫 **每日虧損上限 Daily Loss Limit**\n"
             f"淨損益: {net_pnl:+,} | 上限: -{limit:,}"
         )
+
+    def daily_report(self, report: dict) -> None:
+        """Send a daily report summary to Discord."""
+        date = report.get("date", "?")
+        summary = report.get("summary", {})
+        regime = report.get("market_regime")
+        strategy = report.get("strategy", {})
+        session = report.get("session") or {}
+
+        total = summary.get("total_trades", 0)
+        pnl = summary.get("total_pnl", 0)
+        win_rate = summary.get("win_rate", 0)
+        pf = summary.get("profit_factor", 0)
+        dd = summary.get("max_drawdown", 0)
+
+        lines = [
+            f"{self._header()}",
+            f"📊 **每日報告 Daily Report** — {date}",
+        ]
+
+        # Session identifier line: bot_name + version + start time so the
+        # report stands on its own when read out of context (e.g. saved
+        # JSON, archived Discord logs). bot_name is also in _header() but
+        # belongs in the body for readers who land on the message alone.
+        session_parts: list[str] = []
+        bot = session.get("bot_name") or ""
+        version = session.get("version") or ""
+        started = session.get("started_at") or ""
+        if bot:
+            session_parts.append(f"機器人 Bot: `{bot}`")
+        if version:
+            session_parts.append(f"v{version}")
+        if started:
+            # ISO "2026-04-27T15:02:30" → "2026-04-27 15:02"
+            started_short = started.replace("T", " ")[:16]
+            session_parts.append(f"啟動 Started: {started_short}")
+        if session_parts:
+            lines.append(" · ".join(session_parts))
+
+        lines.extend([
+            f"策略: {strategy.get('name', '?')}",
+            f"交易: {total} 筆 | 勝率: {win_rate:.1%} | PF: {pf:.2f}",
+            f"損益: {pnl:+,} | 最大回撤: {dd:,}",
+        ])
+        if regime:
+            lines.append(
+                f"市場狀態: {regime.get('label', '?')} "
+                f"(ADX {regime.get('adx', 0):.1f})"
+            )
+        self._send("\n".join(lines))
