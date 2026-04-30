@@ -15,8 +15,10 @@ if str(project_root) not in sys.path:
 def _isolate_ai_usage_log(tmp_path, monkeypatch):
     """Redirect the AI usage CSV writer to a per-test tmp path so tests don't
     pollute the user's real data/ai_usage.csv."""
+    monkeypatch.setenv("TAI_AI_USAGE_LOG", str(tmp_path / "ai_usage.csv"))
+    # Reset the one-time stderr notice so each test starts from a clean state.
     from src.ai import chat_client as _cc
-    monkeypatch.setattr(_cc, "_USAGE_LOG_PATH", str(tmp_path / "ai_usage.csv"))
+    monkeypatch.setattr(_cc, "_usage_log_notified", False)
 
 from src.config.settings import AppConfig, RiskConfig, TradingConfig, StrategyConfig
 from src.execution.position_tracker import PositionTracker

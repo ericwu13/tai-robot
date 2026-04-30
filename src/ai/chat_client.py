@@ -5,7 +5,9 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -34,17 +36,33 @@ GOOGLE_MODEL_FLASH = "gemini-2.5-flash"
 # messages that fit are kept, older ones in the middle are dropped.
 _CONVERSATION_CHAR_LIMIT = 200_000
 
-# Where token-usage rows are appended.  Caller can override via env var for tests.
-_USAGE_LOG_PATH = os.environ.get(
-    "TAI_AI_USAGE_LOG",
-    os.path.join(os.getcwd(), "data", "ai_usage.csv"),
-)
+# CSV columns for the per-call usage log.  ``reasoning_tokens`` captures
+# Gemini 2.5's thoughtsTokenCount — these are billed at the output rate but
+# don't show up in candidatesTokenCount, so without this column the log
+# under-reports cost for any thinking-enabled model.
 _USAGE_LOG_HEADERS = [
     "timestamp", "call_site", "provider", "model",
-    "input_tokens", "output_tokens", "total_tokens",
+    "input_tokens", "output_tokens", "reasoning_tokens", "total_tokens",
 ]
 
+# Print one notice on the first write attempt so the user can confirm where
+# logging lives (or see the failure reason).  Toggled to True after first call.
+_usage_log_notified = False
+
 _log = logging.getLogger(__name__)
+
+
+def _resolve_usage_log_path() -> str:
+    """Where to append the per-call usage row.
+
+    Resolved at write time (not import time) so the path is robust against
+    cwd changes.  Override with TAI_AI_USAGE_LOG for tests/CI.
+    """
+    override = os.environ.get("TAI_AI_USAGE_LOG")
+    if override:
+        return override
+    # chat_client.py lives at <repo>/src/ai/chat_client.py
+    return str(Path(__file__).resolve().parents[2] / "data" / "ai_usage.csv")
 
 
 def model_for_tier(provider: str, tier: str) -> str | None:
@@ -65,37 +83,85 @@ def model_for_tier(provider: str, tier: str) -> str | None:
 def _log_token_usage(
     *, call_site: str, provider: str, model: str,
     input_tokens: int, output_tokens: int,
+    reasoning_tokens: int = 0, total_tokens: int = 0,
 ) -> None:
-    """Append one row to ``data/ai_usage.csv``.  Best-effort — never raises."""
+    """Append one row to ``data/ai_usage.csv``.  Best-effort — never raises.
+
+    ``total_tokens`` should be the provider's authoritative total when
+    available (Gemini's ``totalTokenCount`` already includes thinking).
+    Falls back to ``input + output + reasoning`` when zero.
+    """
+    global _usage_log_notified
+    path = _resolve_usage_log_path()
     try:
-        path = _USAGE_LOG_PATH
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        # If a pre-existing file uses an older/different header, archive it
+        # so we don't append rows with mismatched columns.
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                expected = ",".join(_USAGE_LOG_HEADERS)
+                if first_line and first_line != expected:
+                    os.rename(path, path + ".bak")
+            except OSError:
+                pass
+
         new_file = not os.path.exists(path)
+        in_t = int(input_tokens or 0)
+        out_t = int(output_tokens or 0)
+        think_t = int(reasoning_tokens or 0)
+        tot_t = int(total_tokens or 0) or (in_t + out_t + think_t)
+
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new_file:
                 w.writerow(_USAGE_LOG_HEADERS)
             w.writerow([
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                call_site,
-                provider,
-                model,
-                int(input_tokens or 0),
-                int(output_tokens or 0),
-                int((input_tokens or 0) + (output_tokens or 0)),
+                call_site, provider, model,
+                in_t, out_t, think_t, tot_t,
             ])
-    except Exception as e:  # pragma: no cover — logging failure must not break callers
+
+        if not _usage_log_notified:
+            print(f"[ai_usage] logging to {path}", file=sys.stderr)
+            _usage_log_notified = True
+    except Exception as e:
+        if not _usage_log_notified:
+            print(f"[ai_usage] WARNING: failed to write {path}: {e}",
+                  file=sys.stderr)
+            _usage_log_notified = True
         _log.debug("Failed to write AI usage log: %s", e)
 
 
-def _extract_anthropic_usage(data: dict) -> tuple[int, int]:
+def _extract_anthropic_usage(data: dict) -> tuple[int, int, int, int]:
+    """Return (input, output, reasoning, total) for an Anthropic response.
+
+    Anthropic bills extended-thinking output as regular ``output_tokens``,
+    so reasoning is reported as 0 and total = input + output.
+    """
     usage = data.get("usage") or {}
-    return int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
+    in_t = int(usage.get("input_tokens", 0))
+    out_t = int(usage.get("output_tokens", 0))
+    return in_t, out_t, 0, in_t + out_t
 
 
-def _extract_google_usage(data: dict) -> tuple[int, int]:
+def _extract_google_usage(data: dict) -> tuple[int, int, int, int]:
+    """Return (input, output, reasoning, total) for a Gemini response.
+
+    Gemini 2.5 reports thinking under ``thoughtsTokenCount`` separately from
+    ``candidatesTokenCount`` (visible output).  Both are billed at the output
+    rate.  ``totalTokenCount`` is the API's authoritative billed total.
+    """
     meta = data.get("usageMetadata") or {}
-    return int(meta.get("promptTokenCount", 0)), int(meta.get("candidatesTokenCount", 0))
+    in_t = int(meta.get("promptTokenCount", 0))
+    out_t = int(meta.get("candidatesTokenCount", 0))
+    think_t = int(meta.get("thoughtsTokenCount", 0))
+    tot_t = int(meta.get("totalTokenCount", 0)) or (in_t + out_t + think_t)
+    return in_t, out_t, think_t, tot_t
 
 
 class ChatClient:
@@ -218,10 +284,11 @@ class ChatClient:
             if block.get("type") == "text":
                 assistant_text += block["text"]
 
-        in_tok, out_tok = _extract_anthropic_usage(data)
+        in_tok, out_tok, think_tok, tot_tok = _extract_anthropic_usage(data)
         _log_token_usage(
             call_site=call_site, provider=self.provider, model=used_model,
             input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
 
         self.conversation.append({"role": "assistant", "content": assistant_text})
@@ -280,10 +347,11 @@ class ChatClient:
                 if "text" in part:
                     assistant_text += part["text"]
 
-        in_tok, out_tok = _extract_google_usage(data)
+        in_tok, out_tok, think_tok, tot_tok = _extract_google_usage(data)
         _log_token_usage(
             call_site=call_site, provider=self.provider, model=used_model,
             input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
 
         self.conversation.append({"role": "assistant", "content": assistant_text})
@@ -352,10 +420,11 @@ class ChatClient:
             if block.get("type") == "text":
                 assistant_text += block["text"]
 
-        in_tok, out_tok = _extract_anthropic_usage(data)
+        in_tok, out_tok, think_tok, tot_tok = _extract_anthropic_usage(data)
         _log_token_usage(
             call_site=call_site, provider=self.provider, model=used_model,
             input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
         return assistant_text
 
@@ -395,10 +464,11 @@ class ChatClient:
                 if "text" in part:
                     assistant_text += part["text"]
 
-        in_tok, out_tok = _extract_google_usage(data)
+        in_tok, out_tok, think_tok, tot_tok = _extract_google_usage(data)
         _log_token_usage(
             call_site=call_site, provider=self.provider, model=used_model,
             input_tokens=in_tok, output_tokens=out_tok,
+            reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
 
         # Check if response was truncated
