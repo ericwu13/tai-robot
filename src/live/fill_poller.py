@@ -200,9 +200,18 @@ class FillPoller:
         if now is None:
             now = time.monotonic()
 
+        # Compare ``now`` against the deadline directly rather than computing
+        # ``elapsed = now - start`` and comparing to the timeout.  IEEE-754
+        # subtraction can lose a ULP for certain monotonic values
+        # (e.g. ``(7.9 + 10.0) - 7.9 == 9.999999999999998``), which made the
+        # boundary test ``now == start + timeout`` flake on fresh-boot CI
+        # runners where ``time.monotonic()`` returns small values.  The
+        # additive form is exact whenever both sides are derived from the
+        # same start + timeout, so the boundary check is deterministic.
+        deadline = self._start_time + self.FILL_POLL_TIMEOUT
         elapsed = now - self._start_time
 
-        if elapsed >= self.FILL_POLL_TIMEOUT:
+        if now >= deadline:
             return FillPollAction(
                 type="timeout",
                 action_type=self._action_type,
