@@ -238,6 +238,22 @@ class LiveRunner:
         self.data_store = DataStore(max_bars=5000)
         self.aggregator = BarAggregator(symbol, self.target_interval)
 
+        # MTF: opt-in higher-timeframe aggregators driven by completed
+        # primary bars. Empty for single-TF strategies — zero-cost when
+        # unused, no behaviour change for existing strategies.
+        self._htf_intervals: list[int] = list(
+            getattr(strategy, "htf_intervals", []) or []
+        )
+        self._htf_aggregators: dict[int, BarAggregator] = {}
+        self._htf_required: dict[int, int] = {}
+        if self._htf_intervals:
+            from ..backtest.engine import validate_htf_intervals
+            validate_htf_intervals(self.target_interval, self._htf_intervals)
+            for iv in self._htf_intervals:
+                self.data_store._register_htf(iv)
+                self._htf_aggregators[iv] = BarAggregator(symbol, iv)
+            self._htf_required = strategy.htf_required_bars() or {}
+
         # CSV logger — files go to data/live/{symbol}_{bot_name}/
         if log_dir is None:
             log_dir = os.path.join("data", "live")
@@ -362,6 +378,7 @@ class LiveRunner:
 
         for bar in bars:
             self.data_store.add_bar(bar)
+            self._feed_htf(bar)
             self._bar_index += 1
 
         self._aggregated_bars.extend(bars)
@@ -500,6 +517,23 @@ class LiveRunner:
             return agg_bar
         return None
 
+    def _feed_htf(self, primary_bar: Bar) -> None:
+        """Feed a completed primary bar through HTF aggregators."""
+        if not self._htf_aggregators:
+            return
+        for iv, agg in self._htf_aggregators.items():
+            completed = agg.on_bar(primary_bar)
+            if completed is not None:
+                self.data_store._add_htf_bar(iv, completed)
+
+    def _htf_warmup_satisfied(self) -> bool:
+        if not self._htf_required:
+            return True
+        for iv, n in self._htf_required.items():
+            if self.data_store._htf_len(iv) < n:
+                return False
+        return True
+
     def _process_aggregated_bar(self, bar: Bar) -> None:
         """Process a completed aggregated bar through the strategy pipeline.
 
@@ -507,6 +541,7 @@ class LiveRunner:
         When suppress_strategy is True, only updates DataStore (no trading).
         """
         self.data_store.add_bar(bar)
+        self._feed_htf(bar)
         self._aggregated_bars.append(bar)
         idx = self._bar_index
         self._bar_index += 1
@@ -541,8 +576,9 @@ class LiveRunner:
             self.broker.check_exits(idx, bar.open, bar.high, bar.low, bar.close, bar_close_dt)
             self._check_for_trade_close(bar, idx)
 
-        # Run strategy if enough bars
-        if len(self.data_store) >= self.strategy.required_bars():
+        # Run strategy if enough bars (primary AND HTF warmup satisfied)
+        if (len(self.data_store) >= self.strategy.required_bars()
+                and self._htf_warmup_satisfied()):
             old_entries = len(self.broker._pending_entries)
             old_exits = len(self.broker._pending_exits)
             old_closes = len(self.broker._pending_market_closes)
@@ -945,6 +981,18 @@ class LiveRunner:
             for b in merged:
                 new_store.add_bar(b)
             self.data_store = new_store
+            # MTF: rebuild HTF state by re-feeding primary bars through
+            # fresh aggregators so backtest/live parity holds across
+            # session resume.
+            if self._htf_intervals:
+                for iv in self._htf_intervals:
+                    new_store._register_htf(iv)
+                self._htf_aggregators = {
+                    iv: BarAggregator(self.symbol, iv)
+                    for iv in self._htf_intervals
+                }
+                for b in merged:
+                    self._feed_htf(b)
             # CSV-loaded bars are historical, not live — bump
             # _warmup_bar_count so get_live_bars() continues to slice
             # off the correct prefix.

@@ -24,6 +24,11 @@ class BacktestStrategy(ABC):
     kline_type: int = 0
     kline_minute: int = 240
 
+    # MTF: declare higher-timeframe (HTF) subscriptions in seconds. Empty
+    # by default — single-TF strategies pay zero MTF overhead. Each value
+    # must be larger than and an exact multiple of the primary interval.
+    htf_intervals: list[int] = []
+
     @abstractmethod
     def on_bar(self, bar: Bar, data_store: DataStore, broker: BrokerContext) -> None:
         ...
@@ -31,6 +36,15 @@ class BacktestStrategy(ABC):
     @abstractmethod
     def required_bars(self) -> int:
         ...
+
+    def htf_required_bars(self) -> dict[int, int]:
+        """Minimum completed HTF bars before the strategy receives on_bar().
+
+        Default: 1 per declared HTF interval. Strategies that compute
+        indicators on HTF data (e.g. BB(20) on 60m) should override to
+        return the period needed for stable values, e.g. {3600: 20}.
+        """
+        return {iv: 1 for iv in self.htf_intervals}
 
     @property
     def name(self) -> str:
