@@ -17,7 +17,7 @@
 7. [Edge Cases](#7-edge-cases)
 8. [Backwards Compatibility](#8-backwards-compatibility)
 9. [AI Code Gen Integration](#9-ai-code-gen-integration)
-10. [Migration Path](#10-migration-path)
+10. [Opt-in usage](#10-opt-in-usage)
 11. [Scalability Demonstration](#11-scalability-demonstration)
 12. [Performance Considerations](#12-performance-considerations)
 
@@ -41,6 +41,10 @@
   `htf_intervals` pay no performance or complexity cost.
 - **Backwards compatible**: all existing strategies pass their tests unchanged, with
   no code modifications.
+- **Framework-only upgrade**: only the base class and engine change. No file in
+  `src/strategy/` is edited, and user-authored strategies imported at runtime
+  continue working without source changes. Users running custom strategies on
+  their own machines are unaffected.
 
 ### Non-Goals
 
@@ -87,10 +91,12 @@ decisions in both modes. This is enforced by:
 
 ### Backtest data requirements
 
-- **Minimum**: primary-interval bars (e.g., 30-min bars for a 30m primary strategy).
-  The engine aggregates HTF (e.g., 60m) from these.
-- **Alternative**: 1-min bars. The engine aggregates to both primary and HTF on the
-  fly. This matches the live path exactly (live always receives 1-min bars).
+- **Canonical input**: 1-min bars. The engine aggregates to both primary and HTF
+  on the fly. This matches the live path exactly (live always receives 1-min
+  bars), so backtest/live parity is structural rather than coincidental.
+- **Legacy input**: pre-aggregated primary-interval bars (e.g., 30-min bars for a
+  30m primary strategy) are still accepted for backwards compatibility with
+  existing CSV caches. HTF is aggregated from the primary stream.
 - **Format**: `list[Bar]` — same as today. No new data format.
 
 ---
@@ -398,9 +404,15 @@ starts a new HTF aggregation period.
 
 ### 7.1 Warmup
 
-**Problem**: if HTF requires 20 bars of 60-min history, and primary is 30-min, we
-need at least 40 primary bars just for HTF warmup (plus the strategy's own
-`required_bars` for primary warmup).
+**Problem**: if a strategy declares `htf_required_bars = {interval: N}`, the
+engine needs enough primary bars to produce N completed HTF bars before it can
+call `on_bar()`. With a 30-min primary and a 60-min HTF, that's `2*N` primary
+bars for HTF warmup alone — on top of the strategy's own `required_bars()` for
+primary warmup. N is set by the strategy, not the framework.
+
+(e.g., a strategy using `bollinger_bands` on HTF closes might set
+`htf_required_bars = {3600: 20}` to seed a stable BB(20) → needs 40 primary
+30-min bars before any decision can fire.)
 
 **Solution**: `htf_required_bars()` lets the strategy declare exact HTF needs. The
 engine holds back `on_bar()` until all requirements are met. The total warmup is
@@ -463,18 +475,24 @@ warmup AND in the CSV logs.
 
 ### Contract
 
-1. **All existing strategies work unchanged.** The default `htf_intervals = []`
+1. **No existing strategy files are edited.** The change is confined to the base
+   class (`BacktestStrategy`) and the engine. Files in `src/strategy/` and
+   user-authored strategies imported at runtime work without source changes.
+   This is the binding scope rule — users keeping custom strategies on their
+   own machines must remain unaffected by this PR.
+
+2. **All existing strategies work unchanged.** The default `htf_intervals = []`
    means no HTF processing, no warmup changes, no performance overhead.
 
-2. **`on_bar()` signature unchanged.** `(bar, data_store, broker)` — no new params.
+3. **`on_bar()` signature unchanged.** `(bar, data_store, broker)` — no new params.
 
-3. **`DataStore` API unchanged.** `get_bars()`, `get_closes()`, `get_highs()`,
+4. **`DataStore` API unchanged.** `get_bars()`, `get_closes()`, `get_highs()`,
    `get_lows()`, `__len__()` all work exactly as before.
 
-4. **`BacktestEngine` API unchanged.** `run(bars)` still accepts `list[Bar]` and
+5. **`BacktestEngine` API unchanged.** `run(bars)` still accepts `list[Bar]` and
    returns `BacktestResult`.
 
-5. **`LiveRunner` external API unchanged.** `feed_warmup_bars()`, `feed_1m_bars()`,
+6. **`LiveRunner` external API unchanged.** `feed_warmup_bars()`, `feed_1m_bars()`,
    `get_bars_at_interval()` all work as before.
 
 ### What changes
@@ -546,9 +564,22 @@ Step 3) so the AI can reference a working pattern.
 
 ---
 
-## 10. Migration Path
+## 10. Opt-in usage
 
-### Upgrading an existing single-TF strategy to MTF
+### Scope guarantee
+
+This change upgrades only `BacktestStrategy` (the base class) and the engine.
+**No existing strategy file in `src/strategy/` is modified**, and user-authored
+strategies imported at runtime continue to work without source changes. MTF is
+purely additive — a strategy is single-TF unless it explicitly declares
+`htf_intervals`.
+
+This matters because users keep custom strategies on their own machines that
+this repo does not control. A migration that *required* edits to those files
+would silently break them on the next pull. The contract here is the opposite:
+upgrade the framework, leave user code untouched.
+
+### Opting a new (or existing) strategy into MTF
 
 **Step 1**: Add `htf_intervals` class attribute.
 
