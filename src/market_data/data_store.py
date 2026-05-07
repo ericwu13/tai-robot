@@ -20,6 +20,10 @@ class DataStore:
 
     def __init__(self, max_bars: int = 5000, db_path: str | None = None):
         self._bars: deque[Bar] = deque(maxlen=max_bars)
+        self._max_bars = max_bars
+        # Higher-timeframe (HTF) stores keyed by interval in seconds.
+        # Empty for single-TF strategies — zero-cost when unused.
+        self._htf_stores: dict[int, deque[Bar]] = {}
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
 
@@ -77,6 +81,53 @@ class DataStore:
 
     def __len__(self) -> int:
         return len(self._bars)
+
+    # ── Higher-timeframe (HTF) accessors ──
+    #
+    # HTF data is opt-in. The engine populates these via _register_htf and
+    # _add_htf_bar; strategies read them via htf_bars/htf_closes/etc. For
+    # single-TF strategies _htf_stores stays empty and these methods are
+    # never called.
+
+    def _register_htf(self, interval: int, max_bars: int | None = None) -> None:
+        """Register an HTF store for *interval* seconds."""
+        if interval in self._htf_stores:
+            return
+        cap = max_bars if max_bars is not None else self._max_bars
+        self._htf_stores[interval] = deque(maxlen=cap)
+
+    def _add_htf_bar(self, interval: int, bar: Bar) -> None:
+        """Append a completed HTF bar. Auto-registers store if needed."""
+        store = self._htf_stores.get(interval)
+        if store is None:
+            self._register_htf(interval)
+            store = self._htf_stores[interval]
+        store.append(bar)
+
+    def _htf_len(self, interval: int) -> int:
+        store = self._htf_stores.get(interval)
+        return 0 if store is None else len(store)
+
+    def htf_bars(self, interval: int, n: int | None = None) -> list[Bar]:
+        """Return the last n completed HTF bars at *interval* seconds."""
+        store = self._htf_stores.get(interval)
+        if store is None:
+            return []
+        if n is None:
+            return list(store)
+        return list(store)[-n:]
+
+    def htf_closes(self, interval: int, n: int | None = None) -> list[int]:
+        return [b.close for b in self.htf_bars(interval, n)]
+
+    def htf_highs(self, interval: int, n: int | None = None) -> list[int]:
+        return [b.high for b in self.htf_bars(interval, n)]
+
+    def htf_lows(self, interval: int, n: int | None = None) -> list[int]:
+        return [b.low for b in self.htf_bars(interval, n)]
+
+    def htf_opens(self, interval: int, n: int | None = None) -> list[int]:
+        return [b.open for b in self.htf_bars(interval, n)]
 
     def load_from_db(self, symbol: str, interval: int, limit: int = 5000) -> int:
         """Load bars from SQLite into the ring buffer. Returns count loaded."""

@@ -240,6 +240,58 @@ For day-trade strategies, close positions on the last bar: \
 - `data_store.get_lows(n=None)` -> list[int]
 - `len(data_store)` -> int
 
+## Multi-Timeframe (MTF) Support — OPTIONAL
+
+Strategies that need higher-timeframe (HTF) context (e.g. trade on 30m but \
+filter by a 60m trend) can subscribe to additional intervals. MTF is opt-in: \
+single-TF strategies leave `htf_intervals` empty and pay zero overhead.
+
+To use HTF data:
+
+1. Declare `htf_intervals` as a class attribute (list of seconds, each value \
+must be larger than AND an exact multiple of the primary interval):
+```python
+class MyMtfStrategy(BacktestStrategy):
+    kline_type = 0
+    kline_minute = 30           # primary: 30-min bars
+    htf_intervals = [3600]      # subscribe to 60-min HTF bars
+```
+
+2. Optionally override `htf_required_bars()` to declare the minimum HTF \
+history before `on_bar()` is allowed to fire (default: 1 bar per interval). \
+Strategies that compute indicators on HTF closes must override this so the \
+indicator has enough history to be stable:
+```python
+def htf_required_bars(self) -> dict[int, int]:
+    return {3600: 20}    # need 20 completed 60-min bars for BB(20)
+```
+
+3. Read HTF data inside `on_bar()` via the new DataStore methods:
+```python
+htf_bars   = data_store.htf_bars(3600, 20)    # last 20 completed 60-min Bar objects
+htf_closes = data_store.htf_closes(3600, 20)  # last 20 completed 60-min closes
+htf_highs  = data_store.htf_highs(3600, 20)   # last 20 completed 60-min highs
+htf_lows   = data_store.htf_lows(3600, 20)    # last 20 completed 60-min lows
+htf_opens  = data_store.htf_opens(3600, 20)   # last 20 completed 60-min opens
+```
+
+**No-lookahead guarantee.** HTF accessors only return COMPLETED bars. With \
+primary=30m and HTF=60m, at primary-bar 09:30 (mid-hour) you see the \
+[08:00–09:00) bar, NOT the in-progress [09:00–10:00) bar. The in-progress \
+HTF bar is invisible to strategy code. This is what makes MTF backtests \
+realistic.
+
+Rules:
+- `htf_intervals` values must be > primary interval (`kline_minute * 60`).
+- `htf_intervals` values must be exact multiples of the primary interval. \
+Mixed example for `kline_minute=30`: `[3600, 14400]` (60m + 4H) is valid; \
+`[2700]` (45m) raises `ValueError` at engine startup.
+- The engine holds back `on_bar()` until BOTH the primary `required_bars()` \
+AND every `htf_required_bars()` count is satisfied — strategies do not need \
+to guard for empty HTF data.
+- Primary indicators still use the existing API (`data_store.get_closes(n)`). \
+HTF indicators use the new API (`data_store.htf_closes(interval, n)`).
+
 ## Available Indicators
 ```python
 from src.strategy.indicators import sma, ema, rsi, macd, bollinger_bands
