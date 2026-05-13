@@ -212,6 +212,14 @@ def _normalize(metrics: dict[str, float]) -> dict[str, float]:
     }
 
 
+# Where a fitness result came from. Same math runs on both — the field
+# is purely audit metadata so the pool can tell paper from backtest
+# fitness when promotion decisions are made.
+SOURCE_BACKTEST = "backtest"
+SOURCE_PAPER = "paper"
+VALID_SOURCES = (SOURCE_BACKTEST, SOURCE_PAPER)
+
+
 @dataclass
 class FitnessResult:
     """Bundle of raw metrics + composite score returned to callers."""
@@ -227,6 +235,7 @@ class FitnessResult:
     regime_sideways: float
     total_trades: int
     gated: bool   # True when total_trades < MIN_TRADES (composite forced to 0)
+    source: str = SOURCE_BACKTEST
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +251,7 @@ class FitnessResult:
             "regime_sideways": self.regime_sideways,
             "total_trades": self.total_trades,
             "gated": self.gated,
+            "source": self.source,
         }
 
 
@@ -269,10 +279,12 @@ def _compose(
     metrics: Any,
     regimes: dict[str, float],
     weights: dict[str, float],
+    source: str = SOURCE_BACKTEST,
 ) -> FitnessResult:
     """Shared assembly path. ``regimes`` is the pre-computed
     bull/bear/sideways win-rate dict; how it was derived (naive proxy or
-    real ADX/ATR labels) is the caller's choice."""
+    real ADX/ATR labels) is the caller's choice. ``source`` is audit
+    metadata stamped onto the result — same math runs either way."""
     total_trades = len(trades)
     scalars = _extract_metric_floats(metrics)
 
@@ -315,6 +327,7 @@ def _compose(
         regime_sideways=regimes["sideways"],
         total_trades=total_trades,
         gated=gated,
+        source=source,
     )
 
 
@@ -372,6 +385,7 @@ def regime_scores_from_reports(reports: Iterable[dict]) -> dict[str, float]:
 def compute_fitness(
     backtest_result: Any,
     weights: dict[str, float] | None = None,
+    source: str = SOURCE_BACKTEST,
 ) -> FitnessResult:
     """Score a ``BacktestResult`` (or a ``{"trades":..., "metrics":...}``
     dict). Regime scoring uses the per-trade naive proxy because no
@@ -390,7 +404,63 @@ def compute_fitness(
         trades = getattr(backtest_result, "trades", [])
         metrics = getattr(backtest_result, "metrics", None)
 
-    return _compose(trades, metrics, regime_scores(trades), w)
+    return _compose(trades, metrics, regime_scores(trades), w, source=source)
+
+
+def compute_fitness_from_trades(
+    trades: list[Any],
+    equity_curve: list[int] | None = None,
+    weights: dict[str, float] | None = None,
+    source: str = SOURCE_BACKTEST,
+) -> FitnessResult:
+    """Input-agnostic entry point: score a strategy from its raw trades.
+
+    Accepts ``Trade`` dataclass instances (what
+    ``SimulatedBroker.trades`` produces — same shape in backtest and
+    paper trading) OR trade dicts (what session.json / daily-report
+    JSONs store). The same math runs regardless of provenance; the
+    ``source`` field on the returned ``FitnessResult`` records where
+    the trades came from for audit purposes.
+
+    When ``equity_curve`` is omitted, it's rebuilt from the trades'
+    cumulative PnL — useful for paper-trading data loaded from session
+    JSON where the curve may be stale (e.g. position open at last save).
+
+    Regime scoring falls back to the per-trade naive proxy because raw
+    trades carry no market-context (no bar feed, no regime labels). For
+    paper trading, prefer scoring through the daily-report pipeline
+    when available — see :func:`compute_fitness_from_reports`.
+    """
+    if source not in VALID_SOURCES:
+        raise ValueError(
+            f"source must be one of {VALID_SOURCES!r}, got {source!r}"
+        )
+    w = weights if weights is not None else DEFAULT_WEIGHTS
+
+    # Normalize trade representation so the metrics engine sees a stable
+    # shape — dicts (from session JSON) get wrapped, dataclass instances
+    # pass through.
+    norm_trades: list[Any] = [
+        _TradeStub(t) if isinstance(t, dict) else t for t in trades
+    ]
+
+    # If the caller didn't supply an equity curve (or supplied an empty
+    # one), rebuild from cumulative PnL. Paper sessions sometimes save
+    # an equity curve mid-trade that doesn't include the last entry.
+    if not equity_curve:
+        equity_curve = []
+        cum = 0
+        for t in norm_trades:
+            cum += int(getattr(t, "pnl", 0) or 0)
+            equity_curve.append(cum)
+
+    # Lazy import — same rationale as compute_fitness_from_reports.
+    from src.backtest.metrics import calculate_metrics
+    metrics = calculate_metrics(norm_trades, equity_curve, initial_balance=0)
+
+    return _compose(
+        norm_trades, metrics, regime_scores(norm_trades), w, source=source,
+    )
 
 
 class _TradeStub:
@@ -415,20 +485,27 @@ class _TradeStub:
 def compute_fitness_from_reports(
     reports: list[dict],
     weights: dict[str, float] | None = None,
+    source: str = SOURCE_BACKTEST,
 ) -> FitnessResult:
     """Score a strategy from its daily-report dicts.
 
     ``reports`` is the list returned by
     :func:`src.daily_report.report_generator.generate_report_from_backtest`
-    (or a list of JSONs read back from ``data/daily-reports/``). All
-    trades from all reports are concatenated, fresh aggregate
-    ``PerformanceMetrics`` are computed, and per-regime win rates use
-    the labels recorded on each report.
+    or :func:`src.daily_report.report_generator.generate_session_report`
+    (live/paper sessions). Both shapes are identical — only the
+    ``source`` field on the returned ``FitnessResult`` differs.
 
-    Falls back gracefully on the per-trade naive regime proxy when ALL
-    reports are missing regime data (e.g. backtests too short for ADX),
-    so this function never refuses to score for missing context.
+    All trades from all reports are concatenated, fresh aggregate
+    ``PerformanceMetrics`` are computed, and per-regime win rates use
+    the labels recorded on each report. Falls back gracefully on the
+    per-trade naive regime proxy when ALL reports are missing regime
+    data (e.g. backtests too short for ADX), so this function never
+    refuses to score for missing context.
     """
+    if source not in VALID_SOURCES:
+        raise ValueError(
+            f"source must be one of {VALID_SOURCES!r}, got {source!r}"
+        )
     w = weights if weights is not None else DEFAULT_WEIGHTS
 
     # Lazy import: keeps fitness usable without the daily_report package
@@ -458,4 +535,4 @@ def compute_fitness_from_reports(
     if all(v == 0.0 for v in regimes.values()) and synthetic:
         regimes = regime_scores(synthetic)
 
-    return _compose(synthetic, metrics, regimes, w)
+    return _compose(synthetic, metrics, regimes, w, source=source)
