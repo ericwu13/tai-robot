@@ -5,12 +5,22 @@ Two-phase evaluation:
 * ``screen`` — quick 30-day in-sample backtest. Cheap, used to filter
   obvious losers from a large mutation batch before paying for the full
   evaluation. Tagged with the Flash AI tier so any downstream AI scoring
-  picks the cheap model.
+  picks the cheap model. Reports are NOT persisted (screen is a throw-
+  away pass over many candidates).
 
 * ``deep`` — full evaluation: in-sample composite on a 3-month window
   plus walk-forward fitness on the next 3-month out-of-sample window.
   Tagged with the Pro AI tier. Walk-forward fitness is the number that
   drives pool promotion (in-sample composite overfits trivially).
+  Reports ARE persisted to ``data/daily-reports/`` so deep evaluations
+  surface in the existing daily-report UI exactly like manual backtests.
+
+Both phases run the backtest engine, then route the trades through
+:func:`src.daily_report.report_generator.generate_report_from_backtest`
+so regime classification (ADX/ATR/EMA labels) comes from the existing
+classifier rather than an evolution-private heuristic. Fitness is then
+computed from those daily-report dicts via
+:func:`src.evolution.fitness.compute_fitness_from_reports`.
 
 Anti-overfitting: each strategy can additionally be checked for
 parameter robustness via Monte Carlo perturbation (±10% on numeric
@@ -29,8 +39,13 @@ from typing import Any
 from ..ai.chat_client import PROVIDER_GOOGLE, model_for_tier
 from ..backtest.engine import BacktestEngine
 from ..ai.code_sandbox import load_strategy_from_source
+from ..daily_report.report_generator import generate_report_from_backtest
 from ..market_data.models import Bar
-from .fitness import FitnessResult, compute_fitness
+from .fitness import (
+    FitnessResult,
+    compute_fitness,
+    compute_fitness_from_reports,
+)
 
 
 # Days of bars used for the cheap "screen" pass. 30 calendar days is
@@ -56,7 +71,12 @@ CALL_SITE_DEEP = "evolution_deep"
 
 @dataclass
 class EvalResult:
-    """Per-strategy output of an evaluation pass."""
+    """Per-strategy output of an evaluation pass.
+
+    ``reports`` is the list of daily-report dicts produced by
+    :func:`generate_report_from_backtest`. Persisting these to disk
+    (deep phase default) makes evolution-driven backtests visible in
+    the same ``data/daily-reports/`` UI as manual ones."""
     name: str
     source_code: str
     fitness: FitnessResult
@@ -70,6 +90,8 @@ class EvalResult:
     phase: str = "screen"
     ai_tier: str = "light"
     ai_model_hint: str | None = None
+    reports: list[dict] | None = None
+    walkforward_reports: list[dict] | None = None
 
 
 def _slice_bars_by_date(
@@ -196,6 +218,48 @@ def _run_backtest(
     return engine.run(bars)
 
 
+def _ohlc_arrays(bars: list[Bar]) -> tuple[list[int], list[int], list[int]]:
+    """Materialize the highs/lows/closes arrays the regime classifier
+    expects. Pulled out so the evaluator never silently passes None
+    where the daily-report pipeline expects real data."""
+    return ([b.high for b in bars],
+            [b.low for b in bars],
+            [b.close for b in bars])
+
+
+def _backtest_with_reports(
+    strategy_cls: type,
+    bars: list[Bar],
+    name: str,
+    point_value: int,
+    fill_mode: str,
+    save_reports: bool,
+    param_overrides: dict[str, Any] | None = None,
+) -> tuple[Any, list[dict]]:
+    """Run a backtest AND route the trades through the daily-report
+    pipeline so each evaluation produces the same artifact shape as a
+    manual backtest. Returns ``(BacktestResult, list[report_dict])``.
+
+    ``save_reports=True`` persists each daily JSON to
+    ``data/daily-reports/`` (deep phase default); screen-phase calls
+    pass ``False`` to keep the throwaway pass cheap.
+    """
+    result = _run_backtest(strategy_cls, bars, point_value, fill_mode,
+                           param_overrides)
+    highs, lows, closes = _ohlc_arrays(bars)
+    reports = generate_report_from_backtest(
+        trades=result.trades,
+        equity_curve=result.equity_curve,
+        bars_highs=highs,
+        bars_lows=lows,
+        bars_closes=closes,
+        strategy_name=name,
+        point_value=point_value,
+        save=save_reports,
+    )
+    return result, reports
+
+
 def _bar_period(bars: list[Bar]) -> tuple[str, str] | None:
     if not bars:
         return None
@@ -266,12 +330,17 @@ def evaluate_screen(
     point_value: int = 200,
     fill_mode: str = "on_close",
     days: int = SCREEN_DAYS,
+    save_reports: bool = False,
 ) -> list[EvalResult]:
-    """Cheap pass: instantiate, run a 30-day in-sample backtest, score.
+    """Cheap pass: 30-day in-sample backtest, regime-aware fitness, no
+    persistence by default.
 
+    Each strategy is run through the same daily-report pipeline used by
+    manual backtests so regime scoring uses the real ADX/ATR labels.
     ``strategies`` is a list of ``(name, source_code)`` pairs. Failures
     (validation, runtime) are captured as ``EvalResult.error`` rather
-    than raised — one bad mutation shouldn't kill the batch."""
+    than raised — one bad mutation shouldn't kill the batch.
+    """
     window = _last_n_days(bars, days)
     period = _bar_period(window)
     out: list[EvalResult] = []
@@ -279,8 +348,10 @@ def evaluate_screen(
     for name, source in strategies:
         try:
             cls = load_strategy_from_source(source)
-            result = _run_backtest(cls, window, point_value, fill_mode)
-            fit = compute_fitness(result)
+            _, reports = _backtest_with_reports(
+                cls, window, name, point_value, fill_mode, save_reports,
+            )
+            fit = compute_fitness_from_reports(reports)
             out.append(EvalResult(
                 name=name,
                 source_code=source,
@@ -290,6 +361,7 @@ def evaluate_screen(
                 phase="screen",
                 ai_tier="light",
                 ai_model_hint=_ai_hint("light"),
+                reports=reports,
             ))
         except Exception as e:
             out.append(EvalResult(
@@ -312,10 +384,18 @@ def evaluate_deep(
     train_days: int = DEEP_TRAIN_DAYS,
     test_days: int = DEEP_TEST_DAYS,
     monte_carlo: bool = True,
+    save_reports: bool = True,
 ) -> list[EvalResult]:
     """Full pass: 3-month in-sample + 3-month walk-forward + (optional)
     Monte Carlo robustness. ``walkforward_fitness`` on the returned
-    EvalResult is the number that should drive pool promotion."""
+    EvalResult is the number that should drive pool promotion.
+
+    Daily reports for both windows are persisted to
+    ``data/daily-reports/`` by default so deep evaluations show up in
+    the existing report UI alongside manual backtests. Pass
+    ``save_reports=False`` to suppress (e.g. when sweeping a large
+    candidate batch you don't want cluttering the report directory).
+    """
     train, test = _split_train_test(bars, train_days, test_days)
     train_period = _bar_period(train)
     test_period = _bar_period(test)
@@ -325,15 +405,22 @@ def evaluate_deep(
         try:
             cls = load_strategy_from_source(source)
 
-            train_result = _run_backtest(cls, train, point_value, fill_mode)
-            train_fit = compute_fitness(train_result)
+            _, train_reports = _backtest_with_reports(
+                cls, train, name, point_value, fill_mode, save_reports,
+            )
+            train_fit = compute_fitness_from_reports(train_reports)
 
-            test_result = _run_backtest(cls, test, point_value, fill_mode)
-            test_fit = compute_fitness(test_result)
+            _, test_reports = _backtest_with_reports(
+                cls, test, name, point_value, fill_mode, save_reports,
+            )
+            test_fit = compute_fitness_from_reports(test_reports)
 
             fragile = False
             mc_var = 0.0
             if monte_carlo:
+                # MC stays on direct compute_fitness — perturbed
+                # backtests are throw-away noise; persisting their
+                # reports would clutter the data directory.
                 _, mc_var = monte_carlo_robustness(
                     cls, train, point_value, fill_mode,
                 )
@@ -352,6 +439,8 @@ def evaluate_deep(
                 phase="deep",
                 ai_tier="heavy",
                 ai_model_hint=_ai_hint("heavy"),
+                reports=train_reports,
+                walkforward_reports=test_reports,
             ))
         except Exception as e:
             out.append(EvalResult(
