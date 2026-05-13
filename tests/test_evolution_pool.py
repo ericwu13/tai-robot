@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
-from src.evolution.pool import StrategyEntry, StrategyPool
+from src.evolution.pool import (
+    DEFAULT_LIVE_FITNESS_THRESHOLD,
+    MIN_PAPER_DAYS_FOR_LIVE,
+    MIN_PAPER_TRADES_FOR_LIVE,
+    StrategyEntry,
+    StrategyPool,
+    eligible_for_live,
+)
 
 
 @pytest.fixture
@@ -212,3 +220,266 @@ class TestPersistence:
         nested = tmp_path / "newdir" / "evolution_pool.db"
         StrategyPool(nested)
         assert nested.parent.exists()
+
+
+class TestPaperTradingFitness:
+    def test_default_paper_fields(self, pool):
+        entry = make_entry()
+        pool.add(entry)
+        loaded = pool.get(entry.id)
+        assert loaded.paper_trading_fitness == 0.0
+        assert loaded.paper_trading_trades == 0
+        assert loaded.paper_trading_period_start is None
+        assert loaded.paper_trading_period_end is None
+
+    def test_update_paper_trading_fitness(self, pool):
+        entry = make_entry()
+        pool.add(entry)
+        fitness_dict = {
+            "composite": 0.62, "sharpe": 1.4, "source": "paper",
+        }
+        pool.update_paper_trading_fitness(
+            entry.id,
+            fitness_dict,
+            paper_trading_fitness=0.62,
+            period_start="2026-01-01",
+            period_end="2026-01-20",
+            n_trades=45,
+        )
+        loaded = pool.get(entry.id)
+        assert loaded.paper_trading_fitness == pytest.approx(0.62)
+        assert loaded.paper_trading_period_start == "2026-01-01"
+        assert loaded.paper_trading_period_end == "2026-01-20"
+        assert loaded.paper_trading_trades == 45
+        # fitness_json was overwritten with the paper score blob
+        decoded = json.loads(loaded.fitness_json)
+        assert decoded["source"] == "paper"
+
+    def test_update_paper_preserves_walkforward_columns(self, pool):
+        """Updating paper-trading fitness must NOT clobber backtest
+        columns — backtest and paper-trading scores live independently."""
+        entry = make_entry(
+            walkforward_fitness=0.55,
+            fitness_composite=0.40,
+            backtest_period_start="2025-10-01",
+            backtest_period_end="2026-01-01",
+        )
+        pool.add(entry)
+        pool.update_paper_trading_fitness(
+            entry.id, {"composite": 0.30}, paper_trading_fitness=0.30,
+            period_start="2026-01-01", period_end="2026-01-20", n_trades=40,
+        )
+        loaded = pool.get(entry.id)
+        # Paper update landed.
+        assert loaded.paper_trading_fitness == pytest.approx(0.30)
+        # Backtest fields untouched.
+        assert loaded.walkforward_fitness == pytest.approx(0.55)
+        assert loaded.fitness_composite == pytest.approx(0.40)
+        assert loaded.backtest_period_start == "2025-10-01"
+
+    def test_update_paper_missing_raises(self, pool):
+        with pytest.raises(KeyError):
+            pool.update_paper_trading_fitness(
+                "missing", {"composite": 0.1}, 0.1,
+            )
+
+    def test_partial_update_preserves_unspecified(self, pool):
+        """Subsequent updates with only some fields should keep the rest."""
+        entry = make_entry()
+        pool.add(entry)
+        pool.update_paper_trading_fitness(
+            entry.id, {"composite": 0.5}, paper_trading_fitness=0.5,
+            period_start="2026-01-01", period_end="2026-01-20", n_trades=35,
+        )
+        # Second update without period/trades — should keep the first values.
+        pool.update_paper_trading_fitness(
+            entry.id, {"composite": 0.55}, paper_trading_fitness=0.55,
+        )
+        loaded = pool.get(entry.id)
+        assert loaded.paper_trading_fitness == pytest.approx(0.55)
+        assert loaded.paper_trading_period_start == "2026-01-01"
+        assert loaded.paper_trading_period_end == "2026-01-20"
+        assert loaded.paper_trading_trades == 35
+
+    def test_get_top_paper_trading(self, pool):
+        for i, fit in enumerate([0.10, 0.50, 0.30, 0.70]):
+            entry = make_entry(
+                name=f"p{i}",
+                paper_trading_fitness=fit,
+                status="paper_trading",
+            )
+            pool.add(entry)
+        top = pool.get_top_paper_trading(2)
+        assert [e.paper_trading_fitness for e in top] == [0.70, 0.50]
+
+    def test_get_top_paper_trading_filters_by_status(self, pool):
+        # High paper_trading_fitness but wrong status — should be skipped.
+        pool.add(make_entry(
+            name="wrong-status", paper_trading_fitness=0.99, status="validated",
+        ))
+        pool.add(make_entry(
+            name="right-status", paper_trading_fitness=0.50, status="paper_trading",
+        ))
+        top = pool.get_top_paper_trading(10)
+        assert len(top) == 1
+        assert top[0].name == "right-status"
+
+
+class TestEligibleForLive:
+    def _ready_entry(self) -> StrategyEntry:
+        return StrategyEntry(
+            name="ready",
+            source_code="...",
+            walkforward_fitness=0.40,
+            paper_trading_fitness=0.65,
+            paper_trading_trades=MIN_PAPER_TRADES_FOR_LIVE + 5,
+            paper_trading_period_start="2026-01-01",
+            paper_trading_period_end="2026-01-25",  # 24 days > 14
+            status="paper_trading",
+        )
+
+    def test_happy_path_eligible(self):
+        ok, reason = eligible_for_live(self._ready_entry())
+        assert ok is True
+        assert reason == ""
+
+    def test_wrong_status(self):
+        entry = self._ready_entry()
+        entry.status = "validated"
+        ok, reason = eligible_for_live(entry)
+        assert ok is False
+        assert "status" in reason
+
+    def test_fitness_below_threshold(self):
+        entry = self._ready_entry()
+        entry.paper_trading_fitness = 0.30
+        ok, reason = eligible_for_live(
+            entry, fitness_threshold=DEFAULT_LIVE_FITNESS_THRESHOLD,
+        )
+        assert ok is False
+        assert "fitness" in reason
+
+    def test_trade_count_below_minimum(self):
+        entry = self._ready_entry()
+        entry.paper_trading_trades = 10
+        ok, reason = eligible_for_live(entry)
+        assert ok is False
+        assert "trades" in reason
+
+    def test_window_too_short(self):
+        entry = self._ready_entry()
+        entry.paper_trading_period_end = "2026-01-05"  # 4 days
+        ok, reason = eligible_for_live(entry)
+        assert ok is False
+        assert "days" in reason or "window" in reason
+
+    def test_missing_period_data(self):
+        entry = self._ready_entry()
+        entry.paper_trading_period_start = None
+        ok, reason = eligible_for_live(entry)
+        assert ok is False
+        assert "period" in reason
+
+    def test_negative_walkforward_blocks_unless_overridden(self):
+        entry = self._ready_entry()
+        entry.walkforward_fitness = -0.10
+        # Default: blocked.
+        ok, _ = eligible_for_live(entry)
+        assert ok is False
+        # Caller can override (e.g. for emergency promotion).
+        ok2, _ = eligible_for_live(entry, require_positive_walkforward=False)
+        assert ok2 is True
+
+    def test_custom_thresholds(self):
+        entry = self._ready_entry()
+        # Crank threshold above the entry's paper fitness.
+        ok, _ = eligible_for_live(entry, fitness_threshold=0.99)
+        assert ok is False
+        # Custom min_paper_days that the entry passes (3 weeks).
+        ok2, _ = eligible_for_live(entry, min_paper_days=21)
+        # Entry has 24-day window; 21 < 24 so this passes.
+        assert ok2 is True
+
+
+class TestSchemaMigration:
+    """Pool DBs created before paper_trading_* columns existed must be
+    silently upgraded on open. Construct an old-shape DB by hand, then
+    let StrategyPool.__init__ run migrations."""
+
+    def _create_old_pool(self, path) -> str:
+        """Build a v1-schema DB (pre paper_trading columns) and seed it
+        with one row. Returns the inserted id."""
+        conn = sqlite3.connect(path)
+        conn.execute("""
+            CREATE TABLE strategies (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source_code TEXT NOT NULL,
+                parent_id TEXT,
+                generation INTEGER NOT NULL DEFAULT 0,
+                fitness_composite REAL NOT NULL DEFAULT 0.0,
+                fitness_json TEXT NOT NULL DEFAULT '{}',
+                backtest_period_start TEXT,
+                backtest_period_end TEXT,
+                walkforward_period_start TEXT,
+                walkforward_period_end TEXT,
+                walkforward_fitness REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        sid = "v1-row-id"
+        conn.execute("""
+            INSERT INTO strategies (
+                id, name, source_code, walkforward_fitness, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (sid, "legacy", "# legacy code", 0.42, "validated",
+              "2025-06-01T00:00:00", "2025-06-01T00:00:00"))
+        conn.commit()
+        conn.close()
+        return sid
+
+    def test_migration_adds_columns(self, tmp_path):
+        path = tmp_path / "old_pool.db"
+        sid = self._create_old_pool(str(path))
+
+        # Sanity: confirm the column doesn't exist yet.
+        conn = sqlite3.connect(path)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(strategies)")}
+        conn.close()
+        assert "paper_trading_fitness" not in cols
+
+        # Opening with StrategyPool runs the migration.
+        pool = StrategyPool(path)
+
+        conn = sqlite3.connect(path)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(strategies)")}
+        conn.close()
+        assert "paper_trading_fitness" in cols
+        assert "paper_trading_period_start" in cols
+        assert "paper_trading_period_end" in cols
+        assert "paper_trading_trades" in cols
+
+        # Legacy row survives, paper fields default-populated.
+        loaded = pool.get(sid)
+        assert loaded is not None
+        assert loaded.name == "legacy"
+        assert loaded.walkforward_fitness == pytest.approx(0.42)
+        assert loaded.paper_trading_fitness == 0.0
+        assert loaded.paper_trading_trades == 0
+        assert loaded.paper_trading_period_start is None
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """Running __init__ twice on an already-migrated DB should not
+        raise (PRAGMA-guard prevents double ADD COLUMN)."""
+        path = tmp_path / "twice.db"
+        StrategyPool(path)
+        StrategyPool(path)  # second open
+        # And a third for good measure.
+        pool = StrategyPool(path)
+        # Pool is usable.
+        pool.add(make_entry())
+        assert pool.count() == 1

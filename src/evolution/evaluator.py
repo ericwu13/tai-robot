@@ -15,7 +15,17 @@ Two-phase evaluation:
   Reports ARE persisted to ``data/daily-reports/`` so deep evaluations
   surface in the existing daily-report UI exactly like manual backtests.
 
-Both phases run the backtest engine, then route the trades through
+* ``paper_trading`` scoring — once a strategy is promoted to a paper
+  bot, :func:`score_paper_trading_results` and :func:`score_paper_session`
+  ingest its accumulated trades (from ``broker.trades`` or the bot's
+  ``session.json``) and update the pool's ``paper_trading_*`` columns.
+  Paper trades come from the same ``SimulatedBroker`` as backtest
+  trades, so the fitness math is identical — only the ``source`` audit
+  tag and the destination pool columns differ. Promotion to ``live`` is
+  gated by :func:`src.evolution.pool.eligible_for_live`, which weighs
+  the paper-trading composite ahead of walkforward.
+
+Both backtest phases route the trades through
 :func:`src.daily_report.report_generator.generate_report_from_backtest`
 so regime classification (ADX/ATR/EMA labels) comes from the existing
 classifier rather than an evolution-private heuristic. Fitness is then
@@ -39,13 +49,18 @@ from typing import Any
 from ..ai.chat_client import PROVIDER_GOOGLE, model_for_tier
 from ..backtest.engine import BacktestEngine
 from ..ai.code_sandbox import load_strategy_from_source
+from ..backtest.broker import SimulatedBroker
 from ..daily_report.report_generator import generate_report_from_backtest
+from ..live.session_store import load_session
 from ..market_data.models import Bar
 from .fitness import (
     FitnessResult,
+    SOURCE_PAPER,
     compute_fitness,
     compute_fitness_from_reports,
+    compute_fitness_from_trades,
 )
+from .pool import StrategyPool
 
 
 # Days of bars used for the cheap "screen" pass. 30 calendar days is
@@ -456,3 +471,121 @@ def evaluate_deep(
                 ai_model_hint=_ai_hint("heavy"),
             ))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Paper trading scoring
+# ---------------------------------------------------------------------------
+#
+# A strategy promoted to ``paper_trading`` status runs as a real live bot
+# (``LiveRunner.trading_mode == "paper"``). Trades accumulate in the
+# broker; every save snapshot lands in ``data/live/{symbol}_{bot}/session.json``
+# and per-session daily reports land in ``data/daily-reports/``.
+#
+# The scoring functions here read whichever format the caller has on hand
+# and update the pool's ``paper_trading_*`` columns. The fitness math
+# itself is identical to backtest scoring — only the ``source`` tag and
+# the pool column differ. See ``src.evolution.pool.eligible_for_live`` for
+# the live-promotion gate that consumes these scores.
+
+
+def score_paper_trading_results(
+    pool: StrategyPool,
+    strategy_id: str,
+    trades: list[Any],
+    equity_curve: list[int] | None = None,
+    period_start: str | None = None,
+    period_end: str | None = None,
+) -> FitnessResult:
+    """Score accumulated paper-trading trades and update the pool.
+
+    ``trades`` can be ``Trade`` dataclass instances (from
+    ``broker.trades``) or trade dicts (from a session JSON's
+    ``broker.trades`` list). The pool entry's
+    ``paper_trading_fitness`` / ``paper_trading_period_*`` /
+    ``paper_trading_trades`` columns are updated atomically.
+
+    Raises ``KeyError`` if ``strategy_id`` isn't in the pool.
+
+    The returned ``FitnessResult.source`` is ``"paper"`` so downstream
+    inspection can tell this score apart from the backtest one.
+    """
+    fit = compute_fitness_from_trades(
+        trades, equity_curve, source=SOURCE_PAPER,
+    )
+    pool.update_paper_trading_fitness(
+        id_=strategy_id,
+        fitness_dict=fit.to_dict(),
+        paper_trading_fitness=fit.composite,
+        period_start=period_start,
+        period_end=period_end,
+        n_trades=fit.total_trades,
+    )
+    return fit
+
+
+def _trades_from_session_dict(session: dict) -> tuple[list[Any], list[int], str | None]:
+    """Pull ``(trades, equity_curve, started_at)`` out of a session JSON.
+
+    Restores via :class:`SimulatedBroker.from_dict` so the trade list
+    matches the shape ``compute_fitness_from_trades`` accepts directly
+    (Trade dataclass instances with proper OrderSide enums). The
+    started_at timestamp doubles as the paper-trading period start when
+    the caller doesn't override it.
+    """
+    broker_data = session.get("broker") or {}
+    broker = SimulatedBroker.from_dict(broker_data)
+    started = session.get("started_at")
+    return list(broker.trades), list(broker.equity_curve), started
+
+
+def score_paper_session(
+    pool: StrategyPool,
+    strategy_id: str,
+    session_path: str,
+    period_end: str | None = None,
+) -> FitnessResult | None:
+    """Convenience wrapper: load a paper-bot ``session.json`` and score it.
+
+    Reads ``data/live/{symbol}_{bot_name}/session.json`` (the exact path
+    written by :meth:`src.live.live_runner.LiveRunner._auto_save_session`),
+    extracts the broker's accumulated trades + equity curve, and updates
+    the pool. The session's ``started_at`` timestamp is used as the
+    paper-trading period start unless the caller passes ``period_end``;
+    the period end defaults to the session's ``saved_at``.
+
+    Returns ``None`` (without touching the pool) when the session file
+    doesn't exist or is corrupt — paper sessions can be deleted or
+    rotated and the caller shouldn't see that as a hard error.
+
+    Refuses to score sessions where ``trading_mode != "paper"`` —
+    semi_auto / auto sessions carry real-money trades and should be
+    scored via a separate path that explicitly opts in to that data
+    (out of scope for Phase 1).
+    """
+    session = load_session(session_path)
+    if session is None:
+        return None
+    if session.get("trading_mode") not in ("paper", None):
+        # None handles old session files written before the
+        # trading_mode field existed. Real-money modes refuse here.
+        raise ValueError(
+            f"session at {session_path!r} has trading_mode="
+            f"{session.get('trading_mode')!r}, only 'paper' is supported"
+        )
+
+    trades, equity_curve, started_at = _trades_from_session_dict(session)
+    period_end = period_end or session.get("saved_at")
+    # Take just the date portion so the period columns are uniform with
+    # the backtest period_start / period_end format (YYYY-MM-DD).
+    started_date = started_at[:10] if started_at else None
+    end_date = period_end[:10] if period_end else None
+
+    return score_paper_trading_results(
+        pool=pool,
+        strategy_id=strategy_id,
+        trades=trades,
+        equity_curve=equity_curve,
+        period_start=started_date,
+        period_end=end_date,
+    )

@@ -281,10 +281,12 @@ def test_to_dict_roundtrip():
         "composite", "sharpe", "sortino", "max_drawdown_pct",
         "profit_factor", "win_rate", "consistency",
         "regime_bull", "regime_bear", "regime_sideways",
-        "total_trades", "gated",
+        "total_trades", "gated", "source",
     }
     assert set(d.keys()) == expected_keys
     assert d["composite"] == fit.composite
+    # source defaults to "backtest" for compute_fitness on a raw result.
+    assert d["source"] == "backtest"
 
 
 # ---------------------------------------------------------------------------
