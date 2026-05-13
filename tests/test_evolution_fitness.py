@@ -10,8 +10,11 @@ from src.evolution.fitness import (
     DEFAULT_WEIGHTS,
     MIN_TRADES,
     compute_fitness,
+    compute_fitness_from_reports,
     consistency_score,
+    label_to_regime,
     regime_scores,
+    regime_scores_from_reports,
     sortino_ratio,
 )
 
@@ -282,3 +285,176 @@ def test_to_dict_roundtrip():
     }
     assert set(d.keys()) == expected_keys
     assert d["composite"] == fit.composite
+
+
+# ---------------------------------------------------------------------------
+# Report-based fitness — consumes the daily-report dict shape produced by
+# src.daily_report.report_generator.generate_report_from_backtest. Uses real
+# ADX/ATR regime labels via label_to_regime() instead of the per-trade
+# naive proxy.
+# ---------------------------------------------------------------------------
+
+
+def _trade_dict(entry: int, exit_: int, *, pnl: int | None = None,
+                entry_dt: str = "2025-01-15 09:00:00",
+                exit_dt: str = "2025-01-15 10:00:00") -> dict:
+    """Shape mirrors _trade_to_dict in src/daily_report/report_generator.py."""
+    return {
+        "tag": "L", "side": "LONG", "qty": 1,
+        "entry_price": entry, "exit_price": exit_,
+        "entry_dt": entry_dt, "exit_dt": exit_dt,
+        "pnl": pnl if pnl is not None else (exit_ - entry) * 200,
+        "entry_bar_index": 0, "exit_bar_index": 1,
+        "exit_tag": "Exit",
+    }
+
+
+def _report(date: str, trades: list[dict], regime_label: str | None = None) -> dict:
+    """Shape mirrors generate_daily_report() output."""
+    block = {"label": regime_label} if regime_label else None
+    return {
+        "date": date,
+        "trades": trades,
+        "summary": {},
+        "market_regime": block,
+    }
+
+
+class TestLabelToRegime:
+    def test_known_labels(self):
+        assert label_to_regime("trending-up") == "bull"
+        assert label_to_regime("transitional-bullish") == "bull"
+        assert label_to_regime("trending-down") == "bear"
+        assert label_to_regime("transitional-bearish") == "bear"
+        assert label_to_regime("range-bound") == "sideways"
+        assert label_to_regime("low-volatility-chop") == "sideways"
+        assert label_to_regime("high-volatility") == "sideways"
+
+    def test_unknown_or_missing(self):
+        assert label_to_regime(None) is None
+        assert label_to_regime("") is None
+        assert label_to_regime("not-a-label") is None
+
+
+class TestRegimeScoresFromReports:
+    def test_buckets_by_label(self):
+        reports = [
+            _report("2025-01-15", [
+                _trade_dict(20000, 20100),  # win
+                _trade_dict(20000, 19900),  # loss
+            ], regime_label="trending-up"),
+            _report("2025-02-15", [
+                _trade_dict(20000, 19800),  # loss
+            ], regime_label="trending-down"),
+            _report("2025-03-15", [
+                _trade_dict(20000, 20100),  # win
+            ], regime_label="range-bound"),
+        ]
+        scores = regime_scores_from_reports(reports)
+        assert scores["bull"] == 0.5      # 1 win / 2 trades
+        assert scores["bear"] == 0.0      # 0 wins / 1 trade
+        assert scores["sideways"] == 1.0  # 1 win / 1 trade
+
+    def test_skips_reports_without_label(self):
+        reports = [
+            _report("2025-01-15", [_trade_dict(20000, 20100)], regime_label=None),
+            _report("2025-02-15", [_trade_dict(20000, 20100)], regime_label="trending-up"),
+        ]
+        scores = regime_scores_from_reports(reports)
+        # Only the labeled report contributes.
+        assert scores["bull"] == 1.0
+        assert scores["bear"] == 0.0
+        assert scores["sideways"] == 0.0
+
+
+class TestComputeFitnessFromReports:
+    def _make_30_winning_reports(self, regime_label: str = "trending-up") -> list[dict]:
+        """30 winning trades across 6 months — clears MIN_TRADES."""
+        reports = []
+        months = ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06"]
+        for i in range(30):
+            m = months[i % len(months)]
+            reports.append(_report(
+                f"{m}-{(i % 28) + 1:02d}",
+                [_trade_dict(20000, 20100,
+                             entry_dt=f"{m}-{(i % 28) + 1:02d} 09:00:00",
+                             exit_dt=f"{m}-{(i % 28) + 1:02d} 10:00:00")],
+                regime_label=regime_label,
+            ))
+        return reports
+
+    def test_basic_scoring_from_reports(self):
+        reports = self._make_30_winning_reports("trending-up")
+        fit = compute_fitness_from_reports(reports)
+        assert fit.gated is False
+        assert fit.total_trades == 30
+        assert fit.composite > 0.0
+        # All trades classified as bull via the real label.
+        assert fit.regime_bull == 1.0
+        assert fit.regime_bear == 0.0
+        assert fit.regime_sideways == 0.0
+
+    def test_gated_when_below_min_trades(self):
+        reports = [
+            _report("2025-01-15",
+                    [_trade_dict(20000, 20100)] * 5,
+                    regime_label="trending-up"),
+        ]
+        fit = compute_fitness_from_reports(reports)
+        assert fit.gated is True
+        assert fit.composite == 0.0
+
+    def test_falls_back_to_naive_when_no_labels(self):
+        """When NO report has a regime label, fall back to the per-trade
+        naive proxy so we still get useful regime scoring."""
+        reports = []
+        months = ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06"]
+        for i in range(30):
+            m = months[i % len(months)]
+            reports.append(_report(
+                f"{m}-{(i % 28) + 1:02d}",
+                [_trade_dict(20000, 20500,  # +2.5% → naive bull
+                             entry_dt=f"{m}-{(i % 28) + 1:02d} 09:00:00",
+                             exit_dt=f"{m}-{(i % 28) + 1:02d} 10:00:00")],
+                regime_label=None,
+            ))
+        fit = compute_fitness_from_reports(reports)
+        # Naive proxy classifies these as bull (exit > entry by >1%).
+        assert fit.regime_bull > 0.0
+
+    def test_consumes_real_pipeline_output(self):
+        """Run the actual generate_report_from_backtest pipeline and
+        ensure compute_fitness_from_reports accepts its output as-is."""
+        from src.daily_report.report_generator import generate_report_from_backtest
+        from src.backtest.broker import Trade, OrderSide
+
+        # Build 30 trades spread across days with the engine's exact
+        # Trade dataclass — same shape generate_report_from_backtest sees.
+        trades = []
+        for i in range(30):
+            day = (i % 28) + 1
+            trades.append(Trade(
+                tag="L", side=OrderSide.LONG, qty=1,
+                entry_price=20000, exit_price=20100,
+                entry_bar_index=i, exit_bar_index=i + 1,
+                pnl=100 * 200,
+                entry_dt=f"2025-01-{day:02d} 09:00:00",
+                exit_dt=f"2025-01-{day:02d} 10:00:00",
+            ))
+        equity_curve = []
+        cum = 0
+        for t in trades:
+            cum += t.pnl
+            equity_curve.append(cum)
+
+        reports = generate_report_from_backtest(
+            trades=trades, equity_curve=equity_curve,
+            # Skip regime classification (insufficient bars). This
+            # exercises the no-label fallback path explicitly.
+            bars_highs=None, bars_lows=None, bars_closes=None,
+            strategy_name="test", point_value=200, save=False,
+        )
+        assert len(reports) > 0
+        fit = compute_fitness_from_reports(reports)
+        assert fit.total_trades == 30
+        assert fit.gated is False
