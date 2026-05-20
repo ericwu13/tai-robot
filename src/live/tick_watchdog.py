@@ -64,6 +64,27 @@ class TickWatchdog:
         """
         self.last_resubscribe = time.time()
 
+    def on_session_resubscribe(self) -> None:
+        """Call after issuing a session-transition resubscribe.
+
+        Unlike on_resubscribe(), this DOES advance last_tick_time to
+        wall-clock now.  Rationale: the session_resubscribe trigger fires
+        when last_tick_time was set during a wall-clock closed-market
+        period (e.g. a subscription-time auto-tick at 14:50, fired during
+        the 13:45-15:00 gap).  Without advancing last_tick_time, every
+        subsequent check() at 30s cadence keeps seeing the same
+        "last tick was during closed market" condition and re-fires
+        session_resubscribe forever (issue #66).
+
+        Advancing last_tick_time restarts the normal staleness clock.
+        If ticks really aren't arriving (zombie session), the regular
+        warn→resubscribe→reconnect escalation kicks in after WARN_TIMEOUT.
+        Real ticks will reset state via on_tick() as usual.
+        """
+        now = time.time()
+        self.last_tick_time = now
+        self.last_resubscribe = now
+
     def set_grace(self, seconds: int = 30) -> None:
         """Set a grace period after reconnect/resubscribe."""
         self.grace_until = time.time() + seconds
