@@ -54,8 +54,15 @@ class TestSessionTransitionAMtoPM:
             action = wd.check(now=_ts(check_dt))
         assert action == "session_resubscribe"
 
-    def test_last_tick_at_am_close_triggers_reconnect(self):
-        """Tick at 13:44 (AM open), check at 15:01 → reconnect (>10min elapsed)."""
+    def test_last_tick_at_am_close_triggers_session_resubscribe(self):
+        """Tick at 13:44 (AM open), check at 15:01 → session_resubscribe.
+
+        Issue #66 (bot 0422 case): even when last tick was in the prior
+        session (not in the gap itself), the elapsed measurement spans the
+        13:45-15:00 closed gap, so the 77-min reading is a measurement
+        artifact. Prefer a soft resubscribe over a heavy reconnect; if
+        ticks really don't arrive, normal escalation kicks in afterward.
+        """
         wd = TickWatchdog()
         wd.active = True
 
@@ -63,18 +70,23 @@ class TestSessionTransitionAMtoPM:
         am_dt = _taipei_dt(2026, 3, 17, 13, 44)
         wd.last_tick_time = _ts(am_dt)
 
-        # Check at 15:01 — elapsed ~77min, last tick was during open market
+        # Check at 15:01 — elapsed ~77min, but spans the closed gap
         check_dt = _taipei_dt(2026, 3, 17, 15, 1)
         with _patch_now(check_dt):
             action = wd.check(now=_ts(check_dt))
-        assert action == "reconnect"  # >10min elapsed
+        assert action == "session_resubscribe"
 
 
 class TestSessionTransitionPMtoAM:
     """PM session closes 05:00, AM opens 08:45 next day."""
 
-    def test_last_tick_before_close_triggers_reconnect(self):
-        """Tick at 04:59 (PM open), check at 08:46 → reconnect (>3h elapsed)."""
+    def test_last_tick_before_close_triggers_session_resubscribe(self):
+        """Tick at 04:59 (PM open), check at 08:46 → session_resubscribe.
+
+        Last tick was just before the 05:00 night close; check at next
+        AM open. Elapsed (~3h47m) spans the 05:00-08:45 closed gap, so
+        it's a session boundary not a same-session zombie.
+        """
         wd = TickWatchdog()
         wd.active = True
 
@@ -82,11 +94,11 @@ class TestSessionTransitionPMtoAM:
         pm_dt = _taipei_dt(2026, 3, 18, 4, 59)
         wd.last_tick_time = _ts(pm_dt)
 
-        # Check at 08:46 — elapsed ~3h47m, last tick during open market
+        # Check at 08:46 — gap spans 05:00-08:45 closed period
         check_dt = _taipei_dt(2026, 3, 18, 8, 46)
         with _patch_now(check_dt):
             action = wd.check(now=_ts(check_dt))
-        assert action == "reconnect"
+        assert action == "session_resubscribe"
 
     def test_last_tick_at_close_triggers_session_resubscribe(self):
         """Tick at 05:01 (market closed), check at 08:46 → session_resubscribe."""
@@ -107,33 +119,36 @@ class TestWeekendTransition:
     """Friday PM → Saturday 05:00 close → Monday AM 08:45 open."""
 
     def test_friday_night_tick_monday_morning(self):
-        """Last tick Friday 23:00, check Monday 08:46 → reconnect."""
+        """Last tick Friday 23:00, check Monday 08:46 → session_resubscribe.
+
+        Multi-day gap is still a session boundary — start with the soft
+        action; if the COM session is actually dead, the resubscribe will
+        fail (returning an error from RequestTicks) or no ticks will
+        arrive, and the normal escalation reaches reconnect within minutes.
+        """
         wd = TickWatchdog()
         wd.active = True
 
-        # Friday night tick (market open)
         fri_dt = _taipei_dt(2026, 3, 20, 23, 0)  # Friday
         wd.last_tick_time = _ts(fri_dt)
 
-        # Monday morning (AM open)
         mon_dt = _taipei_dt(2026, 3, 23, 8, 46)  # Monday
         with _patch_now(mon_dt):
             action = wd.check(now=_ts(mon_dt))
-        assert action == "reconnect"  # >2 days elapsed, last tick was open market
+        assert action == "session_resubscribe"
 
     def test_saturday_morning_tick_monday(self):
         """Last tick Saturday 04:59 (Fri night carryover), check Monday 08:46."""
         wd = TickWatchdog()
         wd.active = True
 
-        # Saturday 04:59 (market still open from Friday night)
         sat_dt = _taipei_dt(2026, 3, 21, 4, 59)  # Saturday
         wd.last_tick_time = _ts(sat_dt)
 
         mon_dt = _taipei_dt(2026, 3, 23, 8, 46)
         with _patch_now(mon_dt):
             action = wd.check(now=_ts(mon_dt))
-        assert action == "reconnect"
+        assert action == "session_resubscribe"
 
     def test_saturday_after_close_monday(self):
         """Last tick Saturday 06:00 (closed), check Monday 08:46 → session_resubscribe."""
@@ -212,6 +227,66 @@ class TestSettlementDayClose:
         with _patch_now(check_dt):
             action = wd.check(now=_ts(check_dt))
         assert action == "warn"
+
+
+class TestBot0422FalseReconnect:
+    """Issue #66: bot 0422 case.
+
+    Last real tick at 13:28 (AM session), no more ticks (settlement day or
+    cash-market early close), watchdog warns 13:32-13:34, suppressed
+    13:35-13:45, market closes 13:45, reopens 15:00 → watchdog measures
+    90 min elapsed and force-reconnects.
+
+    The 90-min reading is a measurement artifact across the closed gap,
+    not a zombie session. The fix should treat this as a session boundary
+    (soft resubscribe), not escalate straight to reconnect.
+    """
+
+    def test_first_pm_check_resubscribes_not_reconnects(self):
+        """At 15:00:22 first check after PM open, action must be
+        session_resubscribe (not the buggy 90m force-reconnect)."""
+        wd = TickWatchdog()
+        wd.active = True
+
+        last_tick = _taipei_dt(2026, 5, 20, 13, 28)
+        wd.last_tick_time = _ts(last_tick)
+
+        check_dt = _taipei_dt(2026, 5, 20, 15, 0)
+        with _patch_now(check_dt):
+            action = wd.check(now=_ts(check_dt) + 22)  # 15:00:22
+        assert action == "session_resubscribe"
+
+    def test_no_reconnect_loop_after_handler(self):
+        """After handler runs on_session_resubscribe, subsequent checks
+        must NOT keep firing — neither session_resubscribe nor reconnect."""
+        wd = TickWatchdog()
+        wd.active = True
+
+        last_tick = _taipei_dt(2026, 5, 20, 13, 28)
+        wd.last_tick_time = _ts(last_tick)
+
+        check_dt = _taipei_dt(2026, 5, 20, 15, 0)
+        first = _ts(check_dt) + 22
+        with _patch_now(check_dt):
+            assert wd.check(now=first) == "session_resubscribe"
+
+        # Handler runs at 15:00:22
+        with patch("src.live.tick_watchdog.time.time", return_value=first):
+            wd.set_grace(30)
+            wd.on_session_resubscribe()
+
+        # 30s later, grace expired — must be quiet, NOT reconnect
+        second = first + 30
+        second_dt = datetime.fromtimestamp(second, tz=_TZ_TAIPEI)
+        with _patch_now(second_dt):
+            action2 = wd.check(now=second)
+        assert action2 is None
+
+        # Another minute — still quiet
+        third = first + 90
+        third_dt = datetime.fromtimestamp(third, tz=_TZ_TAIPEI)
+        with _patch_now(third_dt):
+            assert wd.check(now=third) is None
 
 
 class TestNormalStaleness:

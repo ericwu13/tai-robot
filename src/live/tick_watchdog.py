@@ -12,6 +12,38 @@ from datetime import datetime
 from .live_runner import is_market_open, minutes_until_session_close, _TZ_TAIPEI
 
 
+def _crossed_session_gap(last_ts: float, now_ts: float) -> bool:
+    """Return True if a market-closed period exists between last_ts and now_ts.
+
+    Used to distinguish session boundary crossings from same-session
+    zombie scenarios.  Both:
+
+      * last tick during closed market (e.g. subscription auto-tick at 14:50
+        during the 13:45-15:00 gap), and
+      * last tick during prior session (e.g. last AM tick at 13:28, check at
+        15:00 PM open — bot 0422 case from issue #66)
+
+    are session-boundary scenarios that warrant a soft resubscribe rather
+    than a 10-minute-elapsed reconnect.
+    """
+    if now_ts <= last_ts:
+        return False
+    last_dt = datetime.fromtimestamp(last_ts, tz=_TZ_TAIPEI)
+    # If last tick was itself during closed market, definitely a gap
+    if not is_market_open(last_dt):
+        return True
+    # Walk the interval in 5-min steps looking for a closed sample.
+    # Real session gaps are >= 75 min (13:45-15:00) or >= 225 min (05:00-08:45),
+    # so 5-min stride catches them with tens of iterations max.
+    step = 300
+    t = last_ts + step
+    while t < now_ts:
+        if not is_market_open(datetime.fromtimestamp(t, tz=_TZ_TAIPEI)):
+            return True
+        t += step
+    return False
+
+
 class TickWatchdog:
     """Monitors tick freshness and decides when to resubscribe or reconnect.
 
@@ -68,13 +100,13 @@ class TickWatchdog:
         """Call after issuing a session-transition resubscribe.
 
         Unlike on_resubscribe(), this DOES advance last_tick_time to
-        wall-clock now.  Rationale: the session_resubscribe trigger fires
-        when last_tick_time was set during a wall-clock closed-market
-        period (e.g. a subscription-time auto-tick at 14:50, fired during
-        the 13:45-15:00 gap).  Without advancing last_tick_time, every
-        subsequent check() at 30s cadence keeps seeing the same
-        "last tick was during closed market" condition and re-fires
-        session_resubscribe forever (issue #66).
+        wall-clock now.  Rationale: the session_resubscribe trigger
+        fires when a closed-market gap exists between last_tick_time
+        and now — e.g. a subscription-time auto-tick at 14:50 during
+        the 13:45-15:00 gap, OR a normal last AM tick at 13:28 with
+        check at 15:00 PM open.  In either case the elapsed reading
+        across the gap is meaningless and the trigger condition would
+        keep firing on every 30s check.
 
         Advancing last_tick_time restarts the normal staleness clock.
         If ticks really aren't arriving (zombie session), the regular
@@ -137,13 +169,27 @@ class TickWatchdog:
         if now < self.grace_until:
             return None
 
-        # Session transition: last tick was during closed market.
-        # The old subscription is stale — resubscribe immediately.
-        last_dt = datetime.fromtimestamp(self.last_tick_time, tz=_TZ_TAIPEI)
-        if not is_market_open(last_dt):
-            return "session_resubscribe"
+        # Session boundary: a closed-market period exists between last
+        # tick and now (last tick during closed gap, or last tick in a
+        # prior session).  Prefer a soft resubscribe over a heavy
+        # reconnect — the 90+ minute elapsed reading is a measurement
+        # artifact of the gap, not a real zombie session.
+        #
+        # RESUBSCRIBE_COOLDOWN prevents the 30s-check loop; the GUI
+        # handler should also call on_session_resubscribe() to advance
+        # last_tick_time so subsequent checks see a fresh clock.  If
+        # ticks still don't arrive, normal warn → resubscribe →
+        # reconnect escalation takes over within minutes.
+        if _crossed_session_gap(self.last_tick_time, now):
+            in_cooldown = (self.last_resubscribe
+                           and (now - self.last_resubscribe) < self.RESUBSCRIBE_COOLDOWN)
+            if not in_cooldown:
+                return "session_resubscribe"
+            # In cooldown: stay quiet rather than escalating to reconnect
+            # on a stale elapsed reading that spans the closed gap.
+            return None
 
-        # Normal staleness checks
+        # Normal staleness checks (same-session zombie)
         elapsed = now - self.last_tick_time
         if elapsed <= self.WARN_TIMEOUT:
             return None
