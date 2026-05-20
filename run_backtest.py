@@ -4027,6 +4027,11 @@ class BacktestApp:
             self._live_log_msg(
                 "新盤重新訂閱 New session — re-subscribing ticks", "status")
             self._resubscribe_ticks()
+            # Advance last_tick_time so the trigger condition clears.
+            # Without this, every 30s check re-fires session_resubscribe
+            # forever because last_tick_time still corresponds to the
+            # prior closed-market period (issue #66).
+            self._tick_watchdog.on_session_resubscribe()
 
         elif action == "reconnect":
             _log(f"Tick watchdog: no ticks for {mins}m, forcing full reconnect")
