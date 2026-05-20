@@ -71,6 +71,11 @@ class TickWatchdog:
         self.last_tick_time: float = 0.0
         self.grace_until: float = 0.0   # suppress warnings until this time
         self.last_resubscribe: float = 0.0  # for cooldown
+        # Order symbol (e.g. "TM0000") — used so minutes_until_session_close
+        # applies the settlement-day 13:30 close for front-month contracts.
+        # Without this, the watchdog uses the default 13:45 close and warns
+        # between 13:30 and 13:35 on settlement day (issue #66).
+        self.order_symbol: str | None = None
 
     def on_tick(self) -> None:
         """Call when a real tick is received (live or history).
@@ -122,6 +127,7 @@ class TickWatchdog:
         self.last_tick_time = 0.0
         self.grace_until = 0.0
         self.last_resubscribe = 0.0
+        self.order_symbol = None
 
     def check(self, now: float | None = None) -> str | None:
         """Check tick health and return the action needed.
@@ -142,9 +148,18 @@ class TickWatchdog:
         if not is_market_open():
             return None
 
-        # Suppress near session close — thin volume is normal
-        mins_left = minutes_until_session_close()
-        if mins_left is not None and mins_left <= self.NEAR_CLOSE_SUPPRESS:
+        # Settlement-day awareness: for front-month contracts, the AM
+        # session closes at 13:30 (not 13:45).  minutes_until_session_close
+        # returns None when we're past the effective close for this
+        # order_symbol even though the global is_market_open still says
+        # True until 13:45.  Treat that window as closed — otherwise the
+        # bot warns every 30s between 13:30 and 13:35 on settlement day
+        # (issue #66).  Near-close suppression also uses the early close
+        # so we don't warn during the last 10 min of real trading.
+        mins_left = minutes_until_session_close(self.order_symbol)
+        if mins_left is None:
+            return None
+        if mins_left <= self.NEAR_CLOSE_SUPPRESS:
             return None
 
         if now is None:
