@@ -113,8 +113,26 @@ def is_front_month_contract(order_symbol: str, d: date | datetime | None = None)
 
     Back-month contracts (May, June, ...) keep trading until 13:45 even
     on settlement day; only the front-month is force-settled at 13:30.
+
+    Also recognizes the static "near-month" placeholder codes used by
+    Capital API continuous-quote symbols (TX00 → "TXFD0", MTX00 →
+    "MTXFD0", TMF00 → "TM0000").  These don't match the standard
+    {letter}{digit} suffix but the broker auto-routes them to the
+    current front-month contract, so for settlement-day purposes they
+    behave as front-month.
     """
-    if not order_symbol or len(order_symbol) < 2:
+    if not order_symbol:
+        return False
+    # Near-month quote-symbol placeholders (issue #66): without this
+    # branch, is_front_month_contract("TM0000") returns False on
+    # settlement day and minutes_until_session_close keeps using 13:45
+    # instead of the actual 13:30 settlement close → false-positive
+    # watchdog warnings between 13:30 and 13:45.
+    from .kline_config import SYMBOL_CONFIG
+    for cfg in SYMBOL_CONFIG.values():
+        if cfg.get("near_month") and cfg.get("order_symbol") == order_symbol:
+            return True
+    if len(order_symbol) < 2:
         return False
     if d is None:
         from src.live.live_runner import _taipei_now

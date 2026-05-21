@@ -51,13 +51,16 @@ LIVE_CHART_TIMEFRAMES = {
 
 SYMBOL_CONFIG = {
     "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100,
-             "taifex_id": "TX", "order_symbol": "TXFD0", "init_margin": 322000},
+             "taifex_id": "TX", "order_symbol": "TXFD0", "init_margin": 322000,
+             "near_month": True},
     "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100,
               "taifex_id": "MTX", "order_symbol": "MTXFD0",
-              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 80500},
+              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 80500,
+              "near_month": True},
     "TMF00": {"prefix": "IMF1", "tv": "IMF1!", "pv": 10, "tick_divisor": 100,
               "taifex_id": "TMF", "order_symbol": "TM0000",
-              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 16100},
+              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 16100,
+              "near_month": True},
 }
 
 _MONTH_CODES = "ABCDEFGHIJKL"  # A=Jan .. L=Dec
