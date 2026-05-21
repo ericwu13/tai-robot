@@ -150,6 +150,70 @@ class TestWeekendTransition:
         assert action == "session_resubscribe"
 
 
+class TestSettlementDayClose:
+    """Issue #66 part 2: on settlement day (3rd Wed), front-month
+    contracts force-settle at 13:30. Without symbol-aware close
+    handling, the watchdog uses the default 13:45 and warns/escalates
+    between 13:30 and 13:45 when ticks correctly stop at 13:30.
+    """
+
+    def test_settlement_no_warning_between_1330_and_1345(self):
+        """Last tick at 13:28 (just before settlement close), check at
+        13:32 with order_symbol=TM0000 (TMF00 front-month) → no warn.
+
+        With the bug: default 13:45 close, mins_left=13 (not near close),
+        elapsed=4min > WARN_TIMEOUT → "warn".
+        """
+        wd = TickWatchdog()
+        wd.active = True
+        wd.order_symbol = "TM0000"  # front-month placeholder for TMF00
+
+        last_tick = _taipei_dt(2026, 5, 20, 13, 28)  # settlement day
+        wd.last_tick_time = _ts(last_tick)
+
+        check_dt = _taipei_dt(2026, 5, 20, 13, 32)
+        with _patch_now(check_dt):
+            action = wd.check(now=_ts(check_dt))
+        assert action is None  # past effective close, no warning
+
+    def test_settlement_no_warning_at_1334(self):
+        wd = TickWatchdog()
+        wd.active = True
+        wd.order_symbol = "TM0000"
+        last_tick = _taipei_dt(2026, 5, 20, 13, 28)
+        wd.last_tick_time = _ts(last_tick)
+        check_dt = _taipei_dt(2026, 5, 20, 13, 34)
+        with _patch_now(check_dt):
+            assert wd.check(now=_ts(check_dt)) is None
+
+    def test_non_settlement_day_still_warns_after_1330(self):
+        """On a non-settlement day, 13:30-13:45 is regular trading,
+        so a stale tick from 13:29 SHOULD trigger warn at 13:32."""
+        wd = TickWatchdog()
+        wd.active = True
+        wd.order_symbol = "TM0000"
+        # 2026-05-19 is Tuesday, NOT settlement day
+        last_tick = _taipei_dt(2026, 5, 19, 13, 29)  # 3 min before check
+        wd.last_tick_time = _ts(last_tick)
+        check_dt = _taipei_dt(2026, 5, 19, 13, 32)
+        with _patch_now(check_dt):
+            action = wd.check(now=_ts(check_dt))
+        assert action == "warn"
+
+    def test_settlement_back_month_uses_1345_close(self):
+        """Back-month contracts (e.g. June TXFF6) close at 13:45 even
+        on settlement day — the early close only applies to front-month."""
+        wd = TickWatchdog()
+        wd.active = True
+        wd.order_symbol = "TXFF6"  # June 2026, back-month on May settlement day
+        last_tick = _taipei_dt(2026, 5, 20, 13, 29)
+        wd.last_tick_time = _ts(last_tick)
+        check_dt = _taipei_dt(2026, 5, 20, 13, 32)
+        with _patch_now(check_dt):
+            action = wd.check(now=_ts(check_dt))
+        assert action == "warn"
+
+
 class TestNormalStaleness:
     """Normal tick staleness during an active session."""
 

@@ -114,6 +114,19 @@ class TestIsFrontMonthContract:
         assert is_front_month_contract("", d) is False
         assert is_front_month_contract("X", d) is False
 
+    def test_near_month_placeholder_symbols_are_front_month(self):
+        """Issue #66: continuous-quote symbols TX00/MTX00/TMF00 use
+        static placeholder order_symbol values that don't match the
+        {letter}{digit} suffix pattern. Without recognizing them,
+        settlement-day detection fails for these (very common) symbols."""
+        d = date(2026, 5, 20)  # settlement day for May
+        # Capital API auto-routes these to current front-month
+        assert is_front_month_contract("TM0000", d) is True   # TMF00
+        assert is_front_month_contract("TXFD0", d) is True    # TX00
+        assert is_front_month_contract("MTXFD0", d) is True   # MTX00
+        # Real back-month code on the same date — not front-month
+        assert is_front_month_contract("TXFF6", d) is False   # June 2026
+
     def test_accepts_datetime(self):
         dt = datetime(2026, 4, 15, 9, 0, tzinfo=_TPE)
         assert is_front_month_contract("TXFD6", dt) is True

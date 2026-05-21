@@ -3851,6 +3851,9 @@ class BacktestApp:
             self._live_tick_active = True
             self._tick_watchdog.on_tick()
             self._tick_watchdog.active = True
+            # Tell the watchdog the order symbol so it knows about the
+            # 13:30 settlement-day close for front-month contracts.
+            self._tick_watchdog.order_symbol = resolve_order_symbol(symbol)
             self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
             _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
         except Exception as e:
