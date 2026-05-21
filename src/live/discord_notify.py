@@ -126,6 +126,48 @@ class DiscordNotifier:
             f"淨損益: {net_pnl:+,} | 上限: -{limit:,}"
         )
 
+    def strategy_improved(
+        self,
+        composite: float,
+        previous_best: float,
+        delta: float,
+        n_trades: int,
+        sortino: float,
+        win_rate: float,
+        profit_factor: float,
+        max_drawdown_pct: float,
+        source: str,
+        first_run: bool = False,
+    ) -> None:
+        """Announce that the strategy hit a new best fitness composite.
+
+        Wired by :func:`src.evolution.notify.check_and_notify_after_report`
+        which runs right after the daily report is saved.  ``first_run``
+        gets a slightly different header because there's no prior best
+        to compare against — composite IS the delta.
+        """
+        if first_run:
+            headline = "🌱 **首次評分 First Fitness Score**"
+            delta_str = f"composite **{composite:.3f}**"
+        else:
+            headline = "📈 **策略進步 Strategy Improvement**"
+            delta_str = (
+                f"composite **{composite:.3f}** "
+                f"(前最佳 prev best {previous_best:.3f}, "
+                f"Δ {delta:+.3f})"
+            )
+        self._send(
+            f"{self._header()}\n"
+            f"{headline}\n"
+            f"{delta_str}\n"
+            f"交易數 trades: {n_trades} | "
+            f"勝率 win-rate: {win_rate:.1%} | "
+            f"PF: {profit_factor:.2f}\n"
+            f"Sortino: {sortino:.2f} | "
+            f"最大回撤 max DD: {max_drawdown_pct:.1f}% | "
+            f"來源 source: `{source}`"
+        )
+
     def daily_report(self, report: dict) -> None:
         """Send a daily report summary to Discord."""
         date = report.get("date", "?")
