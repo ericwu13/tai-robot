@@ -4381,17 +4381,32 @@ class BacktestApp:
         )
         # Mirror the verdict in the live log so the user can see WHY a
         # notification did or didn't fire — debugging "why no Discord"
-        # is otherwise a paper trail of nothing.
+        # is otherwise a paper trail of nothing.  Improvement lines
+        # carry the same detail as the Discord message so the debug
+        # log file is a complete audit trail without scrolling Discord.
+        fit = verdict.fitness
         if verdict.send_notification:
-            self._live_log_msg(
-                f"📈 策略進步 Strategy improvement: composite "
-                f"{verdict.fitness.composite:.3f} (Δ {verdict.delta:+.3f})",
-                "status",
+            detail = (
+                f"📈 策略進步 Strategy improvement: "
+                f"composite {fit.composite:.3f} "
+                f"(前最佳 prev best {verdict.previous_best:.3f}, "
+                f"Δ {verdict.delta:+.3f}) | "
+                f"交易數 trades {fit.total_trades} | "
+                f"勝率 win-rate {fit.win_rate*100:.1f}% | "
+                f"PF {fit.profit_factor:.2f} | "
+                f"Sortino {fit.sortino:.2f} | "
+                f"最大回撤 max DD {fit.max_drawdown_pct*100:.1f}% | "
+                f"來源 source {fit.source}"
             )
+            self._live_log_msg(detail, "status")
+            # Also a copy in the un-prefixed debug log so a `grep
+            # "Strategy improvement"` over debug_YYYYMMDD.log finds it
+            # without the [LIVE] marker getting in the way.
+            _log(detail)
         else:
             self._live_log_msg(
                 f"演化評分 Fitness: composite "
-                f"{verdict.fitness.composite:.3f} — {verdict.reason}",
+                f"{fit.composite:.3f} — {verdict.reason}",
                 "status",
             )
 
