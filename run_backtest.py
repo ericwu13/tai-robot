@@ -4299,7 +4299,15 @@ class BacktestApp:
             self._handle_semi_auto_order(decision)
 
     def _on_live_daily_report(self, report: dict) -> None:
-        """Forward end-of-session daily report to Discord and the live log."""
+        """Forward end-of-session daily report to Discord and the live log.
+
+        After the standard daily-report Discord post, also runs the
+        evolution-notify hook: score the bot's accumulated trades, compare
+        against the persisted baseline, and announce on improvement
+        (issue: strategy-improvement notifications missing). All
+        evolution work is best-effort — daily report must never fail
+        because of fitness scoring or Discord side-effects.
+        """
         date = report.get("date", "?")
         summary = report.get("summary", {}) or {}
         self._live_log_msg(
@@ -4313,6 +4321,94 @@ class BacktestApp:
                 _discord.daily_report(report)
             except Exception:
                 pass  # best-effort; never block on notification failure
+
+        # Evolution: fitness scoring + improvement notification.
+        try:
+            self._run_evolution_check_after_report()
+        except Exception as e:
+            _log(f"evolution notify hook failed: [{type(e).__name__}] {e}")
+
+    def _run_evolution_check_after_report(self) -> None:
+        """Score the running bot and fire a Discord notification on improvement.
+
+        Extracted from ``_on_live_daily_report`` so the broad
+        ``try/except`` wrapping it can't accidentally swallow logic
+        bugs in the daily-report path itself.  Kept private because
+        the only correct call site is the daily-report callback.
+        """
+        if self._live_runner is None:
+            return
+        broker = getattr(self._live_runner, "broker", None)
+        if broker is None:
+            return
+        trades = list(getattr(broker, "trades", []) or [])
+        if not trades:
+            return  # nothing to score yet
+        equity_curve = list(getattr(broker, "equity_curve", []) or [])
+        bot_dir = getattr(self._live_runner, "bot_dir", None)
+        if not bot_dir:
+            return
+
+        from src.evolution.notify import (
+            check_and_notify_after_report,
+            ImprovementVerdict,
+        )
+
+        def _send(verdict: ImprovementVerdict) -> None:
+            if _discord is None or not _discord.enabled:
+                return
+            fit = verdict.fitness
+            _discord.strategy_improved(
+                composite=fit.composite,
+                previous_best=verdict.previous_best,
+                delta=verdict.delta,
+                n_trades=fit.total_trades,
+                sortino=fit.sortino,
+                win_rate=fit.win_rate,
+                profit_factor=fit.profit_factor,
+                max_drawdown_pct=fit.max_drawdown_pct,
+                source=fit.source,
+                first_run=(verdict.previous_best == 0.0
+                          and "first scored" in verdict.reason),
+            )
+
+        verdict = check_and_notify_after_report(
+            bot_dir=bot_dir,
+            trades=trades,
+            equity_curve=equity_curve,
+            trading_mode=getattr(self, "_trading_mode", None),
+            send_notification=_send,
+        )
+        # Mirror the verdict in the live log so the user can see WHY a
+        # notification did or didn't fire — debugging "why no Discord"
+        # is otherwise a paper trail of nothing.  Improvement lines
+        # carry the same detail as the Discord message so the debug
+        # log file is a complete audit trail without scrolling Discord.
+        fit = verdict.fitness
+        if verdict.send_notification:
+            detail = (
+                f"📈 策略進步 Strategy improvement: "
+                f"composite {fit.composite:.3f} "
+                f"(前最佳 prev best {verdict.previous_best:.3f}, "
+                f"Δ {verdict.delta:+.3f}) | "
+                f"交易數 trades {fit.total_trades} | "
+                f"勝率 win-rate {fit.win_rate*100:.1f}% | "
+                f"PF {fit.profit_factor:.2f} | "
+                f"Sortino {fit.sortino:.2f} | "
+                f"最大回撤 max DD {fit.max_drawdown_pct*100:.1f}% | "
+                f"來源 source {fit.source}"
+            )
+            self._live_log_msg(detail, "status")
+            # Also a copy in the un-prefixed debug log so a `grep
+            # "Strategy improvement"` over debug_YYYYMMDD.log finds it
+            # without the [LIVE] marker getting in the way.
+            _log(detail)
+        else:
+            self._live_log_msg(
+                f"演化評分 Fitness: composite "
+                f"{fit.composite:.3f} — {verdict.reason}",
+                "status",
+            )
 
     # ── Semi-auto real order handling ──
 
