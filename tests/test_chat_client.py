@@ -14,6 +14,7 @@ from src.ai.chat_client import (
     GOOGLE_MODEL_FLASH,
     GOOGLE_MODEL_PRO,
     GOOGLE_MODEL_ULTRA,
+    _CONVERSATION_CHAR_LIMIT,
     _classify_model,
     _format_usage_line,
     model_for_tier,
@@ -569,3 +570,69 @@ class TestBuildSummary:
         assert "C" * 100 in summary
         # Total bounded (budget 8000 for tier A, middle messages get small slices)
         assert len(summary) < 20000
+
+
+# ---------------------------------------------------------------------------
+# Conversation auto-truncation tests
+# ---------------------------------------------------------------------------
+
+class TestConversationAutoTruncation:
+
+    def _make_client(self) -> ChatClient:
+        return ChatClient(api_key="test", provider=PROVIDER_ANTHROPIC)
+
+    def test_no_truncation_under_limit(self):
+        client = self._make_client()
+        client.conversation = [
+            {"role": "user", "content": "short"},
+            {"role": "assistant", "content": "reply"},
+        ]
+        client._enforce_conversation_size()
+        assert len(client.conversation) == 2
+
+    def test_truncation_drops_middle_keeps_first_and_tail(self):
+        client = self._make_client()
+        first_msg = {"role": "user", "content": "FIRST_MSG"}
+        # Build a conversation that exceeds _CONVERSATION_CHAR_LIMIT
+        big = "x" * 50_000
+        client.conversation = [first_msg]
+        for i in range(10):
+            client.conversation.append({"role": "assistant", "content": big})
+            client.conversation.append({"role": "user", "content": big})
+        client.conversation.append({"role": "assistant", "content": "LAST_MSG"})
+
+        original_len = len(client.conversation)
+        client._enforce_conversation_size()
+
+        # Should have dropped some middle messages
+        assert len(client.conversation) < original_len
+        # First message preserved
+        assert client.conversation[0]["content"] == "FIRST_MSG"
+        # Last message preserved
+        assert client.conversation[-1]["content"] == "LAST_MSG"
+
+    def test_truncation_preserves_alternating_roles(self):
+        """After truncation the conversation should still make sense —
+        the first message is kept and the tail is kept as-is."""
+        client = self._make_client()
+        # Each message ~25K chars, 10 pairs = ~500K total
+        chunk = "a" * 25_000
+        client.conversation = [{"role": "user", "content": "FIRST"}]
+        for i in range(10):
+            client.conversation.append({"role": "assistant", "content": chunk})
+            client.conversation.append({"role": "user", "content": chunk})
+
+        client._enforce_conversation_size()
+
+        total_chars = sum(len(m.get("content", "")) for m in client.conversation)
+        assert total_chars <= _CONVERSATION_CHAR_LIMIT + 25_000  # one msg can push over
+
+    def test_two_message_conversation_never_truncated(self):
+        """A 2-message conversation is never truncated even if huge."""
+        client = self._make_client()
+        client.conversation = [
+            {"role": "user", "content": "x" * 300_000},
+            {"role": "assistant", "content": "y" * 300_000},
+        ]
+        client._enforce_conversation_size()
+        assert len(client.conversation) == 2
