@@ -385,6 +385,35 @@ def _log(msg):
             pass
 
 
+def _log_debug(msg):
+    """DEBUG-level log for reconnect / watchdog / tick-subscription diagnostics.
+
+    Always captured to the per-session debug log file with both Taipei and
+    local wall-clock timestamps. Printed to console with a ``[DEBUG]`` prefix
+    so it can be filtered with ``grep -v '[DEBUG]'``. NOT pushed to the
+    Tkinter live-event widget so it doesn't drown out user-facing messages.
+
+    Use one of the structured tag prefixes inside ``msg`` to make later
+    triage easier: ``[CONN]``, ``[RECONNECT]``, ``[TICKS]``, ``[WATCHDOG]``,
+    ``[STATE]``.
+    """
+    tpe = _taipei_now()
+    local = datetime.now()
+    ts_tpe = tpe.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    ts_local = local.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    if ts_tpe[:19] == ts_local[:19]:
+        line = f"[{ts_tpe}] [DEBUG] {msg}"
+    else:
+        line = f"[{ts_tpe} TPE / {ts_local} local] [DEBUG] {msg}"
+    print(line, flush=True)
+    if _debug_log_file:
+        try:
+            _debug_log_file.write(line + "\n")
+            _debug_log_file.flush()
+        except Exception:
+            pass
+
+
 # ── COM Event handlers ──
 
 class SKQuoteLibEvents:
@@ -394,10 +423,21 @@ class SKQuoteLibEvents:
     def OnConnection(self, nKind, nCode):
         kind_names = {3001: "Reply", 3002: "Quote", 3003: "Ready",
                       3021: "ConnError", 3033: "Abnormal"}
+        kind_label = kind_names.get(nKind, str(nKind))
         # Only queue.put_nowait() is safe from COM background threads.
         # root.after() is NOT safe — it calls into Tcl/Tk C code which
         # is not thread-safe and corrupts the GIL in Python 3.13.
-        _ui_queue.put_nowait(("log", f"報價連線 QUOTE CONN: {kind_names.get(nKind, nKind)} code={nCode}"))
+        _ui_queue.put_nowait(("log", f"報價連線 QUOTE CONN: {kind_label} code={nCode}"))
+        # Structured DEBUG line per OnConnection event — meaning of each kind
+        # is documented inline so a future debugger can read it cold.
+        meaning = {
+            3001: "Reply — order/reply channel up (intermediate, NOT fully connected)",
+            3002: "Quote — quote channel up (intermediate, waiting for Ready 3003)",
+            3003: "Ready — fully connected, marking quote_connected=True",
+            3021: "ConnError — connection error, triggering disconnect",
+            3033: "Abnormal — abnormal disconnect, triggering disconnect",
+        }.get(nKind, f"unknown kind={nKind}")
+        _ui_queue.put_nowait(("log_debug", f"[CONN] kind={nKind} {kind_label} code={nCode} — {meaning}"))
         if nKind == 3003 and nCode == 0:
             _ui_queue.put_nowait(("conn", "ready"))
         elif nKind == 3002 and nCode == 0:
@@ -541,9 +581,15 @@ class BacktestApp:
                 kind, data = _ui_queue.get_nowait()
                 if kind == "log":
                     _log(data)
+                elif kind == "log_debug":
+                    _log_debug(data)
                 elif kind == "conn":
                     if data == "ready":
-                        self._quote_connected = True
+                        # Ready (3003) is the only state we treat as fully
+                        # connected. Cancel any pending "Quote → Ready"
+                        # watchdog since Ready arrived.
+                        self._cancel_quote_ready_timer("ready_received")
+                        self._set_quote_connected(True, "OnConnection(Ready)")
                         self.btn_api.config(state=tk.NORMAL)
                         self.btn_deploy.config(state=tk.NORMAL)
                         self.btn_login.config(state=tk.DISABLED)
@@ -551,15 +597,13 @@ class BacktestApp:
                         self.status_var.set("已連線 Connected - Ready")
                         self.login_status_var.set("已連線 Connected")
                         self._on_reconnected()
-                    elif data == "quote" and not self._quote_connected:
-                        self._quote_connected = True
-                        self.btn_api.config(state=tk.NORMAL)
-                        self.btn_deploy.config(state=tk.NORMAL)
-                        self.btn_login.config(state=tk.DISABLED)
-                        self.btn_reconnect.config(state=tk.NORMAL)
-                        self.status_var.set("已連線 Connected (Quote) - Ready")
-                        self.login_status_var.set("已連線 Connected")
-                        self._on_reconnected()
+                    elif data == "quote":
+                        # Bug A: Quote (3002) is intermediate, NOT fully
+                        # connected. RequestTicks may return OK on a session
+                        # that only reached Quote, but no ticks ever arrive
+                        # (zombie subscription). Wait for Ready (3003); if
+                        # it never comes, trigger a fresh reconnect attempt.
+                        self._on_quote_intermediate()
                     elif data == "disconnected":
                         self._on_disconnected()
                 elif kind == "account":
@@ -630,11 +674,78 @@ class BacktestApp:
     #  CONNECTION MONITORING & RECONNECTION
     # ══════════════════════════════════════════════════════════════
 
+    def _set_quote_connected(self, value: bool, caller: str) -> None:
+        """Assign self._quote_connected with a [STATE] debug log line.
+
+        Centralising the mutation makes every transition visible in the
+        debug log so a future reconnect-failure post-mortem can see who
+        flipped the flag and when.
+        """
+        old = self._quote_connected
+        if old != value:
+            _log_debug(
+                f"[STATE] _quote_connected: {old!r} -> {value!r} (caller={caller})")
+        self._quote_connected = value
+
+    def _on_quote_intermediate(self) -> None:
+        """Handle Quote (3002) — the intermediate state, not full ready.
+
+        Bug A: Quote alone is NOT enough to call ``_on_reconnected`` —
+        per CLAUDE.md the proper sequence is Reply(3001) → Quote(3002) →
+        Ready(3003). If we resubscribe ticks after only Quote, RequestTicks
+        returns OK but ticks never arrive (zombie subscription). Start a
+        15s timer; if Ready (3003) doesn't follow, treat it as a failed
+        attempt and trigger another reconnect cycle.
+        """
+        self._quote_intermediate_seen_at = time.time()
+        _log_debug(
+            "[CONN] Quote (3002) acknowledged — waiting up to 15s for "
+            "Ready (3003) before resubscribing ticks")
+        self._cancel_quote_ready_timer("quote_intermediate_arm")
+        self._quote_ready_timer_id = self.root.after(
+            15000, self._on_quote_ready_timeout)
+
+    def _on_quote_ready_timeout(self) -> None:
+        """Fired 15s after Quote (3002) if Ready (3003) never arrived.
+
+        Bug A escalation path: warn loudly so the session log shows what
+        happened, then trigger a fresh reconnect attempt rather than
+        sitting on a half-connected session that silently produces no
+        ticks.
+        """
+        self._quote_ready_timer_id = None
+        if self._quote_connected:
+            return  # Ready arrived between fire and now — nothing to do
+        waited = time.time() - (self._quote_intermediate_seen_at or time.time())
+        _log(
+            "報價未就緒 Quote (3002) seen but Ready (3003) did not arrive "
+            f"after {waited:.0f}s — triggering reconnect")
+        _log_debug(
+            f"[CONN] Ready (3003) timeout after {waited:.1f}s — forcing reconnect")
+        # Treat as a connection failure: kick the reconnect ladder so the
+        # GUI re-runs login+EnterMonitor cleanly instead of waiting forever.
+        self._on_disconnected()
+
+    def _cancel_quote_ready_timer(self, reason: str) -> None:
+        """Cancel the Quote→Ready watchdog timer if armed."""
+        if self._quote_ready_timer_id:
+            try:
+                self.root.after_cancel(self._quote_ready_timer_id)
+            except Exception:
+                pass
+            _log_debug(f"[CONN] Quote→Ready timer cancelled (reason={reason})")
+            self._quote_ready_timer_id = None
+            self._quote_intermediate_seen_at = 0.0
+
     def _on_disconnected(self):
         """Handle connection loss: pause live feed, start auto-reconnect."""
         if not self._quote_connected:
+            _log_debug(
+                "[STATE] _on_disconnected called but _quote_connected already False — "
+                "skipping (already handling disconnect)")
             return  # already handling disconnect
-        self._quote_connected = False
+        self._cancel_quote_ready_timer("disconnected")
+        self._set_quote_connected(False, "_on_disconnected")
         self.status_var.set("斷線 Disconnected")
         self.login_status_var.set("斷線 Disconnected")
         self.btn_login.config(state=tk.NORMAL)
@@ -648,6 +759,9 @@ class BacktestApp:
 
         # Start auto-reconnect
         self._conn_monitor.on_disconnected()
+        _log_debug(
+            f"[STATE] ConnectionMonitor: is_active=True, attempt=0 "
+            f"(caller=_on_disconnected)")
         self._schedule_reconnect()
 
     def _manual_reconnect(self):
@@ -656,13 +770,17 @@ class BacktestApp:
         if self._reconnect_timer_id:
             self.root.after_cancel(self._reconnect_timer_id)
             self._reconnect_timer_id = None
+        self._cancel_quote_ready_timer("manual_reconnect")
 
-        self._quote_connected = False
+        self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
         action = self._conn_monitor.on_manual_reconnect()
         self.status_var.set(action.message)
         self.login_status_var.set("重連中 Reconnecting...")
         _log("手動重連 Manual reconnect triggered")
+        _log_debug(
+            "[STATE] ConnectionMonitor: is_active=True, attempt=0 "
+            "(caller=_manual_reconnect)")
 
         self._attempt_reconnect()
 
@@ -696,15 +814,32 @@ class BacktestApp:
             return
 
     def _attempt_reconnect(self):
-        """Try to re-login and reconnect to quote service."""
+        """Try to re-login and reconnect to quote service.
+
+        Bug B: each attempt MUST call ``SKQuoteLib_LeaveMonitor()`` +
+        ``SKCenterLib_LogOut()`` first (best-effort) so we start from a
+        clean COM state. Otherwise login+EnterMonitor stacks on top of a
+        broken session and the server may reach Quote (3002) without ever
+        sending Ready (3003) — exactly the zombie pattern seen in bot
+        session 0422.
+        """
         self._reconnect_timer_id = None
+        attempt_n = self._conn_monitor.attempt + 1  # number we'll attempt now
         if self._quote_connected:
+            _log_debug(
+                f"[RECONNECT] Attempt #{attempt_n} aborted — _quote_connected "
+                "is already True (likely reconnected via another path)")
             return  # already reconnected (e.g. by manual login)
 
         _log(f"嘗試重連 Attempting reconnect #{self._conn_monitor.attempt}")
+        _log_debug(
+            f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
+            "+ LogOut (cleanup) before fresh LoginSetQuote")
 
         try:
             if not _com_available:
+                _log_debug(
+                    f"[RECONNECT] Attempt #{attempt_n} aborted — _com_available=False")
                 self._schedule_reconnect()
                 return
 
@@ -713,51 +848,109 @@ class BacktestApp:
             password = self.login_pass_var.get().strip()
             if not user_id or not password:
                 _log("重連失敗 Reconnect failed: no credentials")
+                _log_debug(
+                    f"[RECONNECT] Attempt #{attempt_n} aborted — no credentials")
                 self._schedule_reconnect()
                 return
 
+            # ── Bug B: best-effort COM teardown before fresh login ──
+            # Both calls swallow errors — the prior session may already be
+            # half-torn-down and these are housekeeping, not gates.
+            try:
+                leave_code = skQ.SKQuoteLib_LeaveMonitor()
+                _log_debug(
+                    f"[RECONNECT] LeaveMonitor returned {leave_code}")
+            except Exception as e:
+                _log_debug(
+                    f"[RECONNECT] LeaveMonitor raised (ignored): "
+                    f"[{type(e).__name__}] {e}")
+            try:
+                logout_code = skC.SKCenterLib_LogOut(user_id)
+                _log_debug(
+                    f"[RECONNECT] LogOut returned {logout_code}")
+            except Exception as e:
+                _log_debug(
+                    f"[RECONNECT] LogOut raised (ignored): "
+                    f"[{type(e).__name__}] {e}")
+            self._logged_in = False
+            _log_debug(
+                f"[RECONNECT] Cleanup done — calling LoginSetQuote")
+
             code = skC.SKCenterLib_LoginSetQuote(user_id, password, "Y")
+            _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
             if code != 0 and code < 2000:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"重連登入失敗 Reconnect login failed: {msg}")
+                _log_debug(
+                    f"[RECONNECT] Attempt #{attempt_n} FAILED at LoginSetQuote — "
+                    f"code={code} msg={msg}")
                 self._schedule_reconnect()
                 return
 
             self._logged_in = True
-            skR.SKReplyLib_ConnectByID(user_id)
-            skQ.SKQuoteLib_EnterMonitorLONG()
+            reply_code = skR.SKReplyLib_ConnectByID(user_id)
+            enter_code = skQ.SKQuoteLib_EnterMonitorLONG()
+            _log_debug(
+                f"[RECONNECT] ConnectByID returned {reply_code}, "
+                f"EnterMonitorLONG returned {enter_code}")
+            _log_debug(
+                f"[RECONNECT] Attempt #{attempt_n} waiting for Ready (3003)...")
 
             # Poll for connection (OnConnection callback will set _quote_connected)
             self.root.after(3000, self._check_reconnection)
 
         except Exception as e:
             _log(f"重連異常 Reconnect error: {e}")
+            _log_debug(
+                f"[RECONNECT] Attempt #{attempt_n} raised: "
+                f"[{type(e).__name__}] {e}")
             self._schedule_reconnect()
 
     def _check_reconnection(self):
         """Poll IsConnected after reconnect login attempt."""
+        attempt_n = self._conn_monitor.attempt
         if self._quote_connected:
+            _log_debug(
+                f"[RECONNECT] Attempt #{attempt_n} SUCCESS — Ready received "
+                "(handled by _on_reconnected via _drain_ui_queue)")
             return  # success, handled by _on_reconnected via _drain_ui_queue
         try:
             ic = skQ.SKQuoteLib_IsConnected()
+            _log_debug(
+                f"[RECONNECT] IsConnected()={ic} after 3s poll "
+                f"(attempt #{attempt_n})")
             if ic == 1:
-                self._quote_connected = True
+                self._set_quote_connected(True, "_check_reconnection(IsConnected==1)")
                 self.btn_api.config(state=tk.NORMAL)
                 self.btn_deploy.config(state=tk.NORMAL)
                 self.btn_login.config(state=tk.DISABLED)
                 self.btn_reconnect.config(state=tk.NORMAL)
                 self.status_var.set("已連線 Connected - Ready")
                 self.login_status_var.set("已連線 Connected")
+                _log_debug(
+                    f"[RECONNECT] Attempt #{attempt_n} SUCCESS — "
+                    "IsConnected==1, fallback path")
                 self._on_reconnected()
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            _log_debug(
+                f"[RECONNECT] IsConnected() raised (ignored): "
+                f"[{type(e).__name__}] {e}")
         # Not connected yet — schedule next reconnect attempt
+        _log_debug(
+            f"[RECONNECT] Attempt #{attempt_n} FAILED — timed out waiting "
+            f"for Ready after 3s, scheduling next attempt")
         self._schedule_reconnect()
 
     def _on_reconnected(self):
         """Handle successful reconnection: re-subscribe ticks if live bot is running."""
         self._conn_monitor.on_connected()
+        _log_debug(
+            "[STATE] ConnectionMonitor: is_active=False, attempt=0 "
+            "(caller=_on_reconnected)")
+        # A successful Ready resets the Bug C warn ladder — any earlier
+        # transient IsConnected!=1 reads are irrelevant once we're back up.
+        self._warn_disconnect_count = 0
         if self._reconnect_timer_id:
             self.root.after_cancel(self._reconnect_timer_id)
             self._reconnect_timer_id = None
@@ -789,13 +982,22 @@ class BacktestApp:
         self._live_history_tick_count = 0
         self._live_stale_drops = 0
         self._live_runner.suppress_strategy = True
+        # Track when this RequestTicks fired so we can log latency to first tick
+        # (and detect zombie subscriptions where no tick arrives).
+        self._ticks_requested_at = time.time()
+        self._first_tick_after_request_logged = False
 
         try:
             result = skQ.SKQuoteLib_RequestTicks(0, com_symbol)
             code = result[0] if isinstance(result, (list, tuple)) else result
+            _log_debug(
+                f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
+                f"subscription sent (retry={_retry})")
             if code != 0 and code >= 3000:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
+                _log_debug(
+                    f"[TICKS] RequestTicks FAILED: code={code} msg={msg}")
                 retry_action = self._conn_monitor.should_retry_resubscribe(_retry)
                 if retry_action:
                     self._live_log_msg(retry_action.message, "status")
@@ -820,6 +1022,8 @@ class BacktestApp:
             self._drain_tick_queue()
         except Exception as e:
             self._live_log_msg(f"重新訂閱異常 Resubscribe error: {e}", "status")
+            _log_debug(
+                f"[TICKS] RequestTicks raised: [{type(e).__name__}] {e}")
 
     # ══════════════════════════════════════════════════════════════
     #  UI BUILD
@@ -861,6 +1065,17 @@ class BacktestApp:
         # Reconnection state
         self._conn_monitor = ConnectionMonitor()
         self._reconnect_timer_id = None
+        # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
+        self._quote_ready_timer_id = None
+        self._quote_intermediate_seen_at: float = 0.0
+        # Bug C: consecutive IsConnected()!=1 readings from the watchdog "warn"
+        # path. Two in a row (30s apart) before we force a disconnect — one
+        # transient bad read shouldn't bypass the resubscribe → reconnect ladder.
+        self._warn_disconnect_count = 0
+        # Track whether the first tick after the latest RequestTicks has
+        # arrived — used to log resubscribe latency / zombie subscriptions.
+        self._ticks_requested_at: float = 0.0
+        self._first_tick_after_request_logged: bool = False
         self._tick_watchdog = TickWatchdog()  # tick health monitoring
         self._live_poll_id = None  # root.after() id for cancellation
         self._live_warmup_mode: bool = False
@@ -2150,7 +2365,7 @@ class BacktestApp:
         try:
             ic = skQ.SKQuoteLib_IsConnected()
             if ic == 1:
-                self._quote_connected = True
+                self._set_quote_connected(True, "_check_connection(IsConnected==1)")
                 self.btn_api.config(state=tk.NORMAL)
                 self.btn_deploy.config(state=tk.NORMAL)
                 self.btn_login.config(state=tk.DISABLED)
@@ -4018,14 +4233,37 @@ class BacktestApp:
         """Delegate tick health check to TickWatchdog and act on the result."""
         wd = self._tick_watchdog
         wd.active = self._live_tick_active
+
+        # Zombie-subscription detection: RequestTicks returned OK but no
+        # tick has arrived. Spot it once per minute past the 60s mark so
+        # the debug log shows the gap explicitly (otherwise it just looks
+        # like a quiet market). Only log during open market hours.
+        if (self._live_tick_active
+                and self._ticks_requested_at
+                and not self._first_tick_after_request_logged
+                and is_market_open()):
+            since_req = time.time() - self._ticks_requested_at
+            if since_req > 60 and int(since_req) % 60 < 35:
+                _log_debug(
+                    f"[TICKS] WARNING: No ticks for {since_req:.0f}s after "
+                    "RequestTicks — possible zombie subscription")
+
         action = wd.check()
+
+        mins = wd.elapsed_minutes()
+        # Per-check telemetry: cheap to grep, lets us reconstruct the watchdog
+        # trajectory across a stale-tick incident from the debug log alone.
+        _log_debug(
+            f"[WATCHDOG] check: elapsed={mins}m action={action!r} "
+            f"active={wd.active} warn_disconnect_count={self._warn_disconnect_count}")
 
         if action is None:
             return
 
-        mins = wd.elapsed_minutes()
-
         if action == "session_resubscribe":
+            _log_debug(
+                f"[WATCHDOG] action=session_resubscribe — new session, "
+                "calling _resubscribe_ticks()")
             _log("Tick watchdog: session transition — resubscribing for new session")
             self._live_log_msg(
                 "新盤重新訂閱 New session — re-subscribing ticks", "status")
@@ -4037,6 +4275,9 @@ class BacktestApp:
             self._tick_watchdog.on_session_resubscribe()
 
         elif action == "reconnect":
+            _log_debug(
+                f"[WATCHDOG] action=reconnect — elapsed={mins}m > RECONNECT_TIMEOUT, "
+                "forcing _on_disconnected()")
             _log(f"Tick watchdog: no ticks for {mins}m, forcing full reconnect")
             self._live_log_msg(
                 f"強制重連 Force reconnect — no ticks for {mins}m", "status")
@@ -4047,6 +4288,9 @@ class BacktestApp:
                     self._on_disconnected()
 
         elif action == "resubscribe":
+            _log_debug(
+                f"[WATCHDOG] Entering resubscribe path "
+                f"(elapsed={mins}m > RESUBSCRIBE_TIMEOUT)")
             _log(f"Tick watchdog: no ticks for {mins}m, re-subscribing")
             self._live_log_msg(
                 f"重新訂閱 Re-subscribing ticks — no ticks for {mins}m", "status")
@@ -4056,14 +4300,49 @@ class BacktestApp:
             self._live_log_msg(
                 f"警告 No ticks for {mins}m — connection may be lost", "status")
             _log(f"Tick watchdog: no ticks for {mins}m")
-            # Check if COM connection is alive
+            _log_debug(
+                f"[WATCHDOG] action=warn — elapsed={mins}m > WARN_TIMEOUT, "
+                "probing IsConnected() (will require 2 consecutive bad reads "
+                "before forcing disconnect)")
+            # Bug C: the old code immediately called _on_disconnected() on any
+            # IsConnected()!=1 reading, bypassing the resubscribe→reconnect
+            # ladder TickWatchdog was designed to drive. The watchdog already
+            # escalates to "resubscribe" at 5min and "reconnect" at 10min;
+            # the IsConnected probe is only a tie-breaker. Require TWO
+            # consecutive bad reads (≈30s apart on the 30s schedule_status_update
+            # cadence) before short-circuiting to disconnect. One bad read alone
+            # is treated as noise and the ladder is allowed to continue.
             if _com_available:
                 try:
                     ic = skQ.SKQuoteLib_IsConnected()
-                    if ic != 1:
+                except Exception as e:
+                    ic = None
+                    _log_debug(
+                        f"[WATCHDOG] IsConnected() raised: "
+                        f"[{type(e).__name__}] {e} — treating as bad read")
+                if ic == 1:
+                    if self._warn_disconnect_count:
+                        _log_debug(
+                            f"[WATCHDOG] IsConnected()=1 — resetting "
+                            f"warn_disconnect_count "
+                            f"(was {self._warn_disconnect_count})")
+                    self._warn_disconnect_count = 0
+                else:
+                    self._warn_disconnect_count += 1
+                    _log_debug(
+                        f"[WATCHDOG] IsConnected()={ic} — "
+                        f"warn_disconnect_count={self._warn_disconnect_count}/2")
+                    if self._warn_disconnect_count >= 2:
+                        _log_debug(
+                            f"[WATCHDOG] IsConnected()={ic} for 2 consecutive "
+                            "warn checks — forcing disconnect")
+                        self._warn_disconnect_count = 0
                         self._on_disconnected()
-                except Exception:
-                    self._on_disconnected()
+                    else:
+                        _log_debug(
+                            "[WATCHDOG] One bad IsConnected() read — "
+                            "deferring to watchdog ladder (will re-check "
+                            "in ~30s)")
 
     def _drain_tick_queue(self):
         """Drain pending ticks from _tick_queue on the main thread.
@@ -4109,6 +4388,23 @@ class BacktestApp:
         if not is_history or not self._live_history_done:
             # Update watchdog: live ticks always, history ticks only during replay
             self._tick_watchdog.on_tick()
+            # A real tick means the COM session is alive — clear Bug C's
+            # warn-shortcut counter so a transient IsConnected glitch
+            # earlier doesn't carry over.
+            if self._warn_disconnect_count:
+                _log_debug(
+                    f"[WATCHDOG] real tick received — resetting "
+                    f"warn_disconnect_count (was {self._warn_disconnect_count})")
+                self._warn_disconnect_count = 0
+            # Log first tick after a RequestTicks so we can spot zombie
+            # subscriptions (RequestTicks returned OK but no tick ever came).
+            if (self._ticks_requested_at
+                    and not self._first_tick_after_request_logged):
+                self._first_tick_after_request_logged = True
+                latency = time.time() - self._ticks_requested_at
+                _log_debug(
+                    f"[TICKS] First tick received after resubscription "
+                    f"({latency:.2f}s since RequestTicks)")
 
         # Convert SK date/time integers to datetime FIRST — we need the
         # timestamp for the staleness check below (issue #50 fix).
@@ -4299,7 +4595,15 @@ class BacktestApp:
             self._handle_semi_auto_order(decision)
 
     def _on_live_daily_report(self, report: dict) -> None:
-        """Forward end-of-session daily report to Discord and the live log."""
+        """Forward end-of-session daily report to Discord and the live log.
+
+        After the standard daily-report Discord post, also runs the
+        evolution-notify hook: score the bot's accumulated trades, compare
+        against the persisted baseline, and announce on improvement
+        (issue: strategy-improvement notifications missing). All
+        evolution work is best-effort — daily report must never fail
+        because of fitness scoring or Discord side-effects.
+        """
         date = report.get("date", "?")
         summary = report.get("summary", {}) or {}
         self._live_log_msg(
@@ -4313,6 +4617,94 @@ class BacktestApp:
                 _discord.daily_report(report)
             except Exception:
                 pass  # best-effort; never block on notification failure
+
+        # Evolution: fitness scoring + improvement notification.
+        try:
+            self._run_evolution_check_after_report()
+        except Exception as e:
+            _log(f"evolution notify hook failed: [{type(e).__name__}] {e}")
+
+    def _run_evolution_check_after_report(self) -> None:
+        """Score the running bot and fire a Discord notification on improvement.
+
+        Extracted from ``_on_live_daily_report`` so the broad
+        ``try/except`` wrapping it can't accidentally swallow logic
+        bugs in the daily-report path itself.  Kept private because
+        the only correct call site is the daily-report callback.
+        """
+        if self._live_runner is None:
+            return
+        broker = getattr(self._live_runner, "broker", None)
+        if broker is None:
+            return
+        trades = list(getattr(broker, "trades", []) or [])
+        if not trades:
+            return  # nothing to score yet
+        equity_curve = list(getattr(broker, "equity_curve", []) or [])
+        bot_dir = getattr(self._live_runner, "bot_dir", None)
+        if not bot_dir:
+            return
+
+        from src.evolution.notify import (
+            check_and_notify_after_report,
+            ImprovementVerdict,
+        )
+
+        def _send(verdict: ImprovementVerdict) -> None:
+            if _discord is None or not _discord.enabled:
+                return
+            fit = verdict.fitness
+            _discord.strategy_improved(
+                composite=fit.composite,
+                previous_best=verdict.previous_best,
+                delta=verdict.delta,
+                n_trades=fit.total_trades,
+                sortino=fit.sortino,
+                win_rate=fit.win_rate,
+                profit_factor=fit.profit_factor,
+                max_drawdown_pct=fit.max_drawdown_pct,
+                source=fit.source,
+                first_run=(verdict.previous_best == 0.0
+                          and "first scored" in verdict.reason),
+            )
+
+        verdict = check_and_notify_after_report(
+            bot_dir=bot_dir,
+            trades=trades,
+            equity_curve=equity_curve,
+            trading_mode=getattr(self, "_trading_mode", None),
+            send_notification=_send,
+        )
+        # Mirror the verdict in the live log so the user can see WHY a
+        # notification did or didn't fire — debugging "why no Discord"
+        # is otherwise a paper trail of nothing.  Improvement lines
+        # carry the same detail as the Discord message so the debug
+        # log file is a complete audit trail without scrolling Discord.
+        fit = verdict.fitness
+        if verdict.send_notification:
+            detail = (
+                f"📈 策略進步 Strategy improvement: "
+                f"composite {fit.composite:.3f} "
+                f"(前最佳 prev best {verdict.previous_best:.3f}, "
+                f"Δ {verdict.delta:+.3f}) | "
+                f"交易數 trades {fit.total_trades} | "
+                f"勝率 win-rate {fit.win_rate*100:.1f}% | "
+                f"PF {fit.profit_factor:.2f} | "
+                f"Sortino {fit.sortino:.2f} | "
+                f"最大回撤 max DD {fit.max_drawdown_pct*100:.1f}% | "
+                f"來源 source {fit.source}"
+            )
+            self._live_log_msg(detail, "status")
+            # Also a copy in the un-prefixed debug log so a `grep
+            # "Strategy improvement"` over debug_YYYYMMDD.log finds it
+            # without the [LIVE] marker getting in the way.
+            _log(detail)
+        else:
+            self._live_log_msg(
+                f"演化評分 Fitness: composite "
+                f"{fit.composite:.3f} — {verdict.reason}",
+                "status",
+            )
 
     # ── Semi-auto real order handling ──
 
