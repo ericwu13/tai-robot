@@ -28,8 +28,11 @@ DEFAULT_MODELS = {
 }
 
 # Tiered Gemini models — used by callers that want to pick light vs heavy reasoning.
+# ``ultra`` is reserved for the most capable model; only used when ``ultra_mode``
+# is enabled (via settings.yaml ``ai.ultra_mode`` or env ``ULTRA_MODE=1``).
 GOOGLE_MODEL_PRO = "gemini-2.5-pro"
 GOOGLE_MODEL_FLASH = "gemini-2.5-flash"
+GOOGLE_MODEL_ULTRA = "gemini-3.1-pro"
 
 # Auto-truncate conversation when its total char size exceeds this threshold
 # in send_message().  The first message is always kept; the most recent N
@@ -65,19 +68,66 @@ def _resolve_usage_log_path() -> str:
     return str(Path(__file__).resolve().parents[2] / "data" / "ai_usage.csv")
 
 
-def model_for_tier(provider: str, tier: str) -> str | None:
+def resolve_ultra_mode(settings_value: bool = False) -> bool:
+    """Resolve the effective ultra_mode flag.
+
+    Env var ``ULTRA_MODE`` overrides the settings value when set
+    (``1``/``true``/``yes``/``on`` → True, anything else → False).
+    Otherwise falls back to ``settings_value``.
+    """
+    env = os.environ.get("ULTRA_MODE", "").strip()
+    if env:
+        return env.lower() in ("1", "true", "yes", "on")
+    return bool(settings_value)
+
+
+def model_for_tier(provider: str, tier: str, ultra_mode: bool = False) -> str | None:
     """Return a tier-appropriate model override, or None to use the user default.
 
-    ``tier`` is ``"light"`` (cheap/fast: chat, recap) or ``"heavy"``
-    (quality matters: codegen, trade review).  For non-Google providers we
-    return None so the user-configured model is preserved (Anthropic users pick
-    their own model in settings).
+    ``tier`` is one of:
+      * ``"light"`` — cheap/fast (chat, recap) → always flash
+      * ``"heavy"`` — quality matters (codegen, trade review) → pro by default,
+        or the ultra model when ``ultra_mode`` is True
+      * ``"ultra"`` — always the ultra model (explicit opt-in regardless of flag)
+
+    For non-Google providers we return None so the user-configured model is
+    preserved (Anthropic users pick their own model in settings).
     """
     if provider == PROVIDER_GOOGLE:
         if tier == "light":
             return GOOGLE_MODEL_FLASH
+        if tier == "ultra":
+            return GOOGLE_MODEL_ULTRA
+        # tier == "heavy" (or anything else): respect ultra_mode flag
+        if ultra_mode:
+            return GOOGLE_MODEL_ULTRA
         return GOOGLE_MODEL_PRO
     return None
+
+
+def _classify_model(model: str) -> tuple[str, str]:
+    """Return ``(short_name, mode)`` for the usage-line footer.
+
+    ``short_name`` is a compact tag (flash/pro/sonnet/...).
+    ``mode`` is ``"ultra"`` when the model matches the configured ultra model
+    string, else ``"standard"``.  Derived from the model name so the footer
+    stays in sync with what was actually called, regardless of how the caller
+    resolved tiers.
+    """
+    m = (model or "").lower()
+    if m == GOOGLE_MODEL_ULTRA.lower():
+        return ("pro", "ultra")
+    if "flash" in m:
+        return ("flash", "standard")
+    if "pro" in m:
+        return ("pro", "standard")
+    if "sonnet" in m:
+        return ("sonnet", "standard")
+    if "opus" in m:
+        return ("opus", "standard")
+    if "haiku" in m:
+        return ("haiku", "standard")
+    return (model or "unknown", "standard")
 
 
 def _log_token_usage(
@@ -138,7 +188,8 @@ def _log_token_usage(
 
 
 def _format_usage_line(input_tokens: int, output_tokens: int,
-                       reasoning_tokens: int, total_tokens: int) -> str:
+                       reasoning_tokens: int, total_tokens: int,
+                       model: str = "") -> str:
     """One-line token-usage summary appended to the assistant response so the
     user can see per-call spend in the chat UI without leaving the window.
 
@@ -146,8 +197,12 @@ def _format_usage_line(input_tokens: int, output_tokens: int,
     """
     if total_tokens <= 0:
         return ""
-    return (f"\n\n📊 tokens: {input_tokens:,} in / {output_tokens:,} out / "
+    line = (f"\n\n📊 tokens: {input_tokens:,} in / {output_tokens:,} out / "
             f"{reasoning_tokens:,} reasoning (total: {total_tokens:,})")
+    if model:
+        short, mode = _classify_model(model)
+        line += f" | model: {short} | mode: {mode}"
+    return line
 
 
 def _extract_anthropic_usage(data: dict) -> tuple[int, int, int, int]:
@@ -307,7 +362,7 @@ class ChatClient:
         # Conversation history holds the raw response — the usage line is
         # caller-only so it doesn't bloat future API requests.
         self.conversation.append({"role": "assistant", "content": assistant_text})
-        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok, used_model)
         return assistant_text
 
     def _send_google(self, user_message: str, *, call_site: str, model: str | None) -> str:
@@ -376,7 +431,7 @@ class ChatClient:
 
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
             assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
-        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok, used_model)
 
         return assistant_text
 
@@ -444,7 +499,7 @@ class ChatClient:
             input_tokens=in_tok, output_tokens=out_tok,
             reasoning_tokens=think_tok, total_tokens=tot_tok,
         )
-        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok, used_model)
         return assistant_text
 
     def _one_shot_google(self, user_message: str, system_prompt: str = "",
@@ -492,7 +547,7 @@ class ChatClient:
 
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
             assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
-        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok)
+        assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok, used_model)
 
         return assistant_text
 

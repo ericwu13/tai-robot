@@ -5,10 +5,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import os
+
 from src.ai.chat_client import (
     ChatClient,
     PROVIDER_ANTHROPIC,
     PROVIDER_GOOGLE,
+    GOOGLE_MODEL_FLASH,
+    GOOGLE_MODEL_PRO,
+    GOOGLE_MODEL_ULTRA,
+    _classify_model,
+    _format_usage_line,
+    model_for_tier,
+    resolve_ultra_mode,
 )
 
 
@@ -318,6 +327,109 @@ class TestChatClientGeneral:
 
         payload = client._client.post.call_args[1]["json"]
         assert "system" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Model tiering + ultra_mode tests
+# ---------------------------------------------------------------------------
+
+class TestModelForTier:
+
+    def test_light_always_flash(self):
+        assert model_for_tier(PROVIDER_GOOGLE, "light") == GOOGLE_MODEL_FLASH
+        assert model_for_tier(PROVIDER_GOOGLE, "light", ultra_mode=True) == GOOGLE_MODEL_FLASH
+
+    def test_heavy_standard_returns_pro(self):
+        assert model_for_tier(PROVIDER_GOOGLE, "heavy") == GOOGLE_MODEL_PRO
+        assert model_for_tier(PROVIDER_GOOGLE, "heavy", ultra_mode=False) == GOOGLE_MODEL_PRO
+
+    def test_heavy_with_ultra_mode_returns_ultra(self):
+        assert model_for_tier(PROVIDER_GOOGLE, "heavy", ultra_mode=True) == GOOGLE_MODEL_ULTRA
+
+    def test_ultra_tier_always_ultra(self):
+        # Explicit ultra tier ignores the ultra_mode flag.
+        assert model_for_tier(PROVIDER_GOOGLE, "ultra") == GOOGLE_MODEL_ULTRA
+        assert model_for_tier(PROVIDER_GOOGLE, "ultra", ultra_mode=False) == GOOGLE_MODEL_ULTRA
+
+    def test_non_google_provider_returns_none(self):
+        # Anthropic users pick their own model in settings; tier resolution
+        # must not override it.
+        assert model_for_tier(PROVIDER_ANTHROPIC, "light") is None
+        assert model_for_tier(PROVIDER_ANTHROPIC, "heavy", ultra_mode=True) is None
+
+
+class TestResolveUltraMode:
+
+    def setup_method(self):
+        self._saved_env = os.environ.pop("ULTRA_MODE", None)
+
+    def teardown_method(self):
+        os.environ.pop("ULTRA_MODE", None)
+        if self._saved_env is not None:
+            os.environ["ULTRA_MODE"] = self._saved_env
+
+    def test_default_false(self):
+        assert resolve_ultra_mode() is False
+        assert resolve_ultra_mode(False) is False
+
+    def test_settings_true(self):
+        assert resolve_ultra_mode(True) is True
+
+    def test_env_var_overrides_to_true(self):
+        os.environ["ULTRA_MODE"] = "1"
+        assert resolve_ultra_mode(False) is True
+
+    def test_env_var_overrides_to_false(self):
+        # When settings say True but env explicitly disables, env wins.
+        os.environ["ULTRA_MODE"] = "0"
+        assert resolve_ultra_mode(True) is False
+
+    def test_env_var_truthy_strings(self):
+        for v in ("1", "true", "TRUE", "yes", "on"):
+            os.environ["ULTRA_MODE"] = v
+            assert resolve_ultra_mode(False) is True, f"expected True for {v!r}"
+
+    def test_env_var_empty_falls_back_to_settings(self):
+        os.environ["ULTRA_MODE"] = ""
+        assert resolve_ultra_mode(True) is True
+        assert resolve_ultra_mode(False) is False
+
+
+class TestClassifyModel:
+
+    def test_flash(self):
+        assert _classify_model("gemini-2.5-flash") == ("flash", "standard")
+
+    def test_pro_standard(self):
+        assert _classify_model("gemini-2.5-pro") == ("pro", "standard")
+
+    def test_ultra_model(self):
+        # The ultra model still has "pro" in its name; mode disambiguates.
+        assert _classify_model(GOOGLE_MODEL_ULTRA) == ("pro", "ultra")
+
+    def test_anthropic_sonnet(self):
+        assert _classify_model("claude-sonnet-4-20250514") == ("sonnet", "standard")
+
+
+class TestUsageLineFooter:
+
+    def test_includes_model_and_mode(self):
+        line = _format_usage_line(100, 50, 25, 175, model="gemini-2.5-pro")
+        assert "| model: pro" in line
+        assert "| mode: standard" in line
+
+    def test_ultra_model_shows_ultra_mode(self):
+        line = _format_usage_line(100, 50, 25, 175, model=GOOGLE_MODEL_ULTRA)
+        assert "| model: pro" in line
+        assert "| mode: ultra" in line
+
+    def test_empty_when_total_zero(self):
+        assert _format_usage_line(0, 0, 0, 0, model="gemini-2.5-pro") == ""
+
+    def test_no_model_no_suffix(self):
+        line = _format_usage_line(100, 50, 25, 175)
+        assert "tokens:" in line
+        assert "| model:" not in line
 
 
 # ---------------------------------------------------------------------------

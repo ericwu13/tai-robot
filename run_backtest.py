@@ -78,7 +78,8 @@ from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
 # AI modules
 from src.ai.chat_client import (
     ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS,
-    model_for_tier,
+    GOOGLE_MODEL_PRO, GOOGLE_MODEL_ULTRA,
+    model_for_tier, resolve_ultra_mode,
 )
 from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT, CODE_GEN_SYSTEM_PROMPT, CHAT_RECAP_PROMPT
 from src.ai.code_sandbox import (
@@ -272,6 +273,15 @@ def _load_settings():
             cfg["ai_model"] = ai.get("model", "")
             cfg["ai_max_tokens"] = ai.get("max_tokens", 16384)
             cfg["recap_token_gate"] = ai.get("recap_token_gate", 30)
+            # ultra_mode: settings.yaml ai.ultra_mode (default False); env
+            # ULTRA_MODE=1 overrides at runtime.  When ON, "heavy" tier callers
+            # (codegen, trade review, pine export) get the ultra model instead
+            # of gemini-2.5-pro.
+            cfg["ultra_mode"] = resolve_ultra_mode(ai.get("ultra_mode", False))
+            if cfg["ultra_mode"]:
+                print(f"[AI] ultra_mode=ON — heavy tier using {GOOGLE_MODEL_ULTRA}")
+            else:
+                print(f"[AI] ultra_mode=OFF — heavy tier using {GOOGLE_MODEL_PRO}")
             # Notifications
             notif = data.get("notifications", {})
             cfg["discord_bot_token"] = notif.get("discord_bot_token", "")
@@ -1626,7 +1636,8 @@ class BacktestApp:
         # Use a one-shot API call (not the chat conversation) to avoid bloat
         client = self._chat_client
         codegen_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
@@ -1713,7 +1724,8 @@ class BacktestApp:
         retry_msg = summary_section + error_msg + "\n\n" + STRATEGY_CODE_CONTEXT
         remaining = retries_left - 1
         codegen_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
@@ -1763,9 +1775,11 @@ class BacktestApp:
 
         source = self._ai_strategy_source
 
+        ultra = self._settings.get("ultra_mode", False)
+
         def _worker():
             try:
-                pine = export_to_pine(self._chat_client, source)
+                pine = export_to_pine(self._chat_client, source, ultra_mode=ultra)
                 self.root.after(0, lambda: self._show_pine_popup(pine))
             except Exception as e:
                 _log(f"Pine export error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -3293,7 +3307,8 @@ class BacktestApp:
         self._append_chat("system", f"Analyzing {total_trades} trades...")
 
         review_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
@@ -3354,7 +3369,8 @@ class BacktestApp:
         )
 
         review_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
