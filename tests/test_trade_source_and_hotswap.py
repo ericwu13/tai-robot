@@ -327,13 +327,17 @@ class TestReportSourceSplit:
                   source="paper"),
         ]
         report = generate_daily_report("2026-06-11", trades, save=False)
-        assert len(report["paper_trades"]) == 2
+        # "paper" = full simulated view (ALL trades, including real-mirrored
+        # ones); "real" = only the subset executed at the broker.
+        assert len(report["paper_trades"]) == 3
         assert len(report["real_trades"]) == 1
         assert report["paper_summary"] is not None
         assert report["real_summary"] is not None
         # Original keys preserved
         assert len(report["trades"]) == 3
         assert report["summary"] is not None
+        # paper view == full simulated view
+        assert report["paper_summary"]["total_pnl"] == report["summary"]["total_pnl"]
 
     def test_all_paper_trades(self, tmp_path):
         from src.daily_report.report_generator import generate_daily_report
@@ -359,6 +363,26 @@ class TestReportSourceSplit:
         assert len(report["paper_trades"]) == 1
         assert len(report["real_trades"]) == 0
 
+    def test_all_real_session_paper_includes_everything(self, tmp_path):
+        # Pure semi_auto/auto session: every trade tagged "real". The paper
+        # (simulated) view must still cover all of them, not be empty.
+        from src.daily_report.report_generator import generate_daily_report
+        trades = [
+            Trade(tag="L1", side=OrderSide.LONG, qty=1,
+                  entry_price=20000, exit_price=20100, entry_bar_index=0,
+                  exit_bar_index=1, pnl=20000, exit_dt="2026-06-11 10:00",
+                  source="real"),
+            Trade(tag="L2", side=OrderSide.LONG, qty=1,
+                  entry_price=20100, exit_price=20050, entry_bar_index=2,
+                  exit_bar_index=3, pnl=-10000, exit_dt="2026-06-11 11:00",
+                  source="real"),
+        ]
+        report = generate_daily_report("2026-06-11", trades, save=False)
+        assert len(report["paper_trades"]) == 2
+        assert report["paper_summary"]["total_pnl"] == 10000
+        assert len(report["real_trades"]) == 2
+        assert report["real_summary"]["total_pnl"] == 10000
+
     def test_trade_to_dict_includes_source(self):
         from src.daily_report.report_generator import _trade_to_dict
         t = Trade(tag="L", side=OrderSide.LONG, qty=1,
@@ -383,7 +407,8 @@ class TestLiveRunnerSummary:
                   pnl=40000, source="real"))
         summary = runner._summary()
         assert summary["trades"] == 2
-        assert summary["paper_trades"] == 1
-        assert summary["paper_pnl"] == 20000
+        # paper = full simulated view (all trades); real = real subset
+        assert summary["paper_trades"] == 2
+        assert summary["paper_pnl"] == 60000
         assert summary["real_trades"] == 1
         assert summary["real_pnl"] == 40000
