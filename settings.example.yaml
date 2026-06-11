@@ -59,3 +59,13 @@ ai:
   # most capable model (gemini-3.1-pro) instead of gemini-2.5-pro.  Costs more.
   # Env var ULTRA_MODE=1 overrides this at runtime.
   ultra_mode: false
+
+evolution:
+  # When the automatic fitness/improvement check runs:
+  #   "weekly" (default) — only on the trading week's LAST session, i.e. the
+  #     Friday night session that closes Saturday ~05:00 TPE. Daily sessions
+  #     rarely cross the 30-trade minimum, so daily scoring is gated noise.
+  #   "daily" — every session end (the pre-2.12 behavior).
+  # The 🧬 Bot Evolution button generates an AI improvement plan on demand
+  # regardless of this setting.
+  cadence: "weekly"

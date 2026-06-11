@@ -293,6 +293,11 @@ def _load_settings():
             # Trading
             trading = data.get("trading", {})
             cfg["allow_live_override"] = trading.get("allow_live_override", False)
+            # Evolution: "weekly" (default) = fitness/improvement check only
+            # on the trading week's last session (Sat AM close); "daily" =
+            # every session end (the pre-2.12 behavior).
+            evo = data.get("evolution", {})
+            cfg["evolution_cadence"] = evo.get("cadence", "weekly")
             break
     return cfg
 
@@ -1296,16 +1301,20 @@ class BacktestApp:
                                      command=self._review_trades, state=tk.DISABLED)
         self.btn_review.grid(row=0, column=8, padx=3, pady=1, sticky=tk.W)
 
+        self.btn_evolution = ttk.Button(btn_frame, text="🧬 進化 Evolution",
+                                        command=self._bot_evolution, state=tk.DISABLED)
+        self.btn_evolution.grid(row=0, column=9, padx=3, pady=1, sticky=tk.W)
+
         self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
                                      command=self._report_issue)
-        self.btn_report.grid(row=0, column=9, padx=3, pady=1, sticky=tk.W)
+        self.btn_report.grid(row=0, column=10, padx=3, pady=1, sticky=tk.W)
 
         # Wrap toolbar buttons onto extra rows when the frame is too
         # narrow for a single row (grid does not auto-wrap).
         self._toolbar_widgets = [
             self.btn_tv, self.btn_api, self.btn_taifex, self.btn_deploy,
             self.btn_chart_all, self.btn_export, self.btn_toggle_settings,
-            tf_frame, self.btn_review, self.btn_report,
+            tf_frame, self.btn_review, self.btn_evolution, self.btn_report,
         ]
         self._toolbar_last_width = 0
         btn_frame.bind("<Configure>", self._reflow_toolbar)
@@ -2859,6 +2868,7 @@ class BacktestApp:
         self.btn_export.config(state=tk.NORMAL)
         if result.trades:
             self.btn_review.config(state=tk.NORMAL)
+            self.btn_evolution.config(state=tk.NORMAL)
         if _LWC_AVAILABLE and result.trades:
             self.btn_chart_all.config(state=tk.NORMAL)
         self.status_var.set(
@@ -3246,42 +3256,13 @@ class BacktestApp:
           explicit instruction to now analyze all trades together. This
           preserves full context no matter how many trades there are.
         """
-        result = (self._live_runner.get_result()
-                  if self._live_runner and self._live_runner.state != LiveState.IDLE
-                  else self._last_result)
-        if not result or not result.trades:
+        payload = self._gather_analysis_payload()
+        if payload is None:
             self.status_var.set("無交易紀錄 No trades to review")
             return
         if not self._ensure_chat_client():
             return
-
-        # Build report + timeframe line + strategy source
-        report = format_report(result.strategy_name, result.metrics)
-        strategy_name = self.strategy_var.get()
-        strategy_cls = STRATEGIES.get(strategy_name)
-        timeframe_line = self._build_review_timeframe_line(strategy_cls)
-        strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
-
-        source_section = ""
-        if strategy_source:
-            source_section = (
-                f"\n\n策略原始碼 Strategy Source Code:\n"
-                f"```python\n{strategy_source}\n```"
-            )
-
-        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
-        # handle thousands of rows; chunked mode below handles the rest.
-        trade_lines = []
-        for i, t in enumerate(result.trades, 1):
-            bars_held = t.exit_bar_index - t.entry_bar_index
-            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
-            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
-            trade_lines.append(
-                f"  {i}. {t.side.value} {t.tag}: "
-                f"entry={entry_dt} @{t.entry_price:,} → "
-                f"exit={exit_dt} @{t.exit_price:,} "
-                f"P&L={t.pnl:+,} ({bars_held} bars)"
-            )
+        result, report, timeframe_line, source_section, trade_lines = payload
 
         # Detect degradation vs previous review round
         cur_pf = result.metrics.profit_factor
@@ -3345,7 +3326,55 @@ class BacktestApp:
             f"{timeframe_line}\n"
         )
 
-        # Estimate context size to decide single-shot vs chunked mode
+        self._dispatch_trade_analysis(
+            preamble, trade_lines, source_section, len(result.trades),
+            label="AI Review: 請分析以下交易紀錄", call_site="trade_review")
+
+    def _gather_analysis_payload(self):
+        """Shared data assembly for AI Review and Bot Evolution.
+
+        Returns ``(result, report, timeframe_line, source_section,
+        trade_lines)`` or None when there are no trades.
+        """
+        result = (self._live_runner.get_result()
+                  if self._live_runner and self._live_runner.state != LiveState.IDLE
+                  else self._last_result)
+        if not result or not result.trades:
+            return None
+
+        report = format_report(result.strategy_name, result.metrics)
+        strategy_name = self.strategy_var.get()
+        strategy_cls = STRATEGIES.get(strategy_name)
+        timeframe_line = self._build_review_timeframe_line(strategy_cls)
+        strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
+
+        source_section = ""
+        if strategy_source:
+            source_section = (
+                f"\n\n策略原始碼 Strategy Source Code:\n"
+                f"```python\n{strategy_source}\n```"
+            )
+
+        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
+        # handle thousands of rows; chunked mode handles the rest.
+        trade_lines = []
+        for i, t in enumerate(result.trades, 1):
+            bars_held = t.exit_bar_index - t.entry_bar_index
+            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
+            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
+            src_mark = " [real]" if getattr(t, "source", "") == "real" else ""
+            trade_lines.append(
+                f"  {i}. {t.side.value} {t.tag}: "
+                f"entry={entry_dt} @{t.entry_price:,} → "
+                f"exit={exit_dt} @{t.exit_price:,} "
+                f"P&L={t.pnl:+,} ({bars_held} bars){src_mark}"
+            )
+        return result, report, timeframe_line, source_section, trade_lines
+
+    def _dispatch_trade_analysis(self, preamble: str, trade_lines: list[str],
+                                 source_section: str, total_trades: int,
+                                 label: str, call_site: str) -> None:
+        """Route to single-shot or chunked delivery based on estimated size."""
         trade_block_chars = sum(len(line) + 1 for line in trade_lines)  # +1 for newline
         estimated_total = (
             len(preamble)
@@ -3360,19 +3389,23 @@ class BacktestApp:
                 preamble=preamble,
                 trade_lines=trade_lines,
                 source_section=source_section,
-                total_trades=len(result.trades),
+                total_trades=total_trades,
+                label=label, call_site=call_site,
             )
         else:
             self._review_trades_chunked(
                 preamble=preamble,
                 trade_lines=trade_lines,
                 source_section=source_section,
-                total_trades=len(result.trades),
+                total_trades=total_trades,
                 estimated_chars=estimated_total,
+                label=label, call_site=call_site,
             )
 
     def _review_trades_single_shot(self, preamble: str, trade_lines: list[str],
-                                     source_section: str, total_trades: int) -> None:
+                                     source_section: str, total_trades: int,
+                                     label: str = "AI Review: 請分析以下交易紀錄",
+                                     call_site: str = "trade_review") -> None:
         """Send the full AI Review in a single API call."""
         context = (
             preamble
@@ -3381,7 +3414,7 @@ class BacktestApp:
             + source_section
         )
 
-        self._append_chat("user", "AI Review: 請分析以下交易紀錄\n" + context)
+        self._append_chat("user", label + "\n" + context)
         self.btn_send.config(state=tk.DISABLED)
         self._append_chat("system", f"Analyzing {total_trades} trades...")
 
@@ -3392,7 +3425,7 @@ class BacktestApp:
         def _worker():
             try:
                 response = self._chat_client.send_message(
-                    context, call_site="trade_review", model=review_model)
+                    context, call_site=call_site, model=review_model)
                 # Replace the trade-dump user turn with a stub so the trade
                 # data does not pollute future send_message() calls (issue: AI
                 # cost runaway because send_message re-sends full history).
@@ -3411,7 +3444,9 @@ class BacktestApp:
 
     def _review_trades_chunked(self, preamble: str, trade_lines: list[str],
                                  source_section: str, total_trades: int,
-                                 estimated_chars: int) -> None:
+                                 estimated_chars: int,
+                                 label: str = "AI Review: 請分析以下交易紀錄",
+                                 call_site: str = "trade_review") -> None:
         """Send AI Review in multiple user messages when the trade list is too large.
 
         Flow:
@@ -3435,7 +3470,7 @@ class BacktestApp:
 
         # GUI feedback: a single summary bubble rather than repeating every batch
         summary_line = (
-            f"AI Review: 請分析以下交易紀錄 "
+            f"{label} "
             f"({total_trades} trades, ~{estimated_chars // 1000}K chars, "
             f"split into {K} parts for API size safety)"
         )
@@ -3513,7 +3548,7 @@ class BacktestApp:
                     )
 
                     response = self._chat_client.send_message(
-                        msg, call_site=f"trade_review_chunk_{batch_idx}/{K}",
+                        msg, call_site=f"{call_site}_chunk_{batch_idx}/{K}",
                         model=review_model,
                     )
 
@@ -3552,6 +3587,112 @@ class BacktestApp:
                 self.root.after(0, lambda: self._on_chat_error(err_msg))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _bot_evolution(self):
+        """🧬 Bot Evolution — ask the AI for a structured improvement plan.
+
+        Differs from AI Review in two ways: the prompt includes the
+        evolution fitness context (composite score, baseline best,
+        real-vs-simulated split), and the AI is asked for a concrete
+        keep/tune/redesign PLAN with validation and revert criteria —
+        not a free-form trade analysis. On-demand counterpart to the
+        weekly automatic fitness check.
+        """
+        payload = self._gather_analysis_payload()
+        if payload is None:
+            self.status_var.set("無交易紀錄 No trades for evolution")
+            return
+        if not self._ensure_chat_client():
+            return
+        result, report, timeframe_line, source_section, trade_lines = payload
+
+        evolution_context = self._build_evolution_context(result)
+
+        preamble = (
+            f"🧬 Bot Evolution — 策略演化計畫\n"
+            f"以下是累積的交易數據與演化適應度評分，請產出一份具體的策略演化計畫。\n"
+            f"Below are accumulated trades and the evolution fitness score. "
+            f"Produce a concrete Evolution Plan.\n\n"
+            f"{evolution_context}"
+            f"## Required output structure (MUST FOLLOW)\n"
+            f"1. **表現總結 Performance summary** — 2-3 sentences covering the data "
+            f"period; if [real] trades exist, compare simulated vs real performance.\n"
+            f"2. **有效部分 What's working** — 2-3 aspects that must NOT be changed.\n"
+            f"3. **問題診斷 Diagnosis** — the single biggest weakness, with evidence "
+            f"from specific trades (cite trade numbers from the list).\n"
+            f"4. **演化計畫 Evolution plan** — EXACTLY ONE concrete change: one "
+            f"parameter (state old → new value) OR one structural change. MANDATORY: "
+            f"scan the trade list and estimate \"removes ~N losers, ~M winners\". "
+            f"If the sample is too small (composite gated / fewer than 30 trades), "
+            f"the correct plan is「繼續收集數據，暫不修改 continue collecting data, "
+            f"no change」— say so explicitly.\n"
+            f"5. **驗證與回退 Validation & revert** — how to verify the change "
+            f"(backtest period, which metric must improve by how much) and the "
+            f"condition under which to revert.\n\n"
+            f"## Rules\n"
+            f"- ONE change maximum. Over-optimization is the #1 cause of strategy "
+            f"degradation.\n"
+            f"- If metrics are acceptable (PF > 1.3, DD < 25%, WR > 40%), the plan "
+            f"is「不修改，繼續運行 no change — keep running」.\n"
+            f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
+            f"instead.\n"
+            f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
+            f"{report}\n\n"
+            f"{timeframe_line}\n"
+        )
+
+        self._dispatch_trade_analysis(
+            preamble, trade_lines, source_section, len(result.trades),
+            label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
+
+    def _build_evolution_context(self, result) -> str:
+        """Fitness + baseline + source-split context block for Bot Evolution."""
+        lines = ["## 演化現況 Evolution Context"]
+        trades = result.trades
+        first_dt = next((t.entry_dt for t in trades if t.entry_dt), "")
+        last_dt = next((t.exit_dt for t in reversed(trades) if t.exit_dt), "")
+        if first_dt or last_dt:
+            lines.append(f"- 資料期間 Data range: {first_dt} → {last_dt} "
+                         f"({len(trades)} trades)")
+
+        real = [t for t in trades if getattr(t, "source", "") == "real"]
+        if real:
+            lines.append(
+                f"- 模擬全視圖 Simulated (all): {len(trades)} trades, "
+                f"P&L {sum(t.pnl for t in trades):+,} | "
+                f"實單 Real subset: {len(real)} trades, "
+                f"P&L {sum(t.pnl for t in real):+,}")
+
+        try:
+            from src.evolution.notify import (
+                score_session_for_notification, load_baseline)
+            live = (self._live_runner is not None
+                    and self._live_runner.state != LiveState.IDLE)
+            fit = score_session_for_notification(
+                trades,
+                equity_curve=list(getattr(result, "equity_curve", []) or []) or None,
+                trading_mode=self._trading_mode if live else "backtest")
+            gate_note = (
+                "（⚠ 交易數不足30筆，composite 被 gating 為 0 — "
+                "結論信心度低 below MIN_TRADES, treat conclusions as "
+                "low-confidence）" if fit.gated else "")
+            lines.append(
+                f"- 適應度 Fitness composite: {fit.composite:.3f} {gate_note}| "
+                f"Sortino {fit.sortino:.2f} | PF {fit.profit_factor:.2f} | "
+                f"勝率 WR {fit.win_rate*100:.1f}% | "
+                f"最大回撤 DD {fit.max_drawdown_pct*100:.1f}% | "
+                f"來源 source {fit.source}")
+            if live and getattr(self._live_runner, "bot_dir", None):
+                baseline = load_baseline(self._live_runner.bot_dir)
+                if baseline is not None:
+                    lines.append(
+                        f"- 歷史最佳 Baseline best composite: "
+                        f"{baseline.best_composite:.3f} "
+                        f"(recorded {baseline.best_recorded_at})")
+        except Exception as e:
+            _log(f"evolution context build failed: [{type(e).__name__}] {e}")
+
+        return "\n".join(lines) + "\n\n"
 
     # ══════════════════════════════════════════════════════════════
     #  LIVE TRADING METHODS
@@ -4782,8 +4923,15 @@ class BacktestApp:
 
         from src.evolution.notify import (
             check_and_notify_after_report,
+            should_run_evolution_check,
             ImprovementVerdict,
         )
+
+        cadence = self._settings.get("evolution_cadence", "weekly")
+        if not should_run_evolution_check(cadence):
+            _log(f"evolution check skipped: cadence={cadence}, "
+                 f"not the week's last session window (Sat TPE)")
+            return
 
         def _send(verdict: ImprovementVerdict) -> None:
             if _discord is None or not _discord.enabled:
@@ -5655,6 +5803,7 @@ class BacktestApp:
         if result.trades:
             self.btn_export.config(state=tk.NORMAL)
             self.btn_review.config(state=tk.NORMAL)
+            self.btn_evolution.config(state=tk.NORMAL)
 
         # Update trade list and metrics
         self._display_results(result, bars)
@@ -5749,6 +5898,18 @@ class BacktestApp:
             _log(f"即時機器人已停止 Live bot stopped: {summary}")
             if _discord and _discord.enabled:
                 _discord.bot_stopped(summary['trades'], summary['pnl'])
+
+            # Run the evolution check NOW, while _live_runner is still set.
+            # The daily-report callback is queued via root.after(0) and runs
+            # after _live_runner is nulled below, so its evolution hook
+            # early-returns on manual stop — without this direct call a
+            # Saturday-morning stop would silently skip the weekly check.
+            # Safe to double-fire: re-scoring the same trades against a
+            # just-written baseline yields delta 0 → no duplicate notify.
+            try:
+                self._run_evolution_check_after_report()
+            except Exception as e:
+                _log(f"evolution check on stop failed: [{type(e).__name__}] {e}")
 
             # Update final results then clear runner so subsequent backtests
             # use _last_bars/_last_result instead of stale live data.
