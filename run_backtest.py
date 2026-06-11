@@ -332,6 +332,18 @@ def _save_ai_settings(provider: str = "", anthropic_key: str = "",
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
 
+def _evolution_omitted_count(total_trades: int, watermark: dict | None) -> int:
+    """How many leading trades a previous evolution run already covered.
+
+    Clamped to ``total_trades`` so a stale watermark from a longer
+    earlier session (or a reset session reusing the bot dir) can never
+    produce a negative window.
+    """
+    if not watermark:
+        return 0
+    return min(int(watermark.get("trade_count", 0) or 0), total_trades)
+
+
 def _ultra_toggle_decision(current: bool, confirm) -> bool | None:
     """Guard logic for the Ultra Mode toggle button.
 
@@ -2967,7 +2979,8 @@ class BacktestApp:
             header_lines.append(f" 1分K / 聚合K  1m/Agg:  {status['bars_1m']} / {status['bars_agg']}")
         self.metrics_text.insert(tk.END, "\n".join(header_lines) + "\n\n")
 
-        report = format_report(result.strategy_name, result.metrics)
+        report = format_report(result.strategy_name, result.metrics,
+                               trades=result.trades)
         self.metrics_text.insert(tk.END, report)
 
         # Trade list
@@ -3392,7 +3405,8 @@ class BacktestApp:
         if not result or not result.trades:
             return None
 
-        report = format_report(result.strategy_name, result.metrics)
+        report = format_report(result.strategy_name, result.metrics,
+                               trades=result.trades)
         strategy_name = self.strategy_var.get()
         strategy_cls = STRATEGIES.get(strategy_name)
         timeframe_line = self._build_review_timeframe_line(strategy_cls)
@@ -3656,7 +3670,35 @@ class BacktestApp:
             return
         result, report, timeframe_line, source_section, trade_lines = payload
 
-        evolution_context = self._build_evolution_context(result)
+        # Exclude trades a previous evolution run already analyzed —
+        # re-sending them invites re-justifying changes from the same
+        # sample. Aggregate metrics + fitness still cover the full
+        # history; only the per-trade list is windowed.
+        watermark = None
+        live = (self._live_runner is not None
+                and self._live_runner.state != LiveState.IDLE)
+        bot_dir = getattr(self._live_runner, "bot_dir", None) if live else None
+        if bot_dir:
+            from src.evolution.notify import load_watermark
+            watermark = load_watermark(bot_dir)
+        omitted = _evolution_omitted_count(len(trade_lines), watermark)
+        if watermark and omitted >= len(trade_lines):
+            # Nothing new since the last evolution — evolving on the
+            # same sample is overfitting bait. Allow an explicit re-run.
+            if not messagebox.askyesno(
+                    "Bot Evolution",
+                    f"上次演化（{watermark['at']}）後沒有新交易。\n"
+                    f"No new trades since the last evolution "
+                    f"({watermark['trade_count']} trades covered).\n\n"
+                    f"沒有新數據的演化容易過擬合。仍要以完整歷史重新執行嗎？\n"
+                    f"Evolving without new data risks overfitting. "
+                    f"Re-run on the full history anyway?"):
+                return
+            omitted = 0  # user chose a full-history re-run
+        sent_lines = trade_lines[omitted:]
+
+        evolution_context = self._build_evolution_context(
+            result, watermark=watermark, omitted_count=omitted)
 
         preamble = (
             f"🧬 Bot Evolution — 策略演化計畫\n"
@@ -3692,26 +3734,31 @@ class BacktestApp:
         )
 
         self._dispatch_trade_analysis(
-            preamble, trade_lines, source_section, len(result.trades),
+            preamble, sent_lines, source_section, len(sent_lines),
             label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
 
-        # Advance the evolution watermark: these trades have now been fed
-        # to an evolution run. High-water mark, not per-trade flags —
-        # broker.trades is append-only so the count identifies the set.
-        # Written at request time; if the API call later fails the only
-        # cost is that the next run frames fewer trades as "new" (the
-        # full list is always resent regardless).
-        if (self._live_runner is not None
-                and self._live_runner.state != LiveState.IDLE
-                and getattr(self._live_runner, "bot_dir", None)):
+        # Advance the evolution watermark: ALL current trades are now
+        # covered (the omitted ones were covered by the previous run).
+        # High-water mark, not per-trade flags — broker.trades is
+        # append-only so the count identifies the set. Written at
+        # request time; if the API call later fails the only cost is
+        # that those trades won't be re-sent to the next run.
+        if bot_dir:
             try:
                 from src.evolution.notify import save_watermark
-                save_watermark(self._live_runner.bot_dir, len(result.trades))
+                save_watermark(bot_dir, len(result.trades))
             except Exception as e:
                 _log(f"evolution watermark save failed: [{type(e).__name__}] {e}")
 
-    def _build_evolution_context(self, result) -> str:
-        """Fitness + baseline + source-split context block for Bot Evolution."""
+    def _build_evolution_context(self, result, watermark: dict | None = None,
+                                 omitted_count: int = 0) -> str:
+        """Fitness + baseline + source-split context block for Bot Evolution.
+
+        ``omitted_count`` > 0 means the first N trades were already
+        analyzed by a previous evolution run and are EXCLUDED from the
+        trade list being sent — the context must say so, since the
+        aggregate metrics still cover the full history.
+        """
         lines = ["## 演化現況 Evolution Context"]
         trades = result.trades
         first_dt = next((t.entry_dt for t in trades if t.entry_dt), "")
@@ -3728,9 +3775,25 @@ class BacktestApp:
                 f"實單 Real subset: {len(real)} trades, "
                 f"P&L {sum(t.pnl for t in real):+,}")
 
+        if omitted_count > 0 and watermark:
+            new_trades = trades[omitted_count:]
+            lines.append(
+                f"- 上次演化 Last evolution: {watermark['at']} — trades "
+                f"#1–#{omitted_count} were already analyzed then and are "
+                f"OMITTED from the trade list below. The aggregate metrics "
+                f"and fitness in this message still cover ALL "
+                f"{len(trades)} trades.")
+            lines.append(
+                f"- 新交易 New since last evolution: {len(new_trades)} "
+                f"trades (#{omitted_count + 1}–#{len(trades)}), "
+                f"P&L {sum(t.pnl for t in new_trades):+,} — the trade list "
+                f"below contains ONLY these. If a strategy change was "
+                f"applied after the last evolution, judge that change on "
+                f"these trades.")
+
         try:
             from src.evolution.notify import (
-                score_session_for_notification, load_baseline, load_watermark)
+                score_session_for_notification, load_baseline)
             live = (self._live_runner is not None
                     and self._live_runner.state != LiveState.IDLE)
             fit = score_session_for_notification(
@@ -3754,35 +3817,6 @@ class BacktestApp:
                         f"- 歷史最佳 Baseline best composite: "
                         f"{baseline.best_composite:.3f} "
                         f"(recorded {baseline.best_recorded_at})")
-
-                # New-vs-already-analyzed framing: tell the AI which
-                # trades arrived since the last evolution run so the
-                # last change is judged on fresh data, not by
-                # re-diagnosing trades that already drove prior plans.
-                wm = load_watermark(self._live_runner.bot_dir)
-                if wm and 0 < wm["trade_count"] < len(trades):
-                    n_prev = wm["trade_count"]
-                    new_trades = trades[n_prev:]
-                    lines.append(
-                        f"- 上次演化 Last evolution: {wm['at']} — covered "
-                        f"trades #1–#{n_prev}. NEW since then: "
-                        f"{len(new_trades)} trades "
-                        f"(#{n_prev + 1}–#{len(trades)}), "
-                        f"P&L {sum(t.pnl for t in new_trades):+,}")
-                    lines.append(
-                        "- 評估規則 Evaluation rule: trades #1–"
-                        f"#{n_prev} already informed the previous "
-                        "evolution plan. If a strategy change was applied "
-                        "after it, judge that change PRIMARILY on the NEW "
-                        "trades — the older ones reflect the previous "
-                        "strategy version. Do NOT re-justify a new change "
-                        "using only already-analyzed trades.")
-                elif wm and wm["trade_count"] >= len(trades):
-                    lines.append(
-                        f"- 上次演化 Last evolution: {wm['at']} — covered "
-                        f"all {wm['trade_count']} trades; NO new trades "
-                        f"since then. The correct plan is to wait for new "
-                        f"data unless a code bug is evident.")
         except Exception as e:
             _log(f"evolution context build failed: [{type(e).__name__}] {e}")
 

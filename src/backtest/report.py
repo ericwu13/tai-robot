@@ -9,7 +9,13 @@ from .broker import Trade
 from .metrics import PerformanceMetrics
 
 
-def format_report(strategy_name: str, metrics: PerformanceMetrics) -> str:
+def format_report(strategy_name: str, metrics: PerformanceMetrics,
+                  trades: list[Trade] | None = None) -> str:
+    """Format the metrics block; when ``trades`` is given and any carry a
+    real-order tag, append a 實單/模擬 source-split section. The headline
+    numbers are the full simulated view (paper = all trades, including
+    real-mirrored ones); the split shows the broker-executed subset.
+    """
     m = metrics
     pf_str = f"{m.profit_factor:.2f}" if m.profit_factor != float("inf") else "INF"
     lines = [
@@ -38,8 +44,20 @@ def format_report(strategy_name: str, metrics: PerformanceMetrics) -> str:
         f" \u6700\u5927\u56de\u64a4% Max Drawdown %:     {m.max_drawdown_pct:>11.2f}%",
         f" \u590f\u666e\u6bd4\u7387 Sharpe Ratio:        {m.sharpe_ratio:>12.2f}",
         f" \u5e73\u5747\u6301\u5009 Avg Bars Held:       {m.avg_bars_held:>12.1f}",
-        "=" * 60,
     ]
+    if trades:
+        real = [t for t in trades if getattr(t, "source", "") == "real"]
+        if real:
+            real_pnl = sum(t.pnl for t in real)
+            real_wins = sum(1 for t in real if t.pnl > 0)
+            lines.extend([
+                "-" * 60,
+                f" \u5be6\u55ae\u4ea4\u6613 Real Trades:         {len(real):>12}",
+                f" \u5be6\u55ae\u640d\u76ca Real P&L:            {real_pnl:>12,}",
+                f" \u5be6\u55ae\u52dd\u7387 Real Win Rate:       {real_wins / len(real) * 100:>11.1f}%",
+                " (\u4ee5\u4e0a\u7e3d\u8a08\u70ba\u6a21\u64ec\u5168\u8996\u5716 totals above = simulated view, all trades)",
+            ])
+    lines.append("=" * 60)
     return "\n".join(lines)
 
 
