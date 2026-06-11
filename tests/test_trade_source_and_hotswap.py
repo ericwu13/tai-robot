@@ -263,6 +263,47 @@ class TestApplyModeSwitch:
         assert runner.trading_mode == "paper"
         assert runner.broker.trade_source == "paper"
 
+    def test_auto_to_semi_auto_switch(self, tmp_path):
+        runner = self._make_runner(tmp_path, "auto")
+        runner._apply_mode_switch("semi_auto")
+        assert runner.trading_mode == "semi_auto"
+        assert runner.broker.trade_source == "real"
+
+    def test_auto_to_paper_switch(self, tmp_path):
+        runner = self._make_runner(tmp_path, "auto")
+        runner._apply_mode_switch("paper")
+        assert runner.trading_mode == "paper"
+        assert runner.broker.trade_source == "paper"
+
+    def test_veto_blocks_switch(self, tmp_path):
+        # Simulates the GUI's fill_pending guard: an exit order in
+        # flight leaves position_size==0, so only the veto can block.
+        runner = self._make_runner(tmp_path, "auto")
+        runner.mode_switch_veto = lambda: "real order fill pending"
+        statuses = []
+        runner.on("on_status", lambda msg: statuses.append(msg))
+        runner._apply_mode_switch("semi_auto")
+        assert runner.trading_mode == "auto"
+        assert runner.broker.trade_source == "real"
+        assert any("fill pending" in s for s in statuses)
+
+    def test_veto_none_allows_switch(self, tmp_path):
+        runner = self._make_runner(tmp_path, "auto")
+        runner.mode_switch_veto = lambda: None
+        runner._apply_mode_switch("semi_auto")
+        assert runner.trading_mode == "semi_auto"
+
+    def test_veto_applies_to_file_override_path(self, tmp_path):
+        runner = self._make_runner(tmp_path, "auto")
+        runner.mode_switch_veto = lambda: "real order fill pending"
+        override_path = os.path.join(runner.bot_dir, "mode_override.json")
+        with open(override_path, "w") as f:
+            json.dump({"trading_mode": "paper"}, f)
+        new_mode = runner._check_mode_override()
+        assert new_mode == "paper"
+        runner._apply_mode_switch(new_mode)
+        assert runner.trading_mode == "auto"  # vetoed
+
 
 # ---------------------------------------------------------------------------
 # Feature 3: Report Split by Source
