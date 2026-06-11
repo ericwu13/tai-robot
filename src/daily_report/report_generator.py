@@ -130,14 +130,15 @@ def generate_daily_report(
     if bars_highs and bars_lows and bars_closes:
         regime = classify_regime(bars_highs, bars_lows, bars_closes)
 
-    # Split trades by source for separate summaries
-    paper_trades = [t for t in trades if getattr(t, "source", "") in ("paper", "")]
+    # Split semantics: "paper" = the full simulated view — EVERY trade has a
+    # simulated fill, including those mirrored to real orders in
+    # semi_auto/auto mode. "real" = the subset actually executed at the
+    # broker (source == "real"). A pure semi_auto session therefore has
+    # paper_trades == trades (not an empty paper bucket).
+    paper_trades = list(trades)
     real_trades = [t for t in trades if getattr(t, "source", "") == "real"]
 
-    paper_summary = None
-    if paper_trades:
-        paper_eq = _build_equity_curve(paper_trades)
-        paper_summary = _metrics_to_dict(calculate_metrics(paper_trades, paper_eq, initial_balance=0))
+    paper_summary = _metrics_to_dict(metrics) if paper_trades else None
 
     real_summary = None
     if real_trades:

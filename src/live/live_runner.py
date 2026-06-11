@@ -877,13 +877,15 @@ class LiveRunner:
 
     def _summary(self) -> dict:
         all_trades = self.broker.trades
-        paper = [t for t in all_trades if t.source in ("paper", "")]
+        # "paper" = the full simulated view (every trade has a simulated
+        # fill, including real-mirrored ones); "real" = the subset that
+        # was actually executed at the broker.
         real = [t for t in all_trades if t.source == "real"]
         return {
             "trades": len(all_trades),
             "pnl": sum(t.pnl for t in all_trades),
-            "paper_trades": len(paper),
-            "paper_pnl": sum(t.pnl for t in paper),
+            "paper_trades": len(all_trades),
+            "paper_pnl": sum(t.pnl for t in all_trades),
             "real_trades": len(real),
             "real_pnl": sum(t.pnl for t in real),
             "bars_1m": len(self._seen_1m_dts),
