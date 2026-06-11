@@ -44,11 +44,21 @@ def _trade_to_dict(t: Trade, point_value: int = 1) -> dict:
         "exit_tag": getattr(t, "exit_tag", ""),
         "real_entry_price": getattr(t, "real_entry_price", 0) or None,
         "real_exit_price": getattr(t, "real_exit_price", 0) or None,
+        "source": getattr(t, "source", ""),
     }
 
 
 def _metrics_to_dict(m: PerformanceMetrics) -> dict:
     return asdict(m)
+
+
+def _build_equity_curve(trades: list[Trade]) -> list[int]:
+    curve = []
+    cumulative = 0
+    for t in trades:
+        cumulative += t.pnl
+        curve.append(cumulative)
+    return curve
 
 
 def _group_trades_by_date(trades: list[Trade]) -> dict[str, list[Trade]]:
@@ -120,6 +130,20 @@ def generate_daily_report(
     if bars_highs and bars_lows and bars_closes:
         regime = classify_regime(bars_highs, bars_lows, bars_closes)
 
+    # Split trades by source for separate summaries
+    paper_trades = [t for t in trades if getattr(t, "source", "") in ("paper", "")]
+    real_trades = [t for t in trades if getattr(t, "source", "") == "real"]
+
+    paper_summary = None
+    if paper_trades:
+        paper_eq = _build_equity_curve(paper_trades)
+        paper_summary = _metrics_to_dict(calculate_metrics(paper_trades, paper_eq, initial_balance=0))
+
+    real_summary = None
+    if real_trades:
+        real_eq = _build_equity_curve(real_trades)
+        real_summary = _metrics_to_dict(calculate_metrics(real_trades, real_eq, initial_balance=0))
+
     report = {
         "date": date,
         "symbol": symbol,
@@ -136,6 +160,10 @@ def generate_daily_report(
         },
         "trades": [_trade_to_dict(t, point_value) for t in trades],
         "summary": _metrics_to_dict(metrics),
+        "paper_trades": [_trade_to_dict(t, point_value) for t in paper_trades],
+        "paper_summary": paper_summary,
+        "real_trades": [_trade_to_dict(t, point_value) for t in real_trades],
+        "real_summary": real_summary,
         "market_regime": regime.to_dict() if regime else None,
     }
 

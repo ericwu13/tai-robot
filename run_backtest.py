@@ -53,6 +53,7 @@ from src.utils.log_redact import (
     redact_future_rights as _redact_future_rights,
 )
 from src.backtest.engine import BacktestEngine
+from src.backtest.broker import _mode_to_source
 from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
@@ -276,6 +277,9 @@ def _load_settings():
             notif = data.get("notifications", {})
             cfg["discord_bot_token"] = notif.get("discord_bot_token", "")
             cfg["discord_channel_id"] = notif.get("discord_channel_id", "")
+            # Trading
+            trading = data.get("trading", {})
+            cfg["allow_live_override"] = trading.get("allow_live_override", False)
             break
     return cfg
 
@@ -3806,7 +3810,10 @@ class BacktestApp:
         )
         self._live_runner.acquire_lock()
         self._live_runner.trading_mode = trading_mode
+        self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
+        self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
+        self._live_runner.on_mode_changed = self._on_mode_changed
 
         # Open debug log file in bot directory
         _open_debug_log(self._live_runner.bot_dir)
@@ -4555,6 +4562,10 @@ class BacktestApp:
                 self._update_live_status()
 
     # ── Live UI updates ──
+
+    def _on_mode_changed(self, old_mode: str, new_mode: str) -> None:
+        """Callback from LiveRunner when trading mode changes via hot-swap."""
+        self._trading_mode = new_mode
 
     def _on_live_bar(self, bar):
         """Callback when an aggregated bar is processed."""

@@ -217,7 +217,8 @@ def _normalize(metrics: dict[str, float]) -> dict[str, float]:
 # fitness when promotion decisions are made.
 SOURCE_BACKTEST = "backtest"
 SOURCE_PAPER = "paper"
-VALID_SOURCES = (SOURCE_BACKTEST, SOURCE_PAPER)
+SOURCE_REAL = "real"
+VALID_SOURCES = (SOURCE_BACKTEST, SOURCE_PAPER, SOURCE_REAL)
 
 
 @dataclass

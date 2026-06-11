@@ -34,6 +34,7 @@ from .fitness import (
     FitnessResult,
     SOURCE_BACKTEST,
     SOURCE_PAPER,
+    SOURCE_REAL,
     compute_fitness_from_trades,
 )
 
@@ -106,6 +107,8 @@ def _trading_mode_to_source(trading_mode: str | None) -> str:
     """
     if trading_mode == "backtest":
         return SOURCE_BACKTEST
+    if trading_mode in ("semi_auto", "auto"):
+        return SOURCE_REAL
     return SOURCE_PAPER
 
 
