@@ -1364,9 +1364,18 @@ class BacktestApp:
         ttk.Label(bot_name_frame, text="|").pack(side=tk.LEFT, padx=4)
         ttk.Label(bot_name_frame, text="模式 Mode:").pack(side=tk.LEFT, padx=(0, 4))
         self.trading_mode_var = tk.StringVar(value="--")
-        self.trading_mode_label = ttk.Label(bot_name_frame, textvariable=self.trading_mode_var,
-                                             font=("Consolas", 10, "bold"))
-        self.trading_mode_label.pack(side=tk.LEFT)
+        self._mode_combo_values = ["模擬 Paper", "半自動 Semi-Auto", "全自動 Auto"]
+        self._mode_combo_to_key = {
+            "模擬 Paper": "paper", "半自動 Semi-Auto": "semi_auto", "全自動 Auto": "auto",
+        }
+        self._mode_key_to_combo = {v: k for k, v in self._mode_combo_to_key.items()}
+        self.mode_combo = ttk.Combobox(
+            bot_name_frame, textvariable=self.trading_mode_var,
+            values=self._mode_combo_values, state=tk.DISABLED,
+            width=18, font=("Consolas", 10, "bold"),
+        )
+        self.mode_combo.pack(side=tk.LEFT)
+        self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_combo_changed)
 
         # Status panel
         status_panel = ttk.LabelFrame(live_frame, text="即時狀態 Live Status", padding=6)
@@ -3707,8 +3716,9 @@ class BacktestApp:
         self._trading_guard.reset()
         self._fill_poller.reset()
         self.bot_name_var.set(bot_name)
-        _MODE_LABELS = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto", "auto": "全自動 Auto"}
-        self.trading_mode_var.set(_MODE_LABELS.get(trading_mode, trading_mode))
+        combo_label = self._mode_key_to_combo.get(trading_mode, trading_mode)
+        self.trading_mode_var.set(combo_label)
+        self.mode_combo.config(state="readonly")
 
         # If resuming, restore strategy + symbol from saved session
         if resume_session:
@@ -4563,9 +4573,25 @@ class BacktestApp:
 
     # ── Live UI updates ──
 
+    def _on_mode_combo_changed(self, event=None) -> None:
+        """User picked a new mode from the dropdown."""
+        label = self.trading_mode_var.get()
+        new_mode = self._mode_combo_to_key.get(label)
+        if not new_mode or not self._live_runner:
+            return
+        if new_mode == self._trading_mode:
+            return
+        old_mode = self._trading_mode
+        self._live_runner._apply_mode_switch(new_mode)
+        if self._trading_mode == old_mode:
+            # Switch was rejected — revert combo to current mode
+            self.trading_mode_var.set(self._mode_key_to_combo.get(old_mode, old_mode))
+
     def _on_mode_changed(self, old_mode: str, new_mode: str) -> None:
         """Callback from LiveRunner when trading mode changes via hot-swap."""
         self._trading_mode = new_mode
+        combo_label = self._mode_key_to_combo.get(new_mode, new_mode)
+        self.trading_mode_var.set(combo_label)
 
     def _on_live_bar(self, bar):
         """Callback when an aggregated bar is processed."""
@@ -5636,6 +5662,7 @@ class BacktestApp:
         self.strategy_combo.config(state="readonly")
         self.bot_name_var.set("(未設定 Not set)")
         self.trading_mode_var.set("--")
+        self.mode_combo.config(state=tk.DISABLED)
         self.status_var.set("就緒 Ready")
 
 
