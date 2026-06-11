@@ -282,6 +282,13 @@ class LiveRunner:
         # Hot-swap mode switching (Feature 2)
         self._allow_live_override: bool = False
         self.on_mode_changed: Callable[[str, str], None] | None = None
+        # Optional external veto: returns a reason string to block the
+        # switch, or None to allow it. The GUI wires this to the
+        # TradingGuard so a switch can't happen while a real order is
+        # in flight (fill_pending) — LiveRunner itself only sees the
+        # simulated position, which is already flat once an exit order
+        # has been sent.
+        self.mode_switch_veto: Callable[[], str | None] | None = None
 
         # Daily-report dedupe key: (date_str, "DAY"|"NIGHT") of the last
         # session for which a report was emitted. Prevents the 30s
@@ -366,6 +373,12 @@ class LiveRunner:
             self._emit("on_status",
                         f"[MODE] cannot switch {self.trading_mode}→{new_mode}: open position exists, close it first")
             return
+        if self.mode_switch_veto is not None:
+            reason = self.mode_switch_veto()
+            if reason:
+                self._emit("on_status",
+                            f"[MODE] cannot switch {self.trading_mode}→{new_mode}: {reason}")
+                return
         old = self.trading_mode
         self.trading_mode = new_mode
         self.broker.trade_source = _mode_to_source(new_mode)
