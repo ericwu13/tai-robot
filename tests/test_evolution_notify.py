@@ -20,6 +20,8 @@ from src.evolution.fitness import FitnessResult, SOURCE_BACKTEST, SOURCE_PAPER, 
 from src.evolution.notify import (
     Baseline,
     BASELINE_FILENAME,
+    EVOLUTION_CADENCE_DAILY,
+    EVOLUTION_CADENCE_WEEKLY,
     IMPROVEMENT_DELTA,
     ImprovementVerdict,
     baseline_path,
@@ -28,6 +30,7 @@ from src.evolution.notify import (
     load_baseline,
     save_baseline,
     score_session_for_notification,
+    should_run_evolution_check,
 )
 
 
@@ -304,3 +307,47 @@ class TestCheckAndNotifyAfterReport:
         )
         assert verdict.send_notification is True
         assert (tmp_path / BASELINE_FILENAME).exists()
+
+
+class TestEvolutionCadence:
+    """should_run_evolution_check — weekly gate for the fitness check.
+
+    2026-06-13 is a Saturday; 2026-06-12 a Friday; 2026-06-08 a Monday.
+    """
+
+    def test_daily_always_runs(self):
+        for day in range(8, 15):  # Mon 06-08 .. Sun 06-14
+            assert should_run_evolution_check(
+                EVOLUTION_CADENCE_DAILY, datetime(2026, 6, day, 13, 45))
+
+    def test_weekly_runs_on_saturday_morning(self):
+        # The week's last session: Friday night close, Sat 04:58 TPE
+        assert should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, 13, 4, 58))
+
+    def test_weekly_runs_on_saturday_manual_stop(self):
+        # Manual stop later Saturday morning still counts
+        assert should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, 13, 9, 30))
+
+    def test_weekly_skips_weekday_session_ends(self):
+        # Mon-Fri day close (13:45) and night close windows must not fire
+        for day in (8, 9, 10, 11, 12):  # Mon..Fri
+            assert not should_run_evolution_check(
+                EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, day, 13, 45))
+            assert not should_run_evolution_check(
+                EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, day, 4, 58))
+
+    def test_weekly_skips_sunday(self):
+        assert not should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, 14, 10, 0))
+
+    def test_tz_aware_now_converted_to_taipei(self):
+        # Friday 21:30 UTC == Saturday 05:30 TPE -> weekly window
+        assert should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY,
+            datetime(2026, 6, 12, 21, 30, tzinfo=timezone.utc))
+
+    def test_unknown_cadence_degrades_to_daily(self):
+        # A typo in settings must not silently disable evolution forever
+        assert should_run_evolution_check("weekIy-typo", datetime(2026, 6, 9, 13, 45))

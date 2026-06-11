@@ -51,6 +51,36 @@ IMPROVEMENT_DELTA = 0.05
 # / decisions.csv / bars_1m_*.csv, no migration story needed.
 BASELINE_FILENAME = "evolution.json"
 
+# ── Evolution cadence ──
+EVOLUTION_CADENCE_DAILY = "daily"
+EVOLUTION_CADENCE_WEEKLY = "weekly"
+
+
+def should_run_evolution_check(cadence: str, now: datetime | None = None) -> bool:
+    """Gate the fitness/improvement check by configured cadence.
+
+    "weekly" → run only on TPE Saturday. The trading week's final
+    session is Friday's night session, which closes Saturday ~05:00
+    TPE, so both the auto session-end report (fires 04:58–05:00) and a
+    manual stop later that Saturday morning land on Saturday. Weekday
+    session ends never do. Rationale: fitness gates the composite to 0
+    below MIN_TRADES (30); a single day rarely crosses that, so daily
+    scoring is noise — a week of accumulated trades is the smallest
+    meaningful sample.
+
+    Anything other than "weekly" behaves as daily (always run), so a
+    typo in settings.yaml degrades to the old behavior, not silence.
+
+    ``now`` may be naive (treated as TPE wall-clock) or tz-aware.
+    """
+    if cadence != EVOLUTION_CADENCE_WEEKLY:
+        return True
+    if now is None:
+        now = datetime.now(_TZ_TAIPEI)
+    elif now.tzinfo is not None:
+        now = now.astimezone(_TZ_TAIPEI)
+    return now.weekday() == 5  # Saturday
+
 
 @dataclass
 class Baseline:
