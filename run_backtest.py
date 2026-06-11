@@ -544,6 +544,10 @@ class BacktestApp:
         self.root.title(f"tai-robot AI 策略工作台 AI Strategy Workbench v{APP_VERSION}")
         self.root.geometry("1400x850")
         self.root.minsize(1100, 650)
+        try:
+            self.root.state("zoomed")  # start maximized (Windows)
+        except tk.TclError:
+            pass
 
         self._settings = _load_settings()
         self._fetcher = KChartFetcher()
@@ -1255,16 +1259,12 @@ class BacktestApp:
                                      command=self._do_export, state=tk.DISABLED)
         self.btn_export.grid(row=0, column=5, padx=3, pady=1, sticky=tk.W)
 
-        self.btn_review = ttk.Button(btn_frame, text="AI檢視 AI Review",
-                                     command=self._review_trades, state=tk.DISABLED)
-        self.btn_review.grid(row=0, column=7, padx=3, pady=1, sticky=tk.W)
-
-        self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
-                                     command=self._report_issue)
-        self.btn_report.grid(row=0, column=8, padx=3, pady=1, sticky=tk.W)
+        self.btn_toggle_settings = ttk.Button(btn_frame, text="▶ 設定 Settings",
+                                               command=self._toggle_settings)
+        self.btn_toggle_settings.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
 
         tf_frame = ttk.Frame(btn_frame)
-        tf_frame.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
+        tf_frame.grid(row=0, column=7, padx=3, pady=1, sticky=tk.W)
         ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
         self.chart_tf_var = tk.StringVar(value="Native")
         self.chart_tf_combo = ttk.Combobox(
@@ -1274,9 +1274,13 @@ class BacktestApp:
         )
         self.chart_tf_combo.pack(side=tk.LEFT)
 
-        self.btn_toggle_settings = ttk.Button(btn_frame, text="▶ 設定 Settings",
-                                               command=self._toggle_settings)
-        self.btn_toggle_settings.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
+        self.btn_review = ttk.Button(btn_frame, text="AI檢視 AI Review",
+                                     command=self._review_trades, state=tk.DISABLED)
+        self.btn_review.grid(row=0, column=8, padx=3, pady=1, sticky=tk.W)
+
+        self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
+                                     command=self._report_issue)
+        self.btn_report.grid(row=0, column=9, padx=3, pady=1, sticky=tk.W)
 
         # Status on its own row so it never clips the buttons above
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
