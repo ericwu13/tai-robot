@@ -211,6 +211,16 @@ class DiscordNotifier:
             f"交易: {total} 筆 | 勝率: {win_rate:.1%} | PF: {pf:.2f}",
             f"損益: {pnl:+,} | 最大回撤: {dd:,}",
         ])
+        # Real-order subset (semi_auto/auto fills). The headline numbers
+        # above are the full simulated view; this line shows what actually
+        # hit the real account. Absent for pure paper sessions.
+        real_summary = report.get("real_summary")
+        if real_summary:
+            lines.append(
+                f"實單 Real: {real_summary.get('total_trades', 0)} 筆 | "
+                f"勝率: {real_summary.get('win_rate', 0):.1%} | "
+                f"損益: {real_summary.get('total_pnl', 0):+,}"
+            )
         if regime:
             lines.append(
                 f"市場狀態: {regime.get('label', '?')} "

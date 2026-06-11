@@ -54,6 +54,9 @@ from src.utils.log_redact import (
 )
 from src.backtest.engine import BacktestEngine
 from src.backtest.broker import _mode_to_source
+
+# Trade.source → display label for the Trades tab and exports
+_SOURCE_LABELS = {"real": "實單 Real", "paper": "模擬 Paper", "backtest": "回測 BT"}
 from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
@@ -1344,7 +1347,7 @@ class BacktestApp:
         trades_frame = ttk.Frame(notebook)
         notebook.add(trades_frame, text="交易明細 Trades")
         columns = ("num", "tag", "side", "entry_time", "entry_price", "real_entry",
-                   "exit_time", "exit_price", "pnl", "bars_held")
+                   "exit_time", "exit_price", "pnl", "bars_held", "source")
         self.trade_tree = ttk.Treeview(trades_frame, columns=columns, show="headings", height=20)
         self._trade_sort_col = None
         self._trade_sort_reverse = False
@@ -1354,10 +1357,12 @@ class BacktestApp:
             ("real_entry", "實進場 Real Entry", 90),
             ("exit_time", "出場時間 Exit Time", 135), ("exit_price", "出場價 Exit", 80),
             ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 60),
+            ("source", "來源 Source", 80),
         ]:
             self.trade_tree.heading(col, text=text,
                                    command=lambda c=col: self._sort_trade_tree(c))
-            self.trade_tree.column(col, width=w, anchor=tk.E if col != "tag" else tk.W)
+            self.trade_tree.column(col, width=w,
+                                   anchor=tk.E if col not in ("tag", "source") else tk.W)
         vsb = ttk.Scrollbar(trades_frame, orient="vertical", command=self.trade_tree.yview)
         self.trade_tree.configure(yscrollcommand=vsb.set)
         self.trade_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -2892,10 +2897,13 @@ class BacktestApp:
             real_entry_str = (f"{t.real_entry_price:,}"
                               if t.real_entry_price > 0 else "--")
 
+            source_str = _SOURCE_LABELS.get(getattr(t, "source", ""), "--")
+
             self.trade_tree.insert("", tk.END, values=(
                 i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
                 real_entry_str,
                 exit_dt, f"{t.exit_price:,}", pnl_str, bars_held,
+                source_str,
             ), tags=(row_tag,))
 
         self.trade_tree.tag_configure("win", foreground="green")
@@ -5690,9 +5698,14 @@ class BacktestApp:
             # which would execute the strategy and potentially generate new entries.
             self._live_runner.suppress_strategy = True
             summary = self._live_runner.stop()
+            real_part = (
+                f" (實單 real: {summary['real_trades']} trades, "
+                f"P&L={summary['real_pnl']:+,})"
+                if summary.get("real_trades") else ""
+            )
             self._live_log_msg(
                 f"已停止 Stopped: {summary['trades']} trades, "
-                f"P&L={summary['pnl']:+,}, "
+                f"P&L={summary['pnl']:+,}{real_part}, "
                 f"bars={summary['bars_1m']}(1m)/{summary['bars_agg']}(agg)",
                 "status",
             )
