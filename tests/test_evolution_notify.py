@@ -351,3 +351,46 @@ class TestEvolutionCadence:
     def test_unknown_cadence_degrades_to_daily(self):
         # A typo in settings must not silently disable evolution forever
         assert should_run_evolution_check("weekIy-typo", datetime(2026, 6, 9, 13, 45))
+
+
+class TestEvolutionWatermark:
+    """load/save_watermark — which trades the on-demand evolution has seen."""
+
+    def test_load_returns_none_when_missing(self, tmp_path):
+        from src.evolution.notify import load_watermark
+        assert load_watermark(tmp_path) is None
+
+    def test_save_load_roundtrip(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 65, at="2026-06-13 05:00:00")
+        wm = load_watermark(tmp_path)
+        assert wm == {"trade_count": 65, "at": "2026-06-13 05:00:00"}
+
+    def test_save_defaults_timestamp(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 10)
+        wm = load_watermark(tmp_path)
+        assert wm["trade_count"] == 10
+        assert len(wm["at"]) == 19  # "YYYY-MM-DD HH:MM:SS"
+
+    def test_load_returns_none_on_corrupt_file(self, tmp_path):
+        from src.evolution.notify import WATERMARK_FILENAME, load_watermark
+        (tmp_path / WATERMARK_FILENAME).write_text("not json", encoding="utf-8")
+        assert load_watermark(tmp_path) is None
+
+    def test_load_returns_none_on_zero_count(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 0)
+        assert load_watermark(tmp_path) is None
+
+    def test_overwrite_advances_watermark(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 40, at="2026-06-06 05:00:00")
+        save_watermark(tmp_path, 65, at="2026-06-13 05:00:00")
+        wm = load_watermark(tmp_path)
+        assert wm["trade_count"] == 65
+
+    def test_no_tmp_file_left(self, tmp_path):
+        from src.evolution.notify import WATERMARK_FILENAME, save_watermark
+        save_watermark(tmp_path, 5)
+        assert not (tmp_path / (WATERMARK_FILENAME + ".tmp")).exists()

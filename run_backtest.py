@@ -3695,6 +3695,21 @@ class BacktestApp:
             preamble, trade_lines, source_section, len(result.trades),
             label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
 
+        # Advance the evolution watermark: these trades have now been fed
+        # to an evolution run. High-water mark, not per-trade flags —
+        # broker.trades is append-only so the count identifies the set.
+        # Written at request time; if the API call later fails the only
+        # cost is that the next run frames fewer trades as "new" (the
+        # full list is always resent regardless).
+        if (self._live_runner is not None
+                and self._live_runner.state != LiveState.IDLE
+                and getattr(self._live_runner, "bot_dir", None)):
+            try:
+                from src.evolution.notify import save_watermark
+                save_watermark(self._live_runner.bot_dir, len(result.trades))
+            except Exception as e:
+                _log(f"evolution watermark save failed: [{type(e).__name__}] {e}")
+
     def _build_evolution_context(self, result) -> str:
         """Fitness + baseline + source-split context block for Bot Evolution."""
         lines = ["## 演化現況 Evolution Context"]
@@ -3715,7 +3730,7 @@ class BacktestApp:
 
         try:
             from src.evolution.notify import (
-                score_session_for_notification, load_baseline)
+                score_session_for_notification, load_baseline, load_watermark)
             live = (self._live_runner is not None
                     and self._live_runner.state != LiveState.IDLE)
             fit = score_session_for_notification(
@@ -3739,6 +3754,35 @@ class BacktestApp:
                         f"- 歷史最佳 Baseline best composite: "
                         f"{baseline.best_composite:.3f} "
                         f"(recorded {baseline.best_recorded_at})")
+
+                # New-vs-already-analyzed framing: tell the AI which
+                # trades arrived since the last evolution run so the
+                # last change is judged on fresh data, not by
+                # re-diagnosing trades that already drove prior plans.
+                wm = load_watermark(self._live_runner.bot_dir)
+                if wm and 0 < wm["trade_count"] < len(trades):
+                    n_prev = wm["trade_count"]
+                    new_trades = trades[n_prev:]
+                    lines.append(
+                        f"- 上次演化 Last evolution: {wm['at']} — covered "
+                        f"trades #1–#{n_prev}. NEW since then: "
+                        f"{len(new_trades)} trades "
+                        f"(#{n_prev + 1}–#{len(trades)}), "
+                        f"P&L {sum(t.pnl for t in new_trades):+,}")
+                    lines.append(
+                        "- 評估規則 Evaluation rule: trades #1–"
+                        f"#{n_prev} already informed the previous "
+                        "evolution plan. If a strategy change was applied "
+                        "after it, judge that change PRIMARILY on the NEW "
+                        "trades — the older ones reflect the previous "
+                        "strategy version. Do NOT re-justify a new change "
+                        "using only already-analyzed trades.")
+                elif wm and wm["trade_count"] >= len(trades):
+                    lines.append(
+                        f"- 上次演化 Last evolution: {wm['at']} — covered "
+                        f"all {wm['trade_count']} trades; NO new trades "
+                        f"since then. The correct plan is to wait for new "
+                        f"data unless a code bug is evident.")
         except Exception as e:
             _log(f"evolution context build failed: [{type(e).__name__}] {e}")
 

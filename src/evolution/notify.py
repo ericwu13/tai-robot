@@ -51,6 +51,47 @@ IMPROVEMENT_DELTA = 0.05
 # / decisions.csv / bars_1m_*.csv, no migration story needed.
 BASELINE_FILENAME = "evolution.json"
 
+# Evolution watermark: which trades the on-demand Bot Evolution has
+# already analyzed. Separate file from evolution.json (the fitness
+# baseline) — save_baseline() rewrites that file wholesale, so a field
+# added there would be silently dropped on the next baseline write.
+# A high-water mark (trade count) is equivalent to per-trade "used"
+# flags because broker.trades is append-only within a session.
+WATERMARK_FILENAME = "evolution_watermark.json"
+
+
+def watermark_path(bot_dir: str | os.PathLike) -> str:
+    return os.path.join(os.fspath(bot_dir), WATERMARK_FILENAME)
+
+
+def load_watermark(bot_dir: str | os.PathLike) -> dict[str, Any] | None:
+    """Return {"trade_count": int, "at": str} or None (first run / corrupt)."""
+    path = watermark_path(bot_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        count = int(data.get("trade_count", 0) or 0)
+        if count <= 0:
+            return None
+        return {"trade_count": count, "at": str(data.get("at", ""))}
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        return None
+
+
+def save_watermark(bot_dir: str | os.PathLike, trade_count: int,
+                   at: str | None = None) -> None:
+    """Record that an evolution run covered the first ``trade_count`` trades."""
+    os.makedirs(os.fspath(bot_dir), exist_ok=True)
+    if at is None:
+        at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+    tmp = watermark_path(bot_dir) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"trade_count": int(trade_count), "at": at}, f)
+    os.replace(tmp, watermark_path(bot_dir))
+
+
 # ── Evolution cadence ──
 EVOLUTION_CADENCE_DAILY = "daily"
 EVOLUTION_CADENCE_WEEKLY = "weekly"
