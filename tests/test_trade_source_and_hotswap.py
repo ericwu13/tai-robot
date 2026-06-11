@@ -88,7 +88,24 @@ class TestTradeSourceField:
 
 
 class TestBrokerTradeSource:
-    def test_trade_source_stamped_on_close(self):
+    def test_trade_source_real_with_confirmed_fill(self):
+        broker = SimulatedBroker(point_value=200)
+        broker.trade_source = "real"
+        broker.queue_entry(Order(tag="Long", side=OrderSide.LONG, qty=1))
+        broker.on_bar_close(0, 20000)
+        # Real broker confirmed the entry fill
+        broker.real_entry_price = 20001
+        broker.real_entry_dt = "2026-06-11 21:01:05"
+        broker.queue_exit(Order(tag="Exit", side=OrderSide.LONG, from_entry="Long", limit=20100))
+        broker.check_exits(1, 20050, 20150, 19950, 20100)
+        assert len(broker.trades) == 1
+        assert broker.trades[0].source == "real"
+
+    def test_trade_source_real_without_fill_downgrades_to_paper(self):
+        # semi_auto confirm declined/timed out, or auto order failed:
+        # the trade never touched the real account → paper, not real.
+        # (Regression: trade #65 of bot 0422 — REAL_ORDER_TIMEOUT on
+        # entry, real_entry_price=0, yet tagged "real" by mode.)
         broker = SimulatedBroker(point_value=200)
         broker.trade_source = "real"
         broker.queue_entry(Order(tag="Long", side=OrderSide.LONG, qty=1))
@@ -96,7 +113,19 @@ class TestBrokerTradeSource:
         broker.queue_exit(Order(tag="Exit", side=OrderSide.LONG, from_entry="Long", limit=20100))
         broker.check_exits(1, 20050, 20150, 19950, 20100)
         assert len(broker.trades) == 1
-        assert broker.trades[0].source == "real"
+        assert broker.trades[0].source == "paper"
+        assert broker.trades[0].real_entry_price == 0
+
+    def test_trade_source_backtest_mode_not_downgraded(self):
+        # backtest has real_entry_price=0 by definition — must NOT be
+        # rewritten; the downgrade only applies to the "real" tag.
+        broker = SimulatedBroker(point_value=200)
+        broker.trade_source = "backtest"
+        broker.queue_entry(Order(tag="Long", side=OrderSide.LONG, qty=1))
+        broker.on_bar_close(0, 20000)
+        broker.queue_exit(Order(tag="Exit", side=OrderSide.LONG, from_entry="Long", limit=20100))
+        broker.check_exits(1, 20050, 20150, 19950, 20100)
+        assert broker.trades[0].source == "backtest"
 
     def test_trade_source_defaults_empty(self):
         broker = SimulatedBroker(point_value=200)
@@ -131,6 +160,7 @@ class TestTradeSerializationRoundTrip:
         broker.trade_source = "real"
         broker.queue_entry(Order(tag="Long", side=OrderSide.LONG, qty=1))
         broker.on_bar_close(0, 20000)
+        broker.real_entry_price = 20001  # confirmed fill → tag stays "real"
         broker.queue_exit(Order(tag="Exit", side=OrderSide.LONG, from_entry="Long", limit=20100))
         broker.check_exits(1, 20050, 20150, 19950, 20100)
 
