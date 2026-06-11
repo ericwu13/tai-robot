@@ -332,6 +332,19 @@ def _save_ai_settings(provider: str = "", anthropic_key: str = "",
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
 
+def _ultra_toggle_decision(current: bool, confirm) -> bool | None:
+    """Guard logic for the Ultra Mode toggle button.
+
+    Turning OFF is immediate (never calls ``confirm``); turning ON
+    requires confirmation because the ultra model costs significantly
+    more. Returns the new state, or None when the user cancelled.
+    Pure function so the guard is testable without Tk.
+    """
+    if current:
+        return False
+    return True if confirm() else None
+
+
 _CACHE_DIR = os.path.join(project_root, "data")
 
 _app = None
@@ -1143,6 +1156,9 @@ class BacktestApp:
         ttk.Button(header, text="Load Chat", width=9, command=self._load_chat_session).pack(side=tk.RIGHT, padx=2)
         ttk.Button(header, text="Save Chat", width=9, command=self._save_chat_session).pack(side=tk.RIGHT, padx=2)
         ttk.Button(header, text="Settings", width=8, command=self._show_api_key_dialog).pack(side=tk.RIGHT, padx=2)
+        self.btn_ultra = ttk.Button(header, width=14, command=self._toggle_ultra_mode)
+        self.btn_ultra.pack(side=tk.RIGHT, padx=2)
+        self._update_ultra_button()
 
         # ── Chat display ──
         self.chat_display = scrolledtext.ScrolledText(
@@ -1991,6 +2007,39 @@ class BacktestApp:
         self._load_saved_strategy()
         self.status_var.set(f"已匯入 Imported: {cls} → {fname}")
 
+    def _update_ultra_button(self) -> None:
+        on = self._settings.get("ultra_mode", False)
+        self.btn_ultra.config(text=f"🚀 Ultra: {'ON' if on else 'OFF'}")
+
+    def _toggle_ultra_mode(self) -> None:
+        """Toggle ultra_mode with a cost confirmation on enable.
+
+        No ChatClient rebuild needed: every heavy-tier call site reads
+        self._settings["ultra_mode"] at call time, so mutating the dict
+        applies to the live client on the very next codegen / review /
+        evolution / Pine export call. Persisted to settings.yaml so it
+        survives restarts (env ULTRA_MODE still wins at next startup).
+        """
+        def _confirm() -> bool:
+            return messagebox.askyesno(
+                "Enable Ultra Mode?",
+                "Ultra Mode switches to Gemini 3.1 Pro which significantly "
+                "increases AI costs. Your current bill may increase. "
+                "Are you sure you want to enable it?",
+                icon="warning",
+            )
+
+        new_state = _ultra_toggle_decision(
+            self._settings.get("ultra_mode", False), _confirm)
+        if new_state is None:
+            return  # user cancelled the enable confirmation
+        self._settings["ultra_mode"] = new_state
+        _save_ai_settings(ultra_mode=new_state)
+        self._update_ultra_button()
+        model = GOOGLE_MODEL_ULTRA if new_state else GOOGLE_MODEL_PRO
+        self.status_var.set(
+            f"Ultra Mode {'ON' if new_state else 'OFF'} — heavy tier: {model}")
+
     def _show_api_key_dialog(self):
         """Show settings dialog with provider selection and API keys."""
         dialog = tk.Toplevel(self.root)
@@ -2070,6 +2119,7 @@ class BacktestApp:
             self._settings["google_api_key"] = gk
             self._settings["ai_model"] = model
             self._settings["ultra_mode"] = ultra
+            self._update_ultra_button()  # keep the chat-header toggle in sync
 
             _save_ai_settings(provider=provider, anthropic_key=ak,
                               google_key=gk, model=model, ultra_mode=ultra)
