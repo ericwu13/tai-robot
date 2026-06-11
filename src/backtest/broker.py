@@ -418,6 +418,15 @@ class SimulatedBroker:
         else:
             pnl = (self.entry_price - exit_price) * self.position_size * self.point_value
 
+        # "real" means the trade was ACTUALLY EXECUTED at the broker, not
+        # merely "the bot was in semi_auto/auto mode". In semi_auto the
+        # order-confirm dialog can be declined or time out, and in auto an
+        # order can fail — the simulated trade still closes, but it never
+        # touched the real account. No confirmed real entry fill → paper.
+        source = self.trade_source
+        if source == "real" and self.real_entry_price == 0:
+            source = "paper"
+
         trade = Trade(
             tag=self.entry_tag,
             side=self.position_side,
@@ -435,7 +444,7 @@ class SimulatedBroker:
             # 0/"" and the Trades tab will render them as "--".
             real_entry_price=self.real_entry_price,
             real_entry_dt=self.real_entry_dt,
-            source=self.trade_source,
+            source=source,
         )
         self.trades.append(trade)
         self._cumulative_pnl += pnl
