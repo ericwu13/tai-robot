@@ -3877,6 +3877,10 @@ class BacktestApp:
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
         self._live_runner.on_mode_changed = self._on_mode_changed
+        self._live_runner.mode_switch_veto = (
+            lambda: "真實委託等待成交中 real order fill pending"
+            if self._trading_guard.fill_pending else None
+        )
 
         # Open debug log file in bot directory
         _open_debug_log(self._live_runner.bot_dir)
@@ -5350,6 +5354,12 @@ class BacktestApp:
         result = self._fill_poller.timeout()
 
         self._trading_mode = result.new_trading_mode
+        # Keep LiveRunner/broker in sync with the forced downgrade —
+        # direct assignment (not _apply_mode_switch) because a safety
+        # downgrade must always apply regardless of switch gates.
+        if self._live_runner is not None:
+            self._live_runner.trading_mode = result.new_trading_mode
+            self._live_runner.broker.trade_source = _mode_to_source(result.new_trading_mode)
         self.trading_mode_var.set("\u26a0 半自動 Semi-Auto (降級 downgraded)")
 
         self._live_log_msg(result.message, "exit")
