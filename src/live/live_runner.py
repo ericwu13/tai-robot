@@ -346,14 +346,20 @@ class LiveRunner:
         except (json.JSONDecodeError, OSError):
             return None
 
-    def _apply_mode_switch(self, new_mode: str) -> None:
-        """Switch trading mode if safe to do so."""
+    def _apply_mode_switch(self, new_mode: str, *, user_confirmed: bool = False) -> None:
+        """Switch trading mode if safe to do so.
+
+        ``user_confirmed=True`` means a human approved this switch via a
+        GUI confirmation dialog — that bypasses the allow_live_override
+        gate, which exists to stop UNATTENDED switches to auto (a dropped
+        mode_override.json file has no human in the loop).
+        """
         if new_mode == self.trading_mode:
             return
         if new_mode not in ("paper", "semi_auto", "auto"):
             self._emit("on_status", f"[MODE] rejected invalid mode: {new_mode!r}")
             return
-        if new_mode == "auto" and not self._allow_live_override:
+        if new_mode == "auto" and not self._allow_live_override and not user_confirmed:
             self._emit("on_status", "[MODE] rejected auto override — allow_live_override=false in settings")
             return
         if self.broker.has_open_position():
