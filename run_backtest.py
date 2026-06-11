@@ -291,7 +291,8 @@ def _load_settings():
 
 
 def _save_ai_settings(provider: str = "", anthropic_key: str = "",
-                      google_key: str = "", model: str = "", max_tokens: int = 0):
+                      google_key: str = "", model: str = "", max_tokens: int = 0,
+                      ultra_mode: bool | None = None):
     """Persist AI settings to settings.yaml."""
     if not yaml:
         return
@@ -311,6 +312,10 @@ def _save_ai_settings(provider: str = "", anthropic_key: str = "",
         ai["model"] = model
     if max_tokens:
         ai["max_tokens"] = max_tokens
+    # bool needs an explicit None-check — `if ultra_mode:` could never
+    # persist False, leaving a stale `true` in settings.yaml forever.
+    if ultra_mode is not None:
+        ai["ultra_mode"] = bool(ultra_mode)
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
@@ -1949,7 +1954,7 @@ class BacktestApp:
         """Show settings dialog with provider selection and API keys."""
         dialog = tk.Toplevel(self.root)
         dialog.title("AI Settings")
-        dialog.geometry("450x280")
+        dialog.geometry("450x330")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1994,23 +1999,39 @@ class BacktestApp:
         provider_var.trace_add("write", _update_hint)
         _update_hint()
 
+        # Ultra mode — heavy-tier calls (codegen, trade review, Pine
+        # export) use the most capable model. Read per-call from
+        # self._settings, so toggling applies immediately. Google only;
+        # env ULTRA_MODE still wins at next startup.
+        ultra_var = tk.BooleanVar(value=self._settings.get("ultra_mode", False))
+        ttk.Checkbutton(
+            frame, variable=ultra_var,
+            text=f"Ultra Mode — 重要呼叫用最強模型 ({GOOGLE_MODEL_ULTRA}, Google only)",
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ttk.Label(
+            frame, foreground="gray",
+            text="影響: 產生策略 codegen / AI檢視 review / Pine 匯出 export (成本較高 costs more)",
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W)
+
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=(16, 0))
+        btn_frame.grid(row=7, column=0, columnspan=2, pady=(16, 0))
 
         def _save():
             provider = provider_var.get()
             ak = anth_var.get().strip()
             gk = goog_var.get().strip()
             model = model_var.get().strip()
+            ultra = bool(ultra_var.get())
 
             self._settings["ai_provider"] = provider
             self._settings["anthropic_api_key"] = ak
             self._settings["google_api_key"] = gk
             self._settings["ai_model"] = model
+            self._settings["ultra_mode"] = ultra
 
             _save_ai_settings(provider=provider, anthropic_key=ak,
-                              google_key=gk, model=model)
+                              google_key=gk, model=model, ultra_mode=ultra)
 
             # Reset client so it picks up new settings
             if self._chat_client:
