@@ -4619,7 +4619,19 @@ class BacktestApp:
         if new_mode == self._trading_mode:
             return
         old_mode = self._trading_mode
-        self._live_runner._apply_mode_switch(new_mode)
+        user_confirmed = False
+        if new_mode == "auto":
+            user_confirmed = messagebox.askokcancel(
+                "確認切換 Confirm Mode Switch",
+                "切換至全自動模式？機器人將直接送出真實委託，不再逐筆確認下單。\n\n"
+                "Switch to FULL-AUTO mode? The bot will place REAL orders "
+                "without per-order confirmation prompts.",
+                icon="warning",
+            )
+            if not user_confirmed:
+                self.trading_mode_var.set(self._mode_key_to_combo.get(old_mode, old_mode))
+                return
+        self._live_runner._apply_mode_switch(new_mode, user_confirmed=user_confirmed)
         if self._trading_mode == old_mode:
             # Switch was rejected — revert combo to current mode
             self.trading_mode_var.set(self._mode_key_to_combo.get(old_mode, old_mode))

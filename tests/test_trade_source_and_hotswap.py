@@ -216,6 +216,18 @@ class TestApplyModeSwitch:
         assert runner.trading_mode == "auto"
         assert runner.broker.trade_source == "real"
 
+    def test_allows_auto_with_user_confirmation(self, tmp_path):
+        # GUI confirmation dialog bypasses the allow_live_override gate
+        runner = self._make_runner(tmp_path, "semi_auto", allow_override=False)
+        runner._apply_mode_switch("auto", user_confirmed=True)
+        assert runner.trading_mode == "auto"
+        assert runner.broker.trade_source == "real"
+
+    def test_user_confirmed_false_still_gated(self, tmp_path):
+        runner = self._make_runner(tmp_path, "semi_auto", allow_override=False)
+        runner._apply_mode_switch("auto", user_confirmed=False)
+        assert runner.trading_mode == "semi_auto"
+
     def test_rejects_when_open_position(self, tmp_path):
         runner = self._make_runner(tmp_path, "paper")
         runner.broker.queue_entry(Order(tag="L", side=OrderSide.LONG, qty=1))
