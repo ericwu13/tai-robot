@@ -1282,6 +1282,16 @@ class BacktestApp:
                                      command=self._report_issue)
         self.btn_report.grid(row=0, column=9, padx=3, pady=1, sticky=tk.W)
 
+        # Wrap toolbar buttons onto extra rows when the frame is too
+        # narrow for a single row (grid does not auto-wrap).
+        self._toolbar_widgets = [
+            self.btn_tv, self.btn_api, self.btn_taifex, self.btn_deploy,
+            self.btn_chart_all, self.btn_export, self.btn_toggle_settings,
+            tf_frame, self.btn_review, self.btn_report,
+        ]
+        self._toolbar_last_width = 0
+        btn_frame.bind("<Configure>", self._reflow_toolbar)
+
         # Status on its own row so it never clips the buttons above
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
         ttk.Label(ctrl, textvariable=self.status_var, foreground="gray",
@@ -2228,6 +2238,29 @@ class BacktestApp:
     def _on_strategy_changed(self, *_args):
         """Update UI when strategy selection changes."""
         pass
+
+    def _reflow_toolbar(self, event) -> None:
+        """Re-grid toolbar buttons so they wrap when the frame is narrow.
+
+        Only re-flows when the frame WIDTH changes — re-gridding changes
+        the frame height, which fires <Configure> again; gating on width
+        breaks that loop.
+        """
+        if event.width == self._toolbar_last_width:
+            return
+        self._toolbar_last_width = event.width
+        x = 0
+        row = 0
+        col = 0
+        for w in self._toolbar_widgets:
+            req = w.winfo_reqwidth() + 6  # padx=3 each side
+            if col > 0 and x + req > event.width:
+                row += 1
+                col = 0
+                x = 0
+            w.grid(row=row, column=col, padx=3, pady=1, sticky=tk.W)
+            col += 1
+            x += req
 
     def _toggle_settings(self):
         """Show/hide backtest settings panel."""
