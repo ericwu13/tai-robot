@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from src.evolution.fitness import FitnessResult, SOURCE_BACKTEST, SOURCE_PAPER
+from src.evolution.fitness import FitnessResult, SOURCE_BACKTEST, SOURCE_PAPER, SOURCE_REAL
 from src.evolution.notify import (
     Baseline,
     BASELINE_FILENAME,
@@ -183,23 +183,21 @@ class TestScoreSessionForNotification:
         )
         assert fit.source == SOURCE_PAPER
 
-    def test_semi_auto_mode_also_tagged_paper(self):
-        # Notification semantics: semi_auto runs real fills with no
-        # look-ahead, so the trades are paper-equivalent for scoring.
+    def test_semi_auto_mode_tagged_real(self):
         trades = [{"pnl": 100, "entry_dt": "2026-05-01 10:00",
                    "exit_dt": "2026-05-01 11:00"}] * 40
         fit = score_session_for_notification(
             trades, equity_curve=None, trading_mode="semi_auto",
         )
-        assert fit.source == SOURCE_PAPER
+        assert fit.source == SOURCE_REAL
 
-    def test_auto_mode_also_tagged_paper(self):
+    def test_auto_mode_tagged_real(self):
         trades = [{"pnl": 100, "entry_dt": "2026-05-01 10:00",
                    "exit_dt": "2026-05-01 11:00"}] * 40
         fit = score_session_for_notification(
             trades, equity_curve=None, trading_mode="auto",
         )
-        assert fit.source == SOURCE_PAPER
+        assert fit.source == SOURCE_REAL
 
     def test_backtest_mode_tagged_backtest(self):
         trades = [{"pnl": 100, "entry_dt": "2026-05-01 10:00",

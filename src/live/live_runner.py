@@ -8,14 +8,16 @@ State machine: IDLE → WARMING_UP → RUNNING → STOPPED
 
 from __future__ import annotations
 
+import json
 import os
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Callable
 
 from ..market_data.models import Bar
 from ..market_data.data_store import DataStore
-from ..backtest.broker import SimulatedBroker, Trade
+from ..backtest.broker import SimulatedBroker, Trade, _mode_to_source
 from ..backtest.strategy import BacktestStrategy
 from ..backtest.data_loader import parse_kline_strings
 from ..backtest.engine import BacktestResult
@@ -274,7 +276,12 @@ class LiveRunner:
         self._callbacks: dict[str, list] = {}
         self.suppress_strategy: bool = False  # suppress strategy during history catchup
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
+        self.broker.trade_source = _mode_to_source(self.trading_mode)
         self.daily_loss_limit: int = 10000  # NTD, for session persistence
+
+        # Hot-swap mode switching (Feature 2)
+        self._allow_live_override: bool = False
+        self.on_mode_changed: Callable[[str, str], None] | None = None
 
         # Daily-report dedupe key: (date_str, "DAY"|"NIGHT") of the last
         # session for which a report was emitted. Prevents the 30s
@@ -323,6 +330,43 @@ class LiveRunner:
     def bot_dir_for(base_dir: str, symbol: str, bot_name: str) -> str:
         """Return the bot directory path without creating it."""
         return os.path.join(base_dir, f"{symbol}_{bot_name}")
+
+    # ── Hot-swap mode switching ──
+
+    def _check_mode_override(self) -> str | None:
+        """Read and consume a mode_override.json file from the bot directory."""
+        override_path = os.path.join(self.bot_dir, "mode_override.json")
+        try:
+            if not os.path.exists(override_path):
+                return None
+            with open(override_path, "r") as f:
+                data = json.load(f)
+            os.remove(override_path)
+            return data.get("trading_mode")
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _apply_mode_switch(self, new_mode: str) -> None:
+        """Switch trading mode if safe to do so."""
+        if new_mode == self.trading_mode:
+            return
+        if new_mode not in ("paper", "semi_auto", "auto"):
+            self._emit("on_status", f"[MODE] rejected invalid mode: {new_mode!r}")
+            return
+        if new_mode == "auto" and not self._allow_live_override:
+            self._emit("on_status", "[MODE] rejected auto override — allow_live_override=false in settings")
+            return
+        if self.broker.has_open_position():
+            self._emit("on_status",
+                        f"[MODE] cannot switch {self.trading_mode}→{new_mode}: open position exists, close it first")
+            return
+        old = self.trading_mode
+        self.trading_mode = new_mode
+        self.broker.trade_source = _mode_to_source(new_mode)
+        self._emit("on_status", f"[MODE] switched {old} → {new_mode}")
+        if self.on_mode_changed:
+            self.on_mode_changed(old, new_mode)
+        self._auto_save_session()
 
     # ── Callback system ──
 
@@ -540,6 +584,10 @@ class LiveRunner:
         Same sequence as BacktestEngine.run() (engine.py:53-65).
         When suppress_strategy is True, only updates DataStore (no trading).
         """
+        new_mode = self._check_mode_override()
+        if new_mode:
+            self._apply_mode_switch(new_mode)
+
         self.data_store.add_bar(bar)
         self._feed_htf(bar)
         self._aggregated_bars.append(bar)
@@ -809,9 +857,16 @@ class LiveRunner:
         return self._summary()
 
     def _summary(self) -> dict:
+        all_trades = self.broker.trades
+        paper = [t for t in all_trades if t.source in ("paper", "")]
+        real = [t for t in all_trades if t.source == "real"]
         return {
-            "trades": len(self.broker.trades),
-            "pnl": sum(t.pnl for t in self.broker.trades),
+            "trades": len(all_trades),
+            "pnl": sum(t.pnl for t in all_trades),
+            "paper_trades": len(paper),
+            "paper_pnl": sum(t.pnl for t in paper),
+            "real_trades": len(real),
+            "real_pnl": sum(t.pnl for t in real),
             "bars_1m": len(self._seen_1m_dts),
             "bars_agg": len(self._aggregated_bars),
             "equity_curve": list(self.broker.equity_curve),

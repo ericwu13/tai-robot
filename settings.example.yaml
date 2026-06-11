@@ -21,6 +21,7 @@ trading:
   order_type: "2"            # "2"=auto new/close
   trade_type: 0              # 0=ROD, 1=IOC, 2=FOK
   price_flag: 0              # 0=market, 1=limit
+  allow_live_override: false  # true = allow mode_override.json to switch to "auto" at runtime
 
 strategy:
   name: "ma_crossover"
