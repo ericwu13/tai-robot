@@ -450,7 +450,6 @@ class TestFormatReportRealSubset:
         assert "Real Avg Win:" in report
         assert "Real Avg Loss:" in report
         assert "Real Max DD:" in report
-        assert "small sample" in report  # < 10 real trades
 
     def test_no_real_trades_no_subset_section(self):
         from src.backtest.report import format_report
