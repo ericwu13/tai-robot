@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from ..backtest.engine import BacktestEngine, BacktestResult
@@ -191,6 +192,159 @@ def decide_verdict(baseline: ABResult, candidate: ABResult,
         f"MaxDD% {cm.max_drawdown_pct:.2f} vs baseline "
         f"{bm.max_drawdown_pct:.2f}: {'✓' if ok_dd else '✗'}")
     return EvolutionVerdict(floor_ok and ok_pf and ok_dd, reasons)
+
+
+def effective_windows(span_days: int, train_days: int,
+                      test_days: int) -> tuple[int, int]:
+    """Scale the walk-forward windows to the available history.
+
+    Full SEE-spec windows (90/90) when data suffices. With less data the
+    split is scaled — test gets half the span (min 7 days), train the
+    rest — so the verdict stays out-of-sample, just over a shorter
+    horizon. Below 21 days walk-forward is meaningless: returns (0, 0)
+    to tell the caller to use the simple single-window A/B instead.
+    """
+    if span_days >= train_days + test_days:
+        return train_days, test_days
+    if span_days < 21:
+        return 0, 0
+    test = max(7, span_days // 2)
+    return span_days - test, test
+
+
+def split_train_test(bars: list, train_days: int,
+                     test_days: int) -> tuple[list, list]:
+    """Walk-forward split anchored at the END of ``bars`` (same semantics
+    as evaluator._split_train_test): the most recent ``test_days`` form
+    the out-of-sample test window, the ``train_days`` before it the
+    in-sample window. Older bars are discarded.
+    """
+    if not bars:
+        return [], []
+    end = bars[-1].dt
+    test_start = end - timedelta(days=test_days)
+    train_start = test_start - timedelta(days=train_days)
+    train = [b for b in bars if train_start <= b.dt < test_start]
+    test = [b for b in bars if b.dt >= test_start]
+    return train, test
+
+
+@dataclass
+class DeepResult:
+    """One side of the walk-forward validation."""
+    name: str
+    train: ABResult
+    test: ABResult
+    fragile: bool = False
+    mc_variance: float = 0.0
+    train_span: str = ""
+    test_span: str = ""
+
+
+def _span_desc(bars: list) -> str:
+    if not bars:
+        return "(empty)"
+    return (f"{bars[0].dt:%Y-%m-%d} → {bars[-1].dt:%Y-%m-%d} "
+            f"({len(bars)} bars)")
+
+
+def run_deep_validation(strategy_cls, bars, point_value: int, name: str,
+                        train_days: int, test_days: int,
+                        monte_carlo: bool = True) -> DeepResult:
+    """Walk-forward validation per the SEE spec: backtest the train and
+    test windows separately; optionally Monte Carlo the train window
+    (±10% jitter on numeric __init__ defaults — a candidate whose edge
+    evaporates under tiny param changes is curve-fit, not improved).
+    """
+    train, test = split_train_test(bars, train_days, test_days)
+    tr = run_ab_backtest(strategy_cls, train, point_value, f"{name} train")
+    te = run_ab_backtest(strategy_cls, test, point_value, f"{name} test")
+    fragile = False
+    mc_var = 0.0
+    if monte_carlo and not tr.error and train:
+        try:
+            from .evaluator import MC_FRAGILE_VARIANCE, monte_carlo_robustness
+            _, mc_var = monte_carlo_robustness(strategy_cls, train, point_value)
+            fragile = mc_var > MC_FRAGILE_VARIANCE
+        except Exception:
+            pass  # robustness check is best-effort, never kills the run
+    return DeepResult(name=name, train=tr, test=te, fragile=fragile,
+                      mc_variance=mc_var, train_span=_span_desc(train),
+                      test_span=_span_desc(test))
+
+
+def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
+                        criteria: dict[str, float] | None) -> EvolutionVerdict:
+    """Walk-forward verdict: the OUT-OF-SAMPLE test window decides.
+
+    Gates, in order: candidate must run in the test window; must not be
+    Monte Carlo fragile; OOS fitness composite must not be below the
+    baseline's (skipped when both are gated by small samples); then the
+    plan's criteria / default guard apply to the test-window metrics via
+    decide_verdict (which also enforces the trade floor).
+    """
+    if candidate.test.error:
+        return EvolutionVerdict(
+            False, [f"candidate test-window error: {candidate.test.error}"])
+    cm = candidate.test.metrics
+    if cm is None or cm.total_trades == 0:
+        return EvolutionVerdict(
+            False, ["candidate produced 0 trades in the test window"])
+
+    reasons: list[str] = []
+    passed = True
+
+    if candidate.fragile:
+        reasons.append(
+            f"Monte Carlo FRAGILE: CV {candidate.mc_variance:.2f} > 0.30 — "
+            f"±10% param jitter destabilizes results (curve-fit)")
+        passed = False
+    elif candidate.mc_variance > 0:
+        reasons.append(
+            f"Monte Carlo robustness: CV {candidate.mc_variance:.2f} ≤ 0.30 ✓")
+
+    cf, bf = candidate.test.fitness, baseline.test.fitness
+    if cf is not None and bf is not None and not (cf.gated and bf.gated):
+        ok = cf.composite >= bf.composite
+        reasons.append(
+            f"OOS composite {cf.composite:.3f} vs baseline "
+            f"{bf.composite:.3f}: {'✓' if ok else '✗'}")
+        passed = passed and ok
+    else:
+        reasons.append(
+            "OOS composite gated on both sides (< 30 test-window trades) — "
+            "composite gate skipped")
+
+    sub = decide_verdict(baseline.test, candidate.test, criteria)
+    reasons.extend(sub.reasons)
+    passed = passed and sub.passed
+    return EvolutionVerdict(passed, reasons, used_criteria=sub.used_criteria)
+
+
+def format_deep_verdict_block(baseline: DeepResult, candidate: DeepResult,
+                              verdict: EvolutionVerdict, data_desc: str,
+                              saved_as: str = "") -> str:
+    """Human-readable walk-forward verdict for the chat log."""
+    lines = [
+        f"🧬 EVO VERDICT (walk-forward) — {'PASS ✅' if verdict.passed else 'FAIL ❌'}",
+        f"資料 Data: {data_desc}",
+        f"訓練期 Train (in-sample): {candidate.train_span}",
+        f"測試期 Test (out-of-sample, decides verdict): {candidate.test_span}",
+        "── 訓練期 In-sample ──",
+        _side_summary(baseline.train),
+        _side_summary(candidate.train),
+        "── 測試期 Out-of-sample ──",
+        _side_summary(baseline.test),
+        _side_summary(candidate.test),
+        ("依計畫標準 plan criteria + walk-forward gates:" if verdict.used_criteria
+         else "預設門檻 default guard + walk-forward gates:"),
+    ]
+    lines.extend(f"  {r}" for r in verdict.reasons)
+    if verdict.passed and saved_as:
+        lines.append(f"已存檔 Saved as「{saved_as}」— 部署仍需手動 deploy manually when ready.")
+    elif not verdict.passed:
+        lines.append("候選未通過，未存檔 Candidate rejected — nothing was saved.")
+    return "\n".join(lines)
 
 
 def _side_summary(side: ABResult) -> str:

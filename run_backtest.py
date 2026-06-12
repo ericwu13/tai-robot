@@ -301,6 +301,10 @@ def _load_settings():
             # auto_pipeline: 🧬 runs plan → codegen → A/B validation →
             # auto-save on PASS. false = plan-only (the old behavior).
             cfg["evolution_auto_pipeline"] = evo.get("auto_pipeline", True)
+            # validation: "deep" (SEE spec — 90/90-day walk-forward + Monte
+            # Carlo, data fetched via Capital API when available) or
+            # "simple" (single-window A/B on whatever data is at hand).
+            cfg["evolution_validation"] = evo.get("validation", "deep")
             break
     return cfg
 
@@ -1111,6 +1115,10 @@ class BacktestApp:
         self._raw_bars_key: tuple = ()  # (symbol, kline_type, kline_minute) of stored raw bars
         self._data_source: str = ""  # tracks where data came from for report
         self._pending_api_fetch: bool = False  # triggers fetch after login completes
+        # When set, the API chunk-fetch loop calls this (with success bool)
+        # at its terminus INSTEAD of running a backtest — lets the
+        # evolution pipeline borrow the fetch machinery for validation data.
+        self._evo_fetch_cb = None  # Callable[[bool], None] | None
 
         # Live trading state
         self._live_chart: LiveChart | None = None
@@ -2588,12 +2596,22 @@ class BacktestApp:
         _log(f"分段查詢 Fetching in {len(chunks)} chunks: {start_date}~{end_date}")
         self._fetch_next_chunk()
 
+    def _consume_evo_fetch_cb(self):
+        """Pop the evolution fetch callback (one-shot), or None."""
+        cb = self._evo_fetch_cb
+        self._evo_fetch_cb = None
+        return cb
+
     def _fetch_next_chunk(self):
         """Fetch the next chunk of KLine data via COM API."""
         chunk = self._fetcher.next_chunk()
         if chunk is None:
             _log(f"全部完成 All chunks fetched: {self._fetcher.total_bar_count} total KLine strings")
-            self._run_backtest()
+            cb = self._consume_evo_fetch_cb()
+            if cb:
+                cb(True)
+            else:
+                self._run_backtest()
             return
 
         n = chunk.chunk_index + 1
@@ -2616,11 +2634,17 @@ class BacktestApp:
                 if code >= 3000:
                     self.status_var.set(f"錯誤 Error: {msg}")
                     self._enable_buttons()
+                    cb = self._consume_evo_fetch_cb()
+                    if cb:
+                        cb(False)
                     return
 
         except Exception as e:
             _log(f"查詢錯誤 Fetch error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._enable_buttons()
+            cb = self._consume_evo_fetch_cb()
+            if cb:
+                cb(False)
 
     def _do_fetch_taifex(self):
         """Fetch daily bars from TAIFEX public API (no account needed)."""
@@ -2814,7 +2838,11 @@ class BacktestApp:
         if not self._fetcher.chunks_done:
             self.root.after(500, self._fetch_next_chunk)
         else:
-            self._run_backtest()
+            cb = self._consume_evo_fetch_cb()
+            if cb:
+                cb(True)
+            else:
+                self._run_backtest()
 
     def _get_strategy_interval(self) -> int:
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
@@ -3915,29 +3943,33 @@ class BacktestApp:
             baseline_cls = type(self._live_runner.strategy)
             point_value = self._live_runner.point_value
             native_sec = self._live_runner.target_interval
-            # Validation data: prefer the FULL session history from the
-            # bot's daily 1-min CSVs (everything since first deploy) —
-            # BacktestEngine aggregates 1-min feeds to the strategy's
-            # native timeframe internally. The in-memory aggregated bars
-            # only cover ~the warmup window; fall back to them when the
-            # CSVs cover less time (fresh bot / deleted files).
-            from src.live.live_runner import load_1m_bars_from_csvs
-            mem_bars = self._live_runner.get_bars()
-            csv_bars = load_1m_bars_from_csvs(
-                self._live_runner.bot_dir, self._live_runner.symbol)
-
-            def _span(bs):
-                return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
-            bars = (csv_bars if csv_bars and _span(csv_bars) >= _span(mem_bars)
-                    else mem_bars)
         else:
             baseline_cls = STRATEGIES.get(self.strategy_var.get())
-            bars = list(self._last_bars or [])
-            native_sec = bars[0].interval if bars else 900
+            native_sec = (self._last_bars[0].interval
+                          if self._last_bars else 900)
             try:
                 point_value = int(self.pv_var.get())
             except (ValueError, TypeError):
                 point_value = 200
+
+        def _fallback_bars() -> tuple[list, str]:
+            """Best locally-available validation data (no API fetch)."""
+            if live:
+                # Full session history from the bot's daily 1-min CSVs
+                # beats the in-memory aggregated bars (~warmup window);
+                # BacktestEngine aggregates 1-min feeds to the strategy's
+                # native timeframe internally.
+                from src.live.live_runner import load_1m_bars_from_csvs
+                mem_bars = self._live_runner.get_bars()
+                csv_bars = load_1m_bars_from_csvs(
+                    self._live_runner.bot_dir, self._live_runner.symbol)
+
+                def _span(bs):
+                    return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
+                if csv_bars and _span(csv_bars) >= _span(mem_bars):
+                    return csv_bars, "bot 1m CSV history"
+                return mem_bars, "in-memory session bars"
+            return list(self._last_bars or []), "last backtest dataset"
         display_name = self.strategy_var.get()
         strategy_source = self._resolve_strategy_source(display_name, baseline_cls)
         taken = {cls.__name__ for cls in STRATEGIES.values()}
@@ -3950,12 +3982,10 @@ class BacktestApp:
             self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
             ultra_mode=self._settings.get("ultra_mode", False))
 
-        self._append_chat(
-            "user", "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
-        self.btn_send.config(state=tk.DISABLED)
-        self._append_chat(
-            "system",
-            f"EVO 1/3: analyzing {total_trades} trades, generating evolution plan...")
+        validation = self._settings.get("evolution_validation", "deep")
+        # Validation data + provenance, filled by the dispatch logic at the
+        # bottom (possibly after an async API fetch) before _worker starts.
+        evo_data: dict = {"bars": [], "origin": ""}
 
         def ui(fn, *args):
             self.root.after(0, fn, *args)
@@ -3963,7 +3993,11 @@ class BacktestApp:
         def _worker():
             from src.evolution.pipeline import (
                 parse_plan_directives, next_candidate_name, run_ab_backtest,
-                decide_verdict, format_verdict_block)
+                decide_verdict, format_verdict_block,
+                effective_windows, run_deep_validation, decide_deep_verdict,
+                format_deep_verdict_block)
+            bars = evo_data["bars"]
+            data_origin = evo_data["origin"]
             try:
                 # ── Phase 1: evolution plan ──
                 plan = self._chat_client.send_message(
@@ -4029,10 +4063,10 @@ class BacktestApp:
                        f"🧬 EVO FAIL: candidate generation failed twice — {last_err}")
                     return
 
-                # ── Phase 3: A/B validation backtest ──
-                # The feed may be 1-min CSVs (engine aggregates to the
-                # strategy's native timeframe) — size the minimum-data
-                # guard in NATIVE bars, not feed bars.
+                # ── Phase 3: validation backtest ──
+                # The feed may be 1-min CSVs or API bars (engine
+                # aggregates sub-native feeds internally) — size guards
+                # in NATIVE bars, not feed bars.
                 feed_iv = bars[0].interval if bars else 0
                 native_est = len(bars)
                 if feed_iv and native_sec > feed_iv:
@@ -4044,22 +4078,61 @@ class BacktestApp:
                        f"backtest. Plan + candidate generated but NOT "
                        f"validated/saved; run a TV/API backtest manually.")
                     return
-                ui(self._append_chat, "system",
-                   f"EVO 3/3: A/B backtest on {len(bars)} × "
-                   f"{feed_iv // 60}min bars ≈ {native_est} native bars "
-                   f"({base_cls_name} vs {candidate_cls.__name__})...")
-                baseline_res = run_ab_backtest(
-                    baseline_cls, bars, point_value, "基準 baseline")
-                candidate_res = run_ab_backtest(
-                    candidate_cls, bars, point_value,
-                    f"候選 {candidate_cls.__name__}")
-                verdict = decide_verdict(
-                    baseline_res, candidate_res, directives["criteria"])
 
-                window_desc = (
+                data_desc = (
+                    f"{data_origin}: "
                     f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
                     f"({len(bars)} × {feed_iv // 60}min bars "
                     f"≈ {native_est} native bars)")
+
+                # Walk-forward (SEE spec: 90d train / 90d test + Monte
+                # Carlo) when data allows; scaled windows on shorter
+                # spans; simple single-window A/B as last resort.
+                span_days = ((bars[-1].dt - bars[0].dt).days
+                             if len(bars) >= 2 else 0)
+                tr_d = te_d = 0
+                if validation == "deep":
+                    from src.evolution.evaluator import (
+                        DEEP_TRAIN_DAYS, DEEP_TEST_DAYS)
+                    tr_d, te_d = effective_windows(
+                        span_days, DEEP_TRAIN_DAYS, DEEP_TEST_DAYS)
+
+                if tr_d:
+                    ui(self._append_chat, "system",
+                       f"EVO 3/3: walk-forward validation — train {tr_d}d / "
+                       f"test {te_d}d + Monte Carlo "
+                       f"({base_cls_name} vs {candidate_cls.__name__})...")
+                    baseline_res = run_deep_validation(
+                        baseline_cls, bars, point_value, "基準 baseline",
+                        tr_d, te_d, monte_carlo=False)
+                    candidate_res = run_deep_validation(
+                        candidate_cls, bars, point_value,
+                        f"候選 {candidate_cls.__name__}", tr_d, te_d,
+                        monte_carlo=True)
+                    verdict = decide_deep_verdict(
+                        baseline_res, candidate_res, directives["criteria"])
+                    cl_base_m = (baseline_res.test.metrics
+                                 if baseline_res.test.result else None)
+                    cl_cand_m = (candidate_res.test.metrics
+                                 if candidate_res.test.result else None)
+                else:
+                    if validation == "deep":
+                        ui(self._append_chat, "system",
+                           f"EVO: data span {span_days}d too short for "
+                           f"walk-forward — using simple A/B.")
+                    ui(self._append_chat, "system",
+                       f"EVO 3/3: A/B backtest on {len(bars)} × "
+                       f"{feed_iv // 60}min bars ≈ {native_est} native bars "
+                       f"({base_cls_name} vs {candidate_cls.__name__})...")
+                    baseline_res = run_ab_backtest(
+                        baseline_cls, bars, point_value, "基準 baseline")
+                    candidate_res = run_ab_backtest(
+                        candidate_cls, bars, point_value,
+                        f"候選 {candidate_cls.__name__}")
+                    verdict = decide_verdict(
+                        baseline_res, candidate_res, directives["criteria"])
+                    cl_base_m = baseline_res.metrics
+                    cl_cand_m = candidate_res.metrics
 
                 saved_as = ""
                 if verdict.passed:
@@ -4080,6 +4153,8 @@ class BacktestApp:
                         from src.daily_report.changelog import append_changelog
 
                         def _mdict(m):
+                            if m is None:
+                                return None
                             pf = (None if m.profit_factor == float("inf")
                                   else round(m.profit_factor, 3))
                             return {"trades": m.total_trades, "pnl": m.total_pnl,
@@ -4092,17 +4167,22 @@ class BacktestApp:
                             version_after=candidate_cls.__name__,
                             change_summary=(
                                 f"auto-evolution candidate; "
+                                f"validation={'walk-forward' if tr_d else 'simple A/B'}; "
                                 f"criteria={directives['criteria']}; "
                                 f"plan excerpt: {plan[:300]}"),
                             initiated_by="ai",
-                            metrics_before=_mdict(baseline_res.metrics),
-                            metrics_after=_mdict(candidate_res.metrics),
+                            metrics_before=_mdict(cl_base_m),
+                            metrics_after=_mdict(cl_cand_m),
                         )
                     except Exception as e:
                         _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
 
-                block = format_verdict_block(
-                    baseline_res, candidate_res, verdict, window_desc, saved_as)
+                if tr_d:
+                    block = format_deep_verdict_block(
+                        baseline_res, candidate_res, verdict, data_desc, saved_as)
+                else:
+                    block = format_verdict_block(
+                        baseline_res, candidate_res, verdict, data_desc, saved_as)
                 ui(self._remove_last_system_line)
                 ui(self._append_chat, "system", block)
                 ui(self.status_var.set,
@@ -4114,7 +4194,68 @@ class BacktestApp:
             finally:
                 ui(lambda: self.btn_send.config(state=tk.NORMAL))
 
-        threading.Thread(target=_worker, daemon=True).start()
+        def _launch(launch_bars, origin):
+            evo_data["bars"] = launch_bars
+            evo_data["origin"] = origin
+            self._append_chat(
+                "user",
+                "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
+            self.btn_send.config(state=tk.DISABLED)
+            self._append_chat(
+                "system",
+                f"EVO 1/3: analyzing {total_trades} trades, "
+                f"generating evolution plan... (validation data: {origin})")
+            threading.Thread(target=_worker, daemon=True).start()
+
+        # ── Validation data dispatch ──
+        # Deep walk-forward wants train+test (+buffer) days of native
+        # bars. Fetch via Capital API when the quote session is up and
+        # the live bot is in steady RUNNING state (KLine routing goes to
+        # the backtest fetcher then — warmup/poll flags are False).
+        # Everything else falls back to local data.
+        can_api_fetch = (
+            validation == "deep" and live and self._quote_connected
+            and not self._live_warmup_mode
+            and self._live_runner.state == LiveState.RUNNING
+            and baseline_cls is not None
+            and self._evo_fetch_cb is None  # no fetch already in flight
+        )
+        if can_api_fetch:
+            from src.evolution.evaluator import DEEP_TRAIN_DAYS, DEEP_TEST_DAYS
+            need_days = DEEP_TRAIN_DAYS + DEEP_TEST_DAYS + 14  # warmup buffer
+            now_tpe = _taipei_now()
+            start = (now_tpe - timedelta(days=need_days)).strftime("%Y%m%d")
+            end = now_tpe.strftime("%Y%m%d")
+            symbol = self._live_runner.symbol
+            kt = baseline_cls.kline_type
+            km = baseline_cls.kline_minute
+            self._append_chat(
+                "system",
+                f"EVO 0/3: fetching ~{need_days}d of {km}min bars via "
+                f"Capital API for walk-forward validation...")
+            self._fetcher.start_api_fetch(symbol, kt, km, start, end)
+
+            def _on_evo_fetch_done(ok: bool):
+                # Deploy keeps the fetch buttons disabled during a live
+                # session — restore that invariant (the chunk-loop error
+                # path calls _enable_buttons()).
+                self.btn_api.config(state=tk.DISABLED)
+                self.btn_tv.config(state=tk.DISABLED)
+                api_bars = self._fetcher.get_api_bars() if ok else []
+                if api_bars:
+                    _launch(api_bars, f"Capital API ({need_days}d requested)")
+                else:
+                    fb, origin = _fallback_bars()
+                    self._append_chat(
+                        "system",
+                        f"EVO: API fetch failed — falling back to {origin}.")
+                    _launch(fb, origin)
+
+            self._evo_fetch_cb = _on_evo_fetch_done
+            self._fetch_next_chunk()
+        else:
+            fb, origin = _fallback_bars()
+            _launch(fb, origin)
 
     # ══════════════════════════════════════════════════════════════
     #  LIVE TRADING METHODS

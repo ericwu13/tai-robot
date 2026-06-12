@@ -73,3 +73,11 @@ evolution:
   # → A/B validation backtest → verdict; a PASS auto-saves the candidate to
   # the strategy store (deployment stays manual). false: plan-only.
   auto_pipeline: true
+  # Validation method for the auto-pipeline:
+  #   "deep" (default) — SEE-spec walk-forward: 90d train / 90d test
+  #     (out-of-sample decides the verdict) + Monte Carlo robustness
+  #     (±10% param jitter; fragile candidates fail). Validation data is
+  #     fetched via the Capital API when connected (~194 days); otherwise
+  #     local data is used and the windows scale down to the available span.
+  #   "simple" — single-window A/B on whatever data is at hand.
+  validation: "deep"
