@@ -298,6 +298,9 @@ def _load_settings():
             # every session end (the pre-2.12 behavior).
             evo = data.get("evolution", {})
             cfg["evolution_cadence"] = evo.get("cadence", "weekly")
+            # auto_pipeline: 🧬 runs plan → codegen → A/B validation →
+            # auto-save on PASS. false = plan-only (the old behavior).
+            cfg["evolution_auto_pipeline"] = evo.get("auto_pipeline", True)
             break
     return cfg
 
@@ -3729,13 +3732,41 @@ class BacktestApp:
             f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
             f"instead.\n"
             f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
+            f"## 機器可讀指令 Machine-readable directives (MANDATORY)\n"
+            f"END your reply with a fenced json block, nothing after it. Example:\n"
+            f"```json\n"
+            f'{{"action": "change", "max_drawdown_pct_max": 35, '
+            f'"profit_factor_min": 1.2, "win_rate_min": 0.45}}\n'
+            f"```\n"
+            f'- action: "change" when proposing a change; "no_change" when the '
+            f"plan is to keep running / collect data.\n"
+            f"- Include ONLY the criteria keys your validation section actually "
+            f"specifies. Units: max_drawdown_pct_max in percent, win_rate_min "
+            f"as a 0-1 fraction, profit_factor_min plain, total_pnl_min in "
+            f"points.\n\n"
             f"{report}\n\n"
             f"{timeframe_line}\n"
         )
 
-        self._dispatch_trade_analysis(
-            preamble, sent_lines, source_section, len(sent_lines),
-            label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
+        # Auto-pipeline: plan → codegen → A/B validation → verdict in one
+        # click. Needs the single-shot path (the plan response must be
+        # captured to drive codegen); oversized payloads degrade to the
+        # plan-only chunked delivery.
+        auto = self._settings.get("evolution_auto_pipeline", True)
+        est = (len(preamble) + sum(len(l) + 1 for l in sent_lines)
+               + len(source_section) + 300)
+        if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
+            self._start_evolution_pipeline(
+                preamble, sent_lines, source_section, result)
+        else:
+            if auto:
+                self._append_chat(
+                    "system",
+                    "EVO: payload too large for the auto-pipeline — "
+                    "falling back to plan-only mode.")
+            self._dispatch_trade_analysis(
+                preamble, sent_lines, source_section, len(sent_lines),
+                label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
 
         # Advance the evolution watermark: ALL current trades are now
         # covered (the omitted ones were covered by the previous run).
@@ -3821,6 +3852,210 @@ class BacktestApp:
             _log(f"evolution context build failed: [{type(e).__name__}] {e}")
 
         return "\n".join(lines) + "\n\n"
+
+    def _start_evolution_pipeline(self, preamble: str, trade_lines: list[str],
+                                  source_section: str, result) -> None:
+        """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
+
+        One click, no manual steps until deployment: the plan's own
+        machine-readable criteria gate the candidate, a PASS auto-saves
+        it to the StrategyStore and registers it in the dropdown.
+        Deploying to live trading stays manual by design.
+
+        Runs in a worker thread; every Tk touch goes through root.after.
+        """
+        context = (
+            preamble
+            + f"交易明細 Trade Details ({len(trade_lines)} trades):\n"
+            + "\n".join(trade_lines)
+            + source_section
+        )
+        total_trades = len(trade_lines)
+
+        # Snapshot everything the worker needs while on the main thread.
+        live = (self._live_runner is not None
+                and self._live_runner.state != LiveState.IDLE)
+        if live:
+            baseline_cls = type(self._live_runner.strategy)
+            bars = self._live_runner.get_bars()
+            point_value = self._live_runner.point_value
+        else:
+            baseline_cls = STRATEGIES.get(self.strategy_var.get())
+            bars = list(self._last_bars or [])
+            try:
+                point_value = int(self.pv_var.get())
+            except (ValueError, TypeError):
+                point_value = 200
+        display_name = self.strategy_var.get()
+        strategy_source = self._resolve_strategy_source(display_name, baseline_cls)
+        taken = {cls.__name__ for cls in STRATEGIES.values()}
+        try:
+            taken |= {e["class_name"] for e in self._strategy_store.list_strategies()}
+        except Exception:
+            pass
+
+        heavy_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
+
+        self._append_chat(
+            "user", "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
+        self.btn_send.config(state=tk.DISABLED)
+        self._append_chat(
+            "system",
+            f"EVO 1/3: analyzing {total_trades} trades, generating evolution plan...")
+
+        def ui(fn, *args):
+            self.root.after(0, fn, *args)
+
+        def _worker():
+            from src.evolution.pipeline import (
+                parse_plan_directives, next_candidate_name, run_ab_backtest,
+                decide_verdict, format_verdict_block)
+            try:
+                # ── Phase 1: evolution plan ──
+                plan = self._chat_client.send_message(
+                    context, call_site="bot_evolution", model=heavy_model)
+                conv = self._chat_client.conversation
+                if len(conv) >= 2 and conv[-2].get("role") == "user":
+                    conv[-2]["content"] = (
+                        f"[bot evolution payload — {total_trades} trades, "
+                        f"trimmed to save tokens]")
+                ui(self._on_chat_response, plan)
+
+                directives = parse_plan_directives(plan)
+                if directives["action"] == "no_change":
+                    ui(self._append_chat, "system",
+                       "🧬 EVO: 計畫為「不修改」— pipeline 結束。"
+                       "Plan says no change — pipeline stops here.")
+                    return
+                if not strategy_source:
+                    ui(self._append_chat, "system",
+                       "🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
+                       "Strategy source unavailable — plan-only.")
+                    return
+
+                # ── Phase 2: candidate codegen (one retry) ──
+                base_cls_name = baseline_cls.__name__ if baseline_cls else "Strategy"
+                candidate_name = next_candidate_name(base_cls_name, taken)
+                ui(self._append_chat, "system",
+                   f"EVO 2/3: generating candidate strategy {candidate_name}...")
+                gen_msg = (
+                    f"{STRATEGY_CODE_CONTEXT}\n\n"
+                    f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
+                    f"## Evolution plan to apply\n{plan}\n\n"
+                    f"## Task\n"
+                    f"Apply EXACTLY the single change specified in the evolution "
+                    f"plan to the strategy above. Keep ALL other logic identical. "
+                    f"The class MUST be named `{candidate_name}` and keep the same "
+                    f"kline_type / kline_minute. Output ONLY one ```python code "
+                    f"block containing the complete strategy file."
+                )
+                candidate_cls = None
+                code = ""
+                last_err = ""
+                for attempt in (1, 2):
+                    msg = gen_msg if attempt == 1 else (
+                        gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
+                        f"Fix the problem and output the complete corrected code.")
+                    resp = self._chat_client.one_shot(
+                        msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                        max_tokens=_CODE_GEN_MAX_TOKENS,
+                        call_site=f"evolution_codegen_{attempt}",
+                        model=heavy_model)
+                    code = extract_python_code(resp) or ""
+                    if not code:
+                        last_err = "no ```python code block found in the response"
+                        continue
+                    try:
+                        candidate_cls = load_strategy_from_source(code)
+                        break
+                    except (CodeValidationError, CodeExecutionError) as e:
+                        last_err = str(e)
+                if candidate_cls is None:
+                    ui(self._append_chat, "system",
+                       f"🧬 EVO FAIL: candidate generation failed twice — {last_err}")
+                    return
+
+                # ── Phase 3: A/B validation backtest ──
+                if len(bars) < 150:
+                    ui(self._append_chat, "system",
+                       f"🧬 EVO: only {len(bars)} bars in memory — not enough "
+                       f"for a meaningful validation backtest. Plan + candidate "
+                       f"generated but NOT validated/saved; run a TV/API "
+                       f"backtest manually.")
+                    return
+                ui(self._append_chat, "system",
+                   f"EVO 3/3: A/B backtest on {len(bars)} bars "
+                   f"({base_cls_name} vs {candidate_cls.__name__})...")
+                baseline_res = run_ab_backtest(
+                    baseline_cls, bars, point_value, "基準 baseline")
+                candidate_res = run_ab_backtest(
+                    candidate_cls, bars, point_value,
+                    f"候選 {candidate_cls.__name__}")
+                verdict = decide_verdict(
+                    baseline_res, candidate_res, directives["criteria"])
+
+                iv_min = bars[0].interval // 60 if bars else 0
+                window_desc = (
+                    f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
+                    f"({len(bars)} bars @ {iv_min}min — in-memory data, may be "
+                    f"shorter than the full session history)")
+
+                saved_as = ""
+                if verdict.passed:
+                    saved_as = f"AI: {candidate_cls.__name__}"
+
+                    def _save():
+                        try:
+                            self._strategy_store.save(
+                                candidate_cls.__name__, code,
+                                description=f"auto-evolution of {base_cls_name}")
+                            STRATEGIES[saved_as] = candidate_cls
+                            self.strategy_combo.config(values=list(STRATEGIES.keys()))
+                        except Exception as e:
+                            _log(f"EVO save failed: [{type(e).__name__}] {e}")
+                    ui(_save)
+
+                    try:
+                        from src.daily_report.changelog import append_changelog
+
+                        def _mdict(m):
+                            pf = (None if m.profit_factor == float("inf")
+                                  else round(m.profit_factor, 3))
+                            return {"trades": m.total_trades, "pnl": m.total_pnl,
+                                    "pf": pf,
+                                    "max_dd_pct": round(m.max_drawdown_pct, 2),
+                                    "win_rate": round(m.win_rate, 3)}
+                        append_changelog(
+                            strategy_name=display_name,
+                            version_before=base_cls_name,
+                            version_after=candidate_cls.__name__,
+                            change_summary=(
+                                f"auto-evolution candidate; "
+                                f"criteria={directives['criteria']}; "
+                                f"plan excerpt: {plan[:300]}"),
+                            initiated_by="ai",
+                            metrics_before=_mdict(baseline_res.metrics),
+                            metrics_after=_mdict(candidate_res.metrics),
+                        )
+                    except Exception as e:
+                        _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+
+                block = format_verdict_block(
+                    baseline_res, candidate_res, verdict, window_desc, saved_as)
+                ui(self._remove_last_system_line)
+                ui(self._append_chat, "system", block)
+                ui(self.status_var.set,
+                   f"🧬 EVO {'PASS — saved ' + saved_as if verdict.passed else 'FAIL — candidate rejected'}")
+            except Exception as e:
+                _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+                err_msg = str(e)
+                ui(self._on_chat_error, err_msg)
+            finally:
+                ui(lambda: self.btn_send.config(state=tk.NORMAL))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ══════════════════════════════════════════════════════════════
     #  LIVE TRADING METHODS

@@ -69,3 +69,7 @@ evolution:
   # The 🧬 Bot Evolution button generates an AI improvement plan on demand
   # regardless of this setting.
   cadence: "weekly"
+  # true (default): 🧬 runs the full auto-pipeline — plan → candidate codegen
+  # → A/B validation backtest → verdict; a PASS auto-saves the candidate to
+  # the strategy store (deployment stays manual). false: plan-only.
+  auto_pipeline: true
