@@ -85,3 +85,9 @@ evolution:
   #     local data is used and the windows scale down to the available span.
   #   "simple" — single-window A/B on whatever data is at hand.
   validation: "deep"
+  # Walk-forward holdout: the most recent N days of trade evidence are
+  # WITHHELD from the AI when it designs the change ("train" = older data
+  # only) and the verdict is decided on this unseen window ("test"). The
+  # cut rolls forward each cycle — this week's holdout becomes next week's
+  # design data.
+  holdout_days: 14
