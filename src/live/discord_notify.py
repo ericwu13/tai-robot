@@ -168,6 +168,24 @@ class DiscordNotifier:
             f"來源 source: `{source}`"
         )
 
+    def evolution_verdict(self, passed: bool, verdict_block: str) -> None:
+        """Send the 🧬 evolution pipeline verdict (manual or weekly auto).
+
+        The block is the same text shown in the chat log, wrapped in a
+        code fence for monospace alignment. Discord caps messages at
+        2000 chars — truncate the body defensively (header + fences eat
+        some budget).
+        """
+        body = verdict_block
+        if len(body) > 1700:
+            body = body[:1700] + "\n…(truncated)"
+        icon = "✅" if passed else "❌"
+        self._send(
+            f"{self._header()}\n"
+            f"🧬 **演化結果 Evolution {'PASS' if passed else 'FAIL'}** {icon}\n"
+            f"```\n{body}\n```"
+        )
+
     def daily_report(self, report: dict) -> None:
         """Send a daily report summary to Discord."""
         date = report.get("date", "?")
