@@ -1394,6 +1394,16 @@ class BacktestApp:
         # Metrics tab
         metrics_frame = ttk.Frame(notebook)
         notebook.add(metrics_frame, text="績效報告 Report")
+        report_bar = ttk.Frame(metrics_frame)
+        report_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Label(report_bar, text="檢視 View:").pack(side=tk.LEFT, padx=(0, 4))
+        self.report_filter_var = tk.StringVar(value="全部 All")
+        self.report_filter_combo = ttk.Combobox(
+            report_bar, textvariable=self.report_filter_var,
+            values=["全部 All", "實單 Real"], state="readonly", width=12)
+        self.report_filter_combo.pack(side=tk.LEFT)
+        self.report_filter_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_report_filter_changed())
         self.metrics_text = scrolledtext.ScrolledText(metrics_frame, wrap=tk.WORD,
                                                        font=("Consolas", 11))
         self.metrics_text.pack(fill=tk.BOTH, expand=True)
@@ -2948,6 +2958,14 @@ class BacktestApp:
         self._append_chat("error", f"Backtest runtime error:\n{error}")
         self._enable_buttons()
 
+    def _on_report_filter_changed(self):
+        """Re-render the Report tab when the 檢視 View filter changes."""
+        result = (self._live_runner.get_result()
+                  if self._live_runner and self._live_runner.state != LiveState.IDLE
+                  else self._last_result)
+        if result is not None:
+            self._display_results(result, self._last_bars)
+
     def _display_results(self, result, bars: list[Bar] | None = None):
         # Metrics report
         self.metrics_text.delete("1.0", tk.END)
@@ -2982,8 +3000,26 @@ class BacktestApp:
             header_lines.append(f" 1分K / 聚合K  1m/Agg:  {status['bars_1m']} / {status['bars_agg']}")
         self.metrics_text.insert(tk.END, "\n".join(header_lines) + "\n\n")
 
-        report = format_report(result.strategy_name, result.metrics,
-                               trades=result.trades)
+        # 檢視 View filter: "全部 All" = full simulated view (every trade
+        # has a simulated fill); "實單 Real" = the same full report
+        # recomputed on only the broker-executed subset.
+        if self.report_filter_var.get().startswith("實單"):
+            rtrades = [t for t in result.trades
+                       if getattr(t, "source", "") == "real"]
+            if rtrades:
+                req, cum = [], 0
+                for t in rtrades:
+                    cum += t.pnl
+                    req.append(cum)
+                rmetrics = calculate_metrics(rtrades, req, initial_balance=0)
+                report = format_report(
+                    f"{result.strategy_name} — 實單 Real only", rmetrics)
+            else:
+                report = ("(無實單交易 No real-order trades in this result — "
+                          "switch 檢視 View back to 全部 All)")
+        else:
+            report = format_report(result.strategy_name, result.metrics,
+                                   trades=result.trades)
         self.metrics_text.insert(tk.END, report)
 
         # Trade list

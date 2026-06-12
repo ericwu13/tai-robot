@@ -59,11 +59,9 @@ def format_report(strategy_name: str, metrics: PerformanceMetrics,
             rm = calculate_metrics(real, real_eq, initial_balance=0)
             rpf = (f"{rm.profit_factor:.2f}"
                    if rm.profit_factor != float("inf") else "INF")
-            small = ("\uff08\u6a23\u672c\u5c11\uff0c\u50c5\u4f9b\u53c3\u8003 small sample\uff09"
-                     if len(real) < 10 else "")
             lines.extend([
                 "-" * 60,
-                f" \u5be6\u55ae\u7d71\u8a08 Real-Order Subset: {len(real)} trades {small}",
+                f" \u5be6\u55ae\u7d71\u8a08 Real-Order Subset: {len(real)} trades",
                 f" \u5be6\u55ae\u52dd\u7387 Real Win Rate:       {rm.win_rate * 100:>11.1f}%"
                 f"  ({rm.winning_trades}W / {rm.losing_trades}L)",
                 f" \u5be6\u55ae\u640d\u76ca Real P&L:            {rm.total_pnl:>12,}",
