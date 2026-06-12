@@ -45,6 +45,14 @@ _CRITERIA_KEYS = (
 # produces zero drawdown. Floor, not a fitness gate (that's MIN_TRADES).
 MIN_CANDIDATE_TRADES = 10
 
+# Non-collapse gate on the DESIGN-side (train) window: the holdout
+# decides the verdict, but a candidate that blows up on the very data
+# its change was designed from is curve-fit to a sub-period. Generous
+# ratios — this only catches collapse, not mild degradation (e.g. the
+# observed atr-stop case: candidate train MaxDD 71% vs baseline 21%).
+TRAIN_COLLAPSE_PF_RATIO = 0.8   # candidate PF < 80% of baseline's → collapse
+TRAIN_COLLAPSE_DD_RATIO = 1.5   # candidate MaxDD% > 150% of baseline's → collapse
+
 
 def parse_plan_directives(plan_text: str) -> dict[str, Any]:
     """Extract the machine-readable directives from an evolution plan.
@@ -194,22 +202,48 @@ def decide_verdict(baseline: ABResult, candidate: ABResult,
     return EvolutionVerdict(floor_ok and ok_pf and ok_dd, reasons)
 
 
-def effective_windows(span_days: int, train_days: int,
-                      test_days: int) -> tuple[int, int]:
-    """Scale the walk-forward windows to the available history.
+def design_cutoff_index(trades: list, start: int, cut: str) -> int:
+    """First index ≥ ``start`` whose exit_dt falls in the holdout (≥ cut).
 
-    Full SEE-spec windows (90/90) when data suffices. With less data the
-    split is scaled — test gets half the span (min 7 days), train the
-    rest — so the verdict stays out-of-sample, just over a shorter
-    horizon. Below 21 days walk-forward is meaningless: returns (0, 0)
-    to tell the caller to use the simple single-window A/B instead.
+    Trades are appended in close order, so the holdout is a suffix of
+    the list: everything before the returned index is design evidence,
+    everything from it on is withheld. Trades with no exit_dt can't be
+    dated — they stay in the design set (conservative: the AI may see
+    them, the verdict window never contains them since they predate
+    the live session's recent tail).
+
+    ``cut`` is a "YYYY-MM-DD HH:MM" string — zero-padded ISO ordering
+    makes lexicographic comparison correct.
     """
-    if span_days >= train_days + test_days:
-        return train_days, test_days
-    if span_days < 21:
-        return 0, 0
-    test = max(7, span_days // 2)
-    return span_days - test, test
+    for i in range(start, len(trades)):
+        ed = getattr(trades[i], "exit_dt", "")
+        if ed and ed >= cut:
+            return i
+    return len(trades)
+
+
+def compute_design_cut(trades: list, holdout_days: int) -> str:
+    """The design/holdout boundary as a "YYYY-MM-DD HH:MM" string.
+
+    Anchored at the LAST trade's exit (the evidence timeline), not the
+    wall clock — a bot idle for weeks would otherwise put its entire
+    history in the design set and leave an empty holdout. Falls back
+    to "" (no holdout) when no trade is parseable.
+    """
+    last_exit = ""
+    for t in reversed(trades):
+        ed = getattr(t, "exit_dt", "")
+        if ed:
+            last_exit = ed
+            break
+    if not last_exit:
+        return ""
+    try:
+        from datetime import datetime as _dt
+        anchor = _dt.strptime(last_exit[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return ""
+    return (anchor - timedelta(days=holdout_days)).strftime("%Y-%m-%d %H:%M")
 
 
 def split_train_test(bars: list, train_days: int,
@@ -315,6 +349,27 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
             "OOS composite gated on both sides (< 30 test-window trades) — "
             "composite gate skipped")
 
+    # Design-window non-collapse gate: catastrophic in-sample degradation
+    # means the change is curve-fit to a sub-period, no matter how the
+    # (often small) holdout looks.
+    ctm, btm = candidate.train.metrics, baseline.train.metrics
+    if (ctm is not None and btm is not None
+            and ctm.total_trades > 0 and btm.total_trades > 0):
+        if btm.profit_factor not in (0.0, float("inf")):
+            pf_ratio = ctm.profit_factor / btm.profit_factor
+            ok = pf_ratio >= TRAIN_COLLAPSE_PF_RATIO
+            reasons.append(
+                f"design-window PF ratio {pf_ratio:.2f} ≥ "
+                f"{TRAIN_COLLAPSE_PF_RATIO:g}: {'✓' if ok else '✗ (collapse)'}")
+            passed = passed and ok
+        base_dd = max(btm.max_drawdown_pct, 1.0)  # floor avoids div-by-~0
+        dd_ratio = ctm.max_drawdown_pct / base_dd
+        ok = dd_ratio <= TRAIN_COLLAPSE_DD_RATIO
+        reasons.append(
+            f"design-window MaxDD ratio {dd_ratio:.2f} ≤ "
+            f"{TRAIN_COLLAPSE_DD_RATIO:g}: {'✓' if ok else '✗ (collapse)'}")
+        passed = passed and ok
+
     sub = decide_verdict(baseline.test, candidate.test, criteria)
     reasons.extend(sub.reasons)
     passed = passed and sub.passed
@@ -328,12 +383,12 @@ def format_deep_verdict_block(baseline: DeepResult, candidate: DeepResult,
     lines = [
         f"🧬 EVO VERDICT (walk-forward) — {'PASS ✅' if verdict.passed else 'FAIL ❌'}",
         f"資料 Data: {data_desc}",
-        f"訓練期 Train (in-sample): {candidate.train_span}",
-        f"測試期 Test (out-of-sample, decides verdict): {candidate.test_span}",
-        "── 訓練期 In-sample ──",
+        f"訓練期 Train (design evidence): {candidate.train_span}",
+        f"測試期 Test (holdout — UNSEEN by design, decides verdict): {candidate.test_span}",
+        "── 訓練期 Design window (in-sample) ──",
         _side_summary(baseline.train),
         _side_summary(candidate.train),
-        "── 測試期 Out-of-sample ──",
+        "── 測試期 Holdout (out-of-sample) ──",
         _side_summary(baseline.test),
         _side_summary(candidate.test),
         ("依計畫標準 plan criteria + walk-forward gates:" if verdict.used_criteria
@@ -342,6 +397,10 @@ def format_deep_verdict_block(baseline: DeepResult, candidate: DeepResult,
     lines.extend(f"  {r}" for r in verdict.reasons)
     if verdict.passed and saved_as:
         lines.append(f"已存檔 Saved as「{saved_as}」— 部署仍需手動 deploy manually when ready.")
+        lines.append(
+            "建議孵化 Forward incubation: deploy it in PAPER mode on the same "
+            "session for ≥14 days / ≥30 trades before switching to "
+            "semi_auto — the future is the only true out-of-sample test.")
     elif not verdict.passed:
         lines.append("候選未通過，未存檔 Candidate rejected — nothing was saved.")
     return "\n".join(lines)
@@ -377,6 +436,10 @@ def format_verdict_block(baseline: ABResult, candidate: ABResult,
     lines.extend(f"  {r}" for r in verdict.reasons)
     if verdict.passed and saved_as:
         lines.append(f"已存檔 Saved as「{saved_as}」— 部署仍需手動 deploy manually when ready.")
+        lines.append(
+            "建議孵化 Forward incubation: deploy it in PAPER mode on the same "
+            "session for ≥14 days / ≥30 trades before switching to "
+            "semi_auto — the future is the only true out-of-sample test.")
     elif not verdict.passed:
         lines.append("候選未通過，未存檔 Candidate rejected — nothing was saved.")
     return "\n".join(lines)

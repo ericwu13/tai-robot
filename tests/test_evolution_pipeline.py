@@ -253,26 +253,81 @@ class TestFormatVerdictBlock:
 
 # ── walk-forward validation ──
 
-class TestEffectiveWindows:
-    def test_full_spec_when_data_suffices(self):
-        from src.evolution.pipeline import effective_windows
-        assert effective_windows(200, 90, 90) == (90, 90)
+def _trade_at(exit_dt: str, pnl: int = 100):
+    return Trade(tag="L", side=OrderSide.LONG, qty=1, entry_price=20000,
+                 exit_price=20000 + pnl, entry_bar_index=0, exit_bar_index=1,
+                 pnl=pnl, exit_dt=exit_dt)
 
-    def test_scaled_on_short_span(self):
-        from src.evolution.pipeline import effective_windows
-        tr, te = effective_windows(50, 90, 90)
-        assert tr == 25 and te == 25
 
-    def test_test_window_floor_seven_days(self):
-        from src.evolution.pipeline import effective_windows
-        tr, te = effective_windows(22, 90, 90)
-        assert te >= 7
-        assert tr + te == 22
+class TestDesignHoldoutSplit:
+    def test_cut_anchored_at_last_exit(self):
+        from src.evolution.pipeline import compute_design_cut
+        trades = [_trade_at("2026-06-01 10:00"), _trade_at("2026-06-12 04:58")]
+        cut = compute_design_cut(trades, 14)
+        assert cut == "2026-05-29 04:58"
 
-    def test_too_short_signals_simple_fallback(self):
-        from src.evolution.pipeline import effective_windows
-        assert effective_windows(20, 90, 90) == (0, 0)
-        assert effective_windows(0, 90, 90) == (0, 0)
+    def test_cut_empty_without_dated_trades(self):
+        from src.evolution.pipeline import compute_design_cut
+        assert compute_design_cut([], 14) == ""
+        assert compute_design_cut([_trade_at("")], 14) == ""
+
+    def test_holdout_is_a_suffix(self):
+        from src.evolution.pipeline import design_cutoff_index
+        trades = [_trade_at("2026-05-01 10:00"),
+                  _trade_at("2026-05-20 10:00"),
+                  _trade_at("2026-06-05 10:00"),
+                  _trade_at("2026-06-10 10:00")]
+        idx = design_cutoff_index(trades, 0, "2026-06-01 00:00")
+        assert idx == 2  # first two are design, last two holdout
+
+    def test_no_holdout_trades(self):
+        from src.evolution.pipeline import design_cutoff_index
+        trades = [_trade_at("2026-05-01 10:00")]
+        assert design_cutoff_index(trades, 0, "2026-06-01 00:00") == 1
+
+    def test_all_in_holdout(self):
+        from src.evolution.pipeline import design_cutoff_index
+        trades = [_trade_at("2026-06-05 10:00")]
+        assert design_cutoff_index(trades, 0, "2026-06-01 00:00") == 0
+
+    def test_undated_trade_stays_in_design(self):
+        from src.evolution.pipeline import design_cutoff_index
+        trades = [_trade_at(""), _trade_at("2026-06-05 10:00")]
+        assert design_cutoff_index(trades, 0, "2026-06-01 00:00") == 1
+
+    def test_start_offset_respected(self):
+        from src.evolution.pipeline import design_cutoff_index
+        trades = [_trade_at("2026-06-05 10:00"),
+                  _trade_at("2026-06-06 10:00")]
+        # scanning from index 1 cannot return less than 1
+        assert design_cutoff_index(trades, 1, "2026-06-01 00:00") == 1
+
+
+class TestTrainCollapseGate:
+    def _deep2(self, name, train_pnls, test_pnls, mc=0.1):
+        from src.evolution.pipeline import DeepResult
+        return DeepResult(name=name, train=_ab(f"{name} train", train_pnls),
+                          test=_ab(f"{name} test", test_pnls),
+                          fragile=False, mc_variance=mc,
+                          train_span="t", test_span="t")
+
+    def test_train_dd_collapse_fails_despite_good_holdout(self):
+        from src.evolution.pipeline import decide_deep_verdict
+        # baseline train: mild DD; candidate train: deep DD (curve-fit
+        # signature, like the observed atr-1.5 case: 71% vs 21%)
+        base = self._deep2("base", [200, -100] * 20, [100, -200] * 10)
+        cand = self._deep2("cand", [500, -450, -450, 500] * 10,
+                           [200, -100] * 10)
+        v = decide_deep_verdict(base, cand, None)
+        assert not v.passed
+        assert any("collapse" in r for r in v.reasons)
+
+    def test_healthy_ratios_pass(self):
+        from src.evolution.pipeline import decide_deep_verdict
+        base = self._deep2("base", [100, -200] * 20, [100, -200] * 10)
+        cand = self._deep2("cand", [120, -180] * 20, [200, -100] * 10)
+        v = decide_deep_verdict(base, cand, None)
+        assert v.passed
 
 
 class TestSplitTrainTest:
@@ -387,5 +442,6 @@ class TestFormatDeepVerdictBlock:
         block = format_deep_verdict_block(base, cand, v, "Capital API",
                                           saved_as="AI: FooEvo1")
         assert "walk-forward" in block
-        assert "Out-of-sample" in block
+        assert "out-of-sample" in block
+        assert "UNSEEN by design" in block
         assert "訓練期" in block and "測試期" in block
