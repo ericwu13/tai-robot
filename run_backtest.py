@@ -4578,25 +4578,51 @@ class BacktestApp:
         if resume_session:
             saved_strategy = resume_session.get("strategy", "")
             saved_symbol = resume_session.get("symbol", "")
-            # Find matching strategy in dropdown
-            matched = False
-            for name in STRATEGIES:
-                if name == saved_strategy or name.endswith(saved_strategy):
-                    self.strategy_var.set(name)
-                    matched = True
-                    break
-            if not matched:
-                # Try AI strategies
+
+            # The user may have deliberately selected a DIFFERENT strategy
+            # (e.g. a passed evolution candidate「AI: ...Evo1」). Silently
+            # reverting to the saved one would discard that choice — this
+            # is THE handoff path for evolved strategies: same bot dir
+            # keeps the broker history, watermark, and fitness baseline,
+            # so the next evolution judges the new version on its own
+            # trades. Exact display-name comparison (an Evo candidate
+            # CONTAINS the base name — substring match would misfire).
+            current_strategy = self.strategy_var.get()
+            use_current = False
+            if (saved_strategy and current_strategy
+                    and current_strategy != saved_strategy):
+                use_current = messagebox.askyesno(
+                    "策略更換 Strategy Change",
+                    f"此機器人上次執行的策略 Saved strategy:\n"
+                    f"  {saved_strategy}\n"
+                    f"目前選擇 Currently selected:\n"
+                    f"  {current_strategy}\n\n"
+                    f"是 Yes — 以目前選擇的策略部署，沿用交易紀錄與演化基準\n"
+                    f"  deploy the SELECTED strategy on this session "
+                    f"(keeps trade history, watermark, baseline)\n"
+                    f"否 No — 還原為上次的策略 revert to the saved strategy\n\n"
+                    f"(建議相同時框 same timeframe recommended)")
+
+            if not use_current:
+                # Find matching strategy in dropdown
+                matched = False
                 for name in STRATEGIES:
-                    if name.startswith("AI:") and saved_strategy in name:
+                    if name == saved_strategy or name.endswith(saved_strategy):
                         self.strategy_var.set(name)
                         matched = True
                         break
-            if not matched:
-                messagebox.showerror("Strategy Not Found",
-                                     f"找不到策略 Strategy '{saved_strategy}' not found.\n"
-                                     "請確認策略已載入 Please ensure the strategy is loaded.")
-                return
+                if not matched:
+                    # Try AI strategies
+                    for name in STRATEGIES:
+                        if name.startswith("AI:") and saved_strategy in name:
+                            self.strategy_var.set(name)
+                            matched = True
+                            break
+                if not matched:
+                    messagebox.showerror("Strategy Not Found",
+                                         f"找不到策略 Strategy '{saved_strategy}' not found.\n"
+                                         "請確認策略已載入 Please ensure the strategy is loaded.")
+                    return
             if saved_symbol and saved_symbol in [v for v in self.symbol_combo['values']]:
                 self.symbol_var.set(saved_symbol)
                 self._on_symbol_changed()
