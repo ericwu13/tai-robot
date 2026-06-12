@@ -3744,8 +3744,12 @@ class BacktestApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _bot_evolution(self):
+    def _bot_evolution(self, auto_run: bool = False):
         """🧬 Bot Evolution — ask the AI for a structured improvement plan.
+
+        ``auto_run=True`` = the weekly Saturday trigger: no dialogs
+        (no-new-trades silently skips instead of asking), early stops
+        are also reported to Discord since nobody is at the screen.
 
         Differs from AI Review in two ways: the prompt includes the
         evolution fitness context (composite score, baseline best,
@@ -3776,7 +3780,19 @@ class BacktestApp:
         omitted = _evolution_omitted_count(len(trade_lines), watermark)
         if watermark and omitted >= len(trade_lines):
             # Nothing new since the last evolution — evolving on the
-            # same sample is overfitting bait. Allow an explicit re-run.
+            # same sample is overfitting bait.
+            if auto_run:
+                msg = (f"🧬 EVO (weekly auto): 上次演化後沒有新交易，跳過。"
+                       f"No new trades since last evolution "
+                       f"({watermark['at']}) — skipped.")
+                self._append_chat("system", msg)
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify(msg)
+                    except Exception:
+                        pass
+                return
+            # Manual click: allow an explicit full-history re-run.
             if not messagebox.askyesno(
                     "Bot Evolution",
                     f"上次演化（{watermark['at']}）後沒有新交易。\n"
@@ -3846,7 +3862,8 @@ class BacktestApp:
                + len(source_section) + 300)
         if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
             self._start_evolution_pipeline(
-                preamble, sent_lines, source_section, result)
+                preamble, sent_lines, source_section, result,
+                auto_run=auto_run)
         else:
             if auto:
                 self._append_chat(
@@ -3943,7 +3960,8 @@ class BacktestApp:
         return "\n".join(lines) + "\n\n"
 
     def _start_evolution_pipeline(self, preamble: str, trade_lines: list[str],
-                                  source_section: str, result) -> None:
+                                  source_section: str, result,
+                                  auto_run: bool = False) -> None:
         """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
 
         One click, no manual steps until deployment: the plan's own
@@ -4023,6 +4041,16 @@ class BacktestApp:
                 format_deep_verdict_block)
             bars = evo_data["bars"]
             data_origin = evo_data["origin"]
+
+            def _notify_discord(msg: str) -> None:
+                # DiscordNotifier._send spawns its own thread — safe to
+                # call from this worker. Best-effort, never kills the run.
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify(msg)
+                    except Exception:
+                        pass
+
             try:
                 # ── Phase 1: evolution plan ──
                 plan = self._chat_client.send_message(
@@ -4036,14 +4064,18 @@ class BacktestApp:
 
                 directives = parse_plan_directives(plan)
                 if directives["action"] == "no_change":
-                    ui(self._append_chat, "system",
-                       "🧬 EVO: 計畫為「不修改」— pipeline 結束。"
-                       "Plan says no change — pipeline stops here.")
+                    msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
+                           "Plan says no change — pipeline stops here.")
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
                     return
                 if not strategy_source:
-                    ui(self._append_chat, "system",
-                       "🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
-                       "Strategy source unavailable — plan-only.")
+                    msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
+                           "Strategy source unavailable — plan-only.")
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
                     return
 
                 # ── Phase 2: candidate codegen (one retry) ──
@@ -4084,8 +4116,10 @@ class BacktestApp:
                     except (CodeValidationError, CodeExecutionError) as e:
                         last_err = str(e)
                 if candidate_cls is None:
-                    ui(self._append_chat, "system",
-                       f"🧬 EVO FAIL: candidate generation failed twice — {last_err}")
+                    msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
                     return
 
                 # ── Phase 3: validation backtest ──
@@ -4097,11 +4131,13 @@ class BacktestApp:
                 if feed_iv and native_sec > feed_iv:
                     native_est = len(bars) * feed_iv // native_sec
                 if native_est < 150:
-                    ui(self._append_chat, "system",
-                       f"🧬 EVO: only ~{native_est} native bars of data "
-                       f"available — not enough for a meaningful validation "
-                       f"backtest. Plan + candidate generated but NOT "
-                       f"validated/saved; run a TV/API backtest manually.")
+                    msg = (f"🧬 EVO: only ~{native_est} native bars of data "
+                           f"available — not enough for a meaningful validation "
+                           f"backtest. Plan + candidate generated but NOT "
+                           f"validated/saved; run a TV/API backtest manually.")
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
                     return
 
                 data_desc = (
@@ -4212,6 +4248,13 @@ class BacktestApp:
                 ui(self._append_chat, "system", block)
                 ui(self.status_var.set,
                    f"🧬 EVO {'PASS — saved ' + saved_as if verdict.passed else 'FAIL — candidate rejected'}")
+                # Verdict goes to Discord from BOTH manual and weekly-auto
+                # runs (manual too, per user: testing + visibility).
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.evolution_verdict(verdict.passed, block)
+                    except Exception:
+                        pass
             except Exception as e:
                 _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 err_msg = str(e)
@@ -5576,6 +5619,23 @@ class BacktestApp:
                 f"{fit.composite:.3f} — {verdict.reason}",
                 "status",
             )
+
+        # Weekly auto-evolution: after the fitness check, run the full
+        # pipeline (plan → codegen → walk-forward → verdict → Discord).
+        # ALWAYS pinned to the weekly window — even when the fitness
+        # cadence is "daily", the pipeline spends AI tokens and must not
+        # fire every session end. The watermark makes repeats safe: a
+        # second fire in the same window finds no new trades and skips.
+        if self._settings.get("evolution_auto_pipeline", True):
+            from src.evolution.notify import EVOLUTION_CADENCE_WEEKLY
+            if should_run_evolution_check(EVOLUTION_CADENCE_WEEKLY):
+                try:
+                    self._live_log_msg(
+                        "🧬 週末自動演化 Weekly auto-evolution starting...",
+                        "status")
+                    self._bot_evolution(auto_run=True)
+                except Exception as e:
+                    _log(f"weekly auto-evolution failed: [{type(e).__name__}] {e}")
 
     # ── Semi-auto real order handling ──
 
