@@ -636,3 +636,57 @@ class TestConversationAutoTruncation:
         ]
         client._enforce_conversation_size()
         assert len(client.conversation) == 2
+
+
+class TestGeminiModelFallback:
+    """_post_gemini: a 404 on a tier-override (preview) model retries once
+    with the configured default instead of failing the call — preview
+    model ids get renamed/retired by Google."""
+
+    def _make_client(self) -> ChatClient:
+        return ChatClient("key", provider=PROVIDER_GOOGLE, model=GOOGLE_MODEL_PRO)
+
+    def test_404_on_override_falls_back_to_default(self):
+        client = self._make_client()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _google_error("model not found", 404),
+            _google_response("plan text"),
+        ]
+        out = client.one_shot("hi", call_site="test", model=GOOGLE_MODEL_ULTRA)
+        assert "plan text" in out
+        assert client._client.post.call_count == 2
+        url2 = client._client.post.call_args_list[1][0][0]
+        assert GOOGLE_MODEL_PRO in url2
+
+    def test_404_on_default_model_not_retried(self):
+        client = self._make_client()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_error("nf", 404)
+        with pytest.raises(RuntimeError):
+            client.one_shot("hi", call_site="test", model=GOOGLE_MODEL_PRO)
+        assert client._client.post.call_count == 1
+
+    def test_non_404_error_not_retried(self):
+        client = self._make_client()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_error("rate limited", 429)
+        with pytest.raises(RuntimeError):
+            client.one_shot("hi", call_site="test", model=GOOGLE_MODEL_ULTRA)
+        assert client._client.post.call_count == 1
+
+    def test_send_message_also_falls_back(self):
+        client = self._make_client()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _google_error("model not found", 404),
+            _google_response("answer"),
+        ]
+        out = client.send_message("hi", call_site="test", model=GOOGLE_MODEL_ULTRA)
+        assert "answer" in out
+        assert client._client.post.call_count == 2
+
+    def test_ultra_model_name_is_the_preview_id(self):
+        # Regression: "gemini-3.1-pro" (no -preview) 404s on v1beta —
+        # verified against ListModels 2026-06-11.
+        assert GOOGLE_MODEL_ULTRA == "gemini-3.1-pro-preview"

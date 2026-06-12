@@ -32,7 +32,11 @@ DEFAULT_MODELS = {
 # is enabled (via settings.yaml ``ai.ultra_mode`` or env ``ULTRA_MODE=1``).
 GOOGLE_MODEL_PRO = "gemini-2.5-pro"
 GOOGLE_MODEL_FLASH = "gemini-2.5-flash"
-GOOGLE_MODEL_ULTRA = "gemini-3.1-pro"
+# NOTE: verified against ListModels 2026-06-11 — the GA name
+# "gemini-3.1-pro" does NOT exist on v1beta; only the -preview id does.
+# Preview models get renamed/retired, which is why _post_gemini falls
+# back to the configured default on 404 instead of failing the call.
+GOOGLE_MODEL_ULTRA = "gemini-3.1-pro-preview"
 
 # Auto-truncate conversation when its total char size exceeds this threshold
 # in send_message().  The first message is always kept; the most recent N
@@ -365,6 +369,26 @@ class ChatClient:
         assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok, used_model)
         return assistant_text
 
+    def _post_gemini(self, payload: dict, used_model: str):
+        """POST to Gemini; on 404 for a tier-override model, retry once
+        with the configured default.
+
+        The ultra tier points at a PREVIEW model id — Google renames and
+        retires those, so a stale name must degrade to the standard
+        model instead of killing the caller's whole run (e.g. the
+        evolution pipeline). Returns ``(response, actual_model_used)``
+        so usage logging and the chat footer reflect reality.
+        """
+        headers = {"content-type": "application/json"}
+        url = GOOGLE_API_URL.format(model=used_model) + f"?key={self.api_key}"
+        response = self._client.post(url, json=payload, headers=headers)
+        if response.status_code == 404 and used_model != self.model:
+            fallback = self.model or GOOGLE_MODEL_PRO
+            url = GOOGLE_API_URL.format(model=fallback) + f"?key={self.api_key}"
+            response = self._client.post(url, json=payload, headers=headers)
+            used_model = fallback
+        return response, used_model
+
     def _send_google(self, user_message: str, *, call_site: str, model: str | None) -> str:
         """Send via Google Gemini API."""
         used_model = model or self.model
@@ -395,10 +419,7 @@ class ChatClient:
         if system_instruction:
             payload["system_instruction"] = system_instruction
 
-        url = GOOGLE_API_URL.format(model=used_model) + f"?key={self.api_key}"
-        headers = {"content-type": "application/json"}
-
-        response = self._client.post(url, json=payload, headers=headers)
+        response, used_model = self._post_gemini(payload, used_model)
 
         if response.status_code != 200:
             error_body = response.text
@@ -515,10 +536,7 @@ class ChatClient:
         if system_prompt:
             payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
 
-        url = GOOGLE_API_URL.format(model=used_model) + f"?key={self.api_key}"
-        headers = {"content-type": "application/json"}
-
-        response = self._client.post(url, json=payload, headers=headers)
+        response, used_model = self._post_gemini(payload, used_model)
 
         if response.status_code != 200:
             error_body = response.text

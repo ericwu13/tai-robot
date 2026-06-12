@@ -56,8 +56,9 @@ ai:
   # sessions that's expensive and rarely worth it.
   recap_token_gate: 30
   # When true, "heavy" tier calls (codegen, trade review, pine export) use the
-  # most capable model (gemini-3.1-pro) instead of gemini-2.5-pro.  Costs more.
-  # Env var ULTRA_MODE=1 overrides this at runtime.
+  # most capable model (gemini-3.1-pro-preview) instead of gemini-2.5-pro.
+  # Costs more. Env var ULTRA_MODE=1 overrides this at runtime. If Google
+  # renames/retires the preview model (404), calls fall back to the default.
   ultra_mode: false
 
 evolution:
