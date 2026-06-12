@@ -351,6 +351,28 @@ def _evolution_omitted_count(total_trades: int, watermark: dict | None) -> int:
     return min(int(watermark.get("trade_count", 0) or 0), total_trades)
 
 
+def _read_persisted_ultra_mode() -> bool:
+    """The settings.yaml ai.ultra_mode value — the durable DEFAULT.
+
+    Distinct from the session value in self._settings["ultra_mode"],
+    which the 🚀 header button flips without persisting. The AI Settings
+    dialog must show this persisted default, NOT the session value —
+    otherwise a session-only toggle followed by saving unrelated AI
+    settings would silently persist ultra mode.
+    """
+    if not yaml:
+        return False
+    path = os.path.join(project_root, "settings.yaml")
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return bool((data.get("ai") or {}).get("ultra_mode", False))
+    except Exception:
+        return False
+
+
 def _ultra_toggle_decision(current: bool, confirm) -> bool | None:
     """Guard logic for the Ultra Mode toggle button.
 
@@ -2045,20 +2067,22 @@ class BacktestApp:
         self.btn_ultra.config(text=f"🚀 Ultra: {'ON' if on else 'OFF'}")
 
     def _toggle_ultra_mode(self) -> None:
-        """Toggle ultra_mode with a cost confirmation on enable.
+        """Toggle ultra_mode for THIS SESSION ONLY (cost confirmation on enable).
 
-        No ChatClient rebuild needed: every heavy-tier call site reads
-        self._settings["ultra_mode"] at call time, so mutating the dict
-        applies to the live client on the very next codegen / review /
-        evolution / Pine export call. Persisted to settings.yaml so it
-        survives restarts (env ULTRA_MODE still wins at next startup).
+        Deliberately not persisted — an expensive mode silently
+        re-enabling itself on the next launch is a surprise-bill
+        generator. The durable default lives in the AI Settings dialog
+        checkbox / settings.yaml ai.ultra_mode (env ULTRA_MODE still
+        wins at startup). No ChatClient rebuild needed: heavy-tier call
+        sites read self._settings["ultra_mode"] at call time.
         """
         def _confirm() -> bool:
             return messagebox.askyesno(
                 "Enable Ultra Mode?",
                 "Ultra Mode switches to Gemini 3.1 Pro which significantly "
                 "increases AI costs. Your current bill may increase. "
-                "Are you sure you want to enable it?",
+                "Are you sure you want to enable it?\n\n"
+                "(本次執行有效 Session only — resets on restart)",
                 icon="warning",
             )
 
@@ -2067,11 +2091,11 @@ class BacktestApp:
         if new_state is None:
             return  # user cancelled the enable confirmation
         self._settings["ultra_mode"] = new_state
-        _save_ai_settings(ultra_mode=new_state)
         self._update_ultra_button()
         model = GOOGLE_MODEL_ULTRA if new_state else GOOGLE_MODEL_PRO
         self.status_var.set(
-            f"Ultra Mode {'ON' if new_state else 'OFF'} — heavy tier: {model}")
+            f"Ultra Mode {'ON' if new_state else 'OFF'} (session only) — "
+            f"heavy tier: {model}")
 
     def _show_api_key_dialog(self):
         """Show settings dialog with provider selection and API keys."""
@@ -2122,18 +2146,19 @@ class BacktestApp:
         provider_var.trace_add("write", _update_hint)
         _update_hint()
 
-        # Ultra mode — heavy-tier calls (codegen, trade review, Pine
-        # export) use the most capable model. Read per-call from
-        # self._settings, so toggling applies immediately. Google only;
-        # env ULTRA_MODE still wins at next startup.
-        ultra_var = tk.BooleanVar(value=self._settings.get("ultra_mode", False))
+        # Ultra mode PERSISTENT DEFAULT — initialized from settings.yaml,
+        # NOT the session value: the 🚀 header button toggles the session
+        # only, and saving unrelated settings here must not accidentally
+        # persist a session-only ultra toggle.
+        ultra_var = tk.BooleanVar(value=_read_persisted_ultra_mode())
         ttk.Checkbutton(
             frame, variable=ultra_var,
-            text=f"Ultra Mode — 重要呼叫用最強模型 ({GOOGLE_MODEL_ULTRA}, Google only)",
+            text=f"Ultra Mode 預設 default — ({GOOGLE_MODEL_ULTRA}, Google only)",
         ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         ttk.Label(
             frame, foreground="gray",
-            text="影響: 產生策略 codegen / AI檢視 review / Pine 匯出 export (成本較高 costs more)",
+            text="持久預設，影響 codegen/review/evolution/Pine (成本較高)。"
+                 "臨時切換請用聊天區 🚀 按鈕 (session-only).",
         ).grid(row=6, column=0, columnspan=2, sticky=tk.W)
 
         # Buttons

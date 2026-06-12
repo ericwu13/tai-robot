@@ -59,3 +59,24 @@ class TestUltraModePersistence:
         monkeypatch.setenv("ULTRA_MODE", "0")
         cfg = rb._load_settings()
         assert cfg["ultra_mode"] is False
+
+
+class TestReadPersistedUltraMode:
+    """The dialog must show the settings.yaml DEFAULT, never the session
+    value — the 🚀 button is session-only and must not leak into saves."""
+
+    def test_reads_yaml_value(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rb, "project_root", str(tmp_path))
+        rb._save_ai_settings(ultra_mode=True)
+        assert rb._read_persisted_ultra_mode() is True
+        rb._save_ai_settings(ultra_mode=False)
+        assert rb._read_persisted_ultra_mode() is False
+
+    def test_missing_file_is_false(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rb, "project_root", str(tmp_path))
+        assert rb._read_persisted_ultra_mode() is False
+
+    def test_corrupt_yaml_is_false(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rb, "project_root", str(tmp_path))
+        (tmp_path / "settings.yaml").write_text("{{not yaml", encoding="utf-8")
+        assert rb._read_persisted_ultra_mode() is False
