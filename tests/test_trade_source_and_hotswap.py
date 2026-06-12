@@ -423,6 +423,57 @@ class TestReportSourceSplit:
         assert d["source"] == "real"
 
 
+class TestFormatReportRealSubset:
+    def _make(self, pnl, source=""):
+        return Trade(tag="L", side=OrderSide.LONG, qty=1,
+                     entry_price=20000, exit_price=20000 + pnl,
+                     entry_bar_index=0, exit_bar_index=1, pnl=pnl,
+                     source=source)
+
+    def test_real_subset_full_stats(self):
+        from src.backtest.report import format_report
+        from src.backtest.metrics import calculate_metrics
+        trades = [
+            self._make(5000, "paper"),
+            self._make(8000, "real"),
+            self._make(-3000, "real"),
+            self._make(2000, "real"),
+        ]
+        eq, cum = [], 0
+        for t in trades:
+            cum += t.pnl
+            eq.append(cum)
+        m = calculate_metrics(trades, eq, initial_balance=0)
+        report = format_report("Test", m, trades=trades)
+        assert "實單統計 Real-Order Subset: 3 trades" in report
+        assert "Real P&L:" in report and "7,000" in report
+        assert "Real Avg Win:" in report
+        assert "Real Avg Loss:" in report
+        assert "Real Max DD:" in report
+        assert "small sample" in report  # < 10 real trades
+
+    def test_no_real_trades_no_subset_section(self):
+        from src.backtest.report import format_report
+        from src.backtest.metrics import calculate_metrics
+        trades = [self._make(5000, "paper"), self._make(-2000, "")]
+        eq, cum = [], 0
+        for t in trades:
+            cum += t.pnl
+            eq.append(cum)
+        m = calculate_metrics(trades, eq, initial_balance=0)
+        report = format_report("Test", m, trades=trades)
+        assert "實單統計" not in report
+
+    def test_no_trades_arg_backward_compatible(self):
+        from src.backtest.report import format_report
+        from src.backtest.metrics import calculate_metrics
+        trades = [self._make(5000, "real")]
+        m = calculate_metrics(trades, [5000], initial_balance=0)
+        report = format_report("Test", m)  # no trades param — old callers
+        assert "實單統計" not in report
+        assert "Backtest Report: Test" in report
+
+
 class TestLiveRunnerSummary:
     def test_summary_splits_by_source(self, tmp_path):
         runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))
