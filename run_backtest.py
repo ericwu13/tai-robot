@@ -3795,7 +3795,12 @@ class BacktestApp:
             compute_design_cut, design_cutoff_index)
         holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
         cut = compute_design_cut(result.trades, holdout_days)
-        cut_idx = (design_cutoff_index(result.trades, omitted, cut)
+        # Scan from 0, NOT from the watermark: a watermark saved past the
+        # cut (e.g. by a pre-holdout build) would otherwise yield
+        # cut_idx == len(trades) and silently destroy the holdout on the
+        # full-re-run path (observed: "Holdout (0 trades)" while trade
+        # #65 sat in the AI payload).
+        cut_idx = (design_cutoff_index(result.trades, 0, cut)
                    if cut else len(result.trades))
         holdout_count = len(result.trades) - cut_idx
 
@@ -4008,7 +4013,8 @@ class BacktestApp:
                 f"- 適應度 Fitness composite: {fit.composite:.3f} {gate_note}| "
                 f"Sortino {fit.sortino:.2f} | PF {fit.profit_factor:.2f} | "
                 f"勝率 WR {fit.win_rate*100:.1f}% | "
-                f"最大回撤 DD {fit.max_drawdown_pct*100:.1f}% | "
+                # max_drawdown_pct is ALREADY percent (fitness caps at 30.0)
+                f"最大回撤 DD {fit.max_drawdown_pct:.1f}% | "
                 f"來源 source {fit.source}")
             if live and getattr(self._live_runner, "bot_dir", None):
                 baseline = load_baseline(self._live_runner.bot_dir)
@@ -5732,7 +5738,7 @@ class BacktestApp:
                 f"勝率 win-rate {fit.win_rate*100:.1f}% | "
                 f"PF {fit.profit_factor:.2f} | "
                 f"Sortino {fit.sortino:.2f} | "
-                f"最大回撤 max DD {fit.max_drawdown_pct*100:.1f}% | "
+                f"最大回撤 max DD {fit.max_drawdown_pct:.1f}% | "
                 f"來源 source {fit.source}"
             )
             self._live_log_msg(detail, "status")

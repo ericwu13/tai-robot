@@ -354,6 +354,31 @@ class TestTrainCollapseGate:
         v = decide_deep_verdict(base, cand, None)
         assert v.passed
 
+    def test_dd_criterion_checked_on_train_window(self):
+        # Plan dd thresholds are anchored on the long-window basis —
+        # a candidate whose TRAIN dd violates them fails, even when the
+        # holdout dd looks fine.
+        from src.evolution.pipeline import decide_deep_verdict
+        base = self._deep2("base", [100, -200] * 20, [100, -200] * 10)
+        cand = self._deep2("cand", [100, -200] * 20, [200, -100] * 10)
+        # baseline-like train: deep dd; ask for dd ≤ 5 (impossible)
+        v = decide_deep_verdict(base, cand, {"max_drawdown_pct_max": 5})
+        assert not v.passed
+        assert any("train-window MaxDD%" in r for r in v.reasons)
+        assert v.used_criteria  # dd-only criteria still count as criteria
+
+    def test_holdout_dd_relative_gate(self):
+        # Holdout dd is gated vs baseline (≤ 1.2×), never vs the plan's
+        # absolute threshold — short-window dd% explodes by construction.
+        from src.evolution.pipeline import decide_deep_verdict
+        base = self._deep2("base", [100, -200] * 20, [200, -100] * 10)
+        # candidate holdout: much deeper dd than baseline's
+        cand = self._deep2("cand", [120, -180] * 20,
+                           [500, -450, -450, 500] * 5)
+        v = decide_deep_verdict(base, cand, None)
+        assert not v.passed
+        assert any("holdout MaxDD ratio" in r for r in v.reasons)
+
 
 class TestSplitTrainTest:
     def test_anchored_at_end(self):
