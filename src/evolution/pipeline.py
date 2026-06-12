@@ -68,6 +68,16 @@ def candidate_trade_floor(baseline_trades: int | None) -> int:
 TRAIN_COLLAPSE_PF_RATIO = 0.8   # candidate PF < 80% of baseline's → collapse
 TRAIN_COLLAPSE_DD_RATIO = 1.5   # candidate MaxDD% > 150% of baseline's → collapse
 
+# Holdout drawdown is gated RELATIVE to the baseline, not against the
+# plan's absolute threshold: dd% is measured from a zero-based P&L
+# curve, so a short window's tiny peak makes the percentage explode
+# (observed: baseline holdout dd% = 129 on 14 days while the long
+# window reads 35). Absolute dd criteria are therefore checked on the
+# train window — the same long-window basis the AI's threshold was
+# anchored on — and the holdout only requires "not materially worse
+# than baseline".
+HOLDOUT_DD_RATIO_MAX = 1.2
+
 
 def parse_plan_directives(plan_text: str) -> dict[str, Any]:
     """Extract the machine-readable directives from an evolution plan.
@@ -391,7 +401,33 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
             f"{TRAIN_COLLAPSE_DD_RATIO:g}: {'✓' if ok else '✗ (collapse)'}")
         passed = passed and ok
 
-    sub = decide_verdict(baseline.test, candidate.test, criteria)
+    # The plan's absolute dd criterion is window-length sensitive —
+    # check it on the train window (the long-window basis the AI's
+    # threshold was anchored on) and replace it with a relative gate
+    # on the holdout.
+    holdout_criteria = dict(criteria) if criteria else None
+    dd_max = (holdout_criteria.pop("max_drawdown_pct_max", None)
+              if holdout_criteria else None)
+    if dd_max is not None and candidate.train.metrics is not None \
+            and candidate.train.metrics.total_trades > 0:
+        tdd = candidate.train.metrics.max_drawdown_pct
+        ok = tdd <= dd_max
+        reasons.append(
+            f"train-window MaxDD% {tdd:.2f} ≤ {dd_max:g} "
+            f"(plan dd criterion, long-window basis): {'✓' if ok else '✗'}")
+        passed = passed and ok
+    btm_test = baseline.test.metrics
+    if btm_test is not None and btm_test.total_trades > 0:
+        bdd = max(btm_test.max_drawdown_pct, 1.0)
+        dd_ratio = cm.max_drawdown_pct / bdd
+        ok = dd_ratio <= HOLDOUT_DD_RATIO_MAX
+        reasons.append(
+            f"holdout MaxDD ratio {dd_ratio:.2f} ≤ "
+            f"{HOLDOUT_DD_RATIO_MAX:g} (vs baseline): {'✓' if ok else '✗'}")
+        passed = passed and ok
+
+    sub = decide_verdict(baseline.test, candidate.test,
+                         holdout_criteria or None)
     reasons.extend(sub.reasons)
     passed = passed and sub.passed
 
@@ -400,7 +436,7 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
             f"⚠ OOS 樣本少 small holdout sample ({cm.total_trades} trades "
             f"< 30) — PASS is PROVISIONAL; the rolling weekly holdout and "
             f"paper incubation provide the statistical confirmation")
-    return EvolutionVerdict(passed, reasons, used_criteria=sub.used_criteria)
+    return EvolutionVerdict(passed, reasons, used_criteria=bool(criteria))
 
 
 def format_deep_verdict_block(baseline: DeepResult, candidate: DeepResult,
