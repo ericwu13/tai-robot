@@ -73,6 +73,9 @@ evolution:
   # true (default): 🧬 runs the full auto-pipeline — plan → candidate codegen
   # → A/B validation backtest → verdict; a PASS auto-saves the candidate to
   # the strategy store (deployment stays manual). false: plan-only.
+  # Also enables the WEEKLY automatic run: fires once per week AFTER the
+  # Saturday close (≥ 05:05 TPE, market quiet, week's data complete), with
+  # the verdict sent to Discord.
   auto_pipeline: true
   # Validation method for the auto-pipeline:
   #   "deep" (default) — SEE-spec walk-forward: 90d train / 90d test

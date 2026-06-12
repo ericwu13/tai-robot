@@ -123,6 +123,23 @@ def should_run_evolution_check(cadence: str, now: datetime | None = None) -> boo
     return now.weekday() == 5  # Saturday
 
 
+def is_post_close_evolution_window(now: datetime | None = None) -> bool:
+    """True on TPE Saturday from 05:05 onward — AFTER the week's last
+    session has closed (the Friday night session ends Saturday 05:00).
+
+    The weekly auto-pipeline runs post-close deliberately: it never
+    competes with session-end force-close handling, the market is
+    quiet, and the week's data is complete (the 05:05 buffer lets the
+    final bar/report settle). ``now`` may be naive (TPE wall-clock)
+    or tz-aware.
+    """
+    if now is None:
+        now = datetime.now(_TZ_TAIPEI)
+    elif now.tzinfo is not None:
+        now = now.astimezone(_TZ_TAIPEI)
+    return now.weekday() == 5 and (now.hour, now.minute) >= (5, 5)
+
+
 @dataclass
 class Baseline:
     """The "best composite so far" record persisted per bot.

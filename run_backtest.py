@@ -1141,6 +1141,9 @@ class BacktestApp:
         # at its terminus INSTEAD of running a backtest — lets the
         # evolution pipeline borrow the fetch machinery for validation data.
         self._evo_fetch_cb = None  # Callable[[bool], None] | None
+        # (ISO year, week) of the last weekly auto-evolution run — the 30s
+        # poll fires the post-close pipeline exactly once per week.
+        self._weekly_evo_done: tuple | None = None
 
         # Live trading state
         self._live_chart: LiveChart | None = None
@@ -4992,6 +4995,7 @@ class BacktestApp:
         self._check_tick_watchdog()
         self._check_session_end_close()
         self._check_session_end_report()
+        self._check_weekly_evolution()
         self._live_poll_id = self.root.after(30000, self._schedule_status_update)
 
     _SESSION_END_CLOSE_MINUTES = 2          # normal session: close 2 min before
@@ -5129,6 +5133,36 @@ class BacktestApp:
         if mins > threshold:
             return
         self._live_runner._generate_daily_report()
+
+    def _check_weekly_evolution(self):
+        """Run the weekly auto-evolution AFTER the Saturday close.
+
+        Post-close (≥ 05:05 TPE Saturday) is deliberate: the session-end
+        force-close and final daily report are done, the market is
+        quiet, and the week's data is complete. Latched per ISO week so
+        the 30s poll fires it exactly once; a bot deployed later on
+        Saturday still gets its run on the first post-deploy poll.
+        """
+        if not self._settings.get("evolution_auto_pipeline", True):
+            return
+        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        from src.evolution.notify import is_post_close_evolution_window
+        if not is_post_close_evolution_window():
+            return
+        if is_market_open():
+            return  # safety: never compete with a live session
+        week_key = _taipei_now().isocalendar()[:2]
+        if self._weekly_evo_done == week_key:
+            return
+        self._weekly_evo_done = week_key
+        self._live_log_msg(
+            "🧬 週末自動演化 Weekly auto-evolution (post-close) starting...",
+            "status")
+        try:
+            self._bot_evolution(auto_run=True)
+        except Exception as e:
+            _log(f"weekly auto-evolution failed: [{type(e).__name__}] {e}")
 
     def _check_tick_watchdog(self):
         """Delegate tick health check to TickWatchdog and act on the result."""
@@ -5646,22 +5680,11 @@ class BacktestApp:
                 "status",
             )
 
-        # Weekly auto-evolution: after the fitness check, run the full
-        # pipeline (plan → codegen → walk-forward → verdict → Discord).
-        # ALWAYS pinned to the weekly window — even when the fitness
-        # cadence is "daily", the pipeline spends AI tokens and must not
-        # fire every session end. The watermark makes repeats safe: a
-        # second fire in the same window finds no new trades and skips.
-        if self._settings.get("evolution_auto_pipeline", True):
-            from src.evolution.notify import EVOLUTION_CADENCE_WEEKLY
-            if should_run_evolution_check(EVOLUTION_CADENCE_WEEKLY):
-                try:
-                    self._live_log_msg(
-                        "🧬 週末自動演化 Weekly auto-evolution starting...",
-                        "status")
-                    self._bot_evolution(auto_run=True)
-                except Exception as e:
-                    _log(f"weekly auto-evolution failed: [{type(e).__name__}] {e}")
+        # NOTE: the weekly auto-evolution pipeline does NOT run here —
+        # this fires ~2 min BEFORE session close, while the bot is still
+        # handling the final bars and force-close. The pipeline runs
+        # post-close via _check_weekly_evolution (Saturday ≥ 05:05 TPE)
+        # on the 30s poll.
 
     # ── Semi-auto real order handling ──
 

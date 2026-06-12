@@ -394,3 +394,35 @@ class TestEvolutionWatermark:
         from src.evolution.notify import WATERMARK_FILENAME, save_watermark
         save_watermark(tmp_path, 5)
         assert not (tmp_path / (WATERMARK_FILENAME + ".tmp")).exists()
+
+
+class TestPostCloseEvolutionWindow:
+    """is_post_close_evolution_window — weekly pipeline runs AFTER the
+    Saturday 05:00 close, never during the final session minutes.
+
+    2026-06-13 is a Saturday.
+    """
+
+    def test_saturday_after_0505_is_in_window(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        assert is_post_close_evolution_window(datetime(2026, 6, 13, 5, 5))
+        assert is_post_close_evolution_window(datetime(2026, 6, 13, 9, 30))
+        assert is_post_close_evolution_window(datetime(2026, 6, 13, 23, 59))
+
+    def test_saturday_before_close_is_not(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        # 04:58 = the old in-session trigger moment — must be excluded
+        assert not is_post_close_evolution_window(datetime(2026, 6, 13, 4, 58))
+        assert not is_post_close_evolution_window(datetime(2026, 6, 13, 5, 4))
+
+    def test_weekdays_and_sunday_are_not(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        for day in (8, 9, 10, 11, 12, 14):  # Mon-Fri + Sunday
+            assert not is_post_close_evolution_window(
+                datetime(2026, 6, day, 10, 0))
+
+    def test_tz_aware_converted(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        # Friday 21:30 UTC == Saturday 05:30 TPE → in window
+        assert is_post_close_evolution_window(
+            datetime(2026, 6, 12, 21, 30, tzinfo=timezone.utc))
