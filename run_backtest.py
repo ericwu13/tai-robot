@@ -3913,11 +3913,27 @@ class BacktestApp:
                 and self._live_runner.state != LiveState.IDLE)
         if live:
             baseline_cls = type(self._live_runner.strategy)
-            bars = self._live_runner.get_bars()
             point_value = self._live_runner.point_value
+            native_sec = self._live_runner.target_interval
+            # Validation data: prefer the FULL session history from the
+            # bot's daily 1-min CSVs (everything since first deploy) —
+            # BacktestEngine aggregates 1-min feeds to the strategy's
+            # native timeframe internally. The in-memory aggregated bars
+            # only cover ~the warmup window; fall back to them when the
+            # CSVs cover less time (fresh bot / deleted files).
+            from src.live.live_runner import load_1m_bars_from_csvs
+            mem_bars = self._live_runner.get_bars()
+            csv_bars = load_1m_bars_from_csvs(
+                self._live_runner.bot_dir, self._live_runner.symbol)
+
+            def _span(bs):
+                return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
+            bars = (csv_bars if csv_bars and _span(csv_bars) >= _span(mem_bars)
+                    else mem_bars)
         else:
             baseline_cls = STRATEGIES.get(self.strategy_var.get())
             bars = list(self._last_bars or [])
+            native_sec = bars[0].interval if bars else 900
             try:
                 point_value = int(self.pv_var.get())
             except (ValueError, TypeError):
@@ -4014,15 +4030,23 @@ class BacktestApp:
                     return
 
                 # ── Phase 3: A/B validation backtest ──
-                if len(bars) < 150:
+                # The feed may be 1-min CSVs (engine aggregates to the
+                # strategy's native timeframe) — size the minimum-data
+                # guard in NATIVE bars, not feed bars.
+                feed_iv = bars[0].interval if bars else 0
+                native_est = len(bars)
+                if feed_iv and native_sec > feed_iv:
+                    native_est = len(bars) * feed_iv // native_sec
+                if native_est < 150:
                     ui(self._append_chat, "system",
-                       f"🧬 EVO: only {len(bars)} bars in memory — not enough "
-                       f"for a meaningful validation backtest. Plan + candidate "
-                       f"generated but NOT validated/saved; run a TV/API "
-                       f"backtest manually.")
+                       f"🧬 EVO: only ~{native_est} native bars of data "
+                       f"available — not enough for a meaningful validation "
+                       f"backtest. Plan + candidate generated but NOT "
+                       f"validated/saved; run a TV/API backtest manually.")
                     return
                 ui(self._append_chat, "system",
-                   f"EVO 3/3: A/B backtest on {len(bars)} bars "
+                   f"EVO 3/3: A/B backtest on {len(bars)} × "
+                   f"{feed_iv // 60}min bars ≈ {native_est} native bars "
                    f"({base_cls_name} vs {candidate_cls.__name__})...")
                 baseline_res = run_ab_backtest(
                     baseline_cls, bars, point_value, "基準 baseline")
@@ -4032,11 +4056,10 @@ class BacktestApp:
                 verdict = decide_verdict(
                     baseline_res, candidate_res, directives["criteria"])
 
-                iv_min = bars[0].interval // 60 if bars else 0
                 window_desc = (
                     f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
-                    f"({len(bars)} bars @ {iv_min}min — in-memory data, may be "
-                    f"shorter than the full session history)")
+                    f"({len(bars)} × {feed_iv // 60}min bars "
+                    f"≈ {native_est} native bars)")
 
                 saved_as = ""
                 if verdict.passed:

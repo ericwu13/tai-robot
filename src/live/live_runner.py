@@ -208,6 +208,45 @@ _INTERVAL_SECONDS = {
 }
 
 
+def load_1m_bars_from_csvs(bot_dir: str, symbol: str) -> list[Bar]:
+    """Load ALL saved 1-min bars from a bot directory's daily CSVs.
+
+    Unlike ``reload_1m_bars`` (which feeds the live in-memory caches and
+    dedups against the session's seen-set), this is a pure reader used by
+    the evolution pipeline to reconstruct the FULL session history — the
+    in-memory deque only holds the last 5000 bars (~3.5 days), while the
+    daily CSVs retain everything since the bot's first deploy.
+
+    Returns bars sorted by dt; duplicate timestamps resolved by
+    last-file-wins. Garbage rows and unreadable files are skipped.
+    """
+    import csv as csv_mod
+    import glob as glob_mod
+
+    out: dict[datetime, Bar] = {}
+    for path in sorted(glob_mod.glob(os.path.join(bot_dir, "bars_1m_*.csv"))):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv_mod.reader(f)
+                next(reader, None)  # header
+                for row in reader:
+                    if len(row) < 6:
+                        continue
+                    try:
+                        dt = datetime.strptime(row[0], "%Y/%m/%d %H:%M")
+                        out[dt] = Bar(
+                            symbol=symbol, dt=dt,
+                            open=int(float(row[1])), high=int(float(row[2])),
+                            low=int(float(row[3])), close=int(float(row[4])),
+                            volume=int(float(row[5])), interval=60,
+                        )
+                    except (ValueError, IndexError):
+                        continue
+        except OSError:
+            continue
+    return [out[k] for k in sorted(out)]
+
+
 class LiveRunner:
     """Orchestrates live bar processing without touching COM.
 

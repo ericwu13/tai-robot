@@ -1186,3 +1186,54 @@ class TestRealEntryPriceLiveRunnerIssue45:
         # Post-confirmation → real
         runner.broker.real_entry_price = 22508
         assert ctx.effective_entry_price() == 22508
+
+
+class TestLoad1mBarsFromCsvs:
+    """load_1m_bars_from_csvs — pure reader for the evolution pipeline."""
+
+    def test_empty_dir(self, tmp_path):
+        from src.live.live_runner import load_1m_bars_from_csvs
+        assert load_1m_bars_from_csvs(str(tmp_path), "TX00") == []
+
+    def test_loads_sorted_across_files(self, tmp_path):
+        from src.live.live_runner import load_1m_bars_from_csvs
+        (tmp_path / "bars_1m_20260611.csv").write_text(
+            "datetime,open,high,low,close,volume\n"
+            "2026/06/11 09:01,200,210,190,205,10\n",
+            encoding="utf-8")
+        (tmp_path / "bars_1m_20260610.csv").write_text(
+            "datetime,open,high,low,close,volume\n"
+            "2026/06/10 09:02,105,115,95,110,12\n"
+            "2026/06/10 09:01,100,110,90,105,10\n",
+            encoding="utf-8")
+        bars = load_1m_bars_from_csvs(str(tmp_path), "TX00")
+        assert len(bars) == 3
+        assert [b.dt for b in bars] == sorted(b.dt for b in bars)
+        assert bars[0].close == 105
+        assert all(b.interval == 60 for b in bars)
+        assert all(b.symbol == "TX00" for b in bars)
+
+    def test_dedup_last_file_wins(self, tmp_path):
+        from src.live.live_runner import load_1m_bars_from_csvs
+        (tmp_path / "bars_1m_20260610.csv").write_text(
+            "datetime,open,high,low,close,volume\n"
+            "2026/06/10 09:01,100,110,90,105,10\n",
+            encoding="utf-8")
+        (tmp_path / "bars_1m_20260611.csv").write_text(
+            "datetime,open,high,low,close,volume\n"
+            "2026/06/10 09:01,999,999,999,999,9\n",
+            encoding="utf-8")
+        bars = load_1m_bars_from_csvs(str(tmp_path), "TX00")
+        assert len(bars) == 1
+        assert bars[0].close == 999
+
+    def test_garbage_rows_skipped(self, tmp_path):
+        from src.live.live_runner import load_1m_bars_from_csvs
+        (tmp_path / "bars_1m_20260610.csv").write_text(
+            "datetime,open,high,low,close,volume\n"
+            "garbage,row\n"
+            "not-a-date,1,2,3,4,5\n"
+            "2026/06/10 09:01,100,110,90,105,10\n",
+            encoding="utf-8")
+        bars = load_1m_bars_from_csvs(str(tmp_path), "TX00")
+        assert len(bars) == 1
