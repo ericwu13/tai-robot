@@ -185,12 +185,37 @@ class TestDecideVerdict:
         assert not v.passed
 
     def test_hard_floor_overrides_perfect_criteria(self):
-        # 5 great trades can't pass — "filter everything away" guard
-        baseline = _ab("base", [100] * 20)
-        candidate = _ab("cand", [500] * (MIN_CANDIDATE_TRADES - 5))
+        # 4 great trades vs a 40-trade baseline = filtered (nearly)
+        # everything away — can't pass no matter the metrics
+        baseline = _ab("base", [100] * 40)
+        candidate = _ab("cand", [500] * 4)
         criteria = {"profit_factor_min": 1.0}
         v = decide_verdict(baseline, candidate, criteria)
         assert not v.passed
+
+    def test_floor_is_relative_to_baseline_window(self):
+        # The 0422 case: 8 candidate trades vs 18 baseline in a 14-day
+        # holdout is normal density for a trend filter — must NOT fail
+        # the floor (old absolute floor of 10 wrongly rejected this).
+        baseline = _ab("base", [100, -100] * 9)   # 18 trades
+        candidate = _ab("cand", [200, -50] * 4)   # 8 trades, better PF/DD
+        v = decide_verdict(baseline, candidate, None)
+        assert v.passed
+
+    def test_floor_absolute_minimum_still_applies(self):
+        # Even vs a tiny baseline, fewer than 5 trades can't validate
+        baseline = _ab("base", [100, -100] * 4)   # 8 trades → floor 5
+        candidate = _ab("cand", [500] * 4)        # 4 trades
+        v = decide_verdict(baseline, candidate, None)
+        assert not v.passed
+
+    def test_candidate_trade_floor_math(self):
+        from src.evolution.pipeline import candidate_trade_floor
+        assert candidate_trade_floor(18) == 5    # ceil(4.5) < abs-min 5
+        assert candidate_trade_floor(40) == 10   # ceil(10)
+        assert candidate_trade_floor(122) == 31  # 90d window scale
+        assert candidate_trade_floor(None) == MIN_CANDIDATE_TRADES
+        assert candidate_trade_floor(0) == MIN_CANDIDATE_TRADES
 
     def test_default_guard_pass(self):
         baseline = _ab("base", [100, -200] * 10)

@@ -40,10 +40,25 @@ _CRITERIA_KEYS = (
     "total_pnl_min",
 )
 
-# A candidate with fewer trades than this cannot pass validation no
-# matter how good its metrics look — "filter everything away" trivially
-# produces zero drawdown. Floor, not a fitness gate (that's MIN_TRADES).
-MIN_CANDIDATE_TRADES = 10
+# Trade floor: a candidate that "filters everything away" trivially
+# produces zero drawdown, so too few trades cannot pass — but "too few"
+# must scale with the window. An absolute 10 was right for a 90-day
+# test window and wrongly rejected an 8-trade candidate on a 14-day
+# holdout where the baseline itself only made 18. The floor is now
+# relative to the baseline's count in the SAME window (with an absolute
+# minimum), falling back to the legacy absolute when no baseline exists.
+MIN_CANDIDATE_TRADES = 10          # legacy absolute (no-baseline fallback)
+MIN_CANDIDATE_TRADES_ABS = 5       # never pass with fewer than this
+CANDIDATE_TRADES_RATIO = 0.25      # ≥ 25% of baseline's same-window count
+
+
+def candidate_trade_floor(baseline_trades: int | None) -> int:
+    """Minimum candidate trades for a valid verdict in this window."""
+    if not baseline_trades or baseline_trades <= 0:
+        return MIN_CANDIDATE_TRADES
+    import math
+    return max(MIN_CANDIDATE_TRADES_ABS,
+               math.ceil(CANDIDATE_TRADES_RATIO * baseline_trades))
 
 # Non-collapse gate on the DESIGN-side (train) window: the holdout
 # decides the verdict, but a candidate that blows up on the very data
@@ -159,11 +174,17 @@ def decide_verdict(baseline: ABResult, candidate: ABResult,
         return EvolutionVerdict(False, ["candidate produced 0 trades — nothing to validate"])
 
     reasons: list[str] = []
-    floor_ok = cm.total_trades >= MIN_CANDIDATE_TRADES
+    base_n = (baseline.metrics.total_trades
+              if baseline.metrics is not None else None)
+    floor = candidate_trade_floor(base_n)
+    floor_ok = cm.total_trades >= floor
     if not floor_ok:
         reasons.append(
             f"hard floor: candidate has {cm.total_trades} trades "
-            f"(< {MIN_CANDIDATE_TRADES}) — too few to validate")
+            f"(< {floor}, floor = max({MIN_CANDIDATE_TRADES_ABS}, "
+            f"{CANDIDATE_TRADES_RATIO:.0%} of baseline's "
+            f"{base_n if base_n else '?'}) ) — looks like the change "
+            f"filtered (nearly) everything away")
 
     if criteria:
         passed = floor_ok
@@ -373,6 +394,12 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
     sub = decide_verdict(baseline.test, candidate.test, criteria)
     reasons.extend(sub.reasons)
     passed = passed and sub.passed
+
+    if passed and cm.total_trades < 30:
+        reasons.append(
+            f"⚠ OOS 樣本少 small holdout sample ({cm.total_trades} trades "
+            f"< 30) — PASS is PROVISIONAL; the rolling weekly holdout and "
+            f"paper incubation provide the statistical confirmation")
     return EvolutionVerdict(passed, reasons, used_criteria=sub.used_criteria)
 
 
