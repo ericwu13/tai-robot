@@ -6,7 +6,7 @@ import csv
 from pathlib import Path
 
 from .broker import Trade
-from .metrics import PerformanceMetrics
+from .metrics import PerformanceMetrics, calculate_metrics
 
 
 def format_report(strategy_name: str, metrics: PerformanceMetrics,
@@ -48,13 +48,32 @@ def format_report(strategy_name: str, metrics: PerformanceMetrics,
     if trades:
         real = [t for t in trades if getattr(t, "source", "") == "real"]
         if real:
-            real_pnl = sum(t.pnl for t in real)
-            real_wins = sum(1 for t in real if t.pnl > 0)
+            # Full metrics on the real-order subset \u2014 same engine as the
+            # daily report's real_summary. Sharpe deliberately omitted:
+            # it's noise below ~30 trades and misleads more than informs.
+            real_eq = []
+            cum = 0
+            for t in real:
+                cum += t.pnl
+                real_eq.append(cum)
+            rm = calculate_metrics(real, real_eq, initial_balance=0)
+            rpf = (f"{rm.profit_factor:.2f}"
+                   if rm.profit_factor != float("inf") else "INF")
+            small = ("\uff08\u6a23\u672c\u5c11\uff0c\u50c5\u4f9b\u53c3\u8003 small sample\uff09"
+                     if len(real) < 10 else "")
             lines.extend([
                 "-" * 60,
-                f" \u5be6\u55ae\u4ea4\u6613 Real Trades:         {len(real):>12}",
-                f" \u5be6\u55ae\u640d\u76ca Real P&L:            {real_pnl:>12,}",
-                f" \u5be6\u55ae\u52dd\u7387 Real Win Rate:       {real_wins / len(real) * 100:>11.1f}%",
+                f" \u5be6\u55ae\u7d71\u8a08 Real-Order Subset: {len(real)} trades {small}",
+                f" \u5be6\u55ae\u52dd\u7387 Real Win Rate:       {rm.win_rate * 100:>11.1f}%"
+                f"  ({rm.winning_trades}W / {rm.losing_trades}L)",
+                f" \u5be6\u55ae\u640d\u76ca Real P&L:            {rm.total_pnl:>12,}",
+                f" \u5be6\u55ae\u7372\u5229\u56e0\u5b50 Real PF:          {rpf:>12}",
+                f" \u5be6\u55ae\u5e73\u5747\u7372\u5229 Real Avg Win:     {rm.avg_win:>12,.0f}",
+                f" \u5be6\u55ae\u5e73\u5747\u8667\u640d Real Avg Loss:    {rm.avg_loss:>12,.0f}",
+                f" \u5be6\u55ae\u6700\u5927\u7372\u5229 Real Largest Win: {rm.largest_win:>12,}",
+                f" \u5be6\u55ae\u6700\u5927\u8667\u640d Real Largest Loss:{rm.largest_loss:>12,}",
+                f" \u5be6\u55ae\u6700\u5927\u56de\u64a4 Real Max DD:      {rm.max_drawdown:>12,}"
+                f"  ({rm.max_drawdown_pct:.2f}%)",
                 " (\u4ee5\u4e0a\u7e3d\u8a08\u70ba\u6a21\u64ec\u5168\u8996\u5716 totals above = simulated view, all trades)",
             ])
     lines.append("=" * 60)
