@@ -3786,34 +3786,29 @@ class BacktestApp:
             watermark = load_watermark(bot_dir)
         omitted = _evolution_omitted_count(len(trade_lines), watermark)
 
-        # Design/holdout split (walk-forward discipline): the most recent
-        # holdout_days of evidence are WITHHELD from the AI — the plan is
-        # designed on the older train window only and validated by
-        # backtesting the unseen holdout. The cut rolls forward each
-        # cycle, so this week's holdout becomes next week's design data.
+        # Trade evidence = everything since the watermark. The walk-forward
+        # holdout applies to the VALIDATION BARS only (the verdict's
+        # train/test split) — filtering the trade evidence by it as well
+        # DEADLOCKED the weekly trigger: right after any run, every new
+        # trade is inside the holdout window, so "after watermark AND
+        # older than holdout" stayed permanently empty (observed on 0422:
+        # auto-evolution skipped forever). We still COUNT how many recent
+        # trades fall inside the validation window so the AI is warned
+        # about the partial design/verdict overlap.
         from src.evolution.pipeline import (
             compute_design_cut, design_cutoff_index)
         holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
         cut = compute_design_cut(result.trades, holdout_days)
-        # Scan from 0, NOT from the watermark: a watermark saved past the
-        # cut (e.g. by a pre-holdout build) would otherwise yield
-        # cut_idx == len(trades) and silently destroy the holdout on the
-        # full-re-run path (observed: "Holdout (0 trades)" while trade
-        # #65 sat in the AI payload).
-        cut_idx = (design_cutoff_index(result.trades, 0, cut)
-                   if cut else len(result.trades))
-        holdout_count = len(result.trades) - cut_idx
+        overlap_start = (design_cutoff_index(result.trades, omitted, cut)
+                         if cut else len(result.trades))
+        recent_overlap = len(result.trades) - overlap_start
 
-        if watermark and cut_idx <= omitted:
-            # No NEW design-window trades since the last run — the recent
-            # trades are all inside the holdout and become design
-            # evidence next cycle as the cut rolls forward.
+        if watermark and omitted >= len(trade_lines):
+            # Nothing new since the last evolution run.
             if auto_run:
-                msg = (f"🧬 EVO (weekly auto): 訓練窗無新交易（最近 "
-                       f"{holdout_days} 天為保留測試集），跳過。"
-                       f"No new design-window trades since last evolution "
-                       f"({watermark['at']}) — recent trades are in the "
-                       f"holdout; skipped.")
+                msg = (f"🧬 EVO (weekly auto): 上次演化後沒有新交易，跳過。"
+                       f"No new trades since last evolution "
+                       f"({watermark['at']}) — skipped.")
                 self._append_chat("system", msg)
                 if _discord is not None and _discord.enabled:
                     try:
@@ -3821,41 +3816,22 @@ class BacktestApp:
                     except Exception:
                         pass
                 return
-            # Manual click: allow an explicit full-design-history re-run
-            # (the holdout stays withheld either way).
+            # Manual click: allow an explicit full-history re-run.
             if not messagebox.askyesno(
                     "Bot Evolution",
-                    f"上次演化（{watermark['at']}）後訓練窗沒有新交易\n"
-                    f"（最近 {holdout_days} 天為保留測試集，不提供給 AI）。\n"
-                    f"No new design-window trades since the last evolution — "
-                    f"recent trades are inside the {holdout_days}d holdout.\n\n"
-                    f"仍要以完整訓練歷史重新執行嗎？\n"
-                    f"Re-run on the full design history anyway? "
-                    f"(holdout stays withheld)"):
+                    f"上次演化（{watermark['at']}）後沒有新交易。\n"
+                    f"No new trades since the last evolution "
+                    f"({watermark['trade_count']} trades covered).\n\n"
+                    f"沒有新數據的演化容易過擬合。仍要以完整歷史重新執行嗎？\n"
+                    f"Evolving without new data risks overfitting. "
+                    f"Re-run on the full history anyway?"):
                 return
-            omitted = 0  # full design-history re-run; cut unchanged
-        sent_lines = trade_lines[omitted:cut_idx]
-        if not sent_lines:
-            self.status_var.set(
-                "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
-                "yet — session younger than the holdout.")
-            return
-
-        # Rebuild the metrics report from design-known trades only — the
-        # full-history report would leak holdout aggregates into design.
-        design_known = result.trades[:cut_idx]
-        d_eq, d_cum = [], 0
-        for t in design_known:
-            d_cum += t.pnl
-            d_eq.append(d_cum)
-        report = format_report(
-            f"{result.strategy_name} — 設計窗 design window (holdout excluded)",
-            calculate_metrics(design_known, d_eq, initial_balance=0))
+            omitted = 0  # full-history re-run
+        sent_lines = trade_lines[omitted:]
 
         evolution_context = self._build_evolution_context(
             result, watermark=watermark, omitted_count=omitted,
-            design_upto=cut_idx, holdout_count=holdout_count,
-            holdout_days=holdout_days)
+            holdout_count=recent_overlap, holdout_days=holdout_days)
 
         preamble = (
             f"🧬 Bot Evolution — 策略演化計畫\n"
@@ -3898,12 +3874,13 @@ class BacktestApp:
             f"specifies. Units: max_drawdown_pct_max in percent, win_rate_min "
             f"as a 0-1 fraction, profit_factor_min plain, total_pnl_min in "
             f"points.\n\n"
-            f"## 保留測試集 Holdout (unseen validation data)\n"
-            f"The most recent {holdout_days} days of evidence "
-            f"({holdout_count} trades) are WITHHELD from everything in this "
-            f"message. Your plan will be validated by backtesting on that "
-            f"unseen window — design a change that should GENERALIZE, not "
-            f"one that chases the most recent trades.\n\n"
+            f"## 驗證方式 Validation (walk-forward)\n"
+            f"Your plan will be validated by backtesting baseline vs "
+            f"candidate with the most recent {holdout_days} days of market "
+            f"data as the out-of-sample decision window. "
+            f"{recent_overlap} of the trades above fall inside that window — "
+            f"design a change that should GENERALIZE, not one that chases "
+            f"the most recent trades.\n\n"
             f"{report}\n\n"
             f"{timeframe_line}\n"
         )
@@ -3929,14 +3906,15 @@ class BacktestApp:
                 preamble, sent_lines, source_section, len(sent_lines),
                 label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
 
-        # Advance the watermark only to the DESIGN cut — the held-out
-        # trades were never shown to the AI, so they must roll into the
-        # design window of the NEXT run (walk-forward). High-water mark,
-        # not per-trade flags — broker.trades is append-only.
+        # Advance the watermark over everything that was sent: trade
+        # evidence is watermark-gated only (the validation holdout lives
+        # on the BARS split, not the trade list — see deadlock note
+        # above). High-water mark, not per-trade flags — broker.trades
+        # is append-only.
         if bot_dir:
             try:
                 from src.evolution.notify import save_watermark
-                save_watermark(bot_dir, cut_idx)
+                save_watermark(bot_dir, len(result.trades))
             except Exception as e:
                 _log(f"evolution watermark save failed: [{type(e).__name__}] {e}")
 
@@ -3949,11 +3927,12 @@ class BacktestApp:
 
         ``omitted_count`` > 0 means the first N trades were already
         analyzed by a previous run and are excluded from the trade list.
-        ``design_upto`` caps EVERYTHING in this context (date range,
-        aggregates, fitness) to the design window — trades from the
-        holdout must not leak into the AI's evidence, not even as
-        aggregates. ``holdout_count``/``holdout_days`` describe what was
-        withheld.
+        ``holdout_count`` = how many recent trades fall inside the
+        validation window (the verdict's bars holdout) — surfaced as an
+        overlap WARNING, not a filter; filtering trade evidence by the
+        holdout deadlocked the weekly trigger. ``design_upto`` optionally
+        caps the context to a prefix of the trades (unused by the
+        current caller).
         """
         lines = ["## 演化現況 Evolution Context"]
         all_trades = result.trades
@@ -3962,18 +3941,25 @@ class BacktestApp:
         first_dt = next((t.entry_dt for t in trades if t.entry_dt), "")
         last_dt = next((t.exit_dt for t in reversed(trades) if t.exit_dt), "")
         if first_dt or last_dt:
-            lines.append(f"- 資料期間 Design data range: {first_dt} → {last_dt} "
+            lines.append(f"- 資料期間 Data range: {first_dt} → {last_dt} "
                          f"({len(trades)} trades)")
-        if holdout_count or holdout_days:
-            lines.append(
-                f"- 保留測試集 Holdout: the most recent {holdout_days}d "
-                f"({holdout_count} trades) are WITHHELD from this message — "
-                f"your plan is validated there.")
+        if holdout_days:
+            if holdout_count:
+                lines.append(
+                    f"- ⚠ 驗證重疊 Validation overlap: {holdout_count} of the "
+                    f"trades below fall inside the last {holdout_days}d — the "
+                    f"verdict's out-of-sample window partially overlaps this "
+                    f"evidence. Prefer changes that generalize.")
+            else:
+                lines.append(
+                    f"- 驗證窗 Validation: the verdict is decided on the last "
+                    f"{holdout_days}d of market data (walk-forward holdout "
+                    f"on bars).")
 
         real = [t for t in trades if getattr(t, "source", "") == "real"]
         if real:
             lines.append(
-                f"- 模擬全視圖 Simulated (design window): {len(trades)} trades, "
+                f"- 模擬全視圖 Simulated (all): {len(trades)} trades, "
                 f"P&L {sum(t.pnl for t in trades):+,} | "
                 f"實單 Real subset: {len(real)} trades, "
                 f"P&L {sum(t.pnl for t in real):+,}")
@@ -3984,8 +3970,8 @@ class BacktestApp:
                 f"- 上次演化 Last evolution: {watermark['at']} — trades "
                 f"#1–#{omitted_count} were already analyzed then and are "
                 f"OMITTED from the trade list below. The aggregate metrics "
-                f"and fitness in this message cover the design window "
-                f"(trades #1–#{len(trades)}).")
+                f"and fitness in this message cover all "
+                f"{len(trades)} trades.")
             lines.append(
                 f"- 新交易 New since last evolution: {len(new_trades)} "
                 f"trades (#{omitted_count + 1}–#{len(trades)}), "
@@ -3999,8 +3985,7 @@ class BacktestApp:
                 score_session_for_notification, load_baseline)
             live = (self._live_runner is not None
                     and self._live_runner.state != LiveState.IDLE)
-            # Fitness over design-window trades only (no holdout
-            # aggregates). Equity curve rebuilt from those trades.
+            # Equity curve rebuilt from the trades shown.
             fit = score_session_for_notification(
                 trades,
                 equity_curve=None,
