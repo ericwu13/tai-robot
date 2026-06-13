@@ -11,6 +11,15 @@ class OrderSide(Enum):
     SHORT = "SHORT"
 
 
+def _mode_to_source(mode: str) -> str:
+    """Map a trading mode to a trade source tag."""
+    if mode in ("semi_auto", "auto"):
+        return "real"
+    if mode == "paper":
+        return "paper"
+    return "backtest"
+
+
 @dataclass
 class Order:
     tag: str
@@ -41,6 +50,7 @@ class Trade:
     real_entry_dt: str = ""
     real_exit_price: int = 0    # Phase 2 — not yet captured
     real_exit_dt: str = ""      # Phase 2 — not yet captured
+    source: str = ""            # "backtest", "paper", or "real"
 
 
 class BrokerContext:
@@ -211,6 +221,10 @@ class SimulatedBroker:
         self._pending_market_closes: list[tuple[str, str]] = []  # (tag, from_entry)
         self._bar_index: int = 0
         self._exit_bar_index: int = -1  # last bar an exit filled on
+
+        # Trade source tag stamped on every Trade created by this broker.
+        # Set by the caller (LiveRunner / BacktestEngine) after construction.
+        self.trade_source: str = ""
 
         # Last exit metadata — read by live_runner to determine real order type
         self.last_exit_type: str = ""  # "limit", "stop", "close", "force_close"
@@ -404,6 +418,15 @@ class SimulatedBroker:
         else:
             pnl = (self.entry_price - exit_price) * self.position_size * self.point_value
 
+        # "real" means the trade was ACTUALLY EXECUTED at the broker, not
+        # merely "the bot was in semi_auto/auto mode". In semi_auto the
+        # order-confirm dialog can be declined or time out, and in auto an
+        # order can fail — the simulated trade still closes, but it never
+        # touched the real account. No confirmed real entry fill → paper.
+        source = self.trade_source
+        if source == "real" and self.real_entry_price == 0:
+            source = "paper"
+
         trade = Trade(
             tag=self.entry_tag,
             side=self.position_side,
@@ -421,6 +444,7 @@ class SimulatedBroker:
             # 0/"" and the Trades tab will render them as "--".
             real_entry_price=self.real_entry_price,
             real_entry_dt=self.real_entry_dt,
+            source=source,
         )
         self.trades.append(trade)
         self._cumulative_pnl += pnl
@@ -437,6 +461,9 @@ class SimulatedBroker:
         self.real_entry_dt = ""
         self._pending_exits.clear()
         self._exit_bar_index = bar_index
+
+    def has_open_position(self) -> bool:
+        return self.position_size > 0
 
     def effective_entry_price(self) -> int:
         """Return the best-available stop-reference price.
@@ -562,6 +589,7 @@ class SimulatedBroker:
                     "real_entry_dt": t.real_entry_dt,
                     "real_exit_price": t.real_exit_price,
                     "real_exit_dt": t.real_exit_dt,
+                    "source": t.source,
                 }
                 for t in self.trades
             ],
@@ -603,6 +631,7 @@ class SimulatedBroker:
                 real_entry_dt=t.get("real_entry_dt", ""),
                 real_exit_price=t.get("real_exit_price", 0),
                 real_exit_dt=t.get("real_exit_dt", ""),
+                source=t.get("source", ""),
             )
             for t in data.get("trades", [])
         ]

@@ -16,10 +16,12 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from src.evolution.fitness import FitnessResult, SOURCE_BACKTEST, SOURCE_PAPER
+from src.evolution.fitness import FitnessResult, SOURCE_BACKTEST, SOURCE_PAPER, SOURCE_REAL
 from src.evolution.notify import (
     Baseline,
     BASELINE_FILENAME,
+    EVOLUTION_CADENCE_DAILY,
+    EVOLUTION_CADENCE_WEEKLY,
     IMPROVEMENT_DELTA,
     ImprovementVerdict,
     baseline_path,
@@ -28,6 +30,7 @@ from src.evolution.notify import (
     load_baseline,
     save_baseline,
     score_session_for_notification,
+    should_run_evolution_check,
 )
 
 
@@ -183,23 +186,21 @@ class TestScoreSessionForNotification:
         )
         assert fit.source == SOURCE_PAPER
 
-    def test_semi_auto_mode_also_tagged_paper(self):
-        # Notification semantics: semi_auto runs real fills with no
-        # look-ahead, so the trades are paper-equivalent for scoring.
+    def test_semi_auto_mode_tagged_real(self):
         trades = [{"pnl": 100, "entry_dt": "2026-05-01 10:00",
                    "exit_dt": "2026-05-01 11:00"}] * 40
         fit = score_session_for_notification(
             trades, equity_curve=None, trading_mode="semi_auto",
         )
-        assert fit.source == SOURCE_PAPER
+        assert fit.source == SOURCE_REAL
 
-    def test_auto_mode_also_tagged_paper(self):
+    def test_auto_mode_tagged_real(self):
         trades = [{"pnl": 100, "entry_dt": "2026-05-01 10:00",
                    "exit_dt": "2026-05-01 11:00"}] * 40
         fit = score_session_for_notification(
             trades, equity_curve=None, trading_mode="auto",
         )
-        assert fit.source == SOURCE_PAPER
+        assert fit.source == SOURCE_REAL
 
     def test_backtest_mode_tagged_backtest(self):
         trades = [{"pnl": 100, "entry_dt": "2026-05-01 10:00",
@@ -306,3 +307,122 @@ class TestCheckAndNotifyAfterReport:
         )
         assert verdict.send_notification is True
         assert (tmp_path / BASELINE_FILENAME).exists()
+
+
+class TestEvolutionCadence:
+    """should_run_evolution_check — weekly gate for the fitness check.
+
+    2026-06-13 is a Saturday; 2026-06-12 a Friday; 2026-06-08 a Monday.
+    """
+
+    def test_daily_always_runs(self):
+        for day in range(8, 15):  # Mon 06-08 .. Sun 06-14
+            assert should_run_evolution_check(
+                EVOLUTION_CADENCE_DAILY, datetime(2026, 6, day, 13, 45))
+
+    def test_weekly_runs_on_saturday_morning(self):
+        # The week's last session: Friday night close, Sat 04:58 TPE
+        assert should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, 13, 4, 58))
+
+    def test_weekly_runs_on_saturday_manual_stop(self):
+        # Manual stop later Saturday morning still counts
+        assert should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, 13, 9, 30))
+
+    def test_weekly_skips_weekday_session_ends(self):
+        # Mon-Fri day close (13:45) and night close windows must not fire
+        for day in (8, 9, 10, 11, 12):  # Mon..Fri
+            assert not should_run_evolution_check(
+                EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, day, 13, 45))
+            assert not should_run_evolution_check(
+                EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, day, 4, 58))
+
+    def test_weekly_skips_sunday(self):
+        assert not should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY, datetime(2026, 6, 14, 10, 0))
+
+    def test_tz_aware_now_converted_to_taipei(self):
+        # Friday 21:30 UTC == Saturday 05:30 TPE -> weekly window
+        assert should_run_evolution_check(
+            EVOLUTION_CADENCE_WEEKLY,
+            datetime(2026, 6, 12, 21, 30, tzinfo=timezone.utc))
+
+    def test_unknown_cadence_degrades_to_daily(self):
+        # A typo in settings must not silently disable evolution forever
+        assert should_run_evolution_check("weekIy-typo", datetime(2026, 6, 9, 13, 45))
+
+
+class TestEvolutionWatermark:
+    """load/save_watermark — which trades the on-demand evolution has seen."""
+
+    def test_load_returns_none_when_missing(self, tmp_path):
+        from src.evolution.notify import load_watermark
+        assert load_watermark(tmp_path) is None
+
+    def test_save_load_roundtrip(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 65, at="2026-06-13 05:00:00")
+        wm = load_watermark(tmp_path)
+        assert wm == {"trade_count": 65, "at": "2026-06-13 05:00:00"}
+
+    def test_save_defaults_timestamp(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 10)
+        wm = load_watermark(tmp_path)
+        assert wm["trade_count"] == 10
+        assert len(wm["at"]) == 19  # "YYYY-MM-DD HH:MM:SS"
+
+    def test_load_returns_none_on_corrupt_file(self, tmp_path):
+        from src.evolution.notify import WATERMARK_FILENAME, load_watermark
+        (tmp_path / WATERMARK_FILENAME).write_text("not json", encoding="utf-8")
+        assert load_watermark(tmp_path) is None
+
+    def test_load_returns_none_on_zero_count(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 0)
+        assert load_watermark(tmp_path) is None
+
+    def test_overwrite_advances_watermark(self, tmp_path):
+        from src.evolution.notify import load_watermark, save_watermark
+        save_watermark(tmp_path, 40, at="2026-06-06 05:00:00")
+        save_watermark(tmp_path, 65, at="2026-06-13 05:00:00")
+        wm = load_watermark(tmp_path)
+        assert wm["trade_count"] == 65
+
+    def test_no_tmp_file_left(self, tmp_path):
+        from src.evolution.notify import WATERMARK_FILENAME, save_watermark
+        save_watermark(tmp_path, 5)
+        assert not (tmp_path / (WATERMARK_FILENAME + ".tmp")).exists()
+
+
+class TestPostCloseEvolutionWindow:
+    """is_post_close_evolution_window — weekly pipeline runs AFTER the
+    Saturday 05:00 close, never during the final session minutes.
+
+    2026-06-13 is a Saturday.
+    """
+
+    def test_saturday_after_0505_is_in_window(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        assert is_post_close_evolution_window(datetime(2026, 6, 13, 5, 5))
+        assert is_post_close_evolution_window(datetime(2026, 6, 13, 9, 30))
+        assert is_post_close_evolution_window(datetime(2026, 6, 13, 23, 59))
+
+    def test_saturday_before_close_is_not(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        # 04:58 = the old in-session trigger moment — must be excluded
+        assert not is_post_close_evolution_window(datetime(2026, 6, 13, 4, 58))
+        assert not is_post_close_evolution_window(datetime(2026, 6, 13, 5, 4))
+
+    def test_weekdays_and_sunday_are_not(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        for day in (8, 9, 10, 11, 12, 14):  # Mon-Fri + Sunday
+            assert not is_post_close_evolution_window(
+                datetime(2026, 6, day, 10, 0))
+
+    def test_tz_aware_converted(self):
+        from src.evolution.notify import is_post_close_evolution_window
+        # Friday 21:30 UTC == Saturday 05:30 TPE → in window
+        assert is_post_close_evolution_window(
+            datetime(2026, 6, 12, 21, 30, tzinfo=timezone.utc))

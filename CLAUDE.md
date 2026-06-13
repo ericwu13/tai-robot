@@ -90,6 +90,7 @@ python test_kline.py       # COM-based KLine history GUI
 
 ## AI Code Generation
 - Indicators return named tuples: `BollingerResult(upper, middle, lower)`, `MacdResult(macd_line, signal_line, histogram)`, `StochasticResult(k, d)` — both `bb.middle` and `upper, mid, lower = bb` work
+- **No `bb_std`/std attribute exists anywhere** (pure-Python indicators; no pandas_ta/talib in this repo). BB std-dev is not returned — recover it as `(bb.upper - bb.middle) / num_std` (population std, ddof=0, matches TradingView `ta.stdev`). `self.bb_std` in strategies is a self-defined constructor param (the σ multiplier): `self.bb_std = float(kwargs.get("bb_std", 2.0))`. Referencing it without that line → runtime AttributeError (the BbandMonthShortV5 crash).
 - `broker.queue_exit()` auto-rounds float limit/stop prices to int (TAIFEX prices are integers)
 - `extract_python_code()` strips trailing markdown that leaks into code fences
 - Trade.entry_dt and exit_dt are STRINGS ("YYYY-MM-DD HH:MM"), not datetime objects

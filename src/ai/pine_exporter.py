@@ -6,7 +6,8 @@ from .chat_client import ChatClient, model_for_tier
 from .prompts import PINE_EXPORT_SYSTEM_PROMPT
 
 
-def export_to_pine(chat_client: ChatClient, strategy_source: str) -> str:
+def export_to_pine(chat_client: ChatClient, strategy_source: str,
+                   ultra_mode: bool = False) -> str:
     """Translate a Python BacktestStrategy to Pine Script v5.
 
     Uses a one-shot API call with PINE_EXPORT_SYSTEM_PROMPT.
@@ -18,7 +19,7 @@ def export_to_pine(chat_client: ChatClient, strategy_source: str) -> str:
     )
     # Pine translation needs the strategy logic preserved exactly — use the
     # heavy tier so subtle entry/exit conditions don't get paraphrased away.
-    pine_model = model_for_tier(chat_client.provider, "heavy")
+    pine_model = model_for_tier(chat_client.provider, "heavy", ultra_mode=ultra_mode)
     response = chat_client.one_shot(
         prompt, system_prompt=PINE_EXPORT_SYSTEM_PROMPT,
         call_site="pine_export", model=pine_model,

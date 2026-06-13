@@ -21,6 +21,7 @@ trading:
   order_type: "2"            # "2"=auto new/close
   trade_type: 0              # 0=ROD, 1=IOC, 2=FOK
   price_flag: 0              # 0=market, 1=limit
+  allow_live_override: false  # true = allow mode_override.json to switch to "auto" at runtime
 
 strategy:
   name: "ma_crossover"
@@ -54,3 +55,39 @@ ai:
   # more than this many messages.  A recap re-sends the full history; on long
   # sessions that's expensive and rarely worth it.
   recap_token_gate: 30
+  # When true, "heavy" tier calls (codegen, trade review, pine export) use the
+  # most capable model (gemini-3.1-pro-preview) instead of gemini-2.5-pro.
+  # Costs more. Env var ULTRA_MODE=1 overrides this at runtime. If Google
+  # renames/retires the preview model (404), calls fall back to the default.
+  ultra_mode: false
+
+evolution:
+  # When the automatic fitness/improvement check runs:
+  #   "weekly" (default) — only on the trading week's LAST session, i.e. the
+  #     Friday night session that closes Saturday ~05:00 TPE. Daily sessions
+  #     rarely cross the 30-trade minimum, so daily scoring is gated noise.
+  #   "daily" — every session end (the pre-2.12 behavior).
+  # The 🧬 Bot Evolution button generates an AI improvement plan on demand
+  # regardless of this setting.
+  cadence: "weekly"
+  # true (default): 🧬 runs the full auto-pipeline — plan → candidate codegen
+  # → A/B validation backtest → verdict; a PASS auto-saves the candidate to
+  # the strategy store (deployment stays manual). false: plan-only.
+  # Also enables the WEEKLY automatic run: fires once per week AFTER the
+  # Saturday close (≥ 05:05 TPE, market quiet, week's data complete), with
+  # the verdict sent to Discord.
+  auto_pipeline: true
+  # Validation method for the auto-pipeline:
+  #   "deep" (default) — SEE-spec walk-forward: 90d train / 90d test
+  #     (out-of-sample decides the verdict) + Monte Carlo robustness
+  #     (±10% param jitter; fragile candidates fail). Validation data is
+  #     fetched via the Capital API when connected (~194 days); otherwise
+  #     local data is used and the windows scale down to the available span.
+  #   "simple" — single-window A/B on whatever data is at hand.
+  validation: "deep"
+  # Walk-forward holdout: the most recent N days of trade evidence are
+  # WITHHELD from the AI when it designs the change ("train" = older data
+  # only) and the verdict is decided on this unseen window ("test"). The
+  # cut rolls forward each cycle — this week's holdout becomes next week's
+  # design data.
+  holdout_days: 14
