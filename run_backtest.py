@@ -53,6 +53,10 @@ from src.utils.log_redact import (
     redact_future_rights as _redact_future_rights,
 )
 from src.backtest.engine import BacktestEngine
+from src.backtest.broker import _mode_to_source
+
+# Trade.source → display label for the Trades tab and exports
+_SOURCE_LABELS = {"real": "實單 Real", "paper": "模擬 Paper", "backtest": "回測 BT"}
 from src.backtest.report import format_report, export_trades_csv
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
@@ -78,7 +82,8 @@ from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
 # AI modules
 from src.ai.chat_client import (
     ChatClient, PROVIDER_ANTHROPIC, PROVIDER_GOOGLE, DEFAULT_MODELS,
-    model_for_tier,
+    GOOGLE_MODEL_PRO, GOOGLE_MODEL_ULTRA,
+    model_for_tier, resolve_ultra_mode,
 )
 from src.ai.prompts import STRATEGY_SYSTEM_PROMPT, STRATEGY_CODE_CONTEXT, CODE_GEN_SYSTEM_PROMPT, CHAT_RECAP_PROMPT
 from src.ai.code_sandbox import (
@@ -272,16 +277,45 @@ def _load_settings():
             cfg["ai_model"] = ai.get("model", "")
             cfg["ai_max_tokens"] = ai.get("max_tokens", 16384)
             cfg["recap_token_gate"] = ai.get("recap_token_gate", 30)
+            # ultra_mode: settings.yaml ai.ultra_mode (default False); env
+            # ULTRA_MODE=1 overrides at runtime.  When ON, "heavy" tier callers
+            # (codegen, trade review, pine export) get the ultra model instead
+            # of gemini-2.5-pro.
+            cfg["ultra_mode"] = resolve_ultra_mode(ai.get("ultra_mode", False))
+            if cfg["ultra_mode"]:
+                print(f"[AI] ultra_mode=ON — heavy tier using {GOOGLE_MODEL_ULTRA}")
+            else:
+                print(f"[AI] ultra_mode=OFF — heavy tier using {GOOGLE_MODEL_PRO}")
             # Notifications
             notif = data.get("notifications", {})
             cfg["discord_bot_token"] = notif.get("discord_bot_token", "")
             cfg["discord_channel_id"] = notif.get("discord_channel_id", "")
+            # Trading
+            trading = data.get("trading", {})
+            cfg["allow_live_override"] = trading.get("allow_live_override", False)
+            # Evolution: "weekly" (default) = fitness/improvement check only
+            # on the trading week's last session (Sat AM close); "daily" =
+            # every session end (the pre-2.12 behavior).
+            evo = data.get("evolution", {})
+            cfg["evolution_cadence"] = evo.get("cadence", "weekly")
+            # auto_pipeline: 🧬 runs plan → codegen → A/B validation →
+            # auto-save on PASS. false = plan-only (the old behavior).
+            cfg["evolution_auto_pipeline"] = evo.get("auto_pipeline", True)
+            # validation: "deep" (SEE spec — 90/90-day walk-forward + Monte
+            # Carlo, data fetched via Capital API when available) or
+            # "simple" (single-window A/B on whatever data is at hand).
+            cfg["evolution_validation"] = evo.get("validation", "deep")
+            # holdout_days: the most recent N days of trade evidence are
+            # WITHHELD from the AI's design and used as the unseen
+            # validation window (walk-forward discipline).
+            cfg["evolution_holdout_days"] = evo.get("holdout_days", 14)
             break
     return cfg
 
 
 def _save_ai_settings(provider: str = "", anthropic_key: str = "",
-                      google_key: str = "", model: str = "", max_tokens: int = 0):
+                      google_key: str = "", model: str = "", max_tokens: int = 0,
+                      ultra_mode: bool | None = None):
     """Persist AI settings to settings.yaml."""
     if not yaml:
         return
@@ -301,8 +335,59 @@ def _save_ai_settings(provider: str = "", anthropic_key: str = "",
         ai["model"] = model
     if max_tokens:
         ai["max_tokens"] = max_tokens
+    # bool needs an explicit None-check — `if ultra_mode:` could never
+    # persist False, leaving a stale `true` in settings.yaml forever.
+    if ultra_mode is not None:
+        ai["ultra_mode"] = bool(ultra_mode)
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+
+
+def _evolution_omitted_count(total_trades: int, watermark: dict | None) -> int:
+    """How many leading trades a previous evolution run already covered.
+
+    Clamped to ``total_trades`` so a stale watermark from a longer
+    earlier session (or a reset session reusing the bot dir) can never
+    produce a negative window.
+    """
+    if not watermark:
+        return 0
+    return min(int(watermark.get("trade_count", 0) or 0), total_trades)
+
+
+def _read_persisted_ultra_mode() -> bool:
+    """The settings.yaml ai.ultra_mode value — the durable DEFAULT.
+
+    Distinct from the session value in self._settings["ultra_mode"],
+    which the 🚀 header button flips without persisting. The AI Settings
+    dialog must show this persisted default, NOT the session value —
+    otherwise a session-only toggle followed by saving unrelated AI
+    settings would silently persist ultra mode.
+    """
+    if not yaml:
+        return False
+    path = os.path.join(project_root, "settings.yaml")
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return bool((data.get("ai") or {}).get("ultra_mode", False))
+    except Exception:
+        return False
+
+
+def _ultra_toggle_decision(current: bool, confirm) -> bool | None:
+    """Guard logic for the Ultra Mode toggle button.
+
+    Turning OFF is immediate (never calls ``confirm``); turning ON
+    requires confirmation because the ultra model costs significantly
+    more. Returns the new state, or None when the user cancelled.
+    Pure function so the guard is testable without Tk.
+    """
+    if current:
+        return False
+    return True if confirm() else None
 
 
 _CACHE_DIR = os.path.join(project_root, "data")
@@ -540,6 +625,10 @@ class BacktestApp:
         self.root.title(f"tai-robot AI 策略工作台 AI Strategy Workbench v{APP_VERSION}")
         self.root.geometry("1400x850")
         self.root.minsize(1100, 650)
+        try:
+            self.root.state("zoomed")  # start maximized (Windows)
+        except tk.TclError:
+            pass
 
         self._settings = _load_settings()
         self._fetcher = KChartFetcher()
@@ -1052,6 +1141,13 @@ class BacktestApp:
         self._raw_bars_key: tuple = ()  # (symbol, kline_type, kline_minute) of stored raw bars
         self._data_source: str = ""  # tracks where data came from for report
         self._pending_api_fetch: bool = False  # triggers fetch after login completes
+        # When set, the API chunk-fetch loop calls this (with success bool)
+        # at its terminus INSTEAD of running a backtest — lets the
+        # evolution pipeline borrow the fetch machinery for validation data.
+        self._evo_fetch_cb = None  # Callable[[bool], None] | None
+        # (ISO year, week) of the last weekly auto-evolution run — the 30s
+        # poll fires the post-close pipeline exactly once per week.
+        self._weekly_evo_done: tuple | None = None
 
         # Live trading state
         self._live_chart: LiveChart | None = None
@@ -1112,6 +1208,9 @@ class BacktestApp:
         ttk.Button(header, text="Load Chat", width=9, command=self._load_chat_session).pack(side=tk.RIGHT, padx=2)
         ttk.Button(header, text="Save Chat", width=9, command=self._save_chat_session).pack(side=tk.RIGHT, padx=2)
         ttk.Button(header, text="Settings", width=8, command=self._show_api_key_dialog).pack(side=tk.RIGHT, padx=2)
+        self.btn_ultra = ttk.Button(header, width=14, command=self._toggle_ultra_mode)
+        self.btn_ultra.pack(side=tk.RIGHT, padx=2)
+        self._update_ultra_button()
 
         # ── Chat display ──
         self.chat_display = scrolledtext.ScrolledText(
@@ -1251,16 +1350,12 @@ class BacktestApp:
                                      command=self._do_export, state=tk.DISABLED)
         self.btn_export.grid(row=0, column=5, padx=3, pady=1, sticky=tk.W)
 
-        self.btn_review = ttk.Button(btn_frame, text="AI檢視 AI Review",
-                                     command=self._review_trades, state=tk.DISABLED)
-        self.btn_review.grid(row=0, column=7, padx=3, pady=1, sticky=tk.W)
-
-        self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
-                                     command=self._report_issue)
-        self.btn_report.grid(row=0, column=8, padx=3, pady=1, sticky=tk.W)
+        self.btn_toggle_settings = ttk.Button(btn_frame, text="▶ 設定 Settings",
+                                               command=self._toggle_settings)
+        self.btn_toggle_settings.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
 
         tf_frame = ttk.Frame(btn_frame)
-        tf_frame.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
+        tf_frame.grid(row=0, column=7, padx=3, pady=1, sticky=tk.W)
         ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
         self.chart_tf_var = tk.StringVar(value="Native")
         self.chart_tf_combo = ttk.Combobox(
@@ -1270,9 +1365,27 @@ class BacktestApp:
         )
         self.chart_tf_combo.pack(side=tk.LEFT)
 
-        self.btn_toggle_settings = ttk.Button(btn_frame, text="▶ 設定 Settings",
-                                               command=self._toggle_settings)
-        self.btn_toggle_settings.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
+        self.btn_review = ttk.Button(btn_frame, text="AI檢視 AI Review",
+                                     command=self._review_trades, state=tk.DISABLED)
+        self.btn_review.grid(row=0, column=8, padx=3, pady=1, sticky=tk.W)
+
+        self.btn_evolution = ttk.Button(btn_frame, text="🧬 進化 Evolution",
+                                        command=self._bot_evolution, state=tk.DISABLED)
+        self.btn_evolution.grid(row=0, column=9, padx=3, pady=1, sticky=tk.W)
+
+        self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
+                                     command=self._report_issue)
+        self.btn_report.grid(row=0, column=10, padx=3, pady=1, sticky=tk.W)
+
+        # Wrap toolbar buttons onto extra rows when the frame is too
+        # narrow for a single row (grid does not auto-wrap).
+        self._toolbar_widgets = [
+            self.btn_tv, self.btn_api, self.btn_taifex, self.btn_deploy,
+            self.btn_chart_all, self.btn_export, self.btn_toggle_settings,
+            tf_frame, self.btn_review, self.btn_evolution, self.btn_report,
+        ]
+        self._toolbar_last_width = 0
+        btn_frame.bind("<Configure>", self._reflow_toolbar)
 
         # Status on its own row so it never clips the buttons above
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
@@ -1318,6 +1431,16 @@ class BacktestApp:
         # Metrics tab
         metrics_frame = ttk.Frame(notebook)
         notebook.add(metrics_frame, text="績效報告 Report")
+        report_bar = ttk.Frame(metrics_frame)
+        report_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Label(report_bar, text="檢視 View:").pack(side=tk.LEFT, padx=(0, 4))
+        self.report_filter_var = tk.StringVar(value="全部 All")
+        self.report_filter_combo = ttk.Combobox(
+            report_bar, textvariable=self.report_filter_var,
+            values=["全部 All", "實單 Real"], state="readonly", width=12)
+        self.report_filter_combo.pack(side=tk.LEFT)
+        self.report_filter_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_report_filter_changed())
         self.metrics_text = scrolledtext.ScrolledText(metrics_frame, wrap=tk.WORD,
                                                        font=("Consolas", 11))
         self.metrics_text.pack(fill=tk.BOTH, expand=True)
@@ -1326,7 +1449,7 @@ class BacktestApp:
         trades_frame = ttk.Frame(notebook)
         notebook.add(trades_frame, text="交易明細 Trades")
         columns = ("num", "tag", "side", "entry_time", "entry_price", "real_entry",
-                   "exit_time", "exit_price", "pnl", "bars_held")
+                   "exit_time", "exit_price", "pnl", "bars_held", "source")
         self.trade_tree = ttk.Treeview(trades_frame, columns=columns, show="headings", height=20)
         self._trade_sort_col = None
         self._trade_sort_reverse = False
@@ -1336,10 +1459,12 @@ class BacktestApp:
             ("real_entry", "實進場 Real Entry", 90),
             ("exit_time", "出場時間 Exit Time", 135), ("exit_price", "出場價 Exit", 80),
             ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 60),
+            ("source", "來源 Source", 80),
         ]:
             self.trade_tree.heading(col, text=text,
                                    command=lambda c=col: self._sort_trade_tree(c))
-            self.trade_tree.column(col, width=w, anchor=tk.E if col != "tag" else tk.W)
+            self.trade_tree.column(col, width=w,
+                                   anchor=tk.E if col not in ("tag", "source") else tk.W)
         vsb = ttk.Scrollbar(trades_frame, orient="vertical", command=self.trade_tree.yview)
         self.trade_tree.configure(yscrollcommand=vsb.set)
         self.trade_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1360,9 +1485,18 @@ class BacktestApp:
         ttk.Label(bot_name_frame, text="|").pack(side=tk.LEFT, padx=4)
         ttk.Label(bot_name_frame, text="模式 Mode:").pack(side=tk.LEFT, padx=(0, 4))
         self.trading_mode_var = tk.StringVar(value="--")
-        self.trading_mode_label = ttk.Label(bot_name_frame, textvariable=self.trading_mode_var,
-                                             font=("Consolas", 10, "bold"))
-        self.trading_mode_label.pack(side=tk.LEFT)
+        self._mode_combo_values = ["模擬 Paper", "半自動 Semi-Auto", "全自動 Auto"]
+        self._mode_combo_to_key = {
+            "模擬 Paper": "paper", "半自動 Semi-Auto": "semi_auto", "全自動 Auto": "auto",
+        }
+        self._mode_key_to_combo = {v: k for k, v in self._mode_combo_to_key.items()}
+        self.mode_combo = ttk.Combobox(
+            bot_name_frame, textvariable=self.trading_mode_var,
+            values=self._mode_combo_values, state=tk.DISABLED,
+            width=18, font=("Consolas", 10, "bold"),
+        )
+        self.mode_combo.pack(side=tk.LEFT)
+        self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_combo_changed)
 
         # Status panel
         status_panel = ttk.LabelFrame(live_frame, text="即時狀態 Live Status", padding=6)
@@ -1626,7 +1760,8 @@ class BacktestApp:
         # Use a one-shot API call (not the chat conversation) to avoid bloat
         client = self._chat_client
         codegen_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
@@ -1713,7 +1848,8 @@ class BacktestApp:
         retry_msg = summary_section + error_msg + "\n\n" + STRATEGY_CODE_CONTEXT
         remaining = retries_left - 1
         codegen_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
@@ -1763,9 +1899,11 @@ class BacktestApp:
 
         source = self._ai_strategy_source
 
+        ultra = self._settings.get("ultra_mode", False)
+
         def _worker():
             try:
-                pine = export_to_pine(self._chat_client, source)
+                pine = export_to_pine(self._chat_client, source, ultra_mode=ultra)
                 self.root.after(0, lambda: self._show_pine_popup(pine))
             except Exception as e:
                 _log(f"Pine export error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -1931,11 +2069,46 @@ class BacktestApp:
         self._load_saved_strategy()
         self.status_var.set(f"已匯入 Imported: {cls} → {fname}")
 
+    def _update_ultra_button(self) -> None:
+        on = self._settings.get("ultra_mode", False)
+        self.btn_ultra.config(text=f"🚀 Ultra: {'ON' if on else 'OFF'}")
+
+    def _toggle_ultra_mode(self) -> None:
+        """Toggle ultra_mode for THIS SESSION ONLY (cost confirmation on enable).
+
+        Deliberately not persisted — an expensive mode silently
+        re-enabling itself on the next launch is a surprise-bill
+        generator. The durable default lives in the AI Settings dialog
+        checkbox / settings.yaml ai.ultra_mode (env ULTRA_MODE still
+        wins at startup). No ChatClient rebuild needed: heavy-tier call
+        sites read self._settings["ultra_mode"] at call time.
+        """
+        def _confirm() -> bool:
+            return messagebox.askyesno(
+                "Enable Ultra Mode?",
+                "Ultra Mode switches to Gemini 3.1 Pro which significantly "
+                "increases AI costs. Your current bill may increase. "
+                "Are you sure you want to enable it?\n\n"
+                "(本次執行有效 Session only — resets on restart)",
+                icon="warning",
+            )
+
+        new_state = _ultra_toggle_decision(
+            self._settings.get("ultra_mode", False), _confirm)
+        if new_state is None:
+            return  # user cancelled the enable confirmation
+        self._settings["ultra_mode"] = new_state
+        self._update_ultra_button()
+        model = GOOGLE_MODEL_ULTRA if new_state else GOOGLE_MODEL_PRO
+        self.status_var.set(
+            f"Ultra Mode {'ON' if new_state else 'OFF'} (session only) — "
+            f"heavy tier: {model}")
+
     def _show_api_key_dialog(self):
         """Show settings dialog with provider selection and API keys."""
         dialog = tk.Toplevel(self.root)
         dialog.title("AI Settings")
-        dialog.geometry("450x280")
+        dialog.geometry("450x330")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1980,23 +2153,41 @@ class BacktestApp:
         provider_var.trace_add("write", _update_hint)
         _update_hint()
 
+        # Ultra mode PERSISTENT DEFAULT — initialized from settings.yaml,
+        # NOT the session value: the 🚀 header button toggles the session
+        # only, and saving unrelated settings here must not accidentally
+        # persist a session-only ultra toggle.
+        ultra_var = tk.BooleanVar(value=_read_persisted_ultra_mode())
+        ttk.Checkbutton(
+            frame, variable=ultra_var,
+            text=f"Ultra Mode 預設 default — ({GOOGLE_MODEL_ULTRA}, Google only)",
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ttk.Label(
+            frame, foreground="gray",
+            text="持久預設，影響 codegen/review/evolution/Pine (成本較高)。"
+                 "臨時切換請用聊天區 🚀 按鈕 (session-only).",
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W)
+
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=(16, 0))
+        btn_frame.grid(row=7, column=0, columnspan=2, pady=(16, 0))
 
         def _save():
             provider = provider_var.get()
             ak = anth_var.get().strip()
             gk = goog_var.get().strip()
             model = model_var.get().strip()
+            ultra = bool(ultra_var.get())
 
             self._settings["ai_provider"] = provider
             self._settings["anthropic_api_key"] = ak
             self._settings["google_api_key"] = gk
             self._settings["ai_model"] = model
+            self._settings["ultra_mode"] = ultra
+            self._update_ultra_button()  # keep the chat-header toggle in sync
 
             _save_ai_settings(provider=provider, anthropic_key=ak,
-                              google_key=gk, model=model)
+                              google_key=gk, model=model, ultra_mode=ultra)
 
             # Reset client so it picks up new settings
             if self._chat_client:
@@ -2212,6 +2403,29 @@ class BacktestApp:
         """Update UI when strategy selection changes."""
         pass
 
+    def _reflow_toolbar(self, event) -> None:
+        """Re-grid toolbar buttons so they wrap when the frame is narrow.
+
+        Only re-flows when the frame WIDTH changes — re-gridding changes
+        the frame height, which fires <Configure> again; gating on width
+        breaks that loop.
+        """
+        if event.width == self._toolbar_last_width:
+            return
+        self._toolbar_last_width = event.width
+        x = 0
+        row = 0
+        col = 0
+        for w in self._toolbar_widgets:
+            req = w.winfo_reqwidth() + 6  # padx=3 each side
+            if col > 0 and x + req > event.width:
+                row += 1
+                col = 0
+                x = 0
+            w.grid(row=row, column=col, padx=3, pady=1, sticky=tk.W)
+            col += 1
+            x += req
+
     def _toggle_settings(self):
         """Show/hide backtest settings panel."""
         if self._settings_visible:
@@ -2414,12 +2628,22 @@ class BacktestApp:
         _log(f"分段查詢 Fetching in {len(chunks)} chunks: {start_date}~{end_date}")
         self._fetch_next_chunk()
 
+    def _consume_evo_fetch_cb(self):
+        """Pop the evolution fetch callback (one-shot), or None."""
+        cb = self._evo_fetch_cb
+        self._evo_fetch_cb = None
+        return cb
+
     def _fetch_next_chunk(self):
         """Fetch the next chunk of KLine data via COM API."""
         chunk = self._fetcher.next_chunk()
         if chunk is None:
             _log(f"全部完成 All chunks fetched: {self._fetcher.total_bar_count} total KLine strings")
-            self._run_backtest()
+            cb = self._consume_evo_fetch_cb()
+            if cb:
+                cb(True)
+            else:
+                self._run_backtest()
             return
 
         n = chunk.chunk_index + 1
@@ -2442,11 +2666,17 @@ class BacktestApp:
                 if code >= 3000:
                     self.status_var.set(f"錯誤 Error: {msg}")
                     self._enable_buttons()
+                    cb = self._consume_evo_fetch_cb()
+                    if cb:
+                        cb(False)
                     return
 
         except Exception as e:
             _log(f"查詢錯誤 Fetch error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._enable_buttons()
+            cb = self._consume_evo_fetch_cb()
+            if cb:
+                cb(False)
 
     def _do_fetch_taifex(self):
         """Fetch daily bars from TAIFEX public API (no account needed)."""
@@ -2640,7 +2870,11 @@ class BacktestApp:
         if not self._fetcher.chunks_done:
             self.root.after(500, self._fetch_next_chunk)
         else:
-            self._run_backtest()
+            cb = self._consume_evo_fetch_cb()
+            if cb:
+                cb(True)
+            else:
+                self._run_backtest()
 
     def _get_strategy_interval(self) -> int:
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
@@ -2769,6 +3003,7 @@ class BacktestApp:
         self.btn_export.config(state=tk.NORMAL)
         if result.trades:
             self.btn_review.config(state=tk.NORMAL)
+            self.btn_evolution.config(state=tk.NORMAL)
         if _LWC_AVAILABLE and result.trades:
             self.btn_chart_all.config(state=tk.NORMAL)
         self.status_var.set(
@@ -2782,6 +3017,14 @@ class BacktestApp:
         self.status_var.set(f"回測錯誤 Backtest error: {error}")
         self._append_chat("error", f"Backtest runtime error:\n{error}")
         self._enable_buttons()
+
+    def _on_report_filter_changed(self):
+        """Re-render the Report tab when the 檢視 View filter changes."""
+        result = (self._live_runner.get_result()
+                  if self._live_runner and self._live_runner.state != LiveState.IDLE
+                  else self._last_result)
+        if result is not None:
+            self._display_results(result, self._last_bars)
 
     def _display_results(self, result, bars: list[Bar] | None = None):
         # Metrics report
@@ -2817,7 +3060,26 @@ class BacktestApp:
             header_lines.append(f" 1分K / 聚合K  1m/Agg:  {status['bars_1m']} / {status['bars_agg']}")
         self.metrics_text.insert(tk.END, "\n".join(header_lines) + "\n\n")
 
-        report = format_report(result.strategy_name, result.metrics)
+        # 檢視 View filter: "全部 All" = full simulated view (every trade
+        # has a simulated fill); "實單 Real" = the same full report
+        # recomputed on only the broker-executed subset.
+        if self.report_filter_var.get().startswith("實單"):
+            rtrades = [t for t in result.trades
+                       if getattr(t, "source", "") == "real"]
+            if rtrades:
+                req, cum = [], 0
+                for t in rtrades:
+                    cum += t.pnl
+                    req.append(cum)
+                rmetrics = calculate_metrics(rtrades, req, initial_balance=0)
+                report = format_report(
+                    f"{result.strategy_name} — 實單 Real only", rmetrics)
+            else:
+                report = ("(無實單交易 No real-order trades in this result — "
+                          "switch 檢視 View back to 全部 All)")
+        else:
+            report = format_report(result.strategy_name, result.metrics,
+                                   trades=result.trades)
         self.metrics_text.insert(tk.END, report)
 
         # Trade list
@@ -2842,10 +3104,13 @@ class BacktestApp:
             real_entry_str = (f"{t.real_entry_price:,}"
                               if t.real_entry_price > 0 else "--")
 
+            source_str = _SOURCE_LABELS.get(getattr(t, "source", ""), "--")
+
             self.trade_tree.insert("", tk.END, values=(
                 i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
                 real_entry_str,
                 exit_dt, f"{t.exit_price:,}", pnl_str, bars_held,
+                source_str,
             ), tags=(row_tag,))
 
         self.trade_tree.tag_configure("win", foreground="green")
@@ -3153,42 +3418,13 @@ class BacktestApp:
           explicit instruction to now analyze all trades together. This
           preserves full context no matter how many trades there are.
         """
-        result = (self._live_runner.get_result()
-                  if self._live_runner and self._live_runner.state != LiveState.IDLE
-                  else self._last_result)
-        if not result or not result.trades:
+        payload = self._gather_analysis_payload()
+        if payload is None:
             self.status_var.set("無交易紀錄 No trades to review")
             return
         if not self._ensure_chat_client():
             return
-
-        # Build report + timeframe line + strategy source
-        report = format_report(result.strategy_name, result.metrics)
-        strategy_name = self.strategy_var.get()
-        strategy_cls = STRATEGIES.get(strategy_name)
-        timeframe_line = self._build_review_timeframe_line(strategy_cls)
-        strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
-
-        source_section = ""
-        if strategy_source:
-            source_section = (
-                f"\n\n策略原始碼 Strategy Source Code:\n"
-                f"```python\n{strategy_source}\n```"
-            )
-
-        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
-        # handle thousands of rows; chunked mode below handles the rest.
-        trade_lines = []
-        for i, t in enumerate(result.trades, 1):
-            bars_held = t.exit_bar_index - t.entry_bar_index
-            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
-            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
-            trade_lines.append(
-                f"  {i}. {t.side.value} {t.tag}: "
-                f"entry={entry_dt} @{t.entry_price:,} → "
-                f"exit={exit_dt} @{t.exit_price:,} "
-                f"P&L={t.pnl:+,} ({bars_held} bars)"
-            )
+        result, report, timeframe_line, source_section, trade_lines = payload
 
         # Detect degradation vs previous review round
         cur_pf = result.metrics.profit_factor
@@ -3252,7 +3488,56 @@ class BacktestApp:
             f"{timeframe_line}\n"
         )
 
-        # Estimate context size to decide single-shot vs chunked mode
+        self._dispatch_trade_analysis(
+            preamble, trade_lines, source_section, len(result.trades),
+            label="AI Review: 請分析以下交易紀錄", call_site="trade_review")
+
+    def _gather_analysis_payload(self):
+        """Shared data assembly for AI Review and Bot Evolution.
+
+        Returns ``(result, report, timeframe_line, source_section,
+        trade_lines)`` or None when there are no trades.
+        """
+        result = (self._live_runner.get_result()
+                  if self._live_runner and self._live_runner.state != LiveState.IDLE
+                  else self._last_result)
+        if not result or not result.trades:
+            return None
+
+        report = format_report(result.strategy_name, result.metrics,
+                               trades=result.trades)
+        strategy_name = self.strategy_var.get()
+        strategy_cls = STRATEGIES.get(strategy_name)
+        timeframe_line = self._build_review_timeframe_line(strategy_cls)
+        strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
+
+        source_section = ""
+        if strategy_source:
+            source_section = (
+                f"\n\n策略原始碼 Strategy Source Code:\n"
+                f"```python\n{strategy_source}\n```"
+            )
+
+        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
+        # handle thousands of rows; chunked mode handles the rest.
+        trade_lines = []
+        for i, t in enumerate(result.trades, 1):
+            bars_held = t.exit_bar_index - t.entry_bar_index
+            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
+            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
+            src_mark = " [real]" if getattr(t, "source", "") == "real" else ""
+            trade_lines.append(
+                f"  {i}. {t.side.value} {t.tag}: "
+                f"entry={entry_dt} @{t.entry_price:,} → "
+                f"exit={exit_dt} @{t.exit_price:,} "
+                f"P&L={t.pnl:+,} ({bars_held} bars){src_mark}"
+            )
+        return result, report, timeframe_line, source_section, trade_lines
+
+    def _dispatch_trade_analysis(self, preamble: str, trade_lines: list[str],
+                                 source_section: str, total_trades: int,
+                                 label: str, call_site: str) -> None:
+        """Route to single-shot or chunked delivery based on estimated size."""
         trade_block_chars = sum(len(line) + 1 for line in trade_lines)  # +1 for newline
         estimated_total = (
             len(preamble)
@@ -3267,19 +3552,23 @@ class BacktestApp:
                 preamble=preamble,
                 trade_lines=trade_lines,
                 source_section=source_section,
-                total_trades=len(result.trades),
+                total_trades=total_trades,
+                label=label, call_site=call_site,
             )
         else:
             self._review_trades_chunked(
                 preamble=preamble,
                 trade_lines=trade_lines,
                 source_section=source_section,
-                total_trades=len(result.trades),
+                total_trades=total_trades,
                 estimated_chars=estimated_total,
+                label=label, call_site=call_site,
             )
 
     def _review_trades_single_shot(self, preamble: str, trade_lines: list[str],
-                                     source_section: str, total_trades: int) -> None:
+                                     source_section: str, total_trades: int,
+                                     label: str = "AI Review: 請分析以下交易紀錄",
+                                     call_site: str = "trade_review") -> None:
         """Send the full AI Review in a single API call."""
         context = (
             preamble
@@ -3288,17 +3577,18 @@ class BacktestApp:
             + source_section
         )
 
-        self._append_chat("user", "AI Review: 請分析以下交易紀錄\n" + context)
+        self._append_chat("user", label + "\n" + context)
         self.btn_send.config(state=tk.DISABLED)
         self._append_chat("system", f"Analyzing {total_trades} trades...")
 
         review_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
                 response = self._chat_client.send_message(
-                    context, call_site="trade_review", model=review_model)
+                    context, call_site=call_site, model=review_model)
                 # Replace the trade-dump user turn with a stub so the trade
                 # data does not pollute future send_message() calls (issue: AI
                 # cost runaway because send_message re-sends full history).
@@ -3317,7 +3607,9 @@ class BacktestApp:
 
     def _review_trades_chunked(self, preamble: str, trade_lines: list[str],
                                  source_section: str, total_trades: int,
-                                 estimated_chars: int) -> None:
+                                 estimated_chars: int,
+                                 label: str = "AI Review: 請分析以下交易紀錄",
+                                 call_site: str = "trade_review") -> None:
         """Send AI Review in multiple user messages when the trade list is too large.
 
         Flow:
@@ -3341,7 +3633,7 @@ class BacktestApp:
 
         # GUI feedback: a single summary bubble rather than repeating every batch
         summary_line = (
-            f"AI Review: 請分析以下交易紀錄 "
+            f"{label} "
             f"({total_trades} trades, ~{estimated_chars // 1000}K chars, "
             f"split into {K} parts for API size safety)"
         )
@@ -3354,7 +3646,8 @@ class BacktestApp:
         )
 
         review_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy")
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
 
         def _worker():
             try:
@@ -3418,7 +3711,7 @@ class BacktestApp:
                     )
 
                     response = self._chat_client.send_message(
-                        msg, call_site=f"trade_review_chunk_{batch_idx}/{K}",
+                        msg, call_site=f"{call_site}_chunk_{batch_idx}/{K}",
                         model=review_model,
                     )
 
@@ -3457,6 +3750,656 @@ class BacktestApp:
                 self.root.after(0, lambda: self._on_chat_error(err_msg))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _bot_evolution(self, auto_run: bool = False):
+        """🧬 Bot Evolution — ask the AI for a structured improvement plan.
+
+        ``auto_run=True`` = the weekly Saturday trigger: no dialogs
+        (no-new-trades silently skips instead of asking), early stops
+        are also reported to Discord since nobody is at the screen.
+
+        Differs from AI Review in two ways: the prompt includes the
+        evolution fitness context (composite score, baseline best,
+        real-vs-simulated split), and the AI is asked for a concrete
+        keep/tune/redesign PLAN with validation and revert criteria —
+        not a free-form trade analysis. On-demand counterpart to the
+        weekly automatic fitness check.
+        """
+        payload = self._gather_analysis_payload()
+        if payload is None:
+            self.status_var.set("無交易紀錄 No trades for evolution")
+            return
+        if not self._ensure_chat_client():
+            return
+        result, report, timeframe_line, source_section, trade_lines = payload
+
+        # Exclude trades a previous evolution run already analyzed —
+        # re-sending them invites re-justifying changes from the same
+        # sample. Aggregate metrics + fitness still cover the full
+        # history; only the per-trade list is windowed.
+        watermark = None
+        live = (self._live_runner is not None
+                and self._live_runner.state != LiveState.IDLE)
+        bot_dir = getattr(self._live_runner, "bot_dir", None) if live else None
+        if bot_dir:
+            from src.evolution.notify import load_watermark
+            watermark = load_watermark(bot_dir)
+        omitted = _evolution_omitted_count(len(trade_lines), watermark)
+
+        # Design/holdout split (walk-forward discipline): the most recent
+        # holdout_days of evidence are WITHHELD from the AI — the plan is
+        # designed on the older train window only and validated by
+        # backtesting the unseen holdout. The cut rolls forward each
+        # cycle, so this week's holdout becomes next week's design data.
+        from src.evolution.pipeline import (
+            compute_design_cut, design_cutoff_index)
+        holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
+        cut = compute_design_cut(result.trades, holdout_days)
+        # Scan from 0, NOT from the watermark: a watermark saved past the
+        # cut (e.g. by a pre-holdout build) would otherwise yield
+        # cut_idx == len(trades) and silently destroy the holdout on the
+        # full-re-run path (observed: "Holdout (0 trades)" while trade
+        # #65 sat in the AI payload).
+        cut_idx = (design_cutoff_index(result.trades, 0, cut)
+                   if cut else len(result.trades))
+        holdout_count = len(result.trades) - cut_idx
+
+        if watermark and cut_idx <= omitted:
+            # No NEW design-window trades since the last run — the recent
+            # trades are all inside the holdout and become design
+            # evidence next cycle as the cut rolls forward.
+            if auto_run:
+                msg = (f"🧬 EVO (weekly auto): 訓練窗無新交易（最近 "
+                       f"{holdout_days} 天為保留測試集），跳過。"
+                       f"No new design-window trades since last evolution "
+                       f"({watermark['at']}) — recent trades are in the "
+                       f"holdout; skipped.")
+                self._append_chat("system", msg)
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify(msg)
+                    except Exception:
+                        pass
+                return
+            # Manual click: allow an explicit full-design-history re-run
+            # (the holdout stays withheld either way).
+            if not messagebox.askyesno(
+                    "Bot Evolution",
+                    f"上次演化（{watermark['at']}）後訓練窗沒有新交易\n"
+                    f"（最近 {holdout_days} 天為保留測試集，不提供給 AI）。\n"
+                    f"No new design-window trades since the last evolution — "
+                    f"recent trades are inside the {holdout_days}d holdout.\n\n"
+                    f"仍要以完整訓練歷史重新執行嗎？\n"
+                    f"Re-run on the full design history anyway? "
+                    f"(holdout stays withheld)"):
+                return
+            omitted = 0  # full design-history re-run; cut unchanged
+        sent_lines = trade_lines[omitted:cut_idx]
+        if not sent_lines:
+            self.status_var.set(
+                "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
+                "yet — session younger than the holdout.")
+            return
+
+        # Rebuild the metrics report from design-known trades only — the
+        # full-history report would leak holdout aggregates into design.
+        design_known = result.trades[:cut_idx]
+        d_eq, d_cum = [], 0
+        for t in design_known:
+            d_cum += t.pnl
+            d_eq.append(d_cum)
+        report = format_report(
+            f"{result.strategy_name} — 設計窗 design window (holdout excluded)",
+            calculate_metrics(design_known, d_eq, initial_balance=0))
+
+        evolution_context = self._build_evolution_context(
+            result, watermark=watermark, omitted_count=omitted,
+            design_upto=cut_idx, holdout_count=holdout_count,
+            holdout_days=holdout_days)
+
+        preamble = (
+            f"🧬 Bot Evolution — 策略演化計畫\n"
+            f"以下是累積的交易數據與演化適應度評分，請產出一份具體的策略演化計畫。\n"
+            f"Below are accumulated trades and the evolution fitness score. "
+            f"Produce a concrete Evolution Plan.\n\n"
+            f"{evolution_context}"
+            f"## Required output structure (MUST FOLLOW)\n"
+            f"1. **表現總結 Performance summary** — 2-3 sentences covering the data "
+            f"period; if [real] trades exist, compare simulated vs real performance.\n"
+            f"2. **有效部分 What's working** — 2-3 aspects that must NOT be changed.\n"
+            f"3. **問題診斷 Diagnosis** — the single biggest weakness, with evidence "
+            f"from specific trades (cite trade numbers from the list).\n"
+            f"4. **演化計畫 Evolution plan** — EXACTLY ONE concrete change: one "
+            f"parameter (state old → new value) OR one structural change. MANDATORY: "
+            f"scan the trade list and estimate \"removes ~N losers, ~M winners\". "
+            f"If the sample is too small (composite gated / fewer than 30 trades), "
+            f"the correct plan is「繼續收集數據，暫不修改 continue collecting data, "
+            f"no change」— say so explicitly.\n"
+            f"5. **驗證與回退 Validation & revert** — how to verify the change "
+            f"(backtest period, which metric must improve by how much) and the "
+            f"condition under which to revert.\n\n"
+            f"## Rules\n"
+            f"- ONE change maximum. Over-optimization is the #1 cause of strategy "
+            f"degradation.\n"
+            f"- If metrics are acceptable (PF > 1.3, DD < 25%, WR > 40%), the plan "
+            f"is「不修改，繼續運行 no change — keep running」.\n"
+            f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
+            f"instead.\n"
+            f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
+            f"## 機器可讀指令 Machine-readable directives (MANDATORY)\n"
+            f"END your reply with a fenced json block, nothing after it. Example:\n"
+            f"```json\n"
+            f'{{"action": "change", "max_drawdown_pct_max": 35, '
+            f'"profit_factor_min": 1.2, "win_rate_min": 0.45}}\n'
+            f"```\n"
+            f'- action: "change" when proposing a change; "no_change" when the '
+            f"plan is to keep running / collect data.\n"
+            f"- Include ONLY the criteria keys your validation section actually "
+            f"specifies. Units: max_drawdown_pct_max in percent, win_rate_min "
+            f"as a 0-1 fraction, profit_factor_min plain, total_pnl_min in "
+            f"points.\n\n"
+            f"## 保留測試集 Holdout (unseen validation data)\n"
+            f"The most recent {holdout_days} days of evidence "
+            f"({holdout_count} trades) are WITHHELD from everything in this "
+            f"message. Your plan will be validated by backtesting on that "
+            f"unseen window — design a change that should GENERALIZE, not "
+            f"one that chases the most recent trades.\n\n"
+            f"{report}\n\n"
+            f"{timeframe_line}\n"
+        )
+
+        # Auto-pipeline: plan → codegen → A/B validation → verdict in one
+        # click. Needs the single-shot path (the plan response must be
+        # captured to drive codegen); oversized payloads degrade to the
+        # plan-only chunked delivery.
+        auto = self._settings.get("evolution_auto_pipeline", True)
+        est = (len(preamble) + sum(len(l) + 1 for l in sent_lines)
+               + len(source_section) + 300)
+        if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
+            self._start_evolution_pipeline(
+                preamble, sent_lines, source_section, result,
+                auto_run=auto_run, holdout_days=holdout_days)
+        else:
+            if auto:
+                self._append_chat(
+                    "system",
+                    "EVO: payload too large for the auto-pipeline — "
+                    "falling back to plan-only mode.")
+            self._dispatch_trade_analysis(
+                preamble, sent_lines, source_section, len(sent_lines),
+                label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
+
+        # Advance the watermark only to the DESIGN cut — the held-out
+        # trades were never shown to the AI, so they must roll into the
+        # design window of the NEXT run (walk-forward). High-water mark,
+        # not per-trade flags — broker.trades is append-only.
+        if bot_dir:
+            try:
+                from src.evolution.notify import save_watermark
+                save_watermark(bot_dir, cut_idx)
+            except Exception as e:
+                _log(f"evolution watermark save failed: [{type(e).__name__}] {e}")
+
+    def _build_evolution_context(self, result, watermark: dict | None = None,
+                                 omitted_count: int = 0,
+                                 design_upto: int | None = None,
+                                 holdout_count: int = 0,
+                                 holdout_days: int = 0) -> str:
+        """Fitness + baseline + source-split context block for Bot Evolution.
+
+        ``omitted_count`` > 0 means the first N trades were already
+        analyzed by a previous run and are excluded from the trade list.
+        ``design_upto`` caps EVERYTHING in this context (date range,
+        aggregates, fitness) to the design window — trades from the
+        holdout must not leak into the AI's evidence, not even as
+        aggregates. ``holdout_count``/``holdout_days`` describe what was
+        withheld.
+        """
+        lines = ["## 演化現況 Evolution Context"]
+        all_trades = result.trades
+        trades = (all_trades[:design_upto] if design_upto is not None
+                  else list(all_trades))
+        first_dt = next((t.entry_dt for t in trades if t.entry_dt), "")
+        last_dt = next((t.exit_dt for t in reversed(trades) if t.exit_dt), "")
+        if first_dt or last_dt:
+            lines.append(f"- 資料期間 Design data range: {first_dt} → {last_dt} "
+                         f"({len(trades)} trades)")
+        if holdout_count or holdout_days:
+            lines.append(
+                f"- 保留測試集 Holdout: the most recent {holdout_days}d "
+                f"({holdout_count} trades) are WITHHELD from this message — "
+                f"your plan is validated there.")
+
+        real = [t for t in trades if getattr(t, "source", "") == "real"]
+        if real:
+            lines.append(
+                f"- 模擬全視圖 Simulated (design window): {len(trades)} trades, "
+                f"P&L {sum(t.pnl for t in trades):+,} | "
+                f"實單 Real subset: {len(real)} trades, "
+                f"P&L {sum(t.pnl for t in real):+,}")
+
+        if omitted_count > 0 and watermark:
+            new_trades = trades[omitted_count:]
+            lines.append(
+                f"- 上次演化 Last evolution: {watermark['at']} — trades "
+                f"#1–#{omitted_count} were already analyzed then and are "
+                f"OMITTED from the trade list below. The aggregate metrics "
+                f"and fitness in this message cover the design window "
+                f"(trades #1–#{len(trades)}).")
+            lines.append(
+                f"- 新交易 New since last evolution: {len(new_trades)} "
+                f"trades (#{omitted_count + 1}–#{len(trades)}), "
+                f"P&L {sum(t.pnl for t in new_trades):+,} — the trade list "
+                f"below contains ONLY these. If a strategy change was "
+                f"applied after the last evolution, judge that change on "
+                f"these trades.")
+
+        try:
+            from src.evolution.notify import (
+                score_session_for_notification, load_baseline)
+            live = (self._live_runner is not None
+                    and self._live_runner.state != LiveState.IDLE)
+            # Fitness over design-window trades only (no holdout
+            # aggregates). Equity curve rebuilt from those trades.
+            fit = score_session_for_notification(
+                trades,
+                equity_curve=None,
+                trading_mode=self._trading_mode if live else "backtest")
+            gate_note = (
+                "（⚠ 交易數不足30筆，composite 被 gating 為 0 — "
+                "結論信心度低 below MIN_TRADES, treat conclusions as "
+                "low-confidence）" if fit.gated else "")
+            lines.append(
+                f"- 適應度 Fitness composite: {fit.composite:.3f} {gate_note}| "
+                f"Sortino {fit.sortino:.2f} | PF {fit.profit_factor:.2f} | "
+                f"勝率 WR {fit.win_rate*100:.1f}% | "
+                # max_drawdown_pct is ALREADY percent (fitness caps at 30.0)
+                f"最大回撤 DD {fit.max_drawdown_pct:.1f}% | "
+                f"來源 source {fit.source}")
+            if live and getattr(self._live_runner, "bot_dir", None):
+                baseline = load_baseline(self._live_runner.bot_dir)
+                if baseline is not None:
+                    lines.append(
+                        f"- 歷史最佳 Baseline best composite: "
+                        f"{baseline.best_composite:.3f} "
+                        f"(recorded {baseline.best_recorded_at})")
+        except Exception as e:
+            _log(f"evolution context build failed: [{type(e).__name__}] {e}")
+
+        return "\n".join(lines) + "\n\n"
+
+    def _start_evolution_pipeline(self, preamble: str, trade_lines: list[str],
+                                  source_section: str, result,
+                                  auto_run: bool = False,
+                                  holdout_days: int = 14) -> None:
+        """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
+
+        One click, no manual steps until deployment: the plan's own
+        machine-readable criteria gate the candidate, a PASS auto-saves
+        it to the StrategyStore and registers it in the dropdown.
+        Deploying to live trading stays manual by design.
+
+        Runs in a worker thread; every Tk touch goes through root.after.
+        """
+        context = (
+            preamble
+            + f"交易明細 Trade Details ({len(trade_lines)} trades):\n"
+            + "\n".join(trade_lines)
+            + source_section
+        )
+        total_trades = len(trade_lines)
+
+        # Snapshot everything the worker needs while on the main thread.
+        live = (self._live_runner is not None
+                and self._live_runner.state != LiveState.IDLE)
+        if live:
+            baseline_cls = type(self._live_runner.strategy)
+            point_value = self._live_runner.point_value
+            native_sec = self._live_runner.target_interval
+        else:
+            baseline_cls = STRATEGIES.get(self.strategy_var.get())
+            native_sec = (self._last_bars[0].interval
+                          if self._last_bars else 900)
+            try:
+                point_value = int(self.pv_var.get())
+            except (ValueError, TypeError):
+                point_value = 200
+
+        def _fallback_bars() -> tuple[list, str]:
+            """Best locally-available validation data (no API fetch)."""
+            if live:
+                # Full session history from the bot's daily 1-min CSVs
+                # beats the in-memory aggregated bars (~warmup window);
+                # BacktestEngine aggregates 1-min feeds to the strategy's
+                # native timeframe internally.
+                from src.live.live_runner import load_1m_bars_from_csvs
+                mem_bars = self._live_runner.get_bars()
+                csv_bars = load_1m_bars_from_csvs(
+                    self._live_runner.bot_dir, self._live_runner.symbol)
+
+                def _span(bs):
+                    return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
+                if csv_bars and _span(csv_bars) >= _span(mem_bars):
+                    return csv_bars, "bot 1m CSV history"
+                return mem_bars, "in-memory session bars"
+            return list(self._last_bars or []), "last backtest dataset"
+        display_name = self.strategy_var.get()
+        strategy_source = self._resolve_strategy_source(display_name, baseline_cls)
+        taken = {cls.__name__ for cls in STRATEGIES.values()}
+        try:
+            taken |= {e["class_name"] for e in self._strategy_store.list_strategies()}
+        except Exception:
+            pass
+
+        heavy_model = model_for_tier(
+            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+            ultra_mode=self._settings.get("ultra_mode", False))
+
+        validation = self._settings.get("evolution_validation", "deep")
+        # Validation data + provenance, filled by the dispatch logic at the
+        # bottom (possibly after an async API fetch) before _worker starts.
+        evo_data: dict = {"bars": [], "origin": ""}
+
+        def ui(fn, *args):
+            self.root.after(0, fn, *args)
+
+        def _worker():
+            from src.evolution.pipeline import (
+                parse_plan_directives, next_candidate_name, run_ab_backtest,
+                decide_verdict, format_verdict_block,
+                run_deep_validation, decide_deep_verdict,
+                format_deep_verdict_block)
+            bars = evo_data["bars"]
+            data_origin = evo_data["origin"]
+
+            def _notify_discord(msg: str) -> None:
+                # DiscordNotifier._send spawns its own thread — safe to
+                # call from this worker. Best-effort, never kills the run.
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify(msg)
+                    except Exception:
+                        pass
+
+            try:
+                # ── Phase 1: evolution plan ──
+                plan = self._chat_client.send_message(
+                    context, call_site="bot_evolution", model=heavy_model)
+                conv = self._chat_client.conversation
+                if len(conv) >= 2 and conv[-2].get("role") == "user":
+                    conv[-2]["content"] = (
+                        f"[bot evolution payload — {total_trades} trades, "
+                        f"trimmed to save tokens]")
+                ui(self._on_chat_response, plan)
+
+                directives = parse_plan_directives(plan)
+                if directives["action"] == "no_change":
+                    msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
+                           "Plan says no change — pipeline stops here.")
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
+                    return
+                if not strategy_source:
+                    msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
+                           "Strategy source unavailable — plan-only.")
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
+                    return
+
+                # ── Phase 2: candidate codegen (one retry) ──
+                base_cls_name = baseline_cls.__name__ if baseline_cls else "Strategy"
+                candidate_name = next_candidate_name(base_cls_name, taken)
+                ui(self._append_chat, "system",
+                   f"EVO 2/3: generating candidate strategy {candidate_name}...")
+                gen_msg = (
+                    f"{STRATEGY_CODE_CONTEXT}\n\n"
+                    f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
+                    f"## Evolution plan to apply\n{plan}\n\n"
+                    f"## Task\n"
+                    f"Apply EXACTLY the single change specified in the evolution "
+                    f"plan to the strategy above. Keep ALL other logic identical. "
+                    f"The class MUST be named `{candidate_name}` and keep the same "
+                    f"kline_type / kline_minute. Output ONLY one ```python code "
+                    f"block containing the complete strategy file."
+                )
+                candidate_cls = None
+                code = ""
+                last_err = ""
+                for attempt in (1, 2):
+                    msg = gen_msg if attempt == 1 else (
+                        gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
+                        f"Fix the problem and output the complete corrected code.")
+                    resp = self._chat_client.one_shot(
+                        msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                        max_tokens=_CODE_GEN_MAX_TOKENS,
+                        call_site=f"evolution_codegen_{attempt}",
+                        model=heavy_model)
+                    code = extract_python_code(resp) or ""
+                    if not code:
+                        last_err = "no ```python code block found in the response"
+                        continue
+                    try:
+                        candidate_cls = load_strategy_from_source(code)
+                        break
+                    except (CodeValidationError, CodeExecutionError) as e:
+                        last_err = str(e)
+                if candidate_cls is None:
+                    msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
+                    return
+
+                # ── Phase 3: validation backtest ──
+                # The feed may be 1-min CSVs or API bars (engine
+                # aggregates sub-native feeds internally) — size guards
+                # in NATIVE bars, not feed bars.
+                feed_iv = bars[0].interval if bars else 0
+                native_est = len(bars)
+                if feed_iv and native_sec > feed_iv:
+                    native_est = len(bars) * feed_iv // native_sec
+                if native_est < 150:
+                    msg = (f"🧬 EVO: only ~{native_est} native bars of data "
+                           f"available — not enough for a meaningful validation "
+                           f"backtest. Plan + candidate generated but NOT "
+                           f"validated/saved; run a TV/API backtest manually.")
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
+                    return
+
+                data_desc = (
+                    f"{data_origin}: "
+                    f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
+                    f"({len(bars)} × {feed_iv // 60}min bars "
+                    f"≈ {native_est} native bars)")
+
+                # Walk-forward (SEE spec: 90d train / 90d test + Monte
+                # Carlo) when data allows; scaled windows on shorter
+                # spans; simple single-window A/B as last resort.
+                span_days = ((bars[-1].dt - bars[0].dt).days
+                             if len(bars) >= 2 else 0)
+                # Walk-forward windows aligned with the design/holdout
+                # split: the test window IS the holdout (the design never
+                # saw it); the train window is up to 90d of pre-holdout
+                # data. Too little pre-holdout history (< 14d) → walk-
+                # forward is meaningless, degrade to simple A/B.
+                tr_d = te_d = 0
+                if validation == "deep":
+                    from src.evolution.evaluator import DEEP_TRAIN_DAYS
+                    te_d = holdout_days
+                    tr_d = min(DEEP_TRAIN_DAYS, max(0, span_days - te_d))
+                    if tr_d < 14:
+                        tr_d = 0
+
+                if tr_d:
+                    ui(self._append_chat, "system",
+                       f"EVO 3/3: walk-forward validation — train {tr_d}d / "
+                       f"test {te_d}d + Monte Carlo "
+                       f"({base_cls_name} vs {candidate_cls.__name__})...")
+                    baseline_res = run_deep_validation(
+                        baseline_cls, bars, point_value, "基準 baseline",
+                        tr_d, te_d, monte_carlo=False)
+                    candidate_res = run_deep_validation(
+                        candidate_cls, bars, point_value,
+                        f"候選 {candidate_cls.__name__}", tr_d, te_d,
+                        monte_carlo=True)
+                    verdict = decide_deep_verdict(
+                        baseline_res, candidate_res, directives["criteria"])
+                    cl_base_m = (baseline_res.test.metrics
+                                 if baseline_res.test.result else None)
+                    cl_cand_m = (candidate_res.test.metrics
+                                 if candidate_res.test.result else None)
+                else:
+                    if validation == "deep":
+                        ui(self._append_chat, "system",
+                           f"EVO: data span {span_days}d too short for "
+                           f"walk-forward — using simple A/B.")
+                    ui(self._append_chat, "system",
+                       f"EVO 3/3: A/B backtest on {len(bars)} × "
+                       f"{feed_iv // 60}min bars ≈ {native_est} native bars "
+                       f"({base_cls_name} vs {candidate_cls.__name__})...")
+                    baseline_res = run_ab_backtest(
+                        baseline_cls, bars, point_value, "基準 baseline")
+                    candidate_res = run_ab_backtest(
+                        candidate_cls, bars, point_value,
+                        f"候選 {candidate_cls.__name__}")
+                    verdict = decide_verdict(
+                        baseline_res, candidate_res, directives["criteria"])
+                    cl_base_m = baseline_res.metrics
+                    cl_cand_m = candidate_res.metrics
+
+                saved_as = ""
+                if verdict.passed:
+                    saved_as = f"AI: {candidate_cls.__name__}"
+
+                    def _save():
+                        try:
+                            self._strategy_store.save(
+                                candidate_cls.__name__, code,
+                                description=f"auto-evolution of {base_cls_name}")
+                            STRATEGIES[saved_as] = candidate_cls
+                            self.strategy_combo.config(values=list(STRATEGIES.keys()))
+                        except Exception as e:
+                            _log(f"EVO save failed: [{type(e).__name__}] {e}")
+                    ui(_save)
+
+                    try:
+                        from src.daily_report.changelog import append_changelog
+
+                        def _mdict(m):
+                            if m is None:
+                                return None
+                            pf = (None if m.profit_factor == float("inf")
+                                  else round(m.profit_factor, 3))
+                            return {"trades": m.total_trades, "pnl": m.total_pnl,
+                                    "pf": pf,
+                                    "max_dd_pct": round(m.max_drawdown_pct, 2),
+                                    "win_rate": round(m.win_rate, 3)}
+                        append_changelog(
+                            strategy_name=display_name,
+                            version_before=base_cls_name,
+                            version_after=candidate_cls.__name__,
+                            change_summary=(
+                                f"auto-evolution candidate; "
+                                f"validation={'walk-forward' if tr_d else 'simple A/B'}; "
+                                f"criteria={directives['criteria']}; "
+                                f"plan excerpt: {plan[:300]}"),
+                            initiated_by="ai",
+                            metrics_before=_mdict(cl_base_m),
+                            metrics_after=_mdict(cl_cand_m),
+                        )
+                    except Exception as e:
+                        _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+
+                if tr_d:
+                    block = format_deep_verdict_block(
+                        baseline_res, candidate_res, verdict, data_desc, saved_as)
+                else:
+                    block = format_verdict_block(
+                        baseline_res, candidate_res, verdict, data_desc, saved_as)
+                ui(self._remove_last_system_line)
+                ui(self._append_chat, "system", block)
+                ui(self.status_var.set,
+                   f"🧬 EVO {'PASS — saved ' + saved_as if verdict.passed else 'FAIL — candidate rejected'}")
+                # Verdict goes to Discord from BOTH manual and weekly-auto
+                # runs (manual too, per user: testing + visibility).
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.evolution_verdict(verdict.passed, block)
+                    except Exception:
+                        pass
+            except Exception as e:
+                _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+                err_msg = str(e)
+                ui(self._on_chat_error, err_msg)
+            finally:
+                ui(lambda: self.btn_send.config(state=tk.NORMAL))
+
+        def _launch(launch_bars, origin):
+            evo_data["bars"] = launch_bars
+            evo_data["origin"] = origin
+            self._append_chat(
+                "user",
+                "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
+            self.btn_send.config(state=tk.DISABLED)
+            self._append_chat(
+                "system",
+                f"EVO 1/3: analyzing {total_trades} trades, "
+                f"generating evolution plan... (validation data: {origin})")
+            threading.Thread(target=_worker, daemon=True).start()
+
+        # ── Validation data dispatch ──
+        # Deep walk-forward wants train+test (+buffer) days of native
+        # bars. Fetch via Capital API when the quote session is up and
+        # the live bot is in steady RUNNING state (KLine routing goes to
+        # the backtest fetcher then — warmup/poll flags are False).
+        # Everything else falls back to local data.
+        can_api_fetch = (
+            validation == "deep" and live and self._quote_connected
+            and not self._live_warmup_mode
+            and self._live_runner.state == LiveState.RUNNING
+            and baseline_cls is not None
+            and self._evo_fetch_cb is None  # no fetch already in flight
+        )
+        if can_api_fetch:
+            from src.evolution.evaluator import DEEP_TRAIN_DAYS, DEEP_TEST_DAYS
+            need_days = DEEP_TRAIN_DAYS + DEEP_TEST_DAYS + 14  # warmup buffer
+            now_tpe = _taipei_now()
+            start = (now_tpe - timedelta(days=need_days)).strftime("%Y%m%d")
+            end = now_tpe.strftime("%Y%m%d")
+            symbol = self._live_runner.symbol
+            kt = baseline_cls.kline_type
+            km = baseline_cls.kline_minute
+            self._append_chat(
+                "system",
+                f"EVO 0/3: fetching ~{need_days}d of {km}min bars via "
+                f"Capital API for walk-forward validation...")
+            self._fetcher.start_api_fetch(symbol, kt, km, start, end)
+
+            def _on_evo_fetch_done(ok: bool):
+                # Deploy keeps the fetch buttons disabled during a live
+                # session — restore that invariant (the chunk-loop error
+                # path calls _enable_buttons()).
+                self.btn_api.config(state=tk.DISABLED)
+                self.btn_tv.config(state=tk.DISABLED)
+                api_bars = self._fetcher.get_api_bars() if ok else []
+                if api_bars:
+                    _launch(api_bars, f"Capital API ({need_days}d requested)")
+                else:
+                    fb, origin = _fallback_bars()
+                    self._append_chat(
+                        "system",
+                        f"EVO: API fetch failed — falling back to {origin}.")
+                    _launch(fb, origin)
+
+            self._evo_fetch_cb = _on_evo_fetch_done
+            self._fetch_next_chunk()
+        else:
+            fb, origin = _fallback_bars()
+            _launch(fb, origin)
 
     # ══════════════════════════════════════════════════════════════
     #  LIVE TRADING METHODS
@@ -3703,32 +4646,59 @@ class BacktestApp:
         self._trading_guard.reset()
         self._fill_poller.reset()
         self.bot_name_var.set(bot_name)
-        _MODE_LABELS = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto", "auto": "全自動 Auto"}
-        self.trading_mode_var.set(_MODE_LABELS.get(trading_mode, trading_mode))
+        combo_label = self._mode_key_to_combo.get(trading_mode, trading_mode)
+        self.trading_mode_var.set(combo_label)
+        self.mode_combo.config(state="readonly")
 
         # If resuming, restore strategy + symbol from saved session
         if resume_session:
             saved_strategy = resume_session.get("strategy", "")
             saved_symbol = resume_session.get("symbol", "")
-            # Find matching strategy in dropdown
-            matched = False
-            for name in STRATEGIES:
-                if name == saved_strategy or name.endswith(saved_strategy):
-                    self.strategy_var.set(name)
-                    matched = True
-                    break
-            if not matched:
-                # Try AI strategies
+
+            # The user may have deliberately selected a DIFFERENT strategy
+            # (e.g. a passed evolution candidate「AI: ...Evo1」). Silently
+            # reverting to the saved one would discard that choice — this
+            # is THE handoff path for evolved strategies: same bot dir
+            # keeps the broker history, watermark, and fitness baseline,
+            # so the next evolution judges the new version on its own
+            # trades. Exact display-name comparison (an Evo candidate
+            # CONTAINS the base name — substring match would misfire).
+            current_strategy = self.strategy_var.get()
+            use_current = False
+            if (saved_strategy and current_strategy
+                    and current_strategy != saved_strategy):
+                use_current = messagebox.askyesno(
+                    "策略更換 Strategy Change",
+                    f"此機器人上次執行的策略 Saved strategy:\n"
+                    f"  {saved_strategy}\n"
+                    f"目前選擇 Currently selected:\n"
+                    f"  {current_strategy}\n\n"
+                    f"是 Yes — 以目前選擇的策略部署，沿用交易紀錄與演化基準\n"
+                    f"  deploy the SELECTED strategy on this session "
+                    f"(keeps trade history, watermark, baseline)\n"
+                    f"否 No — 還原為上次的策略 revert to the saved strategy\n\n"
+                    f"(建議相同時框 same timeframe recommended)")
+
+            if not use_current:
+                # Find matching strategy in dropdown
+                matched = False
                 for name in STRATEGIES:
-                    if name.startswith("AI:") and saved_strategy in name:
+                    if name == saved_strategy or name.endswith(saved_strategy):
                         self.strategy_var.set(name)
                         matched = True
                         break
-            if not matched:
-                messagebox.showerror("Strategy Not Found",
-                                     f"找不到策略 Strategy '{saved_strategy}' not found.\n"
-                                     "請確認策略已載入 Please ensure the strategy is loaded.")
-                return
+                if not matched:
+                    # Try AI strategies
+                    for name in STRATEGIES:
+                        if name.startswith("AI:") and saved_strategy in name:
+                            self.strategy_var.set(name)
+                            matched = True
+                            break
+                if not matched:
+                    messagebox.showerror("Strategy Not Found",
+                                         f"找不到策略 Strategy '{saved_strategy}' not found.\n"
+                                         "請確認策略已載入 Please ensure the strategy is loaded.")
+                    return
             if saved_symbol and saved_symbol in [v for v in self.symbol_combo['values']]:
                 self.symbol_var.set(saved_symbol)
                 self._on_symbol_changed()
@@ -3806,7 +4776,14 @@ class BacktestApp:
         )
         self._live_runner.acquire_lock()
         self._live_runner.trading_mode = trading_mode
+        self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
+        self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
+        self._live_runner.on_mode_changed = self._on_mode_changed
+        self._live_runner.mode_switch_veto = (
+            lambda: "真實委託等待成交中 real order fill pending"
+            if self._trading_guard.fill_pending else None
+        )
 
         # Open debug log file in bot directory
         _open_debug_log(self._live_runner.bot_dir)
@@ -4091,6 +5068,7 @@ class BacktestApp:
         self._check_tick_watchdog()
         self._check_session_end_close()
         self._check_session_end_report()
+        self._check_weekly_evolution()
         self._live_poll_id = self.root.after(30000, self._schedule_status_update)
 
     _SESSION_END_CLOSE_MINUTES = 2          # normal session: close 2 min before
@@ -4228,6 +5206,36 @@ class BacktestApp:
         if mins > threshold:
             return
         self._live_runner._generate_daily_report()
+
+    def _check_weekly_evolution(self):
+        """Run the weekly auto-evolution AFTER the Saturday close.
+
+        Post-close (≥ 05:05 TPE Saturday) is deliberate: the session-end
+        force-close and final daily report are done, the market is
+        quiet, and the week's data is complete. Latched per ISO week so
+        the 30s poll fires it exactly once; a bot deployed later on
+        Saturday still gets its run on the first post-deploy poll.
+        """
+        if not self._settings.get("evolution_auto_pipeline", True):
+            return
+        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        from src.evolution.notify import is_post_close_evolution_window
+        if not is_post_close_evolution_window():
+            return
+        if is_market_open():
+            return  # safety: never compete with a live session
+        week_key = _taipei_now().isocalendar()[:2]
+        if self._weekly_evo_done == week_key:
+            return
+        self._weekly_evo_done = week_key
+        self._live_log_msg(
+            "🧬 週末自動演化 Weekly auto-evolution (post-close) starting...",
+            "status")
+        try:
+            self._bot_evolution(auto_run=True)
+        except Exception as e:
+            _log(f"weekly auto-evolution failed: [{type(e).__name__}] {e}")
 
     def _check_tick_watchdog(self):
         """Delegate tick health check to TickWatchdog and act on the result."""
@@ -4556,6 +5564,38 @@ class BacktestApp:
 
     # ── Live UI updates ──
 
+    def _on_mode_combo_changed(self, event=None) -> None:
+        """User picked a new mode from the dropdown."""
+        label = self.trading_mode_var.get()
+        new_mode = self._mode_combo_to_key.get(label)
+        if not new_mode or not self._live_runner:
+            return
+        if new_mode == self._trading_mode:
+            return
+        old_mode = self._trading_mode
+        user_confirmed = False
+        if new_mode == "auto":
+            user_confirmed = messagebox.askokcancel(
+                "確認切換 Confirm Mode Switch",
+                "切換至全自動模式？機器人將直接送出真實委託，不再逐筆確認下單。\n\n"
+                "Switch to FULL-AUTO mode? The bot will place REAL orders "
+                "without per-order confirmation prompts.",
+                icon="warning",
+            )
+            if not user_confirmed:
+                self.trading_mode_var.set(self._mode_key_to_combo.get(old_mode, old_mode))
+                return
+        self._live_runner._apply_mode_switch(new_mode, user_confirmed=user_confirmed)
+        if self._trading_mode == old_mode:
+            # Switch was rejected — revert combo to current mode
+            self.trading_mode_var.set(self._mode_key_to_combo.get(old_mode, old_mode))
+
+    def _on_mode_changed(self, old_mode: str, new_mode: str) -> None:
+        """Callback from LiveRunner when trading mode changes via hot-swap."""
+        self._trading_mode = new_mode
+        combo_label = self._mode_key_to_combo.get(new_mode, new_mode)
+        self.trading_mode_var.set(combo_label)
+
     def _on_live_bar(self, bar):
         """Callback when an aggregated bar is processed."""
         pass  # Status update handled in _on_live_poll_complete
@@ -4647,8 +5687,15 @@ class BacktestApp:
 
         from src.evolution.notify import (
             check_and_notify_after_report,
+            should_run_evolution_check,
             ImprovementVerdict,
         )
+
+        cadence = self._settings.get("evolution_cadence", "weekly")
+        if not should_run_evolution_check(cadence):
+            _log(f"evolution check skipped: cadence={cadence}, "
+                 f"not the week's last session window (Sat TPE)")
+            return
 
         def _send(verdict: ImprovementVerdict) -> None:
             if _discord is None or not _discord.enabled:
@@ -4691,7 +5738,7 @@ class BacktestApp:
                 f"勝率 win-rate {fit.win_rate*100:.1f}% | "
                 f"PF {fit.profit_factor:.2f} | "
                 f"Sortino {fit.sortino:.2f} | "
-                f"最大回撤 max DD {fit.max_drawdown_pct*100:.1f}% | "
+                f"最大回撤 max DD {fit.max_drawdown_pct:.1f}% | "
                 f"來源 source {fit.source}"
             )
             self._live_log_msg(detail, "status")
@@ -4705,6 +5752,12 @@ class BacktestApp:
                 f"{fit.composite:.3f} — {verdict.reason}",
                 "status",
             )
+
+        # NOTE: the weekly auto-evolution pipeline does NOT run here —
+        # this fires ~2 min BEFORE session close, while the bot is still
+        # handling the final bars and force-close. The pipeline runs
+        # post-close via _check_weekly_evolution (Saturday ≥ 05:05 TPE)
+        # on the 30s poll.
 
     # ── Semi-auto real order handling ──
 
@@ -5248,6 +6301,12 @@ class BacktestApp:
         result = self._fill_poller.timeout()
 
         self._trading_mode = result.new_trading_mode
+        # Keep LiveRunner/broker in sync with the forced downgrade —
+        # direct assignment (not _apply_mode_switch) because a safety
+        # downgrade must always apply regardless of switch gates.
+        if self._live_runner is not None:
+            self._live_runner.trading_mode = result.new_trading_mode
+            self._live_runner.broker.trade_source = _mode_to_source(result.new_trading_mode)
         self.trading_mode_var.set("\u26a0 半自動 Semi-Auto (降級 downgraded)")
 
         self._live_log_msg(result.message, "exit")
@@ -5514,6 +6573,7 @@ class BacktestApp:
         if result.trades:
             self.btn_export.config(state=tk.NORMAL)
             self.btn_review.config(state=tk.NORMAL)
+            self.btn_evolution.config(state=tk.NORMAL)
 
         # Update trade list and metrics
         self._display_results(result, bars)
@@ -5594,15 +6654,32 @@ class BacktestApp:
             # which would execute the strategy and potentially generate new entries.
             self._live_runner.suppress_strategy = True
             summary = self._live_runner.stop()
+            real_part = (
+                f" (實單 real: {summary['real_trades']} trades, "
+                f"P&L={summary['real_pnl']:+,})"
+                if summary.get("real_trades") else ""
+            )
             self._live_log_msg(
                 f"已停止 Stopped: {summary['trades']} trades, "
-                f"P&L={summary['pnl']:+,}, "
+                f"P&L={summary['pnl']:+,}{real_part}, "
                 f"bars={summary['bars_1m']}(1m)/{summary['bars_agg']}(agg)",
                 "status",
             )
             _log(f"即時機器人已停止 Live bot stopped: {summary}")
             if _discord and _discord.enabled:
                 _discord.bot_stopped(summary['trades'], summary['pnl'])
+
+            # Run the evolution check NOW, while _live_runner is still set.
+            # The daily-report callback is queued via root.after(0) and runs
+            # after _live_runner is nulled below, so its evolution hook
+            # early-returns on manual stop — without this direct call a
+            # Saturday-morning stop would silently skip the weekly check.
+            # Safe to double-fire: re-scoring the same trades against a
+            # just-written baseline yields delta 0 → no duplicate notify.
+            try:
+                self._run_evolution_check_after_report()
+            except Exception as e:
+                _log(f"evolution check on stop failed: [{type(e).__name__}] {e}")
 
             # Update final results then clear runner so subsequent backtests
             # use _last_bars/_last_result instead of stale live data.
@@ -5625,6 +6702,7 @@ class BacktestApp:
         self.strategy_combo.config(state="readonly")
         self.bot_name_var.set("(未設定 Not set)")
         self.trading_mode_var.set("--")
+        self.mode_combo.config(state=tk.DISABLED)
         self.status_var.set("就緒 Ready")
 
 

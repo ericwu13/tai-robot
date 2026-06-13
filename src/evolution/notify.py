@@ -34,6 +34,7 @@ from .fitness import (
     FitnessResult,
     SOURCE_BACKTEST,
     SOURCE_PAPER,
+    SOURCE_REAL,
     compute_fitness_from_trades,
 )
 
@@ -49,6 +50,94 @@ IMPROVEMENT_DELTA = 0.05
 # Filename used under each bot's directory.  Sits next to session.json
 # / decisions.csv / bars_1m_*.csv, no migration story needed.
 BASELINE_FILENAME = "evolution.json"
+
+# Evolution watermark: which trades the on-demand Bot Evolution has
+# already analyzed. Separate file from evolution.json (the fitness
+# baseline) — save_baseline() rewrites that file wholesale, so a field
+# added there would be silently dropped on the next baseline write.
+# A high-water mark (trade count) is equivalent to per-trade "used"
+# flags because broker.trades is append-only within a session.
+WATERMARK_FILENAME = "evolution_watermark.json"
+
+
+def watermark_path(bot_dir: str | os.PathLike) -> str:
+    return os.path.join(os.fspath(bot_dir), WATERMARK_FILENAME)
+
+
+def load_watermark(bot_dir: str | os.PathLike) -> dict[str, Any] | None:
+    """Return {"trade_count": int, "at": str} or None (first run / corrupt)."""
+    path = watermark_path(bot_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        count = int(data.get("trade_count", 0) or 0)
+        if count <= 0:
+            return None
+        return {"trade_count": count, "at": str(data.get("at", ""))}
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        return None
+
+
+def save_watermark(bot_dir: str | os.PathLike, trade_count: int,
+                   at: str | None = None) -> None:
+    """Record that an evolution run covered the first ``trade_count`` trades."""
+    os.makedirs(os.fspath(bot_dir), exist_ok=True)
+    if at is None:
+        at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+    tmp = watermark_path(bot_dir) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"trade_count": int(trade_count), "at": at}, f)
+    os.replace(tmp, watermark_path(bot_dir))
+
+
+# ── Evolution cadence ──
+EVOLUTION_CADENCE_DAILY = "daily"
+EVOLUTION_CADENCE_WEEKLY = "weekly"
+
+
+def should_run_evolution_check(cadence: str, now: datetime | None = None) -> bool:
+    """Gate the fitness/improvement check by configured cadence.
+
+    "weekly" → run only on TPE Saturday. The trading week's final
+    session is Friday's night session, which closes Saturday ~05:00
+    TPE, so both the auto session-end report (fires 04:58–05:00) and a
+    manual stop later that Saturday morning land on Saturday. Weekday
+    session ends never do. Rationale: fitness gates the composite to 0
+    below MIN_TRADES (30); a single day rarely crosses that, so daily
+    scoring is noise — a week of accumulated trades is the smallest
+    meaningful sample.
+
+    Anything other than "weekly" behaves as daily (always run), so a
+    typo in settings.yaml degrades to the old behavior, not silence.
+
+    ``now`` may be naive (treated as TPE wall-clock) or tz-aware.
+    """
+    if cadence != EVOLUTION_CADENCE_WEEKLY:
+        return True
+    if now is None:
+        now = datetime.now(_TZ_TAIPEI)
+    elif now.tzinfo is not None:
+        now = now.astimezone(_TZ_TAIPEI)
+    return now.weekday() == 5  # Saturday
+
+
+def is_post_close_evolution_window(now: datetime | None = None) -> bool:
+    """True on TPE Saturday from 05:05 onward — AFTER the week's last
+    session has closed (the Friday night session ends Saturday 05:00).
+
+    The weekly auto-pipeline runs post-close deliberately: it never
+    competes with session-end force-close handling, the market is
+    quiet, and the week's data is complete (the 05:05 buffer lets the
+    final bar/report settle). ``now`` may be naive (TPE wall-clock)
+    or tz-aware.
+    """
+    if now is None:
+        now = datetime.now(_TZ_TAIPEI)
+    elif now.tzinfo is not None:
+        now = now.astimezone(_TZ_TAIPEI)
+    return now.weekday() == 5 and (now.hour, now.minute) >= (5, 5)
 
 
 @dataclass
@@ -106,6 +195,8 @@ def _trading_mode_to_source(trading_mode: str | None) -> str:
     """
     if trading_mode == "backtest":
         return SOURCE_BACKTEST
+    if trading_mode in ("semi_auto", "auto"):
+        return SOURCE_REAL
     return SOURCE_PAPER
 
 

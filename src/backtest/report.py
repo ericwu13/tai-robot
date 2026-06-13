@@ -6,10 +6,16 @@ import csv
 from pathlib import Path
 
 from .broker import Trade
-from .metrics import PerformanceMetrics
+from .metrics import PerformanceMetrics, calculate_metrics
 
 
-def format_report(strategy_name: str, metrics: PerformanceMetrics) -> str:
+def format_report(strategy_name: str, metrics: PerformanceMetrics,
+                  trades: list[Trade] | None = None) -> str:
+    """Format the metrics block; when ``trades`` is given and any carry a
+    real-order tag, append a 實單/模擬 source-split section. The headline
+    numbers are the full simulated view (paper = all trades, including
+    real-mirrored ones); the split shows the broker-executed subset.
+    """
     m = metrics
     pf_str = f"{m.profit_factor:.2f}" if m.profit_factor != float("inf") else "INF"
     lines = [
@@ -38,8 +44,37 @@ def format_report(strategy_name: str, metrics: PerformanceMetrics) -> str:
         f" \u6700\u5927\u56de\u64a4% Max Drawdown %:     {m.max_drawdown_pct:>11.2f}%",
         f" \u590f\u666e\u6bd4\u7387 Sharpe Ratio:        {m.sharpe_ratio:>12.2f}",
         f" \u5e73\u5747\u6301\u5009 Avg Bars Held:       {m.avg_bars_held:>12.1f}",
-        "=" * 60,
     ]
+    if trades:
+        real = [t for t in trades if getattr(t, "source", "") == "real"]
+        if real:
+            # Full metrics on the real-order subset \u2014 same engine as the
+            # daily report's real_summary. Sharpe deliberately omitted:
+            # it's noise below ~30 trades and misleads more than informs.
+            real_eq = []
+            cum = 0
+            for t in real:
+                cum += t.pnl
+                real_eq.append(cum)
+            rm = calculate_metrics(real, real_eq, initial_balance=0)
+            rpf = (f"{rm.profit_factor:.2f}"
+                   if rm.profit_factor != float("inf") else "INF")
+            lines.extend([
+                "-" * 60,
+                f" \u5be6\u55ae\u7d71\u8a08 Real-Order Subset: {len(real)} trades",
+                f" \u5be6\u55ae\u52dd\u7387 Real Win Rate:       {rm.win_rate * 100:>11.1f}%"
+                f"  ({rm.winning_trades}W / {rm.losing_trades}L)",
+                f" \u5be6\u55ae\u640d\u76ca Real P&L:            {rm.total_pnl:>12,}",
+                f" \u5be6\u55ae\u7372\u5229\u56e0\u5b50 Real PF:          {rpf:>12}",
+                f" \u5be6\u55ae\u5e73\u5747\u7372\u5229 Real Avg Win:     {rm.avg_win:>12,.0f}",
+                f" \u5be6\u55ae\u5e73\u5747\u8667\u640d Real Avg Loss:    {rm.avg_loss:>12,.0f}",
+                f" \u5be6\u55ae\u6700\u5927\u7372\u5229 Real Largest Win: {rm.largest_win:>12,}",
+                f" \u5be6\u55ae\u6700\u5927\u8667\u640d Real Largest Loss:{rm.largest_loss:>12,}",
+                f" \u5be6\u55ae\u6700\u5927\u56de\u64a4 Real Max DD:      {rm.max_drawdown:>12,}"
+                f"  ({rm.max_drawdown_pct:.2f}%)",
+                " (\u4ee5\u4e0a\u7e3d\u8a08\u70ba\u6a21\u64ec\u5168\u8996\u5716 totals above = simulated view, all trades)",
+            ])
+    lines.append("=" * 60)
     return "\n".join(lines)
 
 
@@ -54,10 +89,11 @@ def export_trades_csv(trades: list[Trade], path: str | Path) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "Tag", "Side", "Qty", "Entry Price", "Exit Price",
-            "Entry DT", "Exit DT", "Entry Bar", "Exit Bar", "P&L",
+            "Entry DT", "Exit DT", "Entry Bar", "Exit Bar", "P&L", "Source",
         ])
         for t in trades:
             writer.writerow([
                 t.tag, t.side.value, t.qty, t.entry_price, t.exit_price,
                 t.entry_dt, t.exit_dt, t.entry_bar_index, t.exit_bar_index, t.pnl,
+                getattr(t, "source", ""),
             ])

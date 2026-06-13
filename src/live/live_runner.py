@@ -8,14 +8,16 @@ State machine: IDLE → WARMING_UP → RUNNING → STOPPED
 
 from __future__ import annotations
 
+import json
 import os
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Callable
 
 from ..market_data.models import Bar
 from ..market_data.data_store import DataStore
-from ..backtest.broker import SimulatedBroker, Trade
+from ..backtest.broker import SimulatedBroker, Trade, _mode_to_source
 from ..backtest.strategy import BacktestStrategy
 from ..backtest.data_loader import parse_kline_strings
 from ..backtest.engine import BacktestResult
@@ -206,6 +208,45 @@ _INTERVAL_SECONDS = {
 }
 
 
+def load_1m_bars_from_csvs(bot_dir: str, symbol: str) -> list[Bar]:
+    """Load ALL saved 1-min bars from a bot directory's daily CSVs.
+
+    Unlike ``reload_1m_bars`` (which feeds the live in-memory caches and
+    dedups against the session's seen-set), this is a pure reader used by
+    the evolution pipeline to reconstruct the FULL session history — the
+    in-memory deque only holds the last 5000 bars (~3.5 days), while the
+    daily CSVs retain everything since the bot's first deploy.
+
+    Returns bars sorted by dt; duplicate timestamps resolved by
+    last-file-wins. Garbage rows and unreadable files are skipped.
+    """
+    import csv as csv_mod
+    import glob as glob_mod
+
+    out: dict[datetime, Bar] = {}
+    for path in sorted(glob_mod.glob(os.path.join(bot_dir, "bars_1m_*.csv"))):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv_mod.reader(f)
+                next(reader, None)  # header
+                for row in reader:
+                    if len(row) < 6:
+                        continue
+                    try:
+                        dt = datetime.strptime(row[0], "%Y/%m/%d %H:%M")
+                        out[dt] = Bar(
+                            symbol=symbol, dt=dt,
+                            open=int(float(row[1])), high=int(float(row[2])),
+                            low=int(float(row[3])), close=int(float(row[4])),
+                            volume=int(float(row[5])), interval=60,
+                        )
+                    except (ValueError, IndexError):
+                        continue
+        except OSError:
+            continue
+    return [out[k] for k in sorted(out)]
+
+
 class LiveRunner:
     """Orchestrates live bar processing without touching COM.
 
@@ -274,7 +315,19 @@ class LiveRunner:
         self._callbacks: dict[str, list] = {}
         self.suppress_strategy: bool = False  # suppress strategy during history catchup
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
+        self.broker.trade_source = _mode_to_source(self.trading_mode)
         self.daily_loss_limit: int = 10000  # NTD, for session persistence
+
+        # Hot-swap mode switching (Feature 2)
+        self._allow_live_override: bool = False
+        self.on_mode_changed: Callable[[str, str], None] | None = None
+        # Optional external veto: returns a reason string to block the
+        # switch, or None to allow it. The GUI wires this to the
+        # TradingGuard so a switch can't happen while a real order is
+        # in flight (fill_pending) — LiveRunner itself only sees the
+        # simulated position, which is already flat once an exit order
+        # has been sent.
+        self.mode_switch_veto: Callable[[], str | None] | None = None
 
         # Daily-report dedupe key: (date_str, "DAY"|"NIGHT") of the last
         # session for which a report was emitted. Prevents the 30s
@@ -323,6 +376,55 @@ class LiveRunner:
     def bot_dir_for(base_dir: str, symbol: str, bot_name: str) -> str:
         """Return the bot directory path without creating it."""
         return os.path.join(base_dir, f"{symbol}_{bot_name}")
+
+    # ── Hot-swap mode switching ──
+
+    def _check_mode_override(self) -> str | None:
+        """Read and consume a mode_override.json file from the bot directory."""
+        override_path = os.path.join(self.bot_dir, "mode_override.json")
+        try:
+            if not os.path.exists(override_path):
+                return None
+            with open(override_path, "r") as f:
+                data = json.load(f)
+            os.remove(override_path)
+            return data.get("trading_mode")
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _apply_mode_switch(self, new_mode: str, *, user_confirmed: bool = False) -> None:
+        """Switch trading mode if safe to do so.
+
+        ``user_confirmed=True`` means a human approved this switch via a
+        GUI confirmation dialog — that bypasses the allow_live_override
+        gate, which exists to stop UNATTENDED switches to auto (a dropped
+        mode_override.json file has no human in the loop).
+        """
+        if new_mode == self.trading_mode:
+            return
+        if new_mode not in ("paper", "semi_auto", "auto"):
+            self._emit("on_status", f"[MODE] rejected invalid mode: {new_mode!r}")
+            return
+        if new_mode == "auto" and not self._allow_live_override and not user_confirmed:
+            self._emit("on_status", "[MODE] rejected auto override — allow_live_override=false in settings")
+            return
+        if self.broker.has_open_position():
+            self._emit("on_status",
+                        f"[MODE] cannot switch {self.trading_mode}→{new_mode}: open position exists, close it first")
+            return
+        if self.mode_switch_veto is not None:
+            reason = self.mode_switch_veto()
+            if reason:
+                self._emit("on_status",
+                            f"[MODE] cannot switch {self.trading_mode}→{new_mode}: {reason}")
+                return
+        old = self.trading_mode
+        self.trading_mode = new_mode
+        self.broker.trade_source = _mode_to_source(new_mode)
+        self._emit("on_status", f"[MODE] switched {old} → {new_mode}")
+        if self.on_mode_changed:
+            self.on_mode_changed(old, new_mode)
+        self._auto_save_session()
 
     # ── Callback system ──
 
@@ -540,6 +642,10 @@ class LiveRunner:
         Same sequence as BacktestEngine.run() (engine.py:53-65).
         When suppress_strategy is True, only updates DataStore (no trading).
         """
+        new_mode = self._check_mode_override()
+        if new_mode:
+            self._apply_mode_switch(new_mode)
+
         self.data_store.add_bar(bar)
         self._feed_htf(bar)
         self._aggregated_bars.append(bar)
@@ -809,9 +915,18 @@ class LiveRunner:
         return self._summary()
 
     def _summary(self) -> dict:
+        all_trades = self.broker.trades
+        # "paper" = the full simulated view (every trade has a simulated
+        # fill, including real-mirrored ones); "real" = the subset that
+        # was actually executed at the broker.
+        real = [t for t in all_trades if t.source == "real"]
         return {
-            "trades": len(self.broker.trades),
-            "pnl": sum(t.pnl for t in self.broker.trades),
+            "trades": len(all_trades),
+            "pnl": sum(t.pnl for t in all_trades),
+            "paper_trades": len(all_trades),
+            "paper_pnl": sum(t.pnl for t in all_trades),
+            "real_trades": len(real),
+            "real_pnl": sum(t.pnl for t in real),
             "bars_1m": len(self._seen_1m_dts),
             "bars_agg": len(self._aggregated_bars),
             "equity_curve": list(self.broker.equity_curve),

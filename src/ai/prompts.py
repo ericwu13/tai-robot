@@ -304,6 +304,9 @@ ema(values, period) -> float | None
 rsi(values, period=14) -> float | None           # 0-100
 macd(values, fast_period=12, slow_period=26, signal_period=9) -> (macd_line, signal_line, histogram) | None
 bollinger_bands(values, period=20, num_std=2.0) -> BollingerResult(upper, middle, lower) | None  # Both `bb.middle` and `upper, mid, lower = bollinger_bands(...)` work
+#   Std-dev is NOT returned and there is no built-in bb_std/std attribute anywhere.
+#   Recover it from the bands: std_dev = (bb.upper - bb.middle) / num_std
+#   If you need a multiplier param, define it YOURSELF in __init__: self.bb_std = float(kwargs.get("bb_std", 2.0))
 atr(highs, lows, closes, period=14) -> float | None
 adx(highs, lows, closes, period=14) -> float | None   # 0-100, trend strength
 plus_di(highs, lows, closes, period=14) -> float | None  # +DI (0-100)

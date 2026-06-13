@@ -168,6 +168,24 @@ class DiscordNotifier:
             f"來源 source: `{source}`"
         )
 
+    def evolution_verdict(self, passed: bool, verdict_block: str) -> None:
+        """Send the 🧬 evolution pipeline verdict (manual or weekly auto).
+
+        The block is the same text shown in the chat log, wrapped in a
+        code fence for monospace alignment. Discord caps messages at
+        2000 chars — truncate the body defensively (header + fences eat
+        some budget).
+        """
+        body = verdict_block
+        if len(body) > 1700:
+            body = body[:1700] + "\n…(truncated)"
+        icon = "✅" if passed else "❌"
+        self._send(
+            f"{self._header()}\n"
+            f"🧬 **演化結果 Evolution {'PASS' if passed else 'FAIL'}** {icon}\n"
+            f"```\n{body}\n```"
+        )
+
     def daily_report(self, report: dict) -> None:
         """Send a daily report summary to Discord."""
         date = report.get("date", "?")
@@ -211,6 +229,16 @@ class DiscordNotifier:
             f"交易: {total} 筆 | 勝率: {win_rate:.1%} | PF: {pf:.2f}",
             f"損益: {pnl:+,} | 最大回撤: {dd:,}",
         ])
+        # Real-order subset (semi_auto/auto fills). The headline numbers
+        # above are the full simulated view; this line shows what actually
+        # hit the real account. Absent for pure paper sessions.
+        real_summary = report.get("real_summary")
+        if real_summary:
+            lines.append(
+                f"實單 Real: {real_summary.get('total_trades', 0)} 筆 | "
+                f"勝率: {real_summary.get('win_rate', 0):.1%} | "
+                f"損益: {real_summary.get('total_pnl', 0):+,}"
+            )
         if regime:
             lines.append(
                 f"市場狀態: {regime.get('label', '?')} "
