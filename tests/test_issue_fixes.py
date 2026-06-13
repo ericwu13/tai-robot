@@ -367,18 +367,44 @@ class TestIssue3_MacdPerformance:
         assert result is not None
         assert elapsed < 0.5, f"macd(500 values) took {elapsed:.2f}s, expected < 0.5s"
 
-    def test_macd_repeated_calls_simulating_backtest(self):
+    def test_macd_repeated_calls_simulating_backtest(self, monkeypatch):
         """Simulate backtest: call macd() on growing data for 500 bars.
-        This is the O(n³) scenario from issue #3."""
-        from src.strategy.indicators.macd import macd
+        This is the O(n³) scenario from issue #3.
+
+        Counts elements processed by ema() instead of wall-clock time —
+        deterministic under machine load. All of macd()'s repeated-slice
+        work flows through ema(), so an algorithmic regression (extra
+        window pass, wider slices) inflates the count regardless of how
+        fast the machine is. Current implementation: 41,462,500 elements
+        for this scenario; even one extra ema pass per window (~62M)
+        breaks the 60M bound.
+        """
+        import importlib
+        # The indicators package re-exports the macd *function* under the
+        # same name as the submodule, so `import ... as` would grab the
+        # function. import_module returns the real module.
+        macd_mod = importlib.import_module("src.strategy.indicators.macd")
+        from src.strategy.indicators.ma import ema as real_ema
+
+        elements_processed = 0
+
+        def counting_ema(values, period):
+            nonlocal elements_processed
+            elements_processed += len(values)
+            return real_ema(values, period)
+
+        monkeypatch.setattr(macd_mod, "ema", counting_ema)
+
         all_values = [20000 + i * 10 for i in range(500)]
-        start = time.perf_counter()
+        result = None
         for i in range(35, 500):  # start after required_bars
-            macd(all_values[:i])
-        elapsed = time.perf_counter() - start
-        assert elapsed < 5.0, (
-            f"500 repeated macd() calls took {elapsed:.2f}s, expected < 5s. "
-            f"This confirms the O(n³) performance issue."
+            result = macd_mod.macd(all_values[:i])
+        assert result is not None
+
+        assert elements_processed < 60_000_000, (
+            f"500 repeated macd() calls processed {elements_processed:,} "
+            f"elements via ema(), expected < 60M. The O(n³) repeated-slice "
+            f"issue (issue #3) has gotten worse."
         )
 
     def test_backtest_engine_does_not_block(self):
