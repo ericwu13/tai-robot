@@ -99,7 +99,7 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
@@ -5173,10 +5173,21 @@ class BacktestApp:
         self._live_log_msg(
             f"盤前自動平倉 Session-end auto close: {mins}min to close, "
             f"force closing position", "exit")
-        runner.broker.force_close(runner._bar_index, last_bar.close, last_close_dt)
+        # Issue #61: force-close at the FRESHEST available price, not the
+        # strategy-TF aggregated bar close (last_bar.close), which is read
+        # at a 30s-poll moment unrelated to any bar boundary and can be
+        # many minutes stale (incident: agg=45,879 vs true fill 45,778,
+        # ~101pt gap). _get_latest_price() returns tick > 1m > agg; only on
+        # the startup edge where nothing fresher exists do we fall back to
+        # last_bar.close (never force-close at 0 / skip the close).
+        exit_price, price_src = self._get_latest_price()
+        if exit_price <= 0:
+            exit_price = last_bar.close
+        runner.broker.force_close(runner._bar_index, exit_price, last_close_dt)
         runner._log_decision(
             last_bar, "FORCE_CLOSE", side,
-            "session_end", last_bar.close, f"auto close {mins}min before session end",
+            "session_end", exit_price,
+            f"auto close {mins}min before session end (price src: {price_src})",
         )
         runner._auto_save_session()
 
@@ -6326,16 +6337,16 @@ class BacktestApp:
     # ── Manual order buttons ──
 
     def _get_latest_price(self) -> tuple[int, str]:
-        """Get the most recent price and its source label."""
-        if self._live_last_tick_price:
-            return self._live_last_tick_price, "即時 tick"
-        if self._live_runner:
-            bars_1m = self._live_runner._1m_bars
-            if bars_1m:
-                return bars_1m[-1].close, "1m bar"
-            if self._live_runner._aggregated_bars:
-                return self._live_runner._aggregated_bars[-1].close, "agg bar"
-        return 0, "N/A"
+        """Get the most recent price and its source label.
+
+        Delegates to the pure ``select_freshest_price`` helper (single
+        source of truth, unit-tested without the GUI) — priority is
+        live tick > last 1-min bar close > last aggregated bar close,
+        returning ``(0, "N/A")`` when nothing is available.
+        """
+        bars_1m = self._live_runner._1m_bars if self._live_runner else []
+        agg_bars = self._live_runner._aggregated_bars if self._live_runner else []
+        return select_freshest_price(self._live_last_tick_price, bars_1m, agg_bars)
 
     def _manual_order(self, buy_sell: int):
         """Send a manual entry order (0=buy, 1=sell) with confirmation dialog."""
@@ -6638,7 +6649,14 @@ class BacktestApp:
                 side_val = runner.broker.position_side.value if runner.broker.position_size > 0 else "LONG"
                 buy_sell = 1 if side_val == "LONG" else 0  # reverse to close
                 order_symbol = resolve_order_symbol(runner.symbol)
-                price = runner._aggregated_bars[-1].close if runner._aggregated_bars else 0
+                # Issue #61: use the freshest price (tick > 1m > agg) for the
+                # stop-close order label/log, not the potentially-stale
+                # aggregated bar close. The real order is IOC market ("M") so
+                # this price is only a display/log label, but a stale label
+                # recreates the same paper-vs-real divergence on the stop path.
+                price = self._get_latest_price()[0]
+                if price <= 0:
+                    price = runner._aggregated_bars[-1].close if runner._aggregated_bars else 0
                 order_desc = "賣出 SELL" if buy_sell == 1 else "買進 BUY"
                 self._live_log_msg(
                     f"停止平倉 Stop-close: {order_desc} {order_symbol}", "exit")
