@@ -196,6 +196,42 @@ def minutes_until_session_close(order_symbol: str | None = None) -> int | None:
     return None
 
 
+def select_freshest_price(tick_price: int, bars_1m, agg_bars) -> tuple[int, str]:
+    """Pick the freshest available market price and its source label.
+
+    Freshness priority (strictly monotonic — newest first):
+      1. live tick price (now)                  -> ``(tick_price, "即時 tick")``
+      2. last CLOSED 1-min bar close (<=~1min old) -> ``(close, "1m bar")``
+      3. last aggregated strategy-TF bar close (can be many minutes old)
+                                                -> ``(close, "agg bar")``
+      4. nothing available                      -> ``(0, "N/A")``
+
+    ``bars_1m`` / ``agg_bars`` may be any sequence (``list`` or the
+    ``deque`` that LiveRunner uses) — only truthiness and ``[-1].close``
+    are touched, so both work.
+
+    The agg-bar branch is the DOCUMENTED LAST RESORT for the startup edge
+    (no live tick yet AND no closed 1-min bar). It is the stale value
+    behind issue #61 — the session-end / stop force-close used to read it
+    at an arbitrary wall-clock moment unrelated to any bar boundary, so it
+    could be many minutes stale (incident: agg=45,879 vs true fill 45,778,
+    ~101pt gap). Everything above it is fresher. A nonzero ``tick_price``
+    always wins (truthiness check mirrors the original _get_latest_price);
+    a tick that scaled to 0 is treated as "no tick".
+
+    NOTE: there is no timestamp stored alongside the tick price today, so a
+    stale-but-nonzero tick after a silent feed stall cannot be detected
+    here — that staleness guard is a separate follow-up (see issue #61).
+    """
+    if tick_price:
+        return tick_price, "即時 tick"
+    if bars_1m:
+        return bars_1m[-1].close, "1m bar"
+    if agg_bars:
+        return agg_bars[-1].close, "agg bar"
+    return 0, "N/A"
+
+
 # Map (kline_type, kline_minute) to interval in seconds
 _INTERVAL_SECONDS = {
     (0, 240): 14400,
@@ -899,10 +935,22 @@ class LiveRunner:
             # Use wall-clock time — manual stop fires mid-bar, so neither
             # bar open nor bar end reflects the actual close moment.
             last_close_dt = datetime.now(_TZ_TAIPEI).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
-            self.broker.force_close(self._bar_index, last_bar.close, last_close_dt)
+            # Issue #61: prefer the last CLOSED 1-min bar close over the
+            # strategy-TF aggregated close, which can be many minutes stale
+            # at an arbitrary stop moment. No GUI tick price is reachable
+            # from inside the runner, so tick_price=0; the helper falls back
+            # to the agg close only when no 1-min bar exists.
+            exit_price, _src = select_freshest_price(
+                0, self._1m_bars, self._aggregated_bars)
+            if exit_price <= 0:
+                exit_price = last_bar.close  # last-resort (no 1m, no agg)
+            # NB: _log_decision runs AFTER force_close has closed the
+            # position, so position_side is already None here — read the
+            # just-appended trade's side (trades[-1]) for the log row.
+            self.broker.force_close(self._bar_index, exit_price, last_close_dt)
             self._log_decision(
                 last_bar, "FORCE_CLOSE", self.broker.trades[-1].side.value if self.broker.trades else "",
-                "stop", last_bar.close, "live runner stopped",
+                "stop", exit_price, "live runner stopped",
             )
 
         self._auto_save_session()
