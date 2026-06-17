@@ -196,7 +196,30 @@ def minutes_until_session_close(order_symbol: str | None = None) -> int | None:
     return None
 
 
-def select_freshest_price(tick_price: int, bars_1m, agg_bars) -> tuple[int, str]:
+def _tick_within_age(tick_dt: datetime | None, now: datetime | None,
+                     max_tick_age_s: float) -> bool:
+    """True if the live tick is fresh enough to trust as a market price.
+
+    The guard is INACTIVE (always returns True) unless BOTH ``tick_dt`` and
+    ``now`` are supplied — this preserves the 3-arg ``select_freshest_price``
+    call form for callers that don't track a tick timestamp.
+
+    A mixed naive/aware pair is normalized to naive before subtracting,
+    mirroring how run_backtest's ``_on_com_tick`` computes ``tick_age`` (the
+    tick dt is naive Taipei; ``_taipei_now()`` is aware Taipei). A tick dated
+    in the future (negative age, e.g. minor clock skew) counts as fresh.
+    """
+    if tick_dt is None or now is None:
+        return True
+    now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+    tick_naive = tick_dt.replace(tzinfo=None) if tick_dt.tzinfo else tick_dt
+    return (now_naive - tick_naive).total_seconds() <= max_tick_age_s
+
+
+def select_freshest_price(tick_price: int, bars_1m, agg_bars, *,
+                          tick_dt: datetime | None = None,
+                          now: datetime | None = None,
+                          max_tick_age_s: float = 120) -> tuple[int, str]:
     """Pick the freshest available market price and its source label.
 
     Freshness priority (strictly monotonic — newest first):
@@ -219,11 +242,17 @@ def select_freshest_price(tick_price: int, bars_1m, agg_bars) -> tuple[int, str]
     always wins (truthiness check mirrors the original _get_latest_price);
     a tick that scaled to 0 is treated as "no tick".
 
-    NOTE: there is no timestamp stored alongside the tick price today, so a
-    stale-but-nonzero tick after a silent feed stall cannot be detected
-    here — that staleness guard is a separate follow-up (see issue #61).
+    STALE-TICK GUARD (issue #61 follow-up): pass ``tick_dt`` (the tick's
+    parsed datetime) and ``now`` (current Taipei time) to bound tick
+    staleness. When the stored tick is older than ``max_tick_age_s`` (default
+    120s, matching the live tick-watchdog), the tick rung is SKIPPED and the
+    selection falls through to the fresher-by-construction 1-min bar close (a
+    closed 1-min bar is at most ~1 min old). This catches a silent COM feed
+    stall (disconnect / zombie subscription) where ``_live_last_tick_price``
+    stays nonzero but is minutes stale. The guard is INACTIVE unless BOTH
+    ``tick_dt`` and ``now`` are supplied, so the 3-arg call form is unchanged.
     """
-    if tick_price:
+    if tick_price and _tick_within_age(tick_dt, now, max_tick_age_s):
         return tick_price, "即時 tick"
     if bars_1m:
         return bars_1m[-1].close, "1m bar"

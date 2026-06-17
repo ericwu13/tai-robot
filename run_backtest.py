@@ -1185,6 +1185,10 @@ class BacktestApp:
         self._live_tick_symbol: str = ""
         self._live_tick_com_symbol: str = ""
         self._live_last_tick_price: int = 0
+        # Timestamp (naive Taipei) of the tick behind _live_last_tick_price, so
+        # select_freshest_price can reject a stale-but-nonzero tick after a
+        # silent feed stall (issue #61 follow-up).
+        self._live_last_tick_dt: datetime | None = None
         self._last_real_order_side: int | None = None  # 0=BUY, 1=SELL, None=unknown
         # Real position tracking and safety checks live in self._trading_guard
         # Real account data from API
@@ -5494,6 +5498,7 @@ class BacktestApp:
         bid_scaled = bid // divisor
         ask_scaled = ask // divisor
         self._live_last_tick_price = price
+        self._live_last_tick_dt = dt  # naive Taipei; paired staleness guard for force-close
 
         # Log first few live ticks to verify timestamp/price convention
         if self._live_history_done and self._live_tick_count <= self._live_history_tick_count + 5:
@@ -6357,10 +6362,16 @@ class BacktestApp:
         source of truth, unit-tested without the GUI) — priority is
         live tick > last 1-min bar close > last aggregated bar close,
         returning ``(0, "N/A")`` when nothing is available.
+
+        Passes the tick timestamp + current Taipei time so a stale tick
+        (nonzero price after a silent feed stall) is skipped in favour of
+        the fresher 1-min bar close (issue #61 follow-up).
         """
         bars_1m = self._live_runner._1m_bars if self._live_runner else []
         agg_bars = self._live_runner._aggregated_bars if self._live_runner else []
-        return select_freshest_price(self._live_last_tick_price, bars_1m, agg_bars)
+        return select_freshest_price(
+            self._live_last_tick_price, bars_1m, agg_bars,
+            tick_dt=self._live_last_tick_dt, now=_taipei_now())
 
     def _manual_order(self, buy_sell: int):
         """Send a manual entry order (0=buy, 1=sell) with confirmation dialog."""
@@ -6643,6 +6654,7 @@ class BacktestApp:
         self._live_tick_symbol = ""
         self._live_tick_com_symbol = ""
         self._live_last_tick_price = 0
+        self._live_last_tick_dt = None
         self._live_history_done = False
         self._live_tick_count = 0
         self._live_history_tick_count = 0
