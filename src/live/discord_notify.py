@@ -12,6 +12,13 @@ from datetime import datetime, timezone, timedelta
 _TPE = timezone(timedelta(hours=8))
 _API_BASE = "https://discord.com/api/v10"
 
+# Trading mode → readable bilingual label for the mode-switch notification.
+_MODE_LABELS = {
+    "paper": "模擬 Paper",
+    "semi_auto": "輔助 Semi-Auto",
+    "auto": "全自動 Auto",
+}
+
 
 def _taipei_now() -> datetime:
     return datetime.now(_TPE)
@@ -108,6 +115,22 @@ class DiscordNotifier:
             f"{self._header()}\n"
             f"🛑 **機器人停止 Bot Stopped**\n"
             f"交易: {trades} 筆 | P&L: {pnl:+,}"
+        )
+
+    def mode_switched(self, old_mode: str, new_mode: str) -> None:
+        """Notify a live hot-swap of the trading mode.
+
+        Takes the raw mode keys and maps them to readable labels here so
+        the message format stays self-contained. bot_name / symbol /
+        timestamp come from _header() (same as every other notification),
+        so they aren't duplicated in the body.
+        """
+        old_label = _MODE_LABELS.get(old_mode, old_mode)
+        new_label = _MODE_LABELS.get(new_mode, new_mode)
+        self._send(
+            f"{self._header()}\n"
+            f"🔄 **交易模式切換 Trading Mode Switched**\n"
+            f"{old_label} → {new_label}"
         )
 
     def force_close_failed(self, symbol: str, attempts: int, last_error: str) -> None:
