@@ -20,10 +20,14 @@ helper (live tick > last 1-min close > last aggregated close > (0, "N/A")) and
 routes every force-close through it, so paper fills at the same price the real
 market gives. These tests pin the helper on the domain seam — no Tkinter GUI —
 mirroring tests/test_session_end_close_direction.py.
+
+Follow-up (``TestStaleTickGuard``): the stored tick now carries a timestamp, so
+``select_freshest_price`` can reject a stale-but-nonzero tick after a silent
+feed stall (see the keyword-only ``tick_dt`` / ``now`` / ``max_tick_age_s``).
 """
 
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -187,3 +191,125 @@ class TestForceCloseUsesFreshPrice:
         assert broker.trades[-1].exit_price == 45778
         # SHORT 45900 -> 45778 = +122 * 200
         assert broker.trades[-1].pnl == (45900 - 45778) * 200
+
+
+# ── Stale-tick guard (issue #61 follow-up) ──
+
+_TPE = timezone(timedelta(hours=8))   # Taipei, matching live_runner._TZ_TAIPEI
+
+
+class TestStaleTickGuard:
+    """Residual gap in issue #61: ``_live_last_tick_price`` had no timestamp, so
+    after a SILENT COM feed stall (disconnect / zombie subscription) it stayed
+    nonzero but minutes stale, and select_freshest_price would still pick it.
+
+    The keyword-only guard (``tick_dt`` + ``now`` + ``max_tick_age_s``) bounds
+    tick age: a tick older than the window is SKIPPED to the fresher-by-
+    construction 1-min bar close. The guard is inactive unless BOTH ``tick_dt``
+    and ``now`` are supplied, so the 3-arg call form is byte-for-byte unchanged.
+    The incident values are reused (tick=45,778 fresh / 1m=45,790 / agg=45,879)
+    so a wrongly-trusted stale tick is visibly distinct from the 1m fallback."""
+
+    NOW = datetime(2026, 6, 16, 13, 43, 0)   # naive Taipei, like the tick dt
+
+    def test_fresh_tick_within_window_is_used(self):
+        """A 30s-old tick (< 120s default) is still trusted over the bars."""
+        tick_dt = self.NOW - timedelta(seconds=30)
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45778, "即時 tick")
+
+    def test_stale_tick_skipped_to_1m_bar(self):
+        """A 5-minute-old tick (> 120s) is skipped; the fresh 1m close wins.
+        This is the silent-feed-stall scenario the follow-up closes."""
+        tick_dt = self.NOW - timedelta(seconds=300)
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45790, "1m bar")
+
+    def test_three_arg_form_preserves_behavior(self):
+        """No tick_dt/now -> guard inactive; a nonzero tick wins exactly as
+        before (the original 3-arg contract is unaffected)."""
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879)) == (45778, "即時 tick")
+
+    def test_guard_inactive_when_only_now_passed(self):
+        """The guard needs BOTH timestamps; tick_dt absent -> stays off."""
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879), now=self.NOW) == (45778, "即時 tick")
+
+    def test_guard_inactive_when_only_tick_dt_passed(self):
+        """Symmetric: now absent (even with a clearly stale tick_dt) -> off."""
+        stale = self.NOW - timedelta(seconds=600)
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879), tick_dt=stale) == (45778, "即時 tick")
+
+    def test_age_at_exact_boundary_is_fresh(self):
+        """age == max_tick_age_s is inclusive (<=), so the tick is still used."""
+        tick_dt = self.NOW - timedelta(seconds=120)
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45778, "即時 tick")
+
+    def test_age_just_past_boundary_is_stale(self):
+        """One second past the window flips it to the 1m fallback."""
+        tick_dt = self.NOW - timedelta(seconds=121)
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45790, "1m bar")
+
+    def test_future_tick_is_fresh(self):
+        """A tick dated slightly ahead of `now` (clock skew, negative age) is
+        treated as fresh, not stale."""
+        tick_dt = self.NOW + timedelta(seconds=5)
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45778, "即時 tick")
+
+    def test_custom_max_age_is_honoured(self):
+        """A 90s tick is fresh under the 120s default but stale under a 60s cap."""
+        tick_dt = self.NOW - timedelta(seconds=90)
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45778, "即時 tick")
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW, max_tick_age_s=60) == (45790, "1m bar")
+
+    def test_aware_now_with_naive_tick_is_normalized(self):
+        """run_backtest passes an AWARE Taipei `now` (_taipei_now()) and a NAIVE
+        Taipei tick_dt. The helper normalizes both to naive so the subtraction
+        neither raises nor mis-measures age (mirrors _on_com_tick's tick_age)."""
+        now_aware = datetime(2026, 6, 16, 13, 43, 0, tzinfo=_TPE)
+        fresh_naive = datetime(2026, 6, 16, 13, 42, 30)   # 30s old
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=fresh_naive, now=now_aware) == (45778, "即時 tick")
+        stale_naive = datetime(2026, 6, 16, 13, 38, 0)    # 5 min old
+        assert select_freshest_price(
+            45778, _bars(45790), _bars(45879),
+            tick_dt=stale_naive, now=now_aware) == (45790, "1m bar")
+
+    def test_stale_tick_falls_to_agg_when_no_1m(self):
+        """Stale tick AND no 1-min bars -> the agg close (documented last
+        resort) is still reached rather than acting on the stale tick."""
+        tick_dt = self.NOW - timedelta(seconds=300)
+        assert select_freshest_price(
+            45778, deque(), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45879, "agg bar")
+
+    def test_stale_tick_falls_to_na_when_nothing_else(self):
+        """Stale tick with no bars at all -> (0, "N/A"); the caller learns it
+        has no trustworthy price instead of filling at a stale tick."""
+        tick_dt = self.NOW - timedelta(seconds=300)
+        assert select_freshest_price(
+            45778, deque(), [],
+            tick_dt=tick_dt, now=self.NOW) == (0, "N/A")
+
+    def test_zero_tick_with_timestamps_still_falls_through(self):
+        """A scaled-to-0 (falsy) tick skips the rung regardless of freshness —
+        the truthiness contract is checked before the age guard."""
+        tick_dt = self.NOW - timedelta(seconds=10)   # fresh, but price is 0
+        assert select_freshest_price(
+            0, _bars(45790), _bars(45879),
+            tick_dt=tick_dt, now=self.NOW) == (45790, "1m bar")
