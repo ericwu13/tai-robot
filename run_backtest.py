@@ -5602,10 +5602,24 @@ class BacktestApp:
             self.trading_mode_var.set(self._mode_key_to_combo.get(old_mode, old_mode))
 
     def _on_mode_changed(self, old_mode: str, new_mode: str) -> None:
-        """Callback from LiveRunner when trading mode changes via hot-swap."""
+        """Callback from LiveRunner when trading mode changes via hot-swap.
+
+        The Discord notification is fired HERE, not inside
+        LiveRunner._apply_mode_switch, because LiveRunner is
+        notification-agnostic (it holds no notifier reference) and every
+        other Discord notification in this app — order_sent,
+        fill_confirmed, daily_report, bot_stopped — is fired from this
+        GUI layer in response to a LiveRunner callback/event. Keeping the
+        mode-switch notification here preserves that separation.
+        """
         self._trading_mode = new_mode
         combo_label = self._mode_key_to_combo.get(new_mode, new_mode)
         self.trading_mode_var.set(combo_label)
+        if _discord is not None and _discord.enabled:
+            try:
+                _discord.mode_switched(old_mode, new_mode)
+            except Exception:
+                pass  # best-effort; a notification failure must not break the switch
 
     def _on_live_bar(self, bar):
         """Callback when an aggregated bar is processed."""
