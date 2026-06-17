@@ -5,6 +5,16 @@ All notable changes to tai-robot are documented here.
 
 ---
 
+## [2.12.1] — 2026-06-12
+
+### 繁體中文
+- **Discord 模式切換通知**：即時熱切換交易模式（`_apply_mode_switch`）時，發送 🔄 交易模式切換通知至 Discord，含可讀標籤（模擬 Paper / 輔助 Semi-Auto / 全自動 Auto）。通知由 GUI 的 `on_mode_changed` 回呼觸發，LiveRunner 維持與通知無關（與其他通知一致）；通知失敗不影響切換本身。
+
+### English
+- **Discord mode-switch notification**: a 🔄 Trading Mode Switched message is sent to Discord on a live hot-swap (`_apply_mode_switch`), with readable labels (模擬 Paper / 輔助 Semi-Auto / 全自動 Auto). Fired from the GUI's `on_mode_changed` callback so LiveRunner stays notification-agnostic (consistent with every other notification); a notification failure never breaks the switch.
+
+---
+
 ## [2.12.0] — 2026-06-12
 
 ### 繁體中文
