@@ -5,6 +5,22 @@ All notable changes to tai-robot are documented here.
 
 ---
 
+## [2.12.2] — 2026-06-16
+
+### 繁體中文
+
+#### 修正
+- **盤前自動平倉價格失準（issue #61）**：自動平倉（盤前自動平倉／停止機器人／手動停止）原本以「策略原生週期 K 棒收盤價」（`_aggregated_bars[-1].close`）成交模擬部位，但該價格是在與 K 棒邊界無關的任意時點（30 秒輪詢或手動停止）讀取的，在較高週期策略上可能已過時數分鐘。實單以市價（IOC）成交於真實市場，導致模擬與實單出現約 100 點的價差（事故：模擬 45,879 vs 實際成交 45,778）。修正後抽取純函式 `select_freshest_price`（即時 tick ＞ 最近 1 分 K 收盤 ＞ 聚合 K 收盤），三處平倉與 `_get_latest_price` 統一走此函式，模擬價即與實單貼近。
+- **過時 tick 防護（#61 後續）**：`_live_last_tick_price` 過去僅在停止時歸零，feed 靜默中斷後仍保留舊值且無時間戳記。現在 tick 一併記錄時間戳，`select_freshest_price` 可在 tick 超過 120 秒（與 tick 看門狗一致）時跳過該來源，退回較新的 1 分 K 收盤。
+
+### English
+
+#### Fixed
+- **Stale force-close price (issue #61)**: the auto-close paths (session-end auto-close, stop-bot, manual stop) filled the simulated position at the strategy's native-timeframe bar close (`_aggregated_bars[-1].close`), read at an arbitrary wall-clock moment (a 30s poll or manual stop) unrelated to any bar boundary — minutes stale on higher-timeframe strategies. The real IOC-market order filled at the true market, so paper diverged ~100pts from real (incident: paper 45,879 vs real 45,778). Fixed by extracting a pure `select_freshest_price` helper (live tick > last 1-min close > aggregated close) and routing all three force-close sites plus `_get_latest_price` through it, so the simulated price tracks the real fill.
+- **Stale-tick guard (#61 follow-up)**: `_live_last_tick_price` was only zeroed on stop, so after a silent feed stall it kept a nonzero but minutes-old value with no timestamp. The tick now carries a timestamp; `select_freshest_price` skips a tick older than 120s (matching the tick-watchdog) and falls back to the fresher 1-min bar close.
+
+---
+
 ## [2.12.1] — 2026-06-12
 
 ### 繁體中文
