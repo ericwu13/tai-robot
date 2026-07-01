@@ -3840,9 +3840,26 @@ class BacktestApp:
             omitted = 0  # full design-history re-run; cut unchanged
         sent_lines = trade_lines[omitted:cut_idx]
         if not sent_lines:
+            msg = (f"🧬 EVO: 訓練窗沒有交易（資料太新，全部 "
+                   f"{len(trade_lines)} 筆交易都在最近 {holdout_days} 天"
+                   f"保留測試集內）。機器人需運行超過 {holdout_days} 天，"
+                   f"交易才會進入設計窗供 AI 分析。"
+                   f"No design-window trades yet — all {len(trade_lines)} "
+                   f"trades are inside the {holdout_days}d holdout. "
+                   f"The bot needs to run for >{holdout_days} days before "
+                   f"trades age into the design window for AI analysis.")
             self.status_var.set(
                 "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
                 "yet — session younger than the holdout.")
+            if auto_run:
+                self._append_chat("system", msg)
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify(msg)
+                    except Exception:
+                        pass
+            else:
+                self._append_chat("system", msg)
             return
 
         # Rebuild the metrics report from design-known trades only — the
