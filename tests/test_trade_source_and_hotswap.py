@@ -210,6 +210,34 @@ class TestCheckModeOverride:
             f.write("not json{{{")
         assert runner._check_mode_override() is None
 
+    def test_skips_override_while_reloading(self, tmp_path):
+        """Issue #79: during warmup/history replay (_is_reloading=True) a
+        pending mode_override.json must NOT be consumed — it would race with
+        the resume UI sync and blank the mode tag."""
+        runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))
+        override_path = os.path.join(runner.bot_dir, "mode_override.json")
+        os.makedirs(os.path.dirname(override_path), exist_ok=True)
+        with open(override_path, "w") as f:
+            json.dump({"trading_mode": "auto"}, f)
+
+        runner._is_reloading = True
+        assert runner._check_mode_override() is None
+        # File must be preserved (not consumed) so it applies once live.
+        assert os.path.exists(override_path)
+
+        # Once reloading is done, the override applies normally.
+        runner._is_reloading = False
+        assert runner._check_mode_override() == "auto"
+        assert not os.path.exists(override_path)
+
+    def test_feed_warmup_sets_reloading_flag(self, tmp_path):
+        """feed_warmup_bars marks the reloading window so mode overrides are
+        ignored until the GUI clears the flag on the first live tick."""
+        runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))
+        assert runner._is_reloading is False
+        runner.feed_warmup_bars([])
+        assert runner._is_reloading is True
+
 
 class TestApplyModeSwitch:
     def _make_runner(self, tmp_path, mode="paper", allow_override=False):

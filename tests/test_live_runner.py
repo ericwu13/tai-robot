@@ -1,7 +1,7 @@
 """Tests for LiveRunner: warmup, feed, dedup, strategy execution, stop."""
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.market_data.models import Bar
 from src.market_data.data_store import DataStore
@@ -1085,6 +1085,69 @@ class TestReload1mBarsIssue45:
         runner.reload_1m_bars()
 
         assert runner.data_store._bars.maxlen == original_maxlen
+
+
+# ── Regression: issue #79 — reload progress yields (UI freeze) ──
+
+class TestReload1mBarsProgressIssue79:
+    """reload_1m_bars must report progress so the GUI can pump the Tk event
+    loop and stay responsive while re-feeding thousands of saved bars."""
+
+    @staticmethod
+    def _write_many_bars(path: str, n: int) -> None:
+        base = datetime(2026, 2, 28, 0, 0)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("datetime,open,high,low,close,volume\n")
+            for i in range(n):
+                dt = base + timedelta(minutes=i)
+                c = 22500 + i
+                f.write(f"{dt.strftime('%Y/%m/%d %H:%M')},{c},{c+5},{c-5},{c},10\n")
+
+    def test_progress_cb_called_and_order_preserved(self, tmp_path):
+        strategy = OneMinRecordingStrategy()  # 1-min native → heavy rebuild path
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        n = 1300  # > 2 * _RELOAD_PROGRESS_EVERY (500)
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        self._write_many_bars(csv_path, n)
+
+        calls: list[tuple[int, int]] = []
+        count = runner.reload_1m_bars(progress_cb=lambda d, t: calls.append((d, t)))
+
+        assert count == n
+        # Progress fired at least once per heavy loop.
+        assert len(calls) >= 2
+        # Every tick reports a positive batch count (multiple of the stride).
+        assert all(d > 0 and d % runner._RELOAD_PROGRESS_EVERY == 0
+                   for d, _ in calls)
+        # Parse phase reports total=0 (unknown); rebuild phase reports the
+        # real total once known.
+        assert any(t == 0 for _, t in calls)      # parse phase
+        assert any(t == n for _, t in calls)      # rebuild phase, total known
+        # Bars are still in chronological order (callback only observes).
+        agg = runner.get_bars()
+        assert [b.dt for b in agg] == sorted(b.dt for b in agg)
+        assert len(agg) == n
+
+    def test_no_callback_is_safe(self, tmp_path):
+        """Omitting progress_cb (default None) must not raise."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        self._write_many_bars(csv_path, 600)
+        assert runner.reload_1m_bars() == 600
+
+    def test_broken_callback_does_not_break_reload(self, tmp_path):
+        """A raising progress_cb must be swallowed — reload still completes."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        self._write_many_bars(csv_path, 600)
+
+        def _boom(done, total):
+            raise RuntimeError("UI callback blew up")
+
+        assert runner.reload_1m_bars(progress_cb=_boom) == 600
 
 
 # ── Regression: issue #45 — real_entry_price flow into Trades ──
