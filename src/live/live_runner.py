@@ -863,6 +863,44 @@ class LiveRunner:
             decision["exit_limit"] = exit_limit
         self._emit("on_decision", decision)
 
+    def log_blocked_signal(self, action: str, side: str, price: int,
+                           reason_code: str, detail: str = "") -> None:
+        """Record a strategy signal the risk gate/TradingGuard rejected (issue #62).
+
+        When an entry or exit signal is blocked before a real order is sent
+        — daily-loss limit reached, waiting on a prior fill, system halted,
+        no confirmed real position, settlement-day no-entry window, etc. —
+        the block used to be invisible in ``decisions.csv`` and the UI event
+        log. The user could only discover it by digging through raw logs.
+
+        This surfaces the block as a ``SIGNAL_BLOCKED`` decision tied to the
+        most recent bar, using the same emit path as ``_log_decision`` so it
+        renders in the UI event log table and is appended to ``decisions.csv``.
+
+        Args:
+            action: the original signal action ("ENTRY_FILL", "TRADE_CLOSE", ...)
+            side: signal direction ("LONG", "SHORT", or "")
+            price: signal price (int; TAIFEX prices are integers)
+            reason_code: short machine-readable block code, stored in the
+                ``tag`` column (e.g. "DAILY_LOSS_LIMIT", "FILL_PENDING")
+            detail: human-readable explanation, stored in the ``reason`` column
+        """
+        bar_dt = (self._aggregated_bars[-1].dt if self._aggregated_bars
+                  else datetime.now(_TZ_TAIPEI).replace(tzinfo=None))
+        now = datetime.now()
+        reason = f"{action}: {detail}" if detail else action
+        price = int(price)
+        self.csv_logger.log_decision(
+            dt=now, bar_dt=bar_dt, strategy=self.strategy.name,
+            action="SIGNAL_BLOCKED", side=side, tag=reason_code,
+            price=price, reason=reason,
+        )
+        self._emit("on_decision", {
+            "dt": now, "bar_dt": bar_dt, "strategy": self.strategy.name,
+            "action": "SIGNAL_BLOCKED", "side": side, "tag": reason_code,
+            "price": price, "reason": reason,
+        })
+
     # ── Status & results ──
 
     def get_status(self) -> dict:

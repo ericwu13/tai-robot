@@ -1326,3 +1326,83 @@ class TestResetBarMonotonicity:
 
         assert runner.aggregator._last_bar_time is None
         assert runner._htf_aggregators[14400]._last_bar_time is None
+
+
+class TestBlockedSignalLog:
+    """Issue #62: when the risk gate / TradingGuard rejects a strategy signal
+    (daily loss limit, fill pending, halted, no real position, settlement
+    window), it must be recorded as a SIGNAL_BLOCKED decision so the block
+    appears in decisions.csv AND the UI event log instead of being silent."""
+
+    def _running_runner(self, tmp_path):
+        """A RUNNING runner with one completed aggregated bar (09:00 15-min)."""
+        strategy = AlwaysLongStrategy()  # 15-min
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        warmup = [
+            _kline("2026-02-28 09:00", 22000, 22100, 21900, 22050, 500),
+            _kline("2026-02-28 09:15", 22050, 22150, 22000, 22100, 400),
+        ]
+        runner.feed_warmup_bars(warmup)
+        # 09:00-09:14 then 09:15 crosses the 15-min boundary → 09:00 bar closes.
+        runner.feed_1m_bars(_klines_1m("2026-03-01", start_min=540, count=15))
+        runner.feed_1m_bars([_kline("2026-03-01 09:15", 22515, 22525, 22510, 22520, 65)])
+        return runner
+
+    def test_blocked_entry_emits_signal_blocked_decision(self, tmp_path):
+        runner = self._running_runner(tmp_path)
+        emitted = []
+        runner.on("on_decision", emitted.append)
+
+        # Simulate the daily-loss-limit block (guard.BLOCK_ENTRY): a long
+        # entry signal at 22,505 rejected because the limit was reached.
+        runner.log_blocked_signal(
+            "ENTRY_FILL", "LONG", 22505, "DAILY_LOSS_LIMIT",
+            "daily loss limit reached (10,000 NTD)")
+
+        blocked = [d for d in emitted if d["action"] == "SIGNAL_BLOCKED"]
+        assert len(blocked) == 1
+        d = blocked[0]
+        assert d["side"] == "LONG"
+        assert d["price"] == 22505
+        assert d["tag"] == "DAILY_LOSS_LIMIT"
+        assert "daily loss limit" in d["reason"]
+        assert d["strategy"] == runner.strategy.name
+        # Tied to the triggering K-bar (the last completed aggregated bar).
+        assert d["bar_dt"] == runner._aggregated_bars[-1].dt
+
+    def test_blocked_signal_written_to_decisions_csv(self, tmp_path):
+        runner = self._running_runner(tmp_path)
+        runner.log_blocked_signal(
+            "ENTRY_FILL", "SHORT", 22480, "FILL_PENDING",
+            "waiting for entry fill confirmation")
+        runner.stop()  # flush + close csv handles
+
+        import csv
+        with open(tmp_path / "decisions.csv", "r", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        header, data = rows[0], rows[1:]
+        assert header == ["datetime", "bar_dt", "strategy", "action",
+                          "side", "tag", "price", "reason"]
+        blocked = [r for r in data if r[3] == "SIGNAL_BLOCKED"]
+        assert len(blocked) == 1
+        r = blocked[0]
+        assert r[4] == "SHORT"          # side
+        assert r[5] == "FILL_PENDING"   # tag = reason code
+        assert r[6] == "22480"          # price
+        assert "waiting for entry fill" in r[7]  # reason
+
+    def test_blocked_signal_falls_back_to_now_without_bars(self, tmp_path):
+        """No completed bar yet → bar_dt falls back to wall-clock, no crash."""
+        strategy = AlwaysLongStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        emitted = []
+        runner.on("on_decision", emitted.append)
+
+        runner.log_blocked_signal(
+            "TRADE_CLOSE", "LONG", 22600, "NO_REAL_POSITION",
+            "exit — no real entry was confirmed")
+
+        assert len(emitted) == 1
+        assert emitted[0]["action"] == "SIGNAL_BLOCKED"
+        assert emitted[0]["bar_dt"] is not None
