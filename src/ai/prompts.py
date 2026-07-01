@@ -193,7 +193,19 @@ Use this for loss counting: `broker.trades[-1].pnl < 0` — do NOT compare bar.c
   exchange fill via OpenInterest. Prefer `effective_entry_price()` for stop math.
 - **IMPORTANT**: `entry()` returns None — do NOT store its return value. Track position state with `broker.position_size` and use the tag string literal in close()/exit().
 - **IMPORTANT**: `exit()` REQUIRES limit and/or stop prices to work. exit() with no limit/stop does NOTHING.
-  Use `close()` for immediate market exits (e.g. when checking bar.high >= target in on_bar).
+- **`close()` vs `exit()` — choose by how the exit must fill:**
+  - `broker.close(from_entry, tag)` is **market-on-close**: it fills at THIS bar's close and is only
+    evaluated when `on_bar()` runs (once per bar). Use it for session-close exits and discretionary
+    "flatten now" exits — NOT for stop-losses.
+  - `broker.exit(tag, from_entry, stop=X, limit=Y)` is a **resting order**: in live mode it is checked
+    on EVERY tick and fills the instant price touches the level (a stop fills at the tick price); in
+    backtest it is matched against the bar's full OHLC at the stop/limit price. Use it for stop-losses
+    and take-profits you want executed the moment price reaches them.
+  - **Stop-loss anti-pattern (do NOT do this):** `if bar.high >= stop: broker.close(...)`. A manual
+    bar-level check runs only when the bar completes and fills at the bar's close, so an intra-bar
+    spike through the stop is not acted on until the bar closes — losing all intra-bar protection.
+    Place `broker.exit(stop=X)` at entry instead (see the entry/exit pairing rule below) so the live
+    tick engine fills it at the stop the instant price gets there.
 - **CRITICAL — Always pair entry() with exit() on the SAME on_bar() call.** \
   In live mode, TP/SL exits are checked on every tick between bars. If exit() \
   is only called on the NEXT bar (after position_size > 0), the exit order \
