@@ -6,10 +6,13 @@ so bar boundaries align naturally with TAIFEX trading sessions.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 
 from ..market_data.models import Bar
 from ..market_data.sessions import session_align
+
+logger = logging.getLogger(__name__)
 
 
 class BarAggregator:
@@ -29,6 +32,14 @@ class BarAggregator:
         self._current: Bar | None = None
         self._current_start: datetime | None = None
 
+        # Out-of-order bar guard (issue #78). A post-reconnect tick-history
+        # replay can emit 1-min bars whose times go backwards; track the last
+        # accepted bar time so a stale bar cannot corrupt the aggregation or
+        # spawn a spurious extra bar. This tracks the RAW incoming ``bar.dt``,
+        # NOT the session-aligned boundary, so consecutive 1-min bars within
+        # the same aggregation window are both accepted.
+        self._last_bar_time: datetime | None = None
+
     def _align_time(self, dt: datetime) -> datetime:
         """Align datetime to the target bar boundary (session-start-based)."""
         return session_align(dt, self._interval)
@@ -42,6 +53,17 @@ class BarAggregator:
         bar's arrival, leaving the chart and strategy permanently 1 bar
         behind real time (issue #44).
         """
+        # Drop out-of-order/duplicate bars from post-reconnect history replay
+        # (issue #78). Guard on the raw incoming time BEFORE the 1-min
+        # pass-through so stale bars are rejected in every timeframe.
+        if self._last_bar_time is not None and bar.dt <= self._last_bar_time:
+            logger.warning(
+                "[AGG] Dropped out-of-order bar: %s <= last %s",
+                bar.dt, self._last_bar_time,
+            )
+            return None
+        self._last_bar_time = bar.dt
+
         if self._interval == 60:
             return bar
 
@@ -81,6 +103,17 @@ class BarAggregator:
         """Clear state."""
         self._current = None
         self._current_start = None
+        self._last_bar_time = None
+
+    def reset_stale_tracking(self) -> None:
+        """Reset the out-of-order bar guard (issue #78) WITHOUT discarding the
+        in-progress aggregation window.
+
+        Call on reconnect / history-replay start so the first bar after the
+        gap is always accepted, regardless of its timestamp relative to the
+        last bar seen before the drop.
+        """
+        self._last_bar_time = None
 
     def _start(self, aligned_dt: datetime, bar: Bar) -> None:
         self._current_start = aligned_dt

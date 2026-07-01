@@ -30,6 +30,13 @@ class BarBuilder:
         self._bar_start: datetime | None = None
         self._completed_bars: list[Bar] = []
 
+        # Out-of-order tick guard (issue #78). After a COM dropout, RequestTicks
+        # replays historical ticks in a burst that can contain timestamps going
+        # backwards relative to already-processed ticks. Track the last accepted
+        # tick time and drop anything that is not strictly newer, so a stale
+        # replay tick cannot corrupt the current bar's OHLCV.
+        self._last_tick_time: datetime | None = None
+
     @property
     def completed_bars(self) -> list[Bar]:
         return self._completed_bars
@@ -47,6 +54,16 @@ class BarBuilder:
 
     def on_tick(self, tick: Tick) -> Bar | None:
         """Process a tick. Returns a completed bar if a bar boundary was crossed."""
+        # Drop stale/out-of-order ticks from post-reconnect history replay
+        # (issue #78) before they can mutate the current bar.
+        if self._last_tick_time is not None and tick.dt <= self._last_tick_time:
+            logger.warning(
+                "[BAR] Dropped stale tick: %s <= last %s",
+                tick.dt, self._last_tick_time,
+            )
+            return None
+        self._last_tick_time = tick.dt
+
         bar_time = self._align_time(tick.dt)
 
         # First tick ever
@@ -104,3 +121,12 @@ class BarBuilder:
         if self._current_bar is None:
             return None
         return self._finalize_bar()
+
+    def reset_stale_tracking(self) -> None:
+        """Reset the out-of-order tick guard (issue #78).
+
+        Call on reconnect / history-replay start so the first tick after the
+        gap is always accepted, regardless of its timestamp relative to the
+        last tick seen before the drop.
+        """
+        self._last_tick_time = None
