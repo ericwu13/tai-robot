@@ -3771,7 +3771,16 @@ class BacktestApp:
         """
         payload = self._gather_analysis_payload()
         if payload is None:
+            msg = ("🧬 EVO: 無交易紀錄，演化引擎無資料可分析。"
+                   "No trades recorded — evolution has no data to analyze.")
             self.status_var.set("無交易紀錄 No trades for evolution")
+            if auto_run:
+                self._append_chat("system", msg)
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify(msg)
+                    except Exception:
+                        pass
             return
         if not self._ensure_chat_client():
             return
@@ -5267,7 +5276,13 @@ class BacktestApp:
         try:
             self._bot_evolution(auto_run=True)
         except Exception as e:
-            _log(f"weekly auto-evolution failed: [{type(e).__name__}] {e}")
+            err_msg = f"weekly auto-evolution failed: [{type(e).__name__}] {e}"
+            _log(err_msg)
+            if _discord is not None and _discord.enabled:
+                try:
+                    _discord.notify(f"🧬 EVO ERROR: {err_msg}")
+                except Exception:
+                    pass
 
     def _check_tick_watchdog(self):
         """Delegate tick health check to TickWatchdog and act on the result."""
