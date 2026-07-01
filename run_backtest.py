@@ -1071,6 +1071,9 @@ class BacktestApp:
         self._live_history_tick_count = 0
         self._live_stale_drops = 0
         self._live_runner.suppress_strategy = True
+        # Issue #79: reconnect re-enters the history-replay window — ignore
+        # mode overrides until the history→live transition clears the flag.
+        self._live_runner._is_reloading = True
         # Track when this RequestTicks fired so we can log latency to first tick
         # (and detect zombie subscriptions where no tick arrives).
         self._ticks_requested_at = time.time()
@@ -4851,6 +4854,35 @@ class BacktestApp:
             n = self._live_runner.restore_session(resume_session)
             self._live_log_msg(f"恢復交易紀錄 Resumed session: {n} trades restored", "status")
 
+            # Issue #79: reconcile the safety guard with the restored position.
+            # guard.reset() (line above at deploy) cleared real_entry_confirmed
+            # and fill_pending, but the restored broker may already hold an
+            # open position from the previous session. Without this, every
+            # exit/force-close is SKIP_EXIT'd (real_entry_confirmed=False) and
+            # any stale fill_pending would BLOCK_FILL_PENDING the close forever
+            # — the live position stays stuck open until the user manually
+            # switches trading modes.
+            if self._live_runner.broker.position_size > 0:
+                cleared = self._trading_guard.restore_confirmed_position()
+                if cleared:
+                    self._live_log_msg(
+                        "[RESUME] Cleared stale fill_pending — position already "
+                        "confirmed from previous session", "status")
+                self._live_log_msg(
+                    "[RESUME] Restored confirmed real position — exits/"
+                    "force-close re-enabled", "status")
+
+            # Issue #79 (sub-problem C): explicitly re-sync the mode tag now,
+            # before warmup/replay begins. The var was set at deploy time, but
+            # re-asserting it here (and guarding _check_mode_override while
+            # _is_reloading) keeps the tag from momentarily blanking during
+            # history replay until a manual mode switch restores it.
+            combo_label = self._mode_key_to_combo.get(
+                self._trading_mode, self._trading_mode)
+            self.trading_mode_var.set(combo_label)
+            self._live_log_msg(
+                f"[RESUME] Trading mode restored: {self._trading_mode}", "status")
+
         # Register callbacks
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
         self._live_runner.on("on_decision", lambda d: self.root.after(0, self._on_live_decision, d))
@@ -5027,6 +5059,28 @@ class BacktestApp:
                  f"[{type(e).__name__}] {e}")
         self._start_live_tick_subscription()
 
+    def _on_reload_progress(self, done: int, total: int) -> None:
+        """Progress hook for LiveRunner.reload_1m_bars (issue #79).
+
+        Logs every batch and pumps the Tk event loop so the window stays
+        painted during a long bar reload. Uses update_idletasks() (redraw
+        only) rather than update() on purpose: a full update() would
+        dispatch queued user input — a "Stop Bot" click mid-reload would
+        re-enter _stop_live() and clear self._live_runner underneath the
+        still-running reload, crashing on return. update_idletasks() keeps
+        the UI responsive-looking without that re-entrancy hazard.
+        """
+        if total:
+            self._live_log_msg(
+                f"[RESUME] Reloading bars: {done}/{total}...", "status")
+        else:
+            self._live_log_msg(
+                f"[RESUME] Reloading bars: {done}...", "status")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass  # window may be tearing down — never break the reload
+
     # ── Tick-based live data feed ──
 
     def _start_live_tick_subscription(self):
@@ -5034,8 +5088,14 @@ class BacktestApp:
         if not self._live_runner:
             return
 
-        # Reload saved 1-min bars from CSV (for resumed sessions)
-        n_reloaded = self._live_runner.reload_1m_bars()
+        # Reload saved 1-min bars from CSV (for resumed sessions).
+        # Issue #79: for long-lookback strategies the reload can re-feed
+        # thousands of bars through fresh HTF aggregators in one blocking
+        # call, freezing the UI for seconds. Pass a progress callback that
+        # logs every 500 bars and pumps the Tk event loop so the window
+        # stays painted/responsive during the reload.
+        n_reloaded = self._live_runner.reload_1m_bars(
+            progress_cb=self._on_reload_progress)
         if n_reloaded > 0:
             self._live_log_msg(
                 f"已載入歷史1分K Reloaded {n_reloaded} saved 1m bars from CSV", "status")
@@ -5494,6 +5554,9 @@ class BacktestApp:
             self._live_history_done = True
             self._live_history_tick_count = self._live_tick_count
             self._live_runner.suppress_strategy = False
+            # Issue #79: reloading window is over — live hot-swap mode
+            # overrides may now be honored again.
+            self._live_runner._is_reloading = False
             status = self._live_runner.get_status()
             self._live_log_msg(
                 f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "

@@ -456,6 +456,88 @@ class TestFillPendingBlocks:
         assert verdict == g.SEND_EXIT  # NOT blocked
 
 
+class TestScenarioIssue79ResumeReconcile:
+    """Issue #79: on session resume the bot inherits an open position from a
+    previous run. guard.reset() (called on every deploy) clears
+    real_entry_confirmed and fill_pending, so the restored position looks
+    like "no real entry" and every exit/force-close gets SKIP_EXIT'd — the
+    live position is stuck open until the user manually switches modes.
+
+    restore_confirmed_position() reconciles the guard so exits fire again.
+    """
+
+    def test_known_bad_force_close_skipped_without_reconcile(self):
+        """Documents the bug: without reconcile, a restored position with a
+        stale fill_pending cannot be force-closed."""
+        g = TradingGuard()
+        g.reset()                 # simulates deploy-time reset
+        g.fill_pending = True     # stale entry-fill flag from crashed session
+        g.fill_pending_type = "entry"
+        # real_entry_confirmed is False after reset — FORCE_CLOSE reaches
+        # check_exit and is skipped even though a real position exists.
+        verdict, _ = g.decide("semi_auto", "FORCE_CLOSE", "LONG")
+        assert verdict == g.SKIP_EXIT
+
+    def test_reconcile_clears_stale_fill_pending(self):
+        g = TradingGuard()
+        g.reset()
+        g.fill_pending = True
+        g.fill_pending_type = "entry"
+        cleared = g.restore_confirmed_position()
+        assert cleared is True
+        assert g.fill_pending is False
+        assert g.fill_pending_type == ""
+        assert g.real_entry_confirmed is True
+
+    def test_reconcile_reports_no_stale_pending(self):
+        g = TradingGuard()
+        g.reset()  # fill_pending already False
+        cleared = g.restore_confirmed_position()
+        assert cleared is False
+        assert g.real_entry_confirmed is True
+
+    def test_force_close_fires_after_reconcile(self):
+        """The core regression: position_size>0 + fill_pending=True on resume
+        → force-close must fire (SEND_EXIT) after reconciliation."""
+        g = TradingGuard()
+        g.reset()
+        g.fill_pending = True
+        g.fill_pending_type = "entry"
+        g.restore_confirmed_position()
+        verdict, details = g.decide("semi_auto", "FORCE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+        assert details["new_close"] == 1  # explicit close
+
+    def test_normal_trade_close_fires_after_reconcile(self):
+        """A strategy-driven TRADE_CLOSE (the red-box case) must also fire."""
+        g = TradingGuard()
+        g.reset()
+        g.fill_pending = True
+        g.fill_pending_type = "entry"
+        g.restore_confirmed_position()
+        verdict, _ = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
+        assert verdict == g.SEND_EXIT
+
+    def test_reconcile_discards_deferred_close(self):
+        """A deferred close waiting on a fill that will never come is dropped —
+        the reconciled exit will be re-issued by the strategy instead."""
+        g = TradingGuard()
+        g.reset()
+        g.fill_pending = True
+        g.defer_close({"action": "TRADE_CLOSE", "side": "LONG"})
+        g.restore_confirmed_position()
+        assert g.pop_deferred_close() is None
+
+    def test_auto_mode_force_close_fires_after_reconcile(self):
+        g = TradingGuard()
+        g.reset()
+        g.fill_pending = True
+        g.fill_pending_type = "entry"
+        g.restore_confirmed_position()
+        verdict, _ = g.decide("auto", "FORCE_CLOSE", "SHORT")
+        assert verdict == g.SEND_EXIT
+
+
 class TestFillConfirmedResumes:
     """After on_fill_confirmed(), orders should flow normally again."""
 
