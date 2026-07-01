@@ -5926,12 +5926,18 @@ class BacktestApp:
             self._live_log_msg(
                 f"系統已停止 HALTED: {details['reason']}", "exit")
             self._log_order_decision("REAL_ORDER_HALTED", details["reason"])
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "HALTED", details["reason"])
             return
 
         if verdict == guard.BLOCK_FILL_PENDING:
             self._live_log_msg(
                 f"等待確認中 Pending: {details['reason']}", "status")
             self._log_order_decision("REAL_ORDER_PENDING_BLOCK", details["reason"])
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "FILL_PENDING", details["reason"])
             # Issue #50: store blocked TRADE_CLOSE so it can be replayed
             # after _on_fill_confirmed("entry") clears fill_pending. Without
             # this, the close decision is permanently lost and the real
@@ -5945,6 +5951,10 @@ class BacktestApp:
         if verdict == guard.BLOCK_ENTRY:
             self._live_log_msg(
                 f"實單暫停 Order blocked: {details['reason']}", "status")
+            # Issue #62: the daily-loss-limit block used to be silent in
+            # decisions.csv and the UI event log — the exact case reported.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "DAILY_LOSS_LIMIT", details["reason"])
             return
 
         # Settlement-day rule: block NEW entries within 60 min of the
@@ -5956,12 +5966,18 @@ class BacktestApp:
             self._live_log_msg(
                 f"結算日禁止進場 Settlement-day entry blocked: {reason}", "exit")
             self._log_order_decision("REAL_ORDER_BLOCKED", reason)
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "SETTLEMENT_WINDOW", reason)
             return
 
         if verdict == guard.SKIP_EXIT:
             self._live_log_msg(
                 f"跳過平倉(無實倉) Skip: {details['reason']}", "status")
             self._log_order_decision("REAL_ORDER_SKIPPED", details["reason"])
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "NO_REAL_POSITION", details["reason"])
             return
 
         if verdict == guard.SEND_EXIT:
