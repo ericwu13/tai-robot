@@ -515,6 +515,17 @@ class LiveRunner:
             except Exception:
                 pass
 
+    def reset_bar_monotonicity(self) -> None:
+        """Reset the out-of-order bar guards on all aggregators (issue #78).
+
+        Called by the GUI when a reconnect re-enters the tick-history replay
+        window, so the first bar after the gap is always accepted without
+        discarding any in-progress aggregation.
+        """
+        self.aggregator.reset_stale_tracking()
+        for agg in self._htf_aggregators.values():
+            agg.reset_stale_tracking()
+
     # ── Warmup ──
 
     def get_warmup_params(self) -> dict:

@@ -418,3 +418,86 @@ class TestBarAggregator1mPassThrough:
         partial = agg.get_partial_bar()
         assert partial is not None
         assert partial.close == 101
+
+
+# ── Regression: issue #78 — out-of-order bar guard ──
+
+class TestBarAggregatorOutOfOrderGuard:
+    """Issue #78: a post-reconnect tick-history replay can emit 1-min bars
+    whose times go backwards. Such bars must be dropped so they cannot corrupt
+    the aggregation window or spawn a spurious extra bar."""
+
+    def test_out_of_order_bar_dropped_htf(self):
+        """An older bar must not mutate the in-progress H4 window."""
+        agg = BarAggregator("TX00", 14400)
+        agg.on_bar(_bar("2026-03-02 08:45", o=100, h=110, l=90, c=105, v=10))
+        agg.on_bar(_bar("2026-03-02 09:00", o=105, h=120, l=100, c=115, v=20))
+        partial_before = agg.get_partial_bar()
+
+        # Burst replay: a bar timestamped BEFORE the last accepted bar.
+        result = agg.on_bar(_bar("2026-03-02 08:50", o=50, h=999, l=1, c=42, v=99))
+
+        assert result is None
+        partial_after = agg.get_partial_bar()
+        # Window untouched — no OHLCV corruption from the stale bar.
+        assert (partial_after.open, partial_after.high, partial_after.low,
+                partial_after.close, partial_after.volume) == (
+            partial_before.open, partial_before.high, partial_before.low,
+            partial_before.close, partial_before.volume)
+
+    def test_out_of_order_bar_dropped_passthrough(self):
+        """The guard also applies in the 1-min pass-through path."""
+        agg = BarAggregator("TX00", 60)
+        agg.on_bar(_bar("2026-03-02 09:05", c=100))
+        # Older bar in the burst — must be dropped, not passed through.
+        result = agg.on_bar(_bar("2026-03-02 09:02", c=200))
+        assert result is None
+
+    def test_duplicate_bar_dropped(self):
+        """A bar at exactly the last accepted time (<=) is dropped."""
+        agg = BarAggregator("TX00", 14400)
+        agg.on_bar(_bar("2026-03-02 09:00", o=100, h=110, l=90, c=105, v=10))
+        result = agg.on_bar(_bar("2026-03-02 09:00", o=100, h=999, l=1, c=42, v=99))
+        assert result is None
+        partial = agg.get_partial_bar()
+        assert partial.high == 110  # unchanged
+        assert partial.volume == 10
+
+    def test_consecutive_1m_bars_in_window_both_accepted(self):
+        """Guard must NOT reject distinct 1-min bars in the same HTF window
+        (it tracks raw bar.dt, not the aligned boundary)."""
+        agg = BarAggregator("TX00", 14400)
+        assert agg.on_bar(_bar("2026-03-02 08:45", v=1)) is None
+        assert agg.on_bar(_bar("2026-03-02 08:46", v=1)) is None
+        assert agg.on_bar(_bar("2026-03-02 08:47", v=1)) is None
+        partial = agg.get_partial_bar()
+        assert partial.volume == 3  # all three accepted
+
+    def test_reset_stale_tracking_accepts_next_bar(self):
+        """After reset_stale_tracking(), the next bar is accepted regardless of
+        its timestamp — without discarding the in-progress window."""
+        agg = BarAggregator("TX00", 14400)
+        agg.on_bar(_bar("2026-03-02 09:00", o=100, h=110, l=90, c=105, v=10))
+
+        # Reconnect: replay restarts from an earlier checkpoint.
+        agg.reset_stale_tracking()
+
+        # In-progress window survived the reset.
+        assert agg.get_partial_bar() is not None
+        # An "older" bar is now accepted and folds into the window.
+        result = agg.on_bar(_bar("2026-03-02 08:50", o=105, h=120, l=80, c=108, v=5))
+        assert result is None  # same 08:45 H4 window
+        partial = agg.get_partial_bar()
+        assert partial.high == 120  # updated by the accepted bar
+        assert partial.volume == 15
+
+    def test_full_reset_clears_tracker(self):
+        """reset() clears the monotonicity tracker too, so a fresh stream of
+        any timestamp is accepted."""
+        agg = BarAggregator("TX00", 60)
+        agg.on_bar(_bar("2026-03-02 09:05", c=100))
+        agg.reset()
+        # A bar older than the pre-reset one is accepted after a full reset.
+        result = agg.on_bar(_bar("2026-03-02 09:02", c=200))
+        assert result is not None
+        assert result.close == 200

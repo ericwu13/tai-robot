@@ -8,7 +8,7 @@ from src.market_data.data_store import DataStore
 from src.backtest.broker import SimulatedBroker, BrokerContext, OrderSide
 from src.backtest.strategy import BacktestStrategy
 from src.live.live_runner import LiveRunner, LiveState, is_market_open
-from src.live.bar_aggregator import aggregate_bars
+from src.live.bar_aggregator import BarAggregator, aggregate_bars
 
 
 # ── Simple test strategy ──
@@ -1300,3 +1300,29 @@ class TestLoad1mBarsFromCsvs:
             encoding="utf-8")
         bars = load_1m_bars_from_csvs(str(tmp_path), "TX00")
         assert len(bars) == 1
+
+
+class TestResetBarMonotonicity:
+    """Issue #78: reconnect must reset the out-of-order bar guards on the
+    primary aggregator AND all HTF aggregators, so the first bar after the
+    replay gap is always accepted."""
+
+    def test_reset_clears_primary_and_htf_trackers(self, tmp_path):
+        strategy = AlwaysLongStrategy()  # 15-min primary
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        # Force an HTF aggregator to exist alongside the primary one.
+        runner._htf_aggregators[14400] = BarAggregator("TX00", 14400)
+
+        # Advance the guards past a known time on every aggregator.
+        seed = Bar(symbol="TX00", dt=datetime(2026, 3, 2, 9, 0), open=100,
+                   high=110, low=90, close=105, volume=10, interval=60)
+        runner.aggregator.on_bar(seed)
+        runner._htf_aggregators[14400].on_bar(seed)
+        assert runner.aggregator._last_bar_time is not None
+        assert runner._htf_aggregators[14400]._last_bar_time is not None
+
+        runner.reset_bar_monotonicity()
+
+        assert runner.aggregator._last_bar_time is None
+        assert runner._htf_aggregators[14400]._last_bar_time is None

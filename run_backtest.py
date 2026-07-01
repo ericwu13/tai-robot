@@ -1074,6 +1074,13 @@ class BacktestApp:
         # Issue #79: reconnect re-enters the history-replay window — ignore
         # mode overrides until the history→live transition clears the flag.
         self._live_runner._is_reloading = True
+        # Issue #78: the replay burst can carry ticks/bars whose timestamps go
+        # backwards relative to what we already processed. Reset the
+        # out-of-order guards so the first tick/bar after the gap is accepted,
+        # then let the monotonicity checks drop the stale remainder of the burst.
+        if self._live_bar_builder is not None:
+            self._live_bar_builder.reset_stale_tracking()
+        self._live_runner.reset_bar_monotonicity()
         # Track when this RequestTicks fired so we can log latency to first tick
         # (and detect zombie subscriptions where no tick arrives).
         self._ticks_requested_at = time.time()
