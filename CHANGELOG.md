@@ -5,6 +5,22 @@ All notable changes to tai-robot are documented here.
 
 ---
 
+## [2.12.3] — 2026-07-01
+
+### 繁體中文
+
+#### 修正
+- **演化靜默跳過（issue #74）**：週末自動演化在某些條件下（設計窗無交易、尚無交易紀錄、執行異常）靜默返回，使用者無從得知演化未執行。修正後所有跳過路徑均發送雙語聊天訊息，`auto_run` 模式同步發送 Discord 通知；未預期例外也會通報 Discord。
+- **BbandSmaShortV3 止損過窄（issue #75）**：`atr_sl_mult` 由 0.1 調至 1.0。原始 0.1 倍 ATR 使止損僅 36–60 點，在正常 60 分 K 棒波動（均幅 ~346 點）下一根 K 即被洗出。加寬至 1.0 倍後，模擬顯示總損益改善 +6,920（Trade #2 不再被盤中波動觸發止損）。另新增選擇性動態出場機制（追蹤止損、打平、反彈出場），預設關閉。
+
+### English
+
+#### Fixed
+- **Silent evolution skip (issue #74)**: the weekly auto-evolution pipeline returned silently under certain conditions (no design-window trades, no trades at all, uncaught exception), leaving the user unaware that evolution didn't run. All skip paths now send a bilingual chat message; `auto_run` mode also fires a Discord notification; uncaught exceptions are reported to Discord too.
+- **BbandSmaShortV3 SL too tight (issue #75)**: `atr_sl_mult` widened from 0.1 to 1.0. The original 0.1× ATR placed the stop just 36–60 pts above prev_high — well inside normal 60-min bar noise (avg range ~346 pts), causing two of six live trades to stop out on the first bar despite correct directional calls. At 1.0× ATR, what-if simulation on the live session data improved total PnL by +6,920 (Trade #2 survived the spike). Optional dynamic exit mechanisms (trailing stop, break-even, bounce exit) are included but default-off.
+
+---
+
 ## [2.12.2] — 2026-06-16
 
 ### 繁體中文
