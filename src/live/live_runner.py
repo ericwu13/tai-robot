@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -382,8 +383,11 @@ class LiveRunner:
         # Issue #79: True from warmup start until history replay completes.
         # While set, _check_mode_override() is skipped so a stale
         # mode_override.json (or a race with the resume UI sync) can't flip
-        # the trading mode mid-replay and blank the mode tag.
-        self._is_reloading: bool = False
+        # the trading mode mid-replay and blank the mode tag. Backed by the
+        # _is_reloading property, which stamps _reload_started_at on each
+        # False→True flip so a window that never closes can be auto-cleared.
+        self._reloading_flag: bool = False
+        self._reload_started_at: float | None = None
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
         self.broker.trade_source = _mode_to_source(self.trading_mode)
         self.daily_loss_limit: int = 10000  # NTD, for session persistence
@@ -449,6 +453,25 @@ class LiveRunner:
 
     # ── Hot-swap mode switching ──
 
+    # Safety cap on the reloading window (issue #79 review). If the
+    # history→live transition never fires (e.g. the tick feed died), the
+    # window would otherwise stay open forever and wedge hot-swap.
+    RELOAD_TIMEOUT_SECONDS = 600  # 10 minutes
+
+    @property
+    def _is_reloading(self) -> bool:
+        return self._reloading_flag
+
+    @_is_reloading.setter
+    def _is_reloading(self, value: bool) -> None:
+        value = bool(value)
+        if value and not self._reloading_flag:
+            # False→True: stamp the start for the safety timeout.
+            self._reload_started_at = time.monotonic()
+        elif not value:
+            self._reload_started_at = None
+        self._reloading_flag = value
+
     def _check_mode_override(self) -> str | None:
         """Read and consume a mode_override.json file from the bot directory."""
         # Issue #79: never consume/apply a mode override during warmup or
@@ -456,7 +479,32 @@ class LiveRunner:
         # sync and makes the mode tag disappear until the user manually
         # switches modes. Live hot-swaps resume once _is_reloading clears.
         if self._is_reloading:
-            return None
+            # Safety timeout (issue #79 review): auto-clear a reloading window
+            # that has been open too long so hot-swap isn't wedged forever.
+            if (self._reload_started_at is not None
+                    and time.monotonic() - self._reload_started_at
+                    > self.RELOAD_TIMEOUT_SECONDS):
+                self._emit(
+                    "on_status",
+                    "[RESUME] _is_reloading stuck > 10 min — auto-clearing "
+                    "reload window")
+                self._is_reloading = False
+                # fall through and process the override normally below
+            else:
+                # Delete (not just skip) any mode_override.json queued during
+                # the reload window (issue #79 review). Leaving it in place lets
+                # a stale override apply the instant the window clears — possibly
+                # flipping the bot to auto with no human in the loop.
+                override_path = os.path.join(self.bot_dir, "mode_override.json")
+                try:
+                    if os.path.exists(override_path):
+                        os.remove(override_path)
+                        self._emit(
+                            "on_status",
+                            "[RESUME] Deleted stale mode_override.json during reload")
+                except OSError:
+                    pass
+                return None
         override_path = os.path.join(self.bot_dir, "mode_override.json")
         try:
             if not os.path.exists(override_path):
@@ -525,6 +573,28 @@ class LiveRunner:
         self.aggregator.reset_stale_tracking()
         for agg in self._htf_aggregators.values():
             agg.reset_stale_tracking()
+        # Issue #78 (review): the first replayed tick force-finalizes the
+        # in-progress 1-min bar into a TRUNCATED bar, which lands in the dedup
+        # set. Drop that last entry so the correct, full replayed bar can be
+        # re-accepted instead of being silently dedup-dropped.
+        self.clear_last_bar_dedup()
+
+    def clear_last_bar_dedup(self) -> None:
+        """Remove only the most-recent 1-min bar from the dedup set (issue #78).
+
+        On a COM reconnect the BarBuilder force-finalizes whatever in-progress
+        1-min bar it held into a TRUNCATED bar (missing the ticks that arrived
+        after the drop). Its timestamp is recorded in ``_seen_1m_dts``. When the
+        replay then delivers the CORRECT full bar for that same minute,
+        ``_ingest_1m_bar`` would dedup-drop it, leaving the truncated bar in
+        place forever.
+
+        Removing ONLY the last (newest) entry lets the full replayed bar be
+        re-accepted while older bars stay deduped — we must not re-process
+        those or they would double-count trades/volume.
+        """
+        if self._seen_1m_dts:
+            self._seen_1m_dts.discard(max(self._seen_1m_dts))
 
     # ── Warmup ──
 

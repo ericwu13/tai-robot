@@ -111,18 +111,22 @@ class TestOutOfOrderTickGuard:
                 bb.current_bar.low, bb.current_bar.close,
                 bb.current_bar.volume) == snapshot
 
-    def test_duplicate_tick_is_dropped(self):
-        """A tick at exactly the last timestamp (<=) is also dropped."""
+    def test_same_timestamp_tick_is_kept(self):
+        """Issue #78 (review): a tick at exactly the last timestamp is a
+        legitimate same-millisecond fill (e.g. a sweep order hitting several
+        price levels) and MUST be merged into the current bar. The old ``<=``
+        guard dropped these and corrupted High/Low/Volume."""
         bb = BarBuilder("TXFD0", 60)
         bb.on_tick(_tick(20000, 1, 30, minute=0))
         vol_before = bb.current_bar.volume
 
-        # Same timestamp, different price/qty — treated as a duplicate.
+        # Same timestamp, higher price + more qty — must update the bar.
         result = bb.on_tick(_tick(20100, 5, 30, minute=0))
 
         assert result is None
-        assert bb.current_bar.volume == vol_before
-        assert bb.current_bar.close == 20000  # unchanged
+        assert bb.current_bar.volume == vol_before + 5
+        assert bb.current_bar.high == 20100
+        assert bb.current_bar.close == 20100
 
     def test_stale_tick_does_not_spawn_new_bar(self):
         """A stale tick in a later minute must not create a spurious bar."""

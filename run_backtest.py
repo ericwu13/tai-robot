@@ -4870,14 +4870,33 @@ class BacktestApp:
             # — the live position stays stuck open until the user manually
             # switches trading modes.
             if self._live_runner.broker.position_size > 0:
-                cleared = self._trading_guard.restore_confirmed_position()
-                if cleared:
+                # Real-money hazard (issue #79 review): the restored SIM broker
+                # can hold a position even when the REAL account is FLAT (user
+                # closed overnight, or the entry was skipped last session).
+                # Confirming a real entry in that state lets the bot auto-send a
+                # close (sNewClose=2) against a flat account — OPENING a naked
+                # position. Only reconcile the guard if the real account (queried
+                # ~90 lines above via GetOpenInterestGW) also shows a position
+                # for this symbol. Paper mode has no real account, so the sim
+                # position alone is authoritative there.
+                real_ok = True
+                if trading_mode in ("semi_auto", "auto"):
+                    order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+                    prefix = order_sym[:2] if order_sym else ""
+                    real_ok = self._account_monitor.get_signed_position(prefix) != 0
+                if real_ok:
+                    cleared = self._trading_guard.restore_confirmed_position()
+                    if cleared:
+                        self._live_log_msg(
+                            "[RESUME] Cleared stale fill_pending — position already "
+                            "confirmed from previous session", "status")
                     self._live_log_msg(
-                        "[RESUME] Cleared stale fill_pending — position already "
-                        "confirmed from previous session", "status")
-                self._live_log_msg(
-                    "[RESUME] Restored confirmed real position — exits/"
-                    "force-close re-enabled", "status")
+                        "[RESUME] Restored confirmed real position — exits/"
+                        "force-close re-enabled", "status")
+                else:
+                    self._live_log_msg(
+                        "[RESUME] Real account flat but sim has position — NOT "
+                        "confirming entry. Manual review required.", "status")
 
             # Issue #79 (sub-problem C): explicitly re-sync the mode tag now,
             # before warmup/replay begins. The var was set at deploy time, but
@@ -6139,6 +6158,12 @@ class BacktestApp:
                     self._live_log_msg(msg, "exit")
                     self._log_order_decision("REAL_ORDER_BLOCKED", msg)
                     _log(f"REAL ORDER BLOCKED: {msg}")
+                    # Issue #62 (review): the margin block was invisible in
+                    # decisions.csv / the UI table. Surface it as a blocked signal.
+                    if self._live_runner:
+                        side = "LONG" if buy_sell == 0 else "SHORT"
+                        self._live_runner.log_blocked_signal(
+                            "ENTRY_FILL", side, sim_price, "MARGIN_BLOCK", msg)
                     return False
             except (ValueError, TypeError):
                 pass  # can't parse — proceed with order, let exchange decide
@@ -6810,6 +6835,25 @@ class BacktestApp:
                 self._trading_mode = "semi_auto"
                 self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
                 self._trading_mode = saved_mode
+            elif (self._trading_mode in ("semi_auto", "auto")
+                    and not self._trading_guard.real_entry_confirmed
+                    and self._live_runner.broker.position_size > 0):
+                # Issue #62 (review): a sim position is open but no real entry
+                # was ever confirmed, so the force-close is intentionally
+                # skipped. This used to be SILENT — surface it so the user knows
+                # the sim position may be a phantom (no matching real position).
+                runner = self._live_runner
+                side_val = runner.broker.position_side.value
+                price = self._get_latest_price()[0]
+                if price <= 0:
+                    price = runner._aggregated_bars[-1].close if runner._aggregated_bars else 0
+                self._live_log_msg(
+                    "[STOP] Skipping force-close — real_entry_confirmed=False. "
+                    "Position may be phantom.", "exit")
+                runner.log_blocked_signal(
+                    "FORCE_CLOSE", side_val, price, "NO_REAL_ENTRY_STOP_CLOSE",
+                    "real_entry_confirmed=False; sim position open, "
+                    "stop-close skipped")
 
             # Suppress strategy before stop — prevent new entries during shutdown.
             # stop() flushes the aggregator's partial bar and runs _process_aggregated_bar,
