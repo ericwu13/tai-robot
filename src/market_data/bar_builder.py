@@ -33,8 +33,17 @@ class BarBuilder:
         # Out-of-order tick guard (issue #78). After a COM dropout, RequestTicks
         # replays historical ticks in a burst that can contain timestamps going
         # backwards relative to already-processed ticks. Track the last accepted
-        # tick time and drop anything that is not strictly newer, so a stale
-        # replay tick cannot corrupt the current bar's OHLCV.
+        # tick time and drop anything strictly OLDER, so a stale replay tick
+        # cannot corrupt the current bar's OHLCV.
+        #
+        # The guard is strict less-than (``<``), NOT ``<=`` (issue #78 review):
+        # in fast markets a sweep order fills at several price levels within the
+        # same millisecond, producing multiple legitimate ticks at an identical
+        # timestamp. Dropping those (the old ``<=`` behaviour) silently corrupted
+        # bar High/Low/Volume. Same-timestamp ticks belong to the same bar, so
+        # accepting them is always correct. The SK sequence number ``nPtr`` would
+        # give a finer tie-break, but it is not plumbed through the COM tick queue
+        # (see run_backtest._on_com_tick), so timestamp alone is the guard.
         self._last_tick_time: datetime | None = None
 
     @property
@@ -55,10 +64,12 @@ class BarBuilder:
     def on_tick(self, tick: Tick) -> Bar | None:
         """Process a tick. Returns a completed bar if a bar boundary was crossed."""
         # Drop stale/out-of-order ticks from post-reconnect history replay
-        # (issue #78) before they can mutate the current bar.
-        if self._last_tick_time is not None and tick.dt <= self._last_tick_time:
+        # (issue #78) before they can mutate the current bar. Strict ``<`` —
+        # a tick at the SAME timestamp is a legitimate same-millisecond fill
+        # and must pass through (see __init__ comment).
+        if self._last_tick_time is not None and tick.dt < self._last_tick_time:
             logger.warning(
-                "[BAR] Dropped stale tick: %s <= last %s",
+                "[BAR] Dropped stale tick: %s < last %s",
                 tick.dt, self._last_tick_time,
             )
             return None
