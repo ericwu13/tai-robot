@@ -186,7 +186,7 @@ class TestClassifyRegime:
         expected_keys = {
             "label", "trend_strength", "volatility", "direction",
             "adx", "plus_di", "minus_di", "atr", "atr_ratio",
-            "ema_50", "last_close",
+            "ema_50", "last_close", "ema_slope",
         }
         assert set(d.keys()) == expected_keys
 

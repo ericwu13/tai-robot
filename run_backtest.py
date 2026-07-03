@@ -309,6 +309,23 @@ def _load_settings():
             # WITHHELD from the AI's design and used as the unseen
             # validation window (walk-forward discipline).
             cfg["evolution_holdout_days"] = evo.get("holdout_days", 14)
+            # Regime mode (shadow — Phase 1). Advisory only: classifies the
+            # market regime each NIGHT session and logs/announces a strategy
+            # recommendation. Never auto-deploys while dry_run stays True.
+            regime = data.get("regime", {})
+            cfg["regime_enabled"] = regime.get("enabled", False)
+            cfg["regime_dry_run"] = regime.get("dry_run", True)
+            cfg["regime_long_strategy"] = regime.get("long_strategy", "")
+            cfg["regime_short_strategy"] = regime.get("short_strategy", "")
+            cfg["regime_adx_enter"] = regime.get("adx_enter", 25.0)
+            cfg["regime_adx_exit"] = regime.get("adx_exit", 20.0)
+            cfg["regime_confirm_sessions"] = regime.get("confirm_sessions", 2)
+            cfg["regime_vol_spike_ratio"] = regime.get("vol_spike_ratio", 1.5)
+            cfg["regime_range_bias_action"] = regime.get("range_bias_action", "sit_out")
+            cfg["regime_max_flips"] = regime.get("max_flips", 3)
+            cfg["regime_flip_window"] = regime.get("flip_window", 10)
+            cfg["regime_pause_sessions"] = regime.get("pause_sessions", 5)
+            cfg["regime_classify_interval"] = regime.get("classify_interval", 3600)
             break
     return cfg
 
@@ -1162,6 +1179,7 @@ class BacktestApp:
         # Live trading state
         self._live_chart: LiveChart | None = None
         self._live_runner: LiveRunner | None = None
+        self._regime_manager = None  # regime shadow mode (Phase 1)
         # Real trading state
         self._trading_mode: str = "paper"  # "paper" or "semi_auto"
         self._futures_account: str = ""  # full account for order submission
@@ -4655,6 +4673,26 @@ class BacktestApp:
         else:
             self._deploy_live()
 
+    def _load_regime_config(self) -> "RegimeConfig":
+        """Build the regime (shadow-mode) config from flat settings keys."""
+        from src.regime.state_machine import RegimeConfig
+        s = self._settings
+        return RegimeConfig(
+            enabled=s.get("regime_enabled", False),
+            dry_run=s.get("regime_dry_run", True),
+            long_strategy=s.get("regime_long_strategy", ""),
+            short_strategy=s.get("regime_short_strategy", ""),
+            adx_enter=float(s.get("regime_adx_enter", 25.0)),
+            adx_exit=float(s.get("regime_adx_exit", 20.0)),
+            confirm_sessions=int(s.get("regime_confirm_sessions", 2)),
+            vol_spike_ratio=float(s.get("regime_vol_spike_ratio", 1.5)),
+            range_bias_action=s.get("regime_range_bias_action", "sit_out"),
+            max_flips=int(s.get("regime_max_flips", 3)),
+            flip_window=int(s.get("regime_flip_window", 10)),
+            pause_sessions=int(s.get("regime_pause_sessions", 5)),
+            classify_interval=int(s.get("regime_classify_interval", 3600)),
+        )
+
     def _deploy_live(self):
         """Start live bot: create runner, fetch warmup, subscribe to ticks."""
         if not self._quote_connected and not _tv_available:
@@ -4827,6 +4865,22 @@ class BacktestApp:
 
         # Open debug log file in bot directory
         _open_debug_log(self._live_runner.bot_dir)
+
+        # Regime manager (shadow mode — Phase 1). Reads config from settings;
+        # stays inert unless regime.enabled is True. Never auto-deploys —
+        # it only logs and (optionally) announces a recommendation.
+        try:
+            from src.regime.manager import RegimeManager
+            regime_cfg = self._load_regime_config()
+            self._regime_manager = RegimeManager(self._live_runner.bot_dir, regime_cfg)
+            # Discord uses the module-level global _discord (there is no
+            # self._notifier); route regime announcements through it.
+            self._regime_manager.discord_notify_cb = lambda msg: (
+                _discord.notify(msg) if _discord is not None and _discord.enabled else None
+            )
+        except Exception as e:
+            self._regime_manager = None
+            _log(f"[REGIME] init failed: {e}")
 
         # Initialize Discord notifications
         global _discord
@@ -5814,6 +5868,19 @@ class BacktestApp:
             self._run_evolution_check_after_report()
         except Exception as e:
             _log(f"evolution notify hook failed: [{type(e).__name__}] {e}")
+
+        # Regime mode (shadow). The report's "session" key is a metadata dict,
+        # not the DAY/NIGHT slot the manager keys on — inject the slot from the
+        # runner's _session_key() into a shallow copy before handing it over.
+        if getattr(self, "_regime_manager", None) is not None:
+            try:
+                regime_report = report
+                if self._live_runner is not None:
+                    regime_report = dict(report)
+                    regime_report["session"] = self._live_runner._session_key()[1]
+                self._regime_manager.on_daily_report(regime_report)
+            except Exception as e:
+                _log(f"[REGIME] Error: {e}")
 
     def _run_evolution_check_after_report(self) -> None:
         """Score the running bot and fire a Discord notification on improvement.
@@ -6892,6 +6959,7 @@ class BacktestApp:
             self._update_live_results()
             self._update_live_status()
             self._live_runner = None
+            self._regime_manager = None
             self._trading_guard.reset()
             _close_debug_log()
 

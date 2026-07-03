@@ -28,6 +28,10 @@ class RegimeResult:
     ema_50: float
     last_close: float
 
+    # EMA slope over the last 5 bars at the classify timeframe (points change).
+    # Used by the regime state machine / selector to read range-bound bias.
+    ema_slope: float = 0.0
+
     def to_dict(self) -> dict:
         return {
             "label": self.label,
@@ -41,7 +45,27 @@ class RegimeResult:
             "atr_ratio": round(self.atr_ratio, 4),
             "ema_50": round(self.ema_50, 2),
             "last_close": self.last_close,
+            "ema_slope": round(self.ema_slope, 4),
         }
+
+
+def _ema_series(values: list[float], period: int) -> list[float]:
+    """Full EMA series (one value per bar from the seed onward).
+
+    Mirrors ``src.strategy.indicators.ema`` — SMA seed over the first
+    ``period`` values, then the standard 2/(period+1) recurrence — but
+    keeps every intermediate value so the slope can be measured. The
+    last element equals ``ema(values, period)``.
+    """
+    if len(values) < period:
+        return []
+    multiplier = 2.0 / (period + 1)
+    result = sum(values[:period]) / period
+    series = [result]
+    for v in values[period:]:
+        result = (v - result) * multiplier + result
+        series.append(result)
+    return series
 
 
 def _classify_trend(adx_val: float) -> str:
@@ -120,6 +144,14 @@ def classify_regime(
     if ema_val is None:
         return None
 
+    # EMA slope: points change over the last 5 bars (index -1 vs -6). Falls
+    # back to a shorter span when the series has fewer than 6 EMA values.
+    ema_vals = _ema_series([float(c) for c in closes], ema_period)
+    if ema_vals:
+        ema_slope = ema_vals[-1] - ema_vals[-min(6, len(ema_vals))]
+    else:
+        ema_slope = 0.0
+
     # Compute ATR ratio: current vs average of trailing ATR values
     # We calculate ATR on progressively shorter slices to get a trailing series
     min_atr_len = atr_period + 1 + atr_avg_period
@@ -154,4 +186,5 @@ def classify_regime(
         atr_ratio=atr_ratio,
         ema_50=ema_val,
         last_close=last_close,
+        ema_slope=ema_slope,
     )
