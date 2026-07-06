@@ -4776,7 +4776,7 @@ class BacktestApp:
         s = self._settings
         dlg = tk.Toplevel(self.root)
         dlg.title("多空模式設定 Regime Mode Settings")
-        dlg.geometry("700x680")
+        dlg.geometry("700x780")
         dlg.transient(self.root)
         dlg.grab_set()
 
@@ -4859,6 +4859,18 @@ class BacktestApp:
             ttk.Label(stat_lf, textvariable=var, font=("Consolas", 9)).grid(
                 row=r, column=0, sticky=tk.W, pady=1)
 
+        classify_result_var = tk.StringVar(value="")
+        classify_result_lbl = ttk.Label(stat_lf, textvariable=classify_result_var,
+                                        font=("Consolas", 9), wraplength=620)
+        classify_result_lbl.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+
+        def _on_classify_now():
+            self._classify_regime_now(classify_result_var, eff_var, latest_var,
+                                      next_var, hist_tree, parent=dlg)
+
+        ttk.Button(stat_lf, text="立即分類 Classify Now",
+                   command=_on_classify_now).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+
         # ── Recent history ──
         hist_lf = ttk.LabelFrame(outer, text="最近歷史 Recent History (last 7 sessions)", padding=8)
         hist_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
@@ -4900,6 +4912,7 @@ class BacktestApp:
         """Fill the read-only status labels + history tree from the running
         RegimeManager. Best-effort: silently shows placeholders when no bot
         is running or the state/history files don't exist yet."""
+        hist_tree.delete(*hist_tree.get_children())
         mgr = getattr(self, "_regime_manager", None)
         if mgr is None:
             eff_var.set("有效狀態 Effective: — (尚未部署 no bot running)")
@@ -4956,6 +4969,118 @@ class BacktestApp:
         except Exception as e:
             _log(f"[REGIME] status populate failed: {e}")
             hist_tree.insert("", tk.END, values=("No history yet", "", "", "", "", "", ""))
+
+    def _classify_regime_now(self, result_var, eff_var, latest_var, next_var,
+                             hist_tree, parent=None):
+        """Run regime classification manually and display results."""
+        import glob as glob_mod
+        from datetime import datetime as _dt
+
+        # 1. Resolve bot_dir: prefer live runner, else scan data/live/ for most
+        #    recent session directory matching the current symbol.
+        bot_dir = None
+        mgr = getattr(self, "_regime_manager", None)
+        if mgr is not None:
+            bot_dir = mgr.bot_dir
+        elif self._live_runner and hasattr(self._live_runner, "bot_dir"):
+            bot_dir = self._live_runner.bot_dir
+        else:
+            symbol = self.symbol_var.get().strip() or "TX00"
+            base_dir = os.path.join(project_root, "data", "live")
+            if os.path.isdir(base_dir):
+                candidates = sorted(
+                    [d for d in glob_mod.glob(os.path.join(base_dir, f"{symbol}_*"))
+                     if os.path.isdir(d)],
+                    key=os.path.getmtime, reverse=True,
+                )
+                if candidates:
+                    bot_dir = candidates[0]
+
+        if not bot_dir or not os.path.isdir(bot_dir):
+            result_var.set("❌ 找不到交易資料目錄 No bot session directory found — "
+                           "deploy a live bot first or select a symbol with existing sessions.")
+            return
+
+        # 2. Run classification
+        try:
+            from src.daily_report.regime_classifier import classify_regime
+            from src.live.live_runner import load_1m_bars_from_csvs
+            from src.live.bar_aggregator import aggregate_bars
+            from src.regime.state_machine import RegimeStateMachine, RegimeConfig
+            from src.regime.selector import StrategySelector
+            from src.regime.store import save_state, append_history
+
+            symbol = os.path.basename(bot_dir).split("_")[0]
+            bars_1m = load_1m_bars_from_csvs(bot_dir, symbol)
+            if not bars_1m:
+                result_var.set("❌ 找不到 1 分 K 線資料 No 1-min bar CSV files found in "
+                               f"{bot_dir} — run a live session first to generate bar data.")
+                return
+
+            cfg = self._load_regime_config()
+            bars_htf = aggregate_bars(bars_1m, cfg.classify_interval)
+            if len(bars_htf) < 52:
+                result_var.set(f"❌ K 線資料不足 Only {len(bars_htf)} bars "
+                               f"(need ≥52) — run a longer live session.")
+                return
+
+            highs = [b.high for b in bars_htf]
+            lows = [b.low for b in bars_htf]
+            closes = [b.close for b in bars_htf]
+            regime_result = classify_regime(highs, lows, closes)
+            if regime_result is None:
+                result_var.set("❌ 分類失敗 Classification failed — insufficient data for indicators.")
+                return
+
+            # 3. Advance state machine + get recommendation
+            if mgr is not None:
+                state = mgr._state
+                machine = mgr._machine
+                selector = mgr._selector
+            else:
+                from src.regime.store import load_state
+                state_path = os.path.join(bot_dir, "regime_state.json")
+                state = load_state(state_path)
+                machine = RegimeStateMachine()
+                selector = StrategySelector()
+
+            session_date = _dt.now().strftime("%Y-%m-%d")
+            new_state = machine.step(state, regime_result, cfg, session_date)
+            rec = selector.select(new_state, cfg)
+
+            # 4. Persist
+            state_path = os.path.join(bot_dir, "regime_state.json")
+            hist_path = os.path.join(bot_dir, "regime_history.csv")
+            save_state(state_path, new_state, rec, session_date)
+            append_history(hist_path, session_date, new_state, rec)
+
+            if mgr is not None:
+                mgr._state = new_state
+
+            # 5. Display result
+            feat = regime_result.to_dict()
+            action_label = {"deploy_long": "做多 LONG", "deploy_short": "做空 SHORT",
+                            "deploy_short_half": "做空半倉 SHORT½",
+                            "sit_out": "觀望 SIT OUT", "hold": "維持 HOLD"}.get(rec.action, rec.action)
+            lines = [
+                f"✅ 分類完成 Classification complete — {session_date}",
+                f"   Raw: {new_state.raw_regime}  |  Effective: {new_state.effective_regime}",
+                f"   ADX={feat['adx']:.1f}  DI+={feat['plus_di']:.1f}  DI−={feat['minus_di']:.1f}  "
+                f"EMA slope={feat['ema_slope']:.1f}  ATR ratio={feat['atr_ratio']:.2f}",
+                f"   建議 Recommendation: {action_label}"
+                + (f" — {rec.strategy_name}" if rec.strategy_name else "")
+                + f"  ({rec.reason})",
+            ]
+            result_var.set("\n".join(lines))
+
+            # 6. Refresh the status labels + history tree
+            self._populate_regime_status(eff_var, latest_var, next_var, hist_tree)
+            self._update_regime_status()
+            _log(f"[REGIME] Manual classify: {new_state.raw_regime} → {new_state.effective_regime} → {rec.action}")
+
+        except Exception as e:
+            _log(f"[REGIME] classify_now failed: {e}")
+            result_var.set(f"❌ 分類錯誤 Classification error: {e}")
 
     def _save_regime_settings(self, vars_dict, parent=None) -> bool:
         """Validate + persist regime settings. Returns True on success.
