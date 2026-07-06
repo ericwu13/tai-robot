@@ -4783,6 +4783,11 @@ class BacktestApp:
         outer = ttk.Frame(dlg, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
 
+        # Button frame packed first (side=BOTTOM) so it stays visible
+        # even when the history treeview expands to fill remaining space.
+        btns = ttk.Frame(outer)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+
         # ── Enable ──
         enable_lf = ttk.LabelFrame(outer, text="啟用 Enable", padding=8)
         enable_lf.pack(fill=tk.X, pady=(0, 6))
@@ -4876,8 +4881,6 @@ class BacktestApp:
         self._populate_regime_status(eff_var, latest_var, next_var, hist_tree)
 
         # ── Bottom buttons ──
-        btns = ttk.Frame(outer)
-        btns.pack(fill=tk.X, pady=(4, 0))
         vars_dict = {
             "enabled": regime_enabled_var, "dry_run": regime_dry_run_var,
             "long_strategy": long_strat_var, "short_strategy": short_strat_var,
