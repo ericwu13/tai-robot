@@ -94,7 +94,7 @@ class RegimeManager:
     def _notify_discord(self, rec, session_date: str):
         if not callable(self.discord_notify_cb):
             return
-        tag = "🔄 DRY-RUN" if rec.dry_run else "⚡ AUTO"
+        tag = "🔄 DRY-RUN" if rec.dry_run else "⚡ AUTO (手動切換 manual switch required)"
         action_label = {"deploy_long": "做多 LONG", "deploy_short": "做空 SHORT",
                         "deploy_short_half": "做空半倉 SHORT½", "sit_out": "觀望 SIT OUT",
                         "hold": "維持 HOLD"}.get(rec.action, rec.action)
