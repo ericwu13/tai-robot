@@ -12,6 +12,7 @@ Usage:
 
 from version import APP_VERSION
 
+import logging
 import os
 import sys
 import inspect
@@ -550,6 +551,15 @@ def _log(msg):
             if threading.current_thread() is threading.main_thread():
                 _app.log_text.insert(tk.END, line + "\n")
                 _app.log_text.see(tk.END)
+        except Exception:
+            pass
+
+
+class _AppLogHandler(logging.Handler):
+    """Routes Python logging records into the app's _log() function."""
+    def emit(self, record):
+        try:
+            _log(self.format(record))
         except Exception:
             pass
 
@@ -5364,6 +5374,13 @@ class BacktestApp:
             from src.regime.manager import RegimeManager
             regime_cfg = self._load_regime_config()
             self._regime_manager = RegimeManager(self._live_runner.bot_dir, regime_cfg)
+            # Route regime's standard-logging records into the app's _log().
+            regime_logger = logging.getLogger("src.regime")
+            if not any(isinstance(h, _AppLogHandler) for h in regime_logger.handlers):
+                handler = _AppLogHandler()
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                regime_logger.addHandler(handler)
+                regime_logger.setLevel(logging.DEBUG)
             # Discord uses the module-level global _discord (there is no
             # self._notifier); route regime announcements through it.
             self._regime_manager.discord_notify_cb = lambda msg: (
