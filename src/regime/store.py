@@ -8,17 +8,24 @@
 
 import csv
 import json
+import logging
 import os
 
 from .state_machine import RegimeState
 from .selector import Recommendation
 
+logger = logging.getLogger(__name__)
+
 
 def load_state(path: str) -> RegimeState:
     if not os.path.exists(path):
         return RegimeState()
-    with open(path, encoding="utf-8") as f:
-        d = json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("[REGIME] Corrupted state file %s — resetting to default", path)
+        return RegimeState()
     s = RegimeState()
     for k, v in d.items():
         if hasattr(s, k):
@@ -38,6 +45,8 @@ def save_state(path: str, state: RegimeState, rec: Recommendation, session_date:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
