@@ -63,16 +63,29 @@ class RegimeManager:
             session_date = session_key[0]
             self._state = self._machine.step(self._state, result, self.cfg, session_date)
             rec = self._selector.select(self._state, self.cfg)
-            save_state(self._state_path, self._state, rec, session_date)
-            append_history(self._hist_path, session_date, self._state, rec)
-            # Consume manual override (one-shot)
-            if self._state.manual_override != "auto":
-                self._state.manual_override = "auto"
-                save_state(self._state_path, self._state, rec, session_date)
-            self._notify_discord(rec, session_date)
-            logger.info(f"[REGIME] {session_date}: {self._state.raw_regime} → {self._state.effective_regime} → {rec.action} ({rec.strategy_name})")
         except Exception as e:
-            logger.exception(f"[REGIME] Error in on_daily_report: {e}")
+            logger.exception(f"[REGIME] Error in on_daily_report (classify): {e}")
+            return
+
+        try:
+            save_state(self._state_path, self._state, rec, session_date)
+        except Exception as e:
+            logger.exception(f"[REGIME] Error saving state: {e}")
+
+        try:
+            append_history(self._hist_path, session_date, self._state, rec)
+        except Exception as e:
+            logger.exception(f"[REGIME] Error appending history: {e}")
+
+        if self._state.manual_override != "auto":
+            self._state.manual_override = "auto"
+            try:
+                save_state(self._state_path, self._state, rec, session_date)
+            except Exception as e:
+                logger.exception(f"[REGIME] Error saving state (override reset): {e}")
+
+        self._notify_discord(rec, session_date)
+        logger.info(f"[REGIME] {session_date}: {self._state.raw_regime} → {self._state.effective_regime} → {rec.action} ({rec.strategy_name})")
 
     def _get_regime_result(self) -> RegimeResult | None:
         try:
