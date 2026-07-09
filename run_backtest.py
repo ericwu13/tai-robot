@@ -57,7 +57,7 @@ from src.backtest.broker import _mode_to_source
 
 # Trade.source → display label for the Trades tab and exports
 _SOURCE_LABELS = {"real": "實單 Real", "paper": "模擬 Paper", "backtest": "回測 BT"}
-from src.backtest.report import format_report, export_trades_csv
+from src.backtest.report import format_report, export_trades_csv, live_trading_period
 from src.backtest.metrics import calculate_metrics
 from src.backtest.strategy import BacktestStrategy
 from src.backtest.chart import plot_backtest, LiveChart, _LWC_AVAILABLE
@@ -3049,13 +3049,26 @@ class BacktestApp:
         source = self._data_source or "unknown"
         header_lines = [f" 商品 Symbol:  {symbol}", f" 資料來源 Source:  {source}"]
         if bars:
-            # For live mode, show only live-trading range (exclude warmup history)
             is_live = self._live_runner and self._live_runner.state != LiveState.IDLE
             if is_live:
                 live_bars = self._live_runner.get_live_bars()
+                # Range = the session's full trading period. A resumed session
+                # holds trades from long before this process started, so the
+                # period comes from started_at + trade history, not the bars
+                # currently in memory (issue: report showed only post-restart
+                # range while metrics covered months of restored trades).
+                period = live_trading_period(
+                    self._live_runner.started_at,
+                    result.trades,
+                    (live_bars[-1].dt.strftime("%Y-%m-%d %H:%M")
+                     if live_bars else None),
+                )
+                if period:
+                    header_lines.append(
+                        f" 資料範圍 Range:  {period[0]} ~ {period[1]}")
                 if live_bars:
                     header_lines.append(
-                        f" 資料範圍 Range:  {live_bars[0].dt.strftime('%Y-%m-%d %H:%M')} ~ "
+                        f" 本次連線 Live:  {live_bars[0].dt.strftime('%Y-%m-%d %H:%M')} ~ "
                         f"{live_bars[-1].dt.strftime('%Y-%m-%d %H:%M')}")
                     header_lines.append(
                         f" K棒數量 Bars:  {len(live_bars)} 即時 live + "
