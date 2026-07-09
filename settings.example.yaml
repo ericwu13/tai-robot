@@ -91,3 +91,33 @@ evolution:
   # cut rolls forward each cycle — this week's holdout becomes next week's
   # design data.
   holdout_days: 14
+
+# ── Regime mode (shadow — Phase 1) ─────────────────────────────────────
+# Advisory only. Each NIGHT session the bot classifies the market regime
+# (ADX/ATR/EMA on `classify_interval`-second bars), advances a hysteresis
+# state machine, and logs + announces a strategy recommendation. It NEVER
+# auto-deploys while dry_run is true — Phase 1 is observe-and-recommend.
+regime:
+  enabled: false
+  dry_run: true
+  # Strategy names (store display names) to recommend per direction.
+  long_strategy: ""
+  short_strategy: ""
+  # ADX thresholds: enter a trend regime above adx_enter, fall back to
+  # range-bound below adx_exit; the 20–25 dead zone is "transitional".
+  adx_enter: 25.0
+  adx_exit: 20.0
+  # Sessions the raw regime must persist before the effective regime flips
+  # (ADX > 30 fast-tracks a flip after a single session).
+  confirm_sessions: 2
+  # ATR ratio (current / 20-period avg) above which a vol spike forces SIT OUT.
+  vol_spike_ratio: 1.5
+  # In range-bound with a bearish EMA/direction bias: "sit_out" or "short_half".
+  range_bias_action: "sit_out"
+  # After max_flips regime changes within flip_window sessions, pause
+  # recommendations (HOLD) for pause_sessions sessions.
+  max_flips: 3
+  flip_window: 10
+  pause_sessions: 5
+  # Higher-timeframe classification interval, in seconds (3600 = 1h).
+  classify_interval: 3600
