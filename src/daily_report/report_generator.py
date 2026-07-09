@@ -146,6 +146,18 @@ def generate_daily_report(
         real_eq = _build_equity_curve(real_trades)
         real_summary = _metrics_to_dict(calculate_metrics(real_trades, real_eq, initial_balance=0))
 
+    # Per-strategy breakdown (useful for regime switching bots)
+    by_strategy: dict[str, list] = {}
+    for t in trades:
+        strat = getattr(t, "strategy", "") or strategy_name
+        by_strategy.setdefault(strat, []).append(t)
+    per_strategy = {}
+    if len(by_strategy) > 1:
+        for sname, strades in by_strategy.items():
+            seq = _build_equity_curve(strades)
+            sm = calculate_metrics(strades, seq, initial_balance=0)
+            per_strategy[sname] = _metrics_to_dict(sm)
+
     report = {
         "date": date,
         "symbol": symbol,
@@ -166,12 +178,14 @@ def generate_daily_report(
         "paper_summary": paper_summary,
         "real_trades": [_trade_to_dict(t, point_value) for t in real_trades],
         "real_summary": real_summary,
+        "per_strategy": per_strategy,
         "market_regime": regime.to_dict() if regime else None,
     }
 
     if save:
         _REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        path = _REPORTS_DIR / f"{date}.json"
+        suffix = f"_{bot_name}" if bot_name else ""
+        path = _REPORTS_DIR / f"{date}{suffix}.json"
         path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
     return report
@@ -280,8 +294,12 @@ def generate_session_report(
     )
 
 
-def load_report(date: str) -> dict | None:
+def load_report(date: str, bot_name: str = "") -> dict | None:
     """Load a previously saved daily report. Returns None if not found."""
+    if bot_name:
+        path = _REPORTS_DIR / f"{date}_{bot_name}.json"
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     path = _REPORTS_DIR / f"{date}.json"
     if not path.exists():
         return None
