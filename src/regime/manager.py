@@ -16,7 +16,7 @@ from src.live.live_runner import load_1m_bars_from_csvs
 from src.live.bar_aggregator import aggregate_bars
 from .state_machine import RegimeStateMachine, RegimeState, RegimeConfig
 from .selector import StrategySelector
-from .store import load_state, save_state, append_history, backfill_pnl
+from .store import load_state, save_state, append_history
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +37,15 @@ class RegimeManager:
         self.cfg = cfg
 
     def on_daily_report(self, report: dict):
-        """Called from _on_live_daily_report (Tk thread) after every session report."""
+        """Called from _on_live_daily_report (Tk thread) after every session report.
+
+        P&L backfill is retired — the switching runner records session
+        P&L directly via record_session_result(). This method now only
+        classifies on NIGHT sessions.
+        """
         if not self.cfg.enabled:
             return
         session_key = (report.get("date", ""), report.get("session", ""))
-        pnl = report.get("summary", {}).get("total_pnl", None)
-        # Always backfill P&L for previous row
-        if pnl is not None:
-            try:
-                backfill_pnl(self._hist_path, session_key[0], float(pnl),
-                             int(report.get("summary", {}).get("total_trades", 0)))
-            except Exception:
-                pass
 
         # Only classify on NIGHT session and only once per session
         if session_key[1] != "NIGHT" or session_key == self._last_session_key:
