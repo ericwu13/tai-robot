@@ -258,6 +258,37 @@ class RegimeSwitchingRunner(LiveRunner):
         except Exception:
             pass
 
+    # ── Daily report (override) ──
+
+    def _generate_daily_report(self) -> None:
+        """Inject regime status into the daily report."""
+        try:
+            key = self._session_key()
+            if key == self._last_report_session:
+                return
+            self._last_report_session = key
+
+            from ..daily_report.report_generator import generate_session_report
+            report = generate_session_report(
+                broker=self.broker,
+                data_store=self.data_store,
+                strategy_name=self.strategy_display_name,
+                strategy_params=getattr(self.strategy, "params", None),
+                point_value=self.point_value,
+                symbol=self.symbol,
+                bot_name=self.bot_name,
+                started_at=self._started_at,
+            )
+            if report is not None:
+                report["regime_switching"] = {
+                    "active_leg": self._active_leg,
+                    "long_strategy": self._long_strategy_name,
+                    "short_strategy": self._short_strategy_name,
+                }
+                self._emit("on_daily_report", report)
+        except Exception:
+            pass
+
     # ── Stop (override) ──
 
     def stop(self):

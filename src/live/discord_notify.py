@@ -267,4 +267,17 @@ class DiscordNotifier:
                 f"市場狀態: {regime.get('label', '?')} "
                 f"(ADX {regime.get('adx', 0):.1f})"
             )
+        # Per-strategy P&L breakdown (regime switching bots)
+        per_strategy = report.get("per_strategy") or {}
+        if per_strategy:
+            parts = []
+            for sname, smetrics in per_strategy.items():
+                parts.append(f"  {sname}: {smetrics.get('total_trades', 0)} 筆, "
+                             f"P&L {smetrics.get('total_pnl', 0):+,}")
+            lines.append("策略別 Per-strategy:\n" + "\n".join(parts))
+        # Regime switching status
+        regime_sw = report.get("regime_switching")
+        if regime_sw:
+            leg = regime_sw.get("active_leg", "?")
+            lines.append(f"🔄 多空切換 Regime: {leg}")
         self._send("\n".join(lines))
