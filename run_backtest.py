@@ -6387,20 +6387,9 @@ class BacktestApp:
         except Exception as e:
             _log(f"evolution notify hook failed: [{type(e).__name__}] {e}")
 
-        # Regime mode (shadow). The report's "session" key is a metadata dict,
-        # not the DAY/NIGHT slot the manager keys on — inject the slot from the
-        # runner's _session_key() into a shallow copy before handing it over.
-        if getattr(self, "_regime_manager", None) is not None:
-            try:
-                regime_report = report
-                if self._live_runner is not None:
-                    regime_report = dict(report)
-                    regime_report["session"] = self._live_runner._session_key()[1]
-                self._regime_manager.on_daily_report(regime_report)
-            except Exception as e:
-                _log(f"[REGIME] Error: {e}")
-        # Refresh the live-tab regime indicator (safe whether or not a
-        # manager exists — it falls back to the disabled label).
+        # Regime classification is now driven by the switching runner's
+        # wall-clock poll (classify_session), not by the daily report.
+        # Refresh the live-tab regime indicator.
         self.root.after(0, self._update_regime_status)
 
     def _run_evolution_check_after_report(self) -> None:
