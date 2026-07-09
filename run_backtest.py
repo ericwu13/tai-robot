@@ -5182,6 +5182,19 @@ class BacktestApp:
         """Refresh the live-tab regime status line from settings + manager."""
         if not hasattr(self, "live_regime_var"):
             return
+        # Regime switching runner: show active leg
+        runner = getattr(self, "_live_runner", None)
+        if runner is not None and hasattr(runner, 'get_regime_status'):
+            try:
+                rs = runner.get_regime_status()
+                leg = rs.get("active_leg", "idle")
+                leg_map = {"long": "做多 LONG", "short": "做空 SHORT", "idle": "閒置 IDLE"}
+                leg_label = leg_map.get(leg, leg)
+                pending = " ⏳待套用 pending" if rs.get("pending_recommendation") else ""
+                self.live_regime_var.set(f"[Regime] {leg_label}{pending}")
+            except Exception:
+                self.live_regime_var.set("[Regime] 切換中 Switching")
+            return
         if not self._settings.get("regime_enabled", False):
             self.live_regime_var.set("[Regime] 停用 disabled")
             return
@@ -5238,8 +5251,14 @@ class BacktestApp:
         self.trading_mode_var.set(combo_label)
         self.mode_combo.config(state="readonly")
 
+        # Detect regime deploy (settings or resume)
+        regime_cfg = self._load_regime_config()
+        is_regime_deploy = regime_cfg.enabled
+        if resume_session and resume_session.get("regime_mode"):
+            is_regime_deploy = True
+
         # If resuming, restore strategy + symbol from saved session
-        if resume_session:
+        if resume_session and not is_regime_deploy:
             saved_strategy = resume_session.get("strategy", "")
             saved_symbol = resume_session.get("symbol", "")
 
@@ -5294,12 +5313,29 @@ class BacktestApp:
             saved_pv = resume_session.get("point_value")
             if saved_pv:
                 self.pv_var.set(str(saved_pv))
+        elif resume_session:
+            # Regime resume: skip strategy mismatch dialog, just restore point_value
+            saved_pv = resume_session.get("point_value")
+            if saved_pv:
+                self.pv_var.set(str(saved_pv))
 
-        # Re-read strategy after potential update from session
-        strategy_cls = STRATEGIES.get(self.strategy_var.get())
-        if not strategy_cls:
-            self.status_var.set("請選擇策略 Select a strategy")
-            return
+        # Resolve strategy class
+        if is_regime_deploy:
+            from src.regime.switch_logic import validate_leg_strategies
+            errors = validate_leg_strategies(
+                regime_cfg.long_strategy, regime_cfg.short_strategy, STRATEGIES)
+            if errors:
+                messagebox.showerror(
+                    "多空切換設定錯誤 Regime Config Error",
+                    "\n".join(errors))
+                return
+            strategy_cls = STRATEGIES[regime_cfg.long_strategy]
+        else:
+            # Re-read strategy after potential update from session
+            strategy_cls = STRATEGIES.get(self.strategy_var.get())
+            if not strategy_cls:
+                self.status_var.set("請選擇策略 Select a strategy")
+                return
 
         # Check for lock conflict (another instance using the same bot name)
         symbol = self.symbol_var.get().strip()
@@ -5357,11 +5393,25 @@ class BacktestApp:
         strategy = strategy_cls()
 
         log_dir = os.path.join(project_root, "data", "live")
-        self._live_runner = LiveRunner(
-            strategy, symbol, point_value=point_value,
-            log_dir=log_dir, bot_name=bot_name,
-            strategy_display_name=self.strategy_var.get(),
-        )
+        if is_regime_deploy:
+            from src.live.regime_switching_runner import RegimeSwitchingRunner
+            self._live_runner = RegimeSwitchingRunner(
+                strategy, symbol, point_value=point_value,
+                log_dir=log_dir, bot_name=bot_name,
+                strategy_display_name="Regime 切換 Switching",
+                regime_cfg=regime_cfg,
+                long_strategy_name=regime_cfg.long_strategy,
+                short_strategy_name=regime_cfg.short_strategy,
+                strategies_registry=STRATEGIES,
+            )
+            self._regime_manager = self._live_runner.regime_manager
+        else:
+            self._live_runner = LiveRunner(
+                strategy, symbol, point_value=point_value,
+                log_dir=log_dir, bot_name=bot_name,
+                strategy_display_name=self.strategy_var.get(),
+            )
+            self._regime_manager = None
         self._live_runner.acquire_lock()
         self._live_runner.trading_mode = trading_mode
         self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
@@ -5376,29 +5426,14 @@ class BacktestApp:
         # Open debug log file in bot directory
         _open_debug_log(self._live_runner.bot_dir)
 
-        # Regime manager (shadow mode — Phase 1). Reads config from settings;
-        # stays inert unless regime.enabled is True. Never auto-deploys —
-        # it only logs and (optionally) announces a recommendation.
-        try:
-            from src.regime.manager import RegimeManager
-            regime_cfg = self._load_regime_config()
-            self._regime_manager = RegimeManager(self._live_runner.bot_dir, regime_cfg)
-            # Route regime's standard-logging records into the app's _log().
+        # Route regime logging into the app's _log()
+        if self._regime_manager is not None:
             regime_logger = logging.getLogger("src.regime")
             if not any(isinstance(h, _AppLogHandler) for h in regime_logger.handlers):
                 handler = _AppLogHandler()
                 handler.setFormatter(logging.Formatter("%(message)s"))
                 regime_logger.addHandler(handler)
                 regime_logger.setLevel(logging.DEBUG)
-            # Discord uses the module-level global _discord (there is no
-            # self._notifier); route regime announcements through it.
-            self._regime_manager.discord_notify_cb = lambda msg: (
-                _discord.notify(msg) if _discord is not None and _discord.enabled else None
-            )
-        except Exception as e:
-            self._regime_manager = None
-            _log(f"[REGIME] init failed: {e}")
-        self._update_regime_status()
 
         # Initialize Discord notifications
         global _discord
@@ -5413,6 +5448,13 @@ class BacktestApp:
                 mode={"paper": "模擬", "semi_auto": "半自動", "auto": "全自動"}.get(trading_mode, trading_mode),
             )
             _log(f"Discord 通知已啟用 Discord notifications enabled")
+
+        # Route regime announcements through Discord
+        if self._regime_manager is not None:
+            self._regime_manager.discord_notify_cb = lambda msg: (
+                _discord.notify(msg) if _discord is not None and _discord.enabled else None
+            )
+        self._update_regime_status()
 
         # Debug: log resolved order symbol and query stock list
         order_sym = resolve_order_symbol(symbol)
@@ -5496,15 +5538,23 @@ class BacktestApp:
         self.btn_deploy.config(text="停止機器人 Stop Bot")
         self.symbol_combo.config(state=tk.DISABLED)
         self.strategy_combo.config(state=tk.DISABLED)
+        if is_regime_deploy:
+            self.strategy_var.set("Regime 切換 Switching")
         self.chart_tf_combo.config(state="readonly")
         self.chart_tf_var.set("Native")
         self._update_manual_order_buttons()
 
         mode_labels = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto", "auto": "全自動 Auto"}
         mode_label = mode_labels.get(trading_mode, trading_mode)
-        self._live_log_msg(
-            f"部署中 Deploying: {strategy.name} on {symbol} [{bot_name}] "
-            f"模式={mode_label}", "status")
+        if is_regime_deploy:
+            self._live_log_msg(
+                f"部署中 Deploying: Regime Switching [{bot_name}] on {symbol} "
+                f"模式={mode_label} (Long={regime_cfg.long_strategy}, Short={regime_cfg.short_strategy})",
+                "status")
+        else:
+            self._live_log_msg(
+                f"部署中 Deploying: {strategy.name} on {symbol} [{bot_name}] "
+                f"模式={mode_label}", "status")
         _log(f"部署即時機器人 Deploying live bot: {strategy.name} on {symbol} [{bot_name}] mode={trading_mode}")
 
         if trading_mode == "semi_auto":
@@ -5757,7 +5807,18 @@ class BacktestApp:
         self._check_session_end_close()
         self._check_session_end_report()
         self._check_weekly_evolution()
+        self._check_regime_poll()
         self._live_poll_id = self.root.after(30000, self._schedule_status_update)
+
+    def _check_regime_poll(self):
+        """Run regime orchestration poll for RegimeSwitchingRunner bots."""
+        if not hasattr(self._live_runner, 'on_status_poll'):
+            return
+        try:
+            self._live_runner.on_status_poll()
+            self._update_regime_status()
+        except Exception as e:
+            _log(f"[REGIME] on_status_poll error: {e}")
 
     _SESSION_END_CLOSE_MINUTES = 2          # normal session: close 2 min before
     _SETTLEMENT_END_CLOSE_MINUTES = 5       # settlement day: close 5 min before
@@ -5909,6 +5970,9 @@ class BacktestApp:
     def _check_weekly_evolution(self):
         """Run the weekly auto-evolution AFTER the Saturday close.
 
+        Disabled for regime switching bots — baseline tracks
+        ``type(runner.strategy)`` which chases whichever leg is active.
+
         Post-close (≥ 05:05 TPE Saturday) is deliberate: the session-end
         force-close and final daily report are done, the market is
         quiet, and the week's data is complete. Latched per ISO week so
@@ -5918,6 +5982,8 @@ class BacktestApp:
         if not self._settings.get("evolution_auto_pipeline", True):
             return
         if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        if hasattr(self._live_runner, 'on_status_poll'):
             return
         from src.evolution.notify import is_post_close_evolution_window
         if not is_post_close_evolution_window():
@@ -6401,6 +6467,8 @@ class BacktestApp:
         the only correct call site is the daily-report callback.
         """
         if self._live_runner is None:
+            return
+        if hasattr(self._live_runner, 'on_status_poll'):
             return
         broker = getattr(self._live_runner, "broker", None)
         if broker is None:
