@@ -1178,16 +1178,11 @@ class LiveRunner:
     def _session_key(self) -> tuple[str, str]:
         """Return ``(YYYY-MM-DD, "DAY"|"NIGHT")`` for the current TPE moment.
 
-        DAY covers 08:45 ≤ hh:mm < 13:46 — one extra minute past the
-        13:45 close so a poll at 13:45:30 still classifies as DAY.
-        Everything else is NIGHT — the night session straddles midnight
-        (15:00–05:00 TPE), so "not DAY" is the correct partition.
+        Delegates to :func:`src.regime.switch_logic.session_slot` so the
+        session-boundary definition is shared with the switching runner.
         """
-        now = _taipei_now()
-        minutes = now.hour * 60 + now.minute
-        # 525 = 08:45, 826 = 13:46 (one minute past day-session close).
-        slot = "DAY" if 525 <= minutes < 826 else "NIGHT"
-        return (now.strftime("%Y-%m-%d"), slot)
+        from ..regime.switch_logic import session_slot
+        return session_slot()
 
     def _generate_daily_report(self) -> None:
         """Generate a daily report after session stop (best-effort).
@@ -1233,6 +1228,9 @@ class LiveRunner:
         # restored open keeps its persisted entry_strategy (regime mode:
         # the previous deploy may have run a different strategy).
         self.broker.strategy_label = self.strategy_display_name
+        # from_dict does not restore trade_source; re-set it from the
+        # current trading_mode so resumed sessions tag trades correctly.
+        self.broker.trade_source = _mode_to_source(self.trading_mode)
         self._bar_index = session_data.get("bar_index", 0)
         self._started_at = session_data.get("started_at", self._started_at)
         return len(self.broker.trades)

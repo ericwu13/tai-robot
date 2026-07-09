@@ -1406,3 +1406,45 @@ class TestBlockedSignalLog:
         assert len(emitted) == 1
         assert emitted[0]["action"] == "SIGNAL_BLOCKED"
         assert emitted[0]["bar_dt"] is not None
+
+
+class TestRestoreSessionTradeSource:
+    """restore_session must re-set trade_source from the current trading_mode."""
+
+    def test_trade_source_restored_after_resume(self, tmp_path):
+        strategy = AlwaysLongStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        runner.trading_mode = "semi_auto"
+        runner.broker.trade_source = "real"
+        runner.state = LiveState.RUNNING
+
+        # Simulate a saved session (from_dict does NOT restore trade_source)
+        saved = runner.broker.to_dict()
+        session_data = {"broker": saved, "bar_index": 5}
+
+        # Before fix, trade_source would be "" after from_dict
+        runner.restore_session(session_data)
+        assert runner.broker.trade_source == "real"
+
+    def test_trade_source_paper_mode(self, tmp_path):
+        strategy = AlwaysLongStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        runner.trading_mode = "paper"
+
+        saved = runner.broker.to_dict()
+        runner.restore_session({"broker": saved, "bar_index": 0})
+        assert runner.broker.trade_source == "paper"
+
+
+class TestSessionKeyDelegation:
+    """_session_key delegates to switch_logic.session_slot."""
+
+    def test_session_key_returns_tuple(self, tmp_path):
+        strategy = AlwaysLongStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        key = runner._session_key()
+        assert isinstance(key, tuple)
+        assert len(key) == 2
+        date_str, slot = key
+        assert slot in ("DAY", "NIGHT")
+        assert len(date_str) == 10  # YYYY-MM-DD

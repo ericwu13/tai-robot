@@ -5032,7 +5032,6 @@ class BacktestApp:
             from src.live.bar_aggregator import aggregate_bars
             from src.regime.state_machine import RegimeStateMachine, RegimeConfig
             from src.regime.selector import StrategySelector
-            from src.regime.store import save_state, append_history
 
             symbol = os.path.basename(bot_dir).split("_")[0]
             bars_1m = load_1m_bars_from_csvs(bot_dir, symbol)
@@ -5056,9 +5055,10 @@ class BacktestApp:
                 result_var.set("❌ 分類失敗 Classification failed — insufficient data for indicators.")
                 return
 
-            # 3. Advance state machine + get recommendation
+            # 3. Preview: advance a COPY of the state machine (read-only)
+            import copy
             if mgr is not None:
-                state = mgr._state
+                state = copy.deepcopy(mgr._state)
                 machine = mgr._machine
                 selector = mgr._selector
             else:
@@ -5072,16 +5072,11 @@ class BacktestApp:
             new_state = machine.step(state, regime_result, cfg, session_date)
             rec = selector.select(new_state, cfg)
 
-            # 4. Persist
-            state_path = os.path.join(bot_dir, "regime_state.json")
-            hist_path = os.path.join(bot_dir, "regime_history.csv")
-            save_state(state_path, new_state, rec, session_date)
-            append_history(hist_path, session_date, new_state, rec)
+            # Preview only — do NOT persist or mutate the live state.
+            # The switching runner's wall-clock trigger handles real
+            # classification; this button shows what WOULD be classified.
 
-            if mgr is not None:
-                mgr._state = new_state
-
-            # 5. Display result
+            # 4. Display result
             feat = regime_result.to_dict()
             action_label = {"deploy_long": "做多 LONG", "deploy_short": "做空 SHORT",
                             "deploy_short_half": "做空半倉 SHORT½",
