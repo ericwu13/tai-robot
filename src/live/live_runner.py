@@ -404,6 +404,11 @@ class LiveRunner:
         # has been sent.
         self.mode_switch_veto: Callable[[], str | None] | None = None
 
+        # Regime switching: when True, strategy.on_bar is skipped but
+        # DataStore/HTF/bar_index/CSV logging all continue. Distinct
+        # from suppress_strategy (cleared on every reconnect replay).
+        self.regime_idle: bool = False
+
         # Daily-report dedupe key: (date_str, "DAY"|"NIGHT") of the last
         # session for which a report was emitted. Prevents the 30s
         # session-end poll from re-firing within the same close window
@@ -550,6 +555,62 @@ class LiveRunner:
         if self.on_mode_changed:
             self.on_mode_changed(old, new_mode)
         self._auto_save_session()
+
+    # ── Strategy swap (regime switching) ──
+
+    def swap_strategy(
+        self, new_strategy: BacktestStrategy, display_name: str
+    ) -> tuple[bool, str]:
+        """Replace the active strategy in-place. Returns (ok, reason).
+
+        Refuses unless the broker is flat, no external veto, not in
+        replay, and the new strategy shares the same timeframe.
+        """
+        # Gate 1: flat
+        if self.broker.has_open_position():
+            return False, "open position exists"
+        # Gate 2: external veto (fill_pending / poller active)
+        if self.mode_switch_veto is not None:
+            reason = self.mode_switch_veto()
+            if reason:
+                return False, reason
+        # Gate 3: not in replay
+        if self.suppress_strategy or self._is_reloading:
+            return False, "in replay/reload window"
+        # Gate 4: same timeframe
+        new_kt = new_strategy.kline_type
+        new_km = new_strategy.kline_minute
+        if (new_kt, new_km) != (self.strategy.kline_type, self.strategy.kline_minute):
+            return False, f"timeframe mismatch: ({new_kt},{new_km}) vs ({self.strategy.kline_type},{self.strategy.kline_minute})"
+        # Gate 5: enough bars
+        if new_strategy.required_bars() > len(self.data_store):
+            return False, f"insufficient bars: need {new_strategy.required_bars()}, have {len(self.data_store)}"
+
+        # Atomic swap
+        self.strategy = new_strategy
+        self.strategy_display_name = display_name
+        self.broker.strategy_label = display_name
+        # Clear stale orders from the outgoing strategy
+        self.broker._pending_entries.clear()
+        self.broker._pending_exits.clear()
+        self.broker._pending_market_closes.clear()
+        # Ensure HTF intervals are registered
+        new_htf = list(getattr(new_strategy, "htf_intervals", []) or [])
+        for iv in new_htf:
+            if iv not in self._htf_aggregators:
+                self.data_store._register_htf(iv)
+                agg = BarAggregator(self.symbol, iv)
+                self._htf_aggregators[iv] = agg
+                for b in self._aggregated_bars:
+                    completed = agg.on_bar(b)
+                    if completed is not None:
+                        self.data_store._add_htf_bar(iv, completed)
+        self._htf_intervals = new_htf
+        self._htf_required = new_strategy.htf_required_bars() or {}
+
+        self._auto_save_session()
+        self._emit("on_status", f"[SWAP] strategy → {display_name}")
+        return True, ""
 
     # ── Callback system ──
 
@@ -814,8 +875,8 @@ class LiveRunner:
         idx = self._bar_index
         self._bar_index += 1
 
-        # During history catchup, only build bar state — no trading
-        if self.suppress_strategy:
+        # During history catchup or regime idle, only build bar state — no trading
+        if self.suppress_strategy or self.regime_idle:
             return
 
         ctx = self.broker.context
