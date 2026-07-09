@@ -56,7 +56,7 @@ python test_kline.py       # COM-based KLine history GUI
 - No pandas/numpy - indicators use pure Python
 - settings.yaml is NEVER committed (contains credentials)
 - SDK directory (CapitalAPI_2.13.57/) is gitignored (large binaries)
-- Test count: 754 tests (as of v2.5.7)
+- Test count: 1483 tests (as of v2.14.0-regime-phase3)
 
 ## COM Tick History Replay (CRITICAL — issue #50)
 - After `RequestTicks`, COM replays historical ticks before sending live ticks
@@ -87,6 +87,20 @@ python test_kline.py       # COM-based KLine history GUI
 - `feed_warmup_bars()` seeds `_seen_1m_dts` for 1-min strategies to prevent duplicates
 - COM warmup API does NOT return bars for the currently in-progress trading session
 - Without the merge, the live chart had a ~10-hour gap between warmup end and first live bar
+
+## Regime Switching (Phase 3)
+- `RegimeSwitchingRunner(LiveRunner)`: bot type 2, classifies regime per NIGHT session, swaps long/short strategies at session boundaries
+- `session_slot(now)`: pure function → (YYYY-MM-DD, "DAY"|"NIGHT"), DAY=08:45-13:46
+- `in_closed_gap(now)`: True during gaps between sessions (when swaps can be applied)
+- `swap_strategy(new_strategy, display_name)`: 5 safety gates (flat, no veto, not in replay, same timeframe, sufficient bars)
+- `regime_idle`: separate from `suppress_strategy` — suppresses trading but keeps DataStore/CSV flowing
+- On-disk dedup: `state.last_assessed = "date|NIGHT"` prevents double-classification across restarts
+- `record_session_result()`: writes P&L from switching runner's own broker (replaces retired `backfill_pnl`)
+- History v2 schema: 4 new columns (strategy_active, applied, applied_at, trading_mode)
+- Deploy: `_deploy_live` branches on `regime.enabled` to construct `RegimeSwitchingRunner` vs `LiveRunner`
+- Evolution disabled for regime bots (`hasattr(runner, 'on_status_poll')` duck-typing gate)
+- Report files namespaced: `{date}_{bot_name}.json` to avoid collision between concurrent bots
+- Daily report includes `per_strategy` breakdown and `regime_switching` section for Discord
 
 ## AI Code Generation
 - Indicators return named tuples: `BollingerResult(upper, middle, lower)`, `MacdResult(macd_line, signal_line, histogram)`, `StochasticResult(k, d)` — both `bb.middle` and `upper, mid, lower = bb` work
