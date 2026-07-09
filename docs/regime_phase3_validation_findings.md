@@ -1,0 +1,82 @@
+# Regime Phase 3 — Validation Findings (pick-up-later checkpoint)
+
+**Status:** Investigation + adversarial validation of the "RegimeSwitchingRunner" plan.
+Captured 2026-07-08. Workflow run id `wf_da0902d8-5f2` (resume task `wkuabqhmx`).
+Model: Fable 5 (validation) → Opus 4.8 assigned for implementation.
+
+## User directive (DECIDED — not an open question)
+Regime mode becomes a **deploy-time mode of the bot itself**, not a background sidecar:
+- Deploy, regime **off** → single-strategy bot (today's #1), unchanged.
+- Deploy, regime **on** → the bot **is** the switching bot. `trading_mode = paper` → **Shadow #2**; `trading_mode = real (semi_auto/auto)` → **Live #2**. Same engine, broker selected by mode.
+- The v2.13.0 advisory-sidecar arrangement (RegimeManager piggybacking on a plain bot's daily report + backfilling the deployed bot's P&L) is **RETIRED** — not kept as a parallel product mode. Its classifier/state-machine/selector are **kept** as the switching engine's brain.
+
+## Progress
+- **Phase 1 Understand: 7/7 subsystem maps complete** (cached).
+- **Phase 2 Validate: 7/8 verdicts complete** (C5 concurrency failed on session limit; being re-run).
+- **Phase 3 Design: not started** (draft + 3 critics + final synthesis pending re-run).
+- Raw agent transcripts: `.claude/projects/.../subagents/workflows/wf_da0902d8-5f2/agent-*.jsonl`
+- To resume: `Workflow({scriptPath: ".../workflows/scripts/validate-regime-phase3-wf_da0902d8-5f2.js", resumeFromRunId: "wf_da0902d8-5f2"})` — completed agents return from cache.
+
+---
+
+## Verdict summary
+
+| Claim | Verdict | One-liner |
+|---|---|---|
+| C1 P&L wrong metric | **CONFIRMED** | Shadow P&L measures the deployed strategy, not the switch logic. Fix comes free once the switching bot owns its own broker. |
+| C2 standalone coupling | **PARTIAL** | RegimeManager *class* is standalone-ready; only the *wiring* is coupled. Hard dependency = 1-min CSV feed for classifier. |
+| C3 paper-mode reality | **CONFIRMED** | Paper deployment exists end-to-end; real orders are one mode gate. **Zero new broker work.** |
+| C4 swap point | **PARTIAL** | Flat+fill-pending gate exists; but no session-start hook — build one. Do the swap in the closed gap between sessions. |
+| C5 concurrency | **RE-RUNNING** | (failed on session limit) |
+| C6 swap state | **PARTIAL** | Zero-arg ctor is universal (no kwargs work). In-place swap safe only when flat+no-fill-pending. Cross-interval swap has no plumbing. |
+| C7 idle state | **PARTIAL** | `strategy=None` crashes (848/923/1046). Use a **NullStrategy**. Classification must be decoupled from the trade-gated daily report. |
+| C8 classifier data | **PARTIAL** | Fresh bot_dir has a **~2.7 trading-day cold start**. COM warmup can't fill CSVs. Add a dedicated hourly-KLine regime warmup. |
+
+## Three early highlights (load-bearing)
+1. **C1 bonus:** per-trade attribution already anticipates regime mode — `broker.strategy_label` → `Trade.entry_strategy` at entry (`broker.py:234-239/336`), and `restore_session` relabel comment (`live_runner.py:1232-1234`). One broker across swapped strategies yields correct per-strategy P&L for free.
+2. **C3:** the ONLY paper-vs-real gate is `run_backtest.py:6362`. Shadow vs Live = `trading_mode` selection; do **not** build a broker abstraction.
+3. **C7/C8/C4 converge on one refactor:** classification must be driven by a **wall-clock session-boundary trigger** (own the 30s-poll `_session_key()` check), NOT `on_daily_report` — which is trade-gated (`report_generator.py:240-242`), never fires on stop (runner nulled first, `run_backtest.py:7487-7488`), and would starve a sitting-out bot's own classifier.
+
+---
+
+## Full verdict implications (verbatim)
+
+### C1 — P&L wrong metric — CONFIRMED
+The claim is fully confirmed, so Phase 3's core reframe is justified: the only way to get genuine switching P&L is for the switching engine itself to own a broker. Concretely: (1) RegimeSwitchingRunner must produce its P&L from its OWN SimulatedBroker (paper) — the existing per-trade attribution machinery (broker.strategy_label snapshotted into Trade.entry_strategy at entry, broker.py:234-239/336, and restore_session's relabel comment at live_runner.py:1232-1234 which already anticipates regime mode) means a single broker accumulating trades across swapped strategies gives correct per-strategy P&L for free; the history CSV's pnl column becomes meaningful the moment the report source is the switching broker rather than an unrelated bot type 1. (2) backfill_pnl and the on_daily_report backfill call should be retired or repointed — keeping it as-is on the switching bot would still suffer the date-matching brittleness (store.py:85-86 matches date + blank pnl only) and the DAY-report contamination; a cleaner Phase 3 records the session P&L directly when the switching runner closes its session, keyed by the same session identity that wrote the classification row. (3) The zero-trade gap must be fixed for evaluation: generate_session_report returns None on flat sessions, so sit_out sessions (the regime's most distinctive decision) currently produce no data — the switching runner should emit/record pnl=0 rows. (4) The dead next_session.executed/executed_at fields (store.py:39-43) are the natural hook for the switching runner to mark 'this recommendation was actually applied at session boundary' — consume them rather than inventing a parallel mechanism. (5) strategy_deployed in history should be renamed/reinterpreted: today it records the recommendation; in Phase 3 it should record what actually ran (which may differ when a swap is vetoed mid-position or by fill-pending).
+
+### C2 — standalone coupling — PARTIAL
+The claim splits cleanly: the WIRING is live-deployment-coupled (construction site, teardown, and the only tick source), but the RegimeManager CLASS is already standalone-ready — Phase 3 does NOT need to rewrite it, only re-host it. A standalone RegimeSwitchingRunner must self-provide five things: (1) bot_dir — create its own data/live/{SYMBOL}_{name} dir (keep symbol underscore-free because manager.py:92 splits on '_'). (2) 1-min bar feed + CSVs — the ONLY genuinely hard dependency: bars_1m_*.csv are written solely from the live tick path (live_runner.py:774), warmup bars are never logged, classifier needs >=52 classify_interval bars → a fresh shadow bot suffers a ~52-hour cold start. Recommended: decouple _get_regime_result to accept in-memory HTF bars instead of round-tripping through CSVs. (3) Classification trigger — do NOT reuse the daily-report hook (trade-gated, debounced, races teardown on stop). Fire classification on wall-clock NIGHT-session close (lift _session_key, live_runner.py:1178-1190) unconditionally, inject session='NIGHT' (replicating run_backtest.py:6403), add on-disk dedup (_last_session_key is memory-only → restart double-classify risk). (4) P&L — feed backfill from the switching runner's own paper broker summary. (5) Config/Discord/logging plumbing — trivial, re-host the three blocks at run_backtest.py:5388-5402. Note: _classify_regime_now (run_backtest.py:4997-5107) is a working headless template BUT persists real state — standalone runner and the manual button must share one state file per bot_dir or they double-advance hysteresis.
+
+### C3 — paper-mode reality — CONFIRMED
+Phase 3 needs ZERO new broker work: SimulatedBroker + LiveRunner already produce simulated fills, P&L, equity curve, session persistence, decisions log, daily reports (paper/real split), and live chart in paper mode; the real-order mirror is a single gate at run_backtest.py:6362 controlled by the mode string. 'dry_run selects the broker' → reframe as 'dry_run selects trading_mode paper vs semi_auto/auto'. Work is entirely in the ORCHESTRATION layer. Paper mode deliberately lacks: (1) no daily-loss-limit pause in paper (guard.update_pnl only fires in semi_auto/auto off REAL account P&L, run_backtest.py:7208); (2) sim P&L is gross (no fees/tax), entry/TP fills zero-slippage (SL tick exits realistic) → shadow P&L optimistic by fees + entry slippage; (3) no per-trade CSV (trades live in session.json + daily-report JSON); (4) Shadow #2 still needs quote login + COM ticks and consumes the ONE _live_runner slot — 'standalone' = 'no real bot required', not 'runs beside a real bot'.
+
+### C4 — swap point — PARTIAL
+1) Guard condition is right and exists: gate swap on broker.has_open_position()==False AND guard.fill_pending==False (reuse _apply_mode_switch gate, live_runner.py:536-545) — but for Live #2 add real-account signed-position==0 cross-check (issue-#79 resume pattern, run_backtest.py:5449-5476): sim-flat ≠ real-flat. 2) Do NOT couple classification to on_daily_report (fires only ~04:58 via 30s poll while RUNNING, never on stop, never for trade-free broker). Runner must own its NIGHT-end classification trigger keyed on _session_key(), with on-disk dedup. 3) No session-start hook exists — build one. Given the guaranteed >=3h45m fully-closed window between the ~04:58 NIGHT decision and 08:45 DAY open, apply the swap DURING the closed gap as teardown/re-arm (new instance + fresh warmup + aggregator rebuild — required whenever kline params differ), then let normal deploy machinery bring it live at 08:45. 4) is_market_open is holiday-blind (live_runner.py:54-95) → tolerate a session-start signal with no ticks. 5) Do NOT use a mode_override.json-style file trigger (poll latency + silent deletion during _is_reloading, live_runner.py:476-518). 6) DAY→NIGHT boundary (13:45→15:00, 75 min) has no fresh classification (NIGHT-only, manager.py:53-54) — pending rec must carry through, or state that swaps happen only at NIGHT→DAY.
+
+### C6 — swap state — PARTIAL
+Drop the 'kwargs handling' work item: STRATEGIES[display_name]() with zero args is the universal enforced contract; only validation needed is that long/short exist in STRATEGIES at swap time. Swap = in-place strategy replacement, executed ONLY when (a) broker.has_open_position() False, (b) guard.fill_pending False (reuse mode_switch_veto pattern), (c) not suppress_strategy/_is_reloading — then guard and poller are trivially clean, need NO reset (do NOT call guard.reset(); never rebind guard/poller). Procedure: assign self.strategy; update strategy_display_name, broker.strategy_label, GUI identity; if htf_intervals differ, re-register HTF on data_store + rebuild HTF aggregators via reload_1m_bars recipe (1333-1367); leave _bar_index, broker, _seen_1m_dts, _1m_bars, _aggregated_bars, _warmup_bar_count, csv_logger, _last_report_session UNTOUCHED; call _auto_save_session; recreate chart. HARD CONSTRAINT: same-target_interval swaps cheap/safe; cross-interval has no in-place plumbing (frozen at __init__) — either constrain long/short to identical kline_type/kline_minute (validate at save), or make cross-interval a full stop→redeploy with fresh COM warmup (runner must own its warmup trigger since COM warmup is GUI-only). Warm-start caveat: data_store depth satisfies required_bars() but NOT cross-bar instance state (self._prev_hist etc.) — accept 1-2 bar signal delay or replay tail of _aggregated_bars through new instance against a throwaway broker before arming (never the live broker). Report under stable switcher identity (e.g. 'Regime: long/short'), rely on per-trade Trade.strategy. sit_out = the flat precondition for swapping: flatten via force-close then idle. **Pre-existing bug to fix:** if any swap path reuses restore_session, re-set broker.trade_source after restore (from_dict drops it).
+
+### C7 — idle state — PARTIAL
+Do NOT implement sit_out as strategy=None — crashes at live_runner.py:848 (first aggregated bar), 923/927 (flatten decision logging), 1046 (GUI get_result()). Use a **NullStrategy** (BacktestStrategy subclass: no-op on_bar, required_bars() very large, kline_type/kline_minute copied from frozen target_interval, empty htf_intervals) assigned in place — keeps check_exits/on_bar_close/equity/on_bar-emission/chart flowing, every strategy.name read valid (pick display label deliberately; feeds session.json/decisions.csv/reports), zero changes to _process_aggregated_bar. Alt: a NEW strategy_paused flag skipping ONLY 847-882 (do NOT reuse suppress_strategy — GUI-owned, cleared on every history→live transition at 6159, also kills on_bar_close/equity). Sequencing: flatten while outgoing strategy still bound (name read in close path), respect fill-pending veto, then swap. Idle continuity is free (CSV log 774, DataStore/HTF/bar-index 811-815 upstream of the strategy gate). Classification MUST be decoupled from the trades-gated daily report (report suppressed for empty broker.trades 240-242; never reaches manager on stop 7487-7488) — drive from session-end 30s poll (5887-5912). Gate/skip evolution baseline read (run_backtest.py:4216) while NullStrategy active.
+
+### C8 — classifier data — PARTIAL
+(1) CSV plumbing is free: CsvLogger.log_bar in LiveRunner._ingest_1m_bar has zero mode dependence → a shadow bot on LiveRunner writes identical bars_1m CSVs — but must still provide the tick feed (COM subscription + BarBuilder). (2) Classification TRIGGER must be decoupled, not re-plumbed: driving on_daily_report from the switching bot deadlocks at cold start (flat → report None → never classifies → never trades). Call the pipeline directly on a wall-clock/session-boundary schedule using _session_key() for the (date, NIGHT) key. Pass explicit session date (not last-trade-exit-date). (3) Cold start filled explicitly: fresh bot_dir needs ~2.7 trading days of live 1-min logging; COM warmup can't fill it. Clean fix = dedicated regime warmup at deploy: one COM RequestKLineAMByDate at kline_minute=60 (or classify_interval) for ~5-10 days, fed to classify_regime / seed the state machine → change _get_regime_result to accept an injected HTF bar source with CSV as steady-state. Logging warmup bars to CSV is NOT a good alternative (only works for 1-min, breaks 'CSV = what the bot saw live' semantics that reload_1m_bars/evolution depend on).
+
+---
+
+## Consolidated open PRODUCT decisions (for the user)
+These are genuine product choices surfaced by the verdicts. The advisory-sidecar retirement question is **already decided** (retire) and excluded.
+
+1. **Swap boundary policy:** swap only at NIGHT→DAY (08:45, fresh classification), or also at DAY→NIGHT (15:00, reusing prior night's rec)? (Regime classifies NIGHT only.)
+2. **Weekend/holiday staleness:** a Saturday ~04:58 rec first applies Monday 08:45 (~52h stale). Apply it, re-classify Monday pre-open, or sit out until fresh?
+3. **Mid-position carry at boundary:** existing _check_session_end_close force-closes 2 min before every close → 'never swap mid-position' is auto-satisfied IF Phase 3 keeps always-flat-overnight. Keeping positions overnight is a product choice that changes the whole swap-safety story.
+4. **Timeframe constraint:** must long/short share kline_type/kline_minute (cheap in-place swap, validate at save), or support mixed timeframes (forces stop→redeploy + full warmup on every flip, minutes of downtime)?
+5. **Cold-start policy:** accept ~3 trading days of idle/hold on a fresh shadow bot, OR add a dedicated hourly-KLine COM warmup fetch at deploy (one extra API request, classify from day one)?
+6. **Data provenance:** classify only from bars the bot recorded live (conservative, slow start) vs from exchange KLine history (immediate, but not the bot's own observed feed)?
+7. **Shadow P&L fidelity:** accept gross, zero-entry-slippage sim P&L for judging the switch logic, or add a fee/slippage cost model?
+8. **Loss limit in paper:** should Shadow #2 enforce the daily loss limit on SIMULATED P&L, or run unconstrained (no real money)?
+9. **sit_out reporting:** should a trade-free sit_out session still emit a daily report / Discord note for audit, or stay silent?
+10. **Idle-state display name:** what shows in session.json/decisions.csv/chart/Discord for idle — 'Sit Out (觀望)' vs last strategy name + idle tag? (Persisted; used for resume matching.)
+11. **Evolution interaction:** weekly auto-evolution baselines on type(runner.strategy) — for the switching bot, disable evolution, evolve the active leaf, or evolve both configured strategies?
+12. **Report identity:** switching bot's reports/Discord labeled with the switcher's own name (per-trade leaf attribution) or with whichever leaf is active at report time?
+13. **History migration:** preserve v2.13.0 regime_history.csv rows (old rows measure a different quantity — mixing corrupts evaluation) or version/reset the file?
