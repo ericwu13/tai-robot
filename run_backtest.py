@@ -12,6 +12,7 @@ Usage:
 
 from version import APP_VERSION
 
+import logging
 import os
 import sys
 import inspect
@@ -309,6 +310,23 @@ def _load_settings():
             # WITHHELD from the AI's design and used as the unseen
             # validation window (walk-forward discipline).
             cfg["evolution_holdout_days"] = evo.get("holdout_days", 14)
+            # Regime mode (shadow — Phase 1). Advisory only: classifies the
+            # market regime each NIGHT session and logs/announces a strategy
+            # recommendation. Never auto-deploys while dry_run stays True.
+            regime = data.get("regime", {})
+            cfg["regime_enabled"] = regime.get("enabled", False)
+            cfg["regime_dry_run"] = regime.get("dry_run", True)
+            cfg["regime_long_strategy"] = regime.get("long_strategy", "")
+            cfg["regime_short_strategy"] = regime.get("short_strategy", "")
+            cfg["regime_adx_enter"] = regime.get("adx_enter", 25.0)
+            cfg["regime_adx_exit"] = regime.get("adx_exit", 20.0)
+            cfg["regime_confirm_sessions"] = regime.get("confirm_sessions", 2)
+            cfg["regime_vol_spike_ratio"] = regime.get("vol_spike_ratio", 1.5)
+            cfg["regime_range_bias_action"] = regime.get("range_bias_action", "sit_out")
+            cfg["regime_max_flips"] = regime.get("max_flips", 3)
+            cfg["regime_flip_window"] = regime.get("flip_window", 10)
+            cfg["regime_pause_sessions"] = regime.get("pause_sessions", 5)
+            cfg["regime_classify_interval"] = regime.get("classify_interval", 3600)
             break
     return cfg
 
@@ -390,6 +408,73 @@ def _ultra_toggle_decision(current: bool, confirm) -> bool | None:
     return True if confirm() else None
 
 
+def _validate_regime_values(enabled, adx_enter, adx_exit, confirm_sessions,
+                            vol_spike_ratio, long_strategy, short_strategy):
+    """Validate regime-config UI inputs. Pure — no Tk, returns (ok, title, msg).
+
+    Rules: ADX enter must exceed exit (hysteresis band), confirm_sessions >= 1,
+    the vol-spike ratio and thresholds must parse as numbers, and when regime
+    mode is enabled BOTH strategy slots must be filled (an empty slot would
+    make the selector recommend an unrunnable strategy).
+    """
+    try:
+        ae = float(adx_enter)
+        ax = float(adx_exit)
+        vs = float(vol_spike_ratio)
+    except (TypeError, ValueError):
+        return False, "閾值錯誤 Threshold Error", "ADX / vol-spike values must be numbers"
+    if ae <= ax:
+        return False, "閾值錯誤 Threshold Error", "ADX enter must be greater than exit threshold"
+    if vs <= 0:
+        return False, "閾值錯誤 Threshold Error", "Vol spike ratio must be positive"
+    try:
+        cs = int(confirm_sessions)
+    except (TypeError, ValueError):
+        return False, "確認場次錯誤 Confirm Error", "Confirm sessions must be an integer"
+    if cs < 1:
+        return False, "確認場次錯誤 Confirm Error", "Confirm sessions must be at least 1"
+    if enabled and (not str(long_strategy).strip() or not str(short_strategy).strip()):
+        return False, "策略未選 Strategy Missing", \
+            "Both long and short strategies must be set when regime mode is enabled"
+    return True, "", ""
+
+
+def _regime_yaml_block(vals: dict) -> dict:
+    """Build the settings.yaml ``regime:`` section from raw UI values.
+
+    Casts to the persisted types. Assumes inputs already passed
+    ``_validate_regime_values``. Pure so it can be round-trip tested.
+    """
+    return {
+        "enabled": bool(vals["enabled"]),
+        "dry_run": bool(vals["dry_run"]),
+        "long_strategy": str(vals["long_strategy"]),
+        "short_strategy": str(vals["short_strategy"]),
+        "range_bias_action": str(vals["range_bias_action"]),
+        "adx_enter": float(vals["adx_enter"]),
+        "adx_exit": float(vals["adx_exit"]),
+        "confirm_sessions": int(vals["confirm_sessions"]),
+        "vol_spike_ratio": float(vals["vol_spike_ratio"]),
+    }
+
+
+def _regime_block_to_flat_settings(block: dict) -> dict:
+    """Map a ``regime:`` yaml block back to the flat ``regime_*`` keys that
+    live in ``self._settings`` (mirrors the parsing in ``_load_settings``).
+    """
+    return {
+        "regime_enabled": block.get("enabled", False),
+        "regime_dry_run": block.get("dry_run", True),
+        "regime_long_strategy": block.get("long_strategy", ""),
+        "regime_short_strategy": block.get("short_strategy", ""),
+        "regime_range_bias_action": block.get("range_bias_action", "sit_out"),
+        "regime_adx_enter": block.get("adx_enter", 25.0),
+        "regime_adx_exit": block.get("adx_exit", 20.0),
+        "regime_confirm_sessions": block.get("confirm_sessions", 2),
+        "regime_vol_spike_ratio": block.get("vol_spike_ratio", 1.5),
+    }
+
+
 _CACHE_DIR = os.path.join(project_root, "data")
 
 _app = None
@@ -466,6 +551,15 @@ def _log(msg):
             if threading.current_thread() is threading.main_thread():
                 _app.log_text.insert(tk.END, line + "\n")
                 _app.log_text.see(tk.END)
+        except Exception:
+            pass
+
+
+class _AppLogHandler(logging.Handler):
+    """Routes Python logging records into the app's _log() function."""
+    def emit(self, record):
+        try:
+            _log(self.format(record))
         except Exception:
             pass
 
@@ -1162,6 +1256,7 @@ class BacktestApp:
         # Live trading state
         self._live_chart: LiveChart | None = None
         self._live_runner: LiveRunner | None = None
+        self._regime_manager = None  # regime shadow mode (Phase 1)
         # Real trading state
         self._trading_mode: str = "paper"  # "paper" or "semi_auto"
         self._futures_account: str = ""  # full account for order submission
@@ -1391,12 +1486,17 @@ class BacktestApp:
                                      command=self._report_issue)
         self.btn_report.grid(row=0, column=10, padx=3, pady=1, sticky=tk.W)
 
+        self.btn_regime = ttk.Button(btn_frame, text="多空模式 Regime",
+                                     command=self._show_regime_dialog)
+        self.btn_regime.grid(row=0, column=11, padx=3, pady=1, sticky=tk.W)
+
         # Wrap toolbar buttons onto extra rows when the frame is too
         # narrow for a single row (grid does not auto-wrap).
         self._toolbar_widgets = [
             self.btn_tv, self.btn_api, self.btn_taifex, self.btn_deploy,
             self.btn_chart_all, self.btn_export, self.btn_toggle_settings,
             tf_frame, self.btn_review, self.btn_evolution, self.btn_report,
+            self.btn_regime,
         ]
         self._toolbar_last_width = 0
         btn_frame.bind("<Configure>", self._reflow_toolbar)
@@ -1532,6 +1632,12 @@ class BacktestApp:
             ttk.Label(status_panel, text=label).grid(row=0, column=i*2, sticky=tk.W, padx=4)
             ttk.Label(status_panel, textvariable=var, font=("Consolas", 10, "bold")).grid(
                 row=0, column=i*2+1, sticky=tk.W, padx=(0, 12))
+
+        # Regime (shadow-mode) status line — updated on each daily report.
+        self.live_regime_var = tk.StringVar(value="[Regime] 停用 disabled")
+        ttk.Label(status_panel, textvariable=self.live_regime_var,
+                  font=("Consolas", 9), foreground="#8ab4f8").grid(
+            row=1, column=0, columnspan=10, sticky=tk.W, padx=4, pady=(3, 0))
 
         # Manual order buttons
         order_frame = ttk.LabelFrame(live_frame, text="手動下單 Manual Order", padding=4)
@@ -4668,6 +4774,439 @@ class BacktestApp:
         else:
             self._deploy_live()
 
+    def _load_regime_config(self) -> "RegimeConfig":
+        """Build the regime (shadow-mode) config from flat settings keys."""
+        from src.regime.state_machine import RegimeConfig
+        s = self._settings
+        return RegimeConfig(
+            enabled=s.get("regime_enabled", False),
+            dry_run=s.get("regime_dry_run", True),
+            long_strategy=s.get("regime_long_strategy", ""),
+            short_strategy=s.get("regime_short_strategy", ""),
+            adx_enter=float(s.get("regime_adx_enter", 25.0)),
+            adx_exit=float(s.get("regime_adx_exit", 20.0)),
+            confirm_sessions=int(s.get("regime_confirm_sessions", 2)),
+            vol_spike_ratio=float(s.get("regime_vol_spike_ratio", 1.5)),
+            range_bias_action=s.get("regime_range_bias_action", "sit_out"),
+            max_flips=int(s.get("regime_max_flips", 3)),
+            flip_window=int(s.get("regime_flip_window", 10)),
+            pause_sessions=int(s.get("regime_pause_sessions", 5)),
+            classify_interval=int(s.get("regime_classify_interval", 3600)),
+        )
+
+    def _show_regime_dialog(self):
+        """Modal config dialog for regime (multi-directional) mode."""
+        s = self._settings
+        dlg = tk.Toplevel(self.root)
+        dlg.title("多空模式設定 Regime Mode Settings")
+        dlg.geometry("700x780")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        outer = ttk.Frame(dlg, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # Button frame packed first (side=BOTTOM) so it stays visible
+        # even when the history treeview expands to fill remaining space.
+        btns = ttk.Frame(outer)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+
+        # ── Enable ──
+        enable_lf = ttk.LabelFrame(outer, text="啟用 Enable", padding=8)
+        enable_lf.pack(fill=tk.X, pady=(0, 6))
+        regime_enabled_var = tk.BooleanVar(value=bool(s.get("regime_enabled", False)))
+        ttk.Checkbutton(enable_lf, variable=regime_enabled_var,
+                        text="啟用自動多空切換 Enable regime mode").grid(
+            row=0, column=0, sticky=tk.W, pady=1)
+        regime_dry_run_var = tk.BooleanVar(value=bool(s.get("regime_dry_run", True)))
+        ttk.Checkbutton(enable_lf, variable=regime_dry_run_var,
+                        text="僅記錄建議，不自動部署 Dry-run (log only)").grid(
+            row=1, column=0, sticky=tk.W, pady=1)
+
+        # ── Strategy mapping ──
+        strat_names = list(STRATEGIES.keys())
+        map_lf = ttk.LabelFrame(outer, text="策略對應 Strategy Mapping", padding=8)
+        map_lf.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(map_lf, text="做多策略 Long strategy:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        long_strat_var = tk.StringVar(value=s.get("regime_long_strategy", ""))
+        ttk.Combobox(map_lf, textvariable=long_strat_var, values=strat_names,
+                     state="readonly", width=40).grid(row=0, column=1, sticky=tk.W, padx=6, pady=2)
+        ttk.Label(map_lf, text="做空策略 Short strategy:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        short_strat_var = tk.StringVar(value=s.get("regime_short_strategy", ""))
+        ttk.Combobox(map_lf, textvariable=short_strat_var, values=strat_names,
+                     state="readonly", width=40).grid(row=1, column=1, sticky=tk.W, padx=6, pady=2)
+        ttk.Label(map_lf, text="盤整偏空時 Range (bearish bias):").grid(
+            row=2, column=0, sticky=tk.W, pady=2)
+        range_bias_var = tk.StringVar(value=s.get("regime_range_bias_action", "sit_out"))
+        bias_frame = ttk.Frame(map_lf)
+        bias_frame.grid(row=2, column=1, sticky=tk.W, padx=6, pady=2)
+        ttk.Radiobutton(bias_frame, text="觀望 Sit out", variable=range_bias_var,
+                        value="sit_out").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(bias_frame, text="半倉做空 Short half", variable=range_bias_var,
+                        value="short_half").pack(side=tk.LEFT)
+
+        # ── Thresholds ──
+        thr_lf = ttk.LabelFrame(outer, text="判斷閾值 Classification Thresholds", padding=8)
+        thr_lf.pack(fill=tk.X, pady=(0, 6))
+        adx_enter_var = tk.StringVar(value=str(s.get("regime_adx_enter", 25.0)))
+        adx_exit_var = tk.StringVar(value=str(s.get("regime_adx_exit", 20.0)))
+        confirm_var = tk.StringVar(value=str(s.get("regime_confirm_sessions", 2)))
+        vol_spike_var = tk.StringVar(value=str(s.get("regime_vol_spike_ratio", 1.5)))
+        ttk.Label(thr_lf, text="ADX 進入趨勢 Enter trend:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(thr_lf, textvariable=adx_enter_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=6)
+        ttk.Label(thr_lf, text="ADX 離開趨勢 Exit trend:").grid(row=0, column=2, sticky=tk.W, pady=2, padx=(12, 0))
+        ttk.Entry(thr_lf, textvariable=adx_exit_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=6)
+        ttk.Label(thr_lf, text="確認場次 Confirm sessions:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(thr_lf, textvariable=confirm_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=6)
+        ttk.Label(thr_lf, text="波動突增比 Vol spike ratio:").grid(row=1, column=2, sticky=tk.W, pady=2, padx=(12, 0))
+        ttk.Entry(thr_lf, textvariable=vol_spike_var, width=8).grid(row=1, column=3, sticky=tk.W, padx=6)
+
+        # ── Manual override ──
+        ovr_lf = ttk.LabelFrame(outer, text="手動覆蓋 Manual Override (one-shot)", padding=8)
+        ovr_lf.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(ovr_lf, text="明日強制 Tomorrow force:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        override_var = tk.StringVar(value="auto")
+        ttk.Combobox(ovr_lf, textvariable=override_var,
+                     values=["auto", "long", "short", "sit_out"],
+                     state="readonly", width=12).grid(row=0, column=1, sticky=tk.W, padx=6)
+        ttk.Label(ovr_lf, text="(下次生效後自動重設 resets after next session)",
+                  foreground="gray").grid(row=0, column=2, sticky=tk.W, padx=6)
+
+        # ── Current status (read-only) ──
+        stat_lf = ttk.LabelFrame(outer, text="目前狀態 Current Status", padding=8)
+        stat_lf.pack(fill=tk.X, pady=(0, 6))
+        eff_var = tk.StringVar(value="—")
+        latest_var = tk.StringVar(value="—")
+        next_var = tk.StringVar(value="—")
+        for r, var in enumerate((eff_var, latest_var, next_var)):
+            ttk.Label(stat_lf, textvariable=var, font=("Consolas", 9)).grid(
+                row=r, column=0, sticky=tk.W, pady=1)
+
+        classify_result_var = tk.StringVar(value="")
+        classify_result_lbl = ttk.Label(stat_lf, textvariable=classify_result_var,
+                                        font=("Consolas", 9), wraplength=620)
+        classify_result_lbl.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+
+        def _on_classify_now():
+            self._classify_regime_now(classify_result_var, eff_var, latest_var,
+                                      next_var, hist_tree, parent=dlg)
+
+        ttk.Button(stat_lf, text="立即分類 Classify Now",
+                   command=_on_classify_now).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+
+        # ── Recent history ──
+        hist_lf = ttk.LabelFrame(outer, text="最近歷史 Recent History (last 7 sessions)", padding=8)
+        hist_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        hist_cols = ("date", "adx", "raw", "effective", "decision", "strategy", "pnl")
+        hist_tree = ttk.Treeview(hist_lf, columns=hist_cols, show="headings", height=7)
+        for col, text, w in [
+            ("date", "日期 Date", 90), ("adx", "ADX", 50),
+            ("raw", "原始 Raw", 100), ("effective", "有效 Effective", 100),
+            ("decision", "決策 Decision", 90), ("strategy", "策略 Strategy", 120),
+            ("pnl", "損益 P&L", 60),
+        ]:
+            hist_tree.heading(col, text=text)
+            hist_tree.column(col, width=w,
+                             anchor=tk.W if col in ("raw", "effective", "strategy") else tk.CENTER)
+        hvsb = ttk.Scrollbar(hist_lf, orient="vertical", command=hist_tree.yview)
+        hist_tree.configure(yscrollcommand=hvsb.set)
+        hist_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        hvsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._populate_regime_status(eff_var, latest_var, next_var, hist_tree)
+
+        # ── Bottom buttons ──
+        vars_dict = {
+            "enabled": regime_enabled_var, "dry_run": regime_dry_run_var,
+            "long_strategy": long_strat_var, "short_strategy": short_strat_var,
+            "range_bias_action": range_bias_var, "adx_enter": adx_enter_var,
+            "adx_exit": adx_exit_var, "confirm_sessions": confirm_var,
+            "vol_spike_ratio": vol_spike_var, "override": override_var,
+        }
+
+        def _on_save():
+            if self._save_regime_settings(vars_dict, parent=dlg):
+                dlg.destroy()
+
+        ttk.Button(btns, text="儲存 Save", width=10, command=_on_save).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="取消 Cancel", width=10, command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
+
+    def _populate_regime_status(self, eff_var, latest_var, next_var, hist_tree):
+        """Fill the read-only status labels + history tree from the running
+        RegimeManager. Best-effort: silently shows placeholders when no bot
+        is running or the state/history files don't exist yet."""
+        hist_tree.delete(*hist_tree.get_children())
+        mgr = getattr(self, "_regime_manager", None)
+        if mgr is None:
+            eff_var.set("有效狀態 Effective: — (尚未部署 no bot running)")
+            latest_var.set("最近判定 Latest: —")
+            next_var.set("下次建議 Next: —")
+            hist_tree.insert("", tk.END, values=("No history yet", "", "", "", "", "", ""))
+            return
+        try:
+            import json
+            status = mgr.get_status()
+            st = status["state"]
+            eff = st.effective_regime or "unknown"
+            since = st.effective_since or "—"
+            eff_var.set(f"有效狀態 Effective: {eff} (since {since}, {st.session_count} sessions)")
+            adx = (st.last_features or {}).get("adx", 0)
+            latest_var.set(f"最近判定 Latest: {st.raw_regime} (ADX {adx}) @ {st.last_assessed or '—'}")
+
+            # Next recommendation lives in the next_session block of the JSON.
+            nxt = {}
+            try:
+                with open(status["state_path"], encoding="utf-8") as f:
+                    nxt = (json.load(f) or {}).get("next_session", {}) or {}
+            except Exception:
+                nxt = {}
+            if nxt:
+                tag = "DRY-RUN" if nxt.get("dry_run", True) else "AUTO"
+                strat = nxt.get("strategy") or ""
+                strat_part = f" — {strat}" if strat else ""
+                next_var.set(f"下次建議 Next: {nxt.get('action', '—')}{strat_part} [{tag}]")
+            else:
+                next_var.set("下次建議 Next: —")
+
+            # History CSV — last 7 rows.
+            hist_path = status["hist_path"]
+            rows = []
+            if os.path.exists(hist_path):
+                import csv
+                with open(hist_path, newline="", encoding="utf-8") as f:
+                    rows = list(csv.reader(f))
+            if len(rows) <= 1:
+                hist_tree.insert("", tk.END, values=("No history yet", "", "", "", "", "", ""))
+                return
+            # rows[0] is the header; column indices per store.append_history:
+            # date=0, adx=2, raw_regime=8, effective_regime=9, decision=11,
+            # strategy_deployed=12, pnl=15.
+            for row in rows[1:][-7:]:
+                def _cell(i, default=""):
+                    return row[i] if i < len(row) else default
+                pnl = _cell(15)
+                hist_tree.insert("", tk.END, values=(
+                    _cell(0), _cell(2), _cell(8), _cell(9),
+                    _cell(11), _cell(12), pnl if pnl else "—",
+                ))
+        except Exception as e:
+            _log(f"[REGIME] status populate failed: {e}")
+            hist_tree.insert("", tk.END, values=("No history yet", "", "", "", "", "", ""))
+
+    def _classify_regime_now(self, result_var, eff_var, latest_var, next_var,
+                             hist_tree, parent=None):
+        """Run regime classification manually and display results."""
+        import glob as glob_mod
+        from datetime import datetime as _dt
+
+        # 1. Resolve bot_dir: prefer live runner, else scan data/live/ for most
+        #    recent session directory matching the current symbol.
+        bot_dir = None
+        mgr = getattr(self, "_regime_manager", None)
+        if mgr is not None:
+            bot_dir = mgr.bot_dir
+        elif self._live_runner and hasattr(self._live_runner, "bot_dir"):
+            bot_dir = self._live_runner.bot_dir
+        else:
+            symbol = self.symbol_var.get().strip() or "TX00"
+            base_dir = os.path.join(project_root, "data", "live")
+            if os.path.isdir(base_dir):
+                candidates = sorted(
+                    [d for d in glob_mod.glob(os.path.join(base_dir, f"{symbol}_*"))
+                     if os.path.isdir(d)],
+                    key=os.path.getmtime, reverse=True,
+                )
+                if candidates:
+                    bot_dir = candidates[0]
+
+        if not bot_dir or not os.path.isdir(bot_dir):
+            result_var.set("❌ 找不到交易資料目錄 No bot session directory found — "
+                           "deploy a live bot first or select a symbol with existing sessions.")
+            return
+
+        # 2. Run classification
+        try:
+            from src.daily_report.regime_classifier import classify_regime
+            from src.live.live_runner import load_1m_bars_from_csvs
+            from src.live.bar_aggregator import aggregate_bars
+            from src.regime.state_machine import RegimeStateMachine, RegimeConfig
+            from src.regime.selector import StrategySelector
+            from src.regime.store import save_state, append_history
+
+            symbol = os.path.basename(bot_dir).split("_")[0]
+            bars_1m = load_1m_bars_from_csvs(bot_dir, symbol)
+            if not bars_1m:
+                result_var.set("❌ 找不到 1 分 K 線資料 No 1-min bar CSV files found in "
+                               f"{bot_dir} — run a live session first to generate bar data.")
+                return
+
+            cfg = self._load_regime_config()
+            bars_htf = aggregate_bars(bars_1m, cfg.classify_interval)
+            if len(bars_htf) < 52:
+                result_var.set(f"❌ K 線資料不足 Only {len(bars_htf)} bars "
+                               f"(need ≥52) — run a longer live session.")
+                return
+
+            highs = [b.high for b in bars_htf]
+            lows = [b.low for b in bars_htf]
+            closes = [b.close for b in bars_htf]
+            regime_result = classify_regime(highs, lows, closes)
+            if regime_result is None:
+                result_var.set("❌ 分類失敗 Classification failed — insufficient data for indicators.")
+                return
+
+            # 3. Advance state machine + get recommendation
+            if mgr is not None:
+                state = mgr._state
+                machine = mgr._machine
+                selector = mgr._selector
+            else:
+                from src.regime.store import load_state
+                state_path = os.path.join(bot_dir, "regime_state.json")
+                state = load_state(state_path)
+                machine = RegimeStateMachine()
+                selector = StrategySelector()
+
+            session_date = _dt.now().strftime("%Y-%m-%d")
+            new_state = machine.step(state, regime_result, cfg, session_date)
+            rec = selector.select(new_state, cfg)
+
+            # 4. Persist
+            state_path = os.path.join(bot_dir, "regime_state.json")
+            hist_path = os.path.join(bot_dir, "regime_history.csv")
+            save_state(state_path, new_state, rec, session_date)
+            append_history(hist_path, session_date, new_state, rec)
+
+            if mgr is not None:
+                mgr._state = new_state
+
+            # 5. Display result
+            feat = regime_result.to_dict()
+            action_label = {"deploy_long": "做多 LONG", "deploy_short": "做空 SHORT",
+                            "deploy_short_half": "做空半倉 SHORT½",
+                            "sit_out": "觀望 SIT OUT", "hold": "維持 HOLD"}.get(rec.action, rec.action)
+            lines = [
+                f"✅ 分類完成 Classification complete — {session_date}",
+                f"   Raw: {new_state.raw_regime}  |  Effective: {new_state.effective_regime}",
+                f"   ADX={feat['adx']:.1f}  DI+={feat['plus_di']:.1f}  DI−={feat['minus_di']:.1f}  "
+                f"EMA slope={feat['ema_slope']:.1f}  ATR ratio={feat['atr_ratio']:.2f}",
+                f"   建議 Recommendation: {action_label}"
+                + (f" — {rec.strategy_name}" if rec.strategy_name else "")
+                + f"  ({rec.reason})",
+            ]
+            result_var.set("\n".join(lines))
+
+            # 6. Refresh the status labels + history tree
+            self._populate_regime_status(eff_var, latest_var, next_var, hist_tree)
+            self._update_regime_status()
+            _log(f"[REGIME] Manual classify: {new_state.raw_regime} → {new_state.effective_regime} → {rec.action}")
+
+        except Exception as e:
+            _log(f"[REGIME] classify_now failed: {e}")
+            result_var.set(f"❌ 分類錯誤 Classification error: {e}")
+
+    def _save_regime_settings(self, vars_dict, parent=None) -> bool:
+        """Validate + persist regime settings. Returns True on success.
+
+        ``vars_dict`` maps field names to Tk vars (or plain values, for tests).
+        """
+        def _val(key):
+            v = vars_dict[key]
+            return v.get() if hasattr(v, "get") else v
+
+        enabled = bool(_val("enabled"))
+        ok, title, msg = _validate_regime_values(
+            enabled, _val("adx_enter"), _val("adx_exit"), _val("confirm_sessions"),
+            _val("vol_spike_ratio"), _val("long_strategy"), _val("short_strategy"))
+        if not ok:
+            messagebox.showerror(title, msg, parent=parent)
+            return False
+
+        block = _regime_yaml_block({
+            "enabled": enabled,
+            "dry_run": bool(_val("dry_run")),
+            "long_strategy": _val("long_strategy"),
+            "short_strategy": _val("short_strategy"),
+            "range_bias_action": _val("range_bias_action"),
+            "adx_enter": _val("adx_enter"),
+            "adx_exit": _val("adx_exit"),
+            "confirm_sessions": _val("confirm_sessions"),
+            "vol_spike_ratio": _val("vol_spike_ratio"),
+        })
+
+        # 1. Read-modify-write settings.yaml.
+        if yaml:
+            path = os.path.join(project_root, "settings.yaml")
+            data = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+            data.setdefault("regime", {}).update(block)
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
+
+        # 2. Reflect into the in-memory settings dict.
+        self._settings.update(_regime_block_to_flat_settings(block))
+
+        # 3. Hot-reload the running manager's config.
+        mgr = getattr(self, "_regime_manager", None)
+        if mgr is not None:
+            try:
+                mgr.reload_config(self._load_regime_config())
+            except Exception as e:
+                _log(f"[REGIME] reload_config failed: {e}")
+
+        # 4. One-shot manual override → regime_state.json (+ in-memory state).
+        override = str(_val("override"))
+        if mgr is not None:
+            try:
+                import json
+                state_path = mgr._state_path
+                jd = {}
+                if os.path.exists(state_path):
+                    with open(state_path, "r", encoding="utf-8") as f:
+                        jd = json.load(f) or {}
+                jd["manual_override"] = override
+                tmp = state_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(jd, f, indent=2, ensure_ascii=False)
+                os.replace(tmp, state_path)
+                # Keep the live in-memory state in sync so the override
+                # takes effect on the next session without a reload.
+                if getattr(mgr, "_state", None) is not None:
+                    mgr._state.manual_override = override
+            except Exception as e:
+                _log(f"[REGIME] override write failed: {e}")
+
+        self._update_regime_status()
+        self.status_var.set("多空模式設定已儲存 Regime settings saved")
+        return True
+
+    def _update_regime_status(self):
+        """Refresh the live-tab regime status line from settings + manager."""
+        if not hasattr(self, "live_regime_var"):
+            return
+        if not self._settings.get("regime_enabled", False):
+            self.live_regime_var.set("[Regime] 停用 disabled")
+            return
+        mgr = getattr(self, "_regime_manager", None)
+        dry = self._settings.get("regime_dry_run", True)
+        tag = " (DRY-RUN)" if dry else ""
+        if mgr is None:
+            self.live_regime_var.set(f"[Regime] 已啟用 enabled — 等待場次 awaiting session{tag}")
+            return
+        try:
+            st = mgr.get_status()["state"]
+            eff = st.effective_regime or "unknown"
+            side_map = {
+                "trending-up": "做多 LONG", "trending-down": "做空 SHORT",
+                "range-bound": "盤整 RANGE", "unknown": "未知 UNKNOWN",
+            }
+            side = side_map.get(eff, eff)
+            self.live_regime_var.set(f"[Regime] {eff} → {side}{tag}")
+        except Exception:
+            self.live_regime_var.set(f"[Regime] 已啟用 enabled{tag}")
+
     def _deploy_live(self):
         """Start live bot: create runner, fetch warmup, subscribe to ticks."""
         if not self._quote_connected and not _tv_available:
@@ -4840,6 +5379,30 @@ class BacktestApp:
 
         # Open debug log file in bot directory
         _open_debug_log(self._live_runner.bot_dir)
+
+        # Regime manager (shadow mode — Phase 1). Reads config from settings;
+        # stays inert unless regime.enabled is True. Never auto-deploys —
+        # it only logs and (optionally) announces a recommendation.
+        try:
+            from src.regime.manager import RegimeManager
+            regime_cfg = self._load_regime_config()
+            self._regime_manager = RegimeManager(self._live_runner.bot_dir, regime_cfg)
+            # Route regime's standard-logging records into the app's _log().
+            regime_logger = logging.getLogger("src.regime")
+            if not any(isinstance(h, _AppLogHandler) for h in regime_logger.handlers):
+                handler = _AppLogHandler()
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                regime_logger.addHandler(handler)
+                regime_logger.setLevel(logging.DEBUG)
+            # Discord uses the module-level global _discord (there is no
+            # self._notifier); route regime announcements through it.
+            self._regime_manager.discord_notify_cb = lambda msg: (
+                _discord.notify(msg) if _discord is not None and _discord.enabled else None
+            )
+        except Exception as e:
+            self._regime_manager = None
+            _log(f"[REGIME] init failed: {e}")
+        self._update_regime_status()
 
         # Initialize Discord notifications
         global _discord
@@ -5827,6 +6390,22 @@ class BacktestApp:
             self._run_evolution_check_after_report()
         except Exception as e:
             _log(f"evolution notify hook failed: [{type(e).__name__}] {e}")
+
+        # Regime mode (shadow). The report's "session" key is a metadata dict,
+        # not the DAY/NIGHT slot the manager keys on — inject the slot from the
+        # runner's _session_key() into a shallow copy before handing it over.
+        if getattr(self, "_regime_manager", None) is not None:
+            try:
+                regime_report = report
+                if self._live_runner is not None:
+                    regime_report = dict(report)
+                    regime_report["session"] = self._live_runner._session_key()[1]
+                self._regime_manager.on_daily_report(regime_report)
+            except Exception as e:
+                _log(f"[REGIME] Error: {e}")
+        # Refresh the live-tab regime indicator (safe whether or not a
+        # manager exists — it falls back to the disabled label).
+        self.root.after(0, self._update_regime_status)
 
     def _run_evolution_check_after_report(self) -> None:
         """Score the running bot and fire a Discord notification on improvement.
@@ -6905,6 +7484,7 @@ class BacktestApp:
             self._update_live_results()
             self._update_live_status()
             self._live_runner = None
+            self._regime_manager = None
             self._trading_guard.reset()
             _close_debug_log()
 
