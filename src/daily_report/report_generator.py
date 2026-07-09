@@ -45,6 +45,7 @@ def _trade_to_dict(t: Trade, point_value: int = 1) -> dict:
         "real_entry_price": getattr(t, "real_entry_price", 0) or None,
         "real_exit_price": getattr(t, "real_exit_price", 0) or None,
         "source": getattr(t, "source", ""),
+        "strategy": getattr(t, "strategy", ""),
     }
 
 

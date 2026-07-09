@@ -1563,7 +1563,7 @@ class BacktestApp:
         trades_frame = ttk.Frame(notebook)
         notebook.add(trades_frame, text="交易明細 Trades")
         columns = ("num", "tag", "side", "entry_time", "entry_price", "real_entry",
-                   "exit_time", "exit_price", "pnl", "bars_held", "source")
+                   "exit_time", "exit_price", "pnl", "bars_held", "source", "strategy")
         self.trade_tree = ttk.Treeview(trades_frame, columns=columns, show="headings", height=20)
         self._trade_sort_col = None
         self._trade_sort_reverse = False
@@ -1573,12 +1573,12 @@ class BacktestApp:
             ("real_entry", "實進場 Real Entry", 90),
             ("exit_time", "出場時間 Exit Time", 135), ("exit_price", "出場價 Exit", 80),
             ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 60),
-            ("source", "來源 Source", 80),
+            ("source", "來源 Source", 80), ("strategy", "策略 Strategy", 150),
         ]:
             self.trade_tree.heading(col, text=text,
                                    command=lambda c=col: self._sort_trade_tree(c))
             self.trade_tree.column(col, width=w,
-                                   anchor=tk.E if col not in ("tag", "source") else tk.W)
+                                   anchor=tk.E if col not in ("tag", "source", "strategy") else tk.W)
         vsb = ttk.Scrollbar(trades_frame, orient="vertical", command=self.trade_tree.yview)
         self.trade_tree.configure(yscrollcommand=vsb.set)
         self.trade_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -3244,6 +3244,7 @@ class BacktestApp:
                 real_entry_str,
                 exit_dt, f"{t.exit_price:,}", pnl_str, bars_held,
                 source_str,
+                getattr(t, "strategy", "") or "--",
             ), tags=(row_tag,))
 
         self.trade_tree.tag_configure("win", foreground="green")
