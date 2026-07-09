@@ -1071,6 +1071,16 @@ class BacktestApp:
         self._live_history_tick_count = 0
         self._live_stale_drops = 0
         self._live_runner.suppress_strategy = True
+        # Issue #79: reconnect re-enters the history-replay window — ignore
+        # mode overrides until the history→live transition clears the flag.
+        self._live_runner._is_reloading = True
+        # Issue #78: the replay burst can carry ticks/bars whose timestamps go
+        # backwards relative to what we already processed. Reset the
+        # out-of-order guards so the first tick/bar after the gap is accepted,
+        # then let the monotonicity checks drop the stale remainder of the burst.
+        if self._live_bar_builder is not None:
+            self._live_bar_builder.reset_stale_tracking()
+        self._live_runner.reset_bar_monotonicity()
         # Track when this RequestTicks fired so we can log latency to first tick
         # (and detect zombie subscriptions where no tick arrives).
         self._ticks_requested_at = time.time()
@@ -4851,6 +4861,54 @@ class BacktestApp:
             n = self._live_runner.restore_session(resume_session)
             self._live_log_msg(f"恢復交易紀錄 Resumed session: {n} trades restored", "status")
 
+            # Issue #79: reconcile the safety guard with the restored position.
+            # guard.reset() (line above at deploy) cleared real_entry_confirmed
+            # and fill_pending, but the restored broker may already hold an
+            # open position from the previous session. Without this, every
+            # exit/force-close is SKIP_EXIT'd (real_entry_confirmed=False) and
+            # any stale fill_pending would BLOCK_FILL_PENDING the close forever
+            # — the live position stays stuck open until the user manually
+            # switches trading modes.
+            if self._live_runner.broker.position_size > 0:
+                # Real-money hazard (issue #79 review): the restored SIM broker
+                # can hold a position even when the REAL account is FLAT (user
+                # closed overnight, or the entry was skipped last session).
+                # Confirming a real entry in that state lets the bot auto-send a
+                # close (sNewClose=2) against a flat account — OPENING a naked
+                # position. Only reconcile the guard if the real account (queried
+                # ~90 lines above via GetOpenInterestGW) also shows a position
+                # for this symbol. Paper mode has no real account, so the sim
+                # position alone is authoritative there.
+                real_ok = True
+                if trading_mode in ("semi_auto", "auto"):
+                    order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+                    prefix = order_sym[:2] if order_sym else ""
+                    real_ok = self._account_monitor.get_signed_position(prefix) != 0
+                if real_ok:
+                    cleared = self._trading_guard.restore_confirmed_position()
+                    if cleared:
+                        self._live_log_msg(
+                            "[RESUME] Cleared stale fill_pending — position already "
+                            "confirmed from previous session", "status")
+                    self._live_log_msg(
+                        "[RESUME] Restored confirmed real position — exits/"
+                        "force-close re-enabled", "status")
+                else:
+                    self._live_log_msg(
+                        "[RESUME] Real account flat but sim has position — NOT "
+                        "confirming entry. Manual review required.", "status")
+
+            # Issue #79 (sub-problem C): explicitly re-sync the mode tag now,
+            # before warmup/replay begins. The var was set at deploy time, but
+            # re-asserting it here (and guarding _check_mode_override while
+            # _is_reloading) keeps the tag from momentarily blanking during
+            # history replay until a manual mode switch restores it.
+            combo_label = self._mode_key_to_combo.get(
+                self._trading_mode, self._trading_mode)
+            self.trading_mode_var.set(combo_label)
+            self._live_log_msg(
+                f"[RESUME] Trading mode restored: {self._trading_mode}", "status")
+
         # Register callbacks
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
         self._live_runner.on("on_decision", lambda d: self.root.after(0, self._on_live_decision, d))
@@ -5027,6 +5085,28 @@ class BacktestApp:
                  f"[{type(e).__name__}] {e}")
         self._start_live_tick_subscription()
 
+    def _on_reload_progress(self, done: int, total: int) -> None:
+        """Progress hook for LiveRunner.reload_1m_bars (issue #79).
+
+        Logs every batch and pumps the Tk event loop so the window stays
+        painted during a long bar reload. Uses update_idletasks() (redraw
+        only) rather than update() on purpose: a full update() would
+        dispatch queued user input — a "Stop Bot" click mid-reload would
+        re-enter _stop_live() and clear self._live_runner underneath the
+        still-running reload, crashing on return. update_idletasks() keeps
+        the UI responsive-looking without that re-entrancy hazard.
+        """
+        if total:
+            self._live_log_msg(
+                f"[RESUME] Reloading bars: {done}/{total}...", "status")
+        else:
+            self._live_log_msg(
+                f"[RESUME] Reloading bars: {done}...", "status")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass  # window may be tearing down — never break the reload
+
     # ── Tick-based live data feed ──
 
     def _start_live_tick_subscription(self):
@@ -5034,8 +5114,14 @@ class BacktestApp:
         if not self._live_runner:
             return
 
-        # Reload saved 1-min bars from CSV (for resumed sessions)
-        n_reloaded = self._live_runner.reload_1m_bars()
+        # Reload saved 1-min bars from CSV (for resumed sessions).
+        # Issue #79: for long-lookback strategies the reload can re-feed
+        # thousands of bars through fresh HTF aggregators in one blocking
+        # call, freezing the UI for seconds. Pass a progress callback that
+        # logs every 500 bars and pumps the Tk event loop so the window
+        # stays painted/responsive during the reload.
+        n_reloaded = self._live_runner.reload_1m_bars(
+            progress_cb=self._on_reload_progress)
         if n_reloaded > 0:
             self._live_log_msg(
                 f"已載入歷史1分K Reloaded {n_reloaded} saved 1m bars from CSV", "status")
@@ -5494,6 +5580,9 @@ class BacktestApp:
             self._live_history_done = True
             self._live_history_tick_count = self._live_tick_count
             self._live_runner.suppress_strategy = False
+            # Issue #79: reloading window is over — live hot-swap mode
+            # overrides may now be honored again.
+            self._live_runner._is_reloading = False
             status = self._live_runner.get_status()
             self._live_log_msg(
                 f"歷史報價完成 History ticks done: {self._live_tick_count} ticks, "
@@ -5856,12 +5945,18 @@ class BacktestApp:
             self._live_log_msg(
                 f"系統已停止 HALTED: {details['reason']}", "exit")
             self._log_order_decision("REAL_ORDER_HALTED", details["reason"])
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "HALTED", details["reason"])
             return
 
         if verdict == guard.BLOCK_FILL_PENDING:
             self._live_log_msg(
                 f"等待確認中 Pending: {details['reason']}", "status")
             self._log_order_decision("REAL_ORDER_PENDING_BLOCK", details["reason"])
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "FILL_PENDING", details["reason"])
             # Issue #50: store blocked TRADE_CLOSE so it can be replayed
             # after _on_fill_confirmed("entry") clears fill_pending. Without
             # this, the close decision is permanently lost and the real
@@ -5875,6 +5970,10 @@ class BacktestApp:
         if verdict == guard.BLOCK_ENTRY:
             self._live_log_msg(
                 f"實單暫停 Order blocked: {details['reason']}", "status")
+            # Issue #62: the daily-loss-limit block used to be silent in
+            # decisions.csv and the UI event log — the exact case reported.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "DAILY_LOSS_LIMIT", details["reason"])
             return
 
         # Settlement-day rule: block NEW entries within 60 min of the
@@ -5886,12 +5985,18 @@ class BacktestApp:
             self._live_log_msg(
                 f"結算日禁止進場 Settlement-day entry blocked: {reason}", "exit")
             self._log_order_decision("REAL_ORDER_BLOCKED", reason)
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "SETTLEMENT_WINDOW", reason)
             return
 
         if verdict == guard.SKIP_EXIT:
             self._live_log_msg(
                 f"跳過平倉(無實倉) Skip: {details['reason']}", "status")
             self._log_order_decision("REAL_ORDER_SKIPPED", details["reason"])
+            # Issue #62: surface the blocked signal in the decision log / UI table.
+            self._live_runner.log_blocked_signal(
+                action, side, price, "NO_REAL_POSITION", details["reason"])
             return
 
         if verdict == guard.SEND_EXIT:
@@ -6053,6 +6158,12 @@ class BacktestApp:
                     self._live_log_msg(msg, "exit")
                     self._log_order_decision("REAL_ORDER_BLOCKED", msg)
                     _log(f"REAL ORDER BLOCKED: {msg}")
+                    # Issue #62 (review): the margin block was invisible in
+                    # decisions.csv / the UI table. Surface it as a blocked signal.
+                    if self._live_runner:
+                        side = "LONG" if buy_sell == 0 else "SHORT"
+                        self._live_runner.log_blocked_signal(
+                            "ENTRY_FILL", side, sim_price, "MARGIN_BLOCK", msg)
                     return False
             except (ValueError, TypeError):
                 pass  # can't parse — proceed with order, let exchange decide
@@ -6724,6 +6835,25 @@ class BacktestApp:
                 self._trading_mode = "semi_auto"
                 self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
                 self._trading_mode = saved_mode
+            elif (self._trading_mode in ("semi_auto", "auto")
+                    and not self._trading_guard.real_entry_confirmed
+                    and self._live_runner.broker.position_size > 0):
+                # Issue #62 (review): a sim position is open but no real entry
+                # was ever confirmed, so the force-close is intentionally
+                # skipped. This used to be SILENT — surface it so the user knows
+                # the sim position may be a phantom (no matching real position).
+                runner = self._live_runner
+                side_val = runner.broker.position_side.value
+                price = self._get_latest_price()[0]
+                if price <= 0:
+                    price = runner._aggregated_bars[-1].close if runner._aggregated_bars else 0
+                self._live_log_msg(
+                    "[STOP] Skipping force-close — real_entry_confirmed=False. "
+                    "Position may be phantom.", "exit")
+                runner.log_blocked_signal(
+                    "FORCE_CLOSE", side_val, price, "NO_REAL_ENTRY_STOP_CLOSE",
+                    "real_entry_confirmed=False; sim position open, "
+                    "stop-close skipped")
 
             # Suppress strategy before stop — prevent new entries during shutdown.
             # stop() flushes the aggregator's partial bar and runs _process_aggregated_bar,
