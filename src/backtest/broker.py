@@ -51,6 +51,11 @@ class Trade:
     real_exit_price: int = 0    # Phase 2 — not yet captured
     real_exit_dt: str = ""      # Phase 2 — not yet captured
     source: str = ""            # "backtest", "paper", or "real"
+    # Display name of the strategy whose signal OPENED this trade. In
+    # regime mode one bot's restored history spans several strategies
+    # (manual redeploys on regime switches), so per-trade attribution
+    # can't be derived from the session-level strategy name.
+    strategy: str = ""
 
 
 class BrokerContext:
@@ -226,6 +231,13 @@ class SimulatedBroker:
         # Set by the caller (LiveRunner / BacktestEngine) after construction.
         self.trade_source: str = ""
 
+        # Strategy attribution. strategy_label is the CURRENTLY deployed
+        # strategy (set by LiveRunner / BacktestEngine, like trade_source);
+        # entry_strategy is snapshotted from it when a position opens so a
+        # strategy switch mid-position can't mislabel the open trade.
+        self.strategy_label: str = ""
+        self.entry_strategy: str = ""
+
         # Last exit metadata — read by live_runner to determine real order type
         self.last_exit_type: str = ""  # "limit", "stop", "close", "force_close"
         self.last_exit_limit: int | None = None  # strategy's original limit price
@@ -321,6 +333,7 @@ class SimulatedBroker:
                 self.entry_tag = order.tag
                 self.entry_bar_index = bar_index
                 self._entry_dt = bar_dt
+                self.entry_strategy = self.strategy_label
                 # Clear stale exit metadata from previous trade
                 self.last_exit_type = ""
                 self.last_exit_limit = None
@@ -445,6 +458,7 @@ class SimulatedBroker:
             real_entry_price=self.real_entry_price,
             real_entry_dt=self.real_entry_dt,
             source=source,
+            strategy=self.entry_strategy,
         )
         self.trades.append(trade)
         self._cumulative_pnl += pnl
@@ -454,6 +468,7 @@ class SimulatedBroker:
         self.position_side = None
         self.entry_price = 0
         self.entry_tag = ""
+        self.entry_strategy = ""
         # Reset real-fill state so the next trade starts clean. The
         # late-arrival guard in _on_fill_confirmed also rejects writes
         # when position_size == 0, so two layers of defense (issue #45).
@@ -575,6 +590,7 @@ class SimulatedBroker:
             "entry_tag": self.entry_tag,
             "entry_bar_index": self.entry_bar_index,
             "_entry_dt": self._entry_dt,
+            "entry_strategy": self.entry_strategy,
             "real_entry_price": self.real_entry_price,
             "real_entry_dt": self.real_entry_dt,
             "trades": [
@@ -590,6 +606,7 @@ class SimulatedBroker:
                     "real_exit_price": t.real_exit_price,
                     "real_exit_dt": t.real_exit_dt,
                     "source": t.source,
+                    "strategy": t.strategy,
                 }
                 for t in self.trades
             ],
@@ -617,6 +634,7 @@ class SimulatedBroker:
         broker.entry_tag = data.get("entry_tag", "")
         broker.entry_bar_index = data.get("entry_bar_index", 0)
         broker._entry_dt = data.get("_entry_dt", "")
+        broker.entry_strategy = data.get("entry_strategy", "")
         broker.real_entry_price = data.get("real_entry_price", 0)
         broker.real_entry_dt = data.get("real_entry_dt", "")
         broker.trades = [
@@ -632,6 +650,7 @@ class SimulatedBroker:
                 real_exit_price=t.get("real_exit_price", 0),
                 real_exit_dt=t.get("real_exit_dt", ""),
                 source=t.get("source", ""),
+                strategy=t.get("strategy", ""),
             )
             for t in data.get("trades", [])
         ]

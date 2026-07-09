@@ -102,6 +102,7 @@ class BacktestEngine:
         self.strategy = strategy
         self.broker = SimulatedBroker(point_value=point_value, fill_mode=fill_mode)
         self.broker.trade_source = "backtest"
+        self.broker.strategy_label = getattr(strategy, "name", "")
         self.data_store = DataStore(max_bars=max_bars)
 
         # MTF setup. Empty intervals = single-TF, no aggregators created,

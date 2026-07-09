@@ -390,6 +390,7 @@ class LiveRunner:
         self._reload_started_at: float | None = None
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
         self.broker.trade_source = _mode_to_source(self.trading_mode)
+        self.broker.strategy_label = self.strategy_display_name
         self.daily_loss_limit: int = 10000  # NTD, for session persistence
 
         # Hot-swap mode switching (Feature 2)
@@ -1228,6 +1229,10 @@ class LiveRunner:
         """
         broker_data = session_data.get("broker", {})
         self.broker = SimulatedBroker.from_dict(broker_data)
+        # New trades belong to the strategy deployed NOW; a position
+        # restored open keeps its persisted entry_strategy (regime mode:
+        # the previous deploy may have run a different strategy).
+        self.broker.strategy_label = self.strategy_display_name
         self._bar_index = session_data.get("bar_index", 0)
         self._started_at = session_data.get("started_at", self._started_at)
         return len(self.broker.trades)
