@@ -88,3 +88,71 @@ class TestBarBuilder:
         event_bus.drain()
         assert len(received) == 1
         assert received[0].open == 20000
+
+
+class TestOutOfOrderTickGuard:
+    """Issue #78: drop stale/out-of-order ticks from post-reconnect replay."""
+
+    def test_stale_tick_is_dropped(self):
+        """A tick older than the last accepted tick must not mutate the bar."""
+        bb = BarBuilder("TXFD0", 60)
+        bb.on_tick(_tick(20000, 1, 0, minute=0))
+        bb.on_tick(_tick(20050, 2, 30, minute=0))
+
+        snapshot = (bb.current_bar.open, bb.current_bar.high,
+                    bb.current_bar.low, bb.current_bar.close,
+                    bb.current_bar.volume)
+
+        # Burst replay: a tick with a timestamp that goes backwards.
+        result = bb.on_tick(_tick(19000, 99, 10, minute=0))
+
+        assert result is None
+        assert (bb.current_bar.open, bb.current_bar.high,
+                bb.current_bar.low, bb.current_bar.close,
+                bb.current_bar.volume) == snapshot
+
+    def test_same_timestamp_tick_is_kept(self):
+        """Issue #78 (review): a tick at exactly the last timestamp is a
+        legitimate same-millisecond fill (e.g. a sweep order hitting several
+        price levels) and MUST be merged into the current bar. The old ``<=``
+        guard dropped these and corrupted High/Low/Volume."""
+        bb = BarBuilder("TXFD0", 60)
+        bb.on_tick(_tick(20000, 1, 30, minute=0))
+        vol_before = bb.current_bar.volume
+
+        # Same timestamp, higher price + more qty — must update the bar.
+        result = bb.on_tick(_tick(20100, 5, 30, minute=0))
+
+        assert result is None
+        assert bb.current_bar.volume == vol_before + 5
+        assert bb.current_bar.high == 20100
+        assert bb.current_bar.close == 20100
+
+    def test_stale_tick_does_not_spawn_new_bar(self):
+        """A stale tick in a later minute must not create a spurious bar."""
+        bb = BarBuilder("TXFD0", 60)
+        bb.on_tick(_tick(20000, 1, 0, minute=5))  # last = 09:05:00
+        # Older tick that aligns to an earlier minute — would wrongly finalize
+        # and start a new bar without the guard.
+        result = bb.on_tick(_tick(19900, 1, 0, minute=2))
+
+        assert result is None
+        assert len(bb.completed_bars) == 0
+        assert bb.current_bar.dt.minute == 5
+
+    def test_reset_accepts_first_tick_regardless(self):
+        """After reset_stale_tracking(), the next tick is always accepted."""
+        bb = BarBuilder("TXFD0", 60)
+        bb.on_tick(_tick(20000, 1, 30, minute=10))  # last = 09:10:30
+
+        # Reconnect: replay restarts from an earlier checkpoint.
+        bb.reset_stale_tracking()
+
+        result = bb.on_tick(_tick(19950, 3, 0, minute=2))  # older timestamp
+        # New bar started fresh from the "older" replayed tick.
+        assert bb.current_bar is not None
+        assert bb.current_bar.dt.minute == 2
+        assert bb.current_bar.open == 19950
+        # Finalized the minute-10 bar on the boundary cross.
+        assert result is not None
+        assert result.dt.minute == 10

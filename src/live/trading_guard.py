@@ -132,6 +132,34 @@ class TradingGuard:
         self.halted = False
         self.halt_reason = ""
 
+    # ── Session resume reconciliation (issue #79) ──
+
+    def restore_confirmed_position(self) -> bool:
+        """Reconcile guard state for a position inherited from a prior session.
+
+        On session resume the bot re-adopts an open position it opened in a
+        previous run (restored via ``broker.from_dict``). That entry was
+        already confirmed last session — no fresh ``on_fill_confirmed`` will
+        arrive from the COM reconnect. Without this reconciliation the guard
+        (which was ``reset()`` on deploy) still believes no real entry exists:
+
+          * ``real_entry_confirmed`` stays False, so every exit / force-close
+            is SKIP_EXIT'd ("no real entry was confirmed") and the live
+            position is stuck open until the user manually switches modes
+            (issue #79 — the reported "平倉單沒帶入" symptom).
+          * any stale ``fill_pending`` (auto mode) would BLOCK_FILL_PENDING the
+            exit and defer it forever, because the entry fill it is waiting on
+            already happened in the previous session.
+
+        Returns True if a stale ``fill_pending`` was cleared (for logging).
+        """
+        had_pending = self.fill_pending
+        self.fill_pending = False
+        self.fill_pending_type = ""
+        self.real_entry_confirmed = True
+        self._deferred_close = None
+        return had_pending
+
     # ── Margin check ──
 
     @staticmethod

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -379,6 +380,14 @@ class LiveRunner:
         self._warmup_bar_count: int = 0  # count of warmup bars in _aggregated_bars
         self._callbacks: dict[str, list] = {}
         self.suppress_strategy: bool = False  # suppress strategy during history catchup
+        # Issue #79: True from warmup start until history replay completes.
+        # While set, _check_mode_override() is skipped so a stale
+        # mode_override.json (or a race with the resume UI sync) can't flip
+        # the trading mode mid-replay and blank the mode tag. Backed by the
+        # _is_reloading property, which stamps _reload_started_at on each
+        # False→True flip so a window that never closes can be auto-cleared.
+        self._reloading_flag: bool = False
+        self._reload_started_at: float | None = None
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
         self.broker.trade_source = _mode_to_source(self.trading_mode)
         self.daily_loss_limit: int = 10000  # NTD, for session persistence
@@ -444,8 +453,58 @@ class LiveRunner:
 
     # ── Hot-swap mode switching ──
 
+    # Safety cap on the reloading window (issue #79 review). If the
+    # history→live transition never fires (e.g. the tick feed died), the
+    # window would otherwise stay open forever and wedge hot-swap.
+    RELOAD_TIMEOUT_SECONDS = 600  # 10 minutes
+
+    @property
+    def _is_reloading(self) -> bool:
+        return self._reloading_flag
+
+    @_is_reloading.setter
+    def _is_reloading(self, value: bool) -> None:
+        value = bool(value)
+        if value and not self._reloading_flag:
+            # False→True: stamp the start for the safety timeout.
+            self._reload_started_at = time.monotonic()
+        elif not value:
+            self._reload_started_at = None
+        self._reloading_flag = value
+
     def _check_mode_override(self) -> str | None:
         """Read and consume a mode_override.json file from the bot directory."""
+        # Issue #79: never consume/apply a mode override during warmup or
+        # history replay. Applying one mid-replay races with the resume UI
+        # sync and makes the mode tag disappear until the user manually
+        # switches modes. Live hot-swaps resume once _is_reloading clears.
+        if self._is_reloading:
+            # Safety timeout (issue #79 review): auto-clear a reloading window
+            # that has been open too long so hot-swap isn't wedged forever.
+            if (self._reload_started_at is not None
+                    and time.monotonic() - self._reload_started_at
+                    > self.RELOAD_TIMEOUT_SECONDS):
+                self._emit(
+                    "on_status",
+                    "[RESUME] _is_reloading stuck > 10 min — auto-clearing "
+                    "reload window")
+                self._is_reloading = False
+                # fall through and process the override normally below
+            else:
+                # Delete (not just skip) any mode_override.json queued during
+                # the reload window (issue #79 review). Leaving it in place lets
+                # a stale override apply the instant the window clears — possibly
+                # flipping the bot to auto with no human in the loop.
+                override_path = os.path.join(self.bot_dir, "mode_override.json")
+                try:
+                    if os.path.exists(override_path):
+                        os.remove(override_path)
+                        self._emit(
+                            "on_status",
+                            "[RESUME] Deleted stale mode_override.json during reload")
+                except OSError:
+                    pass
+                return None
         override_path = os.path.join(self.bot_dir, "mode_override.json")
         try:
             if not os.path.exists(override_path):
@@ -504,6 +563,39 @@ class LiveRunner:
             except Exception:
                 pass
 
+    def reset_bar_monotonicity(self) -> None:
+        """Reset the out-of-order bar guards on all aggregators (issue #78).
+
+        Called by the GUI when a reconnect re-enters the tick-history replay
+        window, so the first bar after the gap is always accepted without
+        discarding any in-progress aggregation.
+        """
+        self.aggregator.reset_stale_tracking()
+        for agg in self._htf_aggregators.values():
+            agg.reset_stale_tracking()
+        # Issue #78 (review): the first replayed tick force-finalizes the
+        # in-progress 1-min bar into a TRUNCATED bar, which lands in the dedup
+        # set. Drop that last entry so the correct, full replayed bar can be
+        # re-accepted instead of being silently dedup-dropped.
+        self.clear_last_bar_dedup()
+
+    def clear_last_bar_dedup(self) -> None:
+        """Remove only the most-recent 1-min bar from the dedup set (issue #78).
+
+        On a COM reconnect the BarBuilder force-finalizes whatever in-progress
+        1-min bar it held into a TRUNCATED bar (missing the ticks that arrived
+        after the drop). Its timestamp is recorded in ``_seen_1m_dts``. When the
+        replay then delivers the CORRECT full bar for that same minute,
+        ``_ingest_1m_bar`` would dedup-drop it, leaving the truncated bar in
+        place forever.
+
+        Removing ONLY the last (newest) entry lets the full replayed bar be
+        re-accepted while older bars stay deduped — we must not re-process
+        those or they would double-count trades/volume.
+        """
+        if self._seen_1m_dts:
+            self._seen_1m_dts.discard(max(self._seen_1m_dts))
+
     # ── Warmup ──
 
     def get_warmup_params(self) -> dict:
@@ -535,6 +627,10 @@ class LiveRunner:
     def feed_warmup_bars(self, kline_strings: list[str]) -> int:
         """Parse historical bars and seed DataStore. Returns bar count loaded."""
         self.state = LiveState.WARMING_UP
+        # Issue #79: warmup + the tick-history replay that follows are the
+        # "reloading" window. Mark it so mode overrides are ignored until
+        # the GUI clears the flag when live ticks begin.
+        self._is_reloading = True
 
         bars = parse_kline_strings(
             kline_strings, symbol=self.symbol, interval=self.target_interval,
@@ -837,6 +933,44 @@ class LiveRunner:
             decision["exit_limit"] = exit_limit
         self._emit("on_decision", decision)
 
+    def log_blocked_signal(self, action: str, side: str, price: int,
+                           reason_code: str, detail: str = "") -> None:
+        """Record a strategy signal the risk gate/TradingGuard rejected (issue #62).
+
+        When an entry or exit signal is blocked before a real order is sent
+        — daily-loss limit reached, waiting on a prior fill, system halted,
+        no confirmed real position, settlement-day no-entry window, etc. —
+        the block used to be invisible in ``decisions.csv`` and the UI event
+        log. The user could only discover it by digging through raw logs.
+
+        This surfaces the block as a ``SIGNAL_BLOCKED`` decision tied to the
+        most recent bar, using the same emit path as ``_log_decision`` so it
+        renders in the UI event log table and is appended to ``decisions.csv``.
+
+        Args:
+            action: the original signal action ("ENTRY_FILL", "TRADE_CLOSE", ...)
+            side: signal direction ("LONG", "SHORT", or "")
+            price: signal price (int; TAIFEX prices are integers)
+            reason_code: short machine-readable block code, stored in the
+                ``tag`` column (e.g. "DAILY_LOSS_LIMIT", "FILL_PENDING")
+            detail: human-readable explanation, stored in the ``reason`` column
+        """
+        bar_dt = (self._aggregated_bars[-1].dt if self._aggregated_bars
+                  else datetime.now(_TZ_TAIPEI).replace(tzinfo=None))
+        now = datetime.now()
+        reason = f"{action}: {detail}" if detail else action
+        price = int(price)
+        self.csv_logger.log_decision(
+            dt=now, bar_dt=bar_dt, strategy=self.strategy.name,
+            action="SIGNAL_BLOCKED", side=side, tag=reason_code,
+            price=price, reason=reason,
+        )
+        self._emit("on_decision", {
+            "dt": now, "bar_dt": bar_dt, "strategy": self.strategy.name,
+            "action": "SIGNAL_BLOCKED", "side": side, "tag": reason_code,
+            "price": price, "reason": reason,
+        })
+
     # ── Status & results ──
 
     def get_status(self) -> dict:
@@ -1089,7 +1223,12 @@ class LiveRunner:
         self._started_at = session_data.get("started_at", self._started_at)
         return len(self.broker.trades)
 
-    def reload_1m_bars(self) -> int:
+    # Emit a progress tick every N bars during reload so the GUI can keep
+    # the Tkinter event loop pumping (issue #79 — long-lookback strategies
+    # froze the UI for seconds while thousands of saved bars were re-fed).
+    _RELOAD_PROGRESS_EVERY = 500
+
+    def reload_1m_bars(self, progress_cb: Callable[[int, int], None] | None = None) -> int:
         """Reload saved 1-min bar CSVs into _1m_bars and _seen_1m_dts.
 
         Call AFTER restore_session() and feed_warmup_bars().
@@ -1108,10 +1247,25 @@ class LiveRunner:
         bars but then drops them via the _seen_1m_dts dedup before they
         can reach _aggregated_bars (issue #45).
 
+        ``progress_cb`` (issue #79): optional ``(done, total) -> None`` hook
+        invoked every ``_RELOAD_PROGRESS_EVERY`` bars during the two heavy
+        loops (CSV parse and, for 1-min strategies, the data_store/HTF
+        rebuild). LiveRunner is UI-agnostic, so the GUI passes a callback
+        that logs progress and pumps the Tkinter event loop to stay
+        responsive. ``total`` is 0 while it is not yet known (parse phase).
+        Bars are still fed strictly in order — the callback only observes.
+
         Returns the number of NEW 1-min bars loaded from CSV.
         """
         import csv
         import glob as glob_mod
+
+        def _tick(done: int, total: int) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(done, total)
+                except Exception:
+                    pass  # a broken UI callback must never break the reload
 
         pattern = os.path.join(self.bot_dir, "bars_1m_*.csv")
         csv_files = sorted(glob_mod.glob(pattern))
@@ -1146,6 +1300,9 @@ class LiveRunner:
                             self._seen_1m_dts.add(dt)
                             self._1m_bars.append(bar)
                             new_bars.append(bar)
+                            # total unknown during parse → 0
+                            if len(new_bars) % self._RELOAD_PROGRESS_EVERY == 0:
+                                _tick(len(new_bars), 0)
                         except (ValueError, IndexError):
                             continue
             except OSError:
@@ -1170,8 +1327,11 @@ class LiveRunner:
             from ..market_data.data_store import DataStore
             maxlen = self.data_store._bars.maxlen or 5000
             new_store = DataStore(max_bars=maxlen)
-            for b in merged:
+            total = len(merged)
+            for i, b in enumerate(merged, 1):
                 new_store.add_bar(b)
+                if i % self._RELOAD_PROGRESS_EVERY == 0:
+                    _tick(i, total)
             self.data_store = new_store
             # MTF: rebuild HTF state by re-feeding primary bars through
             # fresh aggregators so backtest/live parity holds across
@@ -1183,8 +1343,10 @@ class LiveRunner:
                     iv: BarAggregator(self.symbol, iv)
                     for iv in self._htf_intervals
                 }
-                for b in merged:
+                for i, b in enumerate(merged, 1):
                     self._feed_htf(b)
+                    if i % self._RELOAD_PROGRESS_EVERY == 0:
+                        _tick(i, total)
             # CSV-loaded bars are historical, not live — bump
             # _warmup_bar_count so get_live_bars() continues to slice
             # off the correct prefix.

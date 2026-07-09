@@ -210,6 +210,65 @@ class TestCheckModeOverride:
             f.write("not json{{{")
         assert runner._check_mode_override() is None
 
+    def test_deletes_stale_override_while_reloading(self, tmp_path):
+        """Issue #79 (review): during warmup/history replay (_is_reloading=True)
+        a pending mode_override.json is treated as STALE and DELETED — leaving
+        it in place would let it apply the instant the reload window clears,
+        possibly flipping the bot to auto with no human in the loop."""
+        runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))
+        override_path = os.path.join(runner.bot_dir, "mode_override.json")
+        os.makedirs(os.path.dirname(override_path), exist_ok=True)
+        with open(override_path, "w") as f:
+            json.dump({"trading_mode": "auto"}, f)
+
+        runner._is_reloading = True
+        assert runner._check_mode_override() is None
+        # File must be DELETED, not preserved.
+        assert not os.path.exists(override_path)
+
+        # Nothing left to apply once reloading is done.
+        runner._is_reloading = False
+        assert runner._check_mode_override() is None
+
+    def test_reload_window_auto_clears_after_timeout(self, tmp_path):
+        """Issue #79 (review): a reload window that never closes (e.g. dead
+        tick feed) auto-clears after RELOAD_TIMEOUT_SECONDS so hot-swap isn't
+        wedged forever. Once cleared, a fresh override applies normally."""
+        runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))
+        override_path = os.path.join(runner.bot_dir, "mode_override.json")
+        os.makedirs(os.path.dirname(override_path), exist_ok=True)
+
+        runner._is_reloading = True
+        # Simulate the window having opened well past the timeout.
+        runner._reload_started_at -= runner.RELOAD_TIMEOUT_SECONDS + 1
+
+        # A newly-dropped override arrives after the window went stale.
+        with open(override_path, "w") as f:
+            json.dump({"trading_mode": "semi_auto"}, f)
+
+        result = runner._check_mode_override()
+        assert runner._is_reloading is False  # auto-cleared
+        assert result == "semi_auto"          # override then processed normally
+        assert not os.path.exists(override_path)
+
+    def test_reloading_flag_stamps_start_time(self, tmp_path):
+        """The _is_reloading property records a start timestamp on False→True
+        and clears it on True→False, powering the safety timeout."""
+        runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))
+        assert runner._reload_started_at is None
+        runner._is_reloading = True
+        assert runner._reload_started_at is not None
+        runner._is_reloading = False
+        assert runner._reload_started_at is None
+
+    def test_feed_warmup_sets_reloading_flag(self, tmp_path):
+        """feed_warmup_bars marks the reloading window so mode overrides are
+        ignored until the GUI clears the flag on the first live tick."""
+        runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))
+        assert runner._is_reloading is False
+        runner.feed_warmup_bars([])
+        assert runner._is_reloading is True
+
 
 class TestApplyModeSwitch:
     def _make_runner(self, tmp_path, mode="paper", allow_override=False):

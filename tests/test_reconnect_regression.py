@@ -258,3 +258,38 @@ class TestStructuredLoggingTags:
         assert "def _set_quote_connected(" in rb_source, (
             "Missing _set_quote_connected helper — direct assignment of "
             "self._quote_connected loses the state-transition log line.")
+
+
+# ---------------------------------------------------------------------------
+# Issue #78 — bar/tick monotonicity guard reset on reconnect
+# ---------------------------------------------------------------------------
+
+class TestIssue78_MonotonicityResetOnReconnect:
+    """After a COM dropout, RequestTicks replays history in a burst whose
+    timestamps can go backwards. `_resubscribe_ticks` must reset the
+    out-of-order guards so the first tick/bar after the gap is accepted,
+    then let the guards drop the stale remainder."""
+
+    def test_resubscribe_resets_bar_builder_guard(self, rb_source: str):
+        match = re.search(
+            r"def _resubscribe_ticks\(self.*?(?=\n    def )",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match, "could not locate _resubscribe_ticks body"
+        body = match.group(0)
+        assert "reset_stale_tracking" in body, (
+            "Issue #78 regression: _resubscribe_ticks must reset the "
+            "BarBuilder out-of-order tick guard on reconnect.")
+
+    def test_resubscribe_resets_aggregator_guards(self, rb_source: str):
+        match = re.search(
+            r"def _resubscribe_ticks\(self.*?(?=\n    def )",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match, "could not locate _resubscribe_ticks body"
+        body = match.group(0)
+        assert "reset_bar_monotonicity" in body, (
+            "Issue #78 regression: _resubscribe_ticks must reset the "
+            "aggregator out-of-order bar guards on reconnect.")

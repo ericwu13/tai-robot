@@ -1,14 +1,14 @@
 """Tests for LiveRunner: warmup, feed, dedup, strategy execution, stop."""
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.market_data.models import Bar
 from src.market_data.data_store import DataStore
 from src.backtest.broker import SimulatedBroker, BrokerContext, OrderSide
 from src.backtest.strategy import BacktestStrategy
 from src.live.live_runner import LiveRunner, LiveState, is_market_open
-from src.live.bar_aggregator import aggregate_bars
+from src.live.bar_aggregator import BarAggregator, aggregate_bars
 
 
 # ── Simple test strategy ──
@@ -1087,6 +1087,69 @@ class TestReload1mBarsIssue45:
         assert runner.data_store._bars.maxlen == original_maxlen
 
 
+# ── Regression: issue #79 — reload progress yields (UI freeze) ──
+
+class TestReload1mBarsProgressIssue79:
+    """reload_1m_bars must report progress so the GUI can pump the Tk event
+    loop and stay responsive while re-feeding thousands of saved bars."""
+
+    @staticmethod
+    def _write_many_bars(path: str, n: int) -> None:
+        base = datetime(2026, 2, 28, 0, 0)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("datetime,open,high,low,close,volume\n")
+            for i in range(n):
+                dt = base + timedelta(minutes=i)
+                c = 22500 + i
+                f.write(f"{dt.strftime('%Y/%m/%d %H:%M')},{c},{c+5},{c-5},{c},10\n")
+
+    def test_progress_cb_called_and_order_preserved(self, tmp_path):
+        strategy = OneMinRecordingStrategy()  # 1-min native → heavy rebuild path
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+
+        n = 1300  # > 2 * _RELOAD_PROGRESS_EVERY (500)
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        self._write_many_bars(csv_path, n)
+
+        calls: list[tuple[int, int]] = []
+        count = runner.reload_1m_bars(progress_cb=lambda d, t: calls.append((d, t)))
+
+        assert count == n
+        # Progress fired at least once per heavy loop.
+        assert len(calls) >= 2
+        # Every tick reports a positive batch count (multiple of the stride).
+        assert all(d > 0 and d % runner._RELOAD_PROGRESS_EVERY == 0
+                   for d, _ in calls)
+        # Parse phase reports total=0 (unknown); rebuild phase reports the
+        # real total once known.
+        assert any(t == 0 for _, t in calls)      # parse phase
+        assert any(t == n for _, t in calls)      # rebuild phase, total known
+        # Bars are still in chronological order (callback only observes).
+        agg = runner.get_bars()
+        assert [b.dt for b in agg] == sorted(b.dt for b in agg)
+        assert len(agg) == n
+
+    def test_no_callback_is_safe(self, tmp_path):
+        """Omitting progress_cb (default None) must not raise."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        self._write_many_bars(csv_path, 600)
+        assert runner.reload_1m_bars() == 600
+
+    def test_broken_callback_does_not_break_reload(self, tmp_path):
+        """A raising progress_cb must be swallowed — reload still completes."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260228.csv")
+        self._write_many_bars(csv_path, 600)
+
+        def _boom(done, total):
+            raise RuntimeError("UI callback blew up")
+
+        assert runner.reload_1m_bars(progress_cb=_boom) == 600
+
+
 # ── Regression: issue #45 — real_entry_price flow into Trades ──
 
 class TestRealEntryPriceLiveRunnerIssue45:
@@ -1237,3 +1300,109 @@ class TestLoad1mBarsFromCsvs:
             encoding="utf-8")
         bars = load_1m_bars_from_csvs(str(tmp_path), "TX00")
         assert len(bars) == 1
+
+
+class TestResetBarMonotonicity:
+    """Issue #78: reconnect must reset the out-of-order bar guards on the
+    primary aggregator AND all HTF aggregators, so the first bar after the
+    replay gap is always accepted."""
+
+    def test_reset_clears_primary_and_htf_trackers(self, tmp_path):
+        strategy = AlwaysLongStrategy()  # 15-min primary
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        # Force an HTF aggregator to exist alongside the primary one.
+        runner._htf_aggregators[14400] = BarAggregator("TX00", 14400)
+
+        # Advance the guards past a known time on every aggregator.
+        seed = Bar(symbol="TX00", dt=datetime(2026, 3, 2, 9, 0), open=100,
+                   high=110, low=90, close=105, volume=10, interval=60)
+        runner.aggregator.on_bar(seed)
+        runner._htf_aggregators[14400].on_bar(seed)
+        assert runner.aggregator._last_bar_time is not None
+        assert runner._htf_aggregators[14400]._last_bar_time is not None
+
+        runner.reset_bar_monotonicity()
+
+        assert runner.aggregator._last_bar_time is None
+        assert runner._htf_aggregators[14400]._last_bar_time is None
+
+
+class TestBlockedSignalLog:
+    """Issue #62: when the risk gate / TradingGuard rejects a strategy signal
+    (daily loss limit, fill pending, halted, no real position, settlement
+    window), it must be recorded as a SIGNAL_BLOCKED decision so the block
+    appears in decisions.csv AND the UI event log instead of being silent."""
+
+    def _running_runner(self, tmp_path):
+        """A RUNNING runner with one completed aggregated bar (09:00 15-min)."""
+        strategy = AlwaysLongStrategy()  # 15-min
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        warmup = [
+            _kline("2026-02-28 09:00", 22000, 22100, 21900, 22050, 500),
+            _kline("2026-02-28 09:15", 22050, 22150, 22000, 22100, 400),
+        ]
+        runner.feed_warmup_bars(warmup)
+        # 09:00-09:14 then 09:15 crosses the 15-min boundary → 09:00 bar closes.
+        runner.feed_1m_bars(_klines_1m("2026-03-01", start_min=540, count=15))
+        runner.feed_1m_bars([_kline("2026-03-01 09:15", 22515, 22525, 22510, 22520, 65)])
+        return runner
+
+    def test_blocked_entry_emits_signal_blocked_decision(self, tmp_path):
+        runner = self._running_runner(tmp_path)
+        emitted = []
+        runner.on("on_decision", emitted.append)
+
+        # Simulate the daily-loss-limit block (guard.BLOCK_ENTRY): a long
+        # entry signal at 22,505 rejected because the limit was reached.
+        runner.log_blocked_signal(
+            "ENTRY_FILL", "LONG", 22505, "DAILY_LOSS_LIMIT",
+            "daily loss limit reached (10,000 NTD)")
+
+        blocked = [d for d in emitted if d["action"] == "SIGNAL_BLOCKED"]
+        assert len(blocked) == 1
+        d = blocked[0]
+        assert d["side"] == "LONG"
+        assert d["price"] == 22505
+        assert d["tag"] == "DAILY_LOSS_LIMIT"
+        assert "daily loss limit" in d["reason"]
+        assert d["strategy"] == runner.strategy.name
+        # Tied to the triggering K-bar (the last completed aggregated bar).
+        assert d["bar_dt"] == runner._aggregated_bars[-1].dt
+
+    def test_blocked_signal_written_to_decisions_csv(self, tmp_path):
+        runner = self._running_runner(tmp_path)
+        runner.log_blocked_signal(
+            "ENTRY_FILL", "SHORT", 22480, "FILL_PENDING",
+            "waiting for entry fill confirmation")
+        runner.stop()  # flush + close csv handles
+
+        import csv
+        with open(tmp_path / "decisions.csv", "r", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        header, data = rows[0], rows[1:]
+        assert header == ["datetime", "bar_dt", "strategy", "action",
+                          "side", "tag", "price", "reason"]
+        blocked = [r for r in data if r[3] == "SIGNAL_BLOCKED"]
+        assert len(blocked) == 1
+        r = blocked[0]
+        assert r[4] == "SHORT"          # side
+        assert r[5] == "FILL_PENDING"   # tag = reason code
+        assert r[6] == "22480"          # price
+        assert "waiting for entry fill" in r[7]  # reason
+
+    def test_blocked_signal_falls_back_to_now_without_bars(self, tmp_path):
+        """No completed bar yet → bar_dt falls back to wall-clock, no crash."""
+        strategy = AlwaysLongStrategy()
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        emitted = []
+        runner.on("on_decision", emitted.append)
+
+        runner.log_blocked_signal(
+            "TRADE_CLOSE", "LONG", 22600, "NO_REAL_POSITION",
+            "exit — no real entry was confirmed")
+
+        assert len(emitted) == 1
+        assert emitted[0]["action"] == "SIGNAL_BLOCKED"
+        assert emitted[0]["bar_dt"] is not None
