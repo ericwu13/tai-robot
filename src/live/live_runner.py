@@ -1059,6 +1059,15 @@ class LiveRunner:
         """Return only live-trading aggregated bars (excluding warmup history)."""
         return list(self._aggregated_bars[self._warmup_bar_count:])
 
+    @property
+    def started_at(self) -> str:
+        """When this session originally started (ISO string).
+
+        Survives restarts: restore_session() replaces the process start
+        time with the one persisted in session.json.
+        """
+        return self._started_at
+
     def get_1m_bars(self) -> list[Bar]:
         """Return snapshot of stored 1-min bars."""
         return list(self._1m_bars)

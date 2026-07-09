@@ -9,6 +9,43 @@ from .broker import Trade
 from .metrics import PerformanceMetrics, calculate_metrics
 
 
+def live_trading_period(
+    started_at: str | None,
+    trades: list[Trade] | None,
+    last_bar_dt: str | None,
+) -> tuple[str, str] | None:
+    """Return the ``(start, end)`` of a live session's full trading period.
+
+    A resumed session keeps its original ``started_at`` and restored trade
+    history, but the process only holds live bars since the latest restart —
+    so the period must be derived from all three sources, not the bar list:
+
+    - start: the earlier of ``started_at`` and the first trade's ``entry_dt``
+      (old session files may lack ``started_at``)
+    - end:   the later of ``last_bar_dt`` and the last trade's ``exit_dt``
+      (the bot may have been offline since the last trade)
+
+    All datetimes are "YYYY-MM-DD HH:MM" strings (Trade dt convention), which
+    compare correctly as strings. ``started_at`` may be an ISO timestamp with
+    a "T" separator and seconds; it is normalized. Returns None when either
+    endpoint has no data (e.g. fresh session still warming up).
+    """
+    starts: list[str] = []
+    ends: list[str] = []
+    if started_at:
+        starts.append(started_at.replace("T", " ")[:16])
+    if last_bar_dt:
+        ends.append(last_bar_dt)
+    for t in trades or []:
+        if t.entry_dt:
+            starts.append(t.entry_dt)
+        if t.exit_dt:
+            ends.append(t.exit_dt)
+    if not starts or not ends:
+        return None
+    return min(starts), max(ends)
+
+
 def format_report(strategy_name: str, metrics: PerformanceMetrics,
                   trades: list[Trade] | None = None) -> str:
     """Format the metrics block; when ``trades`` is given and any carry a
