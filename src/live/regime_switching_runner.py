@@ -253,6 +253,8 @@ class RegimeSwitchingRunner(LiveRunner):
                 "broker": self.broker.to_dict(),
                 "regime_mode": True,
                 "active_leg": self._active_leg,
+                "long_strategy": self._long_strategy_name,
+                "short_strategy": self._short_strategy_name,
             }
             save_session(self._session_path, data)
         except Exception:

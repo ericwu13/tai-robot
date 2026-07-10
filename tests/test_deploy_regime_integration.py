@@ -154,6 +154,8 @@ class TestRegimeResume:
             data = json.load(f)
         assert data["regime_mode"] is True
         assert data["active_leg"] == "idle"
+        assert data["long_strategy"] == "StrategyA"
+        assert data["short_strategy"] == "StrategyB"
 
     def test_plain_session_lacks_regime_mode(self, tmp_path):
         runner = _make_plain_runner(tmp_path)

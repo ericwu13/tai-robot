@@ -16,7 +16,6 @@ from src.daily_report.regime_classifier import RegimeResult
 @dataclass
 class RegimeConfig:
     enabled: bool = False
-    dry_run: bool = True
     adx_enter: float = 25.0
     adx_exit: float = 20.0
     confirm_sessions: int = 2

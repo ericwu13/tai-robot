@@ -199,11 +199,10 @@ class RegimeManager:
     def _notify_discord(self, rec, session_date: str):
         if not callable(self.discord_notify_cb):
             return
-        tag = "🔄 DRY-RUN" if rec.dry_run else "⚡ LIVE"
         action_label = {"deploy_long": "做多 LONG", "deploy_short": "做空 SHORT",
                         "deploy_short_half": "做空半倉 SHORT½", "sit_out": "觀望 SIT OUT",
                         "hold": "維持 HOLD"}.get(rec.action, rec.action)
-        msg = (f"📊 **Regime 建議 {tag}** — {session_date}\n"
+        msg = (f"📊 **Regime 建議** — {session_date}\n"
                f"原始 Raw: `{self._state.raw_regime}` (ADX {self._state.last_features.get('adx', 0):.1f})\n"
                f"有效 Effective: `{self._state.effective_regime}` (since {self._state.effective_since})\n"
                f"建議 Recommendation: **{action_label}**"

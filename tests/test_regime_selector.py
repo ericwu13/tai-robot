@@ -5,7 +5,7 @@ from src.regime.selector import StrategySelector, Recommendation
 
 
 def cfg(**kw):
-    base = dict(enabled=True, dry_run=True, long_strategy="LongBot",
+    base = dict(enabled=True, long_strategy="LongBot",
                 short_strategy="ShortBot")
     base.update(kw)
     return RegimeConfig(**base)
@@ -17,7 +17,6 @@ def test_trending_up_deploys_long():
     rec = sel.select(s, cfg())
     assert rec.action == "deploy_long"
     assert rec.strategy_name == "LongBot"
-    assert rec.dry_run is True
 
 
 def test_trending_down_deploys_short():
@@ -116,8 +115,8 @@ def test_override_precedes_pause_and_vol_spike():
     assert rec.action == "deploy_long"
 
 
-def test_dry_run_flag_propagates():
+def test_recommendation_has_no_dry_run():
     sel = StrategySelector()
     s = RegimeState(effective_regime="trending-up")
-    rec = sel.select(s, cfg(dry_run=False))
-    assert rec.dry_run is False
+    rec = sel.select(s, cfg())
+    assert not hasattr(rec, "dry_run")
