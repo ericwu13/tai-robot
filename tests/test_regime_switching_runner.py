@@ -174,6 +174,37 @@ class TestApplyPending:
         assert runner.active_leg == "idle"
         assert runner.regime_idle is True
 
+    def test_cross_tf_swap_without_history_keeps_pending(self, tmp_path):
+        # A cross-timeframe leg needs accumulated 1-min history to rebuild
+        # its aggregator. The 15-min warmup leaves _1m_bars empty, so the
+        # swap is refused and the pending recommendation stays for retry.
+        class Short30m(BacktestStrategy):
+            name = "Short30m"
+            kline_type = 0
+            kline_minute = 30
+
+            def on_bar(self, bar, data_store, broker):
+                pass
+
+            def required_bars(self):
+                return 2
+
+        runner = _make_runner(tmp_path)
+        runner._strategies_registry = dict(runner._strategies_registry)
+        runner._strategies_registry["Short30m"] = Short30m
+        runner._short_strategy_name = "Short30m"
+        runner._pending_recommendation = {
+            "date": "2026-07-10", "action": "deploy_short",
+            "strategy": "Short30m", "qty_scale": 1.0, "reason": "test",
+        }
+        now = datetime(2026, 7, 10, 7, 0, tzinfo=_TZ_TAIPEI)
+        result = runner._maybe_apply_pending(now)
+        assert result is None
+        # Pending survives for the next poll; nothing swapped.
+        assert runner._pending_recommendation is not None
+        assert runner.active_leg != "short"
+        assert runner.target_interval == 900  # still 15-min
+
     def test_apply_hold_noop(self, tmp_path):
         runner = _make_runner(tmp_path)
         runner._pending_recommendation = {

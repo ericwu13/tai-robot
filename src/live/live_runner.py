@@ -563,8 +563,10 @@ class LiveRunner:
     ) -> tuple[bool, str]:
         """Replace the active strategy in-place. Returns (ok, reason).
 
-        Refuses unless the broker is flat, no external veto, not in
-        replay, and the new strategy shares the same timeframe.
+        Refuses unless the broker is flat, no external veto, and not in
+        replay. A leg on a DIFFERENT timeframe is supported: the primary
+        aggregator + DataStore are rebuilt from accumulated 1-min history
+        (see ``_rebuild_timeframe``) before the swap commits.
         """
         # Gate 1: flat
         if self.broker.has_open_position():
@@ -577,12 +579,19 @@ class LiveRunner:
         # Gate 3: not in replay
         if self.suppress_strategy or self._is_reloading:
             return False, "in replay/reload window"
-        # Gate 4: same timeframe
+        # Gate 4: timeframe. Same TF proceeds directly. A different TF
+        # triggers a swap-time aggregator rebuild from the accumulated
+        # 1-min history; if there is not yet enough of it, refuse the swap
+        # so the pending recommendation is retried on the next poll.
         new_kt = new_strategy.kline_type
         new_km = new_strategy.kline_minute
+        new_interval = _INTERVAL_SECONDS.get((new_kt, new_km), 14400)
         if (new_kt, new_km) != (self.strategy.kline_type, self.strategy.kline_minute):
-            return False, f"timeframe mismatch: ({new_kt},{new_km}) vs ({self.strategy.kline_type},{self.strategy.kline_minute})"
-        # Gate 5: enough bars
+            if not self._rebuild_timeframe(new_interval, new_strategy):
+                return False, (
+                    f"insufficient 1-min history to rebuild "
+                    f"({new_kt},{new_km}) timeframe")
+        # Gate 5: enough bars (already guaranteed when a rebuild happened)
         if new_strategy.required_bars() > len(self.data_store):
             return False, f"insufficient bars: need {new_strategy.required_bars()}, have {len(self.data_store)}"
 
@@ -611,6 +620,100 @@ class LiveRunner:
         self._auto_save_session()
         self._emit("on_status", f"[SWAP] strategy → {display_name}")
         return True, ""
+
+    def _rebuild_timeframe(
+        self, new_interval: int, new_strategy: BacktestStrategy
+    ) -> bool:
+        """Rebuild the primary aggregator + DataStore for a new target interval.
+
+        Called by ``swap_strategy`` when the incoming leg runs on a
+        different timeframe than the current one. Re-aggregates the FULL
+        1-min history — persisted ``bars_1m_*.csv`` (via
+        ``load_1m_bars_from_csvs``) merged with the in-memory ``_1m_bars``
+        deque, deduped and sorted — to ``new_interval``.
+
+        The trailing partial bar is deliberately kept INSIDE the fresh
+        aggregator as the in-progress bar (NOT flushed into the store), so
+        the next live 1-min bar continues it instead of double-counting.
+
+        Sufficiency is checked BEFORE any state is mutated: if the rebuilt
+        bar count is below the new strategy's ``required_bars()`` the method
+        logs a warning and returns ``False`` without touching the runner —
+        the caller aborts the swap and the pending recommendation is
+        retried later, once more 1-min history has accumulated.
+
+        On success the new aggregator, ``target_interval``, ``data_store``,
+        ``_aggregated_bars``, ``_warmup_bar_count`` and HTF aggregators are
+        committed atomically and ``True`` is returned. ``_bar_index`` is
+        left untouched so existing broker trade indices stay valid.
+        """
+        # 1. Gather full 1-min history: persisted CSVs + in-memory deque,
+        #    deduped by timestamp (in-memory wins) and sorted ascending.
+        bars_1m_map: dict[datetime, Bar] = {}
+        for b in load_1m_bars_from_csvs(self.bot_dir, self.symbol):
+            bars_1m_map[b.dt] = b
+        for b in self._1m_bars:
+            bars_1m_map[b.dt] = b
+        bars_1m = [bars_1m_map[k] for k in sorted(bars_1m_map)]
+
+        # 2. Re-aggregate to the new interval. Feed each 1-min bar through a
+        #    fresh aggregator: completed bars are collected, the trailing
+        #    partial stays inside `new_agg` (for interval==60 every bar is a
+        #    pass-through and there is no partial).
+        new_agg = BarAggregator(self.symbol, new_interval)
+        completed: list[Bar] = []
+        for b in bars_1m:
+            done = new_agg.on_bar(b)
+            if done is not None:
+                completed.append(done)
+
+        # 3. Sufficiency check BEFORE committing anything.
+        required = new_strategy.required_bars()
+        if len(completed) < required:
+            self._emit(
+                "on_status",
+                f"[SWAP] rebuild to {new_interval}s refused: "
+                f"{len(completed)} bars < required {required} — "
+                f"need more accumulated 1-min history")
+            return False
+
+        # 4. Validate the new strategy's HTF intervals against the new
+        #    primary interval before mutating anything.
+        new_htf = list(getattr(new_strategy, "htf_intervals", []) or [])
+        if new_htf:
+            from ..backtest.engine import validate_htf_intervals
+            validate_htf_intervals(new_interval, new_htf)
+
+        # 5. Build the replacement DataStore + HTF aggregators off the
+        #    completed bars (HTF aggregators keep their own trailing partial).
+        maxlen = self.data_store._bars.maxlen or 5000
+        new_store = DataStore(max_bars=maxlen)
+        new_htf_aggs: dict[int, BarAggregator] = {}
+        for iv in new_htf:
+            new_store._register_htf(iv)
+            new_htf_aggs[iv] = BarAggregator(self.symbol, iv)
+        for b in completed:
+            new_store.add_bar(b)
+            for iv, agg in new_htf_aggs.items():
+                hb = agg.on_bar(b)
+                if hb is not None:
+                    new_store._add_htf_bar(iv, hb)
+
+        # 6. Atomic commit. `_bar_index` is intentionally NOT reset.
+        self.aggregator = new_agg
+        self.target_interval = new_interval
+        self.data_store = new_store
+        self._aggregated_bars = list(completed)
+        self._warmup_bar_count = len(completed)
+        self._htf_intervals = new_htf
+        self._htf_aggregators = new_htf_aggs
+        self._htf_required = new_strategy.htf_required_bars() or {}
+
+        self._emit(
+            "on_status",
+            f"[SWAP] rebuilt timeframe → {new_interval}s: "
+            f"{len(completed)} bars from {len(bars_1m)} 1-min bars")
+        return True
 
     # ── Callback system ──
 

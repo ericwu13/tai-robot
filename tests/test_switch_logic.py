@@ -157,7 +157,10 @@ class TestValidateLegStrategies:
         errors = validate_leg_strategies("A", "B", {})
         assert len(errors) == 2
 
-    def test_timeframe_mismatch(self):
+    def test_timeframe_mismatch_is_allowed(self, caplog):
+        # Mixed timeframes are supported via a swap-time aggregator rebuild,
+        # so validation no longer errors — it only logs a soft warning.
+        import logging
         class S1:
             kline_type = 0
             kline_minute = 60
@@ -165,6 +168,7 @@ class TestValidateLegStrategies:
             kline_type = 0
             kline_minute = 240
         registry = {"Long": S1, "Short": S2}
-        errors = validate_leg_strategies("Long", "Short", registry)
-        assert len(errors) == 1
-        assert "mismatch" in errors[0].lower()
+        with caplog.at_level(logging.WARNING):
+            errors = validate_leg_strategies("Long", "Short", registry)
+        assert errors == []
+        assert any("Mixed timeframes" in r.message for r in caplog.records)

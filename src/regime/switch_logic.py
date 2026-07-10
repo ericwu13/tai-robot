@@ -6,7 +6,10 @@ all testable without COM, Tk, or live infrastructure.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -105,7 +108,12 @@ def validate_leg_strategies(
     short_name: str,
     registry: dict,
 ) -> list[str]:
-    """Validate that both leg strategies exist and share the same timeframe.
+    """Validate that both leg strategies exist in the registry.
+
+    Mixed timeframes are ALLOWED: the switching runner rebuilds its bar
+    aggregator from accumulated 1-min history when it swaps to a leg on a
+    different timeframe (see ``LiveRunner._rebuild_timeframe``). A mismatch
+    is therefore only logged as a soft warning, not returned as an error.
 
     Returns a list of error strings (empty = valid).
     """
@@ -124,7 +132,10 @@ def validate_leg_strategies(
     s_kt = getattr(short_cls, "kline_type", 0)
     s_km = getattr(short_cls, "kline_minute", 1)
     if (l_kt, l_km) != (s_kt, s_km):
-        errors.append(
-            f"時間框架不符 Timeframe mismatch: 多頭 long=({l_kt},{l_km}) vs 空頭 short=({s_kt},{s_km})"
+        logger.warning(
+            "Mixed timeframes detected (long=(%s,%s), short=(%s,%s)): the "
+            "first cross-timeframe swap requires accumulated 1-min history "
+            "to rebuild the new interval's bars before it can apply.",
+            l_kt, l_km, s_kt, s_km,
         )
     return errors
