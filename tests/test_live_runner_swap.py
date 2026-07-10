@@ -161,11 +161,18 @@ class TestSwapStrategyRefused:
         assert ok is False
         assert "replay" in reason
 
-    def test_refused_timeframe_mismatch(self, tmp_path):
+    def test_refused_timeframe_mismatch_without_history(self, tmp_path):
+        # A cross-timeframe swap now attempts a rebuild from accumulated
+        # 1-min history. The 15-min warmup did not populate any 1-min bars,
+        # so the rebuild has nothing to work with and the swap is refused
+        # for insufficient history (not a hard timeframe-mismatch block).
         runner = _make_runner(tmp_path)
         ok, reason = runner.swap_strategy(StrategyDiffTF(), "DiffTF")
         assert ok is False
-        assert "mismatch" in reason
+        assert "insufficient" in reason
+        # State untouched — still on the original timeframe.
+        assert runner.target_interval == 900  # 15-min
+        assert isinstance(runner.strategy, StrategyA)
 
     def test_refused_insufficient_bars(self, tmp_path):
         runner = _make_runner(tmp_path)
