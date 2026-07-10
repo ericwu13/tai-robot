@@ -4501,18 +4501,55 @@ class BacktestApp:
         # Build dialog
         dlg = tk.Toplevel(self.root)
         dlg.title("選擇機器人 Select Bot Session")
-        dlg.geometry("680x520")
+        dlg.geometry("680x600")
+        dlg.minsize(560, 400)
+        dlg.resizable(True, True)
         dlg.transient(self.root)
         dlg.grab_set()
+
+        # Scrollable body: Canvas + Scrollbar + inner Frame.
+        # The regime-switching section expands inline, so the content can grow
+        # taller than the window — this lets the user scroll to reach every field.
+        _outer = ttk.Frame(dlg)
+        _outer.pack(fill=tk.BOTH, expand=True)
+        _canvas = tk.Canvas(_outer, highlightthickness=0)
+        _vscroll = ttk.Scrollbar(_outer, orient="vertical", command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vscroll.set)
+        _vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        _canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        content = ttk.Frame(_canvas)
+        _content_id = _canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _on_content_config(_event=None):
+            _canvas.configure(scrollregion=_canvas.bbox("all"))
+        content.bind("<Configure>", _on_content_config)
+
+        def _on_canvas_config(event):
+            # Keep the inner frame as wide as the canvas so pack fill=X works.
+            _canvas.itemconfigure(_content_id, width=event.width)
+        _canvas.bind("<Configure>", _on_canvas_config)
+
+        def _on_mousewheel(event):
+            _canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_wheel(_event=None):
+            _canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_wheel(_event=None):
+            _canvas.unbind_all("<MouseWheel>")
+        _canvas.bind("<Enter>", _bind_wheel)
+        _canvas.bind("<Leave>", _unbind_wheel)
+        dlg.bind("<Destroy>", lambda e: _unbind_wheel() if e.widget is dlg else None)
 
         result = [None]  # mutable container for return value
 
         # Existing sessions list
         if existing_bots:
-            ttk.Label(dlg, text="載入現有機器人 Load Existing Bot:",
+            ttk.Label(content, text="載入現有機器人 Load Existing Bot:",
                       font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
 
-            list_frame = ttk.Frame(dlg)
+            list_frame = ttk.Frame(content)
             list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
 
             columns = ("name", "strategy", "mode", "trades", "pnl", "position", "saved")
@@ -4559,7 +4596,7 @@ class BacktestApp:
                              regime_var.get(), regime_long_var.get(), regime_short_var.get())
                 dlg.destroy()
 
-            btn_row = ttk.Frame(dlg)
+            btn_row = ttk.Frame(content)
             btn_row.pack(pady=(0, 8))
             ttk.Button(btn_row, text="載入選取 Load Selected", command=on_load).pack(side=tk.LEFT, padx=4)
 
@@ -4619,15 +4656,15 @@ class BacktestApp:
             tree.bind("<Double-1>", lambda e: on_load())
 
         else:
-            ttk.Label(dlg, text=f"沒有 {symbol} 的現有機器人 No existing bots for {symbol}.",
+            ttk.Label(content, text=f"沒有 {symbol} 的現有機器人 No existing bots for {symbol}.",
                       foreground="gray").pack(anchor=tk.W, padx=10, pady=(10, 4))
 
         # New bot section
-        ttk.Separator(dlg, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
-        ttk.Label(dlg, text="建立新機器人 Create New Bot:",
+        ttk.Separator(content, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
+        ttk.Label(content, text="建立新機器人 Create New Bot:",
                   font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(4, 4))
 
-        new_frame = ttk.Frame(dlg)
+        new_frame = ttk.Frame(content)
         new_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
         ttk.Label(new_frame, text="名稱 Name:").pack(side=tk.LEFT, padx=(0, 4))
         new_name_var = tk.StringVar(value=self.strategy_var.get().replace(" ", "_"))
@@ -4655,8 +4692,8 @@ class BacktestApp:
         ttk.Button(new_frame, text="建立 Create", command=on_create).pack(side=tk.LEFT)
 
         # Trading mode selector
-        ttk.Separator(dlg, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
-        mode_frame = ttk.LabelFrame(dlg, text="交易模式 Trading Mode")
+        ttk.Separator(content, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
+        mode_frame = ttk.LabelFrame(content, text="交易模式 Trading Mode")
         mode_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
         mode_var = tk.StringVar(value="paper")
         ttk.Radiobutton(mode_frame, text="模擬 Paper (模擬交易，不下單)",
@@ -4687,8 +4724,8 @@ class BacktestApp:
         loss_entry.pack(side=tk.LEFT, padx=4)
 
         # Regime switching section
-        ttk.Separator(dlg, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
-        regime_lf = ttk.LabelFrame(dlg, text="多空切換 Regime Switching")
+        ttk.Separator(content, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
+        regime_lf = ttk.LabelFrame(content, text="多空切換 Regime Switching")
         regime_lf.pack(fill=tk.X, padx=10, pady=(0, 8))
 
         regime_var = tk.BooleanVar(value=False)
@@ -4715,6 +4752,9 @@ class BacktestApp:
                 regime_strat_frame.pack(fill=tk.X, pady=(0, 4))
             else:
                 regime_strat_frame.pack_forget()
+            # Content height changed — refresh the scroll region so the newly
+            # revealed dropdowns are reachable.
+            _canvas.after_idle(_on_content_config)
 
         ttk.Checkbutton(regime_lf, variable=regime_var,
                         text="啟用多空切換 Enable Regime Switching",
@@ -4723,7 +4763,7 @@ class BacktestApp:
         _toggle_regime_widgets()
 
         # Cancel
-        ttk.Button(dlg, text="取消 Cancel", command=dlg.destroy).pack(pady=(0, 10))
+        ttk.Button(content, text="取消 Cancel", command=dlg.destroy).pack(pady=(0, 10))
 
         # Wait for dialog to close
         self.root.wait_window(dlg)
