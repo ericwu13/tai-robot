@@ -125,6 +125,6 @@ def validate_leg_strategies(
     s_km = getattr(short_cls, "kline_minute", 1)
     if (l_kt, l_km) != (s_kt, s_km):
         errors.append(
-            f"Timeframe mismatch: long=({l_kt},{l_km}) vs short=({s_kt},{s_km})"
+            f"時間框架不符 Timeframe mismatch: 多頭 long=({l_kt},{l_km}) vs 空頭 short=({s_kt},{s_km})"
         )
     return errors
