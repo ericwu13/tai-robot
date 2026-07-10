@@ -26,7 +26,7 @@ def _make_state(**overrides):
 
 def _make_rec(**overrides):
     defaults = dict(action="deploy_long", strategy_name="LongA",
-                    qty_scale=1.0, reason="test", dry_run=False)
+                    qty_scale=1.0, reason="test")
     defaults.update(overrides)
     return Recommendation(**defaults)
 

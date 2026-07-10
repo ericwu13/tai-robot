@@ -48,7 +48,7 @@ def save_state(path: str, state: RegimeState, rec: Recommendation, session_date:
     d["next_session"] = {
         "date": session_date, "action": rec.action,
         "strategy": rec.strategy_name, "qty_scale": rec.qty_scale,
-        "reason": rec.reason, "dry_run": rec.dry_run,
+        "reason": rec.reason,
         "executed": False, "executed_at": None,
     }
     tmp = path + ".tmp"
@@ -115,7 +115,7 @@ def append_history(
             state.raw_regime, state.effective_regime,
             state.pending_count,
             rec.action, rec.strategy_name,
-            rec.dry_run, state.manual_override,
+            "", state.manual_override,
             "", "",  # pnl, trades — filled by record_session_result
             strategy_active,
             str(applied).lower(), applied_at, trading_mode,
