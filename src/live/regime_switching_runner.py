@@ -61,6 +61,10 @@ class RegimeSwitchingRunner(LiveRunner):
             self.bot_dir, regime_cfg,
             bars_provider=bars_provider,
         )
+        # Write an inspectable placeholder regime_state.json at deploy time
+        # so the bot folder reflects regime status before the first
+        # night-end classification. No-op if a state file already exists.
+        self._manager.ensure_initial_state()
 
         self._pending_recommendation: dict | None = None
         self._recorded_sessions: set[tuple[str, str]] = set()
@@ -318,6 +322,14 @@ class RegimeSwitchingRunner(LiveRunner):
     @property
     def active_leg(self) -> str:
         return self._active_leg
+
+    @property
+    def long_strategy_name(self) -> str:
+        return self._long_strategy_name
+
+    @property
+    def short_strategy_name(self) -> str:
+        return self._short_strategy_name
 
     @property
     def regime_manager(self) -> RegimeManager:

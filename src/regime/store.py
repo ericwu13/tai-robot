@@ -59,6 +59,26 @@ def save_state(path: str, state: RegimeState, rec: Recommendation, session_date:
     os.replace(tmp, path)
 
 
+def write_placeholder_state(path: str) -> None:
+    """Write an inspectable placeholder ``regime_state.json`` at deploy time.
+
+    Only writes when no state file exists yet, so a resumed bot's real
+    state (including any unexecuted pending recommendation) is never
+    clobbered. Uses the same atomic temp+fsync+replace pattern as
+    ``save_state`` so the file is never observed half-written. The first
+    night-end classification overwrites this with the full RegimeState.
+    """
+    if os.path.exists(path):
+        return
+    d = {"regime": "unknown", "classified_at": None}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def migrate_legacy_history(csv_path: str) -> None:
     """Rename a v1 history file to regime_history_legacy.csv.
 

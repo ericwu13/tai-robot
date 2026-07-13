@@ -110,6 +110,23 @@ class DiscordNotifier:
             f"策略: {strategy} | 模式: {mode}"
         )
 
+    def bot_deployed_regime(
+        self, long_strategy: str, short_strategy: str, mode: str
+    ) -> None:
+        """Deploy notification for a regime-switching bot.
+
+        Distinct from :meth:`bot_deployed` so the message announces that
+        regime switching is enabled and names both legs, instead of a single
+        strategy (which for a regime bot is just the timeframe donor).
+        """
+        self._send(
+            f"{self._header()}\n"
+            f"🚀 **機器人啟動 Bot Deployed**\n"
+            f"🔄 **多空切換 Regime Switching** 已啟用 Enabled\n"
+            f"做多 Long: {long_strategy} | 做空 Short: {short_strategy}\n"
+            f"模式: {mode}"
+        )
+
     def bot_stopped(self, trades: int, pnl: int) -> None:
         self._send(
             f"{self._header()}\n"

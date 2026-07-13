@@ -532,6 +532,62 @@ class TestFormatReportRealSubset:
         assert "Backtest Report: Test" in report
 
 
+class TestFormatReportRegime:
+    def _make(self, pnl, strategy=""):
+        t = Trade(tag="L", side=OrderSide.LONG, qty=1,
+                  entry_price=20000, exit_price=20000 + pnl,
+                  entry_bar_index=0, exit_bar_index=1, pnl=pnl)
+        t.strategy = strategy
+        return t
+
+    def test_regime_header_shows_both_legs(self):
+        from src.backtest.report import format_report
+        from src.backtest.metrics import calculate_metrics
+        m = calculate_metrics([], [], initial_balance=0)
+        report = format_report(
+            "多空切換 Regime Switching", m,
+            regime={"long": "LongA", "short": "ShortB",
+                    "active_label": "做多 Long", "active_strategy": "LongA"})
+        assert "多空切換 Regime Switching" in report
+        assert "做多 Long: LongA | 做空 Short: ShortB" in report
+        assert "現行 Active: 做多 Long (LongA)" in report
+
+    def test_no_regime_arg_no_extra_header(self):
+        from src.backtest.report import format_report
+        from src.backtest.metrics import calculate_metrics
+        m = calculate_metrics([], [], initial_balance=0)
+        report = format_report("Plain", m)
+        assert "做多 Long:" not in report
+        assert "現行 Active:" not in report
+
+    def test_per_strategy_breakdown_multi(self):
+        from src.backtest.report import format_report
+        from src.backtest.metrics import calculate_metrics
+        trades = [self._make(200, "LongA"), self._make(-50, "LongA"),
+                  self._make(150, "ShortB")]
+        eq, cum = [], 0
+        for t in trades:
+            cum += t.pnl
+            eq.append(cum)
+        m = calculate_metrics(trades, eq, initial_balance=0)
+        report = format_report("多空切換 Regime Switching", m, trades=trades)
+        assert "各策略明細 Per-Strategy Breakdown:" in report
+        assert "LongA:" in report
+        assert "ShortB:" in report
+
+    def test_per_strategy_breakdown_single_absent(self):
+        from src.backtest.report import format_report
+        from src.backtest.metrics import calculate_metrics
+        trades = [self._make(200, "LongA"), self._make(-50, "LongA")]
+        eq, cum = [], 0
+        for t in trades:
+            cum += t.pnl
+            eq.append(cum)
+        m = calculate_metrics(trades, eq, initial_balance=0)
+        report = format_report("LongA", m, trades=trades)
+        assert "Per-Strategy Breakdown" not in report
+
+
 class TestLiveRunnerSummary:
     def test_summary_splits_by_source(self, tmp_path):
         runner = LiveRunner(NeverTradeStrategy(), "TX00", log_dir=str(tmp_path))

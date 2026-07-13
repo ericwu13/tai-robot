@@ -5,10 +5,13 @@ import os
 
 from src.regime.state_machine import RegimeState
 from src.regime.selector import Recommendation
+import json
+
 from src.regime.store import (
     append_history,
     record_session_result,
     migrate_legacy_history,
+    write_placeholder_state,
     _V2_HEADER,
 )
 
@@ -34,6 +37,23 @@ def _make_rec(**overrides):
 def _read_csv(path):
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.reader(f))
+
+
+class TestWritePlaceholderState:
+    def test_writes_when_absent(self, tmp_path):
+        path = str(tmp_path / "regime_state.json")
+        write_placeholder_state(path)
+        assert os.path.exists(path)
+        d = json.loads(open(path, encoding="utf-8").read())
+        assert d == {"regime": "unknown", "classified_at": None}
+
+    def test_no_clobber_when_present(self, tmp_path):
+        path = str(tmp_path / "regime_state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"last_assessed": "2026-07-09|NIGHT"}, f)
+        write_placeholder_state(path)
+        d = json.loads(open(path, encoding="utf-8").read())
+        assert d == {"last_assessed": "2026-07-09|NIGHT"}
 
 
 class TestAppendHistoryV2:

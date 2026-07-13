@@ -12,6 +12,7 @@ Usage:
 
 from version import APP_VERSION
 
+import csv
 import logging
 import os
 import sys
@@ -3107,6 +3108,13 @@ class BacktestApp:
             header_lines.append(f" 1分K / 聚合K  1m/Agg:  {status['bars_1m']} / {status['bars_agg']}")
         self.metrics_text.insert(tk.END, "\n".join(header_lines) + "\n\n")
 
+        # Regime-switching bots report both legs and the active one under a
+        # "多空切換 Regime Switching" title, instead of just the active leg's
+        # strategy name. Detect the runner type and build the header dict.
+        regime_info = self._regime_report_info()
+        report_title = ("多空切換 Regime Switching"
+                        if regime_info else result.strategy_name)
+
         # 檢視 View filter: "全部 All" = full simulated view (every trade
         # has a simulated fill); "實單 Real" = the same full report
         # recomputed on only the broker-executed subset.
@@ -3120,14 +3128,20 @@ class BacktestApp:
                     req.append(cum)
                 rmetrics = calculate_metrics(rtrades, req, initial_balance=0)
                 report = format_report(
-                    f"{result.strategy_name} — 實單 Real only", rmetrics)
+                    f"{report_title} — 實單 Real only", rmetrics,
+                    trades=rtrades, regime=regime_info)
             else:
                 report = ("(無實單交易 No real-order trades in this result — "
                           "switch 檢視 View back to 全部 All)")
         else:
-            report = format_report(result.strategy_name, result.metrics,
-                                   trades=result.trades)
+            report = format_report(report_title, result.metrics,
+                                   trades=result.trades, regime=regime_info)
         self.metrics_text.insert(tk.END, report)
+
+        # Regime Switching Log — recent classification/apply rows from
+        # regime_history.csv, only for regime-switching bots.
+        if regime_info:
+            self._append_regime_log()
 
         # Trade list
         for item in self.trade_tree.get_children():
@@ -3168,6 +3182,84 @@ class BacktestApp:
             _log(f"即時結果更新 Live results: {result.metrics.total_trades} trades")
         else:
             _log(f"回測完成 Backtest complete: {result.metrics.total_trades} trades")
+
+    def _regime_report_info(self) -> dict | None:
+        """Return the regime header dict when the live runner is a
+        RegimeSwitchingRunner, else None.
+
+        The dict feeds ``format_report(regime=...)``: both leg names and
+        the currently active leg (with its live strategy name).
+        """
+        runner = self._live_runner
+        if runner is None or runner.state == LiveState.IDLE:
+            return None
+        from src.live.regime_switching_runner import RegimeSwitchingRunner
+        if not isinstance(runner, RegimeSwitchingRunner):
+            return None
+        leg = runner.active_leg
+        leg_label = {
+            "long": "做多 Long",
+            "short": "做空 Short",
+            "idle": "閒置 Idle",
+        }.get(leg, leg)
+        return {
+            "long": runner.long_strategy_name,
+            "short": runner.short_strategy_name,
+            "active_label": leg_label,
+            "active_strategy": runner.strategy.name,
+        }
+
+    def _append_regime_log(self, max_rows: int = 8) -> None:
+        """Append a "Regime Switching Log" section to the metrics report
+        from the bot's ``regime_history.csv`` (most recent rows last).
+        """
+        runner = self._live_runner
+        if runner is None:
+            return
+        csv_path = os.path.join(runner.bot_dir, "regime_history.csv")
+        if not os.path.exists(csv_path):
+            return
+        try:
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+        except OSError:
+            return
+        if len(rows) < 2:
+            return
+        header, data = rows[0], rows[1:]
+
+        def col(name: str) -> int:
+            try:
+                return header.index(name)
+            except ValueError:
+                return -1
+
+        i_date = col("date")
+        i_session = col("session")
+        i_decision = col("decision")
+        i_active = col("strategy_active")
+        i_applied = col("applied")
+        i_pnl = col("pnl")
+        i_trades = col("trades")
+
+        def cell(row, idx):
+            return row[idx] if 0 <= idx < len(row) else ""
+
+        lines = ["", "=" * 60, " 多空切換紀錄 Regime Switching Log", "=" * 60]
+        for row in data[-max_rows:]:
+            date = cell(row, i_date)
+            session = cell(row, i_session)
+            decision = cell(row, i_decision) or "—"
+            active = cell(row, i_active) or "—"
+            applied = cell(row, i_applied) or "—"
+            pnl = cell(row, i_pnl)
+            n = cell(row, i_trades)
+            pnl_str = f"P&L {pnl} ({n} trades)" if pnl != "" else "P&L —"
+            lines.append(
+                f" {date} {session}: 決策 {decision} | "
+                f"現行 {active} | 已套用 applied={applied} | {pnl_str}")
+        lines.append("=" * 60)
+        self.metrics_text.insert(tk.END, "\n" + "\n".join(lines))
 
     def _get_selected_trade_index(self) -> int | None:
         sel = self.trade_tree.selection()
@@ -5031,10 +5123,19 @@ class BacktestApp:
         _discord = DiscordNotifier(bot_token, channel_id,
                                    bot_name=bot_name, symbol=symbol)
         if _discord.enabled:
-            _discord.bot_deployed(
-                strategy=self.strategy_var.get(),
-                mode={"paper": "模擬", "semi_auto": "半自動", "auto": "全自動"}.get(trading_mode, trading_mode),
-            )
+            mode_zh = {"paper": "模擬", "semi_auto": "半自動",
+                       "auto": "全自動"}.get(trading_mode, trading_mode)
+            if is_regime_deploy:
+                _discord.bot_deployed_regime(
+                    long_strategy=regime_cfg.long_strategy,
+                    short_strategy=regime_cfg.short_strategy,
+                    mode=mode_zh,
+                )
+            else:
+                _discord.bot_deployed(
+                    strategy=self.strategy_var.get(),
+                    mode=mode_zh,
+                )
             _log(f"Discord 通知已啟用 Discord notifications enabled")
 
         # Route regime announcements through Discord

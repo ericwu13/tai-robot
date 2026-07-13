@@ -16,6 +16,7 @@ from .selector import StrategySelector, Recommendation
 from .store import (
     load_state, save_state, append_history,
     record_session_result, migrate_legacy_history,
+    write_placeholder_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,12 @@ class RegimeManager:
         self.discord_notify_cb = None
 
         self._bars_provider = bars_provider or self._default_bars_provider
+
+    def ensure_initial_state(self) -> None:
+        """Write an inspectable placeholder ``regime_state.json`` if none
+        exists yet (deploy-time convenience). No-op when the file already
+        exists, so a resumed bot's persisted state is preserved."""
+        write_placeholder_state(self._state_path)
 
     def reload_config(self, cfg: RegimeConfig):
         self.cfg = cfg
