@@ -3,22 +3,119 @@
 Usage:
     python build_release.py          # build + zip
     python build_release.py --skip-build  # zip only (reuse existing dist/)
+    python build_release.py --allow-dirty # permit uncommitted source
+
+Build-integrity guard (added after the v2.13.0 mismatch, where the
+published EXE was built from a checkout lacking the regime code):
+
+  1. Refuses to package when tracked SOURCE (src/, run_backtest.py,
+     version.py) has uncommitted changes — a dirty tree can't be traced
+     back to a commit. Override with --allow-dirty.
+  2. Refuses to package when the bundled ``_internal/src`` does not match
+     the working-tree ``src`` — this is exactly the drift that shipped in
+     v2.13.0, and it catches a stale ``dist/`` reused via --skip-build.
+  3. Stamps ``BUILD_INFO.json`` (version + commit SHA + dirty flag +
+     build time) into the zip so every artifact is traceable to a commit.
 """
 
 import argparse
+import filecmp
+import json
 import os
 import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import datetime, timezone
 
 from version import APP_VERSION as VERSION
 DIST_DIR = os.path.join("dist", "tai_backtest")
 ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 
+# Tracked paths whose uncommitted state would make the build untraceable.
+SOURCE_PATHS = ["src", "run_backtest.py", "version.py"]
+
 # Files and directories to EXCLUDE from the release zip
 EXCLUDE_FILES = set()  # settings.yaml is now included with default values
 EXCLUDE_DIRS = {"CapitalLog_Backtest", "_comtypes_cache", "__pycache__", "data", "live"}
+
+
+def _git(*args) -> str:
+    return subprocess.check_output(["git", *args], text=True).strip()
+
+
+def git_commit_info() -> tuple[str, bool]:
+    """Return (commit_sha, source_is_dirty) for the current checkout.
+
+    ``source_is_dirty`` is True only when a tracked SOURCE_PATH has
+    uncommitted changes — unrelated dirt (e.g. CLAUDE.md) is ignored so
+    the guard doesn't block on docs edits.
+    """
+    try:
+        sha = _git("rev-parse", "HEAD")
+        porcelain = _git("status", "--porcelain", "--", *SOURCE_PATHS)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("WARNING: git unavailable — cannot verify build provenance")
+        return "unknown", False
+    return sha, bool(porcelain)
+
+
+def _iter_rel_files(root: str):
+    """Yield paths relative to ``root``, skipping __pycache__ and .pyc."""
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for fname in files:
+            if fname.endswith(".pyc"):
+                continue
+            full = os.path.join(dirpath, fname)
+            yield os.path.relpath(full, root)
+
+
+def verify_bundle_matches_source() -> None:
+    """Refuse to package if the bundled ``src`` differs from the working
+    tree — the guard that would have caught the v2.13.0 stale-EXE ship.
+    """
+    bundled = os.path.join(DIST_DIR, "_internal", "src")
+    if not os.path.isdir(bundled):
+        print(f"ERROR: bundled source not found at {bundled} — build first.")
+        sys.exit(1)
+
+    src_files = set(_iter_rel_files("src"))
+    bnd_files = set(_iter_rel_files(bundled))
+    missing = sorted(src_files - bnd_files)
+    extra = sorted(bnd_files - src_files)
+    differ = [rel for rel in sorted(src_files & bnd_files)
+              if not filecmp.cmp(os.path.join("src", rel),
+                                 os.path.join(bundled, rel), shallow=False)]
+
+    if missing or extra or differ:
+        print("ERROR: bundled src/ does not match the working tree.")
+        print("       The dist/ is stale or built from a different commit "
+              "(this is the v2.13.0 failure mode). Rebuild without "
+              "--skip-build.")
+        for rel in missing:
+            print(f"  missing in bundle: {rel}")
+        for rel in extra:
+            print(f"  extra in bundle:   {rel}")
+        for rel in differ:
+            print(f"  differs:           {rel}")
+        sys.exit(1)
+    print(f"Bundle integrity OK — {len(src_files)} source files match HEAD")
+
+
+def write_build_stamp(sha: str, dirty: bool) -> None:
+    """Stamp BUILD_INFO.json into DIST_DIR so it lands in the zip."""
+    stamp = {
+        "version": VERSION,
+        "commit": sha,
+        "dirty": dirty,
+        "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    path = os.path.join(DIST_DIR, "BUILD_INFO.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(stamp, f, indent=2)
+    flag = " (DIRTY)" if dirty else ""
+    print(f"  Stamped BUILD_INFO.json: v{VERSION} @ {sha[:10]}{flag}")
 
 
 def build():
@@ -78,10 +175,25 @@ def package():
 def main():
     parser = argparse.ArgumentParser(description="Build and package tai_backtest release")
     parser.add_argument("--skip-build", action="store_true", help="Skip PyInstaller build, just zip")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="Permit packaging with uncommitted source changes")
     args = parser.parse_args()
+
+    sha, dirty = git_commit_info()
+    if dirty and not args.allow_dirty:
+        print("ERROR: tracked source (src/, run_backtest.py, version.py) has "
+              "uncommitted changes.")
+        print("       Commit them so the release is traceable to a commit, "
+              "or pass --allow-dirty to override.")
+        sys.exit(1)
 
     if not args.skip_build:
         build()
+
+    # Guard: the packaged binary must match the committed source. This is
+    # the check that would have prevented the v2.13.0 stale-EXE ship.
+    verify_bundle_matches_source()
+    write_build_stamp(sha, dirty)
 
     zip_path = package()
 
