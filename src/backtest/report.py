@@ -47,7 +47,8 @@ def live_trading_period(
 
 
 def format_report(strategy_name: str, metrics: PerformanceMetrics,
-                  trades: list[Trade] | None = None) -> str:
+                  trades: list[Trade] | None = None,
+                  regime: dict | None = None) -> str:
     """Format the metrics block; when ``trades`` is given and any carry a
     real-order tag, append a 實單/模擬 source-split section. The headline
     numbers are the full simulated view (paper = all trades, including
@@ -55,10 +56,22 @@ def format_report(strategy_name: str, metrics: PerformanceMetrics,
     """
     m = metrics
     pf_str = f"{m.profit_factor:.2f}" if m.profit_factor != float("inf") else "INF"
-    lines = [
+    header = [
         "=" * 60,
         f" \u56de\u6e2c\u5831\u544a Backtest Report: {strategy_name}",
-        "=" * 60,
+    ]
+    if regime:
+        long_name = regime.get("long") or "\u2014"
+        short_name = regime.get("short") or "\u2014"
+        active_label = regime.get("active_label") or "\u2014"
+        active_strat = regime.get("active_strategy") or "\u2014"
+        # \u505a\u591a Long / \u505a\u7a7a Short / \u73fe\u884c Active
+        header.append(
+            f" \u505a\u591a Long: {long_name} | \u505a\u7a7a Short: {short_name}")
+        header.append(
+            f" \u73fe\u884c Active: {active_label} ({active_strat})")
+    header.append("=" * 60)
+    lines = header + [
         f" \u521d\u59cb\u8cc7\u91d1 Initial Balance:     {m.initial_balance:>12,}",
         f" \u6700\u7d42\u8cc7\u91d1 Final Balance:       {m.final_balance:>12,}",
         "-" * 60,
@@ -111,6 +124,28 @@ def format_report(strategy_name: str, metrics: PerformanceMetrics,
                 f"  ({rm.max_drawdown_pct:.2f}%)",
                 " (\u4ee5\u4e0a\u7e3d\u8a08\u70ba\u6a21\u64ec\u5168\u8996\u5716 totals above = simulated view, all trades)",
             ])
+
+        # Per-strategy breakdown \u2014 shown when trades span more than one
+        # strategy (e.g. a regime-switching bot that swapped long/short
+        # legs). Each leg's metrics are recomputed on its own subset.
+        by_strategy: dict[str, list] = {}
+        for t in trades:
+            sname = getattr(t, "strategy", "") or ""
+            by_strategy.setdefault(sname, []).append(t)
+        if len(by_strategy) > 1:
+            lines.append("-" * 60)
+            lines.append(" \u5404\u7b56\u7565\u660e\u7d30 Per-Strategy Breakdown:")
+            for sname, strades in by_strategy.items():
+                seq, cum = [], 0
+                for t in strades:
+                    cum += t.pnl
+                    seq.append(cum)
+                sm = calculate_metrics(strades, seq, initial_balance=0)
+                label = sname or "(\u672a\u6a19\u8a18 unlabeled)"
+                lines.append(
+                    f"   {label}: {sm.total_trades} trades, "
+                    f"\u52dd\u7387 WR {sm.win_rate * 100:.1f}%, "
+                    f"P&L {sm.total_pnl:+,}")
     lines.append("=" * 60)
     return "\n".join(lines)
 
