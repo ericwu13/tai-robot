@@ -1,6 +1,8 @@
 """Tests for LiveRunner: warmup, feed, dedup, strategy execution, stop."""
 
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
 
 from src.market_data.models import Bar
@@ -546,17 +548,67 @@ class TestLiveRunnerLock:
 
         assert not os.path.isfile(runner._lock_path)
 
-    def test_dead_pid_not_locked(self, tmp_path):
-        """A lock file with a non-existent PID is not considered locked."""
+    @staticmethod
+    def _write_lock(tmp_path, content) -> tuple[str, str]:
         bot_dir = os.path.join(str(tmp_path), "TX00_TestBot")
         os.makedirs(bot_dir, exist_ok=True)
         lock_path = os.path.join(bot_dir, ".lock")
         with open(lock_path, "w") as f:
-            f.write("999999999")  # non-existent PID
+            f.write(str(content))
+        return bot_dir, lock_path
+
+    def test_dead_pid_not_locked(self, tmp_path):
+        """A lock file with a non-existent PID is not considered locked."""
+        bot_dir, lock_path = self._write_lock(tmp_path, 999999999)
 
         is_locked, pid = LiveRunner.check_lock(bot_dir)
         assert not is_locked
         assert pid == 999999999
+        # Stale lock is self-healed (deleted) so it can't block later deploys
+        assert not os.path.isfile(lock_path)
+
+    def test_really_dead_pid_not_locked(self, tmp_path):
+        """A PID that WAS a real process on this console is not locked.
+
+        Regression test for the stale-lock false conflict: os.kill(pid, 0)
+        on Windows is GenerateConsoleCtrlEvent, which keeps succeeding for
+        a dead child that shared our console. A fabricated PID (previous
+        test) does not catch that — the process must have really existed.
+        """
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"])
+        proc.kill()
+        proc.wait()
+        bot_dir, lock_path = self._write_lock(tmp_path, proc.pid)
+
+        is_locked, pid = LiveRunner.check_lock(bot_dir)
+        assert not is_locked
+        assert pid == proc.pid
+        assert not os.path.isfile(lock_path)
+
+    def test_live_foreign_pid_is_locked(self, tmp_path):
+        """A running process that is not ours still counts as locked."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            bot_dir, lock_path = self._write_lock(tmp_path, proc.pid)
+
+            is_locked, pid = LiveRunner.check_lock(bot_dir)
+            assert is_locked
+            assert pid == proc.pid
+            assert os.path.isfile(lock_path)  # live lock is left alone
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_corrupt_lock_not_locked(self, tmp_path):
+        """Unreadable lock content is treated as stale and cleaned up."""
+        bot_dir, lock_path = self._write_lock(tmp_path, "not-a-pid")
+
+        is_locked, pid = LiveRunner.check_lock(bot_dir)
+        assert not is_locked
+        assert pid == 0
+        assert not os.path.isfile(lock_path)
 
     def test_bot_dir_for(self, tmp_path):
         result = LiveRunner.bot_dir_for(str(tmp_path), "TX00", "MyBot")
