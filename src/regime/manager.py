@@ -21,6 +21,10 @@ from .store import (
 
 logger = logging.getLogger(__name__)
 
+# Minimum classify-interval (HTF) bars required to classify: EMA-50 needs
+# 50 plus headroom for the leading/trailing partial aggregation bars.
+MIN_CLASSIFY_BARS = 52
+
 
 class RegimeManager:
     def __init__(
@@ -175,7 +179,7 @@ class RegimeManager:
             if not bars:
                 return None
             bars_htf = aggregate_bars(bars, self.cfg.classify_interval)
-            if len(bars_htf) < 52:
+            if len(bars_htf) < MIN_CLASSIFY_BARS:
                 return None
             highs = [b.high for b in bars_htf]
             lows = [b.low for b in bars_htf]

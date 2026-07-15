@@ -123,15 +123,18 @@ class TestRecordSessionResult:
         assert rows[0] == _V2_HEADER
         assert len(rows) == 2
 
-    def test_does_not_double_backfill(self, tmp_path):
+    def test_re_record_updates_in_place(self, tmp_path):
         path = str(tmp_path / "history.csv")
         append_history(path, "2026-07-09", _make_state(), _make_rec())
         record_session_result(path, "2026-07-09", "NIGHT", 5000.0, 3)
         record_session_result(path, "2026-07-09", "NIGHT", 9999.0, 9)
         rows = _read_csv(path)
-        # Second call can't backfill because pnl is already filled —
-        # it appends a standalone row instead
-        assert rows[1][_V2_HEADER.index("pnl")] == "5000.0"
+        # Re-recording the same session UPDATES the row (the caller
+        # recomputes the full-session total each time, so latest wins) —
+        # appending would double-count the session on stop()/restart.
+        assert rows[1][_V2_HEADER.index("pnl")] == "9999.0"
+        assert rows[1][_V2_HEADER.index("trades")] == "9"
+        assert len(rows) == 2  # header + the single session row
 
 
 class TestMigrateLegacyHistory:

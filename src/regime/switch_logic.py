@@ -2,12 +2,22 @@
 
 Session-boundary detection, classification triggers, swap decisions —
 all testable without COM, Tk, or live infrastructure.
+
+Session identity convention: a trading session is identified by its OPEN
+date. The midnight-straddling night session (15:00 → 05:00 next day)
+keeps a single stable identity — e.g. the night opening Tue 15:00 and
+closing Wed 05:00 is ``("<Tue date>", "NIGHT")`` throughout. This is the
+key used for classification dedup, P&L recording, and history rows.
+(``session_slot`` below predates this and returns the CALENDAR date at
+the queried moment; it is kept for the daily-report session key where
+calendar-date semantics are fine.)
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -81,26 +91,135 @@ def in_closed_gap(now: datetime | None = None) -> bool:
     return False
 
 
-def should_classify(
-    now: datetime,
-    session_slot_result: tuple[str, str],
-    last_assessed_key: str,
-    minutes_to_close: float,
-) -> bool:
-    """Whether the runner should fire classification right now.
+class SessionInfo(NamedTuple):
+    """A concrete trading session, identified by its OPEN date."""
+    open_date: str        # YYYY-MM-DD of the session OPEN
+    slot: str             # "DAY" | "NIGHT"
+    open_dt: datetime     # tz-aware Taipei
+    close_dt: datetime    # tz-aware Taipei
 
-    Only fires on NIGHT sessions, within 2 minutes of close, and only
-    once per on-disk dedup key.
+    @property
+    def key(self) -> str:
+        return f"{self.open_date}|{self.slot}"
+
+
+def _norm_tpe(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(_TZ_TAIPEI)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=_TZ_TAIPEI)
+    return now
+
+
+def _is_closed_day(d: date) -> bool:
+    """True when TAIFEX has no sessions opening on ``d``.
+
+    Delegates to the market-data holiday calendar (weekends + TW public
+    holidays + overrides); degrades to a weekend-only check if the
+    holidays module is unavailable (mis-bundled frozen EXE, issue #58).
     """
-    _date, slot = session_slot_result
-    if slot != "NIGHT":
-        return False
-    if minutes_to_close > 2:
-        return False
-    dedup_key = f"{_date}|NIGHT"
-    if dedup_key == last_assessed_key:
-        return False
-    return True
+    try:
+        from src.market_data.holidays import is_taifex_holiday
+        return is_taifex_holiday(d)
+    except Exception:
+        return d.weekday() >= 5
+
+
+def current_session(now: datetime | None = None) -> SessionInfo | None:
+    """The trading session containing ``now``, or None when the market
+    is closed (intraday gap, weekend, or holiday).
+
+    Unlike ``session_slot``, this returns None outside real sessions —
+    so a Saturday 13:43 poll can no longer masquerade as a DAY session,
+    and the night session is keyed by its OPEN date on both sides of
+    midnight.
+    """
+    now = _norm_tpe(now)
+    minutes = now.hour * 60 + now.minute
+    today = now.date()
+
+    if _DAY_OPEN <= minutes < _DAY_CLOSE:
+        if _is_closed_day(today):
+            return None
+        open_dt = now.replace(hour=8, minute=45, second=0, microsecond=0)
+        close_dt = now.replace(hour=13, minute=45, second=0, microsecond=0)
+        return SessionInfo(today.isoformat(), "DAY", open_dt, close_dt)
+
+    if minutes >= _NIGHT_OPEN:
+        if _is_closed_day(today):
+            return None
+        open_dt = now.replace(hour=15, minute=0, second=0, microsecond=0)
+        return SessionInfo(today.isoformat(), "NIGHT", open_dt,
+                           open_dt + timedelta(hours=14))
+
+    if minutes < _NIGHT_CLOSE:
+        # 00:00-05:00 — carryover of the night that opened yesterday
+        yesterday = today - timedelta(days=1)
+        if _is_closed_day(yesterday):
+            return None
+        open_dt = (now - timedelta(days=1)).replace(
+            hour=15, minute=0, second=0, microsecond=0)
+        return SessionInfo(yesterday.isoformat(), "NIGHT", open_dt,
+                           open_dt + timedelta(hours=14))
+
+    return None
+
+
+def latest_night_session(now: datetime | None = None) -> SessionInfo | None:
+    """The most recently OPENED night session at ``now`` — in progress
+    or already closed. Looks back up to 14 days (long holiday runs).
+    """
+    now = _norm_tpe(now)
+    for back in range(15):
+        d = now.date() - timedelta(days=back)
+        if _is_closed_day(d):
+            continue
+        open_dt = datetime(d.year, d.month, d.day, 15, 0, tzinfo=_TZ_TAIPEI)
+        if open_dt <= now:
+            return SessionInfo(d.isoformat(), "NIGHT", open_dt,
+                               open_dt + timedelta(hours=14))
+    return None
+
+
+def last_completed_night(now: datetime | None = None) -> SessionInfo | None:
+    """The most recent night session that has already CLOSED at ``now``."""
+    now = _norm_tpe(now)
+    sess = latest_night_session(now)
+    if sess is None:
+        return None
+    if now >= sess.close_dt:
+        return sess
+    return latest_night_session(sess.open_dt - timedelta(minutes=1))
+
+
+def classification_due(
+    now: datetime,
+    last_assessed_key: str,
+    window_minutes: float = 2.0,
+) -> SessionInfo | None:
+    """The night session whose classification should fire now, or None.
+
+    Fires in the session's last ``window_minutes`` (the normal 04:58
+    trigger) — or any time AFTER it closed while still unassessed
+    (catch-up: an app hang/sleep across the close window no longer
+    silently skips the day; a catch-up run classifies "as of now", so
+    its features may include bars from the following DAY session).
+
+    Weekend/holiday polls are naturally inert: the latest night session
+    doesn't advance on closed days, so once its key is assessed the
+    check stays None until a new night actually opens.
+    """
+    sess = latest_night_session(now)
+    if sess is None:
+        return None
+    if sess.key == last_assessed_key:
+        return None
+    now = _norm_tpe(now)
+    if now >= sess.close_dt:
+        return sess  # catch-up
+    if (sess.close_dt - now) <= timedelta(minutes=window_minutes):
+        return sess
+    return None
 
 
 def validate_leg_strategies(

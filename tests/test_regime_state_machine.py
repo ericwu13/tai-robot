@@ -117,6 +117,38 @@ def test_pause_expires_after_pause_sessions():
     assert not s.last_features.get("_paused")
 
 
+def test_flips_outside_window_do_not_pause():
+    """flip_window is a SLIDING window — 3 flips spread far apart must not
+    pause. Old code counted lifetime flips (trimmed only to the last 10),
+    so after the 3rd flip EVER, every flip paused the bot forever."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, max_flips=3, pause_sessions=2, flip_window=5)
+    s = RegimeState()
+    s = _step(m, s, cfg, make_result(adx=35.0, plus_di=30, minus_di=10), "2026-01-01")
+    s = _step(m, s, cfg, make_result(adx=35.0, plus_di=10, minus_di=30), "2026-01-02")
+    # 10 transitional sessions push the window past both flips
+    for i in range(10):
+        s = _step(m, s, cfg, make_result(adx=22.0), f"2026-01-{3 + i:02d}")
+    # 3rd lifetime flip — but only 1 flip within the last 5 sessions
+    s = _step(m, s, cfg, make_result(adx=35.0, plus_di=30, minus_di=10), "2026-01-13")
+    assert s.effective_regime == "trending-up"
+    assert s.paused_until_session == 0
+
+
+def test_raised_adx_enter_does_not_disable_hysteresis():
+    """With adx_enter raised above adx_strong, the fast-track is disabled
+    instead of firing on every trending read (which would silently reduce
+    confirm_sessions to 1)."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, adx_enter=32.0)
+    s = RegimeState()
+    s = _step(m, s, cfg, make_result(adx=35.0), "2026-01-01")
+    assert s.raw_regime == "trending-up"
+    assert s.effective_regime == "unknown"   # one session is NOT enough
+    s = _step(m, s, cfg, make_result(adx=35.0), "2026-01-02")
+    assert s.effective_regime == "trending-up"  # confirmed on the 2nd
+
+
 def test_manual_override_field_preserved_through_step():
     # The state machine does not consume manual_override (the manager does);
     # it must survive a step untouched.
