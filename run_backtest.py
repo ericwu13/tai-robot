@@ -3413,11 +3413,15 @@ class BacktestApp:
             "short": "做空 Short",
             "idle": "閒置 Idle",
         }.get(leg, leg)
+        # When idle, the loaded strategy object is only the timeframe
+        # donor (its on_bar is never called) — showing its name reads as
+        # "Idle (DynamicExitPullbackStrategyV2)", which looks like it's
+        # trading. Show a dash instead.
         return {
             "long": runner.long_strategy_name,
             "short": runner.short_strategy_name,
             "active_label": leg_label,
-            "active_strategy": runner.strategy.name,
+            "active_strategy": runner.strategy.name if leg != "idle" else "—",
         }
 
     def _append_regime_log(self, max_rows: int = 8) -> None:
