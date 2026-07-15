@@ -12,6 +12,8 @@ from src.regime.store import (
     record_session_result,
     migrate_legacy_history,
     write_placeholder_state,
+    load_state,
+    save_state,
     _V2_HEADER,
 )
 
@@ -135,6 +137,62 @@ class TestRecordSessionResult:
         assert rows[1][_V2_HEADER.index("pnl")] == "9999.0"
         assert rows[1][_V2_HEADER.index("trades")] == "9"
         assert len(rows) == 2  # header + the single session row
+
+
+class TestKeyFormatMigration:
+    """Pre-v2.16 state files stamped last_assessed with the night's CLOSE
+    date; load_state must translate it once to the OPEN-date key so the
+    upgrade neither skips the next night (key collision) nor re-assesses
+    an already-assessed one (cleared key double-stepping hysteresis)."""
+
+    def _write(self, path, d):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+
+    def test_old_close_date_key_translated(self, tmp_path):
+        # 2026-07-16 is a Thursday; the night that closed 07-16 05:00
+        # opened Wednesday 07-15.
+        path = str(tmp_path / "regime_state.json")
+        self._write(path, {"last_assessed": "2026-07-16|NIGHT"})
+        s = load_state(path)
+        assert s.last_assessed == "2026-07-15|NIGHT"
+
+    def test_old_weekend_phantom_key_translated(self, tmp_path):
+        # An old-code Sunday phantom stamp resolves to the Friday-open
+        # night — the same night Saturday's legitimate stamp covered.
+        path = str(tmp_path / "regime_state.json")
+        self._write(path, {"last_assessed": "2026-07-12|NIGHT"})
+        s = load_state(path)
+        assert s.last_assessed == "2026-07-10|NIGHT"
+
+    def test_new_format_untouched(self, tmp_path):
+        path = str(tmp_path / "regime_state.json")
+        self._write(path, {"last_assessed": "2026-07-15|NIGHT",
+                           "key_format": "open-date"})
+        s = load_state(path)
+        assert s.last_assessed == "2026-07-15|NIGHT"
+
+    def test_empty_key_untouched(self, tmp_path):
+        path = str(tmp_path / "regime_state.json")
+        self._write(path, {"last_assessed": ""})
+        s = load_state(path)
+        assert s.last_assessed == ""
+
+    def test_garbage_key_cleared(self, tmp_path):
+        path = str(tmp_path / "regime_state.json")
+        self._write(path, {"last_assessed": "not-a-date|NIGHT"})
+        s = load_state(path)
+        assert s.last_assessed == ""
+
+    def test_save_stamps_marker_and_round_trips(self, tmp_path):
+        path = str(tmp_path / "regime_state.json")
+        state = _make_state(last_assessed="2026-07-15|NIGHT")
+        save_state(path, state, _make_rec(), "2026-07-15")
+        d = json.loads(open(path, encoding="utf-8").read())
+        assert d["key_format"] == "open-date"
+        # A reload must NOT re-translate a key saved by current code.
+        s = load_state(path)
+        assert s.last_assessed == "2026-07-15|NIGHT"
 
 
 class TestMigrateLegacyHistory:

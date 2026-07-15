@@ -102,7 +102,7 @@ python test_kline.py       # COM-based KLine history GUI
 - `in_closed_gap(now)`: True during gaps between sessions (when swaps can be applied)
 - `swap_strategy(new_strategy, display_name)`: 5 safety gates (flat, no veto, not in replay, same timeframe, sufficient bars)
 - `regime_idle`: separate from `suppress_strategy` — suppresses trading but keeps DataStore/CSV flowing
-- On-disk dedup: `state.last_assessed = "open_date|NIGHT"` prevents double-classification across restarts. Upgrade note: bots deployed pre-v2.16 stored the CLOSE date, so one night may be skipped once right after upgrading — clear `last_assessed` in regime_state.json to avoid it
+- On-disk dedup: `state.last_assessed = "open_date|NIGHT"` prevents double-classification across restarts. Pre-v2.16 files stored the CLOSE date; `load_state` auto-migrates it once (translates to the covered night's open-date key, gated by the `key_format` marker `save_state` stamps) — no manual edit, no skipped night, no duplicate assessment
 - `record_session_result()`: writes P&L from switching runner's own broker (replaces retired `backfill_pnl`)
 - History v2 schema: 4 new columns (strategy_active, applied, applied_at, trading_mode)
 - Deploy: `_deploy_live` branches on `regime.enabled` to construct `RegimeSwitchingRunner` vs `LiveRunner`
