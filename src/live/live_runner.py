@@ -431,11 +431,60 @@ class LiveRunner:
             pass
 
     @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """Return True if a process with this PID is currently running.
+
+        os.kill(pid, 0) is NOT an existence check on Windows: signal 0 is
+        CTRL_C_EVENT, which CPython routes to GenerateConsoleCtrlEvent().
+        Its result tracks console process-group bookkeeping, not liveness —
+        a dead PID that shared the caller's console keeps reporting success,
+        and a live process outside it reports failure (the stale-lock
+        false-conflict bug).
+        """
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_ACCESS_DENIED = 5
+            STILL_ACTIVE = 259
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                # Access denied means a process with this PID exists but
+                # we cannot open it (other user / elevated) — treat as
+                # alive so we never steal a lock we can't verify.
+                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(
+                        handle, ctypes.byref(exit_code)):
+                    return True  # can't tell — stay conservative
+                # A terminated process whose handles are still held keeps
+                # its PID reserved; the exit code distinguishes it.
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
     def check_lock(bot_dir: str) -> tuple[bool, int]:
         """Check if a lock file exists and whether the owning process is alive.
 
         Returns (is_locked, pid).  ``is_locked`` is True only when the lock
-        file exists AND the PID is still running.
+        file exists AND the PID is still running.  A stale lock (owner dead,
+        or unreadable content) is deleted so it cannot block later deploys
+        that abort before reaching acquire_lock().
         """
         lock = os.path.join(bot_dir, ".lock")
         if not os.path.isfile(lock):
@@ -444,13 +493,14 @@ class LiveRunner:
             with open(lock) as f:
                 pid = int(f.read().strip())
         except (ValueError, OSError):
-            return False, 0
-        # Check if process is alive (Windows-compatible)
-        try:
-            os.kill(pid, 0)  # signal 0 = existence check
+            pid = 0
+        if LiveRunner._pid_alive(pid):
             return True, pid
+        try:
+            os.remove(lock)
         except OSError:
-            return False, pid
+            pass
+        return False, pid
 
     @staticmethod
     def bot_dir_for(base_dir: str, symbol: str, bot_name: str) -> str:
