@@ -26,6 +26,38 @@ _V2_HEADER = [
 ]
 
 
+# File-level marker for the last_assessed keying convention. Files
+# written before v2.16 stamped the night's CLOSE date; current code
+# stamps the OPEN date. Absence of the marker on a non-empty key means
+# the file is old-format and must be translated once at load.
+_KEY_FORMAT = "open-date"
+
+
+def _migrate_close_date_key(last_assessed: str) -> str:
+    """Translate a pre-v2.16 close-date key to its open-date equivalent.
+
+    An old stamp "2026-07-16|NIGHT" was written ~04:58 on 07-16 and
+    covered the night that OPENED on the prior trading day — exactly
+    what ``latest_night_session`` returns for that close-window moment.
+    Translating (instead of clearing) avoids both failure modes: a
+    colliding key would silently skip the next night, while a cleared
+    key would re-assess an already-assessed night and double-step the
+    hysteresis state machine.
+    """
+    from datetime import datetime, timedelta, timezone
+    from .switch_logic import latest_night_session
+    try:
+        date_part = last_assessed.split("|")[0]
+        stamped = datetime.strptime(date_part, "%Y-%m-%d").replace(
+            hour=4, minute=58, tzinfo=timezone(timedelta(hours=8)))
+        covered = latest_night_session(stamped)
+        return covered.key if covered else ""
+    except Exception:
+        logger.warning("[REGIME] Could not migrate last_assessed %r — clearing",
+                       last_assessed)
+        return ""
+
+
 def load_state(path: str) -> RegimeState:
     if not os.path.exists(path):
         return RegimeState()
@@ -39,12 +71,18 @@ def load_state(path: str) -> RegimeState:
     for k, v in d.items():
         if hasattr(s, k):
             setattr(s, k, v)
+    if s.last_assessed and d.get("key_format") != _KEY_FORMAT:
+        migrated = _migrate_close_date_key(s.last_assessed)
+        logger.info("[REGIME] Migrated last_assessed %r → %r (open-date keying)",
+                    s.last_assessed, migrated)
+        s.last_assessed = migrated
     return s
 
 
 def save_state(path: str, state: RegimeState, rec: Recommendation, session_date: str):
     import dataclasses
     d = dataclasses.asdict(state)
+    d["key_format"] = _KEY_FORMAT
     d["next_session"] = {
         "date": session_date, "action": rec.action,
         "strategy": rec.strategy_name, "qty_scale": rec.qty_scale,
