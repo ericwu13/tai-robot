@@ -206,12 +206,18 @@ class TestStatusPoll:
 
     def test_poll_in_day_session(self, tmp_path):
         runner = _make_regime_runner(tmp_path)
+        # Last completed night (opened Wed 07-08) already assessed —
+        # otherwise the catch-up trigger legitimately classifies it here.
+        runner._manager._state.last_assessed = "2026-07-08|NIGHT"
         now = datetime(2026, 7, 9, 10, 0, tzinfo=_TZ_TAIPEI)
         lines = runner.on_status_poll(now)
         assert not any("Classified" in l for l in lines)
 
     def test_poll_in_gap_with_pending(self, tmp_path):
         runner = _make_regime_runner(tmp_path)
+        # Pre-assess the completed night so the catch-up classifier does
+        # not overwrite the hand-crafted pending under test.
+        runner._manager._state.last_assessed = "2026-07-09|NIGHT"
         runner._pending_recommendation = {
             "date": "2026-07-10", "action": "deploy_long",
             "strategy": "StrategyA", "qty_scale": 1.0, "reason": "test",

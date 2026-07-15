@@ -13,9 +13,15 @@ from typing import Callable
 
 from ..regime.manager import RegimeManager
 from ..regime.state_machine import RegimeConfig
-from ..regime.switch_logic import session_slot, in_closed_gap, should_classify
-from ..regime.store import record_session_result
-from .live_runner import LiveRunner, _mode_to_source
+from ..regime.switch_logic import (
+    SessionInfo,
+    classification_due,
+    current_session,
+    in_closed_gap,
+    last_completed_night,
+)
+from .bar_aggregator import aggregate_bars
+from .live_runner import LiveRunner, _mode_to_source, load_1m_bars_from_csvs
 from .session_store import save_session
 
 logger = logging.getLogger(__name__)
@@ -57,9 +63,11 @@ class RegimeSwitchingRunner(LiveRunner):
         self._strategies_registry = strategies_registry or {}
         self._active_leg: str = "idle"  # "long" | "short" | "idle"
 
+        self._classify_retry_after: datetime | None = None
+
         self._manager = RegimeManager(
             self.bot_dir, regime_cfg,
-            bars_provider=bars_provider,
+            bars_provider=bars_provider or self._classifier_bars,
         )
         # Write an inspectable placeholder regime_state.json at deploy time
         # so the bot folder reflects regime status before the first
@@ -85,16 +93,16 @@ class RegimeSwitchingRunner(LiveRunner):
             now = now.replace(tzinfo=_TZ_TAIPEI)
 
         lines = []
-        slot = session_slot(now)
-        minutes_to_close = self._minutes_until_session_close(now)
 
-        # T2: Record session P&L at session end (before classification)
-        self._maybe_record_session(now, slot, minutes_to_close)
-
-        # T1: Classify at NIGHT end
-        classified = self._maybe_classify(now, slot, minutes_to_close)
+        # T1: Classify at NIGHT end — BEFORE the P&L record, so the record
+        # lands on the freshly appended classification row instead of
+        # spawning a second standalone row for the same session.
+        classified = self._maybe_classify(now)
         if classified:
             lines.append(f"[REGIME] Classified: {classified.action}")
+
+        # T2: Record session P&L at session end
+        self._maybe_record_session(now)
 
         # T3: Apply pending recommendation in closed gap
         applied = self._maybe_apply_pending(now)
@@ -103,62 +111,107 @@ class RegimeSwitchingRunner(LiveRunner):
 
         return lines
 
-    def _maybe_classify(self, now, slot, minutes_to_close) -> object | None:
+    def _maybe_classify(self, now) -> object | None:
+        if self._classify_retry_after is not None and now < self._classify_retry_after:
+            return None
         last_assessed = self._manager._state.last_assessed
-        if not should_classify(now, slot, last_assessed, minutes_to_close):
+        sess = classification_due(now, last_assessed)
+        if sess is None:
             return None
 
-        session_date, _ = slot
-        rec = self._manager.classify_session(session_date, "NIGHT")
-        if rec is not None:
-            self._pending_recommendation = {
-                "date": session_date, "action": rec.action,
-                "strategy": rec.strategy_name, "qty_scale": rec.qty_scale,
-                "reason": rec.reason,
-            }
-            self._emit("on_status",
-                        f"[REGIME] Classified {session_date}: {rec.action} ({rec.strategy_name})")
+        catch_up = now >= sess.close_dt
+        rec = self._manager.classify_session(sess.open_date, "NIGHT")
+        if rec is None:
+            # Insufficient bars or classifier error. The post-close
+            # catch-up trigger would otherwise retry (and warn) on every
+            # 30s poll until the next night is assessed — back off.
+            self._classify_retry_after = now + timedelta(minutes=30)
+            return None
+        self._classify_retry_after = None
+
+        self._pending_recommendation = {
+            "date": sess.open_date, "action": rec.action,
+            "strategy": rec.strategy_name, "qty_scale": rec.qty_scale,
+            "reason": rec.reason,
+        }
+        tag = " (catch-up)" if catch_up else ""
+        self._emit("on_status",
+                    f"[REGIME] Classified {sess.open_date}{tag}: {rec.action} ({rec.strategy_name})")
         return rec
 
-    def _maybe_record_session(self, now, slot, minutes_to_close):
-        if minutes_to_close > 2:
+    def _maybe_record_session(self, now):
+        sess = current_session(now)
+        if sess is None:
+            return  # gap / weekend / holiday — no phantom rows
+        if (sess.close_dt - now).total_seconds() > 120:
             return
-        session_date, session_type = slot
-        key = (session_date, session_type)
+        key = (sess.open_date, sess.slot)
         if key in self._recorded_sessions:
             return
         self._recorded_sessions.add(key)
+        self._record_session(sess)
 
-        # Compute session P&L from own broker trades
-        pnl, n_trades = self._compute_session_pnl(session_date, session_type)
+    def _record_session(self, sess: SessionInfo):
+        pnl, n_trades = self._compute_session_pnl(sess)
         strategy_name = self.strategy_display_name if self._active_leg != "idle" else "idle"
         self._manager.do_record_session_result(
-            session_date, session_type, pnl, n_trades,
+            sess.open_date, sess.slot, pnl, n_trades,
             strategy_active=strategy_name,
             trading_mode=self.trading_mode,
         )
         self._emit("on_status",
-                    f"[REGIME] Recorded {session_type} P&L: {pnl:+} ({n_trades} trades)")
+                    f"[REGIME] Recorded {sess.slot} P&L: {pnl:+} ({n_trades} trades)")
 
-    def _compute_session_pnl(self, session_date: str, session_type: str) -> tuple[float, int]:
-        """Sum P&L of trades closed in this session window."""
+    def _compute_session_pnl(self, sess: SessionInfo) -> tuple[float, int]:
+        """Sum P&L of trades whose exit falls inside this session's window.
+
+        Window-based (open_dt..close_dt), not calendar-date-based: the
+        night session straddles midnight, so a date-only match dropped
+        pre-midnight exits and double-counted post-midnight exits into
+        the same date's DAY row. exit_dt strings ("YYYY-MM-DD HH:MM",
+        sometimes with seconds from force-close) compare
+        lexicographically == chronologically once sliced to minutes.
+        """
+        lo = sess.open_dt.strftime("%Y-%m-%d %H:%M")
+        hi = sess.close_dt.strftime("%Y-%m-%d %H:%M")
         pnl = 0.0
         count = 0
         for t in self.broker.trades:
-            if not t.exit_dt:
-                continue
-            try:
-                exit_date = t.exit_dt[:10]
-            except (TypeError, IndexError):
-                continue
-            if exit_date == session_date:
+            exit_dt = (t.exit_dt or "")[:16]
+            if lo <= exit_dt <= hi:
                 pnl += t.pnl
                 count += 1
         return pnl, count
 
+    def _discard_pending(self, reason: str) -> None:
+        """Drop the pending recommendation permanently (mark executed on
+        disk so a restart does not re-arm it)."""
+        self._pending_recommendation = None
+        executed_at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+        self._manager.mark_recommendation_executed(executed_at)
+        logger.warning("[REGIME] Discarded pending recommendation: %s", reason)
+        self._emit("on_status", f"[REGIME] Discarded recommendation: {reason}")
+
     def _maybe_apply_pending(self, now) -> str | None:
         if self._pending_recommendation is None:
             return None
+
+        rec = self._pending_recommendation
+
+        # Staleness gate: a recommendation belongs to the night it
+        # classified. If a NEWER night has completed since (apply blocked
+        # for days, or re-armed after a long outage), acting on it would
+        # trade tomorrow on stale data — a fresh classification should
+        # decide instead (classify runs before apply in the same poll;
+        # this only triggers when that classification couldn't produce).
+        completed = last_completed_night(now)
+        if (completed is not None and rec.get("date", "")
+                and rec["date"] < completed.open_date):
+            self._discard_pending(
+                f"stale — assessed {rec.get('date')}, latest completed "
+                f"night is {completed.open_date}")
+            return None
+
         if not in_closed_gap(now):
             return None
         # Gates: flat, no veto, not in replay
@@ -171,9 +224,7 @@ class RegimeSwitchingRunner(LiveRunner):
         if self.suppress_strategy or self._is_reloading:
             return None
 
-        rec = self._pending_recommendation
         action = rec.get("action", "hold")
-        strategy_name = rec.get("strategy", "")
         result = None
 
         try:
@@ -187,15 +238,25 @@ class RegimeSwitchingRunner(LiveRunner):
                 result = "hold (no change)"
             else:
                 result = f"unknown action: {action}"
+        except ValueError as e:
+            # Permanent config error (leg strategy missing from the
+            # registry) — retrying every 30s forever is useless.
+            logger.exception("[REGIME] Unrecoverable apply error: %s", e)
+            self._discard_pending(f"apply failed permanently: {e}")
+            return None
         except Exception as e:
+            # Transient (e.g. swap refused pending more 1-min history) —
+            # keep the recommendation armed for the next poll.
             logger.exception("[REGIME] Error applying recommendation: %s", e)
             self._emit("on_status", f"[REGIME] Apply error: {e}")
             return None
 
-        # Mark executed
-        self._pending_recommendation = None
+        # Mark executed on disk FIRST, then drop the in-memory pending —
+        # the reverse order could re-apply after a restart if the state
+        # write failed silently.
         executed_at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
         self._manager.mark_recommendation_executed(executed_at)
+        self._pending_recommendation = None
         self._auto_save_session()
         self._emit("on_status", f"[REGIME] Applied: {result}")
         return result
@@ -223,21 +284,43 @@ class RegimeSwitchingRunner(LiveRunner):
         self.regime_idle = True
         return "sit_out (idle)"
 
-    # ── Session helpers ──
+    # ── Classifier bar supply ──
 
-    def _minutes_until_session_close(self, now: datetime) -> float:
-        """Estimate minutes until the current session's close."""
-        minutes = now.hour * 60 + now.minute
-        # DAY session: closes at 13:45
-        if 525 <= minutes < 826:
-            return max(0, 825 - minutes)
-        # NIGHT session: closes at 05:00 (next day if after 15:00)
-        if minutes >= 900:
-            return (24 * 60 - minutes) + 300
-        if minutes < 300:
-            return 300 - minutes
-        # In a gap — return large number
-        return 999
+    def _classifier_bars(self) -> list:
+        """Default bars provider for regime classification.
+
+        Prefers the in-memory aggregated bars — seeded at deploy by
+        ``feed_warmup_bars()`` with ~2 weeks of KLine history — so a
+        fresh bot can classify from its first night instead of waiting
+        days for its own CSVs to reach 52 classify-interval bars. Falls
+        back to the CSV 1-min history whenever that yields more
+        classify-interval bars (e.g. after a cross-timeframe swap
+        rebuild dropped the warmup bars) or when the target interval
+        cannot be re-binned into the classify interval (H4/daily legs).
+
+        Reads ``self._aggregated_bars`` at call time — do NOT capture
+        the list object; ``_rebuild_timeframe`` rebinds it (issue #43).
+        """
+        interval = self._regime_cfg.classify_interval
+        candidates: list[list] = []
+        if 0 < self.target_interval <= interval:
+            # Dedup+sort defensively: a mid-gap deploy can append a
+            # tick-replayed session behind warmup bars that already
+            # cover it (warmup bars are not in _seen_1m_dts for >1m
+            # timeframes), which would spam out-of-order warnings.
+            mem = sorted({b.dt: b for b in self._aggregated_bars}.values(),
+                         key=lambda b: b.dt)
+            if mem:
+                candidates.append(mem)
+        csv_bars = load_1m_bars_from_csvs(self.bot_dir, self.symbol)
+        if csv_bars:
+            candidates.append(csv_bars)
+        if not candidates:
+            return []
+        if len(candidates) == 1:
+            return candidates[0]
+        return max(candidates,
+                   key=lambda bs: len(aggregate_bars(bs, interval)))
 
     # ── Session persistence (override) ──
 
@@ -298,24 +381,25 @@ class RegimeSwitchingRunner(LiveRunner):
     # ── Stop (override) ──
 
     def stop(self):
-        """Record in-progress session result before teardown."""
-        try:
-            now = datetime.now(_TZ_TAIPEI)
-            slot = session_slot(now)
-            session_date, session_type = slot
-            key = (session_date, session_type)
-            if key not in self._recorded_sessions:
-                self._recorded_sessions.add(key)
-                pnl, n_trades = self._compute_session_pnl(session_date, session_type)
-                strategy_name = self.strategy_display_name if self._active_leg != "idle" else "idle"
-                self._manager.do_record_session_result(
-                    session_date, session_type, pnl, n_trades,
-                    strategy_active=strategy_name,
-                    trading_mode=self.trading_mode,
-                )
-        except Exception as e:
-            logger.warning("[REGIME] Error recording session on stop: %s", e)
-        return super().stop()
+        """Record the in-progress session result on teardown.
+
+        Runs AFTER ``super().stop()`` so the force-close trade it may
+        append is included in the recorded P&L. Recording is NOT skipped
+        when the close-window record already fired — the store updates
+        the existing row in place, so this just refreshes it with the
+        final trade set. A stop during a gap/weekend records nothing
+        (the session-end record already covered the last session).
+        """
+        now = datetime.now(_TZ_TAIPEI)
+        sess = current_session(now)
+        summary = super().stop()
+        if sess is not None:
+            try:
+                self._recorded_sessions.add((sess.open_date, sess.slot))
+                self._record_session(sess)
+            except Exception as e:
+                logger.warning("[REGIME] Error recording session on stop: %s", e)
+        return summary
 
     # ── Status ──
 

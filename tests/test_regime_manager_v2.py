@@ -137,6 +137,56 @@ class TestRecordResult:
         assert rows[1][_V2_HEADER.index("trades")] == "3"
 
 
+class TestRecordUpdateInPlace:
+    def test_re_record_updates_row_not_duplicate(self, tmp_path):
+        """Re-recording the same session (stop right after the close-window
+        record, or a restart) must update the row in place — the old code
+        appended a second standalone row, double-counting the session."""
+        bot_dir = str(tmp_path / "TX00_test")
+        os.makedirs(bot_dir, exist_ok=True)
+        mgr = RegimeManager(bot_dir, _make_cfg(), bars_provider=lambda: _make_bars())
+
+        mgr.do_record_session_result("2026-07-09", "DAY", 50.0, 3,
+                                     strategy_active="LongA", trading_mode="paper")
+        mgr.do_record_session_result("2026-07-09", "DAY", 80.0, 4,
+                                     strategy_active="LongA", trading_mode="paper")
+
+        hist_path = os.path.join(bot_dir, "regime_history.csv")
+        with open(hist_path, newline="") as f:
+            rows = list(csv.reader(f))
+        matching = [r for r in rows[1:] if r[0] == "2026-07-09" and r[1] == "DAY"]
+        assert len(matching) == 1
+        assert matching[0][_V2_HEADER.index("pnl")] == "80.0"
+        assert matching[0][_V2_HEADER.index("trades")] == "4"
+
+    def test_classify_then_record_single_row(self, tmp_path):
+        """With classify-before-record poll ordering, one session ends up
+        as ONE row carrying both the assessment and its P&L."""
+        bot_dir = str(tmp_path / "TX00_test")
+        os.makedirs(bot_dir, exist_ok=True)
+        mgr = RegimeManager(bot_dir, _make_cfg(), bars_provider=lambda: _make_bars())
+
+        mgr.classify_session("2026-07-09", "NIGHT")
+        mgr.do_record_session_result("2026-07-09", "NIGHT", 120.0, 2,
+                                     strategy_active="LongA", trading_mode="paper")
+
+        hist_path = os.path.join(bot_dir, "regime_history.csv")
+        with open(hist_path, newline="") as f:
+            rows = list(csv.reader(f))
+        matching = [r for r in rows[1:] if r[0] == "2026-07-09" and r[1] == "NIGHT"]
+        assert len(matching) == 1
+        assert matching[0][_V2_HEADER.index("adx")] != ""     # classification kept
+        assert matching[0][_V2_HEADER.index("pnl")] == "120.0"  # P&L attached
+
+    def test_no_tmp_file_left_behind(self, tmp_path):
+        bot_dir = str(tmp_path / "TX00_test")
+        os.makedirs(bot_dir, exist_ok=True)
+        mgr = RegimeManager(bot_dir, _make_cfg(), bars_provider=lambda: _make_bars())
+        mgr.classify_session("2026-07-09", "NIGHT")
+        mgr.do_record_session_result("2026-07-09", "NIGHT", 1.0, 1)
+        assert not [f for f in os.listdir(bot_dir) if f.endswith(".tmp")]
+
+
 class TestPendingRecommendation:
     def test_get_pending_after_classify(self, tmp_path):
         bot_dir = str(tmp_path / "TX00_test")
