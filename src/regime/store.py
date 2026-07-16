@@ -26,6 +26,38 @@ _V2_HEADER = [
 ]
 
 
+# File-level marker for the last_assessed keying convention. Files
+# written before v2.16 stamped the night's CLOSE date; current code
+# stamps the OPEN date. Absence of the marker on a non-empty key means
+# the file is old-format and must be translated once at load.
+_KEY_FORMAT = "open-date"
+
+
+def _migrate_close_date_key(last_assessed: str) -> str:
+    """Translate a pre-v2.16 close-date key to its open-date equivalent.
+
+    An old stamp "2026-07-16|NIGHT" was written ~04:58 on 07-16 and
+    covered the night that OPENED on the prior trading day — exactly
+    what ``latest_night_session`` returns for that close-window moment.
+    Translating (instead of clearing) avoids both failure modes: a
+    colliding key would silently skip the next night, while a cleared
+    key would re-assess an already-assessed night and double-step the
+    hysteresis state machine.
+    """
+    from datetime import datetime, timedelta, timezone
+    from .switch_logic import latest_night_session
+    try:
+        date_part = last_assessed.split("|")[0]
+        stamped = datetime.strptime(date_part, "%Y-%m-%d").replace(
+            hour=4, minute=58, tzinfo=timezone(timedelta(hours=8)))
+        covered = latest_night_session(stamped)
+        return covered.key if covered else ""
+    except Exception:
+        logger.warning("[REGIME] Could not migrate last_assessed %r — clearing",
+                       last_assessed)
+        return ""
+
+
 def load_state(path: str) -> RegimeState:
     if not os.path.exists(path):
         return RegimeState()
@@ -39,12 +71,18 @@ def load_state(path: str) -> RegimeState:
     for k, v in d.items():
         if hasattr(s, k):
             setattr(s, k, v)
+    if s.last_assessed and d.get("key_format") != _KEY_FORMAT:
+        migrated = _migrate_close_date_key(s.last_assessed)
+        logger.info("[REGIME] Migrated last_assessed %r → %r (open-date keying)",
+                    s.last_assessed, migrated)
+        s.last_assessed = migrated
     return s
 
 
 def save_state(path: str, state: RegimeState, rec: Recommendation, session_date: str):
     import dataclasses
     d = dataclasses.asdict(state)
+    d["key_format"] = _KEY_FORMAT
     d["next_session"] = {
         "date": session_date, "action": rec.action,
         "strategy": rec.strategy_name, "qty_scale": rec.qty_scale,
@@ -106,6 +144,32 @@ def migrate_legacy_history(csv_path: str) -> None:
         logger.warning("[REGIME] Could not migrate history: %s", e)
 
 
+def _atomic_write_rows(csv_path: str, rows: list) -> None:
+    """Write all CSV rows via temp + fsync + os.replace.
+
+    A crash mid-write must never truncate the live history file — a
+    zero-byte/partial file would later be mistaken for v1 by
+    ``migrate_legacy_history`` and archived away.
+    """
+    tmp = csv_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, csv_path)
+
+
+def _read_rows(csv_path: str) -> list:
+    """Read history rows, always returning a header as row 0."""
+    if not os.path.exists(csv_path):
+        return [list(_V2_HEADER)]
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return [list(_V2_HEADER)]
+    return rows
+
+
 def append_history(
     csv_path: str,
     session_date: str,
@@ -118,28 +182,25 @@ def append_history(
     trading_mode: str = "",
 ):
     """Append a classification row to regime_history.csv (v2 schema)."""
-    exists = os.path.exists(csv_path)
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if not exists:
-            w.writerow(_V2_HEADER)
-        feat = state.last_features
-        w.writerow([
-            session_date, "NIGHT",
-            round(feat.get("adx", 0), 1),
-            round(feat.get("plus_di", 0), 1),
-            round(feat.get("minus_di", 0), 1),
-            round(feat.get("atr_ratio", 0), 2),
-            round(feat.get("ema_slope", 0), 1),
-            feat.get("last_close", ""),
-            state.raw_regime, state.effective_regime,
-            state.pending_count,
-            rec.action, rec.strategy_name,
-            "", state.manual_override,
-            "", "",  # pnl, trades — filled by record_session_result
-            strategy_active,
-            str(applied).lower(), applied_at, trading_mode,
-        ])
+    rows = _read_rows(csv_path)
+    feat = state.last_features
+    rows.append([
+        session_date, "NIGHT",
+        round(feat.get("adx", 0), 1),
+        round(feat.get("plus_di", 0), 1),
+        round(feat.get("minus_di", 0), 1),
+        round(feat.get("atr_ratio", 0), 2),
+        round(feat.get("ema_slope", 0), 1),
+        feat.get("last_close", ""),
+        state.raw_regime, state.effective_regime,
+        state.pending_count,
+        rec.action, rec.strategy_name,
+        "", state.manual_override,
+        "", "",  # pnl, trades — filled by record_session_result
+        strategy_active,
+        str(applied).lower(), applied_at, trading_mode,
+    ])
+    _atomic_write_rows(csv_path, rows)
 
 
 def record_session_result(
@@ -153,52 +214,37 @@ def record_session_result(
 ):
     """Record a session's P&L directly from the switching runner's broker.
 
-    For NIGHT sessions where a classification row already exists (pnl
-    column blank), backfills that row.  For DAY sessions (or NIGHT
-    sessions with no prior classification row), appends a standalone
-    result row with ``decision=""``.
+    Update-or-append, keyed by (date, session): if a row for this
+    session already exists — a classification row awaiting backfill OR
+    an earlier result row — its pnl/trades are OVERWRITTEN; otherwise a
+    standalone result row is appended.  The caller recomputes the
+    session total from the full trade list each time, so re-recording
+    is idempotent: a stop() right after the close-window record, or a
+    restart that records the same session again, updates the row in
+    place instead of appending a double-counted duplicate.
     """
-    if not os.path.exists(csv_path):
-        # Create with header + standalone row
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(_V2_HEADER)
-            w.writerow(_result_row(session_date, session_slot, pnl, trades,
-                                   strategy_active, trading_mode))
-        return
+    rows = _read_rows(csv_path)
 
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        rows = list(csv.reader(f))
+    session_col = _V2_HEADER.index("session")
+    pnl_col = _V2_HEADER.index("pnl")
+    trades_col = _V2_HEADER.index("trades")
+    active_col = _V2_HEADER.index("strategy_active")
+    mode_col = _V2_HEADER.index("trading_mode")
 
-    # Try to backfill an existing classification row (matching date+session, blank pnl)
-    backfilled = False
-    session_col = _V2_HEADER.index("session")  # 1
-    pnl_col = _V2_HEADER.index("pnl")         # 15
-    trades_col = _V2_HEADER.index("trades")    # 16
-    active_col = _V2_HEADER.index("strategy_active")  # 17
-    mode_col = _V2_HEADER.index("trading_mode")        # 20
     for i in range(len(rows) - 1, 0, -1):
-        if (len(rows[i]) > pnl_col
+        if (len(rows[i]) > mode_col
                 and rows[i][0] == session_date
-                and rows[i][session_col] == session_slot
-                and rows[i][pnl_col] == ""):
+                and rows[i][session_col] == session_slot):
             rows[i][pnl_col] = str(pnl)
             rows[i][trades_col] = str(trades)
-            if len(rows[i]) > active_col and not rows[i][active_col]:
-                rows[i][active_col] = strategy_active
-            if len(rows[i]) > mode_col and not rows[i][mode_col]:
-                rows[i][mode_col] = trading_mode
-            backfilled = True
+            rows[i][active_col] = strategy_active
+            rows[i][mode_col] = trading_mode
             break
-
-    if backfilled:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerows(rows)
     else:
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(
-                _result_row(session_date, session_slot, pnl, trades,
-                            strategy_active, trading_mode))
+        rows.append(_result_row(session_date, session_slot, pnl, trades,
+                                strategy_active, trading_mode))
+
+    _atomic_write_rows(csv_path, rows)
 
 
 def _result_row(date, session, pnl, trades, strategy_active, trading_mode):

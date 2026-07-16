@@ -118,12 +118,45 @@ class TestClassification:
         # Should have classified (or no-op if bars insufficient for this test setup)
         assert isinstance(lines, list)
 
-    def test_day_session_no_classify(self, tmp_path):
+    def test_classify_keyed_by_open_date(self, tmp_path):
+        # The night closing Fri 05:00 opened Thu 15:00 — its key is the
+        # OPEN date (2026-07-09), stable across midnight.
+        runner = _make_runner(tmp_path)
+        now = datetime(2026, 7, 10, 4, 58, tzinfo=_TZ_TAIPEI)
+        runner.on_status_poll(now)
+        assert runner._manager._state.last_assessed == "2026-07-09|NIGHT"
+
+    def test_day_session_no_classify_when_assessed(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        # Last completed night (opened Wed 07-08) already assessed
+        runner._manager._state.last_assessed = "2026-07-08|NIGHT"
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=_TZ_TAIPEI)
+        lines = runner.on_status_poll(now)
+        assert not any("Classified" in l for l in lines)
+
+    def test_catch_up_classify_after_missed_window(self, tmp_path):
+        # A poll long after the night closed (missed 04:58-05:00 window,
+        # or a fresh deploy) classifies the unassessed night late.
         runner = _make_runner(tmp_path)
         now = datetime(2026, 7, 9, 12, 0, tzinfo=_TZ_TAIPEI)
         lines = runner.on_status_poll(now)
-        # Should NOT have classified — it's DAY
-        assert not any("Classified" in l for l in lines)
+        assert any("Classified" in l for l in lines)
+        assert runner._manager._state.last_assessed == "2026-07-08|NIGHT"
+
+    def test_insufficient_bars_backs_off(self, tmp_path):
+        # Classifier failure sets a retry backoff instead of hammering
+        # (and warning) on every 30s poll until the next night.
+        runner = _make_runner(tmp_path)
+        runner._manager._bars_provider = lambda: []
+        now = datetime(2026, 7, 10, 4, 58, tzinfo=_TZ_TAIPEI)
+        runner.on_status_poll(now)
+        assert runner._classify_retry_after is not None
+        # Within the backoff window the manager is not called again
+        calls = []
+        orig = runner._manager.classify_session
+        runner._manager.classify_session = lambda *a, **k: calls.append(a) or orig(*a, **k)
+        runner.on_status_poll(now + timedelta(seconds=30))
+        assert calls == []
 
 
 class TestApplyPending:
@@ -298,3 +331,177 @@ class TestFullCycle:
         gap2 = datetime(2026, 7, 10, 7, 30, tzinfo=_TZ_TAIPEI)
         lines = runner.on_status_poll(gap2)
         # No error, no double-apply
+
+
+def _klines_15m_days(n_days, start="2026-07-01"):
+    """15-min KLine strings spanning ``n_days``, 08:45-18:30 each day
+    (40 bars/day → 10 hourly bars/day after aggregation)."""
+    lines = []
+    day0 = datetime.strptime(start, "%Y-%m-%d")
+    for d in range(n_days):
+        day = day0 + timedelta(days=d)
+        for i in range(40):
+            dt = day.replace(hour=8, minute=45) + timedelta(minutes=15 * i)
+            price = 22000 + d * 100 + i
+            lines.append(
+                f"{dt.strftime('%m/%d/%Y %H:%M')},{price},{price+10},"
+                f"{price-5},{price+3},{50+i}")
+    return lines
+
+
+class TestClassifierBarsPreseed:
+    def _make_bare_runner(self, tmp_path):
+        """Runner with NO bars_provider — exercises the default
+        _classifier_bars provider."""
+        return RegimeSwitchingRunner(
+            LongStrategy(), "TX00", log_dir=str(tmp_path),
+            bot_name="preseed",
+            regime_cfg=_make_cfg(),
+            long_strategy_name="TestLong",
+            short_strategy_name="TestShort",
+            strategies_registry=REGISTRY,
+        )
+
+    def test_warmup_preseeds_classifier(self, tmp_path):
+        """Warmup KLine history alone must let a fresh bot (empty bot
+        dir, no CSVs) classify — the old default provider read only the
+        bot's own CSVs, forcing ~4 trading days of cold start."""
+        runner = self._make_bare_runner(tmp_path)
+        runner.feed_warmup_bars(_klines_15m_days(7))  # ~70 hourly bars
+        runner._is_reloading = False
+        rec = runner._manager.classify_session("2026-07-08", "NIGHT")
+        assert rec is not None
+
+    def test_no_warmup_no_csv_returns_empty(self, tmp_path):
+        runner = self._make_bare_runner(tmp_path)
+        assert runner._classifier_bars() == []
+
+    def test_high_timeframe_falls_back_to_csv(self, tmp_path):
+        # H4/daily bars cannot be re-binned down to the hourly classify
+        # interval — the provider must ignore them.
+        runner = self._make_bare_runner(tmp_path)
+        runner.feed_warmup_bars(_klines_15m_days(7))
+        runner.target_interval = 14400  # simulate an H4 donor
+        assert runner._classifier_bars() == []  # no CSVs in this dir
+
+    def test_provider_survives_aggregated_bars_rebind(self, tmp_path):
+        # _rebuild_timeframe REBINDS self._aggregated_bars (issue #43
+        # family) — the provider must read the attribute at call time.
+        runner = self._make_bare_runner(tmp_path)
+        runner.feed_warmup_bars(_klines_15m_days(7))
+        assert len(runner._classifier_bars()) > 0
+        runner._aggregated_bars = []
+        assert runner._classifier_bars() == []
+
+
+class TestSessionPnlWindow:
+    def _trade(self, exit_dt, pnl):
+        from types import SimpleNamespace
+        return SimpleNamespace(exit_dt=exit_dt, pnl=pnl)
+
+    def test_night_window_spans_midnight(self, tmp_path):
+        """Pre-midnight night exits belong to the night session; day
+        trades don't leak in. The old calendar-date match dropped the
+        22:30 trade entirely (session was keyed by the NEXT day's date
+        at the 04:58 record)."""
+        from src.regime.switch_logic import current_session
+        runner = _make_runner(tmp_path)
+        runner.broker.trades.append(self._trade("2026-07-09 22:30", 100.0))
+        runner.broker.trades.append(self._trade("2026-07-10 03:20", 50.0))
+        runner.broker.trades.append(self._trade("2026-07-09 10:00", 999.0))
+        sess = current_session(datetime(2026, 7, 10, 4, 58, tzinfo=_TZ_TAIPEI))
+        assert runner._compute_session_pnl(sess) == (150.0, 2)
+
+    def test_day_window_excludes_night_trades(self, tmp_path):
+        """The old date-only match double-counted post-midnight night
+        exits into the same date's DAY row."""
+        from src.regime.switch_logic import current_session
+        runner = _make_runner(tmp_path)
+        runner.broker.trades.append(self._trade("2026-07-10 03:20", 50.0))
+        runner.broker.trades.append(self._trade("2026-07-10 09:15", 30.0))
+        sess = current_session(datetime(2026, 7, 10, 10, 0, tzinfo=_TZ_TAIPEI))
+        assert runner._compute_session_pnl(sess) == (30.0, 1)
+
+    def test_force_close_seconds_precision(self, tmp_path):
+        # force_close writes "YYYY-MM-DD HH:MM:SS" — must still match.
+        from src.regime.switch_logic import current_session
+        runner = _make_runner(tmp_path)
+        runner.broker.trades.append(self._trade("2026-07-10 10:00:42", 70.0))
+        sess = current_session(datetime(2026, 7, 10, 10, 5, tzinfo=_TZ_TAIPEI))
+        assert runner._compute_session_pnl(sess) == (70.0, 1)
+
+
+class TestStaleRecommendationDiscard:
+    def test_stale_pending_discarded(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        runner._pending_recommendation = {
+            "date": "2026-07-06", "action": "deploy_long",
+            "strategy": "TestLong", "qty_scale": 1.0, "reason": "old",
+        }
+        # Fri 07:00 — the 07-09-open night has completed since 07-06
+        now = datetime(2026, 7, 10, 7, 0, tzinfo=_TZ_TAIPEI)
+        result = runner._maybe_apply_pending(now)
+        assert result is None
+        assert runner._pending_recommendation is None  # dropped, not applied
+        assert runner.active_leg == "idle"
+
+    def test_fresh_pending_still_applies(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        runner._pending_recommendation = {
+            "date": "2026-07-09", "action": "deploy_long",
+            "strategy": "TestLong", "qty_scale": 1.0, "reason": "fresh",
+        }
+        now = datetime(2026, 7, 10, 7, 0, tzinfo=_TZ_TAIPEI)
+        result = runner._maybe_apply_pending(now)
+        assert result is not None
+        assert runner.active_leg == "long"
+
+
+class TestPermanentApplyErrorDiscard:
+    def test_unknown_strategy_discards_pending(self, tmp_path):
+        """A leg strategy missing from the registry is a permanent config
+        error — old code kept the pending armed and errored every 30s
+        poll forever (and re-armed it after every restart)."""
+        runner = _make_runner(tmp_path)
+        runner._long_strategy_name = "Nonexistent"
+        runner._pending_recommendation = {
+            "date": "2026-07-09", "action": "deploy_long",
+            "strategy": "Nonexistent", "qty_scale": 1.0, "reason": "test",
+        }
+        now = datetime(2026, 7, 10, 7, 0, tzinfo=_TZ_TAIPEI)
+        result = runner._maybe_apply_pending(now)
+        assert result is None
+        assert runner._pending_recommendation is None
+        assert runner.active_leg == "idle"
+
+
+class TestStopRecordsForceClose:
+    def test_force_close_trade_included_in_record(self, tmp_path, monkeypatch):
+        """stop() must record AFTER LiveRunner.stop() appends the
+        force-close trade — old code recorded first, permanently losing
+        that trade's P&L from the session row."""
+        import csv as csv_mod
+        from types import SimpleNamespace
+        import src.live.regime_switching_runner as rsr
+        from src.live.live_runner import LiveRunner
+
+        runner = _make_runner(tmp_path)
+        sess = rsr.current_session(
+            datetime(2026, 7, 10, 10, 0, tzinfo=_TZ_TAIPEI))
+        monkeypatch.setattr(rsr, "current_session", lambda now=None: sess)
+
+        def fake_stop(self):
+            self.broker.trades.append(
+                SimpleNamespace(exit_dt="2026-07-10 10:00", pnl=777.0))
+            return {}
+
+        monkeypatch.setattr(LiveRunner, "stop", fake_stop)
+        runner.stop()
+
+        hist = os.path.join(runner.bot_dir, "regime_history.csv")
+        with open(hist, newline="") as f:
+            rows = list(csv_mod.reader(f))
+        match = [r for r in rows[1:]
+                 if r[0] == "2026-07-10" and r[1] == "DAY"]
+        assert len(match) == 1
+        assert match[0][15] == "777.0"  # pnl column

@@ -85,6 +85,8 @@ a = Analysis(
         'src.live.live_runner', 'src.live.tick_classifier',
         # Utils
         'src.utils.time_utils',
+        # Self-update
+        'src.updater',
     ],
     hookspath=[],
     hooksconfig={},
