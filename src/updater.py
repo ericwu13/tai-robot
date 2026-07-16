@@ -175,12 +175,15 @@ def write_swap_script(
     new_exe_path: str,
     script_path: str,
     temp_dir: str,
+    version: str = "",
 ) -> str:
     """Write ``apply_update.bat`` that swaps the install after this exits.
 
     The script waits for ``old_pid`` to exit, expands the zip, robocopy-swaps
     the payload into ``app_dir`` (excluding user state), deletes ``temp_dir``,
-    and launches ``new_exe_path``. Returns ``script_path``.
+    and launches ``new_exe_path``. On failure it shows a dialog and does NOT
+    launch. On success it auto-relaunches and shows a tray notification.
+    Returns ``script_path``.
     """
     xd = " ".join(_EXCLUDE_DIRS)
     xf = " ".join(_EXCLUDE_FILES)
@@ -191,9 +194,12 @@ def write_swap_script(
     # planted executable in the launch dir) — that would break the wait loop
     # or, worse, run an attacker's binary during the swap.
     sys32 = r"%SystemRoot%\System32"
+    ps = f"{sys32}\\WindowsPowerShell\\v1.0\\powershell.exe"
 
-    # Batch caveat: robocopy exit codes 0-7 are success; 8+ are failures. We
-    # only relaunch when the copy did not hard-fail.
+    ver_label = f"v{version}" if version else "latest"
+
+    # Batch caveat: robocopy exit codes 0-7 are success; 8+ are failures.
+    # On failure we show an error dialog and skip the relaunch.
     script = f"""@echo off
 setlocal
 :: --- Wait for the old process (PID {old_pid}) to exit ---
@@ -205,22 +211,30 @@ if not errorlevel 1 (
 )
 
 :: --- Extract the downloaded zip ---
-{sys32}\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -Command "Expand-Archive -Path '{zip_path}' -DestinationPath '{extract_dir}' -Force"
+{ps} -NoProfile -Command "Expand-Archive -Path '{zip_path}' -DestinationPath '{extract_dir}' -Force"
+if %ERRORLEVEL% NEQ 0 (
+    {ps} -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Failed to extract update archive. The previous version is still in place.', 'tai-robot Update Failed', 'OK', 'Error') | Out-Null"
+    goto CLEANUP
+)
 
 :: --- Swap the install directory (preserve user state) ---
 {sys32}\\robocopy.exe "{payload_src}" "{app_dir}" /E /IS /IT /XD {xd} /XF {xf} /R:2 /W:1 /NFL /NDL /NJH /NJS >NUL
-if %ERRORLEVEL% GEQ 8 (
-    echo Update failed: robocopy error %ERRORLEVEL% 1>&2
-    goto LAUNCH
+set ROBO_ERR=%ERRORLEVEL%
+if %ROBO_ERR% GEQ 8 (
+    {ps} -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Update failed (robocopy error %ROBO_ERR%). The previous version is still in place.', 'tai-robot Update Failed', 'OK', 'Error') | Out-Null"
+    goto CLEANUP
 )
-
-:LAUNCH
-:: --- Clean up the temp download folder ---
-cd /d "%TEMP%"
-rd /s /q "{temp_dir}"
 
 :: --- Launch the updated exe ---
 start "" "{new_exe_path}"
+
+:: --- Show success notification (background, non-blocking) ---
+start /B "" {ps} -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.BalloonTipTitle = 'tai-robot'; $n.BalloonTipText = 'Updated to {ver_label} successfully!'; $n.Visible = $true; $n.ShowBalloonTip(5000); Start-Sleep 6; $n.Dispose()"
+
+:CLEANUP
+:: --- Clean up the temp download folder ---
+cd /d "%TEMP%"
+rd /s /q "{temp_dir}"
 endlocal
 """
     os.makedirs(os.path.dirname(script_path), exist_ok=True)
@@ -293,6 +307,7 @@ def launch_update(
         new_exe_path=new_exe_path,
         script_path=script_path,
         temp_dir=temp_dir,
+        version=version,
     )
 
     # Launch the swap batch so it survives this process exiting.
