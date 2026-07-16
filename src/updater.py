@@ -252,9 +252,14 @@ def launch_update(
 ) -> None:
     """Download the release, write the swap script, launch it detached, exit.
 
-    This does NOT return under normal operation — it calls ``sys.exit(0)``
+    This does NOT return under normal operation — it calls ``os._exit(0)``
     after launching the detached batch so the old exe releases its files for
-    the swap. Exceptions before launch propagate to the caller.
+    the swap. ``os._exit`` (not ``sys.exit``) is used because the UI invokes
+    this from a background daemon thread: ``sys.exit`` only unwinds the calling
+    thread, leaving the process — and its file locks — alive so the swap batch
+    waits forever for the PID to die. ``os._exit`` terminates the whole process
+    immediately from any thread. Exceptions before launch propagate to the
+    caller.
 
     Refuses to run unless frozen: from a source checkout ``_app_dir()`` is the
     repo root, so the swap would robocopy a release over the working tree and
@@ -297,7 +302,7 @@ def launch_update(
     # ("Input redirection is not supported"), which silently aborts the whole
     # swap. CREATE_NO_WINDOW allocates a hidden console so the batch tools
     # work, while keeping the window invisible. Windows does not kill child
-    # processes when the parent exits, so it keeps running after sys.exit().
+    # processes when the parent exits, so it keeps running after we exit.
     CREATE_NO_WINDOW = 0x08000000
     CREATE_NEW_PROCESS_GROUP = 0x00000200
     subprocess.Popen(
@@ -305,7 +310,10 @@ def launch_update(
         creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
-    sys.exit(0)
+    # os._exit (not sys.exit) so the process actually dies even when this runs
+    # in a background daemon thread — sys.exit only unwinds the calling thread,
+    # leaving the exe alive and the swap batch waiting forever for the PID.
+    os._exit(0)
 
 
 # ── startup cleanup ─────────────────────────────────────────────────
