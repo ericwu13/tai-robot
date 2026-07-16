@@ -56,7 +56,7 @@ python test_kline.py       # COM-based KLine history GUI
 - No pandas/numpy - indicators use pure Python
 - settings.yaml is NEVER committed (contains credentials)
 - SDK directory (CapitalAPI_2.13.57/) is gitignored (large binaries)
-- Test count: 1483 tests (as of v2.14.0-regime-phase3)
+- Test count: 1570 tests (as of v2.16.0-regime-session-integrity)
 
 ## COM Tick History Replay (CRITICAL — issue #50)
 - After `RequestTicks`, COM replays historical ticks before sending live ticks
