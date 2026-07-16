@@ -260,7 +260,7 @@ class TestResumeRearm:
         # Check if anything was classified
         state_path = os.path.join(runner1.bot_dir, "regime_state.json")
         if os.path.exists(state_path):
-            with open(state_path) as f:
+            with open(state_path, encoding="utf-8") as f:
                 d = json.load(f)
             ns = d.get("next_session", {})
             if not ns.get("executed", True):

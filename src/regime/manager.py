@@ -21,6 +21,22 @@ from .store import (
 
 logger = logging.getLogger(__name__)
 
+# Regime enum value → bilingual display label for Discord notifications.
+# DISPLAY ONLY — the stored raw_regime/effective_regime values (state file,
+# history CSV, pattern-matching in the state machine/selector) stay as the
+# bare English enum. Never feed a translated label back into stored state.
+_REGIME_LABELS = {
+    "trending-up": "上升趨勢 trending-up",
+    "trending-down": "下降趨勢 trending-down",
+    "range-bound": "盤整 range-bound",
+    "transitional": "過渡期 transitional",
+    "unknown": "未知 unknown",
+}
+
+
+def _regime_label(regime: str) -> str:
+    """Bilingual display label for a regime enum value (falls back to raw)."""
+    return _REGIME_LABELS.get(regime, regime)
 
 class RegimeManager:
     def __init__(
@@ -210,8 +226,8 @@ class RegimeManager:
                         "deploy_short_half": "做空半倉 SHORT½", "sit_out": "觀望 SIT OUT",
                         "hold": "維持 HOLD"}.get(rec.action, rec.action)
         msg = (f"📊 **Regime 建議** — {session_date}\n"
-               f"原始 Raw: `{self._state.raw_regime}` (ADX {self._state.last_features.get('adx', 0):.1f})\n"
-               f"有效 Effective: `{self._state.effective_regime}` (since {self._state.effective_since})\n"
+               f"原始 Raw: `{_regime_label(self._state.raw_regime)}` (ADX {self._state.last_features.get('adx', 0):.1f})\n"
+               f"有效 Effective: `{_regime_label(self._state.effective_regime)}` (since {self._state.effective_since})\n"
                f"建議 Recommendation: **{action_label}**"
                + (f" — `{rec.strategy_name}`" if rec.strategy_name else "")
                + f"\n理由 Reason: {rec.reason}")
