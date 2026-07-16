@@ -23,6 +23,11 @@ class RegimeConfig:
     max_flips: int = 3
     flip_window: int = 10
     pause_sessions: int = 5
+    # Fast-track threshold: a single session with ADX above this confirms
+    # a regime change without waiting confirm_sessions. Only active while
+    # adx_strong > adx_enter — otherwise every trending read would
+    # fast-track and raising adx_enter would silently disable hysteresis.
+    adx_strong: float = 30.0
     long_strategy: str = ""
     short_strategy: str = ""
     range_bias_action: str = "sit_out"   # "sit_out" | "short_half"
@@ -38,6 +43,10 @@ class RegimeState:
     pending_label: str = ""
     pending_count: int = 0
     flip_history: list = field(default_factory=list)
+    # session_count values at which flips were confirmed — the actual
+    # sliding-window data for the flip-counter pause. flip_history keeps
+    # the human-readable dates for display/state inspection.
+    flip_sessions: list = field(default_factory=list)
     paused_until_session: int = 0       # session index counter
     session_count: int = 0
     manual_override: str = "auto"
@@ -86,7 +95,7 @@ class RegimeStateMachine:
         if raw == "transitional":
             s.pending_count = 0   # reset streak but don't change effective
         else:
-            strong = adx > 30
+            strong = cfg.adx_strong > cfg.adx_enter and adx > cfg.adx_strong
             if raw == s.pending_label:
                 s.pending_count += 1
             else:
@@ -99,10 +108,16 @@ class RegimeStateMachine:
                 s.effective_since = session_date
                 s.pending_count = 0
                 s.flip_history.append(session_date)
-                # Trim to flip_window
                 s.flip_history = s.flip_history[-cfg.flip_window:]
-                # Check if flip count triggers pause
-                if len(s.flip_history) >= cfg.max_flips:
+                # Flip-counter pause: max_flips within the last flip_window
+                # SESSIONS (a true sliding window — lifetime flip count is
+                # irrelevant, so an old bot doesn't pause on every flip).
+                s.flip_sessions.append(s.session_count)
+                s.flip_sessions = [
+                    c for c in s.flip_sessions
+                    if s.session_count - c < cfg.flip_window
+                ]
+                if len(s.flip_sessions) >= cfg.max_flips:
                     s.paused_until_session = s.session_count + cfg.pause_sessions
 
         s.last_features["_vol_spike"] = vol_spike

@@ -21,6 +21,10 @@ from .store import (
 
 logger = logging.getLogger(__name__)
 
+# Minimum classify-interval (HTF) bars required to classify: EMA-50 needs
+# 50 plus headroom for the leading/trailing partial aggregation bars.
+MIN_CLASSIFY_BARS = 52
+
 # Regime enum value → bilingual display label for Discord notifications.
 # DISPLAY ONLY — the stored raw_regime/effective_regime values (state file,
 # history CSV, pattern-matching in the state machine/selector) stay as the
@@ -37,6 +41,7 @@ _REGIME_LABELS = {
 def _regime_label(regime: str) -> str:
     """Bilingual display label for a regime enum value (falls back to raw)."""
     return _REGIME_LABELS.get(regime, regime)
+
 
 class RegimeManager:
     def __init__(
@@ -191,7 +196,7 @@ class RegimeManager:
             if not bars:
                 return None
             bars_htf = aggregate_bars(bars, self.cfg.classify_interval)
-            if len(bars_htf) < 52:
+            if len(bars_htf) < MIN_CLASSIFY_BARS:
                 return None
             highs = [b.high for b in bars_htf]
             lows = [b.low for b in bars_htf]

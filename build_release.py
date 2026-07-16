@@ -20,6 +20,7 @@ published EXE was built from a checkout lacking the regime code):
 
 import argparse
 import filecmp
+import hashlib
 import json
 import os
 import shutil
@@ -172,6 +173,25 @@ def package():
     return zip_path
 
 
+def write_checksum(zip_path: str) -> str:
+    """Compute the SHA-256 of the release zip and write a sidecar file.
+
+    Writes ``<zip>.sha256`` in the ``sha256sum``-compatible format
+    (``<hex>  <filename>``) next to the zip. Returns the sidecar path.
+    """
+    h = hashlib.sha256()
+    with open(zip_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    sha_path = zip_path + ".sha256"
+    with open(sha_path, "w", encoding="utf-8") as f:
+        f.write(f"{digest}  {os.path.basename(zip_path)}\n")
+    print(f"  SHA-256: {digest}")
+    print(f"  Wrote {sha_path}")
+    return sha_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build and package tai_backtest release")
     parser.add_argument("--skip-build", action="store_true", help="Skip PyInstaller build, just zip")
@@ -196,10 +216,12 @@ def main():
     write_build_stamp(sha, dirty)
 
     zip_path = package()
+    sha_path = write_checksum(zip_path)
 
     print(f"\n=== Done ===")
-    print(f"To create a GitHub release:")
-    print(f"  gh release create v{VERSION} {zip_path} --title \"v{VERSION}\" --notes \"First release\"")
+    print(f"To create a GitHub release (upload zip + checksum):")
+    print(f"  gh release create v{VERSION} {zip_path} {sha_path} "
+          f"--title \"v{VERSION}\" --notes \"First release\"")
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ from src.utils.log_redact import (
 )
 from src.backtest.engine import BacktestEngine
 from src.backtest.broker import _mode_to_source
+from src import updater
 
 # Trade.source → display label for the Trades tab and exports
 _SOURCE_LABELS = {"real": "實單 Real", "paper": "模擬 Paper", "backtest": "回測 BT"}
@@ -630,6 +631,35 @@ _parse_open_interest = parse_open_interest  # re-export from account_monitor
 _parse_future_rights = parse_future_rights  # re-export from account_monitor
 
 
+def _attach_tooltip(widget, text: str) -> None:
+    """Attach a lightweight hover tooltip to a Tk widget."""
+    state = {"tip": None}
+
+    def show(_event=None):
+        if state["tip"] is not None:
+            return
+        try:
+            x = widget.winfo_rootx() + 20
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+        except tk.TclError:
+            return
+        tip = tk.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(tip, text=text, background="#ffffe0", relief=tk.SOLID,
+                 borderwidth=1, font=("", 9), justify=tk.LEFT,
+                 padx=6, pady=3).pack()
+        state["tip"] = tip
+
+    def hide(_event=None):
+        if state["tip"] is not None:
+            state["tip"].destroy()
+            state["tip"] = None
+
+    widget.bind("<Enter>", show)
+    widget.bind("<Leave>", hide)
+
+
 class BacktestApp:
     def __init__(self, root: tk.Tk):
         global _app
@@ -666,6 +696,15 @@ class BacktestApp:
 
         # Start draining COM UI events on the main thread
         self._drain_ui_queue()
+
+        # Self-update: clean up any leftover temp folders from a prior update,
+        # then check GitHub for a newer release in the background (non-blocking
+        # so it never delays startup).
+        try:
+            updater.cleanup_stale_updates()
+        except Exception:
+            pass
+        threading.Thread(target=self._check_for_updates_bg, daemon=True).start()
 
     # ══════════════════════════════════════════════════════════════
     #  COM → UI QUEUE DRAIN (main thread)
@@ -1406,12 +1445,19 @@ class BacktestApp:
                                      command=self._report_issue)
         self.btn_report.grid(row=0, column=10, padx=3, pady=1, sticky=tk.W)
 
+        self.btn_update = ttk.Button(btn_frame, text="🔄 檢查更新 Check for Updates",
+                                     command=self._start_update)
+        self.btn_update.grid(row=0, column=11, padx=3, pady=1, sticky=tk.W)
+        _attach_tooltip(self.btn_update,
+                        "請先停止所有機器人\nStop all running bots first")
+
         # Wrap toolbar buttons onto extra rows when the frame is too
         # narrow for a single row (grid does not auto-wrap).
         self._toolbar_widgets = [
             self.btn_tv, self.btn_api, self.btn_taifex, self.btn_deploy,
             self.btn_chart_all, self.btn_export, self.btn_toggle_settings,
             tf_frame, self.btn_review, self.btn_evolution, self.btn_report,
+            self.btn_update,
         ]
         self._toolbar_last_width = 0
         btn_frame.bind("<Configure>", self._reflow_toolbar)
@@ -1420,6 +1466,17 @@ class BacktestApp:
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
         ttk.Label(ctrl, textvariable=self.status_var, foreground="gray",
                   font=("", 9)).pack(fill=tk.X, padx=6, pady=(0, 1))
+
+        # Non-blocking "update available" banner (hidden until the startup
+        # check finds a newer release). Populated by _on_update_available.
+        self.update_banner_var = tk.StringVar(value="")
+        self._update_banner = ttk.Label(
+            ctrl, textvariable=self.update_banner_var,
+            foreground="#0a7d00", font=("", 9, "bold"), cursor="hand2")
+        self._update_banner.pack(fill=tk.X, padx=6, pady=(0, 1))
+        self._update_banner.bind("<Button-1>", lambda _e: self._start_update())
+        # Latest release discovered by the startup check (set in bg thread).
+        self._latest_release: "updater.ReleaseInfo | None" = None
 
         # ── Collapsible backtest settings ──
         self._settings_visible = False
@@ -2427,6 +2484,160 @@ class BacktestApp:
         self.root.destroy()
 
     # ══════════════════════════════════════════════════════════════
+    #  SELF-UPDATE
+    # ══════════════════════════════════════════════════════════════
+
+    def _check_for_updates_bg(self):
+        """Background: query GitHub Releases, surface a banner if newer.
+
+        Runs on a daemon thread. Any network failure is silently ignored —
+        the app must work fully offline. UI updates are marshalled back to
+        the main thread via root.after.
+        """
+        try:
+            release = updater.get_latest_release()
+        except Exception:
+            return
+        if release is None:
+            return
+        if not updater.is_newer(release.version, APP_VERSION):
+            return
+        self.root.after(0, self._on_update_available, release)
+
+    def _on_update_available(self, release):
+        """Main thread: show the 'update available' banner."""
+        self._latest_release = release
+        self.update_banner_var.set(
+            f"🆕 v{release.version} 更新可用 available — "
+            f"點此更新 click to update")
+
+    def _is_bot_running(self) -> bool:
+        """True while a live/regime bot is deployed (blocks updates)."""
+        return bool(self._live_runner
+                    and self._live_runner.state != LiveState.IDLE)
+
+    def _start_update(self):
+        """Entry point for the Update button / banner click.
+
+        Refuses while a bot is running, confirms with the user, then downloads
+        and applies the update (the app exits when the swap script launches).
+        """
+        if self._is_bot_running():
+            messagebox.showwarning(
+                "更新 Update",
+                "請先停止所有機器人\nStop all running bots first.")
+            return
+
+        # Self-update only works in the packaged app. From a source checkout
+        # the swap would robocopy over the repo — refuse with a clear note.
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "更新 Update",
+                "自我更新僅在打包版本中可用\n"
+                "Self-update is only available in the packaged app "
+                "(you are running from source).")
+            return
+
+        release = self._latest_release
+        if release is None:
+            # No startup result yet (offline, or check still running) — probe
+            # once synchronously so the manual button always does something.
+            self.status_var.set("檢查更新中 Checking for updates...")
+            try:
+                release = updater.get_latest_release()
+            except Exception:
+                release = None
+            self.status_var.set("就緒 Ready")
+            if release is None:
+                messagebox.showinfo(
+                    "更新 Update",
+                    "無法連線至更新伺服器\nCould not reach the update server.")
+                return
+            if not updater.is_newer(release.version, APP_VERSION):
+                messagebox.showinfo(
+                    "更新 Update",
+                    f"已是最新版本 v{APP_VERSION}\n"
+                    f"You are on the latest version.")
+                return
+            self._latest_release = release
+
+        notes = release.notes.strip()
+        if len(notes) > 800:
+            notes = notes[:800] + "\n…"
+        proceed = messagebox.askyesno(
+            "更新 Update",
+            f"發現新版本 New version available: v{release.version}\n"
+            f"目前版本 Current: v{APP_VERSION}\n\n"
+            f"{notes}\n\n"
+            f"下載並更新？程式將重新啟動。\n"
+            f"Download and update now? The app will restart.")
+        if not proceed:
+            return
+
+        self._run_update_download(release)
+
+    def _run_update_download(self, release):
+        """Show a modal progress dialog and stream the release download.
+
+        On success calls updater.launch_update, which launches the detached
+        swap script and exits the process. On failure closes the dialog and
+        shows an error.
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("更新 Update")
+        dlg.geometry("420x140")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text=f"下載中 Downloading v{release.version}…",
+                  font=("", 10, "bold")).pack(anchor=tk.W, pady=(0, 8))
+        pbar = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        pbar.pack(fill=tk.X, pady=(0, 6))
+        pct_var = tk.StringVar(value="0%")
+        ttk.Label(frame, textvariable=pct_var, foreground="gray").pack(anchor=tk.W)
+
+        # Disable the update button so the flow can't be re-triggered.
+        self.btn_update.config(state=tk.DISABLED)
+
+        def progress_cb(done, total):
+            if total > 0:
+                pct = int(done * 100 / total)
+                self.root.after(0, lambda: (pbar.config(value=pct),
+                                            pct_var.set(f"{pct}%  "
+                                                        f"({done // 1024} / "
+                                                        f"{total // 1024} KB)")))
+            else:
+                self.root.after(0, lambda: pct_var.set(f"{done // 1024} KB"))
+
+        def worker():
+            try:
+                # launch_update calls sys.exit(0) after launching the swap
+                # script; the process ends here on success.
+                updater.launch_update(release.download_url, release.version,
+                                      progress_cb)
+            except SystemExit:
+                raise
+            except Exception as exc:  # pragma: no cover - network/IO failure
+                self.root.after(0, lambda err=exc: self._on_update_failed(
+                    dlg, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_failed(self, dlg, err):
+        """Main thread: tear down the progress dialog and report failure."""
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        self.btn_update.config(state=tk.NORMAL)
+        messagebox.showerror(
+            "更新 Update",
+            f"更新失敗 Update failed:\n{err}")
+
+    # ══════════════════════════════════════════════════════════════
     #  EXISTING BACKTEST METHODS (unchanged logic)
     # ══════════════════════════════════════════════════════════════
 
@@ -3202,11 +3413,15 @@ class BacktestApp:
             "short": "做空 Short",
             "idle": "閒置 Idle",
         }.get(leg, leg)
+        # When idle, the loaded strategy object is only the timeframe
+        # donor (its on_bar is never called) — showing its name reads as
+        # "Idle (DynamicExitPullbackStrategyV2)", which looks like it's
+        # trading. Show a dash instead.
         return {
             "long": runner.long_strategy_name,
             "short": runner.short_strategy_name,
             "active_label": leg_label,
-            "active_strategy": runner.strategy.name,
+            "active_strategy": runner.strategy.name if leg != "idle" else "—",
         }
 
     def _append_regime_log(self, max_rows: int = 8) -> None:
@@ -5224,6 +5439,7 @@ class BacktestApp:
         # Disable controls while live bot is running
         self.btn_api.config(state=tk.DISABLED)
         self.btn_tv.config(state=tk.DISABLED)
+        self.btn_update.config(state=tk.DISABLED)  # no updates while a bot runs
         self.btn_deploy.config(text="停止機器人 Stop Bot")
         self.symbol_combo.config(state=tk.DISABLED)
         self.strategy_combo.config(state=tk.DISABLED)
@@ -7239,6 +7455,7 @@ class BacktestApp:
             self.btn_api.config(state=tk.NORMAL)
             self.btn_deploy.config(state=tk.NORMAL)
         self.btn_tv.config(state=tk.NORMAL)
+        self.btn_update.config(state=tk.NORMAL)  # updates allowed again
         self.symbol_combo.config(state="readonly")
         self.strategy_combo.config(state="readonly")
         self.bot_name_var.set("(未設定 Not set)")

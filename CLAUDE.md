@@ -90,11 +90,19 @@ python test_kline.py       # COM-based KLine history GUI
 
 ## Regime Switching (Phase 3)
 - `RegimeSwitchingRunner(LiveRunner)`: bot type 2, classifies regime per NIGHT session, swaps long/short strategies at session boundaries
-- `session_slot(now)`: pure function → (YYYY-MM-DD, "DAY"|"NIGHT"), DAY=08:45-13:46
+- **Session identity = OPEN date** (`current_session`/`latest_night_session` in switch_logic): the midnight-straddling night keeps ONE key ("2026-07-09|NIGHT" for the night opening 07-09 15:00). All regime keys, history rows, and P&L windows use it. `session_slot(now)` (calendar-date at poll time) survives ONLY for the daily-report key — do NOT use it for session identity.
+- `current_session` returns None on gaps/weekends/TAIFEX holidays → no phantom rows/classifications on closed days (a Sat 13:43 poll once wrote a "2026-07-11,DAY" row)
+- `classification_due`: fires in the night's last 2 min OR any time after close while unassessed (catch-up after app sleep/hang, and lets a fresh deploy classify immediately); 30-min backoff when bars are insufficient
+- Poll order is classify → record → apply: `record_session_result` UPDATES the row for (date,session) in place (idempotent re-record; stop()/restart can't double-count), so the classification row carries its own P&L
+- `_compute_session_pnl` matches trade exits inside the session's [open_dt, close_dt] window — never by calendar date (date-matching lost pre-midnight night P&L and double-counted post-midnight into DAY)
+- `stop()` records AFTER `super().stop()` so the force-close trade is included in the session row
+- Classifier bars come from `_classifier_bars` (default provider): in-memory `_aggregated_bars` (pre-seeded by the warmup KLine fetch → classifies from night one) vs CSV 1-min history, whichever aggregates to more classify-interval bars. Bound method — never capture the list object (`_rebuild_timeframe` rebinds it, issue #43 family)
+- Stale pending recommendations (older than the last completed night) are discarded, not applied; unknown-strategy applies are discarded instead of retried every 30s forever
+- Flip-counter pause uses a true sliding window (`flip_sessions`); `adx_strong` fast-track is disabled when `adx_strong <= adx_enter` (raising adx_enter must not silently reduce confirm_sessions to 1)
 - `in_closed_gap(now)`: True during gaps between sessions (when swaps can be applied)
 - `swap_strategy(new_strategy, display_name)`: 5 safety gates (flat, no veto, not in replay, same timeframe, sufficient bars)
 - `regime_idle`: separate from `suppress_strategy` — suppresses trading but keeps DataStore/CSV flowing
-- On-disk dedup: `state.last_assessed = "date|NIGHT"` prevents double-classification across restarts
+- On-disk dedup: `state.last_assessed = "open_date|NIGHT"` prevents double-classification across restarts. Pre-v2.16 files stored the CLOSE date; `load_state` auto-migrates it once (translates to the covered night's open-date key, gated by the `key_format` marker `save_state` stamps) — no manual edit, no skipped night, no duplicate assessment
 - `record_session_result()`: writes P&L from switching runner's own broker (replaces retired `backfill_pnl`)
 - History v2 schema: 4 new columns (strategy_active, applied, applied_at, trading_mode)
 - Deploy: `_deploy_live` branches on `regime.enabled` to construct `RegimeSwitchingRunner` vs `LiveRunner`
