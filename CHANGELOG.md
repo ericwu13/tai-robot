@@ -5,6 +5,20 @@ All notable changes to tai-robot are documented here.
 
 ---
 
+## [2.16.1] — 2026-07-16
+
+### 繁體中文
+
+#### 修正
+- **自動更新無法終止主程式（updater）**：`launch_update()` 從背景執行緒呼叫 `sys.exit(0)` 時，僅在該執行緒拋出 `SystemExit`，主程式與 GUI 繼續運行，導致更新批次檔無法替換正在使用中的 exe。改用 `os._exit(0)` 立即終止整個程序，更新腳本得以順利完成檔案替換與重新啟動。
+
+### English
+
+#### Fixed
+- **Self-update fails to terminate main process (updater)**: `launch_update()` called `sys.exit(0)` from a background thread, which only raises `SystemExit` in that thread — the main process and GUI kept running, preventing the update batch script from replacing the locked exe. Switched to `os._exit(0)` to terminate the entire process immediately, unblocking the update script's file replacement and relaunch.
+
+---
+
 ## [2.12.3] — 2026-07-01
 
 ### 繁體中文
