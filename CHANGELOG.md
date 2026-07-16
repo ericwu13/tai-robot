@@ -5,6 +5,20 @@ All notable changes to tai-robot are documented here.
 
 ---
 
+## [2.16.3] — 2026-07-16
+
+### 繁體中文
+
+#### 改進
+- **更新後自動重啟並顯示通知（updater）**：套用更新完成後，應用程式自動重新啟動，並顯示 Windows 系統列通知確認版本更新成功。更新失敗時（解壓縮或檔案複製錯誤），以 MessageBox 對話框通知使用者，不會啟動可能損壞的執行檔。同時修正先前 robocopy 失敗仍會啟動 exe 的錯誤。
+
+### English
+
+#### Improved
+- **Auto-relaunch after update and error dialogs on failure (updater)**: After a successful update swap, the app now relaunches automatically and shows a Windows tray notification confirming the new version. On failure (extract or robocopy error), a MessageBox dialog tells the user what went wrong instead of silently launching a potentially broken exe. Also fixes a bug where robocopy failure still fell through to the launch step.
+
+---
+
 ## [2.16.1] — 2026-07-16
 
 ### 繁體中文
