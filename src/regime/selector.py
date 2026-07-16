@@ -26,30 +26,30 @@ class StrategySelector:
             action_map = {"long": "deploy_long", "short": "deploy_short", "sit_out": "sit_out"}
             action = action_map.get(state.manual_override, "hold")
             name = cfg.long_strategy if action == "deploy_long" else (cfg.short_strategy if action == "deploy_short" else "")
-            return Recommendation(action, name, reason=f"manual override: {state.manual_override}")
+            return Recommendation(action, name, reason=f"手動覆寫 manual override: {state.manual_override}")
 
         # Paused
         if state.last_features.get("_paused"):
-            return Recommendation("hold", "", reason="flip-counter pause active")
+            return Recommendation("hold", "", reason="翻轉計數暫停中 flip-counter pause active")
 
         # Vol spike
         if state.last_features.get("_vol_spike"):
-            return Recommendation("sit_out", "", reason="volatility spike — ATR ratio exceeded threshold")
+            return Recommendation("sit_out", "", reason="波動突增 volatility spike — ATR ratio exceeded threshold")
 
         regime = state.effective_regime
         features = state.last_features
 
         if regime == "trending-up":
-            return Recommendation("deploy_long", cfg.long_strategy, reason="trending-up confirmed")
+            return Recommendation("deploy_long", cfg.long_strategy, reason="上升趨勢確認 trending-up confirmed")
         elif regime == "trending-down":
-            return Recommendation("deploy_short", cfg.short_strategy, reason="trending-down confirmed")
+            return Recommendation("deploy_short", cfg.short_strategy, reason="下降趨勢確認 trending-down confirmed")
         elif regime == "range-bound":
             bearish = features.get("ema_slope", 0) < 0 and features.get("direction") == "bearish"
             if bearish:
                 if cfg.range_bias_action == "short_half":
                     return Recommendation("deploy_short_half", cfg.short_strategy, qty_scale=0.5,
-                                         reason="range-bound with bearish bias — half size")
-                return Recommendation("sit_out", "", reason="range-bound with bearish bias — sit out")
-            return Recommendation("sit_out", "", reason="range-bound — neutral/bullish, sit out")
+                                         reason="盤整偏空 — 半倉 range-bound with bearish bias — half size")
+                return Recommendation("sit_out", "", reason="盤整偏空 — 觀望 range-bound with bearish bias — sit out")
+            return Recommendation("sit_out", "", reason="盤整中性/偏多 — 觀望 range-bound — neutral/bullish, sit out")
         else:
-            return Recommendation("hold", "", reason=f"unknown/transitional regime: {regime}")
+            return Recommendation("hold", "", reason=f"未知/過渡期 unknown/transitional regime: {regime}")
