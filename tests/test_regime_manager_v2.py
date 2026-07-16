@@ -99,7 +99,7 @@ class TestClassifySession:
         mgr.classify_session("2026-07-09", "NIGHT")
         state_path = os.path.join(bot_dir, "regime_state.json")
         assert os.path.exists(state_path)
-        with open(state_path) as f:
+        with open(state_path, encoding="utf-8") as f:
             d = json.load(f)
         assert d["last_assessed"] == "2026-07-09|NIGHT"
         ns = d["next_session"]
