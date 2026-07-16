@@ -2614,11 +2614,15 @@ class BacktestApp:
 
         def worker():
             try:
-                # launch_update calls sys.exit(0) after launching the swap
-                # script; the process ends here on success.
+                # launch_update calls os._exit(0) after launching the swap
+                # script (os._exit so the process dies even from this daemon
+                # thread — sys.exit would only kill the thread). The process
+                # ends here on success, so nothing after this runs.
                 updater.launch_update(release.download_url, release.version,
                                       progress_cb)
             except SystemExit:
+                # Dead code now (os._exit raises nothing), but harmless — kept
+                # so a future revert to sys.exit doesn't swallow the exit here.
                 raise
             except Exception as exc:  # pragma: no cover - network/IO failure
                 self.root.after(0, lambda err=exc: self._on_update_failed(
