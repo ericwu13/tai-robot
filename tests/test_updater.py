@@ -179,6 +179,47 @@ class TestWriteSwapScript:
             raw = f.read()
         raw.decode("ascii")  # must not raise
 
+    def test_error_dialog_on_extract_failure(self, tmp_path):
+        _, content = self._write(tmp_path)
+        assert 'if %ERRORLEVEL% NEQ 0' in content
+        assert 'Failed to extract update archive' in content
+        assert 'Update Failed' in content
+
+    def test_error_dialog_on_robocopy_failure(self, tmp_path):
+        _, content = self._write(tmp_path)
+        assert 'set ROBO_ERR=%ERRORLEVEL%' in content
+        assert 'if %ROBO_ERR% GEQ 8' in content
+        assert 'robocopy error %ROBO_ERR%' in content
+
+    def test_no_launch_on_failure(self, tmp_path):
+        _, content = self._write(tmp_path)
+        # Both error paths goto CLEANUP, which does NOT contain a start command.
+        # The start command appears only before CLEANUP, not after it.
+        cleanup_section = content.split(':CLEANUP')[1]
+        assert 'start ""' not in cleanup_section
+
+    def test_version_in_notification(self, tmp_path):
+        temp_dir = str(tmp_path / "tai_update_2.17.0")
+        os.makedirs(temp_dir, exist_ok=True)
+        script_path = os.path.join(temp_dir, "apply_update.bat")
+        updater.write_swap_script(
+            old_pid=4242,
+            zip_path=os.path.join(temp_dir, "app.zip"),
+            extract_dir=os.path.join(temp_dir, "extracted"),
+            app_dir=r"C:\apps\tai",
+            new_exe_path=r"C:\apps\tai\tai_backtest.exe",
+            script_path=script_path,
+            temp_dir=temp_dir,
+            version="2.17.0",
+        )
+        with open(script_path, encoding="ascii") as f:
+            content = f.read()
+        assert 'Updated to v2.17.0 successfully!' in content
+
+    def test_default_version_label(self, tmp_path):
+        _, content = self._write(tmp_path)
+        assert 'Updated to latest successfully!' in content
+
 
 # ── update_temp_dir ──
 
