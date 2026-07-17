@@ -103,15 +103,18 @@ class DiscordNotifier:
             f"已降級為半自動 Downgraded to semi-auto"
         )
 
-    def bot_deployed(self, strategy: str, mode: str) -> None:
+    def bot_deployed(self, strategy: str, mode: str,
+                     version: str = "") -> None:
+        ver = f" v{version}" if version else ""
         self._send(
             f"{self._header()}\n"
-            f"🚀 **機器人啟動 Bot Deployed**\n"
+            f"🚀 **機器人啟動 Bot Deployed**{ver}\n"
             f"策略: {strategy} | 模式: {mode}"
         )
 
     def bot_deployed_regime(
-        self, long_strategy: str, short_strategy: str, mode: str
+        self, long_strategy: str, short_strategy: str, mode: str,
+        version: str = "",
     ) -> None:
         """Deploy notification for a regime-switching bot.
 
@@ -119,9 +122,10 @@ class DiscordNotifier:
         regime switching is enabled and names both legs, instead of a single
         strategy (which for a regime bot is just the timeframe donor).
         """
+        ver = f" v{version}" if version else ""
         self._send(
             f"{self._header()}\n"
-            f"🚀 **機器人啟動 Bot Deployed**\n"
+            f"🚀 **機器人啟動 Bot Deployed**{ver}\n"
             f"🔄 **多空切換 Regime Switching** 已啟用 Enabled\n"
             f"做多 Long: {long_strategy} | 做空 Short: {short_strategy}\n"
             f"模式: {mode}"

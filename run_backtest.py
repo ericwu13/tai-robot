@@ -470,8 +470,10 @@ def _log(msg):
             # Only touch Tkinter widgets from the main thread; COM callbacks
             # run on background threads and touching Tk there crashes the GIL.
             if threading.current_thread() is threading.main_thread():
+                _app.log_text.config(state=tk.NORMAL)
                 _app.log_text.insert(tk.END, line + "\n")
                 _app.log_text.see(tk.END)
+                _app.log_text.config(state=tk.DISABLED)
         except Exception:
             pass
 
@@ -1673,7 +1675,8 @@ class BacktestApp:
 
         # Live event log
         self.live_log = scrolledtext.ScrolledText(live_frame, wrap=tk.WORD, font=("Consolas", 9),
-                                                   bg="#1a1a2e", fg="#e0e0e0")
+                                                   bg="#1a1a2e", fg="#e0e0e0",
+                                                   state=tk.DISABLED)
         self.live_log.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
         self.live_log.tag_configure("entry", foreground="#4caf50")
         self.live_log.tag_configure("exit", foreground="#f44336")
@@ -1683,7 +1686,8 @@ class BacktestApp:
         # Log tab
         log_frame = ttk.Frame(notebook)
         notebook.add(log_frame, text="紀錄 Log")
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Consolas", 9))
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Consolas", 9),
+                                                    state=tk.DISABLED)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
     # ══════════════════════════════════════════════════════════════
@@ -5349,11 +5353,13 @@ class BacktestApp:
                     long_strategy=regime_cfg.long_strategy,
                     short_strategy=regime_cfg.short_strategy,
                     mode=mode_zh,
+                    version=APP_VERSION,
                 )
             else:
                 _discord.bot_deployed(
                     strategy=self.strategy_var.get(),
                     mode=mode_zh,
+                    version=APP_VERSION,
                 )
             _log(f"Discord 通知已啟用 Discord notifications enabled")
 
@@ -7275,8 +7281,10 @@ class BacktestApp:
                 _debug_log_file.flush()
             except Exception:
                 pass
+        self.live_log.config(state=tk.NORMAL)
         self.live_log.insert(tk.END, line, tag)
         self.live_log.see(tk.END)
+        self.live_log.config(state=tk.DISABLED)
 
     def _update_live_status(self):
         """Update the Live tab status panel."""
