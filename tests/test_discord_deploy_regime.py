@@ -18,10 +18,12 @@ def _capture(notifier):
 def test_plain_deploy_message_shape():
     n = DiscordNotifier("token", "channel", bot_name="0710", symbol="TMF00")
     sent = _capture(n)
-    n.bot_deployed(strategy="1分K均線交叉 1m SMA Cross", mode="半自動")
+    n.bot_deployed(strategy="1分K均線交叉 1m SMA Cross", mode="半自動",
+                   version="2.16.3")
     assert len(sent) == 1
     msg = sent[0]
     assert "Bot Deployed" in msg
+    assert "v2.16.3" in msg
     assert "1分K均線交叉 1m SMA Cross" in msg
     # a plain deploy must NOT masquerade as regime switching
     assert "Regime Switching" not in msg
@@ -35,10 +37,12 @@ def test_regime_deploy_names_both_legs():
         long_strategy="AI: DynamicExitPullbackStrategyV2",
         short_strategy="AI: BbandSmaShortV3",
         mode="半自動",
+        version="2.16.3",
     )
     assert len(sent) == 1
     msg = sent[0]
     assert "Bot Deployed" in msg
+    assert "v2.16.3" in msg
     # announces regime switching is enabled
     assert "多空切換 Regime Switching" in msg
     assert "🔄" in msg
