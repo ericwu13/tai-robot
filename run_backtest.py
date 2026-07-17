@@ -1530,7 +1530,8 @@ class BacktestApp:
         self.report_filter_combo.bind(
             "<<ComboboxSelected>>", lambda e: self._on_report_filter_changed())
         self.metrics_text = scrolledtext.ScrolledText(metrics_frame, wrap=tk.WORD,
-                                                       font=("Consolas", 11))
+                                                       font=("Consolas", 11),
+                                                       state=tk.DISABLED)
         self.metrics_text.pack(fill=tk.BOTH, expand=True)
 
         # Trade list tab
@@ -1557,6 +1558,7 @@ class BacktestApp:
         self.trade_tree.configure(yscrollcommand=vsb.set)
         self.trade_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.trade_tree.bind("<Control-c>", self._copy_trade_selection)
 
         # Live tab
         live_frame = ttk.Frame(notebook)
@@ -3282,6 +3284,7 @@ class BacktestApp:
 
     def _display_results(self, result, bars: list[Bar] | None = None):
         # Metrics report
+        self.metrics_text.config(state=tk.NORMAL)
         self.metrics_text.delete("1.0", tk.END)
 
         # Data source header
@@ -3356,6 +3359,7 @@ class BacktestApp:
             report = format_report(report_title, result.metrics,
                                    trades=result.trades, regime=regime_info)
         self.metrics_text.insert(tk.END, report)
+        self.metrics_text.config(state=tk.DISABLED)
 
         # Regime Switching Log — recent classification/apply rows from
         # regime_history.csv, only for regime-switching bots.
@@ -3482,7 +3486,22 @@ class BacktestApp:
                 f" {date} {session}: 決策 {decision} | "
                 f"現行 {active} | 已套用 applied={applied} | {pnl_str}")
         lines.append("=" * 60)
+        self.metrics_text.config(state=tk.NORMAL)
         self.metrics_text.insert(tk.END, "\n" + "\n".join(lines))
+        self.metrics_text.config(state=tk.DISABLED)
+
+    def _copy_trade_selection(self, event=None):
+        sel = self.trade_tree.selection()
+        if not sel:
+            return
+        header = [self.trade_tree.heading(c, "text")
+                  for c in self.trade_tree["columns"]]
+        lines = ["\t".join(header)]
+        for iid in sel:
+            vals = self.trade_tree.item(iid, "values")
+            lines.append("\t".join(str(v) for v in vals))
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
 
     def _get_selected_trade_index(self) -> int | None:
         sel = self.trade_tree.selection()
