@@ -220,6 +220,52 @@ class TestWriteSwapScript:
         _, content = self._write(tmp_path)
         assert 'Updated to latest successfully!' in content
 
+    def test_progress_script_written(self, tmp_path):
+        self._write(tmp_path)
+        progress = tmp_path / "tai_update_9.9.9" / "progress.ps1"
+        assert progress.exists()
+        content = progress.read_text(encoding="utf-8")
+        assert "update_status.txt" in content
+        assert "$form" in content
+        assert "ShowDialog" in content
+
+    def test_bat_writes_status_markers(self, tmp_path):
+        _, content = self._write(tmp_path)
+        for marker in ("WAITING", "EXTRACTING", "INSTALLING",
+                        "LAUNCHING", "DONE", "ERROR"):
+            assert f"echo {marker}" in content
+
+    def test_bat_launches_progress_window(self, tmp_path):
+        _, content = self._write(tmp_path)
+        assert "progress.ps1" in content
+        assert "-ExecutionPolicy Bypass" in content
+
+    def test_progress_version_label(self, tmp_path):
+        temp_dir = str(tmp_path / "tai_update_3.0.0")
+        os.makedirs(temp_dir, exist_ok=True)
+        script_path = os.path.join(temp_dir, "apply_update.bat")
+        updater.write_swap_script(
+            old_pid=1,
+            zip_path=os.path.join(temp_dir, "app.zip"),
+            extract_dir=os.path.join(temp_dir, "extracted"),
+            app_dir=r"C:\apps\tai",
+            new_exe_path=r"C:\apps\tai\tai_backtest.exe",
+            script_path=script_path,
+            temp_dir=temp_dir,
+            version="3.0.0",
+        )
+        ps1 = os.path.join(temp_dir, "progress.ps1")
+        with open(ps1, encoding="utf-8") as f:
+            content = f.read()
+        assert "Updating to v3.0.0" in content
+
+    def test_progress_error_closes_window(self, tmp_path):
+        self._write(tmp_path)
+        ps1 = tmp_path / "tai_update_9.9.9" / "progress.ps1"
+        content = ps1.read_text(encoding="utf-8")
+        assert "ERROR" in content
+        assert "$form.Close()" in content
+
 
 # ── update_temp_dir ──
 
