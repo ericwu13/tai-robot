@@ -44,6 +44,10 @@ logging:
 notifications:
   discord_bot_token: ""          # Discord bot token for live trading alerts
   discord_channel_id: ""         # Discord channel ID to send notifications to
+  # Optional dedicated channels. Leave empty to send everything to
+  # discord_channel_id above.
+  discord_evolution_channel_id: ""    # 🧬 evolution logs (verdict / improvement / status)
+  discord_daily_report_channel_id: "" # 📊 daily transaction report
 
 ai:
   provider: "anthropic"          # "anthropic" or "google"

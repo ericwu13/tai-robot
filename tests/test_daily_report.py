@@ -502,45 +502,126 @@ class TestDiscordDailyReport:
         from src.live.discord_notify import DiscordNotifier
 
         notifier = DiscordNotifier("fake-token", "fake-channel")
-        # Patch _send to capture the message
+        # Patch _send to capture the message + target channel
         sent = []
-        notifier._send = lambda msg: sent.append(msg)
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
 
         report = {
             "date": "2026-04-11",
-            "summary": {
-                "total_trades": 5,
-                "total_pnl": 1500,
-                "win_rate": 0.6,
-                "profit_factor": 2.5,
-                "max_drawdown": 300,
-            },
             "strategy": {"name": "SMA Cross"},
             "market_regime": {"label": "trending-up", "adx": 32.5},
+            "trades": [],
         }
         notifier.daily_report(report)
 
         assert len(sent) == 1
-        msg = sent[0]
-        assert "Daily Report" in msg
+        msg = sent[0][0]
+        # Transactions-only header, not the old stats "Daily Report"
+        assert "Daily Transactions" in msg
         assert "2026-04-11" in msg
         assert "SMA Cross" in msg
         assert "trending-up" in msg
+
+    def test_daily_report_lists_transactions(self):
+        """Transactions-only: each trade closed today is listed; no stats."""
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier("fake-token", "fake-channel")
+        sent = []
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
+
+        report = {
+            "date": "2026-04-11",
+            "strategy": {"name": "SMA Cross"},
+            "market_regime": None,
+            "summary": {"total_trades": 2, "win_rate": 0.5,
+                        "profit_factor": 1.2, "max_drawdown": 99,
+                        "total_pnl": 40},
+            "trades": [
+                {"side": "long", "entry_price": 22500, "exit_price": 22560,
+                 "entry_dt": "2026-04-11 09:00", "exit_dt": "2026-04-11 09:30",
+                 "pnl": 60, "exit_tag": "tp", "strategy": "SMA Cross"},
+                {"side": "short", "entry_price": 22600, "exit_price": 22620,
+                 "entry_dt": "2026-04-11 10:00", "exit_dt": "2026-04-11 10:15",
+                 "pnl": -20, "exit_tag": "sl", "strategy": "SMA Cross"},
+            ],
+        }
+        notifier.daily_report(report)
+
+        msg = sent[0][0]
+        # Trade lines present
+        assert "22,500→22,560" in msg
+        assert "+60" in msg
+        assert "-20" in msg
+        assert "[tp]" in msg
+        # No summary stat block leaked in
+        assert "win_rate" not in msg
+        assert "profit_factor" not in msg
+        assert "最大回撤" not in msg
+
+    def test_daily_report_no_transactions(self):
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier("fake-token", "fake-channel")
+        sent = []
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
+
+        report = {
+            "date": "2026-04-11",
+            "strategy": {"name": "Test"},
+            "market_regime": None,
+            "trades": [],
+        }
+        notifier.daily_report(report)
+        assert "No transactions today" in sent[0][0]
+
+    def test_daily_report_routes_to_daily_channel(self):
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier(
+            "fake-token", "main-channel",
+            daily_report_channel_id="daily-channel")
+        sent = []
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
+
+        notifier.daily_report({"date": "2026-04-11",
+                               "strategy": {"name": "T"}, "trades": []})
+        # daily_report passes the daily channel through to _send
+        assert sent[0][1] == "daily-channel"
+
+    def test_daily_report_regime_switching_shows_active_leg(self):
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier("fake-token", "fake-channel")
+        sent = []
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
+
+        report = {
+            "date": "2026-04-11",
+            "strategy": {"name": "BbandSmaShortV3"},
+            "market_regime": None,
+            "regime_switching": {"active_leg": "short",
+                                 "long_strategy": "L", "short_strategy": "S"},
+            "trades": [],
+        }
+        notifier.daily_report(report)
+
+        msg = sent[0][0]
+        assert "short" in msg          # active leg
+        assert "BbandSmaShortV3" in msg  # active strategy
 
     def test_daily_report_includes_session_line(self):
         from src.live.discord_notify import DiscordNotifier
 
         notifier = DiscordNotifier("fake-token", "fake-channel")
         sent = []
-        notifier._send = lambda msg: sent.append(msg)
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
 
         report = {
             "date": "2026-04-11",
-            "summary": {"total_trades": 1, "total_pnl": 100,
-                        "win_rate": 1.0, "profit_factor": 0,
-                        "max_drawdown": 0},
             "strategy": {"name": "Test"},
             "market_regime": None,
+            "trades": [],
             "session": {
                 "bot_name": "tmf00_main",
                 "started_at": "2026-04-11T08:45:00",
@@ -550,7 +631,7 @@ class TestDiscordDailyReport:
         notifier.daily_report(report)
 
         assert len(sent) == 1
-        msg = sent[0]
+        msg = sent[0][0]
         assert "tmf00_main" in msg
         assert "v2.7.3" in msg
         # Started timestamp trimmed to minute precision (no seconds, no T)
@@ -563,15 +644,13 @@ class TestDiscordDailyReport:
 
         notifier = DiscordNotifier("fake-token", "fake-channel")
         sent = []
-        notifier._send = lambda msg: sent.append(msg)
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
 
         report = {
             "date": "2026-04-11",
-            "summary": {"total_trades": 0, "total_pnl": 0,
-                        "win_rate": 0, "profit_factor": 0,
-                        "max_drawdown": 0},
             "strategy": {"name": "Test"},
             "market_regime": None,
+            "trades": [],
         }
         notifier.daily_report(report)
         assert len(sent) == 1  # didn't crash
@@ -581,20 +660,18 @@ class TestDiscordDailyReport:
 
         notifier = DiscordNotifier("fake-token", "fake-channel")
         sent = []
-        notifier._send = lambda msg: sent.append(msg)
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
 
         report = {
             "date": "2026-04-11",
-            "summary": {"total_trades": 0, "total_pnl": 0,
-                        "win_rate": 0, "profit_factor": 0,
-                        "max_drawdown": 0},
             "strategy": {"name": "Test"},
             "market_regime": None,
+            "trades": [],
         }
         notifier.daily_report(report)
 
         assert len(sent) == 1
-        assert "trending" not in sent[0]  # no regime line
+        assert "trending" not in sent[0][0]  # no regime line
 
 
 # ---------------------------------------------------------------------------
