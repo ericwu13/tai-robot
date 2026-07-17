@@ -5,7 +5,7 @@ from src.live.discord_notify import DiscordNotifier
 
 def _capture(notifier):
     sent = []
-    notifier._send = lambda content: sent.append(content)
+    notifier._send = lambda content, ch="": sent.append(content)
     return sent
 
 

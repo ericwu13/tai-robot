@@ -99,60 +99,52 @@ class TestBotNamespacedFilename:
         assert load_report("2026-07-09") is None
 
 
-class TestDiscordPerStrategy:
-    def test_per_strategy_in_discord_message(self):
-        """Verify per_strategy section is formatted in Discord message."""
+class TestDiscordRegimeInfo:
+    def test_regime_switching_info_in_discord_message(self):
+        """Transactions-only report shows the active leg + active strategy."""
         sent = []
         notifier = DiscordNotifier("fake_token", "fake_channel",
                                    bot_name="test", symbol="TX00")
-        notifier._send = lambda msg: sent.append(msg)
+        notifier._send = lambda msg, ch="": sent.append(msg)
 
         report = {
             "date": "2026-07-09",
-            "summary": {"total_trades": 3, "total_pnl": 350,
-                        "win_rate": 0.67, "profit_factor": 2.0,
-                        "max_drawdown": 50},
             "strategy": {"name": "Regime Switching"},
             "session": {"bot_name": "test", "version": "", "started_at": ""},
             "market_regime": None,
-            "real_summary": None,
-            "per_strategy": {
-                "LongA": {"total_trades": 2, "total_pnl": 200},
-                "ShortB": {"total_trades": 1, "total_pnl": 150},
-            },
             "regime_switching": {
                 "active_leg": "long",
                 "long_strategy": "LongA",
                 "short_strategy": "ShortB",
             },
+            "trades": [],
         }
         notifier.daily_report(report)
         assert len(sent) == 1
         msg = sent[0]
-        assert "LongA" in msg
-        assert "ShortB" in msg
-        assert "Regime: long" in msg
+        assert "Regime: long" in msg      # active leg
+        assert "Regime Switching" in msg  # active strategy
+        # Stat block is gone in the transactions-only format
+        assert "profit_factor" not in msg
+        assert "Per-strategy" not in msg
 
-    def test_no_per_strategy_for_single(self):
-        """Single-strategy reports don't show per_strategy breakdown."""
+    def test_no_stat_block_for_single(self):
+        """Single-strategy reports carry no stat/per-strategy block."""
         sent = []
         notifier = DiscordNotifier("fake_token", "fake_channel")
-        notifier._send = lambda msg: sent.append(msg)
+        notifier._send = lambda msg, ch="": sent.append(msg)
 
         report = {
             "date": "2026-07-09",
-            "summary": {"total_trades": 2, "total_pnl": 200,
-                        "win_rate": 0.5, "profit_factor": 1.5,
-                        "max_drawdown": 100},
             "strategy": {"name": "StratA"},
             "session": {},
             "market_regime": None,
-            "real_summary": None,
-            "per_strategy": {},
+            "trades": [],
         }
         notifier.daily_report(report)
         assert len(sent) == 1
         assert "Per-strategy" not in sent[0]
+        assert "StratA" in sent[0]
 
 
 class TestRegimeSwitchingReport:

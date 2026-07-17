@@ -28,9 +28,17 @@ class DiscordNotifier:
     """Fire-and-forget Discord bot message sender."""
 
     def __init__(self, bot_token: str, channel_id: str,
-                 bot_name: str = "", symbol: str = ""):
+                 bot_name: str = "", symbol: str = "",
+                 evolution_channel_id: str = "",
+                 daily_report_channel_id: str = ""):
         self._token = bot_token.strip() if bot_token else ""
         self._channel_id = channel_id.strip() if channel_id else ""
+        # Optional dedicated channels. Empty → fall back to the main channel
+        # (via _resolve_channel), so a single-channel setup keeps working.
+        self._evolution_channel_id = (
+            evolution_channel_id.strip() if evolution_channel_id else "")
+        self._daily_report_channel_id = (
+            daily_report_channel_id.strip() if daily_report_channel_id else "")
         self._bot_name = bot_name
         self._symbol = symbol
 
@@ -38,15 +46,27 @@ class DiscordNotifier:
     def enabled(self) -> bool:
         return bool(self._token and self._channel_id)
 
-    def _send(self, content: str) -> None:
-        """Send a message via Discord bot REST API in a background thread."""
+    def _resolve_channel(self, channel_id: str = "") -> str:
+        """Pick the target channel, falling back to the main channel."""
+        return channel_id or self._channel_id
+
+    def _send(self, content: str, channel_id: str = "") -> None:
+        """Send a message via Discord bot REST API in a background thread.
+
+        ``channel_id`` optionally overrides the default channel (used to
+        route evolution logs / daily reports to their own channels). Empty
+        → the main channel.
+        """
         if not self.enabled:
+            return
+        target = self._resolve_channel(channel_id)
+        if not target:
             return
 
         def _post():
             try:
                 import httpx
-                url = f"{_API_BASE}/channels/{self._channel_id}/messages"
+                url = f"{_API_BASE}/channels/{target}/messages"
                 headers = {
                     "Authorization": f"Bot {self._token}",
                     "Content-Type": "application/json",
@@ -62,6 +82,16 @@ class DiscordNotifier:
         """Public method to send a free-form notification with the bot header."""
         self._send(f"{self._header()}\n{message}")
 
+    def notify_evolution(self, message: str) -> None:
+        """Free-form notification routed to the evolution channel.
+
+        Same shape as :meth:`notify` but targets the dedicated evolution
+        channel (falls back to the main channel when unconfigured). Use for
+        evolution status/skip/error messages so they don't clutter the
+        trading channel.
+        """
+        self._send(f"{self._header()}\n{message}", self._evolution_channel_id)
+
     def _header(self) -> str:
         ts = _taipei_now().strftime("%Y-%m-%d %H:%M:%S")
         parts = [f"**[{ts}]**"]
@@ -72,10 +102,12 @@ class DiscordNotifier:
         return " ".join(parts)
 
     def order_sent(self, side: str, symbol: str, price_label: str,
-                   sim_price: int, order_id: str) -> None:
+                   sim_price: int, order_id: str, strategy: str = "") -> None:
+        strat_line = f"策略 Strategy: `{strategy}`\n" if strategy else ""
         self._send(
             f"{self._header()}\n"
             f"📤 **委託送出 Order Sent**\n"
+            f"{strat_line}"
             f"方向: **{side}** | 商品: `{symbol}` | "
             f"價格: {price_label} | 模擬價: {sim_price:,}\n"
             f"委託編號: `{order_id}`"
@@ -89,11 +121,14 @@ class DiscordNotifier:
             f"錯誤碼: {code} | {error}"
         )
 
-    def fill_confirmed(self, action_type: str, fill_price: str = "") -> None:
+    def fill_confirmed(self, action_type: str, fill_price: str = "",
+                       strategy: str = "") -> None:
         price_str = f" @**{float(fill_price):,.1f}**" if fill_price else ""
+        strat_str = f"\n策略 Strategy: `{strategy}`" if strategy else ""
         self._send(
             f"{self._header()}\n"
             f"✅ **成交確認 Fill Confirmed** ({action_type}){price_str}"
+            f"{strat_str}"
         )
 
     def fill_timeout_downgrade(self, action_type: str, timeout_s: float) -> None:
@@ -209,7 +244,8 @@ class DiscordNotifier:
             f"PF: {profit_factor:.2f}\n"
             f"Sortino: {sortino:.2f} | "
             f"最大回撤 max DD: {max_drawdown_pct:.1f}% | "
-            f"來源 source: `{source}`"
+            f"來源 source: `{source}`",
+            self._evolution_channel_id,
         )
 
     def evolution_verdict(self, passed: bool, verdict_block: str) -> None:
@@ -227,26 +263,29 @@ class DiscordNotifier:
         self._send(
             f"{self._header()}\n"
             f"🧬 **演化結果 Evolution {'PASS' if passed else 'FAIL'}** {icon}\n"
-            f"```\n{body}\n```"
+            f"```\n{body}\n```",
+            self._evolution_channel_id,
         )
 
     def daily_report(self, report: dict) -> None:
-        """Send a daily report summary to Discord."""
+        """Send a transactions-only daily report to Discord.
+
+        Deliberately NOT a stats summary — no win-rate / P&L / drawdown /
+        per-strategy blocks. It lists the day's transactions (trades that
+        closed today) plus the market regime and the currently-active
+        regime/strategy, and is routed to the dedicated daily-report
+        channel (falls back to the main channel when unconfigured).
+        """
         date = report.get("date", "?")
-        summary = report.get("summary", {})
-        regime = report.get("market_regime")
         strategy = report.get("strategy", {})
         session = report.get("session") or {}
-
-        total = summary.get("total_trades", 0)
-        pnl = summary.get("total_pnl", 0)
-        win_rate = summary.get("win_rate", 0)
-        pf = summary.get("profit_factor", 0)
-        dd = summary.get("max_drawdown", 0)
+        regime = report.get("market_regime")
+        regime_sw = report.get("regime_switching")
+        trades = report.get("trades") or []
 
         lines = [
             f"{self._header()}",
-            f"📊 **每日報告 Daily Report** — {date}",
+            f"📊 **每日交易 Daily Transactions** — {date}",
         ]
 
         # Session identifier line: bot_name + version + start time so the
@@ -268,37 +307,57 @@ class DiscordNotifier:
         if session_parts:
             lines.append(" · ".join(session_parts))
 
-        lines.extend([
-            f"策略: {strategy.get('name', '?')}",
-            f"交易: {total} 筆 | 勝率: {win_rate:.1%} | PF: {pf:.2f}",
-            f"損益: {pnl:+,} | 最大回撤: {dd:,}",
-        ])
-        # Real-order subset (semi_auto/auto fills). The headline numbers
-        # above are the full simulated view; this line shows what actually
-        # hit the real account. Absent for pure paper sessions.
-        real_summary = report.get("real_summary")
-        if real_summary:
-            lines.append(
-                f"實單 Real: {real_summary.get('total_trades', 0)} 筆 | "
-                f"勝率: {real_summary.get('win_rate', 0):.1%} | "
-                f"損益: {real_summary.get('total_pnl', 0):+,}"
-            )
-        if regime:
-            lines.append(
-                f"市場狀態: {regime.get('label', '?')} "
-                f"(ADX {regime.get('adx', 0):.1f})"
-            )
-        # Per-strategy P&L breakdown (regime switching bots)
-        per_strategy = report.get("per_strategy") or {}
-        if per_strategy:
-            parts = []
-            for sname, smetrics in per_strategy.items():
-                parts.append(f"  {sname}: {smetrics.get('total_trades', 0)} 筆, "
-                             f"P&L {smetrics.get('total_pnl', 0):+,}")
-            lines.append("策略別 Per-strategy:\n" + "\n".join(parts))
-        # Regime switching status
-        regime_sw = report.get("regime_switching")
+        # Active strategy / regime — for a regime bot the active leg, else
+        # the session strategy name.
         if regime_sw:
             leg = regime_sw.get("active_leg", "?")
-            lines.append(f"🔄 多空切換 Regime: {leg}")
-        self._send("\n".join(lines))
+            active = strategy.get("name", "?")
+            lines.append(f"🔄 多空切換 Regime: {leg} | 當前策略 Active: {active}")
+        else:
+            lines.append(f"策略 Strategy: {strategy.get('name', '?')}")
+        if regime:
+            lines.append(
+                f"市場狀態 Market Regime: {regime.get('label', '?')} "
+                f"(ADX {regime.get('adx', 0):.1f})"
+            )
+
+        # ── Transactions ──
+        if not trades:
+            lines.append("— 今日無成交 No transactions today —")
+        else:
+            lines.append(f"成交明細 Transactions ({len(trades)}):")
+            for line in self._format_trade_lines(trades):
+                lines.append(line)
+
+        self._send("\n".join(lines), self._daily_report_channel_id)
+
+    @staticmethod
+    def _format_trade_lines(trades: list) -> list[str]:
+        """One compact line per trade, real fill prices preferred.
+
+        Kept under Discord's 2000-char message cap by truncating the list
+        and appending a "+N more" marker when a busy day overflows.
+        """
+        _MAX = 40  # cap the number of listed trades
+        out: list[str] = []
+        for t in trades[:_MAX]:
+            side = str(t.get("side", "")).upper() or "?"
+            entry_px = t.get("real_entry_price") or t.get("entry_price", 0)
+            exit_px = t.get("real_exit_price") or t.get("exit_price", 0)
+            # exit_dt / entry_dt are "YYYY-MM-DD HH:MM[:SS]" strings; show
+            # just the HH:MM window so the line stays compact.
+            entry_t = str(t.get("entry_dt", ""))[11:16]
+            exit_t = str(t.get("exit_dt", ""))[11:16]
+            when = f"{entry_t}→{exit_t}".strip("→") or "?"
+            pnl = t.get("pnl", 0) or 0
+            exit_tag = t.get("exit_tag", "")
+            strat = t.get("strategy", "")
+            tag_str = f" [{exit_tag}]" if exit_tag else ""
+            strat_str = f" ({strat})" if strat else ""
+            out.append(
+                f"• {when} {side} {entry_px:,}→{exit_px:,} "
+                f"P&L {pnl:+,}{tag_str}{strat_str}"
+            )
+        if len(trades) > _MAX:
+            out.append(f"…(+{len(trades) - _MAX} more)")
+        return out

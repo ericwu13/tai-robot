@@ -293,6 +293,12 @@ def _load_settings():
             notif = data.get("notifications", {})
             cfg["discord_bot_token"] = notif.get("discord_bot_token", "")
             cfg["discord_channel_id"] = notif.get("discord_channel_id", "")
+            # Optional dedicated channels; empty → fall back to the main
+            # channel inside DiscordNotifier.
+            cfg["discord_evolution_channel_id"] = str(
+                notif.get("discord_evolution_channel_id", "") or "")
+            cfg["discord_daily_report_channel_id"] = str(
+                notif.get("discord_daily_report_channel_id", "") or "")
             # Trading
             trading = data.get("trading", {})
             cfg["allow_live_override"] = trading.get("allow_live_override", False)
@@ -4156,7 +4162,7 @@ class BacktestApp:
                 self._append_chat("system", msg)
                 if _discord is not None and _discord.enabled:
                     try:
-                        _discord.notify(msg)
+                        _discord.notify_evolution(msg)
                     except Exception:
                         pass
             return
@@ -4208,7 +4214,7 @@ class BacktestApp:
                 self._append_chat("system", msg)
                 if _discord is not None and _discord.enabled:
                     try:
-                        _discord.notify(msg)
+                        _discord.notify_evolution(msg)
                     except Exception:
                         pass
                 return
@@ -4242,7 +4248,7 @@ class BacktestApp:
                 self._append_chat("system", msg)
                 if _discord is not None and _discord.enabled:
                     try:
-                        _discord.notify(msg)
+                        _discord.notify_evolution(msg)
                     except Exception:
                         pass
             else:
@@ -4523,9 +4529,10 @@ class BacktestApp:
             def _notify_discord(msg: str) -> None:
                 # DiscordNotifier._send spawns its own thread — safe to
                 # call from this worker. Best-effort, never kills the run.
+                # Evolution-pipeline status → the evolution channel.
                 if _discord is not None and _discord.enabled:
                     try:
-                        _discord.notify(msg)
+                        _discord.notify_evolution(msg)
                     except Exception:
                         pass
 
@@ -5362,8 +5369,14 @@ class BacktestApp:
         from src.live.discord_notify import DiscordNotifier
         bot_token = self._settings.get("discord_bot_token", "")
         channel_id = self._settings.get("discord_channel_id", "")
+        evolution_channel_id = self._settings.get(
+            "discord_evolution_channel_id", "")
+        daily_report_channel_id = self._settings.get(
+            "discord_daily_report_channel_id", "")
         _discord = DiscordNotifier(bot_token, channel_id,
-                                   bot_name=bot_name, symbol=symbol)
+                                   bot_name=bot_name, symbol=symbol,
+                                   evolution_channel_id=evolution_channel_id,
+                                   daily_report_channel_id=daily_report_channel_id)
         if _discord.enabled:
             mode_zh = {"paper": "模擬", "semi_auto": "半自動",
                        "auto": "全自動"}.get(trading_mode, trading_mode)
@@ -5938,7 +5951,7 @@ class BacktestApp:
             _log(err_msg)
             if _discord is not None and _discord.enabled:
                 try:
-                    _discord.notify(f"🧬 EVO ERROR: {err_msg}")
+                    _discord.notify_evolution(f"🧬 EVO ERROR: {err_msg}")
                 except Exception:
                     pass
 
@@ -6804,7 +6817,8 @@ class BacktestApp:
                 self._last_real_order_side = buy_sell  # track for close button
                 if _discord and _discord.enabled:
                     _discord.order_sent(side_str, order_symbol, price_label,
-                                        sim_price, str(message))
+                                        sim_price, str(message),
+                                        strategy=self._active_strategy_name())
                 if self._trading_mode == "auto":
                     # Auto mode: defer state transition until fill confirmed
                     self._trading_guard.on_fill_pending(action_type)
@@ -6885,6 +6899,18 @@ class BacktestApp:
     # by side/product so line-count and qty-total comparisons both fail.
     # Instead we poll GetOpenInterestGW — the OnOpenInterest callback reliably
     # reflects position changes within a few seconds.
+
+    def _active_strategy_name(self) -> str:
+        """Display name of the strategy that produced the current signal.
+
+        For a regime-switching bot this tracks the active leg, because
+        ``swap_strategy`` updates ``strategy_display_name`` in place on
+        every regime switch (live_runner.py). Returns "" when there's no
+        live runner (nothing to attribute).
+        """
+        if not self._live_runner:
+            return ""
+        return getattr(self._live_runner, "strategy_display_name", "") or ""
 
     def _get_signed_position(self) -> int:
         """Get the current signed position qty for the live symbol."""
@@ -6979,10 +7005,32 @@ class BacktestApp:
              f"deferred_close={'yes' if self._trading_guard._deferred_close else 'no'}")
         result = self._fill_poller.confirm()
 
-        # Get actual fill price from OpenInterest
+        # Get the actual fill price.
+        #
+        # ENTRY: the account now holds a position whose OpenInterest
+        # avg_cost IS the entry fill price (read from _account_monitor).
+        #
+        # EXIT: the exit leaves the account FLAT (pos_current == 0), so
+        # OpenInterest has no row to read — this used to blank the exit
+        # notification (bug: `✅ Fill Confirmed (exit)` with no price). The
+        # just-closed simulated trade carries the exit price instead:
+        # real_exit_price when a FulfillReport poll already captured the
+        # true fill (see _apply_real_exit_fills), else the simulated exit
+        # price. broker.trades[-1] is the exit trade here — the sim broker
+        # matches the exit before the real order is sent, same assumption
+        # _apply_real_exit_fills relies on.
         fill_price = ""
         pos = self._fill_poller.pos_current
-        if pos is not None and pos != 0 and self._live_runner:
+        if poller_action_type == "exit" and self._live_runner:
+            broker = self._live_runner.broker
+            trades = getattr(broker, "trades", None)
+            if trades:
+                last = trades[-1]
+                px = (getattr(last, "real_exit_price", 0)
+                      or getattr(last, "exit_price", 0))
+                if px:
+                    fill_price = str(px)
+        elif pos is not None and pos != 0 and self._live_runner:
             order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
                 "order_symbol", "")
             prefix = order_sym[:2] if order_sym else ""
@@ -6990,7 +7038,8 @@ class BacktestApp:
                 if p.get("product", "").startswith(prefix):
                     fill_price = p.get("avg_cost", "")
                     break
-        _log(f"FILL CONFIRM PRICE: fill_price={fill_price!r} pos={pos}")
+        _log(f"FILL CONFIRM PRICE: fill_price={fill_price!r} pos={pos} "
+             f"type={poller_action_type}")
 
         # Guarded write of real_entry_price onto the broker (issue #45).
         # A late entry-fill callback arriving AFTER the sim position has
@@ -7025,7 +7074,8 @@ class BacktestApp:
             f"{result.message}{price_str}", "entry")
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
         if _discord and _discord.enabled:
-            _discord.fill_confirmed(result.action_type, fill_price)
+            _discord.fill_confirmed(result.action_type, fill_price,
+                                    strategy=self._active_strategy_name())
 
         # Issue #50: replay any deferred close that was blocked by
         # BLOCK_FILL_PENDING. Now that the entry fill is confirmed
