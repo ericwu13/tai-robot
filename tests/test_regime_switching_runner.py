@@ -302,6 +302,57 @@ class TestResumeRearm:
                 assert runner2._pending_recommendation is not None
 
 
+class TestRestoreActiveLeg:
+    """restore_session must re-arm the active leg from session.json."""
+
+    def _save_and_restore(self, tmp_path, leg, strategy_name):
+        runner1 = _make_runner(tmp_path)
+        # Simulate a swap having happened
+        runner1._active_leg = leg
+        runner1.regime_idle = (leg == "idle")
+        if leg != "idle":
+            cls = REGISTRY[strategy_name]
+            runner1.strategy = cls()
+            runner1.strategy_display_name = strategy_name
+            runner1.broker.strategy_label = strategy_name
+        runner1._auto_save_session()
+        session_path = runner1._session_path
+        with open(session_path) as f:
+            session_data = json.load(f)
+
+        runner2 = _make_runner(tmp_path)
+        assert runner2.active_leg == "idle"
+        assert runner2.regime_idle is True
+        runner2.restore_session(session_data)
+        return runner2
+
+    def test_restore_short_leg(self, tmp_path):
+        runner = self._save_and_restore(tmp_path, "short", "TestShort")
+        assert runner.active_leg == "short"
+        assert runner.regime_idle is False
+        assert runner.strategy_display_name == "TestShort"
+        assert runner.broker.strategy_label == "TestShort"
+        assert isinstance(runner.strategy, ShortStrategy)
+
+    def test_restore_long_leg(self, tmp_path):
+        runner = self._save_and_restore(tmp_path, "long", "TestLong")
+        assert runner.active_leg == "long"
+        assert runner.regime_idle is False
+        assert runner.strategy_display_name == "TestLong"
+
+    def test_restore_idle_stays_idle(self, tmp_path):
+        runner = self._save_and_restore(tmp_path, "idle", "")
+        assert runner.active_leg == "idle"
+        assert runner.regime_idle is True
+
+    def test_restore_missing_key_stays_idle(self, tmp_path):
+        """Session JSON without active_leg (pre-regime or corrupted)."""
+        runner = _make_runner(tmp_path)
+        runner.restore_session({"broker": runner.broker.to_dict()})
+        assert runner.active_leg == "idle"
+        assert runner.regime_idle is True
+
+
 class TestStop:
     def test_stop_records_session(self, tmp_path):
         runner = _make_runner(tmp_path)

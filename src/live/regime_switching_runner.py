@@ -324,6 +324,28 @@ class RegimeSwitchingRunner(LiveRunner):
 
     # ── Session persistence (override) ──
 
+    def restore_session(self, session_data: dict) -> int:
+        n = super().restore_session(session_data)
+        saved_leg = session_data.get("active_leg", "idle")
+        if saved_leg in ("long", "short"):
+            name = (self._long_strategy_name if saved_leg == "long"
+                    else self._short_strategy_name)
+            if name in self._strategies_registry:
+                cls = self._strategies_registry[name]
+                self.strategy = cls()
+                self.strategy_display_name = name
+                self.broker.strategy_label = name
+                self._active_leg = saved_leg
+                self.regime_idle = False
+                logger.info(
+                    "[REGIME] Restored active leg from session: %s → %s",
+                    saved_leg, name)
+            else:
+                logger.warning(
+                    "[REGIME] Cannot restore leg '%s': strategy '%s' "
+                    "not in registry", saved_leg, name)
+        return n
+
     def _auto_save_session(self) -> None:
         try:
             data = {
