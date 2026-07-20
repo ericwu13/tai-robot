@@ -7006,30 +7006,26 @@ class BacktestApp:
         result = self._fill_poller.confirm()
 
         # Get the actual fill price.
-        #
-        # ENTRY: the account now holds a position whose OpenInterest
-        # avg_cost IS the entry fill price (read from _account_monitor).
-        #
-        # EXIT: the exit leaves the account FLAT (pos_current == 0), so
-        # OpenInterest has no row to read — this used to blank the exit
-        # notification (bug: `✅ Fill Confirmed (exit)` with no price). The
-        # just-closed simulated trade carries the exit price instead:
-        # real_exit_price when a FulfillReport poll already captured the
-        # true fill (see _apply_real_exit_fills), else the simulated exit
-        # price. broker.trades[-1] is the exit trade here — the sim broker
-        # matches the exit before the real order is sent, same assumption
-        # _apply_real_exit_fills relies on.
+        # ENTRY: OpenInterest avg_cost IS the fill price.
+        # EXIT: sync GetFulfillReport query; retry once after 2.5s if
+        # exchange hasn't posted the fill yet, fall back to simulated
+        # with "(est.)" label.
         fill_price = ""
+        _exit_fill_deferred = False
         pos = self._fill_poller.pos_current
         if poller_action_type == "exit" and self._live_runner:
-            broker = self._live_runner.broker
-            trades = getattr(broker, "trades", None)
-            if trades:
-                last = trades[-1]
-                px = (getattr(last, "real_exit_price", 0)
-                      or getattr(last, "exit_price", 0))
-                if px:
-                    fill_price = str(px)
+            real_px = self._sync_query_exit_fill_price()
+            if real_px:
+                fill_price = str(real_px)
+            else:
+                _exit_fill_deferred = True
+                broker = self._live_runner.broker
+                trades = getattr(broker, "trades", None)
+                if trades:
+                    last = trades[-1]
+                    px = getattr(last, "exit_price", 0)
+                    if px:
+                        fill_price = str(px)
         elif pos is not None and pos != 0 and self._live_runner:
             order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
                 "order_symbol", "")
@@ -7074,8 +7070,17 @@ class BacktestApp:
             f"{result.message}{price_str}", "entry")
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
         if _discord and _discord.enabled:
-            _discord.fill_confirmed(result.action_type, fill_price,
-                                    strategy=self._active_strategy_name())
+            if _exit_fill_deferred:
+                sim_px = fill_price
+                strat = self._active_strategy_name()
+                action = result.action_type
+                self.root.after(
+                    2500,
+                    lambda: self._retry_exit_fill_notification(
+                        action, sim_px, strat))
+            else:
+                _discord.fill_confirmed(result.action_type, fill_price,
+                                        strategy=self._active_strategy_name())
 
         # Issue #50: replay any deferred close that was blocked by
         # BLOCK_FILL_PENDING. Now that the entry fill is confirmed
@@ -7096,6 +7101,48 @@ class BacktestApp:
                 self._handle_semi_auto_order(deferred)
             else:
                 _log(f"FILL CONFIRM DONE: no deferred close to replay")
+
+    def _sync_query_exit_fill_price(self) -> int:
+        """Synchronously query GetFulfillReport and apply new close fills.
+
+        Returns the real exit price from the latest trade (0 if unavailable).
+        Reuses _parse_and_display_fills → _apply_real_exit_fills so the
+        fill-tracking counters stay in sync with the normal 30-second poll.
+        """
+        if (not _com_available or skO is None
+                or not self._logged_in or not self._futures_account):
+            return 0
+        user_id = self.login_user_var.get().strip()
+        try:
+            fills_raw = skO.GetFulfillReport(
+                user_id, self._futures_account, 4)
+            self._parse_and_display_fills(fills_raw, "成交(同商品)")
+        except Exception as e:
+            _log(f"EXIT FILL SYNC: GetFulfillReport error: {e}")
+            return 0
+        if not self._live_runner:
+            return 0
+        broker = self._live_runner.broker
+        if not broker.trades:
+            return 0
+        return getattr(broker.trades[-1], "real_exit_price", 0)
+
+    def _retry_exit_fill_notification(self, action_type: str,
+                                      fallback_price: str,
+                                      strategy: str) -> None:
+        """Retry exchange fill query once, then send Discord notification."""
+        real_px = self._sync_query_exit_fill_price()
+        estimated = False
+        if real_px:
+            fill_price = str(real_px)
+        else:
+            fill_price = fallback_price
+            estimated = bool(fill_price)
+        _log(f"EXIT FILL RETRY: real_px={real_px} fill_price={fill_price!r} "
+             f"estimated={estimated}")
+        if _discord and _discord.enabled:
+            _discord.fill_confirmed(action_type, fill_price,
+                                    strategy=strategy, estimated=estimated)
 
     def _on_fill_timeout(self) -> None:
         """Called when fill confirmation times out — downgrade to semi-auto."""
