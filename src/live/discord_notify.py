@@ -122,8 +122,10 @@ class DiscordNotifier:
         )
 
     def fill_confirmed(self, action_type: str, fill_price: str = "",
-                       strategy: str = "") -> None:
-        price_str = f" @**{float(fill_price):,.1f}**" if fill_price else ""
+                       strategy: str = "",
+                       estimated: bool = False) -> None:
+        est = " (est.)" if estimated else ""
+        price_str = f" @**{float(fill_price):,.1f}**{est}" if fill_price else ""
         strat_str = f"\n策略 Strategy: `{strategy}`" if strategy else ""
         self._send(
             f"{self._header()}\n"
