@@ -20,8 +20,8 @@ from ..regime.switch_logic import (
     in_closed_gap,
     last_completed_night,
 )
-from .bar_aggregator import aggregate_bars
-from .live_runner import LiveRunner, _mode_to_source, load_1m_bars_from_csvs
+from .bar_aggregator import BarAggregator, aggregate_bars
+from .live_runner import LiveRunner, _INTERVAL_SECONDS, _mode_to_source, load_1m_bars_from_csvs
 from .session_store import save_session
 
 logger = logging.getLogger(__name__)
@@ -337,9 +337,18 @@ class RegimeSwitchingRunner(LiveRunner):
                 self.broker.strategy_label = name
                 self._active_leg = saved_leg
                 self.regime_idle = False
+                new_interval = _INTERVAL_SECONDS.get(
+                    (self.strategy.kline_type, self.strategy.kline_minute),
+                    14400)
+                if new_interval != self.target_interval:
+                    self.target_interval = new_interval
+                    self.aggregator = BarAggregator(self.symbol, new_interval)
                 logger.info(
                     "[REGIME] Restored active leg from session: %s → %s",
                     saved_leg, name)
+                logger.info(
+                    "[REGIME] Restored timeframe to %ds for %s",
+                    self.target_interval, name)
             else:
                 logger.warning(
                     "[REGIME] Cannot restore leg '%s': strategy '%s' "
