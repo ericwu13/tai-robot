@@ -1691,6 +1691,23 @@ class BacktestApp:
         self.live_log.tag_configure("bar", foreground="#90caf9")
         self.live_log.tag_configure("status", foreground="#ffc107")
 
+        # Regime tab — current trend + switching history for regime bots.
+        # Content is rebuilt from regime_state.json / regime_history.csv on
+        # each view (tab select or Refresh), so it never grows unbounded.
+        regime_frame = ttk.Frame(notebook)
+        notebook.add(regime_frame, text="多空 Regime")
+        regime_bar = ttk.Frame(regime_frame)
+        regime_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Button(regime_bar, text="刷新 Refresh", width=12,
+                   command=self._refresh_regime_tab).pack(side=tk.LEFT)
+        self.regime_text = scrolledtext.ScrolledText(
+            regime_frame, wrap=tk.WORD, font=("Consolas", 10),
+            state=tk.DISABLED)
+        self.regime_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        self._regime_tab_frame = regime_frame
+        self.results_notebook = notebook
+        notebook.bind("<<NotebookTabChanged>>", self._on_results_tab_changed)
+
         # Log tab
         log_frame = ttk.Frame(notebook)
         notebook.add(log_frame, text="紀錄 Log")
@@ -3367,11 +3384,6 @@ class BacktestApp:
         self.metrics_text.insert(tk.END, report)
         self.metrics_text.config(state=tk.DISABLED)
 
-        # Regime Switching Log — recent classification/apply rows from
-        # regime_history.csv, only for regime-switching bots.
-        if regime_info:
-            self._append_regime_log()
-
         # Trade list
         for item in self.trade_tree.get_children():
             self.trade_tree.delete(item)
@@ -3442,23 +3454,125 @@ class BacktestApp:
             "active_strategy": runner.strategy.name if leg != "idle" else "—",
         }
 
-    def _append_regime_log(self, max_rows: int = 8) -> None:
-        """Append a "Regime Switching Log" section to the metrics report
-        from the bot's ``regime_history.csv`` (most recent rows last).
+    _REGIME_ACTION_LABELS = {
+        "deploy_long": "做多 LONG",
+        "deploy_short": "做空 SHORT",
+        "deploy_short_half": "做空半倉 SHORT½",
+        "sit_out": "觀望 SIT OUT",
+        "hold": "維持 HOLD",
+    }
+
+    def _on_results_tab_changed(self, event=None):
+        """Auto-refresh the Regime tab whenever it is selected."""
+        try:
+            sel = self.results_notebook.nametowidget(self.results_notebook.select())
+        except (KeyError, tk.TclError):
+            return
+        if sel is self._regime_tab_frame:
+            self._refresh_regime_tab()
+
+    def _refresh_regime_tab(self) -> None:
+        """Rebuild the Regime tab content (current trend + switching
+        history). Rebuilt from disk on every view — never appended."""
+        lines = self._build_regime_report()
+        self.regime_text.config(state=tk.NORMAL)
+        self.regime_text.delete("1.0", tk.END)
+        self.regime_text.insert(tk.END, "\n".join(lines))
+        self.regime_text.config(state=tk.DISABLED)
+
+    def _build_regime_report(self) -> list:
+        """Current regime (mirrors the Discord notification: raw/effective
+        with bilingual labels + classifier features) from regime_state.json,
+        then the switching history from regime_history.csv.
+
+        The recommendation's applied status comes from regime_state.json's
+        ``next_session.executed`` — the history CSV's ``applied`` column is
+        never written by the live apply path and is always false.
         """
-        runner = self._live_runner
-        if runner is None:
-            return
-        csv_path = os.path.join(runner.bot_dir, "regime_history.csv")
+        import json
+        from src.regime.manager import _regime_label as regime_label
+
+        # getattr: the tab-changed binding can fire before __init__ sets
+        # _live_runner (notebook is built a few lines earlier).
+        runner = getattr(self, "_live_runner", None)
+        regime_info = self._regime_report_info() if runner else None
+        if regime_info is None or runner is None:
+            return ["(無多空切換機器人執行中 No regime-switching bot running)"]
+
+        lines = ["=" * 60, " 目前趨勢 Current Regime", "=" * 60,
+                 f" 現行 Active: {regime_info['active_label']}"
+                 f" ({regime_info['active_strategy']})",
+                 f" 多方 Long leg:  {regime_info['long']}",
+                 f" 空方 Short leg: {regime_info['short']}"]
+
+        state = {}
+        state_path = os.path.join(runner.bot_dir, "regime_state.json")
+        if os.path.exists(state_path):
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    state = json.load(f)
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
+
+        if state.get("raw_regime"):
+            feat = state.get("last_features") or {}
+            adx = feat.get("adx")
+            lines.append("")
+            lines.append(" 原始 Raw:       "
+                         + regime_label(state.get("raw_regime", "unknown"))
+                         + (f"  (ADX {adx:.1f})"
+                            if isinstance(adx, (int, float)) else ""))
+            lines.append(" 有效 Effective: "
+                         + regime_label(state.get("effective_regime", "unknown"))
+                         + (f"  (自 since {state['effective_since']})"
+                            if state.get("effective_since") else ""))
+            if state.get("pending_label"):
+                lines.append(f" 待確認 Pending: {regime_label(state['pending_label'])}"
+                             f"  (確認 {state.get('pending_count', 0)} 次)")
+            if feat:
+                lines.append(f" 指標 Features:  +DI {feat.get('plus_di', 0):.1f} | "
+                             f"-DI {feat.get('minus_di', 0):.1f} | "
+                             f"ATR比 {feat.get('atr_ratio', 0):.2f} | "
+                             f"EMA斜率 {feat.get('ema_slope', 0):.1f}")
+            if state.get("last_assessed"):
+                lines.append(f" 最近評估 Last assessed: {state['last_assessed']}")
+            ns = state.get("next_session") or {}
+            if ns:
+                action = self._REGIME_ACTION_LABELS.get(
+                    ns.get("action", ""), ns.get("action") or "—")
+                status = (f"已套用 applied at {ns.get('executed_at')}"
+                          if ns.get("executed") else "待套用 pending")
+                lines.append("")
+                lines.append(f" 最新建議 Recommendation ({ns.get('date', '—')}): "
+                             f"{action}"
+                             + (f" — {ns.get('strategy')}" if ns.get("strategy") else ""))
+                lines.append(f"   狀態 Status: {status}")
+                if ns.get("reason"):
+                    lines.append(f"   理由 Reason: {ns['reason']}")
+        else:
+            lines.append("")
+            lines.append(" (尚未分類 Not classified yet — 首次分類於夜盤收盤前 "
+                         "first classification runs at the night-session close)")
+
+        lines += ["", "=" * 60, " 多空切換紀錄 Regime Switching Log", "=" * 60]
+        hist = self._regime_history_lines(runner.bot_dir)
+        lines += hist if hist else [" (無紀錄 No history yet)"]
+        lines.append("=" * 60)
+        return lines
+
+    def _regime_history_lines(self, bot_dir: str, max_rows: int = 30) -> list:
+        """Per-session lines from regime_history.csv (most recent last),
+        including the classified trend for each session."""
+        csv_path = os.path.join(bot_dir, "regime_history.csv")
         if not os.path.exists(csv_path):
-            return
+            return []
         try:
             with open(csv_path, newline="", encoding="utf-8") as f:
                 rows = list(csv.reader(f))
         except OSError:
-            return
+            return []
         if len(rows) < 2:
-            return
+            return []
         header, data = rows[0], rows[1:]
 
         def col(name: str) -> int:
@@ -3469,32 +3583,33 @@ class BacktestApp:
 
         i_date = col("date")
         i_session = col("session")
+        i_raw = col("raw_regime")
+        i_eff = col("effective_regime")
+        i_adx = col("adx")
         i_decision = col("decision")
         i_active = col("strategy_active")
-        i_applied = col("applied")
         i_pnl = col("pnl")
         i_trades = col("trades")
 
         def cell(row, idx):
             return row[idx] if 0 <= idx < len(row) else ""
 
-        lines = ["", "=" * 60, " 多空切換紀錄 Regime Switching Log", "=" * 60]
+        out = []
         for row in data[-max_rows:]:
-            date = cell(row, i_date)
-            session = cell(row, i_session)
+            raw = cell(row, i_raw)
+            eff = cell(row, i_eff)
+            trend = f"{raw}→{eff}" if raw and eff and raw != eff else (eff or raw or "—")
+            adx = cell(row, i_adx)
             decision = cell(row, i_decision) or "—"
             active = cell(row, i_active) or "—"
-            applied = cell(row, i_applied) or "—"
             pnl = cell(row, i_pnl)
             n = cell(row, i_trades)
             pnl_str = f"P&L {pnl} ({n} trades)" if pnl != "" else "P&L —"
-            lines.append(
-                f" {date} {session}: 決策 {decision} | "
-                f"現行 {active} | 已套用 applied={applied} | {pnl_str}")
-        lines.append("=" * 60)
-        self.metrics_text.config(state=tk.NORMAL)
-        self.metrics_text.insert(tk.END, "\n" + "\n".join(lines))
-        self.metrics_text.config(state=tk.DISABLED)
+            out.append(
+                f" {cell(row, i_date)} {cell(row, i_session)}: 趨勢 {trend}"
+                + (f" (ADX {adx})" if adx else "")
+                + f" | 決策 {decision} | 現行 {active} | {pnl_str}")
+        return out
 
     def _copy_trade_selection(self, event=None):
         sel = self.trade_tree.selection()
