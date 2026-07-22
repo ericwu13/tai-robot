@@ -318,8 +318,10 @@ class DiscordNotifier:
         else:
             lines.append(f"策略 Strategy: {strategy.get('name', '?')}")
         if regime:
+            from src.regime.manager import _regime_label
+            raw_label = regime.get("label", "?")
             lines.append(
-                f"市場狀態 Market Regime: {regime.get('label', '?')} "
+                f"市場狀態 Market Regime: {_regime_label(raw_label)} "
                 f"(ADX {regime.get('adx', 0):.1f})"
             )
 
