@@ -34,6 +34,10 @@ _REGIME_LABELS = {
     "trending-down": "下降趨勢 trending-down",
     "range-bound": "盤整 range-bound",
     "transitional": "過渡期 transitional",
+    "transitional-bullish": "過渡偏多 transitional-bullish",
+    "transitional-bearish": "過渡偏空 transitional-bearish",
+    "high-volatility": "高波動 high-volatility",
+    "low-volatility-chop": "低波動盤整 low-volatility-chop",
     "unknown": "未知 unknown",
 }
 
