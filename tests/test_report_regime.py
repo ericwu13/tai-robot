@@ -101,7 +101,7 @@ class TestBotNamespacedFilename:
 
 class TestDiscordRegimeInfo:
     def test_regime_switching_info_in_discord_message(self):
-        """Transactions-only report shows the active leg + active strategy."""
+        """Compact report shows the bilingual active leg label."""
         sent = []
         notifier = DiscordNotifier("fake_token", "fake_channel",
                                    bot_name="test", symbol="TX00")
@@ -110,40 +110,33 @@ class TestDiscordRegimeInfo:
         report = {
             "date": "2026-07-09",
             "strategy": {"name": "Regime Switching"},
-            "session": {"bot_name": "test", "version": "", "started_at": ""},
-            "market_regime": None,
             "regime_switching": {
                 "active_leg": "long",
                 "long_strategy": "LongA",
                 "short_strategy": "ShortB",
             },
-            "trades": [],
+            "summary": {},
         }
         notifier.daily_report(report)
         assert len(sent) == 1
         msg = sent[0]
-        assert "Regime: long" in msg      # active leg
-        assert "Regime Switching" in msg  # active strategy
-        # Stat block is gone in the transactions-only format
-        assert "profit_factor" not in msg
-        assert "Per-strategy" not in msg
+        assert "做多 Long" in msg
+        assert "Regime Switching" in msg
 
     def test_no_stat_block_for_single(self):
-        """Single-strategy reports carry no stat/per-strategy block."""
+        """Single-strategy compact report shows strategy name."""
         sent = []
-        notifier = DiscordNotifier("fake_token", "fake_channel")
+        notifier = DiscordNotifier("fake_token", "fake_channel",
+                                   bot_name="bot")
         notifier._send = lambda msg, ch="": sent.append(msg)
 
         report = {
             "date": "2026-07-09",
             "strategy": {"name": "StratA"},
-            "session": {},
-            "market_regime": None,
-            "trades": [],
+            "summary": {},
         }
         notifier.daily_report(report)
         assert len(sent) == 1
-        assert "Per-strategy" not in sent[0]
         assert "StratA" in sent[0]
 
 

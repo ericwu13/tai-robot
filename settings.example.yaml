@@ -48,6 +48,7 @@ notifications:
   # discord_channel_id above.
   discord_evolution_channel_id: ""    # 🧬 evolution logs (verdict / improvement / status)
   discord_daily_report_channel_id: "" # 📊 daily transaction report
+  discord_regime_channel_id: ""      # 🔄 regime classification & strategy swap
 
 ai:
   provider: "anthropic"          # "anthropic" or "google"

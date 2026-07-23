@@ -278,7 +278,7 @@ def generate_session_report(
     if not day_trades:
         day_trades = trades  # fallback: include all trades
 
-    return generate_daily_report(
+    report = generate_daily_report(
         date=date,
         trades=day_trades,
         bars_highs=bars_highs,
@@ -292,6 +292,22 @@ def generate_session_report(
         started_at=started_at,
         save=True,
     )
+
+    # Enrich the summary with today vs cumulative stats for the compact
+    # Discord daily report. "today" = day_trades; "total" = full broker
+    # history (all trades, not just today).
+    summary = report.get("summary") or {}
+    today_pnl = sum(getattr(t, "pnl", 0) or 0 for t in day_trades)
+    summary["today_pnl"] = today_pnl * point_value if point_value != 1 else today_pnl
+    summary["today_trades"] = len(day_trades)
+    total_pnl = sum(getattr(t, "pnl", 0) or 0 for t in trades)
+    summary["total_pnl"] = total_pnl * point_value if point_value != 1 else total_pnl
+    summary["total_trades"] = len(trades)
+    wins = sum(1 for t in trades if (getattr(t, "pnl", 0) or 0) > 0)
+    summary["win_rate"] = (wins / len(trades) * 100) if trades else 0
+    report["summary"] = summary
+
+    return report
 
 
 def load_report(date: str, bot_name: str = "") -> dict | None:

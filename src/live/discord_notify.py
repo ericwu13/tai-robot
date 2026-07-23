@@ -30,7 +30,8 @@ class DiscordNotifier:
     def __init__(self, bot_token: str, channel_id: str,
                  bot_name: str = "", symbol: str = "",
                  evolution_channel_id: str = "",
-                 daily_report_channel_id: str = ""):
+                 daily_report_channel_id: str = "",
+                 regime_channel_id: str = ""):
         self._token = bot_token.strip() if bot_token else ""
         self._channel_id = channel_id.strip() if channel_id else ""
         # Optional dedicated channels. Empty → fall back to the main channel
@@ -39,6 +40,8 @@ class DiscordNotifier:
             evolution_channel_id.strip() if evolution_channel_id else "")
         self._daily_report_channel_id = (
             daily_report_channel_id.strip() if daily_report_channel_id else "")
+        self._regime_channel_id = (
+            regime_channel_id.strip() if regime_channel_id else "")
         self._bot_name = bot_name
         self._symbol = symbol
 
@@ -270,98 +273,59 @@ class DiscordNotifier:
         )
 
     def daily_report(self, report: dict) -> None:
-        """Send a transactions-only daily report to Discord.
+        """Send a compact daily summary to Discord.
 
-        Deliberately NOT a stats summary — no win-rate / P&L / drawdown /
-        per-strategy blocks. It lists the day's transactions (trades that
-        closed today) plus the market regime and the currently-active
-        regime/strategy, and is routed to the dedicated daily-report
-        channel (falls back to the main channel when unconfigured).
+        Format:
+          📊 {bot_name} · {date}
+          {active_strategy}
+          今日 Today: +1,200 · 3 筆
+          累計 Cumul: +5,600 · 12 筆 · 勝率 Win 67%
         """
         date = report.get("date", "?")
         strategy = report.get("strategy", {})
-        session = report.get("session") or {}
-        regime = report.get("market_regime")
         regime_sw = report.get("regime_switching")
-        trades = report.get("trades") or []
+        summary = report.get("summary", {}) or {}
 
-        lines = [
-            f"{self._header()}",
-            f"📊 **每日交易 Daily Transactions** — {date}",
-        ]
+        today_pnl = summary.get("today_pnl", 0) or 0
+        today_trades = summary.get("today_trades", 0) or 0
+        total_pnl = summary.get("total_pnl", 0) or 0
+        total_trades = summary.get("total_trades", 0) or 0
+        win_rate = summary.get("win_rate", 0) or 0
 
-        # Session identifier line: bot_name + version + start time so the
-        # report stands on its own when read out of context (e.g. saved
-        # JSON, archived Discord logs). bot_name is also in _header() but
-        # belongs in the body for readers who land on the message alone.
-        session_parts: list[str] = []
-        bot = session.get("bot_name") or ""
-        version = session.get("version") or ""
-        started = session.get("started_at") or ""
-        if bot:
-            session_parts.append(f"機器人 Bot: `{bot}`")
-        if version:
-            session_parts.append(f"v{version}")
-        if started:
-            # ISO "2026-04-27T15:02:30" → "2026-04-27 15:02"
-            started_short = started.replace("T", " ")[:16]
-            session_parts.append(f"啟動 Started: {started_short}")
-        if session_parts:
-            lines.append(" · ".join(session_parts))
-
-        # Active strategy / regime — for a regime bot the active leg, else
-        # the session strategy name.
+        bot = self._bot_name or "?"
+        strat_name = strategy.get("name", "?")
         if regime_sw:
             leg = regime_sw.get("active_leg", "?")
-            active = strategy.get("name", "?")
-            lines.append(f"🔄 多空切換 Regime: {leg} | 當前策略 Active: {active}")
+            _LEG_LABELS = {"long": "做多 Long", "short": "做空 Short",
+                           "idle": "閒置 Idle"}
+            strat_line = f"🔄 {_LEG_LABELS.get(leg, leg)} | {strat_name}"
         else:
-            lines.append(f"策略 Strategy: {strategy.get('name', '?')}")
-        if regime:
-            from src.regime.manager import _regime_label
-            raw_label = regime.get("label", "?")
-            lines.append(
-                f"市場狀態 Market Regime: {_regime_label(raw_label)} "
-                f"(ADX {regime.get('adx', 0):.1f})"
-            )
+            strat_line = strat_name
 
-        # ── Transactions ──
-        if not trades:
-            lines.append("— 今日無成交 No transactions today —")
-        else:
-            lines.append(f"成交明細 Transactions ({len(trades)}):")
-            for line in self._format_trade_lines(trades):
-                lines.append(line)
-
+        lines = [
+            f"📊 **{bot}** · {date}",
+            strat_line,
+            f"今日 Today: {today_pnl:+,} · {today_trades} 筆",
+            f"累計 Cumul: {total_pnl:+,} · {total_trades} 筆 · "
+            f"勝率 Win {win_rate:.0f}%",
+        ]
         self._send("\n".join(lines), self._daily_report_channel_id)
 
-    @staticmethod
-    def _format_trade_lines(trades: list) -> list[str]:
-        """One compact line per trade, real fill prices preferred.
+    def regime_swap(self, from_leg: str, to_leg: str,
+                    strategy_name: str) -> None:
+        """Notify a regime strategy swap."""
+        _LEG_LABELS = {"long": "做多 Long", "short": "做空 Short",
+                       "idle": "閒置 Idle"}
+        ts = _taipei_now().strftime("%Y-%m-%d %H:%M:%S")
+        self._send(
+            f"🔄 **{self._bot_name}** · 策略切換 Strategy Swap\n"
+            f"{_LEG_LABELS.get(from_leg, from_leg)} → "
+            f"{_LEG_LABELS.get(to_leg, to_leg)}\n"
+            f"{strategy_name}\n"
+            f"{ts}",
+            self._regime_channel_id,
+        )
 
-        Kept under Discord's 2000-char message cap by truncating the list
-        and appending a "+N more" marker when a busy day overflows.
-        """
-        _MAX = 40  # cap the number of listed trades
-        out: list[str] = []
-        for t in trades[:_MAX]:
-            side = str(t.get("side", "")).upper() or "?"
-            entry_px = t.get("real_entry_price") or t.get("entry_price", 0)
-            exit_px = t.get("real_exit_price") or t.get("exit_price", 0)
-            # exit_dt / entry_dt are "YYYY-MM-DD HH:MM[:SS]" strings; show
-            # just the HH:MM window so the line stays compact.
-            entry_t = str(t.get("entry_dt", ""))[11:16]
-            exit_t = str(t.get("exit_dt", ""))[11:16]
-            when = f"{entry_t}→{exit_t}".strip("→") or "?"
-            pnl = t.get("pnl", 0) or 0
-            exit_tag = t.get("exit_tag", "")
-            strat = t.get("strategy", "")
-            tag_str = f" [{exit_tag}]" if exit_tag else ""
-            strat_str = f" ({strat})" if strat else ""
-            out.append(
-                f"• {when} {side} {entry_px:,}→{exit_px:,} "
-                f"P&L {pnl:+,}{tag_str}{strat_str}"
-            )
-        if len(trades) > _MAX:
-            out.append(f"…(+{len(trades) - _MAX} more)")
-        return out
+    def notify_regime(self, message: str) -> None:
+        """Free-form notification routed to the regime channel."""
+        self._send(f"{self._header()}\n{message}", self._regime_channel_id)
