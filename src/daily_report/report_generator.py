@@ -39,7 +39,7 @@ def _trade_to_dict(t: Trade, point_value: int = 1) -> dict:
         "entry_dt": getattr(t, "entry_dt", ""),
         "exit_dt": getattr(t, "exit_dt", ""),
         "pnl": pnl,
-        "pnl_currency": pnl * point_value if point_value != 1 else pnl,
+        "pnl_currency": pnl,
         "bars_held": exit_bar - entry_bar,
         "exit_tag": getattr(t, "exit_tag", ""),
         "real_entry_price": getattr(t, "real_entry_price", 0) or None,
@@ -294,20 +294,47 @@ def generate_session_report(
     )
 
     # Enrich the summary with today vs cumulative stats for the compact
-    # Discord daily report. "today" = day_trades; "total" = full broker
-    # history (all trades, not just today).
+    # Discord daily report. "today" = day_trades; "total" = cumulative from
+    # all on-disk daily reports for this bot (today's was just saved above).
     summary = report.get("summary") or {}
     today_pnl = sum(getattr(t, "pnl", 0) or 0 for t in day_trades)
-    summary["today_pnl"] = today_pnl * point_value if point_value != 1 else today_pnl
+    summary["today_pnl"] = today_pnl
     summary["today_trades"] = len(day_trades)
-    total_pnl = sum(getattr(t, "pnl", 0) or 0 for t in trades)
-    summary["total_pnl"] = total_pnl * point_value if point_value != 1 else total_pnl
-    summary["total_trades"] = len(trades)
-    wins = sum(1 for t in trades if (getattr(t, "pnl", 0) or 0) > 0)
-    summary["win_rate"] = (wins / len(trades) * 100) if trades else 0
+    total_pnl, total_trades, win_rate = _cumulative_from_reports(bot_name)
+    summary["total_pnl"] = total_pnl
+    summary["total_trades"] = total_trades
+    summary["win_rate"] = win_rate
     report["summary"] = summary
 
     return report
+
+
+def _cumulative_from_reports(bot_name: str) -> tuple[float, int, float]:
+    """Aggregate (total_pnl, total_trades, win_rate) from on-disk daily reports.
+
+    Filters by ``session.bot_name`` inside each JSON file so cumulative stats
+    are scoped to a single bot, regardless of filename conventions.
+    """
+    total_pnl = 0.0
+    total_trades = 0
+    total_wins = 0
+    if not _REPORTS_DIR.exists():
+        return 0.0, 0, 0.0
+    for path in _REPORTS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("session", {}).get("bot_name", "") != bot_name:
+            continue
+        for t in data.get("trades", []):
+            pnl = t.get("pnl", 0) or 0
+            total_pnl += pnl
+            total_trades += 1
+            if pnl > 0:
+                total_wins += 1
+    win_rate = (total_wins / total_trades * 100) if total_trades else 0.0
+    return total_pnl, total_trades, win_rate
 
 
 def load_report(date: str, bot_name: str = "") -> dict | None:
