@@ -331,7 +331,7 @@ class TestGenerateDailyReport:
         )
         td = report["trades"][0]
         assert td["pnl"] == 100
-        assert td["pnl_currency"] == 20000  # 100 * 200
+        assert td["pnl_currency"] == 100  # pnl already in currency
         assert td["bars_held"] == 5
         assert td["side"] == "LONG"
         assert td["exit_tag"] == "limit"
@@ -777,3 +777,49 @@ class TestGenerateSessionReport:
         )
         assert report is not None
         assert report["market_regime"] is None
+
+    def test_cumulative_from_disk_not_broker(self, tmp_path, monkeypatch):
+        """Cumulative stats must come from on-disk reports, not broker.trades.
+
+        Regression: broker.trades is an in-memory list that resets on fresh
+        deploy, making the cumulative unreliable. On-disk daily reports
+        persist across deploys and are per-bot.
+        """
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        # Seed two older daily report files for bot "mybot"
+        for date, pnl_val in [("2026-04-09", 5000), ("2026-04-10", -2000)]:
+            report_data = {
+                "session": {"bot_name": "mybot"},
+                "trades": [{"pnl": pnl_val}],
+            }
+            (tmp_path / f"{date}_mybot.json").write_text(
+                json.dumps(report_data), encoding="utf-8",
+            )
+
+        # Also seed a report for a DIFFERENT bot — must not be counted
+        other = {"session": {"bot_name": "other"}, "trades": [{"pnl": 99999}]}
+        (tmp_path / "2026-04-09_other.json").write_text(
+            json.dumps(other), encoding="utf-8",
+        )
+
+        # Today's broker has 1 trade (pnl=300, already in currency)
+        today_trade = _make_trade(pnl=300, exit_dt="2026-04-11 10:30")
+        broker = _FakeBroker([today_trade])
+
+        report = generate_session_report(
+            broker=broker, data_store=None, bot_name="mybot", point_value=10,
+        )
+        summary = report["summary"]
+
+        # Today: 1 trade, pnl = 300 (already in currency, no extra multiply)
+        assert summary["today_trades"] == 1
+        assert summary["today_pnl"] == 300
+
+        # Cumulative: 3 reports on disk (2 old + 1 just saved) for "mybot"
+        # 5000 + (-2000) + 300 = 3300
+        assert summary["total_pnl"] == 3300
+        assert summary["total_trades"] == 3
+        # 2 wins out of 3 (5000 and 300 are positive)
+        assert abs(summary["win_rate"] - 66.7) < 1
