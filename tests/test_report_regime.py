@@ -101,10 +101,35 @@ class TestBotNamespacedFilename:
 
 class TestDiscordRegimeInfo:
     def test_regime_switching_info_in_discord_message(self):
-        """Compact report shows the bilingual active leg label."""
+        """Compact report shows the bilingual active leg label and regime."""
         sent = []
         notifier = DiscordNotifier("fake_token", "fake_channel",
                                    bot_name="test", symbol="TX00")
+        notifier._send = lambda msg, ch="": sent.append(msg)
+
+        report = {
+            "date": "2026-07-09",
+            "strategy": {"name": "Regime Switching"},
+            "regime_switching": {
+                "active_leg": "long",
+                "long_strategy": "LongA",
+                "short_strategy": "ShortB",
+                "effective_regime": "trending-up",
+            },
+            "summary": {},
+        }
+        notifier.daily_report(report)
+        assert len(sent) == 1
+        msg = sent[0]
+        assert "做多 Long" in msg
+        assert "Regime Switching" in msg
+        assert "市場 Regime: 上升趨勢 trending-up" in msg
+
+    def test_regime_line_omitted_when_no_effective_regime(self):
+        """When effective_regime is None/missing, the regime line is omitted."""
+        sent = []
+        notifier = DiscordNotifier("fake_token", "fake_channel",
+                                   bot_name="test")
         notifier._send = lambda msg, ch="": sent.append(msg)
 
         report = {
@@ -118,10 +143,23 @@ class TestDiscordRegimeInfo:
             "summary": {},
         }
         notifier.daily_report(report)
-        assert len(sent) == 1
-        msg = sent[0]
-        assert "做多 Long" in msg
-        assert "Regime Switching" in msg
+        assert "市場 Regime" not in sent[0]
+
+    def test_version_in_daily_report_header(self):
+        """Daily report header includes the software version."""
+        from version import APP_VERSION
+        sent = []
+        notifier = DiscordNotifier("fake_token", "fake_channel",
+                                   bot_name="test")
+        notifier._send = lambda msg, ch="": sent.append(msg)
+
+        report = {
+            "date": "2026-07-09",
+            "strategy": {"name": "StratA"},
+            "summary": {},
+        }
+        notifier.daily_report(report)
+        assert f"v{APP_VERSION}" in sent[0]
 
     def test_no_stat_block_for_single(self):
         """Single-strategy compact report shows strategy name."""

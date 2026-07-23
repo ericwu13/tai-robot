@@ -519,7 +519,9 @@ class TestDiscordDailyReport:
         msg = sent[0][0]
         assert "my_bot" in msg
         assert "2026-04-11" in msg
-        assert "SMA Cross" in msg
+        from version import APP_VERSION
+        assert f"v{APP_VERSION}" in msg
+        assert "AI: SMA Cross" in msg
         assert "+1,200" in msg
         assert "3 筆" in msg
         assert "+5,600" in msg

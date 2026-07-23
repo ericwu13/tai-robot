@@ -9,6 +9,8 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timezone, timedelta
 
+from version import APP_VERSION
+
 _TPE = timezone(timedelta(hours=8))
 _API_BASE = "https://discord.com/api/v10"
 
@@ -287,11 +289,14 @@ class DiscordNotifier:
         """Send a compact daily summary to Discord.
 
         Format:
-          📊 {bot_name} · {date}
-          {active_strategy}
+          📊 {bot_name} · {date} · v{version}
+          AI: {strategy}
+          市場 Regime: {bilingual_regime_label}   (omitted when unknown/None)
           今日 Today: +1,200 · 3 筆
           累計 Cumul: +5,600 · 12 筆 · 勝率 Win 67%
         """
+        from src.regime.manager import _regime_label
+
         date = report.get("date", "?")
         strategy = report.get("strategy", {})
         regime_sw = report.get("regime_switching")
@@ -314,12 +319,18 @@ class DiscordNotifier:
             strat_line = strat_name
 
         lines = [
-            f"📊 **{bot}** · {date}",
-            strat_line,
+            f"📊 **{bot}** · {date} · v{APP_VERSION}",
+            f"AI: {strat_line}",
+        ]
+        if regime_sw:
+            eff = regime_sw.get("effective_regime")
+            if eff:
+                lines.append(f"市場 Regime: {_regime_label(eff)}")
+        lines.extend([
             f"今日 Today: {today_pnl:+,} · {today_trades} 筆",
             f"累計 Cumul: {total_pnl:+,} · {total_trades} 筆 · "
             f"勝率 Win {win_rate:.0f}%",
-        ]
+        ])
         self._send("\n".join(lines), self._daily_report_channel_id)
 
     def regime_swap(self, from_leg: str, to_leg: str,
