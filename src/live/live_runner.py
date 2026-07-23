@@ -409,12 +409,10 @@ class LiveRunner:
         # from suppress_strategy (cleared on every reconnect replay).
         self.regime_idle: bool = False
 
-        # Daily-report dedupe key: (date_str, "DAY"|"NIGHT") of the last
-        # session for which a report was emitted. Prevents the 30s
-        # session-end poll from re-firing within the same close window
-        # and prevents a manual stop right after auto-fire from
-        # producing a duplicate report.
-        self._last_report_session: tuple[str, str] | None = None
+        # Daily-report dedupe key: the report DATE string (e.g.
+        # "2026-07-21") of the last emitted report. Persisted in
+        # session.json so a restart can't re-send the same day's report.
+        self._last_report_date: str | None = None
 
     # ── Lock file ──
 
@@ -1384,6 +1382,7 @@ class LiveRunner:
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "bar_index": self._bar_index,
                 "broker": self.broker.to_dict(),
+                "last_report_date": self._last_report_date,
             }
             save_session(self._session_path, data)
         except Exception:
@@ -1401,17 +1400,11 @@ class LiveRunner:
     def _generate_daily_report(self) -> None:
         """Generate a daily report after session stop (best-effort).
 
-        Debounced per ``(date, DAY|NIGHT)`` so that the same session is
-        never reported twice — the 30s session-end poll fires this
-        method repeatedly inside the close window, and a manual stop
-        right after auto-fire would otherwise produce a duplicate.
+        Debounced by the report date string (persisted in session.json)
+        so that neither the 30s session-end poll nor a manual stop can
+        re-send the same day's report.
         """
         try:
-            key = self._session_key()
-            if key == self._last_report_session:
-                return
-            self._last_report_session = key
-
             from ..daily_report.report_generator import generate_session_report
             report = generate_session_report(
                 broker=self.broker,
@@ -1423,8 +1416,14 @@ class LiveRunner:
                 bot_name=self.bot_name,
                 started_at=self._started_at,
             )
-            if report is not None:
-                self._emit("on_daily_report", report)
+            if report is None:
+                return
+            report_date = report.get("date", "")
+            if report_date and report_date == self._last_report_date:
+                return
+            self._last_report_date = report_date
+            self._auto_save_session()
+            self._emit("on_daily_report", report)
         except Exception:
             pass  # best-effort; don't crash the bot on report failure
 
@@ -1447,6 +1446,7 @@ class LiveRunner:
         self.broker.trade_source = _mode_to_source(self.trading_mode)
         self._bar_index = session_data.get("bar_index", 0)
         self._started_at = session_data.get("started_at", self._started_at)
+        self._last_report_date = session_data.get("last_report_date")
         return len(self.broker.trades)
 
     # Emit a progress tick every N bars during reload so the GUI can keep

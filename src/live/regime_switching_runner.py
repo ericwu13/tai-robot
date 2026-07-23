@@ -77,6 +77,9 @@ class RegimeSwitchingRunner(LiveRunner):
         self._pending_recommendation: dict | None = None
         self._recorded_sessions: set[tuple[str, str]] = set()
 
+        # Callback fired on strategy swap — wired to DiscordNotifier by the GUI
+        self.on_regime_swap_cb: Callable[[str, str, str], None] | None = None
+
         # Re-arm any unexecuted recommendation from a prior run
         pending = self._manager.get_pending_recommendation()
         if pending and not pending.get("executed", True):
@@ -265,6 +268,7 @@ class RegimeSwitchingRunner(LiveRunner):
         """Instantiate and swap to a leg strategy."""
         if strategy_name not in self._strategies_registry:
             raise ValueError(f"Strategy '{strategy_name}' not in registry")
+        prev_leg = self._active_leg
         strategy_cls = self._strategies_registry[strategy_name]
         new_strategy = strategy_cls()
         ok, reason = self.swap_strategy(new_strategy, strategy_name)
@@ -272,16 +276,26 @@ class RegimeSwitchingRunner(LiveRunner):
             raise RuntimeError(f"swap_strategy refused: {reason}")
         self._active_leg = leg
         self.regime_idle = False
+        if callable(self.on_regime_swap_cb):
+            try:
+                self.on_regime_swap_cb(prev_leg, leg, strategy_name)
+            except Exception:
+                pass
         return f"{leg} → {strategy_name}"
 
     def _apply_sit_out(self) -> str:
         """Enter idle mode — keep current strategy object but suppress trading."""
-        # Clear any pending orders from outgoing strategy
+        prev_leg = self._active_leg
         self.broker._pending_entries.clear()
         self.broker._pending_exits.clear()
         self.broker._pending_market_closes.clear()
         self._active_leg = "idle"
         self.regime_idle = True
+        if callable(self.on_regime_swap_cb):
+            try:
+                self.on_regime_swap_cb(prev_leg, "idle", "")
+            except Exception:
+                pass
         return "sit_out (idle)"
 
     # ── Classifier bar supply ──
@@ -369,6 +383,7 @@ class RegimeSwitchingRunner(LiveRunner):
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "bar_index": self._bar_index,
                 "broker": self.broker.to_dict(),
+                "last_report_date": self._last_report_date,
                 "regime_mode": True,
                 "active_leg": self._active_leg,
                 "long_strategy": self._long_strategy_name,
@@ -381,13 +396,13 @@ class RegimeSwitchingRunner(LiveRunner):
     # ── Daily report (override) ──
 
     def _generate_daily_report(self) -> None:
-        """Inject regime status into the daily report."""
-        try:
-            key = self._session_key()
-            if key == self._last_report_session:
-                return
-            self._last_report_session = key
+        """Inject regime status into the daily report.
 
+        Dedup is handled by the base class (date-string guard persisted
+        in session.json). We override only to inject the regime_switching
+        block and to intercept the emit so it includes the extra data.
+        """
+        try:
             from ..daily_report.report_generator import generate_session_report
             report = generate_session_report(
                 broker=self.broker,
@@ -399,13 +414,19 @@ class RegimeSwitchingRunner(LiveRunner):
                 bot_name=self.bot_name,
                 started_at=self._started_at,
             )
-            if report is not None:
-                report["regime_switching"] = {
-                    "active_leg": self._active_leg,
-                    "long_strategy": self._long_strategy_name,
-                    "short_strategy": self._short_strategy_name,
-                }
-                self._emit("on_daily_report", report)
+            if report is None:
+                return
+            report_date = report.get("date", "")
+            if report_date and report_date == self._last_report_date:
+                return
+            self._last_report_date = report_date
+            report["regime_switching"] = {
+                "active_leg": self._active_leg,
+                "long_strategy": self._long_strategy_name,
+                "short_strategy": self._short_strategy_name,
+            }
+            self._auto_save_session()
+            self._emit("on_daily_report", report)
         except Exception:
             pass
 

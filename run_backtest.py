@@ -299,6 +299,8 @@ def _load_settings():
                 notif.get("discord_evolution_channel_id", "") or "")
             cfg["discord_daily_report_channel_id"] = str(
                 notif.get("discord_daily_report_channel_id", "") or "")
+            cfg["discord_regime_channel_id"] = str(
+                notif.get("discord_regime_channel_id", "") or "")
             # Trading
             trading = data.get("trading", {})
             cfg["allow_live_override"] = trading.get("allow_live_override", False)
@@ -5488,10 +5490,13 @@ class BacktestApp:
             "discord_evolution_channel_id", "")
         daily_report_channel_id = self._settings.get(
             "discord_daily_report_channel_id", "")
+        regime_channel_id = self._settings.get(
+            "discord_regime_channel_id", "")
         _discord = DiscordNotifier(bot_token, channel_id,
                                    bot_name=bot_name, symbol=symbol,
                                    evolution_channel_id=evolution_channel_id,
-                                   daily_report_channel_id=daily_report_channel_id)
+                                   daily_report_channel_id=daily_report_channel_id,
+                                   regime_channel_id=regime_channel_id)
         if _discord.enabled:
             mode_zh = {"paper": "模擬", "semi_auto": "半自動",
                        "auto": "全自動"}.get(trading_mode, trading_mode)
@@ -5510,10 +5515,14 @@ class BacktestApp:
                 )
             _log(f"Discord 通知已啟用 Discord notifications enabled")
 
-        # Route regime announcements through Discord
+        # Route regime announcements through Discord (regime channel)
         if self._regime_manager is not None:
             self._regime_manager.discord_notify_cb = lambda msg: (
-                _discord.notify(msg) if _discord is not None and _discord.enabled else None
+                _discord.notify_regime(msg) if _discord is not None and _discord.enabled else None
+            )
+        if hasattr(self._live_runner, "on_regime_swap_cb"):
+            self._live_runner.on_regime_swap_cb = lambda f, t, s: (
+                _discord.regime_swap(f, t, s) if _discord is not None and _discord.enabled else None
             )
         self._update_regime_status()
 
