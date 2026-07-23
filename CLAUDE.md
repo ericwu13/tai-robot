@@ -56,7 +56,7 @@ python test_kline.py       # COM-based KLine history GUI
 - No pandas/numpy - indicators use pure Python
 - settings.yaml is NEVER committed (contains credentials)
 - SDK directory (CapitalAPI_2.13.57/) is gitignored (large binaries)
-- Test count: 1570 tests (as of v2.16.0-regime-session-integrity)
+- Test count: 1600 tests (as of issue #92 real-exit-price rework)
 
 ## COM Tick History Replay (CRITICAL — issue #50)
 - After `RequestTicks`, COM replays historical ticks before sending live ticks
@@ -76,6 +76,14 @@ python test_kline.py       # COM-based KLine history GUI
 - `try_set_real_entry_price()`: guarded write with 4 checks (price>0, position>0, not already set, entry_bar_index matches). Prevents late callbacks from planting stale values on the next trade.
 - `effective_entry_price()`: returns real if confirmed, else simulated. Strategies use this for slippage-aware stops.
 - Belt-and-braces: `on_bar_close` resets `real_entry_price=0` on every new entry
+
+## Real Exit Price Tracking (issue #92)
+- `SKReplyLib.OnNewData` is the ONLY per-fill price source: type "D" (deal) rows carry the actual fill price for ONE order, keyed by the 13-digit seq no `SendFutureOrderCLR` returned
+- **`GetFulfillReport(..., 4)` ("合併同商品") merges fills by commodity — its price is a DAY-CUMULATIVE AVERAGE per side, never a fill price.** Display-only. Using it as a price source is what reported exit @44,794 (day average) when the bill said 44,622.
+- `src/live/fill_report.py`: `RealFillTracker.register_order(seq, action_type, bar_index, sim_price)` on order OK; `on_new_data(raw)` matches deal rows by seq — unmatched rows (another bot / manual order on the same account) are ignored
+- `broker.try_set_real_exit_price()`: guarded write mirroring the entry guard (no trade / already set / exit_bar_index mismatch drops late ROD fills for previous trades)
+- Discord: `fill_confirmed` uses the real price when the deal row beat the OpenInterest confirm (normal case); else "(est.)" + `fill_price_correction` follow-up when OnNewData lands
+- Entry keeps OpenInterest avg_cost as fallback; OnNewData writes first when faster (identical for 1-lot)
 
 ## BarAggregator 1-min Pass-Through (issue #44)
 - For `target_interval == 60`, `on_bar()` returns the bar immediately (no accumulation delay)

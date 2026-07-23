@@ -136,6 +136,17 @@ class DiscordNotifier:
             f"{strat_str}"
         )
 
+    def fill_price_correction(self, action_type: str, real_price: int,
+                              est_price: int, strategy: str = "") -> None:
+        """Follow-up when the real fill price arrives after an (est.) notice."""
+        strat_str = f"\n策略 Strategy: `{strategy}`" if strategy else ""
+        self._send(
+            f"{self._header()}\n"
+            f"🔁 **成交價更正 Fill Price Correction** ({action_type}) "
+            f"@**{real_price:,}** (原估 est. was {est_price:,})"
+            f"{strat_str}"
+        )
+
     def fill_timeout_downgrade(self, action_type: str, timeout_s: float) -> None:
         self._send(
             f"{self._header()}\n"

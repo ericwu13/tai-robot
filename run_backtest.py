@@ -111,6 +111,7 @@ from src.live.account_monitor import (
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.fill_poller import FillPoller
+from src.live.fill_report import RealFillTracker
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
 from src.market_data.kline_config import (
@@ -620,7 +621,9 @@ class SKReplyLibEvent:
         pass
 
     def OnNewData(self, bstrUserID, bstrData):
-        pass
+        # Real-time per-order report — the only per-fill price source in
+        # the Capital API (issue #92). Enqueued like every other COM event.
+        _ui_queue.put_nowait(("new_data", bstrData))
 
 
 class SKOrderLibEvents:
@@ -807,6 +810,11 @@ class BacktestApp:
                              f"available={parsed.get('available')} "
                              f"float_pnl={parsed.get('float_pnl')}")
                     _log(f"權益數 FutureRights: {_redact_future_rights(data)}")
+                elif kind == "new_data":
+                    try:
+                        self._on_new_data(data)
+                    except Exception as e:
+                        _log(f"OnNewData 處理錯誤 handler error: {e}")
                 elif kind == "order_result":
                     code, msg = data
                     if code == 0:
@@ -1271,6 +1279,12 @@ class BacktestApp:
         # Fill confirmation polling (auto mode) — uses OpenInterest position change
         self._fill_poller = FillPoller(self._trading_guard)
         self._fill_poll_timer_id = None
+        # Per-order real fill prices from OnNewData (issue #92)
+        self._fill_tracker = RealFillTracker()
+        self._last_exit_order_seq: str = ""
+        # Seq no of the exit whose Discord notice went out with the
+        # estimated price — a late OnNewData fill triggers a correction.
+        self._est_notified_exit_seq: str = ""
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -1546,7 +1560,8 @@ class BacktestApp:
         trades_frame = ttk.Frame(notebook)
         notebook.add(trades_frame, text="交易明細 Trades")
         columns = ("num", "tag", "side", "entry_time", "entry_price", "real_entry",
-                   "exit_time", "exit_price", "pnl", "bars_held", "source", "strategy")
+                   "exit_time", "exit_price", "real_exit",
+                   "pnl", "bars_held", "source", "strategy")
         self.trade_tree = ttk.Treeview(trades_frame, columns=columns, show="headings", height=20)
         self._trade_sort_col = None
         self._trade_sort_reverse = False
@@ -1555,6 +1570,7 @@ class BacktestApp:
             ("entry_time", "進場時間 Entry Time", 135), ("entry_price", "進場價 Entry", 80),
             ("real_entry", "實進場 Real Entry", 90),
             ("exit_time", "出場時間 Exit Time", 135), ("exit_price", "出場價 Exit", 80),
+            ("real_exit", "實出場 Real Exit", 90),
             ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 60),
             ("source", "來源 Source", 80), ("strategy", "策略 Strategy", 150),
         ]:
@@ -3402,18 +3418,21 @@ class BacktestApp:
             if not exit_dt and bars and 0 <= t.exit_bar_index < len(bars):
                 exit_dt = bars[t.exit_bar_index].dt.strftime("%Y-%m-%d %H:%M")
 
-            # Real entry price from auto/semi_auto fill confirmation.
+            # Real entry/exit prices from real-order fill confirmation.
             # "--" for paper mode, force-closes, and race-dropped fills
             # so they're visually distinct from valid zero prices.
             real_entry_str = (f"{t.real_entry_price:,}"
                               if t.real_entry_price > 0 else "--")
+            real_exit_str = (f"{t.real_exit_price:,}"
+                             if getattr(t, "real_exit_price", 0) > 0 else "--")
 
             source_str = _SOURCE_LABELS.get(getattr(t, "source", ""), "--")
 
             self.trade_tree.insert("", tk.END, values=(
                 i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
                 real_entry_str,
-                exit_dt, f"{t.exit_price:,}", pnl_str, bars_held,
+                exit_dt, f"{t.exit_price:,}", real_exit_str,
+                pnl_str, bars_held,
                 source_str,
                 getattr(t, "strategy", "") or "--",
             ), tags=(row_tag,))
@@ -6939,6 +6958,22 @@ class BacktestApp:
                 self._live_log_msg(f"實單已送出 Order sent: {message}", action_type)
                 _log(f"REAL ORDER OK: {message}")
                 self._last_real_order_side = buy_sell  # track for close button
+                # Track the seq no so OnNewData deal rows can be matched
+                # back to this order (issue #92). Bar-index snapshot taken
+                # NOW — the sim broker has already opened/closed, so the
+                # guarded real-price writes reject late fills that belong
+                # to a previous trade.
+                if self._live_runner:
+                    broker = self._live_runner.broker
+                    if action_type == "entry":
+                        bar_idx = broker.entry_bar_index
+                    else:
+                        bar_idx = (broker.trades[-1].exit_bar_index
+                                   if broker.trades else -1)
+                    self._fill_tracker.register_order(
+                        str(message), action_type, bar_idx, sim_price)
+                    if action_type == "exit":
+                        self._last_exit_order_seq = str(message).strip()
                 if _discord and _discord.enabled:
                     _discord.order_sent(side_str, order_symbol, price_label,
                                         sim_price, str(message),
@@ -7019,10 +7054,12 @@ class BacktestApp:
 
     # ── Fill confirmation via OpenInterest position change (auto mode) ──
     #
-    # COM SKOrderLib has NO fill callback.  GetFulfillReport aggregates fills
-    # by side/product so line-count and qty-total comparisons both fail.
-    # Instead we poll GetOpenInterestGW — the OnOpenInterest callback reliably
-    # reflects position changes within a few seconds.
+    # GetFulfillReport aggregates fills by side/product so line-count and
+    # qty-total comparisons both fail.  For DID-IT-FILL we poll
+    # GetOpenInterestGW — the OnOpenInterest callback reliably reflects
+    # position changes within a few seconds.  For AT-WHAT-PRICE we use
+    # SKReplyLib.OnNewData deal rows matched by order seq no (issue #92,
+    # see _on_new_data) — the only per-fill price source in the API.
 
     def _active_strategy_name(self) -> str:
         """Display name of the strategy that produced the current signal.
@@ -7130,15 +7167,18 @@ class BacktestApp:
         result = self._fill_poller.confirm()
 
         # Get the actual fill price.
-        # ENTRY: OpenInterest avg_cost IS the fill price.
-        # EXIT: sync GetFulfillReport query; retry once after 2.5s if
-        # exchange hasn't posted the fill yet, fall back to simulated
-        # with "(est.)" label.
+        # ENTRY: OnNewData deal row if already arrived, else OpenInterest
+        # avg_cost (identical for a 1-lot position).
+        # EXIT: OnNewData deal row recorded on trades[-1].real_exit_price
+        # (issue #92 — GetFulfillReport(4) merges fills by commodity into a
+        # day-average price and must NOT be used). If the reply channel is
+        # slow, retry once after 2.5s, then fall back to simulated with an
+        # "(est.)" label; a late OnNewData fill sends a Discord correction.
         fill_price = ""
         _exit_fill_deferred = False
         pos = self._fill_poller.pos_current
         if poller_action_type == "exit" and self._live_runner:
-            real_px = self._sync_query_exit_fill_price()
+            real_px = self._real_exit_price_from_broker()
             if real_px:
                 fill_price = str(real_px)
             else:
@@ -7151,13 +7191,17 @@ class BacktestApp:
                     if px:
                         fill_price = str(px)
         elif pos is not None and pos != 0 and self._live_runner:
-            order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
-                "order_symbol", "")
-            prefix = order_sym[:2] if order_sym else ""
-            for p in self._account_monitor.positions:
-                if p.get("product", "").startswith(prefix):
-                    fill_price = p.get("avg_cost", "")
-                    break
+            real_px = self._live_runner.broker.real_entry_price
+            if real_px:
+                fill_price = str(real_px)
+            else:
+                order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
+                    "order_symbol", "")
+                prefix = order_sym[:2] if order_sym else ""
+                for p in self._account_monitor.positions:
+                    if p.get("product", "").startswith(prefix):
+                        fill_price = p.get("avg_cost", "")
+                        break
         _log(f"FILL CONFIRM PRICE: fill_price={fill_price!r} pos={pos} "
              f"type={poller_action_type}")
 
@@ -7168,7 +7212,8 @@ class BacktestApp:
         # stop would be computed against the previous trade's real fill
         # price. The broker's try_set_real_entry_price() enforces all
         # race conditions; we just pass the snapshot and log if rejected.
-        if poller_action_type == "entry" and self._live_runner and fill_price:
+        if (poller_action_type == "entry" and self._live_runner and fill_price
+                and self._live_runner.broker.real_entry_price == 0):
             broker = self._live_runner.broker
             try:
                 price_int = int(round(float(fill_price)))
@@ -7226,24 +7271,11 @@ class BacktestApp:
             else:
                 _log(f"FILL CONFIRM DONE: no deferred close to replay")
 
-    def _sync_query_exit_fill_price(self) -> int:
-        """Synchronously query GetFulfillReport and apply new close fills.
+    def _real_exit_price_from_broker(self) -> int:
+        """The OnNewData-recorded real exit price of the latest trade.
 
-        Returns the real exit price from the latest trade (0 if unavailable).
-        Reuses _parse_and_display_fills → _apply_real_exit_fills so the
-        fill-tracking counters stay in sync with the normal 30-second poll.
+        0 when the deal report hasn't arrived yet (or paper mode).
         """
-        if (not _com_available or skO is None
-                or not self._logged_in or not self._futures_account):
-            return 0
-        user_id = self.login_user_var.get().strip()
-        try:
-            fills_raw = skO.GetFulfillReport(
-                user_id, self._futures_account, 4)
-            self._parse_and_display_fills(fills_raw, "成交(同商品)")
-        except Exception as e:
-            _log(f"EXIT FILL SYNC: GetFulfillReport error: {e}")
-            return 0
         if not self._live_runner:
             return 0
         broker = self._live_runner.broker
@@ -7254,19 +7286,79 @@ class BacktestApp:
     def _retry_exit_fill_notification(self, action_type: str,
                                       fallback_price: str,
                                       strategy: str) -> None:
-        """Retry exchange fill query once, then send Discord notification."""
-        real_px = self._sync_query_exit_fill_price()
+        """Re-check for the OnNewData fill once, then notify Discord.
+
+        The deal report normally lands within ~1s of the fill; this retry
+        covers a slow reply channel. If the price is still missing the
+        estimated price goes out labeled "(est.)" and _on_new_data sends a
+        correction when the real fill finally arrives.
+        """
+        real_px = self._real_exit_price_from_broker()
         estimated = False
         if real_px:
             fill_price = str(real_px)
         else:
             fill_price = fallback_price
             estimated = bool(fill_price)
+            self._est_notified_exit_seq = self._last_exit_order_seq
         _log(f"EXIT FILL RETRY: real_px={real_px} fill_price={fill_price!r} "
              f"estimated={estimated}")
         if _discord and _discord.enabled:
             _discord.fill_confirmed(action_type, fill_price,
                                     strategy=strategy, estimated=estimated)
+
+    def _on_new_data(self, raw: str) -> None:
+        """SKReplyLib.OnNewData — real-time per-order report (issue #92).
+
+        Type-"D" rows carry the actual deal price for one order, keyed by
+        the seq no SendFutureOrderCLR returned. This is the only reliable
+        fill-price source: GetFulfillReport(4) merges fills by commodity
+        into a day-average price, and OpenInterest only covers entries.
+        Rows for orders this bot didn't send (another bot or a manual
+        order on the same account) don't match the tracker and are ignored.
+        """
+        redacted = raw
+        if self._futures_account:
+            redacted = redacted.replace(self._futures_account, "***")
+        _log(f"回報 OnNewData: {redacted}")
+        fill = self._fill_tracker.on_new_data(raw)
+        if fill is None or not self._live_runner:
+            return
+        broker = self._live_runner.broker
+        if fill.action_type == "exit":
+            fill_dt = _taipei_now().replace(tzinfo=None
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            accepted = broker.try_set_real_exit_price(
+                fill.price, exit_bar_index=fill.bar_index, fill_dt=fill_dt)
+            _log(f"REAL FILL (exit): seq={fill.seq_no} price={fill.price} "
+                 f"qty={fill.qty} sim={fill.sim_price} accepted={accepted}")
+            if not accepted:
+                return
+            self._live_log_msg(
+                f"實際出場價 Real exit fill @{fill.price:,} "
+                f"(模擬 sim {fill.sim_price:,})", "exit")
+            self._log_order_decision(
+                "REAL_EXIT_CONFIRMED",
+                f"price={fill.price} seq={fill.seq_no}")
+            if self._est_notified_exit_seq == fill.seq_no:
+                self._est_notified_exit_seq = ""
+                if _discord and _discord.enabled:
+                    _discord.fill_price_correction(
+                        "exit", fill.price, fill.sim_price,
+                        strategy=self._active_strategy_name())
+        elif fill.action_type == "entry":
+            accepted = broker.try_set_real_entry_price(
+                fill.price, entry_bar_index=fill.bar_index,
+                fill_dt=_taipei_now().isoformat(timespec="seconds"))
+            _log(f"REAL FILL (entry): seq={fill.seq_no} price={fill.price} "
+                 f"qty={fill.qty} sim={fill.sim_price} accepted={accepted}")
+            if accepted:
+                self._live_log_msg(
+                    f"實際進場價 Real entry fill @{fill.price:,} "
+                    f"(模擬 sim {fill.sim_price:,})", "entry")
+                self._log_order_decision(
+                    "REAL_ENTRY_CONFIRMED",
+                    f"price={fill.price} seq={fill.seq_no}")
 
     def _on_fill_timeout(self) -> None:
         """Called when fill confirmation times out — downgrade to semi-auto."""
@@ -7370,12 +7462,12 @@ class BacktestApp:
             self._account_monitor.clear_positions()  # will be rebuilt from callbacks
             skO.GetOpenInterestGW(user_id, self._futures_account, 1)
             skO.GetFutureRights(user_id, self._futures_account, 1)  # 1=TWD
-            # Synchronous order/fill queries
+            # Synchronous fill query — display-only (per-fill prices come
+            # from OnNewData, issue #92). GetOrderReport(5) was dropped:
+            # its CSV layout differs from the fulfill report, so the shared
+            # parser rendered every row as "x0 @" (no price/qty), and
+            # OnNewData now logs each order event with raw data anyway.
             try:
-                # GetOrderReport(5) = filled orders (已成) — has price/qty
-                orders_raw = skO.GetOrderReport(user_id, self._futures_account, 5)
-                self._parse_and_display_fills(orders_raw, "委託(已成)")
-                # Also get FulfillReport for comparison
                 fills_raw = skO.GetFulfillReport(user_id, self._futures_account, 4)
                 self._parse_and_display_fills(fills_raw, "成交(同商品)")
             except Exception as e:
@@ -7450,44 +7542,10 @@ class BacktestApp:
         if self._live_runner and result.new_entries:
             for fill in result.new_entries:
                 self._live_log_msg(f"實{label}: {fill}", "entry")
-            # Phase 2: capture real_exit_price from new close-side fills.
-            # Match by symbol prefix and apply the most recent close fill
-            # to the latest trade.  The broker's race guards reject stale
-            # writes (mismatched exit_bar_index / already-set / no trade).
-            self._apply_real_exit_fills(result.new_parsed)
-
-    def _apply_real_exit_fills(self, new_parsed: list[dict]) -> None:
-        """Apply close-side fills to the most recent trade's real_exit_price.
-
-        Called after each FulfillReport poll detects new fills.  Each close
-        fill (``new_close == "O"``) updates the latest trade in-place via
-        ``broker.try_set_real_exit_price``.  Race guards in the broker
-        handle late callbacks, double-writes, and bar-index mismatches.
-        """
-        if not self._live_runner or not new_parsed:
-            return
-        broker = self._live_runner.broker
-        if not broker.trades:
-            return
-        for fill in new_parsed:
-            if fill.get("new_close") != "O":
-                continue
-            price = fill.get("price")
-            if not price or price <= 0:
-                continue
-            last_trade = broker.trades[-1]
-            fill_dt = _taipei_now().replace(tzinfo=None
-                ).strftime("%Y-%m-%d %H:%M:%S")
-            accepted = broker.try_set_real_exit_price(
-                int(round(price)),
-                exit_bar_index=last_trade.exit_bar_index,
-                fill_dt=fill_dt,
-            )
-            if accepted:
-                self._log_order_decision(
-                    "REAL_EXIT_CONFIRMED",
-                    f"price={int(round(price))} dt={fill_dt}",
-                )
+            # NOTE: these rows are DISPLAY-ONLY. GetFulfillReport(4) merges
+            # fills by commodity — the price is a day-cumulative average,
+            # not a fill price (issue #92). Real fill prices come from
+            # OnNewData deal rows via _on_new_data.
 
     def _log_order_decision(self, action: str, reason: str) -> None:
         """Log a real-order event to the CSV decision log."""

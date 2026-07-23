@@ -93,7 +93,7 @@ class TradingGuard:
         self.fill_pending_type = action_type
 
     def on_fill_confirmed(self) -> None:
-        """Called when GetFulfillReport shows a new fill."""
+        """Called when OpenInterest confirms the position change."""
         self.fill_pending = False
         self.fill_pending_type = ""
 
