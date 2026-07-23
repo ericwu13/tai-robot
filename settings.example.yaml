@@ -49,6 +49,8 @@ notifications:
   discord_evolution_channel_id: ""    # 🧬 evolution logs (verdict / improvement / status)
   discord_daily_report_channel_id: "" # 📊 daily transaction report
   discord_regime_channel_id: ""      # 🔄 regime classification & strategy swap
+  discord_poster_channel_id: ""      # 🚀 release announcements (poster channel)
+  discord_poster_role_id: ""         # role to tag in release announcements
 
 ai:
   provider: "anthropic"          # "anthropic" or "google"
