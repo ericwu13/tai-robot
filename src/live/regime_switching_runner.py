@@ -424,6 +424,7 @@ class RegimeSwitchingRunner(LiveRunner):
                 "active_leg": self._active_leg,
                 "long_strategy": self._long_strategy_name,
                 "short_strategy": self._short_strategy_name,
+                "effective_regime": self._manager._state.effective_regime,
             }
             self._auto_save_session()
             self._emit("on_daily_report", report)
