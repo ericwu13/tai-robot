@@ -29,6 +29,8 @@ import sys
 import zipfile
 from datetime import datetime, timezone
 
+import yaml
+
 from version import APP_VERSION as VERSION
 DIST_DIR = os.path.join("dist", "tai_backtest")
 ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
@@ -192,14 +194,84 @@ def write_checksum(zip_path: str) -> str:
     return sha_path
 
 
+def _load_release_notes() -> str:
+    """Read release_notes_v{VERSION}.md from the project root, or empty."""
+    project = os.path.dirname(os.path.abspath(__file__)) or "."
+    path = os.path.join(project, f"release_notes_v{VERSION}.md")
+    if not os.path.isfile(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        body = f.read().strip()
+    # Strip the leading "# v{VERSION}" title line — redundant with the header.
+    lines = body.splitlines()
+    if lines and lines[0].strip().lstrip("#").strip() == f"v{VERSION}":
+        body = "\n".join(lines[1:]).strip()
+    return body
+
+
+def notify_release(sha: str) -> None:
+    """Send a release announcement to the Discord poster channel."""
+    settings_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)) or ".", "settings.yaml")
+    if not os.path.isfile(settings_path):
+        print("  No settings.yaml — skipping Discord notification")
+        return
+
+    with open(settings_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    notif = cfg.get("notifications", {})
+    bot_token = str(notif.get("discord_bot_token", "") or "").strip()
+    poster_channel = str(notif.get("discord_poster_channel_id", "") or "").strip()
+    if not bot_token or not poster_channel:
+        print("  Discord poster channel not configured — skipping notification")
+        return
+
+    role_id = str(notif.get("discord_poster_role_id", "") or "").strip()
+    role_mention = f"<@&{role_id}>\n" if role_id else ""
+    commit_str = f" (`{sha[:10]}`)" if sha and sha != "unknown" else ""
+    header = f"🚀 **tai-robot v{VERSION} released**{commit_str}"
+
+    repo_url = _git("remote", "get-url", "origin").removesuffix(".git")
+    release_url = f"{repo_url}/releases/tag/v{VERSION}"
+    release_link = f"🔗 {release_url}"
+
+    notes = _load_release_notes()
+    if notes:
+        if len(notes) > 1500:
+            notes = notes[:1500].rsplit("\n", 1)[0] + "\n..."
+        content = f"{role_mention}{header}\n\n{notes}\n\n{release_link}"
+    else:
+        content = f"{role_mention}{header}\n\n{release_link}"
+        print(f"  No release_notes_v{VERSION}.md found — sending without notes")
+
+    import httpx
+    url = f"https://discord.com/api/v10/channels/{poster_channel}/messages"
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json",
+    }
+    resp = httpx.post(url, json={"content": content}, headers=headers, timeout=10)
+    if resp.status_code in (200, 201):
+        print(f"  Sent release announcement to Discord poster channel")
+    else:
+        print(f"  WARNING: Discord API returned {resp.status_code}: {resp.text}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build and package tai_backtest release")
     parser.add_argument("--skip-build", action="store_true", help="Skip PyInstaller build, just zip")
     parser.add_argument("--allow-dirty", action="store_true",
                         help="Permit packaging with uncommitted source changes")
+    parser.add_argument("--notify-only", action="store_true",
+                        help="Skip build/package, just send Discord notification")
     args = parser.parse_args()
 
     sha, dirty = git_commit_info()
+
+    if args.notify_only:
+        notify_release(sha)
+        return
+
     if dirty and not args.allow_dirty:
         print("ERROR: tracked source (src/, run_backtest.py, version.py) has "
               "uncommitted changes.")
@@ -217,6 +289,8 @@ def main():
 
     zip_path = package()
     sha_path = write_checksum(zip_path)
+
+    notify_release(sha)
 
     print(f"\n=== Done ===")
     print(f"To create a GitHub release (upload zip + checksum):")
