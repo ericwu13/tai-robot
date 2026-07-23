@@ -372,6 +372,16 @@ class LiveRunner:
         # Lock file for multi-instance conflict prevention
         self._lock_path = os.path.join(self.bot_dir, ".lock")
 
+        # Freshest tick from the GUI feed (run_backtest._on_com_tick mirrors
+        # every tick here BEFORE feeding BarBuilder). Used by
+        # _entry_fill_price as the next-open fallback for 1-min strategies,
+        # where no partial aggregated bar exists at signal time.
+        self.latest_tick_price: int = 0
+        self.latest_tick_dt: datetime | None = None
+        # Source label of the last entry fill ("next-open"/"tick"/"bar close")
+        # — surfaced in the ENTRY_FILL decision reason for auditability.
+        self._entry_fill_src: str = "bar close"
+
         # Tracking
         self._bar_index = 0  # running bar index for broker
         self._seen_1m_dts: set[datetime] = set()  # for dedup
@@ -1093,11 +1103,20 @@ class LiveRunner:
                     idx, bar.open, bar.high, bar.low, bar.close, fill_dt)
                 self._check_for_trade_close(bar, idx)
 
-        # Fill entry orders and market closes at bar close.
+        # Fill entry orders and market closes.
         # Use wall-clock fill_dt (not synthetic bar boundary) so trade
         # entry_dt/exit_dt reflect when COM actually delivered the bar.
+        #
+        # Entries fill at the NEXT bar's open (entry_fill_price), matching
+        # backtest fill_mode="next_open" — NOT at bar.close, which at a
+        # session boundary is the previous session's close and can be 75+
+        # minutes stale (incident: sim 44,930 = day close vs real IOC fill
+        # 44,774 = night open). Market closes still fill at bar.close,
+        # identical to backtest close-fill semantics.
         trades_before = len(self.broker.trades)
-        self.broker.on_bar_close(idx, bar.close, fill_dt)
+        entry_fill, self._entry_fill_src = self._entry_fill_price(bar)
+        self.broker.on_bar_close(idx, bar.close, fill_dt,
+                                 entry_fill_price=entry_fill)
         # Check for market close trades (broker.close() processed inside on_bar_close)
         if len(self.broker.trades) > trades_before:
             self._check_for_trade_close(bar, idx)
@@ -1118,12 +1137,38 @@ class LiveRunner:
             )
             self._auto_save_session()
 
+    def _entry_fill_price(self, bar: Bar) -> tuple[int, str]:
+        """Next-open entry fill price + source label, matching backtest.
+
+        Backtest runs fill_mode="next_open": a signal on bar N fills at
+        bar N+1's open. In live mode bar N+1's open is ALREADY KNOWN at
+        signal time — the aggregator can only finalize bar N when the
+        first 1-min bar of the next window arrives, so get_partial_bar()
+        holds that window and its open IS the next-open fill price.
+
+        Fallback chain (never fills at 0):
+          1. partial aggregated bar's open  — multi-minute strategies
+          2. freshest tick (<=120s old)     — 1-min pass-through, where no
+             partial exists; the tick that completed the bar is the next
+             bar's first trade for practical purposes
+          3. bar.close                      — stop()-flush edge / no tick
+        """
+        partial = self.aggregator.get_partial_bar()
+        if partial is not None and partial.open > 0:
+            return partial.open, "next-open"
+        now = datetime.now(_TZ_TAIPEI).replace(tzinfo=None)
+        if (self.latest_tick_price > 0
+                and _tick_within_age(self.latest_tick_dt, now, 120)):
+            return self.latest_tick_price, "tick"
+        return bar.close, "bar close"
+
     def _check_for_entry_fill(self, bar: Bar, idx: int) -> None:
         """Check if an entry was just filled."""
         if self.broker.position_size > 0 and self.broker.entry_bar_index == idx:
             self._log_decision(
                 bar, "ENTRY_FILL", self.broker.position_side.value,
-                self.broker.entry_tag, self.broker.entry_price, "filled at bar close",
+                self.broker.entry_tag, self.broker.entry_price,
+                f"filled at {self._entry_fill_src}",
             )
             self._auto_save_session()
 
