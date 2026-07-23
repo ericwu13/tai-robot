@@ -10,7 +10,10 @@ seq no, and ignore fills from other bots on the same account.
 
 from src.backtest.broker import OrderSide, SimulatedBroker, Trade
 from src.live.discord_notify import DiscordNotifier
-from src.live.fill_report import RealFillTracker, parse_new_data
+from src.live.fill_report import (
+    RealFillTracker, parse_new_data,
+    parse_fulfill_report, match_fill_in_report,
+)
 
 
 def make_row(seq="2315604562747", typ="D", err="N", product="TM0000",
@@ -192,3 +195,93 @@ def test_fill_price_correction_message_shape():
     assert "44,622" in msg          # the real price, prominent
     assert "44,589" in msg          # the previously-notified estimate
     assert "DynamicExitPullbackStrategyV2" in msg
+
+
+# ── GetFulfillReport(1) per-fill parsing (issue #92 backup) ──
+
+def _make_fr_row(seq="2315604562747", side="S", price="45081.000000",
+                 qty="1", nc="O", date="20260723"):
+    """Build a minimal GetFulfillReport CSV line (24+ fields)."""
+    f = [""] * 24
+    f[0] = seq
+    f[15] = side
+    f[19] = price
+    f[20] = qty
+    f[21] = nc
+    f[23] = date
+    return ",".join(f)
+
+
+def test_parse_fulfill_report_basic():
+    raw = _make_fr_row()
+    rows = parse_fulfill_report(raw)
+    assert len(rows) == 1
+    assert rows[0].seq_no == "2315604562747"
+    assert rows[0].side == "S"
+    assert rows[0].price == 45081.0
+    assert rows[0].qty == 1
+    assert rows[0].new_close == "O"
+    assert rows[0].date == "20260723"
+
+
+def test_parse_fulfill_report_multiple_rows():
+    raw = "\n".join([
+        _make_fr_row(seq="111", price="44506.000000"),
+        _make_fr_row(seq="222", price="45081.000000"),
+    ])
+    rows = parse_fulfill_report(raw)
+    assert len(rows) == 2
+    assert rows[0].seq_no == "111"
+    assert rows[1].seq_no == "222"
+
+
+def test_parse_fulfill_report_skips_error_lines():
+    raw = "001,ERROR\n" + _make_fr_row()
+    rows = parse_fulfill_report(raw)
+    assert len(rows) == 1
+
+
+def test_parse_fulfill_report_empty_and_none():
+    assert parse_fulfill_report("") == []
+    assert parse_fulfill_report(None) == []
+    assert parse_fulfill_report("001,no data") == []
+
+
+def test_match_fill_in_report_finds_target():
+    rows = parse_fulfill_report("\n".join([
+        _make_fr_row(seq="111", price="44506.000000"),
+        _make_fr_row(seq="222", price="45081.000000"),
+    ]))
+    assert match_fill_in_report(rows, "222") == 45081
+    assert match_fill_in_report(rows, "111") == 44506
+
+
+def test_match_fill_in_report_no_match():
+    rows = parse_fulfill_report(_make_fr_row(seq="111"))
+    assert match_fill_in_report(rows, "999") == 0
+
+
+def test_match_fill_rejects_aggregate_qty():
+    rows = parse_fulfill_report(_make_fr_row(seq="111", qty="2"))
+    assert match_fill_in_report(rows, "111") == 0
+
+
+def test_match_fill_rejects_zero_price():
+    rows = parse_fulfill_report(_make_fr_row(seq="111", price="0"))
+    assert match_fill_in_report(rows, "111") == 0
+
+
+def test_match_fill_rejects_bad_price():
+    rows = parse_fulfill_report(_make_fr_row(seq="111", price=""))
+    assert match_fill_in_report(rows, "111") == 0
+
+
+def test_issue_92_two_bots_same_account():
+    """Two bots on same account: each exit should get its own fill price."""
+    raw = "\n".join([
+        _make_fr_row(seq="AAA", price="44506.000000", side="S", nc="O"),
+        _make_fr_row(seq="BBB", price="44622.000000", side="S", nc="O"),
+    ])
+    rows = parse_fulfill_report(raw)
+    assert match_fill_in_report(rows, "AAA") == 44506
+    assert match_fill_in_report(rows, "BBB") == 44622
