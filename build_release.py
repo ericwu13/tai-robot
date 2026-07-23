@@ -209,8 +209,106 @@ def _load_release_notes() -> str:
     return body
 
 
-def notify_release(sha: str) -> None:
-    """Send a release announcement to the Discord poster channel."""
+def verify_head_pushed() -> None:
+    """Abort if the local HEAD has not been pushed to the remote.
+
+    Without this, ``gh release create`` tags whatever commit the remote
+    has — which may be an older commit if the version-bump hasn't been
+    pushed yet.  This was the root cause of the v2.17.5 double-notification
+    (tag landed on the wrong commit, release had to be recreated).
+    """
+    try:
+        local = _git("rev-parse", "HEAD")
+        remote = _git("rev-parse", "@{upstream}")
+    except subprocess.CalledProcessError:
+        print("ERROR: cannot determine remote tracking branch.")
+        print("       Push your commits first: git push")
+        sys.exit(1)
+
+    if local != remote:
+        behind_ahead = _git("rev-list", "--left-right", "--count",
+                            "@{upstream}...HEAD")
+        print(f"ERROR: local HEAD ({local[:10]}) is not pushed to the remote "
+              f"({remote[:10]}).")
+        print(f"       behind/ahead: {behind_ahead}")
+        print("       Push first so the release tag lands on the correct commit:")
+        print("         git push")
+        sys.exit(1)
+    print(f"  HEAD {local[:10]} confirmed on remote")
+
+
+def _release_notes_path() -> str:
+    project = os.path.dirname(os.path.abspath(__file__)) or "."
+    return os.path.join(project, f"release_notes_v{VERSION}.md")
+
+
+def create_github_release(zip_path: str, sha_path: str, sha: str) -> bool:
+    """Create a GitHub release via ``gh``, attaching the zip and checksum.
+
+    The tag is pinned to *sha* via ``--target`` so it always points at the
+    version-bump commit, regardless of what the remote HEAD happens to be.
+
+    Returns True on success, False on failure.
+    """
+    print(f"\n=== Creating GitHub release v{VERSION} ===")
+
+    tag = f"v{VERSION}"
+    notes_file = _release_notes_path()
+
+    cmd = ["gh", "release", "create", tag, zip_path, sha_path,
+           "--title", tag, "--target", sha]
+    if os.path.isfile(notes_file):
+        cmd += ["--notes-file", notes_file]
+    else:
+        cmd += ["--notes", f"Release {tag}"]
+        print(f"  No release_notes_v{VERSION}.md — using default notes")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "already exists" in stderr.lower():
+            print(f"  Release {tag} already exists — skipping creation")
+            print(f"  (delete it first with: gh release delete {tag} --yes)")
+            return False
+        print(f"  ERROR: gh release create failed (exit {result.returncode})")
+        if stderr:
+            print(f"  {stderr}")
+        return False
+
+    url = result.stdout.strip()
+    print(f"  GitHub release created: {url}")
+    return True
+
+
+def verify_github_release_exists() -> bool:
+    """Return True if the GitHub release for this version is published."""
+    tag = f"v{VERSION}"
+    result = subprocess.run(
+        ["gh", "release", "view", tag, "--json", "isDraft"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        data = json.loads(result.stdout)
+        return not data.get("isDraft", True)
+    except (json.JSONDecodeError, KeyError):
+        return False
+
+
+def notify_release(sha: str, *, force: bool = False) -> None:
+    """Send a release announcement to the Discord poster channel.
+
+    Guarded: writes a marker file so the notification fires at most once
+    per version.  Pass ``force=True`` to resend (e.g. after a botched
+    first attempt).
+    """
+    marker = os.path.join("dist", f".notified_v{VERSION}")
+    if os.path.isfile(marker) and not force:
+        print(f"  Discord notification already sent for v{VERSION} "
+              f"(marker: {marker}).  Use --force-notify to resend.")
+        return
+
     settings_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)) or ".", "settings.yaml")
     if not os.path.isfile(settings_path):
@@ -232,8 +330,7 @@ def notify_release(sha: str) -> None:
     header = f"🚀 **tai-robot v{VERSION} released**{commit_str}"
 
     repo_url = _git("remote", "get-url", "origin").removesuffix(".git")
-    release_url = f"{repo_url}/releases/tag/v{VERSION}"
-    release_link = f"🔗 {release_url}"
+    release_link = f"🔗 {repo_url}/releases/tag/v{VERSION}"
 
     notes = _load_release_notes()
     if notes:
@@ -253,6 +350,9 @@ def notify_release(sha: str) -> None:
     resp = httpx.post(url, json={"content": content}, headers=headers, timeout=10)
     if resp.status_code in (200, 201):
         print(f"  Sent release announcement to Discord poster channel")
+        os.makedirs("dist", exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     else:
         print(f"  WARNING: Discord API returned {resp.status_code}: {resp.text}")
 
@@ -262,14 +362,22 @@ def main():
     parser.add_argument("--skip-build", action="store_true", help="Skip PyInstaller build, just zip")
     parser.add_argument("--allow-dirty", action="store_true",
                         help="Permit packaging with uncommitted source changes")
+    parser.add_argument("--skip-release", action="store_true",
+                        help="Skip GitHub release creation (build + package only)")
     parser.add_argument("--notify-only", action="store_true",
                         help="Skip build/package, just send Discord notification")
+    parser.add_argument("--force-notify", action="store_true",
+                        help="Resend Discord notification even if already sent for this version")
     args = parser.parse_args()
 
     sha, dirty = git_commit_info()
 
     if args.notify_only:
-        notify_release(sha)
+        if not verify_github_release_exists():
+            print(f"ERROR: GitHub release v{VERSION} not found or still in draft.")
+            print("       Publish the release first, then retry --notify-only.")
+            sys.exit(1)
+        notify_release(sha, force=args.force_notify)
         return
 
     if dirty and not args.allow_dirty:
@@ -290,12 +398,22 @@ def main():
     zip_path = package()
     sha_path = write_checksum(zip_path)
 
-    notify_release(sha)
+    if args.skip_release:
+        print(f"\n=== Done (--skip-release) ===")
+        print(f"To create the GitHub release later:")
+        print(f"  gh release create v{VERSION} {zip_path} {sha_path} "
+              f"--title \"v{VERSION}\" --target {sha} "
+              f"--notes-file release_notes_v{VERSION}.md")
+        return
+
+    verify_head_pushed()
+    released = create_github_release(zip_path, sha_path, sha)
+    if released:
+        notify_release(sha, force=args.force_notify)
+    else:
+        print("  Skipping Discord notification — GitHub release not confirmed")
 
     print(f"\n=== Done ===")
-    print(f"To create a GitHub release (upload zip + checksum):")
-    print(f"  gh release create v{VERSION} {zip_path} {sha_path} "
-          f"--title \"v{VERSION}\" --notes \"First release\"")
 
 
 if __name__ == "__main__":
