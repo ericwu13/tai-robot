@@ -56,7 +56,7 @@ python test_kline.py       # COM-based KLine history GUI
 - No pandas/numpy - indicators use pure Python
 - settings.yaml is NEVER committed (contains credentials)
 - SDK directory (CapitalAPI_2.13.57/) is gitignored (large binaries)
-- Test count: 1600 tests (as of issue #92 real-exit-price rework)
+- Test count: 1609 tests (as of live next-open entry fill)
 
 ## COM Tick History Replay (CRITICAL — issue #50)
 - After `RequestTicks`, COM replays historical ticks before sending live ticks
@@ -70,6 +70,13 @@ python test_kline.py       # COM-based KLine history GUI
 - `FORCE_CLOSE` bypasses the gate (user emergency exit)
 - **Deferred close (issue #50)**: when `TRADE_CLOSE` is blocked by fill_pending, the decision is stored via `guard.defer_close()`. After `_on_fill_confirmed("entry")`, it's popped and replayed automatically. Without this, rapid bar replay can permanently lose exit orders.
 - Never rebind `self._trading_guard` — `_fill_poller` holds a reference to it (issue #43)
+
+## Live Next-Open Entry Fill (backtest parity)
+- Backtest runs `fill_mode="next_open"` (signal on bar N fills at bar N+1's open). Live/paper used to fill the placeholder at bar N's CLOSE — at a session boundary that close is the PREVIOUS session's last price, 75+ min stale (incident: sim 44,930 = day close vs real IOC fill 44,774 = night open, 156pt phantom gap in Discord 模擬價)
+- Fix: `LiveRunner._entry_fill_price()` — the next bar's open is ALREADY KNOWN at signal time (the aggregator finalizes bar N only when the next window's first 1-min bar arrives, so `get_partial_bar().open` IS the next-open). Fallbacks: fresh tick ≤120s (`latest_tick_price`, mirrored from `_on_com_tick` before the BarBuilder feed — 1-min pass-through has no partial) → `bar.close` (stop-flush edge)
+- Passed to `broker.on_bar_close(..., entry_fill_price=)` — overrides the ENTRY fill only. Market closes (`broker.close()`) still fill at bar.close, identical to backtest close-fill semantics. Do NOT route entry_fill_price into market closes
+- Fill timing/entry_bar_index unchanged (synchronous placeholder for the real-fill race, issue #45); only the placeholder PRICE changed. Real fills still overwrite via try_set_real_entry_price
+- ENTRY_FILL decision reason now says "filled at next-open" / "filled at tick" / "filled at bar close" (source audit trail)
 
 ## Real Entry Price Tracking (issue #45)
 - `SimulatedBroker.real_entry_price`: set by `_on_fill_confirmed("entry")` from OpenInterest avg_cost

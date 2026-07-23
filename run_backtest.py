@@ -3263,10 +3263,11 @@ class BacktestApp:
         strategy = strategy_cls()
         # next_open = entries fill at the next bar's open, so TP/SL can hit
         # on the same bar as the entry (matches TV strategy.entry() default,
-        # enables same-bar enter+exit). Live mode is unaffected by this flag
-        # because LiveRunner constructs its own broker with the on_close
-        # default — live relies on on_close as a synchronous placeholder
-        # mechanism for the real_entry_price race, not as a fill model.
+        # enables same-bar enter+exit). Live mode keeps the on_close broker
+        # default as a synchronous placeholder mechanism for the
+        # real_entry_price race, but passes entry_fill_price = the partial
+        # bar's open to on_bar_close, so the placeholder PRICE matches this
+        # next_open fill exactly (LiveRunner._entry_fill_price).
         # See SimulatedBroker class docstring for the full model.
         engine = BacktestEngine(strategy, point_value=point_value, fill_mode="next_open")
 
@@ -6348,6 +6349,12 @@ class BacktestApp:
         ask_scaled = ask // divisor
         self._live_last_tick_price = price
         self._live_last_tick_dt = dt  # naive Taipei; paired staleness guard for force-close
+        # Mirror into the runner BEFORE the BarBuilder feed below, so when a
+        # completed 1-min bar triggers an entry fill the runner already holds
+        # the tick that closed the bar (next-open fill for 1-min strategies).
+        if self._live_runner:
+            self._live_runner.latest_tick_price = price
+            self._live_runner.latest_tick_dt = dt
 
         # Log first few live ticks to verify timestamp/price convention
         if self._live_history_done and self._live_tick_count <= self._live_history_tick_count + 5:

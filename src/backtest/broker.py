@@ -283,15 +283,22 @@ class SimulatedBroker:
         if self.fill_mode == "next_open":
             self._fill_pending_entries(bar_index, open_, bar_dt)
 
-    def on_bar_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
+    def on_bar_close(self, bar_index: int, close: int, bar_dt: str = "",
+                     entry_fill_price: int | None = None) -> None:
         """Process pending market closes and (in on_close mode) entry orders.
 
         Market closes ALWAYS fill at this bar's close in both modes —
         ``broker.close()`` is a market-on-close order by definition.
+        ``entry_fill_price`` never affects market closes.
 
         In ``fill_mode="on_close"`` this also fills pending entries at
         the bar's close (legacy semantics; same-bar re-entry supported:
         exit fills intra-bar at TP/SL, entry fills at bar close).
+        ``entry_fill_price`` (when truthy) overrides the entry fill price
+        only — LiveRunner passes the NEXT bar's open here so the live
+        placeholder fill matches backtest ``next_open`` semantics instead
+        of the signal bar's close, which at a session boundary can be
+        75+ minutes stale (day close 44,930 vs night open 44,774).
 
         In ``fill_mode="next_open"`` entries are NOT filled here; the
         engine calls on_bar_open(bar_index+1, ...) on the next bar to
@@ -315,7 +322,8 @@ class SimulatedBroker:
         # dropping all entries — the only branch that opts OUT of filling
         # here is the explicit next_open mode.
         if self.fill_mode != "next_open":
-            self._fill_pending_entries(bar_index, close, bar_dt)
+            fill = entry_fill_price if entry_fill_price else close
+            self._fill_pending_entries(bar_index, fill, bar_dt)
 
     def _fill_pending_entries(self, bar_index: int, price: int, bar_dt: str) -> None:
         """Fill all pending entry orders at the given price.
