@@ -48,8 +48,8 @@ class Trade:
     # paper mode / fill race dropped". See SimulatedBroker.real_entry_price.
     real_entry_price: int = 0
     real_entry_dt: str = ""
-    real_exit_price: int = 0    # Phase 2 — not yet captured
-    real_exit_dt: str = ""      # Phase 2 — not yet captured
+    real_exit_price: int = 0    # from OnNewData deal rows (issue #92)
+    real_exit_dt: str = ""
     source: str = ""            # "backtest", "paper", or "real"
     # Display name of the strategy whose signal OPENED this trade. In
     # regime mode one bot's restored history spans several strategies
