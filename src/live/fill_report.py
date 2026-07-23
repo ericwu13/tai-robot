@@ -166,3 +166,83 @@ class RealFillTracker:
         """The recorded fill for a seq no, or None."""
         order = self._orders.get(str(seq_no).strip())
         return order["fill"] if order else None
+
+
+# ── GetFulfillReport(1) per-fill detail parsing ──
+#
+# Format 1 = "全部" — each physical fill is a separate CSV row.
+# Field layout (Capital API 2.13.57, same structure as format 4 but
+# not merged): [0]=seq, [15]=side(B/S), [19]=price, [20]=qty,
+# [21]=N(new)/O(close), [23]=date.
+
+# Field indices for GetFulfillReport (distinct from OnNewData layout).
+_FR_IDX_SEQ = 0
+_FR_IDX_SIDE = 15
+_FR_IDX_PRICE = 19
+_FR_IDX_QTY = 20
+_FR_IDX_NC = 21
+_FR_IDX_DATE = 23
+_FR_MIN_FIELDS = 24
+
+
+@dataclass
+class FulfillReportRow:
+    """One parsed GetFulfillReport row."""
+    seq_no: str
+    side: str
+    price: float
+    qty: int
+    new_close: str
+    date: str
+
+
+def parse_fulfill_report(raw: str) -> list[FulfillReportRow]:
+    """Parse a GetFulfillReport(1) result into individual rows.
+
+    Skips error/empty lines (starting with '001' or '##').
+    """
+    if not raw or not isinstance(raw, str):
+        return []
+    results: list[FulfillReportRow] = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("001") or line.startswith("##"):
+            continue
+        fields = line.split(",")
+        if len(fields) < _FR_MIN_FIELDS:
+            continue
+        try:
+            price = float(fields[_FR_IDX_PRICE].strip() or 0)
+        except (ValueError, TypeError):
+            price = 0.0
+        try:
+            qty = int(float(fields[_FR_IDX_QTY].strip() or 0))
+        except (ValueError, TypeError):
+            qty = 0
+        results.append(FulfillReportRow(
+            seq_no=fields[_FR_IDX_SEQ].strip(),
+            side=fields[_FR_IDX_SIDE].strip(),
+            price=price,
+            qty=qty,
+            new_close=fields[_FR_IDX_NC].strip(),
+            date=fields[_FR_IDX_DATE].strip(),
+        ))
+    return results
+
+
+def match_fill_in_report(rows: list[FulfillReportRow],
+                         target_seq: str) -> int:
+    """Find the fill price for a specific order seq no.
+
+    Returns the integer fill price, or 0 if not found / bad data.
+    Rejects rows where qty != 1 (aggregated rows from wrong format).
+    """
+    for row in rows:
+        if row.seq_no != target_seq:
+            continue
+        if row.qty != 1:
+            continue
+        if row.price <= 0:
+            continue
+        return int(round(row.price))
+    return 0

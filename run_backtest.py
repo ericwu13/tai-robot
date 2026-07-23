@@ -111,7 +111,9 @@ from src.live.account_monitor import (
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.fill_poller import FillPoller
-from src.live.fill_report import RealFillTracker
+from src.live.fill_report import (
+    RealFillTracker, parse_fulfill_report, match_fill_in_report,
+)
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
 from src.market_data.kline_config import (
@@ -1285,6 +1287,9 @@ class BacktestApp:
         # Seq no of the exit whose Discord notice went out with the
         # estimated price — a late OnNewData fill triggers a correction.
         self._est_notified_exit_seq: str = ""
+        # Backoff retry state for exit fill price polling (issue #92).
+        self._exit_fill_retry_timer: int | None = None
+        self._exit_fill_retry_ctx: dict | None = None
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -7177,10 +7182,10 @@ class BacktestApp:
         # ENTRY: OnNewData deal row if already arrived, else OpenInterest
         # avg_cost (identical for a 1-lot position).
         # EXIT: OnNewData deal row recorded on trades[-1].real_exit_price
-        # (issue #92 — GetFulfillReport(4) merges fills by commodity into a
-        # day-average price and must NOT be used). If the reply channel is
-        # slow, retry once after 2.5s, then fall back to simulated with an
-        # "(est.)" label; a late OnNewData fill sends a Discord correction.
+        # (issue #92). If OnNewData is slow, a backoff retry chain polls
+        # GetFulfillReport(1) (per-fill detail, matched by seq no) up to
+        # ~60s; after exhaustion the sim price goes out with "(est.)" and
+        # a late OnNewData/poll sends a Discord correction.
         fill_price = ""
         _exit_fill_deferred = False
         pos = self._fill_poller.pos_current
@@ -7247,13 +7252,9 @@ class BacktestApp:
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
         if _discord and _discord.enabled:
             if _exit_fill_deferred:
-                sim_px = fill_price
-                strat = self._active_strategy_name()
-                action = result.action_type
-                self.root.after(
-                    2500,
-                    lambda: self._retry_exit_fill_notification(
-                        action, sim_px, strat))
+                self._start_exit_fill_retry(
+                    result.action_type, fill_price,
+                    self._active_strategy_name())
             else:
                 _discord.fill_confirmed(result.action_type, fill_price,
                                         strategy=self._active_strategy_name())
@@ -7290,29 +7291,128 @@ class BacktestApp:
             return 0
         return getattr(broker.trades[-1], "real_exit_price", 0)
 
-    def _retry_exit_fill_notification(self, action_type: str,
-                                      fallback_price: str,
-                                      strategy: str) -> None:
-        """Re-check for the OnNewData fill once, then notify Discord.
+    # ── Exit fill price retry with backoff (issue #92) ──
+    #
+    # OnNewData is the primary source but can be slow. GetFulfillReport(1)
+    # (per-fill detail, NOT format 4 which merges by commodity) is polled
+    # as a backup — the seq no from SendFutureOrderCLR identifies our fill
+    # among all fills on the account.
 
-        The deal report normally lands within ~1s of the fill; this retry
-        covers a slow reply channel. If the price is still missing the
-        estimated price goes out labeled "(est.)" and _on_new_data sends a
-        correction when the real fill finally arrives.
-        """
+    _EXIT_FILL_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000]
+
+    def _start_exit_fill_retry(self, action_type: str,
+                               fallback_price: str,
+                               strategy: str) -> None:
+        """Begin the backoff retry chain for exit fill price."""
+        self._exit_fill_retry_ctx = {
+            "action_type": action_type,
+            "fallback_price": fallback_price,
+            "strategy": strategy,
+            "attempt": 0,
+        }
+        delay = self._EXIT_FILL_RETRY_DELAYS_MS[0]
+        _log(f"EXIT FILL RETRY START: seq={self._last_exit_order_seq} "
+             f"schedule={self._EXIT_FILL_RETRY_DELAYS_MS}ms")
+        self._exit_fill_retry_timer = self.root.after(
+            delay, self._poll_exit_fill_step)
+
+    def _poll_exit_fill_step(self) -> None:
+        """One step of the exit fill price retry chain."""
+        self._exit_fill_retry_timer = None
+        ctx = self._exit_fill_retry_ctx
+        if ctx is None:
+            return
+        attempt = ctx["attempt"]
+        ctx["attempt"] = attempt + 1
+        seq = self._last_exit_order_seq
+
         real_px = self._real_exit_price_from_broker()
-        estimated = False
+        source = "OnNewData"
+        if not real_px:
+            real_px = self._poll_exit_fill_via_report(seq)
+            source = "GetFulfillReport(1)"
+
+        _log(f"EXIT FILL RETRY #{attempt}: real_px={real_px} source={source} "
+             f"seq={seq}")
+
         if real_px:
-            fill_price = str(real_px)
-        else:
-            fill_price = fallback_price
-            estimated = bool(fill_price)
-            self._est_notified_exit_seq = self._last_exit_order_seq
-        _log(f"EXIT FILL RETRY: real_px={real_px} fill_price={fill_price!r} "
-             f"estimated={estimated}")
+            self._exit_fill_retry_ctx = None
+            _log(f"EXIT FILL RETRY RESOLVED: price={real_px} via {source}")
+            if _discord and _discord.enabled:
+                _discord.fill_confirmed(
+                    ctx["action_type"], str(real_px),
+                    strategy=ctx["strategy"])
+            return
+
+        next_idx = attempt + 1
+        if next_idx < len(self._EXIT_FILL_RETRY_DELAYS_MS):
+            delay = self._EXIT_FILL_RETRY_DELAYS_MS[next_idx]
+            _log(f"EXIT FILL RETRY: scheduling attempt #{next_idx} in {delay}ms")
+            self._exit_fill_retry_timer = self.root.after(
+                delay, self._poll_exit_fill_step)
+            return
+
+        self._exit_fill_retry_ctx = None
+        fill_price = ctx["fallback_price"]
+        estimated = bool(fill_price)
+        if estimated:
+            self._est_notified_exit_seq = seq
+        _log(f"EXIT FILL RETRY EXHAUSTED after {len(self._EXIT_FILL_RETRY_DELAYS_MS)} "
+             f"attempts (~61s). Sending estimated={estimated} "
+             f"fill_price={fill_price!r} seq={seq}")
         if _discord and _discord.enabled:
-            _discord.fill_confirmed(action_type, fill_price,
-                                    strategy=strategy, estimated=estimated)
+            _discord.fill_confirmed(
+                ctx["action_type"], fill_price,
+                strategy=ctx["strategy"], estimated=estimated)
+
+    def _poll_exit_fill_via_report(self, target_seq: str) -> int:
+        """Poll GetFulfillReport(1) for the exit fill price by seq no.
+
+        Format 1 = per-fill detail (each fill is a separate row).
+        Returns the integer fill price if matched, 0 if not found.
+        """
+        if not target_seq or not _com_available or skO is None:
+            return 0
+        try:
+            user_id = self.login_user_var.get().strip()
+            fills_raw = skO.GetFulfillReport(
+                user_id, self._futures_account, 1)
+        except Exception as exc:
+            _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
+            return 0
+
+        if isinstance(fills_raw, (tuple, list)):
+            fills_raw = fills_raw[0] if fills_raw else ""
+        if not fills_raw or not isinstance(fills_raw, str):
+            _log("EXIT FILL POLL: GetFulfillReport(1) returned empty")
+            return 0
+
+        rows = parse_fulfill_report(fills_raw)
+        _log(f"EXIT FILL POLL: {len(rows)} rows, target_seq={target_seq}")
+        for i, row in enumerate(rows):
+            if i < 5 or row.seq_no == target_seq:
+                _log(f"EXIT FILL POLL row[{i}]: seq={row.seq_no} "
+                     f"side={row.side} nc={row.new_close} qty={row.qty} "
+                     f"price={row.price} match={row.seq_no == target_seq}")
+
+        price = match_fill_in_report(rows, target_seq)
+        if not price:
+            _log(f"EXIT FILL POLL: target_seq={target_seq} not matched")
+            return 0
+
+        broker = self._live_runner.broker if self._live_runner else None
+        if broker:
+            last = broker.trades[-1] if broker.trades else None
+            if last and last.real_exit_price == 0:
+                fill_dt = _taipei_now().replace(tzinfo=None
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                accepted = broker.try_set_real_exit_price(
+                    price,
+                    exit_bar_index=getattr(last, "exit_bar_index", -1),
+                    fill_dt=fill_dt)
+                _log(f"EXIT FILL POLL: wrote real_exit_price={price} "
+                     f"accepted={accepted}")
+        return price
 
     def _on_new_data(self, raw: str) -> None:
         """SKReplyLib.OnNewData — real-time per-order report (issue #92).
@@ -7475,8 +7575,8 @@ class BacktestApp:
             # parser rendered every row as "x0 @" (no price/qty), and
             # OnNewData now logs each order event with raw data anyway.
             try:
-                fills_raw = skO.GetFulfillReport(user_id, self._futures_account, 4)
-                self._parse_and_display_fills(fills_raw, "成交(同商品)")
+                fills_raw = skO.GetFulfillReport(user_id, self._futures_account, 1)
+                self._parse_and_display_fills(fills_raw, "成交(逐筆)")
             except Exception as e:
                 _log(f"成交查詢失敗 Fills query error: {e}")
         except Exception as e:
@@ -7549,10 +7649,8 @@ class BacktestApp:
         if self._live_runner and result.new_entries:
             for fill in result.new_entries:
                 self._live_log_msg(f"實{label}: {fill}", "entry")
-            # NOTE: these rows are DISPLAY-ONLY. GetFulfillReport(4) merges
-            # fills by commodity — the price is a day-cumulative average,
-            # not a fill price (issue #92). Real fill prices come from
-            # OnNewData deal rows via _on_new_data.
+            # NOTE: display rows only — real fill prices come from
+            # OnNewData deal rows via _on_new_data (issue #92).
 
     def _log_order_decision(self, action: str, reason: str) -> None:
         """Log a real-order event to the CSV decision log."""
