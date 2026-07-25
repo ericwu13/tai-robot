@@ -6549,8 +6549,14 @@ class BacktestApp:
         if _discord is not None and _discord.enabled:
             try:
                 _discord.daily_report(report)
-            except Exception:
-                pass  # best-effort; never block on notification failure
+            except Exception as e:
+                _log(f"Discord daily_report() failed: [{type(e).__name__}] {e}")
+
+        if _discord is None:
+            _log("Discord daily report skipped: notifier not initialized")
+        elif not _discord.enabled:
+            _log("Discord daily report skipped: notifier disabled "
+                 "(missing token or channel_id)")
 
         # Evolution: fitness scoring + improvement notification.
         try:
