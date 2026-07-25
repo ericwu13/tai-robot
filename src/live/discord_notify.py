@@ -6,10 +6,14 @@ All sends run in a background thread to avoid blocking the main/Tkinter thread.
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 from version import APP_VERSION
+
+logger = logging.getLogger(__name__)
 
 _TPE = timezone(timedelta(hours=8))
 _API_BASE = "https://discord.com/api/v10"
@@ -46,6 +50,11 @@ class DiscordNotifier:
             regime_channel_id.strip() if regime_channel_id else "")
         self._bot_name = bot_name
         self._symbol = symbol
+        if self._token and self._channel_id:
+            if not self._evolution_channel_id:
+                logger.warning(
+                    "discord_evolution_channel_id is empty — evolution "
+                    "notifications will use the main channel")
 
     @property
     def enabled(self) -> bool:
@@ -61,6 +70,9 @@ class DiscordNotifier:
         ``channel_id`` optionally overrides the default channel (used to
         route evolution logs / daily reports to their own channels). Empty
         → the main channel.
+
+        Retries up to 3 times with exponential backoff (1s, 2s, 4s) on
+        HTTP 429 (rate-limited). Logs a warning if all retries exhaust.
         """
         if not self.enabled:
             return
@@ -76,10 +88,26 @@ class DiscordNotifier:
                     "Authorization": f"Bot {self._token}",
                     "Content-Type": "application/json",
                 }
-                httpx.post(url, json={"content": content},
-                           headers=headers, timeout=10)
+                delay = 1.0
+                for attempt in range(3):
+                    resp = httpx.post(url, json={"content": content},
+                                     headers=headers, timeout=10)
+                    if resp.status_code != 429:
+                        if resp.status_code >= 400:
+                            logger.error(
+                                "Discord send failed: HTTP %d → %s "
+                                "(channel=%s)",
+                                resp.status_code, resp.text[:300], target,
+                            )
+                        return
+                    time.sleep(delay)
+                    delay *= 2
+                logger.warning(
+                    "Discord send failed after 3 retries (429 rate-limited), "
+                    "channel=%s", target,
+                )
             except Exception:
-                pass  # best effort — don't crash the bot for notifications
+                logger.exception("Discord send error (channel=%s)", target)
 
         threading.Thread(target=_post, daemon=True).start()
 
@@ -182,6 +210,16 @@ class DiscordNotifier:
             f"🔄 **多空切換 Regime Switching** 已啟用 Enabled\n"
             f"做多 Long: {long_strategy} | 做空 Short: {short_strategy}\n"
             f"模式: {mode}"
+        )
+
+    def regime_idle_warning(self) -> None:
+        """Warn that signals are suppressed while awaiting regime classification."""
+        self._send(
+            f"{self._header()}\n"
+            f"⚠️ **策略訊號暫停 Signals Suppressed**\n"
+            f"Bot 處於 regime-idle 狀態，等待市場分類結果。"
+            f"在套用 regime 前不會進行任何交易。\n"
+            f"Awaiting regime classification — no trades until regime is applied."
         )
 
     def bot_stopped(self, trades: int, pnl: int) -> None:

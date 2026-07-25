@@ -383,7 +383,7 @@ class RegimeSwitchingRunner(LiveRunner):
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "bar_index": self._bar_index,
                 "broker": self.broker.to_dict(),
-                "last_report_date": self._last_report_date,
+                "last_report_key": self._last_report_key,
                 "regime_mode": True,
                 "active_leg": self._active_leg,
                 "long_strategy": self._long_strategy_name,
@@ -398,8 +398,8 @@ class RegimeSwitchingRunner(LiveRunner):
     def _generate_daily_report(self) -> None:
         """Inject regime status into the daily report.
 
-        Dedup is handled by the base class (date-string guard persisted
-        in session.json). We override only to inject the regime_switching
+        Dedup is handled by the ``{date}_{session}`` key (persisted in
+        session.json). We override only to inject the regime_switching
         block and to intercept the emit so it includes the extra data.
         """
         try:
@@ -417,9 +417,11 @@ class RegimeSwitchingRunner(LiveRunner):
             if report is None:
                 return
             report_date = report.get("date", "")
-            if report_date and report_date == self._last_report_date:
+            _, session_type = self._session_key()
+            report_key = f"{report_date}_{session_type}" if report_date else ""
+            if report_key and report_key == self._last_report_key:
                 return
-            self._last_report_date = report_date
+            self._last_report_key = report_key
             report["regime_switching"] = {
                 "active_leg": self._active_leg,
                 "long_strategy": self._long_strategy_name,

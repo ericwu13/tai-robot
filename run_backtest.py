@@ -5539,6 +5539,9 @@ class BacktestApp:
                     version=APP_VERSION,
                 )
             _log(f"Discord 通知已啟用 Discord notifications enabled")
+            if self._live_runner.regime_idle:
+                _discord.regime_idle_warning()
+                _log("REGIME IDLE: signals suppressed — awaiting classification")
 
         # Route regime announcements through Discord (regime channel)
         if self._regime_manager is not None:

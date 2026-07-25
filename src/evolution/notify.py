@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
 
+import logging
+
 from .fitness import (
     FitnessResult,
     SOURCE_BACKTEST,
@@ -37,6 +39,8 @@ from .fitness import (
     SOURCE_REAL,
     compute_fitness_from_trades,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
@@ -386,7 +390,5 @@ def check_and_notify_after_report(
             try:
                 send_notification(verdict)
             except Exception:
-                # Notification path is best-effort — never crash the
-                # daily-report pipeline because Discord hiccuped.
-                pass
+                logger.exception("Evolution Discord notification failed")
     return verdict

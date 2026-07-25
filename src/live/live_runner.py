@@ -419,10 +419,11 @@ class LiveRunner:
         # from suppress_strategy (cleared on every reconnect replay).
         self.regime_idle: bool = False
 
-        # Daily-report dedupe key: the report DATE string (e.g.
-        # "2026-07-21") of the last emitted report. Persisted in
-        # session.json so a restart can't re-send the same day's report.
-        self._last_report_date: str | None = None
+        # Daily-report dedupe key: "{date}_{session}" (e.g.
+        # "2026-07-21_DAY") of the last emitted report. Persisted in
+        # session.json so a restart can't re-send the same session's report.
+        # Keyed by session so DAY+NIGHT bots fire separate reports.
+        self._last_report_key: str | None = None
 
     # ── Lock file ──
 
@@ -1427,7 +1428,7 @@ class LiveRunner:
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "bar_index": self._bar_index,
                 "broker": self.broker.to_dict(),
-                "last_report_date": self._last_report_date,
+                "last_report_key": self._last_report_key,
             }
             save_session(self._session_path, data)
         except Exception:
@@ -1445,9 +1446,10 @@ class LiveRunner:
     def _generate_daily_report(self) -> None:
         """Generate a daily report after session stop (best-effort).
 
-        Debounced by the report date string (persisted in session.json)
+        Debounced by ``{date}_{session}`` key (persisted in session.json)
         so that neither the 30s session-end poll nor a manual stop can
-        re-send the same day's report.
+        re-send the same session's report. DAY and NIGHT sessions on the
+        same calendar date produce separate reports.
         """
         try:
             from ..daily_report.report_generator import generate_session_report
@@ -1464,9 +1466,11 @@ class LiveRunner:
             if report is None:
                 return
             report_date = report.get("date", "")
-            if report_date and report_date == self._last_report_date:
+            _, session_type = self._session_key()
+            report_key = f"{report_date}_{session_type}" if report_date else ""
+            if report_key and report_key == self._last_report_key:
                 return
-            self._last_report_date = report_date
+            self._last_report_key = report_key
             self._auto_save_session()
             self._emit("on_daily_report", report)
         except Exception:
@@ -1491,7 +1495,10 @@ class LiveRunner:
         self.broker.trade_source = _mode_to_source(self.trading_mode)
         self._bar_index = session_data.get("bar_index", 0)
         self._started_at = session_data.get("started_at", self._started_at)
-        self._last_report_date = session_data.get("last_report_date")
+        self._last_report_key = (
+            session_data.get("last_report_key")
+            or session_data.get("last_report_date")
+        )
         return len(self.broker.trades)
 
     # Emit a progress tick every N bars during reload so the GUI can keep
@@ -1507,16 +1514,14 @@ class LiveRunner:
         Populates the 1-min bar cache for multi-TF charting and prevents
         duplicate processing when tick history replays the same data.
 
-        For 1-min NATIVE strategies, also merges the new CSV bars into
-        _aggregated_bars and rebuilds data_store in sorted order so the
-        live chart and strategy see a continuous bar history. Without
-        this merge the live chart (which draws from _aggregated_bars)
-        showed a visible gap between the warmup end and the first live
-        bar — the COM warmup API does not return bars for the currently
-        in-progress trading session, and the historical tick-replay
-        that happens during tick subscription rebuilds those missing
-        bars but then drops them via the _seen_1m_dts dedup before they
-        can reach _aggregated_bars (issue #45).
+        Also merges the CSV bars into _aggregated_bars and rebuilds
+        data_store so the strategy sees continuous bar history. For 1-min
+        strategies the CSV bars are used directly; for higher timeframes
+        (H1, H4, etc.) the 1-min bars are re-aggregated into the target
+        interval first (issue #96). Without this, redeploying a bot
+        during the pre-open window left the just-ended session's bars
+        missing from DataStore — the dedup set swallowed the tick-replay
+        bars and indicators computed from insufficient history.
 
         ``progress_cb`` (issue #79): optional ``(done, total) -> None`` hook
         invoked every ``_RELOAD_PROGRESS_EVERY`` bars during the two heavy
@@ -1579,49 +1584,48 @@ class LiveRunner:
             except OSError:
                 continue
 
-        # For 1-min native strategies, the CSV bars ARE target-timeframe
-        # bars. Merge them into _aggregated_bars and rebuild data_store
-        # in sorted order so the live chart and strategy indicators see
-        # a continuous history without the gap between warmup end and
-        # live feed start (issue #45). Non-1-min strategies handle
-        # multi-TF charting via _1m_bars re-aggregation in
-        # get_bars_at_interval(), so their _aggregated_bars is left
-        # untouched here.
-        if self.target_interval == 60 and new_bars:
-            merged = sorted(
-                list(self._aggregated_bars) + new_bars,
-                key=lambda b: b.dt,
-            )
-            self._aggregated_bars[:] = merged
-            # Rebuild data_store in sorted order. The deque maxlen caps
-            # older history automatically so memory stays bounded.
+        # Merge CSV bars into _aggregated_bars and rebuild data_store so
+        # the strategy sees continuous bar history (issue #45, #96).
+        # For 1-min strategies the CSV bars ARE target-TF bars; for
+        # higher timeframes, re-aggregate the 1-min bars first.
+        if new_bars:
             from ..market_data.data_store import DataStore
-            maxlen = self.data_store._bars.maxlen or 5000
-            new_store = DataStore(max_bars=maxlen)
-            total = len(merged)
-            for i, b in enumerate(merged, 1):
-                new_store.add_bar(b)
-                if i % self._RELOAD_PROGRESS_EVERY == 0:
-                    _tick(i, total)
-            self.data_store = new_store
-            # MTF: rebuild HTF state by re-feeding primary bars through
-            # fresh aggregators so backtest/live parity holds across
-            # session resume.
-            if self._htf_intervals:
-                for iv in self._htf_intervals:
-                    new_store._register_htf(iv)
-                self._htf_aggregators = {
-                    iv: BarAggregator(self.symbol, iv)
-                    for iv in self._htf_intervals
-                }
+
+            if self.target_interval == 60:
+                bars_to_merge = new_bars
+            else:
+                all_1m = sorted(self._1m_bars, key=lambda b: b.dt)
+                bars_to_merge = aggregate_bars(all_1m, self.target_interval)
+                # Remove bars already present in _aggregated_bars
+                existing_dts = {b.dt for b in self._aggregated_bars}
+                bars_to_merge = [b for b in bars_to_merge if b.dt not in existing_dts]
+
+            if bars_to_merge:
+                merged = sorted(
+                    list(self._aggregated_bars) + bars_to_merge,
+                    key=lambda b: b.dt,
+                )
+                self._aggregated_bars[:] = merged
+                maxlen = self.data_store._bars.maxlen or 5000
+                new_store = DataStore(max_bars=maxlen)
+                total = len(merged)
                 for i, b in enumerate(merged, 1):
-                    self._feed_htf(b)
+                    new_store.add_bar(b)
                     if i % self._RELOAD_PROGRESS_EVERY == 0:
                         _tick(i, total)
-            # CSV-loaded bars are historical, not live — bump
-            # _warmup_bar_count so get_live_bars() continues to slice
-            # off the correct prefix.
-            self._warmup_bar_count = len(self._aggregated_bars)
+                self.data_store = new_store
+                if self._htf_intervals:
+                    for iv in self._htf_intervals:
+                        new_store._register_htf(iv)
+                    self._htf_aggregators = {
+                        iv: BarAggregator(self.symbol, iv)
+                        for iv in self._htf_intervals
+                    }
+                    for i, b in enumerate(merged, 1):
+                        self._feed_htf(b)
+                        if i % self._RELOAD_PROGRESS_EVERY == 0:
+                            _tick(i, total)
+                self._warmup_bar_count = len(self._aggregated_bars)
 
         return len(new_bars)
 

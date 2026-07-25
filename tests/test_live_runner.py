@@ -1039,20 +1039,20 @@ class TestReload1mBarsIssue45:
         # _1m_bars also has no duplicates
         assert len(runner._1m_bars) == 5
 
-    def test_reload_unchanged_for_h4(self, tmp_path):
-        """H4 strategies: reload must NOT touch _aggregated_bars.
+    def test_reload_merges_reaggregated_bars_for_h4(self, tmp_path):
+        """H4 strategies: CSV 1-min bars must be re-aggregated into H4 and
+        merged into _aggregated_bars (issue #96).
 
-        For non-1-min strategies, multi-TF charting goes through
-        get_bars_at_interval() which re-aggregates _1m_bars on demand.
-        _aggregated_bars is the strategy's native-TF (H4) bars and must
-        not be contaminated by 1-min CSV reloads.
+        Before the fix, _aggregated_bars was left untouched for non-1-min
+        strategies, leaving a hole in DataStore when warmup excluded the
+        just-ended session.
         """
         strategy = NeverTradeStrategy()  # kline_minute=240 (H4)
         runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
 
         warmup = [_kline(f"2026-02-{d:02d} 09:00") for d in range(20, 25)]
         runner.feed_warmup_bars(warmup)
-        agg_before = list(runner.get_bars())
+        agg_before_count = len(runner.get_bars())
 
         # Write a 1-min CSV (different timeframe from the H4 strategy)
         csv_path = os.path.join(runner.bot_dir, "bars_1m_20260301.csv")
@@ -1065,9 +1065,9 @@ class TestReload1mBarsIssue45:
         count = runner.reload_1m_bars()
 
         assert count == 5
-        # _aggregated_bars unchanged (still H4 warmup bars only)
-        assert runner.get_bars() == agg_before
-        # But _1m_bars has the CSV bars so H1/H4 re-aggregation works
+        # _aggregated_bars now includes the re-aggregated H4 bar
+        assert len(runner.get_bars()) == agg_before_count + 1
+        # _1m_bars has the CSV bars for charting re-aggregation
         assert len(runner._1m_bars) == 5
 
     def test_reload_preserves_sorted_order_with_older_csv(self, tmp_path):
@@ -1200,6 +1200,187 @@ class TestReload1mBarsProgressIssue79:
             raise RuntimeError("UI callback blew up")
 
         assert runner.reload_1m_bars(progress_cb=_boom) == 600
+
+
+# ── Regression: issue #96 — H1 reload fills DataStore gap ──
+
+class TestReload1mBarsIssue96:
+    """Pre-open redeploy with saved CSV must fill DataStore for ALL timeframes.
+
+    Before the fix, ``reload_1m_bars`` only merged bars into
+    ``_aggregated_bars`` / DataStore for 1-min strategies. For H1/H4
+    strategies the just-ended night session's bars were missing from
+    DataStore after reload — the dedup set swallowed tick-replay bars
+    and indicators computed from insufficient history, producing zero
+    signals.
+    """
+
+    @staticmethod
+    def _write_bars_csv(path: str, bars: list[Bar]) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("datetime,open,high,low,close,volume\n")
+            for b in bars:
+                f.write(
+                    f"{b.dt.strftime('%Y/%m/%d %H:%M')},"
+                    f"{b.open},{b.high},{b.low},{b.close},{b.volume}\n"
+                )
+
+    @staticmethod
+    def _make_1m_bar(dt: datetime, c: int = 22500) -> Bar:
+        return Bar(
+            symbol="TX00", dt=dt,
+            open=c, high=c + 10, low=c - 10, close=c,
+            volume=10, interval=60,
+        )
+
+    def _make_h1_runner(self, tmp_path):
+        """Create an H1 LiveRunner (kline_minute=60)."""
+        strategy = NeverTradeStrategy()
+        strategy.kline_minute = 60
+        runner = LiveRunner(strategy, "TX00", log_dir=str(tmp_path))
+        runner.target_interval = 3600
+        runner.aggregator = BarAggregator("TX00", 3600)
+        return runner
+
+    def test_h1_reload_fills_datastore_from_csv(self, tmp_path):
+        """H1 strategy: CSV 1-min bars must be re-aggregated and merged
+        into _aggregated_bars and DataStore (issue #96).
+
+        Reproduces the actual scenario: bot redeployed at ~08:00 on
+        Jul 24. Warmup returns bars up to Jul 23 AM close. CSV has the
+        night session bars (Jul 23 15:00 – Jul 24 05:00). Without the
+        fix, these H1 bars were missing from DataStore.
+        """
+        runner = self._make_h1_runner(tmp_path)
+
+        # Warmup: 10 H1 bars covering previous sessions
+        warmup = [
+            _kline(f"2026-07-{d:02d} {h:02d}:00", 22500 + d * 10)
+            for d in range(21, 24) for h in [9, 10, 11]
+        ]
+        # Only take first 10 for a clean warmup
+        warmup = warmup[:10]
+        runner.feed_warmup_bars(warmup)
+        agg_count_after_warmup = len(runner.get_bars())
+        store_count_after_warmup = len(runner.data_store.get_bars())
+
+        # Write CSV with night session bars (Jul 23 15:00–19:59 = 5 hours
+        # of 1-min bars, which should re-aggregate into 5 H1 bars)
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260723.csv")
+        night_bars = []
+        for h in range(15, 20):
+            for m in range(60):
+                dt = datetime(2026, 7, 23, h, m)
+                night_bars.append(self._make_1m_bar(dt, c=22600 + h * 10 + m))
+        self._write_bars_csv(csv_path, night_bars)
+
+        count = runner.reload_1m_bars()
+
+        assert count == len(night_bars)
+        # H1 bars from the night session should now be in _aggregated_bars
+        agg_bars = runner.get_bars()
+        assert len(agg_bars) > agg_count_after_warmup
+        # DataStore also received the re-aggregated bars
+        store_bars = runner.data_store.get_bars()
+        assert len(store_bars) > store_count_after_warmup
+        # Night H1 bars should start at 15:00
+        new_h1_bars = agg_bars[agg_count_after_warmup:]
+        assert new_h1_bars[0].dt == datetime(2026, 7, 23, 15, 0)
+        # Each new bar should be H1 interval
+        assert all(b.interval == 3600 for b in new_h1_bars)
+
+    def test_h1_reload_dedupes_overlap_with_warmup(self, tmp_path):
+        """H1 reload must not duplicate bars already present from warmup."""
+        runner = self._make_h1_runner(tmp_path)
+
+        # Warmup includes an H1 bar at 09:00
+        warmup = [_kline("2026-07-23 09:00", 22500)]
+        runner.feed_warmup_bars(warmup)
+        assert len(runner.get_bars()) == 1
+
+        # CSV also covers 09:00–09:59 (same H1 window) plus 10:00–10:59
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260723.csv")
+        csv_bars = [
+            self._make_1m_bar(datetime(2026, 7, 23, h, m), c=22500 + h * 10)
+            for h in [9, 10] for m in range(60)
+        ]
+        self._write_bars_csv(csv_path, csv_bars)
+
+        runner.reload_1m_bars()
+
+        agg_bars = runner.get_bars()
+        # 09:00 bar from warmup + 10:00 bar from CSV = 2 (no duplicate 09:00)
+        h1_dts = [b.dt for b in agg_bars]
+        assert len(h1_dts) == len(set(h1_dts)), "duplicate H1 bars after reload"
+
+    def test_jimmy_jul24_redeploy_scenario(self, tmp_path):
+        """Reproduce jimmy8399's exact Jul 24 scenario.
+
+        Bot redeployed at ~08:00. Warmup returns AM bars up to Jul 23
+        13:44. Night session CSV (Jul 23 15:00 – Jul 24 04:59) exists
+        on disk. After reload, H1 DataStore must include the night
+        session bars so the strategy has enough history to compute
+        indicators and fire signals.
+        """
+        runner = self._make_h1_runner(tmp_path)
+
+        # Warmup: AM session bars from prior days (Jul 21-23, 08:45-13:44)
+        warmup_bars = []
+        for d in range(21, 24):
+            for h in [8, 9, 10, 11, 12, 13]:
+                if h == 8:
+                    warmup_bars.append(
+                        _kline(f"2026-07-{d:02d} 08:45", 22500 + d * 10))
+                else:
+                    warmup_bars.append(
+                        _kline(f"2026-07-{d:02d} {h:02d}:00", 22500 + d * 10 + h))
+        runner.feed_warmup_bars(warmup_bars)
+        warmup_count = len(runner.get_bars())
+        assert warmup_count > 0
+
+        # Night session CSV: Jul 23 15:00 – Jul 24 04:59 (14 hours = 840 bars)
+        csv_path = os.path.join(runner.bot_dir, "bars_1m_20260724.csv")
+        night_bars = []
+        # Jul 23 15:00-23:59
+        for h in range(15, 24):
+            for m in range(60):
+                night_bars.append(
+                    self._make_1m_bar(datetime(2026, 7, 23, h, m), c=22700 + h))
+        # Jul 24 00:00-04:59
+        for h in range(0, 5):
+            for m in range(60):
+                night_bars.append(
+                    self._make_1m_bar(datetime(2026, 7, 24, h, m), c=22700 + h))
+        self._write_bars_csv(csv_path, night_bars)
+
+        count = runner.reload_1m_bars()
+        assert count == len(night_bars)
+
+        # DataStore must now include night session H1 bars
+        store_bars = runner.data_store.get_bars()
+        store_dts = [b.dt for b in store_bars]
+        # Night session should produce H1 bars at 15:00, 16:00, ..., 04:00
+        assert datetime(2026, 7, 23, 15, 0) in store_dts, \
+            "Night H1 bar at 15:00 missing from DataStore"
+        assert datetime(2026, 7, 24, 4, 0) in store_dts, \
+            "Night H1 bar at 04:00 missing from DataStore"
+        # Total bar count should be warmup + night H1 bars
+        assert len(store_bars) > warmup_count
+        # _warmup_bar_count updated so get_live_bars() returns empty
+        assert runner.get_live_bars() == []
+
+    def test_reload_no_new_bars_leaves_state_unchanged(self, tmp_path):
+        """If CSV has no new bars (all deduped), _aggregated_bars is untouched."""
+        runner = self._make_h1_runner(tmp_path)
+
+        warmup = [_kline("2026-07-23 09:00", 22500)]
+        runner.feed_warmup_bars(warmup)
+        agg_before = list(runner.get_bars())
+
+        # Empty CSV → 0 new bars
+        count = runner.reload_1m_bars()
+        assert count == 0
+        assert runner.get_bars() == agg_before
 
 
 # ── Regression: issue #45 — real_entry_price flow into Trades ──
