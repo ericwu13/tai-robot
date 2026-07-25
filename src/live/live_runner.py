@@ -9,12 +9,15 @@ State machine: IDLE → WARMING_UP → RUNNING → STOPPED
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 from ..market_data.models import Bar
 from ..market_data.data_store import DataStore
@@ -785,7 +788,10 @@ class LiveRunner:
             try:
                 handler(*args)
             except Exception:
-                pass
+                logger.exception(
+                    "Callback error for event %r (handler=%s)",
+                    event, getattr(handler, "__name__", repr(handler)),
+                )
 
     def reset_bar_monotonicity(self) -> None:
         """Reset the out-of-order bar guards on all aggregators (issue #78).
@@ -1474,7 +1480,8 @@ class LiveRunner:
             self._auto_save_session()
             self._emit("on_daily_report", report)
         except Exception:
-            pass  # best-effort; don't crash the bot on report failure
+            logger.exception("Daily report generation failed (bot=%s)",
+                             self.bot_name)
 
     def restore_session(self, session_data: dict) -> int:
         """Restore broker state from a saved session.

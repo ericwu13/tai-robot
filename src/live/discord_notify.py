@@ -79,6 +79,10 @@ class DiscordNotifier:
         target = self._resolve_channel(channel_id)
         if not target:
             return
+        logger.debug(
+            "Discord send attempt: channel=%s, msg_len=%d, bot=%s",
+            target, len(content), self._bot_name,
+        )
 
         def _post():
             try:
@@ -96,18 +100,22 @@ class DiscordNotifier:
                         if resp.status_code >= 400:
                             logger.error(
                                 "Discord send failed: HTTP %d → %s "
-                                "(channel=%s)",
-                                resp.status_code, resp.text[:300], target,
+                                "(channel=%s, bot=%s)",
+                                resp.status_code, resp.text[:500], target,
+                                self._bot_name,
                             )
                         return
                     time.sleep(delay)
                     delay *= 2
                 logger.warning(
                     "Discord send failed after 3 retries (429 rate-limited), "
-                    "channel=%s", target,
+                    "channel=%s, bot=%s", target, self._bot_name,
                 )
             except Exception:
-                logger.exception("Discord send error (channel=%s)", target)
+                logger.exception(
+                    "Discord send error (channel=%s, bot=%s)",
+                    target, self._bot_name,
+                )
 
         threading.Thread(target=_post, daemon=True).start()
 

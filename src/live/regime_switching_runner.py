@@ -431,7 +431,8 @@ class RegimeSwitchingRunner(LiveRunner):
             self._auto_save_session()
             self._emit("on_daily_report", report)
         except Exception:
-            pass
+            logger.exception("Regime daily report generation failed (bot=%s)",
+                             self.bot_name)
 
     # ── Stop (override) ──
 
