@@ -5506,6 +5506,16 @@ class BacktestApp:
                 regime_logger.addHandler(handler)
                 regime_logger.setLevel(logging.DEBUG)
 
+        # Route Discord and LiveRunner logging into the app's _log()
+        for logger_name in ("src.live.discord_notify", "src.live.live_runner",
+                            "src.live.regime_switching_runner"):
+            mod_logger = logging.getLogger(logger_name)
+            if not any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
+                h = _AppLogHandler()
+                h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+                mod_logger.addHandler(h)
+                mod_logger.setLevel(logging.DEBUG)
+
         # Initialize Discord notifications
         global _discord
         from src.live.discord_notify import DiscordNotifier
