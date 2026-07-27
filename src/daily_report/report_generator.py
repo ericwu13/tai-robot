@@ -298,10 +298,10 @@ def generate_session_report(
     # the broker's full trade history (restored from session.json).
     summary = report.get("summary") or {}
     today_pnl = sum(getattr(t, "pnl", 0) or 0 for t in day_trades)
-    summary["today_pnl"] = today_pnl
+    summary["today_pnl"] = int(today_pnl)
     summary["today_trades"] = len(day_trades)
     all_pnls = [getattr(t, "pnl", 0) or 0 for t in trades]
-    summary["total_pnl"] = sum(all_pnls)
+    summary["total_pnl"] = int(sum(all_pnls))
     summary["total_trades"] = len(trades)
     total_wins = sum(1 for p in all_pnls if p > 0)
     summary["win_rate"] = (total_wins / len(trades) * 100) if trades else 0.0

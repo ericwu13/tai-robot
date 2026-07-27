@@ -373,8 +373,8 @@ class DiscordNotifier:
             if eff:
                 lines.append(f"市場 Regime: {_regime_label(eff)}")
         lines.extend([
-            f"今日 Today: {today_pnl:+,} · {today_trades} 筆",
-            f"累計 Cumul: {total_pnl:+,} · {total_trades} 筆 · "
+            f"今日 Today: {int(today_pnl):+,} · {today_trades} 筆",
+            f"累計 Cumul: {int(total_pnl):+,} · {total_trades} 筆 · "
             f"勝率 Win {win_rate:.0f}%",
         ])
         self._send("\n".join(lines), self._daily_report_channel_id)
