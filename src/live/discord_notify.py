@@ -379,6 +379,18 @@ class DiscordNotifier:
         ])
         self._send("\n".join(lines), self._daily_report_channel_id)
 
+    def regime_restored(self, leg: str, strategy_name: str) -> None:
+        """Notify that a previously active regime leg was restored on restart."""
+        _LEG_LABELS = {"long": "做多 LONG", "short": "做空 SHORT"}
+        leg_label = _LEG_LABELS.get(leg, leg)
+        ts = _taipei_now().strftime("%Y-%m-%d %H:%M:%S")
+        self._send(
+            f"✅ **{self._bot_name}** · 已恢復 Regime Restored\n"
+            f"{leg_label}: {strategy_name}\n"
+            f"{ts}",
+            self._regime_channel_id,
+        )
+
     def regime_swap(self, from_leg: str, to_leg: str,
                     strategy_name: str) -> None:
         """Notify a regime strategy swap."""

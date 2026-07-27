@@ -5549,9 +5549,6 @@ class BacktestApp:
                     version=APP_VERSION,
                 )
             _log(f"Discord 通知已啟用 Discord notifications enabled")
-            if self._live_runner.regime_idle:
-                _discord.regime_idle_warning()
-                _log("REGIME IDLE: signals suppressed — awaiting classification")
 
         # Route regime announcements through Discord (regime channel)
         if self._regime_manager is not None:
@@ -5562,7 +5559,6 @@ class BacktestApp:
             self._live_runner.on_regime_swap_cb = lambda f, t, s: (
                 _discord.regime_swap(f, t, s) if _discord is not None and _discord.enabled else None
             )
-        self._update_regime_status()
 
         # Debug: log resolved order symbol and query stock list
         order_sym = resolve_order_symbol(symbol)
@@ -5582,6 +5578,18 @@ class BacktestApp:
         if resume_session:
             n = self._live_runner.restore_session(resume_session)
             self._live_log_msg(f"恢復交易紀錄 Resumed session: {n} trades restored", "status")
+
+            if (hasattr(self._live_runner, '_active_leg')
+                    and self._live_runner._active_leg in ("long", "short")):
+                _leg_zh = {"long": "做多 LONG", "short": "做空 SHORT"}
+                _leg_label = _leg_zh[self._live_runner._active_leg]
+                _strat = self._live_runner.strategy_display_name
+                self._live_log_msg(
+                    f"[RESUME] Active leg restored: {_leg_label} ({_strat})",
+                    "status")
+                if _discord is not None and _discord.enabled:
+                    _discord.regime_restored(
+                        self._live_runner._active_leg, _strat)
 
             # Issue #79: reconcile the safety guard with the restored position.
             # guard.reset() (line above at deploy) cleared real_entry_confirmed
@@ -5630,6 +5638,13 @@ class BacktestApp:
             self.trading_mode_var.set(combo_label)
             self._live_log_msg(
                 f"[RESUME] Trading mode restored: {self._trading_mode}", "status")
+
+        # Regime-idle check — AFTER restore_session so a resumed active leg
+        # is already applied and regime_idle is correctly False.
+        if _discord is not None and _discord.enabled and self._live_runner.regime_idle:
+            _discord.regime_idle_warning()
+            _log("REGIME IDLE: signals suppressed — awaiting classification")
+        self._update_regime_status()
 
         # Register callbacks
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
