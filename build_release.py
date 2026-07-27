@@ -212,7 +212,7 @@ def _load_release_notes() -> str:
     try:
         result = subprocess.run(
             ["gh", "release", "view", f"v{VERSION}", "--json", "body", "-q", ".body"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, encoding="utf-8", timeout=15,
         )
         if result.returncode == 0 and result.stdout.strip():
             return _strip_title(result.stdout.strip())
@@ -276,7 +276,7 @@ def create_github_release(zip_path: str, sha_path: str, sha: str) -> bool:
         cmd += ["--notes", f"Release {tag}"]
         print(f"  No release_notes_v{VERSION}.md — using default notes")
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, encoding="utf-8")
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "already exists" in stderr.lower():
@@ -298,7 +298,7 @@ def verify_github_release_exists() -> bool:
     tag = f"v{VERSION}"
     result = subprocess.run(
         ["gh", "release", "view", tag, "--json", "isDraft"],
-        capture_output=True, text=True,
+        capture_output=True, encoding="utf-8",
     )
     if result.returncode != 0:
         return False
