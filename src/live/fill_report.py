@@ -29,6 +29,9 @@ from dataclasses import dataclass
 # OnNewData comma-field indices (Capital API 2.13.57, futures TF).
 # Source: the SDK's own example, PythonExample/Reply_Service/Reply.py:
 #   [0]  委託序號 KeyNo — 13-digit seq, matches SendFutureOrderCLR's return
+#        *** Type-D (deal/fill) rows have EMPTY field[0]; the seq is at
+#        field[-1] (last field, index 47 in a 48-field row). parse_new_data
+#        falls back to field[-1] when field[0] is empty on D rows. ***
 #   [2]  委託種類 Type — N=new, C=cancel, U=qty chg, P=price chg, D=deal/fill
 #   [3]  委託狀態 OrderErr — "Y" marks an error row
 #   [8]  商品代碼 product
@@ -81,9 +84,13 @@ def parse_new_data(raw) -> NewDataRow | None:
         qty = int(float(fields[_IDX_QTY].strip() or 0))
     except (ValueError, TypeError):
         qty = 0
+    seq = fields[_IDX_SEQ].strip()
+    row_type = fields[_IDX_TYPE].strip()
+    if not seq and row_type == "D":
+        seq = fields[-1].strip()
     return NewDataRow(
-        seq_no=fields[_IDX_SEQ].strip(),
-        row_type=fields[_IDX_TYPE].strip(),
+        seq_no=seq,
+        row_type=row_type,
         order_err=fields[_IDX_ERR].strip(),
         product=fields[_IDX_PRODUCT].strip(),
         book_no=fields[_IDX_BOOK].strip(),
@@ -171,9 +178,12 @@ class RealFillTracker:
 # ── GetFulfillReport(1) per-fill detail parsing ──
 #
 # Format 1 = "全部" — each physical fill is a separate CSV row.
-# Field layout (Capital API 2.13.57, same structure as format 4 but
-# not merged): [0]=seq, [15]=side(B/S), [19]=price, [20]=qty,
-# [21]=N(new)/O(close), [23]=date.
+# BUG (v2.17.7): these indices were assumed identical to format 4 but
+# production logs prove they differ — field[0]="TF" (exchange code, not
+# seq), field[21]="B"/"S" (side, not new/close). A raw-CSV debug log
+# was added in _poll_exit_fill_via_report to capture the actual layout
+# on the next execution.  The indices below remain WRONG for format 1
+# pending that data; the primary fill source (OnNewData) is now fixed.
 
 # Field indices for GetFulfillReport (distinct from OnNewData layout).
 _FR_IDX_SEQ = 0
