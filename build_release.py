@@ -194,19 +194,43 @@ def write_checksum(zip_path: str) -> str:
     return sha_path
 
 
-def _load_release_notes() -> str:
-    """Read release_notes_v{VERSION}.md from the project root, or empty."""
-    project = os.path.dirname(os.path.abspath(__file__)) or "."
-    path = os.path.join(project, f"release_notes_v{VERSION}.md")
-    if not os.path.isfile(path):
-        return ""
-    with open(path, encoding="utf-8") as f:
-        body = f.read().strip()
-    # Strip the leading "# v{VERSION}" title line — redundant with the header.
+def _strip_title(body: str) -> str:
+    """Remove a leading ``# v{VERSION}`` line — redundant with the header."""
     lines = body.splitlines()
     if lines and lines[0].strip().lstrip("#").strip() == f"v{VERSION}":
-        body = "\n".join(lines[1:]).strip()
+        return "\n".join(lines[1:]).strip()
     return body
+
+
+def _load_release_notes() -> str:
+    """Read release notes from the local file, falling back to GitHub.
+
+    Primary: ``release_notes_v{VERSION}.md`` in the project root.
+    Fallback: body of the published GitHub release (``gh release view``).
+    Without the fallback, ``--notify-only`` on a clean checkout (or after
+    the notes file is deleted) sends a Discord message with no changelog.
+    """
+    project = os.path.dirname(os.path.abspath(__file__)) or "."
+    path = os.path.join(project, f"release_notes_v{VERSION}.md")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            body = f.read().strip()
+        return _strip_title(body)
+
+    # Fallback: fetch from the published GitHub release.
+    try:
+        result = subprocess.run(
+            ["gh", "release", "view", f"v{VERSION}", "--json", "body", "-q", ".body"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            print(f"  No local release_notes_v{VERSION}.md — "
+                  f"using notes from GitHub release")
+            return _strip_title(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return ""
 
 
 def verify_head_pushed() -> None:
