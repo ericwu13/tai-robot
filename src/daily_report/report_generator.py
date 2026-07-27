@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from src.backtest.broker import Trade, OrderSide
@@ -17,6 +17,7 @@ from src.backtest.metrics import PerformanceMetrics, calculate_metrics
 from .regime_classifier import classify_regime, RegimeResult
 
 _REPORTS_DIR = Path("data/daily-reports")
+_TPE = timezone(timedelta(hours=8))
 
 
 def _trade_to_dict(t: Trade, point_value: int = 1) -> dict:
@@ -256,9 +257,7 @@ def generate_session_report(
         return None
 
     if not date:
-        # Use the exit date of the last trade, or today
-        last_exit = getattr(trades[-1], "exit_dt", "")
-        date = last_exit[:10] if last_exit else datetime.now().strftime("%Y-%m-%d")
+        date = datetime.now(_TPE).strftime("%Y-%m-%d")
 
     # Extract bar data for regime classification (best-effort)
     bars_highs = bars_lows = bars_closes = None
@@ -275,8 +274,6 @@ def generate_session_report(
         t for t in trades
         if getattr(t, "exit_dt", "")[:10] == date
     ]
-    if not day_trades:
-        day_trades = trades  # fallback: include all trades
 
     report = generate_daily_report(
         date=date,

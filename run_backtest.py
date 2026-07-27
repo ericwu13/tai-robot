@@ -5532,20 +5532,13 @@ class BacktestApp:
                                    evolution_channel_id=evolution_channel_id,
                                    daily_report_channel_id=daily_report_channel_id,
                                    regime_channel_id=regime_channel_id)
+        _deploy_mode_zh = {"paper": "模擬", "semi_auto": "半自動",
+                           "auto": "全自動"}.get(trading_mode, trading_mode)
         if _discord.enabled:
-            mode_zh = {"paper": "模擬", "semi_auto": "半自動",
-                       "auto": "全自動"}.get(trading_mode, trading_mode)
-            if is_regime_deploy:
-                _discord.bot_deployed_regime(
-                    long_strategy=regime_cfg.long_strategy,
-                    short_strategy=regime_cfg.short_strategy,
-                    mode=mode_zh,
-                    version=APP_VERSION,
-                )
-            else:
+            if not is_regime_deploy:
                 _discord.bot_deployed(
                     strategy=self.strategy_var.get(),
-                    mode=mode_zh,
+                    mode=_deploy_mode_zh,
                     version=APP_VERSION,
                 )
             _log(f"Discord 通知已啟用 Discord notifications enabled")
@@ -5587,9 +5580,6 @@ class BacktestApp:
                 self._live_log_msg(
                     f"[RESUME] Active leg restored: {_leg_label} ({_strat})",
                     "status")
-                if _discord is not None and _discord.enabled:
-                    _discord.regime_restored(
-                        self._live_runner._active_leg, _strat)
 
             # Issue #79: reconcile the safety guard with the restored position.
             # guard.reset() (line above at deploy) cleared real_entry_confirmed
@@ -5639,11 +5629,26 @@ class BacktestApp:
             self._live_log_msg(
                 f"[RESUME] Trading mode restored: {self._trading_mode}", "status")
 
-        # Regime-idle check — AFTER restore_session so a resumed active leg
-        # is already applied and regime_idle is correctly False.
-        if _discord is not None and _discord.enabled and self._live_runner.regime_idle:
-            _discord.regime_idle_warning()
-            _log("REGIME IDLE: signals suppressed — awaiting classification")
+        # Regime deploy Discord — AFTER restore_session so the restored leg
+        # can be included in the same message.
+        if is_regime_deploy and _discord is not None and _discord.enabled:
+            _restored_leg = ""
+            _restored_strat = ""
+            if (hasattr(self._live_runner, '_active_leg')
+                    and self._live_runner._active_leg in ("long", "short")):
+                _restored_leg = self._live_runner._active_leg
+                _restored_strat = self._live_runner.strategy_display_name
+            _discord.bot_deployed_regime(
+                long_strategy=regime_cfg.long_strategy,
+                short_strategy=regime_cfg.short_strategy,
+                mode=_deploy_mode_zh,
+                version=APP_VERSION,
+                restored_leg=_restored_leg,
+                restored_strategy=_restored_strat,
+            )
+            if self._live_runner.regime_idle:
+                _discord.regime_idle_warning()
+                _log("REGIME IDLE: signals suppressed — awaiting classification")
         self._update_regime_status()
 
         # Register callbacks

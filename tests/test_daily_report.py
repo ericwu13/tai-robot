@@ -682,6 +682,7 @@ class TestGenerateSessionReport:
             strategy_name="Test Strategy",
             point_value=200,
             symbol="TXF1",
+            date="2026-04-11",
         )
         assert report is not None
         assert report["date"] == "2026-04-11"
@@ -703,6 +704,7 @@ class TestGenerateSessionReport:
             data_store=ds,
             strategy_name="Trend Follower",
             symbol="TXF1",
+            date="2026-04-11",
         )
         assert report is not None
         assert report["market_regime"] is not None
@@ -727,6 +729,7 @@ class TestGenerateSessionReport:
             symbol="TXF1",
             bot_name="tmf00_main",
             started_at="2026-04-11T08:45:00",
+            date="2026-04-11",
         )
         assert report is not None
         assert report["session"]["bot_name"] == "tmf00_main"
@@ -755,7 +758,8 @@ class TestGenerateSessionReport:
         trades = [_make_trade(exit_dt="2026-04-11 10:30")]
         broker = _FakeBroker(trades)
 
-        generate_session_report(broker=broker, data_store=None)
+        generate_session_report(broker=broker, data_store=None,
+                                date="2026-04-11")
         assert (tmp_path / "2026-04-11.json").exists()
 
     def test_data_store_error_handled(self, tmp_path, monkeypatch):
@@ -776,6 +780,7 @@ class TestGenerateSessionReport:
 
         report = generate_session_report(
             broker=broker, data_store=_BrokenDataStore(),
+            date="2026-04-11",
         )
         assert report is not None
         assert report["market_regime"] is None
@@ -800,10 +805,11 @@ class TestGenerateSessionReport:
 
         report = generate_session_report(
             broker=broker, data_store=None, bot_name="mybot", point_value=10,
+            date="2026-04-11",
         )
         summary = report["summary"]
 
-        # Today: 1 trade, pnl = 300
+        # Today (2026-04-11): 1 trade, pnl = 300
         assert summary["today_trades"] == 1
         assert summary["today_pnl"] == 300
 
@@ -843,8 +849,45 @@ class TestGenerateSessionReport:
 
         report = generate_session_report(
             broker=broker, data_store=None, bot_name="mybot",
+            date="2026-04-29",
         )
         summary = report["summary"]
 
         # Cumulative must reflect ALL 20 broker trades, not just the 5 on disk
         assert summary["total_trades"] == 20
+
+    def test_default_date_uses_tpe_timezone(self, tmp_path, monkeypatch):
+        """When no date is provided, defaults to TPE timezone date."""
+        import src.daily_report.report_generator as rg
+        from datetime import datetime, timezone, timedelta
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        tpe_date = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        trades = [_make_trade(pnl=100, exit_dt=f"{tpe_date} 10:30")]
+        broker = _FakeBroker(trades)
+
+        report = generate_session_report(broker=broker, data_store=None)
+        assert report["date"] == tpe_date
+
+    def test_no_trades_today_shows_zero(self, tmp_path, monkeypatch):
+        """When no trades closed today, today stats should be 0, not a
+        fallback to all trades."""
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [
+            _make_trade(pnl=500, exit_dt="2026-04-09 10:30"),
+            _make_trade(pnl=-200, exit_dt="2026-04-10 13:00"),
+        ]
+        broker = _FakeBroker(trades)
+
+        report = generate_session_report(
+            broker=broker, data_store=None, date="2026-04-11",
+        )
+        assert report is not None
+        summary = report["summary"]
+        assert summary["today_trades"] == 0
+        assert summary["today_pnl"] == 0
+        # Cumulative still includes all broker trades
+        assert summary["total_trades"] == 2
+        assert summary["total_pnl"] == 300
