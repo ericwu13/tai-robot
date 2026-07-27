@@ -203,29 +203,18 @@ def _strip_title(body: str) -> str:
 
 
 def _load_release_notes() -> str:
-    """Read release notes from the local file, falling back to GitHub.
+    """Fetch release notes from the published GitHub release.
 
-    Primary: ``release_notes_v{VERSION}.md`` in the project root.
-    Fallback: body of the published GitHub release (``gh release view``).
-    Without the fallback, ``--notify-only`` on a clean checkout (or after
-    the notes file is deleted) sends a Discord message with no changelog.
+    GitHub is the single source of truth — the local
+    ``release_notes_v{VERSION}.md`` file is only used when *creating* the
+    release (``gh release create --notes-file``), never for notification.
     """
-    project = os.path.dirname(os.path.abspath(__file__)) or "."
-    path = os.path.join(project, f"release_notes_v{VERSION}.md")
-    if os.path.isfile(path):
-        with open(path, encoding="utf-8") as f:
-            body = f.read().strip()
-        return _strip_title(body)
-
-    # Fallback: fetch from the published GitHub release.
     try:
         result = subprocess.run(
             ["gh", "release", "view", f"v{VERSION}", "--json", "body", "-q", ".body"],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0 and result.stdout.strip():
-            print(f"  No local release_notes_v{VERSION}.md — "
-                  f"using notes from GitHub release")
             return _strip_title(result.stdout.strip())
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -363,7 +352,7 @@ def notify_release(sha: str, *, force: bool = False) -> None:
         content = f"{role_mention}{header}\n\n{notes}\n\n{release_link}"
     else:
         content = f"{role_mention}{header}\n\n{release_link}"
-        print(f"  No release_notes_v{VERSION}.md found — sending without notes")
+        print(f"  No release notes found on GitHub release v{VERSION} — sending without notes")
 
     import httpx
     url = f"https://discord.com/api/v10/channels/{poster_channel}/messages"
