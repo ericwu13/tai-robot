@@ -295,15 +295,16 @@ def generate_session_report(
 
     # Enrich the summary with today vs cumulative stats for the compact
     # Discord daily report. "today" = day_trades; "total" = cumulative from
-    # all on-disk daily reports for this bot (today's was just saved above).
+    # the broker's full trade history (restored from session.json).
     summary = report.get("summary") or {}
     today_pnl = sum(getattr(t, "pnl", 0) or 0 for t in day_trades)
     summary["today_pnl"] = today_pnl
     summary["today_trades"] = len(day_trades)
-    total_pnl, total_trades, win_rate = _cumulative_from_reports(bot_name)
-    summary["total_pnl"] = total_pnl
-    summary["total_trades"] = total_trades
-    summary["win_rate"] = win_rate
+    all_pnls = [getattr(t, "pnl", 0) or 0 for t in trades]
+    summary["total_pnl"] = sum(all_pnls)
+    summary["total_trades"] = len(trades)
+    total_wins = sum(1 for p in all_pnls if p > 0)
+    summary["win_rate"] = (total_wins / len(trades) * 100) if trades else 0.0
     report["summary"] = summary
 
     return report
