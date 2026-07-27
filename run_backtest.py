@@ -7406,6 +7406,9 @@ class BacktestApp:
             _log("EXIT FILL POLL: GetFulfillReport(1) returned empty")
             return 0
 
+        for j, raw_line in enumerate(fills_raw.split("\n")):
+            if j < 5 and raw_line.strip():
+                _log(f"EXIT FILL POLL raw[{j}]: {raw_line.strip()}")
         rows = parse_fulfill_report(fills_raw)
         _log(f"EXIT FILL POLL: {len(rows)} rows, target_seq={target_seq}")
         for i, row in enumerate(rows):

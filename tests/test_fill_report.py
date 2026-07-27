@@ -19,7 +19,12 @@ from src.live.fill_report import (
 def make_row(seq="2315604562747", typ="D", err="N", product="TM0000",
              book="j0224", price="45081.000000", qty="1",
              date="20260723", time="04:16:01"):
-    """Build a minimal OnNewData bstrData string (26 comma fields)."""
+    """Build a minimal OnNewData bstrData string (26 comma fields).
+
+    For type-N (order accepted), seq is at field[0] — matches real COM
+    behaviour.  For type-D (deal/fill), COM sends empty field[0] with
+    seq at the last field; use ``make_deal_row`` for that case.
+    """
     f = [""] * 26
     f[0] = seq
     f[1] = "TF"
@@ -34,6 +39,28 @@ def make_row(seq="2315604562747", typ="D", err="N", product="TM0000",
     return ",".join(f)
 
 
+def make_deal_row(seq="2315605184242", price="43632.000000", qty="1",
+                  product="TM2608", book="u2967",
+                  date="20260727", time="10:46:00"):
+    """Build a realistic type-D OnNewData row — empty field[0], seq at end.
+
+    This matches the actual COM API behaviour observed in production:
+    type-N rows carry seq at field[0], type-D rows carry it at field[-1].
+    """
+    f = [""] * 48
+    f[1] = "TF"
+    f[2] = "D"
+    f[3] = "N"
+    f[8] = product
+    f[10] = book
+    f[11] = price
+    f[20] = qty
+    f[23] = date
+    f[24] = time
+    f[47] = seq
+    return ",".join(f)
+
+
 # ── parse_new_data ──
 
 def test_parse_deal_row():
@@ -45,6 +72,32 @@ def test_parse_deal_row():
     assert row.price == 45081.0
     assert row.qty == 1
     assert row.is_fill
+
+
+def test_parse_deal_row_empty_field0_seq_at_end():
+    """Type-D rows from COM have empty field[0] and seq at field[-1]."""
+    row = parse_new_data(make_deal_row())
+    assert row is not None
+    assert row.seq_no == "2315605184242"
+    assert row.row_type == "D"
+    assert row.price == 43632.0
+    assert row.qty == 1
+    assert row.is_fill
+
+
+def test_tracker_matches_deal_row_with_empty_field0():
+    """End-to-end: type-N registers seq at field[0], type-D arrives with
+    empty field[0] and seq at field[-1] — tracker must still match."""
+    t = RealFillTracker()
+    t.register_order("2315605184242", "exit", bar_index=500, sim_price=43670)
+    n_row = make_row(seq="2315605184242", typ="N", price="0.0000")
+    assert t.on_new_data(n_row) is None  # type-N is not a fill
+    d_row = make_deal_row(seq="2315605184242", price="43632.000000")
+    fill = t.on_new_data(d_row)
+    assert fill is not None
+    assert fill.price == 43632
+    assert fill.action_type == "exit"
+    assert fill.sim_price == 43670
 
 
 def test_parse_order_accepted_row_is_not_fill():
