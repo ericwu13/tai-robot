@@ -204,21 +204,33 @@ class DiscordNotifier:
     def bot_deployed_regime(
         self, long_strategy: str, short_strategy: str, mode: str,
         version: str = "",
+        restored_leg: str = "",
+        restored_strategy: str = "",
     ) -> None:
         """Deploy notification for a regime-switching bot.
 
         Distinct from :meth:`bot_deployed` so the message announces that
         regime switching is enabled and names both legs, instead of a single
         strategy (which for a regime bot is just the timeframe donor).
+
+        When *restored_leg* is provided (``"long"`` or ``"short"``), an extra
+        line announces the restored regime so the user sees one combined
+        message instead of two separate notifications.
         """
         ver = f" v{version}" if version else ""
-        self._send(
-            f"{self._header()}\n"
-            f"🚀 **機器人啟動 Bot Deployed**{ver}\n"
-            f"🔄 **多空切換 Regime Switching** 已啟用 Enabled\n"
-            f"做多 Long: {long_strategy} | 做空 Short: {short_strategy}\n"
-            f"模式: {mode}"
-        )
+        lines = [
+            f"{self._header()}",
+            f"🚀 **機器人啟動 Bot Deployed**{ver}",
+            f"🔄 **多空切換 Regime Switching** 已啟用 Enabled",
+            f"做多 Long: {long_strategy} | 做空 Short: {short_strategy}",
+            f"模式: {mode}",
+        ]
+        if restored_leg in ("long", "short"):
+            _LEG_LABELS = {"long": "做多 LONG", "short": "做空 SHORT"}
+            lines.append(
+                f"✅ 已恢復 Restored: "
+                f"{_LEG_LABELS[restored_leg]} · {restored_strategy}")
+        self._send("\n".join(lines))
 
     def regime_idle_warning(self) -> None:
         """Warn that signals are suppressed while awaiting regime classification."""
@@ -378,18 +390,6 @@ class DiscordNotifier:
             f"勝率 Win {win_rate:.0f}%",
         ])
         self._send("\n".join(lines), self._daily_report_channel_id)
-
-    def regime_restored(self, leg: str, strategy_name: str) -> None:
-        """Notify that a previously active regime leg was restored on restart."""
-        _LEG_LABELS = {"long": "做多 LONG", "short": "做空 SHORT"}
-        leg_label = _LEG_LABELS.get(leg, leg)
-        ts = _taipei_now().strftime("%Y-%m-%d %H:%M:%S")
-        self._send(
-            f"✅ **{self._bot_name}** · 已恢復 Regime Restored\n"
-            f"{leg_label}: {strategy_name}\n"
-            f"{ts}",
-            self._regime_channel_id,
-        )
 
     def regime_swap(self, from_leg: str, to_leg: str,
                     strategy_name: str) -> None:

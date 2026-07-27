@@ -55,6 +55,39 @@ def test_regime_deploy_names_both_legs():
     assert "07-10-regime-mode" in msg and "TMF00" in msg
 
 
+def test_regime_deploy_with_restored_leg():
+    n = DiscordNotifier("token", "channel", bot_name="07-22-regime",
+                        symbol="TMF00")
+    sent = _capture(n)
+    n.bot_deployed_regime(
+        long_strategy="AI: DynamicExitPullbackStrategyV2",
+        short_strategy="AI: BbandSmaShortV3",
+        mode="模擬",
+        version="2.17.10",
+        restored_leg="short",
+        restored_strategy="AI: BbandSmaShortV3",
+    )
+    assert len(sent) == 1
+    msg = sent[0]
+    assert "Bot Deployed" in msg
+    assert "多空切換 Regime Switching" in msg
+    assert "✅ 已恢復 Restored" in msg
+    assert "做空 SHORT" in msg
+    assert "BbandSmaShortV3" in msg
+
+
+def test_regime_deploy_fresh_no_restored_line():
+    """Fresh deploy (no restored leg) must NOT include a restored line."""
+    n = DiscordNotifier("token", "channel", bot_name="07-22-regime",
+                        symbol="TMF00")
+    sent = _capture(n)
+    n.bot_deployed_regime(
+        long_strategy="LongStrat", short_strategy="ShortStrat", mode="模擬",
+    )
+    assert len(sent) == 1
+    assert "已恢復 Restored" not in sent[0]
+
+
 def test_regime_deploy_disabled_notifier_no_raise():
     n = DiscordNotifier("", "")
     assert n.enabled is False
