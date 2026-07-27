@@ -780,48 +780,71 @@ class TestGenerateSessionReport:
         assert report is not None
         assert report["market_regime"] is None
 
-    def test_cumulative_from_disk_not_broker(self, tmp_path, monkeypatch):
-        """Cumulative stats must come from on-disk reports, not broker.trades.
+    def test_cumulative_from_broker_trades(self, tmp_path, monkeypatch):
+        """Cumulative stats come from broker.trades (the session-restored history).
 
-        Regression: broker.trades is an in-memory list that resets on fresh
-        deploy, making the cumulative unreliable. On-disk daily reports
-        persist across deploys and are per-bot.
+        broker.trades is the authoritative source: session restore loads ALL
+        historical trades from session.json. On-disk daily reports can be
+        incomplete (missed reports from crashes, cleaned up, etc.) — issue #95.
         """
         import src.daily_report.report_generator as rg
         monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
 
-        # Seed two older daily report files for bot "mybot"
-        for date, pnl_val in [("2026-04-09", 5000), ("2026-04-10", -2000)]:
-            report_data = {
-                "session": {"bot_name": "mybot"},
-                "trades": [{"pnl": pnl_val}],
-            }
-            (tmp_path / f"{date}_mybot.json").write_text(
-                json.dumps(report_data), encoding="utf-8",
-            )
-
-        # Also seed a report for a DIFFERENT bot — must not be counted
-        other = {"session": {"bot_name": "other"}, "trades": [{"pnl": 99999}]}
-        (tmp_path / "2026-04-09_other.json").write_text(
-            json.dumps(other), encoding="utf-8",
-        )
-
-        # Today's broker has 1 trade (pnl=300, already in currency)
+        # Broker has 3 trades: 2 historical (restored) + 1 today
+        historical = [
+            _make_trade(pnl=5000, exit_dt="2026-04-09 10:30"),
+            _make_trade(pnl=-2000, exit_dt="2026-04-10 13:00"),
+        ]
         today_trade = _make_trade(pnl=300, exit_dt="2026-04-11 10:30")
-        broker = _FakeBroker([today_trade])
+        broker = _FakeBroker(historical + [today_trade])
 
         report = generate_session_report(
             broker=broker, data_store=None, bot_name="mybot", point_value=10,
         )
         summary = report["summary"]
 
-        # Today: 1 trade, pnl = 300 (already in currency, no extra multiply)
+        # Today: 1 trade, pnl = 300
         assert summary["today_trades"] == 1
         assert summary["today_pnl"] == 300
 
-        # Cumulative: 3 reports on disk (2 old + 1 just saved) for "mybot"
+        # Cumulative: all 3 trades from broker history
         # 5000 + (-2000) + 300 = 3300
         assert summary["total_pnl"] == 3300
         assert summary["total_trades"] == 3
         # 2 wins out of 3 (5000 and 300 are positive)
         assert abs(summary["win_rate"] - 66.7) < 1
+
+    def test_cumulative_not_affected_by_missing_reports(self, tmp_path, monkeypatch):
+        """Cumulative uses broker.trades even when on-disk reports are incomplete.
+
+        This is the exact scenario from issue #95: broker has full history via
+        session restore, but some daily reports were never saved (crash, etc.).
+        """
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        # Broker has 20 trades (session-restored), but disk has only 5 reports
+        all_trades = [
+            _make_trade(pnl=(100 if i % 3 == 0 else -50),
+                        exit_dt=f"2026-04-{10 + i:02d} 10:30")
+            for i in range(20)
+        ]
+        broker = _FakeBroker(all_trades)
+
+        # Only 5 old reports on disk (simulating missing reports)
+        for i in range(5):
+            rdata = {
+                "session": {"bot_name": "mybot"},
+                "trades": [{"pnl": 100}],
+            }
+            (tmp_path / f"2026-04-{10 + i:02d}_mybot.json").write_text(
+                json.dumps(rdata), encoding="utf-8",
+            )
+
+        report = generate_session_report(
+            broker=broker, data_store=None, bot_name="mybot",
+        )
+        summary = report["summary"]
+
+        # Cumulative must reflect ALL 20 broker trades, not just the 5 on disk
+        assert summary["total_trades"] == 20
