@@ -40,10 +40,30 @@ jump to code assumptions before you have read them.
 4. If the logs lack the detail needed, **add logging to the bot** first, redeploy/
    re-run, and gather more data before proposing a fix. Diagnosing on insufficient
    data is how surface-level patches happen.
-5. Output of this phase: a written root-cause statement (what, where, why) — not a fix yet.
+5. Output of this phase (all three, logged in the diagnosis before handing off to Opus):
+   - **Root-cause statement** — what, where, why. Not a fix yet.
+   - **Fix confidence rating (0–100%)** — state the confidence level in the proposed
+     root cause / fix direction, plus what evidence would *raise* it and what would
+     *lower* it (e.g. "70% — a repro against the known-bad code would raise to 90%;
+     finding the same symptom on a code path this fix doesn't touch would lower it").
+     This must be visible in the diagnosis output so Opus sees it before implementing.
+   - **Solid test plan** — a concrete plan that will produce *visible fix evidence*
+     with an unambiguous pass/fail. Prefer tangible artifacts: a screenshot of a
+     rendered chart, a log line that was previously missing, a passing assertion that
+     fails against the known-bad code. Be specific enough that anyone can run it and
+     tell pass from fail. (Example evidence standard — the k-chart fix: a frozen
+     smoke-test EXE fed synthetic bars, with a screenshot showing candles rendering.
+     Aim for that level of concreteness.)
 
 ## Phase 2 — Implement fix (model: `claude-opus-4-8`)
 Goal: fix the root cause cleanly, with the full test suite green.
+
+**Handoff criteria — do not start implementing until Phase 1 delivered all three:**
+the root-cause statement, the **fix confidence rating (0–100%)** with its raise/lower
+factors, and the **solid test plan**. If the confidence rating or test plan is
+missing, loop back to Phase 1 rather than guessing. Implement the fix so it satisfies
+that test plan, then execute the plan and capture its evidence (screenshot, log line,
+or assertion) as proof the fix works — not just a green suite.
 
 1. Branch: `git checkout -b fix/<issue-slug>` off `master`.
 2. Fix the fundamental problem identified in Phase 1 — no surface patches. Remove
