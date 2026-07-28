@@ -145,7 +145,9 @@ PyInstaller's bootloader calls `SetDllDirectoryW(_MEIPASS)`, which overrides the
 
 ### Chart in Frozen EXE
 
-`lightweight_charts` uses pywebview which starts a local HTTP server. In frozen EXEs, this server silently fails. The fix patches `abstract.INDEX` to a `file://` URL at **module level** (not inside `__main__`) so both the main process and the multiprocessing child process (where WebView2 runs) get the patch. `freeze_support()` intercepts child processes before any code after it runs.
+`lightweight_charts` uses pywebview, which serves the chart page from a local HTTP server. Both dev and the frozen EXE use this HTTP server directly.
+
+Historically the frozen EXE patched `abstract.INDEX` to a `file://` URL to work around the pywebview HTTP server appearing to fail in packaged builds. That workaround was removed after a WebView2 runtime update (~150.0.4078.83, 2026-07-24) broke GPU compositing on `file://` origins — candles stopped painting in the packaged EXE while dev (HTTP) worked fine. Serving over HTTP in all builds fixes the rendering and removes the `file://`-specific failure mode.
 
 ## Changelog
 
