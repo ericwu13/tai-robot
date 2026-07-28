@@ -4,10 +4,27 @@
 Trading bot for Taiwan futures using Capital API (SKCOM) v2.13.57.
 Two API approaches: DLL-based (ctypes via SKDLLPython.py) and COM-based (comtypes for KLine).
 
+## Security Constraints (ALWAYS FOLLOW — non-negotiable)
+- Never hardcode channel IDs or role IDs in source files. They belong only in `settings.yaml` (which is gitignored). `settings.example.yaml` has empty placeholder fields.
+- Never push channel IDs, role IDs, or any Discord credentials to git.
+
+## Model Preferences
+- **Debugging / investigation / root-cause tasks**: use `claude-fable-5`
+- **Implementation / code writing / bug fixes**: use `claude-opus-4-8`
+- When a task involves both, use Fable to diagnose first, then hand off to Opus to implement.
+
+## Testing
+- Run tests with: `python -m pytest tests/ -x -q`
+- All tests must pass before merging or shipping a release.
+
+## Release Process
+- Bump `version.py`, write bilingual release notes (繁體中文 + English), build the exe via `build_release.py`, create the GitHub release, upload assets, and send the Discord notification.
+- The Discord notification reads from the GitHub release body — no local file lookup.
+
 ## Build & Test
 ```bash
 pip install pyyaml keyring comtypes holidays
-pytest tests/ -x          # run all tests (44 tests)
+pytest tests/ -x          # run full test suite
 python test_connection.py  # DLL-based quote connection GUI
 python test_kline.py       # COM-based KLine history GUI
 ```
@@ -56,7 +73,6 @@ python test_kline.py       # COM-based KLine history GUI
 - No pandas/numpy - indicators use pure Python
 - settings.yaml is NEVER committed (contains credentials)
 - SDK directory (CapitalAPI_2.13.57/) is gitignored (large binaries)
-- Test count: 1609 tests (as of live next-open entry fill)
 
 ## COM Tick History Replay (CRITICAL — issue #50)
 - After `RequestTicks`, COM replays historical ticks before sending live ticks
