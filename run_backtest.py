@@ -1273,6 +1273,7 @@ class BacktestApp:
         self._fill_poll_timer_id = None
         # Per-order real fill prices from OnNewData (issue #92)
         self._fill_tracker = RealFillTracker()
+        self._real_fill_count: int = 0
         self._last_exit_order_seq: str = ""
         # Seq no of the exit whose Discord notice went out with the
         # estimated price — a late OnNewData fill triggers a correction.
@@ -7463,6 +7464,8 @@ class BacktestApp:
         fill = self._fill_tracker.on_new_data(raw)
         if fill is None or not self._live_runner:
             return
+        self._real_fill_count += 1
+        self.real_fills_var.set(f"{self._real_fill_count} 筆 trades")
         broker = self._live_runner.broker
         if fill.action_type == "exit":
             fill_dt = _taipei_now().replace(tzinfo=None
@@ -7593,7 +7596,7 @@ class BacktestApp:
             btn.config(state=state)
 
     def _query_real_account(self):
-        """Query real account positions, equity, and fills from Capital API."""
+        """Query real account positions and equity from Capital API."""
         if not _com_available or skO is None or not self._logged_in or not self._futures_account:
             return
         user_id = self.login_user_var.get().strip()
@@ -7601,16 +7604,6 @@ class BacktestApp:
             self._account_monitor.clear_positions()  # will be rebuilt from callbacks
             skO.GetOpenInterestGW(user_id, self._futures_account, 1)
             skO.GetFutureRights(user_id, self._futures_account, 1)  # 1=TWD
-            # Synchronous fill query — display-only (per-fill prices come
-            # from OnNewData, issue #92). GetOrderReport(5) was dropped:
-            # its CSV layout differs from the fulfill report, so the shared
-            # parser rendered every row as "x0 @" (no price/qty), and
-            # OnNewData now logs each order event with raw data anyway.
-            try:
-                fills_raw = skO.GetFulfillReport(user_id, self._futures_account, 1)
-                self._parse_and_display_fills(fills_raw, "成交(逐筆)")
-            except Exception as e:
-                _log(f"成交查詢失敗 Fills query error: {e}")
         except Exception as e:
             _log(f"帳戶查詢失敗 Account query error: {e}")
 
@@ -7665,24 +7658,6 @@ class BacktestApp:
             self.real_fees_var.set(d.fees)
             self.real_net_var.set(d.net_pnl)
         self.real_maint_var.set(d.maint_rate)
-
-    def _parse_and_display_fills(self, fills_raw, label="成交"):
-        """Parse fills and display via AccountMonitor."""
-        if not fills_raw:
-            _log(f"{label}(raw type): {type(fills_raw)}")
-            return
-        result = self._account_monitor.parse_fills(fills_raw, label)
-        if result.count == 0:
-            if "成交" in label:
-                self.real_fills_var.set("無成交 No trades today")
-            return
-        if "成交" in label:
-            self.real_fills_var.set(f"{result.count} 筆 trades")
-        if self._live_runner and result.new_entries:
-            for fill in result.new_entries:
-                self._live_log_msg(f"實{label}: {fill}", "entry")
-            # NOTE: display rows only — real fill prices come from
-            # OnNewData deal rows via _on_new_data (issue #92).
 
     def _log_order_decision(self, action: str, reason: str) -> None:
         """Log a real-order event to the CSV decision log."""
