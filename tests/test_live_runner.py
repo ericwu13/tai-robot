@@ -1669,6 +1669,94 @@ class TestRestoreSessionTradeSource:
         assert runner.broker.trade_source == "paper"
 
 
+class TestDoubleResubscribeDedupRegression:
+    """Issue #98: calling reset_bar_monotonicity twice (double resubscribe)
+    must NOT pop good bars from the dedup set.
+
+    Before the fix, each call unconditionally popped max(_seen_1m_dts),
+    removing good completed bars. When history replayed those bars, they
+    were treated as unseen and written to CSV again — duplicate rows.
+    """
+
+    def test_double_reset_without_held_bar_no_csv_duplicates(self, tmp_path):
+        """Ingest 04:57 and 04:58 bars, call reset twice (no held bar),
+        replay those bars, assert CSV has unique timestamps."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        # Warm up so state is RUNNING
+        warmup = [_kline("2026-03-01 04:55", 22000, 22100, 21900, 22050, 500)]
+        runner.feed_warmup_bars(warmup)
+        # Transition to RUNNING by feeding 1-min bars past the warmup
+        runner.feed_1m_bars([
+            _kline("2026-03-01 04:56", 22050, 22060, 22040, 22055, 60),
+            _kline("2026-03-01 04:57", 22055, 22065, 22045, 22060, 70),
+        ])
+        assert runner.state == LiveState.RUNNING
+
+        # Feed the two bars that will be the "good" bars at session end
+        bar_0457 = Bar(symbol="TX00", dt=datetime(2026, 3, 1, 4, 57),
+                       open=22055, high=22065, low=22045, close=22060,
+                       volume=70, interval=60)
+        bar_0458 = Bar(symbol="TX00", dt=datetime(2026, 3, 1, 4, 58),
+                       open=22060, high=22070, low=22050, close=22065,
+                       volume=80, interval=60)
+        runner.feed_1m_bar(bar_0457)
+        runner.feed_1m_bar(bar_0458)
+
+        # Double resubscribe with NO held bar (session gap scenario)
+        runner.reset_bar_monotonicity(bar_was_truncated=False)
+        runner.reset_bar_monotonicity(bar_was_truncated=False)
+
+        # Replay the same bars
+        runner.feed_1m_bar(bar_0457)
+        runner.feed_1m_bar(bar_0458)
+
+        # Read all CSV files and collect timestamps
+        csv_dir = runner.csv_logger._base_dir
+        timestamps = []
+        import csv as csv_mod
+        import glob
+        for f in sorted(glob.glob(os.path.join(csv_dir, "bars_1m_*.csv"))):
+            with open(f) as fh:
+                reader = csv_mod.reader(fh)
+                next(reader, None)  # skip header
+                for row in reader:
+                    timestamps.append(row[0])
+
+        assert len(timestamps) == len(set(timestamps)), (
+            f"Duplicate timestamps in CSV: {timestamps}")
+        assert timestamps == sorted(timestamps), (
+            f"Timestamps not strictly increasing: {timestamps}")
+
+    def test_reset_with_held_bar_allows_replay(self, tmp_path):
+        """When a truncated bar exists (bar_was_truncated=True), the dedup
+        pop should happen so the full replayed bar can replace it."""
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        warmup = [_kline("2026-03-01 09:00", 22000, 22100, 21900, 22050, 500)]
+        runner.feed_warmup_bars(warmup)
+        runner.feed_1m_bars([
+            _kline("2026-03-01 09:01", 22050, 22060, 22040, 22055, 60),
+            _kline("2026-03-01 09:02", 22055, 22065, 22045, 22060, 70),
+        ])
+
+        bar_0902 = Bar(symbol="TX00", dt=datetime(2026, 3, 1, 9, 2),
+                       open=22055, high=22065, low=22045, close=22060,
+                       volume=70, interval=60)
+        runner.feed_1m_bar(bar_0902)
+        assert datetime(2026, 3, 1, 9, 2) in runner._seen_1m_dts
+
+        # Simulate: BarBuilder had a partial bar → truncated
+        runner.reset_bar_monotonicity(bar_was_truncated=True)
+        assert datetime(2026, 3, 1, 9, 2) not in runner._seen_1m_dts
+
+        # Replay the full bar — should be accepted
+        runner.feed_1m_bar(bar_0902)
+        assert datetime(2026, 3, 1, 9, 2) in runner._seen_1m_dts
+
+
 class TestSessionKeyDelegation:
     """_session_key delegates to switch_logic.session_slot."""
 

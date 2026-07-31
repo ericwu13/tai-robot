@@ -1141,9 +1141,17 @@ class BacktestApp:
         # backwards relative to what we already processed. Reset the
         # out-of-order guards so the first tick/bar after the gap is accepted,
         # then let the monotonicity checks drop the stale remainder of the burst.
+        #
+        # Issue #98: only clear the dedup set when the BarBuilder actually
+        # held a partial bar that was force-finalized into a truncated bar.
+        # Without a held bar (session gap, double-resubscribe), the last
+        # dedup entry is a GOOD bar — popping it causes duplicate CSV rows.
+        bar_was_truncated = (self._live_bar_builder is not None
+                             and self._live_bar_builder.current_bar is not None)
         if self._live_bar_builder is not None:
             self._live_bar_builder.reset_stale_tracking()
-        self._live_runner.reset_bar_monotonicity()
+        self._live_runner.reset_bar_monotonicity(
+            bar_was_truncated=bar_was_truncated)
         # Track when this RequestTicks fired so we can log latency to first tick
         # (and detect zombie subscriptions where no tick arrives).
         self._ticks_requested_at = time.time()
@@ -1248,6 +1256,7 @@ class BacktestApp:
         self._first_tick_after_request_logged: bool = False
         self._tick_watchdog = TickWatchdog()  # tick health monitoring
         self._live_poll_id = None  # root.after() id for cancellation
+        self._last_status_poll_wall: float = 0.0  # freeze/wake detection (issue #98)
         self._live_warmup_mode: bool = False
         self._live_warmup_data: list[str] = []
         self._warmup_timeout_id = None
@@ -5918,17 +5927,47 @@ class BacktestApp:
 
     # Tick watchdog thresholds now live in TickWatchdog class
 
+    _STATUS_POLL_INTERVAL_S = 30
+    _FREEZE_DETECT_FACTOR = 3
+
     def _schedule_status_update(self):
         """Periodically update the live status panel + tick watchdog."""
         if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
             return
+
+        # Issue #98: detect machine sleep/freeze. If wall-clock jumped
+        # significantly more than the poll interval, COM likely dumped
+        # buffered ticks that the stale-tick defense dropped (>120s old),
+        # leaving bars permanently missing. Trigger a resubscribe so the
+        # replay+dedup pipeline backfills them.
+        now = time.time()
+        last = getattr(self, '_last_status_poll_wall', 0.0)
+        if last > 0:
+            elapsed = now - last
+            expected = self._STATUS_POLL_INTERVAL_S
+            if elapsed > expected * self._FREEZE_DETECT_FACTOR:
+                _log(f"Wake-from-freeze detected: expected ~{expected}s poll "
+                     f"interval, got {elapsed:.1f}s — triggering resubscribe")
+                self._live_log_msg(
+                    f"系統休眠偵測 Wake-from-freeze ({elapsed:.0f}s gap) "
+                    "— re-subscribing ticks", "status")
+                self._last_status_poll_wall = now
+                self._resubscribe_ticks()
+                self._live_poll_id = self.root.after(
+                    self._STATUS_POLL_INTERVAL_S * 1000,
+                    self._schedule_status_update)
+                return
+        self._last_status_poll_wall = now
+
         self._update_live_status()
         self._check_tick_watchdog()
         self._check_session_end_close()
         self._check_session_end_report()
         self._check_weekly_evolution()
         self._check_regime_poll()
-        self._live_poll_id = self.root.after(30000, self._schedule_status_update)
+        self._live_poll_id = self.root.after(
+            self._STATUS_POLL_INTERVAL_S * 1000,
+            self._schedule_status_update)
 
     def _check_regime_poll(self):
         """Run regime orchestration poll for RegimeSwitchingRunner bots."""
@@ -7774,6 +7813,7 @@ class BacktestApp:
         self._live_tick_count = 0
         self._live_history_tick_count = 0
         self._live_stale_drops = 0
+        self._last_status_poll_wall = 0.0
 
         # Close live chart before stopping runner
         if self._live_chart and self._live_chart.is_alive:

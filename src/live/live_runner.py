@@ -793,12 +793,18 @@ class LiveRunner:
                     event, getattr(handler, "__name__", repr(handler)),
                 )
 
-    def reset_bar_monotonicity(self) -> None:
+    def reset_bar_monotonicity(self, bar_was_truncated: bool = False) -> None:
         """Reset the out-of-order bar guards on all aggregators (issue #78).
 
         Called by the GUI when a reconnect re-enters the tick-history replay
         window, so the first bar after the gap is always accepted without
         discarding any in-progress aggregation.
+
+        Args:
+            bar_was_truncated: True when the BarBuilder held a partial bar
+                that was force-finalized into a truncated bar by this
+                resubscribe.  Only then should the dedup set be cleared
+                (issue #98).
         """
         self.aggregator.reset_stale_tracking()
         for agg in self._htf_aggregators.values():
@@ -807,7 +813,13 @@ class LiveRunner:
         # in-progress 1-min bar into a TRUNCATED bar, which lands in the dedup
         # set. Drop that last entry so the correct, full replayed bar can be
         # re-accepted instead of being silently dedup-dropped.
-        self.clear_last_bar_dedup()
+        #
+        # Issue #98: only pop when a truncated bar was actually produced.
+        # Across session gaps (or double-resubscribe) the last entry is a
+        # GOOD completed bar — popping it causes duplicate CSV rows when the
+        # replay re-delivers that bar.
+        if bar_was_truncated:
+            self.clear_last_bar_dedup()
 
     def clear_last_bar_dedup(self) -> None:
         """Remove only the most-recent 1-min bar from the dedup set (issue #78).
