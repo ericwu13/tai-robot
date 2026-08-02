@@ -236,6 +236,33 @@ class TestDecideVerdict:
         v = decide_verdict(baseline, candidate, None)
         assert not v.passed
 
+    def test_absolute_pf_floor_beats_a_worse_baseline(self):
+        # issue #99: "not worse than baseline" passed a losing candidate
+        # because the baseline lost harder. A net-losing candidate is
+        # never an improvement worth saving.
+        baseline = _ab("base", [-200] * 10)
+        candidate = _ab("cand", [-100] * 10)
+        v = decide_verdict(baseline, candidate, None)
+        assert not v.passed
+        assert any("absolute" in r and "PF" in r for r in v.reasons)
+
+    def test_absolute_pf_floor_not_overridable_by_criteria(self):
+        # Criteria the plan itself wrote cannot buy a losing candidate a
+        # PASS — the floor applies in the criteria path too.
+        baseline = _ab("base", [-200] * 10)
+        candidate = _ab("cand", [100] * 4 + [-100] * 8)  # PF 0.5
+        criteria = {"win_rate_min": 0.1}
+        v = decide_verdict(baseline, candidate, criteria)
+        assert not v.passed
+        assert any("absolute" in r for r in v.reasons)
+
+    def test_pf_floor_reason_present_on_pass(self):
+        baseline = _ab("base", [100, -200] * 10)
+        candidate = _ab("cand", [150, -100] * 10)
+        v = decide_verdict(baseline, candidate, None)
+        assert v.passed
+        assert any("hard floor: PF" in r and "✓" in r for r in v.reasons)
+
 
 # ── run_ab_backtest ──
 
@@ -462,6 +489,54 @@ class TestDecideDeepVerdict:
                           test=ABResult(name="te", error="boom"))
         v = decide_deep_verdict(base, cand, None)
         assert not v.passed
+
+    def test_losing_holdout_fails_even_when_baseline_lost_harder(self):
+        # issue #99 verbatim: the candidate lost all 14 of its holdout
+        # trades, the baseline lost too, so every RELATIVE gate said ✓
+        # (PF 0 ≥ PF 0, dd% 0 ≤ 0) and the pipeline shipped it. The
+        # absolute floor delegated through decide_verdict now blocks it.
+        from src.evolution.pipeline import decide_deep_verdict
+        base = self._deep("base", [100, -200] * 20, [-100] * 10)
+        # candidate train pnls differ slightly so the holdout no-op gate
+        # is not what fails this test — the PF floor is.
+        cand = self._deep("cand", [110, -200] * 20, [-90] * 10, mc=0.1)
+        v = decide_deep_verdict(base, cand, None)
+        assert not v.passed
+        assert any("absolute" in r and "PF" in r for r in v.reasons)
+
+    def test_no_op_mutation_defers_instead_of_passing(self):
+        # The same incident's candidate traded almost identically to the
+        # baseline in the holdout — equal metrics used to read as "not
+        # worse than baseline ✓". Nothing changed, so there is nothing
+        # to judge: FAIL (defer), never PASS.
+        from src.evolution.pipeline import decide_deep_verdict
+        base = self._deep("base", [100, -200] * 20, [200, -100] * 10)
+        cand = self._deep("cand", [100, -200] * 20, [200, -100] * 10, mc=0.1)
+        v = decide_deep_verdict(base, cand, None)
+        assert not v.passed
+        assert any("no-op" in r and "did not express" in r for r in v.reasons)
+
+    def test_expressed_mutation_reports_divergent_counts(self):
+        from src.evolution.pipeline import decide_deep_verdict
+        base = self._deep("base", [100, -200] * 20, [100, -200] * 10)
+        cand = self._deep("cand", [100, -200] * 20, [200, -100] * 10, mc=0.1)
+        v = decide_deep_verdict(base, cand, None)
+        assert v.passed
+        assert any("mutation expressed" in r for r in v.reasons)
+
+    def test_no_op_gate_skipped_without_trade_lists(self):
+        # Hand-built sides that carry metrics but no trade list must not
+        # trip the gate — None means "unknown", not "zero divergent".
+        from src.evolution.pipeline import DeepResult, decide_deep_verdict
+        base = self._deep("base", [100, -200] * 20, [100, -200] * 10)
+        cand_test = _ab("cand test", [200, -100] * 10)
+        cand_test.result.trades = None
+        cand = DeepResult(name="cand", train=_ab("cand train", [100, -200] * 20),
+                          test=cand_test, mc_variance=0.1,
+                          train_span="t", test_span="t")
+        v = decide_deep_verdict(base, cand, None)
+        assert v.passed
+        assert not any("no-op" in r for r in v.reasons)
 
     def test_criteria_checked_on_test_window(self):
         from src.evolution.pipeline import decide_deep_verdict
