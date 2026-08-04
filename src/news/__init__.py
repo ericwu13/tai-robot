@@ -13,6 +13,14 @@ a broken automation must never be able to halt trading indefinitely.
 Runner wiring lands in Phase 2.
 """
 
+from .circuit_breaker import (
+    BreakerAction,
+    BreakerDecision,
+    BreakerState,
+    plan_calendar_gate,
+    plan_signal_actions,
+    should_revert_news,
+)
 from .event_calendar import (
     SCHEMA_VERSION as CALENDAR_SCHEMA_VERSION,
     EventEntry,
@@ -35,6 +43,12 @@ from .signal_file import (
 )
 
 __all__ = [
+    "BreakerAction",
+    "BreakerDecision",
+    "BreakerState",
+    "plan_calendar_gate",
+    "plan_signal_actions",
+    "should_revert_news",
     "CALENDAR_SCHEMA_VERSION",
     "EventEntry",
     "active_event",

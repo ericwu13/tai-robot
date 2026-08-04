@@ -70,6 +70,7 @@ a = Analysis(
         'src.strategy.examples.h4_midline_touch_long',
         'src.strategy.examples.m1_bollinger_atr_long',
         'src.strategy.examples.m1_sma_cross',
+        'src.strategy.examples.news_event',
         'src.strategy.examples.ma_crossover',
         'src.strategy.examples.rsi_reversal',
         'src.strategy.examples.bollinger_breakout',
@@ -83,6 +84,13 @@ a = Analysis(
         # Live
         'src.live', 'src.live.bar_aggregator', 'src.live.csv_logger',
         'src.live.live_runner', 'src.live.tick_classifier',
+        'src.live.regime_switching_runner',
+        # News / event framework (deferred import in _deploy_live)
+        'src.news', 'src.news.circuit_breaker', 'src.news.event_calendar',
+        'src.news.signal_file',
+        'src.regime', 'src.regime.manager', 'src.regime.selector',
+        'src.regime.state_machine', 'src.regime.store',
+        'src.regime.switch_logic',
         # Utils
         'src.utils.time_utils',
         # Self-update

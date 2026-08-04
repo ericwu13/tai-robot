@@ -29,6 +29,14 @@ from ...backtest.strategy import BacktestStrategy
 from ...backtest.broker import BrokerContext, OrderSide
 
 
+# GUI/registry display names. Defined here so the ``STRATEGIES`` key in
+# run_backtest.py and the ``swap_strategy`` display name the circuit
+# breaker passes are literally the same string — the session row, the
+# resume lookup and the Discord swap message all key off it.
+NEWS_SHORT_DISPLAY = "事件強制放空 News Event Short (斷路器 breaker-only)"
+NEWS_LONG_DISPLAY = "事件強制做多 News Event Long (斷路器 breaker-only)"
+
+
 class NewsEventStrategy(BacktestStrategy):
     """事件策略共用基底 — 子類別只換方向與標籤。
 

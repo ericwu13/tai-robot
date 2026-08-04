@@ -422,6 +422,13 @@ class LiveRunner:
         # from suppress_strategy (cleared on every reconnect replay).
         self.regime_idle: bool = False
 
+        # News circuit breaker: same "no trading, keep the data flowing"
+        # semantics as regime_idle, but owned by src.news so a `clear`
+        # signal or an event window ending cannot accidentally un-idle a
+        # regime sit_out (and vice versa). Mirrored from
+        # BreakerState.suppressed by RegimeSwitchingRunner.
+        self.news_idle: bool = False
+
         # Daily-report dedupe key: "{date}_{session}" (e.g.
         # "2026-07-21_DAY") of the last emitted report. Persisted in
         # session.json so a restart can't re-send the same session's report.
@@ -1070,8 +1077,9 @@ class LiveRunner:
         idx = self._bar_index
         self._bar_index += 1
 
-        # During history catchup or regime idle, only build bar state — no trading
-        if self.suppress_strategy or self.regime_idle:
+        # During history catchup, regime idle, or a news suppression, only
+        # build bar state — no trading
+        if self.suppress_strategy or self.regime_idle or self.news_idle:
             return
 
         ctx = self.broker.context
@@ -1386,6 +1394,46 @@ class LiveRunner:
             return bars
         return aggregate_bars(list(self._1m_bars), interval)
 
+    def force_close_position(self, tag: str, reason: str) -> int:
+        """Force-close any open position and emit a FORCE_CLOSE decision.
+
+        The single in-runner emergency-exit path: ``stop()`` uses it, and
+        so does the news circuit breaker's ``risk_off`` flatten. The
+        emitted ``FORCE_CLOSE`` decision is what the GUI turns into a
+        real closing order — ``TradingGuard`` lets FORCE_CLOSE bypass the
+        fill-pending gate, which is exactly what an emergency exit needs.
+
+        No-op (returns 0) when flat or when no bar exists yet. Returns
+        the exit price otherwise. Does NOT save the session — the caller
+        owns that, so ``stop()`` keeps its single save.
+        """
+        if not self._aggregated_bars or self.broker.position_size <= 0:
+            return 0
+        last_bar = self._aggregated_bars[-1]
+        # Use wall-clock time — a manual stop or a news flatten fires
+        # mid-bar, so neither bar open nor bar end reflects the actual
+        # close moment.
+        last_close_dt = datetime.now(_TZ_TAIPEI).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        # Issue #61: prefer the last CLOSED 1-min bar close over the
+        # strategy-TF aggregated close, which can be many minutes stale
+        # at an arbitrary stop moment. No GUI tick price is reachable
+        # from inside the runner, so tick_price=0; the helper falls back
+        # to the agg close only when no 1-min bar exists.
+        exit_price, _src = select_freshest_price(
+            0, self._1m_bars, self._aggregated_bars)
+        if exit_price <= 0:
+            exit_price = last_bar.close  # last-resort (no 1m, no agg)
+        # NB: _log_decision runs AFTER force_close has closed the
+        # position, so position_side is already None here — read the
+        # just-appended trade's side (trades[-1]) for the log row.
+        self.broker.force_close(self._bar_index, exit_price, last_close_dt)
+        self._log_decision(
+            last_bar, "FORCE_CLOSE",
+            self.broker.trades[-1].side.value if self.broker.trades else "",
+            tag, exit_price, reason,
+        )
+        return exit_price
+
     def stop(self) -> dict:
         """Stop live runner: flush aggregator, force-close position, return summary."""
         if self.state == LiveState.STOPPED:
@@ -1397,28 +1445,7 @@ class LiveRunner:
             self._process_aggregated_bar(partial)
 
         # Force close open position
-        if self._aggregated_bars and self.broker.position_size > 0:
-            last_bar = self._aggregated_bars[-1]
-            # Use wall-clock time — manual stop fires mid-bar, so neither
-            # bar open nor bar end reflects the actual close moment.
-            last_close_dt = datetime.now(_TZ_TAIPEI).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
-            # Issue #61: prefer the last CLOSED 1-min bar close over the
-            # strategy-TF aggregated close, which can be many minutes stale
-            # at an arbitrary stop moment. No GUI tick price is reachable
-            # from inside the runner, so tick_price=0; the helper falls back
-            # to the agg close only when no 1-min bar exists.
-            exit_price, _src = select_freshest_price(
-                0, self._1m_bars, self._aggregated_bars)
-            if exit_price <= 0:
-                exit_price = last_bar.close  # last-resort (no 1m, no agg)
-            # NB: _log_decision runs AFTER force_close has closed the
-            # position, so position_side is already None here — read the
-            # just-appended trade's side (trades[-1]) for the log row.
-            self.broker.force_close(self._bar_index, exit_price, last_close_dt)
-            self._log_decision(
-                last_bar, "FORCE_CLOSE", self.broker.trades[-1].side.value if self.broker.trades else "",
-                "stop", exit_price, "live runner stopped",
-            )
+        self.force_close_position("stop", "live runner stopped")
 
         self._auto_save_session()
         self._generate_daily_report()

@@ -71,6 +71,9 @@ from src.strategy.examples.daily_bollinger_long import DailyBollingerLongStrateg
 from src.strategy.examples.h4_midline_touch_long import H4MidlineTouchLongStrategy
 from src.strategy.examples.m1_bollinger_atr_long import M1BollingerAtrLongStrategy
 from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
+from src.strategy.examples.news_event import (
+    NEWS_LONG_DISPLAY, NEWS_SHORT_DISPLAY, NewsEventLong, NewsEventShort,
+)
 
 # AI modules
 from src.ai.chat_client import (
@@ -139,7 +142,19 @@ STRATEGIES: dict[str, type[BacktestStrategy]] = {
     "日線布林多單 Daily Bollinger Long": DailyBollingerLongStrategy,
     "H4 中線戰法多單 H4 Midline Touch Long": H4MidlineTouchLongStrategy,
     "1分K布林ATR多單 1m Bollinger ATR Long": M1BollingerAtrLongStrategy,
+    # 新聞斷路器專用 — 部署由 src.news 斷路器觸發，不判斷型態。
+    # News circuit-breaker only: deployed by src.news on an external
+    # signal, enters unconditionally once. Backtestable so the user can
+    # inspect the stop/time-stop behaviour, but excluded from the regime
+    # leg dropdowns via NEWS_ONLY_STRATEGIES below.
+    NEWS_SHORT_DISPLAY: NewsEventShort,
+    NEWS_LONG_DISPLAY: NewsEventLong,
 }
+
+# Strategies that must never be offered as a regime long/short leg: they
+# enter unconditionally and never re-enter, so a regime session would get
+# exactly one forced trade and then a dead bot.
+NEWS_ONLY_STRATEGIES: set[str] = {NEWS_SHORT_DISPLAY, NEWS_LONG_DISPLAY}
 
 # ── COM setup (only if not using CSV mode) ──
 _com_available = False
@@ -246,6 +261,39 @@ def _init_com():
         _com_available = False
 
 
+def _resolve_news_path(path: str) -> str:
+    """Absolutise a configured news path against ``project_root``.
+
+    n8n usually writes absolute paths, but a relative one in
+    settings.yaml must not resolve against whatever cwd a frozen EXE
+    happens to be launched from.
+    """
+    if not path:
+        return ""
+    return path if os.path.isabs(path) else os.path.join(project_root, path)
+
+
+def _build_news_config(settings: dict):
+    """NewsConfig from the loaded settings dict, or None when disabled.
+
+    Returning None (not a disabled NewsConfig) keeps the runner's
+    "no news config → never touch the filesystem" path the default.
+    """
+    if not settings.get("news_enabled", False):
+        return None
+    from src.config.settings import NewsConfig
+    return NewsConfig(
+        enabled=True,
+        signal_path=_resolve_news_path(settings.get("news_signal_path", "")),
+        events_path=_resolve_news_path(settings.get("news_events_path", "")),
+        ledger_path=_resolve_news_path(settings.get("news_ledger_path", "")),
+        max_signal_age_sec=int(settings.get("news_max_signal_age_sec", 900)),
+        tier2_enabled=bool(settings.get("news_tier2_enabled", False)),
+        calendar_min_severity=str(
+            settings.get("news_calendar_min_severity", "high")),
+    )
+
+
 def _load_settings():
     cfg = {"user_id": "", "password": "", "authority_flag": 0}
     # Check user-writable project_root first, then parent dir (for dist/), then bundle
@@ -313,6 +361,19 @@ def _load_settings():
             # WITHHELD from the AI's design and used as the unseen
             # validation window (walk-forward discipline).
             cfg["evolution_holdout_days"] = evo.get("holdout_days", 14)
+            # News/event framework (src.news). Paths are written by an
+            # external n8n workflow; empty paths keep the feature inert.
+            # Defaults mirror src.config.settings.NewsConfig exactly.
+            news = data.get("news", {}) or {}
+            cfg["news_enabled"] = bool(news.get("enabled", False))
+            cfg["news_signal_path"] = str(news.get("signal_path", "") or "")
+            cfg["news_events_path"] = str(news.get("events_path", "") or "")
+            cfg["news_ledger_path"] = str(news.get("ledger_path", "") or "")
+            cfg["news_max_signal_age_sec"] = int(
+                news.get("max_signal_age_sec", 900) or 900)
+            cfg["news_tier2_enabled"] = bool(news.get("tier2_enabled", False))
+            cfg["news_calendar_min_severity"] = str(
+                news.get("calendar_min_severity", "high") or "high")
             regime = data.get("regime", {})
             cfg["regime_long_strategy"] = regime.get("long_strategy", "")
             cfg["regime_short_strategy"] = regime.get("short_strategy", "")
@@ -5215,7 +5276,9 @@ class BacktestApp:
         regime_lf.pack(fill=tk.X, padx=10, pady=(0, 8))
 
         regime_var = tk.BooleanVar(value=False)
-        strat_names = list(STRATEGIES.keys())
+        # News/circuit-breaker strategies are backtestable but must not be
+        # selectable as a regime leg (see NEWS_ONLY_STRATEGIES).
+        strat_names = [n for n in STRATEGIES if n not in NEWS_ONLY_STRATEGIES]
         default_long = self._settings.get("regime_long_strategy", "")
         default_short = self._settings.get("regime_short_strategy", "")
         regime_long_var = tk.StringVar(value=default_long)
@@ -5274,6 +5337,11 @@ class BacktestApp:
                 leg_map = {"long": "做多 LONG", "short": "做空 SHORT", "idle": "閒置 IDLE"}
                 leg_label = leg_map.get(leg, leg)
                 pending = " ⏳待套用 pending" if rs.get("pending_recommendation") else ""
+                news = rs.get("news", {}) or {}
+                if news.get("signal_suppressed") or news.get("event_suppressed"):
+                    src = ("新聞 news" if news.get("signal_suppressed")
+                           else f"事件 event: {news.get('event_name', '')}")
+                    pending += f" 🚫暫停進場 suppressed ({src})"
                 self.live_regime_var.set(f"[Regime] {leg_label}{pending}")
             except Exception:
                 self.live_regime_var.set("[Regime] 切換中 Switching")
@@ -5469,6 +5537,10 @@ class BacktestApp:
         log_dir = os.path.join(project_root, "data", "live")
         if is_regime_deploy:
             from src.live.regime_switching_runner import RegimeSwitchingRunner
+            # News framework rides the switching runner's 30s poll, so it
+            # is only wired when BOTH news and regime are enabled. A
+            # plain LiveRunner deploy gets no news gating.
+            news_cfg = _build_news_config(self._settings)
             self._live_runner = RegimeSwitchingRunner(
                 strategy, symbol, point_value=point_value,
                 log_dir=log_dir, bot_name=bot_name,
@@ -5477,7 +5549,13 @@ class BacktestApp:
                 long_strategy_name=regime_cfg.long_strategy,
                 short_strategy_name=regime_cfg.short_strategy,
                 strategies_registry=STRATEGIES,
+                news_cfg=news_cfg,
             )
+            if news_cfg is not None:
+                _log(f"新聞框架已啟用 News framework enabled "
+                     f"(tier2={news_cfg.tier2_enabled}, "
+                     f"signal={bool(news_cfg.signal_path)}, "
+                     f"events={bool(news_cfg.events_path)})")
             self._regime_manager = self._live_runner.regime_manager
         else:
             self._live_runner = LiveRunner(
@@ -5554,6 +5632,12 @@ class BacktestApp:
         if hasattr(self._live_runner, "on_regime_swap_cb"):
             self._live_runner.on_regime_swap_cb = lambda f, t, s: (
                 _discord.regime_swap(f, t, s) if _discord is not None and _discord.enabled else None
+            )
+        # News circuit-breaker announcements share the regime channel
+        # (falls back to the main channel when unconfigured).
+        if hasattr(self._live_runner, "on_news_notify_cb"):
+            self._live_runner.on_news_notify_cb = lambda msg: (
+                _discord.notify_regime(msg) if _discord is not None and _discord.enabled else None
             )
 
         # Debug: log resolved order symbol and query stock list
