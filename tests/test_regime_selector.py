@@ -70,6 +70,50 @@ def test_vol_spike_sits_out():
     assert rec.action == "sit_out"
 
 
+def test_event_risk_sits_out_with_event_name():
+    sel = StrategySelector()
+    s = RegimeState(effective_regime="trending-up",
+                    last_features={"_event_risk": "US CPI"})
+    rec = sel.select(s, cfg())
+    assert rec.action == "sit_out"
+    assert rec.strategy_name == ""
+    assert "US CPI" in rec.reason
+
+
+def test_event_risk_outranks_vol_spike():
+    """Both sit out, but the reason must name the scheduled event."""
+    sel = StrategySelector()
+    s = RegimeState(effective_regime="trending-down",
+                    last_features={"_event_risk": "FOMC", "_vol_spike": True})
+    rec = sel.select(s, cfg())
+    assert rec.action == "sit_out"
+    assert "FOMC" in rec.reason
+
+
+def test_pause_precedes_event_risk():
+    sel = StrategySelector()
+    s = RegimeState(effective_regime="trending-up",
+                    last_features={"_paused": True, "_event_risk": "US CPI"})
+    rec = sel.select(s, cfg())
+    assert rec.action == "hold"
+
+
+def test_override_precedes_event_risk():
+    sel = StrategySelector()
+    s = RegimeState(manual_override="long",
+                    last_features={"_event_risk": "US CPI"})
+    rec = sel.select(s, cfg())
+    assert rec.action == "deploy_long"
+
+
+def test_falsy_event_risk_does_not_gate():
+    sel = StrategySelector()
+    for value in ("", None, False):
+        s = RegimeState(effective_regime="trending-up",
+                        last_features={"_event_risk": value})
+        assert sel.select(s, cfg()).action == "deploy_long"
+
+
 def test_unknown_regime_holds():
     sel = StrategySelector()
     s = RegimeState(effective_regime="unknown")
