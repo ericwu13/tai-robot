@@ -40,8 +40,9 @@ strategies/
 .DS_Store
 Thumbs.db
 
-# Claude
-.claude/
+# Claude — local/personal config stays out; shared skills/commands/agents are committed
+.claude/settings.local.json
+.claude/worktrees/
 
 # Capital API SDK (large binaries - download separately)
 CapitalAPI_2.13.57/
