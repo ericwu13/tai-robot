@@ -43,6 +43,21 @@ class OneMinRecordingStrategy(BacktestStrategy):
         return 1
 
 
+class FifteenMinRecordingStrategy(BacktestStrategy):
+    """15-min strategy that records each bar it receives (for issue #97 test)."""
+    kline_type = 0
+    kline_minute = 15
+
+    def __init__(self) -> None:
+        self.seen_bars: list[Bar] = []
+
+    def on_bar(self, bar: Bar, data_store: DataStore, broker: BrokerContext) -> None:
+        self.seen_bars.append(bar)
+
+    def required_bars(self) -> int:
+        return 1
+
+
 class LongWithExitStrategy(BacktestStrategy):
     """Enter long and set TP/SL exit (for testing tick-level exits)."""
     kline_type = 0
@@ -1769,3 +1784,173 @@ class TestSessionKeyDelegation:
         date_str, slot = key
         assert slot in ("DAY", "NIGHT")
         assert len(date_str) == 10  # YYYY-MM-DD
+
+
+class TestAggregatedBarMonotonicGuard:
+    """_process_aggregated_bar drops stale/duplicate aggregated bars (issue #97).
+
+    A non-ascending _aggregated_bars list silently blanks the live chart, and
+    the stale bar is junk data the strategy must never see.
+    """
+
+    def _runner_with_three_bars(self, tmp_path):
+        strategy = OneMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        runner.feed_warmup_bars([_kline("2026-08-01 09:00", 22500)])
+        for i in (1, 2, 3):
+            runner.feed_1m_bar(Bar(
+                symbol="TX00", dt=datetime(2026, 8, 1, 9, i),
+                open=22500 + i, high=22510 + i, low=22490 + i,
+                close=22505 + i, volume=50, interval=60,
+            ))
+        return strategy, runner
+
+    def _stale_bar(self, minute):
+        return Bar(symbol="TX00", dt=datetime(2026, 8, 1, 9, minute),
+                   open=1, high=2, low=0, close=1, volume=29, interval=60)
+
+    def test_older_bar_is_dropped(self, tmp_path):
+        strategy, runner = self._runner_with_three_bars(tmp_path)
+        before_bars = list(runner._aggregated_bars)
+        before_index = runner._bar_index
+        before_seen = len(strategy.seen_bars)
+        before_store = len(runner.data_store)
+
+        runner._process_aggregated_bar(self._stale_bar(2))  # last is 09:03
+
+        assert runner._aggregated_bars == before_bars
+        assert runner._bar_index == before_index
+        assert len(strategy.seen_bars) == before_seen
+        assert len(runner.data_store) == before_store
+
+    def test_duplicate_of_last_bar_is_dropped(self, tmp_path):
+        strategy, runner = self._runner_with_three_bars(tmp_path)
+        before_index = runner._bar_index
+        before_seen = len(strategy.seen_bars)
+
+        runner._process_aggregated_bar(self._stale_bar(3))  # same dt as last
+
+        dts = [b.dt for b in runner._aggregated_bars]
+        assert dts == sorted(dts) and len(dts) == len(set(dts))
+        assert runner._bar_index == before_index
+        assert len(strategy.seen_bars) == before_seen
+
+    def test_newer_bar_still_accepted(self, tmp_path):
+        strategy, runner = self._runner_with_three_bars(tmp_path)
+        before_index = runner._bar_index
+        before_seen = len(strategy.seen_bars)
+
+        runner._process_aggregated_bar(Bar(
+            symbol="TX00", dt=datetime(2026, 8, 1, 9, 4),
+            open=22504, high=22514, low=22494, close=22509,
+            volume=50, interval=60,
+        ))
+
+        assert runner._aggregated_bars[-1].dt == datetime(2026, 8, 1, 9, 4)
+        assert runner._bar_index == before_index + 1
+        assert len(strategy.seen_bars) == before_seen + 1
+
+
+class TestOrphanSessionCloseFlush:
+    """The night's final 1-min bar arrives the NEXT MORNING and re-opens an
+    already-emitted aggregation window, producing a duplicate 04:45 bar that
+    blanks the chart (issue #97).
+    """
+
+    def test_orphan_0459_bar_does_not_duplicate_the_0445_window(self, tmp_path):
+        strategy = FifteenMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        runner.feed_warmup_bars([
+            _kline("2026-07-31 15:00", 22000, 22100, 21900, 22050, 500),
+            _kline("2026-07-31 15:15", 22050, 22150, 22000, 22100, 400),
+        ])
+
+        # Night session runs to 04:58 — all inside the 04:45–05:00 window
+        for i in range(14):
+            dt = datetime(2026, 8, 1, 4, 45) + timedelta(minutes=i)
+            runner.feed_1m_bar(Bar(
+                symbol="TX00", dt=dt, open=22500, high=22510, low=22490,
+                close=22505, volume=44, interval=60,
+            ))
+
+        # The 04:45 window is emitted at the 05:00 session close
+        completed = runner.aggregator.flush()
+        assert completed is not None
+        assert completed.dt == datetime(2026, 8, 1, 4, 45)
+        runner._process_aggregated_bar(completed)
+
+        # Next morning's resubscribe disarms the out-of-order guard...
+        runner.reset_bar_monotonicity()
+
+        # ...and flushes the orphaned 04:59 bar the BarBuilder still held
+        runner.feed_1m_bar(Bar(
+            symbol="TX00", dt=datetime(2026, 8, 1, 4, 59),
+            open=22505, high=22506, low=22504, close=22505,
+            volume=29, interval=60,
+        ))
+
+        # The first real AM bar crosses the boundary and finalizes the stub
+        runner.feed_1m_bar(Bar(
+            symbol="TX00", dt=datetime(2026, 8, 1, 8, 45),
+            open=22600, high=22610, low=22590, close=22605,
+            volume=80, interval=60,
+        ))
+
+        dts = [b.dt for b in runner._aggregated_bars]
+        assert dts.count(datetime(2026, 8, 1, 4, 45)) == 1
+        assert dts == sorted(dts) and len(dts) == len(set(dts))
+        # The 29-volume stub must never reach the strategy
+        assert 29 not in [b.volume for b in strategy.seen_bars]
+
+
+class TestPartialBarChartGuard:
+    """get_bars_at_interval must never return a non-ascending series (issue #97)."""
+
+    def _runner(self, tmp_path):
+        strategy = FifteenMinRecordingStrategy()
+        runner = LiveRunner(strategy, "TX00", point_value=200,
+                            log_dir=str(tmp_path))
+        runner.feed_warmup_bars([
+            _kline("2026-07-31 15:00", 22000, 22100, 21900, 22050, 500),
+        ])
+        return runner
+
+    def test_stale_partial_is_not_appended(self, tmp_path):
+        runner = self._runner(tmp_path)
+        for i in range(3):
+            dt = datetime(2026, 8, 1, 4, 45) + timedelta(minutes=i)
+            runner.feed_1m_bar(Bar(
+                symbol="TX00", dt=dt, open=22500, high=22510, low=22490,
+                close=22505, volume=44, interval=60,
+            ))
+        runner._process_aggregated_bar(runner.aggregator.flush())
+
+        # Orphan re-opens the already-emitted 04:45 window
+        runner.reset_bar_monotonicity()
+        runner.feed_1m_bar(Bar(
+            symbol="TX00", dt=datetime(2026, 8, 1, 4, 59),
+            open=22505, high=22506, low=22504, close=22505,
+            volume=29, interval=60,
+        ))
+        assert runner.aggregator.get_partial_bar().dt == datetime(2026, 8, 1, 4, 45)
+
+        bars = runner.get_bars_at_interval(runner.target_interval)
+        dts = [b.dt for b in bars]
+        assert dts == sorted(dts) and len(dts) == len(set(dts))
+        assert dts[-1] == datetime(2026, 8, 1, 4, 45)
+
+    def test_fresh_partial_is_appended(self, tmp_path):
+        runner = self._runner(tmp_path)
+        for i in range(20):  # crosses 04:45 → 05:00, leaving a live partial
+            dt = datetime(2026, 8, 1, 4, 45) + timedelta(minutes=i)
+            runner.feed_1m_bar(Bar(
+                symbol="TX00", dt=dt, open=22500, high=22510, low=22490,
+                close=22505, volume=44, interval=60,
+            ))
+
+        partial = runner.aggregator.get_partial_bar()
+        assert partial is not None
+        bars = runner.get_bars_at_interval(runner.target_interval)
+        assert bars[-1].dt == partial.dt

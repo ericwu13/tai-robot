@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import calendar
+import logging
 import math
 import queue
 import threading
+from bisect import bisect_right
+from datetime import datetime
 
 from ..market_data.models import Bar
 from .broker import Trade, OrderSide
@@ -18,9 +22,86 @@ except ImportError:
 
 import sys
 
+logger = logging.getLogger(__name__)
+
 # Bars of context to show before entry / after exit when zooming to a trade
 _PAD_BEFORE = 20
 _PAD_AFTER = 10
+
+# Trade dt strings come in both precisions (see Trade.entry_dt / exit_dt)
+_TRADE_DT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+
+
+def _ensure_ascending(bars: list[Bar]) -> list[Bar]:
+    """Return *bars* strictly ascending by dt, de-duplicated (issue #97).
+
+    lightweight-charts silently breaks its render pipeline when ``chart.set()``
+    receives a series whose timestamps are not ascending: ONE descending
+    timestamp anywhere blanks the whole pane (axis/grid/legend still draw) and
+    no exception is raised in Python or JS.  Producers upstream can emit stale
+    aggregated bars after a reconnect or a session-boundary flush, so sanitize
+    at the chart boundary — the chart must never be blanked by a data bug.
+
+    Duplicates keep the LAST occurrence, mirroring lightweight-charts'
+    ``series.update()`` last-write-wins semantics.
+    """
+    if len(bars) < 2:
+        return bars
+
+    if all(bars[i].dt > bars[i - 1].dt for i in range(1, len(bars))):
+        return bars  # already clean — no copy
+
+    ordered = sorted(bars, key=lambda b: b.dt)  # stable: preserves input order
+    result: list[Bar] = []
+    for b in ordered:
+        if result and b.dt == result[-1].dt:
+            result[-1] = b
+        else:
+            result.append(b)
+
+    reordered = sum(1 for i in range(1, len(bars)) if bars[i].dt < bars[i - 1].dt)
+    logger.warning(
+        "[CHART] Non-ascending bar series sanitized (issue #97): %d in, %d out, "
+        "%d backward transitions, %d duplicate timestamps dropped",
+        len(bars), len(result), reordered, len(bars) - len(result),
+    )
+    return result
+
+
+def _trade_dt_to_epoch(dt_str: str) -> int | None:
+    """Parse a Trade dt string into the epoch seconds used by candle times.
+
+    Candle times are produced by lightweight-charts as
+    ``pd.to_datetime(...).astype('int64') // 10**9``, i.e. naive datetimes are
+    treated as UTC.  Use ``calendar.timegm`` to match — NOT
+    ``datetime.timestamp()``, which would apply the machine's local offset and
+    shift every marker by the UTC offset.
+    """
+    if not dt_str:
+        return None
+    for fmt in _TRADE_DT_FORMATS:
+        try:
+            return calendar.timegm(datetime.strptime(dt_str, fmt).timetuple())
+        except ValueError:
+            continue
+    return None
+
+
+def _marker_candle_index(candle_times: list[int], dt_str: str) -> int | None:
+    """Find the candle whose window contains *dt_str*, or None (issue #97).
+
+    Trade bar indices are LIFETIME counters that keep growing across restarts,
+    while the chart only holds the in-memory bar window — anchoring markers by
+    index dropped recent markers (index past the end) and drew stale ones on
+    completely unrelated candles.  Map by timestamp instead.
+    """
+    ts = _trade_dt_to_epoch(dt_str)
+    if ts is None or not candle_times:
+        return None
+    idx = bisect_right(candle_times, ts) - 1
+    if idx < 0 or idx >= len(candle_times):
+        return None
+    return idx
 
 
 def _strip_motw() -> None:
@@ -136,6 +217,10 @@ def plot_backtest(
     if not bars:
         return
 
+    # Sanitize before ANY series is derived — the DataFrame, the BB overlays
+    # and candle_times must all come from the same ordering (issue #97).
+    bars = _ensure_ascending(bars)
+
     # Compute Bollinger Bands on full bar series
     bb_upper, bb_middle, bb_lower = _compute_bollinger(bars, bb_period, bb_std)
 
@@ -206,11 +291,11 @@ def plot_backtest(
     n_candles = len(candle_times)
 
     for i, t in enumerate(trades):
-        ei = t.entry_bar_index
-        xi = t.exit_bar_index
+        ei = _marker_candle_index(candle_times, t.entry_dt)
+        xi = _marker_candle_index(candle_times, t.exit_dt)
 
         # Entry marker
-        if 0 <= ei < n_candles:
+        if ei is not None:
             if t.side == OrderSide.LONG:
                 _add_marker(chart, candle_times[ei], 'belowBar', 'arrowUp',
                             '#1565C0', f"#{i+1} Entry {t.side.value} | {t.tag}")
@@ -219,7 +304,7 @@ def plot_backtest(
                             '#E040FB', f"#{i+1} Entry {t.side.value} | {t.tag}")
 
         # Exit marker
-        if 0 <= xi < n_candles:
+        if xi is not None:
             pnl_str = f"{t.pnl:+,}"
             bars_held = t.exit_bar_index - t.entry_bar_index
             if t.pnl >= 0:
@@ -242,14 +327,18 @@ def plot_backtest(
     # Zoom to specific trade if requested — use raw timestamps to avoid snapping
     if focus_trade_index is not None and 0 <= focus_trade_index < len(trades):
         ft = trades[focus_trade_index]
-        view_start = max(0, ft.entry_bar_index - _PAD_BEFORE)
-        view_end = min(n_candles - 1, ft.exit_bar_index + _PAD_AFTER)
-        start_ts = int(candle_times[view_start])
-        end_ts = int(candle_times[view_end])
-        chart.run_script(
-            f'{chart.id}.chart.timeScale().setVisibleRange('
-            f'{{from: {start_ts}, to: {end_ts}}})'
-        )
+        fei = _marker_candle_index(candle_times, ft.entry_dt)
+        fxi = _marker_candle_index(candle_times, ft.exit_dt)
+        # Fall back to the full view when the trade isn't in this bar window
+        if fei is not None and fxi is not None:
+            view_start = max(0, fei - _PAD_BEFORE)
+            view_end = min(n_candles - 1, fxi + _PAD_AFTER)
+            start_ts = int(candle_times[view_start])
+            end_ts = int(candle_times[view_end])
+            chart.run_script(
+                f'{chart.id}.chart.timeScale().setVisibleRange('
+                f'{{from: {start_ts}, to: {end_ts}}})'
+            )
 
     chart.show(block=True)
 
@@ -294,7 +383,9 @@ class LiveChart:
         bb_period: int = 20,
         bb_std: float = 2.0,
     ):
-        self._initial_bars = list(initial_bars)
+        # Sanitize once here so the candle series, the BB overlays and
+        # self._closes all come from the same ordering (issue #97).
+        self._initial_bars = _ensure_ascending(list(initial_bars))
         self._initial_trades = list(initial_trades)
         self._title = title
         self._bb_period = bb_period
@@ -302,7 +393,7 @@ class LiveChart:
         self._queue: queue.Queue = queue.Queue()
         self._alive = False
         # Track closes for incremental BB computation
-        self._closes: list[float] = [b.close for b in initial_bars]
+        self._closes: list[float] = [b.close for b in self._initial_bars]
 
     # ── Thread-safe push API ──
 
@@ -386,15 +477,15 @@ class LiveChart:
             'time': bb_times, 'BB Lower': bb_lower,
         }).dropna())
 
-        # Initial trade markers
+        # Initial trade markers — anchored by timestamp, not lifetime bar
+        # index (issue #97)
         candle_times = chart.candle_data['time'].tolist()
-        n_candles = len(candle_times)
 
         for i, t in enumerate(trades):
-            ei = t.entry_bar_index
-            xi = t.exit_bar_index
+            ei = _marker_candle_index(candle_times, t.entry_dt)
+            xi = _marker_candle_index(candle_times, t.exit_dt)
 
-            if 0 <= ei < n_candles:
+            if ei is not None:
                 if t.side == OrderSide.LONG:
                     _add_marker(chart, candle_times[ei], 'belowBar', 'arrowUp',
                                 '#1565C0', f"#{i+1} Entry {t.side.value} | {t.tag}")
@@ -402,9 +493,9 @@ class LiveChart:
                     _add_marker(chart, candle_times[ei], 'aboveBar', 'arrowDown',
                                 '#E040FB', f"#{i+1} Entry {t.side.value} | {t.tag}")
 
-            if 0 <= xi < n_candles:
+            if xi is not None:
                 pnl_str = f"{t.pnl:+,}"
-                bars_held = xi - ei
+                bars_held = t.exit_bar_index - t.entry_bar_index
                 if t.pnl >= 0:
                     color = '#00BCD4'
                 elif t.side == OrderSide.LONG:
@@ -494,10 +585,10 @@ class LiveChart:
                 elif kind == "trade":
                     trade, index = msg[1], msg[2]
                     candle_times = chart.candle_data['time'].tolist()
-                    n = len(candle_times)
-                    ei, xi = trade.entry_bar_index, trade.exit_bar_index
+                    ei = _marker_candle_index(candle_times, trade.entry_dt)
+                    xi = _marker_candle_index(candle_times, trade.exit_dt)
 
-                    if 0 <= ei < n:
+                    if ei is not None:
                         if trade.side == OrderSide.LONG:
                             _add_marker(chart, candle_times[ei], 'belowBar', 'arrowUp',
                                         '#1565C0', f"#{index+1} Entry {trade.side.value} | {trade.tag}")
@@ -505,9 +596,9 @@ class LiveChart:
                             _add_marker(chart, candle_times[ei], 'aboveBar', 'arrowDown',
                                         '#E040FB', f"#{index+1} Entry {trade.side.value} | {trade.tag}")
 
-                    if 0 <= xi < n:
+                    if xi is not None:
                         pnl_str = f"{trade.pnl:+,}"
-                        bars_held = xi - ei
+                        bars_held = trade.exit_bar_index - trade.entry_bar_index
                         if trade.pnl >= 0:
                             color = '#00BCD4'
                         elif trade.side == OrderSide.LONG:

@@ -1045,6 +1045,21 @@ class LiveRunner:
         Same sequence as BacktestEngine.run() (engine.py:53-65).
         When suppress_strategy is True, only updates DataStore (no trading).
         """
+        # Monotonic guard (issue #97). A session's final 1-min bar can sit
+        # unfinalized in the BarBuilder until the next morning's resubscribe
+        # flushes it; reset_stale_tracking() has disarmed the aggregator's
+        # out-of-order guard by then, so the aggregator re-opens an already
+        # emitted window and finalizes a stub duplicate. That stub is junk
+        # built from 1-2 stale 1-min bars — it must not reach the DataStore,
+        # the strategy or _aggregated_bars (a non-ascending series silently
+        # blanks the lightweight-charts pane).
+        if self._aggregated_bars and bar.dt <= self._aggregated_bars[-1].dt:
+            logger.warning(
+                "[LIVE] Dropped out-of-order aggregated bar: %s <= last %s",
+                bar.dt, self._aggregated_bars[-1].dt,
+            )
+            return
+
         new_mode = self._check_mode_override()
         if new_mode:
             self._apply_mode_switch(new_mode)
@@ -1363,7 +1378,10 @@ class LiveRunner:
         if interval == self.target_interval:
             bars = list(self._aggregated_bars)
             partial = self.aggregator.get_partial_bar()
-            if partial is not None:
+            # A partial at/behind the last finalized bar is an orphan-window
+            # artefact — appending it makes the series non-ascending, which
+            # silently blanks the chart (issue #97).
+            if partial is not None and (not bars or partial.dt > bars[-1].dt):
                 bars.append(partial)
             return bars
         return aggregate_bars(list(self._1m_bars), interval)

@@ -3780,7 +3780,10 @@ class BacktestApp:
         # reflects the CURRENT timeframe, not the one that last finalized
         # (issue #44 — user saw H1 chart stuck an hour behind).
         partial = self._live_runner.get_partial_bar()
-        if partial is not None:
+        # A partial at/behind the last finalized bar is an orphan-window
+        # artefact — appending it makes the series non-ascending, which
+        # silently blanks the chart (issue #97).
+        if partial is not None and (not bars or partial.dt > bars[-1].dt):
             bars.append(partial)
         result = self._live_runner.get_result()
         trades = list(result.trades)
