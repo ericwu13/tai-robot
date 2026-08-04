@@ -171,6 +171,60 @@ class RegimeManager:
             pass
         return None
 
+    # ── Scheduled-event gate (news calendar) ──
+
+    def set_event_risk(self, event_name: str) -> None:
+        """Stamp or clear the selector's ``_event_risk`` gate.
+
+        The stored value is the EVENT NAME; falsy clears the flag (see
+        ``StrategySelector.select``). Nothing else stamps it, so nothing
+        else clears it — leave it set and the selector sits out forever.
+
+        Persisted by patching ``last_features`` in ``regime_state.json``
+        in place: ``save_state`` demands a Recommendation this call has
+        no business inventing, and the surrounding pending-recommendation
+        block must survive untouched.
+        """
+        if event_name:
+            if self._state.last_features.get("_event_risk") == event_name:
+                return
+            self._state.last_features["_event_risk"] = event_name
+        else:
+            if "_event_risk" not in self._state.last_features:
+                return
+            self._state.last_features.pop("_event_risk", None)
+        self._patch_state_features()
+
+    def _patch_state_features(self) -> None:
+        """Write ``last_features`` back to regime_state.json atomically."""
+        import json
+        try:
+            d = {}
+            if os.path.exists(self._state_path):
+                with open(self._state_path, encoding="utf-8") as f:
+                    d = json.load(f)
+            if not isinstance(d, dict):
+                d = {}
+            d["last_features"] = self._state.last_features
+            tmp = self._state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._state_path)
+        except Exception as e:
+            logger.warning("[REGIME] Could not persist last_features: %s", e)
+
+    def current_recommendation(self) -> Recommendation:
+        """Re-run the selector against the CURRENT state, without classifying.
+
+        Used by the news circuit breaker when it hands a deployed event
+        strategy back to regime control: the regime's own view has not
+        changed, so the leg that should be running is whatever the
+        selector says right now (including a ``_event_risk`` sit-out).
+        """
+        return self._selector.select(self._state, self.cfg)
+
     def mark_recommendation_executed(self, executed_at: str) -> None:
         """Mark the pending next_session recommendation as executed."""
         try:
