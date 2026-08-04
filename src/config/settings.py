@@ -72,6 +72,23 @@ class StrategyConfig:
 
 
 @dataclass
+class NewsConfig:
+    """News/event framework paths and gates (see ``src.news``).
+
+    All paths are empty by default — the feature is off until an operator
+    points them at the files the external n8n workflow writes. Nothing
+    here is ever hardcoded: real paths live only in settings.yaml.
+    """
+    enabled: bool = False
+    signal_path: str = ""          # circuit-breaker signal JSON
+    events_path: str = ""          # scheduled-event calendar JSON
+    ledger_path: str = ""          # consumed signal_id ledger JSON
+    max_signal_age_sec: int = 900
+    tier2_enabled: bool = False    # forced-entry event strategies
+    calendar_min_severity: str = "high"
+
+
+@dataclass
 class LoggingConfig:
     level: str = "INFO"
     log_dir: str = "logs"
@@ -86,6 +103,7 @@ class AppConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    news: NewsConfig = field(default_factory=NewsConfig)
 
 
 def _build_dataclass(cls, data: dict):
@@ -120,5 +138,6 @@ def load_config(path: str | Path = "settings.yaml") -> AppConfig:
         risk=_build_dataclass(RiskConfig, raw.get("risk")),
         strategy=_build_dataclass(StrategyConfig, raw.get("strategy")),
         logging=_build_dataclass(LoggingConfig, raw.get("logging")),
+        news=_build_dataclass(NewsConfig, raw.get("news")),
     )
     return cfg

@@ -2,8 +2,9 @@
 
 The selector reads the state's ``last_features`` (the classifier
 ``to_dict()`` plus the ``_paused`` / ``_vol_spike`` flags stamped by the
-state machine) and returns a Recommendation that the switching runner
-applies at session boundaries.
+state machine, and ``_event_risk`` stamped from the news calendar) and
+returns a Recommendation that the switching runner applies at session
+boundaries.
 """
 
 from dataclasses import dataclass
@@ -31,6 +32,15 @@ class StrategySelector:
         # Paused
         if state.last_features.get("_paused"):
             return Recommendation("hold", "", reason="翻轉計數暫停中 flip-counter pause active")
+
+        # Scheduled event risk — the flag value is the event NAME, stamped
+        # from the news calendar. Deliberate gate: it outranks the vol-spike
+        # heuristic below (both sit out, but this one is a known date).
+        event = state.last_features.get("_event_risk")
+        if event:
+            return Recommendation(
+                "sit_out", "",
+                reason=f"重大事件迴避 scheduled event risk — sit out: {event}")
 
         # Vol spike
         if state.last_features.get("_vol_spike"):
