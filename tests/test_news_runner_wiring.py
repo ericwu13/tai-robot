@@ -133,6 +133,20 @@ def _write_events(path, events, updated_at=IN_SESSION):
                    "events": events}, f)
 
 
+def _fresh_bar(runner):
+    """A new bar strictly after the runner's last aggregated bar.
+
+    Since issue #97/#100, _process_aggregated_bar drops any bar whose dt
+    is not strictly newer than the last recorded one — re-feeding
+    _aggregated_bars[-1] never reaches the strategy. Tests that exercise
+    the news_idle gate must feed a genuinely NEW bar, as the aggregator
+    does in production.
+    """
+    from dataclasses import replace
+    last = runner._aggregated_bars[-1]
+    return replace(last, dt=last.dt + timedelta(minutes=1))
+
+
 def _open_position(runner, price=22500):
     runner.broker.position_size = 1
     runner.broker.position_side = OrderSide.LONG
@@ -212,17 +226,16 @@ class TestRiskOff:
 
         ran = []
         runner.strategy.on_bar = lambda *a, **k: ran.append(1)
-        bar = runner._aggregated_bars[-1]
         runner.regime_idle = False   # isolate news_idle as the only gate
 
         before = len(runner.data_store)
-        runner._process_aggregated_bar(bar)
+        runner._process_aggregated_bar(_fresh_bar(runner))
         assert ran == []                       # no trading
         assert len(runner.data_store) == before + 1   # bars still flow
 
-        # Positive control: the same call trades once suppression lifts.
+        # Positive control: the next bar trades once suppression lifts.
         runner.news_idle = False
-        runner._process_aggregated_bar(bar)
+        runner._process_aggregated_bar(_fresh_bar(runner))
         assert ran == [1]
 
     def test_clear_releases(self, tmp_path):
@@ -473,7 +486,7 @@ class TestCalendarGate:
         ran = []
         runner.strategy.on_bar = lambda *a, **k: ran.append(1)
         runner.regime_idle = False   # isolate news_idle as the only gate
-        runner._process_aggregated_bar(runner._aggregated_bars[-1])
+        runner._process_aggregated_bar(_fresh_bar(runner))
         assert ran == [1]
 
     def test_missing_calendar_does_not_gate(self, tmp_path):
