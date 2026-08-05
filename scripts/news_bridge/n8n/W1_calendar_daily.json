@@ -1,0 +1,53 @@
+{
+  "name": "W1 Calendar sweep (daily)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Daily 10:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\calendar_bridge.py --out C:\\n8n-bridge\\events.json"
+      },
+      "name": "Publish events.json",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        220,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 10:00": {
+      "main": [
+        [
+          {
+            "node": "Publish events.json",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "timezone": "Asia/Taipei"
+  },
+  "id": "NewsW1Calendar00"
+}

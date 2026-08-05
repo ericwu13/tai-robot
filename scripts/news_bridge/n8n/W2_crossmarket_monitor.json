@@ -1,0 +1,57 @@
+{
+  "name": "W2 Cross-market monitor (night session)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/2 15-23 * * *"
+            },
+            {
+              "field": "cronExpression",
+              "expression": "*/2 0-4 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every 2 min (15:00-05:00 TPE)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --once"
+      },
+      "name": "Check SOXX/TSM/QQQ",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every 2 min (15:00-05:00 TPE)": {
+      "main": [
+        [
+          {
+            "node": "Check SOXX/TSM/QQQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "timezone": "Asia/Taipei"
+  },
+  "id": "NewsW2Monitor000"
+}

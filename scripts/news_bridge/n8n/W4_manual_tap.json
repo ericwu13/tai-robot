@@ -1,0 +1,214 @@
+{
+  "name": "W4 Manual tap (Discord confirmation link)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "news-tap-CHANGE-THIS-TO-A-LONG-RANDOM-SECRET",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "name": "Tap webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "news-tap"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.query.action }}",
+                    "rightValue": "deploy_short",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "deploy_short"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.query.action }}",
+                    "rightValue": "deploy_long",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "deploy_long"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.query.action }}",
+                    "rightValue": "risk_off",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "risk_off"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.query.action }}",
+                    "rightValue": "clear",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "clear"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Route action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire deploy_short"
+      },
+      "name": "Fire deploy_short",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        480,
+        -150
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire deploy_long"
+      },
+      "name": "Fire deploy_long",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        480,
+        -50
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire risk_off"
+      },
+      "name": "Fire risk_off",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        480,
+        50
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire clear"
+      },
+      "name": "Fire clear",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        480,
+        150
+      ]
+    }
+  ],
+  "connections": {
+    "Tap webhook": {
+      "main": [
+        [
+          {
+            "node": "Route action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route action": {
+      "main": [
+        [
+          {
+            "node": "Fire deploy_short",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fire deploy_long",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fire risk_off",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fire clear",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "timezone": "Asia/Taipei"
+  },
+  "id": "NewsW4ManualTap0"
+}
