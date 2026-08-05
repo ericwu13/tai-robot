@@ -22,7 +22,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\calendar_bridge.py --out C:\\n8n-bridge\\events.json"
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\calendar_bridge.py --out C:\\Users\\eric8\\n8n-bridge\\events.json"
       },
       "name": "Publish events.json",
       "type": "n8n-nodes-base.executeCommand",
