@@ -104,13 +104,23 @@ evolution:
 # by an external n8n workflow. Leave the paths empty to keep the feature
 # off; the bot treats every file as untrusted and fails open on any parse
 # problem, so a broken automation can never halt trading indefinitely.
+#
+# ENABLEMENT IS PER-BOT, not global. `enabled` and `tier2_enabled` below
+# are only the deploy dialog's REMEMBERED DEFAULTS — the checkboxes in
+# 「多空切換 Regime Switching」decide whether THIS bot gets the breaker,
+# and a resumed bot's own session.json overrides these defaults. That is
+# what lets a news-enabled bot run beside an untouched baseline bot
+# without one risk_off flattening both.
+# The paths / max_signal_age_sec / calendar_min_severity below ARE shared
+# by every news-enabled bot (they describe the n8n files themselves).
 news:
-  enabled: false
+  enabled: false             # dialog default only — per-bot checkbox decides
   signal_path: ""            # circuit-breaker signal JSON (risk_off / deploy_* / clear)
   events_path: ""            # scheduled-event calendar JSON (CPI, FOMC, ...)
   ledger_path: ""            # consumed signal_id ledger — gives exactly-once acting
   max_signal_age_sec: 900    # reject signals older than this (15 min)
-  tier2_enabled: false       # true = allow forced-entry event strategies (deploy_short/long)
+  tier2_enabled: false       # dialog default only — per-bot checkbox decides
+                             # true = allow forced-entry event strategies (deploy_short/long)
   calendar_min_severity: "high"   # "high" | "medium" | "low" — minimum severity that gates a session
 
 # ── Regime switching ───────────────────────────────────────────────────

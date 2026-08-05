@@ -722,11 +722,19 @@ class RegimeSwitchingRunner(LiveRunner):
         # entries the operator (or n8n) deliberately shut off. A saved
         # "news_*" leg is NOT re-instantiated below — the revert step
         # hands the bot back to regime control at the next gap.
-        self._breaker_state = BreakerState.from_dict(session_data.get("news"))
-        self._sync_news_idle()
-        if self._breaker_state.suppressed:
-            logger.info("[NEWS] Restored suppression from session: %s",
-                        self._breaker_state.suppressed_reason or "(no reason)")
+        #
+        # Only when news is enabled for THIS deploy. Restoring a
+        # suppression into a bot the user just opted out of would idle it
+        # with no poller left to ever clear the flag.
+        if self._news_enabled:
+            self._breaker_state = BreakerState.from_dict(session_data.get("news"))
+            self._sync_news_idle()
+            if self._breaker_state.suppressed:
+                logger.info("[NEWS] Restored suppression from session: %s",
+                            self._breaker_state.suppressed_reason or "(no reason)")
+        elif session_data.get("news"):
+            logger.info("[NEWS] Ignoring persisted breaker state — news is "
+                        "disabled for this deploy")
 
         saved_leg = session_data.get("active_leg", "idle")
         if saved_leg in ("long", "short"):
@@ -776,6 +784,12 @@ class RegimeSwitchingRunner(LiveRunner):
                 "active_leg": self._active_leg,
                 "long_strategy": self._long_strategy_name,
                 "short_strategy": self._short_strategy_name,
+                # Per-bot news enablement, so the deploy dialog can
+                # pre-tick this bot's own choice on resume (settings.yaml
+                # only supplies the default for a brand-new bot).
+                "news_enabled": self._news_enabled,
+                "news_tier2_enabled": bool(
+                    self._news_cfg.tier2_enabled if self._news_cfg else False),
                 "news": self._breaker_state.to_dict(),
             }
             save_session(self._session_path, data)

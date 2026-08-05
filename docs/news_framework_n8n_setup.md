@@ -189,17 +189,30 @@ Phone flow: Discord alert → tap link → browser opens the webhook → done. ~
 ```yaml
 # settings.yaml (never committed)
 news:
-  enabled: true
+  enabled: true                  # deploy-dialog DEFAULT only (see below)
   signal_path: "C:/n8n-bridge/signal.json"
   events_path: "C:/n8n-bridge/events.json"
   ledger_path: ""                # empty = bot dir default
   max_signal_age_sec: 900
-  tier2_enabled: false           # keep false until the paper record justifies it
+  tier2_enabled: false           # deploy-dialog DEFAULT only; keep false until
+                                 # the paper record justifies it
   calendar_min_severity: "high"
 ```
 
+**Enablement is per-bot, not global.** `enabled` / `tier2_enabled` above only
+pre-tick the deploy dialog. The actual switches are two checkboxes inside
+「多空切換 Regime Switching」 in the bot-session dialog —
+`📰 新聞斷路器 News circuit breaker` and, under it,
+`允許強制進場 allow forced-entry deploys (Tier 2)`. A resumed bot pre-ticks from its
+own `session.json` instead. That is what makes the A/B in step 5 below possible: the
+news bot and the baseline bot read the same `settings.yaml`, but only the one whose
+checkbox was ticked gets the breaker, so a `risk_off` never flattens both.
+
+The paths, `max_signal_age_sec` and `calendar_min_severity` ARE shared — they describe
+the n8n files themselves, not a policy choice.
+
 News gating runs **only on regime-switching deploys** (bot type 2). Plain LiveRunner
-bots ignore all of it.
+bots ignore all of it, and the checkboxes are hidden unless regime switching is on.
 
 ---
 
@@ -216,7 +229,8 @@ bots ignore all of it.
 3. **Restart test:** trigger suppression, restart the bot, confirm suppression and
    consumed ids survive (session restore).
 4. Build W1–W4, repeat 1–2 through n8n end-to-end.
-5. Run the news-enabled **paper** bot alongside the unchanged baseline regime bot
+5. Run the news-enabled **paper** bot alongside the unchanged baseline regime bot —
+   deploy the baseline with the news checkbox UNTICKED and the news bot with it ticked
    (A/B, reports are namespaced per bot). Tier 2 stays off until Tier 1 + the W3 log
    look sane for ≥2 weeks; real-money mode only after the paper record clears the same
    bar as any evolved strategy (≥14 days, ≥30 trades, positive with margin — remember

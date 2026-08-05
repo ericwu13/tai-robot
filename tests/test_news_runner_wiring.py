@@ -553,6 +553,41 @@ class TestRestart:
         assert runner2.news_idle is True
         assert runner2.breaker_state.event_name == "US CPI"
 
+    def test_session_records_per_bot_news_flags(self, tmp_path):
+        """The dialog pre-ticks a resumed bot from these, not settings.yaml."""
+        runner = _make_runner(tmp_path,
+                              _news_cfg(tmp_path, tier2_enabled=True))
+        runner._auto_save_session()
+        with open(runner._session_path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["news_enabled"] is True
+        assert data["news_tier2_enabled"] is True
+
+    def test_baseline_bot_records_news_off(self, tmp_path):
+        runner = _make_runner(tmp_path, bot_name="baseline")
+        runner._auto_save_session()
+        with open(runner._session_path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["news_enabled"] is False
+        assert data["news_tier2_enabled"] is False
+
+    def test_disabled_deploy_ignores_persisted_suppression(self, tmp_path):
+        """Opting a bot out must not leave it idled by a restored gate —
+        with no news poller left, nothing could ever clear it."""
+        runner1 = _make_runner(tmp_path, _news_cfg(tmp_path))
+        _write_signal(tmp_path / "signal.json")
+        runner1._check_news(IN_SESSION)
+        assert runner1.news_idle is True
+        with open(runner1._session_path, encoding="utf-8") as f:
+            session_data = json.load(f)
+        assert session_data["news"]["signal_suppressed"] is True
+
+        # Same bot dir, redeployed with the news checkbox unticked.
+        runner2 = _make_runner(tmp_path, news_cfg=None)
+        runner2.restore_session(session_data)
+        assert runner2.news_idle is False
+        assert runner2.breaker_state == BreakerState()
+
     def test_session_without_news_block_restores_clean(self, tmp_path):
         runner = _make_runner(tmp_path, _news_cfg(tmp_path))
         runner.restore_session({"broker": runner.broker.to_dict()})
