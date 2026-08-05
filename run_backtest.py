@@ -261,8 +261,8 @@ def _init_com():
         _com_available = False
 
 
-def _resolve_news_path(path: str) -> str:
-    """Absolutise a configured news path against ``project_root``.
+def _resolve_news_path(path: str, base_dir: str | None = None) -> str:
+    """Absolutise a configured news path against ``base_dir``/``project_root``.
 
     n8n usually writes absolute paths, but a relative one in
     settings.yaml must not resolve against whatever cwd a frozen EXE
@@ -270,25 +270,53 @@ def _resolve_news_path(path: str) -> str:
     """
     if not path:
         return ""
-    return path if os.path.isabs(path) else os.path.join(project_root, path)
+    if os.path.isabs(path):
+        return path
+    return os.path.join(base_dir if base_dir is not None else project_root, path)
 
 
-def _build_news_config(settings: dict):
-    """NewsConfig from the loaded settings dict, or None when disabled.
+def _resolve_news_config(
+    settings: dict,
+    *,
+    regime_enabled: bool,
+    news_enabled: bool,
+    tier2_enabled: bool,
+    base_dir: str | None = None,
+):
+    """Resolve THIS deploy's NewsConfig, or None when news must stay off.
 
-    Returning None (not a disabled NewsConfig) keeps the runner's
+    News enablement is PER-BOT, not global: the whole point of the
+    rollout is a news-enabled paper bot running beside an untouched
+    baseline, and a global switch would have one ``risk_off`` flatten
+    both. So the settings file supplies only paths + defaults; the
+    dialog checkboxes for this deploy decide.
+
+    Precedence:
+
+    - ``regime_enabled`` False → None. The breaker rides
+      ``RegimeSwitchingRunner.on_status_poll``; a plain LiveRunner has
+      nowhere to hang it.
+    - ``news_enabled`` False → None (this deploy opted out).
+    - otherwise a NewsConfig whose paths/age/severity come from
+      settings.yaml and whose ``tier2_enabled`` comes from THIS
+      deploy's checkbox — forced-entry is a per-bot risk decision.
+
+    Returning None rather than a disabled NewsConfig keeps the runner's
     "no news config → never touch the filesystem" path the default.
     """
-    if not settings.get("news_enabled", False):
+    if not regime_enabled or not news_enabled:
         return None
     from src.config.settings import NewsConfig
     return NewsConfig(
         enabled=True,
-        signal_path=_resolve_news_path(settings.get("news_signal_path", "")),
-        events_path=_resolve_news_path(settings.get("news_events_path", "")),
-        ledger_path=_resolve_news_path(settings.get("news_ledger_path", "")),
+        signal_path=_resolve_news_path(
+            settings.get("news_signal_path", ""), base_dir),
+        events_path=_resolve_news_path(
+            settings.get("news_events_path", ""), base_dir),
+        ledger_path=_resolve_news_path(
+            settings.get("news_ledger_path", ""), base_dir),
         max_signal_age_sec=int(settings.get("news_max_signal_age_sec", 900)),
-        tier2_enabled=bool(settings.get("news_tier2_enabled", False)),
+        tier2_enabled=bool(tier2_enabled),
         calendar_min_severity=str(
             settings.get("news_calendar_min_severity", "high")),
     )
@@ -364,6 +392,9 @@ def _load_settings():
             # News/event framework (src.news). Paths are written by an
             # external n8n workflow; empty paths keep the feature inert.
             # Defaults mirror src.config.settings.NewsConfig exactly.
+            # NOTE: `enabled` / `tier2_enabled` are only the DEPLOY DIALOG'S
+            # remembered defaults — actual enablement is per-bot, decided by
+            # the dialog checkboxes (see _resolve_news_config).
             news = data.get("news", {}) or {}
             cfg["news_enabled"] = bool(news.get("enabled", False))
             cfg["news_signal_path"] = str(news.get("signal_path", "") or "")
@@ -5140,7 +5171,8 @@ class BacktestApp:
                 idx = tree.index(sel[0])
                 name, sess = existing_bots[idx]
                 result[0] = (name, sess, mode_var.get(), loss_var.get(),
-                             regime_var.get(), regime_long_var.get(), regime_short_var.get())
+                             regime_var.get(), regime_long_var.get(), regime_short_var.get(),
+                             news_var.get(), news_tier2_var.get())
                 dlg.destroy()
 
             btn_row = ttk.Frame(content)
@@ -5195,6 +5227,11 @@ class BacktestApp:
                             regime_short_var.set(sess["short_strategy"])
                     else:
                         regime_var.set(False)
+                    # Per-bot news memory: the bot's own session.json wins
+                    # over the settings.yaml defaults on resume. The user
+                    # can still untick to run this bot without the breaker.
+                    news_var.set(bool(sess.get("news_enabled", False)))
+                    news_tier2_var.set(bool(sess.get("news_tier2_enabled", False)))
                     _toggle_regime_widgets()
 
             tree.bind("<<TreeviewSelect>>", on_select)
@@ -5233,7 +5270,8 @@ class BacktestApp:
                                      "Use 'Load' or enter a different name.", parent=dlg)
                 return
             result[0] = (name, None, mode_var.get(), loss_var.get(),
-                         regime_var.get(), regime_long_var.get(), regime_short_var.get())
+                         regime_var.get(), regime_long_var.get(), regime_short_var.get(),
+                         news_var.get(), news_tier2_var.get())
             dlg.destroy()
 
         ttk.Button(new_frame, text="建立 Create", command=on_create).pack(side=tk.LEFT)
@@ -5296,11 +5334,43 @@ class BacktestApp:
         short_label.grid(row=1, column=0, sticky=tk.W, padx=(10, 4), pady=2)
         short_combo.grid(row=1, column=1, sticky=tk.W, padx=(0, 10), pady=2)
 
+        # News circuit breaker — PER-BOT, not global: the rollout runs a
+        # news-enabled bot beside an untouched baseline, so one risk_off
+        # must not flatten both. Lives inside the regime reveal because the
+        # breaker rides RegimeSwitchingRunner's 30s poll. Settings supply
+        # the remembered defaults; a resumed bot's session.json overrides
+        # them in on_select(), exactly like the regime strategy pair.
+        news_var = tk.BooleanVar(
+            value=bool(self._settings.get("news_enabled", False)))
+        news_tier2_var = tk.BooleanVar(
+            value=bool(self._settings.get("news_tier2_enabled", False)))
+
+        news_frame = ttk.Frame(regime_lf)
+        news_cb = ttk.Checkbutton(
+            news_frame, variable=news_var,
+            text="📰 新聞斷路器 News circuit breaker (此機器人 this bot only)")
+        news_cb.pack(anchor=tk.W, padx=10, pady=(2, 0))
+        tier2_cb = ttk.Checkbutton(
+            news_frame, variable=news_tier2_var,
+            text="允許強制進場 allow forced-entry deploys (Tier 2)")
+        tier2_cb.pack(anchor=tk.W, padx=30, pady=(0, 2))
+
+        def _toggle_news_widgets():
+            # Tier 2 is a sub-decision of the breaker: grey it out rather
+            # than hide it, so the layout doesn't jump (same pattern the
+            # trading-mode radios use when login is missing).
+            tier2_cb.config(state=tk.NORMAL if news_var.get() else tk.DISABLED)
+
+        news_cb.config(command=_toggle_news_widgets)
+
         def _toggle_regime_widgets():
             if regime_var.get():
                 regime_strat_frame.pack(fill=tk.X, pady=(0, 4))
+                news_frame.pack(fill=tk.X, pady=(0, 4))
             else:
                 regime_strat_frame.pack_forget()
+                news_frame.pack_forget()
+            _toggle_news_widgets()
             # Content height changed — refresh the scroll region so the newly
             # revealed dropdowns are reachable.
             _canvas.after_idle(_on_content_config)
@@ -5365,7 +5435,8 @@ class BacktestApp:
         if result is None:  # cancelled
             return
         bot_name, resume_session, trading_mode, loss_limit_str, \
-            regime_enabled, regime_long, regime_short = result
+            regime_enabled, regime_long, regime_short, \
+            news_enabled, news_tier2_enabled = result
         self._trading_mode = trading_mode
         try:
             loss_limit = max(0, int(loss_limit_str))
@@ -5537,10 +5608,15 @@ class BacktestApp:
         log_dir = os.path.join(project_root, "data", "live")
         if is_regime_deploy:
             from src.live.regime_switching_runner import RegimeSwitchingRunner
-            # News framework rides the switching runner's 30s poll, so it
-            # is only wired when BOTH news and regime are enabled. A
-            # plain LiveRunner deploy gets no news gating.
-            news_cfg = _build_news_config(self._settings)
+            # PER-BOT: only this deploy's checkbox turns the breaker on, so
+            # a news bot and a baseline bot can run side by side. A plain
+            # LiveRunner deploy never gets news gating.
+            news_cfg = _resolve_news_config(
+                self._settings,
+                regime_enabled=is_regime_deploy,
+                news_enabled=news_enabled,
+                tier2_enabled=news_tier2_enabled,
+            )
             self._live_runner = RegimeSwitchingRunner(
                 strategy, symbol, point_value=point_value,
                 log_dir=log_dir, bot_name=bot_name,
