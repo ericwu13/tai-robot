@@ -1,0 +1,4 @@
+[
+  {"date": "2026-08-12", "name": "US CPI (Jul)", "severity": "high", "sessions": ["NIGHT"]},
+  {"date": "2026-08-27", "name": "NVDA earnings (US after-close)", "severity": "high", "sessions": ["NIGHT"]}
+]
