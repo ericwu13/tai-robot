@@ -115,7 +115,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire deploy_short"
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire deploy_short"
       },
       "name": "Fire deploy_short",
       "type": "n8n-nodes-base.executeCommand",
@@ -127,7 +127,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire deploy_long"
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire deploy_long"
       },
       "name": "Fire deploy_long",
       "type": "n8n-nodes-base.executeCommand",
@@ -139,7 +139,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire risk_off"
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire risk_off"
       },
       "name": "Fire risk_off",
       "type": "n8n-nodes-base.executeCommand",
@@ -151,7 +151,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\n8n-bridge\\signal.json --force-fire clear"
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire clear"
       },
       "name": "Fire clear",
       "type": "n8n-nodes-base.executeCommand",
