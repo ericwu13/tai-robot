@@ -562,6 +562,47 @@ class TestDiscordDailyReport:
         assert "做空 Short" in msg
         assert "BbandSmaShortV3" in msg
 
+    def test_daily_report_market_regime_fallback(self):
+        """Non-regime bots show market_regime when present."""
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier("fake-token", "fake-channel",
+                                   bot_name="standalone")
+        sent = []
+        notifier._send = lambda msg, ch="": sent.append((msg, ch))
+
+        report = {
+            "date": "2026-04-11",
+            "strategy": {"name": "SMA Cross"},
+            "summary": {},
+            "market_regime": {"label": "trending-up", "adx": 30},
+        }
+        notifier.daily_report(report)
+
+        msg = sent[0][0]
+        assert "市場 Regime:" in msg
+        assert "趨勢上漲" in msg or "trending-up" in msg
+
+    def test_daily_report_no_market_regime(self):
+        """Regime line is absent when market_regime is None or missing."""
+        from src.live.discord_notify import DiscordNotifier
+
+        notifier = DiscordNotifier("fake-token", "fake-channel",
+                                   bot_name="standalone")
+
+        for mr_value in (None, {}, {"label": ""}):
+            sent = []
+            notifier._send = lambda msg, ch="": sent.append((msg, ch))
+            report = {
+                "date": "2026-04-11",
+                "strategy": {"name": "SMA Cross"},
+                "summary": {},
+            }
+            if mr_value is not None:
+                report["market_regime"] = mr_value
+            notifier.daily_report(report)
+            assert "市場 Regime:" not in sent[0][0]
+
     def test_daily_report_zero_stats(self):
         """Reports with no trades / zero stats still render."""
         from src.live.discord_notify import DiscordNotifier

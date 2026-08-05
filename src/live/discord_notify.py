@@ -384,6 +384,8 @@ class DiscordNotifier:
             eff = regime_sw.get("effective_regime")
             if eff:
                 lines.append(f"市場 Regime: {_regime_label(eff)}")
+        elif (mr := report.get("market_regime")) and mr.get("label"):
+            lines.append(f"市場 Regime: {_regime_label(mr['label'])}")
         lines.extend([
             f"今日 Today: {int(today_pnl):+,} · {today_trades} 筆",
             f"累計 Cumul: {int(total_pnl):+,} · {total_trades} 筆 · "
