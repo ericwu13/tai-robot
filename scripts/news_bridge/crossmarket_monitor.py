@@ -44,6 +44,14 @@ THRESHOLDS = {
     "TSM":  (-3.5, 3.5),   # TSMC ADR
     "QQQ":  (-2.0, 2.0),   # Nasdaq proxy
 }
+# Regime-vote thresholds — ALL symbols must breach for a vote to fire.
+# Lower than signal thresholds (a vote accelerates confirmation, it does
+# not flatten the book).
+VOTE_THRESHOLDS = {
+    "SOXX": (-2.5, 2.5),
+    "TSM":  (-2.0, 2.0),
+    "QQQ":  (-2.0, 2.0),
+}
 QUOTE_MAX_AGE_SEC = 600    # discard quotes older than 10 min (closed market)
 NIGHT_START, NIGHT_END = 15, 5   # TPE hours the monitor is active (15:00-05:00)
 
@@ -123,6 +131,30 @@ def save_state(path: Path, state: dict) -> None:
     os.replace(tmp, path)
 
 
+def night_session_key(now: datetime) -> str:
+    """Return ``"YYYY-MM-DD|NIGHT"`` for the night session containing *now*."""
+    if now.hour >= NIGHT_START:
+        return f"{now.strftime('%Y-%m-%d')}|NIGHT"
+    return f"{(now - timedelta(days=1)).strftime('%Y-%m-%d')}|NIGHT"
+
+
+def write_regime_vote(path: str, direction: str, session_key: str) -> None:
+    """Write the regime-vote sidecar file atomically."""
+    payload = {
+        "version": 1,
+        "direction": direction,
+        "expires_after_session": session_key,
+        "source": "W2",
+    }
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(out) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, out)
+    print(f"  VOTE WRITTEN: {direction} for {session_key} -> {out}")
+
+
 def in_night_window(now: datetime) -> bool:
     return now.hour >= NIGHT_START or now.hour < NIGHT_END
 
@@ -134,11 +166,13 @@ def check_once(args, state: dict) -> dict:
           f"{', '.join(THRESHOLDS)} (min move override: {args.min_move or '-'})")
 
     fired_down, fired_up, details = [], [], []
+    quotes: dict[str, dict | None] = {}
     for sym, (down_th, up_th) in THRESHOLDS.items():
         if args.min_move is not None:
             down_th, up_th = -args.min_move, args.min_move
         q = fetch_quote(sym)
         if q is None:
+            quotes[sym] = None
             continue
         age = time.time() - q["quote_time"]
         stale = age > QUOTE_MAX_AGE_SEC
@@ -147,7 +181,9 @@ def check_once(args, state: dict) -> dict:
                 + (", STALE — ignored" if stale and not args.ignore_freshness else "") + ")")
         print(line)
         if stale and not args.ignore_freshness:
+            quotes[sym] = None
             continue
+        quotes[sym] = q
         details.append(f"{sym} {q['pct']:+.2f}%")
         if q["pct"] <= down_th:
             fired_down.append(f"{sym} {q['pct']:+.2f}%")
@@ -173,12 +209,43 @@ def check_once(args, state: dict) -> dict:
         print("  UPSIDE breach — Discord alert only (no auto signal, by design)")
     elif fired_down or fired_up:
         print("  breach already fired for this US session — deduped")
+
+    # Regime vote: ALL vote-threshold symbols must breach in the same
+    # direction.  Separate from the signal (which fires on ANY single
+    # breach) — a vote accelerates regime confirmation, it doesn't
+    # flatten the book.
+    vote_out = getattr(args, "vote_out", None)
+    if vote_out and state.get(f"vote:{us_date}") is None:
+        vote_up, vote_down = 0, 0
+        for sym, (vd, vu) in VOTE_THRESHOLDS.items():
+            q = quotes.get(sym)
+            if q is None:
+                break
+            if q["pct"] >= vu:
+                vote_up += 1
+            elif q["pct"] <= vd:
+                vote_down += 1
+        else:
+            sess_key = night_session_key(now)
+            if vote_up == len(VOTE_THRESHOLDS):
+                write_regime_vote(vote_out, "trending-up", sess_key)
+                state[f"vote:{us_date}"] = "trending-up"
+                post_discord(args.discord_webhook,
+                             f"📊 **Regime vote** — trending-up ({', '.join(details)})")
+            elif vote_down == len(VOTE_THRESHOLDS):
+                write_regime_vote(vote_out, "trending-down", sess_key)
+                state[f"vote:{us_date}"] = "trending-down"
+                post_discord(args.discord_webhook,
+                             f"📊 **Regime vote** — trending-down ({', '.join(details)})")
+
     return state
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cross-market monitor -> signal.json")
     ap.add_argument("--signal-out", required=True, help="signal.json path the bot reads")
+    ap.add_argument("--vote-out", default=None,
+                    help="regime_vote.json path (regime confirmation acceleration)")
     ap.add_argument("--once", action="store_true", help="single check then exit")
     ap.add_argument("--loop", type=int, metavar="SEC",
                     help="poll every SEC seconds (night window only)")

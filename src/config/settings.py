@@ -83,9 +83,13 @@ class NewsConfig:
     signal_path: str = ""          # circuit-breaker signal JSON
     events_path: str = ""          # scheduled-event calendar JSON
     ledger_path: str = ""          # consumed signal_id ledger JSON
+    regime_vote_path: str = ""     # regime-vote sidecar JSON (confirmation acceleration)
     max_signal_age_sec: int = 900
     tier2_enabled: bool = False    # forced-entry event strategies
     calendar_min_severity: str = "high"
+    regime_vote_thresholds: dict = field(default_factory=lambda: {
+        "soxx_pct": 2.5, "tsm_pct": 2.0, "qqq_pct": 2.0,
+    })
 
 
 @dataclass

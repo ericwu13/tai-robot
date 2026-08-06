@@ -206,7 +206,8 @@ class RegimeSwitchingRunner(LiveRunner):
             return None
 
         catch_up = now >= sess.close_dt
-        rec = self._manager.classify_session(sess.open_date, "NIGHT")
+        vote_direction = self._read_regime_vote(sess.key)
+        rec = self._manager.classify_session(sess.open_date, "NIGHT", vote_direction=vote_direction)
         if rec is None:
             # Insufficient bars or classifier error. The post-close
             # catch-up trigger would otherwise retry (and warn) on every
@@ -380,6 +381,26 @@ class RegimeSwitchingRunner(LiveRunner):
             except Exception:
                 pass
         return "sit_out (idle)"
+
+    # ── Regime vote (news-as-votes acceleration) ──
+
+    def _read_regime_vote(self, session_key: str) -> str | None:
+        """Read and consume the regime vote file, returning the direction
+        if it's valid for *session_key*, or None otherwise."""
+        cfg = self._news_cfg
+        if not cfg or not getattr(cfg, "regime_vote_path", ""):
+            return None
+        from ..news.regime_vote import read_regime_vote, consume_regime_vote
+        try:
+            vote = read_regime_vote(cfg.regime_vote_path, session_key)
+            direction = vote.direction if vote else None
+            if vote:
+                logger.info("[REGIME-VOTE] consumed vote: %s (source=%s)", vote.direction, vote.source)
+            consume_regime_vote(cfg.regime_vote_path)
+            return direction
+        except Exception as exc:
+            logger.warning("[REGIME-VOTE] failed to read vote: %s", exc)
+            return None
 
     # ── News circuit breaker (Phase 2) ──
 
