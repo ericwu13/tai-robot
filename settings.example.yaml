@@ -118,14 +118,28 @@ news:
   signal_path: ""            # circuit-breaker signal JSON (risk_off / deploy_* / clear)
   events_path: ""            # scheduled-event calendar JSON (CPI, FOMC, ...)
   ledger_path: ""            # consumed signal_id ledger — gives exactly-once acting
+  regime_vote_path: ""       # regime-vote sidecar JSON — cross-market confirmation acceleration
   max_signal_age_sec: 900    # reject signals older than this (15 min)
   tier2_enabled: false       # dialog default only — per-bot checkbox decides
                              # true = allow forced-entry event strategies (deploy_short/long)
   calendar_min_severity: "high"   # "high" | "medium" | "low" — minimum severity that gates a session
+  regime_vote_thresholds:    # all-symbols-must-breach thresholds for regime vote
+    soxx_pct: 2.5
+    tsm_pct: 2.0
+    qqq_pct: 2.0
 
 # ── Regime switching ───────────────────────────────────────────────────
-# Remembers the last-used strategy pair for the deploy dialog's regime
-# switching checkbox. All classification thresholds are internal defaults.
+# Strategy pair and ADX-based classification thresholds for the regime
+# switching bot. Thresholds default to the RegimeConfig dataclass values;
+# override them here to tune without code changes.
 regime:
   long_strategy: ""
   short_strategy: ""
+  adx_enter: 25.0              # ADX above this → trending
+  adx_exit: 20.0               # ADX below this → range-bound
+  adx_strong: 30.0             # fast-track confirmation (must be > adx_enter)
+  confirm_sessions: 2          # consecutive sessions to confirm a regime change
+  flip_pause_sessions: 5       # sessions to freeze after too many flips
+  max_flips_in_window: 3       # max flips before pausing
+  flip_window_sessions: 10     # sliding window for flip counting
+  classify_interval: 3600      # bar interval (seconds) for classification

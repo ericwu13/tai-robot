@@ -80,7 +80,8 @@ class RegimeManager:
     # ── Classification (Phase 3 wall-clock trigger) ──
 
     def classify_session(
-        self, session_date: str, session_slot: str
+        self, session_date: str, session_slot: str,
+        vote_direction: str | None = None,
     ) -> Recommendation | None:
         """Classify the current regime and produce a recommendation.
 
@@ -88,6 +89,11 @@ class RegimeManager:
         ``state.last_assessed`` prevents double-classification across
         restarts.  Returns the Recommendation, or None if insufficient
         data or dedup blocks.
+
+        *vote_direction*: cross-market regime vote (see
+        ``src.news.regime_vote``).  Passed through to the state machine
+        to accelerate confirmation when the vote agrees with the raw
+        technical classification.
         """
         if session_slot != "NIGHT":
             return None
@@ -102,7 +108,7 @@ class RegimeManager:
             if result is None:
                 logger.warning("[REGIME] Could not compute regime — insufficient bars")
                 return None
-            self._state = self._machine.step(self._state, result, self.cfg, session_date)
+            self._state = self._machine.step(self._state, result, self.cfg, session_date, vote_direction=vote_direction)
             rec = self._selector.select(self._state, self.cfg)
         except Exception as e:
             logger.exception("[REGIME] classify_session error: %s", e)
