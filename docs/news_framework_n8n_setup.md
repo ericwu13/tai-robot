@@ -115,19 +115,42 @@ without changes; the event list itself moves weekly).
 
 ## 3. Workflow W2 — Cross-market monitor (the primary fast trigger)
 
-**Trigger:** Schedule, every 2 min, **only between 15:00 and 05:00 TPE** (n8n cron:
-two ranges, `15:00–23:59` and `00:00–05:00`). Outside the night session there is nothing
-to monitor — the Taiwan day session doesn't overlap US trading.
+**Trigger:** Schedule, every 2 min, during the Taiwan **day** session and the **night**
+session (n8n cron: three ranges, `*/2 8-14`, `*/2 15-23`, `*/2 0-4` — i.e. 08:00–14:58,
+15:00–23:59, 00:00–05:00 TPE). The day session doesn't overlap US trading, but it does
+overlap Tokyo/Seoul — and Nasdaq futures run nearly around the clock. The day range runs
+to **14:58, not 13:58**: Korea and Japan print their closes 14:30–14:50 TPE, routinely the
+sharpest move of their session, and stopping earlier lets those quotes age out of the
+freshness window before the Taiwan night session opens at 15:00 (a KOSPI −4.8% close was
+lost exactly this way).
 
 **Nodes:**
-1. **HTTP Request ×3 (parallel)** — quotes for: `SOXX` (SOX proxy ETF), `TSM` (TSMC ADR),
-   `QQQ` (Nasdaq proxy). Finnhub `/quote` (free tier: real-time US, 60 calls/min — 3 calls
-   per 2 min is nothing). Verify freshness: each response carries a timestamp; discard
-   quotes older than 10 min (pre-market/closed).
-2. **Code node — threshold logic:**
+1. **HTTP Request ×N (parallel)** — quotes for the symbol table below (Yahoo v8 chart API,
+   keyless, in `scripts/news_bridge/crossmarket_monitor.py`; Finnhub `/quote` also works
+   for the US names). Verify freshness: each response carries a timestamp; discard quotes
+   older than that symbol's `max_age`. **That freshness guard is the only session logic
+   there is** — markets that are closed go stale and drop out of every decision, which is
+   what lets one table span Tokyo, Frankfurt and New York.
+   The allowance is **per symbol**, not global — match it to the feed's latency:
+   **600 s** US cash equities/ETFs (real-time on Yahoo: `SOXX`, `TSM`, `QQQ`),
+   **900 s** CME futures (~10 min delayed: `NQ=F`),
+   **1500 s** Asian/European cash (~15–20 min delayed: `ASML.AS`, `^STOXX50E`, `^N225`,
+   `^KS11`). A single 10-min guard looks right and silently throws away every non-US
+   symbol: in live smoke tests a KOSPI −4.07% print arrived 1208 s old while KOSPI was
+   open, and `NQ=F` came back at 603 s / 604 s with Globex trading — 3 s over the line,
+   every single poll.
+2. **Code node — threshold logic (two tiers):**
    - Intraday move = `(current − previousClose) / previousClose`.
-   - Fire `risk_off` when: SOXX ≤ −2.5% **or** TSM ≤ −3.5% **or** QQQ ≤ −2.0%.
+   - **Signal tier** (may auto-write `risk_off` on the downside): `SOXX` ±2.5%,
+     `TSM` ±3.5%, `QQQ` ±2.0%, `ASML.AS` ±3.0%.
+   - **Alert tier** (Discord only, both directions, **never** writes `signal.json`):
+     `^STOXX50E` ±2.0%, `NQ=F` ±1.5%, `^N225` ±2.0%, `^KS11` ±2.0%. These cover the hours
+     when the signal-tier markets are closed — context for the human, not an auto-trigger.
+   - Fire `risk_off` when any **signal-tier** symbol breaches on the downside.
    - Fire long-side alert when the mirror thresholds hit on the upside.
+   - **Regime vote** (`--vote-out regime_vote.json`, separate from the signal): fires when
+     ≥ 2 fresh symbols breach their vote thresholds the same way and no fresh symbol
+     breaches the other way. It accelerates regime confirmation; it never flattens the book.
    - **Firing dedup (n8n side):** keep `lastFiredBucket` in workflow static data — fire at
      most once per direction per US session; re-arm only after the metric retreats halfway
      to zero. (The bot's ledger also dedups, but don't rely on it for rate-limiting.)
@@ -140,6 +163,23 @@ to monitor — the Taiwan day session doesn't overlap US trading.
 
 This asymmetry is deliberate: downside auto-protects (bounded cost if wrong), both
 directions require the human tap to *enter* anything.
+
+**Liveness — is the bridge actually running?** A monitor that fires nothing looks exactly
+like a monitor that died. Every pass appends one line to `<signal dir>/monitor.log`
+(override with `--log-file`) and stamps `last_check` / `last_result` into
+`monitor_state.json`:
+
+```
+2026-08-06 15:02:03 TPE | fresh 2/8 (^N225 -0.99%, ^KS11 -4.81%) | fired: alert-down | vote: - | fetch-fail 6
+2026-08-06 15:04:04 TPE | fresh 3/8 (SOXX -3.20%, TSM -4.10%, QQQ -2.40%) | fired: signal-down | vote: trending-down | fetch-fail 5
+2026-08-06 15:06:03 TPE | fresh 3/8 (SOXX -3.60%, TSM -4.40%, QQQ -2.90%) | fired: signal-down(deduped) | vote: trending-down(deduped) | fetch-fail 5
+```
+
+Read it as: how many symbols answered fresh and at what move, what fired (`none` /
+`signal-down` / `alert-up` / … , `(deduped)` when the bucket already fired), the vote
+outcome, and how many fetches came back empty. `fetch-fail` counts closed-market symbols
+too, so a high count during a single session's hours is normal. The file self-trims to its
+last 2000 lines past ~1 MB, and a failed log write never aborts the monitoring pass.
 
 ---
 

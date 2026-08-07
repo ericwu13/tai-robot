@@ -1,10 +1,14 @@
 {
-  "name": "W2 Cross-market monitor (night session)",
+  "name": "W2 Cross-market monitor (day + night session)",
   "nodes": [
     {
       "parameters": {
         "rule": {
           "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/2 8-14 * * *"
+            },
             {
               "field": "cronExpression",
               "expression": "*/2 15-23 * * *"
@@ -16,7 +20,7 @@
           ]
         }
       },
-      "name": "Every 2 min (15:00-05:00 TPE)",
+      "name": "Every 2 min (08:00-14:58 & 15:00-05:00 TPE)",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -26,9 +30,9 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --once"
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --once --vote-out C:\\Users\\eric8\\n8n-bridge\\regime_vote.json"
       },
-      "name": "Check SOXX/TSM/QQQ",
+      "name": "Check cross-market symbols",
       "type": "n8n-nodes-base.executeCommand",
       "typeVersion": 1,
       "position": [
@@ -38,11 +42,11 @@
     }
   ],
   "connections": {
-    "Every 2 min (15:00-05:00 TPE)": {
+    "Every 2 min (08:00-14:58 & 15:00-05:00 TPE)": {
       "main": [
         [
           {
-            "node": "Check SOXX/TSM/QQQ",
+            "node": "Check cross-market symbols",
             "type": "main",
             "index": 0
           }
