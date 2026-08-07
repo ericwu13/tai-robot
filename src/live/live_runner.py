@@ -200,6 +200,37 @@ def minutes_until_session_close(order_symbol: str | None = None) -> int | None:
     return None
 
 
+def should_defer_session_end_report(
+    exit_pending: bool,
+    real_exit_recorded: bool,
+    minutes_to_close: int,
+    min_minutes_before_close: int,
+) -> bool:
+    """Whether to hold the session-end daily report for a pending real exit fill.
+
+    Issue #92: the session-end force-close's REAL exit price arrives
+    asynchronously (a ``SKReplyLib.OnNewData`` deal row) ~1-6s AFTER the sim
+    position closes and the report is due. The report snapshots each trade's
+    ``real_exit_price`` and its ``{date}_{session}`` debounce blocks any later
+    correction, so generating it before the fill lands freezes
+    ``real_exit_price=0`` into both the report JSON and ``session.json`` — the
+    Trades tab then shows "--" on reload while Discord (a later fill-confirm
+    timer) shows the right price.
+
+    Defer while the fill is in flight (``exit_pending`` and not yet
+    ``real_exit_recorded``), but only while a later 30s poll is still
+    guaranteed before the session actually closes. Within
+    ``min_minutes_before_close`` minutes of the close no further poll is
+    assured, so generate anyway — a genuinely stuck fill then degrades to the
+    simulated price, exactly as before this fix, rather than losing the report.
+    """
+    if not exit_pending:
+        return False
+    if real_exit_recorded:
+        return False
+    return minutes_to_close > min_minutes_before_close
+
+
 def _tick_within_age(tick_dt: datetime | None, now: datetime | None,
                      max_tick_age_s: float) -> bool:
     """True if the live tick is fresh enough to trust as a market price.

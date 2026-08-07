@@ -92,7 +92,7 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, select_freshest_price, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
@@ -1287,6 +1287,12 @@ class BacktestApp:
         # Seq no of the exit whose Discord notice went out with the
         # estimated price — a late OnNewData fill triggers a correction.
         self._est_notified_exit_seq: str = ""
+        # Issue #92: a session-end force-close was triggered and its REAL
+        # exit fill (OnNewData deal row) has not been recorded yet. Holds
+        # off the session-end daily report so it doesn't snapshot
+        # real_exit_price=0 (the report debounce would then freeze the
+        # stale price into the report JSON and session.json).
+        self._session_end_exit_pending: bool = False
         # Backoff retry state for exit fill price polling (issue #92).
         self._exit_fill_retry_timer: int | None = None
         self._exit_fill_retry_ctx: dict | None = None
@@ -5311,6 +5317,9 @@ class BacktestApp:
         self._trading_guard.daily_loss_limit = loss_limit
         self._trading_guard.reset()
         self._fill_poller.reset()
+        # Issue #92: clear any leftover session-end exit-fill wait from a
+        # prior deploy so a fresh bot never defers its first report.
+        self._session_end_exit_pending = False
         self.bot_name_var.set(bot_name)
         combo_label = self._mode_key_to_combo.get(trading_mode, trading_mode)
         self.trading_mode_var.set(combo_label)
@@ -5985,6 +5994,11 @@ class BacktestApp:
     _SESSION_END_CLOSE_MINUTES = 2          # normal session: close 2 min before
     _SETTLEMENT_END_CLOSE_MINUTES = 5       # settlement day: close 5 min before
     _SETTLEMENT_NO_ENTRY_MINUTES = 60       # settlement day: block entries 60 min before close
+    _SESSION_END_REPORT_MIN_MINUTES = 1     # issue #92: keep deferring the
+                                            # session-end report while its real
+                                            # exit fill is in flight, down to
+                                            # this many min before close, then
+                                            # generate anyway (never lose it)
 
     def _is_settlement_no_entry_window(self, order_symbol: str) -> bool:
         """True if a new ENTRY should be blocked due to settlement-day rule.
@@ -6101,6 +6115,14 @@ class BacktestApp:
             f"auto close {mins}min before session end (price src: {price_src})",
         )
         runner._auto_save_session()
+        # Issue #92: this force-close's REAL exit fill (an OnNewData deal
+        # row) arrives asynchronously ~seconds later. Flag it so the
+        # session-end daily report (checked next, same poll) waits for the
+        # real price instead of snapshotting 0. Only real-mode trades get a
+        # broker fill; paper trades never do, so don't make them wait.
+        last_trade = runner.broker.trades[-1] if runner.broker.trades else None
+        self._session_end_exit_pending = bool(
+            last_trade is not None and last_trade.source == "real")
 
     def _check_session_end_report(self):
         """Fire the daily-report hook near each session close.
@@ -6127,6 +6149,29 @@ class BacktestApp:
                      else self._SESSION_END_CLOSE_MINUTES)
         if mins > threshold:
             return
+        # Issue #92: hold the report while the session-end force-close's
+        # real exit fill is still in flight (flag set in
+        # _check_session_end_close). The fill lands async ~seconds after the
+        # close; generating now snapshots real_exit_price=0 into the report
+        # JSON and session.json, and the {date}_{session} debounce blocks any
+        # later correction (Discord's fill-confirm timer shows the right
+        # price, so the two disagree). A subsequent poll — once _on_new_data
+        # has recorded the real price — generates it correctly.
+        if self._session_end_exit_pending:
+            broker = self._live_runner.broker
+            last = broker.trades[-1] if broker.trades else None
+            real_exit_recorded = last is None or last.real_exit_price != 0
+            if should_defer_session_end_report(
+                    exit_pending=True,
+                    real_exit_recorded=real_exit_recorded,
+                    minutes_to_close=mins,
+                    min_minutes_before_close=self._SESSION_END_REPORT_MIN_MINUTES):
+                _log("SESSION-END REPORT DEFERRED: awaiting real exit fill "
+                     f"(mins_to_close={mins})")
+                return
+            # Real price recorded, or the final-minute fallback fired — stop
+            # deferring so this and later polls generate the report.
+            self._session_end_exit_pending = False
         self._live_runner._generate_daily_report()
 
     def _check_weekly_evolution(self):
@@ -7524,6 +7569,24 @@ class BacktestApp:
             self._log_order_decision(
                 "REAL_EXIT_CONFIRMED",
                 f"price={fill.price} seq={fill.seq_no}")
+            # Issue #92: the real exit price just landed asynchronously. If
+            # the session-end (or stop()) report + session save already ran
+            # with real_exit_price=0 — e.g. the fill was slower than the
+            # report-defer window, or the bot was force-closed at stop() —
+            # re-persist so session.json and the Trades tab (on reload) carry
+            # the real price, and refresh the live Trades tab for the running
+            # app. The exit fill is now recorded, so a pending session-end
+            # report may proceed. Best-effort: a UI/IO hiccup must not drop
+            # the confirmed fill.
+            self._session_end_exit_pending = False
+            try:
+                self._live_runner._auto_save_session()
+            except Exception as exc:
+                _log(f"REAL FILL (exit): session re-save failed: {exc}")
+            try:
+                self._update_live_results()
+            except Exception as exc:
+                _log(f"REAL FILL (exit): trades-tab refresh failed: {exc}")
             if self._est_notified_exit_seq == fill.seq_no:
                 self._est_notified_exit_seq = ""
                 if _discord and _discord.enabled:
