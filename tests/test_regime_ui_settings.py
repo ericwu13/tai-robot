@@ -68,8 +68,8 @@ def test_load_settings_regime_defaults(tmp_path, monkeypatch):
     assert cfg.get("regime_short_strategy", "") == ""
 
 
-def test_load_settings_no_threshold_keys(tmp_path, monkeypatch):
-    """Threshold keys are no longer loaded from settings."""
+def test_load_settings_threshold_keys_loaded(tmp_path, monkeypatch):
+    """Regime threshold keys are loaded from settings.yaml."""
     import run_backtest as rb
     settings_path = tmp_path / "settings.yaml"
     settings_path.write_text(
@@ -78,6 +78,7 @@ def test_load_settings_no_threshold_keys(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(rb, "project_root", str(tmp_path))
     cfg = rb._load_settings()
-    assert "regime_adx_enter" not in cfg
+    assert cfg["regime_adx_enter"] == 30.0
+    assert cfg["regime_long_strategy"] == "X"
     assert "regime_enabled" not in cfg
     assert "regime_dry_run" not in cfg
