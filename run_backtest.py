@@ -405,9 +405,17 @@ def _load_settings():
             cfg["news_tier2_enabled"] = bool(news.get("tier2_enabled", False))
             cfg["news_calendar_min_severity"] = str(
                 news.get("calendar_min_severity", "high") or "high")
-            regime = data.get("regime", {})
+            regime = data.get("regime", {}) or {}
             cfg["regime_long_strategy"] = regime.get("long_strategy", "")
             cfg["regime_short_strategy"] = regime.get("short_strategy", "")
+            cfg["regime_adx_enter"] = float(regime.get("adx_enter", 25.0) or 25.0)
+            cfg["regime_adx_exit"] = float(regime.get("adx_exit", 20.0) or 20.0)
+            cfg["regime_adx_strong"] = float(regime.get("adx_strong", 30.0) or 30.0)
+            cfg["regime_confirm_sessions"] = int(regime.get("confirm_sessions", 2) or 2)
+            cfg["regime_flip_pause_sessions"] = int(regime.get("flip_pause_sessions", 5) or 5)
+            cfg["regime_max_flips_in_window"] = int(regime.get("max_flips_in_window", 3) or 3)
+            cfg["regime_flip_window_sessions"] = int(regime.get("flip_window_sessions", 10) or 10)
+            cfg["regime_classify_interval"] = int(regime.get("classify_interval", 3600) or 3600)
             break
     return cfg
 
@@ -5465,7 +5473,7 @@ class BacktestApp:
         self.mode_combo.config(state="readonly")
 
         # Detect regime deploy (dialog checkbox or resume)
-        from src.regime.state_machine import RegimeConfig
+        from src.regime.config_loader import build_regime_config
         is_regime_deploy = bool(regime_enabled)
         if resume_session and resume_session.get("regime_mode"):
             is_regime_deploy = True
@@ -5473,7 +5481,8 @@ class BacktestApp:
                 regime_long = resume_session.get("long_strategy", "")
             if not regime_short:
                 regime_short = resume_session.get("short_strategy", "")
-        regime_cfg = RegimeConfig(
+        regime_cfg = build_regime_config(
+            self._settings,
             enabled=is_regime_deploy,
             long_strategy=regime_long,
             short_strategy=regime_short,
