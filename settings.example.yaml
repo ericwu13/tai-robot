@@ -135,8 +135,6 @@ news:
     - "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
   rss_interval_minutes: 30
   rss_state_file: "data/rss_scorer_state.json"
-  gemini_api_key: ""
-  discord_webhook_url: ""
 
 # ── Regime switching ───────────────────────────────────────────────────
 # Strategy pair and ADX-based classification thresholds for the regime
