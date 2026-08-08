@@ -416,6 +416,10 @@ def _load_settings():
             cfg["regime_max_flips_in_window"] = int(regime.get("max_flips_in_window", 3) or 3)
             cfg["regime_flip_window_sessions"] = int(regime.get("flip_window_sessions", 10) or 10)
             cfg["regime_classify_interval"] = int(regime.get("classify_interval", 3600) or 3600)
+            _rba = str(regime.get("range_bias_action", "sit_out") or "sit_out")
+            cfg["regime_range_bias_action"] = (
+                _rba if _rba in ("sit_out", "short_half", "long_half", "both_half")
+                else "sit_out")
             break
     return cfg
 
@@ -3589,6 +3593,7 @@ class BacktestApp:
 
     _REGIME_ACTION_LABELS = {
         "deploy_long": "做多 LONG",
+        "deploy_long_half": "做多半倉 LONG½",
         "deploy_short": "做空 SHORT",
         "deploy_short_half": "做空半倉 SHORT½",
         "sit_out": "觀望 SIT OUT",

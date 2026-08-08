@@ -21,12 +21,13 @@ from scripts.news_bridge.crossmarket_monitor import (
 )
 
 
-def _make_result(adx, plus_di=30.0, minus_di=10.0, atr_ratio=1.0):
+def _make_result(adx, plus_di=30.0, minus_di=10.0, atr_ratio=1.0,
+                 ema_slope=0.0):
     return RegimeResult(
         label="test", trend_strength="trending", volatility="normal",
         direction="bullish", adx_value=adx, plus_di_value=plus_di,
         minus_di_value=minus_di, atr_value=100.0, atr_ratio=atr_ratio,
-        ema_50=17900.0, last_close=18000.0, ema_slope=0.0,
+        ema_50=17900.0, last_close=18000.0, ema_slope=ema_slope,
     )
 
 
@@ -248,3 +249,45 @@ def test_source_path_derivation():
     assert _source_path("/data/regime_vote.json", "W2").endswith("regime_vote_w2.json")
     assert _source_path("/data/regime_vote.json", "W3").endswith("regime_vote_w3.json")
     assert _source_path("/data/regime_vote.json", "W3-manual").endswith("regime_vote_w3.json")
+
+
+# ── 10. Votes reach the selector (range-bound information fusion) ──
+
+def test_votes_stamped_into_last_features():
+    """step() persists tonight's votes in last_features for the selector
+    and for post-hoc audit (the vote files are consumed right after)."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True)
+    s = RegimeState()
+
+    s = m.step(s, _make_result(adx=15.0), cfg, "2026-08-05",
+               vote_directions=["trending-up"])
+    assert s.last_features["_votes"] == ["trending-up"]
+
+    s = m.step(s, _make_result(adx=15.0), cfg, "2026-08-06",
+               vote_directions=[])
+    assert s.last_features["_votes"] == []
+
+
+def test_range_bound_with_agreeing_vote_deploys_half_size():
+    """The 2026-08 grind-up case: ADX below adx_exit (range-bound) while
+    price drifts up and an external vote says trending-up → the selector
+    deploys the long leg half-size instead of sitting out."""
+    from src.regime.selector import StrategySelector
+
+    m = RegimeStateMachine()
+    sel = StrategySelector()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2,
+                       long_strategy="LongBot", short_strategy="ShortBot")
+    s = RegimeState(effective_regime="range-bound",
+                    effective_since="2026-08-06")
+
+    s = m.step(s, _make_result(adx=18.7, plus_di=25.1, minus_di=16.6,
+                               ema_slope=101.1),
+               cfg, "2026-08-07", vote_directions=["trending-up"])
+    assert s.effective_regime == "range-bound"
+
+    rec = sel.select(s, cfg)
+    assert rec.action == "deploy_long_half"
+    assert rec.strategy_name == "LongBot"
+    assert rec.qty_scale == 0.5

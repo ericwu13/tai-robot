@@ -14,7 +14,7 @@ from .state_machine import RegimeState, RegimeConfig
 
 @dataclass
 class Recommendation:
-    action: str           # "deploy_long" | "deploy_short" | "sit_out" | "hold" | "deploy_short_half"
+    action: str           # "deploy_long" | "deploy_short" | "sit_out" | "hold" | "deploy_short_half" | "deploy_long_half"
     strategy_name: str    # "" for sit_out/hold
     qty_scale: float = 1.0
     reason: str = ""
@@ -54,11 +54,33 @@ class StrategySelector:
         elif regime == "trending-down":
             return Recommendation("deploy_short", cfg.short_strategy, reason="下降趨勢確認 trending-down confirmed")
         elif regime == "range-bound":
-            bearish = features.get("ema_slope", 0) < 0 and features.get("direction") == "bearish"
+            slope = features.get("ema_slope", 0)
+            # Information fusion (news framework): an unambiguous external
+            # vote (W2 cross-market / W3 RSS) that agrees with the local
+            # price drift upgrades a range-bound sit-out to a half-size
+            # probe. Conflicting votes cancel each other; a vote against
+            # the drift is ignored. ±DI direction is deliberately NOT
+            # required — with ADX below adx_exit the DI readings are
+            # low-signal, and the vote itself is the directional evidence.
+            votes = features.get("_votes") or []
+            vote_up = "trending-up" in votes
+            vote_down = "trending-down" in votes
+            if vote_up and not vote_down and slope > 0:
+                return Recommendation("deploy_long_half", cfg.long_strategy, qty_scale=0.5,
+                                     reason="盤整+外部看多票 — 半倉多單 range-bound + external bullish vote — half-size long")
+            if vote_down and not vote_up and slope < 0:
+                return Recommendation("deploy_short_half", cfg.short_strategy, qty_scale=0.5,
+                                     reason="盤整+外部看空票 — 半倉空單 range-bound + external bearish vote — half-size short")
+
+            bearish = slope < 0 and features.get("direction") == "bearish"
+            bullish = slope > 0 and features.get("direction") == "bullish"
+            if bearish and cfg.range_bias_action in ("short_half", "both_half"):
+                return Recommendation("deploy_short_half", cfg.short_strategy, qty_scale=0.5,
+                                     reason="盤整偏空 — 半倉 range-bound with bearish bias — half size")
+            if bullish and cfg.range_bias_action in ("long_half", "both_half"):
+                return Recommendation("deploy_long_half", cfg.long_strategy, qty_scale=0.5,
+                                     reason="盤整偏多 — 半倉 range-bound with bullish bias — half size")
             if bearish:
-                if cfg.range_bias_action == "short_half":
-                    return Recommendation("deploy_short_half", cfg.short_strategy, qty_scale=0.5,
-                                         reason="盤整偏空 — 半倉 range-bound with bearish bias — half size")
                 return Recommendation("sit_out", "", reason="盤整偏空 — 觀望 range-bound with bearish bias — sit out")
             return Recommendation("sit_out", "", reason="盤整中性/偏多 — 觀望 range-bound — neutral/bullish, sit out")
         else:

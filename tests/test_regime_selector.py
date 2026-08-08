@@ -164,3 +164,123 @@ def test_recommendation_has_no_dry_run():
     s = RegimeState(effective_regime="trending-up")
     rec = sel.select(s, cfg())
     assert not hasattr(rec, "dry_run")
+
+
+# ── Range-bound information fusion: external W2/W3 votes ──
+
+def _range_state(slope, direction="bullish", votes=None, extra=None):
+    feats = {"ema_slope": slope, "direction": direction}
+    if votes is not None:
+        feats["_votes"] = votes
+    if extra:
+        feats.update(extra)
+    return RegimeState(effective_regime="range-bound", last_features=feats)
+
+
+def test_range_bound_vote_up_with_updrift_deploys_long_half():
+    """A bullish external vote + positive drift beats sit_out — even with
+    range_bias_action=sit_out (the fusion path bypasses that knob)."""
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up"])
+    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    assert rec.action == "deploy_long_half"
+    assert rec.strategy_name == "LongBot"
+    assert rec.qty_scale == 0.5
+
+
+def test_range_bound_vote_down_with_downdrift_deploys_short_half():
+    sel = StrategySelector()
+    s = _range_state(slope=-50.0, direction="bearish", votes=["trending-down"])
+    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    assert rec.action == "deploy_short_half"
+    assert rec.strategy_name == "ShortBot"
+    assert rec.qty_scale == 0.5
+
+
+def test_range_bound_vote_against_drift_ignored():
+    """Vote up but price drifting down → external and local evidence
+    disagree → sit out."""
+    sel = StrategySelector()
+    s = _range_state(slope=-50.0, direction="bearish", votes=["trending-up"])
+    rec = sel.select(s, cfg())
+    assert rec.action == "sit_out"
+
+
+def test_range_bound_conflicting_votes_cancel():
+    """W2 says up, W3 says down → ambiguous external evidence → falls
+    back to the technical-bias-only path (sit_out by default)."""
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up", "trending-down"])
+    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    assert rec.action == "sit_out"
+
+
+def test_range_bound_vote_needs_only_slope_agreement():
+    """The DI-derived direction field may disagree (low-signal when ADX
+    is low) — slope agreement alone qualifies the vote."""
+    sel = StrategySelector()
+    s = _range_state(slope=98.8, direction="bearish", votes=["trending-up"])
+    rec = sel.select(s, cfg())
+    assert rec.action == "deploy_long_half"
+
+
+def test_vote_does_not_override_vol_spike():
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up"],
+                     extra={"_vol_spike": True})
+    rec = sel.select(s, cfg())
+    assert rec.action == "sit_out"
+    assert "volatility" in rec.reason
+
+
+def test_vote_does_not_override_event_risk():
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up"],
+                     extra={"_event_risk": "FOMC"})
+    rec = sel.select(s, cfg())
+    assert rec.action == "sit_out"
+    assert "FOMC" in rec.reason
+
+
+def test_trending_up_ignores_votes_stays_full_size():
+    """Votes only matter in range-bound; a confirmed trend deploys full."""
+    sel = StrategySelector()
+    s = RegimeState(effective_regime="trending-up",
+                    last_features={"_votes": ["trending-down"]})
+    rec = sel.select(s, cfg())
+    assert rec.action == "deploy_long"
+    assert rec.qty_scale == 1.0
+
+
+# ── range_bias_action: technical bias alone (no votes) ──
+
+def test_range_bound_bullish_long_half():
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, direction="bullish")
+    rec = sel.select(s, cfg(range_bias_action="long_half"))
+    assert rec.action == "deploy_long_half"
+    assert rec.strategy_name == "LongBot"
+    assert rec.qty_scale == 0.5
+
+
+def test_range_bound_both_half_bullish():
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, direction="bullish")
+    rec = sel.select(s, cfg(range_bias_action="both_half"))
+    assert rec.action == "deploy_long_half"
+
+
+def test_range_bound_both_half_bearish():
+    sel = StrategySelector()
+    s = _range_state(slope=-50.0, direction="bearish")
+    rec = sel.select(s, cfg(range_bias_action="both_half"))
+    assert rec.action == "deploy_short_half"
+
+
+def test_range_bound_long_half_needs_full_bias():
+    """Technical-bias-only path (unlike the vote path) requires slope AND
+    direction to agree — no external evidence to lean on."""
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, direction="bearish")
+    rec = sel.select(s, cfg(range_bias_action="long_half"))
+    assert rec.action == "sit_out"

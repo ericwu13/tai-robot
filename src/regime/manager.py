@@ -292,7 +292,8 @@ class RegimeManager:
         if not callable(self.discord_notify_cb):
             return
         action_label = {"deploy_long": "做多 LONG", "deploy_short": "做空 SHORT",
-                        "deploy_short_half": "做空半倉 SHORT½", "sit_out": "觀望 SIT OUT",
+                        "deploy_short_half": "做空半倉 SHORT½",
+                        "deploy_long_half": "做多半倉 LONG½", "sit_out": "觀望 SIT OUT",
                         "hold": "維持 HOLD"}.get(rec.action, rec.action)
         msg = (f"📊 **Regime 建議** — {session_date}\n"
                f"原始 Raw: `{_regime_label(self._state.raw_regime)}` (ADX {self._state.last_features.get('adx', 0):.1f})\n"
