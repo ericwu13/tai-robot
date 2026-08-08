@@ -19,6 +19,10 @@ Usage:
     # force a vote write (pipeline test)
     python rss_scorer.py --settings settings.yaml --force-fire bullish
 
+Gemini API key is read from ``ai.google_api_key``.  Discord webhook is
+read from env var ``NEWS_DISCORD_WEBHOOK`` or the ``--discord-webhook``
+CLI flag (same as W2).
+
 Settings block (in settings.yaml under ``news``)::
 
     news:
@@ -27,8 +31,6 @@ Settings block (in settings.yaml under ``news``)::
         - ...
       rss_interval_minutes: 30
       rss_state_file: data/rss_scorer_state.json
-      gemini_api_key: ""
-      discord_webhook_url: ""
 """
 from __future__ import annotations
 
@@ -90,15 +92,16 @@ def load_settings(path: str) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def get_news_config(settings: dict) -> dict:
+def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
     """Extract the news config block with defaults."""
     news = settings.get("news", {}) or {}
+    ai = settings.get("ai", {}) or {}
     return {
         "feeds": news.get("rss_feeds") or DEFAULT_FEEDS,
         "interval_minutes": int(news.get("rss_interval_minutes", 30)),
         "state_file": news.get("rss_state_file", "data/rss_scorer_state.json"),
-        "gemini_api_key": news.get("gemini_api_key", ""),
-        "discord_webhook_url": news.get("discord_webhook_url", ""),
+        "gemini_api_key": ai.get("google_api_key", ""),
+        "discord_webhook_url": discord_webhook or "",
     }
 
 
@@ -357,16 +360,18 @@ def main() -> int:
     ap.add_argument("--force-fire", metavar="DIRECTION",
                     choices=["bullish", "bearish"],
                     help="force a vote write (pipeline test) and exit")
+    ap.add_argument("--discord-webhook",
+                    default=os.environ.get("NEWS_DISCORD_WEBHOOK") or None)
     args = ap.parse_args()
 
     settings = load_settings(args.settings)
-    cfg = get_news_config(settings)
+    cfg = get_news_config(settings, discord_webhook=args.discord_webhook)
 
     vote_out = args.vote_out or settings.get("news", {}).get("regime_vote_path", "")
     state_path = args.state or cfg["state_file"]
 
     if not cfg["gemini_api_key"] and not args.force_fire:
-        print("ERROR: news.gemini_api_key not set in settings.yaml")
+        print("ERROR: ai.google_api_key not set in settings.yaml")
         return 1
 
     if args.force_fire:
