@@ -19,6 +19,12 @@ def tmp_vote(tmp_path):
     return str(tmp_path / "regime_vote.json")
 
 
+def _w3_path(base_path):
+    """Derive the per-source vote file path W3 writes to."""
+    stem, ext = os.path.splitext(base_path)
+    return f"{stem}_w3{ext}"
+
+
 @pytest.fixture
 def tmp_state(tmp_path):
     return str(tmp_path / "state.json")
@@ -131,7 +137,7 @@ class TestCheckOnce:
         state = {"seen_guids": []}
         state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
 
-        assert not os.path.exists(tmp_vote)
+        assert not os.path.exists(_w3_path(tmp_vote))
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
@@ -145,8 +151,9 @@ class TestCheckOnce:
         state = {"seen_guids": []}
         state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
 
-        assert os.path.exists(tmp_vote)
-        with open(tmp_vote) as f:
+        w3_file = _w3_path(tmp_vote)
+        assert os.path.exists(w3_file)
+        with open(w3_file) as f:
             vote = json.load(f)
         assert vote["direction"] == "trending-up"
         assert vote["source"] == "W3"
@@ -164,8 +171,9 @@ class TestCheckOnce:
         state = {"seen_guids": []}
         state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
 
-        assert os.path.exists(tmp_vote)
-        with open(tmp_vote) as f:
+        w3_file = _w3_path(tmp_vote)
+        assert os.path.exists(w3_file)
+        with open(w3_file) as f:
             vote = json.load(f)
         assert vote["direction"] == "trending-down"
         assert vote["source"] == "W3"
