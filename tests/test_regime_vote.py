@@ -6,9 +6,12 @@ import os
 from src.daily_report.regime_classifier import RegimeResult
 from src.news.regime_vote import (
     RegimeVote,
+    consume_all_regime_votes,
     consume_regime_vote,
+    read_all_regime_votes,
     read_regime_vote,
     write_regime_vote,
+    _source_path,
 )
 from src.regime.state_machine import RegimeConfig, RegimeState, RegimeStateMachine
 from scripts.news_bridge.crossmarket_monitor import (
@@ -39,7 +42,7 @@ def test_vote_agrees_with_raw_label_immediate_flip():
     # First session: ADX 27 (> enter but < strong), +DI dominant → trending-up.
     # Without a vote, this would NOT confirm (pending_count=1 < confirm_sessions=2).
     s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05",
-               vote_direction="trending-up")
+               vote_directions=["trending-up"])
 
     assert s.raw_regime == "trending-up"
     assert s.effective_regime == "trending-up", "vote should accelerate confirmation"
@@ -57,7 +60,7 @@ def test_vote_disagrees_with_raw_label_normal_hysteresis():
 
     # Raw = trending-up, vote = trending-down → disagreement
     s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05",
-               vote_direction="trending-down")
+               vote_directions=["trending-down"])
 
     assert s.raw_regime == "trending-up"
     assert s.effective_regime == "unknown", "disagreeing vote must not accelerate"
@@ -69,11 +72,12 @@ def test_vote_disagrees_with_raw_label_normal_hysteresis():
 def test_expired_vote_ignored(tmp_path):
     """A vote whose expires_after_session doesn't match the current
     session is silently ignored."""
-    vote_path = tmp_path / "regime_vote.json"
-    write_regime_vote(vote_path, "trending-up", "2026-08-04|NIGHT")
+    base_path = tmp_path / "regime_vote.json"
+    write_regime_vote(base_path, "trending-up", "2026-08-04|NIGHT", source="W2")
 
+    w2_path = tmp_path / "regime_vote_w2.json"
     # Current session is 2026-08-05|NIGHT — the vote is from yesterday.
-    vote = read_regime_vote(vote_path, "2026-08-05|NIGHT")
+    vote = read_regime_vote(w2_path, "2026-08-05|NIGHT")
     assert vote is None, "expired vote should return None"
 
 
@@ -87,36 +91,37 @@ def test_no_vote_file_normal_hysteresis():
     s = RegimeState()
 
     s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05",
-               vote_direction=None)
+               vote_directions=[])
     assert s.effective_regime == "unknown"
     assert s.pending_count == 1
 
     s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-06",
-               vote_direction=None)
+               vote_directions=[])
     assert s.effective_regime == "trending-up"
 
 
 # ── 5. Vote file round-trip (write → read → consume) ──
 
 def test_vote_file_round_trip(tmp_path):
-    """write → read → consume lifecycle."""
-    vote_path = tmp_path / "regime_vote.json"
+    """write → read → consume lifecycle with per-source paths."""
+    base_path = tmp_path / "regime_vote.json"
     session_key = "2026-08-05|NIGHT"
 
-    write_regime_vote(vote_path, "trending-up", session_key, source="W2")
-    assert vote_path.exists()
+    write_regime_vote(base_path, "trending-up", session_key, source="W2")
+    w2_path = tmp_path / "regime_vote_w2.json"
+    assert w2_path.exists()
 
-    vote = read_regime_vote(vote_path, session_key)
+    vote = read_regime_vote(w2_path, session_key)
     assert vote is not None
     assert vote.direction == "trending-up"
     assert vote.expires_after_session == session_key
     assert vote.source == "W2"
 
-    consume_regime_vote(vote_path)
-    assert not vote_path.exists()
+    consume_regime_vote(w2_path)
+    assert not w2_path.exists()
 
     # Consuming a missing file is a no-op.
-    consume_regime_vote(vote_path)
+    consume_regime_vote(w2_path)
 
 
 # ── 6. Monitor vote threshold detection ──
@@ -139,11 +144,12 @@ def test_monitor_night_session_key():
 
 
 def test_monitor_write_vote(tmp_path):
-    """Monitor's write_regime_vote produces a valid vote file."""
-    vote_path = str(tmp_path / "regime_vote.json")
-    monitor_write_vote(vote_path, "trending-down", "2026-08-05|NIGHT")
+    """Monitor's write_regime_vote produces a per-source vote file."""
+    base_path = str(tmp_path / "regime_vote.json")
+    monitor_write_vote(base_path, "trending-down", "2026-08-05|NIGHT")
 
-    with open(vote_path, encoding="utf-8") as f:
+    w2_path = str(tmp_path / "regime_vote_w2.json")
+    with open(w2_path, encoding="utf-8") as f:
         data = json.load(f)
 
     assert data["version"] == 1
@@ -187,6 +193,58 @@ def test_vote_no_effect_when_already_in_regime():
 
     # Another trending-up night with a vote — should NOT add a flip
     s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05",
-               vote_direction="trending-up")
+               vote_directions=["trending-up"])
     assert s.effective_regime == "trending-up"
     assert len(s.flip_history) == flip_count_before
+
+
+# ── 9. Multi-source votes: W2 + W3 independent, no overwrite ──
+
+def test_multi_source_votes_both_read(tmp_path):
+    """W2 and W3 write to separate files; read_all returns both."""
+    base_path = tmp_path / "regime_vote.json"
+    session_key = "2026-08-05|NIGHT"
+
+    write_regime_vote(base_path, "trending-up", session_key, source="W2")
+    write_regime_vote(base_path, "trending-up", session_key, source="W3")
+
+    assert (tmp_path / "regime_vote_w2.json").exists()
+    assert (tmp_path / "regime_vote_w3.json").exists()
+
+    votes = read_all_regime_votes(base_path, session_key)
+    assert len(votes) == 2
+    sources = {v.source for v in votes}
+    assert sources == {"W2", "W3"}
+
+
+def test_multi_source_votes_consumed_together(tmp_path):
+    """consume_all deletes all per-source vote files."""
+    base_path = tmp_path / "regime_vote.json"
+    session_key = "2026-08-05|NIGHT"
+
+    write_regime_vote(base_path, "trending-up", session_key, source="W2")
+    write_regime_vote(base_path, "trending-down", session_key, source="W3")
+
+    consume_all_regime_votes(base_path)
+    assert not (tmp_path / "regime_vote_w2.json").exists()
+    assert not (tmp_path / "regime_vote_w3.json").exists()
+
+
+def test_multi_source_any_agrees_accelerates():
+    """If either W2 or W3 agrees with raw, confirmation accelerates."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2)
+    s = RegimeState()
+
+    # W2 says trending-down (disagrees), W3 says trending-up (agrees)
+    s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05",
+               vote_directions=["trending-down", "trending-up"])
+
+    assert s.effective_regime == "trending-up", "W3 agrees → should accelerate"
+
+
+def test_source_path_derivation():
+    """_source_path strips the dash suffix from source names."""
+    assert _source_path("/data/regime_vote.json", "W2").endswith("regime_vote_w2.json")
+    assert _source_path("/data/regime_vote.json", "W3").endswith("regime_vote_w3.json")
+    assert _source_path("/data/regime_vote.json", "W3-manual").endswith("regime_vote_w3.json")

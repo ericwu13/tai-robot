@@ -55,12 +55,12 @@ class RegimeState:
 
 
 class RegimeStateMachine:
-    def step(self, state: RegimeState, result: RegimeResult, cfg: RegimeConfig, session_date: str, vote_direction: str | None = None) -> RegimeState:
+    def step(self, state: RegimeState, result: RegimeResult, cfg: RegimeConfig, session_date: str, vote_directions: list[str] | None = None) -> RegimeState:
         """Advance state by one NIGHT session. Returns new state (immutable-ish).
 
-        *vote_direction*: when a cross-market regime vote agrees with
-        tonight's raw classification, confirmation is immediate (the vote
-        counts as a second confirming session).
+        *vote_directions*: list of cross-market regime votes from
+        independent sources.  If any vote agrees with tonight's raw
+        classification, confirmation is immediate.
         """
         import copy
         s = copy.deepcopy(state)
@@ -107,7 +107,7 @@ class RegimeStateMachine:
                 s.pending_label = raw
                 s.pending_count = 1
 
-            vote_agrees = (vote_direction is not None and vote_direction == raw)
+            vote_agrees = any(v == raw for v in (vote_directions or []))
             if raw != s.effective_regime and (s.pending_count >= cfg.confirm_sessions or strong or vote_agrees):
                 # Regime change confirmed
                 s.effective_regime = raw

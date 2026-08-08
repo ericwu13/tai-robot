@@ -238,14 +238,16 @@ def night_session_key(now: datetime) -> str:
 
 
 def write_regime_vote(path: str, direction: str, session_key: str) -> None:
-    """Write the regime-vote sidecar file atomically."""
+    """Write the per-source regime-vote sidecar file atomically."""
+    source = "W2"
     payload = {
         "version": 1,
         "direction": direction,
         "expires_after_session": session_key,
-        "source": "W2",
+        "source": source,
     }
-    out = Path(path)
+    stem, ext = os.path.splitext(path)
+    out = Path(f"{stem}_{source.lower()}{ext}")
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = str(out) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

@@ -263,8 +263,9 @@ def test_delayed_asian_feed_counts_under_its_wider_allowance(
     thrown away — these symbols get their own 1500 s allowance."""
     market["^KS11"] = quote(-4.07, age_sec=1208)
     market["^N225"] = quote(-2.4, age_sec=903)
-    vote_path = tmp_path / "regime_vote.json"
-    args = make_args(tmp_path, vote_out=str(vote_path))
+    vote_base = tmp_path / "regime_vote.json"
+    vote_path = tmp_path / "regime_vote_w2.json"
+    args = make_args(tmp_path, vote_out=str(vote_base))
 
     state = cm.check_once(args, {})
 
@@ -281,8 +282,9 @@ def test_delayed_futures_feed_counts_just_past_ten_minutes(
     just over 600 s old (observed 603 s and 604 s while Globex traded).  A
     600 s allowance rejects the symbol on literally every poll."""
     market["NQ=F"] = quote(-2.0, age_sec=610)
-    vote_path = tmp_path / "regime_vote.json"
-    args = make_args(tmp_path, vote_out=str(vote_path))
+    vote_base = tmp_path / "regime_vote.json"
+    vote_path = tmp_path / "regime_vote_w2.json"
+    args = make_args(tmp_path, vote_out=str(vote_base))
 
     state = cm.check_once(args, {})
 
@@ -323,7 +325,7 @@ def test_closed_delayed_market_still_goes_stale(tmp_path, market, discord, froze
     cm.check_once(args, {})
 
     assert discord == []
-    assert not (tmp_path / "regime_vote.json").exists()
+    assert not (tmp_path / "regime_vote_w2.json").exists()
 
 
 def test_ignore_freshness_accepts_stale_quote(tmp_path, market, discord, frozen_clock):
@@ -385,8 +387,9 @@ def test_vote_fires_on_two_fresh_symbols_agreeing(
     market["QQQ"] = quote(2.4)                       # vote up 2.0
     market["TSM"] = quote(-6.0, age_sec=9000)        # stale — drops out
     market["^N225"] = quote(0.3)                     # fresh but quiet
-    vote_path = tmp_path / "regime_vote.json"
-    args = make_args(tmp_path, vote_out=str(vote_path))
+    vote_base = tmp_path / "regime_vote.json"
+    vote_path = tmp_path / "regime_vote_w2.json"
+    args = make_args(tmp_path, vote_out=str(vote_base))
 
     state = cm.check_once(args, {})
 
@@ -402,8 +405,9 @@ def test_vote_fires_downward_and_mixes_tiers(tmp_path, market, discord, frozen_c
     """Alert-tier symbols carry votes even though they never write signals."""
     market["NQ=F"] = quote(-1.8)                     # vote down -1.5
     market["^KS11"] = quote(-2.4)                    # vote down -2.0
-    vote_path = tmp_path / "regime_vote.json"
-    args = make_args(tmp_path, vote_out=str(vote_path))
+    vote_base = tmp_path / "regime_vote.json"
+    vote_path = tmp_path / "regime_vote_w2.json"
+    args = make_args(tmp_path, vote_out=str(vote_base))
 
     cm.check_once(args, {})
 
@@ -415,8 +419,9 @@ def test_vote_blocked_by_a_fresh_dissenter(tmp_path, market, discord, frozen_clo
     market["SOXX"] = quote(2.8)
     market["QQQ"] = quote(2.4)
     market["NQ=F"] = quote(-1.9)                     # fresh, breaching the other way
-    vote_path = tmp_path / "regime_vote.json"
-    args = make_args(tmp_path, vote_out=str(vote_path))
+    vote_base = tmp_path / "regime_vote.json"
+    vote_path = tmp_path / "regime_vote_w2.json"
+    args = make_args(tmp_path, vote_out=str(vote_base))
 
     state = cm.check_once(args, {})
 
@@ -428,8 +433,9 @@ def test_vote_needs_two_symbols(tmp_path, market, discord, frozen_clock):
     market["SOXX"] = quote(2.8)                      # the only breach
     market["QQQ"] = quote(0.9)                       # fresh, under threshold
     market["TSM"] = quote(5.0, age_sec=9000)         # stale
-    vote_path = tmp_path / "regime_vote.json"
-    args = make_args(tmp_path, vote_out=str(vote_path))
+    vote_base = tmp_path / "regime_vote.json"
+    vote_path = tmp_path / "regime_vote_w2.json"
+    args = make_args(tmp_path, vote_out=str(vote_base))
 
     cm.check_once(args, {})
 
@@ -439,8 +445,9 @@ def test_vote_needs_two_symbols(tmp_path, market, discord, frozen_clock):
 def test_vote_deduped_per_bucket(tmp_path, market, discord, frozen_clock):
     market["SOXX"] = quote(2.8)
     market["QQQ"] = quote(2.4)
-    vote_path = tmp_path / "regime_vote.json"
-    args = make_args(tmp_path, vote_out=str(vote_path))
+    vote_base = tmp_path / "regime_vote.json"
+    vote_path = tmp_path / "regime_vote_w2.json"
+    args = make_args(tmp_path, vote_out=str(vote_base))
 
     state = cm.check_once(args, {})
     first = read_json(vote_path)
@@ -459,7 +466,7 @@ def test_no_vote_file_written_without_vote_out(tmp_path, market, discord, frozen
 
     cm.check_once(args, {})
 
-    assert not (tmp_path / "regime_vote.json").exists()
+    assert not (tmp_path / "regime_vote_w2.json").exists()
 
 
 def test_night_session_key_uses_open_date():
@@ -528,7 +535,7 @@ def test_fetch_failure_is_survivable(tmp_path, market, discord, frozen_clock):
     state = cm.check_once(args, {})
 
     assert signal_of(args) is None
-    assert not (tmp_path / "regime_vote.json").exists()
+    assert not (tmp_path / "regime_vote_w2.json").exists()
     assert [k for k in state if not k.startswith("last_")] == []
 
 

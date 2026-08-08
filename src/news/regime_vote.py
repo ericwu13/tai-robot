@@ -1,16 +1,18 @@
-"""Regime-vote sidecar file — cross-market confirmation acceleration.
+"""Regime-vote sidecar files — cross-market confirmation acceleration.
 
-An external producer (the W2 cross-market monitor) writes a small JSON
-file when the semiconductor complex moves sharply in one direction.  At
-classification time (04:58) the regime state machine reads this vote and,
-if it agrees with the raw technical classification, skips the normal
-hysteresis confirmation delay (2 nights → 1 night + vote).
+External producers (W2 cross-market monitor, W3 RSS scorer) each write
+their own vote file.  At classification time (04:58) the regime state
+machine reads all vote files and, if any vote agrees with the raw
+technical classification, skips the normal hysteresis confirmation delay
+(2 nights → 1 night + vote).
 
-Separate from ``signal_file.py`` (which controls circuit-breaker
-position overrides).  This file controls regime confirmation acceleration
-only.
+Each source writes to a per-source file derived from the base path::
 
-File schema::
+    regime_vote_path = "C:/n8n-bridge/regime_vote.json"
+    W2 → "C:/n8n-bridge/regime_vote_w2.json"
+    W3 → "C:/n8n-bridge/regime_vote_w3.json"
+
+File schema (unchanged per file)::
 
     {
       "version": 1,
@@ -22,6 +24,7 @@ File schema::
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -96,20 +99,37 @@ def read_regime_vote(
     )
 
 
+def _source_path(base_path: str, source: str) -> str:
+    """Derive per-source vote file path from a base path.
+
+    ``regime_vote.json`` + ``"W2"`` → ``regime_vote_w2.json``
+    ``regime_vote.json`` + ``"W3-manual"`` → ``regime_vote_w3.json``
+    """
+    stem, ext = os.path.splitext(base_path)
+    writer = source.split("-")[0].lower()
+    return f"{stem}_{writer}{ext}"
+
+
+def _vote_glob(base_path: str) -> str:
+    """Glob pattern matching all per-source vote files."""
+    stem, ext = os.path.splitext(base_path)
+    return f"{stem}_*{ext}"
+
+
 def write_regime_vote(
     path: str | os.PathLike,
     direction: str,
     expires_after_session: str,
     source: str = "W2",
 ) -> None:
-    """Write (or overwrite) the vote file atomically."""
+    """Write (or overwrite) the per-source vote file atomically."""
     payload = {
         "version": SCHEMA_VERSION,
         "direction": direction,
         "expires_after_session": expires_after_session,
         "source": source,
     }
-    out = str(path)
+    out = _source_path(str(path), source)
     parent = os.path.dirname(out)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -119,8 +139,38 @@ def write_regime_vote(
     os.replace(tmp, out)
 
 
+def read_all_regime_votes(
+    base_path: str | os.PathLike | None,
+    current_session_key: str,
+) -> list[RegimeVote]:
+    """Read all per-source vote files.  Returns valid, non-expired votes."""
+    if not base_path:
+        return []
+    pattern = _vote_glob(str(base_path))
+    votes = []
+    for fpath in glob.glob(pattern):
+        vote = read_regime_vote(fpath, current_session_key)
+        if vote:
+            votes.append(vote)
+    return votes
+
+
+def consume_all_regime_votes(base_path: str | os.PathLike | None) -> None:
+    """Delete all per-source vote files after classification."""
+    if not base_path:
+        return
+    pattern = _vote_glob(str(base_path))
+    for fpath in glob.glob(pattern):
+        try:
+            os.remove(fpath)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("[REGIME-VOTE] could not remove %s: %s", fpath, exc)
+
+
 def consume_regime_vote(path: str | os.PathLike | None) -> None:
-    """Delete the vote file after it has been consumed (either way)."""
+    """Delete a single vote file after it has been consumed."""
     if not path:
         return
     try:
