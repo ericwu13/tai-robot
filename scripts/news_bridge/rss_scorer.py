@@ -47,7 +47,7 @@ from pathlib import Path
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
 VOTE_THRESHOLD = 0.8
-ARTICLE_MAX_AGE_HOURS = 2
+ARTICLE_MAX_AGE_HOURS = 4
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
@@ -58,10 +58,11 @@ LOG_KEEP_LINES = 2000
 _UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)"}
 
 DEFAULT_FEEDS = [
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
-    "https://finance.yahoo.com/news/rssindex",
     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+    "https://feeds.bloomberg.com/markets/news.rss",
+    "https://feeds.marketwatch.com/marketwatch/topstories",
+    "https://finance.yahoo.com/news/rssindex",
+    "https://www.investing.com/rss/news.rss",
 ]
 
 SCORING_PROMPT = """\
@@ -182,6 +183,22 @@ def mark_seen(state: dict, guids: list[str]) -> dict:
 
 # ── Gemini scoring ───────────────────────────────────────────────────────
 
+import re
+
+_DIR_RE = re.compile(r'"direction"\s*:\s*"(bullish|bearish|neutral)"')
+_CONF_RE = re.compile(r'"confidence"\s*:\s*([\d.]+)')
+
+
+def _parse_partial(text: str) -> dict | None:
+    """Extract direction+confidence from truncated Gemini JSON."""
+    dm = _DIR_RE.search(text)
+    cm = _CONF_RE.search(text)
+    if dm and cm:
+        return {"direction": dm.group(1), "confidence": float(cm.group(1)),
+                "reason": "(truncated)"}
+    return None
+
+
 def score_article(headline: str, summary: str, api_key: str) -> dict | None:
     """Call Gemini to score one article.  Returns parsed JSON or None."""
     prompt = SCORING_PROMPT.format(headline=headline, summary=summary[:500])
@@ -205,6 +222,8 @@ def score_article(headline: str, summary: str, api_key: str) -> dict | None:
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         return json.loads(text)
+    except json.JSONDecodeError:
+        return _parse_partial(text)
     except Exception as e:  # noqa: BLE001
         print(f"    gemini scoring failed: {type(e).__name__}: {e}")
         return None

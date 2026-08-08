@@ -129,10 +129,11 @@ news:
     qqq_pct: 2.0
   # W3 RSS+Gemini news scorer
   rss_feeds:
-    - "https://feeds.reuters.com/reuters/businessNews"
-    - "https://feeds.content.dowjones.io/public/rss/mw_marketpulse"
-    - "https://finance.yahoo.com/news/rssindex"
     - "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
+    - "https://feeds.bloomberg.com/markets/news.rss"
+    - "https://feeds.marketwatch.com/marketwatch/topstories"
+    - "https://finance.yahoo.com/news/rssindex"
+    - "https://www.investing.com/rss/news.rss"
   rss_interval_minutes: 30
   rss_state_file: "data/rss_scorer_state.json"
   discord_webhook: ""             # Discord webhook URL for W2/W3 bridge alerts
