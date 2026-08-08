@@ -426,9 +426,20 @@ def main() -> int:
                     help="TEST ONLY: accept stale quotes (closed market)")
     ap.add_argument("--log-file", default=None, metavar="PATH",
                     help=f"liveness log (default: <signal dir>/{LOG_NAME})")
+    ap.add_argument("--settings", default=None,
+                    help="path to settings.yaml (reads news.discord_webhook)")
     ap.add_argument("--discord-webhook",
                     default=os.environ.get("NEWS_DISCORD_WEBHOOK") or None)
     args = ap.parse_args()
+
+    if not args.discord_webhook and args.settings:
+        try:
+            import yaml
+            with open(args.settings, encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+            args.discord_webhook = (_cfg.get("news", {}) or {}).get("discord_webhook") or None
+        except Exception:
+            pass
 
     if args.force_fire:
         sid = write_signal(args.signal_out, args.force_fire,

@@ -48,7 +48,7 @@ _TZ_TAIPEI = timezone(timedelta(hours=8))
 
 VOTE_THRESHOLD = 0.8
 ARTICLE_MAX_AGE_HOURS = 2
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
 LOG_NAME = "rss_scorer.log"
@@ -70,7 +70,7 @@ news article, classify its likely SHORT-TERM impact on global equity markets
 (next 1-4 hours).
 
 Respond with ONLY a JSON object — no markdown, no explanation:
-{"direction": "bullish"|"bearish"|"neutral", "confidence": <float 0.0-1.0>, "reason": "<one sentence>"}
+{{"direction": "bullish"|"bearish"|"neutral", "confidence": <float 0.0-1.0>, "reason": "<one sentence>"}}
 
 Rules:
 - "confidence" reflects how strongly the article moves markets, not how sure you are of the classification.
@@ -101,7 +101,7 @@ def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
         "interval_minutes": int(news.get("rss_interval_minutes", 30)),
         "state_file": news.get("rss_state_file", "data/rss_scorer_state.json"),
         "gemini_api_key": ai.get("google_api_key", ""),
-        "discord_webhook_url": discord_webhook or "",
+        "discord_webhook_url": discord_webhook or news.get("discord_webhook") or "",
     }
 
 
@@ -188,7 +188,7 @@ def score_article(headline: str, summary: str, api_key: str) -> dict | None:
     url = GEMINI_API_URL.format(model=GEMINI_MODEL, key=api_key)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 256},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
     }).encode("utf-8")
     try:
         req = urllib.request.Request(
@@ -196,7 +196,11 @@ def score_article(headline: str, summary: str, api_key: str) -> dict | None:
             headers={**_UA, "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.load(resp)
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parts = data["candidates"][0]["content"]["parts"]
+        text = ""
+        for part in parts:
+            if "thought" not in part and "text" in part:
+                text = part["text"]
         text = text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -310,6 +314,19 @@ def append_log(path: str | os.PathLike, line: str) -> None:
         pass
 
 
+# ── Isolated import (avoids triggering news/__init__.py dep chain) ───
+
+def _get_write_regime_vote():
+    """Import write_regime_vote directly from the module file."""
+    import importlib.util
+    mod_path = Path(__file__).resolve().parents[2] / "src" / "news" / "regime_vote.py"
+    spec = importlib.util.spec_from_file_location("regime_vote", mod_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod.write_regime_vote
+
+
 # ── Main logic ───────────────────────────────────────────────────────────
 
 def check_once(cfg: dict, state: dict, vote_out: str) -> dict:
@@ -334,8 +351,7 @@ def check_once(cfg: dict, state: dict, vote_out: str) -> dict:
     print(f"  net score: {net:+.2f} -> vote: {direction or 'none'}")
 
     if direction and vote_out:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-        from news.regime_vote import write_regime_vote
+        write_regime_vote = _get_write_regime_vote()
         session_key = night_session_key(now)
         write_regime_vote(vote_out, direction, session_key, source="W3")
         print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
@@ -377,8 +393,7 @@ def main() -> int:
     if args.force_fire:
         direction = "trending-up" if args.force_fire == "bullish" else "trending-down"
         if vote_out:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-            from news.regime_vote import write_regime_vote
+            write_regime_vote = _get_write_regime_vote()
             now = datetime.now(_TZ_TAIPEI)
             write_regime_vote(vote_out, direction, night_session_key(now), source="W3-manual")
             print(f"  FORCE VOTE: {direction} -> {vote_out}")
