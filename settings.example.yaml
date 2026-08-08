@@ -135,6 +135,7 @@ news:
     - "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
   rss_interval_minutes: 30
   rss_state_file: "data/rss_scorer_state.json"
+  discord_webhook: ""             # Discord webhook URL for W2/W3 bridge alerts
 
 # ── Regime switching ───────────────────────────────────────────────────
 # Strategy pair and ADX-based classification thresholds for the regime
