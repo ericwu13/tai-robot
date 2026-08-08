@@ -43,6 +43,7 @@ _SETTINGS_KEY_MAP = {
     "regime_max_flips_in_window": "max_flips",
     "regime_flip_window_sessions": "flip_window",
     "regime_classify_interval": "classify_interval",
+    "regime_range_bias_action": "range_bias_action",
 }
 
 

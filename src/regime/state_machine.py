@@ -30,7 +30,7 @@ class RegimeConfig:
     adx_strong: float = 30.0
     long_strategy: str = ""
     short_strategy: str = ""
-    range_bias_action: str = "sit_out"   # "sit_out" | "short_half"
+    range_bias_action: str = "sit_out"   # "sit_out" | "short_half" | "long_half" | "both_half"
     manual_override: str = "auto"        # "auto" | "long" | "short" | "sit_out"
     classify_interval: int = 3600
 
@@ -67,6 +67,10 @@ class RegimeStateMachine:
         s.session_count += 1
         s.last_assessed = session_date
         s.last_features = result.to_dict()
+        # Persist tonight's external votes for the selector (information
+        # fusion in range-bound regimes) and for post-hoc audit — the vote
+        # files themselves are consumed right after classification.
+        s.last_features["_votes"] = [v for v in (vote_directions or []) if v]
 
         # --- 1. Derive raw regime from configurable thresholds ---
         # RegimeResult has no trend_direction field; derive it from the

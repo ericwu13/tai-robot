@@ -281,6 +281,16 @@ class TestApplyPending:
         result = runner._maybe_apply_pending(now)
         assert runner.active_leg == "short"
 
+    def test_deploy_long_half_as_long(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        runner._pending_recommendation = {
+            "date": "2026-07-10", "action": "deploy_long_half",
+            "strategy": "TestLong", "qty_scale": 0.5, "reason": "test",
+        }
+        now = datetime(2026, 7, 10, 7, 0, tzinfo=_TZ_TAIPEI)
+        result = runner._maybe_apply_pending(now)
+        assert runner.active_leg == "long"
+
 
 class TestResumeRearm:
     def test_pending_rearmed_from_state_file(self, tmp_path):

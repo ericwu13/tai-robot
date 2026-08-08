@@ -47,7 +47,7 @@ class TestClassifySession:
         rec = mgr.classify_session("2026-07-09", "NIGHT")
         assert rec is not None
         assert rec.action in ("deploy_long", "deploy_short", "sit_out", "hold",
-                              "deploy_short_half")
+                              "deploy_short_half", "deploy_long_half")
 
     def test_day_session_returns_none(self, tmp_path):
         bot_dir = str(tmp_path / "TX00_test")

@@ -315,7 +315,7 @@ class RegimeSwitchingRunner(LiveRunner):
         result = None
 
         try:
-            if action == "deploy_long":
+            if action in ("deploy_long", "deploy_long_half"):
                 result = self._apply_leg("long", self._long_strategy_name)
             elif action in ("deploy_short", "deploy_short_half"):
                 result = self._apply_leg("short", self._short_strategy_name)
@@ -470,7 +470,7 @@ class RegimeSwitchingRunner(LiveRunner):
 
         rec = self._manager.current_recommendation()
         try:
-            if rec.action == "deploy_long":
+            if rec.action in ("deploy_long", "deploy_long_half"):
                 result = self._apply_leg("long", self._long_strategy_name)
             elif rec.action in ("deploy_short", "deploy_short_half"):
                 result = self._apply_leg("short", self._short_strategy_name)

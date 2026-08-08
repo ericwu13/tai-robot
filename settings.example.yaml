@@ -153,3 +153,12 @@ regime:
   max_flips_in_window: 3       # max flips before pausing
   flip_window_sessions: 10     # sliding window for flip counting
   classify_interval: 3600      # bar interval (seconds) for classification
+  # What to do in a range-bound regime when the technicals show a
+  # directional bias (ema_slope + DI direction agree):
+  #   sit_out    — never trade ranges on bias alone (default)
+  #   short_half — bearish bias → short leg, half size
+  #   long_half  — bullish bias → long leg, half size
+  #   both_half  — either bias → matching leg, half size
+  # Independent of this setting, an external W2/W3 vote that agrees with
+  # the price drift always deploys the matching leg at half size.
+  range_bias_action: sit_out
