@@ -2,7 +2,7 @@
 
 Standalone bridge script (no n8n dependency).  Fetches public RSS feeds,
 filters to articles from the last 2 hours, scores each headline+summary
-via Gemini 1.5 Flash, aggregates a net sentiment score, and when the
+via Gemini (see GEMINI_MODEL), aggregates a net sentiment score, and when the
 aggregate exceeds the threshold writes a ``regime_vote.json`` for the
 regime state machine and posts a Discord embed.
 
@@ -48,7 +48,7 @@ _TZ_TAIPEI = timezone(timedelta(hours=8))
 
 VOTE_THRESHOLD = 0.8
 ARTICLE_MAX_AGE_HOURS = 4
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
 LOG_NAME = "rss_scorer.log"
@@ -283,26 +283,34 @@ def night_session_key(now: datetime) -> str:
 
 # ── Discord ──────────────────────────────────────────────────────────────
 
-def post_discord_embed(webhook: str | None, direction: str, net_score: float,
+TOP_ARTICLES_SHOWN = 10
+
+
+def post_discord_embed(webhook: str | None, direction: str | None, net_score: float,
                        scored: list[dict]) -> None:
     if not webhook:
         return
-    color = 0x00AA00 if direction == "trending-up" else 0xCC0000
+    if direction == "trending-up":
+        color = 0x00AA00
+    elif direction == "trending-down":
+        color = 0xCC0000
+    else:
+        color = 0x888888
     by_impact = sorted(scored, key=lambda x: abs(float(x["score"].get("confidence", 0))), reverse=True)
-    top_articles = by_impact[:5]
+    top_articles = by_impact[:TOP_ARTICLES_SHOWN]
     desc_lines = []
     for item in top_articles:
         s = item["score"]
         desc_lines.append(
             f"**{s['direction']}** ({s['confidence']:.1f}) — {item['article']['title'][:80]}")
-    if len(scored) > 5:
-        desc_lines.append(f"*…and {len(scored) - 5} more*")
+    if len(scored) > TOP_ARTICLES_SHOWN:
+        desc_lines.append(f"*…and {len(scored) - TOP_ARTICLES_SHOWN} more*")
 
     bull = sum(float(x["score"]["confidence"]) for x in scored if x["score"].get("direction", "").lower() == "bullish")
     bear = sum(float(x["score"]["confidence"]) for x in scored if x["score"].get("direction", "").lower() == "bearish")
 
     embed = {
-        "title": f"📰 RSS Sentiment Vote: {direction}",
+        "title": f"📰 RSS Sentiment Vote: {direction or 'none'}",
         "description": "\n".join(desc_lines) or "No articles scored.",
         "color": color,
         "fields": [
@@ -367,6 +375,7 @@ def check_once(cfg: dict, state: dict, vote_out: str) -> dict:
     print(f"  {len(articles)} recent articles, {len(new_articles)} new")
 
     if not new_articles:
+        post_discord_embed(cfg["discord_webhook_url"], None, 0.0, [])
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
 
@@ -386,7 +395,7 @@ def check_once(cfg: dict, state: dict, vote_out: str) -> dict:
             print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
         except Exception as e:  # noqa: BLE001
             print(f"  vote write failed: {type(e).__name__}: {e}")
-        post_discord_embed(cfg["discord_webhook_url"], direction, net, scored)
+    post_discord_embed(cfg["discord_webhook_url"], direction, net, scored)
 
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_net_score"] = net
