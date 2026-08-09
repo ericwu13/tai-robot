@@ -1,0 +1,61 @@
+{
+  "name": "W3 RSS + Gemini scorer (30 min)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 8-14 * * *"
+            },
+            {
+              "field": "cronExpression",
+              "expression": "*/30 15-23 * * *"
+            },
+            {
+              "field": "cronExpression",
+              "expression": "*/30 0-4 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every 30 min (08:00-14:58 & 15:00-05:00 TPE)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\rss_scorer.py --settings C:\\Users\\eric8\\gitRepos\\tai-robot\\settings.yaml --vote-out C:\\Users\\eric8\\n8n-bridge\\regime_vote.json --state C:\\Users\\eric8\\n8n-bridge\\rss_scorer_state.json --once"
+      },
+      "name": "Score RSS feeds via Gemini",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        260,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every 30 min (08:00-14:58 & 15:00-05:00 TPE)": {
+      "main": [
+        [
+          {
+            "node": "Score RSS feeds via Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "timezone": "Asia/Taipei"
+  },
+  "id": "NewsW3RssScorer000"
+}

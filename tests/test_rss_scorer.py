@@ -86,6 +86,28 @@ class TestAggregation:
         assert net == 0.8
         assert rss_scorer.net_score_to_vote(net) == "trending-up"
 
+    def test_bearish_dominant_produces_negative_net(self):
+        """Regression: bearish(0.9)+bearish(0.8)+3×neutral(0.1) must be -1.7."""
+        scored = [
+            {"article": {}, "score": {"direction": "bearish", "confidence": 0.9}},
+            {"article": {}, "score": {"direction": "bearish", "confidence": 0.8}},
+            {"article": {}, "score": {"direction": "neutral", "confidence": 0.1}},
+            {"article": {}, "score": {"direction": "neutral", "confidence": 0.1}},
+            {"article": {}, "score": {"direction": "neutral", "confidence": 0.1}},
+        ]
+        net = rss_scorer.aggregate_scores(scored)
+        assert net == pytest.approx(-1.7)
+        assert rss_scorer.net_score_to_vote(net) == "trending-down"
+
+    def test_case_insensitive_direction(self):
+        """Gemini may return 'Bearish' — must still subtract."""
+        scored = [
+            {"article": {}, "score": {"direction": "Bearish", "confidence": 0.9}},
+            {"article": {}, "score": {"direction": "BULLISH", "confidence": 0.3}},
+        ]
+        net = rss_scorer.aggregate_scores(scored)
+        assert net == pytest.approx(-0.6)
+
 
 # ── Deduplication tests ──────────────────────────────────────────────────
 
@@ -193,6 +215,28 @@ class TestCheckOnce:
         mock_score.reset_mock()
         state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
         assert mock_score.call_count == 0
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    @patch("rss_scorer._get_write_regime_vote")
+    def test_state_preserved_when_vote_write_fails(
+        self, mock_get_vote, mock_score, mock_feeds, tmp_vote
+    ):
+        """Regression: if write_regime_vote raises, GUIDs must still be in
+        the returned state so save_state() in main() persists them."""
+        mock_feeds.return_value = [
+            _make_article("fail1", "Big crash"),
+            _make_article("fail2", "Markets tank"),
+        ]
+        mock_score.return_value = {"direction": "bearish", "confidence": 0.9, "reason": "crash"}
+        mock_get_vote.side_effect = ImportError("regime_vote not found")
+
+        state = {"seen_guids": []}
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
+
+        assert "fail1" in state["seen_guids"]
+        assert "fail2" in state["seen_guids"]
+        assert "last_check" in state
 
 
 # ── State persistence ────────────────────────────────────────────────────
