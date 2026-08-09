@@ -235,6 +235,7 @@ def score_articles(articles: list[dict], api_key: str) -> list[dict]:
     for art in articles:
         score = score_article(art["title"], art["summary"], api_key)
         if score and "direction" in score and "confidence" in score:
+            score["direction"] = score["direction"].lower()
             results.append({"article": art, "score": score})
             direction = score["direction"]
             confidence = score["confidence"]
@@ -254,7 +255,7 @@ def aggregate_scores(scored: list[dict]) -> float:
     total = 0.0
     for item in scored:
         s = item["score"]
-        direction = s.get("direction", "neutral")
+        direction = s.get("direction", "neutral").lower()
         confidence = float(s.get("confidence", 0))
         if direction == "bullish":
             total += confidence
@@ -370,10 +371,13 @@ def check_once(cfg: dict, state: dict, vote_out: str) -> dict:
     print(f"  net score: {net:+.2f} -> vote: {direction or 'none'}")
 
     if direction and vote_out:
-        write_regime_vote = _get_write_regime_vote()
-        session_key = night_session_key(now)
-        write_regime_vote(vote_out, direction, session_key, source="W3")
-        print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
+        try:
+            write_regime_vote = _get_write_regime_vote()
+            session_key = night_session_key(now)
+            write_regime_vote(vote_out, direction, session_key, source="W3")
+            print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  vote write failed: {type(e).__name__}: {e}")
         post_discord_embed(cfg["discord_webhook_url"], direction, net, scored)
 
     state["last_check"] = now.isoformat(timespec="seconds")
