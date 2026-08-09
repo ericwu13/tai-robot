@@ -7,20 +7,12 @@
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "*/30 8-14 * * *"
-            },
-            {
-              "field": "cronExpression",
-              "expression": "*/30 15-23 * * *"
-            },
-            {
-              "field": "cronExpression",
-              "expression": "*/30 0-4 * * *"
+              "expression": "*/30 * * * *"
             }
           ]
         }
       },
-      "name": "Every 30 min (08:00-14:58 & 15:00-05:00 TPE)",
+      "name": "Every 30 min (24/7)",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -42,7 +34,7 @@
     }
   ],
   "connections": {
-    "Every 30 min (08:00-14:58 & 15:00-05:00 TPE)": {
+    "Every 30 min (24/7)": {
       "main": [
         [
           {
