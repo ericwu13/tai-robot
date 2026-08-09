@@ -288,18 +288,26 @@ def post_discord_embed(webhook: str | None, direction: str, net_score: float,
     if not webhook:
         return
     color = 0x00AA00 if direction == "trending-up" else 0xCC0000
-    top_articles = scored[:5]
+    by_impact = sorted(scored, key=lambda x: abs(float(x["score"].get("confidence", 0))), reverse=True)
+    top_articles = by_impact[:5]
     desc_lines = []
     for item in top_articles:
         s = item["score"]
         desc_lines.append(
             f"**{s['direction']}** ({s['confidence']:.1f}) — {item['article']['title'][:80]}")
+    if len(scored) > 5:
+        desc_lines.append(f"*…and {len(scored) - 5} more*")
+
+    bull = sum(float(x["score"]["confidence"]) for x in scored if x["score"].get("direction", "").lower() == "bullish")
+    bear = sum(float(x["score"]["confidence"]) for x in scored if x["score"].get("direction", "").lower() == "bearish")
+
     embed = {
         "title": f"📰 RSS Sentiment Vote: {direction}",
         "description": "\n".join(desc_lines) or "No articles scored.",
         "color": color,
         "fields": [
             {"name": "Net Score", "value": f"{net_score:+.2f}", "inline": True},
+            {"name": "Bullish / Bearish", "value": f"+{bull:.1f} / -{bear:.1f}", "inline": True},
             {"name": "Articles Scored", "value": str(len(scored)), "inline": True},
         ],
         "footer": {"text": "W3 RSS Scorer"},
