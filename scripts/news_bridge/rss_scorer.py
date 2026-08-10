@@ -2,9 +2,11 @@
 
 Standalone bridge script (no n8n dependency).  Fetches public RSS feeds,
 filters to articles from the last 2 hours, scores each headline+summary
-via Gemini (see GEMINI_MODEL), aggregates a net sentiment score, and when the
-aggregate exceeds the threshold writes a ``regime_vote.json`` for the
-regime state machine and posts a Discord embed.
+via Gemini (see GEMINI_MODEL), aggregates a net sentiment score into a
+session-cumulative total, and when the cumulative total exceeds
+SESSION_VOTE_THRESHOLD writes a ``regime_vote.json`` for the regime
+state machine.  A Discord embed posts every run (heartbeat).  Scoring is
+skipped Sat 05:00 - Mon 15:00 TPE (no night session to vote on).
 
 Deduplicates via a persistent state file (GUID-based) so articles are
 scored exactly once across restarts.
@@ -46,7 +48,8 @@ from pathlib import Path
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
-VOTE_THRESHOLD = 0.8
+VOTE_THRESHOLD = 0.8          # per-run scale (kept as net_score_to_vote default)
+SESSION_VOTE_THRESHOLD = 2.0  # session-cumulative net required to fire a vote
 ARTICLE_MAX_AGE_HOURS = 4
 GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -264,11 +267,11 @@ def aggregate_scores(scored: list[dict]) -> float:
     return total
 
 
-def net_score_to_vote(net_score: float) -> str | None:
+def net_score_to_vote(net_score: float, threshold: float = VOTE_THRESHOLD) -> str | None:
     """Map aggregate score to a regime vote direction, or None."""
-    if net_score >= VOTE_THRESHOLD:
+    if net_score >= threshold:
         return "trending-up"
-    if net_score <= -VOTE_THRESHOLD:
+    if net_score <= -threshold:
         return "trending-down"
     return None
 
@@ -281,13 +284,31 @@ def night_session_key(now: datetime) -> str:
     return f"{(now - timedelta(days=1)).strftime('%Y-%m-%d')}|NIGHT"
 
 
+def in_weekend_pause(now: datetime) -> bool:
+    """True from Sat 05:00 to Mon 15:00 TPE.
+
+    No TAIFEX night session exists in that window, so any vote written
+    would expire against a session that never happens.  Scoring (and its
+    Gemini cost) is skipped; the heartbeat embed still posts.
+    """
+    wd = now.weekday()  # Mon=0 .. Sun=6
+    if wd == 5:  # Saturday: Friday's night session ends 05:00
+        return now.hour >= 5
+    if wd == 6:  # Sunday
+        return True
+    if wd == 0:  # Monday: night session opens 15:00
+        return now.hour < 15
+    return False
+
+
 # ── Discord ──────────────────────────────────────────────────────────────
 
 TOP_ARTICLES_SHOWN = 10
 
 
 def post_discord_embed(webhook: str | None, direction: str | None, net_score: float,
-                       scored: list[dict]) -> None:
+                       scored: list[dict], session_net: float | None = None,
+                       note: str | None = None) -> None:
     if not webhook:
         return
     if direction == "trending-up":
@@ -305,19 +326,25 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
             f"**{s['direction']}** ({s['confidence']:.1f}) — {item['article']['title'][:80]}")
     if len(scored) > TOP_ARTICLES_SHOWN:
         desc_lines.append(f"*…and {len(scored) - TOP_ARTICLES_SHOWN} more*")
+    if note:
+        desc_lines.append(f"*{note}*")
 
     bull = sum(float(x["score"]["confidence"]) for x in scored if x["score"].get("direction", "").lower() == "bullish")
     bear = sum(float(x["score"]["confidence"]) for x in scored if x["score"].get("direction", "").lower() == "bearish")
+
+    fields = [{"name": "Run Net", "value": f"{net_score:+.2f}", "inline": True}]
+    if session_net is not None:
+        fields.append({"name": "Session Net",
+                       "value": f"{session_net:+.2f} / ±{SESSION_VOTE_THRESHOLD:.0f}",
+                       "inline": True})
+    fields.append({"name": "Bullish / Bearish", "value": f"+{bull:.1f} / -{bear:.1f}", "inline": True})
+    fields.append({"name": "Articles Scored", "value": str(len(scored)), "inline": True})
 
     embed = {
         "title": f"📰 RSS Sentiment Vote: {direction or 'none'}",
         "description": "\n".join(desc_lines) or "No articles scored.",
         "color": color,
-        "fields": [
-            {"name": "Net Score", "value": f"{net_score:+.2f}", "inline": True},
-            {"name": "Bullish / Bearish", "value": f"+{bull:.1f} / -{bear:.1f}", "inline": True},
-            {"name": "Articles Scored", "value": str(len(scored)), "inline": True},
-        ],
+        "fields": fields,
         "footer": {"text": "W3 RSS Scorer"},
     }
     body = json.dumps({"embeds": [embed]}).encode("utf-8")
@@ -365,17 +392,42 @@ def _get_write_regime_vote():
 
 # ── Main logic ───────────────────────────────────────────────────────────
 
-def check_once(cfg: dict, state: dict, vote_out: str) -> dict:
-    """One RSS scoring pass.  Returns updated state."""
-    now = datetime.now(_TZ_TAIPEI)
+def _session_net(state: dict, session_key: str) -> float:
+    """Current session-cumulative net score (0.0 if the session rolled over)."""
+    if state.get("session_key") != session_key:
+        return 0.0
+    return float(state.get("session_net", 0.0))
+
+
+def check_once(cfg: dict, state: dict, vote_out: str,
+               now: datetime | None = None) -> dict:
+    """One RSS scoring pass.  Returns updated state.
+
+    The vote fires on the SESSION-CUMULATIVE net score, not the per-run
+    net — one noisy 30-min window can't set the standing vote, but a
+    genuinely strong news day crosses the threshold within a run or two.
+    """
+    now = now or datetime.now(_TZ_TAIPEI)
     print(f"[{now:%Y-%m-%d %H:%M:%S}] RSS scorer checking {len(cfg['feeds'])} feeds")
+
+    if in_weekend_pause(now):
+        print("  weekend pause (Sat 05:00 - Mon 15:00 TPE) — scoring skipped")
+        post_discord_embed(cfg["discord_webhook_url"], None, 0.0, [],
+                           note="Weekend — scoring paused (no night session to vote on)")
+        state["last_check"] = now.isoformat(timespec="seconds")
+        return state
 
     articles = fetch_all_feeds(cfg["feeds"])
     new_articles = dedup_articles(articles, state)
     print(f"  {len(articles)} recent articles, {len(new_articles)} new")
 
+    session_key = night_session_key(now)
+
     if not new_articles:
-        post_discord_embed(cfg["discord_webhook_url"], None, 0.0, [])
+        cum = _session_net(state, session_key)
+        direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
+        post_discord_embed(cfg["discord_webhook_url"], direction, 0.0, [],
+                           session_net=cum)
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
 
@@ -383,19 +435,22 @@ def check_once(cfg: dict, state: dict, vote_out: str) -> dict:
     state = mark_seen(state, [a["guid"] for a in new_articles])
 
     net = aggregate_scores(scored)
-    direction = net_score_to_vote(net)
+    cum = round(_session_net(state, session_key) + net, 4)
+    state["session_key"] = session_key
+    state["session_net"] = cum
+    direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
 
-    print(f"  net score: {net:+.2f} -> vote: {direction or 'none'}")
+    print(f"  run net: {net:+.2f}, session net: {cum:+.2f} -> vote: {direction or 'none'}")
 
     if direction and vote_out:
         try:
             write_regime_vote = _get_write_regime_vote()
-            session_key = night_session_key(now)
             write_regime_vote(vote_out, direction, session_key, source="W3")
             print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
         except Exception as e:  # noqa: BLE001
             print(f"  vote write failed: {type(e).__name__}: {e}")
-    post_discord_embed(cfg["discord_webhook_url"], direction, net, scored)
+    post_discord_embed(cfg["discord_webhook_url"], direction, net, scored,
+                       session_net=cum)
 
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_net_score"] = net
