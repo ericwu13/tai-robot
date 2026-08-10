@@ -5,8 +5,10 @@ filters to articles from the last 2 hours, scores each headline+summary
 via Gemini (see GEMINI_MODEL), aggregates a net sentiment score into a
 session-cumulative total, and when the cumulative total exceeds
 SESSION_VOTE_THRESHOLD writes a ``regime_vote.json`` for the regime
-state machine.  A Discord embed posts every run (heartbeat).  Scoring is
-skipped Sat 05:00 - Mon 15:00 TPE (no night session to vote on).
+state machine.  A Discord embed posts only when something changed: a run
+that scored new articles, or once on entering the weekend pause.
+Scoring is skipped Sat 05:00 - Mon 15:00 TPE (no night session to vote
+on).
 
 Deduplicates via a persistent state file (GUID-based) so articles are
 scored exactly once across restarts.
@@ -412,10 +414,13 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     if in_weekend_pause(now):
         print("  weekend pause (Sat 05:00 - Mon 15:00 TPE) — scoring skipped")
-        post_discord_embed(cfg["discord_webhook_url"], None, 0.0, [],
-                           note="Weekend — scoring paused (no night session to vote on)")
+        if not state.get("weekend_pause_notified"):
+            post_discord_embed(cfg["discord_webhook_url"], None, 0.0, [],
+                               note="Weekend — scoring paused (no night session to vote on)")
+            state["weekend_pause_notified"] = True
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
+    state["weekend_pause_notified"] = False
 
     articles = fetch_all_feeds(cfg["feeds"])
     new_articles = dedup_articles(articles, state)
@@ -424,10 +429,6 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     session_key = night_session_key(now)
 
     if not new_articles:
-        cum = _session_net(state, session_key)
-        direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
-        post_discord_embed(cfg["discord_webhook_url"], direction, 0.0, [],
-                           session_net=cum)
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
 

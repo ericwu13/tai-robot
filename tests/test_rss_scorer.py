@@ -323,6 +323,59 @@ class TestCheckOnce:
         assert "last_check" in state
 
 
+# ── Embed gating: post only when something changed ───────────────────────
+
+class TestEmbedGating:
+    def _cfg(self):
+        return {
+            "feeds": ["https://example.com/rss"],
+            "interval_minutes": 30,
+            "state_file": "data/state.json",
+            "gemini_api_key": "fake-key",
+            "discord_webhook_url": "https://discord.example/webhook",
+        }
+
+    @patch("rss_scorer.post_discord_embed")
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_scored_run_posts(self, mock_score, mock_feeds, mock_embed, tmp_vote):
+        mock_feeds.return_value = [_make_article("e1", "News")]
+        mock_score.return_value = {"direction": "neutral", "confidence": 0.2, "reason": "x"}
+        state = rss_scorer.check_once(self._cfg(), {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        assert mock_embed.call_count == 1
+
+    @patch("rss_scorer.post_discord_embed")
+    @patch("rss_scorer.fetch_all_feeds")
+    def test_no_new_articles_stays_silent(self, mock_feeds, mock_embed, tmp_vote):
+        mock_feeds.return_value = []
+        rss_scorer.check_once(self._cfg(), {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        assert mock_embed.call_count == 0
+
+    @patch("rss_scorer.post_discord_embed")
+    @patch("rss_scorer.fetch_all_feeds")
+    def test_weekend_pause_posts_once(self, mock_feeds, mock_embed, tmp_vote):
+        saturday = datetime(2026, 8, 8, 10, 0, tzinfo=_TPE)
+        state = {"seen_guids": []}
+        state = rss_scorer.check_once(self._cfg(), state, tmp_vote, now=saturday)
+        assert mock_embed.call_count == 1
+        state = rss_scorer.check_once(self._cfg(), state, tmp_vote,
+                                      now=saturday + timedelta(minutes=30))
+        assert mock_embed.call_count == 1  # no second post
+        assert mock_feeds.call_count == 0
+
+    @patch("rss_scorer.post_discord_embed")
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_pause_notify_rearms_after_weekday_run(self, mock_score, mock_feeds,
+                                                   mock_embed, tmp_vote):
+        """Weekday run resets the pause flag so NEXT weekend announces again."""
+        mock_feeds.return_value = [_make_article("e2", "News")]
+        mock_score.return_value = {"direction": "neutral", "confidence": 0.2, "reason": "x"}
+        state = {"seen_guids": [], "weekend_pause_notified": True}
+        state = rss_scorer.check_once(self._cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
+        assert state["weekend_pause_notified"] is False
+
+
 # ── State persistence ────────────────────────────────────────────────────
 
 class TestState:
