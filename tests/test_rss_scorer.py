@@ -140,6 +140,12 @@ class TestDedup:
 
 # ── End-to-end check_once with mocked feeds + Gemini ─────────────────────
 
+_TPE = timezone(timedelta(hours=8))
+# Fixed weekday evening (Tue 2026-08-04 20:00 TPE) — inside the night
+# session, outside the weekend pause, so tests never depend on wall time.
+_WEEKDAY_EVE = datetime(2026, 8, 4, 20, 0, tzinfo=_TPE)
+
+
 class TestCheckOnce:
     def _mock_cfg(self, webhook=""):
         return {
@@ -157,21 +163,22 @@ class TestCheckOnce:
         mock_score.return_value = {"direction": "neutral", "confidence": 0.3, "reason": "routine"}
 
         state = {"seen_guids": []}
-        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
 
         assert not os.path.exists(_w3_path(tmp_vote))
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
-    def test_bullish_vote_written(self, mock_score, mock_feeds, tmp_vote):
+    def test_strong_single_run_votes_immediately(self, mock_score, mock_feeds, tmp_vote):
+        """Requirement 1: a strong enough signal fires within ONE run."""
         mock_feeds.return_value = [
             _make_article("b1", "Markets surge"),
             _make_article("b2", "Tech rally extends"),
         ]
-        mock_score.return_value = {"direction": "bullish", "confidence": 0.5, "reason": "surge"}
+        mock_score.return_value = {"direction": "bullish", "confidence": 1.0, "reason": "surge"}
 
         state = {"seen_guids": []}
-        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
 
         w3_file = _w3_path(tmp_vote)
         assert os.path.exists(w3_file)
@@ -183,22 +190,97 @@ class TestCheckOnce:
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
-    def test_bearish_vote_written(self, mock_score, mock_feeds, tmp_vote):
+    def test_single_below_threshold_run_does_not_vote(self, mock_score, mock_feeds, tmp_vote):
+        """Requirement 2: one ±0.8-style run (old per-run threshold) must
+        NOT set the standing vote anymore — that was the weekend
+        flip-flop bug."""
         mock_feeds.return_value = [
-            _make_article("c1", "Markets crash"),
-            _make_article("c2", "Sell-off deepens"),
+            _make_article("c1", "Markets dip"),
+            _make_article("c2", "Mild sell-off"),
         ]
-        mock_score.return_value = {"direction": "bearish", "confidence": 0.5, "reason": "crash"}
+        mock_score.return_value = {"direction": "bearish", "confidence": 0.5, "reason": "dip"}
 
         state = {"seen_guids": []}
-        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
+
+        assert not os.path.exists(_w3_path(tmp_vote))
+        assert state["session_net"] == pytest.approx(-1.0)
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_session_accumulates_to_vote(self, mock_score, mock_feeds, tmp_vote):
+        """Two below-threshold runs in the same session accumulate and
+        fire the vote on the second run."""
+        cfg = self._mock_cfg()
+        state = {"seen_guids": []}
+        mock_score.return_value = {"direction": "bearish", "confidence": 0.5, "reason": "down"}
+
+        mock_feeds.return_value = [_make_article("s1", "A"), _make_article("s2", "B")]
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE)
+        assert not os.path.exists(_w3_path(tmp_vote))
+
+        mock_feeds.return_value = [_make_article("s3", "C"), _make_article("s4", "D")]
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(minutes=30))
 
         w3_file = _w3_path(tmp_vote)
         assert os.path.exists(w3_file)
         with open(w3_file) as f:
             vote = json.load(f)
         assert vote["direction"] == "trending-down"
-        assert vote["source"] == "W3"
+        assert state["session_net"] == pytest.approx(-2.0)
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_flip_flop_runs_cancel(self, mock_score, mock_feeds, tmp_vote):
+        """The weekend scenario: an up run followed by an equal down run
+        nets to zero — no standing vote."""
+        cfg = self._mock_cfg()
+        state = {"seen_guids": []}
+
+        mock_feeds.return_value = [_make_article("f1", "A"), _make_article("f2", "B")]
+        mock_score.return_value = {"direction": "bullish", "confidence": 0.6, "reason": "up"}
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE)
+
+        mock_feeds.return_value = [_make_article("f3", "C"), _make_article("f4", "D")]
+        mock_score.return_value = {"direction": "bearish", "confidence": 0.6, "reason": "down"}
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(minutes=30))
+
+        assert not os.path.exists(_w3_path(tmp_vote))
+        assert state["session_net"] == pytest.approx(0.0)
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_session_rollover_resets_accumulator(self, mock_score, mock_feeds, tmp_vote):
+        """A new night session starts from zero — yesterday's near-miss
+        must not leak into tonight's vote."""
+        cfg = self._mock_cfg()
+        state = {"seen_guids": []}
+        mock_score.return_value = {"direction": "bearish", "confidence": 0.5, "reason": "down"}
+
+        mock_feeds.return_value = [_make_article("r1", "A"), _make_article("r2", "B")]
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE)
+        assert state["session_net"] == pytest.approx(-1.0)
+
+        mock_feeds.return_value = [_make_article("r3", "C"), _make_article("r4", "D")]
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(days=1))
+        assert state["session_net"] == pytest.approx(-1.0)
+        assert not os.path.exists(_w3_path(tmp_vote))
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_weekend_pause_skips_scoring(self, mock_score, mock_feeds, tmp_vote):
+        """Sat 05:00 - Mon 15:00 TPE: no fetch, no Gemini, no vote."""
+        saturday = datetime(2026, 8, 8, 10, 0, tzinfo=_TPE)
+        state = {"seen_guids": []}
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote, now=saturday)
+
+        assert mock_feeds.call_count == 0
+        assert mock_score.call_count == 0
+        assert not os.path.exists(_w3_path(tmp_vote))
+        assert "last_check" in state
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
@@ -208,12 +290,13 @@ class TestCheckOnce:
         mock_score.return_value = {"direction": "bullish", "confidence": 0.9, "reason": "big"}
 
         state = {"seen_guids": []}
-        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
         assert mock_score.call_count == 1
 
         mock_feeds.return_value = articles
         mock_score.reset_mock()
-        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(minutes=30))
         assert mock_score.call_count == 0
 
     @patch("rss_scorer.fetch_all_feeds")
@@ -228,12 +311,13 @@ class TestCheckOnce:
             _make_article("fail1", "Big crash"),
             _make_article("fail2", "Markets tank"),
         ]
-        mock_score.return_value = {"direction": "bearish", "confidence": 0.9, "reason": "crash"}
+        mock_score.return_value = {"direction": "bearish", "confidence": 1.0, "reason": "crash"}
         mock_get_vote.side_effect = ImportError("regime_vote not found")
 
         state = {"seen_guids": []}
-        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote)
+        state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
 
+        assert mock_get_vote.call_count == 1
         assert "fail1" in state["seen_guids"]
         assert "fail2" in state["seen_guids"]
         assert "last_check" in state
