@@ -82,6 +82,8 @@ DEFAULT_FEEDS = [
     "https://news.google.com/rss/topics/CAAqJQgKIh9DQkFTRVFvSUwyMHZNRFptTXpJU0JYcG9MVlJYS0FBUAE?hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
     "https://news.google.com/rss/search?q=TSMC+OR+%E5%8F%B0%E7%A9%8D%E9%9B%BB&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
     "https://news.google.com/rss/search?q=%E5%8F%B0%E8%82%A1+OR+TAIEX+OR+%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=%E5%A4%A9%E4%B8%8B%E9%9B%9C%E8%AA%8C+%E5%8F%B0%E7%81%A3%E7%B6%93%E6%BF%9F&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=%E5%95%86%E6%A5%AD%E9%80%B1%E5%88%8A+%E5%8F%B0%E8%82%A1&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
     "https://www.scmp.com/rss/5/feed",
 ]
 
