@@ -2,11 +2,12 @@
 
 Standalone bridge script (no n8n dependency).  Fetches public RSS feeds,
 filters to articles from the last 2 hours, scores each headline+summary
-via Gemini (see GEMINI_MODEL), aggregates a net sentiment score into a
-session-cumulative total, and when the cumulative total exceeds
-SESSION_VOTE_THRESHOLD writes a ``regime_vote.json`` for the regime
-state machine.  A Discord embed posts only when something changed: a run
-that scored new articles, or once on entering the weekend pause.
+via Gemini (see GEMINI_MODEL), aggregates a net sentiment score into an
+EMA (exponential moving average) with a 2-hour half-life, and when the
+EMA total exceeds SESSION_VOTE_THRESHOLD writes a ``regime_vote.json``
+for the regime state machine.  A Discord embed posts only when something
+changed: a run that scored new articles, or once on entering the weekend
+pause.
 Scoring is skipped Sat 05:00 - Mon 15:00 TPE (no night session to vote
 on).
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -51,7 +53,13 @@ from pathlib import Path
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
 VOTE_THRESHOLD = 0.8          # per-run scale (kept as net_score_to_vote default)
-SESSION_VOTE_THRESHOLD = 2.0  # session-cumulative net required to fire a vote
+SESSION_VOTE_THRESHOLD: float = 1.5  # session EMA net required to fire a vote
+
+# EMA half-life for session score — empirically, news attention decays within 1-2h
+# 0.84 ≈ exp(-ln(2) * 0.5 / 2.0) = 2-hour half-life at 30-min polling cadence
+EMA_HALF_LIFE_HOURS: float = 2.0
+EMA_DECAY: float = math.exp(-math.log(2) * 0.5 / EMA_HALF_LIFE_HOURS)
+
 ARTICLE_MAX_AGE_HOURS = 4
 GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -253,8 +261,10 @@ def score_articles(articles: list[dict], api_key: str) -> list[dict]:
 # ── Aggregation ──────────────────────────────────────────────────────────
 
 def aggregate_scores(scored: list[dict]) -> float:
-    """Net score: sum of (confidence × direction_sign).
+    """Net score: sum of clipped (confidence × direction_sign).
 
+    Each article's signed score is clipped to ±0.5 to prevent a single
+    high-confidence article from dominating the EMA.
     bullish = +1, bearish = -1, neutral = 0.
     """
     total = 0.0
@@ -263,9 +273,12 @@ def aggregate_scores(scored: list[dict]) -> float:
         direction = s.get("direction", "neutral").lower()
         confidence = float(s.get("confidence", 0))
         if direction == "bullish":
-            total += confidence
+            raw = confidence
         elif direction == "bearish":
-            total -= confidence
+            raw = -confidence
+        else:
+            continue
+        total += max(-0.5, min(0.5, raw))
     return total
 
 
@@ -310,6 +323,7 @@ TOP_ARTICLES_SHOWN = 10
 
 def post_discord_embed(webhook: str | None, direction: str | None, net_score: float,
                        scored: list[dict], session_net: float | None = None,
+                       session_peak: float = 0.0, recent_runs: list[float] | None = None,
                        note: str | None = None) -> None:
     if not webhook:
         return
@@ -341,6 +355,29 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
                        "inline": True})
     fields.append({"name": "Bullish / Bearish", "value": f"+{bull:.1f} / -{bear:.1f}", "inline": True})
     fields.append({"name": "Articles Scored", "value": str(len(scored)), "inline": True})
+
+    if session_peak > 0 and session_net is not None and session_net < session_peak - 1.5:
+        erosion = session_net - session_peak
+        fields.append({"name": "Drawdown",
+                       "value": f"⚠️ Eroding: peak +{session_peak:.1f} → now +{session_net:.1f} ({erosion:.1f})",
+                       "inline": False})
+    elif session_peak < 0 and session_net is not None and session_net > session_peak + 1.5:
+        erosion = session_net - session_peak
+        fields.append({"name": "Drawdown",
+                       "value": f"⚠️ Eroding: peak {session_peak:.1f} → now {session_net:.1f} (+{erosion:.1f})",
+                       "inline": False})
+
+    if recent_runs:
+        recent_net = sum(recent_runs)
+        if recent_net > 0.5:
+            emoji = "\U0001f7e2"
+        elif recent_net < -0.5:
+            emoji = "\U0001f534"
+        else:
+            emoji = "➡️"
+        fields.append({"name": "Momentum",
+                       "value": f"Recent ({len(recent_runs)} runs): {recent_net:+.2f} {emoji}",
+                       "inline": True})
 
     embed = {
         "title": f"📰 RSS Sentiment Vote: {direction or 'none'}",
@@ -397,6 +434,8 @@ def _get_write_regime_vote():
 def _session_net(state: dict, session_key: str) -> float:
     """Current session-cumulative net score (0.0 if the session rolled over)."""
     if state.get("session_key") != session_key:
+        state["session_peak"] = 0.0
+        state["recent_runs"] = []
         return 0.0
     return float(state.get("session_net", 0.0))
 
@@ -436,9 +475,21 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     state = mark_seen(state, [a["guid"] for a in new_articles])
 
     net = aggregate_scores(scored)
-    cum = round(_session_net(state, session_key) + net, 4)
+    cum = round(_session_net(state, session_key) * EMA_DECAY + net, 4)
     state["session_key"] = session_key
     state["session_net"] = cum
+
+    peak = float(state.get("session_peak", 0.0))
+    if cum > 0 and cum > peak:
+        peak = cum
+    elif cum < 0 and cum < peak:
+        peak = cum
+    state["session_peak"] = peak
+
+    recent = list(state.get("recent_runs", []))
+    recent.append(net)
+    state["recent_runs"] = recent[-3:]
+
     direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
 
     print(f"  run net: {net:+.2f}, session net: {cum:+.2f} -> vote: {direction or 'none'}")
@@ -451,7 +502,8 @@ def check_once(cfg: dict, state: dict, vote_out: str,
         except Exception as e:  # noqa: BLE001
             print(f"  vote write failed: {type(e).__name__}: {e}")
     post_discord_embed(cfg["discord_webhook_url"], direction, net, scored,
-                       session_net=cum)
+                       session_net=cum, session_peak=peak,
+                       recent_runs=state["recent_runs"])
 
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_net_score"] = net
