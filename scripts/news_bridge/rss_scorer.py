@@ -32,7 +32,7 @@ Settings block (in settings.yaml under ``news``)::
 
     news:
       rss_feeds:
-        - https://feeds.reuters.com/reuters/businessNews
+        - https://technews.tw/feed/
         - ...
       rss_interval_minutes: 30
       rss_state_file: data/rss_scorer_state.json
@@ -71,17 +71,26 @@ LOG_KEEP_LINES = 2000
 _UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)"}
 
 DEFAULT_FEEDS = [
+    # ── Global ──────────────────────────────────────────────────────────
     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
     "https://feeds.bloomberg.com/markets/news.rss",
     "https://feeds.marketwatch.com/marketwatch/topstories",
     "https://finance.yahoo.com/news/rssindex",
     "https://www.investing.com/rss/news.rss",
+    # ── Taiwan / Asia ───────────────────────────────────────────────────
+    "https://technews.tw/feed/",
+    "https://news.google.com/rss/topics/CAAqJQgKIh9DQkFTRVFvSUwyMHZNRFptTXpJU0JYcG9MVlJYS0FBUAE?hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=TSMC+OR+%E5%8F%B0%E7%A9%8D%E9%9B%BB&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://news.google.com/rss/search?q=%E5%8F%B0%E8%82%A1+OR+TAIEX+OR+%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    "https://www.scmp.com/rss/5/feed",
 ]
 
 SCORING_PROMPT = """\
 You are a financial sentiment analyst.  Given the headline and summary of a
 news article, classify its likely SHORT-TERM impact on global equity markets
-(next 1-4 hours).
+and Taiwan equity futures (TAIEX / 台股加權指數) in particular (next 1-4 hours).
+
+Articles may be in English or Traditional Chinese (繁體中文) — analyse both equally.
 
 Respond with ONLY a JSON object — no markdown, no explanation:
 {{"direction": "bullish"|"bearish"|"neutral", "confidence": <float 0.0-1.0>, "reason": "<one sentence>"}}
@@ -90,6 +99,8 @@ Rules:
 - "confidence" reflects how strongly the article moves markets, not how sure you are of the classification.
 - Routine earnings within expectations → neutral with low confidence.
 - Geopolitical escalation, surprise rate moves, major tech earnings beats/misses → high confidence.
+- TSMC (台積電) earnings, guidance, or capex changes are high-impact for TAIEX (~30% weight).
+- 外資 (foreign institutional) large buy/sell flows, Taiwan central bank policy, and cross-strait tensions are Taiwan-specific high-impact signals.
 - If unsure, default to neutral with confidence 0.2.
 
 Headline: {headline}
