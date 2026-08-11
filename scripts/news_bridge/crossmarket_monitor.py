@@ -48,7 +48,7 @@ with ``--log-file``) and stamps ``last_check``/``last_result`` into
 monitor_state.json, so "is the bridge still running?" is answerable from disk
 without waiting for an alert that may never be due::
 
-    2026-08-06 15:02:03 TPE | fresh 2/8 (^N225 -0.99%, ^KS11 -4.81%) | fired: alert-down | vote: -
+    2026-08-06 15:02:03 TPE | fresh 2/11 (^N225 -0.99%, ^KS11 -4.81%) | fired: alert-down | vote: -
 """
 from __future__ import annotations
 
@@ -101,6 +101,12 @@ SYMBOLS = {
                   "max_age": 1500, "desc": "Nikkei 225 (delayed feed)"},
     "^KS11":     {"tier": "alert", "down": -2.0, "up": 2.0, "vote": (-2.0, 2.0),
                   "max_age": 1500, "desc": "KOSPI (delayed feed)"},
+    "^HSI":      {"tier": "alert", "down": -1.5, "up": 1.5, "vote": (-1.5, 1.5),
+                  "max_age": 1500, "desc": "Hang Seng (HK 09:30-16:00 TPE, delayed feed)"},
+    "^TWII":     {"tier": "alert", "down": -1.5, "up": 1.5, "vote": (-1.5, 1.5),
+                  "max_age": 1500, "desc": "TAIEX (09:00-13:30 TPE)"},
+    "000001.SS": {"tier": "alert", "down": -1.5, "up": 1.5, "vote": (-1.5, 1.5),
+                  "max_age": 1500, "desc": "Shanghai Composite (09:30-15:00 TPE, delayed feed)"},
 }
 
 # Per-symbol regime-vote thresholds, derived from the one table above.
