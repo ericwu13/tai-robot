@@ -114,7 +114,7 @@ def test_symbol_table_tiers_and_thresholds():
     signal_tier = {s for s, c in cm.SYMBOLS.items() if c["tier"] == "signal"}
     alert_tier = {s for s, c in cm.SYMBOLS.items() if c["tier"] == "alert"}
     assert signal_tier == {"SOXX", "TSM", "QQQ", "ASML.AS"}
-    assert alert_tier == {"^STOXX50E", "NQ=F", "^N225", "^KS11"}
+    assert alert_tier == {"^STOXX50E", "NQ=F", "^N225", "^KS11", "^HSI", "^TWII", "000001.SS"}
 
     for sym, cfg in cm.SYMBOLS.items():
         assert cfg["down"] < 0 < cfg["up"], sym
@@ -557,11 +557,11 @@ def test_log_line_appended_per_pass(tmp_path, market, discord, frozen_clock):
     assert len(lines) == 1, "exactly one line per pass"
     line = lines[0]
     assert line.startswith("2026-08-05 22:30:00 TPE | ")
-    assert "fresh 2/8" in line
+    assert "fresh 2/11" in line
     assert "^N225 -0.99%" in line and "^KS11 -4.81%" in line
     assert "fired: alert-down" in line
     assert "vote: -" in line
-    assert "fetch-fail 6" in line              # the other six never answered
+    assert "fetch-fail 9" in line              # the other nine never answered
 
     cm.check_once(args, {})
     assert len(log_lines(tmp_path)) == 2, "lines accumulate, they don't overwrite"
@@ -575,7 +575,7 @@ def test_log_records_quiet_passes(tmp_path, market, discord, frozen_clock):
     cm.check_once(args, {})
 
     line = log_lines(tmp_path)[0]
-    assert "fresh 1/8 (QQQ -0.20%)" in line
+    assert "fresh 1/11 (QQQ -0.20%)" in line
     assert "fired: none" in line
 
 
@@ -627,7 +627,7 @@ def test_log_self_trims_to_the_tail(tmp_path, market, discord, frozen_clock):
     lines = log_lines(tmp_path)
 
     assert len(lines) == cm.LOG_KEEP_LINES, "trim keeps a bounded tail"
-    assert lines[-1].endswith("| vote: - | fetch-fail 8"), "newest line survives"
+    assert lines[-1].endswith("| vote: - | fetch-fail 11"), "newest line survives"
     assert lines[0].startswith("old line 4001"), "oldest lines are the ones dropped"
     assert not (tmp_path / "monitor.log.tmp").exists()
 
@@ -641,7 +641,7 @@ def test_state_carries_last_check_and_last_result(tmp_path, market, discord, fro
     cm.save_state(state_path, state)
 
     assert state["last_check"] == "2026-08-05T22:30:00+08:00"
-    assert state["last_result"].startswith("fresh 1/8 (^KS11 -4.81%)")
+    assert state["last_result"].startswith("fresh 1/11 (^KS11 -4.81%)")
     assert "fired: alert-down" in state["last_result"]
     # the log line is the timestamped form of the very same summary
     assert log_lines(tmp_path)[0].endswith(state["last_result"])

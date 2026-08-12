@@ -129,7 +129,7 @@ LOG_NAME = "monitor.log"
 LOG_MAX_BYTES = 1_000_000
 LOG_KEEP_LINES = 2000
 
-_UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)"}
+_UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)", "Connection": "close"}
 
 
 def fetch_quote(symbol: str) -> dict | None:

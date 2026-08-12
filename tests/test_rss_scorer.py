@@ -83,11 +83,11 @@ class TestAggregation:
             {"article": {}, "score": {"direction": "bullish", "confidence": 0.8}},
         ]
         net = rss_scorer.aggregate_scores(scored)
-        assert net == 0.8
-        assert rss_scorer.net_score_to_vote(net) == "trending-up"
+        assert net == 0.5  # clipped to ±0.5 per article
+        assert rss_scorer.net_score_to_vote(net) is None  # below VOTE_THRESHOLD
 
     def test_bearish_dominant_produces_negative_net(self):
-        """Regression: bearish(0.9)+bearish(0.8)+3×neutral(0.1) must be -1.7."""
+        """Regression: bearish(0.9)+bearish(0.8)+3×neutral(0.1) must be -1.0 (clipped)."""
         scored = [
             {"article": {}, "score": {"direction": "bearish", "confidence": 0.9}},
             {"article": {}, "score": {"direction": "bearish", "confidence": 0.8}},
@@ -96,7 +96,7 @@ class TestAggregation:
             {"article": {}, "score": {"direction": "neutral", "confidence": 0.1}},
         ]
         net = rss_scorer.aggregate_scores(scored)
-        assert net == pytest.approx(-1.7)
+        assert net == pytest.approx(-1.0)  # 2 bearish × -0.5 clip each
         assert rss_scorer.net_score_to_vote(net) == "trending-down"
 
     def test_case_insensitive_direction(self):
@@ -106,7 +106,7 @@ class TestAggregation:
             {"article": {}, "score": {"direction": "BULLISH", "confidence": 0.3}},
         ]
         net = rss_scorer.aggregate_scores(scored)
-        assert net == pytest.approx(-0.6)
+        assert net == pytest.approx(-0.2)  # -0.5 (bearish clipped) + 0.3 (bullish under clip)
 
 
 # ── Deduplication tests ──────────────────────────────────────────────────
@@ -170,10 +170,13 @@ class TestCheckOnce:
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
     def test_strong_single_run_votes_immediately(self, mock_score, mock_feeds, tmp_vote):
-        """Requirement 1: a strong enough signal fires within ONE run."""
+        """Requirement 1: a strong enough signal fires within ONE run.
+        With ±0.5 clip per article, need 4 articles to reach 2.0 > SESSION_VOTE_THRESHOLD (1.5)."""
         mock_feeds.return_value = [
             _make_article("b1", "Markets surge"),
             _make_article("b2", "Tech rally extends"),
+            _make_article("b3", "Chip stocks soar"),
+            _make_article("b4", "TSMC guidance beat"),
         ]
         mock_score.return_value = {"direction": "bullish", "confidence": 1.0, "reason": "surge"}
 
@@ -228,7 +231,8 @@ class TestCheckOnce:
         with open(w3_file) as f:
             vote = json.load(f)
         assert vote["direction"] == "trending-down"
-        assert state["session_net"] == pytest.approx(-2.0)
+        expected = -1.0 * rss_scorer.EMA_DECAY + (-1.0)
+        assert state["session_net"] == pytest.approx(expected, abs=0.01)
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
@@ -248,7 +252,8 @@ class TestCheckOnce:
                                       now=_WEEKDAY_EVE + timedelta(minutes=30))
 
         assert not os.path.exists(_w3_path(tmp_vote))
-        assert state["session_net"] == pytest.approx(0.0)
+        expected = 1.0 * rss_scorer.EMA_DECAY + (-1.0)
+        assert state["session_net"] == pytest.approx(expected, abs=0.01)
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
@@ -306,10 +311,13 @@ class TestCheckOnce:
         self, mock_get_vote, mock_score, mock_feeds, tmp_vote
     ):
         """Regression: if write_regime_vote raises, GUIDs must still be in
-        the returned state so save_state() in main() persists them."""
+        the returned state so save_state() in main() persists them.
+        Need 4 articles to cross SESSION_VOTE_THRESHOLD (1.5) with ±0.5 clip."""
         mock_feeds.return_value = [
             _make_article("fail1", "Big crash"),
             _make_article("fail2", "Markets tank"),
+            _make_article("fail3", "Panic selling"),
+            _make_article("fail4", "Circuit breaker"),
         ]
         mock_score.return_value = {"direction": "bearish", "confidence": 1.0, "reason": "crash"}
         mock_get_vote.side_effect = ImportError("regime_vote not found")
@@ -319,7 +327,7 @@ class TestCheckOnce:
 
         assert mock_get_vote.call_count == 1
         assert "fail1" in state["seen_guids"]
-        assert "fail2" in state["seen_guids"]
+        assert "fail4" in state["seen_guids"]
         assert "last_check" in state
 
 

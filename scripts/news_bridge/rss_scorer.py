@@ -68,7 +68,7 @@ LOG_NAME = "rss_scorer.log"
 LOG_MAX_BYTES = 1_000_000
 LOG_KEEP_LINES = 2000
 
-_UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)"}
+_UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)", "Connection": "close"}
 
 DEFAULT_FEEDS = [
     # ── Global ──────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ def fetch_feed(url: str) -> list[dict]:
     Each dict has keys: guid, title, summary, published_dt (datetime, UTC).
     """
     import feedparser
-    feed = feedparser.parse(url)
+    feed = feedparser.parse(url, request_headers=_UA)
     articles = []
     for entry in feed.entries:
         pub = entry.get("published_parsed") or entry.get("updated_parsed")

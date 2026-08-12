@@ -89,6 +89,38 @@ Review `git diff master...fix/<issue-slug>` for:
 
 If the review surfaces problems, loop back to Phase 2.
 
+## n8n Workflow Debugging (news-framework)
+
+The news-bridge n8n instance runs locally at `http://localhost:5678`. When workflows
+break after a restart, check these first:
+
+**Startup env vars (all three REQUIRED on every launch):**
+```
+NODES_EXCLUDE="[]"  GENERIC_TIMEZONE="Asia/Taipei"  TZ="Asia/Taipei"
+```
+- `NODES_EXCLUDE="[]"`: n8n v2 disables `executeCommand` by default for security.
+  Without this, W1/W2/W3 fail with "Unrecognized node type: n8n-nodes-base.executeCommand".
+  The default exclude list lives in `@n8n/config/dist/configs/nodes.config.js`.
+- `GENERIC_TIMEZONE` + `TZ`: schedule-trigger cron evaluates in the wrong timezone
+  without these (the OS clock is UTC-7, not Asia/Taipei).
+
+**Where n8n reads `.env`:** `dotenv` loads from CWD (where `n8n start` was run), NOT
+from `~/.n8n/.env`. Setting env vars in `~/.n8n/.env` has no effect. Use the command
+line or the Task Scheduler task.
+
+**Task Scheduler:** "n8n Server" task runs `C:\Users\eric8\n8n-bridge\start-n8n.cmd`
+at logon. The script sets all three env vars. If the task exists but n8n isn't running,
+check Task Scheduler history for the failure reason.
+
+**Key debug resources:**
+- Event logs: `~/.n8n/n8nEventLog-*.log` (JSON, one event per line — workflow
+  start/success/failure, node start/finish). Grep for `workflow.failed` or `error`.
+- Database: `~/.n8n/database.sqlite` — `workflow_entity` table has all workflow
+  definitions; query with `python -c "import sqlite3; ..."` (read-only with `?mode=ro`).
+- Startup log: `~/n8n-bridge/n8n_server_new.log` (stdout/stderr redirect).
+- executeCommand nodes use absolute paths (`C:\Python313\python.exe`, not `python`)
+  because n8n child processes do NOT inherit the user's PATH.
+
 ## Phase 4 — Ship
 Goal: a versioned release with a Discord notification.
 
