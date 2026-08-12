@@ -50,11 +50,20 @@ class DiscordNotifier:
             regime_channel_id.strip() if regime_channel_id else "")
         self._bot_name = bot_name
         self._symbol = symbol
+        self._http: "httpx.Client | None" = None
+        self._http_lock = threading.Lock()
         if self._token and self._channel_id:
             if not self._evolution_channel_id:
                 logger.warning(
                     "discord_evolution_channel_id is empty — evolution "
                     "notifications will use the main channel")
+
+    def _get_http(self):
+        """Lazily create a shared httpx.Client for connection pooling."""
+        if self._http is None:
+            import httpx
+            self._http = httpx.Client(timeout=10)
+        return self._http
 
     @property
     def enabled(self) -> bool:
@@ -86,7 +95,6 @@ class DiscordNotifier:
 
         def _post():
             try:
-                import httpx
                 url = f"{_API_BASE}/channels/{target}/messages"
                 headers = {
                     "Authorization": f"Bot {self._token}",
@@ -94,8 +102,10 @@ class DiscordNotifier:
                 }
                 delay = 1.0
                 for attempt in range(3):
-                    resp = httpx.post(url, json={"content": content},
-                                     headers=headers, timeout=10)
+                    with self._http_lock:
+                        client = self._get_http()
+                        resp = client.post(url, json={"content": content},
+                                           headers=headers)
                     if resp.status_code != 429:
                         if resp.status_code >= 400:
                             logger.error(

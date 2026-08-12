@@ -39,6 +39,13 @@ def _extract_post_fn(notifier, content):
     return captured[0]
 
 
+def _mock_client(post_fn):
+    """Build a mock httpx.Client whose .post() calls post_fn."""
+    client = MagicMock()
+    client.post = MagicMock(side_effect=post_fn)
+    return client
+
+
 class TestDiscordRetry429:
     """_send retries up to 3 times on 429 with exponential backoff."""
 
@@ -54,8 +61,8 @@ class TestDiscordRetry429:
             calls.append(1)
             return _FakeResponse(200)
 
-        with patch("httpx.post", side_effect=fake_post), \
-             patch("time.sleep") as mock_sleep:
+        n._http = _mock_client(fake_post)
+        with patch("time.sleep") as mock_sleep:
             target_fn = _extract_post_fn(n, "hello")
             target_fn()
 
@@ -74,8 +81,8 @@ class TestDiscordRetry429:
             call_idx[0] += 1
             return resp
 
-        with patch("httpx.post", side_effect=fake_post), \
-             patch("time.sleep", side_effect=lambda d: sleeps.append(d)):
+        n._http = _mock_client(fake_post)
+        with patch("time.sleep", side_effect=lambda d: sleeps.append(d)):
             target_fn = _extract_post_fn(n, "hello")
             target_fn()
 
@@ -90,8 +97,8 @@ class TestDiscordRetry429:
         def fake_post(*a, **kw):
             return _FakeResponse(429)
 
-        with patch("httpx.post", side_effect=fake_post), \
-             patch("time.sleep", side_effect=lambda d: sleeps.append(d)), \
+        n._http = _mock_client(fake_post)
+        with patch("time.sleep", side_effect=lambda d: sleeps.append(d)), \
              patch("src.live.discord_notify.logger") as mock_logger:
             target_fn = _extract_post_fn(n, "hello")
             target_fn()
@@ -109,8 +116,8 @@ class TestDiscordRetry429:
             calls.append(1)
             return _FakeResponse(403, "Forbidden")
 
-        with patch("httpx.post", side_effect=fake_post), \
-             patch("time.sleep") as mock_sleep, \
+        n._http = _mock_client(fake_post)
+        with patch("time.sleep") as mock_sleep, \
              patch("src.live.discord_notify.logger") as mock_logger:
             target_fn = _extract_post_fn(n, "hello")
             target_fn()
@@ -131,8 +138,8 @@ class TestDiscordRetry429:
             call_idx[0] += 1
             return resp
 
-        with patch("httpx.post", side_effect=fake_post), \
-             patch("time.sleep", side_effect=lambda d: sleeps.append(d)), \
+        n._http = _mock_client(fake_post)
+        with patch("time.sleep", side_effect=lambda d: sleeps.append(d)), \
              patch("src.live.discord_notify.logger") as mock_logger:
             target_fn = _extract_post_fn(n, "hello")
             target_fn()
@@ -146,8 +153,8 @@ class TestDiscordRetry429:
         n = self._make_notifier()
         sleeps = []
 
-        with patch("httpx.post", return_value=_FakeResponse(429)), \
-             patch("time.sleep", side_effect=lambda d: sleeps.append(d)), \
+        n._http = _mock_client(lambda *a, **kw: _FakeResponse(429))
+        with patch("time.sleep", side_effect=lambda d: sleeps.append(d)), \
              patch("src.live.discord_notify.logger"):
             target_fn = _extract_post_fn(n, "hello")
             target_fn()

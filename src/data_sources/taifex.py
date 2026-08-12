@@ -68,6 +68,7 @@ def _fetch_csv_chunk(commodity_id: str, start: date, end: date) -> str:
     data = urllib.parse.urlencode(params).encode("ascii")
     req = urllib.request.Request(_URL, data=data, method="POST")
     req.add_header("User-Agent", "Mozilla/5.0")
+    req.add_header("Connection", "close")
 
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read()
