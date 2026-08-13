@@ -956,8 +956,8 @@ class BacktestApp:
                 self._live_log_msg(action.message, "status")
             return
 
-        if action.type in ("defer_to_market", "attempt"):
-            if action.type == "defer_to_market":
+        if action.type in ("defer_to_market", "attempt", "rest_cycle"):
+            if action.type in ("defer_to_market", "rest_cycle"):
                 self.btn_reconnect.config(state=tk.NORMAL)
             if self._live_runner:
                 self._live_log_msg(action.message, "status")

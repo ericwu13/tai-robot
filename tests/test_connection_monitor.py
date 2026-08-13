@@ -63,15 +63,55 @@ class TestMaxAttempts:
         # Counter should reset for fresh cycle
         assert cm.attempt == 0
 
-    def test_give_up_at_max_no_secs_until_open(self):
-        """Max attempts, live runner, but secs_until_open=0 → give up."""
+    def test_rest_cycle_at_max_market_open_with_live_runner(self):
+        """Max attempts, live runner, market open → rest_cycle (never give up)."""
         cm = ConnectionMonitor()
         cm.on_disconnected()
         for _ in range(10):
             cm.schedule_next(has_live_runner=True, market_open=True, secs_until_open=0)
         action = cm.schedule_next(
             has_live_runner=True, market_open=True, secs_until_open=0)
+        assert action.type == "rest_cycle"
+        assert action.delay_seconds == ConnectionMonitor.REST_CYCLE_DELAY_S
+        assert cm.attempt == 0  # reset for fresh cycle
+        assert cm.is_active  # still active, NOT given up
+
+    def test_rest_cycle_repeats_indefinitely(self):
+        """After rest cycle, another 10 failures → another rest cycle."""
+        cm = ConnectionMonitor()
+        cm.on_disconnected()
+        for cycle in range(3):
+            for _ in range(10):
+                cm.schedule_next(has_live_runner=True, market_open=True, secs_until_open=0)
+            action = cm.schedule_next(
+                has_live_runner=True, market_open=True, secs_until_open=0)
+            assert action.type == "rest_cycle", f"cycle {cycle}"
+            assert cm.is_active
+
+    def test_recovery_after_rest_cycle_resets(self):
+        """on_connected() after a rest cycle fully resets state."""
+        cm = ConnectionMonitor()
+        cm.on_disconnected()
+        for _ in range(10):
+            cm.schedule_next(has_live_runner=True, market_open=True, secs_until_open=0)
+        action = cm.schedule_next(
+            has_live_runner=True, market_open=True, secs_until_open=0)
+        assert action.type == "rest_cycle"
+        action = cm.on_connected()
+        assert action.type == "connected"
+        assert cm.attempt == 0
+        assert not cm.is_active
+
+    def test_give_up_without_live_runner_market_open(self):
+        """Max attempts, no live runner, market open → still give up."""
+        cm = ConnectionMonitor()
+        cm.on_disconnected()
+        for _ in range(10):
+            cm.schedule_next(has_live_runner=False, market_open=True, secs_until_open=0)
+        action = cm.schedule_next(
+            has_live_runner=False, market_open=True, secs_until_open=0)
         assert action.type == "give_up"
+        assert not cm.is_active
 
 
 class TestMarketHoursDeferral:
@@ -226,6 +266,16 @@ class TestMessageFormat:
         action = cm.schedule_next(
             has_live_runner=False, market_open=True, secs_until_open=0)
         assert "失敗" in action.message
+
+    def test_rest_cycle_message(self):
+        cm = ConnectionMonitor()
+        cm.on_disconnected()
+        for _ in range(10):
+            cm.schedule_next(has_live_runner=True, market_open=True, secs_until_open=0)
+        action = cm.schedule_next(
+            has_live_runner=True, market_open=True, secs_until_open=0)
+        assert "冷卻" in action.message
+        assert "cool-down" in action.message.lower()
 
     def test_defer_message(self):
         cm = ConnectionMonitor()

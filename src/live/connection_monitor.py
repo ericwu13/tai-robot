@@ -12,7 +12,7 @@ from dataclasses import dataclass
 @dataclass
 class ReconnectAction:
     """Instruction returned by ConnectionMonitor for the GUI to execute."""
-    type: str  # "attempt" | "defer_to_market" | "give_up" | "connected" | "resubscribe_retry"
+    type: str  # "attempt" | "defer_to_market" | "rest_cycle" | "give_up" | "connected" | "resubscribe_retry"
     delay_seconds: int = 0
     attempt: int = 0
     max_attempts: int = 0
@@ -28,6 +28,7 @@ class ConnectionMonitor:
 
     RECONNECT_DELAYS: list[int] = [5, 10, 20, 30, 60]
     MAX_RECONNECT_ATTEMPTS: int = 10
+    REST_CYCLE_DELAY_S: int = 300  # 5 min cool-down before retrying after ladder exhaustion
     RESUBSCRIBE_MAX_RETRIES: int = 3
     RESUBSCRIBE_RETRY_DELAY_S: int = 5
 
@@ -105,7 +106,17 @@ class ConnectionMonitor:
                     message=(f"休市中 Market closed — reconnecting in ~{defer_mins}m "
                              f"(before next session)"),
                 )
-            # No live runner or market open → give up
+            # Live runner deployed — rest cycle, never give up
+            if has_live_runner:
+                self._attempt = 0
+                delay = self.REST_CYCLE_DELAY_S
+                return ReconnectAction(
+                    type="rest_cycle",
+                    delay_seconds=delay,
+                    message=(f"重連冷卻 Reconnect cool-down {delay}s — "
+                             f"will retry (market still open)"),
+                )
+            # No live runner → give up (manual-mode: user can click Reconnect)
             self._active = False
             return ReconnectAction(
                 type="give_up",
