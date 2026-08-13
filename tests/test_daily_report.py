@@ -25,6 +25,8 @@ from src.daily_report.report_generator import (
     load_report,
     list_reports,
     _group_trades_by_date,
+    _filter_session_trades,
+    _effective_pnl,
 )
 from src.daily_report.changelog import (
     append_changelog,
@@ -49,6 +51,9 @@ def _make_trade(
     exit_bar: int = 5,
     tag: str = "Long",
     exit_tag: str = "limit",
+    real_entry_price: int = 0,
+    real_exit_price: int = 0,
+    source: str = "",
 ) -> Trade:
     return Trade(
         tag=tag,
@@ -62,6 +67,9 @@ def _make_trade(
         exit_tag=exit_tag,
         entry_dt=entry_dt,
         exit_dt=exit_dt,
+        real_entry_price=real_entry_price,
+        real_exit_price=real_exit_price,
+        source=source,
     )
 
 
@@ -932,3 +940,202 @@ class TestGenerateSessionReport:
         # Cumulative still includes all broker trades
         assert summary["total_trades"] == 2
         assert summary["total_pnl"] == 300
+
+
+# ---------------------------------------------------------------------------
+# Session window filtering tests (issue #95)
+# ---------------------------------------------------------------------------
+
+class TestFilterSessionTrades:
+    """Verify session-window filtering handles midnight-crossing sessions."""
+
+    def test_night_session_spans_midnight(self):
+        """Trades before and after midnight in the same night session."""
+        trades = [
+            _make_trade(exit_dt="2026-08-13 23:46"),  # before midnight
+            _make_trade(exit_dt="2026-08-14 04:58"),  # after midnight
+        ]
+        result = _filter_session_trades(
+            trades, date="2026-08-13",
+            session_open_dt="2026-08-13 15:00",
+            session_close_dt="2026-08-14 05:00",
+        )
+        assert len(result) == 2
+
+    def test_day_session_excludes_prior_night(self):
+        """Day session report at 13:43 must not include post-midnight night trades."""
+        trades = [
+            _make_trade(exit_dt="2026-08-13 04:58"),  # last night
+            _make_trade(exit_dt="2026-08-13 10:31"),  # day session
+        ]
+        result = _filter_session_trades(
+            trades, date="2026-08-13",
+            session_open_dt="2026-08-13 08:45",
+            session_close_dt="2026-08-13 13:45",
+        )
+        assert len(result) == 1
+        assert result[0].exit_dt == "2026-08-13 10:31"
+
+    def test_fallback_to_calendar_date_without_window(self):
+        """Without session window, falls back to calendar date matching."""
+        trades = [
+            _make_trade(exit_dt="2026-08-13 23:46"),
+            _make_trade(exit_dt="2026-08-14 04:58"),
+        ]
+        result = _filter_session_trades(trades, date="2026-08-13")
+        assert len(result) == 1
+        assert result[0].exit_dt == "2026-08-13 23:46"
+
+
+class TestEffectivePnl:
+    """Verify _effective_pnl uses real prices when available."""
+
+    def test_real_prices_long(self):
+        t = _make_trade(
+            pnl=3830, side=OrderSide.LONG,
+            entry_price=46037, exit_price=46420,
+            real_entry_price=46032, real_exit_price=46404,
+            source="real",
+        )
+        # Real PnL with point_value=10: (46404 - 46032) * 1 * 10 = 3720
+        assert _effective_pnl(t, point_value=10) == 3720
+
+    def test_real_prices_short(self):
+        t = _make_trade(
+            pnl=500, side=OrderSide.SHORT,
+            entry_price=20100, exit_price=20050,
+            real_entry_price=20095, real_exit_price=20045,
+            source="real",
+        )
+        # Real PnL: (20095 - 20045) * 1 * 1 = 50
+        assert _effective_pnl(t, point_value=1) == 50
+
+    def test_sign_flip_sim_win_real_loss(self):
+        """The actual incident: sim says +60, real says -110."""
+        t = _make_trade(
+            pnl=60, side=OrderSide.LONG,
+            entry_price=46355, exit_price=46361,
+            real_entry_price=46381, real_exit_price=46370,
+            source="real",
+        )
+        # Real PnL: (46370 - 46381) * 1 * 10 = -110
+        assert _effective_pnl(t, point_value=10) == -110
+
+    def test_partial_real_falls_back_to_sim(self):
+        """Real entry set but real exit 0 → use sim PnL."""
+        t = _make_trade(
+            pnl=200, real_entry_price=20050, real_exit_price=0,
+            source="real",
+        )
+        assert _effective_pnl(t, point_value=1) == 200
+
+    def test_paper_trade_uses_sim(self):
+        """Paper trades (no real prices) use sim PnL."""
+        t = _make_trade(pnl=500)
+        assert _effective_pnl(t, point_value=1) == 500
+
+    def test_backtest_trade_uses_sim(self):
+        """Backtest trades have no real prices, use sim."""
+        t = _make_trade(pnl=-300, source="backtest")
+        assert _effective_pnl(t, point_value=1) == -300
+
+
+class TestSessionReportRealPrices:
+    """Verify generate_session_report uses effective P&L (issue #95)."""
+
+    def test_today_pnl_uses_real_prices(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [
+            _make_trade(
+                pnl=3830, side=OrderSide.LONG,
+                entry_price=46037, exit_price=46420,
+                real_entry_price=46032, real_exit_price=46404,
+                exit_dt="2026-08-13 23:46", source="real",
+            ),
+        ]
+        broker = _FakeBroker(trades)
+        report = generate_session_report(
+            broker=broker, data_store=None,
+            date="2026-08-13", point_value=10,
+        )
+        assert report["summary"]["today_pnl"] == 3720  # not 3830
+
+    def test_cumulative_uses_real_prices(self, tmp_path, monkeypatch):
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [
+            _make_trade(
+                pnl=3830, entry_price=46037, exit_price=46420,
+                real_entry_price=46032, real_exit_price=46404,
+                exit_dt="2026-08-13 23:46", source="real",
+            ),
+            _make_trade(
+                pnl=60, entry_price=46355, exit_price=46361,
+                real_entry_price=46381, real_exit_price=46370,
+                exit_dt="2026-08-14 04:58", source="real",
+            ),
+        ]
+        broker = _FakeBroker(trades)
+        report = generate_session_report(
+            broker=broker, data_store=None,
+            date="2026-08-13", point_value=10,
+        )
+        # Real PnLs: 3720 + (-110) = 3610; sim would be 3890
+        assert report["summary"]["total_pnl"] == 3610
+
+    def test_win_rate_uses_real_prices(self, tmp_path, monkeypatch):
+        """Sim says 2 wins, real says 1 win + 1 loss."""
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [
+            _make_trade(
+                pnl=3830, entry_price=46037, exit_price=46420,
+                real_entry_price=46032, real_exit_price=46404,
+                exit_dt="2026-08-13 23:46", source="real",
+            ),
+            _make_trade(
+                pnl=60, entry_price=46355, exit_price=46361,
+                real_entry_price=46381, real_exit_price=46370,
+                exit_dt="2026-08-14 04:58", source="real",
+            ),
+        ]
+        broker = _FakeBroker(trades)
+        report = generate_session_report(
+            broker=broker, data_store=None,
+            date="2026-08-13", point_value=10,
+        )
+        # 1 win out of 2 = 50%
+        assert report["summary"]["win_rate"] == 50.0
+
+    def test_session_window_with_real_prices(self, tmp_path, monkeypatch):
+        """Combined: session window + real prices (the full issue #95 fix)."""
+        import src.daily_report.report_generator as rg
+        monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
+
+        trades = [
+            _make_trade(
+                pnl=3830, entry_price=46037, exit_price=46420,
+                real_entry_price=46032, real_exit_price=46404,
+                exit_dt="2026-08-13 23:46", source="real",
+            ),
+            _make_trade(
+                pnl=60, entry_price=46355, exit_price=46361,
+                real_entry_price=46381, real_exit_price=46370,
+                exit_dt="2026-08-14 04:58", source="real",
+            ),
+        ]
+        broker = _FakeBroker(trades)
+        report = generate_session_report(
+            broker=broker, data_store=None,
+            date="2026-08-13", point_value=10,
+            session_open_dt="2026-08-13 15:00",
+            session_close_dt="2026-08-14 05:00",
+        )
+        # Both trades within session window
+        assert report["summary"]["today_trades"] == 2
+        # Real PnLs: 3720 + (-110) = 3610
+        assert report["summary"]["today_pnl"] == 3610

@@ -398,12 +398,31 @@ class RegimeSwitchingRunner(LiveRunner):
     def _generate_daily_report(self) -> None:
         """Inject regime status into the daily report.
 
-        Dedup is handled by the ``{date}_{session}`` key (persisted in
-        session.json). We override only to inject the regime_switching
-        block and to intercept the emit so it includes the extra data.
+        Dedup key uses the session OPEN date so a night session crossing
+        midnight has one identity (issue #95). We override to inject the
+        regime_switching block.
         """
         try:
             from ..daily_report.report_generator import generate_session_report
+            from ..regime.switch_logic import current_session, session_slot
+
+            session = current_session()
+            if session:
+                session_date = session.open_date
+                session_type = session.slot
+                open_dt_str = session.open_dt.strftime("%Y-%m-%d %H:%M")
+                close_dt_str = session.close_dt.strftime("%Y-%m-%d %H:%M")
+            else:
+                fallback_date, fallback_slot = session_slot()
+                session_date = fallback_date
+                session_type = fallback_slot
+                open_dt_str = ""
+                close_dt_str = ""
+
+            report_key = f"{session_date}_{session_type}"
+            if report_key == self._last_report_key:
+                return
+
             report = generate_session_report(
                 broker=self.broker,
                 data_store=self.data_store,
@@ -411,15 +430,13 @@ class RegimeSwitchingRunner(LiveRunner):
                 strategy_params=getattr(self.strategy, "params", None),
                 point_value=self.point_value,
                 symbol=self.symbol,
+                date=session_date,
                 bot_name=self.bot_name,
                 started_at=self._started_at,
+                session_open_dt=open_dt_str,
+                session_close_dt=close_dt_str,
             )
             if report is None:
-                return
-            report_date = report.get("date", "")
-            _, session_type = self._session_key()
-            report_key = f"{report_date}_{session_type}" if report_date else ""
-            if report_key and report_key == self._last_report_key:
                 return
             self._last_report_key = report_key
             report["regime_switching"] = {

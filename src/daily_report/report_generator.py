@@ -20,6 +20,26 @@ _REPORTS_DIR = Path("data/daily-reports")
 _TPE = timezone(timedelta(hours=8))
 
 
+def _effective_pnl(t: Trade, point_value: int = 1) -> int:
+    """Return real-price P&L when both fills are confirmed, else sim P&L.
+
+    For source="real" trades with both real_entry_price and real_exit_price
+    set (non-zero), recompute P&L from the actual fills. Otherwise fall back
+    to the sim-computed t.pnl. This keeps backtest parity (no real prices)
+    and handles partial-fill edge cases (real entry but no real exit yet).
+    """
+    rep = getattr(t, "real_entry_price", 0) or 0
+    rxp = getattr(t, "real_exit_price", 0) or 0
+    if rep > 0 and rxp > 0:
+        qty = getattr(t, "qty", 1) or 1
+        side = t.side
+        if side == OrderSide.LONG:
+            return (rxp - rep) * qty * point_value
+        else:
+            return (rep - rxp) * qty * point_value
+    return getattr(t, "pnl", 0) or 0
+
+
 def _trade_to_dict(t: Trade, point_value: int = 1) -> dict:
     """Convert a Trade to a JSON-serializable dict with computed fields.
 
@@ -233,6 +253,34 @@ def generate_report_from_backtest(
     return reports
 
 
+def _filter_session_trades(
+    trades: list[Trade],
+    date: str,
+    session_open_dt: str = "",
+    session_close_dt: str = "",
+) -> list[Trade]:
+    """Filter trades whose exit falls within a session window.
+
+    When ``session_open_dt`` and ``session_close_dt`` are provided (ISO
+    strings like ``"2026-08-13 15:00"``), trades are matched by exit_dt
+    within [open, close]. This correctly handles night sessions that cross
+    midnight (issue #95).
+
+    Falls back to calendar-date matching (``exit_dt[:10] == date``) when
+    no session window is given — preserves backtest / explicit-date callers.
+    """
+    if session_open_dt and session_close_dt:
+        return [
+            t for t in trades
+            if (getattr(t, "exit_dt", "") or "") >= session_open_dt
+            and (getattr(t, "exit_dt", "") or "") <= session_close_dt
+        ]
+    return [
+        t for t in trades
+        if getattr(t, "exit_dt", "")[:10] == date
+    ]
+
+
 def generate_session_report(
     broker,
     data_store,
@@ -243,12 +291,21 @@ def generate_session_report(
     date: str = "",
     bot_name: str = "",
     started_at: str = "",
+    session_open_dt: str = "",
+    session_close_dt: str = "",
 ) -> dict | None:
     """Generate a daily report from a live session's broker and data store.
 
     This is the convenience entry point called by LiveRunner.stop().
     Extracts trades and bar data from the live components and delegates to
     generate_daily_report().
+
+    Parameters
+    ----------
+    session_open_dt / session_close_dt : ISO datetime strings defining the
+        trading session window. When provided, "today" trades are filtered
+        by exit_dt within [open, close] instead of by calendar date. This
+        correctly handles night sessions that cross midnight (issue #95).
 
     Returns the report dict, or None if there are no completed trades.
     """
@@ -269,11 +326,8 @@ def generate_session_report(
         except Exception:
             pass  # regime classification will be skipped
 
-    # Filter to trades that closed on this date
-    day_trades = [
-        t for t in trades
-        if getattr(t, "exit_dt", "")[:10] == date
-    ]
+    day_trades = _filter_session_trades(
+        trades, date, session_open_dt, session_close_dt)
 
     report = generate_daily_report(
         date=date,
@@ -291,16 +345,18 @@ def generate_session_report(
     )
 
     # Enrich the summary with today vs cumulative stats for the compact
-    # Discord daily report. "today" = day_trades; "cumulative" = all-time
-    # metrics from the broker's full trade history (restored from session.json).
+    # Discord daily report. Use effective P&L (real fills when available)
+    # so the report reflects actual account impact, not sim placeholders.
     summary = report.get("summary") or {}
-    today_pnl = sum(getattr(t, "pnl", 0) or 0 for t in day_trades)
+    today_pnl = sum(_effective_pnl(t, point_value) for t in day_trades)
     summary["today_pnl"] = int(today_pnl)
     summary["today_trades"] = len(day_trades)
-    cumul = calculate_metrics(trades, _build_equity_curve(trades))
-    summary["total_pnl"] = int(cumul.total_pnl)
-    summary["total_trades"] = cumul.total_trades
-    summary["win_rate"] = cumul.win_rate * 100
+
+    cumul_pnls = [_effective_pnl(t, point_value) for t in trades]
+    summary["total_pnl"] = int(sum(cumul_pnls))
+    summary["total_trades"] = len(trades)
+    wins = sum(1 for p in cumul_pnls if p > 0)
+    summary["win_rate"] = (wins / len(trades) * 100) if trades else 0
     report["summary"] = summary
 
     return report
