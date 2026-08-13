@@ -1513,13 +1513,33 @@ class LiveRunner:
     def _generate_daily_report(self) -> None:
         """Generate a daily report after session stop (best-effort).
 
-        Debounced by ``{date}_{session}`` key (persisted in session.json)
-        so that neither the 30s session-end poll nor a manual stop can
-        re-send the same session's report. DAY and NIGHT sessions on the
-        same calendar date produce separate reports.
+        Debounced by ``{open_date}_{session}`` key (persisted in
+        session.json) using the session's OPEN date so that a night
+        session crossing midnight produces one key, not two (issue #95).
         """
         try:
             from ..daily_report.report_generator import generate_session_report
+            from ..regime.switch_logic import current_session, session_slot
+
+            session = current_session()
+            if session:
+                session_date = session.open_date
+                session_type = session.slot
+                open_dt_str = session.open_dt.strftime("%Y-%m-%d %H:%M")
+                close_dt_str = session.close_dt.strftime("%Y-%m-%d %H:%M")
+            else:
+                # Gap/weekend/holiday — session_slot() always returns a
+                # value so the dedup key is never empty (review issue #95).
+                fallback_date, fallback_slot = session_slot()
+                session_date = fallback_date
+                session_type = fallback_slot
+                open_dt_str = ""
+                close_dt_str = ""
+
+            report_key = f"{session_date}_{session_type}"
+            if report_key == self._last_report_key:
+                return
+
             report = generate_session_report(
                 broker=self.broker,
                 data_store=self.data_store,
@@ -1527,15 +1547,13 @@ class LiveRunner:
                 strategy_params=getattr(self.strategy, "params", None),
                 point_value=self.point_value,
                 symbol=self.symbol,
+                date=session_date,
                 bot_name=self.bot_name,
                 started_at=self._started_at,
+                session_open_dt=open_dt_str,
+                session_close_dt=close_dt_str,
             )
             if report is None:
-                return
-            report_date = report.get("date", "")
-            _, session_type = self._session_key()
-            report_key = f"{report_date}_{session_type}" if report_date else ""
-            if report_key and report_key == self._last_report_key:
                 return
             self._last_report_key = report_key
             self._auto_save_session()

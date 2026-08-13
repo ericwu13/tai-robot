@@ -200,15 +200,33 @@ class TestDailyReportSessionDedup:
 
         return StubRunner(session_key)
 
+    @staticmethod
+    def _mock_session(date, slot):
+        """Create a mock SessionInfo for the given date and slot."""
+        from datetime import datetime, timezone, timedelta
+        tz = timezone(timedelta(hours=8))
+        if slot == "DAY":
+            open_dt = datetime.fromisoformat(f"{date}T08:45:00").replace(tzinfo=tz)
+            close_dt = datetime.fromisoformat(f"{date}T13:45:00").replace(tzinfo=tz)
+        else:
+            open_dt = datetime.fromisoformat(f"{date}T15:00:00").replace(tzinfo=tz)
+            close_dt = open_dt + timedelta(hours=14)
+        from src.regime.switch_logic import SessionInfo
+        return SessionInfo(date, slot, open_dt, close_dt)
+
     def test_day_and_night_both_fire(self):
         """Same date, different sessions -- both reports emitted."""
         report = {"date": "2026-07-24", "strategy": {"name": "T"}}
 
         # DAY session
         runner = self._make_runner(("2026-07-24", "DAY"))
+        day_session = self._mock_session("2026-07-24", "DAY")
         with patch(
             "src.daily_report.report_generator.generate_session_report",
             return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=day_session,
         ):
             runner._generate_daily_report()
         assert runner._last_report_key == "2026-07-24_DAY"
@@ -217,9 +235,13 @@ class TestDailyReportSessionDedup:
         # NIGHT session -- same date, different session
         runner._events.clear()
         runner._sk = ("2026-07-24", "NIGHT")
+        night_session = self._mock_session("2026-07-24", "NIGHT")
         with patch(
             "src.daily_report.report_generator.generate_session_report",
             return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=night_session,
         ):
             runner._generate_daily_report()
         assert runner._last_report_key == "2026-07-24_NIGHT"
@@ -230,9 +252,13 @@ class TestDailyReportSessionDedup:
         report = {"date": "2026-07-24", "strategy": {"name": "T"}}
 
         runner = self._make_runner(("2026-07-24", "DAY"))
+        day_session = self._mock_session("2026-07-24", "DAY")
         with patch(
             "src.daily_report.report_generator.generate_session_report",
             return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=day_session,
         ):
             runner._generate_daily_report()
         assert "on_daily_report" in runner._events
@@ -241,6 +267,79 @@ class TestDailyReportSessionDedup:
         with patch(
             "src.daily_report.report_generator.generate_session_report",
             return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=day_session,
+        ):
+            runner._generate_daily_report()
+        assert "on_daily_report" not in runner._events
+
+    def test_gap_stop_uses_session_slot_fallback(self):
+        """stop() during a gap (current_session=None) still deduplicates."""
+        report = {"date": "2026-07-24", "strategy": {"name": "T"}}
+
+        runner = self._make_runner(("2026-07-24", "NIGHT"))
+        # First report during live session
+        night_session = self._mock_session("2026-07-24", "NIGHT")
+        with patch(
+            "src.daily_report.report_generator.generate_session_report",
+            return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=night_session,
+        ):
+            runner._generate_daily_report()
+        assert runner._last_report_key == "2026-07-24_NIGHT"
+        assert "on_daily_report" in runner._events
+
+        # Second call during gap (stop at 05:30) — current_session=None,
+        # session_slot falls back to ("2026-07-25", "NIGHT").
+        # Key differs, so a fresh report is emitted — but the key is never
+        # empty, preventing dedup destruction (review issue #95).
+        runner._events.clear()
+        with patch(
+            "src.daily_report.report_generator.generate_session_report",
+            return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=None,
+        ), patch(
+            "src.regime.switch_logic.session_slot",
+            return_value=("2026-07-25", "NIGHT"),
+        ):
+            runner._generate_daily_report()
+        # Key is non-empty even when current_session is None
+        assert runner._last_report_key != ""
+        assert runner._last_report_key == "2026-07-25_NIGHT"
+
+    def test_gap_stop_dedup_same_slot(self):
+        """Two gap-stop calls with the same session_slot are deduped."""
+        report = {"date": "2026-07-25", "strategy": {"name": "T"}}
+
+        runner = self._make_runner(("2026-07-25", "NIGHT"))
+        with patch(
+            "src.daily_report.report_generator.generate_session_report",
+            return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=None,
+        ), patch(
+            "src.regime.switch_logic.session_slot",
+            return_value=("2026-07-25", "NIGHT"),
+        ):
+            runner._generate_daily_report()
+        assert "on_daily_report" in runner._events
+
+        runner._events.clear()
+        with patch(
+            "src.daily_report.report_generator.generate_session_report",
+            return_value=dict(report),
+        ), patch(
+            "src.regime.switch_logic.current_session",
+            return_value=None,
+        ), patch(
+            "src.regime.switch_logic.session_slot",
+            return_value=("2026-07-25", "NIGHT"),
         ):
             runner._generate_daily_report()
         assert "on_daily_report" not in runner._events
