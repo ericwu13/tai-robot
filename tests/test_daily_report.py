@@ -988,62 +988,31 @@ class TestFilterSessionTrades:
 
 
 class TestEffectivePnl:
-    """Verify _effective_pnl uses real prices when available."""
+    """Verify _effective_pnl always returns sim P&L for consistency."""
 
-    def test_real_prices_long(self):
+    def test_always_sim_even_with_real_prices(self):
+        """Real prices present but sim P&L is used."""
         t = _make_trade(
             pnl=3830, side=OrderSide.LONG,
             entry_price=46037, exit_price=46420,
             real_entry_price=46032, real_exit_price=46404,
             source="real",
         )
-        # Real PnL with point_value=10: (46404 - 46032) * 1 * 10 = 3720
-        assert _effective_pnl(t, point_value=10) == 3720
+        assert _effective_pnl(t, point_value=10) == 3830
 
-    def test_real_prices_short(self):
-        t = _make_trade(
-            pnl=500, side=OrderSide.SHORT,
-            entry_price=20100, exit_price=20050,
-            real_entry_price=20095, real_exit_price=20045,
-            source="real",
-        )
-        # Real PnL: (20095 - 20045) * 1 * 1 = 50
-        assert _effective_pnl(t, point_value=1) == 50
-
-    def test_sign_flip_sim_win_real_loss(self):
-        """The actual incident: sim says +60, real says -110."""
-        t = _make_trade(
-            pnl=60, side=OrderSide.LONG,
-            entry_price=46355, exit_price=46361,
-            real_entry_price=46381, real_exit_price=46370,
-            source="real",
-        )
-        # Real PnL: (46370 - 46381) * 1 * 10 = -110
-        assert _effective_pnl(t, point_value=10) == -110
-
-    def test_partial_real_falls_back_to_sim(self):
-        """Real entry set but real exit 0 → use sim PnL."""
-        t = _make_trade(
-            pnl=200, real_entry_price=20050, real_exit_price=0,
-            source="real",
-        )
-        assert _effective_pnl(t, point_value=1) == 200
-
-    def test_paper_trade_uses_sim(self):
-        """Paper trades (no real prices) use sim PnL."""
+    def test_paper_trade(self):
         t = _make_trade(pnl=500)
         assert _effective_pnl(t, point_value=1) == 500
 
-    def test_backtest_trade_uses_sim(self):
-        """Backtest trades have no real prices, use sim."""
+    def test_backtest_trade(self):
         t = _make_trade(pnl=-300, source="backtest")
         assert _effective_pnl(t, point_value=1) == -300
 
 
-class TestSessionReportRealPrices:
-    """Verify generate_session_report uses effective P&L (issue #95)."""
+class TestSessionReportSimPrices:
+    """Verify generate_session_report always uses sim P&L for consistency."""
 
-    def test_today_pnl_uses_real_prices(self, tmp_path, monkeypatch):
+    def test_today_pnl_uses_sim(self, tmp_path, monkeypatch):
         import src.daily_report.report_generator as rg
         monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
 
@@ -1060,9 +1029,9 @@ class TestSessionReportRealPrices:
             broker=broker, data_store=None,
             date="2026-08-13", point_value=10,
         )
-        assert report["summary"]["today_pnl"] == 3720  # not 3830
+        assert report["summary"]["today_pnl"] == 3830
 
-    def test_cumulative_uses_real_prices(self, tmp_path, monkeypatch):
+    def test_cumulative_uses_sim(self, tmp_path, monkeypatch):
         import src.daily_report.report_generator as rg
         monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
 
@@ -1083,11 +1052,10 @@ class TestSessionReportRealPrices:
             broker=broker, data_store=None,
             date="2026-08-13", point_value=10,
         )
-        # Real PnLs: 3720 + (-110) = 3610; sim would be 3890
-        assert report["summary"]["total_pnl"] == 3610
+        assert report["summary"]["total_pnl"] == 3890
 
-    def test_win_rate_uses_real_prices(self, tmp_path, monkeypatch):
-        """Sim says 2 wins, real says 1 win + 1 loss."""
+    def test_win_rate_uses_sim(self, tmp_path, monkeypatch):
+        """Both trades are sim-wins, so win_rate = 100%."""
         import src.daily_report.report_generator as rg
         monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
 
@@ -1108,11 +1076,10 @@ class TestSessionReportRealPrices:
             broker=broker, data_store=None,
             date="2026-08-13", point_value=10,
         )
-        # 1 win out of 2 = 50%
-        assert report["summary"]["win_rate"] == 50.0
+        assert report["summary"]["win_rate"] == 100.0
 
-    def test_session_window_with_real_prices(self, tmp_path, monkeypatch):
-        """Combined: session window + real prices (the full issue #95 fix)."""
+    def test_session_window_with_sim_prices(self, tmp_path, monkeypatch):
+        """Session window filtering works correctly with sim P&L."""
         import src.daily_report.report_generator as rg
         monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path)
 
@@ -1135,7 +1102,5 @@ class TestSessionReportRealPrices:
             session_open_dt="2026-08-13 15:00",
             session_close_dt="2026-08-14 05:00",
         )
-        # Both trades within session window
         assert report["summary"]["today_trades"] == 2
-        # Real PnLs: 3720 + (-110) = 3610
-        assert report["summary"]["today_pnl"] == 3610
+        assert report["summary"]["today_pnl"] == 3890

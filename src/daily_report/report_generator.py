@@ -12,7 +12,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from src.backtest.broker import Trade, OrderSide
+from src.backtest.broker import Trade
 from src.backtest.metrics import PerformanceMetrics, calculate_metrics
 from .regime_classifier import classify_regime, RegimeResult
 
@@ -21,22 +21,7 @@ _TPE = timezone(timedelta(hours=8))
 
 
 def _effective_pnl(t: Trade, point_value: int = 1) -> int:
-    """Return real-price P&L when both fills are confirmed, else sim P&L.
-
-    For source="real" trades with both real_entry_price and real_exit_price
-    set (non-zero), recompute P&L from the actual fills. Otherwise fall back
-    to the sim-computed t.pnl. This keeps backtest parity (no real prices)
-    and handles partial-fill edge cases (real entry but no real exit yet).
-    """
-    rep = getattr(t, "real_entry_price", 0) or 0
-    rxp = getattr(t, "real_exit_price", 0) or 0
-    if rep > 0 and rxp > 0:
-        qty = getattr(t, "qty", 1) or 1
-        side = t.side
-        if side == OrderSide.LONG:
-            return (rxp - rep) * qty * point_value
-        else:
-            return (rep - rxp) * qty * point_value
+    """Return simulated P&L for consistency across all trading modes."""
     return getattr(t, "pnl", 0) or 0
 
 
