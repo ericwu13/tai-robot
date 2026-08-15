@@ -147,6 +147,20 @@ class RegimeSwitchingRunner(LiveRunner):
                     "[NEWS] Could not open signal ledger %s: %s — "
                     "news framework DISABLED for this session",
                     ledger_path, e)
+        # Always log the FINAL news state — a deploy that silently dropped the
+        # flag (or lost it to the ledger-failure path above) must be visible in
+        # the log instead of going unnoticed.
+        if self._news_enabled:
+            logger.info(
+                "[NEWS] 新聞斷路器啟用 News circuit breaker ENABLED "
+                "(tier2=%s, signal=%s, votes=%s)",
+                self._news_cfg.tier2_enabled,
+                self._news_cfg.signal_path,
+                getattr(self._news_cfg, "regime_vote_path", ""))
+        else:
+            logger.info(
+                "[NEWS] 新聞斷路器停用 News circuit breaker DISABLED "
+                "for this deploy")
         # Event-calendar cache (path mtime + last parse time)
         self._events_cache: list = []
         self._events_updated_at: str = ""

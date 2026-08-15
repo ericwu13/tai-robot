@@ -5831,6 +5831,8 @@ class BacktestApp:
                 version=APP_VERSION,
                 restored_leg=_restored_leg,
                 restored_strategy=_restored_strat,
+                news_enabled=news_enabled,
+                news_tier2=news_tier2_enabled,
             )
             if self._live_runner.regime_idle:
                 _discord.regime_idle_warning()
@@ -5862,9 +5864,14 @@ class BacktestApp:
         mode_labels = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto", "auto": "全自動 Auto"}
         mode_label = mode_labels.get(trading_mode, trading_mode)
         if is_regime_deploy:
+            if news_enabled:
+                news_label = "ON+Tier2" if news_tier2_enabled else "ON"
+            else:
+                news_label = "OFF"
             self._live_log_msg(
                 f"部署中 Deploying: Regime Switching [{bot_name}] on {symbol} "
-                f"模式={mode_label} (Long={regime_cfg.long_strategy}, Short={regime_cfg.short_strategy})",
+                f"模式={mode_label} (Long={regime_cfg.long_strategy}, Short={regime_cfg.short_strategy}"
+                f", 📰News={news_label})",
                 "status")
         else:
             self._live_log_msg(

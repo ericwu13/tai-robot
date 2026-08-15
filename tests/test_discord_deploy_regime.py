@@ -88,6 +88,33 @@ def test_regime_deploy_fresh_no_restored_line():
     assert "已恢復 Restored" not in sent[0]
 
 
+def test_regime_deploy_news_status_line():
+    """News enablement must be stated at deploy time, ON or OFF.
+
+    Regression: a deploy silently dropped the news flag and the breaker
+    stayed off for a week because nothing in the deploy notification said
+    so. The line is unconditional — absence of news is now visible.
+    """
+    n = DiscordNotifier("token", "channel", bot_name="08-14-regime",
+                        symbol="TMF00")
+    sent = _capture(n)
+
+    n.bot_deployed_regime("Long", "Short", "模擬")
+    n.bot_deployed_regime("Long", "Short", "模擬", news_enabled=True)
+    n.bot_deployed_regime("Long", "Short", "模擬", news_enabled=True,
+                          news_tier2=True)
+    # tier2 without the breaker itself is still OFF
+    n.bot_deployed_regime("Long", "Short", "模擬", news_tier2=True)
+
+    off, on, on_tier2, tier2_only = sent
+    assert "📰 新聞斷路器 News breaker: ❌ OFF" in off
+    assert "📰 新聞斷路器 News breaker: ✅ ON" in on
+    assert "Tier2" not in on
+    assert ("📰 新聞斷路器 News breaker: ✅ ON "
+            "(+Tier2 強制進場 forced-entry)") in on_tier2
+    assert "📰 新聞斷路器 News breaker: ❌ OFF" in tier2_only
+
+
 def test_regime_deploy_disabled_notifier_no_raise():
     n = DiscordNotifier("", "")
     assert n.enabled is False

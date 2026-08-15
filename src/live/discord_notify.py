@@ -216,6 +216,8 @@ class DiscordNotifier:
         version: str = "",
         restored_leg: str = "",
         restored_strategy: str = "",
+        news_enabled: bool = False,
+        news_tier2: bool = False,
     ) -> None:
         """Deploy notification for a regime-switching bot.
 
@@ -226,14 +228,26 @@ class DiscordNotifier:
         When *restored_leg* is provided (``"long"`` or ``"short"``), an extra
         line announces the restored regime so the user sees one combined
         message instead of two separate notifications.
+
+        The news line always states whether the news circuit breaker is ON or
+        OFF, so a deploy that silently dropped the flag is visible at deploy
+        time instead of going unnoticed for days.
         """
         ver = f" v{version}" if version else ""
+        if news_enabled and news_tier2:
+            news_line = ("📰 新聞斷路器 News breaker: ✅ ON "
+                         "(+Tier2 強制進場 forced-entry)")
+        elif news_enabled:
+            news_line = "📰 新聞斷路器 News breaker: ✅ ON"
+        else:
+            news_line = "📰 新聞斷路器 News breaker: ❌ OFF"
         lines = [
             f"{self._header()}",
             f"🚀 **機器人啟動 Bot Deployed**{ver}",
             f"🔄 **多空切換 Regime Switching** 已啟用 Enabled",
             f"做多 Long: {long_strategy} | 做空 Short: {short_strategy}",
             f"模式: {mode}",
+            news_line,
         ]
         if restored_leg in ("long", "short"):
             _LEG_LABELS = {"long": "做多 LONG", "short": "做空 SHORT"}
