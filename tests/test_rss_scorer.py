@@ -409,3 +409,18 @@ class TestNightSessionKey:
     def test_after_midnight(self):
         dt = datetime(2026, 8, 8, 2, 0, tzinfo=timezone(timedelta(hours=8)))
         assert rss_scorer.night_session_key(dt) == "2026-08-07|NIGHT"
+
+    def test_morning_targets_tonight(self):
+        """Vote at 10:00 targets tonight, not last night (already classified)."""
+        dt = datetime(2026, 8, 8, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+        assert rss_scorer.night_session_key(dt) == "2026-08-08|NIGHT"
+
+    def test_boundary_0500_targets_tonight(self):
+        """05:00 is the night close — vote targets the upcoming night."""
+        dt = datetime(2026, 8, 8, 5, 0, tzinfo=timezone(timedelta(hours=8)))
+        assert rss_scorer.night_session_key(dt) == "2026-08-08|NIGHT"
+
+    def test_boundary_0459_targets_last_night(self):
+        """04:59 is still inside the night that opened yesterday."""
+        dt = datetime(2026, 8, 8, 4, 59, tzinfo=timezone(timedelta(hours=8)))
+        assert rss_scorer.night_session_key(dt) == "2026-08-07|NIGHT"

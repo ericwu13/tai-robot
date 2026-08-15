@@ -138,10 +138,18 @@ def test_monitor_night_session_key():
     """night_session_key returns the correct open-date key."""
     from datetime import datetime, timezone, timedelta
     tz = timezone(timedelta(hours=8))
-    # 22:00 TPE on Aug 5 → session opened Aug 5
+    # 22:00 TPE on Aug 5 → inside the night that opened Aug 5
     assert night_session_key(datetime(2026, 8, 5, 22, 0, tzinfo=tz)) == "2026-08-05|NIGHT"
-    # 03:00 TPE on Aug 6 → session opened Aug 5
+    # 03:00 TPE on Aug 6 → still inside the night that opened Aug 5
     assert night_session_key(datetime(2026, 8, 6, 3, 0, tzinfo=tz)) == "2026-08-05|NIGHT"
+    # 10:00 TPE on Aug 6 → day session; vote targets tonight (Aug 6)
+    assert night_session_key(datetime(2026, 8, 6, 10, 0, tzinfo=tz)) == "2026-08-06|NIGHT"
+    # 05:00 TPE on Aug 6 → gap after night close; vote targets tonight (Aug 6)
+    assert night_session_key(datetime(2026, 8, 6, 5, 0, tzinfo=tz)) == "2026-08-06|NIGHT"
+    # 14:00 TPE on Aug 6 → gap before night open; vote targets tonight (Aug 6)
+    assert night_session_key(datetime(2026, 8, 6, 14, 0, tzinfo=tz)) == "2026-08-06|NIGHT"
+    # 04:59 TPE on Aug 6 → still inside last night (opened Aug 5)
+    assert night_session_key(datetime(2026, 8, 6, 4, 59, tzinfo=tz)) == "2026-08-05|NIGHT"
 
 
 def test_monitor_write_vote(tmp_path):

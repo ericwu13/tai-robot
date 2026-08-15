@@ -311,7 +311,12 @@ def net_score_to_vote(net_score: float, threshold: float = VOTE_THRESHOLD) -> st
 # ── Session key (mirrors crossmarket_monitor.py) ────────────────────────
 
 def night_session_key(now: datetime) -> str:
-    if now.hour >= 15:
+    """Target the NIGHT session this vote applies to.
+
+    Boundary is 05:00, not 15:00 — votes during 05:00-14:59 target
+    tonight (today|NIGHT), not last night (already classified at ~04:58).
+    """
+    if now.hour >= 5:
         return f"{now.strftime('%Y-%m-%d')}|NIGHT"
     return f"{(now - timedelta(days=1)).strftime('%Y-%m-%d')}|NIGHT"
 

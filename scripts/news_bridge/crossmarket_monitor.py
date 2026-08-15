@@ -237,8 +237,18 @@ def save_state(path: Path, state: dict) -> None:
 
 
 def night_session_key(now: datetime) -> str:
-    """Return ``"YYYY-MM-DD|NIGHT"`` for the night session containing *now*."""
-    if now.hour >= NIGHT_START:
+    """Return the NIGHT session key this vote targets.
+
+    Time windows (all TPE):
+      00:00-04:59  → yesterday|NIGHT  (inside the night that opened yesterday 15:00)
+      05:00-14:59  → today|NIGHT      (the upcoming night opening today 15:00)
+      15:00-23:59  → today|NIGHT      (the night currently in progress)
+
+    The boundary is 05:00 (NIGHT_END), NOT 15:00 — a vote written during
+    the morning/day session must target tonight's classification, not last
+    night's (which was already classified at ~04:58).
+    """
+    if now.hour >= NIGHT_END:
         return f"{now.strftime('%Y-%m-%d')}|NIGHT"
     return f"{(now - timedelta(days=1)).strftime('%Y-%m-%d')}|NIGHT"
 
