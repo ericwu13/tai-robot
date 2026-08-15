@@ -255,7 +255,26 @@ def _release_notes_path() -> str:
     return os.path.join(project, f"release_notes_v{VERSION}.md")
 
 
-def create_github_release(zip_path: str, sha_path: str, sha: str) -> bool:
+def verify_release_notes() -> str:
+    """Return the release notes path, or abort if missing/empty."""
+    path = _release_notes_path()
+    if not os.path.isfile(path):
+        print(f"ERROR: release notes file not found: {os.path.basename(path)}")
+        print(f"       Create it before running the release build.")
+        sys.exit(1)
+    with open(path, encoding="utf-8") as f:
+        content = f.read().strip()
+    if len(content) < 20:
+        print(f"ERROR: {os.path.basename(path)} is empty or too short "
+              f"({len(content)} chars).")
+        print("       Write proper bilingual release notes before releasing.")
+        sys.exit(1)
+    print(f"  Release notes OK ({os.path.basename(path)}, {len(content)} chars)")
+    return path
+
+
+def create_github_release(zip_path: str, sha_path: str, sha: str,
+                          notes_file: str) -> bool:
     """Create a GitHub release via ``gh``, attaching the zip and checksum.
 
     The tag is pinned to *sha* via ``--target`` so it always points at the
@@ -266,15 +285,10 @@ def create_github_release(zip_path: str, sha_path: str, sha: str) -> bool:
     print(f"\n=== Creating GitHub release v{VERSION} ===")
 
     tag = f"v{VERSION}"
-    notes_file = _release_notes_path()
 
     cmd = ["gh", "release", "create", tag, zip_path, sha_path,
-           "--title", tag, "--target", sha]
-    if os.path.isfile(notes_file):
-        cmd += ["--notes-file", notes_file]
-    else:
-        cmd += ["--notes", f"Release {tag}"]
-        print(f"  No release_notes_v{VERSION}.md — using default notes")
+           "--title", tag, "--target", sha,
+           "--notes-file", notes_file]
 
     result = subprocess.run(cmd, capture_output=True, encoding="utf-8")
     if result.returncode != 0:
@@ -400,6 +414,9 @@ def main():
               "or pass --allow-dirty to override.")
         sys.exit(1)
 
+    if not args.skip_release:
+        notes_file = verify_release_notes()
+
     if not args.skip_build:
         build()
 
@@ -414,13 +431,14 @@ def main():
     if args.skip_release:
         print(f"\n=== Done (--skip-release) ===")
         print(f"To create the GitHub release later:")
+        notes_hint = _release_notes_path()
         print(f"  gh release create v{VERSION} {zip_path} {sha_path} "
               f"--title \"v{VERSION}\" --target {sha} "
-              f"--notes-file release_notes_v{VERSION}.md")
+              f"--notes-file {notes_hint}")
         return
 
     verify_head_pushed()
-    released = create_github_release(zip_path, sha_path, sha)
+    released = create_github_release(zip_path, sha_path, sha, notes_file)
     if released:
         notify_release(sha, force=args.force_notify)
     else:
