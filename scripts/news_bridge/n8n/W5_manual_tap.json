@@ -1,5 +1,5 @@
 {
-  "name": "W4 Manual tap (Discord confirmation link)",
+  "name": "W5 Manual tap (Discord confirmation link)",
   "nodes": [
     {
       "parameters": {
@@ -115,7 +115,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire deploy_short"
+        "command": "C:\\Python313\\python.exe C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire deploy_short --settings C:\\Users\\eric8\\gitRepos\\tai-robot\\settings.yaml"
       },
       "name": "Fire deploy_short",
       "type": "n8n-nodes-base.executeCommand",
@@ -127,7 +127,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire deploy_long"
+        "command": "C:\\Python313\\python.exe C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire deploy_long --settings C:\\Users\\eric8\\gitRepos\\tai-robot\\settings.yaml"
       },
       "name": "Fire deploy_long",
       "type": "n8n-nodes-base.executeCommand",
@@ -139,7 +139,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire risk_off"
+        "command": "C:\\Python313\\python.exe C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire risk_off --settings C:\\Users\\eric8\\gitRepos\\tai-robot\\settings.yaml"
       },
       "name": "Fire risk_off",
       "type": "n8n-nodes-base.executeCommand",
@@ -151,7 +151,7 @@
     },
     {
       "parameters": {
-        "command": "python C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire clear"
+        "command": "C:\\Python313\\python.exe C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\crossmarket_monitor.py --signal-out C:\\Users\\eric8\\n8n-bridge\\signal.json --force-fire clear --settings C:\\Users\\eric8\\gitRepos\\tai-robot\\settings.yaml"
       },
       "name": "Fire clear",
       "type": "n8n-nodes-base.executeCommand",
@@ -210,5 +210,5 @@
   "settings": {
     "timezone": "Asia/Taipei"
   },
-  "id": "NewsW4ManualTap0"
+  "id": "NewsW5ManualTap0"
 }
