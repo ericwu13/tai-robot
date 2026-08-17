@@ -20,7 +20,8 @@ Safety asymmetry (deliberate, mirrors the design doc):
   cost if wrong).
 - UPSIDE breach (any tier)      -> Discord alert only. Entering a position
   always requires the human: run `--force-fire deploy_long` (or deploy_short)
-  yourself — that IS the "tap" until n8n W4 exists.
+  yourself, or activate the W5 manual-tap webhook (n8n/W5_manual_tap.json)
+  and tap the Discord link.
 
 Session hand-offs are handled by the quote-freshness guard alone: whichever
 markets are closed simply go stale and drop out of every decision, so one
@@ -253,23 +254,16 @@ def night_session_key(now: datetime) -> str:
     return f"{(now - timedelta(days=1)).strftime('%Y-%m-%d')}|NIGHT"
 
 
-def write_regime_vote(path: str, direction: str, session_key: str) -> None:
-    """Write the per-source regime-vote sidecar file atomically."""
-    source = "W2"
-    payload = {
-        "version": 1,
-        "direction": direction,
-        "expires_after_session": session_key,
-        "source": source,
-    }
-    stem, ext = os.path.splitext(path)
-    out = Path(f"{stem}_{source.lower()}{ext}")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(out) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, out)
-    print(f"  VOTE WRITTEN: {direction} for {session_key} -> {out}")
+def _get_write_regime_vote():
+    """Import write_regime_vote straight from the module file (scripts/ is
+    not a package and src/news/__init__ pulls a wider dep chain)."""
+    import importlib.util
+    mod_path = Path(__file__).resolve().parents[2] / "src" / "news" / "regime_vote.py"
+    spec = importlib.util.spec_from_file_location("regime_vote", mod_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod.write_regime_vote
 
 
 def in_active_window(now: datetime) -> bool:
@@ -321,10 +315,14 @@ def _collect_quotes(args) -> tuple[dict[str, dict], dict[str, list[str]], list[s
     return fresh, breaches, details, fetch_failures
 
 
-def _vote_direction(fresh: dict[str, dict]) -> str | None:
-    """Return "trending-up"/"trending-down" when at least VOTE_MIN_SYMBOLS
-    fresh symbols breach their vote threshold one way and none breaches the
-    other way.  None otherwise."""
+def _vote_direction(fresh: dict[str, dict]) -> tuple[str | None, list[str], list[str]]:
+    """Return ``(direction, up_syms, down_syms)``.
+
+    *direction* is ``"trending-up"``/``"trending-down"`` when at least
+    VOTE_MIN_SYMBOLS fresh symbols breach their vote threshold one way
+    and none breaches the other way; ``None`` otherwise.  The caller
+    uses *up_syms*/*down_syms* to detect contradictions worth alerting.
+    """
     up, down = [], []
     for sym, q in fresh.items():
         vote_down, vote_up = VOTE_THRESHOLDS[sym]
@@ -333,10 +331,10 @@ def _vote_direction(fresh: dict[str, dict]) -> str | None:
         elif q["pct"] <= vote_down:
             down.append(sym)
     if len(up) >= VOTE_MIN_SYMBOLS and not down:
-        return "trending-up"
+        return "trending-up", up, down
     if len(down) >= VOTE_MIN_SYMBOLS and not up:
-        return "trending-down"
-    return None
+        return "trending-down", up, down
+    return None, up, down
 
 
 def check_once(args, state: dict) -> dict:
@@ -402,18 +400,31 @@ def check_once(args, state: dict) -> dict:
     # ── regime vote: >=2 fresh symbols agree, none disagrees ──────────
     # The direction is computed every pass (pure, cheap) so the log shows
     # what the vote logic saw even when no --vote-out is configured.
-    direction = _vote_direction(fresh)
+    direction, vote_up_syms, vote_down_syms = _vote_direction(fresh)
     vote_note = direction or "-"
     vote_out = getattr(args, "vote_out", None)
     if direction and vote_out:
         if state.get(f"vote:{us_date}") is None:
-            write_regime_vote(vote_out, direction, night_session_key(now))
+            _write_vote = _get_write_regime_vote()
+            _write_vote(vote_out, direction, night_session_key(now), source="W2")
             state[f"vote:{us_date}"] = direction
             post_discord(args.discord_webhook,
                          f"📊 **Regime vote** — {direction} ({', '.join(details)})")
         else:
             vote_note = f"{direction}(deduped)"
             print("  vote already written for this US session — deduped")
+    elif not direction and vote_up_syms and vote_down_syms and vote_out:
+        vote_note = "contradiction"
+        if state.get(f"vote-contra:{us_date}") is None:
+            state[f"vote-contra:{us_date}"] = "alerted"
+            post_discord(args.discord_webhook,
+                         f"⚠️ **W2 regime vote: no vote — contradiction**\n"
+                         f"Up: {', '.join(vote_up_syms)} | "
+                         f"Down: {', '.join(vote_down_syms)}")
+            print("  vote contradiction — Discord alert sent")
+        else:
+            vote_note = "contradiction(deduped)"
+            print("  vote contradiction already alerted — deduped")
 
     # ── liveness: one log line + machine-readable state per pass ──────
     summary = (f"fresh {len(fresh)}/{len(SYMBOLS)} ({', '.join(details) or 'none'})"

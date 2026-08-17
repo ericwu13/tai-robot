@@ -13,7 +13,8 @@ n8n                                        bot (RegimeSwitchingRunner, 30 s poll
 ├─ W1 Calendar sweep (weekly+daily) ─────→ events.json      → calendar sit-out gate
 ├─ W2 Cross-market monitor (night, 2–5m) ─→ signal.json      → Tier 1 risk_off (auto)
 ├─ W3 RSS + Gemini scorer (15–30 m) ─────→ Discord + CSV log (advisory / evidence only)
-└─ W4 Human confirm (Discord tap link) ──→ signal.json      → Tier 2 deploy_short/long
+├─ W4 Chips monitor (daily 16:15 TPE) ───→ regime_vote_w4.json → confirmation acceleration
+└─ W5 Human confirm (Discord tap link) ──→ signal.json      → Tier 2 deploy_short/long
 ```
 
 ---
@@ -156,9 +157,9 @@ lost exactly this way).
      to zero. (The bot's ledger also dedups, but don't rely on it for rate-limiting.)
 3. **On fire — downside:** Code node builds `signal.json` (fresh UUID, `issued_at` now
    with offset, `action: "risk_off"`, reason with the numbers) → Write File → **Discord**
-   alert with the numbers + a W4 confirmation link for `deploy_short`.
+   alert with the numbers + a W5 confirmation link for `deploy_short`.
 4. **On fire — upside:** no auto-signal (there's no long position to protect — upside
-   shocks are opportunity, not risk). Discord alert + W4 confirmation link for
+   shocks are opportunity, not risk). Discord alert + W5 confirmation link for
    `deploy_long` only.
 
 This asymmetry is deliberate: downside auto-protects (bounded cost if wrong), both
@@ -206,7 +207,10 @@ promoting W3 to a signal writer is a deliberate future decision — with the sam
 
 ---
 
-## 5. Workflow W4 — Human confirmation (the tap)
+## 5. Workflow W5 — Human confirmation (the tap)
+
+> Renumbered from "W4" 2026-08-16: the W4 slot now belongs to the chips
+> monitor (`chips_monitor.py`, vote source "W4" / `regime_vote_w4.json`).
 
 **Trigger:** n8n **Webhook node** (GET). The URL is a secret; add a static token query
 param and check it in the first node; reject otherwise. W2/W3 embed this URL (with
@@ -268,7 +272,7 @@ bots ignore all of it, and the checkboxes are hidden unless regime switching is 
    gate releases with the stale warning.
 3. **Restart test:** trigger suppression, restart the bot, confirm suppression and
    consumed ids survive (session restore).
-4. Build W1–W4, repeat 1–2 through n8n end-to-end.
+4. Build W1–W5, repeat 1–2 through n8n end-to-end.
 5. Run the news-enabled **paper** bot alongside the unchanged baseline regime bot —
    deploy the baseline with the news checkbox UNTICKED and the news bot with it ticked
    (A/B, reports are namespaced per bot). Tier 2 stays off until Tier 1 + the W3 log

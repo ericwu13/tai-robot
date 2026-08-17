@@ -1,7 +1,7 @@
 """Regime-vote sidecar files — cross-market confirmation acceleration.
 
-External producers (W2 cross-market monitor, W3 RSS scorer) each write
-their own vote file.  At classification time (04:58) the regime state
+External producers (W2 cross-market monitor, W3 RSS scorer, W4 chips
+monitor) each write their own vote file.  At classification time (04:58) the regime state
 machine reads all vote files and, if any vote agrees with the raw
 technical classification, skips the normal hysteresis confirmation delay
 (2 nights → 1 night + vote).
@@ -11,6 +11,7 @@ Each source writes to a per-source file derived from the base path::
     regime_vote_path = "C:/n8n-bridge/regime_vote.json"
     W2 → "C:/n8n-bridge/regime_vote_w2.json"
     W3 → "C:/n8n-bridge/regime_vote_w3.json"
+    W4 → "C:/n8n-bridge/regime_vote_w4.json"
 
 File schema (unchanged per file)::
 

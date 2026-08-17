@@ -1,0 +1,109 @@
+{
+  "name": "W4 Chips vote (TAIFEX institutional flow, 16:15 TPE weekdays)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "15 16 * * 1-5"
+            }
+          ]
+        }
+      },
+      "name": "Weekdays 16:15 TPE",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "name": "Probe TAIFEX 3-institution API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&response=json&dayDate={{ $now.format('yyyyMMdd') }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "name": "Probe TWSE BFI82U (foreign equity flow)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "command": "C:\\Python313\\python.exe C:\\Users\\eric8\\gitRepos\\tai-robot\\scripts\\news_bridge\\chips_monitor.py --base-path C:\\Users\\eric8\\n8n-bridge\\regime_vote.json --settings C:\\Users\\eric8\\gitRepos\\tai-robot\\settings.yaml"
+      },
+      "name": "Compute W4 chips vote",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        660,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Weekdays 16:15 TPE": {
+      "main": [
+        [
+          {
+            "node": "Probe TAIFEX 3-institution API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Probe TAIFEX 3-institution API": {
+      "main": [
+        [
+          {
+            "node": "Probe TWSE BFI82U (foreign equity flow)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Probe TWSE BFI82U (foreign equity flow)": {
+      "main": [
+        [
+          {
+            "node": "Compute W4 chips vote",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "timezone": "Asia/Taipei"
+  },
+  "id": "NewsW4ChipsVote000"
+}

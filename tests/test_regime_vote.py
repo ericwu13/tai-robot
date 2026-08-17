@@ -17,7 +17,7 @@ from src.regime.state_machine import RegimeConfig, RegimeState, RegimeStateMachi
 from scripts.news_bridge.crossmarket_monitor import (
     VOTE_THRESHOLDS,
     night_session_key,
-    write_regime_vote as monitor_write_vote,
+    _get_write_regime_vote,
 )
 
 
@@ -155,7 +155,8 @@ def test_monitor_night_session_key():
 def test_monitor_write_vote(tmp_path):
     """Monitor's write_regime_vote produces a per-source vote file."""
     base_path = str(tmp_path / "regime_vote.json")
-    monitor_write_vote(base_path, "trending-down", "2026-08-05|NIGHT")
+    monitor_write_vote = _get_write_regime_vote()
+    monitor_write_vote(base_path, "trending-down", "2026-08-05|NIGHT", source="W2")
 
     w2_path = str(tmp_path / "regime_vote_w2.json")
     with open(w2_path, encoding="utf-8") as f:

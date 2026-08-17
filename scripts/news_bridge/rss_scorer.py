@@ -8,8 +8,9 @@ EMA total exceeds SESSION_VOTE_THRESHOLD writes a ``regime_vote.json``
 for the regime state machine.  A Discord embed posts only when something
 changed: a run that scored new articles, or once on entering the weekend
 pause.
-Scoring is skipped Sat 05:00 - Mon 15:00 TPE (no night session to vote
-on).
+Scoring is skipped Sat 05:00 - Mon 05:00 TPE (any vote would target a
+night session that never happens).  From Mon 05:00 scoring resumes like
+any other weekday morning — the vote targets Monday night (opens 15:00).
 
 Deduplicates via a persistent state file (GUID-based) so articles are
 scored exactly once across restarts.
@@ -322,19 +323,23 @@ def night_session_key(now: datetime) -> str:
 
 
 def in_weekend_pause(now: datetime) -> bool:
-    """True from Sat 05:00 to Mon 15:00 TPE.
+    """True from Sat 05:00 to Mon 05:00 TPE.
 
-    No TAIFEX night session exists in that window, so any vote written
-    would expire against a session that never happens.  Scoring (and its
-    Gemini cost) is skipped; the heartbeat embed still posts.
+    In that window ``night_session_key`` targets Sat|NIGHT or Sun|NIGHT —
+    sessions that never happen — so any vote written would expire unread.
+    From Mon 05:00 the key targets Monday night (opens 15:00), a real
+    session classified Tue ~04:58, making Monday morning identical to
+    every other weekday morning (which are never paused).  Scoring (and
+    its Gemini cost) is skipped during the pause; the heartbeat embed
+    still posts once.
     """
     wd = now.weekday()  # Mon=0 .. Sun=6
     if wd == 5:  # Saturday: Friday's night session ends 05:00
         return now.hour >= 5
     if wd == 6:  # Sunday
         return True
-    if wd == 0:  # Monday: night session opens 15:00
-        return now.hour < 15
+    if wd == 0:  # Monday 00:00-04:59 targets Sun|NIGHT (nonexistent)
+        return now.hour < 5
     return False
 
 

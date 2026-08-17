@@ -277,7 +277,7 @@ class TestCheckOnce:
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
     def test_weekend_pause_skips_scoring(self, mock_score, mock_feeds, tmp_vote):
-        """Sat 05:00 - Mon 15:00 TPE: no fetch, no Gemini, no vote."""
+        """Sat 05:00 - Mon 05:00 TPE: no fetch, no Gemini, no vote."""
         saturday = datetime(2026, 8, 8, 10, 0, tzinfo=_TPE)
         state = {"seen_guids": []}
         state = rss_scorer.check_once(self._mock_cfg(), state, tmp_vote, now=saturday)
@@ -286,6 +286,22 @@ class TestCheckOnce:
         assert mock_score.call_count == 0
         assert not os.path.exists(_w3_path(tmp_vote))
         assert "last_check" in state
+
+    def test_weekend_pause_boundaries(self):
+        """Pause runs Sat 05:00 → Mon 05:00.  Monday morning scores like
+        any other weekday morning: its vote targets Monday|NIGHT, a real
+        session (regression: the old Mon-15:00 boundary skipped Monday
+        morning scoring while the day session was open)."""
+        pause = rss_scorer.in_weekend_pause
+        # 2026-08-14 is a Friday, 08-15 Sat, 08-16 Sun, 08-17 Mon.
+        assert not pause(datetime(2026, 8, 14, 23, 0, tzinfo=_TPE))  # Fri night
+        assert not pause(datetime(2026, 8, 15, 4, 59, tzinfo=_TPE))  # Sat, Fri night still open
+        assert pause(datetime(2026, 8, 15, 5, 0, tzinfo=_TPE))       # Sat 05:00 → pause
+        assert pause(datetime(2026, 8, 16, 12, 0, tzinfo=_TPE))      # Sunday
+        assert pause(datetime(2026, 8, 17, 4, 59, tzinfo=_TPE))      # Mon pre-05:00 → Sun|NIGHT
+        assert not pause(datetime(2026, 8, 17, 5, 0, tzinfo=_TPE))   # Mon 05:00 → resume
+        assert not pause(datetime(2026, 8, 17, 10, 33, tzinfo=_TPE))  # Mon morning, day session
+        assert not pause(datetime(2026, 8, 17, 14, 0, tzinfo=_TPE))  # Mon before night open
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
