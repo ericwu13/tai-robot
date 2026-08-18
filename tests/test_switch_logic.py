@@ -9,6 +9,7 @@ from src.regime.switch_logic import (
     latest_night_session,
     last_completed_night,
     classification_due,
+    upcoming_night_session,
     validate_leg_strategies,
     _TZ_TAIPEI,
 )
@@ -285,3 +286,35 @@ class TestValidateLegStrategies:
             errors = validate_leg_strategies("Long", "Short", registry)
         assert errors == []
         assert any("Mixed timeframes" in r.message for r in caplog.records)
+
+
+# ── upcoming_night_session (pending-vote target key) ──
+
+class TestUpcomingNightSession:
+    def test_night_in_progress_is_tonight(self):
+        # Thu 16:00 — tonight's night opened at 15:00.
+        assert upcoming_night_session(
+            _tpe(2026, 7, 9, 16, 0)).key == "2026-07-09|NIGHT"
+
+    def test_after_midnight_still_the_open_night(self):
+        # Fri 03:00 — Thursday's night is still running.
+        assert upcoming_night_session(
+            _tpe(2026, 7, 10, 3, 0)).key == "2026-07-09|NIGHT"
+
+    def test_morning_gap_targets_tonight(self):
+        # Fri 10:00 — last night closed 05:00 (already classified);
+        # a vote written now targets the night opening 15:00 today.
+        assert upcoming_night_session(
+            _tpe(2026, 7, 10, 10, 0)).key == "2026-07-10|NIGHT"
+
+    def test_weekend_targets_monday(self):
+        assert upcoming_night_session(
+            _tpe(2026, 7, 11, 10, 0)).key == "2026-07-13|NIGHT"
+        assert upcoming_night_session(
+            _tpe(2026, 7, 12, 20, 0)).key == "2026-07-13|NIGHT"
+
+    def test_saturday_early_morning_is_fridays_night(self):
+        # Sat 04:00 — Friday's night session is STILL OPEN (closes 05:00),
+        # so its classification hasn't run yet.
+        assert upcoming_night_session(
+            _tpe(2026, 7, 11, 4, 0)).key == "2026-07-10|NIGHT"

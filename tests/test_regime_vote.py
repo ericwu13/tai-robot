@@ -101,6 +101,50 @@ def test_no_vote_file_normal_hysteresis():
     assert s.effective_regime == "trending-up"
 
 
+# ── 4b. Audit trail: _vote_sources + _vote_accelerated ──
+
+def test_vote_sources_and_acceleration_stamped():
+    """step() persists WHO voted and whether the vote alone confirmed
+    the flip — the regime tab reads both from regime_state.json."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2)
+    s = RegimeState()
+
+    s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05",
+               vote_directions=["trending-up"],
+               vote_sources=["W3:trending-up"])
+    assert s.last_features["_vote_sources"] == ["W3:trending-up"]
+    assert s.last_features["_vote_accelerated"] is True
+
+
+def test_hysteresis_flip_not_marked_accelerated():
+    """A flip that would have confirmed anyway (pending_count reached
+    confirm_sessions) must NOT claim vote acceleration, even when an
+    agreeing vote is present."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2)
+    s = RegimeState()
+    s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05")
+    s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-06",
+               vote_directions=["trending-up"],
+               vote_sources=["W3:trending-up"])
+    assert s.effective_regime == "trending-up"
+    assert s.last_features["_vote_accelerated"] is False
+    assert s.last_features["_vote_sources"] == ["W3:trending-up"]
+
+
+def test_disagreeing_vote_not_marked_accelerated():
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2)
+    s = RegimeState()
+    s = m.step(s, _make_result(adx=27.0), cfg, "2026-08-05",
+               vote_directions=["trending-down"],
+               vote_sources=["W4:trending-down"])
+    assert s.effective_regime == "unknown"
+    assert s.last_features["_vote_accelerated"] is False
+    assert s.last_features["_vote_sources"] == ["W4:trending-down"]
+
+
 # ── 5. Vote file round-trip (write → read → consume) ──
 
 def test_vote_file_round_trip(tmp_path):

@@ -165,6 +165,31 @@ def current_session(now: datetime | None = None) -> SessionInfo | None:
     return None
 
 
+def upcoming_night_session(now: datetime | None = None) -> SessionInfo | None:
+    """The night session the NEXT classification will assess: the one
+    in progress, else the next one to open (looks ahead 14 days over
+    holiday runs).
+
+    This is the session key pending regime votes must target to count —
+    it mirrors the bridges' ``night_session_key`` boundary (a vote at
+    10:00 targets tonight's 15:00 open; weekend votes target Monday)
+    while staying TAIFEX-holiday-aware.
+    """
+    now = _norm_tpe(now)
+    latest = latest_night_session(now)
+    if latest and now < latest.close_dt:
+        return latest
+    for ahead in range(15):
+        d = now.date() + timedelta(days=ahead)
+        if _is_closed_day(d):
+            continue
+        open_dt = datetime(d.year, d.month, d.day, 15, 0, tzinfo=_TZ_TAIPEI)
+        if open_dt >= now:
+            return SessionInfo(d.isoformat(), "NIGHT", open_dt,
+                               open_dt + timedelta(hours=14))
+    return None
+
+
 def latest_night_session(now: datetime | None = None) -> SessionInfo | None:
     """The most recently OPENED night session at ``now`` — in progress
     or already closed. Looks back up to 14 days (long holiday runs).

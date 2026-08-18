@@ -15,6 +15,7 @@ from src.regime.store import (
     load_state,
     save_state,
     _V2_HEADER,
+    _V3_HEADER,
 )
 
 
@@ -59,12 +60,41 @@ class TestWritePlaceholderState:
 
 
 class TestAppendHistoryV2:
-    def test_creates_v2_header(self, tmp_path):
+    def test_creates_v3_header(self, tmp_path):
         path = str(tmp_path / "history.csv")
         append_history(path, "2026-07-09", _make_state(), _make_rec())
         rows = _read_csv(path)
-        assert rows[0] == _V2_HEADER
+        assert rows[0] == _V3_HEADER
         assert len(rows) == 2
+
+    def test_votes_cell_from_last_features(self, tmp_path):
+        path = str(tmp_path / "history.csv")
+        state = _make_state()
+        state.last_features["_vote_sources"] = ["W3:trending-up", "W2:trending-up"]
+        state.last_features["_vote_accelerated"] = True
+        append_history(path, "2026-07-09", state, _make_rec())
+        rows = _read_csv(path)
+        assert rows[1][_V3_HEADER.index("votes")] == "W3:trending-up+W2:trending-up*"
+
+    def test_votes_cell_empty_without_votes(self, tmp_path):
+        path = str(tmp_path / "history.csv")
+        append_history(path, "2026-07-09", _make_state(), _make_rec())
+        rows = _read_csv(path)
+        assert rows[1][_V3_HEADER.index("votes")] == ""
+
+    def test_upgrades_v2_header_in_place(self, tmp_path):
+        """A pre-v3 file gains the votes column on the next write; the
+        old short row survives untouched."""
+        path = str(tmp_path / "history.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(_V2_HEADER)
+            w.writerow(["2026-07-08", "NIGHT"] + [""] * (len(_V2_HEADER) - 2))
+        append_history(path, "2026-07-09", _make_state(), _make_rec())
+        rows = _read_csv(path)
+        assert rows[0] == _V3_HEADER
+        assert len(rows[1]) == len(_V2_HEADER)   # old row not padded
+        assert len(rows[2]) == len(_V3_HEADER)   # new row has votes cell
 
     def test_v2_extra_columns(self, tmp_path):
         path = str(tmp_path / "history.csv")
@@ -122,7 +152,7 @@ class TestRecordSessionResult:
         path = str(tmp_path / "history.csv")
         record_session_result(path, "2026-07-09", "DAY", 800.0, 2)
         rows = _read_csv(path)
-        assert rows[0] == _V2_HEADER
+        assert rows[0] == _V3_HEADER
         assert len(rows) == 2
 
     def test_re_record_updates_in_place(self, tmp_path):

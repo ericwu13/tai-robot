@@ -315,6 +315,10 @@ def _resolve_news_config(
             settings.get("news_events_path", ""), base_dir),
         ledger_path=_resolve_news_path(
             settings.get("news_ledger_path", ""), base_dir),
+        # Must stay wired: with "" here the runner's _read_regime_vote
+        # is inert and W2/W3/W4 vote files expire unread.
+        regime_vote_path=_resolve_news_path(
+            settings.get("news_regime_vote_path", ""), base_dir),
         max_signal_age_sec=int(settings.get("news_max_signal_age_sec", 900)),
         tier2_enabled=bool(tier2_enabled),
         calendar_min_severity=str(
@@ -400,6 +404,11 @@ def _load_settings():
             cfg["news_signal_path"] = str(news.get("signal_path", "") or "")
             cfg["news_events_path"] = str(news.get("events_path", "") or "")
             cfg["news_ledger_path"] = str(news.get("ledger_path", "") or "")
+            cfg["news_regime_vote_path"] = str(
+                news.get("regime_vote_path", "") or "")
+            # W3 scorer state (regime tab liveness display only)
+            cfg["news_rss_state_file"] = str(
+                news.get("rss_state_file", "") or "")
             cfg["news_max_signal_age_sec"] = int(
                 news.get("max_signal_age_sec", 900) or 900)
             cfg["news_tier2_enabled"] = bool(news.get("tier2_enabled", False))
@@ -1824,19 +1833,73 @@ class BacktestApp:
         self.live_log.tag_configure("bar", foreground="#90caf9")
         self.live_log.tag_configure("status", foreground="#ffc107")
 
-        # Regime tab — current trend + switching history for regime bots.
-        # Content is rebuilt from regime_state.json / regime_history.csv on
-        # each view (tab select or Refresh), so it never grows unbounded.
+        # Regime tab — status cards, external vote status (W2/W3/W4), and
+        # the switching history grouped into regime episodes. Content is
+        # rebuilt from disk on each view (tab select or Refresh) — data
+        # shaping lives in src/news/vote_status.py + src/regime/episodes.py.
         regime_frame = ttk.Frame(notebook)
         notebook.add(regime_frame, text="多空 Regime")
         regime_bar = ttk.Frame(regime_frame)
         regime_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
         ttk.Button(regime_bar, text="刷新 Refresh", width=12,
                    command=self._refresh_regime_tab).pack(side=tk.LEFT)
-        self.regime_text = scrolledtext.ScrolledText(
-            regime_frame, wrap=tk.WORD, font=("Consolas", 10),
-            state=tk.DISABLED)
-        self.regime_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+
+        cards = ttk.Frame(regime_frame)
+        cards.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self._regime_card_vars = {}
+        for key, title in (("active", "現行 Active"),
+                           ("regime", "趨勢 Regime"),
+                           ("rec", "最新建議 Recommendation")):
+            card = ttk.LabelFrame(cards, text=title)
+            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+            main = tk.StringVar(value="—")
+            sub = tk.StringVar(value="")
+            main_lbl = ttk.Label(card, textvariable=main,
+                                 font=("Segoe UI", 11, "bold"))
+            main_lbl.pack(anchor="w", padx=6, pady=(2, 0))
+            ttk.Label(card, textvariable=sub, foreground="#666666").pack(
+                anchor="w", padx=6, pady=(0, 4))
+            self._regime_card_vars[key] = (main, sub, main_lbl)
+
+        votes_lf = ttk.LabelFrame(regime_frame, text="外部投票 External Votes")
+        votes_lf.pack(fill=tk.X, padx=4, pady=(6, 0))
+        self._votes_grid = ttk.Frame(votes_lf)
+        self._votes_grid.pack(fill=tk.X, padx=6, pady=2)
+        self.regime_consumed_var = tk.StringVar(value="")
+        ttk.Label(votes_lf, textvariable=self.regime_consumed_var,
+                  foreground="#666666").pack(anchor="w", padx=6, pady=(0, 4))
+
+        hist_lf = ttk.LabelFrame(regime_frame, text="切換紀錄 Switching Log")
+        hist_lf.pack(fill=tk.BOTH, expand=True, padx=4, pady=(6, 4))
+        cols = ("session", "trend", "decision", "votes", "pnl", "trades")
+        tree = ttk.Treeview(hist_lf, columns=cols, show="tree headings")
+        tree.heading("#0", text="段落 Episode")
+        tree.column("#0", width=250, stretch=False)
+        for cid, text, width, anchor, stretch in (
+                ("session", "時段 Session", 105, "w", False),
+                ("trend", "趨勢 Trend", 200, "w", True),
+                ("decision", "決策 Decision", 130, "w", True),
+                ("votes", "投票 Votes", 90, "w", False),
+                ("pnl", "P&L", 85, "e", False),
+                ("trades", "筆數", 50, "e", False)):
+            tree.heading(cid, text=text)
+            tree.column(cid, width=width, anchor=anchor, stretch=stretch)
+        vsb = ttk.Scrollbar(hist_lf, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True)
+        # Episode band colors keyed by leg; DAY rows dimmed (they carry
+        # only P&L — no classification happens during the day session).
+        tree.tag_configure("ep_long", background="#e1f5ee",
+                           foreground="#04342c")
+        tree.tag_configure("ep_short", background="#faece7",
+                           foreground="#712b13")
+        tree.tag_configure("ep_idle", background="#f0f0f0",
+                           foreground="#555555")
+        tree.tag_configure("ep_unknown", background="#ececf4",
+                           foreground="#3c3489")
+        tree.tag_configure("day", foreground="#999999")
+        self.regime_tree = tree
         self._regime_tab_frame = regime_frame
         self.results_notebook = notebook
         notebook.bind("<<NotebookTabChanged>>", self._on_results_tab_changed)
@@ -3609,145 +3672,191 @@ class BacktestApp:
         if sel is self._regime_tab_frame:
             self._refresh_regime_tab()
 
+    def _regime_vote_paths(self) -> tuple:
+        """(regime_vote_path, signal_path, rss_state_file) for the vote
+        status display. Prefers the deployed runner's resolved NewsConfig;
+        falls back to settings.yaml so the bridges stay inspectable even
+        with no bot running (they run independently under n8n)."""
+        s = self._settings
+        vote_p = _resolve_news_path(s.get("news_regime_vote_path", ""))
+        sig_p = _resolve_news_path(s.get("news_signal_path", ""))
+        news_cfg = getattr(getattr(self, "_live_runner", None), "_news_cfg", None)
+        if news_cfg is not None:
+            vote_p = getattr(news_cfg, "regime_vote_path", "") or vote_p
+            sig_p = getattr(news_cfg, "signal_path", "") or sig_p
+        # The scorer's own default when settings leave it empty.
+        rss_p = _resolve_news_path(
+            s.get("news_rss_state_file", "") or "data/rss_scorer_state.json")
+        return vote_p, sig_p, rss_p
+
     def _refresh_regime_tab(self) -> None:
-        """Rebuild the Regime tab content (current trend + switching
-        history). Rebuilt from disk on every view — never appended."""
-        lines = self._build_regime_report()
-        self.regime_text.config(state=tk.NORMAL)
-        self.regime_text.delete("1.0", tk.END)
-        self.regime_text.insert(tk.END, "\n".join(lines))
-        self.regime_text.config(state=tk.DISABLED)
-
-    def _build_regime_report(self) -> list:
-        """Current regime (mirrors the Discord notification: raw/effective
-        with bilingual labels + classifier features) from regime_state.json,
-        then the switching history from regime_history.csv.
-
-        The recommendation's applied status comes from regime_state.json's
-        ``next_session.executed`` — the history CSV's ``applied`` column is
-        never written by the live apply path and is always false.
-        """
+        """Rebuild the Regime tab from disk (regime_state.json, history
+        CSV, pending vote files + bridge liveness sidecars). Rendering
+        only — all data shaping lives in the pure modules."""
         import json
-        from src.regime.manager import _regime_label as regime_label
+        from src.news.vote_status import (
+            collect_vote_status, consumed_votes_line, vote_chip)
+        from src.regime.switch_logic import upcoming_night_session
+        from src.regime.episodes import (
+            parse_history, group_episodes, format_votes_cell, trend_text)
 
-        # getattr: the tab-changed binding can fire before __init__ sets
-        # _live_runner (notebook is built a few lines earlier).
         runner = getattr(self, "_live_runner", None)
         regime_info = self._regime_report_info() if runner else None
-        if regime_info is None or runner is None:
-            return ["(無多空切換機器人執行中 No regime-switching bot running)"]
 
-        lines = ["=" * 60, " 目前趨勢 Current Regime", "=" * 60,
-                 f" 現行 Active: {regime_info['active_label']}"
-                 f" ({regime_info['active_strategy']})",
-                 f" 多方 Long leg:  {regime_info['long']}",
-                 f" 空方 Short leg: {regime_info['short']}"]
+        # ── external votes: render with or without a running bot ──
+        now = _taipei_now()
+        sess = upcoming_night_session(now)
+        tonight = sess.key if sess else "—"
+        vote_p, sig_p, rss_p = self._regime_vote_paths()
+        report = collect_vote_status(vote_p, sig_p, rss_p, tonight, now)
+        for w in self._votes_grid.winfo_children():
+            w.destroy()
+        ttk.Label(self._votes_grid, text=f"今晚 tonight → {tonight}",
+                  foreground="#666666").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        for i, st in enumerate(report.sources, start=1):
+            if not st.known:
+                dot_color = "#9e9e9e"     # liveness unknown
+            elif st.stale:
+                dot_color = "#c62828"     # bridge looks dead
+            else:
+                dot_color = "#2e7d32"     # fresh
+            ttk.Label(self._votes_grid, text=f"● {st.label}",
+                      foreground=dot_color).grid(
+                row=i, column=0, sticky="w", padx=(0, 12))
+            chip = vote_chip(st)
+            chip_color = {"trending-up": "#0f6e56",
+                          "trending-down": "#993c1d"}.get(st.vote, "#666666")
+            ttk.Label(self._votes_grid, text=chip,
+                      foreground=chip_color).grid(
+                row=i, column=1, sticky="w", padx=(0, 12))
+            ctx = st.context
+            if st.stale:
+                ctx = f"⚠ 停滯 stale — {ctx}" if ctx else "⚠ 停滯 stale"
+            ttk.Label(self._votes_grid, text=ctx,
+                      foreground="#666666").grid(
+                row=i, column=2, sticky="w", padx=(0, 12))
+            ttk.Label(self._votes_grid,
+                      text=st.last_check.replace("T", " ")[:16],
+                      foreground="#999999").grid(row=i, column=3, sticky="e")
+        self._votes_grid.columnconfigure(2, weight=1)
 
+        # ── state json → cards + consumed-votes audit line ──
         state = {}
-        state_path = os.path.join(runner.bot_dir, "regime_state.json")
-        if os.path.exists(state_path):
-            try:
-                with open(state_path, encoding="utf-8") as f:
-                    state = json.load(f)
-            except (OSError, json.JSONDecodeError, ValueError):
-                pass
+        if runner is not None:
+            state_path = os.path.join(runner.bot_dir, "regime_state.json")
+            if os.path.exists(state_path):
+                try:
+                    with open(state_path, encoding="utf-8") as f:
+                        state = json.load(f)
+                    if not isinstance(state, dict):
+                        state = {}
+                except (OSError, json.JSONDecodeError, ValueError):
+                    state = {}
+        consumed = consumed_votes_line(state.get("last_features"))
+        self.regime_consumed_var.set(
+            f"上次分類 last classified {state.get('last_assessed', '—')} · "
+            f"消耗投票 consumed: {consumed}" if consumed else "")
 
-        if state.get("raw_regime"):
-            feat = state.get("last_features") or {}
-            adx = feat.get("adx")
-            lines.append("")
-            lines.append(" 原始 Raw:       "
-                         + regime_label(state.get("raw_regime", "unknown"))
-                         + (f"  (ADX {adx:.1f})"
-                            if isinstance(adx, (int, float)) else ""))
-            lines.append(" 有效 Effective: "
-                         + regime_label(state.get("effective_regime", "unknown"))
-                         + (f"  (自 since {state['effective_since']})"
-                            if state.get("effective_since") else ""))
+        self._render_regime_cards(regime_info, state)
+
+        # ── switching log: episode-grouped Treeview ──
+        tree = self.regime_tree
+        tree.delete(*tree.get_children())
+        if runner is None or regime_info is None:
+            return
+        csv_path = os.path.join(runner.bot_dir, "regime_history.csv")
+        rows = []
+        if os.path.exists(csv_path):
+            try:
+                with open(csv_path, newline="", encoding="utf-8") as f:
+                    rows = list(csv.reader(f))
+            except OSError:
+                rows = []
+        legs = {}
+        for name, leg in ((regime_info.get("long"), "long"),
+                          (regime_info.get("short"), "short")):
+            if name:
+                legs[str(name)] = leg
+        episodes = group_episodes(parse_history(rows), legs.get)
+        leg_txt = {"long": "▲ 做多 LONG", "short": "▼ 做空 SHORT",
+                   "idle": "— 觀望 IDLE", "unknown": "◆ 其他 OTHER"}
+        for ep in reversed(episodes):
+            span = ep.start[5:] + (" →" if ep.open else f" → {ep.end[5:]}")
+            label = f"{leg_txt.get(ep.leg, ep.leg)} · {span}"
+            if ep.strategy:
+                label += f" · {ep.strategy}"
+            iid = tree.insert(
+                "", "end", text=label,
+                values=(f"{len(ep.sessions)} 節 sess", "", "", "",
+                        f"{ep.pnl:+,.0f}", ep.trades or ""),
+                open=bool(ep.open or ep.leg != "idle"),
+                tags=(f"ep_{ep.leg}",))
+            for srow in reversed(ep.sessions):
+                trend = trend_text(srow)
+                if trend and srow.adx:
+                    trend += f" ({srow.adx})"
+                tree.insert(
+                    iid, "end", text="",
+                    values=(f"{srow.date[5:]} {srow.slot}", trend,
+                            srow.decision or "", format_votes_cell(srow.votes),
+                            "" if srow.pnl is None else f"{srow.pnl:+,.0f}",
+                            "" if srow.trades is None else srow.trades),
+                    tags=(("day",) if srow.slot == "DAY" else ()))
+
+    def _render_regime_cards(self, regime_info, state: dict) -> None:
+        """Fill the three status cards; placeholder text when no regime
+        bot is running."""
+        from src.regime.manager import _regime_label as regime_label
+        active_main, active_sub, active_lbl = self._regime_card_vars["active"]
+        regime_main, regime_sub, _ = self._regime_card_vars["regime"]
+        rec_main, rec_sub, _ = self._regime_card_vars["rec"]
+
+        if regime_info is None:
+            active_main.set("—")
+            active_sub.set("無多空切換機器人 no regime bot running")
+            active_lbl.configure(foreground="")
+            regime_main.set("—")
+            regime_sub.set("")
+            rec_main.set("—")
+            rec_sub.set("")
+            return
+
+        active_main.set(regime_info["active_label"])
+        active_sub.set(regime_info["active_strategy"])
+        active_lbl.configure(foreground={
+            "做多 Long": "#0f6e56", "做空 Short": "#993c1d"}.get(
+            regime_info["active_label"], ""))
+
+        feat = state.get("last_features") or {}
+        adx = feat.get("adx")
+        raw = state.get("raw_regime")
+        if raw:
+            regime_main.set(regime_label(raw)
+                            + (f"  (ADX {adx:.1f})"
+                               if isinstance(adx, (int, float)) else ""))
+            eff_bits = [f"有效 {regime_label(state.get('effective_regime', 'unknown'))}"]
+            if state.get("effective_since"):
+                eff_bits.append(f"自 {state['effective_since']}")
             if state.get("pending_label"):
-                lines.append(f" 待確認 Pending: {regime_label(state['pending_label'])}"
-                             f"  (確認 {state.get('pending_count', 0)} 次)")
-            if feat:
-                lines.append(f" 指標 Features:  +DI {feat.get('plus_di', 0):.1f} | "
-                             f"-DI {feat.get('minus_di', 0):.1f} | "
-                             f"ATR比 {feat.get('atr_ratio', 0):.2f} | "
-                             f"EMA斜率 {feat.get('ema_slope', 0):.1f}")
-            if state.get("last_assessed"):
-                lines.append(f" 最近評估 Last assessed: {state['last_assessed']}")
-            ns = state.get("next_session") or {}
-            if ns:
-                action = self._REGIME_ACTION_LABELS.get(
-                    ns.get("action", ""), ns.get("action") or "—")
-                status = (f"已套用 applied at {ns.get('executed_at')}"
-                          if ns.get("executed") else "待套用 pending")
-                lines.append("")
-                lines.append(f" 最新建議 Recommendation ({ns.get('date', '—')}): "
-                             f"{action}"
-                             + (f" — {ns.get('strategy')}" if ns.get("strategy") else ""))
-                lines.append(f"   狀態 Status: {status}")
-                if ns.get("reason"):
-                    lines.append(f"   理由 Reason: {ns['reason']}")
+                eff_bits.append(f"待確認 {regime_label(state['pending_label'])}"
+                                f" ×{state.get('pending_count', 0)}")
+            regime_sub.set(" · ".join(eff_bits))
         else:
-            lines.append("")
-            lines.append(" (尚未分類 Not classified yet — 首次分類於夜盤收盤前 "
-                         "first classification runs at the night-session close)")
+            regime_main.set("尚未分類 not classified")
+            regime_sub.set("首次分類於夜盤收盤前 first run at night close")
 
-        lines += ["", "=" * 60, " 多空切換紀錄 Regime Switching Log", "=" * 60]
-        hist = self._regime_history_lines(runner.bot_dir)
-        lines += hist if hist else [" (無紀錄 No history yet)"]
-        lines.append("=" * 60)
-        return lines
-
-    def _regime_history_lines(self, bot_dir: str, max_rows: int = 30) -> list:
-        """Per-session lines from regime_history.csv (most recent last),
-        including the classified trend for each session."""
-        csv_path = os.path.join(bot_dir, "regime_history.csv")
-        if not os.path.exists(csv_path):
-            return []
-        try:
-            with open(csv_path, newline="", encoding="utf-8") as f:
-                rows = list(csv.reader(f))
-        except OSError:
-            return []
-        if len(rows) < 2:
-            return []
-        header, data = rows[0], rows[1:]
-
-        def col(name: str) -> int:
-            try:
-                return header.index(name)
-            except ValueError:
-                return -1
-
-        i_date = col("date")
-        i_session = col("session")
-        i_raw = col("raw_regime")
-        i_eff = col("effective_regime")
-        i_adx = col("adx")
-        i_decision = col("decision")
-        i_active = col("strategy_active")
-        i_pnl = col("pnl")
-        i_trades = col("trades")
-
-        def cell(row, idx):
-            return row[idx] if 0 <= idx < len(row) else ""
-
-        out = []
-        for row in data[-max_rows:]:
-            raw = cell(row, i_raw)
-            eff = cell(row, i_eff)
-            trend = f"{raw}→{eff}" if raw and eff and raw != eff else (eff or raw or "—")
-            adx = cell(row, i_adx)
-            decision = cell(row, i_decision) or "—"
-            active = cell(row, i_active) or "—"
-            pnl = cell(row, i_pnl)
-            n = cell(row, i_trades)
-            pnl_str = f"P&L {pnl} ({n} trades)" if pnl != "" else "P&L —"
-            out.append(
-                f" {cell(row, i_date)} {cell(row, i_session)}: 趨勢 {trend}"
-                + (f" (ADX {adx})" if adx else "")
-                + f" | 決策 {decision} | 現行 {active} | {pnl_str}")
-        return out
+        ns = state.get("next_session") or {}
+        if ns:
+            rec_main.set(self._REGIME_ACTION_LABELS.get(
+                ns.get("action", ""), ns.get("action") or "—"))
+            status = (f"已套用 applied {ns.get('executed_at')}"
+                      if ns.get("executed") else "待套用 pending")
+            rec_sub.set((f"{ns.get('strategy')} · " if ns.get("strategy") else "")
+                        + status)
+        else:
+            rec_main.set("—")
+            rec_sub.set("")
 
     def _copy_trade_selection(self, event=None):
         sel = self.trade_tree.selection()

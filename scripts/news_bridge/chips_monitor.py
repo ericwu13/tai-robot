@@ -363,6 +363,17 @@ def record_net_oi(state: dict, date_key: str, net_oi: float) -> dict:
     return state
 
 
+def stamp_liveness(state: dict, now: datetime, summary: str) -> dict:
+    """Stamp last_check/last_result (the W2/W3 liveness contract).
+
+    Stamped on EVERY non-dry pass — including no-data days, which
+    otherwise leave no trace and make a dead W4 indistinguishable from
+    a TAIFEX holiday when reading the sidecar from disk."""
+    state["last_check"] = now.isoformat(timespec="seconds")
+    state["last_result"] = summary
+    return state
+
+
 # ── Liveness log (matches W2/W3 pattern) ─────────────────────────────────
 
 def append_log(path: str | os.PathLike, line: str) -> None:
@@ -391,15 +402,20 @@ def run_once(base_path: str, date_key: str, now: datetime,
     print(f"[{now:%Y-%m-%d %H:%M:%S}] W4 chips monitor — trade date {date_key}"
           + (" (DRY RUN)" if dry_run else ""))
 
-    net_oi = fetch_taifex_foreign_net_oi(date_key)
-    if net_oi is None:
-        print("  no TAIFEX data — no vote (weekend/holiday/outage)")
-        if not dry_run:
-            delete_stale_vote(base_path)
-        return 0
-
     spath = state_path_for(base_path)
     state = load_state(spath)
+
+    net_oi = fetch_taifex_foreign_net_oi(date_key)
+    if net_oi is None:
+        no_data = "no TAIFEX data — no vote (weekend/holiday/outage)"
+        print(f"  {no_data}")
+        if not dry_run:
+            delete_stale_vote(base_path)
+            save_state(spath, stamp_liveness(state, now, no_data))
+            append_log(Path(base_path).parent / LOG_NAME,
+                       f"{now:%Y-%m-%d %H:%M:%S} TPE | {no_data}")
+        return 0
+
     prev = previous_net_oi(state, date_key)
     print(f"  previous-day net OI: "
           f"{f'{prev:+,.0f}' if prev is not None else 'n/a (first run)'}")
@@ -445,9 +461,11 @@ def run_once(base_path: str, date_key: str, now: datetime,
                          f"⚠️ **W4 籌碼 no vote**\n"
                          f"外資 TX net OI: {net_oi:+,.0f} | equity: {equity_txt} NTD\n"
                          f"{reason}")
+    summary = (f"oi {net_oi:+,.0f} | equity {equity_txt} | "
+               f"vote: {direction or '-'} | {reason}")
+    save_state(spath, stamp_liveness(state, now, summary))
     append_log(Path(base_path).parent / LOG_NAME,
-               f"{now:%Y-%m-%d %H:%M:%S} TPE | oi {net_oi:+,.0f} | "
-               f"equity {equity_txt} | vote: {direction or '-'} | {reason}")
+               f"{now:%Y-%m-%d %H:%M:%S} TPE | {summary}")
     return 0
 
 

@@ -55,12 +55,17 @@ class RegimeState:
 
 
 class RegimeStateMachine:
-    def step(self, state: RegimeState, result: RegimeResult, cfg: RegimeConfig, session_date: str, vote_directions: list[str] | None = None) -> RegimeState:
+    def step(self, state: RegimeState, result: RegimeResult, cfg: RegimeConfig, session_date: str, vote_directions: list[str] | None = None, vote_sources: list[str] | None = None) -> RegimeState:
         """Advance state by one NIGHT session. Returns new state (immutable-ish).
 
         *vote_directions*: list of cross-market regime votes from
         independent sources.  If any vote agrees with tonight's raw
         classification, confirmation is immediate.
+
+        *vote_sources*: same votes as ``"SOURCE:direction"`` strings
+        (e.g. ``"W3:trending-up"``) — audit only, parallel to
+        ``vote_directions`` so the selector's membership tests on
+        ``_votes`` keep their plain-direction elements.
         """
         import copy
         s = copy.deepcopy(state)
@@ -71,6 +76,8 @@ class RegimeStateMachine:
         # fusion in range-bound regimes) and for post-hoc audit — the vote
         # files themselves are consumed right after classification.
         s.last_features["_votes"] = [v for v in (vote_directions or []) if v]
+        s.last_features["_vote_sources"] = [v for v in (vote_sources or []) if v]
+        s.last_features["_vote_accelerated"] = False
 
         # --- 1. Derive raw regime from configurable thresholds ---
         # RegimeResult has no trend_direction field; derive it from the
@@ -113,6 +120,10 @@ class RegimeStateMachine:
 
             vote_agrees = any(v == raw for v in (vote_directions or []))
             if raw != s.effective_regime and (s.pending_count >= cfg.confirm_sessions or strong or vote_agrees):
+                # Audit: did the vote alone confirm this flip (hysteresis
+                # not yet satisfied, no adx_strong fast-track)?
+                if vote_agrees and s.pending_count < cfg.confirm_sessions and not strong:
+                    s.last_features["_vote_accelerated"] = True
                 # Regime change confirmed
                 s.effective_regime = raw
                 s.effective_since = session_date

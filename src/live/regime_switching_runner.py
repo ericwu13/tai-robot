@@ -220,8 +220,12 @@ class RegimeSwitchingRunner(LiveRunner):
             return None
 
         catch_up = now >= sess.close_dt
-        vote_directions = self._read_regime_vote(sess.key)
-        rec = self._manager.classify_session(sess.open_date, "NIGHT", vote_directions=vote_directions)
+        votes = self._read_regime_vote(sess.key)
+        rec = self._manager.classify_session(
+            sess.open_date, "NIGHT",
+            vote_directions=[v.direction for v in votes],
+            vote_sources=[f"{v.source or '?'}:{v.direction}" for v in votes],
+        )
         if rec is None:
             # Insufficient bars or classifier error. The post-close
             # catch-up trigger would otherwise retry (and warn) on every
@@ -398,9 +402,10 @@ class RegimeSwitchingRunner(LiveRunner):
 
     # ── Regime vote (news-as-votes acceleration) ──
 
-    def _read_regime_vote(self, session_key: str) -> list[str]:
-        """Read and consume all per-source vote files, returning a list of
-        vote directions valid for *session_key*."""
+    def _read_regime_vote(self, session_key: str) -> list:
+        """Read and consume all per-source vote files, returning the
+        ``RegimeVote`` objects valid for *session_key* (direction AND
+        source — the source survives into the audit trail)."""
         cfg = self._news_cfg
         if not cfg or not getattr(cfg, "regime_vote_path", ""):
             return []
@@ -410,7 +415,7 @@ class RegimeSwitchingRunner(LiveRunner):
             for v in votes:
                 logger.info("[REGIME-VOTE] consumed vote: %s (source=%s)", v.direction, v.source)
             consume_all_regime_votes(cfg.regime_vote_path)
-            return [v.direction for v in votes]
+            return votes
         except Exception as exc:
             logger.warning("[REGIME-VOTE] failed to read votes: %s", exc)
             return []

@@ -25,6 +25,14 @@ _V2_HEADER = [
     "strategy_active", "applied", "applied_at", "trading_mode",
 ]
 
+# v3 header — v2 plus the consumed-votes audit column. The cell holds
+# "+".joined "SOURCE:direction" tokens with a trailing "*" when the vote
+# accelerated the confirm (e.g. "W3:trending-up*"). Existing column
+# positions are unchanged, so _V2_HEADER.index() lookups stay valid;
+# pre-v3 data rows stay one cell short (readers look columns up by
+# header name and must length-guard).
+_V3_HEADER = _V2_HEADER + ["votes"]
+
 
 # File-level marker for the last_assessed keying convention. Files
 # written before v2.16 stamped the night's CLOSE date; current code
@@ -160,13 +168,22 @@ def _atomic_write_rows(csv_path: str, rows: list) -> None:
 
 
 def _read_rows(csv_path: str) -> list:
-    """Read history rows, always returning a header as row 0."""
+    """Read history rows, always returning a header as row 0.
+
+    Upgrades a v2 header to v3 in memory by appending the missing
+    column names; every caller rewrites the whole file atomically, so
+    the upgrade persists on the next write. Old data rows keep their
+    original length.
+    """
     if not os.path.exists(csv_path):
-        return [list(_V2_HEADER)]
+        return [list(_V3_HEADER)]
     with open(csv_path, newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
     if not rows:
-        return [list(_V2_HEADER)]
+        return [list(_V3_HEADER)]
+    for col in _V3_HEADER:
+        if col not in rows[0]:
+            rows[0].append(col)
     return rows
 
 
@@ -181,9 +198,12 @@ def append_history(
     applied_at: str = "",
     trading_mode: str = "",
 ):
-    """Append a classification row to regime_history.csv (v2 schema)."""
+    """Append a classification row to regime_history.csv (v3 schema)."""
     rows = _read_rows(csv_path)
     feat = state.last_features
+    votes = "+".join(feat.get("_vote_sources") or [])
+    if votes and feat.get("_vote_accelerated"):
+        votes += "*"
     rows.append([
         session_date, "NIGHT",
         round(feat.get("adx", 0), 1),
@@ -199,6 +219,7 @@ def append_history(
         "", "",  # pnl, trades — filled by record_session_result
         strategy_active,
         str(applied).lower(), applied_at, trading_mode,
+        votes,
     ])
     _atomic_write_rows(csv_path, rows)
 
@@ -258,4 +279,5 @@ def _result_row(date, session, pnl, trades, strategy_active, trading_mode):
         "", "",                   # dry_run, override
         str(pnl), str(trades),
         strategy_active, "", "", trading_mode,
+        "",                       # votes — classification rows only
     ]

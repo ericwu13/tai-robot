@@ -26,6 +26,7 @@ def _settings(**overrides):
         "news_signal_path": "sig.json",
         "news_events_path": "ev.json",
         "news_ledger_path": "",
+        "news_regime_vote_path": "regime_vote.json",
         "news_max_signal_age_sec": 900,
         "news_tier2_enabled": True,    # remembered dialog default only
         "news_calendar_min_severity": "high",
@@ -110,6 +111,18 @@ class TestSharedFields:
         assert cfg.signal_path == os.path.join(BASE, "sig.json")
         assert cfg.events_path == os.path.join(BASE, "ev.json")
 
+    def test_regime_vote_path_is_wired_through(self):
+        """Regression: the resolver used to drop regime_vote_path, so a
+        GUI-deployed bot never consumed W2/W3/W4 votes — the bridges
+        wrote files that expired unread."""
+        cfg = _resolve()
+        assert cfg.regime_vote_path == os.path.join(BASE, "regime_vote.json")
+
+    def test_regime_vote_path_absolute_passes_through(self):
+        abs_path = os.path.join("C:", os.sep, "n8n-bridge", "regime_vote.json")
+        cfg = _resolve(_settings(news_regime_vote_path=abs_path))
+        assert cfg.regime_vote_path == abs_path
+
     def test_absolute_paths_pass_through(self):
         abs_path = os.path.join("D:", os.sep, "n8n", "signal.json")
         cfg = _resolve(_settings(news_signal_path=abs_path))
@@ -141,6 +154,8 @@ class TestSettingsDefaults:
             "  signal_path: sig.json\n"
             "  events_path: ev.json\n"
             "  ledger_path: led.json\n"
+            "  regime_vote_path: vote.json\n"
+            "  rss_state_file: rss_state.json\n"
             "  max_signal_age_sec: 300\n"
             "  tier2_enabled: true\n"
             '  calendar_min_severity: "medium"\n',
@@ -151,6 +166,8 @@ class TestSettingsDefaults:
         assert cfg["news_signal_path"] == "sig.json"
         assert cfg["news_events_path"] == "ev.json"
         assert cfg["news_ledger_path"] == "led.json"
+        assert cfg["news_regime_vote_path"] == "vote.json"
+        assert cfg["news_rss_state_file"] == "rss_state.json"
         assert cfg["news_max_signal_age_sec"] == 300
         assert cfg["news_tier2_enabled"] is True
         assert cfg["news_calendar_min_severity"] == "medium"

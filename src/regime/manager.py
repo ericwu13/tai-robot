@@ -82,6 +82,7 @@ class RegimeManager:
     def classify_session(
         self, session_date: str, session_slot: str,
         vote_directions: list[str] | None = None,
+        vote_sources: list[str] | None = None,
     ) -> Recommendation | None:
         """Classify the current regime and produce a recommendation.
 
@@ -91,9 +92,12 @@ class RegimeManager:
         data or dedup blocks.
 
         *vote_directions*: list of cross-market regime votes from
-        independent sources (W2, W3).  Passed through to the state
+        independent sources (W2, W3, W4).  Passed through to the state
         machine; if any vote agrees with the raw classification,
         confirmation is accelerated.
+
+        *vote_sources*: the same votes as ``"SOURCE:direction"`` strings,
+        persisted for audit (state file + history ``votes`` column).
         """
         if session_slot != "NIGHT":
             return None
@@ -108,7 +112,7 @@ class RegimeManager:
             if result is None:
                 logger.warning("[REGIME] Could not compute regime — insufficient bars")
                 return None
-            self._state = self._machine.step(self._state, result, self.cfg, session_date, vote_directions=vote_directions or [])
+            self._state = self._machine.step(self._state, result, self.cfg, session_date, vote_directions=vote_directions or [], vote_sources=vote_sources or [])
             rec = self._selector.select(self._state, self.cfg)
         except Exception as e:
             logger.exception("[REGIME] classify_session error: %s", e)

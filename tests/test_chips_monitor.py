@@ -280,6 +280,40 @@ def test_run_once_dry_run_writes_and_deletes_nothing(monkeypatch, base):
     assert chips.w4_vote_path(base).exists()
 
 
+def test_run_once_stamps_liveness_on_data_day(monkeypatch, base):
+    _patch_fetch(monkeypatch, 8_000.0, 6e9)
+    chips.run_once(base, "20260814", RUN_NOW)
+    state = chips.load_state(chips.state_path_for(base))
+    assert state["last_check"] == RUN_NOW.isoformat(timespec="seconds")
+    assert "vote: trending-up" in state["last_result"]
+
+
+def test_run_once_stamps_liveness_on_no_data_day(monkeypatch, base):
+    """A holiday/outage pass must still prove W4 ran — otherwise a dead
+    bridge and a TAIFEX holiday are indistinguishable from disk."""
+    _patch_fetch(monkeypatch, None, None)
+    chips.run_once(base, "20260815", RUN_NOW)
+    state = chips.load_state(chips.state_path_for(base))
+    assert state["last_check"] == RUN_NOW.isoformat(timespec="seconds")
+    assert "no TAIFEX data" in state["last_result"]
+    log = Path(base).parent / chips.LOG_NAME
+    assert log.exists()
+    assert "no TAIFEX data" in log.read_text(encoding="utf-8")
+
+
+def test_run_once_no_vote_still_stamps_liveness(monkeypatch, base):
+    _patch_fetch(monkeypatch, 500.0, 6e9)
+    chips.run_once(base, "20260814", RUN_NOW)
+    state = chips.load_state(chips.state_path_for(base))
+    assert "vote: -" in state["last_result"]
+
+
+def test_run_once_dry_run_never_stamps(monkeypatch, base):
+    _patch_fetch(monkeypatch, None, None)
+    chips.run_once(base, "20260814", RUN_NOW, dry_run=True)
+    assert not chips.state_path_for(base).exists()
+
+
 def test_state_history_trims_to_keep_days(monkeypatch, base):
     _patch_fetch(monkeypatch, 8_000.0, 0.0)
     for day in range(1, chips.STATE_KEEP_DAYS + 5):
