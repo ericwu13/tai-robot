@@ -7319,11 +7319,15 @@ class BacktestApp:
                     px = getattr(last, "exit_price", 0)
                     if px:
                         fill_price = str(px)
-        elif pos is not None and pos != 0 and self._live_runner:
+        elif poller_action_type == "entry" and self._live_runner:
+            # real_entry_price first — it is set whenever the OnNewData
+            # deal row already arrived, including the deal-row
+            # confirmation path where pos_current is still None (no OI
+            # snapshot seen). The OI avg_cost fallback needs a position.
             real_px = self._live_runner.broker.real_entry_price
             if real_px:
                 fill_price = str(real_px)
-            else:
+            elif pos is not None and pos != 0:
                 order_sym = SYMBOL_CONFIG.get(self._live_runner.symbol, {}).get(
                     "order_symbol", "")
                 prefix = order_sym[:2] if order_sym else ""
@@ -7551,6 +7555,7 @@ class BacktestApp:
         fill = self._fill_tracker.on_new_data(raw)
         if fill is None or not self._live_runner:
             return
+
         self._real_fill_count += 1
         self.real_fills_var.set(f"{self._real_fill_count} 筆 trades")
         broker = self._live_runner.broker
@@ -7606,6 +7611,28 @@ class BacktestApp:
                 self._log_order_decision(
                     "REAL_ENTRY_CONFIRMED",
                     f"price={fill.price} seq={fill.seq_no}")
+
+        # Issue #103: a matched deal row is per-order proof our order
+        # filled — OnNewData is the API's order-report stream, while
+        # OnOpenInterest is a derived snapshot that can lag or error
+        # (incident: GetOpenInterestGW returned "JSON data error" for
+        # 40s while the deal row landed within 1s). Confirm the pending
+        # fill poll here, after the broker's guarded write: `accepted`
+        # means the row belongs to the current trade, so a late fill for
+        # a previous trade can never confirm the current order. (Exit
+        # rows rejected by the guard returned above and never get here.)
+        if (accepted
+                and self._trading_guard.fill_pending
+                and self._fill_poller.active
+                and fill.action_type == self._fill_poller.action_type):
+            result = self._fill_poller.on_deal_confirmed(fill.action_type)
+            if result is not None:
+                _log(f"FILL POLL: confirmed via OnNewData deal row — "
+                     f"seq={fill.seq_no} price={fill.price} {result.message}")
+                if self._fill_poll_timer_id:
+                    self.root.after_cancel(self._fill_poll_timer_id)
+                    self._fill_poll_timer_id = None
+                self._on_fill_confirmed()
 
     def _on_fill_timeout(self) -> None:
         """Called when fill confirmation times out — downgrade to semi-auto."""

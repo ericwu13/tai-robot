@@ -46,6 +46,9 @@ class FillPoller:
     No Tkinter, no COM dependencies.
     """
 
+    # Last-resort alarm: OnNewData deal rows confirm in <1s (issue #103)
+    # and OI polling in 2-6s, so reaching this means both broker report
+    # channels are silent — alert the user fast rather than wait.
     FILL_POLL_TIMEOUT: float = 10.0  # seconds
     INITIAL_POLL_DELAY_MS: int = 2000  # first poll after 2s
     POLL_INTERVAL_MS: int = 3000  # subsequent polls every 3s
@@ -185,6 +188,34 @@ class FillPoller:
                         f"({elapsed:.1f}s)",
             )
         return None
+
+    # ── Deal confirmation from OnNewData ──
+
+    def on_deal_confirmed(self, action_type: str) -> FillPollAction | None:
+        """Called when an OnNewData deal row confirms a fill.
+
+        OnNewData deal rows are the definitive proof that an order filled —
+        they carry per-order price/qty keyed by the seq no from
+        SendFutureOrderCLR.  When a matched deal arrives while fill polling
+        is active, this is a faster confirmation path than waiting for the
+        OpenInterest position to update (issue #103).
+
+        Args:
+            action_type: "entry" or "exit" — must match the pending poll
+
+        Returns FillPollAction("confirmed") if the deal matches, else None.
+        """
+        if not self._active:
+            return None
+        if action_type != self._action_type:
+            return None
+
+        elapsed = time.monotonic() - self._start_time
+        return FillPollAction(
+            type="confirmed",
+            action_type=self._action_type,
+            message=f"confirmed via OnNewData deal row ({elapsed:.1f}s)",
+        )
 
     # ── Poll tick (called on timer) ──
 

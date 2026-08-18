@@ -450,3 +450,99 @@ class TestEntryBarIndexIssue45:
         assert action.type == "start_polling"
         # Default entry_bar_index=0 is fine for exits
         assert fp.entry_bar_index == 0
+
+
+# ── Issue #103: on_deal_confirmed() — OnNewData fast path ──
+
+class TestDealConfirmedIssue103:
+    """Tests for on_deal_confirmed() — fill confirmation via OnNewData.
+
+    OnNewData deal rows are definitive proof of fill. When a matched deal
+    arrives while fill polling is active, the bot should confirm immediately
+    instead of waiting for the slower OpenInterest position update.
+    """
+
+    def test_entry_confirmed_via_deal(self):
+        """OnNewData deal row confirms an entry fill."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 0)
+
+        result = fp.on_deal_confirmed("entry")
+        assert result is not None
+        assert result.type == "confirmed"
+        assert result.action_type == "entry"
+        assert "OnNewData" in result.message
+
+    def test_exit_confirmed_via_deal(self):
+        """OnNewData deal row confirms an exit fill."""
+        fp, g = _make_poller()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        fp.start("exit", 1)
+
+        result = fp.on_deal_confirmed("exit")
+        assert result is not None
+        assert result.type == "confirmed"
+        assert result.action_type == "exit"
+
+    def test_action_type_mismatch_rejected(self):
+        """Deal for wrong action type is ignored."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 0)
+
+        result = fp.on_deal_confirmed("exit")
+        assert result is None
+
+    def test_not_active_returns_none(self):
+        """Deal row when no polling is active is ignored."""
+        fp, g = _make_poller()
+        result = fp.on_deal_confirmed("entry")
+        assert result is None
+
+    def test_deal_confirm_then_finalize(self):
+        """Full flow: deal confirm → FillPoller.confirm() → guard cleared."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 0)
+
+        result = fp.on_deal_confirmed("entry")
+        assert result.type == "confirmed"
+
+        confirm = fp.confirm()
+        assert confirm.action_type == "entry"
+        assert not g.fill_pending
+        assert g.real_entry_confirmed
+        assert not fp.active
+
+    def test_deal_beats_oi_timeout(self):
+        """Deal arrives before OI timeout — no downgrade happens."""
+        fp, g = _make_poller(timeout=5.0)
+        g.on_fill_pending("entry")
+        fp.start("entry", 0)
+
+        # OI still shows flat
+        fp.on_position_update(0)
+
+        # Deal row arrives at 3s (before 5s timeout)
+        result = fp.on_deal_confirmed("entry")
+        assert result is not None
+        assert result.type == "confirmed"
+
+        fp.confirm()
+        assert not g.fill_pending
+
+        # Timeout check at 6s should not fire (poller already inactive)
+        action = fp.check_poll(now=fp._start_time + 6.0)
+        assert action.type == "poll_again" or not fp.active
+
+    def test_default_timeout_is_last_resort_alarm(self):
+        """Timeout stays 10s. The deal-row path (issue #103) confirms in
+        ~1s and OI in 2-6s; the timeout only fires when both report
+        channels are dead, and then alerting the user fast beats waiting
+        (incident data: the OI outage lasted 42s — no reasonable timeout
+        would have outlasted it)."""
+        guard = TradingGuard()
+        fp = FillPoller(guard)
+        assert fp.FILL_POLL_TIMEOUT == 10.0
