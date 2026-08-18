@@ -77,13 +77,19 @@ def _read_json(path) -> dict | None:
         return None
 
 
-def read_pending_votes(base_path: str | None) -> dict:
-    """All per-source vote files, keyed by upper-cased source ("W2"...).
+def read_pending_votes(base_path: str | None, tonight_key: str = "") -> dict:
+    """Best per-source vote file, keyed by upper-cased source ("W2"...).
 
     Read-only — never consumes. Malformed files are skipped. The key
     prefers the file's own ``source`` field (normalized to its "W\\d"
     stem, so "W3-manual" files count as W3) and falls back to the
     filename suffix.
+
+    Several files can claim the same source (a mis-pathed manual run
+    once left a ``regime_vote_w3_w3.json`` stray beside the real file).
+    Per source, a file valid for *tonight_key* beats any expired one;
+    among expired files the latest target wins — glob order must never
+    decide, or a week-old stray shadows a live vote.
     """
     if not base_path:
         return {}
@@ -96,6 +102,13 @@ def read_pending_votes(base_path: str | None) -> dict:
         source = str(data.get("source", "")).split("-")[0].upper()
         if not source:
             source = os.path.splitext(os.path.basename(fpath))[0].rsplit("_", 1)[-1].upper()
+        prev = votes.get(source)
+        if prev is not None:
+            def rank(d):
+                expires = str(d.get("expires_after_session", ""))
+                return ((1 if tonight_key and expires == tonight_key else 0), expires)
+            if rank(data) <= rank(prev):
+                continue
         votes[source] = data
     return votes
 
@@ -189,7 +202,7 @@ def collect_vote_status(
     (``"YYYY-MM-DD|NIGHT"``); pending votes are valid only when their
     ``expires_after_session`` matches it exactly.
     """
-    pending = read_pending_votes(regime_vote_path)
+    pending = read_pending_votes(regime_vote_path, tonight_key)
     report = VoteStatusReport(tonight_key=tonight_key)
     for status in (_w2_status(signal_path, now),
                    _w3_status(rss_state_file, now),

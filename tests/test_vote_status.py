@@ -65,6 +65,35 @@ def test_read_pending_votes_never_consumes(tmp_path):
     assert f.exists()
 
 
+def test_stray_double_suffix_file_cannot_shadow_valid_vote(tmp_path):
+    """Real incident (2026-08-18): a mis-pathed manual run left a
+    week-old ``regime_vote_w3_w3.json`` stray whose source field also
+    says W3. Globbed last, it overwrote the REAL vote in the per-source
+    collapse and the tab showed 'expired' while a valid vote for
+    tonight sat on disk. Validity must win, never glob order."""
+    _write(tmp_path / "regime_vote_w3.json", _vote(direction="trending-down"))
+    _write(tmp_path / "regime_vote_w3_w3.json",
+           _vote(direction="trending-down", expires="2026-08-11|NIGHT"))
+    votes = read_pending_votes(str(tmp_path / "regime_vote.json"), TONIGHT)
+    assert votes["W3"]["expires_after_session"] == TONIGHT
+
+    report = collect_vote_status(str(tmp_path / "regime_vote.json"),
+                                 "", "", TONIGHT, NOW)
+    w3 = next(s for s in report.sources if s.source == "W3")
+    assert w3.vote == "trending-down"
+    assert not w3.vote_expired
+
+
+def test_colliding_expired_votes_keep_latest_target(tmp_path):
+    """No valid file: among expired ones the latest target is shown."""
+    _write(tmp_path / "regime_vote_w3.json",
+           _vote(expires="2026-08-15|NIGHT"))
+    _write(tmp_path / "regime_vote_w3_w3.json",
+           _vote(expires="2026-08-11|NIGHT"))
+    votes = read_pending_votes(str(tmp_path / "regime_vote.json"), TONIGHT)
+    assert votes["W3"]["expires_after_session"] == "2026-08-15|NIGHT"
+
+
 # ── collect_vote_status: vote bucketing by session key ───────────────────
 
 def test_valid_pending_vote_for_tonight(tmp_path):
