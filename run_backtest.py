@@ -1675,10 +1675,29 @@ class BacktestApp:
         self.report_filter_combo.pack(side=tk.LEFT)
         self.report_filter_combo.bind(
             "<<ComboboxSelected>>", lambda e: self._on_report_filter_changed())
-        self.metrics_text = scrolledtext.ScrolledText(metrics_frame, wrap=tk.WORD,
-                                                       font=("Consolas", 11),
-                                                       state=tk.DISABLED)
-        self.metrics_text.pack(fill=tk.BOTH, expand=True)
+        # Card-based report body inside a scrollable canvas (view model:
+        # src/backtest/report_view.py; format_report text stays for
+        # Discord/console/export).
+        canvas = tk.Canvas(metrics_frame, highlightthickness=0)
+        report_vsb = ttk.Scrollbar(metrics_frame, orient="vertical",
+                                   command=canvas.yview)
+        canvas.configure(yscrollcommand=report_vsb.set)
+        report_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        body = ttk.Frame(canvas)
+        body_win = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(body_win, width=e.width))
+        canvas.bind("<Enter>", lambda e: canvas.bind_all(
+            "<MouseWheel>",
+            lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        self.report_canvas = canvas
+        self.report_body = body
+        ttk.Label(body, text="(尚無結果 no results yet — 執行回測或部署 "
+                             "run a backtest or deploy)").pack(padx=8, pady=8)
 
         # Trade list tab
         trades_frame = ttk.Frame(notebook)
@@ -3502,12 +3521,113 @@ class BacktestApp:
         if result is not None:
             self._display_results(result, self._last_bars)
 
-    def _display_results(self, result, bars: list[Bar] | None = None):
-        # Metrics report
-        self.metrics_text.config(state=tk.NORMAL)
-        self.metrics_text.delete("1.0", tk.END)
+    _TONE_COLORS = {"good": "#0f6e56", "bad": "#a32d2d"}
 
-        # Data source header
+    def _report_card(self, parent, metric) -> None:
+        """One headline metric card (label / big value / sub line)."""
+        card = tk.Frame(parent, bg="#f7f7f5", highlightbackground="#dcdcd7",
+                        highlightthickness=1)
+        card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        tk.Label(card, text=metric.label, bg="#f7f7f5", fg="#666666",
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(5, 0))
+        tk.Label(card, text=metric.value, bg="#f7f7f5",
+                 fg=self._TONE_COLORS.get(metric.tone, "#222222"),
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=8)
+        tk.Label(card, text=metric.sub or " ", bg="#f7f7f5", fg="#999999",
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(0, 5))
+
+    def _render_report_view(self, title, metrics, trades, regime_info,
+                            header_lines, message=None,
+                            real_panel=True) -> None:
+        """Rebuild the Report tab body: headline cards, detail sections,
+        real-order subset, per-strategy breakdown. Rendering only — the
+        numbers come from src/backtest/report_view.py. ``message`` shows
+        a single notice instead of metrics (e.g. empty 實單 view)."""
+        from src.backtest.report_view import (
+            headline_cards, per_strategy_rows, real_subset, stat_sections)
+        body = self.report_body
+        for w in body.winfo_children():
+            w.destroy()
+
+        if header_lines:
+            ttk.Label(body, text="\n".join(header_lines),
+                      foreground="#666666", font=("Consolas", 9)).pack(
+                anchor="w", padx=6, pady=(4, 0))
+        ttk.Label(body, text=title, font=("Segoe UI", 12, "bold")).pack(
+            anchor="w", padx=6, pady=(6, 0))
+        if regime_info:
+            ttk.Label(
+                body, foreground="#666666",
+                text=f"做多 Long: {regime_info['long']} | "
+                     f"做空 Short: {regime_info['short']} | "
+                     f"現行 Active: {regime_info['active_label']}"
+                     f" ({regime_info['active_strategy']})").pack(
+                anchor="w", padx=6)
+        if message:
+            ttk.Label(body, text=message, foreground="#666666").pack(
+                anchor="w", padx=6, pady=8)
+            return
+
+        row = ttk.Frame(body)
+        row.pack(fill=tk.X, padx=6, pady=(8, 4))
+        for card in headline_cards(metrics):
+            self._report_card(row, card)
+
+        grids = ttk.Frame(body)
+        grids.pack(fill=tk.X, padx=6)
+        for section_title, section_rows in stat_sections(metrics):
+            lf = ttk.LabelFrame(grids, text=section_title)
+            lf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+            lf.columnconfigure(1, weight=1)
+            for r, m in enumerate(section_rows):
+                ttk.Label(lf, text=m.label, foreground="#666666").grid(
+                    row=r, column=0, sticky="w", padx=(8, 16), pady=1)
+                value_lbl = ttk.Label(lf, text=m.value,
+                                      font=("Consolas", 10))
+                if m.tone in self._TONE_COLORS:
+                    value_lbl.configure(
+                        foreground=self._TONE_COLORS[m.tone])
+                value_lbl.grid(row=r, column=1, sticky="e",
+                               padx=(0, 8), pady=1)
+
+        rs = real_subset(trades) if real_panel else None
+        if rs:
+            count, cards = rs
+            lf = ttk.LabelFrame(
+                body, text=f"實單統計 Real-Order Subset ({count} 筆)")
+            lf.pack(fill=tk.X, padx=6, pady=(8, 0))
+            real_row = ttk.Frame(lf)
+            real_row.pack(fill=tk.X, padx=4, pady=4)
+            for card in cards:
+                self._report_card(real_row, card)
+            ttk.Label(lf, foreground="#999999",
+                      text="(上方總計為模擬全視圖 totals above = simulated "
+                           "view, all trades)").pack(
+                anchor="w", padx=8, pady=(0, 4))
+
+        ps = per_strategy_rows(trades)
+        if ps:
+            lf = ttk.LabelFrame(body, text="各策略明細 Per-Strategy Breakdown")
+            lf.pack(fill=tk.X, padx=6, pady=(8, 4))
+            tv = ttk.Treeview(lf, columns=("strategy", "n", "wr", "pnl"),
+                              show="headings", height=len(ps))
+            for cid, text, width, anchor, stretch in (
+                    ("strategy", "策略 Strategy", 260, "w", True),
+                    ("n", "筆數 Trades", 80, "e", False),
+                    ("wr", "勝率 WR", 80, "e", False),
+                    ("pnl", "損益 P&L", 110, "e", False)):
+                tv.heading(cid, text=text)
+                tv.column(cid, width=width, anchor=anchor, stretch=stretch)
+            tv.tag_configure("pos", foreground="#0f6e56")
+            tv.tag_configure("neg", foreground="#a32d2d")
+            for name, n, wr, pnl in ps:
+                tag = "pos" if pnl > 0 else ("neg" if pnl < 0 else "")
+                tv.insert("", "end", values=(name, n, wr, f"{pnl:+,}"),
+                          tags=(tag,) if tag else ())
+            tv.pack(fill=tk.X, padx=4, pady=4)
+
+    def _display_results(self, result, bars: list[Bar] | None = None):
+        # Data source header for the Report tab
         symbol = self.symbol_var.get().strip()
         source = self._data_source or "unknown"
         header_lines = [f" 商品 Symbol:  {symbol}", f" 資料來源 Source:  {source}"]
@@ -3548,7 +3668,6 @@ class BacktestApp:
             status = self._live_runner.get_status()
             header_lines.append(f" 即時狀態 State:  {status['state']}")
             header_lines.append(f" 1分K / 聚合K  1m/Agg:  {status['bars_1m']} / {status['bars_agg']}")
-        self.metrics_text.insert(tk.END, "\n".join(header_lines) + "\n\n")
 
         # Regime-switching bots report both legs and the active one under a
         # "多空切換 Regime Switching" title, instead of just the active leg's
@@ -3559,7 +3678,8 @@ class BacktestApp:
 
         # 檢視 View filter: "全部 All" = full simulated view (every trade
         # has a simulated fill); "實單 Real" = the same full report
-        # recomputed on only the broker-executed subset.
+        # recomputed on only the broker-executed subset (the real panel
+        # would duplicate the headline there, so it is hidden).
         if self.report_filter_var.get().startswith("實單"):
             rtrades = [t for t in result.trades
                        if getattr(t, "source", "") == "real"]
@@ -3569,17 +3689,17 @@ class BacktestApp:
                     cum += t.pnl
                     req.append(cum)
                 rmetrics = calculate_metrics(rtrades, req, initial_balance=0)
-                report = format_report(
-                    f"{report_title} — 實單 Real only", rmetrics,
-                    trades=rtrades, regime=regime_info)
+                self._render_report_view(
+                    f"{report_title} — 實單 Real only", rmetrics, rtrades,
+                    regime_info, header_lines, real_panel=False)
             else:
-                report = ("(無實單交易 No real-order trades in this result — "
-                          "switch 檢視 View back to 全部 All)")
+                self._render_report_view(
+                    report_title, None, None, regime_info, header_lines,
+                    message="(無實單交易 No real-order trades in this result "
+                            "— switch 檢視 View back to 全部 All)")
         else:
-            report = format_report(report_title, result.metrics,
-                                   trades=result.trades, regime=regime_info)
-        self.metrics_text.insert(tk.END, report)
-        self.metrics_text.config(state=tk.DISABLED)
+            self._render_report_view(report_title, result.metrics,
+                                     result.trades, regime_info, header_lines)
 
         # Trade list
         for item in self.trade_tree.get_children():
