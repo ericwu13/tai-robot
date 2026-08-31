@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -440,3 +441,142 @@ class TestNightSessionKey:
         """04:59 is still inside the night that opened yesterday."""
         dt = datetime(2026, 8, 8, 4, 59, tzinfo=timezone(timedelta(hours=8)))
         assert rss_scorer.night_session_key(dt) == "2026-08-07|NIGHT"
+
+
+# ── Gemini API error handling ──────────────────────────────────────────
+
+class TestGeminiAPIError:
+    def _cfg(self, webhook=""):
+        return {
+            "feeds": ["https://example.com/rss"],
+            "interval_minutes": 30,
+            "state_file": "data/state.json",
+            "gemini_api_key": "fake-key",
+            "discord_webhook_url": webhook,
+        }
+
+    def test_score_article_raises_on_http_429(self):
+        with patch("rss_scorer.urllib.request.urlopen") as mock_open:
+            mock_open.side_effect = urllib.error.HTTPError(
+                "url", 429, "Too Many Requests", {}, None)
+            with pytest.raises(rss_scorer.GeminiAPIError) as exc_info:
+                rss_scorer.score_article("headline", "summary", "fake-key")
+            assert exc_info.value.status == 429
+            assert "credits depleted" in str(exc_info.value)
+
+    def test_score_article_raises_on_http_500(self):
+        with patch("rss_scorer.urllib.request.urlopen") as mock_open:
+            mock_open.side_effect = urllib.error.HTTPError(
+                "url", 500, "Internal Server Error", {}, None)
+            with pytest.raises(rss_scorer.GeminiAPIError) as exc_info:
+                rss_scorer.score_article("headline", "summary", "fake-key")
+            assert exc_info.value.status == 500
+
+    def test_score_article_raises_on_connection_error(self):
+        with patch("rss_scorer.urllib.request.urlopen") as mock_open:
+            mock_open.side_effect = urllib.error.URLError("Connection refused")
+            with pytest.raises(rss_scorer.GeminiAPIError) as exc_info:
+                rss_scorer.score_article("headline", "summary", "fake-key")
+            assert exc_info.value.status == 0
+            assert "connection error" in str(exc_info.value)
+
+    def test_score_articles_returns_error_on_api_failure(self):
+        with patch("rss_scorer.score_article",
+                    side_effect=rss_scorer.GeminiAPIError(429, "rate limited")):
+            articles = [_make_article("a1", "Test")]
+            scored, guids, api_error = rss_scorer.score_articles(articles, "fake-key")
+            assert scored == []
+            assert guids == []
+            assert api_error is not None
+            assert "429" in api_error
+
+    def test_score_articles_no_error_returns_none(self):
+        with patch("rss_scorer.score_article",
+                    return_value={"direction": "neutral", "confidence": 0.2, "reason": "x"}):
+            articles = [_make_article("a1", "Test")]
+            scored, guids, api_error = rss_scorer.score_articles(articles, "fake-key")
+            assert api_error is None
+            assert guids == ["a1"]
+            assert len(scored) == 1
+
+    def test_score_articles_partial_error(self):
+        with patch("rss_scorer.score_article") as mock:
+            mock.side_effect = [
+                {"direction": "bullish", "confidence": 0.5, "reason": "up"},
+                rss_scorer.GeminiAPIError(500, "server error"),
+            ]
+            articles = [_make_article("a1", "A"), _make_article("a2", "B"),
+                        _make_article("a3", "C")]
+            scored, guids, api_error = rss_scorer.score_articles(articles, "fake-key")
+            assert len(scored) == 1
+            assert guids == ["a1"]
+            assert "a2" not in guids
+            assert "a3" not in guids
+            assert api_error is not None
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_api_error_articles_not_marked_seen(self, mock_score, mock_feeds, tmp_vote):
+        mock_feeds.return_value = [
+            _make_article("api1", "News A"),
+            _make_article("api2", "News B"),
+        ]
+        mock_score.side_effect = rss_scorer.GeminiAPIError(429, "credits depleted")
+
+        state = {"seen_guids": []}
+        state = rss_scorer.check_once(self._cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
+
+        assert "api1" not in state["seen_guids"]
+        assert "api2" not in state["seen_guids"]
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_partial_error_only_scored_marked_seen(self, mock_score, mock_feeds, tmp_vote):
+        mock_feeds.return_value = [
+            _make_article("p1", "News A"),
+            _make_article("p2", "News B"),
+            _make_article("p3", "News C"),
+        ]
+        mock_score.side_effect = [
+            {"direction": "bullish", "confidence": 0.5, "reason": "up"},
+            rss_scorer.GeminiAPIError(429, "credits depleted"),
+        ]
+
+        state = {"seen_guids": []}
+        state = rss_scorer.check_once(self._cfg(), state, tmp_vote, now=_WEEKDAY_EVE)
+
+        assert "p1" in state["seen_guids"]
+        assert "p2" not in state["seen_guids"]
+        assert "p3" not in state["seen_guids"]
+
+    @patch("rss_scorer.post_discord_embed")
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_api_error_embed_shows_error(self, mock_score, mock_feeds, mock_embed, tmp_vote):
+        mock_feeds.return_value = [_make_article("e1", "News")]
+        mock_score.side_effect = rss_scorer.GeminiAPIError(429, "credits depleted / rate limited")
+
+        state = {"seen_guids": []}
+        rss_scorer.check_once(
+            self._cfg(webhook="https://discord.example/webhook"),
+            state, tmp_vote, now=_WEEKDAY_EVE)
+
+        mock_embed.assert_called_once()
+        kwargs = mock_embed.call_args.kwargs
+        assert kwargs["api_error"] is not None
+        assert "429" in kwargs["api_error"] or "credits" in kwargs["api_error"]
+        assert kwargs["total_fetched"] == 1
+
+    @patch("rss_scorer.post_discord_embed")
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_clean_run_no_api_error_in_embed(self, mock_score, mock_feeds, mock_embed, tmp_vote):
+        mock_feeds.return_value = [_make_article("c1", "News")]
+        mock_score.return_value = {"direction": "neutral", "confidence": 0.2, "reason": "x"}
+
+        rss_scorer.check_once(
+            self._cfg(webhook="https://discord.example/webhook"),
+            {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+
+        kwargs = mock_embed.call_args.kwargs
+        assert kwargs.get("api_error") is None

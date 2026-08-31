@@ -122,14 +122,25 @@ def write_regime_vote(
     direction: str,
     expires_after_session: str,
     source: str = "W2",
+    data_date: str = "",
 ) -> None:
-    """Write (or overwrite) the per-source vote file atomically."""
+    """Write (or overwrite) the per-source vote file atomically.
+
+    *data_date* (``"YYYYMMDD"``) is the trade date of the data the vote
+    was computed from — audit only, and omitted when empty.  A source
+    may vote from data that lags the session it targets (W4 walks the
+    TAIFEX OpenAPI back up to 3 trading days), so the target session key
+    alone no longer identifies the evidence.  Readers ignore unknown
+    keys.
+    """
     payload = {
         "version": SCHEMA_VERSION,
         "direction": direction,
         "expires_after_session": expires_after_session,
         "source": source,
     }
+    if data_date:
+        payload["data_date"] = data_date
     out = _source_path(str(path), source)
     parent = os.path.dirname(out)
     if parent:

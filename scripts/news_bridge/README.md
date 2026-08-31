@@ -54,20 +54,29 @@ metrics) and a TEJ backtest over 2016-01 – 2025-10.
 
 ### Signal logic (`compute_chips_direction`)
 
-1. `|外資 TX net OI| < 1,000` contracts → no vote (hysteresis band).
-2. Futures direction vs equity flow contradiction (equity |flow| >
-   5 bn NTD in the *opposite* direction) → no vote — 外資 buying stocks
-   while short futures is hedging, not a directional view.
-3. `|net OI| >= 5,000` → vote in the OI direction regardless of slope.
-4. `1,000 <= |net OI| < 5,000` → vote only if the day-over-day OI slope
-   agrees (position being built, not unwound).  Yesterday's OI comes
-   from the `.chips_state.json` sidecar next to the vote file; on the
-   first run (no history) a weak signal writes no vote.
+The futures signal is the **day-over-day CHANGE in 外資 TX net OI (ΔOI)**,
+never the level: 外資 carry a permanent structural hedge short (~-80,000
+contracts), so the level clears every threshold in the short direction
+every single day and can never turn positive.  Yesterday's OI comes from
+the `.chips_state.json` sidecar next to the vote file; a baseline older
+than 5 calendar days is discarded (a stale Δ silently inflates across
+the gap).
+
+1. No OI baseline within 5 calendar days → no vote (ΔOI undefined);
+   today's OI is still recorded so the next pass has a baseline.
+2. `|ΔOI| < 1,000` contracts → no vote (hysteresis band).
+3. ΔOI direction vs equity flow contradiction (equity |flow| > 5 bn NTD
+   in the *opposite* direction) → no vote — 外資 adding shorts on a day
+   they net-bought equities is a hedge adjustment, not a directional
+   view.
+4. `|ΔOI| >= 5,000` → vote on the sign of ΔOI.
+5. `1,000 <= |ΔOI| < 5,000` → vote only when the 外資 equity flow points
+   the *same* way (> 5 bn NTD — active cash-market confirmation).
 
 If TWSE is unreachable the contradiction check can't run and the script
 conservatively writes **no vote**.  On every no-vote outcome any stale
 `regime_vote_w4.json` is deleted.  Today's OI is recorded in the sidecar
-even on no-vote days so tomorrow's slope check works.
+even on no-vote days so tomorrow's ΔOI has its baseline.
 
 ### Running
 

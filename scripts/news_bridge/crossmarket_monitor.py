@@ -156,7 +156,11 @@ def fetch_quote(symbol: str) -> dict | None:
         return None
 
 
-def write_signal(path: str, action: str, reason: str, source: str) -> str:
+def write_signal(path: str, action: str, reason: str, source: str,
+                 direction: str = "") -> str:
+    """Write one signal. *direction* ("bearish"/"bullish") tells a bot
+    running ``news.suppress_scope=conflicting_leg`` which leg the shock
+    threatens; omitted (manual taps) the bot gates both legs."""
     sid = str(uuid.uuid4())
     payload = {
         "version": 1,
@@ -167,6 +171,8 @@ def write_signal(path: str, action: str, reason: str, source: str) -> str:
         "source": source,
         "reason": reason,
     }
+    if direction:
+        payload["direction"] = direction
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = str(out) + ".tmp"
@@ -356,7 +362,8 @@ def check_once(args, state: dict) -> dict:
         fired.append("signal-down")
         if state.get(f"down:{us_date}") is None:
             reason = "downside breach: " + ", ".join(breaches["signal_down"])
-            sid = write_signal(args.signal_out, "risk_off", reason, "crossmarket-monitor")
+            sid = write_signal(args.signal_out, "risk_off", reason,
+                               "crossmarket-monitor", direction="bearish")
             state[f"down:{us_date}"] = sid
             post_discord(args.discord_webhook,
                          f"🔴 **跨市場警報 Cross-market DOWNSIDE** — {reason}\n"

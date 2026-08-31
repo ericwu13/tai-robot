@@ -1,5 +1,5 @@
 {
-  "name": "W4 Chips vote (TAIFEX institutional flow, 16:15 TPE weekdays)",
+  "name": "W4 Chips vote (TAIFEX institutional flow, retry slots + 04:15 catch-up)",
   "nodes": [
     {
       "parameters": {
@@ -7,12 +7,12 @@
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "15 16 * * 1-5"
+              "expression": "15 4,16,18,20,22 * * *"
             }
           ]
         }
       },
-      "name": "Weekdays 16:15 TPE",
+      "name": "Retry slots (04:15 + 16:15-22:15 TPE daily)",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -68,7 +68,7 @@
     }
   ],
   "connections": {
-    "Weekdays 16:15 TPE": {
+    "Retry slots (04:15 + 16:15-22:15 TPE daily)": {
       "main": [
         [
           {

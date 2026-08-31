@@ -50,6 +50,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -230,6 +231,14 @@ def _parse_partial(text: str) -> dict | None:
     return None
 
 
+class GeminiAPIError(Exception):
+    """Gemini API call failed (HTTP error, connection error, timeout)."""
+    def __init__(self, status: int, message: str):
+        self.status = status
+        self.message = message
+        super().__init__(f"HTTP {status}: {message}" if status else message)
+
+
 def score_article(headline: str, summary: str, api_key: str) -> dict | None:
     """Call Gemini to score one article.  Returns parsed JSON or None."""
     prompt = SCORING_PROMPT.format(headline=headline, summary=summary[:500])
@@ -255,16 +264,41 @@ def score_article(headline: str, summary: str, api_key: str) -> dict | None:
         return json.loads(text)
     except json.JSONDecodeError:
         return _parse_partial(text)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        if status == 429:
+            msg = "credits depleted / rate limited"
+        elif status >= 500:
+            msg = f"server error ({exc.reason})"
+        else:
+            msg = str(exc.reason)
+        raise GeminiAPIError(status, msg) from exc
+    except OSError as exc:
+        raise GeminiAPIError(0, f"connection error: {exc}") from exc
     except Exception as e:  # noqa: BLE001
         print(f"    gemini scoring failed: {type(e).__name__}: {e}")
         return None
 
 
-def score_articles(articles: list[dict], api_key: str) -> list[dict]:
-    """Score each article, return list of {article, score} dicts."""
+def score_articles(articles: list[dict], api_key: str) -> tuple[list[dict], list[str], str | None]:
+    """Score each article via Gemini.
+
+    Returns (scored_results, scored_guids, api_error):
+      scored_results: list of {article, score} for successfully scored articles
+      scored_guids: GUIDs where the API call succeeded (safe to mark as seen)
+      api_error: error description if Gemini API failed, None otherwise
+    """
     results = []
+    scored_guids = []
+    api_error = None
     for art in articles:
-        score = score_article(art["title"], art["summary"], api_key)
+        try:
+            score = score_article(art["title"], art["summary"], api_key)
+        except GeminiAPIError as exc:
+            api_error = str(exc)
+            print(f"    [API ERROR] {exc} — aborting remaining articles")
+            break
+        scored_guids.append(art["guid"])
         if score and "direction" in score and "confidence" in score:
             score["direction"] = score["direction"].lower()
             results.append({"article": art, "score": score})
@@ -273,7 +307,7 @@ def score_articles(articles: list[dict], api_key: str) -> list[dict]:
             print(f"    [{direction} {confidence:.2f}] {art['title'][:70]}")
         else:
             print(f"    [SKIP] {art['title'][:70]}")
-    return results
+    return results, scored_guids, api_error
 
 
 # ── Aggregation ──────────────────────────────────────────────────────────
@@ -351,10 +385,13 @@ TOP_ARTICLES_SHOWN = 10
 def post_discord_embed(webhook: str | None, direction: str | None, net_score: float,
                        scored: list[dict], session_net: float | None = None,
                        session_peak: float = 0.0, recent_runs: list[float] | None = None,
-                       note: str | None = None) -> None:
+                       note: str | None = None,
+                       api_error: str | None = None, total_fetched: int = 0) -> None:
     if not webhook:
         return
-    if direction == "trending-up":
+    if api_error:
+        color = 0xFFA500
+    elif direction == "trending-up":
         color = 0x00AA00
     elif direction == "trending-down":
         color = 0xCC0000
@@ -381,7 +418,13 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
                        "value": f"{session_net:+.2f} / ±{SESSION_VOTE_THRESHOLD:.0f}",
                        "inline": True})
     fields.append({"name": "Bullish / Bearish", "value": f"+{bull:.1f} / -{bear:.1f}", "inline": True})
-    fields.append({"name": "Articles Scored", "value": str(len(scored)), "inline": True})
+    if api_error:
+        fields.append({"name": "⚠️ API Error", "value": api_error, "inline": False})
+        fields.append({"name": "Articles Fetched", "value": str(total_fetched), "inline": True})
+        if scored:
+            fields.append({"name": "Scored (partial)", "value": str(len(scored)), "inline": True})
+    else:
+        fields.append({"name": "Articles Scored", "value": str(len(scored)), "inline": True})
 
     if session_peak > 0 and session_net is not None and session_net < session_peak - 1.5:
         erosion = session_net - session_peak
@@ -406,9 +449,13 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
                        "value": f"Recent ({len(recent_runs)} runs): {recent_net:+.2f} {emoji}",
                        "inline": True})
 
+    embed_title = ("📰 RSS Sentiment: ⚠️ Scoring Error" if api_error
+                   else f"📰 RSS Sentiment Vote: {direction or 'none'}")
+    embed_desc = "\n".join(desc_lines) or (
+        "Scoring failed — see error below." if api_error else "No articles scored.")
     embed = {
-        "title": f"📰 RSS Sentiment Vote: {direction or 'none'}",
-        "description": "\n".join(desc_lines) or "No articles scored.",
+        "title": embed_title,
+        "description": embed_desc,
         "color": color,
         "fields": fields,
         "footer": {"text": "W3 RSS Scorer"},
@@ -498,8 +545,8 @@ def check_once(cfg: dict, state: dict, vote_out: str,
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
 
-    scored = score_articles(new_articles, cfg["gemini_api_key"])
-    state = mark_seen(state, [a["guid"] for a in new_articles])
+    scored, scored_guids, api_error = score_articles(new_articles, cfg["gemini_api_key"])
+    state = mark_seen(state, scored_guids)
 
     net = aggregate_scores(scored)
     cum = round(_session_net(state, session_key) * EMA_DECAY + net, 4)
@@ -520,6 +567,8 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
 
     print(f"  run net: {net:+.2f}, session net: {cum:+.2f} -> vote: {direction or 'none'}")
+    if api_error:
+        print(f"  ⚠ Gemini API error: {api_error}")
 
     if direction and vote_out:
         try:
@@ -530,7 +579,8 @@ def check_once(cfg: dict, state: dict, vote_out: str,
             print(f"  vote write failed: {type(e).__name__}: {e}")
     post_discord_embed(cfg["discord_webhook_url"], direction, net, scored,
                        session_net=cum, session_peak=peak,
-                       recent_runs=state["recent_runs"])
+                       recent_runs=state["recent_runs"],
+                       api_error=api_error, total_fetched=len(new_articles))
 
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_net_score"] = net
