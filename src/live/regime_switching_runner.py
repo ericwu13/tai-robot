@@ -26,11 +26,13 @@ from ..news.circuit_breaker import (
     SRC_EVENT,
     SRC_SIGNAL,
     STAMP_EVENT,
+    STAMP_NOTICE,
     SUPPRESS,
     UNSUPPRESS,
     BreakerState,
     plan_calendar_gate,
     plan_signal_actions,
+    plan_suppression_maintenance,
     should_revert_news,
 )
 from ..news.event_calendar import (
@@ -378,6 +380,9 @@ class RegimeSwitchingRunner(LiveRunner):
             raise RuntimeError(f"swap_strategy refused: {reason}")
         self._active_leg = leg
         self.regime_idle = False
+        # A directional suppression gates per leg — the swap may have
+        # moved onto (or off) the gated side.
+        self._sync_news_idle()
         if callable(self.on_regime_swap_cb):
             try:
                 self.on_regime_swap_cb(prev_leg, leg, strategy_name)
@@ -393,6 +398,7 @@ class RegimeSwitchingRunner(LiveRunner):
         self.broker._pending_market_closes.clear()
         self._active_leg = "idle"
         self.regime_idle = True
+        self._sync_news_idle()
         if callable(self.on_regime_swap_cb):
             try:
                 self.on_regime_swap_cb(prev_leg, "idle", "")
@@ -435,9 +441,15 @@ class RegimeSwitchingRunner(LiveRunner):
         elif now.tzinfo is None:
             now = now.replace(tzinfo=_TZ_TAIPEI)
         lines: list[str] = []
+        # Maintenance runs LAST so it sees post-signal/post-calendar
+        # state: a risk_off re-fired this same poll has already
+        # refreshed the session stamp (no false expiry), and the
+        # reminder reflects what is still standing after the calendar
+        # stamped or cleared its gate.
         for step, label in ((self._check_news_signal, "signal"),
                             (self._check_news_revert, "revert"),
-                            (self._check_event_calendar, "calendar")):
+                            (self._check_event_calendar, "calendar"),
+                            (self._check_news_maintenance, "maintenance")):
             try:
                 lines.extend(step(now))
             except Exception as e:
@@ -459,6 +471,7 @@ class RegimeSwitchingRunner(LiveRunner):
 
         consumed = (self._ledger.is_consumed(signal.signal_id)
                     if self._ledger is not None else False)
+        side = self.broker.position_side
         decision = plan_signal_actions(
             signal,
             consumed,
@@ -466,6 +479,9 @@ class RegimeSwitchingRunner(LiveRunner):
             self.broker.has_open_position(),
             self._breaker_state,
             in_replay=bool(self.suppress_strategy or self._is_reloading),
+            suppress_scope=getattr(cfg, "suppress_scope", "both") or "both",
+            position_side=side.value.lower() if side else "",
+            session_key=self._news_session_key(now),
         )
         if not decision:
             return []
@@ -473,6 +489,24 @@ class RegimeSwitchingRunner(LiveRunner):
                     signal.signal_id, signal.action)
         return self._execute_breaker(decision, now,
                                      label=f"signal {signal.action}")
+
+    def _check_news_maintenance(self, now) -> list[str]:
+        """Expire an unrefreshed signal suppression; remind while gated.
+
+        Pure decision in :func:`plan_suppression_maintenance`; this is
+        wiring only. Skipped during replay — the restored suppression
+        must survive until the poll loop sees a real session key.
+        """
+        if self.suppress_strategy or self._is_reloading:
+            return []
+        st = self._breaker_state
+        if not st.suppressed:
+            return []
+        decision = plan_suppression_maintenance(
+            st, self._news_session_key(now))
+        if not decision:
+            return []
+        return self._execute_breaker(decision, now, label="maintenance")
 
     def _check_news_revert(self, now) -> list[str]:
         """Hand a deployed event strategy back to regime control.
@@ -622,6 +656,13 @@ class RegimeSwitchingRunner(LiveRunner):
                 st.event_suppressed = on
             elif act.arg == SRC_SIGNAL:
                 st.signal_suppressed = on
+                # Direction/severity gate per-leg; the session key is the
+                # expiry anchor (a re-fired risk_off refreshes it).
+                st.signal_direction = act.direction if on else ""
+                st.signal_severity = act.severity if on else ""
+                st.signal_session_key = act.session_key if on else ""
+                st.signal_suppressed_at = (
+                    now.strftime("%Y-%m-%d %H:%M") if on else "")
             else:
                 logger.warning("[NEWS] Unknown suppression source: %r", act.arg)
                 return ""
@@ -631,6 +672,10 @@ class RegimeSwitchingRunner(LiveRunner):
                 st.suppressed_reason = ""
             verb = "suppressed" if on else "released"
             return f"[NEWS] Entries {verb} ({act.arg}): {act.reason}"
+
+        if kind == STAMP_NOTICE:
+            st.notice_session_key = act.arg
+            return ""
 
         if kind == DEPLOY_NEWS:
             return self._deploy_news_strategy(act.arg, now)
@@ -699,8 +744,18 @@ class RegimeSwitchingRunner(LiveRunner):
         return nxt.key if nxt is not None else ""
 
     def _sync_news_idle(self) -> None:
-        """Mirror the breaker's suppression onto the bar pipeline."""
-        self.news_idle = self._breaker_state.suppressed
+        """Mirror the breaker's suppression onto the bar pipeline.
+
+        Leg-aware: under ``suppress_scope=conflicting_leg`` a directional
+        suppression gates only the leg it would hurt, so this must be
+        re-run whenever ``_active_leg`` changes, not just when the
+        breaker state does — a leg swap can flip the gate either way.
+        """
+        scope = (getattr(self._news_cfg, "suppress_scope", "both") or "both"
+                 if self._news_cfg is not None else "both")
+        st = self._breaker_state
+        self.news_idle = st.gates_leg(self._active_leg, scope)
+        self.news_idle_reason = st.suppressed_reason if self.news_idle else ""
 
     def _news_notify(self, message: str) -> None:
         if not message or not callable(self.on_news_notify_cb):
@@ -802,6 +857,11 @@ class RegimeSwitchingRunner(LiveRunner):
                 logger.warning(
                     "[REGIME] Cannot restore leg '%s': strategy '%s' "
                     "not in registry", saved_leg, name)
+        # Re-sync AFTER the leg restore: the breaker sync above ran while
+        # _active_leg was still "idle", and a directional suppression
+        # gates per leg.
+        if self._news_enabled:
+            self._sync_news_idle()
         return n
 
     def _auto_save_session(self) -> None:
@@ -829,6 +889,9 @@ class RegimeSwitchingRunner(LiveRunner):
                 "news_enabled": self._news_enabled,
                 "news_tier2_enabled": bool(
                     self._news_cfg.tier2_enabled if self._news_cfg else False),
+                "news_suppress_scope": (
+                    getattr(self._news_cfg, "suppress_scope", "both")
+                    if self._news_cfg else "both"),
                 "news": self._breaker_state.to_dict(),
             }
             save_session(self._session_path, data)

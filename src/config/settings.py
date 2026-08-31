@@ -87,6 +87,13 @@ class NewsConfig:
     max_signal_age_sec: int = 900
     tier2_enabled: bool = False    # forced-entry event strategies
     calendar_min_severity: str = "high"
+    # "both": any risk_off gates every leg (legacy behavior, default).
+    # "conflicting_leg": a directional risk_off gates only the leg it
+    # would hurt (bearish → long legs) — a bearish shock no longer
+    # silences a short strategy. Direction-less or severity=critical
+    # signals still gate both. Deliberate policy choice; see
+    # BreakerState.gates_leg.
+    suppress_scope: str = "both"
     regime_vote_thresholds: dict = field(default_factory=lambda: {
         "soxx_pct": 2.5, "tsm_pct": 2.0, "qqq_pct": 2.0,
     })

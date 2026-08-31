@@ -456,9 +456,11 @@ class LiveRunner:
         # News circuit breaker: same "no trading, keep the data flowing"
         # semantics as regime_idle, but owned by src.news so a `clear`
         # signal or an event window ending cannot accidentally un-idle a
-        # regime sit_out (and vice versa). Mirrored from
-        # BreakerState.suppressed by RegimeSwitchingRunner.
+        # regime sit_out (and vice versa). Mirrored (leg-aware) from
+        # BreakerState by RegimeSwitchingRunner._sync_news_idle, which
+        # also fills news_idle_reason for the NEWS_SUPPRESSED audit rows.
         self.news_idle: bool = False
+        self.news_idle_reason: str = ""
 
         # Daily-report dedupe key: "{date}_{session}" (e.g.
         # "2026-07-21_DAY") of the last emitted report. Persisted in
@@ -1111,6 +1113,18 @@ class LiveRunner:
         # During history catchup, regime idle, or a news suppression, only
         # build bar state — no trading
         if self.suppress_strategy or self.regime_idle or self.news_idle:
+            # Audit trail for suppressed windows: one row per bar the
+            # news gate (and nothing else) swallowed, so a post-hoc
+            # replay (scripts/replay_bars.py) can show what the strategy
+            # would have done — the breaker keeps its own track record
+            # instead of silently filtering live away from the backtest.
+            # Only when news_idle is the BINDING block: replay catchup
+            # bars and regime sit-outs are not missed trading.
+            if self.news_idle and not self.suppress_strategy \
+                    and not self.regime_idle:
+                self._log_decision(
+                    bar, "NEWS_SUPPRESSED", "", "", bar.close,
+                    self.news_idle_reason or "news circuit breaker")
             return
 
         ctx = self.broker.context

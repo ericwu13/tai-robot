@@ -28,8 +28,12 @@ File schema::
       "action": "risk_off",
       "severity": "high",
       "source": "crossmarket-sox",
-      "reason": "SOX -3.2% intraday"
+      "reason": "SOX -3.2% intraday",
+      "direction": "bearish"
     }
+
+``direction`` ("bearish"/"bullish") is optional and advisory — see
+:class:`NewsSignal`.
 """
 
 from __future__ import annotations
@@ -68,6 +72,11 @@ class NewsSignal:
     severity: str = ""
     source: str = ""
     reason: str = ""
+    # "bearish"/"bullish"/"" — which way the shock points. Advisory:
+    # under news.suppress_scope=conflicting_leg a directional risk_off
+    # gates only the leg it would hurt. Absent/junk degrades to "",
+    # which gates both legs (old writers keep the old behavior).
+    direction: str = ""
 
 
 def _to_taipei(now: datetime | None) -> datetime:
@@ -143,6 +152,10 @@ def read_signal(
     if age < -CLOCK_SKEW_SEC:
         return None, f"issued_at is {-age:.0f}s in the future"
 
+    direction = str(data.get("direction") or "").strip().lower()
+    if direction not in ("bearish", "bullish"):
+        direction = ""
+
     return NewsSignal(
         signal_id=signal_id.strip(),
         action=action,
@@ -150,6 +163,7 @@ def read_signal(
         severity=str(data.get("severity") or ""),
         source=str(data.get("source") or ""),
         reason=str(data.get("reason") or ""),
+        direction=direction,
     ), ""
 
 

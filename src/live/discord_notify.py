@@ -218,6 +218,7 @@ class DiscordNotifier:
         restored_strategy: str = "",
         news_enabled: bool = False,
         news_tier2: bool = False,
+        news_directional: bool = False,
     ) -> None:
         """Deploy notification for a regime-switching bot.
 
@@ -231,7 +232,11 @@ class DiscordNotifier:
 
         The news line always states whether the news circuit breaker is ON or
         OFF, so a deploy that silently dropped the flag is visible at deploy
-        time instead of going unnoticed for days.
+        time instead of going unnoticed for days. Same rule for the
+        directional (suppress_scope) sub-mode: whenever the breaker is ON,
+        the line states ✅/❌ explicitly — a bot the user believes is
+        directional but that deployed as gate-both would otherwise sit
+        silent through the exact incident the knob exists to prevent.
         """
         ver = f" v{version}" if version else ""
         if news_enabled and news_tier2:
@@ -241,6 +246,11 @@ class DiscordNotifier:
             news_line = "📰 新聞斷路器 News breaker: ✅ ON"
         else:
             news_line = "📰 新聞斷路器 News breaker: ❌ OFF"
+        if news_enabled:
+            news_line += (
+                " | 方向性 directional: ✅ 只擋衝突方向 conflicting-leg only"
+                if news_directional else
+                " | 方向性 directional: ❌ 擋雙向 gates both legs")
         lines = [
             f"{self._header()}",
             f"🚀 **機器人啟動 Bot Deployed**{ver}",

@@ -35,10 +35,12 @@ def _settings(**overrides):
     return s
 
 
-def _resolve(settings=None, *, regime=True, news=True, tier2=False):
+def _resolve(settings=None, *, regime=True, news=True, tier2=False,
+             scope="both"):
     return rb._resolve_news_config(
         settings if settings is not None else _settings(),
         regime_enabled=regime, news_enabled=news, tier2_enabled=tier2,
+        suppress_scope=scope,
         base_dir=BASE,
     )
 
@@ -95,6 +97,30 @@ class TestTier2PerDeploy:
                                               ("", False), (None, False)])
     def test_tier2_is_coerced_to_bool(self, raw, expected):
         assert _resolve(tier2=raw).tier2_enabled is expected
+
+
+# ── suppress_scope comes from THIS deploy ──
+
+class TestSuppressScopePerDeploy:
+    def test_scope_from_deploy_not_settings(self):
+        # settings default says conflicting_leg; this deploy did not tick it
+        cfg = _resolve(_settings(news_suppress_scope="conflicting_leg"),
+                       scope="both")
+        assert cfg.suppress_scope == "both"
+
+    def test_conflicting_leg_passes_through(self):
+        cfg = _resolve(scope="conflicting_leg")
+        assert cfg.suppress_scope == "conflicting_leg"
+
+    def test_default_is_both(self):
+        cfg = rb._resolve_news_config(
+            _settings(), regime_enabled=True, news_enabled=True,
+            tier2_enabled=False, base_dir=BASE)
+        assert cfg.suppress_scope == "both"
+
+    @pytest.mark.parametrize("junk", ["", None, "BOTH", "directional", 1])
+    def test_junk_scope_degrades_to_both(self, junk):
+        assert _resolve(scope=junk).suppress_scope == "both"
 
 
 # ── Shared fields still come from settings ──

@@ -281,6 +281,7 @@ def _resolve_news_config(
     regime_enabled: bool,
     news_enabled: bool,
     tier2_enabled: bool,
+    suppress_scope: str = "both",
     base_dir: str | None = None,
 ):
     """Resolve THIS deploy's NewsConfig, or None when news must stay off.
@@ -298,8 +299,9 @@ def _resolve_news_config(
       nowhere to hang it.
     - ``news_enabled`` False → None (this deploy opted out).
     - otherwise a NewsConfig whose paths/age/severity come from
-      settings.yaml and whose ``tier2_enabled`` comes from THIS
-      deploy's checkbox — forced-entry is a per-bot risk decision.
+      settings.yaml and whose ``tier2_enabled`` / ``suppress_scope``
+      come from THIS deploy's checkboxes — forced-entry and
+      directional gating are per-bot risk decisions.
 
     Returning None rather than a disabled NewsConfig keeps the runner's
     "no news config → never touch the filesystem" path the default.
@@ -321,6 +323,8 @@ def _resolve_news_config(
             settings.get("news_regime_vote_path", ""), base_dir),
         max_signal_age_sec=int(settings.get("news_max_signal_age_sec", 900)),
         tier2_enabled=bool(tier2_enabled),
+        suppress_scope=("conflicting_leg"
+                        if suppress_scope == "conflicting_leg" else "both"),
         calendar_min_severity=str(
             settings.get("news_calendar_min_severity", "high")),
     )
@@ -412,6 +416,10 @@ def _load_settings():
             cfg["news_max_signal_age_sec"] = int(
                 news.get("max_signal_age_sec", 900) or 900)
             cfg["news_tier2_enabled"] = bool(news.get("tier2_enabled", False))
+            # Dialog default only, like enabled/tier2 — the per-bot
+            # checkbox decides ("conflicting_leg" ⇔ ticked).
+            cfg["news_suppress_scope"] = str(
+                news.get("suppress_scope", "both") or "both")
             cfg["news_calendar_min_severity"] = str(
                 news.get("calendar_min_severity", "high") or "high")
             regime = data.get("regime", {}) or {}
@@ -5420,7 +5428,8 @@ class BacktestApp:
                 name, sess = existing_bots[idx]
                 result[0] = (name, sess, mode_var.get(), loss_var.get(),
                              regime_var.get(), regime_long_var.get(), regime_short_var.get(),
-                             news_var.get(), news_tier2_var.get())
+                             news_var.get(), news_tier2_var.get(),
+                             news_directional_var.get())
                 dlg.destroy()
 
             btn_row = ttk.Frame(content)
@@ -5480,6 +5489,8 @@ class BacktestApp:
                     # can still untick to run this bot without the breaker.
                     news_var.set(bool(sess.get("news_enabled", False)))
                     news_tier2_var.set(bool(sess.get("news_tier2_enabled", False)))
+                    news_directional_var.set(
+                        sess.get("news_suppress_scope", "") == "conflicting_leg")
                     _toggle_regime_widgets()
 
             tree.bind("<<TreeviewSelect>>", on_select)
@@ -5519,7 +5530,8 @@ class BacktestApp:
                 return
             result[0] = (name, None, mode_var.get(), loss_var.get(),
                          regime_var.get(), regime_long_var.get(), regime_short_var.get(),
-                         news_var.get(), news_tier2_var.get())
+                         news_var.get(), news_tier2_var.get(),
+                         news_directional_var.get())
             dlg.destroy()
 
         ttk.Button(new_frame, text="建立 Create", command=on_create).pack(side=tk.LEFT)
@@ -5592,6 +5604,13 @@ class BacktestApp:
             value=bool(self._settings.get("news_enabled", False)))
         news_tier2_var = tk.BooleanVar(
             value=bool(self._settings.get("news_tier2_enabled", False)))
+        # Directional gating (suppress_scope): per-bot policy decision,
+        # same as tier2 — a bearish risk_off silencing a SHORT strategy
+        # for two days is what this knob exists to prevent (08-18→20
+        # incident). Ticked ⇔ "conflicting_leg".
+        news_directional_var = tk.BooleanVar(
+            value=self._settings.get(
+                "news_suppress_scope", "both") == "conflicting_leg")
 
         news_frame = ttk.Frame(regime_lf)
         news_cb = ttk.Checkbutton(
@@ -5601,13 +5620,20 @@ class BacktestApp:
         tier2_cb = ttk.Checkbutton(
             news_frame, variable=news_tier2_var,
             text="允許強制進場 allow forced-entry deploys (Tier 2)")
-        tier2_cb.pack(anchor=tk.W, padx=30, pady=(0, 2))
+        tier2_cb.pack(anchor=tk.W, padx=30, pady=(0, 0))
+        directional_cb = ttk.Checkbutton(
+            news_frame, variable=news_directional_var,
+            text="方向性暫停 directional risk_off — 只擋衝突方向"
+                 " gate conflicting leg only")
+        directional_cb.pack(anchor=tk.W, padx=30, pady=(0, 2))
 
         def _toggle_news_widgets():
-            # Tier 2 is a sub-decision of the breaker: grey it out rather
-            # than hide it, so the layout doesn't jump (same pattern the
-            # trading-mode radios use when login is missing).
-            tier2_cb.config(state=tk.NORMAL if news_var.get() else tk.DISABLED)
+            # Tier 2 / directional are sub-decisions of the breaker: grey
+            # them out rather than hide, so the layout doesn't jump (same
+            # pattern the trading-mode radios use when login is missing).
+            sub_state = tk.NORMAL if news_var.get() else tk.DISABLED
+            tier2_cb.config(state=sub_state)
+            directional_cb.config(state=sub_state)
 
         news_cb.config(command=_toggle_news_widgets)
 
@@ -5684,7 +5710,7 @@ class BacktestApp:
             return
         bot_name, resume_session, trading_mode, loss_limit_str, \
             regime_enabled, regime_long, regime_short, \
-            news_enabled, news_tier2_enabled = result
+            news_enabled, news_tier2_enabled, news_directional = result
         self._trading_mode = trading_mode
         try:
             loss_limit = max(0, int(loss_limit_str))
@@ -5868,6 +5894,8 @@ class BacktestApp:
                 regime_enabled=is_regime_deploy,
                 news_enabled=news_enabled,
                 tier2_enabled=news_tier2_enabled,
+                suppress_scope=("conflicting_leg" if news_directional
+                                else "both"),
             )
             self._live_runner = RegimeSwitchingRunner(
                 strategy, symbol, point_value=point_value,
@@ -5882,6 +5910,7 @@ class BacktestApp:
             if news_cfg is not None:
                 _log(f"新聞框架已啟用 News framework enabled "
                      f"(tier2={news_cfg.tier2_enabled}, "
+                     f"scope={news_cfg.suppress_scope}, "
                      f"signal={bool(news_cfg.signal_path)}, "
                      f"events={bool(news_cfg.events_path)})")
             self._regime_manager = self._live_runner.regime_manager
@@ -6062,6 +6091,7 @@ class BacktestApp:
                 restored_strategy=_restored_strat,
                 news_enabled=news_enabled,
                 news_tier2=news_tier2_enabled,
+                news_directional=news_directional,
             )
             if self._live_runner.regime_idle:
                 _discord.regime_idle_warning()
@@ -6095,6 +6125,8 @@ class BacktestApp:
         if is_regime_deploy:
             if news_enabled:
                 news_label = "ON+Tier2" if news_tier2_enabled else "ON"
+                if news_directional:
+                    news_label += "+Dir"
             else:
                 news_label = "OFF"
             self._live_log_msg(

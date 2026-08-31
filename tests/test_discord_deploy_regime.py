@@ -115,6 +115,34 @@ def test_regime_deploy_news_status_line():
     assert "📰 新聞斷路器 News breaker: ❌ OFF" in tier2_only
 
 
+def test_regime_deploy_directional_status_line():
+    """The directional sub-mode is stated ✅/❌ whenever the breaker is ON.
+
+    Same rule as the breaker line itself: a bot the user believes is
+    directional but that deployed gate-both must say so at deploy time —
+    that silent mismatch is the 08-18→20 incident shape all over again.
+    Breaker OFF ⇒ no directional segment (nothing to state).
+    """
+    n = DiscordNotifier("token", "channel", bot_name="08-14-regime",
+                        symbol="TMF00")
+    sent = _capture(n)
+
+    n.bot_deployed_regime("Long", "Short", "模擬", news_enabled=True,
+                          news_directional=True)
+    n.bot_deployed_regime("Long", "Short", "模擬", news_enabled=True,
+                          news_tier2=True, news_directional=True)
+    n.bot_deployed_regime("Long", "Short", "模擬", news_enabled=True)
+    # directional without the breaker itself: no directional segment
+    n.bot_deployed_regime("Long", "Short", "模擬", news_directional=True)
+
+    on_dir, tier2_dir, on_plain, dir_only = sent
+    assert "方向性 directional: ✅ 只擋衝突方向 conflicting-leg only" in on_dir
+    assert ("(+Tier2 強制進場 forced-entry) | "
+            "方向性 directional: ✅") in tier2_dir
+    assert "方向性 directional: ❌ 擋雙向 gates both legs" in on_plain
+    assert "方向性" not in dir_only
+
+
 def test_regime_deploy_disabled_notifier_no_raise():
     n = DiscordNotifier("", "")
     assert n.enabled is False

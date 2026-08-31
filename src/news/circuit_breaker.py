@@ -11,6 +11,9 @@ Three planners:
 
 - :func:`plan_signal_actions` — the circuit-breaker signal file
   (``risk_off`` / ``clear`` / ``deploy_short`` / ``deploy_long``).
+- :func:`plan_suppression_maintenance` — expire a signal suppression no
+  fresh ``risk_off`` has refreshed past a session boundary (fail open),
+  and emit a once-per-session "still suppressed" reminder.
 - :func:`plan_calendar_gate` — the scheduled-event calendar: stamp or
   clear the ``_event_risk`` flag the regime selector sits out on.
 - :func:`should_revert_news` — when to hand a deployed event strategy
@@ -34,6 +37,7 @@ kind                 arg                        meaning
 ``CLEAR_EVENT``      ``""``                     clear ``_event_risk``
 ``DISCORD``          ``""``                     ``reason`` is the message
 ``MARK_CONSUMED``    signal_id                  ledger write (always last)
+``STAMP_NOTICE``     session key                still-suppressed reminder sent
 ===================  =========================  ===========================
 
 Two invariants the tests pin down:
@@ -64,6 +68,7 @@ STAMP_EVENT = "stamp_event"
 CLEAR_EVENT = "clear_event"
 DISCORD = "discord"
 MARK_CONSUMED = "mark_consumed"
+STAMP_NOTICE = "stamp_notice"   # arg = session key the reminder covered
 
 # ── Suppression sources (SUPPRESS/UNSUPPRESS arg) ──
 SRC_SIGNAL = "signal"   # Tier 1 risk_off — released only by `clear`
@@ -76,11 +81,20 @@ FLATTEN_TAG = "news_risk_off"
 
 @dataclass(frozen=True)
 class BreakerAction:
-    """One command for the runner to execute."""
+    """One command for the runner to execute.
+
+    ``direction``/``severity``/``session_key`` are carried only on
+    ``SUPPRESS(SRC_SIGNAL)`` actions — the runner stamps them onto
+    :class:`BreakerState` so later polls can gate per-leg and expire the
+    suppression at a session boundary. Blank everywhere else.
+    """
 
     kind: str
     arg: str = ""
     reason: str = ""
+    direction: str = ""
+    severity: str = ""
+    session_key: str = ""
 
 
 @dataclass
@@ -98,10 +112,49 @@ class BreakerState:
     event_name: str = ""                  # currently stamped `_event_risk`
     news_strategy_active: bool = False
     news_deployed_session_key: str = ""   # "" when no event strategy is deployed
+    # ── Signal-suppression metadata (blank unless signal_suppressed) ──
+    signal_direction: str = ""            # "bearish"/"bullish"/"" from the signal
+    signal_severity: str = ""             # "critical" gates both legs regardless of scope
+    signal_session_key: str = ""          # session the suppression was (re)stamped in;
+                                          # expiry anchor — "" means unknown age (legacy)
+    signal_suppressed_at: str = ""        # human-readable TPE stamp, display only
+    notice_session_key: str = ""          # last session a still-suppressed reminder went out
 
     @property
     def suppressed(self) -> bool:
         return self.signal_suppressed or self.event_suppressed
+
+    def gates_leg(self, active_leg: str, scope: str = "both") -> bool:
+        """Does the current suppression stop *active_leg* from trading?
+
+        The event source always gates: scheduled macro events (FOMC, CPI)
+        cut both ways, so the calendar carries no direction. The signal
+        source gates per *scope*:
+
+        - ``"both"`` (default): any signal suppression gates every leg —
+          the pre-direction behavior, unchanged.
+        - ``"conflicting_leg"``: a directional signal gates only the leg
+          it would hurt (bearish → long legs, bullish → short legs).
+          No direction, or severity ``"critical"``, still gates
+          everything — unknown danger fails closed.
+
+        Leg matching is by suffix so event legs participate too
+        (``"news_short"`` counts as short). ``"idle"`` is gated, which is
+        harmless — an idle leg does not trade anyway.
+        """
+        if self.event_suppressed:
+            return True
+        if not self.signal_suppressed:
+            return False
+        if scope != "conflicting_leg":
+            return True
+        if self.signal_severity == "critical":
+            return True
+        if self.signal_direction == "bearish":
+            return not active_leg.endswith("short")
+        if self.signal_direction == "bullish":
+            return not active_leg.endswith("long")
+        return True
 
     def to_dict(self) -> dict:
         return {
@@ -111,12 +164,22 @@ class BreakerState:
             "event_name": self.event_name,
             "news_strategy_active": self.news_strategy_active,
             "news_deployed_session_key": self.news_deployed_session_key,
+            "signal_direction": self.signal_direction,
+            "signal_severity": self.signal_severity,
+            "signal_session_key": self.signal_session_key,
+            "signal_suppressed_at": self.signal_suppressed_at,
+            "notice_session_key": self.notice_session_key,
         }
 
     @classmethod
     def from_dict(cls, data: object) -> "BreakerState":
         """Rebuild from ``session.json``. Junk degrades to a clean state —
-        a corrupt session file must not resurrect a phantom suppression."""
+        a corrupt session file must not resurrect a phantom suppression.
+
+        A pre-expiry session file has no ``signal_session_key``; the field
+        defaults to "" and :func:`plan_suppression_maintenance` releases
+        such a suppression on the first poll (unknown age fails open).
+        """
         if not isinstance(data, dict):
             return cls()
         return cls(
@@ -127,6 +190,11 @@ class BreakerState:
             news_strategy_active=bool(data.get("news_strategy_active", False)),
             news_deployed_session_key=str(
                 data.get("news_deployed_session_key", "") or ""),
+            signal_direction=str(data.get("signal_direction", "") or ""),
+            signal_severity=str(data.get("signal_severity", "") or ""),
+            signal_session_key=str(data.get("signal_session_key", "") or ""),
+            signal_suppressed_at=str(data.get("signal_suppressed_at", "") or ""),
+            notice_session_key=str(data.get("notice_session_key", "") or ""),
         )
 
 
@@ -188,6 +256,20 @@ def _msg(title: str, signal: NewsSignal, tail: str = "") -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _position_conflicts(direction: str, position_side: str) -> bool:
+    """Would a *direction* shock hurt a *position_side* holding?
+
+    Unknown direction or side is treated as conflicting — when in doubt,
+    the emergency exit stays an emergency exit.
+    """
+    side = (position_side or "").lower()
+    if direction == "bearish":
+        return side != "short"
+    if direction == "bullish":
+        return side != "long"
+    return True
+
+
 def plan_signal_actions(
     signal: NewsSignal | None,
     is_consumed: bool,
@@ -195,6 +277,10 @@ def plan_signal_actions(
     has_position: bool,
     state: BreakerState,
     in_replay: bool,
+    *,
+    suppress_scope: str = "both",
+    position_side: str = "",
+    session_key: str = "",
 ) -> BreakerDecision:
     """Plan the response to one circuit-breaker signal.
 
@@ -206,6 +292,19 @@ def plan_signal_actions(
         has_position: the simulated broker holds a position right now.
         state: current breaker state (read-only here).
         in_replay: history replay / reload window is in progress.
+        suppress_scope: ``news.suppress_scope`` — ``"both"`` (a risk_off
+            gates every leg, pre-direction behavior) or
+            ``"conflicting_leg"`` (a directional risk_off gates only the
+            leg it would hurt; see :meth:`BreakerState.gates_leg`).
+        position_side: ``"long"``/``"short"``/"" — under
+            ``conflicting_leg`` a directional risk_off flattens only a
+            CONFLICTING position (bearish flattens a long); a
+            same-direction position is left to its strategy's own exits,
+            whose pipeline keeps running because the leg is not gated.
+        session_key: the session (current, else next) the suppression is
+            stamped for — the expiry anchor
+            :func:`plan_suppression_maintenance` checks. A re-fired
+            risk_off refreshes the stamp.
 
     Returns an empty decision for a consumed or absent signal; otherwise
     a list that ALWAYS ends with ``MARK_CONSUMED``.
@@ -232,20 +331,35 @@ def plan_signal_actions(
         return BreakerDecision(acts)
 
     if action == "risk_off":
-        if has_position:
+        directional = (suppress_scope == "conflicting_leg"
+                       and signal.severity != "critical"
+                       and signal.direction in ("bearish", "bullish"))
+        keep_position = (has_position and directional
+                         and not _position_conflicts(signal.direction,
+                                                     position_side))
+        if has_position and not keep_position:
             acts.append(BreakerAction(
                 FLATTEN, arg=FLATTEN_TAG,
                 reason=f"news risk_off ({signal.source or 'n8n'})"))
         acts.append(BreakerAction(
             SUPPRESS, arg=SRC_SIGNAL,
-            reason=signal.reason or "news risk_off"))
+            reason=signal.reason or "news risk_off",
+            direction=signal.direction, severity=signal.severity,
+            session_key=session_key))
+        if keep_position:
+            tail = (f"同向持倉保留（{signal.direction}）same-direction "
+                    f"position kept; only the conflicting leg is gated")
+        elif has_position:
+            tail = "已平倉並暫停進場 flattened + entries suppressed"
+        else:
+            tail = "已暫停進場（無持倉）entries suppressed (flat)"
+        if directional and not has_position:
+            tail += (f"\n方向 Direction: `{signal.direction}` — "
+                     f"只擋衝突方向 gates the conflicting leg only")
         acts.append(BreakerAction(
             DISCORD, reason=_msg(
                 "🚨 **新聞斷路器 News circuit breaker** — 風險關閉 RISK OFF",
-                signal,
-                ("已平倉並暫停進場 flattened + entries suppressed"
-                 if has_position else
-                 "已暫停進場（無持倉）entries suppressed (flat)"))))
+                signal, tail)))
 
     elif action == "clear":
         acts.append(BreakerAction(
@@ -285,6 +399,86 @@ def plan_signal_actions(
                      if has_position else "已部署 deployed"))))
 
     acts.append(BreakerAction(MARK_CONSUMED, arg=sid))
+    return BreakerDecision(acts)
+
+
+def plan_suppression_maintenance(
+    state: BreakerState,
+    current_session_key: str,
+) -> BreakerDecision:
+    """Expire an unrefreshed signal suppression; remind while suppressed.
+
+    Two session-keyed jobs:
+
+    1. **Expiry (fail open).** A ``risk_off`` is information about the
+       session it fired in. The monitor re-fires while the breach
+       persists (each fire is a fresh ``signal_id``, so the ledger does
+       not swallow it), which re-stamps ``signal_session_key``; once the
+       session key has moved on without a refresh the suppression is
+       stale and is released. A suppression with no session key (carried
+       in from a pre-expiry ``session.json``) has unknown age and is
+       released immediately. Same rule the calendar gate already
+       follows — a forgotten n8n job must not park the bot forever — and
+       the mirror of the 900s freshness gate on *acting*: if relevance
+       decays for acting on a signal, it decays for staying suppressed
+       by one. (The 2026-08-18→20 incident: a latched risk_off idled a
+       bot for two days because no ``clear`` ever came.)
+    2. **Reminder.** While EITHER source is still suppressed, one
+       Discord line per session, so a silently idle bot is noticed in
+       hours, not discovered days later by accident.
+
+    The event source is never expired here — the calendar stamps and
+    clears it against its own schedule (and already fails open when
+    stale).
+
+    A blank *current_session_key* (no session resolvable — deep holiday
+    edge) holds everything: no expiry, no reminder. Conservative, and
+    the next resolvable poll catches up.
+    """
+    acts: list[BreakerAction] = []
+    signal_still_on = state.signal_suppressed
+
+    if signal_still_on and current_session_key:
+        legacy = not state.signal_session_key
+        moved = (not legacy
+                 and current_session_key != state.signal_session_key)
+        if legacy or moved:
+            why = ("legacy suppression with no expiry key (unknown age)"
+                   if legacy else
+                   f"session moved {state.signal_session_key} → "
+                   f"{current_session_key} without a fresh risk_off")
+            acts.append(BreakerAction(
+                UNSUPPRESS, arg=SRC_SIGNAL, reason=f"expired: {why}"))
+            acts.append(BreakerAction(
+                DISCORD, reason=(
+                    "⏲️ **新聞暫停到期 News suppression EXPIRED** — 自動解除 "
+                    "released (fail open)\n"
+                    f"原因 Was: {state.suppressed_reason or '(no reason)'}\n"
+                    f"到期 Expiry: {why}\n"
+                    "持續的風險會由監控重新觸發 an ongoing breach re-fires "
+                    "the monitor and re-suppresses")))
+            signal_still_on = False
+
+    if ((signal_still_on or state.event_suppressed)
+            and current_session_key
+            and state.notice_session_key != current_session_key):
+        srcs = []
+        if signal_still_on:
+            d = f", {state.signal_direction}" if state.signal_direction else ""
+            since = (f" since {state.signal_suppressed_at}"
+                     if state.signal_suppressed_at else "")
+            srcs.append(f"signal ({state.suppressed_reason or 'risk_off'}"
+                        f"{d}){since}")
+        if state.event_suppressed:
+            srcs.append(f"event ({state.event_name or 'scheduled event'})")
+        acts.append(BreakerAction(
+            DISCORD, reason=(
+                "⏸️ **進場仍暫停中 Entries still SUPPRESSED** — "
+                f"{current_session_key}\n"
+                f"來源 Source: {'; '.join(srcs)}\n"
+                "解除 To clear: `clear` 訊號 signal / 等到期 wait for expiry")))
+        acts.append(BreakerAction(STAMP_NOTICE, arg=current_session_key))
+
     return BreakerDecision(acts)
 
 
