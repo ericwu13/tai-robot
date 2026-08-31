@@ -73,8 +73,17 @@ HEALTHY_STATE = {
 
 
 def make_regime_bot(tmp_path, state, name="TMF00_bot"):
+    """A directory whose CURRENT deploy is a regime bot.
+
+    session.json's ``regime_mode`` is what separates a live regime bot
+    from a plain deploy that inherited a leftover regime_state.json — a
+    fixture without it would be graded as archaeology (everything
+    demoted to P3), so the regime assertions below would pass vacuously.
+    """
     bot = tmp_path / "live" / name
     write_json(bot / "regime_state.json", state)
+    write_json(bot / "session.json", {
+        "regime_mode": True, "strategy": "S", "trading_mode": "paper"})
     return bot
 
 
@@ -139,6 +148,7 @@ def test_regime_latched_news_suppression_is_p1(tmp_path):
 def test_regime_current_suppression_is_only_informational(tmp_path):
     bot = make_regime_bot(tmp_path, HEALTHY_STATE)
     write_json(bot / "session.json", {
+        "regime_mode": True,
         "news": {
             "signal_suppressed": True,
             "suppressed_reason": "risk_off: SOXX -2.6%",
@@ -193,8 +203,46 @@ def test_regime_corrupt_state_is_p1(tmp_path):
     bot = tmp_path / "live" / "TMF00_bot"
     bot.mkdir(parents=True)
     (bot / "regime_state.json").write_text("{not json", encoding="utf-8")
+    write_json(bot / "session.json", {"regime_mode": True})
     findings, _ = check_regime(NOW, str(tmp_path / "live"))
     assert any("corrupt" in m for m in messages(findings, "P1"))
+
+
+def test_regime_plain_deploy_with_leftover_state_is_only_p3(tmp_path):
+    """A LIVE plain-deploy bot redeployed over an old regime bot's
+    directory: regime_state.json is a leftover, so its stale
+    last_assessed is archaeology, not a missed classification."""
+    state = dict(HEALTHY_STATE, last_assessed="2026-08-07|NIGHT")
+    state.pop("key_format")
+    bot = make_regime_bot(tmp_path, state)
+    write_json(bot / "session.json", {          # plain deploy: no regime_mode
+        "strategy": "AI: BbandSmaShortV3", "trading_mode": "semi_auto",
+        "saved_at": "2026-08-25T05:55:00",
+    })
+    findings, _ = check_regime(NOW, str(tmp_path / "live"))
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+    assert not has_level(findings, "P2"), messages(findings, "P2")
+    assert any("[non-regime deploy]" in m for m in messages(findings, "P3")), \
+        messages(findings, "P3")
+
+
+def test_regime_stale_state_on_a_real_regime_deploy_is_still_p1(tmp_path):
+    """Regression guard for the demotion above: the SAME stale state on a
+    bot whose session.json says regime_mode must still raise P1."""
+    make_regime_bot(tmp_path, dict(HEALTHY_STATE, last_assessed="2026-08-07|NIGHT"))
+    findings, _ = check_regime(NOW, str(tmp_path / "live"))
+    assert any("classification missed" in m for m in messages(findings, "P1")), \
+        levels(findings)
+
+
+def test_regime_state_without_session_json_is_demoted(tmp_path):
+    """No session.json at all = nothing is deployed here now."""
+    bot = tmp_path / "live" / "TMF00_bot"
+    write_json(bot / "regime_state.json",
+               dict(HEALTHY_STATE, last_assessed="2026-08-07|NIGHT"))
+    findings, _ = check_regime(NOW, str(tmp_path / "live"))
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+    assert any("[non-regime deploy]" in m for m in messages(findings, "P3"))
 
 
 def test_regime_missing_session_pnl_is_p2(tmp_path):

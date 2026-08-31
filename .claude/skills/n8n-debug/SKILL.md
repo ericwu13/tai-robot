@@ -18,6 +18,21 @@ record. (The 2026-08-16 yaml incident: the full `ModuleNotFoundError`
 traceback sat in `execution_data` for 12 hours of half-hourly failures
 while the audit only read code and ran pytest in the dev shell.)
 
+## Rule zero-b — probe the upstream API before fixing around it
+
+When a bridge fix depends on an external feed's schedule or semantics,
+probe the endpoint's ACTUAL contract first (does it honor parameters?
+what exactly does it serve? when does it flip?), and treat the fix as
+unverified until one real cycle confirms it. (The 2026-08-25 W4 retry
+ladder was designed on the assumption that the TAIFEX OpenAPI lagged
+"hours" and honored a date — it takes no date parameter, serves exactly
+one dataset, and lags >12h; the first live night falsified the fix and
+it had to be redesigned as the walk-back.) Also compare live data
+magnitudes against every threshold in the decision path: a reading that
+permanently saturates a threshold (外資 net OI −80k vs a 5k "strong"
+band) means the threshold was calibrated for a different quantity
+(delta vs level), not that the signal is strong.
+
 ## The helper (tested — prefer it over ad-hoc queries)
 
 ```bash

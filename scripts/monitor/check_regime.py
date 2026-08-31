@@ -52,6 +52,23 @@ def _night_close_dt(open_date: str):
     return d.replace(hour=15, tzinfo=TZ_TPE) + timedelta(hours=14)
 
 
+def _is_regime_deploy(bot_dir) -> bool:
+    """True when the CURRENT deployment in *bot_dir* is a regime bot.
+
+    ``regime_state.json`` only proves a regime bot lived here once — a
+    plain LiveRunner redeployed into the same directory leaves the old
+    file untouched, and its frozen ``last_assessed`` then reads as a
+    missed classification.  ``session.json``'s ``regime_mode`` is the
+    deployment's own marker: ``RegimeSwitchingRunner._auto_save_session``
+    writes it unconditionally (and is its only writer), a running bot
+    always has a session.json, and ``check_deploy`` gates on the same
+    key.  Missing/corrupt session.json therefore means "not a regime
+    deploy".
+    """
+    data = read_json(os.path.join(bot_dir, "session.json"))
+    return bool(data.get("regime_mode")) if isinstance(data, dict) else False
+
+
 def _was_running(bot_dir, night) -> bool:
     """True when the bot showed any activity after ``night`` opened.
 
@@ -319,15 +336,21 @@ def check_regime(now: datetime, base_dir: str):
     for bot_dir in dirs:
         name = bot_name(bot_dir)
         lines.append(f"--- {name}")
-        # Findings are collected per bot so a retired directory (no
-        # activity since the last night opened) can be demoted wholesale:
-        # a stopped bot cannot classify, apply, or expire anything, so
-        # its frozen state is archaeology, not an incident.
+        # Findings are collected per bot so a directory whose regime
+        # files are archaeology rather than an incident can be demoted
+        # wholesale: a stopped bot cannot classify, apply, or expire
+        # anything, and neither can a directory now running a plain
+        # (non-regime) deploy.
         active = _was_running(bot_dir, last_completed)
+        regime_deploy = _is_regime_deploy(bot_dir)
         if not active:
             lines.append("  (stopped/retired — no activity since "
                          f"{last_completed.key if last_completed else '?'} "
                          "opened; findings demoted to P3)")
+        if not regime_deploy:
+            lines.append("  (current deployment is not a regime bot — regime "
+                         "files are leftovers from an earlier deployment; "
+                         "findings demoted to P3)")
         findings_before = len(findings)
         state = read_json(os.path.join(bot_dir, "regime_state.json"))
         if not isinstance(state, dict):
@@ -342,12 +365,14 @@ def check_regime(now: datetime, base_dir: str):
         _check_history(now, bot_dir, name, lines, findings)
         _check_news_block(now, bot_dir, name, sl, lines, findings)
         _check_decisions(now, bot_dir, name, lines, findings)
-        if not active:
+        tags = ("[stopped bot] " if not active else "") \
+            + ("[non-regime deploy] " if not regime_deploy else "")
+        if tags:
             for i in range(findings_before, len(findings)):
                 f = findings[i]
                 if f.level != "P3":
                     findings[i] = Finding(
-                        "P3", f.area, f"[stopped bot] {f.message}", f.path)
+                        "P3", f.area, f"{tags}{f.message}", f.path)
         lines.append("")
 
     return findings, lines
