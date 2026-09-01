@@ -271,45 +271,22 @@ def _check_news_block(now, bot_dir, name, sl, lines, findings):
 
 
 def _check_decisions(now, bot_dir, name, lines, findings):
-    path = os.path.join(bot_dir, "decisions.csv")
-    if not os.path.isfile(path):
-        return
-    cutoff = now - timedelta(hours=24)
-    counts = {"NEWS_SUPPRESSED": 0, "REAL_ORDER_TIMEOUT": 0}
-    try:
-        with open(path, encoding="utf-8", errors="replace", newline="") as f:
-            for row in csv.reader(f):
-                if len(row) < 4:
-                    continue
-                action = (row[3] or "").strip()
-                if action not in counts:
-                    continue
-                # Column 0 is stamped with datetime.now() — the MACHINE
-                # clock (UTC-7 here), not TPE. Column 1 (bar_dt) is the
-                # bar open in TPE, which is also the semantically right
-                # base for "bars swallowed in the last 24h".
-                try:
-                    ts = datetime.strptime(row[1].strip(), "%Y-%m-%d %H:%M")
-                except ValueError:
-                    continue
-                if ts.replace(tzinfo=TZ_TPE) >= cutoff:
-                    counts[action] += 1
-    except OSError:
-        return
+    """NEWS_SUPPRESSED only — news gating exists solely on regime deploys.
 
-    lines.append(f"  decisions (24h): NEWS_SUPPRESSED={counts['NEWS_SUPPRESSED']} "
-                 f"REAL_ORDER_TIMEOUT={counts['REAL_ORDER_TIMEOUT']}")
-    if counts["NEWS_SUPPRESSED"] > NEWS_SUPPRESSED_BUDGET:
+    REAL_ORDER_TIMEOUT is deployment-agnostic (any semi_auto bot) and is
+    scanned by check_bots via ``count_decisions``, so it keeps a P1/P2
+    path even for plain deploys this module would demote.
+    """
+    from scripts.monitor.check_bots import count_decisions
+    count = count_decisions(now, bot_dir, "NEWS_SUPPRESSED")
+    if count is None:
+        return
+    lines.append(f"  decisions (24h): NEWS_SUPPRESSED={count}")
+    if count > NEWS_SUPPRESSED_BUDGET:
         findings.append(Finding(
             "P2", "regime",
-            f"{name}: news gate swallowed {counts['NEWS_SUPPRESSED']} bars in 24h",
-            path))
-    if counts["REAL_ORDER_TIMEOUT"]:
-        findings.append(Finding(
-            "P2", "regime",
-            f"{name}: {counts['REAL_ORDER_TIMEOUT']} REAL_ORDER_TIMEOUT rows in "
-            f"24h — orders sent without a fill confirmation",
-            path))
+            f"{name}: news gate swallowed {count} bars in 24h",
+            os.path.join(bot_dir, "decisions.csv")))
 
 
 def check_regime(now: datetime, base_dir: str):

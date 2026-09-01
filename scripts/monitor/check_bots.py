@@ -23,12 +23,14 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from datetime import datetime  # noqa: E402
+import csv  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
 
 from scripts.monitor.common import (  # noqa: E402
-    Finding, age_minutes, bot_name, default_base_dir, discover_bot_dirs,
-    guard_stdout, last_activity, last_tpe_timestamp, newest_debug_logs,
-    pid_alive, print_report, read_json, read_lock_pid, tail_text,
+    TZ_TPE, Finding, age_minutes, bot_name, default_base_dir,
+    discover_bot_dirs, guard_stdout, last_activity, last_tpe_timestamp,
+    newest_debug_logs, pid_alive, print_report, read_json, read_lock_pid,
+    tail_text,
 )
 
 # A live bot writes a status/tick line well inside this window.
@@ -40,6 +42,57 @@ STALE_LOG_MINUTES = 10.0
 # incident when the bot was recently alive — otherwise it is archaeology,
 # and grading it P1 would pin the daily verdict at RED forever.
 RECENT_CRASH_DAYS = 3.0
+
+
+def count_decisions(now: datetime, bot_dir: str, action: str):
+    """Rows in decisions.csv with *action* whose bar_dt is inside 24h.
+
+    Returns None when there is no readable decisions.csv.  Keyed on
+    column 1 (bar_dt, TPE) — column 0 is stamped with ``datetime.now()``,
+    the MACHINE clock (UTC-7 on this box), and reading it as TPE shifts
+    the window by 15h.  Shared with check_regime's NEWS_SUPPRESSED scan.
+    """
+    path = os.path.join(bot_dir, "decisions.csv")
+    if not os.path.isfile(path):
+        return None
+    cutoff = now - timedelta(hours=24)
+    count = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            for row in csv.reader(f):
+                if len(row) < 4 or (row[3] or "").strip() != action:
+                    continue
+                try:
+                    ts = datetime.strptime(row[1].strip(), "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+                if ts.replace(tzinfo=TZ_TPE) >= cutoff:
+                    count += 1
+    except OSError:
+        return None
+    return count
+
+
+def _check_order_timeouts(now, bot_dir, name, lines, findings) -> None:
+    """REAL_ORDER_TIMEOUT lives here, not in check_regime: it happens on
+    ANY semi_auto deployment (the real-order confirm dialog auto-skips
+    after 10s and the signal executes paper-only — the order is never
+    sent; see run_backtest._dismiss_order_dialog and the trade-source
+    downgrade in test_trade_source_and_hotswap).  check_regime demotes
+    every finding for non-regime deploys, which silenced this signal for
+    plain bots.
+    """
+    timeouts = count_decisions(now, bot_dir, "REAL_ORDER_TIMEOUT")
+    if not timeouts:
+        return
+    lines.append(f"  order timeouts (24h): {timeouts}")
+    findings.append(Finding(
+        "P2", "bots",
+        f"{name}: real-order confirm dialog timed out {timeouts}x in 24h "
+        f"(semi_auto auto-skip after 10s) — those signals ran PAPER-only, "
+        f"so the real account diverges from the sim; attend the dialog or "
+        f"switch the bot to auto",
+        os.path.join(bot_dir, "decisions.csv")))
 
 
 def _session_now(now: datetime):
@@ -171,6 +224,8 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
                     f"position {side} x{pos} | trades {len(broker.get('trades') or [])}")
         else:
             lines.append("  session: no session.json")
+
+        _check_order_timeouts(now, bot_dir, name, lines, findings)
 
     lines.append("")
     _build_info(_REPO, lines, findings)

@@ -345,6 +345,54 @@ def test_bots_unparsable_lock_is_p2(tmp_path):
     assert any("unparsable lock" in m for m in messages(findings, "P2"))
 
 
+def _timeout_rows(bar_dts):
+    rows = ["datetime,bar_dt,strategy,action,side,tag,price,reason"]
+    for bd in bar_dts:
+        rows.append(f"2026-08-24 14:55:00,{bd},S,REAL_ORDER_TIMEOUT,,,0,timeout 10s")
+    return "\n".join(rows)
+
+
+def test_bots_recent_order_timeouts_are_p2_even_on_plain_deploys(tmp_path):
+    """REAL_ORDER_TIMEOUT = the semi_auto confirm dialog auto-skipped after
+    10s and the signal ran PAPER-only (the order was never sent — see
+    run_backtest._dismiss_order_dialog and the trade-source downgrade in
+    test_trade_source_and_hotswap).  It is deployment-agnostic, so it must
+    live in check_bots: check_regime demotes every finding for plain
+    deploys (the TMF00_0422 case) and no longer scans it at all."""
+    bot = make_live_bot(tmp_path)  # plain deploy: session has no regime_mode
+    recent = (NOW - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
+    (bot / "decisions.csv").write_text(_timeout_rows([recent, recent]),
+                                       encoding="utf-8")
+    findings, _ = check_bots(NOW, str(tmp_path / "live"),
+                             pid_alive_fn=lambda pid: True)
+    assert any("timed out 2x" in m and "PAPER-only" in m
+               for m in messages(findings, "P2")), messages(findings)
+
+
+def test_bots_old_order_timeouts_are_ignored(tmp_path):
+    """Only the last 24h (keyed on bar_dt, TPE) counts."""
+    bot = make_live_bot(tmp_path)
+    old = (NOW - timedelta(days=4)).strftime("%Y-%m-%d %H:%M")
+    (bot / "decisions.csv").write_text(_timeout_rows([old, old]),
+                                       encoding="utf-8")
+    findings, _ = check_bots(NOW, str(tmp_path / "live"),
+                             pid_alive_fn=lambda pid: True)
+    assert not any("timed out" in m for m in messages(findings, "P2")), \
+        messages(findings, "P2")
+
+
+def test_regime_no_longer_flags_order_timeouts(tmp_path):
+    """Moved to check_bots — check_regime must not double-report it, and
+    its NEWS_SUPPRESSED scan must be unaffected."""
+    bot = make_regime_bot(tmp_path, HEALTHY_STATE)
+    recent = (NOW - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
+    (bot / "decisions.csv").write_text(_timeout_rows([recent]),
+                                       encoding="utf-8")
+    findings, _ = check_regime(NOW, str(tmp_path / "live"))
+    assert not any("REAL_ORDER_TIMEOUT" in m or "timed out" in m
+                   for m in messages(findings)), messages(findings)
+
+
 def test_bots_corrupt_session_json_is_p2(tmp_path):
     bot = make_live_bot(tmp_path, pid=4242)
     (bot / "session.json").write_text("{broken", encoding="utf-8")
