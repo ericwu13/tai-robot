@@ -1,13 +1,27 @@
 """Classify incoming COM ticks: transition signal, drop, or keep.
 
 Extracted from ``run_backtest.py._on_com_tick`` for unit-testability.
-Two independent concerns handled here:
 
-1. **Issue #50 defense** — COM sometimes mis-labels history ticks as
-   ``is_history=False``.  We rely on wall-clock age (> staleness
-   threshold) instead of trusting the flag alone.
+**The ``is_history`` flag is untrusted in BOTH directions.** Wall-clock
+age is the single source of truth for whether a tick is replay or live:
 
-2. **Bot 271 fix** — after the one-way ``live_history_done`` flag
+1. **Issue #50** — COM sometimes mis-labels *history* ticks as
+   ``is_history=False``.  Hazard: the strategy un-suppresses on the
+   first replay tick and trades on hours-old data.
+
+2. **Issue #105** — the mirror image: COM delivered an entire
+   post-reconnect stream via ``OnNotifyHistoryTicksLONG``
+   (``is_history=True``) and never switched to the live callback.
+   Hazard: ``suppress_strategy`` / ``_is_reloading`` latch True
+   forever and the bot becomes a zombie (bars flow, strategy never
+   runs) until restart.  Guarded by the same age rule: a *fresh* tick
+   transitions regardless of the flag.
+
+   Trade-off: the final ≤120s of a legitimate replay now transitions
+   slightly early, on essentially-current data.  Benign, and vastly
+   better than a permanently suppressed bot.
+
+3. **Bot 271 fix** — after the one-way ``live_history_done`` flag
    flips to True, any stale tick arriving later is a replay from a
    resubscribe (e.g., watchdog forced resubscribe after an overnight
    gap). Without dropping these, BarBuilder creates fake "live" bars
@@ -40,7 +54,8 @@ def classify_tick(
         tick_age_seconds: seconds between wall-clock now and tick.dt
             (positive = tick is in the past).
         is_history_flag: the ``is_history`` param from the COM callback.
-            Not fully trusted — see issue #50.
+            NOT trusted in either direction — see issues #50 and #105.
+            Accepted for signature stability / caller diagnostics only.
         live_history_done: session-level flag; True means a fresh tick
             has already transitioned the session to live mode.
         staleness_threshold: ticks older than this are "stale".
@@ -51,15 +66,16 @@ def classify_tick(
         ``"keep"``       — process normally (live tick, or pre-transition
                            history tick that builds bars silently).
     """
-    if not is_history_flag and not live_history_done:
-        # Pre-transition phase: fresh tick → transition; stale → keep
-        # processing silently (BarBuilder still builds bars for warmup).
+    if not live_history_done:
+        # Pre-transition phase: age decides, not the flag (issue #105).
+        # Fresh tick → transition; stale → keep processing silently
+        # (BarBuilder still builds bars for warmup).
         if tick_age_seconds <= staleness_threshold:
             return "transition"
         return "keep"
 
     # Post-transition: drop stale replay ticks to prevent contamination.
-    if live_history_done and tick_age_seconds > staleness_threshold:
+    if tick_age_seconds > staleness_threshold:
         return "drop"
 
     return "keep"

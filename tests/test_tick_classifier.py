@@ -1,12 +1,19 @@
 """Tests for tick classification: history→live transition + stale-tick drop.
 
-Covers the two bugs these tests are designed to prevent:
+Covers the bugs these tests are designed to prevent:
 - Issue #50: COM mis-labels history ticks as is_history=False, causing
   suppress_strategy to clear on a stale tick and the strategy to trade
   on hours-old data.
+- Issue #105: the mirror image — COM delivered the whole post-reconnect
+  live stream via OnNotifyHistoryTicksLONG (is_history=True) and never
+  switched to the live callback. The transition never fired and the bot
+  ran suppressed all session (bars flowed, strategy never traded).
 - Bot 271: after watchdog resubscribe, COM replays yesterday's ticks
   with the transition flag already flipped — without per-tick staleness
   drop, those stale ticks build fake "live" bars that feed the strategy.
+
+Contract: tick AGE is the single source of truth in both directions;
+the is_history flag never decides anything on its own.
 """
 
 from __future__ import annotations
@@ -47,29 +54,38 @@ class TestInitialPhase:
         )
         assert verdict == "keep"
 
-    def test_recent_history_flag_tick_kept(self):
-        """Even fresh is_history=True tick stays in keep (no transition)."""
+    def test_fresh_history_flag_tick_transitions(self):
+        """Issue #105: a FRESH tick must transition even when COM flags it
+        is_history=True.
+
+        This assertion previously read ``== "keep"`` — it pinned the bug.
+        COM delivered every post-reconnect tick through
+        OnNotifyHistoryTicksLONG, so under the old rule no tick could ever
+        transition and suppress_strategy latched True for the whole session.
+        """
         verdict = classify_tick(
             tick_age_seconds=5.0,
             is_history_flag=True,
             live_history_done=False,
         )
-        assert verdict == "keep"
+        assert verdict == "transition"
 
-    def test_boundary_at_threshold(self):
-        """Exactly at threshold counts as fresh (uses <=)."""
+    @pytest.mark.parametrize("is_history_flag", [True, False])
+    def test_boundary_at_threshold(self, is_history_flag):
+        """Exactly at threshold counts as fresh (uses <=), either flag."""
         verdict = classify_tick(
             tick_age_seconds=float(HISTORY_STALENESS_SECONDS),
-            is_history_flag=False,
+            is_history_flag=is_history_flag,
             live_history_done=False,
         )
         assert verdict == "transition"
 
-    def test_just_over_threshold(self):
-        """Just above threshold is stale."""
+    @pytest.mark.parametrize("is_history_flag", [True, False])
+    def test_just_over_threshold(self, is_history_flag):
+        """Just above threshold is stale → keep, whatever the flag says."""
         verdict = classify_tick(
             tick_age_seconds=float(HISTORY_STALENESS_SECONDS + 1),
-            is_history_flag=False,
+            is_history_flag=is_history_flag,
             live_history_done=False,
         )
         assert verdict == "keep"
@@ -177,12 +193,43 @@ class TestZombieScenarios:
         assert verdict == "keep"  # bars build; strategy stays suppressed
 
     def test_initial_deploy_midsession_transitions_immediately(self):
-        """Normal deploy during market hours: COM sends 1-2s of replay
-        then the first fresh tick, which triggers transition."""
-        # Short history
-        assert classify_tick(1.0, True, False) == "keep"
-        # First fresh tick
+        """Normal deploy during market hours: COM sends replay then live
+        ticks. Any tick already inside the freshness window transitions.
+
+        The first assertion used to expect "keep" (it pinned the issue #105
+        bug). A 1-second-old tick is current data by any measure — the
+        documented trade-off is that the tail end of a legitimate replay
+        transitions slightly early, on essentially-current prices."""
+        # Tail of the replay burst, still flagged history but current
+        assert classify_tick(1.0, True, False) == "transition"
+        # A fresh tick on the live callback transitions too
         assert classify_tick(0.5, False, False) == "transition"
+
+    def test_issue_105_all_ticks_flagged_history(self):
+        """Real scenario from TMF00 DynamicExitPullbackStrategyV2 on
+        2026-09-01 (v2.17.21):
+
+        - Quote reconnect at 08:47:52 → _resubscribe_ticks resets
+          live_history_done=False, suppress_strategy=True
+        - First tick arrives 0.84s later — but COM routes the ENTIRE
+          stream (24,666 ticks, ~20/s) through OnNotifyHistoryTicksLONG
+        - Old rule: is_history=True → "keep" forever, no transition ever.
+          The bot ran suppressed all session; the 600s safety valve cleared
+          only _is_reloading, leaving suppress_strategy latched.
+        """
+        # The very first post-reconnect tick, 0.84s old but flagged history
+        assert classify_tick(0.84, True, False) == "transition"
+
+        # Everything after it is a normal fresh tick in live mode
+        assert classify_tick(0.9, True, True) == "keep"
+        assert classify_tick(1.2, False, True) == "keep"
+
+    def test_stale_only_feed_stays_suppressed(self):
+        """Counterpart to #105: when every tick really IS old (dead feed /
+        pure replay), no transition fires. The 600s valve then clears only
+        the reload window — keeping the strategy suppressed is correct."""
+        for flag in (True, False):
+            assert classify_tick(4000.0, flag, False) == "keep"
 
     def test_custom_threshold(self):
         """Threshold is overridable for tests."""
