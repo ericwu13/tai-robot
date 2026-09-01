@@ -592,10 +592,18 @@ class LiveRunner:
             if (self._reload_started_at is not None
                     and time.monotonic() - self._reload_started_at
                     > self.RELOAD_TIMEOUT_SECONDS):
+                # Issue #105: this valve clears ONLY the reload window, never
+                # suppress_strategy. With age-based transition in both
+                # directions (see tick_classifier), reaching this timeout
+                # means the feed is dead or every tick is stale — in which
+                # case keeping the strategy suppressed is the correct
+                # outcome, not a bug to paper over.
                 self._emit(
                     "on_status",
                     "[RESUME] _is_reloading stuck > 10 min — auto-clearing "
-                    "reload window")
+                    "reload window (mode overrides re-enabled; strategy stays "
+                    "SUPPRESSED until a fresh tick arrives — check the quote "
+                    "feed)")
                 self._is_reloading = False
                 # fall through and process the override normally below
             else:

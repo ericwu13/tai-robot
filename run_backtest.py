@@ -6813,8 +6813,25 @@ class BacktestApp:
             return
 
         self._live_tick_count += 1
-        if not is_history or not self._live_history_done:
-            # Update watchdog: live ticks always, history ticks only during replay
+
+        # Convert SK date/time integers to datetime FIRST — the timestamp
+        # drives both the watchdog freshness gate below and the staleness
+        # classification further down (issues #50 / #105).
+        try:
+            dt_aware = combine_sk_datetime(date, time_hms, time_millismicros)
+            dt = dt_aware.replace(tzinfo=None) if dt_aware.tzinfo else dt_aware
+        except Exception:
+            return
+        now_naive = _taipei_now().replace(tzinfo=None)
+        tick_age = (now_naive - dt).total_seconds()
+
+        if (not is_history or not self._live_history_done
+                or tick_age <= HISTORY_STALENESS_SECONDS):
+            # Update watchdog: live ticks always, history ticks during replay,
+            # and any FRESH tick regardless of the flag. Issue #105: COM can
+            # deliver the entire live stream through OnNotifyHistoryTicksLONG,
+            # so a flag-only gate starves the watchdog while ticks pour in and
+            # forces a pointless resubscribe every 5 minutes.
             self._tick_watchdog.on_tick()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
@@ -6834,28 +6851,14 @@ class BacktestApp:
                     f"[TICKS] First tick received after resubscription "
                     f"({latency:.2f}s since RequestTicks)")
 
-        # Convert SK date/time integers to datetime FIRST — we need the
-        # timestamp for the staleness check below (issue #50 fix).
-        try:
-            dt_aware = combine_sk_datetime(date, time_hms, time_millismicros)
-            dt = dt_aware.replace(tzinfo=None) if dt_aware.tzinfo else dt_aware
-        except Exception:
-            return
-
         # Detect transition from history to live ticks.
-        # Issue #50: COM sometimes sends historical ticks via
-        # OnNotifyTicksLONG (is_history=False) instead of
-        # OnNotifyHistoryTicksLONG (is_history=True). If we blindly
-        # trust the flag, suppress_strategy gets cleared on the FIRST
-        # tick of the replay and the strategy runs on hours-old data,
-        # entering real trades at stale prices.
-        #
-        # Defense: also check whether the tick's datetime is "stale"
-        # (> 2 minutes behind wall-clock). If so, treat as history
-        # regardless of the is_history flag.
-        now_naive = _taipei_now().replace(tzinfo=None)
-        tick_age = (now_naive - dt).total_seconds()
-
+        # The is_history flag is untrusted in BOTH directions; tick age
+        # decides. Issue #50: COM sometimes sends historical ticks via
+        # OnNotifyTicksLONG (is_history=False) — trusting the flag clears
+        # suppress_strategy on the FIRST replay tick and the strategy trades
+        # on hours-old data. Issue #105 is the mirror: COM sent the whole
+        # live stream via OnNotifyHistoryTicksLONG (is_history=True), so the
+        # transition never fired and the bot sat suppressed forever.
         verdict = classify_tick(
             tick_age_seconds=tick_age,
             is_history_flag=is_history,
