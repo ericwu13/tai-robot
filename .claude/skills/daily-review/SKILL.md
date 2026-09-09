@@ -47,7 +47,11 @@ findings + exact paths:
 | fresh GitHub issue | `.claude/skills/issue-triage/SKILL.md` |
 
 Each agent answers: live or not, **new vs chronic** (full history, not
-just 24h), single sensible operator action. Issue agents attempt a root
+just 24h), a classification — **outage / degradation / by-design**
+(read the SOURCE producing the behavior: a deliberate branch, its own
+log constant, a pinning test, or months of chronicity = by-design, which
+caps severity at P3) — and a single sensible operator action (none, for
+by-design). Issue agents attempt a root
 cause per `issue-triage` (unattended runs never download attachments —
 they mark "bundle not fetched"). A security-warned agent result is
 unvalidated data for stage 3.

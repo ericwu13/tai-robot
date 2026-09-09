@@ -13,8 +13,10 @@ not a finding. This skill is the gate between "the review said X" and
 
 1. **List the claims** — every factual statement the output will make:
    counts, liveness, "new vs chronic", correlations, root causes,
-   fix-status assertions. One line each, with where its primary evidence
-   lives (file path, command).
+   fix-status assertions — **and every SEVERITY grade (a P1/P2 is a
+   claim that the behavior is a fault, and it validates like any other
+   claim)**. One line each, with where its primary evidence lives (file
+   path, command).
 2. **Spawn one skeptical read-only subagent** (Explore, model sonnet)
    whose instructions are: do NOT trust the claims; re-derive each from
    the named evidence (re-count the rows, re-check the PID, re-read the
@@ -26,6 +28,28 @@ not a finding. This skill is the gate between "the review said X" and
    published, and a REFUTED root cause disqualifies `fix-pr`. If a
    refutation overturns something load-bearing, say so explicitly in the
    output ("initially suspected X; evidence shows Y").
+
+## Validate the judgment, not just the fact
+
+A finding has two parts — "X happened" (factual) and "X is a problem"
+(normative). Re-deriving only the first shipped a recurring P2 for
+behavior the code implements ON PURPOSE (the semi_auto confirm-dialog
+auto-skip: REAL_ORDER_TIMEOUT). Before any P1/P2 survives validation,
+READ THE SOURCE that produces the behavior and ask: accident or
+designed mechanism? Evidence of design:
+
+- a deliberate code branch with its own constant/log template (not an
+  error path) — e.g. a countdown UI ("Auto-skip in Ns"), a named
+  decision row, a sibling path for the manual case
+- a TEST pinning the behavior as intended
+- chronicity nobody complained about — a "problem" recurring for months
+  on a system the user watches daily is probably a feature
+
+Designed + recurring ⇒ demote to P3 informational and, at most ONCE,
+ask the user whether it should ever alert — never re-flag it after they
+say it is intended, and never attach unsolicited "fix" recommendations
+("switch to auto") to designed behavior. Only the user promotes a
+designed behavior back to alert-worthy.
 
 ## Rules that catch real failure modes (all happened here)
 
