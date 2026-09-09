@@ -46,6 +46,43 @@ def _calls(node: ast.AST) -> list[str]:
     ]
 
 
+def _plain_calls(node: ast.AST) -> list[str]:
+    """Names of every bare-function call under ``node`` (``foo(...)``)."""
+    return [
+        n.func.id for n in ast.walk(node)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    ]
+
+
+def _worker_outer_handler() -> ast.ExceptHandler:
+    """The pipeline worker's outermost ``except Exception as e`` handler.
+
+    Identified by the try whose body runs the PLAN phase
+    (``self._chat_client.send_message(...)``) — that is the try that wraps
+    the whole pipeline.
+    """
+    src = textwrap.dedent(
+        inspect.getsource(rb.BacktestApp._start_evolution_pipeline))
+    tree = ast.parse(src)
+    workers = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_worker"
+    ]
+    assert len(workers) == 1, "expected exactly one _worker() in the pipeline"
+    tries = [
+        n for n in workers[0].body
+        if isinstance(n, ast.Try) and "send_message" in _calls(n)
+    ]
+    assert len(tries) == 1, (
+        "expected exactly one top-level try wrapping the plan phase")
+    handlers = [
+        h for h in tries[0].handlers
+        if isinstance(h.type, ast.Name) and h.type.id == "Exception"
+    ]
+    assert len(handlers) == 1, "expected one `except Exception` on that try"
+    return handlers[0]
+
+
 class TestCodegenLoopSurvivesApiFailure:
 
     def test_one_shot_is_inside_a_try_in_the_loop(self):
@@ -106,3 +143,57 @@ class TestCodegenLoopSurvivesApiFailure:
             for h in s.handlers for n in ast.walk(h) if isinstance(n, ast.Name)
         }
         assert {"CodeValidationError", "CodeExecutionError"} <= names
+
+
+class TestOuterFailureNotifiesDiscord:
+    """issue #108 (review extension) — the pipeline's outermost handler used
+    to log + show a chat error and nothing else, so a plan-phase failure on
+    the weekly auto-run died Discord-silent: exactly the symptom reported.
+    Every other EVO failure branch already notifies, guarded by ``auto_run``
+    so manual runs stay quiet.
+    """
+
+    def test_outer_handler_notifies_discord(self):
+        handler = _worker_outer_handler()
+        assert "_notify_discord" in _plain_calls(handler), (
+            "the outer `except Exception` must notify Discord — otherwise a "
+            "plan-phase failure kills the weekly evolution run silently")
+
+    def test_discord_notice_is_guarded_by_auto_run(self):
+        """Manual runs stay Discord-silent, like the no_change / EVO FAIL /
+        insufficient-data branches."""
+        handler = _worker_outer_handler()
+        guarded = [
+            node for node in ast.walk(handler)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name) and node.test.id == "auto_run"
+            and "_notify_discord" in _plain_calls(ast.Module(
+                body=node.body, type_ignores=[]))
+        ]
+        assert guarded, (
+            "the Discord notice must sit under `if auto_run:` so only the "
+            "weekly auto-run reports outer failures")
+
+    def test_existing_log_and_ui_error_kept(self):
+        """The notification is additive — the log line and the chat-error
+        callback must both survive."""
+        handler = _worker_outer_handler()
+        assert "_log" in _plain_calls(handler)
+        assert "ui" in _plain_calls(handler)
+        assert "_on_chat_error" in {
+            n.attr for n in ast.walk(handler) if isinstance(n, ast.Attribute)
+        }
+
+    def test_message_built_inside_the_handler(self):
+        """Python 3.13 deletes the exception variable when the handler exits,
+        so the message must be built eagerly, never inside a closure that
+        reads ``e`` later (CLAUDE.md gotcha)."""
+        handler = _worker_outer_handler()
+        lambdas = [n for n in ast.walk(handler) if isinstance(n, ast.Lambda)]
+        for lam in lambdas:
+            free = {n.id for n in ast.walk(lam.body) if isinstance(n, ast.Name)}
+            bound = {a.arg for a in lam.args.args} | {
+                a.arg for a in lam.args.kwonlyargs}
+            assert handler.name not in (free - bound), (
+                f"lambda closes over the exception variable "
+                f"{handler.name!r}; Python 3.13 deletes it after the handler")

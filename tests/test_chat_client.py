@@ -118,7 +118,10 @@ class TestAnthropicSendMessage:
         client._client.post.return_value = _anthropic_error("rate limit", 429)
 
         with pytest.raises(RuntimeError, match="429"):
-            client.send_message("test")
+            # 429 is transient — retried and exhausted (issue #108); the
+            # sleep patch keeps the suite fast.
+            with patch("src.ai.chat_client.time.sleep"):
+                client.send_message("test")
 
         assert len(client.conversation) == 0
 
@@ -247,7 +250,10 @@ class TestGoogleSendMessage:
         client._client.post.return_value = _google_error("quota exceeded", 429)
 
         with pytest.raises(RuntimeError, match="429"):
-            client.send_message("test")
+            # 429 is transient — retried and exhausted (issue #108); the
+            # sleep patch keeps the suite fast.
+            with patch("src.ai.chat_client.time.sleep"):
+                client.send_message("test")
 
         assert len(client.conversation) == 0
 
@@ -813,6 +819,120 @@ class TestTransientRetry:
         assert "plan text" in out
         urls = [c[0][0] for c in client._client.post.call_args_list]
         assert client._client.post.call_count == 3
+        assert GOOGLE_MODEL_ULTRA in urls[0]
+        assert GOOGLE_MODEL_PRO in urls[1] and GOOGLE_MODEL_ULTRA not in urls[1]
+        assert GOOGLE_MODEL_PRO in urls[2] and GOOGLE_MODEL_ULTRA not in urls[2]
+
+
+class TestTransientRetrySendMessage:
+    """issue #108 (review extension) — ``send_message`` drives the evolution
+    PLAN phase, not just chat.  Before this it posted directly and raised on
+    the first non-200, so a 503 mid-outage killed the weekly run before
+    codegen ever ran.  Both provider send paths now share
+    ``_post_with_retry`` with their ``one_shot`` siblings.
+    """
+
+    def _google(self) -> ChatClient:
+        return ChatClient("goog-test", provider=PROVIDER_GOOGLE,
+                          model=GOOGLE_MODEL_PRO)
+
+    def _anthropic(self) -> ChatClient:
+        return ChatClient("sk-test", provider=PROVIDER_ANTHROPIC)
+
+    # ── recovery ──
+
+    def test_google_503_then_success(self):
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _google_error("This model is currently experiencing high demand", 503),
+            _google_error("high demand", 503),
+            _google_response("evolution plan"),
+        ]
+        with patch("src.ai.chat_client.time.sleep") as sleep:
+            out = client.send_message("analyze", call_site="bot_evolution")
+        assert "evolution plan" in out
+        assert client._client.post.call_count == 3
+        assert [c[0][0] for c in sleep.call_args_list] == [1.0, 2.0]
+        # A recovered call still records the exchange exactly once.
+        assert len(client.conversation) == 2
+        assert client.conversation[-1]["content"] == "evolution plan"
+
+    def test_anthropic_503_then_success(self):
+        client = self._anthropic()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _anthropic_error("overloaded", 503),
+            _anthropic_response("evolution plan"),
+        ]
+        with patch("src.ai.chat_client.time.sleep"):
+            out = client.send_message("analyze", call_site="bot_evolution")
+        assert "evolution plan" in out
+        assert client._client.post.call_count == 2
+        assert len(client.conversation) == 2
+
+    # ── bounded give-up ──
+
+    def test_google_gives_up_after_bounded_attempts(self):
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_error("high demand", 503)
+        with patch("src.ai.chat_client.time.sleep"):
+            with pytest.raises(RuntimeError, match="503"):
+                client.send_message("analyze")
+        assert client._client.post.call_count == _RETRY_ATTEMPTS
+        # Failure still rolls the user message back off the history.
+        assert client.conversation == []
+
+    def test_anthropic_gives_up_after_bounded_attempts(self):
+        client = self._anthropic()
+        client._client = MagicMock()
+        client._client.post.return_value = _anthropic_error("overloaded", 502)
+        with patch("src.ai.chat_client.time.sleep"):
+            with pytest.raises(RuntimeError, match="502"):
+                client.send_message("analyze")
+        assert client._client.post.call_count == _RETRY_ATTEMPTS
+        assert client.conversation == []
+
+    # ── permanent errors still fail fast ──
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    def test_google_permanent_error_fails_fast(self, status):
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_error("nope", status)
+        with pytest.raises(RuntimeError, match=str(status)):
+            client.send_message("analyze")
+        assert client._client.post.call_count == 1
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    def test_anthropic_permanent_error_fails_fast(self, status):
+        client = self._anthropic()
+        client._client = MagicMock()
+        client._client.post.return_value = _anthropic_error("nope", status)
+        with pytest.raises(RuntimeError, match=str(status)):
+            client.send_message("analyze")
+        assert client._client.post.call_count == 1
+
+    # ── the 404 stale-model fallback must survive the retry wrapper ──
+
+    def test_retry_after_404_fallback_stays_on_fallback_model(self):
+        """Same box idiom as ``_one_shot_google``: once the 404 fallback has
+        switched models, a transient error on the fallback must retry the
+        FALLBACK, never resurrect the dead preview id."""
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _google_error("model not found", 404),   # ultra
+            _google_error("high demand", 503),       # pro (fallback)
+            _google_response("evolution plan"),      # pro
+        ]
+        with patch("src.ai.chat_client.time.sleep"):
+            out = client.send_message("hi", call_site="test",
+                                      model=GOOGLE_MODEL_ULTRA)
+        assert "evolution plan" in out
+        assert client._client.post.call_count == 3
+        urls = [c[0][0] for c in client._client.post.call_args_list]
         assert GOOGLE_MODEL_ULTRA in urls[0]
         assert GOOGLE_MODEL_PRO in urls[1] and GOOGLE_MODEL_ULTRA not in urls[1]
         assert GOOGLE_MODEL_PRO in urls[2] and GOOGLE_MODEL_ULTRA not in urls[2]
