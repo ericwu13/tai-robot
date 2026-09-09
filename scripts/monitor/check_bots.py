@@ -74,24 +74,27 @@ def count_decisions(now: datetime, bot_dir: str, action: str):
 
 
 def _check_order_timeouts(now, bot_dir, name, lines, findings) -> None:
-    """REAL_ORDER_TIMEOUT lives here, not in check_regime: it happens on
-    ANY semi_auto deployment (the real-order confirm dialog auto-skips
-    after 10s and the signal executes paper-only — the order is never
-    sent; see run_backtest._dismiss_order_dialog and the trade-source
-    downgrade in test_trade_source_and_hotswap).  check_regime demotes
-    every finding for non-regime deploys, which silenced this signal for
-    plain bots.
+    """REAL_ORDER_TIMEOUT = the semi_auto confirm dialog auto-skipped
+    after 10s; the signal ran paper-only (the order was never sent — see
+    run_backtest._dismiss_order_dialog and the trade-source downgrade in
+    test_trade_source_and_hotswap).
+
+    P3 INFORMATIONAL by user decision (2026-09-09): unattended semi_auto
+    skipping is the FEATURE — "trade real only when someone confirms" —
+    so a recurring count must never grade P2 (it pinned every digest
+    YELLOW for by-design behavior). The count stays visible as a report
+    line + P3 because sim P&L (and the evolution fitness baseline) then
+    includes trades the real account never took — context, not a fault.
     """
     timeouts = count_decisions(now, bot_dir, "REAL_ORDER_TIMEOUT")
     if not timeouts:
         return
     lines.append(f"  order timeouts (24h): {timeouts}")
     findings.append(Finding(
-        "P2", "bots",
-        f"{name}: real-order confirm dialog timed out {timeouts}x in 24h "
-        f"(semi_auto auto-skip after 10s) — those signals ran PAPER-only, "
-        f"so the real account diverges from the sim; attend the dialog or "
-        f"switch the bot to auto",
+        "P3", "bots",
+        f"{name}: {timeouts} semi_auto confirm auto-skip(s) in 24h — by "
+        f"design (unattended signals run paper-only); sim P&L includes "
+        f"trades the real account did not take",
         os.path.join(bot_dir, "decisions.csv")))
 
 

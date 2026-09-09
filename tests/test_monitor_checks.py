@@ -352,21 +352,22 @@ def _timeout_rows(bar_dts):
     return "\n".join(rows)
 
 
-def test_bots_recent_order_timeouts_are_p2_even_on_plain_deploys(tmp_path):
+def test_bots_order_timeouts_are_p3_informational_never_p2(tmp_path):
     """REAL_ORDER_TIMEOUT = the semi_auto confirm dialog auto-skipped after
-    10s and the signal ran PAPER-only (the order was never sent — see
-    run_backtest._dismiss_order_dialog and the trade-source downgrade in
-    test_trade_source_and_hotswap).  It is deployment-agnostic, so it must
-    live in check_bots: check_regime demotes every finding for plain
-    deploys (the TMF00_0422 case) and no longer scans it at all."""
+    10s and the signal ran paper-only.  USER DECISION 2026-09-09: this is
+    the FEATURE (trade real only when someone confirms), so the count is a
+    P3 report line — a recurring by-design condition must never grade P2
+    (it pinned every daily digest YELLOW)."""
     bot = make_live_bot(tmp_path)  # plain deploy: session has no regime_mode
     recent = (NOW - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
     (bot / "decisions.csv").write_text(_timeout_rows([recent, recent]),
                                        encoding="utf-8")
     findings, _ = check_bots(NOW, str(tmp_path / "live"),
                              pid_alive_fn=lambda pid: True)
-    assert any("timed out 2x" in m and "PAPER-only" in m
-               for m in messages(findings, "P2")), messages(findings)
+    assert any("auto-skip" in m and "by design" in m
+               for m in messages(findings, "P3")), messages(findings)
+    assert not has_level(findings, "P2"), messages(findings, "P2")
+    assert not has_level(findings, "P1"), messages(findings, "P1")
 
 
 def test_bots_old_order_timeouts_are_ignored(tmp_path):
@@ -377,8 +378,8 @@ def test_bots_old_order_timeouts_are_ignored(tmp_path):
                                        encoding="utf-8")
     findings, _ = check_bots(NOW, str(tmp_path / "live"),
                              pid_alive_fn=lambda pid: True)
-    assert not any("timed out" in m for m in messages(findings, "P2")), \
-        messages(findings, "P2")
+    assert not any("auto-skip" in m or "timed out" in m
+                   for m in messages(findings)), messages(findings)
 
 
 def test_regime_no_longer_flags_order_timeouts(tmp_path):
