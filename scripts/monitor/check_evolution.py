@@ -14,6 +14,17 @@ Three facts drive everything:
   clock.  ``data/ai_usage.csv`` is the only record of how FAR an attempt
   got: a ``bot_evolution`` row means the plan phase reached the AI, an
   ``evolution_codegen_*`` row means codegen did.
+- an empty ledger does NOT mean the slot never fired.  Every early
+  return in ``_bot_evolution`` — no trades, and the holdout skip that
+  fires whenever the week's trades all sit inside the withheld window —
+  happens before the first AI call, so a run that completed exactly as
+  designed leaves ai_usage.csv untouched and the watermark frozen.  The
+  bot's debug log is what separates "fired and self-limited" from "never
+  fired": the Tk app writes a start line the moment the slot fires.  Do
+  NOT infer a cause from the ledger alone.  It reported "GUI closed" for
+  the 2026-09-05 slot, when both bots had in fact run and taken the
+  holdout skip — identified from the Discord message lengths (203/207
+  chars) matching that branch's template to the character.
 - regime bots are excluded from evolution BY DESIGN, and a run with no
   new trades outside the holdout window silently skips.  Neither is a
   failure, so neither may raise a finding on its own.
@@ -35,9 +46,10 @@ import csv  # noqa: E402
 from datetime import datetime, timedelta  # noqa: E402
 
 from scripts.monitor.common import (  # noqa: E402
-    TZ_TPE, Finding, bot_name, default_base_dir, discover_bot_dirs,
-    guard_stdout, last_activity, pid_alive, print_report, read_json,
-    read_lock_pid, to_tpe,
+    TZ_TPE, Finding, bot_name, debug_log_open_date, default_base_dir,
+    discover_bot_dirs, first_ts_in_line, guard_stdout, last_activity,
+    newest_debug_logs, pid_alive, print_report, read_json, read_lock_pid,
+    to_tpe,
 )
 
 # The AI pipeline runs from this Saturday slot (TPE); the fitness check
@@ -57,6 +69,13 @@ RECENT_ACTIVITY_DAYS = 7.0
 
 PLAN_CALL_SITE = "bot_evolution"
 CODEGEN_PREFIX = "evolution_codegen"
+
+# The ASCII half of the start line the Tk app logs when the slot fires
+# ("🧬 週末自動演化 Weekly auto-evolution (post-close) starting...").
+# Matching the English keeps this independent of the log's encoding, and
+# carrying "(post-close) starting" keeps it clear of the lower-cased
+# "weekly auto-evolution failed" the failure path writes.
+START_MARKER = "Weekly auto-evolution (post-close) starting"
 
 
 def last_due(now: datetime) -> datetime:
@@ -107,8 +126,72 @@ def read_usage(path: str):
     return runs
 
 
-def _check_usage(now, due, usage, feature_in_use, path, lines, findings) -> None:
+def _spans_due(path: str, due: datetime) -> bool:
+    """Could this debug log contain ``due``'s slot?
+
+    True when the deploy opened the log on or before the due day AND was
+    still writing to it at or after the slot.  Skipping the rest is what
+    keeps a "never started" answer cheap on a tree full of retired bots
+    whose logs run to tens of megabytes.
+    """
+    opened = debug_log_open_date(path)
+    if opened is None or opened > due.date():
+        return False
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(path), TZ_TPE)
+    except OSError:
+        return False
+    return mtime >= due
+
+
+def find_start(bot_dir: str, due: datetime):
+    """TPE timestamp of this bot's evolution start line for ``due``'s day.
+
+    ``None`` when the slot left no start line — the bot was not running,
+    the GUI was closed, or auto_pipeline is off.  Scans forward rather
+    than tailing: the slot can sit far from the end of a log that kept
+    growing for days afterwards.
+
+    Every log is offered to ``_spans_due``; capping the list would drop
+    the slot's file on a bot redeployed often enough that day (one bot
+    here has 33).  The cap was never what made this cheap — the filter
+    is, at one ``stat`` per file.
+    """
+    due = to_tpe(due)
+    for path in newest_debug_logs(bot_dir, None):
+        if not _spans_due(path, due):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if START_MARKER not in line:
+                        continue
+                    ts = first_ts_in_line(line)
+                    if ts is not None and ts.date() == due.date():
+                        return ts
+        except OSError:
+            continue
+    return None
+
+
+def due_slot_starts(base_dir: str, due: datetime):
+    """``[(bot_name, started_at)]`` for every bot that logged a start."""
+    due = to_tpe(due)
+    starts = []
+    for bot_dir in discover_bot_dirs(base_dir):
+        ts = find_start(bot_dir, due)
+        if ts is not None:
+            starts.append((bot_name(bot_dir), ts))
+    starts.sort(key=lambda row: row[1])
+    return starts
+
+
+def _check_usage(now, due, usage, feature_in_use, path, starts,
+                 lines, findings) -> None:
     lines.append("--- usage evidence")
+    started = ", ".join(f"{name} {ts.strftime('%H:%M:%S')}"
+                        for name, ts in starts)
+    lines.append(f"start line in debug logs: {started or 'none for this slot'}")
     if usage is None:
         lines.append(f"ai_usage.csv: missing or unreadable ({path})")
         findings.append(Finding(
@@ -137,16 +220,28 @@ def _check_usage(now, due, usage, feature_in_use, path, lines, findings) -> None
                  f"plan x{counts['plan']}, codegen x{counts['codegen']}")
 
     if not counts["plan"]:
-        if feature_in_use:
-            findings.append(Finding(
-                "P2", "evolution",
-                f"weekly evolution did not start on {due_day} (GUI closed, no "
-                f"eligible non-regime bot RUNNING at 05:05 TPE Sat, or "
-                f"auto_pipeline off)",
-                path))
-        else:
+        if starts:
+            # The slot fired and returned before the AI was called.  In
+            # practice that is the holdout skip: the bot's recent trades
+            # all sit inside the withheld window, so there is nothing new
+            # to design on.  That branch is deliberate, it notifies
+            # Discord itself, and this module's own contract says it may
+            # not raise a finding on its own.  Report it and stop —
+            # calling it a stall sends the operator hunting a failure
+            # that did not happen.
+            lines.append(f"  (fired and returned before the AI call — normally "
+                         f"the by-design holdout skip; the bot's own 🧬 Discord "
+                         f"message says which branch)")
+        elif not feature_in_use:
             lines.append("  (no watermark anywhere — evolution has never been "
                          "used in this tree, so a silent Saturday is expected)")
+        else:
+            findings.append(Finding(
+                "P2", "evolution",
+                f"weekly evolution did not start on {due_day} — no start line "
+                f"in any bot debug log (GUI closed, no eligible non-regime bot "
+                f"RUNNING at 05:05 TPE Sat, or auto_pipeline off)",
+                path))
         return
 
     if not counts["codegen"]:
@@ -306,7 +401,10 @@ def check_evolution(now: datetime, base_dir: str, repo_root: str = _REPO,
     usage = read_usage(usage_path)
     feature_in_use = any(mark is not None for _, mark, _ in rows)
 
-    _check_usage(now, due, usage, feature_in_use, usage_path, lines, findings)
+    starts = due_slot_starts(base_dir, due)
+
+    _check_usage(now, due, usage, feature_in_use, usage_path, starts,
+                 lines, findings)
     lines.append("")
     _check_watermarks(now, due, rows, lines, findings)
     lines.append("")

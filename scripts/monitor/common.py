@@ -307,15 +307,34 @@ def last_tpe_timestamp(text: str, scan_lines: int = 50):
     return None
 
 
-def newest_debug_logs(bot_dir: str, count: int = 1) -> list:
-    """Newest ``debug_YYYYMMDD.log`` paths, newest first (by TPE date)."""
-    paths = glob.glob(os.path.join(bot_dir, "debug_*.log"))
+def debug_log_open_date(path: str):
+    """The TPE date a ``debug_YYYYMMDD.log`` was OPENED, or None.
+
+    The name is stamped once, from the Taipei clock, when the deploy
+    creates the file; the file then grows for as long as that deploy
+    runs.  So this is the START of the log's coverage, never the end —
+    ``debug_20260828.log`` carried lines through 09-07.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    tag = stem.split("_", 1)[-1]
+    if len(tag) != 8 or not tag.isdigit():
+        return None
+    try:
+        return datetime.strptime(tag, "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def newest_debug_logs(bot_dir: str, count: int | None = 1) -> list:
+    """Newest ``debug_YYYYMMDD.log`` paths, newest first (by TPE date).
+
+    ``count=None`` returns every log in the directory.
+    """
     dated = []
-    for p in paths:
-        stem = os.path.splitext(os.path.basename(p))[0]
-        tag = stem.split("_", 1)[-1]
-        if len(tag) == 8 and tag.isdigit():
-            dated.append((tag, p))
+    for p in glob.glob(os.path.join(bot_dir, "debug_*.log")):
+        opened = debug_log_open_date(p)
+        if opened is not None:
+            dated.append((opened, p))
     dated.sort(reverse=True)
     return [p for _, p in dated[:count]]
 

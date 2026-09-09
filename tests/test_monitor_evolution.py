@@ -207,6 +207,189 @@ def test_never_used_tree_without_any_ledger_has_no_p2(tmp_path, repo):
     assert not has_level(findings, "P2"), messages(findings, "P2")
 
 
+# ── check 1b: did it START? (debug-log evidence) ────────────────────────
+#
+# ai_usage.csv cannot see a run that died before its first AI call, so
+# "never started" and "started, then stalled" produce an identical empty
+# ledger.  Only the debug log separates them.
+
+def start_line(stamp):
+    """The line run_backtest.py logs the moment the slot fires."""
+    return (f"[LIVE] [{stamp} TPE / 2026-01-01 00:00:00 local] "
+            f"🧬 週末自動演化 Weekly auto-evolution (post-close) starting...")
+
+
+def noise_line(stamp):
+    return (f"[{stamp} TPE / 2026-01-01 00:00:00 local] "
+            f"帳戶資料 Account: equity=80683 available=80683 float_pnl=0")
+
+
+def write_debug_log(bot, tag, rows, mtime=None):
+    """``debug_<tag>.log`` — named for the day the deploy OPENED it.
+
+    The mtime is pinned, never left to the wall clock: the scan only
+    considers logs still being written at or after the slot, so a
+    fixture that inherited "now" would change meaning the day the suite
+    is run, and `set_mtime` (added for `last_activity`) would silently
+    push a log out of range.
+    """
+    path = bot / f"debug_{tag}.log"
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    stamp = (mtime or (DUE + timedelta(hours=1))).timestamp()
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+# The previous Saturday: a watermark this fresh is not stale, so these
+# cases assert on the start/no-start finding without a second P2 in the way.
+PREV_SLOT = {"trade_count": 127, "at": "2026-08-22 05:05:01"}
+PREV_ROW_UTC = "2026-08-21T21:05:49+00:00"
+
+
+def test_start_line_without_a_plan_call_raises_nothing(tmp_path, repo):
+    """The real 2026-09-05 shape: the slot fired and returned before the
+    AI was called.
+
+    Every early return in _bot_evolution — including the holdout skip,
+    which fires whenever the week's trades all sit inside the withheld
+    window — happens before the first AI call.  So a run that completed
+    exactly as designed leaves the ledger empty and the watermark
+    frozen.  Reporting that as an outage sends the operator hunting a
+    failure that did not happen.  The log is also named for a day two
+    weeks earlier, because a deploy keeps writing to the file it opened.
+    """
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260815", [noise_line("2026-08-29 05:04:53"),
+                                      start_line("2026-08-29 05:05:25"),
+                                      noise_line("2026-08-29 05:06:00")])
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert not any("did not start" in m for m in messages(findings)), \
+        messages(findings)
+    assert not has_level(findings, "P2"), messages(findings, "P2")
+    assert any("start line in debug logs: TMF00_0422 05:05:25" in ln
+               for ln in lines), lines
+    assert any("by-design holdout skip" in ln for ln in lines), lines
+
+
+def test_first_ever_slot_that_self_limits_is_not_called_unused(tmp_path, repo):
+    """No watermark anywhere yet — it is only written once an attempt
+    gets past the early returns.  A start line still proves the feature
+    is live, so the tree must not be written off as "never used"."""
+    bot = make_bot(tmp_path, pid=4242)
+    write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:25")])
+    write_usage(repo, [("2026-08-29T02:00:00+00:00", "chat")])
+    findings, lines = run(tmp_path, repo)
+    assert not has_level(findings, "P2"), messages(findings, "P2")
+    assert not any("never been used" in ln for ln in lines), lines
+    assert any("start line in debug logs: TMF00_0422 05:05:25" in ln
+               for ln in lines), lines
+
+
+def test_no_start_line_in_a_live_log_still_reports_a_non_start(tmp_path, repo):
+    """The bot was logging through the slot and never started — the
+    original reading, which stays correct when the evidence supports it."""
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260815", [noise_line("2026-08-29 05:04:53"),
+                                      noise_line("2026-08-29 05:06:00")])
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("did not start on 2026-08-29" in m
+               for m in messages(findings, "P2")), messages(findings, "P2")
+    assert any("start line in debug logs: none for this slot" in ln
+               for ln in lines), lines
+
+
+def test_start_line_from_another_saturday_is_not_credited(tmp_path, repo):
+    """One log spans many weeks, so it holds every past slot's start
+    line.  Crediting the wrong one would excuse a Saturday that never
+    fired."""
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260815", [start_line("2026-08-22 05:05:11"),
+                                      noise_line("2026-08-29 05:06:00")])
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("did not start on 2026-08-29" in m
+               for m in messages(findings, "P2")), messages(findings, "P2")
+    assert any("none for this slot" in ln for ln in lines), lines
+
+
+def test_every_started_bot_is_named_in_report_order(tmp_path, repo):
+    """The slot fires per bot, so the evidence line names each one — in
+    the order they fired."""
+    first = make_bot(tmp_path, name="TMF00_0422", watermark=PREV_SLOT, pid=4242)
+    second = make_bot(tmp_path, name="TMF00_short", watermark=PREV_SLOT, pid=4243)
+    write_debug_log(first, "20260815", [start_line("2026-08-29 05:05:25")])
+    write_debug_log(second, "20260815", [start_line("2026-08-29 05:05:28")])
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("TMF00_0422 05:05:25, TMF00_short 05:05:28" in ln
+               for ln in lines), lines
+    assert not has_level(findings, "P2"), messages(findings, "P2")
+
+
+# ── which logs the scan is allowed to look at ───────────────────────────
+
+def test_slot_is_found_behind_many_newer_logs(tmp_path, repo):
+    """A bot redeployed daily leaves a log per deploy — one here has 33.
+
+    Capping the scan at the newest few would drop the file the slot is
+    actually in and report a non-start, which is the original bug with
+    the sign flipped.
+    """
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:25")])
+    for tag in ("20260830", "20260831", "20260901", "20260902",
+                "20260903", "20260904", "20260905"):
+        write_debug_log(bot, tag, [noise_line("2026-09-01 09:00:00")],
+                        mtime=NOW)
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("start line in debug logs: TMF00_0422 05:05:25" in ln
+               for ln in lines), lines
+    assert not any("did not start" in m for m in messages(findings)), \
+        messages(findings)
+
+
+def test_log_closed_before_the_slot_is_not_scanned(tmp_path, repo):
+    """A deploy that stopped before 05:05 cannot hold the slot.  Its
+    stale start line from an earlier Saturday must not be credited."""
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:25")],
+                    mtime=DUE - timedelta(hours=2))
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("none for this slot" in ln for ln in lines), lines
+    assert any("did not start on 2026-08-29" in m
+               for m in messages(findings, "P2")), messages(findings, "P2")
+
+
+def test_log_opened_after_the_slot_is_not_scanned(tmp_path, repo):
+    """Opened the day AFTER the due Saturday, so it cannot contain that
+    slot however new it is."""
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260830", [start_line("2026-08-29 05:05:25")],
+                    mtime=NOW)
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("none for this slot" in ln for ln in lines), lines
+    assert any("did not start on 2026-08-29" in m
+               for m in messages(findings, "P2")), messages(findings, "P2")
+
+
+def test_log_opened_on_the_due_day_is_scanned(tmp_path, repo):
+    """A deploy started early on the due Saturday still catches the slot
+    on its first post-deploy poll."""
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260829", [start_line("2026-08-29 05:05:25")])
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("start line in debug logs: TMF00_0422 05:05:25" in ln
+               for ln in lines), lines
+    assert not any("did not start" in m for m in messages(findings)), \
+        messages(findings)
+
+
 # ── check 2: watermarks / baselines ─────────────────────────────────────
 
 def test_stale_watermark_with_recent_activity_is_p2(tmp_path, repo):
