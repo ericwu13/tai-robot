@@ -5079,20 +5079,28 @@ class BacktestApp:
                     msg = gen_msg if attempt == 1 else (
                         gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
                         f"Fix the problem and output the complete corrected code.")
-                    resp = self._chat_client.one_shot(
-                        msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
-                        max_tokens=_CODE_GEN_MAX_TOKENS,
-                        call_site=f"evolution_codegen_{attempt}",
-                        model=heavy_model)
-                    code = extract_python_code(resp) or ""
-                    if not code:
-                        last_err = "no ```python code block found in the response"
-                        continue
                     try:
+                        # The API call is INSIDE the try (issue #108): a
+                        # transient model outage (Gemini 503) used to escape
+                        # this loop entirely, so the advertised "one retry"
+                        # never happened for API failures and the error died
+                        # in the outer handler with no Discord notice.
+                        resp = self._chat_client.one_shot(
+                            msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                            max_tokens=_CODE_GEN_MAX_TOKENS,
+                            call_site=f"evolution_codegen_{attempt}",
+                            model=heavy_model)
+                        code = extract_python_code(resp) or ""
+                        if not code:
+                            last_err = "no ```python code block found in the response"
+                            continue
                         candidate_cls = load_strategy_from_source(code)
                         break
                     except (CodeValidationError, CodeExecutionError) as e:
                         last_err = str(e)
+                    except Exception as e:
+                        last_err = f"AI API error — [{type(e).__name__}] {e}"
+                        _log(f"EVO codegen attempt {attempt} failed: {last_err}")
                 if candidate_cls is None:
                     msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
                     ui(self._append_chat, "system", msg)

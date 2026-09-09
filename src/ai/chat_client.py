@@ -6,6 +6,7 @@ import csv
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +43,17 @@ GOOGLE_MODEL_ULTRA = "gemini-3.1-pro-preview"
 # in send_message().  The first message is always kept; the most recent N
 # messages that fit are kept, older ones in the middle are dropped.
 _CONVERSATION_CHAR_LIMIT = 200_000
+
+# ── Transient-failure retry (issue #108) ──
+# A model outage ("503 This model is currently experiencing high demand")
+# killed a whole weekly evolution run because every non-200 raised
+# immediately.  These statuses are the ones worth waiting out; everything
+# else (400 bad request, 401 bad key, 404 unknown model) is permanent and
+# must still fail fast on the FIRST response.
+_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+# Same idiom as DiscordNotifier._send: bounded attempts, 1s/2s backoff.
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 1.0
 
 # CSV columns for the per-call usage log.  ``reasoning_tokens`` captures
 # Gemini 2.5's thoughtsTokenCount — these are billed at the output rate but
@@ -479,6 +491,41 @@ class ChatClient:
         return self._one_shot_anthropic(user_message, prompt, tokens,
                                         call_site=call_site, model=model)
 
+    def _post_with_retry(self, do_post, *, provider_label: str):
+        """Run ``do_post()`` (returns an httpx response), retrying transient
+        HTTP failures with exponential backoff.
+
+        Retries only on :data:`_TRANSIENT_STATUS` (429 / 5xx) — a model
+        outage or rate limit is worth waiting out, a 400/401/404 is not
+        and is returned on the first response exactly as before
+        (issue #108).  The last response is returned when the attempts
+        are exhausted, so the caller raises its usual error.
+
+        ``do_post`` carries all the per-call context, which keeps
+        :meth:`one_shot` stateless.
+        """
+        delay = _RETRY_BASE_DELAY
+        response = None
+        for attempt in range(1, _RETRY_ATTEMPTS + 1):
+            response = do_post()
+            if response.status_code not in _TRANSIENT_STATUS:
+                return response
+            if attempt == _RETRY_ATTEMPTS:
+                break
+            _log.warning(
+                "%s API transient error %d (attempt %d/%d) — retrying in %.0fs",
+                provider_label, response.status_code, attempt,
+                _RETRY_ATTEMPTS, delay,
+            )
+            time.sleep(delay)
+            delay *= 2
+        if response is not None:
+            _log.error(
+                "%s API still failing with %d after %d attempts — giving up",
+                provider_label, response.status_code, _RETRY_ATTEMPTS,
+            )
+        return response
+
     def _one_shot_anthropic(self, user_message: str, system_prompt: str = "",
                             max_tokens: int = 0, *, call_site: str = "unknown",
                             model: str | None = None) -> str:
@@ -497,7 +544,11 @@ class ChatClient:
             "content-type": "application/json",
         }
 
-        response = self._client.post(ANTHROPIC_API_URL, json=payload, headers=headers)
+        response = self._post_with_retry(
+            lambda: self._client.post(ANTHROPIC_API_URL, json=payload,
+                                      headers=headers),
+            provider_label="Anthropic",
+        )
 
         if response.status_code != 200:
             error_body = response.text
@@ -536,7 +587,17 @@ class ChatClient:
         if system_prompt:
             payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
 
-        response, used_model = self._post_gemini(payload, used_model)
+        # The 404 stale-preview-model fallback lives inside _post_gemini and
+        # is unchanged; the box carries the model it settled on so a retry
+        # after the fallback keeps using the fallback model (issue #108).
+        box = {"model": used_model}
+
+        def _post():
+            resp, box["model"] = self._post_gemini(payload, box["model"])
+            return resp
+
+        response = self._post_with_retry(_post, provider_label="Gemini")
+        used_model = box["model"]
 
         if response.status_code != 200:
             error_body = response.text
