@@ -16,6 +16,7 @@ from src.regime.store import (
     save_state,
     _V2_HEADER,
     _V3_HEADER,
+    _V4_HEADER,
 )
 
 
@@ -60,11 +61,11 @@ class TestWritePlaceholderState:
 
 
 class TestAppendHistoryV2:
-    def test_creates_v3_header(self, tmp_path):
+    def test_creates_v4_header(self, tmp_path):
         path = str(tmp_path / "history.csv")
         append_history(path, "2026-07-09", _make_state(), _make_rec())
         rows = _read_csv(path)
-        assert rows[0] == _V3_HEADER
+        assert rows[0] == _V4_HEADER
         assert len(rows) == 2
 
     def test_votes_cell_from_last_features(self, tmp_path):
@@ -83,7 +84,7 @@ class TestAppendHistoryV2:
         assert rows[1][_V3_HEADER.index("votes")] == ""
 
     def test_upgrades_v2_header_in_place(self, tmp_path):
-        """A pre-v3 file gains the votes column on the next write; the
+        """A pre-v4 file gains the missing columns on the next write; the
         old short row survives untouched."""
         path = str(tmp_path / "history.csv")
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -92,9 +93,9 @@ class TestAppendHistoryV2:
             w.writerow(["2026-07-08", "NIGHT"] + [""] * (len(_V2_HEADER) - 2))
         append_history(path, "2026-07-09", _make_state(), _make_rec())
         rows = _read_csv(path)
-        assert rows[0] == _V3_HEADER
+        assert rows[0] == _V4_HEADER
         assert len(rows[1]) == len(_V2_HEADER)   # old row not padded
-        assert len(rows[2]) == len(_V3_HEADER)   # new row has votes cell
+        assert len(rows[2]) == len(_V4_HEADER)   # new row has votes + vote_rule
 
     def test_v2_extra_columns(self, tmp_path):
         path = str(tmp_path / "history.csv")
@@ -152,7 +153,7 @@ class TestRecordSessionResult:
         path = str(tmp_path / "history.csv")
         record_session_result(path, "2026-07-09", "DAY", 800.0, 2)
         rows = _read_csv(path)
-        assert rows[0] == _V3_HEADER
+        assert rows[0] == _V4_HEADER
         assert len(rows) == 2
 
     def test_re_record_updates_in_place(self, tmp_path):
@@ -259,3 +260,91 @@ class TestBackfillPnlRemoved:
         """backfill_pnl was retired — ensure it's not exported."""
         import src.regime.store as store_mod
         assert not hasattr(store_mod, "backfill_pnl")
+
+
+class TestVoteRuleColumn:
+    """v4 adds `vote_rule` (got/needed) beside the existing `votes` cell.
+
+    The two are complementary: `votes` says WHO voted, `vote_rule` says
+    whether the asymmetric quorum was met. The `votes` format is load
+    bearing — vote_status.consumed_votes_line and
+    scripts/monitor/check_regime.py both parse its SRC:direction tokens —
+    so this pins that adding a column left it alone.
+    """
+
+    def _state(self, sources, rule, accelerated=False):
+        from src.regime.state_machine import RegimeState
+        return RegimeState(
+            raw_regime="trending-up", effective_regime="trending-up",
+            last_features={"_vote_sources": sources, "_vote_rule": rule,
+                           "_vote_accelerated": accelerated})
+
+    def _rec(self):
+        from src.regime.selector import Recommendation
+        return Recommendation("deploy_long", "LongBot")
+
+    def test_header_gains_vote_rule_after_votes(self, tmp_path):
+        path = str(tmp_path / "regime_history.csv")
+        append_history(path, "2026-08-05", self._state([], ""), self._rec())
+        rows = _read_csv(path)
+        assert rows[0][-2:] == ["votes", "vote_rule"]
+
+    def test_v3_file_upgrades_in_place(self, tmp_path):
+        """A file written before this change gains the column on the next
+        write; its existing rows stay one cell short (readers look up by
+        header name and length-guard)."""
+        path = str(tmp_path / "regime_history.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(_V3_HEADER)
+            w.writerow(["2026-08-04", "NIGHT"] + [""] * (len(_V3_HEADER) - 3)
+                       + ["W3:trending-up*"])
+
+        append_history(path, "2026-08-05",
+                       self._state(["W2:trending-up", "W3:trending-up"],
+                                   "up:2/2", accelerated=True),
+                       self._rec())
+
+        rows = _read_csv(path)
+        assert rows[0] == _V4_HEADER
+        assert len(rows[1]) == len(_V3_HEADER), "old row is not padded"
+        assert rows[1][_V3_HEADER.index("votes")] == "W3:trending-up*"
+        assert len(rows[2]) == len(_V4_HEADER)
+        assert rows[2][_V4_HEADER.index("vote_rule")] == "up:2/2"
+
+    def test_votes_cell_format_is_unchanged(self, tmp_path):
+        path = str(tmp_path / "regime_history.csv")
+        append_history(path, "2026-08-05",
+                       self._state(["W2:trending-up", "W3:trending-up"],
+                                   "up:2/2", accelerated=True),
+                       self._rec())
+        row = _read_csv(path)[1]
+        assert row[_V4_HEADER.index("votes")] == "W2:trending-up+W3:trending-up*"
+
+    def test_blank_vote_rule_without_votes(self, tmp_path):
+        path = str(tmp_path / "regime_history.csv")
+        append_history(path, "2026-08-05", self._state([], ""), self._rec())
+        assert _read_csv(path)[1][_V4_HEADER.index("vote_rule")] == ""
+
+    def test_result_row_leaves_both_audit_cells_blank(self, tmp_path):
+        path = str(tmp_path / "regime_history.csv")
+        record_session_result(path, "2026-08-05", "DAY", 1200.0, 2)
+        row = _read_csv(path)[1]
+        assert row[_V4_HEADER.index("votes")] == ""
+        assert row[_V4_HEADER.index("vote_rule")] == ""
+
+    def test_consumed_votes_line_still_parses_the_tokens(self, tmp_path):
+        """vote_status reads _vote_sources (not the CSV), but the token
+        format is shared — pin that the new column did not change it."""
+        from src.news.vote_status import consumed_votes_line
+        path = str(tmp_path / "regime_history.csv")
+        state = self._state(["W2:trending-up", "W3:trending-up"], "up:2/2",
+                            accelerated=True)
+        append_history(path, "2026-08-05", state, self._rec())
+
+        cell = _read_csv(path)[1][_V4_HEADER.index("votes")]
+        line = consumed_votes_line(state.last_features)
+        for token in cell.rstrip("*").split("+"):
+            src = token.split(":")[0]
+            assert src in line
+        assert "accelerated" in line

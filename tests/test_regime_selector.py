@@ -178,14 +178,53 @@ def _range_state(slope, direction="bullish", votes=None, extra=None):
 
 
 def test_range_bound_vote_up_with_updrift_deploys_long_half():
-    """A bullish external vote + positive drift beats sit_out — even with
-    range_bias_action=sit_out (the fusion path bypasses that knob)."""
+    """TWO bullish external votes + positive drift beat sit_out — even
+    with range_bias_action=sit_out (the fusion path bypasses that knob).
+
+    Updated for the asymmetric quorum (vote_quorum_up=2): one up vote
+    used to be enough, which is what put the bot long on W2's 3/10 word.
+    See test_range_bound_single_up_vote_sits_out below."""
     sel = StrategySelector()
-    s = _range_state(slope=101.0, votes=["trending-up"])
+    s = _range_state(slope=101.0, votes=["trending-up", "trending-up"])
     rec = sel.select(s, cfg(range_bias_action="sit_out"))
     assert rec.action == "deploy_long_half"
     assert rec.strategy_name == "LongBot"
     assert rec.qty_scale == 0.5
+
+
+def test_range_bound_single_up_vote_sits_out():
+    """One up vote is below vote_quorum_up (2) — the probe stays shut."""
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up"])
+    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    assert rec.action == "sit_out"
+
+
+def test_range_bound_single_down_vote_still_deploys_short_half():
+    """The DOWN side keeps its quorum of 1 — protecting/short-siding on
+    one source is the cheap direction, and this is unchanged behaviour."""
+    sel = StrategySelector()
+    s = _range_state(slope=-50.0, votes=["trending-down"])
+    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    assert rec.action == "deploy_short_half"
+    assert rec.qty_scale == 0.5
+
+
+def test_range_bound_one_opposing_vote_still_cancels_a_quorum():
+    """Conflict-cancel is absolute: two up votes make the quorum, but a
+    single down vote still kills the probe."""
+    sel = StrategySelector()
+    s = _range_state(slope=101.0,
+                     votes=["trending-up", "trending-up", "trending-down"])
+    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    assert rec.action == "sit_out"
+
+
+def test_range_bound_quorum_is_configurable():
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up"])
+    rec = sel.select(s, cfg(range_bias_action="sit_out", vote_quorum_up=1))
+    assert rec.action == "deploy_long_half"
 
 
 def test_range_bound_vote_down_with_downdrift_deploys_short_half():
@@ -217,16 +256,21 @@ def test_range_bound_conflicting_votes_cancel():
 
 def test_range_bound_vote_needs_only_slope_agreement():
     """The DI-derived direction field may disagree (low-signal when ADX
-    is low) — slope agreement alone qualifies the vote."""
+    is low) — slope agreement alone qualifies the votes.
+
+    Updated for the asymmetric quorum: the up side now needs two votes
+    (vote_quorum_up=2); what this test pins is that `direction` is still
+    not consulted."""
     sel = StrategySelector()
-    s = _range_state(slope=98.8, direction="bearish", votes=["trending-up"])
+    s = _range_state(slope=98.8, direction="bearish",
+                     votes=["trending-up", "trending-up"])
     rec = sel.select(s, cfg())
     assert rec.action == "deploy_long_half"
 
 
 def test_vote_does_not_override_vol_spike():
     sel = StrategySelector()
-    s = _range_state(slope=101.0, votes=["trending-up"],
+    s = _range_state(slope=101.0, votes=["trending-up", "trending-up"],
                      extra={"_vol_spike": True})
     rec = sel.select(s, cfg())
     assert rec.action == "sit_out"
@@ -235,7 +279,7 @@ def test_vote_does_not_override_vol_spike():
 
 def test_vote_does_not_override_event_risk():
     sel = StrategySelector()
-    s = _range_state(slope=101.0, votes=["trending-up"],
+    s = _range_state(slope=101.0, votes=["trending-up", "trending-up"],
                      extra={"_event_risk": "FOMC"})
     rec = sel.select(s, cfg())
     assert rec.action == "sit_out"

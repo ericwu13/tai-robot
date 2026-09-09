@@ -13,14 +13,23 @@ Each source writes to a per-source file derived from the base path::
     W3 → "C:/n8n-bridge/regime_vote_w3.json"
     W4 → "C:/n8n-bridge/regime_vote_w4.json"
 
-File schema (unchanged per file)::
+File schema (schema version stays 1 — ``fired_at`` is additive and
+readers ignore unknown keys)::
 
     {
       "version": 1,
       "direction": "trending-up",
       "expires_after_session": "2026-08-05|NIGHT",
-      "source": "W2"
+      "source": "W2",
+      "fired_at": "2026-08-05T22:31:07+08:00"
     }
+
+``fired_at`` exists because a vote's edge has a half-life.  W2 fires
+during the US session but the nightly lane only reads it at the 04:58
+classification, up to ~20 h later, and over that lag W2 was right 3
+times in 10 — its edge lives in the ~4 h after the fire.  ``age_sec``
+(computed at read time, from ``fired_at`` when parseable and otherwise
+from the file mtime) lets the consumer apply a per-source age limit.
 """
 
 from __future__ import annotations
@@ -30,11 +39,14 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 VALID_DIRECTIONS = ("trending-up", "trending-down")
+
+_TZ_TAIPEI = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -42,6 +54,38 @@ class RegimeVote:
     direction: str
     expires_after_session: str
     source: str = ""
+    fired_at: str = ""            # ISO-8601 +08:00, stamped by the writer
+    age_sec: float | None = None  # computed at read time; None = unknowable
+
+
+def _now_tpe() -> datetime:
+    return datetime.now(_TZ_TAIPEI)
+
+
+def vote_age_sec(fired_at: str, path: str, now: datetime | None = None) -> float | None:
+    """Age of a vote in seconds.
+
+    Prefers the writer's own ``fired_at`` stamp; falls back to the file's
+    mtime for pre-``fired_at`` files (and for a stamp we cannot parse).
+    Returns None when neither is available.  Never negative — a bridge
+    host whose clock runs a few seconds fast must not read as "from the
+    future" and skew an age gate.
+    """
+    now = now or _now_tpe()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=_TZ_TAIPEI)
+    if fired_at:
+        try:
+            ts = datetime.fromisoformat(str(fired_at))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_TZ_TAIPEI)
+            return max(0.0, (now - ts).total_seconds())
+        except (TypeError, ValueError):
+            logger.debug("[REGIME-VOTE] unparseable fired_at %r — using mtime", fired_at)
+    try:
+        return max(0.0, now.timestamp() - os.path.getmtime(path))
+    except OSError:
+        return None
 
 
 def read_regime_vote(
@@ -93,10 +137,13 @@ def read_regime_vote(
         )
         return None
 
+    fired_at = str(data.get("fired_at", "") or "")
     return RegimeVote(
         direction=direction,
         expires_after_session=expires,
         source=str(data.get("source", "")),
+        fired_at=fired_at,
+        age_sec=vote_age_sec(fired_at, path),
     )
 
 
@@ -126,6 +173,9 @@ def write_regime_vote(
 ) -> None:
     """Write (or overwrite) the per-source vote file atomically.
 
+    Stamps ``fired_at`` (ISO-8601 with the +08:00 offset) so readers can
+    age the vote out; see ``vote_age_sec``.
+
     *data_date* (``"YYYYMMDD"``) is the trade date of the data the vote
     was computed from — audit only, and omitted when empty.  A source
     may vote from data that lags the session it targets (W4 walks the
@@ -138,6 +188,10 @@ def write_regime_vote(
         "direction": direction,
         "expires_after_session": expires_after_session,
         "source": source,
+        # Wall-clock fire time (TPE offset).  The session key says WHICH
+        # night the vote targets; this says HOW OLD the evidence is, which
+        # is what the nightly lane's per-source age gate needs.
+        "fired_at": _now_tpe().isoformat(timespec="seconds"),
     }
     if data_date:
         payload["data_date"] = data_date

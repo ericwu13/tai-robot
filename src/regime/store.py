@@ -33,6 +33,13 @@ _V2_HEADER = [
 # header name and must length-guard).
 _V3_HEADER = _V2_HEADER + ["votes"]
 
+# v4 header — v3 plus the vote-RULE audit column ("up:1/2" / "down:2/1",
+# got/needed). The `votes` cell says WHO voted; this one says whether the
+# quorum was met, which is the whole difference between the old
+# any-vote-accelerates rule and the asymmetric one. Same additive
+# mechanism as v3: existing positions unchanged, older rows stay short.
+_V4_HEADER = _V3_HEADER + ["vote_rule"]
+
 
 # File-level marker for the last_assessed keying convention. Files
 # written before v2.16 stamped the night's CLOSE date; current code
@@ -170,18 +177,18 @@ def _atomic_write_rows(csv_path: str, rows: list) -> None:
 def _read_rows(csv_path: str) -> list:
     """Read history rows, always returning a header as row 0.
 
-    Upgrades a v2 header to v3 in memory by appending the missing
+    Upgrades an older header to v4 in memory by appending the missing
     column names; every caller rewrites the whole file atomically, so
     the upgrade persists on the next write. Old data rows keep their
     original length.
     """
     if not os.path.exists(csv_path):
-        return [list(_V3_HEADER)]
+        return [list(_V4_HEADER)]
     with open(csv_path, newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
     if not rows:
-        return [list(_V3_HEADER)]
-    for col in _V3_HEADER:
+        return [list(_V4_HEADER)]
+    for col in _V4_HEADER:
         if col not in rows[0]:
             rows[0].append(col)
     return rows
@@ -198,7 +205,7 @@ def append_history(
     applied_at: str = "",
     trading_mode: str = "",
 ):
-    """Append a classification row to regime_history.csv (v3 schema)."""
+    """Append a classification row to regime_history.csv (v4 schema)."""
     rows = _read_rows(csv_path)
     feat = state.last_features
     votes = "+".join(feat.get("_vote_sources") or [])
@@ -220,6 +227,7 @@ def append_history(
         strategy_active,
         str(applied).lower(), applied_at, trading_mode,
         votes,
+        feat.get("_vote_rule", ""),
     ])
     _atomic_write_rows(csv_path, rows)
 
@@ -279,5 +287,5 @@ def _result_row(date, session, pnl, trades, strategy_active, trading_mode):
         "", "",                   # dry_run, override
         str(pnl), str(trades),
         strategy_active, "", "", trading_mode,
-        "",                       # votes — classification rows only
+        "", "",                   # votes, vote_rule — classification rows only
     ]

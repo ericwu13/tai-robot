@@ -97,6 +97,14 @@ class NewsConfig:
     regime_vote_thresholds: dict = field(default_factory=lambda: {
         "soxx_pct": 2.5, "tsm_pct": 2.0, "qqq_pct": 2.0,
     })
+    # Per-source max age (HOURS) for a vote reaching the NIGHTLY lane.
+    # The nightly lane reads votes at the ~04:58 classification, which
+    # for a W2 fire during the US session is up to ~20 h later — and over
+    # that lag W2 was right 3 times in 10.  Its edge lives in the ~4 h
+    # after the fire, so a W2 vote older than that is consumed (deleted
+    # with the rest) but NOT passed to the classifier.  A source absent
+    # from this dict has no age limit; {} disables the gate entirely.
+    nightly_vote_max_age_h: dict = field(default_factory=lambda: {"W2": 4.0})
 
 
 @dataclass

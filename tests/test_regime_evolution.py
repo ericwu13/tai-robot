@@ -82,6 +82,17 @@ class TestSettingsWiring:
         assert cfg.adx_exit == default.adx_exit
         assert cfg.confirm_sessions == default.confirm_sessions
 
+    def test_vote_quorum_maps_from_settings(self, tmp_path):
+        cfg = build_regime_config(
+            {"regime_vote_quorum_up": 3, "regime_vote_quorum_down": 2},
+            base_dir=str(tmp_path))
+        assert cfg.vote_quorum_up == 3
+        assert cfg.vote_quorum_down == 2
+
+    def test_vote_quorum_defaults_are_asymmetric(self, tmp_path):
+        cfg = build_regime_config({}, base_dir=str(tmp_path))
+        assert (cfg.vote_quorum_up, cfg.vote_quorum_down) == (2, 1)
+
     def test_settings_values_differ_from_defaults(self, tmp_path):
         """Proves the test is meaningful — settings != dataclass defaults."""
         settings = _make_settings()

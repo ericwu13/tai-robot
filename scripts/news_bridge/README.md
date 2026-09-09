@@ -42,12 +42,28 @@ always needs the human tap.
 Vote files live next to `news.regime_vote_path` (settings.yaml), one per
 source: `regime_vote.json` → `regime_vote_w2.json` / `_w3` / `_w4`.  At
 classification time (~04:58 TPE) the regime state machine reads every
-valid, non-expired vote; a vote that agrees with the raw technical
-classification skips one night of hysteresis confirmation.  Votes are
-**deleted after every classification pass**, directions are only
-`trending-up` / `trending-down` (no neutral — an uncertain source writes
-nothing), and `expires_after_session` must equal the night being
-classified (`"YYYY-MM-DD|NIGHT"`, open-date convention, 05:00 boundary).
+valid, non-expired vote; votes that agree with the raw technical
+classification and **meet that direction's quorum** skip one night of
+hysteresis confirmation.  Votes are **deleted after every classification
+pass**, directions are only `trending-up` / `trending-down` (no neutral —
+an uncertain source writes nothing), and `expires_after_session` must
+equal the night being classified (`"YYYY-MM-DD|NIGHT"`, open-date
+convention, 05:00 boundary).
+
+Two gates sit between a vote file and a strategy swap:
+
+- **Asymmetric quorum** (`regime.vote_quorum_up` = 2,
+  `regime.vote_quorum_down` = 1): going long on external evidence is the
+  expensive mistake, so it takes two sources; confirming a down read
+  early is cheap and protective, so one is enough.  Conflict-cancel in
+  the range-bound probe is unchanged and absolute — ANY opposing vote
+  kills it, quorum or not.
+- **Per-source age gate** (`news.nightly_vote_max_age_h`, default
+  `{W2: 4.0}`): the writer stamps `fired_at`, and a vote older than its
+  source's limit at read time is consumed with the rest but never shown
+  to the classifier.  W2 fires during the US session and the nightly lane
+  reads it ~20 h later at the END of the session it named; W2's edge
+  lives in the ~4 h after the fire.  Sources not listed have no limit.
 
 ## W4 — 籌碼 chips monitor (`chips_monitor.py`)
 

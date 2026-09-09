@@ -309,6 +309,7 @@ def _resolve_news_config(
     if not regime_enabled or not news_enabled:
         return None
     from src.config.settings import NewsConfig
+    _defaults = NewsConfig()
     return NewsConfig(
         enabled=True,
         signal_path=_resolve_news_path(
@@ -327,7 +328,31 @@ def _resolve_news_config(
                         if suppress_scope == "conflicting_leg" else "both"),
         calendar_min_severity=str(
             settings.get("news_calendar_min_severity", "high")),
+        # Same regression class as regime_vote_path above: a knob that
+        # never reaches NewsConfig is a knob the runner cannot honour.
+        nightly_vote_max_age_h=_normalize_vote_max_age(
+            settings.get("news_nightly_vote_max_age_h"),
+            _defaults.nightly_vote_max_age_h),
     )
+
+
+def _normalize_vote_max_age(raw, default: dict) -> dict:
+    """Coerce ``news.nightly_vote_max_age_h`` into ``{SOURCE: hours}``.
+
+    Not a dict (missing / junk) → the NewsConfig default. An explicit
+    empty mapping means "no age gate at all" and is honoured. Keys are
+    upper-cased to the bridge stem the votes self-label with; unusable
+    values are dropped rather than crashing a deploy.
+    """
+    if not isinstance(raw, dict):
+        return dict(default)
+    out: dict = {}
+    for key, val in raw.items():
+        try:
+            out[str(key).strip().upper()] = float(val)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _load_settings():
@@ -422,6 +447,12 @@ def _load_settings():
                 news.get("suppress_scope", "both") or "both")
             cfg["news_calendar_min_severity"] = str(
                 news.get("calendar_min_severity", "high") or "high")
+            # Per-source vote age gate for the nightly lane (hours).
+            # Absent → None → _resolve_news_config falls back to the
+            # NewsConfig default; an explicit {} disables the gate.
+            _vote_age = news.get("nightly_vote_max_age_h", None)
+            cfg["news_nightly_vote_max_age_h"] = (
+                _vote_age if isinstance(_vote_age, dict) else None)
             regime = data.get("regime", {}) or {}
             cfg["regime_long_strategy"] = regime.get("long_strategy", "")
             cfg["regime_short_strategy"] = regime.get("short_strategy", "")
@@ -433,6 +464,12 @@ def _load_settings():
             cfg["regime_max_flips_in_window"] = int(regime.get("max_flips_in_window", 3) or 3)
             cfg["regime_flip_window_sessions"] = int(regime.get("flip_window_sessions", 10) or 10)
             cfg["regime_classify_interval"] = int(regime.get("classify_interval", 3600) or 3600)
+            # Asymmetric vote quorum — how many agreeing external votes
+            # accelerate a confirm / open a range-bound probe.
+            cfg["regime_vote_quorum_up"] = max(
+                0, int(regime.get("vote_quorum_up", 2) or 0))
+            cfg["regime_vote_quorum_down"] = max(
+                0, int(regime.get("vote_quorum_down", 1) or 0))
             _rba = str(regime.get("range_bias_action", "sit_out") or "sit_out")
             cfg["regime_range_bias_action"] = (
                 _rba if _rba in ("sit_out", "short_half", "long_half", "both_half")

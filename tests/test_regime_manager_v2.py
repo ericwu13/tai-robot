@@ -115,7 +115,7 @@ class TestClassifySession:
         assert os.path.exists(hist_path)
         with open(hist_path, newline="") as f:
             rows = list(csv.reader(f))
-        assert rows[0] == _V2_HEADER + ["votes"]
+        assert rows[0] == _V2_HEADER + ["votes", "vote_rule"]
         assert len(rows) == 2
 
 

@@ -13,6 +13,37 @@ from dataclasses import dataclass, field
 from src.daily_report.regime_classifier import RegimeResult
 
 
+def _vote_quorum(cfg, direction: str) -> int:
+    """Votes needed for *direction* ("trending-up" / "trending-down")."""
+    if direction == "trending-down":
+        return int(getattr(cfg, "vote_quorum_down", 1))
+    return int(getattr(cfg, "vote_quorum_up", 2))
+
+
+def vote_rule_tag(votes: list, raw: str, cfg) -> str:
+    """Short got/needed audit string, e.g. ``"up:1/2"`` / ``"down:2/1"``.
+
+    Empty when no votes were present at all — the history column then
+    reads blank instead of claiming a rule was evaluated.  For a
+    non-trending *raw* (transitional / range-bound, where the selector
+    rather than the confirmation gate uses the votes) the majority side
+    is reported.
+    """
+    if not votes:
+        return ""
+    ups = sum(1 for v in votes if v == "trending-up")
+    downs = sum(1 for v in votes if v == "trending-down")
+    if raw == "trending-up":
+        side = "up"
+    elif raw == "trending-down":
+        side = "down"
+    else:
+        side = "down" if downs > ups else "up"
+    got = ups if side == "up" else downs
+    needed = _vote_quorum(cfg, f"trending-{side}")
+    return f"{side}:{got}/{needed}"
+
+
 @dataclass
 class RegimeConfig:
     enabled: bool = False
@@ -31,6 +62,15 @@ class RegimeConfig:
     long_strategy: str = ""
     short_strategy: str = ""
     range_bias_action: str = "sit_out"   # "sit_out" | "short_half" | "long_half" | "both_half"
+    # How many agreeing external votes it takes to accelerate a
+    # confirmation (and, in the selector, to probe a range). Deliberately
+    # ASYMMETRIC: entering long on external evidence is the expensive
+    # mistake (W2, the loudest voter, is 3/10 right by the time the
+    # nightly lane reads it), while confirming a DOWN read early is the
+    # cheap, protective direction. 0 on either side disables votes for
+    # that direction entirely.
+    vote_quorum_up: int = 2
+    vote_quorum_down: int = 1
     manual_override: str = "auto"        # "auto" | "long" | "short" | "sit_out"
     classify_interval: int = 3600
 
@@ -59,8 +99,11 @@ class RegimeStateMachine:
         """Advance state by one NIGHT session. Returns new state (immutable-ish).
 
         *vote_directions*: list of cross-market regime votes from
-        independent sources.  If any vote agrees with tonight's raw
-        classification, confirmation is immediate.
+        independent sources (one per source — one file per source, so
+        counting list entries counts sources).  Confirmation is
+        immediate when the number agreeing with tonight's raw
+        classification meets that direction's quorum
+        (``cfg.vote_quorum_up`` / ``cfg.vote_quorum_down``).
 
         *vote_sources*: same votes as ``"SOURCE:direction"`` strings
         (e.g. ``"W3:trending-up"``) — audit only, parallel to
@@ -75,9 +118,11 @@ class RegimeStateMachine:
         # Persist tonight's external votes for the selector (information
         # fusion in range-bound regimes) and for post-hoc audit — the vote
         # files themselves are consumed right after classification.
-        s.last_features["_votes"] = [v for v in (vote_directions or []) if v]
+        votes = [v for v in (vote_directions or []) if v]
+        s.last_features["_votes"] = votes
         s.last_features["_vote_sources"] = [v for v in (vote_sources or []) if v]
         s.last_features["_vote_accelerated"] = False
+        s.last_features["_vote_rule"] = ""
 
         # --- 1. Derive raw regime from configurable thresholds ---
         # RegimeResult has no trend_direction field; derive it from the
@@ -97,6 +142,10 @@ class RegimeStateMachine:
         else:
             raw = "transitional"   # dead zone 20-25
         s.raw_regime = raw
+        # Stamped before the pause/transitional early-returns so the
+        # audit column is populated on every assessed session that saw
+        # votes, not only the ones that reached the confirmation gate.
+        s.last_features["_vote_rule"] = vote_rule_tag(votes, raw, cfg)
 
         # --- 2. Vol spike override (does not change effective regime) ---
         vol_spike = result.atr_ratio > cfg.vol_spike_ratio
@@ -118,7 +167,9 @@ class RegimeStateMachine:
                 s.pending_label = raw
                 s.pending_count = 1
 
-            vote_agrees = any(v == raw for v in (vote_directions or []))
+            needed = _vote_quorum(cfg, raw)
+            agreeing = sum(1 for v in votes if v == raw)
+            vote_agrees = needed > 0 and agreeing >= needed
             if raw != s.effective_regime and (s.pending_count >= cfg.confirm_sessions or strong or vote_agrees):
                 # Audit: did the vote alone confirm this flip (hysteresis
                 # not yet satisfied, no adx_strong fast-track)?

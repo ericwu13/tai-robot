@@ -149,6 +149,27 @@ class TestSharedFields:
         cfg = _resolve(_settings(news_regime_vote_path=abs_path))
         assert cfg.regime_vote_path == abs_path
 
+    def test_nightly_vote_max_age_is_wired_through(self):
+        """Same regression class as regime_vote_path: a knob the resolver
+        drops is a knob the runner can never honour."""
+        cfg = _resolve(_settings(news_nightly_vote_max_age_h={"w2": 2, "W3": 6}))
+        assert cfg.nightly_vote_max_age_h == {"W2": 2.0, "W3": 6.0}
+
+    def test_nightly_vote_max_age_defaults_to_w2_four_hours(self):
+        from src.config.settings import NewsConfig
+        assert _resolve().nightly_vote_max_age_h == NewsConfig().nightly_vote_max_age_h
+        assert _resolve().nightly_vote_max_age_h == {"W2": 4.0}
+
+    def test_explicit_empty_mapping_disables_the_age_gate(self):
+        assert _resolve(_settings(news_nightly_vote_max_age_h={})
+                        ).nightly_vote_max_age_h == {}
+
+    def test_junk_nightly_vote_max_age_falls_back_to_default(self):
+        assert _resolve(_settings(news_nightly_vote_max_age_h="4h")
+                        ).nightly_vote_max_age_h == {"W2": 4.0}
+        assert _resolve(_settings(news_nightly_vote_max_age_h={"W2": "soon"})
+                        ).nightly_vote_max_age_h == {}
+
     def test_absolute_paths_pass_through(self):
         abs_path = os.path.join("D:", os.sep, "n8n", "signal.json")
         cfg = _resolve(_settings(news_signal_path=abs_path))
@@ -181,6 +202,8 @@ class TestSettingsDefaults:
             "  events_path: ev.json\n"
             "  ledger_path: led.json\n"
             "  regime_vote_path: vote.json\n"
+            "  nightly_vote_max_age_h:\n"
+            "    W2: 2.5\n"
             "  rss_state_file: rss_state.json\n"
             "  max_signal_age_sec: 300\n"
             "  tier2_enabled: true\n"
@@ -193,6 +216,7 @@ class TestSettingsDefaults:
         assert cfg["news_events_path"] == "ev.json"
         assert cfg["news_ledger_path"] == "led.json"
         assert cfg["news_regime_vote_path"] == "vote.json"
+        assert cfg["news_nightly_vote_max_age_h"] == {"W2": 2.5}
         assert cfg["news_rss_state_file"] == "rss_state.json"
         assert cfg["news_max_signal_age_sec"] == 300
         assert cfg["news_tier2_enabled"] is True
@@ -208,6 +232,8 @@ class TestSettingsDefaults:
         assert cfg["news_signal_path"] == ""
         assert cfg["news_max_signal_age_sec"] == 900
         assert cfg["news_calendar_min_severity"] == "high"
+        # Absent from settings → None → the NewsConfig default applies.
+        assert cfg["news_nightly_vote_max_age_h"] is None
 
     def test_remembered_defaults_feed_the_dialog_not_the_gate(
             self, tmp_path, monkeypatch):

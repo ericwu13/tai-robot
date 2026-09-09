@@ -135,6 +135,16 @@ news:
                              #   "direction" field, and severity "critical", always
                              #   gate both. Suppression auto-expires at the next
                              #   session boundary unless a fresh risk_off refreshes it.
+  nightly_vote_max_age_h:    # per-source max vote age (hours) for the NIGHTLY lane
+    W2: 4.0                  # W2's edge lives in the ~4h after the fire. The nightly
+                             # lane only reads votes at the ~04:58 classification — the
+                             # END of the session the vote named — and the leg it swings
+                             # goes live at the next 08:45 open, ~20h after a US-session
+                             # fire. Over that lag W2 scored 3/10. Older W2 votes are
+                             # still consumed (deleted), just not shown to the classifier.
+                             # A source not listed here has NO age limit (W3 news and W4
+                             # chips are daily-cadence signals — ageing them out would
+                             # silence them). An empty mapping {} disables the gate.
   regime_vote_thresholds:    # all-symbols-must-breach thresholds for regime vote
     soxx_pct: 2.5
     tsm_pct: 2.0
@@ -171,6 +181,17 @@ regime:
   #   short_half — bearish bias → short leg, half size
   #   long_half  — bullish bias → long leg, half size
   #   both_half  — either bias → matching leg, half size
-  # Independent of this setting, an external W2/W3 vote that agrees with
-  # the price drift always deploys the matching leg at half size.
+  # Independent of this setting, external votes that meet the quorum
+  # below and agree with the price drift deploy the matching leg at half
+  # size.
   range_bias_action: sit_out
+  # How many agreeing external votes (W2/W3/W4, one per source) it takes
+  # to accelerate a regime confirmation or open a range-bound probe.
+  # ASYMMETRIC on purpose: going long on external evidence is the
+  # expensive mistake — W2, the loudest voter, is 3/10 right by the time
+  # the nightly lane reads it — while confirming a DOWN read early is the
+  # cheap, protective direction. Conflict-cancel is unchanged and
+  # absolute: ANY opposing vote kills a range-bound probe, quorum or not.
+  # 0 disables votes for that direction entirely.
+  vote_quorum_up: 2
+  vote_quorum_down: 1
