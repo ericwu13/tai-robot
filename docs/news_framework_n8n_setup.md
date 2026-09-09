@@ -143,11 +143,17 @@ lost exactly this way).
 2. **Code node — threshold logic (two tiers):**
    - Intraday move = `(current − previousClose) / previousClose`.
    - **Signal tier** (may auto-write `risk_off` on the downside): `SOXX` ±2.5%,
-     `TSM` ±3.5%, `QQQ` ±2.0%, `ASML.AS` ±3.0%.
+     `TSM` ±3.5%, `QQQ` ±2.0%.
    - **Alert tier** (Discord only, both directions, **never** writes `signal.json`):
-     `^STOXX50E` ±2.0%, `NQ=F` ±1.5%, `^N225` ±2.0%, `^KS11` ±2.0%. These cover the hours
-     when the signal-tier markets are closed — context for the human, not an auto-trigger.
-   - Fire `risk_off` when any **signal-tier** symbol breaches on the downside.
+     `ASML.AS` ±3.0%, `^STOXX50E` ±2.0%, `NQ=F` ±1.5%, `^N225` ±2.0%, `^KS11` ±2.0%.
+     These cover the hours when the signal-tier markets are closed — context for the
+     human, not an auto-trigger. `ASML.AS` was signal tier until the fire review scored
+     it 20% win as a lone trigger; it keeps its vote thresholds and still counts toward
+     the quorum below, it just cannot fire `risk_off` by itself any more.
+   - Fire `risk_off` when a **signal-tier** symbol breaches on the downside **and the
+     vote quorum agrees** — i.e. ≥ 2 fresh symbols (any tier) breach their vote
+     thresholds down and none breaches up. A lone breach, or one contradicted by a
+     fresh up-breach, posts the Discord alert only and writes no signal.
    - Fire long-side alert when the mirror thresholds hit on the upside.
    - **Regime vote** (`--vote-out regime_vote.json`, separate from the signal): fires when
      ≥ 2 fresh symbols breach their vote thresholds the same way and no fresh symbol

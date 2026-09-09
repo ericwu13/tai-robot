@@ -18,6 +18,25 @@ which fires a *signal*, not a vote.  It was historically numbered "W4" —
 if your n8n instance still shows a workflow named "W4 Manual tap", rename
 or delete it there; the W4 slot belongs to the chips monitor.)
 
+## W2 — 跨市場 cross-market monitor (`crossmarket_monitor.py`)
+
+Two symbol tiers, and one quorum gate on top of both:
+
+| Tier | Symbols | May write `signal.json`? |
+|------|---------|--------------------------|
+| signal | `SOXX` ±2.5%, `TSM` ±3.5%, `QQQ` ±2.0% | yes — downside only, **and only with the vote quorum** |
+| alert | `ASML.AS` ±3.0%, `^STOXX50E` ±2.0%, `NQ=F` ±1.5%, `^N225` ±2.0%, `^KS11` ±2.0%, `^HSI` ±1.5%, `^TWII` ±1.5%, `000001.SS` ±1.5% | never — Discord alert only, both directions |
+
+Every symbol in both tiers carries its own (looser) **vote** thresholds and
+counts toward the quorum: `risk_off` is written only when ≥ `VOTE_MIN_SYMBOLS`
+(2) fresh symbols breach their vote thresholds down and none breaches up.  A
+single signal-tier breach with no quorum posts the alert and writes nothing
+(dedup key `signal-alert-down:<us_date>`, deliberately separate from
+`down:<us_date>` so it can never suppress a later real fire).
+
+Upside never auto-writes anything, in either tier — entering a position
+always needs the human tap.
+
 ## Regime votes in one paragraph
 
 Vote files live next to `news.regime_vote_path` (settings.yaml), one per

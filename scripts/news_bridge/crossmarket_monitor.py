@@ -7,17 +7,27 @@ and posts a Discord alert.
 
 Two symbol tiers (see ``SYMBOLS``):
 
-- ``"signal"`` — US/EU semis + Nasdaq proxies whose moves historically lead
-  TAIEX.  A DOWNSIDE breach writes ``risk_off`` automatically; an UPSIDE
-  breach is a Discord alert only.
-- ``"alert"``  — wider context (EU/JP/KR indices, Nasdaq futures).  Discord
-  alert only in BOTH directions; these symbols NEVER write signal.json.
-  They exist to give the human a heads-up during hours when the signal-tier
-  markets are closed.
+- ``"signal"`` — US semis + Nasdaq proxies whose moves historically lead
+  TAIEX.  A DOWNSIDE breach may write ``risk_off``, but only with the vote
+  quorum behind it (below); an UPSIDE breach is a Discord alert only.
+- ``"alert"``  — wider context (EU semis/indices, JP/KR/HK/CN indices,
+  Nasdaq futures).  Discord alert only in BOTH directions; these symbols
+  NEVER write signal.json on their own.  They exist to give the human a
+  heads-up during hours when the signal-tier markets are closed — and they
+  still carry vote thresholds, so they count toward the quorum.
+
+Quorum gate on ``risk_off`` (the single-symbol veto):
+  A lone signal-tier downside breach is NOT enough to flatten the book.
+  ``risk_off`` is written only when ``_vote_direction`` also returns
+  "trending-down" — i.e. at least VOTE_MIN_SYMBOLS fresh symbols breach
+  their vote thresholds down and none breaches up.  A single-symbol breach
+  (or one contradicted by an up-breach elsewhere) posts the Discord alert
+  and nothing else.  ASML.AS in particular was a 20%-win single trigger,
+  which is why it now sits in the alert tier: it votes, it does not fire.
 
 Safety asymmetry (deliberate, mirrors the design doc):
-- DOWNSIDE breach (signal tier) -> writes `risk_off` automatically (bounded
-  cost if wrong).
+- DOWNSIDE breach (signal tier + quorum) -> writes `risk_off` automatically
+  (bounded cost if wrong).
 - UPSIDE breach (any tier)      -> Discord alert only. Entering a position
   always requires the human: run `--force-fire deploy_long` (or deploy_short)
   yourself, or activate the W5 manual-tap webhook (n8n/W5_manual_tap.json)
@@ -89,10 +99,13 @@ SYMBOLS = {
                   "max_age": 600, "desc": "TSMC ADR"},
     "QQQ":       {"tier": "signal", "down": -2.0, "up": 2.0, "vote": (-2.0, 2.0),
                   "max_age": 600, "desc": "Nasdaq proxy"},
-    "ASML.AS":   {"tier": "signal", "down": -3.0, "up": 3.0, "vote": (-3.0, 3.0),
+    # ── alert tier (never writes signal.json) ─────────────────────────
+    # ASML.AS was signal tier until the fire review: 20% win rate as a
+    # lone trigger.  It keeps its vote thresholds (it still counts toward
+    # the quorum) but can no longer fire risk_off by itself.
+    "ASML.AS":   {"tier": "alert", "down": -3.0, "up": 3.0, "vote": (-3.0, 3.0),
                   "max_age": 1500,
                   "desc": "European semi bellwether (Euronext 15:00-23:30 TPE, delayed)"},
-    # ── alert tier (never writes signal.json) ─────────────────────────
     "^STOXX50E": {"tier": "alert", "down": -2.0, "up": 2.0, "vote": (-2.0, 2.0),
                   "max_age": 1500, "desc": "Euro Stoxx 50 (delayed feed)"},
     "NQ=F":      {"tier": "alert", "down": -1.5, "up": 1.5, "vote": (-1.5, 1.5),
@@ -321,17 +334,25 @@ def _collect_quotes(args) -> tuple[dict[str, dict], dict[str, list[str]], list[s
     return fresh, breaches, details, fetch_failures
 
 
-def _vote_direction(fresh: dict[str, dict]) -> tuple[str | None, list[str], list[str]]:
+def _vote_direction(fresh: dict[str, dict],
+                    min_move: float | None = None) -> tuple[str | None, list[str], list[str]]:
     """Return ``(direction, up_syms, down_syms)``.
 
     *direction* is ``"trending-up"``/``"trending-down"`` when at least
     VOTE_MIN_SYMBOLS fresh symbols breach their vote threshold one way
     and none breaches the other way; ``None`` otherwise.  The caller
     uses *up_syms*/*down_syms* to detect contradictions worth alerting.
+
+    *min_move* is the ``--min-move`` test override: it replaces every
+    symbol's vote thresholds too, so a pipeline smoke test can still
+    reach the quorum that now gates ``risk_off``.
     """
     up, down = [], []
     for sym, q in fresh.items():
-        vote_down, vote_up = VOTE_THRESHOLDS[sym]
+        if min_move is not None:
+            vote_down, vote_up = -min_move, min_move
+        else:
+            vote_down, vote_up = VOTE_THRESHOLDS[sym]
         if q["pct"] >= vote_up:
             up.append(sym)
         elif q["pct"] <= vote_down:
@@ -352,26 +373,51 @@ def check_once(args, state: dict) -> dict:
     fresh, breaches, details, fetch_failures = _collect_quotes(args)
     fired: list[str] = []
 
+    # The vote direction IS the quorum: computed up front because the
+    # risk_off gate below depends on it (a lone signal-tier breach must
+    # not flatten the book).  Pure and cheap, so it runs even without a
+    # --vote-out — the log line then still shows what the vote saw.
+    direction, vote_up_syms, vote_down_syms = _vote_direction(fresh, args.min_move)
+
     # One fire per direction per US-session date (dedup across restarts).
     # Signal-tier fires and alert-tier alerts keep SEPARATE keys so an
     # alert can never suppress a later signal-tier risk_off.
     us_date = (now - timedelta(hours=13)).strftime("%Y-%m-%d")  # rough US session key
 
-    # ── signal tier: downside auto-fires, upside alerts only ──────────
+    # ── signal tier: downside auto-fires WITH QUORUM, upside alerts only ──
     if breaches["signal_down"]:
-        fired.append("signal-down")
-        if state.get(f"down:{us_date}") is None:
-            reason = "downside breach: " + ", ".join(breaches["signal_down"])
-            sid = write_signal(args.signal_out, "risk_off", reason,
-                               "crossmarket-monitor", direction="bearish")
-            state[f"down:{us_date}"] = sid
-            post_discord(args.discord_webhook,
-                         f"🔴 **跨市場警報 Cross-market DOWNSIDE** — {reason}\n"
-                         f"已寫入 risk_off（自動）。要進空單請手動: "
-                         f"`--force-fire deploy_short`")
+        if direction == "trending-down":
+            fired.append("signal-down")
+            if state.get(f"down:{us_date}") is None:
+                reason = "downside breach: " + ", ".join(breaches["signal_down"])
+                sid = write_signal(args.signal_out, "risk_off", reason,
+                                   "crossmarket-monitor", direction="bearish")
+                state[f"down:{us_date}"] = sid
+                post_discord(args.discord_webhook,
+                             f"🔴 **跨市場警報 Cross-market DOWNSIDE** — {reason}\n"
+                             f"已寫入 risk_off（自動）。要進空單請手動: "
+                             f"`--force-fire deploy_short`")
+            else:
+                fired[-1] += "(deduped)"
+                print("  signal-tier downside already fired for this US session — deduped")
         else:
-            fired[-1] += "(deduped)"
-            print("  signal-tier downside already fired for this US session — deduped")
+            # Quorum not met: only one symbol broke, or a fresh symbol
+            # broke the other way.  Alert the human, write nothing.  The
+            # dedup key is deliberately distinct from "down:" so it can
+            # never suppress a real risk_off later in the same session.
+            fired.append("signal-down(no-quorum)")
+            key = f"signal-alert-down:{us_date}"
+            if state.get(key) is None:
+                state[key] = "alerted"
+                post_discord(args.discord_webhook,
+                             "🟠 **跨市場觀察 Cross-market DOWNSIDE (alert tier)** — "
+                             + ", ".join(breaches["signal_down"])
+                             + "\n未達票數門檻，未寫入 risk_off "
+                               "(quorum not met — no risk_off).")
+                print("  signal-tier downside without quorum — Discord alert only")
+            else:
+                fired[-1] += "(deduped)"
+                print("  signal-tier no-quorum downside already alerted — deduped")
 
     if breaches["signal_up"]:
         fired.append("signal-up")
@@ -387,27 +433,29 @@ def check_once(args, state: dict) -> dict:
             print("  signal-tier upside already alerted for this US session — deduped")
 
     # ── alert tier: Discord only, both directions, never signal.json ──
-    for direction, emoji, word in (("down", "🟠", "DOWNSIDE"), ("up", "🔵", "UPSIDE")):
-        hits = breaches[f"alert_{direction}"]
+    # NOTE: the loop variable is `side`, NOT `direction` — `direction`
+    # holds the vote quorum the risk_off gate above used and is read
+    # again by the regime-vote block below.
+    for side, emoji, word in (("down", "🟠", "DOWNSIDE"), ("up", "🔵", "UPSIDE")):
+        hits = breaches[f"alert_{side}"]
         if not hits:
             continue
-        fired.append(f"alert-{direction}")
-        key = f"alert-{direction}:{us_date}"
+        fired.append(f"alert-{side}")
+        key = f"alert-{side}:{us_date}"
         if state.get(key) is not None:
             fired[-1] += "(deduped)"
-            print(f"  alert-tier {direction} already alerted for this US session — deduped")
+            print(f"  alert-tier {side} already alerted for this US session — deduped")
             continue
         state[key] = "alerted"
         post_discord(args.discord_webhook,
                      f"{emoji} **跨市場觀察 Cross-market {word} (alert tier)** — "
                      + ", ".join(hits)
                      + "\n僅通知，未寫入訊號 (alert tier writes no signal).")
-        print(f"  alert-tier {direction} breach — Discord alert only (never a signal)")
+        print(f"  alert-tier {side} breach — Discord alert only (never a signal)")
 
     # ── regime vote: >=2 fresh symbols agree, none disagrees ──────────
-    # The direction is computed every pass (pure, cheap) so the log shows
-    # what the vote logic saw even when no --vote-out is configured.
-    direction, vote_up_syms, vote_down_syms = _vote_direction(fresh)
+    # Same *direction* the risk_off gate above used — one quorum, two
+    # consumers.
     vote_note = direction or "-"
     vote_out = getattr(args, "vote_out", None)
     if direction and vote_out:

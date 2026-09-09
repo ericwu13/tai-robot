@@ -8,6 +8,10 @@ These tests pin that asymmetry, the freshness guard that handles session
 hand-offs between Tokyo/Frankfurt/New York, the per-direction dedup, and
 the 2-of-N regime vote.
 
+The 2-of-N vote is ALSO the quorum that gates `risk_off` (see
+test_crossmarket_monitor_tiers.py), so every downside fire below needs two
+fresh symbols breaching their vote thresholds, not one.
+
 The script lives under scripts/ and is not an importable package, so it is
 loaded by path.  fetch_quote and post_discord are monkeypatched in every
 test — nothing here touches the network.
@@ -113,8 +117,12 @@ def signal_of(args):
 def test_symbol_table_tiers_and_thresholds():
     signal_tier = {s for s, c in cm.SYMBOLS.items() if c["tier"] == "signal"}
     alert_tier = {s for s, c in cm.SYMBOLS.items() if c["tier"] == "alert"}
-    assert signal_tier == {"SOXX", "TSM", "QQQ", "ASML.AS"}
-    assert alert_tier == {"^STOXX50E", "NQ=F", "^N225", "^KS11", "^HSI", "^TWII", "000001.SS"}
+    # ASML.AS moved signal -> alert with the quorum re-tier (20% win as a
+    # lone trigger); it keeps its vote thresholds. See
+    # test_crossmarket_monitor_tiers.py::test_asml_is_alert_tier.
+    assert signal_tier == {"SOXX", "TSM", "QQQ"}
+    assert alert_tier == {"ASML.AS", "^STOXX50E", "NQ=F", "^N225", "^KS11",
+                          "^HSI", "^TWII", "000001.SS"}
 
     for sym, cfg in cm.SYMBOLS.items():
         assert cfg["down"] < 0 < cfg["up"], sym
@@ -140,8 +148,10 @@ def test_freshness_allowance_matches_feed_latency():
 # ── 1. signal tier: downside auto-fires ────────────────────────────────
 
 def test_signal_tier_downside_writes_risk_off(tmp_path, market, discord, frozen_clock):
+    # Quorum re-tier: QQQ now has to breach its own vote threshold too —
+    # a lone SOXX print is an alert, not a circuit breaker.
     market["SOXX"] = quote(-3.1)
-    market["QQQ"] = quote(-0.4)
+    market["QQQ"] = quote(-2.4)
     args = make_args(tmp_path)
 
     state = cm.check_once(args, {})
@@ -157,16 +167,20 @@ def test_signal_tier_downside_writes_risk_off(tmp_path, market, discord, frozen_
     assert any("DOWNSIDE" in m for m in discord)
 
 
-def test_new_signal_tier_symbol_asml_can_fire(tmp_path, market, discord, frozen_clock):
-    """ASML.AS is a signal-tier addition — it must be able to auto-protect."""
+def test_asml_corroborates_but_never_triggers(tmp_path, market, discord, frozen_clock):
+    """Was test_new_signal_tier_symbol_asml_can_fire.  The quorum re-tier
+    demoted ASML.AS to the alert tier (20% win as a lone trigger): it can
+    supply the second vote, but the trigger must come from signal tier."""
     market["ASML.AS"] = quote(-3.4)
+    market["SOXX"] = quote(-2.6)
     args = make_args(tmp_path)
 
     cm.check_once(args, {})
 
     sig = signal_of(args)
     assert sig is not None and sig["action"] == "risk_off"
-    assert "ASML.AS" in sig["reason"]
+    assert "SOXX" in sig["reason"]
+    assert "ASML.AS" not in sig["reason"], "alert-tier symbols never name the fire"
 
 
 def test_below_threshold_does_not_fire(tmp_path, market, discord, frozen_clock):
@@ -249,6 +263,7 @@ def test_stale_breach_is_ignored(tmp_path, market, discord, frozen_clock):
 
 def test_fresh_side_of_the_boundary_still_fires(tmp_path, market, discord, frozen_clock):
     market["SOXX"] = quote(-5.0, age_sec=allowance("SOXX") - 60)
+    market["QQQ"] = quote(-2.6, age_sec=allowance("QQQ") - 60)   # quorum
     args = make_args(tmp_path)
 
     cm.check_once(args, {})
@@ -330,6 +345,7 @@ def test_closed_delayed_market_still_goes_stale(tmp_path, market, discord, froze
 
 def test_ignore_freshness_accepts_stale_quote(tmp_path, market, discord, frozen_clock):
     market["SOXX"] = quote(-5.0, age_sec=6000)
+    market["QQQ"] = quote(-4.0, age_sec=6000)                    # quorum
     args = make_args(tmp_path, ignore_freshness=True)
 
     cm.check_once(args, {})
@@ -342,6 +358,7 @@ def test_ignore_freshness_accepts_stale_quote(tmp_path, market, discord, frozen_
 def test_second_downside_breach_in_same_bucket_is_deduped(
         tmp_path, market, discord, frozen_clock):
     market["SOXX"] = quote(-3.0)
+    market["QQQ"] = quote(-2.6)       # quorum
     args = make_args(tmp_path)
 
     state = cm.check_once(args, {})
@@ -355,6 +372,7 @@ def test_second_downside_breach_in_same_bucket_is_deduped(
 
 def test_dedup_state_survives_reload_from_disk(tmp_path, market, discord, frozen_clock):
     market["SOXX"] = quote(-3.0)
+    market["QQQ"] = quote(-2.6)       # quorum
     args = make_args(tmp_path)
     state_path = tmp_path / "monitor_state.json"
 
@@ -374,6 +392,7 @@ def test_upside_dedup_does_not_block_downside(tmp_path, market, discord, frozen_
     assert signal_of(args) is None
 
     market["SOXX"] = quote(-3.0)
+    market["QQQ"] = quote(-2.6)       # quorum
     cm.check_once(args, state)
 
     assert signal_of(args) is not None
@@ -503,7 +522,10 @@ def test_force_fire_writes_fresh_signal(tmp_path, monkeypatch, discord):
 
 def test_min_move_override_lowers_all_tier_thresholds(
         tmp_path, market, discord, frozen_clock):
+    """--min-move replaces the VOTE thresholds too, so the pipeline smoke
+    test can still reach the quorum that now gates risk_off."""
     market["QQQ"] = quote(-0.6)                      # far from its -2.0 threshold
+    market["SOXX"] = quote(-0.7)                     # far from its -2.5 threshold
     args = make_args(tmp_path, min_move=0.5)
 
     cm.check_once(args, {})
@@ -652,6 +674,7 @@ def test_state_carries_last_check_and_last_result(tmp_path, market, discord, fro
 def test_unwritable_log_does_not_break_the_pass(tmp_path, market, discord, frozen_clock):
     """A monitoring pass that completed must never be lost to a log error."""
     market["SOXX"] = quote(-3.0)
+    market["QQQ"] = quote(-2.6)                # quorum
     blocked = tmp_path / "monitor.log"
     blocked.mkdir()                            # a directory where a file goes
     args = make_args(tmp_path)
