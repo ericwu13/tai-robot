@@ -351,7 +351,11 @@ class ChatClient:
             "content-type": "application/json",
         }
 
-        response = self._client.post(ANTHROPIC_API_URL, json=payload, headers=headers)
+        response = self._post_with_retry(
+            lambda: self._client.post(ANTHROPIC_API_URL, json=payload,
+                                      headers=headers),
+            provider_label="Anthropic",
+        )
 
         if response.status_code != 200:
             error_body = response.text
@@ -431,7 +435,17 @@ class ChatClient:
         if system_instruction:
             payload["system_instruction"] = system_instruction
 
-        response, used_model = self._post_gemini(payload, used_model)
+        # The 404 stale-preview-model fallback lives inside _post_gemini and
+        # is unchanged; the box carries the model it settled on so a retry
+        # after the fallback keeps using the fallback model (issue #108).
+        box = {"model": used_model}
+
+        def _post():
+            resp, box["model"] = self._post_gemini(payload, box["model"])
+            return resp
+
+        response = self._post_with_retry(_post, provider_label="Gemini")
+        used_model = box["model"]
 
         if response.status_code != 200:
             error_body = response.text

@@ -5250,6 +5250,14 @@ class BacktestApp:
             except Exception as e:
                 _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 err_msg = str(e)
+                # Built INSIDE the except — Python 3.13 deletes `e` on exit.
+                # Weekly-auto runs must not die silently (issue #108): a
+                # plan-phase failure only reached the log before this.
+                # Manual runs stay Discord-quiet, like the other EVO
+                # failure branches above.
+                if auto_run:
+                    _notify_discord(
+                        f"🧬 EVO ERROR: [{type(e).__name__}] {e}")
                 ui(self._on_chat_error, err_msg)
             finally:
                 ui(lambda: self.btn_send.config(state=tk.NORMAL))
