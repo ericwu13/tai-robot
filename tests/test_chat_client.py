@@ -15,6 +15,7 @@ from src.ai.chat_client import (
     GOOGLE_MODEL_PRO,
     GOOGLE_MODEL_ULTRA,
     _CONVERSATION_CHAR_LIMIT,
+    _RETRY_ATTEMPTS,
     _classify_model,
     _format_usage_line,
     model_for_tier,
@@ -667,13 +668,23 @@ class TestGeminiModelFallback:
             client.one_shot("hi", call_site="test", model=GOOGLE_MODEL_PRO)
         assert client._client.post.call_count == 1
 
-    def test_non_404_error_not_retried(self):
+    def test_non_404_error_does_not_trigger_model_fallback(self):
+        """Rewritten for issue #108: a 429 is now retried on the SAME model.
+
+        Pre-#108 this pinned ``post.call_count == 1`` (no retry at all).
+        The model-fallback behaviour it actually guards — only a 404 may
+        switch models — is unchanged: every attempt still targets the
+        ultra model, never the configured default.
+        """
         client = self._make_client()
         client._client = MagicMock()
         client._client.post.return_value = _google_error("rate limited", 429)
-        with pytest.raises(RuntimeError):
-            client.one_shot("hi", call_site="test", model=GOOGLE_MODEL_ULTRA)
-        assert client._client.post.call_count == 1
+        with pytest.raises(RuntimeError, match="429"):
+            with patch("src.ai.chat_client.time.sleep"):
+                client.one_shot("hi", call_site="test", model=GOOGLE_MODEL_ULTRA)
+        urls = [c[0][0] for c in client._client.post.call_args_list]
+        assert urls, "expected at least one POST"
+        assert all(GOOGLE_MODEL_ULTRA in u for u in urls)
 
     def test_send_message_also_falls_back(self):
         client = self._make_client()
@@ -690,3 +701,118 @@ class TestGeminiModelFallback:
         # Regression: "gemini-3.1-pro" (no -preview) 404s on v1beta —
         # verified against ListModels 2026-06-11.
         assert GOOGLE_MODEL_ULTRA == "gemini-3.1-pro-preview"
+
+
+class TestTransientRetry:
+    """issue #108 — a transient model outage (Gemini 503 "experiencing high
+    demand") used to kill the whole evolution run on the first response.
+    ``one_shot`` now retries 429/5xx with backoff; permanent errors still
+    fail fast on the first response.
+    """
+
+    def _google(self) -> ChatClient:
+        return ChatClient("goog-test", provider=PROVIDER_GOOGLE,
+                          model=GOOGLE_MODEL_PRO)
+
+    def _anthropic(self) -> ChatClient:
+        return ChatClient("sk-test", provider=PROVIDER_ANTHROPIC)
+
+    # ── recovery ──
+
+    def test_google_503_then_success(self):
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _google_error("This model is currently experiencing high demand", 503),
+            _google_error("high demand", 503),
+            _google_response("candidate code"),
+        ]
+        with patch("src.ai.chat_client.time.sleep") as sleep:
+            out = client.one_shot("generate", call_site="evolution_codegen_1")
+        assert "candidate code" in out
+        assert client._client.post.call_count == 3
+        assert [c[0][0] for c in sleep.call_args_list] == [1.0, 2.0]
+
+    def test_anthropic_503_then_success(self):
+        client = self._anthropic()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _anthropic_error("overloaded", 503),
+            _anthropic_response("candidate code"),
+        ]
+        with patch("src.ai.chat_client.time.sleep"):
+            out = client.one_shot("generate")
+        assert "candidate code" in out
+        assert client._client.post.call_count == 2
+
+    def test_google_429_then_success(self):
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _google_error("quota exceeded", 429),
+            _google_response("ok"),
+        ]
+        with patch("src.ai.chat_client.time.sleep"):
+            assert "ok" in client.one_shot("generate")
+        assert client._client.post.call_count == 2
+
+    # ── bounded give-up ──
+
+    def test_google_gives_up_after_bounded_attempts(self):
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_error("high demand", 503)
+        with patch("src.ai.chat_client.time.sleep"):
+            with pytest.raises(RuntimeError, match="503"):
+                client.one_shot("generate")
+        assert client._client.post.call_count == _RETRY_ATTEMPTS
+
+    def test_anthropic_gives_up_after_bounded_attempts(self):
+        client = self._anthropic()
+        client._client = MagicMock()
+        client._client.post.return_value = _anthropic_error("overloaded", 502)
+        with patch("src.ai.chat_client.time.sleep"):
+            with pytest.raises(RuntimeError, match="502"):
+                client.one_shot("generate")
+        assert client._client.post.call_count == _RETRY_ATTEMPTS
+
+    # ── permanent errors still fail fast ──
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    def test_google_permanent_error_fails_fast(self, status):
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_error("nope", status)
+        with pytest.raises(RuntimeError, match=str(status)):
+            client.one_shot("generate")
+        assert client._client.post.call_count == 1
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    def test_anthropic_permanent_error_fails_fast(self, status):
+        client = self._anthropic()
+        client._client = MagicMock()
+        client._client.post.return_value = _anthropic_error("nope", status)
+        with pytest.raises(RuntimeError, match=str(status)):
+            client.one_shot("generate")
+        assert client._client.post.call_count == 1
+
+    # ── the 404 stale-model fallback must survive the retry wrapper ──
+
+    def test_retry_after_404_fallback_stays_on_fallback_model(self):
+        """404 on the preview id → fall back to the default model; a 503 on
+        the FALLBACK must retry the fallback, not resurrect the dead id."""
+        client = self._google()
+        client._client = MagicMock()
+        client._client.post.side_effect = [
+            _google_error("model not found", 404),   # ultra
+            _google_error("high demand", 503),       # pro (fallback)
+            _google_response("plan text"),           # pro
+        ]
+        with patch("src.ai.chat_client.time.sleep"):
+            out = client.one_shot("hi", call_site="test", model=GOOGLE_MODEL_ULTRA)
+        assert "plan text" in out
+        urls = [c[0][0] for c in client._client.post.call_args_list]
+        assert client._client.post.call_count == 3
+        assert GOOGLE_MODEL_ULTRA in urls[0]
+        assert GOOGLE_MODEL_PRO in urls[1] and GOOGLE_MODEL_ULTRA not in urls[1]
+        assert GOOGLE_MODEL_PRO in urls[2] and GOOGLE_MODEL_ULTRA not in urls[2]
