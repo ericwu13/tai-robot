@@ -71,6 +71,13 @@ class RegimeConfig:
     # that direction entirely.
     vote_quorum_up: int = 2
     vote_quorum_down: int = 1
+    # May a quorum of votes plus agreeing drift open a half-size probe out
+    # of a FLAT range-bound session? Default False. External signals may
+    # only ADD in the direction the regime leg already holds — never open
+    # a position from flat. This does NOT gate vote acceleration of a
+    # trend confirmation in step(), which is exactly "adding in the
+    # direction the regime already holds".
+    vote_range_probe: bool = False
     manual_override: str = "auto"        # "auto" | "long" | "short" | "sit_out"
     classify_interval: int = 3600
     # --- Flip-pause / streak semantics ----------------------------------

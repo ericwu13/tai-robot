@@ -11,14 +11,16 @@ Two jobs:
    ``decision`` columns exactly. If it cannot reproduce what the bot did,
    its claims about the new rules are worthless.
 2. **The change.** Under the current rules the engine leaves the stale
-   ``trending-down`` on 2026-08-21 instead of 2026-08-28, and never arms
-   a pause at all.
+   ``trending-down`` on 2026-08-21 instead of 2026-08-28, never arms a
+   pause at all, and opens no half-size vote probe out of a flat range
+   (``vote_range_probe`` defaults to False).
 """
 
 from src.regime.replay import HistoryRow, diff_sessions, parse_votes, replay
 from src.regime.state_machine import RegimeConfig
 
 LEGACY_RULES = dict(pause_freezes_exits=True,
+                    vote_range_probe=True,
                     exits_count_as_flips=True,
                     transitional_resets_streak=True)
 
@@ -138,18 +140,33 @@ def test_diff_between_the_two_rule_sets():
         ("2026-08-19", "trending-down", "trending-down", "hold", "deploy_short"),
         ("2026-08-20", "trending-down", "trending-down", "hold", "deploy_short"),
         ("2026-08-21", "trending-down", "range-bound", "hold", "sit_out"),
-        ("2026-08-24", "trending-down", "range-bound", "deploy_short", "deploy_short_half"),
+        ("2026-08-24", "trending-down", "range-bound", "deploy_short", "sit_out"),
         ("2026-08-25", "trending-down", "range-bound", "deploy_short", "sit_out"),
         ("2026-08-26", "trending-down", "range-bound", "deploy_short", "sit_out"),
-        ("2026-08-27", "trending-down", "range-bound", "deploy_short", "deploy_long_half"),
+        ("2026-08-27", "trending-down", "range-bound", "deploy_short", "sit_out"),
+        ("2026-08-28", "range-bound", "range-bound", "deploy_short_half", "sit_out"),
+        ("2026-08-31", "range-bound", "range-bound", "deploy_short_half", "sit_out"),
+        ("2026-09-07", "range-bound", "range-bound", "deploy_long_half", "sit_out"),
+        ("2026-09-08", "range-bound", "range-bound", "deploy_long_half", "sit_out"),
     ]
 
 
-def test_the_two_rule_sets_agree_from_08_28_onward():
-    """The change is bounded to the frozen stretch — once the legacy run
-    catches up on 08-28 the two are identical again."""
+def test_the_two_rule_sets_agree_on_effective_from_08_28_onward():
+    """The regime change is bounded to the frozen stretch — once the
+    legacy run catches up on 08-28 both read range-bound. What still
+    differs after that is only the vote probe (see the test below)."""
     tail = [(a, b) for a, b in zip(legacy_run(), new_run())
             if a.date >= "2026-08-28"]
     assert tail
     for a, b in tail:
-        assert (a.effective, a.decision) == (b.effective, b.decision), a.date
+        assert a.effective == b.effective, a.date
+
+
+def test_new_rules_never_open_a_probe_from_a_flat_range():
+    """External votes may only add in the direction the regime leg
+    already holds. Every half-size probe the recording opened out of a
+    flat range — including 08-24 and 08-27, both of which moved AGAINST
+    the vote — becomes sit_out."""
+    probes = [s.date for s in legacy_run() if s.decision.endswith("_half")]
+    assert probes == ["2026-08-28", "2026-08-31", "2026-09-07", "2026-09-08"]
+    assert not [s for s in new_run() if s.decision.endswith("_half")]

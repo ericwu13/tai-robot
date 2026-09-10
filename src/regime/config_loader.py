@@ -46,6 +46,7 @@ _SETTINGS_KEY_MAP = {
     "regime_range_bias_action": "range_bias_action",
     "regime_vote_quorum_up": "vote_quorum_up",
     "regime_vote_quorum_down": "vote_quorum_down",
+    "regime_vote_range_probe": "vote_range_probe",
     "regime_pause_freezes_exits": "pause_freezes_exits",
     "regime_exits_count_as_flips": "exits_count_as_flips",
     "regime_transitional_resets_streak": "transitional_resets_streak",

@@ -470,6 +470,11 @@ def _load_settings():
                 0, int(regime.get("vote_quorum_up", 2) or 0))
             cfg["regime_vote_quorum_down"] = max(
                 0, int(regime.get("vote_quorum_down", 1) or 0))
+            # May votes open a half-size probe from a flat range? Off by
+            # default — external signals may only add in the direction the
+            # regime leg already holds.
+            cfg["regime_vote_range_probe"] = bool(
+                regime.get("vote_range_probe", False))
             # Flip-pause / streak semantics. Defaults are the current
             # rules; True on any of them restores the legacy behaviour
             # (see RegimeConfig / CLAUDE.md "Regime Switching").

@@ -90,6 +90,7 @@ _RULE_KEYS = {
     "pause_freezes_exits": "regime_pause_freezes_exits",
     "exits_count_as_flips": "regime_exits_count_as_flips",
     "transitional_resets_streak": "regime_transitional_resets_streak",
+    "vote_range_probe": "regime_vote_range_probe",
 }
 
 

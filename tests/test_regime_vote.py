@@ -429,13 +429,18 @@ def test_votes_stamped_into_last_features():
 def test_range_bound_with_agreeing_vote_deploys_half_size():
     """The 2026-08 grind-up case: ADX below adx_exit (range-bound) while
     price drifts up and an external vote says trending-up → the selector
-    deploys the long leg half-size instead of sitting out."""
+    deploys the long leg half-size instead of sitting out.
+
+    vote_range_probe=True: the probe is opt-in now (default False —
+    external votes may only add in the direction the regime leg already
+    holds, never open from flat). This pins what the knob enables."""
     from src.regime.selector import StrategySelector
 
     m = RegimeStateMachine()
     sel = StrategySelector()
     cfg = RegimeConfig(enabled=True, confirm_sessions=2,
-                       long_strategy="LongBot", short_strategy="ShortBot")
+                       long_strategy="LongBot", short_strategy="ShortBot",
+                       vote_range_probe=True)
     s = RegimeState(effective_regime="range-bound",
                     effective_since="2026-08-06")
 

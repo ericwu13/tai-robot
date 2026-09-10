@@ -36,6 +36,7 @@ from src.regime.replay import (                            # noqa: E402
 from src.regime.state_machine import RegimeConfig          # noqa: E402
 
 LEGACY_RULES = dict(pause_freezes_exits=True,
+                    vote_range_probe=True,
                     exits_count_as_flips=True,
                     transitional_resets_streak=True)
 

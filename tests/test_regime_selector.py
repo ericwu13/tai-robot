@@ -78,13 +78,14 @@ def test_paused_range_bound_sits_out():
 
 def test_paused_range_bound_can_still_probe():
     """...including the range-bound probe rules: the pause gates the
-    ENGINE's trend entries, not the selector's half-size range probe."""
+    ENGINE's trend entries, not the selector's half-size range probe.
+    (vote_range_probe=True — the probe is opt-in, see probe_cfg below.)"""
     sel = StrategySelector()
     s = RegimeState(effective_regime="range-bound",
                     last_features={"_paused": True, "ema_slope": -5.0,
                                    "direction": "bearish",
                                    "_votes": ["trending-down"]})
-    rec = sel.select(s, cfg(vote_quorum_down=1))
+    rec = sel.select(s, cfg(vote_quorum_down=1, vote_range_probe=True))
     assert rec.action == "deploy_short_half"
     assert rec.qty_scale == 0.5
 
@@ -204,6 +205,47 @@ def _range_state(slope, direction="bullish", votes=None, extra=None):
     return RegimeState(effective_regime="range-bound", last_features=feats)
 
 
+def probe_cfg(**kw):
+    """The vote-probe tests below opt IN to the range probe.
+
+    ``vote_range_probe`` defaults to False: external votes may only add in
+    the direction the regime leg already holds, never open a position out
+    of a flat range. These tests pin what the knob enables when a bot
+    turns it on — see test_range_bound_votes_do_not_probe_by_default for
+    the default."""
+    kw.setdefault("vote_range_probe", True)
+    return cfg(**kw)
+
+
+def test_range_bound_votes_do_not_probe_by_default():
+    """Two agreeing votes + matching drift, default config: no probe. The
+    vote is external evidence, and the regime leg is flat — opening from
+    flat on it is the thing the rule forbids."""
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up", "trending-up"])
+    rec = sel.select(s, cfg())
+    assert rec.action == "sit_out"
+    assert rec.strategy_name == ""
+
+
+def test_range_bound_probe_knob_restores_the_half_size_probe():
+    sel = StrategySelector()
+    s = _range_state(slope=101.0, votes=["trending-up", "trending-up"])
+    rec = sel.select(s, cfg(vote_range_probe=True))
+    assert rec.action == "deploy_long_half"
+    assert rec.qty_scale == 0.5
+
+
+def test_range_bound_probe_off_still_honours_technical_bias():
+    """Turning the vote probe off does not disable range_bias_action —
+    range-bound falls through to the technical-bias path as before."""
+    sel = StrategySelector()
+    s = _range_state(slope=-50.0, direction="bearish",
+                     votes=["trending-down"])
+    rec = sel.select(s, cfg(range_bias_action="short_half"))
+    assert rec.action == "deploy_short_half"
+
+
 def test_range_bound_vote_up_with_updrift_deploys_long_half():
     """TWO bullish external votes + positive drift beat sit_out — even
     with range_bias_action=sit_out (the fusion path bypasses that knob).
@@ -213,7 +255,7 @@ def test_range_bound_vote_up_with_updrift_deploys_long_half():
     See test_range_bound_single_up_vote_sits_out below."""
     sel = StrategySelector()
     s = _range_state(slope=101.0, votes=["trending-up", "trending-up"])
-    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    rec = sel.select(s, probe_cfg(range_bias_action="sit_out"))
     assert rec.action == "deploy_long_half"
     assert rec.strategy_name == "LongBot"
     assert rec.qty_scale == 0.5
@@ -223,7 +265,7 @@ def test_range_bound_single_up_vote_sits_out():
     """One up vote is below vote_quorum_up (2) — the probe stays shut."""
     sel = StrategySelector()
     s = _range_state(slope=101.0, votes=["trending-up"])
-    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    rec = sel.select(s, probe_cfg(range_bias_action="sit_out"))
     assert rec.action == "sit_out"
 
 
@@ -232,7 +274,7 @@ def test_range_bound_single_down_vote_still_deploys_short_half():
     one source is the cheap direction, and this is unchanged behaviour."""
     sel = StrategySelector()
     s = _range_state(slope=-50.0, votes=["trending-down"])
-    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    rec = sel.select(s, probe_cfg(range_bias_action="sit_out"))
     assert rec.action == "deploy_short_half"
     assert rec.qty_scale == 0.5
 
@@ -243,21 +285,21 @@ def test_range_bound_one_opposing_vote_still_cancels_a_quorum():
     sel = StrategySelector()
     s = _range_state(slope=101.0,
                      votes=["trending-up", "trending-up", "trending-down"])
-    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    rec = sel.select(s, probe_cfg(range_bias_action="sit_out"))
     assert rec.action == "sit_out"
 
 
 def test_range_bound_quorum_is_configurable():
     sel = StrategySelector()
     s = _range_state(slope=101.0, votes=["trending-up"])
-    rec = sel.select(s, cfg(range_bias_action="sit_out", vote_quorum_up=1))
+    rec = sel.select(s, probe_cfg(range_bias_action="sit_out", vote_quorum_up=1))
     assert rec.action == "deploy_long_half"
 
 
 def test_range_bound_vote_down_with_downdrift_deploys_short_half():
     sel = StrategySelector()
     s = _range_state(slope=-50.0, direction="bearish", votes=["trending-down"])
-    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    rec = sel.select(s, probe_cfg(range_bias_action="sit_out"))
     assert rec.action == "deploy_short_half"
     assert rec.strategy_name == "ShortBot"
     assert rec.qty_scale == 0.5
@@ -268,7 +310,7 @@ def test_range_bound_vote_against_drift_ignored():
     disagree → sit out."""
     sel = StrategySelector()
     s = _range_state(slope=-50.0, direction="bearish", votes=["trending-up"])
-    rec = sel.select(s, cfg())
+    rec = sel.select(s, probe_cfg())
     assert rec.action == "sit_out"
 
 
@@ -277,7 +319,7 @@ def test_range_bound_conflicting_votes_cancel():
     back to the technical-bias-only path (sit_out by default)."""
     sel = StrategySelector()
     s = _range_state(slope=101.0, votes=["trending-up", "trending-down"])
-    rec = sel.select(s, cfg(range_bias_action="sit_out"))
+    rec = sel.select(s, probe_cfg(range_bias_action="sit_out"))
     assert rec.action == "sit_out"
 
 
@@ -291,7 +333,7 @@ def test_range_bound_vote_needs_only_slope_agreement():
     sel = StrategySelector()
     s = _range_state(slope=98.8, direction="bearish",
                      votes=["trending-up", "trending-up"])
-    rec = sel.select(s, cfg())
+    rec = sel.select(s, probe_cfg())
     assert rec.action == "deploy_long_half"
 
 
@@ -299,7 +341,7 @@ def test_vote_does_not_override_vol_spike():
     sel = StrategySelector()
     s = _range_state(slope=101.0, votes=["trending-up", "trending-up"],
                      extra={"_vol_spike": True})
-    rec = sel.select(s, cfg())
+    rec = sel.select(s, probe_cfg())
     assert rec.action == "sit_out"
     assert "volatility" in rec.reason
 
@@ -308,7 +350,7 @@ def test_vote_does_not_override_event_risk():
     sel = StrategySelector()
     s = _range_state(slope=101.0, votes=["trending-up", "trending-up"],
                      extra={"_event_risk": "FOMC"})
-    rec = sel.select(s, cfg())
+    rec = sel.select(s, probe_cfg())
     assert rec.action == "sit_out"
     assert "FOMC" in rec.reason
 
@@ -318,7 +360,7 @@ def test_trending_up_ignores_votes_stays_full_size():
     sel = StrategySelector()
     s = RegimeState(effective_regime="trending-up",
                     last_features={"_votes": ["trending-down"]})
-    rec = sel.select(s, cfg())
+    rec = sel.select(s, probe_cfg())
     assert rec.action == "deploy_long"
     assert rec.qty_scale == 1.0
 

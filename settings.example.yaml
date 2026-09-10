@@ -195,6 +195,13 @@ regime:
   # 0 disables votes for that direction entirely.
   vote_quorum_up: 2
   vote_quorum_down: 1
+  # May votes open a position out of a FLAT range-bound session?
+  # Default off — external votes may only CONFIRM a trend the technicals
+  # already show, never open a position from flat. Set true to let a
+  # quorum of agreeing votes plus matching EMA drift open a half-size
+  # probe. Note "half" is still 1 lot today (the minimum), so a probe is
+  # a full-size position in practice.
+  vote_range_probe: false
   # Flip-pause / streak semantics. The defaults below are the CURRENT
   # rules; flip one to true only to restore the legacy behaviour.
   # true = a flip pause freezes everything (legacy). false = it freezes
