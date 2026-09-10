@@ -29,8 +29,13 @@ class StrategySelector:
             name = cfg.long_strategy if action == "deploy_long" else (cfg.short_strategy if action == "deploy_short" else "")
             return Recommendation(action, name, reason=f"手動覆寫 manual override: {state.manual_override}")
 
-        # Paused
-        if state.last_features.get("_paused"):
+        # Paused. The pause freezes trend ENTRIES, so a paused engine
+        # that is still holding a trend holds its deployment. But the
+        # machine can now EXIT to range-bound while paused, and a
+        # range-bound read must reach its own branch (sit_out / probe) —
+        # holding there would keep the dead leg deployed for the whole
+        # pause window, which is exactly what this change removes.
+        if state.last_features.get("_paused") and state.effective_regime != "range-bound":
             return Recommendation("hold", "", reason="翻轉計數暫停中 flip-counter pause active")
 
         # Scheduled event risk — the flag value is the event NAME, stamped
@@ -67,17 +72,24 @@ class StrategySelector:
             # sources to probe long, one to probe short — see
             # RegimeConfig), while conflict-cancel stays absolute: ANY
             # opposing vote, quorum or not, kills the probe.
-            votes = features.get("_votes") or []
-            ups = sum(1 for v in votes if v == "trending-up")
-            downs = sum(1 for v in votes if v == "trending-down")
-            vote_up = cfg.vote_quorum_up > 0 and ups >= cfg.vote_quorum_up
-            vote_down = cfg.vote_quorum_down > 0 and downs >= cfg.vote_quorum_down
-            if vote_up and not downs and slope > 0:
-                return Recommendation("deploy_long_half", cfg.long_strategy, qty_scale=0.5,
-                                     reason="盤整+外部看多票 — 半倉多單 range-bound + external bullish vote — half-size long")
-            if vote_down and not ups and slope < 0:
-                return Recommendation("deploy_short_half", cfg.short_strategy, qty_scale=0.5,
-                                     reason="盤整+外部看空票 — 半倉空單 range-bound + external bearish vote — half-size short")
+            #
+            # Gated by cfg.vote_range_probe, default OFF: a probe opens a
+            # position from FLAT on external evidence, which is the one
+            # thing external signals may not do — they may only add in the
+            # direction the regime leg already holds. Vote acceleration of
+            # a trend CONFIRMATION (state_machine.step) is unaffected.
+            if cfg.vote_range_probe:
+                votes = features.get("_votes") or []
+                ups = sum(1 for v in votes if v == "trending-up")
+                downs = sum(1 for v in votes if v == "trending-down")
+                vote_up = cfg.vote_quorum_up > 0 and ups >= cfg.vote_quorum_up
+                vote_down = cfg.vote_quorum_down > 0 and downs >= cfg.vote_quorum_down
+                if vote_up and not downs and slope > 0:
+                    return Recommendation("deploy_long_half", cfg.long_strategy, qty_scale=0.5,
+                                         reason="盤整+外部看多票 — 半倉多單 range-bound + external bullish vote — half-size long")
+                if vote_down and not ups and slope < 0:
+                    return Recommendation("deploy_short_half", cfg.short_strategy, qty_scale=0.5,
+                                         reason="盤整+外部看空票 — 半倉空單 range-bound + external bearish vote — half-size short")
 
             bearish = slope < 0 and features.get("direction") == "bearish"
             bullish = slope > 0 and features.get("direction") == "bullish"
