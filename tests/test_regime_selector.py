@@ -55,11 +55,38 @@ def test_range_bound_bearish_short_half():
 
 
 def test_paused_holds():
+    """Paused while still holding a TREND: keep the deployment as-is."""
     sel = StrategySelector()
     s = RegimeState(effective_regime="trending-up",
                     last_features={"_paused": True})
     rec = sel.select(s, cfg())
     assert rec.action == "hold"
+
+
+def test_paused_range_bound_sits_out():
+    """The state machine can now exit to range-bound DURING a pause.
+    Holding there would keep the dead leg deployed for the whole pause
+    window — the range-bound branch must run instead."""
+    sel = StrategySelector()
+    s = RegimeState(effective_regime="range-bound",
+                    last_features={"_paused": True, "ema_slope": 5.0,
+                                   "direction": "bullish"})
+    rec = sel.select(s, cfg())
+    assert rec.action == "sit_out"
+    assert rec.strategy_name == ""
+
+
+def test_paused_range_bound_can_still_probe():
+    """...including the range-bound probe rules: the pause gates the
+    ENGINE's trend entries, not the selector's half-size range probe."""
+    sel = StrategySelector()
+    s = RegimeState(effective_regime="range-bound",
+                    last_features={"_paused": True, "ema_slope": -5.0,
+                                   "direction": "bearish",
+                                   "_votes": ["trending-down"]})
+    rec = sel.select(s, cfg(vote_quorum_down=1))
+    assert rec.action == "deploy_short_half"
+    assert rec.qty_scale == 0.5
 
 
 def test_vol_spike_sits_out():

@@ -470,6 +470,15 @@ def _load_settings():
                 0, int(regime.get("vote_quorum_up", 2) or 0))
             cfg["regime_vote_quorum_down"] = max(
                 0, int(regime.get("vote_quorum_down", 1) or 0))
+            # Flip-pause / streak semantics. Defaults are the current
+            # rules; True on any of them restores the legacy behaviour
+            # (see RegimeConfig / CLAUDE.md "Regime Switching").
+            cfg["regime_pause_freezes_exits"] = bool(
+                regime.get("pause_freezes_exits", False))
+            cfg["regime_exits_count_as_flips"] = bool(
+                regime.get("exits_count_as_flips", False))
+            cfg["regime_transitional_resets_streak"] = bool(
+                regime.get("transitional_resets_streak", False))
             _rba = str(regime.get("range_bias_action", "sit_out") or "sit_out")
             cfg["regime_range_bias_action"] = (
                 _rba if _rba in ("sit_out", "short_half", "long_half", "both_half")

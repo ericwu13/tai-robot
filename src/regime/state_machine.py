@@ -73,6 +73,23 @@ class RegimeConfig:
     vote_quorum_down: int = 1
     manual_override: str = "auto"        # "auto" | "long" | "short" | "sit_out"
     classify_interval: int = 3600
+    # --- Flip-pause / streak semantics ----------------------------------
+    # All three default to the CURRENT rules; setting one True restores the
+    # legacy behaviour it replaced (kept as an escape hatch, and as the
+    # oracle the parity tests replay against).
+    #
+    # False: a pause freezes trend ENTRIES only — the engine may still exit
+    #        to range-bound (which makes the selector sit out).
+    # True : legacy — a pause freezes the machine entirely.
+    pause_freezes_exits: bool = False
+    # False: only trend entries (range-bound→trend, trend→opposite trend)
+    #        count toward max_flips.  True: legacy — exits count too, so a
+    #        calm→trend→calm sequence self-armed a pause.
+    exits_count_as_flips: bool = False
+    # False: a transitional (dead-zone ADX) read neither increments nor
+    #        resets the pending streak.  True: legacy — it zeroed the
+    #        streak, so a single dead-zone night restarted confirmation.
+    transitional_resets_streak: bool = False
 
 
 @dataclass
@@ -151,14 +168,25 @@ class RegimeStateMachine:
         vol_spike = result.atr_ratio > cfg.vol_spike_ratio
 
         # --- 3. Flip-counter pause check ---
-        if s.paused_until_session > 0 and s.session_count <= s.paused_until_session:
+        # The pause exists to stop the engine whipsawing between the long
+        # and short legs. It is NOT a reason to keep a stale trend
+        # deployed: while paused the machine still assesses, and a
+        # confirmed EXIT to range-bound is still applied (the selector
+        # then sits out). Only trend ENTRIES are frozen.
+        paused = s.paused_until_session > 0 and s.session_count <= s.paused_until_session
+        if paused:
             s.last_features["_paused"] = True
-            s.last_features["_vol_spike"] = vol_spike
-            return s   # frozen
+            if cfg.pause_freezes_exits:
+                s.last_features["_vol_spike"] = vol_spike
+                return s   # legacy: frozen entirely
 
         # --- 4. Hysteresis confirmation ---
         if raw == "transitional":
-            s.pending_count = 0   # reset streak but don't change effective
+            # A dead-zone read is an absence of evidence, not evidence
+            # against the pending streak: by default it neither
+            # increments nor resets pending_count.
+            if cfg.transitional_resets_streak:
+                s.pending_count = 0   # legacy: reset streak (effective unchanged)
         else:
             strong = cfg.adx_strong > cfg.adx_enter and adx > cfg.adx_strong
             if raw == s.pending_label:
@@ -170,7 +198,18 @@ class RegimeStateMachine:
             needed = _vote_quorum(cfg, raw)
             agreeing = sum(1 for v in votes if v == raw)
             vote_agrees = needed > 0 and agreeing >= needed
-            if raw != s.effective_regime and (s.pending_count >= cfg.confirm_sessions or strong or vote_agrees):
+            confirmed = raw != s.effective_regime and (
+                s.pending_count >= cfg.confirm_sessions or strong or vote_agrees)
+            # An entry is any move INTO a trend (from range-bound, from
+            # unknown, or a reversal). Everything else is an exit to
+            # range-bound. A pause blocks entries only; the streak is
+            # left intact so it confirms the session the pause lifts.
+            # (Votes only ever agree with a trending raw, so the
+            # acceleration path is inert while paused.)
+            is_entry = raw != "range-bound"
+            if confirmed and paused and is_entry:
+                confirmed = False
+            if confirmed:
                 # Audit: did the vote alone confirm this flip (hysteresis
                 # not yet satisfied, no adx_strong fast-track)?
                 if vote_agrees and s.pending_count < cfg.confirm_sessions and not strong:
@@ -179,18 +218,19 @@ class RegimeStateMachine:
                 s.effective_regime = raw
                 s.effective_since = session_date
                 s.pending_count = 0
-                s.flip_history.append(session_date)
-                s.flip_history = s.flip_history[-cfg.flip_window:]
-                # Flip-counter pause: max_flips within the last flip_window
-                # SESSIONS (a true sliding window — lifetime flip count is
-                # irrelevant, so an old bot doesn't pause on every flip).
-                s.flip_sessions.append(s.session_count)
-                s.flip_sessions = [
-                    c for c in s.flip_sessions
-                    if s.session_count - c < cfg.flip_window
-                ]
-                if len(s.flip_sessions) >= cfg.max_flips:
-                    s.paused_until_session = s.session_count + cfg.pause_sessions
+                if is_entry or cfg.exits_count_as_flips:
+                    s.flip_history.append(session_date)
+                    s.flip_history = s.flip_history[-cfg.flip_window:]
+                    # Flip-counter pause: max_flips within the last flip_window
+                    # SESSIONS (a true sliding window — lifetime flip count is
+                    # irrelevant, so an old bot doesn't pause on every flip).
+                    s.flip_sessions.append(s.session_count)
+                    s.flip_sessions = [
+                        c for c in s.flip_sessions
+                        if s.session_count - c < cfg.flip_window
+                    ]
+                    if len(s.flip_sessions) >= cfg.max_flips:
+                        s.paused_until_session = s.session_count + cfg.pause_sessions
 
         s.last_features["_vol_spike"] = vol_spike
         return s

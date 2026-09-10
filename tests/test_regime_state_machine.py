@@ -35,6 +35,9 @@ def test_transitional_does_not_change_effective():
     s = _step(m, s, cfg, make_result(adx=22.0), "2026-01-01")
     assert s.raw_regime == "transitional"
     assert s.effective_regime == "unknown"
+    # pending_count is 0 because nothing has been pending yet — a
+    # transitional read no longer RESETS an existing streak (see
+    # test_transitional_does_not_reset_the_streak).
     assert s.pending_count == 0
 
 
@@ -93,7 +96,9 @@ def test_flip_counter_triggers_pause():
     s = _step(m, s, cfg, make_result(adx=35.0, plus_di=30, minus_di=10), "2026-01-03")
     assert len(s.flip_history) == 3
     assert s.paused_until_session == s.session_count + 2
-    # Next session is frozen: effective regime does not move and _paused flags.
+    # Next session is frozen: the read below is a trending ENTRY, which a
+    # pause still blocks. (Exits to range-bound are no longer frozen —
+    # see test_pause_still_allows_exit_to_range_bound.)
     frozen_before = s.effective_regime
     s = _step(m, s, cfg, make_result(adx=35.0, plus_di=10, minus_di=30), "2026-01-04")
     assert s.last_features.get("_paused") is True
@@ -157,3 +162,165 @@ def test_manual_override_field_preserved_through_step():
     s = RegimeState(manual_override="long")
     s = _step(m, s, cfg, make_result(adx=35.0), "2026-01-01")
     assert s.manual_override == "long"
+
+
+# ── Pause / flip / streak semantics ─────────────────────────────────────
+#
+# Three rules, each with a legacy escape hatch on RegimeConfig:
+#   1. a flip pause freezes trend ENTRIES only (pause_freezes_exits)
+#   2. only trend entries count toward max_flips (exits_count_as_flips)
+#   3. a transitional read leaves the streak alone (transitional_resets_streak)
+# The `legacy_*` tests at the bottom pin the behaviour each knob restores.
+
+LEGACY = dict(pause_freezes_exits=True,
+              exits_count_as_flips=True,
+              transitional_resets_streak=True)
+
+
+def _strong_up():
+    return make_result(adx=35.0, plus_di=30, minus_di=10)
+
+
+def _strong_down():
+    return make_result(adx=35.0, plus_di=10, minus_di=30)
+
+
+def _range():
+    return make_result(adx=15.0, plus_di=20, minus_di=19)
+
+
+def _arm_pause_ending_down(m, cfg):
+    """Three strong trend entries (down, up, down) -> pause armed, and the
+    effective regime left at trending-down."""
+    s = RegimeState()
+    s = _step(m, s, cfg, _strong_down(), "2026-01-01")
+    s = _step(m, s, cfg, _strong_up(), "2026-01-02")
+    s = _step(m, s, cfg, _strong_down(), "2026-01-03")
+    assert s.effective_regime == "trending-down"
+    assert s.paused_until_session > s.session_count
+    return s
+
+
+def test_pause_still_allows_exit_to_range_bound():
+    """A pause must not keep a dead trend deployed: two range-bound reads
+    inside the pause window still confirm the exit."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, max_flips=3,
+                       pause_sessions=5, flip_window=10)
+    s = _arm_pause_ending_down(m, cfg)
+    s = _step(m, s, cfg, _range(), "2026-01-04")
+    assert s.effective_regime == "trending-down"   # one read is not enough
+    s = _step(m, s, cfg, _range(), "2026-01-05")
+    assert s.last_features["_paused"] is True      # still inside the window
+    assert s.effective_regime == "range-bound"
+    assert s.effective_since == "2026-01-05"
+
+
+def test_pause_blocks_entry_but_keeps_the_streak():
+    """A trend entry is frozen while paused, but its confirmation streak
+    survives, so it confirms the first session after the pause lifts."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, max_flips=3,
+                       pause_sessions=2, flip_window=10)
+    s = _arm_pause_ending_down(m, cfg)
+    paused_until = s.paused_until_session          # session 3 + 2 = 5
+    # adx 27: trending, below adx_strong, so hysteresis applies.
+    up = make_result(adx=27.0, plus_di=30, minus_di=10)
+    s = _step(m, s, cfg, up, "2026-01-04")
+    assert s.effective_regime == "trending-down"
+    assert (s.pending_label, s.pending_count) == ("trending-up", 1)
+    s = _step(m, s, cfg, up, "2026-01-05")
+    assert s.session_count == paused_until
+    assert s.last_features["_paused"] is True
+    assert s.effective_regime == "trending-down"   # entry frozen ...
+    assert (s.pending_label, s.pending_count) == ("trending-up", 2)  # ... streak kept
+    # Pause lifts: the streak is already satisfied, so the very next
+    # session applies the entry.
+    s = _step(m, s, cfg, up, "2026-01-06")
+    assert not s.last_features.get("_paused")
+    assert s.effective_regime == "trending-up"
+
+
+def test_votes_cannot_accelerate_an_entry_during_a_pause():
+    """There is no range-bound vote, so the vote fast-track is inert while
+    paused — it can only ever confirm a (blocked) trend entry."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, max_flips=3,
+                       pause_sessions=3, flip_window=10, vote_quorum_up=2)
+    s = _arm_pause_ending_down(m, cfg)
+    s = m.step(s, make_result(adx=27.0, plus_di=30, minus_di=10), cfg,
+               "2026-01-04",
+               vote_directions=["trending-up", "trending-up"],
+               vote_sources=["W2:trending-up", "W3:trending-up"])
+    assert s.effective_regime == "trending-down"
+    assert s.last_features["_vote_accelerated"] is False
+
+
+def test_exit_does_not_count_as_a_flip():
+    """Going quiet is not a whipsaw: an exit to range-bound neither
+    appends to the flip window nor arms a pause."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, max_flips=2,
+                       pause_sessions=3, flip_window=10)
+    s = RegimeState()
+    s = _step(m, s, cfg, _strong_up(), "2026-01-01")
+    assert s.flip_history == ["2026-01-01"]
+    s = _step(m, s, cfg, _range(), "2026-01-02")
+    s = _step(m, s, cfg, _range(), "2026-01-03")
+    assert s.effective_regime == "range-bound"
+    assert s.flip_history == ["2026-01-01"]        # exit not recorded
+    assert s.flip_sessions == [1]
+    assert s.paused_until_session == 0             # and no pause armed
+
+
+def test_transitional_does_not_reset_the_streak():
+    """A dead-zone ADX night is an absence of evidence, not evidence
+    against the pending streak."""
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2)
+    s = RegimeState()
+    s = _step(m, s, cfg, _range(), "2026-01-01")
+    assert (s.pending_label, s.pending_count) == ("range-bound", 1)
+    s = _step(m, s, cfg, make_result(adx=22.0), "2026-01-02")
+    assert s.raw_regime == "transitional"
+    assert (s.pending_label, s.pending_count) == ("range-bound", 1)
+    s = _step(m, s, cfg, _range(), "2026-01-03")
+    assert s.effective_regime == "range-bound"
+
+
+# ── Legacy knobs reproduce the pre-change behaviour ─────────────────────
+
+def test_legacy_pause_freezes_exits_too():
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, max_flips=3,
+                       pause_sessions=5, flip_window=10, **LEGACY)
+    s = _arm_pause_ending_down(m, cfg)
+    s = _step(m, s, cfg, _range(), "2026-01-04")
+    s = _step(m, s, cfg, _range(), "2026-01-05")
+    assert s.last_features["_paused"] is True
+    assert s.effective_regime == "trending-down"   # frozen, exit included
+    assert s.pending_count == 0                    # step returned before hysteresis
+
+
+def test_legacy_exit_counts_as_a_flip():
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, max_flips=2,
+                       pause_sessions=3, flip_window=10, **LEGACY)
+    s = RegimeState()
+    s = _step(m, s, cfg, _strong_up(), "2026-01-01")
+    s = _step(m, s, cfg, _range(), "2026-01-02")
+    s = _step(m, s, cfg, _range(), "2026-01-03")
+    assert s.flip_history == ["2026-01-01", "2026-01-03"]
+    assert s.paused_until_session == s.session_count + 3
+
+
+def test_legacy_transitional_resets_the_streak():
+    m = RegimeStateMachine()
+    cfg = RegimeConfig(enabled=True, confirm_sessions=2, **LEGACY)
+    s = RegimeState()
+    s = _step(m, s, cfg, _range(), "2026-01-01")
+    s = _step(m, s, cfg, make_result(adx=22.0), "2026-01-02")
+    assert s.pending_count == 0
+    s = _step(m, s, cfg, _range(), "2026-01-03")
+    assert s.effective_regime == "unknown"         # streak restarted
+    assert s.pending_count == 1

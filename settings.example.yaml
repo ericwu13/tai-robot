@@ -195,3 +195,16 @@ regime:
   # 0 disables votes for that direction entirely.
   vote_quorum_up: 2
   vote_quorum_down: 1
+  # Flip-pause / streak semantics. The defaults below are the CURRENT
+  # rules; flip one to true only to restore the legacy behaviour.
+  # true = a flip pause freezes everything (legacy). false = it freezes
+  # trend ENTRIES only, so the engine can still exit to range-bound and
+  # stop trading a dead trend.
+  pause_freezes_exits: false
+  # true = an exit to range-bound counts toward max_flips_in_window
+  # (legacy). false = only trend entries count, so a calm spell can no
+  # longer help arm a pause.
+  exits_count_as_flips: false
+  # true = a transitional (dead-zone ADX) session zeroes the confirmation
+  # streak (legacy). false = it neither increments nor resets it.
+  transitional_resets_streak: false

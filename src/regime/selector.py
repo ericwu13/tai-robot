@@ -29,8 +29,13 @@ class StrategySelector:
             name = cfg.long_strategy if action == "deploy_long" else (cfg.short_strategy if action == "deploy_short" else "")
             return Recommendation(action, name, reason=f"手動覆寫 manual override: {state.manual_override}")
 
-        # Paused
-        if state.last_features.get("_paused"):
+        # Paused. The pause freezes trend ENTRIES, so a paused engine
+        # that is still holding a trend holds its deployment. But the
+        # machine can now EXIT to range-bound while paused, and a
+        # range-bound read must reach its own branch (sit_out / probe) —
+        # holding there would keep the dead leg deployed for the whole
+        # pause window, which is exactly what this change removes.
+        if state.last_features.get("_paused") and state.effective_regime != "range-bound":
             return Recommendation("hold", "", reason="翻轉計數暫停中 flip-counter pause active")
 
         # Scheduled event risk — the flag value is the event NAME, stamped
