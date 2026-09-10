@@ -81,16 +81,21 @@ a = Analysis(
         'src.backtest', 'src.backtest.engine', 'src.backtest.broker',
         'src.backtest.chart', 'src.backtest.data_loader',
         'src.backtest.report', 'src.backtest.metrics', 'src.backtest.strategy',
+        'src.backtest.report_view',
         # Live
         'src.live', 'src.live.bar_aggregator', 'src.live.csv_logger',
         'src.live.live_runner', 'src.live.tick_classifier',
         'src.live.regime_switching_runner',
         # News / event framework (deferred import in _deploy_live)
         'src.news', 'src.news.circuit_breaker', 'src.news.event_calendar',
-        'src.news.signal_file',
+        'src.news.signal_file', 'src.news.regime_vote',
+        'src.news.vote_status', 'src.news.fire_scoring',
         'src.regime', 'src.regime.manager', 'src.regime.selector',
         'src.regime.state_machine', 'src.regime.store',
-        'src.regime.switch_logic',
+        'src.regime.switch_logic', 'src.regime.config_loader',
+        'src.regime.episodes', 'src.regime.replay',
+        # Regime gene evolution (deferred import in the evolution pipeline)
+        'src.evolution.regime_fitness', 'src.evolution.regime_pipeline',
         # Utils
         'src.utils.time_utils',
         # Self-update
