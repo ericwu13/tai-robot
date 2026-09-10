@@ -18,17 +18,52 @@ which fires a *signal*, not a vote.  It was historically numbered "W4" —
 if your n8n instance still shows a workflow named "W4 Manual tap", rename
 or delete it there; the W4 slot belongs to the chips monitor.)
 
+## W2 — 跨市場 cross-market monitor (`crossmarket_monitor.py`)
+
+Two symbol tiers, and one quorum gate on top of both:
+
+| Tier | Symbols | May write `signal.json`? |
+|------|---------|--------------------------|
+| signal | `SOXX` ±2.5%, `TSM` ±3.5%, `QQQ` ±2.0% | yes — downside only, **and only with the vote quorum** |
+| alert | `ASML.AS` ±3.0%, `^STOXX50E` ±2.0%, `NQ=F` ±1.5%, `^N225` ±2.0%, `^KS11` ±2.0%, `^HSI` ±1.5%, `^TWII` ±1.5%, `000001.SS` ±1.5% | never — Discord alert only, both directions |
+
+Every symbol in both tiers carries its own (looser) **vote** thresholds and
+counts toward the quorum: `risk_off` is written only when ≥ `VOTE_MIN_SYMBOLS`
+(2) fresh symbols breach their vote thresholds down and none breaches up.  A
+single signal-tier breach with no quorum posts the alert and writes nothing
+(dedup key `signal-alert-down:<us_date>`, deliberately separate from
+`down:<us_date>` so it can never suppress a later real fire).
+
+Upside never auto-writes anything, in either tier — entering a position
+always needs the human tap.
+
 ## Regime votes in one paragraph
 
 Vote files live next to `news.regime_vote_path` (settings.yaml), one per
 source: `regime_vote.json` → `regime_vote_w2.json` / `_w3` / `_w4`.  At
 classification time (~04:58 TPE) the regime state machine reads every
-valid, non-expired vote; a vote that agrees with the raw technical
-classification skips one night of hysteresis confirmation.  Votes are
-**deleted after every classification pass**, directions are only
-`trending-up` / `trending-down` (no neutral — an uncertain source writes
-nothing), and `expires_after_session` must equal the night being
-classified (`"YYYY-MM-DD|NIGHT"`, open-date convention, 05:00 boundary).
+valid, non-expired vote; votes that agree with the raw technical
+classification and **meet that direction's quorum** skip one night of
+hysteresis confirmation.  Votes are **deleted after every classification
+pass**, directions are only `trending-up` / `trending-down` (no neutral —
+an uncertain source writes nothing), and `expires_after_session` must
+equal the night being classified (`"YYYY-MM-DD|NIGHT"`, open-date
+convention, 05:00 boundary).
+
+Two gates sit between a vote file and a strategy swap:
+
+- **Asymmetric quorum** (`regime.vote_quorum_up` = 2,
+  `regime.vote_quorum_down` = 1): going long on external evidence is the
+  expensive mistake, so it takes two sources; confirming a down read
+  early is cheap and protective, so one is enough.  Conflict-cancel in
+  the range-bound probe is unchanged and absolute — ANY opposing vote
+  kills it, quorum or not.
+- **Per-source age gate** (`news.nightly_vote_max_age_h`, default
+  `{W2: 4.0}`): the writer stamps `fired_at`, and a vote older than its
+  source's limit at read time is consumed with the rest but never shown
+  to the classifier.  W2 fires during the US session and the nightly lane
+  reads it ~20 h later at the END of the session it named; W2's edge
+  lives in the ~4 h after the fire.  Sources not listed have no limit.
 
 ## W4 — 籌碼 chips monitor (`chips_monitor.py`)
 

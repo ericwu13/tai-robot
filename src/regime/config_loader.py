@@ -44,6 +44,8 @@ _SETTINGS_KEY_MAP = {
     "regime_flip_window_sessions": "flip_window",
     "regime_classify_interval": "classify_interval",
     "regime_range_bias_action": "range_bias_action",
+    "regime_vote_quorum_up": "vote_quorum_up",
+    "regime_vote_quorum_down": "vote_quorum_down",
 }
 
 

@@ -55,20 +55,27 @@ class StrategySelector:
             return Recommendation("deploy_short", cfg.short_strategy, reason="下降趨勢確認 trending-down confirmed")
         elif regime == "range-bound":
             slope = features.get("ema_slope", 0)
-            # Information fusion (news framework): an unambiguous external
-            # vote (W2 cross-market / W3 RSS) that agrees with the local
-            # price drift upgrades a range-bound sit-out to a half-size
-            # probe. Conflicting votes cancel each other; a vote against
-            # the drift is ignored. ±DI direction is deliberately NOT
+            # Information fusion (news framework): unambiguous external
+            # votes (W2 cross-market / W3 RSS / W4 chips) that agree with
+            # the local price drift upgrade a range-bound sit-out to a
+            # half-size probe. ±DI direction is deliberately NOT
             # required — with ADX below adx_exit the DI readings are
-            # low-signal, and the vote itself is the directional evidence.
+            # low-signal, and the votes themselves are the directional
+            # evidence.
+            #
+            # The supporting side must meet its QUORUM (asymmetric: two
+            # sources to probe long, one to probe short — see
+            # RegimeConfig), while conflict-cancel stays absolute: ANY
+            # opposing vote, quorum or not, kills the probe.
             votes = features.get("_votes") or []
-            vote_up = "trending-up" in votes
-            vote_down = "trending-down" in votes
-            if vote_up and not vote_down and slope > 0:
+            ups = sum(1 for v in votes if v == "trending-up")
+            downs = sum(1 for v in votes if v == "trending-down")
+            vote_up = cfg.vote_quorum_up > 0 and ups >= cfg.vote_quorum_up
+            vote_down = cfg.vote_quorum_down > 0 and downs >= cfg.vote_quorum_down
+            if vote_up and not downs and slope > 0:
                 return Recommendation("deploy_long_half", cfg.long_strategy, qty_scale=0.5,
                                      reason="盤整+外部看多票 — 半倉多單 range-bound + external bullish vote — half-size long")
-            if vote_down and not vote_up and slope < 0:
+            if vote_down and not ups and slope < 0:
                 return Recommendation("deploy_short_half", cfg.short_strategy, qty_scale=0.5,
                                      reason="盤整+外部看空票 — 半倉空單 range-bound + external bearish vote — half-size short")
 

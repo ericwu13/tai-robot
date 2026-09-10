@@ -73,6 +73,26 @@ _TZ_TAIPEI = timezone(timedelta(hours=8))
 _EVENTS_REFRESH_SEC = 300
 
 
+def _vote_age_limit_h(limits: dict, source: str) -> float | None:
+    """The max-age limit (hours) that applies to *source*, or None.
+
+    Sources self-label as "W3" or "W3-manual"; the limit is keyed by the
+    bridge stem ("W3"), matching how ``_source_path`` derives filenames.
+    """
+    if not limits:
+        return None
+    stem = str(source or "").split("-")[0].strip().upper()
+    if not stem:
+        return None
+    raw = limits.get(stem)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class RegimeSwitchingRunner(LiveRunner):
     """LiveRunner subclass that swaps strategies based on regime classification.
 
@@ -411,17 +431,37 @@ class RegimeSwitchingRunner(LiveRunner):
     def _read_regime_vote(self, session_key: str) -> list:
         """Read and consume all per-source vote files, returning the
         ``RegimeVote`` objects valid for *session_key* (direction AND
-        source — the source survives into the audit trail)."""
+        source — the source survives into the audit trail).
+
+        Votes older than their source's ``nightly_vote_max_age_h`` limit
+        are dropped here.  The nightly lane fires at ~04:58, at the END
+        of the session a W2 vote names, and the leg it swings only goes
+        live at the next 08:45 open — a 4 h-edge signal is long dead by
+        then.  Expired votes are still CONSUMED with the rest: leaving
+        them on disk would only make them older.
+        """
         cfg = self._news_cfg
         if not cfg or not getattr(cfg, "regime_vote_path", ""):
             return []
         from ..news.regime_vote import read_all_regime_votes, consume_all_regime_votes
         try:
             votes = read_all_regime_votes(cfg.regime_vote_path, session_key)
+            max_age_h = getattr(cfg, "nightly_vote_max_age_h", None) or {}
+            kept = []
             for v in votes:
-                logger.info("[REGIME-VOTE] consumed vote: %s (source=%s)", v.direction, v.source)
+                limit_h = _vote_age_limit_h(max_age_h, v.source)
+                if (limit_h is not None and v.age_sec is not None
+                        and v.age_sec > limit_h * 3600.0):
+                    logger.info(
+                        "[REGIME-VOTE] expired-by-age (%s, %.1fh > %.1fh limit) — "
+                        "consumed but not classified",
+                        v.source or "?", v.age_sec / 3600.0, limit_h)
+                    continue
+                logger.info("[REGIME-VOTE] consumed vote: %s (source=%s)",
+                            v.direction, v.source)
+                kept.append(v)
             consume_all_regime_votes(cfg.regime_vote_path)
-            return votes
+            return kept
         except Exception as exc:
             logger.warning("[REGIME-VOTE] failed to read votes: %s", exc)
             return []

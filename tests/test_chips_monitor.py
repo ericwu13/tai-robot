@@ -223,6 +223,9 @@ def test_run_once_writes_valid_vote_file(monkeypatch, base):
     assert chips.run_once(base, "20260814", RUN_NOW) == 0
 
     vote = read_json(chips.w4_vote_path(base))
+    # write_regime_vote also stamps fired_at (nightly-lane age gate) — a
+    # wall-clock value, so it is checked for presence, not equality.
+    assert vote.pop("fired_at", "").startswith("20")
     assert vote == {
         "version": 1,
         "direction": "trending-up",
