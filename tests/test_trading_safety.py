@@ -464,6 +464,13 @@ class TestScenarioIssue79ResumeReconcile:
     live position is stuck open until the user manually switches modes.
 
     restore_confirmed_position() reconciles the guard so exits fire again.
+
+    NOTE: these tests cover the guard only. WHETHER the caller is allowed to
+    reconcile is decided by account_monitor.resume_real_position_ok() — it
+    replaced a direction-agnostic `get_signed_position(prefix) != 0` that
+    confirmed a sim LONG against a real SHORT (and read a not-yet-received
+    OpenInterest snapshot as "flat"). See TestResumeRealPositionOk in
+    tests/test_account_monitor.py.
     """
 
     def test_known_bad_force_close_skipped_without_reconcile(self):

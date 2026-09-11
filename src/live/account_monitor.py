@@ -94,6 +94,42 @@ def parse_future_rights(bstr: str) -> dict | None:
         return None
 
 
+def resume_real_position_ok(signed_pos: int, sim_side: str,
+                            snapshot_received: bool) -> tuple[bool, str]:
+    """Decide whether a restored SIM position may be confirmed against the
+    REAL account on session resume (issue #79 follow-up).
+
+    Args:
+        signed_pos: real signed position qty for the symbol prefix
+            (positive = long, negative = short, 0 = flat).
+        sim_side: the restored broker's ``position_side`` value —
+            ``"LONG"`` / ``"SHORT"``.
+        snapshot_received: True once an OnOpenInterest snapshot has actually
+            landed for the current query. False means we simply do not know
+            what the real account holds — an empty position list is NOT
+            evidence of a flat account.
+
+    Returns:
+        ``(ok, reason_key)`` with ``reason_key`` in
+        ``{"match", "flat", "opposite", "unknown"}``. Only ``"match"`` is
+        safe to confirm: confirming while the real book holds the OPPOSITE
+        side would let the bot auto-send a close (sNewClose=2) in the wrong
+        direction, i.e. ADD to the real position instead of closing it.
+        ``"unknown"`` also covers an unrecognised ``sim_side`` — direction
+        cannot be compared, so it is never confirmed.
+    """
+    if not snapshot_received:
+        return False, "unknown"
+    side = (sim_side or "").strip().upper()
+    if side not in ("LONG", "SHORT"):
+        return False, "unknown"
+    if signed_pos == 0:
+        return False, "flat"
+    if (side == "LONG" and signed_pos > 0) or (side == "SHORT" and signed_pos < 0):
+        return True, "match"
+    return False, "opposite"
+
+
 def fmt_money(val: str) -> str:
     """Format a numeric string with comma separators."""
     try:
@@ -118,26 +154,38 @@ class AccountMonitor:
         self.positions: list[dict] = []
         self.rights: dict = {}
         self._prev_fill_counts: dict[str, int] = {}
+        # False until an OnOpenInterest snapshot has actually landed. An empty
+        # `positions` list means "we don't know yet", NOT "the account is
+        # flat" — the callback is asynchronous and has been seen ~4s late.
+        self.oi_snapshot_received: bool = False
 
     def reset(self) -> None:
         """Clear all state."""
         self.positions.clear()
         self.rights.clear()
         self._prev_fill_counts.clear()
+        # Full state wipe → the snapshot we held is gone too; back to unknown.
+        self.oi_snapshot_received = False
 
     # ── Position tracking ──
 
     def add_position(self, parsed: dict) -> None:
         """Add a parsed open interest entry."""
         self.positions.append(parsed)
+        self.oi_snapshot_received = True
 
     def clear_positions(self) -> None:
         """Clear position list (before rebuilding from callbacks)."""
         self.positions.clear()
+        # A fresh query is in flight — invalidate the previous snapshot so a
+        # racing reader can tell "not answered yet" from "answered: flat".
+        self.oi_snapshot_received = False
 
     def set_flat(self) -> None:
         """Called when '001' (no positions) is received."""
         self.positions.clear()
+        # '001' IS an answer: the account really is flat.
+        self.oi_snapshot_received = True
 
     def update_rights(self, parsed: dict) -> None:
         """Store parsed future rights data."""
