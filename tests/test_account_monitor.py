@@ -15,6 +15,7 @@ from src.live.account_monitor import (
     parse_open_interest,
     parse_future_rights,
     fmt_money,
+    resume_real_position_ok,
 )
 
 
@@ -170,6 +171,88 @@ class TestPositionTracking:
         m.add_position({"product": "TXF4", "side": "B", "qty": 2, "avg_cost": "22500"})
         m.add_position({"product": "TXG4", "side": "B", "qty": 1, "avg_cost": "22600"})
         assert m.get_signed_position("TX") == 2
+
+
+# ── OpenInterest snapshot flag (resume-reconcile race fix) ──
+
+class TestOiSnapshotFlag:
+    """The pre-deploy position check used to wait a fixed 0.5s for the async
+    OnOpenInterest callback. When the callback landed later (~4s observed
+    live), `positions` was still empty and the code read that as "the real
+    account is flat". `oi_snapshot_received` separates "not answered yet"
+    from "answered: flat".
+    """
+
+    def test_initially_unknown(self):
+        m = AccountMonitor()
+        assert m.oi_snapshot_received is False
+
+    def test_clear_positions_invalidates_snapshot(self):
+        m = AccountMonitor()
+        m.set_flat()
+        assert m.oi_snapshot_received is True
+        m.clear_positions()          # a fresh query is now in flight
+        assert m.oi_snapshot_received is False
+
+    def test_add_position_marks_received(self):
+        m = AccountMonitor()
+        m.clear_positions()
+        m.add_position({"product": "TXF4", "side": "S", "qty": 1,
+                        "avg_cost": "22500"})
+        assert m.oi_snapshot_received is True
+
+    def test_set_flat_marks_received(self):
+        m = AccountMonitor()
+        m.clear_positions()
+        m.set_flat()                 # "001" = genuinely no positions
+        assert m.oi_snapshot_received is True
+
+    def test_reset_returns_to_unknown(self):
+        m = AccountMonitor()
+        m.set_flat()
+        m.reset()
+        assert m.oi_snapshot_received is False
+
+
+# ── resume_real_position_ok ──
+
+class TestResumeRealPositionOk:
+    """Issue #79 follow-up: the resume reconcile used a direction-agnostic
+    `get_signed_position(prefix) != 0`. A real SHORT would confirm a sim
+    LONG, and the auto close (sNewClose=2) would then be sent in the wrong
+    direction — adding to the real book instead of closing it.
+    """
+
+    def test_long_matches_long(self):
+        assert resume_real_position_ok(1, "LONG", True) == (True, "match")
+
+    def test_short_matches_short(self):
+        assert resume_real_position_ok(-1, "SHORT", True) == (True, "match")
+
+    def test_real_short_does_not_confirm_sim_long(self):
+        assert resume_real_position_ok(-1, "LONG", True) == (False, "opposite")
+
+    def test_real_long_does_not_confirm_sim_short(self):
+        assert resume_real_position_ok(1, "SHORT", True) == (False, "opposite")
+
+    def test_flat_long(self):
+        assert resume_real_position_ok(0, "LONG", True) == (False, "flat")
+
+    def test_flat_short(self):
+        assert resume_real_position_ok(0, "SHORT", True) == (False, "flat")
+
+    @pytest.mark.parametrize("signed", [-2, -1, 0, 1, 2])
+    @pytest.mark.parametrize("side", ["LONG", "SHORT"])
+    def test_no_snapshot_is_never_confirmed(self, signed, side):
+        """No snapshot = unknown, regardless of what the stale list says."""
+        assert resume_real_position_ok(signed, side, False) == (False, "unknown")
+
+    def test_unknown_sim_side_is_not_confirmed(self):
+        """Direction cannot be compared → never confirm."""
+        assert resume_real_position_ok(1, "", True) == (False, "unknown")
+
+    def test_side_is_case_insensitive(self):
+        assert resume_real_position_ok(3, "long", True) == (True, "match")
 
 
 # ── AccountMonitor.compute_display ──

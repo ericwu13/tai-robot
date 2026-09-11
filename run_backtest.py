@@ -101,6 +101,7 @@ from src.live.tick_watchdog import TickWatchdog
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
+    resume_real_position_ok,
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.fill_poller import FillPoller
@@ -133,6 +134,11 @@ try:
 except ImportError:
     _tv_available = False
 
+
+# How long the pre-deploy position check waits for the asynchronous
+# OnOpenInterest callback before giving up. The callback has been observed
+# ~4s after GetOpenInterestGW; the old fixed 0.5s sleep raced it.
+OI_SNAPSHOT_TIMEOUT_S = 5.0
 
 # Registry of available backtest strategies
 STRATEGIES: dict[str, type[BacktestStrategy]] = {
@@ -5915,10 +5921,25 @@ class BacktestApp:
                 user_id = self.login_user_var.get().strip()
                 self._account_monitor.clear_positions()
                 skO.GetOpenInterestGW(user_id, self._futures_account, 1)
-                # Drain UI queue to process the callback
-                self.root.update_idletasks()
-                time.sleep(0.5)
-                self._drain_ui_queue()
+                # The OnOpenInterest reply arrives asynchronously through the
+                # UI queue — observed ~4s after the query. The old fixed 0.5s
+                # sleep raced it: `positions` was still empty, so the
+                # existing-position warning below never fired and the resume
+                # reconcile read a phantom "flat" account. Poll until the
+                # snapshot actually lands (or we time out).
+                _deadline = time.time() + OI_SNAPSHOT_TIMEOUT_S
+                while time.time() < _deadline:
+                    self.root.update_idletasks()
+                    self._drain_ui_queue()
+                    if self._account_monitor.oi_snapshot_received:
+                        break
+                    time.sleep(0.1)
+                if not self._account_monitor.oi_snapshot_received:
+                    _log(
+                        "持倉查詢逾時 Position snapshot not received within "
+                        f"{OI_SNAPSHOT_TIMEOUT_S:.0f}s — treating real position "
+                        "as UNKNOWN"
+                    )
             except Exception as e:
                 _log(f"部署前持倉查詢失敗 Pre-deploy position check failed: {e}")
 
@@ -6110,11 +6131,22 @@ class BacktestApp:
                 # ~90 lines above via GetOpenInterestGW) also shows a position
                 # for this symbol. Paper mode has no real account, so the sim
                 # position alone is authoritative there.
-                real_ok = True
+                # A bare `!= 0` was direction-agnostic: a real SHORT would
+                # "confirm" a sim LONG, and the auto close (sNewClose=2) would
+                # then be sent in the WRONG direction — adding to the real
+                # position instead of closing it. Require a direction match,
+                # and never read an un-answered snapshot as "flat".
+                real_ok, real_reason = True, "match"
                 if trading_mode in ("semi_auto", "auto"):
                     order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
                     prefix = order_sym[:2] if order_sym else ""
-                    real_ok = self._account_monitor.get_signed_position(prefix) != 0
+                    sim_side = (self._live_runner.broker.position_side.value
+                                if self._live_runner.broker.position_side else "")
+                    real_ok, real_reason = resume_real_position_ok(
+                        self._account_monitor.get_signed_position(prefix),
+                        sim_side,
+                        self._account_monitor.oi_snapshot_received,
+                    )
                 if real_ok:
                     cleared = self._trading_guard.restore_confirmed_position()
                     if cleared:
@@ -6124,6 +6156,15 @@ class BacktestApp:
                     self._live_log_msg(
                         "[RESUME] Restored confirmed real position — exits/"
                         "force-close re-enabled", "status")
+                elif real_reason == "opposite":
+                    self._live_log_msg(
+                        "[RESUME] Real account position is OPPOSITE to sim — NOT "
+                        "confirming entry. Manual review required.", "status")
+                elif real_reason == "unknown":
+                    self._live_log_msg(
+                        "[RESUME] Real position UNKNOWN (持倉快照未收到 position "
+                        "snapshot not received) — NOT confirming entry. Manual "
+                        "review required.", "status")
                 else:
                     self._live_log_msg(
                         "[RESUME] Real account flat but sim has position — NOT "
