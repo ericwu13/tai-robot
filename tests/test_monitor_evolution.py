@@ -404,6 +404,47 @@ def test_stale_watermark_with_recent_activity_is_p2(tmp_path, repo):
                for m in messages(findings, "P2")), messages(findings)
 
 
+def test_stale_watermark_with_a_start_line_for_the_due_slot_is_not_p2(tmp_path, repo):
+    """Issue #115: the slot DID reach this bot and it took the by-design
+    holdout skip, which returns before ``save_watermark`` — so the stale
+    watermark is exactly what a correct run leaves behind.
+
+    Observed 2026-09-12 for TMF00_07-27-空單: start line 05:05:25 TPE,
+    the skip's Discord notice one second later, watermark still 08-29.
+    Raising "the Saturday slot is not reaching this bot" against a bot
+    whose own log holds that slot's start line is self-contradicting.
+    """
+    bot = make_bot(tmp_path, watermark={"trade_count": 4, "at": "2026-08-15 05:05:00"},
+                   pid=4242)
+    write_debug_log(bot, "20260810", [noise_line("2026-08-29 05:04:53"),
+                                      start_line("2026-08-29 05:05:25"),
+                                      noise_line("2026-08-29 05:06:00")])
+    set_mtime(bot, NOW - timedelta(days=1))
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert not any("not attempted for 2+ weeks" in m
+                   for m in messages(findings, "P2")), messages(findings, "P2")
+    assert not has_level(findings, "P2"), messages(findings, "P2")
+    assert any("the slot fired on 2026-08-29 at 05:05" in ln
+               for ln in lines), lines
+
+
+def test_stale_watermark_without_a_start_line_is_still_p2(tmp_path, repo):
+    """Regression guard for issue #115's fix: the bot was logging through
+    the slot and left no start line, so "the slot is not reaching this
+    bot" is the honest reading and must survive."""
+    bot = make_bot(tmp_path, watermark={"trade_count": 4, "at": "2026-08-15 05:05:00"},
+                   pid=4242)
+    write_debug_log(bot, "20260810", [noise_line("2026-08-29 05:04:53"),
+                                      noise_line("2026-08-29 05:06:00")])
+    set_mtime(bot, NOW - timedelta(days=1))
+    write_usage(repo, [(PREV_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("not attempted for 2+ weeks" in m
+               for m in messages(findings, "P2")), messages(findings, "P2")
+    assert not any("the slot fired on" in ln for ln in lines), lines
+
+
 def test_stale_watermark_on_a_dormant_bot_is_archaeology(tmp_path, repo):
     """Same stale watermark, but nothing in the directory has moved in
     months — data/live is full of retired test bots."""
