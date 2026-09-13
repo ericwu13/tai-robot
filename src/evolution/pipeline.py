@@ -95,8 +95,11 @@ HOLDOUT_DD_RATIO_MAX = 1.2
 # 0.00 — the BEST possible value — and a window with a small peak
 # reports absurd percentages (107.9% and 174.5% seen on real data).
 # Relative gates built on that number reject every candidate that has
-# any drawdown whenever the baseline never went positive, which is how
-# the pipeline produced a candidate on only 4 Saturdays ever.
+# any drawdown whenever the baseline never went positive, and are
+# trivially loose whenever the baseline's peak was tiny. (Why so few
+# candidates ever reached a verdict is a separate problem — the plan
+# prompt's sample rule, see ``plan_sample_rule``; this sentinel only
+# decided the verdicts of the candidates that did get there.)
 #
 # ``max_drawdown`` is the same peak-to-trough figure BEFORE the division,
 # so the initial_balance offset cancels out entirely: it is always
