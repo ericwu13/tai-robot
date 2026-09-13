@@ -33,7 +33,8 @@ from typing import Any
 
 from ..backtest.engine import BacktestEngine, BacktestResult
 from ..backtest.metrics import PerformanceMetrics
-from .fitness import FitnessResult, compute_fitness_from_trades
+from .fitness import (DEFAULT_CAPITAL_BASE_TWD, FitnessResult,
+                      compute_fitness_from_trades)
 
 _JSON_FENCE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
 
@@ -76,10 +77,15 @@ TRAIN_COLLAPSE_PF_RATIO = 0.8   # candidate PF < 80% of baseline's → collapse
 TRAIN_COLLAPSE_DD_RATIO = 1.5   # candidate MaxDD% > 150% of baseline's → collapse
 
 # Holdout drawdown is gated RELATIVE to the baseline, not against the
-# plan's absolute threshold: dd% is measured from a zero-based P&L
-# curve, so a short window's tiny peak makes the percentage explode
+# plan's absolute threshold: dd% used to be measured from a zero-based
+# P&L curve, so a short window's tiny peak made the percentage explode
 # (observed: baseline holdout dd% = 129 on 14 days while the long
-# window reads 35). Absolute dd criteria are therefore checked on the
+# window reads 35). Issue #119 gave the metric a capital base
+# (``evolution.capital_base_twd``), which removes that explosion, but
+# the relative gate is KEPT: a 14-day holdout still sees far less
+# drawdown than a 90-day window, so an absolute threshold anchored on
+# the long window would be trivially easy there.
+# Absolute dd criteria are therefore checked on the
 # train window — the same long-window basis the AI's threshold was
 # anchored on — and the holdout only requires "not materially worse
 # than baseline".
@@ -168,18 +174,26 @@ class ABResult:
         return self.result.metrics if self.result else None
 
 
-def run_ab_backtest(strategy_cls, bars, point_value: int, name: str) -> ABResult:
+def run_ab_backtest(strategy_cls, bars, point_value: int, name: str,
+                    capital_base: int = DEFAULT_CAPITAL_BASE_TWD) -> ABResult:
     """Backtest one strategy class (default-constructed) on the given bars.
 
     Both sides of the A/B get identical treatment — default params, same
     bars, same fill mode — so the comparison isolates the code change.
     Never raises; failures come back in ``error``.
+
+    ``capital_base`` (TWD) is the starting equity both the engine's
+    ``max_drawdown_pct`` and the fitness composite measure drawdown
+    against, so the plan's ``max_drawdown_pct_max`` criterion means
+    something (issue #119).
     """
     try:
         strategy = strategy_cls()
-        engine = BacktestEngine(strategy, point_value=point_value)
+        engine = BacktestEngine(strategy, point_value=point_value,
+                                initial_balance=capital_base)
         result = engine.run(list(bars))
-        fitness = compute_fitness_from_trades(result.trades, result.equity_curve)
+        fitness = compute_fitness_from_trades(
+            result.trades, result.equity_curve, capital_base=capital_base)
         return ABResult(name=name, result=result, fitness=fitness)
     except Exception as e:
         return ABResult(name=name, error=f"[{type(e).__name__}] {e}")
@@ -396,21 +410,27 @@ def _span_desc(bars: list) -> str:
 
 def run_deep_validation(strategy_cls, bars, point_value: int, name: str,
                         train_days: int, test_days: int,
-                        monte_carlo: bool = True) -> DeepResult:
+                        monte_carlo: bool = True,
+                        capital_base: int = DEFAULT_CAPITAL_BASE_TWD
+                        ) -> DeepResult:
     """Walk-forward validation per the SEE spec: backtest the train and
     test windows separately; optionally Monte Carlo the train window
     (±10% jitter on numeric __init__ defaults — a candidate whose edge
     evaporates under tiny param changes is curve-fit, not improved).
     """
     train, test = split_train_test(bars, train_days, test_days)
-    tr = run_ab_backtest(strategy_cls, train, point_value, f"{name} train")
-    te = run_ab_backtest(strategy_cls, test, point_value, f"{name} test")
+    tr = run_ab_backtest(strategy_cls, train, point_value, f"{name} train",
+                         capital_base=capital_base)
+    te = run_ab_backtest(strategy_cls, test, point_value, f"{name} test",
+                         capital_base=capital_base)
     fragile = False
     mc_var = 0.0
     if monte_carlo and not tr.error and train:
         try:
             from .evaluator import MC_FRAGILE_VARIANCE, monte_carlo_robustness
-            _, mc_var = monte_carlo_robustness(strategy_cls, train, point_value)
+            _, mc_var = monte_carlo_robustness(
+                strategy_cls, train, point_value,
+                capital_base=capital_base)
             fragile = mc_var > MC_FRAGILE_VARIANCE
         except Exception:
             pass  # robustness check is best-effort, never kills the run
@@ -919,7 +939,8 @@ def decide_multifold_verdict(
 
 def run_multifold_validation(baseline_cls, candidate_cls, bars,
                              point_value: int, fold_days: int = 14,
-                             max_folds: int = 10
+                             max_folds: int = 10,
+                             capital_base: int = DEFAULT_CAPITAL_BASE_TWD
                              ) -> tuple[list[Fold], ABResult, ABResult]:
     """Backtest both sides ONCE over all bars, then slice into folds.
 
@@ -933,8 +954,10 @@ def run_multifold_validation(baseline_cls, candidate_cls, bars,
     erroring, ``folds`` is empty — inspect ``.error`` on the ABResults.
     """
     bars = list(bars)
-    base_ab = run_ab_backtest(baseline_cls, bars, point_value, "基準 baseline")
-    cand_ab = run_ab_backtest(candidate_cls, bars, point_value, "候選 candidate")
+    base_ab = run_ab_backtest(baseline_cls, bars, point_value, "基準 baseline",
+                              capital_base=capital_base)
+    cand_ab = run_ab_backtest(candidate_cls, bars, point_value, "候選 candidate",
+                              capital_base=capital_base)
     if (base_ab.error or cand_ab.error
             or base_ab.result is None or cand_ab.result is None):
         return [], base_ab, cand_ab

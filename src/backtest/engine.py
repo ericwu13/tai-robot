@@ -60,13 +60,18 @@ class BacktestResult:
         strategy_name: str,
         broker: SimulatedBroker,
         bars_processed: int,
+        initial_balance: int = 0,
     ):
         self.strategy_name = strategy_name
         self.broker = broker
         self.trades = broker.trades
         self.equity_curve = broker.equity_curve
         self.bars_processed = bars_processed
-        self.metrics: PerformanceMetrics = calculate_metrics(broker.trades, broker.equity_curve)
+        self.initial_balance = int(initial_balance)
+        self.metrics: PerformanceMetrics = calculate_metrics(
+            broker.trades, broker.equity_curve,
+            initial_balance=self.initial_balance,
+        )
 
 
 class BacktestEngine:
@@ -98,7 +103,16 @@ class BacktestEngine:
         point_value: int = 1,
         max_bars: int = 5000,
         fill_mode: str = "on_close",
+        initial_balance: int = 0,
     ):
+        # Starting equity the drawdown PERCENTAGE is measured against.
+        # 0 (the default) keeps every pre-existing backtest byte-identical:
+        # with no capital base, ``max_drawdown_pct`` is drawdown over the
+        # PEAK OF CUMULATIVE P&L, which is 0.00% for a window that never
+        # goes positive and hundreds of percent for a tiny peak. The
+        # evolution pipeline passes ``evolution.capital_base_twd`` so its
+        # dd% is a real percentage of capital (issue #119).
+        self.initial_balance = int(initial_balance)
         self.strategy = strategy
         self.broker = SimulatedBroker(point_value=point_value, fill_mode=fill_mode)
         self.broker.trade_source = "backtest"
@@ -239,4 +253,5 @@ class BacktestEngine:
             strategy_name=self.strategy.name,
             broker=self.broker,
             bars_processed=len(bars),
+            initial_balance=self.initial_balance,
         )

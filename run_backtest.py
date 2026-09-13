@@ -428,6 +428,19 @@ def _load_settings():
             # WITHHELD from the AI's design and used as the unseen
             # validation window (walk-forward discipline).
             cfg["evolution_holdout_days"] = evo.get("holdout_days", 14)
+            # capital_base_twd: starting equity the evolution drawdown
+            # PERCENTAGE is measured against (fitness composite + the
+            # validation backtests). Without it, dd% is drawdown over the
+            # peak of cumulative P&L — 0.00% for a window that never goes
+            # positive, hundreds of percent for a tiny peak (issue #119).
+            # 0 / negative / junk falls back to the default: a zero base
+            # is exactly the bug.
+            try:
+                _cap_base = int(evo.get("capital_base_twd", 100000) or 0)
+            except (TypeError, ValueError):
+                _cap_base = 0
+            cfg["evolution_capital_base_twd"] = (
+                _cap_base if _cap_base > 0 else 100000)
             # News/event framework (src.news). Paths are written by an
             # external n8n workflow; empty paths keep the feature inert.
             # Defaults mirror src.config.settings.NewsConfig exactly.
@@ -4904,6 +4917,23 @@ class BacktestApp:
             except Exception as e:
                 _log(f"evolution watermark save failed: [{type(e).__name__}] {e}")
 
+    def _evolution_capital_base(self) -> int:
+        """Starting equity the evolution drawdown PERCENTAGE is measured
+        against, in TWD (``evolution.capital_base_twd``, default 100k).
+
+        Trade P&L and the equity curves built from it are already TWD
+        (``pnl = points * qty * point_value``, point_value 200 for TXF),
+        so the base needs no conversion. A 0 / missing value would put
+        the metric back on the peak-of-cumulative-P&L basis that scored
+        a sinking strategy at a perfect 0.00% (issue #119).
+        """
+        try:
+            base = int(self._settings.get(
+                "evolution_capital_base_twd", 100000) or 0)
+        except (TypeError, ValueError):
+            base = 0
+        return base if base > 0 else 100000
+
     def _build_evolution_context(self, result, watermark: dict | None = None,
                                  omitted_count: int = 0,
                                  design_upto: int | None = None,
@@ -4968,7 +4998,8 @@ class BacktestApp:
             fit = score_session_for_notification(
                 trades,
                 equity_curve=None,
-                trading_mode=self._trading_mode if live else "backtest")
+                trading_mode=self._trading_mode if live else "backtest",
+                capital_base=self._evolution_capital_base())
             gate_note = (
                 "（⚠ 交易數不足30筆，composite 被 gating 為 0 — "
                 "結論信心度低 below MIN_TRADES, treat conclusions as "
@@ -5014,6 +5045,7 @@ class BacktestApp:
         total_trades = len(trade_lines)
 
         # Snapshot everything the worker needs while on the main thread.
+        capital_base = self._evolution_capital_base()
         live = (self._live_runner is not None
                 and self._live_runner.state != LiveState.IDLE)
         if live:
@@ -5214,11 +5246,12 @@ class BacktestApp:
                        f"({base_cls_name} vs {candidate_cls.__name__})...")
                     baseline_res = run_deep_validation(
                         baseline_cls, bars, point_value, "基準 baseline",
-                        tr_d, te_d, monte_carlo=False)
+                        tr_d, te_d, monte_carlo=False,
+                        capital_base=capital_base)
                     candidate_res = run_deep_validation(
                         candidate_cls, bars, point_value,
                         f"候選 {candidate_cls.__name__}", tr_d, te_d,
-                        monte_carlo=True)
+                        monte_carlo=True, capital_base=capital_base)
                     verdict = decide_deep_verdict(
                         baseline_res, candidate_res, directives["criteria"])
                     cl_base_m = (baseline_res.test.metrics
@@ -5235,10 +5268,12 @@ class BacktestApp:
                        f"{feed_iv // 60}min bars ≈ {native_est} native bars "
                        f"({base_cls_name} vs {candidate_cls.__name__})...")
                     baseline_res = run_ab_backtest(
-                        baseline_cls, bars, point_value, "基準 baseline")
+                        baseline_cls, bars, point_value, "基準 baseline",
+                        capital_base=capital_base)
                     candidate_res = run_ab_backtest(
                         candidate_cls, bars, point_value,
-                        f"候選 {candidate_cls.__name__}")
+                        f"候選 {candidate_cls.__name__}",
+                        capital_base=capital_base)
                     verdict = decide_verdict(
                         baseline_res, candidate_res, directives["criteria"])
                     cl_base_m = baseline_res.metrics
