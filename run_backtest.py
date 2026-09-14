@@ -4752,7 +4752,7 @@ class BacktestApp:
         # backtesting the unseen holdout. The cut rolls forward each
         # cycle, so this week's holdout becomes next week's design data.
         from src.evolution.pipeline import (
-            compute_design_cut, design_cutoff_index)
+            compute_design_cut, design_cutoff_index, plan_sample_rule)
         holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
         cut = compute_design_cut(result.trades, holdout_days)
         # Scan from 0, NOT from the watermark: a watermark saved past the
@@ -4849,9 +4849,7 @@ class BacktestApp:
             f"4. **演化計畫 Evolution plan** — EXACTLY ONE concrete change: one "
             f"parameter (state old → new value) OR one structural change. MANDATORY: "
             f"scan the trade list and estimate \"removes ~N losers, ~M winners\". "
-            f"If the sample is too small (composite gated / fewer than 30 trades), "
-            f"the correct plan is「繼續收集數據，暫不修改 continue collecting data, "
-            f"no change」— say so explicitly.\n"
+            f"{plan_sample_rule(cut_idx, len(sent_lines))}\n"
             f"5. **驗證與回退 Validation & revert** — how to verify the change "
             f"(backtest period, which metric must improve by how much) and the "
             f"condition under which to revert.\n\n"
@@ -5101,6 +5099,7 @@ class BacktestApp:
 
         def _worker():
             from src.evolution.pipeline import (
+                check_candidate_name,
                 parse_plan_directives, next_candidate_name, run_ab_backtest,
                 decide_verdict, format_verdict_block,
                 run_deep_validation, decide_deep_verdict,
@@ -5184,6 +5183,19 @@ class BacktestApp:
                             last_err = "no ```python code block found in the response"
                             continue
                         candidate_cls = load_strategy_from_source(code)
+                        # load_strategy_from_source returns the first
+                        # BacktestStrategy subclass whatever it is named;
+                        # the PASS path saves by candidate_cls.__name__
+                        # and StrategyStore.save overwrites by class
+                        # name, so a kept base-class name would clobber
+                        # the LIVE strategy's stored source and its
+                        # registry entry (issue #114). Discard it and
+                        # spend the retry correcting the name.
+                        if (name_err := check_candidate_name(
+                                candidate_cls, candidate_name)):
+                            candidate_cls = None
+                            last_err = name_err
+                            continue
                         break
                     except (CodeValidationError, CodeExecutionError) as e:
                         last_err = str(e)
