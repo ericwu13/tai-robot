@@ -54,6 +54,7 @@ from ..daily_report.report_generator import generate_report_from_backtest
 from ..live.session_store import load_session
 from ..market_data.models import Bar
 from .fitness import (
+    DEFAULT_CAPITAL_BASE_TWD,
     FitnessResult,
     SOURCE_PAPER,
     compute_fitness,
@@ -221,14 +222,21 @@ def _run_backtest(
     point_value: int = 200,
     fill_mode: str = "on_close",
     param_overrides: dict[str, Any] | None = None,
+    capital_base: int = DEFAULT_CAPITAL_BASE_TWD,
 ) -> Any:
-    """Single backtest run. Returns the engine's BacktestResult."""
+    """Single backtest run. Returns the engine's BacktestResult.
+
+    ``capital_base`` (TWD) seeds the metrics' starting equity so
+    ``max_drawdown_pct`` is a percentage of capital rather than of the
+    peak of cumulative P&L (issue #119).
+    """
     strategy = _instantiate(strategy_cls, param_overrides)
     engine = BacktestEngine(
         strategy,
         point_value=point_value,
         max_bars=max(5000, len(bars)),
         fill_mode=fill_mode,
+        initial_balance=capital_base,
     )
     return engine.run(bars)
 
@@ -250,6 +258,7 @@ def _backtest_with_reports(
     fill_mode: str,
     save_reports: bool,
     param_overrides: dict[str, Any] | None = None,
+    capital_base: int = DEFAULT_CAPITAL_BASE_TWD,
 ) -> tuple[Any, list[dict]]:
     """Run a backtest AND route the trades through the daily-report
     pipeline so each evaluation produces the same artifact shape as a
@@ -260,7 +269,7 @@ def _backtest_with_reports(
     pass ``False`` to keep the throwaway pass cheap.
     """
     result = _run_backtest(strategy_cls, bars, point_value, fill_mode,
-                           param_overrides)
+                           param_overrides, capital_base=capital_base)
     highs, lows, closes = _ohlc_arrays(bars)
     reports = generate_report_from_backtest(
         trades=result.trades,
@@ -297,6 +306,7 @@ def monte_carlo_robustness(
     fill_mode: str = "on_close",
     trials: int = MC_TRIALS,
     seed: int | None = 42,
+    capital_base: int = DEFAULT_CAPITAL_BASE_TWD,
 ) -> tuple[float, float]:
     """Run ``trials`` backtests with ±10% jittered numeric params.
 
@@ -320,6 +330,7 @@ def monte_carlo_robustness(
                 point_value=point_value,
                 fill_mode=fill_mode,
                 param_overrides=overrides,
+                capital_base=capital_base,
             )
             fit = compute_fitness(result)
             composites.append(fit.composite)
@@ -346,6 +357,7 @@ def evaluate_screen(
     fill_mode: str = "on_close",
     days: int = SCREEN_DAYS,
     save_reports: bool = False,
+    capital_base: int = DEFAULT_CAPITAL_BASE_TWD,
 ) -> list[EvalResult]:
     """Cheap pass: 30-day in-sample backtest, regime-aware fitness, no
     persistence by default.
@@ -365,8 +377,10 @@ def evaluate_screen(
             cls = load_strategy_from_source(source)
             _, reports = _backtest_with_reports(
                 cls, window, name, point_value, fill_mode, save_reports,
+                capital_base=capital_base,
             )
-            fit = compute_fitness_from_reports(reports)
+            fit = compute_fitness_from_reports(
+                reports, capital_base=capital_base)
             out.append(EvalResult(
                 name=name,
                 source_code=source,
@@ -400,6 +414,7 @@ def evaluate_deep(
     test_days: int = DEEP_TEST_DAYS,
     monte_carlo: bool = True,
     save_reports: bool = True,
+    capital_base: int = DEFAULT_CAPITAL_BASE_TWD,
 ) -> list[EvalResult]:
     """Full pass: 3-month in-sample + 3-month walk-forward + (optional)
     Monte Carlo robustness. ``walkforward_fitness`` on the returned
@@ -422,13 +437,17 @@ def evaluate_deep(
 
             _, train_reports = _backtest_with_reports(
                 cls, train, name, point_value, fill_mode, save_reports,
+                capital_base=capital_base,
             )
-            train_fit = compute_fitness_from_reports(train_reports)
+            train_fit = compute_fitness_from_reports(
+                train_reports, capital_base=capital_base)
 
             _, test_reports = _backtest_with_reports(
                 cls, test, name, point_value, fill_mode, save_reports,
+                capital_base=capital_base,
             )
-            test_fit = compute_fitness_from_reports(test_reports)
+            test_fit = compute_fitness_from_reports(
+                test_reports, capital_base=capital_base)
 
             fragile = False
             mc_var = 0.0
@@ -438,6 +457,7 @@ def evaluate_deep(
                 # reports would clutter the data directory.
                 _, mc_var = monte_carlo_robustness(
                     cls, train, point_value, fill_mode,
+                    capital_base=capital_base,
                 )
                 fragile = mc_var > MC_FRAGILE_VARIANCE
 
@@ -496,6 +516,7 @@ def score_paper_trading_results(
     equity_curve: list[int] | None = None,
     period_start: str | None = None,
     period_end: str | None = None,
+    capital_base: int = DEFAULT_CAPITAL_BASE_TWD,
 ) -> FitnessResult:
     """Score accumulated paper-trading trades and update the pool.
 
@@ -512,6 +533,7 @@ def score_paper_trading_results(
     """
     fit = compute_fitness_from_trades(
         trades, equity_curve, source=SOURCE_PAPER,
+        capital_base=capital_base,
     )
     pool.update_paper_trading_fitness(
         id_=strategy_id,

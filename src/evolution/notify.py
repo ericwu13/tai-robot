@@ -33,6 +33,7 @@ from typing import Any, Callable
 import logging
 
 from .fitness import (
+    DEFAULT_CAPITAL_BASE_TWD,
     FitnessResult,
     SOURCE_BACKTEST,
     SOURCE_PAPER,
@@ -208,6 +209,7 @@ def score_session_for_notification(
     trades: list[Any],
     equity_curve: list[int] | None = None,
     trading_mode: str | None = None,
+    capital_base: int = DEFAULT_CAPITAL_BASE_TWD,
 ) -> FitnessResult:
     """Score accumulated trades without the paper-mode restriction.
 
@@ -224,6 +226,7 @@ def score_session_for_notification(
         trades=trades,
         equity_curve=equity_curve,
         source=source,
+        capital_base=capital_base,
     )
 
 

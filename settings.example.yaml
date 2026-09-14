@@ -98,6 +98,20 @@ evolution:
   # cut rolls forward each cycle — this week's holdout becomes next week's
   # design data.
   holdout_days: 14
+  # 資金基準（新台幣）：演化評分與驗證回測的「起始權益」。最大回撤百分比
+  # (max_drawdown_pct) 以此為分母，才會是真正的「佔資金比例」。若沒有
+  # 基準，回撤百分比是拿「累積損益的高點」當分母 —— 一路虧損的窗口高點
+  # 為 0，回撤就被記成 0.00%（最好的分數），高點很小的窗口則會爆到
+  # 100–226%。填 0 或負數會退回預設值。
+  #
+  # Capital base (TWD) used as the STARTING EQUITY for the evolution
+  # fitness composite and the evolution validation backtests, so
+  # max_drawdown_pct is a real percentage of capital. Without it the
+  # denominator is the peak of cumulative P&L: a window that never goes
+  # positive reports 0.00% (the best possible score) and a tiny-peak
+  # window reports 100-226%. 0 / negative falls back to the default.
+  # Not a credential; changing it only rescales evolution scores.
+  capital_base_twd: 100000
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON

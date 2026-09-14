@@ -35,6 +35,22 @@ from typing import Any, Iterable
 # size is too small to distinguish signal from luck.
 MIN_TRADES = 30
 
+# Starting equity the drawdown PERCENTAGE is measured against (issue #119).
+#
+# UNITS — TWD. ``Trade.pnl`` is ``(exit - entry) * qty * point_value`` and
+# every evolution path runs with the real TXF point value (200), so both
+# the trade P&L and the equity curve this module builds from it are
+# already NT dollars. The base is therefore used as-is; there is no
+# per-contract-points normalization anywhere in this file (``norm_trades``
+# only wraps dicts in ``_TradeStub``, it does not rescale P&L).
+#
+# Without a base, ``calculate_metrics`` measures drawdown against the peak
+# of CUMULATIVE P&L: a window that never goes positive has peak 0 and
+# reports 0.00% — the best possible score for the worst possible window —
+# while a tiny peak reports hundreds of percent. Overridable per call and
+# configurable via ``evolution.capital_base_twd``.
+DEFAULT_CAPITAL_BASE_TWD = 100_000
+
 # Default weights — must sum to 1.0. Tuned to favor risk-adjusted return
 # while penalizing drawdown and rewarding regime robustness.
 DEFAULT_WEIGHTS: dict[str, float] = {
@@ -58,6 +74,17 @@ _DRAWDOWN_CAP_PCT = 30.0   # 30% DD or worse → 0.0
 # from "sideways"; 1% is small enough that intraday noise doesn't dominate
 # but large enough that a directional bar move counts as a regime signal.
 _REGIME_TREND_PCT = 0.01
+
+
+def _safe_capital_base(value: Any) -> int:
+    """Coerce a capital base to a positive int, falling back to the
+    default. A 0 or negative base would reinstate the peak-from-zero
+    sentinel this setting exists to remove (issue #119)."""
+    try:
+        base = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_CAPITAL_BASE_TWD
+    return base if base > 0 else DEFAULT_CAPITAL_BASE_TWD
 
 
 def _clip01(x: float) -> float:
@@ -413,6 +440,7 @@ def compute_fitness_from_trades(
     equity_curve: list[int] | None = None,
     weights: dict[str, float] | None = None,
     source: str = SOURCE_BACKTEST,
+    capital_base: float = DEFAULT_CAPITAL_BASE_TWD,
 ) -> FitnessResult:
     """Input-agnostic entry point: score a strategy from its raw trades.
 
@@ -431,6 +459,10 @@ def compute_fitness_from_trades(
     trades carry no market-context (no bar feed, no regime labels). For
     paper trading, prefer scoring through the daily-report pipeline
     when available — see :func:`compute_fitness_from_reports`.
+
+    ``capital_base`` is the starting equity (TWD — same unit as the
+    trades' P&L) the drawdown percentage is measured against. See
+    :data:`DEFAULT_CAPITAL_BASE_TWD`.
     """
     if source not in VALID_SOURCES:
         raise ValueError(
@@ -457,7 +489,10 @@ def compute_fitness_from_trades(
 
     # Lazy import — same rationale as compute_fitness_from_reports.
     from src.backtest.metrics import calculate_metrics
-    metrics = calculate_metrics(norm_trades, equity_curve, initial_balance=0)
+    metrics = calculate_metrics(
+        norm_trades, equity_curve,
+        initial_balance=_safe_capital_base(capital_base),
+    )
 
     return _compose(
         norm_trades, metrics, regime_scores(norm_trades), w, source=source,
@@ -487,6 +522,7 @@ def compute_fitness_from_reports(
     reports: list[dict],
     weights: dict[str, float] | None = None,
     source: str = SOURCE_BACKTEST,
+    capital_base: float = DEFAULT_CAPITAL_BASE_TWD,
 ) -> FitnessResult:
     """Score a strategy from its daily-report dicts.
 
@@ -528,7 +564,10 @@ def compute_fitness_from_reports(
     for t in synthetic:
         cum += int(t.pnl or 0)
         equity_curve.append(cum)
-    metrics = calculate_metrics(synthetic, equity_curve, initial_balance=0)
+    metrics = calculate_metrics(
+        synthetic, equity_curve,
+        initial_balance=_safe_capital_base(capital_base),
+    )
 
     # Real regime labels first; fall back to the per-trade proxy when
     # NO report carries a label at all.
