@@ -276,7 +276,18 @@ def _parse_stamp(raw):
         return None
 
 
-def _check_watermarks(now, due, rows, lines, findings) -> None:
+def _check_watermarks(now, due, rows, starts, lines, findings) -> None:
+    """Report each bot's watermark, and grade a stale one.
+
+    ``starts`` is ``due_slot_starts``' ``[(bot_name, started_at)]`` — the
+    same list ``_check_usage`` reads, keyed by ``bot_name(bot_dir)``.  It
+    is what keeps this check honest: every early return in
+    ``_bot_evolution`` — the holdout skip above all — happens BEFORE
+    ``save_watermark``, so a bot whose slot fired and self-limited keeps
+    its old watermark.  Reporting "the Saturday slot is not reaching this
+    bot" against a bot whose own log holds that slot's start line
+    contradicts the evidence (issue #115).
+    """
     lines.append("--- watermarks / baselines")
     if not rows:
         lines.append("no evolution artefacts under the bot tree "
@@ -284,6 +295,7 @@ def _check_watermarks(now, due, rows, lines, findings) -> None:
         return
 
     cutoff = due - timedelta(days=STALE_WATERMARK_DAYS)
+    started_at = dict(starts or ())
     for bot_dir, mark, base in rows:
         name = bot_name(bot_dir)
         if mark is None:
@@ -315,6 +327,12 @@ def _check_watermarks(now, due, rows, lines, findings) -> None:
         if idle_days > RECENT_ACTIVITY_DAYS:
             lines.append(f"  (stale watermark, last activity {idle_days:.0f} "
                          f"days ago — archaeology)")
+            continue
+        fired = started_at.get(name)
+        if fired is not None:
+            lines.append(f"  (stale watermark but the slot fired on "
+                         f"{due.date()} at {fired.strftime('%H:%M')} — "
+                         f"holdout/young-session skip, by design)")
             continue
         findings.append(Finding(
             "P2", "evolution",
@@ -406,7 +424,7 @@ def check_evolution(now: datetime, base_dir: str, repo_root: str = _REPO,
     _check_usage(now, due, usage, feature_in_use, usage_path, starts,
                  lines, findings)
     lines.append("")
-    _check_watermarks(now, due, rows, lines, findings)
+    _check_watermarks(now, due, rows, starts, lines, findings)
     lines.append("")
     _check_eligibility(base_dir, pid_alive_fn, lines, findings)
     lines.append("")
