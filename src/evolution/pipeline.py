@@ -33,7 +33,7 @@ from typing import Any
 
 from ..backtest.engine import BacktestEngine, BacktestResult
 from ..backtest.metrics import PerformanceMetrics
-from .fitness import FitnessResult, compute_fitness_from_trades
+from .fitness import MIN_TRADES, FitnessResult, compute_fitness_from_trades
 
 _JSON_FENCE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
 
@@ -73,7 +73,7 @@ def candidate_trade_floor(baseline_trades: int | None) -> int:
 # ratios — this only catches collapse, not mild degradation (e.g. the
 # observed atr-stop case: candidate train MaxDD 71% vs baseline 21%).
 TRAIN_COLLAPSE_PF_RATIO = 0.8   # candidate PF < 80% of baseline's → collapse
-TRAIN_COLLAPSE_DD_RATIO = 1.5   # candidate MaxDD% > 150% of baseline's → collapse
+TRAIN_COLLAPSE_DD_RATIO = 1.5   # candidate MaxDD > 150% of baseline's → collapse
 
 # Holdout drawdown is gated RELATIVE to the baseline, not against the
 # plan's absolute threshold: dd% is measured from a zero-based P&L
@@ -84,6 +84,30 @@ TRAIN_COLLAPSE_DD_RATIO = 1.5   # candidate MaxDD% > 150% of baseline's → coll
 # anchored on — and the holdout only requires "not materially worse
 # than baseline".
 HOLDOUT_DD_RATIO_MAX = 1.2
+
+# ── Why every baseline-vs-candidate dd comparison uses max_drawdown
+# ── (currency) and never max_drawdown_pct (issue #114).
+#
+# ``calculate_metrics`` computes ``max_drawdown_pct = max_dd / peak * 100
+# if peak > 0 else 0.0`` with ``peak`` seeded from ``initial_balance``.
+# The evolution backtests never pass a balance, so peak starts at 0: a
+# window whose cumulative P&L never rises above zero reports MaxDD% =
+# 0.00 — the BEST possible value — and a window with a small peak
+# reports absurd percentages (107.9% and 174.5% seen on real data).
+# Relative gates built on that number reject every candidate that has
+# any drawdown whenever the baseline never went positive, and are
+# trivially loose whenever the baseline's peak was tiny. (Why so few
+# candidates ever reached a verdict is a separate problem — the plan
+# prompt's sample rule, see ``plan_sample_rule``; this sentinel only
+# decided the verdicts of the candidates that did get there.)
+#
+# ``max_drawdown`` is the same peak-to-trough figure BEFORE the division,
+# so the initial_balance offset cancels out entirely: it is always
+# defined, carries no sentinel, and both sides of an A/B ran on the same
+# bars — making it directly comparable. The plan's own
+# ``max_drawdown_pct_max`` criterion stays on dd%: that is a percent the
+# model itself specified about the candidate, not a baseline comparison.
+DD_RATIO_FLOOR = 1   # currency floor; only guards division by zero
 
 # Absolute profitability floor (issue #99). Every gate above is RELATIVE
 # — "not worse than the baseline" — which silently passes a candidate
@@ -153,6 +177,75 @@ def next_candidate_name(base_name: str, taken: set[str] | None = None) -> str:
     while f"{root}Evo{n}" in taken or f"{root}Evo{n}" == base_name:
         n += 1
     return f"{root}Evo{n}"
+
+
+def check_candidate_name(cls, expected: str) -> str:
+    """Empty string when the generated class carries ``expected``,
+    otherwise the error message describing the mismatch.
+
+    ``load_strategy_from_source`` returns the FIRST ``BacktestStrategy``
+    subclass it finds, whatever it is called, and the codegen prompt's
+    "the class MUST be named X" is only a request. On PASS the pipeline
+    saves by ``candidate_cls.__name__`` and ``StrategyStore.save``
+    overwrites by class name — so a model that kept the base class name
+    would silently replace the LIVE strategy's stored source and its
+    ``STRATEGIES`` registry entry (issue #114). The caller turns a
+    non-empty return into ``last_err`` and retries.
+    """
+    if cls is None:
+        return (f"generated code produced no strategy class "
+                f"(expected {expected or 'a BacktestStrategy subclass'})")
+    if not expected:
+        return ""
+    actual = getattr(cls, "__name__", "") or "<unnamed>"
+    if actual == expected:
+        return ""
+    return f"class must be named {expected}, got {actual}"
+
+
+def plan_sample_rule(design_total: int, new_count: int) -> str:
+    """The evolution plan prompt's small-sample rule, on the right base.
+
+    The rule ("too few trades → continue collecting data, no change")
+    has to be measured against the DESIGN-WINDOW total, but the trade
+    list the model receives is a DELTA: only the trades new since the
+    previous run's watermark. The model kept applying the <30 rule to
+    that short list and answering ``no_change`` almost every week — the
+    09-12 run sent 3 trades of a 130-trade design window, and issue #94's
+    run sent 1 of 14 (issue #114).
+
+    ``design_total`` is the design-window trade count (the same number
+    the context block reports as "Simulated (design window): N trades");
+    ``new_count`` is how many of them appear in the list below.
+    """
+    applies = design_total < MIN_TRADES
+    if 0 <= new_count < design_total:
+        scope = (
+            f"樣本大小規則 Sample-size rule — it applies to the "
+            f"DESIGN-WINDOW TOTAL ({design_total} trades), NOT to the trade "
+            f"list below. The list below is a DELTA: only the {new_count} "
+            f"trade{'' if new_count == 1 else 's'} new since the previous "
+            f"evolution run. The earlier "
+            f"design-window trades were analysed in a previous run and are "
+            f"already reflected in the aggregate metrics and fitness above, "
+            f"so a short list is NOT a reason for 「no change」 and does not "
+            f"trigger the small-sample rule.")
+    else:
+        scope = (
+            f"樣本大小規則 Sample-size rule — it applies to the "
+            f"DESIGN-WINDOW TOTAL ({design_total} trades); the trade list "
+            f"below covers that whole window.")
+    rule = (
+        f"Only when the design window itself is too small (fitness "
+        f"composite gated / fewer than {MIN_TRADES} design-window trades) "
+        f"is「繼續收集數據，暫不修改 continue collecting data, no change」the "
+        f"correct plan — say so explicitly then.")
+    verdict = (
+        f"With {design_total} design-window trades the rule DOES apply here."
+        if applies else
+        f"With {design_total} design-window trades the rule does NOT apply "
+        f"here — propose one concrete change.")
+    return f"{scope} {rule} {verdict}"
 
 
 @dataclass
@@ -257,13 +350,16 @@ def decide_verdict(baseline: ABResult, candidate: ABResult,
             False, [f"baseline backtest error: {baseline.error or 'no result'}"])
     bm = baseline.metrics
     ok_pf = cm.profit_factor >= bm.profit_factor
-    ok_dd = cm.max_drawdown_pct <= bm.max_drawdown_pct
+    # Absolute drawdown, never dd% — see the DD_RATIO_FLOOR note above
+    # (issue #114): a baseline that never went positive reports dd% 0.00
+    # and no candidate with any drawdown could ever clear it.
+    ok_dd = cm.max_drawdown <= bm.max_drawdown
     cpf = "INF" if cm.profit_factor == float("inf") else f"{cm.profit_factor:.2f}"
     bpf = "INF" if bm.profit_factor == float("inf") else f"{bm.profit_factor:.2f}"
     reasons.append(f"PF {cpf} vs baseline {bpf}: {'✓' if ok_pf else '✗'}")
     reasons.append(
-        f"MaxDD% {cm.max_drawdown_pct:.2f} vs baseline "
-        f"{bm.max_drawdown_pct:.2f}: {'✓' if ok_dd else '✗'}")
+        f"MaxDD {cm.max_drawdown:,} vs baseline {bm.max_drawdown:,} "
+        f"(絕對值 absolute): {'✓' if ok_dd else '✗'}")
     return EvolutionVerdict(floor_ok and pf_ok and ok_pf and ok_dd, reasons)
 
 
@@ -500,12 +596,16 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
                 f"design-window PF ratio {pf_ratio:.2f} ≥ "
                 f"{TRAIN_COLLAPSE_PF_RATIO:g}: {'✓' if ok else '✗ (collapse)'}")
             passed = passed and ok
-        base_dd = max(btm.max_drawdown_pct, 1.0)  # floor avoids div-by-~0
-        dd_ratio = ctm.max_drawdown_pct / base_dd
+        # Absolute drawdown (issue #114) — dd% carries the zero-peak
+        # sentinel; the floor here only guards division by zero.
+        base_dd = max(btm.max_drawdown, DD_RATIO_FLOOR)
+        dd_ratio = ctm.max_drawdown / base_dd
         ok = dd_ratio <= TRAIN_COLLAPSE_DD_RATIO
         reasons.append(
             f"design-window MaxDD ratio {dd_ratio:.2f} ≤ "
-            f"{TRAIN_COLLAPSE_DD_RATIO:g}: {'✓' if ok else '✗ (collapse)'}")
+            f"{TRAIN_COLLAPSE_DD_RATIO:g} ({ctm.max_drawdown:,} vs baseline "
+            f"{btm.max_drawdown:,} 絕對值 absolute): "
+            f"{'✓' if ok else '✗ (collapse)'}")
         passed = passed and ok
 
     # The plan's absolute dd criterion is window-length sensitive —
@@ -525,12 +625,15 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
         passed = passed and ok
     btm_test = baseline.test.metrics
     if btm_test is not None and btm_test.total_trades > 0:
-        bdd = max(btm_test.max_drawdown_pct, 1.0)
-        dd_ratio = cm.max_drawdown_pct / bdd
+        # Absolute drawdown (issue #114) — see DD_RATIO_FLOOR.
+        bdd = max(btm_test.max_drawdown, DD_RATIO_FLOOR)
+        dd_ratio = cm.max_drawdown / bdd
         ok = dd_ratio <= HOLDOUT_DD_RATIO_MAX
         reasons.append(
             f"holdout MaxDD ratio {dd_ratio:.2f} ≤ "
-            f"{HOLDOUT_DD_RATIO_MAX:g} (vs baseline): {'✓' if ok else '✗'}")
+            f"{HOLDOUT_DD_RATIO_MAX:g} ({cm.max_drawdown:,} vs baseline "
+            f"{btm_test.max_drawdown:,} 絕對值 absolute): "
+            f"{'✓' if ok else '✗'}")
         passed = passed and ok
 
     sub = decide_verdict(baseline.test, candidate.test,
@@ -592,9 +695,12 @@ def _side_summary(side: ABResult) -> str:
     if side.fitness is not None:
         gated = " (gated)" if side.fitness.gated else ""
         comp = f" | composite {side.fitness.composite:.3f}{gated}"
+    # Both drawdown figures: the gates compare the absolute one
+    # (issue #114), so printing dd% alone made the reasons unreadable.
     return (f"  {side.name}: {m.total_trades} trades | "
             f"P&L {m.total_pnl:+,} | PF {pf} | "
-            f"WR {m.win_rate * 100:.1f}% | MaxDD% {m.max_drawdown_pct:.2f}{comp}")
+            f"WR {m.win_rate * 100:.1f}% | MaxDD {m.max_drawdown:,} "
+            f"({m.max_drawdown_pct:.2f}%){comp}")
 
 
 def format_verdict_block(baseline: ABResult, candidate: ABResult,
