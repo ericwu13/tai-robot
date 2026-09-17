@@ -22,12 +22,17 @@ equity curve are already TWD. The capital base is TWD too — no conversion.
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from datetime import datetime, timedelta
 
 import pytest
 
 from src.backtest.broker import Trade, OrderSide
 from src.backtest.engine import BacktestEngine
+from src.backtest.metrics import calculate_metrics
+from src.backtest.report import format_report
 from src.backtest.strategy import BacktestStrategy
 from src.backtest.broker import BrokerContext
 from src.market_data.models import Bar
@@ -194,3 +199,79 @@ class TestCapitalBaseSetting:
         cfg = _cfg(tmp_path, monkeypatch,
                    f"evolution:\n  capital_base_twd: {bad}\n")
         assert cfg["evolution_capital_base_twd"] == 100_000
+
+
+# ── Design-window AI report leftover (#119/#120) ──────────────────────
+#
+# Fitness already seeds capital_base via ``_evolution_capital_base()``.
+# The design-window ``format_report`` in ``_bot_evolution`` still called
+# ``calculate_metrics(..., initial_balance=0)``, so the AI still saw the
+# zero-peak MaxDD% sentinel that #119/#120 removed from the composite.
+
+
+def _design_equity(trades):
+    d_eq, d_cum = [], 0
+    for t in trades:
+        d_cum += t.pnl
+        d_eq.append(d_cum)
+    return d_eq
+
+
+class TestDesignReportUsesCapitalBase:
+    """These two glue tests FAIL against the pre-fix ``_bot_evolution``
+    (``initial_balance=0``). The report-number test documents what the
+    AI must see once the wire-in lands.
+    """
+
+    def test_bot_evolution_design_report_does_not_pass_zero_base(self):
+        """FAILS pre-fix: the leftover is literally ``initial_balance=0``."""
+        import run_backtest as rb
+        src = textwrap.dedent(
+            inspect.getsource(rb.BacktestApp._bot_evolution))
+        tree = ast.parse(src)
+        calls = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "calculate_metrics"
+        ]
+        assert calls, (
+            "_bot_evolution must still score the design-window report")
+        for call in calls:
+            kw = {k.arg: k.value for k in call.keywords}
+            assert "initial_balance" in kw
+            val = kw["initial_balance"]
+            assert not (isinstance(val, ast.Constant) and val.value == 0), (
+                "issue #119 leftover: design-window format_report must not "
+                "seed calculate_metrics with initial_balance=0")
+
+    def test_bot_evolution_design_report_uses_evolution_capital_base(self):
+        """FAILS pre-fix: ``_evolution_capital_base()`` is not the
+        ``initial_balance`` of the design-window ``calculate_metrics``."""
+        import run_backtest as rb
+        src = inspect.getsource(rb.BacktestApp._bot_evolution)
+        assert "format_report" in src
+        assert "initial_balance=self._evolution_capital_base()" in src, (
+            "design-window calculate_metrics / format_report must seed "
+            "initial_balance from _evolution_capital_base() so MaxDD% "
+            "matches the fitness composite")
+        assert (
+            "calculate_metrics(design_known, d_eq, initial_balance=0)"
+            not in src)
+
+    def test_sinking_design_window_report_shows_capital_based_dd(self):
+        """30 × -1k TWD against a 100k base is 30.00%, not the 0.00%
+        sentinel ``initial_balance=0`` prints — the number the AI reads
+        in the design-window report body."""
+        trades = [_trade(-1000, i) for i in range(MIN_TRADES)]
+        d_eq = _design_equity(trades)
+        m0 = calculate_metrics(trades, d_eq, initial_balance=0)
+        m = calculate_metrics(trades, d_eq, initial_balance=100_000)
+        report = format_report(
+            "X — 設計窗 design window (holdout excluded)", m)
+        assert m0.max_drawdown_pct == 0.0
+        assert m.max_drawdown_pct == pytest.approx(30.0)
+        assert m.initial_balance == 100_000
+        assert m.final_balance == 70_000
+        assert "100,000" in report
+        assert "30.00%" in report
