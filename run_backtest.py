@@ -110,6 +110,7 @@ from src.live.fill_report import (
 )
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
+from src.live.deploy_request import DeployRequest
 from src.market_data.kline_config import (
     TV_INTERVALS, INTERVAL_SECONDS, SYMBOL_CONFIG, CACHE_SUFFIXES,
     LIVE_CHART_TIMEFRAMES, resolve_order_symbol, get_near_month_symbol,
@@ -156,6 +157,29 @@ STRATEGIES: dict[str, type[BacktestStrategy]] = {
     NEWS_SHORT_DISPLAY: NewsEventShort,
     NEWS_LONG_DISPLAY: NewsEventLong,
 }
+
+def load_saved_ai_strategies(store: StrategyStore) -> int:
+    """Register every saved AI strategy in ``store`` into STRATEGIES.
+
+    Shared by the GUI startup and the headless CLI so both see the same
+    ``AI: <ClassName>`` entries. Returns the number newly loaded.
+    """
+    loaded = 0
+    for entry in store.list_strategies():
+        class_name = entry["class_name"]
+        name = f"AI: {class_name}"
+        if name in STRATEGIES:
+            continue  # already loaded
+        source = store.load_source(class_name)
+        if not source:
+            continue
+        try:
+            STRATEGIES[name] = load_strategy_from_source(source)
+            loaded += 1
+        except Exception:
+            _log(f"Failed to auto-load strategy: {class_name}")
+    return loaded
+
 
 # Strategies that must never be offered as a regime long/short leg: they
 # enter unconditionally and never re-enter, so a regime session would get
@@ -2380,22 +2404,7 @@ class BacktestApp:
     def _load_saved_strategies(self):
         """Auto-load all saved AI strategies into STRATEGIES on startup."""
         self._refresh_saved_combo()
-        entries = self._strategy_store.list_strategies()
-        loaded = 0
-        for entry in entries:
-            class_name = entry["class_name"]
-            name = f"AI: {class_name}"
-            if name in STRATEGIES:
-                continue  # already loaded
-            source = self._strategy_store.load_source(class_name)
-            if not source:
-                continue
-            try:
-                strategy_cls = load_strategy_from_source(source)
-                STRATEGIES[name] = strategy_cls
-                loaded += 1
-            except Exception:
-                _log(f"Failed to auto-load strategy: {class_name}")
+        loaded = load_saved_ai_strategies(self._strategy_store)
         if loaded:
             self.strategy_combo.config(values=list(STRATEGIES.keys()))
             _log(f"Auto-loaded {loaded} saved AI strategies")
@@ -3500,7 +3509,7 @@ class BacktestApp:
             req_end = self.end_var.get().strip()
             if actual_start != req_start or actual_end != req_end:
                 _log(f"資料範圍修正 Data range adjusted: {actual_start} ~ {actual_end}")
-                ok = messagebox.askokcancel(
+                ok = self._confirm(
                     "資料範圍不足 Insufficient Data Range",
                     f"要求範圍 Requested: {req_start} ~ {req_end}\n"
                     f"實際範圍 Available: {actual_start} ~ {actual_end}\n"
@@ -5828,9 +5837,44 @@ class BacktestApp:
         result = self._show_bot_session_dialog(symbol, base_dir)
         if result is None:  # cancelled
             return
-        bot_name, resume_session, trading_mode, loss_limit_str, \
-            regime_enabled, regime_long, regime_short, \
-            news_enabled, news_tier2_enabled, news_directional = result
+        self._deploy_live_from(DeployRequest.from_dialog_tuple(result))
+
+    # ── Dialog seams (overridden by the headless CLI, src/live/headless_app.py) ──
+
+    def _confirm(self, title: str, message: str) -> bool:
+        """Yes/No question on the deploy + backtest paths.
+
+        The GUI asks the user; ``HeadlessBotApp`` answers from its policy
+        flags. Every interactive question on these paths MUST go through
+        here so the CLI never blocks on a hidden dialog.
+        """
+        return bool(messagebox.askyesno(title, message))
+
+    def _alert(self, title: str, message: str) -> None:
+        """Error popup on the deploy path (log-only when headless)."""
+        messagebox.showerror(title, message)
+
+    def _deploy_live_from(self, req: DeployRequest) -> bool:
+        """Deploy a live bot from an already-resolved request.
+
+        Everything after the session-picker dialog lives here so the
+        headless CLI (``run_bot_cli.py``) can deploy without Tk dialogs.
+        Returns True when warmup was started, False when the deploy was
+        refused (lock conflict, unknown strategy, config error, declined
+        confirmation).
+        """
+        symbol = self.symbol_var.get().strip()
+        base_dir = os.path.join(project_root, "data", "live")
+        bot_name = req.bot_name
+        resume_session = req.resume_session
+        trading_mode = req.trading_mode
+        loss_limit_str = req.loss_limit
+        regime_enabled = req.regime_enabled
+        regime_long = req.regime_long
+        regime_short = req.regime_short
+        news_enabled = req.news_enabled
+        news_tier2_enabled = req.news_tier2_enabled
+        news_directional = req.news_directional
         self._trading_mode = trading_mode
         try:
             loss_limit = max(0, int(loss_limit_str))
@@ -5885,7 +5929,7 @@ class BacktestApp:
             use_current = False
             if (saved_strategy and current_strategy
                     and current_strategy != saved_strategy):
-                use_current = messagebox.askyesno(
+                use_current = self._confirm(
                     "策略更換 Strategy Change",
                     f"此機器人上次執行的策略 Saved strategy:\n"
                     f"  {saved_strategy}\n"
@@ -5913,10 +5957,10 @@ class BacktestApp:
                             matched = True
                             break
                 if not matched:
-                    messagebox.showerror("Strategy Not Found",
-                                         f"找不到策略 Strategy '{saved_strategy}' not found.\n"
-                                         "請確認策略已載入 Please ensure the strategy is loaded.")
-                    return
+                    self._alert("Strategy Not Found",
+                                f"找不到策略 Strategy '{saved_strategy}' not found.\n"
+                                "請確認策略已載入 Please ensure the strategy is loaded.")
+                    return False
             if saved_symbol and saved_symbol in [v for v in self.symbol_combo['values']]:
                 self.symbol_var.set(saved_symbol)
                 self._on_symbol_changed()
@@ -5936,30 +5980,30 @@ class BacktestApp:
             errors = validate_leg_strategies(
                 regime_cfg.long_strategy, regime_cfg.short_strategy, STRATEGIES)
             if errors:
-                messagebox.showerror(
+                self._alert(
                     "多空切換設定錯誤 Regime Config Error",
                     "\n".join(errors))
-                return
+                return False
             strategy_cls = STRATEGIES[regime_cfg.long_strategy]
         else:
             # Re-read strategy after potential update from session
             strategy_cls = STRATEGIES.get(self.strategy_var.get())
             if not strategy_cls:
                 self.status_var.set("請選擇策略 Select a strategy")
-                return
+                return False
 
         # Check for lock conflict (another instance using the same bot name)
         symbol = self.symbol_var.get().strip()
         bot_dir = LiveRunner.bot_dir_for(base_dir, symbol, bot_name)
         is_locked, lock_pid = LiveRunner.check_lock(bot_dir)
         if is_locked:
-            messagebox.showerror(
+            self._alert(
                 "Bot Name Conflict",
                 f"機器人名稱 '{bot_name}' 已被另一個程式佔用 (PID {lock_pid})。\n"
                 f"Bot name '{bot_name}' is already in use by another instance.\n\n"
                 "請使用不同的名稱 Please use a different name.",
             )
-            return
+            return False
 
         # Semi-auto: check for pre-existing real positions before deploy
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
@@ -5996,7 +6040,7 @@ class BacktestApp:
                     side = "多 LONG" if p["side"] == "B" else "空 SHORT"
                     pos_parts.append(f"{side} x{p['qty']} {p['product']}")
                 pos_str = ", ".join(pos_parts)
-                proceed = messagebox.askyesno(
+                proceed = self._confirm(
                     "帳戶有持倉 Existing Position",
                     f"帳戶已有未平倉部位：{pos_str}\n"
                     f"Account has open positions: {pos_str}\n\n"
@@ -6007,7 +6051,7 @@ class BacktestApp:
                     "Deploy anyway? (Use manual buttons to close, then orders resume)",
                 )
                 if not proceed:
-                    return
+                    return False
                 # Deploy but guard.real_entry_confirmed stays False
                 # so no auto exits are sent for positions we didn't create
 
@@ -6304,6 +6348,7 @@ class BacktestApp:
 
         # Start warmup
         self._start_live_warmup()
+        return True
 
     def _start_live_warmup(self):
         """Fetch historical bars at strategy's native timeframe for warmup."""
@@ -8619,18 +8664,31 @@ class BacktestApp:
         self.status_var.set("就緒 Ready")
 
 
+# Event sinks + comtypes connections must outlive the event loop; keep them
+# referenced at module level (shared by the GUI main() and the headless CLI).
+_com_event_handlers: list = []
+
+
+def register_com_events() -> None:
+    """Attach the SKCOM event handler classes to the COM objects."""
+    if not _com_available:
+        return
+    import comtypes.client
+    quote_event = SKQuoteLibEvents()
+    _com_event_handlers.append(quote_event)
+    _com_event_handlers.append(comtypes.client.GetEvents(skQ, quote_event))
+    reply_event = SKReplyLibEvent()
+    _com_event_handlers.append(reply_event)
+    _com_event_handlers.append(comtypes.client.GetEvents(skR, reply_event))
+    if skO is not None:
+        order_event = SKOrderLibEvents()
+        _com_event_handlers.append(order_event)
+        _com_event_handlers.append(comtypes.client.GetEvents(skO, order_event))
+
+
 def main():
     _init_com()
-
-    if _com_available:
-        import comtypes.client
-        SKQuoteEvent = SKQuoteLibEvents()
-        SKQuoteLibEventHandler = comtypes.client.GetEvents(skQ, SKQuoteEvent)
-        SKReplyEvent = SKReplyLibEvent()
-        SKReplyLibEventHandler = comtypes.client.GetEvents(skR, SKReplyEvent)
-        if skO is not None:
-            SKOrderEvent = SKOrderLibEvents()
-            SKOrderLibEventHandler = comtypes.client.GetEvents(skO, SKOrderEvent)
+    register_com_events()
 
     root = tk.Tk()
     app = BacktestApp(root)

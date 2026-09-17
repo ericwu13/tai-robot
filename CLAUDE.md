@@ -67,6 +67,11 @@ python test_kline.py       # COM-based KLine history GUI
 - Data arrives synchronously within RequestKLineAMByDate call
 - **Bar timestamp convention**: COM API returns intraday N-min bars labeled by their CLOSE time (e.g. an AM 60-min bar covering 12:45–13:45 arrives as `13:45`). Everywhere else in this codebase (BarBuilder/BarAggregator/`is_last_bar_of_session`/strategies) `bar.dt` is the bar OPEN time. `parse_kline_strings()` auto-detects close-time labels and shifts them to open-time so downstream code sees a single convention. Do NOT undo this normalization without rewriting every consumer.
 
+## Headless CLI (run_bot_cli.py)
+- `run_bot_cli.py deploy|stop|list|status|strategies|backtest` — same live machinery as the GUI: `HeadlessBotApp(BacktestApp)` on a withdrawn Tk root (`src/live/headless_app.py`), so tick/fill/reconnect/session-end code is byte-identical. Pure helpers (parser, DeployRequest builder, STOP file, bot scan) in `src/live/headless.py`.
+- Dialog seam: `_deploy_live()` = dialog only → `_deploy_live_from(DeployRequest)`; every prompt on that path goes through `self._confirm(title, msg)` / `self._alert(title, msg)` (GUI: messagebox; headless: `HeadlessPolicy.answer(title)`, unknown title = NO). Adding a new prompt to the deploy/backtest path = use the seam and add its title to `src/live/headless.py`, or the CLI will decline it.
+- `semi_auto` is refused headless (needs the order-confirm dialog). Stop = `STOP` file in the bot dir or Ctrl+C → normal `_stop_live()`.
+
 ## Conventions
 - Python 3.13+ on Windows 11
 - Snake_case for functions/variables, PascalCase for classes

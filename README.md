@@ -116,6 +116,57 @@ tai_backtest/
   CapitalLog_Backtest/      # API logs (auto-created on login)
 ```
 
+## Headless CLI (deploy bots without the GUI)
+
+`run_bot_cli.py` drives the **same** live-bot code as the workbench — it
+constructs `BacktestApp` on a hidden Tk window, so order handling, fill
+tracking, reconnects, session-end close and regime polling are identical to
+a GUI deploy. Only the dialogs are replaced by flags. Use it from scripts,
+scheduled tasks, or agents.
+
+```bash
+python run_bot_cli.py strategies                       # display names (incl. saved AI: ...)
+python run_bot_cli.py list                             # every data/live/{symbol}_{bot} + lock state
+python run_bot_cli.py status --symbol TMF00 --bot night1 --json
+
+# paper bot, new session (resumes automatically if session.json exists)
+python run_bot_cli.py deploy --symbol TMF00 --bot night1 --strategy "H4 Bollinger Long"
+
+# regime-switching bot with the news breaker, real orders
+python run_bot_cli.py deploy --symbol TMF00 --bot regime1 --mode auto --regime \
+    --long-strategy "H4 Bollinger Long" --short-strategy "AI: SomeShort" \
+    --news --news-directional --loss-limit 1500
+
+# stop: writes data/live/{symbol}_{bot}/STOP, the CLI bot force-closes,
+# saves the session, writes the daily report and exits
+python run_bot_cli.py stop --symbol TMF00 --bot night1 --wait 60
+
+# backtest from the shell (tv = TradingView download, api = Capital API login)
+python run_bot_cli.py backtest --symbol TX00 --strategy "1m SMA" \
+    --start 20260101 --end 20260301 --source tv --export trades.csv
+```
+
+Notes:
+
+- Credentials come from `settings.yaml` (`credentials.user_id/password`);
+  `TAI_USER_ID` / `TAI_PASSWORD` environment variables override them.
+- `--mode semi_auto` is refused: it needs a human on the 10-second
+  order-confirm dialog. Headless modes are `paper` and `auto`.
+- Resume rules match the GUI: `--strategy` on a resumed bot deploys the
+  selected strategy (keeps history/watermark); without it the saved strategy
+  is used. `--new` refuses to resume, `--resume` refuses to start fresh.
+- A real-order deploy waits for the futures account from the API and, like
+  the GUI, aborts if the account already holds a position unless
+  `--allow-existing-position` is given.
+- Ctrl+C is the same as `stop`. Only CLI-started bots poll the STOP file; a
+  GUI bot is stopped from the workbench.
+- Exit codes: `0` ok · `1` usage · `2` login/connection · `3` COM unavailable ·
+  `4` deploy refused (lock held, unknown strategy, config error) ·
+  `5` bot stopped on its own (warmup/subscription failure — see
+  `data/live/{symbol}_{bot}/debug_YYYYMMDD.log`) · `6` timeout · `7` backtest failed.
+- The process must run in a desktop session (hidden Tk window); a Windows
+  service running as LocalSystem is not supported.
+
 ## Project Structure
 
 ```
