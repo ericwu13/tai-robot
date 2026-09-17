@@ -34,14 +34,17 @@ computed from those daily-report dicts via
 
 Anti-overfitting: each strategy can additionally be checked for
 parameter robustness via Monte Carlo perturbation (±10% on numeric
-``__init__`` defaults; >30% fitness variance flags the strategy as
+constructor defaults — signature, ``kwargs.get`` literals, or
+instance numeric attrs; >30% fitness variance flags the strategy as
 fragile).
 """
 
 from __future__ import annotations
 
+import ast
 import inspect
 import random
+import textwrap
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -177,10 +180,17 @@ def _instantiate(
         raise
 
 
-def _numeric_param_defaults(strategy_cls: type) -> dict[str, float]:
-    """Pull numeric defaults from the strategy's ``__init__`` for MC
-    perturbation. Booleans are excluded — they're integers in Python
-    but not numeric in any meaningful sense for ±10%."""
+def _accepts_var_keyword(strategy_cls: type) -> bool:
+    try:
+        sig = inspect.signature(strategy_cls.__init__)
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD
+               for p in sig.parameters.values())
+
+
+def _signature_numeric_defaults(strategy_cls: type) -> dict[str, float]:
+    """Numeric defaults declared on the ``__init__`` signature."""
     out: dict[str, float] = {}
     try:
         sig = inspect.signature(strategy_cls.__init__)
@@ -196,6 +206,109 @@ def _numeric_param_defaults(strategy_cls: type) -> dict[str, float]:
         if isinstance(p.default, (int, float)):
             out[name] = float(p.default)
     return out
+
+
+def _ast_numeric_const(node: ast.AST) -> float | None:
+    """Literal int/float (not bool), including unary ``+/-``."""
+    if isinstance(node, ast.Constant):
+        val = node.value
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        return float(val)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        inner = _ast_numeric_const(node.operand)
+        if inner is None:
+            return None
+        return -inner if isinstance(node.op, ast.USub) else inner
+    return None
+
+
+def _kwargs_get_numeric_defaults(strategy_cls: type) -> dict[str, float]:
+    """Parse ``kwargs.get("name", default)`` numeric literals from source.
+
+    Matches the AI-codegen pattern (``self.x = kwargs.get("x", 20)`` and
+    the wrapped form ``self.x = float(kwargs.get("x", 2.0))``). Does not
+    instantiate the class.
+    """
+    try:
+        src = inspect.getsource(strategy_cls.__init__)
+    except (OSError, TypeError):
+        return {}
+    try:
+        tree = ast.parse(textwrap.dedent(src))
+    except SyntaxError:
+        return {}
+    out: dict[str, float] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "get"):
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id == "kwargs"):
+            continue
+        if len(node.args) < 2:
+            continue
+        key_node, val_node = node.args[0], node.args[1]
+        if not (isinstance(key_node, ast.Constant)
+                and isinstance(key_node.value, str)):
+            continue
+        num = _ast_numeric_const(val_node)
+        if num is None:
+            continue
+        out[key_node.value] = num
+    return out
+
+
+def _instance_numeric_attrs(strategy_cls: type) -> dict[str, float]:
+    """Fallback: public numeric instance attrs after a no-arg construct.
+
+    Only used when the constructor accepts ``**kwargs`` so the names can
+    actually be passed back as MC overrides. Zero-valued attrs are skipped
+    — they are almost always position state (``trailing_stop_price = 0``),
+    not tunable parameters. Booleans are excluded for the same reason as
+    the signature path.
+    """
+    if not _accepts_var_keyword(strategy_cls):
+        return {}
+    try:
+        inst = strategy_cls()
+    except Exception:
+        return {}
+    out: dict[str, float] = {}
+    for name, val in vars(inst).items():
+        if name.startswith("_"):
+            continue
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        if val == 0:
+            continue
+        out[name] = float(val)
+    return out
+
+
+def _numeric_param_defaults(strategy_cls: type) -> dict[str, float]:
+    """Pull numeric defaults for MC perturbation.
+
+    Sources, later overwrites earlier on name conflict (so an explicit
+    signature default wins over a ``kwargs.get`` literal):
+
+    1. ``kwargs.get("name", default)`` numeric literals in ``__init__``
+    2. ``__init__`` signature defaults (int/float, not bool)
+    3. Public numeric instance attributes after a no-arg construct —
+       **only** when (1)+(2) found nothing *and* the class accepts
+       ``**kwargs``. Instantiation is skipped when source/signature
+       already yielded params, so recording ``__init__`` side effects
+       (used in tests) are not polluted by discovery.
+
+    Booleans are excluded — they're integers in Python but not numeric
+    in any meaningful sense for ±10%.
+    """
+    out = _kwargs_get_numeric_defaults(strategy_cls)
+    out.update(_signature_numeric_defaults(strategy_cls))
+    if out:
+        return out
+    return _instance_numeric_attrs(strategy_cls)
 
 
 def _perturb(
