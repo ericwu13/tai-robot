@@ -97,6 +97,31 @@ def save_watermark(bot_dir: str | os.PathLike, trade_count: int,
     os.replace(tmp, watermark_path(bot_dir))
 
 
+def should_advance_watermark(action: str | None) -> bool:
+    """True only after a completed plan with ``action=change`` (issue #125).
+
+    Launch / worker start, ``no_change``, and a missing/unknown action
+    must not consume next week's design-window delta. Gate thresholds
+    (ABS_PF_FLOOR, MIN_EXPRESSED, HOLDOUT_DD_RATIO, …) are unrelated.
+    """
+    return (action or "").strip().lower() == "change"
+
+
+def maybe_advance_watermark(
+        bot_dir: str | os.PathLike | None, trade_count: int,
+        action: str | None, at: str | None = None) -> bool:
+    """Save the watermark iff ``action`` authorizes it (issue #125).
+
+    Returns True when a file was written. ``bot_dir`` None (backtest GUI
+    with no live session) is a no-op, matching the pre-#125 live-only
+    save path.
+    """
+    if not bot_dir or not should_advance_watermark(action):
+        return False
+    save_watermark(bot_dir, trade_count, at=at)
+    return True
+
+
 # ── Evolution cadence ──
 EVOLUTION_CADENCE_DAILY = "daily"
 EVOLUTION_CADENCE_WEEKLY = "weekly"

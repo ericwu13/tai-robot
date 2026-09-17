@@ -4893,7 +4893,8 @@ class BacktestApp:
         if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
             self._start_evolution_pipeline(
                 preamble, sent_lines, source_section, result,
-                auto_run=auto_run, holdout_days=holdout_days)
+                auto_run=auto_run, holdout_days=holdout_days,
+                bot_dir=bot_dir, design_cut_idx=cut_idx)
         else:
             if auto:
                 self._append_chat(
@@ -4903,17 +4904,9 @@ class BacktestApp:
             self._dispatch_trade_analysis(
                 preamble, sent_lines, source_section, len(sent_lines),
                 label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
-
-        # Advance the watermark only to the DESIGN cut — the held-out
-        # trades were never shown to the AI, so they must roll into the
-        # design window of the NEXT run (walk-forward). High-water mark,
-        # not per-trade flags — broker.trades is append-only.
-        if bot_dir:
-            try:
-                from src.evolution.notify import save_watermark
-                save_watermark(bot_dir, cut_idx)
-            except Exception as e:
-                _log(f"evolution watermark save failed: [{type(e).__name__}] {e}")
+            # Issue #125: plan-only fallback does not parse ``action``,
+            # so the watermark stays frozen (does not burn next week's
+            # delta). Auto-pipeline saves after action=change.
 
     def _evolution_capital_base(self) -> int:
         """Starting equity the evolution drawdown PERCENTAGE is measured
@@ -5024,7 +5017,8 @@ class BacktestApp:
     def _start_evolution_pipeline(self, preamble: str, trade_lines: list[str],
                                   source_section: str, result,
                                   auto_run: bool = False,
-                                  holdout_days: int = 14) -> None:
+                                  holdout_days: int = 14,
+                                  bot_dir=None, design_cut_idx: int = 0) -> None:
         """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
 
         One click, no manual steps until deployment: the plan's own
@@ -5136,6 +5130,17 @@ class BacktestApp:
                     if auto_run:
                         _notify_discord(msg)
                     return
+                # Issue #125: watermark advances only after a completed
+                # plan with action=change — never at launch. no_change
+                # returned above; a later codegen/validation FAIL does
+                # not un-save (the plan already consumed this delta).
+                try:
+                    from src.evolution.notify import maybe_advance_watermark
+                    maybe_advance_watermark(
+                        bot_dir, design_cut_idx, directives["action"])
+                except Exception as e:
+                    _log(f"evolution watermark save failed: "
+                         f"[{type(e).__name__}] {e}")
                 if not strategy_source:
                     msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
                            "Strategy source unavailable — plan-only.")
