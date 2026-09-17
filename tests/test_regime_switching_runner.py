@@ -566,3 +566,160 @@ class TestStopRecordsForceClose:
                  if r[0] == "2026-07-10" and r[1] == "DAY"]
         assert len(match) == 1
         assert match[0][15] == "777.0"  # pnl column
+
+
+# ── issue #122: P&L catch-up for a night that closed during an outage ──
+
+_PNL_COL = 15
+_TRADES_COL = 16
+
+
+def _hist_path(runner):
+    return os.path.join(runner.bot_dir, "regime_history.csv")
+
+
+def _hist_rows(runner):
+    import csv as csv_mod
+    path = _hist_path(runner)
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv_mod.reader(f))[1:]
+
+
+def _row_for(runner, date, slot):
+    match = [r for r in _hist_rows(runner) if r[0] == date and r[1] == slot]
+    assert len(match) <= 1, f"duplicate rows for {date}/{slot}"
+    return match[0] if match else None
+
+
+def _write_classification_row(runner, session_date):
+    """Append a real classification row (pnl/trades blank) for the given
+    night, exactly as ``_maybe_classify`` would."""
+    from src.regime.store import append_history
+    from src.regime.state_machine import RegimeState
+    from src.regime.selector import Recommendation
+
+    state = RegimeState()
+    state.raw_regime = "trending-up"
+    state.effective_regime = "trending-up"
+    state.last_features = {"adx": 30.0, "plus_di": 25.0, "minus_di": 10.0,
+                           "atr_ratio": 1.2, "ema_slope": 5.0,
+                           "last_close": 22000}
+    rec = Recommendation(action="deploy_long", strategy_name="TestLong",
+                         qty_scale=1.0, reason="test")
+    append_history(_hist_path(runner), session_date, state, rec)
+
+
+def _trade(exit_dt, pnl):
+    from types import SimpleNamespace
+    return SimpleNamespace(exit_dt=exit_dt, pnl=pnl)
+
+
+class TestNightPnlCatchUp:
+    """A night that CLOSED while the process was down is classified in
+    catch-up mode on the first poll after the restart, but the record
+    path only ever looked at ``current_session(now)`` — so the night's
+    row kept blank pnl/trades forever (issue #122)."""
+
+    def test_backfills_blank_night_row_from_next_day_session(self, tmp_path):
+        # Outage across the 2026-09-17 05:00 close; restart polls 13:17.
+        runner = _make_runner(tmp_path)
+        runner._manager._state.last_assessed = "2026-09-16|NIGHT"
+        _write_classification_row(runner, "2026-09-16")
+        runner.broker.trades.append(_trade("2026-09-16 22:30", 120.0))
+        runner.broker.trades.append(_trade("2026-09-17 09:30", 7.0))  # DAY
+
+        runner._maybe_record_session(
+            datetime(2026, 9, 17, 13, 17, tzinfo=_TZ_TAIPEI))
+
+        row = _row_for(runner, "2026-09-16", "NIGHT")
+        assert row is not None
+        assert row[_PNL_COL] == "120.0"   # window math excludes the DAY trade
+        assert row[_TRADES_COL] == "1"
+        # The in-progress DAY session is still 28 min from its close
+        assert _row_for(runner, "2026-09-17", "DAY") is None
+
+    def test_backfills_during_the_morning_gap(self, tmp_path):
+        # 06:00 — no current session at all, so the old code recorded
+        # nothing whatsoever.
+        runner = _make_runner(tmp_path)
+        runner._manager._state.last_assessed = "2026-09-16|NIGHT"
+        _write_classification_row(runner, "2026-09-16")
+
+        runner._maybe_record_session(
+            datetime(2026, 9, 17, 6, 0, tzinfo=_TZ_TAIPEI))
+
+        row = _row_for(runner, "2026-09-16", "NIGHT")
+        assert row[_PNL_COL] == "0.0"
+        assert row[_TRADES_COL] == "0"
+
+    def test_recorded_row_not_re_recorded(self, tmp_path):
+        # A pnl already on disk is the restart-proof dedup: a fresh
+        # process (empty _recorded_sessions) must not re-record it.
+        runner = _make_runner(tmp_path)
+        runner._manager._state.last_assessed = "2026-09-16|NIGHT"
+        _write_classification_row(runner, "2026-09-16")
+        runner._manager.do_record_session_result(
+            "2026-09-16", "NIGHT", 120.0, 1, strategy_active="TestLong")
+
+        calls = []
+        orig = runner._manager.do_record_session_result
+        runner._manager.do_record_session_result = (
+            lambda *a, **k: calls.append(a) or orig(*a, **k))
+        runner._maybe_record_session(
+            datetime(2026, 9, 17, 13, 17, tzinfo=_TZ_TAIPEI))
+
+        assert calls == []
+        assert _row_for(runner, "2026-09-16", "NIGHT")[_PNL_COL] == "120.0"
+
+    def test_in_memory_dedup_still_applies(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        runner._manager._state.last_assessed = "2026-09-16|NIGHT"
+        _write_classification_row(runner, "2026-09-16")
+        runner._recorded_sessions.add(("2026-09-16", "NIGHT"))
+
+        runner._maybe_record_session(
+            datetime(2026, 9, 17, 13, 17, tzinfo=_TZ_TAIPEI))
+
+        assert _row_for(runner, "2026-09-16", "NIGHT")[_PNL_COL] == ""
+
+    def test_no_phantom_row_without_classification(self, tmp_path):
+        # Nothing was classified for that night (bot was down all along)
+        # — a catch-up must not invent a standalone result row.
+        runner = _make_runner(tmp_path)
+        runner._manager._state.last_assessed = "2026-09-16|NIGHT"
+
+        runner._maybe_record_session(
+            datetime(2026, 9, 17, 13, 17, tzinfo=_TZ_TAIPEI))
+
+        assert _row_for(runner, "2026-09-16", "NIGHT") is None
+
+    def test_current_session_record_still_fires(self, tmp_path):
+        # The catch-up is additive: the close-window record is unchanged.
+        runner = _make_runner(tmp_path)
+        runner._manager._state.last_assessed = "2026-09-16|NIGHT"
+        runner.broker.trades.append(_trade("2026-09-17 09:30", 42.0))
+
+        runner._maybe_record_session(
+            datetime(2026, 9, 17, 13, 44, tzinfo=_TZ_TAIPEI))
+
+        row = _row_for(runner, "2026-09-17", "DAY")
+        assert row is not None and row[_PNL_COL] == "42.0"
+
+    def test_restart_poll_classifies_and_records_the_missed_night(self, tmp_path):
+        """End to end: state.last_assessed is older than night N, so the
+        first poll after the restart classifies N (catch-up) AND fills
+        its P&L on the same poll (classify → record order)."""
+        runner = _make_runner(tmp_path)
+        runner.broker.trades.append(_trade("2026-07-08 22:30", 250.0))
+
+        lines = runner.on_status_poll(
+            datetime(2026, 7, 9, 12, 0, tzinfo=_TZ_TAIPEI))
+
+        assert runner._manager._state.last_assessed == "2026-07-08|NIGHT"
+        assert any("Classified" in l for l in lines)
+        row = _row_for(runner, "2026-07-08", "NIGHT")
+        assert row is not None
+        assert row[_PNL_COL] == "250.0"
+        assert row[_TRADES_COL] == "1"

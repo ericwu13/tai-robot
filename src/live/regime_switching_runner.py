@@ -267,6 +267,10 @@ class RegimeSwitchingRunner(LiveRunner):
         return rec
 
     def _maybe_record_session(self, now):
+        self._record_current_session(now)
+        self._record_night_catch_up(now)
+
+    def _record_current_session(self, now):
         sess = current_session(now)
         if sess is None:
             return  # gap / weekend / holiday — no phantom rows
@@ -278,7 +282,40 @@ class RegimeSwitchingRunner(LiveRunner):
         self._recorded_sessions.add(key)
         self._record_session(sess)
 
-    def _record_session(self, sess: SessionInfo):
+    def _record_night_catch_up(self, now):
+        """Backfill P&L for a night that CLOSED while this process was
+        down (issue #122).
+
+        The classify path already has a catch-up branch
+        (``classification_due`` returns the night any time after its
+        close while unassessed), so the first poll after an overnight
+        outage appends a classification row with blank pnl/trades — but
+        the record path only ever looked at ``current_session(now)``,
+        which by then is the following DAY session. The night's row
+        stayed blank forever.
+
+        Only a row that EXISTS with a blank pnl is backfilled: no row at
+        all means nothing was classified (gap / weekend / fresh bot) and
+        appending one would be a phantom, while a filled pnl is the
+        on-disk dedup that survives restarts (``_recorded_sessions`` is
+        in-memory only).
+        """
+        night = last_completed_night(now)
+        if night is None:
+            return
+        key = (night.open_date, night.slot)
+        if key in self._recorded_sessions:
+            return
+        if not self._manager.is_session_result_pending(night.open_date, night.slot):
+            return
+        self._recorded_sessions.add(key)
+        self._record_session(night, catch_up=True)
+
+    def _record_session(self, sess: SessionInfo, catch_up: bool = False):
+        # NOTE: strategy_active is the leg active NOW, which for a
+        # catch-up record is the post-restart leg rather than whatever
+        # traded during the session — the P&L itself is window-matched
+        # from the restored trade list and is exact either way.
         pnl, n_trades = self._compute_session_pnl(sess)
         strategy_name = self.strategy_display_name if self._active_leg != "idle" else "idle"
         self._manager.do_record_session_result(
@@ -286,8 +323,9 @@ class RegimeSwitchingRunner(LiveRunner):
             strategy_active=strategy_name,
             trading_mode=self.trading_mode,
         )
+        tag = " (catch-up)" if catch_up else ""
         self._emit("on_status",
-                    f"[REGIME] Recorded {sess.slot} P&L: {pnl:+} ({n_trades} trades)")
+                    f"[REGIME] Recorded {sess.slot} P&L{tag}: {pnl:+} ({n_trades} trades)")
 
     def _compute_session_pnl(self, sess: SessionInfo) -> tuple[float, int]:
         """Sum P&L of trades whose exit falls inside this session's window.

@@ -276,6 +276,41 @@ def record_session_result(
     _atomic_write_rows(csv_path, rows)
 
 
+def session_result_pending(
+    csv_path: str,
+    session_date: str,
+    session_slot: str,
+) -> bool:
+    """True when this session's history row EXISTS but its pnl is blank.
+
+    That is the signature of a classification row awaiting backfill:
+    ``append_history`` writes pnl/trades empty and leaves them to
+    ``record_session_result``. Read-only — callers use it to decide
+    whether a late (catch-up) record is warranted:
+
+    - no row at all → False, so nothing is written for a session that
+      was never classified (gap / weekend / fresh bot): no phantom rows;
+    - a row whose pnl is already filled → False, the on-disk dedup that
+      keeps a catch-up record idempotent across restarts.
+
+    The row match mirrors ``record_session_result`` exactly (including
+    its v2-length guard), so a True answer guarantees that function
+    UPDATES that row instead of appending a second one.
+    """
+    rows = _read_rows(csv_path)
+
+    session_col = _V2_HEADER.index("session")
+    pnl_col = _V2_HEADER.index("pnl")
+    mode_col = _V2_HEADER.index("trading_mode")
+
+    for i in range(len(rows) - 1, 0, -1):
+        if (len(rows[i]) > mode_col
+                and rows[i][0] == session_date
+                and rows[i][session_col] == session_slot):
+            return not str(rows[i][pnl_col]).strip()
+    return False
+
+
 def _result_row(date, session, pnl, trades, strategy_active, trading_mode):
     """Build a standalone result row (no classification data)."""
     return [
