@@ -6213,9 +6213,23 @@ class BacktestApp:
                         "snapshot not received) — NOT confirming entry. Manual "
                         "review required.", "status")
                 else:
-                    self._live_log_msg(
-                        "[RESUME] Real account flat but sim has position — NOT "
-                        "confirming entry. Manual review required.", "status")
+                    # Issue #107: OI is flat. The restored sim LONG is a ghost
+                    # (confirm dialog skipped/timed out last session, or the
+                    # user closed overnight with real_entry_price still 0).
+                    # Refusing to confirm is necessary but not sufficient —
+                    # leave the sim flat so session.json cannot keep showing
+                    # 持倉 after reboot.
+                    cleared = self._live_runner.reconcile_unconfirmed_on_resume(
+                        real_reason)
+                    if cleared:
+                        self._live_log_msg(
+                            "[RESUME] Real account flat but sim had an "
+                            "unconfirmed position — ghost sim entry cleared "
+                            "(issue #107). NOT confirming entry.", "status")
+                    else:
+                        self._live_log_msg(
+                            "[RESUME] Real account flat but sim has position — NOT "
+                            "confirming entry. Manual review required.", "status")
 
             # Issue #79 (sub-problem C): explicitly re-sync the mode tag now,
             # before warmup/replay begins. The var was set at deploy time, but
@@ -7583,12 +7597,39 @@ class BacktestApp:
         if reason == "timeout":
             self._live_log_msg("實單跳過 Order skipped (timeout 10s)", "status")
             self._log_order_decision("REAL_ORDER_TIMEOUT", "timeout 10s")
+            self._unwind_skipped_sim_entry()
         elif reason == "skipped":
             self._live_log_msg("實單跳過 Order skipped by user", "status")
             self._log_order_decision("REAL_ORDER_SKIPPED", "user skipped")
+            self._unwind_skipped_sim_entry()
         elif reason == "confirmed":
             pass  # logged in _send_real_order
-        # "replaced" = new dialog replaced old one, no log needed
+        # "replaced" = new dialog replaced old one — same pending entry,
+        # do not unwind (issue #107 only fires on skip/timeout).
+
+    def _unwind_skipped_sim_entry(self):
+        """Flatten the sim placeholder after confirm skip/timeout (issue #107).
+
+        ENTRY_FILL already filled SimulatedBroker and auto-saved session.json
+        with an unconfirmed LONG. If we only log the skip, resume restores
+        that ghost even though OpenInterest is flat.
+        """
+        runner = self._live_runner
+        broker = runner.broker if runner else None
+        guard = getattr(self, "_trading_guard", None)
+        abandoned = False
+        if guard is not None:
+            size_before = broker.position_size if broker is not None else 0
+            guard.on_entry_skipped(broker)
+            abandoned = bool(broker is not None and size_before > 0
+                             and broker.position_size == 0)
+        elif broker is not None:
+            abandoned = broker.abandon_unconfirmed_entry()
+        if runner is not None:
+            runner._auto_save_session()
+        if abandoned:
+            self._live_log_msg(
+                "模擬倉已撤 Ghost sim entry unwound (issue #107)", "status")
 
     _FORCE_CLOSE_RETRY_DELAYS = [5000, 10000, 15000]  # ms
 

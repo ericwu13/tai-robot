@@ -77,10 +77,15 @@ class TradingGuard:
         """Called when a real exit order is confirmed filled."""
         self.real_entry_confirmed = False
 
-    def on_entry_skipped(self) -> None:
-        """Called when user skips/times out on entry confirmation."""
-        # real_entry_confirmed stays False — exits won't auto-send
-        pass
+    def on_entry_skipped(self, broker=None) -> None:
+        """Called when user skips/times out on entry confirmation.
+
+        ``real_entry_confirmed`` stays False — exits won't auto-send
+        (issue #17). If ``broker`` is provided, abandon the unconfirmed
+        sim entry so session.json cannot restore a ghost LONG (issue #107).
+        """
+        if broker is not None:
+            broker.abandon_unconfirmed_entry()
 
     # ── Fill confirmation gate ──
 

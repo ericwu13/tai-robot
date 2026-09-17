@@ -485,6 +485,38 @@ class SimulatedBroker:
         self._pending_exits.clear()
         self._exit_bar_index = bar_index
 
+    def abandon_unconfirmed_entry(self) -> bool:
+        """Drop an open sim position that the real broker never filled.
+
+        Issue #107: semi-auto ENTRY_FILL fills SimulatedBroker immediately,
+        then the 10s confirm dialog can timeout/skip. Without this unwind the
+        ghost LONG (``real_entry_price=0``) is written to session.json and
+        restored on resume even though OpenInterest is flat.
+
+        Does NOT record a Trade — the user declined the order, so there is
+        no fill to book. Positions with ``real_entry_price > 0`` are left
+        untouched (a confirmed real fill must close via the normal exit
+        path). Returns True if a position was abandoned.
+        """
+        if self.position_size <= 0:
+            return False
+        if self.real_entry_price > 0:
+            return False
+        self.position_size = 0
+        self.position_side = None
+        self.entry_price = 0
+        self.entry_tag = ""
+        self.entry_strategy = ""
+        self.entry_bar_index = 0
+        self._entry_dt = ""
+        self.real_entry_price = 0
+        self.real_entry_dt = ""
+        self._pending_exits.clear()
+        self._pending_market_closes.clear()
+        self.last_exit_type = ""
+        self.last_exit_limit = None
+        return True
+
     def has_open_position(self) -> bool:
         return self.position_size > 0
 

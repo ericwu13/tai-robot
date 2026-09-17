@@ -117,6 +117,13 @@ class TestDecideExitSkipped:
         assert verdict == g.SKIP_EXIT
 
     def test_exit_skipped_after_entry_was_skipped(self):
+        """Issue #17 + #107: skip/timeout keeps real_entry_confirmed False.
+
+        Issue #107 additionally requires on_entry_skipped(broker) to flatten
+        the sim placeholder — covered in tests/test_issue107_ghost_entry.py.
+        This test keeps the no-broker call so the issue #17 SKIP_EXIT contract
+        cannot regress if the broker argument is omitted.
+        """
         g = TradingGuard()
         g.on_entry_skipped()  # user timed out
         verdict, _ = g.decide("semi_auto", "TRADE_CLOSE", "LONG")
@@ -337,7 +344,9 @@ class TestScenarioIssue17:
         assert verdict == g.SEND_EXIT
         g.on_exit_sent()
 
-        # 21:42 — new entry, user times out
+        # 21:42 — new entry, user times out (issue #17: no real exit;
+        # issue #107: on_entry_skipped also unwinds the sim placeholder
+        # when a broker is passed — see test_issue107_ghost_entry.py)
         g.on_entry_skipped()
 
         # 21:42 — SL1 fires TRADE_CLOSE

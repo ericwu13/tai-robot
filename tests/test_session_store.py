@@ -46,6 +46,12 @@ class TestBrokerSerialization:
         assert restored.position_size == 0
 
     def test_roundtrip_with_open_position(self):
+        """from_dict must restore an open position (paper / confirmed real).
+
+        Issue #107 does NOT drop ghosts inside from_dict — it abandons at
+        skip/timeout (and resume-when-OI-flat) then persists the flat
+        state. Paper sessions still rely on this round-trip.
+        """
         broker = SimulatedBroker(point_value=50)
         broker.queue_entry(
             __import__("src.backtest.broker", fromlist=["Order"]).Order(

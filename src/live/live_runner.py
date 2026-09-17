@@ -1636,6 +1636,31 @@ class LiveRunner:
         )
         return len(self.broker.trades)
 
+    def abandon_unconfirmed_entry(self) -> bool:
+        """Flatten a sim placeholder the real account never filled (issue #107).
+
+        Called from the semi-auto confirm skip/timeout path and from resume
+        when OpenInterest is flat. Does not send any real order. Returns
+        True if a position was dropped and the session was re-saved.
+        """
+        if not self.broker.abandon_unconfirmed_entry():
+            return False
+        self._auto_save_session()
+        return True
+
+    def reconcile_unconfirmed_on_resume(self, real_reason: str) -> bool:
+        """On resume, drop a restored ghost if the real account is flat.
+
+        ``real_reason`` is the key from
+        :func:`src.live.account_monitor.resume_real_position_ok`. Only
+        ``"flat"`` (OI snapshot received, signed position 0) is safe to
+        auto-clear. ``"unknown"`` / ``"opposite"`` stay for manual review;
+        ``"match"`` is a real position and must not be abandoned.
+        """
+        if real_reason != "flat":
+            return False
+        return self.abandon_unconfirmed_entry()
+
     # Emit a progress tick every N bars during reload so the GUI can keep
     # the Tkinter event loop pumping (issue #79 — long-lookback strategies
     # froze the UI for seconds while thousands of saved bars were re-fed).

@@ -102,10 +102,16 @@ class TestBrokerTradeSource:
         assert broker.trades[0].source == "real"
 
     def test_trade_source_real_without_fill_downgrades_to_paper(self):
-        # semi_auto confirm declined/timed out, or auto order failed:
-        # the trade never touched the real account → paper, not real.
-        # (Regression: trade #65 of bot 0422 — REAL_ORDER_TIMEOUT on
-        # entry, real_entry_price=0, yet tagged "real" by mode.)
+        # If an unconfirmed sim position is later closed through the
+        # normal exit path (auto send-failure, or a crash between
+        # ENTRY_FILL and the confirm dialog), the Trade must be tagged
+        # paper, not real. (Regression: trade #65 of bot 0422 —
+        # REAL_ORDER_TIMEOUT on entry, real_entry_price=0, yet tagged
+        # "real" by mode.)
+        #
+        # Issue #107: skip/timeout now abandons the sim position BEFORE
+        # any close, so that path no longer books a Trade at all. This
+        # test still pins the _close_position source-tagging fallback.
         broker = SimulatedBroker(point_value=200)
         broker.trade_source = "real"
         broker.queue_entry(Order(tag="Long", side=OrderSide.LONG, qty=1))
