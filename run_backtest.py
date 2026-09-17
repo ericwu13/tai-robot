@@ -4825,9 +4825,13 @@ class BacktestApp:
         for t in design_known:
             d_cum += t.pnl
             d_eq.append(d_cum)
+        # Same capital base as the fitness composite — a 0 seed would
+        # reprint the zero-peak MaxDD% sentinel #119/#120 removed there.
         report = format_report(
             f"{result.strategy_name} — 設計窗 design window (holdout excluded)",
-            calculate_metrics(design_known, d_eq, initial_balance=0))
+            calculate_metrics(
+                design_known, d_eq,
+                initial_balance=self._evolution_capital_base()))
 
         evolution_context = self._build_evolution_context(
             result, watermark=watermark, omitted_count=omitted,
