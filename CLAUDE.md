@@ -71,6 +71,7 @@ python test_kline.py       # COM-based KLine history GUI
 - `run_bot_cli.py deploy|stop|list|status|strategies|backtest` — same live machinery as the GUI: `HeadlessBotApp(BacktestApp)` on a withdrawn Tk root (`src/live/headless_app.py`), so tick/fill/reconnect/session-end code is byte-identical. Pure helpers (parser, DeployRequest builder, STOP file, bot scan) in `src/live/headless.py`.
 - Dialog seam: `_deploy_live()` = dialog only → `_deploy_live_from(DeployRequest)`; every prompt on that path goes through `self._confirm(title, msg)` / `self._alert(title, msg)` (GUI: messagebox; headless: `HeadlessPolicy.answer(title)`, unknown title = NO). Adding a new prompt to the deploy/backtest path = use the seam and add its title to `src/live/headless.py`, or the CLI will decline it.
 - `semi_auto` is refused headless (needs the order-confirm dialog). Stop = `STOP` file in the bot dir or Ctrl+C → normal `_stop_live()`.
+- `deploy --detach --wait-ready N` spawns the bot detached (stdout → `{bot_dir}/cli_stdout.log`) and returns 0 on `Tick subscription active` under the child's own lock, the child's exit code if it died, 6 if still starting. The `deploy` skill (`.claude/skills/deploy`) is the agent-facing procedure with its safety gates; it runs from the MAIN tree (worktrees have no settings/SDK/data).
 
 ## Conventions
 - Python 3.13+ on Windows 11

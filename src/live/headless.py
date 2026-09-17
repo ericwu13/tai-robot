@@ -182,6 +182,100 @@ def clear_stop_file(bot_dir: str) -> None:
         pass
 
 
+# ── Detached launch (deploy --detach) ──
+
+CLI_STDOUT_NAME = "cli_stdout.log"
+# Printed by BacktestApp._start_live_tick_subscription once RequestTicks
+# succeeded (mirrored to stdout by HeadlessBotApp._live_log_msg). Login,
+# warmup and CSV reload are all done by then — the bot is live.
+READY_MARKER = "Tick subscription active"
+
+
+def cli_stdout_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, CLI_STDOUT_NAME)
+
+
+def strip_detach_args(argv: list[str]) -> list[str]:
+    """argv for the child: the same deploy command minus the launcher flags."""
+    out: list[str] = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--detach" or arg.startswith("--wait-ready="):
+            continue
+        if arg == "--wait-ready":
+            skip_next = True
+            continue
+        out.append(arg)
+    return out
+
+
+def spawn_detached(cmd: list[str], stdout_path: str, cwd: str | None = None):
+    """Start ``cmd`` so it survives this process; stdout+stderr append to a file.
+
+    Returns the ``subprocess.Popen`` (``poll()`` still works — the parent
+    keeps a handle — but the child is not killed when the parent exits).
+    """
+    import subprocess
+    os.makedirs(os.path.dirname(stdout_path) or ".", exist_ok=True)
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
+                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kwargs["start_new_session"] = True
+    with open(stdout_path, "ab") as log:
+        return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, cwd=cwd, **kwargs)
+
+
+def _file_contains_after(path: str, marker: str, start_offset: int) -> bool:
+    try:
+        with open(path, "rb") as f:
+            f.seek(start_offset)
+            return marker.encode("utf-8") in f.read()
+    except OSError:
+        return False
+
+
+def tail_lines(path: str, n: int = 15, start_offset: int = 0) -> list[str]:
+    """Last ``n`` lines written at or after ``start_offset``."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(start_offset)
+            data = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = [ln.rstrip("\r") for ln in data.split("\n") if ln.strip()]
+    return lines[-n:]
+
+
+def wait_for_ready(poll_exit, bot_dir: str, stdout_path: str, timeout_s: float,
+                   pid: int, *, start_offset: int = 0, marker: str = READY_MARKER,
+                   sleep_s: float = 1.0) -> tuple[str, int | None]:
+    """Block until the detached bot is live, died, or the timeout passes.
+
+    Returns ``("ready", None)`` once the bot's own .lock names ``pid`` and
+    the marker appeared in stdout AFTER ``start_offset`` (the log is
+    appended across runs — an old run's marker must not count);
+    ``("exited", code)`` if the child ended first; ``("timeout", None)``
+    otherwise (the child is still running, e.g. a long CSV reload).
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        code = poll_exit()
+        if code is not None:
+            return "exited", int(code)
+        alive, lock_pid = read_lock(bot_dir)
+        if alive and lock_pid == pid and _file_contains_after(stdout_path, marker, start_offset):
+            return "ready", None
+        if time.monotonic() >= deadline:
+            return "timeout", None
+        time.sleep(sleep_s)
+
+
 # ── Bot directory scan ──
 
 @dataclass
@@ -357,6 +451,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds to wait for the quote connection (default 90)")
     d.add_argument("--heartbeat-min", type=int, default=5,
                    help="print a status line every N minutes (0 = off)")
+    d.add_argument("--detach", action="store_true",
+                   help="spawn the bot as a detached background process "
+                        f"(stdout -> {{bot_dir}}/{CLI_STDOUT_NAME}) and return")
+    d.add_argument("--wait-ready", type=int, default=180, metavar="SECONDS",
+                   help="with --detach: wait up to N seconds for the bot to reach "
+                        "tick subscription before returning (0 = return at once)")
 
     s = sub.add_parser("stop", help="ask a CLI-deployed bot to stop (STOP file)")
     s.add_argument("--symbol", required=True)

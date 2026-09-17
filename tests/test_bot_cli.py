@@ -267,6 +267,79 @@ def test_parser_subcommands_and_dates():
         hl.parse_yyyymmdd("2026-01-01")
 
 
+# ── detached launch ──
+
+def test_strip_detach_args():
+    argv = ["deploy", "--symbol", "TX00", "--detach", "--bot", "b",
+            "--wait-ready", "30", "--strategy", "s", "--wait-ready=5"]
+    assert hl.strip_detach_args(argv) == [
+        "deploy", "--symbol", "TX00", "--bot", "b", "--strategy", "s"]
+    assert hl.strip_detach_args(["list"]) == ["list"]
+
+
+def test_parser_detach_defaults():
+    a = hl.build_parser().parse_args(["deploy", "--symbol", "TX00", "--bot", "b"])
+    assert a.detach is False and a.wait_ready == 180
+    a = hl.build_parser().parse_args(
+        ["deploy", "--symbol", "TX00", "--bot", "b", "--detach", "--wait-ready", "0"])
+    assert a.detach is True and a.wait_ready == 0
+
+
+def test_wait_for_ready_exited_wins(tmp_path):
+    bot_dir = str(tmp_path / "TX00_b")
+    out = str(tmp_path / "out.log")
+    state, code = hl.wait_for_ready(lambda: 2, bot_dir, out, 5, pid=123, sleep_s=0)
+    assert (state, code) == ("exited", 2)
+
+
+def test_wait_for_ready_ignores_marker_from_previous_run(tmp_path):
+    bot_dir = str(tmp_path / "TX00_b")
+    os.makedirs(bot_dir)
+    out = str(tmp_path / "out.log")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(f"old run: {hl.READY_MARKER}\n")
+    offset = os.path.getsize(out)
+    with open(os.path.join(bot_dir, ".lock"), "w") as f:
+        f.write(str(os.getpid()))
+    # marker only before the offset -> not ready -> times out
+    state, _ = hl.wait_for_ready(lambda: None, bot_dir, out, 0.05, pid=os.getpid(),
+                                 start_offset=offset, sleep_s=0.01)
+    assert state == "timeout"
+    with open(out, "a", encoding="utf-8") as f:
+        f.write(f"[LIVE] 已訂閱 {hl.READY_MARKER} for TX00\n")
+    state, _ = hl.wait_for_ready(lambda: None, bot_dir, out, 1, pid=os.getpid(),
+                                 start_offset=offset, sleep_s=0.01)
+    assert state == "ready"
+
+
+def test_wait_for_ready_requires_lock_owned_by_child(tmp_path):
+    bot_dir = str(tmp_path / "TX00_b")
+    os.makedirs(bot_dir)
+    out = str(tmp_path / "out.log")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(f"{hl.READY_MARKER}\n")
+    with open(os.path.join(bot_dir, ".lock"), "w") as f:
+        f.write("999999999")  # someone else's dead pid
+    state, _ = hl.wait_for_ready(lambda: None, bot_dir, out, 0.05, pid=os.getpid(),
+                                 sleep_s=0.01)
+    assert state == "timeout"
+
+
+def test_spawn_detached_runs_and_logs(tmp_path):
+    import sys
+    import time
+    out = str(tmp_path / "logs" / "out.log")
+    proc = hl.spawn_detached(
+        [sys.executable, "-c", "print('child says hi', flush=True)"], out)
+    for _ in range(200):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    assert proc.poll() == 0
+    assert hl.tail_lines(out) == ["child says hi"]
+    assert hl.tail_lines(out, start_offset=os.path.getsize(out)) == []
+
+
 # ── read-only lock probe ──
 
 def test_read_lock_never_deletes_stale_lock(tmp_path):

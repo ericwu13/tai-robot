@@ -31,9 +31,10 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.live.headless import (  # noqa: E402
-    EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, HeadlessConfigError, bot_info,
-    bots_as_json, build_parser, format_bot_table, list_bots, parse_yyyymmdd,
-    request_stop,
+    EXIT_BOT_STOPPED, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, HeadlessConfigError,
+    bot_info, bots_as_json, build_parser, cli_stdout_path, format_bot_table,
+    list_bots, parse_yyyymmdd, request_stop, spawn_detached, strip_detach_args,
+    tail_lines, wait_for_ready,
 )
 
 
@@ -89,8 +90,44 @@ def cmd_strategies(args) -> int:
 
 
 def cmd_deploy(args) -> int:
+    if args.detach:
+        return launch_detached(args)
     from src.live.headless_app import run_deploy
     return run_deploy(args)
+
+
+def launch_detached(args) -> int:
+    """Re-run this deploy command as a detached child and (optionally) wait
+    until it is live. The child owns the bot; this process only reports."""
+    from src.live.live_runner import LiveRunner
+    bot_dir = LiveRunner.bot_dir_for(_base_dir(), args.symbol, args.bot)
+    stdout_path = cli_stdout_path(bot_dir)
+    cmd = [sys.executable, os.path.abspath(__file__)] + strip_detach_args(args._raw_argv)
+    os.makedirs(bot_dir, exist_ok=True)
+    offset = os.path.getsize(stdout_path) if os.path.exists(stdout_path) else 0
+    proc = spawn_detached(cmd, stdout_path, cwd=project_root)
+    import subprocess
+    print(f"spawned PID {proc.pid}: run_bot_cli.py {subprocess.list2cmdline(cmd[2:])}")
+    print(f"stdout: {stdout_path}")
+    if not args.wait_ready:
+        return EXIT_OK
+    state, code = wait_for_ready(proc.poll, bot_dir, stdout_path, args.wait_ready,
+                                 proc.pid, start_offset=offset)
+    tail = tail_lines(stdout_path, 15, start_offset=offset)
+    if state == "ready":
+        print(f"READY: {args.symbol}_{args.bot} is live (PID {proc.pid}, lock acquired, "
+              "tick subscription active)")
+        print("\n".join(tail))
+        return EXIT_OK
+    if state == "exited":
+        print(f"EXITED: bot process ended with code {code} before becoming ready",
+              file=sys.stderr)
+        print("\n".join(tail), file=sys.stderr)
+        return code if code else EXIT_BOT_STOPPED
+    print(f"TIMEOUT: PID {proc.pid} still running but not ready after {args.wait_ready}s "
+          "(long warmup/CSV reload?) — check `status` and the stdout log", file=sys.stderr)
+    print("\n".join(tail), file=sys.stderr)
+    return EXIT_TIMEOUT
 
 
 def cmd_backtest(args) -> int:
@@ -118,7 +155,9 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
-    args = build_parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = build_parser().parse_args(raw_argv)
+    args._raw_argv = raw_argv  # launch_detached re-issues the same command
     try:
         return COMMANDS[args.command](args)
     except HeadlessConfigError as e:

@@ -129,8 +129,10 @@ python run_bot_cli.py strategies                       # display names (incl. sa
 python run_bot_cli.py list                             # every data/live/{symbol}_{bot} + lock state
 python run_bot_cli.py status --symbol TMF00 --bot night1 --json
 
-# paper bot, new session (resumes automatically if session.json exists)
-python run_bot_cli.py deploy --symbol TMF00 --bot night1 --strategy "H4 Bollinger Long"
+# paper bot, new session (resumes automatically if session.json exists);
+# --detach spawns it as a background process and waits until ticks are subscribed
+python run_bot_cli.py deploy --symbol TMF00 --bot night1 --strategy "H4 Bollinger Long" \
+    --detach --wait-ready 240
 
 # regime-switching bot with the news breaker, real orders
 python run_bot_cli.py deploy --symbol TMF00 --bot regime1 --mode auto --regime \
@@ -160,6 +162,14 @@ Notes:
   `--allow-existing-position` is given.
 - Ctrl+C is the same as `stop`. Only CLI-started bots poll the STOP file; a
   GUI bot is stopped from the workbench.
+- `--detach` re-runs the command as a detached child (stdout appended to
+  `data/live/{symbol}_{bot}/cli_stdout.log`) and, with `--wait-ready N`,
+  returns `0` once the child owns the lock and logged `Tick subscription
+  active`, the child's exit code if it died first, or `6` if it is still
+  starting after N seconds (the child keeps running).
+- Agents: the `deploy` skill (`.claude/skills/deploy`) wraps all of this
+  with the safety gates (mode consent, not-already-running, strategy
+  resolution, resume vs switch).
 - Exit codes: `0` ok · `1` usage · `2` login/connection · `3` COM unavailable ·
   `4` deploy refused (lock held, unknown strategy, config error) ·
   `5` bot stopped on its own (warmup/subscription failure — see
