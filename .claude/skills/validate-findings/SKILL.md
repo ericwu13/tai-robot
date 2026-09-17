@@ -16,18 +16,24 @@ not a finding. This skill is the gate between "the review said X" and
    fix-status assertions — **and every SEVERITY grade (a P1/P2 is a
    claim that the behavior is a fault, and it validates like any other
    claim)**. One line each, with where its primary evidence lives (file
-   path, command).
+   path, command). Whenever the output would lead to `fix-pr`, also list
+   the mandatory claim **"This still needs a new code fix on current
+   master"** (see below).
 2. **Spawn one skeptical read-only subagent** (Explore, model sonnet)
    whose instructions are: do NOT trust the claims; re-derive each from
    the named evidence (re-count the rows, re-check the PID, re-read the
-   log); return CONFIRMED or REFUTED per claim with one evidence line,
-   then a final "SAFE TO PUBLISH: yes/no". For small claim sets (≤3)
-   the main session may validate inline instead — same re-derivation
-   rule.
+   log); for a "needs a new code fix" claim, re-search related closed
+   issues/PRs/CHANGELOG and re-check the inventing path on current
+   master; return CONFIRMED or REFUTED per claim with one evidence line,
+   then a final "SAFE TO PUBLISH: yes/no" — and separately whether
+   assign-`fix-pr` is allowed. For small claim sets (≤3) the main
+   session may validate inline instead — same re-derivation rule.
 3. **Act on verdicts**: REFUTED claims are corrected or dropped — never
    published, and a REFUTED root cause disqualifies `fix-pr`. If a
    refutation overturns something load-bearing, say so explicitly in the
-   output ("initially suspected X; evidence shows Y").
+   output ("initially suspected X; evidence shows Y"). A REFUTED "needs
+   a new code fix on current master" blocks **assign**, even if the
+   mechanism facts are CONFIRMED.
 
 ## Validate the judgment, not just the fact
 
@@ -51,6 +57,19 @@ say it is intended, and never attach unsolicited "fix" recommendations
 ("switch to auto") to designed behavior. Only the user promotes a
 designed behavior back to alert-worthy.
 
+## "Still needs a new code fix on current master"
+
+Mandatory whenever the output would assign `fix-pr`. Primary evidence
+must include all three: (a) closed issues, merged PRs, and
+CHANGELOG/release notes searched for the same *user-visible symptom
+class*; (b) whether the inventing code path still exists on current
+master after those merges; (c) the owner has not already marked the
+symptom covered. If related shipped work addresses the same symptom
+class and owner judgment is unknown → **REFUTE** "needs a new fix now".
+SAFE TO PUBLISH may be **yes** for the root-cause facts but **not** for
+"assign `fix-pr`" — say so explicitly. Do not treat CONFIRMED mechanism
+as permission to code.
+
 ## Rules that catch real failure modes (all happened here)
 
 - **Correlation discipline**: an issue naming a strategy does NOT pin it
@@ -68,3 +87,10 @@ designed behavior back to alert-worthy.
   may all be right, but each must be re-derived before use.
 - **"Absent file" ≠ broken**: vote files are consumed/deleted by design;
   reports only exist after trades; logs are quiet in closed sessions.
+- **Related-fix discipline**: checking related closed issues *after*
+  owner pushback is too late. #107 (ghost sim 持倉 after restart) was
+  assigned a fix-pr; the owner later treated it as covered by resume OI
+  reconcile in #79/#113 (shipped). Search related work before assign.
+  A remaining inventing path (e.g. timeout skip unwind) is not an
+  automatic close — and related resume/OI safety already shipped for
+  the same symptom is not an automatic assign.

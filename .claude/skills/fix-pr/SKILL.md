@@ -17,7 +17,15 @@ release); this one ends at a draft PR and a comment on the issue.
 2. The fix is bounded: a handful of files, no architecture change, no
    change to live order-sending semantics, never settings/credentials.
 3. No duplicate work: `gh pr list --state open --json number,headRefName`
-   and `git branch --list "fix/issue-<N>*"` show nothing covering it.
+   and `git branch --list "fix/issue-<N>*"` show nothing covering it;
+   also search **merged** PRs and closed issues that already claim the
+   same user-visible symptom class (not only open PRs / `fix/issue-N`
+   branches). A merged resume/OI fix for "ghost 持倉 after restart"
+   counts as covering work even if this issue number was never mentioned.
+4. Related-work gate passed: `issue-triage` recorded a related-work
+   search; `validate-findings` did not block assign; if any
+   `LIKELY COVERED` / `OWNER JUDGMENT NEEDED` existed, the owner
+   explicitly chose continue. No silent duplicate of #79/#113-class work.
 
 ## Execution
 
