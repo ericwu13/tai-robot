@@ -63,4 +63,5 @@ Healthy vs unhealthy:
 
 - bot alive but not trading → `regime-health` (idle leg? news gate?)
 - bot dead → read the tail of its newest `debug_*.log`, then `log-scan`
+- needs restarting headlessly (paper/auto) → `deploy`; semi_auto → `deploy-check` for the workbench recipe
 - needs restarting → `deploy-check` for the manual redeploy recipe

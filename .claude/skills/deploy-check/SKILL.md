@@ -28,9 +28,13 @@ Per bot it also checks `session.json`: for `regime_mode: true` both
 `long_strategy` and `short_strategy` must be non-empty and `active_leg`
 must be one of `long` / `short` / `idle`.
 
-## Manual redeploy (the only way)
+## Redeploy
 
-**There is NO headless deploy** — the deploy dialog is a GUI modal.
+**Headless (paper / auto):** the `deploy` skill —
+`python run_bot_cli.py deploy --symbol S --bot B [--strategy …] --detach --wait-ready 240`
+from the main tree; resume is automatic, `stop --wait 120` stops it.
+
+**Workbench (required for `semi_auto`, which needs the order-confirm dialog):**
 
 1. start `dist\tai_backtest\tai_backtest.exe`
 2. log in (Capital API credentials)
@@ -58,5 +62,6 @@ must be one of `long` / `short` / `idle`.
 
 ## Next steps
 
+- needs (re)starting headlessly → `deploy`
 - after redeploying → `bot-status` to confirm the lock and a fresh log line
 - votes still not consumed → `bridge-health`
