@@ -159,6 +159,13 @@ news:
                              # A source not listed here has NO age limit (W3 news and W4
                              # chips are daily-cadence signals — ageing them out would
                              # silence them). An empty mapping {} disables the gate.
+  w2_hot_lane_enabled: false # OFF until ship. When true, a W2 vote written
+                             # within w2_hot_lane_admit_max_age_h of fired_at
+                             # is stamped admitted_at so tonight's ~04:58
+                             # classify can keep it even if wall-clock age
+                             # exceeds nightly_vote_max_age_h[W2].
+                             # Admit ≠ deploy / ≠ strategy swap.
+  w2_hot_lane_admit_max_age_h: 4.0  # write-time admit window (hours)
   regime_vote_thresholds:    # all-symbols-must-breach thresholds for regime vote
     soxx_pct: 2.5
     tsm_pct: 2.0

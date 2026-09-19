@@ -363,7 +363,23 @@ def _resolve_news_config(
         nightly_vote_max_age_h=_normalize_vote_max_age(
             settings.get("news_nightly_vote_max_age_h"),
             _defaults.nightly_vote_max_age_h),
+        w2_hot_lane_enabled=bool(settings.get(
+            "news_w2_hot_lane_enabled", _defaults.w2_hot_lane_enabled)),
+        w2_hot_lane_admit_max_age_h=_coerce_hot_lane_admit_age(
+            settings.get("news_w2_hot_lane_admit_max_age_h"),
+            _defaults.w2_hot_lane_admit_max_age_h),
     )
+
+
+def _coerce_hot_lane_admit_age(raw, default: float) -> float:
+    """Coerce ``news.w2_hot_lane_admit_max_age_h`` to a non-negative float."""
+    if raw is None:
+        return float(default)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return val if val >= 0 else float(default)
 
 
 def _normalize_vote_max_age(raw, default: dict) -> dict:
@@ -496,6 +512,13 @@ def _load_settings():
             _vote_age = news.get("nightly_vote_max_age_h", None)
             cfg["news_nightly_vote_max_age_h"] = (
                 _vote_age if isinstance(_vote_age, dict) else None)
+            cfg["news_w2_hot_lane_enabled"] = bool(
+                news.get("w2_hot_lane_enabled", False))
+            try:
+                cfg["news_w2_hot_lane_admit_max_age_h"] = float(
+                    news.get("w2_hot_lane_admit_max_age_h", 4.0) or 4.0)
+            except (TypeError, ValueError):
+                cfg["news_w2_hot_lane_admit_max_age_h"] = 4.0
             regime = data.get("regime", {}) or {}
             cfg["regime_long_strategy"] = regime.get("long_strategy", "")
             cfg["regime_short_strategy"] = regime.get("short_strategy", "")

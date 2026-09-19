@@ -461,10 +461,21 @@ def check_once(args, state: dict) -> dict:
     if direction and vote_out:
         if state.get(f"vote:{us_date}") is None:
             _write_vote = _get_write_regime_vote()
-            _write_vote(vote_out, direction, night_session_key(now), source="W2")
+            hot_lane = bool(getattr(args, "w2_hot_lane_enabled", False))
+            try:
+                admit_h = float(getattr(args, "w2_hot_lane_admit_max_age_h", 4.0)
+                                or 4.0)
+            except (TypeError, ValueError):
+                admit_h = 4.0
+            admitted = _write_vote(
+                vote_out, direction, night_session_key(now), source="W2",
+                hot_lane_enabled=hot_lane, admit_max_age_h=admit_h)
             state[f"vote:{us_date}"] = direction
-            post_discord(args.discord_webhook,
-                         f"📊 **Regime vote** — {direction} ({', '.join(details)})")
+            msg = f"📊 **Regime vote** — {direction} ({', '.join(details)})"
+            if admitted:
+                msg += (f"\nW2 vote written ({direction}); "
+                        f"admitted for tonight's classify")
+            post_discord(args.discord_webhook, msg)
         else:
             vote_note = f"{direction}(deduped)"
             print("  vote already written for this US session — deduped")
@@ -516,12 +527,23 @@ def main() -> int:
                     default=os.environ.get("NEWS_DISCORD_WEBHOOK") or None)
     args = ap.parse_args()
 
-    if not args.discord_webhook and args.settings:
+    if args.settings:
         try:
             import yaml
             with open(args.settings, encoding="utf-8") as f:
                 _cfg = yaml.safe_load(f) or {}
-            args.discord_webhook = (_cfg.get("news", {}) or {}).get("discord_webhook") or None
+            news = _cfg.get("news", {}) or {}
+            if not args.discord_webhook:
+                args.discord_webhook = news.get("discord_webhook") or None
+            if getattr(args, "w2_hot_lane_enabled", None) is None:
+                args.w2_hot_lane_enabled = bool(
+                    news.get("w2_hot_lane_enabled", False))
+            if getattr(args, "w2_hot_lane_admit_max_age_h", None) is None:
+                try:
+                    args.w2_hot_lane_admit_max_age_h = float(
+                        news.get("w2_hot_lane_admit_max_age_h", 4.0) or 4.0)
+                except (TypeError, ValueError):
+                    args.w2_hot_lane_admit_max_age_h = 4.0
         except Exception:
             pass
 

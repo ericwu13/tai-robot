@@ -420,6 +420,43 @@ def test_vote_fires_on_two_fresh_symbols_agreeing(
     assert state["vote:2026-08-05"] == "trending-up"
 
 
+def test_hot_lane_discord_says_admitted_not_deployed(
+        tmp_path, market, discord, frozen_clock):
+    """Admit copy is classify-queued, not a deploy. #132"""
+    market["SOXX"] = quote(2.8)
+    market["QQQ"] = quote(2.4)
+    args = make_args(tmp_path, vote_out=str(tmp_path / "regime_vote.json"),
+                     w2_hot_lane_enabled=True, w2_hot_lane_admit_max_age_h=4.0)
+
+    cm.check_once(args, {})
+
+    vote_msgs = [m for m in discord if "Regime vote" in m or "W2 vote written" in m]
+    assert vote_msgs, "a W2 vote must still announce"
+    body = "\n".join(vote_msgs)
+    assert "admitted for tonight's classify" in body
+    assert "deploy_long" not in body
+    assert "deploy_short" not in body
+    vote = read_json(tmp_path / "regime_vote_w2.json")
+    assert vote.get("admitted_at")
+
+
+def test_hot_lane_disabled_discord_is_status_quo(
+        tmp_path, market, discord, frozen_clock):
+    """Flag off: vote Discord stays the current line, no admit claim. #132"""
+    market["SOXX"] = quote(2.8)
+    market["QQQ"] = quote(2.4)
+    args = make_args(tmp_path, vote_out=str(tmp_path / "regime_vote.json"))
+
+    cm.check_once(args, {})
+
+    vote_msgs = [m for m in discord if "Regime vote" in m]
+    assert vote_msgs
+    assert "admitted for tonight" not in "\n".join(vote_msgs)
+    vote = read_json(tmp_path / "regime_vote_w2.json")
+    assert vote is not None
+    assert "admitted_at" not in vote
+
+
 def test_vote_fires_downward_and_mixes_tiers(tmp_path, market, discord, frozen_clock):
     """Alert-tier symbols carry votes even though they never write signals."""
     market["NQ=F"] = quote(-1.8)                     # vote down -1.5
