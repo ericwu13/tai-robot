@@ -13,15 +13,16 @@ Each source writes to a per-source file derived from the base path::
     W3 → "C:/n8n-bridge/regime_vote_w3.json"
     W4 → "C:/n8n-bridge/regime_vote_w4.json"
 
-File schema (schema version stays 1 — ``fired_at`` is additive and
-readers ignore unknown keys)::
+File schema (schema version stays 1 — ``fired_at`` / ``admitted_at``
+are additive and readers ignore unknown keys)::
 
     {
       "version": 1,
       "direction": "trending-up",
       "expires_after_session": "2026-08-05|NIGHT",
       "source": "W2",
-      "fired_at": "2026-08-05T22:31:07+08:00"
+      "fired_at": "2026-08-05T22:31:07+08:00",
+      "admitted_at": "2026-08-05T22:31:07+08:00"
     }
 
 ``fired_at`` exists because a vote's edge has a half-life.  W2 fires
@@ -56,6 +57,7 @@ class RegimeVote:
     source: str = ""
     fired_at: str = ""            # ISO-8601 +08:00, stamped by the writer
     age_sec: float | None = None  # computed at read time; None = unknowable
+    admitted_at: str = ""         # ISO-8601 +08:00; hot-lane check-in (W2)
 
 
 def _now_tpe() -> datetime:
@@ -144,7 +146,44 @@ def read_regime_vote(
         source=str(data.get("source", "")),
         fired_at=fired_at,
         age_sec=vote_age_sec(fired_at, path),
+        admitted_at=str(data.get("admitted_at", "") or ""),
     )
+
+
+def _vote_stem(source: str) -> str:
+    """Bridge stem used for TTL / hot-lane: ``W2-US`` still maps to ``W2``."""
+    return str(source or "").split("-")[0].strip().upper()
+
+
+def should_admit_w2_hot_lane(
+    source: str,
+    fired_at: str,
+    *,
+    enabled: bool,
+    admit_max_age_h: float,
+    now: datetime | None = None,
+    path: str = "",
+) -> bool:
+    """True when a W2 write is still inside the hot-lane admit window.
+
+    Stem must be W2 (hyphen suffixes still count as W2). Non-W2 sources
+    never admit. A delayed / replayed write whose age already exceeds
+    *admit_max_age_h* is not admitted.
+    """
+    if not enabled:
+        return False
+    if _vote_stem(source) != "W2":
+        return False
+    try:
+        limit_h = float(admit_max_age_h)
+    except (TypeError, ValueError):
+        return False
+    if limit_h < 0:
+        return False
+    age = vote_age_sec(fired_at, path, now=now)
+    if age is None:
+        return False
+    return age <= limit_h * 3600.0
 
 
 def _source_path(base_path: str, source: str) -> str:
@@ -170,11 +209,21 @@ def write_regime_vote(
     expires_after_session: str,
     source: str = "W2",
     data_date: str = "",
-) -> None:
+    *,
+    now: datetime | None = None,
+    fired_at: str = "",
+    hot_lane_enabled: bool = False,
+    admit_max_age_h: float = 4.0,
+) -> bool:
     """Write (or overwrite) the per-source vote file atomically.
 
     Stamps ``fired_at`` (ISO-8601 with the +08:00 offset) so readers can
     age the vote out; see ``vote_age_sec``.
+
+    When *hot_lane_enabled* and the source stem is W2 and the fire is
+    still inside *admit_max_age_h*, also stamps ``admitted_at`` so the
+    nightly classify can keep this vote after the hard TTL.  Does not
+    classify, consume other stems, or stamp ``last_assessed``.
 
     *data_date* (``"YYYYMMDD"``) is the trade date of the data the vote
     was computed from — audit only, and omitted when empty.  A source
@@ -182,7 +231,13 @@ def write_regime_vote(
     TAIFEX OpenAPI back up to 3 trading days), so the target session key
     alone no longer identifies the evidence.  Readers ignore unknown
     keys.
+
+    Returns True when ``admitted_at`` was stamped (for Discord copy).
     """
+    now = now or _now_tpe()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=_TZ_TAIPEI)
+    fire_stamp = fired_at or now.isoformat(timespec="seconds")
     payload = {
         "version": SCHEMA_VERSION,
         "direction": direction,
@@ -191,10 +246,21 @@ def write_regime_vote(
         # Wall-clock fire time (TPE offset).  The session key says WHICH
         # night the vote targets; this says HOW OLD the evidence is, which
         # is what the nightly lane's per-source age gate needs.
-        "fired_at": _now_tpe().isoformat(timespec="seconds"),
+        "fired_at": fire_stamp,
     }
     if data_date:
         payload["data_date"] = data_date
+    admitted = should_admit_w2_hot_lane(
+        source, fire_stamp,
+        enabled=hot_lane_enabled,
+        admit_max_age_h=admit_max_age_h,
+        now=now,
+    )
+    if admitted:
+        payload["admitted_at"] = now.isoformat(timespec="seconds")
+        logger.info(
+            "[REGIME-VOTE] W2 vote written (%s); admitted for tonight's classify",
+            direction)
     out = _source_path(str(path), source)
     parent = os.path.dirname(out)
     if parent:
@@ -203,6 +269,7 @@ def write_regime_vote(
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     os.replace(tmp, out)
+    return admitted
 
 
 def read_all_regime_votes(

@@ -463,14 +463,16 @@ _TPE = timezone(timedelta(hours=8))
 
 
 def _write_raw(tmp_path, suffix, *, source="W2", direction="trending-up",
-               session="2026-08-05|NIGHT", fired_at=""):
-    """Write a vote file by hand so fired_at can be absent or ancient."""
+               session="2026-08-05|NIGHT", fired_at="", admitted_at=None):
+    """Write a vote file by hand so fired_at / admitted_at can be set."""
     payload = {
         "version": 1, "direction": direction,
         "expires_after_session": session, "source": source,
     }
     if fired_at is not None:
         payload["fired_at"] = fired_at or datetime.now(_TPE).isoformat(timespec="seconds")
+    if admitted_at:
+        payload["admitted_at"] = admitted_at
     path = tmp_path / f"regime_vote_{suffix}.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
@@ -599,3 +601,166 @@ def test_source_suffix_matches_the_bridge_stem_limit():
     assert _vote_age_limit_h({"W3": 4.0}, "W2") is None
     assert _vote_age_limit_h({}, "W2") is None
     assert _vote_age_limit_h({"W2": "junk"}, "W2") is None
+
+
+# ── 12. W2 hot-lane Option C (issue #132) ──
+#
+# US-evening W2 is ~7.4h old by the ~04:58 classify. The 4h TTL is
+# intentional for NON-admitted votes; hot-lane stamps admitted_at at
+# write (while young) so nightly classify can keep that W2 without
+# raising the TTL or calling _read_regime_vote early.
+
+_HOT_FIRE = datetime(2026, 9, 17, 21, 32, tzinfo=_TPE)
+_HOT_CLASSIFY = datetime(2026, 9, 18, 4, 58, tzinfo=_TPE)
+_HOT_SESSION = "2026-09-17|NIGHT"
+_HOT_FIRE_ISO = "2026-09-17T21:32:00+08:00"
+_HOT_ADMIT_ISO = "2026-09-17T21:32:05+08:00"
+
+
+def test_hot_lane_admit_stamp_on_write(tmp_path):
+    """write with the feature flag on → sidecar gets admitted_at. #132"""
+    from src.news.regime_vote import write_regime_vote
+    base = tmp_path / "regime_vote.json"
+    write_regime_vote(
+        base, "trending-up", _HOT_SESSION, source="W2",
+        now=_HOT_FIRE, hot_lane_enabled=True, admit_max_age_h=4.0)
+
+    data = json.loads((tmp_path / "regime_vote_w2.json").read_text(encoding="utf-8"))
+    assert data["version"] == 1, "admitted_at is additive — schema stays v1"
+    assert data["source"] == "W2"
+    assert data["fired_at"]
+    assert data["admitted_at"]
+    admitted = datetime.fromisoformat(data["admitted_at"])
+    assert admitted.utcoffset() == timedelta(hours=8)
+    assert admitted == _HOT_FIRE
+
+
+def test_hot_lane_no_admit_when_disabled(tmp_path):
+    """Flag off (the settings.example default) → no admitted_at. #132"""
+    from src.news.regime_vote import write_regime_vote
+    write_regime_vote(
+        tmp_path / "regime_vote.json", "trending-up", _HOT_SESSION,
+        source="W2", now=_HOT_FIRE, hot_lane_enabled=False)
+
+    data = json.loads((tmp_path / "regime_vote_w2.json").read_text(encoding="utf-8"))
+    assert data["version"] == 1
+    assert "admitted_at" not in data
+
+
+def test_hot_lane_no_admit_when_write_is_already_over_age(tmp_path):
+    """Delayed / replayed write past the admit window omits admitted_at. #132"""
+    from src.news.regime_vote import write_regime_vote
+    write_regime_vote(
+        tmp_path / "regime_vote.json", "trending-up", _HOT_SESSION,
+        source="W2", now=_HOT_CLASSIFY, fired_at=_HOT_FIRE_ISO,
+        hot_lane_enabled=True, admit_max_age_h=4.0)
+
+    data = json.loads((tmp_path / "regime_vote_w2.json").read_text(encoding="utf-8"))
+    assert "admitted_at" not in data
+    assert data["fired_at"] == _HOT_FIRE_ISO
+
+
+def test_hot_lane_w3_write_never_stamps_admit(tmp_path):
+    """Hot-lane is W2-only — W3/W4 stay unchanged even if the flag is on."""
+    from src.news.regime_vote import write_regime_vote
+    write_regime_vote(
+        tmp_path / "regime_vote.json", "trending-down", _HOT_SESSION,
+        source="W3", now=_HOT_FIRE, hot_lane_enabled=True)
+
+    data = json.loads((tmp_path / "regime_vote_w3.json").read_text(encoding="utf-8"))
+    assert "admitted_at" not in data
+
+
+def test_classify_keeps_admitted_over_age(tmp_path, monkeypatch):
+    """#132 gold night: fire 21:32 / classify 04:58 = 7.4h. Admitted W2
+    is kept for classify even though 7.4h > nightly_vote_max_age_h[W2]=4."""
+    monkeypatch.setattr("src.news.regime_vote._now_tpe", lambda: _HOT_CLASSIFY)
+    _write_raw(tmp_path, "w2", session=_HOT_SESSION,
+               fired_at=_HOT_FIRE_ISO, admitted_at=_HOT_ADMIT_ISO)
+    runner = _VoteReader(tmp_path / "regime_vote.json")
+
+    votes = runner._read_regime_vote(_HOT_SESSION)
+
+    assert [v.source for v in votes] == ["W2"]
+    assert votes[0].admitted_at == _HOT_ADMIT_ISO
+    assert votes[0].age_sec is not None
+    assert votes[0].age_sec > 4 * 3600
+    # 21:32 → 04:58 = 7h26m (the #132 7.4h case study)
+    assert abs(votes[0].age_sec - (7 * 3600 + 26 * 60)) < 2
+
+
+def test_classify_drops_over_age_without_admit(tmp_path, monkeypatch):
+    """Same 7.4h fixture, no admitted_at → expired-by-age, not classified. #132"""
+    monkeypatch.setattr("src.news.regime_vote._now_tpe", lambda: _HOT_CLASSIFY)
+    _write_raw(tmp_path, "w2", session=_HOT_SESSION, fired_at=_HOT_FIRE_ISO)
+    runner = _VoteReader(tmp_path / "regime_vote.json")
+
+    votes = runner._read_regime_vote(_HOT_SESSION)
+
+    assert votes == []
+    assert not (tmp_path / "regime_vote_w2.json").exists(), (
+        "non-admitted over-age W2 is still consumed")
+
+
+def test_admit_does_not_consume_other_stems(tmp_path):
+    """Admit is a sidecar stamp — W3 stays on disk until nightly consume. #132"""
+    from src.news.regime_vote import read_all_regime_votes, write_regime_vote
+    base = tmp_path / "regime_vote.json"
+    write_regime_vote(base, "trending-down", _HOT_SESSION, source="W3",
+                      now=_HOT_FIRE)
+    write_regime_vote(base, "trending-up", _HOT_SESSION, source="W2",
+                      now=_HOT_FIRE, hot_lane_enabled=True)
+
+    assert (tmp_path / "regime_vote_w3.json").exists()
+    assert (tmp_path / "regime_vote_w2.json").exists()
+    peeked = read_all_regime_votes(base, _HOT_SESSION)
+    assert {v.source for v in peeked} == {"W2", "W3"}
+
+
+def test_hot_lane_does_not_classify_at_write(tmp_path, monkeypatch):
+    """Write/admit must not call _read_regime_vote (consume_all + last_assessed). #132"""
+    from src.news import regime_vote as rv
+
+    consume_calls = []
+    classify_calls = []
+    monkeypatch.setattr(
+        rv, "consume_all_regime_votes",
+        lambda *a, **k: consume_calls.append("consume_all"))
+    monkeypatch.setattr(
+        "src.live.regime_switching_runner.classification_due",
+        lambda *a, **k: classify_calls.append("classification_due") or None)
+
+    last_assessed = tmp_path / "last_assessed.txt"
+    last_assessed.write_text("untouched", encoding="utf-8")
+
+    rv.write_regime_vote(
+        tmp_path / "regime_vote.json", "trending-up", _HOT_SESSION,
+        source="W2", now=_HOT_FIRE, hot_lane_enabled=True)
+
+    write_regime_vote(
+        tmp_path / "regime_vote.json", "trending-down", _HOT_SESSION,
+        source="W3", now=_HOT_FIRE)
+
+    assert consume_calls == [], "admit must not consume_all"
+    assert classify_calls == [], "admit must not run classification_due"
+    assert last_assessed.read_text(encoding="utf-8") == "untouched"
+    assert (tmp_path / "regime_vote_w3.json").exists()
+    w2 = json.loads((tmp_path / "regime_vote_w2.json").read_text(encoding="utf-8"))
+    assert w2.get("admitted_at")
+
+
+def test_hot_lane_schema_is_additive(tmp_path):
+    """v1 readers ignore unknown keys; admitted_at does not bump version. #132"""
+    from src.news.regime_vote import read_regime_vote, write_regime_vote
+    write_regime_vote(
+        tmp_path / "regime_vote.json", "trending-up", _HOT_SESSION,
+        source="W2", now=_HOT_FIRE, hot_lane_enabled=True)
+    path = tmp_path / "regime_vote_w2.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["version"] == 1
+    assert "admitted_at" in data
+
+    vote = read_regime_vote(path, _HOT_SESSION)
+    assert vote is not None
+    assert vote.admitted_at
+    assert vote.source == "W2"

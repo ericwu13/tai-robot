@@ -105,6 +105,12 @@ class NewsConfig:
     # with the rest) but NOT passed to the classifier.  A source absent
     # from this dict has no age limit; {} disables the gate entirely.
     nightly_vote_max_age_h: dict = field(default_factory=lambda: {"W2": 4.0})
+    # W2 hot-lane (Option C): stamp admitted_at at write if the fire is
+    # still inside this window, so the ~04:58 classify can keep that W2
+    # even when wall-clock age exceeds nightly_vote_max_age_h. Flag is
+    # OFF by default until ship — admit ≠ deploy.
+    w2_hot_lane_admit_max_age_h: float = 4.0
+    w2_hot_lane_enabled: bool = False
 
 
 @dataclass

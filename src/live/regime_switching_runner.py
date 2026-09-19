@@ -472,11 +472,13 @@ class RegimeSwitchingRunner(LiveRunner):
         source — the source survives into the audit trail).
 
         Votes older than their source's ``nightly_vote_max_age_h`` limit
-        are dropped here.  The nightly lane fires at ~04:58, at the END
+        are dropped here unless a W2 vote was hot-lane admitted for this
+        *session_key* (``admitted_at`` stamped at write while the fire
+        was still young).  The nightly lane fires at ~04:58, at the END
         of the session a W2 vote names, and the leg it swings only goes
         live at the next 08:45 open — a 4 h-edge signal is long dead by
-        then.  Expired votes are still CONSUMED with the rest: leaving
-        them on disk would only make them older.
+        then unless it checked in.  Expired votes are still CONSUMED
+        with the rest: leaving them on disk would only make them older.
         """
         cfg = self._news_cfg
         if not cfg or not getattr(cfg, "regime_vote_path", ""):
@@ -488,15 +490,25 @@ class RegimeSwitchingRunner(LiveRunner):
             kept = []
             for v in votes:
                 limit_h = _vote_age_limit_h(max_age_h, v.source)
-                if (limit_h is not None and v.age_sec is not None
-                        and v.age_sec > limit_h * 3600.0):
+                over_age = (limit_h is not None and v.age_sec is not None
+                            and v.age_sec > limit_h * 3600.0)
+                admitted = (bool(getattr(v, "admitted_at", "") or "")
+                            and v.expires_after_session == session_key)
+                if over_age and not admitted:
                     logger.info(
-                        "[REGIME-VOTE] expired-by-age (%s, %.1fh > %.1fh limit) — "
-                        "consumed but not classified",
+                        "[REGIME-VOTE] expired-by-age (%s, %.1fh > %.1fh limit, "
+                        "not admitted) — consumed but not classified",
                         v.source or "?", v.age_sec / 3600.0, limit_h)
                     continue
-                logger.info("[REGIME-VOTE] consumed vote: %s (source=%s)",
-                            v.direction, v.source)
+                if over_age and admitted:
+                    logger.info(
+                        "[REGIME-VOTE] hot-lane-admit (%s, %.1fh > %.1fh limit, "
+                        "admitted_at=%s)",
+                        v.source or "?", v.age_sec / 3600.0, limit_h,
+                        v.admitted_at)
+                else:
+                    logger.info("[REGIME-VOTE] consumed vote: %s (source=%s)",
+                                v.direction, v.source)
                 kept.append(v)
             consume_all_regime_votes(cfg.regime_vote_path)
             return kept

@@ -64,6 +64,13 @@ Two gates sit between a vote file and a strategy swap:
   to the classifier.  W2 fires during the US session and the nightly lane
   reads it ~20 h later at the END of the session it named; W2's edge
   lives in the ~4 h after the fire.  Sources not listed have no limit.
+- **W2 hot-lane admit** (`news.w2_hot_lane_enabled`, default `false`;
+  `news.w2_hot_lane_admit_max_age_h`, default `4.0`): when the flag is
+  on, a W2 write that is still inside the admit window is stamped
+  `admitted_at` on `regime_vote_w2.json`.  Nightly classify then keeps
+  that W2 even if wall-clock age at ~04:58 exceeds the 4h TTL.
+  Admit is a sidecar stamp only — it does not consume other stems,
+  does not run classify, and does not mean the bot deployed.
 
 ## W4 — 籌碼 chips monitor (`chips_monitor.py`)
 
