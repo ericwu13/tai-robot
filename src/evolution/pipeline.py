@@ -5,7 +5,8 @@ in run_backtest.py. Flow when the user clicks 🧬 Bot Evolution with
 auto-pipeline enabled:
 
   1. The evolution plan prompt requires a trailing machine-readable
-     ```json directives block (action + validation criteria).
+     ```json directives block (action only — omit holdout criteria so
+     the default not-worse-than-baseline verdict applies).
   2. ``parse_plan_directives`` extracts it (tolerant of garbage).
   3. The GUI generates a candidate strategy via codegen, then backtests
      baseline and candidate on the same bars (``run_ab_backtest``).
@@ -252,6 +253,30 @@ def plan_sample_rule(design_total: int, new_count: int) -> str:
         f"With {design_total} design-window trades the rule does NOT apply "
         f"here — propose one concrete change.")
     return f"{scope} {rule} {verdict}"
+
+
+def plan_directives_block() -> str:
+    """Machine-readable JSON trailer the evolution plan prompt requires.
+
+    Must NOT ask the model for numeric holdout criteria. Copied example
+    PF/WR bars (``profit_factor_min`` 1.2 / ``win_rate_min`` 0.45) were
+    written into ``directives["criteria"]`` and FAILed Path A candidates
+    that would have passed the default not-worse-than-baseline path
+    (TMF00_0422 2026-09-19). Leave the JSON as ``action`` only so
+    ``parse_plan_directives`` returns ``criteria=None``.
+    """
+    return (
+        "## 機器可讀指令 Machine-readable directives (MANDATORY)\n"
+        "END your reply with a fenced json block, nothing after it. Example:\n"
+        "```json\n"
+        '{"action": "change"}\n'
+        "```\n"
+        '- action: "change" when proposing a change; "no_change" when the '
+        "plan is to keep running / collect data.\n"
+        "- Do NOT emit numeric holdout pass/fail criteria. Leave the JSON "
+        "as action only (omit any criteria object) so the pipeline uses "
+        "its default not-worse-than-baseline verdict.\n"
+    )
 
 
 @dataclass

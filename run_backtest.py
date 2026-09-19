@@ -4761,7 +4761,8 @@ class BacktestApp:
         # backtesting the unseen holdout. The cut rolls forward each
         # cycle, so this week's holdout becomes next week's design data.
         from src.evolution.pipeline import (
-            compute_design_cut, design_cutoff_index, plan_sample_rule)
+            compute_design_cut, design_cutoff_index, plan_sample_rule,
+            plan_directives_block)
         holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
         cut = compute_design_cut(result.trades, holdout_days)
         # Scan from 0, NOT from the watermark: a watermark saved past the
@@ -4874,18 +4875,7 @@ class BacktestApp:
             f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
             f"instead.\n"
             f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
-            f"## 機器可讀指令 Machine-readable directives (MANDATORY)\n"
-            f"END your reply with a fenced json block, nothing after it. Example:\n"
-            f"```json\n"
-            f'{{"action": "change", "max_drawdown_pct_max": 35, '
-            f'"profit_factor_min": 1.2, "win_rate_min": 0.45}}\n'
-            f"```\n"
-            f'- action: "change" when proposing a change; "no_change" when the '
-            f"plan is to keep running / collect data.\n"
-            f"- Include ONLY the criteria keys your validation section actually "
-            f"specifies. Units: max_drawdown_pct_max in percent, win_rate_min "
-            f"as a 0-1 fraction, profit_factor_min plain, total_pnl_min in "
-            f"points.\n\n"
+            f"{plan_directives_block()}\n"
             f"## 保留測試集 Holdout (unseen validation data)\n"
             f"The most recent {holdout_days} days of evidence "
             f"({holdout_count} trades) are WITHHELD from everything in this "
