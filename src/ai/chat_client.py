@@ -55,6 +55,15 @@ _TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
 _RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 1.0
 
+# ── Caller-only response annotations ──
+# Both are appended to the string the send/one_shot methods RETURN, never
+# to the raw text stored in ``self.conversation``.  Consumers that parse a
+# response (the evolution plan gate, issue #108) must strip them by these
+# constants instead of copying the literals, so a format change here can
+# never silently break a parser.
+TRUNCATION_WARNING = "[WARNING: Response truncated due to token limit]"
+USAGE_LINE_PREFIX = "\n\n📊 tokens: "
+
 # CSV columns for the per-call usage log.  ``reasoning_tokens`` captures
 # Gemini 2.5's thoughtsTokenCount — these are billed at the output rate but
 # don't show up in candidatesTokenCount, so without this column the log
@@ -213,7 +222,7 @@ def _format_usage_line(input_tokens: int, output_tokens: int,
     """
     if total_tokens <= 0:
         return ""
-    line = (f"\n\n📊 tokens: {input_tokens:,} in / {output_tokens:,} out / "
+    line = (f"{USAGE_LINE_PREFIX}{input_tokens:,} in / {output_tokens:,} out / "
             f"{reasoning_tokens:,} reasoning (total: {total_tokens:,})")
     if model:
         short, mode = _classify_model(model)
@@ -316,30 +325,40 @@ class ChatClient:
         *,
         call_site: str = "unknown",
         model: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Send a message and return the assistant's response text.
 
         Blocking call — run from a background thread when used with Tkinter.
+
+        ``max_tokens`` overrides ``self.max_tokens`` for this call only
+        (None = the client default, unchanged for every existing caller).
+        Needed because thinking tokens share the output budget: a 4096
+        cap let Gemini spend the whole pool on reasoning and return ZERO
+        visible text for the evolution plan (issue #108).
         """
         self.conversation.append({"role": "user", "content": user_message})
         self._enforce_conversation_size()
 
         try:
             if self.provider == PROVIDER_GOOGLE:
-                return self._send_google(user_message, call_site=call_site, model=model)
+                return self._send_google(user_message, call_site=call_site,
+                                         model=model, max_tokens=max_tokens)
             else:
-                return self._send_anthropic(user_message, call_site=call_site, model=model)
+                return self._send_anthropic(user_message, call_site=call_site,
+                                            model=model, max_tokens=max_tokens)
         except Exception:
             # Remove the user message on failure
             self.conversation.pop()
             raise
 
-    def _send_anthropic(self, user_message: str, *, call_site: str, model: str | None) -> str:
+    def _send_anthropic(self, user_message: str, *, call_site: str,
+                        model: str | None, max_tokens: int | None = None) -> str:
         """Send via Anthropic API."""
         used_model = model or self.model
         payload: dict = {
             "model": used_model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens or self.max_tokens,
             "messages": self.conversation,
         }
         if self.system_prompt:
@@ -405,7 +424,8 @@ class ChatClient:
             used_model = fallback
         return response, used_model
 
-    def _send_google(self, user_message: str, *, call_site: str, model: str | None) -> str:
+    def _send_google(self, user_message: str, *, call_site: str,
+                     model: str | None, max_tokens: int | None = None) -> str:
         """Send via Google Gemini API."""
         used_model = model or self.model
 
@@ -429,7 +449,7 @@ class ChatClient:
         payload: dict = {
             "contents": contents,
             "generationConfig": {
-                "maxOutputTokens": self.max_tokens,
+                "maxOutputTokens": max_tokens or self.max_tokens,
             },
         }
         if system_instruction:
@@ -477,7 +497,7 @@ class ChatClient:
         self.conversation.append({"role": "assistant", "content": assistant_text})
 
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
-            assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+            assistant_text += f"\n\n{TRUNCATION_WARNING}"
         assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok, used_model)
 
         return assistant_text
@@ -639,7 +659,7 @@ class ChatClient:
         )
 
         if candidates and candidates[0].get("finishReason") == "MAX_TOKENS":
-            assistant_text += "\n\n[WARNING: Response truncated due to token limit]"
+            assistant_text += f"\n\n{TRUNCATION_WARNING}"
         assistant_text += _format_usage_line(in_tok, out_tok, think_tok, tot_tok, used_model)
 
         return assistant_text
