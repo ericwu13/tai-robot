@@ -7,7 +7,9 @@ auto-pipeline enabled:
   1. The evolution plan prompt requires a trailing machine-readable
      ```json directives block (action only — omit holdout criteria so
      the default not-worse-than-baseline verdict applies).
-  2. ``parse_plan_directives`` extracts it (tolerant of garbage).
+  2. ``plan_unusable_reason`` refuses a response that came back empty or
+     truncated by the token limit (issue #108); ``parse_plan_directives``
+     then extracts the block (tolerant of garbage).
   3. The GUI generates a candidate strategy via codegen, then backtests
      baseline and candidate on the same bars (``run_ab_backtest``).
   4. ``decide_verdict`` checks the plan's own criteria (or a default
@@ -32,6 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from ..ai.chat_client import TRUNCATION_WARNING, USAGE_LINE_PREFIX
 from ..backtest.engine import BacktestEngine, BacktestResult
 from ..backtest.metrics import PerformanceMetrics
 from .fitness import (DEFAULT_CAPITAL_BASE_TWD, MIN_TRADES, FitnessResult,
@@ -132,6 +135,64 @@ ABS_PF_FLOOR = 1.0
 # (present on exactly one side) there is nothing to judge; defer to the
 # next window rather than PASS or FAIL on coincidence.
 MIN_EXPRESSED_TRADES = 3
+
+
+def _strip_client_annotations(plan_text: str) -> tuple[str, bool]:
+    """``(body, was_truncated)`` — the model's own text, annotations removed.
+
+    ``ChatClient`` appends two caller-only strings to what it returns: the
+    MAX_TOKENS warning and the ``📊 tokens:`` usage line (a single trailing
+    line). Both are imported constants, not copies, so this stays in sync
+    with the client. Without stripping them, a response whose visible text
+    was EMPTY still looks non-empty to every downstream check.
+    """
+    body = plan_text or ""
+    idx = body.rfind(USAGE_LINE_PREFIX)
+    if idx != -1 and "\n" not in body[idx + len(USAGE_LINE_PREFIX):]:
+        body = body[:idx]
+    truncated = TRUNCATION_WARNING in body
+    if truncated:
+        body = body.replace(TRUNCATION_WARNING, "")
+    return body.strip(), truncated
+
+
+def _has_directive_block(plan_text: str) -> bool:
+    """True when a parseable ```json object closes the plan."""
+    matches = _JSON_FENCE.findall(plan_text or "")
+    if not matches:
+        return False
+    try:
+        return isinstance(json.loads(matches[-1]), dict)
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
+def plan_unusable_reason(plan_text: str) -> str:
+    """"" when the plan can drive the pipeline, else why it cannot.
+
+    The 2026-09-07 and 09-19 weekly runs both got an EVO 1/3 response with
+    zero visible text — Gemini spent the whole ``maxOutputTokens`` pool on
+    thinking tokens and finished with MAX_TOKENS (issue #108). HTTP was
+    200, so the transient-status retry never fired, and
+    ``parse_plan_directives``' deliberately tolerant default made that
+    nothing look like a real ``action=change`` plan: the watermark burned
+    the trade delta and codegen mutated the strategy from an empty plan.
+
+    Unusable means: nothing left after the annotations are stripped, or a
+    truncated response with no directive block to anchor it. A COMPLETE
+    plan that merely forgot the JSON block stays usable — that is the
+    formatting whim ``parse_plan_directives`` is tolerant of on purpose —
+    and a truncated plan that still carries a valid directive block made
+    it to the end, so it stays usable too.
+    """
+    body, truncated = _strip_client_annotations(plan_text)
+    if not body:
+        return ("empty plan response (no visible text — the model's "
+                "output budget went to thinking tokens)")
+    if truncated and not _has_directive_block(body):
+        return ("plan response truncated by the token limit before the "
+                "directives block")
+    return ""
 
 
 def parse_plan_directives(plan_text: str) -> dict[str, Any]:

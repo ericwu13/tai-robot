@@ -5119,7 +5119,7 @@ class BacktestApp:
 
         def _worker():
             from src.evolution.pipeline import (
-                check_candidate_name,
+                check_candidate_name, plan_unusable_reason,
                 parse_plan_directives, next_candidate_name, run_ab_backtest,
                 decide_verdict, format_verdict_block,
                 run_deep_validation, decide_deep_verdict,
@@ -5140,13 +5140,42 @@ class BacktestApp:
             try:
                 # ── Phase 1: evolution plan ──
                 plan = self._chat_client.send_message(
-                    context, call_site="bot_evolution", model=heavy_model)
+                    context, call_site="bot_evolution", model=heavy_model,
+                    # Thinking tokens share this budget — the codegen
+                    # calls already get _CODE_GEN_MAX_TOKENS, so give the
+                    # plan the same floor (issue #108).
+                    max_tokens=max(self._chat_client.max_tokens,
+                                   _CODE_GEN_MAX_TOKENS))
                 conv = self._chat_client.conversation
                 if len(conv) >= 2 and conv[-2].get("role") == "user":
                     conv[-2]["content"] = (
                         f"[bot evolution payload — {total_trades} trades, "
                         f"trimmed to save tokens]")
                 ui(self._on_chat_response, plan)
+
+                # Issue #108: an empty / token-truncated plan must stop the
+                # run HERE — before the watermark and before codegen.
+                # parse_plan_directives degrades to action="change" by
+                # design, so without this gate a zero-text response burned
+                # the trade delta and fed codegen a plan of nothing.
+                if (unusable := plan_unusable_reason(plan)):
+                    msg = (
+                        f"🧬 EVO 中止 ABORT: 計畫回應無法使用（{unusable}）。"
+                        f"本次未消耗任何交易資料（watermark 未前進），"
+                        f"下次執行會重跑同一批交易。"
+                        f"建議在 settings.yaml 將 ai.max_tokens 提高到 "
+                        f"≥{_CODE_GEN_MAX_TOKENS}（思考 token 與輸出共用額度）。\n"
+                        f"Plan response unusable ({unusable}) — the model's "
+                        f"reply was empty or cut off by the token limit. "
+                        f"Nothing was consumed: the watermark did NOT "
+                        f"advance and the next run retries the same trades. "
+                        f"Raise `ai.max_tokens` in settings.yaml to "
+                        f"≥{_CODE_GEN_MAX_TOKENS} (thinking tokens share the "
+                        f"output budget).")
+                    ui(self._append_chat, "system", msg)
+                    if auto_run:
+                        _notify_discord(msg)
+                    return
 
                 directives = parse_plan_directives(plan)
                 if directives["action"] == "no_change":

@@ -131,6 +131,9 @@ class TestParsePlanDirectives:
         assert d["criteria"] == {"win_rate_min": 0.4}
 
     def test_empty_input(self):
+        # Still the tolerant default ON PURPOSE — refusing an empty plan
+        # is ``plan_unusable_reason``'s job, upstream of this parser
+        # (issue #108, see test_evolution_issue108_empty_plan.py).
         assert parse_plan_directives("")["action"] == "change"
         assert parse_plan_directives(None)["action"] == "change"
 
