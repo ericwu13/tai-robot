@@ -22,6 +22,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -123,6 +124,12 @@ from src.market_data.kchart_fetcher import (
 )
 
 # TAIFEX public data (no API key needed)
+from src.ui.theme import (
+    CHAT_TAGS, EPISODE_TAGS, FONTS, LOG_TAGS, PALETTE,
+    STATUS_LEVEL_STYLES, TONE, init_theme,
+)
+from src.ui.widgets import ScrollableFrame, StatusDot, TagTextLog, attach_tooltip
+from src.ui.labels import READY
 from src.data_sources.taifex import fetch_futures_daily, parse_taifex_csv
 from src.data_sources.cache import (
     get_cache_path, save_bars_csv, load_bars_csv, cache_covers_range,
@@ -704,17 +711,7 @@ def _log(msg):
             _debug_log_file.flush()
         except Exception:
             pass
-    if _app and hasattr(_app, "log_text"):
-        try:
-            # Only touch Tkinter widgets from the main thread; COM callbacks
-            # run on background threads and touching Tk there crashes the GIL.
-            if threading.current_thread() is threading.main_thread():
-                _app.log_text.config(state=tk.NORMAL)
-                _app.log_text.insert(tk.END, line + "\n")
-                _app.log_text.see(tk.END)
-                _app.log_text.config(state=tk.DISABLED)
-        except Exception:
-            pass
+    _route_to_log_widget(line, "info")
 
 
 class _AppLogHandler(logging.Handler):
@@ -753,6 +750,37 @@ def _log_debug(msg):
             _debug_log_file.flush()
         except Exception:
             pass
+    _route_to_log_widget(line, "debug")
+
+
+def _route_to_log_widget(line: str, level: str = "info") -> None:
+    """Append a formatted line to the Log tab. Off-thread callers enqueue.
+
+    COM already posts ``("log", raw)`` / ``("log_debug", raw)`` and the
+    drain calls ``_log`` / ``_log_debug`` on the Tk thread. Background
+    Python threads that call those helpers directly must not touch Tk —
+    they enqueue a widget-only ``log_ui`` item so print/file stay
+    immediate and the widget update is not dropped.
+    """
+    if not _app or not hasattr(_app, "log_text"):
+        return
+    if threading.current_thread() is not threading.main_thread():
+        try:
+            _ui_queue.put_nowait(("log_ui", (level, line)))
+        except Exception:
+            pass
+        return
+    try:
+        widget = _app.log_text
+        if hasattr(widget, "append"):
+            widget.append(line, level)
+        else:
+            widget.config(state=tk.NORMAL)
+            widget.insert(tk.END, line + "\n")
+            widget.see(tk.END)
+            widget.config(state=tk.DISABLED)
+    except Exception:
+        pass
 
 
 # ── COM Event handlers ──
@@ -874,35 +902,6 @@ _parse_open_interest = parse_open_interest  # re-export from account_monitor
 _parse_future_rights = parse_future_rights  # re-export from account_monitor
 
 
-def _attach_tooltip(widget, text: str) -> None:
-    """Attach a lightweight hover tooltip to a Tk widget."""
-    state = {"tip": None}
-
-    def show(_event=None):
-        if state["tip"] is not None:
-            return
-        try:
-            x = widget.winfo_rootx() + 20
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-        except tk.TclError:
-            return
-        tip = tk.Toplevel(widget)
-        tip.wm_overrideredirect(True)
-        tip.wm_geometry(f"+{x}+{y}")
-        tk.Label(tip, text=text, background="#ffffe0", relief=tk.SOLID,
-                 borderwidth=1, font=("", 9), justify=tk.LEFT,
-                 padx=6, pady=3).pack()
-        state["tip"] = tip
-
-    def hide(_event=None):
-        if state["tip"] is not None:
-            state["tip"].destroy()
-            state["tip"] = None
-
-    widget.bind("<Enter>", show)
-    widget.bind("<Leave>", hide)
-
-
 class BacktestApp:
     def __init__(self, root: tk.Tk):
         global _app
@@ -928,11 +927,17 @@ class BacktestApp:
         self._ai_strategy_cls: type[BacktestStrategy] | None = None
         self._strategy_store = StrategyStore(os.path.join(project_root, "strategies"))
 
+        init_theme(self.root)
+        self._status_history: deque = deque(maxlen=20)
+        self._rendered_trade_count: int = 0
+        self._report_render_pending: bool = False
+        self._report_render_last: float = 0.0
+        self._report_render_latest = None
         self._build_ui()
         self._load_saved_strategies()
         # Chat auto-load removed — user must explicitly use "Load Chat"
 
-        self.status_var.set("就緒 Ready")
+        self.set_status(READY)
 
         # Auto-save chat on window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -953,13 +958,12 @@ class BacktestApp:
     #  COM → UI QUEUE DRAIN (main thread)
     # ══════════════════════════════════════════════════════════════
 
-    def _drain_ui_queue(self):
-        """Drain COM connection/UI events on the main thread.
+    def _process_ui_queue(self):
+        """Drain queued COM/UI events once. Does not reschedule.
 
-        COM callbacks (OnConnection, OnReplyMessage, etc.) fire on background
-        threads. Neither Tkinter calls NOR root.after() are safe from those
-        threads. The only safe primitive is queue.put_nowait(). This method
-        runs on the main thread via root.after() and processes queued events.
+        Split out of ``_drain_ui_queue`` so the headless OI-wait loop can
+        consume the snapshot without stacking another ``after(100, …)``
+        pump on every 100 ms poll.
         """
         try:
             while True:
@@ -968,6 +972,9 @@ class BacktestApp:
                     _log(data)
                 elif kind == "log_debug":
                     _log_debug(data)
+                elif kind == "log_ui":
+                    level, line = data
+                    _route_to_log_widget(line, level)
                 elif kind == "conn":
                     if data == "ready":
                         # Ready (3003) is the only state we treat as fully
@@ -979,7 +986,8 @@ class BacktestApp:
                         self.btn_deploy.config(state=tk.NORMAL)
                         self.btn_login.config(state=tk.DISABLED)
                         self.btn_reconnect.config(state=tk.NORMAL)
-                        self.status_var.set("已連線 Connected - Ready")
+                        self.set_status("已連線 Connected - Ready", "ok")
+                        self._set_conn_dot("ok")
                         self.login_status_var.set("已連線 Connected")
                         self._on_reconnected()
                     elif data == "quote":
@@ -988,6 +996,7 @@ class BacktestApp:
                         # that only reached Quote, but no ticks ever arrive
                         # (zombie subscription). Wait for Ready (3003); if
                         # it never comes, trigger a fresh reconnect attempt.
+                        self._set_conn_dot("warn")
                         self._on_quote_intermediate()
                     elif data == "disconnected":
                         self._on_disconnected()
@@ -1054,11 +1063,100 @@ class BacktestApp:
                     else:
                         err = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
                         _log(f"委託失敗 Order FAILED: code={code} {err} {msg}")
+                        self.set_status(f"委託失敗 Order FAILED: {err}", "error")
                         if self._live_runner:
                             self._live_log_msg(f"實單失敗 Order FAILED: {err}", "exit")
         except queue.Empty:
             pass
+
+    def _drain_ui_queue(self):
+        """Drain COM connection/UI events on the main thread.
+
+        COM callbacks (OnConnection, OnReplyMessage, etc.) fire on background
+        threads. Neither Tkinter calls NOR root.after() are safe from those
+        threads. The only safe primitive is queue.put_nowait(). This method
+        runs on the main thread via root.after() and processes queued events.
+        """
+        self._process_ui_queue()
         self.root.after(100, self._drain_ui_queue)
+
+    def set_status(self, msg, level: str = "info") -> None:
+        """Update the bottom status strip, keep a last-20 history deque."""
+        if not hasattr(self, "status_var"):
+            return
+        self.status_var.set(msg)
+        ts = _taipei_now().strftime("%H:%M:%S")
+        if not hasattr(self, "_status_history"):
+            self._status_history = deque(maxlen=20)
+        self._status_history.append((ts, level, str(msg)))
+        style = STATUS_LEVEL_STYLES.get(level, "Dim.TLabel")
+        label = getattr(self, "_status_msg_label", None)
+        if label is not None:
+            try:
+                label.configure(style=style)
+            except tk.TclError:
+                pass
+
+    def _set_conn_dot(self, state: str) -> None:
+        dot = getattr(self, "_conn_dot", None)
+        if dot is not None:
+            try:
+                dot.set_state(state)
+            except tk.TclError:
+                pass
+
+    def _show_status_history(self) -> None:
+        """Click-to-open popover of the last 20 status messages."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("狀態紀錄 Status History")
+        dlg.geometry("520x280")
+        dlg.transient(self.root)
+        dlg.configure(bg=PALETTE["bg"])
+        log = TagTextLog(dlg, show_toolbar=False, max_lines=20)
+        log.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        tag_for = {"info": "info", "ok": "entry", "warn": "status", "error": "exit"}
+        for ts, level, msg in self._status_history:
+            log.append(f"[{ts}] {msg}", tag_for.get(level, "info"))
+        ttk.Button(dlg, text="關閉 Close", command=dlg.destroy).pack(pady=(0, 8))
+
+    def _build_status_strip(self, parent) -> None:
+        """Bottom strip: connection dot + message + last-20 history button."""
+        strip = ttk.Frame(parent, style="StatusStrip.TFrame")
+        strip.pack(side=tk.BOTTOM, fill=tk.X)
+        self._conn_dot = StatusDot(strip, text="連線 Conn")
+        self._conn_dot.pack(side=tk.LEFT, padx=(8, 10), pady=3)
+        self.status_var = tk.StringVar(value="初始化中 Initializing...")
+        self._status_msg_label = ttk.Label(
+            strip, textvariable=self.status_var, style="Dim.TLabel")
+        self._status_msg_label.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=3)
+        ttk.Button(strip, text="紀錄 History", width=12,
+                   command=self._show_status_history).pack(
+            side=tk.RIGHT, padx=6, pady=2)
+
+    def _oi_wait_must_block(self) -> bool:
+        """Headless (or unmapped) roots cannot pump an after() OI poll.
+
+        ``HeadlessBotApp`` calls ``_deploy_live_from`` synchronously and
+        inspects the bool + ``_live_runner`` before returning — the
+        after-poll chain would return too early. Detect via the policy
+        attribute (set before ``BacktestApp.__init__``) or an unmapped
+        window; do not import ``headless_app`` (cycle).
+        """
+        if getattr(self, "policy", None) is not None:
+            return True
+        try:
+            return not bool(self.root.winfo_viewable())
+        except tk.TclError:
+            return True
+
+    def _wait_oi_snapshot_blocking(self) -> None:
+        """Poll the UI queue for the OI snapshot without spinning Tk."""
+        deadline = time.time() + OI_SNAPSHOT_TIMEOUT_S
+        while time.time() < deadline:
+            self._process_ui_queue()
+            if self._account_monitor.oi_snapshot_received:
+                break
+            time.sleep(0.1)
 
     # ══════════════════════════════════════════════════════════════
     #  CONNECTION MONITORING & RECONNECTION
@@ -1136,7 +1234,8 @@ class BacktestApp:
             return  # already handling disconnect
         self._cancel_quote_ready_timer("disconnected")
         self._set_quote_connected(False, "_on_disconnected")
-        self.status_var.set("斷線 Disconnected")
+        self.set_status("斷線 Disconnected", "error")
+        self._set_conn_dot("err")
         self.login_status_var.set("斷線 Disconnected")
         self.btn_login.config(state=tk.NORMAL)
         self.btn_reconnect.config(state=tk.NORMAL)
@@ -1165,7 +1264,8 @@ class BacktestApp:
         self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
         action = self._conn_monitor.on_manual_reconnect()
-        self.status_var.set(action.message)
+        self.set_status(action.message, "warn")
+        self._set_conn_dot("warn")
         self.login_status_var.set("重連中 Reconnecting...")
         _log("手動重連 Manual reconnect triggered")
         _log_debug(
@@ -1185,7 +1285,7 @@ class BacktestApp:
 
     def _execute_reconnect_action(self, action):
         """Thin dispatcher: execute a ReconnectAction from ConnectionMonitor."""
-        self.status_var.set(action.message)
+        self.set_status(action.message, "warn")
         _log(action.message)
 
         if action.type == "give_up":
@@ -1315,7 +1415,8 @@ class BacktestApp:
                 self.btn_deploy.config(state=tk.NORMAL)
                 self.btn_login.config(state=tk.DISABLED)
                 self.btn_reconnect.config(state=tk.NORMAL)
-                self.status_var.set("已連線 Connected - Ready")
+                self.set_status("已連線 Connected - Ready", "ok")
+                self._set_conn_dot("ok")
                 self.login_status_var.set("已連線 Connected")
                 _log_debug(
                     f"[RECONNECT] Attempt #{attempt_n} SUCCESS — "
@@ -1438,6 +1539,9 @@ class BacktestApp:
     # ══════════════════════════════════════════════════════════════
 
     def _build_ui(self):
+        # Status strip packs BOTTOM first so the paned workbench fills the rest.
+        self._build_status_strip(self.root)
+
         # Main horizontal split
         paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -1544,7 +1648,8 @@ class BacktestApp:
         header = ttk.Frame(parent)
         header.pack(fill=tk.X, padx=4, pady=(4, 2))
 
-        ttk.Label(header, text="AI 策略工作台", font=("", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Label(header, text="AI 策略工作台",
+                  font=FONTS.get("section") or ("", 13, "bold")).pack(side=tk.LEFT)
         ttk.Button(header, text="New Chat", width=9, command=self._reset_chat).pack(side=tk.RIGHT, padx=2)
         ttk.Button(header, text="Load Chat", width=9, command=self._load_chat_session).pack(side=tk.RIGHT, padx=2)
         ttk.Button(header, text="Save Chat", width=9, command=self._save_chat_session).pack(side=tk.RIGHT, padx=2)
@@ -1554,27 +1659,28 @@ class BacktestApp:
         self._update_ultra_button()
 
         # ── Chat display ──
-        self.chat_display = scrolledtext.ScrolledText(
-            parent, wrap=tk.WORD, font=("Consolas", 10),
-            bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
-            state=tk.DISABLED, relief=tk.FLAT, padx=8, pady=8,
+        self.chat_display = TagTextLog(
+            parent, tags=CHAT_TAGS, show_toolbar=False,
+            bg=PALETTE["bg_inset"], fg=PALETTE["text"],
+            font=FONTS.get("mono") or ("Consolas", 10),
         )
         self.chat_display.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
-
-        # Chat text tags for styling
-        self.chat_display.tag_configure("user", foreground="#569cd6", font=("Consolas", 10, "bold"))
-        self.chat_display.tag_configure("assistant", foreground="#d4d4d4")
-        self.chat_display.tag_configure("code", foreground="#ce9178", font=("Consolas", 9))
-        self.chat_display.tag_configure("error", foreground="#f44747")
-        self.chat_display.tag_configure("system", foreground="#6a9955")
+        self.chat_display.tag_configure(
+            "user", foreground=CHAT_TAGS["user"]["foreground"],
+            font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"))
+        self.chat_display.tag_configure(
+            "code", foreground=CHAT_TAGS["code"]["foreground"],
+            font=FONTS.get("mono_small") or ("Consolas", 9))
 
         # ── Input area ──
         input_frame = ttk.Frame(parent)
         input_frame.pack(fill=tk.X, padx=4, pady=2)
 
         self.chat_input = tk.Text(
-            input_frame, height=3, font=("Consolas", 10),
-            bg="#252526", fg="#d4d4d4", insertbackground="white",
+            input_frame, height=3,
+            font=FONTS.get("mono") or ("Consolas", 10),
+            bg=PALETTE["bg_raised"], fg=PALETTE["text"],
+            insertbackground=PALETTE["text"],
             relief=tk.FLAT, padx=6, pady=4,
         )
         self.chat_input.pack(fill=tk.X, expand=True)
@@ -1638,7 +1744,6 @@ class BacktestApp:
         self.strategy_combo = ttk.Combobox(row1, textvariable=self.strategy_var, width=28,
                                             state="readonly", values=list(STRATEGIES.keys()))
         self.strategy_combo.grid(row=0, column=3, padx=(0, 4))
-        self.strategy_var.trace_add("write", self._on_strategy_changed)
         ttk.Button(row1, text="原始碼 Source", command=self._show_strategy_source).grid(row=0, column=4, padx=2)
 
         # ── Row 2: Login ──
@@ -1661,7 +1766,8 @@ class BacktestApp:
         self.btn_reconnect.grid(row=0, column=5, padx=2)
 
         self.login_status_var = tk.StringVar(value="")
-        ttk.Label(row2, textvariable=self.login_status_var, foreground="gray").grid(row=0, column=6, padx=4)
+        ttk.Label(row2, textvariable=self.login_status_var,
+                  style="Dim.TLabel").grid(row=0, column=6, padx=4)
 
         # ── Action buttons (grid layout — wraps gracefully) ──
         btn_frame = ttk.Frame(ctrl)
@@ -1721,8 +1827,8 @@ class BacktestApp:
         self.btn_update = ttk.Button(btn_frame, text="🔄 檢查更新 Check for Updates",
                                      command=self._start_update)
         self.btn_update.grid(row=0, column=11, padx=3, pady=1, sticky=tk.W)
-        _attach_tooltip(self.btn_update,
-                        "請先停止所有機器人\nStop all running bots first")
+        attach_tooltip(self.btn_update,
+                       "請先停止所有機器人\nStop all running bots first")
 
         # Wrap toolbar buttons onto extra rows when the frame is too
         # narrow for a single row (grid does not auto-wrap).
@@ -1735,17 +1841,13 @@ class BacktestApp:
         self._toolbar_last_width = 0
         btn_frame.bind("<Configure>", self._reflow_toolbar)
 
-        # Status on its own row so it never clips the buttons above
-        self.status_var = tk.StringVar(value="初始化中 Initializing...")
-        ttk.Label(ctrl, textvariable=self.status_var, foreground="gray",
-                  font=("", 9)).pack(fill=tk.X, padx=6, pady=(0, 1))
-
+        # Status strip lives at the window bottom (see _build_status_strip).
         # Non-blocking "update available" banner (hidden until the startup
         # check finds a newer release). Populated by _on_update_available.
         self.update_banner_var = tk.StringVar(value="")
         self._update_banner = ttk.Label(
             ctrl, textvariable=self.update_banner_var,
-            foreground="#0a7d00", font=("", 9, "bold"), cursor="hand2")
+            style="Status.Ok.TLabel", cursor="hand2")
         self._update_banner.pack(fill=tk.X, padx=6, pady=(0, 1))
         self._update_banner.bind("<Button-1>", lambda _e: self._start_update())
         # Latest release discovered by the startup check (set in bg thread).
@@ -1800,28 +1902,14 @@ class BacktestApp:
         self.report_filter_combo.pack(side=tk.LEFT)
         self.report_filter_combo.bind(
             "<<ComboboxSelected>>", lambda e: self._on_report_filter_changed())
-        # Card-based report body inside a scrollable canvas (view model:
-        # src/backtest/report_view.py; format_report text stays for
+        # Card-based report body inside the blessed ScrollableFrame (view
+        # model: src/backtest/report_view.py; format_report text stays for
         # Discord/console/export).
-        canvas = tk.Canvas(metrics_frame, highlightthickness=0)
-        report_vsb = ttk.Scrollbar(metrics_frame, orient="vertical",
-                                   command=canvas.yview)
-        canvas.configure(yscrollcommand=report_vsb.set)
-        report_vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
-        body = ttk.Frame(canvas)
-        body_win = canvas.create_window((0, 0), window=body, anchor="nw")
-        body.bind("<Configure>",
-                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfigure(body_win, width=e.width))
-        canvas.bind("<Enter>", lambda e: canvas.bind_all(
-            "<MouseWheel>",
-            lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        self.report_canvas = canvas
-        self.report_body = body
-        ttk.Label(body, text="(尚無結果 no results yet — 執行回測或部署 "
+        report_scroll = ScrollableFrame(metrics_frame)
+        report_scroll.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        self.report_canvas = report_scroll.canvas
+        self.report_body = report_scroll.body
+        ttk.Label(self.report_body, text="(尚無結果 no results yet — 執行回測或部署 "
                              "run a backtest or deploy)").pack(padx=8, pady=8)
 
         # Trade list tab
@@ -1862,7 +1950,7 @@ class BacktestApp:
         ttk.Label(bot_name_frame, text="機器人名稱 Bot Name:").pack(side=tk.LEFT, padx=(0, 4))
         self.bot_name_var = tk.StringVar(value="(未設定 Not set)")
         self.bot_name_label = ttk.Label(bot_name_frame, textvariable=self.bot_name_var,
-                                         font=("Consolas", 10, "bold"))
+                                         font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"))
         self.bot_name_label.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(bot_name_frame, text="|").pack(side=tk.LEFT, padx=4)
         ttk.Label(bot_name_frame, text="模式 Mode:").pack(side=tk.LEFT, padx=(0, 4))
@@ -1875,7 +1963,7 @@ class BacktestApp:
         self.mode_combo = ttk.Combobox(
             bot_name_frame, textvariable=self.trading_mode_var,
             values=self._mode_combo_values, state=tk.DISABLED,
-            width=18, font=("Consolas", 10, "bold"),
+            width=18, font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"),
         )
         self.mode_combo.pack(side=tk.LEFT)
         self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_combo_changed)
@@ -1898,13 +1986,15 @@ class BacktestApp:
             ("盤勢 Market:", self.live_market_var),
         ]):
             ttk.Label(status_panel, text=label).grid(row=0, column=i*2, sticky=tk.W, padx=4)
-            ttk.Label(status_panel, textvariable=var, font=("Consolas", 10, "bold")).grid(
+            ttk.Label(status_panel, textvariable=var,
+                      font=FONTS.get("mono_bold") or ("Consolas", 10, "bold")).grid(
                 row=0, column=i*2+1, sticky=tk.W, padx=(0, 12))
 
         # Regime (shadow-mode) status line — updated on each daily report.
         self.live_regime_var = tk.StringVar(value="[Regime] 停用 disabled")
         ttk.Label(status_panel, textvariable=self.live_regime_var,
-                  font=("Consolas", 9), foreground="#8ab4f8").grid(
+                  font=FONTS.get("mono_small") or ("Consolas", 9),
+                  foreground=PALETTE["info"]).grid(
             row=1, column=0, columnspan=10, sticky=tk.W, padx=4, pady=(3, 0))
 
         # Manual order buttons
@@ -1948,7 +2038,8 @@ class BacktestApp:
             ("淨損益 Net:", self.real_net_var),
         ]:
             ttk.Label(row0, text=label).pack(side=tk.LEFT, padx=(4, 2))
-            lbl = ttk.Label(row0, textvariable=var, font=("Consolas", 10, "bold"))
+            lbl = ttk.Label(row0, textvariable=var,
+                            font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"))
             lbl.pack(side=tk.LEFT, padx=(0, 8))
 
         row1 = ttk.Frame(acct_frame)
@@ -1961,21 +2052,20 @@ class BacktestApp:
             ("今日成交 Trades:", self.real_fills_var),
         ]:
             ttk.Label(row1, text=label).pack(side=tk.LEFT, padx=(4, 2))
-            ttk.Label(row1, textvariable=var, font=("Consolas", 10, "bold")).pack(
+            ttk.Label(row1, textvariable=var,
+                      font=FONTS.get("mono_bold") or ("Consolas", 10, "bold")).pack(
                 side=tk.LEFT, padx=(0, 8))
 
         ttk.Button(row1, text="刷新 Refresh", width=12,
                    command=self._query_real_account).pack(side=tk.RIGHT, padx=4)
 
         # Live event log
-        self.live_log = scrolledtext.ScrolledText(live_frame, wrap=tk.WORD, font=("Consolas", 9),
-                                                   bg="#1a1a2e", fg="#e0e0e0",
-                                                   state=tk.DISABLED)
+        self.live_log = TagTextLog(
+            live_frame, tags=LOG_TAGS, show_toolbar=False,
+            bg=PALETTE["bg_inset"], fg=PALETTE["text"],
+            font=FONTS.get("mono_small") or ("Consolas", 9),
+        )
         self.live_log.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
-        self.live_log.tag_configure("entry", foreground="#4caf50")
-        self.live_log.tag_configure("exit", foreground="#f44336")
-        self.live_log.tag_configure("bar", foreground="#90caf9")
-        self.live_log.tag_configure("status", foreground="#ffc107")
 
         # Regime tab — status cards, external vote status (W2/W3/W4), and
         # the switching history grouped into regime episodes. Content is
@@ -1999,9 +2089,9 @@ class BacktestApp:
             main = tk.StringVar(value="—")
             sub = tk.StringVar(value="")
             main_lbl = ttk.Label(card, textvariable=main,
-                                 font=("Segoe UI", 11, "bold"))
+                                 font=FONTS.get("value") or ("Segoe UI", 11, "bold"))
             main_lbl.pack(anchor="w", padx=6, pady=(2, 0))
-            ttk.Label(card, textvariable=sub, foreground="#666666").pack(
+            ttk.Label(card, textvariable=sub, style="Dim.TLabel").pack(
                 anchor="w", padx=6, pady=(0, 4))
             self._regime_card_vars[key] = (main, sub, main_lbl)
 
@@ -2011,7 +2101,7 @@ class BacktestApp:
         self._votes_grid.pack(fill=tk.X, padx=6, pady=2)
         self.regime_consumed_var = tk.StringVar(value="")
         ttk.Label(votes_lf, textvariable=self.regime_consumed_var,
-                  foreground="#666666").pack(anchor="w", padx=6, pady=(0, 4))
+                  style="Dim.TLabel").pack(anchor="w", padx=6, pady=(0, 4))
 
         hist_lf = ttk.LabelFrame(regime_frame, text="切換紀錄 Switching Log")
         hist_lf.pack(fill=tk.BOTH, expand=True, padx=4, pady=(6, 4))
@@ -2034,15 +2124,8 @@ class BacktestApp:
         tree.pack(fill=tk.BOTH, expand=True)
         # Episode band colors keyed by leg; DAY rows dimmed (they carry
         # only P&L — no classification happens during the day session).
-        tree.tag_configure("ep_long", background="#e1f5ee",
-                           foreground="#04342c")
-        tree.tag_configure("ep_short", background="#faece7",
-                           foreground="#712b13")
-        tree.tag_configure("ep_idle", background="#f0f0f0",
-                           foreground="#555555")
-        tree.tag_configure("ep_unknown", background="#ececf4",
-                           foreground="#3c3489")
-        tree.tag_configure("day", foreground="#999999")
+        for tag_name, opts in EPISODE_TAGS.items():
+            tree.tag_configure(tag_name, **opts)
         self.regime_tree = tree
         self._regime_tab_frame = regime_frame
         self.results_notebook = notebook
@@ -2051,8 +2134,11 @@ class BacktestApp:
         # Log tab
         log_frame = ttk.Frame(notebook)
         notebook.add(log_frame, text="紀錄 Log")
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Consolas", 9),
-                                                    state=tk.DISABLED)
+        self.log_text = TagTextLog(
+            log_frame, levels=("info", "debug"), show_toolbar=True,
+            max_lines=5000,
+            font=FONTS.get("mono_small") or ("Consolas", 9),
+        )
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
     # ══════════════════════════════════════════════════════════════
@@ -2086,7 +2172,7 @@ class BacktestApp:
         max_tokens = self._settings.get("ai_max_tokens", 16384)
         self._chat_client = ChatClient(api_key, provider=provider, model=model, max_tokens=max_tokens)
         self._chat_client.set_system_prompt(STRATEGY_SYSTEM_PROMPT)
-        self.status_var.set(f"AI: {provider} / {model}")
+        self.set_status(f"AI: {provider} / {model}")
         return True
 
     def _on_chat_enter(self, event):
@@ -2108,7 +2194,7 @@ class BacktestApp:
 
         # Disable send while waiting
         self.btn_send.config(state=tk.DISABLED)
-        self._append_chat("system", "Thinking...")
+        self._append_chat("system", "Thinking...", transient=True)
 
         chat_model = model_for_tier(
             self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "light")
@@ -2139,8 +2225,14 @@ class BacktestApp:
         self.btn_send.config(state=tk.NORMAL)
         self.btn_generate.config(state=tk.NORMAL)
 
-    def _append_chat(self, role: str, text: str):
-        """Append a styled message to the chat display."""
+    def _append_chat(self, role: str, text: str, *, transient: bool = False):
+        """Append a styled message to the chat display.
+
+        Transient system lines (Thinking…, Generating code…, …) are
+        wrapped in a ``transient_start`` / ``transient_end`` mark pair so
+        ``_remove_last_system_line`` can delete by range instead of
+        searching the buffer.
+        """
         self.chat_display.config(state=tk.NORMAL)
 
         provider = self._settings.get("ai_provider", PROVIDER_ANTHROPIC)
@@ -2154,39 +2246,30 @@ class BacktestApp:
         }
         prefix = prefix_map.get(role, "")
 
+        if transient:
+            self.chat_display.mark_set("transient_start", tk.END)
+            self.chat_display.mark_gravity("transient_start", tk.LEFT)
         self.chat_display.insert(tk.END, prefix + text + "\n\n", role)
+        if transient:
+            self.chat_display.mark_set("transient_end", tk.END)
+            self.chat_display.mark_gravity("transient_end", tk.LEFT)
         self.chat_display.see(tk.END)
         self.chat_display.config(state=tk.DISABLED)
 
     def _remove_last_system_line(self):
-        """Remove the last system message (Thinking..., Generating code..., Recapping..., etc)."""
+        """Remove the last transient system line by its mark range."""
         self.chat_display.config(state=tk.NORMAL)
-        content = self.chat_display.get("1.0", tk.END)
-        # Search for known system message patterns (newest first)
-        markers = [
-            "Thinking...\n",
-            "Generating code...\n",
-            "正在回顧對話上下文 Recapping conversation context...\n",
-            "匯出中 Exporting to Pine Script...\n",
-        ]
-        idx = -1
-        marker_text = ""
-        for m in markers:
-            pos = content.rfind(m)
-            if pos > idx:
-                idx = pos
-                marker_text = m
-        if idx >= 0:
-            before = content[:idx]
-            line = before.count("\n") + 1
-            col = len(before) - before.rfind("\n") - 1
-            start = f"{line}.{col}"
-            end_idx = idx + len(marker_text) + 1  # +1 for trailing \n
-            after_before = content[:end_idx]
-            end_line = after_before.count("\n") + 1
-            end_col = len(after_before) - after_before.rfind("\n") - 1
-            end = f"{end_line}.{end_col}"
+        try:
+            start = self.chat_display.index("transient_start")
+            end = self.chat_display.index("transient_end")
             self.chat_display.delete(start, end)
+        except tk.TclError:
+            pass
+        try:
+            self.chat_display.mark_unset("transient_start")
+            self.chat_display.mark_unset("transient_end")
+        except tk.TclError:
+            pass
         self.chat_display.config(state=tk.DISABLED)
 
     def _generate_strategy(self):
@@ -2216,7 +2299,7 @@ class BacktestApp:
         self._append_chat("user", "Generate Strategy")
         self.btn_send.config(state=tk.DISABLED)
         self.btn_generate.config(state=tk.DISABLED)
-        self._append_chat("system", "Generating code...")
+        self._append_chat("system", "Generating code...", transient=True)
 
         # Use a one-shot API call (not the chat conversation) to avoid bloat
         client = self._chat_client
@@ -2296,7 +2379,8 @@ class BacktestApp:
             self._append_chat("error", "Auto-retry exhausted. Please fix manually and try again.")
             return
 
-        self._append_chat("system", f"Auto-retrying... ({retries_left} left)")
+        self._append_chat("system", f"Auto-retrying... ({retries_left} left)",
+                          transient=True)
         self.btn_send.config(state=tk.DISABLED)
         self.btn_generate.config(state=tk.DISABLED)
 
@@ -2337,7 +2421,7 @@ class BacktestApp:
         self.strategy_combo.config(values=list(STRATEGIES.keys()))
         self.strategy_var.set(name)
 
-        self.status_var.set(f"策略已載入 Strategy loaded: {strategy_cls.__name__}")
+        self.set_status(f"策略已載入 Strategy loaded: {strategy_cls.__name__}")
         self._append_chat("system",
                           f"策略已載入 Strategy loaded: **{strategy_cls.__name__}**\n"
                           f"已設為目前策略，可直接點選回測按鈕執行。\n"
@@ -2355,7 +2439,7 @@ class BacktestApp:
         if not self._ensure_chat_client():
             return
 
-        self.status_var.set("匯出中 Exporting to Pine Script...")
+        self.set_status("匯出中 Exporting to Pine Script...")
         self.btn_pine.config(state=tk.DISABLED)
 
         source = self._ai_strategy_source
@@ -2375,7 +2459,7 @@ class BacktestApp:
     def _show_pine_popup(self, pine_code: str):
         """Show Pine Script in a popup window with Copy button."""
         self._remove_last_system_line()
-        self.status_var.set("Pine Script 匯出完成 Export complete.")
+        self.set_status("Pine Script 匯出完成 Export complete.")
         self.btn_pine.config(state=tk.NORMAL)
 
         popup = tk.Toplevel(self.root)
@@ -2421,7 +2505,7 @@ class BacktestApp:
             return
 
         path = self._strategy_store.save(class_name, self._ai_strategy_source, desc)
-        self.status_var.set(f"策略已儲存 Strategy saved: {os.path.basename(path)}")
+        self.set_status(f"策略已儲存 Strategy saved: {os.path.basename(path)}")
         self._refresh_saved_combo()
 
     def _load_saved_strategies(self):
@@ -2451,7 +2535,7 @@ class BacktestApp:
         try:
             strategy_cls = load_strategy_from_source(source)
             self._on_strategy_generated(source, strategy_cls)
-            self.status_var.set(f"已載入策略 Loaded: {class_name}")
+            self.set_status(f"已載入策略 Loaded: {class_name}")
         except (CodeValidationError, CodeExecutionError) as e:
             self._append_chat("error", f"Failed to load {class_name}: {e}")
 
@@ -2463,7 +2547,7 @@ class BacktestApp:
         self._strategy_store.delete(class_name)
         self._refresh_saved_combo()
         self.saved_var.set("")
-        self.status_var.set(f"已刪除 Deleted: {class_name}")
+        self.set_status(f"已刪除 Deleted: {class_name}")
 
     def _import_strategy_file(self):
         """Pick a .py file, validate, and register it as a saved strategy.
@@ -2513,7 +2597,7 @@ class BacktestApp:
         self._refresh_saved_combo()
         self.saved_var.set(cls)
         self._load_saved_strategy()
-        self.status_var.set(f"已匯入 Imported: {cls} → {fname}")
+        self.set_status(f"已匯入 Imported: {cls} → {fname}")
 
     def _update_ultra_button(self) -> None:
         on = self._settings.get("ultra_mode", False)
@@ -2546,7 +2630,7 @@ class BacktestApp:
         self._settings["ultra_mode"] = new_state
         self._update_ultra_button()
         model = GOOGLE_MODEL_ULTRA if new_state else GOOGLE_MODEL_PRO
-        self.status_var.set(
+        self.set_status(
             f"Ultra Mode {'ON' if new_state else 'OFF'} (session only) — "
             f"heavy tier: {model}")
 
@@ -2640,7 +2724,7 @@ class BacktestApp:
                 self._chat_client.close()
                 self._chat_client = None
 
-            self.status_var.set(f"設定已儲存 Settings saved. Provider: {provider}")
+            self.set_status(f"設定已儲存 Settings saved. Provider: {provider}")
             dialog.destroy()
 
         ttk.Button(btn_frame, text="Save", width=10, command=_save).pack(side=tk.LEFT, padx=8)
@@ -2686,7 +2770,7 @@ class BacktestApp:
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(session, f, indent=2, ensure_ascii=False)
-        self.status_var.set(f"Chat saved: {os.path.basename(path)}")
+        self.set_status(f"Chat saved: {os.path.basename(path)}")
         _log(f"Chat session saved to {path}")
 
     def _load_chat_session(self):
@@ -2730,7 +2814,7 @@ class BacktestApp:
         self.chat_display.config(state=tk.DISABLED)
 
         n_msgs = len(self._chat_client.conversation)
-        self.status_var.set(f"已載入對話 Chat loaded: {os.path.basename(path)} ({n_msgs} msgs)")
+        self.set_status(f"已載入對話 Chat loaded: {os.path.basename(path)} ({n_msgs} msgs)")
         _log(f"Chat session loaded from {path} ({n_msgs} messages)")
 
         # Ask AI to summarize its understanding of the conversation
@@ -2756,7 +2840,8 @@ class BacktestApp:
             )
             return
 
-        self._append_chat("system", "正在回顧對話上下文 Recapping conversation context...")
+        self._append_chat("system", "正在回顧對話上下文 Recapping conversation context...",
+                          transient=True)
         self.btn_send.config(state=tk.DISABLED)
 
         recap_model = model_for_tier(
@@ -2792,7 +2877,7 @@ class BacktestApp:
     def _on_recap_error(self, err: str):
         """Handle recap error — not critical, just log it."""
         self._remove_last_system_line()
-        self.status_var.set(f"Context recap failed: {err}")
+        self.set_status(f"Context recap failed: {err}", "error")
         self.btn_send.config(state=tk.NORMAL)
 
     _AUTO_CHAT_PATH = os.path.join("data", "chats", "_last_session.json")
@@ -2896,12 +2981,12 @@ class BacktestApp:
         if release is None:
             # No startup result yet (offline, or check still running) — probe
             # once synchronously so the manual button always does something.
-            self.status_var.set("檢查更新中 Checking for updates...")
+            self.set_status("檢查更新中 Checking for updates...")
             try:
                 release = updater.get_latest_release()
             except Exception:
                 release = None
-            self.status_var.set("就緒 Ready")
+            self.set_status("就緒 Ready")
             if release is None:
                 messagebox.showinfo(
                     "更新 Update",
@@ -3003,10 +3088,6 @@ class BacktestApp:
         self.end_var.set(datetime.now().strftime("%Y%m%d"))
         self.start_var.set((datetime.now() - timedelta(days=days)).strftime("%Y%m%d"))
 
-    def _on_strategy_changed(self, *_args):
-        """Update UI when strategy selection changes."""
-        pass
-
     def _reflow_toolbar(self, event) -> None:
         """Re-grid toolbar buttons so they wrap when the frame is narrow.
 
@@ -3074,8 +3155,9 @@ class BacktestApp:
         win.title(f"原始碼 — {name}")
         win.geometry("800x600")
         text = scrolledtext.ScrolledText(
-            win, wrap=tk.NONE, font=("Consolas", 10),
-            bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+            win, wrap=tk.NONE, font=FONTS.get("mono") or ("Consolas", 10),
+            bg=PALETTE["bg_inset"], fg=PALETTE["text"],
+            insertbackground=PALETTE["text"],
         )
         text.pack(fill=tk.BOTH, expand=True)
         text.insert(tk.END, f"# {filepath}\n\n{source}")
@@ -3134,7 +3216,7 @@ class BacktestApp:
                 skC.SKCenterLib_SetAuthority(authority_flag)
 
             _log(f"登入中 Logging in as {_redact_acct(user_id)}...")
-            self.status_var.set("登入中 Logging in...")
+            self.set_status("登入中 Logging in...")
             self.login_status_var.set("登入中...")
 
             code = skC.SKCenterLib_LoginSetQuote(user_id, password, "Y")
@@ -3144,7 +3226,7 @@ class BacktestApp:
                 if code == 1097:
                     _log("提示: 請確認已安裝群益API憑證 (從券商網站下載安裝)")
                     _log("Hint: Ensure Capital API certificate is installed (download from broker website)")
-                self.status_var.set(f"登入失敗 Login failed: {msg}")
+                self.set_status(f"登入失敗 Login failed: {msg}", "error")
                 self.login_status_var.set(f"登入失敗 {msg}")
                 self.btn_login.config(state=tk.NORMAL)
                 self._pending_api_fetch = False
@@ -3168,12 +3250,12 @@ class BacktestApp:
                 except Exception as e:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
 
-            self.status_var.set("連線中 Connecting...")
+            self.set_status("連線中 Connecting...")
             self.root.after(3000, self._check_connection)
 
         except Exception as e:
             _log(f"初始化錯誤 Init error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
-            self.status_var.set(f"錯誤 Error: {e}")
+            self.set_status(f"錯誤 Error: {e}", "error")
             self.login_status_var.set(f"錯誤 Error")
             self.btn_login.config(state=tk.NORMAL)
             self._pending_api_fetch = False
@@ -3187,7 +3269,8 @@ class BacktestApp:
                 self.btn_api.config(state=tk.NORMAL)
                 self.btn_deploy.config(state=tk.NORMAL)
                 self.btn_login.config(state=tk.DISABLED)
-                self.status_var.set("已連線 Connected - Ready")
+                self.set_status("已連線 Connected - Ready", "ok")
+                self._set_conn_dot("ok")
                 self.login_status_var.set("已連線 Connected")
                 if self._pending_api_fetch:
                     self._pending_api_fetch = False
@@ -3204,7 +3287,7 @@ class BacktestApp:
         self._data_source = "API"
 
         if not self._quote_connected:
-            self.status_var.set("請先登入 Please login first")
+            self.set_status("請先登入 Please login first")
             self.login_status_var.set("請先登入 Login required")
             return
 
@@ -3225,7 +3308,7 @@ class BacktestApp:
             chunks = self._fetcher.start_api_fetch(
                 symbol, kline_type, minute_num, start_date, end_date)
         except ValueError:
-            self.status_var.set("日期格式錯誤 Date format error (YYYYMMDD)")
+            self.set_status("日期格式錯誤 Date format error (YYYYMMDD)")
             return
 
         self._disable_buttons()
@@ -3252,7 +3335,7 @@ class BacktestApp:
 
         n = chunk.chunk_index + 1
         total = chunk.total_chunks
-        self.status_var.set(f"查詢中 Fetching chunk {n}/{total}: {chunk.start_date}~{chunk.end_date}")
+        self.set_status(f"查詢中 Fetching chunk {n}/{total}: {chunk.start_date}~{chunk.end_date}")
         sym = self._fetcher.symbol
         sym_note = f" (via {chunk.kline_symbol})" if chunk.kline_symbol != sym else ""
         _log(f"請求K線 [{n}/{total}] {sym}{sym_note} type={chunk.kline_type} "
@@ -3268,7 +3351,7 @@ class BacktestApp:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"請求結果 Result: code={code} {msg}")
                 if code >= 3000:
-                    self.status_var.set(f"錯誤 Error: {msg}")
+                    self.set_status(f"錯誤 Error: {msg}", "error")
                     self._enable_buttons()
                     cb = self._consume_evo_fetch_cb()
                     if cb:
@@ -3286,13 +3369,13 @@ class BacktestApp:
         """Fetch daily bars from TAIFEX public API (no account needed)."""
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
-            self.status_var.set("請選擇策略 Select a strategy")
+            self.set_status("請選擇策略 Select a strategy")
             return
 
         symbol = self.symbol_var.get().strip()
         cfg = SYMBOL_CONFIG.get(symbol)
         if not cfg or "taifex_id" not in cfg:
-            self.status_var.set(f"TAIFEX不支援此商品 Unsupported symbol: {symbol}")
+            self.set_status(f"TAIFEX不支援此商品 Unsupported symbol: {symbol}")
             return
 
         commodity_id = cfg["taifex_id"]
@@ -3318,7 +3401,7 @@ class BacktestApp:
             start_date = datetime.strptime(start_str, "%Y%m%d").date()
             end_date = datetime.strptime(end_str, "%Y%m%d").date()
         except ValueError:
-            self.status_var.set("日期格式錯誤 Invalid date format (YYYYMMDD)")
+            self.set_status("日期格式錯誤 Invalid date format (YYYYMMDD)")
             return
 
         # Reuse in-memory bars if same source + symbol
@@ -3342,14 +3425,14 @@ class BacktestApp:
 
         # Fetch from TAIFEX API in background thread
         self._disable_buttons()
-        self.status_var.set(f"從TAIFEX下載中... Downloading from TAIFEX ({start_date} ~ {end_date})")
+        self.set_status(f"從TAIFEX下載中... Downloading from TAIFEX ({start_date} ~ {end_date})")
         _log(f"開始下載TAIFEX資料 Fetching {commodity_id} from {start_date} to {end_date}")
 
         def _fetch():
             try:
                 def _progress(cur, total):
                     self.root.after(0, lambda c=cur, t=total:
-                        self.status_var.set(f"TAIFEX下載中 {c}/{t} chunks..."))
+                        self.set_status(f"TAIFEX下載中 {c}/{t} chunks..."))
 
                 bars = fetch_futures_daily(
                     commodity_id, start_date, end_date,
@@ -3359,7 +3442,7 @@ class BacktestApp:
 
                 def _done():
                     if not bars:
-                        self.status_var.set("TAIFEX無資料 No data returned")
+                        self.set_status("TAIFEX無資料 No data returned")
                         self._enable_buttons()
                         return
                     # Save to cache (merge with existing)
@@ -3380,7 +3463,7 @@ class BacktestApp:
             except Exception as e:
                 self.root.after(0, lambda: [
                     _log(f"TAIFEX錯誤 Error: {e}"),
-                    self.status_var.set(f"TAIFEX錯誤: {e}"),
+                    self.set_status(f"TAIFEX錯誤: {e}", "error"),
                     self._enable_buttons(),
                 ])
 
@@ -3390,7 +3473,7 @@ class BacktestApp:
         """Use TradingView data: local CSV first, re-use in-memory, or download live."""
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
-            self.status_var.set("請選擇策略 Select a strategy")
+            self.set_status("請選擇策略 Select a strategy")
             return
 
         # Fast re-run: reuse TV bars already in memory (e.g. date range change)
@@ -3409,7 +3492,7 @@ class BacktestApp:
             self._fetch_tradingview_live()
             return
 
-        self.status_var.set("無資料 No local CSV and tvDatafeed not installed.")
+        self.set_status("無資料 No local CSV and tvDatafeed not installed.")
         self._enable_buttons()
 
 
@@ -3423,7 +3506,7 @@ class BacktestApp:
         km = strategy_cls.kline_minute
         tv_interval_name = TV_INTERVALS.get((kt, km))
         if not tv_interval_name:
-            self.status_var.set(f"TradingView不支援此週期 Unsupported interval: type={kt} min={km}")
+            self.set_status(f"TradingView不支援此週期 Unsupported interval: type={kt} min={km}")
             self._enable_buttons()
             return
 
@@ -3434,23 +3517,35 @@ class BacktestApp:
 
         self._data_source = "TradingView (live)"
         self._disable_buttons()
-        self.status_var.set(f"從TradingView下載 Fetching from TradingView: {tv_symbol} {tv_interval_name}...")
-        self.root.update()
+        self.set_status(f"從TradingView下載 Fetching from TradingView: {tv_symbol} {tv_interval_name}...")
 
         _log(f"TradingView下載 Fetching {tv_symbol}@TAIFEX interval={tv_interval_name} n_bars=5000")
 
-        df, err = fetch_tv_dataframe(tv_symbol, "TAIFEX", tv_interval)
+        def _tv_worker():
+            try:
+                df, err = fetch_tv_dataframe(tv_symbol, "TAIFEX", tv_interval)
+                self.root.after(
+                    0, lambda d=df, e=err: self._on_tv_fetch_done(
+                        d, e, tv_symbol, interval))
+            except Exception as exc:
+                tb = traceback.format_exc()
+                self.root.after(
+                    0, lambda err=exc, tb=tb: self._on_tv_fetch_error(err, tb))
+
+        threading.Thread(target=_tv_worker, daemon=True).start()
+
+    def _on_tv_fetch_done(self, df, err, tv_symbol, interval):
+        """Apply a completed TradingView fetch on the Tk thread."""
         if err:
             _log(f"TradingView錯誤 {err.message}")
-            self.status_var.set(f"TradingView錯誤 {err.message}")
+            self.set_status(f"TradingView錯誤 {err.message}", "error")
             self._enable_buttons()
             return
-
         try:
             result = tv_dataframe_to_bars(df, symbol=tv_symbol, interval=interval)
             if not result.ok:
                 _log(f"TradingView無資料 {result.error}")
-                self.status_var.set("TradingView無資料 No data")
+                self.set_status("TradingView無資料 No data")
                 self._enable_buttons()
                 return
 
@@ -3462,9 +3557,12 @@ class BacktestApp:
             self._execute_backtest(bars)
 
         except Exception as e:
-            _log(f"TradingView錯誤 TV error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
-            self.status_var.set(f"TradingView錯誤: {e}")
-            self._enable_buttons()
+            self._on_tv_fetch_error(e, traceback.format_exc())
+
+    def _on_tv_fetch_error(self, error, tb):
+        _log(f"TradingView錯誤 TV error: [{type(error).__name__}] {error}\n{tb}")
+        self.set_status(f"TradingView錯誤: {error}", "error")
+        self._enable_buttons()
 
     # ── Backtest execution ──
 
@@ -3501,7 +3599,7 @@ class BacktestApp:
 
     def _execute_backtest(self, bars: list[Bar]):
         if not bars:
-            self.status_var.set("無資料 No data")
+            self.set_status("無資料 No data")
             self._enable_buttons()
             return
 
@@ -3540,7 +3638,7 @@ class BacktestApp:
                     f"是否繼續回測？Continue with available data?",
                 )
                 if not ok:
-                    self.status_var.set("已取消 Cancelled")
+                    self.set_status("已取消 Cancelled")
                     self._enable_buttons()
                     return
                 # Update date fields so re-run won't show popup again
@@ -3548,7 +3646,7 @@ class BacktestApp:
                 self.end_var.set(actual_end)
 
         if not bars:
-            self.status_var.set("篩選後無資料 No data after date filter")
+            self.set_status("篩選後無資料 No data after date filter")
             self._enable_buttons()
             return
 
@@ -3557,13 +3655,13 @@ class BacktestApp:
             point_value = int(self.pv_var.get())
             initial_balance = int(self.balance_var.get())
         except ValueError as e:
-            self.status_var.set(f"參數錯誤 Param error: {e}")
+            self.set_status(f"參數錯誤 Param error: {e}", "error")
             self._enable_buttons()
             return
 
         strategy_cls = STRATEGIES.get(self.strategy_var.get())
         if not strategy_cls:
-            self.status_var.set("請選擇策略 Select a strategy")
+            self.set_status("請選擇策略 Select a strategy")
             self._enable_buttons()
             return
 
@@ -3580,7 +3678,7 @@ class BacktestApp:
 
         _log(f"開始回測 Running backtest: {len(bars)} bars, "
              f"balance={initial_balance:,}, point_value={point_value}")
-        self.status_var.set("回測中 Running backtest...")
+        self.set_status("回測中 Running backtest...")
 
         def _backtest_worker():
             try:
@@ -3602,6 +3700,7 @@ class BacktestApp:
 
         self._last_result = result
         self._last_bars = bars
+        self._rendered_trade_count = 0
         self._display_results(result, bars)
 
         self._enable_buttons()
@@ -3611,7 +3710,7 @@ class BacktestApp:
             self.btn_evolution.config(state=tk.NORMAL)
         if _LWC_AVAILABLE and result.trades:
             self.btn_chart_all.config(state=tk.NORMAL)
-        self.status_var.set(
+        self.set_status(
             f"完成 Done: {result.metrics.total_trades} trades, "
             f"win rate {result.metrics.win_rate * 100:.1f}%, "
             f"P&L {result.metrics.total_pnl:+,}")
@@ -3619,7 +3718,7 @@ class BacktestApp:
     def _on_backtest_error(self, error, tb):
         """Handle backtest error on the main thread."""
         _log(f"回測錯誤 Backtest error:\n{tb}")
-        self.status_var.set(f"回測錯誤 Backtest error: {error}")
+        self.set_status(f"回測錯誤 Backtest error: {error}", "error")
         self._append_chat("error", f"Backtest runtime error:\n{error}")
         self._enable_buttons()
 
@@ -3631,24 +3730,52 @@ class BacktestApp:
         if result is not None:
             self._display_results(result, self._last_bars)
 
-    _TONE_COLORS = {"good": "#0f6e56", "bad": "#a32d2d"}
-
     def _report_card(self, parent, metric) -> None:
         """One headline metric card (label / big value / sub line)."""
-        card = tk.Frame(parent, bg="#f7f7f5", highlightbackground="#dcdcd7",
-                        highlightthickness=1)
+        card = ttk.Frame(parent, style="Card.TFrame")
         card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-        tk.Label(card, text=metric.label, bg="#f7f7f5", fg="#666666",
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(5, 0))
-        tk.Label(card, text=metric.value, bg="#f7f7f5",
-                 fg=self._TONE_COLORS.get(metric.tone, "#222222"),
-                 font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=8)
-        tk.Label(card, text=metric.sub or " ", bg="#f7f7f5", fg="#999999",
-                 font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(0, 5))
+        ttk.Label(card, text=metric.label, style="Dim.TLabel").pack(
+            anchor="w", padx=8, pady=(5, 0))
+        value_style = "CardValue.TLabel"
+        value_fg = TONE.get(metric.tone, PALETTE["text"])
+        ttk.Label(card, text=metric.value, style=value_style,
+                  font=FONTS.get("title") or ("Segoe UI", 14, "bold"),
+                  foreground=value_fg).pack(anchor="w", padx=8)
+        ttk.Label(card, text=metric.sub or " ", style="Dim.TLabel").pack(
+            anchor="w", padx=8, pady=(0, 5))
 
     def _render_report_view(self, title, metrics, trades, regime_info,
                             header_lines, message=None,
                             real_panel=True) -> None:
+        """Throttle + coalesce Report-tab rebuilds to at most once per second."""
+        self._report_render_latest = (
+            title, metrics, trades, regime_info, header_lines, message, real_panel)
+        now = time.monotonic()
+        elapsed = now - getattr(self, "_report_render_last", 0.0)
+        if elapsed >= 1.0:
+            self._flush_report_render()
+            return
+        if getattr(self, "_report_render_pending", False):
+            return
+        self._report_render_pending = True
+        delay_ms = max(1, int((1.0 - elapsed) * 1000))
+        self.root.after(delay_ms, self._flush_report_render)
+
+    def _flush_report_render(self) -> None:
+        self._report_render_pending = False
+        payload = getattr(self, "_report_render_latest", None)
+        if payload is None:
+            return
+        self._report_render_last = time.monotonic()
+        (title, metrics, trades, regime_info,
+         header_lines, message, real_panel) = payload
+        self._render_report_view_now(
+            title, metrics, trades, regime_info, header_lines,
+            message=message, real_panel=real_panel)
+
+    def _render_report_view_now(self, title, metrics, trades, regime_info,
+                               header_lines, message=None,
+                               real_panel=True) -> None:
         """Rebuild the Report tab body: headline cards, detail sections,
         real-order subset, per-strategy breakdown. Rendering only — the
         numbers come from src/backtest/report_view.py. ``message`` shows
@@ -3661,20 +3788,22 @@ class BacktestApp:
 
         if header_lines:
             ttk.Label(body, text="\n".join(header_lines),
-                      foreground="#666666", font=("Consolas", 9)).pack(
+                      style="Dim.TLabel",
+                      font=FONTS.get("mono_small") or ("Consolas", 9)).pack(
                 anchor="w", padx=6, pady=(4, 0))
-        ttk.Label(body, text=title, font=("Segoe UI", 12, "bold")).pack(
+        ttk.Label(body, text=title,
+                  font=FONTS.get("section") or ("Segoe UI", 12, "bold")).pack(
             anchor="w", padx=6, pady=(6, 0))
         if regime_info:
             ttk.Label(
-                body, foreground="#666666",
+                body, style="Dim.TLabel",
                 text=f"做多 Long: {regime_info['long']} | "
                      f"做空 Short: {regime_info['short']} | "
                      f"現行 Active: {regime_info['active_label']}"
                      f" ({regime_info['active_strategy']})").pack(
                 anchor="w", padx=6)
         if message:
-            ttk.Label(body, text=message, foreground="#666666").pack(
+            ttk.Label(body, text=message, style="Dim.TLabel").pack(
                 anchor="w", padx=6, pady=8)
             return
 
@@ -3690,13 +3819,12 @@ class BacktestApp:
             lf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
             lf.columnconfigure(1, weight=1)
             for r, m in enumerate(section_rows):
-                ttk.Label(lf, text=m.label, foreground="#666666").grid(
+                ttk.Label(lf, text=m.label, style="Dim.TLabel").grid(
                     row=r, column=0, sticky="w", padx=(8, 16), pady=1)
                 value_lbl = ttk.Label(lf, text=m.value,
-                                      font=("Consolas", 10))
-                if m.tone in self._TONE_COLORS:
-                    value_lbl.configure(
-                        foreground=self._TONE_COLORS[m.tone])
+                                      font=FONTS.get("mono") or ("Consolas", 10))
+                if m.tone in TONE:
+                    value_lbl.configure(foreground=TONE[m.tone])
                 value_lbl.grid(row=r, column=1, sticky="e",
                                padx=(0, 8), pady=1)
 
@@ -3710,7 +3838,7 @@ class BacktestApp:
             real_row.pack(fill=tk.X, padx=4, pady=4)
             for card in cards:
                 self._report_card(real_row, card)
-            ttk.Label(lf, foreground="#999999",
+            ttk.Label(lf, style="Dim.TLabel",
                       text="(上方總計為模擬全視圖 totals above = simulated "
                            "view, all trades)").pack(
                 anchor="w", padx=8, pady=(0, 4))
@@ -3728,8 +3856,8 @@ class BacktestApp:
                     ("pnl", "損益 P&L", 110, "e", False)):
                 tv.heading(cid, text=text)
                 tv.column(cid, width=width, anchor=anchor, stretch=stretch)
-            tv.tag_configure("pos", foreground="#0f6e56")
-            tv.tag_configure("neg", foreground="#a32d2d")
+            tv.tag_configure("pos", foreground=TONE["good"])
+            tv.tag_configure("neg", foreground=TONE["bad"])
             for name, n, wr, pnl in ps:
                 tag = "pos" if pnl > 0 else ("neg" if pnl < 0 else "")
                 tv.insert("", "end", values=(name, n, wr, f"{pnl:+,}"),
@@ -3811,48 +3939,57 @@ class BacktestApp:
             self._render_report_view(report_title, result.metrics,
                                      result.trades, regime_info, header_lines)
 
-        # Trade list
-        for item in self.trade_tree.get_children():
-            self.trade_tree.delete(item)
-        for i, t in enumerate(result.trades, 1):
-            bars_held = t.exit_bar_index - t.entry_bar_index
-            pnl_str = f"{t.pnl:+,}"
-            row_tag = "win" if t.pnl > 0 else "loss"
+        # Trade list — incremental insert on live updates; full rebuild
+        # when a backtest replaces the list or a column sort is active.
+        is_live = bool(self._live_runner and self._live_runner.state != LiveState.IDLE)
+        watermark = getattr(self, "_rendered_trade_count", 0)
+        can_incremental = (
+            is_live
+            and self._trade_sort_col is None
+            and watermark > 0
+            and watermark <= len(result.trades)
+        )
+        if not can_incremental:
+            for item in self.trade_tree.get_children():
+                self.trade_tree.delete(item)
+            start = 0
+        else:
+            start = watermark
+        for i, t in enumerate(result.trades[start:], start + 1):
+            self._insert_trade_row(i, t, bars)
+        self._rendered_trade_count = len(result.trades)
 
-            # Prefer stored datetimes; fall back to bar index lookup
-            entry_dt = t.entry_dt or ""
-            exit_dt = t.exit_dt or ""
-            if not entry_dt and bars and 0 <= t.entry_bar_index < len(bars):
-                entry_dt = bars[t.entry_bar_index].dt.strftime("%Y-%m-%d %H:%M")
-            if not exit_dt and bars and 0 <= t.exit_bar_index < len(bars):
-                exit_dt = bars[t.exit_bar_index].dt.strftime("%Y-%m-%d %H:%M")
-
-            # Real entry/exit prices from real-order fill confirmation.
-            # "--" for paper mode, force-closes, and race-dropped fills
-            # so they're visually distinct from valid zero prices.
-            real_entry_str = (f"{t.real_entry_price:,}"
-                              if t.real_entry_price > 0 else "--")
-            real_exit_str = (f"{t.real_exit_price:,}"
-                             if getattr(t, "real_exit_price", 0) > 0 else "--")
-
-            source_str = _SOURCE_LABELS.get(getattr(t, "source", ""), "--")
-
-            self.trade_tree.insert("", tk.END, values=(
-                i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
-                real_entry_str,
-                exit_dt, f"{t.exit_price:,}", real_exit_str,
-                pnl_str, bars_held,
-                source_str,
-                getattr(t, "strategy", "") or "--",
-            ), tags=(row_tag,))
-
-        self.trade_tree.tag_configure("win", foreground="green")
-        self.trade_tree.tag_configure("loss", foreground="red")
+        self.trade_tree.tag_configure("win", foreground=TONE["good"])
+        self.trade_tree.tag_configure("loss", foreground=TONE["bad"])
 
         if self._live_runner and self._live_runner.state != LiveState.IDLE:
             _log(f"即時結果更新 Live results: {result.metrics.total_trades} trades")
         else:
             _log(f"回測完成 Backtest complete: {result.metrics.total_trades} trades")
+
+    def _insert_trade_row(self, i, t, bars) -> None:
+        bars_held = t.exit_bar_index - t.entry_bar_index
+        pnl_str = f"{t.pnl:+,}"
+        row_tag = "win" if t.pnl > 0 else "loss"
+        entry_dt = t.entry_dt or ""
+        exit_dt = t.exit_dt or ""
+        if not entry_dt and bars and 0 <= t.entry_bar_index < len(bars):
+            entry_dt = bars[t.entry_bar_index].dt.strftime("%Y-%m-%d %H:%M")
+        if not exit_dt and bars and 0 <= t.exit_bar_index < len(bars):
+            exit_dt = bars[t.exit_bar_index].dt.strftime("%Y-%m-%d %H:%M")
+        real_entry_str = (f"{t.real_entry_price:,}"
+                          if t.real_entry_price > 0 else "--")
+        real_exit_str = (f"{t.real_exit_price:,}"
+                         if getattr(t, "real_exit_price", 0) > 0 else "--")
+        source_str = _SOURCE_LABELS.get(getattr(t, "source", ""), "--")
+        self.trade_tree.insert("", tk.END, values=(
+            i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
+            real_entry_str,
+            exit_dt, f"{t.exit_price:,}", real_exit_str,
+            pnl_str, bars_held,
+            source_str,
+            getattr(t, "strategy", "") or "--",
+        ), tags=(row_tag,))
 
     def _regime_report_info(self) -> dict | None:
         """Return the regime header dict when the live runner is a
@@ -3942,21 +4079,21 @@ class BacktestApp:
         for w in self._votes_grid.winfo_children():
             w.destroy()
         ttk.Label(self._votes_grid, text=f"今晚 tonight → {tonight}",
-                  foreground="#666666").grid(
+                  style="Dim.TLabel").grid(
             row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
         for i, st in enumerate(report.sources, start=1):
             if not st.known:
-                dot_color = "#9e9e9e"     # liveness unknown
+                dot_state = "off"
             elif st.stale:
-                dot_color = "#c62828"     # bridge looks dead
+                dot_state = "err"
             else:
-                dot_color = "#2e7d32"     # fresh
-            ttk.Label(self._votes_grid, text=f"● {st.label}",
-                      foreground=dot_color).grid(
-                row=i, column=0, sticky="w", padx=(0, 12))
+                dot_state = "ok"
+            dot = StatusDot(self._votes_grid, text=st.label)
+            dot.set_state(dot_state)
+            dot.grid(row=i, column=0, sticky="w", padx=(0, 12))
             chip = vote_chip(st)
-            chip_color = {"trending-up": "#0f6e56",
-                          "trending-down": "#993c1d"}.get(st.vote, "#666666")
+            chip_color = {"trending-up": TONE["good"],
+                          "trending-down": TONE["bad"]}.get(st.vote, PALETTE["text_dim"])
             ttk.Label(self._votes_grid, text=chip,
                       foreground=chip_color).grid(
                 row=i, column=1, sticky="w", padx=(0, 12))
@@ -3964,11 +4101,11 @@ class BacktestApp:
             if st.stale:
                 ctx = f"⚠ 停滯 stale — {ctx}" if ctx else "⚠ 停滯 stale"
             ttk.Label(self._votes_grid, text=ctx,
-                      foreground="#666666").grid(
+                      style="Dim.TLabel").grid(
                 row=i, column=2, sticky="w", padx=(0, 12))
             ttk.Label(self._votes_grid,
                       text=st.last_check.replace("T", " ")[:16],
-                      foreground="#999999").grid(row=i, column=3, sticky="e")
+                      style="Dim.TLabel").grid(row=i, column=3, sticky="e")
         self._votes_grid.columnconfigure(2, weight=1)
 
         # ── state json → cards + consumed-votes audit line ──
@@ -4055,7 +4192,7 @@ class BacktestApp:
         active_main.set(regime_info["active_label"])
         active_sub.set(regime_info["active_strategy"])
         active_lbl.configure(foreground={
-            "做多 Long": "#0f6e56", "做空 Short": "#993c1d"}.get(
+            "做多 Long": TONE["good"], "做空 Short": TONE["bad"]}.get(
             regime_info["active_label"], ""))
 
         feat = state.get("last_features") or {}
@@ -4158,6 +4295,9 @@ class BacktestApp:
         for c, text in col_texts.items():
             display = text + arrow if c == col else text
             self.trade_tree.heading(c, text=display)
+        # Next live update must full-rebuild so newly inserted rows pick up
+        # the active sort instead of appending out of order.
+        self._rendered_trade_count = 0
 
     def _chart_kwargs(self) -> dict:
         return dict(bb_period=20, bb_std=2.0)
@@ -4212,10 +4352,10 @@ class BacktestApp:
                           focus_trade_index=focus, **kwargs)
             _log("[CHART] Chart closed normally")
         except ImportError as e:
-            self.root.after(0, lambda: self.status_var.set(str(e)))
+            self.root.after(0, lambda: self.set_status(str(e), "error"))
             _log(f"圖表錯誤 Chart error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
         except Exception as e:
-            self.root.after(0, lambda: self.status_var.set(f"圖表錯誤 Chart error: {e}"))
+            self.root.after(0, lambda: self.set_status(f"圖表錯誤 Chart error: {e}", "error"))
             _log(f"圖表錯誤 Chart error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
 
     def _show_live_chart(self):
@@ -4318,7 +4458,7 @@ class BacktestApp:
             initialfile=f"backtest_trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
         if path:
             export_trades_csv(result.trades, path)
-            self.status_var.set(f"已匯出 Exported: {path}")
+            self.set_status(f"已匯出 Exported: {path}")
             _log(f"匯出交易 Exported trades to {path}")
 
     # Threshold (characters) above which AI Review switches from a single-shot
@@ -4403,7 +4543,7 @@ class BacktestApp:
         """
         payload = self._gather_analysis_payload()
         if payload is None:
-            self.status_var.set("無交易紀錄 No trades to review")
+            self.set_status("無交易紀錄 No trades to review")
             return
         if not self._ensure_chat_client():
             return
@@ -4562,7 +4702,8 @@ class BacktestApp:
 
         self._append_chat("user", label + "\n" + context)
         self.btn_send.config(state=tk.DISABLED)
-        self._append_chat("system", f"Analyzing {total_trades} trades...")
+        self._append_chat("system", f"Analyzing {total_trades} trades...",
+                          transient=True)
 
         review_model = model_for_tier(
             self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
@@ -4690,7 +4831,7 @@ class BacktestApp:
                     self.root.after(
                         0,
                         lambda b=batch_idx, k=K:
-                            self.status_var.set(f"AI Review: sending part {b}/{k}...")
+                            self.set_status(f"AI Review: sending part {b}/{k}...")
                     )
 
                     response = self._chat_client.send_message(
@@ -4752,7 +4893,7 @@ class BacktestApp:
         if payload is None:
             msg = ("🧬 EVO: 無交易紀錄，演化引擎無資料可分析。"
                    "No trades recorded — evolution has no data to analyze.")
-            self.status_var.set("無交易紀錄 No trades for evolution")
+            self.set_status("無交易紀錄 No trades for evolution")
             if auto_run:
                 self._append_chat("system", msg)
                 if _discord is not None and _discord.enabled:
@@ -4837,7 +4978,7 @@ class BacktestApp:
                    f"trades are inside the {holdout_days}d holdout. "
                    f"The bot needs to run for >{holdout_days} days before "
                    f"trades age into the design window for AI analysis.")
-            self.status_var.set(
+            self.set_status(
                 "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
                 "yet — session younger than the holdout.")
             if auto_run:
@@ -5402,7 +5543,7 @@ class BacktestApp:
                         baseline_res, candidate_res, verdict, data_desc, saved_as)
                 ui(self._remove_last_system_line)
                 ui(self._append_chat, "system", block)
-                ui(self.status_var.set,
+                ui(self.set_status,
                    f"🧬 EVO {'PASS — saved ' + saved_as if verdict.passed else 'FAIL — candidate rejected'}")
                 # Verdict goes to Discord from BOTH manual and weekly-auto
                 # runs (manual too, per user: testing + visibility).
@@ -5521,40 +5662,10 @@ class BacktestApp:
         dlg.transient(self.root)
         dlg.grab_set()
 
-        # Scrollable body: Canvas + Scrollbar + inner Frame.
-        # The regime-switching section expands inline, so the content can grow
-        # taller than the window — this lets the user scroll to reach every field.
-        _outer = ttk.Frame(dlg)
+        # Scrollable body: blessed ScrollableFrame (unbinds wheel on destroy).
+        _outer = ScrollableFrame(dlg)
         _outer.pack(fill=tk.BOTH, expand=True)
-        _canvas = tk.Canvas(_outer, highlightthickness=0)
-        _vscroll = ttk.Scrollbar(_outer, orient="vertical", command=_canvas.yview)
-        _canvas.configure(yscrollcommand=_vscroll.set)
-        _vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        _canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        content = ttk.Frame(_canvas)
-        _content_id = _canvas.create_window((0, 0), window=content, anchor="nw")
-
-        def _on_content_config(_event=None):
-            _canvas.configure(scrollregion=_canvas.bbox("all"))
-        content.bind("<Configure>", _on_content_config)
-
-        def _on_canvas_config(event):
-            # Keep the inner frame as wide as the canvas so pack fill=X works.
-            _canvas.itemconfigure(_content_id, width=event.width)
-        _canvas.bind("<Configure>", _on_canvas_config)
-
-        def _on_mousewheel(event):
-            _canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _bind_wheel(_event=None):
-            _canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        def _unbind_wheel(_event=None):
-            _canvas.unbind_all("<MouseWheel>")
-        _canvas.bind("<Enter>", _bind_wheel)
-        _canvas.bind("<Leave>", _unbind_wheel)
-        dlg.bind("<Destroy>", lambda e: _unbind_wheel() if e.widget is dlg else None)
+        content = _outer.body
 
         result = [None]  # mutable container for return value
 
@@ -5827,7 +5938,7 @@ class BacktestApp:
             _toggle_news_widgets()
             # Content height changed — refresh the scroll region so the newly
             # revealed dropdowns are reachable.
-            _canvas.after_idle(_on_content_config)
+            _outer.canvas.after_idle(_outer._on_body_configure)
 
         ttk.Checkbutton(regime_lf, variable=regime_var,
                         text="啟用多空切換 Enable Regime Switching",
@@ -5875,7 +5986,7 @@ class BacktestApp:
     def _deploy_live(self):
         """Start live bot: create runner, fetch warmup, subscribe to ticks."""
         if not self._quote_connected and not _tv_available:
-            self.status_var.set("請先登入 Please login first")
+            self.set_status("請先登入 Please login first")
             self.login_status_var.set("請先登入 Login required")
             return
 
@@ -6040,7 +6151,7 @@ class BacktestApp:
             # Re-read strategy after potential update from session
             strategy_cls = STRATEGIES.get(self.strategy_var.get())
             if not strategy_cls:
-                self.status_var.set("請選擇策略 Select a strategy")
+                self.set_status("請選擇策略 Select a strategy")
                 return False
 
         # Check for lock conflict (another instance using the same bot name)
@@ -6056,56 +6167,73 @@ class BacktestApp:
             )
             return False
 
+        def _after_oi_wait() -> bool:
+            if (trading_mode in ("semi_auto", "auto") and self._futures_account
+                    and not self._account_monitor.oi_snapshot_received):
+                _log(
+                    "持倉查詢逾時 Position snapshot not received within "
+                    f"{OI_SNAPSHOT_TIMEOUT_S:.0f}s — treating real position "
+                    "as UNKNOWN"
+                )
+            if trading_mode in ("semi_auto", "auto") and self._futures_account:
+                if self._account_monitor.positions:
+                    pos_parts = []
+                    for p in self._account_monitor.positions:
+                        side = "多 LONG" if p["side"] == "B" else "空 SHORT"
+                        pos_parts.append(f"{side} x{p['qty']} {p['product']}")
+                    pos_str = ", ".join(pos_parts)
+                    proceed = self._confirm(
+                        "帳戶有持倉 Existing Position",
+                        f"帳戶已有未平倉部位：{pos_str}\n"
+                        f"Account has open positions: {pos_str}\n\n"
+                        "半自動模式下，機器人不會送出實單，直到持倉清空。\n"
+                        "In semi-auto mode, the bot will NOT send real orders\n"
+                        "until existing positions are closed.\n\n"
+                        "是否仍要部署？（可用手動按鈕平倉後恢復）\n"
+                        "Deploy anyway? (Use manual buttons to close, then orders resume)",
+                    )
+                    if not proceed:
+                        return False
+            return self._deploy_live_continue(
+                req, strategy_cls, is_regime_deploy, regime_cfg,
+                news_enabled, news_tier2_enabled, news_directional,
+                resume_session, trading_mode, bot_name)
+
         # Semi-auto: check for pre-existing real positions before deploy
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
-            # Refresh real positions synchronously
             try:
                 user_id = self.login_user_var.get().strip()
                 self._account_monitor.clear_positions()
                 skO.GetOpenInterestGW(user_id, self._futures_account, 1)
                 # The OnOpenInterest reply arrives asynchronously through the
-                # UI queue — observed ~4s after the query. The old fixed 0.5s
-                # sleep raced it: `positions` was still empty, so the
-                # existing-position warning below never fired and the resume
-                # reconcile read a phantom "flat" account. Poll until the
-                # snapshot actually lands (or we time out).
-                _deadline = time.time() + OI_SNAPSHOT_TIMEOUT_S
-                while time.time() < _deadline:
-                    self.root.update_idletasks()
-                    self._drain_ui_queue()
-                    if self._account_monitor.oi_snapshot_received:
-                        break
-                    time.sleep(0.1)
-                if not self._account_monitor.oi_snapshot_received:
-                    _log(
-                        "持倉查詢逾時 Position snapshot not received within "
-                        f"{OI_SNAPSHOT_TIMEOUT_S:.0f}s — treating real position "
-                        "as UNKNOWN"
-                    )
+                # UI queue — observed ~4s after the query. GUI waits via an
+                # after(100) poll so the Tk thread is not frozen; headless
+                # falls back to a blocking drain (no update_idletasks).
+                if self._oi_wait_must_block():
+                    self._wait_oi_snapshot_blocking()
+                else:
+                    _deadline = time.time() + OI_SNAPSHOT_TIMEOUT_S
+
+                    def _poll_oi():
+                        if (self._account_monitor.oi_snapshot_received
+                                or time.time() >= _deadline):
+                            _after_oi_wait()
+                            return
+                        self.root.after(100, _poll_oi)
+
+                    self.root.after(100, _poll_oi)
+                    return True
             except Exception as e:
                 _log(f"部署前持倉查詢失敗 Pre-deploy position check failed: {e}")
+        return _after_oi_wait()
 
-            if self._account_monitor.positions:
-                pos_parts = []
-                for p in self._account_monitor.positions:
-                    side = "多 LONG" if p["side"] == "B" else "空 SHORT"
-                    pos_parts.append(f"{side} x{p['qty']} {p['product']}")
-                pos_str = ", ".join(pos_parts)
-                proceed = self._confirm(
-                    "帳戶有持倉 Existing Position",
-                    f"帳戶已有未平倉部位：{pos_str}\n"
-                    f"Account has open positions: {pos_str}\n\n"
-                    "半自動模式下，機器人不會送出實單，直到持倉清空。\n"
-                    "In semi-auto mode, the bot will NOT send real orders\n"
-                    "until existing positions are closed.\n\n"
-                    "是否仍要部署？（可用手動按鈕平倉後恢復）\n"
-                    "Deploy anyway? (Use manual buttons to close, then orders resume)",
-                )
-                if not proceed:
-                    return False
-                # Deploy but guard.real_entry_confirmed stays False
-                # so no auto exits are sent for positions we didn't create
 
+    def _deploy_live_continue(
+            self, req: DeployRequest, strategy_cls, is_regime_deploy,
+            regime_cfg, news_enabled, news_tier2_enabled, news_directional,
+            resume_session, trading_mode, bot_name) -> bool:
+        """Finish deploy after the OI snapshot wait / Existing-Position confirm."""
+        symbol = self.symbol_var.get().strip()
         try:
             point_value = int(self.pv_var.get())
         except ValueError:
@@ -7295,8 +7423,12 @@ class BacktestApp:
                 pass  # best-effort; a notification failure must not break the switch
 
     def _on_live_bar(self, bar):
-        """Callback when an aggregated bar is processed."""
-        pass  # Status update handled in _on_live_poll_complete
+        """Callback when an aggregated bar is processed.
+
+        Live status is driven by ``on_status`` / ``_update_live_status``
+        (tick path), not the retired 1-min poll complete handler.
+        """
+        pass
 
     def _on_live_decision(self, decision):
         """Callback when a trading decision is made."""
@@ -7602,10 +7734,10 @@ class BacktestApp:
         countdown = [10]  # mutable for closure
 
         # Header
-        color = "#228B22" if buy_sell == 0 else "#DC143C"
+        color = PALETTE["ok"] if buy_sell == 0 else PALETTE["err"]
         action_label = "進場 ENTRY" if action_type == "entry" else "出場 EXIT"
         header = tk.Label(dlg, text=f"{action_label}: {order_desc}",
-                         font=("", 16, "bold"), fg=color)
+                         font=FONTS.get("title") or ("", 16, "bold"), fg=color)
         header.pack(pady=(15, 5))
 
         # Order details
@@ -8519,10 +8651,13 @@ class BacktestApp:
                 _debug_log_file.flush()
             except Exception:
                 pass
-        self.live_log.config(state=tk.NORMAL)
-        self.live_log.insert(tk.END, line, tag)
-        self.live_log.see(tk.END)
-        self.live_log.config(state=tk.DISABLED)
+        if hasattr(self.live_log, "append"):
+            self.live_log.append(line, tag)
+        else:
+            self.live_log.config(state=tk.NORMAL)
+            self.live_log.insert(tk.END, line, tag)
+            self.live_log.see(tk.END)
+            self.live_log.config(state=tk.DISABLED)
 
     def _update_live_status(self):
         """Update the Live tab status panel."""
@@ -8712,7 +8847,7 @@ class BacktestApp:
         self.bot_name_var.set("(未設定 Not set)")
         self.trading_mode_var.set("--")
         self.mode_combo.config(state=tk.DISABLED)
-        self.status_var.set("就緒 Ready")
+        self.set_status("就緒 Ready")
 
 
 # Event sinks + comtypes connections must outlive the event loop; keep them
