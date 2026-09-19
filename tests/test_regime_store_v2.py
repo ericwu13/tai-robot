@@ -10,6 +10,7 @@ import json
 from src.regime.store import (
     append_history,
     record_session_result,
+    session_result_pending,
     migrate_legacy_history,
     write_placeholder_state,
     load_state,
@@ -168,6 +169,62 @@ class TestRecordSessionResult:
         assert rows[1][_V2_HEADER.index("pnl")] == "9999.0"
         assert rows[1][_V2_HEADER.index("trades")] == "9"
         assert len(rows) == 2  # header + the single session row
+
+
+class TestSessionResultPending:
+    """``session_result_pending`` is the on-disk gate for the P&L
+    catch-up record (issue #122): backfill only a row that exists with
+    a blank pnl."""
+
+    def test_true_for_classification_row(self, tmp_path):
+        path = str(tmp_path / "history.csv")
+        append_history(path, "2026-09-16", _make_state(), _make_rec())
+        assert session_result_pending(path, "2026-09-16", "NIGHT") is True
+
+    def test_false_once_recorded(self, tmp_path):
+        path = str(tmp_path / "history.csv")
+        append_history(path, "2026-09-16", _make_state(), _make_rec())
+        record_session_result(path, "2026-09-16", "NIGHT", 120.0, 1)
+        assert session_result_pending(path, "2026-09-16", "NIGHT") is False
+
+    def test_false_for_zero_pnl(self, tmp_path):
+        # "0.0" is a recorded result, not a blank — a flat session must
+        # not be re-recorded forever.
+        path = str(tmp_path / "history.csv")
+        append_history(path, "2026-09-16", _make_state(), _make_rec())
+        record_session_result(path, "2026-09-16", "NIGHT", 0.0, 0)
+        assert session_result_pending(path, "2026-09-16", "NIGHT") is False
+
+    def test_false_when_row_absent(self, tmp_path):
+        path = str(tmp_path / "history.csv")
+        append_history(path, "2026-09-16", _make_state(), _make_rec())
+        assert session_result_pending(path, "2026-09-16", "DAY") is False
+        assert session_result_pending(path, "2026-09-15", "NIGHT") is False
+
+    def test_false_when_file_missing(self, tmp_path):
+        path = str(tmp_path / "history.csv")
+        assert session_result_pending(path, "2026-09-16", "NIGHT") is False
+        assert not os.path.exists(path)  # read-only: no file created
+
+    def test_matches_the_last_row_for_the_session(self, tmp_path):
+        # Mirrors record_session_result's backwards scan: the row it
+        # would update is the row this check must answer for.
+        path = str(tmp_path / "history.csv")
+        append_history(path, "2026-09-16", _make_state(), _make_rec())
+        record_session_result(path, "2026-09-16", "NIGHT", 120.0, 1)
+        append_history(path, "2026-09-16", _make_state(), _make_rec())
+        assert session_result_pending(path, "2026-09-16", "NIGHT") is True
+
+    def test_short_legacy_row_is_not_pending(self, tmp_path):
+        # record_session_result skips rows shorter than the v2 schema
+        # (it would append a standalone row instead of updating) — the
+        # check mirrors that guard so no duplicate row is created.
+        path = str(tmp_path / "history.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(_V4_HEADER)
+            w.writerow(["2026-09-16", "NIGHT", "30.0"])
+        assert session_result_pending(path, "2026-09-16", "NIGHT") is False
 
 
 class TestKeyFormatMigration:

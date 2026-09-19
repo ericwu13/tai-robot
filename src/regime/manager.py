@@ -16,7 +16,7 @@ from .selector import StrategySelector, Recommendation
 from .store import (
     load_state, save_state, append_history,
     record_session_result, migrate_legacy_history,
-    write_placeholder_state,
+    session_result_pending, write_placeholder_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,24 @@ class RegimeManager:
             )
         except Exception as e:
             logger.exception("[REGIME] Error recording session result: %s", e)
+
+    def is_session_result_pending(
+        self,
+        session_date: str,
+        session_slot: str,
+    ) -> bool:
+        """True when this session has a history row whose P&L is still
+        blank — a classification row awaiting backfill.
+
+        A read error answers False: a catch-up record is an optional
+        repair, never worth appending a speculative row over.
+        """
+        try:
+            return session_result_pending(
+                self._hist_path, session_date, session_slot)
+        except Exception as e:
+            logger.exception("[REGIME] Error checking session result: %s", e)
+            return False
 
     # ── Pending recommendation from persisted state ──
 
