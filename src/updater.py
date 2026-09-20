@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Callable, NamedTuple
 
 # GitHub repo this app updates from. Overridable via env for forks/testing.
@@ -138,31 +139,339 @@ def get_latest_release(timeout: float = 10.0) -> ReleaseInfo | None:
 
 # ── download ────────────────────────────────────────────────────────
 
+# Sustained rate below this for SLOW_RATE_WINDOW_S aborts the TCP so the
+# next attempt can land on a different CDN edge (issue #139). Reporter
+# measured bad Fastly edges at ~57–80 KB/s and good ones at ~13 MB/s.
+SLOW_RATE_MIN_BPS = 128_000
+SLOW_RATE_WINDOW_S = 8.0
+MAX_DOWNLOAD_ATTEMPTS = 4
+RANGE_WORKERS = 4
+MIN_PARALLEL_BYTES = 1_048_576  # 1 MiB — skip Range fan-out for tiny files
+
+
+class SlowDownloadError(Exception):
+    """One TCP connection stayed below ``min_bps`` for the whole window."""
+
+
+class RateWatch:
+    """Abort a stream that stays below ``min_bps`` for ``window_s``.
+
+    The first ``window_s`` after construction (or ``reset()``) is a grace
+    period so TLS / TTFB / a tiny first chunk cannot false-trigger. After
+    that, if ``bytes / elapsed < min_bps``, ``feed`` raises
+    ``SlowDownloadError``. Instant-complete downloads never trip this
+    because they finish inside the grace window.
+    """
+
+    def __init__(
+        self,
+        min_bps: float = SLOW_RATE_MIN_BPS,
+        window_s: float = SLOW_RATE_WINDOW_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.min_bps = float(min_bps)
+        self.window_s = float(window_s)
+        self.clock = clock
+        self.reset()
+
+    def reset(self) -> None:
+        self._t0 = self.clock()
+        self._bytes = 0
+
+    def feed(self, n: int) -> None:
+        if n < 0:
+            raise ValueError("n must be >= 0")
+        self._bytes += n
+        if self.min_bps <= 0:
+            return
+        elapsed = self.clock() - self._t0
+        if elapsed < self.window_s:
+            return
+        rate = self._bytes / elapsed
+        if rate < self.min_bps:
+            raise SlowDownloadError(
+                f"download {rate:.0f} B/s < {self.min_bps:.0f} B/s "
+                f"over {elapsed:.1f}s"
+            )
+
+
+def _total_from_content_range(value: str) -> int:
+    """Parse the total size from a Content-Range header, or 0 if unknown."""
+    if "/" not in value:
+        return 0
+    tail = value.rsplit("/", 1)[-1].strip()
+    return int(tail) if tail.isdigit() else 0
+
+
+def _split_ranges(total: int, n: int) -> list[tuple[int, int]]:
+    """Inclusive ``(start, end)`` byte ranges covering ``[0, total)``."""
+    n = max(1, min(int(n), total))
+    base, extra = divmod(total, n)
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for i in range(n):
+        size = base + (1 if i < extra else 0)
+        ranges.append((cursor, cursor + size - 1))
+        cursor += size
+    return ranges
+
+
+def _interpret_response(
+    resp, resume_from: int,
+) -> tuple[int, int, bool]:
+    """Return ``(total, write_start, append)`` from a streaming response.
+
+    A 206 + resume appends; a 200 (server ignored Range) restarts at 0.
+    """
+    content_length = int(resp.headers.get("Content-Length") or 0)
+    content_range = resp.headers.get("Content-Range") or ""
+    ranged_total = _total_from_content_range(content_range)
+    if resume_from > 0 and getattr(resp, "status_code", 200) == 206:
+        total = ranged_total or (resume_from + content_length)
+        return total, resume_from, True
+    total = ranged_total or content_length
+    return total, 0, False
+
+
+def _write_body(
+    resp,
+    dest_path: str,
+    *,
+    start: int,
+    append: bool,
+    total: int,
+    progress_cb: Callable[[int, int], None] | None,
+    watch: RateWatch | None,
+    chunk_cb: Callable[[int], None] | None = None,
+) -> int:
+    """Write ``resp.iter_bytes()`` to ``dest_path``. Returns bytes on disk."""
+    mode = "ab" if append else "wb"
+    done = start
+    with open(dest_path, mode) as f:
+        for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            if total and done + len(chunk) > total:
+                chunk = chunk[: total - done]
+                if not chunk:
+                    return done
+            f.write(chunk)
+            done += len(chunk)
+            if chunk_cb is not None:
+                chunk_cb(len(chunk))
+            elif progress_cb is not None:
+                progress_cb(done, total)
+            if total and done >= total:
+                return done
+            if watch is not None:
+                watch.feed(len(chunk))
+    return done
+
+
+def _accepts_ranges(resp) -> bool:
+    return "bytes" in (resp.headers.get("Accept-Ranges") or "").lower()
+
+
+def _download_one_range(
+    url: str,
+    part_path: str,
+    start: int,
+    end: int,
+    *,
+    timeout: float,
+    min_bps: float,
+    window_s: float,
+    max_attempts: int,
+    clock: Callable[[], float],
+    chunk_cb: Callable[[int], None] | None,
+) -> None:
+    """Fetch ``bytes=start-end`` into ``part_path``, resuming on slow abort."""
+    import httpx
+
+    expected = end - start + 1
+    last_err: Exception | None = None
+    for _attempt in range(max_attempts):
+        already = (
+            os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+        )
+        if already >= expected:
+            return
+        cursor = start + already
+        watch = RateWatch(min_bps, window_s, clock=clock)
+        headers = {"Range": f"bytes={cursor}-{end}"}
+        try:
+            with httpx.stream(
+                "GET", url, headers=headers,
+                follow_redirects=True, timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+                if resp.status_code != 206:
+                    raise SlowDownloadError(
+                        "server ignored HTTP Range; cannot write a slice"
+                    )
+                _write_body(
+                    resp, part_path,
+                    start=already, append=already > 0,
+                    total=expected, progress_cb=None, watch=watch,
+                    chunk_cb=chunk_cb,
+                )
+            have = (
+                os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+            )
+            if have >= expected:
+                return
+            last_err = SlowDownloadError(
+                f"short range read {have}/{expected} for bytes={start}-{end}"
+            )
+        except SlowDownloadError as exc:
+            last_err = exc
+            continue
+    raise SlowDownloadError(
+        f"range {start}-{end} stalled after {max_attempts} attempts"
+    ) from last_err
+
+
+def _download_parallel(
+    url: str,
+    dest_path: str,
+    total: int,
+    n_parts: int,
+    *,
+    progress_cb: Callable[[int, int], None] | None,
+    timeout: float,
+    min_bps: float,
+    window_s: float,
+    max_attempts: int,
+    clock: Callable[[], float],
+) -> None:
+    """HTTP Range fan-out (issue #139). Each part retries a slow edge."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    ranges = _split_ranges(total, n_parts)
+    part_paths = [f"{dest_path}.part{i}" for i in range(len(ranges))]
+    done_lock = threading.Lock()
+    done_box = [0]
+
+    def on_chunk(n: int) -> None:
+        with done_lock:
+            done_box[0] += n
+            cur = done_box[0]
+        if progress_cb is not None:
+            progress_cb(cur, total)
+
+    def worker(part_path: str, start: int, end: int) -> None:
+        _download_one_range(
+            url, part_path, start, end,
+            timeout=timeout, min_bps=min_bps, window_s=window_s,
+            max_attempts=max_attempts, clock=clock, chunk_cb=on_chunk,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+            futs = [
+                pool.submit(worker, path, start, end)
+                for path, (start, end) in zip(part_paths, ranges)
+            ]
+            for fut in as_completed(futs):
+                fut.result()
+        with open(dest_path, "wb") as out:
+            for path in part_paths:
+                with open(path, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+    finally:
+        for path in part_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def download_release(
     url: str,
     dest_path: str,
     progress_cb: Callable[[int, int], None] | None = None,
     timeout: float = 30.0,
+    *,
+    min_bps: float = SLOW_RATE_MIN_BPS,
+    window_s: float = SLOW_RATE_WINDOW_S,
+    max_attempts: int = MAX_DOWNLOAD_ATTEMPTS,
+    range_workers: int = RANGE_WORKERS,
+    min_parallel_bytes: int = MIN_PARALLEL_BYTES,
+    clock: Callable[[], float] = time.monotonic,
 ) -> str:
     """Stream a release zip to ``dest_path`` via httpx.
 
     ``progress_cb(bytes_done, total)`` is called as bytes arrive; ``total``
     is 0 when the server omits Content-Length. Returns ``dest_path``.
+
+    A connection that stays below ``min_bps`` for ``window_s`` is aborted
+    and retried (new TCP, new CDN edge) up to ``max_attempts`` times.
+    Partial bytes are resumed with ``Range`` when the server returns 206
+    (issue #139). When the first response advertises ``Accept-Ranges`` and
+    the asset is at least ``min_parallel_bytes``, the download fans out to
+    ``range_workers`` parallel Range requests.
     """
     import httpx
 
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    with httpx.stream("GET", url, follow_redirects=True, timeout=timeout) as resp:
-        resp.raise_for_status()
-        total = int(resp.headers.get("Content-Length") or 0)
-        done = 0
-        with open(dest_path, "wb") as f:
-            for chunk in resp.iter_bytes(chunk_size=64 * 1024):
-                f.write(chunk)
-                done += len(chunk)
-                if progress_cb is not None:
-                    progress_cb(done, total)
-    return dest_path
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+
+    last_err: Exception | None = None
+    done = 0
+    total = 0
+
+    for _attempt in range(max_attempts):
+        headers: dict[str, str] = {}
+        if done > 0:
+            headers["Range"] = f"bytes={done}-"
+        watch = RateWatch(min_bps, window_s, clock=clock)
+        try:
+            switch_parallel = False
+            with httpx.stream(
+                "GET", url, headers=headers,
+                follow_redirects=True, timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+                total, start, append = _interpret_response(resp, done)
+                if (
+                    start == 0
+                    and getattr(resp, "status_code", 200) == 200
+                    and range_workers > 1
+                    and _accepts_ranges(resp)
+                    and total >= min_parallel_bytes
+                ):
+                    switch_parallel = True
+                else:
+                    _write_body(
+                        resp, dest_path, start=start, append=append,
+                        total=total, progress_cb=progress_cb, watch=watch,
+                    )
+                    return dest_path
+            if switch_parallel:
+                _download_parallel(
+                    url, dest_path, total=total, n_parts=range_workers,
+                    progress_cb=progress_cb, timeout=timeout,
+                    min_bps=min_bps, window_s=window_s,
+                    max_attempts=max_attempts, clock=clock,
+                )
+                return dest_path
+        except SlowDownloadError as exc:
+            last_err = exc
+            try:
+                done = (
+                    os.path.getsize(dest_path)
+                    if os.path.isfile(dest_path) else 0
+                )
+            except OSError:
+                done = 0
+            continue
+
+    raise SlowDownloadError(
+        f"Download stalled below {min_bps / 1024:.0f} KB/s "
+        f"after {max_attempts} attempts (slow CDN edge). Try again."
+    ) from last_err
 
 
 # ── progress window ────────────────────────────────────────────────

@@ -324,21 +324,87 @@ class TestLaunchUpdateGuard:
 
 # ── download_release ──
 
+def _stream_cm(chunks, headers=None, status=200):
+    """httpx.stream context-manager mock that yields ``chunks``."""
+    stream_cm = MagicMock()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.status_code = status
+    resp.headers = headers or {}
+    resp.iter_bytes.return_value = iter(chunks)
+    stream_cm.__enter__.return_value = resp
+    stream_cm.__exit__.return_value = False
+    return stream_cm
+
+
+class _FakeClock:
+    """Monotonic clock the test advances so RateWatch can fire without sleeps."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+class _TimedChunks:
+    """Iterator that advances ``clock`` by ``dt`` before each chunk (issue #139)."""
+
+    def __init__(self, chunks, clock, dt):
+        self._chunks = list(chunks)
+        self._clock = clock
+        self._dt = dt
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._chunks:
+            raise StopIteration
+        self._clock.advance(self._dt)
+        return self._chunks.pop(0)
+
+
+class TestRateWatch:
+    """Failing-first helper tests for issue #139 (slow CDN edge abort)."""
+
+    def test_aborts_after_sustained_low_rate(self):
+        clock = _FakeClock()
+        watch = updater.RateWatch(min_bps=1_000, window_s=2.0, clock=clock)
+        watch.feed(100)
+        clock.advance(1.0)
+        watch.feed(100)          # 200 B / 1s so far — still in grace
+        clock.advance(1.0)
+        with pytest.raises(updater.SlowDownloadError):
+            watch.feed(100)      # 300 B / 2s = 150 B/s < 1000
+
+    def test_allows_fast_stream(self):
+        clock = _FakeClock()
+        watch = updater.RateWatch(min_bps=1_000, window_s=2.0, clock=clock)
+        watch.feed(10_000)
+        clock.advance(2.0)
+        watch.feed(10_000)       # 20 KB / 2s = 10 KB/s ≥ 1 KB/s
+        clock.advance(2.0)
+        watch.feed(10_000)       # still well above the floor
+
+    def test_grace_window_does_not_abort(self):
+        clock = _FakeClock()
+        watch = updater.RateWatch(min_bps=1_000_000, window_s=8.0, clock=clock)
+        watch.feed(1)            # elapsed 0 — never abort during grace
+        clock.advance(7.9)
+        watch.feed(1)            # still inside window_s
+
+
 class TestDownloadRelease:
     def test_streams_and_reports_progress(self, tmp_path):
         chunks = [b"a" * 100, b"b" * 50]
-
-        stream_cm = MagicMock()
-        resp = MagicMock()
-        resp.raise_for_status.return_value = None
-        resp.headers = {"Content-Length": "150"}
-        resp.iter_bytes.return_value = iter(chunks)
-        stream_cm.__enter__.return_value = resp
-        stream_cm.__exit__.return_value = False
-
-        progress = []
         dest = str(tmp_path / "out" / "app.zip")
-        with patch("httpx.stream", return_value=stream_cm):
+        progress = []
+        with patch("httpx.stream", return_value=_stream_cm(
+                chunks, {"Content-Length": "150"})):
             updater.download_release(
                 "https://x/app.zip", dest,
                 progress_cb=lambda d, t: progress.append((d, t)))
@@ -347,3 +413,169 @@ class TestDownloadRelease:
         with open(dest, "rb") as f:
             assert f.read() == b"a" * 100 + b"b" * 50
         assert progress == [(100, 150), (150, 150)]
+
+    def test_retries_after_slow_stream(self, tmp_path):
+        # Pre-fix download_release has no RateWatch / retry: this fails
+        # because the first (slow) connection is the only attempt.
+        clock = _FakeClock()
+        dest = str(tmp_path / "app.zip")
+        payload = b"HELLO-WORLD-OK"  # 14 bytes, completes on attempt 2
+
+        slow = _stream_cm(
+            _TimedChunks([b"xx", b"yy"], clock, dt=2.0),
+            {"Content-Length": str(len(payload))},
+        )
+        fast = _stream_cm(
+            [payload],
+            {"Content-Length": str(len(payload))},
+        )
+        with patch("httpx.stream", side_effect=[slow, fast]) as stream:
+            updater.download_release(
+                "https://x/app.zip", dest,
+                min_bps=1_000, window_s=2.0, max_attempts=3,
+                range_workers=1, clock=clock,
+            )
+
+        with open(dest, "rb") as f:
+            assert f.read() == payload
+        assert stream.call_count == 2
+
+    def test_resumes_with_range_header(self, tmp_path):
+        # After a slow abort the next GET must send Range: bytes=<done>-
+        # and append a 206 body (issue #139 resume).
+        clock = _FakeClock()
+        dest = str(tmp_path / "app.zip")
+        first = _stream_cm(
+            _TimedChunks([b"AAAA", b"BBBB"], clock, dt=1.0),
+            {"Content-Length": "12", "Accept-Ranges": "bytes"},
+        )
+        second = _stream_cm(
+            [b"CCCC"],
+            {"Content-Length": "4",
+             "Content-Range": "bytes 8-11/12",
+             "Accept-Ranges": "bytes"},
+            status=206,
+        )
+        captured = []
+
+        def fake_stream(method, url, **kwargs):
+            captured.append(kwargs.get("headers") or {})
+            return first if len(captured) == 1 else second
+
+        with patch("httpx.stream", side_effect=fake_stream):
+            updater.download_release(
+                "https://x/app.zip", dest,
+                min_bps=1_000, window_s=2.0, max_attempts=3,
+                range_workers=1, clock=clock,
+            )
+
+        with open(dest, "rb") as f:
+            assert f.read() == b"AAAABBBBCCCC"
+        assert captured[1].get("Range") == "bytes=8-"
+
+    def test_raises_after_max_attempts(self, tmp_path):
+        clock = _FakeClock()
+        dest = str(tmp_path / "app.zip")
+
+        def always_slow(*_a, **_k):
+            return _stream_cm(
+                _TimedChunks([b"ab", b"cd"], clock, dt=2.0),
+                {"Content-Length": "99"},
+            )
+
+        with patch("httpx.stream", side_effect=always_slow):
+            with pytest.raises(updater.SlowDownloadError):
+                updater.download_release(
+                    "https://x/app.zip", dest,
+                    min_bps=1_000, window_s=2.0, max_attempts=2,
+                    range_workers=1, clock=clock,
+                )
+
+    def test_parallel_ranges_assemble_file(self, tmp_path):
+        # Optional #139 path: first GET advertises Accept-Ranges + size,
+        # then 4 Range workers write their slices. Pre-fix has no Range
+        # fan-out, so this fails (only the probe body would be saved).
+        data = b"ABCDEFGHIJKLMNOP"  # 16 bytes
+        dest = str(tmp_path / "app.zip")
+        probe = _stream_cm(
+            [data],
+            {"Content-Length": "16", "Accept-Ranges": "bytes"},
+        )
+        parts = {
+            "bytes=0-3": b"ABCD",
+            "bytes=4-7": b"EFGH",
+            "bytes=8-11": b"IJKL",
+            "bytes=12-15": b"MNOP",
+        }
+
+        def fake_stream(method, url, **kwargs):
+            headers = kwargs.get("headers") or {}
+            rng = headers.get("Range")
+            if rng is None:
+                return probe
+            body = parts[rng]
+            return _stream_cm(
+                [body],
+                {"Content-Length": str(len(body)),
+                 "Content-Range": f"{rng.replace('=', ' ')}/16",
+                 "Accept-Ranges": "bytes"},
+                status=206,
+            )
+
+        with patch("httpx.stream", side_effect=fake_stream):
+            updater.download_release(
+                "https://x/app.zip", dest,
+                range_workers=4, min_parallel_bytes=1,
+            )
+
+        with open(dest, "rb") as f:
+            assert f.read() == data
+
+    def test_parallel_retries_slow_part(self, tmp_path):
+        # Shared fake clocks + threads race, so the slow worker raises
+        # SlowDownloadError from the iterator (the same exception RateWatch
+        # uses). Resume must request the remaining suffix of that part.
+        data = b"ABCDEFGH"  # 8 bytes, 2 workers
+        dest = str(tmp_path / "app.zip")
+        probe = _stream_cm(
+            [data],
+            {"Content-Length": "8", "Accept-Ranges": "bytes"},
+        )
+
+        def _slow_then_raise():
+            yield b"E"
+            raise updater.SlowDownloadError("mock slow edge")
+
+        def fake_stream(method, url, **kwargs):
+            headers = kwargs.get("headers") or {}
+            rng = headers.get("Range")
+            if rng is None:
+                return probe
+            if rng == "bytes=0-3":
+                return _stream_cm(
+                    [b"ABCD"],
+                    {"Content-Length": "4", "Content-Range": "bytes 0-3/8"},
+                    status=206,
+                )
+            if rng == "bytes=4-7":
+                return _stream_cm(
+                    _slow_then_raise(),
+                    {"Content-Length": "4", "Content-Range": "bytes 4-7/8"},
+                    status=206,
+                )
+            if rng == "bytes=5-7":
+                return _stream_cm(
+                    [b"FGH"],
+                    {"Content-Length": "3", "Content-Range": "bytes 5-7/8"},
+                    status=206,
+                )
+            raise AssertionError(f"unexpected Range {rng}")
+
+        with patch("httpx.stream", side_effect=fake_stream):
+            updater.download_release(
+                "https://x/app.zip", dest,
+                max_attempts=3, range_workers=2, min_parallel_bytes=1,
+            )
+
+        with open(dest, "rb") as f:
+            assert f.read() == data
