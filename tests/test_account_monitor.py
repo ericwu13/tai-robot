@@ -173,6 +173,47 @@ class TestPositionTracking:
         assert m.get_signed_position("TX") == 2
 
 
+# ── has_open_positions (issue #139 — zero-qty Existing Position) ──
+
+class TestHasOpenPositions:
+    """Deploy confirm used ``if self._account_monitor.positions:``.
+
+    Capital can return a qty=0 OI row (side still B/S) for a flat book.
+    A non-empty list is then truthy and the dialog shows 「空 SHORT x0」
+    while the bot's Position is +0. Distinct from #107 (ghost *non-zero*
+    持倉 after resume).
+    """
+
+    def test_zero_qty_row_is_not_an_open_position(self):
+        """Would fail against ``bool(monitor.positions)`` — the inventing path."""
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 0, "avg_cost": "0"})
+        assert m.positions, "pre-fix inventing path: list is truthy"
+        assert m.oi_snapshot_received is True
+        assert m.has_open_positions() is False
+
+    def test_nonzero_qty_is_an_open_position(self):
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 1, "avg_cost": "44000"})
+        assert m.has_open_positions() is True
+
+    def test_empty_list_is_not_an_open_position(self):
+        m = AccountMonitor()
+        m.set_flat()
+        assert m.has_open_positions() is False
+
+    def test_mixed_rows_any_nonzero(self):
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 0, "avg_cost": "0"})
+        m.add_position({"product": "TXF00", "side": "B", "qty": 1, "avg_cost": "22500"})
+        assert m.has_open_positions() is True
+
+    def test_missing_qty_defaults_to_flat(self):
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S"})
+        assert m.has_open_positions() is False
+
+
 # ── OpenInterest snapshot flag (resume-reconcile race fix) ──
 
 class TestOiSnapshotFlag:

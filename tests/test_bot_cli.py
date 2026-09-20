@@ -95,6 +95,20 @@ def test_seam_titles_match_gui_strings():
     assert hl.TITLE_EXISTING_POSITION in src
 
 
+def test_deploy_existing_position_gates_on_nonzero_qty():
+    """Issue #139: a qty=0 OI row must not fire Existing Position.
+
+    The inventing path was ``if self._account_monitor.positions:`` — a
+    truthy list of zero-qty rows. The title seam stays byte-exact.
+    Distinct from #107 (ghost non-zero 持倉).
+    """
+    src = inspect.getsource(rb.BacktestApp._deploy_live_from)
+    assert "if self._account_monitor.positions:" not in src
+    assert "has_open_positions" in src
+    assert hl.TITLE_EXISTING_POSITION in src
+    assert src.count(hl.TITLE_EXISTING_POSITION) == 1
+
+
 # ── HeadlessPolicy ──
 
 def test_policy_answers_by_title_and_declines_unknown():

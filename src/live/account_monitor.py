@@ -205,6 +205,17 @@ class AccountMonitor:
                 return qty if p.get("side") == "B" else -qty
         return 0
 
+    def has_open_positions(self) -> bool:
+        """True if any stored OI row has non-zero qty.
+
+        Capital can return a qty=0 row (side still B/S) for a flat book.
+        A non-empty ``positions`` list is therefore not "account has a
+        position" — that truthiness check showed 「空 SHORT x0」 on
+        load-existing (issue #139). Distinct from #107 (ghost *non-zero*
+        持倉 after resume).
+        """
+        return any(p.get("qty", 0) != 0 for p in self.positions)
+
     # ── Display computation ──
 
     def compute_display(self) -> AccountDisplay:

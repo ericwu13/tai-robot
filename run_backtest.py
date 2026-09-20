@@ -6306,9 +6306,11 @@ class BacktestApp:
                     "as UNKNOWN"
                 )
             if trading_mode in ("semi_auto", "auto") and self._futures_account:
-                if self._account_monitor.positions:
+                if self._account_monitor.has_open_positions():
                     pos_parts = []
                     for p in self._account_monitor.positions:
+                        if p.get("qty", 0) == 0:
+                            continue
                         side = "多 LONG" if p["side"] == "B" else "空 SHORT"
                         pos_parts.append(f"{side} x{p['qty']} {p['product']}")
                     pos_str = ", ".join(pos_parts)
