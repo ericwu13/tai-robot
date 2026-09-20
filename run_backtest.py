@@ -1127,6 +1127,8 @@ class BacktestApp:
         """Bottom strip: connection dot + message + last-20 history button."""
         strip = ttk.Frame(parent, style="StatusStrip.TFrame")
         strip.pack(side=tk.BOTTOM, fill=tk.X)
+        # Packed after the strip so the hairline sits *above* it (pack BOTTOM).
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
         self._conn_dot = StatusDot(strip, text="連線 Conn", surface="raised")
         self._conn_dot.pack(side=tk.LEFT, padx=(8, 10), pady=3)
         self.status_var = tk.StringVar(value="初始化中 Initializing...")

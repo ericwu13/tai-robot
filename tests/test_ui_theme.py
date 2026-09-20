@@ -134,7 +134,13 @@ def test_init_theme_on_withdrawn_root_defines_named_styles():
         # Flat clam: no system-white bevel leftover on the window fill.
         assert style.lookup("TFrame", "lightcolor") == PALETTE["bg"]
         assert style.lookup("TButton", "padding")
+        # Interactive chrome must outline — flat lightcolor==fill made
+        # buttons/entries look like unfinished holes.
+        assert style.lookup("TButton", "lightcolor") != style.lookup(
+            "TButton", "background")
+        assert style.lookup("TEntry", "bordercolor") != PALETTE["bg"]
         assert style.lookup("Treeview", "fieldbackground") == PALETTE["bg_inset"]
+        assert style.map("Treeview", "foreground")
         assert set(FONTS) >= {"title", "section", "value", "body", "mono", "mono_small"}
     finally:
         root.destroy()
