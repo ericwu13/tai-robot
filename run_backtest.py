@@ -23,7 +23,7 @@ import time
 import traceback
 import tkinter as tk
 from collections import deque
-from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
+from tkinter import ttk, filedialog, simpledialog, messagebox
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
@@ -126,9 +126,13 @@ from src.market_data.kchart_fetcher import (
 # TAIFEX public data (no API key needed)
 from src.ui.theme import (
     CHAT_TAGS, EPISODE_TAGS, FONTS, LOG_TAGS, PALETTE,
-    STATUS_LEVEL_STYLES, TONE, init_theme,
+    STATUS_LEVEL_STYLES, TONE, apply_window_theme, init_theme,
+    style_text_widget,
 )
-from src.ui.widgets import ScrollableFrame, StatusDot, TagTextLog, attach_tooltip
+from src.ui.widgets import (
+    ScrollableFrame, StatusDot, TagTextLog, attach_tooltip,
+    themed_scrolled_text,
+)
 from src.ui.labels import READY
 from src.data_sources.taifex import fetch_futures_daily, parse_taifex_csv
 from src.data_sources.cache import (
@@ -1089,7 +1093,7 @@ class BacktestApp:
         if not hasattr(self, "_status_history"):
             self._status_history = deque(maxlen=20)
         self._status_history.append((ts, level, str(msg)))
-        style = STATUS_LEVEL_STYLES.get(level, "Dim.TLabel")
+        style = STATUS_LEVEL_STYLES.get(level, "StatusStrip.Dim.TLabel")
         label = getattr(self, "_status_msg_label", None)
         if label is not None:
             try:
@@ -1111,7 +1115,7 @@ class BacktestApp:
         dlg.title("狀態紀錄 Status History")
         dlg.geometry("520x280")
         dlg.transient(self.root)
-        dlg.configure(bg=PALETTE["bg"])
+        apply_window_theme(dlg)
         log = TagTextLog(dlg, show_toolbar=False, max_lines=20)
         log.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         tag_for = {"info": "info", "ok": "entry", "warn": "status", "error": "exit"}
@@ -1123,11 +1127,11 @@ class BacktestApp:
         """Bottom strip: connection dot + message + last-20 history button."""
         strip = ttk.Frame(parent, style="StatusStrip.TFrame")
         strip.pack(side=tk.BOTTOM, fill=tk.X)
-        self._conn_dot = StatusDot(strip, text="連線 Conn")
+        self._conn_dot = StatusDot(strip, text="連線 Conn", surface="raised")
         self._conn_dot.pack(side=tk.LEFT, padx=(8, 10), pady=3)
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
         self._status_msg_label = ttk.Label(
-            strip, textvariable=self.status_var, style="Dim.TLabel")
+            strip, textvariable=self.status_var, style="StatusStrip.Dim.TLabel")
         self._status_msg_label.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=3)
         ttk.Button(strip, text="紀錄 History", width=12,
                    command=self._show_status_history).pack(
@@ -1679,10 +1683,9 @@ class BacktestApp:
         self.chat_input = tk.Text(
             input_frame, height=3,
             font=FONTS.get("mono") or ("Consolas", 10),
-            bg=PALETTE["bg_raised"], fg=PALETTE["text"],
-            insertbackground=PALETTE["text"],
-            relief=tk.FLAT, padx=6, pady=4,
+            padx=6, pady=4,
         )
+        style_text_widget(self.chat_input, inset=False)
         self.chat_input.pack(fill=tk.X, expand=True)
         self.chat_input.bind("<Return>", self._on_chat_enter)
         self.chat_input.bind("<Shift-Return>", lambda e: None)  # allow newline
@@ -1910,7 +1913,8 @@ class BacktestApp:
         self.report_canvas = report_scroll.canvas
         self.report_body = report_scroll.body
         ttk.Label(self.report_body, text="(尚無結果 no results yet — 執行回測或部署 "
-                             "run a backtest or deploy)").pack(padx=8, pady=8)
+                             "run a backtest or deploy)",
+                  style="Dim.TLabel").pack(padx=8, pady=8)
 
         # Trade list tab
         trades_frame = ttk.Frame(notebook)
@@ -2465,9 +2469,11 @@ class BacktestApp:
         popup = tk.Toplevel(self.root)
         popup.title("Pine Script Export")
         popup.geometry("700x600")
+        apply_window_theme(popup)
 
-        text = scrolledtext.ScrolledText(popup, wrap=tk.WORD, font=("Consolas", 10))
-        text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        wrap, text = themed_scrolled_text(
+            popup, wrap=tk.WORD, font=FONTS.get("mono") or ("Consolas", 10))
+        wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         text.insert(tk.END, pine_code)
 
         btn_frame = ttk.Frame(popup)
@@ -2642,6 +2648,7 @@ class BacktestApp:
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
+        apply_window_theme(dialog)
 
         frame = ttk.Frame(dialog, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -2678,7 +2685,7 @@ class BacktestApp:
         def _update_hint(*args):
             p = provider_var.get()
             hint_label.config(text=f"Default: {DEFAULT_MODELS.get(p, '')}")
-        hint_label = ttk.Label(frame, text="", foreground="gray")
+        hint_label = ttk.Label(frame, text="", style="Dim.TLabel")
         hint_label.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
         provider_var.trace_add("write", _update_hint)
         _update_hint()
@@ -2693,7 +2700,7 @@ class BacktestApp:
             text=f"Ultra Mode 預設 default — ({GOOGLE_MODEL_ULTRA}, Google only)",
         ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         ttk.Label(
-            frame, foreground="gray",
+            frame, style="Dim.TLabel",
             text="持久預設，影響 codegen/review/evolution/Pine (成本較高)。"
                  "臨時切換請用聊天區 🚀 按鈕 (session-only).",
         ).grid(row=6, column=0, columnspan=2, sticky=tk.W)
@@ -3028,6 +3035,7 @@ class BacktestApp:
         dlg.resizable(False, False)
         dlg.transient(self.root)
         dlg.grab_set()
+        apply_window_theme(dlg)
 
         frame = ttk.Frame(dlg, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -3036,7 +3044,7 @@ class BacktestApp:
         pbar = ttk.Progressbar(frame, mode="determinate", maximum=100)
         pbar.pack(fill=tk.X, pady=(0, 6))
         pct_var = tk.StringVar(value="0%")
-        ttk.Label(frame, textvariable=pct_var, foreground="gray").pack(anchor=tk.W)
+        ttk.Label(frame, textvariable=pct_var, style="Dim.TLabel").pack(anchor=tk.W)
 
         # Disable the update button so the flow can't be re-triggered.
         self.btn_update.config(state=tk.DISABLED)
@@ -3154,12 +3162,10 @@ class BacktestApp:
         win = tk.Toplevel(self.root)
         win.title(f"原始碼 — {name}")
         win.geometry("800x600")
-        text = scrolledtext.ScrolledText(
-            win, wrap=tk.NONE, font=FONTS.get("mono") or ("Consolas", 10),
-            bg=PALETTE["bg_inset"], fg=PALETTE["text"],
-            insertbackground=PALETTE["text"],
-        )
-        text.pack(fill=tk.BOTH, expand=True)
+        apply_window_theme(win)
+        wrap, text = themed_scrolled_text(
+            win, wrap=tk.NONE, font=FONTS.get("mono") or ("Consolas", 10))
+        wrap.pack(fill=tk.BOTH, expand=True)
         text.insert(tk.END, f"# {filepath}\n\n{source}")
         text.config(state=tk.DISABLED)
 
@@ -3734,14 +3740,14 @@ class BacktestApp:
         """One headline metric card (label / big value / sub line)."""
         card = ttk.Frame(parent, style="Card.TFrame")
         card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-        ttk.Label(card, text=metric.label, style="Dim.TLabel").pack(
+        ttk.Label(card, text=metric.label, style="Card.Dim.TLabel").pack(
             anchor="w", padx=8, pady=(5, 0))
         value_style = "CardValue.TLabel"
         value_fg = TONE.get(metric.tone, PALETTE["text"])
         ttk.Label(card, text=metric.value, style=value_style,
                   font=FONTS.get("title") or ("Segoe UI", 14, "bold"),
                   foreground=value_fg).pack(anchor="w", padx=8)
-        ttk.Label(card, text=metric.sub or " ", style="Dim.TLabel").pack(
+        ttk.Label(card, text=metric.sub or " ", style="Card.Dim.TLabel").pack(
             anchor="w", padx=8, pady=(0, 5))
 
     def _render_report_view(self, title, metrics, trades, regime_info,
@@ -5661,6 +5667,7 @@ class BacktestApp:
         dlg.resizable(True, True)
         dlg.transient(self.root)
         dlg.grab_set()
+        apply_window_theme(dlg)
 
         # Scrollable body: blessed ScrollableFrame (unbinds wheel on destroy).
         _outer = ScrollableFrame(dlg)
@@ -5791,7 +5798,7 @@ class BacktestApp:
 
         else:
             ttk.Label(content, text=f"沒有 {symbol} 的現有機器人 No existing bots for {symbol}.",
-                      foreground="gray").pack(anchor=tk.W, padx=10, pady=(10, 4))
+                      style="Dim.TLabel").pack(anchor=tk.W, padx=10, pady=(10, 4))
 
         # New bot section
         ttk.Separator(content, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
@@ -5849,7 +5856,7 @@ class BacktestApp:
             semi_auto_rb.config(state=tk.DISABLED)
             auto_rb.config(state=tk.DISABLED)
             ttk.Label(mode_frame, text="  (需先登入才能使用半/全自動 Login required for semi/auto)",
-                      foreground="gray").pack(anchor=tk.W, padx=10)
+                      style="Dim.TLabel").pack(anchor=tk.W, padx=10)
 
         # Daily loss limit (semi-auto only)
         loss_frame = ttk.Frame(mode_frame)
@@ -7728,6 +7735,7 @@ class BacktestApp:
         dlg.geometry("440x230")
         dlg.attributes("-topmost", True)
         dlg.resizable(False, False)
+        apply_window_theme(dlg)
 
         # Don't use grab_set — must not block main thread
         self._order_confirm_dlg = dlg
@@ -7736,24 +7744,39 @@ class BacktestApp:
         # Header
         color = PALETTE["ok"] if buy_sell == 0 else PALETTE["err"]
         action_label = "進場 ENTRY" if action_type == "entry" else "出場 EXIT"
-        header = tk.Label(dlg, text=f"{action_label}: {order_desc}",
-                         font=FONTS.get("title") or ("", 16, "bold"), fg=color)
+        header = tk.Label(
+            dlg, text=f"{action_label}: {order_desc}",
+            font=FONTS.get("title") or ("", 16, "bold"),
+            fg=color, bg=PALETTE["bg"],
+        )
         header.pack(pady=(15, 5))
 
         # Order details
         symbol = self._live_runner.symbol if self._live_runner else "?"
         cfg = SYMBOL_CONFIG.get(symbol, {})
         pv = cfg.get("pv", "?")
-        tk.Label(dlg, text=f"商品 Symbol: {order_symbol} ({symbol})  |  每點 PV: {pv} NTD",
-                font=("", 11)).pack(pady=2)
+        tk.Label(
+            dlg, text=f"商品 Symbol: {order_symbol} ({symbol})  |  每點 PV: {pv} NTD",
+            font=FONTS.get("body") or ("", 10),
+            fg=PALETTE["text"], bg=PALETTE["bg"],
+        ).pack(pady=2)
         src_label = f" ({price_source})" if price_source else ""
-        tk.Label(dlg, text=f"參考價格 Ref Price: {price:,}{src_label}  |  數量 Qty: 1 口",
-                font=("", 11)).pack(pady=2)
-        tk.Label(dlg, text="實單將以市價IOC送出 Will send as IOC market order",
-                font=("", 9), fg="gray").pack(pady=2)
+        tk.Label(
+            dlg, text=f"參考價格 Ref Price: {price:,}{src_label}  |  數量 Qty: 1 口",
+            font=FONTS.get("body") or ("", 10),
+            fg=PALETTE["text"], bg=PALETTE["bg"],
+        ).pack(pady=2)
+        tk.Label(
+            dlg, text="實單將以市價IOC送出 Will send as IOC market order",
+            font=FONTS.get("mono_small") or ("", 9),
+            fg=PALETTE["text_dim"], bg=PALETTE["bg"],
+        ).pack(pady=2)
 
-        countdown_label = tk.Label(dlg, text=f"自動跳過 Auto-skip in {countdown[0]}s",
-                                  font=("", 10), fg="orange")
+        countdown_label = tk.Label(
+            dlg, text=f"自動跳過 Auto-skip in {countdown[0]}s",
+            font=FONTS.get("body") or ("", 10),
+            fg=PALETTE["warn"], bg=PALETTE["bg"],
+        )
         countdown_label.pack(pady=5)
 
         btn_frame = ttk.Frame(dlg)

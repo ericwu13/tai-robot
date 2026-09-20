@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk
 
-from src.ui.theme import CHAT_TAGS, DOT_COLORS, FONTS, LOG_TAGS, PALETTE
+from src.ui.theme import (
+    CHAT_TAGS, FONTS, LOG_TAGS, PALETTE, style_text_widget,
+)
 
 
 class ScrollableFrame(ttk.Frame):
@@ -39,6 +41,10 @@ class ScrollableFrame(ttk.Frame):
         self.bind("<Destroy>", self._on_destroy)
         self._wheel_bound = False
 
+    def _on_linux_wheel(self, event):
+        # X11 / this preview host: Button-4 up, Button-5 down.
+        self.canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+
     def _on_body_configure(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
@@ -54,6 +60,8 @@ class ScrollableFrame(ttk.Frame):
         if self._wheel_bound:
             return
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_linux_wheel)
+        self.canvas.bind_all("<Button-5>", self._on_linux_wheel)
         self._wheel_bound = True
 
     def _unbind_wheel(self, _event=None):
@@ -61,6 +69,8 @@ class ScrollableFrame(ttk.Frame):
             return
         try:
             self.canvas.unbind_all("<MouseWheel>")
+            self.canvas.unbind_all("<Button-4>")
+            self.canvas.unbind_all("<Button-5>")
         except tk.TclError:
             pass
         self._wheel_bound = False
@@ -109,8 +119,38 @@ def attach_tooltip(widget, text: str) -> None:
     widget.bind("<Leave>", hide)
 
 
+def themed_scrolled_text(parent, *, wrap=tk.WORD, font=None, inset: bool = True,
+                         **text_kw):
+    """Text + ttk.Scrollbar well. Returns ``(frame, text)``.
+
+    ``scrolledtext.ScrolledText`` ships a raw ``tk.Scrollbar`` that stays
+    the system light chrome — this helper is the dark-theme replacement.
+    """
+    frame = ttk.Frame(parent)
+    text = tk.Text(
+        frame, wrap=wrap,
+        font=font or FONTS.get("mono") or ("Consolas", 10),
+        padx=6, pady=4, **text_kw,
+    )
+    style_text_widget(text, inset=inset)
+    vsb = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+    text.configure(yscrollcommand=vsb.set)
+    if wrap == tk.NONE:
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+        text.configure(xscrollcommand=hsb.set)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    return frame, text
+
+
 class StatusDot(ttk.Label):
-    """Colored ● plus optional label. States: ok / warn / err / off."""
+    """Colored ● plus optional label. States: ok / warn / err / off.
+
+    ``surface`` picks the fill so the dot does not punch a hole through
+    a raised strip (``"raised"``) or a card (``"card"``). Default
+    ``"bg"`` matches window / LabelFrame backgrounds.
+    """
 
     _STATE_TO_KEY = {
         "ok": "ok",
@@ -119,12 +159,37 @@ class StatusDot(ttk.Label):
         "error": "err",
         "off": "off",
     }
+    _STYLES = {
+        "bg": {
+            "ok": "Status.Ok.TLabel",
+            "warn": "Status.Warn.TLabel",
+            "err": "Status.Err.TLabel",
+            "off": "Dim.TLabel",
+        },
+        "raised": {
+            "ok": "StatusStrip.Ok.TLabel",
+            "warn": "StatusStrip.Warn.TLabel",
+            "err": "StatusStrip.Err.TLabel",
+            "off": "StatusStrip.Dim.TLabel",
+        },
+        "card": {
+            "ok": "Status.Ok.TLabel",
+            "warn": "Status.Warn.TLabel",
+            "err": "Status.Err.TLabel",
+            "off": "Card.Dim.TLabel",
+        },
+    }
 
-    def __init__(self, parent, text: str = "", **kwargs):
-        super().__init__(parent, text=self._render("off", text), **kwargs)
+    def __init__(self, parent, text: str = "", *, surface: str = "bg", **kwargs):
         self._label = text
         self._state = "off"
-        self.configure(style="Dim.TLabel")
+        self._surface = surface if surface in self._STYLES else "bg"
+        if "style" not in kwargs:
+            kwargs["style"] = self._style_for("off")
+        super().__init__(parent, text=self._render("off", text), **kwargs)
+
+    def _style_for(self, key: str) -> str:
+        return self._STYLES[self._surface][key]
 
     @staticmethod
     def _render(state: str, label: str) -> str:
@@ -133,13 +198,8 @@ class StatusDot(ttk.Label):
     def set_state(self, state: str) -> None:
         key = self._STATE_TO_KEY.get(state, "off")
         self._state = key
-        style = {
-            "ok": "Status.Ok.TLabel",
-            "warn": "Status.Warn.TLabel",
-            "err": "Status.Err.TLabel",
-            "off": "Dim.TLabel",
-        }[key]
-        self.configure(text=self._render(key, self._label), style=style)
+        self.configure(text=self._render(key, self._label),
+                       style=self._style_for(key))
 
     def set_label(self, text: str) -> None:
         self._label = text
@@ -147,7 +207,7 @@ class StatusDot(ttk.Label):
 
 
 class TagTextLog(ttk.Frame):
-    """Read-only ScrolledText with tag palette, cap, filter, search, pause.
+    """Read-only dark Text well with tag palette, cap, filter, search, pause.
 
     ``append`` must be called on the Tk thread. Producers on other threads
     must enqueue through ``_ui_queue`` (documented by the off-thread raise).
@@ -206,13 +266,11 @@ class TagTextLog(ttk.Frame):
             self._search_var = tk.StringVar(value="")
             self._pause_var = tk.BooleanVar(value=False)
 
-        self.text = scrolledtext.ScrolledText(
-            self, wrap=tk.WORD, font=self._font,
-            bg=self._bg, fg=self._fg,
-            insertbackground=PALETTE["text"],
-            state=tk.DISABLED, relief=tk.FLAT, padx=6, pady=4,
+        wrap, self.text = themed_scrolled_text(
+            self, wrap=tk.WORD, font=self._font, inset=True,
         )
-        self.text.pack(fill=tk.BOTH, expand=True)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        self.text.configure(bg=self._bg, fg=self._fg, state=tk.DISABLED)
         self.text.tag_configure("search_hit", background=PALETTE["accent"],
                                 foreground=PALETTE["bg"])
         self.text.tag_configure("info", foreground=self._fg)

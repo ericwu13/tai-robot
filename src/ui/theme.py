@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+# Plan §7 token table. text_dim (#8a8a94) is ≥4.5:1 on bg / bg_raised /
+# bg_inset (5.28 / 4.85 / 5.47) so the values stay as specified.
 PALETTE: dict[str, str] = {
     "bg": "#16161a",
     "bg_raised": "#1e1e24",
@@ -23,6 +25,11 @@ PALETTE: dict[str, str] = {
     "up": "#26a69a",
     "down": "#ef5350",
 }
+
+# Hover / pressed surfaces derived from the same tokens (not new hues).
+_HOVER = "#2a2a32"          # raised + border blend
+_DISABLED_BG = "#1a1a1e"    # sits on bg without vanishing
+_DISABLED_FG = "#5c5c66"
 
 # Report / regime card tones. Values follow the dark-theme pair (plan §7),
 # not the old light-theme #0f6e56 / #a32d2d literals.
@@ -64,18 +71,73 @@ EPISODE_TAGS: dict[str, dict[str, str]] = {
     "day": {"foreground": PALETTE["text_dim"]},
 }
 
-# Named ttk styles used by set_status / StatusDot / cards.
+# set_status styles sit on the raised status strip — using Dim.TLabel
+# (bg token) punched a darker hole in the strip.
 STATUS_LEVEL_STYLES: dict[str, str] = {
-    "info": "Dim.TLabel",
-    "ok": "Status.Ok.TLabel",
-    "warn": "Status.Warn.TLabel",
-    "error": "Status.Err.TLabel",
+    "info": "StatusStrip.Dim.TLabel",
+    "ok": "StatusStrip.Ok.TLabel",
+    "warn": "StatusStrip.Warn.TLabel",
+    "error": "StatusStrip.Err.TLabel",
 }
 
 # Populated by init_theme (tkfont.Font objects need a live Tcl interpreter).
 FONTS: dict[str, Any] = {}
 
 _THEME_INIT = False
+
+_UI_FAMILIES = (
+    "Segoe UI", "Microsoft JhengHei UI", "Microsoft JhengHei",
+    "Noto Sans CJK TC", "Noto Sans", "DejaVu Sans", "sans-serif",
+)
+_MONO_FAMILIES = (
+    "Consolas", "Cascadia Mono", "DejaVu Sans Mono", "monospace",
+)
+
+
+def _pick_family(root, candidates: tuple[str, ...]) -> str:
+    from tkinter import font as tkfont
+    available = set(tkfont.families(root))
+    for name in candidates:
+        if name in available:
+            return name
+    return candidates[-1]
+
+
+def _flat_colors(p: dict[str, str], fill: str) -> dict[str, str]:
+    """Kill clam's system light/dark bevel (the white-flash source)."""
+    return {
+        "background": fill,
+        "lightcolor": fill,
+        "darkcolor": fill,
+        "bordercolor": p["border"],
+        "focuscolor": p["accent"],
+    }
+
+
+def style_text_widget(widget, *, inset: bool = True) -> None:
+    """Apply inset-well colors to a raw Tk Text / Listbox."""
+    p = PALETTE
+    bg = p["bg_inset"] if inset else p["bg_raised"]
+    widget.configure(
+        bg=bg, fg=p["text"],
+        insertbackground=p["text"],
+        selectbackground=p["accent"],
+        selectforeground=p["text"],
+        highlightthickness=1,
+        highlightbackground=p["border"],
+        highlightcolor=p["accent"],
+        relief="flat", borderwidth=0,
+        insertwidth=2,
+    )
+
+
+def apply_window_theme(win) -> None:
+    """Paint a Toplevel so it does not flash the system light chrome."""
+    p = PALETTE
+    try:
+        win.configure(bg=p["bg"])
+    except Exception:
+        pass
 
 
 def init_theme(root) -> Any:
@@ -105,54 +167,178 @@ def init_theme(root) -> Any:
     p = PALETTE
     root.configure(bg=p["bg"])
 
-    style.configure(".", background=p["bg"], foreground=p["text"],
-                    fieldbackground=p["bg_inset"], bordercolor=p["border"],
-                    troughcolor=p["bg_inset"])
-    style.configure("TFrame", background=p["bg"])
-    style.configure("TLabel", background=p["bg"], foreground=p["text"])
-    style.configure("TButton", background=p["bg_raised"], foreground=p["text"],
-                    bordercolor=p["border"], focusthickness=1,
-                    focuscolor=p["accent"])
+    # Combobox popdown is a raw Tk Listbox — clam never themes it.
+    # Without this the dropdown is a white flash on a dark window.
+    root.option_add("*TCombobox*Listbox.background", p["bg_inset"])
+    root.option_add("*TCombobox*Listbox.foreground", p["text"])
+    root.option_add("*TCombobox*Listbox.selectBackground", p["accent"])
+    root.option_add("*TCombobox*Listbox.selectForeground", p["text"])
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
+    root.option_add("*Listbox.background", p["bg_inset"])
+    root.option_add("*Listbox.foreground", p["text"])
+    root.option_add("*Listbox.selectBackground", p["accent"])
+    root.option_add("*Listbox.selectForeground", p["text"])
+
+    style.configure(".",
+                    foreground=p["text"],
+                    fieldbackground=p["bg_inset"],
+                    troughcolor=p["bg_inset"],
+                    **_flat_colors(p, p["bg"]))
+
+    style.configure("TFrame", **_flat_colors(p, p["bg"]))
+    style.configure("TLabel", background=p["bg"], foreground=p["text"],
+                    lightcolor=p["bg"], darkcolor=p["bg"],
+                    bordercolor=p["bg"])
+    style.configure("TButton",
+                    foreground=p["text"],
+                    padding=(10, 5),
+                    focusthickness=1,
+                    **_flat_colors(p, p["bg_raised"]))
     style.map("TButton",
-              background=[("active", p["border"]), ("disabled", p["bg"])],
-              foreground=[("disabled", p["text_dim"])])
-    style.configure("TEntry", fieldbackground=p["bg_inset"],
-                    foreground=p["text"], insertcolor=p["text"],
-                    bordercolor=p["border"])
-    style.configure("TCombobox", fieldbackground=p["bg_inset"],
-                    foreground=p["text"], background=p["bg_raised"],
-                    arrowcolor=p["text"])
+              background=[("pressed", p["bg_inset"]),
+                          ("active", _HOVER),
+                          ("disabled", _DISABLED_BG)],
+              foreground=[("disabled", _DISABLED_FG)],
+              lightcolor=[("pressed", p["bg_inset"]),
+                          ("active", _HOVER),
+                          ("disabled", _DISABLED_BG)],
+              darkcolor=[("pressed", p["bg_inset"]),
+                         ("active", _HOVER),
+                         ("disabled", _DISABLED_BG)],
+              bordercolor=[("focus", p["accent"]),
+                           ("disabled", p["border"])],
+              focuscolor=[("focus", p["accent"])])
+
+    style.configure("TEntry",
+                    fieldbackground=p["bg_inset"],
+                    foreground=p["text"],
+                    insertcolor=p["text"],
+                    padding=(6, 4),
+                    **_flat_colors(p, p["bg_inset"]))
+    style.map("TEntry",
+              fieldbackground=[("disabled", _DISABLED_BG),
+                               ("focus", p["bg_inset"])],
+              foreground=[("disabled", _DISABLED_FG)],
+              bordercolor=[("focus", p["accent"])],
+              lightcolor=[("focus", p["accent"])],
+              darkcolor=[("focus", p["accent"])])
+
+    style.configure("TCombobox",
+                    fieldbackground=p["bg_inset"],
+                    foreground=p["text"],
+                    arrowcolor=p["text"],
+                    padding=(6, 3),
+                    **_flat_colors(p, p["bg_inset"]))
     style.map("TCombobox",
-              fieldbackground=[("readonly", p["bg_inset"])],
-              foreground=[("readonly", p["text"])])
-    style.configure("TNotebook", background=p["bg"], bordercolor=p["border"])
-    style.configure("TNotebook.Tab", background=p["bg_raised"],
-                    foreground=p["text_dim"], padding=(10, 4))
+              fieldbackground=[("readonly", p["bg_inset"]),
+                               ("disabled", _DISABLED_BG)],
+              foreground=[("readonly", p["text"]),
+                          ("disabled", _DISABLED_FG)],
+              background=[("readonly", p["bg_inset"]),
+                          ("disabled", _DISABLED_BG)],
+              arrowcolor=[("disabled", _DISABLED_FG)],
+              bordercolor=[("focus", p["accent"])],
+              lightcolor=[("focus", p["accent"])],
+              darkcolor=[("focus", p["accent"])])
+
+    style.configure("TNotebook",
+                    tabmargins=(4, 6, 4, 0),
+                    **_flat_colors(p, p["bg"]))
+    style.configure("TNotebook.Tab",
+                    foreground=p["text_dim"],
+                    padding=(12, 6),
+                    **_flat_colors(p, p["bg_raised"]))
     style.map("TNotebook.Tab",
-              background=[("selected", p["bg_inset"])],
-              foreground=[("selected", p["accent"])])
-    style.configure("Treeview", background=p["bg_inset"],
-                    foreground=p["text"], fieldbackground=p["bg_inset"],
-                    bordercolor=p["border"], rowheight=22)
-    style.configure("Treeview.Heading", background=p["bg_raised"],
-                    foreground=p["text"], bordercolor=p["border"])
+              background=[("selected", p["bg"]),
+                          ("active", _HOVER)],
+              foreground=[("selected", p["text"]),
+                          ("active", p["text"])],
+              lightcolor=[("selected", p["bg"]),
+                          ("active", _HOVER)],
+              darkcolor=[("selected", p["bg"]),
+                         ("active", _HOVER)],
+              bordercolor=[("selected", p["accent"])])
+
+    style.configure("Treeview",
+                    fieldbackground=p["bg_inset"],
+                    foreground=p["text"],
+                    rowheight=24,
+                    **_flat_colors(p, p["bg_inset"]))
+    style.configure("Treeview.Heading",
+                    foreground=p["text"],
+                    padding=(6, 4),
+                    **_flat_colors(p, p["bg_raised"]))
     style.map("Treeview",
               background=[("selected", p["accent"])],
-              foreground=[("selected", p["bg"])])
-    style.configure("TLabelframe", background=p["bg"], bordercolor=p["border"])
-    style.configure("TLabelframe.Label", background=p["bg"],
-                    foreground=p["text_dim"])
-    style.configure("TPanedwindow", background=p["bg"])
-    style.configure("TScrollbar", background=p["bg_raised"],
-                    troughcolor=p["bg_inset"], bordercolor=p["border"],
-                    arrowcolor=p["text"])
-    style.configure("TCheckbutton", background=p["bg"], foreground=p["text"])
-    style.configure("TRadiobutton", background=p["bg"], foreground=p["text"])
+              foreground=[("selected", p["text"])])
+    style.map("Treeview.Heading",
+              background=[("active", _HOVER)],
+              lightcolor=[("active", _HOVER)],
+              darkcolor=[("active", _HOVER)])
 
-    style.configure("Card.TFrame", background=p["bg_raised"],
-                    relief="solid", borderwidth=1)
+    style.configure("TLabelframe",
+                    relief="groove",
+                    borderwidth=1,
+                    **_flat_colors(p, p["bg"]))
+    style.configure("TLabelframe.Label",
+                    background=p["bg"],
+                    foreground=p["text_dim"],
+                    lightcolor=p["bg"],
+                    darkcolor=p["bg"])
+
+    style.configure("TPanedwindow", **_flat_colors(p, p["bg"]))
+    style.configure("Sash", sashthickness=6, **_flat_colors(p, p["border"]))
+
+    for name in ("TScrollbar", "Vertical.TScrollbar", "Horizontal.TScrollbar"):
+        style.configure(name,
+                        troughcolor=p["bg_inset"],
+                        arrowcolor=p["text_dim"],
+                        arrowsize=13,
+                        **_flat_colors(p, p["bg_raised"]))
+        style.map(name,
+                  background=[("active", _HOVER), ("disabled", p["bg"])],
+                  arrowcolor=[("disabled", _DISABLED_FG)],
+                  lightcolor=[("active", _HOVER)],
+                  darkcolor=[("active", _HOVER)])
+
+    style.configure("TCheckbutton",
+                    background=p["bg"],
+                    foreground=p["text"],
+                    indicatorcolor=p["bg_inset"],
+                    padding=2)
+    style.map("TCheckbutton",
+              background=[("active", p["bg"])],
+              foreground=[("disabled", _DISABLED_FG)],
+              indicatorcolor=[("selected", p["accent"]),
+                              ("pressed", p["accent"])])
+    style.configure("TRadiobutton",
+                    background=p["bg"],
+                    foreground=p["text"],
+                    indicatorcolor=p["bg_inset"],
+                    padding=2)
+    style.map("TRadiobutton",
+              background=[("active", p["bg"])],
+              foreground=[("disabled", _DISABLED_FG)],
+              indicatorcolor=[("selected", p["accent"]),
+                              ("pressed", p["accent"])])
+
+    style.configure("TProgressbar",
+                    troughcolor=p["bg_inset"],
+                    **_flat_colors(p, p["accent"]))
+    style.configure("Horizontal.TProgressbar",
+                    troughcolor=p["bg_inset"],
+                    **_flat_colors(p, p["accent"]))
+
+    # Cards sit on bg_raised — child labels must share that fill or they
+    # punch a bg-colored hole through the card.
+    style.configure("Card.TFrame", **_flat_colors(p, p["bg_raised"]))
+    style.configure("Card.TLabel", background=p["bg_raised"],
+                    foreground=p["text"])
+    style.configure("Card.Dim.TLabel", background=p["bg_raised"],
+                    foreground=p["text_dim"])
     style.configure("CardValue.TLabel", background=p["bg_raised"],
                     foreground=p["text"])
+
     style.configure("Status.Ok.TLabel", background=p["bg"],
                     foreground=p["ok"])
     style.configure("Status.Warn.TLabel", background=p["bg"],
@@ -161,16 +347,29 @@ def init_theme(root) -> Any:
                     foreground=p["err"])
     style.configure("Dim.TLabel", background=p["bg"],
                     foreground=p["text_dim"])
-    style.configure("StatusStrip.TFrame", background=p["bg_raised"])
 
+    style.configure("StatusStrip.TFrame", **_flat_colors(p, p["bg_raised"]))
+    style.configure("StatusStrip.TLabel", background=p["bg_raised"],
+                    foreground=p["text"])
+    style.configure("StatusStrip.Dim.TLabel", background=p["bg_raised"],
+                    foreground=p["text_dim"])
+    style.configure("StatusStrip.Ok.TLabel", background=p["bg_raised"],
+                    foreground=p["ok"])
+    style.configure("StatusStrip.Warn.TLabel", background=p["bg_raised"],
+                    foreground=p["warn"])
+    style.configure("StatusStrip.Err.TLabel", background=p["bg_raised"],
+                    foreground=p["err"])
+
+    ui = _pick_family(root, _UI_FAMILIES)
+    mono = _pick_family(root, _MONO_FAMILIES)
     FONTS.clear()
-    FONTS["title"] = tkfont.Font(root=root, family="Segoe UI", size=16, weight="bold")
-    FONTS["section"] = tkfont.Font(root=root, family="Segoe UI", size=13, weight="bold")
-    FONTS["value"] = tkfont.Font(root=root, family="Segoe UI", size=11, weight="bold")
-    FONTS["body"] = tkfont.Font(root=root, family="Segoe UI", size=10)
-    FONTS["mono"] = tkfont.Font(root=root, family="Consolas", size=10)
-    FONTS["mono_small"] = tkfont.Font(root=root, family="Consolas", size=9)
-    FONTS["mono_bold"] = tkfont.Font(root=root, family="Consolas", size=10, weight="bold")
+    FONTS["title"] = tkfont.Font(root=root, family=ui, size=16, weight="bold")
+    FONTS["section"] = tkfont.Font(root=root, family=ui, size=13, weight="bold")
+    FONTS["value"] = tkfont.Font(root=root, family=ui, size=11, weight="bold")
+    FONTS["body"] = tkfont.Font(root=root, family=ui, size=10)
+    FONTS["mono"] = tkfont.Font(root=root, family=mono, size=10)
+    FONTS["mono_small"] = tkfont.Font(root=root, family=mono, size=9)
+    FONTS["mono_bold"] = tkfont.Font(root=root, family=mono, size=10, weight="bold")
 
     _THEME_INIT = True
     return style

@@ -90,14 +90,17 @@ def test_ui_package_does_not_import_run_backtest():
         src = open(mod.__file__, encoding="utf-8").read()
         assert "import run_backtest" not in src
         assert "from run_backtest" not in src
+    widgets_src = open(widgets_mod.__file__, encoding="utf-8").read()
+    assert "from tkinter import scrolledtext" not in widgets_src
+    assert "import scrolledtext" not in widgets_src
 
 
 def test_status_level_styles_map():
-    """set_status levels → named ttk styles (chunk 2)."""
-    assert STATUS_LEVEL_STYLES["info"] == "Dim.TLabel"
-    assert STATUS_LEVEL_STYLES["ok"] == "Status.Ok.TLabel"
-    assert STATUS_LEVEL_STYLES["warn"] == "Status.Warn.TLabel"
-    assert STATUS_LEVEL_STYLES["error"] == "Status.Err.TLabel"
+    """set_status levels sit on the raised strip — not Dim.TLabel (bg hole)."""
+    assert STATUS_LEVEL_STYLES["info"] == "StatusStrip.Dim.TLabel"
+    assert STATUS_LEVEL_STYLES["ok"] == "StatusStrip.Ok.TLabel"
+    assert STATUS_LEVEL_STYLES["warn"] == "StatusStrip.Warn.TLabel"
+    assert STATUS_LEVEL_STYLES["error"] == "StatusStrip.Err.TLabel"
 
 
 # ── Tk tests ──
@@ -114,15 +117,24 @@ def test_init_theme_on_withdrawn_root_defines_named_styles():
         style = init_theme(root)
         assert isinstance(style, ttk.Style)
         for name in (
-            "Card.TFrame", "CardValue.TLabel",
+            "Card.TFrame", "CardValue.TLabel", "Card.Dim.TLabel",
             "Status.Ok.TLabel", "Status.Warn.TLabel", "Status.Err.TLabel",
             "Dim.TLabel",
+            "StatusStrip.TFrame", "StatusStrip.TLabel",
+            "StatusStrip.Dim.TLabel", "StatusStrip.Ok.TLabel",
+            "StatusStrip.Warn.TLabel", "StatusStrip.Err.TLabel",
+            "TButton", "TEntry", "TCombobox", "TNotebook.Tab",
+            "Treeview", "TLabelframe", "TScrollbar",
         ):
             # lookup returns '' for unknown options on a missing style;
             # a configured style has a background or foreground.
             fg = style.lookup(name, "foreground")
             bg = style.lookup(name, "background")
             assert fg or bg, f"named style {name} was not configured"
+        # Flat clam: no system-white bevel leftover on the window fill.
+        assert style.lookup("TFrame", "lightcolor") == PALETTE["bg"]
+        assert style.lookup("TButton", "padding")
+        assert style.lookup("Treeview", "fieldbackground") == PALETTE["bg_inset"]
         assert set(FONTS) >= {"title", "section", "value", "body", "mono", "mono_small"}
     finally:
         root.destroy()
@@ -144,9 +156,10 @@ def test_headless_bot_app_constructs_with_theme():
         assert hasattr(app, "_conn_dot")
         app.set_status("hello", "info")
         assert app.status_var.get() == "hello"
-        assert app._status_msg_label.cget("style") == "Dim.TLabel"
+        assert app._status_msg_label.cget("style") == "StatusStrip.Dim.TLabel"
         app.set_status("boom", "error")
-        assert app._status_msg_label.cget("style") == "Status.Err.TLabel"
+        assert app._status_msg_label.cget("style") == "StatusStrip.Err.TLabel"
+        assert app._conn_dot.cget("style") == "StatusStrip.Dim.TLabel"
         assert len(app._status_history) >= 2
     finally:
         try:
@@ -172,6 +185,16 @@ def test_tag_text_log_cap_trims_from_top():
         assert content[0] == "line-3"
         assert content[-1] == "line-7"
         assert len(content) == 5
+        # Dark well + ttk scrollbar (not a light tk.Scrollbar orphan).
+        assert str(log.text.cget("bg")) == PALETTE["bg_inset"]
+        from tkinter import ttk as _ttk
+        bars = [w for w in log.winfo_children()
+                if isinstance(w, (tk.Frame, _ttk.Frame))]
+        scrollbars = []
+        for w in log.winfo_children():
+            scrollbars.extend(
+                c for c in w.winfo_children() if isinstance(c, _ttk.Scrollbar))
+        assert scrollbars, "TagTextLog must use ttk.Scrollbar, not ScrolledText"
     finally:
         root.destroy()
 
@@ -225,6 +248,11 @@ def test_status_dot_states():
         assert dot.cget("style") == "Status.Err.TLabel"
         dot.set_state("off")
         assert dot.cget("style") == "Dim.TLabel"
+        raised = StatusDot(root, text="strip", surface="raised")
+        raised.set_state("ok")
+        assert raised.cget("style") == "StatusStrip.Ok.TLabel"
+        raised.set_state("off")
+        assert raised.cget("style") == "StatusStrip.Dim.TLabel"
     finally:
         root.destroy()
 
