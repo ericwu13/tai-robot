@@ -33,13 +33,21 @@ Safety asymmetry (deliberate, mirrors the design doc):
   yourself, or activate the W5 manual-tap webhook (n8n/W5_manual_tap.json)
   and tap the Discord link.
 
-Session hand-offs are handled by the quote-freshness guard alone: whichever
-markets are closed simply go stale and drop out of every decision, so one
-symbol table covers Tokyo/Seoul, Frankfurt/Amsterdam and New York without any
+Session hand-offs are handled by the quote-freshness guard, so one symbol
+table covers Tokyo/Seoul, Frankfurt/Amsterdam and New York without any
 per-symbol clock logic.  The allowance is PER SYMBOL (``max_age``), because
 Yahoo is real-time only for US cash — it publishes CME futures ~10 min and
 Asian/European quotes ~15-20 min delayed.  A single 10-minute guard silently
 discarded a live KOSPI -4% print and every NQ=F quote ever.
+
+The stamp alone is NOT enough (issue #137).  On Sun 2026-09-20 Yahoo served a
+closed ^TWII with an ADVANCING ``regularMarketTime`` — trailing wall-clock by
+the usual ~20 min — while ``currentTradingPeriod`` and every bar in the same
+response were Friday's and the price never moved.  Friday's +2.90% read as a
+20-minute-old print and re-alerted on a day TWSE never opened.  So freshness
+is judged against the LAST BAR too (``quote_freshness``): a stamp that runs
+away from the bars is capped, and a re-stamped closed market ages out through
+the normal ``max_age`` path.  It is an ADDITIONAL reject, never a replacement.
 
 Usage:
     # one check, print only (no files written unless a threshold fires)
@@ -131,6 +139,19 @@ VOTE_THRESHOLDS = {sym: cfg["vote"] for sym, cfg in SYMBOLS.items()}
 VOTE_MIN_SYMBOLS = 2
 
 QUOTE_MAX_AGE_SEC = 600    # default allowance for symbols with no max_age
+
+# Stamp-vs-bars guard (issue #137).  The chart request is interval=1m, so the
+# newest bar is at most one bar behind a live stamp; the grace on top absorbs
+# the closing prints that legitimately land AFTER the last bar.  Measured
+# across all 11 symbols in one live probe (2026-09-20): SOXX/QQQ/TSM +1-2 s,
+# ^HSI -2 s, 000001.SS +24 s, ASML.AS +327 s, ^N225 +903 s and ^STOXX50E
+# +1800 s (the two closing auctions) — so one hour is the worst legitimate
+# case doubled.  It is deliberately generous: this guard exists to catch a
+# stamp from ANOTHER SESSION (the ^TWII phantom sat 46 h past its last bar),
+# not to shave minutes off a live feed, and the per-symbol max_age above is
+# still what decides freshness inside a session.
+BAR_INTERVAL_SEC = 60
+STAMP_BAR_GRACE_SEC = 3600
 # TPE hours.  The day window runs to 15:00 (not 14:00) so the Korea/Japan
 # closing prints — 14:30-14:50 TPE, routinely the sharpest move of their
 # session — are still fresh when the Taiwan night session opens at 15:00.
@@ -146,27 +167,105 @@ LOG_KEEP_LINES = 2000
 _UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)", "Connection": "close"}
 
 
+def _epoch(value) -> int | None:
+    """An epoch field Yahoo may omit or serve as null."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_quote(symbol: str) -> dict | None:
-    """Return {price, prev_close, pct, quote_time} or None on any failure."""
+    """Return one quote dict or None on any failure.
+
+    Keys: price, prev_close, pct, quote_time, plus the three fields
+    ``quote_freshness`` cross-checks the stamp against — all read from the
+    SAME response, so the guard costs no extra request:
+    ``last_bar_time`` (the newest 1-min bar, None when Yahoo serves no
+    ``timestamp[]`` at all) and ``period_start``/``period_end``
+    (``meta.currentTradingPeriod.regular``, diagnostics only — see
+    ``quote_freshness`` for why they are not a reject).
+    """
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
            f"?interval=1m&range=1d")
     try:
         req = urllib.request.Request(url, headers=_UA)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
-        meta = data["chart"]["result"][0]["meta"]
+        result = data["chart"]["result"][0]
+        meta = result["meta"]
         price = float(meta["regularMarketPrice"])
         prev = float(meta.get("chartPreviousClose") or meta.get("previousClose"))
         qtime = int(meta["regularMarketTime"])
+        period = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+        bars = [t for t in (result.get("timestamp") or []) if t is not None]
         return {
             "price": price,
             "prev_close": prev,
             "pct": (price - prev) / prev * 100.0,
             "quote_time": qtime,
+            "last_bar_time": _epoch(bars[-1]) if bars else None,
+            "period_start": _epoch(period.get("start")),
+            "period_end": _epoch(period.get("end")),
         }
     except Exception as e:                                    # noqa: BLE001
         print(f"  [{symbol}] fetch failed: {type(e).__name__}: {e}")
         return None
+
+
+def quote_freshness(q: dict, max_age: float, now: float,
+                    grace: float = STAMP_BAR_GRACE_SEC) -> tuple[bool, float, str]:
+    """Decide whether *q* may take part in a decision.  Pure: no clock, no I/O.
+
+    Returns ``(fresh, age, reason)``.  *reason* is the log suffix and is
+    non-empty whenever something is worth saying, fresh or not.
+
+    Two rejects, both derived from the one Yahoo response:
+
+    1. The stamp is older than the symbol's *max_age* — the original guard,
+       untouched.
+    2. The stamp does not belong to the bars (issue #137).  The effective
+       quote time is capped at ``last_bar_time + BAR_INTERVAL_SEC + grace``,
+       so a re-stamped closed market ages out through (1) instead of
+       reading as brand new.  Capping can only ever make a quote older,
+       which is what keeps this an ADDITIONAL reject: no quote that the
+       max_age guard rejects today can start passing because of it.
+
+    ``meta.currentTradingPeriod`` is deliberately NOT a reject.  A live
+    probe (2026-09-20) found it inconsistent between symbols — ^KS11/^HSI/
+    ^TWII/000001.SS had already rolled forward to the NEXT session while
+    ^N225/ASML.AS still reported the past one — so "stamp inside the
+    period" would throw away a delayed closing quote that arrives just
+    after the roll.  The bars carry the same information and never lie
+    about which session they came from.
+
+    No usable ``timestamp[]`` (Yahoo served an empty one for NQ=F between
+    Globex sessions in that same probe) falls back to *max_age* alone and
+    says so: fail-closed there would drop such a symbol on every poll,
+    which is a worse failure than the one being fixed — and the phantom
+    payload this guards against does carry bars.
+    """
+    qtime = q["quote_time"]
+    last_bar = q.get("last_bar_time")
+    if not last_bar:
+        age = now - qtime
+        if age <= max_age:
+            return True, age, "no bar timestamps — max_age only"
+        return False, age, f"STALE > {max_age}s allowance"
+    ceiling = last_bar + BAR_INTERVAL_SEC + grace
+    effective = min(qtime, ceiling)
+    age = now - effective
+    if age <= max_age:
+        return True, age, ""
+    # Name the cap only when the cap is what rejected it — an ordinary old
+    # quote must keep reading as an ordinary old quote in monitor.log.
+    if effective < qtime and (now - qtime) <= max_age:
+        reason = ("STALE — stamp outside last bar/trading period "
+                  f"({qtime - last_bar:.0f}s past the last 1m bar")
+        if q.get("period_end"):
+            reason += f", {qtime - q['period_end']:+.0f}s vs trading-period end"
+        return False, age, reason + ")"
+    return False, age, f"STALE > {max_age}s allowance"
 
 
 def write_signal(path: str, action: str, reason: str, source: str,
@@ -315,12 +414,13 @@ def _collect_quotes(args) -> tuple[dict[str, dict], dict[str, list[str]], list[s
         if q is None:
             fetch_failures += 1
             continue
-        age = time.time() - q["quote_time"]
         max_age = cfg.get("max_age", QUOTE_MAX_AGE_SEC)
-        stale = age > max_age and not args.ignore_freshness
+        ok, age, reason = quote_freshness(q, max_age, time.time())
+        stale = not ok and not args.ignore_freshness
         print(f"  [{sym}] {q['pct']:+.2f}% (px {q['price']:.2f} vs pc "
               f"{q['prev_close']:.2f}, quote age {age:.0f}s"
-              + (f", STALE > {max_age}s allowance — ignored" if stale else "") + ")")
+              + (f", {reason}" if reason else "")
+              + (" — ignored" if stale else "") + ")")
         if stale:
             continue
         fresh[sym] = q

@@ -47,14 +47,28 @@ FROZEN_NOW = datetime(2026, 8, 5, 22, 30, tzinfo=TPE)
 
 # ── harness ────────────────────────────────────────────────────────────
 
-def quote(pct: float, age_sec: float = 0.0) -> dict:
-    """A Yahoo-shaped quote dict *age_sec* seconds old."""
+def quote(pct: float, age_sec: float = 0.0, bar_age_sec: float | None = None,
+          with_bars: bool = True) -> dict:
+    """A Yahoo-shaped quote dict *age_sec* seconds old.
+
+    The last 1-min bar sits 60 s behind the stamp by default — what a live
+    feed looks like.  *bar_age_sec* ages the BARS independently of the
+    stamp (issue #137's re-stamped closed market), and *with_bars=False*
+    drops ``timestamp[]`` entirely (Yahoo returns none between sessions).
+    """
     prev = 100.0
+    now = time.time()
+    if bar_age_sec is None:
+        bar_age_sec = age_sec + 60
+    last_bar = None if not with_bars else now - bar_age_sec
     return {
         "price": prev * (1 + pct / 100.0),
         "prev_close": prev,
         "pct": pct,
-        "quote_time": time.time() - age_sec,
+        "quote_time": now - age_sec,
+        "last_bar_time": last_bar,
+        "period_start": None if last_bar is None else last_bar - 4 * 3600,
+        "period_end": last_bar,
     }
 
 
@@ -351,6 +365,177 @@ def test_ignore_freshness_accepts_stale_quote(tmp_path, market, discord, frozen_
     cm.check_once(args, {})
 
     assert signal_of(args) is not None
+
+
+# ── 4b. the stamp must belong to the bars (issue #137) ─────────────────
+# On Sun 2026-09-20 Yahoo re-stamped a CLOSED ^TWII with an ADVANCING
+# regularMarketTime (trailing wall-clock by the usual ~20 min) while every
+# bar in the same response was Friday's and the price never moved.  Friday's
+# +2.90% therefore read as a 20-minute-old print and re-alerted on a day
+# TWSE never opened.  max_age alone cannot see this: the stamp is young.
+
+TWO_DAYS = 2 * 86400
+
+
+def phantom(pct: float) -> dict:
+    """The 2026-09-20 payload shape: stamp 1200 s old, bars two days old."""
+    return quote(pct, age_sec=1200, bar_age_sec=TWO_DAYS)
+
+
+def test_restamped_closed_market_drops_out_of_every_decision(
+        tmp_path, market, discord, frozen_clock):
+    market["^TWII"] = phantom(2.90)
+    args = make_args(tmp_path, vote_out=str(tmp_path / "regime_vote.json"))
+
+    state = cm.check_once(args, {})
+
+    assert discord == [], "a two-day-old print must not alert"
+    assert "alert-up:2026-08-05" not in state
+    assert "fresh 0/11" in state["last_result"]
+    assert not (tmp_path / "regime_vote_w2.json").exists()
+
+
+def test_phantom_stamp_is_excluded_from_fresh_and_from_breaches(tmp_path, market):
+    market["^TWII"] = phantom(2.90)
+    market["^N225"] = quote(2.1)                     # genuinely live
+
+    fresh, breaches, details, _ = cm._collect_quotes(make_args(tmp_path))
+
+    assert "^TWII" not in fresh and "^N225" in fresh
+    assert breaches["alert_up"] == ["^N225 +2.10%"]
+    assert details == ["^N225 +2.10%"]
+    assert cm._vote_direction(fresh)[0] is None, "one symbol is not a quorum"
+
+
+def test_phantom_symbol_cannot_complete_the_vote_quorum(
+        tmp_path, market, discord, frozen_clock):
+    """The latent half of #137: ^TWII carries vote thresholds, so a
+    phantom-fresh stale print plus ONE genuinely fresh breach used to be a
+    quorum — a regime vote backed by a two-day-old close."""
+    market["^TWII"] = phantom(2.90)                  # votes up at 1.5
+    market["^N225"] = quote(2.1)                     # votes up at 2.0
+    args = make_args(tmp_path, vote_out=str(tmp_path / "regime_vote.json"))
+
+    state = cm.check_once(args, {})
+
+    assert not (tmp_path / "regime_vote_w2.json").exists()
+    assert "vote:2026-08-05" not in state
+    assert all("^TWII" not in m for m in discord)
+
+
+def test_a_stamp_hours_past_the_last_bar_is_rejected_whoever_sends_it(
+        tmp_path, market):
+    """Not a ^TWII special case — nothing restricted the phantom stamp to
+    one symbol.  The same probe caught ^KS11 stamped 19:05 TPE against a
+    14:00 TPE last bar (5.1 h), which the max_age guard alone reads as a
+    five-minute-old quote."""
+    market["^KS11"] = quote(-2.4, age_sec=300, bar_age_sec=5.1 * 3600)
+
+    fresh, _, _, _ = cm._collect_quotes(make_args(tmp_path))
+
+    assert "^KS11" not in fresh
+
+
+def test_reject_reason_names_the_stamp_mismatch(
+        tmp_path, market, discord, frozen_clock, capsys):
+    """monitor.log/stdout must say WHY, or the next occurrence costs another
+    afternoon of raw-payload archaeology."""
+    market["^TWII"] = phantom(2.90)
+
+    cm.check_once(make_args(tmp_path), {})
+
+    assert "STALE — stamp outside last bar/trading period" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("symbol,pct,age_sec,bar_age_sec,why", [
+    ("QQQ", -2.4, 30, 90, "US cash — Yahoo real-time, bars track the stamp"),
+    ("^N225", -2.4, 300, 1203, "Tokyo closing auction: stamp 903 s past the last bar"),
+    ("^STOXX50E", -2.4, 300, 2100, "Euronext close: stamp 1800 s past the last bar"),
+    ("NQ=F", -2.0, 610, 670, "Globex 10-min delayed — already borderline on max_age"),
+])
+def test_live_market_payloads_still_count_as_fresh(
+        tmp_path, market, symbol, pct, age_sec, bar_age_sec, why):
+    """Every stamp-minus-last-bar gap here was measured in the live probe of
+    2026-09-20; the closing-auction prints are the reason the grace is wide."""
+    market[symbol] = quote(pct, age_sec=age_sec, bar_age_sec=bar_age_sec)
+
+    fresh, _, _, _ = cm._collect_quotes(make_args(tmp_path))
+
+    assert symbol in fresh, why
+
+
+def test_payload_without_bars_falls_back_to_the_max_age_guard(
+        tmp_path, market, capsys):
+    """Fail OPEN, deliberately: Yahoo served NQ=F with an empty
+    ``timestamp[]`` between Globex sessions in the 2026-09-20 probe, and the
+    new rule is an ADDITIONAL reject on top of max_age, never a replacement.
+    Fail-closed there would delete the symbol from the table on every poll."""
+    market["NQ=F"] = quote(-2.0, age_sec=610, with_bars=False)
+    market["^N225"] = quote(-2.4, age_sec=9000, with_bars=False)   # plain old stale
+
+    fresh, _, _, _ = cm._collect_quotes(make_args(tmp_path))
+
+    assert "NQ=F" in fresh
+    assert "^N225" not in fresh, "max_age still rejects on its own"
+    assert "no bar timestamps" in capsys.readouterr().out
+
+
+def test_ignore_freshness_still_overrides_the_new_reject(tmp_path, market, discord,
+                                                         frozen_clock):
+    market["SOXX"] = phantom(-5.0)
+    market["QQQ"] = phantom(-4.0)
+    args = make_args(tmp_path, ignore_freshness=True)
+
+    cm.check_once(args, {})
+
+    assert signal_of(args) is not None
+
+
+# ── the freshness verdict itself: pure, no clock, no network ───────────
+
+def test_quote_freshness_caps_the_stamp_at_the_last_bar():
+    now = 1_000_000.0
+    live = {"quote_time": now - 30, "last_bar_time": now - 90}
+    fresh, age, reason = cm.quote_freshness(live, 600, now)
+    assert fresh and reason == ""
+    assert age == pytest.approx(30)
+
+    stamped = {"quote_time": now - 1200, "last_bar_time": now - TWO_DAYS}
+    fresh, age, reason = cm.quote_freshness(stamped, 1500, now)
+    assert not fresh
+    assert age == pytest.approx(
+        TWO_DAYS - cm.BAR_INTERVAL_SEC - cm.STAMP_BAR_GRACE_SEC)
+    assert "stamp outside last bar/trading period" in reason
+    assert f"{TWO_DAYS - 1200}s past the last 1m bar" in reason
+
+
+def test_quote_freshness_keeps_the_max_age_reason_for_an_ordinary_old_quote():
+    now = 1_000_000.0
+    q = {"quote_time": now - 2000, "last_bar_time": now - 2060}
+
+    fresh, age, reason = cm.quote_freshness(q, 1500, now)
+
+    assert not fresh and age == pytest.approx(2000)
+    assert reason == "STALE > 1500s allowance"
+
+
+def test_grace_covers_the_widest_observed_closing_auction_print():
+    """Probe of 2026-09-20: the largest legitimate stamp-minus-last-bar gap
+    across all 11 symbols was ^STOXX50E at +1800 s (^N225 +903 s)."""
+    assert cm.STAMP_BAR_GRACE_SEC >= 2 * 1800
+    now = 1_000_000.0
+    auction = {"quote_time": now - 60, "last_bar_time": now - 60 - 1800}
+
+    assert cm.quote_freshness(auction, 1500, now)[0]
+
+
+def test_quote_freshness_without_bars_is_max_age_only():
+    now = 1_000_000.0
+    fresh, age, reason = cm.quote_freshness({"quote_time": now - 610}, 900, now)
+    assert fresh and age == pytest.approx(610)
+    assert "no bar timestamps" in reason, "the fallback must be visible in the log"
+
+    assert not cm.quote_freshness({"quote_time": now - 9000}, 900, now)[0]
 
 
 # ── 5. dedup ───────────────────────────────────────────────────────────

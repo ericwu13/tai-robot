@@ -132,6 +132,15 @@ lost exactly this way).
    older than that symbol's `max_age`. **That freshness guard is the only session logic
    there is** — markets that are closed go stale and drop out of every decision, which is
    what lets one table span Tokyo, Frankfurt and New York.
+   **The vendor's timestamp is not trusted on its own** (issue #137): Yahoo served a closed
+   `^TWII` with an advancing `regularMarketTime` on Sun 2026-09-20 while every bar in the
+   same response was Friday's, so Friday's +2.90% re-alerted as a 20-minute-old print. The
+   effective quote time is therefore capped at `timestamp[-1] + 60 s + 1 h` — a stamp that
+   runs away from its own bars ages out through `max_age` as it should, and the reject is
+   logged as `STALE — stamp outside last bar/trading period`. It is an **additional**
+   reject: nothing `max_age` rejects today starts passing because of it, and a response
+   with no `timestamp[]` at all (Yahoo does that for `NQ=F` between Globex sessions) falls
+   back to `max_age` alone.
    The allowance is **per symbol**, not global — match it to the feed's latency:
    **600 s** US cash equities/ETFs (real-time on Yahoo: `SOXX`, `TSM`, `QQQ`),
    **900 s** CME futures (~10 min delayed: `NQ=F`),
