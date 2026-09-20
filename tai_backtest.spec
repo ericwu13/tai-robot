@@ -101,7 +101,7 @@ a = Analysis(
         # Self-update
         'src.updater',
         # Tk workbench theme / widgets / labels (Phase 1 UI modernization)
-        'src.ui', 'src.ui.theme', 'src.ui.widgets', 'src.ui.labels',
+        'src.ui', 'src.ui.theme', 'src.ui.widgets', 'src.ui.raster', 'src.ui.labels',
     ],
     hookspath=[],
     hooksconfig={},

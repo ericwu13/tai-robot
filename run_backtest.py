@@ -125,12 +125,13 @@ from src.market_data.kchart_fetcher import (
 
 # TAIFEX public data (no API key needed)
 from src.ui.theme import (
-    CHAT_TAGS, EPISODE_TAGS, FONTS, LOG_TAGS, PALETTE,
-    STATUS_LEVEL_STYLES, TONE, apply_window_theme, init_theme,
-    style_text_widget,
+    CHAT_TAGS, EPISODE_TAGS, FONTS, LOG_TAGS, PALETTE, ROW_TONE, S,
+    STATUS_LEVEL_STYLES, TONE, apply_window_theme, enable_dpi_awareness,
+    init_theme,
 )
 from src.ui.widgets import (
-    ScrollableFrame, StatusDot, TagTextLog, attach_tooltip,
+    FlowFrame, ScrollableFrame, StatCard, StatusDot, TagTextLog,
+    attach_tooltip, enable_row_hover, place_dialog, scrolled_tree,
     themed_scrolled_text,
 )
 from src.ui.labels import CHAT_PLACEHOLDER, READY, REPORT_EMPTY
@@ -912,13 +913,18 @@ class BacktestApp:
         _app = self
 
         self.root = root
+        # HeadlessBotApp sets ``policy`` before delegating here. Headless
+        # bots get no theme at all: widget construction stays identical to
+        # the unthemed app and the live path does zero extra work.
+        self._headless = getattr(self, "policy", None) is not None
         self.root.title(f"tai-robot AI 策略工作台 AI Strategy Workbench v{APP_VERSION}")
-        self.root.geometry("1400x850")
-        self.root.minsize(1100, 650)
-        try:
-            self.root.state("zoomed")  # start maximized (Windows)
-        except tk.TclError:
-            pass
+        # Build hidden, reveal once complete (see end of __init__): the
+        # window never paints half-constructed, and headless bots never
+        # flash one at all.
+        self.root.withdraw()
+        init_theme(self.root, minimal=self._headless)
+        self.root.geometry(f"{S(1400)}x{S(850)}")
+        self.root.minsize(S(1100), S(650))
 
         self._settings = _load_settings()
         self._fetcher = KChartFetcher()
@@ -931,7 +937,6 @@ class BacktestApp:
         self._ai_strategy_cls: type[BacktestStrategy] | None = None
         self._strategy_store = StrategyStore(os.path.join(project_root, "strategies"))
 
-        init_theme(self.root)
         self._status_history: deque = deque(maxlen=20)
         self._rendered_trade_count: int = 0
         self._report_render_pending: bool = False
@@ -957,6 +962,15 @@ class BacktestApp:
         except Exception:
             pass
         threading.Thread(target=self._check_for_updates_bg, daemon=True).start()
+
+        if not self._headless:
+            self.root.deiconify()
+            try:
+                self.root.state("zoomed")  # start maximized (Windows)
+            except tk.TclError:
+                pass
+            # The caption bar only exists once the window is mapped.
+            apply_window_theme(self.root, caption=PALETTE["bg_raised"])
 
     # ══════════════════════════════════════════════════════════════
     #  COM → UI QUEUE DRAIN (main thread)
@@ -1101,10 +1115,18 @@ class BacktestApp:
             except tk.TclError:
                 pass
 
+    _CONN_LABELS = {
+        "off": "未連線 Offline",
+        "ok": "已連線 Connected",
+        "warn": "連線中 Connecting",
+        "err": "斷線 Disconnected",
+    }
+
     def _set_conn_dot(self, state: str) -> None:
         dot = getattr(self, "_conn_dot", None)
         if dot is not None:
             try:
+                dot.set_label(self._CONN_LABELS.get(state, self._CONN_LABELS["off"]))
                 dot.set_state(state)
             except tk.TclError:
                 pass
@@ -1113,31 +1135,45 @@ class BacktestApp:
         """Click-to-open popover of the last 20 status messages."""
         dlg = tk.Toplevel(self.root)
         dlg.title("狀態紀錄 Status History")
-        dlg.geometry("520x280")
         dlg.transient(self.root)
         apply_window_theme(dlg)
-        log = TagTextLog(dlg, show_toolbar=False, max_lines=20)
-        log.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        body = ttk.Frame(dlg, padding=S(14))
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(body, text="關閉 Close", command=dlg.destroy).pack(
+            side=tk.BOTTOM, anchor="e", pady=S(10, 0))
+        log = TagTextLog(body, show_toolbar=False, max_lines=20)
+        log.pack(fill=tk.BOTH, expand=True)
         tag_for = {"info": "info", "ok": "entry", "warn": "status", "error": "exit"}
         for ts, level, msg in self._status_history:
             log.append(f"[{ts}] {msg}", tag_for.get(level, "info"))
-        ttk.Button(dlg, text="關閉 Close", command=dlg.destroy).pack(pady=(0, 8))
+        place_dialog(dlg, self.root, 620, 360)
 
     def _build_status_strip(self, parent) -> None:
-        """Bottom strip: connection dot + message + last-20 history button."""
-        strip = ttk.Frame(parent, style="StatusStrip.TFrame")
+        """Bottom strip: latest status message + last-20 history button.
+
+        The connection dot lives in the top bar (``_build_top_bar``).
+        """
+        strip = ttk.Frame(parent, style="StatusStrip.TFrame",
+                          padding=S(16, 3, 8, 3))
         strip.pack(side=tk.BOTTOM, fill=tk.X)
         # Packed after the strip so the hairline sits *above* it (pack BOTTOM).
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
-        self._conn_dot = StatusDot(strip, text="連線 Conn", surface="raised")
-        self._conn_dot.pack(side=tk.LEFT, padx=(8, 10), pady=3)
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
         self._status_msg_label = ttk.Label(
             strip, textvariable=self.status_var, style="StatusStrip.Dim.TLabel")
-        self._status_msg_label.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=3)
-        ttk.Button(strip, text="紀錄 History", width=12,
-                   command=self._show_status_history).pack(
-            side=tk.RIGHT, padx=6, pady=2)
+        self._status_msg_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.btn_update = ttk.Button(
+            strip, text="檢查更新 Check for Updates", style="Bar.Ghost.TButton",
+            command=self._start_update)
+        self.btn_update.pack(side=tk.RIGHT)
+        attach_tooltip(self.btn_update,
+                       "請先停止所有機器人\nStop all running bots first")
+        self.btn_report = ttk.Button(
+            strip, text="回報問題 Report Issue", style="Bar.Ghost.TButton",
+            command=self._report_issue)
+        self.btn_report.pack(side=tk.RIGHT)
+        ttk.Button(strip, text="紀錄 History", style="Bar.Ghost.TButton",
+                   command=self._show_status_history).pack(side=tk.RIGHT)
 
     def _oi_wait_must_block(self) -> bool:
         """Headless (or unmapped) roots cannot pump an after() OI poll.
@@ -1545,12 +1581,14 @@ class BacktestApp:
     # ══════════════════════════════════════════════════════════════
 
     def _build_ui(self):
-        # Status strip packs BOTTOM first so the paned workbench fills the rest.
+        # Status strip packs BOTTOM and the context bar TOP first, so the
+        # paned workbench fills whatever is left.
         self._build_status_strip(self.root)
+        self._build_top_bar(self.root)
 
         # Main horizontal split
         paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        paned.pack(fill=tk.BOTH, expand=True, padx=S(14), pady=S(12, 10))
 
         # Left: Chat panel
         left = ttk.Frame(paned)
@@ -1649,170 +1687,187 @@ class BacktestApp:
         self._live_history_tick_count: int = 0
         self._live_stale_drops: int = 0
 
+    def _build_top_bar(self, parent) -> None:
+        """Full-width context bar: brand, symbol/strategy, connection + login.
+
+        A FlowFrame, so the login group drops to a second row on narrow
+        windows instead of clipping.
+        """
+        bar = ttk.Frame(parent, style="Bar.TFrame", padding=S(16, 10, 16, 10))
+        bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
+        flow = FlowFrame(bar, gap=18, row_gap=8, style="Bar.TFrame")
+        flow.pack(fill=tk.X)
+
+        def group(gap: int = 18):
+            frame = ttk.Frame(flow, style="Bar.TFrame")
+            flow.add(frame, gap=gap)
+            return frame
+
+        brand = group(gap=28)
+        ttk.Label(brand, text="tai-robot", style="Bar.Title.TLabel").pack(side=tk.LEFT)
+        ttk.Label(brand, text=f"v{APP_VERSION}", style="Bar.Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(8, 0), pady=S(3, 0))
+
+        g = group()
+        ttk.Label(g, text="商品 Symbol", style="Bar.Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
+        self.symbol_var = tk.StringVar(value="TX00")
+        self.symbol_combo = ttk.Combobox(
+            g, textvariable=self.symbol_var, width=8, state="readonly",
+            values=list(SYMBOL_CONFIG.keys()), style="Bar.TCombobox")
+        self.symbol_combo.pack(side=tk.LEFT)
+        self.symbol_combo.bind("<<ComboboxSelected>>", lambda e: self._on_symbol_changed())
+
+        g = group()
+        ttk.Label(g, text="策略 Strategy", style="Bar.Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
+        self.strategy_var = tk.StringVar(value=list(STRATEGIES.keys())[0])
+        self.strategy_combo = ttk.Combobox(
+            g, textvariable=self.strategy_var, width=30, state="readonly",
+            values=list(STRATEGIES.keys()), style="Bar.TCombobox")
+        self.strategy_combo.pack(side=tk.LEFT)
+        ttk.Button(g, text="原始碼 Source", style="Bar.Ghost.TButton",
+                   command=self._show_strategy_source).pack(side=tk.LEFT, padx=S(4, 0))
+
+        flow.add_spacer()
+
+        g = group(gap=14)
+        self._conn_dot = StatusDot(g, text=self._CONN_LABELS["off"], surface="raised")
+        self._conn_dot.pack(side=tk.LEFT)
+
+        g = group(gap=0)
+        ttk.Label(g, text="帳號 User ID", style="Bar.Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
+        self.login_user_var = tk.StringVar(value=self._settings.get("user_id", ""))
+        ttk.Entry(g, textvariable=self.login_user_var, width=14,
+                  style="Bar.TEntry").pack(side=tk.LEFT, padx=S(0, 12))
+        ttk.Label(g, text="密碼 Password", style="Bar.Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
+        self.login_pass_var = tk.StringVar(value=self._settings.get("password", ""))
+        ttk.Entry(g, textvariable=self.login_pass_var, width=14, show="•",
+                  style="Bar.TEntry").pack(side=tk.LEFT, padx=S(0, 12))
+        self.btn_login = ttk.Button(g, text="登入 Login", style="Bar.Accent.TButton",
+                                    command=self._manual_login)
+        self.btn_login.pack(side=tk.LEFT, padx=S(0, 6))
+        self.btn_reconnect = ttk.Button(g, text="重新連線 Reconnect", style="Bar.TButton",
+                                        command=self._manual_reconnect, state=tk.DISABLED)
+        self.btn_reconnect.pack(side=tk.LEFT)
+        self.login_status_var = tk.StringVar(value="")
+        ttk.Label(g, textvariable=self.login_status_var,
+                  style="Bar.Dim.TLabel").pack(side=tk.LEFT, padx=S(10, 0))
+
     def _build_chat_panel(self, parent):
-        # ── Header ──
-        header = ttk.Frame(parent)
-        header.pack(fill=tk.X, padx=4, pady=(4, 2))
+        parent.configure(padding=S(0, 0, 6, 0))
 
-        ttk.Label(header, text="AI 策略工作台",
-                  font=FONTS.get("section") or ("", 13, "bold")).pack(side=tk.LEFT)
-        ttk.Button(header, text="New Chat", width=9, command=self._reset_chat).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(header, text="Load Chat", width=9, command=self._load_chat_session).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(header, text="Save Chat", width=9, command=self._save_chat_session).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(header, text="Settings", width=8, command=self._show_api_key_dialog).pack(side=tk.RIGHT, padx=2)
-        self.btn_ultra = ttk.Button(header, width=14, command=self._toggle_ultra_mode)
-        self.btn_ultra.pack(side=tk.RIGHT, padx=2)
+        # ── Header (wraps when the pane is dragged narrow) ──
+        header = FlowFrame(parent, gap=0, row_gap=2)
+        header.pack(fill=tk.X, pady=S(0, 8))
+        self._chat_header = header
+        header.add(ttk.Label(header, text="AI 策略工作台", style="Section.TLabel"),
+                   gap=12)
+        header.add_spacer()
+        self.btn_ultra = header.add(ttk.Button(
+            header, style="Ghost.TButton", command=self._toggle_ultra_mode))
         self._update_ultra_button()
+        for text, command in (
+                ("Settings", self._show_api_key_dialog),
+                ("Save Chat", self._save_chat_session),
+                ("Load Chat", self._load_chat_session),
+                ("New Chat", self._reset_chat)):
+            header.add(ttk.Button(header, text=text, style="Ghost.TButton",
+                                  command=command))
 
-        # ── Chat display ──
+        # ── Chat display: prose in the UI font, code in mono ──
         self.chat_display = TagTextLog(
             parent, tags=CHAT_TAGS, show_toolbar=False,
             placeholder=CHAT_PLACEHOLDER,
-            bg=PALETTE["bg_inset"], fg=PALETTE["text"],
-            font=FONTS.get("mono") or ("Consolas", 10),
+            font=FONTS.get("body") or ("", 10),
         )
-        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+        self.chat_display.config(spacing1=S(1), spacing3=S(1))
         self.chat_display.tag_configure(
             "user", foreground=CHAT_TAGS["user"]["foreground"],
-            font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"))
+            font=FONTS.get("body_bold") or ("", 10, "bold"))
         self.chat_display.tag_configure(
             "code", foreground=CHAT_TAGS["code"]["foreground"],
             font=FONTS.get("mono_small") or ("Consolas", 9))
 
-        # ── Input area ──
-        input_frame = ttk.Frame(parent)
-        input_frame.pack(fill=tk.X, padx=4, pady=2)
-
-        self.chat_input = tk.Text(
-            input_frame, height=3,
-            font=FONTS.get("mono") or ("Consolas", 10),
-            padx=6, pady=4,
-        )
-        style_text_widget(self.chat_input, inset=False)
-        self.chat_input.pack(fill=tk.X, expand=True)
+        # ── Input: a well that lights up while focused ──
+        input_well, self.chat_input = themed_scrolled_text(
+            parent, height=3, font=FONTS.get("body") or ("", 10),
+            focus_ring=True, scrollbar=False)
         self.chat_input.bind("<Return>", self._on_chat_enter)
         self.chat_input.bind("<Shift-Return>", lambda e: None)  # allow newline
 
         # ── Action buttons ──
         btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, padx=4, pady=(2, 4))
-
-        self.btn_send = ttk.Button(btn_frame, text="Send", width=7, command=self._send_chat)
-        self.btn_send.pack(side=tk.LEFT, padx=2)
-
+        self.btn_send = ttk.Button(btn_frame, text="Send", style="Accent.TButton",
+                                   command=self._send_chat)
+        self.btn_send.pack(side=tk.LEFT, padx=S(0, 6))
         self.btn_generate = ttk.Button(btn_frame, text="Generate Strategy",
-                                        command=self._generate_strategy, state=tk.NORMAL)
-        self.btn_generate.pack(side=tk.LEFT, padx=2)
-
+                                       command=self._generate_strategy, state=tk.NORMAL)
+        self.btn_generate.pack(side=tk.LEFT, padx=S(0, 6))
         self.btn_pine = ttk.Button(btn_frame, text="Export Pine",
-                                    command=self._export_pine, state=tk.DISABLED)
-        self.btn_pine.pack(side=tk.LEFT, padx=2)
-
+                                   command=self._export_pine, state=tk.DISABLED)
+        self.btn_pine.pack(side=tk.LEFT, padx=S(0, 6))
         self.btn_save_strategy = ttk.Button(btn_frame, text="Save Strategy",
-                                             command=self._save_strategy, state=tk.DISABLED)
-        self.btn_save_strategy.pack(side=tk.LEFT, padx=2)
+                                            command=self._save_strategy, state=tk.DISABLED)
+        self.btn_save_strategy.pack(side=tk.LEFT)
 
-        # ── Saved strategies dropdown ──
+        # ── Saved strategies ──
         saved_frame = ttk.Frame(parent)
-        saved_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
-
-        ttk.Label(saved_frame, text="Saved:").pack(side=tk.LEFT, padx=2)
+        ttk.Label(saved_frame, text="已儲存 Saved", style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
         self.saved_var = tk.StringVar()
         self.saved_combo = ttk.Combobox(saved_frame, textvariable=self.saved_var,
-                                         state="readonly", width=30)
-        self.saved_combo.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+                                        state="readonly", width=30)
+        self.saved_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=S(0, 6))
         self.saved_combo.bind("<<ComboboxSelected>>", lambda e: self._load_saved_strategy())
+        ttk.Button(saved_frame, text="Load",
+                   command=self._load_saved_strategy).pack(side=tk.LEFT, padx=S(0, 6))
+        ttk.Button(saved_frame, text="匯入 Import",
+                   command=self._import_strategy_file).pack(side=tk.LEFT, padx=S(0, 6))
+        ttk.Button(saved_frame, text="Delete", style="Ghost.TButton",
+                   command=self._delete_saved_strategy).pack(side=tk.LEFT)
 
-        ttk.Button(saved_frame, text="Load", width=5,
-                   command=self._load_saved_strategy).pack(side=tk.LEFT, padx=2)
-        ttk.Button(saved_frame, text="Delete", width=6,
-                   command=self._delete_saved_strategy).pack(side=tk.LEFT, padx=2)
-        ttk.Button(saved_frame, text="匯入 Import", width=10,
-                   command=self._import_strategy_file).pack(side=tk.LEFT, padx=2)
+        # Fixed rows claim their space bottom-up; the transcript gets the
+        # rest, so a short window shrinks the chat, never the controls.
+        saved_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=S(8, 0))
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=S(8, 0))
+        input_well.pack(side=tk.BOTTOM, fill=tk.X, pady=S(8, 0))
+        self.chat_display.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
     def _build_control_panel(self, parent):
+        parent.configure(padding=S(6, 0, 0, 0))
         ctrl = ttk.Frame(parent)
-        ctrl.pack(fill=tk.X, padx=4, pady=(4, 2))
+        ctrl.pack(fill=tk.X)
 
-        # ── Row 1: Symbol + Strategy ──
-        row1 = ttk.Frame(ctrl)
-        row1.pack(fill=tk.X, pady=(0, 2))
+        # ── Toolbar: grouped actions, wraps on narrow windows ──
+        bar = FlowFrame(ctrl, gap=6, row_gap=6)
+        bar.pack(fill=tk.X)
+        self._toolbar = bar
 
-        ttk.Label(row1, text="商品 Symbol:").grid(row=0, column=0, sticky=tk.W, padx=(4, 2))
-        self.symbol_var = tk.StringVar(value="TX00")
-        self.symbol_combo = ttk.Combobox(row1, textvariable=self.symbol_var, width=8,
-                                          state="readonly", values=list(SYMBOL_CONFIG.keys()))
-        self.symbol_combo.grid(row=0, column=1, padx=(0, 8))
-        self.symbol_combo.bind("<<ComboboxSelected>>", lambda e: self._on_symbol_changed())
+        self.btn_tv = bar.add(ttk.Button(
+            bar, text="TV 回測 Backtest", command=self._do_fetch_tv))
+        self.btn_api = bar.add(ttk.Button(
+            bar, text="API 回測 Backtest", command=self._do_fetch_api,
+            state=tk.DISABLED))
+        self.btn_taifex = bar.add(ttk.Button(
+            bar, text="TAIFEX 回測 Backtest", command=self._do_fetch_taifex),
+            gap=10)
+        bar.add_separator()
 
-        ttk.Label(row1, text="策略 Strategy:").grid(row=0, column=2, sticky=tk.W, padx=(0, 2))
-        self.strategy_var = tk.StringVar(value=list(STRATEGIES.keys())[0])
-        self.strategy_combo = ttk.Combobox(row1, textvariable=self.strategy_var, width=28,
-                                            state="readonly", values=list(STRATEGIES.keys()))
-        self.strategy_combo.grid(row=0, column=3, padx=(0, 4))
-        ttk.Button(row1, text="原始碼 Source", command=self._show_strategy_source).grid(row=0, column=4, padx=2)
+        self.btn_deploy = bar.add(ttk.Button(
+            bar, text="部署機器人 Deploy Bot", style="Accent.TButton",
+            command=self._toggle_live, state=tk.DISABLED), gap=10)
+        bar.add_separator()
 
-        # ── Row 2: Login ──
-        row2 = ttk.Frame(ctrl)
-        row2.pack(fill=tk.X, pady=(0, 2))
-
-        ttk.Label(row2, text="帳號 User ID:").grid(row=0, column=0, sticky=tk.W, padx=(4, 2))
-        self.login_user_var = tk.StringVar(value=self._settings.get("user_id", ""))
-        ttk.Entry(row2, textvariable=self.login_user_var, width=14).grid(row=0, column=1, padx=(0, 4))
-
-        ttk.Label(row2, text="密碼 Password:").grid(row=0, column=2, sticky=tk.W, padx=(0, 2))
-        self.login_pass_var = tk.StringVar(value=self._settings.get("password", ""))
-        ttk.Entry(row2, textvariable=self.login_pass_var, width=14, show="*").grid(row=0, column=3, padx=(0, 4))
-
-        self.btn_login = ttk.Button(row2, text="登入 Login", command=self._manual_login)
-        self.btn_login.grid(row=0, column=4, padx=2)
-
-        self.btn_reconnect = ttk.Button(row2, text="重新連線 Reconnect", command=self._manual_reconnect,
-                                         state=tk.DISABLED)
-        self.btn_reconnect.grid(row=0, column=5, padx=2)
-
-        self.login_status_var = tk.StringVar(value="")
-        ttk.Label(row2, textvariable=self.login_status_var,
-                  style="Dim.TLabel").grid(row=0, column=6, padx=4)
-
-        # ── Action buttons (grid layout — wraps gracefully) ──
-        btn_frame = ttk.Frame(ctrl)
-        btn_frame.pack(fill=tk.X, pady=(2, 2))
-        # Match chat-header button gaps (padx=2) so the wrap rows don't
-        # feel packed-then-sparse against the left pane.
-        _tb = dict(padx=2, pady=2, sticky=tk.W)
-
-        self.btn_tv = ttk.Button(btn_frame, text="TV回測 TV Backtest",
-                                 command=self._do_fetch_tv)
-        self.btn_tv.grid(row=0, column=0, **_tb)
-
-        self.btn_api = ttk.Button(btn_frame, text="API回測 API Backtest",
-                                   command=self._do_fetch_api, state=tk.DISABLED)
-        self.btn_api.grid(row=0, column=1, **_tb)
-
-        self.btn_taifex = ttk.Button(btn_frame, text="TAIFEX回測 TAIFEX Backtest",
-                                      command=self._do_fetch_taifex)
-        self.btn_taifex.grid(row=0, column=2, **_tb)
-
-        self.btn_deploy = ttk.Button(btn_frame, text="部署機器人 Deploy Bot",
-                                      command=self._toggle_live, state=tk.DISABLED)
-        self.btn_deploy.grid(row=0, column=3, **_tb)
-
-        self.btn_chart_all = ttk.Button(btn_frame, text="K線圖 K Chart",
-                                        command=self._show_chart_all, state=tk.DISABLED)
-        self.btn_chart_all.grid(row=0, column=4, **_tb)
-
-        self.btn_export = ttk.Button(btn_frame, text="匯出交易 Export Trades",
-                                     command=self._do_export, state=tk.DISABLED)
-        self.btn_export.grid(row=0, column=5, **_tb)
-
-        self.btn_toggle_settings = ttk.Button(btn_frame, text="▶ 設定 Settings",
-                                               command=self._toggle_settings)
-        self.btn_toggle_settings.grid(row=0, column=6, **_tb)
-
-        tf_frame = ttk.Frame(btn_frame)
-        tf_frame.grid(row=0, column=7, **_tb)
-        ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
+        self.btn_chart_all = bar.add(ttk.Button(
+            bar, text="K線圖 K Chart", command=self._show_chart_all,
+            state=tk.DISABLED))
+        tf_frame = ttk.Frame(bar)
+        ttk.Label(tf_frame, text="Chart TF", style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 6))
         self.chart_tf_var = tk.StringVar(value="Native")
         self.chart_tf_combo = ttk.Combobox(
             tf_frame, textvariable=self.chart_tf_var,
@@ -1820,90 +1875,87 @@ class BacktestApp:
             state=tk.DISABLED, width=7,
         )
         self.chart_tf_combo.pack(side=tk.LEFT)
+        bar.add(tf_frame)
+        self.btn_export = bar.add(ttk.Button(
+            bar, text="匯出交易 Export Trades", command=self._do_export,
+            state=tk.DISABLED), gap=10)
+        bar.add_separator()
 
-        self.btn_review = ttk.Button(btn_frame, text="AI檢視 AI Review",
-                                     command=self._review_trades, state=tk.DISABLED)
-        self.btn_review.grid(row=0, column=8, **_tb)
+        self.btn_review = bar.add(ttk.Button(
+            bar, text="AI檢視 AI Review", command=self._review_trades,
+            state=tk.DISABLED))
+        self.btn_evolution = bar.add(ttk.Button(
+            bar, text="🧬 進化 Evolution", command=self._bot_evolution,
+            state=tk.DISABLED), gap=10)
+        bar.add_separator()
 
-        self.btn_evolution = ttk.Button(btn_frame, text="🧬 進化 Evolution",
-                                        command=self._bot_evolution, state=tk.DISABLED)
-        self.btn_evolution.grid(row=0, column=9, **_tb)
+        self.btn_toggle_settings = bar.add(ttk.Button(
+            bar, text="▶ 設定 Settings", style="Ghost.TButton",
+            command=self._toggle_settings))
+        # App-level actions (report issue / update) live in the status strip.
 
-        self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
-                                     command=self._report_issue)
-        self.btn_report.grid(row=0, column=10, **_tb)
-
-        self.btn_update = ttk.Button(btn_frame, text="🔄 檢查更新 Check for Updates",
-                                     command=self._start_update)
-        self.btn_update.grid(row=0, column=11, **_tb)
-        attach_tooltip(self.btn_update,
-                       "請先停止所有機器人\nStop all running bots first")
-
-        # Wrap toolbar buttons onto extra rows when the frame is too
-        # narrow for a single row (grid does not auto-wrap).
-        self._toolbar_widgets = [
-            self.btn_tv, self.btn_api, self.btn_taifex, self.btn_deploy,
-            self.btn_chart_all, self.btn_export, self.btn_toggle_settings,
-            tf_frame, self.btn_review, self.btn_evolution, self.btn_report,
-            self.btn_update,
-        ]
-        self._toolbar_last_width = 0
-        btn_frame.bind("<Configure>", self._reflow_toolbar)
-
-        # Status strip lives at the window bottom (see _build_status_strip).
-        # Non-blocking "update available" banner (hidden until the startup
-        # check finds a newer release). Populated by _on_update_available.
+        # Non-blocking "update available" banner — only takes up a row
+        # while it has something to say. Populated by _on_update_available.
         self.update_banner_var = tk.StringVar(value="")
         self._update_banner = ttk.Label(
             ctrl, textvariable=self.update_banner_var,
             style="Status.Ok.TLabel", cursor="hand2")
-        self._update_banner.pack(fill=tk.X, padx=6, pady=(0, 1))
         self._update_banner.bind("<Button-1>", lambda _e: self._start_update())
+
+        def _sync_banner(*_args):
+            if self.update_banner_var.get():
+                self._update_banner.pack(fill=tk.X, pady=S(8, 0))
+            else:
+                self._update_banner.pack_forget()
+        self.update_banner_var.trace_add("write", _sync_banner)
         # Latest release discovered by the startup check (set in bg thread).
         self._latest_release: "updater.ReleaseInfo | None" = None
 
         # ── Collapsible backtest settings ──
         self._settings_visible = False
-        self._settings_frame = ttk.LabelFrame(ctrl, text="回測參數 Backtest Settings", padding=6)
+        self._settings_frame = ttk.LabelFrame(ctrl, text="回測參數 Backtest Settings")
         # Hidden by default — toggled by _toggle_settings
-
         sf = self._settings_frame
 
-        # Row 0: Balance + Point Value
         row_a = ttk.Frame(sf)
-        row_a.pack(fill=tk.X, pady=2)
-        ttk.Label(row_a, text="初始資金 Balance:").pack(side=tk.LEFT, padx=(4, 2))
+        row_a.pack(fill=tk.X)
+        ttk.Label(row_a, text="初始資金 Balance", style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
         self.balance_var = tk.StringVar(value="1000000")
-        ttk.Entry(row_a, textvariable=self.balance_var, width=12).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(row_a, text="每點價值 Pt Value:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Entry(row_a, textvariable=self.balance_var, width=12).pack(
+            side=tk.LEFT, padx=S(0, 18))
+        ttk.Label(row_a, text="每點價值 Pt Value", style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
         self.pv_var = tk.StringVar(value="200")
-        ttk.Entry(row_a, textvariable=self.pv_var, width=6).pack(side=tk.LEFT, padx=(0, 4))
-
-        # Row 1: Start + End + Quick period buttons
-        row_b = ttk.Frame(sf)
-        row_b.pack(fill=tk.X, pady=2)
-        ttk.Label(row_b, text="起始 Start:").pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Entry(row_a, textvariable=self.pv_var, width=6).pack(
+            side=tk.LEFT, padx=S(0, 18))
+        ttk.Label(row_a, text="起始 Start", style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
         default_start = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
         self.start_var = tk.StringVar(value=default_start)
-        ttk.Entry(row_b, textvariable=self.start_var, width=10).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(row_b, text="結束 End:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Entry(row_a, textvariable=self.start_var, width=10).pack(
+            side=tk.LEFT, padx=S(0, 18))
+        ttk.Label(row_a, text="結束 End", style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
         self.end_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
-        ttk.Entry(row_b, textvariable=self.end_var, width=10).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Entry(row_a, textvariable=self.end_var, width=10).pack(
+            side=tk.LEFT, padx=S(0, 18))
         for label, days in [("3月", 90), ("6月", 180), ("1年", 365), ("2年", 730), ("4年", 1461)]:
-            ttk.Button(row_b, text=label, width=4,
-                       command=lambda d=days: self._set_period(d)).pack(side=tk.LEFT, padx=1)
-
+            ttk.Button(row_a, text=label, style="Ghost.TButton",
+                       command=lambda d=days: self._set_period(d)).pack(side=tk.LEFT)
 
     def _build_results_notebook(self, parent):
         notebook = ttk.Notebook(parent)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        notebook.pack(fill=tk.BOTH, expand=True, pady=S(8, 0))
+        page_pad = S(2, 10, 2, 2)
 
-        # Metrics tab
-        metrics_frame = ttk.Frame(notebook)
+        # ── Report tab ──
+        metrics_frame = ttk.Frame(notebook, padding=page_pad)
         notebook.add(metrics_frame, text="績效報告 Report")
         report_bar = ttk.Frame(metrics_frame)
-        report_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
-        ttk.Label(report_bar, text="檢視 View:").pack(side=tk.LEFT, padx=(0, 4))
+        report_bar.pack(fill=tk.X, pady=S(0, 8))
+        ttk.Label(report_bar, text="檢視 View", style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
         self.report_filter_var = tk.StringVar(value="全部 All")
         self.report_filter_combo = ttk.Combobox(
             report_bar, textvariable=self.report_filter_var,
@@ -1915,54 +1967,50 @@ class BacktestApp:
         # model: src/backtest/report_view.py; format_report text stays for
         # Discord/console/export).
         report_scroll = ScrollableFrame(metrics_frame)
-        report_scroll.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        report_scroll.pack(fill=tk.BOTH, expand=True)
         self.report_canvas = report_scroll.canvas
         self.report_body = report_scroll.body
         ttk.Label(self.report_body, text=REPORT_EMPTY,
-                  style="Empty.TLabel").pack(padx=8, pady=8)
+                  style="Empty.TLabel").pack(padx=S(8), pady=S(24))
 
-        # Trade list tab
-        trades_frame = ttk.Frame(notebook)
+        # ── Trades tab ──
+        trades_frame = ttk.Frame(notebook, padding=page_pad)
         notebook.add(trades_frame, text="交易明細 Trades")
         columns = ("num", "tag", "side", "entry_time", "entry_price", "real_entry",
                    "exit_time", "exit_price", "real_exit",
                    "pnl", "bars_held", "source", "strategy")
-        self.trade_tree = ttk.Treeview(trades_frame, columns=columns, show="headings", height=20)
+        tree_wrap, self.trade_tree = scrolled_tree(
+            trades_frame, columns=columns, show="headings", height=20)
+        tree_wrap.pack(fill=tk.BOTH, expand=True)
         self._trade_sort_col = None
         self._trade_sort_reverse = False
         for col, text, w in [
-            ("num", "#", 40), ("tag", "標籤 Tag", 80), ("side", "方向 Side", 55),
-            ("entry_time", "進場時間 Entry Time", 135), ("entry_price", "進場價 Entry", 80),
-            ("real_entry", "實進場 Real Entry", 90),
-            ("exit_time", "出場時間 Exit Time", 135), ("exit_price", "出場價 Exit", 80),
-            ("real_exit", "實出場 Real Exit", 90),
-            ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 60),
-            ("source", "來源 Source", 80), ("strategy", "策略 Strategy", 150),
+            ("num", "#", 44), ("tag", "標籤 Tag", 90), ("side", "方向 Side", 70),
+            ("entry_time", "進場時間 Entry Time", 140), ("entry_price", "進場價 Entry", 90),
+            ("real_entry", "實進場 Real Entry", 100),
+            ("exit_time", "出場時間 Exit Time", 140), ("exit_price", "出場價 Exit", 90),
+            ("real_exit", "實出場 Real Exit", 100),
+            ("pnl", "損益 P&L", 100), ("bars_held", "持倉K棒 Bars", 80),
+            ("source", "來源 Source", 90), ("strategy", "策略 Strategy", 160),
         ]:
-            self.trade_tree.heading(col, text=text,
-                                   command=lambda c=col: self._sort_trade_tree(c))
-            self.trade_tree.column(col, width=w,
-                                   anchor=tk.E if col not in ("tag", "source", "strategy") else tk.W)
-        vsb = ttk.Scrollbar(trades_frame, orient="vertical", command=self.trade_tree.yview)
-        self.trade_tree.configure(yscrollcommand=vsb.set)
-        self.trade_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+            anchor = tk.E if col not in ("tag", "source", "strategy") else tk.W
+            self.trade_tree.heading(col, text=text, anchor=anchor,
+                                    command=lambda c=col: self._sort_trade_tree(c))
+            self.trade_tree.column(col, width=S(w), minwidth=S(40), anchor=anchor)
         self.trade_tree.bind("<Control-c>", self._copy_trade_selection)
+        enable_row_hover(self.trade_tree)
 
-        # Live tab
-        live_frame = ttk.Frame(notebook)
+        # ── Live tab ──
+        live_frame = ttk.Frame(notebook, padding=page_pad)
         notebook.add(live_frame, text="即時 Live")
 
-        # Bot name display (set via popup on Deploy)
+        # Bot identity + hot mode switch
         bot_name_frame = ttk.Frame(live_frame)
-        bot_name_frame.pack(fill=tk.X, padx=4, pady=(4, 0))
-        ttk.Label(bot_name_frame, text="機器人名稱 Bot Name:").pack(side=tk.LEFT, padx=(0, 4))
+        bot_name_frame.pack(fill=tk.X, pady=S(0, 10))
         self.bot_name_var = tk.StringVar(value="(未設定 Not set)")
         self.bot_name_label = ttk.Label(bot_name_frame, textvariable=self.bot_name_var,
-                                         font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"))
-        self.bot_name_label.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(bot_name_frame, text="|").pack(side=tk.LEFT, padx=4)
-        ttk.Label(bot_name_frame, text="模式 Mode:").pack(side=tk.LEFT, padx=(0, 4))
+                                        style="Section.TLabel")
+        self.bot_name_label.pack(side=tk.LEFT)
         self.trading_mode_var = tk.StringVar(value="--")
         self._mode_combo_values = ["模擬 Paper", "半自動 Semi-Auto", "全自動 Auto"]
         self._mode_combo_to_key = {
@@ -1971,60 +2019,81 @@ class BacktestApp:
         self._mode_key_to_combo = {v: k for k, v in self._mode_combo_to_key.items()}
         self.mode_combo = ttk.Combobox(
             bot_name_frame, textvariable=self.trading_mode_var,
-            values=self._mode_combo_values, state=tk.DISABLED,
-            width=18, font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"),
+            values=self._mode_combo_values, state=tk.DISABLED, width=18,
         )
-        self.mode_combo.pack(side=tk.LEFT)
+        self.mode_combo.pack(side=tk.RIGHT)
         self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_combo_changed)
+        ttk.Label(bot_name_frame, text="模式 Mode", style="Dim.TLabel").pack(
+            side=tk.RIGHT, padx=S(0, 8))
 
-        # Status panel
-        status_panel = ttk.LabelFrame(live_frame, text="即時狀態 Live Status", padding=6)
-        status_panel.pack(fill=tk.X, padx=4, pady=(4, 2))
-
+        # Stat cards
         self.live_state_var = tk.StringVar(value="IDLE")
         self.live_pos_var = tk.StringVar(value="Flat")
         self.live_pnl_var = tk.StringVar(value="0")
         self.live_bars_var = tk.StringVar(value="0 / 0")
         self.live_market_var = tk.StringVar(value="--")
+        stats = ttk.Frame(live_frame)
+        stats.pack(fill=tk.X)
+        stat_specs = [
+            ("狀態 State", self.live_state_var, False),
+            ("持倉 Position", self.live_pos_var, False),
+            ("損益 P&L", self.live_pnl_var, True),
+            ("K棒 即時/總計 Bars", self.live_bars_var, False),
+            ("盤勢 Market", self.live_market_var, False),
+        ]
+        stat_cards = []
+        for i, (caption, var, signed) in enumerate(stat_specs):
+            stats.columnconfigure(i, weight=1, uniform="stat")
+            card = StatCard(stats, caption, variable=var, signed=signed)
+            card.grid(row=0, column=i, sticky="nsew",
+                      padx=(0, S(10) if i < len(stat_specs) - 1 else 0))
+            stat_cards.append(card)
 
-        for i, (label, var) in enumerate([
-            ("狀態 State:", self.live_state_var),
-            ("持倉 Position:", self.live_pos_var),
-            ("損益 P&L:", self.live_pnl_var),
-            ("K棒 (即時/總計):", self.live_bars_var),
-            ("盤勢 Market:", self.live_market_var),
-        ]):
-            ttk.Label(status_panel, text=label).grid(row=0, column=i*2, sticky=tk.W, padx=4)
-            ttk.Label(status_panel, textvariable=var,
-                      font=FONTS.get("mono_bold") or ("Consolas", 10, "bold")).grid(
-                row=0, column=i*2+1, sticky=tk.W, padx=(0, 12))
+        def _tint_state(*_args, card=stat_cards[0]):
+            running = str(self.live_state_var.get()).upper().startswith("RUNNING")
+            card.set_tone("good" if running else None)
+        self.live_state_var.trace_add("write", _tint_state)
 
         # Regime (shadow-mode) status line — updated on each daily report.
         self.live_regime_var = tk.StringVar(value="[Regime] 停用 disabled")
-        ttk.Label(status_panel, textvariable=self.live_regime_var,
+        ttk.Label(live_frame, textvariable=self.live_regime_var,
                   font=FONTS.get("mono_small") or ("Consolas", 9),
-                  foreground=PALETTE["info"]).grid(
-            row=1, column=0, columnspan=10, sticky=tk.W, padx=4, pady=(3, 0))
+                  foreground=PALETTE["info"]).pack(anchor="w", pady=S(8, 0))
 
-        # Manual order buttons
-        order_frame = ttk.LabelFrame(live_frame, text="手動下單 Manual Order", padding=4)
-        order_frame.pack(fill=tk.X, padx=4, pady=(2, 2))
-        self.btn_manual_buy = ttk.Button(order_frame, text="買進 BUY",
-                                          command=lambda: self._manual_order(0))
-        self.btn_manual_buy.pack(side=tk.LEFT, padx=4)
-        self.btn_manual_sell = ttk.Button(order_frame, text="賣出 SELL",
-                                           command=lambda: self._manual_order(1))
-        self.btn_manual_sell.pack(side=tk.LEFT, padx=4)
-        self.btn_manual_close = ttk.Button(order_frame, text="平倉 CLOSE",
-                                            command=self._manual_close)
-        self.btn_manual_close.pack(side=tk.LEFT, padx=4)
+        # Manual order + real account, side by side
+        mid = ttk.Frame(live_frame)
+        mid.pack(fill=tk.X, pady=S(10, 0))
+
+        order_frame = ttk.Frame(mid, style="Card.TFrame", padding=S(14, 10, 14, 12))
+        order_frame.pack(side=tk.LEFT, fill=tk.Y, padx=S(0, 10))
+        ttk.Label(order_frame, text="手動下單 Manual Order",
+                  style="Card.Dim.TLabel").pack(anchor="w", pady=S(0, 8))
+        order_btns = ttk.Frame(order_frame, style="CardBody.TFrame")
+        order_btns.pack(anchor="w")
+        self.btn_manual_buy = ttk.Button(order_btns, text="買進 BUY",
+                                         style="Card.Success.TButton",
+                                         command=lambda: self._manual_order(0))
+        self.btn_manual_buy.pack(side=tk.LEFT, padx=S(0, 6))
+        self.btn_manual_sell = ttk.Button(order_btns, text="賣出 SELL",
+                                          style="Card.Danger.TButton",
+                                          command=lambda: self._manual_order(1))
+        self.btn_manual_sell.pack(side=tk.LEFT, padx=S(0, 6))
+        self.btn_manual_close = ttk.Button(order_btns, text="平倉 CLOSE",
+                                           style="Card.TButton",
+                                           command=self._manual_close)
+        self.btn_manual_close.pack(side=tk.LEFT)
         # Disable until live bot is running with semi-auto
         for btn in (self.btn_manual_buy, self.btn_manual_sell, self.btn_manual_close):
             btn.config(state=tk.DISABLED)
 
-        # Real account panel
-        acct_frame = ttk.LabelFrame(live_frame, text="實帳戶 Real Account", padding=4)
-        acct_frame.pack(fill=tk.X, padx=4, pady=(2, 2))
+        acct_frame = ttk.Frame(mid, style="Card.TFrame", padding=S(14, 10, 14, 12))
+        acct_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        acct_head = ttk.Frame(acct_frame, style="CardBody.TFrame")
+        acct_head.pack(fill=tk.X, pady=S(0, 6))
+        ttk.Label(acct_head, text="實帳戶 Real Account",
+                  style="Card.Dim.TLabel").pack(side=tk.LEFT)
+        ttk.Button(acct_head, text="刷新 Refresh", style="Card.Ghost.TButton",
+                   command=self._query_real_account).pack(side=tk.RIGHT)
 
         self.real_pos_var = tk.StringVar(value="--")
         self.real_equity_var = tk.StringVar(value="--")
@@ -2037,100 +2106,98 @@ class BacktestApp:
         self.real_fills_var = tk.StringVar(value="--")
         self.real_loss_limit_var = tk.StringVar(value="--")
 
-        row0 = ttk.Frame(acct_frame)
-        row0.pack(fill=tk.X, pady=(0, 2))
-        for label, var in [
-            ("持倉 Pos:", self.real_pos_var),
-            ("浮動 Float:", self.real_pnl_var),
-            ("平倉損益 Realized:", self.real_realized_var),
-            ("費用 Fee+Tax:", self.real_fees_var),
-            ("淨損益 Net:", self.real_net_var),
-        ]:
-            ttk.Label(row0, text=label).pack(side=tk.LEFT, padx=(4, 2))
-            lbl = ttk.Label(row0, textvariable=var,
-                            font=FONTS.get("mono_bold") or ("Consolas", 10, "bold"))
-            lbl.pack(side=tk.LEFT, padx=(0, 8))
-
-        row1 = ttk.Frame(acct_frame)
-        row1.pack(fill=tk.X, pady=(0, 2))
-        for label, var in [
-            ("權益 Equity:", self.real_equity_var),
-            ("可用 Avail:", self.real_available_var),
-            ("維持率 Maint%:", self.real_maint_var),
-            ("虧損上限 Loss Limit:", self.real_loss_limit_var),
-            ("今日成交 Trades:", self.real_fills_var),
-        ]:
-            ttk.Label(row1, text=label).pack(side=tk.LEFT, padx=(4, 2))
-            ttk.Label(row1, textvariable=var,
-                      font=FONTS.get("mono_bold") or ("Consolas", 10, "bold")).pack(
-                side=tk.LEFT, padx=(0, 8))
-
-        ttk.Button(row1, text="刷新 Refresh", width=12,
-                   command=self._query_real_account).pack(side=tk.RIGHT, padx=4)
+        acct_grid = ttk.Frame(acct_frame, style="CardBody.TFrame")
+        acct_grid.pack(fill=tk.X)
+        acct_rows = [
+            [("持倉 Pos", self.real_pos_var),
+             ("浮動 Float", self.real_pnl_var),
+             ("平倉損益 Realized", self.real_realized_var),
+             ("費用 Fee+Tax", self.real_fees_var),
+             ("淨損益 Net", self.real_net_var)],
+            [("權益 Equity", self.real_equity_var),
+             ("可用 Avail", self.real_available_var),
+             ("維持率 Maint%", self.real_maint_var),
+             ("虧損上限 Loss Limit", self.real_loss_limit_var),
+             ("今日成交 Trades", self.real_fills_var)],
+        ]
+        for r, cells in enumerate(acct_rows):
+            for c, (caption, var) in enumerate(cells):
+                acct_grid.columnconfigure(c, weight=1, uniform="acct")
+                cell = ttk.Frame(acct_grid, style="CardBody.TFrame")
+                cell.grid(row=r, column=c, sticky="w", pady=(S(6) if r else 0, 0))
+                ttk.Label(cell, text=caption, style="Card.Dim.TLabel").pack(anchor="w")
+                ttk.Label(cell, textvariable=var, style="Card.TLabel",
+                          font=FONTS.get("mono_bold") or ("Consolas", 10, "bold")).pack(
+                    anchor="w")
 
         # Live event log
         self.live_log = TagTextLog(
             live_frame, tags=LOG_TAGS, show_toolbar=False,
-            bg=PALETTE["bg_inset"], fg=PALETTE["text"],
             font=FONTS.get("mono_small") or ("Consolas", 9),
         )
-        self.live_log.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        self.live_log.pack(fill=tk.BOTH, expand=True, pady=S(10, 0))
 
-        # Regime tab — status cards, external vote status (W2/W3/W4), and
+        # ── Regime tab — status cards, external vote status (W2/W3/W4), and
         # the switching history grouped into regime episodes. Content is
         # rebuilt from disk on each view (tab select or Refresh) — data
         # shaping lives in src/news/vote_status.py + src/regime/episodes.py.
-        regime_frame = ttk.Frame(notebook)
+        regime_frame = ttk.Frame(notebook, padding=page_pad)
         notebook.add(regime_frame, text="多空 Regime")
-        regime_bar = ttk.Frame(regime_frame)
-        regime_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
-        ttk.Button(regime_bar, text="刷新 Refresh", width=12,
-                   command=self._refresh_regime_tab).pack(side=tk.LEFT)
 
         cards = ttk.Frame(regime_frame)
-        cards.pack(fill=tk.X, padx=4, pady=(4, 0))
+        cards.pack(fill=tk.X)
         self._regime_card_vars = {}
-        for key, title in (("active", "現行 Active"),
-                           ("regime", "趨勢 Regime"),
-                           ("rec", "最新建議 Recommendation")):
-            card = ttk.LabelFrame(cards, text=title)
-            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        regime_cards = (("active", "現行 Active"),
+                        ("regime", "趨勢 Regime"),
+                        ("rec", "最新建議 Recommendation"))
+        for i, (key, title) in enumerate(regime_cards):
+            cards.columnconfigure(i, weight=1, uniform="regime")
             main = tk.StringVar(value="—")
             sub = tk.StringVar(value="")
-            main_lbl = ttk.Label(card, textvariable=main,
-                                 font=FONTS.get("value") or ("Segoe UI", 11, "bold"))
-            main_lbl.pack(anchor="w", padx=6, pady=(2, 0))
-            ttk.Label(card, textvariable=sub, style="Dim.TLabel").pack(
-                anchor="w", padx=6, pady=(0, 4))
-            self._regime_card_vars[key] = (main, sub, main_lbl)
+            card = StatCard(cards, title, variable=main, sub_variable=sub, small=True)
+            card.grid(row=0, column=i, sticky="nsew",
+                      padx=(0, S(10) if i < len(regime_cards) - 1 else 0))
+            self._regime_card_vars[key] = (main, sub, card.value_label)
 
-        votes_lf = ttk.LabelFrame(regime_frame, text="外部投票 External Votes")
-        votes_lf.pack(fill=tk.X, padx=4, pady=(6, 0))
-        self._votes_grid = ttk.Frame(votes_lf)
-        self._votes_grid.pack(fill=tk.X, padx=6, pady=2)
+        votes_head = ttk.Frame(regime_frame)
+        votes_head.pack(fill=tk.X, pady=S(12, 4))
+        ttk.Label(votes_head, text="外部投票 External Votes",
+                  style="Small.Dim.TLabel").pack(side=tk.LEFT)
+        ttk.Button(votes_head, text="刷新 Refresh", style="Ghost.TButton",
+                   command=self._refresh_regime_tab).pack(side=tk.RIGHT)
+        votes_lf = ttk.Frame(regime_frame, style="Card.TFrame",
+                             padding=S(14, 10, 14, 10))
+        votes_lf.pack(fill=tk.X)
+        self._votes_grid = ttk.Frame(votes_lf, style="CardBody.TFrame")
+        self._votes_grid.pack(fill=tk.X)
         self.regime_consumed_var = tk.StringVar(value="")
-        ttk.Label(votes_lf, textvariable=self.regime_consumed_var,
-                  style="Dim.TLabel").pack(anchor="w", padx=6, pady=(0, 4))
+        consumed_lbl = ttk.Label(votes_lf, textvariable=self.regime_consumed_var,
+                                 style="Card.Dim.TLabel")
 
-        hist_lf = ttk.LabelFrame(regime_frame, text="切換紀錄 Switching Log")
-        hist_lf.pack(fill=tk.BOTH, expand=True, padx=4, pady=(6, 4))
+        def _sync_consumed(*_args):
+            if self.regime_consumed_var.get():
+                consumed_lbl.pack(anchor="w", pady=S(4, 0))
+            else:
+                consumed_lbl.pack_forget()
+        self.regime_consumed_var.trace_add("write", _sync_consumed)
+
+        ttk.Label(regime_frame, text="切換紀錄 Switching Log",
+                  style="Small.Dim.TLabel").pack(anchor="w", pady=S(12, 4))
         cols = ("session", "trend", "decision", "votes", "pnl", "trades")
-        tree = ttk.Treeview(hist_lf, columns=cols, show="tree headings")
-        tree.heading("#0", text="段落 Episode")
-        tree.column("#0", width=250, stretch=False)
+        hist_wrap, tree = scrolled_tree(regime_frame, columns=cols,
+                                        show="tree headings")
+        hist_wrap.pack(fill=tk.BOTH, expand=True)
+        tree.heading("#0", text="段落 Episode", anchor="w")
+        tree.column("#0", width=S(250), stretch=False)
         for cid, text, width, anchor, stretch in (
-                ("session", "時段 Session", 105, "w", False),
+                ("session", "時段 Session", 115, "w", False),
                 ("trend", "趨勢 Trend", 200, "w", True),
-                ("decision", "決策 Decision", 130, "w", True),
-                ("votes", "投票 Votes", 90, "w", False),
-                ("pnl", "P&L", 85, "e", False),
-                ("trades", "筆數", 50, "e", False)):
-            tree.heading(cid, text=text)
-            tree.column(cid, width=width, anchor=anchor, stretch=stretch)
-        vsb = ttk.Scrollbar(hist_lf, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        tree.pack(fill=tk.BOTH, expand=True)
+                ("decision", "決策 Decision", 140, "w", True),
+                ("votes", "投票 Votes", 100, "w", False),
+                ("pnl", "P&L", 95, "e", False),
+                ("trades", "筆數", 60, "e", False)):
+            tree.heading(cid, text=text, anchor=anchor)
+            tree.column(cid, width=S(width), anchor=anchor, stretch=stretch)
         # Episode band colors keyed by leg; DAY rows dimmed (they carry
         # only P&L — no classification happens during the day session).
         for tag_name, opts in EPISODE_TAGS.items():
@@ -2140,8 +2207,8 @@ class BacktestApp:
         self.results_notebook = notebook
         notebook.bind("<<NotebookTabChanged>>", self._on_results_tab_changed)
 
-        # Log tab
-        log_frame = ttk.Frame(notebook)
+        # ── Log tab ──
+        log_frame = ttk.Frame(notebook, padding=page_pad)
         notebook.add(log_frame, text="紀錄 Log")
         self.log_text = TagTextLog(
             log_frame, levels=("info", "debug"), show_toolbar=True,
@@ -2461,7 +2528,7 @@ class BacktestApp:
                 self.root.after(0, lambda: self._show_pine_popup(pine))
             except Exception as e:
                 _log(f"Pine export error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
-                self.root.after(0, lambda: self._on_pine_error(str(e)))
+                self.root.after(0, lambda err=str(e): self._on_pine_error(err))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2473,16 +2540,16 @@ class BacktestApp:
 
         popup = tk.Toplevel(self.root)
         popup.title("Pine Script Export")
-        popup.geometry("700x600")
         apply_window_theme(popup)
+        place_dialog(popup, self.root, 820, 680)
 
         wrap, text = themed_scrolled_text(
             popup, wrap=tk.WORD, font=FONTS.get("mono") or ("Consolas", 10))
-        wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=S(14), pady=S(14, 8))
         text.insert(tk.END, pine_code)
 
         btn_frame = ttk.Frame(popup)
-        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        btn_frame.pack(fill=tk.X, padx=S(14), pady=S(0, 14))
 
         def copy():
             popup.clipboard_clear()
@@ -2491,8 +2558,8 @@ class BacktestApp:
             popup.after(2000, lambda: copy_btn.config(text="Copy to Clipboard"))
 
         copy_btn = ttk.Button(btn_frame, text="Copy to Clipboard", command=copy)
-        copy_btn.pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT, padx=4)
+        copy_btn.pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT)
 
     def _on_pine_error(self, error: str):
         self._remove_last_system_line()
@@ -2613,6 +2680,9 @@ class BacktestApp:
     def _update_ultra_button(self) -> None:
         on = self._settings.get("ultra_mode", False)
         self.btn_ultra.config(text=f"🚀 Ultra: {'ON' if on else 'OFF'}")
+        header = getattr(self, "_chat_header", None)
+        if header is not None:
+            header.reflow()  # label width changed
 
     def _toggle_ultra_mode(self) -> None:
         """Toggle ultra_mode for THIS SESSION ONLY (cost confirmation on enable).
@@ -2649,49 +2719,54 @@ class BacktestApp:
         """Show settings dialog with provider selection and API keys."""
         dialog = tk.Toplevel(self.root)
         dialog.title("AI Settings")
-        dialog.geometry("450x330")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
         apply_window_theme(dialog)
 
-        frame = ttk.Frame(dialog, padding=16)
+        frame = ttk.Frame(dialog, padding=S(20, 18, 20, 16))
         frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="AI 設定 Settings", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=S(0, 12))
+        row_pad = dict(pady=S(5))
 
         # Provider selection
-        ttk.Label(frame, text="Provider:", font=("", 10, "bold")).grid(
-            row=0, column=0, sticky=tk.W, pady=(0, 8))
+        ttk.Label(frame, text="Provider", style="Dim.TLabel").grid(
+            row=1, column=0, sticky=tk.W, **row_pad)
         provider_var = tk.StringVar(value=self._settings.get("ai_provider", PROVIDER_ANTHROPIC))
         provider_combo = ttk.Combobox(frame, textvariable=provider_var, state="readonly",
                                        values=[PROVIDER_ANTHROPIC, PROVIDER_GOOGLE], width=20)
-        provider_combo.grid(row=0, column=1, sticky=tk.W, pady=(0, 8), padx=(8, 0))
+        provider_combo.grid(row=1, column=1, sticky=tk.W, padx=S(12, 0), **row_pad)
 
         # Anthropic key
-        ttk.Label(frame, text="Anthropic API Key:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Label(frame, text="Anthropic API Key", style="Dim.TLabel").grid(
+            row=2, column=0, sticky=tk.W, **row_pad)
         anth_key = self._settings.get("anthropic_api_key", "")
         anth_var = tk.StringVar(value=anth_key)
-        anth_entry = ttk.Entry(frame, textvariable=anth_var, width=38, show="*")
-        anth_entry.grid(row=1, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        anth_entry = ttk.Entry(frame, textvariable=anth_var, width=44, show="•")
+        anth_entry.grid(row=2, column=1, sticky=tk.W, padx=S(12, 0), **row_pad)
 
         # Google key
-        ttk.Label(frame, text="Google Gemini Key:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Label(frame, text="Google Gemini Key", style="Dim.TLabel").grid(
+            row=3, column=0, sticky=tk.W, **row_pad)
         goog_key = self._settings.get("google_api_key", "")
         goog_var = tk.StringVar(value=goog_key)
-        goog_entry = ttk.Entry(frame, textvariable=goog_var, width=38, show="*")
-        goog_entry.grid(row=2, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        goog_entry = ttk.Entry(frame, textvariable=goog_var, width=44, show="•")
+        goog_entry.grid(row=3, column=1, sticky=tk.W, padx=S(12, 0), **row_pad)
 
         # Model override (optional)
-        ttk.Label(frame, text="Model (optional):").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Label(frame, text="Model (optional)", style="Dim.TLabel").grid(
+            row=4, column=0, sticky=tk.W, **row_pad)
         model_var = tk.StringVar(value=self._settings.get("ai_model", ""))
-        ttk.Entry(frame, textvariable=model_var, width=38).grid(
-            row=3, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        ttk.Entry(frame, textvariable=model_var, width=44).grid(
+            row=4, column=1, sticky=tk.W, padx=S(12, 0), **row_pad)
 
         # Default model hint
         def _update_hint(*args):
             p = provider_var.get()
             hint_label.config(text=f"Default: {DEFAULT_MODELS.get(p, '')}")
-        hint_label = ttk.Label(frame, text="", style="Dim.TLabel")
-        hint_label.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
+        hint_label = ttk.Label(frame, text="", style="Faint.TLabel")
+        hint_label.grid(row=5, column=1, sticky=tk.W, padx=S(12, 0))
         provider_var.trace_add("write", _update_hint)
         _update_hint()
 
@@ -2703,16 +2778,16 @@ class BacktestApp:
         ttk.Checkbutton(
             frame, variable=ultra_var,
             text=f"Ultra Mode 預設 default — ({GOOGLE_MODEL_ULTRA}, Google only)",
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=S(14, 0))
         ttk.Label(
-            frame, style="Dim.TLabel",
+            frame, style="Faint.TLabel", wraplength=S(520), justify=tk.LEFT,
             text="持久預設，影響 codegen/review/evolution/Pine (成本較高)。"
                  "臨時切換請用聊天區 🚀 按鈕 (session-only).",
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.W)
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=S(2, 0))
 
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=7, column=0, columnspan=2, pady=(16, 0))
+        btn_frame.grid(row=8, column=0, columnspan=2, sticky=tk.E, pady=S(18, 0))
 
         def _save():
             provider = provider_var.get()
@@ -2739,8 +2814,11 @@ class BacktestApp:
             self.set_status(f"設定已儲存 Settings saved. Provider: {provider}")
             dialog.destroy()
 
-        ttk.Button(btn_frame, text="Save", width=10, command=_save).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btn_frame, text="Cancel", width=10, command=dialog.destroy).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(
+            side=tk.LEFT, padx=S(0, 8))
+        ttk.Button(btn_frame, text="Save", style="Accent.TButton",
+                   command=_save).pack(side=tk.LEFT)
+        place_dialog(dialog, self.root)
 
     def _reset_chat(self):
         """Clear chat display and reset conversation."""
@@ -2876,7 +2954,7 @@ class BacktestApp:
                 conv = self._chat_client.conversation
                 if conv and conv[-1].get("role") == "user":
                     conv.pop()
-                self.root.after(0, lambda: self._on_recap_error(str(e)))
+                self.root.after(0, lambda err=str(e): self._on_recap_error(err))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3036,20 +3114,21 @@ class BacktestApp:
         """
         dlg = tk.Toplevel(self.root)
         dlg.title("更新 Update")
-        dlg.geometry("420x140")
         dlg.resizable(False, False)
         dlg.transient(self.root)
         dlg.grab_set()
         apply_window_theme(dlg)
 
-        frame = ttk.Frame(dlg, padding=16)
+        frame = ttk.Frame(dlg, padding=S(22, 18, 22, 18))
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text=f"下載中 Downloading v{release.version}…",
-                  font=("", 10, "bold")).pack(anchor=tk.W, pady=(0, 8))
-        pbar = ttk.Progressbar(frame, mode="determinate", maximum=100)
-        pbar.pack(fill=tk.X, pady=(0, 6))
+                  style="Section.TLabel").pack(anchor=tk.W, pady=S(0, 12))
+        pbar = ttk.Progressbar(frame, mode="determinate", maximum=100,
+                               length=S(420))
+        pbar.pack(fill=tk.X, pady=S(0, 8))
         pct_var = tk.StringVar(value="0%")
         ttk.Label(frame, textvariable=pct_var, style="Dim.TLabel").pack(anchor=tk.W)
+        place_dialog(dlg, self.root)
 
         # Disable the update button so the flow can't be re-triggered.
         self.btn_update.config(state=tk.DISABLED)
@@ -3101,29 +3180,6 @@ class BacktestApp:
         self.end_var.set(datetime.now().strftime("%Y%m%d"))
         self.start_var.set((datetime.now() - timedelta(days=days)).strftime("%Y%m%d"))
 
-    def _reflow_toolbar(self, event) -> None:
-        """Re-grid toolbar buttons so they wrap when the frame is narrow.
-
-        Only re-flows when the frame WIDTH changes — re-gridding changes
-        the frame height, which fires <Configure> again; gating on width
-        breaks that loop.
-        """
-        if event.width == self._toolbar_last_width:
-            return
-        self._toolbar_last_width = event.width
-        x = 0
-        row = 0
-        col = 0
-        for w in self._toolbar_widgets:
-            req = w.winfo_reqwidth() + 4  # padx=2 each side
-            if col > 0 and x + req > event.width:
-                row += 1
-                col = 0
-                x = 0
-            w.grid(row=row, column=col, padx=2, pady=2, sticky=tk.W)
-            col += 1
-            x += req
-
     def _toggle_settings(self):
         """Show/hide backtest settings panel."""
         if self._settings_visible:
@@ -3131,7 +3187,7 @@ class BacktestApp:
             self.btn_toggle_settings.config(text="▶ 設定 Settings")
             self._settings_visible = False
         else:
-            self._settings_frame.pack(fill=tk.X, pady=(2, 0))
+            self._settings_frame.pack(fill=tk.X, pady=S(10, 0))
             self.btn_toggle_settings.config(text="▼ 設定 Settings")
             self._settings_visible = True
 
@@ -3166,11 +3222,11 @@ class BacktestApp:
                 return
         win = tk.Toplevel(self.root)
         win.title(f"原始碼 — {name}")
-        win.geometry("800x600")
         apply_window_theme(win)
+        place_dialog(win, self.root, 960, 720)
         wrap, text = themed_scrolled_text(
             win, wrap=tk.NONE, font=FONTS.get("mono") or ("Consolas", 10))
-        wrap.pack(fill=tk.BOTH, expand=True)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=S(14), pady=S(14))
         text.insert(tk.END, f"# {filepath}\n\n{source}")
         text.config(state=tk.DISABLED)
 
@@ -3472,9 +3528,9 @@ class BacktestApp:
 
                 self.root.after(0, _done)
             except Exception as e:
-                self.root.after(0, lambda: [
-                    _log(f"TAIFEX錯誤 Error: {e}"),
-                    self.set_status(f"TAIFEX錯誤: {e}", "error"),
+                self.root.after(0, lambda err=e: [
+                    _log(f"TAIFEX錯誤 Error: {err}"),
+                    self.set_status(f"TAIFEX錯誤: {err}", "error"),
                     self._enable_buttons(),
                 ])
 
@@ -3741,19 +3797,18 @@ class BacktestApp:
         if result is not None:
             self._display_results(result, self._last_bars)
 
-    def _report_card(self, parent, metric) -> None:
-        """One headline metric card (label / big value / sub line)."""
-        card = ttk.Frame(parent, style="Card.TFrame")
-        card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-        ttk.Label(card, text=metric.label, style="Card.Dim.TLabel").pack(
-            anchor="w", padx=8, pady=(5, 0))
-        value_style = "CardValue.TLabel"
-        value_fg = TONE.get(metric.tone, PALETTE["text"])
-        ttk.Label(card, text=metric.value, style=value_style,
-                  font=FONTS.get("title") or ("Segoe UI", 14, "bold"),
-                  foreground=value_fg).pack(anchor="w", padx=8)
-        ttk.Label(card, text=metric.sub or " ", style="Card.Dim.TLabel").pack(
-            anchor="w", padx=8, pady=(0, 5))
+    def _report_cards_row(self, parent, metrics_list) -> None:
+        """Row of equal-width headline metric cards (label / value / sub)."""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X)
+        last = len(metrics_list) - 1
+        for i, metric in enumerate(metrics_list):
+            row.columnconfigure(i, weight=1, uniform="report_card")
+            card = StatCard(row, metric.label, value=metric.value,
+                            sub=metric.sub or " ")
+            card.set_tone(metric.tone if metric.tone in TONE else None)
+            card.grid(row=0, column=i, sticky="nsew",
+                      padx=(0, S(10) if i < last else 0))
 
     def _render_report_view(self, title, metrics, trades, regime_info,
                             header_lines, message=None,
@@ -3796,84 +3851,91 @@ class BacktestApp:
         body = self.report_body
         for w in body.winfo_children():
             w.destroy()
+        pad = dict(padx=S(2, 14))  # right gutter keeps cards off the scrollbar
 
-        if header_lines:
-            ttk.Label(body, text="\n".join(header_lines),
-                      style="Dim.TLabel",
-                      font=FONTS.get("mono_small") or ("Consolas", 9)).pack(
-                anchor="w", padx=6, pady=(4, 0))
-        ttk.Label(body, text=title,
-                  font=FONTS.get("section") or ("Segoe UI", 12, "bold")).pack(
-            anchor="w", padx=6, pady=(6, 0))
+        ttk.Label(body, text=title, style="Section.TLabel").pack(
+            anchor="w", **pad)
         if regime_info:
             ttk.Label(
                 body, style="Dim.TLabel",
-                text=f"做多 Long: {regime_info['long']} | "
-                     f"做空 Short: {regime_info['short']} | "
+                text=f"做多 Long: {regime_info['long']}   ·   "
+                     f"做空 Short: {regime_info['short']}   ·   "
                      f"現行 Active: {regime_info['active_label']}"
                      f" ({regime_info['active_strategy']})").pack(
-                anchor="w", padx=6)
+                anchor="w", pady=S(2, 0), **pad)
+        if header_lines:
+            ttk.Label(body, text="\n".join(ln.strip() for ln in header_lines),
+                      style="Faint.TLabel",
+                      font=FONTS.get("mono_small") or ("Consolas", 9)).pack(
+                anchor="w", pady=S(6, 0), **pad)
         if message:
             ttk.Label(body, text=message, style="Empty.TLabel").pack(
-                anchor="w", padx=6, pady=8)
+                anchor="w", pady=S(16), **pad)
             return
 
-        row = ttk.Frame(body)
-        row.pack(fill=tk.X, padx=6, pady=(8, 4))
-        for card in headline_cards(metrics):
-            self._report_card(row, card)
+        cards_wrap = ttk.Frame(body)
+        cards_wrap.pack(fill=tk.X, pady=S(12, 0), **pad)
+        self._report_cards_row(cards_wrap, list(headline_cards(metrics)))
 
         grids = ttk.Frame(body)
-        grids.pack(fill=tk.X, padx=6)
-        for section_title, section_rows in stat_sections(metrics):
-            lf = ttk.LabelFrame(grids, text=section_title)
-            lf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-            lf.columnconfigure(1, weight=1)
+        grids.pack(fill=tk.X, pady=S(10, 0), **pad)
+        sections = list(stat_sections(metrics))
+        for i, (section_title, section_rows) in enumerate(sections):
+            grids.columnconfigure(i, weight=1, uniform="report_section")
+            card = ttk.Frame(grids, style="Card.TFrame",
+                             padding=S(14, 10, 14, 12))
+            card.grid(row=0, column=i, sticky="nsew",
+                      padx=(0, S(10) if i < len(sections) - 1 else 0))
+            ttk.Label(card, text=section_title,
+                      style="Card.Dim.TLabel").pack(anchor="w", pady=S(0, 6))
+            table = ttk.Frame(card, style="CardBody.TFrame")
+            table.pack(fill=tk.X)
+            table.columnconfigure(1, weight=1)
             for r, m in enumerate(section_rows):
-                ttk.Label(lf, text=m.label, style="Dim.TLabel").grid(
-                    row=r, column=0, sticky="w", padx=(8, 16), pady=1)
-                value_lbl = ttk.Label(lf, text=m.value,
-                                      font=FONTS.get("mono") or ("Consolas", 10))
+                ttk.Label(table, text=m.label, style="Card.TLabel").grid(
+                    row=r, column=0, sticky="w", pady=S(2))
+                value_lbl = ttk.Label(
+                    table, text=m.value, style="Card.TLabel",
+                    font=FONTS.get("mono") or ("Consolas", 10))
                 if m.tone in TONE:
                     value_lbl.configure(foreground=TONE[m.tone])
-                value_lbl.grid(row=r, column=1, sticky="e",
-                               padx=(0, 8), pady=1)
+                value_lbl.grid(row=r, column=1, sticky="e", pady=S(2))
 
         rs = real_subset(trades) if real_panel else None
         if rs:
             count, cards = rs
-            lf = ttk.LabelFrame(
-                body, text=f"實單統計 Real-Order Subset ({count} 筆)")
-            lf.pack(fill=tk.X, padx=6, pady=(8, 0))
-            real_row = ttk.Frame(lf)
-            real_row.pack(fill=tk.X, padx=4, pady=4)
-            for card in cards:
-                self._report_card(real_row, card)
-            ttk.Label(lf, style="Dim.TLabel",
-                      text="(上方總計為模擬全視圖 totals above = simulated "
-                           "view, all trades)").pack(
-                anchor="w", padx=8, pady=(0, 4))
+            ttk.Label(body, style="Small.Dim.TLabel",
+                      text=f"實單統計 Real-Order Subset ({count} 筆)").pack(
+                anchor="w", pady=S(16, 6), **pad)
+            real_wrap = ttk.Frame(body)
+            real_wrap.pack(fill=tk.X, **pad)
+            self._report_cards_row(real_wrap, list(cards))
+            ttk.Label(body, style="Faint.TLabel",
+                      text="上方總計為模擬全視圖 totals above = simulated "
+                           "view, all trades").pack(
+                anchor="w", pady=S(6, 0), **pad)
 
         ps = per_strategy_rows(trades)
         if ps:
-            lf = ttk.LabelFrame(body, text="各策略明細 Per-Strategy Breakdown")
-            lf.pack(fill=tk.X, padx=6, pady=(8, 4))
-            tv = ttk.Treeview(lf, columns=("strategy", "n", "wr", "pnl"),
+            ttk.Label(body, style="Small.Dim.TLabel",
+                      text="各策略明細 Per-Strategy Breakdown").pack(
+                anchor="w", pady=S(16, 6), **pad)
+            tv = ttk.Treeview(body, columns=("strategy", "n", "wr", "pnl"),
                               show="headings", height=len(ps))
             for cid, text, width, anchor, stretch in (
                     ("strategy", "策略 Strategy", 260, "w", True),
-                    ("n", "筆數 Trades", 80, "e", False),
-                    ("wr", "勝率 WR", 80, "e", False),
-                    ("pnl", "損益 P&L", 110, "e", False)):
-                tv.heading(cid, text=text)
-                tv.column(cid, width=width, anchor=anchor, stretch=stretch)
+                    ("n", "筆數 Trades", 90, "e", False),
+                    ("wr", "勝率 WR", 90, "e", False),
+                    ("pnl", "損益 P&L", 120, "e", False)):
+                tv.heading(cid, text=text, anchor=anchor)
+                tv.column(cid, width=S(width), anchor=anchor, stretch=stretch)
             tv.tag_configure("pos", foreground=TONE["good"])
             tv.tag_configure("neg", foreground=TONE["bad"])
             for name, n, wr, pnl in ps:
                 tag = "pos" if pnl > 0 else ("neg" if pnl < 0 else "")
                 tv.insert("", "end", values=(name, n, wr, f"{pnl:+,}"),
                           tags=(tag,) if tag else ())
-            tv.pack(fill=tk.X, padx=4, pady=4)
+            tv.pack(fill=tk.X, pady=S(0, 12), **pad)
 
     def _display_results(self, result, bars: list[Bar] | None = None):
         # Data source header for the Report tab
@@ -3970,8 +4032,8 @@ class BacktestApp:
             self._insert_trade_row(i, t, bars)
         self._rendered_trade_count = len(result.trades)
 
-        self.trade_tree.tag_configure("win", foreground=TONE["good"])
-        self.trade_tree.tag_configure("loss", foreground=TONE["bad"])
+        self.trade_tree.tag_configure("win", foreground=ROW_TONE["good"])
+        self.trade_tree.tag_configure("loss", foreground=ROW_TONE["bad"])
 
         if self._live_runner and self._live_runner.state != LiveState.IDLE:
             _log(f"即時結果更新 Live results: {result.metrics.total_trades} trades")
@@ -4090,8 +4152,8 @@ class BacktestApp:
         for w in self._votes_grid.winfo_children():
             w.destroy()
         ttk.Label(self._votes_grid, text=f"今晚 tonight → {tonight}",
-                  style="Dim.TLabel").grid(
-            row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
+                  style="Card.Dim.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=S(0, 4))
         for i, st in enumerate(report.sources, start=1):
             if not st.known:
                 dot_state = "off"
@@ -4099,24 +4161,24 @@ class BacktestApp:
                 dot_state = "err"
             else:
                 dot_state = "ok"
-            dot = StatusDot(self._votes_grid, text=st.label)
+            dot = StatusDot(self._votes_grid, text=st.label, surface="card")
             dot.set_state(dot_state)
-            dot.grid(row=i, column=0, sticky="w", padx=(0, 12))
+            dot.grid(row=i, column=0, sticky="w", padx=S(0, 18), pady=S(2))
             chip = vote_chip(st)
             chip_color = {"trending-up": TONE["good"],
                           "trending-down": TONE["bad"]}.get(st.vote, PALETTE["text_dim"])
-            ttk.Label(self._votes_grid, text=chip,
+            ttk.Label(self._votes_grid, text=chip, style="Card.TLabel",
                       foreground=chip_color).grid(
-                row=i, column=1, sticky="w", padx=(0, 12))
+                row=i, column=1, sticky="w", padx=S(0, 18))
             ctx = st.context
             if st.stale:
                 ctx = f"⚠ 停滯 stale — {ctx}" if ctx else "⚠ 停滯 stale"
             ttk.Label(self._votes_grid, text=ctx,
-                      style="Dim.TLabel").grid(
-                row=i, column=2, sticky="w", padx=(0, 12))
+                      style="Card.Dim.TLabel").grid(
+                row=i, column=2, sticky="w", padx=S(0, 18))
             ttk.Label(self._votes_grid,
                       text=st.last_check.replace("T", " ")[:16],
-                      style="Dim.TLabel").grid(row=i, column=3, sticky="e")
+                      style="Card.Dim.TLabel").grid(row=i, column=3, sticky="e")
         self._votes_grid.columnconfigure(2, weight=1)
 
         # ── state json → cards + consumed-votes audit line ──
@@ -4363,10 +4425,10 @@ class BacktestApp:
                           focus_trade_index=focus, **kwargs)
             _log("[CHART] Chart closed normally")
         except ImportError as e:
-            self.root.after(0, lambda: self.set_status(str(e), "error"))
+            self.root.after(0, lambda err=str(e): self.set_status(err, "error"))
             _log(f"圖表錯誤 Chart error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
         except Exception as e:
-            self.root.after(0, lambda: self.set_status(f"圖表錯誤 Chart error: {e}", "error"))
+            self.root.after(0, lambda err=e: self.set_status(f"圖表錯誤 Chart error: {err}", "error"))
             _log(f"圖表錯誤 Chart error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
 
     def _show_live_chart(self):
@@ -5667,43 +5729,63 @@ class BacktestApp:
         # Build dialog
         dlg = tk.Toplevel(self.root)
         dlg.title("選擇機器人 Select Bot Session")
-        dlg.geometry("680x600")
-        dlg.minsize(560, 400)
+        dlg.minsize(S(640), S(460))
         dlg.resizable(True, True)
         dlg.transient(self.root)
         dlg.grab_set()
         apply_window_theme(dlg)
 
+        result = [None]  # mutable container for return value
+
+        # Fixed footer first (pack BOTTOM): the commit buttons stay visible
+        # and come AFTER every option they depend on. They used to sit
+        # above the mode/regime sections — set options below, scroll back
+        # up to commit.
+        footer = ttk.Frame(dlg, style="Bar.TFrame", padding=S(16, 10, 16, 10))
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(dlg, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
+
         # Scrollable body: blessed ScrollableFrame (unbinds wheel on destroy).
         _outer = ScrollableFrame(dlg)
         _outer.pack(fill=tk.BOTH, expand=True)
-        content = _outer.body
+        content = ttk.Frame(_outer.body, padding=S(18, 14, 18, 8))
+        content.pack(fill=tk.BOTH, expand=True)
 
-        result = [None]  # mutable container for return value
+        head = ttk.Frame(content)
+        head.pack(fill=tk.X, pady=S(0, 12))
+        ttk.Label(head, text="部署機器人 Deploy Bot",
+                  style="Title.TLabel").pack(side=tk.LEFT)
+        ttk.Label(head, text=symbol, style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(10, 0), pady=S(6, 0))
+
+        def section(title: str):
+            ttk.Label(content, text=title, style="Small.Dim.TLabel").pack(
+                anchor=tk.W, pady=S(0, 6))
+            card = ttk.Frame(content, style="Card.TFrame",
+                             padding=S(14, 12, 14, 12))
+            card.pack(fill=tk.X, pady=S(0, 14))
+            return card
 
         # Existing sessions list
+        tree = None
         if existing_bots:
-            ttk.Label(content, text="載入現有機器人 Load Existing Bot:",
-                      font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 4))
-
-            list_frame = ttk.Frame(content)
-            list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
-
+            ttk.Label(content, text="載入現有機器人 Load Existing Bot",
+                      style="Small.Dim.TLabel").pack(anchor=tk.W, pady=S(0, 6))
             columns = ("name", "strategy", "mode", "trades", "pnl", "position", "saved")
-            tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=8)
+            list_frame, tree = scrolled_tree(
+                content, columns=columns, show="headings",
+                height=min(8, max(3, len(existing_bots))))
+            list_frame.pack(fill=tk.X, pady=S(0, 14))
             for col, text, w in [
-                ("name", "名稱 Name", 90), ("strategy", "策略 Strategy", 110),
+                ("name", "名稱 Name", 120), ("strategy", "策略 Strategy", 150),
                 ("mode", "模式 Mode", 70),
-                ("trades", "交易數 Trades", 55), ("pnl", "損益 P&L", 60),
-                ("position", "持倉 Position", 60), ("saved", "上次儲存 Last Saved", 120),
+                ("trades", "交易數 Trades", 80), ("pnl", "損益 P&L", 80),
+                ("position", "持倉 Position", 90), ("saved", "上次儲存 Last Saved", 140),
             ]:
-                tree.heading(col, text=text)
-                tree.column(col, width=w, anchor=tk.W if col in ("name", "strategy") else tk.CENTER)
-
-            vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
-            tree.configure(yscrollcommand=vsb.set)
-            tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+                anchor = tk.W if col in ("name", "strategy", "saved") else tk.CENTER
+                tree.heading(col, text=text, anchor=anchor)
+                tree.column(col, width=S(w), anchor=anchor)
+            enable_row_hover(tree)
 
             _MODE_SHORT = {"paper": "模擬", "semi_auto": "半自動", "auto": "全自動"}
             for bot_name, sess in existing_bots:
@@ -5735,10 +5817,6 @@ class BacktestApp:
                              news_directional_var.get())
                 dlg.destroy()
 
-            btn_row = ttk.Frame(content)
-            btn_row.pack(pady=(0, 8))
-            ttk.Button(btn_row, text="載入選取 Load Selected", command=on_load).pack(side=tk.LEFT, padx=4)
-
             def on_delete():
                 sel = tree.selection()
                 if not sel:
@@ -5762,8 +5840,6 @@ class BacktestApp:
                     self._live_log_msg(f"已刪除機器人 Bot deleted: {name}", "status")
                 except Exception as e:
                     messagebox.showerror("Error", f"刪除失敗: {e}", parent=dlg)
-
-            ttk.Button(btn_row, text="刪除 Delete", command=on_delete).pack(side=tk.LEFT, padx=4)
 
             # Pre-select saved trading mode and loss limit when bot is selected
             def on_select(event=None):
@@ -5803,19 +5879,16 @@ class BacktestApp:
 
         else:
             ttk.Label(content, text=f"沒有 {symbol} 的現有機器人 No existing bots for {symbol}.",
-                      style="Dim.TLabel").pack(anchor=tk.W, padx=10, pady=(10, 4))
+                      style="Dim.TLabel").pack(anchor=tk.W, pady=S(0, 14))
 
         # New bot section
-        ttk.Separator(content, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
-        ttk.Label(content, text="建立新機器人 Create New Bot:",
-                  font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(4, 4))
-
-        new_frame = ttk.Frame(content)
-        new_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
-        ttk.Label(new_frame, text="名稱 Name:").pack(side=tk.LEFT, padx=(0, 4))
+        new_card = section("建立新機器人 Create New Bot")
+        ttk.Label(new_card, text="名稱 Name", style="Card.Dim.TLabel").pack(
+            side=tk.LEFT, padx=S(0, 8))
         new_name_var = tk.StringVar(value=self.strategy_var.get().replace(" ", "_"))
-        new_entry = ttk.Entry(new_frame, textvariable=new_name_var, width=25)
-        new_entry.pack(side=tk.LEFT, padx=(0, 8))
+        new_entry = ttk.Entry(new_card, textvariable=new_name_var, width=32,
+                              style="Card.TEntry")
+        new_entry.pack(side=tk.LEFT)
 
         existing_names = {b[0] for b in existing_bots}
 
@@ -5837,44 +5910,43 @@ class BacktestApp:
                          news_directional_var.get())
             dlg.destroy()
 
-        ttk.Button(new_frame, text="建立 Create", command=on_create).pack(side=tk.LEFT)
-
         # Trading mode selector
-        ttk.Separator(content, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
-        mode_frame = ttk.LabelFrame(content, text="交易模式 Trading Mode")
-        mode_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        mode_frame = section("交易模式 Trading Mode")
         mode_var = tk.StringVar(value="paper")
         ttk.Radiobutton(mode_frame, text="模擬 Paper (模擬交易，不下單)",
-                        variable=mode_var, value="paper").pack(anchor=tk.W, padx=10, pady=2)
+                        style="Card.TRadiobutton",
+                        variable=mode_var, value="paper").pack(anchor=tk.W, pady=S(2))
         semi_auto_rb = ttk.Radiobutton(
             mode_frame,
             text="半自動 Semi-Auto (模擬成交後確認下單，10秒未回應則跳過)",
+            style="Card.TRadiobutton",
             variable=mode_var, value="semi_auto")
-        semi_auto_rb.pack(anchor=tk.W, padx=10, pady=2)
+        semi_auto_rb.pack(anchor=tk.W, pady=S(2))
         auto_rb = ttk.Radiobutton(
             mode_frame,
             text="全自動 Auto (模擬成交後自動下單，無需確認)",
+            style="Card.TRadiobutton",
             variable=mode_var, value="auto")
-        auto_rb.pack(anchor=tk.W, padx=10, pady=2)
+        auto_rb.pack(anchor=tk.W, pady=S(2))
         # Disable real trading modes if not connected or no account
         if not (self._logged_in and self._futures_account):
             semi_auto_rb.config(state=tk.DISABLED)
             auto_rb.config(state=tk.DISABLED)
-            ttk.Label(mode_frame, text="  (需先登入才能使用半/全自動 Login required for semi/auto)",
-                      style="Dim.TLabel").pack(anchor=tk.W, padx=10)
+            ttk.Label(mode_frame, text="需先登入才能使用半/全自動 Login required for semi/auto",
+                      style="Card.Dim.TLabel").pack(anchor=tk.W, pady=S(4, 0))
 
         # Daily loss limit (semi-auto only)
-        loss_frame = ttk.Frame(mode_frame)
-        loss_frame.pack(anchor=tk.W, padx=30, pady=(0, 4))
-        ttk.Label(loss_frame, text="每日虧損上限 Daily Loss Limit (NTD):").pack(side=tk.LEFT)
+        loss_frame = ttk.Frame(mode_frame, style="CardBody.TFrame")
+        loss_frame.pack(anchor=tk.W, pady=S(10, 0))
+        ttk.Label(loss_frame, text="每日虧損上限 Daily Loss Limit (NTD)",
+                  style="Card.Dim.TLabel").pack(side=tk.LEFT, padx=S(0, 8))
         loss_var = tk.StringVar(value="10000")
-        loss_entry = ttk.Entry(loss_frame, textvariable=loss_var, width=8)
-        loss_entry.pack(side=tk.LEFT, padx=4)
+        loss_entry = ttk.Entry(loss_frame, textvariable=loss_var, width=10,
+                               style="Card.TEntry")
+        loss_entry.pack(side=tk.LEFT)
 
         # Regime switching section
-        ttk.Separator(content, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=4)
-        regime_lf = ttk.LabelFrame(content, text="多空切換 Regime Switching")
-        regime_lf.pack(fill=tk.X, padx=10, pady=(0, 8))
+        regime_lf = section("多空切換 Regime Switching")
 
         regime_var = tk.BooleanVar(value=False)
         # News/circuit-breaker strategies are backtestable but must not be
@@ -5885,17 +5957,21 @@ class BacktestApp:
         regime_long_var = tk.StringVar(value=default_long)
         regime_short_var = tk.StringVar(value=default_short)
 
-        regime_strat_frame = ttk.Frame(regime_lf)
-        long_label = ttk.Label(regime_strat_frame, text="多頭策略 Long Strategy:")
+        regime_strat_frame = ttk.Frame(regime_lf, style="CardBody.TFrame")
+        long_label = ttk.Label(regime_strat_frame, text="多頭策略 Long Strategy",
+                               style="Card.Dim.TLabel")
         long_combo = ttk.Combobox(regime_strat_frame, textvariable=regime_long_var,
-                                  values=strat_names, state="readonly", width=35)
-        short_label = ttk.Label(regime_strat_frame, text="空頭策略 Short Strategy:")
+                                  values=strat_names, state="readonly", width=38,
+                                  style="Card.TCombobox")
+        short_label = ttk.Label(regime_strat_frame, text="空頭策略 Short Strategy",
+                                style="Card.Dim.TLabel")
         short_combo = ttk.Combobox(regime_strat_frame, textvariable=regime_short_var,
-                                   values=strat_names, state="readonly", width=35)
-        long_label.grid(row=0, column=0, sticky=tk.W, padx=(10, 4), pady=2)
-        long_combo.grid(row=0, column=1, sticky=tk.W, padx=(0, 10), pady=2)
-        short_label.grid(row=1, column=0, sticky=tk.W, padx=(10, 4), pady=2)
-        short_combo.grid(row=1, column=1, sticky=tk.W, padx=(0, 10), pady=2)
+                                   values=strat_names, state="readonly", width=38,
+                                   style="Card.TCombobox")
+        long_label.grid(row=0, column=0, sticky=tk.W, padx=S(0, 10), pady=S(3))
+        long_combo.grid(row=0, column=1, sticky=tk.W, pady=S(3))
+        short_label.grid(row=1, column=0, sticky=tk.W, padx=S(0, 10), pady=S(3))
+        short_combo.grid(row=1, column=1, sticky=tk.W, pady=S(3))
 
         # News circuit breaker — PER-BOT, not global: the rollout runs a
         # news-enabled bot beside an untouched baseline, so one risk_off
@@ -5915,20 +5991,20 @@ class BacktestApp:
             value=self._settings.get(
                 "news_suppress_scope", "both") == "conflicting_leg")
 
-        news_frame = ttk.Frame(regime_lf)
+        news_frame = ttk.Frame(regime_lf, style="CardBody.TFrame")
         news_cb = ttk.Checkbutton(
-            news_frame, variable=news_var,
+            news_frame, variable=news_var, style="Card.TCheckbutton",
             text="📰 新聞斷路器 News circuit breaker (此機器人 this bot only)")
-        news_cb.pack(anchor=tk.W, padx=10, pady=(2, 0))
+        news_cb.pack(anchor=tk.W, pady=S(2, 0))
         tier2_cb = ttk.Checkbutton(
-            news_frame, variable=news_tier2_var,
+            news_frame, variable=news_tier2_var, style="Card.TCheckbutton",
             text="允許強制進場 allow forced-entry deploys (Tier 2)")
-        tier2_cb.pack(anchor=tk.W, padx=30, pady=(0, 0))
+        tier2_cb.pack(anchor=tk.W, padx=S(26, 0))
         directional_cb = ttk.Checkbutton(
-            news_frame, variable=news_directional_var,
+            news_frame, variable=news_directional_var, style="Card.TCheckbutton",
             text="方向性暫停 directional risk_off — 只擋衝突方向"
                  " gate conflicting leg only")
-        directional_cb.pack(anchor=tk.W, padx=30, pady=(0, 2))
+        directional_cb.pack(anchor=tk.W, padx=S(26, 0), pady=S(0, 2))
 
         def _toggle_news_widgets():
             # Tier 2 / directional are sub-decisions of the breaker: grey
@@ -5942,8 +6018,8 @@ class BacktestApp:
 
         def _toggle_regime_widgets():
             if regime_var.get():
-                regime_strat_frame.pack(fill=tk.X, pady=(0, 4))
-                news_frame.pack(fill=tk.X, pady=(0, 4))
+                regime_strat_frame.pack(fill=tk.X, pady=S(8, 4))
+                news_frame.pack(fill=tk.X, pady=S(4, 0))
             else:
                 regime_strat_frame.pack_forget()
                 news_frame.pack_forget()
@@ -5952,14 +6028,23 @@ class BacktestApp:
             # revealed dropdowns are reachable.
             _outer.canvas.after_idle(_outer._on_body_configure)
 
-        ttk.Checkbutton(regime_lf, variable=regime_var,
+        ttk.Checkbutton(regime_lf, variable=regime_var, style="Card.TCheckbutton",
                         text="啟用多空切換 Enable Regime Switching",
-                        command=_toggle_regime_widgets).pack(
-            anchor=tk.W, padx=10, pady=4)
+                        command=_toggle_regime_widgets).pack(anchor=tk.W)
         _toggle_regime_widgets()
 
-        # Cancel
-        ttk.Button(content, text="取消 Cancel", command=dlg.destroy).pack(pady=(0, 10))
+        # Footer actions (right-aligned; primary rightmost)
+        ttk.Button(footer, text="建立新機器人 Create New", style="Bar.Accent.TButton",
+                   command=on_create).pack(side=tk.RIGHT)
+        if tree is not None:
+            ttk.Button(footer, text="載入選取 Load Selected", style="Bar.Accent.TButton",
+                       command=on_load).pack(side=tk.RIGHT, padx=S(0, 8))
+            ttk.Button(footer, text="刪除 Delete", style="Bar.Ghost.TButton",
+                       command=on_delete).pack(side=tk.LEFT)
+        ttk.Button(footer, text="取消 Cancel", style="Bar.TButton",
+                   command=dlg.destroy).pack(side=tk.RIGHT, padx=S(0, 8))
+
+        place_dialog(dlg, self.root, 820, 740)
 
         # Wait for dialog to close
         self.root.wait_window(dlg)
@@ -6501,7 +6586,7 @@ class BacktestApp:
         self.btn_api.config(state=tk.DISABLED)
         self.btn_tv.config(state=tk.DISABLED)
         self.btn_update.config(state=tk.DISABLED)  # no updates while a bot runs
-        self.btn_deploy.config(text="停止機器人 Stop Bot")
+        self.btn_deploy.config(text="停止機器人 Stop Bot", style="Danger.TButton")
         self.symbol_combo.config(state=tk.DISABLED)
         self.strategy_combo.config(state=tk.DISABLED)
         if is_regime_deploy:
@@ -6645,7 +6730,7 @@ class BacktestApp:
                 self.root.after(0, _finish)
             except Exception as e:
                 _log(f"TV暖機錯誤: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
-                self.root.after(0, lambda: self._live_log_msg(f"TV暖機錯誤: {e}", "status"))
+                self.root.after(0, lambda err=e: self._live_log_msg(f"TV暖機錯誤: {err}", "status"))
                 self.root.after(0, self._stop_live)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -7737,7 +7822,6 @@ class BacktestApp:
 
         dlg = tk.Toplevel(self.root)
         dlg.title("確認下單 Confirm Order")
-        dlg.geometry("440x230")
         dlg.attributes("-topmost", True)
         dlg.resizable(False, False)
         apply_window_theme(dlg)
@@ -7746,46 +7830,44 @@ class BacktestApp:
         self._order_confirm_dlg = dlg
         countdown = [10]  # mutable for closure
 
+        body = ttk.Frame(dlg, padding=S(24, 18, 24, 18))
+        body.pack(fill=tk.BOTH, expand=True)
+
         # Header
         color = PALETTE["ok"] if buy_sell == 0 else PALETTE["err"]
         action_label = "進場 ENTRY" if action_type == "entry" else "出場 EXIT"
-        header = tk.Label(
-            dlg, text=f"{action_label}: {order_desc}",
-            font=FONTS.get("title") or ("", 16, "bold"),
-            fg=color, bg=PALETTE["bg"],
-        )
-        header.pack(pady=(15, 5))
+        ttk.Label(body, text=f"{action_label}: {order_desc}",
+                  style="Title.TLabel", foreground=color).pack(anchor="w")
 
         # Order details
         symbol = self._live_runner.symbol if self._live_runner else "?"
         cfg = SYMBOL_CONFIG.get(symbol, {})
         pv = cfg.get("pv", "?")
-        tk.Label(
-            dlg, text=f"商品 Symbol: {order_symbol} ({symbol})  |  每點 PV: {pv} NTD",
-            font=FONTS.get("body") or ("", 10),
-            fg=PALETTE["text"], bg=PALETTE["bg"],
-        ).pack(pady=2)
         src_label = f" ({price_source})" if price_source else ""
-        tk.Label(
-            dlg, text=f"參考價格 Ref Price: {price:,}{src_label}  |  數量 Qty: 1 口",
-            font=FONTS.get("body") or ("", 10),
-            fg=PALETTE["text"], bg=PALETTE["bg"],
-        ).pack(pady=2)
-        tk.Label(
-            dlg, text="實單將以市價IOC送出 Will send as IOC market order",
-            font=FONTS.get("mono_small") or ("", 9),
-            fg=PALETTE["text_dim"], bg=PALETTE["bg"],
-        ).pack(pady=2)
+        details = ttk.Frame(body, style="Card.TFrame", padding=S(14, 10, 14, 10))
+        details.pack(fill=tk.X, pady=S(12, 0))
+        for r, (caption, value) in enumerate((
+                ("商品 Symbol", f"{order_symbol} ({symbol})"),
+                ("每點 PV", f"{pv} NTD"),
+                ("參考價格 Ref Price", f"{price:,}{src_label}"),
+                ("數量 Qty", "1 口"))):
+            ttk.Label(details, text=caption, style="Card.Dim.TLabel").grid(
+                row=r, column=0, sticky="w", padx=S(0, 24), pady=S(2))
+            ttk.Label(details, text=value, style="Card.TLabel",
+                      font=FONTS.get("mono_bold") or ("Consolas", 10, "bold")).grid(
+                row=r, column=1, sticky="w", pady=S(2))
+        ttk.Label(body, text="實單將以市價IOC送出 Will send as IOC market order",
+                  style="Faint.TLabel").pack(anchor="w", pady=S(10, 0))
 
-        countdown_label = tk.Label(
-            dlg, text=f"自動跳過 Auto-skip in {countdown[0]}s",
-            font=FONTS.get("body") or ("", 10),
-            fg=PALETTE["warn"], bg=PALETTE["bg"],
-        )
-        countdown_label.pack(pady=5)
+        countdown_label = ttk.Label(
+            body, text=f"自動跳過 Auto-skip in {countdown[0]}s",
+            style="Status.Warn.TLabel")
+        countdown_label.pack(anchor="w", pady=S(10, 4))
+        countdown_bar = ttk.Progressbar(body, maximum=10, value=10)
+        countdown_bar.pack(fill=tk.X)
 
-        btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(pady=10)
+        btn_frame = ttk.Frame(body)
+        btn_frame.pack(anchor="e", pady=S(16, 0))
 
         def on_confirm():
             self._dismiss_order_dialog("confirmed")
@@ -7794,8 +7876,12 @@ class BacktestApp:
         def on_skip():
             self._dismiss_order_dialog("skipped")
 
-        ttk.Button(btn_frame, text="確認送出 Confirm", command=on_confirm).pack(side=tk.LEFT, padx=10)
-        ttk.Button(btn_frame, text="跳過 Skip", command=on_skip).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="跳過 Skip", command=on_skip).pack(
+            side=tk.LEFT, padx=S(0, 8))
+        ttk.Button(btn_frame, text="確認送出 Confirm",
+                   style="Success.TButton" if buy_sell == 0 else "Danger.TButton",
+                   command=on_confirm).pack(side=tk.LEFT)
+        place_dialog(dlg, self.root)
 
         # Audio alert
         try:
@@ -7813,6 +7899,7 @@ class BacktestApp:
                 self._dismiss_order_dialog("timeout")
                 return
             countdown_label.config(text=f"自動跳過 Auto-skip in {countdown[0]}s")
+            countdown_bar.configure(value=countdown[0])
             self._order_confirm_timer_id = dlg.after(1000, tick)
 
         self._order_confirm_timer_id = dlg.after(1000, tick)
@@ -8861,7 +8948,7 @@ class BacktestApp:
             _close_debug_log()
 
         # Restore UI
-        self.btn_deploy.config(text="部署機器人 Deploy Bot")
+        self.btn_deploy.config(text="部署機器人 Deploy Bot", style="Accent.TButton")
         self._update_manual_order_buttons()
         self.chart_tf_combo.config(state=tk.DISABLED)
         self.chart_tf_var.set("Native")
@@ -8901,6 +8988,9 @@ def register_com_events() -> None:
 
 
 def main():
+    # First: COM init and Tk both create (hidden) windows, and DPI
+    # awareness can only be set before the process owns any window.
+    enable_dpi_awareness()
     _init_com()
     register_com_events()
 

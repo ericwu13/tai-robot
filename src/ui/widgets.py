@@ -1,4 +1,4 @@
-"""Reusable Tk widgets for the workbench (Phase 1).
+"""Reusable Tk widgets for the workbench.
 
 Imports ``src.ui.theme`` only — never ``run_backtest``.
 """
@@ -10,8 +10,9 @@ import tkinter as tk
 from tkinter import ttk
 
 from src.ui.theme import (
-    CHAT_TAGS, EMPTY_FG, FONTS, LOG_TAGS, PALETTE, style_text_widget,
+    CHAT_TAGS, EMPTY_FG, FONTS, LOG_TAGS, PALETTE, S, TONE, style_text_widget,
 )
+from src.ui.raster import mix
 
 
 class ScrollableFrame(ttk.Frame):
@@ -23,11 +24,11 @@ class ScrollableFrame(ttk.Frame):
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
-        bg = PALETTE["bg"]
-        self.canvas = tk.Canvas(self, highlightthickness=0, bg=bg,
-                                borderwidth=0)
+        self.canvas = tk.Canvas(self, highlightthickness=0,
+                                bg=PALETTE["bg"], borderwidth=0)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vsb.set)
+        self.canvas.configure(
+            yscrollcommand=autohide_scrollbar(vsb, "Vertical.TScrollbar"))
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -42,7 +43,6 @@ class ScrollableFrame(ttk.Frame):
         self._wheel_bound = False
 
     def _on_linux_wheel(self, event):
-        # X11 / this preview host: Button-4 up, Button-5 down.
         self.canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
 
     def _on_body_configure(self, _event=None):
@@ -52,6 +52,10 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.itemconfigure(self._win, width=event.width)
 
     def _on_mousewheel(self, event):
+        # Content shorter than the viewport must not scroll into blank space.
+        first, last = self.canvas.yview()
+        if first <= 0.0 and last >= 1.0:
+            return
         delta = int(-1 * (event.delta / 120)) if event.delta else 0
         if delta:
             self.canvas.yview_scroll(delta, "units")
@@ -80,31 +84,206 @@ class ScrollableFrame(ttk.Frame):
             self._unbind_wheel()
 
 
+class FlowFrame(ttk.Frame):
+    """Left-to-right layout that wraps onto extra rows when too narrow.
+
+    ``add(widget)`` registers a child (created with this frame as parent).
+    ``add_spacer()`` right-aligns everything after it while that tail still
+    fits on the current row; otherwise the tail wraps like any other item.
+
+    Children are positioned with ``place`` — a grid would share column
+    widths across the wrapped rows and tear the rows apart.
+    """
+
+    _SPACER = object()
+
+    def __init__(self, parent, *, gap: int = 6, row_gap: int = 6, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._items: list = []
+        self._gap = gap
+        self._row_gap = row_gap
+        self._last_width = -1
+        self._child_sizes: dict = {}
+        self._reflow_pending = False
+        self._layout_width = 0
+        self.bind("<Configure>", self._on_configure)
+
+    def add(self, widget, *, gap: int | None = None):
+        self._items.append((widget, self._gap if gap is None else gap))
+        self._last_width = -1
+        self._set_height(self._natural_height())
+        # A child whose text changes later (status dot, Deploy↔Stop) resizes
+        # itself; its neighbours must move or they overlap.
+        widget.bind("<Configure>", self._on_child_configure, add="+")
+        return widget
+
+    def _on_child_configure(self, event) -> None:
+        size = (event.width, event.height)
+        if self._child_sizes.get(event.widget) == size:
+            return
+        self._child_sizes[event.widget] = size
+        if not self._reflow_pending:
+            self._reflow_pending = True
+            self.after_idle(self._deferred_reflow)
+
+    def _deferred_reflow(self) -> None:
+        self._reflow_pending = False
+        try:
+            self.reflow()
+        except tk.TclError:
+            pass  # destroyed while the idle callback was queued
+
+    def add_spacer(self) -> None:
+        self._items.append((self._SPACER, 0))
+
+    def add_separator(self):
+        sep = ttk.Separator(self, orient=tk.VERTICAL)
+        self._items.append((sep, self._gap))
+        return sep
+
+    def _natural_height(self) -> int:
+        heights = [w.winfo_reqheight() for w, _ in self._items
+                   if w is not self._SPACER and not isinstance(w, ttk.Separator)]
+        return max(heights) if heights else 1
+
+    def _set_height(self, height: int) -> None:
+        try:
+            if int(self.cget("height")) != height:
+                self.configure(height=height)
+        except (tk.TclError, ValueError):
+            pass
+
+    def _on_configure(self, event) -> None:
+        # Gate on width: placing children changes the height, which fires
+        # <Configure> again.
+        if event.width == self._last_width:
+            return
+        self._last_width = event.width
+        self.reflow(event.width)
+
+    def reflow(self, width: int | None = None) -> None:
+        if width is None:
+            width = self.winfo_width()
+        if width <= 1:
+            # Not mapped yet (or withdrawn): reuse the last real width
+            # rather than collapsing everything into a 1-px column.
+            width = self._layout_width
+        if width <= 1:
+            return
+        self._layout_width = width
+
+        def size(widget):
+            if isinstance(widget, ttk.Separator):
+                return max(1, widget.winfo_reqwidth()), 0
+            return widget.winfo_reqwidth(), widget.winfo_reqheight()
+
+        # rows: list of (left_items, right_items); item = (widget, gap, w, h)
+        rows = [([], [])]
+        x = 0
+        pending_spacer = False
+        for index, (widget, gap) in enumerate(self._items):
+            if widget is self._SPACER:
+                tail = [(w, g) for w, g in self._items[index + 1:]
+                        if w is not self._SPACER]
+                tail_w = sum(size(w)[0] + S(g) for w, g in tail)
+                pending_spacer = x + tail_w <= width
+                continue
+            w_px, h_px = size(widget)
+            need = w_px + S(gap)
+            left, right = rows[-1]
+            if pending_spacer:
+                right.append((widget, gap, w_px, h_px))
+                continue
+            if left and x + w_px > width:
+                rows.append(([], []))
+                left, right = rows[-1]
+                x = 0
+            left.append((widget, gap, w_px, h_px))
+            x += need
+
+        y = 0
+        for left, right in rows:
+            items = left + right
+            row_h = max((h for _, _, _, h in items), default=0) or \
+                self._natural_height()
+            # A separator that would end or start a row is just noise.
+            while left and isinstance(left[-1][0], ttk.Separator) and not right:
+                left[-1][0].place_forget()
+                left = left[:-1]
+            while left and isinstance(left[0][0], ttk.Separator):
+                left[0][0].place_forget()
+                left = left[1:]
+            cx = 0
+            for widget, gap, w_px, h_px in left:
+                self._place(widget, cx, y, w_px, h_px, row_h)
+                cx += w_px + S(gap)
+            if right:
+                total = sum(w + S(g) for _, g, w, _ in right) - S(right[-1][1])
+                cx = max(cx, width - total)
+                for widget, gap, w_px, h_px in right:
+                    self._place(widget, cx, y, w_px, h_px, row_h)
+                    cx += w_px + S(gap)
+            y += row_h + S(self._row_gap)
+        self._set_height(max(1, y - S(self._row_gap)))
+
+    @staticmethod
+    def _place(widget, x, y, w_px, h_px, row_h) -> None:
+        if isinstance(widget, ttk.Separator):
+            inset = max(1, int(row_h * 0.22))
+            widget.place(x=x, y=y + inset, width=w_px,
+                         height=max(1, row_h - 2 * inset))
+        else:
+            widget.place(x=x, y=y + (row_h - h_px) // 2)
+
+
+def place_dialog(win, parent, width: int | None = None,
+                 height: int | None = None) -> None:
+    """Size (logical px, optional) and center a Toplevel over its parent.
+
+    Without a size the dialog keeps its natural (content) size — fixed
+    pixel geometries clip at high DPI.
+    """
+    try:
+        win.update_idletasks()
+        w = S(width) if width else win.winfo_reqwidth()
+        h = S(height) if height else win.winfo_reqheight()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        if pw <= 1 or ph <= 1:  # parent not mapped (headless / early)
+            pw, ph = win.winfo_screenwidth(), win.winfo_screenheight()
+            px = py = 0
+        x = px + max(0, (pw - w) // 2)
+        y = py + max(0, (ph - h) // 3)
+        if width or height:
+            win.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            win.geometry(f"+{x}+{y}")
+    except tk.TclError:
+        pass
+
+
 def attach_tooltip(widget, text: str) -> None:
-    """Lightweight hover tooltip using the dark raised/border palette."""
+    """Lightweight hover tooltip on the raised surface."""
     state = {"tip": None}
 
     def show(_event=None):
         if state["tip"] is not None:
             return
         try:
-            x = widget.winfo_rootx() + 20
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            x = widget.winfo_rootx() + S(12)
+            y = widget.winfo_rooty() + widget.winfo_height() + S(6)
         except tk.TclError:
             return
         tip = tk.Toplevel(widget)
         tip.wm_overrideredirect(True)
         tip.wm_geometry(f"+{x}+{y}")
+        tip.configure(bg=PALETTE["border_strong"])
         tk.Label(
             tip, text=text,
-            background=PALETTE["bg_raised"],
-            foreground=PALETTE["text"],
-            highlightbackground=PALETTE["border"],
-            highlightthickness=1,
-            relief=tk.SOLID, borderwidth=1,
-            font=FONTS.get("mono_small") or ("", 9),
-            justify=tk.LEFT, padx=6, pady=3,
-        ).pack()
+            background=PALETTE["bg_raised"], foreground=PALETTE["text"],
+            font=FONTS.get("small") or ("", 9),
+            justify=tk.LEFT, padx=S(10), pady=S(6), bd=0,
+        ).pack(padx=S(1), pady=S(1))
         state["tip"] = tip
 
     def hide(_event=None):
@@ -115,68 +294,109 @@ def attach_tooltip(widget, text: str) -> None:
                 pass
             state["tip"] = None
 
-    widget.bind("<Enter>", show)
-    widget.bind("<Leave>", hide)
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+    widget.bind("<ButtonPress>", hide, add="+")
+
+
+def autohide_scrollbar(scrollbar: ttk.Scrollbar, base_style: str):
+    """Return a ``yscrollcommand`` that hides the thumb while content fits.
+
+    Swaps the scrollbar between ``base_style`` and ``Hidden.<base_style>``
+    (same footprint) rather than unmapping it — no relayout, no flicker.
+    """
+    state = {"hidden": None}
+
+    def on_set(first, last):
+        scrollbar.set(first, last)
+        try:
+            hidden = float(first) <= 0.0 and float(last) >= 1.0
+        except (TypeError, ValueError):
+            return
+        if hidden != state["hidden"]:
+            state["hidden"] = hidden
+            try:
+                scrollbar.configure(
+                    style=("Hidden." + base_style) if hidden else base_style)
+            except tk.TclError:
+                pass
+
+    return on_set
+
+
+def scrolled_tree(parent, **tree_kw):
+    """Treeview + auto-hiding pill scrollbar in one frame → (frame, tree)."""
+    frame = ttk.Frame(parent)
+    tree = ttk.Treeview(frame, **tree_kw)
+    vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=autohide_scrollbar(vsb, "Vertical.TScrollbar"))
+    vsb.pack(side=tk.RIGHT, fill=tk.Y, padx=S(2, 0))
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    return frame, tree
 
 
 def themed_scrolled_text(parent, *, wrap=tk.WORD, font=None, inset: bool = True,
+                         focus_ring: bool = False, scrollbar: bool = True,
                          **text_kw):
-    """Text + ttk.Scrollbar well. Returns ``(frame, text)``.
+    """Borderless Text + pill scrollbar inside a rounded well.
 
-    ``scrolledtext.ScrolledText`` ships a raw ``tk.Scrollbar`` that stays
-    the system light chrome — this helper is the dark-theme replacement.
+    Returns ``(frame, text)``. ``scrolledtext.ScrolledText`` ships a raw
+    ``tk.Scrollbar`` that stays system-light — this is its replacement.
+    ``focus_ring`` lights the well's border while the text has focus.
     """
-    frame = ttk.Frame(parent)
+    frame = ttk.Frame(parent, style="Well.TFrame", padding=S(3))
+    body = ttk.Frame(frame, style="WellBody.TFrame")
+    body.pack(fill=tk.BOTH, expand=True)
+    text_kw.setdefault("padx", S(10))
+    text_kw.setdefault("pady", S(8))
     text = tk.Text(
-        frame, wrap=wrap,
+        body, wrap=wrap,
         font=font or FONTS.get("mono") or ("Consolas", 10),
-        padx=6, pady=4, **text_kw,
+        **text_kw,
     )
     style_text_widget(text, inset=inset)
-    vsb = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-    text.configure(yscrollcommand=vsb.set)
-    if wrap == tk.NONE:
-        hsb = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
-        text.configure(xscrollcommand=hsb.set)
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
-    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    if scrollbar:
+        vsb = ttk.Scrollbar(body, orient="vertical", command=text.yview,
+                            style="Inset.Vertical.TScrollbar")
+        text.configure(yscrollcommand=autohide_scrollbar(
+            vsb, "Inset.Vertical.TScrollbar"))
+        if wrap == tk.NONE:
+            hsb = ttk.Scrollbar(body, orient="horizontal", command=text.xview,
+                                style="Inset.Horizontal.TScrollbar")
+            text.configure(xscrollcommand=autohide_scrollbar(
+                hsb, "Inset.Horizontal.TScrollbar"))
+            hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
     text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    if focus_ring:
+        text.bind("<FocusIn>", lambda _e: frame.state(["focus"]), add="+")
+        text.bind("<FocusOut>", lambda _e: frame.state(["!focus"]), add="+")
     return frame, text
 
 
 class StatusDot(ttk.Label):
     """Colored ● plus optional label. States: ok / warn / err / off.
 
-    ``surface`` picks the fill so the dot does not punch a hole through
-    a raised strip (``"raised"``) or a card (``"card"``). Default
-    ``"bg"`` matches window / LabelFrame backgrounds.
+    ``surface`` picks the style family so the label background matches
+    what it sits on: ``"bg"``, ``"raised"`` (status strip / top bar) or
+    ``"card"``.
     """
 
     _STATE_TO_KEY = {
-        "ok": "ok",
-        "warn": "warn",
-        "err": "err",
-        "error": "err",
-        "off": "off",
+        "ok": "ok", "warn": "warn", "err": "err", "error": "err", "off": "off",
     }
     _STYLES = {
         "bg": {
-            "ok": "Status.Ok.TLabel",
-            "warn": "Status.Warn.TLabel",
-            "err": "Status.Err.TLabel",
-            "off": "Dim.TLabel",
+            "ok": "Status.Ok.TLabel", "warn": "Status.Warn.TLabel",
+            "err": "Status.Err.TLabel", "off": "Dim.TLabel",
         },
         "raised": {
-            "ok": "StatusStrip.Ok.TLabel",
-            "warn": "StatusStrip.Warn.TLabel",
-            "err": "StatusStrip.Err.TLabel",
-            "off": "StatusStrip.Dim.TLabel",
+            "ok": "StatusStrip.Ok.TLabel", "warn": "StatusStrip.Warn.TLabel",
+            "err": "StatusStrip.Err.TLabel", "off": "StatusStrip.Dim.TLabel",
         },
         "card": {
-            "ok": "Status.Ok.TLabel",
-            "warn": "Status.Warn.TLabel",
-            "err": "Status.Err.TLabel",
-            "off": "Card.Dim.TLabel",
+            "ok": "Card.Status.Ok.TLabel", "warn": "Card.Status.Warn.TLabel",
+            "err": "Card.Status.Err.TLabel", "off": "Card.Dim.TLabel",
         },
     }
 
@@ -186,19 +406,19 @@ class StatusDot(ttk.Label):
         self._surface = surface if surface in self._STYLES else "bg"
         if "style" not in kwargs:
             kwargs["style"] = self._style_for("off")
-        super().__init__(parent, text=self._render("off", text), **kwargs)
+        super().__init__(parent, text=self._render(text), **kwargs)
 
     def _style_for(self, key: str) -> str:
         return self._STYLES[self._surface][key]
 
     @staticmethod
-    def _render(state: str, label: str) -> str:
-        return f"● {label}" if label else "●"
+    def _render(label: str) -> str:
+        return f"●  {label}" if label else "●"
 
     def set_state(self, state: str) -> None:
         key = self._STATE_TO_KEY.get(state, "off")
         self._state = key
-        self.configure(text=self._render(key, self._label),
+        self.configure(text=self._render(self._label),
                        style=self._style_for(key))
 
     def set_label(self, text: str) -> None:
@@ -206,8 +426,107 @@ class StatusDot(ttk.Label):
         self.set_state(self._state)
 
 
+class StatCard(ttk.Frame):
+    """Raised card: dim caption, large value, optional dim sub-line.
+
+    ``variable`` keeps the value live; ``signed=True`` tints it green/red
+    from a leading ``+`` / ``-`` (P&L fields) without the caller having
+    to know about colors.
+    """
+
+    def __init__(self, parent, caption: str, *, variable=None, value: str = "",
+                 sub_variable=None, sub: str | None = None,
+                 signed: bool = False, small: bool = False, **kwargs):
+        kwargs.setdefault("style", "Card.TFrame")
+        kwargs.setdefault("padding", S(14, 10, 14, 10))
+        super().__init__(parent, **kwargs)
+        ttk.Label(self, text=caption, style="Card.Dim.TLabel").pack(anchor="w")
+        value_style = "CardValueSmall.TLabel" if small else "CardValue.TLabel"
+        self._value = ttk.Label(self, style=value_style)
+        if variable is not None:
+            self._value.configure(textvariable=variable)
+        else:
+            self._value.configure(text=value)
+        self._value.pack(anchor="w", pady=S(2, 0))
+        self._sub = None
+        if sub_variable is not None or sub is not None:
+            self._sub = ttk.Label(self, style="Card.Dim.TLabel")
+            if sub_variable is not None:
+                self._sub.configure(textvariable=sub_variable)
+            else:
+                self._sub.configure(text=sub)
+            self._sub.pack(anchor="w")
+        self._variable = variable
+        if signed and variable is not None:
+            variable.trace_add("write", self._retint)
+            self._retint()
+
+    @property
+    def value_label(self) -> ttk.Label:
+        return self._value
+
+    def set_tone(self, tone: str | None) -> None:
+        color = TONE.get(tone) if tone else None
+        self._value.configure(foreground=color or PALETTE["text"])
+
+    def _retint(self, *_args) -> None:
+        try:
+            raw = str(self._variable.get()).strip()
+        except tk.TclError:
+            return
+        digits = raw.lstrip("+-").replace(",", "").strip()
+        nonzero = any(ch in "123456789" for ch in digits)
+        if raw.startswith("+") and nonzero:
+            self.set_tone("good")
+        elif raw.startswith("-") and nonzero:
+            self.set_tone("bad")
+        else:
+            self.set_tone(None)
+
+
+def enable_row_hover(tree: ttk.Treeview) -> None:
+    """Subtle hover highlight for Treeview rows.
+
+    Uses a transient ``hover`` tag that is always removed before another
+    row gets it, so code reading item tags never sees a stale one.
+    """
+    state = {"iid": ""}
+    tree.tag_configure("hover",
+                       background=mix(PALETTE["bg_inset"], PALETTE["text"], 0.06))
+
+    def clear():
+        iid = state["iid"]
+        state["iid"] = ""
+        if iid:
+            try:
+                if tree.exists(iid):
+                    tags = [t for t in tree.item(iid, "tags") if t != "hover"]
+                    tree.item(iid, tags=tags)
+            except tk.TclError:
+                pass
+
+    def on_motion(event):
+        try:
+            iid = tree.identify_row(event.y)
+        except tk.TclError:
+            return
+        if iid == state["iid"]:
+            return
+        clear()
+        if iid:
+            try:
+                tags = list(tree.item(iid, "tags"))
+                tree.item(iid, tags=tags + ["hover"])
+                state["iid"] = iid
+            except tk.TclError:
+                pass
+
+    tree.bind("<Motion>", on_motion, add="+")
+    tree.bind("<Leave>", lambda _e: clear(), add="+")
+
+
 class TagTextLog(ttk.Frame):
-    """Read-only dark Text well with tag palette, cap, filter, search, pause.
+    """Read-only Text well with tag palette, cap, filter, search, pause.
 
     ``append`` must be called on the Tk thread. Producers on other threads
     must enqueue through ``_ui_queue`` (documented by the off-thread raise).
@@ -234,13 +553,15 @@ class TagTextLog(ttk.Frame):
         self._bg = bg or PALETTE["bg_inset"]
         self._fg = fg or PALETTE["text"]
         self._font = font or FONTS.get("mono_small") or ("Consolas", 9)
+        self._filter_var = tk.StringVar(value="All")
+        self._search_var = tk.StringVar(value="")
+        self._pause_var = tk.BooleanVar(value=False)
 
         if show_toolbar:
             bar = ttk.Frame(self)
-            bar.pack(fill=tk.X, padx=2, pady=(2, 0))
-            ttk.Label(bar, text="Filter:", style="Dim.TLabel").pack(
-                side=tk.LEFT, padx=(2, 4))
-            self._filter_var = tk.StringVar(value="All")
+            bar.pack(fill=tk.X, pady=S(0, 8))
+            ttk.Label(bar, text="篩選 Filter", style="Dim.TLabel").pack(
+                side=tk.LEFT, padx=S(0, 6))
             values = ["All"]
             if "info" in levels:
                 values.append("Info")
@@ -249,23 +570,19 @@ class TagTextLog(ttk.Frame):
             combo = ttk.Combobox(
                 bar, textvariable=self._filter_var, values=values,
                 state="readonly", width=8)
-            combo.pack(side=tk.LEFT, padx=(0, 8))
+            combo.pack(side=tk.LEFT, padx=S(0, 14))
             combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_filter())
-            ttk.Label(bar, text="Search:", style="Dim.TLabel").pack(
-                side=tk.LEFT, padx=(0, 4))
-            self._search_var = tk.StringVar()
-            search = ttk.Entry(bar, textvariable=self._search_var, width=24)
-            search.pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Label(bar, text="搜尋 Search", style="Dim.TLabel").pack(
+                side=tk.LEFT, padx=S(0, 6))
+            search = ttk.Entry(bar, textvariable=self._search_var, width=28)
+            search.pack(side=tk.LEFT, padx=S(0, 14))
             search.bind("<KeyRelease>", lambda _e: self._apply_search())
-            self._pause_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                bar, text="暫停 Pause", variable=self._pause_var,
+                bar, text="暫停捲動 Pause", variable=self._pause_var,
                 command=self._on_pause_toggle,
             ).pack(side=tk.LEFT)
-        else:
-            self._filter_var = tk.StringVar(value="All")
-            self._search_var = tk.StringVar(value="")
-            self._pause_var = tk.BooleanVar(value=False)
+            ttk.Button(bar, text="清除 Clear", style="Ghost.TButton",
+                       command=self.clear).pack(side=tk.RIGHT)
 
         wrap, self.text = themed_scrolled_text(
             self, wrap=tk.WORD, font=self._font, inset=True,
@@ -275,8 +592,7 @@ class TagTextLog(ttk.Frame):
         self._placeholder = placeholder or ""
         self._ph_label = None
         if self._placeholder:
-            # Overlay (not buffer text) so get()/save paths stay empty and
-            # the well fill is not punched by a Dim.TLabel hole.
+            # Overlay (not buffer text) so get()/save paths stay empty.
             self._ph_label = tk.Label(
                 self.text, text=self._placeholder,
                 bg=self._bg, fg=EMPTY_FG,
@@ -284,10 +600,11 @@ class TagTextLog(ttk.Frame):
                 justify=tk.CENTER, bd=0, highlightthickness=0,
             )
             self._show_placeholder()
-        self.text.tag_configure("search_hit", background=PALETTE["accent"],
-                                foreground=PALETTE["bg"])
+        self.text.tag_configure(
+            "search_hit", background=mix(self._bg, PALETTE["warn"], 0.45),
+            foreground=PALETTE["text"])
         self.text.tag_configure("info", foreground=self._fg)
-        self.text.tag_configure("debug", foreground=PALETTE["text_dim"])
+        self.text.tag_configure("debug", foreground=PALETTE["text_faint"])
 
         palette = dict(CHAT_TAGS)
         palette.update(LOG_TAGS)
@@ -312,13 +629,22 @@ class TagTextLog(ttk.Frame):
         if not self._paused:
             self.text.see(tk.END)
         self.text.configure(state=tk.DISABLED)
-        self._apply_filter()
 
     def clear(self) -> None:
         self.text.configure(state=tk.NORMAL)
         self.text.delete("1.0", tk.END)
         self.text.configure(state=tk.DISABLED)
         self._show_placeholder()
+
+    def line_count(self) -> int:
+        """Buffer lines, O(1): the index of the end sentinel, not a copy
+        of the buffer (a busy bot appends thousands of lines)."""
+        return int(self.text.index("end-1c").split(".")[0]) - 1
+
+    def _trim(self) -> None:
+        extra = self.line_count() - self.max_lines
+        if extra > 0:
+            self.text.delete("1.0", f"{extra + 1}.0")
 
     def _show_placeholder(self) -> None:
         if self._ph_label is None:
@@ -339,25 +665,17 @@ class TagTextLog(ttk.Frame):
     def _maybe_restore_placeholder(self) -> None:
         if self._ph_label is None:
             return
-        raw = self.text.get("1.0", "end-1c").strip()
-        if not raw:
+        if self.text.compare("end-1c", "==", "1.0"):
             self._show_placeholder()
         else:
             self._hide_placeholder()
 
-    def _trim(self) -> None:
-        raw = self.text.get("1.0", "end-1c")
-        n = len(raw.splitlines())
-        extra = n - self.max_lines
-        if extra > 0:
-            self.text.delete("1.0", f"{extra + 1}.0")
-
     def _apply_filter(self) -> None:
         choice = (self._filter_var.get() or "All").lower()
-        # Info hides debug-tagged lines; All/Debug show everything.
-        elide_debug = choice == "info"
+        # Info hides debug-tagged lines; Debug hides everything else.
         try:
-            self.text.tag_configure("debug", elide=elide_debug)
+            self.text.tag_configure("debug", elide=(choice == "info"))
+            self.text.tag_configure("info", elide=(choice == "debug"))
         except tk.TclError:
             pass
 
@@ -367,13 +685,18 @@ class TagTextLog(ttk.Frame):
         if not needle:
             return
         start = "1.0"
+        first = None
         while True:
             pos = self.text.search(needle, start, tk.END, nocase=True)
             if not pos:
                 break
             end = f"{pos}+{len(needle)}c"
             self.text.tag_add("search_hit", pos, end)
+            if first is None:
+                first = pos
             start = end
+        if first is not None:
+            self.text.see(first)
 
     def _on_pause_toggle(self) -> None:
         self._paused = bool(self._pause_var.get())

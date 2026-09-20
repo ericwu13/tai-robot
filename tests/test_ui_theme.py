@@ -1,13 +1,15 @@
-"""Phase 1 UI infrastructure — theme, widgets, status strip, headless construct.
+"""Workbench UI infrastructure — rasterizer, theme, widgets, headless construct.
 
-Tk-dependent cases skip when the interpreter has no tkinter (some CI
-shells / this cloud image). Pure constants and the labels seam run
-everywhere.
+Tk-dependent cases skip when the interpreter has no usable Tk (some CI
+shells). The rasterizer, palette requirements and the labels seam are
+pure and run everywhere.
 """
 
 from __future__ import annotations
 
+import struct
 import threading
+import zlib
 
 import pytest
 
@@ -16,19 +18,20 @@ from src.live.headless import (
     TITLE_EXISTING_POSITION,
     TITLE_STRATEGY_CHANGE,
 )
-from src.ui import labels
+from src.ui import labels, raster
 from src.ui.theme import (
     CHAT_TAGS,
     DOT_COLORS,
-    EMPTY_FG,
     EPISODE_TAGS,
     LOG_TAGS,
     PALETTE,
+    ROW_TONE,
     STATUS_LEVEL_STYLES,
+    THEME_NAME,
     TONE,
+    S,
 )
 
-# ── skip-guard (Tk unavailable in some CI shells) ──
 
 def _tk_probe():
     try:
@@ -45,37 +48,179 @@ _TK_OK = _tk_probe()
 _tk_skip = pytest.mark.skipif(not _TK_OK, reason="Tk unavailable")
 
 
-# ── (pure) palette / labels — designed to fail pre-Phase-1 ──
+def _new_root():
+    """tk.Tk() with one retry: Windows intermittently fails to locate
+    init.tcl when interpreters are created in quick succession."""
+    import tkinter as tk
+    try:
+        return tk.Tk()
+    except tk.TclError:
+        return tk.Tk()
 
-def test_palette_has_plan_tokens():
-    expected = {
-        "bg": "#16161a",
-        "bg_raised": "#1e1e24",
-        "bg_inset": "#121216",
-        "border": "#2e2e36",
-        "text": "#d6d6dc",
-        "text_dim": "#8a8a94",
-        "accent": "#4f8cff",
-        "ok": "#2ecc8f",
-        "warn": "#f0b429",
-        "err": "#ef5350",
-        "info": "#8ab4f8",
-        "up": "#26a69a",
-        "down": "#ef5350",
-    }
-    for key, value in expected.items():
-        assert PALETTE[key] == value
-    assert TONE["good"] == PALETTE["ok"]
-    assert TONE["bad"] == PALETTE["err"]
-    # Empty-copy token is brighter than text_dim, still not full text.
-    assert EMPTY_FG == "#b4b4bc"
-    assert EMPTY_FG != PALETTE["text_dim"]
-    assert EMPTY_FG != PALETTE["text"]
+
+@pytest.fixture
+def themed_root():
+    from src.ui.theme import init_theme
+    root = _new_root()
+    root.withdraw()
+    init_theme(root)
+    try:
+        yield root
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+# ── rasterizer (pure) ────────────────────────────────────────────────
+
+def _decode_png(png: bytes):
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, width, height, idat = 8, 0, 0, b""
+    while pos < len(png):
+        (length,) = struct.unpack(">I", png[pos:pos + 4])
+        tag = png[pos + 4:pos + 8]
+        data = png[pos + 8:pos + 8 + length]
+        (crc,) = struct.unpack(">I", png[pos + 8 + length:pos + 12 + length])
+        assert crc == zlib.crc32(tag + data) & 0xFFFFFFFF, f"bad CRC in {tag}"
+        if tag == b"IHDR":
+            width, height, depth, color, *_ = struct.unpack(">IIBBBBB", data)
+            assert (depth, color) == (8, 6), "must be RGBA8"
+        elif tag == b"IDAT":
+            idat += data
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * 4 + 1
+    rows = [raw[y * stride + 1:(y + 1) * stride] for y in range(height)]
+    assert all(raw[y * stride] == 0 for y in range(height)), "filter must be None"
+    return width, height, rows
+
+
+def _px(rows, x, y):
+    return tuple(rows[y][x * 4:x * 4 + 4])
+
+
+def test_png_roundtrip_is_valid_rgba():
+    im = raster.Image(12, 9)
+    im.rounded_rect(0, 0, 12, 9, 0, "#336699")
+    w, h, rows = _decode_png(im.to_png())
+    assert (w, h) == (12, 9)
+    assert _px(rows, 5, 4) == (0x33, 0x66, 0x99, 255)
+
+
+def test_rounded_rect_corners_are_transparent_and_antialiased():
+    size = 40
+    im = raster.Image(size, size)
+    im.rounded_rect(0, 0, size, size, 12, "#ffffff")
+    _, _, rows = _decode_png(im.to_png())
+    assert _px(rows, 0, 0)[3] == 0, "outside the corner arc must be transparent"
+    assert _px(rows, size // 2, size // 2)[3] == 255
+    # Straight edges on integer coordinates stay pixel-exact.
+    assert _px(rows, size // 2, 0)[3] == 255
+    # The arc itself must carry partial coverage — that is the smoothing.
+    alphas = {_px(rows, x, y)[3] for x in range(12) for y in range(12)}
+    assert any(0 < a < 255 for a in alphas), "corner has no anti-aliased pixels"
+
+
+def test_bordered_rect_has_ring_and_fill():
+    im = raster.Image(30, 30)
+    im.bordered_rect(0, 0, 30, 30, 6, "#101010", "#ff0000", 2)
+    _, _, rows = _decode_png(im.to_png())
+    assert _px(rows, 15, 0)[:3] == (255, 0, 0)       # top edge = border
+    assert _px(rows, 15, 15)[:3] == (16, 16, 16)     # center = fill
+
+
+def test_hollow_bordered_rect_center_is_transparent():
+    im = raster.Image(30, 30)
+    im.bordered_rect(0, 0, 30, 30, 6, None, "#ff0000", 2)
+    _, _, rows = _decode_png(im.to_png())
+    assert _px(rows, 15, 15)[3] == 0
+    assert _px(rows, 15, 0)[3] == 255
+
+
+def test_stretch_center_widens_without_touching_corners():
+    im = raster.Image(9, 9)
+    im.bordered_rect(0, 0, 9, 9, 3, "#202020", "#ffffff", 1)
+    rgba = im.to_rgba()
+    out, w, h = raster.stretch_center(rgba, 9, 9, 4, 4, 20, 10)
+    assert (w, h) == (9 - 1 + 20, 9 - 1 + 10)
+    assert len(out) == w * h * 4
+    # Corner pixels are byte-identical to the source.
+    assert out[:4] == rgba[:4]
+    assert out[-4:] == rgba[-4:]
+
+
+def test_solid_rows_bands():
+    rgba, w, h = raster.solid_rows(4, [(2, "#010203"), (1, None)])
+    assert (w, h) == (4, 3)
+    assert rgba[:4] == bytes((1, 2, 3, 255))
+    assert rgba[-4:] == b"\x00\x00\x00\x00"
+
+
+def test_mix_endpoints():
+    assert raster.mix("#000000", "#ffffff", 0.0) == "#000000"
+    assert raster.mix("#000000", "#ffffff", 1.0) == "#ffffff"
+    assert raster.mix("#000000", "#ffffff", 0.5) in ("#7f7f7f", "#808080")
+
+
+# ── palette requirements (pure) ──────────────────────────────────────
+
+def _luminance(color: str) -> float:
+    def channel(v):
+        v /= 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = raster.hex_to_rgb(color)
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def _contrast(a: str, b: str) -> float:
+    la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def test_palette_has_required_tokens():
+    required = {"bg", "bg_raised", "bg_inset", "border", "text", "text_dim",
+                "accent", "on_accent", "ok", "warn", "err", "info", "up", "down"}
+    assert required <= set(PALETTE)
+    for name, value in PALETTE.items():
+        assert len(value) == 7 and value.startswith("#"), name
+        raster.hex_to_rgb(value)
+    assert TONE["good"] == PALETTE["ok"] and TONE["bad"] == PALETTE["err"]
     assert set(CHAT_TAGS) >= {"user", "assistant", "code", "error", "system"}
     assert set(LOG_TAGS) >= {"entry", "exit", "bar", "status"}
     assert DOT_COLORS["ok"] == PALETTE["ok"]
     assert "ep_long" in EPISODE_TAGS
 
+
+@pytest.mark.parametrize("surface", ["bg", "bg_raised", "bg_inset"])
+def test_text_contrast_meets_wcag_aa_on_every_surface(surface):
+    """Body text ≥ 7:1, secondary text and status colors ≥ 4.5:1."""
+    assert _contrast(PALETTE["text"], PALETTE[surface]) >= 7.0
+    for token in ("text_dim", "ok", "warn", "err", "info"):
+        ratio = _contrast(PALETTE[token], PALETTE[surface])
+        assert ratio >= 4.5, f"{token} on {surface}: {ratio:.2f}:1"
+
+
+def test_accent_button_label_is_readable():
+    assert _contrast(PALETTE["on_accent"], PALETTE["accent"]) >= 3.0
+
+
+def test_row_tones_stay_readable_and_distinct():
+    for tone in ("good", "bad"):
+        assert _contrast(ROW_TONE[tone], PALETTE["bg_inset"]) >= 4.5
+    assert ROW_TONE["good"] != ROW_TONE["bad"]
+
+
+def test_scale_helper_never_collapses_to_zero():
+    assert S(0) == 0
+    assert isinstance(S(8), int) and S(8) >= 8
+    assert S(0.4) >= 1, "a non-zero metric must survive rounding"
+    pair = S(4, 0)
+    assert isinstance(pair, tuple) and pair[1] == 0 and pair[0] >= 4
+
+
+# ── labels seam / package hygiene (pure) ─────────────────────────────
 
 def test_labels_import_seam_titles_not_redefined():
     """Seam titles must be the headless.py objects, not a second literal."""
@@ -90,93 +235,158 @@ def test_labels_import_seam_titles_not_redefined():
 
 
 def test_ui_package_does_not_import_run_backtest():
+    import src.ui.labels as labels_mod
+    import src.ui.raster as raster_mod
     import src.ui.theme as theme_mod
     import src.ui.widgets as widgets_mod
-    import src.ui.labels as labels_mod
-    for mod in (theme_mod, widgets_mod, labels_mod):
-        assert "run_backtest" not in getattr(mod, "__dict__", {})
+    for mod in (theme_mod, widgets_mod, labels_mod, raster_mod):
         src = open(mod.__file__, encoding="utf-8").read()
         assert "import run_backtest" not in src
         assert "from run_backtest" not in src
+    raster_src = open(raster_mod.__file__, encoding="utf-8").read()
+    assert "tkinter" not in raster_src, "rasterizer must stay display-free"
+    assert "PIL" not in raster_src, "no Pillow dependency in the bundle"
     widgets_src = open(widgets_mod.__file__, encoding="utf-8").read()
-    assert "from tkinter import scrolledtext" not in widgets_src
     assert "import scrolledtext" not in widgets_src
 
 
 def test_status_level_styles_map():
-    """set_status levels sit on the raised strip — not Dim.TLabel (bg hole)."""
     assert STATUS_LEVEL_STYLES["info"] == "StatusStrip.Dim.TLabel"
     assert STATUS_LEVEL_STYLES["ok"] == "StatusStrip.Ok.TLabel"
     assert STATUS_LEVEL_STYLES["warn"] == "StatusStrip.Warn.TLabel"
     assert STATUS_LEVEL_STYLES["error"] == "StatusStrip.Err.TLabel"
 
 
-# ── Tk tests ──
+def test_spec_lists_src_ui_hiddenimports():
+    spec = open("tai_backtest.spec", encoding="utf-8").read()
+    for name in ("src.ui", "src.ui.theme", "src.ui.widgets", "src.ui.labels",
+                 "src.ui.raster"):
+        assert f"'{name}'" in spec
+
+
+# ── theme (Tk) ───────────────────────────────────────────────────────
 
 @_tk_skip
-def test_init_theme_on_withdrawn_root_defines_named_styles():
+def test_init_theme_installs_image_theme(themed_root):
+    from tkinter import ttk
+    from src.ui.theme import FONTS
+
+    style = ttk.Style(themed_root)
+    assert style.theme_use() == THEME_NAME
+    for name in ("TButton", "Accent.TButton", "Success.TButton",
+                 "Danger.TButton", "Ghost.TButton", "TEntry", "TCombobox",
+                 "TCheckbutton", "TRadiobutton", "TNotebook.Tab", "Treeview",
+                 "Card.TFrame", "Well.TFrame", "TLabelframe",
+                 "Vertical.TScrollbar", "Hidden.Vertical.TScrollbar",
+                 "Inset.Vertical.TScrollbar", "Horizontal.TProgressbar"):
+        assert style.layout(name), f"{name} has no layout"
+    assert style.lookup("Dim.TLabel", "foreground") == PALETTE["text_dim"]
+    assert style.lookup("Card.TLabel", "background") == PALETTE["bg_raised"]
+    assert style.lookup("Treeview", "fieldbackground") == PALETTE["bg_inset"]
+    assert int(style.lookup("Treeview", "rowheight")) == S(30)
+    assert set(FONTS) >= {"title", "section", "value", "metric", "body",
+                          "small", "mono", "mono_small", "mono_bold"}
+
+
+@_tk_skip
+def test_style_fonts_are_not_shadowed_by_option_database(themed_root):
+    """A bare ``*Font`` option lands on every ttk widget's -font and
+    silently defeats the style fonts (titles rendered at body size)."""
+    from tkinter import ttk
+    from src.ui.theme import FONTS
+    label = ttk.Label(themed_root, text="x", style="Title.TLabel")
+    assert str(label.cget("font")) == ""
+    assert ttk.Style(themed_root).lookup("Title.TLabel", "font") == str(FONTS["title"])
+
+
+@_tk_skip
+def test_init_theme_is_idempotent_and_survives_a_second_root(themed_root):
     import tkinter as tk
     from tkinter import ttk
     from src.ui.theme import FONTS, init_theme
 
-    root = tk.Tk()
+    init_theme(themed_root)  # same interpreter: theme already exists
+    assert ttk.Style(themed_root).theme_use() == THEME_NAME
+    other = _new_root()
+    other.withdraw()
+    try:
+        init_theme(other)     # fresh interpreter: rebuilt from scratch
+        assert ttk.Style(other).theme_use() == THEME_NAME
+        ttk.Button(other, text="x", style="Accent.TButton")
+        assert FONTS["body"].actual()["size"]
+    finally:
+        other.destroy()
+
+
+@_tk_skip
+def test_nine_slice_sources_have_wide_centers(themed_root):
+    """ttk tiles the center slice: a 1-px center means ~100k blended draws
+    per repaint of a large Treeview (the UI effectively hangs)."""
+    images = themed_root._tairobot_images
+    img, edge = images.box(PALETTE["bg_inset"], PALETTE["border"], radius=8)
+    assert img.width() - 2 * edge >= S(24)
+    assert img.height() - 2 * edge >= S(24)
+
+
+@_tk_skip
+def test_minimal_mode_creates_no_theme_and_custom_styles_still_construct():
+    """Headless bots: zero theme work, yet every dotted style name used by
+    the builders must resolve to its stock base layout."""
+    import tkinter as tk
+    from tkinter import ttk
+    from src.ui import theme
+
+    root = _new_root()
     root.withdraw()
     try:
-        style = init_theme(root)
-        assert isinstance(style, ttk.Style)
-        for name in (
-            "Card.TFrame", "CardValue.TLabel", "Card.Dim.TLabel",
-            "Status.Ok.TLabel", "Status.Warn.TLabel", "Status.Err.TLabel",
-            "Dim.TLabel", "Empty.TLabel", "Empty.Inset.TLabel",
-            "StatusStrip.TFrame", "StatusStrip.TLabel",
-            "StatusStrip.Dim.TLabel", "StatusStrip.Ok.TLabel",
-            "StatusStrip.Warn.TLabel", "StatusStrip.Err.TLabel",
-            "TButton", "TEntry", "TCombobox", "TNotebook.Tab",
-            "Treeview", "TLabelframe", "TScrollbar",
-        ):
-            # lookup returns '' for unknown options on a missing style;
-            # a configured style has a background or foreground.
-            fg = style.lookup(name, "foreground")
-            bg = style.lookup(name, "background")
-            assert fg or bg, f"named style {name} was not configured"
-        # Flat clam: no system-white bevel leftover on the window fill.
-        assert style.lookup("TFrame", "lightcolor") == PALETTE["bg"]
-        assert style.lookup("TButton", "padding")
-        # Interactive chrome must outline — flat lightcolor==fill made
-        # buttons/entries look like unfinished holes.
-        assert style.lookup("TButton", "lightcolor") != style.lookup(
-            "TButton", "background")
-        assert style.lookup("TEntry", "bordercolor") != PALETTE["bg"]
-        assert style.lookup("Treeview", "fieldbackground") == PALETTE["bg_inset"]
-        assert style.map("Treeview", "foreground")
-        assert style.lookup("Dim.TLabel", "foreground") == PALETTE["text_dim"]
-        assert style.lookup("Empty.TLabel", "foreground") == EMPTY_FG
-        assert set(FONTS) >= {"title", "section", "value", "body", "mono", "mono_small"}
+        before = ttk.Style(root).theme_use()
+        theme.init_theme(root, minimal=True)
+        assert ttk.Style(root).theme_use() == before
+        assert THEME_NAME not in ttk.Style(root).theme_names()
+        ttk.Button(root, text="x", style="Bar.Accent.TButton")
+        ttk.Button(root, text="x", style="Card.Ghost.TButton")
+        ttk.Frame(root, style="Card.TFrame")
+        ttk.Frame(root, style="Well.TFrame")
+        ttk.Label(root, text="x", style="Card.Status.Ok.TLabel")
+        ttk.Entry(root, style="Bar.TEntry")
+        ttk.Combobox(root, style="Card.TCombobox")
+        ttk.Checkbutton(root, style="Card.TCheckbutton")
+        ttk.Scrollbar(root, orient="vertical",
+                      style="Hidden.Inset.Vertical.TScrollbar")
+        root.update_idletasks()
     finally:
         root.destroy()
 
 
 @_tk_skip
-def test_headless_bot_app_constructs_with_theme():
-    """Headless invariant: every widget builds on a withdrawn root."""
+def test_headless_bot_app_constructs_unthemed_and_stays_hidden():
+    """Headless invariant: every widget builds on a withdrawn root, no
+    theme is installed, and no window ever flashes on screen."""
     import tkinter as tk
+    from tkinter import ttk
     from src.live.headless_app import HeadlessBotApp
 
-    root = tk.Tk()
+    root = _new_root()
     root.withdraw()
     try:
         app = HeadlessBotApp(root)
         assert app.root is root
-        assert hasattr(app, "set_status")
-        assert hasattr(app, "log_text")
-        assert hasattr(app, "_conn_dot")
+        assert app._headless is True
+        assert root.state() == "withdrawn"
+        assert ttk.Style(root).theme_use() != THEME_NAME
+        for attr in ("log_text", "live_log", "chat_display", "trade_tree",
+                     "regime_tree", "btn_deploy", "btn_login", "btn_update",
+                     "btn_report", "symbol_combo", "strategy_combo",
+                     "mode_combo", "results_notebook", "_conn_dot"):
+            assert hasattr(app, attr), attr
         app.set_status("hello", "info")
         assert app.status_var.get() == "hello"
         assert app._status_msg_label.cget("style") == "StatusStrip.Dim.TLabel"
         app.set_status("boom", "error")
         assert app._status_msg_label.cget("style") == "StatusStrip.Err.TLabel"
-        assert app._conn_dot.cget("style") == "StatusStrip.Dim.TLabel"
         assert len(app._status_history) >= 2
+        app._set_conn_dot("ok")
+        assert "Connected" in str(app._conn_dot.cget("text"))
     finally:
         try:
             root.destroy()
@@ -184,136 +394,208 @@ def test_headless_bot_app_constructs_with_theme():
             pass
 
 
+# ── widgets (Tk) ─────────────────────────────────────────────────────
+
 @_tk_skip
-def test_tag_text_log_cap_trims_from_top():
-    import tkinter as tk
-    from src.ui.theme import init_theme
+def test_tag_text_log_cap_trims_from_top(themed_root):
+    from tkinter import ttk
     from src.ui.widgets import TagTextLog
 
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        init_theme(root)
-        log = TagTextLog(root, max_lines=5, show_toolbar=True)
-        for i in range(8):
-            log.append(f"line-{i}", "info")
-        content = log.get("1.0", "end-1c").strip().splitlines()
-        assert content[0] == "line-3"
-        assert content[-1] == "line-7"
-        assert len(content) == 5
-        # Dark well + ttk scrollbar (not a light tk.Scrollbar orphan).
-        assert str(log.text.cget("bg")) == PALETTE["bg_inset"]
-        from tkinter import ttk as _ttk
-        bars = [w for w in log.winfo_children()
-                if isinstance(w, (tk.Frame, _ttk.Frame))]
-        scrollbars = []
-        for w in log.winfo_children():
-            scrollbars.extend(
-                c for c in w.winfo_children() if isinstance(c, _ttk.Scrollbar))
-        assert scrollbars, "TagTextLog must use ttk.Scrollbar, not ScrolledText"
-    finally:
-        root.destroy()
+    log = TagTextLog(themed_root, max_lines=5, show_toolbar=True)
+    for i in range(8):
+        log.append(f"line-{i}", "info")
+    content = log.get("1.0", "end-1c").strip().splitlines()
+    assert content == [f"line-{i}" for i in range(3, 8)]
+    assert log.line_count() == 5
+    assert str(log.text.cget("bg")) == PALETTE["bg_inset"]
+
+    def scrollbars(widget):
+        found = []
+        for child in widget.winfo_children():
+            if isinstance(child, ttk.Scrollbar):
+                found.append(child)
+            found.extend(scrollbars(child))
+        return found
+    assert scrollbars(log), "TagTextLog must use a ttk.Scrollbar"
 
 
 @_tk_skip
-def test_tag_text_log_placeholder_clears_on_first_message():
-    import tkinter as tk
-    from src.ui.theme import init_theme
+def test_tag_text_log_trim_does_not_copy_the_buffer(themed_root):
+    """Trimming once copied the whole buffer per appended line — O(n) work
+    on every log line of a busy bot."""
     from src.ui.widgets import TagTextLog
 
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        init_theme(root)
-        log = TagTextLog(root, placeholder="開始對話… / Start chatting…")
-        assert log._ph_label is not None
-        assert str(log._ph_label.place_info().get("anchor", "")) == "center"
-        # Overlay is not in the buffer.
-        assert log.get("1.0", "end-1c").strip() == ""
-        log.append("hello", "info")
-        assert log._ph_label.place_info() == {}
-        assert "hello" in log.get("1.0", "end-1c")
-        log.clear()
-        assert str(log._ph_label.place_info().get("anchor", "")) == "center"
-        assert log.get("1.0", "end-1c").strip() == ""
-    finally:
-        root.destroy()
+    log = TagTextLog(themed_root, max_lines=50)
+    calls = []
+    real_get = log.text.get
+    log.text.get = lambda *a, **k: (calls.append(a), real_get(*a, **k))[1]
+    for i in range(120):
+        log.append(f"line-{i}")
+    assert not calls, "append/trim must not read the buffer back"
+    assert log.line_count() == 50
 
 
 @_tk_skip
-def test_tag_text_log_append_from_non_main_thread_raises():
+def test_tag_text_log_placeholder_clears_on_first_message(themed_root):
+    from src.ui.widgets import TagTextLog
+
+    log = TagTextLog(themed_root, placeholder="開始對話… / Start chatting…")
+    assert str(log._ph_label.place_info().get("anchor", "")) == "center"
+    assert log.get("1.0", "end-1c").strip() == ""  # overlay, not buffer text
+    log.append("hello", "info")
+    assert log._ph_label.place_info() == {}
+    log.clear()
+    assert str(log._ph_label.place_info().get("anchor", "")) == "center"
+
+
+@_tk_skip
+def test_tag_text_log_append_from_non_main_thread_raises(themed_root):
     """Producers must go through _ui_queue — documented by this raise."""
-    import tkinter as tk
-    from src.ui.theme import init_theme
     from src.ui.widgets import TagTextLog
 
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        init_theme(root)
-        log = TagTextLog(root)
-        errors: list[BaseException] = []
+    log = TagTextLog(themed_root)
+    errors: list[BaseException] = []
 
-        def worker():
-            try:
-                log.append("from-worker")
-            except RuntimeError as exc:
-                errors.append(exc)
+    def worker():
+        try:
+            log.append("from-worker")
+        except RuntimeError as exc:
+            errors.append(exc)
 
-        t = threading.Thread(target=worker)
-        t.start()
-        t.join(timeout=5)
-        assert errors, "off-thread append must raise RuntimeError"
-        assert "Tk thread" in str(errors[0])
-    finally:
-        root.destroy()
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=5)
+    assert errors and "Tk thread" in str(errors[0])
 
 
 @_tk_skip
-def test_status_dot_states():
-    import tkinter as tk
-    from src.ui.theme import init_theme
+def test_status_dot_states(themed_root):
     from src.ui.widgets import StatusDot
 
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        init_theme(root)
-        dot = StatusDot(root, text="conn")
-        dot.set_state("ok")
-        assert "●" in str(dot.cget("text"))
-        assert dot.cget("style") == "Status.Ok.TLabel"
-        dot.set_state("warn")
-        assert dot.cget("style") == "Status.Warn.TLabel"
-        dot.set_state("err")
-        assert dot.cget("style") == "Status.Err.TLabel"
-        dot.set_state("off")
-        assert dot.cget("style") == "Dim.TLabel"
-        raised = StatusDot(root, text="strip", surface="raised")
-        raised.set_state("ok")
-        assert raised.cget("style") == "StatusStrip.Ok.TLabel"
-        raised.set_state("off")
-        assert raised.cget("style") == "StatusStrip.Dim.TLabel"
-    finally:
-        root.destroy()
+    dot = StatusDot(themed_root, text="conn")
+    dot.set_state("ok")
+    assert "●" in str(dot.cget("text"))
+    assert dot.cget("style") == "Status.Ok.TLabel"
+    dot.set_state("err")
+    assert dot.cget("style") == "Status.Err.TLabel"
+    dot.set_state("off")
+    assert dot.cget("style") == "Dim.TLabel"
+    raised = StatusDot(themed_root, text="strip", surface="raised")
+    raised.set_state("ok")
+    assert raised.cget("style") == "StatusStrip.Ok.TLabel"
+    card = StatusDot(themed_root, text="vote", surface="card")
+    card.set_state("warn")
+    assert card.cget("style") == "Card.Status.Warn.TLabel"
+    card.set_label("renamed")
+    assert "renamed" in str(card.cget("text"))
 
 
-def test_spec_lists_src_ui_hiddenimports():
-    spec = open("tai_backtest.spec", encoding="utf-8").read()
-    for name in ("src.ui", "src.ui.theme", "src.ui.widgets", "src.ui.labels"):
-        assert f"'{name}'" in spec
+@_tk_skip
+def test_flow_frame_wraps_and_right_aligns_tail(themed_root):
+    from tkinter import ttk
+    from src.ui.widgets import FlowFrame
 
+    flow = FlowFrame(themed_root, gap=6, row_gap=6)
+    left = [flow.add(ttk.Button(flow, text=f"button-{i}")) for i in range(4)]
+    flow.add_spacer()
+    tail = flow.add(ttk.Button(flow, text="tail"))
+    themed_root.update_idletasks()
+    total = sum(b.winfo_reqwidth() for b in left + [tail]) + S(6) * 5
+
+    flow.reflow(total + S(200))                    # roomy: one row
+    ys = {int(b.place_info()["y"]) for b in left + [tail]}
+    assert len(ys) == 1
+    tail_x = int(tail.place_info()["x"])
+    assert tail_x + tail.winfo_reqwidth() == total + S(200), "tail hugs the right edge"
+
+    flow.reflow(left[0].winfo_reqwidth() * 2 + S(20))  # narrow: must wrap
+    rows = {int(b.place_info()["y"]) for b in left + [tail]}
+    assert len(rows) >= 2
+    for b in left + [tail]:
+        x = int(b.place_info()["x"])
+        assert x + b.winfo_reqwidth() <= left[0].winfo_reqwidth() * 2 + S(20), \
+            "no child may be clipped past the frame edge"
+    assert int(flow.cget("height")) > left[0].winfo_reqheight()
+
+
+@_tk_skip
+def test_flow_frame_reflows_when_a_child_grows(themed_root):
+    """The connection dot's label changes length at runtime; neighbours
+    must move instead of being overlapped."""
+    from tkinter import ttk
+    from src.ui.widgets import FlowFrame
+
+    flow = FlowFrame(themed_root, gap=6)
+    flow.pack(fill="x")
+    first = flow.add(ttk.Label(flow, text="off"))
+    second = flow.add(ttk.Label(flow, text="neighbour"))
+    flow.reflow(S(800))
+    themed_root.update()
+    first.configure(text="a considerably longer connection label")
+    themed_root.update()
+    a, b = first.place_info(), second.place_info()
+    right_edge = int(a["x"]) + first.winfo_reqwidth()
+    moved_right = int(b["x"]) >= right_edge
+    wrapped = int(b["y"]) >= int(a["y"]) + first.winfo_reqheight()
+    assert moved_right or wrapped, "neighbour is overlapped by the grown child"
+
+
+@_tk_skip
+def test_stat_card_signed_tint(themed_root):
+    import tkinter as tk
+    from src.ui.widgets import StatCard
+
+    var = tk.StringVar(master=themed_root, value="0")
+    card = StatCard(themed_root, "損益 P&L", variable=var, signed=True)
+    assert str(card.value_label.cget("foreground")) == PALETTE["text"]
+    var.set("+12,400")
+    assert str(card.value_label.cget("foreground")) == PALETTE["ok"]
+    var.set("-3,150")
+    assert str(card.value_label.cget("foreground")) == PALETTE["err"]
+    var.set("+0")
+    assert str(card.value_label.cget("foreground")) == PALETTE["text"]
+
+
+@_tk_skip
+def test_autohide_scrollbar_swaps_style_not_geometry(themed_root):
+    from tkinter import ttk
+    from src.ui.widgets import autohide_scrollbar
+
+    vsb = ttk.Scrollbar(themed_root, orient="vertical")
+    on_set = autohide_scrollbar(vsb, "Vertical.TScrollbar")
+    on_set("0.0", "1.0")
+    assert vsb.cget("style") == "Hidden.Vertical.TScrollbar"
+    on_set("0.0", "0.4")
+    assert vsb.cget("style") == "Vertical.TScrollbar"
+
+
+@_tk_skip
+def test_row_hover_tag_is_transient(themed_root):
+    from src.ui.widgets import scrolled_tree, enable_row_hover
+
+    frame, tree = scrolled_tree(themed_root, columns=("a",), show="headings")
+    iid = tree.insert("", "end", values=(1,), tags=("win",))
+    enable_row_hover(tree)
+    tree.item(iid, tags=("win", "hover"))
+    tree.event_generate("<Leave>")
+    # The helper tracks its own hovered row; a foreign "hover" is left
+    # alone, and the original tag is never dropped.
+    assert "win" in tree.item(iid, "tags")
+
+
+# ── source contracts: fail against the pre-fix code ──────────────────
 
 def test_phase1_run_backtest_source_contracts():
-    """Fail-against-pre-fix: the Phase 1 glue changes must be present."""
     import inspect
     import run_backtest as rb
 
     src = open(rb.__file__, encoding="utf-8").read()
     assert "def _attach_tooltip(" not in src
     assert "def _on_strategy_changed(" not in src
-    assert "self.root.update()" not in inspect.getsource(rb.BacktestApp._fetch_tradingview_live)
-    assert "threading.Thread" in inspect.getsource(rb.BacktestApp._fetch_tradingview_live)
+    assert "def _reflow_toolbar(" not in src, "FlowFrame replaces the hand-rolled reflow"
+    tv_src = inspect.getsource(rb.BacktestApp._fetch_tradingview_live)
+    assert "self.root.update()" not in tv_src
+    assert "threading.Thread" in tv_src
     deploy_src = inspect.getsource(rb.BacktestApp._deploy_live_from)
     assert "self.root.update_idletasks" not in deploy_src
     assert "time.sleep(" not in deploy_src
@@ -323,9 +605,6 @@ def test_phase1_run_backtest_source_contracts():
     assert "return False" in deploy_src
     assert "messagebox." not in deploy_src
     assert "def set_status(" in src
-    assert "CHAT_PLACEHOLDER" in src
-    assert "Empty.TLabel" in src
-    assert "REPORT_EMPTY" in src
     assert "transient_start" in inspect.getsource(rb.BacktestApp._append_chat)
     assert "transient_start" in inspect.getsource(rb.BacktestApp._remove_last_system_line)
     assert "_rendered_trade_count" in inspect.getsource(rb.BacktestApp._display_results)
@@ -336,3 +615,44 @@ def test_phase1_run_backtest_source_contracts():
     confirm_src = inspect.getsource(rb.BacktestApp._show_order_confirm_dialog)
     assert "dlg.grab_set" not in confirm_src
     assert "countdown" in confirm_src
+
+
+def test_startup_orders_dpi_awareness_before_any_window():
+    """COM init and tk.Tk() both create windows; DPI awareness can only be
+    set while the process owns none."""
+    import inspect
+    import run_backtest as rb
+
+    main_src = inspect.getsource(rb.main)
+    assert main_src.index("enable_dpi_awareness()") < main_src.index("_init_com()")
+    assert main_src.index("_init_com()") < main_src.index("tk.Tk()")
+
+
+def test_headless_gets_minimal_theme_and_no_window_reveal():
+    import inspect
+    import run_backtest as rb
+
+    init_src = inspect.getsource(rb.BacktestApp.__init__)
+    assert "minimal=self._headless" in init_src
+    reveal = init_src[init_src.index("if not self._headless:"):]
+    assert "deiconify" in reveal and "zoomed" in reveal
+    assert init_src.count("deiconify") == 1, "only the GUI path may reveal the window"
+
+
+def test_exception_lambdas_capture_by_default_arg():
+    """Python 3.13 deletes ``e`` when the except block ends; a bare
+    ``lambda: ...e...`` scheduled with root.after raises NameError later."""
+    import ast
+    import run_backtest as rb
+
+    tree = ast.parse(open(rb.__file__, encoding="utf-8").read())
+    offenders = []
+    for handler in (n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)):
+        if not handler.name:
+            continue
+        for lam in (n for n in ast.walk(handler) if isinstance(n, ast.Lambda)):
+            bound = {a.arg for a in lam.args.args + lam.args.kwonlyargs}
+            uses = {n.id for n in ast.walk(lam.body) if isinstance(n, ast.Name)}
+            if handler.name in uses and handler.name not in bound:
+                offenders.append(lam.lineno)
+    assert not offenders, f"lambdas closing over a deleted except-variable: {offenders}"
