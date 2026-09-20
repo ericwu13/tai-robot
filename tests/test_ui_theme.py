@@ -301,12 +301,26 @@ def test_style_fonts_are_not_shadowed_by_option_database(themed_root):
 
 @_tk_skip
 def test_init_theme_is_idempotent_and_survives_a_second_root(themed_root):
-    import tkinter as tk
+    """The style and option databases reference fonts BY NAME. Auto-named
+    fonts were deleted when FONTS was cleared (Font.__del__), so a second
+    init_theme — or a second root — silently reset every themed widget to
+    the default font: no error, just smaller titles."""
+    from tkinter import font as tkfont
     from tkinter import ttk
     from src.ui.theme import FONTS, init_theme
 
+    def title_height(root):
+        label = ttk.Label(root, text="Title", style="Title.TLabel")
+        root.update_idletasks()
+        return label.winfo_reqheight()
+
+    before = title_height(themed_root)
     init_theme(themed_root)  # same interpreter: theme already exists
-    assert ttk.Style(themed_root).theme_use() == THEME_NAME
+    style = ttk.Style(themed_root)
+    assert style.theme_use() == THEME_NAME
+    assert style.lookup("Title.TLabel", "font") in tkfont.names(themed_root)
+    assert title_height(themed_root) == before
+
     other = _new_root()
     other.withdraw()
     try:
@@ -314,6 +328,9 @@ def test_init_theme_is_idempotent_and_survives_a_second_root(themed_root):
         assert ttk.Style(other).theme_use() == THEME_NAME
         ttk.Button(other, text="x", style="Accent.TButton")
         assert FONTS["body"].actual()["size"]
+        # ...and the first root's typography must have survived it.
+        assert style.lookup("Title.TLabel", "font") in tkfont.names(themed_root)
+        assert title_height(themed_root) == before
     finally:
         other.destroy()
 
@@ -583,6 +600,214 @@ def test_row_hover_tag_is_transient(themed_root):
     assert "win" in tree.item(iid, "tags")
 
 
+@_tk_skip
+def test_stat_card_drops_its_trace_when_destroyed(themed_root):
+    """The variable outlives the card; a leftover trace fires into a
+    destroyed label and the next write raises TclError."""
+    import tkinter as tk
+    from src.ui.widgets import StatCard
+
+    # Tk does not raise from a trace callback: it routes the exception to
+    # report_callback_exception (a traceback on stderr, every write).
+    errors = []
+    themed_root.report_callback_exception = lambda *exc: errors.append(exc)
+    var = tk.StringVar(master=themed_root, value="0")
+    card = StatCard(themed_root, "損益 P&L", variable=var, signed=True)
+    card.destroy()
+    themed_root.update_idletasks()
+    var.set("+5")
+    assert not errors, f"trace fired into a destroyed card: {errors[0][1]!r}"
+
+
+def test_fit_dialog_stays_inside_the_work_area():
+    """820x740 logical at 150 % = 1230x1110 px: taller than a 1080p work
+    area. The Deploy dialog's commit buttons sit at its bottom edge."""
+    from src.ui.widgets import fit_dialog
+
+    area = (0, 0, 1920, 1032)
+    w, h, x, y = fit_dialog(1230, 1110, (0, 45, 1920, 963), area,
+                            frame=12, caption=48)
+    assert y >= area[1] + 48
+    assert y + h <= area[3] - 12, "bottom edge (buttons) must be on screen"
+    assert x >= area[0] + 12 and x + w <= area[2] - 12
+
+    # A dialog that fits is centered and untouched in size.
+    w, h, x, y = fit_dialog(600, 400, (0, 45, 1920, 963), area,
+                            frame=12, caption=48)
+    assert (w, h) == (600, 400) and x == (1920 - 600) // 2
+
+    # Secondary monitor to the LEFT of the primary: negative coordinates.
+    left = (-1920, 0, 0, 1040)
+    w, h, x, y = fit_dialog(1230, 1110, (-1920, 45, 1920, 963), left,
+                            frame=12, caption=48)
+    assert left[0] <= x and x + w <= left[2]
+    assert y + h <= left[3] - 12
+
+
+@_tk_skip
+def test_place_dialog_clamps_a_fixed_size_to_the_monitor(themed_root, monkeypatch):
+    import tkinter as tk
+    from src.ui import theme, widgets
+
+    class Parent:                      # maximized 1080p window at 150 %
+        def winfo_rootx(self): return 0
+        def winfo_rooty(self): return 45
+        def winfo_width(self): return 1920
+        def winfo_height(self): return 963
+        def winfo_id(self): return 0
+
+    monkeypatch.setattr(theme, "_SCALE", 1.5)
+    monkeypatch.setattr(widgets, "work_area", lambda _w: (0, 0, 1920, 1032),
+                        raising=False)
+    win = tk.Toplevel(themed_root)
+    win.withdraw()
+    # A withdrawn window does not report a requested geometry back, so
+    # record what place_dialog asks for.
+    requested = []
+    real_geometry = win.geometry
+    win.geometry = lambda spec=None: (requested.append(spec), real_geometry(spec))[1]
+    widgets.place_dialog(win, Parent(), 820, 740)
+    assert requested and requested[-1], "place_dialog must set a geometry"
+    size, _, pos = requested[-1].partition("+")
+    height = int(size.split("x")[1])
+    y = int(pos.split("+")[1])
+    assert y + height <= 1032, f"dialog bottom {y + height} is below the work area"
+
+
+# ── Trades tab: the tree must always equal the computed rows ─────────
+
+class _StubRunner:
+    started_at = None
+
+    def __init__(self, state):
+        self.state = state
+
+    def get_live_bars(self):
+        return []
+
+    def get_status(self):
+        return {"state": "RUNNING", "bars_1m": 0, "bars_agg": 0}
+
+
+def _trade(tag, pnl, real_exit=0):
+    from src.backtest.broker import OrderSide, Trade
+    return Trade(tag=tag, side=OrderSide.LONG, qty=1, entry_price=44000,
+                 exit_price=44000 + pnl // 200, entry_bar_index=0,
+                 exit_bar_index=3, pnl=pnl, entry_dt="2026-09-01 09:00",
+                 exit_dt="2026-09-01 09:30", real_exit_price=real_exit,
+                 source="real")
+
+
+def _result(trades):
+    from types import SimpleNamespace
+    from src.backtest.metrics import calculate_metrics
+    curve, total = [], 0
+    for t in trades:
+        total += t.pnl
+        curve.append(total)
+    return SimpleNamespace(
+        trades=trades, equity_curve=curve, strategy_name="UiTest",
+        metrics=calculate_metrics(trades, curve, initial_balance=1_000_000))
+
+
+@pytest.fixture
+def workbench():
+    from src.live.headless_app import HeadlessBotApp
+    root = _new_root()
+    root.withdraw()
+    try:
+        yield HeadlessBotApp(root)
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def _column(app, name):
+    tree = app.trade_tree
+    idx = list(tree["columns"]).index(name)
+    return [tree.item(iid, "values")[idx] for iid in tree.get_children()]
+
+
+@_tk_skip
+def test_trades_tab_shows_a_real_exit_price_that_lands_after_the_row_was_drawn(workbench):
+    """Issue #92: the trade row is drawn at the bar close with real exit
+    "--"; the OnNewData deal row sets trades[-1].real_exit_price seconds
+    later and asks for a refresh. The row must update."""
+    from src.live.live_runner import LiveState
+    app = workbench
+    app._live_runner = _StubRunner(LiveState.RUNNING)
+    trades = [_trade("A", 800, real_exit=44004), _trade("B", -400)]
+    app._display_results(_result(trades))
+    assert _column(app, "real_exit") == ["44,004", "--"]
+    last = app.trade_tree.get_children()[-1]
+    app.trade_tree.selection_set(last)
+
+    trades[-1].real_exit_price = 44622            # guarded in-place write
+    app._display_results(_result(trades))
+    assert _column(app, "real_exit") == ["44,004", "44,622"]
+    assert app.trade_tree.selection() == (last,), "refresh must keep the selection"
+
+
+@_tk_skip
+def test_trades_tab_never_keeps_rows_from_a_previous_result(workbench):
+    """Backtest (3 trades) → deploy a resumed bot (5 trades): every row
+    must belong to the bot. Then a shorter result must drop the surplus."""
+    from src.live.live_runner import LiveState
+    app = workbench
+    app._display_results(_result([_trade("BT", 100) for _ in range(3)]))
+    assert _column(app, "tag") == ["BT"] * 3
+
+    app._live_runner = _StubRunner(LiveState.RUNNING)
+    app._display_results(_result([_trade("LIVE", 100) for _ in range(5)]))
+    assert _column(app, "tag") == ["LIVE"] * 5
+
+    app._display_results(_result([_trade("BOT-B", 100) for _ in range(2)]))
+    assert _column(app, "tag") == ["BOT-B"] * 2
+    assert _column(app, "num") == ["1", "2"]
+
+
+@_tk_skip
+def test_trades_tab_sort_survives_a_live_update(workbench):
+    from src.live.live_runner import LiveState
+    app = workbench
+    app._live_runner = _StubRunner(LiveState.RUNNING)
+    trades = [_trade("A", 800), _trade("B", -400), _trade("C", 1200)]
+    app._display_results(_result(trades))
+    app._sort_trade_tree("pnl")                   # ascending
+    assert _column(app, "tag") == ["B", "A", "C"]
+
+    trades.append(_trade("D", -2000))             # new worst trade closes
+    app._display_results(_result(trades))
+    assert _column(app, "tag") == ["D", "B", "A", "C"]
+
+
+@_tk_skip
+def test_deploy_cannot_be_reentered_while_the_position_check_is_pending(workbench):
+    """The GUI waits for the OI snapshot without blocking Tk, so the Deploy
+    button stays clickable; a second deploy would build a second runner
+    over the first."""
+    app = workbench
+    calls = []
+    app._deploy_live = lambda: calls.append("deploy")
+    app._deploy_pending = True
+    app._toggle_live()
+    assert calls == []
+    app._deploy_pending = False
+    app._toggle_live()
+    assert calls == ["deploy"]
+
+
+def test_async_oi_wait_always_clears_the_pending_flag():
+    import inspect
+    import run_backtest as rb
+    src = inspect.getsource(rb.BacktestApp._deploy_live_from)
+    poll = src[src.index("def _poll_oi"):]
+    assert "finally:" in poll and "self._deploy_pending = False" in poll
+    assert src.index("self._deploy_pending = True") < src.index("return True")
+
+
 # ── source contracts: fail against the pre-fix code ──────────────────
 
 def test_phase1_run_backtest_source_contracts():
@@ -607,7 +832,8 @@ def test_phase1_run_backtest_source_contracts():
     assert "def set_status(" in src
     assert "transient_start" in inspect.getsource(rb.BacktestApp._append_chat)
     assert "transient_start" in inspect.getsource(rb.BacktestApp._remove_last_system_line)
-    assert "_rendered_trade_count" in inspect.getsource(rb.BacktestApp._display_results)
+    assert "_sync_trade_tree" in inspect.getsource(rb.BacktestApp._display_results)
+    assert "_rendered_trade_count" not in src, "bare-count watermark must stay gone"
     assert "_flush_report_render" in inspect.getsource(rb.BacktestApp._render_report_view)
     assert "log_ui" in inspect.getsource(rb._route_to_log_widget)
     assert "def _deploy_live_continue(" in src

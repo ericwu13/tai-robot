@@ -431,6 +431,15 @@ class _Images:
 # ── Theme construction ───────────────────────────────────────────────
 
 def _define_fonts(root) -> None:
+    """(Re)define the theme fonts under fixed names.
+
+    Fixed names + ``delete_font = False`` matter: the ttk style database
+    and the option database reference fonts BY NAME. Auto-named fonts are
+    deleted when their Python object is dropped (``Font.__del__``), so a
+    second ``init_theme`` — or a second root clearing ``FONTS`` — silently
+    reset every themed widget to the default font. Names are per
+    interpreter, so each root gets its own set under the same names.
+    """
     from tkinter import font as tkfont
     ui = _pick_family(root, _UI_FAMILIES, "TkDefaultFont")
     semi = _pick_family(root, _UI_SEMIBOLD_FAMILIES, ui)
@@ -438,26 +447,33 @@ def _define_fonts(root) -> None:
     icon = _pick_family(root, _ICON_FAMILIES, "")
     semi_weight = "normal" if semi != ui else "bold"
 
-    FONTS.clear()
-    FONTS["body"] = tkfont.Font(root=root, family=ui, size=10)
-    FONTS["body_bold"] = tkfont.Font(root=root, family=semi, size=10,
-                                     weight=semi_weight)
-    FONTS["small"] = tkfont.Font(root=root, family=ui, size=9)
-    FONTS["caption"] = tkfont.Font(root=root, family=ui, size=8)
-    FONTS["section"] = tkfont.Font(root=root, family=semi, size=12,
-                                   weight=semi_weight)
-    FONTS["title"] = tkfont.Font(root=root, family=semi, size=15,
-                                 weight=semi_weight)
-    FONTS["value"] = tkfont.Font(root=root, family=semi, size=11,
-                                 weight=semi_weight)
-    FONTS["metric"] = tkfont.Font(root=root, family=semi, size=17,
-                                  weight=semi_weight)
-    FONTS["mono"] = tkfont.Font(root=root, family=mono, size=10)
-    FONTS["mono_small"] = tkfont.Font(root=root, family=mono, size=9)
-    FONTS["mono_bold"] = tkfont.Font(root=root, family=mono, size=10,
-                                     weight="bold")
+    specs = {
+        "body": dict(family=ui, size=10, weight="normal"),
+        "body_bold": dict(family=semi, size=10, weight=semi_weight),
+        "small": dict(family=ui, size=9, weight="normal"),
+        "caption": dict(family=ui, size=8, weight="normal"),
+        "section": dict(family=semi, size=12, weight=semi_weight),
+        "title": dict(family=semi, size=15, weight=semi_weight),
+        "value": dict(family=semi, size=11, weight=semi_weight),
+        "metric": dict(family=semi, size=17, weight=semi_weight),
+        "mono": dict(family=mono, size=10, weight="normal"),
+        "mono_small": dict(family=mono, size=9, weight="normal"),
+        "mono_bold": dict(family=mono, size=10, weight="bold"),
+    }
     if icon:
-        FONTS["icon"] = tkfont.Font(root=root, family=icon, size=11)
+        specs["icon"] = dict(family=icon, size=11, weight="normal")
+
+    existing = set(tkfont.names(root))
+    FONTS.clear()
+    for key, spec in specs.items():
+        name = f"tairobot_{key}"
+        if name in existing:
+            font = tkfont.Font(root=root, name=name, exists=True)
+            font.configure(**spec)
+        else:
+            font = tkfont.Font(root=root, name=name, **spec)
+        font.delete_font = False
+        FONTS[key] = font
 
 
 def _button_variant(style, im: _Images, name: str, element: str, *,

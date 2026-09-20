@@ -938,7 +938,11 @@ class BacktestApp:
         self._strategy_store = StrategyStore(os.path.join(project_root, "strategies"))
 
         self._status_history: deque = deque(maxlen=20)
-        self._rendered_trade_count: int = 0
+        # iid -> (values, tag) currently shown in the Trades tab; lets
+        # _sync_trade_tree skip rows that did not change.
+        self._trade_rows: dict = {}
+        # True while the GUI waits (async) for the pre-deploy OI snapshot.
+        self._deploy_pending: bool = False
         self._report_render_pending: bool = False
         self._report_render_last: float = 0.0
         self._report_render_latest = None
@@ -3767,7 +3771,6 @@ class BacktestApp:
 
         self._last_result = result
         self._last_bars = bars
-        self._rendered_trade_count = 0
         self._display_results(result, bars)
 
         self._enable_buttons()
@@ -4012,25 +4015,7 @@ class BacktestApp:
             self._render_report_view(report_title, result.metrics,
                                      result.trades, regime_info, header_lines)
 
-        # Trade list — incremental insert on live updates; full rebuild
-        # when a backtest replaces the list or a column sort is active.
-        is_live = bool(self._live_runner and self._live_runner.state != LiveState.IDLE)
-        watermark = getattr(self, "_rendered_trade_count", 0)
-        can_incremental = (
-            is_live
-            and self._trade_sort_col is None
-            and watermark > 0
-            and watermark <= len(result.trades)
-        )
-        if not can_incremental:
-            for item in self.trade_tree.get_children():
-                self.trade_tree.delete(item)
-            start = 0
-        else:
-            start = watermark
-        for i, t in enumerate(result.trades[start:], start + 1):
-            self._insert_trade_row(i, t, bars)
-        self._rendered_trade_count = len(result.trades)
+        self._sync_trade_tree(result.trades, bars)
 
         self.trade_tree.tag_configure("win", foreground=ROW_TONE["good"])
         self.trade_tree.tag_configure("loss", foreground=ROW_TONE["bad"])
@@ -4040,29 +4025,68 @@ class BacktestApp:
         else:
             _log(f"回測完成 Backtest complete: {result.metrics.total_trades} trades")
 
-    def _insert_trade_row(self, i, t, bars) -> None:
+    @staticmethod
+    def _trade_row_values(i, t, bars) -> tuple[tuple, str]:
+        """(column values, row tag) for trade number ``i`` (1-based)."""
         bars_held = t.exit_bar_index - t.entry_bar_index
         pnl_str = f"{t.pnl:+,}"
         row_tag = "win" if t.pnl > 0 else "loss"
+        # Prefer stored datetimes; fall back to bar index lookup
         entry_dt = t.entry_dt or ""
         exit_dt = t.exit_dt or ""
         if not entry_dt and bars and 0 <= t.entry_bar_index < len(bars):
             entry_dt = bars[t.entry_bar_index].dt.strftime("%Y-%m-%d %H:%M")
         if not exit_dt and bars and 0 <= t.exit_bar_index < len(bars):
             exit_dt = bars[t.exit_bar_index].dt.strftime("%Y-%m-%d %H:%M")
+        # Real entry/exit prices from real-order fill confirmation.
+        # "--" for paper mode, force-closes, and race-dropped fills
+        # so they're visually distinct from valid zero prices.
         real_entry_str = (f"{t.real_entry_price:,}"
                           if t.real_entry_price > 0 else "--")
         real_exit_str = (f"{t.real_exit_price:,}"
                          if getattr(t, "real_exit_price", 0) > 0 else "--")
         source_str = _SOURCE_LABELS.get(getattr(t, "source", ""), "--")
-        self.trade_tree.insert("", tk.END, values=(
-            i, t.tag, t.side.value, entry_dt, f"{t.entry_price:,}",
+        values = (
+            str(i), str(t.tag), str(t.side.value), entry_dt, f"{t.entry_price:,}",
             real_entry_str,
             exit_dt, f"{t.exit_price:,}", real_exit_str,
-            pnl_str, bars_held,
+            pnl_str, str(bars_held),
             source_str,
             getattr(t, "strategy", "") or "--",
-        ), tags=(row_tag,))
+        )
+        return values, row_tag
+
+    def _sync_trade_tree(self, trades, bars) -> None:
+        """Reconcile the Trades tab to ``trades``.
+
+        Rows are keyed by trade number, so the tree's final content always
+        equals the computed rows — whatever was shown before (a backtest,
+        another bot's session) and whenever a row changes after it was
+        first drawn (the real exit price lands seconds after the close,
+        issue #92). Unchanged rows are not touched: a live trade close
+        costs one insert, not a rebuild, and the selection survives.
+        """
+        tree = self.trade_tree
+        wanted = {f"t{i}": self._trade_row_values(i, t, bars)
+                  for i, t in enumerate(trades, 1)}
+        for iid in tree.get_children():
+            if iid not in wanted:
+                tree.delete(iid)
+        shown = self._trade_rows
+        changed = False
+        for iid, row in wanted.items():
+            values, row_tag = row
+            if not tree.exists(iid):
+                tree.insert("", tk.END, iid=iid, values=values, tags=(row_tag,))
+                changed = True
+            elif shown.get(iid) != row:
+                tags = (row_tag, "hover") if "hover" in tree.item(iid, "tags") \
+                    else (row_tag,)
+                tree.item(iid, values=values, tags=tags)
+                changed = True
+        self._trade_rows = wanted
+        if changed and self._trade_sort_col is not None:
+            self._apply_trade_sort()
 
     def _regime_report_info(self) -> dict | None:
         """Return the regime header dict when the live runner is a
@@ -4327,6 +4351,13 @@ class BacktestApp:
         else:
             self._trade_sort_col = col
             self._trade_sort_reverse = False
+        self._apply_trade_sort()
+
+    def _apply_trade_sort(self) -> None:
+        """Order the rows by the active sort column (no toggling)."""
+        col = self._trade_sort_col
+        if col is None:
+            return
 
         # Numeric columns need numeric sorting
         numeric_cols = {"num", "entry_price", "real_entry", "exit_price",
@@ -4335,8 +4366,7 @@ class BacktestApp:
         items = []
         for iid in self.trade_tree.get_children():
             values = self.trade_tree.item(iid, "values")
-            tags = self.trade_tree.item(iid, "tags")
-            items.append((iid, values, tags))
+            items.append((iid, values))
 
         col_idx = list(self.trade_tree["columns"]).index(col)
 
@@ -4353,7 +4383,7 @@ class BacktestApp:
 
         items.sort(key=sort_key, reverse=self._trade_sort_reverse)
 
-        for idx, (iid, values, tags) in enumerate(items):
+        for idx, (iid, _values) in enumerate(items):
             self.trade_tree.move(iid, "", idx)
 
         # Update heading to show sort direction
@@ -4368,9 +4398,6 @@ class BacktestApp:
         for c, text in col_texts.items():
             display = text + arrow if c == col else text
             self.trade_tree.heading(c, text=display)
-        # Next live update must full-rebuild so newly inserted rows pick up
-        # the active sort instead of appending out of order.
-        self._rendered_trade_count = 0
 
     def _chart_kwargs(self) -> dict:
         return dict(bb_period=20, bb_std=2.0)
@@ -6052,6 +6079,12 @@ class BacktestApp:
 
     def _toggle_live(self):
         """Toggle between Deploy Bot and Stop Bot."""
+        if self._deploy_pending:
+            # The GUI waits for the pre-deploy position snapshot without
+            # blocking Tk, so the button is live meanwhile. A second deploy
+            # here would build a second runner over the first.
+            self.set_status("部署進行中 Deploy already in progress…", "warn")
+            return
         if self._live_runner and self._live_runner.state != LiveState.IDLE:
             self._stop_live()
         else:
@@ -6314,10 +6347,14 @@ class BacktestApp:
                     def _poll_oi():
                         if (self._account_monitor.oi_snapshot_received
                                 or time.time() >= _deadline):
-                            _after_oi_wait()
+                            try:
+                                _after_oi_wait()
+                            finally:
+                                self._deploy_pending = False
                             return
                         self.root.after(100, _poll_oi)
 
+                    self._deploy_pending = True
                     self.root.after(100, _poll_oi)
                     return True
             except Exception as e:

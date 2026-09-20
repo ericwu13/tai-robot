@@ -5,6 +5,7 @@ Imports ``src.ui.theme`` only — never ``run_backtest``.
 
 from __future__ import annotations
 
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -236,28 +237,80 @@ class FlowFrame(ttk.Frame):
             widget.place(x=x, y=y + (row_h - h_px) // 2)
 
 
+def work_area(widget) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the usable area of ``widget``'s monitor.
+
+    Excludes the taskbar and follows the monitor the widget is actually on;
+    falls back to the primary screen where the Win32 call is unavailable.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD),
+                            ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(widget.winfo_id()) or widget.winfo_id()
+            monitor = user32.MonitorFromWindow(hwnd, 2)  # DEFAULTTONEAREST
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                r = info.rcWork
+                if r.right > r.left and r.bottom > r.top:
+                    return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+    return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
+
+
+def fit_dialog(w: int, h: int, parent_box: tuple[int, int, int, int],
+               area: tuple[int, int, int, int], *, frame: int = 0,
+               caption: int = 0) -> tuple[int, int, int, int]:
+    """Pure geometry: size ``w``x``h`` centered over ``parent_box``
+    (x, y, width, height), shrunk and shifted to stay inside ``area``.
+
+    ``frame``/``caption`` reserve room for the native window border and
+    title bar, which Tk's client-area geometry does not include.
+    """
+    left, top, right, bottom = area
+    w = max(1, min(w, right - left - 2 * frame))
+    h = max(1, min(h, bottom - top - caption - frame))
+    px, py, pw, ph = parent_box
+    x = px + (pw - w) // 2
+    y = py + (ph - h) // 3
+    x = max(left + frame, min(x, right - frame - w))
+    y = max(top + caption, min(y, bottom - frame - h))
+    return w, h, x, y
+
+
 def place_dialog(win, parent, width: int | None = None,
                  height: int | None = None) -> None:
-    """Size (logical px, optional) and center a Toplevel over its parent.
+    """Size (logical px, optional) and center a Toplevel over its parent,
+    never larger than — or outside — the parent monitor's work area.
 
-    Without a size the dialog keeps its natural (content) size — fixed
-    pixel geometries clip at high DPI.
+    The process is DPI-aware, so a fixed logical size can exceed a small
+    scaled screen (820x740 at 150 % is taller than a 1080p work area);
+    dialog bodies scroll or expand, so shrinking is harmless, while
+    off-screen commit buttons are not.
     """
     try:
         win.update_idletasks()
         w = S(width) if width else win.winfo_reqwidth()
         h = S(height) if height else win.winfo_reqheight()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        if pw <= 1 or ph <= 1:  # parent not mapped (headless / early)
-            pw, ph = win.winfo_screenwidth(), win.winfo_screenheight()
-            px = py = 0
-        x = px + max(0, (pw - w) // 2)
-        y = py + max(0, (ph - h) // 3)
-        if width or height:
-            win.geometry(f"{w}x{h}+{x}+{y}")
-        else:
-            win.geometry(f"+{x}+{y}")
+        parent_box = (parent.winfo_rootx(), parent.winfo_rooty(),
+                      parent.winfo_width(), parent.winfo_height())
+        mapped = parent_box[2] > 1 and parent_box[3] > 1
+        area = work_area(parent if mapped else win)
+        if not mapped:  # headless / early: center on the screen instead
+            parent_box = (area[0], area[1], area[2] - area[0], area[3] - area[1])
+        w, h, x, y = fit_dialog(w, h, parent_box, area,
+                                frame=S(8), caption=S(32))
+        win.geometry(f"{w}x{h}+{x}+{y}")
     except tk.TclError:
         pass
 
@@ -457,13 +510,25 @@ class StatCard(ttk.Frame):
                 self._sub.configure(text=sub)
             self._sub.pack(anchor="w")
         self._variable = variable
+        self._trace_id = None
         if signed and variable is not None:
-            variable.trace_add("write", self._retint)
+            self._trace_id = variable.trace_add("write", self._retint)
+            self.bind("<Destroy>", self._drop_trace, add="+")
             self._retint()
 
     @property
     def value_label(self) -> ttk.Label:
         return self._value
+
+    def _drop_trace(self, event) -> None:
+        # The variable usually outlives the card; a trace left behind would
+        # fire into a destroyed label on the next write.
+        if event.widget is self and self._trace_id is not None:
+            try:
+                self._variable.trace_remove("write", self._trace_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._trace_id = None
 
     def set_tone(self, tone: str | None) -> None:
         color = TONE.get(tone) if tone else None
