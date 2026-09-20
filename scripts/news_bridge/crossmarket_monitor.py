@@ -33,13 +33,21 @@ Safety asymmetry (deliberate, mirrors the design doc):
   yourself, or activate the W5 manual-tap webhook (n8n/W5_manual_tap.json)
   and tap the Discord link.
 
-Session hand-offs are handled by the quote-freshness guard alone: whichever
-markets are closed simply go stale and drop out of every decision, so one
-symbol table covers Tokyo/Seoul, Frankfurt/Amsterdam and New York without any
-per-symbol clock logic.  The allowance is PER SYMBOL (``max_age``), because
-Yahoo is real-time only for US cash — it publishes CME futures ~10 min and
-Asian/European quotes ~15-20 min delayed.  A single 10-minute guard silently
-discarded a live KOSPI -4% print and every NQ=F quote ever.
+Session hand-offs are handled by the quote-freshness guard: a closed
+market's last print ages past ``max_age`` and drops out of every
+decision, so one symbol table covers Tokyo/Seoul, Frankfurt/Amsterdam
+and New York without any per-symbol clock table.  ``max_age`` alone is
+not enough — Yahoo sometimes keeps advancing ``regularMarketTime`` on a
+closed market (issue #137, ``^TWII`` on a Sunday restamped Friday's
+close).  A quote is also rejected when that stamp sits outside
+``currentTradingPeriod.regular`` (plus a closing-auction grace) or runs
+more than that grace ahead of the last 1-min bar, so a restamped
+previous session cannot count as fresh.  Missing period *and* bars fall
+back to ``max_age`` only and log that choice.  The allowance is PER
+SYMBOL (``max_age``), because Yahoo is real-time only for US cash — it
+publishes CME futures ~10 min and Asian/European quotes ~15-20 min
+delayed.  A single 10-minute guard silently discarded a live KOSPI -4%
+print and every NQ=F quote ever.
 
 Usage:
     # one check, print only (no files written unless a threshold fires)
@@ -131,6 +139,14 @@ VOTE_THRESHOLDS = {sym: cfg["vote"] for sym, cfg in SYMBOLS.items()}
 VOTE_MIN_SYMBOLS = 2
 
 QUOTE_MAX_AGE_SEC = 600    # default allowance for symbols with no max_age
+# Extra window after currentTradingPeriod.regular.end / last 1-min bar
+# before a stamp is treated as belonging to a different session.
+# ^N225 prints ~15 min after 14:30 (closing auction); ^KS11 has been
+# seen ~5 h after 14:00 (official close).  A Sunday/holiday phantom
+# stamp is a full session later (20+ h), so 6 h still rejects those
+# without replacing max_age for a just-closed live market.
+PERIOD_END_GRACE_SEC = 6 * 3600
+STAMP_AHEAD_OF_TAPE_SEC = PERIOD_END_GRACE_SEC
 # TPE hours.  The day window runs to 15:00 (not 14:00) so the Korea/Japan
 # closing prints — 14:30-14:50 TPE, routinely the sharpest move of their
 # session — are still fresh when the Taiwan night session opens at 15:00.
@@ -146,24 +162,103 @@ LOG_KEEP_LINES = 2000
 _UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)", "Connection": "close"}
 
 
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_fields(result: dict) -> dict:
+    """Pull regular-period bounds and last 1-min bar out of a Yahoo chart."""
+    try:
+        meta = result.get("meta") or {}
+        regular = ((meta.get("currentTradingPeriod") or {}).get("regular")
+                   or {})
+        timestamps = result.get("timestamp") or []
+        last_bar = _int_or_none(timestamps[-1]) if timestamps else None
+        return {
+            "period_start": _int_or_none(regular.get("start")),
+            "period_end": _int_or_none(regular.get("end")),
+            "last_bar_time": last_bar,
+        }
+    except (TypeError, AttributeError, IndexError):
+        return {"period_start": None, "period_end": None, "last_bar_time": None}
+
+
+def parse_chart_quote(result: dict) -> dict:
+    """Turn one Yahoo v8 ``chart.result[]`` item into a quote dict.
+
+    Always exposes ``period_start`` / ``period_end`` / ``last_bar_time``
+    (None when the payload omitted them) so the session-stamp guard can
+    tell "Yahoo said nothing" from "the caller never parsed a chart".
+    """
+    meta = result["meta"]
+    price = float(meta["regularMarketPrice"])
+    prev = float(meta.get("chartPreviousClose") or meta.get("previousClose"))
+    qtime = int(meta["regularMarketTime"])
+    quote = {
+        "price": price,
+        "prev_close": prev,
+        "pct": (price - prev) / prev * 100.0,
+        "quote_time": qtime,
+    }
+    quote.update(_session_fields(result))
+    return quote
+
+
+def _last_bar_is_fresh(quote: dict, now: float, max_age: float) -> bool:
+    last_bar = quote.get("last_bar_time")
+    if last_bar is None:
+        return False
+    return (now - float(last_bar)) <= float(max_age) + 60
+
+
+def session_stale_reason(quote: dict,
+                         *,
+                         now: float | None = None,
+                         max_age: float = QUOTE_MAX_AGE_SEC) -> str | None:
+    """Additional reject when Yahoo's stamp does not belong to this session.
+
+    Returns the per-symbol print suffix, or None if the stamp is
+    acceptable.  This does **not** replace ``max_age`` — the caller still
+    ages ``regularMarketTime``.  Missing period *and* bars: no additional
+    reject (fallback).
+
+    A stamp outside ``currentTradingPeriod.regular`` is ignored when the
+    last 1-min bar is itself fresh: ``NQ=F`` sometimes reports a short
+    cash-like period while the Globex tape is still printing.
+    """
+    now = time.time() if now is None else now
+    stamp = float(quote["quote_time"])
+    start = quote.get("period_start")
+    end = quote.get("period_end")
+    last_bar = quote.get("last_bar_time")
+
+    period_bad = (
+        start is not None and end is not None
+        and not (float(start) <= stamp <= float(end) + PERIOD_END_GRACE_SEC)
+    )
+    tape_bad = (
+        last_bar is not None
+        and stamp > float(last_bar) + STAMP_AHEAD_OF_TAPE_SEC
+    )
+    if period_bad and _last_bar_is_fresh(quote, now, max_age):
+        period_bad = False
+    if period_bad or tape_bad:
+        return "STALE — stamp outside trading period"
+    return None
+
+
 def fetch_quote(symbol: str) -> dict | None:
-    """Return {price, prev_close, pct, quote_time} or None on any failure."""
+    """Return {price, prev_close, pct, quote_time, session fields} or None."""
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
            f"?interval=1m&range=1d")
     try:
         req = urllib.request.Request(url, headers=_UA)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
-        meta = data["chart"]["result"][0]["meta"]
-        price = float(meta["regularMarketPrice"])
-        prev = float(meta.get("chartPreviousClose") or meta.get("previousClose"))
-        qtime = int(meta["regularMarketTime"])
-        return {
-            "price": price,
-            "prev_close": prev,
-            "pct": (price - prev) / prev * 100.0,
-            "quote_time": qtime,
-        }
+        return parse_chart_quote(data["chart"]["result"][0])
     except Exception as e:                                    # noqa: BLE001
         print(f"  [{symbol}] fetch failed: {type(e).__name__}: {e}")
         return None
@@ -315,12 +410,27 @@ def _collect_quotes(args) -> tuple[dict[str, dict], dict[str, list[str]], list[s
         if q is None:
             fetch_failures += 1
             continue
-        age = time.time() - q["quote_time"]
+        now = time.time()
+        age = now - q["quote_time"]
         max_age = cfg.get("max_age", QUOTE_MAX_AGE_SEC)
-        stale = age > max_age and not args.ignore_freshness
+        session_reason = (
+            None if args.ignore_freshness
+            else session_stale_reason(q, now=now, max_age=max_age))
+        age_stale = age > max_age and not args.ignore_freshness
+        stale = bool(session_reason) or age_stale
+        meta_missing = (
+            q.get("period_start") is None and q.get("last_bar_time") is None
+            and not args.ignore_freshness and not stale)
+        if session_reason:
+            extra = f", {session_reason}"
+        elif age_stale:
+            extra = f", STALE > {max_age}s allowance — ignored"
+        elif meta_missing:
+            extra = ", session metadata missing — freshness by max_age only"
+        else:
+            extra = ""
         print(f"  [{sym}] {q['pct']:+.2f}% (px {q['price']:.2f} vs pc "
-              f"{q['prev_close']:.2f}, quote age {age:.0f}s"
-              + (f", STALE > {max_age}s allowance — ignored" if stale else "") + ")")
+              f"{q['prev_close']:.2f}, quote age {age:.0f}s{extra})")
         if stale:
             continue
         fresh[sym] = q

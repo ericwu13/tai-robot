@@ -129,9 +129,14 @@ lost exactly this way).
 1. **HTTP Request ×N (parallel)** — quotes for the symbol table below (Yahoo v8 chart API,
    keyless, in `scripts/news_bridge/crossmarket_monitor.py`; Finnhub `/quote` also works
    for the US names). Verify freshness: each response carries a timestamp; discard quotes
-   older than that symbol's `max_age`. **That freshness guard is the only session logic
-   there is** — markets that are closed go stale and drop out of every decision, which is
-   what lets one table span Tokyo, Frankfurt and New York.
+   older than that symbol's `max_age`. Closed markets normally age out and drop from
+   every decision, which is what lets one table span Tokyo, Frankfurt and New York.
+   `max_age` is not sufficient on its own — Yahoo has been observed to keep advancing
+   `regularMarketTime` on a closed market (issue #137, `^TWII` on a Sunday, Friday's
+   +2.90% re-alerted). A quote is also rejected when that stamp sits outside
+   `currentTradingPeriod.regular` (plus a closing-auction grace) or runs more than that
+   grace ahead of the last 1-min bar, so a restamped previous session cannot count as
+   fresh. Missing period *and* bars fall back to `max_age` only.
    The allowance is **per symbol**, not global — match it to the feed's latency:
    **600 s** US cash equities/ETFs (real-time on Yahoo: `SOXX`, `TSM`, `QQQ`),
    **900 s** CME futures (~10 min delayed: `NQ=F`),
