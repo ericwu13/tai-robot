@@ -20,6 +20,7 @@ from src.ui import labels
 from src.ui.theme import (
     CHAT_TAGS,
     DOT_COLORS,
+    EMPTY_FG,
     EPISODE_TAGS,
     LOG_TAGS,
     PALETTE,
@@ -66,6 +67,10 @@ def test_palette_has_plan_tokens():
         assert PALETTE[key] == value
     assert TONE["good"] == PALETTE["ok"]
     assert TONE["bad"] == PALETTE["err"]
+    # Empty-copy token is brighter than text_dim, still not full text.
+    assert EMPTY_FG == "#b4b4bc"
+    assert EMPTY_FG != PALETTE["text_dim"]
+    assert EMPTY_FG != PALETTE["text"]
     assert set(CHAT_TAGS) >= {"user", "assistant", "code", "error", "system"}
     assert set(LOG_TAGS) >= {"entry", "exit", "bar", "status"}
     assert DOT_COLORS["ok"] == PALETTE["ok"]
@@ -79,6 +84,9 @@ def test_labels_import_seam_titles_not_redefined():
     assert labels.TITLE_DATA_RANGE is TITLE_DATA_RANGE
     assert labels.DEPLOY_BOT == "部署機器人 Deploy Bot"
     assert labels.READY == "就緒 Ready"
+    assert "開始對話" in labels.CHAT_PLACEHOLDER
+    assert "Start chatting" in labels.CHAT_PLACEHOLDER
+    assert "尚無結果" in labels.REPORT_EMPTY
 
 
 def test_ui_package_does_not_import_run_backtest():
@@ -119,7 +127,7 @@ def test_init_theme_on_withdrawn_root_defines_named_styles():
         for name in (
             "Card.TFrame", "CardValue.TLabel", "Card.Dim.TLabel",
             "Status.Ok.TLabel", "Status.Warn.TLabel", "Status.Err.TLabel",
-            "Dim.TLabel",
+            "Dim.TLabel", "Empty.TLabel", "Empty.Inset.TLabel",
             "StatusStrip.TFrame", "StatusStrip.TLabel",
             "StatusStrip.Dim.TLabel", "StatusStrip.Ok.TLabel",
             "StatusStrip.Warn.TLabel", "StatusStrip.Err.TLabel",
@@ -141,6 +149,8 @@ def test_init_theme_on_withdrawn_root_defines_named_styles():
         assert style.lookup("TEntry", "bordercolor") != PALETTE["bg"]
         assert style.lookup("Treeview", "fieldbackground") == PALETTE["bg_inset"]
         assert style.map("Treeview", "foreground")
+        assert style.lookup("Dim.TLabel", "foreground") == PALETTE["text_dim"]
+        assert style.lookup("Empty.TLabel", "foreground") == EMPTY_FG
         assert set(FONTS) >= {"title", "section", "value", "body", "mono", "mono_small"}
     finally:
         root.destroy()
@@ -201,6 +211,31 @@ def test_tag_text_log_cap_trims_from_top():
             scrollbars.extend(
                 c for c in w.winfo_children() if isinstance(c, _ttk.Scrollbar))
         assert scrollbars, "TagTextLog must use ttk.Scrollbar, not ScrolledText"
+    finally:
+        root.destroy()
+
+
+@_tk_skip
+def test_tag_text_log_placeholder_clears_on_first_message():
+    import tkinter as tk
+    from src.ui.theme import init_theme
+    from src.ui.widgets import TagTextLog
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        init_theme(root)
+        log = TagTextLog(root, placeholder="開始對話… / Start chatting…")
+        assert log._ph_label is not None
+        assert str(log._ph_label.place_info().get("anchor", "")) == "center"
+        # Overlay is not in the buffer.
+        assert log.get("1.0", "end-1c").strip() == ""
+        log.append("hello", "info")
+        assert log._ph_label.place_info() == {}
+        assert "hello" in log.get("1.0", "end-1c")
+        log.clear()
+        assert str(log._ph_label.place_info().get("anchor", "")) == "center"
+        assert log.get("1.0", "end-1c").strip() == ""
     finally:
         root.destroy()
 
@@ -288,6 +323,9 @@ def test_phase1_run_backtest_source_contracts():
     assert "return False" in deploy_src
     assert "messagebox." not in deploy_src
     assert "def set_status(" in src
+    assert "CHAT_PLACEHOLDER" in src
+    assert "Empty.TLabel" in src
+    assert "REPORT_EMPTY" in src
     assert "transient_start" in inspect.getsource(rb.BacktestApp._append_chat)
     assert "transient_start" in inspect.getsource(rb.BacktestApp._remove_last_system_line)
     assert "_rendered_trade_count" in inspect.getsource(rb.BacktestApp._display_results)

@@ -36,6 +36,10 @@ _DISABLED_FG = "#5c5c66"
 _EDGE = "#4e4e58"
 # Clickable fill sits a step above bg_raised so TButton reads as a target.
 _BTN = "#25252c"
+# Empty-state copy only (chat placeholder, report "尚無結果").
+# text_dim on bg_inset is ≥4.5:1 but still vanishes in a large well;
+# this sits between text_dim (#8a8a94) and text (#d6d6dc).
+EMPTY_FG = "#b4b4bc"
 
 # Report / regime card tones. Values follow the dark-theme pair (plan §7),
 # not the old light-theme #0f6e56 / #a32d2d literals.
@@ -365,6 +369,10 @@ def init_theme(root) -> Any:
                     foreground=p["err"])
     style.configure("Dim.TLabel", background=p["bg"],
                     foreground=p["text_dim"])
+    style.configure("Empty.TLabel", background=p["bg"],
+                    foreground=EMPTY_FG)
+    style.configure("Empty.Inset.TLabel", background=p["bg_inset"],
+                    foreground=EMPTY_FG)
 
     style.configure("TSeparator", background=_EDGE)
     style.configure("StatusStrip.TFrame", relief="solid", borderwidth=1,

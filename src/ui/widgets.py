@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from src.ui.theme import (
-    CHAT_TAGS, FONTS, LOG_TAGS, PALETTE, style_text_widget,
+    CHAT_TAGS, EMPTY_FG, FONTS, LOG_TAGS, PALETTE, style_text_widget,
 )
 
 
@@ -221,6 +221,7 @@ class TagTextLog(ttk.Frame):
         levels: tuple[str, ...] = ("info", "debug"),
         max_lines: int = 5000,
         show_toolbar: bool = False,
+        placeholder: str | None = None,
         bg: str | None = None,
         fg: str | None = None,
         font=None,
@@ -271,6 +272,18 @@ class TagTextLog(ttk.Frame):
         )
         wrap.pack(fill=tk.BOTH, expand=True)
         self.text.configure(bg=self._bg, fg=self._fg, state=tk.DISABLED)
+        self._placeholder = placeholder or ""
+        self._ph_label = None
+        if self._placeholder:
+            # Overlay (not buffer text) so get()/save paths stay empty and
+            # the well fill is not punched by a Dim.TLabel hole.
+            self._ph_label = tk.Label(
+                self.text, text=self._placeholder,
+                bg=self._bg, fg=EMPTY_FG,
+                font=FONTS.get("body") or ("", 10),
+                justify=tk.CENTER, bd=0, highlightthickness=0,
+            )
+            self._show_placeholder()
         self.text.tag_configure("search_hit", background=PALETTE["accent"],
                                 foreground=PALETTE["bg"])
         self.text.tag_configure("info", foreground=self._fg)
@@ -292,6 +305,7 @@ class TagTextLog(ttk.Frame):
                 "producers must go through _ui_queue")
         if not line.endswith("\n"):
             line = line + "\n"
+        self._hide_placeholder()
         self.text.configure(state=tk.NORMAL)
         self.text.insert(tk.END, line, tag)
         self._trim()
@@ -304,6 +318,32 @@ class TagTextLog(ttk.Frame):
         self.text.configure(state=tk.NORMAL)
         self.text.delete("1.0", tk.END)
         self.text.configure(state=tk.DISABLED)
+        self._show_placeholder()
+
+    def _show_placeholder(self) -> None:
+        if self._ph_label is None:
+            return
+        try:
+            self._ph_label.place(relx=0.5, rely=0.42, anchor=tk.CENTER)
+        except tk.TclError:
+            pass
+
+    def _hide_placeholder(self) -> None:
+        if self._ph_label is None:
+            return
+        try:
+            self._ph_label.place_forget()
+        except tk.TclError:
+            pass
+
+    def _maybe_restore_placeholder(self) -> None:
+        if self._ph_label is None:
+            return
+        raw = self.text.get("1.0", "end-1c").strip()
+        if not raw:
+            self._show_placeholder()
+        else:
+            self._hide_placeholder()
 
     def _trim(self) -> None:
         raw = self.text.get("1.0", "end-1c")
@@ -347,10 +387,13 @@ class TagTextLog(ttk.Frame):
     configure = config
 
     def insert(self, *args, **kwargs):
+        self._hide_placeholder()
         return self.text.insert(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        return self.text.delete(*args, **kwargs)
+        result = self.text.delete(*args, **kwargs)
+        self._maybe_restore_placeholder()
+        return result
 
     def get(self, *args, **kwargs):
         return self.text.get(*args, **kwargs)

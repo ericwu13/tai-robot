@@ -41,6 +41,10 @@ TAB_LIVE = "即時 Live"
 TAB_REGIME = "多空 Regime"
 TAB_LOG = "紀錄 Log"
 
+# Empty states
+CHAT_PLACEHOLDER = "開始對話… / Start chatting…"
+REPORT_EMPTY = "(尚無結果 no results yet — 執行回測或部署 run a backtest or deploy)"
+
 # Status strip
 STATUS_HISTORY = "紀錄 History"
 CONNECTED_READY = "已連線 Connected - Ready"

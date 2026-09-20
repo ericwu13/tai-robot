@@ -133,7 +133,7 @@ from src.ui.widgets import (
     ScrollableFrame, StatusDot, TagTextLog, attach_tooltip,
     themed_scrolled_text,
 )
-from src.ui.labels import READY
+from src.ui.labels import CHAT_PLACEHOLDER, READY, REPORT_EMPTY
 from src.data_sources.taifex import fetch_futures_daily, parse_taifex_csv
 from src.data_sources.cache import (
     get_cache_path, save_bars_csv, load_bars_csv, cache_covers_range,
@@ -1667,6 +1667,7 @@ class BacktestApp:
         # ── Chat display ──
         self.chat_display = TagTextLog(
             parent, tags=CHAT_TAGS, show_toolbar=False,
+            placeholder=CHAT_PLACEHOLDER,
             bg=PALETTE["bg_inset"], fg=PALETTE["text"],
             font=FONTS.get("mono") or ("Consolas", 10),
         )
@@ -1735,7 +1736,7 @@ class BacktestApp:
 
         # ── Row 1: Symbol + Strategy ──
         row1 = ttk.Frame(ctrl)
-        row1.pack(fill=tk.X, pady=(0, 1))
+        row1.pack(fill=tk.X, pady=(0, 2))
 
         ttk.Label(row1, text="商品 Symbol:").grid(row=0, column=0, sticky=tk.W, padx=(4, 2))
         self.symbol_var = tk.StringVar(value="TX00")
@@ -1753,7 +1754,7 @@ class BacktestApp:
 
         # ── Row 2: Login ──
         row2 = ttk.Frame(ctrl)
-        row2.pack(fill=tk.X, pady=(1, 2))
+        row2.pack(fill=tk.X, pady=(0, 2))
 
         ttk.Label(row2, text="帳號 User ID:").grid(row=0, column=0, sticky=tk.W, padx=(4, 2))
         self.login_user_var = tk.StringVar(value=self._settings.get("user_id", ""))
@@ -1777,37 +1778,40 @@ class BacktestApp:
         # ── Action buttons (grid layout — wraps gracefully) ──
         btn_frame = ttk.Frame(ctrl)
         btn_frame.pack(fill=tk.X, pady=(2, 2))
+        # Match chat-header button gaps (padx=2) so the wrap rows don't
+        # feel packed-then-sparse against the left pane.
+        _tb = dict(padx=2, pady=2, sticky=tk.W)
 
         self.btn_tv = ttk.Button(btn_frame, text="TV回測 TV Backtest",
                                  command=self._do_fetch_tv)
-        self.btn_tv.grid(row=0, column=0, padx=3, pady=1, sticky=tk.W)
+        self.btn_tv.grid(row=0, column=0, **_tb)
 
         self.btn_api = ttk.Button(btn_frame, text="API回測 API Backtest",
                                    command=self._do_fetch_api, state=tk.DISABLED)
-        self.btn_api.grid(row=0, column=1, padx=3, pady=1, sticky=tk.W)
+        self.btn_api.grid(row=0, column=1, **_tb)
 
         self.btn_taifex = ttk.Button(btn_frame, text="TAIFEX回測 TAIFEX Backtest",
                                       command=self._do_fetch_taifex)
-        self.btn_taifex.grid(row=0, column=2, padx=3, pady=1, sticky=tk.W)
+        self.btn_taifex.grid(row=0, column=2, **_tb)
 
         self.btn_deploy = ttk.Button(btn_frame, text="部署機器人 Deploy Bot",
                                       command=self._toggle_live, state=tk.DISABLED)
-        self.btn_deploy.grid(row=0, column=3, padx=3, pady=1, sticky=tk.W)
+        self.btn_deploy.grid(row=0, column=3, **_tb)
 
         self.btn_chart_all = ttk.Button(btn_frame, text="K線圖 K Chart",
                                         command=self._show_chart_all, state=tk.DISABLED)
-        self.btn_chart_all.grid(row=0, column=4, padx=3, pady=1, sticky=tk.W)
+        self.btn_chart_all.grid(row=0, column=4, **_tb)
 
         self.btn_export = ttk.Button(btn_frame, text="匯出交易 Export Trades",
                                      command=self._do_export, state=tk.DISABLED)
-        self.btn_export.grid(row=0, column=5, padx=3, pady=1, sticky=tk.W)
+        self.btn_export.grid(row=0, column=5, **_tb)
 
         self.btn_toggle_settings = ttk.Button(btn_frame, text="▶ 設定 Settings",
                                                command=self._toggle_settings)
-        self.btn_toggle_settings.grid(row=0, column=6, padx=3, pady=1, sticky=tk.W)
+        self.btn_toggle_settings.grid(row=0, column=6, **_tb)
 
         tf_frame = ttk.Frame(btn_frame)
-        tf_frame.grid(row=0, column=7, padx=3, pady=1, sticky=tk.W)
+        tf_frame.grid(row=0, column=7, **_tb)
         ttk.Label(tf_frame, text="Chart TF:").pack(side=tk.LEFT, padx=(0, 2))
         self.chart_tf_var = tk.StringVar(value="Native")
         self.chart_tf_combo = ttk.Combobox(
@@ -1819,19 +1823,19 @@ class BacktestApp:
 
         self.btn_review = ttk.Button(btn_frame, text="AI檢視 AI Review",
                                      command=self._review_trades, state=tk.DISABLED)
-        self.btn_review.grid(row=0, column=8, padx=3, pady=1, sticky=tk.W)
+        self.btn_review.grid(row=0, column=8, **_tb)
 
         self.btn_evolution = ttk.Button(btn_frame, text="🧬 進化 Evolution",
                                         command=self._bot_evolution, state=tk.DISABLED)
-        self.btn_evolution.grid(row=0, column=9, padx=3, pady=1, sticky=tk.W)
+        self.btn_evolution.grid(row=0, column=9, **_tb)
 
         self.btn_report = ttk.Button(btn_frame, text="回報問題 Report Issue",
                                      command=self._report_issue)
-        self.btn_report.grid(row=0, column=10, padx=3, pady=1, sticky=tk.W)
+        self.btn_report.grid(row=0, column=10, **_tb)
 
         self.btn_update = ttk.Button(btn_frame, text="🔄 檢查更新 Check for Updates",
                                      command=self._start_update)
-        self.btn_update.grid(row=0, column=11, padx=3, pady=1, sticky=tk.W)
+        self.btn_update.grid(row=0, column=11, **_tb)
         attach_tooltip(self.btn_update,
                        "請先停止所有機器人\nStop all running bots first")
 
@@ -1914,9 +1918,8 @@ class BacktestApp:
         report_scroll.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
         self.report_canvas = report_scroll.canvas
         self.report_body = report_scroll.body
-        ttk.Label(self.report_body, text="(尚無結果 no results yet — 執行回測或部署 "
-                             "run a backtest or deploy)",
-                  style="Dim.TLabel").pack(padx=8, pady=8)
+        ttk.Label(self.report_body, text=REPORT_EMPTY,
+                  style="Empty.TLabel").pack(padx=8, pady=8)
 
         # Trade list tab
         trades_frame = ttk.Frame(notebook)
@@ -3112,12 +3115,12 @@ class BacktestApp:
         row = 0
         col = 0
         for w in self._toolbar_widgets:
-            req = w.winfo_reqwidth() + 6  # padx=3 each side
+            req = w.winfo_reqwidth() + 4  # padx=2 each side
             if col > 0 and x + req > event.width:
                 row += 1
                 col = 0
                 x = 0
-            w.grid(row=row, column=col, padx=3, pady=1, sticky=tk.W)
+            w.grid(row=row, column=col, padx=2, pady=2, sticky=tk.W)
             col += 1
             x += req
 
@@ -3811,7 +3814,7 @@ class BacktestApp:
                      f" ({regime_info['active_strategy']})").pack(
                 anchor="w", padx=6)
         if message:
-            ttk.Label(body, text=message, style="Dim.TLabel").pack(
+            ttk.Label(body, text=message, style="Empty.TLabel").pack(
                 anchor="w", padx=6, pady=8)
             return
 
