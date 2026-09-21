@@ -3153,8 +3153,9 @@ class BacktestApp:
                 # script (os._exit so the process dies even from this daemon
                 # thread — sys.exit would only kill the thread). The process
                 # ends here on success, so nothing after this runs.
-                updater.launch_update(release.download_url, release.version,
-                                      progress_cb)
+                updater.launch_update(
+                    release.download_url, release.version, progress_cb,
+                    checksum_url=release.checksum_url)
             except SystemExit:
                 # Dead code now (os._exit raises nothing), but harmless — kept
                 # so a future revert to sys.exit doesn't swallow the exit here.
