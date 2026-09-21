@@ -102,7 +102,7 @@ from src.live.tick_watchdog import TickWatchdog
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
-    resume_real_position_ok,
+    resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.fill_poller import FillPoller
@@ -8676,27 +8676,46 @@ class BacktestApp:
         self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type="entry", price_source=price_src)
 
     def _manual_close(self):
-        """Send a manual close (flatten) order — reverse of current position."""
+        """Send a manual close (flatten) order — reverse of this product.
+
+        Issue #145: the side comes from ``close_order_side`` (this bot's
+        order-symbol prefix + futures market ``TF``). A foreign OI row
+        (a TO option, including one that shares the TX prefix) must not
+        pick it. A snapshot that says this product is flat refuses the
+        order — ``_last_real_order_side`` / the sim broker are only used
+        when no snapshot has arrived. The dialog is an explicit close
+        (sNewClose 1); its default of 2 (auto) opens a naked position
+        on a flat book.
+        """
         if not self._live_runner:
             return
         symbol = self._live_runner.symbol
         order_symbol = resolve_order_symbol(symbol)
-        # Priority: real API position > last real order > simulated broker
-        pos = self._account_monitor.first_open_position()
-        if pos:
-            # Use real position from API (skip qty=0 / ## leftover rows)
-            buy_sell = 1 if pos["side"] == "B" else 0  # B(long)→SELL, S(short)→BUY
-        elif self._last_real_order_side is not None:
-            buy_sell = 1 - self._last_real_order_side
-        elif self._live_runner.broker.position_size != 0:
-            side = self._live_runner.broker.position_side.value if self._live_runner.broker.position_side else "LONG"
-            buy_sell = 1 if side == "LONG" else 0
-        else:
+        # Same prefix as _get_signed_position (first 2 chars of the
+        # configured order symbol): TM / TX / MT.
+        cfg_order = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+        prefix = cfg_order[:2] if cfg_order else ""
+        monitor = self._account_monitor
+        broker = self._live_runner.broker
+        signed = monitor.get_signed_position(prefix, FUTURES_OI_MARKET)
+        buy_sell = close_order_side(
+            monitor.positions,
+            prefix,
+            signed,
+            self._last_real_order_side,
+            snapshot_received=monitor.oi_snapshot_received,
+            market=FUTURES_OI_MARKET,
+            sim_size=broker.position_size,
+            sim_side=(broker.position_side.value if broker.position_side else None),
+        )
+        if buy_sell is None:
             self._live_log_msg("無持倉紀錄 No position record — use BUY or SELL directly", "status")
             return
         order_desc = "平倉賣 CLOSE SELL" if buy_sell == 1 else "平倉買 CLOSE BUY"
         price, price_src = self._get_latest_price()
-        self._show_order_confirm_dialog(buy_sell, order_symbol, order_desc, price, action_type="exit", price_source=price_src)
+        self._show_order_confirm_dialog(
+            buy_sell, order_symbol, order_desc, price,
+            action_type="exit", price_source=price_src, new_close=1)
 
     def _update_manual_order_buttons(self):
         """Enable/disable manual order buttons based on live state."""
