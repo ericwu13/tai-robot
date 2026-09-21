@@ -54,6 +54,25 @@ class TestParseOpenInterest:
         raw = "F,ACCOUNT,TXF4,B,notanum,0,22500.0,120,0.0002,USER"
         assert parse_open_interest(raw) is None
 
+    def test_end_of_data_terminator_rejected(self):
+        """Issue #139: Capital sends ``##`` as OI end-of-data after
+        ``001,查無資料``. Pre-fix this parsed as qty=0 / empty side
+        (dialog: 「空 SHORT x0」). Same sentinel as parse_future_rights.
+        """
+        raw = "##," + "," * 50
+        assert parse_open_interest(raw) is None
+
+    def test_end_of_data_does_not_overlay_flat_snapshot(self):
+        """001 set_flat then ## must not append a fake position."""
+        m = AccountMonitor()
+        m.set_flat()
+        parsed = parse_open_interest("##," + "," * 50)
+        if parsed:
+            m.add_position(parsed)
+        assert parsed is None
+        assert m.positions == []
+        assert m.oi_snapshot_received is True
+
 
 # ── parse_future_rights ──
 
@@ -171,6 +190,59 @@ class TestPositionTracking:
         m.add_position({"product": "TXF4", "side": "B", "qty": 2, "avg_cost": "22500"})
         m.add_position({"product": "TXG4", "side": "B", "qty": 1, "avg_cost": "22600"})
         assert m.get_signed_position("TX") == 2
+
+
+# ── has_open_positions (issue #139 — zero-qty Existing Position) ──
+
+class TestHasOpenPositions:
+    """Deploy confirm used ``if self._account_monitor.positions:``.
+
+    Confirmed (#139 debug_20260920.log): Capital follows ``001,查無資料``
+    with a ``##`` end-of-data terminator. Pre-fix parse_open_interest
+    ingested that row as qty=0 / empty side, so the list was truthy and
+    the dialog showed 「空 SHORT x0」. Distinct from #107 (ghost
+    *non-zero* 持倉 after resume).
+    """
+
+    def test_zero_qty_row_is_not_an_open_position(self):
+        """Would fail against ``bool(monitor.positions)`` — the inventing path."""
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 0, "avg_cost": "0"})
+        assert m.positions, "pre-fix inventing path: list is truthy"
+        assert m.oi_snapshot_received is True
+        assert m.has_open_positions() is False
+
+    def test_nonzero_qty_is_an_open_position(self):
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 1, "avg_cost": "44000"})
+        assert m.has_open_positions() is True
+
+    def test_empty_list_is_not_an_open_position(self):
+        m = AccountMonitor()
+        m.set_flat()
+        assert m.has_open_positions() is False
+
+    def test_mixed_rows_any_nonzero(self):
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 0, "avg_cost": "0"})
+        m.add_position({"product": "TXF00", "side": "B", "qty": 1, "avg_cost": "22500"})
+        assert m.has_open_positions() is True
+
+    def test_missing_qty_defaults_to_flat(self):
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S"})
+        assert m.has_open_positions() is False
+
+    def test_first_open_position_skips_zero_qty(self):
+        """_manual_close must not derive an order from a qty=0 OI row."""
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 0, "avg_cost": "0"})
+        assert m.first_open_position() is None
+        m.add_position({"product": "TXF00", "side": "B", "qty": 1, "avg_cost": "22500"})
+        pos = m.first_open_position()
+        assert pos is not None
+        assert pos["qty"] == 1
+        assert pos["side"] == "B"
 
 
 # ── OpenInterest snapshot flag (resume-reconcile race fix) ──

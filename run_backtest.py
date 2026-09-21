@@ -6306,9 +6306,11 @@ class BacktestApp:
                     "as UNKNOWN"
                 )
             if trading_mode in ("semi_auto", "auto") and self._futures_account:
-                if self._account_monitor.positions:
+                if self._account_monitor.has_open_positions():
                     pos_parts = []
                     for p in self._account_monitor.positions:
+                        if p.get("qty", 0) == 0:
+                            continue
                         side = "多 LONG" if p["side"] == "B" else "空 SHORT"
                         pos_parts.append(f"{side} x{p['qty']} {p['product']}")
                     pos_str = ", ".join(pos_parts)
@@ -8679,9 +8681,9 @@ class BacktestApp:
         symbol = self._live_runner.symbol
         order_symbol = resolve_order_symbol(symbol)
         # Priority: real API position > last real order > simulated broker
-        if self._account_monitor.positions:
-            # Use real position from API
-            pos = self._account_monitor.positions[0]
+        pos = self._account_monitor.first_open_position()
+        if pos:
+            # Use real position from API (skip qty=0 / ## leftover rows)
             buy_sell = 1 if pos["side"] == "B" else 0  # B(long)→SELL, S(short)→BUY
         elif self._last_real_order_side is not None:
             buy_sell = 1 - self._last_real_order_side

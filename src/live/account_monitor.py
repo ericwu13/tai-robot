@@ -43,11 +43,11 @@ class FillsResult:
 def parse_open_interest(bstr: str) -> dict | None:
     """Parse OnOpenInterest callback data into a dict.
 
-    Returns None for error/empty codes (001, 970).
+    Returns None for error/empty/end-of-data codes (001, 970, 980, ##).
     Fields: product, side(B/S), qty, daytrade_qty, avg_cost, fee, tax_rate
     """
     vals = bstr.split(",")
-    if len(vals) < 10 or vals[0] in ("001", "970", "980"):
+    if len(vals) < 10 or vals[0].strip() in ("001", "970", "980", "##"):
         return None
     try:
         return {
@@ -204,6 +204,29 @@ class AccountMonitor:
                 qty = p.get("qty", 0)
                 return qty if p.get("side") == "B" else -qty
         return 0
+
+    def has_open_positions(self) -> bool:
+        """True if any stored OI row has non-zero qty.
+
+        Confirmed (#139 debug_20260920.log): Capital follows
+        ``001,查無資料`` with a ``##`` end-of-data terminator. Pre-fix
+        ``parse_open_interest`` ingested that row as qty=0 / empty side,
+        so a truthy ``positions`` list showed 「空 SHORT x0」 on
+        load-existing. Distinct from #107 (ghost *non-zero* 持倉 after
+        resume).
+        """
+        return any(p.get("qty", 0) != 0 for p in self.positions)
+
+    def first_open_position(self) -> dict | None:
+        """First OI row with non-zero qty, or None if the book is flat.
+
+        Used by ``_manual_close`` so a qty=0 / leftover terminator row
+        cannot pick the close side (issue #139).
+        """
+        for p in self.positions:
+            if p.get("qty", 0) != 0:
+                return p
+        return None
 
     # ── Display computation ──
 
