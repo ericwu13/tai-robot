@@ -16,6 +16,10 @@ from src.live.account_monitor import (
     parse_future_rights,
     fmt_money,
     resume_real_position_ok,
+    FUTURES_OI_MARKET,
+    close_order_side,
+    oi_product_match,
+    product_signed_position,
 )
 
 
@@ -61,6 +65,17 @@ class TestParseOpenInterest:
         """
         raw = "##," + "," * 50
         assert parse_open_interest(raw) is None
+
+    def test_market_code_is_kept(self):
+        """Issue #145: field 0 is the market (TF futures, TO options)."""
+        opt = parse_open_interest("TO,ACCT,TX146500F6,B,1,0,500.0,15,2,ID")
+        assert opt is not None
+        assert opt["market"] == "TO"
+        assert opt["product"] == "TX146500F6"
+        fut = parse_open_interest("TF,ACCT,TM0000,S,1,0,44774.0,15,2,ID")
+        assert fut["market"] == "TF"
+        assert fut["side"] == "S"
+        assert fut["qty"] == 1
 
     def test_end_of_data_does_not_overlay_flat_snapshot(self):
         """001 set_flat then ## must not append a fake position."""
@@ -243,6 +258,155 @@ class TestHasOpenPositions:
         assert pos is not None
         assert pos["qty"] == 1
         assert pos["side"] == "B"
+
+
+# Short, so a missed market filter cannot hide behind the same side as
+# the long futures rows below.
+_TO_OPTION = {
+    "market": "TO", "product": "TX146500F6", "side": "S", "qty": 1,
+}
+_TF_TM_LONG = {
+    "market": "TF", "product": "TM0000", "side": "B", "qty": 1,
+}
+_TF_TM_SHORT = {
+    "market": "TF", "product": "TM0000", "side": "S", "qty": 1,
+}
+_TF_TM_ZERO = {
+    "market": "TF", "product": "TM0000", "side": "S", "qty": 0,
+}
+_TF_TX_LONG = {
+    "market": "TF", "product": "TXFD0", "side": "B", "qty": 1,
+}
+
+
+class TestCloseOrderSide:
+    """Issue #145. Pre-fix, ``first_open_position()`` returned any non-zero
+    row, so a TO option picked the close side for a flat futures book.
+    """
+
+    def test_foreign_option_is_not_this_product(self):
+        assert oi_product_match(_TO_OPTION, "TM", FUTURES_OI_MARKET) is False
+        assert product_signed_position([_TO_OPTION], "TM", FUTURES_OI_MARKET) == 0
+        assert close_order_side(
+            [_TO_OPTION], "TM", 0, last_side=0,
+            snapshot_received=True, market=FUTURES_OI_MARKET,
+            sim_size=1, sim_side="LONG",
+        ) is None
+
+    def test_same_prefix_option_is_not_a_future(self):
+        """TX option starts with TX. Prefix-only signed qty is the option."""
+        assert product_signed_position([_TO_OPTION], "TX") == -1
+        assert product_signed_position(
+            [_TO_OPTION], "TX", FUTURES_OI_MARKET) == 0
+        assert close_order_side(
+            [_TO_OPTION], "TX", 0, last_side=0,
+            snapshot_received=True, market=FUTURES_OI_MARKET,
+        ) is None
+
+    def test_prefix_only_signed_cannot_invent_a_side(self):
+        """Contaminated signed=+1 (option counted) still refuses: no TF row."""
+        assert close_order_side(
+            [_TO_OPTION], "TX", signed=1, last_side=0,
+            snapshot_received=True, market=FUTURES_OI_MARKET,
+        ) is None
+
+    def test_matching_future_side_ignores_option_row(self):
+        rows = [_TO_OPTION, _TF_TM_LONG]
+        signed = product_signed_position(rows, "TM", FUTURES_OI_MARKET)
+        assert signed == 1
+        assert close_order_side(
+            rows, "TM", signed, snapshot_received=True,
+            market=FUTURES_OI_MARKET,
+        ) == 1  # SELL
+
+    def test_short_future_buys(self):
+        signed = product_signed_position([_TF_TM_SHORT], "TM", FUTURES_OI_MARKET)
+        assert signed == -1
+        assert close_order_side(
+            [_TF_TM_SHORT], "TM", signed, snapshot_received=True,
+            market=FUTURES_OI_MARKET,
+        ) == 0
+
+    def test_tx_future_not_the_option_beside_it(self):
+        rows = [_TO_OPTION, _TF_TX_LONG]
+        signed = product_signed_position(rows, "TX", FUTURES_OI_MARKET)
+        assert signed == 1
+        assert close_order_side(
+            rows, "TX", signed, snapshot_received=True,
+            market=FUTURES_OI_MARKET,
+        ) == 1
+
+    def test_zero_qty_does_not_mask_a_later_real_row(self):
+        rows = [_TF_TM_ZERO, _TO_OPTION, _TF_TM_LONG]
+        signed = product_signed_position(rows, "TM", FUTURES_OI_MARKET)
+        assert signed == 1
+        assert close_order_side(
+            rows, "TM", signed=0, snapshot_received=True,
+            market=FUTURES_OI_MARKET,
+        ) == 1
+
+    def test_flat_snapshot_refuses_last_side_and_sim(self):
+        assert close_order_side(
+            [], "TM", 0, last_side=0, snapshot_received=True,
+            market=FUTURES_OI_MARKET, sim_size=1, sim_side="LONG",
+        ) is None
+
+    def test_unknown_book_reverses_last_side(self):
+        assert close_order_side(
+            [], "TM", 0, last_side=0, snapshot_received=False,
+            market=FUTURES_OI_MARKET,
+        ) == 1
+        assert close_order_side(
+            [], "TM", 0, last_side=1, snapshot_received=False,
+            market=FUTURES_OI_MARKET,
+        ) == 0
+
+    def test_unknown_book_reverses_sim_side(self):
+        assert close_order_side(
+            [], "TM", 0, snapshot_received=False, market=FUTURES_OI_MARKET,
+            sim_size=1, sim_side="SHORT",
+        ) == 0
+        assert close_order_side(
+            [], "TM", 0, snapshot_received=False, market=FUTURES_OI_MARKET,
+            sim_size=1, sim_side="LONG",
+        ) == 1
+
+    def test_unknown_book_with_nothing_refuses(self):
+        assert close_order_side(
+            [], "TM", 0, snapshot_received=False, market=FUTURES_OI_MARKET,
+        ) is None
+
+    def test_empty_prefix_matches_nothing(self):
+        assert close_order_side(
+            [_TF_TM_LONG], "", 0, last_side=0, snapshot_received=True,
+            market=FUTURES_OI_MARKET,
+        ) is None
+
+    def test_first_open_position_filter(self):
+        m = AccountMonitor()
+        m.add_position(dict(_TO_OPTION))
+        m.add_position(dict(_TF_TM_LONG))
+        # Unfiltered still returns the first non-zero row (any product).
+        assert m.first_open_position()["product"] == "TX146500F6"
+        assert m.first_open_position("TM", FUTURES_OI_MARKET)["product"] == "TM0000"
+        assert m.first_open_position("TX", FUTURES_OI_MARKET) is None
+        assert m.first_open_position("TX", "TO")["market"] == "TO"
+
+    def test_get_signed_position_market_is_opt_in(self):
+        """Prefix-only scan is unchanged for resume / fill-poll."""
+        m = AccountMonitor()
+        m.add_position(dict(_TO_OPTION))
+        m.add_position(dict(_TF_TM_ZERO))
+        m.add_position(dict(_TF_TX_LONG))
+        assert m.get_signed_position("TX") == -1  # short option, first TX hit
+        assert m.get_signed_position("TX", market=FUTURES_OI_MARKET) == 1
+        assert m.get_signed_position("TM") == 0  # qty=0 first TM row
+        assert m.get_signed_position("TM", market=FUTURES_OI_MARKET) == 0
+        m.add_position({
+            "market": "TF", "product": "TM0000", "side": "B", "qty": 2,
+        })
+        assert m.get_signed_position("TM") == 0  # still the qty=0 row
+        assert m.get_signed_position("TM", market=FUTURES_OI_MARKET) == 2
 
 
 # ── OpenInterest snapshot flag (resume-reconcile race fix) ──

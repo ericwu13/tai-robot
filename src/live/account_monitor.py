@@ -51,6 +51,7 @@ def parse_open_interest(bstr: str) -> dict | None:
         return None
     try:
         return {
+            "market": vals[0].strip(),      # TF=futures, TO=options
             "product": vals[2].strip(),
             "side": vals[3].strip(),        # B=long, S=short
             "qty": int(vals[4].strip() or 0),
@@ -92,6 +93,103 @@ def parse_future_rights(bstr: str) -> dict | None:
         }
     except (ValueError, IndexError):
         return None
+
+
+# Capital OnOpenInterest field 0. TF = futures, TO = options. A TX option
+# (``TO``, product ``TX…``) shares the ``TX`` prefix with TX futures, so a
+# prefix check alone cannot tell them apart (issue #145).
+FUTURES_OI_MARKET = "TF"
+
+
+def oi_product_match(row: dict, prefix: str, market: str | None = None) -> bool:
+    """True when ``row`` is a non-zero position in this product.
+
+    ``prefix`` is the order-symbol prefix (``TM``, ``TX``, ``MT``).
+    ``market`` is the OI market code; pass :data:`FUTURES_OI_MARKET` to
+    ignore options and any other book. An empty prefix matches nothing
+    (``startswith("")`` would match every product).
+    """
+    if not prefix or not isinstance(row, dict):
+        return False
+    product = row.get("product", "") or ""
+    if not str(product).startswith(prefix):
+        return False
+    if market is not None and str(row.get("market", "") or "").strip() != market:
+        return False
+    return row.get("qty", 0) != 0
+
+
+def product_signed_position(positions: list[dict], prefix: str,
+                            market: str | None = None) -> int:
+    """Signed qty of the first non-zero row for this prefix and market.
+
+    Positive = long, negative = short, 0 = flat. Qty=0 rows are skipped
+    so a leftover flat line cannot mask a later real row.
+    """
+    if not prefix:
+        return 0
+    for row in positions:
+        if not oi_product_match(row, prefix, market):
+            continue
+        qty = row.get("qty", 0) or 0
+        try:
+            qty = int(qty)
+        except (TypeError, ValueError):
+            continue
+        return qty if row.get("side") == "B" else -qty
+    return 0
+
+
+def close_order_side(
+    positions: list[dict],
+    prefix: str,
+    signed: int,
+    last_side: int | None = None,
+    *,
+    snapshot_received: bool = False,
+    market: str | None = None,
+    sim_size: int = 0,
+    sim_side: str | None = None,
+) -> int | None:
+    """Buy/sell code that flattens this bot's product, or None to refuse.
+
+    Returns ``0`` (BUY) or ``1`` (SELL). Issue #145.
+
+    A non-zero OI row for this ``prefix`` + ``market`` supplies the side
+    (long → SELL, short → BUY). Any other row — a TO option, a different
+    prefix, a qty=0 line — is ignored.
+
+    When an OpenInterest snapshot has landed and there is no such row,
+    refuse. ``signed == 0`` is that flat book: do not fall through to
+    ``last_side`` or the simulated broker. Those fallbacks on a flat
+    account used to send a close, and ``sNewClose=2`` (auto) opens a
+    naked position. ``signed`` must be this product's qty
+    (:func:`product_signed_position`), not a prefix-only scan.
+
+    A matching row wins over a stale ``signed`` of 0, so a qty=0 line
+    that an unfiltered scan reported as flat cannot hide a later real row.
+
+    Fallbacks run only when no snapshot has arrived (the book is unknown):
+    reverse ``last_side`` (0=BUY, 1=SELL), else reverse the sim side.
+    """
+    for row in positions or ():
+        if oi_product_match(row, prefix, market):
+            return 1 if row.get("side") == "B" else 0
+
+    if snapshot_received and signed == 0:
+        return None
+    if snapshot_received:
+        # Answered book, no row for this product. A non-zero ``signed``
+        # here was not computed from these rows (e.g. a prefix-only scan
+        # that counted an option). Do not invent a side from it.
+        return None
+
+    if last_side is not None:
+        return 1 - int(last_side)
+    if sim_size != 0:
+        side = (sim_side or "LONG").strip().upper()
+        return 1 if side == "LONG" else 0
+    return None
 
 
 def resume_real_position_ok(signed_pos: int, sim_side: str,
@@ -191,14 +289,22 @@ class AccountMonitor:
         """Store parsed future rights data."""
         self.rights = parsed
 
-    def get_signed_position(self, prefix: str) -> int:
+    def get_signed_position(self, prefix: str, market: str | None = None) -> int:
         """Get signed position qty matching a symbol prefix.
 
         Positive = long, negative = short, 0 = flat.
         Prefix is typically first 2 chars of order symbol (e.g., "TX", "TM").
+
+        Without ``market``, the first prefix match is returned, including a
+        qty=0 row. Resume reconcile and fill-poll depend on that. Pass
+        ``market`` (``TF`` for this bot's futures) to skip other markets
+        and qty=0 rows — a TX option must not count as a TX future
+        (issue #145).
         """
         if not prefix:
             return 0
+        if market is not None:
+            return product_signed_position(self.positions, prefix, market)
         for p in self.positions:
             if p.get("product", "").startswith(prefix):
                 qty = p.get("qty", 0)
@@ -217,14 +323,22 @@ class AccountMonitor:
         """
         return any(p.get("qty", 0) != 0 for p in self.positions)
 
-    def first_open_position(self) -> dict | None:
-        """First OI row with non-zero qty, or None if the book is flat.
+    def first_open_position(self, prefix: str | None = None,
+                            market: str | None = None) -> dict | None:
+        """First OI row with non-zero qty, or None if nothing matches.
 
-        Used by ``_manual_close`` so a qty=0 / leftover terminator row
-        cannot pick the close side (issue #139).
+        No arguments: any non-zero row (issue #139 — skip qty=0 / ``##``).
+        With ``prefix`` and/or ``market``: only this product. A TO option
+        must not be returned for a TF futures close (issue #145). The
+        manual-close decision itself is :func:`close_order_side`.
         """
+        if prefix is None and market is None:
+            for p in self.positions:
+                if p.get("qty", 0) != 0:
+                    return p
+            return None
         for p in self.positions:
-            if p.get("qty", 0) != 0:
+            if oi_product_match(p, prefix or "", market):
                 return p
         return None
 

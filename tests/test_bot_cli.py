@@ -110,10 +110,153 @@ def test_deploy_existing_position_gates_on_nonzero_qty():
 
 
 def test_manual_close_skips_zero_qty_before_deriving_order():
-    """Issue #139: a qty=0 / ## terminator row must not pick close side."""
+    """Issue #139 / #145: qty=0 rows and foreign products must not pick the side.
+
+    The close decision lives in ``close_order_side`` (prefix + futures
+    market). The button passes ``new_close=1`` (explicit close). A
+    ``positions[0]`` read is the pre-#139 inventing path.
+    """
     src = inspect.getsource(rb.BacktestApp._manual_close)
     assert "positions[0]" not in src
-    assert "first_open_position" in src
+    assert "close_order_side" in src
+    assert "new_close=1)" in src
+
+
+def _manual_close_harness(symbol, *, rows=(), flat=False, last_side=None,
+                          sim_size=0, sim_side=None):
+    """Call ``_manual_close`` without Tk. Returns (dialogs, logs)."""
+    from src.live.account_monitor import AccountMonitor, parse_open_interest
+
+    monitor = AccountMonitor()
+    if flat:
+        monitor.set_flat()
+    for raw in rows:
+        parsed = parse_open_interest(raw)
+        assert parsed is not None, raw
+        monitor.add_position(parsed)
+    dialogs = []
+    logs = []
+    side_obj = None if sim_side is None else SimpleNamespace(value=sim_side)
+    app = SimpleNamespace(
+        _live_runner=SimpleNamespace(
+            symbol=symbol,
+            broker=SimpleNamespace(position_size=sim_size, position_side=side_obj),
+        ),
+        _account_monitor=monitor,
+        _last_real_order_side=last_side,
+        _show_order_confirm_dialog=lambda *a, **k: dialogs.append((a, k)),
+        _get_latest_price=lambda: (44774, "tick"),
+        _live_log_msg=lambda msg, tag="status": logs.append((msg, tag)),
+    )
+    rb.BacktestApp._manual_close(app)
+    return dialogs, logs
+
+
+# Short option. A wrong pick would BUY; the futures rows below are long
+# and must SELL. Same side on both rows would hide a missed market filter.
+_TO_OPTION = "TO,ACCT,TX146500F6,S,1,0,500.0,15,2,ID"
+_TF_TM_LONG = "TF,ACCT,TM0000,B,1,0,44774.0,15,2,ID"
+_TF_TM_SHORT = "TF,ACCT,TM0000,S,1,0,44774.0,15,2,ID"
+_TF_TM_ZERO = "TF,ACCT,TM0000,S,0,0,0,0,0,ID"
+_TF_TX_LONG = "TF,ACCT,TXFD0,B,1,0,22500.0,15,2,ID"
+
+
+def test_manual_close_ignores_foreign_option_on_flat_futures():
+    """Issue #145: a lone TO option must not SELL TM futures.
+
+    Pre-fix ``first_open_position()`` returned that row (qty != 0) and
+    the dialog proposed 平倉賣 with the default ``new_close=2``, which
+    opens a naked short on a flat futures book.
+    """
+    dialogs, logs = _manual_close_harness("TMF00", rows=(_TO_OPTION,))
+    assert dialogs == []
+    assert logs and "No position record" in logs[0][0]
+
+
+def test_manual_close_same_prefix_option_is_not_a_tx_future():
+    """Issue #145: TX options share the TX prefix. Market TO must not close TX."""
+    dialogs, _logs = _manual_close_harness("TX00", rows=(_TO_OPTION,))
+    assert dialogs == []
+
+
+def test_manual_close_zero_qty_future_plus_option_does_not_order():
+    """Issue #139 qty=0 skip must not then fall through to a TO option."""
+    dialogs, _logs = _manual_close_harness(
+        "TMF00", rows=(_TF_TM_ZERO, _TO_OPTION))
+    assert dialogs == []
+
+
+def test_manual_close_zero_qty_row_does_not_hide_a_later_future():
+    """A qty=0 TM line before the real long must still SELL, new_close=1."""
+    dialogs, _logs = _manual_close_harness(
+        "TMF00", rows=(_TF_TM_ZERO, _TO_OPTION, _TF_TM_LONG))
+    assert len(dialogs) == 1
+    args, kwargs = dialogs[0]
+    assert args[0] == 1
+    assert kwargs.get("new_close") == 1
+
+
+def test_manual_close_uses_this_product_side_and_explicit_close():
+    """Matching TF long → SELL, and the close button passes new_close=1.
+
+    Pre-fix the dialog omitted ``new_close``, so the default 2 (auto) applied.
+    """
+    dialogs, _logs = _manual_close_harness(
+        "TMF00", rows=(_TO_OPTION, _TF_TM_LONG))
+    assert len(dialogs) == 1
+    args, kwargs = dialogs[0]
+    assert args[0] == 1  # SELL to close a long
+    assert args[1] == "TM0000"
+    assert kwargs.get("action_type") == "exit"
+    assert kwargs.get("new_close") == 1
+
+
+def test_manual_close_short_future_buys_with_new_close_1():
+    dialogs, _logs = _manual_close_harness("TMF00", rows=(_TF_TM_SHORT,))
+    assert len(dialogs) == 1
+    args, kwargs = dialogs[0]
+    assert args[0] == 0  # BUY to close a short
+    assert kwargs.get("new_close") == 1
+
+
+def test_manual_close_refuses_flat_snapshot_despite_last_order_side():
+    """Known-flat book must not fall through to ``_last_real_order_side``.
+
+    Pre-fix that fallback still proposed a close, and sNewClose=2 opened
+    a naked position.
+    """
+    dialogs, _logs = _manual_close_harness(
+        "TMF00", flat=True, last_side=0, sim_size=1, sim_side="LONG")
+    assert dialogs == []
+
+
+def test_manual_close_unknown_snapshot_still_uses_last_side():
+    """No OI answer yet: keep the last-real-order fallback, but new_close=1."""
+    dialogs, _logs = _manual_close_harness("TMF00", last_side=0)
+    assert len(dialogs) == 1
+    args, kwargs = dialogs[0]
+    assert args[0] == 1  # last order was BUY → close SELL
+    assert kwargs.get("new_close") == 1
+
+
+def test_manual_close_unknown_snapshot_uses_sim_side():
+    dialogs, _logs = _manual_close_harness(
+        "TMF00", sim_size=1, sim_side="SHORT")
+    assert len(dialogs) == 1
+    args, kwargs = dialogs[0]
+    assert args[0] == 0  # sim short → BUY to close
+    assert kwargs.get("new_close") == 1
+
+
+def test_manual_close_tx_future_not_the_option_row():
+    """Same prefix, both rows present: side comes from the TF future."""
+    dialogs, _logs = _manual_close_harness(
+        "TX00", rows=(_TO_OPTION, _TF_TX_LONG))
+    assert len(dialogs) == 1
+    args, kwargs = dialogs[0]
+    assert args[0] == 1
+    assert args[1] == "TXFD0"
+    assert kwargs.get("new_close") == 1
 
 
 # ── HeadlessPolicy ──
