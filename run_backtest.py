@@ -131,8 +131,10 @@ from src.ui.theme import (
 )
 from src.ui.widgets import (
     FlowFrame, ScrollableFrame, StatCard, StatusDot, TagTextLog,
-    attach_tooltip, enable_row_hover, place_dialog, scrolled_tree,
-    themed_scrolled_text,
+    attach_tooltip, composer_value, enable_row_hover,
+    install_composer_placeholder, place_dialog, refresh_composer_placeholder,
+    scrolled_tree, status_strip_padding, themed_scrolled_text,
+    window_resize_insets,
 )
 from src.ui.labels import CHAT_PLACEHOLDER, READY, REPORT_EMPTY
 from src.data_sources.taifex import fetch_futures_daily, parse_taifex_csv
@@ -1156,28 +1158,37 @@ class BacktestApp:
         """Bottom strip: latest status message + last-20 history button.
 
         The connection dot lives in the top bar (``_build_top_bar``).
+
+        Win10/11 thick frames report HTBOTTOM / HTBOTTOMRIGHT over the
+        outer client pixels. Buttons packed against that edge miss hover
+        and start a window drag — the sluggish History / Report Issue /
+        Check for Updates targets (issue #139 item 3). Padding clears
+        that band; the ghost buttons themselves get a taller hit box.
         """
-        strip = ttk.Frame(parent, style="StatusStrip.TFrame",
-                          padding=S(16, 3, 8, 3))
+        strip = ttk.Frame(
+            parent, style="StatusStrip.TFrame",
+            padding=status_strip_padding(window_resize_insets()))
         strip.pack(side=tk.BOTTOM, fill=tk.X)
+        self._status_strip = strip
         # Packed after the strip so the hairline sits *above* it (pack BOTTOM).
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="初始化中 Initializing...")
         self._status_msg_label = ttk.Label(
             strip, textvariable=self.status_var, style="StatusStrip.Dim.TLabel")
         self._status_msg_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        hit = dict(style="Bar.Ghost.TButton", padding=S(12, 8), cursor="hand2")
         self.btn_update = ttk.Button(
-            strip, text="檢查更新 Check for Updates", style="Bar.Ghost.TButton",
-            command=self._start_update)
+            strip, text="檢查更新 Check for Updates",
+            command=self._start_update, **hit)
         self.btn_update.pack(side=tk.RIGHT)
         attach_tooltip(self.btn_update,
                        "請先停止所有機器人\nStop all running bots first")
         self.btn_report = ttk.Button(
-            strip, text="回報問題 Report Issue", style="Bar.Ghost.TButton",
-            command=self._report_issue)
+            strip, text="回報問題 Report Issue",
+            command=self._report_issue, **hit)
         self.btn_report.pack(side=tk.RIGHT)
-        ttk.Button(strip, text="紀錄 History", style="Bar.Ghost.TButton",
-                   command=self._show_status_history).pack(side=tk.RIGHT)
+        ttk.Button(strip, text="紀錄 History",
+                   command=self._show_status_history, **hit).pack(side=tk.RIGHT)
 
     def _oi_wait_must_block(self) -> bool:
         """Headless (or unmapped) roots cannot pump an after() OI poll.
@@ -1783,9 +1794,12 @@ class BacktestApp:
                                   command=command))
 
         # ── Chat display: prose in the UI font, code in mono ──
+        # No transcript placeholder. A hint centered in this well
+        # (rely=0.42) sits far above the caret on a tall pane — the
+        # anti-ergonomic prompt in issue #139 item 4. The hint lives in
+        # the composer, on the first line, next to Send.
         self.chat_display = TagTextLog(
             parent, tags=CHAT_TAGS, show_toolbar=False,
-            placeholder=CHAT_PLACEHOLDER,
             font=FONTS.get("body") or ("", 10),
         )
         self.chat_display.config(spacing1=S(1), spacing3=S(1))
@@ -1796,18 +1810,24 @@ class BacktestApp:
             "code", foreground=CHAT_TAGS["code"]["foreground"],
             font=FONTS.get("mono_small") or ("Consolas", 9))
 
-        # ── Input: a well that lights up while focused ──
+        # ── Composer: hint on the caret line, Send on the same row ──
+        composer = ttk.Frame(parent)
+        self._chat_composer = composer
         input_well, self.chat_input = themed_scrolled_text(
-            parent, height=3, font=FONTS.get("body") or ("", 10),
+            composer, height=4, font=FONTS.get("body") or ("", 10),
             focus_ring=True, scrollbar=False)
+        self._chat_input_well = input_well
+        install_composer_placeholder(self.chat_input, CHAT_PLACEHOLDER)
         self.chat_input.bind("<Return>", self._on_chat_enter)
         self.chat_input.bind("<Shift-Return>", lambda e: None)  # allow newline
+        input_well.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.btn_send = ttk.Button(
+            composer, text="Send", style="Accent.TButton",
+            command=self._send_chat)
+        self.btn_send.pack(side=tk.RIGHT, fill=tk.Y, padx=S(8, 0))
 
-        # ── Action buttons ──
+        # ── Secondary actions (Send is on the composer row) ──
         btn_frame = ttk.Frame(parent)
-        self.btn_send = ttk.Button(btn_frame, text="Send", style="Accent.TButton",
-                                   command=self._send_chat)
-        self.btn_send.pack(side=tk.LEFT, padx=S(0, 6))
         self.btn_generate = ttk.Button(btn_frame, text="Generate Strategy",
                                        command=self._generate_strategy, state=tk.NORMAL)
         self.btn_generate.pack(side=tk.LEFT, padx=S(0, 6))
@@ -1838,7 +1858,7 @@ class BacktestApp:
         # rest, so a short window shrinks the chat, never the controls.
         saved_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=S(8, 0))
         btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=S(8, 0))
-        input_well.pack(side=tk.BOTTOM, fill=tk.X, pady=S(8, 0))
+        composer.pack(side=tk.BOTTOM, fill=tk.X, pady=S(8, 0))
         self.chat_display.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
     def _build_control_panel(self, parent):
@@ -2263,13 +2283,15 @@ class BacktestApp:
 
     def _send_chat(self):
         """Send chat message to Claude in a background thread."""
-        text = self.chat_input.get("1.0", tk.END).strip()
+        text = composer_value(self.chat_input)
         if not text:
+            refresh_composer_placeholder(self.chat_input)
             return
         if not self._ensure_chat_client():
             return
 
         self.chat_input.delete("1.0", tk.END)
+        refresh_composer_placeholder(self.chat_input)
         self._append_chat("user", text)
 
         # Disable send while waiting

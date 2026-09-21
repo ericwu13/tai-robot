@@ -315,6 +315,96 @@ def place_dialog(win, parent, width: int | None = None,
         pass
 
 
+def tooltip_origin(anchor: tuple[int, int, int, int],
+                   tip: tuple[int, int],
+                   screen: tuple[int, int, int, int],
+                   gap: int = 6) -> tuple[int, int]:
+    """Top-left for a tooltip under ``anchor`` (x, y, w, h).
+
+    Flips above the control when the below slot would leave ``screen``
+    (left, top, right, bottom). A status-strip button sits on the bottom
+    edge; opening under it lands off the work area, and the window
+    manager clamps the tip back onto the button. That Enter/Leave loop
+    is the sluggish hit on Check for Updates (issue #139 item 3).
+    """
+    ax, ay, _aw, ah = anchor
+    tw, th = tip
+    left, top, right, bottom = screen
+    x = ax
+    y_below = ay + ah + gap
+    if y_below + th > bottom:
+        y = ay - gap - th
+    else:
+        y = y_below
+    if y < top:
+        y = top
+    if x + tw > right:
+        x = right - tw
+    if x < left:
+        x = left
+    return x, y
+
+
+def resize_insets_from_metrics(metrics) -> tuple[int, int, int]:
+    """(left, right, bottom) client pixels a thick frame claims for resize.
+
+    ``metrics`` is ``GetSystemMetrics``. Indexes: SM_CXFRAME 32,
+    SM_CYFRAME 33, SM_CXPADDEDBORDER 92, SM_CYPADDEDBORDER 93,
+    SM_CXVSCROLL 2. The right inset is the corner grip — at least a
+    scrollbar wide — so a button packed into the bottom-right is not
+    HTBOTTOMRIGHT (a window drag). Values are already device pixels.
+    """
+    frame_x = max(0, int(metrics(32)))
+    frame_y = max(0, int(metrics(33)))
+    pad_x = max(0, int(metrics(92)))
+    pad_y = max(0, int(metrics(93)))
+    grip = max(0, int(metrics(2)))
+    edge_x = frame_x + pad_x
+    edge_y = frame_y + pad_y
+    return (edge_x, max(edge_x, grip), edge_y)
+
+
+def window_resize_insets() -> tuple[int, int, int]:
+    """Resize/drag insets for this process. Zeros off Windows.
+
+    Headless and the GUI share the builder, so this must not require a
+    mapped window. A withdrawn root still gets the same padding.
+    """
+    if sys.platform != "win32":
+        return (0, 0, 0)
+    try:
+        import ctypes
+        return resize_insets_from_metrics(
+            ctypes.windll.user32.GetSystemMetrics)
+    except Exception:
+        return (0, 0, 0)
+
+
+# Logical (96-DPI) padding of the status strip before the OS drag inset.
+# Top/bottom are a step roomier than the old 3px so the ghost buttons
+# have a real hit box once the dead resize band is added underneath.
+_STATUS_STRIP_BASE = (16, 6, 8, 6)
+
+
+def status_strip_padding(insets: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    """Padding that keeps the status-strip buttons out of the drag band.
+
+    ``insets`` is ``window_resize_insets()``: (left, right, bottom)
+    device pixels. Right and bottom are added to the logical base so
+    History / Report Issue / Check for Updates are HTCLIENT (issue #139
+    item 3). The left inset is not applied — the status message stays
+    on the strip's left rhythm.
+    """
+    _left, right, bottom = insets
+    base_l, base_t, base_r, base_b = S(*_STATUS_STRIP_BASE)
+    return (
+        base_l,
+        base_t,
+        base_r + max(0, int(right)),
+        base_b + max(0, int(bottom)),
+    )
+
+
 def attach_tooltip(widget, text: str) -> None:
     """Lightweight hover tooltip on the raised surface."""
     state = {"tip": None}
@@ -322,21 +412,32 @@ def attach_tooltip(widget, text: str) -> None:
     def show(_event=None):
         if state["tip"] is not None:
             return
+        tip = None
         try:
-            x = widget.winfo_rootx() + S(12)
-            y = widget.winfo_rooty() + widget.winfo_height() + S(6)
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.configure(bg=PALETTE["border_strong"])
+            tk.Label(
+                tip, text=text,
+                background=PALETTE["bg_raised"], foreground=PALETTE["text"],
+                font=FONTS.get("small") or ("", 9),
+                justify=tk.LEFT, padx=S(10), pady=S(6), bd=0,
+            ).pack(padx=S(1), pady=S(1))
+            tip.update_idletasks()
+            area = work_area(widget)
+            x, y = tooltip_origin(
+                (widget.winfo_rootx(), widget.winfo_rooty(),
+                 max(1, widget.winfo_width()), max(1, widget.winfo_height())),
+                (tip.winfo_reqwidth(), tip.winfo_reqheight()),
+                area, gap=S(6))
+            tip.wm_geometry(f"+{x}+{y}")
         except tk.TclError:
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except tk.TclError:
+                    pass
             return
-        tip = tk.Toplevel(widget)
-        tip.wm_overrideredirect(True)
-        tip.wm_geometry(f"+{x}+{y}")
-        tip.configure(bg=PALETTE["border_strong"])
-        tk.Label(
-            tip, text=text,
-            background=PALETTE["bg_raised"], foreground=PALETTE["text"],
-            font=FONTS.get("small") or ("", 9),
-            justify=tk.LEFT, padx=S(10), pady=S(6), bd=0,
-        ).pack(padx=S(1), pady=S(1))
         state["tip"] = tip
 
     def hide(_event=None):
@@ -425,6 +526,123 @@ def themed_scrolled_text(parent, *, wrap=tk.WORD, font=None, inset: bool = True,
         text.bind("<FocusIn>", lambda _e: frame.state(["focus"]), add="+")
         text.bind("<FocusOut>", lambda _e: frame.state(["!focus"]), add="+")
     return frame, text
+
+
+# Hint tag inside a chat composer. Not buffer content for Send: composer_value
+# returns "" while this tag is present (issue #139 item 4).
+_COMPOSER_TAG = "composer_ph"
+_MODIFIER_KEYSYMS = frozenset({
+    "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+    "Meta_L", "Meta_R", "Super_L", "Super_R", "Caps_Lock", "Num_Lock",
+    "ISO_Level3_Shift", "Mode_switch",
+})
+# Keys that move the caret or leave the field. They must not wipe the hint.
+_NAV_KEYSYMS = frozenset({
+    "Left", "Right", "Up", "Down", "Home", "End", "Next", "Prior",
+    "Tab", "Escape", "Shift_L", "Shift_R",
+})
+
+
+def _composer_showing(text) -> bool:
+    try:
+        return bool(text.tag_ranges(_COMPOSER_TAG))
+    except tk.TclError:
+        return False
+
+
+def _clear_composer_placeholder(text) -> None:
+    if not _composer_showing(text):
+        return
+    try:
+        text.delete("1.0", "end")
+    except tk.TclError:
+        pass
+
+
+def composer_value(text) -> str:
+    """User text in a composer. The hint is not a message."""
+    if _composer_showing(text):
+        return ""
+    try:
+        return text.get("1.0", "end-1c").strip()
+    except tk.TclError:
+        return ""
+
+
+def refresh_composer_placeholder(text) -> None:
+    """Show the hint when the composer is empty; leave real text alone.
+
+    Safe on a withdrawn root (headless constructs the same widgets).
+    """
+    hint = getattr(text, "_composer_hint", "")
+    if not hint:
+        return
+    try:
+        if _composer_showing(text):
+            text.mark_set("insert", "1.0")
+            return
+        if text.get("1.0", "end-1c").strip():
+            return
+        text.delete("1.0", "end")
+        text.insert("1.0", hint, (_COMPOSER_TAG,))
+        text.mark_set("insert", "1.0")
+    except tk.TclError:
+        pass
+
+
+def note_composer_key(text, keysym: str, char: str = "", state: int = 0) -> None:
+    """Drop the hint before a real edit. Plain Enter leaves it.
+
+    ``<Return>`` sends via ``composer_value``, which ignores the hint, so
+    wiping it first would flash an empty box on a no-op send. Shift+Enter
+    is a newline: the hint has to go first or the newline is appended to
+    the prompt.
+    """
+    if keysym in ("Return", "KP_Enter"):
+        if int(state) & 0x1:
+            _clear_composer_placeholder(text)
+        return
+    if keysym in _MODIFIER_KEYSYMS or keysym in _NAV_KEYSYMS:
+        return
+    if char or keysym in ("BackSpace", "Delete"):
+        _clear_composer_placeholder(text)
+
+
+def install_composer_placeholder(text, placeholder: str) -> None:
+    """Gray hint on the first line of ``text``, where the caret is.
+
+    An overlay centered in the transcript sits hundreds of pixels above
+    this box on a tall pane (issue #139 item 4). The hint is a tagged
+    run, not a floating label, so it lines up with the caret. Clicks,
+    paste, and editing keys clear it; FocusOut restores it when empty.
+    """
+    text._composer_hint = placeholder
+    try:
+        text.tag_configure(_COMPOSER_TAG, foreground=PALETTE["text_dim"])
+    except tk.TclError:
+        return
+
+    def on_key(event, widget=text):
+        note_composer_key(
+            widget, str(getattr(event, "keysym", "")),
+            getattr(event, "char", "") or "",
+            int(getattr(event, "state", 0) or 0))
+
+    def on_click(_event=None, widget=text):
+        # A click in the middle of the hint would edit the hint itself.
+        _clear_composer_placeholder(widget)
+
+    def on_paste(_event=None, widget=text):
+        _clear_composer_placeholder(widget)
+
+    def on_focus_out(_event=None, widget=text):
+        refresh_composer_placeholder(widget)
+
+    text.bind("<Key>", on_key, add="+")
+    text.bind("<Button-1>", on_click, add="+")
+    text.bind("<<Paste>>", on_paste, add="+")
+    text.bind("<FocusOut>", on_focus_out, add="+")
+    refresh_composer_placeholder(text)
 
 
 class StatusDot(ttk.Label):
