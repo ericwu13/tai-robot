@@ -109,6 +109,13 @@ def test_deploy_existing_position_gates_on_nonzero_qty():
     assert src.count(hl.TITLE_EXISTING_POSITION) == 1
 
 
+def test_manual_close_skips_zero_qty_before_deriving_order():
+    """Issue #139: a qty=0 / ## terminator row must not pick close side."""
+    src = inspect.getsource(rb.BacktestApp._manual_close)
+    assert "positions[0]" not in src
+    assert "first_open_position" in src
+
+
 # ── HeadlessPolicy ──
 
 def test_policy_answers_by_title_and_declines_unknown():

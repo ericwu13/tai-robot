@@ -54,6 +54,25 @@ class TestParseOpenInterest:
         raw = "F,ACCOUNT,TXF4,B,notanum,0,22500.0,120,0.0002,USER"
         assert parse_open_interest(raw) is None
 
+    def test_end_of_data_terminator_rejected(self):
+        """Issue #139: Capital sends ``##`` as OI end-of-data after
+        ``001,查無資料``. Pre-fix this parsed as qty=0 / empty side
+        (dialog: 「空 SHORT x0」). Same sentinel as parse_future_rights.
+        """
+        raw = "##," + "," * 50
+        assert parse_open_interest(raw) is None
+
+    def test_end_of_data_does_not_overlay_flat_snapshot(self):
+        """001 set_flat then ## must not append a fake position."""
+        m = AccountMonitor()
+        m.set_flat()
+        parsed = parse_open_interest("##," + "," * 50)
+        if parsed:
+            m.add_position(parsed)
+        assert parsed is None
+        assert m.positions == []
+        assert m.oi_snapshot_received is True
+
 
 # ── parse_future_rights ──
 
@@ -178,10 +197,11 @@ class TestPositionTracking:
 class TestHasOpenPositions:
     """Deploy confirm used ``if self._account_monitor.positions:``.
 
-    Capital can return a qty=0 OI row (side still B/S) for a flat book.
-    A non-empty list is then truthy and the dialog shows 「空 SHORT x0」
-    while the bot's Position is +0. Distinct from #107 (ghost *non-zero*
-    持倉 after resume).
+    Confirmed (#139 debug_20260920.log): Capital follows ``001,查無資料``
+    with a ``##`` end-of-data terminator. Pre-fix parse_open_interest
+    ingested that row as qty=0 / empty side, so the list was truthy and
+    the dialog showed 「空 SHORT x0」. Distinct from #107 (ghost
+    *non-zero* 持倉 after resume).
     """
 
     def test_zero_qty_row_is_not_an_open_position(self):
@@ -212,6 +232,17 @@ class TestHasOpenPositions:
         m = AccountMonitor()
         m.add_position({"product": "TMF00", "side": "S"})
         assert m.has_open_positions() is False
+
+    def test_first_open_position_skips_zero_qty(self):
+        """_manual_close must not derive an order from a qty=0 OI row."""
+        m = AccountMonitor()
+        m.add_position({"product": "TMF00", "side": "S", "qty": 0, "avg_cost": "0"})
+        assert m.first_open_position() is None
+        m.add_position({"product": "TXF00", "side": "B", "qty": 1, "avg_cost": "22500"})
+        pos = m.first_open_position()
+        assert pos is not None
+        assert pos["qty"] == 1
+        assert pos["side"] == "B"
 
 
 # ── OpenInterest snapshot flag (resume-reconcile race fix) ──

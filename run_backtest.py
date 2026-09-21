@@ -8681,9 +8681,9 @@ class BacktestApp:
         symbol = self._live_runner.symbol
         order_symbol = resolve_order_symbol(symbol)
         # Priority: real API position > last real order > simulated broker
-        if self._account_monitor.positions:
-            # Use real position from API
-            pos = self._account_monitor.positions[0]
+        pos = self._account_monitor.first_open_position()
+        if pos:
+            # Use real position from API (skip qty=0 / ## leftover rows)
             buy_sell = 1 if pos["side"] == "B" else 0  # B(long)→SELL, S(short)→BUY
         elif self._last_real_order_side is not None:
             buy_sell = 1 - self._last_real_order_side
