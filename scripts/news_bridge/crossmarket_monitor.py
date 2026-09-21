@@ -156,6 +156,9 @@ BAR_WIDTH_SEC = 60
 # Closing-auction window after currentTradingPeriod.regular.end.
 # ^N225 stamps ~15 min after 14:30; 1 h covers that without accepting
 # a multi-hour official-close restamp.  Independent of the tape bound.
+# Only consulted when last_bar_time is missing — with bars present the
+# tape rule (and its period waiver) decides, so tuning this constant
+# has no effect on that path.
 PERIOD_END_GRACE_SEC = 3600
 # TPE hours.  The day window runs to 15:00 (not 14:00) so the Korea/Japan
 # closing prints — 14:30-14:50 TPE, routinely the sharpest move of their
