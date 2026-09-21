@@ -12,6 +12,7 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from src import updater
@@ -397,6 +398,23 @@ class TestRateWatch:
         clock.advance(7.9)
         watch.feed(1)            # still inside window_s
 
+    def test_reset_drops_connect_time(self):
+        clock = _FakeClock()
+        watch = updater.RateWatch(min_bps=128_000, window_s=8.0, clock=clock)
+        clock.advance(8.5)       # TLS / 302 / TTFB
+        watch.reset()            # after headers — must not count connect
+        watch.feed(65_536)
+
+    def test_fast_then_slow_aborts(self):
+        clock = _FakeClock()
+        watch = updater.RateWatch(min_bps=1_000, window_s=2.0, clock=clock)
+        watch.feed(10_000)
+        clock.advance(0.5)
+        watch.feed(10_000)
+        clock.advance(2.0)
+        with pytest.raises(updater.SlowDownloadError):
+            watch.feed(100)      # ~50 B/s over the last 2s
+
 
 class TestDownloadRelease:
     def test_streams_and_reports_progress(self, tmp_path):
@@ -474,22 +492,82 @@ class TestDownloadRelease:
         assert captured[1].get("Range") == "bytes=8-"
 
     def test_raises_after_max_attempts(self, tmp_path):
+        # Unreachable / dead edge: last-attempt fail-open cannot help.
+        # Bounded retries then the error is surfaced (F1).
+        dest = str(tmp_path / "app.zip")
+        calls = {"n": 0}
+
+        def always_dead(*_a, **_k):
+            calls["n"] += 1
+            raise httpx.ReadTimeout("timed out")
+
+        with patch("httpx.stream", side_effect=always_dead):
+            with pytest.raises(updater.SlowDownloadError, match="timed out"):
+                updater.download_release(
+                    "https://x/app.zip", dest,
+                    max_attempts=2, range_workers=1,
+                )
+        assert calls["n"] == 2
+
+    def test_uniformly_slow_link_completes_on_final_attempt(self, tmp_path):
+        # F1: a slow-but-working link must still finish (last attempt
+        # unwatched). Pre-review code failed this the same way every try.
         clock = _FakeClock()
         dest = str(tmp_path / "app.zip")
+        payload = b"HELLO-WORLD-OK"
 
         def always_slow(*_a, **_k):
             return _stream_cm(
-                _TimedChunks([b"ab", b"cd"], clock, dt=2.0),
-                {"Content-Length": "99"},
+                _TimedChunks(
+                    [b"HE", b"LL", b"O-", b"WO", b"RL", b"D-", b"OK"],
+                    clock, dt=2.0,
+                ),
+                {"Content-Length": str(len(payload))},
             )
 
-        with patch("httpx.stream", side_effect=always_slow):
-            with pytest.raises(updater.SlowDownloadError):
-                updater.download_release(
-                    "https://x/app.zip", dest,
-                    min_bps=1_000, window_s=2.0, max_attempts=2,
-                    range_workers=1, clock=clock,
-                )
+        with patch("httpx.stream", side_effect=always_slow) as stream:
+            updater.download_release(
+                "https://x/app.zip", dest,
+                min_bps=1_000, window_s=2.0, max_attempts=2,
+                range_workers=1, clock=clock,
+            )
+        with open(dest, "rb") as f:
+            assert f.read() == payload
+        assert stream.call_count == 2
+
+    def test_retries_transport_error_mid_stream(self, tmp_path):
+        dest = str(tmp_path / "app.zip")
+        payload = b"HELLO-WORLD-OK"
+
+        def boom():
+            yield b"HE"
+            raise httpx.ReadTimeout("timed out")
+
+        first = _stream_cm(
+            boom(),
+            {"Content-Length": str(len(payload)), "Accept-Ranges": "bytes"},
+        )
+        second = _stream_cm(
+            [b"LLO-WORLD-OK"],
+            {"Content-Length": "12",
+             "Content-Range": "bytes 2-13/14",
+             "Accept-Ranges": "bytes"},
+            status=206,
+        )
+        captured = []
+
+        def fake_stream(method, url, **kwargs):
+            captured.append(kwargs.get("headers") or {})
+            return first if len(captured) == 1 else second
+
+        with patch("httpx.stream", side_effect=fake_stream):
+            updater.download_release(
+                "https://x/app.zip", dest,
+                max_attempts=3, range_workers=1,
+            )
+        with open(dest, "rb") as f:
+            assert f.read() == payload
+        assert captured[1].get("Range") == "bytes=2-"
 
     def test_parallel_ranges_assemble_file(self, tmp_path):
         # Optional #139 path: first GET advertises Accept-Ranges + size,
@@ -579,3 +657,99 @@ class TestDownloadRelease:
 
         with open(dest, "rb") as f:
             assert f.read() == data
+
+    def test_range_ignored_falls_back_to_serial(self, tmp_path):
+        # F3: Accept-Ranges advertised but ranged GET returns 200 → serial
+        # fallback, not a 4×4 "slow CDN edge" loop.
+        data = b"ABCDEFGH"
+        dest = str(tmp_path / "app.zip")
+        calls = []
+
+        def fake_stream(method, url, **kwargs):
+            rng = (kwargs.get("headers") or {}).get("Range")
+            calls.append(rng)
+            return _stream_cm(
+                [data],
+                {"Content-Length": "8", "Accept-Ranges": "bytes"},
+                status=200,
+            )
+
+        with patch("httpx.stream", side_effect=fake_stream):
+            updater.download_release(
+                "https://x/app.zip", dest,
+                max_attempts=3, range_workers=2, min_parallel_bytes=1,
+            )
+        with open(dest, "rb") as f:
+            assert f.read() == data
+        none_calls = [c for c in calls if c is None]
+        assert len(none_calls) >= 2          # probe + serial fallback
+        assert len(calls) <= 5               # not 4 probes + 64 ranges
+
+    def test_parallel_failure_does_not_restart_fanout(self, tmp_path):
+        # F3 restart-loop coverage: one dead part must NOT re-probe / fan
+        # out from byte 0. Error is surfaced after that part's own attempts.
+        dest = str(tmp_path / "app.zip")
+        data = b"ABCDEFGH"
+        probe_calls = []
+        range_calls = []
+        probe = _stream_cm(
+            [data],
+            {"Content-Length": "8", "Accept-Ranges": "bytes"},
+        )
+
+        def fake_stream(method, url, **kwargs):
+            rng = (kwargs.get("headers") or {}).get("Range")
+            if rng is None:
+                probe_calls.append(1)
+                return probe
+            range_calls.append(rng)
+            if rng.startswith("bytes=0-"):
+                return _stream_cm(
+                    [b"ABCD"],
+                    {"Content-Length": "4", "Content-Range": "bytes 0-3/8"},
+                    status=206,
+                )
+            raise httpx.ReadTimeout("dead edge")
+
+        with patch("httpx.stream", side_effect=fake_stream):
+            with pytest.raises(updater.SlowDownloadError, match="stalled after 3") as excinfo:
+                updater.download_release(
+                    "https://x/app.zip", dest,
+                    max_attempts=3, range_workers=2, min_parallel_bytes=1,
+                )
+        assert "dead edge" in str(excinfo.value.__cause__)
+        assert probe_calls == [1]
+        assert range_calls.count("bytes=0-3") == 1
+        assert sum(1 for r in range_calls if r.startswith("bytes=4-")) == 3
+
+    def test_check_declared_size_rejects_oversized(self, tmp_path):
+        p = tmp_path / "f.zip"
+        p.write_bytes(b"12345")
+        with pytest.raises(updater.OversizedDownloadError):
+            updater._check_declared_size(str(p), 4)
+        assert not p.exists()
+
+    def test_write_body_clamps_to_declared_length(self, tmp_path):
+        dest = str(tmp_path / "app.zip")
+        with patch("httpx.stream", return_value=_stream_cm(
+                [b"12345678"], {"Content-Length": "4"})):
+            updater.download_release(
+                "https://x/app.zip", dest, range_workers=1)
+        with open(dest, "rb") as f:
+            assert f.read() == b"1234"
+
+    def test_download_rejects_file_larger_than_declared(self, tmp_path):
+        dest = str(tmp_path / "app.zip")
+
+        def write_extra(resp, dest_path, **_k):
+            with open(dest_path, "wb") as f:
+                f.write(b"12345678")
+            return 8
+
+        with patch.object(updater, "_write_body", side_effect=write_extra):
+            with patch("httpx.stream", return_value=_stream_cm(
+                    [b"xxxx"], {"Content-Length": "4"})):
+                with pytest.raises(updater.OversizedDownloadError):
+                    updater.download_release(
+                        "https://x/app.zip", dest, range_workers=1)
+        assert not os.path.isfile(dest)
