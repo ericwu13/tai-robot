@@ -1,15 +1,18 @@
 """Tests for src.updater — version comparison, release lookup, swap script.
 
 The updater is GUI-independent. These tests verify semver comparison,
-GitHub release parsing (with mocked httpx), swap-script generation, temp-dir
-naming, and stale-folder cleanup. Nothing here touches the network or spawns
-a real process.
+GitHub release parsing (with mocked httpx), download integrity verification
+(issue #146), swap-script generation, temp-dir naming, and stale-folder
+cleanup. Nothing here touches the network or spawns a real process.
 """
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import sys
+import zipfile
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -129,6 +132,387 @@ class TestGetLatestRelease:
     def test_network_error_returns_none(self):
         with patch("httpx.get", side_effect=OSError("no network")):
             assert updater.get_latest_release() is None
+
+    # ── sha256 sidecar capture (issue #146) ──
+
+    def test_captures_sha256_sidecar_url(self):
+        payload = {
+            "tag_name": "v2.15.0",
+            "assets": [
+                {"name": "tai_backtest_v2.15.0_win_x64.zip",
+                 "browser_download_url": "https://example.com/app.zip"},
+                {"name": "tai_backtest_v2.15.0_win_x64.zip.sha256",
+                 "browser_download_url": "https://example.com/app.zip.sha256"},
+            ],
+        }
+        with patch("httpx.get", return_value=_mock_response(payload)):
+            info = updater.get_latest_release()
+        assert info.download_url == "https://example.com/app.zip"
+        assert info.sha256_url == "https://example.com/app.zip.sha256"
+
+    def test_sha256_listed_before_zip_still_picks_zip(self):
+        # GitHub does not guarantee asset order. The ".zip.sha256" asset
+        # must never be mistaken for the payload, and must still be found.
+        payload = {
+            "tag_name": "v2.15.0",
+            "assets": [
+                {"name": "tai_backtest_v2.15.0_win_x64.zip.sha256",
+                 "browser_download_url": "https://example.com/app.zip.sha256"},
+                {"name": "tai_backtest_v2.15.0_win_x64.zip",
+                 "browser_download_url": "https://example.com/app.zip"},
+            ],
+        }
+        with patch("httpx.get", return_value=_mock_response(payload)):
+            info = updater.get_latest_release()
+        assert info.download_url == "https://example.com/app.zip"
+        assert info.sha256_url == "https://example.com/app.zip.sha256"
+
+    def test_sidecar_matched_by_exact_name(self):
+        # A checksum published for a *different* asset must not be used.
+        payload = {
+            "tag_name": "v2.15.0",
+            "assets": [
+                {"name": "tai_backtest_v2.15.0_win_x64.zip",
+                 "browser_download_url": "https://example.com/app.zip"},
+                {"name": "some_other_file.7z.sha256",
+                 "browser_download_url": "https://example.com/other.sha256"},
+            ],
+        }
+        with patch("httpx.get", return_value=_mock_response(payload)):
+            info = updater.get_latest_release()
+        assert info.sha256_url == ""
+
+    def test_no_sidecar_yields_empty_url(self):
+        payload = {
+            "tag_name": "v2.15.0",
+            "assets": [
+                {"name": "a.zip", "browser_download_url": "https://x/a.zip"}],
+        }
+        with patch("httpx.get", return_value=_mock_response(payload)):
+            info = updater.get_latest_release()
+        assert info.sha256_url == ""
+
+    def test_positional_release_info_still_constructible(self):
+        # sha256_url must be defaulted so old positional constructions work.
+        info = updater.ReleaseInfo("2.15.0", "https://x/a.zip", "notes")
+        assert info.sha256_url == ""
+
+
+# ── _parse_sha256_file (issue #146) ──
+
+_DIGEST = "a" * 64
+
+
+class TestParseSha256File:
+    def test_bare_digest(self):
+        assert updater._parse_sha256_file(_DIGEST) == _DIGEST
+
+    def test_sha256sum_text_mode(self):
+        # The format build_release.py writes: "<hex>  <filename>\n".
+        text = f"{_DIGEST}  tai_backtest_v2.15.0_win_x64.zip\n"
+        assert updater._parse_sha256_file(text) == _DIGEST
+
+    def test_sha256sum_binary_mode(self):
+        text = f"{_DIGEST} *tai_backtest_v2.15.0_win_x64.zip\n"
+        assert updater._parse_sha256_file(text) == _DIGEST
+
+    def test_uppercase_is_normalised(self):
+        assert updater._parse_sha256_file("A" * 64) == _DIGEST
+
+    def test_bom_and_whitespace_tolerated(self):
+        text = f"\ufeff   {_DIGEST}  app.zip\r\n"
+        assert updater._parse_sha256_file(text) == _DIGEST
+
+    def test_first_line_wins(self):
+        text = f"{_DIGEST}  app.zip\n{'b' * 64}  other.zip\n"
+        assert updater._parse_sha256_file(text) == _DIGEST
+
+    def test_malformed_returns_none(self):
+        assert updater._parse_sha256_file("") is None
+        assert updater._parse_sha256_file("   \n  ") is None
+        assert updater._parse_sha256_file("not a checksum at all") is None
+        assert updater._parse_sha256_file("a" * 63) is None      # too short
+        assert updater._parse_sha256_file("a" * 65) is None      # too long
+        assert updater._parse_sha256_file("z" * 64) is None      # not hex
+        assert updater._parse_sha256_file(
+            "<html>404 not found</html>") is None
+
+
+# ── _sha256_of ──
+
+class TestSha256Of:
+    def test_matches_hashlib(self, tmp_path):
+        p = tmp_path / "blob.bin"
+        data = b"tai-robot" * 5000
+        p.write_bytes(data)
+        assert updater._sha256_of(str(p)) == hashlib.sha256(data).hexdigest()
+
+    def test_chunked_read_matches(self, tmp_path):
+        p = tmp_path / "blob.bin"
+        data = bytes(range(256)) * 1000
+        p.write_bytes(data)
+        assert (updater._sha256_of(str(p), chunk_size=7)
+                == hashlib.sha256(data).hexdigest())
+
+
+# ── download verification (issue #146) ──
+
+def _zip_bytes(payload: bytes = b"hello world") -> bytes:
+    """A small but structurally valid release zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("tai_backtest/tai_backtest.exe", payload)
+    return buf.getvalue()
+
+
+def _sidecar(body: bytes, name: str = "app.zip") -> str:
+    return f"{hashlib.sha256(body).hexdigest()}  {name}\n"
+
+
+def _sha_response(text):
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.text = text
+    return resp
+
+
+class TestDownloadVerification:
+    """A zip that survives ``_check_declared_size`` can still be garbage.
+
+    Pre-fix the only integrity check was ``Expand-Archive`` inside the swap
+    batch — which runs after ``launch_update`` has called ``os._exit(0)``.
+    """
+
+    def _download(self, tmp_path, body, *, sha256_text=None,
+                  sha_error=None, sha256_url="https://x/app.zip.sha256"):
+        dest = str(tmp_path / "app.zip")
+        if sha_error is not None:
+            get_kwargs = {"side_effect": sha_error}
+        else:
+            get_kwargs = {"return_value": _sha_response(sha256_text)}
+        with patch("httpx.get", **get_kwargs):
+            with patch("httpx.stream", return_value=_stream_cm(
+                    [body], {"Content-Length": str(len(body))})):
+                updater.download_release(
+                    "https://x/app.zip", dest, range_workers=1,
+                    sha256_url=sha256_url, verify_zip=True)
+        return dest
+
+    def test_matching_checksum_passes(self, tmp_path):
+        good = _zip_bytes()
+        dest = self._download(tmp_path, good, sha256_text=_sidecar(good))
+        with open(dest, "rb") as f:
+            assert f.read() == good
+
+    def test_wrong_content_same_length_is_rejected(self, tmp_path):
+        # The exact failure mode of one bad slice from the 4-way Range
+        # fan-out: correct Content-Length, wrong bytes.
+        good = _zip_bytes()
+        corrupt = bytearray(good)
+        corrupt[-40] ^= 0xFF
+        corrupt = bytes(corrupt)
+        assert len(corrupt) == len(good)
+
+        dest = str(tmp_path / "app.zip")
+        with patch("httpx.get", return_value=_sha_response(_sidecar(good))):
+            with patch("httpx.stream", return_value=_stream_cm(
+                    [corrupt], {"Content-Length": str(len(corrupt))})):
+                with pytest.raises(updater.ChecksumMismatchError):
+                    updater.download_release(
+                        "https://x/app.zip", dest, range_workers=1,
+                        sha256_url="https://x/app.zip.sha256",
+                        verify_zip=True)
+        # The rejected bytes must be gone so nothing can install them.
+        assert not os.path.isfile(dest)
+
+    def test_no_sidecar_fails_open(self, tmp_path):
+        # Old releases publish no .sha256 — the update must still work.
+        good = _zip_bytes()
+        dest = str(tmp_path / "app.zip")
+        with patch("httpx.get", side_effect=AssertionError(
+                "must not fetch a sidecar when there is none")):
+            with patch("httpx.stream", return_value=_stream_cm(
+                    [good], {"Content-Length": str(len(good))})):
+                updater.download_release(
+                    "https://x/app.zip", dest, range_workers=1,
+                    sha256_url="", verify_zip=True)
+        with open(dest, "rb") as f:
+            assert f.read() == good
+
+    def test_sidecar_fetch_error_fails_open(self, tmp_path):
+        good = _zip_bytes()
+        dest = self._download(tmp_path, good,
+                              sha_error=httpx.ConnectError("no network"))
+        assert os.path.isfile(dest)
+
+    def test_malformed_sidecar_fails_open(self, tmp_path):
+        good = _zip_bytes()
+        dest = self._download(tmp_path, good,
+                              sha256_text="<html>404 not found</html>")
+        assert os.path.isfile(dest)
+
+    def test_corrupt_zip_without_checksum_is_rejected(self, tmp_path):
+        # Belt-and-braces: no checksum published, but the payload is not a
+        # readable zip at all.
+        junk = b"not a zip file at all, just noise" * 10
+        dest = str(tmp_path / "app.zip")
+        with patch("httpx.stream", return_value=_stream_cm(
+                [junk], {"Content-Length": str(len(junk))})):
+            with pytest.raises(updater.CorruptArchiveError):
+                updater.download_release(
+                    "https://x/app.zip", dest, range_workers=1,
+                    sha256_url="", verify_zip=True)
+        assert not os.path.isfile(dest)
+
+    def test_bad_crc_entry_is_rejected(self, tmp_path):
+        # Readable central directory, corrupt member payload → testzip()
+        # reports the bad entry.
+        good = bytearray(_zip_bytes(b"A" * 2000))
+        good[40] ^= 0xFF          # inside the deflated member data
+        body = bytes(good)
+        dest = str(tmp_path / "app.zip")
+        with patch("httpx.stream", return_value=_stream_cm(
+                [body], {"Content-Length": str(len(body))})):
+            with pytest.raises((updater.CorruptArchiveError,
+                                updater.ChecksumMismatchError)):
+                updater.download_release(
+                    "https://x/app.zip", dest, range_workers=1,
+                    sha256_url="", verify_zip=True)
+        assert not os.path.isfile(dest)
+
+    def test_parallel_path_is_verified_too(self, tmp_path):
+        # The Range fan-out returns from a different code path; a bad slice
+        # there must be caught by the same single verification call site.
+        good = _zip_bytes(b"B" * 400)
+        corrupt = bytearray(good)
+        corrupt[-30] ^= 0xFF
+        corrupt = bytes(corrupt)
+        total = len(good)
+        half = total // 2
+        dest = str(tmp_path / "app.zip")
+
+        def fake_stream(method, url, **kwargs):
+            rng = (kwargs.get("headers") or {}).get("Range")
+            if rng is None:
+                return _stream_cm(
+                    [good],
+                    {"Content-Length": str(total), "Accept-Ranges": "bytes"})
+            start, end = (int(x) for x in rng.split("=")[1].split("-"))
+            body = corrupt[start:end + 1]
+            return _stream_cm(
+                [body],
+                {"Content-Length": str(len(body)),
+                 "Content-Range": f"bytes {start}-{end}/{total}"},
+                status=206,
+            )
+
+        with patch("httpx.get", return_value=_sha_response(_sidecar(good))):
+            with patch("httpx.stream", side_effect=fake_stream):
+                with pytest.raises(updater.ChecksumMismatchError):
+                    updater.download_release(
+                        "https://x/app.zip", dest,
+                        range_workers=2, min_parallel_bytes=1,
+                        sha256_url="https://x/app.zip.sha256",
+                        verify_zip=True)
+        assert not os.path.isfile(dest)
+        assert half > 0  # sanity: the payload really was splittable
+
+    def test_verification_is_not_retried(self, tmp_path):
+        # A mismatch must surface to the UI, not spin the retry loop.
+        good = _zip_bytes()
+        _flipped = bytearray(good)
+        _flipped[10] ^= 0xFF
+        corrupt = bytes(_flipped)
+        calls = {"n": 0}
+
+        def fake_stream(*_a, **_k):
+            calls["n"] += 1
+            return _stream_cm(
+                [corrupt], {"Content-Length": str(len(corrupt))})
+
+        dest = str(tmp_path / "app.zip")
+        with patch("httpx.get", return_value=_sha_response(_sidecar(good))):
+            with patch("httpx.stream", side_effect=fake_stream):
+                with pytest.raises(updater.ChecksumMismatchError):
+                    updater.download_release(
+                        "https://x/app.zip", dest, range_workers=1,
+                        max_attempts=4,
+                        sha256_url="https://x/app.zip.sha256",
+                        verify_zip=True)
+        assert calls["n"] == 1
+
+    def test_defaults_do_not_verify(self, tmp_path):
+        # Backwards compatibility: callers that stream something other than
+        # a release zip are unaffected by the new checks.
+        dest = str(tmp_path / "blob.bin")
+        with patch("httpx.stream", return_value=_stream_cm(
+                [b"plain bytes"], {"Content-Length": "11"})):
+            updater.download_release(
+                "https://x/blob.bin", dest, range_workers=1)
+        assert os.path.isfile(dest)
+
+
+class TestVerifyReleaseZip:
+    def test_returns_verified_digest(self, tmp_path):
+        good = _zip_bytes()
+        p = tmp_path / "app.zip"
+        p.write_bytes(good)
+        with patch("httpx.get", return_value=_sha_response(_sidecar(good))):
+            digest = updater.verify_release_zip(
+                str(p), sha256_url="https://x/app.zip.sha256")
+        assert digest == hashlib.sha256(good).hexdigest()
+
+    def test_returns_none_when_nothing_to_verify_against(self, tmp_path):
+        p = tmp_path / "app.zip"
+        p.write_bytes(_zip_bytes())
+        assert updater.verify_release_zip(str(p)) is None
+
+    def test_check_zip_can_be_skipped(self, tmp_path):
+        p = tmp_path / "app.zip"
+        p.write_bytes(b"not a zip")
+        assert updater.verify_release_zip(str(p), check_zip=False) is None
+        assert p.exists()
+
+
+# ── launch_update wiring (issue #146) ──
+
+class TestLaunchUpdateVerifies:
+    def test_passes_sha256_url_and_enables_zip_check(self, tmp_path,
+                                                     monkeypatch):
+        # The UI hands launch_update the release's sidecar URL; it must
+        # reach download_release, and verification must happen BEFORE the
+        # swap script is written / the process exits.
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(updater.tempfile, "gettempdir",
+                            lambda: str(tmp_path))
+        seen = {}
+        order = []
+
+        def fake_download(url, dest, progress_cb=None, **kwargs):
+            seen.update(kwargs)
+            order.append("download")
+            return dest
+
+        monkeypatch.setattr(updater, "download_release", fake_download)
+        monkeypatch.setattr(
+            updater, "write_swap_script",
+            lambda **kw: order.append("swap") or kw["script_path"])
+        monkeypatch.setattr(updater.subprocess, "Popen",
+                            lambda *a, **k: order.append("spawn"))
+
+        def fake_exit(code):
+            order.append("exit")
+            raise SystemExit(code)
+
+        monkeypatch.setattr(updater.os, "_exit", fake_exit)
+
+        with pytest.raises(SystemExit):
+            updater.launch_update("https://x/app.zip", "2.15.0",
+                                  sha256_url="https://x/app.zip.sha256")
+
+        assert seen.get("sha256_url") == "https://x/app.zip.sha256"
+        assert seen.get("verify_zip") is True
+        assert order == ["download", "swap", "spawn", "exit"]
 
 
 # ── write_swap_script ──

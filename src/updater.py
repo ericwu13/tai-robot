@@ -9,7 +9,15 @@ that waits for this process to exit, robocopy-swaps the install directory
 Design notes
 ------------
 - No new pip deps: streaming download uses ``httpx`` (already bundled); the
-  checksum uses ``hashlib`` (stdlib).
+  integrity check uses ``hashlib`` / ``zipfile`` (stdlib).
+- The download is verified *before* the app exits (issue #146). Every
+  release publishes a ``<zip>.sha256`` sidecar (build_release.py); when it
+  is present the assembled zip must match it, and the archive must in any
+  case be a readable zip. A verification failure is a normal in-app error —
+  the running app is still alive to show it. Without this the only
+  integrity check was ``Expand-Archive`` inside the swap batch, which runs
+  *after* ``launch_update`` has called ``os._exit(0)``: a corrupt zip then
+  meant an error dialog and no app to relaunch.
 - The GitHub owner/repo is derived from the ``origin`` remote when running
   from a source checkout, and falls back to the hard-coded default otherwise
   (the frozen exe has no .git).
@@ -23,6 +31,7 @@ folder (see build_release.py), so the swap source is
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -30,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from collections import deque
 from typing import Callable, NamedTuple
 
@@ -56,6 +66,10 @@ class ReleaseInfo(NamedTuple):
     version: str          # normalized, no leading "v" (e.g. "2.14.2")
     download_url: str     # browser_download_url of the release zip asset
     notes: str            # release body (markdown)
+    # browser_download_url of the "<zip>.sha256" sidecar, "" when the
+    # release has none (older releases). Defaulted so existing positional
+    # ReleaseInfo(version, url, notes) constructions keep working.
+    sha256_url: str = ""
 
 
 # ── version comparison ──────────────────────────────────────────────
@@ -103,7 +117,12 @@ def get_latest_release(timeout: float = 10.0) -> ReleaseInfo | None:
     """Fetch the latest GitHub release. Returns None on any network error.
 
     Picks the first release asset whose name ends in ``.zip`` as the
-    downloadable payload.
+    downloadable payload (``.zip.sha256`` does not end in ``.zip``, so the
+    sidecar can never be mistaken for the payload — keep it that way).
+
+    Also captures the ``<zip name>.sha256`` sidecar asset, matched by exact
+    (case-insensitive) name and regardless of the order GitHub lists the
+    assets in. A release without one yields ``sha256_url == ""``.
     """
     import httpx
 
@@ -125,17 +144,149 @@ def get_latest_release(timeout: float = 10.0) -> ReleaseInfo | None:
     if not version:
         return None
 
+    assets = data.get("assets", []) or []
     download_url = ""
-    for asset in data.get("assets", []) or []:
-        name = (asset.get("name") or "").lower()
-        if name.endswith(".zip"):
+    zip_name = ""
+    for asset in assets:
+        name = asset.get("name") or ""
+        if name.lower().endswith(".zip"):
             download_url = asset.get("browser_download_url", "")
+            zip_name = name
             break
     if not download_url:
         return None
 
+    sha256_url = ""
+    want = f"{zip_name}.sha256".lower()
+    for asset in assets:
+        if (asset.get("name") or "").lower() == want:
+            sha256_url = asset.get("browser_download_url", "") or ""
+            break
+
     notes = data.get("body") or ""
-    return ReleaseInfo(version=version, download_url=download_url, notes=notes)
+    return ReleaseInfo(version=version, download_url=download_url,
+                       notes=notes, sha256_url=sha256_url)
+
+
+# ── integrity verification (issue #146) ─────────────────────────────
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class ChecksumMismatchError(Exception):
+    """Downloaded zip does not match the checksum published for the release."""
+
+
+class CorruptArchiveError(Exception):
+    """Downloaded file is not a readable zip (bad directory or bad CRC)."""
+
+
+def _parse_sha256_file(text: str) -> str | None:
+    """Return the lowercase hex digest from a ``sha256sum`` sidecar.
+
+    Accepts a bare ``<64 hex>`` line, ``<hex>  <name>`` (sha256sum text
+    mode — what build_release.py writes) and ``<hex> *<name>`` (binary
+    mode), tolerating a UTF-8 BOM, surrounding whitespace, CRLF and
+    uppercase hex. Returns None when the content is empty or is not a
+    well-formed digest line — the caller then fails open.
+    """
+    if not text:
+        return None
+    stripped = text.lstrip("\ufeff").strip()
+    if not stripped:
+        return None
+    parts = stripped.splitlines()[0].strip().split()
+    if not parts:
+        return None
+    digest = parts[0].lower()
+    return digest if _SHA256_RE.match(digest) else None
+
+
+def _sha256_of(path: str, chunk_size: int = 1024 * 1024) -> str:
+    """Return the lowercase hex SHA-256 of ``path`` (chunked, no full read)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _discard(path: str) -> None:
+    """Delete a rejected download so it can never be installed. Best-effort."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _fetch_expected_sha256(url: str, timeout: float = 10.0) -> str | None:
+    """Fetch and parse a ``.sha256`` sidecar. None means "cannot verify".
+
+    Fails open by design: a missing, unreachable or malformed sidecar must
+    not block an update (old releases published none, and this is a second
+    network hop that can flake independently of the zip download).
+    """
+    if not url:
+        return None
+    import httpx
+
+    try:
+        resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+        resp.raise_for_status()
+        return _parse_sha256_file(resp.text)
+    except Exception:
+        return None
+
+
+def verify_release_zip(
+    path: str,
+    *,
+    sha256_url: str = "",
+    check_zip: bool = True,
+    timeout: float = 10.0,
+) -> str | None:
+    """Verify an assembled release zip before it is installed (issue #146).
+
+    Two independent checks:
+
+    1. **Checksum** — when ``sha256_url`` points at the release's
+       ``<zip>.sha256`` sidecar, the on-disk digest must equal the
+       published one. A mismatch deletes the file and raises
+       ``ChecksumMismatchError``. This is the only thing that catches a
+       correct-length / wrong-content zip, e.g. one bad slice from the
+       Range fan-out in ``_download_parallel``.
+       **Fail open**: no sidecar, or an unreachable / malformed one, skips
+       the hash rather than failing the update.
+    2. **Archive structure** — ``zipfile`` must read the central directory
+       and every entry's CRC. Cheap belt-and-braces that still catches a
+       corrupt download when no checksum is published.
+
+    Returns the digest that was verified, or None when none was available.
+    """
+    digest: str | None = None
+    expected = _fetch_expected_sha256(sha256_url, timeout)
+    if expected:
+        digest = _sha256_of(path)
+        if digest != expected:
+            _discard(path)
+            raise ChecksumMismatchError(
+                f"update rejected: SHA-256 {digest} does not match the "
+                f"published checksum {expected}")
+    if check_zip:
+        try:
+            with zipfile.ZipFile(path) as zf:
+                bad_entry = zf.testzip()
+        except (zipfile.BadZipFile, OSError) as exc:
+            _discard(path)
+            raise CorruptArchiveError(
+                f"update rejected: download is not a readable zip ({exc})"
+            ) from exc
+        if bad_entry is not None:
+            _discard(path)
+            raise CorruptArchiveError(
+                f"update rejected: archive entry {bad_entry!r} failed its "
+                f"CRC check")
+    return digest
 
 
 # ── download ────────────────────────────────────────────────────────
@@ -515,6 +666,8 @@ def download_release(
     range_workers: int = RANGE_WORKERS,
     min_parallel_bytes: int = MIN_PARALLEL_BYTES,
     clock: Callable[[], float] = time.monotonic,
+    sha256_url: str = "",
+    verify_zip: bool = False,
 ) -> str:
     """Stream a release zip to ``dest_path`` via httpx.
 
@@ -532,12 +685,26 @@ def download_release(
     ``range_workers`` parallel Range requests. If the server then ignores
     Range, we fall back to a single stream rather than retrying fan-out.
     Parallel failure does **not** restart the fan-out from byte 0.
+
+    Once the file is fully assembled — on the serial *and* the parallel
+    path — it is handed to ``verify_release_zip`` (issue #146):
+    ``sha256_url`` enables the published-checksum check and ``verify_zip``
+    the archive-structure check. Both default off so callers that stream
+    something other than a release zip are unaffected; ``launch_update``
+    (the only production caller) turns both on. A verification failure is
+    **not** retried — the bytes are deleted and the error is raised for the
+    UI to show, so the user can retry the whole update deliberately.
     """
     import httpx
 
     dest_dir = os.path.dirname(dest_path)
     if dest_dir:
         os.makedirs(dest_dir, exist_ok=True)
+
+    def _finish() -> str:
+        verify_release_zip(dest_path, sha256_url=sha256_url,
+                           check_zip=verify_zip, timeout=timeout)
+        return dest_path
 
     last_err: Exception | None = None
     done = 0
@@ -575,8 +742,11 @@ def download_release(
                         total=total, progress_cb=progress_cb, watch=watch,
                     )
                     _check_declared_size(dest_path, total)
-                    return dest_path
-        except OversizedDownloadError:
+                    return _finish()
+        except (OversizedDownloadError, ChecksumMismatchError,
+                CorruptArchiveError):
+            # Integrity failures are terminal: the bytes are already gone
+            # and re-running the same fan-out would not make them right.
             raise
         except Exception as exc:
             if not _is_retryable(exc):
@@ -607,7 +777,7 @@ def download_release(
                 force_serial = True
                 done = 0
                 continue
-            return dest_path
+            return _finish()
 
     if last_err is not None:
         raise SlowDownloadError(
@@ -826,8 +996,9 @@ def launch_update(
     zip_url: str,
     version: str,
     progress_cb: Callable[[int, int], None] | None = None,
+    sha256_url: str = "",
 ) -> None:
-    """Download the release, write the swap script, launch it detached, exit.
+    """Download the release, verify it, write the swap script, launch, exit.
 
     This does NOT return under normal operation — it calls ``os._exit(0)``
     after launching the detached batch so the old exe releases its files for
@@ -842,6 +1013,13 @@ def launch_update(
     repo root, so the swap would robocopy a release over the working tree and
     relaunch a nonexistent exe. Self-update only makes sense for the packaged
     build.
+
+    The zip is verified before the swap script is written (issue #146).
+    ``sha256_url`` is the release's ``<zip>.sha256`` sidecar when it has one
+    (``ReleaseInfo.sha256_url``); the archive-structure check always runs. A
+    failure therefore surfaces while the app is still alive, instead of
+    becoming an ``Expand-Archive`` error *after* ``os._exit(0)`` — which
+    left the user with an error dialog and nothing relaunched.
     """
     if not getattr(sys, "frozen", False):
         raise RuntimeError(
@@ -857,7 +1035,8 @@ def launch_update(
     extract_dir = os.path.join(temp_dir, "extracted")
     script_path = os.path.join(temp_dir, "apply_update.bat")
 
-    download_release(zip_url, zip_path, progress_cb)
+    download_release(zip_url, zip_path, progress_cb,
+                     sha256_url=sha256_url, verify_zip=True)
 
     app_dir = _app_dir()
     new_exe_path = os.path.join(app_dir, EXE_NAME)
