@@ -8,8 +8,12 @@ a real process.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import io
 import os
 import sys
+import zipfile
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -753,3 +757,245 @@ class TestDownloadRelease:
                     updater.download_release(
                         "https://x/app.zip", dest, range_workers=1)
         assert not os.path.isfile(dest)
+
+
+# ── SHA-256 verify before swap (issue #146) ─────────────────────────
+#
+# Pre-fix these fail: launch_update never fetches the published
+# ``.sha256`` asset and still calls write_swap_script / os._exit on a
+# wrong or CRC-corrupt zip. ReleaseInfo has no checksum_url, and the
+# module never calls hashlib.sha256.
+
+
+def _stored_zip(payload: bytes = b"hello-world-payload") -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("tai_backtest/marker.txt", payload)
+    return buf.getvalue()
+
+
+def _corrupt_stored_zip(payload: bytes = b"hello-world-payload") -> bytes:
+    raw = bytearray(_stored_zip(payload))
+    idx = raw.find(payload)
+    assert idx >= 0
+    raw[idx] ^= 0xFF
+    return bytes(raw)
+
+
+def _sha256_response(text: str):
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.text = text
+    return resp
+
+
+class _LaunchHarness:
+    """Frozen launch_update with download, swap, and os._exit stubbed.
+
+    Records call order. os._exit raises SystemExit so a pre-fix run cannot
+    kill the test process.
+    """
+
+    def __init__(self, tmp_path, monkeypatch, payload: bytes):
+        self.payload = payload
+        self.events: list[str] = []
+        self.checksum_calls: list[tuple[str, dict]] = []
+        self.zip_path = os.path.join(
+            str(tmp_path), "tai_update_2.19.6", "tai_backtest_v2.19.6.zip")
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
+
+        def fake_download(url, dest, progress_cb=None, **kwargs):
+            self.events.append("download")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(self.payload)
+            return dest
+
+        def fake_swap(*args, **kwargs):
+            self.events.append("swap")
+            return kwargs.get("script_path", args[5] if len(args) > 5 else "")
+
+        def fake_popen(*args, **kwargs):
+            self.events.append("popen")
+            return MagicMock()
+
+        def fake_exit(code=0):
+            self.events.append("exit")
+            raise SystemExit(code)
+
+        monkeypatch.setattr(updater, "download_release", fake_download)
+        monkeypatch.setattr(updater, "write_swap_script", fake_swap)
+        monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(updater.os, "_exit", fake_exit)
+
+    def install_checksum(self, monkeypatch, text: str | None = None,
+                         exc: BaseException | None = None):
+        def fake_get(url, **kwargs):
+            self.events.append("checksum")
+            self.checksum_calls.append((url, kwargs))
+            if exc is not None:
+                raise exc
+            digest = hashlib.sha256(self.payload).hexdigest()
+            body = text if text is not None else f"{digest}  app.zip\n"
+            return _sha256_response(body)
+
+        # fetch imports httpx inside the function; patch the module global.
+        import httpx
+        monkeypatch.setattr(httpx, "get", fake_get)
+
+
+class TestReleaseChecksumUrl:
+    """Issue #146: the published .sha256 asset must be remembered."""
+
+    def test_records_sidecar_matching_the_zip_name(self):
+        payload = {
+            "tag_name": "v2.19.6",
+            "body": "notes",
+            "assets": [
+                {"name": "other.zip.sha256",
+                 "browser_download_url": "https://example.com/other.zip.sha256"},
+                {"name": "tai_backtest_v2.19.6_win_x64.zip.sha256",
+                 "browser_download_url": "https://cdn.example/special.sha256"},
+                {"name": "tai_backtest_v2.19.6_win_x64.zip",
+                 "browser_download_url": "https://example.com/app.zip"},
+            ],
+        }
+        with patch("httpx.get", return_value=_mock_response(payload)):
+            info = updater.get_latest_release()
+        assert info is not None
+        assert info.download_url == "https://example.com/app.zip"
+        assert info.checksum_url == "https://cdn.example/special.sha256"
+
+    def test_falls_back_to_zip_url_plus_sha256_suffix(self):
+        payload = {
+            "tag_name": "v2.19.6",
+            "assets": [
+                {"name": "tai_backtest_v2.19.6_win_x64.zip",
+                 "browser_download_url": "https://example.com/app.zip"},
+            ],
+        }
+        with patch("httpx.get", return_value=_mock_response(payload)):
+            info = updater.get_latest_release()
+        assert info is not None
+        assert info.checksum_url == "https://example.com/app.zip.sha256"
+
+    def test_sha256_asset_alone_is_not_a_zip(self):
+        payload = {
+            "tag_name": "v2.19.6",
+            "assets": [
+                {"name": "tai_backtest_v2.19.6_win_x64.zip.sha256",
+                 "browser_download_url": "https://example.com/app.zip.sha256"},
+            ],
+        }
+        with patch("httpx.get", return_value=_mock_response(payload)):
+            assert updater.get_latest_release() is None
+
+
+class TestVerifyBeforeSwap:
+    """Issue #146: hashlib.sha256 after assembly, before swap / os._exit.
+
+    A mismatch or a bad zip deletes the download and raises ChecksumError
+    so the GUI worker can show an in-app error and the user can retry.
+    """
+
+    def test_docstring_describes_real_sha256_check(self):
+        doc = updater.__doc__ or ""
+        assert "hashlib.sha256" in doc
+        assert "ChecksumError" in doc
+        assert "hashlib.sha256" in inspect.getsource(updater)
+
+    def test_matching_sidecar_runs_swap_only_after_checksum(self, tmp_path, monkeypatch):
+        payload = _stored_zip()
+        harness = _LaunchHarness(tmp_path, monkeypatch, payload)
+        digest = hashlib.sha256(payload).hexdigest().upper()
+        # build_release.write_checksum format: "<hex>  <filename>\\r\\n"
+        sidecar = f"{digest}  tai_backtest_v2.19.6_win_x64.zip\r\n"
+        harness.install_checksum(monkeypatch, text=sidecar)
+
+        with pytest.raises(SystemExit):
+            updater.launch_update(
+                "https://example.com/app.zip", "2.19.6",
+                checksum_url="https://cdn.example/special.sha256",
+            )
+
+        assert harness.events == ["download", "checksum", "swap", "popen", "exit"]
+        assert harness.checksum_calls[0][0] == "https://cdn.example/special.sha256"
+        assert harness.checksum_calls[0][1].get("follow_redirects") is True
+        assert os.path.isfile(harness.zip_path)
+
+    def test_omitted_checksum_url_uses_zip_url_suffix(self, tmp_path, monkeypatch):
+        payload = _stored_zip()
+        harness = _LaunchHarness(tmp_path, monkeypatch, payload)
+        harness.install_checksum(monkeypatch)
+
+        with pytest.raises(SystemExit):
+            updater.launch_update("https://example.com/app.zip", "2.19.6")
+
+        assert harness.checksum_calls[0][0] == "https://example.com/app.zip.sha256"
+        assert harness.events.index("checksum") < harness.events.index("swap")
+
+    def test_hash_mismatch_deletes_zip_and_skips_swap(self, tmp_path, monkeypatch):
+        payload = _stored_zip()
+        harness = _LaunchHarness(tmp_path, monkeypatch, payload)
+        harness.install_checksum(monkeypatch, text=("ab" * 32) + "  app.zip\n")
+
+        with pytest.raises(updater.ChecksumError, match="SHA-256"):
+            updater.launch_update("https://example.com/app.zip", "2.19.6")
+
+        assert "swap" not in harness.events
+        assert "exit" not in harness.events
+        assert "popen" not in harness.events
+        assert not os.path.isfile(harness.zip_path)
+
+    def test_checksum_download_failure_is_in_app_and_deletes_zip(
+            self, tmp_path, monkeypatch):
+        payload = _stored_zip()
+        harness = _LaunchHarness(tmp_path, monkeypatch, payload)
+        harness.install_checksum(monkeypatch, exc=OSError("cdn down"))
+
+        with pytest.raises(updater.ChecksumError):
+            updater.launch_update("https://example.com/app.zip", "2.19.6")
+
+        assert "swap" not in harness.events
+        assert "exit" not in harness.events
+        assert not os.path.isfile(harness.zip_path)
+
+    def test_crc_corrupt_zip_rejected_when_hash_matches(self, tmp_path, monkeypatch):
+        # Hash covers the file bytes; zipfile.testzip covers member CRCs.
+        # A sidecar that matches the corrupt bytes must still abort before swap.
+        payload = _corrupt_stored_zip()
+        harness = _LaunchHarness(tmp_path, monkeypatch, payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        harness.install_checksum(
+            monkeypatch, text=f"{digest} *tai_backtest_v2.19.6_win_x64.zip\n")
+
+        with pytest.raises(updater.ChecksumError, match="CRC"):
+            updater.launch_update("https://example.com/app.zip", "2.19.6")
+
+        assert "swap" not in harness.events
+        assert "exit" not in harness.events
+        assert not os.path.isfile(harness.zip_path)
+
+    def test_non_zip_bytes_rejected_when_hash_matches(self, tmp_path, monkeypatch):
+        payload = b"this is not a zip"
+        harness = _LaunchHarness(tmp_path, monkeypatch, payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        harness.install_checksum(monkeypatch, text=digest + "\n")
+
+        with pytest.raises(updater.ChecksumError):
+            updater.launch_update("https://example.com/app.zip", "2.19.6")
+
+        assert "swap" not in harness.events
+        assert not os.path.isfile(harness.zip_path)
+
+    def test_empty_sidecar_deletes_zip(self, tmp_path, monkeypatch):
+        payload = _stored_zip()
+        harness = _LaunchHarness(tmp_path, monkeypatch, payload)
+        harness.install_checksum(monkeypatch, text="   \n")
+
+        with pytest.raises(updater.ChecksumError):
+            updater.launch_update("https://example.com/app.zip", "2.19.6")
+
+        assert not os.path.isfile(harness.zip_path)
+        assert "swap" not in harness.events

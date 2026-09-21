@@ -8,8 +8,14 @@ that waits for this process to exit, robocopy-swaps the install directory
 
 Design notes
 ------------
-- No new pip deps: streaming download uses ``httpx`` (already bundled); the
-  checksum uses ``hashlib`` (stdlib).
+- No new pip deps: streaming download uses ``httpx`` (already bundled).
+  After the zip is assembled — and before ``write_swap_script`` or
+  ``os._exit`` — the published ``<zip>.sha256`` asset (``sha256sum``
+  format from ``build_release.write_checksum``) is fetched and checked
+  with ``hashlib.sha256``. A mismatch, a failed ``zipfile.testzip``,
+  or a checksum download error deletes the zip and raises
+  ``ChecksumError`` so the GUI can retry in-app instead of exiting
+  into a broken swap.
 - The GitHub owner/repo is derived from the ``origin`` remote when running
   from a source checkout, and falls back to the hard-coded default otherwise
   (the frozen exe has no .git).
@@ -23,6 +29,8 @@ folder (see build_release.py), so the swap source is
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import re
 import shutil
@@ -30,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from collections import deque
 from typing import Callable, NamedTuple
 
@@ -56,6 +65,7 @@ class ReleaseInfo(NamedTuple):
     version: str          # normalized, no leading "v" (e.g. "2.14.2")
     download_url: str     # browser_download_url of the release zip asset
     notes: str            # release body (markdown)
+    checksum_url: str = ""  # browser_download_url of the ``<zip>.sha256`` asset
 
 
 # ── version comparison ──────────────────────────────────────────────
@@ -103,7 +113,8 @@ def get_latest_release(timeout: float = 10.0) -> ReleaseInfo | None:
     """Fetch the latest GitHub release. Returns None on any network error.
 
     Picks the first release asset whose name ends in ``.zip`` as the
-    downloadable payload.
+    downloadable payload, and the matching ``<zip>.sha256`` asset as
+    ``checksum_url`` (or ``<zip url>.sha256`` when the listing omits it).
     """
     import httpx
 
@@ -126,16 +137,37 @@ def get_latest_release(timeout: float = 10.0) -> ReleaseInfo | None:
         return None
 
     download_url = ""
-    for asset in data.get("assets", []) or []:
-        name = (asset.get("name") or "").lower()
-        if name.endswith(".zip"):
-            download_url = asset.get("browser_download_url", "")
-            break
+    zip_name = ""
+    assets = data.get("assets", []) or []
+    for asset in assets:
+        name = asset.get("name") or ""
+        # ``*.zip.sha256`` does not end with ``.zip``.
+        if name.lower().endswith(".zip") and not download_url:
+            download_url = asset.get("browser_download_url", "") or ""
+            zip_name = name
     if not download_url:
         return None
 
+    checksum_url = ""
+    want = (zip_name + ".sha256").lower()
+    for asset in assets:
+        name = asset.get("name") or ""
+        if name.lower() == want:
+            checksum_url = asset.get("browser_download_url", "") or ""
+            if checksum_url:
+                break
+    if not checksum_url:
+        # Every current release publishes this sibling asset. If the
+        # listing omitted it, still request the conventional URL.
+        checksum_url = download_url + ".sha256"
+
     notes = data.get("body") or ""
-    return ReleaseInfo(version=version, download_url=download_url, notes=notes)
+    return ReleaseInfo(
+        version=version,
+        download_url=download_url,
+        notes=notes,
+        checksum_url=checksum_url,
+    )
 
 
 # ── download ────────────────────────────────────────────────────────
@@ -165,6 +197,133 @@ class RangeNotSupported(Exception):
 
 class OversizedDownloadError(Exception):
     """On-disk bytes exceed the declared Content-Length / Content-Range total."""
+
+
+class ChecksumError(Exception):
+    """Assembled zip failed the published SHA-256 or zip CRC check.
+
+    Raised before the swap script is written, so the process stays up and
+    the GUI can show an error the user can retry (issue #146). The zip is
+    deleted before this propagates.
+    """
+
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _delete_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _parse_sha256_sidecar(text: str) -> str:
+    """Return the hex digest from a ``sha256sum`` sidecar.
+
+    Accepts ``<hex>  <name>.zip`` (text mode, two spaces), ``<hex> *<name>.zip``
+    (binary mode), and a bare 64-char hex line. Comparison is case-insensitive.
+    """
+    line = ""
+    for raw in (text or "").splitlines():
+        raw = raw.strip().lstrip("\ufeff")
+        if raw and not raw.startswith("#"):
+            line = raw
+            break
+    if not line:
+        raise ChecksumError(
+            "Published SHA-256 checksum file is empty. "
+            "The update was not applied; retry."
+        )
+    parts = line.split()
+    token = parts[0].lower()
+    if _SHA256_HEX.match(token) is None:
+        raise ChecksumError(
+            "Published SHA-256 checksum file has no digest. "
+            "The update was not applied; retry."
+        )
+    if len(parts) >= 2:
+        name = parts[1][1:] if parts[1].startswith("*") else parts[1]
+        if not name.lower().endswith(".zip"):
+            raise ChecksumError(
+                "Published SHA-256 checksum is not for a zip asset. "
+                "The update was not applied; retry."
+            )
+    return token
+
+
+def _sha256_file(path: str) -> str:
+    """Streaming SHA-256, same chunk size as ``build_release.write_checksum``."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fetch_sha256_digest(url: str, timeout: float) -> str:
+    import httpx
+
+    try:
+        resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+        resp.raise_for_status()
+    except Exception as exc:
+        raise ChecksumError(
+            "Could not download the published SHA-256 checksum. "
+            "The update was not applied; retry."
+        ) from exc
+    text = resp.text or ""
+    if len(text) > 4096:
+        text = text[:4096]
+    return _parse_sha256_sidecar(text)
+
+
+def _assert_zip_crc(path: str) -> None:
+    """``zipfile.testzip()`` before the swap script (issue #146)."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            bad = zf.testzip()
+    except zipfile.BadZipFile as exc:
+        raise ChecksumError(
+            "Downloaded update is not a valid zip and was deleted. "
+            "Retry the update."
+        ) from exc
+    if bad is not None:
+        raise ChecksumError(
+            f"Downloaded update failed its zip CRC check ({bad}) and was deleted. "
+            "Retry the update."
+        )
+
+
+def verify_release_zip(
+    zip_path: str,
+    checksum_url: str,
+    timeout: float = 30.0,
+) -> None:
+    """SHA-256 the assembled zip, then reject a CRC-corrupt archive.
+
+    Call only after the file is fully written and before ``write_swap_script``
+    / ``os._exit``. On mismatch, a bad zip, or a checksum download failure
+    the zip is deleted and ``ChecksumError`` is raised (retryable in-app).
+    """
+    try:
+        expected = _fetch_sha256_digest(checksum_url, timeout)
+        actual = _sha256_file(zip_path)
+        if not hmac.compare_digest(actual, expected):
+            raise ChecksumError(
+                f"SHA-256 mismatch: expected {expected}, got {actual}. "
+                "The download was deleted; retry the update."
+            )
+        _assert_zip_crc(zip_path)
+    except ChecksumError:
+        _delete_file(zip_path)
+        raise
+    except Exception as exc:
+        _delete_file(zip_path)
+        raise ChecksumError(
+            "Could not verify the downloaded update and it was deleted. "
+            "Retry the update."
+        ) from exc
 
 
 class RateWatch:
@@ -826,8 +985,10 @@ def launch_update(
     zip_url: str,
     version: str,
     progress_cb: Callable[[int, int], None] | None = None,
+    *,
+    checksum_url: str = "",
 ) -> None:
-    """Download the release, write the swap script, launch it detached, exit.
+    """Download the release, verify it, write the swap script, launch it, exit.
 
     This does NOT return under normal operation — it calls ``os._exit(0)``
     after launching the detached batch so the old exe releases its files for
@@ -837,6 +998,11 @@ def launch_update(
     waits forever for the PID to die. ``os._exit`` terminates the whole process
     immediately from any thread. Exceptions before launch propagate to the
     caller.
+
+    ``checksum_url`` is the published ``<zip>.sha256`` asset. When omitted,
+    ``zip_url + ".sha256"`` is fetched. Verification runs after the zip is
+    assembled and before the swap script: a ``ChecksumError`` deletes the
+    zip and returns to the caller so the update can be retried in-app.
 
     Refuses to run unless frozen: from a source checkout ``_app_dir()`` is the
     repo root, so the swap would robocopy a release over the working tree and
@@ -858,6 +1024,10 @@ def launch_update(
     script_path = os.path.join(temp_dir, "apply_update.bat")
 
     download_release(zip_url, zip_path, progress_cb)
+
+    # Issue #146: do not write the swap script or exit until the assembled
+    # bytes match the published sidecar and the zip CRC passes.
+    verify_release_zip(zip_path, checksum_url or (zip_url + ".sha256"))
 
     app_dir = _app_dir()
     new_exe_path = os.path.join(app_dir, EXE_NAME)
