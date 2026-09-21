@@ -133,10 +133,15 @@ lost exactly this way).
    every decision, which is what lets one table span Tokyo, Frankfurt and New York.
    `max_age` is not sufficient on its own — Yahoo has been observed to keep advancing
    `regularMarketTime` on a closed market (issue #137, `^TWII` on a Sunday, Friday's
-   +2.90% re-alerted). A quote is also rejected when that stamp sits outside
-   `currentTradingPeriod.regular` (plus a closing-auction grace) or runs more than that
-   grace ahead of the last 1-min bar, so a restamped previous session cannot count as
-   fresh. Missing period *and* bars fall back to `max_age` only.
+   +2.90% re-alerted). Two independent extra rejects: the stamp sits outside
+   `currentTradingPeriod.regular` (plus a 1 h closing-auction grace — `^N225` prints
+   ~15 min after 14:30), or it runs more than one 1-min bar + that symbol's `max_age`
+   ahead of the last bar. A 5 h-after-last-bar `^KS11` official-close restamp is a
+   closed session and does **not** count toward the quorum. Yahoo rolls the period
+   forward before the next open (and on weekday holidays); only the tape rule rejects
+   a restamp that already sits inside today's period. Missing period and/or bars fall
+   back to whichever rule remains plus `max_age`, and the liveness line records
+   `session-reject N (…)` so `check_bridge.py` can see a guard drop.
    The allowance is **per symbol**, not global — match it to the feed's latency:
    **600 s** US cash equities/ETFs (real-time on Yahoo: `SOXX`, `TSM`, `QQQ`),
    **900 s** CME futures (~10 min delayed: `NQ=F`),

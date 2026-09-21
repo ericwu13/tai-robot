@@ -39,15 +39,26 @@ decision, so one symbol table covers Tokyo/Seoul, Frankfurt/Amsterdam
 and New York without any per-symbol clock table.  ``max_age`` alone is
 not enough — Yahoo sometimes keeps advancing ``regularMarketTime`` on a
 closed market (issue #137, ``^TWII`` on a Sunday restamped Friday's
-close).  A quote is also rejected when that stamp sits outside
-``currentTradingPeriod.regular`` (plus a closing-auction grace) or runs
-more than that grace ahead of the last 1-min bar, so a restamped
-previous session cannot count as fresh.  Missing period *and* bars fall
-back to ``max_age`` only and log that choice.  The allowance is PER
-SYMBOL (``max_age``), because Yahoo is real-time only for US cash — it
-publishes CME futures ~10 min and Asian/European quotes ~15-20 min
-delayed.  A single 10-minute guard silently discarded a live KOSPI -4%
-print and every NQ=F quote ever.
+close).  Two *independent* extra rejects (not aliases of each other):
+
+- period: stamp outside ``currentTradingPeriod.regular``
+  ``[start, end + PERIOD_END_GRACE_SEC]`` (1 h — ``^N225`` closing
+  auction is ~15 min after 14:30).  Waived only when the last bar
+  exists *and* the stamp is within the tape bound of that bar, so a
+  rolled-forward period (Yahoo publishes tomorrow's session before
+  the next open) does not drop a just-printed close.
+- tape: stamp more than ``BAR_WIDTH_SEC + max_age`` ahead of
+  ``timestamp[-1]``.  A 5 h-after-last-bar ``^KS11`` official-close
+  restamp is a closed session and is **not** a quorum member.
+
+Yahoo also rolls the period forward on a weekday holiday while
+leaving Friday's bars in place — only the tape rule rejects that
+shape.  Missing period and/or bars fall back to whichever rule
+remains plus ``max_age``, and log which fallback applied.  The
+allowance is PER SYMBOL (``max_age``), because Yahoo is real-time
+only for US cash — it publishes CME futures ~10 min and
+Asian/European quotes ~15-20 min delayed.  A single 10-minute guard
+silently discarded a live KOSPI -4% print and every NQ=F quote ever.
 
 Usage:
     # one check, print only (no files written unless a threshold fires)
@@ -139,14 +150,13 @@ VOTE_THRESHOLDS = {sym: cfg["vote"] for sym, cfg in SYMBOLS.items()}
 VOTE_MIN_SYMBOLS = 2
 
 QUOTE_MAX_AGE_SEC = 600    # default allowance for symbols with no max_age
-# Extra window after currentTradingPeriod.regular.end / last 1-min bar
-# before a stamp is treated as belonging to a different session.
-# ^N225 prints ~15 min after 14:30 (closing auction); ^KS11 has been
-# seen ~5 h after 14:00 (official close).  A Sunday/holiday phantom
-# stamp is a full session later (20+ h), so 6 h still rejects those
-# without replacing max_age for a just-closed live market.
-PERIOD_END_GRACE_SEC = 6 * 3600
-STAMP_AHEAD_OF_TAPE_SEC = PERIOD_END_GRACE_SEC
+# 1-min chart bars are labeled by their OPEN.  Adding this reaches the
+# bar's close before comparing a print stamp to the tape.
+BAR_WIDTH_SEC = 60
+# Closing-auction window after currentTradingPeriod.regular.end.
+# ^N225 stamps ~15 min after 14:30; 1 h covers that without accepting
+# a multi-hour official-close restamp.  Independent of the tape bound.
+PERIOD_END_GRACE_SEC = 3600
 # TPE hours.  The day window runs to 15:00 (not 14:00) so the Korea/Japan
 # closing prints — 14:30-14:50 TPE, routinely the sharpest move of their
 # session — are still fresh when the Taiwan night session opens at 15:00.
@@ -207,11 +217,23 @@ def parse_chart_quote(result: dict) -> dict:
     return quote
 
 
-def _last_bar_is_fresh(quote: dict, now: float, max_age: float) -> bool:
-    last_bar = quote.get("last_bar_time")
-    if last_bar is None:
-        return False
-    return (now - float(last_bar)) <= float(max_age) + 60
+def _tape_limit_sec(max_age: float) -> float:
+    """How far a stamp may lead ``timestamp[-1]`` (bar close + feed delay)."""
+    return BAR_WIDTH_SEC + float(max_age)
+
+
+def _session_fallback_note(quote: dict) -> str | None:
+    """Which session field(s) were missing when we fell back to max_age."""
+    has_period = (quote.get("period_start") is not None
+                  and quote.get("period_end") is not None)
+    has_tape = quote.get("last_bar_time") is not None
+    if has_period and has_tape:
+        return None
+    if not has_period and not has_tape:
+        return "session metadata missing — freshness by max_age only"
+    if not has_period:
+        return "period missing — tape + max_age only"
+    return "last bar missing — period + max_age only"
 
 
 def session_stale_reason(quote: dict,
@@ -220,32 +242,38 @@ def session_stale_reason(quote: dict,
                          max_age: float = QUOTE_MAX_AGE_SEC) -> str | None:
     """Additional reject when Yahoo's stamp does not belong to this session.
 
-    Returns the per-symbol print suffix, or None if the stamp is
-    acceptable.  This does **not** replace ``max_age`` — the caller still
-    ages ``regularMarketTime``.  Missing period *and* bars: no additional
-    reject (fallback).
+    Returns a rule-specific per-symbol print suffix, or None if the stamp
+    is acceptable.  Does **not** replace ``max_age``.  ``now`` is accepted
+    so callers can freeze the clock; the rules themselves compare the
+    payload fields to each other.
 
-    A stamp outside ``currentTradingPeriod.regular`` is ignored when the
-    last 1-min bar is itself fresh: ``NQ=F`` sometimes reports a short
-    cash-like period while the Globex tape is still printing.
+    A stamp outside ``currentTradingPeriod.regular`` is waived when the
+    last bar exists and the stamp is within the tape bound of that bar
+    (``NQ=F`` Globex / a period Yahoo has already rolled to the next
+    session).  The tape rule is *not* waived — it is what rejects a
+    weekday-holiday restamp sitting inside today's rolled period.
     """
-    now = time.time() if now is None else now
+    del now  # rules are field-vs-field; age vs wall clock is the caller's
     stamp = float(quote["quote_time"])
     start = quote.get("period_start")
     end = quote.get("period_end")
     last_bar = quote.get("last_bar_time")
+    tape_limit = _tape_limit_sec(max_age)
 
+    tape_bad = (
+        last_bar is not None
+        and stamp > float(last_bar) + tape_limit
+    )
     period_bad = (
         start is not None and end is not None
         and not (float(start) <= stamp <= float(end) + PERIOD_END_GRACE_SEC)
     )
-    tape_bad = (
-        last_bar is not None
-        and stamp > float(last_bar) + STAMP_AHEAD_OF_TAPE_SEC
-    )
-    if period_bad and _last_bar_is_fresh(quote, now, max_age):
+    if period_bad and last_bar is not None and not tape_bad:
         period_bad = False
-    if period_bad or tape_bad:
+    if tape_bad:
+        ahead = int(stamp - float(last_bar))
+        return f"STALE — stamp ahead of last bar by {ahead}s"
+    if period_bad:
         return "STALE — stamp outside trading period"
     return None
 
@@ -389,18 +417,22 @@ def in_active_window(now: datetime) -> bool:
     return now.hour >= NIGHT_START or now.hour < NIGHT_END
 
 
-def _collect_quotes(args) -> tuple[dict[str, dict], dict[str, list[str]], list[str], int]:
+def _collect_quotes(args) -> tuple[
+        dict[str, dict], dict[str, list[str]], list[str], int, list[str]]:
     """Fetch every symbol once.
 
-    Returns ``(fresh_quotes, breaches, details, fetch_failures)`` where
-    *breaches* maps ``"<tier>_<direction>"`` to the human-readable breach
-    lines and *fetch_failures* counts symbols whose fetch returned nothing.
+    Returns ``(fresh_quotes, breaches, details, fetch_failures,
+    session_rejects)`` where *breaches* maps ``"<tier>_<direction>"`` to
+    the human-readable breach lines, *fetch_failures* counts symbols
+    whose fetch returned nothing, and *session_rejects* lists symbols
+    the period/tape guard dropped (so ``monitor.log`` can show them).
     """
     fresh: dict[str, dict] = {}
     breaches: dict[str, list[str]] = {
         "signal_down": [], "signal_up": [], "alert_down": [], "alert_up": []}
     details: list[str] = []
     fetch_failures = 0
+    session_rejects: list[str] = []
 
     for sym, cfg in SYMBOLS.items():
         down_th, up_th = cfg["down"], cfg["up"]
@@ -418,15 +450,16 @@ def _collect_quotes(args) -> tuple[dict[str, dict], dict[str, list[str]], list[s
             else session_stale_reason(q, now=now, max_age=max_age))
         age_stale = age > max_age and not args.ignore_freshness
         stale = bool(session_reason) or age_stale
-        meta_missing = (
-            q.get("period_start") is None and q.get("last_bar_time") is None
-            and not args.ignore_freshness and not stale)
+        fallback = (
+            None if args.ignore_freshness or stale
+            else _session_fallback_note(q))
         if session_reason:
             extra = f", {session_reason}"
+            session_rejects.append(sym)
         elif age_stale:
             extra = f", STALE > {max_age}s allowance — ignored"
-        elif meta_missing:
-            extra = ", session metadata missing — freshness by max_age only"
+        elif fallback:
+            extra = f", {fallback}"
         else:
             extra = ""
         print(f"  [{sym}] {q['pct']:+.2f}% (px {q['price']:.2f} vs pc "
@@ -441,7 +474,7 @@ def _collect_quotes(args) -> tuple[dict[str, dict], dict[str, list[str]], list[s
         elif q["pct"] >= up_th:
             breaches[f"{cfg['tier']}_up"].append(line)
 
-    return fresh, breaches, details, fetch_failures
+    return fresh, breaches, details, fetch_failures, session_rejects
 
 
 def _vote_direction(fresh: dict[str, dict],
@@ -480,7 +513,7 @@ def check_once(args, state: dict) -> dict:
     print(f"[{now:%Y-%m-%d %H:%M:%S}] checking "
           f"{', '.join(SYMBOLS)} (min move override: {args.min_move or '-'})")
 
-    fresh, breaches, details, fetch_failures = _collect_quotes(args)
+    fresh, breaches, details, fetch_failures, session_rejects = _collect_quotes(args)
     fired: list[str] = []
 
     # The vote direction IS the quorum: computed up front because the
@@ -606,7 +639,9 @@ def check_once(args, state: dict) -> dict:
     summary = (f"fresh {len(fresh)}/{len(SYMBOLS)} ({', '.join(details) or 'none'})"
                f" | fired: {'+'.join(fired) or 'none'}"
                f" | vote: {vote_note}"
-               + (f" | fetch-fail {fetch_failures}" if fetch_failures else ""))
+               + (f" | fetch-fail {fetch_failures}" if fetch_failures else "")
+               + (f" | session-reject {len(session_rejects)} "
+                  f"({', '.join(session_rejects)})" if session_rejects else ""))
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_result"] = summary
     append_log(log_path_for(args), f"{now:%Y-%m-%d %H:%M:%S} TPE | {summary}")
