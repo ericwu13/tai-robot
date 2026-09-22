@@ -272,14 +272,19 @@ def test_status_strip_padding_clears_the_resize_drag_insets():
 
 
 def test_resize_insets_from_metrics_cover_the_corner_grip():
-    """The bottom-right grip is a scrollbar wide, larger than the frame."""
+    """The bottom-right grip is a scrollbar wide, larger than the frame.
+
+    The padded border is isotropic (SM_CXPADDEDBORDER only). Index 93 is
+    absent on purpose: a future GetSystemMetrics(93) must KeyError here.
+    Bottom inset is SM_CYFRAME + that same pad (5 + 4 = 9).
+    """
     from src.ui.widgets import resize_insets_from_metrics
 
     def metrics(index: int) -> int:
-        return {32: 4, 33: 5, 92: 4, 93: 3, 2: 17}[index]
+        return {32: 4, 33: 5, 92: 4, 2: 17}[index]
 
     # (left edge, right/corner, bottom edge)
-    assert resize_insets_from_metrics(metrics) == (8, 17, 8)
+    assert resize_insets_from_metrics(metrics) == (8, 17, 9)
 
 
 def test_resize_insets_are_zero_off_windows(monkeypatch):

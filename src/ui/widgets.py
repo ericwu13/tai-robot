@@ -349,15 +349,16 @@ def resize_insets_from_metrics(metrics) -> tuple[int, int, int]:
     """(left, right, bottom) client pixels a thick frame claims for resize.
 
     ``metrics`` is ``GetSystemMetrics``. Indexes: SM_CXFRAME 32,
-    SM_CYFRAME 33, SM_CXPADDEDBORDER 92, SM_CYPADDEDBORDER 93,
-    SM_CXVSCROLL 2. The right inset is the corner grip — at least a
+    SM_CYFRAME 33, SM_CXPADDEDBORDER 92, SM_CXVSCROLL 2. The padded
+    border is isotropic: the same SM_CXPADDEDBORDER value is added on
+    both axes. The right inset is the corner grip — at least a
     scrollbar wide — so a button packed into the bottom-right is not
     HTBOTTOMRIGHT (a window drag). Values are already device pixels.
     """
     frame_x = max(0, int(metrics(32)))
     frame_y = max(0, int(metrics(33)))
     pad_x = max(0, int(metrics(92)))
-    pad_y = max(0, int(metrics(93)))
+    pad_y = pad_x
     grip = max(0, int(metrics(2)))
     edge_x = frame_x + pad_x
     edge_y = frame_y + pad_y
