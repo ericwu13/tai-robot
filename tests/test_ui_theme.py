@@ -234,6 +234,88 @@ def test_labels_import_seam_titles_not_redefined():
     assert "尚無結果" in labels.REPORT_EMPTY
 
 
+def test_tooltip_opens_above_a_bottom_edge_control():
+    """Issue #139 item 3: a tooltip under a status-strip button falls off
+    the work area. The window manager clamps it back onto the button,
+    and the resulting Enter/Leave loop makes the hit feel sluggish."""
+    from src.ui.widgets import tooltip_origin
+
+    # Room below: open underneath, left-aligned with the control.
+    assert tooltip_origin(
+        (10, 10, 40, 20), (80, 30), (0, 0, 800, 600), gap=6) == (10, 36)
+
+    # Flush with the bottom edge: open above, and do not cover the control.
+    x, y = tooltip_origin(
+        (100, 1000, 180, 28), (200, 36), (0, 0, 1920, 1040), gap=6)
+    assert (x, y) == (100, 958)
+    assert y + 36 <= 1000
+
+    # Past the right edge: clamp inside the screen.
+    x, y = tooltip_origin(
+        (700, 10, 40, 20), (150, 30), (0, 0, 800, 600), gap=6)
+    assert x == 650 and y == 36
+    assert x + 150 <= 800
+
+
+def test_status_strip_padding_clears_the_resize_drag_insets():
+    """Issue #139 item 3: History / Report / Updates must sit above
+    HTBOTTOM and left of the corner grip. Insets are device pixels; the
+    logical rhythm still goes through S()."""
+    from src.ui.widgets import status_strip_padding
+
+    assert status_strip_padding((0, 0, 0)) == S(16, 6, 8, 6)
+    assert status_strip_padding((-4, -1, -8)) == S(16, 6, 8, 6)
+    left, top, right, bottom = status_strip_padding((9, 21, 13))
+    assert (left, top) == (S(16), S(6))  # left inset is not applied
+    assert right == S(8) + 21
+    assert bottom == S(6) + 13
+
+
+def test_resize_insets_from_metrics_cover_the_corner_grip():
+    """The bottom-right grip is a scrollbar wide, larger than the frame.
+
+    The padded border is isotropic (SM_CXPADDEDBORDER only). Index 93 is
+    absent on purpose: a future GetSystemMetrics(93) must KeyError here.
+    Bottom inset is SM_CYFRAME + that same pad (5 + 4 = 9).
+    """
+    from src.ui.widgets import resize_insets_from_metrics
+
+    def metrics(index: int) -> int:
+        return {32: 4, 33: 5, 92: 4, 2: 17}[index]
+
+    # (left edge, right/corner, bottom edge)
+    assert resize_insets_from_metrics(metrics) == (8, 17, 9)
+
+
+def test_resize_insets_are_zero_off_windows(monkeypatch):
+    import sys
+    from src.ui.widgets import window_resize_insets
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert window_resize_insets() == (0, 0, 0)
+
+
+def test_issue_139_helpers_are_wired_into_the_chrome():
+    """The geometry helpers have to be called. A pure function that
+    nothing packs does not move the buttons."""
+    import inspect
+    import run_backtest as rb
+    from src.ui import widgets
+
+    strip = inspect.getsource(rb.BacktestApp._build_status_strip)
+    assert "status_strip_padding" in strip
+    assert "window_resize_insets" in strip
+    chat = inspect.getsource(rb.BacktestApp._build_chat_panel)
+    assert "install_composer_placeholder" in chat
+    assert "_chat_composer" in chat
+    # The transcript must not host the floating centered hint.
+    assert "placeholder=CHAT_PLACEHOLDER" not in chat
+    send = inspect.getsource(rb.BacktestApp._send_chat)
+    assert "composer_value" in send
+    tip = inspect.getsource(widgets.attach_tooltip)
+    assert "tooltip_origin" in tip
+
+
 def test_ui_package_does_not_import_run_backtest():
     import src.ui.labels as labels_mod
     import src.ui.raster as raster_mod
@@ -463,6 +545,100 @@ def test_tag_text_log_placeholder_clears_on_first_message(themed_root):
     assert log._ph_label.place_info() == {}
     log.clear()
     assert str(log._ph_label.place_info().get("anchor", "")) == "center"
+
+
+@_tk_skip
+def test_composer_placeholder_is_not_a_message(themed_root):
+    """Issue #139 item 4: the hint sits on the caret line, and Send must
+    not post it. A real character replaces the hint."""
+    import tkinter as tk
+    from src.ui.labels import CHAT_PLACEHOLDER
+    from src.ui.widgets import (
+        composer_value, install_composer_placeholder, note_composer_key,
+        refresh_composer_placeholder, themed_scrolled_text,
+    )
+
+    _well, text = themed_scrolled_text(themed_root, height=4, scrollbar=False)
+    install_composer_placeholder(text, CHAT_PLACEHOLDER)
+    assert "開始對話" in text.get("1.0", "end-1c")
+    assert composer_value(text) == ""
+
+    # Enter leaves the hint in place (the send path ignores it).
+    note_composer_key(text, "Return", "\r")
+    assert composer_value(text) == ""
+    assert "開始對話" in text.get("1.0", "end-1c")
+
+    # Shift+Enter is a newline: the hint must not stay glued to it.
+    note_composer_key(text, "Return", "\r", state=1)
+    text.insert(tk.INSERT, "\n")
+    assert "開始對話" not in text.get("1.0", "end-1c")
+    text.delete("1.0", tk.END)
+    refresh_composer_placeholder(text)
+    assert composer_value(text) == ""
+
+    note_composer_key(text, "a", "a")
+    text.insert(tk.INSERT, "a")
+    assert composer_value(text) == "a"
+
+    text.delete("1.0", tk.END)
+    refresh_composer_placeholder(text)
+    assert composer_value(text) == ""
+    assert "Start chatting" in text.get("1.0", "end-1c")
+
+
+def _pad4(widget) -> tuple[int, int, int, int]:
+    raw = widget.cget("padding")
+    if isinstance(raw, str):
+        parts = [int(float(p)) for p in raw.split()]
+    else:
+        parts = [int(p) for p in raw]
+    if len(parts) == 1:
+        return (parts[0], parts[0], parts[0], parts[0])
+    if len(parts) == 2:
+        return (parts[0], parts[1], parts[0], parts[1])
+    if len(parts) == 3:
+        return (parts[0], parts[1], parts[2], parts[1])
+    return (parts[0], parts[1], parts[2], parts[3])
+
+
+@_tk_skip
+def test_issue_139_bottom_chrome_and_chat_composer(monkeypatch):
+    """Items 3–4 on a withdrawn root (the headless construct path).
+
+    The status strip's right/bottom padding includes the resize/drag
+    inset, and the chat hint lives in the input beside Send — not as a
+    label floating in the transcript.
+    """
+    import run_backtest as rb
+    from src.live.headless_app import HeadlessBotApp
+    from src.ui.widgets import composer_value
+
+    monkeypatch.setattr(rb, "window_resize_insets", lambda: (0, 21, 13))
+    root = _new_root()
+    root.withdraw()
+    try:
+        app = HeadlessBotApp(root)
+        left, _top, right, bottom = _pad4(app._status_strip)
+        assert right >= 21
+        assert bottom >= 13
+        assert left == S(16)
+        for btn in (app.btn_update, app.btn_report):
+            assert str(btn.cget("cursor")) == "hand2"
+
+        assert app.chat_display._ph_label is None
+        assert composer_value(app.chat_input) == ""
+        assert "開始對話" in app.chat_input.get("1.0", "end-1c")
+        assert app.btn_send.master is app._chat_composer
+        assert app._chat_input_well.master is app._chat_composer
+        assert str(app.btn_send.pack_info()["side"]) == "right"
+        assert str(app._chat_input_well.pack_info()["side"]) == "left"
+        # Generate stays a secondary action, not on the composer row.
+        assert app.btn_generate.master is not app._chat_composer
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
 
 @_tk_skip
