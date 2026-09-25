@@ -1,7 +1,8 @@
 """Tests for RegimeSwitchingRunner: classification, apply, resume."""
 
-import os
 import json
+import logging
+import os
 from datetime import datetime, timedelta, timezone
 
 from src.market_data.models import Bar
@@ -143,20 +144,83 @@ class TestClassification:
         assert any("Classified" in l for l in lines)
         assert runner._manager._state.last_assessed == "2026-07-08|NIGHT"
 
-    def test_insufficient_bars_backs_off(self, tmp_path):
+    def test_insufficient_bars_backs_off(self, tmp_path, caplog):
         # Classifier failure sets a retry backoff instead of hammering
-        # (and warning) on every 30s poll until the next night.
+        # on every 30s poll until the next night. Issue #151: that bail
+        # must be a visible WARN — the old test pinned a silent return.
         runner = _make_runner(tmp_path)
         runner._manager._bars_provider = lambda: []
         now = datetime(2026, 7, 10, 4, 58, tzinfo=_TZ_TAIPEI)
-        runner.on_status_poll(now)
-        assert runner._classify_retry_after is not None
-        # Within the backoff window the manager is not called again
+        with caplog.at_level(logging.WARNING, logger="src.live.regime_switching_runner"):
+            runner.on_status_poll(now)
+        assert runner._classify_retry_after == now + timedelta(minutes=30)
+        assert any(
+            r.levelno >= logging.WARNING
+            and "2026-07-09|NIGHT" in r.message
+            and "no result" in r.message
+            for r in caplog.records
+        )
+        # Within the backoff window the manager is not called again,
+        # and the skip itself is logged (not a silent return).
         calls = []
         orig = runner._manager.classify_session
         runner._manager.classify_session = lambda *a, **k: calls.append(a) or orig(*a, **k)
-        runner.on_status_poll(now + timedelta(seconds=30))
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="src.live.regime_switching_runner"):
+            runner.on_status_poll(now + timedelta(seconds=30))
         assert calls == []
+        assert any(
+            r.levelno == logging.INFO and "retry backoff" in r.message
+            for r in caplog.records
+        )
+
+    def test_catch_up_none_warns_and_retries(self, tmp_path, caplog):
+        """#151: catch-up + _get_regime_result()→None → WARN and 30-min retry.
+
+        A post-close poll that cannot classify must name the blocked
+        night. Pre-fix, _maybe_classify only armed the backoff and returned.
+        """
+        runner = _make_runner(tmp_path)
+        runner._manager._get_regime_result = lambda: None
+        # Night that opened 2026-07-08 closed 05:00 on 07-09; noon is catch-up.
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=_TZ_TAIPEI)
+        with caplog.at_level(logging.WARNING, logger="src.live.regime_switching_runner"):
+            lines = runner.on_status_poll(now)
+        assert not any("Classified" in line for line in lines)
+        assert runner._classify_retry_after == now + timedelta(minutes=30)
+        assert runner._manager._state.last_assessed != "2026-07-08|NIGHT"
+        warns = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == "src.live.regime_switching_runner"
+        ]
+        assert len(warns) == 1
+        assert "2026-07-08|NIGHT" in warns[0].message
+        assert "catch-up" in warns[0].message
+        assert "no result" in warns[0].message
+        # Still unassessed, so the next poll after the backoff tries again.
+        runner._classify_retry_after = now
+        calls = []
+        runner._manager.classify_session = (
+            lambda *a, **k: calls.append(a) or None
+        )
+        runner.on_status_poll(now + timedelta(minutes=30))
+        assert calls, "catch-up must retry classify_session after the backoff"
+
+    def test_not_due_bail_is_logged(self, tmp_path, caplog):
+        """#151: classification_due→None must not return silently."""
+        runner = _make_runner(tmp_path)
+        runner._manager._state.last_assessed = "2026-07-09|NIGHT"
+        now = datetime(2026, 7, 10, 12, 0, tzinfo=_TZ_TAIPEI)
+        with caplog.at_level(logging.INFO, logger="src.live.regime_switching_runner"):
+            lines = runner.on_status_poll(now)
+        assert not any("Classified" in line for line in lines)
+        assert runner._classify_retry_after is None
+        assert any(
+            r.levelno == logging.INFO
+            and "not due" in r.message
+            and "2026-07-09|NIGHT" in r.message
+            for r in caplog.records
+        )
 
 
 class TestApplyPending:
