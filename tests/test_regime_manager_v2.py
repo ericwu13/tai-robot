@@ -2,12 +2,13 @@
 
 import csv
 import json
+import logging
 import os
 
 from src.market_data.models import Bar
 from src.regime.manager import RegimeManager
 from src.regime.state_machine import RegimeConfig
-from src.regime.store import _V2_HEADER
+from src.regime.store import _V2_HEADER, load_state
 from datetime import datetime
 
 
@@ -82,14 +83,67 @@ class TestClassifySession:
         rec2 = mgr.classify_session("2026-07-10", "NIGHT")
         assert rec2 is not None
 
-    def test_insufficient_bars_returns_none(self, tmp_path):
+    def test_insufficient_bars_returns_none(self, tmp_path, caplog):
         bot_dir = str(tmp_path / "TX00_test")
         os.makedirs(bot_dir, exist_ok=True)
         short_bars = _make_bars(10)  # only 10 hourly bars, need >= 52
         mgr = RegimeManager(bot_dir, _make_cfg(), bars_provider=lambda: short_bars)
 
-        rec = mgr.classify_session("2026-07-09", "NIGHT")
+        with caplog.at_level(logging.WARNING, logger="src.regime.manager"):
+            rec = mgr.classify_session("2026-07-09", "NIGHT")
         assert rec is None
+        # #151 keeps this warning — it is the named blocker for short history.
+        assert any(
+            "insufficient bars" in r.message for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+        assert mgr._state.last_assessed == ""
+
+    def test_save_state_failure_keeps_disk_and_memory_consistent(self, tmp_path, monkeypatch):
+        """#151: save_state raising must not leave memory last_assessed ahead of disk.
+
+        Pre-fix, classify_session stamped last_assessed, logged the OSError,
+        and returned the recommendation — the next poll then silent-deduped.
+        """
+        bot_dir = str(tmp_path / "TX00_test")
+        os.makedirs(bot_dir, exist_ok=True)
+        state_path = os.path.join(bot_dir, "regime_state.json")
+        hist_path = os.path.join(bot_dir, "regime_history.csv")
+        prior = {
+            "last_assessed": "2026-07-08|NIGHT",
+            "key_format": "open-date",
+            "session_count": 3,
+            "pending_count": 1,
+            "effective_regime": "trending-up",
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(prior, f)
+        disk_before = open(state_path, encoding="utf-8").read()
+
+        mgr = RegimeManager(bot_dir, _make_cfg(), bars_provider=lambda: _make_bars())
+        assert mgr._state.last_assessed == "2026-07-08|NIGHT"
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        import src.regime.manager as regime_manager
+        real_save = regime_manager.save_state
+        monkeypatch.setattr(regime_manager, "save_state", _boom)
+        rec = mgr.classify_session("2026-07-09", "NIGHT")
+
+        assert rec is None
+        assert open(state_path, encoding="utf-8").read() == disk_before
+        assert not os.path.exists(hist_path)
+        disk = load_state(state_path)
+        assert mgr._state.last_assessed == disk.last_assessed == "2026-07-08|NIGHT"
+        assert mgr._state.session_count == disk.session_count
+        assert mgr._state.pending_count == disk.pending_count
+        assert mgr._state.effective_regime == disk.effective_regime
+        # The unpersisted night is not deduped — a later poll can classify it.
+        monkeypatch.setattr(regime_manager, "save_state", real_save)
+        rec2 = mgr.classify_session("2026-07-09", "NIGHT")
+        assert rec2 is not None
+        assert mgr._state.last_assessed == "2026-07-09|NIGHT"
 
     def test_persists_state_file(self, tmp_path):
         bot_dir = str(tmp_path / "TX00_test")

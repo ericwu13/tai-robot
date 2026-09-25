@@ -107,6 +107,7 @@ class RegimeManager:
             logger.debug("[REGIME] classify_session skipped — already assessed %s", dedup_key)
             return None
 
+        prior_state = self._state
         try:
             result = self._get_regime_result()
             if result is None:
@@ -116,15 +117,20 @@ class RegimeManager:
             rec = self._selector.select(self._state, self.cfg)
         except Exception as e:
             logger.exception("[REGIME] classify_session error: %s", e)
+            self._state = prior_state
             return None
 
-        # Stamp the on-disk dedup key before persisting (survives restart)
+        # Stamp the on-disk dedup key before persisting (survives restart).
+        # If the write fails, roll memory back to disk — a stamp that only
+        # exists in this process makes the next poll silent-dedup (#151).
         self._state.last_assessed = dedup_key
 
         try:
             save_state(self._state_path, self._state, rec, session_date)
         except Exception as e:
             logger.exception("[REGIME] Error saving state: %s", e)
+            self._rollback_unpersisted_assessment(dedup_key, prior_state)
+            return None
 
         try:
             append_history(self._hist_path, session_date, self._state, rec)
@@ -145,6 +151,29 @@ class RegimeManager:
             self._state.effective_regime, rec.action, rec.strategy_name,
         )
         return rec
+
+    def _rollback_unpersisted_assessment(self, dedup_key: str, prior_state) -> None:
+        """Reload disk after a failed ``save_state`` so memory cannot lead it.
+
+        ``last_assessed`` is the dedup key. A stamp that exists only in this
+        process makes ``classification_due`` return None on every later poll,
+        with no warning (#151). Disk wins; if the reload itself fails, fall
+        back to the pre-step state and clear the new key.
+        """
+        try:
+            self._state = load_state(self._state_path)
+        except Exception as e:
+            logger.exception(
+                "[REGIME] Could not reload state after save failure: %s", e)
+            self._state = prior_state
+            if self._state.last_assessed == dedup_key:
+                self._state.last_assessed = ""
+        logger.warning(
+            "[REGIME] save_state failed for %s — memory reloaded from disk "
+            "(last_assessed=%s)",
+            dedup_key,
+            self._state.last_assessed or "(none)",
+        )
 
     def do_record_session_result(
         self,
