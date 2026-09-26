@@ -48,11 +48,16 @@ def _fold(n: int, base_pnls: list[int], cand_pnls: list[int],
 
 
 def _winning_folds() -> list[Fold]:
-    """3 folds, candidate ahead in every one, profitable holdout."""
+    """4 non-empty divergent folds, candidate ahead in every one.
+
+    Issue #153 requires ≥4 folds with cand.n>0 and ≥3 divergent folds
+    before majority, so the old 3-fold PASS fixture is no longer enough.
+    """
     return [
         _fold(0, [100, -200], [200, -100]),   # Δ +200
         _fold(1, [100, -200], [-50, 100]),    # Δ +150
-        _fold(2, [100, -200], [300, -100]),   # Δ +300, holdout PF 3.0
+        _fold(2, [100, -200], [300, -100]),   # Δ +300
+        _fold(3, [100, -200], [250, -50]),    # Δ +200, holdout PF 5.0
     ]
 
 
@@ -251,7 +256,7 @@ class TestDecideMultifoldVerdict:
         v = decide_multifold_verdict(_winning_folds())
         assert v.passed
         assert not v.used_criteria
-        assert any("fold majority" in r and "3/3" in r for r in v.reasons)
+        assert any("fold majority" in r and "4/4" in r for r in v.reasons)
         assert any("paired total" in r for r in v.reasons)
 
     def test_losing_holdout_fold_fails(self):
@@ -335,6 +340,30 @@ class TestDecideMultifoldVerdict:
         assert v.passed  # the impossible dd threshold does NOT gate here
         assert any("window-length" in r for r in v.reasons)
 
+    def test_three_nonempty_folds_fail_issue_153_floor(self):
+        """FAILS pre-fix: 3 winning folds used to PASS. #153 requires ≥4."""
+        folds = [
+            _fold(0, [100, -200], [200, -100]),
+            _fold(1, [100, -200], [-50, 100]),
+            _fold(2, [100, -200], [300, -100]),
+        ]
+        v = decide_multifold_verdict(folds)
+        assert not v.passed
+        assert any("non-empty folds" in r and "✗" in r for r in v.reasons)
+
+    def test_two_divergent_folds_fail_before_majority(self):
+        """4 non-empty folds but only 2 differ — majority must not pass."""
+        folds = [
+            _fold(0, [100, -200], [200, -100]),   # Δ ≠ 0
+            _fold(1, [100, -50], [100, -50], shared=2),  # Δ = 0
+            _fold(2, [100, -50], [100, -50], shared=2),  # Δ = 0
+            _fold(3, [100], [400]),               # Δ ≠ 0, holdout profitable
+        ]
+        v = decide_multifold_verdict(folds)
+        assert not v.passed
+        assert any("divergent folds" in r and "before majority" in r and "✗" in r
+                   for r in v.reasons)
+
 
 # ── run_multifold_validation ──
 
@@ -388,7 +417,7 @@ class TestFormatMultifoldBlock:
         assert "PASS" in block
         assert "AI: FooEvo1" in block
         assert "deploy manually" in block
-        assert block.count("\n  #") == 3
+        assert block.count("\n  #") == 4
         assert "Δ" in block and "shared" in block
 
     def test_fail_block(self):
