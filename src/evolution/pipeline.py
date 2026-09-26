@@ -14,15 +14,17 @@ auto-pipeline enabled:
      baseline and candidate on the same bars (``run_ab_backtest``).
   4. ``decide_verdict`` checks the plan's own criteria (or a default
      not-worse-than-baseline guard) plus hard floors.
-  5. PASS → the GUI saves the candidate to the StrategyStore and
-     registers it in the dropdown. Deployment stays manual — an AI
-     that redeploys its own live trading logic is a failure mode.
+  5. A clean PASS promotes the candidate in the StrategyPool to
+     ``validated`` only. It does not write the StrategyStore and does
+     not register the STRATEGIES dropdown (issue #153 — the EMA50→80
+     auto-save). Deployment stays manual.
 
-A third, additive validation layer lives at the bottom of this module:
 ``run_multifold_validation`` / ``decide_multifold_verdict`` slice one
 continuous backtest into consecutive rolling folds and compare the two
 sides fold by fold, because a single 14-day holdout on a strategy that
-trades ~30×/month decides on ~14 trades (issue #99).
+trades ~30×/month decides on ~14 trades (issue #99). The Saturday /
+deep path ANDs that verdict with ``decide_month_gates`` (prior-month
+floor, latest-month edge share, holdout-in-latest-month rule).
 """
 
 from __future__ import annotations
@@ -136,6 +138,15 @@ ABS_PF_FLOOR = 1.0
 # next window rather than PASS or FAIL on coincidence.
 MIN_EXPRESSED_TRADES = 3
 
+# Issue #153. Majority over a couple of folds is a coin flip, and a
+# holdout that sits inside the latest calendar month can crown a
+# September-only stretch (EMA50→80). These floors are ANDed with the
+# walk-forward verdict on the Saturday / deep path.
+MIN_NONEMPTY_FOLDS = 4          # folds with cand.n > 0
+MIN_DIVERGENT_FOLDS = 3         # folds with Δ ≠ 0, required before majority
+PRIOR_MONTH_SLACK_TWD = 5000    # cand prior-months net ≥ base − this
+LATEST_MONTH_EDGE_SHARE_MAX = 0.50
+
 
 def _strip_client_annotations(plan_text: str) -> tuple[str, bool]:
     """``(body, was_truncated)`` — the model's own text, annotations removed.
@@ -204,7 +215,7 @@ def parse_plan_directives(plan_text: str) -> dict[str, Any]:
     the default not-worse-than-baseline guard rather than dying on a
     formatting whim of the model.
     """
-    out: dict[str, Any] = {"action": "change", "criteria": None}
+    out: dict[str, Any] = {"action": "change", "criteria": None, "knobs": None}
     matches = _JSON_FENCE.findall(plan_text or "")
     if not matches:
         return out
@@ -230,6 +241,9 @@ def parse_plan_directives(plan_text: str) -> dict[str, Any]:
                 val = val / 100.0  # model wrote 45 for 45%
             criteria[key] = val
     out["criteria"] = criteria or None
+    raw_knobs = data.get("knobs")
+    if isinstance(raw_knobs, dict) and raw_knobs:
+        out["knobs"] = dict(raw_knobs)
     return out
 
 
@@ -383,6 +397,9 @@ class EvolutionVerdict:
     passed: bool
     reasons: list[str] = field(default_factory=list)
     used_criteria: bool = False
+    # Holdout sits in the latest calendar month and the prior-month OOS
+    # check did not clear (issue #153). Never a pool promotion.
+    provisional: bool = False
 
 
 def decide_verdict(baseline: ABResult, candidate: ABResult,
@@ -778,8 +795,20 @@ def format_deep_verdict_block(baseline: DeepResult, candidate: DeepResult,
     return "\n".join(lines)
 
 
-def _verdict_trailer(verdict: EvolutionVerdict, saved_as: str) -> list[str]:
-    """The saved-as / rejected footer shared by every verdict formatter."""
+def _verdict_trailer(verdict: EvolutionVerdict, saved_as: str, *,
+                     pool_promoted: str = "") -> list[str]:
+    """The saved-as / rejected footer shared by every verdict formatter.
+
+    ``pool_promoted`` is the StrategyPool id when a clean PASS was
+    recorded as ``validated``. That path does not touch StrategyStore
+    or the STRATEGIES dropdown (issue #153).
+    """
+    if verdict.passed and pool_promoted:
+        return [
+            f"已晉升 StrategyPool status=validated ({pool_promoted}) — "
+            f"未寫入 StrategyStore、未註冊 STRATEGIES 下拉選單。"
+            f"部署仍需手動 Operator deploy stays manual.",
+        ]
     if verdict.passed and saved_as:
         return [
             f"已存檔 Saved as「{saved_as}」— 部署仍需手動 deploy manually when ready.",
@@ -788,7 +817,10 @@ def _verdict_trailer(verdict: EvolutionVerdict, saved_as: str) -> list[str]:
             "semi_auto — the future is the only true out-of-sample test.",
         ]
     if not verdict.passed:
-        return ["候選未通過，未存檔 Candidate rejected — nothing was saved."]
+        lines = ["候選未通過，未存檔 Candidate rejected — nothing was saved."]
+        if verdict.provisional:
+            lines.append("PROVISIONAL — never auto-save.")
+        return lines
     return []
 
 
@@ -1006,10 +1038,13 @@ def decide_multifold_verdict(
 
     Gates (all ANDed, every one leaves a reason line): the most recent
     fold must be profitable in absolute terms (ABS_PF_FLOOR — the
-    issue #99 loophole); the mutation must have expressed itself; the
-    candidate must beat the baseline in at least half the folds where
-    the two differ; and the paired total must be positive. Plan criteria,
-    when given, apply to the candidate's AGGREGATE across all folds.
+    issue #99 loophole); the mutation must have expressed itself; at
+    least ``MIN_NONEMPTY_FOLDS`` folds have candidate trades and at
+    least ``MIN_DIVERGENT_FOLDS`` folds actually differ (issue #153,
+    checked before majority); the candidate must beat the baseline in
+    at least half the folds where the two differ; and the paired total
+    must be positive. Plan criteria, when given, apply to the
+    candidate's AGGREGATE across all folds.
     """
     if not folds:
         return EvolutionVerdict(
@@ -1055,10 +1090,26 @@ def decide_multifold_verdict(
             f"mutation expressed: {divergent} divergent trades across "
             f"{len(folds)} folds ({shared} identical) ✓")
 
+    # 2b. Sample floors (issue #153) — before majority. Two divergent
+    #     folds is a coin flip; a candidate that barely traded cannot
+    #     claim a majority.
+    nonempty = [f for f in folds if f.cand.n > 0]
+    n_ok = len(nonempty) >= MIN_NONEMPTY_FOLDS
+    reasons.append(
+        f"non-empty folds: {len(nonempty)} ≥ {MIN_NONEMPTY_FOLDS} "
+        f"(cand.n>0): {'✓' if n_ok else '✗'}")
+    passed = passed and n_ok
+
+    div_folds = [f for f in folds if f.delta != 0]
+    d_ok = len(div_folds) >= MIN_DIVERGENT_FOLDS
+    reasons.append(
+        f"divergent folds: {len(div_folds)} ≥ {MIN_DIVERGENT_FOLDS} "
+        f"before majority: {'✓' if d_ok else '✗'}")
+    passed = passed and d_ok
+
     # 3. Fold majority — consistency, not one lucky month. Folds where
     #    both sides scored identically carry no directional information
     #    and are excluded from the count.
-    div_folds = [f for f in folds if f.delta != 0]
     if div_folds:
         wins = sum(1 for f in div_folds if f.delta > 0)
         ok = wins * 2 >= len(div_folds)
@@ -1179,4 +1230,252 @@ def format_multifold_block(folds: list[Fold], verdict: EvolutionVerdict,
                  else "預設門檻 default paired fold gates:")
     lines.extend(f"  {r}" for r in verdict.reasons)
     lines.extend(_verdict_trailer(verdict, saved_as))
+    return "\n".join(lines)
+
+
+# ── Month gates (issue #153) ──────────────────────────────────────────
+#
+# A single recent holdout can be entirely inside the latest calendar
+# month. EMA50→80 cleared that window because September carried more
+# than the whole full-sample edge while May–Aug fell through the
+# baseline−5k floor. These checks use exit-month nets from one
+# continuous run (the same trades ``run_multifold_validation`` slices).
+
+_MINUS = "−"  # U+2212 — matches the Kai calibration fail lines
+_MONTH_ABBR = (
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+def _signed(n: int) -> str:
+    """``+35670`` / ``−8430`` with no thousands separator."""
+    n = int(n)
+    if n < 0:
+        return f"{_MINUS}{abs(n)}"
+    return f"+{n}"
+
+
+def _month_of(stamp: str) -> str:
+    """``YYYY-MM`` from an exit/holdout stamp, or ``""``."""
+    s = stamp or ""
+    if len(s) >= 7 and s[4] == "-" and s[:4].isdigit() and s[5:7].isdigit():
+        month = int(s[5:7])
+        if 1 <= month <= 12 and int(s[:4]) > 0:
+            return s[:7]
+    return ""
+
+
+def _month_label(ym: str) -> str:
+    month = int(ym[5:7]) if len(ym) >= 7 else 0
+    if 1 <= month <= 12:
+        return _MONTH_ABBR[month]
+    return ym
+
+
+def _by_month(trades: list) -> dict[str, list]:
+    buckets: dict[str, list] = {}
+    for t in trades or []:
+        mk = _month_of(getattr(t, "exit_dt", "") or "")
+        if not mk:
+            continue
+        buckets.setdefault(mk, []).append(t)
+    return buckets
+
+
+def _pnl_of(trades: list) -> int:
+    return sum(int(getattr(t, "pnl", 0) or 0) for t in trades)
+
+
+def holdout_window_start(bars, test_days: int) -> str:
+    """Start of the deep holdout, ``YYYY-MM-DD HH:MM``.
+
+    Same anchor as ``split_train_test``: the last bar minus
+    ``test_days``. Empty when the window can't be dated.
+    """
+    if not bars or not test_days or test_days <= 0:
+        return ""
+    end = getattr(bars[-1], "dt", None)
+    if end is None:
+        return ""
+    try:
+        start = end - timedelta(days=int(test_days))
+    except (TypeError, ValueError):
+        return ""
+    try:
+        return start.strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, AttributeError):
+        return ""
+
+
+def decide_month_gates(base_trades: list, cand_trades: list, *,
+                       holdout_start: str | None = None,
+                       slack_twd: int = PRIOR_MONTH_SLACK_TWD,
+                       share_max: float = LATEST_MONTH_EDGE_SHARE_MAX,
+                       ) -> EvolutionVerdict:
+    """Prior-month floor, latest-month edge share, holdout placement.
+
+    Latest calendar month is the newest ``YYYY-MM`` among dated exits
+    on either side (September in the #153 window). Prior months are
+    everything else.
+
+    1. ``cand_prior_net >= base_prior_net - slack_twd`` (default 5k TWD).
+       A miss is ``prior-months collapse``.
+    2. When full-window edge (cand − base) is positive, the latest
+       month's share of that edge must be ≤ 50%. A miss is
+       ``calendar-month dominated``.
+    3. If the deep holdout starts in that latest month, the prior-month
+       block must show candidate PF ≥ 1 and Δ ≥ 0. Otherwise the
+       verdict is provisional and must never auto-save. An unknown
+       holdout start fails closed the same way.
+    """
+    base_b = _by_month(base_trades)
+    cand_b = _by_month(cand_trades)
+    months = set(base_b) | set(cand_b)
+    if not months:
+        return EvolutionVerdict(
+            False,
+            ["month gates: no dated exits — cannot assess prior months ✗"],
+            provisional=True)
+
+    latest = max(months)
+    label = _month_label(latest)
+    base_prior_trades = [t for m, ts in base_b.items() if m != latest for t in ts]
+    cand_prior_trades = [t for m, ts in cand_b.items() if m != latest for t in ts]
+    base_latest_trades = base_b.get(latest, [])
+    cand_latest_trades = cand_b.get(latest, [])
+
+    base_prior = _pnl_of(base_prior_trades)
+    cand_prior = _pnl_of(cand_prior_trades)
+    base_latest = _pnl_of(base_latest_trades)
+    cand_latest = _pnl_of(cand_latest_trades)
+    base_full = base_prior + base_latest
+    cand_full = cand_prior + cand_latest
+    floor = base_prior - int(slack_twd)
+    slack = cand_prior - floor
+
+    reasons: list[str] = []
+    passed = True
+    provisional = False
+
+    abl_ok = cand_prior >= floor
+    collapse = "" if abl_ok else " — prior-months collapse"
+    reasons.append(
+        f"month ablation: prior-months net {_signed(cand_prior)} ≥ "
+        f"baseline{_MINUS}5k ({_signed(floor)}): "
+        f"{'✓' if abl_ok else '✗'} (slack {_signed(slack)}){collapse}")
+    passed = passed and abl_ok
+
+    edge = cand_full - base_full
+    latest_delta = cand_latest - base_latest
+    if edge > 0:
+        share_ok = latest_delta * 100 <= edge * int(round(share_max * 100))
+        pct = f"{(latest_delta / edge) * 100:.1f}%"
+        dominated = "" if share_ok else " — calendar-month dominated"
+        reasons.append(
+            f"latest-month edge share: edge {_signed(edge)} > 0; "
+            f"{label} share {int(latest_delta)}/{int(edge)} = {pct} ≤ "
+            f"{share_max * 100:.0f}%: "
+            f"{'✓' if share_ok else '✗'}{dominated}")
+        passed = passed and share_ok
+    else:
+        reasons.append(
+            f"latest-month edge share: edge {_signed(edge)} ≤ 0 — "
+            f"share gate not applied ✓")
+
+    ho_month = _month_of(holdout_start or "")
+    prior_stats = window_stats(cand_prior_trades)
+    pf = prior_stats.profit_factor
+    pf_txt = "INF" if pf == float("inf") else f"{pf:.3f}"
+    delta = cand_prior - base_prior
+    pf_ok = prior_stats.n > 0 and pf >= ABS_PF_FLOOR
+    delta_ok = delta >= 0
+    if not ho_month:
+        reasons.append(
+            "holdout≠latest-month-only: deep holdout start unknown — "
+            "provisional, never auto-save ✗")
+        passed = False
+        provisional = True
+    elif ho_month != latest:
+        reasons.append(
+            f"holdout≠latest-month-only: deep holdout starts "
+            f"{holdout_start} outside latest calendar month {label} — "
+            f"gate not applied ✓")
+    elif pf_ok and delta_ok:
+        reasons.append(
+            f"holdout≠latest-month-only: prior-month OOS PF {pf_txt} ≥ 1 ✓ "
+            f"and Δ {_signed(delta)} ≥ 0 ✓")
+    elif pf_ok:
+        reasons.append(
+            f"holdout≠latest-month-only: prior-month OOS PF {pf_txt} ≥ 1 ✓ "
+            f"but Δ {_signed(delta)} ≥ 0: ✗ — provisional, never auto-save")
+        passed = False
+        provisional = True
+    else:
+        reasons.append(
+            f"holdout≠latest-month-only: prior-month OOS PF {pf_txt} ≥ 1 ✗ "
+            f"and Δ {_signed(delta)} ≥ 0: {'✓' if delta_ok else '✗'} — "
+            f"provisional, never auto-save")
+        passed = False
+        provisional = True
+
+    return EvolutionVerdict(passed, reasons, provisional=provisional)
+
+
+def combine_evolution_verdicts(*parts: EvolutionVerdict) -> EvolutionVerdict:
+    """AND every layer. Month reasons should be passed first so a
+    truncated Discord body still shows them (issue #153).
+
+    A provisional layer is not a clean PASS: pool promotion stays off.
+    """
+    reasons: list[str] = []
+    passed = True
+    provisional = False
+    used = False
+    for part in parts:
+        reasons.extend(part.reasons)
+        passed = passed and part.passed
+        provisional = provisional or part.provisional
+        used = used or part.used_criteria
+    if provisional and passed:
+        passed = False
+        reasons.append(
+            "PROVISIONAL — never auto-save (holdout in the latest "
+            "calendar month without prior-month OOS PF≥1 and Δ≥0)")
+    return EvolutionVerdict(passed, reasons, used_criteria=used,
+                            provisional=provisional)
+
+
+def eligible_for_validated_pool(verdict: EvolutionVerdict) -> bool:
+    """Clean PASS only. Provisional and FAIL never auto-save."""
+    return bool(verdict.passed) and not bool(verdict.provisional)
+
+
+def format_weekend_verdict_block(verdict: EvolutionVerdict, folds: list,
+                                 data_desc: str, *,
+                                 pool_promoted: str = "") -> str:
+    """Chat + Discord block: month gates, multi-fold, then walk-forward.
+
+    Reasons are printed before the fold table so Discord's 1700-char
+    cap keeps the #153 fail lines.
+    """
+    tag = "PASS ✅" if verdict.passed else "FAIL ❌"
+    if verdict.provisional:
+        tag += " (PROVISIONAL — never auto-save)"
+    lines = [
+        f"🧬 EVO VERDICT (walk-forward + multi-fold + month) — {tag}",
+        f"資料 Data: {data_desc}",
+        "多折 + 月閘門 + walk-forward reasons:",
+    ]
+    lines.extend(f"  {r}" for r in verdict.reasons)
+    lines.append(
+        f"滾動折數 Rolling folds: {len(folds or [])} "
+        f"(最新在最後 newest last — that fold is the true holdout)")
+    for i, f in enumerate(folds or [], 1):
+        lines.append(
+            f"  #{i} {f.start} → {f.end} | "
+            f"base {f.base.n}/{f.base.pnl:+,} | "
+            f"cand {f.cand.n}/{f.cand.pnl:+,} | "
+            f"Δ {f.delta:+,} | shared {f.shared}")
+    lines.extend(_verdict_trailer(verdict, "", pool_promoted=pool_promoted))
     return "\n".join(lines)
