@@ -234,11 +234,24 @@ class RegimeSwitchingRunner(LiveRunner):
         return lines
 
     def _maybe_classify(self, now) -> object | None:
+        # Issue #151: every bail used to return with no status line. The
+        # 30s poll then looked healthy (heartbeat, news) while
+        # last_assessed never moved. Name the reason on each return.
         if self._classify_retry_after is not None and now < self._classify_retry_after:
+            logger.info(
+                "[REGIME] Classification retry backoff until %s "
+                "(last_assessed=%s)",
+                self._classify_retry_after.strftime("%Y-%m-%d %H:%M:%S"),
+                self._manager._state.last_assessed or "(none)",
+            )
             return None
         last_assessed = self._manager._state.last_assessed
         sess = classification_due(now, last_assessed)
         if sess is None:
+            logger.info(
+                "[REGIME] Classification not due (last_assessed=%s)",
+                last_assessed or "(none)",
+            )
             return None
 
         catch_up = now >= sess.close_dt
@@ -249,10 +262,19 @@ class RegimeSwitchingRunner(LiveRunner):
             vote_sources=[f"{v.source or '?'}:{v.direction}" for v in votes],
         )
         if rec is None:
-            # Insufficient bars or classifier error. The post-close
-            # catch-up trigger would otherwise retry (and warn) on every
-            # 30s poll until the next night is assessed — back off.
+            # Insufficient bars, classifier error, or a save that did not
+            # stick. The post-close catch-up trigger would otherwise retry
+            # on every 30s poll until the next night is assessed — back off,
+            # but leave a WARN that names the blocked session (#151).
             self._classify_retry_after = now + timedelta(minutes=30)
+            logger.warning(
+                "[REGIME] Classification produced no result for %s "
+                "(last_assessed=%s)%s — retry after %s",
+                sess.key,
+                last_assessed or "(none)",
+                " (catch-up)" if catch_up else "",
+                self._classify_retry_after.strftime("%Y-%m-%d %H:%M:%S"),
+            )
             return None
         self._classify_retry_after = None
 
