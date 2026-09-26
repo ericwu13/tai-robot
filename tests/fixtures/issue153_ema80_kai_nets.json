@@ -1,0 +1,17 @@
+{
+  "description": "Kai gate calibration 2026-09-26. EMA80 (evo1 stretch) vs V2 EMA50. May-Aug is the prior block; September is the latest calendar month. Nets are cost-adjusted TWD from the Nova A/B summary. These numbers are the MUST-FAIL oracle — do not relax them.",
+  "latest_month": "2026-09",
+  "holdout_start": "2026-09-11 00:00",
+  "base_prior_net": 49100,
+  "base_latest_net": -12880,
+  "cand_prior_gross_win": 185544,
+  "cand_prior_gross_loss": 149874,
+  "cand_prior_net": 35670,
+  "cand_latest_net": 22380,
+  "floor": 44100,
+  "slack": -8430,
+  "full_edge": 21830,
+  "latest_delta": 35260,
+  "share": "161.5%",
+  "prior_pf": "1.238"
+}

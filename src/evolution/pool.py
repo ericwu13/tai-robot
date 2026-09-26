@@ -433,6 +433,29 @@ def default_pool_path() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "evolution_pool.db"
 
 
+def record_validated_candidate(pool: StrategyPool, name: str, source_code: str,
+                               walkforward_fitness: float = 0.0,
+                               notes: str = "") -> str:
+    """Insert a clean-PASS candidate and promote it to ``validated``.
+
+    This is the only auto path after a weekend-evo PASS (issue #153).
+    It does not write StrategyStore and does not register STRATEGIES —
+    operator deploy stays manual. Returns the pool id.
+    """
+    entry = StrategyEntry(
+        name=name,
+        source_code=source_code,
+        status="candidate",
+        walkforward_fitness=float(walkforward_fitness),
+        notes=notes or (
+            "weekend evo PASS — StrategyPool validated only; "
+            "StrategyStore auto-save blocked"),
+    )
+    pool.add(entry)
+    pool.promote(entry.id, "validated")
+    return entry.id
+
+
 # ---------------------------------------------------------------------------
 # Promotion gates
 # ---------------------------------------------------------------------------

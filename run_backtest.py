@@ -5050,6 +5050,17 @@ class BacktestApp:
         from src.evolution.pipeline import (
             compute_design_cut, design_cutoff_index, plan_sample_rule,
             plan_directives_block)
+        knob_note = ""
+        if auto_run:
+            from src.evolution.knobs import (
+                knob_grid_for, saturday_knob_directives)
+            if live and getattr(self._live_runner, "strategy", None) is not None:
+                _evo_cls_name = type(self._live_runner.strategy).__name__
+            else:
+                _evo_obj = STRATEGIES.get(self.strategy_var.get())
+                _evo_cls_name = _evo_obj.__name__ if _evo_obj else ""
+            if knob_grid_for(_evo_cls_name):
+                knob_note = saturday_knob_directives()
         holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
         cut = compute_design_cut(result.trades, holdout_days)
         # Scan from 0, NOT from the watermark: a watermark saved past the
@@ -5163,6 +5174,7 @@ class BacktestApp:
             f"instead.\n"
             f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
             f"{plan_directives_block()}\n"
+            f"{knob_note}"
             f"## 保留測試集 Holdout (unseen validation data)\n"
             f"The most recent {holdout_days} days of evidence "
             f"({holdout_count} trades) are WITHHELD from everything in this "
@@ -5312,9 +5324,13 @@ class BacktestApp:
         """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
 
         One click, no manual steps until deployment: the plan's own
-        machine-readable criteria gate the candidate, a PASS auto-saves
-        it to the StrategyStore and registers it in the dropdown.
-        Deploying to live trading stays manual by design.
+        machine-readable criteria, the multi-fold verdict, and the
+        month gates all have to pass. A clean PASS promotes the
+        candidate in the StrategyPool to ``validated`` only — it does
+        NOT write the StrategyStore and does NOT register STRATEGIES
+        (issue #153). Deploying to live trading stays manual by design.
+        Saturday auto on DynamicExitPullback* applies an allowlisted
+        knob grid (max 2); structural codegen is not the auto path.
 
         Runs in a worker thread; every Tk touch goes through root.after.
         """
@@ -5385,9 +5401,12 @@ class BacktestApp:
             from src.evolution.pipeline import (
                 check_candidate_name, plan_unusable_reason,
                 parse_plan_directives, next_candidate_name, run_ab_backtest,
-                decide_verdict, format_verdict_block,
+                decide_verdict,
                 run_deep_validation, decide_deep_verdict,
-                format_deep_verdict_block)
+                run_multifold_validation, decide_multifold_verdict,
+                decide_month_gates, combine_evolution_verdicts,
+                format_weekend_verdict_block, holdout_window_start,
+                eligible_for_validated_pool)
             bars = evo_data["bars"]
             data_origin = evo_data["origin"]
 
@@ -5449,6 +5468,21 @@ class BacktestApp:
                     if auto_run:
                         _notify_discord(msg)
                     return
+                # Issue #153: Saturday knob mode refuses off-grid /
+                # structural plans BEFORE the watermark, so a rejected
+                # EMA80-class plan does not burn next week's delta.
+                _knob_apply = None
+                if auto_run and baseline_cls is not None:
+                    from src.evolution.knobs import saturday_knob_decision
+                    rejection, _knob_apply = saturday_knob_decision(
+                        baseline_cls.__name__, directives.get("knobs"),
+                        baseline_cls)
+                    if rejection:
+                        msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        return
                 # Issue #125: watermark advances only after a completed
                 # plan with action=change — never at launch. no_change
                 # returned above; a later codegen/validation FAIL does
@@ -5468,64 +5502,86 @@ class BacktestApp:
                         _notify_discord(msg)
                     return
 
-                # ── Phase 2: candidate codegen (one retry) ──
+                # ── Phase 2: Saturday knob grid, else candidate codegen ──
                 base_cls_name = baseline_cls.__name__ if baseline_cls else "Strategy"
                 candidate_name = next_candidate_name(base_cls_name, taken)
-                ui(self._append_chat, "system",
-                   f"EVO 2/3: generating candidate strategy {candidate_name}...")
-                gen_msg = (
-                    f"{STRATEGY_CODE_CONTEXT}\n\n"
-                    f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
-                    f"## Evolution plan to apply\n{plan}\n\n"
-                    f"## Task\n"
-                    f"Apply EXACTLY the single change specified in the evolution "
-                    f"plan to the strategy above. Keep ALL other logic identical. "
-                    f"The class MUST be named `{candidate_name}` and keep the same "
-                    f"kline_type / kline_minute. Output ONLY one ```python code "
-                    f"block containing the complete strategy file."
-                )
                 candidate_cls = None
                 code = ""
                 last_err = ""
-                for attempt in (1, 2):
-                    msg = gen_msg if attempt == 1 else (
-                        gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
-                        f"Fix the problem and output the complete corrected code.")
+                if _knob_apply:
+                    ui(self._append_chat, "system",
+                       f"EVO 2/3: Saturday knob mode — applying {_knob_apply} "
+                       f"as {candidate_name} (no codegen)...")
                     try:
-                        # The API call is INSIDE the try (issue #108): a
-                        # transient model outage (Gemini 503) used to escape
-                        # this loop entirely, so the advertised "one retry"
-                        # never happened for API failures and the error died
-                        # in the outer handler with no Discord notice.
-                        resp = self._chat_client.one_shot(
-                            msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
-                            max_tokens=_CODE_GEN_MAX_TOKENS,
-                            call_site=f"evolution_codegen_{attempt}",
-                            model=heavy_model)
-                        code = extract_python_code(resp) or ""
-                        if not code:
-                            last_err = "no ```python code block found in the response"
-                            continue
+                        from src.evolution.knobs import rewrite_knob_source
+                        code = rewrite_knob_source(
+                            strategy_source, base_cls_name, candidate_name,
+                            _knob_apply)
                         candidate_cls = load_strategy_from_source(code)
-                        # load_strategy_from_source returns the first
-                        # BacktestStrategy subclass whatever it is named;
-                        # the PASS path saves by candidate_cls.__name__
-                        # and StrategyStore.save overwrites by class
-                        # name, so a kept base-class name would clobber
-                        # the LIVE strategy's stored source and its
-                        # registry entry (issue #114). Discard it and
-                        # spend the retry correcting the name.
                         if (name_err := check_candidate_name(
                                 candidate_cls, candidate_name)):
                             candidate_cls = None
                             last_err = name_err
-                            continue
-                        break
-                    except (CodeValidationError, CodeExecutionError) as e:
-                        last_err = str(e)
                     except Exception as e:
-                        last_err = f"AI API error — [{type(e).__name__}] {e}"
-                        _log(f"EVO codegen attempt {attempt} failed: {last_err}")
+                        candidate_cls = None
+                        last_err = (f"knob apply failed — [{type(e).__name__}] {e}")
+                    if candidate_cls is None:
+                        msg = (f"🧬 EVO FAIL: Saturday knob apply failed — "
+                               f"{last_err}. structural/codegen escalate, not auto.")
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        return
+                if candidate_cls is None:
+                    ui(self._append_chat, "system",
+                       f"EVO 2/3: generating candidate strategy {candidate_name}...")
+                    gen_msg = (
+                        f"{STRATEGY_CODE_CONTEXT}\n\n"
+                        f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
+                        f"## Evolution plan to apply\n{plan}\n\n"
+                        f"## Task\n"
+                        f"Apply EXACTLY the single change specified in the evolution "
+                        f"plan to the strategy above. Keep ALL other logic identical. "
+                        f"The class MUST be named `{candidate_name}` and keep the same "
+                        f"kline_type / kline_minute. Output ONLY one ```python code "
+                        f"block containing the complete strategy file."
+                    )
+                    for attempt in (1, 2):
+                        msg = gen_msg if attempt == 1 else (
+                            gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
+                            f"Fix the problem and output the complete corrected code.")
+                        try:
+                            # The API call is INSIDE the try (issue #108): a
+                            # transient model outage (Gemini 503) used to escape
+                            # this loop entirely, so the advertised "one retry"
+                            # never happened for API failures and the error died
+                            # in the outer handler with no Discord notice.
+                            resp = self._chat_client.one_shot(
+                                msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                                max_tokens=_CODE_GEN_MAX_TOKENS,
+                                call_site=f"evolution_codegen_{attempt}",
+                                model=heavy_model)
+                            code = extract_python_code(resp) or ""
+                            if not code:
+                                last_err = "no ```python code block found in the response"
+                                continue
+                            candidate_cls = load_strategy_from_source(code)
+                            # load_strategy_from_source returns the first
+                            # BacktestStrategy subclass whatever it is named.
+                            # A kept base-class name would collide with the
+                            # live strategy (issue #114). Discard it and
+                            # spend the retry correcting the name.
+                            if (name_err := check_candidate_name(
+                                    candidate_cls, candidate_name)):
+                                candidate_cls = None
+                                last_err = name_err
+                                continue
+                            break
+                        except (CodeValidationError, CodeExecutionError) as e:
+                            last_err = str(e)
+                        except Exception as e:
+                            last_err = f"AI API error — [{type(e).__name__}] {e}"
+                            _log(f"EVO codegen attempt {attempt} failed: {last_err}")
                 if candidate_cls is None:
                     msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
                     ui(self._append_chat, "system", msg)
@@ -5577,8 +5633,8 @@ class BacktestApp:
 
                 if tr_d:
                     ui(self._append_chat, "system",
-                       f"EVO 3/3: walk-forward validation — train {tr_d}d / "
-                       f"test {te_d}d + Monte Carlo "
+                       f"EVO 3/3: walk-forward + multi-fold + month gates — "
+                       f"train {tr_d}d / test {te_d}d + Monte Carlo "
                        f"({base_cls_name} vs {candidate_cls.__name__})...")
                     baseline_res = run_deep_validation(
                         baseline_cls, bars, point_value, "基準 baseline",
@@ -5588,7 +5644,7 @@ class BacktestApp:
                         candidate_cls, bars, point_value,
                         f"候選 {candidate_cls.__name__}", tr_d, te_d,
                         monte_carlo=True, capital_base=capital_base)
-                    verdict = decide_deep_verdict(
+                    window_verdict = decide_deep_verdict(
                         baseline_res, candidate_res, directives["criteria"])
                     cl_base_m = (baseline_res.test.metrics
                                  if baseline_res.test.result else None)
@@ -5598,9 +5654,10 @@ class BacktestApp:
                     if validation == "deep":
                         ui(self._append_chat, "system",
                            f"EVO: data span {span_days}d too short for "
-                           f"walk-forward — using simple A/B.")
+                           f"walk-forward — using simple A/B plus multi-fold "
+                           f"and month gates.")
                     ui(self._append_chat, "system",
-                       f"EVO 3/3: A/B backtest on {len(bars)} × "
+                       f"EVO 3/3: A/B + multi-fold + month gates on {len(bars)} × "
                        f"{feed_iv // 60}min bars ≈ {native_est} native bars "
                        f"({base_cls_name} vs {candidate_cls.__name__})...")
                     baseline_res = run_ab_backtest(
@@ -5610,66 +5667,108 @@ class BacktestApp:
                         candidate_cls, bars, point_value,
                         f"候選 {candidate_cls.__name__}",
                         capital_base=capital_base)
-                    verdict = decide_verdict(
+                    window_verdict = decide_verdict(
                         baseline_res, candidate_res, directives["criteria"])
                     cl_base_m = baseline_res.metrics
                     cl_cand_m = candidate_res.metrics
 
-                saved_as = ""
-                if verdict.passed:
-                    saved_as = f"AI: {candidate_cls.__name__}"
+                # Issue #153: multi-fold + month gates on the same bars.
+                # Month reasons are combined first so Discord truncation
+                # keeps prior-months collapse / calendar-month dominated.
+                folds, mf_base, mf_cand = run_multifold_validation(
+                    baseline_cls, candidate_cls, bars, point_value,
+                    capital_base=capital_base)
+                mf_verdict = decide_multifold_verdict(
+                    folds, directives["criteria"])
+                base_trades = (list(mf_base.result.trades)
+                               if mf_base.result is not None else [])
+                cand_trades = (list(mf_cand.result.trades)
+                               if mf_cand.result is not None else [])
+                ho_start = holdout_window_start(bars, te_d or holdout_days)
+                month_verdict = decide_month_gates(
+                    base_trades, cand_trades, holdout_start=ho_start)
+                verdict = combine_evolution_verdicts(
+                    month_verdict, mf_verdict, window_verdict)
 
-                    def _save():
-                        try:
-                            self._strategy_store.save(
-                                candidate_cls.__name__, code,
-                                description=f"auto-evolution of {base_cls_name}")
-                            STRATEGIES[saved_as] = candidate_cls
-                            self.strategy_combo.config(values=list(STRATEGIES.keys()))
-                        except Exception as e:
-                            _log(f"EVO save failed: [{type(e).__name__}] {e}")
-                    ui(_save)
-
+                # Clean PASS → StrategyPool validated only. Never
+                # StrategyStore.save and never STRATEGIES[...].
+                pool_id = ""
+                if eligible_for_validated_pool(verdict):
                     try:
-                        from src.daily_report.changelog import append_changelog
-
-                        def _mdict(m):
-                            if m is None:
-                                return None
-                            pf = (None if m.profit_factor == float("inf")
-                                  else round(m.profit_factor, 3))
-                            return {"trades": m.total_trades, "pnl": m.total_pnl,
-                                    "pf": pf,
-                                    "max_dd_pct": round(m.max_drawdown_pct, 2),
-                                    "win_rate": round(m.win_rate, 3)}
-                        append_changelog(
-                            strategy_name=display_name,
-                            version_before=base_cls_name,
-                            version_after=candidate_cls.__name__,
-                            change_summary=(
-                                f"auto-evolution candidate; "
-                                f"validation={'walk-forward' if tr_d else 'simple A/B'}; "
-                                f"criteria={directives['criteria']}; "
-                                f"plan excerpt: {plan[:300]}"),
-                            initiated_by="ai",
-                            metrics_before=_mdict(cl_base_m),
-                            metrics_after=_mdict(cl_cand_m),
+                        from src.evolution.pool import (
+                            StrategyPool, default_pool_path,
+                            record_validated_candidate)
+                        wf = 0.0
+                        fit = getattr(
+                            getattr(candidate_res, "test", None), "fitness", None)
+                        if fit is None:
+                            fit = getattr(candidate_res, "fitness", None)
+                        if fit is not None:
+                            wf = float(fit.composite)
+                        pool_id = record_validated_candidate(
+                            StrategyPool(default_pool_path()),
+                            name=candidate_cls.__name__,
+                            source_code=code,
+                            walkforward_fitness=wf,
+                            notes=(
+                                "issue #153 weekend evo PASS — StrategyPool "
+                                "validated only; StrategyStore / STRATEGIES "
+                                "auto-save blocked"),
                         )
                     except Exception as e:
-                        _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+                        _log(f"EVO pool promote failed: [{type(e).__name__}] {e}")
+                        pool_id = ""
 
-                if tr_d:
-                    block = format_deep_verdict_block(
-                        baseline_res, candidate_res, verdict, data_desc, saved_as)
-                else:
-                    block = format_verdict_block(
-                        baseline_res, candidate_res, verdict, data_desc, saved_as)
+                    if pool_id:
+                        try:
+                            from src.daily_report.changelog import append_changelog
+
+                            def _mdict(m):
+                                if m is None:
+                                    return None
+                                pf = (None if m.profit_factor == float("inf")
+                                      else round(m.profit_factor, 3))
+                                return {"trades": m.total_trades, "pnl": m.total_pnl,
+                                        "pf": pf,
+                                        "max_dd_pct": round(m.max_drawdown_pct, 2),
+                                        "win_rate": round(m.win_rate, 3)}
+                            append_changelog(
+                                strategy_name=display_name,
+                                version_before=base_cls_name,
+                                version_after=candidate_cls.__name__,
+                                change_summary=(
+                                    f"auto-evolution pool-validated only "
+                                    f"(StrategyStore auto-save blocked, #153); "
+                                    f"validation={'walk-forward' if tr_d else 'simple A/B'}"
+                                    f"+multifold+month; "
+                                    f"criteria={directives['criteria']}; "
+                                    f"plan excerpt: {plan[:300]}"),
+                                initiated_by="ai",
+                                metrics_before=_mdict(cl_base_m),
+                                metrics_after=_mdict(cl_cand_m),
+                            )
+                        except Exception as e:
+                            _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+
+                block = format_weekend_verdict_block(
+                    verdict, folds, data_desc, pool_promoted=pool_id)
+                if verdict.passed and not pool_id:
+                    block += ("\nPool promotion failed — nothing was registered "
+                              "and STRATEGIES was not updated.")
                 ui(self._remove_last_system_line)
                 ui(self._append_chat, "system", block)
-                ui(self.set_status,
-                   f"🧬 EVO {'PASS — saved ' + saved_as if verdict.passed else 'FAIL — candidate rejected'}")
+                if verdict.passed and pool_id:
+                    status = ("🧬 EVO PASS — pool validated, "
+                              "not added to STRATEGIES")
+                elif verdict.passed:
+                    status = ("🧬 EVO PASS — pool promotion failed; "
+                              "nothing registered")
+                else:
+                    status = "🧬 EVO FAIL — candidate rejected"
+                ui(self.set_status, status)
                 # Verdict goes to Discord from BOTH manual and weekly-auto
-                # runs (manual too, per user: testing + visibility).
+                # runs (manual too, per user: testing + visibility). The
+                # block carries multi-fold and month reasons (issue #153).
                 if _discord is not None and _discord.enabled:
                     try:
                         _discord.evolution_verdict(verdict.passed, block)
