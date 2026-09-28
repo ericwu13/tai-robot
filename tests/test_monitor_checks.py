@@ -286,8 +286,13 @@ def test_regime_history_pnl_present_is_clean(tmp_path):
 # 2026-09-25 Mid-Autumn and 2026-09-28 Teachers' Day (Confucius' Birthday)
 # are TAIFEX holidays. A weekend-only calendar invents both nights.
 
+# 05:17 TPE is the reproduced tip-probe instant: weekend-only
+# classification_due returned 2026-09-25|NIGHT while a working calendar
+# stayed on 2026-09-24|NIGHT.
+TEACHERS_DAY_PROBE = datetime(2026, 9, 28, 5, 17, tzinfo=TZ_TPE)
 TEACHERS_DAY_MORNING = datetime(2026, 9, 28, 9, 0, tzinfo=TZ_TPE)
 DAY_AFTER_TEACHERS = datetime(2026, 9, 29, 9, 0, tzinfo=TZ_TPE)
+TUESDAY_NIGHT_OPEN = datetime(2026, 9, 29, 16, 0, tzinfo=TZ_TPE)
 ASSESSED_BEFORE_GAP = "2026-09-24|NIGHT"
 
 
@@ -338,7 +343,8 @@ def test_issue155_healthy_calendar_holiday_gap_is_not_a_miss(tmp_path):
     assert is_taifex_holiday(date(2026, 9, 28)) is True
     state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
     bot = make_regime_bot(tmp_path, state)
-    for now in (TEACHERS_DAY_MORNING, DAY_AFTER_TEACHERS):
+    for now in (TEACHERS_DAY_PROBE, TEACHERS_DAY_MORNING, DAY_AFTER_TEACHERS,
+                TUESDAY_NIGHT_OPEN):
         _mark_bot_alive(bot, now)
         findings, _ = check_regime(now, str(tmp_path / "live"))
         missed = _miss_p1(findings)
@@ -356,8 +362,10 @@ def test_issue155_holiday_gap_degraded_calendar_no_miss_p1(tmp_path, monkeypatch
     state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
     bot = make_regime_bot(tmp_path, state)
     invented = {
+        TEACHERS_DAY_PROBE: "2026-09-25",
         TEACHERS_DAY_MORNING: "2026-09-25",
         DAY_AFTER_TEACHERS: "2026-09-28",
+        TUESDAY_NIGHT_OPEN: "2026-09-28",
     }
     for now, open_date in invented.items():
         _mark_bot_alive(bot, now)
@@ -378,8 +386,10 @@ def test_issue155_degraded_calendar_finding_instead_of_miss_p1(
     state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
     bot = make_regime_bot(tmp_path, state)
     moments = (
+        TEACHERS_DAY_PROBE,
         TEACHERS_DAY_MORNING,
         DAY_AFTER_TEACHERS,
+        TUESDAY_NIGHT_OPEN,
         datetime(2026, 9, 30, 9, 0, tzinfo=TZ_TPE),
     )
     for mode in ("raise", "empty"):
@@ -394,6 +404,38 @@ def test_issue155_degraded_calendar_finding_instead_of_miss_p1(
                 and "holiday calendar degraded" in f.message
             ]
             assert degraded, (mode, now, [(f.level, f.message) for f in findings])
+
+
+def test_issue155_weekend_only_holiday_bit_does_not_refute_phantom(
+        tmp_path, monkeypatch):
+    """The reproduced tip: classification_due is due, and is_taifex_holiday lies.
+
+    At 2026-09-28 05:17 TPE a weekend-only calendar returns
+    ``2026-09-25|NIGHT`` from ``classification_due`` and
+    ``is_taifex_holiday(2026-09-25) is False``. Checking the holiday bit
+    cannot refute the phantom. ``check_regime`` must still refuse the
+    miss P1 and report the degraded calendar. Live ``classification_due``
+    is left on the #58 fallback — this test does not ask it to change.
+    """
+    from datetime import date
+
+    from src.market_data.holidays import is_taifex_holiday
+    from src.regime.switch_logic import classification_due
+
+    _degrade_tw_holiday_calendar(monkeypatch, mode="raise")
+    now = TEACHERS_DAY_PROBE
+    assert is_taifex_holiday(date(2026, 9, 25)) is False
+    due = classification_due(now, ASSESSED_BEFORE_GAP)
+    assert due is not None and due.key == "2026-09-25|NIGHT", due
+    state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
+    bot = make_regime_bot(tmp_path, state)
+    _mark_bot_alive(bot, now)
+    findings, _ = check_regime(now, str(tmp_path / "live"))
+    assert not _miss_p1(findings), _miss_p1(findings)
+    assert any(
+        f.level in ("P2", "P3") and "holiday calendar degraded" in f.message
+        for f in findings
+    ), [(f.level, f.message) for f in findings]
 
 
 def test_issue155_refuses_miss_p1_when_completed_night_is_holiday(

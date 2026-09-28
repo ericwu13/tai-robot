@@ -355,3 +355,19 @@ class TestHolidayCalendarDegraded:
         assert sess.key == "2026-09-24|NIGHT"
         sess = last_completed_night(_tpe(2026, 9, 29, 9, 0))
         assert sess.key == "2026-09-24|NIGHT"
+
+    def test_probe_at_0517_is_not_due_and_tuesday_is_next_night(self):
+        """Working calendar, reproduced tip instant 2026-09-28 05:17 TPE.
+
+        last night stays 2026-09-24|NIGHT, classification_due is None.
+        Monday does not open a night; the next one is Tuesday 15:00.
+        """
+        probe = _tpe(2026, 9, 28, 5, 17)
+        assert latest_night_session(probe).key == "2026-09-24|NIGHT"
+        assert last_completed_night(probe).key == "2026-09-24|NIGHT"
+        assert classification_due(probe, "2026-09-24|NIGHT") is None
+        tuesday_open = _tpe(2026, 9, 29, 15, 0)
+        assert latest_night_session(tuesday_open).key == "2026-09-29|NIGHT"
+        # In progress, not yet closed: still not a missed 09-24 replacement.
+        assert classification_due(tuesday_open, "2026-09-24|NIGHT") is None
+        assert last_completed_night(tuesday_open).key == "2026-09-24|NIGHT"

@@ -52,17 +52,22 @@ Healthy vs unhealthy:
 - `classification_due` fires in the night's last 2 minutes OR any time
   after close while unassessed — so a catch-up after an app hang is
   normal and its features may include following-DAY bars.
-- **Holiday gaps are not missed nights.** Before escalating a
-  `classification missed` P1 (residual #151) across a quiet stretch,
-  verify `is_taifex_holiday` on every open date from `last_assessed`
-  through today. TAIFEX was closed on Mid-Autumn **2026-09-25** and
-  Teachers' Day **2026-09-28**. With `last_assessed=2026-09-24|NIGHT`,
-  live `classification_due` stays not-due on Teachers' Day morning —
-  there is no catch-up to run and no bot restart to do. If the TW
-  `holidays` calendar is degraded (package missing, raising, or empty —
-  the weekend-only fallback), `check_regime` refuses the miss P1 and
-  reports a degraded-calendar finding instead. Do not hand-advance
-  `last_assessed` for that finding.
+- **Holiday gaps are not residual #151 misses.** With
+  `last_assessed=2026-09-24|NIGHT`, a working calendar on Teachers' Day
+  morning (reproduced at 2026-09-28 05:17 TPE) still has last completed
+  night `2026-09-24|NIGHT`, and `classification_due` returns None. Live
+  logs `Classification not due`. Mid-Autumn **2026-09-25** and Teachers'
+  Day **2026-09-28** did not open nights. The next real night is Tuesday
+  **2026-09-29 15:00** TPE. Do not restart the bot and do not
+  hand-advance `last_assessed`.
+  The phantom `classification_due → 2026-09-25|NIGHT` happens only when
+  the TW `holidays` package has fallen back to weekends. In that state
+  `is_taifex_holiday(2026-09-25)` is also false, so a holiday check does
+  not refute the tip. Call `holiday_calendar_degraded(now)` first. If it
+  is true, refuse the miss escalation: `check_regime` emits a
+  degraded-calendar finding (P2) instead of a miss P1. Use
+  `is_taifex_holiday` only after that health check says the calendar is
+  intact.
 - Poll order is classify → record → apply. `record_session_result`
   UPDATES the row in place, so re-recording never double-counts.
 - Votes: `last_features._vote_sources` is the audit trail of what the
