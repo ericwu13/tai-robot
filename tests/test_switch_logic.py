@@ -318,3 +318,40 @@ class TestUpcomingNightSession:
         # so its classification hasn't run yet.
         assert upcoming_night_session(
             _tpe(2026, 7, 11, 4, 0)).key == "2026-07-10|NIGHT"
+
+
+# ── holiday calendar health (issue #155) ──
+
+def _boom_tw_calendar(monkeypatch):
+    import src.market_data.holidays as hol
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("TW calendar unavailable")
+
+    monkeypatch.setattr(hol._holidays, "country_holidays", _boom)
+
+
+class TestHolidayCalendarDegraded:
+    def test_exposed_and_healthy_on_teachers_day(self):
+        import src.regime.switch_logic as sl
+        fn = getattr(sl, "holiday_calendar_degraded", None)
+        assert callable(fn), (
+            "switch_logic.holiday_calendar_degraded missing (#155)")
+        assert fn(_tpe(2026, 9, 28, 9, 0)) is False
+
+    def test_true_when_package_raises(self, monkeypatch):
+        """Pre-fix FAIL: no health signal, and the fallback is silent."""
+        import src.regime.switch_logic as sl
+        _boom_tw_calendar(monkeypatch)
+        fn = getattr(sl, "holiday_calendar_degraded", None)
+        assert callable(fn), (
+            "switch_logic.holiday_calendar_degraded missing (#155)")
+        assert fn(_tpe(2026, 9, 28, 9, 0)) is True
+
+    def test_last_completed_skips_mid_autumn_and_teachers_day(self):
+        # Live path: Teachers' Day morning still sees the Thursday night.
+        sess = last_completed_night(_tpe(2026, 9, 28, 9, 0))
+        assert sess is not None
+        assert sess.key == "2026-09-24|NIGHT"
+        sess = last_completed_night(_tpe(2026, 9, 29, 9, 0))
+        assert sess.key == "2026-09-24|NIGHT"

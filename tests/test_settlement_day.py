@@ -32,6 +32,31 @@ class TestThirdWednesday:
         assert third_wednesday(2026, 1) == date(2026, 1, 21)
 
 
+class TestHolidayCalendarHealth:
+    def test_ok_for_2026(self):
+        from src.market_data.holidays import holiday_calendar_health
+        ok, detail = holiday_calendar_health(2026)
+        assert ok is True
+        assert "2026" in detail
+
+    def test_degraded_when_package_raises(self, monkeypatch):
+        """Pre-fix FAIL: health is not exposed; the fallback only logs."""
+        import src.market_data.holidays as hol
+        def _boom(*_a, **_k):
+            raise RuntimeError("TW calendar unavailable")
+        monkeypatch.setattr(hol._holidays, "country_holidays", _boom)
+        ok, detail = hol.holiday_calendar_health(2026)
+        assert ok is False
+        assert "RuntimeError" in detail or "unavailable" in detail.lower()
+
+    def test_degraded_when_package_returns_empty(self, monkeypatch):
+        import src.market_data.holidays as hol
+        monkeypatch.setattr(hol._holidays, "country_holidays", lambda *_a, **_k: [])
+        ok, detail = hol.holiday_calendar_health(2026)
+        assert ok is False
+        assert "empty" in detail.lower()
+
+
 class TestIsTaifexHoliday:
     def test_weekend(self):
         assert is_taifex_holiday(date(2026, 4, 11)) is True   # Saturday

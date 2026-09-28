@@ -25,8 +25,8 @@ daily-report key; never use it for session identity.
 
 | Level | Meaning |
 |---|---|
-| P1 | `last_assessed` older than the last completed night (classification MISSED); corrupt `regime_state.json`; news suppression latched on a stale session key |
-| P2 | never classified (placeholder state); pre-v2.16 `key_format`; flip-counter pause active; recommendation never applied; session P&L never recorded; >20 `NEWS_SUPPRESSED` bars in 24h; any `REAL_ORDER_TIMEOUT` |
+| P1 | `last_assessed` older than the last completed night (classification MISSED) — only when the TW holiday calendar is healthy and that night is not `is_taifex_holiday`; corrupt `regime_state.json`; news suppression latched on a stale session key |
+| P2 | never classified (placeholder state); pre-v2.16 `key_format`; flip-counter pause active; recommendation never applied; session P&L never recorded; >20 `NEWS_SUPPRESSED` bars in 24h; any `REAL_ORDER_TIMEOUT`; TW holiday calendar degraded (miss P1 suppressed) |
 | P3 | suppression that is current and by-design; findings on a stopped/retired bot (demoted wholesale — a bot that isn't running cannot classify) |
 
 Healthy vs unhealthy:
@@ -52,6 +52,17 @@ Healthy vs unhealthy:
 - `classification_due` fires in the night's last 2 minutes OR any time
   after close while unassessed — so a catch-up after an app hang is
   normal and its features may include following-DAY bars.
+- **Holiday gaps are not missed nights.** Before escalating a
+  `classification missed` P1 (residual #151) across a quiet stretch,
+  verify `is_taifex_holiday` on every open date from `last_assessed`
+  through today. TAIFEX was closed on Mid-Autumn **2026-09-25** and
+  Teachers' Day **2026-09-28**. With `last_assessed=2026-09-24|NIGHT`,
+  live `classification_due` stays not-due on Teachers' Day morning —
+  there is no catch-up to run and no bot restart to do. If the TW
+  `holidays` calendar is degraded (package missing, raising, or empty —
+  the weekend-only fallback), `check_regime` refuses the miss P1 and
+  reports a degraded-calendar finding instead. Do not hand-advance
+  `last_assessed` for that finding.
 - Poll order is classify → record → apply. `record_session_result`
   UPDATES the row in place, so re-recording never double-counts.
 - Votes: `last_features._vote_sources` is the audit trail of what the

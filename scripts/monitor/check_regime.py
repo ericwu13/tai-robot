@@ -10,6 +10,12 @@ Every key compared here uses that convention.
 Two history columns are DEAD by construction and are never read:
 ``applied`` / ``applied_at``.  Application evidence lives in
 ``regime_state.json``'s ``next_session.executed``.
+
+A missed-night P1 is emitted only when the TW public-holiday calendar
+is healthy and the candidate night does not open on ``is_taifex_holiday``.
+A degraded calendar (weekend-only fallback, issue #58) invents weekday
+TAIFEX holidays such as Mid-Autumn and Teachers' Day; that is a calendar
+finding, not a missed classification (issue #155).
 """
 
 from __future__ import annotations
@@ -82,7 +88,60 @@ def _was_running(bot_dir, night) -> bool:
     return seen is None or seen >= night.open_dt
 
 
-def _check_state(now, bot_dir, name, state, sl, lines, findings):
+def _holiday_calendar_status(now, sl):
+    """``(degraded, detail)``. Missing switch_logic is not a calendar fault.
+
+    The miss path already skips session keys when ``sl`` is None.
+    """
+    if sl is None:
+        return False, ""
+    fn = getattr(sl, "holiday_calendar_degraded", None)
+    if not callable(fn):
+        return False, ""
+    try:
+        degraded = bool(fn(now))
+    except Exception as exc:  # noqa: BLE001
+        return True, type(exc).__name__
+    if not degraded:
+        return False, ""
+    return True, _calendar_degraded_detail(now)
+
+
+def _calendar_degraded_detail(now) -> str:
+    try:
+        from src.market_data.holidays import holiday_calendar_health
+        years = {now.year, (now.date() - timedelta(days=14)).year}
+        parts = []
+        for year in sorted(years):
+            ok, detail = holiday_calendar_health(year)
+            if not ok:
+                parts.append(str(detail))
+        text = "; ".join(parts) if parts else "weekend-only fallback"
+    except Exception as exc:  # noqa: BLE001
+        text = type(exc).__name__
+    return " ".join(text.split())[:180]
+
+
+def _night_opens_on_holiday(sess) -> bool:
+    """True when the candidate night's OPEN date is a TAIFEX holiday.
+
+    A lookup failure refuses the escalation: the weekend-only fallback
+    would otherwise report that holiday as a missed session (#155).
+    """
+    open_date = getattr(sess, "open_date", "") or ""
+    try:
+        day = datetime.strptime(open_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False
+    try:
+        from src.market_data.holidays import is_taifex_holiday
+        return bool(is_taifex_holiday(day))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _check_state(now, bot_dir, name, state, sl, lines, findings,
+                 calendar_degraded=False):
     path = os.path.join(bot_dir, "regime_state.json")
     last_completed = sl.last_completed_night(now) if sl else None
     latest = sl.latest_night_session(now) if sl else None
@@ -110,11 +169,25 @@ def _check_state(now, bot_dir, name, state, sl, lines, findings):
                                     latest.key if latest else ""}
         if not healthy:
             if last_assessed < last_completed.key:
-                findings.append(Finding(
-                    "P1", "regime",
-                    f"{name}: classification missed for night "
-                    f"{last_completed.key} (state still at {last_assessed})",
-                    path))
+                # #155: do not invent a holiday night. A degraded TW
+                # calendar (weekend-only) names Mid-Autumn / Teachers' Day
+                # as completed sessions; verify is_taifex_holiday even
+                # when the calendar claims to be healthy.
+                if calendar_degraded:
+                    lines.append(
+                        "  note: missed-night escalation suppressed "
+                        f"(holiday calendar degraded; candidate "
+                        f"{last_completed.key})")
+                elif _night_opens_on_holiday(last_completed):
+                    lines.append(
+                        f"  note: {last_completed.key} opens on a TAIFEX "
+                        "holiday — not a missed classification")
+                else:
+                    findings.append(Finding(
+                        "P1", "regime",
+                        f"{name}: classification missed for night "
+                        f"{last_completed.key} (state still at {last_assessed})",
+                        path))
             else:
                 lines.append("  note: last_assessed is ahead of the last "
                              "completed night (clock skew?)")
@@ -302,6 +375,11 @@ def check_regime(now: datetime, base_dir: str):
     if sl is None:
         lines.append("WARNING: src.regime.switch_logic unavailable — "
                      "session-key checks skipped")
+    calendar_degraded, calendar_detail = _holiday_calendar_status(now, sl)
+    if calendar_degraded:
+        lines.append(
+            "holiday calendar: DEGRADED "
+            f"({calendar_detail}) — missed-night P1 suppressed")
     lines.append("")
 
     dirs = [d for d in discover_bot_dirs(base_dir)
@@ -309,6 +387,15 @@ def check_regime(now: datetime, base_dir: str):
     if not dirs:
         lines.append(f"no regime bots under {base_dir}")
         return findings, lines
+    if calendar_degraded:
+        findings.append(Finding(
+            "P2", "regime",
+            "holiday calendar degraded "
+            f"({calendar_detail}) — refused missed-night escalation. "
+            "Weekday TAIFEX holidays are invisible; verify "
+            "is_taifex_holiday before treating a gap as a residual "
+            "#151 miss.",
+            "src/market_data/holidays.py"))
 
     for bot_dir in dirs:
         name = bot_name(bot_dir)
@@ -338,7 +425,8 @@ def check_regime(now: datetime, base_dir: str):
                 os.path.join(bot_dir, "regime_state.json")))
             lines.append("  state: CORRUPT")
         else:
-            _check_state(now, bot_dir, name, state, sl, lines, findings)
+            _check_state(now, bot_dir, name, state, sl, lines, findings,
+                         calendar_degraded=calendar_degraded)
         _check_history(now, bot_dir, name, lines, findings)
         _check_news_block(now, bot_dir, name, sl, lines, findings)
         _check_decisions(now, bot_dir, name, lines, findings)

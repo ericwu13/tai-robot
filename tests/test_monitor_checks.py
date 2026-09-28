@@ -280,6 +280,160 @@ def test_regime_history_pnl_present_is_clean(tmp_path):
     assert any("W3:trending-down" in ln for ln in lines)
 
 
+# ── issue #155: holiday-gap / degraded-calendar miss P1 ────────────────
+#
+# Fixture: last real classified night is 2026-09-24|NIGHT (Thursday).
+# 2026-09-25 Mid-Autumn and 2026-09-28 Teachers' Day (Confucius' Birthday)
+# are TAIFEX holidays. A weekend-only calendar invents both nights.
+
+TEACHERS_DAY_MORNING = datetime(2026, 9, 28, 9, 0, tzinfo=TZ_TPE)
+DAY_AFTER_TEACHERS = datetime(2026, 9, 29, 9, 0, tzinfo=TZ_TPE)
+ASSESSED_BEFORE_GAP = "2026-09-24|NIGHT"
+
+
+def _miss_p1(findings):
+    return [m for m in messages(findings, "P1") if "classification missed" in m]
+
+
+def _mark_bot_alive(bot, when: datetime):
+    """Stamp regime files so ``_was_running`` sees activity after the night opened.
+
+    ``last_activity`` uses file mtimes. A night whose open is still in the
+    future relative to the machine clock would otherwise demote every
+    finding to P3 and hide a miss P1.
+    """
+    import os
+    ts = when.timestamp()
+    for name in ("session.json", "regime_state.json"):
+        os.utime(bot / name, (ts, ts))
+
+
+def _degrade_tw_holiday_calendar(monkeypatch, mode="raise"):
+    """Break the TW public-holiday lookup the way issue #58 degrades it.
+
+    ``raise`` — ``country_holidays`` throws (frozen EXE / missing package).
+    ``empty`` — lookup succeeds with no dates. Both make
+    ``is_taifex_holiday`` answer weekends only.
+    """
+    import src.market_data.holidays as hol
+
+    if mode == "empty":
+        monkeypatch.setattr(
+            hol._holidays, "country_holidays", lambda *_a, **_k: [])
+        return
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("TW calendar unavailable")
+
+    monkeypatch.setattr(hol._holidays, "country_holidays", _boom)
+
+
+def test_issue155_healthy_calendar_holiday_gap_is_not_a_miss(tmp_path):
+    """Working calendar: 09-25 and 09-28 are closed, so 09-24 is current."""
+    from datetime import date
+
+    from src.market_data.holidays import is_taifex_holiday
+
+    assert is_taifex_holiday(date(2026, 9, 25)) is True
+    assert is_taifex_holiday(date(2026, 9, 28)) is True
+    state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
+    bot = make_regime_bot(tmp_path, state)
+    for now in (TEACHERS_DAY_MORNING, DAY_AFTER_TEACHERS):
+        _mark_bot_alive(bot, now)
+        findings, _ = check_regime(now, str(tmp_path / "live"))
+        missed = _miss_p1(findings)
+        assert not any("2026-09-25" in m or "2026-09-28" in m for m in missed), missed
+        assert not missed, (now, missed)
+
+
+def test_issue155_holiday_gap_degraded_calendar_no_miss_p1(tmp_path, monkeypatch):
+    """Pre-fix FAIL: weekend-only fallback invents 09-25 and 09-28 nights.
+
+    Teachers' Day morning names a missed ``2026-09-25|NIGHT``. The next
+    morning names a missed ``2026-09-28|NIGHT``. Neither night opened.
+    """
+    _degrade_tw_holiday_calendar(monkeypatch, mode="raise")
+    state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
+    bot = make_regime_bot(tmp_path, state)
+    invented = {
+        TEACHERS_DAY_MORNING: "2026-09-25",
+        DAY_AFTER_TEACHERS: "2026-09-28",
+    }
+    for now, open_date in invented.items():
+        _mark_bot_alive(bot, now)
+        findings, _ = check_regime(now, str(tmp_path / "live"))
+        missed = _miss_p1(findings)
+        assert not any(open_date in m for m in missed), (now, missed)
+        assert not missed, (now, missed)
+
+
+def test_issue155_degraded_calendar_finding_instead_of_miss_p1(
+        tmp_path, monkeypatch):
+    """Pre-fix FAIL: a dead or empty TW calendar must be P2/P3, never a miss P1.
+
+    Also covers the morning after a real post-gap night (09-30): while the
+    calendar is degraded the checker cannot tell a holiday from a session,
+    so it still must not emit a miss P1.
+    """
+    state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
+    bot = make_regime_bot(tmp_path, state)
+    moments = (
+        TEACHERS_DAY_MORNING,
+        DAY_AFTER_TEACHERS,
+        datetime(2026, 9, 30, 9, 0, tzinfo=TZ_TPE),
+    )
+    for mode in ("raise", "empty"):
+        _degrade_tw_holiday_calendar(monkeypatch, mode=mode)
+        for now in moments:
+            _mark_bot_alive(bot, now)
+            findings, _ = check_regime(now, str(tmp_path / "live"))
+            assert not _miss_p1(findings), (mode, now, _miss_p1(findings))
+            degraded = [
+                f for f in findings
+                if f.level in ("P2", "P3")
+                and "holiday calendar degraded" in f.message
+            ]
+            assert degraded, (mode, now, [(f.level, f.message) for f in findings])
+
+
+def test_issue155_refuses_miss_p1_when_completed_night_is_holiday(
+        tmp_path, monkeypatch):
+    """Pre-fix FAIL: the miss path never verifies ``is_taifex_holiday``.
+
+    A probe that names ``2026-09-25|NIGHT`` as the last completed night
+    must not escalate, even when the holiday package itself is healthy.
+    """
+    import src.regime.switch_logic as sl
+    from src.regime.switch_logic import SessionInfo
+
+    holiday_night = SessionInfo(
+        "2026-09-25", "NIGHT",
+        datetime(2026, 9, 25, 15, 0, tzinfo=TZ_TPE),
+        datetime(2026, 9, 26, 5, 0, tzinfo=TZ_TPE),
+    )
+    monkeypatch.setattr(sl, "last_completed_night", lambda now=None: holiday_night)
+    monkeypatch.setattr(sl, "latest_night_session", lambda now=None: holiday_night)
+    state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
+    bot = make_regime_bot(tmp_path, state)
+    _mark_bot_alive(bot, TEACHERS_DAY_MORNING)
+    findings, _ = check_regime(TEACHERS_DAY_MORNING, str(tmp_path / "live"))
+    missed = _miss_p1(findings)
+    assert not any("2026-09-25" in m for m in missed), missed
+    assert not missed, missed
+
+
+def test_issue155_real_night_after_holiday_gap_is_still_p1(tmp_path):
+    """Tuesday 09-29 night did trade. Missing it is still a real P1."""
+    now = datetime(2026, 9, 30, 9, 0, tzinfo=TZ_TPE)
+    state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
+    bot = make_regime_bot(tmp_path, state)
+    _mark_bot_alive(bot, now)
+    findings, _ = check_regime(now, str(tmp_path / "live"))
+    missed = _miss_p1(findings)
+    assert any("2026-09-29|NIGHT" in m for m in missed), missed
+    assert not any("2026-09-25" in m or "2026-09-28" in m for m in missed), missed
+
+
 # ── check_bots ──────────────────────────────────────────────────────────
 
 def make_live_bot(tmp_path, pid=4242, log_date="20260825", log_time="15:55:00",
