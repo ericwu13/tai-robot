@@ -76,7 +76,7 @@ C:/Python313/python.exe .claude/skills/n8n-debug/scripts/n8n_query.py status
 
 | Evidence in `detail` / logs | Root cause → fix |
 |---|---|
-| `ModuleNotFoundError: No module named 'yaml'/'feedparser'/'tzdata'` | Service runs as **LocalSystem** → user-site packages invisible. Install system-wide: `sudo cmd /c "set PYTHONNOUSERSITE=1&& C:\Python313\python.exe -s -m pip install <pkg>"` (UAC prompt; plain elevated pip says "already satisfied" and installs nothing). Verify: `python -s -c "import <pkg>"` |
+| `ModuleNotFoundError: No module named 'yaml'/'feedparser'/'tzdata'` | Do not install into system site-packages. The monitor venv recipe is in `.claude/skills/regime-health/SKILL.md`: `C:\Users\eric8\.venvs\tai-monitor\Scripts\python.exe -m pip install holidays==0.105 python-dateutil PyYAML==6.0.3 six`. Checkers that import `src.market_data.holidays` run as `C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s`. `feedparser` and `tzdata` are not in that venv. n8n W4/W5 executeCommand nodes stay on `C:\Python313\python.exe` (LocalSystem, no `-s`). |
 | `'python' is not recognized` | executeCommand has no user PATH → absolute `C:\Python313\python.exe` in the workflow command |
 | Every executeCommand fails in ~7 ms, empty stderr | n8n's child-process spawning died → restart the service |
 | `Unrecognized node type: n8n-nodes-base.executeCommand` | `NODES_EXCLUDE="[]"` env lost |
@@ -96,10 +96,11 @@ prove nothing about the deployment env. Therefore, after ANY change to
 C:/Python313/python.exe -s <script> --dry-run   # or --once
 ```
 
-`-s` replicates LocalSystem's package visibility. A clean dry-run under
-`-s` is the merge gate for bridge scripts, alongside pytest. New
-third-party imports must be installed system-wide (recipe above) — as of
-2026-08-17 that set is: pyyaml, feedparser, tzdata.
+`-s` on `C:/Python313/python.exe` replicates LocalSystem's package
+visibility for news-bridge scripts. Those scripts do not import
+`src.market_data.holidays`. `feedparser` and `tzdata` are outside the
+tai-monitor venv (regime-health). W4/W5 executeCommand nodes stay on
+`C:\Python313\python.exe`.
 
 ## Paths & facts
 

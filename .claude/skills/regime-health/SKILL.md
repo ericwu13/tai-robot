@@ -10,28 +10,27 @@ C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_re
 ```
 
 The monitor runs from the `tai-monitor` venv, not a system-site install.
-Create it once from the system interpreter, then install only what
-`check_regime` imports:
+Verified on oreopie: that venv is Python 3.13.7 and contains exactly
+`holidays==0.105`, `python-dateutil`, `PyYAML==6.0.3`, and `six`.
+`check_regime` runs clean under `-s` there. Create it once from the
+system interpreter, then install that pin list:
 
 ```bat
 C:\Python313\python.exe -m venv C:\Users\eric8\.venvs\tai-monitor
-C:\Users\eric8\.venvs\tai-monitor\Scripts\python.exe -m pip install holidays
+C:\Users\eric8\.venvs\tai-monitor\Scripts\python.exe -m pip install holidays==0.105 python-dateutil PyYAML==6.0.3 six
 ```
 
-`pip install holidays` is the install. It pulls `python-dateutil` (the
-only requirement declared by `holidays` 0.105). Do not use
-`pip install -e .`: `pyproject.toml` also depends on `pyyaml`, `keyring`,
-`httpx`, `lightweight-charts`, and `pandas`, and `check_regime` never
-imports those. The script inserts the repo root on `sys.path` itself, so
-an editable install is unnecessary.
+`check_regime` imports `holidays`, which imports `python-dateutil`, which
+imports `six`. `PyYAML` is in the same venv for the checkers that share
+it and call `load_settings` (`check_bridge`, `daily_review`).
+`check_regime` does not call `load_settings`. The script inserts the repo
+root on `sys.path` itself.
 
 Executed chain (a `check_regime(now, base_dir)` call):
 `scripts.monitor.check_regime` → `src.regime.switch_logic.holiday_calendar_degraded`
 / `latest_night_session` → `src.market_data.holidays` → `import holidays`
-→ `dateutil`. `yaml` lives only in `scripts.monitor.common.load_settings`,
-which this checker does not call. `src.live.live_runner` is imported only
-by settlement-day helpers in `holidays.py`, which this checker does not
-call.
+→ `dateutil` → `six`. `src.live.live_runner` is imported only by
+settlement-day helpers in `holidays.py`, which this checker does not call.
 
 `C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s -c "import holidays"`
 is the env gate for this path. A missing `holidays` install makes the

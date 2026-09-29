@@ -6,7 +6,7 @@ description: Check the news/vote bridge pipeline — are W2 cross-market, W3 RSS
 # Bridge Health
 
 ```bash
-C:/Python313/python.exe -s scripts/monitor/check_bridge.py [--settings PATH]
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bridge.py [--settings PATH]
 ```
 
 Read-only over the paths in `settings.yaml` (`news.signal_path`,
