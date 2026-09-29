@@ -438,6 +438,37 @@ def test_issue155_weekend_only_holiday_bit_does_not_refute_phantom(
     ), [(f.level, f.message) for f in findings]
 
 
+def test_issue155_f3_m7_holidays_import_error_is_degraded_p2(tmp_path, monkeypatch):
+    """F3-M7: ImportError of ``src.market_data.holidays`` is fail-closed.
+
+    ``holiday_calendar_degraded`` returns True from
+    ``except Exception: return True`` around
+    ``from src.market_data.holidays import holiday_calendar_health``.
+    Teachers' Day morning with ``last_assessed=2026-09-24|NIGHT`` must
+    be a degraded-calendar P2 and not a miss P1. The weekend-only
+    ``_is_closed_day`` fallback still invents ``2026-09-25|NIGHT``; the
+    monitor must not escalate it.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "src.market_data.holidays", None)
+    with pytest.raises(ImportError):
+        from src.market_data.holidays import holiday_calendar_health  # noqa: F401
+
+    import src.regime.switch_logic as sl
+    assert sl.holiday_calendar_degraded(TEACHERS_DAY_MORNING) is True
+
+    state = dict(HEALTHY_STATE, last_assessed=ASSESSED_BEFORE_GAP)
+    bot = make_regime_bot(tmp_path, state)
+    _mark_bot_alive(bot, TEACHERS_DAY_MORNING)
+    findings, _ = check_regime(TEACHERS_DAY_MORNING, str(tmp_path / "live"))
+    assert not _miss_p1(findings), _miss_p1(findings)
+    assert any(
+        f.level == "P2" and "holiday calendar degraded" in f.message
+        for f in findings
+    ), [(f.level, f.message) for f in findings]
+
+
 def test_issue155_refuses_miss_p1_when_completed_night_is_holiday(
         tmp_path, monkeypatch):
     """Pre-fix FAIL: the miss path never verifies ``is_taifex_holiday``.

@@ -9,6 +9,13 @@ description: Verify the regime-switching brain — did it classify last night, d
 C:/Python313/python.exe -s scripts/monitor/check_regime.py
 ```
 
+`C:/Python313/python.exe -s -c "import holidays"` is the env gate for this
+path. `holidays` must be installed system-site, same recipe as the
+n8n-debug LocalSystem row:
+`sudo cmd /c "set PYTHONNOUSERSITE=1&& C:\Python313\python.exe -s -m pip install holidays"`.
+A user-site install is invisible under `-s`; the checker then reports a
+degraded calendar instead of a missed night.
+
 Read-only over `data/live/<bot>/regime_state.json`, `regime_history.csv`,
 `decisions.csv`, and the `news` block of `session.json`.
 
