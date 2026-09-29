@@ -1,8 +1,8 @@
 """Daily review orchestrator — runs every read-only check and grades them.
 
-    C:/Python313/python.exe scripts/monitor/daily_review.py [--discord]
-                                                           [--settings PATH]
-                                                           [--no-report-file]
+    C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/daily_review.py [--discord]
+                                                                                          [--settings PATH]
+                                                                                          [--no-report-file]
 
 Best run ~05:10-05:30 TPE, just after the night session closes and the
 regime classification/record pass has landed.  (The OS clock here is

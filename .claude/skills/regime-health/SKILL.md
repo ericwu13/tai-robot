@@ -6,8 +6,35 @@ description: Verify the regime-switching brain — did it classify last night, d
 # Regime Health
 
 ```bash
-C:/Python313/python.exe -s scripts/monitor/check_regime.py
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_regime.py
 ```
+
+The monitor runs from the `tai-monitor` venv, not a system-site install.
+Verified on oreopie: that venv is Python 3.13.7 and contains exactly
+`holidays==0.105`, `python-dateutil`, `PyYAML==6.0.3`, and `six`.
+`check_regime` runs clean under `-s` there. Create it once from the
+system interpreter, then install that pin list:
+
+```bat
+C:\Python313\python.exe -m venv C:\Users\eric8\.venvs\tai-monitor
+C:\Users\eric8\.venvs\tai-monitor\Scripts\python.exe -m pip install holidays==0.105 python-dateutil PyYAML==6.0.3 six
+```
+
+`check_regime` imports `holidays`, which imports `python-dateutil`, which
+imports `six`. `PyYAML` is in the same venv for the checkers that share
+it and call `load_settings` (`check_bridge`, `daily_review`).
+`check_regime` does not call `load_settings`. The script inserts the repo
+root on `sys.path` itself.
+
+Executed chain (a `check_regime(now, base_dir)` call):
+`scripts.monitor.check_regime` → `src.regime.switch_logic.holiday_calendar_degraded`
+/ `latest_night_session` → `src.market_data.holidays` → `import holidays`
+→ `dateutil` → `six`. `src.live.live_runner` is imported only by
+settlement-day helpers in `holidays.py`, which this checker does not call.
+
+`C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s -c "import holidays"`
+is the env gate for this path. A missing `holidays` install makes the
+checker report a degraded calendar instead of a missed night.
 
 Read-only over `data/live/<bot>/regime_state.json`, `regime_history.csv`,
 `decisions.csv`, and the `news` block of `session.json`.
@@ -25,8 +52,8 @@ daily-report key; never use it for session identity.
 
 | Level | Meaning |
 |---|---|
-| P1 | `last_assessed` older than the last completed night (classification MISSED); corrupt `regime_state.json`; news suppression latched on a stale session key |
-| P2 | never classified (placeholder state); pre-v2.16 `key_format`; flip-counter pause active; recommendation never applied; session P&L never recorded; >20 `NEWS_SUPPRESSED` bars in 24h; any `REAL_ORDER_TIMEOUT` |
+| P1 | `last_assessed` older than the last completed night (classification MISSED) — only when the TW holiday calendar is healthy and that night is not `is_taifex_holiday`; corrupt `regime_state.json`; news suppression latched on a stale session key |
+| P2 | never classified (placeholder state); pre-v2.16 `key_format`; flip-counter pause active; recommendation never applied; session P&L never recorded; >20 `NEWS_SUPPRESSED` bars in 24h; any `REAL_ORDER_TIMEOUT`; TW holiday calendar degraded (miss P1 suppressed) |
 | P3 | suppression that is current and by-design; findings on a stopped/retired bot (demoted wholesale — a bot that isn't running cannot classify) |
 
 Healthy vs unhealthy:
@@ -52,6 +79,22 @@ Healthy vs unhealthy:
 - `classification_due` fires in the night's last 2 minutes OR any time
   after close while unassessed — so a catch-up after an app hang is
   normal and its features may include following-DAY bars.
+- **Holiday gaps are not residual #151 misses.** With
+  `last_assessed=2026-09-24|NIGHT`, a working calendar on Teachers' Day
+  morning (reproduced at 2026-09-28 05:17 TPE) still has last completed
+  night `2026-09-24|NIGHT`, and `classification_due` returns None. Live
+  logs `Classification not due`. Mid-Autumn **2026-09-25** and Teachers'
+  Day **2026-09-28** did not open nights. The next real night is Tuesday
+  **2026-09-29 15:00** TPE. Do not restart the bot and do not
+  hand-advance `last_assessed`.
+  The phantom `classification_due → 2026-09-25|NIGHT` happens only when
+  the TW `holidays` package has fallen back to weekends. In that state
+  `is_taifex_holiday(2026-09-25)` is also false, so a holiday check does
+  not refute the tip. Call `holiday_calendar_degraded(now)` first. If it
+  is true, refuse the miss escalation: `check_regime` emits a
+  degraded-calendar finding (P2) instead of a miss P1. Use
+  `is_taifex_holiday` only after that health check says the calendar is
+  intact.
 - Poll order is classify → record → apply. `record_session_result`
   UPDATES the row in place, so re-recording never double-counts.
 - Votes: `last_features._vote_sources` is the audit trail of what the

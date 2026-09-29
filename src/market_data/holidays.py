@@ -60,6 +60,30 @@ def _tw_public_holidays(year: int) -> frozenset[date]:
         return frozenset()
 
 
+def holiday_calendar_health(year: int | None = None) -> tuple[bool, str]:
+    """Whether TW public holidays resolved for ``year``.
+
+    ``(True, detail)`` when ``holidays.country_holidays("TW")`` returns a
+    non-empty set. ``(False, detail)`` when the package raises or resolves
+    empty — the same weekend-only answer ``is_taifex_holiday`` then gives
+    (issue #58). The result is this call only; the warn-once latch does
+    not stick a later good year as degraded.
+
+    Monitor probes that escalate a missed night must treat False as
+    "do not invent weekday TAIFEX holidays" (issue #155).
+    """
+    y = date.today().year if year is None else int(year)
+    try:
+        days = frozenset(_holidays.country_holidays("TW", years=y))
+    except Exception as e:
+        # Same warn-once log the trading-day check emits on this failure.
+        _tw_public_holidays(y)
+        return False, f"{type(e).__name__}: {e}"
+    if not days:
+        return False, f"TW public holidays for {y} resolved empty"
+    return True, f"{len(days)} TW public holidays for {y}"
+
+
 def is_taifex_holiday(d: date) -> bool:
     """True if TAIFEX is closed on ``d`` (weekend, public holiday, or override)."""
     if d in OVERRIDE_TRADING:

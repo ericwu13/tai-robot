@@ -8,11 +8,12 @@ description: Check whether a deployed tai-robot bot process is actually alive an
 One read-only command answers "is it alive":
 
 ```bash
-C:/Python313/python.exe -s scripts/monitor/check_bots.py
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bots.py
 ```
 
-(`-s` matches the LocalSystem package visibility the service runs under.
-Optional arg: a different `data/live` base directory.)
+(`-s` ignores user-site packages, so this interpreter sees the
+tai-monitor pins from the regime-health skill. Optional arg: a different
+`data/live` base directory.)
 
 ## What it reads
 

@@ -19,7 +19,7 @@ redact()`).
 ## Stage 1 — fetch (no subagents)
 
 ```bash
-C:/Python313/python.exe -s scripts/monitor/daily_review.py
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/daily_review.py
 ```
 
 Always exits 0; writes `data/monitor/daily_review_<TPE date>.md`.

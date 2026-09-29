@@ -318,3 +318,56 @@ class TestUpcomingNightSession:
         # so its classification hasn't run yet.
         assert upcoming_night_session(
             _tpe(2026, 7, 11, 4, 0)).key == "2026-07-10|NIGHT"
+
+
+# ── holiday calendar health (issue #155) ──
+
+def _boom_tw_calendar(monkeypatch):
+    import src.market_data.holidays as hol
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("TW calendar unavailable")
+
+    monkeypatch.setattr(hol._holidays, "country_holidays", _boom)
+
+
+class TestHolidayCalendarDegraded:
+    def test_exposed_and_healthy_on_teachers_day(self):
+        import src.regime.switch_logic as sl
+        fn = getattr(sl, "holiday_calendar_degraded", None)
+        assert callable(fn), (
+            "switch_logic.holiday_calendar_degraded missing (#155)")
+        assert fn(_tpe(2026, 9, 28, 9, 0)) is False
+
+    def test_true_when_package_raises(self, monkeypatch):
+        """Pre-fix FAIL: no health signal, and the fallback is silent."""
+        import src.regime.switch_logic as sl
+        _boom_tw_calendar(monkeypatch)
+        fn = getattr(sl, "holiday_calendar_degraded", None)
+        assert callable(fn), (
+            "switch_logic.holiday_calendar_degraded missing (#155)")
+        assert fn(_tpe(2026, 9, 28, 9, 0)) is True
+
+    def test_last_completed_skips_mid_autumn_and_teachers_day(self):
+        # Live path: Teachers' Day morning still sees the Thursday night.
+        sess = last_completed_night(_tpe(2026, 9, 28, 9, 0))
+        assert sess is not None
+        assert sess.key == "2026-09-24|NIGHT"
+        sess = last_completed_night(_tpe(2026, 9, 29, 9, 0))
+        assert sess.key == "2026-09-24|NIGHT"
+
+    def test_probe_at_0517_is_not_due_and_tuesday_is_next_night(self):
+        """Working calendar, reproduced tip instant 2026-09-28 05:17 TPE.
+
+        last night stays 2026-09-24|NIGHT, classification_due is None.
+        Monday does not open a night; the next one is Tuesday 15:00.
+        """
+        probe = _tpe(2026, 9, 28, 5, 17)
+        assert latest_night_session(probe).key == "2026-09-24|NIGHT"
+        assert last_completed_night(probe).key == "2026-09-24|NIGHT"
+        assert classification_due(probe, "2026-09-24|NIGHT") is None
+        tuesday_open = _tpe(2026, 9, 29, 15, 0)
+        assert latest_night_session(tuesday_open).key == "2026-09-29|NIGHT"
+        # In progress, not yet closed: still not a missed 09-24 replacement.
+        assert classification_due(tuesday_open, "2026-09-24|NIGHT") is None
+        assert last_completed_night(tuesday_open).key == "2026-09-24|NIGHT"

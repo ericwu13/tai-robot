@@ -117,12 +117,39 @@ def _is_closed_day(d: date) -> bool:
     Delegates to the market-data holiday calendar (weekends + TW public
     holidays + overrides); degrades to a weekend-only check if the
     holidays module is unavailable (mis-bundled frozen EXE, issue #58).
+    That fallback is silent on purpose (live code must not crash). Miss
+    probes must call ``holiday_calendar_degraded`` before treating a
+    weekday as a session that should have been classified (issue #155).
     """
     try:
         from src.market_data.holidays import is_taifex_holiday
         return is_taifex_holiday(d)
     except Exception:
         return d.weekday() >= 5
+
+
+def holiday_calendar_degraded(now: datetime | None = None) -> bool:
+    """True when ``_is_closed_day`` cannot see TW public holidays.
+
+    Probes ``now``'s year and the year 14 days earlier — the lookback
+    ``latest_night_session`` uses — so a New Year poll still notices a
+    broken calendar for the December night it might name. An import
+    failure counts: that is the same weekend-only fallback.
+    """
+    now = _norm_tpe(now)
+    years = {now.year, (now.date() - timedelta(days=14)).year}
+    try:
+        from src.market_data.holidays import holiday_calendar_health
+    except Exception:
+        return True
+    for year in sorted(years):
+        try:
+            ok, _detail = holiday_calendar_health(year)
+        except Exception:
+            return True
+        if not ok:
+            return True
+    return False
 
 
 def current_session(now: datetime | None = None) -> SessionInfo | None:
