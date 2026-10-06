@@ -125,15 +125,20 @@ class TestBugB_CleanupBeforeRelogin:
         assert leave_pos < login_pos, (
             "Bug B: LeaveMonitor must happen BEFORE LoginSetQuote.")
 
-    def test_logout_called_before_login(self, rb_source: str):
+    def test_logout_is_hasattr_guarded(self, rb_source: str):
+        """Capital API 2.13.57 has no SKCenterLib_LogOut. An unguarded
+        call always raises AttributeError and never runs."""
         body = self._attempt_reconnect_body(rb_source)
-        logout_pos = body.find("skC.SKCenterLib_LogOut(")
-        login_pos = body.find("skC.SKCenterLib_LoginSetQuote(")
-        assert logout_pos != -1, (
-            "Bug B: _attempt_reconnect must call SKCenterLib_LogOut "
-            "before re-login to ensure a clean COM state.")
-        assert logout_pos < login_pos, (
-            "Bug B: LogOut must happen BEFORE LoginSetQuote.")
+        guard = body.find('hasattr(skC, "SKCenterLib_LogOut")')
+        call = body.find("skC.SKCenterLib_LogOut(")
+        login = body.find("skC.SKCenterLib_LoginSetQuote(")
+        assert guard != -1, (
+            "Issue #157: LogOut must be skipped when the COM object has "
+            "no SKCenterLib_LogOut.")
+        assert call != -1 and login != -1
+        assert guard < call < login, (
+            "Issue #157: the hasattr guard must wrap the LogOut call, "
+            "and that call must stay before LoginSetQuote.")
 
     def test_cleanup_calls_swallow_errors(self, rb_source: str):
         """Cleanup calls must be best-effort — a prior session may already
@@ -175,10 +180,10 @@ class TestIssue157_GuardBeforeLeaveMonitor:
         assert leave_pos != -1
         assert decide_pos < leave_pos, (
             "Issue #157: decide() must run BEFORE SKQuoteLib_LeaveMonitor.")
-        assert "market_open=is_market_open()" in body[decide_pos:leave_pos], (
-            "Issue #157: the guard must see whether the market is open. "
-            "Pre-session IsConnected()==2 skips teardown; after the open "
-            "the intra-session recovery still tears down.")
+        assert "seconds_since_open=" in body[decide_pos:leave_pos], (
+            "Issue #157: the guard must see seconds since the session "
+            "open. A half-up handshake skips until open+90s even when "
+            "the market is already open.")
 
     def test_skip_branch_returns_before_leave_monitor(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
@@ -218,6 +223,96 @@ class TestIssue157_GuardBeforeLeaveMonitor:
         assert "root.after(3000, self._check_reconnection)" not in body, (
             "Issue #157: hardcoded 3s Ready poll is what scheduled "
             "LeaveMonitor ~2 min before the open.")
+
+
+class TestIssue157_Amendments:
+    """LogOut guard, faulthandler, broker-call log, single timer."""
+
+    def test_reconnect_calls_are_logged_with_thread_id(self, rb_source: str):
+        assert (
+            '[RECONNECT] about to call {name} tid={threading.get_ident()}'
+            in rb_source
+        ), "missing [RECONNECT] about to call <name> tid=<thread id> helper"
+        match = re.search(
+            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match
+        body = match.group(1)
+        for name in (
+            "IsConnected",
+            "LeaveMonitor",
+            "LoginSetQuote",
+            "ConnectByID",
+            "EnterMonitorLONG",
+        ):
+            assert f'_log_reconnect_call("{name}")' in body, name
+
+    def test_forced_teardown_log_line(self, rb_source: str):
+        ctrl_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "src", "live", "reconnect_controller.py",
+        )
+        ctrl_source = open(ctrl_path, encoding="utf-8").read()
+        assert "P1 forced teardown of half-up session" in ctrl_source
+        assert "_log_debug(FORCED_TEARDOWN_LOG)" in rb_source
+        assert "note_forced_teardown()" in rb_source
+
+    def test_faulthandler_armed_at_deploy(self, rb_source: str):
+        assert "def enable_reconnect_faulthandler(" in rb_source
+        assert "faulthandler.enable(" in rb_source
+        assert "_faulthandler_log" in rb_source
+        assert 'faulthandler.log' in rb_source
+        # Deploy must arm it once the bot directory exists.
+        deploy = re.search(
+            r"def _deploy_live_continue\(.*?(?=\n    def )",
+            rb_source,
+            re.DOTALL,
+        )
+        assert deploy, "could not locate _deploy_live_continue"
+        body = deploy.group(0)
+        assert "enable_reconnect_faulthandler(" in body
+        assert body.find("_open_debug_log(") < body.find(
+            "enable_reconnect_faulthandler(")
+
+    def test_disconnect_cancels_then_arms_one_timer(self, rb_source: str):
+        disc = re.search(
+            r"def _on_disconnected\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert disc
+        assert "_cancel_reconnect_timer()" in disc.group(1)
+        action = re.search(
+            r"def _execute_reconnect_action\(self, action\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert action
+        assert "arm_single_timer(" in action.group(1)
+
+
+def test_faulthandler_handle_stays_open(tmp_path):
+    """The dump file handle must outlive enable(); closing it drops the hook."""
+    import faulthandler
+
+    import run_backtest as rb
+
+    faulthandler.disable()
+    rb._faulthandler_log = None
+    rb.enable_reconnect_faulthandler(str(tmp_path))
+    handle = rb._faulthandler_log
+    assert handle is not None
+    assert not handle.closed
+    handle.write("armed\n")
+    handle.flush()
+    text = (tmp_path / "faulthandler.log").read_text(encoding="utf-8")
+    assert "armed" in text
+    # A second deploy must not replace the live handle.
+    rb.enable_reconnect_faulthandler(str(tmp_path))
+    assert rb._faulthandler_log is handle
+    assert not handle.closed
 
 
 # ---------------------------------------------------------------------------
