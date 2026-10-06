@@ -112,6 +112,7 @@ from src.live.reconnect_controller import (
     ESCALATION_LOG,
     FORCED_TEARDOWN_LOG,
     HALF_UP_TEARDOWN_CONFIRM,
+    HALF_UP_YES_STALE_LOG,
     HEADLESS_HALF_UP_REFUSED_P1,
     IS_CONNECTING,
     OPERATOR_DECLINED_HALF_UP_LOG,
@@ -1408,59 +1409,123 @@ class BacktestApp:
             fn = self._tk_confirm_half_up_teardown
         return bool(fn(HALF_UP_TEARDOWN_CONFIRM, default="no"))
 
+    def _suspend_reconnect_slot(self) -> None:
+        """Drop the shared after id while the confirm modal is up."""
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        self._reconnect_schedule.suspend(root.after_cancel)
+
+    def _resume_reconnect_slot(self) -> None:
+        """Put back the skip poll ``_suspend_reconnect_slot`` held."""
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        self._reconnect_schedule.resume(
+            after=root.after, after_cancel=root.after_cancel)
+
     def _half_up_manual_snapshot(self):
-        """``(IsConnected, seconds_since_open)`` when the confirm rule applies.
+        """Trigger tuple, or None when this press is not the confirm case.
 
         The rule is manual (this method is only reached from the button),
-        half-up with no Ready since the last EnterMonitor, ``IsConnected()==2``,
-        and holiday-aware now < open+90. Anything else returns None so the
-        caller takes the normal manual path with no dialog and no extra alert.
+        half-up with no Ready since the last EnterMonitor,
+        ``IsConnected()==2`` or a failed probe (None), and the holiday-aware
+        clock still before open+90. The tuple also freezes the attempt
+        counter and the forced-teardown allowance for the Yes re-check.
+        Anything else returns None: no dialog, no extra alert.
         """
         is_connected = self._probe_reconnect_is_connected()
-        if is_connected != IS_CONNECTING or not self._reconnect_controller.is_half_up():
+        if not self._reconnect_controller.is_half_up():
             return None
         since = self._reconnect_seconds_since_open()
         if not self._reconnect_controller.manual_half_up_needs_confirm(
             is_connected, since
         ):
             return None
-        return is_connected, since
+        return (
+            is_connected,
+            since,
+            self._conn_monitor.attempt,
+            self._reconnect_controller.forced_teardown_used,
+        )
+
+    def _half_up_yes_blocked(self, attempt: int, forced_used: bool) -> bool:
+        """True when Yes must not tear down.
+
+        The attempt counter and the allowance must still match the
+        pre-dialog snapshot, no reconnect handshake is in flight, and
+        the probe is still half-up (``IsConnected()==2``) or None.
+        Ready, 0, and 1 are a different session.
+        """
+        ctrl = self._reconnect_controller
+        if self._conn_monitor.attempt != attempt:
+            return True
+        if ctrl.forced_teardown_used != forced_used:
+            return True
+        if ctrl.handshake_open:
+            return True
+        is_connected = self._probe_reconnect_is_connected()
+        if is_connected not in (IS_CONNECTING, None):
+            return True
+        if not ctrl.is_half_up():
+            return True
+        return False
 
     def _refuse_half_up_manual(self, is_connected, since) -> None:
-        """Headless or a dialog that cannot be shown. No broker call."""
+        """Headless has no dialog. One IsConnected read already happened."""
         self._raise_reconnect_alert(self._half_up_manual_p1(
             HEADLESS_HALF_UP_REFUSED_P1, is_connected, since))
         self.btn_reconnect.config(state=tk.NORMAL)
 
+    def _decline_half_up_manual(self) -> None:
+        """No, or a dialog that cannot be shown. Never a teardown."""
+        self._resume_reconnect_slot()
+        _log(OPERATOR_DECLINED_HALF_UP_LOG)
+        self.btn_reconnect.config(state=tk.NORMAL)
+
+    def _confirm_half_up_manual(self, trigger) -> bool:
+        """Ask, then True only when Yes is still the same handshake.
+
+        False means the caller must not touch the broker. The shared
+        timer slot is cancelled before ``askyesno`` and re-armed after
+        it returns, including No and TclError.
+        """
+        is_connected, since, attempt, forced_used = trigger
+        if getattr(self, "_headless_reconnect", False):
+            self._refuse_half_up_manual(is_connected, since)
+            return False
+        self._suspend_reconnect_slot()
+        try:
+            confirmed = self._ask_half_up_teardown()
+        except tk.TclError:
+            self._decline_half_up_manual()
+            self._raise_reconnect_alert(self._half_up_manual_p1(
+                HEADLESS_HALF_UP_REFUSED_P1, is_connected, since))
+            return False
+        self._resume_reconnect_slot()
+        if not confirmed:
+            _log(OPERATOR_DECLINED_HALF_UP_LOG)
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return False
+        if self._half_up_yes_blocked(attempt, forced_used):
+            _log(HALF_UP_YES_STALE_LOG)
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return False
+        fresh = self._probe_reconnect_is_connected()
+        fresh_since = self._reconnect_seconds_since_open()
+        self._raise_reconnect_alert(self._half_up_manual_p1(
+            OPERATOR_FORCED_HALF_UP_P1, fresh, fresh_since))
+        return True
+
     def _manual_reconnect(self):
         """Manual reconnect triggered by user button click."""
-        # Before open+90 a half-up session asks first, on this Tk thread.
-        # The modal lets after() callbacks run, so the state is read again
-        # after the operator answers. No, headless, and a TclError return
-        # here: the poll stays armed, the allowance stays used, and
-        # LeaveMonitor is not called. Every other state falls through.
+        # Before open+90 a half-up session, including a failed IsConnected
+        # probe, asks first. No and TclError never fall through to the
+        # teardown below, whatever the clock or the probe did meanwhile.
+        # Yes does, only when that same handshake is still half-up or None.
         trigger = self._half_up_manual_snapshot()
-        if trigger is not None:
-            is_connected, since = trigger
-            if getattr(self, "_headless_reconnect", False):
-                self._refuse_half_up_manual(is_connected, since)
-                return
-            try:
-                confirmed = self._ask_half_up_teardown()
-            except tk.TclError:
-                self._refuse_half_up_manual(is_connected, since)
-                return
-            again = self._half_up_manual_snapshot()
-            if again is None:
-                pass
-            elif not confirmed:
-                _log(OPERATOR_DECLINED_HALF_UP_LOG)
-                self.btn_reconnect.config(state=tk.NORMAL)
-                return
-            else:
-                is_connected, since = again
-                self._raise_reconnect_alert(self._half_up_manual_p1(
-                    OPERATOR_FORCED_HALF_UP_P1, is_connected, since))
+        if trigger is not None and not self._confirm_half_up_manual(trigger):
+            return
         # Cancel reconnect, Ready-wait, and skip-poll callbacks together.
         self._cancel_reconnect_timer()
         self._cancel_quote_ready_timer("manual_reconnect")

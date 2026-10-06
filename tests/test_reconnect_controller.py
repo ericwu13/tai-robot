@@ -22,6 +22,7 @@ from src.live.reconnect_controller import (
     CLOCK_DISAGREE_WARN,
     CLOCK_FALLBACK_WARN,
     FORCED_TEARDOWN_LOG,
+    HOLIDAY_LOOKUP_WARN,
     IS_CONNECTED,
     IS_CONNECTING,
     ReconnectController,
@@ -549,6 +550,55 @@ class TestClockDisagreement:
         monday = datetime(2026, 9, 28, 10, 0, 0, tzinfo=_TPE)
         seconds_since_session_open(monday)
         assert pop_session_clock_warnings() == [CLOCK_DISAGREE_WARN]
+
+
+class TestHolidayWarnLatch:
+    """A calendar that fails on only some dates warns once per failure stretch."""
+
+    def test_partial_holiday_failure_warns_once_across_eight_polls(self, monkeypatch):
+        from datetime import date as date_cls
+
+        def holiday(d):
+            if d >= date_cls(2026, 10, 12):
+                raise RuntimeError(f"calendar failed for {d}")
+            return d.weekday() >= 5
+
+        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", holiday)
+        saturday = datetime(2026, 10, 10, 10, 0, 0, tzinfo=_TPE)
+        assert saturday.weekday() == 5
+        reset_session_clock_warnings()
+        warned = []
+        for _ in range(8):
+            since = seconds_since_session_open(saturday)
+            assert since < 0
+            warned.extend(pop_session_clock_warnings())
+        assert warned == [HOLIDAY_LOOKUP_WARN]
+
+
+class TestFallbackWarnIsNotMasked:
+    """Each clock entry queues its own WARN. The other must not be required."""
+
+    def test_seconds_since_warns_without_in_live_session(self, monkeypatch):
+        def boom(now=None):
+            raise RuntimeError("session lookup failed")
+
+        monkeypatch.setattr("src.regime.switch_logic.current_session", boom)
+        when = datetime(2026, 10, 6, 10, 0, 0, tzinfo=_TPE)
+        reset_session_clock_warnings()
+        since = seconds_since_session_open(when)
+        assert since == 75 * 60
+        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
+
+    def test_in_live_session_holiday_raise_warns_alone(self, monkeypatch):
+        def boom(d):
+            raise RuntimeError("holiday lookup failed")
+
+        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+        when = datetime(2026, 10, 9, 10, 0, 0, tzinfo=_TPE)
+        assert when.weekday() == 4
+        reset_session_clock_warnings()
+        assert in_live_session(when) is True
+        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
 
 
 class TestSingleReconnectTimer:

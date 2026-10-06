@@ -63,6 +63,10 @@ HALF_UP_TEARDOWN_CONFIRM = (
 OPERATOR_DECLINED_HALF_UP_LOG = "[RECONNECT] operator declined half-up teardown"
 OPERATOR_FORCED_HALF_UP_P1 = "operator forced half-up teardown"
 HEADLESS_HALF_UP_REFUSED_P1 = "manual reconnect refused: half-up before open+90"
+# Yes, but the handshake moved while the dialog was open.
+HALF_UP_YES_STALE_LOG = (
+    "[RECONNECT] operator Yes dropped — handshake changed during confirm"
+)
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -91,38 +95,46 @@ def _is_closed_day(d: date) -> bool:
 
     Uses ``is_taifex_holiday`` (weekends, TW public holidays, overrides).
     A missing holiday module degrades to weekends, matching
-    ``current_session``. A call that raises does the same and queues
-    ``HOLIDAY_LOOKUP_WARN``. It must not escape into the
-    ``current_session`` fail-open: that path is only for a dead session
-    lookup, and a blanket open+90 there LeaveMonitors a half-up session
-    on a Saturday or a closed overnight.
+    ``current_session``.     A call that raises does the same and queues
+    ``HOLIDAY_LOOKUP_WARN``. The latch stays until a full next-open
+    walk finishes with no failures, so one bad date cannot re-alert on
+    every 15s poll. A Saturday or a closed overnight stays on the
+    negative clock and keeps skipping; the raise does not force
+    LeaveMonitor there.
     """
+    global _holiday_scan_failures
     try:
         from src.market_data.holidays import is_taifex_holiday
     except Exception:
         return d.weekday() >= 5
     try:
-        closed = is_taifex_holiday(d)
+        return is_taifex_holiday(d)
     except Exception:
+        _holiday_scan_failures += 1
         _note_clock_warning("holiday", HOLIDAY_LOOKUP_WARN)
         return d.weekday() >= 5
-    _clear_clock_warning("holiday")
-    return closed
 
 
 def _next_session_open(now: datetime) -> datetime:
     """Next DAY 08:45 or NIGHT 15:00 on a day that actually trades."""
-    for ahead in range(16):
-        day = now.date() + timedelta(days=ahead)
-        if _is_closed_day(day):
-            continue
-        for hour, minute in ((8, 45), (15, 0)):
-            open_dt = datetime(
-                day.year, day.month, day.day, hour, minute, tzinfo=_TZ_TAIPEI)
-            if open_dt > now:
-                return open_dt
-    day = now.date() + timedelta(days=1)
-    return datetime(day.year, day.month, day.day, 8, 45, tzinfo=_TZ_TAIPEI)
+    global _holiday_scan_failures
+    _holiday_scan_failures = 0
+    try:
+        for ahead in range(16):
+            day = now.date() + timedelta(days=ahead)
+            if _is_closed_day(day):
+                continue
+            for hour, minute in ((8, 45), (15, 0)):
+                open_dt = datetime(
+                    day.year, day.month, day.day, hour, minute,
+                    tzinfo=_TZ_TAIPEI)
+                if open_dt > now:
+                    return open_dt
+        day = now.date() + timedelta(days=1)
+        return datetime(day.year, day.month, day.day, 8, 45, tzinfo=_TZ_TAIPEI)
+    finally:
+        if _holiday_scan_failures == 0:
+            _clear_clock_warning("holiday")
 
 
 def _live_session(now: datetime):
@@ -181,6 +193,9 @@ _latched_clock_warnings: set[str] = set()
 # Calendar disagreement is noisy if the two clocks flicker. One WARN per
 # Taipei date, even when they agree again and then disagree the same day.
 _clock_disagree_day: date | None = None
+# Failures inside the current _next_session_open walk. The holiday WARN
+# latch clears only when a whole walk finishes with zero failures.
+_holiday_scan_failures: int = 0
 
 
 def _note_clock_warning(kind: str, message: str) -> None:
@@ -230,10 +245,11 @@ def pop_session_clock_warnings() -> list[str]:
 
 def reset_session_clock_warnings() -> None:
     """Drop queued warnings and their once-only latches. Tests use this."""
-    global _pending_clock_warnings, _clock_disagree_day
+    global _pending_clock_warnings, _clock_disagree_day, _holiday_scan_failures
     _pending_clock_warnings = []
     _latched_clock_warnings.clear()
     _clock_disagree_day = None
+    _holiday_scan_failures = 0
 
 
 def _holiday_calls_failed(now: datetime) -> bool:
@@ -360,6 +376,9 @@ class ReconnectSchedule:
     def __init__(self) -> None:
         self._id = None
         self._kind: str | None = None
+        self._delay_ms: int | None = None
+        self._callback = None
+        self._suspended = False
 
     @property
     def timer_id(self):
@@ -373,12 +392,46 @@ class ReconnectSchedule:
         """The armed callback is running; the toolkit has already dropped it."""
         self._id = None
         self._kind = None
+        self._delay_ms = None
+        self._callback = None
+        self._suspended = False
 
     def arm(self, kind: str, delay_ms: int, callback, *, after, after_cancel):
+        self._delay_ms = delay_ms
+        self._callback = callback
+        self._suspended = False
         self._id = arm_single_timer(
             self._id, delay_ms, callback, after=after, after_cancel=after_cancel)
         self._kind = kind
         return self._id
+
+    def suspend(self, after_cancel) -> None:
+        """Cancel the pending id and keep the callback for ``resume``.
+
+        The half-up confirm dialog uses this so a skip poll cannot fire
+        LeaveMonitor while the modal is up. The after id lives in this
+        one slot; nothing else is armed beside it.
+        """
+        if self._id is None or self._callback is None:
+            return
+        try:
+            after_cancel(self._id)
+        except Exception:
+            pass
+        self._id = None
+        self._suspended = True
+
+    def resume(self, *, after, after_cancel):
+        """Re-arm the callback ``suspend`` held, if it is still pending."""
+        if not self._suspended or self._callback is None:
+            self._suspended = False
+            return None
+        kind = self._kind or "skip"
+        delay_ms = 0 if self._delay_ms is None else self._delay_ms
+        callback = self._callback
+        self._suspended = False
+        return self.arm(
+            kind, delay_ms, callback, after=after, after_cancel=after_cancel)
 
     def cancel_all(self, after_cancel) -> None:
         if self._id is not None:
@@ -388,6 +441,9 @@ class ReconnectSchedule:
                 pass
         self._id = None
         self._kind = None
+        self._delay_ms = None
+        self._callback = None
+        self._suspended = False
 
 
 class ReconnectController:
@@ -500,13 +556,13 @@ class ReconnectController:
     ) -> bool:
         """Operator Reconnect must ask before tearing this session down.
 
-        The trigger is manual (the caller), ``IsConnected()==2``, no
-        Ready since the last EnterMonitor, and the holiday-aware clock
-        still before open+90s. Fully up, fully down, a failed probe, and
-        open+90s or later are not this state.
+        The trigger is manual (the caller), no Ready since the last
+        EnterMonitor, and the holiday-aware clock still before open+90s.
+        ``IsConnected()==2`` and a failed probe (None) both count.
+        Fully up, fully down, and open+90s or later do not.
         """
         return (
-            is_connected == IS_CONNECTING
+            (is_connected == IS_CONNECTING or is_connected is None)
             and self._half_up()
             and seconds_since_open < self.HALF_UP_HOLD_S
         )

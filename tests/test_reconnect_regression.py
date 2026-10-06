@@ -416,27 +416,70 @@ def _behavior_app(ctrl):
         lambda phrase, is_connected, since: rb.BacktestApp._half_up_manual_p1(
             app, phrase, is_connected, since))
     app.btn_states = []
+    app.quote_flips = []
 
     def _btn_config(**kwargs):
         if "state" in kwargs:
             app.btn_states.append(kwargs["state"])
 
+    def _set_quote(value, reason=None):
+        app.quote_flips.append(value)
+        app._quote_connected = value
+
+    class _After:
+        def __init__(self):
+            self.pending: dict = {}
+            self._n = 0
+
+        def after(self, delay_ms, callback):
+            self._n += 1
+            token = self._n
+            self.pending[token] = (delay_ms, callback)
+            return token
+
+        def after_cancel(self, token):
+            self.pending.pop(token, None)
+
+        def fire(self):
+            items = list(self.pending.values())
+            self.pending.clear()
+            for _delay, callback in items:
+                callback()
+
+    app.root = _After()
     app.btn_reconnect = SimpleNamespace(config=_btn_config)
     app._half_up_manual_snapshot = (
         lambda: rb.BacktestApp._half_up_manual_snapshot(app))
+    app._half_up_yes_blocked = (
+        lambda attempt, forced: rb.BacktestApp._half_up_yes_blocked(
+            app, attempt, forced))
+    app._suspend_reconnect_slot = (
+        lambda: rb.BacktestApp._suspend_reconnect_slot(app))
+    app._resume_reconnect_slot = (
+        lambda: rb.BacktestApp._resume_reconnect_slot(app))
     app._refuse_half_up_manual = (
         lambda is_connected, since: rb.BacktestApp._refuse_half_up_manual(
             app, is_connected, since))
+    app._decline_half_up_manual = (
+        lambda: rb.BacktestApp._decline_half_up_manual(app))
+    app._confirm_half_up_manual = (
+        lambda trigger: rb.BacktestApp._confirm_half_up_manual(app, trigger))
     app._tk_confirm_half_up_teardown = (
         lambda message, default="no": rb.BacktestApp._tk_confirm_half_up_teardown(
             app, message, default=default))
     app._ask_half_up_teardown = (
         lambda: rb.BacktestApp._ask_half_up_teardown(app))
-    app._cancel_reconnect_timer = lambda: None
+    app._cancel_reconnect_timer = (
+        lambda: rb.BacktestApp._cancel_reconnect_timer(app))
     app._cancel_quote_ready_timer = lambda reason: None
-    app._set_quote_connected = lambda *args, **kwargs: None
+    app._set_quote_connected = _set_quote
     app._headless_reconnect = False
-    app._half_up_confirm_fn = None
+
+    def _unexpected_half_up_dialog(*_args, **_kwargs):
+        raise AssertionError(
+            "half-up confirm dialog opened without a test double")
+
+    app._half_up_confirm_fn = _unexpected_half_up_dialog
     # Armed by the failed-login and skip paths. Not called during these tests.
     app._attempt_reconnect = lambda manual=False: None
     app._check_reconnection = lambda: None
@@ -462,7 +505,8 @@ def test_manual_reconnect_passes_manual_true():
     assert not ctrl.forced_teardown_used
 
 
-def _half_up_press_app(monkeypatch, *, is_connected, since, half_up, bot_name="bot-0422"):
+def _half_up_press_app(monkeypatch, *, is_connected, since, half_up, bot_name="bot-0422",
+                       allowance_used=True):
     """App whose manual Reconnect probe and clock are fixed."""
     import run_backtest as rb
     from types import SimpleNamespace
@@ -474,7 +518,8 @@ def _half_up_press_app(monkeypatch, *, is_connected, since, half_up, bot_name="b
         ctrl.on_clean_disconnect()
         ctrl.on_attempt_started()
         ctrl.on_attempt_failed()
-    ctrl.note_forced_teardown()
+    if allowance_used:
+        ctrl.note_forced_teardown()
     app = _behavior_app(ctrl)
     app._live_runner = SimpleNamespace(bot_name=bot_name)
     monkeypatch.setattr(rb, "_com_available", True)
@@ -515,6 +560,9 @@ def test_half_up_dialog_only_before_open_plus_90(monkeypatch):
         (1, -120, True, False),
         (0, -120, True, False),
         (2, -120, False, False),
+        (None, -120, True, True),
+        (None, 90, True, False),
+        (None, 91, True, False),
     )
     for is_connected, since, half_up, expect_dialog in cases:
         calls = []
@@ -565,7 +613,10 @@ def test_half_up_decline_makes_no_broker_call(monkeypatch, capsys):
     # The real cancel goes through the schedule. Point the app at it.
     app._cancel_reconnect_timer = (
         lambda: rb_mod.BacktestApp._cancel_reconnect_timer(app))
-    app.root = type("Root", (), {"after_cancel": staticmethod(after_cancel)})()
+    app.root = type("Root", (), {
+        "after": staticmethod(after),
+        "after_cancel": staticmethod(after_cancel),
+    })()
 
     def confirm(message, *, default):
         assert message == HALF_UP_TEARDOWN_CONFIRM
@@ -658,51 +709,212 @@ def test_headless_half_up_reconnect_is_refused(monkeypatch, capsys):
     assert "normal" in app.btn_states
 
 
-def test_half_up_dialog_recheck_takes_normal_path(monkeypatch):
-    """After the dialog, a session that left the trigger uses the normal path.
+def _bind_real_attempt(rb_mod, app):
+    """Count LeaveMonitor on the fake broker. Do not stub the attempt."""
+    app._attempt_reconnect = (
+        lambda manual=False: rb_mod.BacktestApp._attempt_reconnect(app, manual))
+    app._schedule_reconnect = lambda: None
+    app._check_reconnection = (
+        lambda: rb_mod.BacktestApp._check_reconnection(app))
 
-    Tk keeps running after() callbacks during askyesno. If Ready arrives,
-    or the holiday-aware clock crosses open+90, the answer is not the
-    half-up override: one manual attempt, no forced P1, no decline log.
-    """
+
+def _mutable_half_up(monkeypatch, *, is_connected=2, since=-120, half_up=True,
+                     allowance_used=True):
+    """Half-up press whose probe and clock can move during the dialog."""
     import run_backtest as rb
 
-    state = {"ic": 2, "since": -120}
+    state = {"ic": is_connected, "since": since}
+    rb_mod, app, ctrl = _half_up_press_app(
+        monkeypatch,
+        is_connected=is_connected,
+        since=since,
+        half_up=half_up,
+        allowance_used=allowance_used,
+    )
 
-    def confirm_ready(message, *, default):
+    class _Quote:
+        def SKQuoteLib_IsConnected(self):
+            return state["ic"]
+
+        def SKQuoteLib_LeaveMonitor(self):
+            app.events.append("leave")
+            return 0
+
+    monkeypatch.setattr(rb_mod, "skQ", _Quote())
+    monkeypatch.setattr(
+        rb_mod, "seconds_since_session_open", lambda now=None: state["since"])
+    _bind_real_attempt(rb_mod, app)
+    return rb_mod, app, ctrl, state
+
+
+def test_half_up_dialog_recheck_takes_normal_path(monkeypatch, capsys):
+    """No never tears down, even if the clock crosses open+90 mid-dialog.
+
+    The old test stubbed _attempt_reconnect and expected a manual attempt
+    after that clock change. That was the fall-through bug.
+    """
+    import run_backtest as rb
+    from src.live.reconnect_controller import OPERATOR_DECLINED_HALF_UP_LOG
+
+    _rb, app, ctrl, state = _mutable_half_up(monkeypatch, since=80)
+
+    def confirm(message, *, default):
         assert default == "no"
+        state["since"] = 95
+        return False
+
+    app._half_up_confirm_fn = confirm
+    assert ctrl.forced_teardown_used
+    rb.BacktestApp._manual_reconnect(app)
+    assert app.events == []
+    assert ctrl.forced_teardown_used
+    assert app.quote_flips == []
+    assert "normal" in app.btn_states
+    assert OPERATOR_DECLINED_HALF_UP_LOG in capsys.readouterr().out
+
+
+def test_half_up_no_after_none_probe_does_not_leave(monkeypatch):
+    """A failed probe before open+90 asks. No does not LeaveMonitor."""
+    import run_backtest as rb
+    from src.live.reconnect_controller import HALF_UP_TEARDOWN_CONFIRM
+
+    calls = []
+    _rb, app, ctrl, _state = _mutable_half_up(
+        monkeypatch, is_connected=None, since=-120)
+
+    def confirm(message, *, default):
+        calls.append((message, default))
+        return False
+
+    app._half_up_confirm_fn = confirm
+    rb.BacktestApp._manual_reconnect(app)
+    assert calls == [(HALF_UP_TEARDOWN_CONFIRM, "no")]
+    assert app.events == []
+    assert ctrl.forced_teardown_used
+    assert app.quote_flips == []
+
+
+def test_headless_none_probe_refuses(monkeypatch):
+    """Headless refuses a failed probe before open+90. No dialog, no LeaveMonitor."""
+    import run_backtest as rb
+    from src.live.reconnect_controller import HEADLESS_HALF_UP_REFUSED_P1
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    _rb, app, ctrl, _state = _mutable_half_up(
+        monkeypatch, is_connected=None, since=-120)
+    app._headless_reconnect = True
+
+    def confirm(message, *, default):
+        raise AssertionError("headless must not open a confirm dialog")
+
+    app._half_up_confirm_fn = confirm
+    rb.BacktestApp._manual_reconnect(app)
+    assert app.events == []
+    assert ctrl.forced_teardown_used
+    assert any(HEADLESS_HALF_UP_REFUSED_P1 in msg for msg in discord.messages)
+    assert "normal" in app.btn_states
+
+
+def test_half_up_no_after_down_or_up_probe_does_not_leave(monkeypatch):
+    """No is final. A probe that becomes 0 or 1 does not tear down."""
+    import run_backtest as rb
+
+    for became in (0, 1):
+        _rb, app, ctrl, state = _mutable_half_up(monkeypatch, since=80)
+
+        def confirm(message, *, default, _became=became, _state=state):
+            _state["ic"] = _became
+            return False
+
+        app._half_up_confirm_fn = confirm
+        rb.BacktestApp._manual_reconnect(app)
+        assert app.events == [], became
+        assert ctrl.forced_teardown_used
+        assert app.quote_flips == []
+
+
+def test_timer_during_dialog_yes_leaves_once(monkeypatch):
+    """The skip poll is cancelled while the dialog is up. Yes leaves once."""
+    import run_backtest as rb
+    from src.live.reconnect_controller import OPERATOR_FORCED_HALF_UP_P1
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    rb_mod, app, ctrl, state = _mutable_half_up(
+        monkeypatch, since=80, allowance_used=False)
+    app._reconnect_schedule.arm(
+        "skip",
+        15_000,
+        lambda: rb_mod.BacktestApp._attempt_reconnect(app, False),
+        after=app.root.after,
+        after_cancel=app.root.after_cancel,
+    )
+
+    def confirm(message, *, default):
+        state["since"] = 95
+        app.root.fire()
+        return True
+
+    app._half_up_confirm_fn = confirm
+    assert ctrl.forced_teardown_used is False
+    rb.BacktestApp._manual_reconnect(app)
+    assert app.events.count("leave") == 1
+    assert ctrl.forced_teardown_used is False
+    assert any(OPERATOR_FORCED_HALF_UP_P1 in msg for msg in discord.messages)
+
+
+def test_timer_during_dialog_no_does_not_leave(monkeypatch):
+    """Firing the slot mid-dialog does nothing after it was cancelled."""
+    import run_backtest as rb
+
+    rb_mod, app, ctrl, state = _mutable_half_up(
+        monkeypatch, since=80, allowance_used=False)
+    app._reconnect_schedule.arm(
+        "skip",
+        15_000,
+        lambda: rb_mod.BacktestApp._attempt_reconnect(app, False),
+        after=app.root.after,
+        after_cancel=app.root.after_cancel,
+    )
+
+    def confirm(message, *, default):
+        state["since"] = 95
+        app.root.fire()
+        return False
+
+    app._half_up_confirm_fn = confirm
+    rb.BacktestApp._manual_reconnect(app)
+    assert app.events == []
+    assert ctrl.forced_teardown_used is False
+    assert app.quote_flips == []
+    assert app.root.pending, "the skip poll is re-armed after No"
+
+
+def test_ready_during_dialog_yes_does_not_tear_down(monkeypatch, capsys):
+    """Ready (IsConnected==1) during the dialog drops Yes."""
+    import run_backtest as rb
+    from src.live.reconnect_controller import (
+        HALF_UP_YES_STALE_LOG,
+        OPERATOR_FORCED_HALF_UP_P1,
+    )
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    _rb, app, ctrl, state = _mutable_half_up(monkeypatch, since=80)
+
+    def confirm(message, *, default):
         state["ic"] = 1
         return True
 
-    def confirm_past(message, *, default):
-        assert default == "no"
-        state["since"] = 91
-        return False
-
-    for confirm in (confirm_ready, confirm_past):
-        rb_mod, app, ctrl = _half_up_press_app(
-            monkeypatch, is_connected=2, since=-120, half_up=True)
-        state["ic"] = 2
-        state["since"] = -120
-
-        class _Quote:
-            def SKQuoteLib_IsConnected(self):
-                return state["ic"]
-
-            def SKQuoteLib_LeaveMonitor(self):
-                app.events.append("leave")
-                return 0
-
-        monkeypatch.setattr(rb_mod, "skQ", _Quote())
-        monkeypatch.setattr(
-            rb_mod, "seconds_since_session_open", lambda now=None: state["since"])
-        attempted = []
-        app._half_up_confirm_fn = confirm
-        app._attempt_reconnect = lambda manual=False: attempted.append(manual)
-        rb.BacktestApp._manual_reconnect(app)
-        assert attempted == [True]
-        assert app.events == []
-        assert not ctrl.forced_teardown_used
+    app._half_up_confirm_fn = confirm
+    assert ctrl.forced_teardown_used
+    rb.BacktestApp._manual_reconnect(app)
+    assert app.events == []
+    assert ctrl.forced_teardown_used
+    assert app.quote_flips == []
+    assert not any(OPERATOR_FORCED_HALF_UP_P1 in msg for msg in discord.messages)
+    assert HALF_UP_YES_STALE_LOG in capsys.readouterr().out
 
 
 def test_half_up_tclerror_refuses_like_headless(monkeypatch, capsys):
