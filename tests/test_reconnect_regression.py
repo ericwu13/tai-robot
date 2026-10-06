@@ -313,8 +313,11 @@ class TestIssue157_Amendments:
         assert deploy, "could not locate _deploy_live_continue"
         body = deploy.group(0)
         assert "enable_reconnect_faulthandler(" in body
-        assert body.find("_open_debug_log(") < body.find(
-            "enable_reconnect_faulthandler(")
+        open_pos = body.find("_open_debug_log(")
+        arm_pos = body.find("enable_reconnect_faulthandler(")
+        assert open_pos < arm_pos
+        assert "try:" in body[open_pos:arm_pos]
+        assert "except Exception" in body[arm_pos:arm_pos + 300]
 
     def test_disconnect_cancels_then_arms_one_timer(self, rb_source: str):
         disc = re.search(

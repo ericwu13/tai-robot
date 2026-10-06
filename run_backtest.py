@@ -6725,9 +6725,14 @@ class BacktestApp:
             if self._trading_guard.fill_pending else None
         )
 
-        # Open debug log file in bot directory
+        # Open debug log file in bot directory. A faulthandler open
+        # failure must not abort the deploy.
         _open_debug_log(self._live_runner.bot_dir)
-        enable_reconnect_faulthandler(self._live_runner.bot_dir)
+        try:
+            enable_reconnect_faulthandler(self._live_runner.bot_dir)
+        except Exception as e:
+            _log(
+                f"[RECONNECT] faulthandler not armed: [{type(e).__name__}] {e}")
 
         # Route regime logging into the app's _log()
         if self._regime_manager is not None:
