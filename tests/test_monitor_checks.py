@@ -825,8 +825,9 @@ def test_bots_fresh_heartbeat_suppresses_stale_log_p1(tmp_path):
 
 
 def test_bots_alive_heartbeat_frozen_log_is_p2(tmp_path):
-    """Main loop is fine (fresh heartbeat) but ticks have stopped."""
+    """Flat bot: main loop is fine (fresh heartbeat) but ticks have stopped."""
     bot = make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    _paper_flat(bot, position=0)
     write_heartbeat(bot, NOW_IN_SESSION, age_s=5)
     findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
                                  pid_alive_fn=lambda pid: True)
@@ -834,6 +835,23 @@ def test_bots_alive_heartbeat_frozen_log_is_p2(tmp_path):
     assert any("frozen mid-session" in m and "no ticks" in m
                for m in messages(findings, "P2")), messages(findings)
     assert not has_level(findings, "P1"), messages(findings, "P1")
+
+
+def test_bots_alive_frozen_log_open_position_is_p1(tmp_path):
+    """ALIVE plus a frozen log is P1 when the session holds a position.
+
+    Same broker source as HUNG grading. Flat stays P2
+    (test_bots_alive_heartbeat_frozen_log_is_p2).
+    """
+    bot = make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    _paper_flat(bot, position=1)
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=5)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: ALIVE" in _hb_line(lines)
+    opened = [m for m in messages(findings, "P1") if "position is open" in m]
+    assert opened, messages(findings)
+    assert not any("no ticks" in m for m in messages(findings, "P2")), messages(findings)
 
 
 def _snapshot_tree(root):

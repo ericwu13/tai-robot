@@ -114,6 +114,8 @@ def _app(bot_dir: str):
     # on the wiring fake; otherwise leave it unset-as-None.
     controller_cls = getattr(rb, "ReconnectController", None)
     app._reconnect_controller = controller_cls() if controller_cls else None
+    # #158's _check_reconnection reads this. Harmless on this branch.
+    app._reconnect_ready_wait_s = getattr(controller_cls, "READY_WAIT_S", 3)
     return app
 
 

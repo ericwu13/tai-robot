@@ -236,6 +236,29 @@ def _position_open(broker: dict) -> bool:
         return False
 
 
+def _load_session_data(sess_path: str):
+    """Session dict, or None when the file is unreadable.
+
+    ``load_session`` first, then ``read_json``. This is the source HUNG
+    grading and the ALIVE frozen-log grade both use.
+    """
+    try:
+        from src.live.session_store import load_session
+        return load_session(sess_path)
+    except Exception:  # noqa: BLE001
+        return read_json(sess_path)
+
+
+def _session_position_open(bot_dir: str) -> bool:
+    sess_path = os.path.join(bot_dir, "session.json")
+    if not os.path.isfile(sess_path):
+        return False
+    data = _load_session_data(sess_path)
+    if not isinstance(data, dict):
+        return False
+    return _position_open(data.get("broker") or {})
+
+
 def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid, *,
                        has_lock=False):
     """``(STATE, detail)`` from heartbeat.json plus the lock PID.
@@ -433,24 +456,30 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
                         log_path))
                 elif (hb_state == "ALIVE" and session is not None
                         and mins > STALE_LOG_MINUTES):
-                    findings.append(Finding(
-                        "P2", "bots",
-                        f"{name}: debug log frozen mid-session while "
-                        f"heartbeat is ALIVE (no ticks) — last line "
-                        f"{mins:.0f} min ago during {session.key}",
-                        log_path))
+                    # The main loop is pumping, so a flat bot with no ticks
+                    # is P2. An open position is the same broker source HUNG
+                    # uses, and that case stays P1.
+                    if _session_position_open(bot_dir):
+                        findings.append(Finding(
+                            "P1", "bots",
+                            f"{name}: debug log frozen mid-session while "
+                            f"heartbeat is ALIVE and a position is open — "
+                            f"last line {mins:.0f} min ago during {session.key}",
+                            log_path))
+                    else:
+                        findings.append(Finding(
+                            "P2", "bots",
+                            f"{name}: debug log frozen mid-session while "
+                            f"heartbeat is ALIVE (no ticks) — last line "
+                            f"{mins:.0f} min ago during {session.key}",
+                            log_path))
                 elif session is None:
                     lines.append("  log freshness: not checked (market closed)")
 
         position_open = False
         sess_path = os.path.join(bot_dir, "session.json")
         if os.path.isfile(sess_path):
-            data = None
-            try:
-                from src.live.session_store import load_session
-                data = load_session(sess_path)
-            except Exception:  # noqa: BLE001
-                data = read_json(sess_path)
+            data = _load_session_data(sess_path)
             if data is None:
                 findings.append(Finding(
                     "P2", "bots",
