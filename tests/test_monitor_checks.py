@@ -680,7 +680,9 @@ def test_bots_stale_heartbeat_during_night_is_hung_p1(tmp_path):
     findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
                                  pid_alive_fn=lambda pid: True)
     assert "heartbeat: HUNG" in _hb_line(lines)
-    assert any("HUNG" in m for m in messages(findings, "P1")), messages(findings)
+    hung = [m for m in messages(findings, "P1") if "HUNG" in m]
+    assert hung, messages(findings)
+    assert all("holiday_calendar_degraded" not in m for m in hung)
 
 
 def test_bots_hung_in_day_night_gap_flat_paper_is_p2(tmp_path):
@@ -764,7 +766,9 @@ def test_bots_degraded_calendar_does_not_invent_a_holiday(tmp_path, monkeypatch)
         NOW_HOLIDAY_PREOPEN, str(tmp_path / "live"),
         pid_alive_fn=lambda pid: True)
     assert "heartbeat: HUNG" in _hb_line(lines)
-    assert any("HUNG" in m for m in messages(findings, "P1")), messages(findings)
+    hung = [m for m in messages(findings, "P1") if "HUNG" in m]
+    assert hung, messages(findings)
+    assert any("holiday_calendar_degraded" in m for m in hung), hung
 
 
 def test_bots_no_heartbeat_is_unknown_and_uses_legacy_log_rule(tmp_path):
@@ -819,13 +823,15 @@ def test_bots_fresh_heartbeat_suppresses_stale_log_p1(tmp_path):
 
 
 def _snapshot_tree(root):
+    """relpath → (mtime_ns, contents). Existence is the key set."""
     out = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         for name in sorted(filenames):
             path = os.path.join(dirpath, name)
+            st = os.stat(path)
             with open(path, "rb") as handle:
-                out[os.path.relpath(path, root)] = handle.read()
+                out[os.path.relpath(path, root)] = (st.st_mtime_ns, handle.read())
     return out
 
 
@@ -837,7 +843,10 @@ def test_check_bots_does_not_write(tmp_path, monkeypatch):
 
     bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
     write_heartbeat(bot, NOW_IN_SESSION, age_s=400)
+    write_json(bot / "hang.json", {"reason": "heartbeat", "ts": 1})
     before = _snapshot_tree(tmp_path)
+    assert any(k.endswith("heartbeat.json") for k in before)
+    assert any(k.endswith("hang.json") for k in before)
     root = os.path.abspath(str(tmp_path))
     real_open = builtins.open
 
@@ -869,14 +878,86 @@ def test_check_bots_does_not_write(tmp_path, monkeypatch):
         monkeypatch.setattr(mod.os, name, wrapped, raising=False)
 
     for mod in (cb, common):
-        for name in ("remove", "unlink", "replace", "rename", "mkdir", "makedirs"):
+        for name in ("remove", "unlink", "replace", "rename", "mkdir",
+                     "makedirs", "utime"):
             forbid(mod, name)
 
     findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
                                  pid_alive_fn=lambda pid: True)
     assert "heartbeat: HUNG" in _hb_line(lines)
     assert any("HUNG" in m for m in messages(findings, "P1"))
-    assert _snapshot_tree(tmp_path) == before
+    after = _snapshot_tree(tmp_path)
+    assert after.keys() == before.keys()
+    for key, (mtime_ns, content) in before.items():
+        assert after[key][0] == mtime_ns, key
+        assert after[key][1] == content, key
+
+
+def test_bots_hung_requires_lock_pid_matching_heartbeat(tmp_path):
+    """A stale file whose PID is not the lock owner is not a HUNG P1."""
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=400, pid=9999)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: UNKNOWN" in _hb_line(lines)
+    assert "HUNG" not in _hb_line(lines)
+    assert not any("HUNG" in m for m in messages(findings)), messages(findings)
+
+
+def test_bots_no_lock_stale_heartbeat_is_unknown_not_hung(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    (bot / ".lock").unlink()
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=400, pid=4242)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: UNKNOWN" in _hb_line(lines)
+    assert not any("HUNG" in m for m in messages(findings)), messages(findings)
+
+
+def test_bots_corrupt_heartbeat_is_not_reported_as_missing(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    (bot / "heartbeat.json").write_text("{broken", encoding="utf-8")
+    _findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                  pid_alive_fn=lambda pid: True)
+    line = _hb_line(lines)
+    assert "corrupt heartbeat.json" in line
+    assert "no heartbeat.json" not in line
+
+
+def test_bots_heartbeat_thresholds_are_strict(tmp_path):
+    """120s is STALE not HUNG, 45s is ALIVE not STALE, 60s inflight is not HUNG.
+
+    ×10 on the hung threshold, ×20 on inflight, or ``>`` changed to ``>=``
+    fails one of these.
+    """
+    from scripts.monitor.check_bots import (
+        HEARTBEAT_HUNG_S, HEARTBEAT_STALE_S, INFLIGHT_HUNG_S)
+    assert HEARTBEAT_HUNG_S == 120.0
+    assert HEARTBEAT_STALE_S == 45.0
+    assert INFLIGHT_HUNG_S == 60.0
+
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=120)
+    _f, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                           pid_alive_fn=lambda pid: True)
+    assert "heartbeat: STALE" in _hb_line(lines)
+    assert "HUNG" not in _hb_line(lines)
+
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=121)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m for m in messages(findings, "P1"))
+
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=45)
+    _f, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                           pid_alive_fn=lambda pid: True)
+    assert "heartbeat: ALIVE" in _hb_line(lines)
+
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=46)
+    _f, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                           pid_alive_fn=lambda pid: True)
+    assert "heartbeat: STALE" in _hb_line(lines)
 
 
 # ── check_bridge ────────────────────────────────────────────────────────

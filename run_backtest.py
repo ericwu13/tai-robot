@@ -9021,7 +9021,22 @@ class BacktestApp:
             if _discord is not None and _discord.enabled:
                 _discord.notify(message)
 
-        start(runner.bot_dir, alert_fn=_alert)
+        # An unwritable bot dir must not abort deploy after the lock is
+        # held and the button already says Stop. The stamps are optional.
+        try:
+            start(runner.bot_dir, alert_fn=_alert)
+        except Exception as e:
+            _log(f"[HEARTBEAT] start failed: [{type(e).__name__}] {e}")
+            if _discord is not None and _discord.enabled:
+                try:
+                    _discord.notify(
+                        f"⚠️ **P2** heartbeat.json could not be started: "
+                        f"[{type(e).__name__}] {e}. Deploy continues."
+                    )
+                except Exception as notify_err:
+                    _log(f"[HEARTBEAT] P2 notify failed: "
+                         f"[{type(notify_err).__name__}] {notify_err}")
+            return
         self._heartbeat_active = True
         self._arm_heartbeat_tick()
 

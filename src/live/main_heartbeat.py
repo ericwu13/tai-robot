@@ -64,7 +64,8 @@ def atomic_write_json(path: str, payload: dict) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False)
             handle.flush()
-            os.fsync(handle.fileno())
+        # Atomic rename is the durability boundary. fsync on the Tk thread
+        # would stall the broker pump around every wrapped COM call.
         os.replace(tmp, path)
     except Exception:
         try:
@@ -136,11 +137,21 @@ class HeartbeatWriter:
 
     @contextmanager
     def inflight(self, name: str):
-        self.begin_inflight(name)
+        try:
+            self.begin_inflight(name)
+        except Exception:
+            logger.exception(
+                "heartbeat start stamp failed for %s; the COM call still runs",
+                name)
         try:
             yield
         finally:
-            self.end_inflight()
+            try:
+                self.end_inflight()
+            except Exception:
+                logger.exception(
+                    "heartbeat end stamp failed for %s; the broker result is unchanged",
+                    name)
 
 
 def read_heartbeat(path: str) -> dict | None:
@@ -164,11 +175,22 @@ def _inflight_age(hb: dict, now: float) -> tuple[dict | None, float | None]:
     return raw, now - start
 
 
-def _heartbeat_age(hb: dict, now: float) -> float | None:
+def _hb_ts(hb: dict) -> float | None:
     try:
-        return now - float(hb.get("ts"))
+        return float(hb.get("ts"))
     except (TypeError, ValueError):
         return None
+
+
+def _inflight_key(hb: dict):
+    """Stable identity of the in-flight call, or None when nothing is in flight."""
+    raw = hb.get("inflight_com_call")
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    if not name:
+        return None
+    return (str(name), raw.get("start_ts"))
 
 
 class HangWatchdog:
@@ -186,6 +208,16 @@ class HangWatchdog:
         self._enabled = True
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        # Monotonic baselines. The file's ``ts`` stays wall-clock (check_bots
+        # is another process and cannot read this clock). Stall is how long
+        # this process has seen the same ts / inflight, so a wall-clock step
+        # cannot fake or hide a hang.
+        self._seen_ts: float | None = None
+        self._seen_mono = 0.0
+        self._seen_inflight_key = None
+        self._seen_inflight_mono = 0.0
+        self._last_loop_mono: float | None = None
+        self._latched_ts: float | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -216,6 +248,12 @@ class HangWatchdog:
             self.alert_fn = alert_fn
         self._enabled = True
         self._latched = False
+        self._seen_ts = None
+        self._seen_mono = 0.0
+        self._seen_inflight_key = None
+        self._seen_inflight_mono = 0.0
+        self._last_loop_mono = None
+        self._latched_ts = None
         self._wake.set()
 
     def _loop(self) -> None:
@@ -225,47 +263,83 @@ class HangWatchdog:
             enabled = self._enabled and bool(self.bot_dir)
             if enabled:
                 try:
-                    self._check_once()
+                    self._poll()
                 except Exception:
                     logger.exception("hang watchdog check failed")
             self._wake.wait(self.poll_s if enabled else _IDLE_PARK_S)
             self._wake.clear()
 
-    def _check_once(self) -> None:
+    def _poll(self) -> None:
+        """One watchdog wake. A huge gap is this thread sleeping, not a hang."""
+        now_mono = time.monotonic()
+        prev = self._last_loop_mono
+        self._last_loop_mono = now_mono
+        gap = 0.0 if prev is None else now_mono - prev
+        # Much larger than the poll (5×, at least 1s): OS sleep or a stalled
+        # wake. Skip the decision and adopt the file as the new baseline.
+        # Do not clear the latch — a hang that started before the sleep is
+        # still the same episode.
+        if gap > max(self.poll_s * 5.0, 1.0):
+            self._rebase(now_mono)
+            return
+        self._check_once(now_mono)
+
+    def _rebase(self, now_mono: float) -> None:
+        """Treat the current file as just observed. Leave ``_latched`` alone."""
+        self._seen_mono = now_mono
+        self._seen_inflight_mono = now_mono
+        hb = read_heartbeat(os.path.join(self.bot_dir, HEARTBEAT_FILENAME))
+        if not isinstance(hb, dict):
+            return
+        self._seen_ts = _hb_ts(hb)
+        self._seen_inflight_key = _inflight_key(hb)
+
+    def _check_once(self, now_mono: float | None = None) -> None:
+        if now_mono is None:
+            now_mono = time.monotonic()
         path = os.path.join(self.bot_dir, HEARTBEAT_FILENAME)
         hb = read_heartbeat(path)
         if hb is None:
-            # Missing file = not armed (clean stop, or not deployed yet).
-            self._latched = False
+            # Missing or unreadable. Not a recovery — clearing the latch
+            # here would send a second alert when the same hang is readable
+            # again. Re-arm only on a confirmed fresh heartbeat below.
             return
-        now = time.time()
-        age = _heartbeat_age(hb, now)
-        inflight, inflight_age = _inflight_age(hb, now)
-        hung_heartbeat = age is not None and age > self.hung_s
-        hung_inflight = (inflight_age is not None
-                         and inflight_age > self.inflight_hung_s)
+        ts = _hb_ts(hb)
+        if ts is None:
+            hb_stall = None
+        else:
+            if ts != self._seen_ts:
+                self._seen_ts = ts
+                self._seen_mono = now_mono
+            hb_stall = now_mono - self._seen_mono
+        inflight_key = _inflight_key(hb)
+        if inflight_key != self._seen_inflight_key:
+            self._seen_inflight_key = inflight_key
+            self._seen_inflight_mono = now_mono
+        inflight_stall = (
+            now_mono - self._seen_inflight_mono
+            if inflight_key is not None else None)
+        hung_heartbeat = hb_stall is not None and hb_stall > self.hung_s
+        hung_inflight = (inflight_stall is not None
+                         and inflight_stall > self.inflight_hung_s)
         if not hung_heartbeat and not hung_inflight:
-            self._latched = False
+            # Re-arm only when a new timestamp is actually fresh. A missing
+            # file, an unreadable file, or a wake-gap rebase of the same
+            # ts must not clear the latch (that would send a second P1).
+            if (self._latched and ts is not None and ts != self._latched_ts
+                    and hb_stall is not None and hb_stall <= self.hung_s):
+                self._latched = False
+                self._latched_ts = None
             return
         if self._latched:
             return
-        # Latch BEFORE the alert so a slow send cannot double-fire, and a
-        # second poll during the dump still counts as the same episode.
+        # Latch first so a slow send cannot double-fire. The alert goes out
+        # before the dump and hang.json: a full disk must not eat the P1.
         self._latched = True
+        self._latched_ts = ts
         reason = "inflight_com_call" if hung_inflight else "heartbeat"
-        stacks_path = os.path.join(self.bot_dir, STACKS_FILENAME)
-        dump_thread_stacks(stacks_path)
-        hang = {
-            "ts": now,
-            "pid": os.getpid(),
-            "reason": reason,
-            "heartbeat_age_s": age,
-            "inflight_com_call": inflight,
-            "stacks_file": STACKS_FILENAME,
-        }
-        atomic_write_json(os.path.join(self.bot_dir, HANG_FILENAME), hang)
-        if self.alert_fn is None:
-            return
+        age = hb_stall
+        inflight, _inflight_wall = _inflight_age(hb, time.time())
         name = ""
         if isinstance(inflight, dict):
             name = str(inflight.get("name") or "")
@@ -276,10 +350,28 @@ class HangWatchdog:
             f"inflight_com_call={name or 'none'} ({reason}). "
             f"Process was NOT killed or restarted."
         )
+        if self.alert_fn is not None:
+            try:
+                self.alert_fn(message)
+            except Exception:
+                logger.exception("hang watchdog alert failed")
+        stacks_path = os.path.join(self.bot_dir, STACKS_FILENAME)
         try:
-            self.alert_fn(message)
+            dump_thread_stacks(stacks_path)
         except Exception:
-            logger.exception("hang watchdog alert failed")
+            logger.exception("hang watchdog stack dump failed")
+        hang = {
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "reason": reason,
+            "heartbeat_age_s": age,
+            "inflight_com_call": inflight,
+            "stacks_file": STACKS_FILENAME,
+        }
+        try:
+            atomic_write_json(os.path.join(self.bot_dir, HANG_FILENAME), hang)
+        except Exception:
+            logger.exception("hang watchdog hang.json write failed")
 
 
 # Process-wide install used by the Tk app. Tests may bind their own pair.
@@ -324,7 +416,8 @@ def tick() -> None:
 def stop() -> None:
     """Drop the writer and delete heartbeat.json. The watchdog keeps running.
 
-    A missing file is not a hang: the watchdog re-arms and stays quiet.
+    A missing file is not a hang. The latch stays set until a later read
+    shows a new, fresh timestamp, so a gap in the file cannot double-alert.
     """
     global _writer
     with _guard:
@@ -341,13 +434,33 @@ def call_com(name: str, fn, *args, **kwargs):
     is installed. Otherwise ``fn`` runs unchanged — login before deploy,
     and any background caller, keep their existing behavior. The heartbeat
     writer itself still rejects a background-thread write.
+
+    Start and end stamps are best-effort. A failed ``os.replace`` (Windows
+    keeps the file locked while a reader holds it) must not skip ``fn``
+    and must not replace ``fn``'s return value or exception.
     """
     writer = _writer
     on_main = threading.current_thread() is threading.main_thread()
     if writer is None or not on_main:
         return fn(*args, **kwargs)
-    writer.begin_inflight(name)
     try:
-        return fn(*args, **kwargs)
-    finally:
+        writer.begin_inflight(name)
+    except Exception:
+        logger.exception(
+            "heartbeat start stamp failed for %s; the COM call still runs",
+            name)
+    outcome = None
+    error = None
+    try:
+        outcome = fn(*args, **kwargs)
+    except BaseException as exc:
+        error = exc
+    try:
         writer.end_inflight()
+    except Exception:
+        logger.exception(
+            "heartbeat end stamp failed for %s; the broker result is unchanged",
+            name)
+    if error is not None:
+        raise error
+    return outcome

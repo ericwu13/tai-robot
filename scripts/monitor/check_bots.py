@@ -219,12 +219,15 @@ def _position_open(broker: dict) -> bool:
         return False
 
 
-def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid):
-    """``(STATE, detail)`` from heartbeat.json plus PID.
+def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid, *,
+                       has_lock=False):
+    """``(STATE, detail)`` from heartbeat.json plus the lock PID.
 
     STATE is ALIVE, STALE, HUNG, DEAD, or UNKNOWN. ``hb is None`` (no
     file) is UNKNOWN — the caller falls back to the legacy log rule.
-    A dead PID is DEAD even when the file's timestamp looks fresh.
+    HUNG and STALE require a ``.lock`` whose PID is alive and equal to
+    the heartbeat PID. A dead lock PID is DEAD. Anything else (no lock,
+    unparsable lock, PID mismatch) is UNKNOWN — not a false HUNG.
     """
     if not isinstance(hb, dict):
         return "UNKNOWN", {}
@@ -247,14 +250,16 @@ def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid):
         "inflight_name": inflight_name,
         "inflight_age_s": inflight_age,
     }
-    owner = lock_pid
-    if owner is None:
-        try:
-            owner = int(hb.get("pid"))
-        except (TypeError, ValueError):
-            owner = None
-    if owner is not None and not pid_alive_fn(owner):
+    try:
+        hb_pid = int(hb.get("pid"))
+    except (TypeError, ValueError):
+        hb_pid = None
+    if has_lock and lock_pid is not None and not pid_alive_fn(lock_pid):
         return "DEAD", detail
+    matched = (has_lock and lock_pid is not None and hb_pid is not None
+               and lock_pid == hb_pid)
+    if not matched:
+        return "UNKNOWN", detail
     inflight_hung = inflight_age is not None and inflight_age > INFLIGHT_HUNG_S
     if age is None and not inflight_hung:
         return "UNKNOWN", detail
@@ -266,6 +271,8 @@ def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid):
 
 
 def _format_heartbeat(state: str, detail: dict) -> str:
+    if state == "UNKNOWN" and detail.get("corrupt"):
+        return "  heartbeat: UNKNOWN (corrupt heartbeat.json)"
     if state == "UNKNOWN" and not detail:
         return ("  heartbeat: UNKNOWN (no heartbeat.json; "
                 "log freshness rule)")
@@ -355,12 +362,16 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
                         os.path.join(bot_dir, ".lock")))
 
         hb_path = os.path.join(bot_dir, HEARTBEAT_FILENAME)
-        if not os.path.isfile(hb_path):
+        hb_file_missing = not os.path.isfile(hb_path)
+        if hb_file_missing:
             hb_state, hb_detail = "UNKNOWN", {}
         else:
-            hb_state, hb_detail = classify_heartbeat(
-                now, read_json(hb_path), pid_alive_fn,
-                pid if (has_lock and pid is not None) else None)
+            raw_hb = read_json(hb_path)
+            if raw_hb is None:
+                hb_state, hb_detail = "UNKNOWN", {"corrupt": True}
+            else:
+                hb_state, hb_detail = classify_heartbeat(
+                    now, raw_hb, pid_alive_fn, pid, has_lock=has_lock)
         lines.append(_format_heartbeat(hb_state, hb_detail))
 
         logs = newest_debug_logs(bot_dir, 1)
@@ -379,7 +390,8 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
                 # log-freshness rule applies only when there is no heartbeat
                 # file (UNKNOWN), so a hung-but-alive bot is not double-counted
                 # and a fresh heartbeat is not graded by a quiet log.
-                if (hb_state == "UNKNOWN" and session is not None and alive
+                if (hb_file_missing and hb_state == "UNKNOWN"
+                        and session is not None and alive
                         and mins > STALE_LOG_MINUTES):
                     findings.append(Finding(
                         "P1", "bots",
@@ -435,10 +447,12 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
                 where = "on a closed day"
             else:
                 where = "during the closed gap"
+            degraded = (" holiday_calendar_degraded"
+                        if _calendar_degraded(now) else "")
             findings.append(Finding(
                 level, "bots",
                 f"{name}: HUNG — main-loop heartbeat {age_txt}s old "
-                f"{where}{extra}",
+                f"{where}{extra}{degraded}",
                 hb_path))
         elif hb_state == "STALE":
             age = hb_detail.get("age_s")

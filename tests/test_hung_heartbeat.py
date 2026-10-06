@@ -17,6 +17,8 @@ import os
 import threading
 import time
 
+import pytest
+
 import src.live.main_heartbeat as hb
 from src.live.main_heartbeat import (
     HeartbeatWriter, HangWatchdog, MainThreadHeartbeatError,
@@ -158,6 +160,175 @@ def test_watchdog_rearms_only_after_recovery(tmp_path):
         assert watchdog._thread.is_alive()
     finally:
         watchdog.disable()
+
+
+class _BrokerBoom(Exception):
+    """Stand-in for a COM/broker failure. Identity must survive a bad stamp."""
+
+
+def _failing_replace(monkeypatch, fail_on: int):
+    real = hb.os.replace
+    seen = {"n": 0}
+
+    def wrapped(src, dst):
+        seen["n"] += 1
+        if seen["n"] == fail_on:
+            raise PermissionError(f"replace {fail_on}")
+        return real(src, dst)
+
+    monkeypatch.setattr(hb.os, "replace", wrapped)
+    return seen
+
+
+@pytest.mark.parametrize("fail_on", [1, 2])
+def test_call_com_stamp_failure_returns_fn_result(tmp_path, monkeypatch, fail_on):
+    """(a) start stamp is replace #1, (b) end stamp is replace #2."""
+    writer = HeartbeatWriter(str(tmp_path))
+    hb._writer = writer
+    _failing_replace(monkeypatch, fail_on)
+    calls = []
+    token = object()
+
+    def fn():
+        calls.append(1)
+        return token
+
+    try:
+        assert hb.call_com("SendFutureOrderCLR", fn) is token
+    finally:
+        hb._writer = None
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("fail_on", [1, 2])
+def test_call_com_stamp_failure_reraises_fn_exception(tmp_path, monkeypatch, fail_on):
+    writer = HeartbeatWriter(str(tmp_path))
+    hb._writer = writer
+    _failing_replace(monkeypatch, fail_on)
+    calls = []
+    boom = _BrokerBoom("order rejected")
+
+    def fn():
+        calls.append(1)
+        raise boom
+
+    try:
+        with pytest.raises(_BrokerBoom) as caught:
+            hb.call_com("SendFutureOrderCLR", fn)
+    finally:
+        hb._writer = None
+    assert caught.value is boom
+    assert calls == [1]
+
+
+def test_default_thresholds_and_strict_boundaries(tmp_path):
+    """Pins 90s / 60s and ``>`` (age == threshold is not hung)."""
+    assert hb.DEFAULT_HUNG_S == 90.0
+    assert hb.DEFAULT_INFLIGHT_HUNG_S == 60.0
+    alerts = []
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write()
+    watchdog = HangWatchdog(str(tmp_path), alert_fn=alerts.append)
+    assert watchdog.hung_s == 90.0
+    assert watchdog.inflight_hung_s == 60.0
+    data = hb.read_heartbeat(writer.path)
+    watchdog._seen_ts = data["ts"]
+    watchdog._seen_mono = 0.0
+    watchdog._check_once(90.0)
+    assert alerts == []
+    watchdog._check_once(90.01)
+    assert len(alerts) == 1
+
+    alerts.clear()
+    inflight_dir = tmp_path / "inflight"
+    inflight_dir.mkdir()
+    writer = HeartbeatWriter(str(inflight_dir))
+    writer._inflight = {"name": "LeaveMonitor", "start_ts": 1.0}
+    writer.write()
+    watchdog = HangWatchdog(str(inflight_dir), alert_fn=alerts.append)
+    watchdog._check_once(0.0)
+    watchdog._check_once(60.0)
+    assert alerts == []
+    watchdog._check_once(60.01)
+    assert len(alerts) == 1
+    assert "LeaveMonitor" in alerts[0]
+
+
+def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_path, monkeypatch):
+    alerts = []
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write()
+    watchdog = HangWatchdog(
+        str(tmp_path), hung_s=90.0, inflight_hung_s=60.0,
+        poll_s=2.0, alert_fn=alerts.append)
+    watchdog._check_once()
+    base = time.time()
+    monkeypatch.setattr(hb.time, "time", lambda: base + 600.0)
+    watchdog._check_once()
+    assert alerts == [], "wall-clock jump must not raise a P1"
+
+    watchdog._seen_mono = time.monotonic() - 91.0
+    monkeypatch.setattr(hb.time, "time", lambda: 1.0)
+    watchdog._check_once()
+    assert len(alerts) == 1, "backward wall jump must not hide a real stall"
+
+    alerts.clear()
+    sleep_dir = tmp_path / "sleep"
+    sleep_dir.mkdir()
+    writer = HeartbeatWriter(str(sleep_dir))
+    writer.write()
+    watchdog = HangWatchdog(
+        str(sleep_dir), hung_s=90.0, poll_s=2.0, alert_fn=alerts.append)
+    watchdog._latched = True
+    watchdog._latched_ts = hb.read_heartbeat(writer.path)["ts"]
+    watchdog._poll()
+    watchdog._seen_mono = time.monotonic() - 600.0
+    watchdog._last_loop_mono = time.monotonic() - 600.0
+    watchdog._poll()
+    assert alerts == []
+    assert watchdog._latched is True
+    watchdog._poll()
+    assert alerts == []
+    assert watchdog._latched is True, "wake rebase must not re-arm the latch"
+    # A modest wake (2× poll) is not a sleep. A real stall still alerts.
+    watchdog._latched = False
+    watchdog._seen_mono = time.monotonic() - 91.0
+    watchdog._last_loop_mono = time.monotonic() - (watchdog.poll_s * 2)
+    watchdog._poll()
+    assert len(alerts) == 1
+
+
+def test_alert_goes_out_when_dump_fails_and_missing_file_does_not_rearm(tmp_path, monkeypatch):
+    alerts = []
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write()
+    raw = (tmp_path / "heartbeat.json").read_bytes()
+    watchdog = HangWatchdog(str(tmp_path), hung_s=90.0, alert_fn=alerts.append)
+
+    def boom(_path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(hb, "dump_thread_stacks", boom)
+    watchdog._check_once(0.0)
+    watchdog._check_once(100.0)
+    assert len(alerts) == 1
+    watchdog._check_once(200.0)
+    assert len(alerts) == 1
+    os.remove(writer.path)
+    watchdog._check_once(300.0)
+    assert watchdog._latched is True
+    (tmp_path / "heartbeat.json").write_bytes(b"{broken")
+    watchdog._check_once(400.0)
+    assert watchdog._latched is True
+    assert len(alerts) == 1
+    (tmp_path / "heartbeat.json").write_bytes(raw)
+    watchdog._check_once(500.0)
+    assert len(alerts) == 1, "same heartbeat must not send a second P1"
+    writer.write()
+    watchdog._check_once(500.1)
+    assert watchdog._latched is False
+    watchdog._check_once(700.0)
+    assert len(alerts) == 2
 
 
 def test_attempt_reconnect_stamps_leave_monitor():
