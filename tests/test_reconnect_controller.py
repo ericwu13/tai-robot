@@ -21,7 +21,6 @@ from src.live.reconnect_controller import (
     ACTION_TEARDOWN_AND_LOGIN,
     CLOCK_DISAGREE_WARN,
     CLOCK_FALLBACK_WARN,
-    HOLIDAY_LOOKUP_WARN,
     FORCED_TEARDOWN_LOG,
     IS_CONNECTED,
     IS_CONNECTING,
@@ -443,10 +442,12 @@ class TestSessionLookupFallback:
         assert not decision.forced_teardown
 
     def test_holiday_call_raise_keeps_skipping_when_closed(self, monkeypatch):
-        """Call-time is_taifex_holiday failure uses weekdays and warns.
+        """Call-time is_taifex_holiday failure uses the weekend clock and warns.
 
-        Saturday 10:00 and Monday 03:00 are closed. The half-up guard
-        keeps skipping. It does not take the live-session fail-open.
+        Saturday 10:00 and Monday 03:00 are closed on that clock. The
+        half-up guard keeps skipping. It does not take the live-session
+        fail-open. The probe runs before current_session, which would
+        swallow the raise.
         """
         def boom(d):
             raise RuntimeError("holiday lookup failed")
@@ -461,11 +462,62 @@ class TestSessionLookupFallback:
             since = seconds_since_session_open(when)
             assert since < 0, when
             assert since < ReconnectController.HALF_UP_HOLD_S
-            assert pop_session_clock_warnings() == [HOLIDAY_LOOKUP_WARN]
+            assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
             ctrl = _incident_controller()
             decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
             assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
             assert not decision.forced_teardown
+
+    def test_friday_session_holiday_raise_warns_before_current_session(self, monkeypatch):
+        """A raise during Friday session hours must not stay silent.
+
+        2026-10-09 10:00 is 75 minutes after the weekend clock's 08:45.
+        current_session only asks is_taifex_holiday(today) and swallows
+        the raise, so without the today+yesterday probe there is no WARN
+        and the half-up guard sees a live session.
+        """
+        from datetime import date as date_cls
+
+        seen: list[date_cls] = []
+
+        def boom(d):
+            seen.append(d)
+            raise RuntimeError("holiday lookup failed")
+
+        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+        when = datetime(2026, 10, 9, 10, 0, 0, tzinfo=_TPE)
+        assert when.weekday() == 4
+        reset_session_clock_warnings()
+        since = seconds_since_session_open(when)
+        assert since == 75 * 60
+        assert since >= ReconnectController.HALF_UP_HOLD_S
+        assert set(seen) == {when.date(), when.date() - timedelta(days=1)}
+        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
+        # The same failure on the deferral flag is one latched WARN.
+        assert in_live_session(when) is True
+        assert pop_session_clock_warnings() == []
+
+    def test_yesterday_holiday_raise_still_warns_on_friday_morning(self, monkeypatch):
+        """Yesterday is probed even when today's call succeeds.
+
+        Day-session current_session never asks about yesterday, so a
+        raise there used to disappear.
+        """
+        from datetime import date as date_cls
+
+        yesterday = date_cls(2026, 10, 8)
+
+        def boom(d):
+            if d == yesterday:
+                raise RuntimeError("yesterday failed")
+            return False
+
+        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+        when = datetime(2026, 10, 9, 10, 0, 0, tzinfo=_TPE)
+        reset_session_clock_warnings()
+        since = seconds_since_session_open(when)
+        assert since == 75 * 60
+        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
 
 
 class TestClockDisagreement:
@@ -485,6 +537,18 @@ class TestClockDisagreement:
         decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
         assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
         assert not decision.forced_teardown
+
+    def test_disagreement_warns_at_most_once_per_calendar_day(self):
+        """Agreeing and disagreeing again the same day does not re-warn."""
+        friday = datetime(2026, 9, 25, 10, 0, 0, tzinfo=_TPE)
+        seconds_since_session_open(friday)
+        assert pop_session_clock_warnings() == [CLOCK_DISAGREE_WARN]
+        seconds_since_session_open(friday.replace(hour=11))
+        in_live_session(friday)
+        assert pop_session_clock_warnings() == []
+        monday = datetime(2026, 9, 28, 10, 0, 0, tzinfo=_TPE)
+        seconds_since_session_open(monday)
+        assert pop_session_clock_warnings() == [CLOCK_DISAGREE_WARN]
 
 
 class TestSingleReconnectTimer:

@@ -178,6 +178,9 @@ def _weekend_seconds_since_open(now: datetime) -> int:
 
 _pending_clock_warnings: list[str] = []
 _latched_clock_warnings: set[str] = set()
+# Calendar disagreement is noisy if the two clocks flicker. One WARN per
+# Taipei date, even when they agree again and then disagree the same day.
+_clock_disagree_day: date | None = None
 
 
 def _note_clock_warning(kind: str, message: str) -> None:
@@ -197,16 +200,24 @@ def _note_clock_disagreement(now: datetime, in_session: bool) -> None:
 
     The holiday-aware answer stays in force. The WARN is what stops a
     trading day mislabeled as closed from skipping with no operator signal.
+    It fires at most once per Taipei calendar day: agreeing and then
+    disagreeing again the same day does not send a second alert.
     """
+    global _clock_disagree_day
     try:
         from src.live.live_runner import is_market_open
         weekend_open = bool(is_market_open(now))
     except Exception:
         return
-    if weekend_open != in_session:
-        _note_clock_warning("disagree", CLOCK_DISAGREE_WARN)
-    else:
-        _clear_clock_warning("disagree")
+    if weekend_open == in_session:
+        return
+    day = now.date()
+    if _clock_disagree_day == day:
+        return
+    _clock_disagree_day = day
+    # The kind latch would otherwise hold into the next date.
+    _latched_clock_warnings.discard("disagree")
+    _note_clock_warning("disagree", CLOCK_DISAGREE_WARN)
 
 
 def pop_session_clock_warnings() -> list[str]:
@@ -219,9 +230,33 @@ def pop_session_clock_warnings() -> list[str]:
 
 def reset_session_clock_warnings() -> None:
     """Drop queued warnings and their once-only latches. Tests use this."""
-    global _pending_clock_warnings
+    global _pending_clock_warnings, _clock_disagree_day
     _pending_clock_warnings = []
     _latched_clock_warnings.clear()
+    _clock_disagree_day = None
+
+
+def _holiday_calls_failed(now: datetime) -> bool:
+    """True when ``is_taifex_holiday`` raises for today or yesterday.
+
+    ``current_session`` calls ``switch_logic._is_closed_day``, which
+    swallows that raise and treats a weekday as open. During the day
+    session that looks like a normal Friday: no WARN, and a half-up
+    session is past open+90s, so one LeaveMonitor is allowed. Probe both
+    days before that lookup. An import failure is not a call-time raise;
+    ``current_session`` still degrades to weekends on its own.
+    """
+    try:
+        from src.market_data.holidays import is_taifex_holiday
+    except Exception:
+        return False
+    failed = False
+    for day in (now.date(), now.date() - timedelta(days=1)):
+        try:
+            is_taifex_holiday(day)
+        except Exception:
+            failed = True
+    return failed
 
 
 def seconds_since_session_open(now: datetime | None = None) -> int:
@@ -234,15 +269,20 @@ def seconds_since_session_open(now: datetime | None = None) -> int:
     an open: the weekend-only clock would already be past open+90s at
     10:00, and this one is still negative.
 
-    If ``current_session`` itself raises, this returns the weekend-only
-    clock and queues ``CLOCK_FALLBACK_WARN``. That value is past open+90s
-    only when the weekend-only clock says a session is already open, so
-    a Saturday or a closed overnight still skips. It is not a blanket
-    open+90, and it is not the next night open (−18000s) at 10:00 on a
-    trading day. A raised ``is_taifex_holiday`` call does not reach this
-    branch; ``_is_closed_day`` keeps the weekday-only answer.
+    If ``current_session`` itself raises, or ``is_taifex_holiday`` raises
+    for today or yesterday, this returns the weekend-only clock and queues
+    ``CLOCK_FALLBACK_WARN``. That value is past open+90s only when the
+    weekend-only clock says a session is already open, so a Saturday or a
+    closed overnight still skips. It is not a blanket open+90, and it is
+    not the next night open (−18000s) at 10:00 on a trading day. The
+    holiday probe runs first: ``current_session`` would swallow the raise
+    and report a live Friday session with no WARN.
     """
     now = _as_taipei(now)
+    if _holiday_calls_failed(now):
+        _clear_clock_warning("disagree")
+        _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
+        return _weekend_seconds_since_open(now)
     try:
         session = _live_session(now)
         if session is not None:
@@ -269,10 +309,15 @@ def in_live_session(now: datetime | None = None) -> bool:
 
     The reconnect deferral uses this. It does not call the weekend-only
     market-open helper, which treats a weekday holiday as a normal session.
-    A lookup that raises falls back to that helper and queues the same
-    WARN as ``seconds_since_session_open``.
+    A lookup that raises, including ``is_taifex_holiday`` for today or
+    yesterday, falls back to that helper and queues the same WARN as
+    ``seconds_since_session_open``.
     """
     now = _as_taipei(now)
+    if _holiday_calls_failed(now):
+        _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
+        from src.live.live_runner import is_market_open
+        return bool(is_market_open(now))
     try:
         live = _live_session(now) is not None
     except Exception:
