@@ -20,6 +20,7 @@ from src.live.reconnect_controller import (
     ACTION_SKIP_TEARDOWN_WAIT,
     ACTION_TEARDOWN_AND_LOGIN,
     CALENDAR_DEGRADED_P1,
+    CALENDAR_RECOVERY_POLLS,
     CLOCK_DISAGREE_WARN,
     CLOCK_FALLBACK_WARN,
     FORCED_TEARDOWN_LOG,
@@ -473,6 +474,8 @@ class TestSessionLookupFallback:
             decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
             assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
             assert not decision.forced_teardown
+            # Closed market: no "press Reconnect" P1.
+            assert pop_calendar_degraded_p1() is None
 
     def test_friday_session_holiday_raise_warns_before_current_session(self, monkeypatch):
         """A raise during Friday session hours must not stay silent.
@@ -545,7 +548,12 @@ class TestDegradedCalendarDoesNotForceTeardown:
         datetime(2027, 1, 1, 10, 0, 0, tzinfo=_TPE),
     )
 
-    def test_full_drop_and_ready_are_unchanged(self, monkeypatch):
+    def test_full_drop_while_degraded_does_not_tear_down(self, monkeypatch):
+        """A 0 reading during a degraded half-up episode is not a teardown.
+
+        Ready (IsConnected()==1) is still already-connected. A healthy
+        full drop, with the calendar up, still tears down.
+        """
         def boom(d):
             raise RuntimeError("holiday lookup failed")
 
@@ -555,10 +563,14 @@ class TestDegradedCalendarDoesNotForceTeardown:
         assert since >= ReconnectController.HALF_UP_HOLD_S
         ctrl = _incident_controller()
         dropped = ctrl.decide(0, seconds_since_open=since)
-        assert dropped.action == ACTION_TEARDOWN_AND_LOGIN
+        assert dropped.action == ACTION_SKIP_TEARDOWN_WAIT
         assert not dropped.forced_teardown
         ready = ctrl.decide(IS_CONNECTED, seconds_since_open=since)
         assert ready.action == ACTION_ALREADY_CONNECTED
+        reset_session_clock_warnings()
+        healthy = _incident_controller()
+        still_down = healthy.decide(0, seconds_since_open=since)
+        assert still_down.action == ACTION_TEARDOWN_AND_LOGIN
 
     def test_manual_confirm_required_past_weekend_open_plus_90(self, monkeypatch):
         def boom(d):
@@ -577,7 +589,8 @@ class TestDegradedCalendarDoesNotForceTeardown:
             assert not calendar_degraded()
             assert not ctrl.manual_half_up_needs_confirm(IS_CONNECTING, since)
 
-    def test_calendar_recovery_rearms_the_p1(self, monkeypatch):
+    def test_one_good_lookup_does_not_rearm_recovery_does(self, monkeypatch):
+        """The P1 re-arms after the recovery streak, not after one success."""
         state = {"fail": True}
 
         def holiday(d):
@@ -588,19 +601,25 @@ class TestDegradedCalendarDoesNotForceTeardown:
         monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", holiday)
         when = self._FRIDAYS[0]
         since = seconds_since_session_open(when)
+        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
         ctrl = _incident_controller()
         first = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
         assert first.action == ACTION_SKIP_TEARDOWN_WAIT
         assert pop_calendar_degraded_p1() == CALENDAR_DEGRADED_P1
-        ctrl.decide(IS_CONNECTING, seconds_since_open=since)
-        assert pop_calendar_degraded_p1() is None
 
         state["fail"] = False
+        seconds_since_session_open(when)
+        assert calendar_degraded()
+        held = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert held.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert pop_calendar_degraded_p1() is None
+        for _ in range(CALENDAR_RECOVERY_POLLS - 2):
+            seconds_since_session_open(when)
+            assert calendar_degraded()
         recovered = seconds_since_session_open(when)
         assert not calendar_degraded()
         assert recovered == 75 * 60
-        healthy = ctrl.decide(IS_CONNECTING, seconds_since_open=recovered)
-        assert healthy.forced_teardown
+        assert pop_session_clock_warnings() == []
 
         state["fail"] = True
         degraded_since = seconds_since_session_open(when)
@@ -608,8 +627,10 @@ class TestDegradedCalendarDoesNotForceTeardown:
         assert again.action == ACTION_SKIP_TEARDOWN_WAIT
         assert not again.forced_teardown
         assert pop_calendar_degraded_p1() == CALENDAR_DEGRADED_P1
+        ctrl.decide(IS_CONNECTING, seconds_since_open=degraded_since)
+        assert pop_calendar_degraded_p1() is None
 
-    def test_ready_and_full_drop_rearm_the_p1(self, monkeypatch):
+    def test_ready_rearms_and_a_drop_does_not(self, monkeypatch):
         def boom(now=None):
             raise RuntimeError("session lookup failed")
 
@@ -621,17 +642,16 @@ class TestDegradedCalendarDoesNotForceTeardown:
             ACTION_SKIP_TEARDOWN_WAIT)
         assert pop_calendar_degraded_p1() == CALENDAR_DEGRADED_P1
 
+        dropped = ctrl.decide(0, seconds_since_open=since)
+        assert dropped.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert ctrl.decide(IS_CONNECTING, seconds_since_open=since).action == (
+            ACTION_SKIP_TEARDOWN_WAIT)
+        assert pop_calendar_degraded_p1() is None
+
         ctrl.on_ready()
         ctrl.on_clean_disconnect()
         ctrl.on_attempt_started()
         ctrl.on_attempt_failed()
-        assert ctrl.decide(IS_CONNECTING, seconds_since_open=since).action == (
-            ACTION_SKIP_TEARDOWN_WAIT)
-        assert pop_calendar_degraded_p1() == CALENDAR_DEGRADED_P1
-
-        ctrl.decide(IS_CONNECTING, seconds_since_open=since)
-        assert pop_calendar_degraded_p1() is None
-        ctrl.decide(0, seconds_since_open=since)
         assert ctrl.decide(IS_CONNECTING, seconds_since_open=since).action == (
             ACTION_SKIP_TEARDOWN_WAIT)
         assert pop_calendar_degraded_p1() == CALENDAR_DEGRADED_P1

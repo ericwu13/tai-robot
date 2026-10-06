@@ -114,12 +114,12 @@ from src.live.reconnect_controller import (
     HALF_UP_TEARDOWN_CONFIRM,
     HALF_UP_CONFIRM_UNAVAILABLE_LOG,
     HALF_UP_YES_STALE_LOG,
-    HEADLESS_HALF_UP_REFUSED_P1,
     IS_CONNECTING,
     OPERATOR_DECLINED_HALF_UP_LOG,
     OPERATOR_FORCED_HALF_UP_P1,
     ReconnectController,
     ReconnectSchedule,
+    headless_half_up_refusal_phrase,
     in_live_session,
     pop_calendar_degraded_p1,
     pop_session_clock_warnings,
@@ -1480,9 +1480,13 @@ class BacktestApp:
         return False
 
     def _refuse_half_up_manual(self, is_connected, since) -> None:
-        """Headless has no dialog. One IsConnected read already happened."""
+        """Headless has no dialog. One IsConnected read already happened.
+
+        A degraded calendar uses its own phrase. A healthy clock that
+        is still before open+90 keeps the original text.
+        """
         self._raise_reconnect_alert(self._half_up_manual_p1(
-            HEADLESS_HALF_UP_REFUSED_P1, is_connected, since))
+            headless_half_up_refusal_phrase(), is_connected, since))
         self.btn_reconnect.config(state=tk.NORMAL)
 
     def _decline_half_up_manual(self) -> None:
@@ -1512,7 +1516,7 @@ class BacktestApp:
         except tk.TclError:
             self._decline_half_up_manual()
             self._raise_reconnect_alert(self._half_up_manual_p1(
-                HEADLESS_HALF_UP_REFUSED_P1, is_connected, since))
+                headless_half_up_refusal_phrase(), is_connected, since))
             return False
         self._resume_reconnect_slot()
         if not confirmed:

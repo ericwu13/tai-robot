@@ -692,7 +692,10 @@ def test_half_up_yes_alerts_before_one_leave_and_resets(monkeypatch):
 def test_headless_half_up_reconnect_is_refused(monkeypatch, capsys):
     """No UI: one P1, no LeaveMonitor, allowance unchanged."""
     import run_backtest as rb
-    from src.live.reconnect_controller import HEADLESS_HALF_UP_REFUSED_P1
+    from src.live.reconnect_controller import (
+        HEADLESS_HALF_UP_DEGRADED_P1,
+        HEADLESS_HALF_UP_REFUSED_P1,
+    )
 
     discord = _Discord()
     monkeypatch.setattr(rb, "_discord", discord)
@@ -713,11 +716,13 @@ def test_headless_half_up_reconnect_is_refused(monkeypatch, capsys):
     assert ctrl.forced_teardown_used
     assert len(discord.messages) == 1
     assert HEADLESS_HALF_UP_REFUSED_P1 in discord.messages[0]
+    assert HEADLESS_HALF_UP_DEGRADED_P1 not in discord.messages[0]
     assert "bot=bot-0422" in discord.messages[0]
     assert "IsConnected=2" in discord.messages[0]
     assert "secs_to_open=120" in discord.messages[0]
     out = capsys.readouterr().out
     assert HEADLESS_HALF_UP_REFUSED_P1 in out
+    assert HEADLESS_HALF_UP_DEGRADED_P1 not in out
     assert "normal" in app.btn_states
 
 
@@ -1148,13 +1153,26 @@ def test_holiday_call_raise_skips_and_warns_while_closed(monkeypatch, capsys):
         rb.BacktestApp._attempt_reconnect(app)
         assert leaves == []
         assert CLOCK_FALLBACK_WARN in discord.messages
-        assert discord.messages.count(CALENDAR_DEGRADED_P1) == 1
+        assert discord.messages.count(CALENDAR_DEGRADED_P1) == 0
         assert any(item and item[0] == "skip" for item in app.armed), app.armed
         out = capsys.readouterr().out
         warn_lines = [line for line in out.splitlines() if CLOCK_FALLBACK_WARN in line]
         assert warn_lines
         assert all("[DEBUG]" not in line for line in warn_lines)
-        assert out.count(CALENDAR_DEGRADED_P1) == 1
+        assert CALENDAR_DEGRADED_P1 not in out
+
+        calls = []
+
+        def confirm(message, *, default):
+            calls.append((message, default))
+            return False
+
+        app._half_up_confirm_fn = confirm
+        rb.BacktestApp._manual_reconnect(app)
+        from src.live.reconnect_controller import HALF_UP_TEARDOWN_CONFIRM
+        assert calls == [(HALF_UP_TEARDOWN_CONFIRM, "no")]
+        assert leaves == []
+        assert discord.messages.count(CALENDAR_DEGRADED_P1) == 0
         app.armed.clear()
 
 
@@ -1288,7 +1306,10 @@ def test_headless_degraded_half_up_refuses(monkeypatch, capsys):
     from datetime import datetime, timedelta, timezone
 
     import run_backtest as rb
-    from src.live.reconnect_controller import HEADLESS_HALF_UP_REFUSED_P1
+    from src.live.reconnect_controller import (
+        HEADLESS_HALF_UP_DEGRADED_P1,
+        HEADLESS_HALF_UP_REFUSED_P1,
+    )
 
     when = datetime(2026, 10, 9, 10, 0, tzinfo=timezone(timedelta(hours=8)))
     rb_mod, app, ctrl, discord, leaves = _degraded_friday_app(
@@ -1302,9 +1323,103 @@ def test_headless_degraded_half_up_refuses(monkeypatch, capsys):
     rb_mod.BacktestApp._manual_reconnect(app)
     assert leaves == []
     assert not ctrl.forced_teardown_used
-    assert any(HEADLESS_HALF_UP_REFUSED_P1 in msg for msg in discord.messages)
+    assert any(HEADLESS_HALF_UP_DEGRADED_P1 in msg for msg in discord.messages)
+    assert not any(HEADLESS_HALF_UP_REFUSED_P1 in msg for msg in discord.messages)
     assert "normal" in app.btn_states
-    assert HEADLESS_HALF_UP_REFUSED_P1 in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert HEADLESS_HALF_UP_DEGRADED_P1 in out
+    assert HEADLESS_HALF_UP_REFUSED_P1 not in out
+
+
+def _replace_probe(monkeypatch, rb_mod, leaves, state):
+    """Point the broker and the holiday lookup at a mutable ``state``."""
+    def holiday(d):
+        if state["fail"]:
+            raise RuntimeError("holiday lookup failed")
+        return d.weekday() >= 5
+
+    class _Quote:
+        def SKQuoteLib_IsConnected(self):
+            return state["ic"]
+
+        def SKQuoteLib_LeaveMonitor(self):
+            leaves.append("leave")
+            return 0
+
+    monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", holiday)
+    monkeypatch.setattr(rb_mod, "skQ", _Quote())
+
+
+def test_flapping_calendar_one_p1_and_no_leave(monkeypatch, capsys):
+    """Fail, succeed, fail… for 41 polls. One P1, one WARN, no LeaveMonitor.
+
+    A single good lookup must not re-arm either latch.
+    """
+    import run_backtest as rb
+    from src.live.reconnect_controller import (
+        CALENDAR_DEGRADED_P1,
+        CLOCK_FALLBACK_WARN,
+    )
+
+    when = datetime(2026, 10, 9, 10, 0, tzinfo=_TPE)
+    state = {"fail": True, "ic": 2}
+    rb_mod, app, _ctrl, discord, leaves = _degraded_friday_app(
+        monkeypatch, when, failure="holiday")
+    _replace_probe(monkeypatch, rb_mod, leaves, state)
+    for i in range(41):
+        state["fail"] = (i % 2 == 0)
+        if i == 0:
+            rb_mod.BacktestApp._attempt_reconnect(app)
+        else:
+            assert len(app.root.pending) == 1
+            app.root.fire()
+    assert leaves == []
+    assert discord.messages.count(CALENDAR_DEGRADED_P1) == 1
+    assert discord.messages.count(CLOCK_FALLBACK_WARN) == 1
+    out = capsys.readouterr().out
+    assert out.count(CALENDAR_DEGRADED_P1) == 1
+    assert out.count(CLOCK_FALLBACK_WARN) == 1
+
+
+def test_connection_flap_one_p1_over_simulated_hour(monkeypatch, capsys):
+    """IsConnected 0/2 for a simulated hour. One P1, no automatic LeaveMonitor.
+
+    Time advances by the delay production actually arms: the 15s skip
+    while the teardown is withheld, or the ConnectionMonitor backoff
+    ladder when a retry is scheduled. A drop does not re-arm the P1.
+    """
+    import run_backtest as rb
+    from src.live.connection_monitor import ConnectionMonitor
+    from src.live.reconnect_controller import (
+        CALENDAR_DEGRADED_P1,
+        ReconnectController,
+    )
+
+    when = datetime(2026, 10, 9, 10, 0, tzinfo=_TPE)
+    state = {"fail": True, "ic": 0}
+    rb_mod, app, _ctrl, discord, leaves = _degraded_friday_app(
+        monkeypatch, when, failure="holiday")
+    _replace_probe(monkeypatch, rb_mod, leaves, state)
+    app._schedule_reconnect = (
+        lambda: rb_mod.BacktestApp._schedule_reconnect(app))
+    allowed_ms = {ReconnectController.CONNECTING_WAIT_S * 1000}
+    allowed_ms.update(delay * 1000 for delay in ConnectionMonitor.RECONNECT_DELAYS)
+    allowed_ms.add(ConnectionMonitor.REST_CYCLE_DELAY_S * 1000)
+
+    elapsed = 0.0
+    while elapsed < 3600:
+        if not app.root.pending:
+            rb_mod.BacktestApp._attempt_reconnect(app)
+        else:
+            app.root.fire()
+        assert len(app.root.pending) == 1
+        delay_ms = next(iter(app.root.pending.values()))[0]
+        assert delay_ms in allowed_ms
+        elapsed += delay_ms / 1000
+        state["ic"] = 2 if state["ic"] == 0 else 0
+    assert leaves == []
+    assert discord.messages.count(CALENDAR_DEGRADED_P1) == 1
+    assert capsys.readouterr().out.count(CALENDAR_DEGRADED_P1) == 1
 
 
 def test_skip_cap_alerts_discord_and_does_not_arm(monkeypatch, capsys):
