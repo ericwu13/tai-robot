@@ -38,10 +38,17 @@ FORCED_TEARDOWN_LOG = "[RECONNECT] P1 forced teardown of half-up session"
 ESCALATION_LOG = (
     "[RECONNECT] P1 half-up skip loop stopped after forced teardown"
 )
-# Holiday-aware lookup raised. The GUI sends this through _log and Discord.
+# current_session itself raised while the weekend-only clock says the
+# market is open. The GUI sends this through _log and Discord.
 CLOCK_FALLBACK_WARN = (
     "[RECONNECT] WARN holiday-aware session lookup failed — "
     "using the weekend-only clock"
+)
+# is_taifex_holiday raised at call time. Weekday-only closed check.
+# Import failure stays silent; this one is a live lookup error.
+HOLIDAY_LOOKUP_WARN = (
+    "[RECONNECT] WARN is_taifex_holiday failed — "
+    "using the weekday-only closed check"
 )
 # is_market_open() and current_session disagree. Holiday-aware still wins.
 CLOCK_DISAGREE_WARN = (
@@ -83,15 +90,24 @@ def _is_closed_day(d: date) -> bool:
     """True when TAIFEX has no session opening on ``d``.
 
     Uses ``is_taifex_holiday`` (weekends, TW public holidays, overrides).
-    A missing holiday calendar degrades to weekends, matching
-    ``current_session``. A lookup that raises propagates so the clock
-    can fall back to the weekend-only edges instead of a multi-day skip.
+    A missing holiday module degrades to weekends, matching
+    ``current_session``. A call that raises does the same and queues
+    ``HOLIDAY_LOOKUP_WARN``. It must not escape into the
+    ``current_session`` fail-open: that path is only for a dead session
+    lookup, and a blanket open+90 there LeaveMonitors a half-up session
+    on a Saturday or a closed overnight.
     """
     try:
         from src.market_data.holidays import is_taifex_holiday
     except Exception:
         return d.weekday() >= 5
-    return is_taifex_holiday(d)
+    try:
+        closed = is_taifex_holiday(d)
+    except Exception:
+        _note_clock_warning("holiday", HOLIDAY_LOOKUP_WARN)
+        return d.weekday() >= 5
+    _clear_clock_warning("holiday")
+    return closed
 
 
 def _next_session_open(now: datetime) -> datetime:
@@ -218,10 +234,13 @@ def seconds_since_session_open(now: datetime | None = None) -> int:
     an open: the weekend-only clock would already be past open+90s at
     10:00, and this one is still negative.
 
-    If ``current_session`` or the holiday lookup raises, this returns the
-    weekend-only clock instead and queues ``CLOCK_FALLBACK_WARN``. At
-    10:00 on a trading day that is seconds since 08:45, so one forced
-    teardown is allowed. It is not the next night open (−18000s).
+    If ``current_session`` itself raises, this returns the weekend-only
+    clock and queues ``CLOCK_FALLBACK_WARN``. That value is past open+90s
+    only when the weekend-only clock says a session is already open, so
+    a Saturday or a closed overnight still skips. It is not a blanket
+    open+90, and it is not the next night open (−18000s) at 10:00 on a
+    trading day. A raised ``is_taifex_holiday`` call does not reach this
+    branch; ``_is_closed_day`` keeps the weekday-only answer.
     """
     now = _as_taipei(now)
     try:
@@ -233,9 +252,13 @@ def seconds_since_session_open(now: datetime | None = None) -> int:
             since = int((now - _next_session_open(now)).total_seconds())
             in_session = False
     except Exception:
-        _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
         _clear_clock_warning("disagree")
-        return _weekend_seconds_since_open(now)
+        weekend_since = _weekend_seconds_since_open(now)
+        # Past open+90 only when this clock says a session is open.
+        # A Saturday or a closed overnight stays negative, so decide()
+        # keeps skipping instead of LeaveMonitor.
+        _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
+        return weekend_since
     _clear_clock_warning("fallback")
     _note_clock_disagreement(now, in_session)
     return since

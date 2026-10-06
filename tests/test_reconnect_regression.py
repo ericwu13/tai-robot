@@ -666,6 +666,62 @@ def test_tk_half_up_confirm_defaults_to_no(monkeypatch):
     assert seen["default"] == rb.messagebox.NO
 
 
+def test_holiday_call_raise_skips_and_warns_while_closed(monkeypatch, capsys):
+    """is_taifex_holiday raising on a closed clock does not LeaveMonitor.
+
+    Saturday 10:00 and Monday 03:00 stay on the weekday-only answer.
+    The WARN reaches _log and Discord. The skip poll stays armed.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import run_backtest as rb
+    from src.live.reconnect_controller import (
+        HOLIDAY_LOOKUP_WARN,
+        ReconnectController,
+        reset_session_clock_warnings,
+    )
+
+    def boom(d):
+        raise RuntimeError("holiday lookup failed")
+
+    cases = (
+        datetime(2026, 10, 10, 10, 0, tzinfo=timezone(timedelta(hours=8))),
+        datetime(2026, 10, 5, 3, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+    for when in cases:
+        reset_session_clock_warnings()
+        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+        monkeypatch.setattr("src.live.live_runner._taipei_now", lambda when=when: when)
+        discord = _Discord()
+        monkeypatch.setattr(rb, "_discord", discord)
+        monkeypatch.setattr(rb, "_com_available", True)
+        leaves = []
+
+        class _Quote:
+            def SKQuoteLib_IsConnected(self):
+                return 2
+
+            def SKQuoteLib_LeaveMonitor(self):
+                leaves.append("leave")
+                return 0
+
+        monkeypatch.setattr(rb, "skQ", _Quote())
+        ctrl = ReconnectController()
+        ctrl.on_clean_disconnect()
+        ctrl.on_attempt_started()
+        ctrl.on_attempt_failed()
+        app = _behavior_app(ctrl)
+        rb.BacktestApp._attempt_reconnect(app)
+        assert leaves == []
+        assert discord.messages == [HOLIDAY_LOOKUP_WARN]
+        assert any(item and item[0] == "skip" for item in app.armed), app.armed
+        out = capsys.readouterr().out
+        warn_lines = [line for line in out.splitlines() if HOLIDAY_LOOKUP_WARN in line]
+        assert warn_lines
+        assert all("[DEBUG]" not in line for line in warn_lines)
+        app.armed.clear()
+
+
 def test_lookup_failure_warns_and_reaches_forced_teardown(monkeypatch, capsys):
     """current_session raises at 10:00 on a trading day.
 

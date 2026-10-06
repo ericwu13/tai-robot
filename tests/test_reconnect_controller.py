@@ -21,6 +21,7 @@ from src.live.reconnect_controller import (
     ACTION_TEARDOWN_AND_LOGIN,
     CLOCK_DISAGREE_WARN,
     CLOCK_FALLBACK_WARN,
+    HOLIDAY_LOOKUP_WARN,
     FORCED_TEARDOWN_LOG,
     IS_CONNECTED,
     IS_CONNECTING,
@@ -425,21 +426,46 @@ class TestSessionLookupFallback:
             assert ctrl.record_skip_poll() is False
         assert ctrl.record_skip_poll() is True
 
-    def test_holiday_lookup_raise_uses_weekend_clock(self, monkeypatch):
-        def boom(d):
-            raise RuntimeError("holiday lookup failed")
+    def test_current_session_raise_on_saturday_keeps_skipping(self, monkeypatch):
+        """A dead session lookup must not invent open+90 while closed."""
+        def boom(now=None):
+            raise RuntimeError("session lookup failed")
 
-        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
-        # 14:00 is the day-to-night gap. The next-open scan is what calls
-        # the holiday calendar. Weekend-only, that open is today 15:00.
-        when = datetime(2026, 10, 6, 14, 0, 0, tzinfo=_TPE)
+        monkeypatch.setattr("src.regime.switch_logic.current_session", boom)
+        when = datetime(2026, 10, 10, 10, 0, 0, tzinfo=_TPE)
+        assert when.weekday() == 5
         since = seconds_since_session_open(when)
-        assert since == -3600
-        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
+        assert since < 0
+        assert since < ReconnectController.HALF_UP_HOLD_S
         ctrl = _incident_controller()
         decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
         assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
         assert not decision.forced_teardown
+
+    def test_holiday_call_raise_keeps_skipping_when_closed(self, monkeypatch):
+        """Call-time is_taifex_holiday failure uses weekdays and warns.
+
+        Saturday 10:00 and Monday 03:00 are closed. The half-up guard
+        keeps skipping. It does not take the live-session fail-open.
+        """
+        def boom(d):
+            raise RuntimeError("holiday lookup failed")
+
+        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+        saturday = datetime(2026, 10, 10, 10, 0, 0, tzinfo=_TPE)
+        monday_overnight = datetime(2026, 10, 5, 3, 0, 0, tzinfo=_TPE)
+        assert saturday.weekday() == 5
+        assert monday_overnight.weekday() == 0
+        for when in (saturday, monday_overnight):
+            reset_session_clock_warnings()
+            since = seconds_since_session_open(when)
+            assert since < 0, when
+            assert since < ReconnectController.HALF_UP_HOLD_S
+            assert pop_session_clock_warnings() == [HOLIDAY_LOOKUP_WARN]
+            ctrl = _incident_controller()
+            decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+            assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+            assert not decision.forced_teardown
 
 
 class TestClockDisagreement:
