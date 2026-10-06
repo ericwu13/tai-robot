@@ -13,6 +13,7 @@ checks stop noticing them.
 """
 
 import json
+import os
 from datetime import datetime, timedelta
 
 import pytest
@@ -627,6 +628,255 @@ def test_bots_corrupt_session_json_is_p2(tmp_path):
     findings, _ = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
                              pid_alive_fn=lambda pid: True)
     assert any("session.json unreadable" in m for m in messages(findings, "P2"))
+
+
+def _hb_line(lines):
+    for line in lines:
+        if "heartbeat:" in line:
+            return line
+    return ""
+
+
+def write_heartbeat(bot, now, age_s=0.0, inflight=None, inflight_age_s=0.0,
+                    pid=4242):
+    payload = {
+        "ts": (now - timedelta(seconds=age_s)).timestamp(),
+        "pid": pid,
+        "inflight_com_call": None,
+    }
+    if inflight is not None:
+        payload["inflight_com_call"] = {
+            "name": inflight,
+            "start_ts": (now - timedelta(seconds=inflight_age_s)).timestamp(),
+        }
+    write_json(bot / "heartbeat.json", payload)
+
+
+def _paper_flat(bot, position=0):
+    write_json(bot / "session.json", {
+        "strategy": "S", "trading_mode": "paper",
+        "saved_at": "2026-08-25T14:00:00",
+        "broker": {
+            "_cumulative_pnl": 0,
+            "position_size": position,
+            "position_side": "LONG" if position else None,
+            "trades": [],
+        },
+    })
+
+
+NOW_GAP = datetime(2026, 8, 25, 14, 0, tzinfo=TZ_TPE)       # day/night gap
+NOW_PREOPEN = datetime(2026, 8, 25, 14, 50, tzinfo=TZ_TPE)  # 10 min before NIGHT
+# Friday 2026-09-25 is Mid-Autumn Festival (TAIFEX closed).
+NOW_HOLIDAY = datetime(2026, 9, 25, 16, 0, tzinfo=TZ_TPE)
+NOW_HOLIDAY_PREOPEN = datetime(2026, 9, 25, 14, 50, tzinfo=TZ_TPE)
+
+
+def test_bots_stale_heartbeat_during_night_is_hung_p1(tmp_path):
+    """PID-alive + a fresh log is not enough. A 400s-old heartbeat in
+    NIGHT is HUNG P1. This is the check a PID-only liveness test fails."""
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=400)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m for m in messages(findings, "P1")), messages(findings)
+
+
+def test_bots_hung_in_day_night_gap_flat_paper_is_p2(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242)
+    _paper_flat(bot, position=0)
+    write_heartbeat(bot, NOW_GAP, age_s=400)
+    findings, lines = check_bots(NOW_GAP, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m for m in messages(findings, "P2")), messages(findings)
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+
+
+def test_bots_hung_at_preopen_is_p1(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242)
+    _paper_flat(bot, position=0)
+    write_heartbeat(bot, NOW_PREOPEN, age_s=400)
+    findings, lines = check_bots(NOW_PREOPEN, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m and "pre-open" in m for m in messages(findings, "P1")), messages(findings)
+
+
+def test_bots_hung_while_holding_a_position_is_p1(tmp_path):
+    """Same 14:00 gap that is P2 when flat is P1 with an open position."""
+    bot = make_live_bot(tmp_path, pid=4242)
+    _paper_flat(bot, position=1)
+    write_heartbeat(bot, NOW_GAP, age_s=400)
+    findings, lines = check_bots(NOW_GAP, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m and "position" in m for m in messages(findings, "P1")), messages(findings)
+
+
+def test_bots_fresh_heartbeat_on_holiday_is_alive(tmp_path):
+    from datetime import date
+    from src.market_data.holidays import is_taifex_holiday
+    assert is_taifex_holiday(date(2026, 9, 25))
+    bot = make_live_bot(tmp_path, pid=4242)
+    _paper_flat(bot, position=0)
+    write_heartbeat(bot, NOW_HOLIDAY, age_s=5)
+    findings, lines = check_bots(NOW_HOLIDAY, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: ALIVE" in _hb_line(lines)
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+    assert not any("HUNG" in m for m in messages(findings)), messages(findings)
+
+
+def test_bots_hung_on_weekday_holiday_preopen_is_p2(tmp_path):
+    """14:50 on a confirmed TAIFEX holiday is not pre-open.
+
+    Dropping ``is_taifex_holiday`` (weekend-only) makes this clock time
+    look like the trading-day pre-open and grades it P1.
+    """
+    from datetime import date
+    from src.market_data.holidays import is_taifex_holiday
+    assert is_taifex_holiday(date(2026, 9, 25))
+    bot = make_live_bot(tmp_path, pid=4242)
+    _paper_flat(bot, position=0)
+    write_heartbeat(bot, NOW_HOLIDAY_PREOPEN, age_s=400)
+    findings, lines = check_bots(
+        NOW_HOLIDAY_PREOPEN, str(tmp_path / "live"),
+        pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m for m in messages(findings, "P2")), messages(findings)
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+
+
+def test_bots_degraded_calendar_does_not_invent_a_holiday(tmp_path, monkeypatch):
+    """holiday_calendar_degraded → do not trust a weekday holiday closure.
+
+    The 14:50 pre-open stays P1 when the TW calendar is weekend-only.
+    """
+    monkeypatch.setattr(
+        "src.regime.switch_logic.holiday_calendar_degraded",
+        lambda now=None: True)
+    bot = make_live_bot(tmp_path, pid=4242)
+    _paper_flat(bot, position=0)
+    write_heartbeat(bot, NOW_HOLIDAY_PREOPEN, age_s=400)
+    findings, lines = check_bots(
+        NOW_HOLIDAY_PREOPEN, str(tmp_path / "live"),
+        pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m for m in messages(findings, "P1")), messages(findings)
+
+
+def test_bots_no_heartbeat_is_unknown_and_uses_legacy_log_rule(tmp_path):
+    make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: UNKNOWN" in _hb_line(lines)
+    assert any("frozen mid-session" in m for m in messages(findings, "P1"))
+
+
+def test_bots_inflight_com_call_older_than_60s_is_hung(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=1,
+                    inflight="LeaveMonitor", inflight_age_s=61)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    line = _hb_line(lines)
+    assert "heartbeat: HUNG" in line
+    assert "inflight=LeaveMonitor" in line
+    assert any("HUNG" in m and "LeaveMonitor" in m
+               for m in messages(findings, "P1")), messages(findings)
+
+
+def test_bots_inflight_at_exactly_60s_is_not_hung(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=1,
+                    inflight="LeaveMonitor", inflight_age_s=60)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: ALIVE" in _hb_line(lines)
+    assert not any("HUNG" in m for m in messages(findings)), messages(findings)
+
+
+def test_bots_dead_pid_with_heartbeat_is_dead(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=1, pid=4242)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: False)
+    assert "heartbeat: DEAD" in _hb_line(lines)
+    assert any("dead PID" in m for m in messages(findings, "P1"))
+    assert not any("HUNG" in m for m in messages(findings)), messages(findings)
+
+
+def test_bots_fresh_heartbeat_suppresses_stale_log_p1(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=5)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: ALIVE" in _hb_line(lines)
+    assert not any("frozen mid-session" in m for m in messages(findings))
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+
+
+def _snapshot_tree(root):
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            with open(path, "rb") as handle:
+                out[os.path.relpath(path, root)] = handle.read()
+    return out
+
+
+def test_check_bots_does_not_write(tmp_path, monkeypatch):
+    """check_bots is strictly read-only: no creates, no replaces, no deletes."""
+    import builtins
+    import scripts.monitor.check_bots as cb
+    import scripts.monitor.common as common
+
+    bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=400)
+    before = _snapshot_tree(tmp_path)
+    root = os.path.abspath(str(tmp_path))
+    real_open = builtins.open
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        mode_s = mode if isinstance(mode, str) else "r"
+        try:
+            path = os.path.abspath(os.fspath(file))
+        except TypeError:
+            path = ""
+        if path.startswith(root) and any(ch in mode_s for ch in "wax+"):
+            raise AssertionError(f"check_bots opened {path} mode={mode_s}")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+
+    def forbid(mod, name):
+        real = getattr(mod.os, name)
+
+        def wrapped(*args, **kwargs):
+            for arg in list(args) + list(kwargs.values()):
+                try:
+                    path = os.path.abspath(os.fspath(arg))
+                except TypeError:
+                    continue
+                if path.startswith(root):
+                    raise AssertionError(f"check_bots os.{name} on {path}")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(mod.os, name, wrapped, raising=False)
+
+    for mod in (cb, common):
+        for name in ("remove", "unlink", "replace", "rename", "mkdir", "makedirs"):
+            forbid(mod, name)
+
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    assert any("HUNG" in m for m in messages(findings, "P1"))
+    assert _snapshot_tree(tmp_path) == before
 
 
 # ── check_bridge ────────────────────────────────────────────────────────

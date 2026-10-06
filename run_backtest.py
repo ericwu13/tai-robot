@@ -99,6 +99,7 @@ _CODE_GEN_MAX_TOKENS = 16384
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
+from src.live.main_heartbeat import call_com
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
@@ -1404,7 +1405,7 @@ class BacktestApp:
             # Both calls swallow errors — the prior session may already be
             # half-torn-down and these are housekeeping, not gates.
             try:
-                leave_code = skQ.SKQuoteLib_LeaveMonitor()
+                leave_code = call_com("LeaveMonitor", skQ.SKQuoteLib_LeaveMonitor)
                 _log_debug(
                     f"[RECONNECT] LeaveMonitor returned {leave_code}")
             except Exception as e:
@@ -1412,7 +1413,7 @@ class BacktestApp:
                     f"[RECONNECT] LeaveMonitor raised (ignored): "
                     f"[{type(e).__name__}] {e}")
             try:
-                logout_code = skC.SKCenterLib_LogOut(user_id)
+                logout_code = call_com("LogOut", skC.SKCenterLib_LogOut, user_id)
                 _log_debug(
                     f"[RECONNECT] LogOut returned {logout_code}")
             except Exception as e:
@@ -1423,7 +1424,8 @@ class BacktestApp:
             _log_debug(
                 f"[RECONNECT] Cleanup done — calling LoginSetQuote")
 
-            code = skC.SKCenterLib_LoginSetQuote(user_id, password, "Y")
+            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
+                            user_id, password, "Y")
             _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
             if code != 0 and code < 2000:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
@@ -1435,8 +1437,8 @@ class BacktestApp:
                 return
 
             self._logged_in = True
-            reply_code = skR.SKReplyLib_ConnectByID(user_id)
-            enter_code = skQ.SKQuoteLib_EnterMonitorLONG()
+            reply_code = call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            enter_code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
             _log_debug(
                 f"[RECONNECT] ConnectByID returned {reply_code}, "
                 f"EnterMonitorLONG returned {enter_code}")
@@ -1511,7 +1513,8 @@ class BacktestApp:
             if _com_available and skQ:
                 try:
                     for mkt in (2, 7, 9):
-                        skQ.SKQuoteLib_RequestStockList(mkt)
+                        call_com("RequestStockList",
+                                 skQ.SKQuoteLib_RequestStockList, mkt)
                 except Exception as e:
                     _log(f"商品資料重載失敗 Commodity reload failed: {e}")
             self._resubscribe_ticks()
@@ -1554,7 +1557,7 @@ class BacktestApp:
         self._first_tick_after_request_logged = False
 
         try:
-            result = skQ.SKQuoteLib_RequestTicks(0, com_symbol)
+            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, com_symbol)
             code = result[0] if isinstance(result, (list, tuple)) else result
             _log_debug(
                 f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
@@ -3313,7 +3316,8 @@ class BacktestApp:
             self.set_status("登入中 Logging in...")
             self.login_status_var.set("登入中...")
 
-            code = skC.SKCenterLib_LoginSetQuote(user_id, password, "Y")
+            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
+                            user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
@@ -3330,16 +3334,16 @@ class BacktestApp:
             _log(f"登入成功 LOGIN OK (code={code})")
             self.login_status_var.set("登入成功 Logged in")
 
-            skR.SKReplyLib_ConnectByID(user_id)
-            code = skQ.SKQuoteLib_EnterMonitorLONG()
+            call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
             _log(f"進入報價監控 EnterMonitorLONG: code={code}")
 
             # Initialize order service for real trading
             if skO is not None:
                 try:
-                    skO.SKOrderLib_Initialize()
-                    skO.ReadCertByID(user_id)
-                    skO.GetUserAccount()
+                    call_com("SKOrderLib_Initialize", skO.SKOrderLib_Initialize)
+                    call_com("ReadCertByID", skO.ReadCertByID, user_id)
+                    call_com("GetUserAccount", skO.GetUserAccount)
                     _log("委託服務初始化 Order service initialized (cert verified)")
                 except Exception as e:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
@@ -3436,7 +3440,8 @@ class BacktestApp:
              f"{chunk.start_date}~{chunk.end_date} min={chunk.minute_num}")
 
         try:
-            code = skQ.SKQuoteLib_RequestKLineAMByDate(
+            code = call_com(
+                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
                 chunk.kline_symbol, chunk.kline_type, chunk.session,
                 chunk.trade_session, chunk.start_date, chunk.end_date,
                 chunk.minute_num)
@@ -6458,7 +6463,8 @@ class BacktestApp:
             try:
                 user_id = self.login_user_var.get().strip()
                 self._account_monitor.clear_positions()
-                skO.GetOpenInterestGW(user_id, self._futures_account, 1)
+                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                         user_id, self._futures_account, 1)
                 # The OnOpenInterest reply arrives asynchronously through the
                 # UI queue — observed ~4s after the query. GUI waits via an
                 # after(100) poll so the Tk thread is not frozen; headless
@@ -6621,7 +6627,7 @@ class BacktestApp:
                 # Query multiple market types to find TMF order codes
                 # 2=期貨T盤, 7=期貨全盤, 9=客製化期貨
                 for mkt in (2, 7, 9):
-                    rc = skQ.SKQuoteLib_RequestStockList(mkt)
+                    rc = call_com("RequestStockList", skQ.SKQuoteLib_RequestStockList, mkt)
                     if isinstance(rc, int) and rc != 0:
                         _log(f"商品列表查詢 RequestStockList({mkt}) code={rc}")
             except Exception as e:
@@ -6783,6 +6789,10 @@ class BacktestApp:
             self._live_log_msg(
                 "*** 全自動模式 AUTO MODE — 模擬成交後自動下單 ***", "exit")
 
+        # Main-loop heartbeat + hung-but-alive watchdog (issue #157).
+        # Started before warmup so a COM call on this thread is stamped.
+        self._start_main_heartbeat()
+
         # Start warmup
         self._start_live_warmup()
         return True
@@ -6826,7 +6836,8 @@ class BacktestApp:
              f"min={kline_minute} {start_str}~{end_str}")
 
         try:
-            code = skQ.SKQuoteLib_RequestKLineAMByDate(
+            code = call_com(
+                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0:
                 msg = skC.SKCenterLib_GetReturnCodeMessage(code)
@@ -6987,7 +6998,7 @@ class BacktestApp:
         sym_note = f" (via {tick_sym})" if tick_sym != symbol else ""
         self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}{sym_note}...", "status")
         try:
-            result = skQ.SKQuoteLib_RequestTicks(0, tick_sym)
+            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, tick_sym)
             # COM may return (code, stockIdx) tuple or just an int
             if isinstance(result, (list, tuple)):
                 code = result[0]
@@ -8184,7 +8195,9 @@ class BacktestApp:
                  f"price={oOrder.bstrPrice}({price_label}) qty=1 newclose={nc}({nc_label}) reserved=0")
 
             # Synchronous send — returns immediately for IOC market orders
-            message, code = skO.SendFutureOrderCLR(user_id, False, oOrder)
+            message, code = call_com(
+                "SendFutureOrderCLR", skO.SendFutureOrderCLR,
+                user_id, False, oOrder)
             _log(f"REAL ORDER RESULT: code={code} message={message}")
 
             if code == 0:
@@ -8374,7 +8387,8 @@ class BacktestApp:
         # Request fresh position data via COM
         try:
             user_id = self.login_user_var.get().strip()
-            skO.GetOpenInterestGW(user_id, self._futures_account, 1)
+            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                     user_id, self._futures_account, 1)
         except Exception as e:
             _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
@@ -8600,7 +8614,8 @@ class BacktestApp:
             return 0
         try:
             user_id = self.login_user_var.get().strip()
-            fills_raw = skO.GetFulfillReport(
+            fills_raw = call_com(
+                "GetFulfillReport", skO.GetFulfillReport,
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
@@ -8857,8 +8872,10 @@ class BacktestApp:
         user_id = self.login_user_var.get().strip()
         try:
             self._account_monitor.clear_positions()  # will be rebuilt from callbacks
-            skO.GetOpenInterestGW(user_id, self._futures_account, 1)
-            skO.GetFutureRights(user_id, self._futures_account, 1)  # 1=TWD
+            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                     user_id, self._futures_account, 1)
+            call_com("GetFutureRights", skO.GetFutureRights,
+                     user_id, self._futures_account, 1)  # 1=TWD
         except Exception as e:
             _log(f"帳戶查詢失敗 Account query error: {e}")
 
@@ -8986,6 +9003,60 @@ class BacktestApp:
 
         # Update trade list and metrics
         self._display_results(result, bars)
+
+    def _start_main_heartbeat(self) -> None:
+        """Arm heartbeat.json on the Tk main loop and the hang watchdog.
+
+        The watchdog thread never exits, kills, or restarts the process.
+        It dumps stacks, writes hang.json, and sends one Discord P1 per
+        hang episode (re-armed only after the heartbeat recovers).
+        """
+        from src.live.main_heartbeat import start
+        runner = self._live_runner
+        if runner is None:
+            return
+
+        def _alert(message: str) -> None:
+            _log(message)
+            if _discord is not None and _discord.enabled:
+                _discord.notify(message)
+
+        start(runner.bot_dir, alert_fn=_alert)
+        self._heartbeat_active = True
+        self._arm_heartbeat_tick()
+
+    def _arm_heartbeat_tick(self) -> None:
+        from src.live.main_heartbeat import HEARTBEAT_INTERVAL_MS
+        self._heartbeat_after_id = self.root.after(
+            HEARTBEAT_INTERVAL_MS, self._on_main_heartbeat)
+
+    def _on_main_heartbeat(self) -> None:
+        """root.after tick. This is the only periodic writer."""
+        from src.live.main_heartbeat import tick
+        self._heartbeat_after_id = None
+        if not getattr(self, "_heartbeat_active", False):
+            return
+        try:
+            tick()
+        except Exception as e:
+            _log(f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
+        if getattr(self, "_heartbeat_active", False):
+            self._arm_heartbeat_tick()
+
+    def _stop_main_heartbeat(self) -> None:
+        from src.live.main_heartbeat import stop
+        self._heartbeat_active = False
+        after_id = getattr(self, "_heartbeat_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            self._heartbeat_after_id = None
+        try:
+            stop()
+        except Exception as e:
+            _log(f"[HEARTBEAT] stop failed: [{type(e).__name__}] {e}")
 
     def _stop_live(self):
         """Stop the live bot and restore UI."""
@@ -9122,6 +9193,11 @@ class BacktestApp:
             # use _last_bars/_last_result instead of stale live data.
             self._update_live_results()
             self._update_live_status()
+            # Drop the heartbeat file on a clean stop so a live GUI that
+            # is no longer running a bot is not reported HUNG. A main
+            # thread blocked inside the stop-close COM call never reaches
+            # here — the watchdog still sees the inflight stamp.
+            self._stop_main_heartbeat()
             self._live_runner = None
             self._regime_manager = None
             self._trading_guard.reset()
