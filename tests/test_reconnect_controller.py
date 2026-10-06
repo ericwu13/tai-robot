@@ -339,6 +339,53 @@ class TestWeekdayHolidayHalfUp:
         assert action.delay_seconds == max(secs - 120, 60)
 
 
+class TestSessionLookupFailOpen:
+    """A raised session or holiday lookup must not skip for days.
+
+    Fail open: the clock reports open+90s, so a half-up session gets one
+    forced teardown and the second attempt is refused.
+    """
+
+    def test_current_session_raise_allows_one_forced_teardown(self, monkeypatch):
+        def boom(now=None):
+            raise RuntimeError("session lookup failed")
+
+        monkeypatch.setattr("src.regime.switch_logic.current_session", boom)
+        # Tuesday 10:00 is a real day session when the lookup works.
+        when = datetime(2026, 10, 6, 10, 0, 0, tzinfo=_TPE)
+        since = seconds_since_session_open(when)
+        assert since == ReconnectController.HALF_UP_HOLD_S
+        assert in_live_session(when)
+        assert seconds_until_next_session_open(when) == 0
+        ctrl = _incident_controller()
+        first = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert first.action == ACTION_TEARDOWN_AND_LOGIN
+        assert first.forced_teardown
+        assert first.reason == FORCED_TEARDOWN_LOG
+        ctrl.note_forced_teardown()
+        second = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert second.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not second.forced_teardown
+
+    def test_holiday_lookup_raise_allows_one_forced_teardown(self, monkeypatch):
+        def boom(d):
+            raise RuntimeError("holiday lookup failed")
+
+        monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+        # 14:00 is the day-to-night gap: current_session is None, so the
+        # next-open scan is what calls the holiday calendar.
+        when = datetime(2026, 10, 6, 14, 0, 0, tzinfo=_TPE)
+        since = seconds_since_session_open(when)
+        assert since == ReconnectController.HALF_UP_HOLD_S
+        ctrl = _incident_controller()
+        first = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert first.forced_teardown
+        ctrl.note_forced_teardown()
+        second = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert second.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not second.forced_teardown
+
+
 class TestSingleReconnectTimer:
     def _clock(self):
         pending: dict[int, object] = {}

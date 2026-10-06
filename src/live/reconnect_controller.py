@@ -60,13 +60,14 @@ def _is_closed_day(d: date) -> bool:
 
     Uses ``is_taifex_holiday`` (weekends, TW public holidays, overrides).
     A missing holiday calendar degrades to weekends, matching
-    ``current_session``.
+    ``current_session``. A lookup that raises does not: the caller
+    fails open instead of inventing a multi-day skip.
     """
     try:
         from src.market_data.holidays import is_taifex_holiday
-        return is_taifex_holiday(d)
     except Exception:
         return d.weekday() >= 5
+    return is_taifex_holiday(d)
 
 
 def _next_session_open(now: datetime) -> datetime:
@@ -85,12 +86,19 @@ def _next_session_open(now: datetime) -> datetime:
 
 
 def _live_session(now: datetime):
-    """``current_session`` for ``now``, or None if it cannot be resolved."""
-    try:
-        from src.regime.switch_logic import current_session
-        return current_session(now)
-    except Exception:
-        return None
+    """``current_session`` for ``now``.
+
+    Raises when the session lookup raises. Callers fail open; swallowing
+    the error and treating it as "no session" skips a half-up handshake
+    until a next open that was never computed.
+    """
+    from src.regime.switch_logic import current_session
+    return current_session(now)
+
+
+def _since_open_when_lookup_fails() -> int:
+    """Past the half-up hold, so one forced teardown is allowed."""
+    return ReconnectController.HALF_UP_HOLD_S
 
 
 def seconds_since_session_open(now: datetime | None = None) -> int:
@@ -102,12 +110,19 @@ def seconds_since_session_open(now: datetime | None = None) -> int:
     ``is_taifex_holiday`` says actually trades. A weekday holiday is not
     an open: the weekend-only clock would already be past open+90s at
     10:00, and this one is still negative.
+
+    If ``current_session`` or the holiday lookup raises, this returns
+    open+90s. ``decide`` then allows one forced teardown instead of
+    skipping for as long as the clock stays unknown.
     """
     now = _as_taipei(now)
-    session = _live_session(now)
-    if session is not None:
-        return int((now - session.open_dt).total_seconds())
-    return int((now - _next_session_open(now)).total_seconds())
+    try:
+        session = _live_session(now)
+        if session is not None:
+            return int((now - session.open_dt).total_seconds())
+        return int((now - _next_session_open(now)).total_seconds())
+    except Exception:
+        return _since_open_when_lookup_fails()
 
 
 def in_live_session(now: datetime | None = None) -> bool:
@@ -115,8 +130,13 @@ def in_live_session(now: datetime | None = None) -> bool:
 
     The reconnect deferral uses this. It does not call the weekend-only
     market-open helper, which treats a weekday holiday as a normal session.
+    A lookup that raises is treated as in-session so the deferral does
+    not park a half-up handshake for days.
     """
-    return _live_session(_as_taipei(now)) is not None
+    try:
+        return _live_session(_as_taipei(now)) is not None
+    except Exception:
+        return True
 
 
 def seconds_until_next_session_open(now: datetime | None = None) -> int:
