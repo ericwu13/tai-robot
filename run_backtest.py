@@ -111,7 +111,7 @@ from src.live.reconnect_controller import (
     ACTION_SKIP_TEARDOWN_WAIT,
     FORCED_TEARDOWN_LOG,
     ReconnectController,
-    arm_single_timer,
+    ReconnectSchedule,
     seconds_since_session_open,
 )
 from src.live.fill_poller import FillPoller
@@ -1352,10 +1352,8 @@ class BacktestApp:
 
     def _manual_reconnect(self):
         """Manual reconnect triggered by user button click."""
-        # Cancel any pending auto-reconnect timer
-        if self._reconnect_timer_id:
-            self.root.after_cancel(self._reconnect_timer_id)
-            self._reconnect_timer_id = None
+        # Cancel reconnect, Ready-wait, and skip-poll callbacks together.
+        self._cancel_reconnect_timer()
         self._cancel_quote_ready_timer("manual_reconnect")
 
         self._set_quote_connected(False, "_manual_reconnect")
@@ -1396,23 +1394,23 @@ class BacktestApp:
                 self.btn_reconnect.config(state=tk.NORMAL)
             if self._live_runner:
                 self._live_log_msg(action.message, "status")
-            self._reconnect_timer_id = arm_single_timer(
-                self._reconnect_timer_id,
-                action.delay_seconds * 1000,
-                self._attempt_reconnect,
-                after=self.root.after,
-                after_cancel=self.root.after_cancel,
-            )
+            self._arm_reconnect_callback(
+                "reconnect", action.delay_seconds * 1000, self._attempt_reconnect)
             return
 
+    def _arm_reconnect_callback(self, kind: str, delay_ms: int, callback) -> None:
+        """Arm the one reconnect/ready/skip slot, cancelling whatever it held."""
+        self._reconnect_timer_id = self._reconnect_schedule.arm(
+            kind,
+            delay_ms,
+            callback,
+            after=self.root.after,
+            after_cancel=self.root.after_cancel,
+        )
+
     def _cancel_reconnect_timer(self) -> None:
-        """Cancel the one pending reconnect timer, if any."""
-        if self._reconnect_timer_id is None:
-            return
-        try:
-            self.root.after_cancel(self._reconnect_timer_id)
-        except Exception:
-            pass
+        """Cancel reconnect, Ready-wait, and skip-poll callbacks."""
+        self._reconnect_schedule.cancel_all(self.root.after_cancel)
         self._reconnect_timer_id = None
 
     def _attempt_reconnect(self):
@@ -1428,6 +1426,8 @@ class BacktestApp:
         until open+90s, then allows one forced teardown per disconnect.
         The skip returns before the Bug B call below.
         """
+        # This callback is the armed timer, already popped by Tk.
+        self._reconnect_schedule.note_fired()
         self._reconnect_timer_id = None
         attempt_n = self._conn_monitor.attempt + 1  # number we'll attempt now
         if self._quote_connected:
@@ -1483,13 +1483,8 @@ class BacktestApp:
                 _log_debug(
                     f"[RECONNECT] Attempt #{attempt_n} skipping LeaveMonitor "
                     f"+ LogOut — {decision.reason}")
-                self._reconnect_timer_id = arm_single_timer(
-                    self._reconnect_timer_id,
-                    decision.wait_seconds * 1000,
-                    self._check_reconnection,
-                    after=self.root.after,
-                    after_cancel=self.root.after_cancel,
-                )
+                self._arm_reconnect_callback(
+                    "skip", decision.wait_seconds * 1000, self._check_reconnection)
                 return
 
             if decision.forced_teardown:
@@ -1552,22 +1547,18 @@ class BacktestApp:
             _log_debug(
                 f"[RECONNECT] ConnectByID returned {reply_code}, "
                 f"EnterMonitorLONG returned {enter_code}")
+            since_open = seconds_since_session_open()
             wait_s = self._reconnect_controller.ready_wait_seconds(
-                market_open=is_market_open(),
-                secs_until_open=seconds_until_market_open(),
-            )
+                seconds_since_open=since_open)
             self._reconnect_ready_wait_s = wait_s
             _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} waiting {wait_s}s for Ready (3003)...")
+                f"[RECONNECT] Attempt #{attempt_n} waiting {wait_s}s for Ready (3003) "
+                f"(seconds_since_open={since_open})")
 
-            # Poll for connection (OnConnection callback will set _quote_connected)
-            self._reconnect_timer_id = arm_single_timer(
-                self._reconnect_timer_id,
-                wait_s * 1000,
-                self._check_reconnection,
-                after=self.root.after,
-                after_cancel=self.root.after_cancel,
-            )
+            # Poll for connection (OnConnection callback will set _quote_connected).
+            # Same slot as the reconnect and skip timers.
+            self._arm_reconnect_callback(
+                "ready", wait_s * 1000, self._check_reconnection)
 
         except Exception as e:
             _log(f"重連異常 Reconnect error: {e}")
@@ -1580,6 +1571,8 @@ class BacktestApp:
     def _check_reconnection(self):
         """Poll IsConnected after reconnect login attempt."""
         attempt_n = self._conn_monitor.attempt
+        self._reconnect_schedule.note_fired()
+        self._reconnect_timer_id = None
         if self._quote_connected:
             self._reconnect_controller.on_ready()
             _log_debug(
@@ -1624,13 +1617,8 @@ class BacktestApp:
                 f"[RECONNECT] Attempt #{attempt_n} still connecting — "
                 f"{decision.reason}; polling again in {decision.wait_seconds}s "
                 "without LeaveMonitor")
-            self._reconnect_timer_id = arm_single_timer(
-                self._reconnect_timer_id,
-                decision.wait_seconds * 1000,
-                self._check_reconnection,
-                after=self.root.after,
-                after_cancel=self.root.after_cancel,
-            )
+            self._arm_reconnect_callback(
+                "skip", decision.wait_seconds * 1000, self._check_reconnection)
             return
         # Not connected yet — schedule next reconnect attempt
         _log_debug(
@@ -1648,9 +1636,7 @@ class BacktestApp:
         # A successful Ready resets the Bug C warn ladder — any earlier
         # transient IsConnected!=1 reads are irrelevant once we're back up.
         self._warn_disconnect_count = 0
-        if self._reconnect_timer_id:
-            self.root.after_cancel(self._reconnect_timer_id)
-            self._reconnect_timer_id = None
+        self._cancel_reconnect_timer()
 
         if self._live_runner and self._live_runner.state == LiveState.RUNNING:
             self._live_log_msg("已重連 Reconnected — resubscribing ticks", "status")
@@ -1795,6 +1781,7 @@ class BacktestApp:
         # Issue #157: gates LeaveMonitor while a pre-session handshake is
         # still connecting (IsConnected()==2, Ready never arrived).
         self._reconnect_controller = ReconnectController()
+        self._reconnect_schedule = ReconnectSchedule()
         self._reconnect_timer_id = None
         self._reconnect_ready_wait_s: int = ReconnectController.READY_WAIT_S
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
@@ -9147,9 +9134,8 @@ class BacktestApp:
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
             self._live_poll_id = None
-        if self._reconnect_timer_id:
-            self.root.after_cancel(self._reconnect_timer_id)
-            self._reconnect_timer_id = None
+        self._cancel_reconnect_timer()
+        self._cancel_quote_ready_timer("stop_live")
         self._conn_monitor.reset()
         self._reconnect_controller.reset()
 

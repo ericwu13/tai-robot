@@ -125,20 +125,26 @@ class TestBugB_CleanupBeforeRelogin:
         assert leave_pos < login_pos, (
             "Bug B: LeaveMonitor must happen BEFORE LoginSetQuote.")
 
-    def test_logout_is_hasattr_guarded(self, rb_source: str):
-        """Capital API 2.13.57 has no SKCenterLib_LogOut. An unguarded
-        call always raises AttributeError and never runs."""
+    def test_logout_called_before_login(self, rb_source: str):
+        """Inverted for #157.
+
+        The old pin required an unconditional ``skC.SKCenterLib_LogOut(``
+        before LoginSetQuote. Capital API 2.13.57 has no such method, so
+        an unguarded call always raises AttributeError. LogOut is allowed
+        only inside ``hasattr``, and removing the call entirely is also
+        fine. An unconditional call site fails this test.
+        """
         body = self._attempt_reconnect_body(rb_source)
         guard = body.find('hasattr(skC, "SKCenterLib_LogOut")')
         call = body.find("skC.SKCenterLib_LogOut(")
         login = body.find("skC.SKCenterLib_LoginSetQuote(")
-        assert guard != -1, (
-            "Issue #157: LogOut must be skipped when the COM object has "
-            "no SKCenterLib_LogOut.")
-        assert call != -1 and login != -1
-        assert guard < call < login, (
-            "Issue #157: the hasattr guard must wrap the LogOut call, "
-            "and that call must stay before LoginSetQuote.")
+        assert login != -1, "LoginSetQuote unexpectedly removed"
+        if call == -1:
+            assert "SKCenterLib_LogOut(" not in body
+            return
+        assert guard != -1 and guard < call < login, (
+            "Issue #157: SKCenterLib_LogOut( must not run unless hasattr "
+            "says the COM object actually has it.")
 
     def test_cleanup_calls_swallow_errors(self, rb_source: str):
         """Cleanup calls must be best-effort — a prior session may already
@@ -220,6 +226,12 @@ class TestIssue157_GuardBeforeLeaveMonitor:
             "Issue #157: the Ready poll delay must come from "
             "ReconnectController.ready_wait_seconds so a pre-session "
             "attempt waits until the open instead of failing at 3s.")
+        wait_pos = body.find("ready_wait_seconds(")
+        assert "seconds_since_open=" in body[wait_pos:wait_pos + 120], (
+            "Issue #157: the Ready wait uses the same open+90s clock as "
+            "decide(). The old secs_until_open+15 grace handed the first "
+            "poll off near open+15s.")
+        assert "market_open=" not in body[wait_pos:wait_pos + 120]
         assert "root.after(3000, self._check_reconnection)" not in body, (
             "Issue #157: hardcoded 3s Ready poll is what scheduled "
             "LeaveMonitor ~2 min before the open.")
@@ -290,7 +302,31 @@ class TestIssue157_Amendments:
             re.DOTALL,
         )
         assert action
-        assert "arm_single_timer(" in action.group(1)
+        assert "_arm_reconnect_callback(" in action.group(1)
+        assert "cancel_all(" in rb_source
+        stop = re.search(
+            r"def _stop_live\(self\):(.*?)(?=\ndef |\Z)",
+            rb_source,
+            re.DOTALL,
+        )
+        manual = re.search(
+            r"def _manual_reconnect\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert stop and "_cancel_reconnect_timer()" in stop.group(1)
+        assert manual and "_cancel_reconnect_timer()" in manual.group(1)
+        # Ready-wait and skip reschedule use the same slot as reconnect.
+        attempt = re.search(
+            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert attempt
+        assert '_arm_reconnect_callback(\n                    "ready"' in attempt.group(1) \
+            or '_arm_reconnect_callback(\n                "ready"' in attempt.group(1) \
+            or '"ready"' in attempt.group(1)
+        assert '"skip"' in attempt.group(1)
 
 
 def test_faulthandler_handle_stays_open(tmp_path):

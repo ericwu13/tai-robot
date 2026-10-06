@@ -20,6 +20,7 @@ from src.live.reconnect_controller import (
     IS_CONNECTED,
     IS_CONNECTING,
     ReconnectController,
+    ReconnectSchedule,
     arm_single_timer,
     seconds_since_session_open,
 )
@@ -99,6 +100,13 @@ class TestIssue157HalfUpHold:
         assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
         assert not decision.forced_teardown
 
+    def test_half_up_at_open_plus_89_skips(self):
+        """One second before the deadline is still a skip, not a teardown."""
+        ctrl = _incident_controller()
+        decision = ctrl.decide(IS_CONNECTING, seconds_since_open=89)
+        assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not decision.forced_teardown
+
     def test_half_up_at_open_plus_91_tears_down_once(self):
         ctrl = _incident_controller()
         decision = ctrl.decide(IS_CONNECTING, seconds_since_open=_OPEN_PLUS_91)
@@ -164,33 +172,38 @@ class TestIssue157HalfUpHold:
 
 
 class TestIssue157ReadyWait:
-    """Acceptance (3): pre-session Ready wait covers the open; intra-session stays 3s."""
+    """The Ready wait uses the same open+90s deadline as decide()."""
 
-    def test_pre_session_wait_covers_until_open_plus_grace(self):
+    def test_deferred_pre_open_wait_lands_on_open_plus_90(self):
         ctrl = ReconnectController()
-        # Deferred reconnect fires ~120s before the open (secs_until_open - 120).
-        wait = ctrl.ready_wait_seconds(market_open=False, secs_until_open=120)
-        assert wait >= 120 + ReconnectController.PRE_SESSION_GRACE_S
-        assert wait <= ReconnectController.PRE_SESSION_WAIT_CAP_S
+        # ConnectionMonitor defers to about open−120s. From there the
+        # Ready poll must land on open+90, not open+15.
+        since = -120
+        wait = ctrl.ready_wait_seconds(seconds_since_open=since)
+        assert since + wait == ctrl.HALF_UP_HOLD_S
+        assert ctrl.HALF_UP_HOLD_S == 90
+
+    def test_open_plus_89_wait_does_not_fire_before_the_deadline(self):
+        """A 1s remainder is raised to the 3s floor, so the poll lands at or after open+90s."""
+        ctrl = ReconnectController()
+        wait = ctrl.ready_wait_seconds(seconds_since_open=89)
+        assert 89 + wait >= ctrl.HALF_UP_HOLD_S
 
     def test_pre_session_wait_is_capped(self):
         ctrl = ReconnectController()
-        wait = ctrl.ready_wait_seconds(market_open=False, secs_until_open=10_000)
+        wait = ctrl.ready_wait_seconds(seconds_since_open=-10_000)
         assert wait == ReconnectController.PRE_SESSION_WAIT_CAP_S
+        # The cap must still cover the normal open−120 deferral.
+        assert ctrl.PRE_SESSION_WAIT_CAP_S >= 120 + ctrl.HALF_UP_HOLD_S
 
-    def test_intra_session_wait_stays_three_seconds(self):
+    def test_past_open_plus_90_wait_stays_three_seconds(self):
         ctrl = ReconnectController()
-        assert ctrl.ready_wait_seconds(market_open=True, secs_until_open=0) == (
+        assert ctrl.ready_wait_seconds(seconds_since_open=90) == (
             ReconnectController.READY_WAIT_S
         )
-        assert ctrl.ready_wait_seconds(market_open=False, secs_until_open=0) == (
+        assert ctrl.ready_wait_seconds(seconds_since_open=91) == (
             ReconnectController.READY_WAIT_S
         )
-
-    def test_short_gap_still_waits_past_the_open(self):
-        ctrl = ReconnectController()
-        wait = ctrl.ready_wait_seconds(market_open=False, secs_until_open=30)
-        assert wait == 30 + ReconnectController.PRE_SESSION_GRACE_S
 
 
 class TestReset:
@@ -226,11 +239,7 @@ class TestSessionOpenClock:
 
 
 class TestSingleReconnectTimer:
-    def test_repeated_arm_leaves_exactly_one_pending_timer(self):
-        """``_on_disconnected`` schedules through ``arm_single_timer``.
-
-        Two disconnects must not leave two ``root.after`` callbacks.
-        """
+    def _clock(self):
         pending: dict[int, object] = {}
         seq = {"n": 0}
 
@@ -243,10 +252,42 @@ class TestSingleReconnectTimer:
         def after_cancel(token):
             pending.pop(token, None)
 
+        return pending, after, after_cancel
+
+    def test_repeated_on_disconnected_leaves_exactly_one_timer(self):
+        """Two disconnect arms must not leave two ``root.after`` callbacks."""
+        pending, after, after_cancel = self._clock()
+        schedule = ReconnectSchedule()
+        schedule.arm(
+            "reconnect", 28_000, lambda: None, after=after, after_cancel=after_cancel)
+        schedule.arm(
+            "reconnect", 28_000, lambda: None, after=after, after_cancel=after_cancel)
+        assert list(pending) == [schedule.timer_id]
+        assert len(pending) == 1
+        assert schedule.kind == "reconnect"
+
+    def test_stop_or_manual_reconnect_clears_ready_and_skip(self):
+        """``_stop_live`` and ``_manual_reconnect`` both call ``cancel_all``."""
+        pending, after, after_cancel = self._clock()
+        schedule = ReconnectSchedule()
+        schedule.arm(
+            "reconnect", 5_000, lambda: None, after=after, after_cancel=after_cancel)
+        schedule.arm(
+            "ready", 210_000, lambda: None, after=after, after_cancel=after_cancel)
+        schedule.arm(
+            "skip", 15_000, lambda: None, after=after, after_cancel=after_cancel)
+        assert len(pending) == 1
+        assert schedule.kind == "skip"
+        schedule.cancel_all(after_cancel)
+        assert pending == {}
+        assert schedule.timer_id is None
+        assert schedule.kind is None
+
+    def test_arm_single_timer_still_cancels_the_previous_id(self):
+        pending, after, after_cancel = self._clock()
         current = None
         current = arm_single_timer(
-            current, 28_000, lambda: None, after=after, after_cancel=after_cancel)
+            current, 1_000, lambda: None, after=after, after_cancel=after_cancel)
         current = arm_single_timer(
-            current, 28_000, lambda: None, after=after, after_cancel=after_cancel)
+            current, 1_000, lambda: None, after=after, after_cancel=after_cancel)
         assert list(pending) == [current]
-        assert len(pending) == 1

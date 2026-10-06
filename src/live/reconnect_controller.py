@@ -107,6 +107,46 @@ def arm_single_timer(current_id, delay_ms, callback, *, after, after_cancel):
     return after(delay_ms, callback)
 
 
+class ReconnectSchedule:
+    """The reconnect, Ready-wait, and skip-poll callbacks share one slot.
+
+    ``_stop_live`` and ``_manual_reconnect`` call ``cancel_all``. A second
+    ``_on_disconnected`` arms this again and still leaves one callback.
+    """
+
+    def __init__(self) -> None:
+        self._id = None
+        self._kind: str | None = None
+
+    @property
+    def timer_id(self):
+        return self._id
+
+    @property
+    def kind(self) -> str | None:
+        return self._kind
+
+    def note_fired(self) -> None:
+        """The armed callback is running; the toolkit has already dropped it."""
+        self._id = None
+        self._kind = None
+
+    def arm(self, kind: str, delay_ms: int, callback, *, after, after_cancel):
+        self._id = arm_single_timer(
+            self._id, delay_ms, callback, after=after, after_cancel=after_cancel)
+        self._kind = kind
+        return self._id
+
+    def cancel_all(self, after_cancel) -> None:
+        if self._id is not None:
+            try:
+                after_cancel(self._id)
+            except Exception:
+                pass
+        self._id = None
+        self._kind = None
+
+
 class ReconnectController:
     """Decides whether COM teardown is safe before a reconnect attempt.
 
@@ -127,11 +167,9 @@ class ReconnectController:
     # session down. The GUI schedules this with root.after — it does not
     # block the Tk thread.
     CONNECTING_WAIT_S: int = 15
-    # Pre-session attempts wait until the open plus this grace, so the
-    # 3-second failure poll cannot schedule LeaveMonitor while the server
-    # is still refusing Ready.
-    PRE_SESSION_GRACE_S: int = 15
-    PRE_SESSION_WAIT_CAP_S: int = 180
+    # Covers the ConnectionMonitor deferral (open−120s) plus the 90s hold.
+    # Longer gaps (a weekend) cap here; decide() still skips until open+90s.
+    PRE_SESSION_WAIT_CAP_S: int = 210
 
     def __init__(self) -> None:
         self._handshake_open: bool = False
@@ -272,16 +310,16 @@ class ReconnectController:
             reason="LeaveMonitor then fresh login",
         )
 
-    def ready_wait_seconds(self, *, market_open: bool, secs_until_open: int) -> int:
+    def ready_wait_seconds(self, *, seconds_since_open: float) -> int:
         """How long to wait for Ready (3003) after LoginSetQuote.
 
-        Intra-session stays at the historical 3s poll. A pre-session
-        attempt waits until the open plus a short grace (capped), so the
-        failure poll cannot schedule a second LeaveMonitor while the
-        server is not yet sending 3003. The wait is a ``root.after``
-        delay, not a sleep on the Tk thread.
+        Uses the same open+90s deadline as ``decide``. Before that instant
+        the wait is the time remaining (capped). At or after it, the
+        intra-session poll stays 3s. The wait is a ``root.after`` delay,
+        not a sleep on the Tk thread.
         """
-        if market_open or secs_until_open <= 0:
+        if seconds_since_open >= self.HALF_UP_HOLD_S:
             return self.READY_WAIT_S
-        uncapped = max(self.READY_WAIT_S, int(secs_until_open) + self.PRE_SESSION_GRACE_S)
-        return min(self.PRE_SESSION_WAIT_CAP_S, uncapped)
+        remaining = int(self.HALF_UP_HOLD_S - seconds_since_open)
+        remaining = max(self.READY_WAIT_S, remaining)
+        return min(self.PRE_SESSION_WAIT_CAP_S, remaining)
