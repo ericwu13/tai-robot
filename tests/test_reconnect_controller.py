@@ -111,6 +111,21 @@ class TestIssue157HalfUpHold:
         assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
         assert not decision.forced_teardown
 
+    def test_open_plus_89_skips_and_90_is_the_first_forced_teardown(self):
+        """89s still skips. 90s is the first instant a forced teardown is allowed, and 91s is the same."""
+        ctrl = _incident_controller()
+        at_89 = ctrl.decide(IS_CONNECTING, seconds_since_open=89)
+        assert at_89.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not at_89.forced_teardown
+        at_90 = ctrl.decide(IS_CONNECTING, seconds_since_open=90)
+        assert at_90.action == ACTION_TEARDOWN_AND_LOGIN
+        assert at_90.forced_teardown
+        assert at_90.reason == FORCED_TEARDOWN_LOG
+        at_91 = ctrl.decide(IS_CONNECTING, seconds_since_open=91)
+        assert at_91.action == ACTION_TEARDOWN_AND_LOGIN
+        assert at_91.forced_teardown
+        assert at_91.reason == FORCED_TEARDOWN_LOG
+
     def test_half_up_at_open_plus_91_tears_down_once(self):
         ctrl = _incident_controller()
         decision = ctrl.decide(IS_CONNECTING, seconds_since_open=_OPEN_PLUS_91)
@@ -196,6 +211,52 @@ class TestIssue157ReadyWait:
             decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
             assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
             assert decision.wait_seconds == ReconnectController.CONNECTING_WAIT_S
+
+
+class TestOperatorReconnectAndSkipCap:
+    """The Reconnect button always tears down. The post-forced loop is finite."""
+
+    def test_manual_reconnect_resets_allowance_and_is_not_refused(self):
+        ctrl = _incident_controller()
+        ctrl.note_forced_teardown()
+        assert ctrl.forced_teardown_used
+        # Before open+90 the automatic path still skips. The button must not.
+        blocked = ctrl.decide(IS_CONNECTING, seconds_since_open=15)
+        assert blocked.action == ACTION_SKIP_TEARDOWN_WAIT
+        ctrl.on_operator_reconnect()
+        assert not ctrl.forced_teardown_used
+        for since in (15, 89, 90, 91):
+            decision = ctrl.decide(
+                IS_CONNECTING, seconds_since_open=since, manual=True)
+            assert decision.action == ACTION_TEARDOWN_AND_LOGIN
+            assert not decision.forced_teardown
+
+    def test_post_forced_skip_loop_stops_at_the_limit(self):
+        ctrl = _incident_controller()
+        # The open+90 hold is not the loop being bounded.
+        assert not ctrl.record_skip_poll()
+        ctrl.note_forced_teardown()
+        for _ in range(ctrl.POST_FORCED_SKIP_LIMIT - 1):
+            decision = ctrl.decide(IS_CONNECTING, seconds_since_open=91)
+            assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+            assert not decision.forced_teardown
+            assert not ctrl.record_skip_poll()
+        assert ctrl.record_skip_poll()
+        # Stopping the loop does not call LeaveMonitor again.
+        again = ctrl.decide(IS_CONNECTING, seconds_since_open=91)
+        assert again.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not again.forced_teardown
+
+    def test_operator_reconnect_clears_the_skip_count(self):
+        ctrl = _incident_controller()
+        ctrl.note_forced_teardown()
+        for _ in range(ctrl.POST_FORCED_SKIP_LIMIT - 1):
+            assert not ctrl.record_skip_poll()
+        ctrl.on_operator_reconnect()
+        ctrl.note_forced_teardown()
+        for _ in range(ctrl.POST_FORCED_SKIP_LIMIT - 1):
+            assert not ctrl.record_skip_poll()
+        assert ctrl.record_skip_poll()
 
 
 class TestReset:

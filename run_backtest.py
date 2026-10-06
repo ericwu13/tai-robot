@@ -109,6 +109,7 @@ from src.live.connection_monitor import ConnectionMonitor
 from src.live.reconnect_controller import (
     ACTION_ALREADY_CONNECTED,
     ACTION_SKIP_TEARDOWN_WAIT,
+    ESCALATION_LOG,
     FORCED_TEARDOWN_LOG,
     ReconnectController,
     ReconnectSchedule,
@@ -674,14 +675,23 @@ def enable_reconnect_faulthandler(bot_dir: str) -> None:
     """Arm faulthandler at deploy, writing to ``bot_dir/faulthandler.log``.
 
     The handle is stored on a module global. Closing it would silently
-    disable the dump.
+    disable the dump. A failure to open the file is a warning: diagnostics
+    must not abort the deploy.
     """
     global _faulthandler_log
     if _faulthandler_log is not None and not _faulthandler_log.closed:
         return
-    path = os.path.join(bot_dir, "faulthandler.log")
-    handle = open(path, "a", encoding="utf-8")
-    faulthandler.enable(file=handle, all_threads=True)
+    handle = None
+    try:
+        path = os.path.join(bot_dir, "faulthandler.log")
+        handle = open(path, "a", encoding="utf-8")
+        faulthandler.enable(file=handle, all_threads=True)
+    except Exception as e:
+        if handle is not None and not handle.closed:
+            handle.close()
+        _log(
+            f"[RECONNECT] faulthandler not armed: [{type(e).__name__}] {e}")
+        return
     _faulthandler_log = handle
 
 
@@ -1360,6 +1370,9 @@ class BacktestApp:
 
         self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
+        # The button always tears down, including a half-up session whose
+        # one automatic forced teardown was already used.
+        self._reconnect_controller.on_operator_reconnect()
         action = self._conn_monitor.on_manual_reconnect()
         self.set_status(action.message, "warn")
         self._set_conn_dot("warn")
@@ -1369,7 +1382,7 @@ class BacktestApp:
             "[STATE] ConnectionMonitor: is_active=True, attempt=0 "
             "(caller=_manual_reconnect)")
 
-        self._attempt_reconnect()
+        self._attempt_reconnect(manual=True)
 
     def _schedule_reconnect(self):
         """Schedule the next reconnection attempt via ConnectionMonitor.
@@ -1420,7 +1433,37 @@ class BacktestApp:
         self._reconnect_schedule.cancel_all(self.root.after_cancel)
         self._reconnect_timer_id = None
 
-    def _attempt_reconnect(self):
+    def _raise_reconnect_alert(self, message: str) -> None:
+        """Operator-visible reconnect alert: the log pane and Discord.
+
+        ``_log_debug`` alone does not reach the operator. ``_discord.notify``
+        is the same path settlement-day and other live alerts use.
+        """
+        _log(message)
+        if _discord is not None and _discord.enabled:
+            try:
+                _discord.notify(message)
+            except Exception as e:
+                _log_debug(
+                    f"[RECONNECT] Discord alert failed: "
+                    f"[{type(e).__name__}] {e}")
+
+    def _defer_half_up_teardown(self, decision, attempt_n: int) -> None:
+        """Skip LeaveMonitor, or stop the loop after the forced teardown."""
+        _log(
+            "重連暫緩 Reconnect deferred — session still connecting, "
+            "not calling LeaveMonitor")
+        _log_debug(
+            f"[RECONNECT] Attempt #{attempt_n} skipping LeaveMonitor "
+            f"+ LogOut — {decision.reason}")
+        if self._reconnect_controller.record_skip_poll():
+            self._raise_reconnect_alert(ESCALATION_LOG)
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return
+        self._arm_reconnect_callback(
+            "skip", decision.wait_seconds * 1000, self._check_reconnection)
+
+    def _attempt_reconnect(self, manual: bool = False):
         """Try to re-login and reconnect to quote service.
 
         Bug B: a teardown-and-login attempt calls
@@ -1476,27 +1519,21 @@ class BacktestApp:
             decision = self._reconnect_controller.decide(
                 is_connected,
                 seconds_since_open=seconds_since_session_open(),
+                manual=manual,
             )
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} guard={decision.action} "
-                f"IsConnected()={is_connected} — {decision.reason}")
+                f"IsConnected()={is_connected} manual={manual} — {decision.reason}")
             if decision.action == ACTION_ALREADY_CONNECTED:
                 self._check_reconnection()
                 return
             if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
-                _log(
-                    "重連暫緩 Reconnect deferred — session still connecting, "
-                    "not calling LeaveMonitor")
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} skipping LeaveMonitor "
-                    f"+ LogOut — {decision.reason}")
-                self._arm_reconnect_callback(
-                    "skip", decision.wait_seconds * 1000, self._check_reconnection)
+                self._defer_half_up_teardown(decision, attempt_n)
                 return
 
             if decision.forced_teardown:
                 self._reconnect_controller.note_forced_teardown()
-                _log_debug(FORCED_TEARDOWN_LOG)
+                self._raise_reconnect_alert(FORCED_TEARDOWN_LOG)
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
                 "(cleanup) before fresh LoginSetQuote")
@@ -1618,12 +1655,7 @@ class BacktestApp:
         decision = self._reconnect_controller.decide(
             ic, seconds_since_open=seconds_since_session_open())
         if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} still connecting — "
-                f"{decision.reason}; polling again in {decision.wait_seconds}s "
-                "without LeaveMonitor")
-            self._arm_reconnect_callback(
-                "skip", decision.wait_seconds * 1000, self._check_reconnection)
+            self._defer_half_up_teardown(decision, attempt_n)
             return
         # Not connected yet — schedule next reconnect attempt
         _log_debug(

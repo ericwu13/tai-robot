@@ -106,7 +106,7 @@ class TestBugB_CleanupBeforeRelogin:
 
     def _attempt_reconnect_body(self, rb_source: str) -> str:
         match = re.search(
-            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            r"def _attempt_reconnect\(self.*?\):(.*?)\n    def ",
             rb_source,
             re.DOTALL,
         )
@@ -169,7 +169,7 @@ class TestIssue157_GuardBeforeLeaveMonitor:
 
     def _attempt_reconnect_body(self, rb_source: str) -> str:
         match = re.search(
-            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            r"def _attempt_reconnect\(self.*?\):(.*?)\n    def ",
             rb_source,
             re.DOTALL,
         )
@@ -264,7 +264,7 @@ class TestIssue157_Amendments:
             in rb_source
         ), "missing [RECONNECT] about to call <name> tid=<thread id> helper"
         match = re.search(
-            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            r"def _attempt_reconnect\(self.*?\):(.*?)\n    def ",
             rb_source,
             re.DOTALL,
         )
@@ -286,8 +286,18 @@ class TestIssue157_Amendments:
         )
         ctrl_source = open(ctrl_path, encoding="utf-8").read()
         assert "P1 forced teardown of half-up session" in ctrl_source
-        assert "_log_debug(FORCED_TEARDOWN_LOG)" in rb_source
+        assert "P1 half-up skip loop stopped after forced teardown" in ctrl_source
+        assert "_raise_reconnect_alert(FORCED_TEARDOWN_LOG)" in rb_source
+        assert "_log_debug(FORCED_TEARDOWN_LOG)" not in rb_source
         assert "note_forced_teardown()" in rb_source
+        alert = re.search(
+            r"def _raise_reconnect_alert\(self, message: str\) -> None:(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert alert
+        assert "_log(message)" in alert.group(1)
+        assert "_discord.notify(message)" in alert.group(1)
 
     def test_faulthandler_armed_at_deploy(self, rb_source: str):
         assert "def enable_reconnect_faulthandler(" in rb_source
@@ -334,17 +344,30 @@ class TestIssue157_Amendments:
         )
         assert stop and "_cancel_reconnect_timer()" in stop.group(1)
         assert manual and "_cancel_reconnect_timer()" in manual.group(1)
+        assert "on_operator_reconnect()" in manual.group(1)
+        assert "_attempt_reconnect(manual=True)" in manual.group(1)
         # Ready-wait and skip reschedule use the same slot as reconnect.
         attempt = re.search(
-            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            r"def _attempt_reconnect\(self.*?\):(.*?)\n    def ",
             rb_source,
             re.DOTALL,
         )
         assert attempt
         assert '_arm_reconnect_callback(\n                    "ready"' in attempt.group(1) \
-            or '_arm_reconnect_callback(\n                "ready"' in attempt.group(1) \
-            or '"ready"' in attempt.group(1)
-        assert '"skip"' in attempt.group(1)
+            or '_arm_reconnect_callback(\n                "ready"' in attempt.group(1)
+        defer = re.search(
+            r"def _defer_half_up_teardown\(self, decision, attempt_n: int\) -> None:(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert defer
+        assert '"skip"' in defer.group(1)
+        assert "record_skip_poll()" in defer.group(1)
+        assert "_raise_reconnect_alert(ESCALATION_LOG)" in defer.group(1)
+        # The cap returns before another skip callback is armed.
+        assert defer.group(1).find("record_skip_poll()") < defer.group(1).find(
+            '_arm_reconnect_callback(')
+        assert "return" in defer.group(1).split("_arm_reconnect_callback(")[0]
 
 
 def test_faulthandler_handle_stays_open(tmp_path):
@@ -355,18 +378,41 @@ def test_faulthandler_handle_stays_open(tmp_path):
 
     faulthandler.disable()
     rb._faulthandler_log = None
+    handle = None
+    try:
+        rb.enable_reconnect_faulthandler(str(tmp_path))
+        handle = rb._faulthandler_log
+        assert handle is not None
+        assert not handle.closed
+        handle.write("armed\n")
+        handle.flush()
+        text = (tmp_path / "faulthandler.log").read_text(encoding="utf-8")
+        assert "armed" in text
+        # A second deploy must not replace the live handle.
+        rb.enable_reconnect_faulthandler(str(tmp_path))
+        assert rb._faulthandler_log is handle
+        assert not handle.closed
+    finally:
+        faulthandler.disable()
+        rb._faulthandler_log = None
+        if handle is not None and not handle.closed:
+            handle.close()
+
+
+def test_faulthandler_open_failure_does_not_abort_deploy(tmp_path, monkeypatch, capsys):
+    """A log-file OSError is a warning. Deploy must continue."""
+    import run_backtest as rb
+
+    def boom(*args, **kwargs):
+        raise OSError("denied")
+
+    monkeypatch.setattr(rb, "open", boom, raising=False)
+    rb._faulthandler_log = None
     rb.enable_reconnect_faulthandler(str(tmp_path))
-    handle = rb._faulthandler_log
-    assert handle is not None
-    assert not handle.closed
-    handle.write("armed\n")
-    handle.flush()
-    text = (tmp_path / "faulthandler.log").read_text(encoding="utf-8")
-    assert "armed" in text
-    # A second deploy must not replace the live handle.
-    rb.enable_reconnect_faulthandler(str(tmp_path))
-    assert rb._faulthandler_log is handle
-    assert not handle.closed
+    assert rb._faulthandler_log is None
+    out = capsys.readouterr().out
+    assert "faulthandler not armed" in out
+    assert "OSError" in out
 
 
 # ---------------------------------------------------------------------------

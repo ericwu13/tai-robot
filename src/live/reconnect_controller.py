@@ -28,6 +28,10 @@ ACTION_ALREADY_CONNECTED = "already_connected"
 
 # Logged when the one post-deadline teardown of a half-up session fires.
 FORCED_TEARDOWN_LOG = "[RECONNECT] P1 forced teardown of half-up session"
+# Logged when the 15s skip loop after that teardown is stopped.
+ESCALATION_LOG = (
+    "[RECONNECT] P1 half-up skip loop stopped after forced teardown"
+)
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -199,12 +203,16 @@ class ReconnectController:
     # block the Tk thread. This loop, not a long Ready timer, holds the
     # pre-open gap (including multi-day holidays).
     CONNECTING_WAIT_S: int = 15
+    # After the one forced teardown, this many 15s skips then the loop
+    # stops and the GUI raises an operator alert. 8 × 15s = 2 minutes.
+    POST_FORCED_SKIP_LIMIT: int = 8
 
     def __init__(self) -> None:
         self._handshake_open: bool = False
         self._reached_ready: bool = False
         self._previous_attempt_missed_ready: bool = False
         self._forced_teardown_used: bool = False
+        self._post_forced_skips: int = 0
 
     def reset(self) -> None:
         """Drop all latch state (bot stop / new deploy)."""
@@ -212,6 +220,7 @@ class ReconnectController:
         self._reached_ready = False
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
+        self._post_forced_skips = 0
 
     @property
     def previous_attempt_missed_ready(self) -> bool:
@@ -232,6 +241,7 @@ class ReconnectController:
         self._reached_ready = True
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
+        self._post_forced_skips = 0
 
     def on_attempt_failed(self) -> None:
         """The Ready wait ended without Ready.
@@ -256,6 +266,17 @@ class ReconnectController:
         self._reached_ready = False
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
+        self._post_forced_skips = 0
+
+    def on_operator_reconnect(self) -> None:
+        """The operator pressed Reconnect.
+
+        Clears the one-teardown allowance and the post-forced skip count.
+        ``decide(..., manual=True)`` then tears down even while the
+        session is still half-up, including before open+90s.
+        """
+        self._forced_teardown_used = False
+        self._post_forced_skips = 0
 
     def note_forced_teardown(self) -> None:
         """The GUI is about to LeaveMonitor a half-up session past open+90s.
@@ -263,6 +284,7 @@ class ReconnectController:
         A second forced teardown in this same disconnect is then refused.
         """
         self._forced_teardown_used = True
+        self._post_forced_skips = 0
 
     @property
     def forced_teardown_used(self) -> bool:
@@ -274,11 +296,24 @@ class ReconnectController:
             return False
         return self._previous_attempt_missed_ready or self._handshake_open
 
+    def record_skip_poll(self) -> bool:
+        """Count one skip after the forced teardown was used.
+
+        Returns True when the loop has reached ``POST_FORCED_SKIP_LIMIT``
+        and must not be scheduled again. Skips before that teardown
+        (the open+90 hold) are not counted.
+        """
+        if not self._forced_teardown_used:
+            return False
+        self._post_forced_skips += 1
+        return self._post_forced_skips >= self.POST_FORCED_SKIP_LIMIT
+
     def decide(
         self,
         is_connected: int | None,
         *,
         seconds_since_open: float,
+        manual: bool = False,
     ) -> ReconnectGuardDecision:
         """Choose the next COM action.
 
@@ -300,6 +335,15 @@ class ReconnectController:
             return ReconnectGuardDecision(
                 action=ACTION_ALREADY_CONNECTED,
                 reason="IsConnected()==1 — session already up, skip teardown and login",
+            )
+
+        if manual:
+            return ReconnectGuardDecision(
+                action=ACTION_TEARDOWN_AND_LOGIN,
+                reason=(
+                    "operator reconnect — LeaveMonitor even if the "
+                    "session is half-up"
+                ),
             )
 
         unsafe = self._half_up() and (
