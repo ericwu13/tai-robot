@@ -11,6 +11,12 @@ until 90s after a real TAIFEX session open — ``current_session`` /
 ``is_taifex_holiday``, not the weekend-only ``is_market_open()`` clock.
 A weekday holiday has no open, so a half-up session keeps skipping.
 After a real open+90s, one forced teardown per disconnect is allowed.
+
+If that holiday-aware lookup raises, the clock falls back to the
+weekend-only session edges and leaves a WARN for the GUI to send
+through ``_log`` and Discord. Swallowing the error and treating it as
+"no session" makes 10:00 on a trading day look 18000s before the night
+open, and the half-up skip then never reaches the cap.
 """
 
 from __future__ import annotations
@@ -31,6 +37,16 @@ FORCED_TEARDOWN_LOG = "[RECONNECT] P1 forced teardown of half-up session"
 # Logged when the 15s skip loop after that teardown is stopped.
 ESCALATION_LOG = (
     "[RECONNECT] P1 half-up skip loop stopped after forced teardown"
+)
+# Holiday-aware lookup raised. The GUI sends this through _log and Discord.
+CLOCK_FALLBACK_WARN = (
+    "[RECONNECT] WARN holiday-aware session lookup failed — "
+    "using the weekend-only clock"
+)
+# is_market_open() and current_session disagree. Holiday-aware still wins.
+CLOCK_DISAGREE_WARN = (
+    "[RECONNECT] WARN weekend-only is_market_open() and the "
+    "holiday-aware session clock disagree"
 )
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
@@ -60,8 +76,8 @@ def _is_closed_day(d: date) -> bool:
 
     Uses ``is_taifex_holiday`` (weekends, TW public holidays, overrides).
     A missing holiday calendar degrades to weekends, matching
-    ``current_session``. A lookup that raises does not: the caller
-    fails open instead of inventing a multi-day skip.
+    ``current_session``. A lookup that raises propagates so the clock
+    can fall back to the weekend-only edges instead of a multi-day skip.
     """
     try:
         from src.market_data.holidays import is_taifex_holiday
@@ -88,17 +104,100 @@ def _next_session_open(now: datetime) -> datetime:
 def _live_session(now: datetime):
     """``current_session`` for ``now``.
 
-    Raises when the session lookup raises. Callers fail open; swallowing
-    the error and treating it as "no session" skips a half-up handshake
-    until a next open that was never computed.
+    Raises when the session lookup raises. Callers fall back to the
+    weekend-only clock. Swallowing the error and treating it as "no
+    session" is the −18000s probe at 10:00 on a trading day.
     """
     from src.regime.switch_logic import current_session
     return current_session(now)
 
 
-def _since_open_when_lookup_fails() -> int:
-    """Past the half-up hold, so one forced teardown is allowed."""
-    return ReconnectController.HALF_UP_HOLD_S
+def _weekend_session_open(now: datetime) -> datetime:
+    """Open instant the weekend-only clock uses for ``now``.
+
+    Same edges as ``live_runner.is_market_open``: weekdays 08:45–13:45
+    and 15:00–05:00, Saturday until 05:00, Sunday closed, Monday with no
+    night carryover. A weekday holiday is an ordinary weekday here.
+    When the market is closed this is the next open, so the delta is
+    negative.
+    """
+    from src.live.live_runner import is_market_open
+
+    weekday = now.weekday()
+    minutes = now.hour * 60 + now.minute
+
+    def at(day, hour: int, minute: int) -> datetime:
+        return datetime(day.year, day.month, day.day, hour, minute, tzinfo=_TZ_TAIPEI)
+
+    if is_market_open(now):
+        if minutes >= 15 * 60:
+            return at(now.date(), 15, 0)
+        if minutes < 5 * 60:
+            return at(now.date() - timedelta(days=1), 15, 0)
+        return at(now.date(), 8, 45)
+    if weekday == 6:
+        return at(now.date() + timedelta(days=1), 8, 45)
+    if weekday == 5:
+        return at(now.date() + timedelta(days=2), 8, 45)
+    if weekday == 0 and minutes < 5 * 60:
+        return at(now.date(), 8, 45)
+    if 5 * 60 <= minutes < 8 * 60 + 45:
+        return at(now.date(), 8, 45)
+    if 13 * 60 + 45 <= minutes < 15 * 60:
+        return at(now.date(), 15, 0)
+    return at(now.date() + timedelta(days=1), 8, 45)
+
+
+def _weekend_seconds_since_open(now: datetime) -> int:
+    return int((now - _weekend_session_open(now)).total_seconds())
+
+
+_pending_clock_warnings: list[str] = []
+_latched_clock_warnings: set[str] = set()
+
+
+def _note_clock_warning(kind: str, message: str) -> None:
+    """Queue ``message`` once until ``kind`` clears."""
+    if kind in _latched_clock_warnings:
+        return
+    _latched_clock_warnings.add(kind)
+    _pending_clock_warnings.append(message)
+
+
+def _clear_clock_warning(kind: str) -> None:
+    _latched_clock_warnings.discard(kind)
+
+
+def _note_clock_disagreement(now: datetime, in_session: bool) -> None:
+    """WARN when the weekend-only flag and the holiday-aware answer differ.
+
+    The holiday-aware answer stays in force. The WARN is what stops a
+    trading day mislabeled as closed from skipping with no operator signal.
+    """
+    try:
+        from src.live.live_runner import is_market_open
+        weekend_open = bool(is_market_open(now))
+    except Exception:
+        return
+    if weekend_open != in_session:
+        _note_clock_warning("disagree", CLOCK_DISAGREE_WARN)
+    else:
+        _clear_clock_warning("disagree")
+
+
+def pop_session_clock_warnings() -> list[str]:
+    """Warnings the GUI should send through ``_log`` and Discord."""
+    global _pending_clock_warnings
+    pending = _pending_clock_warnings
+    _pending_clock_warnings = []
+    return pending
+
+
+def reset_session_clock_warnings() -> None:
+    """Drop queued warnings and their once-only latches. Tests use this."""
+    global _pending_clock_warnings
+    _pending_clock_warnings = []
+    _latched_clock_warnings.clear()
 
 
 def seconds_since_session_open(now: datetime | None = None) -> int:
@@ -111,18 +210,27 @@ def seconds_since_session_open(now: datetime | None = None) -> int:
     an open: the weekend-only clock would already be past open+90s at
     10:00, and this one is still negative.
 
-    If ``current_session`` or the holiday lookup raises, this returns
-    open+90s. ``decide`` then allows one forced teardown instead of
-    skipping for as long as the clock stays unknown.
+    If ``current_session`` or the holiday lookup raises, this returns the
+    weekend-only clock instead and queues ``CLOCK_FALLBACK_WARN``. At
+    10:00 on a trading day that is seconds since 08:45, so one forced
+    teardown is allowed. It is not the next night open (−18000s).
     """
     now = _as_taipei(now)
     try:
         session = _live_session(now)
         if session is not None:
-            return int((now - session.open_dt).total_seconds())
-        return int((now - _next_session_open(now)).total_seconds())
+            since = int((now - session.open_dt).total_seconds())
+            in_session = True
+        else:
+            since = int((now - _next_session_open(now)).total_seconds())
+            in_session = False
     except Exception:
-        return _since_open_when_lookup_fails()
+        _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
+        _clear_clock_warning("disagree")
+        return _weekend_seconds_since_open(now)
+    _clear_clock_warning("fallback")
+    _note_clock_disagreement(now, in_session)
+    return since
 
 
 def in_live_session(now: datetime | None = None) -> bool:
@@ -130,13 +238,18 @@ def in_live_session(now: datetime | None = None) -> bool:
 
     The reconnect deferral uses this. It does not call the weekend-only
     market-open helper, which treats a weekday holiday as a normal session.
-    A lookup that raises is treated as in-session so the deferral does
-    not park a half-up handshake for days.
+    A lookup that raises falls back to that helper and queues the same
+    WARN as ``seconds_since_session_open``.
     """
+    now = _as_taipei(now)
     try:
-        return _live_session(_as_taipei(now)) is not None
+        live = _live_session(now) is not None
     except Exception:
-        return True
+        _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
+        from src.live.live_runner import is_market_open
+        return bool(is_market_open(now))
+    _note_clock_disagreement(now, live)
+    return live
 
 
 def seconds_until_next_session_open(now: datetime | None = None) -> int:
@@ -350,7 +463,15 @@ class ReconnectController:
         one forced teardown per disconnect is allowed. A down session
         (``IsConnected()==0``) and the first attempt after a clean 3033
         still tear down — those are not the half-up state.
+
+        ``IsConnected()==0`` also clears the post-forced skip count. A
+        session that fully drops inside this disconnect is not the
+        half-up loop those skips were counting. A failed probe (None)
+        does not clear it.
         """
+        if is_connected == 0:
+            self._post_forced_skips = 0
+
         if is_connected == IS_CONNECTED:
             return ReconnectGuardDecision(
                 action=ACTION_ALREADY_CONNECTED,

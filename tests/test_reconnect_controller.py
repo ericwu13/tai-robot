@@ -12,11 +12,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.reconnect_controller import (
     ACTION_ALREADY_CONNECTED,
     ACTION_SKIP_TEARDOWN_WAIT,
     ACTION_TEARDOWN_AND_LOGIN,
+    CLOCK_DISAGREE_WARN,
+    CLOCK_FALLBACK_WARN,
     FORCED_TEARDOWN_LOG,
     IS_CONNECTED,
     IS_CONNECTING,
@@ -24,6 +28,8 @@ from src.live.reconnect_controller import (
     ReconnectSchedule,
     arm_single_timer,
     in_live_session,
+    pop_session_clock_warnings,
+    reset_session_clock_warnings,
     seconds_since_session_open,
     seconds_until_next_session_open,
 )
@@ -34,6 +40,13 @@ _BEFORE_OPEN = -120
 _OPEN_PLUS_15 = 15
 _OPEN_PLUS_91 = 91
 _TPE = timezone(timedelta(hours=8))
+
+
+@pytest.fixture(autouse=True)
+def _reset_clock_warnings():
+    reset_session_clock_warnings()
+    yield
+    reset_session_clock_warnings()
 
 
 def _incident_controller() -> ReconnectController:
@@ -247,6 +260,40 @@ class TestOperatorReconnectAndSkipCap:
         assert again.action == ACTION_SKIP_TEARDOWN_WAIT
         assert not again.forced_teardown
 
+    def test_post_forced_skip_limit_is_eight(self):
+        """The cap is 8 polls. A limit of 1000 must not survive this test."""
+        assert ReconnectController.POST_FORCED_SKIP_LIMIT == 8
+        ctrl = _incident_controller()
+        ctrl.note_forced_teardown()
+        for _ in range(7):
+            assert ctrl.record_skip_poll() is False
+        assert ctrl.record_skip_poll() is True
+
+    def test_full_drop_resets_post_forced_skips(self):
+        """IsConnected()==0 inside this disconnect restarts the skip count.
+
+        A failed probe does not. The one forced-teardown allowance stays
+        used: the next half-up stretch still skips, it just gets a fresh 8.
+        """
+        ctrl = _incident_controller()
+        ctrl.note_forced_teardown()
+        for _ in range(5):
+            assert ctrl.record_skip_poll() is False
+        # A failed probe leaves the count where it is: polls 6..8 still cap.
+        assert ctrl.decide(None, seconds_since_open=91).action == (
+            ACTION_SKIP_TEARDOWN_WAIT
+        )
+        for _ in range(2):
+            assert ctrl.record_skip_poll() is False
+        assert ctrl.record_skip_poll() is True
+        dropped = ctrl.decide(0, seconds_since_open=91)
+        assert dropped.action == ACTION_TEARDOWN_AND_LOGIN
+        assert not dropped.forced_teardown
+        assert ctrl.forced_teardown_used
+        for _ in range(7):
+            assert ctrl.record_skip_poll() is False
+        assert ctrl.record_skip_poll() is True
+
     def test_operator_reconnect_clears_the_skip_count(self):
         ctrl = _incident_controller()
         ctrl.note_forced_teardown()
@@ -282,6 +329,10 @@ class TestSessionOpenClock:
         assert seconds_since_session_open(open_15) == 15
         assert seconds_since_session_open(open_91) == 91
         assert seconds_since_session_open(before) == -120
+        # 10:00 is 75 minutes after the day open. The clocks agree, so no WARN.
+        ten = datetime(2026, 10, 6, 10, 0, 0, tzinfo=_TPE)
+        assert seconds_since_session_open(ten) == 75 * 60
+        assert pop_session_clock_warnings() == []
 
     def test_night_open_and_weekend_gap(self):
         night = datetime(2026, 10, 6, 15, 1, 30, tzinfo=_TPE)
@@ -339,51 +390,75 @@ class TestWeekdayHolidayHalfUp:
         assert action.delay_seconds == max(secs - 120, 60)
 
 
-class TestSessionLookupFailOpen:
-    """A raised session or holiday lookup must not skip for days.
+class TestSessionLookupFallback:
+    """A raised lookup uses the weekend-only clock and queues a WARN.
 
-    Fail open: the clock reports open+90s, so a half-up session gets one
-    forced teardown and the second attempt is refused.
+    Reed's probe: current_session raises at 10:00 on a trading day and
+    the swallowed error reports −18000 (next night open). The half-up
+    skip then never calls the cap. The weekend-only clock is seconds
+    since 08:45, so one forced teardown is allowed and the cap can fire.
     """
 
-    def test_current_session_raise_allows_one_forced_teardown(self, monkeypatch):
+    def test_current_session_raise_at_1000_uses_weekend_clock(self, monkeypatch):
         def boom(now=None):
             raise RuntimeError("session lookup failed")
 
         monkeypatch.setattr("src.regime.switch_logic.current_session", boom)
-        # Tuesday 10:00 is a real day session when the lookup works.
         when = datetime(2026, 10, 6, 10, 0, 0, tzinfo=_TPE)
         since = seconds_since_session_open(when)
-        assert since == ReconnectController.HALF_UP_HOLD_S
+        # 75 minutes after 08:45. Not −18000, and not a hardcoded open+90.
+        assert since == 75 * 60
+        assert since != -18000
         assert in_live_session(when)
         assert seconds_until_next_session_open(when) == 0
+        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
         ctrl = _incident_controller()
         first = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
         assert first.action == ACTION_TEARDOWN_AND_LOGIN
         assert first.forced_teardown
-        assert first.reason == FORCED_TEARDOWN_LOG
         ctrl.note_forced_teardown()
-        second = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
-        assert second.action == ACTION_SKIP_TEARDOWN_WAIT
-        assert not second.forced_teardown
+        for _ in range(7):
+            assert ctrl.decide(
+                IS_CONNECTING, seconds_since_open=since).action == (
+                ACTION_SKIP_TEARDOWN_WAIT
+            )
+            assert ctrl.record_skip_poll() is False
+        assert ctrl.record_skip_poll() is True
 
-    def test_holiday_lookup_raise_allows_one_forced_teardown(self, monkeypatch):
+    def test_holiday_lookup_raise_uses_weekend_clock(self, monkeypatch):
         def boom(d):
             raise RuntimeError("holiday lookup failed")
 
         monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
-        # 14:00 is the day-to-night gap: current_session is None, so the
-        # next-open scan is what calls the holiday calendar.
+        # 14:00 is the day-to-night gap. The next-open scan is what calls
+        # the holiday calendar. Weekend-only, that open is today 15:00.
         when = datetime(2026, 10, 6, 14, 0, 0, tzinfo=_TPE)
         since = seconds_since_session_open(when)
-        assert since == ReconnectController.HALF_UP_HOLD_S
+        assert since == -3600
+        assert pop_session_clock_warnings() == [CLOCK_FALLBACK_WARN]
         ctrl = _incident_controller()
-        first = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
-        assert first.forced_teardown
-        ctrl.note_forced_teardown()
-        second = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
-        assert second.action == ACTION_SKIP_TEARDOWN_WAIT
-        assert not second.forced_teardown
+        decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not decision.forced_teardown
+
+
+class TestClockDisagreement:
+    """A successful holiday-aware answer that fights is_market_open warns.
+
+    The holiday-aware value stays in force, so a real holiday still skips.
+    """
+
+    def test_weekday_holiday_warns_and_still_skips(self):
+        when = datetime(2026, 9, 25, 10, 0, 0, tzinfo=_TPE)
+        since = seconds_since_session_open(when)
+        assert since < 0
+        assert not in_live_session(when)
+        # in_live_session notes the same disagreement; the latch keeps one.
+        assert pop_session_clock_warnings() == [CLOCK_DISAGREE_WARN]
+        ctrl = _incident_controller()
+        decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not decision.forced_teardown
 
 
 class TestSingleReconnectTimer:

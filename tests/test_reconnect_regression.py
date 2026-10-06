@@ -290,14 +290,6 @@ class TestIssue157_Amendments:
         assert "_raise_reconnect_alert(FORCED_TEARDOWN_LOG)" in rb_source
         assert "_log_debug(FORCED_TEARDOWN_LOG)" not in rb_source
         assert "note_forced_teardown()" in rb_source
-        alert = re.search(
-            r"def _raise_reconnect_alert\(self, message: str\) -> None:(.*?)\n    def ",
-            rb_source,
-            re.DOTALL,
-        )
-        assert alert
-        assert "_log(message)" in alert.group(1)
-        assert "_discord.notify(message)" in alert.group(1)
 
     def test_faulthandler_armed_at_deploy(self, rb_source: str):
         assert "def enable_reconnect_faulthandler(" in rb_source
@@ -348,7 +340,6 @@ class TestIssue157_Amendments:
         assert stop and "_cancel_reconnect_timer()" in stop.group(1)
         assert manual and "_cancel_reconnect_timer()" in manual.group(1)
         assert "on_operator_reconnect()" in manual.group(1)
-        assert "_attempt_reconnect(manual=True)" in manual.group(1)
         # Ready-wait and skip reschedule use the same slot as reconnect.
         attempt = re.search(
             r"def _attempt_reconnect\(self.*?\):(.*?)\n    def ",
@@ -357,19 +348,237 @@ class TestIssue157_Amendments:
         )
         assert attempt
         assert '_arm_reconnect_callback("ready"' in attempt.group(1)
-        defer = re.search(
-            r"def _defer_half_up_teardown\(self, decision, attempt_n: int\) -> None:(.*?)\n    def ",
-            rb_source,
-            re.DOTALL,
-        )
-        assert defer
-        assert '"skip"' in defer.group(1)
-        assert "record_skip_poll()" in defer.group(1)
-        assert "_raise_reconnect_alert(ESCALATION_LOG)" in defer.group(1)
-        # The cap returns before another skip callback is armed.
-        assert defer.group(1).find("record_skip_poll()") < defer.group(1).find(
-            '_arm_reconnect_callback(')
-        assert "return" in defer.group(1).split("_arm_reconnect_callback(")[0]
+
+
+class _Var:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def get(self) -> str:
+        return self._value
+
+
+class _Discord:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.messages: list[str] = []
+
+    def notify(self, message: str) -> None:
+        self.messages.append(message)
+
+
+def _behavior_app(ctrl):
+    """Enough of BacktestApp for the reconnect methods, without Tk."""
+    from types import SimpleNamespace
+
+    import run_backtest as rb
+    from src.live.connection_monitor import ConnectionMonitor
+    from src.live.reconnect_controller import ReconnectSchedule
+
+    app = SimpleNamespace(
+        _reconnect_schedule=ReconnectSchedule(),
+        _reconnect_timer_id=None,
+        _conn_monitor=ConnectionMonitor(),
+        _quote_connected=False,
+        _reconnect_controller=ctrl,
+        _live_runner=None,
+        login_user_var=_Var("user"),
+        login_pass_var=_Var("secret"),
+        btn_reconnect=SimpleNamespace(config=lambda **kwargs: None),
+        set_status=lambda *args, **kwargs: None,
+        _set_conn_dot=lambda *args, **kwargs: None,
+        login_status_var=SimpleNamespace(set=lambda value: None),
+        _logged_in=False,
+        _reconnect_ready_wait_s=3,
+        armed=[],
+    )
+
+    def arm(*args, **kwargs):
+        app.armed.append(args)
+
+    app._arm_reconnect_callback = arm
+    app._raise_reconnect_alert = (
+        lambda message: rb.BacktestApp._raise_reconnect_alert(app, message))
+    app._emit_session_clock_warnings = (
+        lambda: rb.BacktestApp._emit_session_clock_warnings(app))
+    app._reconnect_seconds_since_open = (
+        lambda: rb.BacktestApp._reconnect_seconds_since_open(app))
+    app._execute_reconnect_action = (
+        lambda action: rb.BacktestApp._execute_reconnect_action(app, action))
+    app._schedule_reconnect = lambda: rb.BacktestApp._schedule_reconnect(app)
+    app._defer_half_up_teardown = (
+        lambda decision, attempt_n: rb.BacktestApp._defer_half_up_teardown(
+            app, decision, attempt_n))
+    # Armed by the failed-login and skip paths. Not called during these tests.
+    app._attempt_reconnect = lambda manual=False: None
+    app._check_reconnection = lambda: None
+    return app
+
+
+def test_manual_reconnect_passes_manual_true():
+    """Drive the button handler. The attempt must see manual=True."""
+    import run_backtest as rb
+    from src.live.reconnect_controller import ReconnectController
+
+    ctrl = ReconnectController()
+    ctrl.note_forced_teardown()
+    app = _behavior_app(ctrl)
+    seen = {}
+
+    def attempt(manual=False):
+        seen["manual"] = manual
+
+    app._cancel_reconnect_timer = lambda: None
+    app._cancel_quote_ready_timer = lambda reason: None
+    app._set_quote_connected = lambda *args, **kwargs: None
+    app._attempt_reconnect = attempt
+    rb.BacktestApp._manual_reconnect(app)
+    assert seen["manual"] is True
+    assert not ctrl.forced_teardown_used
+
+
+def test_lookup_failure_warns_and_reaches_forced_teardown(monkeypatch, capsys):
+    """current_session raises at 10:00 on a trading day.
+
+    The weekend-only clock is used (75 minutes after 08:45, not −18000).
+    One forced teardown runs, the WARN reaches _log and Discord, and the
+    post-forced skip cap is then reached.
+    """
+    import run_backtest as rb
+    from src.live.reconnect_controller import (
+        ACTION_SKIP_TEARDOWN_WAIT,
+        CLOCK_FALLBACK_WARN,
+        ESCALATION_LOG,
+        FORCED_TEARDOWN_LOG,
+        ReconnectController,
+        reset_session_clock_warnings,
+    )
+
+    def boom(now=None):
+        raise RuntimeError("session lookup failed")
+
+    reset_session_clock_warnings()
+    monkeypatch.setattr("src.regime.switch_logic.current_session", boom)
+    monkeypatch.setattr(
+        "src.live.live_runner._taipei_now",
+        lambda: __import__("datetime").datetime(
+            2026, 10, 6, 10, 0, 0,
+            tzinfo=__import__("datetime").timezone(
+                __import__("datetime").timedelta(hours=8))),
+    )
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(rb, "_com_available", True)
+
+    class _Quote:
+        def SKQuoteLib_IsConnected(self):
+            return 2
+
+        def SKQuoteLib_LeaveMonitor(self):
+            return 0
+
+    class _Center:
+        def SKCenterLib_LoginSetQuote(self, *args):
+            return 1
+
+        def SKCenterLib_GetReturnCodeMessage(self, code):
+            return "fail"
+
+    monkeypatch.setattr(rb, "skQ", _Quote())
+    monkeypatch.setattr(rb, "skC", _Center())
+
+    ctrl = ReconnectController()
+    ctrl.on_clean_disconnect()
+    ctrl.on_attempt_started()
+    ctrl.on_attempt_failed()
+    seen = {}
+    real_decide = ctrl.decide
+
+    def decide(is_connected, *, seconds_since_open, manual=False):
+        seen["since"] = seconds_since_open
+        seen["manual"] = manual
+        return real_decide(
+            is_connected, seconds_since_open=seconds_since_open, manual=manual)
+
+    ctrl.decide = decide
+    app = _behavior_app(ctrl)
+    rb.BacktestApp._attempt_reconnect(app)
+    assert seen["since"] == 75 * 60
+    assert seen["manual"] is False
+    assert ctrl.forced_teardown_used
+    assert CLOCK_FALLBACK_WARN in discord.messages
+    assert FORCED_TEARDOWN_LOG in discord.messages
+    out = capsys.readouterr().out
+    warn_lines = [line for line in out.splitlines() if CLOCK_FALLBACK_WARN in line]
+    assert warn_lines
+    assert all("[DEBUG]" not in line for line in warn_lines)
+
+    for i in range(8):
+        app.armed.clear()
+        decision = ctrl.decide(2, seconds_since_open=seen["since"])
+        assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+        rb.BacktestApp._defer_half_up_teardown(app, decision, i + 2)
+        if i < 7:
+            assert app.armed
+        else:
+            assert app.armed == []
+            assert ESCALATION_LOG in discord.messages
+    reset_session_clock_warnings()
+
+
+def test_skip_cap_alerts_discord_and_does_not_arm(monkeypatch, capsys):
+    """The 8th post-forced skip notifies and returns before another timer."""
+    import run_backtest as rb
+    from src.live.reconnect_controller import (
+        ACTION_SKIP_TEARDOWN_WAIT,
+        ESCALATION_LOG,
+        ReconnectController,
+    )
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    ctrl = ReconnectController()
+    ctrl.on_clean_disconnect()
+    ctrl.on_attempt_started()
+    ctrl.on_attempt_failed()
+    ctrl.note_forced_teardown()
+    for _ in range(7):
+        assert ctrl.record_skip_poll() is False
+    app = _behavior_app(ctrl)
+    decision = ctrl.decide(2, seconds_since_open=91)
+    assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+    rb.BacktestApp._defer_half_up_teardown(app, decision, 4)
+    assert app.armed == []
+    assert discord.messages == [ESCALATION_LOG]
+    out = capsys.readouterr().out
+    stall_lines = [line for line in out.splitlines() if ESCALATION_LOG in line]
+    assert stall_lines
+    assert all("[DEBUG]" not in line for line in stall_lines)
+
+
+def test_clock_disagreement_warns_through_log_and_discord(monkeypatch, capsys):
+    """A weekday holiday stays on the holiday-aware clock and still warns."""
+    import run_backtest as rb
+    from datetime import datetime, timedelta, timezone
+
+    from src.live.reconnect_controller import (
+        CLOCK_DISAGREE_WARN,
+        reset_session_clock_warnings,
+    )
+
+    when = datetime(2026, 9, 25, 10, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    reset_session_clock_warnings()
+    monkeypatch.setattr("src.live.live_runner._taipei_now", lambda: when)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    app = _behavior_app(object())
+    since = rb.BacktestApp._reconnect_seconds_since_open(app)
+    assert since < 0
+    assert discord.messages == [CLOCK_DISAGREE_WARN]
+    out = capsys.readouterr().out
+    assert CLOCK_DISAGREE_WARN in out
+    assert "[DEBUG]" not in out.split(CLOCK_DISAGREE_WARN)[0].splitlines()[-1]
+    reset_session_clock_warnings()
 
 
 def test_faulthandler_handle_stays_open(tmp_path):

@@ -114,6 +114,7 @@ from src.live.reconnect_controller import (
     ReconnectController,
     ReconnectSchedule,
     in_live_session,
+    pop_session_clock_warnings,
     seconds_since_session_open,
     seconds_until_next_session_open,
 )
@@ -1396,7 +1397,19 @@ class BacktestApp:
             market_open=in_live_session(),
             secs_until_open=seconds_until_next_session_open(),
         )
+        self._emit_session_clock_warnings()
         self._execute_reconnect_action(action)
+
+    def _reconnect_seconds_since_open(self) -> int:
+        """Holiday-aware seconds since open, then any queued clock WARN."""
+        since = seconds_since_session_open()
+        self._emit_session_clock_warnings()
+        return since
+
+    def _emit_session_clock_warnings(self) -> None:
+        """Send a lookup-failure or clock-disagreement WARN to log and Discord."""
+        for message in pop_session_clock_warnings():
+            self._raise_reconnect_alert(message)
 
     def _execute_reconnect_action(self, action):
         """Thin dispatcher: execute a ReconnectAction from ConnectionMonitor."""
@@ -1516,9 +1529,10 @@ class BacktestApp:
                 _log_debug(
                     f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
                     f"[{type(e).__name__}] {e}")
+            since_open = self._reconnect_seconds_since_open()
             decision = self._reconnect_controller.decide(
                 is_connected,
-                seconds_since_open=seconds_since_session_open(),
+                seconds_since_open=since_open,
                 manual=manual,
             )
             _log_debug(
@@ -1595,7 +1609,7 @@ class BacktestApp:
             self._reconnect_ready_wait_s = wait_s
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} waiting {wait_s}s for Ready (3003) "
-                f"(seconds_since_open={seconds_since_session_open()})")
+                f"(seconds_since_open={since_open})")
 
             # Poll for connection (OnConnection callback will set _quote_connected).
             # Same slot as the reconnect and skip timers.
@@ -1652,7 +1666,7 @@ class BacktestApp:
         # guard stays armed across polls.
         self._reconnect_controller.on_attempt_failed()
         decision = self._reconnect_controller.decide(
-            ic, seconds_since_open=seconds_since_session_open())
+            ic, seconds_since_open=self._reconnect_seconds_since_open())
         if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
             self._defer_half_up_teardown(decision, attempt_n)
             return
