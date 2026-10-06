@@ -111,6 +111,11 @@ from src.live.reconnect_controller import (
     ACTION_SKIP_TEARDOWN_WAIT,
     ESCALATION_LOG,
     FORCED_TEARDOWN_LOG,
+    HALF_UP_TEARDOWN_CONFIRM,
+    HEADLESS_HALF_UP_REFUSED_P1,
+    IS_CONNECTING,
+    OPERATOR_DECLINED_HALF_UP_LOG,
+    OPERATOR_FORCED_HALF_UP_P1,
     ReconnectController,
     ReconnectSchedule,
     in_live_session,
@@ -1363,16 +1368,91 @@ class BacktestApp:
             f"(caller=_on_disconnected)")
         self._schedule_reconnect()
 
+    def _probe_reconnect_is_connected(self):
+        """``SKQuoteLib_IsConnected()``, or None when it cannot be read."""
+        if not _com_available:
+            return None
+        try:
+            _log_reconnect_call("IsConnected")
+            return skQ.SKQuoteLib_IsConnected()
+        except Exception as e:
+            _log_debug(
+                f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
+                f"[{type(e).__name__}] {e}")
+            return None
+
+    def _reconnect_bot_id(self) -> str:
+        runner = getattr(self, "_live_runner", None)
+        name = getattr(runner, "bot_name", None) if runner is not None else None
+        if name:
+            return str(name)
+        return "unknown"
+
+    def _half_up_manual_p1(self, phrase: str, is_connected, since: float) -> str:
+        secs_to_open = 0 if since >= 0 else int(-since)
+        return (
+            f"[RECONNECT] P1 {phrase} "
+            f"bot={self._reconnect_bot_id()} IsConnected={is_connected} "
+            f"secs_to_open={secs_to_open}"
+        )
+
+    def _tk_confirm_half_up_teardown(self, message: str, *, default: bool = False) -> bool:
+        """GUI confirm. ``default=False`` is the No button."""
+        button = messagebox.NO if default is False else messagebox.YES
+        return bool(messagebox.askyesno(
+            "重連 Reconnect", message, default=button))
+
+    def _ask_half_up_teardown(self) -> bool:
+        """Injectable confirm. Tests set ``_half_up_confirm_fn(message, default=)``."""
+        fn = getattr(self, "_half_up_confirm_fn", None)
+        if fn is None:
+            fn = self._tk_confirm_half_up_teardown
+        return bool(fn(HALF_UP_TEARDOWN_CONFIRM, default=False))
+
+    def _block_half_up_manual_teardown(self) -> bool:
+        """True when this press must not call the broker.
+
+        Trigger: half-up, ``IsConnected()==2``, holiday-aware now < open+90.
+        Headless has no dialog and refuses with a P1. The GUI asks and
+        defaults to No. No logs the decline and leaves the poll armed.
+        Yes sends the operator P1 and returns False so the caller runs
+        the existing manual teardown, including the allowance reset.
+        """
+        is_connected = self._probe_reconnect_is_connected()
+        if is_connected != IS_CONNECTING or not self._reconnect_controller.is_half_up():
+            return False
+        since = self._reconnect_seconds_since_open()
+        if not self._reconnect_controller.manual_half_up_needs_confirm(
+            is_connected, since
+        ):
+            return False
+        if getattr(self, "_headless_reconnect", False):
+            self._raise_reconnect_alert(self._half_up_manual_p1(
+                HEADLESS_HALF_UP_REFUSED_P1, is_connected, since))
+            return True
+        if not self._ask_half_up_teardown():
+            _log(OPERATOR_DECLINED_HALF_UP_LOG)
+            return True
+        self._raise_reconnect_alert(self._half_up_manual_p1(
+            OPERATOR_FORCED_HALF_UP_P1, is_connected, since))
+        return False
+
     def _manual_reconnect(self):
         """Manual reconnect triggered by user button click."""
+        # Before open+90 a half-up session asks first. No and headless
+        # return here, so the poll timer and the allowance stay as they are
+        # and LeaveMonitor is not called. Every other state falls through.
+        if self._block_half_up_manual_teardown():
+            return
         # Cancel reconnect, Ready-wait, and skip-poll callbacks together.
         self._cancel_reconnect_timer()
         self._cancel_quote_ready_timer("manual_reconnect")
 
         self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
-        # The button always tears down, including a half-up session whose
-        # one automatic forced teardown was already used.
+        # The button tears down, including a half-up session whose one
+        # automatic forced teardown was already used. Before open+90 that
+        # only happens after the operator confirms.
         self._reconnect_controller.on_operator_reconnect()
         action = self._conn_monitor.on_manual_reconnect()
         self.set_status(action.message, "warn")

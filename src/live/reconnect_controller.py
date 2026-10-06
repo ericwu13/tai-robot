@@ -48,6 +48,14 @@ CLOCK_DISAGREE_WARN = (
     "[RECONNECT] WARN weekend-only is_market_open() and the "
     "holiday-aware session clock disagree"
 )
+# Operator Reconnect on a half-up session before open+90. Default answer is No.
+HALF_UP_TEARDOWN_CONFIRM = (
+    "Session is still connecting (no Ready). Tearing it down is the "
+    "call that crashed/froze bots in #157. Proceed?"
+)
+OPERATOR_DECLINED_HALF_UP_LOG = "[RECONNECT] operator declined half-up teardown"
+OPERATOR_FORCED_HALF_UP_P1 = "operator forced half-up teardown"
+HEADLESS_HALF_UP_REFUSED_P1 = "manual reconnect refused: half-up before open+90"
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -402,14 +410,38 @@ class ReconnectController:
         self._post_forced_skips = 0
 
     def on_operator_reconnect(self) -> None:
-        """The operator pressed Reconnect.
+        """The operator pressed Reconnect and a teardown will run.
 
         Clears the one-teardown allowance and the post-forced skip count.
         ``decide(..., manual=True)`` then tears down even while the
-        session is still half-up, including before open+90s.
+        session is still half-up. Before open+90 the GUI asks first
+        (default No) and headless refuses; this method runs only when
+        the teardown is actually going ahead.
         """
         self._forced_teardown_used = False
         self._post_forced_skips = 0
+
+    def is_half_up(self) -> bool:
+        """No Ready (3003) since the last EnterMonitor."""
+        return self._half_up()
+
+    def manual_half_up_needs_confirm(
+        self,
+        is_connected: int | None,
+        seconds_since_open: float,
+    ) -> bool:
+        """Operator Reconnect must ask before tearing this session down.
+
+        The trigger is manual (the caller), ``IsConnected()==2``, no
+        Ready since the last EnterMonitor, and the holiday-aware clock
+        still before open+90s. Fully up, fully down, a failed probe, and
+        open+90s or later are not this state.
+        """
+        return (
+            is_connected == IS_CONNECTING
+            and self._half_up()
+            and seconds_since_open < self.HALF_UP_HOLD_S
+        )
 
     def note_forced_teardown(self) -> None:
         """The GUI is about to LeaveMonitor a half-up session past open+90s.
