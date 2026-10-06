@@ -279,9 +279,17 @@ def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_pat
     writer.write()
     watchdog = HangWatchdog(
         str(sleep_dir), hung_s=90.0, poll_s=2.0, alert_fn=alerts.append)
+    # Unlatched. A resume whose wake gap is ~600s must rebase, not P1.
+    assert watchdog._latched is False
+    watchdog._poll()
+    watchdog._seen_mono = time.monotonic() - 600.0
+    watchdog._last_loop_mono = time.monotonic() - 600.0
+    watchdog._poll()
+    assert alerts == [], "resume from sleep must not false-P1"
+    assert watchdog._latched is False
+    # An episode that was already latched stays latched across that wake.
     watchdog._latched = True
     watchdog._latched_ts = hb.read_heartbeat(writer.path)["ts"]
-    watchdog._poll()
     watchdog._seen_mono = time.monotonic() - 600.0
     watchdog._last_loop_mono = time.monotonic() - 600.0
     watchdog._poll()
@@ -329,6 +337,88 @@ def test_alert_goes_out_when_dump_fails_and_missing_file_does_not_rearm(tmp_path
     assert watchdog._latched is False
     watchdog._check_once(700.0)
     assert len(alerts) == 2
+
+
+def test_watchdog_default_poll_waits_two_seconds(tmp_path, monkeypatch):
+    """DEFAULT_POLL_S is 2s. A 60s wait is a different watchdog."""
+    waits = []
+    orig = hb.threading.Event.wait
+
+    def wrapped(self, timeout=None):
+        if threading.current_thread().name == "hang-watchdog":
+            waits.append(timeout)
+            return orig(self, 30)
+        return orig(self, timeout)
+
+    monkeypatch.setattr(hb.threading.Event, "wait", wrapped)
+    watchdog = HangWatchdog(str(tmp_path))
+    watchdog.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not waits:
+            time.sleep(0.01)
+    finally:
+        watchdog.disable()
+    assert waits, "watchdog never waited"
+    assert waits[0] == 2.0
+
+
+def test_stop_idles_watchdog_and_foreign_heartbeat_is_quiet(tmp_path):
+    alerts = []
+    bot = str(tmp_path)
+    hb.start(bot, alert_fn=alerts.append, hung_s=0.2, poll_s=0.05)
+    try:
+        hb.stop()
+        assert hb._watchdog is not None and hb._watchdog._enabled is False
+        foreign = {
+            "ts": time.time() - 500,
+            "pid": os.getpid() + 7,
+            "inflight_com_call": None,
+        }
+        (tmp_path / "heartbeat.json").write_text(
+            json.dumps(foreign), encoding="utf-8")
+        time.sleep(0.3)
+        assert alerts == []
+        assert not (tmp_path / "hang.json").exists()
+        hb._watchdog._check_once(time.monotonic() + 500)
+        assert alerts == []
+        assert not (tmp_path / "hang.json").exists()
+    finally:
+        hb.stop()
+        if hb._watchdog is not None:
+            hb._watchdog.disable()
+
+
+def test_foreign_pid_heartbeat_while_running_does_not_alert(tmp_path):
+    alerts = []
+    watchdog = HangWatchdog(str(tmp_path), hung_s=90.0, alert_fn=alerts.append)
+    payload = {
+        "ts": 1_000.0,
+        "pid": os.getpid() + 99,
+        "inflight_com_call": None,
+    }
+    (tmp_path / "heartbeat.json").write_text(json.dumps(payload), encoding="utf-8")
+    watchdog._seen_ts = payload["ts"]
+    watchdog._seen_mono = 0.0
+    watchdog._check_once(1_000.0)
+    assert alerts == []
+    assert not (tmp_path / "hang.json").exists()
+    assert not (tmp_path / "hang_stacks.txt").exists()
+
+
+def test_start_rotates_hang_artifacts(tmp_path):
+    (tmp_path / "hang.json").write_text("old-hang", encoding="utf-8")
+    (tmp_path / "hang_stacks.txt").write_text("old-stacks", encoding="utf-8")
+    try:
+        hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
+        assert (tmp_path / "hang.json.prev").read_text(encoding="utf-8") == "old-hang"
+        assert (tmp_path / "hang_stacks.txt.prev").read_text(encoding="utf-8") == "old-stacks"
+        assert not (tmp_path / "hang.json").exists()
+        assert not (tmp_path / "hang_stacks.txt").exists()
+    finally:
+        hb.stop()
+        if hb._watchdog is not None:
+            hb._watchdog.disable()
 
 
 def test_attempt_reconnect_stamps_leave_monitor():

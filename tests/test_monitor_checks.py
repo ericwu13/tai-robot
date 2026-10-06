@@ -751,10 +751,11 @@ def test_bots_hung_on_weekday_holiday_preopen_is_p2(tmp_path):
     assert not has_level(findings, "P1"), messages(findings, "P1")
 
 
-def test_bots_degraded_calendar_does_not_invent_a_holiday(tmp_path, monkeypatch):
-    """holiday_calendar_degraded → do not trust a weekday holiday closure.
+def test_bots_degraded_calendar_caps_flat_weekday_at_p2(tmp_path, monkeypatch):
+    """A degraded calendar cannot prove a weekday is open (#156).
 
-    The 14:50 pre-open stays P1 when the TW calendar is weekend-only.
+    Flat HUNG on that weekday is P2 and tagged, including the old
+    holiday-pre-open clock that used to stay P1.
     """
     monkeypatch.setattr(
         "src.regime.switch_logic.holiday_calendar_degraded",
@@ -766,9 +767,10 @@ def test_bots_degraded_calendar_does_not_invent_a_holiday(tmp_path, monkeypatch)
         NOW_HOLIDAY_PREOPEN, str(tmp_path / "live"),
         pid_alive_fn=lambda pid: True)
     assert "heartbeat: HUNG" in _hb_line(lines)
-    hung = [m for m in messages(findings, "P1") if "HUNG" in m]
+    hung = [m for m in messages(findings, "P2") if "HUNG" in m]
     assert hung, messages(findings)
     assert any("holiday_calendar_degraded" in m for m in hung), hung
+    assert not any("HUNG" in m for m in messages(findings, "P1")), messages(findings)
 
 
 def test_bots_no_heartbeat_is_unknown_and_uses_legacy_log_rule(tmp_path):
@@ -818,7 +820,19 @@ def test_bots_fresh_heartbeat_suppresses_stale_log_p1(tmp_path):
     findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
                                  pid_alive_fn=lambda pid: True)
     assert "heartbeat: ALIVE" in _hb_line(lines)
-    assert not any("frozen mid-session" in m for m in messages(findings))
+    assert not any("frozen mid-session" in m for m in messages(findings, "P1"))
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+
+
+def test_bots_alive_heartbeat_frozen_log_is_p2(tmp_path):
+    """Main loop is fine (fresh heartbeat) but ticks have stopped."""
+    bot = make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=5)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: ALIVE" in _hb_line(lines)
+    assert any("frozen mid-session" in m and "no ticks" in m
+               for m in messages(findings, "P2")), messages(findings)
     assert not has_level(findings, "P1"), messages(findings, "P1")
 
 
@@ -922,6 +936,89 @@ def test_bots_corrupt_heartbeat_is_not_reported_as_missing(tmp_path):
     line = _hb_line(lines)
     assert "corrupt heartbeat.json" in line
     assert "no heartbeat.json" not in line
+
+
+def _frozen_log_p1(findings):
+    return [m for m in messages(findings, "P1") if "frozen mid-session" in m]
+
+
+def test_bots_corrupt_heartbeat_frozen_log_is_p1(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    (bot / "heartbeat.json").write_text("{broken", encoding="utf-8")
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "corrupt heartbeat.json" in _hb_line(lines)
+    assert _frozen_log_p1(findings), messages(findings)
+
+
+def test_bots_pid_mismatch_frozen_log_is_p1(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=5, pid=9999)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: UNKNOWN" in _hb_line(lines)
+    assert "HUNG" not in _hb_line(lines)
+    assert _frozen_log_p1(findings), messages(findings)
+
+
+def test_bots_missing_lock_frozen_log_is_p1(tmp_path):
+    bot = make_live_bot(tmp_path, pid=4242, log_time="14:00:00")
+    (bot / ".lock").unlink()
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=400, pid=4242)
+    findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: UNKNOWN" in _hb_line(lines)
+    assert _frozen_log_p1(findings), messages(findings)
+
+
+@pytest.mark.parametrize("moment", [
+    datetime(2026, 10, 9, 9, 0, tzinfo=TZ_TPE),
+    datetime(2026, 10, 9, 14, 50, tzinfo=TZ_TPE),
+    datetime(2026, 10, 9, 16, 0, tzinfo=TZ_TPE),
+])
+def test_bots_degraded_flat_hung_weekday_is_p2(tmp_path, monkeypatch, moment):
+    """Fri 2026-10-09 09:00, 14:50 and 16:00. Flat + degraded → P2."""
+    monkeypatch.setattr(
+        "src.regime.switch_logic.holiday_calendar_degraded",
+        lambda now=None: True)
+    bot = make_live_bot(
+        tmp_path, pid=4242,
+        log_date=moment.strftime("%Y%m%d"),
+        log_time=moment.strftime("%H:%M:%S"))
+    _paper_flat(bot, position=0)
+    write_heartbeat(bot, moment, age_s=400)
+    findings, lines = check_bots(moment, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    hung = [m for m in messages(findings, "P2") if "HUNG" in m]
+    assert hung, messages(findings)
+    assert all("holiday_calendar_degraded" in m for m in hung), hung
+    assert not any("HUNG" in m for m in messages(findings, "P1")), messages(findings)
+
+
+def test_bots_is_taifex_holiday_raise_caps_flat_hung_at_p2(tmp_path, monkeypatch):
+    """Health check passes, but is_taifex_holiday itself raises."""
+    monkeypatch.setattr(
+        "src.regime.switch_logic.holiday_calendar_degraded",
+        lambda now=None: False)
+
+    def boom(_day):
+        raise RuntimeError("calendar down")
+
+    monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+    moment = datetime(2026, 10, 9, 9, 0, tzinfo=TZ_TPE)
+    bot = make_live_bot(
+        tmp_path, pid=4242,
+        log_date=moment.strftime("%Y%m%d"),
+        log_time=moment.strftime("%H:%M:%S"))
+    _paper_flat(bot, position=0)
+    write_heartbeat(bot, moment, age_s=400)
+    findings, lines = check_bots(moment, str(tmp_path / "live"),
+                                 pid_alive_fn=lambda pid: True)
+    assert "heartbeat: HUNG" in _hb_line(lines)
+    hung = [m for m in messages(findings, "P2") if "HUNG" in m]
+    assert hung and all("holiday_calendar_degraded" in m for m in hung), hung
+    assert not any("HUNG" in m for m in messages(findings, "P1")), messages(findings)
 
 
 def test_bots_heartbeat_thresholds_are_strict(tmp_path):

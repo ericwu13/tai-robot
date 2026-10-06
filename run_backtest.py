@@ -1464,7 +1464,7 @@ class BacktestApp:
                 "(handled by _on_reconnected via _drain_ui_queue)")
             return  # success, handled by _on_reconnected via _drain_ui_queue
         try:
-            ic = skQ.SKQuoteLib_IsConnected()
+            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
             _log_debug(
                 f"[RECONNECT] IsConnected()={ic} after 3s poll "
                 f"(attempt #{attempt_n})")
@@ -3361,7 +3361,7 @@ class BacktestApp:
 
     def _check_connection(self):
         try:
-            ic = skQ.SKQuoteLib_IsConnected()
+            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
             if ic == 1:
                 self._set_quote_connected(True, "_check_connection(IsConnected==1)")
                 self.btn_api.config(state=tk.NORMAL)
@@ -7390,7 +7390,7 @@ class BacktestApp:
             # is treated as noise and the ladder is allowed to continue.
             if _com_available:
                 try:
-                    ic = skQ.SKQuoteLib_IsConnected()
+                    ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
                 except Exception as e:
                     ic = None
                     _log_debug(

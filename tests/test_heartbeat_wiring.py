@@ -99,6 +99,16 @@ def _app(bot_dir: str):
     app._heartbeat_active = False
     app._heartbeat_after_id = None
     app._bot_dir = bot_dir
+    # Present before and after the #158 reconnect merge. This branch does
+    # not read them; #158's _attempt_reconnect / stop path does.
+    app._reconnect_schedule = SimpleNamespace(
+        note_fired=lambda: None,
+        suspend=lambda *_a, **_k: None,
+        resume=lambda *_a, **_k: None,
+        arm=lambda *_a, **_k: None,
+        cancel_all=lambda *_a, **_k: None,
+    )
+    app._quote_ready_timer_id = None
     return app
 
 
@@ -169,7 +179,7 @@ def test_deploy_wires_heartbeat_tick_and_stop(tmp_path, monkeypatch):
         assert app._heartbeat_active is True
         assert len(app.root.pending) == 1
         ms = app.root.fire_one()
-        assert ms == hb.HEARTBEAT_INTERVAL_MS
+        assert ms == 5000
         assert len(app.root.pending) == 1, "heartbeat tick did not re-arm"
         hb._watchdog.alert_fn("probe")
         assert exited == []
@@ -220,6 +230,120 @@ def test_deploy_continues_when_heartbeat_start_raises(tmp_path, monkeypatch):
         assert "PermissionError" in text
     finally:
         _cleanup()
+
+
+def test_tick_rearms_after_a_failed_write(tmp_path, monkeypatch):
+    bot_dir = str(tmp_path / "bot")
+    _install_runner(monkeypatch, bot_dir)
+    app = _app(bot_dir)
+    app._start_live_warmup = lambda: None
+    calls = {"n": 0}
+    real = hb.tick
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk full")
+        return real()
+
+    monkeypatch.setattr(hb, "tick", flaky)
+    try:
+        assert app._deploy_live_continue(
+            None, _Strategy, False, None, False, False, False,
+            None, "paper", "wirebot") is True
+        app.root.fire_one()
+        assert len(app.root.pending) == 1, "tick stopped re-arming after one failure"
+        app.root.fire_one()
+        assert calls["n"] == 2
+        assert len(app.root.pending) == 1
+    finally:
+        _cleanup()
+
+
+def test_first_write_failure_still_arms_later_ticks(tmp_path, monkeypatch):
+    bot_dir = str(tmp_path / "bot")
+    os.makedirs(bot_dir, exist_ok=True)
+    calls = {"n": 0}
+    real = hb.HeartbeatWriter.write
+
+    def flaky(self, now=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("first write")
+        return real(self, now=now)
+
+    monkeypatch.setattr(hb.HeartbeatWriter, "write", flaky)
+    app = _app(bot_dir)
+    app._live_runner = SimpleNamespace(bot_dir=bot_dir)
+    try:
+        app._start_main_heartbeat()
+        assert app._heartbeat_active is True
+        assert len(app.root.pending) == 1
+        assert not os.path.isfile(os.path.join(bot_dir, "heartbeat.json"))
+        app.root.fire_one()
+        assert os.path.isfile(os.path.join(bot_dir, "heartbeat.json"))
+        assert len(app.root.pending) == 1
+    finally:
+        _cleanup()
+
+
+def test_send_future_order_stamps_inflight(tmp_path, monkeypatch):
+    """The real send path stamps inflight_com_call. A comment does not."""
+    import sys
+    import types
+
+    bot_dir = str(tmp_path / "bot")
+    os.makedirs(bot_dir, exist_ok=True)
+    writer = hb.HeartbeatWriter(bot_dir)
+    writer.write()
+    hb._writer = writer
+    seen = {}
+
+    def send(*_a, **_k):
+        data = json.loads(open(writer.path, encoding="utf-8").read())
+        inflight = data.get("inflight_com_call") or {}
+        seen["name"] = inflight.get("name")
+        return ("SEQ1", 0)
+
+    sk_mod = types.ModuleType("comtypes.gen.SKCOMLib")
+
+    class _Order:
+        pass
+
+    sk_mod.FUTUREORDER = _Order
+    gen = types.ModuleType("comtypes.gen")
+    comtypes_mod = types.ModuleType("comtypes")
+    comtypes_mod.gen = gen
+    monkeypatch.setitem(sys.modules, "comtypes", comtypes_mod)
+    monkeypatch.setitem(sys.modules, "comtypes.gen", gen)
+    monkeypatch.setitem(sys.modules, "comtypes.gen.SKCOMLib", sk_mod)
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(SendFutureOrderCLR=send))
+    monkeypatch.setattr(rb, "_discord", None)
+    app = _app(bot_dir)
+    app._futures_account = "ACCT"
+    app._live_runner = SimpleNamespace(
+        symbol="TMF00",
+        csv_logger=None,
+        strategy_display_name="Probe",
+        broker=SimpleNamespace(entry_bar_index=1, trades=[
+            SimpleNamespace(exit_bar_index=2)]),
+    )
+    app._fill_tracker = SimpleNamespace(register_order=lambda *_a, **_k: None)
+    app._trading_guard = SimpleNamespace(
+        on_entry_sent=lambda: None,
+        on_exit_sent=lambda: None,
+        on_fill_pending=lambda *_a: None,
+    )
+    app._trading_mode = "semi_auto"
+    app.login_user_var = _Var("user")
+    try:
+        ok = app._send_real_order(1, "TMFH6", "exit", 20000)
+    finally:
+        hb._writer = None
+        _cleanup()
+    assert ok is True
+    assert seen.get("name") == "SendFutureOrderCLR"
 
 
 def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):

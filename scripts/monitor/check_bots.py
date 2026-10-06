@@ -154,12 +154,25 @@ def _parse_epoch(value):
 
 
 def _calendar_degraded(now: datetime) -> bool:
-    """True when the TW holiday calendar cannot be trusted (issue #155)."""
+    """True when the TW holiday calendar cannot be trusted (issue #155).
+
+    ``holiday_calendar_degraded`` is the health check. A health check that
+    passes while ``is_taifex_holiday`` itself raises is the same failure:
+    a weekday must not be graded as a confirmed open session (#156).
+    """
     try:
         from src.regime.switch_logic import holiday_calendar_degraded
-        return bool(holiday_calendar_degraded(now))
+        degraded = bool(holiday_calendar_degraded(now))
     except Exception:  # noqa: BLE001
         return True
+    if degraded:
+        return True
+    try:
+        from src.market_data.holidays import is_taifex_holiday
+        is_taifex_holiday(_as_tpe(now).date())
+    except Exception:  # noqa: BLE001
+        return True
+    return False
 
 
 def _confirmed_closed_day(now: datetime) -> bool:
@@ -205,6 +218,10 @@ def hung_severity(now: datetime, position_open: bool) -> str:
     """
     if position_open:
         return "P1"
+    # A degraded calendar cannot prove a weekday is open (#156). Cap a
+    # flat bot at P2 instead of a false session/pre-open P1.
+    if _calendar_degraded(now):
+        return "P2"
     if _session_now(now) is not None:
         return "P1"
     if _in_preopen(now):
@@ -386,17 +403,24 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
                 mins = age_minutes(now, ts)
                 lines.append(f"  log: {os.path.basename(log_path)} last line "
                              f"{ts.strftime('%Y-%m-%d %H:%M:%S')} TPE ({mins:.0f} min ago)")
-                # Heartbeat present → it is the main-loop signal. The legacy
-                # log-freshness rule applies only when there is no heartbeat
-                # file (UNKNOWN), so a hung-but-alive bot is not double-counted
-                # and a fresh heartbeat is not graded by a quiet log.
-                if (hb_file_missing and hb_state == "UNKNOWN"
-                        and session is not None and alive
+                # UNKNOWN covers a missing file, a corrupt file, a PID
+                # mismatch, and a missing lock. All of those still need
+                # the legacy frozen-log P1 — a hung-but-alive HUNG grade
+                # is separate and is not double-counted here.
+                if (hb_state == "UNKNOWN" and session is not None
                         and mins > STALE_LOG_MINUTES):
                     findings.append(Finding(
                         "P1", "bots",
                         f"{name}: debug log frozen mid-session (hang?) — "
                         f"last line {mins:.0f} min ago during {session.key}",
+                        log_path))
+                elif (hb_state == "ALIVE" and session is not None
+                        and mins > STALE_LOG_MINUTES):
+                    findings.append(Finding(
+                        "P2", "bots",
+                        f"{name}: debug log frozen mid-session while "
+                        f"heartbeat is ALIVE (no ticks) — last line "
+                        f"{mins:.0f} min ago during {session.key}",
                         log_path))
                 elif session is None:
                     lines.append("  log freshness: not checked (market closed)")

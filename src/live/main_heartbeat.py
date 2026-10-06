@@ -304,6 +304,14 @@ class HangWatchdog:
             # here would send a second alert when the same hang is readable
             # again. Re-arm only on a confirmed fresh heartbeat below.
             return
+        try:
+            file_pid = int(hb.get("pid"))
+        except (TypeError, ValueError):
+            file_pid = None
+        if file_pid is not None and file_pid != os.getpid():
+            # Another instance's file. Do not alert and do not overwrite
+            # hang.json with this process's stacks.
+            return
         ts = _hb_ts(hb)
         if ts is None:
             hb_stall = None
@@ -380,6 +388,22 @@ _watchdog: HangWatchdog | None = None
 _guard = threading.Lock()
 
 
+def _rotate_hang_artifacts(bot_dir: str) -> None:
+    """Move hang.json and hang_stacks.txt aside. Best-effort.
+
+    A clean stop leaves them in place so the episode can be read. The next
+    deploy must not keep reporting that old episode.
+    """
+    for name in (HANG_FILENAME, STACKS_FILENAME):
+        path = os.path.join(bot_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.replace(path, path + ".prev")
+        except OSError:
+            logger.exception("hang file rotate failed for %s", name)
+
+
 def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
           inflight_hung_s: float = DEFAULT_INFLIGHT_HUNG_S,
           poll_s: float = DEFAULT_POLL_S) -> HeartbeatWriter:
@@ -387,11 +411,17 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
 
     Must run on the Tk main thread (the first write asserts it). Calling
     ``start`` again retargets the same watchdog thread — it does not spawn
-    a second one and it does not restart the process.
+    a second one and it does not restart the process. A failed first write
+    still installs the writer so a later tick can retry.
     """
     global _writer, _watchdog
+    _rotate_hang_artifacts(bot_dir)
     writer = HeartbeatWriter(bot_dir)
-    writer.write()
+    try:
+        writer.write()
+    except Exception:
+        logger.exception(
+            "heartbeat initial write failed; later ticks will retry")
     with _guard:
         _writer = writer
         if _watchdog is None:
@@ -414,7 +444,11 @@ def tick() -> None:
 
 
 def stop() -> None:
-    """Drop the writer and delete heartbeat.json. The watchdog keeps running.
+    """Drop the writer, delete heartbeat.json, and idle the watchdog.
+
+    ``start`` / ``configure`` re-enable the same thread. Leaving it enabled
+    on this bot dir would let a later instance's stale file raise a P1
+    from this process and overwrite hang.json with these stacks.
 
     A missing file is not a hang. The latch stays set until a later read
     shows a new, fresh timestamp, so a gap in the file cannot double-alert.
@@ -423,6 +457,9 @@ def stop() -> None:
     with _guard:
         writer = _writer
         _writer = None
+        watchdog = _watchdog
+    if watchdog is not None:
+        watchdog.disable()
     if writer is not None:
         writer.delete()
 

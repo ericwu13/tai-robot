@@ -191,7 +191,7 @@ class TestBugC_WarnLadderRespected:
         # Each call must be preceded by the counter check on the same path.
         # Simplest pin: between the IsConnected() call and the _on_disconnected
         # call, the counter check must appear.
-        ic_idx = warn.find("skQ.SKQuoteLib_IsConnected()")
+        ic_idx = warn.find("skQ.SKQuoteLib_IsConnected")
         disc_idx = warn.find("self._on_disconnected()")
         assert ic_idx != -1, "IsConnected() probe missing from warn branch"
         assert disc_idx != -1, "_on_disconnected() call missing from warn branch"
