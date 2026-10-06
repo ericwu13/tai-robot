@@ -147,6 +147,78 @@ class TestBugB_CleanupBeforeRelogin:
                 "tear-down does not abort the reconnect attempt.")
 
 
+class TestIssue157_GuardBeforeLeaveMonitor:
+    """Issue #157: LeaveMonitor on a half-up pre-session session AVs.
+
+    The guard decision must run, and the skip branch must return, before
+    ``SKQuoteLib_LeaveMonitor``. Bug B still requires the teardown call
+    on the path that does log in.
+    """
+
+    def _attempt_reconnect_body(self, rb_source: str) -> str:
+        match = re.search(
+            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match, "could not locate _attempt_reconnect body"
+        return match.group(1)
+
+    def test_decide_runs_before_leave_monitor(self, rb_source: str):
+        body = self._attempt_reconnect_body(rb_source)
+        decide_pos = body.find("_reconnect_controller.decide(")
+        leave_pos = body.find("SKQuoteLib_LeaveMonitor")
+        assert decide_pos != -1, (
+            "Issue #157: _attempt_reconnect must consult ReconnectController "
+            "before any COM teardown.")
+        assert leave_pos != -1
+        assert decide_pos < leave_pos, (
+            "Issue #157: decide() must run BEFORE SKQuoteLib_LeaveMonitor.")
+        assert "market_open=is_market_open()" in body[decide_pos:leave_pos], (
+            "Issue #157: the guard must see whether the market is open. "
+            "Pre-session IsConnected()==2 skips teardown; after the open "
+            "the intra-session recovery still tears down.")
+
+    def test_skip_branch_returns_before_leave_monitor(self, rb_source: str):
+        body = self._attempt_reconnect_body(rb_source)
+        skip_pos = body.find("ACTION_SKIP_TEARDOWN_WAIT")
+        leave_pos = body.find("SKQuoteLib_LeaveMonitor")
+        assert skip_pos != -1, "skip action not handled in _attempt_reconnect"
+        assert skip_pos < leave_pos
+        between = body[skip_pos:leave_pos]
+        assert "return" in between, (
+            "Issue #157: the skip branch must return before LeaveMonitor. "
+            "Falling through calls the COM teardown the guard just refused.")
+
+    def test_check_reconnection_also_skips(self, rb_source: str):
+        """The Ready poll is the path that used to schedule attempt #2."""
+        match = re.search(
+            r"def _check_reconnection\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match, "could not locate _check_reconnection body"
+        body = match.group(1)
+        skip_pos = body.find("ACTION_SKIP_TEARDOWN_WAIT")
+        schedule_pos = body.find("self._schedule_reconnect()")
+        assert skip_pos != -1, (
+            "Issue #157: _check_reconnection must honour the skip decision "
+            "instead of always scheduling another teardown attempt.")
+        assert schedule_pos != -1
+        assert skip_pos < schedule_pos
+        assert "return" in body[skip_pos:schedule_pos]
+
+    def test_pre_session_ready_wait_is_not_hardcoded_3s(self, rb_source: str):
+        body = self._attempt_reconnect_body(rb_source)
+        assert "ready_wait_seconds(" in body, (
+            "Issue #157: the Ready poll delay must come from "
+            "ReconnectController.ready_wait_seconds so a pre-session "
+            "attempt waits until the open instead of failing at 3s.")
+        assert "root.after(3000, self._check_reconnection)" not in body, (
+            "Issue #157: hardcoded 3s Ready poll is what scheduled "
+            "LeaveMonitor ~2 min before the open.")
+
+
 # ---------------------------------------------------------------------------
 # Bug C — watchdog warn handler must not shortcut the ladder
 # ---------------------------------------------------------------------------
