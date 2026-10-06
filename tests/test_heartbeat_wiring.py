@@ -109,6 +109,11 @@ def _app(bot_dir: str):
         cancel_all=lambda *_a, **_k: None,
     )
     app._quote_ready_timer_id = None
+    # #158 adds ReconnectController. This branch does not have the class.
+    # Construct it when the name exists so a merge does not AttributeError
+    # on the wiring fake; otherwise leave it unset-as-None.
+    controller_cls = getattr(rb, "ReconnectController", None)
+    app._reconnect_controller = controller_cls() if controller_cls else None
     return app
 
 
@@ -260,6 +265,106 @@ def test_tick_rearms_after_a_failed_write(tmp_path, monkeypatch):
         _cleanup()
 
 
+def test_deploy_continues_when_write_raises_main_thread_error(
+        tmp_path, monkeypatch):
+    """start() re-raises MainThreadHeartbeatError; the deploy guard catches it."""
+    bot_dir = str(tmp_path / "bot")
+    _install_runner(monkeypatch, bot_dir)
+    notes = []
+
+    class FakeNotifier:
+        def __init__(self, *_a, **_k):
+            self.enabled = True
+
+        def bot_deployed(self, **_k):
+            return None
+
+        def notify(self, message):
+            notes.append(message)
+
+    monkeypatch.setattr(
+        "src.live.discord_notify.DiscordNotifier", FakeNotifier)
+
+    def boom(self, now=None):
+        raise hb.MainThreadHeartbeatError("off thread")
+
+    monkeypatch.setattr(hb.HeartbeatWriter, "write", boom)
+    app = _app(bot_dir)
+    warmups = []
+    app._start_live_warmup = lambda: warmups.append(True)
+    try:
+        ok = app._deploy_live_continue(
+            None, _Strategy, False, None, False, False, False,
+            None, "paper", "wirebot")
+        assert ok is True
+        assert warmups == [True]
+        assert app._heartbeat_active is False
+        assert hb._writer is None
+        assert len(notes) == 1
+        assert "P2" in notes[0]
+        assert "MainThreadHeartbeatError" in notes[0]
+    finally:
+        _cleanup()
+
+
+def test_first_write_failure_logs_p2_and_still_arms(tmp_path, monkeypatch):
+    """A PermissionError on the first write is visible and the tick still arms.
+
+    main_heartbeat's logger is not the bot log, so the P2 has to be raised
+    by _start_main_heartbeat from writer.initial_write_error.
+    """
+    bot_dir = str(tmp_path / "bot")
+    _install_runner(monkeypatch, bot_dir)
+    notes = []
+
+    class FakeNotifier:
+        def __init__(self, *_a, **_k):
+            self.enabled = True
+
+        def bot_deployed(self, **_k):
+            return None
+
+        def notify(self, message):
+            notes.append(message)
+
+    monkeypatch.setattr(
+        "src.live.discord_notify.DiscordNotifier", FakeNotifier)
+    calls = {"n": 0}
+    real = hb.HeartbeatWriter.write
+
+    def flaky(self, now=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("first write")
+        return real(self, now=now)
+
+    monkeypatch.setattr(hb.HeartbeatWriter, "write", flaky)
+    app = _app(bot_dir)
+    app._start_live_warmup = lambda: None
+    try:
+        ok = app._deploy_live_continue(
+            None, _Strategy, False, None, False, False, False,
+            None, "paper", "wirebot")
+        assert ok is True
+        assert app._heartbeat_active is True
+        assert len(app.root.pending) == 1
+        assert hb._writer is not None
+        assert isinstance(hb._writer.initial_write_error, PermissionError)
+        assert len(notes) == 1
+        assert "P2" in notes[0]
+        assert "PermissionError" in notes[0]
+        log_files = list((tmp_path / "bot").glob("debug_*.log"))
+        assert log_files
+        text = log_files[0].read_text(encoding="utf-8")
+        assert "start failed" in text
+        assert "PermissionError" in text
+        assert not os.path.isfile(os.path.join(bot_dir, "heartbeat.json"))
+        app.root.fire_one()
+        assert os.path.isfile(os.path.join(bot_dir, "heartbeat.json"))
+    finally:
+        _cleanup()
+
+
 def test_first_write_failure_still_arms_later_ticks(tmp_path, monkeypatch):
     bot_dir = str(tmp_path / "bot")
     os.makedirs(bot_dir, exist_ok=True)
@@ -344,6 +449,38 @@ def test_send_future_order_stamps_inflight(tmp_path, monkeypatch):
         _cleanup()
     assert ok is True
     assert seen.get("name") == "SendFutureOrderCLR"
+
+
+def test_check_reconnection_stamps_is_connected(tmp_path, monkeypatch):
+    """The reconnect probe wraps IsConnected. Unwrapping it leaves no stamp."""
+    bot_dir = str(tmp_path / "bot")
+    os.makedirs(bot_dir, exist_ok=True)
+    writer = hb.HeartbeatWriter(bot_dir)
+    writer.write()
+    hb._writer = writer
+    seen = {}
+
+    def is_connected():
+        data = json.loads(open(writer.path, encoding="utf-8").read())
+        inflight = data.get("inflight_com_call") or {}
+        seen["name"] = inflight.get("name")
+        return 0
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(
+        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
+    app = _app(bot_dir)
+    app._quote_connected = False
+    app._conn_monitor = SimpleNamespace(attempt=1)
+    scheduled = []
+    app._schedule_reconnect = lambda: scheduled.append(True)
+    try:
+        app._check_reconnection()
+    finally:
+        hb._writer = None
+        _cleanup()
+    assert seen.get("name") == "IsConnected"
+    assert scheduled == [True]
 
 
 def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):

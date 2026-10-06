@@ -9021,22 +9021,33 @@ class BacktestApp:
             if _discord is not None and _discord.enabled:
                 _discord.notify(message)
 
-        # An unwritable bot dir must not abort deploy after the lock is
-        # held and the button already says Stop. The stamps are optional.
-        try:
-            start(runner.bot_dir, alert_fn=_alert)
-        except Exception as e:
-            _log(f"[HEARTBEAT] start failed: [{type(e).__name__}] {e}")
+        def _p2_start_failed(exc: BaseException) -> None:
+            # Python logging in main_heartbeat is not wired to the bot
+            # log. This is the path Discord and the debug file can see.
+            _log(f"[HEARTBEAT] start failed: [{type(exc).__name__}] {exc}")
             if _discord is not None and _discord.enabled:
                 try:
                     _discord.notify(
                         f"⚠️ **P2** heartbeat.json could not be started: "
-                        f"[{type(e).__name__}] {e}. Deploy continues."
+                        f"[{type(exc).__name__}] {exc}. Deploy continues."
                     )
                 except Exception as notify_err:
                     _log(f"[HEARTBEAT] P2 notify failed: "
                          f"[{type(notify_err).__name__}] {notify_err}")
+
+        # An unwritable bot dir must not abort deploy after the lock is
+        # held and the button already says Stop. The stamps are optional.
+        # MainThreadHeartbeatError is re-raised by start() and lands here.
+        # A first-write OSError is returned on the writer: log the P2 and
+        # still arm the tick so a later tick retries.
+        try:
+            writer = start(runner.bot_dir, alert_fn=_alert)
+        except Exception as e:
+            _p2_start_failed(e)
             return
+        err = getattr(writer, "initial_write_error", None)
+        if err is not None:
+            _p2_start_failed(err)
         self._heartbeat_active = True
         self._arm_heartbeat_tick()
 

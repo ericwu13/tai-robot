@@ -380,6 +380,7 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
 
         hb_path = os.path.join(bot_dir, HEARTBEAT_FILENAME)
         hb_file_missing = not os.path.isfile(hb_path)
+        raw_hb = None
         if hb_file_missing:
             hb_state, hb_detail = "UNKNOWN", {}
         else:
@@ -389,6 +390,20 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
             else:
                 hb_state, hb_detail = classify_heartbeat(
                     now, raw_hb, pid_alive_fn, pid, has_lock=has_lock)
+        # A missing heartbeat.json is UNKNOWN, and discover_bot_dirs lists
+        # every dir that has session.json. The frozen-log P1 is only for a
+        # process that is actually alive: the lock owner when a lock exists,
+        # otherwise the heartbeat PID. A stopped bot (no lock, no readable
+        # heartbeat) and a dead lock must not page on every in-session run.
+        if has_lock:
+            proc_alive = alive
+        elif isinstance(raw_hb, dict):
+            try:
+                proc_alive = bool(pid_alive_fn(int(raw_hb.get("pid"))))
+            except (TypeError, ValueError):
+                proc_alive = False
+        else:
+            proc_alive = False
         lines.append(_format_heartbeat(hb_state, hb_detail))
 
         logs = newest_debug_logs(bot_dir, 1)
@@ -404,10 +419,12 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
                 lines.append(f"  log: {os.path.basename(log_path)} last line "
                              f"{ts.strftime('%Y-%m-%d %H:%M:%S')} TPE ({mins:.0f} min ago)")
                 # UNKNOWN covers a missing file, a corrupt file, a PID
-                # mismatch, and a missing lock. All of those still need
-                # the legacy frozen-log P1 — a hung-but-alive HUNG grade
-                # is separate and is not double-counted here.
-                if (hb_state == "UNKNOWN" and session is not None
+                # mismatch, and a missing lock. The frozen-log P1 still
+                # needs a live process (proc_alive). A plain ``alive``
+                # check would drop the missing-lock case, whose only PID
+                # is inside the heartbeat. HUNG is not double-counted.
+                if (hb_state == "UNKNOWN" and proc_alive
+                        and session is not None
                         and mins > STALE_LOG_MINUTES):
                     findings.append(Finding(
                         "P1", "bots",

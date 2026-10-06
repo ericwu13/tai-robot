@@ -971,6 +971,53 @@ def test_bots_missing_lock_frozen_log_is_p1(tmp_path):
     assert _frozen_log_p1(findings), messages(findings)
 
 
+# Thu 2026-10-08 10:00 TPE is inside the DAY session (08:45–13:45).
+_THU_DAY = datetime(2026, 10, 8, 10, 0, tzinfo=TZ_TPE)
+
+
+@pytest.mark.parametrize("log_date,log_time", [
+    ("20261007", "10:00:00"),  # 1 day old
+    ("20261008", "09:30:00"),  # 30 min old
+])
+def test_bots_stopped_no_lock_no_heartbeat_stale_log_is_not_p1(
+        tmp_path, log_date, log_time):
+    """A cleanly stopped dir (session.json, no lock, no heartbeat) is quiet.
+
+    discover_bot_dirs lists it. A missing heartbeat is UNKNOWN. That must
+    not page 'debug log frozen mid-session' on every in-session run.
+    """
+    bot = make_live_bot(
+        tmp_path, pid=4242, log_date=log_date, log_time=log_time,
+        name="stopped")
+    (bot / ".lock").unlink()
+    assert not (bot / "heartbeat.json").exists()
+    findings, _lines = check_bots(
+        _THU_DAY, str(tmp_path / "live"), pid_alive_fn=lambda pid: True)
+    assert not _frozen_log_p1(findings), messages(findings)
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+    assert any("no .lock" in m for m in messages(findings, "P3")), messages(findings)
+
+
+def test_bots_abandoned_dead_lock_is_p3_only(tmp_path):
+    """A dead-PID lock older than the crash window is archaeology, not a hang.
+
+    File mtimes count as last activity, so the markers are backdated with
+    the log line. A recent mtime would grade a crash P1 instead.
+    """
+    bot = make_live_bot(
+        tmp_path, pid=99999, log_date="20261001", log_time="10:00:00",
+        name="abandoned")
+    old = (_THU_DAY - timedelta(days=7)).timestamp()
+    os.utime(bot / ".lock", (old, old))
+    os.utime(bot / "session.json", (old, old))
+    findings, lines = check_bots(
+        _THU_DAY, str(tmp_path / "live"), pid_alive_fn=lambda pid: False)
+    assert "heartbeat: UNKNOWN" in _hb_line(lines)
+    assert any("abandoned" in m for m in messages(findings, "P3")), messages(findings)
+    assert not _frozen_log_p1(findings), messages(findings)
+    assert not has_level(findings, "P1"), messages(findings, "P1")
+
+
 @pytest.mark.parametrize("moment", [
     datetime(2026, 10, 9, 9, 0, tzinfo=TZ_TPE),
     datetime(2026, 10, 9, 14, 50, tzinfo=TZ_TPE),

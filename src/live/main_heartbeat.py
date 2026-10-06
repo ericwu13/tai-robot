@@ -99,6 +99,9 @@ class HeartbeatWriter:
     def __init__(self, bot_dir: str):
         self.bot_dir = bot_dir
         self._inflight: dict | None = None
+        # Set by start() when the first write fails for a reason other
+        # than MainThreadHeartbeatError. The writer is still installed.
+        self.initial_write_error: BaseException | None = None
 
     @property
     def path(self) -> str:
@@ -411,15 +414,23 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
 
     Must run on the Tk main thread (the first write asserts it). Calling
     ``start`` again retargets the same watchdog thread — it does not spawn
-    a second one and it does not restart the process. A failed first write
-    still installs the writer so a later tick can retry.
+    a second one and it does not restart the process.
+
+    ``MainThreadHeartbeatError`` propagates and the writer is not
+    installed. The caller's guard in ``_start_main_heartbeat`` still
+    keeps deploy going. Any other first-write failure is stored on
+    ``writer.initial_write_error``; the writer is still installed so a
+    later tick can retry.
     """
     global _writer, _watchdog
     _rotate_hang_artifacts(bot_dir)
     writer = HeartbeatWriter(bot_dir)
     try:
         writer.write()
-    except Exception:
+    except MainThreadHeartbeatError:
+        raise
+    except Exception as exc:
+        writer.initial_write_error = exc
         logger.exception(
             "heartbeat initial write failed; later ticks will retry")
     with _guard:

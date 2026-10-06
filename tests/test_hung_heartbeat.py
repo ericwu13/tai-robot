@@ -406,6 +406,57 @@ def test_foreign_pid_heartbeat_while_running_does_not_alert(tmp_path):
     assert not (tmp_path / "hang_stacks.txt").exists()
 
 
+def test_stop_then_start_reenables_watchdog_and_alerts(tmp_path):
+    """configure() must set _enabled again. A second start after stop alerts.
+
+    Removing ``self._enabled = True`` from configure() leaves the thread
+    parked and this hang produces no alert.
+    """
+    alerts = []
+    bot = str(tmp_path)
+    hb.start(bot, alert_fn=alerts.append, hung_s=0.25, poll_s=0.05)
+    try:
+        hb.stop()
+        assert hb._watchdog is not None and hb._watchdog._enabled is False
+        hb.start(bot, alert_fn=alerts.append, hung_s=0.25, poll_s=0.05)
+        assert hb._watchdog._enabled is True
+        alerts.clear()
+        # start() just wrote a fresh ts. Overwrite with an older ts and
+        # the same pid. The first sight baselines the stall at 0; after
+        # hung_s of an unchanged ts the watchdog alerts.
+        stale = {
+            "ts": time.time() - 10_000,
+            "pid": os.getpid(),
+            "inflight_com_call": None,
+        }
+        (tmp_path / "heartbeat.json").write_text(
+            json.dumps(stale), encoding="utf-8")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not alerts:
+            time.sleep(0.05)
+        assert alerts, "watchdog stayed idle after configure()/start()"
+    finally:
+        hb.stop()
+        if hb._watchdog is not None:
+            hb._watchdog.disable()
+
+
+def test_start_reraises_main_thread_heartbeat_error(tmp_path, monkeypatch):
+    """A refused off-thread write must not be swallowed or install a writer."""
+    def boom(self, now=None):
+        raise MainThreadHeartbeatError("off thread")
+
+    monkeypatch.setattr(HeartbeatWriter, "write", boom)
+    try:
+        with pytest.raises(MainThreadHeartbeatError):
+            hb.start(str(tmp_path))
+        assert hb._writer is None
+    finally:
+        hb.stop()
+        if hb._watchdog is not None:
+            hb._watchdog.disable()
+
+
 def test_start_rotates_hang_artifacts(tmp_path):
     (tmp_path / "hang.json").write_text("old-hang", encoding="utf-8")
     (tmp_path / "hang_stacks.txt").write_text("old-stacks", encoding="utf-8")
