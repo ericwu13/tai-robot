@@ -1599,8 +1599,7 @@ class BacktestApp:
 
             # Poll for connection (OnConnection callback will set _quote_connected).
             # Same slot as the reconnect and skip timers.
-            self._arm_reconnect_callback(
-                "ready", wait_s * 1000, self._check_reconnection)
+            self._arm_reconnect_callback("ready", wait_s * 1000, self._check_reconnection)
 
         except Exception as e:
             _log(f"重連異常 Reconnect error: {e}")

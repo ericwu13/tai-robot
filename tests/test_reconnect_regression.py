@@ -356,8 +356,7 @@ class TestIssue157_Amendments:
             re.DOTALL,
         )
         assert attempt
-        assert '_arm_reconnect_callback(\n                    "ready"' in attempt.group(1) \
-            or '_arm_reconnect_callback(\n                "ready"' in attempt.group(1)
+        assert '_arm_reconnect_callback("ready"' in attempt.group(1)
         defer = re.search(
             r"def _defer_half_up_teardown\(self, decision, attempt_n: int\) -> None:(.*?)\n    def ",
             rb_source,
