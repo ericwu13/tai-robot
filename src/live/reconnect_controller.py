@@ -80,10 +80,14 @@ CALENDAR_DEGRADED_P1 = (
     "automatically — press Reconnect to confirm"
 )
 # Consecutive clean lookups before a degraded episode is over.
-# 40 × the 15s half-up poll is about 10 minutes. One good lookup does
-# not re-arm the P1 or the fallback WARN. Ready, a clean disconnect,
-# and ReconnectController.reset() re-arm immediately. A full drop
-# (IsConnected()==0) does not, while the calendar is still degraded.
+# 40 × the 15s half-up poll is about 10 minutes, and that figure is
+# approximate: seconds_since_session_open also runs from
+# _schedule_reconnect and from a manual Reconnect press, so one
+# cycle can count more than one lookup. One good lookup does not
+# re-arm the P1 or the fallback WARN. Ready, a clean disconnect,
+# and ReconnectController.reset() end the episode immediately.
+# A full drop (IsConnected()==0) does not. It tears down and logs
+# in on the normal backoff, and it sends no degraded-calendar P1.
 CALENDAR_RECOVERY_POLLS = 40
 # Yes, but the handshake moved while the dialog was open.
 HALF_UP_YES_STALE_LOG = (
@@ -282,12 +286,16 @@ def reset_session_clock_warnings() -> None:
 
 
 # A holiday or session lookup raised during the reconnect decision.
-# Stays set until CALENDAR_RECOVERY_POLLS clean lookups in a row.
-# The automatic half-up path does not LeaveMonitor while this is set.
+# Stays set until CALENDAR_RECOVERY_POLLS clean lookups in a row, or
+# until Ready, a clean disconnect, or reset ends the episode. The
+# automatic path does not LeaveMonitor a half-up session
+# (IsConnected()==2 or a failed probe) while this is set.
+# IsConnected()==0 still tears down.
 _calendar_degraded: bool = False
-# One P1 per degraded episode. Re-armed on Ready, a clean disconnect,
-# reset, or after the recovery streak. Not on a single good lookup,
-# and not on IsConnected()==0 while the calendar is still degraded.
+# One P1 per degraded episode. Cleared when the episode ends (Ready,
+# a clean disconnect, reset, or the recovery streak). Not on a single
+# good lookup, and not on IsConnected()==0 while the calendar is
+# still degraded.
 _calendar_degraded_p1_sent: bool = False
 _pending_calendar_degraded_p1: str | None = None
 _calendar_clean_streak: int = 0
@@ -309,10 +317,12 @@ def note_calendar_recovered() -> None:
     """Count one clean lookup. The episode ends only after the streak.
 
     ``CALENDAR_RECOVERY_POLLS`` consecutive successes (about 10 minutes
-    at the 15s poll) clear the degraded flag, re-arm the P1, and clear
-    the fallback-WARN latch. One good lookup between failures does
-    none of those. Ready, a clean disconnect, and ``reset`` re-arm the
-    P1 immediately via ``rearm_calendar_degraded_p1``.
+    at the 15s poll, less when ``_schedule_reconnect`` or a manual
+    press also looks the clock up) clear the degraded flag, re-arm
+    the P1, and clear the fallback-WARN latch. One good lookup between
+    failures does none of those. Ready, a clean disconnect, and
+    ``reset`` end the episode immediately via
+    ``end_calendar_degraded_episode``.
     """
     global _calendar_degraded, _calendar_degraded_p1_sent, _calendar_clean_streak
     _calendar_clean_streak += 1
@@ -324,13 +334,21 @@ def note_calendar_recovered() -> None:
     _clear_clock_warning("fallback")
 
 
-def rearm_calendar_degraded_p1() -> None:
-    """Ready, a clean disconnect, or reset. A new episode may alert once.
+def end_calendar_degraded_episode() -> None:
+    """Ready, a clean disconnect, or reset. The next lookup starts clean.
 
-    A full drop does not call this while the calendar is still degraded.
+    Clears the degraded flag, the recovery streak, the P1 latch, and
+    the fallback WARN latch. A later failing lookup can degrade the
+    new episode and send one P1. A full drop does not call this, so a
+    0/2 flap keeps the one P1 of the episode that is still open.
     """
-    global _calendar_degraded_p1_sent
+    global _calendar_degraded, _calendar_degraded_p1_sent, _calendar_clean_streak
+    global _pending_calendar_degraded_p1
+    _calendar_degraded = False
     _calendar_degraded_p1_sent = False
+    _calendar_clean_streak = 0
+    _pending_calendar_degraded_p1 = None
+    _clear_clock_warning("fallback")
 
 
 def headless_half_up_refusal_phrase() -> str:
@@ -616,7 +634,7 @@ class ReconnectController:
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
         self._post_forced_skips = 0
-        rearm_calendar_degraded_p1()
+        end_calendar_degraded_episode()
 
     @property
     def previous_attempt_missed_ready(self) -> bool:
@@ -638,7 +656,7 @@ class ReconnectController:
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
         self._post_forced_skips = 0
-        rearm_calendar_degraded_p1()
+        end_calendar_degraded_episode()
 
     def on_attempt_failed(self) -> None:
         """The Ready wait ended without Ready.
@@ -664,7 +682,7 @@ class ReconnectController:
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
         self._post_forced_skips = 0
-        rearm_calendar_degraded_p1()
+        end_calendar_degraded_episode()
 
     def on_operator_reconnect(self) -> None:
         """The operator pressed Reconnect and a teardown will run.
@@ -758,6 +776,13 @@ class ReconnectController:
         (``IsConnected()==0``) and the first attempt after a clean 3033
         still tear down — those are not the half-up state.
 
+        A fully down session tears down and logs in on the normal
+        backoff even when the calendar is degraded, and that path
+        sends no degraded-calendar P1. While the calendar is degraded,
+        only ``IsConnected()==2`` or a failed probe keeps skipping
+        past open+90. Ready, a clean disconnect, and ``reset()`` end
+        that episode. A full drop does not.
+
         ``IsConnected()==0`` also clears the post-forced skip count. A
         session that fully drops inside this disconnect is not the
         half-up loop those skips were counting. A failed probe (None)
@@ -784,18 +809,24 @@ class ReconnectController:
             )
 
         half_up = self._half_up()
-        # Degraded and still half-up: never LeaveMonitor, including a
-        # full drop. The weekend clock being past open+90 does not
-        # make that teardown safe. The "press Reconnect" P1 is only
-        # queued once that clock is at open+90; a closed Saturday or
-        # overnight would be asking for a risky Yes.
-        if half_up and calendar_degraded() and is_connected != IS_CONNECTED:
+        # Degraded calendar: hold LeaveMonitor only while the session
+        # is still half-up (IsConnected()==2) or the probe failed.
+        # IsConnected()==0 is fully down. It tears down and logs in
+        # on the normal backoff below, and it does not queue the P1.
+        # The "press Reconnect" P1 is only queued once the weekend
+        # clock is at open+90; a closed Saturday or overnight would
+        # be asking for a risky Yes.
+        if (
+            half_up
+            and calendar_degraded()
+            and (is_connected == IS_CONNECTING or is_connected is None)
+        ):
             if seconds_since_open >= self.HALF_UP_HOLD_S:
                 queue_calendar_degraded_p1()
             why = (
                 "IsConnected() probe failed"
                 if is_connected is None
-                else f"IsConnected()=={is_connected}"
+                else "IsConnected()==2 (connecting)"
             )
             return ReconnectGuardDecision(
                 action=ACTION_SKIP_TEARDOWN_WAIT,

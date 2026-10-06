@@ -1382,12 +1382,15 @@ def test_flapping_calendar_one_p1_and_no_leave(monkeypatch, capsys):
 
 
 def test_connection_flap_one_p1_over_simulated_hour(monkeypatch, capsys):
-    """IsConnected 0/2 for a simulated hour. One P1, no automatic LeaveMonitor.
+    """IsConnected 0/2 for a simulated hour. At most one degraded P1.
 
-    Time advances by the delay production actually arms: the 15s skip
-    while the teardown is withheld, or the ConnectionMonitor backoff
-    ladder when a retry is scheduled. A drop does not re-arm the P1.
+    A 0 poll tears down and logs in on the normal backoff. A 2 poll,
+    while the calendar is still degraded and Ready never arrived, still
+    skips LeaveMonitor. A drop does not re-arm the P1, so the hour
+    stays at one.
     """
+    from types import SimpleNamespace
+
     import run_backtest as rb
     from src.live.connection_monitor import ConnectionMonitor
     from src.live.reconnect_controller import (
@@ -1399,7 +1402,23 @@ def test_connection_flap_one_p1_over_simulated_hour(monkeypatch, capsys):
     state = {"fail": True, "ic": 0}
     rb_mod, app, _ctrl, discord, leaves = _degraded_friday_app(
         monkeypatch, when, failure="holiday")
-    _replace_probe(monkeypatch, rb_mod, leaves, state)
+
+    class _Quote:
+        def SKQuoteLib_IsConnected(self):
+            return state["ic"]
+
+        def SKQuoteLib_LeaveMonitor(self):
+            # Only a fully down poll may tear the session down.
+            leaves.append(state["ic"])
+            return 0
+
+    def boom(d):
+        raise RuntimeError("holiday lookup failed")
+
+    monkeypatch.setattr("src.market_data.holidays.is_taifex_holiday", boom)
+    monkeypatch.setattr(rb_mod, "skQ", _Quote())
+    app._live_runner = SimpleNamespace(bot_name="bot-0422")
+    app._live_log_msg = lambda *args, **kwargs: None
     app._schedule_reconnect = (
         lambda: rb_mod.BacktestApp._schedule_reconnect(app))
     allowed_ms = {ReconnectController.CONNECTING_WAIT_S * 1000}
@@ -1417,9 +1436,67 @@ def test_connection_flap_one_p1_over_simulated_hour(monkeypatch, capsys):
         assert delay_ms in allowed_ms
         elapsed += delay_ms / 1000
         state["ic"] = 2 if state["ic"] == 0 else 0
-    assert leaves == []
+    assert leaves
+    assert all(ic == 0 for ic in leaves)
     assert discord.messages.count(CALENDAR_DEGRADED_P1) == 1
     assert capsys.readouterr().out.count(CALENDAR_DEGRADED_P1) == 1
+
+
+def test_degraded_full_drop_uses_the_healthy_backoff(monkeypatch, capsys):
+    """IsConnected()==0 while degraded logs in like a healthy Friday.
+
+    Same LeaveMonitor, same first backoff, and no degraded P1. A half-up
+    reading on that Friday still withholds LeaveMonitor.
+    """
+    from types import SimpleNamespace
+
+    import run_backtest as rb
+    from src.live.connection_monitor import ConnectionMonitor
+    from src.live.reconnect_controller import CALENDAR_DEGRADED_P1
+
+    when = datetime(2026, 10, 9, 10, 0, tzinfo=_TPE)
+    healthy_delay = ConnectionMonitor.RECONNECT_DELAYS[0] * 1000
+
+    def _one(fail: bool) -> tuple[int, list, list]:
+        state = {"fail": fail, "ic": 0}
+        rb_mod, app, _ctrl, discord, leaves = _degraded_friday_app(
+            monkeypatch, when, failure="holiday")
+
+        def holiday(d):
+            if state["fail"]:
+                raise RuntimeError("holiday lookup failed")
+            return d.weekday() >= 5
+
+        class _Quote:
+            def SKQuoteLib_IsConnected(self):
+                return state["ic"]
+
+            def SKQuoteLib_LeaveMonitor(self):
+                leaves.append("leave")
+                return 0
+
+        monkeypatch.setattr(
+            "src.market_data.holidays.is_taifex_holiday", holiday)
+        monkeypatch.setattr(rb_mod, "skQ", _Quote())
+        app._live_runner = SimpleNamespace(bot_name="bot-0422")
+        app._live_log_msg = lambda *args, **kwargs: None
+        app._schedule_reconnect = (
+            lambda: rb_mod.BacktestApp._schedule_reconnect(app))
+        rb_mod.BacktestApp._attempt_reconnect(app)
+        assert len(app.root.pending) == 1
+        delay_ms = next(iter(app.root.pending.values()))[0]
+        return delay_ms, list(leaves), list(discord.messages)
+
+    degraded_delay, degraded_leaves, degraded_msgs = _one(True)
+    healthy_run_delay, healthy_leaves, healthy_msgs = _one(False)
+    assert degraded_delay == healthy_delay
+    assert healthy_run_delay == healthy_delay
+    assert degraded_delay == healthy_run_delay
+    assert degraded_leaves == ["leave"]
+    assert healthy_leaves == ["leave"]
+    assert CALENDAR_DEGRADED_P1 not in degraded_msgs
+    assert CALENDAR_DEGRADED_P1 not in healthy_msgs
+    assert CALENDAR_DEGRADED_P1 not in capsys.readouterr().out
 
 
 def test_skip_cap_alerts_discord_and_does_not_arm(monkeypatch, capsys):
