@@ -97,7 +97,7 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
@@ -112,7 +112,9 @@ from src.live.reconnect_controller import (
     FORCED_TEARDOWN_LOG,
     ReconnectController,
     ReconnectSchedule,
+    in_live_session,
     seconds_since_session_open,
+    seconds_until_next_session_open,
 )
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
@@ -1370,11 +1372,16 @@ class BacktestApp:
         self._attempt_reconnect()
 
     def _schedule_reconnect(self):
-        """Schedule the next reconnection attempt via ConnectionMonitor."""
+        """Schedule the next reconnection attempt via ConnectionMonitor.
+
+        The session flag and the seconds-until-open both come from the
+        holiday-aware helpers. A weekday TAIFEX holiday is closed even
+        though the weekend-only market clock says it is open.
+        """
         action = self._conn_monitor.schedule_next(
             has_live_runner=bool(self._live_runner),
-            market_open=is_market_open(),
-            secs_until_open=seconds_until_market_open(),
+            market_open=in_live_session(),
+            secs_until_open=seconds_until_next_session_open(),
         )
         self._execute_reconnect_action(action)
 
@@ -1547,13 +1554,11 @@ class BacktestApp:
             _log_debug(
                 f"[RECONNECT] ConnectByID returned {reply_code}, "
                 f"EnterMonitorLONG returned {enter_code}")
-            since_open = seconds_since_session_open()
-            wait_s = self._reconnect_controller.ready_wait_seconds(
-                seconds_since_open=since_open)
+            wait_s = self._reconnect_controller.ready_wait_seconds()
             self._reconnect_ready_wait_s = wait_s
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} waiting {wait_s}s for Ready (3003) "
-                f"(seconds_since_open={since_open})")
+                f"(seconds_since_open={seconds_since_session_open()})")
 
             # Poll for connection (OnConnection callback will set _quote_connected).
             # Same slot as the reconnect and skip timers.

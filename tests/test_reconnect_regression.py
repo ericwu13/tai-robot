@@ -220,21 +220,39 @@ class TestIssue157_GuardBeforeLeaveMonitor:
         assert skip_pos < schedule_pos
         assert "return" in body[skip_pos:schedule_pos]
 
-    def test_pre_session_ready_wait_is_not_hardcoded_3s(self, rb_source: str):
+    def test_ready_wait_is_the_short_poll(self, rb_source: str):
+        """Open+90s is the skip loop, not a long Ready timer.
+
+        ``secs_until_open + 90`` was not used. A holiday gap can last
+        days, and one timer would not re-check IsConnected()==2.
+        """
         body = self._attempt_reconnect_body(rb_source)
-        assert "ready_wait_seconds(" in body, (
-            "Issue #157: the Ready poll delay must come from "
-            "ReconnectController.ready_wait_seconds so a pre-session "
-            "attempt waits until the open instead of failing at 3s.")
-        wait_pos = body.find("ready_wait_seconds(")
-        assert "seconds_since_open=" in body[wait_pos:wait_pos + 120], (
-            "Issue #157: the Ready wait uses the same open+90s clock as "
-            "decide(). The old secs_until_open+15 grace handed the first "
-            "poll off near open+15s.")
-        assert "market_open=" not in body[wait_pos:wait_pos + 120]
-        assert "root.after(3000, self._check_reconnection)" not in body, (
-            "Issue #157: hardcoded 3s Ready poll is what scheduled "
-            "LeaveMonitor ~2 min before the open.")
+        assert "ready_wait_seconds()" in body
+        assert "seconds_since_open=" not in body[
+            body.find("ready_wait_seconds()"):body.find("ready_wait_seconds()") + 80
+        ]
+        assert "root.after(3000, self._check_reconnection)" not in body
+
+    def test_schedule_uses_holiday_aware_session(self, rb_source: str):
+        match = re.search(
+            r"def _schedule_reconnect\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match
+        body = match.group(1)
+        assert "in_live_session(" in body
+        assert "seconds_until_next_session_open(" in body
+        assert "is_market_open(" not in body
+        assert "seconds_until_market_open(" not in body
+        attempt = self._attempt_reconnect_body(rb_source)
+        assert "is_market_open(" not in attempt
+        check = re.search(
+            r"def _check_reconnection\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert check and "is_market_open(" not in check.group(1)
 
 
 class TestIssue157_Amendments:

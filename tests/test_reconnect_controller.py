@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from src.live.connection_monitor import ConnectionMonitor
 from src.live.reconnect_controller import (
     ACTION_ALREADY_CONNECTED,
     ACTION_SKIP_TEARDOWN_WAIT,
@@ -22,8 +23,11 @@ from src.live.reconnect_controller import (
     ReconnectController,
     ReconnectSchedule,
     arm_single_timer,
+    in_live_session,
     seconds_since_session_open,
+    seconds_until_next_session_open,
 )
+from src.market_data.holidays import is_taifex_holiday
 
 # Before the open. The skip must not depend on this being negative.
 _BEFORE_OPEN = -120
@@ -172,38 +176,26 @@ class TestIssue157HalfUpHold:
 
 
 class TestIssue157ReadyWait:
-    """The Ready wait uses the same open+90s deadline as decide()."""
+    """The long pre-open Ready wait is dropped in favor of the skip polls.
 
-    def test_deferred_pre_open_wait_lands_on_open_plus_90(self):
-        ctrl = ReconnectController()
-        # ConnectionMonitor defers to about open−120s. From there the
-        # Ready poll must land on open+90, not open+15.
-        since = -120
-        wait = ctrl.ready_wait_seconds(seconds_since_open=since)
-        assert since + wait == ctrl.HALF_UP_HOLD_S
-        assert ctrl.HALF_UP_HOLD_S == 90
+    ``secs_until_open + 90`` as one timer would not re-check
+    ``IsConnected()==2``, and a holiday gap can last days. After
+    LoginSetQuote the Ready poll is 3s. If the session is still half-up,
+    ``decide`` skips and the 15s poll repeats until a real open+90s.
+    """
 
-    def test_open_plus_89_wait_does_not_fire_before_the_deadline(self):
-        """A 1s remainder is raised to the 3s floor, so the poll lands at or after open+90s."""
+    def test_ready_wait_is_the_short_poll(self):
         ctrl = ReconnectController()
-        wait = ctrl.ready_wait_seconds(seconds_since_open=89)
-        assert 89 + wait >= ctrl.HALF_UP_HOLD_S
+        assert ctrl.ready_wait_seconds() == ReconnectController.READY_WAIT_S
+        assert ctrl.READY_WAIT_S == 3
 
-    def test_pre_session_wait_is_capped(self):
-        ctrl = ReconnectController()
-        wait = ctrl.ready_wait_seconds(seconds_since_open=-10_000)
-        assert wait == ReconnectController.PRE_SESSION_WAIT_CAP_S
-        # The cap must still cover the normal open−120 deferral.
-        assert ctrl.PRE_SESSION_WAIT_CAP_S >= 120 + ctrl.HALF_UP_HOLD_S
-
-    def test_past_open_plus_90_wait_stays_three_seconds(self):
-        ctrl = ReconnectController()
-        assert ctrl.ready_wait_seconds(seconds_since_open=90) == (
-            ReconnectController.READY_WAIT_S
-        )
-        assert ctrl.ready_wait_seconds(seconds_since_open=91) == (
-            ReconnectController.READY_WAIT_S
-        )
+    def test_short_poll_still_skips_half_up_before_open_plus_90(self):
+        """A 3s Ready poll must not become a teardown while the hold remains."""
+        ctrl = _incident_controller()
+        for since in (-120, _OPEN_PLUS_15, 89):
+            decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+            assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+            assert decision.wait_seconds == ReconnectController.CONNECTING_WAIT_S
 
 
 class TestReset:
@@ -236,6 +228,54 @@ class TestSessionOpenClock:
         # Saturday 10:00 is closed until Monday 08:45.
         saturday = datetime(2026, 10, 10, 10, 0, 0, tzinfo=_TPE)
         assert seconds_since_session_open(saturday) < 0
+
+
+class TestWeekdayHolidayHalfUp:
+    """A weekday TAIFEX holiday is not an open.
+
+    ``is_market_open()`` only knows weekends, so 2026-09-25 10:00 looks
+    like a day session hours past open+90s. The half-up guard must still
+    skip, and the deferral must aim at the next real open.
+    """
+
+    def test_half_up_on_2026_09_25_skips_teardown(self):
+        when = datetime(2026, 9, 25, 10, 0, 0, tzinfo=_TPE)
+        assert when.weekday() < 5
+        assert is_taifex_holiday(when.date())
+        assert not in_live_session(when)
+        # Next session is Tue 2026-09-29 08:45 (Mon 09-28 is also closed).
+        expected_open = datetime(2026, 9, 29, 8, 45, tzinfo=_TPE)
+        since = seconds_since_session_open(when)
+        assert since == int((when - expected_open).total_seconds())
+        assert since < 0
+        ctrl = _incident_controller()
+        decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+        assert not decision.forced_teardown
+
+    def test_holiday_open_plus_91_wall_clock_still_skips(self):
+        """08:46:31 is open+91s on the weekend-only clock. Not on this day."""
+        when = datetime(2026, 9, 25, 8, 46, 31, tzinfo=_TPE)
+        since = seconds_since_session_open(when)
+        assert since < ReconnectController.HALF_UP_HOLD_S
+        ctrl = _incident_controller()
+        decision = ctrl.decide(IS_CONNECTING, seconds_since_open=since)
+        assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
+
+    def test_holiday_deferral_targets_the_next_real_open(self):
+        when = datetime(2026, 9, 25, 10, 0, 0, tzinfo=_TPE)
+        secs = seconds_until_next_session_open(when)
+        assert secs == -seconds_since_session_open(when)
+        assert secs > 120
+        monitor = ConnectionMonitor()
+        monitor.on_disconnected()
+        action = monitor.schedule_next(
+            has_live_runner=True,
+            market_open=in_live_session(when),
+            secs_until_open=secs,
+        )
+        assert action.type == "defer_to_market"
+        assert action.delay_seconds == max(secs - 120, 60)
 
 
 class TestSingleReconnectTimer:

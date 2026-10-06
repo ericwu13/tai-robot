@@ -6,15 +6,17 @@ before a fresh login.
 
 Calling LeaveMonitor on a half-up session (the previous attempt saw
 Quote/Reply but never Ready, and ``IsConnected()==2``) faults or hangs
-inside SKCOM/ntdll. The skip holds until open+90s whether or not the
-market is already open. After that, one forced teardown per disconnect
-is allowed.
+inside SKCOM/ntdll. That skip keys off the connection state. It lasts
+until 90s after a real TAIFEX session open — ``current_session`` /
+``is_taifex_holiday``, not the weekend-only ``is_market_open()`` clock.
+A weekday holiday has no open, so a half-up session keeps skipping.
+After a real open+90s, one forced teardown per disconnect is allowed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 # SKQuoteLib_IsConnected() codes used by the reconnect poll.
 IS_CONNECTED = 1
@@ -28,10 +30,6 @@ ACTION_ALREADY_CONNECTED = "already_connected"
 FORCED_TEARDOWN_LOG = "[RECONNECT] P1 forced teardown of half-up session"
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
-_AM_OPEN_S = 8 * 3600 + 45 * 60
-_AM_CLOSE_S = 13 * 3600 + 45 * 60
-_PM_OPEN_S = 15 * 3600
-_NIGHT_CLOSE_S = 5 * 3600
 
 
 @dataclass(frozen=True)
@@ -44,53 +42,85 @@ class ReconnectGuardDecision:
     forced_teardown: bool = False
 
 
-def seconds_since_session_open(now: datetime | None = None) -> int:
-    """Seconds relative to the session open the reconnect clock uses.
-
-    Negative before the next open (open−120s is −120). Zero at the open.
-    Positive afterwards, including the night session after midnight.
-    Weekend gaps count forward to Monday 08:45. Holidays are not special
-    here — that deferral is still the connection monitor's job.
-    """
+def _as_taipei(now: datetime | None) -> datetime:
     if now is None:
         from src.live.live_runner import _taipei_now
-        now = _taipei_now()
-    elif now.tzinfo is None:
-        now = now.replace(tzinfo=_TZ_TAIPEI)
-    else:
-        now = now.astimezone(_TZ_TAIPEI)
+        return _taipei_now()
+    if now.tzinfo is None:
+        return now.replace(tzinfo=_TZ_TAIPEI)
+    return now.astimezone(_TZ_TAIPEI)
 
-    sod = now.hour * 3600 + now.minute * 60 + now.second
-    weekday = now.weekday()  # Mon=0 .. Sun=6
 
-    def _until(target_sod: int, day_shift: int = 0) -> int:
-        return day_shift * 86400 + target_sod - sod
+def _is_closed_day(d: date) -> bool:
+    """True when TAIFEX has no session opening on ``d``.
 
-    # Saturday 00:00–05:00 is Friday's night session, open since 15:00.
-    if weekday == 5 and sod < _NIGHT_CLOSE_S:
-        return sod + 86400 - _PM_OPEN_S
+    Uses ``is_taifex_holiday`` (weekends, TW public holidays, overrides).
+    A missing holiday calendar degrades to weekends, matching
+    ``current_session``.
+    """
+    try:
+        from src.market_data.holidays import is_taifex_holiday
+        return is_taifex_holiday(d)
+    except Exception:
+        return d.weekday() >= 5
 
-    # Sunday, or Saturday after 05:00: next open is Monday 08:45.
-    if weekday == 6:
-        return -_until(_AM_OPEN_S, day_shift=1)
-    if weekday == 5:
-        return -_until(_AM_OPEN_S, day_shift=2)
 
-    # Monday 00:00–05:00 has no Sunday carryover.
-    if weekday == 0 and sod < _NIGHT_CLOSE_S:
-        return -_until(_AM_OPEN_S)
+def _next_session_open(now: datetime) -> datetime:
+    """Next DAY 08:45 or NIGHT 15:00 on a day that actually trades."""
+    for ahead in range(16):
+        day = now.date() + timedelta(days=ahead)
+        if _is_closed_day(day):
+            continue
+        for hour, minute in ((8, 45), (15, 0)):
+            open_dt = datetime(
+                day.year, day.month, day.day, hour, minute, tzinfo=_TZ_TAIPEI)
+            if open_dt > now:
+                return open_dt
+    day = now.date() + timedelta(days=1)
+    return datetime(day.year, day.month, day.day, 8, 45, tzinfo=_TZ_TAIPEI)
 
-    if _AM_OPEN_S <= sod < _AM_CLOSE_S:
-        return sod - _AM_OPEN_S
-    if sod >= _PM_OPEN_S:
-        return sod - _PM_OPEN_S
-    if sod < _NIGHT_CLOSE_S:
-        return sod + 86400 - _PM_OPEN_S
 
-    # 05:00–08:45 → today's 08:45. 13:45–15:00 → today's 15:00.
-    if sod < _AM_OPEN_S:
-        return -_until(_AM_OPEN_S)
-    return -_until(_PM_OPEN_S)
+def _live_session(now: datetime):
+    """``current_session`` for ``now``, or None if it cannot be resolved."""
+    try:
+        from src.regime.switch_logic import current_session
+        return current_session(now)
+    except Exception:
+        return None
+
+
+def seconds_since_session_open(now: datetime | None = None) -> int:
+    """Seconds relative to the real session open the reconnect clock uses.
+
+    Inside a session this is seconds since that session's open (night
+    included, keyed by ``current_session``). Outside a session it is
+    negative, counting to the next DAY 08:45 or NIGHT 15:00 on a day
+    ``is_taifex_holiday`` says actually trades. A weekday holiday is not
+    an open: the weekend-only clock would already be past open+90s at
+    10:00, and this one is still negative.
+    """
+    now = _as_taipei(now)
+    session = _live_session(now)
+    if session is not None:
+        return int((now - session.open_dt).total_seconds())
+    return int((now - _next_session_open(now)).total_seconds())
+
+
+def in_live_session(now: datetime | None = None) -> bool:
+    """True when a real TAIFEX session contains ``now``.
+
+    The reconnect deferral uses this. It does not call the weekend-only
+    market-open helper, which treats a weekday holiday as a normal session.
+    """
+    return _live_session(_as_taipei(now)) is not None
+
+
+def seconds_until_next_session_open(now: datetime | None = None) -> int:
+    """Seconds until the next real session open, or 0 when one is in progress."""
+    since = seconds_since_session_open(now)
+    if since >= 0:
+        return 0
+    return -since
 
 
 def arm_single_timer(current_id, delay_ms, callback, *, after, after_cancel):
@@ -152,24 +182,23 @@ class ReconnectController:
 
     The half-up latch is set when an attempt's Ready wait ends without
     3003. While that latch is set and ``IsConnected()==2``, LeaveMonitor
-    is skipped until open+90s — the market-open flag does not lift the
-    skip. After open+90s, one forced teardown is allowed per disconnect.
+    is skipped. The connection state is what blocks the teardown. The
+    clock only ends the hold, and only at 90s after a real session open.
+    After that, one forced teardown is allowed per disconnect.
     The caller records it with ``note_forced_teardown`` when it actually
     enters the LeaveMonitor path, so a poll that only inspects the
     decision does not consume the allowance.
     """
 
     READY_WAIT_S: int = 3
-    # Half-up LeaveMonitor stays refused until this many seconds after
-    # the session open, whether or not ``is_market_open()`` is already true.
+    # Half-up LeaveMonitor stays refused until this many seconds after a
+    # real session open. A weekday holiday never reaches this deadline.
     HALF_UP_HOLD_S: int = 90
     # Poll interval while we are deliberately not tearing a connecting
     # session down. The GUI schedules this with root.after — it does not
-    # block the Tk thread.
+    # block the Tk thread. This loop, not a long Ready timer, holds the
+    # pre-open gap (including multi-day holidays).
     CONNECTING_WAIT_S: int = 15
-    # Covers the ConnectionMonitor deferral (open−120s) plus the 90s hold.
-    # Longer gaps (a weekend) cap here; decide() still skips until open+90s.
-    PRE_SESSION_WAIT_CAP_S: int = 210
 
     def __init__(self) -> None:
         self._handshake_open: bool = False
@@ -254,14 +283,16 @@ class ReconnectController:
         """Choose the next COM action.
 
         ``is_connected`` is ``SKQuoteLib_IsConnected()``, or None when the
-        probe raised. ``seconds_since_open`` is negative before the open
-        and positive after it (see ``seconds_since_session_open``).
+        probe raised. ``seconds_since_open`` is negative before the next
+        real open and positive after it (see ``seconds_since_session_open``).
+        It must come from that holiday-aware clock. This method does not
+        consult a weekend-only market-open flag.
 
         Skip LeaveMonitor while the handshake is half-up
-        (no Ready 3003, ``IsConnected()==2`` or a failed probe) and
-        ``seconds_since_open`` is still under open+90s. That does not
-        depend on whether the market is open. After open+90s, one forced
-        teardown per disconnect is allowed. A down session
+        (no Ready 3003, ``IsConnected()==2`` or a failed probe) and the
+        real session is still under open+90s. On a weekday holiday that
+        clock stays negative, so the skip holds. After a real open+90s,
+        one forced teardown per disconnect is allowed. A down session
         (``IsConnected()==0``) and the first attempt after a clean 3033
         still tear down — those are not the half-up state.
         """
@@ -310,16 +341,13 @@ class ReconnectController:
             reason="LeaveMonitor then fresh login",
         )
 
-    def ready_wait_seconds(self, *, seconds_since_open: float) -> int:
+    def ready_wait_seconds(self) -> int:
         """How long to wait for Ready (3003) after LoginSetQuote.
 
-        Uses the same open+90s deadline as ``decide``. Before that instant
-        the wait is the time remaining (capped). At or after it, the
-        intra-session poll stays 3s. The wait is a ``root.after`` delay,
-        not a sleep on the Tk thread.
+        Always the short poll. The pre-open hold is the skip loop in
+        ``decide`` (every ``CONNECTING_WAIT_S``), not one timer of
+        ``secs_until_open + 90``. A holiday gap can last days; a single
+        long ``root.after`` would not re-check ``IsConnected()==2``.
+        The wait is a ``root.after`` delay, not a sleep on the Tk thread.
         """
-        if seconds_since_open >= self.HALF_UP_HOLD_S:
-            return self.READY_WAIT_S
-        remaining = int(self.HALF_UP_HOLD_S - seconds_since_open)
-        remaining = max(self.READY_WAIT_S, remaining)
-        return min(self.PRE_SESSION_WAIT_CAP_S, remaining)
+        return self.READY_WAIT_S
