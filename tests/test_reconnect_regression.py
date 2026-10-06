@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -41,6 +42,15 @@ RB_PATH = os.path.join(PROJECT_ROOT, "run_backtest.py")
 def rb_source() -> str:
     with open(RB_PATH, encoding="utf-8") as f:
         return f.read()
+
+
+@pytest.fixture(autouse=True)
+def _reset_reconnect_clock():
+    """Calendar degradation is process-wide. Keep it out of the next test."""
+    from src.live.reconnect_controller import reset_session_clock_warnings
+    reset_session_clock_warnings()
+    yield
+    reset_session_clock_warnings()
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +411,8 @@ def _behavior_app(ctrl):
         lambda message: rb.BacktestApp._raise_reconnect_alert(app, message))
     app._emit_session_clock_warnings = (
         lambda: rb.BacktestApp._emit_session_clock_warnings(app))
+    app._emit_calendar_degraded_p1 = (
+        lambda: rb.BacktestApp._emit_calendar_degraded_p1(app))
     app._reconnect_seconds_since_open = (
         lambda: rb.BacktestApp._reconnect_seconds_since_open(app))
     app._execute_reconnect_action = (
@@ -917,12 +929,126 @@ def test_ready_during_dialog_yes_does_not_tear_down(monkeypatch, capsys):
     assert HALF_UP_YES_STALE_LOG in capsys.readouterr().out
 
 
+def _assert_yes_dropped(app, discord, capsys):
+    """Yes was stale: no LeaveMonitor, the stale log line, and no forced P1."""
+    from src.live.reconnect_controller import (
+        HALF_UP_YES_STALE_LOG,
+        OPERATOR_FORCED_HALF_UP_P1,
+    )
+
+    assert app.events == []
+    assert app.quote_flips == []
+    assert "normal" in app.btn_states
+    out = capsys.readouterr().out
+    assert HALF_UP_YES_STALE_LOG in out
+    assert not any(OPERATOR_FORCED_HALF_UP_P1 in msg for msg in discord.messages)
+
+
+def test_yes_blocked_when_attempt_changes_during_dialog(monkeypatch, capsys):
+    """F5a: bumping the attempt counter during the dialog drops Yes."""
+    import run_backtest as rb
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    _rb, app, ctrl, state = _mutable_half_up(monkeypatch, since=80)
+    assert app._conn_monitor.attempt == 0
+
+    def confirm(message, *, default):
+        app._conn_monitor.schedule_next(
+            has_live_runner=False, market_open=True, secs_until_open=0)
+        assert app._conn_monitor.attempt == 1
+        assert state["ic"] == 2
+        return True
+
+    app._half_up_confirm_fn = confirm
+    rb.BacktestApp._manual_reconnect(app)
+    _assert_yes_dropped(app, discord, capsys)
+    assert ctrl.forced_teardown_used
+
+
+def test_yes_blocked_when_allowance_flips_during_dialog(monkeypatch, capsys):
+    """F5b: flipping forced_teardown_used during the dialog drops Yes."""
+    import run_backtest as rb
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    _rb, app, ctrl, _state = _mutable_half_up(
+        monkeypatch, since=80, allowance_used=False)
+    assert ctrl.forced_teardown_used is False
+
+    def confirm(message, *, default):
+        ctrl.note_forced_teardown()
+        assert ctrl.forced_teardown_used
+        return True
+
+    app._half_up_confirm_fn = confirm
+    rb.BacktestApp._manual_reconnect(app)
+    _assert_yes_dropped(app, discord, capsys)
+    assert ctrl.forced_teardown_used
+
+
+def test_yes_blocked_when_handshake_opens_during_dialog(monkeypatch, capsys):
+    """F5c: an in-flight handshake opened during the dialog drops Yes."""
+    import run_backtest as rb
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    _rb, app, ctrl, state = _mutable_half_up(monkeypatch, since=80)
+    assert ctrl.handshake_open is False
+
+    def confirm(message, *, default):
+        ctrl.on_attempt_started()
+        assert ctrl.handshake_open
+        assert ctrl.is_half_up()
+        assert state["ic"] == 2
+        return True
+
+    app._half_up_confirm_fn = confirm
+    rb.BacktestApp._manual_reconnect(app)
+    _assert_yes_dropped(app, discord, capsys)
+
+
+def test_yes_blocked_when_ready_clears_half_up_during_dialog(monkeypatch, capsys):
+    """F5e: Ready during the dialog drops Yes even if IsConnected stays 2.
+
+    IsConnected()==1 is already refused by the probe check. This is the
+    half-up latch itself going false, which that probe check does not see.
+    """
+    import run_backtest as rb
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    _rb, app, ctrl, state = _mutable_half_up(
+        monkeypatch, since=80, allowance_used=False)
+
+    def confirm(message, *, default):
+        assert state["ic"] == 2
+        ctrl.on_ready()
+        assert not ctrl.is_half_up()
+        assert not ctrl.handshake_open
+        assert ctrl.forced_teardown_used is False
+        return True
+
+    app._half_up_confirm_fn = confirm
+    rb.BacktestApp._manual_reconnect(app)
+    _assert_yes_dropped(app, discord, capsys)
+    assert state["ic"] == 2
+
+
 def test_half_up_tclerror_refuses_like_headless(monkeypatch, capsys):
-    """A dialog that raises TclError does not call the broker."""
+    """A dialog that raises TclError does not call the broker.
+
+    No dialog was shown, so the log is the TclError refusal, not an
+    operator decline. The headless-style P1 is still sent.
+    """
     import tkinter as tk
 
     import run_backtest as rb
-    from src.live.reconnect_controller import HEADLESS_HALF_UP_REFUSED_P1
+    from src.live.reconnect_controller import (
+        HALF_UP_CONFIRM_UNAVAILABLE_LOG,
+        HEADLESS_HALF_UP_REFUSED_P1,
+        OPERATOR_DECLINED_HALF_UP_LOG,
+    )
 
     discord = _Discord()
     monkeypatch.setattr(rb, "_discord", discord)
@@ -949,6 +1075,8 @@ def test_half_up_tclerror_refuses_like_headless(monkeypatch, capsys):
     assert "normal" in app.btn_states
     out = capsys.readouterr().out
     assert HEADLESS_HALF_UP_REFUSED_P1 in out
+    assert HALF_UP_CONFIRM_UNAVAILABLE_LOG in out
+    assert OPERATOR_DECLINED_HALF_UP_LOG not in out
 
 
 def test_tk_half_up_confirm_defaults_to_no(monkeypatch):
@@ -981,6 +1109,7 @@ def test_holiday_call_raise_skips_and_warns_while_closed(monkeypatch, capsys):
 
     import run_backtest as rb
     from src.live.reconnect_controller import (
+        CALENDAR_DEGRADED_P1,
         CLOCK_FALLBACK_WARN,
         ReconnectController,
         reset_session_clock_warnings,
@@ -1018,53 +1147,58 @@ def test_holiday_call_raise_skips_and_warns_while_closed(monkeypatch, capsys):
         app = _behavior_app(ctrl)
         rb.BacktestApp._attempt_reconnect(app)
         assert leaves == []
-        assert discord.messages == [CLOCK_FALLBACK_WARN]
+        assert CLOCK_FALLBACK_WARN in discord.messages
+        assert discord.messages.count(CALENDAR_DEGRADED_P1) == 1
         assert any(item and item[0] == "skip" for item in app.armed), app.armed
         out = capsys.readouterr().out
         warn_lines = [line for line in out.splitlines() if CLOCK_FALLBACK_WARN in line]
         assert warn_lines
         assert all("[DEBUG]" not in line for line in warn_lines)
+        assert out.count(CALENDAR_DEGRADED_P1) == 1
         app.armed.clear()
 
 
-def test_lookup_failure_warns_and_reaches_forced_teardown(monkeypatch, capsys):
-    """current_session raises at 10:00 on a trading day.
+_TPE = timezone(timedelta(hours=8))
+_DEGRADED_FRIDAYS = (
+    datetime(2026, 10, 9, 10, 0, tzinfo=_TPE),
+    datetime(2027, 1, 1, 10, 0, tzinfo=_TPE),
+)
 
-    The weekend-only clock is used (75 minutes after 08:45, not −18000).
-    One forced teardown runs, the WARN reaches _log and Discord, and the
-    post-forced skip cap is then reached.
-    """
+
+def _degraded_friday_app(monkeypatch, when, *, failure):
+    """Half-up app whose holiday or session lookup raises at ``when``."""
     import run_backtest as rb
     from src.live.reconnect_controller import (
-        ACTION_SKIP_TEARDOWN_WAIT,
-        CLOCK_FALLBACK_WARN,
-        ESCALATION_LOG,
-        FORCED_TEARDOWN_LOG,
         ReconnectController,
         reset_session_clock_warnings,
     )
 
-    def boom(now=None):
-        raise RuntimeError("session lookup failed")
-
     reset_session_clock_warnings()
-    monkeypatch.setattr("src.regime.switch_logic.current_session", boom)
+    if failure == "holiday":
+        def boom_holiday(d):
+            raise RuntimeError("holiday lookup failed")
+
+        monkeypatch.setattr(
+            "src.market_data.holidays.is_taifex_holiday", boom_holiday)
+    else:
+        def boom_session(now=None):
+            raise RuntimeError("session lookup failed")
+
+        monkeypatch.setattr(
+            "src.regime.switch_logic.current_session", boom_session)
     monkeypatch.setattr(
-        "src.live.live_runner._taipei_now",
-        lambda: __import__("datetime").datetime(
-            2026, 10, 6, 10, 0, 0,
-            tzinfo=__import__("datetime").timezone(
-                __import__("datetime").timedelta(hours=8))),
-    )
+        "src.live.live_runner._taipei_now", lambda when=when: when)
     discord = _Discord()
     monkeypatch.setattr(rb, "_discord", discord)
     monkeypatch.setattr(rb, "_com_available", True)
+    leaves = []
 
     class _Quote:
         def SKQuoteLib_IsConnected(self):
             return 2
 
         def SKQuoteLib_LeaveMonitor(self):
+            leaves.append("leave")
             return 0
 
     class _Center:
@@ -1076,44 +1210,101 @@ def test_lookup_failure_warns_and_reaches_forced_teardown(monkeypatch, capsys):
 
     monkeypatch.setattr(rb, "skQ", _Quote())
     monkeypatch.setattr(rb, "skC", _Center())
-
     ctrl = ReconnectController()
     ctrl.on_clean_disconnect()
     ctrl.on_attempt_started()
     ctrl.on_attempt_failed()
-    seen = {}
-    real_decide = ctrl.decide
-
-    def decide(is_connected, *, seconds_since_open, manual=False):
-        seen["since"] = seconds_since_open
-        seen["manual"] = manual
-        return real_decide(
-            is_connected, seconds_since_open=seconds_since_open, manual=manual)
-
-    ctrl.decide = decide
     app = _behavior_app(ctrl)
-    rb.BacktestApp._attempt_reconnect(app)
-    assert seen["since"] == 75 * 60
-    assert seen["manual"] is False
-    assert ctrl.forced_teardown_used
-    assert CLOCK_FALLBACK_WARN in discord.messages
-    assert FORCED_TEARDOWN_LOG in discord.messages
-    out = capsys.readouterr().out
-    warn_lines = [line for line in out.splitlines() if CLOCK_FALLBACK_WARN in line]
-    assert warn_lines
-    assert all("[DEBUG]" not in line for line in warn_lines)
+    app._arm_reconnect_callback = (
+        lambda kind, delay_ms, callback: rb.BacktestApp._arm_reconnect_callback(
+            app, kind, delay_ms, callback))
+    app._attempt_reconnect = (
+        lambda manual=False: rb.BacktestApp._attempt_reconnect(app, manual))
+    app._check_reconnection = (
+        lambda: rb.BacktestApp._check_reconnection(app))
+    app._schedule_reconnect = lambda: None
+    return rb, app, ctrl, discord, leaves
 
-    for i in range(8):
-        app.armed.clear()
-        decision = ctrl.decide(2, seconds_since_open=seen["since"])
-        assert decision.action == ACTION_SKIP_TEARDOWN_WAIT
-        rb.BacktestApp._defer_half_up_teardown(app, decision, i + 2)
-        if i < 7:
-            assert app.armed
-        else:
-            assert app.armed == []
-            assert ESCALATION_LOG in discord.messages
-    reset_session_clock_warnings()
+
+@pytest.mark.parametrize("failure", ["holiday", "session"])
+@pytest.mark.parametrize("when", _DEGRADED_FRIDAYS)
+def test_degraded_friday_never_auto_tears_down(when, failure, monkeypatch, capsys):
+    """Fri 10:00 with a dead calendar: 0 automatic LeaveMonitor, one P1.
+
+    The weekend clock is 75 minutes after 08:45. That used to allow one
+    forced teardown. It must not. A manual press still opens the confirm
+    dialog: No leaves the broker alone, Yes calls LeaveMonitor once.
+    """
+    import run_backtest as rb
+    from src.live.reconnect_controller import (
+        CALENDAR_DEGRADED_P1,
+        CLOCK_FALLBACK_WARN,
+        HALF_UP_TEARDOWN_CONFIRM,
+    )
+
+    assert when.weekday() == 4, when
+    rb_mod, app, ctrl, discord, leaves = _degraded_friday_app(
+        monkeypatch, when, failure=failure)
+    # One automatic attempt, then the 15s skip poll seven more times.
+    # Each poll re-arms the single shared slot; none calls LeaveMonitor.
+    rb_mod.BacktestApp._attempt_reconnect(app)
+    for _ in range(7):
+        assert len(app.root.pending) == 1
+        app.root.fire()
+    assert leaves == []
+    assert not ctrl.forced_teardown_used
+    assert discord.messages.count(CALENDAR_DEGRADED_P1) == 1
+    assert discord.messages.count(CLOCK_FALLBACK_WARN) == 1
+    assert len(app.root.pending) == 1
+    _delay, _callback = next(iter(app.root.pending.values()))
+    assert _delay == 15_000
+
+    calls = []
+
+    def confirm_no(message, *, default):
+        calls.append((message, default))
+        return False
+
+    app._half_up_confirm_fn = confirm_no
+    rb.BacktestApp._manual_reconnect(app)
+    assert calls == [(HALF_UP_TEARDOWN_CONFIRM, "no")]
+    assert leaves == []
+
+    def confirm_yes(message, *, default):
+        calls.append(("yes", default))
+        return True
+
+    app._half_up_confirm_fn = confirm_yes
+    rb.BacktestApp._manual_reconnect(app)
+    assert calls[-1] == ("yes", "no")
+    assert leaves == ["leave"]
+    out = capsys.readouterr().out
+    assert out.count(CALENDAR_DEGRADED_P1) == 1
+    assert CLOCK_FALLBACK_WARN in out
+
+
+def test_headless_degraded_half_up_refuses(monkeypatch, capsys):
+    """Headless has no dialog. A degraded Friday half-up press is a P1."""
+    from datetime import datetime, timedelta, timezone
+
+    import run_backtest as rb
+    from src.live.reconnect_controller import HEADLESS_HALF_UP_REFUSED_P1
+
+    when = datetime(2026, 10, 9, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+    rb_mod, app, ctrl, discord, leaves = _degraded_friday_app(
+        monkeypatch, when, failure="holiday")
+    app._headless_reconnect = True
+
+    def confirm(message, *, default):
+        raise AssertionError("headless must not open a confirm dialog")
+
+    app._half_up_confirm_fn = confirm
+    rb_mod.BacktestApp._manual_reconnect(app)
+    assert leaves == []
+    assert not ctrl.forced_teardown_used
+    assert any(HEADLESS_HALF_UP_REFUSED_P1 in msg for msg in discord.messages)
+    assert "normal" in app.btn_states
+    assert HEADLESS_HALF_UP_REFUSED_P1 in capsys.readouterr().out
 
 
 def test_skip_cap_alerts_discord_and_does_not_arm(monkeypatch, capsys):

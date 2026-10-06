@@ -12,11 +12,13 @@ until 90s after a real TAIFEX session open — ``current_session`` /
 A weekday holiday has no open, so a half-up session keeps skipping.
 After a real open+90s, one forced teardown per disconnect is allowed.
 
-If that holiday-aware lookup raises, the clock falls back to the
+If that holiday-aware lookup raises, the clock still falls back to the
 weekend-only session edges and leaves a WARN for the GUI to send
-through ``_log`` and Discord. Swallowing the error and treating it as
-"no session" makes 10:00 on a trading day look 18000s before the night
-open, and the half-up skip then never reaches the cap.
+through ``_log`` and Discord. That degraded calendar does not allow
+the automatic forced teardown: a half-up session keeps skipping, and
+one P1 asks the operator to press Reconnect. Swallowing the error and
+treating it as "no session" makes 10:00 on a trading day look 18000s
+before the night open.
 """
 
 from __future__ import annotations
@@ -61,8 +63,18 @@ HALF_UP_TEARDOWN_CONFIRM = (
     "call that crashed/froze bots in #157. Proceed?"
 )
 OPERATOR_DECLINED_HALF_UP_LOG = "[RECONNECT] operator declined half-up teardown"
+# No dialog was shown. Distinct from an operator No.
+HALF_UP_CONFIRM_UNAVAILABLE_LOG = (
+    "[RECONNECT] half-up confirm unavailable (TclError); refused"
+)
 OPERATOR_FORCED_HALF_UP_P1 = "operator forced half-up teardown"
 HEADLESS_HALF_UP_REFUSED_P1 = "manual reconnect refused: half-up before open+90"
+# Automatic path withheld LeaveMonitor because the holiday/session
+# lookup raised. One per degraded episode, via _log and Discord.
+CALENDAR_DEGRADED_P1 = (
+    "[RECONNECT] P1 calendar degraded; half-up session not torn down "
+    "automatically — press Reconnect to confirm"
+)
 # Yes, but the handshake moved while the dialog was open.
 HALF_UP_YES_STALE_LOG = (
     "[RECONNECT] operator Yes dropped — handshake changed during confirm"
@@ -111,6 +123,7 @@ def _is_closed_day(d: date) -> bool:
         return is_taifex_holiday(d)
     except Exception:
         _holiday_scan_failures += 1
+        note_calendar_degraded()
         _note_clock_warning("holiday", HOLIDAY_LOOKUP_WARN)
         return d.weekday() >= 5
 
@@ -246,10 +259,66 @@ def pop_session_clock_warnings() -> list[str]:
 def reset_session_clock_warnings() -> None:
     """Drop queued warnings and their once-only latches. Tests use this."""
     global _pending_clock_warnings, _clock_disagree_day, _holiday_scan_failures
+    global _calendar_degraded, _calendar_degraded_p1_sent
+    global _pending_calendar_degraded_p1
     _pending_clock_warnings = []
     _latched_clock_warnings.clear()
     _clock_disagree_day = None
     _holiday_scan_failures = 0
+    _calendar_degraded = False
+    _calendar_degraded_p1_sent = False
+    _pending_calendar_degraded_p1 = None
+
+
+# A holiday or session lookup raised during the reconnect decision.
+# Stays set until a later lookup succeeds. The automatic half-up path
+# does not force a teardown while this is set, whatever the weekend
+# clock says about open+90.
+_calendar_degraded: bool = False
+# One P1 per degraded episode. Re-armed when the calendar recovers or
+# the episode ends (Ready, a full drop, or a new disconnect).
+_calendar_degraded_p1_sent: bool = False
+_pending_calendar_degraded_p1: str | None = None
+
+
+def calendar_degraded() -> bool:
+    """True after ``is_taifex_holiday`` or ``current_session`` raised."""
+    return _calendar_degraded
+
+
+def note_calendar_degraded() -> None:
+    global _calendar_degraded
+    _calendar_degraded = True
+
+
+def note_calendar_recovered() -> None:
+    """A lookup succeeded. The next degraded stretch may alert again."""
+    global _calendar_degraded, _calendar_degraded_p1_sent
+    _calendar_degraded = False
+    _calendar_degraded_p1_sent = False
+
+
+def rearm_calendar_degraded_p1() -> None:
+    """The disconnect episode ended, or a new one started."""
+    global _calendar_degraded_p1_sent
+    _calendar_degraded_p1_sent = False
+
+
+def queue_calendar_degraded_p1() -> None:
+    """Queue the operator P1 once until the latch is re-armed."""
+    global _calendar_degraded_p1_sent, _pending_calendar_degraded_p1
+    if not _calendar_degraded or _calendar_degraded_p1_sent:
+        return
+    _calendar_degraded_p1_sent = True
+    _pending_calendar_degraded_p1 = CALENDAR_DEGRADED_P1
+
+
+def pop_calendar_degraded_p1() -> str | None:
+    """The P1 the GUI should send, or None when this poll stays quiet."""
+    global _pending_calendar_degraded_p1
+    message = _pending_calendar_degraded_p1
+    _pending_calendar_degraded_p1 = None
+    return message
 
 
 def _holiday_calls_failed(now: datetime) -> bool:
@@ -287,18 +356,23 @@ def seconds_since_session_open(now: datetime | None = None) -> int:
 
     If ``current_session`` itself raises, or ``is_taifex_holiday`` raises
     for today or yesterday, this returns the weekend-only clock and queues
-    ``CLOCK_FALLBACK_WARN``. That value is past open+90s only when the
-    weekend-only clock says a session is already open, so a Saturday or a
-    closed overnight still skips. It is not a blanket open+90, and it is
-    not the next night open (−18000s) at 10:00 on a trading day. The
-    holiday probe runs first: ``current_session`` would swallow the raise
-    and report a live Friday session with no WARN.
+    ``CLOCK_FALLBACK_WARN``. The calendar is then degraded: ``decide``
+    keeps skipping a half-up session instead of the forced teardown,
+    even when this fallback value is past open+90s (Friday 10:00 is
+    75 minutes after 08:45). A Saturday or a closed overnight is still
+    negative. It is not the next night open (−18000s) at 10:00 on a
+    trading day. The holiday probe runs first: ``current_session``
+    would swallow the raise and report a live Friday session with no WARN.
     """
+    global _holiday_scan_failures
     now = _as_taipei(now)
     if _holiday_calls_failed(now):
+        note_calendar_degraded()
         _clear_clock_warning("disagree")
         _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
         return _weekend_seconds_since_open(now)
+    # A previous closed-day walk must not keep this call degraded.
+    _holiday_scan_failures = 0
     try:
         session = _live_session(now)
         if session is not None:
@@ -308,13 +382,15 @@ def seconds_since_session_open(now: datetime | None = None) -> int:
             since = int((now - _next_session_open(now)).total_seconds())
             in_session = False
     except Exception:
+        note_calendar_degraded()
         _clear_clock_warning("disagree")
         weekend_since = _weekend_seconds_since_open(now)
-        # Past open+90 only when this clock says a session is open.
-        # A Saturday or a closed overnight stays negative, so decide()
-        # keeps skipping instead of LeaveMonitor.
         _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
         return weekend_since
+    if _holiday_scan_failures:
+        note_calendar_degraded()
+    else:
+        note_calendar_recovered()
     _clear_clock_warning("fallback")
     _note_clock_disagreement(now, in_session)
     return since
@@ -331,15 +407,21 @@ def in_live_session(now: datetime | None = None) -> bool:
     """
     now = _as_taipei(now)
     if _holiday_calls_failed(now):
+        note_calendar_degraded()
         _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
         from src.live.live_runner import is_market_open
         return bool(is_market_open(now))
     try:
         live = _live_session(now) is not None
     except Exception:
+        note_calendar_degraded()
         _note_clock_warning("fallback", CLOCK_FALLBACK_WARN)
         from src.live.live_runner import is_market_open
         return bool(is_market_open(now))
+    # A future-date failure is recorded on the scan counter. Do not
+    # clear that degraded stretch from this flag alone.
+    if _holiday_scan_failures == 0:
+        note_calendar_recovered()
     _note_clock_disagreement(now, live)
     return live
 
@@ -422,11 +504,18 @@ class ReconnectSchedule:
         self._suspended = True
 
     def resume(self, *, after, after_cancel):
-        """Re-arm the callback ``suspend`` held, if it is still pending."""
+        """Re-arm the callback ``suspend`` held, if it is still pending.
+
+        The full delay is re-armed on purpose (the safe direction). A
+        leftover shorter wait could fire LeaveMonitor as soon as the
+        dialog returns; starting the interval over only postpones the
+        next probe.
+        """
         if not self._suspended or self._callback is None:
             self._suspended = False
             return None
         kind = self._kind or "skip"
+        # Full delay on purpose (the safe direction), not the time left.
         delay_ms = 0 if self._delay_ms is None else self._delay_ms
         callback = self._callback
         self._suspended = False
@@ -486,6 +575,7 @@ class ReconnectController:
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
         self._post_forced_skips = 0
+        rearm_calendar_degraded_p1()
 
     @property
     def previous_attempt_missed_ready(self) -> bool:
@@ -507,6 +597,7 @@ class ReconnectController:
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
         self._post_forced_skips = 0
+        rearm_calendar_degraded_p1()
 
     def on_attempt_failed(self) -> None:
         """The Ready wait ended without Ready.
@@ -532,6 +623,7 @@ class ReconnectController:
         self._previous_attempt_missed_ready = False
         self._forced_teardown_used = False
         self._post_forced_skips = 0
+        rearm_calendar_degraded_p1()
 
     def on_operator_reconnect(self) -> None:
         """The operator pressed Reconnect and a teardown will run.
@@ -559,12 +651,17 @@ class ReconnectController:
         The trigger is manual (the caller), no Ready since the last
         EnterMonitor, and the holiday-aware clock still before open+90s.
         ``IsConnected()==2`` and a failed probe (None) both count.
-        Fully up, fully down, and open+90s or later do not.
+        A degraded calendar counts as before open+90: that deadline
+        cannot be trusted once the lookup has raised. Fully up, fully
+        down, and a healthy clock at open+90s or later do not.
         """
+        before_deadline = (
+            seconds_since_open < self.HALF_UP_HOLD_S or calendar_degraded()
+        )
         return (
             (is_connected == IS_CONNECTING or is_connected is None)
             and self._half_up()
-            and seconds_since_open < self.HALF_UP_HOLD_S
+            and before_deadline
         )
 
     def note_forced_teardown(self) -> None:
@@ -627,6 +724,8 @@ class ReconnectController:
         """
         if is_connected == 0:
             self._post_forced_skips = 0
+            # A full drop ends the half-up episode. The next one may alert.
+            rearm_calendar_degraded_p1()
 
         if is_connected == IS_CONNECTED:
             return ReconnectGuardDecision(
@@ -646,6 +745,24 @@ class ReconnectController:
         unsafe = self._half_up() and (
             is_connected == IS_CONNECTING or is_connected is None
         )
+        # Degraded calendar: never the automatic forced teardown, even
+        # when the weekend-only fallback is already past open+90s.
+        if unsafe and calendar_degraded():
+            queue_calendar_degraded_p1()
+            why = (
+                "IsConnected() probe failed"
+                if is_connected is None
+                else "IsConnected()==2 (connecting)"
+            )
+            return ReconnectGuardDecision(
+                action=ACTION_SKIP_TEARDOWN_WAIT,
+                reason=(
+                    "skip LeaveMonitor — calendar degraded, half-up, "
+                    f"no Ready (3003), {why}; automatic forced teardown "
+                    "withheld"
+                ),
+                wait_seconds=self.CONNECTING_WAIT_S,
+            )
         if unsafe and seconds_since_open < self.HALF_UP_HOLD_S:
             why = (
                 "IsConnected() probe failed"

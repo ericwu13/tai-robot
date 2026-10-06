@@ -112,6 +112,7 @@ from src.live.reconnect_controller import (
     ESCALATION_LOG,
     FORCED_TEARDOWN_LOG,
     HALF_UP_TEARDOWN_CONFIRM,
+    HALF_UP_CONFIRM_UNAVAILABLE_LOG,
     HALF_UP_YES_STALE_LOG,
     HEADLESS_HALF_UP_REFUSED_P1,
     IS_CONNECTING,
@@ -120,6 +121,7 @@ from src.live.reconnect_controller import (
     ReconnectController,
     ReconnectSchedule,
     in_live_session,
+    pop_calendar_degraded_p1,
     pop_session_clock_warnings,
     seconds_since_session_open,
     seconds_until_next_session_open,
@@ -1417,7 +1419,11 @@ class BacktestApp:
         self._reconnect_schedule.suspend(root.after_cancel)
 
     def _resume_reconnect_slot(self) -> None:
-        """Put back the skip poll ``_suspend_reconnect_slot`` held."""
+        """Put back the skip poll ``_suspend_reconnect_slot`` held.
+
+        Resume re-arms the full delay on purpose (the safe direction).
+        The next probe waits the whole interval again.
+        """
         root = getattr(self, "root", None)
         if root is None:
             return
@@ -1429,10 +1435,12 @@ class BacktestApp:
 
         The rule is manual (this method is only reached from the button),
         half-up with no Ready since the last EnterMonitor,
-        ``IsConnected()==2`` or a failed probe (None), and the holiday-aware
-        clock still before open+90. The tuple also freezes the attempt
-        counter and the forced-teardown allowance for the Yes re-check.
-        Anything else returns None: no dialog, no extra alert.
+        ``IsConnected()==2`` or a failed probe (None), and either the
+        holiday-aware clock is still before open+90 or the calendar
+        lookup is degraded (open+90 cannot be trusted). The tuple also
+        freezes the attempt counter and the forced-teardown allowance
+        for the Yes re-check. Anything else returns None: no dialog,
+        no extra alert.
         """
         is_connected = self._probe_reconnect_is_connected()
         if not self._reconnect_controller.is_half_up():
@@ -1478,9 +1486,13 @@ class BacktestApp:
         self.btn_reconnect.config(state=tk.NORMAL)
 
     def _decline_half_up_manual(self) -> None:
-        """No, or a dialog that cannot be shown. Never a teardown."""
+        """The confirm dialog could not be shown. Never a teardown.
+
+        This is not an operator No — no dialog was shown — so the log
+        line is the TclError refusal, not ``operator declined``.
+        """
         self._resume_reconnect_slot()
-        _log(OPERATOR_DECLINED_HALF_UP_LOG)
+        _log(HALF_UP_CONFIRM_UNAVAILABLE_LOG)
         self.btn_reconnect.config(state=tk.NORMAL)
 
     def _confirm_half_up_manual(self, trigger) -> bool:
@@ -1573,6 +1585,12 @@ class BacktestApp:
         for message in pop_session_clock_warnings():
             self._raise_reconnect_alert(message)
 
+    def _emit_calendar_degraded_p1(self) -> None:
+        """One P1 when a degraded calendar withheld the forced teardown."""
+        message = pop_calendar_degraded_p1()
+        if message:
+            self._raise_reconnect_alert(message)
+
     def _execute_reconnect_action(self, action):
         """Thin dispatcher: execute a ReconnectAction from ConnectionMonitor."""
         self.set_status(action.message, "warn")
@@ -1625,6 +1643,7 @@ class BacktestApp:
 
     def _defer_half_up_teardown(self, decision, attempt_n: int) -> None:
         """Skip LeaveMonitor, or stop the loop after the forced teardown."""
+        self._emit_calendar_degraded_p1()
         _log(
             "重連暫緩 Reconnect deferred — session still connecting, "
             "not calling LeaveMonitor")
