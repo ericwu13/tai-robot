@@ -115,8 +115,9 @@ class TestBugB_CleanupBeforeRelogin:
 
     def test_leave_monitor_called_before_login(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
-        leave_pos = body.find("SKQuoteLib_LeaveMonitor")
-        login_pos = body.find("SKCenterLib_LoginSetQuote")
+        # Call sites only — the docstring also names these functions.
+        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor()")
+        login_pos = body.find("skC.SKCenterLib_LoginSetQuote(")
         assert leave_pos != -1, (
             "Bug B: _attempt_reconnect must call SKQuoteLib_LeaveMonitor "
             "to tear down the prior COM session before re-login.")
@@ -126,8 +127,8 @@ class TestBugB_CleanupBeforeRelogin:
 
     def test_logout_called_before_login(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
-        logout_pos = body.find("SKCenterLib_LogOut")
-        login_pos = body.find("SKCenterLib_LoginSetQuote")
+        logout_pos = body.find("skC.SKCenterLib_LogOut(")
+        login_pos = body.find("skC.SKCenterLib_LoginSetQuote(")
         assert logout_pos != -1, (
             "Bug B: _attempt_reconnect must call SKCenterLib_LogOut "
             "before re-login to ensure a clean COM state.")
@@ -167,7 +168,7 @@ class TestIssue157_GuardBeforeLeaveMonitor:
     def test_decide_runs_before_leave_monitor(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
         decide_pos = body.find("_reconnect_controller.decide(")
-        leave_pos = body.find("SKQuoteLib_LeaveMonitor")
+        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor()")
         assert decide_pos != -1, (
             "Issue #157: _attempt_reconnect must consult ReconnectController "
             "before any COM teardown.")
@@ -182,7 +183,7 @@ class TestIssue157_GuardBeforeLeaveMonitor:
     def test_skip_branch_returns_before_leave_monitor(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
         skip_pos = body.find("ACTION_SKIP_TEARDOWN_WAIT")
-        leave_pos = body.find("SKQuoteLib_LeaveMonitor")
+        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor()")
         assert skip_pos != -1, "skip action not handled in _attempt_reconnect"
         assert skip_pos < leave_pos
         between = body[skip_pos:leave_pos]
