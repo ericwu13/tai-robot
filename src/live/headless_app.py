@@ -57,6 +57,9 @@ class HeadlessBotApp(rb.BacktestApp):
         root.withdraw()
         super().__init__(root)
         root.withdraw()  # __init__ zooms the window; hide it again
+        # No window to confirm a half-up LeaveMonitor. Manual Reconnect
+        # before open+90 refuses instead of popping a dialog.
+        self._headless_reconnect = True
 
     # ── dialog seams ──
 

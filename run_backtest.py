@@ -13,6 +13,7 @@ Usage:
 from version import APP_VERSION
 
 import csv
+import faulthandler
 import logging
 import os
 import sys
@@ -96,7 +97,7 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
@@ -105,6 +106,26 @@ from src.live.account_monitor import (
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
 )
 from src.live.connection_monitor import ConnectionMonitor
+from src.live.reconnect_controller import (
+    ACTION_ALREADY_CONNECTED,
+    ACTION_SKIP_TEARDOWN_WAIT,
+    ESCALATION_LOG,
+    FORCED_TEARDOWN_LOG,
+    HALF_UP_TEARDOWN_CONFIRM,
+    HALF_UP_CONFIRM_UNAVAILABLE_LOG,
+    HALF_UP_YES_STALE_LOG,
+    IS_CONNECTING,
+    OPERATOR_DECLINED_HALF_UP_LOG,
+    OPERATOR_FORCED_HALF_UP_P1,
+    ReconnectController,
+    ReconnectSchedule,
+    headless_half_up_refusal_phrase,
+    in_live_session,
+    pop_calendar_degraded_p1,
+    pop_session_clock_warnings,
+    seconds_since_session_open,
+    seconds_until_next_session_open,
+)
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
     RealFillTracker, parse_fulfill_report, match_fill_in_report,
@@ -654,6 +675,39 @@ _CACHE_DIR = os.path.join(project_root, "data")
 _app = None
 _debug_log_file = None  # file handle for bot debug log
 _discord = None  # DiscordNotifier instance (set on deploy)
+# Kept alive for the process lifetime so faulthandler can write a native
+# dump if LeaveMonitor faults inside SKCOM/ntdll (issue #157).
+_faulthandler_log = None
+
+
+def enable_reconnect_faulthandler(bot_dir: str) -> None:
+    """Arm faulthandler at deploy, writing to ``bot_dir/faulthandler.log``.
+
+    The handle is stored on a module global. Closing it would silently
+    disable the dump. A failure to open the file is a warning: diagnostics
+    must not abort the deploy.
+    """
+    global _faulthandler_log
+    if _faulthandler_log is not None and not _faulthandler_log.closed:
+        return
+    handle = None
+    try:
+        path = os.path.join(bot_dir, "faulthandler.log")
+        handle = open(path, "a", encoding="utf-8")
+        faulthandler.enable(file=handle, all_threads=True)
+    except Exception as e:
+        if handle is not None and not handle.closed:
+            handle.close()
+        _log(
+            f"[RECONNECT] faulthandler not armed: [{type(e).__name__}] {e}")
+        return
+    _faulthandler_log = handle
+
+
+def _log_reconnect_call(name: str) -> None:
+    """Debug line immediately before a reconnect-path broker call."""
+    _log_debug(
+        f"[RECONNECT] about to call {name} tid={threading.get_ident()}")
 
 
 def _open_debug_log(bot_dir: str) -> None:
@@ -1291,6 +1345,13 @@ class BacktestApp:
             return  # already handling disconnect
         self._cancel_quote_ready_timer("disconnected")
         self._set_quote_connected(False, "_on_disconnected")
+        # A server-side 3021/3033 (or an equivalent forced disconnect) is a
+        # down session. The next LeaveMonitor is attempt #1, which is safe.
+        # Do not carry a half-up latch across that boundary.
+        self._reconnect_controller.on_clean_disconnect()
+        # Drop any earlier reconnect timer before the new one is armed, so
+        # a second disconnect cannot leave two pending callbacks.
+        self._cancel_reconnect_timer()
         self.set_status("斷線 Disconnected", "error")
         self._set_conn_dot("err")
         self.login_status_var.set("斷線 Disconnected")
@@ -1310,16 +1371,187 @@ class BacktestApp:
             f"(caller=_on_disconnected)")
         self._schedule_reconnect()
 
+    def _probe_reconnect_is_connected(self):
+        """``SKQuoteLib_IsConnected()``, or None when it cannot be read."""
+        if not _com_available:
+            return None
+        try:
+            _log_reconnect_call("IsConnected")
+            return skQ.SKQuoteLib_IsConnected()
+        except Exception as e:
+            _log_debug(
+                f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
+                f"[{type(e).__name__}] {e}")
+            return None
+
+    def _reconnect_bot_id(self) -> str:
+        runner = getattr(self, "_live_runner", None)
+        name = getattr(runner, "bot_name", None) if runner is not None else None
+        if name:
+            return str(name)
+        return "unknown"
+
+    def _half_up_manual_p1(self, phrase: str, is_connected, since: float) -> str:
+        secs_to_open = 0 if since >= 0 else int(-since)
+        return (
+            f"[RECONNECT] P1 {phrase} "
+            f"bot={self._reconnect_bot_id()} IsConnected={is_connected} "
+            f"secs_to_open={secs_to_open}"
+        )
+
+    def _tk_confirm_half_up_teardown(self, message: str, *, default: str = "no") -> bool:
+        """GUI confirm on the Tk thread. The default button is No."""
+        return bool(messagebox.askyesno(
+            "重連 Reconnect", message, default=default))
+
+    def _ask_half_up_teardown(self) -> bool:
+        """Injectable confirm. Tests set ``_half_up_confirm_fn(message, default=)``."""
+        fn = getattr(self, "_half_up_confirm_fn", None)
+        if fn is None:
+            fn = self._tk_confirm_half_up_teardown
+        return bool(fn(HALF_UP_TEARDOWN_CONFIRM, default="no"))
+
+    def _suspend_reconnect_slot(self) -> None:
+        """Drop the shared after id while the confirm modal is up."""
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        self._reconnect_schedule.suspend(root.after_cancel)
+
+    def _resume_reconnect_slot(self) -> None:
+        """Put back the skip poll ``_suspend_reconnect_slot`` held.
+
+        Resume re-arms the full delay on purpose (the safe direction).
+        The next probe waits the whole interval again.
+        """
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        self._reconnect_schedule.resume(
+            after=root.after, after_cancel=root.after_cancel)
+
+    def _half_up_manual_snapshot(self):
+        """Trigger tuple, or None when this press is not the confirm case.
+
+        The rule is manual (this method is only reached from the button),
+        half-up with no Ready since the last EnterMonitor,
+        ``IsConnected()==2`` or a failed probe (None), and either the
+        holiday-aware clock is still before open+90 or the calendar
+        lookup is degraded (open+90 cannot be trusted). The tuple also
+        freezes the attempt counter and the forced-teardown allowance
+        for the Yes re-check. Anything else returns None: no dialog,
+        no extra alert.
+        """
+        is_connected = self._probe_reconnect_is_connected()
+        if not self._reconnect_controller.is_half_up():
+            return None
+        since = self._reconnect_seconds_since_open()
+        if not self._reconnect_controller.manual_half_up_needs_confirm(
+            is_connected, since
+        ):
+            return None
+        return (
+            is_connected,
+            since,
+            self._conn_monitor.attempt,
+            self._reconnect_controller.forced_teardown_used,
+        )
+
+    def _half_up_yes_blocked(self, attempt: int, forced_used: bool) -> bool:
+        """True when Yes must not tear down.
+
+        The attempt counter and the allowance must still match the
+        pre-dialog snapshot, no reconnect handshake is in flight, and
+        the probe is still half-up (``IsConnected()==2``) or None.
+        Ready, 0, and 1 are a different session.
+        """
+        ctrl = self._reconnect_controller
+        if self._conn_monitor.attempt != attempt:
+            return True
+        if ctrl.forced_teardown_used != forced_used:
+            return True
+        if ctrl.handshake_open:
+            return True
+        is_connected = self._probe_reconnect_is_connected()
+        if is_connected not in (IS_CONNECTING, None):
+            return True
+        if not ctrl.is_half_up():
+            return True
+        return False
+
+    def _refuse_half_up_manual(self, is_connected, since) -> None:
+        """Headless has no dialog. One IsConnected read already happened.
+
+        A degraded calendar uses its own phrase. A healthy clock that
+        is still before open+90 keeps the original text.
+        """
+        self._raise_reconnect_alert(self._half_up_manual_p1(
+            headless_half_up_refusal_phrase(), is_connected, since))
+        self.btn_reconnect.config(state=tk.NORMAL)
+
+    def _decline_half_up_manual(self) -> None:
+        """The confirm dialog could not be shown. Never a teardown.
+
+        This is not an operator No — no dialog was shown — so the log
+        line is the TclError refusal, not ``operator declined``.
+        """
+        self._resume_reconnect_slot()
+        _log(HALF_UP_CONFIRM_UNAVAILABLE_LOG)
+        self.btn_reconnect.config(state=tk.NORMAL)
+
+    def _confirm_half_up_manual(self, trigger) -> bool:
+        """Ask, then True only when Yes is still the same handshake.
+
+        False means the caller must not touch the broker. The shared
+        timer slot is cancelled before ``askyesno`` and re-armed after
+        it returns, including No and TclError.
+        """
+        is_connected, since, attempt, forced_used = trigger
+        if getattr(self, "_headless_reconnect", False):
+            self._refuse_half_up_manual(is_connected, since)
+            return False
+        self._suspend_reconnect_slot()
+        try:
+            confirmed = self._ask_half_up_teardown()
+        except tk.TclError:
+            self._decline_half_up_manual()
+            self._raise_reconnect_alert(self._half_up_manual_p1(
+                headless_half_up_refusal_phrase(), is_connected, since))
+            return False
+        self._resume_reconnect_slot()
+        if not confirmed:
+            _log(OPERATOR_DECLINED_HALF_UP_LOG)
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return False
+        if self._half_up_yes_blocked(attempt, forced_used):
+            _log(HALF_UP_YES_STALE_LOG)
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return False
+        fresh = self._probe_reconnect_is_connected()
+        fresh_since = self._reconnect_seconds_since_open()
+        self._raise_reconnect_alert(self._half_up_manual_p1(
+            OPERATOR_FORCED_HALF_UP_P1, fresh, fresh_since))
+        return True
+
     def _manual_reconnect(self):
         """Manual reconnect triggered by user button click."""
-        # Cancel any pending auto-reconnect timer
-        if self._reconnect_timer_id:
-            self.root.after_cancel(self._reconnect_timer_id)
-            self._reconnect_timer_id = None
+        # Before open+90 a half-up session, including a failed IsConnected
+        # probe, asks first. No and TclError never fall through to the
+        # teardown below, whatever the clock or the probe did meanwhile.
+        # Yes does, only when that same handshake is still half-up or None.
+        trigger = self._half_up_manual_snapshot()
+        if trigger is not None and not self._confirm_half_up_manual(trigger):
+            return
+        # Cancel reconnect, Ready-wait, and skip-poll callbacks together.
+        self._cancel_reconnect_timer()
         self._cancel_quote_ready_timer("manual_reconnect")
 
         self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
+        # The button tears down, including a half-up session whose one
+        # automatic forced teardown was already used. Before open+90 that
+        # only happens after the operator confirms.
+        self._reconnect_controller.on_operator_reconnect()
         action = self._conn_monitor.on_manual_reconnect()
         self.set_status(action.message, "warn")
         self._set_conn_dot("warn")
@@ -1329,16 +1561,39 @@ class BacktestApp:
             "[STATE] ConnectionMonitor: is_active=True, attempt=0 "
             "(caller=_manual_reconnect)")
 
-        self._attempt_reconnect()
+        self._attempt_reconnect(manual=True)
 
     def _schedule_reconnect(self):
-        """Schedule the next reconnection attempt via ConnectionMonitor."""
+        """Schedule the next reconnection attempt via ConnectionMonitor.
+
+        The session flag and the seconds-until-open both come from the
+        holiday-aware helpers. A weekday TAIFEX holiday is closed even
+        though the weekend-only market clock says it is open.
+        """
         action = self._conn_monitor.schedule_next(
             has_live_runner=bool(self._live_runner),
-            market_open=is_market_open(),
-            secs_until_open=seconds_until_market_open(),
+            market_open=in_live_session(),
+            secs_until_open=seconds_until_next_session_open(),
         )
+        self._emit_session_clock_warnings()
         self._execute_reconnect_action(action)
+
+    def _reconnect_seconds_since_open(self) -> int:
+        """Holiday-aware seconds since open, then any queued clock WARN."""
+        since = seconds_since_session_open()
+        self._emit_session_clock_warnings()
+        return since
+
+    def _emit_session_clock_warnings(self) -> None:
+        """Send a lookup-failure or clock-disagreement WARN to log and Discord."""
+        for message in pop_session_clock_warnings():
+            self._raise_reconnect_alert(message)
+
+    def _emit_calendar_degraded_p1(self) -> None:
+        """One P1 when a degraded calendar withheld the forced teardown."""
+        message = pop_calendar_degraded_p1()
+        if message:
+            self._raise_reconnect_alert(message)
 
     def _execute_reconnect_action(self, action):
         """Thin dispatcher: execute a ReconnectAction from ConnectionMonitor."""
@@ -1356,20 +1611,71 @@ class BacktestApp:
                 self.btn_reconnect.config(state=tk.NORMAL)
             if self._live_runner:
                 self._live_log_msg(action.message, "status")
-            self._reconnect_timer_id = self.root.after(
-                action.delay_seconds * 1000, self._attempt_reconnect)
+            self._arm_reconnect_callback(
+                "reconnect", action.delay_seconds * 1000, self._attempt_reconnect)
             return
 
-    def _attempt_reconnect(self):
+    def _arm_reconnect_callback(self, kind: str, delay_ms: int, callback) -> None:
+        """Arm the one reconnect/ready/skip slot, cancelling whatever it held."""
+        self._reconnect_timer_id = self._reconnect_schedule.arm(
+            kind,
+            delay_ms,
+            callback,
+            after=self.root.after,
+            after_cancel=self.root.after_cancel,
+        )
+
+    def _cancel_reconnect_timer(self) -> None:
+        """Cancel reconnect, Ready-wait, and skip-poll callbacks."""
+        self._reconnect_schedule.cancel_all(self.root.after_cancel)
+        self._reconnect_timer_id = None
+
+    def _raise_reconnect_alert(self, message: str) -> None:
+        """Operator-visible reconnect alert: the log pane and Discord.
+
+        ``_log_debug`` alone does not reach the operator. ``_discord.notify``
+        is the same path settlement-day and other live alerts use.
+        """
+        _log(message)
+        if _discord is not None and _discord.enabled:
+            try:
+                _discord.notify(message)
+            except Exception as e:
+                _log_debug(
+                    f"[RECONNECT] Discord alert failed: "
+                    f"[{type(e).__name__}] {e}")
+
+    def _defer_half_up_teardown(self, decision, attempt_n: int) -> None:
+        """Skip LeaveMonitor, or stop the loop after the forced teardown."""
+        self._emit_calendar_degraded_p1()
+        _log(
+            "重連暫緩 Reconnect deferred — session still connecting, "
+            "not calling LeaveMonitor")
+        _log_debug(
+            f"[RECONNECT] Attempt #{attempt_n} skipping LeaveMonitor "
+            f"+ LogOut — {decision.reason}")
+        if self._reconnect_controller.record_skip_poll():
+            self._raise_reconnect_alert(ESCALATION_LOG)
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return
+        self._arm_reconnect_callback(
+            "skip", decision.wait_seconds * 1000, self._check_reconnection)
+
+    def _attempt_reconnect(self, manual: bool = False):
         """Try to re-login and reconnect to quote service.
 
-        Bug B: each attempt MUST call ``SKQuoteLib_LeaveMonitor()`` +
-        ``SKCenterLib_LogOut()`` first (best-effort) so we start from a
-        clean COM state. Otherwise login+EnterMonitor stacks on top of a
-        broken session and the server may reach Quote (3002) without ever
-        sending Ready (3003) — exactly the zombie pattern seen in bot
-        session 0422.
+        Bug B: a teardown-and-login attempt calls
+        ``SKQuoteLib_LeaveMonitor()`` first (best-effort) so we start
+        from a clean COM state. ``SKCenterLib_LogOut`` is not in Capital
+        API 2.13.57 and is called only when the COM object actually has it.
+
+        Issue #157: LeaveMonitor on a half-up session (no Ready, 
+        ``IsConnected()==2``) faults or hangs. The controller skips it
+        until open+90s, then allows one forced teardown per disconnect.
+        The skip returns before the Bug B call below.
         """
+        # This callback is the armed timer, already popped by Tk.
+        self._reconnect_schedule.note_fired()
         self._reconnect_timer_id = None
         attempt_n = self._conn_monitor.attempt + 1  # number we'll attempt now
         if self._quote_connected:
@@ -1379,9 +1685,6 @@ class BacktestApp:
             return  # already reconnected (e.g. by manual login)
 
         _log(f"嘗試重連 Attempting reconnect #{self._conn_monitor.attempt}")
-        _log_debug(
-            f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
-            "+ LogOut (cleanup) before fresh LoginSetQuote")
 
         try:
             if not _com_available:
@@ -1400,9 +1703,46 @@ class BacktestApp:
                 self._schedule_reconnect()
                 return
 
+            # ── Issue #157: guard LeaveMonitor on a half-up pre-session ──
+            # Probe before any teardown. A probe failure is passed as None
+            # so the controller can refuse a blind LeaveMonitor.
+            is_connected = None
+            try:
+                _log_reconnect_call("IsConnected")
+                is_connected = skQ.SKQuoteLib_IsConnected()
+            except Exception as e:
+                _log_debug(
+                    f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
+                    f"[{type(e).__name__}] {e}")
+            since_open = self._reconnect_seconds_since_open()
+            decision = self._reconnect_controller.decide(
+                is_connected,
+                seconds_since_open=since_open,
+                manual=manual,
+            )
+            _log_debug(
+                f"[RECONNECT] Attempt #{attempt_n} guard={decision.action} "
+                f"IsConnected()={is_connected} manual={manual} — {decision.reason}")
+            if decision.action == ACTION_ALREADY_CONNECTED:
+                self._check_reconnection()
+                return
+            if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
+                self._defer_half_up_teardown(decision, attempt_n)
+                return
+
+            if decision.forced_teardown:
+                self._reconnect_controller.note_forced_teardown()
+                self._raise_reconnect_alert(FORCED_TEARDOWN_LOG)
+            _log_debug(
+                f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
+                "(cleanup) before fresh LoginSetQuote")
+            self._reconnect_controller.on_attempt_started()
+
             # ── Bug B: best-effort COM teardown before fresh login ──
-            # Both calls swallow errors — the prior session may already be
-            # half-torn-down and these are housekeeping, not gates.
+            # LeaveMonitor swallows errors — the prior session may already
+            # be half-torn-down. LogOut is not in Capital API 2.13.57; an
+            # unguarded call always raises AttributeError and never runs.
+            _log_reconnect_call("LeaveMonitor")
             try:
                 leave_code = skQ.SKQuoteLib_LeaveMonitor()
                 _log_debug(
@@ -1411,18 +1751,25 @@ class BacktestApp:
                 _log_debug(
                     f"[RECONNECT] LeaveMonitor raised (ignored): "
                     f"[{type(e).__name__}] {e}")
-            try:
-                logout_code = skC.SKCenterLib_LogOut(user_id)
+            if hasattr(skC, "SKCenterLib_LogOut"):
+                _log_reconnect_call("LogOut")
+                try:
+                    logout_code = skC.SKCenterLib_LogOut(user_id)
+                    _log_debug(
+                        f"[RECONNECT] LogOut returned {logout_code}")
+                except Exception as e:
+                    _log_debug(
+                        f"[RECONNECT] LogOut raised (ignored): "
+                        f"[{type(e).__name__}] {e}")
+            else:
                 _log_debug(
-                    f"[RECONNECT] LogOut returned {logout_code}")
-            except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] LogOut raised (ignored): "
-                    f"[{type(e).__name__}] {e}")
+                    "[RECONNECT] LogOut skipped — SKCenterLib_LogOut "
+                    "is not in this Capital API")
             self._logged_in = False
             _log_debug(
                 f"[RECONNECT] Cleanup done — calling LoginSetQuote")
 
+            _log_reconnect_call("LoginSetQuote")
             code = skC.SKCenterLib_LoginSetQuote(user_id, password, "Y")
             _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
             if code != 0 and code < 2000:
@@ -1431,40 +1778,54 @@ class BacktestApp:
                 _log_debug(
                     f"[RECONNECT] Attempt #{attempt_n} FAILED at LoginSetQuote — "
                     f"code={code} msg={msg}")
+                self._reconnect_controller.on_attempt_failed()
                 self._schedule_reconnect()
                 return
 
             self._logged_in = True
+            _log_reconnect_call("ConnectByID")
             reply_code = skR.SKReplyLib_ConnectByID(user_id)
+            _log_reconnect_call("EnterMonitorLONG")
             enter_code = skQ.SKQuoteLib_EnterMonitorLONG()
             _log_debug(
                 f"[RECONNECT] ConnectByID returned {reply_code}, "
                 f"EnterMonitorLONG returned {enter_code}")
+            wait_s = self._reconnect_controller.ready_wait_seconds()
+            self._reconnect_ready_wait_s = wait_s
             _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} waiting for Ready (3003)...")
+                f"[RECONNECT] Attempt #{attempt_n} waiting {wait_s}s for Ready (3003) "
+                f"(seconds_since_open={since_open})")
 
-            # Poll for connection (OnConnection callback will set _quote_connected)
-            self.root.after(3000, self._check_reconnection)
+            # Poll for connection (OnConnection callback will set _quote_connected).
+            # Same slot as the reconnect and skip timers.
+            self._arm_reconnect_callback("ready", wait_s * 1000, self._check_reconnection)
 
         except Exception as e:
             _log(f"重連異常 Reconnect error: {e}")
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} raised: "
                 f"[{type(e).__name__}] {e}")
+            self._reconnect_controller.on_attempt_failed()
             self._schedule_reconnect()
 
     def _check_reconnection(self):
         """Poll IsConnected after reconnect login attempt."""
         attempt_n = self._conn_monitor.attempt
+        self._reconnect_schedule.note_fired()
+        self._reconnect_timer_id = None
         if self._quote_connected:
+            self._reconnect_controller.on_ready()
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} SUCCESS — Ready received "
                 "(handled by _on_reconnected via _drain_ui_queue)")
             return  # success, handled by _on_reconnected via _drain_ui_queue
+        waited = self._reconnect_ready_wait_s
+        ic = None
         try:
+            _log_reconnect_call("IsConnected")
             ic = skQ.SKQuoteLib_IsConnected()
             _log_debug(
-                f"[RECONNECT] IsConnected()={ic} after 3s poll "
+                f"[RECONNECT] IsConnected()={ic} after {waited}s poll "
                 f"(attempt #{attempt_n})")
             if ic == 1:
                 self._set_quote_connected(True, "_check_reconnection(IsConnected==1)")
@@ -1484,14 +1845,25 @@ class BacktestApp:
             _log_debug(
                 f"[RECONNECT] IsConnected() raised (ignored): "
                 f"[{type(e).__name__}] {e}")
+            ic = None
+        # Issue #157: a half-up pre-session session must be polled, not
+        # torn down. on_attempt_failed latches "missed Ready" first so the
+        # guard stays armed across polls.
+        self._reconnect_controller.on_attempt_failed()
+        decision = self._reconnect_controller.decide(
+            ic, seconds_since_open=self._reconnect_seconds_since_open())
+        if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
+            self._defer_half_up_teardown(decision, attempt_n)
+            return
         # Not connected yet — schedule next reconnect attempt
         _log_debug(
             f"[RECONNECT] Attempt #{attempt_n} FAILED — timed out waiting "
-            f"for Ready after 3s, scheduling next attempt")
+            f"for Ready after {waited}s, scheduling next attempt")
         self._schedule_reconnect()
 
     def _on_reconnected(self):
         """Handle successful reconnection: re-subscribe ticks if live bot is running."""
+        self._reconnect_controller.on_ready()
         self._conn_monitor.on_connected()
         _log_debug(
             "[STATE] ConnectionMonitor: is_active=False, attempt=0 "
@@ -1499,9 +1871,7 @@ class BacktestApp:
         # A successful Ready resets the Bug C warn ladder — any earlier
         # transient IsConnected!=1 reads are irrelevant once we're back up.
         self._warn_disconnect_count = 0
-        if self._reconnect_timer_id:
-            self.root.after_cancel(self._reconnect_timer_id)
-            self._reconnect_timer_id = None
+        self._cancel_reconnect_timer()
 
         if self._live_runner and self._live_runner.state == LiveState.RUNNING:
             self._live_log_msg("已重連 Reconnected — resubscribing ticks", "status")
@@ -1643,7 +2013,12 @@ class BacktestApp:
         self._trading_guard = TradingGuard()  # safety checks for real orders
         # Reconnection state
         self._conn_monitor = ConnectionMonitor()
+        # Issue #157: gates LeaveMonitor while a pre-session handshake is
+        # still connecting (IsConnected()==2, Ready never arrived).
+        self._reconnect_controller = ReconnectController()
+        self._reconnect_schedule = ReconnectSchedule()
         self._reconnect_timer_id = None
+        self._reconnect_ready_wait_s: int = ReconnectController.READY_WAIT_S
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
         self._quote_ready_timer_id = None
         self._quote_intermediate_seen_at: float = 0.0
@@ -6548,8 +6923,14 @@ class BacktestApp:
             if self._trading_guard.fill_pending else None
         )
 
-        # Open debug log file in bot directory
+        # Open debug log file in bot directory. A faulthandler open
+        # failure must not abort the deploy.
         _open_debug_log(self._live_runner.bot_dir)
+        try:
+            enable_reconnect_faulthandler(self._live_runner.bot_dir)
+        except Exception as e:
+            _log(
+                f"[RECONNECT] faulthandler not armed: [{type(e).__name__}] {e}")
 
         # Route regime logging into the app's _log()
         if self._regime_manager is not None:
@@ -8993,10 +9374,10 @@ class BacktestApp:
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
             self._live_poll_id = None
-        if self._reconnect_timer_id:
-            self.root.after_cancel(self._reconnect_timer_id)
-            self._reconnect_timer_id = None
+        self._cancel_reconnect_timer()
+        self._cancel_quote_ready_timer("stop_live")
         self._conn_monitor.reset()
+        self._reconnect_controller.reset()
 
         if self._warmup_timeout_id:
             self.root.after_cancel(self._warmup_timeout_id)
