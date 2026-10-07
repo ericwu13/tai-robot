@@ -109,12 +109,10 @@ def _app(bot_dir: str):
         cancel_all=lambda *_a, **_k: None,
     )
     app._quote_ready_timer_id = None
-    # #158 adds ReconnectController. This branch does not have the class.
-    # Construct it when the name exists so a merge does not AttributeError
-    # on the wiring fake; otherwise leave it unset-as-None.
+    # Master has ReconnectController. Construct it so _attempt_reconnect
+    # and stop can call it. _check_reconnection reads the wait below.
     controller_cls = getattr(rb, "ReconnectController", None)
     app._reconnect_controller = controller_cls() if controller_cls else None
-    # #158's _check_reconnection reads this. Harmless on this branch.
     app._reconnect_ready_wait_s = getattr(controller_cls, "READY_WAIT_S", 3)
     return app
 
@@ -483,6 +481,73 @@ def test_check_reconnection_stamps_is_connected(tmp_path, monkeypatch):
         _cleanup()
     assert seen.get("name") == "IsConnected"
     assert scheduled == [True]
+
+
+def _stamp_during(writer):
+    def is_connected():
+        data = json.loads(open(writer.path, encoding="utf-8").read())
+        inflight = data.get("inflight_com_call") or {}
+        return inflight.get("name")
+    return is_connected
+
+
+def test_probe_reconnect_is_connected_is_stamped(tmp_path, monkeypatch):
+    """_probe_reconnect_is_connected stamps IsConnected before it returns."""
+    bot_dir = str(tmp_path / "bot")
+    os.makedirs(bot_dir, exist_ok=True)
+    writer = hb.HeartbeatWriter(bot_dir)
+    writer.write()
+    hb._writer = writer
+    seen = {}
+
+    def is_connected():
+        seen["name"] = _stamp_during(writer)()
+        return 2
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(
+        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
+    app = _app(bot_dir)
+    try:
+        assert app._probe_reconnect_is_connected() == 2
+    finally:
+        hb._writer = None
+        _cleanup()
+    assert seen.get("name") == "IsConnected"
+
+
+def test_attempt_reconnect_pre_decide_is_connected_is_stamped(tmp_path, monkeypatch):
+    """The IsConnected probe before decide is wrapped. Unwrapping leaves no stamp."""
+    bot_dir = str(tmp_path / "bot")
+    os.makedirs(bot_dir, exist_ok=True)
+    writer = hb.HeartbeatWriter(bot_dir)
+    writer.write()
+    hb._writer = writer
+    seen = {}
+
+    def is_connected():
+        seen["name"] = _stamp_during(writer)()
+        return 2
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(
+        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
+    app = _app(bot_dir)
+    app._quote_connected = False
+    app._conn_monitor = SimpleNamespace(attempt=0)
+    app._reconnect_timer_id = None
+    app.login_user_var = _Var("user")
+    app.login_pass_var = _Var("secret")
+    app.btn_reconnect = _Widget()
+    # Half-up and still before open+90, so decide skips and never reaches
+    # LeaveMonitor. The stamp under test is the probe before decide.
+    app._reconnect_controller._previous_attempt_missed_ready = True
+    try:
+        app._attempt_reconnect()
+    finally:
+        hb._writer = None
+        _cleanup()
+    assert seen.get("name") == "IsConnected"
 
 
 def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):
