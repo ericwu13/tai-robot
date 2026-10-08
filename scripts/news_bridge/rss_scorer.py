@@ -245,7 +245,7 @@ def score_article(headline: str, summary: str, api_key: str) -> dict | None:
     url = GEMINI_API_URL.format(model=GEMINI_MODEL, key=api_key)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
+        "generationConfig": {"maxOutputTokens": 1024},
     }).encode("utf-8")
     try:
         req = urllib.request.Request(

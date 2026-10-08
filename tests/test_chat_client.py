@@ -63,6 +63,47 @@ def _google_error(msg: str, status: int = 400) -> MagicMock:
     return resp
 
 
+# Upcoming Gemini models reject these generationConfig fields (any casing).
+_FORBIDDEN_GEMINI_KEY_NORMS = frozenset({
+    "temperature",
+    "topp",
+    "topk",
+    "thinkingbudget",
+    "thinkingconfig",
+})
+
+
+def _norm_key(key: str) -> str:
+    return "".join(ch for ch in key.lower() if ch.isalnum())
+
+
+def forbidden_gemini_keys(obj) -> list[str]:
+    """Forbidden sampling keys anywhere in a Gemini JSON payload."""
+    found: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if _norm_key(str(key)) in _FORBIDDEN_GEMINI_KEY_NORMS:
+                    found.append(str(key))
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return found
+
+
+def _assert_gemini_payload_omits_sampling_params(client: ChatClient, payload: dict) -> None:
+    url = client._client.post.call_args.args[0]
+    assert "generativelanguage.googleapis.com" in url
+    assert ":generateContent" in url
+    assert "maxOutputTokens" in payload["generationConfig"]
+    assert forbidden_gemini_keys(payload) == []
+    assert set(payload["generationConfig"]) == {"maxOutputTokens"}
+
+
 # ---------------------------------------------------------------------------
 # Anthropic provider tests
 # ---------------------------------------------------------------------------
@@ -244,6 +285,17 @@ class TestGoogleSendMessage:
         payload = client._client.post.call_args[1]["json"]
         assert payload["system_instruction"]["parts"][0]["text"] == "You are helpful."
 
+    def test_payload_keeps_max_output_tokens_and_omits_sampling_params(self):
+        client = self._make_client()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_response("ok")
+
+        client.send_message("Hi")
+
+        payload = client._client.post.call_args[1]["json"]
+        assert payload["generationConfig"]["maxOutputTokens"] == client.max_tokens
+        _assert_gemini_payload_omits_sampling_params(client, payload)
+
     def test_api_error_removes_user_message(self):
         client = self._make_client()
         client._client = MagicMock()
@@ -292,6 +344,17 @@ class TestGoogleOneShot:
         payload = client._client.post.call_args[1]["json"]
         assert len(payload["contents"]) == 1
         assert payload["contents"][0]["parts"][0]["text"] == "new prompt"
+
+    def test_payload_keeps_max_output_tokens_and_omits_sampling_params(self):
+        client = self._make_client()
+        client._client = MagicMock()
+        client._client.post.return_value = _google_response("ok")
+
+        client.one_shot("Generate strategy", max_tokens=4096)
+
+        payload = client._client.post.call_args[1]["json"]
+        assert payload["generationConfig"]["maxOutputTokens"] == 4096
+        _assert_gemini_payload_omits_sampling_params(client, payload)
 
     def test_api_error_raises(self):
         client = self._make_client()
