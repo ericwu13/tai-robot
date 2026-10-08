@@ -1,6 +1,7 @@
 """Tests for W3 RSS+Gemini news scorer."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -441,6 +442,85 @@ class TestNightSessionKey:
         """04:59 is still inside the night that opened yesterday."""
         dt = datetime(2026, 8, 8, 4, 59, tzinfo=timezone(timedelta(hours=8)))
         assert rss_scorer.night_session_key(dt) == "2026-08-07|NIGHT"
+
+
+# ── Gemini request payload ─────────────────────────────────────────────
+# Upcoming Gemini models return 400 INVALID_ARGUMENT when a request
+# includes temperature / topP / topK / thinkingBudget (any casing).
+
+_FORBIDDEN_GEMINI_KEY_NORMS = frozenset({
+    "temperature",
+    "topp",
+    "topk",
+    "thinkingbudget",
+    "thinkingconfig",
+})
+
+
+def _norm_key(key: str) -> str:
+    return "".join(ch for ch in key.lower() if ch.isalnum())
+
+
+def forbidden_gemini_keys(obj) -> list[str]:
+    """Forbidden sampling keys anywhere in a Gemini JSON payload.
+
+    Walks dicts and lists. Matching ignores case and underscores, so
+    ``temperature``, ``top_p``, ``topP``, ``thinkingBudget`` and
+    ``thinkingConfig`` all count.
+    """
+    found: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if _norm_key(str(key)) in _FORBIDDEN_GEMINI_KEY_NORMS:
+                    found.append(str(key))
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return found
+
+
+class _UrlopenBody(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+class TestScoreArticleGeminiPayload:
+    def test_payload_keeps_max_output_tokens_and_omits_sampling_params(self):
+        captured: dict = {}
+        raw = json.dumps({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": '{"direction": "neutral", "confidence": 0.2, "reason": "routine"}',
+                    }],
+                },
+            }],
+        }).encode()
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _UrlopenBody(raw)
+
+        with patch("rss_scorer.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = rss_scorer.score_article("Headline", "Summary text", "fake-key")
+
+        assert result == {"direction": "neutral", "confidence": 0.2, "reason": "routine"}
+        assert "generativelanguage.googleapis.com" in captured["url"]
+        assert ":generateContent" in captured["url"]
+        body = captured["body"]
+        assert body["generationConfig"]["maxOutputTokens"] == 1024
+        assert forbidden_gemini_keys(body) == []
+        assert body["generationConfig"] == {"maxOutputTokens": 1024}
 
 
 # ── Gemini API error handling ──────────────────────────────────────────
