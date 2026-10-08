@@ -126,8 +126,8 @@ class TestBugB_CleanupBeforeRelogin:
     def test_leave_monitor_called_before_login(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
         # Call sites only — the docstring also names these functions.
-        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor()")
-        login_pos = body.find("skC.SKCenterLib_LoginSetQuote(")
+        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor")
+        login_pos = body.find("skC.SKCenterLib_LoginSetQuote")
         assert leave_pos != -1, (
             "Bug B: _attempt_reconnect must call SKQuoteLib_LeaveMonitor "
             "to tear down the prior COM session before re-login.")
@@ -146,11 +146,11 @@ class TestBugB_CleanupBeforeRelogin:
         """
         body = self._attempt_reconnect_body(rb_source)
         guard = body.find('hasattr(skC, "SKCenterLib_LogOut")')
-        call = body.find("skC.SKCenterLib_LogOut(")
-        login = body.find("skC.SKCenterLib_LoginSetQuote(")
+        call = body.find("skC.SKCenterLib_LogOut")
+        login = body.find("skC.SKCenterLib_LoginSetQuote")
         assert login != -1, "LoginSetQuote unexpectedly removed"
         if call == -1:
-            assert "SKCenterLib_LogOut(" not in body
+            assert "skC.SKCenterLib_LogOut" not in body
             return
         assert guard != -1 and guard < call < login, (
             "Issue #157: SKCenterLib_LogOut( must not run unless hasattr "
@@ -189,7 +189,7 @@ class TestIssue157_GuardBeforeLeaveMonitor:
     def test_decide_runs_before_leave_monitor(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
         decide_pos = body.find("_reconnect_controller.decide(")
-        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor()")
+        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor")
         assert decide_pos != -1, (
             "Issue #157: _attempt_reconnect must consult ReconnectController "
             "before any COM teardown.")
@@ -204,7 +204,7 @@ class TestIssue157_GuardBeforeLeaveMonitor:
     def test_skip_branch_returns_before_leave_monitor(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
         skip_pos = body.find("ACTION_SKIP_TEARDOWN_WAIT")
-        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor()")
+        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor")
         assert skip_pos != -1, "skip action not handled in _attempt_reconnect"
         assert skip_pos < leave_pos
         between = body[skip_pos:leave_pos]
@@ -1643,7 +1643,7 @@ class TestBugC_WarnLadderRespected:
         # Each call must be preceded by the counter check on the same path.
         # Simplest pin: between the IsConnected() call and the _on_disconnected
         # call, the counter check must appear.
-        ic_idx = warn.find("skQ.SKQuoteLib_IsConnected()")
+        ic_idx = warn.find("skQ.SKQuoteLib_IsConnected")
         disc_idx = warn.find("self._on_disconnected()")
         assert ic_idx != -1, "IsConnected() probe missing from warn branch"
         assert disc_idx != -1, "_on_disconnected() call missing from warn branch"
