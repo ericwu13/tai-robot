@@ -14,11 +14,14 @@ Three facts drive everything:
   ``at`` stamp inside the slot means a candidate was designed.
   ``data/ai_usage.csv`` records how FAR an AI-driven attempt got: a
   ``bot_evolution`` row means the plan phase reached the AI, an
-  ``evolution_codegen_*`` row means codegen did.  The Saturday knob mode
-  (#153/#154) builds its candidate WITHOUT a codegen call, so "no codegen
-  row" is NOT "no candidate": the watermark and the StrategyPool
-  (``data/evolution_pool.db``, ``validated`` rows stamped UTC) are what
-  separate a knob-mode run and its PASS from a plan-only stop (#161).
+  ``evolution_codegen_*`` row means codegen did.  "No codegen row" is
+  NOT "no candidate": Saturday knob mode (#153/#154) builds its
+  candidate without a codegen call, and codegen can also stop after the
+  watermark advances (strategy source unavailable, or a crash before the
+  usage row).  The watermark plus a StrategyPool ``validated`` row
+  (``data/evolution_pool.db``, stamped UTC; changelog.json is only a
+  fallback and is not itself pool validation) separate a designed
+  candidate and its PASS from a plan-only stop (#161).
 - an empty ledger does NOT mean the slot never fired.  Every early
   return in ``_bot_evolution`` — no trades, and the holdout skip that
   fires whenever the week's trades all sit inside the withheld window —
@@ -200,10 +203,12 @@ def due_slot_starts(base_dir: str, due: datetime):
 
 def _check_usage(now, due, usage, feature_in_use, path, starts,
                  lines, findings, outcome=None) -> None:
-    """``outcome`` is ``slot_outcome``'s ``(advanced, passes)`` for the
-    due slot: the evidence a knob-mode run leaves where codegen would
-    have left an ai_usage.csv row (issue #161)."""
-    advanced, passes = outcome or ([], [])
+    """``outcome`` is ``slot_outcome``'s ``(advanced, passes, via_changelog)``
+    for the due slot: the evidence a designed candidate leaves where
+    codegen would have left an ai_usage.csv row (issue #161).
+    ``via_changelog`` marks passes read from changelog.json because the
+    pool had no validated row in the window."""
+    advanced, passes, via_changelog = outcome or ([], [], False)
     lines.append("--- usage evidence")
     started = ", ".join(f"{name} {ts.strftime('%H:%M:%S')}"
                         for name, ts in starts)
@@ -261,20 +266,31 @@ def _check_usage(now, due, usage, feature_in_use, path, starts,
         return
 
     for name, ts in passes:
-        lines.append(f"PASS: {name} pool-validated at {ts.strftime('%H:%M')} "
-                     f"TPE (StrategyStore untouched by design, #154)")
+        clock = ts.strftime("%H:%M")
+        if via_changelog:
+            # changelog.json is written on PASS, but a missing pool row
+            # means pool validation was not observed.  Do not claim it.
+            lines.append(
+                f"PASS (changelog only; pool validation not observed): "
+                f"{name} at {clock} TPE "
+                f"(StrategyStore untouched by design, #154)")
+        else:
+            lines.append(f"PASS: {name} pool-validated at {clock} "
+                         f"TPE (StrategyStore untouched by design, #154)")
 
     if counts["codegen"]:
         return
-    # No codegen row.  Since #154 the default Saturday path for
-    # allowlisted strategies is knob mode, which evaluates a candidate
-    # with no codegen model call — only a plan with neither a watermark
-    # advance nor a PASS in the slot really stopped at the plan phase.
+    # No codegen row.  A watermark inside the slot means the plan said
+    # action=change and a candidate was designed: Saturday knob mode
+    # (no codegen call, #154), or codegen that stopped after the
+    # watermark — strategy source unavailable, or a crash before the
+    # usage row.  Only a plan with neither a watermark advance nor a
+    # PASS really stopped at the plan phase.
     for name, at in advanced:
-        lines.append(f"candidate evaluated via Saturday knob mode (no codegen "
-                     f"row): {name} watermark advanced at "
-                     f"{at.strftime('%H:%M')} TPE — verdict text lives in "
-                     f"Discord")
+        lines.append(
+            f"candidate designed (watermark advanced; knob mode or codegen "
+            f"stopped early): {name} at {at.strftime('%H:%M')} TPE — "
+            f"verdict text lives in Discord")
     if advanced or passes:
         return
     findings.append(Finding(
@@ -361,21 +377,28 @@ def read_changelog_passes(path: str):
                                       "%Y-%m-%d %H:%M:%S")
         except ValueError:
             continue
+        # astimezone() treats the naive stamp as this process's local
+        # time.  That equals the trading machine's clock only when the
+        # monitor and the trading machine share a timezone, which is
+        # acceptable as a fallback (the pool's UTC stamp is authoritative).
         out.append((str(entry.get("version_after") or "?"),
                     to_tpe(local.astimezone())))
     return out
 
 
 def slot_outcome(due, rows, repo_root):
-    """``(advanced, passes)`` for ``due``'s slot (issue #161).
+    """``(advanced, passes, via_changelog)`` for ``due``'s slot (issue #161).
 
     ``advanced`` = ``[(bot_name, at)]`` for watermarks stamped inside the
     slot window: the plan said ``action=change``, so a candidate was
-    designed (by codegen, or by knob mode when no codegen row exists).
+    designed (knob mode, or codegen that may have stopped before its
+    usage row).  An advance is not a PASS.
     ``passes`` = ``[(name, ts)]`` for pool-validated candidates created
     in the window; changelog.json is consulted only when the pool has
     none (a pool promote failure skips the changelog too, so the two
-    never disagree in the other direction).
+    never disagree in the other direction).  ``via_changelog`` is True
+    when ``passes`` came from that fallback — those are not pool
+    validations.
     """
     due = to_tpe(due)
     advanced = []
@@ -388,11 +411,13 @@ def slot_outcome(due, rows, repo_root):
     data_dir = os.path.join(repo_root, "data")
     pool = read_pool_validated(os.path.join(data_dir, "evolution_pool.db"))
     passes = [(n, ts) for n, ts in pool if _in_slot(ts, due)]
+    via_changelog = False
     if not passes:
         changelog = read_changelog_passes(os.path.join(data_dir, "changelog.json"))
         passes = [(n, ts) for n, ts in changelog if _in_slot(ts, due)]
+        via_changelog = bool(passes)
     passes.sort(key=lambda row: row[1])
-    return advanced, passes
+    return advanced, passes, via_changelog
 
 
 def _check_watermarks(now, due, rows, starts, lines, findings) -> None:

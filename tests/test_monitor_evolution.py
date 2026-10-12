@@ -607,16 +607,20 @@ KNOB_MARK = {"trade_count": 172, "at": "2026-08-29 05:05:54"}
 
 def test_knob_mode_candidate_is_not_called_plan_only(tmp_path, repo):
     """FAILS pre-fix: watermark advanced inside the slot = the plan said
-    change and a candidate was evaluated, codegen row or not."""
+    change and a candidate was designed, codegen row or not.  The advance
+    is not a pool PASS — counting watermark-advanced bots as PASS must
+    not print a PASS: line."""
     bot = make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
     write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:28")])
     write_usage(repo, KNOB_USAGE)
     findings, lines = run(tmp_path, repo)
     assert not any("stopped at plan phase" in m for m in messages(findings)), \
         messages(findings)
-    assert any("candidate evaluated via Saturday knob mode" in ln
-               and "TMF00_0422 watermark advanced at 05:05 TPE" in ln
+    assert any("candidate designed (watermark advanced; knob mode or "
+               "codegen stopped early)" in ln
+               and "TMF00_0422" in ln and "at 05:05 TPE" in ln
                for ln in lines), lines
+    assert not any("PASS:" in ln for ln in lines), lines
     assert not has_level(findings, "P1") and not has_level(findings, "P2"), \
         messages(findings)
 
@@ -658,8 +662,32 @@ def test_changelog_pass_is_read_as_machine_local_time(tmp_path, repo):
          "version_after": "DynamicExitPullbackStrategyV2Evo1",
          "initiated_by": "ai"}])
     findings, lines = run(tmp_path, repo)
-    assert any("PASS: DynamicExitPullbackStrategyV2Evo1 pool-validated at "
-               "05:29 TPE" in ln for ln in lines), lines
+    assert any("PASS (changelog only; pool validation not observed): "
+               "DynamicExitPullbackStrategyV2Evo1 at 05:29 TPE" in ln
+               for ln in lines), lines
+    assert not any("pool-validated" in ln for ln in lines), lines
+
+
+def test_changelog_only_pass_is_not_labelled_pool_validated(tmp_path, repo):
+    """A pool that exists but has no in-slot validated row falls back to
+    the changelog.  That line must not claim pool validation, and an
+    older pool PASS stays out of the slot."""
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    write_pool(repo, [("OlderEvo1", "validated", "2026-08-21T21:29:25+00:00")])
+    pass_at = datetime(2026, 8, 29, 5, 29, 25, tzinfo=TZ_TPE)
+    local = pass_at.astimezone().replace(tzinfo=None)
+    write_json(repo / "data" / "changelog.json", [
+        {"date": local.strftime("%Y-%m-%d %H:%M:%S"),
+         "version_after": "DynamicExitPullbackStrategyV2Evo1",
+         "initiated_by": "ai"}])
+    _, lines = run(tmp_path, repo)
+    assert any(ln.startswith(
+        "PASS (changelog only; pool validation not observed): "
+        "DynamicExitPullbackStrategyV2Evo1 at 05:29 TPE")
+        for ln in lines), lines
+    assert not any("pool-validated" in ln or "OlderEvo1" in ln
+                   for ln in lines), lines
 
 
 def test_plan_only_slot_still_p3_despite_an_old_pool_pass(tmp_path, repo):
