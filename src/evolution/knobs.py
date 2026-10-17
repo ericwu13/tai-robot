@@ -4,10 +4,17 @@ Weekend auto-evolution must not codegen an off-grid stretch such as
 EMA 50→80. DynamicExitPullback* may change at most two knobs, and only
 to the discrete values below. Structural edits escalate; they are not
 applied on the Saturday path.
+
+Issue #164: the class name is only a candidate. Knob mode applies when
+the class instantiates with no arguments, exposes every grid knob, and
+each knob has a literal ``kwargs.get`` default that
+``rewrite_knob_source`` can replace. Otherwise the Saturday run stops
+before the watermark (option ii — no codegen fallback, no partial grid).
 """
 
 from __future__ import annotations
 
+import inspect
 import re
 
 MAX_AUTO_KNOBS = 2
@@ -61,6 +68,73 @@ def read_strategy_knobs(strategy_cls, grid: dict) -> dict:
     return out
 
 
+def _literal_kwarg_default_re(key: str) -> str:
+    """The ``kwargs.get("key", <num>)`` shape ``rewrite_knob_source`` replaces."""
+    return (
+        rf'(kwargs\.get\(\s*["\']{re.escape(key)}["\']\s*,\s*)'
+        rf'([0-9]+(?:\.[0-9]+)?)(\s*\))'
+    )
+
+
+def _has_literal_knob_default(source: str, key: str) -> bool:
+    return re.search(_literal_kwarg_default_re(key), source or "") is not None
+
+
+def _class_source(strategy_cls) -> str:
+    try:
+        return inspect.getsource(strategy_cls)
+    except (OSError, TypeError):
+        return ""
+
+
+def _knob_list(keys) -> str:
+    return "[" + ", ".join(keys) + "]"
+
+
+def knob_mode_ineligible(strategy_cls, grid, source) -> str:
+    """``""`` when Saturday knob mode can read and rewrite ``strategy_cls``.
+
+    Otherwise a reason: no-arg instantiation failed, a grid knob is
+    missing on the instance, or a grid knob has no literal
+    ``kwargs.get("key", <num>)`` default.
+    """
+    name = getattr(strategy_cls, "__name__", None) or str(strategy_cls)
+    try:
+        inst = strategy_cls()
+    except Exception as e:
+        return (f"knob mode not applicable: {name} no-arg instantiation "
+                f"failed ({type(e).__name__}: {e}); skipping knob mode")
+    missing = [key for key in grid if not hasattr(inst, key)]
+    if missing:
+        return (f"knob mode not applicable: {name} lacks knobs "
+                f"{_knob_list(missing)}; skipping knob mode")
+    nonliteral = [
+        key for key in grid
+        if not _has_literal_knob_default(source, key)
+    ]
+    if nonliteral:
+        return (f"knob mode not applicable: {name} lacks a literal "
+                f"kwargs.get default for knobs {_knob_list(nonliteral)}; "
+                f"skipping knob mode")
+    return ""
+
+
+def saturday_knob_directives_if_eligible(strategy_cls, source: str) -> str:
+    """MANDATORY knob block, or ``""`` when the class is not knob-eligible.
+
+    The Saturday prompt must not demand a grid the class cannot satisfy
+    (issue #164).
+    """
+    if strategy_cls is None:
+        return ""
+    grid = knob_grid_for(getattr(strategy_cls, "__name__", None))
+    if not grid:
+        return ""
+    if knob_mode_ineligible(strategy_cls, grid, source or ""):
+        return ""
+    return saturday_knob_directives()
+
+
 def knob_proposal_rejection(proposal, baseline: dict, grid: dict,
                             max_knobs: int = MAX_AUTO_KNOBS) -> str:
     """Empty string when ``proposal`` is an allowlisted change of at most
@@ -102,16 +176,32 @@ def changed_knobs(proposal, baseline: dict, grid: dict) -> dict:
     return out
 
 
-def saturday_knob_decision(class_name, proposal, strategy_cls):
+def saturday_knob_decision(class_name, proposal, strategy_cls,
+                           source: str | None = None):
     """``(rejection, knobs_to_apply)``.
 
     Non-grid strategies return ``("", None)`` so the caller keeps codegen.
+    A grid class that cannot be instantiated, is missing a grid knob, or
+    has no literal ``kwargs.get`` default returns ``(reason, None)``.
+    The caller stops before the watermark (issue #164, option ii: no
+    codegen fallback, no partial grid).
     A valid grid proposal returns ``("", {knob: value})``.
     A refused Saturday plan returns ``(reason, None)``.
+
+    ``source`` is the strategy text ``rewrite_knob_source`` would edit.
+    ``None`` falls back to ``inspect.getsource`` so existing callers keep
+    working; pass ``""`` when the source was looked up and is missing.
     """
     grid = knob_grid_for(class_name)
     if grid is None:
         return "", None
+    if source is None:
+        source = _class_source(strategy_cls)
+    # Before read_strategy_knobs: a missing knob used to raise KeyError
+    # and the cryptic refusal repeated every Saturday (#164).
+    reason = knob_mode_ineligible(strategy_cls, grid, source)
+    if reason:
+        return reason, None
     try:
         baseline = read_strategy_knobs(strategy_cls, grid)
     except Exception as e:
@@ -161,10 +251,7 @@ def rewrite_knob_source(source: str, base_name: str, candidate_name: str,
     text = source.replace(needle, f"class {candidate_name}", 1)
     for key, value in knobs.items():
         rendered = render_knob_default(key, value)
-        pattern = (
-            rf'(kwargs\.get\(\s*["\']{re.escape(key)}["\']\s*,\s*)'
-            rf'([0-9]+(?:\.[0-9]+)?)(\s*\))'
-        )
+        pattern = _literal_kwarg_default_re(key)
         text2, n = re.subn(pattern, rf"\g<1>{rendered}\g<3>", text, count=1)
         if n != 1:
             raise ValueError(f"could not rewrite default for {key}")

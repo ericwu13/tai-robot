@@ -5432,15 +5432,20 @@ class BacktestApp:
             plan_directives_block)
         knob_note = ""
         if auto_run:
-            from src.evolution.knobs import (
-                knob_grid_for, saturday_knob_directives)
+            from src.evolution.knobs import saturday_knob_directives_if_eligible
             if live and getattr(self._live_runner, "strategy", None) is not None:
-                _evo_cls_name = type(self._live_runner.strategy).__name__
+                _evo_cls = type(self._live_runner.strategy)
             else:
-                _evo_obj = STRATEGIES.get(self.strategy_var.get())
-                _evo_cls_name = _evo_obj.__name__ if _evo_obj else ""
-            if knob_grid_for(_evo_cls_name):
-                knob_note = saturday_knob_directives()
+                _evo_cls = STRATEGIES.get(self.strategy_var.get())
+            _evo_source = ""
+            if _evo_cls is not None:
+                _evo_source = self._resolve_strategy_source(
+                    self.strategy_var.get(), _evo_cls)
+            # Issue #164: a DynamicExitPullback* name is not enough. Do
+            # not inject the MANDATORY knob block for a class the grid
+            # cannot read or rewrite.
+            knob_note = saturday_knob_directives_if_eligible(
+                _evo_cls, _evo_source)
         holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
         cut = compute_design_cut(result.trades, holdout_days)
         # Scan from 0, NOT from the watermark: a watermark saved past the
@@ -5848,15 +5853,17 @@ class BacktestApp:
                     if auto_run:
                         _notify_discord(msg)
                     return
-                # Issue #153: Saturday knob mode refuses off-grid /
-                # structural plans BEFORE the watermark, so a rejected
-                # EMA80-class plan does not burn next week's delta.
+                # Issue #153 / #164: Saturday knob mode refuses off-grid
+                # plans and ineligible classes BEFORE the watermark, so a
+                # rejected plan does not burn next week's delta.
+                # Option (ii): an ineligible class stops the run here.
+                # No codegen fallback and no partial grid (pending CEO).
                 _knob_apply = None
                 if auto_run and baseline_cls is not None:
                     from src.evolution.knobs import saturday_knob_decision
                     rejection, _knob_apply = saturday_knob_decision(
                         baseline_cls.__name__, directives.get("knobs"),
-                        baseline_cls)
+                        baseline_cls, strategy_source)
                     if rejection:
                         msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
                         ui(self._append_chat, "system", msg)
