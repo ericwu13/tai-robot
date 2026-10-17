@@ -95,7 +95,8 @@ def knob_mode_ineligible(strategy_cls, grid, source) -> str:
     """``""`` when Saturday knob mode can read and rewrite ``strategy_cls``.
 
     Otherwise a reason: no-arg instantiation failed, a grid knob is
-    missing on the instance, or a grid knob has no literal
+    missing on the instance, reading a grid knob raised (anything other
+    than ``AttributeError``), or a grid knob has no literal
     ``kwargs.get("key", <num>)`` default.
     """
     name = getattr(strategy_cls, "__name__", None) or str(strategy_cls)
@@ -104,7 +105,18 @@ def knob_mode_ineligible(strategy_cls, grid, source) -> str:
     except Exception as e:
         return (f"knob mode not applicable: {name} no-arg instantiation "
                 f"failed ({type(e).__name__}: {e}); skipping knob mode")
-    missing = [key for key in grid if not hasattr(inst, key)]
+    missing = []
+    for key in grid:
+        try:
+            getattr(inst, key)
+        except AttributeError:
+            missing.append(key)
+        except Exception as e:
+            # Outside the instantiation try on purpose: a property that
+            # raises RuntimeError must become a refusal, not an EVO ERROR
+            # that escapes saturday_knob_decision (#164).
+            return (f"knob mode not applicable: {name} knob {key} "
+                    f"raised {type(e).__name__}")
     if missing:
         return (f"knob mode not applicable: {name} lacks knobs "
                 f"{_knob_list(missing)}; skipping knob mode")

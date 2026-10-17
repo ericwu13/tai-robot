@@ -19,6 +19,8 @@ import ast
 import inspect
 import textwrap
 
+import pytest
+
 import run_backtest as rb
 from src.evolution.knobs import (
     DYNAMIC_EXIT_PULLBACK_GRID,
@@ -71,6 +73,42 @@ class DynamicExitPullbackBufferComputed:
 class DynamicExitPullbackBoom:
     def __init__(self):
         raise RuntimeError("needs a session")
+
+
+class DynamicExitPullbackRaisingKnob:
+    """``atr_buffer_mult`` is present but its getter raises."""
+
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 50)
+        self.atr_period = kwargs.get("atr_period", 14)
+        self.atr_stop_mult = kwargs.get("atr_stop_mult", 2.5)
+
+    @property
+    def atr_buffer_mult(self):
+        raise RuntimeError("buffer unavailable")
+
+
+# AI: strategies are exec'd from a string. inspect.getsource cannot see
+# them, so eligibility has to judge the source the caller passes.
+_IN_MEMORY_V2 = textwrap.dedent("""\
+class DynamicExitPullbackInMemory:
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 50)
+        self.atr_period = kwargs.get("atr_period", 14)
+        self.atr_stop_mult = kwargs.get("atr_stop_mult", 2.5)
+        self.atr_buffer_mult = kwargs.get("atr_buffer_mult", 0.5)
+""")
+
+_IN_MEMORY_V3 = _IN_MEMORY_V2.replace(
+    '    self.atr_buffer_mult = kwargs.get("atr_buffer_mult", 0.5)\n',
+    "",
+)
+
+
+def _exec_in_memory(source: str):
+    namespace: dict = {}
+    exec(source, namespace)
+    return namespace["DynamicExitPullbackInMemory"]
 
 
 class TestKnobModeIneligible:
@@ -161,6 +199,54 @@ class TestKnobModeIneligible:
             "SomeOtherStrategy", {"ema_period": 80}, object)
         assert empty == "" and applied is None
         assert saturday_knob_directives_if_eligible(object, "") == ""
+
+    def test_in_memory_source_with_literal_knobs_is_eligible(self):
+        """The passed source is the text eligibility rewrites.
+
+        ``inspect.getsource`` raises on an exec'd class. Ignoring the
+        ``source`` argument and always calling ``inspect.getsource``
+        marks this class ineligible.
+        """
+        cls = _exec_in_memory(_IN_MEMORY_V2)
+        # Empty-namespace exec (the AI loader) has no retrievable source.
+        # _class_source swallows this TypeError and returns "".
+        with pytest.raises(TypeError):
+            inspect.getsource(cls)
+        assert knob_mode_ineligible(
+            cls, DYNAMIC_EXIT_PULLBACK_GRID, _IN_MEMORY_V2) == ""
+        ok, knobs = saturday_knob_decision(
+            cls.__name__, {"ema_period": 60}, cls, _IN_MEMORY_V2)
+        assert ok == ""
+        assert knobs == {"ema_period": 60}
+
+    def test_in_memory_source_missing_buffer_is_the_clear_refusal(self):
+        assert "atr_buffer_mult" not in _IN_MEMORY_V3
+        cls = _exec_in_memory(_IN_MEMORY_V3)
+        reason = (
+            "knob mode not applicable: DynamicExitPullbackInMemory "
+            "lacks knobs [atr_buffer_mult]; skipping knob mode"
+        )
+        assert knob_mode_ineligible(
+            cls, DYNAMIC_EXIT_PULLBACK_GRID, _IN_MEMORY_V3) == reason
+        decision, applied = saturday_knob_decision(
+            cls.__name__, {"ema_period": 60}, cls, _IN_MEMORY_V3)
+        assert applied is None
+        assert decision == reason
+        assert "KeyError" not in decision
+
+    def test_raising_knob_property_is_a_refusal_not_an_error(self):
+        reason = (
+            "knob mode not applicable: DynamicExitPullbackRaisingKnob "
+            "knob atr_buffer_mult raised RuntimeError"
+        )
+        assert knob_mode_ineligible(
+            DynamicExitPullbackRaisingKnob, DYNAMIC_EXIT_PULLBACK_GRID,
+            inspect.getsource(DynamicExitPullbackRaisingKnob)) == reason
+        decision, applied = saturday_knob_decision(
+            "DynamicExitPullbackRaisingKnob", {"ema_period": 60},
+            DynamicExitPullbackRaisingKnob)
+        assert applied is None
+        assert decision == reason
 
 
 class TestKnobPromptGate:
