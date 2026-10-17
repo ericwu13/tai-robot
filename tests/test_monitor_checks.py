@@ -946,6 +946,56 @@ def test_bots_no_lock_stale_heartbeat_is_unknown_not_hung(tmp_path):
     assert not any("HUNG" in m for m in messages(findings)), messages(findings)
 
 
+def test_bots_heartbeat_read_retries_then_classifies(tmp_path, monkeypatch):
+    """PermissionError twice, then a real read: ALIVE, not busy or corrupt."""
+    import scripts.monitor.check_bots as cb
+    make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    bot = tmp_path / "live" / "TMF00_bot"
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=1)
+    sleeps = []
+    calls = {"n": 0}
+    real = cb._open_heartbeat
+
+    def flaky(path):
+        calls["n"] += 1
+        if calls["n"] < cb._HEARTBEAT_READ_ATTEMPTS:
+            raise PermissionError("busy")
+        return real(path)
+
+    monkeypatch.setattr(cb, "_open_heartbeat", flaky)
+    monkeypatch.setattr(cb, "_heartbeat_sleep", lambda delay: sleeps.append(delay))
+    _findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                  pid_alive_fn=lambda pid: True)
+    line = _hb_line(lines)
+    assert "heartbeat: ALIVE" in line
+    assert "busy" not in line
+    assert "corrupt" not in line
+    assert calls["n"] == cb._HEARTBEAT_READ_ATTEMPTS
+    assert sleeps == [cb._HEARTBEAT_READ_BACKOFF_S,
+                      cb._HEARTBEAT_READ_BACKOFF_S]
+
+
+def test_bots_persistent_permission_error_is_busy_not_corrupt(tmp_path, monkeypatch):
+    import scripts.monitor.check_bots as cb
+    make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
+    bot = tmp_path / "live" / "TMF00_bot"
+    write_heartbeat(bot, NOW_IN_SESSION, age_s=1)
+    sleeps = []
+
+    def boom(_path):
+        raise PermissionError("busy")
+
+    monkeypatch.setattr(cb, "_open_heartbeat", boom)
+    monkeypatch.setattr(cb, "_heartbeat_sleep", lambda delay: sleeps.append(delay))
+    _findings, lines = check_bots(NOW_IN_SESSION, str(tmp_path / "live"),
+                                  pid_alive_fn=lambda pid: True)
+    line = _hb_line(lines)
+    assert "busy heartbeat.json" in line
+    assert "corrupt" not in line
+    assert sleeps == [cb._HEARTBEAT_READ_BACKOFF_S,
+                      cb._HEARTBEAT_READ_BACKOFF_S]
+
+
 def test_bots_corrupt_heartbeat_is_not_reported_as_missing(tmp_path):
     bot = make_live_bot(tmp_path, pid=4242, log_time="15:55:00")
     (bot / "heartbeat.json").write_text("{broken", encoding="utf-8")

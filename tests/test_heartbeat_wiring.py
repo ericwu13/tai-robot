@@ -181,6 +181,10 @@ def test_deploy_wires_heartbeat_tick_and_stop(tmp_path, monkeypatch):
         assert ok is True
         hb_path = os.path.join(bot_dir, "heartbeat.json")
         assert os.path.isfile(hb_path)
+        # The in-process watchdog reads this snapshot, not the file, so
+        # tick/stop do not os.replace or os.remove against an open handle.
+        snap = hb._read_snapshot(hb_path)
+        assert snap is not None and snap["pid"] == os.getpid()
         assert app._heartbeat_active is True
         assert len(app.root.pending) == 1
         ms = app.root.fire_one()
@@ -191,6 +195,7 @@ def test_deploy_wires_heartbeat_tick_and_stop(tmp_path, monkeypatch):
         _stop_attrs(app)
         app._stop_live()
         assert not os.path.isfile(hb_path)
+        assert hb._read_snapshot(hb_path) is None
     finally:
         _cleanup()
 
@@ -390,6 +395,42 @@ def test_first_write_failure_still_arms_later_ticks(tmp_path, monkeypatch):
         assert len(app.root.pending) == 1
     finally:
         _cleanup()
+
+
+def test_tick_replace_failure_is_rate_limited_in_bot_log(tmp_path, monkeypatch, capsys):
+    """Final os.replace failures reach _log once, not logger.exception per tick."""
+    bot_dir = str(tmp_path / "bot")
+    os.makedirs(bot_dir, exist_ok=True)
+    app = _app(bot_dir)
+    app._live_runner = SimpleNamespace(bot_dir=bot_dir)
+    clock = {"t": 5_000.0}
+    hb.reset_replace_failure_log()
+    monkeypatch.setattr(hb, "_sleep", lambda _delay: None)
+    monkeypatch.setattr(hb, "_monotonic", lambda: clock["t"])
+    try:
+        app._start_main_heartbeat()
+        assert hb._replace_failure_log is rb._log
+        capsys.readouterr()
+
+        def boom(_src, _dst):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(hb.os, "replace", boom)
+        app.root.fire_one()
+        first = capsys.readouterr().out
+        assert first.count("heartbeat os.replace failed") == 1
+        assert "tick failed" not in first
+        assert "suppressed" not in first
+        app.root.fire_one()
+        assert "heartbeat os.replace failed" not in capsys.readouterr().out
+        clock["t"] += hb._REPLACE_LOG_INTERVAL_S
+        app.root.fire_one()
+        third = capsys.readouterr().out
+        assert "heartbeat os.replace failed" in third
+        assert "1 suppressed" in third
+    finally:
+        _cleanup()
+        hb.reset_replace_failure_log()
 
 
 def test_send_future_order_stamps_inflight(tmp_path, monkeypatch):

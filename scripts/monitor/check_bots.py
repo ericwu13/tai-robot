@@ -24,8 +24,10 @@ holidays, python-dateutil, PyYAML and six.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
@@ -310,7 +312,51 @@ def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid, *,
     return "ALIVE", detail
 
 
+# Plain open() on Windows does not share delete access, so a reader can
+# collide with the writer's os.replace. Retry only PermissionError.
+_HEARTBEAT_READ_ATTEMPTS = 3
+_HEARTBEAT_READ_BACKOFF_S = 0.010
+
+
+def _heartbeat_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _open_heartbeat(path: str):
+    return open(path, encoding="utf-8")
+
+
+def _read_heartbeat_json(path, *, sleep=None):
+    """``(payload, kind)``.
+
+    ``kind`` is ``None`` on success, ``"busy"`` when PermissionError
+    survives 3 attempts at 10 ms, or ``"corrupt"`` for invalid JSON and
+    any other read error. Busy is not corrupt: the file is locked, not
+    truncated.
+    """
+    sleep_fn = _heartbeat_sleep if sleep is None else sleep
+    for attempt in range(_HEARTBEAT_READ_ATTEMPTS):
+        try:
+            with _open_heartbeat(path) as handle:
+                data = json.load(handle)
+        except PermissionError:
+            if attempt + 1 >= _HEARTBEAT_READ_ATTEMPTS:
+                return None, "busy"
+            sleep_fn(_HEARTBEAT_READ_BACKOFF_S)
+            continue
+        except ValueError:
+            return None, "corrupt"
+        except OSError:
+            return None, "corrupt"
+        if data is None:
+            return None, "corrupt"
+        return data, None
+    return None, "busy"
+
+
 def _format_heartbeat(state: str, detail: dict) -> str:
+    if state == "UNKNOWN" and detail.get("busy"):
+        return "  heartbeat: UNKNOWN (busy heartbeat.json)"
     if state == "UNKNOWN" and detail.get("corrupt"):
         return "  heartbeat: UNKNOWN (corrupt heartbeat.json)"
     if state == "UNKNOWN" and not detail:
@@ -407,8 +453,11 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
         if hb_file_missing:
             hb_state, hb_detail = "UNKNOWN", {}
         else:
-            raw_hb = read_json(hb_path)
-            if raw_hb is None:
+            raw_hb, read_kind = _read_heartbeat_json(hb_path)
+            if read_kind == "busy":
+                raw_hb = None
+                hb_state, hb_detail = "UNKNOWN", {"busy": True}
+            elif raw_hb is None:
                 hb_state, hb_detail = "UNKNOWN", {"corrupt": True}
             else:
                 hb_state, hb_detail = classify_heartbeat(
