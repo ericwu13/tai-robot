@@ -350,9 +350,18 @@ class FillPoller:
                 new_trading_mode="semi_auto",
             )
 
-        # Clear fill pending state — do NOT halt
+        # Clear fill pending state — do NOT halt.
+        # An entry timeout must also drop the deferred close. This is
+        # the only timeout path the app uses (_on_fill_timeout).
+        # TradingGuard.on_fill_timeout discards the close, but the app
+        # never calls it. The close belonged to the entry that just
+        # timed out. The next entry confirm pops whatever is left, and
+        # after the downgrade to semi-auto that confirm only happens
+        # once the operator switches back to auto.
         self._guard.fill_pending = False
         self._guard.fill_pending_type = ""
+        if action_type == "entry":
+            self._guard._deferred_close = None
 
         # Conservative assumption: order filled. A resumed entry is
         # the exception — assuming it filled lets _on_fill_confirmed
