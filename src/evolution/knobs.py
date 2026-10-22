@@ -129,7 +129,7 @@ def knob_mode_ineligible(strategy_cls, grid, source) -> str:
             # raises RuntimeError must become a refusal, not an EVO ERROR
             # that escapes saturday_knob_decision (#164).
             return (f"knob mode not applicable: {name} knob {key} "
-                    f"raised {type(e).__name__}")
+                    f"raised {type(e).__name__}; skipping knob mode")
     if missing:
         return (f"knob mode not applicable: {name} lacks knobs "
                 f"{_knob_list(missing)}; skipping knob mode")

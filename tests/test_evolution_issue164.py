@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -244,7 +246,7 @@ class TestKnobModeIneligible:
     def test_raising_knob_property_is_a_refusal_not_an_error(self):
         reason = (
             "knob mode not applicable: DynamicExitPullbackRaisingKnob "
-            "knob atr_buffer_mult raised RuntimeError"
+            "knob atr_buffer_mult raised RuntimeError; skipping knob mode"
         )
         assert knob_mode_ineligible(
             DynamicExitPullbackRaisingKnob, DYNAMIC_EXIT_PULLBACK_GRID,
@@ -404,3 +406,227 @@ class TestKnobNotApplicable:
         grid_skip, _ = settle_knob_ineligibility(
             tmp_path, object, "class X: pass", 12, at=_AT)
         assert grid_skip == "not_grid"
+
+
+class DynamicExitPullbackStub:
+    """Ineligible live class for the ``_bot_evolution`` / backstop calls.
+
+    Missing ``atr_buffer_mult`` — the same shape as the #164 V3 report.
+    """
+
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 50)
+        self.atr_period = kwargs.get("atr_period", 14)
+        self.atr_stop_mult = kwargs.get("atr_stop_mult", 2.5)
+
+
+_STUB_SOURCE = inspect.getsource(DynamicExitPullbackStub)
+_STUB_REASON = (
+    "knob mode not applicable: DynamicExitPullbackStub lacks knobs "
+    "[atr_buffer_mult]; skipping knob mode"
+)
+# Usable action=change plan. The backstop sits after this plan call;
+# codegen (``one_shot``) must not run for an ineligible class.
+_CHANGE_PLAN = (
+    "Performance summary: the pullback is unchanged.\n"
+    "```json\n"
+    '{"action": "change", "knobs": {"ema_period": 60}}\n'
+    "```\n"
+)
+
+
+class _InlineThread:
+    """Run the evolution worker before ``_bot_evolution`` returns.
+
+    A real daemon thread would let a removed ``return`` reach
+    ``send_message`` after the assertion had already passed.
+    """
+
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+
+class _DiscordLog:
+    def __init__(self):
+        self.enabled = True
+        self.msgs: list[str] = []
+
+    def notify_evolution(self, msg):
+        self.msgs.append(msg)
+
+
+def _wiring_trades():
+    """One design-window trade and one holdout trade (14d holdout)."""
+    from src.backtest.broker import OrderSide, Trade
+
+    def trade(exit_dt):
+        return Trade(
+            tag="t", side=OrderSide.LONG, qty=1,
+            entry_price=20000, exit_price=20010,
+            entry_bar_index=0, exit_bar_index=1, pnl=200,
+            entry_dt=exit_dt, exit_dt=exit_dt, source="paper",
+        )
+
+    return [
+        trade("2026-01-01 10:00"),
+        trade("2026-06-01 10:00"),
+    ]
+
+
+def _wiring_app(bot_dir, chat):
+    """Stub ``BacktestApp`` enough for ``_bot_evolution`` to settle.
+
+    Methods the early return never calls are still bound, so a mutant
+    that falls into the AI pipeline hits the mocked client instead of
+    an ``AttributeError`` on the stub.
+    """
+    from src.live.live_runner import LiveState
+
+    runner = types.SimpleNamespace(
+        state=LiveState.RUNNING,
+        bot_dir=bot_dir,
+        strategy=DynamicExitPullbackStub(),
+        point_value=200,
+        target_interval=60,
+        symbol="TXF",
+        get_bars=lambda: [],
+    )
+    trades = _wiring_trades()
+    result = types.SimpleNamespace(
+        trades=trades, strategy_name="DynamicExitPullbackStub", metrics=None)
+    app = types.SimpleNamespace(
+        _live_runner=runner,
+        _settings={
+            "evolution_holdout_days": 14,
+            "evolution_auto_pipeline": True,
+            "evolution_capital_base_twd": 100000,
+            "ai_provider": "anthropic",
+            "ultra_mode": False,
+            "evolution_validation": "off",
+        },
+        _chat_client=chat,
+        _REVIEW_SINGLE_SHOT_CHAR_LIMIT=600_000,
+        _quote_connected=False,
+        _live_warmup_mode=False,
+        _evo_fetch_cb=None,
+        _trading_mode="paper",
+        _last_bars=[],
+        _strategy_store=types.SimpleNamespace(list_strategies=lambda: []),
+        strategy_var=types.SimpleNamespace(get=lambda: "DynamicExitPullbackStub"),
+        chat=[],
+        root=types.SimpleNamespace(
+            after=lambda delay, fn, *args: fn(*args)),
+        btn_send=types.SimpleNamespace(config=lambda **kwargs: None),
+        _result=result,
+    )
+    app._gather_analysis_payload = lambda: (
+        result, "report", "timeframe", "", ["design trade", "holdout trade"])
+    app._ensure_chat_client = lambda: True
+    app._resolve_strategy_source = lambda name, cls: _STUB_SOURCE
+    app._append_chat = lambda role, text: app.chat.append((role, text))
+    app.set_status = lambda msg: None
+    app._on_chat_response = lambda plan: None
+    app._on_chat_error = lambda msg: None
+    app._remove_last_system_line = lambda: None
+    app._evolution_capital_base = types.MethodType(
+        rb.BacktestApp._evolution_capital_base, app)
+    app._build_evolution_context = types.MethodType(
+        rb.BacktestApp._build_evolution_context, app)
+    app._start_evolution_pipeline = types.MethodType(
+        rb.BacktestApp._start_evolution_pipeline, app)
+    return app
+
+
+class TestKnobSettleWiring:
+    """Call the Saturday entry points. AST order does not catch a
+    broken prefix check, a missing ``return``, or a backstop that
+    never records (M5–M8).
+    """
+
+    def test_bot_evolution_records_advances_and_second_run_skips(
+            self, tmp_path, monkeypatch):
+        chat = MagicMock()
+        chat.send_message.return_value = _CHANGE_PLAN
+        chat.max_tokens = 1024
+        chat.conversation = []
+        discord = _DiscordLog()
+        monkeypatch.setattr(rb, "_discord", discord)
+        monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+        app = _wiring_app(tmp_path, chat)
+
+        rb.BacktestApp._bot_evolution(app, auto_run=True)
+
+        rec = load_knob_not_applicable(tmp_path)
+        key = knob_applicability_key("DynamicExitPullbackStub", _STUB_SOURCE)
+        assert rec is not None
+        assert rec["outcome"] == KNOB_NOT_APPLICABLE
+        assert rec["class_name"] == key["class_name"]
+        assert rec["source_hash"] == key["source_hash"]
+        assert rec["reason"] == _STUB_REASON
+        mark = load_watermark(tmp_path)
+        assert mark is not None and mark["trade_count"] == 1
+        assert chat.send_message.call_count == 0
+        assert chat.one_shot.call_count == 0
+        assert app.chat == [("system", f"🧬 EVO {_STUB_REASON}")]
+        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
+
+        rb.BacktestApp._bot_evolution(app, auto_run=True)
+
+        assert load_knob_not_applicable(tmp_path) == rec
+        assert load_watermark(tmp_path) == mark
+        assert app.chat == [("system", f"🧬 EVO {_STUB_REASON}")]
+        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
+        assert chat.send_message.call_count == 0
+        assert chat.one_shot.call_count == 0
+
+    def test_pipeline_backstop_records_and_second_run_skips(
+            self, tmp_path, monkeypatch):
+        chat = MagicMock()
+        chat.send_message.return_value = _CHANGE_PLAN
+        chat.max_tokens = 1024
+        chat.conversation = []
+        discord = _DiscordLog()
+        monkeypatch.setattr(rb, "_discord", discord)
+        monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+        bot_dir = tmp_path / "backstop"
+        bot_dir.mkdir()
+        app = _wiring_app(bot_dir, chat)
+
+        rb.BacktestApp._start_evolution_pipeline(
+            app, "preamble", ["design trade"], "", app._result,
+            auto_run=True, holdout_days=14, bot_dir=bot_dir,
+            design_cut_idx=4)
+
+        rec = load_knob_not_applicable(bot_dir)
+        key = knob_applicability_key("DynamicExitPullbackStub", _STUB_SOURCE)
+        assert rec is not None
+        assert rec["outcome"] == KNOB_NOT_APPLICABLE
+        assert rec["class_name"] == key["class_name"]
+        assert rec["source_hash"] == key["source_hash"]
+        assert rec["reason"] == _STUB_REASON
+        mark = load_watermark(bot_dir)
+        assert mark is not None and mark["trade_count"] == 4
+        assert chat.one_shot.call_count == 0
+        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
+        assert not any("Saturday knob mode refused" in m for m in discord.msgs)
+        assert sum(1 for _role, text in app.chat if _STUB_REASON in text) == 1
+
+        rb.BacktestApp._start_evolution_pipeline(
+            app, "preamble", ["design trade"], "", app._result,
+            auto_run=True, holdout_days=14, bot_dir=bot_dir,
+            design_cut_idx=9)
+
+        assert load_knob_not_applicable(bot_dir) == rec
+        assert load_watermark(bot_dir) == mark
+        assert chat.one_shot.call_count == 0
+        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
+        assert sum(1 for _role, text in app.chat if _STUB_REASON in text) == 1
+        assert not any(
+            "Saturday knob mode refused" in text or "No new design-window" in text
+            for _role, text in app.chat)
