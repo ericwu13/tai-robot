@@ -10,8 +10,6 @@ import json
 import os
 from types import SimpleNamespace
 
-import pytest
-
 import run_backtest as rb
 import src.live.main_heartbeat as hb
 
@@ -101,8 +99,9 @@ def _app(bot_dir: str):
     app._heartbeat_active = False
     app._heartbeat_after_id = None
     app._bot_dir = bot_dir
-    # Present before and after the #158 reconnect merge. This branch does
-    # not read them; #158's _attempt_reconnect / stop path does.
+    # The half-up controller is gone. These attributes are unused by
+    # the pre-#158 reconnect path; leave them so a stray read cannot
+    # AttributeError inside a wiring test.
     app._reconnect_schedule = SimpleNamespace(
         note_fired=lambda: None,
         suspend=lambda *_a, **_k: None,
@@ -111,11 +110,8 @@ def _app(bot_dir: str):
         cancel_all=lambda *_a, **_k: None,
     )
     app._quote_ready_timer_id = None
-    # Master has ReconnectController. Construct it so _attempt_reconnect
-    # and stop can call it. _check_reconnection reads the wait below.
-    controller_cls = getattr(rb, "ReconnectController", None)
-    app._reconnect_controller = controller_cls() if controller_cls else None
-    app._reconnect_ready_wait_s = getattr(controller_cls, "READY_WAIT_S", 3)
+    app._reconnect_controller = None
+    app._reconnect_ready_wait_s = 3
     return app
 
 
@@ -524,135 +520,6 @@ def test_check_reconnection_stamps_is_connected(tmp_path, monkeypatch):
         _cleanup()
     assert seen.get("name") == "IsConnected"
     assert scheduled == [True]
-
-
-def _stamp_during(writer):
-    def is_connected():
-        data = json.loads(open(writer.path, encoding="utf-8").read())
-        inflight = data.get("inflight_com_call") or {}
-        return inflight.get("name")
-    return is_connected
-
-
-def test_probe_reconnect_is_connected_is_stamped(tmp_path, monkeypatch):
-    """_probe_reconnect_is_connected stamps IsConnected before it returns."""
-    bot_dir = str(tmp_path / "bot")
-    os.makedirs(bot_dir, exist_ok=True)
-    writer = hb.HeartbeatWriter(bot_dir)
-    writer.write()
-    hb._writer = writer
-    seen = {}
-
-    def is_connected():
-        seen["name"] = _stamp_during(writer)()
-        return 2
-
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(
-        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
-    app = _app(bot_dir)
-    try:
-        assert app._probe_reconnect_is_connected() == 2
-    finally:
-        hb._writer = None
-        _cleanup()
-    assert seen.get("name") == "IsConnected"
-
-
-def _reconnect_clock(monkeypatch, since: int, in_session: bool) -> None:
-    """Pin the holiday-aware clock. The wall clock must not decide this."""
-    monkeypatch.setattr(
-        rb, "seconds_since_session_open", lambda now=None, _since=since: _since)
-    monkeypatch.setattr(
-        rb, "in_live_session", lambda now=None, _open=in_session: _open)
-
-
-def _run_half_up_reconnect(tmp_path, monkeypatch, *, since: int, in_session: bool):
-    """Drive one half-up ``_attempt_reconnect`` under a pinned clock.
-
-    Returns ``(stamps, scheduled)``. ``schedule_next`` is present because
-    the real ``_schedule_reconnect`` reads it off the monitor; the test
-    replaces that method and records whether it ran.
-    """
-    _reconnect_clock(monkeypatch, since, in_session)
-    bot_dir = str(tmp_path / "bot")
-    os.makedirs(bot_dir, exist_ok=True)
-    writer = hb.HeartbeatWriter(bot_dir)
-    writer.write()
-    hb._writer = writer
-    stamps = []
-
-    def is_connected():
-        stamps.append(_stamp_during(writer)())
-        return 2
-
-    def leave():
-        stamps.append(_stamp_during(writer)())
-        return 0
-
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(rb, "skQ", SimpleNamespace(
-        SKQuoteLib_IsConnected=is_connected,
-        SKQuoteLib_LeaveMonitor=leave,
-    ))
-    app = _app(bot_dir)
-    app._quote_connected = False
-    scheduled = []
-    next_calls = []
-
-    def schedule_next(**kwargs):
-        next_calls.append(kwargs)
-        return SimpleNamespace(type="attempt", message="stub", delay_seconds=1)
-
-    app._conn_monitor = SimpleNamespace(attempt=0, schedule_next=schedule_next)
-    app._schedule_reconnect = lambda: scheduled.append(True)
-    app._reconnect_timer_id = None
-    app.login_user_var = _Var("user")
-    app.login_pass_var = _Var("secret")
-    app.btn_reconnect = _Widget()
-    app._reconnect_controller._previous_attempt_missed_ready = True
-    try:
-        app._attempt_reconnect()
-    finally:
-        hb._writer = None
-        _cleanup()
-    assert next_calls == []
-    return stamps, scheduled
-
-
-def test_attempt_reconnect_pre_decide_is_connected_is_stamped(tmp_path, monkeypatch):
-    """The IsConnected probe before decide is wrapped. Unwrapping leaves no stamp.
-
-    Fixed before open (issue #167). A wall clock past open+90 used to
-    force a teardown and then crash the monitor stub.
-    """
-    stamps, scheduled = _run_half_up_reconnect(
-        tmp_path, monkeypatch, since=-3600, in_session=False)
-    assert stamps == ["IsConnected"]
-    assert scheduled == []
-
-
-@pytest.mark.parametrize(
-    "since, in_session, forced",
-    [
-        (-3600, False, False),  # before open+90
-        (45, True, False),      # inside the open+90 window
-        (91, True, True),       # after open+90
-        (-18000, False, False),  # session closed / holiday (clock stays negative)
-    ],
-)
-def test_attempt_reconnect_half_up_follows_pinned_clock(
-        tmp_path, monkeypatch, since, in_session, forced):
-    """Four clocks. Only past open+90 stamps LeaveMonitor and reschedules."""
-    stamps, scheduled = _run_half_up_reconnect(
-        tmp_path, monkeypatch, since=since, in_session=in_session)
-    assert stamps[0] == "IsConnected"
-    if forced:
-        assert "LeaveMonitor" in stamps
-        assert scheduled == [True]
-    else:
-        assert stamps == ["IsConnected"]
-        assert scheduled == []
 
 
 def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):
