@@ -719,5 +719,16 @@ class SimulatedBroker:
         broker._cumulative_pnl = data.get("_cumulative_pnl", 0)
         broker._bar_index = data.get("_bar_index", 0)
         broker._exit_bar_index = data.get("_exit_bar_index", -1)
-        broker._pending_exits = _orders_from_dicts(data.get("pending_exits"))
+        # Issue #168: a flat book must not inherit exits. A stale SL left
+        # in the session would close the NEXT trade (check_exits and
+        # check_tick_exit both walk _pending_exits, and nothing else
+        # clears them after from_dict).
+        pending = _orders_from_dicts(data.get("pending_exits"))
+        try:
+            size = int(broker.position_size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0:
+            pending = []
+        broker._pending_exits = pending
         return broker

@@ -7,6 +7,11 @@ Each test plants one resume fault and asserts the guard that must catch it:
 * open position resumes with no stop at all
 * an exit fill still in flight is cleared on resume and sent again
 * the first tick after restore is not evaluated (gap left unprotected)
+* a flat session keeps a stale stop that closes the next trade
+* a restored fill gate never restarts the fill poller (flat and open)
+* live mode keeps a paper loss-limit stop
+* the restore alert fires again
+* a zero or negative stop/limit is restored as a real price
 
 Nothing here is strategy-specific. The fixtures only model the generic
 failure: a fresh strategy instance has no stop latched at entry.
@@ -394,3 +399,294 @@ def test_legacy_resume_without_guard_snapshot_still_clears_fill_pending():
     assert guard.real_entry_confirmed is True
     verdict, _details = guard.decide("auto", "TRADE_CLOSE", "LONG")
     assert verdict == guard.SEND_EXIT
+
+
+def test_flat_session_drops_stale_stop_before_new_entry(tmp_path):
+    """A flat book with a leftover SL must not close the next trade.
+
+    from_dict used to restore pending exits even when position_size is 0,
+    and nothing afterwards cleared them. The next long then stopped out
+    at the stale price — in auto mode check_tick_exit would send that.
+    """
+    stale = {
+        "point_value": 200,
+        "fill_mode": "on_close",
+        "position_size": 0,
+        "position_side": None,
+        "entry_price": 0,
+        "entry_tag": "",
+        "entry_bar_index": 0,
+        "trades": [],
+        "equity_curve": [],
+        "_cumulative_pnl": 0,
+        "_bar_index": 10,
+        "_exit_bar_index": 9,
+        "pending_exits": [{
+            "tag": "SL",
+            "side": "LONG",
+            "qty": 0,
+            "limit": None,
+            "stop": 22400,
+            "from_entry": "Long",
+        }],
+    }
+    restored = SimulatedBroker.from_dict(stale)
+    assert restored.position_size == 0
+    assert restored._pending_exits == []
+
+    session = {"bar_index": 10, "broker": stale}
+    runner, _alerts, _blocked = _resume(
+        tmp_path, SilentStrategy(), session, mode="auto",
+    )
+    assert runner.broker.position_size == 0
+    assert runner.broker._pending_exits == []
+
+    # The new long is opened after resume. The stale SL at 22400 must
+    # not be sitting on the broker when the tick arrives.
+    runner.broker.position_size = 1
+    runner.broker.position_side = OrderSide.LONG
+    runner.broker.entry_price = 22500
+    runner.broker.entry_tag = "Long"
+    assert runner.check_tick_exit(22400) is None
+    assert runner.broker.position_size == 1
+    assert runner.broker.trades == []
+
+
+def test_live_resume_drops_existing_paper_safety_stop(tmp_path):
+    """R7: auto/semi_auto must not keep a paper loss-limit stop.
+
+    A session saved in paper mode can already hold the synthetic stop.
+    Live resume is alert-only — that order has to be removed, not left
+    where check_exits would send it.
+    """
+    session = {
+        "bar_index": 10,
+        "broker": _open_broker(stop=22450, tag=_LOSS_LIMIT_STOP_TAG),
+    }
+    runner, alerts, _blocked = _resume(
+        tmp_path, SilentStrategy(), session, mode="auto", loss_limit=10000,
+    )
+    assert runner.restored_without_stop is True
+    assert all(o.tag != _LOSS_LIMIT_STOP_TAG for o in runner.broker._pending_exits)
+    assert not any(o.stop is not None for o in runner.broker._pending_exits)
+    assert alerts and "alert-only" in alerts[0]
+    assert "Paper protective stop" not in alerts[0]
+
+    runner.feed_1m_bar(_bar(
+        datetime(2026, 3, 2, 9, 0), 22400, 22420, 22300, 22350))
+    assert runner.broker.trades == []
+    assert runner.broker.position_size == 1
+
+
+def test_restore_alert_fires_once(tmp_path):
+    """R8: a second reconcile must not raise the restore alert again."""
+    session = {"bar_index": 10, "broker": _open_broker()}
+    runner, alerts, _blocked = _resume(
+        tmp_path, SilentStrategy(), session, mode="paper", loss_limit=10000,
+    )
+    assert len(alerts) == 1
+    runner._reconcile_restored_exits(alert=True)
+    runner._emit_restore_alert()
+    assert len(alerts) == 1
+
+
+def test_zero_and_negative_prices_are_not_stops():
+    """R9: 0 and negative prices are not a stop or a target.
+
+    A negative short stop matches every positive tick (price >= stop).
+    """
+    restored = SimulatedBroker.from_dict({
+        "point_value": 200,
+        "position_size": 1,
+        "position_side": "SHORT",
+        "entry_price": 22500,
+        "entry_tag": "Short",
+        "entry_bar_index": 4,
+        "trades": [],
+        "equity_curve": [],
+        "pending_exits": [{
+            "tag": "SL",
+            "side": "SHORT",
+            "qty": 0,
+            "limit": 0,
+            "stop": -100,
+            "from_entry": "Short",
+        }],
+    })
+    assert len(restored._pending_exits) == 1
+    order = restored._pending_exits[0]
+    assert order.stop is None
+    assert order.limit is None
+    restored.check_exits(11, 22500, 22520, 22480, 22510, "2026-03-02 09:00")
+    assert restored.position_size == 1
+    assert restored.trades == []
+
+
+def test_zero_or_negative_saved_levels_do_not_count_as_a_stop(tmp_path):
+    """R9: exit_levels of 0 / negative are ignored, paper stop still applies."""
+    session = {
+        "bar_index": 10,
+        "broker": _open_broker(),
+        "exit_levels": {
+            "stop": 0,
+            "limit": -5,
+            "from_entry": "Long",
+            "tag": "SL",
+            "entry_bar_index": 4,
+        },
+    }
+    runner, alerts, _blocked = _resume(
+        tmp_path, SilentStrategy(), session, mode="paper", loss_limit=10000,
+    )
+    assert runner.restored_without_stop is True
+    assert alerts and "no recoverable stop" in alerts[0]
+    foreign = [
+        o for o in runner.broker._pending_exits
+        if o.tag != _LOSS_LIMIT_STOP_TAG
+    ]
+    assert foreign == []
+    prot = [
+        o for o in runner.broker._pending_exits
+        if o.tag == _LOSS_LIMIT_STOP_TAG
+    ]
+    assert len(prot) == 1
+    assert prot[0].stop == 22450
+
+
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def append(self, line, tag="status"):
+        self.lines.append(line)
+
+
+class _Root:
+    def __init__(self):
+        self.pending = {}
+        self._next = 1
+
+    def after(self, ms, fn, *args):
+        token = self._next
+        self._next += 1
+        self.pending[token] = (ms, fn, args)
+        return token
+
+    def after_cancel(self, token):
+        self.pending.pop(token, None)
+
+
+def _resume_guard_app(*, position_size: int):
+    """Minimal app for the resume-guard path. Deploy has already reset."""
+    import run_backtest as rb
+    from src.live.fill_poller import FillPoller
+    from types import SimpleNamespace
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.root = _Root()
+    app.live_log = _Log()
+    app._alerts = []
+    app._alert = lambda title, msg: app._alerts.append((title, msg))
+    guard = TradingGuard()
+    guard.reset()
+    app._trading_guard = guard
+    app._fill_poller = FillPoller(guard, timeout=10.0)
+    app._fill_poller.reset()
+    app._fill_poll_timer_id = None
+    app._futures_account = "ACC"
+    side = SimpleNamespace(value="LONG") if position_size else None
+    app._live_runner = SimpleNamespace(
+        symbol="TX00",
+        broker=SimpleNamespace(
+            position_size=position_size,
+            position_side=side,
+            entry_bar_index=4,
+        ),
+    )
+    signed = 1 if position_size else 0
+    app._account_monitor = SimpleNamespace(
+        get_signed_position=lambda prefix: signed,
+        oi_snapshot_received=True,
+    )
+    return app
+
+
+def _enable_fill_com(monkeypatch):
+    import run_backtest as rb
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", object())
+
+
+def test_resume_in_position_restarts_fill_poller(monkeypatch):
+    """Open position + in-flight exit: poller restarts, deal row can clear."""
+    app = _resume_guard_app(position_size=1)
+    assert app._fill_poller.active is False
+    _enable_fill_com(monkeypatch)
+    app._reconcile_resumed_guard(
+        {
+            "trading_guard": {
+                "fill_pending": True,
+                "fill_pending_type": "exit",
+                "deferred_close": {
+                    "action": "TRADE_CLOSE", "side": "LONG", "price": 22400,
+                },
+            },
+        },
+        "auto",
+        "TX00",
+    )
+    guard = app._trading_guard
+    poller = app._fill_poller
+    assert guard.fill_pending is True
+    assert guard.fill_pending_type == "exit"
+    assert guard._deferred_close["price"] == 22400
+    assert poller.active is True
+    assert poller.action_type == "exit"
+    assert app.root.pending, "fill poll was not scheduled"
+    assert app._alerts, "in-flight fill resumed with no alert"
+    verdict, _details = guard.decide("auto", "TRADE_CLOSE", "LONG")
+    assert verdict == guard.BLOCK_FILL_PENDING
+
+    # The deal-row clear in run_backtest requires the poller to be active.
+    assert poller.on_deal_confirmed("exit") is not None
+    poller.confirm()
+    assert guard.fill_pending is False
+    verdict, _details = guard.decide("auto", "TRADE_CLOSE", "LONG")
+    assert verdict != guard.BLOCK_FILL_PENDING
+
+
+def test_resume_flat_restarts_entry_fill_poller(monkeypatch):
+    """Flat book + restored entry gate: poller restarts and timeout clears it."""
+    app = _resume_guard_app(position_size=0)
+    assert app._fill_poller.active is False
+    _enable_fill_com(monkeypatch)
+    app._reconcile_resumed_guard(
+        {
+            "trading_guard": {
+                "fill_pending": True,
+                "fill_pending_type": "entry",
+                "deferred_close": None,
+            },
+        },
+        "auto",
+        "TX00",
+    )
+    guard = app._trading_guard
+    poller = app._fill_poller
+    assert guard.fill_pending is True
+    assert guard.fill_pending_type == "entry"
+    assert poller.active is True
+    assert poller.action_type == "entry"
+    assert app.root.pending, "fill poll was not scheduled"
+    assert app._alerts, "flat entry gate resumed with no alert"
+    verdict, _details = guard.decide("auto", "ENTRY_FILL", "LONG")
+    assert verdict == guard.BLOCK_FILL_PENDING
+
+    action = poller.check_poll(
+        now=poller._start_time + poller.FILL_POLL_TIMEOUT)
+    assert action.type == "timeout"
+    poller.timeout()
+    assert guard.fill_pending is False
+    assert poller.active is False
+    verdict, _details = guard.decide("auto", "ENTRY_FILL", "LONG")
+    assert verdict != guard.BLOCK_FILL_PENDING
