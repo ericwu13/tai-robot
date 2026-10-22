@@ -100,7 +100,11 @@ _CODE_GEN_MAX_TOKENS = 16384
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard
 from src.live.tick_watchdog import TickWatchdog
-from src.live.main_heartbeat import call_com
+from src.live.broker_port import (
+    BrokerEvent,
+    InProcessSkcomPort,
+    initialize_com,
+)
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
@@ -226,6 +230,19 @@ NEWS_ONLY_STRATEGIES: set[str] = {NEWS_SHORT_DISPLAY, NEWS_LONG_DISPLAY}
 _com_available = False
 skC = skQ = skR = skO = None
 
+
+def _live_com_handles():
+    """COM objects the in-process port calls.
+
+    Read on each call so tests that monkeypatch ``skQ`` / ``skC`` / ``skR``
+    / ``skO`` still reach the fake. GUI and headless share this one port.
+    """
+    return skC, skQ, skR, skO
+
+
+broker_port = InProcessSkcomPort(_live_com_handles)
+
+
 def _init_com():
     """Initialise Capital API COM objects (SKCOM).
 
@@ -237,94 +254,15 @@ def _init_com():
       - We must call SetDllDirectoryW(libs_path) so COM can find SKCOM.dll's
         sibling DLLs, then restore with SetDllDirectoryW(None) so SKCOM's
         runtime network calls can find system DLLs (WinHTTP, Schannel, etc.).
+
+    Object creation lives in the in-process broker port. A missing SDK
+    leaves these globals as they are (the old early return).
     """
     global _com_available, skC, skQ, skR, skO
-    try:
-        import ctypes
-        import comtypes
-        import comtypes.client
-
-        frozen = getattr(sys, 'frozen', False)
-
-        # Locate DLL directory: bundled libs first (deployed EXE), SDK fallback (dev)
-        bundled_libs = os.path.join(bundle_root, "libs")
-        sdk_libs = os.path.abspath(os.path.join(
-            project_root,
-            "CapitalAPI_2.13.57", "CapitalAPI_2.13.57_PythonExample",
-            "SKDLLPythonTester", "libs",
-        ))
-
-        if frozen and os.path.isdir(bundled_libs):
-            libs_path = bundled_libs
-        elif os.path.isdir(sdk_libs):
-            libs_path = sdk_libs
-        elif os.path.isdir(bundled_libs):
-            libs_path = bundled_libs
-        else:
-            print("COM not available: no SDK or bundled libs found")
-            return
-
-        # ── Phase 1: Configure DLL search paths ──
-        os.environ["PATH"] = libs_path + os.pathsep + os.environ.get("PATH", "")
-        try:
-            os.add_dll_directory(libs_path)
-        except (OSError, AttributeError):
-            pass
-        # SetDllDirectoryW — this is what COM's LoadLibrary actually uses.
-        # In frozen EXEs, PyInstaller set it to _MEIPASS; override to libs.
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetDllDirectoryW(libs_path)
-
-        # ── Phase 2: Load typelib and create COM objects ──
-        dll_path = os.path.join(libs_path, "SKCOM.dll")
-        comtypes.client.GetModule(dll_path)
-        import comtypes.gen.SKCOMLib as sk
-
-        try:
-            skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
-        except OSError:
-            # COM not registered — register from libs_path (requires admin once)
-            import subprocess
-            print(f"COM not registered. Attempting regsvr32 from: {libs_path}")
-            reg_ok = True
-            for dll_name in ("SKCOM.dll", "CTSecuritiesATL.dll"):
-                dll_to_reg = os.path.join(libs_path, dll_name)
-                if os.path.isfile(dll_to_reg):
-                    r = subprocess.run(
-                        ["regsvr32", "/s", dll_to_reg],
-                        capture_output=True, text=True,
-                    )
-                    if r.returncode != 0:
-                        print(f"  regsvr32 FAILED for {dll_name} (code {r.returncode})")
-                        reg_ok = False
-                    else:
-                        print(f"  regsvr32 OK: {dll_name}")
-                else:
-                    print(f"  WARNING: {dll_name} not found in {libs_path}")
-                    reg_ok = False
-            if not reg_ok:
-                print("COM registration failed — right-click the EXE > Run as administrator")
-            try:
-                skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
-            except OSError:
-                print("COM CreateObject failed after registration attempt.")
-                print("Fix: right-click tai_backtest.exe > Run as administrator (once)")
-                raise
-
-        skQ = comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib)
-        skR = comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib)
-        skO = comtypes.client.CreateObject(sk.SKOrderLib, interface=sk.ISKOrderLib)
-
-        # ── Phase 3: Restore default DLL search order ──
-        # None = default Windows search (app dir → System32 → Windows → PATH).
-        # This lets SKCOM's internal network calls find WinHTTP, Schannel, etc.
-        kernel32.SetDllDirectoryW(None)
-
-        _com_available = True
-    except Exception as e:
-        print(f"COM not available: {e}")
-        traceback.print_exc()
-        _com_available = False
+    result = initialize_com(bundle_root, project_root, skC, skQ, skR, skO)
+    if result is None:
+        return
+    _com_available, skC, skQ, skR, skO = result
 
 
 def _resolve_news_path(path: str, base_dir: str | None = None) -> str:
@@ -889,6 +827,7 @@ class SKQuoteLibEvents:
             n = _app._fetcher.total_bar_count
             if n <= 3:
                 _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
+        broker_port.emit(BrokerEvent.BAR, bstrData)
 
     def OnKLineComplete(self, nCode):
         if not _app:
@@ -1135,12 +1074,14 @@ class BacktestApp:
                         _log(f"OnNewData 處理錯誤 handler error: {e}")
                 elif kind == "order_result":
                     code, msg = data
+                    broker_port.emit(BrokerEvent.ORDER_REPLY, (code, msg))
                     if code == 0:
                         _log(f"委託回報 Order OK: {msg}")
                         if self._live_runner:
                             self._live_log_msg(f"實單成功 Order OK: {msg}", "entry")
                     else:
-                        err = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                        err = (
+                            broker_port.return_code_message(code) if skC else str(code))
                         _log(f"委託失敗 Order FAILED: code={code} {err} {msg}")
                         self.set_status(f"委託失敗 Order FAILED: {err}", "error")
                         if self._live_runner:
@@ -1346,6 +1287,8 @@ class BacktestApp:
             return  # already handling disconnect
         self._cancel_quote_ready_timer("disconnected")
         self._set_quote_connected(False, "_on_disconnected")
+        # After the flag flips, so a listener cannot re-enter this method.
+        broker_port.emit(BrokerEvent.DISCONNECT, None)
         # A server-side 3021/3033 (or an equivalent forced disconnect) is a
         # down session. The next LeaveMonitor is attempt #1, which is safe.
         # Do not carry a half-up latch across that boundary.
@@ -1378,7 +1321,7 @@ class BacktestApp:
             return None
         try:
             _log_reconnect_call("IsConnected")
-            return call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+            return broker_port.is_connected()
         except Exception as e:
             _log_debug(
                 f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
@@ -1710,7 +1653,7 @@ class BacktestApp:
             is_connected = None
             try:
                 _log_reconnect_call("IsConnected")
-                is_connected = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+                is_connected = broker_port.is_connected()
             except Exception as e:
                 _log_debug(
                     f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
@@ -1745,17 +1688,17 @@ class BacktestApp:
             # unguarded call always raises AttributeError and never runs.
             _log_reconnect_call("LeaveMonitor")
             try:
-                leave_code = call_com("LeaveMonitor", skQ.SKQuoteLib_LeaveMonitor)
+                leave_code = broker_port.leave_monitor()
                 _log_debug(
                     f"[RECONNECT] LeaveMonitor returned {leave_code}")
             except Exception as e:
                 _log_debug(
                     f"[RECONNECT] LeaveMonitor raised (ignored): "
                     f"[{type(e).__name__}] {e}")
-            if hasattr(skC, "SKCenterLib_LogOut"):
+            if broker_port.supports_logout():
                 _log_reconnect_call("LogOut")
                 try:
-                    logout_code = call_com("LogOut", skC.SKCenterLib_LogOut, user_id)
+                    logout_code = broker_port.logout(user_id)
                     _log_debug(
                         f"[RECONNECT] LogOut returned {logout_code}")
                 except Exception as e:
@@ -1771,11 +1714,10 @@ class BacktestApp:
                 f"[RECONNECT] Cleanup done — calling LoginSetQuote")
 
             _log_reconnect_call("LoginSetQuote")
-            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
-                            user_id, password, "Y")
+            code = broker_port.login(user_id, password, "Y")
             _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
             if code != 0 and code < 2000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = broker_port.return_code_message(code)
                 _log(f"重連登入失敗 Reconnect login failed: {msg}")
                 _log_debug(
                     f"[RECONNECT] Attempt #{attempt_n} FAILED at LoginSetQuote — "
@@ -1786,9 +1728,9 @@ class BacktestApp:
 
             self._logged_in = True
             _log_reconnect_call("ConnectByID")
-            reply_code = call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            reply_code = broker_port.connect_reply(user_id)
             _log_reconnect_call("EnterMonitorLONG")
-            enter_code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
+            enter_code = broker_port.enter_monitor()
             _log_debug(
                 f"[RECONNECT] ConnectByID returned {reply_code}, "
                 f"EnterMonitorLONG returned {enter_code}")
@@ -1825,7 +1767,7 @@ class BacktestApp:
         ic = None
         try:
             _log_reconnect_call("IsConnected")
-            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+            ic = broker_port.is_connected()
             _log_debug(
                 f"[RECONNECT] IsConnected()={ic} after {waited}s poll "
                 f"(attempt #{attempt_n})")
@@ -1883,8 +1825,7 @@ class BacktestApp:
             if _com_available and skQ:
                 try:
                     for mkt in (2, 7, 9):
-                        call_com("RequestStockList",
-                                 skQ.SKQuoteLib_RequestStockList, mkt)
+                        broker_port.request_stock_list(mkt)
                 except Exception as e:
                     _log(f"商品資料重載失敗 Commodity reload failed: {e}")
             self._resubscribe_ticks()
@@ -1927,13 +1868,13 @@ class BacktestApp:
         self._first_tick_after_request_logged = False
 
         try:
-            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, com_symbol)
+            result = broker_port.subscribe_quotes(0, com_symbol)
             code = result[0] if isinstance(result, (list, tuple)) else result
             _log_debug(
                 f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
                 f"subscription sent (retry={_retry})")
             if code != 0 and code >= 3000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = broker_port.return_code_message(code)
                 self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
                 _log_debug(
                     f"[TICKS] RequestTicks FAILED: code={code} msg={msg}")
@@ -3682,19 +3623,18 @@ class BacktestApp:
 
             log_dir = os.path.join(project_root, "CapitalLog_Backtest")
             os.makedirs(log_dir, exist_ok=True)
-            skC.SKCenterLib_SetLogPath(log_dir)
+            broker_port.set_log_path(log_dir)
 
             if authority_flag:
-                skC.SKCenterLib_SetAuthority(authority_flag)
+                broker_port.set_authority(authority_flag)
 
             _log(f"登入中 Logging in as {_redact_acct(user_id)}...")
             self.set_status("登入中 Logging in...")
             self.login_status_var.set("登入中...")
 
-            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
-                            user_id, password, "Y")
+            code = broker_port.login(user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = broker_port.return_code_message(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
                 if code == 1097:
                     _log("提示: 請確認已安裝群益API憑證 (從券商網站下載安裝)")
@@ -3709,16 +3649,16 @@ class BacktestApp:
             _log(f"登入成功 LOGIN OK (code={code})")
             self.login_status_var.set("登入成功 Logged in")
 
-            call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
-            code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
+            broker_port.connect_reply(user_id)
+            code = broker_port.enter_monitor()
             _log(f"進入報價監控 EnterMonitorLONG: code={code}")
 
             # Initialize order service for real trading
             if skO is not None:
                 try:
-                    call_com("SKOrderLib_Initialize", skO.SKOrderLib_Initialize)
-                    call_com("ReadCertByID", skO.ReadCertByID, user_id)
-                    call_com("GetUserAccount", skO.GetUserAccount)
+                    broker_port.initialize_order()
+                    broker_port.read_cert(user_id)
+                    broker_port.get_user_account()
                     _log("委託服務初始化 Order service initialized (cert verified)")
                 except Exception as e:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
@@ -3736,7 +3676,7 @@ class BacktestApp:
 
     def _check_connection(self):
         try:
-            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+            ic = broker_port.is_connected()
             if ic == 1:
                 self._set_quote_connected(True, "_check_connection(IsConnected==1)")
                 self.btn_api.config(state=tk.NORMAL)
@@ -3815,14 +3755,13 @@ class BacktestApp:
              f"{chunk.start_date}~{chunk.end_date} min={chunk.minute_num}")
 
         try:
-            code = call_com(
-                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
+            code = broker_port.subscribe_kline(
                 chunk.kline_symbol, chunk.kline_type, chunk.session,
                 chunk.trade_session, chunk.start_date, chunk.end_date,
                 chunk.minute_num)
 
             if code != 0:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = broker_port.return_code_message(code)
                 _log(f"請求結果 Result: code={code} {msg}")
                 if code >= 3000:
                     self.set_status(f"錯誤 Error: {msg}", "error")
@@ -6880,8 +6819,8 @@ class BacktestApp:
             try:
                 user_id = self.login_user_var.get().strip()
                 self._account_monitor.clear_positions()
-                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                         user_id, self._futures_account, 1)
+                broker_port.query_open_interest(
+                    user_id, self._futures_account, 1)
                 # The OnOpenInterest reply arrives asynchronously through the
                 # UI queue — observed ~4s after the query. GUI waits via an
                 # after(100) poll so the Tk thread is not frozen; headless
@@ -7050,7 +6989,7 @@ class BacktestApp:
                 # Query multiple market types to find TMF order codes
                 # 2=期貨T盤, 7=期貨全盤, 9=客製化期貨
                 for mkt in (2, 7, 9):
-                    rc = call_com("RequestStockList", skQ.SKQuoteLib_RequestStockList, mkt)
+                    rc = broker_port.request_stock_list(mkt)
                     if isinstance(rc, int) and rc != 0:
                         _log(f"商品列表查詢 RequestStockList({mkt}) code={rc}")
             except Exception as e:
@@ -7259,11 +7198,10 @@ class BacktestApp:
              f"min={kline_minute} {start_str}~{end_str}")
 
         try:
-            code = call_com(
-                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
+            code = broker_port.subscribe_kline(
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = broker_port.return_code_message(code)
                 _log(f"暖機查詢失敗 Warmup fetch failed: code={code} {msg}")
                 self._live_log_msg(
                     f"暖機查詢失敗 Warmup failed: code={code} {msg}", "status")
@@ -7421,14 +7359,14 @@ class BacktestApp:
         sym_note = f" (via {tick_sym})" if tick_sym != symbol else ""
         self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}{sym_note}...", "status")
         try:
-            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, tick_sym)
+            result = broker_port.subscribe_quotes(0, tick_sym)
             # COM may return (code, stockIdx) tuple or just an int
             if isinstance(result, (list, tuple)):
                 code = result[0]
             else:
                 code = result
             if code != 0 and code >= 3000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = broker_port.return_code_message(code)
                 self._live_log_msg(f"訂閱失敗 Tick subscribe failed: {msg}", "status")
                 self._stop_live()
                 return
@@ -7813,7 +7751,7 @@ class BacktestApp:
             # is treated as noise and the ladder is allowed to continue.
             if _com_available:
                 try:
-                    ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+                    ic = broker_port.is_connected()
                 except Exception as e:
                     ic = None
                     _log_debug(
@@ -7878,6 +7816,10 @@ class BacktestApp:
         Converts raw COM tick data to Tick, feeds to BarBuilder.
         When a 1-min bar completes, routes to LiveRunner.
         """
+        broker_port.emit(
+            BrokerEvent.TICK,
+            (date, time_hms, time_millismicros, bid, ask, close, qty,
+             simulate, is_history))
         if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
             return
         if not self._live_bar_builder:
@@ -8571,9 +8513,7 @@ class BacktestApp:
                 pass  # can't parse — proceed with order, let exchange decide
 
         try:
-            import comtypes.gen.SKCOMLib as sk
-
-            oOrder = sk.FUTUREORDER()
+            oOrder = broker_port.new_future_order()
             oOrder.bstrFullAccount = self._futures_account
             oOrder.bstrStockNo = order_symbol
             oOrder.sBuySell = buy_sell
@@ -8618,9 +8558,7 @@ class BacktestApp:
                  f"price={oOrder.bstrPrice}({price_label}) qty=1 newclose={nc}({nc_label}) reserved=0")
 
             # Synchronous send — returns immediately for IOC market orders
-            message, code = call_com(
-                "SendFutureOrderCLR", skO.SendFutureOrderCLR,
-                user_id, False, oOrder)
+            message, code = broker_port.place_order(user_id, oOrder, False)
             _log(f"REAL ORDER RESULT: code={code} message={message}")
 
             if code == 0:
@@ -8664,7 +8602,8 @@ class BacktestApp:
                 )
                 return True
             else:
-                err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                err_msg = (
+                    broker_port.return_code_message(code) if skC else str(code))
                 self._live_log_msg(f"實單失敗 Order FAILED: code={code} {err_msg} | {message}", "exit")
                 _log(f"REAL ORDER FAILED: code={code} err={err_msg} msg={message}")
                 if _discord and _discord.enabled:
@@ -8810,8 +8749,8 @@ class BacktestApp:
         # Request fresh position data via COM
         try:
             user_id = self.login_user_var.get().strip()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, self._futures_account, 1)
+            broker_port.query_open_interest(
+                user_id, self._futures_account, 1)
         except Exception as e:
             _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
@@ -9037,8 +8976,7 @@ class BacktestApp:
             return 0
         try:
             user_id = self.login_user_var.get().strip()
-            fills_raw = call_com(
-                "GetFulfillReport", skO.GetFulfillReport,
+            fills_raw = broker_port.query_fills(
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
@@ -9090,6 +9028,7 @@ class BacktestApp:
         Rows for orders this bot didn't send (another bot or a manual
         order on the same account) don't match the tracker and are ignored.
         """
+        broker_port.emit(BrokerEvent.FILL, raw)
         redacted = raw
         if self._futures_account:
             redacted = redacted.replace(self._futures_account, "***")
@@ -9295,10 +9234,10 @@ class BacktestApp:
         user_id = self.login_user_var.get().strip()
         try:
             self._account_monitor.clear_positions()  # will be rebuilt from callbacks
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, self._futures_account, 1)
-            call_com("GetFutureRights", skO.GetFutureRights,
-                     user_id, self._futures_account, 1)  # 1=TWD
+            broker_port.query_open_interest(
+                user_id, self._futures_account, 1)
+            broker_port.query_future_rights(
+                user_id, self._futures_account, 1)  # 1=TWD
         except Exception as e:
             _log(f"帳戶查詢失敗 Account query error: {e}")
 
@@ -9689,17 +9628,11 @@ def register_com_events() -> None:
     """Attach the SKCOM event handler classes to the COM objects."""
     if not _com_available:
         return
-    import comtypes.client
     quote_event = SKQuoteLibEvents()
-    _com_event_handlers.append(quote_event)
-    _com_event_handlers.append(comtypes.client.GetEvents(skQ, quote_event))
     reply_event = SKReplyLibEvent()
-    _com_event_handlers.append(reply_event)
-    _com_event_handlers.append(comtypes.client.GetEvents(skR, reply_event))
-    if skO is not None:
-        order_event = SKOrderLibEvents()
-        _com_event_handlers.append(order_event)
-        _com_event_handlers.append(comtypes.client.GetEvents(skO, order_event))
+    order_event = SKOrderLibEvents() if skO is not None else None
+    _com_event_handlers.extend(
+        broker_port.attach_events(quote_event, reply_event, order_event))
 
 
 def main():
