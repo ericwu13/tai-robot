@@ -43,6 +43,83 @@ HEARTBEAT_INTERVAL_MS = 5000
 # The thread stays alive — it does not exit.
 _IDLE_PARK_S = 3600.0
 
+# os.replace on Windows raises PermissionError (WinError 5 / sharing
+# violation) while a reader holds the destination without FILE_SHARE_DELETE.
+# This runs on the Tk/COM main thread, so the budget is 4 attempts and
+# 5/10/20 ms (≤35 ms). Only PermissionError is retried. _sleep and
+# _monotonic are module-level so tests can inject fakes; atomic_write_json
+# also accepts per-call overrides.
+_REPLACE_ATTEMPTS = 4
+_REPLACE_BACKOFF_S = (0.005, 0.010, 0.020)
+_REPLACE_LOG_INTERVAL_S = 600.0
+# Readers retry the same sharing violation. 3 attempts, 10 ms apart.
+_READ_ATTEMPTS = 3
+_READ_BACKOFF_S = 0.010
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+_replace_log_lock = threading.Lock()
+_replace_log_state = {"last": None, "suppressed": 0}
+
+
+def _log_replace_failure_line(message: str) -> None:
+    """Default sink: one logger line, no traceback."""
+    logger.error(message)
+
+
+_replace_failure_log = _log_replace_failure_line
+
+
+def set_replace_failure_logger(fn) -> None:
+    """Send final heartbeat-write failures to ``fn``.
+
+    ``None`` restores the module logger. The Tk app points this at
+    ``run_backtest._log`` so a stamp or tick failure lands in the bot
+    log. The rate limit still applies — installing the sink does not
+    log every retry.
+    """
+    global _replace_failure_log
+    _replace_failure_log = _log_replace_failure_line if fn is None else fn
+
+
+def reset_replace_failure_log() -> None:
+    """Clear the rate-limit window. Tests only."""
+    with _replace_log_lock:
+        _replace_log_state["last"] = None
+        _replace_log_state["suppressed"] = 0
+
+
+def note_heartbeat_failure(message: str, *, monotonic=None) -> None:
+    """Log ``message`` on the first failure, then at most once per 10 min.
+
+    A repeat inside the window is counted. The next line that is emitted
+    includes that suppressed count. ``monotonic`` overrides the clock
+    (tests). The sink is whatever ``set_replace_failure_logger`` installed.
+    """
+    mono = _monotonic if monotonic is None else monotonic
+    now = float(mono())
+    with _replace_log_lock:
+        last = _replace_log_state["last"]
+        if last is not None and now - last < _REPLACE_LOG_INTERVAL_S:
+            _replace_log_state["suppressed"] += 1
+            return
+        suppressed = int(_replace_log_state["suppressed"])
+        _replace_log_state["suppressed"] = 0
+        _replace_log_state["last"] = now
+    if suppressed:
+        message = f"{message} ({suppressed} suppressed)"
+    try:
+        _replace_failure_log(message)
+    except Exception:
+        logger.exception("heartbeat failure log raised")
+
 
 class MainThreadHeartbeatError(RuntimeError):
     """Raised when a background thread tries to write heartbeat.json."""
@@ -55,8 +132,18 @@ def _assert_main_thread() -> None:
             f"(caller={threading.current_thread().name!r})")
 
 
-def atomic_write_json(path: str, payload: dict) -> None:
-    """Write JSON via a temp file in the same directory plus os.replace."""
+def atomic_write_json(path: str, payload: dict, *, sleep=None,
+                      monotonic=None) -> None:
+    """Write JSON via a temp file in the same directory plus os.replace.
+
+    ``os.replace`` is retried only on ``PermissionError`` (Windows sharing
+    violation while a reader holds the destination). 4 attempts, backing
+    off 5/10/20 ms. Any other error fails immediately. The final failure
+    removes the temp file, re-raises, and is logged once per 10 minutes.
+    ``sleep`` and ``monotonic`` override the module clock for tests.
+    """
+    sleep_fn = _sleep if sleep is None else sleep
+    mono_fn = _monotonic if monotonic is None else monotonic
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".hb-", suffix=".tmp", dir=directory)
@@ -66,13 +153,58 @@ def atomic_write_json(path: str, payload: dict) -> None:
             handle.flush()
         # Atomic rename is the durability boundary. fsync on the Tk thread
         # would stall the broker pump around every wrapped COM call.
-        os.replace(tmp, path)
+        _replace_into_place(tmp, path, sleep_fn=sleep_fn, monotonic=mono_fn)
     except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
+    """Move ``tmp`` onto ``path``. Retry PermissionError only."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            if attempt + 1 >= _REPLACE_ATTEMPTS:
+                # Callers (tick / call_com) must not log this again.
+                exc.hb_logged = True  # type: ignore[attr-defined]
+                note_heartbeat_failure(
+                    "heartbeat os.replace failed for "
+                    f"{os.path.basename(path) or path}: "
+                    f"[{type(exc).__name__}] {exc}",
+                    monotonic=monotonic)
+                raise
+            sleep_fn(_REPLACE_BACKOFF_S[attempt])
+
+
+def _remove_with_retry(path: str, *, sleep=None, monotonic=None) -> None:
+    """Delete ``path``. Same PermissionError backoff as ``os.replace``.
+
+    Missing files and other OSErrors are ignored, matching the old
+    ``delete()``. The final PermissionError is rate-limited and not
+    re-raised.
+    """
+    sleep_fn = _sleep if sleep is None else sleep
+    mono_fn = _monotonic if monotonic is None else monotonic
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.remove(path)
+            return
+        except PermissionError as exc:
+            if attempt + 1 >= _REPLACE_ATTEMPTS:
+                note_heartbeat_failure(
+                    "heartbeat os.remove failed for "
+                    f"{os.path.basename(path) or path}: "
+                    f"[{type(exc).__name__}] {exc}",
+                    monotonic=mono_fn)
+                return
+            sleep_fn(_REPLACE_BACKOFF_S[attempt])
+        except OSError:
+            return
 
 
 def dump_thread_stacks(path: str) -> None:
@@ -91,6 +223,60 @@ def dump_thread_stacks(path: str) -> None:
         for tid, frame in frames.items():
             handle.write(f"\n--- thread {tid} ---\n")
             handle.write("".join(traceback.format_stack(frame)))
+
+
+_snapshots_lock = threading.Lock()
+_snapshots: dict[str, dict] = {}
+
+
+def _snapshot_key(path: str) -> str:
+    return os.path.abspath(path)
+
+
+def _copy_heartbeat(payload: dict) -> dict:
+    inflight = payload.get("inflight_com_call")
+    return {
+        "ts": payload.get("ts"),
+        "pid": payload.get("pid"),
+        "inflight_com_call": (
+            dict(inflight) if isinstance(inflight, dict) else inflight),
+    }
+
+
+def _publish_snapshot(path: str, payload: dict) -> None:
+    """Remember the last heartbeat this process successfully wrote."""
+    snap = _copy_heartbeat(payload)
+    with _snapshots_lock:
+        _snapshots[_snapshot_key(path)] = snap
+
+
+def _clear_snapshot(path: str) -> None:
+    with _snapshots_lock:
+        _snapshots.pop(_snapshot_key(path), None)
+
+
+def _read_snapshot(path: str) -> dict | None:
+    with _snapshots_lock:
+        snap = _snapshots.get(_snapshot_key(path))
+        if snap is None:
+            return None
+        return _copy_heartbeat(snap)
+
+
+def _load_heartbeat(bot_dir: str) -> dict | None:
+    """In-process view of the heartbeat.
+
+    The watchdog used to re-open heartbeat.json every poll. On Windows
+    that open denies ``os.replace`` on the main thread. A snapshot of the
+    last successful write is the same data without taking the file. When
+    this process has not published one (or ``delete`` cleared it), fall
+    back to the file so a foreign heartbeat is still visible.
+    """
+    path = os.path.join(bot_dir, HEARTBEAT_FILENAME)
+    snap = _read_snapshot(path)
+    if snap is not None:
+        return snap
+    return read_heartbeat(path)
 
 
 class HeartbeatWriter:
@@ -120,6 +306,7 @@ class HeartbeatWriter:
             "inflight_com_call": self._inflight,
         }
         atomic_write_json(self.path, payload)
+        _publish_snapshot(self.path, payload)
 
     def begin_inflight(self, name: str) -> None:
         """Persist the in-flight call BEFORE the COM call can block."""
@@ -131,40 +318,81 @@ class HeartbeatWriter:
         self.write()
 
     def delete(self) -> None:
-        """Remove heartbeat.json. Main-thread only; missing file is fine."""
+        """Remove heartbeat.json. Main-thread only; missing file is fine.
+
+        The snapshot stays until the remove attempts finish so the
+        watchdog does not fall back to opening the file while
+        ``os.remove`` runs (that open is what makes remove fail with
+        PermissionError on Windows). A final PermissionError is logged
+        and swallowed — delete must not raise on the Tk thread.
+        """
         _assert_main_thread()
-        try:
-            os.remove(self.path)
-        except OSError:
-            pass
+        _remove_with_retry(self.path)
+        _clear_snapshot(self.path)
 
     @contextmanager
     def inflight(self, name: str):
         try:
             self.begin_inflight(name)
-        except Exception:
-            logger.exception(
-                "heartbeat start stamp failed for %s; the COM call still runs",
-                name)
+        except Exception as exc:
+            _report_stamp_failure(
+                exc,
+                "heartbeat start stamp failed for "
+                f"{name}; the COM call still runs: "
+                f"[{type(exc).__name__}] {exc}")
         try:
             yield
         finally:
             try:
                 self.end_inflight()
-            except Exception:
-                logger.exception(
-                    "heartbeat end stamp failed for %s; the broker result is unchanged",
-                    name)
+            except Exception as exc:
+                _report_stamp_failure(
+                    exc,
+                    "heartbeat end stamp failed for "
+                    f"{name}; the broker result is unchanged: "
+                    f"[{type(exc).__name__}] {exc}")
 
 
-def read_heartbeat(path: str) -> dict | None:
-    """Return the heartbeat object, or None if it is missing or unreadable."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+def _open_read(path: str):
+    """Open a heartbeat for reading. Tests inject a flaky opener here."""
+    return open(path, encoding="utf-8")
+
+
+def read_heartbeat(path: str, *, sleep=None) -> dict | None:
+    """Return the heartbeat object, or None if it is missing or unreadable.
+
+    ``PermissionError`` is tried up to 3 times, 10 ms apart. A reader
+    using plain ``open`` cannot share delete access with ``os.replace``;
+    the replace has usually finished by the next attempt. Any other
+    error returns None immediately. ``sleep`` overrides the backoff
+    (tests).
+    """
+    sleep_fn = _sleep if sleep is None else sleep
+    for attempt in range(_READ_ATTEMPTS):
+        try:
+            with _open_read(path) as handle:
+                data = json.load(handle)
+        except PermissionError:
+            if attempt + 1 >= _READ_ATTEMPTS:
+                return None
+            sleep_fn(_READ_BACKOFF_S)
+            continue
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def _report_stamp_failure(exc: BaseException, message: str) -> None:
+    """Rate-limited stamp log. Skip when the writer already logged it.
+
+    ``logger.exception`` on every COM call would miss the bot log (the
+    main_heartbeat logger is not attached there) and would ignore the
+    10-minute limit. The installed sink is ``_log`` while a bot is up.
+    """
+    if getattr(exc, "hb_logged", False):
+        return
+    note_heartbeat_failure(message)
 
 
 def _inflight_age(hb: dict, now: float) -> tuple[dict | None, float | None]:
@@ -291,7 +519,7 @@ class HangWatchdog:
         """Treat the current file as just observed. Leave ``_latched`` alone."""
         self._seen_mono = now_mono
         self._seen_inflight_mono = now_mono
-        hb = read_heartbeat(os.path.join(self.bot_dir, HEARTBEAT_FILENAME))
+        hb = _load_heartbeat(self.bot_dir)
         if not isinstance(hb, dict):
             return
         self._seen_ts = _hb_ts(hb)
@@ -300,8 +528,7 @@ class HangWatchdog:
     def _check_once(self, now_mono: float | None = None) -> None:
         if now_mono is None:
             now_mono = time.monotonic()
-        path = os.path.join(self.bot_dir, HEARTBEAT_FILENAME)
-        hb = read_heartbeat(path)
+        hb = _load_heartbeat(self.bot_dir)
         if hb is None:
             # Missing or unreadable. Not a recovery — clearing the latch
             # here would send a second alert when the same hang is readable
@@ -473,6 +700,7 @@ def stop() -> None:
         watchdog.disable()
     if writer is not None:
         writer.delete()
+    set_replace_failure_logger(None)
 
 
 def call_com(name: str, fn, *args, **kwargs):
@@ -493,10 +721,12 @@ def call_com(name: str, fn, *args, **kwargs):
         return fn(*args, **kwargs)
     try:
         writer.begin_inflight(name)
-    except Exception:
-        logger.exception(
-            "heartbeat start stamp failed for %s; the COM call still runs",
-            name)
+    except Exception as exc:
+        _report_stamp_failure(
+            exc,
+            "heartbeat start stamp failed for "
+            f"{name}; the COM call still runs: "
+            f"[{type(exc).__name__}] {exc}")
     outcome = None
     error = None
     try:
@@ -505,10 +735,12 @@ def call_com(name: str, fn, *args, **kwargs):
         error = exc
     try:
         writer.end_inflight()
-    except Exception:
-        logger.exception(
-            "heartbeat end stamp failed for %s; the broker result is unchanged",
-            name)
+    except Exception as exc:
+        _report_stamp_failure(
+            exc,
+            "heartbeat end stamp failed for "
+            f"{name}; the broker result is unchanged: "
+            f"[{type(exc).__name__}] {exc}")
     if error is not None:
         raise error
     return outcome

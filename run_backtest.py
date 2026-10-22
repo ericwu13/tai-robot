@@ -9392,7 +9392,7 @@ class BacktestApp:
         It dumps stacks, writes hang.json, and sends one Discord P1 per
         hang episode (re-armed only after the heartbeat recovers).
         """
-        from src.live.main_heartbeat import start
+        from src.live.main_heartbeat import set_replace_failure_logger, start
         runner = self._live_runner
         if runner is None:
             return
@@ -9403,8 +9403,8 @@ class BacktestApp:
                 _discord.notify(message)
 
         def _p2_start_failed(exc: BaseException) -> None:
-            # Python logging in main_heartbeat is not wired to the bot
-            # log. This is the path Discord and the debug file can see.
+            # One-shot deploy failure. Distinct from the rate-limited
+            # os.replace line, which goes through _log via the sink below.
             _log(f"[HEARTBEAT] start failed: [{type(exc).__name__}] {exc}")
             if _discord is not None and _discord.enabled:
                 try:
@@ -9421,6 +9421,11 @@ class BacktestApp:
         # MainThreadHeartbeatError is re-raised by start() and lands here.
         # A first-write OSError is returned on the writer: log the P2 and
         # still arm the tick so a later tick retries.
+        # Stamp failures used to call logger.exception, which never
+        # reached this bot log, and every tick failure was logged.
+        # The sink is _log. The writer rate-limits the final
+        # os.replace failure: the first line, then at most one per 10 min.
+        set_replace_failure_logger(_log)
         try:
             writer = start(runner.bot_dir, alert_fn=_alert)
         except Exception as e:
@@ -9439,14 +9444,19 @@ class BacktestApp:
 
     def _on_main_heartbeat(self) -> None:
         """root.after tick. This is the only periodic writer."""
-        from src.live.main_heartbeat import tick
+        from src.live.main_heartbeat import note_heartbeat_failure, tick
         self._heartbeat_after_id = None
         if not getattr(self, "_heartbeat_active", False):
             return
         try:
             tick()
         except Exception as e:
-            _log(f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
+            # A final os.replace failure is already in the bot log via
+            # the rate-limited sink (hb_logged). Anything else still
+            # goes to _log, through the same 10-minute limit.
+            if not getattr(e, "hb_logged", False):
+                note_heartbeat_failure(
+                    f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
         if getattr(self, "_heartbeat_active", False):
             self._arm_heartbeat_tick()
 
