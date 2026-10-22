@@ -6745,8 +6745,40 @@ class BacktestApp:
                 self._live_log_msg(
                     "[RESUME] Kept in-flight fill_pending — "
                     "not sending a new exit", "status")
+            # Sim is flat, so position_side cannot name the entry. A
+            # deferred close still does: side LONG means the in-flight
+            # entry was a long. The real book has to match that side.
+            # Otherwise the poller is started with expected_sign=None,
+            # any non-zero OI confirms it, and the close is replayed
+            # into the opposite real position.
+            if trading_mode in ("semi_auto", "auto"):
+                close_side = self._deferred_close_side()
+                if close_side:
+                    order_sym = SYMBOL_CONFIG.get(symbol, {}).get(
+                        "order_symbol", "")
+                    prefix = order_sym[:2] if order_sym else ""
+                    real_ok, real_reason = resume_real_position_ok(
+                        self._account_monitor.get_signed_position(prefix),
+                        close_side,
+                        self._account_monitor.oi_snapshot_received,
+                    )
+                    if not real_ok:
+                        self._live_log_msg(
+                            "[RESUME] Flat sim, deferred close "
+                            f"{close_side} does not match the real book "
+                            f"({real_reason}) — NOT re-arming. "
+                            "Manual review required.",
+                            "status")
         self._arm_resumed_fill_poll(
             outcome, real_ok=real_ok, real_reason=real_reason)
+
+    def _deferred_close_side(self) -> str:
+        """Side named by a restored deferred close, or \"\"."""
+        deferred = self._trading_guard._deferred_close
+        if not isinstance(deferred, dict):
+            return ""
+        side = str(deferred.get("side") or "").upper()
+        return side if side in ("LONG", "SHORT") else ""
 
     def _arm_resumed_fill_poll(self, outcome: dict, *,
                                real_ok: bool, real_reason: str) -> None:
@@ -6759,31 +6791,37 @@ class BacktestApp:
 
         Do not arm when that would confirm the wrong book (issue #168):
 
-        * sim is open and ``real_ok`` is False (opposite, real-flat, or
-          an unanswered snapshot). The entry poller treats any non-zero
-          OI as the fill and ``timeout()`` used to do the same after 10s,
-          then the saved close is replayed in the wrong direction.
+        * the sim is open and ``real_ok`` is False, or the sim is flat
+          but a deferred close names a side the real book does not hold.
+          The entry poller would otherwise treat any non-zero OI as the
+          fill and replay that close into the opposite position.
         * the OI snapshot has not arrived (``get_signed_position`` is 0,
           and an in-flight exit is "already flat").
         * COM is down. ``start()`` would auto-confirm with no fill.
 
-        The gate stays up and an alert is raised. A mismatched real book
-        also drops the deferred close so it cannot be replayed later.
+        The gate stays up and an alert is raised. A mismatched book
+        drops the deferred close. On the flat branch a missing snapshot
+        or COM drops it too, so it cannot be replayed later.
         """
         if not outcome.get("kept_inflight") or not self._trading_guard.fill_pending:
             return
         action_type = self._trading_guard.fill_pending_type or "entry"
         sim_open = bool(
             self._live_runner and self._live_runner.broker.position_size > 0)
+        close_side = "" if sim_open else self._deferred_close_side()
         snapshot_received = bool(
             getattr(self._account_monitor, "oi_snapshot_received", False))
         com_ok = bool(
             _com_available and skO is not None and self._futures_account)
-        mismatch = sim_open and not real_ok
+        directed = sim_open or bool(close_side)
+        mismatch = directed and not real_ok
+        # Flat sim + a saved close: a missing snapshot or COM is the
+        # same hazard as a mismatch, because there is no position side
+        # to constrain the poller.
+        drop_close = mismatch or (
+            bool(close_side) and (not snapshot_received or not com_ok))
         if mismatch or not snapshot_received or not com_ok:
-            if mismatch:
-                # The saved close is a sim-side order. Replaying it
-                # against the opposite real book adds to that position.
+            if drop_close:
                 self._trading_guard._deferred_close = None
             why = real_reason if mismatch else (
                 "no_com" if not com_ok else "unknown")
@@ -6802,8 +6840,8 @@ class BacktestApp:
                 "Orders stay blocked until you review the position.",
             )
             return
-        side = ""
-        if self._live_runner and self._live_runner.broker.position_side:
+        side = close_side
+        if sim_open and self._live_runner and self._live_runner.broker.position_side:
             side = self._live_runner.broker.position_side.value or ""
         expected_sign = 1 if side == "LONG" else -1 if side == "SHORT" else None
         self._live_log_msg(

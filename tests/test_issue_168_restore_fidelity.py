@@ -9,6 +9,8 @@ Each test plants one resume fault and asserts the guard that must catch it:
 * the first tick after restore is not evaluated (gap left unprotected)
 * a flat session keeps a stale stop that closes the next trade
 * a restored fill gate never restarts the fill poller (flat and open)
+* a flat sim with a deferred close confirms the opposite real book
+* the resumed poller is armed without the deferred close's sign
 * live mode keeps a paper loss-limit stop
 * the restore alert fires again
 * a zero or negative stop/limit is restored as a real price
@@ -804,3 +806,107 @@ def test_no_com_resume_does_not_autoconfirm_entry(monkeypatch):
     assert app._alerts
     assert "not started" in app._alerts[0][1]
     assert not any("FILL_CONFIRMED" in line for line in app.live_log.lines)
+
+
+def test_flat_sim_deferred_long_does_not_confirm_real_short(monkeypatch):
+    """Sim flat, deferred close-LONG, real SHORT: do not arm or replay.
+
+    The open-position book check used to be skipped because the sim was
+    flat, so the poller started with expected_sign=None and confirmed on
+    the real -1. The saved close then sold into that short.
+    """
+    app = _resume_guard_app(position_size=0)
+    app._account_monitor = SimpleNamespace(
+        get_signed_position=lambda prefix: -1,
+        oi_snapshot_received=True,
+        positions=[],
+    )
+    _enable_fill_com(monkeypatch)
+    app._reconcile_resumed_guard(
+        _guard_session("entry", {
+            "action": "TRADE_CLOSE", "side": "LONG", "price": 22400,
+        }),
+        "auto",
+        "TX00",
+    )
+    guard = app._trading_guard
+    assert app._fill_poller.active is False
+    assert app._fill_poller.on_position_update(-1) is None
+    assert guard.fill_pending is True
+    assert guard._deferred_close is None
+    assert guard.real_entry_confirmed is False
+    assert app._alerts
+    assert "not started" in app._alerts[0][1]
+    assert not any("FILL_CONFIRMED" in line for line in app.live_log.lines)
+    verdict, _details = guard.decide("auto", "TRADE_CLOSE", "LONG")
+    assert verdict == guard.BLOCK_FILL_PENDING
+
+
+def test_flat_deferred_close_missing_book_drops_close(monkeypatch):
+    """Flat sim + saved close: no snapshot, or no COM, drops the close.
+
+    Arming either way has no position side to constrain the poller, so
+    the close must not be left for a later confirm to replay.
+    """
+    import run_backtest as rb
+
+    cases = (
+        ("snapshot", True, False, 0),
+        ("com", False, True, 1),
+    )
+    for name, com_on, snapshot, signed in cases:
+        app = _resume_guard_app(position_size=0)
+        app._account_monitor = SimpleNamespace(
+            get_signed_position=lambda prefix, signed=signed: signed,
+            oi_snapshot_received=snapshot,
+            positions=[],
+        )
+        monkeypatch.setattr(rb, "_com_available", com_on)
+        if com_on:
+            monkeypatch.setattr(rb, "skO", object())
+        app._reconcile_resumed_guard(
+            _guard_session("entry", {
+                "action": "TRADE_CLOSE", "side": "LONG", "price": 22400,
+            }),
+            "auto",
+            "TX00",
+        )
+        guard = app._trading_guard
+        assert app._fill_poller.active is False, name
+        assert guard.fill_pending is True, name
+        assert guard._deferred_close is None, name
+        assert guard.real_entry_confirmed is False, name
+        assert app._alerts, name
+        assert "not started" in app._alerts[0][1], name
+
+
+def test_flat_deferred_close_wires_expected_sign_to_poller(monkeypatch):
+    """A matching real long reaches the poller as expected_sign=+1, resumed.
+
+    Calling _start_fill_polling(action_type) without those kwargs leaves
+    the poller direction-blind: the opposite OI confirms the entry.
+    """
+    app = _resume_guard_app(position_size=0)
+    app._account_monitor = SimpleNamespace(
+        get_signed_position=lambda prefix: 1,
+        oi_snapshot_received=True,
+        positions=[],
+    )
+    _enable_fill_com(monkeypatch)
+    app._reconcile_resumed_guard(
+        _guard_session("entry", {
+            "action": "TRADE_CLOSE", "side": "LONG", "price": 22400,
+        }),
+        "auto",
+        "TX00",
+    )
+    poller = app._fill_poller
+    guard = app._trading_guard
+    assert poller.active is True
+    assert poller._expected_sign == 1
+    assert poller._resumed is True
+    assert guard._deferred_close["side"] == "LONG"
+    assert poller.on_position_update(-1) is None
+    assert guard.real_entry_confirmed is False
+    confirmed = poller.on_position_update(1)
+    assert confirmed is not None and confirmed.type == "confirmed"
