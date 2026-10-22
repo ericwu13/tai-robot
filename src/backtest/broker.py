@@ -11,6 +11,45 @@ class OrderSide(Enum):
     SHORT = "SHORT"
 
 
+def _opt_price(value) -> int | None:
+    """Coerce a persisted price to a positive int, or None if absent/invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def _orders_from_dicts(raw) -> list:
+    """Rebuild exit orders from a session list. Junk rows are skipped."""
+    if not isinstance(raw, list):
+        return []
+    orders = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        side_raw = item.get("side")
+        try:
+            side = OrderSide(side_raw) if side_raw else OrderSide.LONG
+        except ValueError:
+            side = OrderSide.LONG
+        try:
+            qty = int(item.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        orders.append(Order(
+            tag=str(item.get("tag") or ""),
+            side=side,
+            qty=qty,
+            limit=_opt_price(item.get("limit")),
+            stop=_opt_price(item.get("stop")),
+            from_entry=str(item.get("from_entry") or ""),
+        ))
+    return orders
+
+
 def _mode_to_source(mode: str) -> str:
     """Map a trading mode to a trade source tag."""
     if mode in ("semi_auto", "auto"):
@@ -622,6 +661,19 @@ class SimulatedBroker:
             "_cumulative_pnl": self._cumulative_pnl,
             "_bar_index": self._bar_index,
             "_exit_bar_index": self._exit_bar_index,
+            # Issue #168: exit orders live only in memory unless persisted.
+            # A restart otherwise restores the position with no stop/TP.
+            "pending_exits": [
+                {
+                    "tag": o.tag,
+                    "side": o.side.value if o.side else None,
+                    "qty": o.qty,
+                    "limit": o.limit,
+                    "stop": o.stop,
+                    "from_entry": o.from_entry,
+                }
+                for o in self._pending_exits
+            ],
         }
 
     @classmethod
@@ -629,7 +681,8 @@ class SimulatedBroker:
         """Restore broker state from a serialized dict.
 
         All new fields use ``.get()`` with safe defaults so old session
-        files (before issue #45) load without error.
+        files (before issue #45, and before pending exits in #168) load
+        without error.
         """
         broker = cls(
             point_value=data.get("point_value", 1),
@@ -666,4 +719,5 @@ class SimulatedBroker:
         broker._cumulative_pnl = data.get("_cumulative_pnl", 0)
         broker._bar_index = data.get("_bar_index", 0)
         broker._exit_bar_index = data.get("_exit_bar_index", -1)
+        broker._pending_exits = _orders_from_dicts(data.get("pending_exits"))
         return broker

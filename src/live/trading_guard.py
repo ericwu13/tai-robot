@@ -32,6 +32,37 @@ class TradingGuard:
         # the deferred close so the real exit order isn't permanently lost.
         self._deferred_close: dict | None = None
 
+    def to_dict(self) -> dict:
+        """Snapshot the in-flight fill gate for session.json (issue #168).
+
+        Only the fields resume must not forget. ``real_entry_confirmed``
+        stays with :meth:`restore_confirmed_position` so a stale snapshot
+        cannot un-confirm a position the #79 reconcile just accepted.
+        """
+        deferred = self._deferred_close
+        return {
+            "fill_pending": bool(self.fill_pending),
+            "fill_pending_type": self.fill_pending_type if self.fill_pending else "",
+            "deferred_close": dict(deferred) if isinstance(deferred, dict) else None,
+        }
+
+    def restore_inflight(self, data: dict) -> None:
+        """Put a persisted in-flight fill back after resume (issue #168).
+
+        ``reset()`` on deploy and :meth:`restore_confirmed_position` both
+        clear ``fill_pending`` and the deferred close. An exit that was
+        already sent, and not yet confirmed, has to stay pending so resume
+        does not send a second one. Does not touch ``real_entry_confirmed``.
+        """
+        if not isinstance(data, dict):
+            return
+        pending = bool(data.get("fill_pending", False))
+        kind = str(data.get("fill_pending_type") or "")
+        self.fill_pending = pending
+        self.fill_pending_type = kind if pending else ""
+        deferred = data.get("deferred_close")
+        self._deferred_close = dict(deferred) if isinstance(deferred, dict) else None
+
     def reset(self) -> None:
         """Reset all state (called on new deploy)."""
         self.real_entry_confirmed = False
@@ -277,3 +308,36 @@ class TradingGuard:
             return {"trade_type": 1, "new_close": 0}  # IOC, new
         else:
             return {"trade_type": 0, "new_close": 2}  # ROD, auto (exchange decides)
+
+
+def apply_resume_guard(
+    guard: TradingGuard,
+    *,
+    position_open: bool,
+    real_ok: bool,
+    persisted: dict | None,
+) -> dict:
+    """Reconcile the guard on resume (issues #79 and #168).
+
+    Returns ``{"cleared_stale": bool, "kept_inflight": bool}``.
+
+    #79: an inherited open position whose real entry already happened must
+    set ``real_entry_confirmed``, otherwise every exit is SKIP_EXIT. That
+    reconcile also clears ``fill_pending`` — correct only when nothing
+    in-flight was saved.
+
+    #168: a persisted in-flight ``fill_pending`` / deferred close is put
+    back afterwards. ``reset()`` at deploy has already wiped them; without
+    the put-back an exit that was sent last session is sent again.
+    Legacy sessions (``persisted is None``) keep the #79 clear.
+    """
+    cleared = False
+    if position_open and real_ok:
+        cleared = bool(guard.restore_confirmed_position())
+    kept = False
+    if isinstance(persisted, dict):
+        guard.restore_inflight(persisted)
+        kept = bool(persisted.get("fill_pending"))
+        if kept:
+            cleared = False
+    return {"cleared_stale": cleared, "kept_inflight": kept}

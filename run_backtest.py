@@ -98,7 +98,7 @@ _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
-from src.live.trading_guard import TradingGuard
+from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.main_heartbeat import call_com
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
@@ -6648,6 +6648,14 @@ class BacktestApp:
         """Error popup on the deploy path (log-only when headless)."""
         messagebox.showerror(title, message)
 
+    def _on_restore_alert(self, message: str) -> None:
+        """Alert when a resumed position has no recoverable stop (issue #168).
+
+        Headless overrides ``_alert`` and only records it, so a detached
+        bot is not blocked on a hidden dialog.
+        """
+        self._alert("恢復後沒有停損 No Stop After Restore", message)
+
     def _deploy_live_from(self, req: DeployRequest) -> bool:
         """Deploy a live bot from an already-resolved request.
 
@@ -6922,6 +6930,12 @@ class BacktestApp:
         self._live_runner.trading_mode = trading_mode
         self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
+        # Issue #168: snapshot the guard into session.json on each save.
+        # Do not rebind self._trading_guard — the fill poller holds it.
+        # A runner double that has no session writer simply skips this.
+        _set_guard = getattr(self._live_runner, "set_guard_state_provider", None)
+        if callable(_set_guard):
+            _set_guard(self._trading_guard.to_dict)
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
         self._live_runner.on_mode_changed = self._on_mode_changed
         self._live_runner.mode_switch_veto = (
@@ -7032,10 +7046,16 @@ class BacktestApp:
             # guard.reset() (line above at deploy) cleared real_entry_confirmed
             # and fill_pending, but the restored broker may already hold an
             # open position from the previous session. Without this, every
-            # exit/force-close is SKIP_EXIT'd (real_entry_confirmed=False) and
-            # any stale fill_pending would BLOCK_FILL_PENDING the close forever
-            # — the live position stays stuck open until the user manually
-            # switches trading modes.
+            # exit/force-close is SKIP_EXIT'd (real_entry_confirmed=False).
+            # Issue #168: fill_pending and the deferred close are persisted.
+            # apply_resume_guard puts them back so an in-flight exit is not
+            # cleared and sent again. Legacy sessions have no snapshot, and
+            # keep the #79 clear.
+            persisted_guard = None
+            if isinstance(resume_session, dict):
+                raw_guard = resume_session.get("trading_guard")
+                if isinstance(raw_guard, dict):
+                    persisted_guard = raw_guard
             if self._live_runner.broker.position_size > 0:
                 # Real-money hazard (issue #79 review): the restored SIM broker
                 # can hold a position even when the REAL account is FLAT (user
@@ -7062,9 +7082,14 @@ class BacktestApp:
                         sim_side,
                         self._account_monitor.oi_snapshot_received,
                     )
+                outcome = apply_resume_guard(
+                    self._trading_guard,
+                    position_open=True,
+                    real_ok=real_ok,
+                    persisted=persisted_guard,
+                )
                 if real_ok:
-                    cleared = self._trading_guard.restore_confirmed_position()
-                    if cleared:
+                    if outcome["cleared_stale"]:
                         self._live_log_msg(
                             "[RESUME] Cleared stale fill_pending — position already "
                             "confirmed from previous session", "status")
@@ -7084,6 +7109,21 @@ class BacktestApp:
                     self._live_log_msg(
                         "[RESUME] Real account flat but sim has position — NOT "
                         "confirming entry. Manual review required.", "status")
+                if outcome["kept_inflight"]:
+                    self._live_log_msg(
+                        "[RESUME] Kept in-flight fill_pending — "
+                        "not sending a new exit", "status")
+            elif persisted_guard is not None:
+                outcome = apply_resume_guard(
+                    self._trading_guard,
+                    position_open=False,
+                    real_ok=False,
+                    persisted=persisted_guard,
+                )
+                if outcome["kept_inflight"]:
+                    self._live_log_msg(
+                        "[RESUME] Kept in-flight fill_pending — "
+                        "not sending a new exit", "status")
 
             # Issue #79 (sub-problem C): explicitly re-sync the mode tag now,
             # before warmup/replay begins. The var was set at deploy time, but
@@ -7125,6 +7165,7 @@ class BacktestApp:
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
         self._live_runner.on("on_decision", lambda d: self.root.after(0, self._on_live_decision, d))
         self._live_runner.on("on_status", lambda s: self.root.after(0, self._live_log_msg, s, "status"))
+        self._live_runner.on("on_alert", lambda m: self.root.after(0, self._on_restore_alert, m))
         self._live_runner.on("on_daily_report", lambda r: self.root.after(0, self._on_live_daily_report, r))
 
         # Set data source for live mode
@@ -7961,7 +8002,10 @@ class BacktestApp:
             simulate=bool(simulate),
         )
 
-        # Real-time TP/SL check on every tick (fills at exact price)
+        # Real-time TP/SL check on every tick (fills at exact price).
+        # Issue #168: restored exits are already on the broker, so the
+        # first live tick — this call, once history replay has finished —
+        # evaluates them immediately. A gapped stop fills at the tick.
         if self._live_runner and self._live_history_done:
             tick_dt = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
             result = self._live_runner.check_tick_exit(price, tick_dt)
