@@ -470,6 +470,322 @@ def test_phase1_does_not_spawn_a_broker_child():
     assert "multiprocessing.Process" not in app
 
 
+def _install_future_order(monkeypatch):
+    sk_mod = types.ModuleType("comtypes.gen.SKCOMLib")
+
+    class _Order:
+        pass
+
+    sk_mod.FUTUREORDER = _Order
+    gen = types.ModuleType("comtypes.gen")
+    gen.__path__ = []
+    comtypes_mod = types.ModuleType("comtypes")
+    comtypes_mod.__path__ = []
+    comtypes_mod.gen = gen
+    monkeypatch.setitem(sys.modules, "comtypes", comtypes_mod)
+    monkeypatch.setitem(sys.modules, "comtypes.gen", gen)
+    monkeypatch.setitem(sys.modules, "comtypes.gen.SKCOMLib", sk_mod)
+    return _Order
+
+
+def test_place_order_send_error_reaches_send_real_order(monkeypatch):
+    """SendFutureOrderCLR errors stay errors all the way into the app.
+
+    ``place_order`` and ``call_com`` re-raise. ``_send_real_order`` catches
+    that, logs it, and returns False. Swallowing the COM error and returning
+    ``("", 0)`` would make ``code == 0`` look like a sent order.
+    """
+    calls = []
+
+    def send(*args):
+        calls.append(args)
+        raise OSError("send failed")
+
+    _install_future_order(monkeypatch)
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(SendFutureOrderCLR=send))
+    monkeypatch.setattr(rb, "skC", object())
+    monkeypatch.setattr(rb, "_discord", None)
+    lines = []
+    exits = []
+    registered = []
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._futures_account = "ACCT"
+    app._live_runner = SimpleNamespace(
+        symbol="TMF00",
+        csv_logger=None,
+        strategy_display_name="Probe",
+        broker=SimpleNamespace(entry_bar_index=3, trades=[]),
+    )
+    app._fill_tracker = SimpleNamespace(
+        register_order=lambda *args, **_k: registered.append(args))
+    app._trading_guard = SimpleNamespace(
+        on_entry_sent=lambda: None,
+        on_exit_sent=lambda: exits.append("exit"),
+        on_fill_pending=lambda *_a: exits.append("pending"),
+    )
+    app._trading_mode = "semi_auto"
+    app.login_user_var = _Var("user-1")
+    app.live_log = SimpleNamespace(
+        append=lambda line, tag="status": lines.append(line))
+    app.root = _Root()
+
+    assert app._send_real_order(1, "TMFH6", "exit", 20000) is False
+    assert len(calls) == 1
+    assert calls[0][0] == "user-1"
+    assert calls[0][1] is False
+    text = "".join(lines)
+    assert "實單異常 Order error" in text
+    assert "send failed" in text
+    assert "實單已送出" not in text
+    assert "Order sent" not in text
+    assert exits == []
+    assert registered == []
+
+    with pytest.raises(OSError, match="send failed"):
+        rb.broker_port.place_order("user-1", object(), False)
+
+
+def _install_get_events(monkeypatch):
+    calls = []
+
+    def get_events(com_obj, sink):
+        token = ("GetEvents", len(calls))
+        calls.append((com_obj, sink, token))
+        return token
+
+    comtypes_mod = types.ModuleType("comtypes")
+    comtypes_mod.__path__ = []
+    client = types.ModuleType("comtypes.client")
+    client.GetEvents = get_events
+    comtypes_mod.client = client
+    monkeypatch.setitem(sys.modules, "comtypes", comtypes_mod)
+    monkeypatch.setitem(sys.modules, "comtypes.client", client)
+    return calls
+
+
+def test_attach_events_binds_quote_reply_and_order_sinks_in_order(monkeypatch):
+    """Quote, reply, then the order sink. Dropping the order sink is silent.
+
+    ``SKOrderLibEvents`` is what delivers order, open-interest, and fill
+    callbacks. The returned list is the sink, then its ``GetEvents`` token,
+    for quote, reply, and order, in that order.
+    """
+    calls = _install_get_events(monkeypatch)
+    skQ, skR, skO = object(), object(), object()
+    quote, reply, order = object(), object(), object()
+    port = InProcessSkcomPort(lambda: (None, skQ, skR, skO))
+    bound = port.attach_events(quote, reply, order)
+    assert [item[2] for item in calls] == [bound[1], bound[3], bound[5]]
+    assert calls == [
+        (skQ, quote, bound[1]),
+        (skR, reply, bound[3]),
+        (skO, order, bound[5]),
+    ]
+    assert bound == [
+        quote, bound[1],
+        reply, bound[3],
+        order, bound[5],
+    ]
+    assert port._bindings == bound
+
+
+def test_attach_events_skips_order_sink_when_order_lib_is_missing(monkeypatch):
+    calls = _install_get_events(monkeypatch)
+    skQ, skR = object(), object()
+    quote, reply, order = object(), object(), object()
+    port = InProcessSkcomPort(lambda: (None, skQ, skR, None))
+    bound = port.attach_events(quote, reply, order)
+    assert [com_obj for com_obj, _sink, _token in calls] == [skQ, skR]
+    assert order not in bound
+    assert None not in [com_obj for com_obj, _sink, _token in calls]
+    assert bound == [quote, bound[1], reply, bound[3]]
+    assert port._bindings == bound
+
+
+def test_attach_events_skips_order_sink_when_no_order_handler(monkeypatch):
+    calls = _install_get_events(monkeypatch)
+    skQ, skR, skO = object(), object(), object()
+    quote, reply = object(), object()
+    port = InProcessSkcomPort(lambda: (None, skQ, skR, skO))
+    bound = port.attach_events(quote, reply, None)
+    assert [com_obj for com_obj, _sink, _token in calls] == [skQ, skR]
+    assert skO not in [com_obj for com_obj, _sink, _token in calls]
+    assert None not in bound
+    assert bound == [quote, bound[1], reply, bound[3]]
+
+
+def test_register_com_events_binds_the_order_sink(monkeypatch):
+    calls = _install_get_events(monkeypatch)
+    skQ, skR, skO = object(), object(), object()
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skQ", skQ)
+    monkeypatch.setattr(rb, "skR", skR)
+    monkeypatch.setattr(rb, "skO", skO)
+    saved_handlers = list(rb._com_event_handlers)
+    saved_bindings = list(rb.broker_port._bindings)
+    try:
+        rb.register_com_events()
+        added = rb._com_event_handlers[len(saved_handlers):]
+    finally:
+        rb._com_event_handlers[:] = saved_handlers
+        rb.broker_port._bindings[:] = saved_bindings
+    assert [type(added[i]) for i in (0, 2, 4)] == [
+        rb.SKQuoteLibEvents, rb.SKReplyLibEvent, rb.SKOrderLibEvents]
+    assert calls == [
+        (skQ, added[0], added[1]),
+        (skR, added[2], added[3]),
+        (skO, added[4], added[5]),
+    ]
+    assert added[4] is calls[2][1]
+    assert isinstance(added[4], rb.SKOrderLibEvents)
+
+
+def test_initialize_com_success_restores_dll_search_and_returns_true(
+        tmp_path, monkeypatch):
+    """Success restores the default DLL search and reports available.
+
+    ``SetDllDirectoryW(None)`` is the last search-path call. Returning
+    False, or leaving the libs directory as the process DLL directory,
+    is a failed init.
+    """
+    import ctypes
+
+    libs = (
+        tmp_path / "CapitalAPI_2.13.57"
+        / "CapitalAPI_2.13.57_PythonExample" / "SKDLLPythonTester" / "libs")
+    libs.mkdir(parents=True)
+    libs_path = os.path.abspath(str(libs))
+    dll_calls = []
+
+    class _Kernel32:
+        def SetDllDirectoryW(self, path):
+            dll_calls.append(path)
+            return 1
+
+    monkeypatch.setattr(
+        ctypes, "windll", SimpleNamespace(kernel32=_Kernel32()), raising=False)
+
+    created = []
+
+    def get_module(_path):
+        return None
+
+    def create_object(coclass, interface=None):
+        obj = (coclass, interface)
+        created.append(obj)
+        return obj
+
+    comtypes_mod = types.ModuleType("comtypes")
+    comtypes_mod.__path__ = []
+    client = types.ModuleType("comtypes.client")
+    client.GetModule = get_module
+    client.CreateObject = create_object
+    comtypes_mod.client = client
+    gen = types.ModuleType("comtypes.gen")
+    gen.__path__ = []
+    sk_mod = types.ModuleType("comtypes.gen.SKCOMLib")
+    for name in (
+        "SKCenterLib", "ISKCenterLib", "SKQuoteLib", "ISKQuoteLib",
+        "SKReplyLib", "ISKReplyLib", "SKOrderLib", "ISKOrderLib",
+    ):
+        setattr(sk_mod, name, name)
+    gen.SKCOMLib = sk_mod
+    comtypes_mod.gen = gen
+    monkeypatch.setitem(sys.modules, "comtypes", comtypes_mod)
+    monkeypatch.setitem(sys.modules, "comtypes.client", client)
+    monkeypatch.setitem(sys.modules, "comtypes.gen", gen)
+    monkeypatch.setitem(sys.modules, "comtypes.gen.SKCOMLib", sk_mod)
+
+    saved_path = os.environ.get("PATH")
+    try:
+        result = initialize_com(
+            str(tmp_path), str(tmp_path), None, None, None, None)
+    finally:
+        if saved_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved_path
+
+    assert dll_calls == [libs_path, None]
+    assert dll_calls[-1] is None
+    assert result[0] is True
+    assert result[1:] == tuple(created)
+    assert created == [
+        ("SKCenterLib", "ISKCenterLib"),
+        ("SKQuoteLib", "ISKQuoteLib"),
+        ("SKReplyLib", "ISKReplyLib"),
+        ("SKOrderLib", "ISKOrderLib"),
+    ]
+
+
+def test_query_fills_forwards_the_format_argument(stamps):
+    log = []
+    port = InProcessSkcomPort(lambda: (None, None, None, _Rec(log)))
+    port.query_fills("user", "ACCT")
+    port.query_fills("user", "ACCT", 1)
+    port.query_fills("user", "ACCT", 9)
+    assert [args for _name, args in log] == [
+        ("user", "ACCT", 1),
+        ("user", "ACCT", 1),
+        ("user", "ACCT", 9),
+    ]
+    assert stamps == ["GetFulfillReport", "GetFulfillReport", "GetFulfillReport"]
+
+
+def test_exit_fill_poll_requests_per_fill_format(monkeypatch):
+    log = []
+    _install(monkeypatch, log)
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._futures_account = "ACCT"
+    app.login_user_var = _Var("user-1")
+    assert app._poll_exit_fill_via_report("SEQ") == 0
+    assert log == [("GetFulfillReport", ("user-1", "ACCT", 1))]
+
+
+def test_disconnect_is_emitted_after_quote_connected_is_cleared():
+    """The listener sees the flag already false, so it cannot re-enter."""
+    disc = rb.BacktestApp.__new__(rb.BacktestApp)
+    disc._quote_connected = True
+    disc._quote_ready_timer_id = None
+    disc._reconnect_controller = SimpleNamespace(on_clean_disconnect=lambda: None)
+    disc._cancel_reconnect_timer = lambda: None
+    disc.set_status = lambda *_a, **_k: None
+    disc._set_conn_dot = lambda *_a, **_k: None
+    disc.login_status_var = _Var()
+    disc.btn_login = _Widget()
+    disc.btn_reconnect = _Widget()
+    disc._live_runner = None
+    disc._live_tick_active = False
+    disc._conn_monitor = SimpleNamespace(on_disconnected=lambda: None)
+    disc._schedule_reconnect = lambda: None
+    seen = []
+
+    def on_disconnect(_payload):
+        seen.append(disc._quote_connected)
+
+    rb.broker_port.subscribe(BrokerEvent.DISCONNECT, on_disconnect)
+    try:
+        disc._on_disconnected()
+    finally:
+        rb.broker_port._listeners[BrokerEvent.DISCONNECT].remove(on_disconnect)
+    assert seen == [False]
+    assert disc._quote_connected is False
+
+
+def test_return_code_message_returns_the_center_string():
+    seen = []
+
+    class _Center:
+        def SKCenterLib_GetReturnCodeMessage(self, code):
+            seen.append(code)
+            return f"msg-{code}"
+
+    port = InProcessSkcomPort(lambda: (_Center(), None, None, None))
+    assert port.return_code_message(1097) == "msg-1097"
+    assert seen == [1097]
+
+
 # ── lint: no direct SKCOM call outside the adapter ──
 
 _PREFIXES = (
