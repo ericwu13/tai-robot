@@ -4,11 +4,26 @@ Weekend auto-evolution must not codegen an off-grid stretch such as
 EMA 50→80. DynamicExitPullback* may change at most two knobs, and only
 to the discrete values below. Structural edits escalate; they are not
 applied on the Saturday path.
+
+Issue #164: the class name is only a candidate. Knob mode applies when
+the class instantiates with no arguments, exposes every grid knob, and
+each knob has a literal ``kwargs.get`` default that
+``rewrite_knob_source`` can replace. An ineligible class is recorded
+once as ``not applicable``, keyed on class name plus source hash, and
+the watermark advances (option iii). The same key is not retried or
+re-alerted; a new hash is re-evaluated. There is no codegen fallback.
+Off-grid proposals on an eligible class still stop before the watermark.
+The substring grid match stays; an explicit class opt-in is a follow-up.
 """
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
+import os
 import re
+from datetime import datetime, timedelta, timezone
 
 MAX_AUTO_KNOBS = 2
 
@@ -23,6 +38,11 @@ DYNAMIC_EXIT_PULLBACK_GRID: dict[str, tuple] = {
 _EMA_OUT_OF_AUTO = (80, 90)
 _ESCALATE = "structural/codegen escalate, not auto"
 _FLOAT_KNOBS = ("atr_stop_mult", "atr_buffer_mult")
+
+# Option (iii): one persisted outcome per (class name, source hash).
+KNOB_NOT_APPLICABLE = "not applicable"
+KNOB_NOT_APPLICABLE_FILENAME = "knob_not_applicable.json"
+_TZ_TAIPEI = timezone(timedelta(hours=8))
 
 
 def knob_grid_for(class_name: str | None) -> dict[str, tuple] | None:
@@ -59,6 +79,85 @@ def read_strategy_knobs(strategy_cls, grid: dict) -> dict:
             raise KeyError(key)
         out[key] = getattr(inst, key)
     return out
+
+
+def _literal_kwarg_default_re(key: str) -> str:
+    """The ``kwargs.get("key", <num>)`` shape ``rewrite_knob_source`` replaces."""
+    return (
+        rf'(kwargs\.get\(\s*["\']{re.escape(key)}["\']\s*,\s*)'
+        rf'([0-9]+(?:\.[0-9]+)?)(\s*\))'
+    )
+
+
+def _has_literal_knob_default(source: str, key: str) -> bool:
+    return re.search(_literal_kwarg_default_re(key), source or "") is not None
+
+
+def _class_source(strategy_cls) -> str:
+    try:
+        return inspect.getsource(strategy_cls)
+    except (OSError, TypeError):
+        return ""
+
+
+def _knob_list(keys) -> str:
+    return "[" + ", ".join(keys) + "]"
+
+
+def knob_mode_ineligible(strategy_cls, grid, source) -> str:
+    """``""`` when Saturday knob mode can read and rewrite ``strategy_cls``.
+
+    Otherwise a reason: no-arg instantiation failed, a grid knob is
+    missing on the instance, reading a grid knob raised (anything other
+    than ``AttributeError``), or a grid knob has no literal
+    ``kwargs.get("key", <num>)`` default.
+    """
+    name = getattr(strategy_cls, "__name__", None) or str(strategy_cls)
+    try:
+        inst = strategy_cls()
+    except Exception as e:
+        return (f"knob mode not applicable: {name} no-arg instantiation "
+                f"failed ({type(e).__name__}: {e}); skipping knob mode")
+    missing = []
+    for key in grid:
+        try:
+            getattr(inst, key)
+        except AttributeError:
+            missing.append(key)
+        except Exception as e:
+            # Outside the instantiation try on purpose: a property that
+            # raises RuntimeError must become a refusal, not an EVO ERROR
+            # that escapes saturday_knob_decision (#164).
+            return (f"knob mode not applicable: {name} knob {key} "
+                    f"raised {type(e).__name__}; skipping knob mode")
+    if missing:
+        return (f"knob mode not applicable: {name} lacks knobs "
+                f"{_knob_list(missing)}; skipping knob mode")
+    nonliteral = [
+        key for key in grid
+        if not _has_literal_knob_default(source, key)
+    ]
+    if nonliteral:
+        return (f"knob mode not applicable: {name} lacks a literal "
+                f"kwargs.get default for knobs {_knob_list(nonliteral)}; "
+                f"skipping knob mode")
+    return ""
+
+
+def saturday_knob_directives_if_eligible(strategy_cls, source: str) -> str:
+    """MANDATORY knob block, or ``""`` when the class is not knob-eligible.
+
+    The Saturday prompt must not demand a grid the class cannot satisfy
+    (issue #164).
+    """
+    if strategy_cls is None:
+        return ""
+    grid = knob_grid_for(getattr(strategy_cls, "__name__", None))
+    if not grid:
+        return ""
+    if knob_mode_ineligible(strategy_cls, grid, source or ""):
+        return ""
+    return saturday_knob_directives()
 
 
 def knob_proposal_rejection(proposal, baseline: dict, grid: dict,
@@ -102,16 +201,33 @@ def changed_knobs(proposal, baseline: dict, grid: dict) -> dict:
     return out
 
 
-def saturday_knob_decision(class_name, proposal, strategy_cls):
+def saturday_knob_decision(class_name, proposal, strategy_cls,
+                           source: str | None = None):
     """``(rejection, knobs_to_apply)``.
 
     Non-grid strategies return ``("", None)`` so the caller keeps codegen.
+    A grid class that cannot be instantiated, is missing a grid knob, or
+    has no literal ``kwargs.get`` default returns ``(reason, None)``.
+    The caller records that once and advances the watermark (issue #164,
+    option iii: no codegen fallback, no weekly retry of the same source).
     A valid grid proposal returns ``("", {knob: value})``.
-    A refused Saturday plan returns ``(reason, None)``.
+    A refused Saturday plan on an eligible class returns ``(reason, None)``
+    and the caller stops before the watermark.
+
+    ``source`` is the strategy text ``rewrite_knob_source`` would edit.
+    ``None`` falls back to ``inspect.getsource`` so existing callers keep
+    working; pass ``""`` when the source was looked up and is missing.
     """
     grid = knob_grid_for(class_name)
     if grid is None:
         return "", None
+    if source is None:
+        source = _class_source(strategy_cls)
+    # Before read_strategy_knobs: a missing knob used to raise KeyError
+    # and the cryptic refusal repeated every Saturday (#164).
+    reason = knob_mode_ineligible(strategy_cls, grid, source)
+    if reason:
+        return reason, None
     try:
         baseline = read_strategy_knobs(strategy_cls, grid)
     except Exception as e:
@@ -121,6 +237,99 @@ def saturday_knob_decision(class_name, proposal, strategy_cls):
     if reason:
         return reason, None
     return "", changed_knobs(proposal, baseline, grid)
+
+
+def is_knob_not_applicable_reason(reason: str | None) -> bool:
+    """True for an eligibility refusal, not an off-grid proposal refusal."""
+    return (reason or "").startswith("knob mode not applicable:")
+
+
+def knob_applicability_key(class_name: str, source: str) -> dict[str, str]:
+    """Cache key: class name plus the sha256 of the strategy source."""
+    digest = hashlib.sha256((source or "").encode("utf-8")).hexdigest()
+    return {"class_name": class_name or "", "source_hash": digest}
+
+
+def knob_not_applicable_path(bot_dir) -> str:
+    return os.path.join(os.fspath(bot_dir), KNOB_NOT_APPLICABLE_FILENAME)
+
+
+def load_knob_not_applicable(bot_dir) -> dict | None:
+    """The persisted not-applicable record, or None if absent or unreadable."""
+    if not bot_dir:
+        return None
+    path = knob_not_applicable_path(bot_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("outcome") != KNOB_NOT_APPLICABLE:
+        return None
+    return data
+
+
+def _same_not_applicable(record: dict | None, class_name: str,
+                         source: str) -> bool:
+    if not record:
+        return False
+    key = knob_applicability_key(class_name, source)
+    return (record.get("class_name") == key["class_name"]
+            and record.get("source_hash") == key["source_hash"])
+
+
+def save_knob_not_applicable(bot_dir, class_name: str, source: str,
+                             reason: str, at: str) -> dict:
+    """Write the one not-applicable outcome for this class and source."""
+    os.makedirs(os.fspath(bot_dir), exist_ok=True)
+    key = knob_applicability_key(class_name, source)
+    payload = {
+        "outcome": KNOB_NOT_APPLICABLE,
+        "class_name": key["class_name"],
+        "source_hash": key["source_hash"],
+        "reason": reason,
+        "at": at,
+    }
+    path = knob_not_applicable_path(bot_dir)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+    return payload
+
+
+def settle_knob_ineligibility(bot_dir, strategy_cls, source: str,
+                              trade_count: int, at: str | None = None):
+    """``(action, reason)`` for one Saturday look at a live class.
+
+    ``action`` is ``not_grid`` (codegen stays available), ``eligible``
+    (knob mode proceeds; nothing is written), ``skip`` (this class and
+    source hash were already recorded — caller returns with no alert),
+    or ``recorded`` (first time, or a new hash: outcome stored, watermark
+    advanced, caller alerts once). No codegen fallback.
+    """
+    if strategy_cls is None:
+        return "not_grid", ""
+    name = getattr(strategy_cls, "__name__", "") or ""
+    grid = knob_grid_for(name)
+    if not grid:
+        return "not_grid", ""
+    reason = knob_mode_ineligible(strategy_cls, grid, source or "")
+    if not reason:
+        return "eligible", ""
+    source = source or ""
+    if bot_dir and _same_not_applicable(
+            load_knob_not_applicable(bot_dir), name, source):
+        return "skip", ""
+    if at is None:
+        at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+    if bot_dir:
+        save_knob_not_applicable(bot_dir, name, source, reason, at)
+        from src.evolution.notify import save_watermark
+        save_watermark(bot_dir, int(trade_count), at=at)
+    return "recorded", reason
 
 
 def iter_knob_candidates(baseline: dict, grid: dict | None = None,
@@ -161,10 +370,7 @@ def rewrite_knob_source(source: str, base_name: str, candidate_name: str,
     text = source.replace(needle, f"class {candidate_name}", 1)
     for key, value in knobs.items():
         rendered = render_knob_default(key, value)
-        pattern = (
-            rf'(kwargs\.get\(\s*["\']{re.escape(key)}["\']\s*,\s*)'
-            rf'([0-9]+(?:\.[0-9]+)?)(\s*\))'
-        )
+        pattern = _literal_kwarg_default_re(key)
         text2, n = re.subn(pattern, rf"\g<1>{rendered}\g<3>", text, count=1)
         if n != 1:
             raise ValueError(f"could not rewrite default for {key}")
