@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 from ..market_data.models import Bar
 from ..market_data.data_store import DataStore
-from ..backtest.broker import SimulatedBroker, Trade, _mode_to_source
+from ..backtest.broker import Order, OrderSide, SimulatedBroker, Trade, _mode_to_source
 from ..backtest.strategy import BacktestStrategy
 from ..backtest.data_loader import parse_kline_strings
 from ..backtest.engine import BacktestResult
@@ -40,6 +40,34 @@ class LiveState(Enum):
 
 # Taipei timezone (UTC+8)
 _TZ_TAIPEI = timezone(timedelta(hours=8))
+
+# Synthetic paper stop used only when a restored position has no recoverable
+# stop (issue #168). Never treated as the strategy's own level, and never
+# placed in semi_auto/auto (those modes alert only).
+_LOSS_LIMIT_STOP_TAG = "loss_limit_stop"
+
+
+def _coerce_price(value) -> int | None:
+    """Positive int price, or None when the value is missing or unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def _position_is_open(broker) -> bool:
+    """True when the broker holds a positive numeric position.
+
+    A missing or non-numeric size (a test double that skipped broker
+    setup) is treated as flat so resume/save still complete.
+    """
+    size = getattr(broker, "position_size", 0)
+    if isinstance(size, bool) or not isinstance(size, (int, float)):
+        return False
+    return size > 0
 
 # Taiwan futures sessions (approximate)
 _AM_OPEN = (8, 45)   # 08:45
@@ -436,6 +464,20 @@ class LiveRunner:
         self.broker.trade_source = _mode_to_source(self.trading_mode)
         self.broker.strategy_label = self.strategy_display_name
         self.daily_loss_limit: int = 10000  # NTD, for session persistence
+
+        # Issue #168: a resumed open position must keep a stop. The strategy
+        # object is new, so levels it latched at entry are gone unless we
+        # saved them. ``restored_without_stop`` blocks new entries until
+        # that position is flat again.
+        self.restored_without_stop: bool = False
+        self._restored_open_position: bool = False
+        self._protective_stop_only: bool = False
+        self._saved_exit_levels: dict | None = None
+        self._restore_alerted: bool = False
+        self._awaiting_restore_tick: bool = False
+        # Optional TradingGuard.to_dict. The guard stays on the app — the
+        # fill poller holds that instance — so the runner only snapshots it.
+        self._guard_state_provider: Callable[[], dict] | None = None
 
         # Hot-swap mode switching (Feature 2)
         self._allow_live_override: bool = False
@@ -948,6 +990,12 @@ class LiveRunner:
                 self._seen_1m_dts.add(bar.dt)
 
         self.state = LiveState.RUNNING
+        # Issue #168: warmup does not run the strategy, so a restored
+        # position still has no strategy-held stop. Arm saved exits (or
+        # the paper loss-limit stop) before the first live tick, and
+        # alert once callbacks are registered — deploy wires them before
+        # warmup.
+        self._reconcile_restored_exits(alert=True)
         self._auto_save_session()  # persist immediately on start
         self._emit("on_status", f"Warmup complete: {len(bars)} bars loaded")
         return len(bars)
@@ -985,6 +1033,14 @@ class LiveRunner:
         """
         if self.state != LiveState.RUNNING:
             return None
+        # Issue #168: the first tick after a restore evaluates exits now.
+        # A stop the market has already gapped through fills at this tick
+        # (market), the same rule as backtest ``_resolve_exit`` (a gap
+        # fills at the open, not at the stop). Falling through is the
+        # guard — returning here would leave the position unprotected
+        # until the next aggregated bar.
+        if self._awaiting_restore_tick:
+            self._awaiting_restore_tick = False
         if self.broker.position_size == 0 or not self.broker._pending_exits:
             return None
 
@@ -1156,6 +1212,11 @@ class LiveRunner:
         fill_dt = datetime.now(_TZ_TAIPEI).replace(tzinfo=None
                   ).strftime("%Y-%m-%d %H:%M:%S")
 
+        # Captured before check_exits: a restored protective stop may close
+        # the position on this bar, and the strategy would otherwise re-enter
+        # in the same call. The block stays in force for that bar.
+        block_new_entries = self.restored_without_stop
+
         # Check exit orders against this bar
         if idx > 0:
             self.broker.check_exits(idx, bar.open, bar.high, bar.low, bar.close, bar_close_dt)
@@ -1169,6 +1230,12 @@ class LiveRunner:
             old_closes = len(self.broker._pending_market_closes)
 
             self.strategy.on_bar(bar, self.data_store, ctx)
+            # Issue #168: a fresh strategy calls exit(stop=None) and would
+            # erase the restored stop. Put it back before the catch-up
+            # check so this bar can still close.
+            self._reconcile_restored_exits(alert=False)
+            if self.restored_without_stop:
+                block_new_entries = True
 
             # Detect new entry/exit decisions
             if len(self.broker._pending_entries) > old_entries:
@@ -1208,6 +1275,9 @@ class LiveRunner:
         # minutes stale (incident: sim 44,930 = day close vs real IOC fill
         # 44,774 = night open). Market closes still fill at bar.close,
         # identical to backtest close-fill semantics.
+        if block_new_entries and self.broker._pending_entries:
+            self._drop_entries_without_stop(bar)
+
         trades_before = len(self.broker.trades)
         entry_fill, self._entry_fill_src = self._entry_fill_price(bar)
         self.broker.on_bar_close(idx, bar.close, fill_dt,
@@ -1529,24 +1599,386 @@ class LiveRunner:
 
     # ── Session persistence ──
 
+    def _load_saved_exit_levels(self, raw) -> None:
+        """Accept a session exit-level snapshot for this open position."""
+        self._saved_exit_levels = None
+        if not isinstance(raw, dict) or not _position_is_open(self.broker):
+            return
+        stop = _coerce_price(raw.get("stop"))
+        limit = _coerce_price(raw.get("limit"))
+        if stop is None and limit is None:
+            return
+        idx = raw.get("entry_bar_index")
+        if idx is not None:
+            try:
+                if int(idx) != int(self.broker.entry_bar_index):
+                    return
+            except (TypeError, ValueError):
+                return
+        self._saved_exit_levels = {
+            "stop": stop,
+            "limit": limit,
+            "from_entry": str(raw.get("from_entry") or self.broker.entry_tag or ""),
+            "tag": str(raw.get("tag") or "restored_exit"),
+            "entry_bar_index": self.broker.entry_bar_index,
+        }
+
+    def _strategy_reported_levels(self) -> dict:
+        """Stop/limit from ``strategy.exit_levels()``, if that method exists.
+
+        A fresh instance returns nothing: the stop was latched at entry on
+        the previous process and is not recomputed from warmup bars.
+        """
+        fn = getattr(self.strategy, "exit_levels", None)
+        if not callable(fn):
+            return {}
+        try:
+            levels = fn() or {}
+        except Exception:
+            logger.exception("exit_levels() failed during restore reconcile")
+            return {}
+        if not isinstance(levels, dict):
+            return {}
+        out: dict = {}
+        for key in ("stop", "limit"):
+            price = _coerce_price(levels.get(key))
+            if price is not None:
+                out[key] = price
+        return out
+
+    def _non_synthetic_exit(self) -> Order | None:
+        for order in self.broker._pending_exits:
+            if order.tag == _LOSS_LIMIT_STOP_TAG:
+                continue
+            if order.stop is None and order.limit is None:
+                continue
+            return order
+        return None
+
+    def _only_synthetic_stop(self) -> bool:
+        real = False
+        synthetic = False
+        for order in self.broker._pending_exits:
+            if order.stop is None and order.limit is None:
+                continue
+            if order.tag == _LOSS_LIMIT_STOP_TAG:
+                synthetic = True
+            else:
+                real = True
+        return synthetic and not real
+
+    def _has_loss_limit_stop(self) -> bool:
+        return any(
+            o.tag == _LOSS_LIMIT_STOP_TAG and o.stop is not None
+            for o in self.broker._pending_exits
+        )
+
+    def _drop_loss_limit_stops(self) -> None:
+        self.broker._pending_exits = [
+            o for o in self.broker._pending_exits
+            if o.tag != _LOSS_LIMIT_STOP_TAG
+        ]
+
+    def _install_exit(self, *, tag: str, stop, limit) -> None:
+        """Queue one exit, replacing a stop-less order for this position."""
+        from_entry = self.broker.entry_tag or ""
+        for order in self.broker._pending_exits:
+            if order.tag == _LOSS_LIMIT_STOP_TAG:
+                continue
+            if order.stop is None and order.from_entry:
+                from_entry = order.from_entry
+                break
+        self.broker.queue_exit(Order(
+            tag=tag or "restored_exit",
+            side=OrderSide.LONG,
+            qty=0,
+            limit=limit,
+            stop=stop,
+            from_entry=from_entry,
+        ))
+
+    def _loss_limit_stop_price(self) -> int | None:
+        """Price at which the session loss-limit is exhausted, or None.
+
+        ``daily_loss_limit`` is NTD. Points = limit / (point value * qty),
+        floored so the protective stop does not exceed the limit. Long
+        stops sit below the entry; short stops sit above it.
+        """
+        limit_ntd = int(self.daily_loss_limit or 0)
+        qty = int(self.broker.position_size or 0)
+        pv = int(self.point_value or 0)
+        entry = int(self.broker.entry_price or 0)
+        if limit_ntd <= 0 or qty <= 0 or pv <= 0 or entry <= 0:
+            return None
+        points = limit_ntd // (pv * qty)
+        if points <= 0:
+            return None
+        if self.broker.position_side == OrderSide.LONG:
+            price = entry - points
+        elif self.broker.position_side == OrderSide.SHORT:
+            price = entry + points
+        else:
+            return None
+        return price if price > 0 else None
+
+    def _clear_restore_protection(self) -> None:
+        self._restored_open_position = False
+        self.restored_without_stop = False
+        self._protective_stop_only = False
+        self._saved_exit_levels = None
+
+    def _remember_exit(self, *, stop, limit, tag: str, from_entry: str) -> None:
+        self._saved_exit_levels = {
+            "stop": _coerce_price(stop),
+            "limit": _coerce_price(limit),
+            "from_entry": from_entry or self.broker.entry_tag or "",
+            "tag": tag or "restored_exit",
+            "entry_bar_index": self.broker.entry_bar_index,
+        }
+
+    def _reconcile_restored_exits(self, *, alert: bool) -> None:
+        """Keep a stop on a position that was open across a restart.
+
+        Order of trust:
+        1. ``strategy.exit_levels()`` when it actually returns a stop
+           (the new instance recomputed one).
+        2. The snapshot saved with the session.
+        3. A non-synthetic pending exit restored with the broker.
+        4. Nothing recoverable: flag ``restored_without_stop``, alert,
+           block new entries, and in paper mode place the session
+           loss-limit as a protective stop. Live modes alert only.
+        """
+        if not self._restored_open_position:
+            return
+        if self.broker.position_size <= 0:
+            self._clear_restore_protection()
+            return
+
+        reported = self._strategy_reported_levels()
+        if reported.get("stop") is not None:
+            existing = self._non_synthetic_exit()
+            if existing is None or existing.stop is None:
+                self._install_exit(
+                    tag="restored_exit",
+                    stop=reported.get("stop"),
+                    limit=reported.get("limit"),
+                )
+            self._remember_exit(
+                stop=reported.get("stop"),
+                limit=reported.get("limit"),
+                tag="restored_exit",
+                from_entry=self.broker.entry_tag or "",
+            )
+            self.restored_without_stop = False
+            self._protective_stop_only = False
+            self._drop_loss_limit_stops()
+            return
+
+        saved = self._saved_exit_levels or {}
+        saved_stop = _coerce_price(saved.get("stop"))
+        if saved_stop is not None:
+            existing = self._non_synthetic_exit()
+            if existing is not None and existing.stop is not None:
+                self._remember_exit(
+                    stop=existing.stop,
+                    limit=existing.limit,
+                    tag=existing.tag,
+                    from_entry=existing.from_entry,
+                )
+            else:
+                self._install_exit(
+                    tag=str(saved.get("tag") or "restored_exit"),
+                    stop=saved_stop,
+                    limit=_coerce_price(saved.get("limit")),
+                )
+            self.restored_without_stop = False
+            self._protective_stop_only = False
+            self._drop_loss_limit_stops()
+            return
+
+        existing = self._non_synthetic_exit()
+        if (existing is not None and existing.stop is not None
+                and not self._protective_stop_only):
+            self._remember_exit(
+                stop=existing.stop,
+                limit=existing.limit,
+                tag=existing.tag,
+                from_entry=existing.from_entry,
+            )
+            self.restored_without_stop = False
+            return
+
+        self.restored_without_stop = True
+        self._protective_stop_only = True
+        if self.trading_mode == "paper":
+            if not self._has_loss_limit_stop():
+                price = self._loss_limit_stop_price()
+                carry_limit = None
+                if existing is not None and existing.limit is not None:
+                    carry_limit = _coerce_price(existing.limit)
+                if price is not None:
+                    self._install_exit(
+                        tag=_LOSS_LIMIT_STOP_TAG,
+                        stop=price,
+                        limit=carry_limit,
+                    )
+        else:
+            self._drop_loss_limit_stops()
+        if alert:
+            self._emit_restore_alert()
+
+    def _emit_restore_alert(self) -> None:
+        if self._restore_alerted:
+            return
+        self._restore_alerted = True
+        side = (self.broker.position_side.value
+                if self.broker.position_side else "?")
+        entry = self.broker.entry_price
+        if self.trading_mode == "paper":
+            stop = None
+            for order in self.broker._pending_exits:
+                if order.tag == _LOSS_LIMIT_STOP_TAG and order.stop is not None:
+                    stop = int(order.stop)
+                    break
+            if stop is not None:
+                extra = (
+                    f"模擬保護停損已套用 Paper protective stop @ {stop} "
+                    f"(session loss limit {self.daily_loss_limit:,} NTD)."
+                )
+            else:
+                extra = (
+                    "模擬保護停損無法計算 "
+                    "Paper protective stop could not be priced."
+                )
+        else:
+            extra = (
+                "實單僅警示 Live mode is alert-only — "
+                "no synthetic stop was placed."
+            )
+        msg = (
+            "[RESTORE] 恢復後沒有可還原的停損 "
+            "Restored open position has no recoverable stop "
+            f"({side} @ {entry}). 新進場已封鎖 New entries blocked. "
+            + extra
+        )
+        self._emit("on_alert", msg)
+        self._emit("on_status", msg)
+
+    def _drop_entries_without_stop(self, bar: Bar) -> None:
+        """Discard entries while a restored position has no real stop."""
+        dropped = list(self.broker._pending_entries)
+        self.broker._pending_entries.clear()
+        for order in dropped:
+            side = order.side.value if order.side else ""
+            self.log_blocked_signal(
+                "ENTRY_FILL", side, bar.close, "RESTORED_WITHOUT_STOP",
+                "restored position has no recoverable stop — new entries blocked",
+            )
+
+    def _exit_levels_for_save(self) -> dict | None:
+        """Strategy stop/limit to persist. Omits the synthetic paper stop."""
+        if not _position_is_open(self.broker):
+            self._saved_exit_levels = None
+            return None
+        if self._protective_stop_only or self._only_synthetic_stop():
+            return None
+        try:
+            info = self.get_exit_info() or {}
+        except Exception:
+            logger.exception("get_exit_info failed while saving exit levels")
+            info = {}
+        stop = _coerce_price(info.get("stop"))
+        limit = _coerce_price(info.get("limit"))
+        if stop is None and limit is None:
+            saved = self._saved_exit_levels
+            if not saved:
+                return None
+            if saved.get("entry_bar_index") not in (
+                    None, self.broker.entry_bar_index):
+                return None
+            if saved.get("from_entry") not in (
+                    None, "", self.broker.entry_tag):
+                return None
+            return saved
+        tag = "restored_exit"
+        from_entry = self.broker.entry_tag or ""
+        for order in self.broker._pending_exits:
+            if order.tag == _LOSS_LIMIT_STOP_TAG:
+                continue
+            if order.stop is None and order.limit is None:
+                continue
+            tag = order.tag or tag
+            from_entry = order.from_entry or from_entry
+            break
+        snap = {
+            "stop": stop,
+            "limit": limit,
+            "from_entry": from_entry,
+            "tag": tag,
+            "entry_bar_index": self.broker.entry_bar_index,
+        }
+        self._saved_exit_levels = snap
+        return snap
+
+    def set_guard_state_provider(self, provider: Callable[[], dict] | None) -> None:
+        """Supply ``TradingGuard.to_dict`` for session saves (issue #168).
+
+        The guard lives on the app. The runner never rebinds it.
+        """
+        self._guard_state_provider = provider
+
+    def _base_session_data(self) -> dict:
+        """Session fields shared by LiveRunner and RegimeSwitchingRunner."""
+        data = {
+            "strategy": self.strategy_display_name,
+            "symbol": self.symbol,
+            "bot_name": self.bot_name,
+            "point_value": self.point_value,
+            "target_interval": self.target_interval,
+            "trading_mode": self.trading_mode,
+            "daily_loss_limit": self.daily_loss_limit,
+            "started_at": self._started_at,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "bar_index": self._bar_index,
+            "broker": self.broker.to_dict(),
+            "last_report_key": self._last_report_key,
+        }
+        # Exit levels must not drop the broker snapshot or the report
+        # key when a partial runner (or a throwing strategy) can't
+        # produce them.
+        try:
+            data.update(self._restore_session_fields())
+        except Exception:
+            logger.exception(
+                "Restore fields omitted from session save (bot=%s)",
+                getattr(self, "bot_name", ""))
+        return data
+
+    def _restore_session_fields(self) -> dict:
+        """Exit levels and the in-flight fill gate (issue #168)."""
+        fields: dict = {
+            "exit_levels": self._exit_levels_for_save(),
+            "restored_without_stop": bool(
+                getattr(self, "restored_without_stop", False)
+                and _position_is_open(self.broker)
+            ),
+        }
+        provider = getattr(self, "_guard_state_provider", None)
+        if provider is not None:
+            try:
+                snap = provider()
+            except Exception:
+                logger.exception(
+                    "Trading guard snapshot failed (bot=%s)", self.bot_name)
+                snap = None
+            if isinstance(snap, dict):
+                fields["trading_guard"] = snap
+        return fields
+
     def _auto_save_session(self) -> None:
         """Save session state to disk (called on every trade event)."""
         try:
-            data = {
-                "strategy": self.strategy_display_name,
-                "symbol": self.symbol,
-                "bot_name": self.bot_name,
-                "point_value": self.point_value,
-                "target_interval": self.target_interval,
-                "trading_mode": self.trading_mode,
-                "daily_loss_limit": self.daily_loss_limit,
-                "started_at": self._started_at,
-                "saved_at": datetime.now().isoformat(timespec="seconds"),
-                "bar_index": self._bar_index,
-                "broker": self.broker.to_dict(),
-                "last_report_key": self._last_report_key,
-            }
-            save_session(self._session_path, data)
+            save_session(self._session_path, self._base_session_data())
         except Exception:
             pass  # best-effort; don't crash the bot
 
@@ -1634,6 +2066,19 @@ class LiveRunner:
             session_data.get("last_report_key")
             or session_data.get("last_report_date")
         )
+        # Issue #168: arm exits before warmup/ticks. Alert waits for
+        # feed_warmup_bars so the GUI has registered on_alert.
+        self._load_saved_exit_levels(session_data.get("exit_levels"))
+        self._restored_open_position = _position_is_open(self.broker)
+        self.restored_without_stop = (
+            bool(session_data.get("restored_without_stop"))
+            and self._restored_open_position
+        )
+        self._protective_stop_only = self.restored_without_stop
+        self._restore_alerted = False
+        self._awaiting_restore_tick = self._restored_open_position
+        if self._restored_open_position:
+            self._reconcile_restored_exits(alert=False)
         return len(self.broker.trades)
 
     # Emit a progress tick every N bars during reload so the GUI can keep

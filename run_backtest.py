@@ -98,7 +98,7 @@ _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
-from src.live.trading_guard import TradingGuard
+from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.broker_port import (
     BrokerEvent,
@@ -6629,6 +6629,221 @@ class BacktestApp:
         """Error popup on the deploy path (log-only when headless)."""
         messagebox.showerror(title, message)
 
+    def _on_restore_alert(self, message: str) -> None:
+        """Alert when a resumed position has no recoverable stop (issue #168).
+
+        Headless overrides ``_alert`` and only records it, so a detached
+        bot is not blocked on a hidden dialog.
+        """
+        self._alert("恢復後沒有停損 No Stop After Restore", message)
+
+    def _reconcile_resumed_guard(self, resume_session, trading_mode, symbol) -> None:
+        """Restore the fill gate and restart its poller (issues #79, #168).
+
+        ``reset()`` on deploy cleared ``fill_pending``. A persisted
+        in-flight order is put back so it is not sent twice. The fill
+        poller was reset in the same breath, and deal-row confirmation
+        only runs while ``_fill_poller.active``. Without restarting it,
+        every later real order — protective exits included — stays
+        ``BLOCK_FILL_PENDING`` with nothing but a log line. The flat
+        path is the same hazard: a restored entry gate blocks entries
+        and exits. Both paths arm the poller below.
+        """
+        persisted_guard = None
+        if isinstance(resume_session, dict):
+            raw_guard = resume_session.get("trading_guard")
+            if isinstance(raw_guard, dict):
+                persisted_guard = raw_guard
+        outcome = {"cleared_stale": False, "kept_inflight": False}
+        # Paper has no real book, so the sim position is the match.
+        # semi_auto/auto overwrite this from the OI snapshot.
+        real_ok, real_reason = True, "match"
+        sim_open = self._live_runner.broker.position_size > 0
+        if sim_open:
+            # Real-money hazard (issue #79 review): the restored SIM broker
+            # can hold a position even when the REAL account is FLAT (user
+            # closed overnight, or the entry was skipped last session).
+            # Confirming a real entry in that state lets the bot auto-send a
+            # close (sNewClose=2) against a flat account — OPENING a naked
+            # position. Only reconcile the guard if the real account (queried
+            # ~90 lines above via GetOpenInterestGW) also shows a position
+            # for this symbol. Paper mode has no real account, so the sim
+            # position alone is authoritative there.
+            # A bare `!= 0` was direction-agnostic: a real SHORT would
+            # "confirm" a sim LONG, and the auto close (sNewClose=2) would
+            # then be sent in the WRONG direction — adding to the real
+            # position instead of closing it. Require a direction match,
+            # and never read an un-answered snapshot as "flat".
+            if trading_mode in ("semi_auto", "auto"):
+                order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+                prefix = order_sym[:2] if order_sym else ""
+                sim_side = (self._live_runner.broker.position_side.value
+                            if self._live_runner.broker.position_side else "")
+                real_ok, real_reason = resume_real_position_ok(
+                    self._account_monitor.get_signed_position(prefix),
+                    sim_side,
+                    self._account_monitor.oi_snapshot_received,
+                )
+            outcome = apply_resume_guard(
+                self._trading_guard,
+                position_open=True,
+                real_ok=real_ok,
+                persisted=persisted_guard,
+            )
+            if real_ok:
+                if outcome["cleared_stale"]:
+                    self._live_log_msg(
+                        "[RESUME] Cleared stale fill_pending — position already "
+                        "confirmed from previous session", "status")
+                self._live_log_msg(
+                    "[RESUME] Restored confirmed real position — exits/"
+                    "force-close re-enabled", "status")
+            elif real_reason == "opposite":
+                self._live_log_msg(
+                    "[RESUME] Real account position is OPPOSITE to sim — NOT "
+                    "confirming entry. Manual review required.", "status")
+            elif real_reason == "unknown":
+                self._live_log_msg(
+                    "[RESUME] Real position UNKNOWN (持倉快照未收到 position "
+                    "snapshot not received) — NOT confirming entry. Manual "
+                    "review required.", "status")
+            else:
+                self._live_log_msg(
+                    "[RESUME] Real account flat but sim has position — NOT "
+                    "confirming entry. Manual review required.", "status")
+            if outcome["kept_inflight"]:
+                self._live_log_msg(
+                    "[RESUME] Kept in-flight fill_pending — "
+                    "not sending a new exit", "status")
+        elif persisted_guard is not None:
+            outcome = apply_resume_guard(
+                self._trading_guard,
+                position_open=False,
+                real_ok=False,
+                persisted=persisted_guard,
+            )
+            if outcome["kept_inflight"]:
+                self._live_log_msg(
+                    "[RESUME] Kept in-flight fill_pending — "
+                    "not sending a new exit", "status")
+            # Sim is flat, so position_side cannot name the entry. A
+            # deferred close still does: side LONG means the in-flight
+            # entry was a long. The real book has to match that side.
+            # Otherwise the poller is started with expected_sign=None,
+            # any non-zero OI confirms it, and the close is replayed
+            # into the opposite real position.
+            if trading_mode in ("semi_auto", "auto"):
+                close_side = self._deferred_close_side()
+                if close_side:
+                    order_sym = SYMBOL_CONFIG.get(symbol, {}).get(
+                        "order_symbol", "")
+                    prefix = order_sym[:2] if order_sym else ""
+                    real_ok, real_reason = resume_real_position_ok(
+                        self._account_monitor.get_signed_position(prefix),
+                        close_side,
+                        self._account_monitor.oi_snapshot_received,
+                    )
+                    if not real_ok:
+                        self._live_log_msg(
+                            "[RESUME] Flat sim, deferred close "
+                            f"{close_side} does not match the real book "
+                            f"({real_reason}) — NOT re-arming. "
+                            "Manual review required.",
+                            "status")
+        self._arm_resumed_fill_poll(
+            outcome, real_ok=real_ok, real_reason=real_reason)
+
+    def _deferred_close_side(self) -> str:
+        """Side named by a restored deferred close, or \"\"."""
+        deferred = self._trading_guard._deferred_close
+        if not isinstance(deferred, dict):
+            return ""
+        side = str(deferred.get("side") or "").upper()
+        return side if side in ("LONG", "SHORT") else ""
+
+    def _arm_resumed_fill_poll(self, outcome: dict, *,
+                               real_ok: bool, real_reason: str) -> None:
+        """Restart fill polling for an order that was in flight at resume.
+
+        Deploy has already ``reset()`` the poller. Putting ``fill_pending``
+        back without this leaves the gate closed forever: OnNewData will
+        not clear it (``_fill_poller.active`` is required) and the timeout
+        that downgrades to semi-auto never starts.
+
+        Do not arm when that would confirm the wrong book (issue #168):
+
+        * the sim is open and ``real_ok`` is False, or the sim is flat
+          but a deferred close names a side the real book does not hold.
+          The entry poller would otherwise treat any non-zero OI as the
+          fill and replay that close into the opposite position.
+        * the OI snapshot has not arrived (``get_signed_position`` is 0,
+          and an in-flight exit is "already flat").
+        * COM is down. ``start()`` would auto-confirm with no fill.
+
+        The gate stays up and an alert is raised. A mismatched book
+        drops the deferred close. On the flat branch a missing snapshot
+        or COM drops it too, so it cannot be replayed later.
+        """
+        if not outcome.get("kept_inflight") or not self._trading_guard.fill_pending:
+            return
+        action_type = self._trading_guard.fill_pending_type or "entry"
+        sim_open = bool(
+            self._live_runner and self._live_runner.broker.position_size > 0)
+        close_side = "" if sim_open else self._deferred_close_side()
+        snapshot_received = bool(
+            getattr(self._account_monitor, "oi_snapshot_received", False))
+        com_ok = bool(
+            _com_available and skO is not None and self._futures_account)
+        directed = sim_open or bool(close_side)
+        mismatch = directed and not real_ok
+        # Flat sim + a saved close: a missing snapshot or COM is the
+        # same hazard as a mismatch, because there is no position side
+        # to constrain the poller.
+        drop_close = mismatch or (
+            bool(close_side) and (not snapshot_received or not com_ok))
+        if mismatch or not snapshot_received or not com_ok:
+            if drop_close:
+                self._trading_guard._deferred_close = None
+            why = real_reason if mismatch else (
+                "no_com" if not com_ok else "unknown")
+            self._live_log_msg(
+                "[RESUME] In-flight "
+                f"{action_type} fill NOT re-armed ({why}). "
+                "Orders stay blocked — manual review required.",
+                "status",
+            )
+            self._alert(
+                "恢復後成交需人工核對 Manual Review",
+                f"In-flight {action_type} fill was restored but the fill "
+                f"poller was not started ({why}). "
+                "Real account does not match, the position snapshot has "
+                "not arrived, or COM is unavailable. "
+                "Orders stay blocked until you review the position.",
+            )
+            return
+        side = close_side
+        if sim_open and self._live_runner and self._live_runner.broker.position_side:
+            side = self._live_runner.broker.position_side.value or ""
+        expected_sign = 1 if side == "LONG" else -1 if side == "SHORT" else None
+        self._live_log_msg(
+            "[RESUME] In-flight "
+            f"{action_type} fill restored — restarting fill poller. "
+            "Real orders stay blocked until it confirms or times out.",
+            "status",
+        )
+        self._start_fill_polling(
+            action_type, expected_sign=expected_sign, resumed=True)
+        # Still pending: the poller is armed and the gate is held on
+        # purpose. Say so. A log line alone is how this used to stick.
+        # Headless records ``_alert`` and does not block on a dialog.
+        if self._trading_guard.fill_pending and self._fill_poller.active:
+            self._alert(
+                "恢復後成交確認未完成 Fill Still Pending",
+                f"In-flight {action_type} fill was restored. "
+                "New real orders stay blocked until the fill confirms "
+                "or the poller times out and downgrades to semi-auto.",
+            )
+
     def _deploy_live_from(self, req: DeployRequest) -> bool:
         """Deploy a live bot from an already-resolved request.
 
@@ -6903,6 +7118,12 @@ class BacktestApp:
         self._live_runner.trading_mode = trading_mode
         self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
+        # Issue #168: snapshot the guard into session.json on each save.
+        # Do not rebind self._trading_guard — the fill poller holds it.
+        # A runner double that has no session writer simply skips this.
+        _set_guard = getattr(self._live_runner, "set_guard_state_provider", None)
+        if callable(_set_guard):
+            _set_guard(self._trading_guard.to_dict)
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
         self._live_runner.on_mode_changed = self._on_mode_changed
         self._live_runner.mode_switch_veto = (
@@ -7009,62 +7230,10 @@ class BacktestApp:
                     f"[RESUME] Active leg restored: {_leg_label} ({_strat})",
                     "status")
 
-            # Issue #79: reconcile the safety guard with the restored position.
-            # guard.reset() (line above at deploy) cleared real_entry_confirmed
-            # and fill_pending, but the restored broker may already hold an
-            # open position from the previous session. Without this, every
-            # exit/force-close is SKIP_EXIT'd (real_entry_confirmed=False) and
-            # any stale fill_pending would BLOCK_FILL_PENDING the close forever
-            # — the live position stays stuck open until the user manually
-            # switches trading modes.
-            if self._live_runner.broker.position_size > 0:
-                # Real-money hazard (issue #79 review): the restored SIM broker
-                # can hold a position even when the REAL account is FLAT (user
-                # closed overnight, or the entry was skipped last session).
-                # Confirming a real entry in that state lets the bot auto-send a
-                # close (sNewClose=2) against a flat account — OPENING a naked
-                # position. Only reconcile the guard if the real account (queried
-                # ~90 lines above via GetOpenInterestGW) also shows a position
-                # for this symbol. Paper mode has no real account, so the sim
-                # position alone is authoritative there.
-                # A bare `!= 0` was direction-agnostic: a real SHORT would
-                # "confirm" a sim LONG, and the auto close (sNewClose=2) would
-                # then be sent in the WRONG direction — adding to the real
-                # position instead of closing it. Require a direction match,
-                # and never read an un-answered snapshot as "flat".
-                real_ok, real_reason = True, "match"
-                if trading_mode in ("semi_auto", "auto"):
-                    order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
-                    prefix = order_sym[:2] if order_sym else ""
-                    sim_side = (self._live_runner.broker.position_side.value
-                                if self._live_runner.broker.position_side else "")
-                    real_ok, real_reason = resume_real_position_ok(
-                        self._account_monitor.get_signed_position(prefix),
-                        sim_side,
-                        self._account_monitor.oi_snapshot_received,
-                    )
-                if real_ok:
-                    cleared = self._trading_guard.restore_confirmed_position()
-                    if cleared:
-                        self._live_log_msg(
-                            "[RESUME] Cleared stale fill_pending — position already "
-                            "confirmed from previous session", "status")
-                    self._live_log_msg(
-                        "[RESUME] Restored confirmed real position — exits/"
-                        "force-close re-enabled", "status")
-                elif real_reason == "opposite":
-                    self._live_log_msg(
-                        "[RESUME] Real account position is OPPOSITE to sim — NOT "
-                        "confirming entry. Manual review required.", "status")
-                elif real_reason == "unknown":
-                    self._live_log_msg(
-                        "[RESUME] Real position UNKNOWN (持倉快照未收到 position "
-                        "snapshot not received) — NOT confirming entry. Manual "
-                        "review required.", "status")
-                else:
-                    self._live_log_msg(
-                        "[RESUME] Real account flat but sim has position — NOT "
-                        "confirming entry. Manual review required.", "status")
+            # Issue #79 + #168: reconcile the guard with the restored
+            # position and, when an order was in flight, restart the fill
+            # poller. See _reconcile_resumed_guard.
+            self._reconcile_resumed_guard(resume_session, trading_mode, symbol)
 
             # Issue #79 (sub-problem C): explicitly re-sync the mode tag now,
             # before warmup/replay begins. The var was set at deploy time, but
@@ -7106,6 +7275,7 @@ class BacktestApp:
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
         self._live_runner.on("on_decision", lambda d: self.root.after(0, self._on_live_decision, d))
         self._live_runner.on("on_status", lambda s: self.root.after(0, self._live_log_msg, s, "status"))
+        self._live_runner.on("on_alert", lambda m: self.root.after(0, self._on_restore_alert, m))
         self._live_runner.on("on_daily_report", lambda r: self.root.after(0, self._on_live_daily_report, r))
 
         # Set data source for live mode
@@ -7945,7 +8115,10 @@ class BacktestApp:
             simulate=bool(simulate),
         )
 
-        # Real-time TP/SL check on every tick (fills at exact price)
+        # Real-time TP/SL check on every tick (fills at exact price).
+        # Issue #168: restored exits are already on the broker, so the
+        # first live tick — this call, once history replay has finished —
+        # evaluates them immediately. A gapped stop fills at the tick.
         if self._live_runner and self._live_history_done:
             tick_dt = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
             result = self._live_runner.check_tick_exit(price, tick_dt)
@@ -8706,7 +8879,9 @@ class BacktestApp:
                     self.root.after_cancel(self._fill_poll_timer_id)
                 self._on_fill_confirmed()
 
-    def _start_fill_polling(self, action_type: str) -> None:
+    def _start_fill_polling(self, action_type: str, *,
+                            expected_sign: int | None = None,
+                            resumed: bool = False) -> None:
         """Start polling OpenInterest for position change after order sent."""
         com_ok = _com_available and skO is not None and bool(self._futures_account)
         # Snapshot broker.entry_bar_index so _on_fill_confirmed can later
@@ -8716,7 +8891,9 @@ class BacktestApp:
                          if self._live_runner else 0)
         action = self._fill_poller.start(
             action_type, self._get_signed_position(), com_available=com_ok,
-            entry_bar_index=entry_bar_idx)
+            entry_bar_index=entry_bar_idx,
+            expected_sign=expected_sign,
+            resumed=resumed)
 
         if action.type == "no_com":
             _log(f"FILL POLL: {action.message}")
