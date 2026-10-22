@@ -473,8 +473,14 @@ def test_start_rotates_hang_artifacts(tmp_path):
 
 
 def test_attempt_reconnect_stamps_leave_monitor():
-    path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                        "run_backtest.py")
+    """LeaveMonitor and SendFutureOrderCLR are still call_com stamps.
+
+    Issue #169 Phase 1 moved the SKCOM calls into the in-process port.
+    The stamp stays on the COM call, not on the app's control flow.
+    """
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "src", "live", "broker_port.py")
     text = open(path, encoding="utf-8").read()
     assert 'call_com("LeaveMonitor"' in text
     send_at = text.find("skO.SendFutureOrderCLR")
