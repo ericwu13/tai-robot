@@ -6674,7 +6674,11 @@ class BacktestApp:
             if isinstance(raw_guard, dict):
                 persisted_guard = raw_guard
         outcome = {"cleared_stale": False, "kept_inflight": False}
-        if self._live_runner.broker.position_size > 0:
+        # Paper has no real book, so the sim position is the match.
+        # semi_auto/auto overwrite this from the OI snapshot.
+        real_ok, real_reason = True, "match"
+        sim_open = self._live_runner.broker.position_size > 0
+        if sim_open:
             # Real-money hazard (issue #79 review): the restored SIM broker
             # can hold a position even when the REAL account is FLAT (user
             # closed overnight, or the entry was skipped last session).
@@ -6689,7 +6693,6 @@ class BacktestApp:
             # then be sent in the WRONG direction — adding to the real
             # position instead of closing it. Require a direction match,
             # and never read an un-answered snapshot as "flat".
-            real_ok, real_reason = True, "match"
             if trading_mode in ("semi_auto", "auto"):
                 order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
                 prefix = order_sym[:2] if order_sym else ""
@@ -6742,26 +6745,75 @@ class BacktestApp:
                 self._live_log_msg(
                     "[RESUME] Kept in-flight fill_pending — "
                     "not sending a new exit", "status")
-        self._arm_resumed_fill_poll(outcome)
+        self._arm_resumed_fill_poll(
+            outcome, real_ok=real_ok, real_reason=real_reason)
 
-    def _arm_resumed_fill_poll(self, outcome: dict) -> None:
+    def _arm_resumed_fill_poll(self, outcome: dict, *,
+                               real_ok: bool, real_reason: str) -> None:
         """Restart fill polling for an order that was in flight at resume.
 
         Deploy has already ``reset()`` the poller. Putting ``fill_pending``
         back without this leaves the gate closed forever: OnNewData will
         not clear it (``_fill_poller.active`` is required) and the timeout
         that downgrades to semi-auto never starts.
+
+        Do not arm when that would confirm the wrong book (issue #168):
+
+        * sim is open and ``real_ok`` is False (opposite, real-flat, or
+          an unanswered snapshot). The entry poller treats any non-zero
+          OI as the fill and ``timeout()`` used to do the same after 10s,
+          then the saved close is replayed in the wrong direction.
+        * the OI snapshot has not arrived (``get_signed_position`` is 0,
+          and an in-flight exit is "already flat").
+        * COM is down. ``start()`` would auto-confirm with no fill.
+
+        The gate stays up and an alert is raised. A mismatched real book
+        also drops the deferred close so it cannot be replayed later.
         """
         if not outcome.get("kept_inflight") or not self._trading_guard.fill_pending:
             return
         action_type = self._trading_guard.fill_pending_type or "entry"
+        sim_open = bool(
+            self._live_runner and self._live_runner.broker.position_size > 0)
+        snapshot_received = bool(
+            getattr(self._account_monitor, "oi_snapshot_received", False))
+        com_ok = bool(
+            _com_available and skO is not None and self._futures_account)
+        mismatch = sim_open and not real_ok
+        if mismatch or not snapshot_received or not com_ok:
+            if mismatch:
+                # The saved close is a sim-side order. Replaying it
+                # against the opposite real book adds to that position.
+                self._trading_guard._deferred_close = None
+            why = real_reason if mismatch else (
+                "no_com" if not com_ok else "unknown")
+            self._live_log_msg(
+                "[RESUME] In-flight "
+                f"{action_type} fill NOT re-armed ({why}). "
+                "Orders stay blocked — manual review required.",
+                "status",
+            )
+            self._alert(
+                "恢復後成交需人工核對 Manual Review",
+                f"In-flight {action_type} fill was restored but the fill "
+                f"poller was not started ({why}). "
+                "Real account does not match, the position snapshot has "
+                "not arrived, or COM is unavailable. "
+                "Orders stay blocked until you review the position.",
+            )
+            return
+        side = ""
+        if self._live_runner and self._live_runner.broker.position_side:
+            side = self._live_runner.broker.position_side.value or ""
+        expected_sign = 1 if side == "LONG" else -1 if side == "SHORT" else None
         self._live_log_msg(
             "[RESUME] In-flight "
             f"{action_type} fill restored — restarting fill poller. "
             "Real orders stay blocked until it confirms or times out.",
             "status",
         )
-        self._start_fill_polling(action_type)
+        self._start_fill_polling(
+            action_type, expected_sign=expected_sign, resumed=True)
         # Still pending: the poller is armed and the gate is held on
         # purpose. Say so. A log line alone is how this used to stick.
         # Headless records ``_alert`` and does not block on a dialog.
@@ -8808,7 +8860,9 @@ class BacktestApp:
                     self.root.after_cancel(self._fill_poll_timer_id)
                 self._on_fill_confirmed()
 
-    def _start_fill_polling(self, action_type: str) -> None:
+    def _start_fill_polling(self, action_type: str, *,
+                            expected_sign: int | None = None,
+                            resumed: bool = False) -> None:
         """Start polling OpenInterest for position change after order sent."""
         com_ok = _com_available and skO is not None and bool(self._futures_account)
         # Snapshot broker.entry_bar_index so _on_fill_confirmed can later
@@ -8818,7 +8872,9 @@ class BacktestApp:
                          if self._live_runner else 0)
         action = self._fill_poller.start(
             action_type, self._get_signed_position(), com_available=com_ok,
-            entry_bar_index=entry_bar_idx)
+            entry_bar_index=entry_bar_idx,
+            expected_sign=expected_sign,
+            resumed=resumed)
 
         if action.type == "no_com":
             _log(f"FILL POLL: {action.message}")

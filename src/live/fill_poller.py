@@ -12,6 +12,15 @@ from dataclasses import dataclass
 from src.live.trading_guard import TradingGuard
 
 
+def _position_sign(qty: int) -> int:
+    """+1 long, -1 short, 0 flat."""
+    if qty > 0:
+        return 1
+    if qty < 0:
+        return -1
+    return 0
+
+
 @dataclass
 class FillPollAction:
     """Instruction returned by FillPoller for the GUI to execute."""
@@ -67,6 +76,11 @@ class FillPoller:
         # guard to reject a late entry-fill callback that arrives
         # AFTER the original trade already closed (issue #45 race).
         self._entry_bar_index: int = 0
+        # Resume only. +1 long, -1 short, None = any non-zero (a live
+        # order that was not a resumed book). timeout() must not assume
+        # a resumed entry filled unless this sign was actually seen.
+        self._expected_sign: int | None = None
+        self._resumed: bool = False
 
     def reset(self) -> None:
         """Clear all state."""
@@ -76,6 +90,8 @@ class FillPoller:
         self._pos_current = None
         self._start_time = 0
         self._entry_bar_index = 0
+        self._expected_sign = None
+        self._resumed = False
 
     @property
     def active(self) -> bool:
@@ -106,7 +122,9 @@ class FillPoller:
 
     def start(self, action_type: str, current_position: int,
               com_available: bool = True,
-              entry_bar_index: int = 0) -> FillPollAction:
+              entry_bar_index: int = 0,
+              expected_sign: int | None = None,
+              resumed: bool = False) -> FillPollAction:
         """Begin monitoring for a fill.
 
         Args:
@@ -117,9 +135,16 @@ class FillPoller:
                 stored so _on_fill_confirmed can verify a late
                 confirmation still belongs to the current trade
                 (issue #45)
+            expected_sign: +1 long / -1 short for a resumed entry.
+                None keeps the historical "any non-zero" entry check.
+            resumed: True when this poll continues an order from the
+                previous process. ``timeout()`` will not assume that
+                entry filled unless ``expected_sign`` was seen.
 
         Returns FillPollAction telling the caller what to do next.
         """
+        self._expected_sign = expected_sign
+        self._resumed = resumed
         if not com_available:
             # Auto-confirm immediately when COM unavailable
             self._guard.on_fill_confirmed()
@@ -163,7 +188,9 @@ class FillPoller:
         """Called when OpenInterest callback reports a matching position.
 
         Uses target-state checking (NOT before/after delta):
-          - entry: position != 0 (we have a position now)
+          - entry: position != 0, and when ``expected_sign`` was set
+            the sign must match (a real short must not confirm a
+            resumed long)
           - exit:  position == 0 (we're flat now)
 
         Returns FillPollAction("confirmed") if fill detected, else None.
@@ -175,7 +202,10 @@ class FillPoller:
 
         confirmed = False
         if self._action_type == "entry":
-            confirmed = signed_position != 0
+            if self._expected_sign is None:
+                confirmed = signed_position != 0
+            else:
+                confirmed = _position_sign(signed_position) == self._expected_sign
         elif self._action_type == "exit":
             confirmed = signed_position == 0
 
@@ -280,22 +310,56 @@ class FillPoller:
             message=f"成交已確認 {action_type.upper()} fill confirmed",
         )
 
+    def _resumed_entry_may_confirm(self) -> bool:
+        """True when a resumed entry's book shows the expected sign.
+
+        A live (non-resume) poll has no expected sign and may assume
+        the fill. A resumed entry may not: timeout used to call
+        ``on_entry_sent`` after 10s, and the deferred close then sold
+        into a real short.
+        """
+        if not self._resumed or self._expected_sign is None:
+            return True
+        observed = (self._pos_current
+                    if self._pos_current is not None else self._pos_before)
+        return _position_sign(observed) == self._expected_sign
+
     def timeout(self) -> FillTimeoutResult:
         """Handle fill timeout. Clears pending state, returns downgrade info.
 
         Assumes the order DID fill (conservative for position safety):
           - entry timeout: assume we have a position → allow exits
           - exit timeout:  assume we closed → prevent double exits
+
+        A resumed entry whose side was not seen is not assumed filled.
+        The gate stays up so the deferred close cannot be replayed.
         """
         action_type = self._action_type
+
+        if (action_type == "entry" and self._resumed
+                and not self._resumed_entry_may_confirm()):
+            self._active = False
+            timeout_s = self.FILL_POLL_TIMEOUT
+            return FillTimeoutResult(
+                action_type=action_type,
+                timeout_seconds=timeout_s,
+                message=(f"成交超時 Fill timeout: resumed entry side did not "
+                         f"match after {timeout_s:.0f}s — 未確認進場 "
+                         f"entry NOT confirmed. 降級為半自動 downgraded to "
+                         f"semi-auto. 請人工核對持倉 Manual review required."),
+                new_trading_mode="semi_auto",
+            )
 
         # Clear fill pending state — do NOT halt
         self._guard.fill_pending = False
         self._guard.fill_pending_type = ""
 
-        # Conservative assumption: order filled
+        # Conservative assumption: order filled. A resumed entry is
+        # the exception — assuming it filled lets _on_fill_confirmed
+        # replay a deferred close into the wrong real book (issue #168).
         if action_type == "entry":
-            self._guard.on_entry_sent()
+            if self._resumed_entry_may_confirm():
+                self._guard.on_entry_sent()
         elif action_type == "exit":
             self._guard.on_exit_sent()
 
