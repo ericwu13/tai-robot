@@ -5431,13 +5431,14 @@ class BacktestApp:
             compute_design_cut, design_cutoff_index, plan_sample_rule,
             plan_directives_block)
         knob_note = ""
+        _evo_cls = None
+        _evo_source = ""
         if auto_run:
             from src.evolution.knobs import saturday_knob_directives_if_eligible
             if live and getattr(self._live_runner, "strategy", None) is not None:
                 _evo_cls = type(self._live_runner.strategy)
             else:
                 _evo_cls = STRATEGIES.get(self.strategy_var.get())
-            _evo_source = ""
             if _evo_cls is not None:
                 _evo_source = self._resolve_strategy_source(
                     self.strategy_var.get(), _evo_cls)
@@ -5456,6 +5457,27 @@ class BacktestApp:
         cut_idx = (design_cutoff_index(result.trades, 0, cut)
                    if cut else len(result.trades))
         holdout_count = len(result.trades) - cut_idx
+
+        # Issue #164 option (iii): an ineligible class is deterministic.
+        # Record it once (class name + source hash), alert once, and
+        # advance the watermark. The same key returns here with no AI
+        # call and no second alert. A new hash falls through and is
+        # re-evaluated. No codegen fallback. Eligible classes are untouched.
+        if auto_run and _evo_cls is not None:
+            from src.evolution.knobs import settle_knob_ineligibility
+            _knob_settle, _knob_reason = settle_knob_ineligibility(
+                bot_dir, _evo_cls, _evo_source, cut_idx)
+            if _knob_settle == "skip":
+                return
+            if _knob_settle == "recorded":
+                msg = f"🧬 EVO {_knob_reason}"
+                self._append_chat("system", msg)
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify_evolution(msg)
+                    except Exception:
+                        pass
+                return
 
         if watermark and cut_idx <= omitted:
             # No NEW design-window trades since the last run — the recent
@@ -5853,18 +5875,31 @@ class BacktestApp:
                     if auto_run:
                         _notify_discord(msg)
                     return
-                # Issue #153 / #164: Saturday knob mode refuses off-grid
-                # plans and ineligible classes BEFORE the watermark, so a
-                # rejected plan does not burn next week's delta.
-                # Option (ii): an ineligible class stops the run here.
-                # No codegen fallback and no partial grid (pending CEO).
+                # Issue #153: an eligible class with an off-grid / structural
+                # plan is refused BEFORE the watermark, so that plan does
+                # not burn next week's delta.
+                # Issue #164 option (iii): an ineligible class is recorded
+                # once and the watermark advances. No codegen fallback.
+                # _bot_evolution settles this before the AI call; this is
+                # the backstop if a plan was already in hand.
                 _knob_apply = None
                 if auto_run and baseline_cls is not None:
-                    from src.evolution.knobs import saturday_knob_decision
+                    from src.evolution.knobs import (
+                        is_knob_not_applicable_reason, saturday_knob_decision,
+                        settle_knob_ineligibility)
                     rejection, _knob_apply = saturday_knob_decision(
                         baseline_cls.__name__, directives.get("knobs"),
                         baseline_cls, strategy_source)
                     if rejection:
+                        if is_knob_not_applicable_reason(rejection):
+                            action, why = settle_knob_ineligibility(
+                                bot_dir, baseline_cls, strategy_source,
+                                design_cut_idx)
+                            if action == "recorded":
+                                msg = f"🧬 EVO {why}"
+                                ui(self._append_chat, "system", msg)
+                                _notify_discord(msg)
+                            return
                         msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
                         ui(self._append_chat, "system", msg)
                         if auto_run:

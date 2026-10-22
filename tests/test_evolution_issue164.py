@@ -9,8 +9,11 @@ These tests fail against the pre-fix ``knobs.py``: ``knob_mode_ineligible``
 did not exist, and ``saturday_knob_decision`` returned
 ``could not read baseline knobs (KeyError: 'atr_buffer_mult')``.
 
-Option (ii) stays: the reason is a refusal, so the caller returns before
-``maybe_advance_watermark``. No codegen fallback and no partial grid.
+Option (iii): an ineligible class is recorded once as ``not applicable``,
+keyed on class name plus source hash, and the watermark advances. The
+same key is not retried or re-alerted. A new hash is re-evaluated.
+No codegen fallback. Off-grid refusals on an eligible class still stop
+before the watermark.
 """
 
 from __future__ import annotations
@@ -24,10 +27,15 @@ import pytest
 import run_backtest as rb
 from src.evolution.knobs import (
     DYNAMIC_EXIT_PULLBACK_GRID,
+    KNOB_NOT_APPLICABLE,
+    knob_applicability_key,
     knob_mode_ineligible,
+    load_knob_not_applicable,
     saturday_knob_decision,
     saturday_knob_directives_if_eligible,
+    settle_knob_ineligibility,
 )
+from src.evolution.notify import load_watermark
 
 _V3_REASON = (
     "knob mode not applicable: DynamicExitPullbackV3 lacks knobs "
@@ -124,7 +132,6 @@ class TestKnobModeIneligible:
             DynamicExitPullbackV3)
         assert applied is None
         assert decision == _V3_REASON
-        # Non-empty refusal: the pipeline returns before the watermark.
         assert decision
 
     def test_missing_knobs_are_listed_in_grid_order(self):
@@ -267,11 +274,23 @@ class TestKnobPromptGate:
         assert "knob_note = saturday_knob_directives()" not in src
         assert "{knob_note}" in src
 
-    def test_ineligible_refusal_stays_before_the_watermark(self):
+    def test_ineligible_settles_before_the_ai_and_codegen(self):
+        """Same key skips before the pipeline. Off-grid refusal still
+        sits before the change-plan watermark advance."""
+        evo = textwrap.dedent(inspect.getsource(rb.BacktestApp._bot_evolution))
+        assert evo.index("settle_knob_ineligibility") < evo.index(
+            "No new design-window trades")
+        assert evo.index('== "skip"') < evo.index('== "recorded"')
+        assert evo.index("settle_knob_ineligibility") < evo.index(
+            "_start_evolution_pipeline")
         src = textwrap.dedent(
             inspect.getsource(rb.BacktestApp._start_evolution_pipeline))
         assert src.index("saturday_knob_decision") < src.index(
             "maybe_advance_watermark")
+        assert src.index("is_knob_not_applicable_reason") < src.index(
+            "maybe_advance_watermark")
+        assert src.index("is_knob_not_applicable_reason") < src.index(
+            "evolution_codegen")
         tree = ast.parse(src)
         calls = [
             n for n in ast.walk(tree)
@@ -281,7 +300,107 @@ class TestKnobPromptGate:
         ]
         assert len(calls) == 1
         assert "strategy_source" in ast.dump(calls[0])
-        # The non-empty reason is what `if rejection: return` keys off.
-        # Codegen stays behind that return (option ii).
-        assert src.index("if rejection:") < src.index("maybe_advance_watermark")
-        assert src.index("if rejection:") < src.index("evolution_codegen")
+
+
+_AT = "2026-10-17 05:05:00"
+
+
+class TestKnobNotApplicable:
+    def test_ineligible_recorded_once_and_watermark_advances(self, tmp_path):
+        source = inspect.getsource(DynamicExitPullbackV3)
+        action, reason = settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+        assert action == "recorded"
+        assert reason == _V3_REASON
+        rec = load_knob_not_applicable(tmp_path)
+        key = knob_applicability_key("DynamicExitPullbackV3", source)
+        assert rec["outcome"] == KNOB_NOT_APPLICABLE == "not applicable"
+        assert rec["class_name"] == key["class_name"]
+        assert rec["source_hash"] == key["source_hash"]
+        assert rec["reason"] == _V3_REASON
+        assert rec["at"] == _AT
+        assert load_watermark(tmp_path) == {"trade_count": 12, "at": _AT}
+
+    def test_second_run_same_key_skips_silently(self, tmp_path):
+        source = inspect.getsource(DynamicExitPullbackV3)
+        settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+        rec = load_knob_not_applicable(tmp_path)
+        mark = load_watermark(tmp_path)
+        action, reason = settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackV3, source, 40,
+            at="2026-10-24 05:05:00")
+        assert action == "skip"
+        assert reason == ""
+        assert load_knob_not_applicable(tmp_path) == rec
+        assert load_watermark(tmp_path) == mark
+
+    def test_source_hash_change_reevaluates(self, tmp_path):
+        source = inspect.getsource(DynamicExitPullbackV3)
+        settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+        edited = source + "\n# edited knob source\n"
+        assert knob_applicability_key(
+            "DynamicExitPullbackV3", edited)["source_hash"] != (
+            knob_applicability_key(
+                "DynamicExitPullbackV3", source)["source_hash"])
+        action, reason = settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackV3, edited, 18,
+            at="2026-10-24 05:05:00")
+        assert action == "recorded"
+        assert reason == _V3_REASON
+        rec = load_knob_not_applicable(tmp_path)
+        assert rec["class_name"] == "DynamicExitPullbackV3"
+        assert rec["source_hash"] == knob_applicability_key(
+            "DynamicExitPullbackV3", edited)["source_hash"]
+        assert rec["outcome"] == "not applicable"
+        assert load_watermark(tmp_path)["trade_count"] == 18
+
+    def test_class_name_is_part_of_the_key(self, tmp_path):
+        source = inspect.getsource(DynamicExitPullbackV3)
+        settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+        other = type(
+            "DynamicExitPullbackOther", (DynamicExitPullbackV3,), {})
+        action, reason = settle_knob_ineligibility(
+            tmp_path, other, source, 15, at="2026-10-24 05:05:00")
+        assert action == "recorded"
+        assert "lacks knobs [atr_buffer_mult]" in reason
+        assert load_knob_not_applicable(tmp_path)["class_name"] == (
+            "DynamicExitPullbackOther")
+
+    def test_eligible_paths_do_not_record_or_advance(self, tmp_path):
+        from dynamic_exit_pullback_strategy_v2 import (
+            DynamicExitPullbackStrategyV2)
+        settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackV3,
+            inspect.getsource(DynamicExitPullbackV3), 12, at=_AT)
+        source = inspect.getsource(DynamicExitPullbackStrategyV2)
+        action, reason = settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackStrategyV2, source, 99,
+            at="2026-10-24 05:05:00")
+        assert action == "eligible"
+        assert reason == ""
+        assert load_watermark(tmp_path)["trade_count"] == 12
+        assert load_knob_not_applicable(tmp_path)["class_name"] == (
+            "DynamicExitPullbackV3")
+        ok, knobs = saturday_knob_decision(
+            "DynamicExitPullbackStrategyV2", {"ema_period": 60},
+            DynamicExitPullbackStrategyV2, source)
+        assert ok == ""
+        assert knobs == {"ema_period": 60}
+        # The edited in-memory class is eligible, so the old record
+        # does not keep it skipped and the watermark stays put.
+        good = _exec_in_memory(_IN_MEMORY_V2)
+        bad = _exec_in_memory(_IN_MEMORY_V3)
+        again, _ = settle_knob_ineligibility(
+            tmp_path, bad, _IN_MEMORY_V3, 12, at=_AT)
+        assert again == "recorded"
+        action, reason = settle_knob_ineligibility(
+            tmp_path, good, _IN_MEMORY_V2, 40, at="2026-10-24 05:05:00")
+        assert action == "eligible"
+        assert reason == ""
+        assert load_watermark(tmp_path)["trade_count"] == 12
+        grid_skip, _ = settle_knob_ineligibility(
+            tmp_path, object, "class X: pass", 12, at=_AT)
+        assert grid_skip == "not_grid"

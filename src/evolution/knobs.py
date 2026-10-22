@@ -8,14 +8,22 @@ applied on the Saturday path.
 Issue #164: the class name is only a candidate. Knob mode applies when
 the class instantiates with no arguments, exposes every grid knob, and
 each knob has a literal ``kwargs.get`` default that
-``rewrite_knob_source`` can replace. Otherwise the Saturday run stops
-before the watermark (option ii — no codegen fallback, no partial grid).
+``rewrite_knob_source`` can replace. An ineligible class is recorded
+once as ``not applicable``, keyed on class name plus source hash, and
+the watermark advances (option iii). The same key is not retried or
+re-alerted; a new hash is re-evaluated. There is no codegen fallback.
+Off-grid proposals on an eligible class still stop before the watermark.
+The substring grid match stays; an explicit class opt-in is a follow-up.
 """
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
+import os
 import re
+from datetime import datetime, timedelta, timezone
 
 MAX_AUTO_KNOBS = 2
 
@@ -30,6 +38,11 @@ DYNAMIC_EXIT_PULLBACK_GRID: dict[str, tuple] = {
 _EMA_OUT_OF_AUTO = (80, 90)
 _ESCALATE = "structural/codegen escalate, not auto"
 _FLOAT_KNOBS = ("atr_stop_mult", "atr_buffer_mult")
+
+# Option (iii): one persisted outcome per (class name, source hash).
+KNOB_NOT_APPLICABLE = "not applicable"
+KNOB_NOT_APPLICABLE_FILENAME = "knob_not_applicable.json"
+_TZ_TAIPEI = timezone(timedelta(hours=8))
 
 
 def knob_grid_for(class_name: str | None) -> dict[str, tuple] | None:
@@ -195,10 +208,11 @@ def saturday_knob_decision(class_name, proposal, strategy_cls,
     Non-grid strategies return ``("", None)`` so the caller keeps codegen.
     A grid class that cannot be instantiated, is missing a grid knob, or
     has no literal ``kwargs.get`` default returns ``(reason, None)``.
-    The caller stops before the watermark (issue #164, option ii: no
-    codegen fallback, no partial grid).
+    The caller records that once and advances the watermark (issue #164,
+    option iii: no codegen fallback, no weekly retry of the same source).
     A valid grid proposal returns ``("", {knob: value})``.
-    A refused Saturday plan returns ``(reason, None)``.
+    A refused Saturday plan on an eligible class returns ``(reason, None)``
+    and the caller stops before the watermark.
 
     ``source`` is the strategy text ``rewrite_knob_source`` would edit.
     ``None`` falls back to ``inspect.getsource`` so existing callers keep
@@ -223,6 +237,99 @@ def saturday_knob_decision(class_name, proposal, strategy_cls,
     if reason:
         return reason, None
     return "", changed_knobs(proposal, baseline, grid)
+
+
+def is_knob_not_applicable_reason(reason: str | None) -> bool:
+    """True for an eligibility refusal, not an off-grid proposal refusal."""
+    return (reason or "").startswith("knob mode not applicable:")
+
+
+def knob_applicability_key(class_name: str, source: str) -> dict[str, str]:
+    """Cache key: class name plus the sha256 of the strategy source."""
+    digest = hashlib.sha256((source or "").encode("utf-8")).hexdigest()
+    return {"class_name": class_name or "", "source_hash": digest}
+
+
+def knob_not_applicable_path(bot_dir) -> str:
+    return os.path.join(os.fspath(bot_dir), KNOB_NOT_APPLICABLE_FILENAME)
+
+
+def load_knob_not_applicable(bot_dir) -> dict | None:
+    """The persisted not-applicable record, or None if absent or unreadable."""
+    if not bot_dir:
+        return None
+    path = knob_not_applicable_path(bot_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("outcome") != KNOB_NOT_APPLICABLE:
+        return None
+    return data
+
+
+def _same_not_applicable(record: dict | None, class_name: str,
+                         source: str) -> bool:
+    if not record:
+        return False
+    key = knob_applicability_key(class_name, source)
+    return (record.get("class_name") == key["class_name"]
+            and record.get("source_hash") == key["source_hash"])
+
+
+def save_knob_not_applicable(bot_dir, class_name: str, source: str,
+                             reason: str, at: str) -> dict:
+    """Write the one not-applicable outcome for this class and source."""
+    os.makedirs(os.fspath(bot_dir), exist_ok=True)
+    key = knob_applicability_key(class_name, source)
+    payload = {
+        "outcome": KNOB_NOT_APPLICABLE,
+        "class_name": key["class_name"],
+        "source_hash": key["source_hash"],
+        "reason": reason,
+        "at": at,
+    }
+    path = knob_not_applicable_path(bot_dir)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+    return payload
+
+
+def settle_knob_ineligibility(bot_dir, strategy_cls, source: str,
+                              trade_count: int, at: str | None = None):
+    """``(action, reason)`` for one Saturday look at a live class.
+
+    ``action`` is ``not_grid`` (codegen stays available), ``eligible``
+    (knob mode proceeds; nothing is written), ``skip`` (this class and
+    source hash were already recorded — caller returns with no alert),
+    or ``recorded`` (first time, or a new hash: outcome stored, watermark
+    advanced, caller alerts once). No codegen fallback.
+    """
+    if strategy_cls is None:
+        return "not_grid", ""
+    name = getattr(strategy_cls, "__name__", "") or ""
+    grid = knob_grid_for(name)
+    if not grid:
+        return "not_grid", ""
+    reason = knob_mode_ineligible(strategy_cls, grid, source or "")
+    if not reason:
+        return "eligible", ""
+    source = source or ""
+    if bot_dir and _same_not_applicable(
+            load_knob_not_applicable(bot_dir), name, source):
+        return "skip", ""
+    if at is None:
+        at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+    if bot_dir:
+        save_knob_not_applicable(bot_dir, name, source, reason, at)
+        from src.evolution.notify import save_watermark
+        save_watermark(bot_dir, int(trade_count), at=at)
+    return "recorded", reason
 
 
 def iter_knob_candidates(baseline: dict, grid: dict | None = None,
