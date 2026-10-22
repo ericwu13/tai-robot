@@ -702,6 +702,30 @@ def test_windows_reader_writer_stress(tmp_path):
     assert hb.read_heartbeat(path)["ts"] == 499
 
 
+def test_delete_retries_permission_error_then_removes(tmp_path, monkeypatch):
+    """One sharing violation, then remove succeeds. Nothing is raised."""
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write()
+    target = tmp_path / "heartbeat.json"
+    assert target.is_file()
+    real = hb.os.remove
+    calls = {"n": 0}
+    sleeps = []
+
+    def flaky(path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("busy")
+        return real(path)
+
+    monkeypatch.setattr(hb.os, "remove", flaky)
+    monkeypatch.setattr(hb, "_sleep", lambda delay: sleeps.append(delay))
+    writer.delete()
+    assert not target.exists()
+    assert calls["n"] == 2
+    assert sleeps == [hb._REPLACE_BACKOFF_S[0]]
+
+
 def test_attempt_reconnect_stamps_leave_monitor():
     path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                         "run_backtest.py")

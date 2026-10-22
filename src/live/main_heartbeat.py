@@ -181,6 +181,32 @@ def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
             sleep_fn(_REPLACE_BACKOFF_S[attempt])
 
 
+def _remove_with_retry(path: str, *, sleep=None, monotonic=None) -> None:
+    """Delete ``path``. Same PermissionError backoff as ``os.replace``.
+
+    Missing files and other OSErrors are ignored, matching the old
+    ``delete()``. The final PermissionError is rate-limited and not
+    re-raised.
+    """
+    sleep_fn = _sleep if sleep is None else sleep
+    mono_fn = _monotonic if monotonic is None else monotonic
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.remove(path)
+            return
+        except PermissionError as exc:
+            if attempt + 1 >= _REPLACE_ATTEMPTS:
+                note_heartbeat_failure(
+                    "heartbeat os.remove failed for "
+                    f"{os.path.basename(path) or path}: "
+                    f"[{type(exc).__name__}] {exc}",
+                    monotonic=mono_fn)
+                return
+            sleep_fn(_REPLACE_BACKOFF_S[attempt])
+        except OSError:
+            return
+
+
 def dump_thread_stacks(path: str) -> None:
     """Dump every thread stack into ``path``.
 
@@ -294,15 +320,14 @@ class HeartbeatWriter:
     def delete(self) -> None:
         """Remove heartbeat.json. Main-thread only; missing file is fine.
 
-        The snapshot stays until the file is gone so the watchdog does not
-        fall back to opening the file while ``os.remove`` runs (that open
-        is what makes remove fail with PermissionError on Windows).
+        The snapshot stays until the remove attempts finish so the
+        watchdog does not fall back to opening the file while
+        ``os.remove`` runs (that open is what makes remove fail with
+        PermissionError on Windows). A final PermissionError is logged
+        and swallowed — delete must not raise on the Tk thread.
         """
         _assert_main_thread()
-        try:
-            os.remove(self.path)
-        except OSError:
-            pass
+        _remove_with_retry(self.path)
         _clear_snapshot(self.path)
 
     @contextmanager
