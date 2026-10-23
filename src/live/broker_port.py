@@ -1,8 +1,8 @@
 """Thin broker port for the issue #157 reconnect machine.
 
-P1 only. The live GUI and the headless bot do not call this yet; P2
-is the switchover and is on hold. Implementations must not be imported
-from here — this module is a typing surface with no Tk and no COM.
+P1 typing surface. P2 wires it from ``ComBrokerPort`` + ``LinkHost``.
+Implementations must not be imported from here — this module has no Tk
+and no COM.
 
 This is the P1 interface for LinkStateMachine, not a revive of the #170 seam that #174 reverts.
 

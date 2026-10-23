@@ -726,11 +726,19 @@ def test_delete_retries_permission_error_then_removes(tmp_path, monkeypatch):
     assert sleeps == [hb._REPLACE_BACKOFF_S[0]]
 
 
-def test_attempt_reconnect_stamps_leave_monitor():
-    path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                        "run_backtest.py")
-    text = open(path, encoding="utf-8").read()
-    assert 'call_com("LeaveMonitor"' in text
-    send_at = text.find("skO.SendFutureOrderCLR")
+def test_leave_monitor_is_stamped_via_call_com():
+    """Shutdown LeaveMonitor goes through call_com. Reconnect does not call it."""
+    root = os.path.dirname(os.path.dirname(__file__))
+    port = open(os.path.join(root, "src", "live", "com_broker_port.py"),
+                encoding="utf-8").read()
+    assert '"LeaveMonitor"' in port
+    assert "self._invoke(" in port
+    app = open(os.path.join(root, "run_backtest.py"), encoding="utf-8").read()
+    match_start = app.find("def _attempt_reconnect(")
+    match_end = app.find("\n    def ", match_start + 1)
+    body = app[match_start:match_end]
+    assert "LeaveMonitor" not in body
+    assert "LoginSetQuote" not in body
+    send_at = app.find("skO.SendFutureOrderCLR")
     assert send_at != -1
-    assert "call_com(" in text[max(0, send_at - 120):send_at]
+    assert "call_com(" in app[max(0, send_at - 120):send_at]
