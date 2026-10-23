@@ -1199,7 +1199,14 @@ class TestReedReview:
         assert machine.login == LoginPhase.LOGGED_IN
         fake.hold_reply_connected = True
         fake.held_reply_state = 1
-        t = pump(machine, fake, t, 30)
+        # First tick after the reply settle. Track-stuck-only is still DOWN.
+        t = t + timedelta(seconds=9)
+        at(machine, fake, t)
+        assert machine.reply == LinkPhase.READY
+        assert machine._reply_stuck_since is None
+        assert machine._unreconciled_since is None
+        assert not machine.degraded
+        t = pump(machine, fake, t, 20)
         assert machine.reply == LinkPhase.READY
         assert not machine.degraded
         assert machine.entries_blocked
@@ -1461,6 +1468,24 @@ def scenario_manual_login_wedge(rules):
     machine.manual_reconnect(t + timedelta(seconds=11))
 
 
+def scenario_wedge_id_up_immediate(rules):
+    """Dies when IsConnectedByID==1 only arms the stuck clock."""
+    machine, fake, t0 = boot_ready(rules)
+    t = t0 + timedelta(hours=1)
+    inject_connection(machine, fake, KIND_CONN_ERROR, t)
+    fake.enter_codes = [1108]
+    fake.login_codes = [0]
+    at(machine, fake, t + timedelta(seconds=5))
+    at(machine, fake, t + timedelta(seconds=6))
+    fake.hold_reply_connected = True
+    fake.held_reply_state = 1
+    at(machine, fake, t + timedelta(seconds=16))
+    if machine.reply != LinkPhase.READY or machine._reply_stuck_since is not None:
+        raise SimulatedAV(
+            "stuck clock instead of marking the surviving reply READY"
+        )
+
+
 def scenario_login_wedge_id_gate(rules):
     machine, fake, t0 = boot_ready(rules)
     t = t0 + timedelta(hours=1)
@@ -1689,6 +1714,12 @@ MUTANTS = [
         scenario_login_wedge_id_gate,
         "IsConnectedByID",
         "a surviving reply does not clear entries_blocked before reconcile",
+    ),
+    (
+        "wedge_id_up_immediate",
+        scenario_wedge_id_up_immediate,
+        "stuck clock",
+        "IsConnectedByID==1 on the 1108 wedge marks reply up on that tick, not after stuck_limit",
     ),
 ]
 

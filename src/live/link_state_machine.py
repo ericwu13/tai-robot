@@ -142,6 +142,9 @@ class MachineRules:
     # That surviving reply does not unblock entries before a reconcile.
     # Mutant clears the block and reconciles before OnComplete.
     entries_blocked_until_reconcile: bool = True
+    # IsConnectedByID==1 on the 1108 wedge is honored on this tick.
+    # Mutant only arms the stuck clock and waits out stuck_limit.
+    wedge_id_up_immediate: bool = True
 
 
 @dataclass
@@ -903,10 +906,19 @@ class LinkStateMachine:
             return True
         if self.rules.login_wedge_id_gate:
             state = self.port.is_connected_by_id(self.config.user_id)
-            if state == 1 and self._wedge_reply_survived():
+            if state == 1:
+                # The reply survived login. Same honor as a late
+                # IsConnectedByID==1, but OnComplete will not come, so
+                # do not park this on _track_reply_stuck and do not
+                # ConnectByID.
                 if not self.rules.wedge_id_up_without_reconnect:
                     # Mutant: ConnectByID while the reply link is still up.
                     self.port.connect_reply(self.config.user_id)
+                    return True
+                if not self.rules.wedge_id_up_immediate:
+                    # Mutant: only arm the stuck clock. The link stays
+                    # DOWN until stuck_limit instead of being marked up.
+                    self._track_reply_stuck(now, state)
                     return True
                 self._accept_surviving_reply()
                 return True
