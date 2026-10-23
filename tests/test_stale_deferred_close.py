@@ -110,6 +110,53 @@ def test_E2_stale_close_not_replayed_into_new_entry(monkeypatch):
     )
 
 
+def test_exit_timeout_then_auto_switch_does_not_replay_close(monkeypatch):
+    """Exit timeout, then a manual switch back to auto, then the next entry.
+
+    Pre-#171, same as the entry leak: timeout() left the deferred close
+    for an exit. Semi-auto does not pop it. Switching back to auto and
+    confirming the next entry replayed that close.
+    """
+    app = _resume_guard_app(position_size=1)
+    _book(app, 1)
+    _enable_fill_com(monkeypatch)
+    monkeypatch.setattr(rb, "_discord", None)
+    app._trading_mode = "auto"
+    app._live_runner.trading_mode = "auto"
+    app._live_runner.broker.trade_source = "real"
+    app.trading_mode_var = SimpleNamespace(
+        set=lambda value: setattr(app, "_mode_label", value))
+
+    guard = app._trading_guard
+    guard.on_entry_sent()
+    guard.on_fill_pending("exit")
+    guard.defer_close(dict(_CLOSE_LONG))
+    app._get_signed_position = lambda: 1
+    app._start_fill_polling("exit")
+    assert app._fill_poller.active is True
+    assert app._fill_poller.action_type == "exit"
+
+    app._on_fill_timeout()
+    assert app._trading_mode == "semi_auto"
+    assert app._live_runner.trading_mode == "semi_auto"
+    assert guard.fill_pending is False
+    assert guard.real_entry_confirmed is False
+    assert guard._deferred_close is None
+
+    # The operator switches back to auto. The switch does not pop a
+    # close; the next auto entry confirm would.
+    app._trading_mode = "auto"
+    app._live_runner.trading_mode = "auto"
+
+    guard.on_fill_pending("entry")
+    app._get_signed_position = lambda: 0
+    app._start_fill_polling("entry")
+    result = app._fill_poller.on_position_update(-1)
+    assert result is not None and result.type == "confirmed"
+    app._on_fill_confirmed()
+    assert app._sent == []
+
+
 def test_entry_timeout_same_session_does_not_replay_stale_close(monkeypatch):
     """Pre-#171, no restart: the next auto entry confirm pops the close.
 
