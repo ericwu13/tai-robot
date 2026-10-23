@@ -119,6 +119,19 @@ class MachineRules:
     # IsConnectedByID==1 is not OnComplete. Do not reconcile until then.
     # Mutant reconciles immediately and the fake rejects it.
     id_up_waits_for_complete: bool = True
+    # Manual Reconnect restarts the unreconciled stuck window from the
+    # press. The clock stays set until OnComplete. Mutant leaves it
+    # expired, so the next tick degrades again.
+    manual_reconnect_restarts_unreconciled: bool = True
+    # 1108 wedge waits out backoff before ConnectByID, same as the
+    # disconnect path. Mutant connects during the backoff.
+    login_wedge_backoff: bool = True
+    # A pending OnComplete on a READY unreconciled reply is reconciled
+    # from _honor_unreconciled. Mutant skips that and resumes orders.
+    honor_unreconciled_pending: bool = True
+    # That OnComplete is not dropped before the reconcile. Mutant clears
+    # the clock and the pending flag, then resumes orders.
+    honor_unreconciled_keeps_pending: bool = True
 
 
 @dataclass
@@ -253,6 +266,10 @@ class LinkStateMachine:
         waiting for OnComplete is not sent again. The 1108 wedge,
         which can miss OnSolaceReplyDisconnect, waits out the reply
         settle from this press and then sends one ConnectByID.
+
+        A READY reply that is still waiting for OnComplete keeps
+        ``_unreconciled_since``. The press restarts that window from
+        now. It does not clear it.
         """
         if not self.degraded:
             return
@@ -277,6 +294,13 @@ class LinkStateMachine:
         if not self.rules.manual_reconnect_clears_stuck:
             self.port.connect_reply(self.config.user_id)
             return
+        if self._unreconciled_since is not None:
+            if not self.rules.manual_reconnect_restarts_unreconciled:
+                # Mutant: leave the expired clock. The next tick
+                # re-degrades, and this call hits a reply that is up.
+                self.port.connect_reply(self.config.user_id)
+                return
+            self._unreconciled_since = now
         if self._saw_3033:
             self._solace_down_at = now
         if self._down_without_reply_event_since is not None:
@@ -859,6 +883,11 @@ class LinkStateMachine:
         ):
             return True
         if self._backoff_until is not None and now < self._backoff_until:
+            if self.rules.login_wedge_backoff:
+                return True
+            # Mutant: ConnectByID during backoff. The scenario holds
+            # the reply link up, so this is the re-call crash.
+            self.port.connect_reply(self.config.user_id)
             return True
         if self.rules.login_wedge_id_gate:
             state = self.port.is_connected_by_id(self.config.user_id)
@@ -944,6 +973,16 @@ class LinkStateMachine:
         if self._terminal_degrade():
             return
         if self._pending_complete:
+            if not self.rules.honor_unreconciled_keeps_pending:
+                # Mutant: drop the OnComplete before reconcile.
+                self._pending_complete = False
+                self._unreconciled_since = None
+                self.port.release_orders()
+                return
+            if not self.rules.honor_unreconciled_pending:
+                # Mutant: leave the OnComplete sitting and resume orders.
+                self.port.release_orders()
+                return
             self._finish_reply()
             self._clear_reply_stuck_clocks()
             return

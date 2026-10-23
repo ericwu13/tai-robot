@@ -1135,6 +1135,94 @@ class TestReedReview:
         assert machine.degraded or machine.reply != LinkPhase.READY
         assert machine.reply != LinkPhase.READY
 
+    def test_U4_manual_reconnect_restarts_unreconciled_clock(self):
+        """READY + unreconciled: the press restarts the stuck window.
+
+        The next tick must not degrade from the clock that already
+        fired. The clock stays set until OnComplete.
+        """
+        cfg = LinkMachineConfig(stuck_limit_s=5)
+        machine, fake, t0 = boot_ready(cfg=cfg)
+        t = t0 + timedelta(minutes=1)
+        inject_reply_disconnect(machine, fake, t)
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        at(machine, fake, t + timedelta(seconds=10))
+        at(machine, fake, t + timedelta(seconds=15))
+        assert machine.degraded
+        at(machine, fake, t + timedelta(seconds=16))
+        assert machine.reply == LinkPhase.READY
+        assert not machine.degraded
+        assert not machine.reply_reconciled
+        at(machine, fake, t + timedelta(seconds=21))
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        press = t + timedelta(seconds=21)
+        connects = fake.calls.count("ConnectByID")
+        degraded_alerts = sum(
+            alert.startswith("DEGRADED") for alert in machine.alerts
+        )
+        machine.manual_reconnect(press)
+        assert machine._unreconciled_since == press
+        assert not machine.degraded
+        at(machine, fake, press + timedelta(seconds=1))
+        assert not machine.degraded
+        assert machine.entries_blocked
+        assert machine.orders_paused
+        assert not machine.reply_reconciled
+        assert machine._unreconciled_since == press
+        assert fake.calls.count("ConnectByID") == connects
+        assert sum(
+            alert.startswith("DEGRADED") for alert in machine.alerts
+        ) == degraded_alerts
+        at(machine, fake, press + timedelta(seconds=4))
+        assert not machine.degraded
+        at(machine, fake, press + timedelta(seconds=5))
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        assert machine.entries_blocked
+
+    def test_wedge_backoff_blocks_connect_until_it_elapses(self):
+        """1108 wedge ConnectByID waits out backoff, then sends one."""
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(hours=1)
+        inject_connection(machine, fake, KIND_CONN_ERROR, t)
+        fake.enter_codes = [1108]
+        fake.login_codes = [0]
+        connects = fake.calls.count("ConnectByID")
+        machine._backoff_until = t + timedelta(seconds=200)
+        t = pump(machine, fake, t, 150)
+        assert machine.login == LoginPhase.LOGGED_IN
+        assert fake.calls.count("ConnectByID") == connects
+        t = pump(machine, fake, t, 100)
+        assert fake.calls.count("ConnectByID") == connects + 1
+        assert machine.reply == LinkPhase.CONNECTING
+
+    def test_honor_unreconciled_pending_complete_reconciles(self):
+        """OnComplete while READY and unreconciled reconciles on that tick."""
+        cfg = LinkMachineConfig(stuck_limit_s=30)
+        machine, fake, t0 = boot_ready(cfg=cfg)
+        t = t0 + timedelta(minutes=1)
+        inject_reply_disconnect(machine, fake, t)
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        at(machine, fake, t + timedelta(seconds=10))
+        at(machine, fake, t + timedelta(seconds=40))
+        assert machine.degraded
+        at(machine, fake, t + timedelta(seconds=41))
+        assert machine.reply == LinkPhase.READY
+        assert not machine.degraded
+        assert not machine.reply_reconciled
+        assert machine._unreconciled_since is not None
+        late = t + timedelta(seconds=42)
+        inject_complete(machine, fake, late)
+        at(machine, fake, late)
+        assert machine.reply_reconciled
+        assert machine._unreconciled_since is None
+        assert not machine.entries_blocked
+        assert not machine.orders_paused
+        assert not machine.degraded
+
 
 def _quote_up(machine, fake, t):
     t = pump(machine, fake, t, 2)
@@ -1334,6 +1422,47 @@ def scenario_login_wedge_id_gate(rules):
     pump(machine, fake, t + timedelta(seconds=7), 30)
 
 
+def scenario_manual_restarts_unreconciled(rules):
+    cfg = LinkMachineConfig(stuck_limit_s=5)
+    machine, fake, t0 = boot_ready(rules, cfg)
+    t = t0 + timedelta(minutes=1)
+    inject_reply_disconnect(machine, fake, t)
+    fake.hold_reply_connected = True
+    fake.held_reply_state = 1
+    at(machine, fake, t + timedelta(seconds=10))
+    at(machine, fake, t + timedelta(seconds=15))
+    at(machine, fake, t + timedelta(seconds=16))
+    at(machine, fake, t + timedelta(seconds=21))
+    machine.manual_reconnect(t + timedelta(seconds=21))
+
+
+def scenario_login_wedge_backoff(rules):
+    machine, fake, t0 = boot_ready(rules)
+    t = t0 + timedelta(hours=1)
+    inject_connection(machine, fake, KIND_CONN_ERROR, t)
+    fake.enter_codes = [1108]
+    fake.login_codes = [0]
+    machine._backoff_until = t + timedelta(hours=2)
+    pump(machine, fake, t, 7)
+    fake.hold_reply_connected = True
+    fake.held_reply_state = 1
+    pump(machine, fake, t + timedelta(seconds=7), 30)
+
+
+def scenario_honor_pending_complete(rules):
+    cfg = LinkMachineConfig(stuck_limit_s=30)
+    machine, fake, t0 = boot_ready(rules, cfg)
+    t = t0 + timedelta(minutes=1)
+    inject_reply_disconnect(machine, fake, t)
+    fake.hold_reply_connected = True
+    fake.held_reply_state = 1
+    at(machine, fake, t + timedelta(seconds=10))
+    at(machine, fake, t + timedelta(seconds=40))
+    at(machine, fake, t + timedelta(seconds=41))
+    inject_complete(machine, fake, t + timedelta(seconds=42))
+    at(machine, fake, t + timedelta(seconds=42))
+
+
 # field, scenario, SimulatedAV match, rule the mutant deletes
 MUTANTS = [
     (
@@ -1473,6 +1602,30 @@ MUTANTS = [
         scenario_id_already_up,
         "before OnComplete",
         "IsConnectedByID==1 does not reconcile until OnComplete",
+    ),
+    (
+        "manual_reconnect_restarts_unreconciled",
+        scenario_manual_restarts_unreconciled,
+        "IsConnectedByID",
+        "manual Reconnect restarts the unreconciled stuck window from the press",
+    ),
+    (
+        "login_wedge_backoff",
+        scenario_login_wedge_backoff,
+        "IsConnectedByID",
+        "1108 wedge waits out backoff before ConnectByID",
+    ),
+    (
+        "honor_unreconciled_pending",
+        scenario_honor_pending_complete,
+        "reconcile",
+        "pending OnComplete on a READY unreconciled reply is reconciled",
+    ),
+    (
+        "honor_unreconciled_keeps_pending",
+        scenario_honor_pending_complete,
+        "reconcile",
+        "that OnComplete is not cleared before the reconcile",
     ),
 ]
 
