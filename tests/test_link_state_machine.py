@@ -1182,6 +1182,57 @@ class TestReedReview:
         assert machine.degraded_reason == "stuck"
         assert machine.entries_blocked
 
+    def test_U5_wedge_reply_survived_stays_up_entries_blocked(self):
+        """1108 wedge, IsConnectedByID==1, OnComplete never comes.
+
+        The reply is up. Entries stay blocked. One reconcile-pending
+        alert. No ConnectByID, and no re-degrade from the unreconciled
+        clock.
+        """
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(hours=1)
+        inject_connection(machine, fake, KIND_CONN_ERROR, t)
+        fake.enter_codes = [1108]
+        fake.login_codes = [0]
+        connects = fake.calls.count("ConnectByID")
+        t = pump(machine, fake, t, 7)
+        assert machine.login == LoginPhase.LOGGED_IN
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        t = pump(machine, fake, t, 30)
+        assert machine.reply == LinkPhase.READY
+        assert not machine.degraded
+        assert machine.entries_blocked
+        assert machine.orders_paused
+        assert not machine.reply_reconciled
+        assert machine._unreconciled_since is None
+        assert fake.calls.count("ConnectByID") == connects
+        pending = [
+            alert for alert in machine.alerts if alert.startswith("RECONCILE_PENDING")
+        ]
+        assert pending == [
+            "RECONCILE_PENDING: reply up; entries blocked until positions reconcile"
+        ]
+        t = _quote_up(machine, fake, t)
+        assert machine.quote == LinkPhase.READY
+        alert_count = len(machine.alerts)
+        t = pump(machine, fake, t, 400)
+        assert not machine.degraded
+        assert machine.entries_blocked
+        assert machine.reply == LinkPhase.READY
+        assert not machine.reply_reconciled
+        assert machine._unreconciled_since is None
+        assert fake.calls.count("ConnectByID") == connects
+        assert len(machine.alerts) == alert_count
+        for _ in range(3):
+            machine.manual_reconnect(t)
+            t = pump(machine, fake, t, 20)
+        assert not machine.degraded
+        assert machine.entries_blocked
+        assert fake.calls.count("ConnectByID") == connects
+        assert len(machine.alerts) == alert_count
+        assert "RestartProcess" not in fake.calls
+
     def test_wedge_backoff_blocks_connect_until_it_elapses(self):
         """1108 wedge ConnectByID waits out backoff, then sends one."""
         machine, fake, t0 = boot_ready()
@@ -1626,6 +1677,18 @@ MUTANTS = [
         scenario_honor_pending_complete,
         "reconcile",
         "that OnComplete is not cleared before the reconcile",
+    ),
+    (
+        "wedge_id_up_without_reconnect",
+        scenario_login_wedge_id_gate,
+        "IsConnectedByID",
+        "1108 wedge with IsConnectedByID==1 marks reply up; no ConnectByID",
+    ),
+    (
+        "entries_blocked_until_reconcile",
+        scenario_login_wedge_id_gate,
+        "IsConnectedByID",
+        "a surviving reply does not clear entries_blocked before reconcile",
     ),
 ]
 

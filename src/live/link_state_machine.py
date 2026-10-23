@@ -31,10 +31,14 @@ both links are down and idle. Three login failures, a stuck link, or
 ``IsConnected`` every 60s, and wait for ``manual_reconnect``. While
 the reply link is not READY, each degraded tick also reads
 ``IsConnectedByID`` so an already-up reply is noticed on the next
-tick. That read is not the 60s probe. ``IsConnectedByID==1`` marks
-the reply up and clears the degrade, but positions are not reconciled
-until OnComplete. Entries stay blocked. If OnComplete does not arrive
-within the stuck limit, the machine degrades again and alerts.
+tick. That read is not the 60s probe. ``IsConnectedByID==1`` after a reply rebuild marks the reply up and
+clears the degrade, but positions are not reconciled until OnComplete.
+Entries stay blocked. If OnComplete does not arrive within the stuck
+limit, the machine degrades again and alerts. ``IsConnectedByID==1``
+on the 1108 wedge means the reply survived login: mark it up, keep
+entries blocked, alert once that reconcile is still pending, and clear
+the degrade and unreconciled clocks so that path does not re-degrade.
+Do not call ConnectByID again.
 ``login_failures`` and ``api_update_required`` are not cleared by a
 late OnComplete or by ``IsConnectedByID==1``. This machine never
 restarts the process. The vendor note that five login failures
@@ -132,6 +136,12 @@ class MachineRules:
     # That OnComplete is not dropped before the reconcile. Mutant clears
     # the clock and the pending flag, then resumes orders.
     honor_unreconciled_keeps_pending: bool = True
+    # 1108 wedge and IsConnectedByID==1: the reply survived. Mark it up.
+    # Mutant calls ConnectByID again.
+    wedge_id_up_without_reconnect: bool = True
+    # That surviving reply does not unblock entries before a reconcile.
+    # Mutant clears the block and reconciles before OnComplete.
+    entries_blocked_until_reconcile: bool = True
 
 
 @dataclass
@@ -209,6 +219,7 @@ class LinkStateMachine:
     # Entries stay blocked until OnComplete reconciles, or until this
     # clock hits stuck_limit and we degrade again.
     _unreconciled_since: datetime | None = None
+    _reconcile_pending_noted: bool = False
 
     # ── events: flags only ───────────────────────────────────────────
 
@@ -628,6 +639,7 @@ class LinkStateMachine:
         self._login_wedge_settle_at = None
         self._settle_before_stuck = False
         self._unreconciled_since = None
+        self._reconcile_pending_noted = False
 
     def _complete_is_actionable(self) -> bool:
         """OnComplete still belongs to this episode.
@@ -891,6 +903,13 @@ class LinkStateMachine:
             return True
         if self.rules.login_wedge_id_gate:
             state = self.port.is_connected_by_id(self.config.user_id)
+            if state == 1 and self._wedge_reply_survived():
+                if not self.rules.wedge_id_up_without_reconnect:
+                    # Mutant: ConnectByID while the reply link is still up.
+                    self.port.connect_reply(self.config.user_id)
+                    return True
+                self._accept_surviving_reply()
+                return True
             if state != 0:
                 self._track_reply_stuck(now, state)
                 return True
@@ -948,6 +967,12 @@ class LinkStateMachine:
             # Mutant: reconcile before OnComplete has been observed.
             self.port.reconcile_positions()
             return True
+        if self._wedge_reply_survived():
+            if not self.rules.wedge_id_up_without_reconnect:
+                self.port.connect_reply(self.config.user_id)
+                return True
+            self._accept_surviving_reply()
+            return True
         self.reply = LinkPhase.READY
         self._reply_awaiting_complete = False
         self._reply_connect_started_at = None
@@ -960,6 +985,49 @@ class LinkStateMachine:
             "REPLY_UP unreconciled: entries blocked until OnComplete"
         )
         return True
+
+    def _wedge_reply_survived(self) -> bool:
+        """1108 login left the reply up. ConnectByID was not sent."""
+        return (
+            self._login_wedge_settle_at is not None
+            and not self._reply_awaiting_complete
+            and not self._saw_reply_disconnect
+            and not self._saw_3033
+        )
+
+    def _accept_surviving_reply(self) -> None:
+        """IsConnectedByID==1 on the login wedge. Do not ConnectByID.
+
+        OnComplete will not arrive for a link that never dropped, so
+        this does not reconcile and does not arm the unreconciled
+        re-degrade clock. Entries stay blocked. One alert.
+        """
+        if not self.rules.entries_blocked_until_reconcile:
+            # Mutant: drop the entry block before a position reconcile.
+            # ConnectByID is illegal while this reply is still up.
+            self.entries_blocked = False
+            self.orders_paused = False
+            self.port.connect_reply(self.config.user_id)
+            return
+        self.reply = LinkPhase.READY
+        self.entries_blocked = True
+        self.orders_paused = True
+        self.reply_reconciled = False
+        self._pending_complete = False
+        self._reply_awaiting_complete = False
+        self._reply_connect_started_at = None
+        self.degraded = False
+        self.degraded_reason = ""
+        self._clear_reply_stuck_clocks()
+        self._unreconciled_since = None
+        self._settle_before_stuck = False
+        self._quote_stuck_since = None
+        if self._reconcile_pending_noted:
+            return
+        self._reconcile_pending_noted = True
+        self.alerts.append(
+            "RECONCILE_PENDING: reply up; entries blocked until positions reconcile"
+        )
 
     def _honor_unreconciled(self, now: datetime) -> None:
         """READY without a reconcile cannot sit there silently.
