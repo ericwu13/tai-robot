@@ -1,0 +1,18 @@
+{
+  "description": "Issue #154 observability fixture, 10-10 Evo1 ema60 shape. October is the newest exit month (a short stub). Under current latest=max(YYYY-MM) the share cap sees only the Oct delta (−260 / +3240 = −8.0%) and PASSes. September's +5890 is 181.8% of the full-window edge but counts as a prior month. May–Aug are lumped into the August row so prior nets match the recompute (base 33190, cand 36690, slack +8500); September absolute nets are a split that preserves that prior total and the +5890 delta — they are not a replay of broker fills. Desired verdict under CEO latest-month semantics is FAIL. Do not change latest=max(months) to make the xfail pass.",
+  "holdout_start": "2026-09-25 00:00",
+  "months": [
+    {"month": "2026-08", "base_net": 23190, "cand_net": 20800, "delta": -2390},
+    {"month": "2026-09", "base_net": 10000, "cand_net": 15890, "delta": 5890},
+    {"month": "2026-10", "base_net": -9740, "cand_net": -10000, "delta": -260}
+  ],
+  "base_prior_net": 33190,
+  "cand_prior_net": 36690,
+  "floor": 28190,
+  "ablation_slack": 8500,
+  "sep_delta": 5890,
+  "oct_stub_delta": -260,
+  "full_edge": 3240,
+  "current_share": "-8.0%",
+  "desired_sep_share": "181.8%"
+}

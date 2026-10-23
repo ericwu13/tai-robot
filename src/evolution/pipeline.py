@@ -400,8 +400,9 @@ class EvolutionVerdict:
     # Holdout sits in the latest calendar month and the prior-month OOS
     # check did not clear (issue #153). Never a pool promotion.
     provisional: bool = False
-    # Per-month observation. None until a caller fills it. Present so a
-    # merge can read ``month_verdict.month_gates`` without AttributeError.
+    # Observation only (per-month nets, latest label, edge, share,
+    # ablation slack, reasons). Set by decide_month_gates. Does not
+    # affect passed / provisional. Other verdicts leave it None.
     month_gates: dict | None = None
 
 
@@ -1353,6 +1354,105 @@ def holdout_window_start(bars, test_days: int) -> str:
         return ""
 
 
+def _month_rows(base_b: dict[str, list], cand_b: dict[str, list],
+                months: set[str]) -> list[dict]:
+    """Per-month base/cand nets, oldest month first."""
+    rows = []
+    for month in sorted(months):
+        base_net = _pnl_of(base_b.get(month, []))
+        cand_net = _pnl_of(cand_b.get(month, []))
+        rows.append({
+            "month": month,
+            "label": _month_label(month),
+            "base_net": base_net,
+            "cand_net": cand_net,
+            "delta": cand_net - base_net,
+        })
+    return rows
+
+
+def _share_pct(latest_delta: int, edge: int) -> float | None:
+    """Displayed share in percent, same rounding as the reason line."""
+    if edge == 0:
+        return None
+    return float(f"{(latest_delta / edge) * 100:.1f}")
+
+
+def _month_gates_observation(
+        month_rows: list[dict],
+        *,
+        latest: str,
+        latest_label: str,
+        edge: int | None,
+        latest_delta: int | None,
+        share_pct: float | None,
+        share_applied: bool,
+        ablation_slack: int | None,
+        base_prior_net: int | None,
+        cand_prior_net: int | None,
+        floor: int | None,
+        holdout_start: str | None,
+        passed: bool,
+        provisional: bool,
+        reasons: list[str]) -> dict:
+    """Inputs and reasons behind one month-gate verdict.
+
+    Observability only — callers must not treat this dict as a second
+    decision. ``passed`` is copied from the verdict that was already
+    decided.
+    """
+    return {
+        "months": month_rows,
+        "latest": latest,
+        "latest_label": latest_label,
+        "edge": edge,
+        "latest_delta": latest_delta,
+        "share_pct": share_pct,
+        "share_applied": share_applied,
+        "ablation_slack": ablation_slack,
+        "base_prior_net": base_prior_net,
+        "cand_prior_net": cand_prior_net,
+        "floor": floor,
+        "holdout_start": holdout_start or "",
+        "passed": bool(passed),
+        "provisional": bool(provisional),
+        "reasons": list(reasons),
+    }
+
+
+def format_month_gates_debug(block: dict | None) -> str:
+    """One debug.log record: inputs, derived share/slack, and reasons."""
+    if not block:
+        return "EVO month gates: (no observation)"
+    if block.get("passed"):
+        verdict = "PASS"
+    elif block.get("provisional"):
+        verdict = "FAIL provisional"
+    else:
+        verdict = "FAIL"
+    edge = block.get("edge")
+    slack = block.get("ablation_slack")
+    share = block.get("share_pct")
+    share_txt = "n/a" if share is None else f"{share:.1f}%"
+    bits = []
+    for row in block.get("months") or []:
+        bits.append(
+            f"{row['month']} base={_signed(row['base_net'])} "
+            f"cand={_signed(row['cand_net'])} Δ={_signed(row['delta'])}")
+    head = (
+        f"EVO month gates: verdict={verdict} "
+        f"latest={block.get('latest_label') or '-'} "
+        f"({block.get('latest') or '-'}) "
+        f"edge={_signed(edge) if edge is not None else 'n/a'} "
+        f"share={share_txt} "
+        f"ablation_slack={_signed(slack) if slack is not None else 'n/a'} "
+        f"holdout={block.get('holdout_start') or '-'}"
+    )
+    detail = "per-month: " + ("; ".join(bits) if bits else "(none)")
+    reasons = " | ".join(block.get("reasons") or [])
+    return f"{head}\n  {detail}\n  reasons: {reasons}"
+
+
 def decide_month_gates(base_trades: list, cand_trades: list, *,
                        holdout_start: str | None = None,
                        slack_twd: int = PRIOR_MONTH_SLACK_TWD,
@@ -1378,15 +1478,27 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
     ``drop_prior_pf_floor`` (paper relative path only) skips gate 3's
     PF ≥ 1 requirement and still requires Δ ≥ 0. Latest-month identity
     and the slack formula are unchanged.
+
+    ``verdict.month_gates`` records the inputs (per-month nets, latest
+    label, edge, share, ablation slack) and these reasons. It does not
+    change ``passed``.
     """
     base_b = _by_month(base_trades)
     cand_b = _by_month(cand_trades)
     months = set(base_b) | set(cand_b)
     if not months:
+        reasons = [
+            "month gates: no dated exits — cannot assess prior months ✗"]
         return EvolutionVerdict(
-            False,
-            ["month gates: no dated exits — cannot assess prior months ✗"],
-            provisional=True)
+            False, reasons, provisional=True,
+            month_gates=_month_gates_observation(
+                [],
+                latest="", latest_label="",
+                edge=None, latest_delta=None, share_pct=None,
+                share_applied=False, ablation_slack=None,
+                base_prior_net=None, cand_prior_net=None, floor=None,
+                holdout_start=holdout_start,
+                passed=False, provisional=True, reasons=reasons))
 
     latest = max(months)
     label = _month_label(latest)
@@ -1481,7 +1593,18 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
         passed = False
         provisional = True
 
-    return EvolutionVerdict(passed, reasons, provisional=provisional)
+    observation = _month_gates_observation(
+        _month_rows(base_b, cand_b, months),
+        latest=latest, latest_label=label,
+        edge=int(edge), latest_delta=int(latest_delta),
+        share_pct=_share_pct(int(latest_delta), int(edge)),
+        share_applied=edge > 0,
+        ablation_slack=int(slack),
+        base_prior_net=int(base_prior), cand_prior_net=int(cand_prior),
+        floor=int(floor), holdout_start=holdout_start,
+        passed=passed, provisional=provisional, reasons=reasons)
+    return EvolutionVerdict(
+        passed, reasons, provisional=provisional, month_gates=observation)
 
 
 def combine_evolution_verdicts(*parts: EvolutionVerdict) -> EvolutionVerdict:
