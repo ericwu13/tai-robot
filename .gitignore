@@ -44,6 +44,10 @@ Thumbs.db
 .claude/settings.local.json
 .claude/worktrees/
 
+# Tailscale / SSH local credentials (never commit)
+.claude/skills/tailscale-ssh/hosts.local.yaml
+**/.ssh/tailscale-hosts.local.yaml
+
 # Capital API SDK (large binaries - download separately)
 CapitalAPI_2.13.57/
 

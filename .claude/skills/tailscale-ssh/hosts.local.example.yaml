@@ -1,0 +1,14 @@
+﻿# Copy to hosts.local.yaml (gitignored) or %USERPROFILE%\.ssh\tailscale-hosts.local.yaml
+# Fill real values locally. Never commit the filled file.
+
+tailnet: "REPLACE_TAILNET_NAME"
+hosts:
+  steven:
+    tailscale_ip: "100.x.x.x"
+    user: "Traderbot"
+    identity_file: "~/.ssh/id_ed25519_steven"
+    notes: "Windows trading server"
+  oreopie:
+    tailscale_ip: "100.x.x.x"
+    user: "REPLACE_LOCAL_USER"
+    notes: "Jump / primary trading host"
