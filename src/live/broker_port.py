@@ -4,6 +4,8 @@ P1 only. The live GUI and the headless bot do not call this yet; P2
 is the switchover and is on hold. Implementations must not be imported
 from here — this module is a typing surface with no Tk and no COM.
 
+This is the P1 interface for LinkStateMachine, not a revive of the #170 seam that #174 reverts.
+
 The call set is the one the reconnect machine is allowed to make.
 ``leave_monitor`` is user shutdown only: CapitalAPI 2.13.57 §4-4-1 says
 LeaveMonitor drops every Solace link, quote and reply. ``logout`` and
