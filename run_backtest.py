@@ -97,40 +97,16 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.tick_watchdog import TickWatchdog
-from src.live.broker_port import (
-    BrokerEvent,
-    InProcessSkcomPort,
-    initialize_com,
-)
+from src.live.main_heartbeat import call_com, set_com_return_logger
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
 )
 from src.live.connection_monitor import ConnectionMonitor
-from src.live.reconnect_controller import (
-    ACTION_ALREADY_CONNECTED,
-    ACTION_SKIP_TEARDOWN_WAIT,
-    ESCALATION_LOG,
-    FORCED_TEARDOWN_LOG,
-    HALF_UP_TEARDOWN_CONFIRM,
-    HALF_UP_CONFIRM_UNAVAILABLE_LOG,
-    HALF_UP_YES_STALE_LOG,
-    IS_CONNECTING,
-    OPERATOR_DECLINED_HALF_UP_LOG,
-    OPERATOR_FORCED_HALF_UP_P1,
-    ReconnectController,
-    ReconnectSchedule,
-    headless_half_up_refusal_phrase,
-    in_live_session,
-    pop_calendar_degraded_p1,
-    pop_session_clock_warnings,
-    seconds_since_session_open,
-    seconds_until_next_session_open,
-)
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
     RealFillTracker, parse_fulfill_report, match_fill_in_report,
@@ -230,19 +206,6 @@ NEWS_ONLY_STRATEGIES: set[str] = {NEWS_SHORT_DISPLAY, NEWS_LONG_DISPLAY}
 _com_available = False
 skC = skQ = skR = skO = None
 
-
-def _live_com_handles():
-    """COM objects the in-process port calls.
-
-    Read on each call so tests that monkeypatch ``skQ`` / ``skC`` / ``skR``
-    / ``skO`` still reach the fake. GUI and headless share this one port.
-    """
-    return skC, skQ, skR, skO
-
-
-broker_port = InProcessSkcomPort(_live_com_handles)
-
-
 def _init_com():
     """Initialise Capital API COM objects (SKCOM).
 
@@ -254,15 +217,94 @@ def _init_com():
       - We must call SetDllDirectoryW(libs_path) so COM can find SKCOM.dll's
         sibling DLLs, then restore with SetDllDirectoryW(None) so SKCOM's
         runtime network calls can find system DLLs (WinHTTP, Schannel, etc.).
-
-    Object creation lives in the in-process broker port. A missing SDK
-    leaves these globals as they are (the old early return).
     """
     global _com_available, skC, skQ, skR, skO
-    result = initialize_com(bundle_root, project_root, skC, skQ, skR, skO)
-    if result is None:
-        return
-    _com_available, skC, skQ, skR, skO = result
+    try:
+        import ctypes
+        import comtypes
+        import comtypes.client
+
+        frozen = getattr(sys, 'frozen', False)
+
+        # Locate DLL directory: bundled libs first (deployed EXE), SDK fallback (dev)
+        bundled_libs = os.path.join(bundle_root, "libs")
+        sdk_libs = os.path.abspath(os.path.join(
+            project_root,
+            "CapitalAPI_2.13.57", "CapitalAPI_2.13.57_PythonExample",
+            "SKDLLPythonTester", "libs",
+        ))
+
+        if frozen and os.path.isdir(bundled_libs):
+            libs_path = bundled_libs
+        elif os.path.isdir(sdk_libs):
+            libs_path = sdk_libs
+        elif os.path.isdir(bundled_libs):
+            libs_path = bundled_libs
+        else:
+            print("COM not available: no SDK or bundled libs found")
+            return
+
+        # ── Phase 1: Configure DLL search paths ──
+        os.environ["PATH"] = libs_path + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(libs_path)
+        except (OSError, AttributeError):
+            pass
+        # SetDllDirectoryW — this is what COM's LoadLibrary actually uses.
+        # In frozen EXEs, PyInstaller set it to _MEIPASS; override to libs.
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetDllDirectoryW(libs_path)
+
+        # ── Phase 2: Load typelib and create COM objects ──
+        dll_path = os.path.join(libs_path, "SKCOM.dll")
+        comtypes.client.GetModule(dll_path)
+        import comtypes.gen.SKCOMLib as sk
+
+        try:
+            skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
+        except OSError:
+            # COM not registered — register from libs_path (requires admin once)
+            import subprocess
+            print(f"COM not registered. Attempting regsvr32 from: {libs_path}")
+            reg_ok = True
+            for dll_name in ("SKCOM.dll", "CTSecuritiesATL.dll"):
+                dll_to_reg = os.path.join(libs_path, dll_name)
+                if os.path.isfile(dll_to_reg):
+                    r = subprocess.run(
+                        ["regsvr32", "/s", dll_to_reg],
+                        capture_output=True, text=True,
+                    )
+                    if r.returncode != 0:
+                        print(f"  regsvr32 FAILED for {dll_name} (code {r.returncode})")
+                        reg_ok = False
+                    else:
+                        print(f"  regsvr32 OK: {dll_name}")
+                else:
+                    print(f"  WARNING: {dll_name} not found in {libs_path}")
+                    reg_ok = False
+            if not reg_ok:
+                print("COM registration failed — right-click the EXE > Run as administrator")
+            try:
+                skC = comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib)
+            except OSError:
+                print("COM CreateObject failed after registration attempt.")
+                print("Fix: right-click tai_backtest.exe > Run as administrator (once)")
+                raise
+
+        skQ = comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib)
+        skR = comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib)
+        skO = comtypes.client.CreateObject(sk.SKOrderLib, interface=sk.ISKOrderLib)
+
+        # ── Phase 3: Restore default DLL search order ──
+        # None = default Windows search (app dir → System32 → Windows → PATH).
+        # This lets SKCOM's internal network calls find WinHTTP, Schannel, etc.
+        kernel32.SetDllDirectoryW(None)
+
+        _com_available = True
+    except Exception as e:
+        print(f"COM not available: {e}")
+        traceback.print_exc()
+        _com_available = False
 
 
 def _resolve_news_path(path: str, base_dir: str | None = None) -> str:
@@ -753,6 +795,33 @@ def _log_debug(msg):
     _route_to_log_widget(line, "debug")
 
 
+def _log_com_return(name: str, elapsed_ms: float, failed: bool) -> None:
+    """P0: how long the SKCOM call took, written as it returns.
+
+    Logging only. The caller already invoked the COM method; this does
+    not make another one and does not branch on the elapsed time.
+    """
+    status = "raised" if failed else "returned"
+    _log_debug(
+        f"[COM] {name} {status} in {elapsed_ms:.0f} ms "
+        f"tid={threading.get_ident()}")
+
+
+def _log_reply_link_state(value, *, where: str) -> None:
+    """Log a reply-link value the caller already holds.
+
+    Does not call SKCOM. Reconnect does not call this helper: nothing
+    on the pre-#158 path reads the reply link, and a probe would change
+    the call sequence under investigation.
+    """
+    _log_debug(
+        f"[RECONNECT] reply-link IsConnectedByID={value} at {where} "
+        f"tid={threading.get_ident()}")
+
+
+set_com_return_logger(_log_com_return)
+
+
 def _route_to_log_widget(line: str, level: str = "info") -> None:
     """Append a formatted line to the Log tab. Off-thread callers enqueue.
 
@@ -827,7 +896,6 @@ class SKQuoteLibEvents:
             n = _app._fetcher.total_bar_count
             if n <= 3:
                 _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
-        broker_port.emit(BrokerEvent.BAR, bstrData)
 
     def OnKLineComplete(self, nCode):
         if not _app:
@@ -1074,14 +1142,12 @@ class BacktestApp:
                         _log(f"OnNewData 處理錯誤 handler error: {e}")
                 elif kind == "order_result":
                     code, msg = data
-                    broker_port.emit(BrokerEvent.ORDER_REPLY, (code, msg))
                     if code == 0:
                         _log(f"委託回報 Order OK: {msg}")
                         if self._live_runner:
                             self._live_log_msg(f"實單成功 Order OK: {msg}", "entry")
                     else:
-                        err = (
-                            broker_port.return_code_message(code) if skC else str(code))
+                        err = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
                         _log(f"委託失敗 Order FAILED: code={code} {err} {msg}")
                         self.set_status(f"委託失敗 Order FAILED: {err}", "error")
                         if self._live_runner:
@@ -1287,15 +1353,6 @@ class BacktestApp:
             return  # already handling disconnect
         self._cancel_quote_ready_timer("disconnected")
         self._set_quote_connected(False, "_on_disconnected")
-        # After the flag flips, so a listener cannot re-enter this method.
-        broker_port.emit(BrokerEvent.DISCONNECT, None)
-        # A server-side 3021/3033 (or an equivalent forced disconnect) is a
-        # down session. The next LeaveMonitor is attempt #1, which is safe.
-        # Do not carry a half-up latch across that boundary.
-        self._reconnect_controller.on_clean_disconnect()
-        # Drop any earlier reconnect timer before the new one is armed, so
-        # a second disconnect cannot leave two pending callbacks.
-        self._cancel_reconnect_timer()
         self.set_status("斷線 Disconnected", "error")
         self._set_conn_dot("err")
         self.login_status_var.set("斷線 Disconnected")
@@ -1315,187 +1372,16 @@ class BacktestApp:
             f"(caller=_on_disconnected)")
         self._schedule_reconnect()
 
-    def _probe_reconnect_is_connected(self):
-        """``SKQuoteLib_IsConnected()``, or None when it cannot be read."""
-        if not _com_available:
-            return None
-        try:
-            _log_reconnect_call("IsConnected")
-            return broker_port.is_connected()
-        except Exception as e:
-            _log_debug(
-                f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
-                f"[{type(e).__name__}] {e}")
-            return None
-
-    def _reconnect_bot_id(self) -> str:
-        runner = getattr(self, "_live_runner", None)
-        name = getattr(runner, "bot_name", None) if runner is not None else None
-        if name:
-            return str(name)
-        return "unknown"
-
-    def _half_up_manual_p1(self, phrase: str, is_connected, since: float) -> str:
-        secs_to_open = 0 if since >= 0 else int(-since)
-        return (
-            f"[RECONNECT] P1 {phrase} "
-            f"bot={self._reconnect_bot_id()} IsConnected={is_connected} "
-            f"secs_to_open={secs_to_open}"
-        )
-
-    def _tk_confirm_half_up_teardown(self, message: str, *, default: str = "no") -> bool:
-        """GUI confirm on the Tk thread. The default button is No."""
-        return bool(messagebox.askyesno(
-            "重連 Reconnect", message, default=default))
-
-    def _ask_half_up_teardown(self) -> bool:
-        """Injectable confirm. Tests set ``_half_up_confirm_fn(message, default=)``."""
-        fn = getattr(self, "_half_up_confirm_fn", None)
-        if fn is None:
-            fn = self._tk_confirm_half_up_teardown
-        return bool(fn(HALF_UP_TEARDOWN_CONFIRM, default="no"))
-
-    def _suspend_reconnect_slot(self) -> None:
-        """Drop the shared after id while the confirm modal is up."""
-        root = getattr(self, "root", None)
-        if root is None:
-            return
-        self._reconnect_schedule.suspend(root.after_cancel)
-
-    def _resume_reconnect_slot(self) -> None:
-        """Put back the skip poll ``_suspend_reconnect_slot`` held.
-
-        Resume re-arms the full delay on purpose (the safe direction).
-        The next probe waits the whole interval again.
-        """
-        root = getattr(self, "root", None)
-        if root is None:
-            return
-        self._reconnect_schedule.resume(
-            after=root.after, after_cancel=root.after_cancel)
-
-    def _half_up_manual_snapshot(self):
-        """Trigger tuple, or None when this press is not the confirm case.
-
-        The rule is manual (this method is only reached from the button),
-        half-up with no Ready since the last EnterMonitor,
-        ``IsConnected()==2`` or a failed probe (None), and either the
-        holiday-aware clock is still before open+90 or the calendar
-        lookup is degraded (open+90 cannot be trusted). The tuple also
-        freezes the attempt counter and the forced-teardown allowance
-        for the Yes re-check. Anything else returns None: no dialog,
-        no extra alert.
-        """
-        is_connected = self._probe_reconnect_is_connected()
-        if not self._reconnect_controller.is_half_up():
-            return None
-        since = self._reconnect_seconds_since_open()
-        if not self._reconnect_controller.manual_half_up_needs_confirm(
-            is_connected, since
-        ):
-            return None
-        return (
-            is_connected,
-            since,
-            self._conn_monitor.attempt,
-            self._reconnect_controller.forced_teardown_used,
-        )
-
-    def _half_up_yes_blocked(self, attempt: int, forced_used: bool) -> bool:
-        """True when Yes must not tear down.
-
-        The attempt counter and the allowance must still match the
-        pre-dialog snapshot, no reconnect handshake is in flight, and
-        the probe is still half-up (``IsConnected()==2``) or None.
-        Ready, 0, and 1 are a different session.
-        """
-        ctrl = self._reconnect_controller
-        if self._conn_monitor.attempt != attempt:
-            return True
-        if ctrl.forced_teardown_used != forced_used:
-            return True
-        if ctrl.handshake_open:
-            return True
-        is_connected = self._probe_reconnect_is_connected()
-        if is_connected not in (IS_CONNECTING, None):
-            return True
-        if not ctrl.is_half_up():
-            return True
-        return False
-
-    def _refuse_half_up_manual(self, is_connected, since) -> None:
-        """Headless has no dialog. One IsConnected read already happened.
-
-        A degraded calendar uses its own phrase. A healthy clock that
-        is still before open+90 keeps the original text.
-        """
-        self._raise_reconnect_alert(self._half_up_manual_p1(
-            headless_half_up_refusal_phrase(), is_connected, since))
-        self.btn_reconnect.config(state=tk.NORMAL)
-
-    def _decline_half_up_manual(self) -> None:
-        """The confirm dialog could not be shown. Never a teardown.
-
-        This is not an operator No — no dialog was shown — so the log
-        line is the TclError refusal, not ``operator declined``.
-        """
-        self._resume_reconnect_slot()
-        _log(HALF_UP_CONFIRM_UNAVAILABLE_LOG)
-        self.btn_reconnect.config(state=tk.NORMAL)
-
-    def _confirm_half_up_manual(self, trigger) -> bool:
-        """Ask, then True only when Yes is still the same handshake.
-
-        False means the caller must not touch the broker. The shared
-        timer slot is cancelled before ``askyesno`` and re-armed after
-        it returns, including No and TclError.
-        """
-        is_connected, since, attempt, forced_used = trigger
-        if getattr(self, "_headless_reconnect", False):
-            self._refuse_half_up_manual(is_connected, since)
-            return False
-        self._suspend_reconnect_slot()
-        try:
-            confirmed = self._ask_half_up_teardown()
-        except tk.TclError:
-            self._decline_half_up_manual()
-            self._raise_reconnect_alert(self._half_up_manual_p1(
-                headless_half_up_refusal_phrase(), is_connected, since))
-            return False
-        self._resume_reconnect_slot()
-        if not confirmed:
-            _log(OPERATOR_DECLINED_HALF_UP_LOG)
-            self.btn_reconnect.config(state=tk.NORMAL)
-            return False
-        if self._half_up_yes_blocked(attempt, forced_used):
-            _log(HALF_UP_YES_STALE_LOG)
-            self.btn_reconnect.config(state=tk.NORMAL)
-            return False
-        fresh = self._probe_reconnect_is_connected()
-        fresh_since = self._reconnect_seconds_since_open()
-        self._raise_reconnect_alert(self._half_up_manual_p1(
-            OPERATOR_FORCED_HALF_UP_P1, fresh, fresh_since))
-        return True
-
     def _manual_reconnect(self):
         """Manual reconnect triggered by user button click."""
-        # Before open+90 a half-up session, including a failed IsConnected
-        # probe, asks first. No and TclError never fall through to the
-        # teardown below, whatever the clock or the probe did meanwhile.
-        # Yes does, only when that same handshake is still half-up or None.
-        trigger = self._half_up_manual_snapshot()
-        if trigger is not None and not self._confirm_half_up_manual(trigger):
-            return
-        # Cancel reconnect, Ready-wait, and skip-poll callbacks together.
-        self._cancel_reconnect_timer()
+        # Cancel any pending auto-reconnect timer
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
         self._cancel_quote_ready_timer("manual_reconnect")
 
         self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
-        # The button tears down, including a half-up session whose one
-        # automatic forced teardown was already used. Before open+90 that
-        # only happens after the operator confirms.
-        self._reconnect_controller.on_operator_reconnect()
         action = self._conn_monitor.on_manual_reconnect()
         self.set_status(action.message, "warn")
         self._set_conn_dot("warn")
@@ -1505,39 +1391,16 @@ class BacktestApp:
             "[STATE] ConnectionMonitor: is_active=True, attempt=0 "
             "(caller=_manual_reconnect)")
 
-        self._attempt_reconnect(manual=True)
+        self._attempt_reconnect()
 
     def _schedule_reconnect(self):
-        """Schedule the next reconnection attempt via ConnectionMonitor.
-
-        The session flag and the seconds-until-open both come from the
-        holiday-aware helpers. A weekday TAIFEX holiday is closed even
-        though the weekend-only market clock says it is open.
-        """
+        """Schedule the next reconnection attempt via ConnectionMonitor."""
         action = self._conn_monitor.schedule_next(
             has_live_runner=bool(self._live_runner),
-            market_open=in_live_session(),
-            secs_until_open=seconds_until_next_session_open(),
+            market_open=is_market_open(),
+            secs_until_open=seconds_until_market_open(),
         )
-        self._emit_session_clock_warnings()
         self._execute_reconnect_action(action)
-
-    def _reconnect_seconds_since_open(self) -> int:
-        """Holiday-aware seconds since open, then any queued clock WARN."""
-        since = seconds_since_session_open()
-        self._emit_session_clock_warnings()
-        return since
-
-    def _emit_session_clock_warnings(self) -> None:
-        """Send a lookup-failure or clock-disagreement WARN to log and Discord."""
-        for message in pop_session_clock_warnings():
-            self._raise_reconnect_alert(message)
-
-    def _emit_calendar_degraded_p1(self) -> None:
-        """One P1 when a degraded calendar withheld the forced teardown."""
-        message = pop_calendar_degraded_p1()
-        if message:
-            self._raise_reconnect_alert(message)
 
     def _execute_reconnect_action(self, action):
         """Thin dispatcher: execute a ReconnectAction from ConnectionMonitor."""
@@ -1555,71 +1418,21 @@ class BacktestApp:
                 self.btn_reconnect.config(state=tk.NORMAL)
             if self._live_runner:
                 self._live_log_msg(action.message, "status")
-            self._arm_reconnect_callback(
-                "reconnect", action.delay_seconds * 1000, self._attempt_reconnect)
+            self._reconnect_timer_id = self.root.after(
+                action.delay_seconds * 1000, self._attempt_reconnect)
             return
 
-    def _arm_reconnect_callback(self, kind: str, delay_ms: int, callback) -> None:
-        """Arm the one reconnect/ready/skip slot, cancelling whatever it held."""
-        self._reconnect_timer_id = self._reconnect_schedule.arm(
-            kind,
-            delay_ms,
-            callback,
-            after=self.root.after,
-            after_cancel=self.root.after_cancel,
-        )
-
-    def _cancel_reconnect_timer(self) -> None:
-        """Cancel reconnect, Ready-wait, and skip-poll callbacks."""
-        self._reconnect_schedule.cancel_all(self.root.after_cancel)
-        self._reconnect_timer_id = None
-
-    def _raise_reconnect_alert(self, message: str) -> None:
-        """Operator-visible reconnect alert: the log pane and Discord.
-
-        ``_log_debug`` alone does not reach the operator. ``_discord.notify``
-        is the same path settlement-day and other live alerts use.
-        """
-        _log(message)
-        if _discord is not None and _discord.enabled:
-            try:
-                _discord.notify(message)
-            except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] Discord alert failed: "
-                    f"[{type(e).__name__}] {e}")
-
-    def _defer_half_up_teardown(self, decision, attempt_n: int) -> None:
-        """Skip LeaveMonitor, or stop the loop after the forced teardown."""
-        self._emit_calendar_degraded_p1()
-        _log(
-            "重連暫緩 Reconnect deferred — session still connecting, "
-            "not calling LeaveMonitor")
-        _log_debug(
-            f"[RECONNECT] Attempt #{attempt_n} skipping LeaveMonitor "
-            f"+ LogOut — {decision.reason}")
-        if self._reconnect_controller.record_skip_poll():
-            self._raise_reconnect_alert(ESCALATION_LOG)
-            self.btn_reconnect.config(state=tk.NORMAL)
-            return
-        self._arm_reconnect_callback(
-            "skip", decision.wait_seconds * 1000, self._check_reconnection)
-
-    def _attempt_reconnect(self, manual: bool = False):
+    def _attempt_reconnect(self):
         """Try to re-login and reconnect to quote service.
 
         Bug B: a teardown-and-login attempt calls
         ``SKQuoteLib_LeaveMonitor()`` first (best-effort) so we start
-        from a clean COM state. ``SKCenterLib_LogOut`` is not in Capital
-        API 2.13.57 and is called only when the COM object actually has it.
-
-        Issue #157: LeaveMonitor on a half-up session (no Ready, 
-        ``IsConnected()==2``) faults or hangs. The controller skips it
-        until open+90s, then allows one forced teardown per disconnect.
-        The skip returns before the Bug B call below.
+        from a clean COM state. ``SKCenterLib_LogOut`` is not called:
+        it is not in Capital API 2.13.57.
+        Otherwise login+EnterMonitor stacks on top of a broken session and
+        the server may reach Quote (3002) without ever sending Ready (3003)
+        — exactly the zombie pattern seen in bot session 0422.
         """
-        # This callback is the armed timer, already popped by Tk.
-        self._reconnect_schedule.note_fired()
         self._reconnect_timer_id = None
         attempt_n = self._conn_monitor.attempt + 1  # number we'll attempt now
         if self._quote_connected:
@@ -1629,6 +1442,9 @@ class BacktestApp:
             return  # already reconnected (e.g. by manual login)
 
         _log(f"嘗試重連 Attempting reconnect #{self._conn_monitor.attempt}")
+        _log_debug(
+            f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
+            "(cleanup) before fresh LoginSetQuote")
 
         try:
             if not _com_available:
@@ -1647,129 +1463,74 @@ class BacktestApp:
                 self._schedule_reconnect()
                 return
 
-            # ── Issue #157: guard LeaveMonitor on a half-up pre-session ──
-            # Probe before any teardown. A probe failure is passed as None
-            # so the controller can refuse a blind LeaveMonitor.
-            is_connected = None
-            try:
-                _log_reconnect_call("IsConnected")
-                is_connected = broker_port.is_connected()
-            except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
-                    f"[{type(e).__name__}] {e}")
-            since_open = self._reconnect_seconds_since_open()
-            decision = self._reconnect_controller.decide(
-                is_connected,
-                seconds_since_open=since_open,
-                manual=manual,
-            )
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} guard={decision.action} "
-                f"IsConnected()={is_connected} manual={manual} — {decision.reason}")
-            if decision.action == ACTION_ALREADY_CONNECTED:
-                self._check_reconnection()
-                return
-            if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
-                self._defer_half_up_teardown(decision, attempt_n)
-                return
-
-            if decision.forced_teardown:
-                self._reconnect_controller.note_forced_teardown()
-                self._raise_reconnect_alert(FORCED_TEARDOWN_LOG)
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
-                "(cleanup) before fresh LoginSetQuote")
-            self._reconnect_controller.on_attempt_started()
-
             # ── Bug B: best-effort COM teardown before fresh login ──
             # LeaveMonitor swallows errors — the prior session may already
-            # be half-torn-down. LogOut is not in Capital API 2.13.57; an
-            # unguarded call always raises AttributeError and never runs.
+            # be half-torn-down. LogOut is not called: Capital API 2.13.57
+            # has no such method, and a call always raises AttributeError.
+            # Reply-link IsConnectedByID is not read here either. Pre-#158
+            # never fetched it, so logging it would be a new COM call.
+            _log_debug(
+                "[RECONNECT] LogOut not called — not in Capital API 2.13.57")
             _log_reconnect_call("LeaveMonitor")
             try:
-                leave_code = broker_port.leave_monitor()
+                leave_code = call_com("LeaveMonitor", skQ.SKQuoteLib_LeaveMonitor)
                 _log_debug(
                     f"[RECONNECT] LeaveMonitor returned {leave_code}")
             except Exception as e:
                 _log_debug(
                     f"[RECONNECT] LeaveMonitor raised (ignored): "
                     f"[{type(e).__name__}] {e}")
-            if broker_port.supports_logout():
-                _log_reconnect_call("LogOut")
-                try:
-                    logout_code = broker_port.logout(user_id)
-                    _log_debug(
-                        f"[RECONNECT] LogOut returned {logout_code}")
-                except Exception as e:
-                    _log_debug(
-                        f"[RECONNECT] LogOut raised (ignored): "
-                        f"[{type(e).__name__}] {e}")
-            else:
-                _log_debug(
-                    "[RECONNECT] LogOut skipped — SKCenterLib_LogOut "
-                    "is not in this Capital API")
             self._logged_in = False
             _log_debug(
                 f"[RECONNECT] Cleanup done — calling LoginSetQuote")
 
             _log_reconnect_call("LoginSetQuote")
-            code = broker_port.login(user_id, password, "Y")
+            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
+                            user_id, password, "Y")
             _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
             if code != 0 and code < 2000:
-                msg = broker_port.return_code_message(code)
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"重連登入失敗 Reconnect login failed: {msg}")
                 _log_debug(
                     f"[RECONNECT] Attempt #{attempt_n} FAILED at LoginSetQuote — "
                     f"code={code} msg={msg}")
-                self._reconnect_controller.on_attempt_failed()
                 self._schedule_reconnect()
                 return
 
             self._logged_in = True
             _log_reconnect_call("ConnectByID")
-            reply_code = broker_port.connect_reply(user_id)
+            reply_code = call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
             _log_reconnect_call("EnterMonitorLONG")
-            enter_code = broker_port.enter_monitor()
+            enter_code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
             _log_debug(
                 f"[RECONNECT] ConnectByID returned {reply_code}, "
                 f"EnterMonitorLONG returned {enter_code}")
-            wait_s = self._reconnect_controller.ready_wait_seconds()
-            self._reconnect_ready_wait_s = wait_s
             _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} waiting {wait_s}s for Ready (3003) "
-                f"(seconds_since_open={since_open})")
+                f"[RECONNECT] Attempt #{attempt_n} waiting for Ready (3003)...")
 
-            # Poll for connection (OnConnection callback will set _quote_connected).
-            # Same slot as the reconnect and skip timers.
-            self._arm_reconnect_callback("ready", wait_s * 1000, self._check_reconnection)
+            # Poll for connection (OnConnection callback will set _quote_connected)
+            self.root.after(3000, self._check_reconnection)
 
         except Exception as e:
             _log(f"重連異常 Reconnect error: {e}")
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} raised: "
                 f"[{type(e).__name__}] {e}")
-            self._reconnect_controller.on_attempt_failed()
             self._schedule_reconnect()
 
     def _check_reconnection(self):
         """Poll IsConnected after reconnect login attempt."""
         attempt_n = self._conn_monitor.attempt
-        self._reconnect_schedule.note_fired()
-        self._reconnect_timer_id = None
         if self._quote_connected:
-            self._reconnect_controller.on_ready()
             _log_debug(
                 f"[RECONNECT] Attempt #{attempt_n} SUCCESS — Ready received "
                 "(handled by _on_reconnected via _drain_ui_queue)")
             return  # success, handled by _on_reconnected via _drain_ui_queue
-        waited = self._reconnect_ready_wait_s
-        ic = None
         try:
             _log_reconnect_call("IsConnected")
-            ic = broker_port.is_connected()
+            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
             _log_debug(
-                f"[RECONNECT] IsConnected()={ic} after {waited}s poll "
+                f"[RECONNECT] IsConnected()={ic} after 3s poll "
                 f"(attempt #{attempt_n})")
             if ic == 1:
                 self._set_quote_connected(True, "_check_reconnection(IsConnected==1)")
@@ -1789,25 +1550,14 @@ class BacktestApp:
             _log_debug(
                 f"[RECONNECT] IsConnected() raised (ignored): "
                 f"[{type(e).__name__}] {e}")
-            ic = None
-        # Issue #157: a half-up pre-session session must be polled, not
-        # torn down. on_attempt_failed latches "missed Ready" first so the
-        # guard stays armed across polls.
-        self._reconnect_controller.on_attempt_failed()
-        decision = self._reconnect_controller.decide(
-            ic, seconds_since_open=self._reconnect_seconds_since_open())
-        if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
-            self._defer_half_up_teardown(decision, attempt_n)
-            return
         # Not connected yet — schedule next reconnect attempt
         _log_debug(
             f"[RECONNECT] Attempt #{attempt_n} FAILED — timed out waiting "
-            f"for Ready after {waited}s, scheduling next attempt")
+            f"for Ready after 3s, scheduling next attempt")
         self._schedule_reconnect()
 
     def _on_reconnected(self):
         """Handle successful reconnection: re-subscribe ticks if live bot is running."""
-        self._reconnect_controller.on_ready()
         self._conn_monitor.on_connected()
         _log_debug(
             "[STATE] ConnectionMonitor: is_active=False, attempt=0 "
@@ -1815,7 +1565,9 @@ class BacktestApp:
         # A successful Ready resets the Bug C warn ladder — any earlier
         # transient IsConnected!=1 reads are irrelevant once we're back up.
         self._warn_disconnect_count = 0
-        self._cancel_reconnect_timer()
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
 
         if self._live_runner and self._live_runner.state == LiveState.RUNNING:
             self._live_log_msg("已重連 Reconnected — resubscribing ticks", "status")
@@ -1825,7 +1577,8 @@ class BacktestApp:
             if _com_available and skQ:
                 try:
                     for mkt in (2, 7, 9):
-                        broker_port.request_stock_list(mkt)
+                        call_com("RequestStockList",
+                                 skQ.SKQuoteLib_RequestStockList, mkt)
                 except Exception as e:
                     _log(f"商品資料重載失敗 Commodity reload failed: {e}")
             self._resubscribe_ticks()
@@ -1868,13 +1621,13 @@ class BacktestApp:
         self._first_tick_after_request_logged = False
 
         try:
-            result = broker_port.subscribe_quotes(0, com_symbol)
+            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, com_symbol)
             code = result[0] if isinstance(result, (list, tuple)) else result
             _log_debug(
                 f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
                 f"subscription sent (retry={_retry})")
             if code != 0 and code >= 3000:
-                msg = broker_port.return_code_message(code)
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
                 _log_debug(
                     f"[TICKS] RequestTicks FAILED: code={code} msg={msg}")
@@ -1957,12 +1710,7 @@ class BacktestApp:
         self._trading_guard = TradingGuard()  # safety checks for real orders
         # Reconnection state
         self._conn_monitor = ConnectionMonitor()
-        # Issue #157: gates LeaveMonitor while a pre-session handshake is
-        # still connecting (IsConnected()==2, Ready never arrived).
-        self._reconnect_controller = ReconnectController()
-        self._reconnect_schedule = ReconnectSchedule()
         self._reconnect_timer_id = None
-        self._reconnect_ready_wait_s: int = ReconnectController.READY_WAIT_S
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
         self._quote_ready_timer_id = None
         self._quote_intermediate_seen_at: float = 0.0
@@ -3623,18 +3371,19 @@ class BacktestApp:
 
             log_dir = os.path.join(project_root, "CapitalLog_Backtest")
             os.makedirs(log_dir, exist_ok=True)
-            broker_port.set_log_path(log_dir)
+            skC.SKCenterLib_SetLogPath(log_dir)
 
             if authority_flag:
-                broker_port.set_authority(authority_flag)
+                skC.SKCenterLib_SetAuthority(authority_flag)
 
             _log(f"登入中 Logging in as {_redact_acct(user_id)}...")
             self.set_status("登入中 Logging in...")
             self.login_status_var.set("登入中...")
 
-            code = broker_port.login(user_id, password, "Y")
+            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
+                            user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
-                msg = broker_port.return_code_message(code)
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
                 if code == 1097:
                     _log("提示: 請確認已安裝群益API憑證 (從券商網站下載安裝)")
@@ -3649,16 +3398,16 @@ class BacktestApp:
             _log(f"登入成功 LOGIN OK (code={code})")
             self.login_status_var.set("登入成功 Logged in")
 
-            broker_port.connect_reply(user_id)
-            code = broker_port.enter_monitor()
+            call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
             _log(f"進入報價監控 EnterMonitorLONG: code={code}")
 
             # Initialize order service for real trading
             if skO is not None:
                 try:
-                    broker_port.initialize_order()
-                    broker_port.read_cert(user_id)
-                    broker_port.get_user_account()
+                    call_com("SKOrderLib_Initialize", skO.SKOrderLib_Initialize)
+                    call_com("ReadCertByID", skO.ReadCertByID, user_id)
+                    call_com("GetUserAccount", skO.GetUserAccount)
                     _log("委託服務初始化 Order service initialized (cert verified)")
                 except Exception as e:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
@@ -3676,7 +3425,7 @@ class BacktestApp:
 
     def _check_connection(self):
         try:
-            ic = broker_port.is_connected()
+            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
             if ic == 1:
                 self._set_quote_connected(True, "_check_connection(IsConnected==1)")
                 self.btn_api.config(state=tk.NORMAL)
@@ -3755,13 +3504,14 @@ class BacktestApp:
              f"{chunk.start_date}~{chunk.end_date} min={chunk.minute_num}")
 
         try:
-            code = broker_port.subscribe_kline(
+            code = call_com(
+                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
                 chunk.kline_symbol, chunk.kline_type, chunk.session,
                 chunk.trade_session, chunk.start_date, chunk.end_date,
                 chunk.minute_num)
 
             if code != 0:
-                msg = broker_port.return_code_message(code)
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"請求結果 Result: code={code} {msg}")
                 if code >= 3000:
                     self.set_status(f"錯誤 Error: {msg}", "error")
@@ -7034,8 +6784,8 @@ class BacktestApp:
             try:
                 user_id = self.login_user_var.get().strip()
                 self._account_monitor.clear_positions()
-                broker_port.query_open_interest(
-                    user_id, self._futures_account, 1)
+                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                         user_id, self._futures_account, 1)
                 # The OnOpenInterest reply arrives asynchronously through the
                 # UI queue — observed ~4s after the query. GUI waits via an
                 # after(100) poll so the Tk thread is not frozen; headless
@@ -7131,7 +6881,7 @@ class BacktestApp:
             if self._trading_guard.fill_pending else None
         )
 
-        # Open debug log file in bot directory. A faulthandler open
+        # Open debug log, then arm the native dump. A faulthandler open
         # failure must not abort the deploy.
         _open_debug_log(self._live_runner.bot_dir)
         try:
@@ -7210,7 +6960,7 @@ class BacktestApp:
                 # Query multiple market types to find TMF order codes
                 # 2=期貨T盤, 7=期貨全盤, 9=客製化期貨
                 for mkt in (2, 7, 9):
-                    rc = broker_port.request_stock_list(mkt)
+                    rc = call_com("RequestStockList", skQ.SKQuoteLib_RequestStockList, mkt)
                     if isinstance(rc, int) and rc != 0:
                         _log(f"商品列表查詢 RequestStockList({mkt}) code={rc}")
             except Exception as e:
@@ -7368,10 +7118,11 @@ class BacktestApp:
              f"min={kline_minute} {start_str}~{end_str}")
 
         try:
-            code = broker_port.subscribe_kline(
+            code = call_com(
+                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0:
-                msg = broker_port.return_code_message(code)
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 _log(f"暖機查詢失敗 Warmup fetch failed: code={code} {msg}")
                 self._live_log_msg(
                     f"暖機查詢失敗 Warmup failed: code={code} {msg}", "status")
@@ -7529,14 +7280,14 @@ class BacktestApp:
         sym_note = f" (via {tick_sym})" if tick_sym != symbol else ""
         self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}{sym_note}...", "status")
         try:
-            result = broker_port.subscribe_quotes(0, tick_sym)
+            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, tick_sym)
             # COM may return (code, stockIdx) tuple or just an int
             if isinstance(result, (list, tuple)):
                 code = result[0]
             else:
                 code = result
             if code != 0 and code >= 3000:
-                msg = broker_port.return_code_message(code)
+                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
                 self._live_log_msg(f"訂閱失敗 Tick subscribe failed: {msg}", "status")
                 self._stop_live()
                 return
@@ -7921,7 +7672,7 @@ class BacktestApp:
             # is treated as noise and the ladder is allowed to continue.
             if _com_available:
                 try:
-                    ic = broker_port.is_connected()
+                    ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
                 except Exception as e:
                     ic = None
                     _log_debug(
@@ -7986,10 +7737,6 @@ class BacktestApp:
         Converts raw COM tick data to Tick, feeds to BarBuilder.
         When a 1-min bar completes, routes to LiveRunner.
         """
-        broker_port.emit(
-            BrokerEvent.TICK,
-            (date, time_hms, time_millismicros, bid, ask, close, qty,
-             simulate, is_history))
         if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
             return
         if not self._live_bar_builder:
@@ -8686,7 +8433,9 @@ class BacktestApp:
                 pass  # can't parse — proceed with order, let exchange decide
 
         try:
-            oOrder = broker_port.new_future_order()
+            import comtypes.gen.SKCOMLib as sk
+
+            oOrder = sk.FUTUREORDER()
             oOrder.bstrFullAccount = self._futures_account
             oOrder.bstrStockNo = order_symbol
             oOrder.sBuySell = buy_sell
@@ -8731,7 +8480,9 @@ class BacktestApp:
                  f"price={oOrder.bstrPrice}({price_label}) qty=1 newclose={nc}({nc_label}) reserved=0")
 
             # Synchronous send — returns immediately for IOC market orders
-            message, code = broker_port.place_order(user_id, oOrder, False)
+            message, code = call_com(
+                "SendFutureOrderCLR", skO.SendFutureOrderCLR,
+                user_id, False, oOrder)
             _log(f"REAL ORDER RESULT: code={code} message={message}")
 
             if code == 0:
@@ -8775,8 +8526,7 @@ class BacktestApp:
                 )
                 return True
             else:
-                err_msg = (
-                    broker_port.return_code_message(code) if skC else str(code))
+                err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
                 self._live_log_msg(f"實單失敗 Order FAILED: code={code} {err_msg} | {message}", "exit")
                 _log(f"REAL ORDER FAILED: code={code} err={err_msg} msg={message}")
                 if _discord and _discord.enabled:
@@ -8926,8 +8676,8 @@ class BacktestApp:
         # Request fresh position data via COM
         try:
             user_id = self.login_user_var.get().strip()
-            broker_port.query_open_interest(
-                user_id, self._futures_account, 1)
+            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                     user_id, self._futures_account, 1)
         except Exception as e:
             _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
@@ -9153,7 +8903,8 @@ class BacktestApp:
             return 0
         try:
             user_id = self.login_user_var.get().strip()
-            fills_raw = broker_port.query_fills(
+            fills_raw = call_com(
+                "GetFulfillReport", skO.GetFulfillReport,
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
@@ -9205,7 +8956,6 @@ class BacktestApp:
         Rows for orders this bot didn't send (another bot or a manual
         order on the same account) don't match the tracker and are ignored.
         """
-        broker_port.emit(BrokerEvent.FILL, raw)
         redacted = raw
         if self._futures_account:
             redacted = redacted.replace(self._futures_account, "***")
@@ -9411,10 +9161,10 @@ class BacktestApp:
         user_id = self.login_user_var.get().strip()
         try:
             self._account_monitor.clear_positions()  # will be rebuilt from callbacks
-            broker_port.query_open_interest(
-                user_id, self._futures_account, 1)
-            broker_port.query_future_rights(
-                user_id, self._futures_account, 1)  # 1=TWD
+            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                     user_id, self._futures_account, 1)
+            call_com("GetFutureRights", skO.GetFutureRights,
+                     user_id, self._futures_account, 1)  # 1=TWD
         except Exception as e:
             _log(f"帳戶查詢失敗 Account query error: {e}")
 
@@ -9639,10 +9389,10 @@ class BacktestApp:
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
             self._live_poll_id = None
-        self._cancel_reconnect_timer()
-        self._cancel_quote_ready_timer("stop_live")
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
         self._conn_monitor.reset()
-        self._reconnect_controller.reset()
 
         if self._warmup_timeout_id:
             self.root.after_cancel(self._warmup_timeout_id)
@@ -9805,11 +9555,17 @@ def register_com_events() -> None:
     """Attach the SKCOM event handler classes to the COM objects."""
     if not _com_available:
         return
+    import comtypes.client
     quote_event = SKQuoteLibEvents()
+    _com_event_handlers.append(quote_event)
+    _com_event_handlers.append(comtypes.client.GetEvents(skQ, quote_event))
     reply_event = SKReplyLibEvent()
-    order_event = SKOrderLibEvents() if skO is not None else None
-    _com_event_handlers.extend(
-        broker_port.attach_events(quote_event, reply_event, order_event))
+    _com_event_handlers.append(reply_event)
+    _com_event_handlers.append(comtypes.client.GetEvents(skR, reply_event))
+    if skO is not None:
+        order_event = SKOrderLibEvents()
+        _com_event_handlers.append(order_event)
+        _com_event_handlers.append(comtypes.client.GetEvents(skO, order_event))
 
 
 def main():
