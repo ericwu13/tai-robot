@@ -126,6 +126,9 @@ class FakeSkcom:
         self.subscribed = False
         self.reply_up = False
         self.reply_rebuild_inflight = False
+        # The previous OnSolaceReplyDisconnect does not authorize this
+        # episode. ConnectByID stays illegal until a fresh disconnect.
+        self.reply_disconnect_at = None
         self.complete_seen = False
         self.reconciled = False
         self.orders_released = False

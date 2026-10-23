@@ -87,6 +87,14 @@ class MachineRules:
     one_link_at_a_time: bool = True
     orders_after_complete_and_reconcile: bool = True
     degraded_instead_of_restart: bool = True
+    # A finished or degraded 3033 must not authorize the next one.
+    reset_3033_episode: bool = True
+    # One ConnectByID until OnComplete. No retry while that call is in flight.
+    reply_connect_once_until_complete: bool = True
+    # 3021 → 1108 → login OK, with reply still down: degrade, do not wedge.
+    stuck_after_login_recovery: bool = True
+    # Manual Reconnect restarts the stuck window instead of ConnectByID.
+    manual_reconnect_clears_stuck: bool = True
 
 
 @dataclass
@@ -156,6 +164,8 @@ class LinkStateMachine:
     _quote_stuck_since: datetime | None = None
     _reply_stuck_since: datetime | None = None
     _last_probe_at: datetime | None = None
+    _reply_awaiting_complete: bool = False
+    _down_without_reply_event_since: datetime | None = None
 
     # ── events: flags only ───────────────────────────────────────────
 
@@ -227,6 +237,15 @@ class LinkStateMachine:
             self.quote = LinkPhase.DOWN
             if self._quote_down_at is None:
                 self._quote_down_at = now
+        # The stuck window that just fired must not still be expired.
+        # Restart it from this press. Do not call ConnectByID here.
+        if not self.rules.manual_reconnect_clears_stuck:
+            self.port.connect_reply(self.config.user_id)
+            return
+        if self._saw_3033:
+            self._solace_down_at = now
+        if self._down_without_reply_event_since is not None:
+            self._down_without_reply_event_since = now
 
     def snapshot(self) -> dict:
         """State a later heartbeat can publish. This method writes nothing."""
@@ -300,6 +319,8 @@ class LinkStateMachine:
             self.orders_paused = True
             self._pending_complete = False
             self._reply_stuck_since = None
+            self._reply_awaiting_complete = False
+            self._down_without_reply_event_since = None
             return
         if event.name == "complete":
             self._pending_complete = True
@@ -309,16 +330,23 @@ class LinkStateMachine:
         kind, code, at = event.kind, event.code, event.now
         if kind == KIND_SOLACE_DOWN:
             self._saw_3033 = True
-            if self._solace_down_at is None:
-                self._solace_down_at = at
             self.quote = LinkPhase.DOWN
             self._quote_down_at = at
             self._pending_3003 = False
             self._quote_stuck_since = None
             self.orders_paused = True
             # 3033 is the shared Solace session. Both links go down.
-            # Reply reconnects first, and only after OnSolaceReplyDisconnect
-            # plus the §4-3-h settle. Quote waits until that finishes.
+            # Reply reconnects first, and only after a fresh
+            # OnSolaceReplyDisconnect plus the §4-3-h settle. A disconnect
+            # left over from the previous episode does not count.
+            if self.rules.reset_3033_episode:
+                self._solace_down_at = at
+                self._saw_reply_disconnect = False
+                self._reply_down_at = None
+                self._reply_awaiting_complete = False
+                self._down_without_reply_event_since = None
+            elif self._solace_down_at is None:
+                self._solace_down_at = at
             if self.rules.solace_3033_both_links_reply_first:
                 self.reply = LinkPhase.DOWN
                 self.reply_reconciled = False
@@ -329,6 +357,10 @@ class LinkStateMachine:
             self._quote_down_at = at
             self._pending_3003 = False
             self._quote_stuck_since = None
+            # A new quote drop is a new observation. An earlier
+            # login-recovery clock must not already be expired.
+            if self._down_without_reply_event_since is not None:
+                self._down_without_reply_event_since = at
             return
         if kind == KIND_READY and code == 0:
             self._pending_3003 = True
@@ -392,6 +424,8 @@ class LinkStateMachine:
             self.login = LoginPhase.LOGGED_IN
             self._login_recovery = False
             self._login_permitted = True
+            self.login_failures = 0
+            self._arm_stuck_if_links_down_without_reply_event(now)
             return
         if code == API_UPDATE_REQUIRED:
             self.login = LoginPhase.DEGRADED
@@ -424,6 +458,13 @@ class LinkStateMachine:
     # ── reply link ───────────────────────────────────────────────────
 
     def _kick_reply(self, now: datetime) -> None:
+        # OUR safety design, not a vendor rule: ConnectByID was already
+        # accepted and OnComplete has not arrived. Do not call it again.
+        if (
+            self._reply_awaiting_complete
+            and self.rules.reply_connect_once_until_complete
+        ):
+            return
         initial = (
             self.reply == LinkPhase.IDLE
             and not self._saw_reply_disconnect
@@ -432,6 +473,7 @@ class LinkStateMachine:
         if not initial:
             if not self._saw_reply_disconnect or self._reply_down_at is None:
                 self._maybe_stuck_waiting_for_reply_event(now)
+                self._maybe_stuck_after_login_recovery(now)
                 return
             elapsed = (now - self._reply_down_at).total_seconds()
             # §4-3-h: the disconnect is not finished. Wait out the settle
@@ -455,6 +497,7 @@ class LinkStateMachine:
         self.reply = LinkPhase.CONNECTING
         self._reply_connect_started_at = now
         self._pending_complete = False
+        self._reply_awaiting_complete = True
         if not self.rules.one_link_at_a_time:
             # Mutant: start the quote link while ConnectByID is in flight.
             self.port.enter_monitor()
@@ -467,12 +510,19 @@ class LinkStateMachine:
         state = self.port.is_connected_by_id(self.config.user_id)
         if state in (1, 2):
             self._track_reply_stuck(now, state)
+            if self.degraded:
+                return
+        else:
+            self._reply_stuck_since = None
+        if self.rules.reply_connect_once_until_complete:
+            # Stay in CONNECTING until OnComplete. IsConnectedByID==0
+            # is not permission to call ConnectByID again.
+            if elapsed >= self.config.stuck_limit_s:
+                self._degrade(now, "stuck")
             return
-        self._reply_stuck_since = None
         if elapsed >= self.config.connecting_timeout_s:
-            # One shot failed and the id is back to 0. The next tick
-            # may call ConnectByID once. Not in this tick.
-            self.reply = LinkPhase.DOWN
+            # Mutant: a second ConnectByID while the first is still open.
+            self.port.connect_reply(self.config.user_id)
 
     def _finish_reply(self) -> None:
         if self.rules.orders_after_complete_and_reconcile:
@@ -485,6 +535,7 @@ class LinkStateMachine:
         self.reply = LinkPhase.READY
         self._pending_complete = False
         self._reply_connect_started_at = None
+        self._reply_awaiting_complete = False
 
     def _maybe_stuck_waiting_for_reply_event(self, now: datetime) -> None:
         """3033 with no OnSolaceReplyDisconnect cannot move either link.
@@ -547,6 +598,7 @@ class LinkStateMachine:
             self.quote = LinkPhase.READY
             self._quote_stuck_since = None
             self._quote_connect_started_at = None
+            self._maybe_finish_solace_episode()
             return
         elapsed = (now - self._quote_connect_started_at).total_seconds()
         state = self.port.is_connected()
@@ -623,9 +675,52 @@ class LinkStateMachine:
             f"probe IsConnected every {int(self.config.probe_interval_s)}s; "
             "waiting for manual Reconnect"
         )
+        # This episode failed. A later 3033 has to see a new
+        # OnSolaceReplyDisconnect and run the settle path again.
+        if self.rules.reset_3033_episode:
+            self._saw_reply_disconnect = False
+            self._reply_down_at = None
+            self._reply_awaiting_complete = False
+            self._solace_down_at = None
         if not self.rules.degraded_instead_of_restart:
             # Mutant: relaunch the process instead of staying down.
             self.port.restart_process()
+
+    def _maybe_finish_solace_episode(self) -> None:
+        """Both links are back. Forget this 3033 so the next one is new."""
+        if not self._saw_3033 or self.reply != LinkPhase.READY:
+            return
+        if not self.rules.reset_3033_episode:
+            return
+        self._saw_3033 = False
+        self._solace_down_at = None
+        self._saw_reply_disconnect = False
+        self._reply_down_at = None
+        self._reply_awaiting_complete = False
+        self._reply_stuck_since = None
+        self._down_without_reply_event_since = None
+
+    def _arm_stuck_if_links_down_without_reply_event(self, now: datetime) -> None:
+        """3021 → EnterMonitor 1108 → login succeeded, reply still down.
+
+        There is no OnSolaceReplyDisconnect to settle, and ConnectByID
+        would be the call the fake faults on. Wait out stuck_limit, then
+        degrade: alert, block entries, probe, manual Reconnect.
+        """
+        if self.reply != LinkPhase.DOWN or self._saw_reply_disconnect or self._saw_3033:
+            return
+        if self.rules.stuck_after_login_recovery:
+            if self._down_without_reply_event_since is None:
+                self._down_without_reply_event_since = now
+            return
+        self.port.connect_reply(self.config.user_id)
+
+    def _maybe_stuck_after_login_recovery(self, now: datetime) -> None:
+        if self._down_without_reply_event_since is None:
+            return
+        waited = (now - self._down_without_reply_event_since).total_seconds()
+        if waited >= self.config.stuck_limit_s:
+            self._degrade(now, "stuck")
 
     def _probe(self, now: datetime) -> None:
         """Cheap IsConnected read. Never EnterMonitor, ConnectByID, or Login."""

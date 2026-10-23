@@ -152,6 +152,23 @@ def finish_reply_then_quote(machine, fake, now) -> datetime:
     return ready
 
 
+def recover_3033_with_reply_event(machine, fake, now) -> datetime:
+    """3033, a fresh reply disconnect, OnComplete, then 3003."""
+    inject_connection(machine, fake, KIND_SOLACE_DOWN, now)
+    inject_reply_disconnect(machine, fake, now + timedelta(seconds=1))
+    now = pump(machine, fake, now + timedelta(seconds=1), 15)
+    assert machine.reply == LinkPhase.CONNECTING, machine.reply
+    inject_complete(machine, fake, now)
+    at(machine, fake, now)
+    assert machine.reply == LinkPhase.READY
+    now = pump(machine, fake, now, 10)
+    assert machine.quote == LinkPhase.CONNECTING
+    inject_connection(machine, fake, KIND_READY, now)
+    at(machine, fake, now)
+    assert machine.quote == LinkPhase.READY
+    return now
+
+
 # ── fake contract ────────────────────────────────────────────────────
 
 
@@ -634,6 +651,129 @@ class TestReplays:
         assert "RestartProcess" not in fake.calls
 
 
+# ── Reed review: 3033 reset, 1108 wedge, in-flight ConnectByID ───────
+
+
+class TestReedReview:
+    def test_A_second_3033_without_reply_event_no_connect_by_id(self):
+        """A finished 3033 must not authorize the next one."""
+        machine, fake, t0 = boot_ready()
+        done = recover_3033_with_reply_event(
+            machine, fake, t0 + timedelta(minutes=1)
+        )
+        later = done + timedelta(hours=2)
+        inject_connection(machine, fake, KIND_SOLACE_DOWN, later)
+        before = len(fake.calls)
+        pump(machine, fake, later, 120)
+        new = mutating(fake.calls[before:])
+        assert "ConnectByID" not in new, new
+        assert machine.reply == LinkPhase.DOWN
+        assert machine.quote == LinkPhase.DOWN
+        assert not machine.degraded
+
+    def test_B_second_reply_disconnect_settle_uses_fresh_time(self):
+        machine, fake, t0 = boot_ready()
+        done = recover_3033_with_reply_event(
+            machine, fake, t0 + timedelta(minutes=1)
+        )
+        later = done + timedelta(hours=2)
+        inject_connection(machine, fake, KIND_SOLACE_DOWN, later)
+        start = later + timedelta(seconds=1)
+        inject_reply_disconnect(machine, fake, start)
+        before = fake.calls.count("ConnectByID")
+        pump(machine, fake, start, 9)
+        assert fake.calls.count("ConnectByID") == before
+        pump(machine, fake, start, 30)
+        assert fake.calls.count("ConnectByID") == before + 1
+        assert machine.reply == LinkPhase.CONNECTING
+
+    def test_C_manual_reconnect_after_stuck_gets_fresh_window(self):
+        machine, fake, t0 = boot_ready()
+        inject_connection(machine, fake, KIND_SOLACE_DOWN, t0)
+        stuck = pump(machine, fake, t0, 310)
+        assert machine.degraded and machine.degraded_reason == "stuck"
+        press = stuck + timedelta(seconds=1)
+        before = fake.calls.count("ConnectByID")
+        machine.manual_reconnect(press)
+        at(machine, fake, press)
+        assert not machine.degraded, "manual Reconnect re-degraded on the very next tick"
+        assert not machine.entries_blocked
+        assert fake.calls.count("ConnectByID") == before
+        assert "LeaveMonitor" not in fake.calls
+        pump(machine, fake, press, 299)
+        assert not machine.degraded
+        at(machine, fake, press + timedelta(seconds=300))
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        assert fake.calls.count("ConnectByID") == before
+
+    def test_D_login_failures_reset_after_success(self):
+        machine, fake, t0 = boot_ready()
+        t = t0
+        for i in range(3):
+            t += timedelta(hours=1)
+            inject_connection(machine, fake, KIND_CONN_ERROR, t)
+            fake.enter_codes = [1108]
+            fake.login_codes = [1108, 0]
+            t = pump(machine, fake, t, 30)
+            assert not machine.degraded, (i, machine.degraded_reason, machine.login_failures)
+            assert machine.login == LoginPhase.LOGGED_IN, (i, machine.login)
+            assert machine.login_failures == 0, (i, machine.login_failures)
+
+    def test_E_slow_on_complete_no_second_connect_by_id(self):
+        """OnComplete past 60s: one ConnectByID, then the late complete."""
+        machine, fake, t0 = boot_ready()
+        inject_connection(machine, fake, KIND_SOLACE_DOWN, t0)
+        start = t0 + timedelta(seconds=1)
+        inject_reply_disconnect(machine, fake, start)
+        before = fake.calls.count("ConnectByID")
+        held = pump(machine, fake, start, 120)
+        assert fake.calls.count("ConnectByID") == before + 1
+        assert machine.reply == LinkPhase.CONNECTING
+        assert not machine.degraded
+        inject_complete(machine, fake, held)
+        at(machine, fake, held)
+        assert machine.reply == LinkPhase.READY
+        assert fake.calls.count("ConnectByID") == before + 1
+        assert not machine.orders_paused
+
+    def test_F_quote_drop_then_1108_does_not_wedge_silently(self):
+        """3021 → EnterMonitorLONG 1108 → login OK degrades, it does not wedge.
+
+        Alert, block entries, probe IsConnected, wait for manual Reconnect.
+        """
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(hours=1)
+        inject_connection(machine, fake, KIND_CONN_ERROR, t)
+        fake.enter_codes = [1108]
+        fake.login_codes = [0]
+        connects = fake.calls.count("ConnectByID")
+        enters = fake.calls.count("EnterMonitorLONG")
+        reads = fake.calls.count("IsConnected")
+        end = pump(machine, fake, t, 3600, step=5)
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        assert machine.entries_blocked
+        assert machine.orders_paused
+        assert machine.login == LoginPhase.LOGGED_IN
+        assert machine.quote == LinkPhase.DOWN
+        assert machine.reply == LinkPhase.DOWN
+        assert machine.alerts
+        assert "manual Reconnect" in machine.alerts[-1]
+        assert fake.calls.count("ConnectByID") == connects
+        assert fake.calls.count("EnterMonitorLONG") == enters + 1
+        assert fake.calls.count("IsConnected") >= reads + 2
+        assert "RestartProcess" not in fake.calls
+        assert "LeaveMonitor" not in fake.calls
+        press = end + timedelta(seconds=1)
+        machine.manual_reconnect(press)
+        at(machine, fake, press)
+        assert not machine.degraded
+        assert not machine.entries_blocked
+        assert fake.calls.count("ConnectByID") == connects
+        assert "LeaveMonitor" not in fake.calls
+
+
 # ── mutants: one per rule, each killed by its scenario ──────────────
 
 
@@ -717,6 +857,43 @@ def scenario_degraded(rules):
     at(machine, fake, t0 + timedelta(seconds=5))
 
 
+def scenario_reset_3033(rules):
+    machine, fake, t0 = boot_ready(rules)
+    done = recover_3033_with_reply_event(
+        machine, fake, t0 + timedelta(minutes=1)
+    )
+    later = done + timedelta(hours=2)
+    inject_connection(machine, fake, KIND_SOLACE_DOWN, later)
+    at(machine, fake, later)
+
+
+def scenario_reply_once(rules):
+    machine, fake, t0 = boot_ready(rules)
+    t = t0 + timedelta(minutes=1)
+    inject_connection(machine, fake, KIND_SOLACE_DOWN, t)
+    inject_reply_disconnect(machine, fake, t)
+    at(machine, fake, t + timedelta(seconds=10))
+    at(machine, fake, t + timedelta(seconds=71))
+
+
+def scenario_stuck_after_login(rules):
+    machine, fake, t0 = boot_ready(rules)
+    t = t0 + timedelta(hours=1)
+    inject_connection(machine, fake, KIND_CONN_ERROR, t)
+    fake.enter_codes = [1108]
+    fake.login_codes = [0]
+    pump(machine, fake, t, 10)
+
+
+def scenario_manual_clears_stuck(rules):
+    cfg = LinkMachineConfig(stuck_limit_s=5)
+    machine, fake, t0 = boot_ready(rules, cfg)
+    t = t0 + timedelta(minutes=1)
+    inject_connection(machine, fake, KIND_SOLACE_DOWN, t)
+    pump(machine, fake, t, 6)
+    machine.manual_reconnect(t + timedelta(seconds=6))
+
+
 # field, scenario, SimulatedAV match, rule the mutant deletes
 MUTANTS = [
     (
@@ -796,6 +973,30 @@ MUTANTS = [
         scenario_degraded,
         "process restart",
         "stuck or 3 login failures: stay down, alert, probe; never restart",
+    ),
+    (
+        "reset_3033_episode",
+        scenario_reset_3033,
+        "OnSolaceReplyDisconnect",
+        "a finished 3033 does not authorize ConnectByID on the next 3033",
+    ),
+    (
+        "reply_connect_once_until_complete",
+        scenario_reply_once,
+        "re-called",
+        "one ConnectByID until OnComplete; no second call while it is in flight",
+    ),
+    (
+        "stuck_after_login_recovery",
+        scenario_stuck_after_login,
+        "OnSolaceReplyDisconnect",
+        "3021 → 1108 → login OK with reply still down degrades; no ConnectByID",
+    ),
+    (
+        "manual_reconnect_clears_stuck",
+        scenario_manual_clears_stuck,
+        "OnSolaceReplyDisconnect",
+        "manual Reconnect clears the stuck window instead of ConnectByID",
     ),
 ]
 
