@@ -1,4 +1,4 @@
-﻿# Copy to hosts.local.yaml (gitignored) or %USERPROFILE%\.ssh\tailscale-hosts.local.yaml
+# Copy to hosts.local.yaml (gitignored) or %USERPROFILE%\.ssh\tailscale-hosts.local.yaml
 # Fill real values locally. Never commit the filled file.
 
 tailnet: "REPLACE_TAILNET_NAME"

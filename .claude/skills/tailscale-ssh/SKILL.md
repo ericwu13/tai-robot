@@ -1,4 +1,4 @@
-﻿---
+---
 name: tailscale-ssh
 description: SSH to Tailscale hosts (Steven, oreopie, other tailnet nodes). Use when an agent needs remote shell on a trading PC over Tailscale. Credentials and the filled hosts map stay local — never commit keys or passwords.
 ---
@@ -12,8 +12,10 @@ Reach Windows hosts on the Tailscale tailnet with OpenSSH.
 ## Live pattern (prefer this)
 
 ```powershell
-ssh -i $env:USERPROFILE\.ssh\id_ed25519_steven -o BatchMode=yes -o ConnectTimeout=10 Traderbot@100.74.218.42 "<remote command>"
+ssh -i $env:USERPROFILE\.ssh\id_ed25519_steven -o BatchMode=yes -o ConnectTimeout=10 Traderbot@100.x.x.x "<remote command>"
 ```
+
+The real address is `tailscale_ip` in gitignored `hosts.local.yaml` (or `%USERPROFILE%\.ssh\tailscale-hosts.local.yaml`).
 
 | Field | Notes |
 |---|---|
