@@ -703,6 +703,27 @@ def stop() -> None:
     set_replace_failure_logger(None)
 
 
+# Optional. run_backtest installs a debug-log sink. A failure here must
+# not change the COM result. None in unit tests that never import the app.
+_com_return_logger = None
+
+
+def set_com_return_logger(fn) -> None:
+    """Install the duration line written when a ``call_com`` call returns."""
+    global _com_return_logger
+    _com_return_logger = fn
+
+
+def _emit_com_return(name: str, elapsed_ms: float, *, failed: bool) -> None:
+    fn = _com_return_logger
+    if fn is None:
+        return
+    try:
+        fn(name, elapsed_ms, failed)
+    except Exception:
+        logger.debug("COM return log failed for %s", name, exc_info=True)
+
+
 def call_com(name: str, fn, *args, **kwargs):
     """Run a broker/COM call, stamping inflight_com_call around it.
 
@@ -714,33 +735,40 @@ def call_com(name: str, fn, *args, **kwargs):
     Start and end stamps are best-effort. A failed ``os.replace`` (Windows
     keeps the file locked while a reader holds it) must not skip ``fn``
     and must not replace ``fn``'s return value or exception.
+
+    After ``fn`` returns or raises, the duration is logged. That log is
+    also best-effort and does not add a COM call or change control flow.
     """
     writer = _writer
     on_main = threading.current_thread() is threading.main_thread()
-    if writer is None or not on_main:
-        return fn(*args, **kwargs)
-    try:
-        writer.begin_inflight(name)
-    except Exception as exc:
-        _report_stamp_failure(
-            exc,
-            "heartbeat start stamp failed for "
-            f"{name}; the COM call still runs: "
-            f"[{type(exc).__name__}] {exc}")
+    stamp = writer is not None and on_main
+    if stamp:
+        try:
+            writer.begin_inflight(name)
+        except Exception as exc:
+            _report_stamp_failure(
+                exc,
+                "heartbeat start stamp failed for "
+                f"{name}; the COM call still runs: "
+                f"[{type(exc).__name__}] {exc}")
+    started = time.perf_counter()
     outcome = None
     error = None
     try:
         outcome = fn(*args, **kwargs)
     except BaseException as exc:
         error = exc
-    try:
-        writer.end_inflight()
-    except Exception as exc:
-        _report_stamp_failure(
-            exc,
-            "heartbeat end stamp failed for "
-            f"{name}; the broker result is unchanged: "
-            f"[{type(exc).__name__}] {exc}")
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if stamp:
+        try:
+            writer.end_inflight()
+        except Exception as exc:
+            _report_stamp_failure(
+                exc,
+                "heartbeat end stamp failed for "
+                f"{name}; the broker result is unchanged: "
+                f"[{type(exc).__name__}] {exc}")
+    _emit_com_return(name, elapsed_ms, failed=error is not None)
     if error is not None:
         raise error
     return outcome

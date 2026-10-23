@@ -13,6 +13,7 @@ Usage:
 from version import APP_VERSION
 
 import csv
+import faulthandler
 import logging
 import os
 import sys
@@ -99,7 +100,7 @@ _CODE_GEN_MAX_TOKENS = 16384
 from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.tick_watchdog import TickWatchdog
-from src.live.main_heartbeat import call_com
+from src.live.main_heartbeat import call_com, set_com_return_logger
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
@@ -655,6 +656,39 @@ _CACHE_DIR = os.path.join(project_root, "data")
 _app = None
 _debug_log_file = None  # file handle for bot debug log
 _discord = None  # DiscordNotifier instance (set on deploy)
+# Kept alive for the process lifetime so faulthandler can write a native
+# dump if LeaveMonitor faults inside SKCOM/ntdll (issue #157).
+_faulthandler_log = None
+
+
+def enable_reconnect_faulthandler(bot_dir: str) -> None:
+    """Arm faulthandler at deploy, writing to ``bot_dir/faulthandler.log``.
+
+    The handle is stored on a module global. Closing it would silently
+    disable the dump. A failure to open the file is a warning: diagnostics
+    must not abort the deploy.
+    """
+    global _faulthandler_log
+    if _faulthandler_log is not None and not _faulthandler_log.closed:
+        return
+    handle = None
+    try:
+        path = os.path.join(bot_dir, "faulthandler.log")
+        handle = open(path, "a", encoding="utf-8")
+        faulthandler.enable(file=handle, all_threads=True)
+    except Exception as e:
+        if handle is not None and not handle.closed:
+            handle.close()
+        _log(
+            f"[RECONNECT] faulthandler not armed: [{type(e).__name__}] {e}")
+        return
+    _faulthandler_log = handle
+
+
+def _log_reconnect_call(name: str) -> None:
+    """Debug line immediately before a reconnect-path broker call."""
+    _log_debug(
+        f"[RECONNECT] about to call {name} tid={threading.get_ident()}")
 
 
 def _open_debug_log(bot_dir: str) -> None:
@@ -759,6 +793,33 @@ def _log_debug(msg):
         except Exception:
             pass
     _route_to_log_widget(line, "debug")
+
+
+def _log_com_return(name: str, elapsed_ms: float, failed: bool) -> None:
+    """P0: how long the SKCOM call took, written as it returns.
+
+    Logging only. The caller already invoked the COM method; this does
+    not make another one and does not branch on the elapsed time.
+    """
+    status = "raised" if failed else "returned"
+    _log_debug(
+        f"[COM] {name} {status} in {elapsed_ms:.0f} ms "
+        f"tid={threading.get_ident()}")
+
+
+def _log_reply_link_state(value, *, where: str) -> None:
+    """Log a reply-link value the caller already holds.
+
+    Does not call SKCOM. Reconnect does not call this helper: nothing
+    on the pre-#158 path reads the reply link, and a probe would change
+    the call sequence under investigation.
+    """
+    _log_debug(
+        f"[RECONNECT] reply-link IsConnectedByID={value} at {where} "
+        f"tid={threading.get_ident()}")
+
+
+set_com_return_logger(_log_com_return)
 
 
 def _route_to_log_widget(line: str, level: str = "info") -> None:
@@ -1364,12 +1425,13 @@ class BacktestApp:
     def _attempt_reconnect(self):
         """Try to re-login and reconnect to quote service.
 
-        Bug B: each attempt MUST call ``SKQuoteLib_LeaveMonitor()`` +
-        ``SKCenterLib_LogOut()`` first (best-effort) so we start from a
-        clean COM state. Otherwise login+EnterMonitor stacks on top of a
-        broken session and the server may reach Quote (3002) without ever
-        sending Ready (3003) — exactly the zombie pattern seen in bot
-        session 0422.
+        Bug B: a teardown-and-login attempt calls
+        ``SKQuoteLib_LeaveMonitor()`` first (best-effort) so we start
+        from a clean COM state. ``SKCenterLib_LogOut`` is not called:
+        it is not in Capital API 2.13.57.
+        Otherwise login+EnterMonitor stacks on top of a broken session and
+        the server may reach Quote (3002) without ever sending Ready (3003)
+        — exactly the zombie pattern seen in bot session 0422.
         """
         self._reconnect_timer_id = None
         attempt_n = self._conn_monitor.attempt + 1  # number we'll attempt now
@@ -1382,7 +1444,7 @@ class BacktestApp:
         _log(f"嘗試重連 Attempting reconnect #{self._conn_monitor.attempt}")
         _log_debug(
             f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
-            "+ LogOut (cleanup) before fresh LoginSetQuote")
+            "(cleanup) before fresh LoginSetQuote")
 
         try:
             if not _com_available:
@@ -1402,8 +1464,14 @@ class BacktestApp:
                 return
 
             # ── Bug B: best-effort COM teardown before fresh login ──
-            # Both calls swallow errors — the prior session may already be
-            # half-torn-down and these are housekeeping, not gates.
+            # LeaveMonitor swallows errors — the prior session may already
+            # be half-torn-down. LogOut is not called: Capital API 2.13.57
+            # has no such method, and a call always raises AttributeError.
+            # Reply-link IsConnectedByID is not read here either. Pre-#158
+            # never fetched it, so logging it would be a new COM call.
+            _log_debug(
+                "[RECONNECT] LogOut not called — not in Capital API 2.13.57")
+            _log_reconnect_call("LeaveMonitor")
             try:
                 leave_code = call_com("LeaveMonitor", skQ.SKQuoteLib_LeaveMonitor)
                 _log_debug(
@@ -1412,18 +1480,11 @@ class BacktestApp:
                 _log_debug(
                     f"[RECONNECT] LeaveMonitor raised (ignored): "
                     f"[{type(e).__name__}] {e}")
-            try:
-                logout_code = call_com("LogOut", skC.SKCenterLib_LogOut, user_id)
-                _log_debug(
-                    f"[RECONNECT] LogOut returned {logout_code}")
-            except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] LogOut raised (ignored): "
-                    f"[{type(e).__name__}] {e}")
             self._logged_in = False
             _log_debug(
                 f"[RECONNECT] Cleanup done — calling LoginSetQuote")
 
+            _log_reconnect_call("LoginSetQuote")
             code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
                             user_id, password, "Y")
             _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
@@ -1437,7 +1498,9 @@ class BacktestApp:
                 return
 
             self._logged_in = True
+            _log_reconnect_call("ConnectByID")
             reply_code = call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            _log_reconnect_call("EnterMonitorLONG")
             enter_code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
             _log_debug(
                 f"[RECONNECT] ConnectByID returned {reply_code}, "
@@ -1464,6 +1527,7 @@ class BacktestApp:
                 "(handled by _on_reconnected via _drain_ui_queue)")
             return  # success, handled by _on_reconnected via _drain_ui_queue
         try:
+            _log_reconnect_call("IsConnected")
             ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
             _log_debug(
                 f"[RECONNECT] IsConnected()={ic} after 3s poll "
@@ -6817,8 +6881,14 @@ class BacktestApp:
             if self._trading_guard.fill_pending else None
         )
 
-        # Open debug log file in bot directory
+        # Open debug log, then arm the native dump. A faulthandler open
+        # failure must not abort the deploy.
         _open_debug_log(self._live_runner.bot_dir)
+        try:
+            enable_reconnect_faulthandler(self._live_runner.bot_dir)
+        except Exception as e:
+            _log(
+                f"[RECONNECT] faulthandler not armed: [{type(e).__name__}] {e}")
 
         # Route regime logging into the app's _log()
         if self._regime_manager is not None:

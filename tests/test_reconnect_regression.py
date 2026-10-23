@@ -12,8 +12,9 @@ Bugs covered:
   Ready must schedule a watchdog timer.
 
 * **Bug B** — no COM teardown before re-login. ``_attempt_reconnect``
-  must call ``SKQuoteLib_LeaveMonitor`` AND ``SKCenterLib_LogOut`` before
-  the fresh ``LoginSetQuote``.
+  must call ``SKQuoteLib_LeaveMonitor`` before the fresh
+  ``LoginSetQuote``. ``SKCenterLib_LogOut`` is not called: it is not in
+  Capital API 2.13.57.
 
 * **Bug C** — watchdog "warn" handler bypasses the resubscribe/reconnect
   ladder. The handler must require TWO consecutive bad ``IsConnected()``
@@ -125,27 +126,32 @@ class TestBugB_CleanupBeforeRelogin:
         assert leave_pos < login_pos, (
             "Bug B: LeaveMonitor must happen BEFORE LoginSetQuote.")
 
-    def test_logout_called_before_login(self, rb_source: str):
+    def test_logout_is_not_called(self, rb_source: str):
+        """LogOut is absent. Capital API 2.13.57 has no such method.
+
+        The pre-#158 path called it unconditionally. That call is the
+        one intentional difference from the old sequence: it always
+        raised AttributeError. No hasattr guard, and no call.
+        """
         body = self._attempt_reconnect_body(rb_source)
-        logout_pos = body.find("SKCenterLib_LogOut")
-        login_pos = body.find("SKCenterLib_LoginSetQuote")
-        assert logout_pos != -1, (
-            "Bug B: _attempt_reconnect must call SKCenterLib_LogOut "
-            "before re-login to ensure a clean COM state.")
-        assert logout_pos < login_pos, (
-            "Bug B: LogOut must happen BEFORE LoginSetQuote.")
+        assert "skC.SKCenterLib_LogOut" not in body
+        assert 'call_com(\n                "LogOut"' not in body
+        assert 'call_com("LogOut"' not in body
+        assert "SKCenterLib_LoginSetQuote" in body
 
     def test_cleanup_calls_swallow_errors(self, rb_source: str):
-        """Cleanup calls must be best-effort — a prior session may already
-        be half-torn-down."""
+        """LeaveMonitor must be best-effort — a prior session may already
+        be half-torn-down. LogOut is not part of the sequence."""
         body = self._attempt_reconnect_body(rb_source)
-        # Each cleanup call should be inside its own try/except
-        for fn in ("SKQuoteLib_LeaveMonitor", "SKCenterLib_LogOut"):
-            # Match `try:` ... fn ... `except` within 5 lines
-            pat = rf"try:\s*\n[^\n]*{fn}[^\n]*\n(?:[^\n]*\n){{0,5}}\s*except"
-            assert re.search(pat, body), (
-                f"Bug B: {fn} must be wrapped in try/except so a partial "
-                "tear-down does not abort the reconnect attempt.")
+        pat = (
+            r"try:\s*\n[^\n]*SKQuoteLib_LeaveMonitor[^\n]*\n"
+            r"(?:[^\n]*\n){0,5}\s*except"
+        )
+        assert re.search(pat, body), (
+            "Bug B: SKQuoteLib_LeaveMonitor must be wrapped in try/except "
+            "so a partial tear-down does not abort the reconnect attempt.")
+        assert "skC.SKCenterLib_LogOut" not in body
+        assert 'call_com("LogOut"' not in body
 
 
 # ---------------------------------------------------------------------------
@@ -294,3 +300,124 @@ class TestIssue78_MonotonicityResetOnReconnect:
         assert "reset_bar_monotonicity" in body, (
             "Issue #78 regression: _resubscribe_ticks must reset the "
             "aggregator out-of-order bar guards on reconnect.")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics kept from #158, plus P0 return timings
+# ---------------------------------------------------------------------------
+
+class TestKeptReconnectDiagnostics:
+
+    def test_reconnect_calls_are_logged_before_they_run(self, rb_source: str):
+        assert (
+            "[RECONNECT] about to call {name} tid={threading.get_ident()}"
+            in rb_source
+        )
+        match = re.search(
+            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match
+        body = match.group(1)
+        for name in (
+            "LeaveMonitor",
+            "LoginSetQuote",
+            "ConnectByID",
+            "EnterMonitorLONG",
+        ):
+            assert f'_log_reconnect_call("{name}")' in body, name
+        # The #158 pre-decide probe was a new IsConnected call. It stays out.
+        assert '_log_reconnect_call("IsConnected")' not in body
+        assert "SKQuoteLib_IsConnected" not in body
+        assert "SKReplyLib_IsConnectedByID" not in body
+        check = re.search(
+            r"def _check_reconnection\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert check
+        # This IsConnected is the pre-#158 poll. Log it; do not add another.
+        assert '_log_reconnect_call("IsConnected")' in check.group(1)
+
+    def test_duration_line_is_installed_on_call_com(self, rb_source: str):
+        assert "def _log_com_return(" in rb_source
+        assert "[COM] {name} {status} in {elapsed_ms:.0f} ms" in rb_source
+        assert "set_com_return_logger(_log_com_return)" in rb_source
+
+    def test_reply_link_state_helper_does_not_call_skcom(self, rb_source: str):
+        """IsConnectedByID is logged only from a value the caller already has."""
+        match = re.search(
+            r"def _log_reply_link_state\(.*?\n(?=def )",
+            rb_source,
+            re.DOTALL,
+        )
+        assert match
+        body = match.group(0)
+        assert "call_com(" not in body
+        assert "SKReplyLib_" not in body
+        assert "reply-link IsConnectedByID=" in body
+        assert "SKReplyLib_IsConnectedByID" not in rb_source
+
+    def test_faulthandler_armed_at_deploy(self, rb_source: str):
+        assert "def enable_reconnect_faulthandler(" in rb_source
+        assert "faulthandler.enable(" in rb_source
+        assert "_faulthandler_log" in rb_source
+        assert "faulthandler.log" in rb_source
+        deploy = re.search(
+            r"def _deploy_live_continue\(.*?(?=\n    def )",
+            rb_source,
+            re.DOTALL,
+        )
+        assert deploy, "could not locate _deploy_live_continue"
+        body = deploy.group(0)
+        assert "enable_reconnect_faulthandler(" in body
+        open_pos = body.find("_open_debug_log(")
+        arm_pos = body.find("enable_reconnect_faulthandler(")
+        assert open_pos < arm_pos
+        assert "try:" in body[open_pos:arm_pos]
+        assert "except Exception" in body[arm_pos:arm_pos + 400]
+
+
+def test_faulthandler_handle_stays_open(tmp_path):
+    """The dump file handle must outlive enable(); closing it drops the hook."""
+    import faulthandler
+
+    import run_backtest as rb
+
+    faulthandler.disable()
+    rb._faulthandler_log = None
+    handle = None
+    try:
+        rb.enable_reconnect_faulthandler(str(tmp_path))
+        handle = rb._faulthandler_log
+        assert handle is not None
+        assert not handle.closed
+        handle.write("armed\n")
+        handle.flush()
+        text = (tmp_path / "faulthandler.log").read_text(encoding="utf-8")
+        assert "armed" in text
+        rb.enable_reconnect_faulthandler(str(tmp_path))
+        assert rb._faulthandler_log is handle
+        assert not handle.closed
+    finally:
+        faulthandler.disable()
+        rb._faulthandler_log = None
+        if handle is not None and not handle.closed:
+            handle.close()
+
+
+def test_faulthandler_open_failure_does_not_abort_deploy(tmp_path, monkeypatch, capsys):
+    """A log-file OSError is a warning. Deploy must continue."""
+    import run_backtest as rb
+
+    def boom(*args, **kwargs):
+        raise OSError("denied")
+
+    monkeypatch.setattr(rb, "open", boom, raising=False)
+    rb._faulthandler_log = None
+    rb.enable_reconnect_faulthandler(str(tmp_path))
+    assert rb._faulthandler_log is None
+    out = capsys.readouterr().out
+    assert "faulthandler not armed" in out
+    assert "OSError" in out
