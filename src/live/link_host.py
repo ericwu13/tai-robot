@@ -26,7 +26,6 @@ from src.live.link_state_machine import (
     LinkMachineConfig,
     LinkPhase,
     LinkStateMachine,
-    LoginPhase,
     MachineRules,
 )
 
@@ -117,37 +116,14 @@ def adopt_after_process_login(
 ) -> LinkHost:
     """Build the one machine for this process after ``_do_login`` succeeded.
 
-    ``_do_login`` has already called LoginSetQuote, ConnectByID, and
-    EnterMonitorLONG. This does not call ``start()`` and does not call
-    the port.
-
-    The machine has no public "already logged in" method. The fields set
-    here are the state ``start()`` plus those two link calls would have
-    left, minus a second login:
-
-    * ``login = LOGGED_IN``
-    * ``_started`` so a later ``start()`` does not log in again
-    * ``_login_permitted`` so a later 1xxx recovery is allowed
-    * quote CONNECTING (EnterMonitorLONG already issued, waiting for 3003)
-    * reply CONNECTING and awaiting OnComplete (ConnectByID already issued)
-
-    Entries stay closed (``orders_paused``) until that OnComplete
-    reconciles and 3003 subscribes. TY: this field adopt is the seam
-    if a public method should replace it.
+    Does not call ``start()`` and does not assign machine fields. The
+    public ``LinkStateMachine.adopt_after_process_login`` owns that state.
+    If process-start OnComplete never arrives, the machine stays
+    ``orders_paused`` until ``stuck_limit``, then DEGRADED. Recovery is
+    manual Reconnect or an operator restart.
     """
     cfg = config or LinkMachineConfig()
     cfg.user_id = user_id or cfg.user_id
     machine = LinkStateMachine(port, cfg, rules or MachineRules())
-    machine.login = LoginPhase.LOGGED_IN
-    machine._started = True
-    machine._login_permitted = True
-    machine.quote = LinkPhase.CONNECTING
-    machine._quote_connect_started_at = now
-    machine.reply = LinkPhase.CONNECTING
-    machine._reply_connect_started_at = now
-    machine._reply_awaiting_complete = True
-    machine._pending_complete = False
-    machine.orders_paused = True
-    machine.reply_reconciled = False
-    machine.entries_blocked = False
+    machine.adopt_after_process_login(now)
     return LinkHost(machine)

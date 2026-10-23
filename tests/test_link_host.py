@@ -34,6 +34,8 @@ from src.live.link_state_machine import (
     KIND_SOLACE_DOWN,
     LinkMachineConfig,
     LinkPhase,
+    LinkStateMachine,
+    LoginPhase,
     MachineRules,
 )
 from src.live.main_heartbeat import HeartbeatWriter
@@ -358,6 +360,55 @@ def test_adopt_then_start_does_not_login_again():
     before = fake.calls.count("LoginSetQuote")
     host.machine.start(t0)
     assert fake.calls.count("LoginSetQuote") == before == 1
+
+
+def test_public_adopt_does_not_call_the_broker():
+    """The machine method owns the process-login state. No port calls."""
+    fake = FakeSkcom()
+    now = T0
+    machine = LinkStateMachine(fake, LinkMachineConfig(user_id=USER))
+    machine.adopt_after_process_login(now)
+    assert fake.calls == []
+    assert machine.login == LoginPhase.LOGGED_IN
+    assert machine.quote == LinkPhase.CONNECTING
+    assert machine.reply == LinkPhase.CONNECTING
+    assert machine.orders_paused
+    assert machine.reply_reconciled is False
+    assert machine.entries_blocked is False
+    machine.start(now)
+    assert fake.calls == []
+
+
+def test_second_adopt_does_not_restart_the_stuck_clock():
+    """A second adopt must not move the OnComplete wait that degrades."""
+    cfg = LinkMachineConfig(user_id=USER, stuck_limit_s=5)
+    fake = FakeSkcom(reply_settle_s=cfg.reply_settle_s)
+    machine = LinkStateMachine(fake, cfg)
+    t0 = T0
+    machine.adopt_after_process_login(t0)
+    machine.adopt_after_process_login(t0 + timedelta(seconds=4))
+    machine.tick(t0 + timedelta(seconds=5))
+    assert machine.degraded
+    assert machine.orders_paused
+    for name in ("LoginSetQuote", "LeaveMonitor", "EnterMonitorLONG", "ConnectByID"):
+        assert name not in fake.calls
+
+
+def test_host_does_not_assign_machine_private_fields():
+    text = (ROOT / "src" / "live" / "link_host.py").read_text(encoding="utf-8")
+    for name in (
+        "_started",
+        "_login_permitted",
+        "_quote_connect_started_at",
+        "_reply_connect_started_at",
+        "_reply_awaiting_complete",
+        "_pending_complete",
+    ):
+        assert name not in text
+    assert "adopt_after_process_login(now)" in text
+    run = (ROOT / "run_backtest.py").read_text(encoding="utf-8")
+    assert "_login_permitted" not in run
+    assert "machine._started" not in run
 
 
 def test_app_attempt_reconnect_does_not_teardown():
