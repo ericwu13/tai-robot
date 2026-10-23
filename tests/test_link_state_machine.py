@@ -1021,6 +1021,140 @@ class TestReedReview:
         assert fake.calls.count("ConnectByID") == connects
         assert "RestartProcess" not in fake.calls
 
+    def test_I1_id_up_after_degrade_eventually_unblocks_or_redegrades(self):
+        """IsConnectedByID==1 marks reply up immediately, without a reconcile.
+
+        Entries stay blocked. OnComplete never arrives, so the stuck
+        limit degrades again instead of leaving READY+blocked forever
+        with no alert.
+        """
+        machine, fake, t, connects = _reply_inflight_degraded()
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        t += timedelta(seconds=1)
+        at(machine, fake, t)
+        assert machine.reply == LinkPhase.READY
+        assert not machine.degraded
+        assert not machine.reply_reconciled
+        assert machine.entries_blocked
+        assert machine.orders_paused
+        t = _quote_up(machine, fake, t)
+        t = pump(machine, fake, t, 3600)
+        assert fake.calls.count("ConnectByID") == connects
+        assert not (machine.entries_blocked and not machine.degraded)
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        assert any(alert.startswith("DEGRADED") for alert in machine.alerts)
+        assert any("unreconciled" in alert for alert in machine.alerts)
+
+    def test_I2_id_up_manual_is_noop_until_late_complete(self):
+        """Manual Reconnect does nothing while the reply is already up.
+
+        A later OnComplete is still honored and reconciles.
+        """
+        machine, fake, t, connects = _reply_inflight_degraded()
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        t += timedelta(seconds=1)
+        at(machine, fake, t)
+        t = _quote_up(machine, fake, t)
+        before = list(fake.calls)
+        machine.manual_reconnect(t)
+        t = pump(machine, fake, t, 600)
+        assert machine.entries_blocked
+        assert machine.orders_paused
+        assert not machine.reply_reconciled
+        assert mutating(fake.calls[len(before):]) == []
+        assert fake.calls.count("ConnectByID") == connects
+        inject_complete(machine, fake, t)
+        t = pump(machine, fake, t, 60)
+        assert machine.reply_reconciled
+        assert not machine.degraded
+        assert not machine.entries_blocked
+
+    def test_I3_login_failures_survive_connected_id_and_late_complete(self):
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(hours=1)
+        inject_connection(machine, fake, KIND_CONN_ERROR, t)
+        fake.enter_codes = [1108]
+        fake.login_codes = [1108, 1108, 1108]
+        t = pump(machine, fake, t, 60)
+        assert machine.degraded
+        assert machine.degraded_reason == "login_failures"
+        alerts = len(machine.alerts)
+        inject_complete(machine, fake, t)
+        at(machine, fake, t)
+        assert machine.degraded
+        assert machine.degraded_reason == "login_failures"
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        t = pump(machine, fake, t, 600)
+        assert machine.degraded
+        assert machine.degraded_reason == "login_failures"
+        assert len(machine.alerts) == alerts
+
+    def test_L2_late_complete_emits_one_recovery_alert(self):
+        machine, fake, t, _connects = _reply_inflight_degraded()
+        before = len(machine.alerts)
+        t += timedelta(seconds=30)
+        inject_complete(machine, fake, t)
+        at(machine, fake, t)
+        assert not machine.degraded
+        assert machine.reply_reconciled
+        assert len(machine.alerts) == before + 1
+        assert machine.alerts[-1].startswith("RECOVERED")
+
+    def test_W5_wedge_surviving_reply_does_not_connect_again(self):
+        """1108 login wedge must not ConnectByID when the reply link is up."""
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(hours=1)
+        inject_connection(machine, fake, KIND_CONN_ERROR, t)
+        fake.enter_codes = [1108]
+        fake.login_codes = [0]
+        connects = fake.calls.count("ConnectByID")
+        t = pump(machine, fake, t, 7)
+        assert machine.login == LoginPhase.LOGGED_IN
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        t = pump(machine, fake, t, 30)
+        assert fake.calls.count("ConnectByID") == connects
+        assert "RestartProcess" not in fake.calls
+
+    def test_S1_stale_complete_after_3033_is_ignored(self):
+        """OnComplete after 3033 reset the in-flight connect is stale."""
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(hours=1)
+        inject_reply_disconnect(machine, fake, t)
+        t = pump(machine, fake, t, 15)
+        assert machine.reply == LinkPhase.CONNECTING
+        inject_connection(machine, fake, KIND_SOLACE_DOWN, t)
+        at(machine, fake, t)
+        with fake.handling_event():
+            machine.on_complete(t + timedelta(seconds=1))
+        t = pump(machine, fake, t + timedelta(seconds=1), 400)
+        assert machine.degraded or machine.reply != LinkPhase.READY
+        assert machine.reply != LinkPhase.READY
+
+
+def _quote_up(machine, fake, t):
+    t = pump(machine, fake, t, 2)
+    if machine.quote == LinkPhase.CONNECTING:
+        inject_connection(machine, fake, KIND_READY, t)
+        at(machine, fake, t)
+    return t
+
+
+def _reply_inflight_degraded():
+    machine, fake, t0 = boot_ready()
+    t = t0 + timedelta(hours=1)
+    inject_reply_disconnect(machine, fake, t)
+    t = pump(machine, fake, t, 15)
+    assert machine.reply == LinkPhase.CONNECTING
+    connects = fake.calls.count("ConnectByID")
+    t = pump(machine, fake, t, 400)
+    assert machine.degraded and machine.reply == LinkPhase.DOWN
+    return machine, fake, t, connects
+
 
 # ── mutants: one per rule, each killed by its scenario ──────────────
 
@@ -1188,6 +1322,18 @@ def scenario_manual_login_wedge(rules):
     machine.manual_reconnect(t + timedelta(seconds=11))
 
 
+def scenario_login_wedge_id_gate(rules):
+    machine, fake, t0 = boot_ready(rules)
+    t = t0 + timedelta(hours=1)
+    inject_connection(machine, fake, KIND_CONN_ERROR, t)
+    fake.enter_codes = [1108]
+    fake.login_codes = [0]
+    pump(machine, fake, t, 7)
+    fake.hold_reply_connected = True
+    fake.held_reply_state = 1
+    pump(machine, fake, t + timedelta(seconds=7), 30)
+
+
 # field, scenario, SimulatedAV match, rule the mutant deletes
 MUTANTS = [
     (
@@ -1315,6 +1461,18 @@ MUTANTS = [
         scenario_manual_login_wedge,
         "login recovery",
         "manual Reconnect on the 1108 wedge waits out settle, then one ConnectByID",
+    ),
+    (
+        "login_wedge_id_gate",
+        scenario_login_wedge_id_gate,
+        "IsConnectedByID",
+        "1108 wedge ConnectByID only when IsConnectedByID==0",
+    ),
+    (
+        "id_up_waits_for_complete",
+        scenario_id_already_up,
+        "before OnComplete",
+        "IsConnectedByID==1 does not reconcile until OnComplete",
     ),
 ]
 

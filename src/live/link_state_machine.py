@@ -28,9 +28,17 @@ Login runs once per process. A later login is allowed only after a
 call returns a not-logged-in code (1xxx, the 1108 seen on 10-12) and
 both links are down and idle. Three login failures, a stuck link, or
 9996 enter DEGRADED: stay disconnected, alert, block entries, probe
-``IsConnected`` every 60s, and wait for ``manual_reconnect``. This
-machine never restarts the process. The vendor note that five login
-failures require an API restart is deliberately not followed.
+``IsConnected`` every 60s, and wait for ``manual_reconnect``. While
+the reply link is not READY, each degraded tick also reads
+``IsConnectedByID`` so an already-up reply is noticed on the next
+tick. That read is not the 60s probe. ``IsConnectedByID==1`` marks
+the reply up and clears the degrade, but positions are not reconciled
+until OnComplete. Entries stay blocked. If OnComplete does not arrive
+within the stuck limit, the machine degrades again and alerts.
+``login_failures`` and ``api_update_required`` are not cleared by a
+late OnComplete or by ``IsConnectedByID==1``. This machine never
+restarts the process. The vendor note that five login failures
+require an API restart is deliberately not followed.
 """
 
 from __future__ import annotations
@@ -105,6 +113,12 @@ class MachineRules:
     connected_id_without_reconnect: bool = True
     # Manual Reconnect on the login wedge waits out settle, then one connect.
     manual_login_wedge_settles: bool = True
+    # 1108 wedge ConnectByID only when IsConnectedByID==0. Same gate as
+    # the disconnect path. Mutant connects while the reply link is up.
+    login_wedge_id_gate: bool = True
+    # IsConnectedByID==1 is not OnComplete. Do not reconcile until then.
+    # Mutant reconciles immediately and the fake rejects it.
+    id_up_waits_for_complete: bool = True
 
 
 @dataclass
@@ -178,6 +192,10 @@ class LinkStateMachine:
     _down_without_reply_event_since: datetime | None = None
     _login_wedge_settle_at: datetime | None = None
     _settle_before_stuck: bool = False
+    # Set when IsConnectedByID==1 recovered the reply without OnComplete.
+    # Entries stay blocked until OnComplete reconciles, or until this
+    # clock hits stuck_limit and we degrade again.
+    _unreconciled_since: datetime | None = None
 
     # ── events: flags only ───────────────────────────────────────────
 
@@ -289,6 +307,8 @@ class LinkStateMachine:
             return
         self._tick_body(now)
         if not self.degraded:
+            self._honor_unreconciled(now)
+        if not self.degraded:
             self._maybe_unblock_entries()
 
     def _tick_body(self, now: datetime) -> None:
@@ -346,9 +366,17 @@ class LinkStateMachine:
             self._reply_stuck_since = None
             self._reply_awaiting_complete = False
             self._down_without_reply_event_since = None
+            self._unreconciled_since = None
             return
         if event.name == "complete":
-            self._pending_complete = True
+            # A 3033 (or a fresh disconnect) already ended the episode.
+            # OnComplete from that torn-down ConnectByID is stale: the
+            # fake world has not seen it, and reconciling would be a
+            # lie. Honor it only for the connect still in flight, or
+            # for a READY reply that IsConnectedByID brought up and
+            # that still owes a reconcile.
+            if self._complete_is_actionable():
+                self._pending_complete = True
             return
         if event.name != "connection":
             return
@@ -370,12 +398,14 @@ class LinkStateMachine:
                 self._reply_down_at = None
                 self._reply_awaiting_complete = False
                 self._down_without_reply_event_since = None
+                self._unreconciled_since = None
             elif self._solace_down_at is None:
                 self._solace_down_at = at
             if self.rules.solace_3033_both_links_reply_first:
                 self.reply = LinkPhase.DOWN
                 self.reply_reconciled = False
                 self._pending_complete = False
+                self._unreconciled_since = None
             return
         if kind == KIND_CONN_ERROR:
             self.quote = LinkPhase.DOWN
@@ -573,6 +603,18 @@ class LinkStateMachine:
         self._down_without_reply_event_since = None
         self._login_wedge_settle_at = None
         self._settle_before_stuck = False
+        self._unreconciled_since = None
+
+    def _complete_is_actionable(self) -> bool:
+        """OnComplete still belongs to this episode.
+
+        After 3033 clears the in-flight connect, a late OnComplete is
+        ignored. A READY reply that came up via IsConnectedByID==1 is
+        still waiting for this callback so it can reconcile.
+        """
+        if self._reply_awaiting_complete or self.reply == LinkPhase.CONNECTING:
+            return True
+        return self.reply == LinkPhase.READY and not self.reply_reconciled
 
     def _maybe_stuck_waiting_for_reply_event(self, now: datetime) -> None:
         """3033 with no OnSolaceReplyDisconnect cannot move either link.
@@ -738,6 +780,7 @@ class LinkStateMachine:
         self._reply_awaiting_complete = False
         self._reply_stuck_since = None
         self._down_without_reply_event_since = None
+        self._unreconciled_since = None
 
     def _arm_reply_stuck_after_manual(self, now: datetime) -> None:
         """Reply is down after the press. Arm a clock, and maybe a settle.
@@ -806,6 +849,23 @@ class LinkStateMachine:
                 if self.degraded:
                     return True
             return True
+        # OUR safety design, not a vendor rule. The 1108 wedge uses the
+        # same one-in-flight, backoff, and IsConnectedByID==0 gates as
+        # the disconnect path. A reply link that survived login is not
+        # a reason to call ConnectByID again.
+        if (
+            self._reply_awaiting_complete
+            and self.rules.reply_connect_once_until_complete
+        ):
+            return True
+        if self._backoff_until is not None and now < self._backoff_until:
+            return True
+        if self.rules.login_wedge_id_gate:
+            state = self.port.is_connected_by_id(self.config.user_id)
+            if state != 0:
+                self._track_reply_stuck(now, state)
+                return True
+            self._reply_stuck_since = None
         self._login_wedge_settle_at = None
         self._settle_before_stuck = False
         code = self.port.connect_reply(self.config.user_id)
@@ -819,13 +879,24 @@ class LinkStateMachine:
             self.port.enter_monitor()
         return True
 
+    def _terminal_degrade(self) -> bool:
+        """Login gave up. A later link callback must not clear this."""
+        return self.degraded_reason in ("login_failures", "api_update_required")
+
     def _recover_late_reply(self, now: datetime) -> bool:
         """OnComplete or IsConnectedByID==1 after degrade. No ConnectByID.
 
-        Clears degraded and the reply stuck clocks. ``entries_blocked``
-        stays set until both links are up and positions are reconciled.
+        OnComplete reconciles and clears degraded. ``IsConnectedByID``
+        is read on every degraded tick while the reply is not READY
+        (the 60s probe is ``IsConnected`` only). ``IsConnectedByID==1``
+        marks the reply up without reconciling: OnComplete has not
+        happened, so a reconcile here would be a lie. Entries stay
+        blocked. ``_honor_unreconciled`` degrades again if OnComplete
+        never arrives. ``login_failures`` and ``api_update_required``
+        stay degraded.
         """
-        del now
+        if self._terminal_degrade():
+            return False
         if self._pending_complete:
             if not self.rules.late_complete_without_reconnect:
                 self.port.connect_reply(self.config.user_id)
@@ -834,6 +905,7 @@ class LinkStateMachine:
             self._clear_reply_stuck_clocks()
             self.degraded = False
             self.degraded_reason = ""
+            self.alerts.append("RECOVERED: OnComplete; reply reconciled")
             return True
         if self.reply == LinkPhase.READY:
             return False
@@ -843,14 +915,43 @@ class LinkStateMachine:
         if not self.rules.connected_id_without_reconnect:
             self.port.connect_reply(self.config.user_id)
             return True
+        if not self.rules.id_up_waits_for_complete:
+            # Mutant: reconcile before OnComplete has been observed.
+            self.port.reconcile_positions()
+            return True
         self.reply = LinkPhase.READY
         self._reply_awaiting_complete = False
         self._reply_connect_started_at = None
         self._pending_complete = False
         self._clear_reply_stuck_clocks()
+        self._unreconciled_since = now
         self.degraded = False
         self.degraded_reason = ""
+        self.alerts.append(
+            "REPLY_UP unreconciled: entries blocked until OnComplete"
+        )
         return True
+
+    def _honor_unreconciled(self, now: datetime) -> None:
+        """READY without a reconcile cannot sit there silently.
+
+        OnComplete finishes the reconcile. If it never arrives, degrade
+        again once ``stuck_limit`` has passed so entries are not blocked
+        forever with no alert.
+        """
+        if self.reply != LinkPhase.READY or self.reply_reconciled:
+            return
+        if self._terminal_degrade():
+            return
+        if self._pending_complete:
+            self._finish_reply()
+            self._clear_reply_stuck_clocks()
+            return
+        if self._unreconciled_since is None:
+            return
+        waited = (now - self._unreconciled_since).total_seconds()
+        if waited >= self.config.stuck_limit_s:
+            self._degrade(now, "stuck")
 
     def _clear_reply_stuck_clocks(self) -> None:
         self._solace_down_at = None
