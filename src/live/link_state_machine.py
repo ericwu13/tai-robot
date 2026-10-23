@@ -95,6 +95,9 @@ class MachineRules:
     stuck_after_login_recovery: bool = True
     # Manual Reconnect restarts the stuck window instead of ConnectByID.
     manual_reconnect_clears_stuck: bool = True
+    # Reply still down, and no 3033/1108 clock is running: arm one.
+    # Do not ConnectByID while the previous rebuild has no OnComplete.
+    manual_reconnect_arms_reply_stuck: bool = True
 
 
 @dataclass
@@ -217,6 +220,16 @@ class LinkStateMachine:
 
         No LeaveMonitor, no Login, no process restart. The next
         ``tick`` follows the same gates as any other attempt.
+
+        If the reply link is still down, a stuck clock starts from
+        this press. ``_degrade`` has already dropped the disconnect
+        latch, and a ConnectByID that never saw OnComplete is still
+        in flight, so another ConnectByID is the re-call crash. The
+        same is true after the 1108 wedge: there is no
+        OnSolaceReplyDisconnect to authorize ConnectByID. When the
+        clock expires the machine degrades again (alert,
+        entries_blocked, probe) instead of leaving reply DOWN with
+        entries unblocked.
         """
         if not self.degraded:
             return
@@ -246,6 +259,7 @@ class LinkStateMachine:
             self._solace_down_at = now
         if self._down_without_reply_event_since is not None:
             self._down_without_reply_event_since = now
+        self._arm_reply_stuck_after_manual(now)
 
     def snapshot(self) -> dict:
         """State a later heartbeat can publish. This method writes nothing."""
@@ -699,6 +713,25 @@ class LinkStateMachine:
         self._reply_awaiting_complete = False
         self._reply_stuck_since = None
         self._down_without_reply_event_since = None
+
+    def _arm_reply_stuck_after_manual(self, now: datetime) -> None:
+        """Start a stuck clock when manual Reconnect leaves reply down.
+
+        A 3033 already restarted ``_solace_down_at``. A 1108 recovery
+        already has ``_down_without_reply_event_since`` (refreshed
+        above). Those two re-degrade on purpose: ConnectByID is not
+        legal yet. This covers the remaining case, a reply disconnect
+        or a first ConnectByID that degraded with no OnComplete.
+        """
+        if self.reply != LinkPhase.DOWN:
+            return
+        if self._saw_3033 or self._down_without_reply_event_since is not None:
+            return
+        if self.rules.manual_reconnect_arms_reply_stuck:
+            self._down_without_reply_event_since = now
+            return
+        # Mutant: ConnectByID while that rebuild is still in flight.
+        self.port.connect_reply(self.config.user_id)
 
     def _arm_stuck_if_links_down_without_reply_event(self, now: datetime) -> None:
         """3021 → EnterMonitor 1108 → login succeeded, reply still down.

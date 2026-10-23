@@ -773,6 +773,102 @@ class TestReedReview:
         assert fake.calls.count("ConnectByID") == connects
         assert "LeaveMonitor" not in fake.calls
 
+    def test_Y1_reply_disconnect_only_stuck_then_manual(self):
+        """Reply disconnect, ConnectByID, no OnComplete, then manual Reconnect.
+
+        The press must not leave reply DOWN with degraded clear and
+        entries unblocked. ConnectByID is still in flight, so the
+        machine re-arms the stuck clock and degrades again.
+        """
+        machine, fake, t = boot_ready()
+        t += timedelta(hours=1)
+        inject_reply_disconnect(machine, fake, t + timedelta(seconds=1))
+        t = pump(machine, fake, t + timedelta(seconds=1), 15)
+        assert machine.reply == LinkPhase.CONNECTING
+        t = pump(machine, fake, t, 400)
+        assert machine.degraded, machine.snapshot()
+        n_alerts = len(machine.alerts)
+        t += timedelta(seconds=30)
+        machine.manual_reconnect(t)
+        before = len(fake.calls)
+        connects = fake.calls.count("ConnectByID")
+        at(machine, fake, t)
+        assert not machine.degraded
+        assert fake.calls.count("ConnectByID") == connects
+        pump(machine, fake, t, 3600)
+        assert machine.degraded or machine.reply == LinkPhase.READY
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        assert machine.entries_blocked
+        assert machine.orders_paused
+        assert machine.reply == LinkPhase.DOWN
+        assert len(machine.alerts) > n_alerts
+        assert "entries blocked" in machine.alerts[-1]
+        assert fake.calls.count("ConnectByID") == connects
+        assert "ConnectByID" not in mutating(fake.calls[before:])
+        assert "LeaveMonitor" not in fake.calls
+        assert "RestartProcess" not in fake.calls
+
+    def test_X2_initial_reply_stuck_then_manual_reconnect(self):
+        """Boot ConnectByID never gets OnComplete. Manual Reconnect re-degrades."""
+        machine, fake = pair()
+        fake.set_now(T0)
+        machine.start(T0)
+        t = pump(machine, fake, T0, 310)
+        assert machine.degraded, machine.snapshot()
+        t += timedelta(seconds=5)
+        machine.manual_reconnect(t)
+        before = len(fake.calls)
+        connects = fake.calls.count("ConnectByID")
+        at(machine, fake, t)
+        assert not machine.degraded
+        pump(machine, fake, t, 3600)
+        assert machine.degraded or machine.reply == LinkPhase.READY
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        assert machine.entries_blocked
+        assert machine.reply == LinkPhase.DOWN
+        assert machine.alerts
+        assert fake.calls.count("ConnectByID") == connects
+        assert "ConnectByID" not in mutating(fake.calls[before:])
+        assert "LeaveMonitor" not in fake.calls
+        assert "RestartProcess" not in fake.calls
+
+    def test_1108_manual_reconnect_redegrades_without_rebuilding_reply(self):
+        """1108 wedge: manual Reconnect re-degrades at stuck_limit.
+
+        There is no OnSolaceReplyDisconnect, so ConnectByID stays
+        illegal. Re-degrade (alert, entries_blocked) is intentional.
+        """
+        cfg = LinkMachineConfig(stuck_limit_s=5)
+        machine, fake, t0 = boot_ready(cfg=cfg)
+        t = t0 + timedelta(hours=1)
+        inject_connection(machine, fake, KIND_CONN_ERROR, t)
+        fake.enter_codes = [1108]
+        fake.login_codes = [0]
+        t = pump(machine, fake, t, 30)
+        assert machine.degraded
+        assert machine.reply == LinkPhase.DOWN
+        connects = fake.calls.count("ConnectByID")
+        n_alerts = len(machine.alerts)
+        press = t + timedelta(seconds=1)
+        machine.manual_reconnect(press)
+        at(machine, fake, press)
+        assert not machine.degraded
+        assert fake.calls.count("ConnectByID") == connects
+        at(machine, fake, press + timedelta(seconds=4))
+        assert not machine.degraded
+        at(machine, fake, press + timedelta(seconds=5))
+        assert machine.degraded
+        assert machine.degraded_reason == "stuck"
+        assert machine.entries_blocked
+        assert machine.reply == LinkPhase.DOWN
+        assert machine.quote == LinkPhase.DOWN
+        assert len(machine.alerts) > n_alerts
+        assert fake.calls.count("ConnectByID") == connects
+        assert "LeaveMonitor" not in fake.calls
+        assert "RestartProcess" not in fake.calls
+
 
 # ── mutants: one per rule, each killed by its scenario ──────────────
 
@@ -894,6 +990,16 @@ def scenario_manual_clears_stuck(rules):
     machine.manual_reconnect(t + timedelta(seconds=6))
 
 
+def scenario_manual_arms_reply_stuck(rules):
+    cfg = LinkMachineConfig(stuck_limit_s=5)
+    machine, fake, t0 = boot_ready(rules, cfg)
+    t = t0 + timedelta(minutes=1)
+    inject_reply_disconnect(machine, fake, t)
+    at(machine, fake, t + timedelta(seconds=10))
+    at(machine, fake, t + timedelta(seconds=15))
+    machine.manual_reconnect(t + timedelta(seconds=16))
+
+
 # field, scenario, SimulatedAV match, rule the mutant deletes
 MUTANTS = [
     (
@@ -997,6 +1103,12 @@ MUTANTS = [
         scenario_manual_clears_stuck,
         "OnSolaceReplyDisconnect",
         "manual Reconnect clears the stuck window instead of ConnectByID",
+    ),
+    (
+        "manual_reconnect_arms_reply_stuck",
+        scenario_manual_arms_reply_stuck,
+        "re-called",
+        "reply still down after degrade: arm the stuck clock, do not ConnectByID again",
     ),
 ]
 
