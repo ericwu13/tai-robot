@@ -177,13 +177,30 @@ tai_backtest/
 
 ## Headless CLI (deploy bots without the GUI)
 
-`run_bot_cli.py` drives the **same** live-bot code as the workbench — it
+The headless CLI drives the **same** live-bot code as the workbench — it
 constructs `BacktestApp` on a hidden Tk window, so order handling, fill
 tracking, reconnects, session-end close and regime polling are identical to
-a GUI deploy. Only the dialogs are replaced by flags. Use it from scripts,
-scheduled tasks, or agents.
+a GUI deploy. Only the dialogs are replaced by flags.
+
+Two ways to invoke it. Source checkouts (oreopie) use `python run_bot_cli.py`.
+A packaged install has no Python on PATH: run `tai_backtest.exe <command>`
+from the folder that contains the EXE. The EXE routes
+`deploy|stop|list|status|strategies|backtest` to the CLI and exits with
+that command's code. No arguments, `-h`/`--help`, or an unknown first
+token opens the GUI (double-click is unchanged). v2.19.2 shipped the
+source CLI; that tag's note that headless "ships in this tag" did not
+route the release EXE. Headless from `tai_backtest.exe` starts with the
+cut that contains this packaging change.
 
 ```bash
+# --- packaged install (cmd / PowerShell, cd to the EXE folder) ---
+tai_backtest.exe strategies
+tai_backtest.exe list
+tai_backtest.exe status --symbol TMF00 --bot night1 --json
+tai_backtest.exe deploy --symbol TMF00 --bot night1 --strategy "H4 Bollinger Long" --mode paper --detach --wait-ready 240
+tai_backtest.exe stop --symbol TMF00 --bot night1 --wait 60
+
+# --- source checkout ---
 python run_bot_cli.py strategies                       # display names (incl. saved AI: ...)
 python run_bot_cli.py list                             # every data/live/{symbol}_{bot} + lock state
 python run_bot_cli.py status --symbol TMF00 --bot night1 --json
@@ -225,7 +242,10 @@ Notes:
   `data/live/{symbol}_{bot}/cli_stdout.log`) and, with `--wait-ready N`,
   returns `0` once the child owns the lock and logged `Tick subscription
   active`, the child's exit code if it died first, or `6` if it is still
-  starting after N seconds (the child keeps running).
+  starting after N seconds (the child keeps running). From the EXE the
+  child is `tai_backtest.exe <subcommand> …` (no `.py` argument). From
+  source it is `python run_bot_cli.py <subcommand> …`. Both use the same
+  `data/live` directory as the GUI, so `list`/`status` see either kind of bot.
 - Agents: the `deploy` skill (`.claude/skills/deploy`) wraps all of this
   with the safety gates (mode consent, not-already-running, strategy
   resolution, resume vs switch).

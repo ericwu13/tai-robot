@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +24,13 @@ from .session_store import load_session
 # order-confirm dialog — headless it would silently skip every real order,
 # which is worse than refusing.
 HEADLESS_MODES = ("paper", "auto")
+
+# Subcommands the release EXE routes to this CLI. An empty argv, -h/--help,
+# or any other first token stays on the GUI (run_backtest.main). Keep this
+# in lockstep with build_parser's subparsers — tests assert equality.
+CLI_COMMANDS = frozenset({
+    "deploy", "stop", "list", "status", "strategies", "backtest",
+})
 
 STOP_FILENAME = "STOP"
 
@@ -212,6 +220,36 @@ def strip_detach_args(argv: list[str]) -> list[str]:
     return out
 
 
+def route_argv(argv: list[str] | None) -> tuple[str, list[str]]:
+    """Choose the GUI workbench or the headless CLI from process argv.
+
+    Returns ``("gui"|"cli", argv)``. Empty argv, ``-h``/``--help`` with no
+    subcommand, and any unknown first token stay on the GUI so a
+    double-click and a mistyped launch keep today's workbench path. A
+    known subcommand is handed to ``run_bot_cli.main`` unchanged.
+    """
+    args = list(argv or [])
+    if not args or args[0] in ("-h", "--help") or args[0] not in CLI_COMMANDS:
+        return "gui", args
+    return "cli", args
+
+
+def child_command(raw_argv: list[str], *, frozen: bool,
+                  executable: str, script: str) -> list[str]:
+    """Argv for a ``deploy --detach`` child.
+
+    Frozen: ``[executable, subcommand, ...]`` with no ``.py`` token, so
+    the release EXE routes back into the CLI. Source: ``[executable,
+    script, subcommand, ...]`` (``python run_bot_cli.py ...``).
+    ``--detach`` / ``--wait-ready`` are stripped exactly once; stripping
+    an already-stripped argv is a no-op.
+    """
+    stripped = strip_detach_args(list(raw_argv))
+    if frozen:
+        return [executable, *stripped]
+    return [executable, script, *stripped]
+
+
 def spawn_detached(cmd: list[str], stdout_path: str, cwd: str | None = None):
     """Start ``cmd`` so it survives this process; stdout+stderr append to a file.
 
@@ -222,6 +260,12 @@ def spawn_detached(cmd: list[str], stdout_path: str, cwd: str | None = None):
     os.makedirs(os.path.dirname(stdout_path) or ".", exist_ok=True)
     kwargs: dict = {}
     if os.name == "nt":
+        # DETACHED_PROCESS: the child does not inherit or allocate a console,
+        # so a console=True EXE does not keep a window. CREATE_NO_WINDOW is
+        # mutually exclusive with DETACHED_PROCESS (CreateProcess fails if
+        # both are set) and is not combined here. stdout/stderr are the log
+        # file handle. Windows QA confirms whether a window still flashes;
+        # only that result would justify switching flags.
         kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
                                    | subprocess.CREATE_NEW_PROCESS_GROUP)
     else:
@@ -413,19 +457,44 @@ def bots_as_json(bots: list[BotInfo]) -> str:
 
 # ── Argument parser ──
 
+class _HeadlessArgumentParser(argparse.ArgumentParser):
+    """Name the GUI when ``--mode semi_auto`` is rejected.
+
+    ``choices`` stays paper/auto. The stock invalid-choice line does not
+    say where semi_auto belongs, so operators of the frozen EXE would
+    only see "choose from 'paper', 'auto'".
+    """
+
+    def error(self, message: str) -> None:
+        if "invalid choice" in message and "semi_auto" in message:
+            message += (
+                "; semi_auto needs the GUI workbench "
+                "(order-confirm dialog). Headless modes are paper and auto"
+            )
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="run_bot_cli.py",
+    prog = "tai_backtest.exe" if getattr(sys, "frozen", False) else "run_bot_cli.py"
+    p = _HeadlessArgumentParser(
+        prog=prog,
         description=("Headless tai-robot: deploy/stop live bots and run "
                      "backtests without the Tk workbench."),
+        epilog=("semi_auto is not available headless — use the GUI "
+                "workbench. Headless modes are paper and auto."),
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    d = sub.add_parser("deploy", help="deploy a live bot and run until stopped")
+    d = sub.add_parser(
+        "deploy",
+        help="deploy a live bot and run until stopped",
+        epilog=("semi_auto is not available headless — use the GUI "
+                "workbench for the order-confirm dialog."),
+    )
     d.add_argument("--symbol", required=True, help="e.g. TX00, MTX00, TMF00")
     d.add_argument("--bot", required=True, help="bot name (data/live/{symbol}_{bot})")
     d.add_argument("--mode", default="paper", choices=list(HEADLESS_MODES),
-                   help="trading mode (default paper)")
+                   help="paper or auto (default paper). semi_auto needs the GUI")
     d.add_argument("--strategy", default="",
                    help="strategy display name or unique substring; on resume, "
                         "overrides the saved strategy")

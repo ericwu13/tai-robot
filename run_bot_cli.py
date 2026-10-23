@@ -4,7 +4,7 @@ Runs the same live-bot machinery as run_backtest.py (the Tk workbench)
 on a hidden window, so nothing about order handling, fill tracking,
 reconnects or session-end close differs between a GUI bot and a CLI bot.
 
-Examples:
+Examples (source / oreopie):
   python run_bot_cli.py strategies
   python run_bot_cli.py deploy --symbol TMF00 --bot night1 --strategy "H4 Bollinger" --mode paper
   python run_bot_cli.py deploy --symbol TMF00 --bot regime1 --regime \\
@@ -13,6 +13,11 @@ Examples:
   python run_bot_cli.py list
   python run_bot_cli.py status --symbol TMF00 --bot night1 --json
   python run_bot_cli.py backtest --symbol TX00 --strategy "1m SMA" --start 20260101 --end 20260301
+
+Packaged EXE (no Python on PATH), from the install folder:
+  tai_backtest.exe list
+  tai_backtest.exe deploy --symbol TMF00 --bot night1 --strategy "H4 Bollinger" \\
+      --mode paper --detach --wait-ready 240
 
 Exit codes: 0 ok · 1 usage · 2 login/connection · 3 COM unavailable ·
 4 deploy refused · 5 bot stopped on its own · 6 timeout · 7 backtest failed.
@@ -31,22 +36,29 @@ if __name__ == "__main__":
 
 import time
 
-# Same sys.path setup as run_backtest.py so `import run_backtest` works
-# from any cwd.
-project_root = os.path.dirname(os.path.abspath(__file__))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# Same roots as the GUI (src.paths): frozen → EXE dir + _MEIPASS, source →
+# repo root. dirname(__file__) is inside the bundle when frozen and must
+# not be used for data/live, strategies, or the detach cwd.
+from src.paths import bundle_root, project_root
+
+for _path in (project_root(), bundle_root()):
+    if _path and _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from src.live.headless import (  # noqa: E402
     EXIT_BOT_STOPPED, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, HeadlessConfigError,
-    bot_info, bots_as_json, build_parser, cli_stdout_path, format_bot_table,
-    list_bots, parse_yyyymmdd, request_stop, spawn_detached, strip_detach_args,
+    bot_info, bots_as_json, build_parser, child_command, cli_stdout_path,
+    format_bot_table, list_bots, parse_yyyymmdd, request_stop, spawn_detached,
     tail_lines, wait_for_ready,
 )
 
 
 def _base_dir() -> str:
-    return os.path.join(project_root, "data", "live")
+    return os.path.join(project_root(), "data", "live")
+
+
+def _strategies_dir() -> str:
+    return os.path.join(project_root(), "strategies")
 
 
 def cmd_list(args) -> int:
@@ -72,8 +84,9 @@ def cmd_stop(args) -> int:
         return EXIT_USAGE
     path = request_stop(info.bot_dir)
     print(f"STOP requested for {args.symbol}_{args.bot} (PID {info.pid}): {path}")
-    print("note: only bots started by run_bot_cli.py poll the STOP file; "
-          "a GUI-deployed bot must be stopped from the workbench")
+    print("note: only headless bots (run_bot_cli.py, or tai_backtest.exe "
+          "<command>) poll the STOP file; a GUI-deployed bot must be "
+          "stopped from the workbench")
     if not args.wait:
         return EXIT_OK
     deadline = time.monotonic() + args.wait
@@ -89,7 +102,7 @@ def cmd_stop(args) -> int:
 def cmd_strategies(args) -> int:
     import run_backtest as rb
     from src.ai.strategy_store import StrategyStore
-    rb.load_saved_ai_strategies(StrategyStore(os.path.join(project_root, "strategies")))
+    rb.load_saved_ai_strategies(StrategyStore(_strategies_dir()))
     for name, cls in rb.STRATEGIES.items():
         note = "  (news-only, not a regime leg)" if name in rb.NEWS_ONLY_STRATEGIES else ""
         print(f"{name}    [type={cls.kline_type} min={cls.kline_minute}]{note}")
@@ -107,14 +120,25 @@ def launch_detached(args) -> int:
     """Re-run this deploy command as a detached child and (optionally) wait
     until it is live. The child owns the bot; this process only reports."""
     from src.live.live_runner import LiveRunner
+    root = project_root()
     bot_dir = LiveRunner.bot_dir_for(_base_dir(), args.symbol, args.bot)
     stdout_path = cli_stdout_path(bot_dir)
-    cmd = [sys.executable, os.path.abspath(__file__)] + strip_detach_args(args._raw_argv)
+    frozen = bool(getattr(sys, "frozen", False))
+    cmd = child_command(
+        args._raw_argv,
+        frozen=frozen,
+        executable=sys.executable,
+        script=os.path.abspath(__file__),
+    )
     os.makedirs(bot_dir, exist_ok=True)
     offset = os.path.getsize(stdout_path) if os.path.exists(stdout_path) else 0
-    proc = spawn_detached(cmd, stdout_path, cwd=project_root)
+    proc = spawn_detached(cmd, stdout_path, cwd=root)
     import subprocess
-    print(f"spawned PID {proc.pid}: run_bot_cli.py {subprocess.list2cmdline(cmd[2:])}")
+    if frozen:
+        shown = subprocess.list2cmdline(cmd)
+    else:
+        shown = "run_bot_cli.py " + subprocess.list2cmdline(cmd[2:])
+    print(f"spawned PID {proc.pid}: {shown}")
     print(f"stdout: {stdout_path}")
     if not args.wait_ready:
         return EXIT_OK

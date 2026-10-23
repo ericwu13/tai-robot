@@ -119,6 +119,17 @@ a = Analysis(
         'src.updater',
         # Tk workbench theme / widgets / labels (Phase 1 UI modernization)
         'src.ui', 'src.ui.theme', 'src.ui.widgets', 'src.ui.raster', 'src.ui.labels',
+        # Headless CLI (Option A). run_backtest.py imports these only after
+        # argv routing, so static analysis can miss them. Loose .py under
+        # _internal is not the import contract — these names are.
+        'run_bot_cli',
+        'src.paths',
+        'src.live.headless',
+        'src.live.headless_app',
+        'src.live.deploy_request',
+        'src.live.session_store',
+        # src.ai.strategy_store is listed with the AI modules above
+        # (cmd_strategies imports it lazily).
     ],
     hookspath=[],
     hooksconfig={},

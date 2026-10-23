@@ -7,7 +7,8 @@ Two backtest buttons:
 Multi-symbol support via SYMBOL_CONFIG (TX00, MTX00).
 
 Usage:
-  python run_backtest.py
+  python run_backtest.py                 # GUI workbench
+  python run_backtest.py list            # headless CLI (see run_bot_cli.py)
 """
 
 from version import APP_VERSION
@@ -42,15 +43,13 @@ from tkinter import ttk, filedialog, simpledialog, messagebox
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
-# Ensure src is importable — handle PyInstaller frozen EXE
-if getattr(sys, 'frozen', False):
-    # --onedir: EXE is in dist/tai_backtest/, _MEIPASS == EXE dir
-    # --onefile: EXE extracts to temp _MEI dir
-    bundle_root = sys._MEIPASS
-    project_root = os.path.dirname(sys.executable)
-else:
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    bundle_root = project_root
+# Ensure src is importable — handle PyInstaller frozen EXE.
+# The frozen check lives in src.paths so the GUI and the headless CLI
+# share one definition (install dir for data/live, _MEIPASS for the bundle).
+from src.paths import bundle_root as _bundle_root, project_root as _project_root
+
+project_root = _project_root()
+bundle_root = _bundle_root()
 
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -11067,4 +11066,14 @@ def main():
 
 if __name__ == "__main__":
     # freeze_support() already ran at the top of this module, before Tk.
+    # Spawn and grid-smoke already exited there. A CLI subcommand goes to
+    # run_bot_cli; anything else still here is the GUI.
+    from src.live.headless import route_argv
+    kind, routed = route_argv(sys.argv[1:])
+    if kind == "cli":
+        # Lazy: the GUI path must not import the CLI driver, and must not
+        # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
+        # that init (once) via run_bot_cli → headless_app._boot.
+        import run_bot_cli
+        sys.exit(run_bot_cli.main(routed))
     main()
