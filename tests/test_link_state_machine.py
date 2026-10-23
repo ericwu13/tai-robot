@@ -501,8 +501,9 @@ class TestReplays:
         assert fake.calls.count("EnterMonitorLONG") == 1
         machine.manual_reconnect(t0 + timedelta(seconds=125))
         assert not machine.degraded
-        assert not machine.entries_blocked
+        assert machine.entries_blocked
         at(machine, fake, t0 + timedelta(seconds=125))
+        assert machine.entries_blocked
         assert "LeaveMonitor" not in fake.calls
         assert fake.calls.count("LoginSetQuote") == 1
         assert fake.calls.count("EnterMonitorLONG") == 1
@@ -631,8 +632,9 @@ class TestReplays:
         assert fake.calls.count("IsConnected") == reads + 1
         assert fake.calls.count("LoginSetQuote") == 3
         machine.manual_reconnect(T0 + timedelta(seconds=70))
-        assert not machine.entries_blocked
+        assert machine.entries_blocked
         at(machine, fake, T0 + timedelta(seconds=70))
+        assert machine.entries_blocked
         assert machine.login == LoginPhase.LOGGED_IN
         assert fake.calls.count("LoginSetQuote") == 4
         assert "LeaveMonitor" not in fake.calls
@@ -647,7 +649,7 @@ class TestReplays:
         assert machine.degraded_reason == "api_update_required"
         assert machine.entries_blocked
         at(machine, fake, T0 + timedelta(seconds=30))
-        assert fake.calls == ["LoginSetQuote"]
+        assert mutating(fake.calls) == ["LoginSetQuote"]
         assert "RestartProcess" not in fake.calls
 
 
@@ -697,11 +699,12 @@ class TestReedReview:
         machine.manual_reconnect(press)
         at(machine, fake, press)
         assert not machine.degraded, "manual Reconnect re-degraded on the very next tick"
-        assert not machine.entries_blocked
+        assert machine.entries_blocked
         assert fake.calls.count("ConnectByID") == before
         assert "LeaveMonitor" not in fake.calls
         pump(machine, fake, press, 299)
         assert not machine.degraded
+        assert machine.entries_blocked
         at(machine, fake, press + timedelta(seconds=300))
         assert machine.degraded
         assert machine.degraded_reason == "stuck"
@@ -719,6 +722,18 @@ class TestReedReview:
             assert not machine.degraded, (i, machine.degraded_reason, machine.login_failures)
             assert machine.login == LoginPhase.LOGGED_IN, (i, machine.login)
             assert machine.login_failures == 0, (i, machine.login_failures)
+            if machine.reply == LinkPhase.CONNECTING:
+                inject_complete(machine, fake, t)
+                at(machine, fake, t)
+                entered = t + timedelta(seconds=1)
+                at(machine, fake, entered)
+                ready = entered + timedelta(seconds=1)
+                inject_connection(machine, fake, KIND_READY, ready)
+                at(machine, fake, ready)
+                t = ready
+            assert machine.reply == LinkPhase.READY
+            assert machine.quote == LinkPhase.READY
+            assert not machine.entries_blocked
 
     def test_E_slow_on_complete_no_second_connect_by_id(self):
         """OnComplete past 60s: one ConnectByID, then the late complete."""
@@ -760,7 +775,7 @@ class TestReedReview:
         assert machine.reply == LinkPhase.DOWN
         assert machine.alerts
         assert "manual Reconnect" in machine.alerts[-1]
-        assert fake.calls.count("ConnectByID") == connects
+        assert fake.calls.count("ConnectByID") == connects + 1
         assert fake.calls.count("EnterMonitorLONG") == enters + 1
         assert fake.calls.count("IsConnected") >= reads + 2
         assert "RestartProcess" not in fake.calls
@@ -769,8 +784,8 @@ class TestReedReview:
         machine.manual_reconnect(press)
         at(machine, fake, press)
         assert not machine.degraded
-        assert not machine.entries_blocked
-        assert fake.calls.count("ConnectByID") == connects
+        assert machine.entries_blocked
+        assert fake.calls.count("ConnectByID") == connects + 1
         assert "LeaveMonitor" not in fake.calls
 
     def test_Y1_reply_disconnect_only_stuck_then_manual(self):
@@ -834,39 +849,176 @@ class TestReedReview:
         assert "LeaveMonitor" not in fake.calls
         assert "RestartProcess" not in fake.calls
 
-    def test_1108_manual_reconnect_redegrades_without_rebuilding_reply(self):
-        """1108 wedge: manual Reconnect re-degrades at stuck_limit.
+    def test_1108_login_then_one_connect_after_settle(self):
+        """No OnSolaceReplyDisconnect: one settle, then one ConnectByID."""
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(hours=1)
+        inject_connection(machine, fake, KIND_CONN_ERROR, t)
+        fake.enter_codes = [1108]
+        fake.login_codes = [0]
+        connects = fake.calls.count("ConnectByID")
+        at(machine, fake, t + timedelta(seconds=5))
+        at(machine, fake, t + timedelta(seconds=6))
+        assert machine.login == LoginPhase.LOGGED_IN
+        assert machine.login_failures == 0
+        logged_in = t + timedelta(seconds=6)
+        at(machine, fake, logged_in + timedelta(seconds=9))
+        assert fake.calls.count("ConnectByID") == connects
+        at(machine, fake, logged_in + timedelta(seconds=10))
+        assert fake.calls.count("ConnectByID") == connects + 1
+        assert machine.reply == LinkPhase.CONNECTING
+        at(machine, fake, logged_in + timedelta(seconds=20))
+        assert fake.calls.count("ConnectByID") == connects + 1
+        assert "RestartProcess" not in fake.calls
+        assert "LeaveMonitor" not in fake.calls
 
-        There is no OnSolaceReplyDisconnect, so ConnectByID stays
-        illegal. Re-degrade (alert, entries_blocked) is intentional.
+    def test_1108_manual_reconnect_settles_then_one_connect(self):
+        """Manual Reconnect does not ConnectByID on the press.
+
+        Degrade during the post-login settle, then the press starts a
+        fresh settle and one ConnectByID. Entries stay blocked until
+        both links are up and positions are reconciled.
         """
-        cfg = LinkMachineConfig(stuck_limit_s=5)
+        cfg = LinkMachineConfig(stuck_limit_s=5, reply_settle_s=10)
         machine, fake, t0 = boot_ready(cfg=cfg)
         t = t0 + timedelta(hours=1)
         inject_connection(machine, fake, KIND_CONN_ERROR, t)
         fake.enter_codes = [1108]
         fake.login_codes = [0]
-        t = pump(machine, fake, t, 30)
-        assert machine.degraded
-        assert machine.reply == LinkPhase.DOWN
         connects = fake.calls.count("ConnectByID")
-        n_alerts = len(machine.alerts)
-        press = t + timedelta(seconds=1)
+        at(machine, fake, t + timedelta(seconds=5))
+        at(machine, fake, t + timedelta(seconds=6))
+        at(machine, fake, t + timedelta(seconds=11))
+        assert machine.degraded
+        assert fake.calls.count("ConnectByID") == connects
+        press = t + timedelta(seconds=11)
         machine.manual_reconnect(press)
         at(machine, fake, press)
         assert not machine.degraded
+        assert machine.entries_blocked
         assert fake.calls.count("ConnectByID") == connects
-        at(machine, fake, press + timedelta(seconds=4))
+        at(machine, fake, press + timedelta(seconds=9))
+        assert fake.calls.count("ConnectByID") == connects
+        assert machine.entries_blocked
+        at(machine, fake, press + timedelta(seconds=10))
+        assert fake.calls.count("ConnectByID") == connects + 1
+        assert machine.reply == LinkPhase.CONNECTING
+        assert machine.entries_blocked
+        done = press + timedelta(seconds=11)
+        inject_complete(machine, fake, done)
+        at(machine, fake, done)
+        assert machine.reply == LinkPhase.READY
+        assert machine.reply_reconciled
+        assert machine.entries_blocked
+        assert machine.quote != LinkPhase.READY
+        entered = done + timedelta(seconds=1)
+        at(machine, fake, entered)
+        assert machine.quote == LinkPhase.CONNECTING
+        assert machine.entries_blocked
+        ready = entered + timedelta(seconds=1)
+        inject_connection(machine, fake, KIND_READY, ready)
+        at(machine, fake, ready)
+        assert machine.quote == LinkPhase.READY
+        assert machine.reply == LinkPhase.READY
+        assert not machine.entries_blocked
         assert not machine.degraded
-        at(machine, fake, press + timedelta(seconds=5))
+        assert fake.calls.count("ConnectByID") == connects + 1
+        assert "RestartProcess" not in fake.calls
+        assert "LeaveMonitor" not in fake.calls
+
+    def test_late_on_complete_after_degrade_blocks_until_both_links(self):
+        """ConnectByID, degrade, late OnComplete. No second connect, no restart.
+
+        Entries stay blocked until the quote link is up and reconcile
+        has finished.
+        """
+        cfg = LinkMachineConfig(stuck_limit_s=5)
+        machine, fake, t0 = boot_ready(cfg=cfg)
+        t = t0 + timedelta(minutes=1)
+        inject_connection(machine, fake, KIND_SOLACE_DOWN, t)
+        inject_reply_disconnect(machine, fake, t)
+        at(machine, fake, t + timedelta(seconds=10))
+        connects = fake.calls.count("ConnectByID")
+        assert connects == fake.calls.count("ConnectByID")
+        at(machine, fake, t + timedelta(seconds=15))
         assert machine.degraded
-        assert machine.degraded_reason == "stuck"
         assert machine.entries_blocked
         assert machine.reply == LinkPhase.DOWN
-        assert machine.quote == LinkPhase.DOWN
-        assert len(machine.alerts) > n_alerts
+        late = t + timedelta(seconds=16)
+        inject_complete(machine, fake, late)
+        at(machine, fake, late)
+        assert machine.reply == LinkPhase.READY
+        assert machine.reply_reconciled
+        assert not machine.degraded
+        assert machine.entries_blocked
+        assert machine.quote != LinkPhase.READY
         assert fake.calls.count("ConnectByID") == connects
+        assert "RestartProcess" not in fake.calls
+        ready = late + timedelta(seconds=1)
+        inject_connection(machine, fake, KIND_READY, ready)
+        at(machine, fake, ready)
+        assert machine.quote == LinkPhase.READY
+        assert machine.reply == LinkPhase.READY
+        assert not machine.entries_blocked
+        assert fake.calls.count("ConnectByID") == connects
+        assert "RestartProcess" not in fake.calls
         assert "LeaveMonitor" not in fake.calls
+
+    def test_connected_id_already_up_after_degrade_no_connect(self):
+        """IsConnectedByID==1 after degrade marks reply up. No ConnectByID.
+
+        Reconcile has not run, so entries stay blocked.
+        """
+        cfg = LinkMachineConfig(stuck_limit_s=5)
+        machine, fake, t0 = boot_ready(cfg=cfg)
+        t = t0 + timedelta(minutes=1)
+        connects = fake.calls.count("ConnectByID")
+        inject_reply_disconnect(machine, fake, t)
+        fake.hold_reply_connected = True
+        fake.held_reply_state = 1
+        at(machine, fake, t + timedelta(seconds=10))
+        at(machine, fake, t + timedelta(seconds=15))
+        assert machine.degraded
+        assert machine.entries_blocked
+        at(machine, fake, t + timedelta(seconds=16))
+        assert machine.reply == LinkPhase.READY
+        assert not machine.degraded
+        assert not machine.reply_reconciled
+        assert machine.entries_blocked
+        assert fake.calls.count("ConnectByID") == connects
+        assert "RestartProcess" not in fake.calls
+        assert "LeaveMonitor" not in fake.calls
+
+    def test_manual_entries_blocked_until_both_up_and_reconciled(self):
+        """The fresh manual-Reconnect window keeps entries blocked.
+
+        The block clears only after both links are up and reconcile.
+        """
+        cfg = LinkMachineConfig(stuck_limit_s=30)
+        machine, fake, t0 = boot_ready(cfg=cfg)
+        t = t0 + timedelta(minutes=1)
+        inject_reply_disconnect(machine, fake, t)
+        at(machine, fake, t + timedelta(seconds=10))
+        connects = fake.calls.count("ConnectByID")
+        at(machine, fake, t + timedelta(seconds=40))
+        assert machine.degraded
+        assert machine.entries_blocked
+        press = t + timedelta(seconds=41)
+        machine.manual_reconnect(press)
+        for second in range(0, 20):
+            at(machine, fake, press + timedelta(seconds=second))
+            assert machine.entries_blocked, second
+            assert not machine.degraded, second
+            assert fake.calls.count("ConnectByID") == connects
+        late = press + timedelta(seconds=20)
+        inject_complete(machine, fake, late)
+        at(machine, fake, late)
+        assert machine.reply == LinkPhase.READY
+        assert machine.reply_reconciled
+        assert machine.quote == LinkPhase.READY
+        assert not machine.entries_blocked
+        assert not machine.degraded
+        assert fake.calls.count("ConnectByID") == connects
         assert "RestartProcess" not in fake.calls
 
 
@@ -1000,6 +1152,42 @@ def scenario_manual_arms_reply_stuck(rules):
     machine.manual_reconnect(t + timedelta(seconds=16))
 
 
+def scenario_late_complete(rules):
+    cfg = LinkMachineConfig(stuck_limit_s=5)
+    machine, fake, t0 = boot_ready(rules, cfg)
+    t = t0 + timedelta(minutes=1)
+    inject_reply_disconnect(machine, fake, t)
+    at(machine, fake, t + timedelta(seconds=10))
+    at(machine, fake, t + timedelta(seconds=15))
+    inject_complete(machine, fake, t + timedelta(seconds=16))
+    at(machine, fake, t + timedelta(seconds=16))
+
+
+def scenario_id_already_up(rules):
+    cfg = LinkMachineConfig(stuck_limit_s=5)
+    machine, fake, t0 = boot_ready(rules, cfg)
+    t = t0 + timedelta(minutes=1)
+    inject_reply_disconnect(machine, fake, t)
+    fake.hold_reply_connected = True
+    fake.held_reply_state = 1
+    at(machine, fake, t + timedelta(seconds=10))
+    at(machine, fake, t + timedelta(seconds=15))
+    at(machine, fake, t + timedelta(seconds=16))
+
+
+def scenario_manual_login_wedge(rules):
+    cfg = LinkMachineConfig(stuck_limit_s=5, reply_settle_s=10)
+    machine, fake, t0 = boot_ready(rules, cfg)
+    t = t0 + timedelta(hours=1)
+    inject_connection(machine, fake, KIND_CONN_ERROR, t)
+    fake.enter_codes = [1108]
+    fake.login_codes = [0]
+    at(machine, fake, t + timedelta(seconds=5))
+    at(machine, fake, t + timedelta(seconds=6))
+    at(machine, fake, t + timedelta(seconds=11))
+    machine.manual_reconnect(t + timedelta(seconds=11))
+
+
 # field, scenario, SimulatedAV match, rule the mutant deletes
 MUTANTS = [
     (
@@ -1095,8 +1283,8 @@ MUTANTS = [
     (
         "stuck_after_login_recovery",
         scenario_stuck_after_login,
-        "OnSolaceReplyDisconnect",
-        "3021 → 1108 → login OK with reply still down degrades; no ConnectByID",
+        "login recovery",
+        "3021 → 1108 → login OK waits out settle, then one ConnectByID",
     ),
     (
         "manual_reconnect_clears_stuck",
@@ -1109,6 +1297,24 @@ MUTANTS = [
         scenario_manual_arms_reply_stuck,
         "re-called",
         "reply still down after degrade: arm the stuck clock, do not ConnectByID again",
+    ),
+    (
+        "late_complete_without_reconnect",
+        scenario_late_complete,
+        "IsConnectedByID",
+        "late OnComplete after degrade marks reply up; no second ConnectByID",
+    ),
+    (
+        "connected_id_without_reconnect",
+        scenario_id_already_up,
+        "IsConnectedByID",
+        "IsConnectedByID==1 after degrade marks reply up; no ConnectByID",
+    ),
+    (
+        "manual_login_wedge_settles",
+        scenario_manual_login_wedge,
+        "login recovery",
+        "manual Reconnect on the 1108 wedge waits out settle, then one ConnectByID",
     ),
 ]
 

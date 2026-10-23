@@ -91,13 +91,20 @@ class MachineRules:
     reset_3033_episode: bool = True
     # One ConnectByID until OnComplete. No retry while that call is in flight.
     reply_connect_once_until_complete: bool = True
-    # 3021 → 1108 → login OK, with reply still down: degrade, do not wedge.
+    # 3021 → 1108 → login OK, reply still down, no disconnect event:
+    # one settle, then one ConnectByID. Mutant connects immediately.
     stuck_after_login_recovery: bool = True
     # Manual Reconnect restarts the stuck window instead of ConnectByID.
     manual_reconnect_clears_stuck: bool = True
     # Reply still down, and no 3033/1108 clock is running: arm one.
     # Do not ConnectByID while the previous rebuild has no OnComplete.
     manual_reconnect_arms_reply_stuck: bool = True
+    # Late OnComplete after degrade marks reply up. No second ConnectByID.
+    late_complete_without_reconnect: bool = True
+    # IsConnectedByID==1 after degrade marks reply up. No ConnectByID.
+    connected_id_without_reconnect: bool = True
+    # Manual Reconnect on the login wedge waits out settle, then one connect.
+    manual_login_wedge_settles: bool = True
 
 
 @dataclass
@@ -169,6 +176,8 @@ class LinkStateMachine:
     _last_probe_at: datetime | None = None
     _reply_awaiting_complete: bool = False
     _down_without_reply_event_since: datetime | None = None
+    _login_wedge_settle_at: datetime | None = None
+    _settle_before_stuck: bool = False
 
     # ── events: flags only ───────────────────────────────────────────
 
@@ -221,20 +230,15 @@ class LinkStateMachine:
         No LeaveMonitor, no Login, no process restart. The next
         ``tick`` follows the same gates as any other attempt.
 
-        If the reply link is still down, a stuck clock starts from
-        this press. ``_degrade`` has already dropped the disconnect
-        latch, and a ConnectByID that never saw OnComplete is still
-        in flight, so another ConnectByID is the re-call crash. The
-        same is true after the 1108 wedge: there is no
-        OnSolaceReplyDisconnect to authorize ConnectByID. When the
-        clock expires the machine degrades again (alert,
-        entries_blocked, probe) instead of leaving reply DOWN with
-        entries unblocked.
+        ``entries_blocked`` stays set until both links are up and
+        positions have been reconciled. A ConnectByID that is still
+        waiting for OnComplete is not sent again. The 1108 wedge,
+        which can miss OnSolaceReplyDisconnect, waits out the reply
+        settle from this press and then sends one ConnectByID.
         """
         if not self.degraded:
             return
         self.degraded = False
-        self.entries_blocked = False
         self.degraded_reason = ""
         self._quote_stuck_since = None
         self._reply_stuck_since = None
@@ -283,9 +287,16 @@ class LinkStateMachine:
         """
         if self._shut_down:
             return
+        self._tick_body(now)
+        if not self.degraded:
+            self._maybe_unblock_entries()
+
+    def _tick_body(self, now: datetime) -> None:
         if self.degraded:
-            self._probe(now)
-            return
+            self._drain(now)
+            if not self._recover_late_reply(now):
+                self._probe(now)
+                return
 
         self._drain(now)
         self._forbidden_reconnect_calls()
@@ -478,6 +489,12 @@ class LinkStateMachine:
             self._reply_awaiting_complete
             and self.rules.reply_connect_once_until_complete
         ):
+            if self._pending_complete:
+                self._finish_reply()
+                self._clear_reply_stuck_clocks()
+                return
+            self._maybe_stuck_waiting_for_reply_event(now)
+            self._maybe_stuck_after_login_recovery(now)
             return
         initial = (
             self.reply == LinkPhase.IDLE
@@ -486,6 +503,8 @@ class LinkStateMachine:
         )
         if not initial:
             if not self._saw_reply_disconnect or self._reply_down_at is None:
+                if self._login_wedge_connect(now):
+                    return
                 self._maybe_stuck_waiting_for_reply_event(now)
                 self._maybe_stuck_after_login_recovery(now)
                 return
@@ -550,6 +569,10 @@ class LinkStateMachine:
         self._pending_complete = False
         self._reply_connect_started_at = None
         self._reply_awaiting_complete = False
+        self._reply_stuck_since = None
+        self._down_without_reply_event_since = None
+        self._login_wedge_settle_at = None
+        self._settle_before_stuck = False
 
     def _maybe_stuck_waiting_for_reply_event(self, now: datetime) -> None:
         """3033 with no OnSolaceReplyDisconnect cannot move either link.
@@ -694,7 +717,9 @@ class LinkStateMachine:
         if self.rules.reset_3033_episode:
             self._saw_reply_disconnect = False
             self._reply_down_at = None
-            self._reply_awaiting_complete = False
+            # Keep _reply_awaiting_complete. The ConnectByID that just
+            # timed out is still in flight until OnComplete or a new
+            # 3033. Clearing it here is what sent a second ConnectByID.
             self._solace_down_at = None
         if not self.rules.degraded_instead_of_restart:
             # Mutant: relaunch the process instead of staying down.
@@ -715,38 +740,135 @@ class LinkStateMachine:
         self._down_without_reply_event_since = None
 
     def _arm_reply_stuck_after_manual(self, now: datetime) -> None:
-        """Start a stuck clock when manual Reconnect leaves reply down.
+        """Reply is down after the press. Arm a clock, and maybe a settle.
 
-        A 3033 already restarted ``_solace_down_at``. A 1108 recovery
-        already has ``_down_without_reply_event_since`` (refreshed
-        above). Those two re-degrade on purpose: ConnectByID is not
-        legal yet. This covers the remaining case, a reply disconnect
-        or a first ConnectByID that degraded with no OnComplete.
+        A 3033 already restarted ``_solace_down_at``. A ConnectByID that
+        is still waiting for OnComplete is not sent again. Otherwise
+        this is the login wedge: the disconnect event may have been
+        missed, so wait out the reply settle from this press, then one
+        ConnectByID. Not on the press itself.
         """
-        if self.reply != LinkPhase.DOWN:
+        if self.reply != LinkPhase.DOWN or self._saw_3033:
             return
-        if self._saw_3033 or self._down_without_reply_event_since is not None:
+        if (
+            self._reply_awaiting_complete
+            and self.rules.reply_connect_once_until_complete
+        ):
+            if self._down_without_reply_event_since is not None:
+                return
+            if self.rules.manual_reconnect_arms_reply_stuck:
+                self._down_without_reply_event_since = now
+                return
+            # Mutant: ConnectByID while that rebuild is still in flight.
+            self.port.connect_reply(self.config.user_id)
             return
-        if self.rules.manual_reconnect_arms_reply_stuck:
+        if self._down_without_reply_event_since is None:
             self._down_without_reply_event_since = now
+        if not self.rules.manual_login_wedge_settles:
+            # Mutant: ConnectByID on the button press, inside the settle.
+            self.port.connect_reply(self.config.user_id)
             return
-        # Mutant: ConnectByID while that rebuild is still in flight.
-        self.port.connect_reply(self.config.user_id)
+        self._login_wedge_settle_at = now
+        self._settle_before_stuck = True
 
     def _arm_stuck_if_links_down_without_reply_event(self, now: datetime) -> None:
         """3021 → EnterMonitor 1108 → login succeeded, reply still down.
 
-        There is no OnSolaceReplyDisconnect to settle, and ConnectByID
-        would be the call the fake faults on. Wait out stuck_limit, then
-        degrade: alert, block entries, probe, manual Reconnect.
+        OnSolaceReplyDisconnect can be missed while login is down. Arm
+        one reply settle, then one ConnectByID. Also arm the stuck
+        clock so a connect that never completes still degrades.
         """
         if self.reply != LinkPhase.DOWN or self._saw_reply_disconnect or self._saw_3033:
             return
         if self.rules.stuck_after_login_recovery:
+            if self._login_wedge_settle_at is None:
+                self._login_wedge_settle_at = now
             if self._down_without_reply_event_since is None:
                 self._down_without_reply_event_since = now
             return
         self.port.connect_reply(self.config.user_id)
+
+    def _login_wedge_connect(self, now: datetime) -> bool:
+        """Settle, then one ConnectByID, when the disconnect event was missed.
+
+        Returns True when this tick belongs to that wait or that call.
+        """
+        if self._login_wedge_settle_at is None or self._saw_3033:
+            return False
+        if self._saw_reply_disconnect and self._reply_down_at is not None:
+            return False
+        elapsed = (now - self._login_wedge_settle_at).total_seconds()
+        if elapsed < self.config.reply_settle_s:
+            # A manual press asked for this connect. Do not declare the
+            # link stuck before that one ConnectByID is sent.
+            if not self._settle_before_stuck:
+                self._maybe_stuck_after_login_recovery(now)
+                if self.degraded:
+                    return True
+            return True
+        self._login_wedge_settle_at = None
+        self._settle_before_stuck = False
+        code = self.port.connect_reply(self.config.user_id)
+        if not self._accept_link_code(code, now):
+            return True
+        self.reply = LinkPhase.CONNECTING
+        self._reply_connect_started_at = now
+        self._pending_complete = False
+        self._reply_awaiting_complete = True
+        if not self.rules.one_link_at_a_time:
+            self.port.enter_monitor()
+        return True
+
+    def _recover_late_reply(self, now: datetime) -> bool:
+        """OnComplete or IsConnectedByID==1 after degrade. No ConnectByID.
+
+        Clears degraded and the reply stuck clocks. ``entries_blocked``
+        stays set until both links are up and positions are reconciled.
+        """
+        del now
+        if self._pending_complete:
+            if not self.rules.late_complete_without_reconnect:
+                self.port.connect_reply(self.config.user_id)
+                return True
+            self._finish_reply()
+            self._clear_reply_stuck_clocks()
+            self.degraded = False
+            self.degraded_reason = ""
+            return True
+        if self.reply == LinkPhase.READY:
+            return False
+        state = self.port.is_connected_by_id(self.config.user_id)
+        if state != 1:
+            return False
+        if not self.rules.connected_id_without_reconnect:
+            self.port.connect_reply(self.config.user_id)
+            return True
+        self.reply = LinkPhase.READY
+        self._reply_awaiting_complete = False
+        self._reply_connect_started_at = None
+        self._pending_complete = False
+        self._clear_reply_stuck_clocks()
+        self.degraded = False
+        self.degraded_reason = ""
+        return True
+
+    def _clear_reply_stuck_clocks(self) -> None:
+        self._solace_down_at = None
+        self._down_without_reply_event_since = None
+        self._reply_stuck_since = None
+        self._login_wedge_settle_at = None
+        self._reply_down_at = None
+
+    def _maybe_unblock_entries(self) -> None:
+        """Drop the entry block only when both links are up and reconciled."""
+        if self.degraded:
+            return
+        if (
+            self.quote == LinkPhase.READY
+            and self.reply == LinkPhase.READY
+            and self.reply_reconciled
+        ):
+            self.entries_blocked = False
 
     def _maybe_stuck_after_login_recovery(self, now: datetime) -> None:
         if self._down_without_reply_event_since is None:

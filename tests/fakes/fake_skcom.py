@@ -76,6 +76,9 @@ class FakeSkcom:
         self.login_codes: list[int] = []
         self.connect_codes: list[int] = []
         self.enter_codes: list[int] = []
+        # Set when a not-logged-in recovery login succeeds. A missed
+        # OnSolaceReplyDisconnect may ConnectByID only after this settle.
+        self.login_wedge_at: datetime | None = None
 
     # ── clock / event scope ──────────────────────────────────────────
 
@@ -227,6 +230,8 @@ class FakeSkcom:
         code = self._pop(self.login_codes, 0)
         if code in (0, LOGIN_ALREADY):
             self.logged_in = True
+            if recovery:
+                self.login_wedge_at = self.now
             self.pending_login_recovery = False
             return code
         self.logged_in = False
@@ -302,12 +307,27 @@ class FakeSkcom:
                 "ConnectByID re-called while a reply rebuild is in flight"
             )
         if not self._initial_reply_connect():
-            if self.reply_disconnect_at is None and (
-                self.solace_session_down or self.reply_ever_connected
-            ):
+            if self.reply_disconnect_at is None and self.solace_session_down:
                 raise SimulatedAV(
                     "ConnectByID before OnSolaceReplyDisconnect"
                 )
+            if (
+                self.reply_disconnect_at is None
+                and self.reply_ever_connected
+            ):
+                # Login wedge can miss OnSolaceReplyDisconnect. One
+                # settle measured from the recovery login, then connect.
+                if self.login_wedge_at is None:
+                    raise SimulatedAV(
+                        "ConnectByID before OnSolaceReplyDisconnect"
+                    )
+                waited = (
+                    self._require_now() - self.login_wedge_at
+                ).total_seconds()
+                if waited < self.reply_settle_s:
+                    raise SimulatedAV(
+                        "ConnectByID within reply settle of login recovery"
+                    )
             if self.reply_disconnect_at is not None:
                 elapsed = (
                     self._require_now() - self.reply_disconnect_at
