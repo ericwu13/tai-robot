@@ -1,10 +1,11 @@
 """Pure quote/reply reconnect machine for issue #157.
 
-No Tk, no COM, no session clock. The host (P2, not this change) feeds
-events and a clock in, and performs the ``BrokerPort`` calls this
-machine returns to on ``tick``. Event methods only queue flags. Every
-SKCOM call happens from ``tick``, which does not sleep and does not
-block waiting for 3003 or OnComplete.
+No Tk, no COM, no session clock. The host feeds events and a clock in,
+and performs the ``BrokerPort`` calls this machine returns to on
+``tick``. Event methods only queue flags. Every SKCOM call happens
+from ``tick``, which does not sleep and does not block waiting for
+3003 or OnComplete. After the process-start login the host calls
+``adopt_after_process_login`` and does not call ``start``.
 
 Vendor rules used here (CapitalAPI 2.13.57):
 
@@ -252,6 +253,41 @@ class LinkStateMachine:
         self._started = True
         self._login_permitted = True
         self._attempt_login(now)
+
+    def adopt_after_process_login(self, now: datetime) -> None:
+        """Take over a process that already logged in and opened both links.
+
+        ``_do_login`` has already called LoginSetQuote, ConnectByID, and
+        EnterMonitorLONG. This does not call ``start`` and does not call
+        the port, so it does not log in again.
+
+        The state is what ``start`` plus those two link calls would have
+        left, without a second login:
+
+        * logged in, and a later ``start`` is a no-op
+        * a later 1xxx recovery may still log in
+        * quote CONNECTING (EnterMonitorLONG already issued, waiting for 3003)
+        * reply CONNECTING and awaiting OnComplete (ConnectByID already issued)
+
+        Entries stay paused until that OnComplete reconciles. If it never
+        arrives, the reply stays paused until ``stuck_limit`` and the
+        machine degrades. Recovery is ``manual_reconnect`` or an operator
+        restart. A second call does nothing: it must not restart that clock.
+        """
+        if self._shut_down or self._started:
+            return
+        self.login = LoginPhase.LOGGED_IN
+        self._started = True
+        self._login_permitted = True
+        self.quote = LinkPhase.CONNECTING
+        self._quote_connect_started_at = now
+        self.reply = LinkPhase.CONNECTING
+        self._reply_connect_started_at = now
+        self._reply_awaiting_complete = True
+        self._pending_complete = False
+        self.orders_paused = True
+        self.reply_reconciled = False
+        self.entries_blocked = False
 
     def shutdown(self, now: datetime) -> None:
         """User shutdown. The only ``LeaveMonitor`` call site.

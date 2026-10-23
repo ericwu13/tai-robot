@@ -25,6 +25,9 @@ class TradingGuard:
         self.fill_pending_type: str = ""  # "entry" or "exit"
         self.halted: bool = False
         self.halt_reason: str = ""
+        # Process-level link gate (#157 P2). Not cleared by reset(): a
+        # deploy must not reopen entries while the reply is unreconciled.
+        self.link_entries_blocked: bool = False
 
         # Deferred close (issue #50). When a TRADE_CLOSE is blocked by
         # BLOCK_FILL_PENDING, the decision is stored here. When
@@ -81,6 +84,8 @@ class TradingGuard:
 
         Returns (allowed, reason).
         """
+        if self.link_entries_blocked:
+            return False, "link down: entries blocked until reply reconcile"
         if self.paused:
             return False, f"daily loss limit reached ({self.daily_loss_limit:,} NTD)"
         return True, ""
@@ -229,6 +234,7 @@ class TradingGuard:
     CONFIRM_ENTRY = "confirm_entry"          # show dialog (semi-auto mode)
     BLOCK_FILL_PENDING = "block_fill_pending"  # waiting for prior fill
     BLOCK_HALTED = "block_halted"            # system halted after fill timeout
+    BLOCK_LINK = "block_link"                # quote/reply not reconciled (#157)
 
     def decide(self, trading_mode: str, action: str, side: str) -> tuple[str, dict]:
         """Decide what to do with a simulated fill.
@@ -276,7 +282,12 @@ class TradingGuard:
                     f"waiting for {self.fill_pending_type} fill confirmation")
                 return self.BLOCK_FILL_PENDING, details
 
-        # Entry: check daily loss limit
+        # Entry: link gate, then daily loss limit. Exits are not link-gated.
+        # FORCE_CLOSE and TRADE_CLOSE keep the #168/#171 policy.
+        if action == "ENTRY_FILL" and self.link_entries_blocked:
+            details["reason"] = "link down: entries blocked until reply reconcile"
+            return self.BLOCK_LINK, details
+
         if action == "ENTRY_FILL":
             allowed, reason = self.check_entry(trading_mode)
             if not allowed:

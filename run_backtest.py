@@ -107,6 +107,9 @@ from src.live.account_monitor import (
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
 )
 from src.live.connection_monitor import ConnectionMonitor
+from src.live.com_broker_port import ComBrokerPort
+from src.live.link_host import adopt_after_process_login
+from src.live.link_state_machine import KIND_CONN_ERROR
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
     RealFillTracker, parse_fulfill_report, match_fill_in_report,
@@ -876,6 +879,8 @@ class SKQuoteLibEvents:
             3033: "Abnormal — abnormal disconnect, triggering disconnect",
         }.get(nKind, f"unknown kind={nKind}")
         _ui_queue.put_nowait(("log_debug", f"[CONN] kind={nKind} {kind_label} code={nCode} — {meaning}"))
+        # Flag only. The main-thread drain calls the link machine. No SKCOM here.
+        _ui_queue.put_nowait(("link", ("connection", int(nKind), int(nCode))))
         if nKind == 3003 and nCode == 0:
             _ui_queue.put_nowait(("conn", "ready"))
         elif nKind == 3002 and nCode == 0:
@@ -945,7 +950,17 @@ class SKReplyLibEvent:
         _ui_queue.put_nowait(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
 
     def OnComplete(self, bstrUserID):
-        pass
+        del bstrUserID
+        _ui_queue.put_nowait((
+            "log_debug", "[CONN] OnComplete — reply backfill finished"))
+        _ui_queue.put_nowait(("link", ("complete",)))
+
+    def OnSolaceReplyDisconnect(self, bstrUserID):
+        """§4-3-h. Flag only — do not ConnectByID from this callback."""
+        del bstrUserID
+        _ui_queue.put_nowait(("log", "回報斷線 REPLY DISCONNECT"))
+        _ui_queue.put_nowait(("log_debug", "[CONN] OnSolaceReplyDisconnect"))
+        _ui_queue.put_nowait(("link", ("reply_disconnect",)))
 
     def OnNewData(self, bstrUserID, bstrData):
         # Real-time per-order report — the only per-fill price source in
@@ -1061,6 +1076,8 @@ class BacktestApp:
                 elif kind == "log_ui":
                     level, line = data
                     _route_to_log_widget(line, level)
+                elif kind == "link":
+                    self._apply_link_flag(data)
                 elif kind == "conn":
                     if data == "ready":
                         # Ready (3003) is the only state we treat as fully
@@ -1075,7 +1092,8 @@ class BacktestApp:
                         self.set_status("已連線 Connected - Ready", "ok")
                         self._set_conn_dot("ok")
                         self.login_status_var.set("已連線 Connected")
-                        self._on_reconnected()
+                        # Resubscribe is the machine's subscribe_quotes,
+                        # which runs on the following tick after 3003.
                     elif data == "quote":
                         # Bug A: Quote (3002) is intermediate, NOT fully
                         # connected. RequestTicks may return OK on a session
@@ -1085,7 +1103,7 @@ class BacktestApp:
                         self._set_conn_dot("warn")
                         self._on_quote_intermediate()
                     elif data == "disconnected":
-                        self._on_disconnected()
+                        self._on_disconnected(from_event=True)
                 elif kind == "account":
                     # Parse account data: "TF,branch,,account,..." format
                     parts = data.split(",") if isinstance(data, str) else []
@@ -1164,6 +1182,7 @@ class BacktestApp:
         runs on the main thread via root.after() and processes queued events.
         """
         self._process_ui_queue()
+        self._link_host_tick()
         self.root.after(100, self._drain_ui_queue)
 
     def set_status(self, msg, level: str = "info") -> None:
@@ -1326,12 +1345,10 @@ class BacktestApp:
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
         _log(
             "報價未就緒 Quote (3002) seen but Ready (3003) did not arrive "
-            f"after {waited:.0f}s — triggering reconnect")
+            f"after {waited:.0f}s — link machine keeps waiting (no re-login)")
         _log_debug(
-            f"[CONN] Ready (3003) timeout after {waited:.1f}s — forcing reconnect")
-        # Treat as a connection failure: kick the reconnect ladder so the
-        # GUI re-runs login+EnterMonitor cleanly instead of waiting forever.
-        self._on_disconnected()
+            f"[CONN] Ready (3003) timeout after {waited:.1f}s — "
+            "machine owns the wait; no LeaveMonitor")
 
     def _cancel_quote_ready_timer(self, reason: str) -> None:
         """Cancel the Quote→Ready watchdog timer if armed."""
@@ -1344,8 +1361,13 @@ class BacktestApp:
             self._quote_ready_timer_id = None
             self._quote_intermediate_seen_at = 0.0
 
-    def _on_disconnected(self):
-        """Handle connection loss: pause live feed, start auto-reconnect."""
+    def _on_disconnected(self, *, from_event: bool = False):
+        """Handle connection loss: pause the feed. The link machine reconnects.
+
+        ``from_event`` is an OnConnection 3021/3033 that was already queued.
+        The watchdog path is not, so it flags a quote-down for the machine.
+        Neither path calls LeaveMonitor or LoginSetQuote.
+        """
         if not self._quote_connected:
             _log_debug(
                 "[STATE] _on_disconnected called but _quote_connected already False — "
@@ -1356,7 +1378,15 @@ class BacktestApp:
         self.set_status("斷線 Disconnected", "error")
         self._set_conn_dot("err")
         self.login_status_var.set("斷線 Disconnected")
-        self.btn_login.config(state=tk.NORMAL)
+        # The process-start login stays. A second Login button press would
+        # call LoginSetQuote again. Reconnect is the machine's button.
+        if getattr(self, "_link_host", None) is None:
+            self.btn_login.config(state=tk.NORMAL)
+        else:
+            self.btn_login.config(state=tk.DISABLED)
+            if not from_event:
+                self._link_host.note_connection(
+                    KIND_CONN_ERROR, 0, _taipei_now())
         self.btn_reconnect.config(state=tk.NORMAL)
         _log("斷線 Connection lost")
 
@@ -1373,25 +1403,41 @@ class BacktestApp:
         self._schedule_reconnect()
 
     def _manual_reconnect(self):
-        """Manual reconnect triggered by user button click."""
-        # Cancel any pending auto-reconnect timer
+        """Manual Reconnect button. Calls the machine, then one tick.
+
+        While the machine is not DEGRADED, ``manual_reconnect`` is the
+        no-op the machine already defines (no second teardown). There is
+        no LeaveMonitor and no LoginSetQuote on this path.
+        """
         if self._reconnect_timer_id:
             self.root.after_cancel(self._reconnect_timer_id)
             self._reconnect_timer_id = None
         self._cancel_quote_ready_timer("manual_reconnect")
 
-        self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
         action = self._conn_monitor.on_manual_reconnect()
         self.set_status(action.message, "warn")
         self._set_conn_dot("warn")
         self.login_status_var.set("重連中 Reconnecting...")
-        _log("手動重連 Manual reconnect triggered")
+        _log("手動重連 Manual reconnect — link machine")
         _log_debug(
             "[STATE] ConnectionMonitor: is_active=True, attempt=0 "
             "(caller=_manual_reconnect)")
-
-        self._attempt_reconnect()
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            _log("手動重連 Manual reconnect: link machine not adopted yet")
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return
+        try:
+            alerts = host.manual_reconnect(_taipei_now())
+        except Exception as e:
+            _log(f"[RECONNECT] manual reconnect raised: [{type(e).__name__}] {e}")
+            alerts = []
+        self._apply_link_gate()
+        for alert in alerts:
+            self._on_link_alert(alert)
+        self._publish_link_heartbeat()
+        self.btn_reconnect.config(state=tk.NORMAL)
 
     def _schedule_reconnect(self):
         """Schedule the next reconnection attempt via ConnectionMonitor."""
@@ -1423,141 +1469,192 @@ class BacktestApp:
             return
 
     def _attempt_reconnect(self):
-        """Try to re-login and reconnect to quote service.
+        """One link-machine tick, scheduled by ConnectionMonitor for UI backoff.
 
-        Bug B: a teardown-and-login attempt calls
-        ``SKQuoteLib_LeaveMonitor()`` first (best-effort) so we start
-        from a clean COM state. ``SKCenterLib_LogOut`` is not called:
-        it is not in Capital API 2.13.57.
-        Otherwise login+EnterMonitor stacks on top of a broken session and
-        the server may reach Quote (3002) without ever sending Ready (3003)
-        — exactly the zombie pattern seen in bot session 0422.
+        The steady pump is ``_drain_ui_queue``. This method does not call
+        the broker. Process-start login stays in ``_do_login``.
         """
         self._reconnect_timer_id = None
-        attempt_n = self._conn_monitor.attempt + 1  # number we'll attempt now
-        if self._quote_connected:
+        host = getattr(self, "_link_host", None)
+        if host is None:
             _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} aborted — _quote_connected "
-                "is already True (likely reconnected via another path)")
-            return  # already reconnected (e.g. by manual login)
+                "[RECONNECT] tick skipped — link machine not adopted "
+                "(process-start login has not completed)")
+            return
+        _log_debug("[RECONNECT] link machine tick")
+        self._link_host_tick(force=True)
 
-        _log(f"嘗試重連 Attempting reconnect #{self._conn_monitor.attempt}")
+    def _sk_libs(self):
+        return skC, skQ, skR, skO
+
+    def _link_credentials(self) -> tuple[str, str]:
+        return (
+            self.login_user_var.get().strip(),
+            self.login_pass_var.get().strip(),
+        )
+
+    def _adopt_link_machine(self) -> None:
+        """One machine per process, after a successful ``_do_login``.
+
+        See ``adopt_after_process_login``. A second call is a no-op.
+        Flags that arrived before the machine existed are applied now.
+        """
+        if getattr(self, "_link_host", None) is not None:
+            return
+        user_id = self.login_user_var.get().strip()
+        self._link_host = adopt_after_process_login(
+            ComBrokerPort(
+                call=call_com,
+                libs=self._sk_libs,
+                credentials=self._link_credentials,
+                on_subscribe=self._on_reconnected,
+                on_reconcile=self._on_machine_reconcile,
+                on_release=self._on_machine_release_orders,
+                before_call=_log_reconnect_call,
+            ),
+            now=_taipei_now(),
+            user_id=user_id,
+        )
         _log_debug(
-            f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
-            "(cleanup) before fresh LoginSetQuote")
+            "[RECONNECT] link machine adopted after process-start login "
+            "(one per app process; start() not called)")
+        pending = list(getattr(self, "_link_flags_pending", []) or [])
+        self._link_flags_pending = []
+        for item in pending:
+            self._dispatch_link_flag(item)
 
+    def _apply_link_flag(self, data) -> None:
+        """Main thread. Queues a machine flag. No broker call."""
+        if getattr(self, "_link_host", None) is None:
+            self._link_flags_pending.append(data)
+            return
+        self._dispatch_link_flag(data)
+
+    def _dispatch_link_flag(self, data) -> None:
+        host = self._link_host
+        if host is None:
+            return
+        now = _taipei_now()
+        name = data[0] if data else ""
+        if name == "connection":
+            _name, kind, code = data
+            host.note_connection(int(kind), int(code), now)
+        elif name == "reply_disconnect":
+            host.note_reply_disconnect(now)
+        elif name == "complete":
+            host.note_complete(now)
+
+    def _link_host_tick(self, *, force: bool = False) -> None:
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        now = _taipei_now()
         try:
-            if not _com_available:
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} aborted — _com_available=False")
-                self._schedule_reconnect()
-                return
-
-            # Re-login
-            user_id = self.login_user_var.get().strip()
-            password = self.login_pass_var.get().strip()
-            if not user_id or not password:
-                _log("重連失敗 Reconnect failed: no credentials")
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} aborted — no credentials")
-                self._schedule_reconnect()
-                return
-
-            # ── Bug B: best-effort COM teardown before fresh login ──
-            # LeaveMonitor swallows errors — the prior session may already
-            # be half-torn-down. LogOut is not called: Capital API 2.13.57
-            # has no such method, and a call always raises AttributeError.
-            # Reply-link IsConnectedByID is not read here either. Pre-#158
-            # never fetched it, so logging it would be a new COM call.
-            _log_debug(
-                "[RECONNECT] LogOut not called — not in Capital API 2.13.57")
-            _log_reconnect_call("LeaveMonitor")
-            try:
-                leave_code = call_com("LeaveMonitor", skQ.SKQuoteLib_LeaveMonitor)
-                _log_debug(
-                    f"[RECONNECT] LeaveMonitor returned {leave_code}")
-            except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] LeaveMonitor raised (ignored): "
-                    f"[{type(e).__name__}] {e}")
-            self._logged_in = False
-            _log_debug(
-                f"[RECONNECT] Cleanup done — calling LoginSetQuote")
-
-            _log_reconnect_call("LoginSetQuote")
-            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
-                            user_id, password, "Y")
-            _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
-            if code != 0 and code < 2000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
-                _log(f"重連登入失敗 Reconnect login failed: {msg}")
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} FAILED at LoginSetQuote — "
-                    f"code={code} msg={msg}")
-                self._schedule_reconnect()
-                return
-
-            self._logged_in = True
-            _log_reconnect_call("ConnectByID")
-            reply_code = call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
-            _log_reconnect_call("EnterMonitorLONG")
-            enter_code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
-            _log_debug(
-                f"[RECONNECT] ConnectByID returned {reply_code}, "
-                f"EnterMonitorLONG returned {enter_code}")
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} waiting for Ready (3003)...")
-
-            # Poll for connection (OnConnection callback will set _quote_connected)
-            self.root.after(3000, self._check_reconnection)
-
+            alerts = host.tick(now) if force else host.maybe_tick(now)
         except Exception as e:
-            _log(f"重連異常 Reconnect error: {e}")
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} raised: "
-                f"[{type(e).__name__}] {e}")
-            self._schedule_reconnect()
+            _log(f"[RECONNECT] link machine tick raised: "
+                 f"[{type(e).__name__}] {e}")
+            return
+        self._apply_link_gate()
+        for alert in alerts:
+            self._on_link_alert(alert)
+        if alerts or force:
+            self._publish_link_heartbeat()
 
-    def _check_reconnection(self):
-        """Poll IsConnected after reconnect login attempt."""
-        attempt_n = self._conn_monitor.attempt
-        if self._quote_connected:
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} SUCCESS — Ready received "
-                "(handled by _on_reconnected via _drain_ui_queue)")
-            return  # success, handled by _on_reconnected via _drain_ui_queue
-        try:
-            _log_reconnect_call("IsConnected")
-            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
-            _log_debug(
-                f"[RECONNECT] IsConnected()={ic} after 3s poll "
-                f"(attempt #{attempt_n})")
-            if ic == 1:
-                self._set_quote_connected(True, "_check_reconnection(IsConnected==1)")
-                self.btn_api.config(state=tk.NORMAL)
-                self.btn_deploy.config(state=tk.NORMAL)
-                self.btn_login.config(state=tk.DISABLED)
-                self.btn_reconnect.config(state=tk.NORMAL)
-                self.set_status("已連線 Connected - Ready", "ok")
+    def _apply_link_gate(self) -> None:
+        host = getattr(self, "_link_host", None)
+        guard = getattr(self, "_trading_guard", None)
+        if host is None or guard is None:
+            return
+        allowed = host.entries_allowed()
+        guard.link_entries_blocked = not allowed
+        if allowed:
+            if getattr(self, "_link_gate_latched", False):
+                self._link_gate_latched = False
+                self.set_status("已連線 Connected — entries open", "ok")
                 self._set_conn_dot("ok")
-                self.login_status_var.set("已連線 Connected")
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} SUCCESS — "
-                    "IsConnected==1, fallback path")
-                self._on_reconnected()
-                return
+            return
+        if host.machine.degraded:
+            return
+        if not getattr(self, "_link_gate_latched", False):
+            self._link_gate_latched = True
+            self.set_status(
+                "進場暫停 Entries blocked until reply reconcile", "warn")
+            self._set_conn_dot("warn")
+
+    def _on_link_alert(self, alert: str) -> None:
+        _log(f"[RECONNECT] {alert}")
+        level = "error" if str(alert).startswith("DEGRADED") else "warn"
+        self.set_status(alert, level)
+        if str(alert).startswith("DEGRADED"):
+            self._set_conn_dot("err")
+            if hasattr(self, "login_status_var"):
+                self.login_status_var.set("降級 DEGRADED — 手動重連")
+            if hasattr(self, "btn_reconnect"):
+                self.btn_reconnect.config(state=tk.NORMAL)
+            timer = getattr(self, "_reconnect_timer_id", None)
+            if timer is not None:
+                try:
+                    self.root.after_cancel(timer)
+                except Exception:
+                    pass
+                self._reconnect_timer_id = None
+        if _discord is not None and _discord.enabled:
+            try:
+                _discord.notify(f"⚠️ {alert}")
+            except Exception as e:
+                _log(f"[RECONNECT] discord alert failed: [{type(e).__name__}] {e}")
+
+    def _on_machine_reconcile(self) -> None:
+        """Refresh open interest. The machine clears the gate in this tick.
+
+        The OnOpenInterest callback is async. The entry gate follows the
+        machine (OnComplete + this call), not that later callback.
+        """
+        if not _com_available or skO is None:
+            return
+        user_id = self.login_user_var.get().strip()
+        account = getattr(self, "_futures_account", "") or ""
+        if not user_id or not account:
+            _log_debug("[RECONNECT] reconcile skipped — no futures account yet")
+            return
+        try:
+            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                     user_id, account, 1)
+        except Exception as e:
+            _log(f"[RECONNECT] reconcile raised: [{type(e).__name__}] {e}")
+
+    def _on_machine_release_orders(self) -> None:
+        _log_debug("[RECONNECT] orders released after OnComplete reconcile")
+
+    def _publish_link_heartbeat(self) -> None:
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        from src.live.main_heartbeat import set_link_state
+        try:
+            set_link_state(host.snapshot())
         except Exception as e:
             _log_debug(
-                f"[RECONNECT] IsConnected() raised (ignored): "
-                f"[{type(e).__name__}] {e}")
-        # Not connected yet — schedule next reconnect attempt
-        _log_debug(
-            f"[RECONNECT] Attempt #{attempt_n} FAILED — timed out waiting "
-            f"for Ready after 3s, scheduling next attempt")
-        self._schedule_reconnect()
+                f"[RECONNECT] link heartbeat skipped: [{type(e).__name__}] {e}")
+
+    def _shutdown_link(self) -> None:
+        """User shutdown. The only LeaveMonitor the live host asks for."""
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        try:
+            host.shutdown(_taipei_now())
+        except Exception as e:
+            _log(f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
+        self._link_host = None
 
     def _on_reconnected(self):
-        """Handle successful reconnection: re-subscribe ticks if live bot is running."""
+        """Resubscribe after the machine has seen quote READY (3003).
+
+        Called from ``ComBrokerPort.subscribe_quotes`` only. The 3003 UI
+        branch updates buttons and does not subscribe by itself.
+        """
         self._conn_monitor.on_connected()
         _log_debug(
             "[STATE] ConnectionMonitor: is_active=False, attempt=0 "
@@ -1711,6 +1808,10 @@ class BacktestApp:
         # Reconnection state
         self._conn_monitor = ConnectionMonitor()
         self._reconnect_timer_id = None
+        # One link machine per app process. None until _do_login succeeds.
+        self._link_host = None
+        self._link_flags_pending: list = []
+        self._link_gate_latched = False
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
         self._quote_ready_timer_id = None
         self._quote_intermediate_seen_at: float = 0.0
@@ -3101,8 +3202,9 @@ class BacktestApp:
             pass
 
     def _on_closing(self):
-        """Handle window close: auto-save chat, then destroy."""
+        """Handle window close: auto-save chat, drop the quote link, destroy."""
         self._auto_save_chat()
+        self._shutdown_link()
         self.root.destroy()
 
     # ══════════════════════════════════════════════════════════════
@@ -3413,6 +3515,7 @@ class BacktestApp:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
 
             self.set_status("連線中 Connecting...")
+            self._adopt_link_machine()
             self.root.after(3000, self._check_connection)
 
         except Exception as e:
@@ -8213,6 +8316,13 @@ class BacktestApp:
                     f"延遲平倉已儲存 Deferred close stored: {action}", "status")
             return
 
+        if verdict == guard.BLOCK_LINK:
+            self._live_log_msg(
+                f"實單暫停 Link blocked: {details['reason']}", "status")
+            self._live_runner.log_blocked_signal(
+                action, side, price, "LINK_ENTRIES_BLOCKED", details["reason"])
+            return
+
         if verdict == guard.BLOCK_ENTRY:
             self._live_log_msg(
                 f"實單暫停 Order blocked: {details['reason']}", "status")
@@ -9356,6 +9466,7 @@ class BacktestApp:
         self._heartbeat_after_id = None
         if not getattr(self, "_heartbeat_active", False):
             return
+        self._publish_link_heartbeat()
         try:
             tick()
         except Exception as e:

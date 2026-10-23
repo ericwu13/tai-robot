@@ -285,6 +285,8 @@ class HeartbeatWriter:
     def __init__(self, bot_dir: str):
         self.bot_dir = bot_dir
         self._inflight: dict | None = None
+        # Optional #157 link snapshot. None keeps the historical payload.
+        self.link_state: dict | None = None
         # Set by start() when the first write fails for a reason other
         # than MainThreadHeartbeatError. The writer is still installed.
         self.initial_write_error: BaseException | None = None
@@ -305,6 +307,8 @@ class HeartbeatWriter:
             "pid": os.getpid(),
             "inflight_com_call": self._inflight,
         }
+        if self.link_state is not None:
+            payload["link"] = self.link_state
         atomic_write_json(self.path, payload)
         _publish_snapshot(self.path, payload)
 
@@ -672,6 +676,19 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
                 bot_dir, hung_s=hung_s, inflight_hung_s=inflight_hung_s,
                 poll_s=poll_s, alert_fn=alert_fn)
     return writer
+
+
+def set_link_state(state: dict | None) -> None:
+    """Publish the link-machine snapshot on the next heartbeat write.
+
+    Main-thread callers only. ``None`` leaves the key off the file, which
+    is the pre-#157 payload. The watchdog reads ``ts`` and
+    ``inflight_com_call`` and ignores this key.
+    """
+    writer = _writer
+    if writer is None:
+        return
+    writer.link_state = None if state is None else dict(state)
 
 
 def tick() -> None:

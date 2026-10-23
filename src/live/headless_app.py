@@ -277,11 +277,21 @@ class DeployDriver(_Driver):
             self._last_heartbeat = time.monotonic()
             try:
                 st = app._live_runner.get_status()
+                link = ""
+                host = getattr(app, "_link_host", None)
+                if host is not None:
+                    snap = host.snapshot()
+                    link = (
+                        f" link={snap['quote']}/{snap['reply']}"
+                        f" degraded={snap['degraded']}"
+                        f" entries_blocked={snap['entries_blocked']}"
+                    )
                 rb._log(f"[HEADLESS] heartbeat: state={st['state']} pos={st['position']} "
                         f"trades={st['trades']} pnl={st['pnl']:+,} "
                         f"bars={st['bars_1m']}/{st['bars_agg']} "
                         f"market={'open' if st['market_open'] else 'closed'} "
-                        f"mode={app._trading_mode} connected={app._quote_connected}")
+                        f"mode={app._trading_mode} connected={app._quote_connected}"
+                        f"{link}")
             except Exception as e:
                 rb._log(f"[HEADLESS] heartbeat failed: {e}")
         self.root.after(self.POLL_MS, self._poll)
@@ -386,6 +396,10 @@ def run_backtest(args) -> int:
 
 
 def _teardown(app: HeadlessBotApp) -> None:
+    try:
+        app._shutdown_link()
+    except Exception:
+        pass
     try:
         app.root.destroy()
     except Exception:

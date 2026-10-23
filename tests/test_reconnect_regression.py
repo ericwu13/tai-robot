@@ -11,10 +11,9 @@ Bugs covered:
   must only fire on Ready (3003), and a Quote (3002) without a follow-up
   Ready must schedule a watchdog timer.
 
-* **Bug B** — no COM teardown before re-login. ``_attempt_reconnect``
-  must call ``SKQuoteLib_LeaveMonitor`` before the fresh
-  ``LoginSetQuote``. ``SKCenterLib_LogOut`` is not called: it is not in
-  Capital API 2.13.57.
+* **Bug B** — superseded by #157 P2. The 0422 "cleanup" LeaveMonitor +
+  LoginSetQuote sequence is the crash. ``_attempt_reconnect`` must not
+  call it. ``SKCenterLib_LogOut`` stays absent (not in Capital API 2.13.57).
 
 * **Bug C** — watchdog "warn" handler bypasses the resubscribe/reconnect
   ladder. The handler must require TWO consecutive bad ``IsConnected()``
@@ -103,7 +102,8 @@ class TestBugA_QuoteIsIntermediate:
 # Bug B — clean COM state before re-login
 # ---------------------------------------------------------------------------
 
-class TestBugB_CleanupBeforeRelogin:
+class TestBugB_NoTeardownOnReconnect:
+    """#157 P2. The old LeaveMonitor-then-login body is the crash sequence."""
 
     def _attempt_reconnect_body(self, rb_source: str) -> str:
         match = re.search(
@@ -114,44 +114,38 @@ class TestBugB_CleanupBeforeRelogin:
         assert match, "could not locate _attempt_reconnect body"
         return match.group(1)
 
-    def test_leave_monitor_called_before_login(self, rb_source: str):
+    def test_reconnect_does_not_leave_or_login(self, rb_source: str):
         body = self._attempt_reconnect_body(rb_source)
-        # Call sites only — the docstring also names these functions.
-        leave_pos = body.find("skQ.SKQuoteLib_LeaveMonitor")
-        login_pos = body.find("skC.SKCenterLib_LoginSetQuote")
-        assert leave_pos != -1, (
-            "Bug B: _attempt_reconnect must call SKQuoteLib_LeaveMonitor "
-            "to tear down the prior COM session before re-login.")
-        assert login_pos != -1, "LoginSetQuote unexpectedly removed"
-        assert leave_pos < login_pos, (
-            "Bug B: LeaveMonitor must happen BEFORE LoginSetQuote.")
+        for forbidden in (
+            "SKQuoteLib_LeaveMonitor",
+            "SKCenterLib_LoginSetQuote",
+            "SKCenterLib_LogOut",
+            'call_com("LeaveMonitor"',
+            'call_com("LoginSetQuote"',
+            'call_com("LogOut"',
+            "SKQuoteLib_EnterMonitorLONG",
+            "SKReplyLib_ConnectByID",
+        ):
+            assert forbidden not in body, forbidden
+        assert "_link_host_tick" in body
 
     def test_logout_is_not_called(self, rb_source: str):
-        """LogOut is absent. Capital API 2.13.57 has no such method.
-
-        The pre-#158 path called it unconditionally. That call is the
-        one intentional difference from the old sequence: it always
-        raised AttributeError. No hasattr guard, and no call.
-        """
+        """LogOut is absent from the reconnect body. 2.13.57 has no such method."""
         body = self._attempt_reconnect_body(rb_source)
-        assert "skC.SKCenterLib_LogOut" not in body
-        assert 'call_com(\n                "LogOut"' not in body
+        assert "SKCenterLib_LogOut" not in body
         assert 'call_com("LogOut"' not in body
-        assert "SKCenterLib_LoginSetQuote" in body
 
-    def test_cleanup_calls_swallow_errors(self, rb_source: str):
-        """LeaveMonitor must be best-effort — a prior session may already
-        be half-torn-down. LogOut is not part of the sequence."""
-        body = self._attempt_reconnect_body(rb_source)
-        pat = (
-            r"try:\s*\n[^\n]*SKQuoteLib_LeaveMonitor[^\n]*\n"
-            r"(?:[^\n]*\n){0,5}\s*except"
+    def test_process_start_login_remains(self, rb_source: str):
+        """The one LoginSetQuote stays on the process-start path."""
+        match = re.search(
+            r"def _do_login\(self.*?(?=\n    def )",
+            rb_source,
+            re.DOTALL,
         )
-        assert re.search(pat, body), (
-            "Bug B: SKQuoteLib_LeaveMonitor must be wrapped in try/except "
-            "so a partial tear-down does not abort the reconnect attempt.")
-        assert "skC.SKCenterLib_LogOut" not in body
-        assert 'call_com("LogOut"' not in body
+        assert match, "could not locate _do_login"
+        body = match.group(0)
+        assert "SKCenterLib_LoginSetQuote" in body
+        assert "_adopt_link_machine" in body
 
 
 # ---------------------------------------------------------------------------
@@ -320,25 +314,12 @@ class TestKeptReconnectDiagnostics:
         )
         assert match
         body = match.group(1)
-        for name in (
-            "LeaveMonitor",
-            "LoginSetQuote",
-            "ConnectByID",
-            "EnterMonitorLONG",
-        ):
-            assert f'_log_reconnect_call("{name}")' in body, name
-        # The #158 pre-decide probe was a new IsConnected call. It stays out.
-        assert '_log_reconnect_call("IsConnected")' not in body
+        # The broker calls moved into ComBrokerPort. The reconnect body
+        # only ticks the machine, so it does not log a call of its own.
+        assert "_log_reconnect_call(" not in body
         assert "SKQuoteLib_IsConnected" not in body
         assert "SKReplyLib_IsConnectedByID" not in body
-        check = re.search(
-            r"def _check_reconnection\(self\):(.*?)\n    def ",
-            rb_source,
-            re.DOTALL,
-        )
-        assert check
-        # This IsConnected is the pre-#158 poll. Log it; do not add another.
-        assert '_log_reconnect_call("IsConnected")' in check.group(1)
+        assert "def _check_reconnection(" not in rb_source
 
     def test_duration_line_is_installed_on_call_com(self, rb_source: str):
         assert "def _log_com_return(" in rb_source

@@ -490,8 +490,10 @@ def test_send_future_order_stamps_inflight(tmp_path, monkeypatch):
     assert seen.get("name") == "SendFutureOrderCLR"
 
 
-def test_check_reconnection_stamps_is_connected(tmp_path, monkeypatch):
-    """The reconnect probe wraps IsConnected. Unwrapping it leaves no stamp."""
+def test_is_connected_probe_is_stamped(tmp_path):
+    """The machine's IsConnected probe goes through call_com."""
+    from src.live.com_broker_port import ComBrokerPort
+
     bot_dir = str(tmp_path / "bot")
     os.makedirs(bot_dir, exist_ok=True)
     writer = hb.HeartbeatWriter(bot_dir)
@@ -505,25 +507,26 @@ def test_check_reconnection_stamps_is_connected(tmp_path, monkeypatch):
         seen["name"] = inflight.get("name")
         return 0
 
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(
-        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
-    app = _app(bot_dir)
-    app._quote_connected = False
-    app._conn_monitor = SimpleNamespace(attempt=1)
-    scheduled = []
-    app._schedule_reconnect = lambda: scheduled.append(True)
+    port = ComBrokerPort(
+        call=hb.call_com,
+        libs=lambda: (None, SimpleNamespace(SKQuoteLib_IsConnected=is_connected), None, None),
+        credentials=lambda: ("user", "secret"),
+        on_subscribe=lambda: None,
+        on_reconcile=lambda: None,
+        on_release=lambda: None,
+    )
     try:
-        app._check_reconnection()
+        assert port.is_connected() == 0
     finally:
         hb._writer = None
         _cleanup()
     assert seen.get("name") == "IsConnected"
-    assert scheduled == [True]
 
 
-def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):
-    """Behavior, not a source grep: inflight name during the COM call."""
+def test_leave_monitor_is_stamped_on_shutdown(tmp_path):
+    """User shutdown stamps LeaveMonitor. Reconnect does not call it."""
+    from src.live.com_broker_port import ComBrokerPort
+
     bot_dir = str(tmp_path / "bot")
     os.makedirs(bot_dir, exist_ok=True)
     writer = hb.HeartbeatWriter(bot_dir)
@@ -537,26 +540,21 @@ def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):
         seen["name"] = inflight.get("name")
         return 0
 
-    skq = SimpleNamespace(
-        SKQuoteLib_LeaveMonitor=leave,
-        SKQuoteLib_EnterMonitorLONG=lambda: 0,
+    port = ComBrokerPort(
+        call=hb.call_com,
+        libs=lambda: (
+            None,
+            SimpleNamespace(SKQuoteLib_LeaveMonitor=leave),
+            None,
+            None,
+        ),
+        credentials=lambda: ("user", "secret"),
+        on_subscribe=lambda: None,
+        on_reconcile=lambda: None,
+        on_release=lambda: None,
     )
-    skc = SimpleNamespace(
-        SKCenterLib_LogOut=lambda _user: 0,
-        SKCenterLib_LoginSetQuote=lambda *_a: 0,
-        SKCenterLib_GetReturnCodeMessage=lambda _code: "",
-    )
-    skr = SimpleNamespace(SKReplyLib_ConnectByID=lambda _user: 0)
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(rb, "skQ", skq)
-    monkeypatch.setattr(rb, "skC", skc)
-    monkeypatch.setattr(rb, "skR", skr)
-    app = _app(bot_dir)
-    app._conn_monitor = SimpleNamespace(attempt=0, reset=lambda: None)
-    app.login_user_var = _Var("user")
-    app.login_pass_var = _Var("secret")
     try:
-        app._attempt_reconnect()
+        assert port.leave_monitor() == 0
     finally:
         hb._writer = None
         _cleanup()
