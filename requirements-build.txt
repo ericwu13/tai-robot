@@ -1,8 +1,11 @@
-# Build toolchain for tai_backtest.exe. build_release.py installs this file
-# before it runs PyInstaller, unless --no-install is passed.
+# Build toolchain for tai_backtest.exe. build_release.py does not install
+# this file unless --install-build-deps is passed. --no-install is accepted
+# and is a no-op (not installing is already the default).
 #
-# Use a dedicated build virtualenv. Installing this file into a dev or
-# live venv can downgrade comtypes there.
+# Prefer a dedicated build virtualenv (.venv-build). --install-build-deps
+# uses that interpreter when it exists. Otherwise it warns and names the
+# active interpreter before installing there, which can downgrade comtypes
+# in a dev or live venv.
 #
 # The runtime hook is the real startup fix. The comtypes 1.4.15 wheel
 # (and 1.4.17) does not ship comtypes/gen/, so `import comtypes.gen`

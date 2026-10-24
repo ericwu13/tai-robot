@@ -127,8 +127,10 @@ def test_requirements_build_pins_known_good_toolchain():
     assert "pyinstaller-hooks-contrib" in text
     assert "not pinned" in text
     readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "--install-build-deps" in readme
     assert "--no-install" in readme
-    assert "dedicated build virtualenv" in readme
+    assert "does **not** pip-install" in readme
+    assert ".venv-build" in readme
     assert "does not ship a `comtypes/gen/`" in readme
 
 
@@ -226,67 +228,101 @@ def test_ensure_build_requirements_exits_when_still_wrong(tmp_path):
         )
 
 
-def test_build_no_install_skips_pip(monkeypatch, capsys):
-    order = []
-
-    def fake_ensure(root):
-        order.append("ensure")
-
-    def fake_warn(root):
-        order.append("warn")
-        print("Not installing requirements-build.txt (--no-install).")
-        return {}
-
-    def fake_strategies(root):
-        order.append("strategies")
-        return []
+def _record_subprocess(monkeypatch):
+    calls = []
 
     def fake_run(cmd, cwd=None):
-        order.append("pyinstaller")
+        calls.append(list(cmd))
         return types.SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(build_release, "ensure_build_requirements", fake_ensure)
-    monkeypatch.setattr(build_release, "warn_build_requirements", fake_warn)
-    monkeypatch.setattr(build_release, "strategies_datas", fake_strategies)
     monkeypatch.setattr(build_release.subprocess, "run", fake_run)
-
-    build_release.build(install_requirements=False)
-
-    assert order == ["warn", "strategies", "pyinstaller"]
-    assert "--no-install" in capsys.readouterr().out
+    monkeypatch.setattr(build_release, "strategies_datas", lambda root: [])
+    return calls
 
 
-def test_main_wires_no_install_flag():
+def test_build_default_never_calls_pip(monkeypatch):
+    calls = _record_subprocess(monkeypatch)
+
+    def boom(*_a, **_k):
+        raise AssertionError("default build must not install")
+
+    monkeypatch.setattr(build_release, "ensure_build_requirements", boom)
+    build_release.build()
+    assert calls
+    assert all("pip" not in part for cmd in calls for part in cmd)
+    assert calls[0][1:3] == ["-m", "PyInstaller"]
+
+
+def test_build_install_build_deps_calls_pip(monkeypatch):
+    calls = _record_subprocess(monkeypatch)
+    versions = {}
+
+    def version_of(name):
+        return versions.get(name)
+
+    def fake_run(cmd, cwd=None):
+        calls.append(list(cmd))
+        if "pip" in cmd:
+            versions["PyInstaller"] = "6.19.0"
+            versions["comtypes"] = "1.4.15"
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build_release.subprocess, "run", fake_run)
+    monkeypatch.setattr(build_release, "_installed_version", version_of)
+    monkeypatch.setattr(build_release, "_dedicated_build_python", lambda root: None)
+
+    build_release.build(install_requirements=True)
+
+    pip_cmds = [cmd for cmd in calls if "pip" in cmd]
+    assert len(pip_cmds) == 1
+    assert pip_cmds[0][0] == sys.executable
+    assert pip_cmds[0][1:4] == ["-m", "pip", "install"]
+    assert pip_cmds[0][-1].endswith("requirements-build.txt")
+    pyinstaller = [cmd for cmd in calls if "PyInstaller" in cmd]
+    assert pyinstaller and pyinstaller[0][0] == sys.executable
+
+
+def test_install_opt_in_prefers_venv_build_python(monkeypatch, tmp_path, capsys):
+    py = tmp_path / ".venv-build" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("", encoding="utf-8")
+    chosen = build_release._python_for_install(str(tmp_path))
+    assert chosen == str(py)
+    out = capsys.readouterr().out
+    assert "dedicated venv" in out
+    assert str(py) in out
+
+
+def test_install_opt_in_warns_with_active_interpreter(tmp_path, capsys):
+    chosen = build_release._python_for_install(str(tmp_path))
+    assert chosen == sys.executable
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert sys.executable in out
+    assert "comtypes" in out
+
+
+def test_no_install_is_a_noop_and_does_not_cancel_opt_in():
+    assert build_release.resolve_install_request(
+        install_build_deps=False, no_install=False,
+    ) is False
+    assert build_release.resolve_install_request(
+        install_build_deps=False, no_install=True,
+    ) is False
+    assert build_release.resolve_install_request(
+        install_build_deps=True, no_install=False,
+    ) is True
+    assert build_release.resolve_install_request(
+        install_build_deps=True, no_install=True,
+    ) is True
+
+
+def test_main_wires_install_flags():
     import inspect
     src = inspect.getsource(build_release.main)
+    assert '"--install-build-deps"' in src
     assert '"--no-install"' in src
-    assert "install_requirements=not args.no_install" in src
-
-
-def test_build_installs_pins_and_stages_strategies_before_pyinstaller(monkeypatch):
-    order = []
-
-    def fake_ensure(root):
-        order.append(("ensure", root))
-
-    def fake_strategies(root):
-        order.append(("strategies", root))
-        return []
-
-    def fake_run(cmd, cwd=None):
-        order.append(("pyinstaller", list(cmd), cwd))
-        return types.SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(build_release, "ensure_build_requirements", fake_ensure)
-    monkeypatch.setattr(build_release, "strategies_datas", fake_strategies)
-    monkeypatch.setattr(build_release.subprocess, "run", fake_run)
-
-    build_release.build()
-
-    assert [step[0] for step in order] == ["ensure", "strategies", "pyinstaller"]
-    cmd = order[2][1]
-    assert cmd[:3] == [sys.executable, "-m", "PyInstaller"]
-    assert "tai_backtest.spec" in cmd
+    assert "resolve_install_request(" in src
 
 
 # ── runtime hook (Linux, comtypes mocked) ───────────────────────────

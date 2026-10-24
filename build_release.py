@@ -1,16 +1,19 @@
 """Build and package tai_backtest EXE for release.
 
 Usage:
-    python build_release.py          # build + zip
+    python build_release.py          # build + zip; does not pip-install
     python build_release.py --skip-build  # zip only (reuse existing dist/)
     python build_release.py --allow-dirty # permit uncommitted source
-    python build_release.py --skip-release --no-install
-        # build without pip-installing requirements-build.txt
+    python build_release.py --skip-release
+        # build + zip only. Does not pip-install (the default).
+    python build_release.py --skip-release --install-build-deps
+        # also pip-install requirements-build.txt. Prefers .venv-build.
 
-Use a dedicated build virtualenv. The default path installs
-``requirements-build.txt`` into the active environment, which can
-downgrade ``comtypes`` in a dev or live venv. ``--no-install`` skips
-that pip install.
+The default never runs pip. ``--no-install`` is accepted and changes
+nothing. ``--install-build-deps`` is the opt-in. It installs into
+``.venv-build`` when that interpreter exists; otherwise it warns and
+names the active interpreter before installing there. That can
+downgrade ``comtypes`` in a dev or live venv.
 
 Build-integrity guard (added after the v2.13.0 mismatch, where the
 published EXE was built from a checkout lacking the regime code):
@@ -270,15 +273,19 @@ def unsatisfied_pins(
 
 def ensure_build_requirements(
     project_root: str | None = None, *, runner=None, version_of=None,
+    python: str | None = None,
 ) -> dict[str, str]:
     """Install ``requirements-build.txt`` when the environment doesn't match.
 
-    ``runner`` and ``version_of`` exist so tests can avoid pip and the
-    real environment. ``runner`` is called like ``subprocess.run(cmd)``.
+    ``python`` is the interpreter that receives the packages (default:
+    this process). ``runner`` and ``version_of`` exist so tests can avoid
+    pip and the real environment. ``runner`` is called like
+    ``subprocess.run(cmd)``.
     """
     root = os.path.abspath(
         project_root or os.path.dirname(os.path.abspath(__file__)) or "."
     )
+    py = python or sys.executable
     req_path = os.path.join(root, BUILD_REQUIREMENTS)
     with open(req_path, encoding="utf-8") as fh:
         pins = parse_pinned_requirements(fh.read())
@@ -294,8 +301,9 @@ def ensure_build_requirements(
         if name in bad:
             have = bad[name] or "not installed"
             print(f"  {name}: want {want}, have {have}")
-    cmd = [sys.executable, "-m", "pip", "install", "-r", req_path]
-    print(f"Installing pinned build dependencies from {BUILD_REQUIREMENTS}")
+    cmd = [py, "-m", "pip", "install", "-r", req_path]
+    print(f"Installing pinned build dependencies with {py}")
+    print(f"  {' '.join(cmd)}")
     run = runner or subprocess.run
     result = run(cmd)
     if getattr(result, "returncode", 1) != 0:
@@ -313,15 +321,17 @@ def ensure_build_requirements(
 def warn_build_requirements(project_root: str) -> dict[str, str | None]:
     """Report pin drift without running pip.
 
-    Used by ``--no-install``. Returns the unsatisfied pins (empty when
-    the active environment already matches).
+    Used by the default build (and the ``--no-install`` no-op). Returns
+    the unsatisfied pins (empty when the active environment already
+    matches). Does not run pip.
     """
     root = os.path.abspath(project_root or ".")
     req_path = os.path.join(root, BUILD_REQUIREMENTS)
     with open(req_path, encoding="utf-8") as fh:
         pins = parse_pinned_requirements(fh.read())
     bad = unsatisfied_pins(pins, _installed_version)
-    print(f"Not installing {BUILD_REQUIREMENTS} (--no-install).")
+    print(f"Not installing {BUILD_REQUIREMENTS} "
+          f"(default; pass --install-build-deps to opt in).")
     if not bad:
         listed = ", ".join(f"{name}=={ver}" for name, ver in pins.items())
         print(f"Build dependencies OK ({listed})")
@@ -335,16 +345,64 @@ def warn_build_requirements(project_root: str) -> dict[str, str | None]:
     return bad
 
 
-def build(*, install_requirements: bool = True):
+def _dedicated_build_python(project_root: str) -> str | None:
+    """Return ``.venv-build``'s interpreter when that venv exists."""
+    root = os.path.abspath(project_root or ".")
+    candidates = [
+        os.path.join(root, ".venv-build", "Scripts", "python.exe"),
+        os.path.join(root, ".venv-build", "bin", "python"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _python_for_install(project_root: str) -> str:
+    """Interpreter that ``--install-build-deps`` should pip into.
+
+    Prefers ``.venv-build``. Otherwise warns and returns this process's
+    interpreter, by full path, so the operator can see the target.
+    """
+    dedicated = _dedicated_build_python(project_root)
+    if dedicated:
+        print(f"Installing build dependencies into dedicated venv: {dedicated}")
+        return dedicated
+    print("WARNING: --install-build-deps will pip-install into this interpreter:")
+    print(f"  {sys.executable}")
+    print("That can downgrade comtypes in a dev or live venv.")
+    print("Prefer a dedicated build venv and re-run with its python:")
+    print("  python -m venv .venv-build")
+    print("  .venv-build/bin/python build_release.py --skip-release --install-build-deps")
+    print("  Windows: .venv-build\\Scripts\\python build_release.py --skip-release --install-build-deps")
+    return sys.executable
+
+
+def resolve_install_request(*, install_build_deps: bool, no_install: bool) -> bool:
+    """Whether this invocation should pip-install.
+
+    The default is no. ``--no-install`` is accepted and does not change
+    that. ``--install-build-deps`` is the only opt-in; the no-op alias
+    does not cancel it.
+    """
+    if install_build_deps and no_install:
+        print("NOTE: --no-install is a no-op and does not cancel "
+              "--install-build-deps.")
+    return bool(install_build_deps)
+
+
+def build(*, install_requirements: bool = False):
     print(f"=== Building tai_backtest v{VERSION} ===")
     root = os.path.dirname(os.path.abspath(__file__)) or "."
+    py = sys.executable
     if install_requirements:
-        ensure_build_requirements(root)
+        py = _python_for_install(root)
+        ensure_build_requirements(root, python=py)
     else:
         warn_build_requirements(root)
     strategies_datas(root)
     result = subprocess.run(
-        [sys.executable, "-m", "PyInstaller", "tai_backtest.spec", "--noconfirm"],
+        [py, "-m", "PyInstaller", "tai_backtest.spec", "--noconfirm"],
         cwd=root,
     )
     if result.returncode != 0:
@@ -611,11 +669,15 @@ def main():
                         help="Permit packaging with uncommitted source changes")
     parser.add_argument("--skip-release", action="store_true",
                         help="Skip GitHub release creation (build + package only)")
+    parser.add_argument("--install-build-deps", action="store_true",
+                        help="pip-install requirements-build.txt before "
+                             "PyInstaller. Uses .venv-build when that "
+                             "interpreter exists; otherwise installs into "
+                             "the active interpreter and prints its path. "
+                             "Can downgrade comtypes in a dev or live venv.")
     parser.add_argument("--no-install", action="store_true",
-                        help="Do not pip-install requirements-build.txt into "
-                             "the active environment. Use a dedicated build "
-                             "venv for a normal build so comtypes is not "
-                             "downgraded in a dev or live venv.")
+                        help="Accepted no-op. The build does not pip-install "
+                             "unless --install-build-deps is also set.")
     parser.add_argument("--notify-only", action="store_true",
                         help="Skip build/package, just send Discord notification")
     parser.add_argument("--force-notify", action="store_true",
@@ -643,7 +705,10 @@ def main():
         notes_file = verify_release_notes()
 
     if not args.skip_build:
-        build(install_requirements=not args.no_install)
+        build(install_requirements=resolve_install_request(
+            install_build_deps=args.install_build_deps,
+            no_install=args.no_install,
+        ))
 
     # Guard: the packaged binary must match the committed source. This is
     # the check that would have prevented the v2.13.0 stale-EXE ship.

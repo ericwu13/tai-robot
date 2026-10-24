@@ -55,24 +55,27 @@ The app can be packaged as a standalone Windows EXE using PyInstaller (--onedir 
 
 ### Build Steps
 
-Use a dedicated build virtualenv. `build_release.py` installs `requirements-build.txt` into the **active** environment, which can downgrade `comtypes` in a dev or live venv. `.venv-build/` is gitignored.
+`build_release.py` does **not** pip-install into the active interpreter. A normal build uses whatever PyInstaller and comtypes that interpreter already has. `--no-install` is accepted and does the same thing. `--skip-release` builds and zips only (no GitHub release, no Discord).
 
 ```bash
-python -m venv .venv-build
-# Windows: .venv-build\Scripts\activate
-# POSIX:   source .venv-build/bin/activate
 python build_release.py --skip-release
 ```
 
-`--skip-release` builds and zips only (no GitHub release, no Discord). `--no-install` skips the pip install and builds with whatever is already in the active environment:
+To install `requirements-build.txt`, pass `--install-build-deps`. Prefer a dedicated build venv (`.venv-build/`, gitignored) so comtypes is not downgraded in a dev or live venv. When `.venv-build` exists, that flag installs into its interpreter and runs PyInstaller with it. Otherwise it prints a warning naming the active interpreter (`sys.executable`) and installs there.
 
 ```bash
-python build_release.py --skip-release --no-install
+python -m venv .venv-build
+# POSIX
+.venv-build/bin/python build_release.py --skip-release --install-build-deps
+# Windows
+.venv-build\Scripts\python build_release.py --skip-release --install-build-deps
 ```
 
 `requirements-build.txt` pins `PyInstaller==6.19.0` and `comtypes==1.4.15`. Those pins are secondary. The comtypes 1.4.15 wheel does not ship a `comtypes/gen/` package (1.4.17 does not either), so `import comtypes.gen` fails until the runtime hook creates it. That hook is the startup fix. `pyinstaller-hooks-contrib` is not pinned: PyInstaller 6.19.0 requires `pyinstaller-hooks-contrib>=2026.0`, and pip may install any newer release that satisfies that. No specific hooks-contrib version was recorded with the Windows smoke.
 
-Direct invocation, from the same dedicated venv, after the pins are installed:
+The #194 Windows checklist (`docs/testing/grid_subprocess_windows_checklist.md` on that branch) installs the pins with its own `pip install` inside `C:\tai-test-194\src\.venv`, then runs `python build_release.py --skip-release`. That command does not pip-install. The empty `src\strategies` and `strategies` directories in that checklist are for the commit it checks out, which predates this spec.
+
+Direct invocation, after the pins are installed in the interpreter you intend to build with:
 
 ```bash
 pip install -r requirements-build.txt
@@ -93,7 +96,7 @@ Output: `dist/tai_backtest/tai_backtest.exe`
 | File | Purpose |
 |------|---------|
 | `requirements-build.txt` | Pinned PyInstaller and comtypes for the EXE build |
-| `build_release.py` | Installs those pins, runs the spec, zips the dist |
+| `build_release.py` | Runs the spec and zips the dist. Does not pip-install unless `--install-build-deps` |
 | `tai_backtest.spec` | PyInstaller build specification (--onedir mode) |
 | `runtime_hook_comtypes.py` | Runtime hook for writable comtypes.gen cache |
 
