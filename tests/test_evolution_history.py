@@ -224,13 +224,19 @@ def test_pass_run_records_each_gate_reason(tmp_path):
 
 
 def test_relative_fail_stores_relative_reasons(tmp_path):
+    from src.evolution.trial_penalty import TrialEvidence
     cfg = evolution_gate_config_from_mapping({"paper_gate": "relative"})
     gate = resolve_promotion_gate("paper", "relative", "absolute")
     window = EvolutionVerdict(False, ["window held ✗"])
+    # A missing trial falls back to the absolute gate, which stores no
+    # relative reasons. A supplied trial stays on the relative path.
     assembled = assemble_promotion_verdict(
         gate=gate, gate_cfg=cfg, folds=[],
         base_trades=[], cand_trades=[],
         holdout_start="", criteria=None, window_verdict=window,
+        trial=TrialEvidence(
+            dsr=0.0, pbo=1.0, n_trials=8, n_eff=8.0,
+            rho_bar=0.0, partitions=8),
     )
     assert assembled.relative_verdict is not None
     assert assembled.window_verdict is window
