@@ -925,3 +925,115 @@ def test_offthread_queue_does_not_clobber_main_thread_stamp(tmp_path):
             thread.join(timeout=5)
         hb._writer = None
         hb._reset_offthread_stamps()
+
+
+def _heartbeat(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_drain_publishes_oldest_overlapping_stamp(tmp_path):
+    """Two open worker calls: the drain keeps the older inflight name.
+
+    Mutation: ``snapshot[-1]`` (newest) publishes ``RequestTicks`` and
+    this assertion fails.
+    """
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write(now=1.0)
+    hb._writer = writer
+    hb._reset_offthread_stamps()
+    older_in = threading.Event()
+    newer_in = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def older():
+        older_in.set()
+        assert release.wait(timeout=5)
+        return "old"
+
+    def newer():
+        newer_in.set()
+        assert release.wait(timeout=5)
+        return "new"
+
+    def run(name, fn):
+        try:
+            hb.call_com(name, fn)
+        except BaseException:
+            errors.append(traceback.format_exc())
+
+    older_thread = threading.Thread(
+        target=run, args=("RequestStockList", older), name="reconnect-worker")
+    newer_thread = threading.Thread(
+        target=run, args=("RequestTicks", newer), name="reconnect-worker-2")
+    try:
+        older_thread.start()
+        assert older_in.wait(timeout=2)
+        newer_thread.start()
+        assert newer_in.wait(timeout=2)
+        with hb._stamp_lock:
+            queued = [item["name"] for item in hb._stamp_stack]
+        assert queued == ["RequestStockList", "RequestTicks"]
+        hb.drain_queued_stamps()
+        inflight = _heartbeat(tmp_path / "heartbeat.json").get(
+            "inflight_com_call") or {}
+        assert inflight.get("name") == "RequestStockList", (
+            "drain published the newest queued stamp")
+    finally:
+        release.set()
+        older_thread.join(timeout=5)
+        newer_thread.join(timeout=5)
+        hb._writer = None
+        hb._reset_offthread_stamps()
+    assert errors == []
+    assert older_thread.is_alive() is False
+    assert newer_thread.is_alive() is False
+
+
+def test_main_call_com_republishes_open_worker_stamp(tmp_path):
+    """A finished main-thread call_com puts an open worker stamp back.
+
+    The file is read when ``call_com`` returns. Nothing calls ``tick`` or
+    ``drain_queued_stamps`` after that. Removing the drain at the end of
+    main-thread ``call_com`` leaves ``inflight_com_call`` cleared.
+    """
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write(now=1.0)
+    hb._writer = writer
+    hb._reset_offthread_stamps()
+    entered = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def worker_fn():
+        entered.set()
+        assert release.wait(timeout=5)
+        return 0
+
+    def run():
+        try:
+            hb.call_com("RequestStockList", worker_fn)
+        except BaseException:
+            errors.append(traceback.format_exc())
+
+    thread = threading.Thread(target=run, name="reconnect-worker")
+    try:
+        thread.start()
+        assert entered.wait(timeout=2)
+        hb.drain_queued_stamps()
+        published = _heartbeat(tmp_path / "heartbeat.json")
+        assert (published.get("inflight_com_call") or {}).get("name") == (
+            "RequestStockList")
+        assert hb.call_com("IsConnected", lambda: 1) == 1
+        restored = _heartbeat(tmp_path / "heartbeat.json")
+        assert (restored.get("inflight_com_call") or {}).get("name") == (
+            "RequestStockList"), (
+            "main-thread call_com cleared the worker stamp and did not "
+            "drain it back")
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        hb._writer = None
+        hb._reset_offthread_stamps()
+    assert errors == []
+    assert thread.is_alive() is False
