@@ -71,9 +71,6 @@ DIST_DIR = os.path.join("dist", "tai_backtest")
 ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 
 # Tracked paths whose uncommitted state would make the build untraceable.
-# Keep run_bot_cli.py, tai_backtest.spec, and the comtypes runtime hook
-# when merging #195's build_release.py (that branch does not list them).
-# Do not drop #195's requirements-build.txt wiring that follows this list.
 SOURCE_PATHS = [
     "src", "run_backtest.py", "run_bot_cli.py", "tai_backtest.spec",
     "runtime_hook_comtypes.py", "version.py",

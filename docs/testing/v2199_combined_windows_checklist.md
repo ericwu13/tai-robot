@@ -121,6 +121,29 @@ Pass, only after Eric's go-ahead: exit code 0, and the detached child
 a live password you were not told to use, or if any process outside
 `C:\tai-test-177\` changes.
 
+`deploy --detach` must not open a console window. While `cli177` is
+still running, record the child (the process under `C:\tai-test-177\`
+whose command line contains `cli177` and does not contain `--detach`):
+
+```powershell
+$bot = Get-CimInstance Win32_Process -Filter "Name = 'tai_backtest.exe'" |
+  Where-Object {
+    $_.ExecutablePath -like 'C:\tai-test-177\*' -and
+    $_.CommandLine -like '*cli177*' -and
+    $_.CommandLine -notlike '*--detach*'
+  }
+$bot | Select-Object ProcessId, ExecutablePath, CommandLine | Format-List
+Get-Process -Id $bot.ProcessId | Select-Object Id, MainWindowHandle, MainWindowTitle
+Get-CimInstance Win32_Process -Filter "Name = 'conhost.exe'" |
+  Where-Object { $_.ParentProcessId -eq $bot.ProcessId } |
+  Select-Object ProcessId, ParentProcessId, CommandLine
+```
+
+Pass: `MainWindowHandle` is **0**, `MainWindowTitle` is empty, and no
+`conhost.exe` has that bot as its parent. Fail if the handle is
+non-zero or a new conhost is attached to that PID. Write both into the
+evidence block. Then continue with status, list, and stop.
+
 Then, still only with that go-ahead:
 
 ```powershell
@@ -152,8 +175,9 @@ confirm that PID is gone before the smoke gates.
 ## #194 gates (a) through (f)
 
 Same pass rules as `docs/testing/grid_subprocess_windows_checklist.md`,
-with this folder and this payload size. The smoke flag exits before Tk
-and COM. It does not read `settings.yaml` and does not use the network.
+with this folder and this payload size, except gate (f) below. The
+smoke flag exits before Tk and COM. It does not read `settings.yaml`
+and does not use the network.
 
 Snapshot command (test processes only):
 
@@ -225,25 +249,48 @@ for this.
 ### (f) Payload larger than the 8 KB Windows pipe
 
 Use **131072** bytes (over the 8 KB pipe). The child builds the blob.
-It is not in the pickled job. The result is not a `GridOutcome`.
+It is not in the pickled job. This checklist does not change the
+smoke command's exit codes. It only changes what counts as a pass.
 
 ```powershell
 .\tai_backtest.exe --grid-subprocess-smoke --payload-bytes 131072 --timeout-s 60
 echo "exit=$LASTEXITCODE"
 ```
 
-Pass:
+Pass, all of these:
 
 - Returns well under 60 seconds. It does not hang.
-- Exit code is **1**, not 0 and not 2.
-- Output contains `grid-smoke: mode=payload`, `payload_bytes=131072`,
-  `outcome=crash`, and `not a grid outcome`.
-- `result_bytes` is greater than 131072.
+- Exit code is **0**.
+- Output contains `outcome=ok`.
+- Output contains `payload_bytes=131072`, and `result_bytes` is greater
+  than 131072 (the expected payload size).
 - The `--multiprocessing-fork` PID is gone.
 - No Tk window, no broker login, no API-key prompt.
 
-Fail: `outcome=timeout`, still alive at 60 seconds, `result_bytes`
-under 131072, or exit code 0.
+Exit code **1** is not a pass. 1 is also the crash code, so a crash
+must not be recorded as a successful payload. Fail on exit 1, on any
+outcome other than `ok`, on `outcome=timeout`, if the process is still
+alive at 60 seconds, or if `result_bytes` is not greater than 131072.
+
+## Frozen hook imports src.paths
+
+The frozen runtime hook calls `from src.paths import skips_gui_and_com`
+before it installs `comtypes.gen`. This check is the no-args GUI launch
+above. Pass only when all three are true:
+
+- The EXE launches (the workbench window opened).
+- `C:\tai-test-177\app\_comtypes_cache` is created.
+- `comtypes.gen` imports. The window appears only after that import. A
+  missing `src.paths` in the bundle raises in the hook first, so the
+  EXE exits before the window and does not leave a usable cache.
+
+```powershell
+Test-Path C:\tai-test-177\app\_comtypes_cache
+Test-Path C:\tai-test-177\app\_comtypes_cache\__init__.py
+Get-Content C:\tai-test-177\app\_comtypes_cache\__init__.py
+```
+
+Fail if any of the three is missing. Record them in the evidence block.
 
 ## #195 — cache, comtypes.gen, strategies placeholder
 
@@ -300,11 +347,16 @@ live settings or live API key copied in (must be no):
 Eric go-ahead for paper deploy (yes/no):
 
 deploy cli177 paper --detach --wait-ready (skip if no go-ahead): exit code:
+deploy --detach: child MainWindowHandle (must be 0):
+deploy --detach: conhost attached to that PID (must be no):
 status cli177:
 list:
 stop cli177: exit code:
 
 no-args GUI opened (must be yes) and closed before smoke (yes/no):
+frozen hook imports src.paths: EXE launched (must be yes):
+frozen hook imports src.paths: _comtypes_cache created (must be yes):
+frozen hook imports src.paths: comtypes.gen imported (must be yes):
 _comtypes_cache\__init__.py exists after GUI (must be yes):
 _internal\strategies names (must be only README.txt):
 
@@ -318,8 +370,9 @@ grid mode: exit code (must be 0) / outcome / result_bytes:
 (d) outcome=stopped and exit code 3 (yes/no):
 (e) outcome=timeout, exit code 2, elapsed_s about 8:
 (f) command: --grid-subprocess-smoke --payload-bytes 131072 --timeout-s 60
-(f) exit code (must be 1):
-(f) outcome=crash and "not a grid outcome" (yes/no):
+(f) exit code (must be 0; exit 1 is a fail):
+(f) outcome=ok (must be yes):
+(f) payload_bytes (must be 131072):
 (f) result_bytes (must be > 131072):
 
 cleanup: Stop-Process -Id only for ExecutablePath under C:\tai-test-177\ (yes/no)

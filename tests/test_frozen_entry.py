@@ -139,6 +139,26 @@ def test_spawn_process_exits_before_gui():
     assert proc.stdout == ""
 
 
+def test_cli_spawn_child_exits_zero_before_headless():
+    """M9: the spawn child in run_bot_cli.py must SystemExit(0).
+
+    Deleting that exit lets ``--multiprocessing-fork`` fall through into
+    the headless imports and argparse. The process then does not return
+    0 with empty stdout and stderr.
+    """
+    import subprocess
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "run_bot_cli.py"),
+         "--multiprocessing-fork", "parent_pid=1"],
+        cwd=REPO, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+    assert proc.stderr == ""
+    assert "Traceback" not in proc.stderr
+    assert "usage:" not in proc.stderr.lower()
+
+
 def test_grid_smoke_process_does_not_enter_gui():
     """The smoke flag finishes in grid_smoke, not in the Tk mainloop.
 
@@ -408,6 +428,12 @@ def test_v2199_checklist_is_one_combined_oreopie_run():
     assert "_comtypes_cache" in text
     assert "needs Eric's go-ahead" in text
     assert "Do not run `Activate.ps1`" in text
+    assert "MainWindowHandle" in text
+    assert "conhost.exe" in text
+    assert "from src.paths import skips_gui_and_com" in text
+    assert "outcome=ok" in text
+    assert "(f) exit code (must be 0; exit 1 is a fail):" in text
+    assert "exit code (must be 1)" not in text
 
 
 def test_install_notes_document_headless_exe():
