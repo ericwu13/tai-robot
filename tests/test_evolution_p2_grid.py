@@ -817,7 +817,9 @@ class TestNoGridEvidenceUsesAbsolute:
         )
         text = "\n".join(assembled.verdict.reasons)
         assert NO_GRID_EVIDENCE_LOG in text
-        assert "not supplied" not in text
+        # The month gate may say "price bars not supplied". That is not
+        # the relative-path miss for a missing trial.
+        assert "PBO and DSR: not supplied" not in text
         assert any("holdout fold PF" in r and "✗" in r
                    for r in assembled.verdict.reasons)
         assert assembled.verdict.passed is False
