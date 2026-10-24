@@ -6336,6 +6336,8 @@ class BacktestApp:
                     _knob_apply = None
                     grid_outcome = None
                     _structural_form = ""
+                    _structural_codegen_attempts = 0
+                    _structural_trial = None
                     # The monthly structural Saturday replaces the grid.
                     # Other runs search the pre-registered knob grid.
                     if (not structural_lane) and grid_search_applies(
@@ -6550,6 +6552,8 @@ class BacktestApp:
                     last_err = ""
                     if structural_lane:
                         # One attempt. This is not the Saturday codegen retry loop.
+                        # A failed attempt still counts toward DSR's trial count.
+                        _structural_codegen_attempts += 1
                         ui(self._append_chat, "system",
                            f"EVO 2/3: structural lane form {_structural_form} — "
                            f"one codegen attempt, no retry, as {candidate_name}...")
@@ -6589,7 +6593,7 @@ class BacktestApp:
                             notice = _record_structural("refused", {
                                 "reason": last_err,
                                 "form": _structural_form,
-                                "dsr_trials": 0,
+                                "dsr_trials": _structural_codegen_attempts,
                                 "sandbox_ok": False,
                             }, form=_structural_form)
                             msg = (f"🧬 EVO structural lane FAIL: one codegen attempt "
@@ -6955,7 +6959,6 @@ class BacktestApp:
                         # Evidence only. The proposal file does not replace
                         # the history line written after the Discord verdict.
                         try:
-                            from src.evolution.paper_gate import PromotionGate
                             from src.evolution.structural_lane import (
                                 lane_config_from_settings, make_incubation,
                                 structural_paper_decision)
@@ -6967,20 +6970,40 @@ class BacktestApp:
                             _incubation = None
                             _form = _structural_form if structural_lane else ""
                             if structural_lane:
+                                # Paper and backtest use the relative gate.
+                                # Real money stays absolute. A real trial
+                                # keeps the relative path from falling
+                                # back to absolute the way trial=None does.
+                                from src.evolution.grid_search import (
+                                    structural_selection_pnls)
+                                from src.evolution.trial_penalty import (
+                                    structural_trial_evidence)
+                                _base_pnls, _cand_pnls = structural_selection_pnls(
+                                    base_trades, cand_trades,
+                                    fold_days=int(evo_gate_cfg.relative.fold_days),
+                                    holdout_start=ho_start,
+                                )
+                                _attempt_columns: list = (
+                                    [None] * max(0, _structural_codegen_attempts - 1)
+                                    + [_cand_pnls or None])
+                                _structural_trial = structural_trial_evidence(
+                                    baseline_folds=_base_pnls,
+                                    attempts=_attempt_columns,
+                                )
+                                self._structural_trial_penalty = _structural_trial
+                                _q2_abs = abs_pf_required(evo_gate)
                                 _q2_window = (
                                     decide_deep_verdict(
                                         baseline_res, candidate_res,
                                         directives["criteria"],
-                                        require_abs_pf=False)
+                                        require_abs_pf=_q2_abs)
                                     if tr_d else
                                     decide_verdict(
                                         baseline_res, candidate_res,
                                         directives["criteria"],
-                                        require_abs_pf=False))
+                                        require_abs_pf=_q2_abs))
                                 _q2 = assemble_promotion_verdict(
-                                    gate=PromotionGate(
-                                        "relative",
-                                        "structural lane Q2; Saturday gate unchanged"),
+                                    gate=evo_gate,
                                     gate_cfg=evo_gate_cfg,
                                     folds=folds,
                                     base_trades=base_trades,
@@ -6990,22 +7013,18 @@ class BacktestApp:
                                     window_verdict=_q2_window,
                                     bars=bars,
                                     month_gate=month_gate_cfg,
-                                    trial=None,
+                                    trial=_structural_trial,
                                 )
                                 _q2_passed = (
                                     bool(_q2.verdict.passed)
                                     and not bool(_q2.verdict.provisional))
                                 _q2_reasons = list(_q2.verdict.reasons)
-                                _penalty = getattr(
-                                    self, "_structural_trial_penalty", None) or {}
                                 _paper_ok, _paper_reasons = structural_paper_decision(
                                     sandbox_ok=True,
                                     native_bars=native_est,
                                     q2_passed=_q2_passed,
-                                    pbo=_penalty.get("pbo") if isinstance(
-                                        _penalty, dict) else None,
-                                    dsr=_penalty.get("dsr") if isinstance(
-                                        _penalty, dict) else None,
+                                    pbo=_structural_trial.pbo,
+                                    dsr=_structural_trial.dsr,
                                     config=_lane_cfg,
                                 )
                                 _bt_mean = None
@@ -7036,7 +7055,10 @@ class BacktestApp:
                                     "paper_recommended": _paper_ok,
                                     "native_bars": native_est,
                                     "sandbox_ok": True,
-                                    "dsr_trials": 1 if structural_lane else 0,
+                                    "dsr_trials": (
+                                        _structural_trial.n_trials
+                                        if structural_lane and _structural_trial is not None
+                                        else 0),
                                     "knob_apply": _knob_apply,
                                     "candidate": candidate_cls.__name__,
                                 },

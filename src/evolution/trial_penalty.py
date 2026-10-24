@@ -432,3 +432,96 @@ def trial_sharpe_std(sharpes: list[float]) -> float:
     """Cross-sectional sample standard deviation of finite trial Sharpes."""
     finite = [s for s in sharpes if s is not None and math.isfinite(s)]
     return _sample_std(finite)
+
+
+def structural_trial_evidence(
+        *,
+        baseline_folds: list[float],
+        attempts: list[list[float] | None],
+        chosen: int | None = None) -> TrialEvidence:
+    """DSR and CSCV PBO for one structural turn.
+
+    ``baseline_folds`` and each scored attempt are selection-fold absolute
+    PnL. The caller has already dropped the holdout (the last fold, and
+    the walk-forward cutoff when that is earlier), the same exclusion the
+    knob grid uses. This function does not put the holdout back.
+
+    ``attempts`` is every codegen attempt in the turn, in order. ``None``
+    is a refused or failed attempt: it has no fold column, and it still
+    counts. DSR's ``n_trials`` is ``len(attempts)``, not the number of
+    columns that produced a series.
+
+    DSR is the chosen candidate's per-fold Δ against the baseline
+    (candidate minus baseline). ρ̄ is the mean pairwise correlation of
+    those scored Δ columns. A single scored column has no pair, so ρ̄
+    is 0 and ``N_eff`` equals ``n_trials``. One scored Sharpe has no
+    cross-trial dispersion, so the selection premium SR0 is 0 even when
+    failed attempts raise N. That is ``expected_maximum_sharpe``: a
+    non-positive dispersion has no premium. It is not a waiver of the
+    trial count.
+
+    PBO is CSCV on one matrix whose columns are the baseline fold PnL
+    and each scored candidate's fold PnL (absolute, not the Δ). With
+    one scored candidate the matrix has two columns, baseline and that
+    candidate. A split counts as overfit when the in-sample winner's
+    out-of-sample PnL is at or below the OOS median. For two columns
+    that is the in-sample winner failing to beat the other column out
+    of sample. Fewer than 8 selection folds cannot form S = 8, a
+    constant Δ series has no Sharpe, and any other miss leaves ``dsr``
+    or ``pbo`` as None. None is not a pass.
+
+    ``chosen`` is an index into ``attempts``. The default is the last
+    scored attempt.
+    """
+    try:
+        base = [float(x) for x in baseline_folds]
+    except (TypeError, ValueError):
+        base = []
+    if not all(math.isfinite(x) for x in base):
+        base = []
+    n_trials = len(attempts or [])
+    scored_at: list[int] = []
+    scored_abs: list[list[float]] = []
+    for index, column in enumerate(attempts or []):
+        if column is None or not base or len(column) != len(base):
+            continue
+        try:
+            values = [float(x) for x in column]
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in values):
+            continue
+        scored_at.append(index)
+        scored_abs.append(values)
+    if chosen is None:
+        chosen_pos = len(scored_at) - 1 if scored_at else None
+    elif chosen in scored_at:
+        chosen_pos = scored_at.index(chosen)
+    else:
+        chosen_pos = None
+    deltas = [
+        [cand - base_pnl for cand, base_pnl in zip(column, base)]
+        for column in scored_abs
+    ]
+    rho = mean_pairwise_correlation(deltas) if len(deltas) >= 2 else 0.0
+    n_eff = effective_trial_count(n_trials, rho) if n_trials else 0.0
+    sharpes = [sharpe_ratio(column) for column in deltas]
+    sharpe_std = trial_sharpe_std([item for item in sharpes if item is not None])
+    dsr = None
+    if chosen_pos is not None:
+        dsr = score_configuration(
+            deltas[chosen_pos], n_eff=n_eff, sharpe_std=sharpe_std)
+    columns = ([base] + scored_abs) if base and scored_abs else []
+    matrix = [list(row) for row in zip(*columns)] if columns else []
+    if matrix:
+        pbo, partitions = probability_of_backtest_overfitting(matrix)
+    else:
+        pbo, partitions = None, None
+    return TrialEvidence(
+        dsr=dsr,
+        pbo=pbo,
+        n_trials=n_trials,
+        n_eff=n_eff,
+        rho_bar=rho,
+        partitions=partitions,
+    )

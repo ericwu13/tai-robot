@@ -570,6 +570,35 @@ def select_grid(
         selected, tuple(reasons), tuple(preregistered), evidence, rationale)
 
 
+def structural_selection_pnls(
+        base_trades,
+        cand_trades,
+        *,
+        fold_days: int,
+        holdout_start: str | None,
+        max_folds: int = 10) -> tuple[list[float], list[float]]:
+    """Selection-fold absolute PnL for one structural candidate.
+
+    The last baseline fold is the holdout and is excluded. The selection
+    cutoff is the earlier of that fold's start and ``holdout_start``
+    (the walk-forward window), the same rule as ``run_grid_on_bars``.
+    Returns ``(baseline, candidate)``. Empty when there is no selection
+    fold. This does not score DSR or PBO.
+    """
+    raw_bounds = _anchor_bounds(
+        _baseline_bounds(base_trades, int(fold_days), int(max_folds)),
+        holdout_start or "")
+    bounds = _cover_trades_after_baseline(
+        raw_bounds, [base_trades or [], cand_trades or []])
+    selection, holdout = _split_holdout(bounds)
+    if holdout is None or not selection:
+        return [], []
+    return (
+        [_fold_sum(base_trades, start, end) for start, end in selection],
+        [_fold_sum(cand_trades, start, end) for start, end in selection],
+    )
+
+
 def explanation_prompt(selected: dict, reasons) -> str:
     """Ask the model to explain a setting it is not allowed to change."""
     body = "\n".join(str(line) for line in reasons)

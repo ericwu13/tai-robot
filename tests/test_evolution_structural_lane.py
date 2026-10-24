@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1385,3 +1385,374 @@ def test_structural_saturday_replaces_the_grid_other_saturdays_run_it(
     assert chat.send_message.call_count == 1
     assert rb._evolution_in_progress == set()
     rb._evolution_guard_clear()
+
+
+# Selection-fold deltas. The tenth value is the holdout and is excluded
+# from DSR and PBO. Nine selection folds support CSCV S = 8.
+_STRONG_DELTAS = [180, 220, 160, 240, 190, 210, 170, 230, 200, 200]
+# Early folds look strong and later folds give it back. CSCV PBO is 1
+# and DSR stays under 0.90, so the paper recommendation fails closed.
+_OVERFIT_DELTAS = [1200, 1100, 1300, 1000, -900, -800, -1000, -700, -900, -800]
+
+
+def _fold_trades(deltas):
+    """Four trades per fold. Baseline sums to -300; the last trade carries Δ."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Trade:
+        exit_dt: str
+        pnl: int
+        entry_dt: str = ""
+        entry_price: int = 1
+        exit_price: int = 1
+        entry_bar_index: int = 0
+
+    base, cand = [], []
+    origin = datetime(2026, 1, 5, 9, 0)
+    for i, delta in enumerate(deltas):
+        start = origin + timedelta(days=14 * i)
+        for j, (b, c) in enumerate(
+                zip([100, 50, -200, -250], [100, 50, -200, -250 + delta])):
+            stamp = (start + timedelta(hours=j)).strftime("%Y-%m-%d %H:%M")
+            base.append(_Trade(
+                stamp, b, entry_dt=stamp, entry_bar_index=i * 10 + j))
+            cand.append(_Trade(
+                stamp, c, entry_dt=stamp, exit_price=2,
+                entry_bar_index=i * 10 + j))
+    return base, cand
+
+
+def _q2_bars():
+    """200 native bars ending when the holdout fold starts, so selection is untrimmed."""
+    from datetime import timedelta
+    from src.market_data.models import Bar
+
+    end = datetime(2026, 5, 12, 0, 0)
+    return [
+        Bar(
+            symbol="TXF",
+            dt=end - timedelta(minutes=199 - i),
+            open=20000, high=20010, low=19990, close=20000,
+            volume=1, interval=60,
+        )
+        for i in range(200)
+    ]
+
+
+def _structural_q2_calls():
+    """Keyword ``trial`` values on every assemble_promotion_verdict call."""
+    tree = ast.parse(Path("run_backtest.py").read_text(encoding="utf-8"))
+    trials = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != "assemble_promotion_verdict":
+            continue
+        for kw in node.keywords:
+            if kw.arg == "trial":
+                trials.append(kw.value)
+    return trials
+
+
+class TestStructuralQ2Evidence:
+    def test_one_candidate_pbo_is_two_columns_and_fails_closed(self):
+        """One scored candidate is baseline plus that candidate.
+
+        Fewer than 8 selection folds, or a constant Δ (no Sharpe), leaves
+        PBO or DSR missing. Missing is not a pass.
+        """
+        from src.evolution.grid_search import structural_selection_pnls
+        from src.evolution.trial_penalty import structural_trial_evidence
+
+        doc = structural_trial_evidence.__doc__ or ""
+        assert "two columns" in doc
+        assert "None is not a pass" in doc
+        base, cand = _fold_trades(_STRONG_DELTAS)
+        from src.evolution.pipeline import analyze_folds
+        folds = analyze_folds(base, cand, fold_days=14, max_folds=10)
+        b_pnls, c_pnls = structural_selection_pnls(
+            base, cand, fold_days=14, holdout_start=folds[-1].start)
+        assert len(b_pnls) == 9
+        trial = structural_trial_evidence(
+            baseline_folds=b_pnls, attempts=[c_pnls])
+        assert trial.n_trials == 1
+        assert trial.partitions == 8
+        assert trial.pbo == 0.0
+        assert trial.dsr is not None and trial.dsr > 0.90
+        # Ten trade-folds in, nine selection folds out: the holdout is gone.
+        assert [c - b for b, c in zip(b_pnls, c_pnls)] == [
+            float(d) for d in _STRONG_DELTAS[:-1]]
+
+        short_b, short_c = _fold_trades(_STRONG_DELTAS[:7])
+        short_folds = analyze_folds(short_b, short_c, fold_days=14, max_folds=10)
+        sb, sc = structural_selection_pnls(
+            short_b, short_c, fold_days=14,
+            holdout_start=short_folds[-1].start)
+        assert len(sb) < 8
+        short = structural_trial_evidence(baseline_folds=sb, attempts=[sc])
+        assert short.pbo is None and short.partitions is None
+        flat = structural_trial_evidence(
+            baseline_folds=b_pnls, attempts=[[x + 200 for x in b_pnls]])
+        assert flat.dsr is None
+        ok, reasons = structural_paper_decision(
+            sandbox_ok=True, native_bars=200, q2_passed=True,
+            pbo=flat.pbo, dsr=flat.dsr)
+        assert ok is False
+        assert any("not supplied" in line for line in reasons)
+
+    def test_failed_codegen_attempts_count_in_the_trial(self):
+        """None columns have no series and still raise N and N_eff."""
+        from src.evolution.grid_search import structural_selection_pnls
+        from src.evolution.pipeline import analyze_folds
+        from src.evolution.trial_penalty import structural_trial_evidence
+
+        base, cand = _fold_trades(_STRONG_DELTAS)
+        folds = analyze_folds(base, cand, fold_days=14, max_folds=10)
+        b_pnls, c_pnls = structural_selection_pnls(
+            base, cand, fold_days=14, holdout_start=folds[-1].start)
+        counted = structural_trial_evidence(
+            baseline_folds=b_pnls, attempts=[None, None, c_pnls])
+        assert counted.n_trials == 3
+        assert counted.n_eff == 3
+        assert counted.rho_bar == 0.0
+        assert counted.pbo == 0.0
+        assert counted.partitions == 8
+        src = Path("run_backtest.py").read_text(encoding="utf-8")
+        assert "[None] * max(0, _structural_codegen_attempts - 1)" in src
+        inc = src.index("_structural_codegen_attempts += 1")
+        site = src.index('call_site="evolution_codegen_structural"')
+        recorded = src.index('"dsr_trials": _structural_codegen_attempts')
+        assert inc < site < recorded
+
+    def test_reverting_q2_to_trial_none_fails(self):
+        """The structural assembly passes the computed trial, not None.
+
+        ``trial=None`` on a relative gate falls back to the absolute PF
+        floor. This losing-but-improved book then fails. Replacing
+        ``trial=_structural_trial`` with ``trial=None`` fails this test.
+        """
+        from src.evolution.grid_search import structural_selection_pnls
+        from src.evolution.paper_gate import (
+            NO_GRID_EVIDENCE_LOG,
+            assemble_promotion_verdict,
+            evolution_gate_config_from_mapping,
+            resolve_promotion_gate,
+        )
+        from src.evolution.pipeline import EvolutionVerdict, analyze_folds
+        from src.evolution.trial_penalty import structural_trial_evidence
+
+        trials = _structural_q2_calls()
+        assert len(trials) == 2
+        assert any(
+            isinstance(node, ast.Name) and node.id == "_structural_trial"
+            for node in trials)
+        assert any(
+            isinstance(node, ast.Name) and node.id == "grid_trial"
+            for node in trials)
+        assert not any(isinstance(node, ast.Constant) and node.value is None
+                       for node in trials)
+        src = inspect.getsource(rb.BacktestApp._start_evolution_pipeline)
+        assert "abs_pf_required(evo_gate)" in src
+        assert "self._structural_trial_penalty = _structural_trial" in src
+        assert 'PromotionGate("relative"' not in src
+
+        base, cand = _fold_trades(_STRONG_DELTAS)
+        folds = analyze_folds(base, cand, fold_days=14, max_folds=10)
+        b_pnls, c_pnls = structural_selection_pnls(
+            base, cand, fold_days=14, holdout_start=folds[-1].start)
+        trial = structural_trial_evidence(
+            baseline_folds=b_pnls, attempts=[None, c_pnls])
+        assert trial.n_trials == 2
+        cfg = evolution_gate_config_from_mapping({
+            "paper_gate": "relative", "real_gate": "absolute"})
+        gate = resolve_promotion_gate("paper", cfg.paper_gate, "absolute")
+        window = EvolutionVerdict(True, ["window held"])
+        common = dict(
+            gate=gate, gate_cfg=cfg, folds=folds, base_trades=base,
+            cand_trades=cand, holdout_start=folds[-1].start, criteria=None,
+            window_verdict=window)
+        passed = assemble_promotion_verdict(**common, trial=trial)
+        assert passed.verdict.passed and not passed.verdict.provisional
+        assert any("dropped on the paper relative path" in r
+                   for r in passed.verdict.reasons)
+        fallen = assemble_promotion_verdict(**common, trial=None)
+        assert not fallen.verdict.passed
+        assert any(NO_GRID_EVIDENCE_LOG in r for r in fallen.verdict.reasons)
+        real = resolve_promotion_gate("auto", cfg.paper_gate, "absolute")
+        assert real.mode == "absolute"
+        absolute = assemble_promotion_verdict(
+            **{**common, "gate": real}, trial=trial)
+        assert not absolute.verdict.passed
+        assert any("holdout fold PF" in r and "✗" in r
+                   for r in absolute.verdict.reasons)
+        assert not any("dropped on the paper relative path" in r
+                       for r in absolute.verdict.reasons)
+
+    def test_framework_doc_names_the_lock_and_the_relative_q2(self):
+        text = Path("docs/evolution_framework.md").read_text(encoding="utf-8")
+        assert "do not add a lock" not in text
+        assert "threading.RLock" in text
+        assert "One GUI per tree is the supported model." in text
+        assert "no cross-process lock" in text
+        assert "One scored candidate is two columns" in text
+        assert "fails closed" in text
+        example = Path("settings.example.yaml").read_text(encoding="utf-8")
+        assert "One GUI per tree is the supported" in example
+        assert "no cross-process lock" in example
+
+
+def _run_structural_q2(tmp_path, monkeypatch, *, deltas, trading_mode,
+                       codegen_ok=True):
+    """Drive the structural worker with fixture trades. No live pool write."""
+    import types
+    from unittest.mock import MagicMock
+    from src.backtest.metrics import PerformanceMetrics
+    from src.evolution.pipeline import ABResult, analyze_folds
+    import src.evolution.pipeline as pipeline
+    import src.daily_report.changelog as changelog
+    from tests.test_evolution_history import _HIST_CODE, _validation_app
+    from tests.test_evolution_issue164 import _InlineThread
+
+    rb._evolution_guard_clear()
+    monkeypatch.setattr(rb, "project_root", str(tmp_path))
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(changelog, "append_changelog", lambda **kwargs: None)
+    monkeypatch.setattr(changelog, "load_changelog", lambda: [])
+    pool_path = tmp_path / "pool.db"
+    monkeypatch.setattr(
+        "src.evolution.pool.default_pool_path", lambda: pool_path)
+
+    base, cand = _fold_trades(deltas)
+
+    def _metrics(pf, dd, pnl):
+        return PerformanceMetrics(
+            total_trades=40, profit_factor=pf, max_drawdown=dd,
+            max_drawdown_pct=5.0, total_pnl=pnl, win_rate=0.4)
+
+    def _side(name, trades, pf, dd, pnl):
+        return ABResult(
+            name=name,
+            result=types.SimpleNamespace(
+                trades=list(trades), metrics=_metrics(pf, dd, pnl)))
+
+    def _ab(*_args, **kwargs):
+        name = kwargs.get("name") or (_args[3] if len(_args) > 3 else "")
+        if "候選" in str(name):
+            return _side(name, cand, 0.6, 4000, -1000)
+        return _side(name, base, 0.4, 5000, -3000)
+
+    def _mf(*_args, **_kwargs):
+        folds = analyze_folds(base, cand, fold_days=14, max_folds=10)
+        return (
+            folds,
+            _side("base", base, 0.4, 5000, -3000),
+            _side("cand", cand, 0.6, 4000, -1000),
+        )
+
+    monkeypatch.setattr(pipeline, "run_ab_backtest", _ab)
+    monkeypatch.setattr(pipeline, "run_multifold_validation", _mf)
+    chat = MagicMock()
+    chat.send_message.return_value = "structural_form: side_split\n"
+    chat.one_shot.return_value = _HIST_CODE if codegen_ok else "no code block"
+    chat.max_tokens = 1024
+    chat.conversation = []
+    bot = tmp_path / "bot"
+    app = _validation_app(bot, chat, paper_gate="relative")
+    app._live_runner.trading_mode = trading_mode
+    app._trading_mode = trading_mode
+    app._live_runner.get_bars = lambda: _q2_bars()
+    ledger = tmp_path / "lane" / "structural_lane.json"
+    rb.BacktestApp._start_evolution_pipeline(
+        app, "preamble", ["design trade"], "", app._result,
+        auto_run=True, holdout_days=14, bot_dir=str(bot),
+        design_cut_idx=1, structural_lane=True,
+        structural_ledger=str(ledger), structural_bot_id="HistBase",
+        structural_month="2026-10")
+    proposals = list((tmp_path / "lane" / "proposals").glob("*.json"))
+    return app, proposals, pool_path, ledger
+
+
+def test_lane_recommends_paper_for_a_strong_candidate(tmp_path, monkeypatch):
+    """A strong losing-but-improved candidate can be recommended for paper.
+
+    The recommendation is text. The pool stays empty. Replacing the Q2
+    trial with None drops this book onto the absolute PF floor, so
+    paper_recommended becomes false and this test fails.
+    """
+    from src.evolution.structural_lane import load_ledger
+
+    app, proposals, pool_path, ledger = _run_structural_q2(
+        tmp_path, monkeypatch, deltas=_STRONG_DELTAS, trading_mode="paper")
+    assert app.errors == [], app.errors
+    assert len(proposals) == 1
+    body = json.loads(proposals[0].read_text(encoding="utf-8"))
+    evidence = body["evidence"]
+    assert evidence["paper_recommended"] is True
+    assert evidence["q2_passed"] is True
+    assert any("dropped on the paper relative path" in line
+               for line in evidence["q2_reasons"])
+    assert not any("no grid trial evidence" in line
+                   for line in evidence["q2_reasons"])
+    assert any("DSR" in line and "pass" in line
+               for line in evidence["paper_reasons"])
+    assert any("PBO" in line and "pass" in line
+               for line in evidence["paper_reasons"])
+    assert any("recommendation only" in line
+               for line in evidence["paper_reasons"])
+    assert body["applied"] is False
+    assert body["pool_promoted"] is False
+    assert body["dsr_trials"] == 1
+    assert "applied_at" not in body
+    row = load_ledger(ledger)["incubations"][-1]
+    assert row["status"] == "paper_recommended"
+    assert row["applied"] is False
+    assert "applied_at" not in row
+    assert _validated_count(pool_path) == 0
+
+
+def test_lane_fails_closed_on_an_overfit_candidate(tmp_path, monkeypatch):
+    app, proposals, pool_path, ledger = _run_structural_q2(
+        tmp_path, monkeypatch, deltas=_OVERFIT_DELTAS, trading_mode="paper")
+    assert app.errors == [], app.errors
+    body = json.loads(proposals[0].read_text(encoding="utf-8"))
+    evidence = body["evidence"]
+    assert evidence["paper_recommended"] is False
+    assert any(line.startswith("PBO ") and "FAIL" in line
+               for line in evidence["paper_reasons"])
+    assert any(line.startswith("DSR ") and "FAIL" in line
+               for line in evidence["paper_reasons"])
+    from src.evolution.structural_lane import load_ledger
+    assert load_ledger(ledger)["incubations"][-1]["status"] == "not_admitted"
+    assert _validated_count(pool_path) == 0
+
+
+def test_real_money_structural_q2_stays_absolute(tmp_path, monkeypatch):
+    app, proposals, _pool, _ledger = _run_structural_q2(
+        tmp_path, monkeypatch, deltas=_STRONG_DELTAS, trading_mode="auto")
+    assert app.errors == [], app.errors
+    evidence = json.loads(proposals[0].read_text(encoding="utf-8"))["evidence"]
+    assert evidence["paper_recommended"] is False
+    assert evidence["q2_passed"] is False
+    assert any("holdout fold PF" in line and "✗" in line
+               for line in evidence["q2_reasons"])
+    assert not any("dropped on the paper relative path" in line
+                   for line in evidence["q2_reasons"])
+
+
+def test_failed_codegen_attempt_is_one_trial(tmp_path, monkeypatch):
+    app, proposals, pool_path, _ledger = _run_structural_q2(
+        tmp_path, monkeypatch, deltas=_STRONG_DELTAS, trading_mode="paper",
+        codegen_ok=False)
+    assert app.errors == [], app.errors
+    assert len(proposals) == 1
+    body = json.loads(proposals[0].read_text(encoding="utf-8"))
+    assert body["status"] == "refused"
+    assert body["dsr_trials"] == 1
+    assert body["evidence"]["dsr_trials"] == 1
+    assert body["evidence"]["sandbox_ok"] is False
+    assert body["pool_promoted"] is False
+    assert body["applied"] is False
+    assert _validated_count(pool_path) == 0
