@@ -8,6 +8,13 @@ hosts:
     user: "Traderbot"
     identity_file: "~/.ssh/id_ed25519_steven"
     notes: "Windows trading server"
+    # Optional: makes scripts/monitor/daily_review.py check this host over ssh.
+    # bots listed here are expected to RUN here; their local data/live copy is ignored.
+    monitor:
+      bridge_dir: 'C:\Users\REPLACE_REMOTE_USER\n8n-bridge'   # host runs W1-W4; omit if not
+      live_dir: 'C:\Users\REPLACE_REMOTE_USER\tai-robot-src\data\live'
+      bots: ['REPLACE_BOT_DIR_NAME']
+      task_path: '\TaiRobot\'
   oreopie:
     tailscale_ip: "100.x.x.x"
     user: "REPLACE_LOCAL_USER"

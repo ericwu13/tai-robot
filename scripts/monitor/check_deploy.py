@@ -48,9 +48,12 @@ _NEWS_KEYS = (
 )
 
 
-def _check_settings(settings: dict, lines, findings) -> None:
+def _check_settings(settings: dict, lines, findings, news_wiring=True) -> None:
     lines.append("settings wiring:")
-    for key, level, consequence in _NEWS_KEYS:
+    if not news_wiring:
+        lines.append("  news.*: not checked here — the news bridge runs on "
+                     "another host (see BRIDGE @<host>)")
+    for key, level, consequence in (_NEWS_KEYS if news_wiring else ()):
         raw = setting(settings, key)
         resolved = resolve_news_path(raw, _REPO)
         if not resolved:
@@ -90,14 +93,22 @@ def _check_settings(settings: dict, lines, findings) -> None:
             "(daily_review --discord will be a no-op)", ""))
 
 
-def check_deploy(settings: dict, base_dir: str):
-    """``(findings, report_lines)`` for settings wiring + per-bot deploy shape."""
+def check_deploy(settings: dict | None, base_dir: str, exclude=(),
+                 news_wiring: bool = True):
+    """``(findings, report_lines)`` for settings wiring + per-bot deploy shape.
+
+    ``settings=None`` skips the wiring section (a remote mirror: that
+    host's settings.yaml holds credentials and is never fetched).
+    ``news_wiring=False`` keeps the Discord checks but skips ``news.*``
+    when the bridge those paths fed has moved to another host.
+    """
     findings = []
     lines = []
-    _check_settings(settings, lines, findings)
-    lines.append("")
+    if settings is not None:
+        _check_settings(settings, lines, findings, news_wiring)
+        lines.append("")
 
-    bot_dirs = discover_bot_dirs(base_dir)
+    bot_dirs = discover_bot_dirs(base_dir, exclude)
     if not bot_dirs:
         lines.append(f"no bot directories under {base_dir}")
     for bot_dir in bot_dirs:
@@ -137,8 +148,9 @@ def check_deploy(settings: dict, base_dir: str):
                 f"{name}: active_leg {leg!r} is not one of {sorted(VALID_LEGS)}",
                 path))
 
-    lines.append("")
-    lines.extend(REDEPLOY_RECIPE)
+    if settings is not None:
+        lines.append("")
+        lines.extend(REDEPLOY_RECIPE)
     return findings, lines
 
 

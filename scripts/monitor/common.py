@@ -178,12 +178,20 @@ def post_discord(webhook_url: str, content: str) -> bool:
 
 # ── bot directories / processes ─────────────────────────────────────────
 
-def discover_bot_dirs(base_dir: str) -> list:
-    """Sub-directories of ``data/live`` that look like a deployed bot."""
+def discover_bot_dirs(base_dir: str, exclude=()) -> list:
+    """Sub-directories of ``data/live`` that look like a deployed bot.
+
+    ``exclude`` names bots that now run on another host
+    (``scripts.monitor.remote``): their directory here is a stale copy
+    left behind by the move, and grading it would report a live bot as
+    stopped.
+    """
     if not base_dir or not os.path.isdir(base_dir):
         return []
     found = []
     for name in sorted(os.listdir(base_dir)):
+        if name in exclude:
+            continue
         path = os.path.join(base_dir, name)
         if not os.path.isdir(path):
             continue

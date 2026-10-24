@@ -33,6 +33,12 @@ The real address is `tailscale_ip` in gitignored `hosts.local.yaml` (or `%USERPR
 
 Copy from `hosts.local.example.yaml`. Do not invent values if missing.
 
+A host's optional `monitor:` block (`bridge_dir`, `live_dir`, `bots`,
+`task_path`) makes the daily review check that host's news bridge and
+bots over SSH — `scripts/monitor/remote.py` reads the same file in the
+same order. It uses Windows OpenSSH with `-F NUL` and the remote
+PowerShell script on stdin, so nothing is uploaded to the host.
+
 ## Optional Host alias
 
 `~/.ssh/config` Host stanzas are convenience only. Default invoke is explicit `-i` + IP + user.
