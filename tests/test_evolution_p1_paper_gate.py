@@ -753,11 +753,13 @@ class TestPromotionProvenance:
         )
         month_verdict = assembled.month_verdict
         assert month_verdict is not None
-        assert hasattr(month_verdict, "month_gates")
-        assert month_verdict.month_gates is None
-        assert assembled.month_gates is None
-        # The expression a #181 merge writes must resolve.
+        assert isinstance(month_verdict.month_gates, dict)
+        # assemble_promotion_verdict threads the observation out. The
+        # PASS changelog reads this same object.
         assert month_verdict.month_gates is assembled.month_gates
+        assert "latest" in month_verdict.month_gates
+        assert "share_applied" in month_verdict.month_gates
+        assert month_verdict.month_gates["passed"] is month_verdict.passed
 
     def test_pass_records_name_the_gate_that_passed(self):
         assert gate_provenance("relative") == "promotion_gate=relative"
@@ -773,8 +775,10 @@ class TestPromotionProvenance:
         assert src.index("gate_provenance(evo_gate.mode)") < src.index(
             "plan excerpt:")
         bind = src.index("month_verdict = assembled.month_verdict")
-        assert bind < summary_at
-        assert "month_gates=" not in src
+        forwarded = src.index("month_gates=month_verdict.month_gates")
+        assert bind < summary_at < forwarded < fail_at
+        assert "params_before=params_before" in src[summary_at:fail_at]
+        assert "params_reason=params_reason" in src[summary_at:fail_at]
 
     def test_idle_evolve_uses_configured_mode_and_never_invents_one(self):
         class _Runner:

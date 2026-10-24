@@ -5732,7 +5732,8 @@ class BacktestApp:
                 decide_verdict,
                 run_deep_validation, decide_deep_verdict,
                 run_multifold_validation,
-                format_weekend_verdict_block, holdout_window_start,
+                format_weekend_verdict_block, format_month_gates_debug,
+                holdout_window_start,
                 eligible_for_validated_pool)
             from src.evolution.paper_gate import (
                 WeekRecord,
@@ -6079,11 +6080,18 @@ class BacktestApp:
                     window_verdict=window_verdict,
                 )
                 verdict = assembled.verdict
-                # Bound before the PASS changelog so a merge can read
-                # month_verdict.month_gates without NameError. The value
-                # is not forwarded: this changelog signature has no
-                # month_gates parameter yet.
+                # assemble_promotion_verdict threads decide_month_gates'
+                # observation out. The PASS changelog below forwards it.
                 month_verdict = assembled.month_verdict
+                # Debug-only. A logging failure must not abort validation.
+                try:
+                    _log(format_month_gates_debug(month_verdict.month_gates))
+                except Exception as e:
+                    try:
+                        _log(f"EVO month gates log failed: "
+                             f"[{type(e).__name__}] {e}")
+                    except Exception:
+                        pass
 
                 # Clean PASS → StrategyPool validated only. Never
                 # StrategyStore.save and never STRATEGIES[...].
@@ -6156,6 +6164,7 @@ class BacktestApp:
                                 params_before=params_before,
                                 params_after=params_after,
                                 params_reason=params_reason,
+                                month_gates=month_verdict.month_gates,
                             )
                         except Exception as e:
                             _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
