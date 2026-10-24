@@ -1,5 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-import glob
 import os
 import sys
 import importlib
@@ -27,18 +26,17 @@ _holidays_datas = collect_data_files('holidays')
 # ``python -m PyInstaller`` puts the cwd on sys.path; the ``pyinstaller``
 # entry-point script does not. SPECPATH is the spec file's directory.
 sys.path.insert(0, SPECPATH)
-from build_release import strategies_datas
+from build_release import prepare_capital_sdk_binaries, strategies_datas
 _strategies_datas = strategies_datas(SPECPATH)
 
-# Collect SDK DLLs
-sdk_libs = os.path.join(
-    'CapitalAPI_2.13.57', 'CapitalAPI_2.13.57_PythonExample',
-    'SKDLLPythonTester', 'libs',
-)
-dll_binaries = []
-if os.path.isdir(sdk_libs):
-    for dll in glob.glob(os.path.join(sdk_libs, '*.dll')):
-        dll_binaries.append((dll, 'libs'))
+# Broker DLLs. Missing or empty SKCOM.dll / CTSecuritiesATL.dll fails
+# the build (exit 1) instead of shipping an empty _internal/libs.
+# project_root=SPECPATH resolves a relative TAI_CAPITAL_SDK_DIR against
+# the spec directory, matching build_release.py. When that env var is
+# unset and the cwd is the spec directory, the glob stays the historical
+# relative libs path, so a present SDK bundles the same *.dll files.
+# Opt out only with TAI_ALLOW_MISSING_CAPITAL_SDK=1.
+dll_binaries = prepare_capital_sdk_binaries(project_root=SPECPATH)
 
 a = Analysis(
     ['run_backtest.py'],
