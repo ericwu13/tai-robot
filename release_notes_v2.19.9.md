@@ -1,6 +1,6 @@
 # v2.19.9
 
-> 草稿 / DRAFT. Base: master `a9016343` (#193). #194 and #195 are **pending merge**. No build, tag or publish yet.
+> 草稿 / DRAFT. Base: master `747d4dcd` (#194 merged). #195 and #177 are **pending merge**. No build, tag or publish yet.
 
 ## 修復與功能 Fixes & features
 
@@ -58,8 +58,8 @@
   **#181**: month-gate inputs (per-month nets, share) logged to debug.log and stored on changelog `month_gates`; observability only.
 - **#165**：不符資格的週六 knob 類別在 KeyError 前即被拒絕，只警示一次並推進 watermark（#164）。
   **#165**: ineligible Saturday knob classes are refused before `KeyError`, alerted once, watermark advances (#164).
-- **#194（pending merge）**：週六網格改在 spawn 子程序中執行，不再在 live bot 程序內佔用 GIL 卡住 Tk（tick、成交輪詢、STOP 檔）。上限 20 分鐘；逾時／當機／停止時殺掉子程序、不挑選、watermark 不變。新增 `--grid-subprocess-smoke`。
-  **#194 (pending merge)**: the Saturday grid runs in a spawned subprocess instead of the live process, so it no longer holds the GIL and stalls Tk (ticks, fill polling, STOP file). Bounded at 20 min; timeout/crash/stop kills the child, picks nothing, watermark unchanged. Adds `--grid-subprocess-smoke`.
+- **#194**（merge `747d4dcd`）：週六網格改在 spawn 子程序中執行，不再在 live bot 程序內佔用 GIL 卡住 Tk（tick、成交輪詢、STOP 檔）。上限 20 分鐘；逾時／當機／停止時殺掉子程序、不挑選、watermark 不變。新增 `--grid-subprocess-smoke`。
+  **#194** (merged `747d4dcd`): the Saturday grid runs in a spawned subprocess instead of the live process, so it no longer holds the GIL and stalls Tk (ticks, fill polling, STOP file). Bounded at 20 min; timeout/crash/stop kills the child, picks nothing, watermark unchanged. Adds `--grid-subprocess-smoke`.
 - **#177（pending merge）**：發行版 `tai_backtest.exe` 直接支援無介面指令（`deploy`／`stop`／`list`／`status`／`strategies`／`backtest`），不另出第二個 EXE。雙擊、沒有參數、或無法辨識的第一個參數仍開 GUI。`--mode` 只接受 `paper` 與 `auto`；`semi_auto` 請用 GUI。不改下單、成交、還原或重連。
   **#177 (pending merge)**: the release `tai_backtest.exe` routes headless commands (`deploy` / `stop` / `list` / `status` / `strategies` / `backtest`); no second EXE. Double-click, no args, or an unknown first token still opens the GUI. `--mode` accepts `paper` and `auto` only; `semi_auto` stays on the GUI. No order, fill, restore or reconnect changes.
 
@@ -93,7 +93,7 @@
 - **Not in this build:** Moving the broker into its own process (#169) isn't included, so a reconnect still happens inside the same process.
 - **User impact:** If it happens, the bot exits or stops responding and does not restart itself. Any open position loses automatic exit management until you restart the bot. After a disconnect alert, check the bot and restart it if it's down or frozen.
 
-- **#192 GIL 卡頓**：由 #194 解決（pending merge）。 / **#192 GIL stall**: resolved by #194 (pending merge).
+- **#192 GIL 卡頓**：已由 #194 解決（網格改在 spawn 子程序執行）。 / **#192 GIL stall**: resolved by #194 (the grid now runs in a spawned subprocess).
 - **#195**：任何建置前必須合併。 / must be merged before any build.
 
 ## 開發者 Developer
