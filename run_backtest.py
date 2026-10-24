@@ -6084,7 +6084,6 @@ class BacktestApp:
                 # is not forwarded: this changelog signature has no
                 # month_gates parameter yet.
                 month_verdict = assembled.month_verdict
-                month_verdict.month_gates
 
                 # Clean PASS → StrategyPool validated only. Never
                 # StrategyStore.save and never STRATEGIES[...].

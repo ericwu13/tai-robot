@@ -668,6 +668,12 @@ class TestRetireRecommendation:
             [{"strategy": "DynamicExitPullback", "change_summary": padded}],
             "DynamicExitPullback",
         )[0].passed is False
+        # The marker regex is case-sensitive.
+        folded = fail.replace("EVO_RELATIVE_GATE", "evo_relative_gate")
+        assert weeks_from_changelog(
+            [{"strategy": "DynamicExitPullback", "change_summary": folded}],
+            "DynamicExitPullback",
+        ) == []
 
     def test_emit_recommends_without_touching_bot_state(self):
         bot = {"trading_mode": "auto", "enabled": True, "pool_status": "live"}

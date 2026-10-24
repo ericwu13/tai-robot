@@ -54,14 +54,13 @@ _REAL_MONEY_MODES = ("semi_auto", "auto", "live", "full_auto")
 # written, so they cannot count toward the retire streak. This is a
 # record of a verdict, not a strategy change.
 RELATIVE_EVAL_MARKER = "EVO_RELATIVE_GATE"
-# Anchored at the start of the summary. A search anywhere in the line
-# would treat the same text inside an AI plan excerpt as a real
-# Saturday record.
+# Anchored at the start of the summary, and case-sensitive. A search
+# anywhere in the line would treat the same text inside an AI plan
+# excerpt as a real Saturday record. A different case is not the marker.
 _EVAL_RE = re.compile(
     rf"^{re.escape(RELATIVE_EVAL_MARKER)}\b.*?"
     r"\bpassed=(true|false)\b.*?\bat="
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})",
-    re.IGNORECASE,
 )
 _RELATIVE_MODES = ("paper", "backtest")
 
