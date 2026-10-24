@@ -112,6 +112,32 @@ evolution:
   # window reports 100-226%. 0 / negative falls back to the default.
   # Not a credential; changing it only rescales evolution scores.
   capital_base_twd: 100000
+  # 僅星期六自動演化：設計窗交易數低於此值時，不呼叫 AI 演化計畫
+  # （0 次 AI 呼叫，水位線不前進），聊天室／Discord 顯示
+  # waiting for sample: N/<門檻>。預設 30，與 fitness.MIN_TRADES 相同，
+  # 只套用在自動路徑。手動「進化」按鈕不受此門檻限制，會記錄
+  # below min_design_trades (N/30), manual override 並仍呼叫 AI。
+  # 已達門檻的自動路徑行為不變。填 0 代表關閉此檢查。
+  # 適應度 composite 的 30 筆 gating 數學不變。
+  #
+  # Saturday/automatic runs only: skip the AI plan call while the
+  # design window has fewer trades than this. The chat/Discord line is
+  # "waiting for sample: N/<threshold>". 0 AI calls, watermark unchanged.
+  # Default 30 (fitness.MIN_TRADES) applies to the automatic path only.
+  # The manual Evolve button is exempt: it logs
+  # "below min_design_trades (N/30), manual override" and still calls
+  # the AI. Bots at or above the threshold keep today's automatic path.
+  # Set 0 to disable the check. Does not change fitness math or gate
+  # semantics. Not a credential.
+  min_design_trades: 30
+  # 水位線跳過（訓練窗沒有新交易）時，若距上次出場已達此日曆天數，
+  # 附加一行 idle N days since last exit <date>。預設 7。填 0 代表
+  # 完全不附加這一行。
+  #
+  # On a watermark skip, append "idle N days since last exit <date>"
+  # when the last trade exit is at least this many calendar days ago.
+  # Default 7. Set 0 to disable the idle line entirely. Not a credential.
+  idle_warn_days: 7
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON
