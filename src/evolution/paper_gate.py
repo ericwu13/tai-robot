@@ -760,7 +760,9 @@ def decide_relative_paper_checks(
         folds: list[Fold],
         base_trade_pnls: list[float],
         config: RelativeGateConfig | None = None,
-        trial: TrialEvidence | None = None) -> EvolutionVerdict:
+        trial: TrialEvidence | None = None,
+        *,
+        pbo_required: bool = True) -> EvolutionVerdict:
     """Fold floor, bootstrap, effect size, post-backfill, DSR, and PBO.
 
     ``meets_min_folds`` (≥ 6 non-empty folds) is required here. A miss
@@ -770,12 +772,18 @@ def decide_relative_paper_checks(
     becomes 3), the same number ``assemble_promotion_verdict`` passes
     into the multi-fold check.
 
-    DSR and PBO come from the pre-registered grid (``trial``). They are
-    required. A missing score, DSR ≤ ``dsr_min``, or PBO ≥ ``pbo_max``
-    is a miss. This function does not recompute CSCV.
+    DSR and PBO come from the pre-registered grid (``trial``). DSR is
+    required. A missing DSR, or DSR ≤ ``dsr_min``, is a miss. PBO is a
+    pass condition only when ``pbo_required`` is true (the grid). The
+    structural lane passes false: two-column CSCV is logged and does
+    not decide. This function does not recompute CSCV.
     """
     cfg = config or RelativeGateConfig()
     divergent_floor = bounded_min_divergent_folds(cfg.min_divergent_folds)
+    pbo_clause = (
+        "PBO informational (not a pass condition)"
+        if not pbo_required else
+        f"PBO<{cfg.pbo_max:g}")
     reasons = [
         f"paper relative thresholds: nonempty≥{cfg.min_nonempty_folds} "
         f"divergent≥{divergent_floor} "
@@ -783,7 +791,7 @@ def decide_relative_paper_checks(
         f"bootstrap p<{cfg.bootstrap_alpha:g} "
         f"effect≥{cfg.effect_size_sigma:g}×σ "
         f"post-backfill≥{cfg.min_post_backfill_folds} "
-        f"DSR>{cfg.dsr_min:g} PBO<{cfg.pbo_max:g} "
+        f"DSR>{cfg.dsr_min:g} {pbo_clause} "
         f"seed={cfg.bootstrap_seed} resamples={cfg.bootstrap_resamples}",
     ]
     passed = True
@@ -872,11 +880,18 @@ def decide_relative_paper_checks(
             f"DSR {dsr_txt} > {cfg.dsr_min:g} "
             f"(N={trial.n_trials} N_eff={trial.n_eff:.4g} "
             f"ρ̄={trial.rho_bar:.4g}): {'✓' if dsr_ok else '✗'}")
-        reasons.append(
-            f"PBO {pbo_txt} < {cfg.pbo_max:g} "
-            f"(CSCV partitions={trial.partitions}): "
-            f"{'✓' if pbo_ok else '✗'}")
-        passed = passed and dsr_ok and pbo_ok
+        if pbo_required:
+            reasons.append(
+                f"PBO {pbo_txt} < {cfg.pbo_max:g} "
+                f"(CSCV partitions={trial.partitions}): "
+                f"{'✓' if pbo_ok else '✗'}")
+            passed = passed and dsr_ok and pbo_ok
+        else:
+            reasons.append(
+                f"PBO {pbo_txt} (CSCV partitions={trial.partitions}): "
+                f"informational only — two-column CSCV is not a "
+                f"pass condition")
+            passed = passed and dsr_ok
 
     return EvolutionVerdict(passed, reasons)
 
@@ -921,6 +936,7 @@ def assemble_promotion_verdict(
         bars=None,
         month_gate=None,
         trial: TrialEvidence | None = None,
+        pbo_required: bool = True,
 ) -> PromotionAssembly:
     """AND month gates, multi-fold, the walk-forward window, and (paper
     relative only) the bootstrap / effect-size / DSR / PBO checks.
@@ -932,11 +948,13 @@ def assemble_promotion_verdict(
     On the relative path the multi-fold divergent floor is
     ``bounded_min_divergent_folds(relative.min_divergent_folds)`` — at
     least 2, and the same number the threshold line logs. The absolute
-    path keeps ``MIN_DIVERGENT_FOLDS``. ``trial`` is the grid's DSR and
-    PBO. The relative path requires it. With no trial (``llm_one``, or
-    a class that is not on the knob grid) the gate falls back to
-    absolute and the verdict carries ``NO_GRID_EVIDENCE_LOG`` instead
-    of failing the relative checks for a missing score.
+    path keeps ``MIN_DIVERGENT_FOLDS``.     ``trial`` is the grid's DSR and
+    PBO. The relative path requires the DSR. PBO is required unless
+    ``pbo_required`` is false (the structural lane logs it and does
+    not gate on it). With no trial (``llm_one``, or a class that is
+    not on the knob grid) the gate falls back to absolute and the
+    verdict carries ``NO_GRID_EVIDENCE_LOG`` instead of failing the
+    relative checks for a missing score.
 
     ``bars`` and ``month_gate`` are forwarded to ``decide_month_gates``.
     This module does not compute the scaled slack. Omitting both keeps
@@ -965,7 +983,7 @@ def assemble_promotion_verdict(
     if relative:
         relative_verdict = decide_relative_paper_checks(
             folds, baseline_pnls_in_folds(base_trades, folds), rel_cfg,
-            trial)
+            trial, pbo_required=pbo_required)
         parts.append(relative_verdict)
     verdict = combine_evolution_verdicts(*parts)
     if fallback_line:

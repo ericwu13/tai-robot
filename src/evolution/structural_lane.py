@@ -72,7 +72,8 @@ DEFAULT_GRAD_MAJORITY = 0.60
 DEFAULT_GRAD_DD_RATIO = 1.2
 DEFAULT_GRAD_DECAY = 0.50
 DEFAULT_PBO_MAX = 0.50
-DEFAULT_DSR_MIN = 0.90
+# Structural lane only. The grid's trial_penalty.dsr_min stays 0.90.
+DEFAULT_DSR_MIN = 0.95
 
 # Outstanding paper recommendations. A refusal does not occupy a slot.
 _IN_PAPER_STATUSES = ("paper_recommended", "graduation_recommended")
@@ -675,10 +676,16 @@ def format_proposal_notice(body: dict) -> str:
 
 def structural_paper_decision(*, sandbox_ok: bool, native_bars: int,
                               q2_passed: bool, pbo, dsr,
-                              config: dict | None = None) -> tuple[bool, list[str]]:
+                              config: dict | None = None,
+                              selection_winner: bool = False,
+                              ) -> tuple[bool, list[str]]:
     """Whether a structural candidate may be *recommended* for paper.
 
-    A pass here still does not promote. Missing PBO or DSR fails closed.
+    A pass here still does not promote. PBO is logged and is not a
+    pass condition: two-column CSCV does not discriminate. A missing
+    DSR fails closed. The candidate must be the strict selection-fold
+    winner against the baseline. ``selection_winner`` defaults to
+    false so a caller that forgets the comparison does not pass.
     """
     cfg = config or default_lane_config()
     reasons: list[str] = []
@@ -698,26 +705,37 @@ def structural_paper_decision(*, sandbox_ok: bool, native_bars: int,
     else:
         reasons.append("Q2 relative checks: FAIL")
         ok = False
-    pbo_max = float(cfg.get("pbo_max", DEFAULT_PBO_MAX))
-    dsr_min = float(cfg.get("dsr_min", DEFAULT_DSR_MIN))
-    if pbo is None or dsr is None:
+    if pbo is None:
         reasons.append(
-            "PBO/DSR not supplied (trial-penalty change); "
+            "PBO not computed; informational only, not a pass condition")
+    else:
+        try:
+            pbo_v = float(pbo)
+        except (TypeError, ValueError):
+            pbo_v = float("nan")
+        reasons.append(
+            f"PBO {pbo_v} informational only "
+            f"(two-column CSCV is not a pass condition)")
+    dsr_min = float(cfg.get("dsr_min", DEFAULT_DSR_MIN))
+    if dsr is None:
+        reasons.append(
+            "DSR not supplied (trial-penalty change); "
             "not treated as a pass")
         ok = False
     else:
         try:
-            pbo_v = float(pbo)
             dsr_v = float(dsr)
         except (TypeError, ValueError):
-            pbo_v = dsr_v = float("nan")
-        pbo_ok = pbo_v == pbo_v and pbo_v < pbo_max
+            dsr_v = float("nan")
         dsr_ok = dsr_v == dsr_v and dsr_v > dsr_min
         reasons.append(
-            f"PBO {pbo_v} < {pbo_max:g}: {'pass' if pbo_ok else 'FAIL'}")
-        reasons.append(
             f"DSR {dsr_v} > {dsr_min:g}: {'pass' if dsr_ok else 'FAIL'}")
-        ok = ok and pbo_ok and dsr_ok
+        ok = ok and dsr_ok
+    if selection_winner:
+        reasons.append("selection-fold winner vs baseline: pass")
+    else:
+        reasons.append("selection-fold winner vs baseline: FAIL")
+        ok = False
     reasons.append(
         "paper entry is a recommendation only; nothing is promoted")
     return ok, reasons

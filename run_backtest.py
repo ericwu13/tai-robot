@@ -6969,14 +6969,17 @@ class BacktestApp:
                             _paper_ok = False
                             _incubation = None
                             _form = _structural_form if structural_lane else ""
+                            _selection_winner = False
                             if structural_lane:
                                 # Paper and backtest use the relative gate.
                                 # Real money stays absolute. A real trial
                                 # keeps the relative path from falling
                                 # back to absolute the way trial=None does.
+                                from dataclasses import replace
                                 from src.evolution.grid_search import (
                                     structural_selection_pnls)
                                 from src.evolution.trial_penalty import (
+                                    selection_fold_winner,
                                     structural_trial_evidence)
                                 _base_pnls, _cand_pnls = structural_selection_pnls(
                                     base_trades, cand_trades,
@@ -6991,6 +6994,24 @@ class BacktestApp:
                                     attempts=_attempt_columns,
                                 )
                                 self._structural_trial_penalty = _structural_trial
+                                _selection_winner = selection_fold_winner(
+                                    _base_pnls, _cand_pnls)
+                                _log(
+                                    "EVO structural trial: "
+                                    f"DSR={_structural_trial.dsr} "
+                                    f"PBO={_structural_trial.pbo} informational "
+                                    f"N={_structural_trial.n_trials} "
+                                    f"selection_winner={_selection_winner}")
+                                # Lane DSR bar, not the grid's 0.90. PBO is
+                                # logged by the relative check and is not a
+                                # pass condition on this lane.
+                                _structural_gate_cfg = replace(
+                                    evo_gate_cfg,
+                                    relative=replace(
+                                        evo_gate_cfg.relative,
+                                        dsr_min=float(_lane_cfg["dsr_min"]),
+                                    ),
+                                )
                                 _q2_abs = abs_pf_required(evo_gate)
                                 _q2_window = (
                                     decide_deep_verdict(
@@ -7004,7 +7025,7 @@ class BacktestApp:
                                         require_abs_pf=_q2_abs))
                                 _q2 = assemble_promotion_verdict(
                                     gate=evo_gate,
-                                    gate_cfg=evo_gate_cfg,
+                                    gate_cfg=_structural_gate_cfg,
                                     folds=folds,
                                     base_trades=base_trades,
                                     cand_trades=cand_trades,
@@ -7014,11 +7035,16 @@ class BacktestApp:
                                     bars=bars,
                                     month_gate=month_gate_cfg,
                                     trial=_structural_trial,
+                                    pbo_required=False,
                                 )
                                 _q2_passed = (
                                     bool(_q2.verdict.passed)
-                                    and not bool(_q2.verdict.provisional))
+                                    and not bool(_q2.verdict.provisional)
+                                    and _selection_winner)
                                 _q2_reasons = list(_q2.verdict.reasons)
+                                _q2_reasons.append(
+                                    "selection-fold winner vs baseline: "
+                                    + ("pass" if _selection_winner else "FAIL"))
                                 _paper_ok, _paper_reasons = structural_paper_decision(
                                     sandbox_ok=True,
                                     native_bars=native_est,
@@ -7026,6 +7052,7 @@ class BacktestApp:
                                     pbo=_structural_trial.pbo,
                                     dsr=_structural_trial.dsr,
                                     config=_lane_cfg,
+                                    selection_winner=_selection_winner,
                                 )
                                 _bt_mean = None
                                 if cand_trades:
@@ -7055,6 +7082,13 @@ class BacktestApp:
                                     "paper_recommended": _paper_ok,
                                     "native_bars": native_est,
                                     "sandbox_ok": True,
+                                    "pbo": (None if _structural_trial is None
+                                            else _structural_trial.pbo),
+                                    "dsr": (None if _structural_trial is None
+                                            else _structural_trial.dsr),
+                                    "selection_winner": (
+                                        _selection_winner if structural_lane
+                                        else None),
                                     "dsr_trials": (
                                         _structural_trial.n_trials
                                         if structural_lane and _structural_trial is not None

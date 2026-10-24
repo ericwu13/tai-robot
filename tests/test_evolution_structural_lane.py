@@ -367,18 +367,28 @@ class TestStructuralLaneGate:
         assert passes_native_bar_guard(150) is True
         ok, reasons = structural_paper_decision(
             sandbox_ok=True, native_bars=200, q2_passed=True,
-            pbo=None, dsr=None)
+            pbo=None, dsr=None, selection_winner=True)
         assert ok is False
         assert any("not supplied" in line for line in reasons)
+        # PBO is logged. It does not decide. DSR must clear 0.95.
         ok, reasons = structural_paper_decision(
             sandbox_ok=True, native_bars=200, q2_passed=True,
-            pbo=0.2, dsr=0.95)
-        assert ok is True
+            pbo=0.99, dsr=0.99, selection_winner=True)
+        assert ok is True, reasons
+        assert any("informational" in line for line in reasons)
         assert any("recommendation only" in line for line in reasons)
-        bad, _ = structural_paper_decision(
+        below, below_reasons = structural_paper_decision(
             sandbox_ok=True, native_bars=200, q2_passed=True,
-            pbo=0.8, dsr=0.95)
-        assert bad is False
+            pbo=0.1, dsr=0.93, selection_winner=True)
+        assert below is False
+        assert any(line.startswith("DSR ") and "FAIL" in line
+                   for line in below_reasons)
+        not_winner, winner_reasons = structural_paper_decision(
+            sandbox_ok=True, native_bars=200, q2_passed=True,
+            pbo=0.1, dsr=0.99, selection_winner=False)
+        assert not_winner is False
+        assert any("selection-fold winner" in line and "FAIL" in line
+                   for line in winner_reasons)
 
     def test_module_does_not_import_the_knob_grid_or_open_drafts(self):
         tree = ast.parse(Path("src/evolution/structural_lane.py").read_text(
@@ -1391,7 +1401,8 @@ def test_structural_saturday_replaces_the_grid_other_saturdays_run_it(
 # from DSR and PBO. Nine selection folds support CSCV S = 8.
 _STRONG_DELTAS = [180, 220, 160, 240, 190, 210, 170, 230, 200, 200]
 # Early folds look strong and later folds give it back. CSCV PBO is 1
-# and DSR stays under 0.90, so the paper recommendation fails closed.
+# and DSR stays under 0.95, so the paper recommendation fails closed.
+# PBO on that book is high and is not what decides it.
 _OVERFIT_DELTAS = [1200, 1100, 1300, 1000, -900, -800, -1000, -700, -900, -800]
 
 
@@ -1601,6 +1612,110 @@ class TestStructuralQ2Evidence:
         example = Path("settings.example.yaml").read_text(encoding="utf-8")
         assert "One GUI per tree is the supported" in example
         assert "no cross-process lock" in example
+        assert "two-column CSCV" in text
+        assert "0.95" in text
+        assert "about half the time" in text
+
+    def test_structural_dsr_min_is_stricter_than_the_grid(self):
+        from src.evolution.paper_gate import DEFAULT_DSR_MIN as grid_dsr_min
+        assert default_lane_config()["dsr_min"] == pytest.approx(0.95)
+        assert grid_dsr_min == pytest.approx(0.90)
+        src = inspect.getsource(rb.BacktestApp._start_evolution_pipeline)
+        assert 'dsr_min=float(_lane_cfg["dsr_min"])' in src
+        assert "pbo_required=False" in src
+
+    def test_assumed_sharpe_dispersion_makes_n_trials_bite(self):
+        """The same Δ passes at one attempt and fails when N is large.
+
+        One scored column has sample Sharpe dispersion 0. Without the
+        assumed-σ floor, SR0 stays 0 and a large attempt count does not
+        move DSR.
+        """
+        from src.evolution.trial_penalty import (
+            STRUCTURAL_ASSUMED_SHARPE_STD, structural_trial_evidence)
+
+        assert STRUCTURAL_ASSUMED_SHARPE_STD == 1.0
+        mild = [20.0, 60.0, 10.0, 80.0, 30.0, 70.0, 15.0, 55.0, 40.0]
+        base = [0.0] * len(mild)
+        cand = [b + d for b, d in zip(base, mild)]
+        one = structural_trial_evidence(
+            baseline_folds=base, attempts=[cand])
+        many = structural_trial_evidence(
+            baseline_folds=base, attempts=[None] * 9 + [cand])
+        assert one.n_trials == 1
+        assert many.n_trials == 10
+        assert one.dsr is not None and one.dsr > 0.95
+        assert many.dsr is not None and many.dsr <= 0.95
+        passed, _ = structural_paper_decision(
+            sandbox_ok=True, native_bars=200, q2_passed=True,
+            pbo=one.pbo, dsr=one.dsr, selection_winner=True)
+        failed, reasons = structural_paper_decision(
+            sandbox_ok=True, native_bars=200, q2_passed=True,
+            pbo=many.pbo, dsr=many.dsr, selection_winner=True)
+        assert passed is True
+        assert failed is False
+        assert any(line.startswith("DSR ") and "FAIL" in line
+                   for line in reasons)
+
+    def test_holdout_cutoff_before_the_last_fold_drops_the_tail(self):
+        """Walk-forward cutoff earlier than the last fold start is excluded.
+
+        Ignoring ``holdout_start`` (HOLDOUT_START_IGNORED) leaves the
+        tail inside the selection fold and this comparison fails.
+        """
+        from src.evolution.grid_search import structural_selection_pnls
+        from src.evolution.pipeline import analyze_folds
+
+        base, cand = _fold_trades(_STRONG_DELTAS)
+        folds = analyze_folds(base, cand, fold_days=14, max_folds=10)
+        last_start = folds[-1].start
+        early = "2026-04-27 11:00"
+        assert early < last_start
+        full_b, full_c = structural_selection_pnls(
+            base, cand, fold_days=14, holdout_start=last_start)
+        cut_b, cut_c = structural_selection_pnls(
+            base, cand, fold_days=14, holdout_start=early)
+        assert full_c[-1] == pytest.approx(-100.0)
+        assert cut_c[-1] == pytest.approx(150.0)
+        assert cut_b[-1] == pytest.approx(150.0)
+        assert (full_b, full_c) != (cut_b, cut_c)
+
+    def test_grid_still_requires_pbo_and_structural_does_not(self):
+        from src.evolution.paper_gate import (
+            RelativeGateConfig,
+            assemble_promotion_verdict,
+            decide_relative_paper_checks,
+            evolution_gate_config_from_mapping,
+            resolve_promotion_gate,
+        )
+        from src.evolution.pipeline import EvolutionVerdict, analyze_folds
+        from src.evolution.trial_penalty import TrialEvidence
+
+        base, cand = _fold_trades(_STRONG_DELTAS)
+        folds = analyze_folds(base, cand, fold_days=14, max_folds=10)
+        cfg = evolution_gate_config_from_mapping({
+            "paper_gate": "relative", "real_gate": "absolute"})
+        gate = resolve_promotion_gate("paper", cfg.paper_gate, "absolute")
+        high_pbo = TrialEvidence(
+            dsr=0.99, pbo=0.99, n_trials=1, n_eff=1.0,
+            rho_bar=0.0, partitions=8)
+        window = EvolutionVerdict(True, ["window held"])
+        common = dict(
+            gate=gate, gate_cfg=cfg, folds=folds, base_trades=base,
+            cand_trades=cand, holdout_start=folds[-1].start, criteria=None,
+            window_verdict=window, trial=high_pbo)
+        gated = assemble_promotion_verdict(**common)
+        assert not gated.verdict.passed
+        assert any("PBO 0.9900" in r and "✗" in r for r in gated.verdict.reasons)
+        open_pbo = assemble_promotion_verdict(**common, pbo_required=False)
+        assert open_pbo.verdict.passed and not open_pbo.verdict.provisional
+        assert any("informational only" in r for r in open_pbo.verdict.reasons)
+        # Default argument stays the grid's gate. Flipping it to false
+        # lets this high PBO through.
+        direct = decide_relative_paper_checks(
+            folds, [t.pnl for t in base], RelativeGateConfig(
+                bootstrap_resamples=50), high_pbo)
+        assert not direct.passed
 
 
 def _run_structural_q2(tmp_path, monkeypatch, *, deltas, trading_mode,
@@ -1698,8 +1813,11 @@ def test_lane_recommends_paper_for_a_strong_candidate(tmp_path, monkeypatch):
                    for line in evidence["q2_reasons"])
     assert any("DSR" in line and "pass" in line
                for line in evidence["paper_reasons"])
-    assert any("PBO" in line and "pass" in line
+    assert any("PBO" in line and "informational" in line
                for line in evidence["paper_reasons"])
+    assert evidence["selection_winner"] is True
+    assert evidence["dsr"] > 0.95
+    assert evidence["pbo"] == 0.0
     assert any("recommendation only" in line
                for line in evidence["paper_reasons"])
     assert body["applied"] is False
@@ -1720,8 +1838,9 @@ def test_lane_fails_closed_on_an_overfit_candidate(tmp_path, monkeypatch):
     body = json.loads(proposals[0].read_text(encoding="utf-8"))
     evidence = body["evidence"]
     assert evidence["paper_recommended"] is False
-    assert any(line.startswith("PBO ") and "FAIL" in line
-               for line in evidence["paper_reasons"])
+    assert any("informational" in line for line in evidence["paper_reasons"])
+    assert not any(line.startswith("PBO ") and "FAIL" in line
+                   for line in evidence["paper_reasons"])
     assert any(line.startswith("DSR ") and "FAIL" in line
                for line in evidence["paper_reasons"])
     from src.evolution.structural_lane import load_ledger
@@ -1740,6 +1859,31 @@ def test_real_money_structural_q2_stays_absolute(tmp_path, monkeypatch):
                for line in evidence["q2_reasons"])
     assert not any("dropped on the paper relative path" in line
                    for line in evidence["q2_reasons"])
+
+
+def test_no_edge_candidate_is_not_recommended(tmp_path, monkeypatch):
+    """A selection-fold tie with the baseline is not a paper recommendation.
+
+    Two-column PBO can clear a no-edge book. The lane does not.
+    """
+    from src.evolution.structural_lane import load_ledger
+
+    # Nine selection folds sum to 0. The tenth value is the holdout.
+    deltas = [80, -80, 60, -60, 40, -40, 20, -20, 0, 0]
+    app, proposals, pool_path, ledger = _run_structural_q2(
+        tmp_path, monkeypatch, deltas=deltas, trading_mode="paper")
+    assert app.errors == [], app.errors
+    body = json.loads(proposals[0].read_text(encoding="utf-8"))
+    evidence = body["evidence"]
+    assert evidence["paper_recommended"] is False
+    assert evidence["selection_winner"] is False
+    assert any("selection-fold winner" in line and "FAIL" in line
+               for line in evidence["paper_reasons"])
+    assert any("informational" in line for line in evidence["paper_reasons"])
+    assert body["pool_promoted"] is False
+    assert body["applied"] is False
+    assert load_ledger(ledger)["incubations"][-1]["status"] == "not_admitted"
+    assert _validated_count(pool_path) == 0
 
 
 def test_failed_codegen_attempt_is_one_trial(tmp_path, monkeypatch):

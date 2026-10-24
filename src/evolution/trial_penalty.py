@@ -225,7 +225,8 @@ def deflated_sharpe_ratio(
         n_trials: float,
         n_obs: int,
         skew: float,
-        kurtosis: float) -> float | None:
+        kurtosis: float,
+        sr0_floor: float = 0.0) -> float | None:
     """Probability that the true Sharpe exceeds 0 after the trial penalty.
 
     Bailey & López de Prado (2014), "The Deflated Sharpe Ratio":
@@ -234,9 +235,11 @@ def deflated_sharpe_ratio(
         SE(SR) = sqrt( (1 - γ3*SR + ((γ4 - 1)/4)*SR^2) / (T - 1) )
 
     ``SR0`` is ``expected_maximum_sharpe`` (0 only when N ≤ 1 or the
-    cross-trial dispersion is 0). ``γ3`` is skewness and ``γ4`` is
-    non-excess kurtosis. None when the estimation variance is not
-    positive or an input is non-finite. The caller treats None as a miss.
+    cross-trial dispersion is 0), then raised to ``sr0_floor`` when
+    that bound is higher. The grid passes no floor. ``γ3`` is skewness
+    and ``γ4`` is non-excess kurtosis. None when the estimation
+    variance is not positive or an input is non-finite. The caller
+    treats None as a miss.
     """
     if n_obs < 2:
         return None
@@ -246,6 +249,8 @@ def deflated_sharpe_ratio(
     if sharpe_std < 0.0:
         return None
     sr0 = expected_maximum_sharpe(n_trials, sharpe_std)
+    if math.isfinite(sr0_floor) and sr0_floor > sr0:
+        sr0 = sr0_floor
     var = (
         1.0
         - skew * observed_sharpe
@@ -417,21 +422,74 @@ def score_configuration(
         fold_pnls: list[float],
         *,
         n_eff: float,
-        sharpe_std: float) -> float | None:
-    """DSR of one configuration's fold-PnL vector."""
+        sharpe_std: float,
+        sr0_floor: float = 0.0) -> float | None:
+    """DSR of one configuration's fold-PnL vector.
+
+    ``sr0_floor`` is a lower bound on the selection premium. The grid
+    leaves it at 0. The structural lane passes the assumed-dispersion
+    floor so a single scored column does not wipe the trial count out.
+    """
     sr = sharpe_ratio(fold_pnls)
     moments = sample_moments(fold_pnls)
     if sr is None or moments is None:
         return None
     skew, kurtosis = moments
     return deflated_sharpe_ratio(
-        sr, sharpe_std, n_eff, len(fold_pnls), skew, kurtosis)
+        sr, sharpe_std, n_eff, len(fold_pnls), skew, kurtosis,
+        sr0_floor=sr0_floor)
 
 
 def trial_sharpe_std(sharpes: list[float]) -> float:
     """Cross-sectional sample standard deviation of finite trial Sharpes."""
     finite = [s for s in sharpes if s is not None and math.isfinite(s)]
     return _sample_std(finite)
+
+
+# Bailey & López de Prado SR0 is linear in the cross-trial Sharpe
+# standard deviation. One scored column has a sample deviation of 0,
+# which zeros SR0 for every trial count and deletes the penalty.
+# σ_SR = 1 is one standard deviation of unseen trial Sharpes, in the
+# same units as the fold-PnL Sharpe (mean / sample std of the
+# selection-fold Δ). It is the scale of the statistic itself, not a
+# number fit to a backtest. N ≤ 1 still has SR0 = 0: the formula has
+# no selection premium for a single trial. For N > 1 the floor is
+# expected_maximum_sharpe(N, this constant) and it replaces a smaller
+# empirical SR0. The grid does not use this constant.
+STRUCTURAL_ASSUMED_SHARPE_STD = 1.0
+
+
+def selection_fold_winner(baseline_folds: list[float],
+                          candidate_folds: list[float]) -> bool:
+    """True when the candidate strictly wins the selection folds.
+
+    The score is the sum of selection-fold PnL, the same in-sample
+    score CSCV uses. The baseline is column 0, and a tie takes the
+    lower column index, so a tie is not a candidate win. Empty or
+    mismatched columns are not a win.
+    """
+    if not baseline_folds or not candidate_folds:
+        return False
+    if len(baseline_folds) != len(candidate_folds):
+        return False
+    try:
+        base = sum(float(x) for x in baseline_folds)
+        cand = sum(float(x) for x in candidate_folds)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(base) or not math.isfinite(cand):
+        return False
+    return cand > base
+
+
+def structural_sr0_floor(n_trials: float) -> float:
+    """Assumed-dispersion SR0 for one structural turn.
+
+    Uses the raw attempt count, including refused and failed codegen
+    attempts. One attempt has no premium.
+    """
+    return expected_maximum_sharpe(
+        n_trials, STRUCTURAL_ASSUMED_SHARPE_STD)
 
 
 def structural_trial_evidence(
@@ -455,10 +513,13 @@ def structural_trial_evidence(
     (candidate minus baseline). ρ̄ is the mean pairwise correlation of
     those scored Δ columns. A single scored column has no pair, so ρ̄
     is 0 and ``N_eff`` equals ``n_trials``. One scored Sharpe has no
-    cross-trial dispersion, so the selection premium SR0 is 0 even when
-    failed attempts raise N. That is ``expected_maximum_sharpe``: a
-    non-positive dispersion has no premium. It is not a waiver of the
-    trial count.
+    measured cross-trial dispersion. The structural path does not treat
+    that as SR0 = 0. It applies ``structural_sr0_floor`` — Bailey &
+    López de Prado's expected maximum with
+    ``STRUCTURAL_ASSUMED_SHARPE_STD`` and this turn's attempt count,
+    including refused and failed attempts — whenever that floor is
+    above the empirical SR0. One attempt still has no premium. More
+    attempts raise the bar.
 
     PBO is CSCV on one matrix whose columns are the baseline fold PnL
     and each scored candidate's fold PnL (absolute, not the Δ). With
@@ -466,9 +527,10 @@ def structural_trial_evidence(
     candidate. A split counts as overfit when the in-sample winner's
     out-of-sample PnL is at or below the OOS median. For two columns
     that is the in-sample winner failing to beat the other column out
-    of sample. Fewer than 8 selection folds cannot form S = 8, a
-    constant Δ series has no Sharpe, and any other miss leaves ``dsr``
-    or ``pbo`` as None. None is not a pass.
+    of sample. That comparison has no discriminating power, so the
+    structural decision logs PBO and does not gate on it. Fewer than 8
+    selection folds cannot form S = 8, and a constant Δ series has no
+    Sharpe. A missing DSR leaves ``dsr`` as None. None is not a pass.
 
     ``chosen`` is an index into ``attempts``. The default is the last
     scored attempt.
@@ -510,7 +572,8 @@ def structural_trial_evidence(
     dsr = None
     if chosen_pos is not None:
         dsr = score_configuration(
-            deltas[chosen_pos], n_eff=n_eff, sharpe_std=sharpe_std)
+            deltas[chosen_pos], n_eff=n_eff, sharpe_std=sharpe_std,
+            sr0_floor=structural_sr0_floor(n_trials))
     columns = ([base] + scored_abs) if base and scored_abs else []
     matrix = [list(row) for row in zip(*columns)] if columns else []
     if matrix:

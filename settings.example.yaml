@@ -288,14 +288,17 @@ evolution:
   # The month's structural Saturday replaces that day's knob-grid
   # sweep. Other Saturdays run the grid. The lane uses the same history
   # file and the same per-bot run guard. It does not add a history cap.
-  # Paper and backtest Q2 use the relative gate with DSR and CSCV PBO
-  # (change versus the baseline, holdout excluded). Real money stays
-  # absolute. paper_recommended is text only.
+  # Paper and backtest Q2 use the relative gate. Structural dsr_min
+  # is 0.95; the grid's trial_penalty.dsr_min stays 0.90. The candidate
+  # must beat the baseline on the selection folds. PBO is computed and
+  # shown, and it is not a pass condition (two-column CSCV does not
+  #   discriminate). Real money stays absolute. paper_recommended is text only.
   # The shared ledger has one process-wide threading lock around
   # reserve, record, and save. One GUI per tree is the supported
   # model. There is no cross-process lock and no file lock.
   structural_lane:
     enabled: true
+    dsr_min: 0.95              # this lane only; grid trial_penalty.dsr_min stays 0.90
     per_bot_per_month: 1
     max_in_paper: 3
     min_paper_sessions: 21
