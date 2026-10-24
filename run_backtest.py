@@ -17,6 +17,15 @@ import faulthandler
 import logging
 import os
 import sys
+
+# Frozen EXE spawn children re-execute this file as __main__. This has
+# to run before Tk, COM, or the Capital API are imported and before
+# main() starts a bot. A child sees --multiprocessing-fork, runs the
+# grid payload, and exits here. The headless entry is run_bot_cli.py.
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
 import inspect
 import queue
 import threading
@@ -6140,6 +6149,9 @@ class BacktestApp:
                 _refuse_overlapping_evolution(self, auto_run=auto_run)
                 return
         started = False
+        # A previous stop must not cancel this run. _stop_live sets the
+        # flag again if the operator stops while this run is in flight.
+        self._evolution_cancel = False
         try:
             context = (
                 preamble
@@ -6330,8 +6342,15 @@ class BacktestApp:
                     # Eligible knob classes are scored on a pre-registered
                     # grid. The model does not pick the setting. llm_one and
                     # classes that are not on the knob grid keep the plan.
+                    from src.evolution.grid_process import (
+                        DEFAULT_GRID_TIMEOUT_S,
+                        GridJob,
+                        GridProcessFailure,
+                        grid_failure_message,
+                        run_grid_isolated,
+                    )
                     from src.evolution.grid_search import (
-                        explanation_prompt, grid_search_applies, run_grid_on_bars)
+                        explanation_prompt, grid_search_applies)
                     grid_trial = None
                     _knob_apply = None
                     grid_outcome = None
@@ -6353,15 +6372,62 @@ class BacktestApp:
                             evolution_gate_raw
                             if isinstance(evolution_gate_raw, dict) else {}
                         ).relative.fold_days
-                        grid_outcome = run_grid_on_bars(
-                            strategy_cls=baseline_cls,
-                            source=strategy_source,
-                            bars=bars,
-                            point_value=point_value,
-                            capital_base=capital_base,
-                            evo=evolution_gate_raw,
-                            fold_days=int(_grid_fold_days),
+
+                        def _grid_stop_requested() -> bool:
+                            # GUI stop sets the flag. Headless `STOP` is a
+                            # file in the bot directory. Either one kills
+                            # the grid child; this thread only polls.
+                            if getattr(self, "_evolution_cancel", False):
+                                return True
+                            if not bot_dir:
+                                return False
+                            try:
+                                from src.live.headless import stop_requested
+                                return bool(stop_requested(bot_dir))
+                            except Exception:
+                                return False
+
+                        _timeout = getattr(self, "_grid_timeout_s", None)
+                        if _timeout is None:
+                            _timeout = DEFAULT_GRID_TIMEOUT_S
+                        _gate_raw = (dict(evolution_gate_raw)
+                                     if isinstance(evolution_gate_raw, dict)
+                                     else {})
+                        # Default is a spawn child. `_grid_in_process` is
+                        # the test seam (monkeypatched run_grid_on_bars).
+                        grid_result = run_grid_isolated(
+                            GridJob(
+                                source=strategy_source or "",
+                                class_name=(baseline_cls.__name__
+                                            if baseline_cls is not None
+                                            else ""),
+                                bars=tuple(bars),
+                                point_value=int(point_value),
+                                capital_base=int(capital_base),
+                                evo=_gate_raw,
+                                fold_days=int(_grid_fold_days),
+                            ),
+                            timeout_s=float(_timeout),
+                            stop_check=_grid_stop_requested,
+                            in_process=bool(
+                                getattr(self, "_grid_in_process", False)),
                         )
+                        if isinstance(grid_result, GridProcessFailure):
+                            # No trial evidence. Same exit as a grid that
+                            # selected nothing: no model pick, watermark
+                            # stays, one history line. The finally below
+                            # releases the evolution guard.
+                            _log(
+                                "EVO grid subprocess "
+                                f"{grid_result.kind} pid={grid_result.pid}: "
+                                f"{grid_result.detail}")
+                            msg = grid_failure_message(grid_result)
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "grid_failed", msg)
+                            return
+                        grid_outcome = grid_result
                         for line in grid_outcome.reasons:
                             _log(line)
                         if grid_outcome.selected is None:
@@ -10794,6 +10860,10 @@ class BacktestApp:
 
     def _stop_live(self):
         """Stop the live bot and restore UI."""
+        # The grid sweep runs in another process. The worker polls this
+        # flag and terminates that child so a GUI stop does not wait
+        # out the sweep. The headless STOP file is polled the same way.
+        self._evolution_cancel = True
         self._stop_account_polling()
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
@@ -10990,6 +11060,5 @@ def main():
 
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
+    # freeze_support() already ran at the top of this module, before Tk.
     main()

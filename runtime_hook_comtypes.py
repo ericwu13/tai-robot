@@ -1,12 +1,21 @@
 """PyInstaller runtime hook: frozen-EXE fixups for comtypes and pythonnet.
 
-1. comtypes.gen: writable cache directory next to EXE.
+1. comtypes.gen: writable cache directory next to EXE. Skipped in a
+   multiprocessing spawn child (`--multiprocessing-fork`) so the grid
+   sweep does not import COM.
 2. pythonnet: set PYTHONNET_PYDLL so Python.Runtime.dll finds the Python
    shared library in both the main process and multiprocessing children.
 3. PATH: prepend _MEIPASS so the .NET CLR can resolve native DLLs.
 """
 import os
 import sys
+
+
+def _is_multiprocessing_child(argv=None) -> bool:
+    """True when this frozen process is a spawn child, not the bot."""
+    args = sys.argv if argv is None else argv
+    return len(args) >= 2 and args[1] == "--multiprocessing-fork"
+
 
 if getattr(sys, 'frozen', False):
     _bundle_dir = sys._MEIPASS
@@ -40,14 +49,18 @@ if getattr(sys, 'frozen', False):
         os.environ['PATH'] = _bundle_dir + os.pathsep + _path
 
     # ── comtypes ──
-    cache_dir = os.path.join(os.path.dirname(sys.executable), '_comtypes_cache')
-    os.makedirs(cache_dir, exist_ok=True)
+    # The grid child is a frozen re-exec of this EXE. It must not import
+    # COM. PATH / PYTHONNET above do not import comtypes.
+    if not _is_multiprocessing_child():
+        cache_dir = os.path.join(
+            os.path.dirname(sys.executable), '_comtypes_cache')
+        os.makedirs(cache_dir, exist_ok=True)
 
-    import comtypes.gen
-    comtypes.gen.__path__.insert(0, cache_dir)
+        import comtypes.gen
+        comtypes.gen.__path__.insert(0, cache_dir)
 
-    try:
-        import comtypes.client._code_cache as _cc
-        _cc.gen_dir = cache_dir
-    except (ImportError, AttributeError):
-        pass
+        try:
+            import comtypes.client._code_cache as _cc
+            _cc.gen_dir = cache_dir
+        except (ImportError, AttributeError):
+            pass

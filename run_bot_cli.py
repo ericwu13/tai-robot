@@ -22,6 +22,13 @@ from __future__ import annotations
 
 import os
 import sys
+
+# Frozen spawn children re-execute this entry before main(). Must run
+# before headless imports run_backtest (Tk / COM / the bot).
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
 import time
 
 # Same sys.path setup as run_backtest.py so `import run_backtest` works
@@ -166,6 +173,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
+    # freeze_support() already ran above, before headless imported Tk.
     sys.exit(main())
