@@ -350,9 +350,20 @@ class FillPoller:
                 new_trading_mode="semi_auto",
             )
 
-        # Clear fill pending state — do NOT halt
+        # Clear fill pending state — do NOT halt.
+        # Any timeout that drops the gate also drops the deferred close,
+        # whether the order was an entry or an exit. This is the only
+        # timeout path the app uses (_on_fill_timeout).
+        # TradingGuard.on_fill_timeout discards the close, but the app
+        # never calls it. The close belonged to the order that just
+        # timed out. The next entry confirm pops whatever is left, and
+        # after the downgrade to semi-auto that confirm only happens
+        # once the operator switches back to auto. An exit timeout had
+        # the same leak before #171. The resumed-mismatch return above
+        # keeps the gate up and does not reach here.
         self._guard.fill_pending = False
         self._guard.fill_pending_type = ""
+        self._guard._deferred_close = None
 
         # Conservative assumption: order filled. A resumed entry is
         # the exception — assuming it filled lets _on_fill_confirmed

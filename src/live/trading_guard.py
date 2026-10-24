@@ -42,11 +42,19 @@ class TradingGuard:
         stays with :meth:`restore_confirmed_position` so a stale snapshot
         cannot un-confirm a position the #79 reconcile just accepted.
         """
+        # A deferred close is only replayed when the ENTRY it was waiting
+        # on confirms. Saving it after that entry has timed out (or beside
+        # an in-flight exit) lets the next entry confirm send it.
         deferred = self._deferred_close
+        keep_close = (
+            bool(self.fill_pending)
+            and self.fill_pending_type == "entry"
+            and isinstance(deferred, dict)
+        )
         return {
             "fill_pending": bool(self.fill_pending),
             "fill_pending_type": self.fill_pending_type if self.fill_pending else "",
-            "deferred_close": dict(deferred) if isinstance(deferred, dict) else None,
+            "deferred_close": dict(deferred) if keep_close else None,
         }
 
     def restore_inflight(self, data: dict) -> None:
@@ -63,8 +71,16 @@ class TradingGuard:
         kind = str(data.get("fill_pending_type") or "")
         self.fill_pending = pending
         self.fill_pending_type = kind if pending else ""
+        # Same gate as to_dict. restore_confirmed_position() has already
+        # cleared a stale close on the open-and-matching branch; putting
+        # the snapshot back unconditionally undoes that clear. A file
+        # written before this gate (fill_pending false, close still set)
+        # must not come back either.
         deferred = data.get("deferred_close")
-        self._deferred_close = dict(deferred) if isinstance(deferred, dict) else None
+        if pending and kind == "entry" and isinstance(deferred, dict):
+            self._deferred_close = dict(deferred)
+        else:
+            self._deferred_close = None
 
     def reset(self) -> None:
         """Reset all state (called on new deploy)."""
