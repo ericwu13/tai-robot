@@ -55,17 +55,39 @@ The app can be packaged as a standalone Windows EXE using PyInstaller (--onedir 
 
 ### Build Steps
 
+The EXE toolchain is pinned in `requirements-build.txt`:
+
+- `PyInstaller==6.19.0`
+- `comtypes==1.4.15`
+
+Those pins are load-bearing. PyInstaller 6.22.3 with comtypes 1.4.17 builds an EXE that dies at startup in `runtime_hook_comtypes.py` (`ModuleNotFoundError: No module named 'comtypes.gen'`). 6.19.0 + 1.4.15 does not. Do not float them without launching the EXE on Windows.
+
 ```bash
-# From the project root
+# From the project root. build_release.py installs the pins when they
+# are missing or different, then runs PyInstaller. --skip-release builds
+# and zips only (no GitHub release, no Discord).
+python build_release.py --skip-release
+```
+
+Equivalent direct invocation, after the same pins are installed:
+
+```bash
+pip install -r requirements-build.txt
 python -m PyInstaller tai_backtest.spec --noconfirm
 ```
 
 Output: `dist/tai_backtest/tai_backtest.exe`
 
+`strategies/` is gitignored and holds per-machine AI strategies. A fresh clone does not have that directory. The spec does not bundle it. At build time it stages an empty placeholder under `build/strategies_placeholder/` (a `README.txt` only) so PyInstaller has a datas source, and private `.py` files are never copied into the EXE. Saved strategies are loaded at runtime from the `strategies/` directory next to `tai_backtest.exe`, which the app creates on first use.
+
+`runtime_hook_comtypes.py` points `comtypes.gen` at a writable `_comtypes_cache` next to the EXE. If the frozen bundle did not collect `comtypes.gen`, the hook creates that package in the cache instead of crashing. The spec also lists `comtypes.gen` in `hiddenimports` so a build with the pinned comtypes collects the real package. Confirming the EXE process actually starts still requires Windows.
+
 ### Build Files
 
 | File | Purpose |
 |------|---------|
+| `requirements-build.txt` | Pinned PyInstaller and comtypes for the EXE build |
+| `build_release.py` | Installs those pins, runs the spec, zips the dist |
 | `tai_backtest.spec` | PyInstaller build specification (--onedir mode) |
 | `runtime_hook_comtypes.py` | Runtime hook for writable comtypes.gen cache |
 
@@ -73,7 +95,8 @@ Output: `dist/tai_backtest/tai_backtest.exe`
 
 - SDK DLLs (8 files from `CapitalAPI_2.13.57/.../libs/`) into `_internal/libs/`
 - `lightweight_charts/js/` (WebGL chart assets)
-- `data/`, `src/`, `strategies/` directories
+- `src/`
+- an empty `strategies/` placeholder (private `strategies/` is not packaged)
 - `settings.example.yaml` as config template
 
 ## Deploying the EXE

@@ -19,6 +19,13 @@ _lwc_js = os.path.join(_lwc_dir, 'js')
 _holidays_submodules = collect_submodules('holidays')
 _holidays_datas = collect_data_files('holidays')
 
+# ``strategies/`` is gitignored (private AI strategies). A fresh clone does
+# not have the directory, and PyInstaller aborts if a datas source is
+# missing. Never point datas at that tree — a developer build would ship
+# their private strategies. Stage an empty placeholder instead.
+from build_release import strategies_datas
+_strategies_datas = strategies_datas(SPECPATH)
+
 # Collect SDK DLLs
 sdk_libs = os.path.join(
     'CapitalAPI_2.13.57', 'CapitalAPI_2.13.57_PythonExample',
@@ -35,7 +42,7 @@ a = Analysis(
     binaries=dll_binaries,
     datas=[
         ('src', 'src'),
-        ('strategies', 'strategies'),
+        *_strategies_datas,
         ('settings.example.yaml', '.'),
         (_lwc_js, 'lightweight_charts/js'),
         *_holidays_datas,
@@ -47,9 +54,15 @@ a = Analysis(
         # TAIFEX settlement-day detection (3rd Wed early close)
         # Must include ALL submodules — see note above about dynamic import.
         *_holidays_submodules,
-        # COM (Capital API) — include submodules PyInstaller's analysis misses
+        # COM (Capital API) — include submodules PyInstaller's analysis misses.
+        # ``comtypes.gen`` is generated at runtime. PyInstaller 6.22.3 with
+        # comtypes 1.4.17 leaves it out of the bundle and the EXE crashes in
+        # runtime_hook_comtypes.py. Force-include it when the installed
+        # package ships it; the runtime hook still builds the package in
+        # the writable cache if this import is missing at startup.
         'comtypes', 'comtypes.client', 'comtypes.stream',
         'comtypes.client._code_cache', 'comtypes.client._generate',
+        'comtypes.gen',
         # TradingView data feed (optional)
         'tvDatafeed', 'websocket', 'websocket._abnf', 'websocket._core',
         'websocket._exceptions', 'websocket._http', 'websocket._logging',

@@ -38,9 +38,24 @@ ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 # Tracked paths whose uncommitted state would make the build untraceable.
 SOURCE_PATHS = ["src", "run_backtest.py", "version.py"]
 
+# Pinned toolchain consumed by ``build()`` before PyInstaller runs.
+# PyInstaller 6.22.3 + comtypes 1.4.17 omit ``comtypes.gen`` and the EXE
+# dies in the runtime hook. Do not float these pins.
+BUILD_REQUIREMENTS = "requirements-build.txt"
+
 # Files and directories to EXCLUDE from the release zip
 EXCLUDE_FILES = set()  # settings.yaml is now included with default values
 EXCLUDE_DIRS = {"CapitalLog_Backtest", "_comtypes_cache", "__pycache__", "data", "live"}
+
+# Marker shipped in the empty strategies placeholder. Never a private strategy.
+_STRATEGIES_PLACEHOLDER_NAME = "README.txt"
+_STRATEGIES_PLACEHOLDER_TEXT = (
+    "Empty placeholder bundled with tai_backtest.\n"
+    "\n"
+    "Private AI strategies live in the gitignored strategies/ directory\n"
+    "next to the source checkout, or next to tai_backtest.exe after install.\n"
+    "Those files are not packaged into the EXE.\n"
+)
 
 
 def _git(*args) -> str:
@@ -121,11 +136,181 @@ def write_build_stamp(sha: str, dirty: bool) -> None:
     print(f"  Stamped BUILD_INFO.json: v{VERSION} @ {sha[:10]}{flag}")
 
 
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _is_within(child: str, parent: str) -> bool:
+    """True when ``child`` is strictly inside ``parent``."""
+    child_n = _norm(child)
+    parent_n = _norm(parent)
+    if child_n == parent_n:
+        return False
+    try:
+        return os.path.commonpath([child_n, parent_n]) == parent_n
+    except ValueError:
+        return False
+
+
+def _assert_safe_strategies_staging(project_root: str, staging: str) -> None:
+    """Refuse to wipe or bundle the private ``strategies/`` tree."""
+    private = os.path.join(project_root, "strategies")
+    if (
+        _norm(staging) == _norm(private)
+        or _is_within(staging, private)
+        or _is_within(private, staging)
+    ):
+        raise RuntimeError(
+            "refusing to bundle the private strategies directory: "
+            f"{private}"
+        )
+
+
+def strategies_datas(
+    project_root: str, *, staging_dir: str | None = None,
+) -> list[tuple[str, str]]:
+    """PyInstaller ``datas`` entries for an empty ``strategies`` directory.
+
+    ``strategies/`` is gitignored. PyInstaller aborts when a datas source
+    is missing, which is every fresh clone. Pointing datas at the real
+    directory would also ship whatever private AI strategies happen to be
+    on the build machine. Stage a marker-only directory under ``build/``
+    (gitignored) and return that instead.
+    """
+    project_root = os.path.abspath(project_root or ".")
+    staging = os.path.abspath(
+        staging_dir
+        or os.path.join(project_root, "build", "strategies_placeholder")
+    )
+    # Project-root check first: the private strategies path lives inside
+    # the project, so a staging dir of the project itself would otherwise
+    # be reported as a private-strategies overlap.
+    if _norm(staging) == _norm(project_root) or _is_within(project_root, staging):
+        raise RuntimeError(
+            f"refusing to stage the strategies placeholder at {staging}"
+        )
+    _assert_safe_strategies_staging(project_root, staging)
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    os.makedirs(staging, exist_ok=True)
+    with open(os.path.join(staging, _STRATEGIES_PLACEHOLDER_NAME),
+              "w", encoding="utf-8") as fh:
+        fh.write(_STRATEGIES_PLACEHOLDER_TEXT)
+    leaked = [
+        name for name in os.listdir(staging)
+        if name.endswith(".py") or name == "index.json"
+    ]
+    if leaked:
+        raise RuntimeError(f"refusing to bundle strategy files: {leaked}")
+    return [(staging, "strategies")]
+
+
+def parse_pinned_requirements(text: str) -> dict[str, str]:
+    """Parse ``name==version`` pins. Comments and blank lines are ignored.
+
+    Every requirement must be an exact pin. A floating specifier would
+    let the EXE toolchain drift back to the crashing combination.
+    """
+    pins: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "==" not in line:
+            raise ValueError(
+                f"{BUILD_REQUIREMENTS}:{lineno}: pin must be name==version "
+                f"({raw.strip()!r})"
+            )
+        name, version = (part.strip() for part in line.split("==", 1))
+        if (
+            not name or not version
+            or any(ch in name for ch in " <>,;[]@")
+            or any(ch in version for ch in " <>,;[]@")
+        ):
+            raise ValueError(
+                f"{BUILD_REQUIREMENTS}:{lineno}: pin must be name==version "
+                f"({raw.strip()!r})"
+            )
+        if name in pins:
+            raise ValueError(
+                f"{BUILD_REQUIREMENTS}:{lineno}: duplicate pin for {name}"
+            )
+        pins[name] = version
+    if not pins:
+        raise ValueError(f"{BUILD_REQUIREMENTS} has no pins")
+    return pins
+
+
+def _installed_version(dist_name: str) -> str | None:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version(dist_name)
+    except PackageNotFoundError:
+        return None
+
+
+def unsatisfied_pins(
+    pins: dict[str, str], version_of,
+) -> dict[str, str | None]:
+    """Return ``{name: installed_or_None}`` for pins that are not met."""
+    bad: dict[str, str | None] = {}
+    for name, want in pins.items():
+        got = version_of(name)
+        if got != want:
+            bad[name] = got
+    return bad
+
+
+def ensure_build_requirements(
+    project_root: str | None = None, *, runner=None, version_of=None,
+) -> dict[str, str]:
+    """Install ``requirements-build.txt`` when the environment doesn't match.
+
+    ``runner`` and ``version_of`` exist so tests can avoid pip and the
+    real environment. ``runner`` is called like ``subprocess.run(cmd)``.
+    """
+    root = os.path.abspath(
+        project_root or os.path.dirname(os.path.abspath(__file__)) or "."
+    )
+    req_path = os.path.join(root, BUILD_REQUIREMENTS)
+    with open(req_path, encoding="utf-8") as fh:
+        pins = parse_pinned_requirements(fh.read())
+    version_of = version_of or _installed_version
+    bad = unsatisfied_pins(pins, version_of)
+    if not bad:
+        listed = ", ".join(f"{name}=={ver}" for name, ver in pins.items())
+        print(f"Build dependencies OK ({listed})")
+        return pins
+
+    print(f"Build dependencies do not match {BUILD_REQUIREMENTS}:")
+    for name, want in pins.items():
+        if name in bad:
+            have = bad[name] or "not installed"
+            print(f"  {name}: want {want}, have {have}")
+    cmd = [sys.executable, "-m", "pip", "install", "-r", req_path]
+    print(f"Installing pinned build dependencies from {BUILD_REQUIREMENTS}")
+    run = runner or subprocess.run
+    result = run(cmd)
+    if getattr(result, "returncode", 1) != 0:
+        print(f"ERROR: failed to install {BUILD_REQUIREMENTS}")
+        sys.exit(1)
+    bad = unsatisfied_pins(pins, version_of)
+    if bad:
+        print("ERROR: build dependencies still mismatch after install: "
+              f"{bad}")
+        sys.exit(1)
+    print("Build dependencies installed")
+    return pins
+
+
 def build():
     print(f"=== Building tai_backtest v{VERSION} ===")
+    root = os.path.dirname(os.path.abspath(__file__)) or "."
+    ensure_build_requirements(root)
+    strategies_datas(root)
     result = subprocess.run(
         [sys.executable, "-m", "PyInstaller", "tai_backtest.spec", "--noconfirm"],
-        cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+        cwd=root,
     )
     if result.returncode != 0:
         print("BUILD FAILED")
