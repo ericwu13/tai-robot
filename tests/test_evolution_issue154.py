@@ -259,12 +259,20 @@ class TestIssue153GoldPinStillFails:
 
 class TestMonthGateLoggingWired:
     def test_worker_logs_before_combine_and_persists_block(self):
+        """The worker logs the observation assemble_promotion_verdict
+        threads out, then the PASS changelog forwards the same value.
+
+        ``combine_evolution_verdicts`` stays inside the helper. The
+        worker's month verdict is ``assembled.month_verdict``.
+        """
         src = _pipeline_src()
-        call = src.index("month_verdict = decide_month_gates(")
+        assembled = src.index("assembled = assemble_promotion_verdict(")
+        bind = src.index("month_verdict = assembled.month_verdict")
         logged = src.index("_log(format_month_gates_debug(month_verdict.month_gates))")
-        combined = src.index("verdict = combine_evolution_verdicts(")
-        assert call < logged < combined
-        assert "month_gates=month_verdict.month_gates" in src
+        persisted = src.index("month_gates=month_verdict.month_gates")
+        assert assembled < bind < logged < persisted
+        assert "month_verdict = decide_month_gates(" not in src
+        assert "verdict = combine_evolution_verdicts(" not in src
         # The call is inside the worker, not only the import.
         tree = ast.parse(src)
         logs = [
@@ -281,7 +289,7 @@ class TestMonthGateLoggingWired:
         guarded = _month_gate_log_try(src)
         assert guarded.strip().startswith("try:")
         assert "except Exception" in guarded
-        assert call < src.index(guarded) < combined
+        assert bind < src.index(guarded) < persisted
         # The handler records the failure and does not re-raise.
         guard_tree = ast.parse(_normalize_source_segment(guarded))
         try_node = guard_tree.body[0]
