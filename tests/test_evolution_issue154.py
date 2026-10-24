@@ -1,12 +1,12 @@
-"""Issue #154 — partial current month is logged, not re-defined by default.
+"""Issue #154 — partial current month is logged.
 
-The 10-10 Evo1 ema60 PASS is still the default rule: ``latest = max(months)``
-picks the October stub, whose delta is −260 against a +3240 edge
-(−8.0% ≤ 50%). September's +5890 (181.8% of that edge) sits in the
-prior block and clears the ablation floor. This module pins that
-PASS. P5 ``merge_stub`` (fewer than 12 price-bar sessions) folds the
-stub and that same shape FAILs; that test opts into the config because
-the shipped default stays ``max_exit_month``.
+The 10-10 Evo1 ema60 shape still PASSes when the default call supplies
+no price bars: ``merge_stub`` cannot count sessions and keeps the
+October stub. That stub's delta is −260 against a +3240 edge
+(−8.0% ≤ 50%). September's +5890 sits in the prior block. Gate 1
+uses the default scaled allowance (13190 TWD for this two-trade prior
+block). Passing 11 October trading dates folds the stub and that
+shape FAILs.
 
 The #153 9/26 gold pin stays in ``test_evolution_issue153`` and must
 still FAIL. Existing PASS fixtures there are not modified.
@@ -139,8 +139,8 @@ class TestOctStubCurrentPass:
         assert "prior-months collapse" not in text
         assert "calendar-month dominated" not in text
         assert (
-            "month ablation: prior-months net +36690 ≥ baseline−5k "
-            "(+28190): ✓ (slack +8500)"
+            "month ablation: prior-months net +36690 ≥ baseline−13190 "
+            "(+20000): ✓ (slack +16690)"
         ) in text
         assert (
             "latest-month edge share: edge +3240 > 0; "
@@ -157,7 +157,7 @@ class TestOctStubCurrentPass:
         assert block["share_pct"] == -8.0
         assert block["share_applied"] is True
         assert block["edge"] > 0
-        assert block["ablation_slack"] == 8500
+        assert block["ablation_slack"] == 16690
         assert block["base_prior_net"] == 33190
         assert block["cand_prior_net"] == 36690
         rows = {row["month"]: row for row in block["months"]}
@@ -176,7 +176,7 @@ class TestOctStubCurrentPass:
         assert "latest=Oct (2026-10)" in log
         assert "edge=+3240" in log
         assert "share=-8.0%" in log
-        assert "ablation_slack=+8500" in log
+        assert "ablation_slack=+16690" in log
         assert "holdout=2026-09-25 00:00" in log
         assert "2026-09 base=+10000 cand=+15890 Δ=+5890" in log
         assert "2026-10 base=−9740 cand=−10000 Δ=−260" in log
@@ -197,7 +197,7 @@ class TestOctStubCurrentPass:
         assert "EVO month gates: verdict=PASS" in text
         assert "latest=Oct" in text
         assert "share=-8.0%" in text
-        assert "ablation_slack=+8500" in text
+        assert "ablation_slack=+16690" in text
         assert "2026-09" in text and "2026-10" in text
 
 
@@ -228,19 +228,25 @@ class TestOctStubDesiredFail:
         """A short October stub must not be the only month the share cap sees.
 
         September's +5890 is 181.8% of the +3240 edge. With
-        ``latest_def=merge_stub`` and 11 distinct October dates in the
+        ``latest_def=merge_stub`` and 11 October trading dates in the
         price bars, October folds into September and this shape FAILs
-        (calendar-month dominated). The default ``max_exit_month`` call
-        still PASSes; that pin is ``TestOctStubCurrentPass``.
+        (calendar-month dominated). The no-bars default call still
+        PASSes; that pin is ``TestOctStubCurrentPass``.
         """
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         from src.evolution.pipeline import MonthGateConfig
+        from src.market_data.holidays import is_taifex_holiday
 
-        # Eleven bar-open dates. Not a calendar count and not the one
-        # October trade in the fixture.
-        bars = [type("B", (), {"dt": datetime(2026, 10, day)})()
-                for day in range(1, 12)]
+        # Eleven day-session trading dates. Midnight stamps would map
+        # through the night session and collapse weekends.
+        cursor = datetime(2026, 10, 1)
+        days = []
+        while len(days) < 11:
+            if not is_taifex_holiday(cursor.date()):
+                days.append(cursor.replace(hour=9))
+            cursor += timedelta(days=1)
+        bars = [type("B", (), {"dt": day})() for day in days]
         data = _load()
         base, cand = _books(data)
         v = decide_month_gates(

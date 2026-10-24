@@ -88,9 +88,11 @@ class TestEma80MustFail:
         assert not v.passed
         assert "prior-months collapse" in text
         assert "calendar-month dominated" in text
+        # One baseline prior trade: scaled σ is undefined, allowance
+        # is the 3000 floor, and gate 3 uses half of it.
         assert (
-            "month ablation: prior-months net +35670 ≥ baseline−5k "
-            "(+44100): ✗ (slack −8430) — prior-months collapse"
+            "month ablation: prior-months net +35670 ≥ baseline−3000 "
+            "(+46100): ✗ (slack −10430) — prior-months collapse"
         ) in text
         assert (
             "latest-month edge share: edge +21830 > 0; "
@@ -98,7 +100,7 @@ class TestEma80MustFail:
             "calendar-month dominated"
         ) in text
         assert f"PF {data['prior_pf']}" in text
-        assert "Δ −13430 ≥ 0: ✗" in text
+        assert "Δ −13430 ≥ −1500: ✗" in text
         assert "provisional, never auto-save" in text
         assert v.provisional
         assert not eligible_for_validated_pool(v)
@@ -120,7 +122,7 @@ class TestEma80MustFail:
         assert "prior-months collapse" in visible
         assert "calendar-month dominated" in visible
         assert "161.5%" in visible
-        assert "35670" in visible and "44100" in visible
+        assert "35670" in visible and "46100" in visible
         assert any(token in visible for token in (
             "fold majority", "non-empty folds", "divergent folds"))
         assert not combined.passed
@@ -151,7 +153,8 @@ class TestMonthGatesDiscriminate:
         assert "13410/45840" in text
 
     def test_exact_floor_and_half_share_pass(self):
-        # floor = 0 − 5000 = −5000; cand prior 1000 clears it.
+        # One baseline prior trade, so the scaled allowance is the 3000
+        # floor: 0 − 3000 = −3000. Cand prior 1000 clears it.
         # edge = 2000, latest-month Δ = 1000 → share 50.0% (the ceiling).
         base = [
             _trade("2026-08-01 10:00", 0, 1),
@@ -176,6 +179,26 @@ class TestMonthGatesDiscriminate:
         assert v.provisional
         assert not eligible_for_validated_pool(v)
         assert any("never auto-save" in r for r in v.reasons)
+
+    def test_flat_opt_out_keeps_the_five_k_gold_line(self):
+        from src.evolution.pipeline import MonthGateConfig, MonthSlackConfig
+
+        data = _load()
+        base, cand = _ema80_books(data)
+        v = decide_month_gates(
+            base, cand, holdout_start=data["holdout_start"],
+            month_gate=MonthGateConfig(
+                latest_def="max_exit_month",
+                slack=MonthSlackConfig(mode="flat")))
+        text = "\n".join(v.reasons)
+        assert not v.passed
+        assert (
+            "month ablation: prior-months net +35670 ≥ baseline−5k "
+            "(+44100): ✗ (slack −8430) — prior-months collapse"
+        ) in text
+        assert "Δ −13430 ≥ 0: ✗" in text
+        assert v.month_gates["slack_allowance"] == 5000
+        assert v.month_gates["gate3_slack"] == 0
 
 
 class TestPoolPromotionBlocksStore:
