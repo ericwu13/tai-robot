@@ -99,6 +99,19 @@ python -m PyInstaller tai_backtest.spec --noconfirm
 
 The spec inserts `SPECPATH` onto `sys.path` so `import build_release` works for the `pyinstaller` entry-point script as well as `python -m PyInstaller`.
 
+The Capital API SDK is gitignored. A worktree or fresh clone has no `CapitalAPI_2.13.57/` tree. Broker DLLs are read from this libs directory. `SKCOM.dll` and `CTSecuritiesATL.dll` must both be present and nonzero (`run_backtest.py` registers `CTSecuritiesATL.dll`, and `SKCOM.dll` loads its sibling DLLs from the same folder):
+
+`CapitalAPI_2.13.57/CapitalAPI_2.13.57_PythonExample/SKDLLPythonTester/libs`
+
+`tai_backtest.spec` and `build_release.py` both refuse to build when that directory is missing or either required DLL is missing or empty. The error names the file. Set `TAI_CAPITAL_SDK_DIR` to a libs directory that contains both files when the SDK lives outside the repo. A relative value is resolved against the project root — the directory that contains `tai_backtest.spec` (`SPECPATH` on a raw `pyinstaller` run) — not the shell's current directory. CI and Linux test builds that are not packaging a broker EXE can set `TAI_ALLOW_MISSING_CAPITAL_SDK=1` or pass `--allow-missing-broker-sdk`. Only the value `1` opts out; `true` or `yes` prints a warning and the build still fails. The opt-out prints a warning and the build continues; if a required DLL is still absent, the EXE has no broker DLLs.
+
+```bash
+export TAI_CAPITAL_SDK_DIR=/path/to/SKDLLPythonTester/libs
+# or, relative to the project root:
+export TAI_CAPITAL_SDK_DIR=CapitalAPI_2.13.57/CapitalAPI_2.13.57_PythonExample/SKDLLPythonTester/libs
+python build_release.py --skip-release
+```
+
 Output: `dist/tai_backtest/tai_backtest.exe`
 
 `strategies/` is gitignored and holds per-machine AI strategies. A fresh clone does not have that directory. The spec does not bundle it. At build time it stages an empty placeholder under `build/strategies_placeholder/` (a `README.txt` only) so PyInstaller has a datas source, and private `.py` files are never copied into the EXE. Saved strategies are loaded at runtime from the `strategies/` directory next to `tai_backtest.exe`, which the app creates on first use.

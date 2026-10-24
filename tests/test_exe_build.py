@@ -272,7 +272,17 @@ def test_ensure_build_requirements_exits_when_still_wrong(tmp_path):
         )
 
 
+def _opt_out_missing_sdk(monkeypatch):
+    """Reach pip/PyInstaller assertions on a checkout with no Capital SDK.
+
+    CI and a fresh clone have no ``CapitalAPI_2.13.57`` tree. ``build()``
+    now exits before PyInstaller unless this opt-out is set.
+    """
+    monkeypatch.setenv("TAI_ALLOW_MISSING_CAPITAL_SDK", "1")
+
+
 def _record_subprocess(monkeypatch):
+    _opt_out_missing_sdk(monkeypatch)
     calls = []
 
     def fake_run(cmd, cwd=None):
@@ -369,6 +379,7 @@ def _assert_pip_and_pyinstaller(calls, interpreter):
 
 def test_build_install_build_deps_calls_pip(monkeypatch):
     """No .venv-build: pip, both pin checks, and PyInstaller use this interpreter."""
+    _opt_out_missing_sdk(monkeypatch)
     calls = []
     store = {}
     monkeypatch.setattr(
@@ -392,6 +403,7 @@ def test_install_passes_when_host_lacks_pins_and_target_gains_them(
     monkeypatch, tmp_path,
 ):
     """Running Python lacks the pins. The target gains them, so the build passes."""
+    _opt_out_missing_sdk(monkeypatch)
     win = tmp_path / ".venv-build" / "Scripts" / "python.exe"
     win.parent.mkdir(parents=True)
     win.write_text("", encoding="utf-8")
@@ -427,6 +439,7 @@ def test_install_still_runs_when_host_has_pins_and_target_does_not(
     monkeypatch, tmp_path,
 ):
     """Host pins must not skip the install. The target is what gets checked."""
+    _opt_out_missing_sdk(monkeypatch)
     target = str(tmp_path / ".venv-build" / "bin" / "python")
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8"):
@@ -509,7 +522,7 @@ def test_main_passes_install_build_deps(monkeypatch):
     """``main`` must hand the flag to ``build``, not merely accept it."""
     seen = []
 
-    def fake_build(*, install_requirements=False):
+    def fake_build(*, install_requirements=False, allow_missing_broker_sdk=False):
         seen.append(install_requirements)
 
     monkeypatch.setattr(build_release, "build", fake_build)
