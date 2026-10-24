@@ -501,10 +501,11 @@ class TestRelativePaperEdges:
         assert any("prior-month OOS PF" in r and "✗" in r for r in absolute.reasons)
         assert relative.passed, relative.reasons
         assert not relative.provisional
-        # Δ < 0 still provisional when the PF floor is dropped.
+        # Δ below the strict half-slack (1500, half the 3000 floor when
+        # σ is undefined) is still provisional when the PF floor is dropped.
         worse = decide_month_gates(
             [_Trade("2026-08-01 10:00", 500), _Trade("2026-09-15 10:00", 0)],
-            [_Trade("2026-08-01 10:00", 100), _Trade("2026-09-15 10:00", 0)],
+            [_Trade("2026-08-01 10:00", -1001), _Trade("2026-09-15 10:00", 0)],
             holdout_start="2026-09-02 00:00",
             drop_prior_pf_floor=True,
         )

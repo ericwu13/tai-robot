@@ -187,6 +187,16 @@ evolution:
   idle_warn_days: 7        # watermark-skip idle line; 0 disables the line
   knob_ineligible_fallback: "none"  # "none" (default) | "structural_lane"
                                     # neither value enables weekly codegen
+  month_gate:
+    latest_def: merge_stub       # merge_stub (default) | max_exit_month (opt out)
+    min_sessions: 12             # fold the newest month below this many TAIFEX dates
+    slack:
+      mode: scaled               # scaled (default) | flat (opt out: flat_twd, gate 3 Δ ≥ 0)
+      flat_twd: 5000
+      k: 1.0
+      gate3_k: 0.5               # strict check uses this fraction of the scaled allowance
+      floor: 3000
+      cap: 15000
 
 trading:
   allow_live_override: false   # NOTE: lives under `trading:`, not `evolution:`
@@ -201,6 +211,9 @@ trading:
 | `evolution.min_design_trades` | `30` | Saturday/automatic path only: skip the AI plan call while the design window has fewer trades than this (`waiting for sample: N/<threshold>`, 0 AI calls, watermark unchanged). The manual Evolve button is exempt and logs `below min_design_trades (N/30), manual override`. `0` disables the check. Does not change the fitness `MIN_TRADES` gate. |
 | `evolution.idle_warn_days` | `7` | On a watermark skip, append `idle N days since last exit <date>` when the last exit is at least this many calendar days ago. `0` disables the line. |
 | `evolution.knob_ineligible_fallback` | `"none"` | Weekly handling of a knob-grid class with fewer than 2 rewritable knobs. `"none"` excludes it and logs `excluded: <class> — <reason>; fallback=none` every Saturday. `"structural_lane"` only changes that logged mode; it does not enable weekly codegen. |
+| `evolution.month_gate.latest_def` | `"merge_stub"` | Fold the newest exit month into the previous month when it has fewer than `min_sessions` TAIFEX trading dates in the price bars. A night session (15:00–05:00) belongs to the next trading day, so one night is one date and Friday night maps to Monday. `"max_exit_month"` opts out and keeps the newest exit month. |
+| `evolution.month_gate.min_sessions` | `12` | Session-count threshold for the stub fold. |
+| `evolution.month_gate.slack.mode` | `"scaled"` | Gate 1 allowance is `clamp(k × σ × sqrt(n), floor, cap)` TWD. σ is the baseline's prior-block per-trade sample standard deviation; n is the candidate's prior-block trade count. Gate 3 uses `gate3_k` of that allowance (half by default). `"flat"` opts out: gate 1 uses `flat_twd` and gate 3 requires Δ ≥ 0. |
 | **`trading.allow_live_override`** | `false` | **Not an evolution key.** It gates the live **hot-swap mode switch** — whether a `mode_override.json` file (or the UI) may switch the running bot to fully-automatic `auto` mode. Documented here because it governs how much autonomy a live bot has; evolution itself never deploys or switches modes. |
 
 ---

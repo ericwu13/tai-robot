@@ -642,6 +642,8 @@ def assemble_promotion_verdict(
         holdout_start: str | None,
         criteria: dict | None,
         window_verdict: EvolutionVerdict,
+        bars=None,
+        month_gate=None,
 ) -> PromotionAssembly:
     """AND month gates, multi-fold, the walk-forward window, and (paper
     relative only) the bootstrap / effect-size checks.
@@ -653,6 +655,10 @@ def assemble_promotion_verdict(
     On the relative path the multi-fold divergent floor is
     ``relative.min_divergent_folds``, the same number the threshold
     line logs. The absolute path keeps ``MIN_DIVERGENT_FOLDS``.
+
+    ``bars`` and ``month_gate`` are forwarded to ``decide_month_gates``.
+    This module does not compute the scaled slack. Omitting both keeps
+    the pre-P5 month gates.
     """
     relative = gate.mode == "relative"
     rel_cfg = gate_cfg.relative
@@ -660,6 +666,8 @@ def assemble_promotion_verdict(
         base_trades, cand_trades,
         holdout_start=holdout_start,
         drop_prior_pf_floor=relative,
+        bars=bars,
+        month_gate=month_gate,
     )
     mf = decide_multifold_verdict(
         folds, criteria,

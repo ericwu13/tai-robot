@@ -177,6 +177,54 @@ evolution:
     bootstrap_resamples: 10000
     bootstrap_seed: 20261024
     fold_days: 14
+  # P5 月閘門。預設就是新規則：最新月的台指交易日少於
+  # min_sessions 時併入前一個月；閘門 1 寬限是 1 個標準誤，
+  # 夾在 floor 與 cap 之間；閘門 3 用該寬限的一半。
+  # 要回到舊規則，把 latest_def 設成 max_exit_month、slack.mode 設成 flat。
+  # 不是憑證。
+  #
+  # P5 month gates. The defaults ARE the new rule: a newest month with
+  # fewer than min_sessions TAIFEX trading dates folds into the previous
+  # month, gate 1's allowance is one standard error clamped to
+  # [floor, cap], and gate 3 uses half of that allowance. Opt out with
+  # latest_def: max_exit_month and slack.mode: flat (flat 5,000 TWD,
+  # gate 3 requires Δ ≥ 0). Not a credential.
+  month_gate:
+    # merge_stub（預設）: 該月在價格 K 棒裡的台指交易日少於
+    #   min_sessions 時，併入前一個月。夜盤（15:00 到隔天 05:00）
+    #   算下一個交易日，所以跨午夜的同一夜只算一個日期；週五夜盤
+    #   算到週一。不看日曆天數，也不數成交筆數。
+    # max_exit_month: 停用折疊，最新月永遠是最新出場的 YYYY-MM。
+    #
+    # merge_stub (default): if that month has fewer than min_sessions
+    #   TAIFEX trading dates in the price bars, fold it into the
+    #   previous month. A night session (15:00 through 05:00 the next
+    #   morning) belongs to the next trading day, so one night is one
+    #   date and Friday night maps to Monday. Not a calendar length
+    #   and not a trade count.
+    # max_exit_month: opt out of the fold. Latest stays the newest
+    #   exit month.
+    latest_def: merge_stub
+    min_sessions: 12
+    slack:
+      # scaled（預設）: 閘門 1 寬限 = clamp(k × σ × sqrt(n), floor, cap)。
+      #   σ 是基準策略在先前月份每筆損益的樣本標準差（n−1）。
+      #   n 是候選策略在該區塊的成交筆數。閘門 3 用 gate3_k × 該寬限
+      #   （預設一半）。
+      # flat: 停用縮放。閘門 1 用 flat_twd；閘門 3 仍是 Δ ≥ 0。
+      #
+      # scaled (default): gate 1 slack = clamp(k × σ × sqrt(n), floor, cap).
+      #   σ is the sample standard deviation (n−1) of the baseline's
+      #   per-trade PnL in the prior-months block. n is the candidate's
+      #   trade count in that block. Gate 3 uses gate3_k × that slack
+      #   (default half).
+      # flat: opt out. Gate 1 uses flat_twd; gate 3 stays Δ ≥ 0.
+      mode: scaled
+      flat_twd: 5000
+      k: 1.0
+      gate3_k: 0.5
+      floor: 3000
+      cap: 15000
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON

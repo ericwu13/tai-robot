@@ -30,14 +30,19 @@ floor, latest-month edge share, holdout-in-latest-month rule).
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from ..ai.chat_client import TRUNCATION_WARNING, USAGE_LINE_PREFIX
 from ..backtest.engine import BacktestEngine, BacktestResult
+from ..market_data.holidays import next_trading_day
+from ..market_data.sessions import (
+    DAY_CLOSE, DAY_OPEN, NIGHT_CLOSE, NIGHT_OPEN,
+)
 from ..backtest.metrics import PerformanceMetrics
 from .fitness import (DEFAULT_CAPITAL_BASE_TWD, MIN_TRADES, FitnessResult,
                       compute_fitness_from_trades)
@@ -146,6 +151,22 @@ MIN_NONEMPTY_FOLDS = 4          # folds with cand.n > 0
 MIN_DIVERGENT_FOLDS = 3         # folds with Δ ≠ 0, required before majority
 PRIOR_MONTH_SLACK_TWD = 5000    # cand prior-months net ≥ base − this
 LATEST_MONTH_EDGE_SHARE_MAX = 0.50
+
+# P5 (Nova Q1 / Q7). Defaults are the new rule: fold a newest month
+# with fewer than 12 TAIFEX trading dates, and size gate 1 as one
+# standard error clamped to [3000, 15000]. Gate 3 uses half of that.
+# max_exit_month and flat are opt-outs.
+MONTH_GATE_LATEST_MAX = "max_exit_month"
+MONTH_GATE_LATEST_MERGE = "merge_stub"
+MONTH_GATE_MIN_SESSIONS = 12
+MONTH_SLACK_FLAT = "flat"
+MONTH_SLACK_SCALED = "scaled"
+MONTH_SLACK_K = 1.0
+MONTH_SLACK_GATE3_K = 0.5
+MONTH_SLACK_FLOOR_TWD = 3000
+MONTH_SLACK_CAP_TWD = 15000
+_MONTH_GATE_LATEST_DEFS = (MONTH_GATE_LATEST_MAX, MONTH_GATE_LATEST_MERGE)
+_MONTH_SLACK_MODES = (MONTH_SLACK_FLAT, MONTH_SLACK_SCALED)
 
 
 def _strip_client_annotations(plan_text: str) -> tuple[str, bool]:
@@ -404,6 +425,9 @@ class EvolutionVerdict:
     # ablation slack, reasons). Set by decide_month_gates. Does not
     # affect passed / provisional. Other verdicts leave it None.
     month_gates: dict | None = None
+    # Sentence combine_evolution_verdicts appends when provisional.
+    # Empty for layers that are not a month-gate verdict.
+    provisional_rule: str = ""
 
 
 def decide_verdict(baseline: ABResult, candidate: ABResult,
@@ -1394,12 +1418,24 @@ def _month_gates_observation(
         holdout_start: str | None,
         passed: bool,
         provisional: bool,
-        reasons: list[str]) -> dict:
+        reasons: list[str],
+        slack_mode: str = MONTH_SLACK_FLAT,
+        slack_allowance: int | None = None,
+        gate3_slack: int = 0,
+        sigma_per_trade: float | None = None,
+        n_prior_cand: int | None = None,
+        latest_sessions: int | None = None,
+        latest_def: str = MONTH_GATE_LATEST_MAX,
+        folded_from: str = "") -> dict:
     """Inputs and reasons behind one month-gate verdict.
 
     Observability only — callers must not treat this dict as a second
     decision. ``passed`` is copied from the verdict that was already
     decided.
+
+    ``ablation_slack`` is the margin above the floor (candidate prior
+    net minus floor), the same field the #154 log pinned. The allowance
+    itself is ``slack_allowance``.
     """
     return {
         "months": month_rows,
@@ -1417,6 +1453,14 @@ def _month_gates_observation(
         "passed": bool(passed),
         "provisional": bool(provisional),
         "reasons": list(reasons),
+        "slack_mode": slack_mode,
+        "slack_allowance": slack_allowance,
+        "gate3_slack": int(gate3_slack),
+        "sigma_per_trade": sigma_per_trade,
+        "n_prior_cand": n_prior_cand,
+        "latest_sessions": latest_sessions,
+        "latest_def": latest_def,
+        "folded_from": folded_from or "",
     }
 
 
@@ -1439,6 +1483,18 @@ def format_month_gates_debug(block: dict | None) -> str:
         bits.append(
             f"{row['month']} base={_signed(row['base_net'])} "
             f"cand={_signed(row['cand_net'])} Δ={_signed(row['delta'])}")
+    extra = ""
+    if block.get("folded_from"):
+        extra += f" folded_from={block['folded_from']}"
+        sessions = block.get("latest_sessions")
+        if sessions is not None:
+            extra += f" sessions={sessions}"
+    if block.get("slack_mode") == MONTH_SLACK_SCALED:
+        extra += (
+            f" slack_mode=scaled"
+            f" allowance={block.get('slack_allowance')}"
+            f" gate3_slack={block.get('gate3_slack')}"
+        )
     head = (
         f"EVO month gates: verdict={verdict} "
         f"latest={block.get('latest_label') or '-'} "
@@ -1447,10 +1503,364 @@ def format_month_gates_debug(block: dict | None) -> str:
         f"share={share_txt} "
         f"ablation_slack={_signed(slack) if slack is not None else 'n/a'} "
         f"holdout={block.get('holdout_start') or '-'}"
+        f"{extra}"
     )
     detail = "per-month: " + ("; ".join(bits) if bits else "(none)")
     reasons = " | ".join(block.get("reasons") or [])
     return f"{head}\n  {detail}\n  reasons: {reasons}"
+
+
+@dataclass(frozen=True)
+class MonthSlackConfig:
+    """Gate-1 allowance and the stricter gate-3 slice of it.
+
+    ``mode="scaled"`` (the default) sizes the allowance as one standard
+    error of summed PnL, clamped, and gate 3 uses ``gate3_k`` times
+    that allowance (default half). ``mode="flat"`` is the opt-out:
+    gate 1 uses ``flat_twd`` and gate 3 stays Δ ≥ 0.
+    """
+
+    mode: str = MONTH_SLACK_SCALED
+    flat_twd: int = PRIOR_MONTH_SLACK_TWD
+    k: float = MONTH_SLACK_K
+    gate3_k: float = MONTH_SLACK_GATE3_K
+    floor: int = MONTH_SLACK_FLOOR_TWD
+    cap: int = MONTH_SLACK_CAP_TWD
+
+
+@dataclass(frozen=True)
+class MonthGateConfig:
+    """P5 month-gate policy. Defaults fold stubs and scale the slack."""
+
+    latest_def: str = MONTH_GATE_LATEST_MERGE
+    min_sessions: int = MONTH_GATE_MIN_SESSIONS
+    slack: MonthSlackConfig = field(default_factory=MonthSlackConfig)
+    warnings: tuple[str, ...] = ()
+
+
+def _sample_stdev(values: list[float]) -> float | None:
+    """Sample standard deviation (divisor n−1). None when n < 2."""
+    n = len(values)
+    if n < 2:
+        return None
+    mu = sum(values) / n
+    var = sum((x - mu) ** 2 for x in values) / (n - 1)
+    if var < 0:
+        var = 0.0
+    return math.sqrt(var)
+
+
+def scaled_slack_twd(sigma: float, n_trades: int, *,
+                     k: float = MONTH_SLACK_K,
+                     floor: int = MONTH_SLACK_FLOOR_TWD,
+                     cap: int = MONTH_SLACK_CAP_TWD) -> int:
+    """``clamp(k × σ × sqrt(n), floor, cap)`` in TWD.
+
+    ``sigma`` is the per-trade standard deviation. ``n_trades`` is the
+    trade count the standard error is taken over. A non-finite product
+    is treated as 0 and then clamped, so the result is the floor.
+    """
+    try:
+        n = int(n_trades)
+    except (TypeError, ValueError):
+        n = 0
+    if isinstance(n_trades, bool) or n < 0:
+        n = 0
+    try:
+        raw = float(k) * float(sigma) * math.sqrt(n)
+    except (TypeError, ValueError):
+        raw = 0.0
+    if not math.isfinite(raw) or raw < 0:
+        raw = 0.0
+    value = int(round(raw))
+    lo = int(floor)
+    hi = int(cap)
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
+
+
+def _as_datetime(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        s = value.strip()
+        for fmt, n in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16),
+                       ("%Y-%m-%dT%H:%M:%S", 19), ("%Y-%m-%dT%H:%M", 16),
+                       ("%Y-%m-%d", 10)):
+            if len(s) < n:
+                continue
+            try:
+                return datetime.strptime(s[:n], fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def taifex_trading_date(dt: datetime) -> date | None:
+    """TAIFEX trading date of a bar open, or None when it is off-session.
+
+    Day session (08:45–13:45) belongs to that calendar date, rolled
+    forward only when the date itself is closed. Night session
+    (15:00 through 05:00 the next morning) belongs to the next trading
+    day, so the evening half and the after-midnight half of one night
+    are the same date. Friday night therefore lands on Monday when
+    Saturday and Sunday are closed.
+    """
+    minutes = dt.hour * 60 + dt.minute
+    if DAY_OPEN <= minutes < DAY_CLOSE:
+        anchor = dt.date()
+    elif minutes >= NIGHT_OPEN:
+        anchor = dt.date() + timedelta(days=1)
+    elif minutes < NIGHT_CLOSE:
+        anchor = dt.date()
+    else:
+        return None
+    return next_trading_day(anchor)
+
+
+def trading_date_of_bar(bar) -> str | None:
+    """``YYYY-MM-DD`` trading date of a bar, or None off-session."""
+    dt = _as_datetime(getattr(bar, "dt", None))
+    if dt is None:
+        return None
+    day = taifex_trading_date(dt)
+    if day is None:
+        return None
+    return day.isoformat()
+
+
+def count_month_sessions(bars, ym: str) -> int | None:
+    """Distinct TAIFEX trading dates in calendar month ``ym``.
+
+    ``None`` when ``bars`` is None: the caller did not supply price
+    data, and a stub must not be inferred from trades or from how many
+    days the calendar month has. An empty list counts as 0. Several
+    bars on one trading date count once. A night that crosses midnight
+    is one date, and that date is the next trading day.
+    """
+    if bars is None:
+        return None
+    seen: set[str] = set()
+    for bar in bars:
+        day = trading_date_of_bar(bar)
+        if day is not None and day[:7] == ym:
+            seen.add(day)
+    return len(seen)
+
+
+def _previous_month(ym: str) -> str:
+    year = int(ym[:4])
+    month = int(ym[5:7])
+    if month == 1:
+        return f"{year - 1:04d}-12"
+    return f"{year:04d}-{month - 1:02d}"
+
+
+def _mg_warn_choice(block: dict, key: str, allowed: tuple[str, ...],
+                    default: str, warnings: list[str], label: str) -> str:
+    if key not in block:
+        return default
+    value = block[key]
+    if isinstance(value, str) and value.strip().lower() in allowed:
+        return value.strip().lower()
+    warnings.append(f"{label} {value!r} invalid; using default {default}")
+    return default
+
+
+def _mg_warn_int(block: dict, key: str, default: int, *, lo: int,
+                 hi: int | None, warnings: list[str], label: str) -> int:
+    if key not in block:
+        return default
+    value = block[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        warnings.append(f"{label} {value!r} invalid; using default {default}")
+        return default
+    if value < lo or (hi is not None and value > hi):
+        warnings.append(
+            f"{label} {value!r} outside [{lo}, {hi}]; using default {default}")
+        return default
+    return value
+
+
+def _mg_warn_float(block: dict, key: str, default: float, *,
+                   lo: float, hi: float, lo_inclusive: bool,
+                   warnings: list[str], label: str) -> float:
+    if key not in block:
+        return default
+    value = block[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        warnings.append(f"{label} {value!r} invalid; using default {default}")
+        return default
+    n = float(value)
+    below = n < lo if lo_inclusive else n <= lo
+    if not math.isfinite(n) or below or n > hi:
+        warnings.append(
+            f"{label} {value!r} outside the allowed range; "
+            f"using default {default}")
+        return default
+    return n
+
+
+def month_gate_config_from_mapping(evo: dict | None) -> MonthGateConfig:
+    """Parse ``evolution.month_gate``. Missing keys keep the defaults.
+
+    A missing ``month_gate`` block is not a warning. A present but
+    unusable value falls back and leaves one string in ``warnings``.
+    """
+    evo = evo if isinstance(evo, dict) else {}
+    warnings: list[str] = []
+    if "month_gate" not in evo:
+        return MonthGateConfig()
+    block = evo.get("month_gate")
+    if not isinstance(block, dict):
+        warnings.append(
+            f"evolution.month_gate {block!r} invalid; using defaults")
+        return MonthGateConfig(warnings=tuple(warnings))
+    latest = _mg_warn_choice(
+        block, "latest_def", _MONTH_GATE_LATEST_DEFS, MONTH_GATE_LATEST_MERGE,
+        warnings, "evolution.month_gate.latest_def")
+    min_sessions = _mg_warn_int(
+        block, "min_sessions", MONTH_GATE_MIN_SESSIONS, lo=1, hi=31,
+        warnings=warnings, label="evolution.month_gate.min_sessions")
+    if "slack" not in block:
+        return MonthGateConfig(
+            latest_def=latest, min_sessions=min_sessions,
+            warnings=tuple(warnings))
+    slack_raw = block.get("slack")
+    if not isinstance(slack_raw, dict):
+        warnings.append(
+            f"evolution.month_gate.slack {slack_raw!r} invalid; "
+            f"using default scaled slack")
+        return MonthGateConfig(
+            latest_def=latest, min_sessions=min_sessions,
+            warnings=tuple(warnings))
+    mode = _mg_warn_choice(
+        slack_raw, "mode", _MONTH_SLACK_MODES, MONTH_SLACK_SCALED,
+        warnings, "evolution.month_gate.slack.mode")
+    flat_twd = _mg_warn_int(
+        slack_raw, "flat_twd", PRIOR_MONTH_SLACK_TWD, lo=0, hi=None,
+        warnings=warnings, label="evolution.month_gate.slack.flat_twd")
+    k = _mg_warn_float(
+        slack_raw, "k", MONTH_SLACK_K, lo=0.0, hi=100.0, lo_inclusive=False,
+        warnings=warnings, label="evolution.month_gate.slack.k")
+    gate3_k = _mg_warn_float(
+        slack_raw, "gate3_k", MONTH_SLACK_GATE3_K, lo=0.0, hi=1.0,
+        lo_inclusive=True, warnings=warnings,
+        label="evolution.month_gate.slack.gate3_k")
+    floor = _mg_warn_int(
+        slack_raw, "floor", MONTH_SLACK_FLOOR_TWD, lo=0, hi=None,
+        warnings=warnings, label="evolution.month_gate.slack.floor")
+    cap = _mg_warn_int(
+        slack_raw, "cap", MONTH_SLACK_CAP_TWD, lo=0, hi=None,
+        warnings=warnings, label="evolution.month_gate.slack.cap")
+    if floor > cap:
+        warnings.append(
+            f"evolution.month_gate.slack floor {floor} > cap {cap}; "
+            f"using defaults {MONTH_SLACK_FLOOR_TWD} and {MONTH_SLACK_CAP_TWD}")
+        floor = MONTH_SLACK_FLOOR_TWD
+        cap = MONTH_SLACK_CAP_TWD
+    return MonthGateConfig(
+        latest_def=latest,
+        min_sessions=min_sessions,
+        slack=MonthSlackConfig(
+            mode=mode, flat_twd=flat_twd, k=k, gate3_k=gate3_k,
+            floor=floor, cap=cap),
+        warnings=tuple(warnings))
+
+
+def _resolve_latest_block(months: set[str], bars,
+                          cfg: MonthGateConfig | None,
+                          ) -> tuple[str, str, int | None, str]:
+    """``(anchor, folded_from, sessions, note)``.
+
+    ``folded_from`` is empty when the newest exit month stays latest.
+    ``sessions`` is None when price bars were not supplied. ``note`` is
+    empty on the default ``max_exit_month`` path so existing reason
+    lists stay unchanged.
+    """
+    newest = max(months)
+    if cfg is None or cfg.latest_def != MONTH_GATE_LATEST_MERGE:
+        return newest, "", None, ""
+    sessions = count_month_sessions(bars, newest)
+    if sessions is None:
+        return newest, "", None, (
+            "latest-month definition: price bars not supplied — "
+            "session count unavailable, newest exit month kept")
+    if sessions < cfg.min_sessions:
+        anchor = _previous_month(newest)
+        return anchor, newest, sessions, (
+            f"latest-month definition: {newest} has {sessions} trading "
+            f"sessions in the price bars (< {cfg.min_sessions}) — "
+            f"folded into {anchor}")
+    return newest, "", sessions, (
+        f"latest-month definition: {newest} has {sessions} trading "
+        f"sessions in the price bars (≥ {cfg.min_sessions}) — "
+        f"kept as latest")
+
+
+def _prior_allowance(base_prior_trades: list, cand_prior_trades: list,
+                     cfg: MonthGateConfig | None, legacy_slack: int,
+                     ) -> tuple[int, int, float | None, int, str]:
+    """``(gate1_allowance, gate3_slack, sigma, n_prior_cand, mode)``.
+
+    Flat mode (and a missing config) uses the flat allowance and a
+    gate-3 slack of 0, so Δ ≥ 0 is unchanged. Scaled mode uses
+    ``clamp(k × σ × sqrt(n), floor, cap)`` with σ the baseline's
+    prior-block sample standard deviation and n the candidate's
+    prior-block trade count. Gate 3 then allows ``gate3_k`` of that
+    clamped allowance. Fewer than two baseline prior trades cannot
+    estimate σ, so the allowance is the floor.
+    """
+    n_cand = len(cand_prior_trades or [])
+    slack_cfg = cfg.slack if cfg is not None else None
+    if slack_cfg is None or slack_cfg.mode != MONTH_SLACK_SCALED:
+        allowance = int(slack_cfg.flat_twd) if slack_cfg is not None else int(legacy_slack)
+        return allowance, 0, None, n_cand, MONTH_SLACK_FLAT
+    pnls = [float(int(getattr(t, "pnl", 0) or 0)) for t in base_prior_trades]
+    sigma = _sample_stdev(pnls)
+    if sigma is None:
+        allowance = int(slack_cfg.floor)
+    else:
+        allowance = scaled_slack_twd(
+            sigma, n_cand, k=slack_cfg.k,
+            floor=slack_cfg.floor, cap=slack_cfg.cap)
+    gate3 = int(round(float(slack_cfg.gate3_k) * allowance))
+    if gate3 < 0:
+        gate3 = 0
+    return allowance, gate3, sigma, n_cand, MONTH_SLACK_SCALED
+
+
+def _allowance_label(allowance: int, mode: str) -> str:
+    """Historical ``5k`` text for the flat default; TWD otherwise."""
+    if mode == MONTH_SLACK_FLAT and int(allowance) == PRIOR_MONTH_SLACK_TWD:
+        return "5k"
+    return str(int(allowance))
+
+
+def _provisional_rule(mode: str, allowance: int, gate3_slack: int) -> str:
+    """Trailer sentence for the slack rule actually in force."""
+    if mode == MONTH_SLACK_SCALED:
+        return (
+            "PROVISIONAL — never auto-save (scaled allowance "
+            f"{int(allowance)}, strict check uses half "
+            f"({int(gate3_slack)}))"
+        )
+    return (
+        "PROVISIONAL — never auto-save (flat allowance "
+        f"{int(allowance)}, strict check is Δ ≥ 0)"
+    )
+
+
+def _delta_bound(gate3_slack: int) -> str:
+    """The right-hand side of ``Δ ≥ …``. Zero keeps the historical ``0``."""
+    if int(gate3_slack) <= 0:
+        return "0"
+    return f"{_MINUS}{int(gate3_slack)}"
 
 
 def decide_month_gates(base_trades: list, cand_trades: list, *,
@@ -1458,39 +1868,59 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
                        slack_twd: int = PRIOR_MONTH_SLACK_TWD,
                        share_max: float = LATEST_MONTH_EDGE_SHARE_MAX,
                        drop_prior_pf_floor: bool = False,
+                       bars=None,
+                       month_gate: MonthGateConfig | None = None,
                        ) -> EvolutionVerdict:
     """Prior-month floor, latest-month edge share, holdout placement.
 
+    The default policy (``month_gate`` omitted) is ``merge_stub`` plus
+    scaled slack. ``max_exit_month`` and ``flat`` are opt-outs.
+
     Latest calendar month is the newest ``YYYY-MM`` among dated exits
-    on either side (September in the #153 window). Prior months are
-    everything else.
+    on either side (September in the #153 window), unless
+    ``latest_def`` is ``merge_stub`` and that month has fewer than
+    ``min_sessions`` TAIFEX trading dates in ``bars``. A night session
+    counts as the next trading day, so one night is one date. The
+    count is not a trade count and not the length of the calendar
+    month. The stub folds into the previous month once; it is not
+    folded again. Prior months are everything outside the latest block.
 
-    1. ``cand_prior_net >= base_prior_net - slack_twd`` (default 5k TWD).
-       A miss is ``prior-months collapse``.
+    1. ``cand_prior_net >= base_prior_net - allowance``. Scaled mode
+       (the default) sets the allowance to one standard error, clamped.
+       Flat mode uses ``flat_twd`` (5k unless changed). A miss is
+       ``prior-months collapse``.
     2. When full-window edge (cand − base) is positive, the latest
-       month's share of that edge must be ≤ 50%. A miss is
+       block's share of that edge must be ≤ 50%. A miss is
        ``calendar-month dominated``.
-    3. If the deep holdout starts in that latest month, the prior-month
-       block must show candidate PF ≥ 1 and Δ ≥ 0. Otherwise the
-       verdict is provisional and must never auto-save. An unknown
-       holdout start fails closed the same way.
+    3. If the deep holdout starts inside the latest block, the
+       prior-month block must show candidate PF ≥ 1 and Δ at least
+       ``-gate3_slack``. Flat mode keeps gate3_slack at 0 (Δ ≥ 0).
+       Scaled mode uses half the clamped allowance by default.
+       Otherwise the verdict is provisional and must never auto-save.
+       An unknown holdout start fails closed the same way.
 
-    ``drop_prior_pf_floor`` (paper relative path only) skips gate 3's
-    PF ≥ 1 requirement and still requires Δ ≥ 0. Latest-month identity
-    and the slack formula are unchanged.
+    ``slack_twd`` is ignored. The allowance comes from ``month_gate``
+    (the default config when it is omitted). ``drop_prior_pf_floor``
+    (paper relative path only) skips gate 3's PF ≥ 1 requirement.
 
-    ``verdict.month_gates`` records the inputs (per-month nets, latest
-    label, edge, share, ablation slack) and these reasons. It does not
-    change ``passed``.
+    ``verdict.month_gates`` records the inputs and these reasons. It
+    does not change ``passed``. ``provisional_rule`` states the slack
+    rule in force so a combined trailer does not claim Δ ≥ 0 under
+    the scaled policy.
     """
+    if month_gate is None:
+        month_gate = MonthGateConfig()
     base_b = _by_month(base_trades)
     cand_b = _by_month(cand_trades)
     months = set(base_b) | set(cand_b)
     if not months:
         reasons = [
             "month gates: no dated exits — cannot assess prior months ✗"]
+        allowance, gate3_slack, _, _, slack_mode = _prior_allowance(
+            [], [], month_gate, slack_twd)
+        rule = _provisional_rule(slack_mode, allowance, gate3_slack)
         return EvolutionVerdict(
-            False, reasons, provisional=True,
+            False, reasons, provisional=True, provisional_rule=rule,
             month_gates=_month_gates_observation(
                 [],
                 latest="", latest_label="",
@@ -1498,14 +1928,28 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
                 share_applied=False, ablation_slack=None,
                 base_prior_net=None, cand_prior_net=None, floor=None,
                 holdout_start=holdout_start,
-                passed=False, provisional=True, reasons=reasons))
+                passed=False, provisional=True, reasons=reasons,
+                latest_def=month_gate.latest_def,
+                slack_mode=slack_mode, slack_allowance=int(allowance),
+                gate3_slack=int(gate3_slack)))
 
-    latest = max(months)
-    label = _month_label(latest)
-    base_prior_trades = [t for m, ts in base_b.items() if m != latest for t in ts]
-    cand_prior_trades = [t for m, ts in cand_b.items() if m != latest for t in ts]
-    base_latest_trades = base_b.get(latest, [])
-    cand_latest_trades = cand_b.get(latest, [])
+    anchor, folded_from, sessions, note = _resolve_latest_block(
+        months, bars, month_gate)
+    latest_keys = {anchor}
+    if folded_from:
+        latest_keys.add(folded_from)
+    label = _month_label(anchor)
+    if folded_from:
+        label = f"{label}+{_month_label(folded_from)}"
+
+    base_prior_trades = [
+        t for m, ts in base_b.items() if m not in latest_keys for t in ts]
+    cand_prior_trades = [
+        t for m, ts in cand_b.items() if m not in latest_keys for t in ts]
+    base_latest_trades = [
+        t for m, ts in base_b.items() if m in latest_keys for t in ts]
+    cand_latest_trades = [
+        t for m, ts in cand_b.items() if m in latest_keys for t in ts]
 
     base_prior = _pnl_of(base_prior_trades)
     cand_prior = _pnl_of(cand_prior_trades)
@@ -1513,18 +1957,24 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
     cand_latest = _pnl_of(cand_latest_trades)
     base_full = base_prior + base_latest
     cand_full = cand_prior + cand_latest
-    floor = base_prior - int(slack_twd)
+    allowance, gate3_slack, sigma, n_cand, slack_mode = _prior_allowance(
+        base_prior_trades, cand_prior_trades, month_gate, slack_twd)
+    floor = base_prior - int(allowance)
     slack = cand_prior - floor
+    bound = _delta_bound(gate3_slack)
+    allow_label = _allowance_label(allowance, slack_mode)
 
     reasons: list[str] = []
     passed = True
     provisional = False
+    if note:
+        reasons.append(note)
 
     abl_ok = cand_prior >= floor
     collapse = "" if abl_ok else " — prior-months collapse"
     reasons.append(
         f"month ablation: prior-months net {_signed(cand_prior)} ≥ "
-        f"baseline{_MINUS}5k ({_signed(floor)}): "
+        f"baseline{_MINUS}{allow_label} ({_signed(floor)}): "
         f"{'✓' if abl_ok else '✗'} (slack {_signed(slack)}){collapse}")
     passed = passed and abl_ok
 
@@ -1551,14 +2001,14 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
     pf_txt = "INF" if pf == float("inf") else f"{pf:.3f}"
     delta = cand_prior - base_prior
     pf_ok = prior_stats.n > 0 and pf >= ABS_PF_FLOOR
-    delta_ok = delta >= 0
+    delta_ok = delta >= -int(gate3_slack)
     if not ho_month:
         reasons.append(
             "holdout≠latest-month-only: deep holdout start unknown — "
             "provisional, never auto-save ✗")
         passed = False
         provisional = True
-    elif ho_month != latest:
+    elif ho_month not in latest_keys:
         reasons.append(
             f"holdout≠latest-month-only: deep holdout starts "
             f"{holdout_start} outside latest calendar month {label} — "
@@ -1567,44 +2017,51 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
         if delta_ok:
             reasons.append(
                 f"holdout≠latest-month-only: paper relative drops prior-month "
-                f"PF ≥ 1 (measured {pf_txt}); Δ {_signed(delta)} ≥ 0 ✓")
+                f"PF ≥ 1 (measured {pf_txt}); Δ {_signed(delta)} ≥ {bound} ✓")
         else:
             reasons.append(
                 f"holdout≠latest-month-only: paper relative drops prior-month "
-                f"PF ≥ 1 (measured {pf_txt}); Δ {_signed(delta)} ≥ 0: ✗ — "
+                f"PF ≥ 1 (measured {pf_txt}); Δ {_signed(delta)} ≥ {bound}: ✗ — "
                 f"provisional, never auto-save")
             passed = False
             provisional = True
     elif pf_ok and delta_ok:
         reasons.append(
             f"holdout≠latest-month-only: prior-month OOS PF {pf_txt} ≥ 1 ✓ "
-            f"and Δ {_signed(delta)} ≥ 0 ✓")
+            f"and Δ {_signed(delta)} ≥ {bound} ✓")
     elif pf_ok:
         reasons.append(
             f"holdout≠latest-month-only: prior-month OOS PF {pf_txt} ≥ 1 ✓ "
-            f"but Δ {_signed(delta)} ≥ 0: ✗ — provisional, never auto-save")
+            f"but Δ {_signed(delta)} ≥ {bound}: ✗ — provisional, never auto-save")
         passed = False
         provisional = True
     else:
         reasons.append(
             f"holdout≠latest-month-only: prior-month OOS PF {pf_txt} ≥ 1 ✗ "
-            f"and Δ {_signed(delta)} ≥ 0: {'✓' if delta_ok else '✗'} — "
+            f"and Δ {_signed(delta)} ≥ {bound}: {'✓' if delta_ok else '✗'} — "
             f"provisional, never auto-save")
         passed = False
         provisional = True
 
     observation = _month_gates_observation(
         _month_rows(base_b, cand_b, months),
-        latest=latest, latest_label=label,
+        latest=anchor, latest_label=label,
         edge=int(edge), latest_delta=int(latest_delta),
         share_pct=_share_pct(int(latest_delta), int(edge)),
         share_applied=edge > 0,
         ablation_slack=int(slack),
         base_prior_net=int(base_prior), cand_prior_net=int(cand_prior),
         floor=int(floor), holdout_start=holdout_start,
-        passed=passed, provisional=provisional, reasons=reasons)
+        passed=passed, provisional=provisional, reasons=reasons,
+        slack_mode=slack_mode, slack_allowance=int(allowance),
+        gate3_slack=int(gate3_slack), sigma_per_trade=sigma,
+        n_prior_cand=n_cand, latest_sessions=sessions,
+        latest_def=month_gate.latest_def,
+        folded_from=folded_from)
+    rule = _provisional_rule(slack_mode, allowance, gate3_slack)
     return EvolutionVerdict(
-        passed, reasons, provisional=provisional, month_gates=observation)
+        passed, reasons, provisional=provisional, month_gates=observation,
+        provisional_rule=rule)
 
 
 def combine_evolution_verdicts(*parts: EvolutionVerdict) -> EvolutionVerdict:
@@ -1617,18 +2074,20 @@ def combine_evolution_verdicts(*parts: EvolutionVerdict) -> EvolutionVerdict:
     passed = True
     provisional = False
     used = False
+    rule = ""
     for part in parts:
         reasons.extend(part.reasons)
         passed = passed and part.passed
         provisional = provisional or part.provisional
         used = used or part.used_criteria
-    if provisional and passed:
-        passed = False
-        reasons.append(
-            "PROVISIONAL — never auto-save (holdout in the latest "
-            "calendar month without prior-month OOS PF≥1 and Δ≥0)")
+        if not rule and part.provisional_rule:
+            rule = part.provisional_rule
+    if provisional:
+        if passed:
+            passed = False
+        reasons.append(rule or "PROVISIONAL — never auto-save.")
     return EvolutionVerdict(passed, reasons, used_criteria=used,
-                            provisional=provisional)
+                            provisional=provisional, provisional_rule=rule)
 
 
 def eligible_for_validated_pool(verdict: EvolutionVerdict) -> bool:
