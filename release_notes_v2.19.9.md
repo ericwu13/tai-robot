@@ -38,8 +38,8 @@
 
 ### 週末進化 Weekend evolution
 
-- **#193**：週六自動進化預設改為 `saturday_mode: propose`：只寫提案檔，不提升 pool、不寫 StrategyStore、不改 bot；`promote` 為明確選用。新增每月結構通道 `structural_lane`（預設開啟、僅提案；每 bot 每月一個候選，DSR ≥ 0.95，需在選擇折數勝過基準；PBO 僅記錄）。該月的結構週六取代當天的 knob grid。手動 Evolve 按鈕不變。
-  **#193**: Saturday auto run now defaults to `saturday_mode: propose` — writes a proposal file only; no pool promotion, no StrategyStore write, no bot change. `promote` is an explicit opt-in. Adds a monthly `structural_lane` (on by default, propose-only; one candidate per bot per month, DSR ≥ 0.95, must win the selection folds; PBO logged, not a pass condition). The month's structural Saturday replaces that day's knob grid. Manual Evolve unchanged.
+- **#193**：週六自動進化預設改為 `saturday_mode: propose`：只寫提案檔，不提升 pool、不寫 StrategyStore、不改 bot；`promote` 為明確選用。新增每月結構通道 `structural_lane`（預設開啟、僅提案；每 bot 每月一個候選，DSR > 0.95，需在選擇折數勝過基準；PBO 僅記錄）。該月的結構週六取代當天的 knob grid。手動 Evolve 按鈕不變。
+  **#193**: Saturday auto run now defaults to `saturday_mode: propose` — writes a proposal file only; no pool promotion, no StrategyStore write, no bot change. `promote` is an explicit opt-in. Adds a monthly `structural_lane` (on by default, propose-only; one candidate per bot per month, DSR > 0.95, must win the selection folds; PBO logged, not a pass condition). The month's structural Saturday replaces that day's knob grid. Manual Evolve unchanged.
 - **#192**：週六 knob 搜尋預設 `search: grid_batch`：預先登錄網格（最多 48 組、最多 2 個 knob），以 DSR、PBO 與高原規則挑選；模型只解釋結果。holdout 不參與挑選。`llm_one` 為舊行為。同時 paper／backtest 晉升預設改為 `paper_gate: relative`。
   **#192**: Saturday knob search defaults to `search: grid_batch` — a pre-registered grid (≤48 settings, ≤2 knobs) picked by DSR, PBO and a plateau rule; the model only explains the winner; the holdout stays out of selection. `llm_one` keeps the old plan. Paper/backtest promotion now defaults to `paper_gate: relative`.
 - **#188**：新增相對晉升門檻（配對折 bootstrap、60% 多數、效果量、≥6 非空折），僅適用 paper／backtest；實單維持絕對 PF 門檻；無效值退回 absolute 並警告。新增退役建議：只寫建議，不停用 bot。（預設值由 #192 改為 relative。）
@@ -60,6 +60,8 @@
   **#165**: ineligible Saturday knob classes are refused before `KeyError`, alerted once, watermark advances (#164).
 - **#194（pending merge）**：週六網格改在 spawn 子程序中執行，不再在 live bot 程序內佔用 GIL 卡住 Tk（tick、成交輪詢、STOP 檔）。上限 20 分鐘；逾時／當機／停止時殺掉子程序、不挑選、watermark 不變。新增 `--grid-subprocess-smoke`。
   **#194 (pending merge)**: the Saturday grid runs in a spawned subprocess instead of the live process, so it no longer holds the GIL and stalls Tk (ticks, fill polling, STOP file). Bounded at 20 min; timeout/crash/stop kills the child, picks nothing, watermark unchanged. Adds `--grid-subprocess-smoke`.
+- **#177（pending merge）**：發行版 `tai_backtest.exe` 直接支援無介面指令（`deploy`／`stop`／`list`／`status`／`strategies`／`backtest`），不另出第二個 EXE。雙擊、沒有參數、或無法辨識的第一個參數仍開 GUI。`--mode` 只接受 `paper` 與 `auto`；`semi_auto` 請用 GUI。不改下單、成交、還原或重連。
+  **#177 (pending merge)**: the release `tai_backtest.exe` routes headless commands (`deploy` / `stop` / `list` / `status` / `strategies` / `backtest`); no second EXE. Double-click, no args, or an unknown first token still opens the GUI. `--mode` accepts `paper` and `auto` only; `semi_auto` stays on the GUI. No order, fill, restore or reconnect changes.
 
 ### 打包 Build
 
@@ -71,6 +73,7 @@
 - 所有 GUI／bot 需換新 EXE 並重啟以取得 #178 重連與 #183。 / All GUIs/bots need the new EXE + restart for the #178 reconnect path and #183.
 - 有週六 `auto_run` 的 bot 需新版並重啟。注意預設行為改變：`saturday_mode: propose`（不再自動提升 pool）、`search: grid_batch`、`paper_gate: relative`、月門檻 `merge_stub` + `scaled`。 / Bots with Saturday `auto_run` need the new build + restart. Default behaviour changes: `saturday_mode: propose` (no automatic pool promotion), `search: grid_batch`, `paper_gate: relative`, month gates `merge_stub` + `scaled`.
 - `settings.example.yaml` 新增 `evolution` 鍵 / new `evolution` keys: `min_design_trades`, `idle_warn_days`, `knob_ineligible_fallback`, `paper_gate`, `real_gate`, `search`, `saturday_mode`, `relative.*`, `trial_penalty.*`, `retire.*`, `month_gate.*` (`latest_def`, `min_sessions`, `slack.*`), `structural_lane.*`. 可選本機檔 / optional local file: `taifex_closures.yaml`.
+- 無介面操作（#177，pending merge）：在安裝資料夾執行 `tai_backtest.exe deploy`（部署）、`tai_backtest.exe stop`（停止）、`tai_backtest.exe list`（列出）、`tai_backtest.exe status`（狀態）。`--mode` 只有 `paper`／`auto`；`semi_auto` 請用 GUI。需在已登入的桌面工作階段執行（不支援 Windows 服務／LocalSystem）。 / Headless (#177, pending merge): from the install folder run `tai_backtest.exe deploy`, `tai_backtest.exe stop`, `tai_backtest.exe list`, `tai_backtest.exe status`. `--mode` is `paper` or `auto` only; `semi_auto` stays on the GUI. Requires a logged-in desktop session (not a Windows service / LocalSystem).
 - `evolution_history.jsonl` 不會自動截斷，需要時手動封存。 / `evolution_history.jsonl` is never trimmed; archive by hand if needed.
 - DEGRADED 時新進場被封鎖，請按 Reconnect 或重啟。 / In DEGRADED, new entries are blocked: press Reconnect or restart.
 
