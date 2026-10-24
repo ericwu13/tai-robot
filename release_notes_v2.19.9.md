@@ -1,6 +1,6 @@
 # v2.19.9
 
-> 草稿 / DRAFT. Base: master `747d4dcd` (#194 merged). #195 and #177 are **pending merge**. No build, tag or publish yet.
+> 草稿 / DRAFT. Base: master `cad71dd9` (#194, #195 merged). #177 is **pending merge**; #172 awaits a merge-or-known-issue decision. No build, tag or publish yet.
 
 ## 修復與功能 Fixes & features
 
@@ -62,11 +62,13 @@
   **#194** (merged `747d4dcd`): the Saturday grid runs in a spawned subprocess instead of the live process, so it no longer holds the GIL and stalls Tk (ticks, fill polling, STOP file). Bounded at 20 min; timeout/crash/stop kills the child, picks nothing, watermark unchanged. Adds `--grid-subprocess-smoke`.
 - **#177（pending merge）**：發行版 `tai_backtest.exe` 直接支援無介面指令（`deploy`／`stop`／`list`／`status`／`strategies`／`backtest`），不另出第二個 EXE。雙擊、沒有參數、或無法辨識的第一個參數仍開 GUI。`--mode` 只接受 `paper` 與 `auto`；`semi_auto` 請用 GUI。不改下單、成交、還原或重連。
   **#177 (pending merge)**: the release `tai_backtest.exe` routes headless commands (`deploy` / `stop` / `list` / `status` / `strategies` / `backtest`); no second EXE. Double-click, no args, or an unknown first token still opens the GUI. `--mode` accepts `paper` and `auto` only; `semi_auto` stays on the GUI. No order, fill, restore or reconnect changes.
+- **#172（pending：merge 或列為已知問題，待決定）**：#171 的後續修正。被 `BLOCK_FILL_PENDING` 擋下的延遲平倉（deferred close）在成交逾時或重啟後可能留下，之後在下一筆 auto 進場確認時被重播（新空單多一筆賣出，或同方向進場反被平倉）。修正：僅在進場 `fill_pending` 中才保存／還原 `deferred_close`；`FillPoller.timeout()` 在任何釋放成交閘門的逾時（進場與出場）都清除它。不改 BrokerPort／`broker.py`。進場逾時後不對帳實際部位仍是追蹤中的後續問題。
+  **#172 (pending — merge or known issue, decision pending)**: fix-forward for #171. A deferred close (stored when `TRADE_CLOSE` is blocked by `BLOCK_FILL_PENDING`) could survive a fill timeout or a restart and be replayed on the next auto entry confirm (an extra sell on a new short, or a same-side entry closed instead). Fix: `deferred_close` is saved/restored only while an entry `fill_pending` is in flight, and `FillPoller.timeout()` clears it on every timeout that drops the fill gate (entry and exit). No BrokerPort / `broker.py` changes. Not reconciling the real book after an entry timeout remains a tracked follow-up.
 
 ### 打包 Build
 
-- **#195（pending merge）**：修正乾淨 clone 的 EXE 建置（不再打包 gitignored 的 `strategies/`，改用空白佔位）與 `comtypes.gen` 啟動當機（runtime hook 在 `_comtypes_cache` 建立 `comtypes.gen`）；固定 PyInstaller 6.19.0、comtypes 1.4.15。
-  **#195 (pending merge)**: fixes fresh-clone EXE builds (bundles an empty placeholder instead of the gitignored `strategies/`) and the `comtypes.gen` startup crash (runtime hook creates `comtypes.gen` in `_comtypes_cache`); pins PyInstaller 6.19.0 and comtypes 1.4.15.
+- **#195**（merge `cad71dd9`）：修正乾淨 clone 的 EXE 建置（不再打包 gitignored 的 `strategies/`，改用空白佔位）與 `comtypes.gen` 啟動當機（runtime hook 在 `_comtypes_cache` 建立 `comtypes.gen`）；固定 PyInstaller 6.19.0、comtypes 1.4.15。
+  **#195** (merged `cad71dd9`): fixes fresh-clone EXE builds (bundles an empty placeholder instead of the gitignored `strategies/`) and the `comtypes.gen` startup crash (runtime hook creates `comtypes.gen` in `_comtypes_cache`); pins PyInstaller 6.19.0 and comtypes 1.4.15.
 
 ## 升級注意 Upgrade notes
 
@@ -94,7 +96,7 @@
 - **User impact:** If it happens, the bot exits or stops responding and does not restart itself. Any open position loses automatic exit management until you restart the bot. After a disconnect alert, check the bot and restart it if it's down or frozen.
 
 - **#192 GIL 卡頓**：已由 #194 解決（網格改在 spawn 子程序執行）。 / **#192 GIL stall**: resolved by #194 (the grid now runs in a spawned subprocess).
-- **#195**：任何建置前必須合併。 / must be merged before any build.
+- **#195**：已合併（`cad71dd9`），建置需要的修正已在 master。 / merged (`cad71dd9`); the build fix is on master.
 
 ## 開發者 Developer
 
