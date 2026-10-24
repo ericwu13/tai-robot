@@ -359,7 +359,9 @@ def test_resume_inflight_exit_does_not_send_new_exit(tmp_path):
     saved = load_session(runner.session_path)["trading_guard"]
     assert saved["fill_pending"] is True
     assert saved["fill_pending_type"] == "exit"
-    assert saved["deferred_close"]["action"] == "TRADE_CLOSE"
+    # The close was parked beside an in-flight exit. It is replayed only
+    # on the next entry confirm, so it must not be written into the session.
+    assert saved["deferred_close"] is None
 
     # Deploy calls reset() before resume. That is the wipe under test.
     fresh = TradingGuard()
@@ -372,16 +374,15 @@ def test_resume_inflight_exit_does_not_send_new_exit(tmp_path):
     assert fresh.fill_pending is True
     assert fresh.fill_pending_type == "exit"
     assert fresh.real_entry_confirmed is True
-    assert fresh._deferred_close["action"] == "TRADE_CLOSE"
-    assert fresh._deferred_close["price"] == 22400
+    assert fresh._deferred_close is None
 
     verdict, _details = fresh.decide("auto", "TRADE_CLOSE", "LONG")
     assert verdict == fresh.BLOCK_FILL_PENDING
     assert verdict != fresh.SEND_EXIT
-    # The blocked decision must not clear the in-flight state.
+    # The blocked decision must not clear the in-flight exit gate.
     assert fresh.fill_pending is True
     assert fresh.fill_pending_type == "exit"
-    assert fresh._deferred_close["action"] == "TRADE_CLOSE"
+    assert fresh._deferred_close is None
 
 
 def test_legacy_resume_without_guard_snapshot_still_clears_fill_pending():
@@ -642,7 +643,8 @@ def test_resume_in_position_restarts_fill_poller(monkeypatch):
     poller = app._fill_poller
     assert guard.fill_pending is True
     assert guard.fill_pending_type == "exit"
-    assert guard._deferred_close["price"] == 22400
+    # The snapshot's close belongs to an exit, not a pending entry.
+    assert guard._deferred_close is None
     assert poller.active is True
     assert poller.action_type == "exit"
     assert app.root.pending, "fill poll was not scheduled"
