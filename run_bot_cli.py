@@ -28,11 +28,16 @@ from __future__ import annotations
 import os
 import sys
 
-# Frozen spawn children re-execute this entry before main(). Must run
-# before headless imports run_backtest (Tk / COM / the bot).
+# Source CLI is __main__ for `python run_bot_cli.py`. A spawn child of that
+# process must run freeze_support and exit before headless imports the bot.
+# The frozen EXE enters through run_backtest.py instead; this guard is the
+# source-shaped counterpart and uses the same helper.
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
+    from src.paths import is_multiprocessing_child
+    if is_multiprocessing_child():
+        raise SystemExit(0)
 
 import time
 

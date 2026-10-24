@@ -21,14 +21,21 @@ import sys
 
 # Frozen EXE spawn children re-execute this file as __main__. This has
 # to run before Tk, COM, or the Capital API are imported and before
-# main() starts a bot. A child sees --multiprocessing-fork, runs the
-# grid payload, and exits here. The headless entry is run_bot_cli.py.
-# The grid-smoke flag is the key-free parent: it also exits here, so
-# this process never opens a Tk window or talks to the broker.
+# main() starts a bot. freeze_support() is first so a Windows frozen
+# child can run its payload and exit. Classification uses
+# src.paths.skips_gui_and_com, the same helper as the comtypes hook, so
+# a spawn child and the grid-smoke parent never reach the CLI router.
+# The headless entry is run_bot_cli.py.
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-    if "--grid-subprocess-smoke" in sys.argv:
+    from src.paths import dispatch_entry
+    _kind, _routed = dispatch_entry(sys.argv)
+    if _kind == "spawn":
+        raise SystemExit(0)
+    if _kind == "grid_smoke":
+        # ``--grid-subprocess-smoke`` (anywhere in argv). grid_smoke.main
+        # owns --payload-bytes and the non-GridOutcome exit 1.
         from src.evolution.grid_smoke import main as _grid_smoke_main
         raise SystemExit(_grid_smoke_main(sys.argv))
 
@@ -11065,15 +11072,19 @@ def main():
 
 
 if __name__ == "__main__":
-    # freeze_support() already ran at the top of this module, before Tk.
-    # Spawn and grid-smoke already exited there. A CLI subcommand goes to
-    # run_bot_cli; anything else still here is the GUI.
-    from src.live.headless import route_argv
-    kind, routed = route_argv(sys.argv[1:])
+    # freeze_support() and the spawn / grid-smoke exits already ran at the
+    # top of this module, before Tk was imported. Classify again with the
+    # same helper: a CLI subcommand goes to run_bot_cli, anything else that
+    # is still here is the GUI. Spawn and grid-smoke must not fall through
+    # into main() if the top exit was skipped.
+    from src.paths import dispatch_entry
+    kind, routed = dispatch_entry(sys.argv)
     if kind == "cli":
         # Lazy: the GUI path must not import the CLI driver, and must not
         # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
         # that init (once) via run_bot_cli → headless_app._boot.
         import run_bot_cli
         sys.exit(run_bot_cli.main(routed))
+    if kind != "gui":
+        raise SystemExit(0)
     main()

@@ -42,9 +42,9 @@ Build-integrity guard (added after the v2.13.0 mismatch, where the
 published EXE was built from a checkout lacking the regime code):
 
   1. Refuses to package when tracked SOURCE (src/, run_backtest.py,
-     run_bot_cli.py, tai_backtest.spec, version.py) has uncommitted
-     changes — a dirty tree can't be traced back to a commit. Override
-     with --allow-dirty.
+     run_bot_cli.py, tai_backtest.spec, runtime_hook_comtypes.py,
+     version.py) has uncommitted changes — a dirty tree can't be traced
+     back to a commit. Override with --allow-dirty.
   2. Refuses to package when the bundled ``_internal/src`` does not match
      the working-tree ``src`` — this is exactly the drift that shipped in
      v2.13.0, and it catches a stale ``dist/`` reused via --skip-build.
@@ -71,8 +71,12 @@ DIST_DIR = os.path.join("dist", "tai_backtest")
 ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 
 # Tracked paths whose uncommitted state would make the build untraceable.
+# Keep run_bot_cli.py, tai_backtest.spec, and the comtypes runtime hook
+# when merging #195's build_release.py (that branch does not list them).
+# Do not drop #195's requirements-build.txt wiring that follows this list.
 SOURCE_PATHS = [
-    "src", "run_backtest.py", "run_bot_cli.py", "tai_backtest.spec", "version.py",
+    "src", "run_backtest.py", "run_bot_cli.py", "tai_backtest.spec",
+    "runtime_hook_comtypes.py", "version.py",
 ]
 
 # Pinned toolchain consumed by ``build()`` before PyInstaller runs.

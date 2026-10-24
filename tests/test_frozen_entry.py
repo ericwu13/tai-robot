@@ -59,14 +59,122 @@ def test_gui_main_sequence_has_no_cli_import():
     assert "run_bot_cli" not in body
 
 
-def test_dunder_main_freezes_then_routes_without_second_com_init():
+def test_spawn_guard_runs_before_tk_import():
     text = (REPO / "run_backtest.py").read_text(encoding="utf-8")
-    block = text.split('if __name__ == "__main__":', 1)[1]
-    assert block.index("freeze_support()") < block.index("route_argv")
-    assert block.index("route_argv") < block.index("import run_bot_cli")
-    assert "sys.exit(run_bot_cli.main(routed))" in block
-    assert "enable_dpi_awareness()" not in block
-    assert "_init_com()" not in block
+    pre_tk = text[:text.index("\nimport tkinter")]
+    assert pre_tk.count('if __name__ == "__main__":') == 1
+    assert pre_tk.index("freeze_support()") < pre_tk.index("dispatch_entry")
+    assert "route_argv(" not in pre_tk
+    assert "_grid_smoke_main" in pre_tk
+    assert "enable_dpi_awareness()" not in pre_tk
+    assert "_init_com()" not in pre_tk
+    bottom = text.split('if __name__ == "__main__":')[-1]
+    assert bottom.index("dispatch_entry") < bottom.index("import run_bot_cli")
+    assert "sys.exit(run_bot_cli.main(routed))" in bottom
+    assert "\n    main()\n" in bottom
+    assert "enable_dpi_awareness()" not in bottom
+    assert "_init_com()" not in bottom
+
+
+def test_spawn_child_never_calls_route_argv_or_gui(monkeypatch):
+    calls = []
+    real = hl.route_argv
+
+    def spy(argv):
+        calls.append(list(argv))
+        return real(argv)
+
+    monkeypatch.setattr(hl, "route_argv", spy)
+    argv = ["tai_backtest.exe", "--multiprocessing-fork", "parent_pid=1", "pipe_handle=0"]
+    assert paths.dispatch_entry(argv) == ("spawn", argv)
+    assert calls == []
+    # The flag only counts at argv[1]. A later copy is not a spawn child.
+    later = ["tai_backtest.exe", "deploy", "--multiprocessing-fork"]
+    assert paths.dispatch_entry(later)[0] == "cli"
+    assert calls == [["deploy", "--multiprocessing-fork"]]
+
+
+def test_grid_smoke_is_not_routed(monkeypatch):
+    calls = []
+
+    def boom(argv):
+        calls.append(list(argv))
+        return ("gui", list(argv))
+
+    monkeypatch.setattr(hl, "route_argv", boom)
+    argv = ["tai_backtest.exe", "--grid-subprocess-smoke", "--hang"]
+    assert paths.dispatch_entry(argv) == ("grid_smoke", argv)
+    assert calls == []
+    assert paths.skips_gui_and_com(argv)
+    assert paths.skips_gui_and_com(
+        ["tai_backtest.exe", "--multiprocessing-fork", "x"])
+
+
+def test_no_args_and_help_stay_gui_and_cli_still_routes():
+    assert paths.dispatch_entry(["tai_backtest.exe"]) == ("gui", [])
+    assert paths.dispatch_entry(["tai_backtest.exe", "--help"]) == ("gui", ["--help"])
+    assert paths.dispatch_entry(["tai_backtest.exe", "-h"]) == ("gui", ["-h"])
+    assert paths.dispatch_entry(["tai_backtest.exe", "nope"]) == ("gui", ["nope"])
+    for cmd in CLI_COMMANDS:
+        kind, routed = paths.dispatch_entry(
+            ["tai_backtest.exe", cmd, "--symbol", "TMF00"])
+        assert kind == "cli"
+        assert routed == [cmd, "--symbol", "TMF00"]
+    paper = ["tai_backtest.exe", "deploy", "--symbol", "TMF00", "--bot", "b",
+             "--strategy", "x", "--mode", "paper"]
+    assert paths.dispatch_entry(paper) == ("cli", paper[1:])
+    assert not paths.skips_gui_and_com(paper)
+
+
+def test_spawn_process_exits_before_gui():
+    """A real interpreter: the fork argv must exit, not enter mainloop."""
+    import subprocess
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "run_backtest.py"),
+         "--multiprocessing-fork", "parent_pid=1"],
+        cwd=REPO, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0
+    assert "Traceback" not in proc.stderr
+    assert proc.stdout == ""
+
+
+def test_grid_smoke_process_does_not_enter_gui():
+    """The smoke flag must finish (not sit in the Tk mainloop).
+
+    grid_smoke.py arrives with #194. Until then the process exits on the
+    import, still before Tk. Either way it must not hang.
+    """
+    import subprocess
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "run_backtest.py"),
+         "--grid-subprocess-smoke"],
+        cwd=REPO, capture_output=True, text=True, timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "mainloop" not in combined
+    # Not the GUI path. #194's module is absent on this branch, so the
+    # import fails; once it exists the smoke main returns on its own.
+    if proc.returncode != 0:
+        assert "grid_smoke" in combined
+
+
+def test_comtypes_hook_skips_only_spawn_and_smoke():
+    import runtime_hook_comtypes as hook
+    paper = ["tai_backtest.exe", "deploy", "--symbol", "TMF00", "--bot", "b",
+             "--mode", "paper"]
+    assert hook.should_install_comtypes(paper)
+    assert hook.should_install_comtypes(["tai_backtest.exe", "list"])
+    assert hook.should_install_comtypes(["tai_backtest.exe"])
+    assert not hook.should_install_comtypes(
+        ["tai_backtest.exe", "--multiprocessing-fork", "parent_pid=1"])
+    assert not hook.should_install_comtypes(
+        ["tai_backtest.exe", "--grid-subprocess-smoke"])
+    text = (REPO / "runtime_hook_comtypes.py").read_text(encoding="utf-8")
+    assert "def ensure_comtypes_gen(" in text
+    assert "should_install_comtypes" in text
+    assert text.index("if should_install_comtypes():") < text.index(
+        "        ensure_comtypes_gen(cache_dir)")
 
 
 # ── child_command ────────────────────────────────────────────────────
@@ -259,6 +367,16 @@ def test_spec_hiddenimports_and_source_paths():
     import build_release
     assert "run_bot_cli.py" in build_release.SOURCE_PATHS
     assert "tai_backtest.spec" in build_release.SOURCE_PATHS
+    assert "runtime_hook_comtypes.py" in build_release.SOURCE_PATHS
+    assert list(build_release.SOURCE_PATHS) == list(dict.fromkeys(build_release.SOURCE_PATHS))
+    # Quoted hiddenimport names, once each. #194/#195 add more names in
+    # other hunks; a restack that duplicates one of these fails here.
+    import re
+    names = re.findall(r"'((?:src\.|run_bot_cli|comtypes)[^']*)'", spec)
+    assert names.count("run_bot_cli") == 1
+    assert names.count("src.paths") == 1
+    assert names.count("src.live.headless") == 1
+    assert names.count("src.ai.strategy_store") == 1
 
 
 def test_redeploy_recipe_names_exe_and_source_headless():
