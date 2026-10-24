@@ -1,9 +1,26 @@
 """Build and package tai_backtest EXE for release.
 
 Usage:
-    python build_release.py          # build + zip
+    python build_release.py          # build + zip; does not pip-install
     python build_release.py --skip-build  # zip only (reuse existing dist/)
     python build_release.py --allow-dirty # permit uncommitted source
+    python build_release.py --skip-release
+        # build + zip only. Does not pip-install (the default).
+    python build_release.py --skip-release --install-build-deps
+        # also pip-install -e . and requirements-build.txt into the
+        # target interpreter (prefers .venv-build), then run PyInstaller
+        # with that same interpreter.
+
+The default never runs pip. ``--no-install`` is accepted and changes
+nothing. ``--install-build-deps`` is the opt-in. It installs this
+project (``pip install -e .``: pyyaml, keyring, httpx,
+lightweight-charts, pandas, holidays) and ``requirements-build.txt``
+into ``.venv-build`` when that interpreter exists; otherwise it warns
+and names the active interpreter before installing there. The install
+always runs, including when the PyInstaller and comtypes pins already
+match, so the project packages are present. Pin checks before and after
+the install query that same interpreter. Installing there can
+downgrade ``comtypes`` in a dev or live venv.
 
 Build-integrity guard (added after the v2.13.0 mismatch, where the
 published EXE was built from a checkout lacking the regime code):
@@ -38,9 +55,24 @@ ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 # Tracked paths whose uncommitted state would make the build untraceable.
 SOURCE_PATHS = ["src", "run_backtest.py", "version.py"]
 
+# Pinned toolchain consumed by ``build()`` before PyInstaller runs.
+# PyInstaller 6.22.3 + comtypes 1.4.17 omit ``comtypes.gen`` and the EXE
+# dies in the runtime hook. Do not float these pins.
+BUILD_REQUIREMENTS = "requirements-build.txt"
+
 # Files and directories to EXCLUDE from the release zip
 EXCLUDE_FILES = set()  # settings.yaml is now included with default values
 EXCLUDE_DIRS = {"CapitalLog_Backtest", "_comtypes_cache", "__pycache__", "data", "live"}
+
+# Marker shipped in the empty strategies placeholder. Never a private strategy.
+_STRATEGIES_PLACEHOLDER_NAME = "README.txt"
+_STRATEGIES_PLACEHOLDER_TEXT = (
+    "Empty placeholder bundled with tai_backtest.\n"
+    "\n"
+    "Private AI strategies live in the gitignored strategies/ directory\n"
+    "next to the source checkout, or next to tai_backtest.exe after install.\n"
+    "Those files are not packaged into the EXE.\n"
+)
 
 
 def _git(*args) -> str:
@@ -121,11 +153,315 @@ def write_build_stamp(sha: str, dirty: bool) -> None:
     print(f"  Stamped BUILD_INFO.json: v{VERSION} @ {sha[:10]}{flag}")
 
 
-def build():
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _is_within(child: str, parent: str) -> bool:
+    """True when ``child`` is strictly inside ``parent``."""
+    child_n = _norm(child)
+    parent_n = _norm(parent)
+    if child_n == parent_n:
+        return False
+    try:
+        return os.path.commonpath([child_n, parent_n]) == parent_n
+    except ValueError:
+        return False
+
+
+def _assert_safe_strategies_staging(project_root: str, staging: str) -> None:
+    """Refuse to wipe or bundle the private ``strategies/`` tree."""
+    private = os.path.join(project_root, "strategies")
+    if (
+        _norm(staging) == _norm(private)
+        or _is_within(staging, private)
+        or _is_within(private, staging)
+    ):
+        raise RuntimeError(
+            "refusing to bundle the private strategies directory: "
+            f"{private}"
+        )
+
+
+def strategies_datas(
+    project_root: str, *, staging_dir: str | None = None,
+) -> list[tuple[str, str]]:
+    """PyInstaller ``datas`` entries for an empty ``strategies`` directory.
+
+    ``strategies/`` is gitignored. PyInstaller aborts when a datas source
+    is missing, which is every fresh clone. Pointing datas at the real
+    directory would also ship whatever private AI strategies happen to be
+    on the build machine. Stage a marker-only directory under ``build/``
+    (gitignored) and return that instead.
+    """
+    project_root = os.path.abspath(project_root or ".")
+    staging = os.path.abspath(
+        staging_dir
+        or os.path.join(project_root, "build", "strategies_placeholder")
+    )
+    # Project-root check first: the private strategies path lives inside
+    # the project, so a staging dir of the project itself would otherwise
+    # be reported as a private-strategies overlap.
+    if _norm(staging) == _norm(project_root) or _is_within(project_root, staging):
+        raise RuntimeError(
+            f"refusing to stage the strategies placeholder at {staging}"
+        )
+    _assert_safe_strategies_staging(project_root, staging)
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    os.makedirs(staging, exist_ok=True)
+    with open(os.path.join(staging, _STRATEGIES_PLACEHOLDER_NAME),
+              "w", encoding="utf-8") as fh:
+        fh.write(_STRATEGIES_PLACEHOLDER_TEXT)
+    leaked = [
+        name for name in os.listdir(staging)
+        if name.endswith(".py") or name == "index.json"
+    ]
+    if leaked:
+        raise RuntimeError(f"refusing to bundle strategy files: {leaked}")
+    return [(staging, "strategies")]
+
+
+def parse_pinned_requirements(text: str) -> dict[str, str]:
+    """Parse ``name==version`` pins. Comments and blank lines are ignored.
+
+    Every requirement must be an exact pin. A floating specifier would
+    let the EXE toolchain drift back to the crashing combination.
+    """
+    pins: dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "==" not in line:
+            raise ValueError(
+                f"{BUILD_REQUIREMENTS}:{lineno}: pin must be name==version "
+                f"({raw.strip()!r})"
+            )
+        name, version = (part.strip() for part in line.split("==", 1))
+        if (
+            not name or not version
+            or any(ch in name for ch in " <>,;[]@")
+            or any(ch in version for ch in " <>,;[]@")
+        ):
+            raise ValueError(
+                f"{BUILD_REQUIREMENTS}:{lineno}: pin must be name==version "
+                f"({raw.strip()!r})"
+            )
+        if name in pins:
+            raise ValueError(
+                f"{BUILD_REQUIREMENTS}:{lineno}: duplicate pin for {name}"
+            )
+        pins[name] = version
+    if not pins:
+        raise ValueError(f"{BUILD_REQUIREMENTS} has no pins")
+    return pins
+
+
+def _installed_version(dist_name: str) -> str | None:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version(dist_name)
+    except PackageNotFoundError:
+        return None
+
+
+# Query one distribution inside a chosen interpreter. Exit 3 means the
+# distribution is not installed there. Any other non-zero exit is a
+# probe failure (the interpreter itself could not run).
+_VERSION_PROBE = (
+    "import importlib.metadata, sys\n"
+    "try:\n"
+    "    print(importlib.metadata.version(sys.argv[1]), end='')\n"
+    "except importlib.metadata.PackageNotFoundError:\n"
+    "    raise SystemExit(3)\n"
+)
+
+
+def query_dist_version(python: str, dist_name: str, *, runner=None):
+    """Return the installed version of ``dist_name`` inside ``python``.
+
+    ``None`` when that interpreter does not have the distribution.
+    ``runner`` is called like ``subprocess.run(cmd, capture_output=True,
+    text=True)``.
+    """
+    cmd = [python, "-c", _VERSION_PROBE, dist_name]
+    run = runner or subprocess.run
+    try:
+        result = run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        print(f"ERROR: could not query {dist_name} in {python}: {exc}")
+        sys.exit(1)
+    code = getattr(result, "returncode", 1)
+    if code == 0:
+        text = (getattr(result, "stdout", "") or "").strip()
+        return text or None
+    if code == 3:
+        return None
+    print(f"ERROR: could not query {dist_name} in {python} (exit {code})")
+    sys.exit(1)
+
+
+def unsatisfied_pins(
+    pins: dict[str, str], version_of,
+) -> dict[str, str | None]:
+    """Return ``{name: installed_or_None}`` for pins that are not met."""
+    bad: dict[str, str | None] = {}
+    for name, want in pins.items():
+        got = version_of(name)
+        if got != want:
+            bad[name] = got
+    return bad
+
+
+def ensure_build_requirements(
+    project_root: str | None = None, *, runner=None, version_of=None,
+    python: str | None = None,
+) -> dict[str, str]:
+    """Install this project and ``requirements-build.txt`` into ``python``.
+
+    ``python`` is the interpreter that receives the packages (default:
+    this process). The pip install always runs, including when the
+    pins already match: those pins do not cover the project packages.
+    Pin checks before and after the install query that same interpreter.
+    ``runner`` and ``version_of`` exist so tests can avoid pip and a real
+    environment. ``runner`` is called like ``subprocess.run(cmd)`` for
+    pip and like ``subprocess.run(cmd, capture_output=True, text=True)``
+    for version probes.
+    """
+    root = os.path.abspath(
+        project_root or os.path.dirname(os.path.abspath(__file__)) or "."
+    )
+    py = python or sys.executable
+    req_path = os.path.join(root, BUILD_REQUIREMENTS)
+    with open(req_path, encoding="utf-8") as fh:
+        pins = parse_pinned_requirements(fh.read())
+    run = runner or subprocess.run
+    if version_of is None:
+        def version_of(name, _py=py, _run=run):
+            return query_dist_version(_py, name, runner=_run)
+    bad = unsatisfied_pins(pins, version_of)
+    if not bad:
+        listed = ", ".join(f"{name}=={ver}" for name, ver in pins.items())
+        print(f"Build dependencies OK ({listed})")
+    else:
+        print(f"Build dependencies do not match {BUILD_REQUIREMENTS}:")
+        for name, want in pins.items():
+            if name in bad:
+                have = bad[name] or "not installed"
+                print(f"  {name}: want {want}, have {have}")
+    # Always install. Matching pins do not mean the project (pyyaml,
+    # keyring, httpx, lightweight-charts, pandas, holidays) is present.
+    # -e . installs the project. -r pins the toolchain.
+    cmd = [py, "-m", "pip", "install", "-e", root, "-r", req_path]
+    print(f"Installing the project and pinned build dependencies with {py}")
+    print(f"  {' '.join(cmd)}")
+    result = run(cmd)
+    if getattr(result, "returncode", 1) != 0:
+        print(f"ERROR: failed to install {BUILD_REQUIREMENTS}")
+        sys.exit(1)
+    bad = unsatisfied_pins(pins, version_of)
+    if bad:
+        print("ERROR: build dependencies still mismatch after install: "
+              f"{bad}")
+        sys.exit(1)
+    print("Build dependencies installed")
+    return pins
+
+
+def warn_build_requirements(project_root: str) -> dict[str, str | None]:
+    """Report pin drift without running pip.
+
+    Used by the default build (and the ``--no-install`` no-op). Returns
+    the unsatisfied pins (empty when the active environment already
+    matches). Does not run pip.
+    """
+    root = os.path.abspath(project_root or ".")
+    req_path = os.path.join(root, BUILD_REQUIREMENTS)
+    with open(req_path, encoding="utf-8") as fh:
+        pins = parse_pinned_requirements(fh.read())
+    bad = unsatisfied_pins(pins, _installed_version)
+    print(f"Not installing {BUILD_REQUIREMENTS} "
+          f"(default; pass --install-build-deps to opt in).")
+    if not bad:
+        listed = ", ".join(f"{name}=={ver}" for name, ver in pins.items())
+        print(f"Build dependencies OK ({listed})")
+        return bad
+    print("WARNING: active environment does not match the pins:")
+    for name, got in bad.items():
+        have = got or "not installed"
+        print(f"  {name}: want {pins[name]}, have {have}")
+    print("The runtime hook still creates comtypes.gen when that package")
+    print("is missing. The pins are secondary.")
+    return bad
+
+
+def _dedicated_build_python(project_root: str) -> str | None:
+    """Return ``.venv-build``'s interpreter when that venv exists."""
+    root = os.path.abspath(project_root or ".")
+    candidates = [
+        os.path.join(root, ".venv-build", "Scripts", "python.exe"),
+        os.path.join(root, ".venv-build", "bin", "python"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _python_for_install(project_root: str) -> str:
+    """Interpreter that ``--install-build-deps`` should pip into.
+
+    Prefers ``.venv-build``. Otherwise warns and returns this process's
+    interpreter, by full path, so the operator can see the target.
+    """
+    dedicated = _dedicated_build_python(project_root)
+    if dedicated:
+        print(f"Installing build dependencies into dedicated venv: {dedicated}")
+        return dedicated
+    print("WARNING: --install-build-deps will pip-install into this interpreter:")
+    print(f"  {sys.executable}")
+    print("The install is pip install -e . plus requirements-build.txt.")
+    print("That can downgrade comtypes in a dev or live venv.")
+    print("Prefer a dedicated build venv and re-run with its python:")
+    print("  python -m venv .venv-build")
+    print("  .venv-build/bin/python build_release.py --skip-release --install-build-deps")
+    print("  Windows: .venv-build\\Scripts\\python build_release.py --skip-release --install-build-deps")
+    return sys.executable
+
+
+def resolve_install_request(*, install_build_deps: bool, no_install: bool) -> bool:
+    """Whether this invocation should pip-install.
+
+    The default is no. ``--no-install`` is accepted and does not change
+    that. ``--install-build-deps`` is the only opt-in; the no-op alias
+    does not cancel it.
+    """
+    if install_build_deps and no_install:
+        print("NOTE: --no-install is a no-op and does not cancel "
+              "--install-build-deps.")
+    return bool(install_build_deps)
+
+
+def build(*, install_requirements: bool = False):
+    """Build the EXE. PyInstaller runs on the same interpreter as any install.
+
+    With ``install_requirements``, pin checks, ``pip install -e .``,
+    ``pip install -r requirements-build.txt``, and PyInstaller all use
+    the target interpreter (``.venv-build`` when it exists).
+    """
     print(f"=== Building tai_backtest v{VERSION} ===")
+    root = os.path.dirname(os.path.abspath(__file__)) or "."
+    py = sys.executable
+    if install_requirements:
+        py = _python_for_install(root)
+        ensure_build_requirements(root, python=py)
+    else:
+        warn_build_requirements(root)
+    strategies_datas(root)
     result = subprocess.run(
-        [sys.executable, "-m", "PyInstaller", "tai_backtest.spec", "--noconfirm"],
-        cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+        [py, "-m", "PyInstaller", "tai_backtest.spec", "--noconfirm"],
+        cwd=root,
     )
     if result.returncode != 0:
         print("BUILD FAILED")
@@ -391,6 +727,17 @@ def main():
                         help="Permit packaging with uncommitted source changes")
     parser.add_argument("--skip-release", action="store_true",
                         help="Skip GitHub release creation (build + package only)")
+    parser.add_argument("--install-build-deps", action="store_true",
+                        help="pip-install -e . and requirements-build.txt "
+                             "into the target interpreter, then run "
+                             "PyInstaller with it. Uses .venv-build when "
+                             "that interpreter exists; otherwise installs "
+                             "into the active interpreter and prints its "
+                             "path. Can downgrade comtypes in a dev or "
+                             "live venv.")
+    parser.add_argument("--no-install", action="store_true",
+                        help="Accepted no-op. The build does not pip-install "
+                             "unless --install-build-deps is also set.")
     parser.add_argument("--notify-only", action="store_true",
                         help="Skip build/package, just send Discord notification")
     parser.add_argument("--force-notify", action="store_true",
@@ -418,7 +765,10 @@ def main():
         notes_file = verify_release_notes()
 
     if not args.skip_build:
-        build()
+        build(install_requirements=resolve_install_request(
+            install_build_deps=args.install_build_deps,
+            no_install=args.no_install,
+        ))
 
     # Guard: the packaged binary must match the committed source. This is
     # the check that would have prevented the v2.13.0 stale-EXE ship.

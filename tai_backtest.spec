@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import glob
 import os
+import sys
 import importlib
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
@@ -19,6 +20,16 @@ _lwc_js = os.path.join(_lwc_dir, 'js')
 _holidays_submodules = collect_submodules('holidays')
 _holidays_datas = collect_data_files('holidays')
 
+# ``strategies/`` is gitignored (private AI strategies). A fresh clone does
+# not have the directory, and PyInstaller aborts if a datas source is
+# missing. Never point datas at that tree — a developer build would ship
+# their private strategies. Stage an empty placeholder instead.
+# ``python -m PyInstaller`` puts the cwd on sys.path; the ``pyinstaller``
+# entry-point script does not. SPECPATH is the spec file's directory.
+sys.path.insert(0, SPECPATH)
+from build_release import strategies_datas
+_strategies_datas = strategies_datas(SPECPATH)
+
 # Collect SDK DLLs
 sdk_libs = os.path.join(
     'CapitalAPI_2.13.57', 'CapitalAPI_2.13.57_PythonExample',
@@ -35,7 +46,7 @@ a = Analysis(
     binaries=dll_binaries,
     datas=[
         ('src', 'src'),
-        ('strategies', 'strategies'),
+        *_strategies_datas,
         ('settings.example.yaml', '.'),
         (_lwc_js, 'lightweight_charts/js'),
         *_holidays_datas,
@@ -47,9 +58,14 @@ a = Analysis(
         # TAIFEX settlement-day detection (3rd Wed early close)
         # Must include ALL submodules — see note above about dynamic import.
         *_holidays_submodules,
-        # COM (Capital API) — include submodules PyInstaller's analysis misses
+        # COM (Capital API) — include submodules PyInstaller's analysis misses.
+        # comtypes wheels do not ship comtypes/gen. Force-include the name
+        # when a build environment has generated it; the runtime hook
+        # creates the package in the writable cache when the import is
+        # simply missing.
         'comtypes', 'comtypes.client', 'comtypes.stream',
         'comtypes.client._code_cache', 'comtypes.client._generate',
+        'comtypes.gen',
         # TradingView data feed (optional)
         'tvDatafeed', 'websocket', 'websocket._abnf', 'websocket._core',
         'websocket._exceptions', 'websocket._http', 'websocket._logging',

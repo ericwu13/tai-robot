@@ -55,17 +55,62 @@ The app can be packaged as a standalone Windows EXE using PyInstaller (--onedir 
 
 ### Build Steps
 
+`build_release.py` does **not** pip-install into the active interpreter. A normal build uses whatever PyInstaller and comtypes that interpreter already has. `--no-install` is accepted and does the same thing. `--skip-release` builds and zips only (no GitHub release, no Discord).
+
 ```bash
-# From the project root
-python -m PyInstaller tai_backtest.spec --noconfirm
+python build_release.py --skip-release
 ```
 
+A fresh `.venv-build` needs this project's packages as well as the toolchain. PyInstaller analyzes imports of pyyaml, keyring, httpx, lightweight-charts, pandas, and holidays. `--install-build-deps` always installs both into the target interpreter, including when the PyInstaller and comtypes pins already match: `pip install -e .` (those packages) and `pip install -r requirements-build.txt` (the pins). Pin checks before and after that install query the same interpreter, and PyInstaller runs with it. Prefer a dedicated build venv (`.venv-build/`, gitignored) so comtypes is not downgraded in a dev or live venv. When `.venv-build` exists, the flag installs into its interpreter. Otherwise it prints a warning naming the active interpreter (`sys.executable`) and installs there.
+
+```bash
+python -m venv .venv-build
+# POSIX — manual equivalent of the flag
+.venv-build/bin/python -m pip install -e .
+.venv-build/bin/python -m pip install -r requirements-build.txt
+.venv-build/bin/python -m PyInstaller tai_backtest.spec --noconfirm
+# Windows
+.venv-build\Scripts\python -m pip install -e .
+.venv-build\Scripts\python -m pip install -r requirements-build.txt
+.venv-build\Scripts\python -m PyInstaller tai_backtest.spec --noconfirm
+```
+
+`--install-build-deps` runs that `pip install -e .` and the requirements file on the target interpreter, then builds:
+
+```bash
+# POSIX
+.venv-build/bin/python build_release.py --skip-release --install-build-deps
+# Windows
+.venv-build\Scripts\python build_release.py --skip-release --install-build-deps
+```
+
+`requirements-build.txt` pins `PyInstaller==6.19.0` and `comtypes==1.4.15`. Those pins are secondary. The comtypes 1.4.15 wheel does not ship a `comtypes/gen/` package (1.4.17 does not either), so `import comtypes.gen` fails until the runtime hook creates it. That hook is the startup fix. `pyinstaller-hooks-contrib` is not pinned: PyInstaller 6.19.0 requires `pyinstaller-hooks-contrib>=2026.0`, and pip may install any newer release that satisfies that. No specific hooks-contrib version was recorded with the Windows smoke.
+
+The #194 Windows checklist (`docs/testing/grid_subprocess_windows_checklist.md`) checks out `cf58c7c`, which predates `--install-build-deps`. It creates `.venv-build` and runs `.\.venv-build\Scripts\python.exe` for `pip install -e .` (pyyaml, keyring, httpx, lightweight-charts, pandas, holidays) plus the pins, then that same interpreter runs `build_release.py --skip-release`. That command does not pip-install. Do not Activate, and do not build with the system Python. The empty `src\strategies` and `strategies` directories in that checklist are for the commit it checks out, whose spec still lists `('strategies', 'strategies')`. This branch's spec stages a placeholder instead.
+
+Direct invocation, after the project and the pins are installed in the interpreter you intend to build with:
+
+```bash
+pip install -e .
+pip install -r requirements-build.txt
+python -m PyInstaller tai_backtest.spec --noconfirm
+# or: pyinstaller tai_backtest.spec --noconfirm
+```
+
+The spec inserts `SPECPATH` onto `sys.path` so `import build_release` works for the `pyinstaller` entry-point script as well as `python -m PyInstaller`.
+
 Output: `dist/tai_backtest/tai_backtest.exe`
+
+`strategies/` is gitignored and holds per-machine AI strategies. A fresh clone does not have that directory. The spec does not bundle it. At build time it stages an empty placeholder under `build/strategies_placeholder/` (a `README.txt` only) so PyInstaller has a datas source, and private `.py` files are never copied into the EXE. Saved strategies are loaded at runtime from the `strategies/` directory next to `tai_backtest.exe`, which the app creates on first use.
+
+`runtime_hook_comtypes.py` points `comtypes.gen` at a writable `_comtypes_cache` next to the EXE. If that package is missing (`ModuleNotFoundError.name == 'comtypes.gen'`), the hook creates it in the cache. A broken `comtypes.gen` whose own import failed is not swallowed. The spec also lists `comtypes.gen` in `hiddenimports`. Confirming the EXE process actually starts still requires Windows.
 
 ### Build Files
 
 | File | Purpose |
 |------|---------|
+| `requirements-build.txt` | Pinned PyInstaller and comtypes for the EXE build |
+| `build_release.py` | Runs the spec and zips the dist. Does not pip-install unless `--install-build-deps` (then `pip install -e .` and the pins, into the target interpreter) |
 | `tai_backtest.spec` | PyInstaller build specification (--onedir mode) |
 | `runtime_hook_comtypes.py` | Runtime hook for writable comtypes.gen cache |
 
@@ -73,7 +118,8 @@ Output: `dist/tai_backtest/tai_backtest.exe`
 
 - SDK DLLs (8 files from `CapitalAPI_2.13.57/.../libs/`) into `_internal/libs/`
 - `lightweight_charts/js/` (WebGL chart assets)
-- `data/`, `src/`, `strategies/` directories
+- `src/`
+- an empty `strategies/` placeholder (private `strategies/` is not packaged)
 - `settings.example.yaml` as config template
 
 ## Deploying the EXE
