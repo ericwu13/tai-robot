@@ -322,8 +322,10 @@ class TestSearchSwitch:
     def test_worker_scores_the_grid_before_the_watermark(self):
         src = textwrap.dedent(inspect.getsource(
             rb.BacktestApp._start_evolution_pipeline))
-        assert src.index("run_grid_on_bars") < src.index(
+        assert src.index("run_grid_isolated") < src.index(
             "maybe_advance_watermark")
+        assert 'getattr(self, "_grid_in_process", False)' in src
+        assert "GridProcessFailure" in src
         assert src.index("grid_outcome.selected is None") < src.index(
             "maybe_advance_watermark")
         assert src.index("plan_unusable_reason(plan)") < src.index("one_shot(")
