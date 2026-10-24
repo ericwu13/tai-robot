@@ -106,7 +106,7 @@ The automatic run is pinned to the **end of the trading week**, which in Taiwan 
 - **Post-close evolution pipeline** (`is_post_close_evolution_window`) fires on **TPE Saturday ≥ 05:05** via `_check_weekly_evolution` on the 30-second status poll. The 05:05 buffer guarantees the session-end force-close and final daily report have settled, the market is quiet, and the week's data is complete. It is **latched per ISO week** so it runs exactly once; a bot deployed later on Saturday still gets its run on the first post-deploy poll.
 - Both require `evolution.auto_pipeline: true`, a `RUNNING` bot, and (for the pipeline) a closed market.
 
-**"Skipped" is correct, not a bug.** If the run finds no *new design-window trades* (`cut_idx <= watermark`), it logs `🧬 EVO (weekly auto): … skipped` and stops. This happens whenever every trade since the last run is still inside the 14-day holdout — i.e., the bot has traded recently but nothing has aged across the cut yet. The design deliberately makes the AI work on evidence that is **14–21 days old**; right after a run, or right after a fresh deploy, that older-evidence pool has nothing new, so skipping is the intended same-sample-protection behavior. It self-heals: as trades age past the rolling cut, the next Saturday fires normally.
+**"Skipped" is correct, not a bug.** If the run finds no *new design-window trades* (`cut_idx <= watermark`), it logs `🧬 EVO (weekly auto): … skipped` and stops. This happens whenever every trade since the last run is still inside the 14-day holdout — i.e., the bot has traded recently but nothing has aged across the cut yet. The design deliberately makes the AI work on evidence that is **14–21 days old**; right after a run, or right after a fresh deploy, that older-evidence pool has nothing new, so skipping is the intended same-sample-protection behavior. It self-heals: as trades age past the rolling cut, the next Saturday fires normally. When that skip happens and the last exit is at least `evolution.idle_warn_days` calendar days ago (default 7), the same message gains a line `idle N days since last exit <date>` so a quiet book is visible next to a holdout wait.
 
 ---
 
@@ -115,9 +115,9 @@ The automatic run is pinned to the **end of the trading week**, which in Taiwan 
 `fitness.py` forces the composite fitness score to **0.0 when there are fewer than `MIN_TRADES = 30` trades** in the scored window. Small samples score well by luck; gating prevents a lucky 5-trade week from propagating as a "good" strategy.
 
 **Practical implication:** a freshly deployed bot needs roughly **2–4 weeks of live trading** (enough closed trades to cross 30 in the design window) before evolution produces a *meaningful* plan. Before that:
-- The fitness composite shows as `0.000 (gated)` and the AI is told the sample is too small.
-- The prescribed plan in that state is **「繼續收集數據，暫不修改」/ "continue collecting data, no change."**
-- The walk-forward verdict also notes when both sides are gated (`OOS composite gated on both sides`) and leans on the absolute/relative metric gates instead.
+- The plan call itself is skipped when the design window has fewer than `evolution.min_design_trades` trades (default 30, the same number as `MIN_TRADES`). Chat and Discord get `waiting for sample: N/30`, no AI call is made, and the watermark does not advance. This skip is an approved behavior change for sub-30 samples. Set the key to `0` to disable it and call the AI anyway.
+- The fitness composite is still `0.000 (gated)` below `MIN_TRADES`. That math is unchanged. With the check disabled, the AI is told the sample is low-confidence, as before.
+- The walk-forward verdict also notes when both sides are gated (`OOS composite gated on both sides`) and leans on the absolute/relative metric gates instead. Those gates are unchanged. Bots with at least `min_design_trades` design-window trades keep the previous plan-call path.
 
 This is why the weekly cadence (not daily) is the default — a single trading day almost never crosses 30 trades, so daily scoring would be pure gated noise.
 
@@ -182,6 +182,8 @@ evolution:
   auto_pipeline: true      # run the full plan→codegen→validate pipeline; also enables the weekly auto run
   validation: "deep"       # "deep" (walk-forward + Monte Carlo) | "simple" (single-window A/B)
   holdout_days: 14         # most-recent-N-days withheld from the AI and used as the OOS test window
+  min_design_trades: 30    # skip the AI plan call below this design-window count; 0 disables
+  idle_warn_days: 7        # watermark-skip idle line once the last exit is this many days ago
 
 trading:
   allow_live_override: false   # NOTE: lives under `trading:`, not `evolution:`
@@ -193,6 +195,8 @@ trading:
 | `evolution.holdout_days` | `14` | Days of most-recent trade evidence withheld from the AI; also the walk-forward test-window length. |
 | `evolution.auto_pipeline` | `true` | Enables the one-click pipeline *and* the weekly post-close auto run. `false` = plan-only (no codegen/validation/auto-save). |
 | `evolution.validation` | `"deep"` | Validation method (see §6). `"simple"` skips the walk-forward split and Monte Carlo. |
+| `evolution.min_design_trades` | `30` | Skip the AI plan call while the design window has fewer trades than this (`waiting for sample: N/<threshold>`, 0 AI calls, watermark unchanged). `0` disables the check. Does not change the fitness `MIN_TRADES` gate. |
+| `evolution.idle_warn_days` | `7` | On a watermark skip, append `idle N days since last exit <date>` when the last exit is at least this many calendar days ago. |
 | **`trading.allow_live_override`** | `false` | **Not an evolution key.** It gates the live **hot-swap mode switch** — whether a `mode_override.json` file (or the UI) may switch the running bot to fully-automatic `auto` mode. Documented here because it governs how much autonomy a live bot has; evolution itself never deploys or switches modes. |
 
 ---
