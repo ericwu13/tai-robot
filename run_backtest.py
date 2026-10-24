@@ -537,8 +537,12 @@ def _load_settings():
                 normalize_knob_ineligible_fallback(
                     evo.get("knob_ineligible_fallback", "none")))
             # P6 / structural lane. A missing saturday_mode is propose.
-            # "promote" is an explicit opt-in. The lane stays off.
+            # "promote" is an explicit opt-in. A missing structural_lane
+            # block leaves the lane on. It still only proposes: the pool
+            # guard is unchanged. Boolean false is the off switch.
             # A failure here must not drop news/regime settings below.
+            # The exception fallback leaves the lane off so a broken
+            # parser cannot start a structural run.
             try:
                 from src.evolution.structural_lane import settings_from_evolution
                 _lane_settings = settings_from_evolution(
@@ -6077,9 +6081,10 @@ class BacktestApp:
         NOT write the StrategyStore and does NOT register STRATEGIES
         (issue #153). Deploying to live trading stays manual by design.
         Saturday auto on a knob-grid class applies an allowlisted knob
-        grid (max 2). The monthly structural lane is separate and stays
-        off unless ``evolution.structural_lane.enabled``. Propose mode
-        records evidence and does not promote the pool. Both of those
+        grid (max 2) only when the structural lane is off. The monthly
+        lane is on unless ``evolution.structural_lane.enabled`` is
+        boolean false, and it still only proposes. Propose mode records
+        evidence and does not promote the pool. Both of those
         Saturday paths append the same evolution-history line and use
         the same in-process run guard. Neither adds a lock or a cap.
 

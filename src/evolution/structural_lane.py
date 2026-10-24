@@ -3,6 +3,7 @@
 The knob grid is a different lane. This module does not import it, does
 not pick a grid point, and does not write settings, an allowlist, a
 live or paper strategy, StrategyStore, or the strategy registry.
+The lane defaults on and still only proposes. Boolean false turns it off.
 
 A structural candidate is one named form from a fixed menu, at most
 once per bot per calendar month, and at most ``max_in_paper``
@@ -88,7 +89,10 @@ def form_ids() -> tuple[str, ...]:
 
 
 def normalize_saturday_mode(value) -> str:
-    """``promote`` (today's pool path) or ``propose``. Anything else is promote."""
+    """``propose`` (the default) or ``promote``. Anything else is propose.
+
+    Promote is an explicit opt-in. It is not the default.
+    """
     if isinstance(value, str):
         text = value.strip().lower()
         if text in (SATURDAY_PROMOTE, SATURDAY_PROPOSE):
@@ -97,9 +101,13 @@ def normalize_saturday_mode(value) -> str:
 
 
 def default_lane_config() -> dict:
-    """Defaults keep the lane off and the Saturday path on promote."""
+    """Lane on. A missing ``enabled`` is boolean true.
+
+    Saturday mode is not stored here; a missing mode is propose.
+    The lane still only proposes. It does not promote the pool.
+    """
     return {
-        "enabled": False,
+        "enabled": True,
         "per_bot_per_month": DEFAULT_PER_BOT_PER_MONTH,
         "max_in_paper": DEFAULT_MAX_IN_PAPER,
         "min_paper_sessions": DEFAULT_MIN_PAPER_SESSIONS,
@@ -155,9 +163,10 @@ def _warn_float(mapping: dict, key: str, default: float, lo: float, hi: float,
 
 
 def parse_lane_config(raw) -> dict:
-    """Fill defaults. Only boolean true turns the lane on.
+    """Fill defaults. A missing block leaves the lane on.
 
-    ``paper_days`` is accepted and ignored. Nova Q6 replaced that
+    Boolean false is the off switch. A non-boolean ``enabled`` stays
+    off. ``paper_days`` is accepted and ignored. Nova Q6 replaced that
     14-day sketch with a session and trade floor.
     """
     cfg = default_lane_config()
@@ -168,6 +177,7 @@ def parse_lane_config(raw) -> dict:
     if not isinstance(raw, dict):
         warnings.append(
             f"structural_lane {raw!r} is not a mapping; lane stays disabled")
+        cfg["enabled"] = False
         cfg["warnings"] = warnings
         return cfg
     if "paper_days" in raw:
@@ -378,6 +388,12 @@ def _atomic_json(path: Path, payload: dict) -> None:
 
 
 def save_ledger(path, ledger: dict) -> None:
+    """Replace the ledger file. This does not take a file lock.
+
+    One bot's evolution runs are serialized by the in-process guard.
+    A cross-process lock around this read-modify-write is a later
+    cleanup, not this change.
+    """
     body = {
         "slots": list(ledger.get("slots") or []),
         "incubations": list(ledger.get("incubations") or []),
@@ -498,6 +514,20 @@ def _touch_slot(ledger: dict, bot_id: str, month: str, form: str,
             slot["status"] = status
             slot["form"] = form or slot.get("form") or ""
             slot["applied"] = False
+            slot.pop("applied_at", None)
+
+
+def _proposal_path(root, bot_id: str, month: str, lane: str, moment: datetime) -> Path:
+    """One new file per attempt. A later attempt does not replace an earlier one."""
+    directory = Path(root) / "proposals"
+    stamp = moment.strftime("%Y%m%dT%H%M%S%f")
+    stem = f"{sanitize_bot_id(bot_id)}-{month}-{lane}-{stamp}"
+    path = directory / f"{stem}.json"
+    suffix = 2
+    while path.exists():
+        path = directory / f"{stem}-{suffix}.json"
+        suffix += 1
+    return path
 
 
 def record_proposal(root, *, bot_id: str, month: str, lane: str, status: str,
@@ -517,6 +547,7 @@ def record_proposal(root, *, bot_id: str, month: str, lane: str, status: str,
     moment = now or datetime.now()
     payload = dict(evidence or {})
     payload.pop("applied", None)
+    payload.pop("applied_at", None)
     dsr_trials = payload.get("dsr_trials")
     if not isinstance(dsr_trials, int) or isinstance(dsr_trials, bool):
         dsr_trials = 1 if lane == "structural" and status == "proposed" else 0
@@ -535,8 +566,7 @@ def record_proposal(root, *, bot_id: str, month: str, lane: str, status: str,
         "dsr_trials": dsr_trials,
         "evidence": payload,
     }
-    path = (Path(root) / "proposals" /
-            f"{sanitize_bot_id(bot_id)}-{month}-{lane}.json")
+    path = _proposal_path(root, bot_id, month, lane, moment)
     _atomic_json(path, body)
     if touch_slot and ledger_path:
         ledger = load_ledger(ledger_path)
@@ -944,6 +974,7 @@ def structural_saturday_followup(ledger_path, *, observations=(),
             if obs.get("paper_trades") is not None:
                 inc["trades"] = len(list(obs.get("paper_trades") or []))
             inc["applied"] = False
+            inc.pop("applied_at", None)
             changed = True
         report_before = len(report) if report is not None else 0
         emit_graduation_recommendation(

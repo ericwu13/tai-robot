@@ -125,8 +125,9 @@ class TestSaturdayModeAppliesNothing:
     def test_default_is_propose_and_promote_is_opt_in(self):
         stored = settings_from_evolution({})
         assert stored["evolution_saturday_mode"] == "propose"
-        assert stored["evolution_structural_lane"]["enabled"] is False
+        assert stored["evolution_structural_lane"]["enabled"] is True
         assert stored["evolution_structural_lane"]["warnings"] == []
+        assert default_lane_config()["enabled"] is True
         assert normalize_saturday_mode(None) == "propose"
         assert normalize_saturday_mode("nope") == "propose"
         assert normalize_saturday_mode("propose") == "propose"
@@ -507,7 +508,7 @@ class TestSettingsAndWiring:
     def test_loader_defaults_and_example_yaml(self, tmp_path, monkeypatch):
         loaded = _cfg(tmp_path, monkeypatch, "evolution:\n  cadence: weekly\n")
         assert loaded["evolution_saturday_mode"] == "propose"
-        assert loaded["evolution_structural_lane"]["enabled"] is False
+        assert loaded["evolution_structural_lane"]["enabled"] is True
         opt_in = _cfg(
             tmp_path, monkeypatch, "evolution:\n  saturday_mode: promote\n")
         assert opt_in["evolution_saturday_mode"] == "promote"
@@ -521,7 +522,7 @@ class TestSettingsAndWiring:
         example = Path("settings.example.yaml").read_text(encoding="utf-8")
         assert 'saturday_mode: "propose"' in example
         assert "latest_def: merge_stub" in example
-        assert "enabled: false" in example
+        assert "structural_lane:\n    enabled: true" in example
         assert "per_bot_per_month: 1" in example
 
     def test_pipeline_promotes_only_through_the_gate(self):
@@ -672,9 +673,26 @@ class TestSettingsAndWiring:
             month="2026-10", ledger_path=tmp_path / "missing.json") is False
 
 
+def _validated_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    from src.evolution.pool import StrategyPool
+    return StrategyPool(path).count("validated")
+
+
+def _repo_pool_bytes() -> bytes | None:
+    from src.evolution.pool import default_pool_path
+    path = default_pool_path()
+    return path.read_bytes() if path.exists() else None
+
+
 def test_propose_saturday_appends_one_history_line_and_skips_the_pool(
         tmp_path, monkeypatch):
-    """Propose mode uses the D2 append and does not promote the pool."""
+    """Propose mode uses the D2 append and does not promote the pool.
+
+    The pool is real. Replacing ``if _promote_pool`` with
+    ``if eligible_for_validated_pool(verdict)`` inserts a validated row.
+    """
     from tests.test_evolution_history import (
         _validation_app, _patch_validation, load_evolution_history,
         evolution_history_path)
@@ -682,14 +700,10 @@ def test_propose_saturday_appends_one_history_line_and_skips_the_pool(
 
     rb._evolution_guard_clear()
     ledger = tmp_path / "lane" / "structural_lane.json"
-    calls = []
-
-    def _pool(*_args, **kwargs):
-        calls.append(kwargs)
-        return "should-not-promote"
-
+    pool_path = tmp_path / "pool.db"
+    repo_before = _repo_pool_bytes()
     monkeypatch.setattr(
-        "src.evolution.pool.record_validated_candidate", _pool)
+        "src.evolution.pool.default_pool_path", lambda: pool_path)
     _patch_validation(monkeypatch, passed=True)
     monkeypatch.setattr(
         "src.evolution.pipeline.eligible_for_validated_pool", lambda verdict: True)
@@ -702,6 +716,7 @@ def test_propose_saturday_appends_one_history_line_and_skips_the_pool(
     chat.max_tokens = 1024
     chat.conversation = []
     app = _validation_app(tmp_path, chat, paper_gate="relative")
+    app._settings["evolution_saturday_mode"] = "propose"
     app._settings["evolution_structural_lane"] = {
         "enabled": False,
         "ledger_path": str(ledger),
@@ -712,7 +727,8 @@ def test_propose_saturday_appends_one_history_line_and_skips_the_pool(
         design_cut_idx=1)
     rows = load_evolution_history(evolution_history_path(tmp_path))
     assert app.errors == [], app.chat
-    assert calls == []
+    assert _validated_count(pool_path) == 0
+    assert _repo_pool_bytes() == repo_before
     assert len(rows) == 1, rows
     assert rows[0]["final_status"] == "pass"
     assert rows[0]["reason_kind"] == "validation"
@@ -802,3 +818,400 @@ def test_admission_is_a_decision_not_a_write(tmp_path):
     assert isinstance(decision, Admission)
     assert decision.admit is True
     assert list(tmp_path.iterdir()) == []
+
+
+def test_docstrings_do_not_say_the_default_is_promote():
+    norm = inspect.getsource(normalize_saturday_mode)
+    defaults = inspect.getsource(default_lane_config)
+    assert "Anything else is promote" not in norm
+    assert "Saturday path on promote" not in defaults
+    assert "Lane on" in defaults
+    assert "does not promote" in defaults
+
+
+@pytest.mark.parametrize("flag", ["true", "false", "True", "yes", 1, 0, None])
+def test_non_boolean_enabled_stays_off(flag):
+    from src.evolution.structural_lane import lane_config_from_settings
+
+    parsed = parse_lane_config({"enabled": flag})
+    assert parsed["enabled"] is False
+    assert any("not a boolean" in line for line in parsed["warnings"])
+    stored = settings_from_evolution({"structural_lane": {"enabled": flag}})
+    assert stored["evolution_structural_lane"]["enabled"] is False
+    loaded = lane_config_from_settings({
+        "evolution_structural_lane": {"enabled": flag},
+    })
+    assert loaded["enabled"] is False
+    assert isinstance(loaded["enabled"], bool)
+
+
+def test_loader_non_boolean_enabled_stays_off(tmp_path, monkeypatch):
+    quoted = _cfg(
+        tmp_path, monkeypatch,
+        'evolution:\n  structural_lane:\n    enabled: "true"\n')
+    assert quoted["evolution_structural_lane"]["enabled"] is False
+    assert any(
+        "not a boolean" in line
+        for line in quoted["evolution_structural_lane"]["warnings"])
+    off = _cfg(
+        tmp_path, monkeypatch,
+        "evolution:\n  structural_lane:\n    enabled: false\n")
+    assert off["evolution_structural_lane"]["enabled"] is False
+
+
+def test_proposal_files_are_timestamped_and_never_overwrite(tmp_path):
+    moment = datetime(2026, 10, 24, 8, 0, 0)
+    first = record_proposal(
+        tmp_path / "lane", bot_id=_BREAKOUT, month="2026-10",
+        lane="structural", status="proposed",
+        evidence={"n": 1}, now=moment)
+    raw = Path(first["path"]).read_bytes()
+    second = record_proposal(
+        tmp_path / "lane", bot_id=_BREAKOUT, month="2026-10",
+        lane="structural", status="proposed",
+        evidence={"n": 2}, now=moment)
+    assert first["path"] != second["path"]
+    assert Path(first["path"]).read_bytes() == raw
+    assert "20261024T080000" in Path(first["path"]).name
+    assert Path(second["path"]).name.startswith(Path(first["path"]).stem)
+    assert Path(second["path"]).name.endswith("-2.json")
+    assert json.loads(raw.decode("utf-8"))["evidence"]["n"] == 1
+    assert len(list((tmp_path / "lane" / "proposals").glob("*.json"))) == 2
+
+
+def test_applied_at_never_survives_a_lane_write(tmp_path):
+    ledger = tmp_path / "lane" / "structural_lane.json"
+    cfg = default_lane_config()
+    assert cfg["enabled"] is True
+    reserve_structural_slot(
+        ledger, bot_id=_BREAKOUT, month="2026-10", config=cfg, now=_NOW)
+    stored = load_ledger(ledger)
+    stored["slots"][0]["applied_at"] = "2026-01-01T00:00:00"
+    stored["slots"][0]["applied"] = True
+    save_ledger(ledger, stored)
+    planted = make_incubation(
+        bot_id=_BREAKOUT, month="2026-10", form="side_split",
+        status="not_admitted", now=_NOW)
+    assert "applied_at" not in planted
+    planted["applied_at"] = "2026-02-02T00:00:00"
+    planted["applied"] = True
+    body = record_proposal(
+        tmp_path / "lane",
+        bot_id=_BREAKOUT,
+        month="2026-10",
+        lane="structural",
+        status="proposed",
+        evidence={
+            "applied": True,
+            "applied_at": "2026-03-03T00:00:00",
+            "reasons": ["q"],
+        },
+        form="side_split",
+        ledger_path=ledger,
+        touch_slot=True,
+        incubation=planted,
+        now=_NOW,
+    )
+    assert body["applied"] is False
+    assert "applied_at" not in body
+    assert "applied_at" not in body["evidence"]
+    updated = load_ledger(ledger)
+    assert updated["slots"][0]["applied"] is False
+    assert "applied_at" not in updated["slots"][0]
+    row = updated["incubations"][0]
+    assert row["applied"] is False
+    assert "applied_at" not in row
+    again = load_ledger(ledger)
+    again["incubations"][0]["applied_at"] = "2026-04-04T00:00:00"
+    again["incubations"][0]["applied"] = True
+    save_ledger(ledger, again)
+    structural_saturday_followup(
+        ledger,
+        observations=[{
+            "bot_id": _BREAKOUT,
+            "month": "2026-10",
+            "sessions": 3,
+            "paper_trades": [],
+        }],
+        config=cfg,
+    )
+    final = load_ledger(ledger)
+    assert final["incubations"][0]["applied"] is False
+    assert "applied_at" not in final["incubations"][0]
+    assert applied_graduation_stamps(final) == []
+
+
+def test_sanitize_bot_id_blocks_path_traversal(tmp_path):
+    from src.evolution.structural_lane import sanitize_bot_id
+
+    assert sanitize_bot_id("") == "bot"
+    assert sanitize_bot_id("   ") == "bot"
+    assert sanitize_bot_id("***") == "bot"
+    assert sanitize_bot_id("TXF/Plain bot") == "TXF_Plain_bot"
+    assert sanitize_bot_id("ok.name-1") == "ok.name-1"
+    assert len(sanitize_bot_id("b" * 90)) == 80
+    root = (tmp_path / "lane" / "proposals").resolve()
+    for raw in (
+            "../../etc/passwd",
+            r"..\..\windows\system32",
+            "TXF/Plain bot",
+            "a/b\\c",
+    ):
+        cleaned = sanitize_bot_id(raw)
+        assert "/" not in cleaned and "\\" not in cleaned
+        body = record_proposal(
+            tmp_path / "lane",
+            bot_id=raw,
+            month="2026-10",
+            lane="structural",
+            status="refused",
+            now=_NOW,
+        )
+        path = Path(body["path"]).resolve()
+        assert path.parent == root
+        assert ".." not in path.parts
+        assert cleaned in path.name
+
+
+def _no_proposals(directory: Path) -> None:
+    proposals = directory / "proposals"
+    if not proposals.exists():
+        return
+    assert list(proposals.glob("*.json")) == []
+
+
+@pytest.mark.parametrize("flag", [False, "true"])
+def test_saturday_off_switch_blocks_gate_and_launch(
+        tmp_path, monkeypatch, flag):
+    """Auto-Saturday with the lane off does not launch and writes no proposal.
+
+    ``flag`` is boolean false or the non-boolean string ``true``.
+    M17: the class-exclusion wrapper ignores ``enabled`` and calls divert.
+    M18b: ``_lane_on = True`` calls the launch function.
+    M18: the launch function's enabled return is removed, and an
+    admission stub then starts the pipeline.
+    A deleted ``if not structural_only`` return also reaches weekly codegen.
+    """
+    import src.evolution.structural_lane as lane_mod
+    from tests.test_evolution_d1_knobs import _chat
+    from tests.test_evolution_issue164 import (
+        _CHANGE_PLAN, _DiscordLog, _InlineThread, _wiring_app)
+    from tests.test_evolution_min_design_trades import (
+        _app, _design_book, _run)
+    from src.evolution.history import (
+        evolution_history_path, load_evolution_history)
+
+    rb._evolution_guard_clear()
+    monkeypatch.setattr(rb, "_discord", _DiscordLog())
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    seen = []
+    real_divert = lane_mod.ineligible_structural_divert
+
+    def _divert(*args, **kwargs):
+        seen.append(1)
+        return real_divert(*args, **kwargs)
+
+    monkeypatch.setattr(lane_mod, "ineligible_structural_divert", _divert)
+    home = tmp_path / f"off-{flag}"
+    chat = _chat()
+    chat.send_message.return_value = _CHANGE_PLAN
+    app = _wiring_app(home, chat)
+    app._settings["evolution_knob_ineligible_fallback"] = "structural_lane"
+    app._settings["evolution_min_design_trades"] = 0
+    app._settings["evolution_structural_lane"] = {
+        "enabled": flag,
+        "ledger_path": str(home / "lane.json"),
+    }
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    assert seen == []
+    assert chat.send_message.call_count == 0
+    assert chat.one_shot.call_count == 0
+    _no_proposals(home)
+    rows = load_evolution_history(evolution_history_path(home))
+    assert len(rows) == 1
+    assert rows[0]["reason_kind"] == "knob_ineligible"
+    rb._evolution_guard_clear()
+
+    launches = []
+    real_launch = rb.BacktestApp._maybe_launch_structural
+
+    def _wrap(self, *args, **kwargs):
+        launches.append(1)
+        return real_launch(self, *args, **kwargs)
+
+    monkeypatch.setattr(rb.BacktestApp, "_maybe_launch_structural", _wrap)
+    plain_home = tmp_path / f"plain-{flag}"
+    plain_chat = _chat()
+    plain = _app(
+        plain_home, _design_book(1), plain_chat,
+        {
+            "evolution_min_design_trades": 0,
+            "evolution_structural_lane": {
+                "enabled": flag,
+                "ledger_path": str(plain_home / "lane.json"),
+            },
+        })
+    _run(monkeypatch, plain)
+    assert launches == []
+    assert plain_chat.send_message.call_count == 1
+    _no_proposals(plain_home)
+    monkeypatch.setattr(rb.BacktestApp, "_maybe_launch_structural", real_launch)
+    rb._evolution_guard_clear()
+
+    admitted = []
+
+    def _admit(*_args, **_kwargs):
+        admitted.append(1)
+        return Admission(True, "admitted")
+
+    monkeypatch.setattr(lane_mod, "admission_decision", _admit)
+    launch_home = tmp_path / f"launch-{flag}"
+    launch_app = _wiring_app(launch_home, _chat())
+    launch_app._settings["evolution_structural_lane"] = {
+        "enabled": flag,
+        "ledger_path": str(launch_home / "lane.json"),
+    }
+    started = []
+    launch_app._start_evolution_pipeline = (
+        lambda *args, **kwargs: started.append(1))
+    assert rb.BacktestApp._maybe_launch_structural(
+        launch_app, "preamble", ["trade"], "", launch_app._result,
+        True, 14, launch_home, 1, False) is False
+    assert admitted == []
+    assert started == []
+    _no_proposals(launch_home)
+    rb._evolution_guard_clear()
+
+
+def test_refused_structural_only_does_not_fall_into_weekly(
+        tmp_path, monkeypatch):
+    """A refused ineligible class must not start the weekly plan call.
+
+    Deleting ``elif structural_only: pass`` falls into weekly codegen.
+    """
+    import src.evolution.structural_lane as lane_mod
+    from tests.test_evolution_d1_knobs import _chat
+    from tests.test_evolution_issue164 import (
+        _CHANGE_PLAN, _DiscordLog, _InlineThread, _wiring_app)
+
+    rb._evolution_guard_clear()
+    monkeypatch.setattr(rb, "_discord", _DiscordLog())
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    calls = {"n": 0}
+
+    def _gate(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Admission(True, "admitted")
+        return Admission(False, "refused for the test")
+
+    monkeypatch.setattr(lane_mod, "admission_decision", _gate)
+    chat = _chat()
+    chat.send_message.return_value = _CHANGE_PLAN
+    app = _wiring_app(tmp_path, chat)
+    app._settings["evolution_knob_ineligible_fallback"] = "structural_lane"
+    app._settings["evolution_min_design_trades"] = 0
+    app._settings["evolution_structural_lane"] = {
+        "enabled": True,
+        "ledger_path": str(tmp_path / "lane.json"),
+    }
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    assert chat.send_message.call_count == 0
+    assert chat.one_shot.call_count == 0
+    _no_proposals(tmp_path)
+    from src.evolution.history import (
+        evolution_history_path, load_evolution_history)
+    rows = load_evolution_history(evolution_history_path(tmp_path))
+    assert len(rows) == 1
+    assert rows[0]["final_status"] == "refused"
+    assert rows[0]["reason_kind"] == "refused"
+    rb._evolution_guard_clear()
+
+
+def test_default_lane_runs_propose_and_adds_no_pool_row(
+        tmp_path, monkeypatch):
+    """A missing structural_lane key runs the lane and writes no pool row.
+
+    Replacing ``if _promote_pool`` with ``if eligible_for_validated_pool``
+    inserts a validated row. The knob grid must not run inside the lane.
+    """
+    import types
+    from unittest.mock import MagicMock
+    import src.evolution.knobs as knobs
+    from tests.test_evolution_history import (
+        _HIST_CODE, _patch_validation, _validation_app,
+        evolution_history_path, load_evolution_history)
+    from tests.test_evolution_issue164 import _DiscordLog, _InlineThread
+    from tests.test_evolution_min_design_trades import _design_book
+
+    rb._evolution_guard_clear()
+    pool_path = tmp_path / "pool.db"
+    repo_before = _repo_pool_bytes()
+    monkeypatch.setattr(rb, "project_root", str(tmp_path))
+    monkeypatch.setattr(rb, "_discord", _DiscordLog())
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(
+        "src.evolution.pool.default_pool_path", lambda: pool_path)
+    _patch_validation(monkeypatch, passed=True)
+    monkeypatch.setattr(
+        "src.evolution.pipeline.eligible_for_validated_pool",
+        lambda verdict: True)
+    knob_calls = []
+
+    def _knob(*args, **kwargs):
+        knob_calls.append(args)
+        raise AssertionError("knob grid ran inside the structural lane")
+
+    def _rewrite(*_args, **_kwargs):
+        raise AssertionError("knob rewrite ran inside the structural lane")
+
+    monkeypatch.setattr(knobs, "saturday_knob_decision", _knob)
+    monkeypatch.setattr(knobs, "rewrite_knob_source", _rewrite)
+    plan = (
+        "Performance is flat.\n"
+        "```json\n"
+        '{"action": "change", "knobs": {"ema_period": 60}}\n'
+        "```\n"
+        "structural_form: side_split\n"
+    )
+    chat = MagicMock()
+    chat.send_message.return_value = plan
+    chat.one_shot.return_value = _HIST_CODE
+    chat.max_tokens = 1024
+    chat.conversation = []
+    app = _validation_app(tmp_path / "bot", chat, paper_gate="relative")
+    trades = _design_book(1)
+    app._result.trades = trades
+    app._settings["evolution_min_design_trades"] = 0
+    assert "evolution_structural_lane" not in app._settings
+    assert "evolution_saturday_mode" not in app._settings
+    app._gather_analysis_payload = lambda: (
+        app._result, "report", "timeframe", "",
+        [f"trade {i}" for i in range(len(trades))])
+    app._ensure_chat_client = lambda: True
+    app._build_evolution_context = types.MethodType(
+        rb.BacktestApp._build_evolution_context, app)
+    app._start_evolution_pipeline = types.MethodType(
+        rb.BacktestApp._start_evolution_pipeline, app)
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    assert app.errors == [], app.chat
+    assert knob_calls == []
+    sites = [
+        call.kwargs.get("call_site")
+        for call in chat.one_shot.call_args_list
+    ]
+    assert sites == ["evolution_codegen_structural"]
+    assert _validated_count(pool_path) == 0
+    assert _repo_pool_bytes() == repo_before
+    proposals = list((tmp_path / "data" / "evolution" / "proposals").glob("*.json"))
+    assert len(proposals) == 1
+    body = json.loads(proposals[0].read_text(encoding="utf-8"))
+    assert body["lane"] == "structural"
+    assert body["applied"] is False
+    assert body["pool_promoted"] is False
+    assert "applied_at" not in body
+    rows = load_evolution_history(evolution_history_path(tmp_path / "bot"))
+    assert len(rows) == 1, rows
+    assert rows[0]["final_status"] == "pass"
+    assert rows[0]["reason"] == "proposal recorded; nothing applied"
+    assert rb._evolution_in_progress == set()

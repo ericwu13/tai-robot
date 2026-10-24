@@ -228,7 +228,7 @@ evolution:
   saturday_mode: "propose"  # "propose" (default) | "promote" (explicit opt-in)
                              # propose records evidence and applies nothing
   structural_lane:
-    enabled: false           # monthly lane, off until set; not the knob grid
+    enabled: true            # monthly lane, on unless boolean false; propose-only
     per_bot_per_month: 1
     max_in_paper: 3
     min_paper_sessions: 21
@@ -247,7 +247,7 @@ trading:
 | `evolution.validation` | `"deep"` | Validation method (see §6). `"simple"` skips the walk-forward split and Monte Carlo. |
 | `evolution.min_design_trades` | `30` | Saturday/automatic path only: skip the AI plan call while the design window has fewer trades than this (`waiting for sample: N/<threshold>`, 0 AI calls, watermark unchanged). The manual Evolve button is exempt and logs `below min_design_trades (N/30), manual override`. `0` disables the check. Does not change the fitness `MIN_TRADES` gate. |
 | `evolution.idle_warn_days` | `7` | On a watermark skip, append `idle N days since last exit <date>` when the last exit is at least this many calendar days ago. `0` disables the line. |
-| `evolution.knob_ineligible_fallback` | `"none"` | Weekly handling of a knob-grid class with fewer than 2 rewritable knobs. `"none"` excludes it and logs `excluded: <class> — <reason>; fallback=none` every Saturday. `"structural_lane"` only changes that logged mode; it does not enable weekly codegen. The monthly lane runs only when `structural_lane.enabled` is also true. |
+| `evolution.knob_ineligible_fallback` | `"none"` | Weekly handling of a knob-grid class with fewer than 2 rewritable knobs. `"none"` excludes it and logs `excluded: <class> — <reason>; fallback=none` every Saturday. `"structural_lane"` only changes that logged mode; it does not enable weekly codegen. The monthly lane is on unless `structural_lane.enabled` is boolean false. |
 | `evolution.paper_gate` | `"relative"` | Exact modes `paper` and `backtest` only. `"relative"` requires the fold bootstrap, the effect size, DSR > `trial_penalty.dsr_min`, and PBO < `trial_penalty.pbo_max`. An invalid value, or an unknown trading mode, falls back to absolute and warns. `"absolute"` restores the PF ≥ 1 floors. Real-money modes ignore this key. |
 | `evolution.search` | `"grid_batch"` | Eligible knob classes: the grid selects the setting. `"llm_one"` asks the model for one change, as before. |
 | `evolution.trial_penalty` | DSR 0.90, PBO 0.50, 48 / 2 / 4, band 0.50 | Caps and the pass lines for the grid. Values above the caps fall back. `relative.min_divergent_folds` must be ≥ 2 and ≤ 30; anything else falls back to the Q2 default (≥ 3 divergent folds). |
@@ -255,7 +255,7 @@ trading:
 | `evolution.month_gate.min_sessions` | `12` | Session-count threshold for the stub fold. |
 | `evolution.month_gate.slack.mode` | `"scaled"` | Gate 1 allowance is `clamp(k × σ × sqrt(n), floor, cap)` TWD. σ is the baseline's prior-block per-trade sample standard deviation; n is the candidate's prior-block trade count. Gate 3 uses `gate3_k` of that allowance (half by default). `"flat"` opts out: gate 1 uses `flat_twd` and gate 3 requires Δ ≥ 0. |
 | `evolution.saturday_mode` | `"propose"` | Saturday auto run. `"propose"` writes a proposal file with the verdict evidence and does not promote the pool, write StrategyStore, or change a bot. `"promote"` is the explicit opt-in that keeps the StrategyPool validated-on-PASS path. The manual Evolve button is not this flag. |
-| `evolution.structural_lane.enabled` | `false` | Monthly structural lane, separate from the knob grid. One named form from a fixed menu, one codegen attempt, no retry that month. Default off. |
+| `evolution.structural_lane.enabled` | `true` | Monthly structural lane, separate from the knob grid. One named form from a fixed menu, one codegen attempt, no retry that month. On by default and still propose-only: it does not promote the pool. Boolean false is the off switch. A non-boolean value stays off. |
 | `evolution.structural_lane.per_bot_per_month` | `1` | Structural candidates per bot per calendar month. |
 | `evolution.structural_lane.max_in_paper` | `3` | Outstanding paper *recommendations* across bots. A recommendation does not put a bot into paper. |
 | `evolution.structural_lane.min_paper_sessions` | `21` | Paper sessions before graduation can be recommended (Nova Q6). |

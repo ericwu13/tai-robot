@@ -103,6 +103,10 @@ def _app(bot_dir, trades, chat, settings_extra=None):
         "ai_provider": "anthropic",
         "ultra_mode": False,
         "evolution_validation": "simple",
+        # Weekly-path fixture. The structural lane defaults on; these
+        # tests opt out so they still cover the plan/knob Saturday path
+        # and do not write a lane ledger under the repo.
+        "evolution_structural_lane": {"enabled": False},
     }
     if settings_extra:
         settings.update(settings_extra)

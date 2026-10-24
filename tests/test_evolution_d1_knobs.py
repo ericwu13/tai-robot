@@ -340,6 +340,9 @@ class TestFallbackOffByDefault:
         monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
         app = _wiring_app(tmp_path, chat)
         app._settings["evolution_knob_ineligible_fallback"] = "structural_lane"
+        # The lane defaults on. This case is the off switch: the fallback
+        # string alone must not start weekly codegen.
+        app._settings["evolution_structural_lane"] = {"enabled": False}
 
         rb.BacktestApp._bot_evolution(app, auto_run=True)
 
