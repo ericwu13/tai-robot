@@ -5463,15 +5463,19 @@ class BacktestApp:
             knob_note = ""
             _evo_cls = None
             _evo_source = ""
+            # Class and source are resolved for both the Saturday run and the
+            # manual button. The grid (P2) selects knob settings on either
+            # path when the class is eligible. The weekly exclusion settle
+            # stays Saturday-only.
+            if live and getattr(self._live_runner, "strategy", None) is not None:
+                _evo_cls = type(self._live_runner.strategy)
+            else:
+                _evo_cls = STRATEGIES.get(self.strategy_var.get())
+            if _evo_cls is not None:
+                _evo_source = self._resolve_strategy_source(
+                    self.strategy_var.get(), _evo_cls)
             if auto_run:
                 from src.evolution.knobs import saturday_knob_directives_if_eligible
-                if live and getattr(self._live_runner, "strategy", None) is not None:
-                    _evo_cls = type(self._live_runner.strategy)
-                else:
-                    _evo_cls = STRATEGIES.get(self.strategy_var.get())
-                if _evo_cls is not None:
-                    _evo_source = self._resolve_strategy_source(
-                        self.strategy_var.get(), _evo_cls)
                 # D1: the block lists only the knobs this class can rewrite.
                 # Fewer than 2 rewritable grid knobs → no MANDATORY block,
                 # and the settle below excludes the class before the AI call.
@@ -5714,7 +5718,14 @@ class BacktestApp:
             auto = self._settings.get("evolution_auto_pipeline", True)
             est = (len(preamble) + sum(len(l) + 1 for l in sent_lines)
                    + len(source_section) + 300)
-            if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
+            # The grid does not send the trade payload to a model to pick a
+            # setting, so a large payload must not drop an eligible class
+            # back onto the plan-only LLM path.
+            from src.evolution.grid_search import grid_search_applies
+            _use_grid = auto and grid_search_applies(
+                _evo_cls, _evo_source,
+                self._settings.get("evolution_gate_raw") or {})
+            if auto and (est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT or _use_grid):
                 self._start_evolution_pipeline(
                     preamble, sent_lines, source_section, result,
                     auto_run=auto_run, holdout_days=holdout_days,
@@ -5862,8 +5873,12 @@ class BacktestApp:
         candidate in the StrategyPool to ``validated`` only — it does
         NOT write the StrategyStore and does NOT register STRATEGIES
         (issue #153). Deploying to live trading stays manual by design.
-        Saturday auto on DynamicExitPullback* applies an allowlisted
-        knob grid (max 2); structural codegen is not the auto path.
+        An eligible knob class is searched by the pre-registered grid
+        (at most 48 settings, at most 2 knobs together). DSR, PBO, and
+        the plateau pick the setting. The model may only explain it.
+        ``evolution.search: llm_one`` keeps the one-change plan.
+        Structural codegen stays the path for classes that are not on
+        the knob grid.
 
         Runs in a worker thread; every Tk touch goes through root.after.
         """
@@ -6042,93 +6057,141 @@ class BacktestApp:
                             pass
 
                 try:
-                    # ── Phase 1: evolution plan ──
-                    ai_calls += 1
-                    plan = self._chat_client.send_message(
-                        context, call_site="bot_evolution", model=heavy_model,
-                        # Thinking tokens share this budget — the codegen
-                        # calls already get _CODE_GEN_MAX_TOKENS, so give the
-                        # plan the same floor (issue #108).
-                        max_tokens=max(self._chat_client.max_tokens,
-                                       _CODE_GEN_MAX_TOKENS))
-                    conv = self._chat_client.conversation
-                    if len(conv) >= 2 and conv[-2].get("role") == "user":
-                        conv[-2]["content"] = (
-                            f"[bot evolution payload — {total_trades} trades, "
-                            f"trimmed to save tokens]")
-                    ui(self._on_chat_response, plan)
-
-                    # Issue #108: an empty / token-truncated plan must stop the
-                    # run HERE — before the watermark and before codegen.
-                    # parse_plan_directives degrades to action="change" by
-                    # design, so without this gate a zero-text response burned
-                    # the trade delta and fed codegen a plan of nothing.
-                    if (unusable := plan_unusable_reason(plan)):
-                        msg = (
-                            f"🧬 EVO 中止 ABORT: 計畫回應無法使用（{unusable}）。"
-                            f"本次未消耗任何交易資料（watermark 未前進），"
-                            f"下次執行會重跑同一批交易。"
-                            f"建議在 settings.yaml 將 ai.max_tokens 提高到 "
-                            f"≥{_CODE_GEN_MAX_TOKENS}（思考 token 與輸出共用額度）。\n"
-                            f"Plan response unusable ({unusable}) — the model's "
-                            f"reply was empty or cut off by the token limit. "
-                            f"Nothing was consumed: the watermark did NOT "
-                            f"advance and the next run retries the same trades. "
-                            f"Raise `ai.max_tokens` in settings.yaml to "
-                            f"≥{_CODE_GEN_MAX_TOKENS} (thinking tokens share the "
-                            f"output budget).")
-                        ui(self._append_chat, "system", msg)
-                        if auto_run:
-                            _notify_discord(msg)
-                        _remember("fail", "plan_unusable", msg)
-                        return
-
-                    directives = parse_plan_directives(plan)
-                    if directives["action"] == "no_change":
-                        msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
-                               "Plan says no change — pipeline stops here.")
-                        ui(self._append_chat, "system", msg)
-                        if auto_run:
-                            _notify_discord(msg)
-                        _remember("no_change", "no_change", msg)
-                        return
-                    # Issue #153: an eligible class with an off-grid / structural
-                    # plan is refused BEFORE the watermark, so that plan does
-                    # not burn next week's delta.
-                    # D1: an ineligible class is excluded from weekly codegen.
-                    # The exclusion line is emitted every Saturday, including
-                    # when this class+source+grid was already recorded.
-                    # _bot_evolution settles this before the AI call; this is
-                    # the backstop if a plan was already in hand.
+                    # ── Phase 1: grid search, or the evolution plan ──
+                    # Eligible knob classes are scored on a pre-registered
+                    # grid. The model does not pick the setting. llm_one and
+                    # classes that are not on the knob grid keep the plan.
+                    from src.evolution.grid_search import (
+                        explanation_prompt, grid_search_applies, run_grid_on_bars)
+                    grid_trial = None
                     _knob_apply = None
-                    if auto_run and baseline_cls is not None:
-                        from src.evolution.knobs import (
-                            is_knob_not_applicable_reason,
-                            normalize_knob_ineligible_fallback,
-                            saturday_knob_decision, settle_knob_ineligibility)
-                        rejection, _knob_apply = saturday_knob_decision(
-                            baseline_cls.__name__, directives.get("knobs"),
-                            baseline_cls, strategy_source)
-                        if rejection:
-                            if is_knob_not_applicable_reason(rejection):
-                                _knob_fallback = normalize_knob_ineligible_fallback(
-                                    self._settings.get(
-                                        "evolution_knob_ineligible_fallback"))
-                                action, why = settle_knob_ineligibility(
-                                    bot_dir, baseline_cls, strategy_source,
-                                    design_cut_idx, fallback=_knob_fallback)
-                                if action in ("recorded", "skip") and why:
-                                    ui(self._append_chat, "system", why)
-                                    _notify_discord(why)
-                                    _log(why)
-                                _remember("skip", "knob_ineligible", why or rejection)
-                                return
-                            msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
+                    grid_outcome = None
+                    if grid_search_applies(
+                            baseline_cls, strategy_source, evolution_gate_raw):
+                        ui(self._append_chat, "system",
+                           "EVO 1/3: 預先登記的旋鈕網格評分中（模型不挑選設定）。"
+                           "Pre-registered knob grid — the model does not "
+                           "pick the setting.")
+                        grid_outcome = run_grid_on_bars(
+                            strategy_cls=baseline_cls,
+                            source=strategy_source,
+                            bars=bars,
+                            point_value=point_value,
+                            capital_base=capital_base,
+                            evo=evolution_gate_raw,
+                            fold_days=holdout_days,
+                        )
+                        for line in grid_outcome.reasons:
+                            _log(line)
+                        if grid_outcome.selected is None:
+                            msg = (
+                                "🧬 EVO: 網格沒有選出設定（高原 / DSR / PBO 未過）。"
+                                "本次未消耗任何交易資料（watermark 未前進）。\n"
+                                "Grid selected no setting (plateau / DSR / PBO). "
+                                "Nothing was consumed: the watermark did NOT "
+                                "advance.\n"
+                                + "\n".join(grid_outcome.reasons))
                             ui(self._append_chat, "system", msg)
                             if auto_run:
                                 _notify_discord(msg)
-                            _remember("refused", "refused", msg)
+                            _remember("fail", "grid_no_pick", msg)
                             return
+                        plan = grid_outcome.rationale
+                        directives = {
+                            "action": "change",
+                            "knobs": dict(grid_outcome.selected),
+                            "criteria": None,
+                        }
+                        _knob_apply = dict(grid_outcome.selected)
+                        grid_trial = grid_outcome.evidence
+                    if grid_outcome is None:
+                        # ── Evolution plan (LLM picks only on this branch) ──
+                        ai_calls += 1
+                        plan = self._chat_client.send_message(
+                            context, call_site="bot_evolution", model=heavy_model,
+                            # Thinking tokens share this budget — the codegen
+                            # calls already get _CODE_GEN_MAX_TOKENS, so give the
+                            # plan the same floor (issue #108).
+                            max_tokens=max(self._chat_client.max_tokens,
+                                           _CODE_GEN_MAX_TOKENS))
+                        conv = self._chat_client.conversation
+                        if len(conv) >= 2 and conv[-2].get("role") == "user":
+                            conv[-2]["content"] = (
+                                f"[bot evolution payload — {total_trades} trades, "
+                                f"trimmed to save tokens]")
+                        ui(self._on_chat_response, plan)
+
+                        # Issue #108: an empty / token-truncated plan must stop the
+                        # run HERE — before the watermark and before codegen.
+                        # parse_plan_directives degrades to action="change" by
+                        # design, so without this gate a zero-text response burned
+                        # the trade delta and fed codegen a plan of nothing.
+                        if (unusable := plan_unusable_reason(plan)):
+                            msg = (
+                                f"🧬 EVO 中止 ABORT: 計畫回應無法使用（{unusable}）。"
+                                f"本次未消耗任何交易資料（watermark 未前進），"
+                                f"下次執行會重跑同一批交易。"
+                                f"建議在 settings.yaml 將 ai.max_tokens 提高到 "
+                                f"≥{_CODE_GEN_MAX_TOKENS}（思考 token 與輸出共用額度）。\n"
+                                f"Plan response unusable ({unusable}) — the model's "
+                                f"reply was empty or cut off by the token limit. "
+                                f"Nothing was consumed: the watermark did NOT "
+                                f"advance and the next run retries the same trades. "
+                                f"Raise `ai.max_tokens` in settings.yaml to "
+                                f"≥{_CODE_GEN_MAX_TOKENS} (thinking tokens share the "
+                                f"output budget).")
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "plan_unusable", msg)
+                            return
+
+                        directives = parse_plan_directives(plan)
+                        if directives["action"] == "no_change":
+                            msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
+                                   "Plan says no change — pipeline stops here.")
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("no_change", "no_change", msg)
+                            return
+                        # Issue #153: an eligible class with an off-grid / structural
+                        # plan is refused BEFORE the watermark, so that plan does
+                        # not burn next week's delta.
+                        # D1: an ineligible class is excluded from weekly codegen.
+                        # The exclusion line is emitted every Saturday, including
+                        # when this class+source+grid was already recorded.
+                        # _bot_evolution settles this before the AI call; this is
+                        # the backstop if a plan was already in hand.
+                        _knob_apply = None
+                        if auto_run and baseline_cls is not None:
+                            from src.evolution.knobs import (
+                                is_knob_not_applicable_reason,
+                                normalize_knob_ineligible_fallback,
+                                saturday_knob_decision, settle_knob_ineligibility)
+                            rejection, _knob_apply = saturday_knob_decision(
+                                baseline_cls.__name__, directives.get("knobs"),
+                                baseline_cls, strategy_source)
+                            if rejection:
+                                if is_knob_not_applicable_reason(rejection):
+                                    _knob_fallback = normalize_knob_ineligible_fallback(
+                                        self._settings.get(
+                                            "evolution_knob_ineligible_fallback"))
+                                    action, why = settle_knob_ineligibility(
+                                        bot_dir, baseline_cls, strategy_source,
+                                        design_cut_idx, fallback=_knob_fallback)
+                                    if action in ("recorded", "skip") and why:
+                                        ui(self._append_chat, "system", why)
+                                        _notify_discord(why)
+                                        _log(why)
+                                    _remember("skip", "knob_ineligible", why or rejection)
+                                    return
+                                msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
+                                ui(self._append_chat, "system", msg)
+                                if auto_run:
+                                    _notify_discord(msg)
+                                _remember("refused", "refused", msg)
+                                return
                     # Issue #125: watermark advances only after a completed
                     # plan with action=change — never at launch. no_change
                     # returned above; a later codegen/validation FAIL does
@@ -6140,6 +6203,28 @@ class BacktestApp:
                     except Exception as e:
                         _log(f"evolution watermark save failed: "
                              f"[{type(e).__name__}] {e}")
+                    if grid_outcome is not None:
+                        # The setting is already chosen. This call only
+                        # explains it. A failure keeps the mechanical line.
+                        try:
+                            ai_calls += 1
+                            explained = self._chat_client.one_shot(
+                                explanation_prompt(
+                                    grid_outcome.selected, grid_outcome.reasons),
+                                system_prompt=(
+                                    "You explain a knob setting that has already "
+                                    "been selected. Do NOT propose a different "
+                                    "setting. Do NOT output directives JSON."),
+                                max_tokens=max(self._chat_client.max_tokens,
+                                               _CODE_GEN_MAX_TOKENS),
+                                call_site="evolution_grid_explain",
+                                model=heavy_model)
+                            if explained and explained.strip():
+                                plan = explained.strip()
+                        except Exception as e:
+                            _log(f"EVO grid explanation failed: "
+                                 f"[{type(e).__name__}] {e}")
+                        ui(self._on_chat_response, plan)
                     if not strategy_source:
                         msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
                                "Strategy source unavailable — plan-only.")
@@ -6366,8 +6451,9 @@ class BacktestApp:
                                    if mf_cand.result is not None else [])
                     ho_start = holdout_window_start(bars, te_d or holdout_days)
                     # Paper relative drops the absolute PF floors and ANDs the
-                    # bootstrap / effect-size checks. Real money stays absolute.
-                    # The retire recommendation below does not feed this verdict.
+                    # bootstrap / effect-size checks plus the grid's DSR and
+                    # PBO (grid_trial). Real money stays absolute. The retire
+                    # recommendation below does not feed this verdict.
                     assembled = assemble_promotion_verdict(
                         gate=evo_gate,
                         gate_cfg=evo_gate_cfg,
@@ -6379,6 +6465,7 @@ class BacktestApp:
                         window_verdict=window_verdict,
                         bars=bars,
                         month_gate=month_gate_cfg,
+                        trial=grid_trial,
                     )
                     verdict = assembled.verdict
                     # assemble_promotion_verdict threads decide_month_gates'

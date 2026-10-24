@@ -41,6 +41,7 @@ from src.evolution.paper_gate import (
     resolve_promotion_gate,
     weeks_from_changelog,
 )
+from src.evolution.trial_penalty import TrialEvidence
 from src.evolution.pipeline import (
     ABResult,
     ABS_PF_FLOOR,
@@ -56,6 +57,12 @@ from src.evolution.pipeline import (
 
 
 _NOW = datetime(2026, 10, 24, 6, 0)
+
+# A grid trial that clears DSR > 0.90 and PBO < 0.50. Tests of the
+# other relative checks pass this in so a missing penalty is not what
+# fails them. The penalty's own pass/fail is covered separately.
+_PASSING_TRIAL = TrialEvidence(
+    dsr=0.97, pbo=0.10, n_trials=12, n_eff=8.0, rho_bar=0.2, partitions=8)
 
 
 @dataclass
@@ -122,7 +129,7 @@ def _gate(trading_mode: str, paper_gate: str, real_gate: str = "absolute"):
 
 
 def _judge(trading_mode, paper_gate, folds, base, cand, *, real_gate="absolute",
-           window=None, holdout_start=None):
+           window=None, holdout_start=None, trial=_PASSING_TRIAL):
     cfg, gate = _gate(trading_mode, paper_gate, real_gate)
     if window is None:
         window = EvolutionVerdict(True, ["walk-forward collapse guards held ✓"])
@@ -133,6 +140,7 @@ def _judge(trading_mode, paper_gate, folds, base, cand, *, real_gate="absolute",
         base_trades=base, cand_trades=cand,
         holdout_start=holdout_start, criteria=None,
         window_verdict=window,
+        trial=trial,
     )
     return assembled.verdict, gate
 
@@ -179,8 +187,15 @@ def _weeks(dates: list[str], passed: bool = False,
 class TestGateConfig:
     def test_defaults_match_the_approved_spec(self):
         cfg = evolution_gate_config_from_mapping({})
-        assert cfg.paper_gate == "absolute"
+        assert cfg.paper_gate == "relative"
         assert cfg.real_gate == "absolute"
+        assert cfg.search == "grid_batch"
+        assert cfg.relative.dsr_min == pytest.approx(0.90)
+        assert cfg.relative.pbo_max == pytest.approx(0.50)
+        assert cfg.trial.max_settings == 48
+        assert cfg.trial.max_joint_knobs == 2
+        assert cfg.trial.max_values_per_knob == 4
+        assert cfg.trial.plateau_band == pytest.approx(0.50)
         rel, ret = cfg.relative, cfg.retire
         assert rel.min_nonempty_folds == 6
         assert rel.min_divergent_folds == 3
@@ -209,13 +224,14 @@ class TestGateConfig:
         blank = evolution_gate_config_from_mapping({})
         assert cfg == blank
 
-    def test_junk_paper_gate_stays_absolute_and_real_gate_cannot_go_relative(self):
+    def test_junk_paper_gate_uses_the_relative_default_and_real_gate_cannot_go_relative(self):
         cfg = evolution_gate_config_from_mapping({
             "paper_gate": "nope",
             "real_gate": "relative",
         })
-        assert cfg.paper_gate == "absolute"
+        assert cfg.paper_gate == "relative"
         assert cfg.real_gate == "absolute"
+        assert any("paper_gate" in w for w in cfg.warnings)
         forced = resolve_promotion_gate("paper", "relative", "relative")
         assert forced.mode == "relative"
         assert "ignored" in forced.note
@@ -319,7 +335,8 @@ class TestRelativePaperEdges:
         assert any("drops prior-month" in r and "✓" in r for r in paper.reasons)
         assert any("prior-month OOS PF" in r and "✗" in r for r in real.reasons)
         assert any("seed=20261024" in r for r in paper.reasons)
-        assert any("PBO and DSR not applied" in r for r in paper.reasons)
+        assert any("DSR 0.9700 > 0.9" in r and "✓" in r for r in paper.reasons)
+        assert any("PBO 0.1000 < 0.5" in r and "✓" in r for r in paper.reasons)
         # Same numbers, two families: the gate has no strategy-name argument.
         for _family in ("DynamicExitPullback", "BollingerBreakout"):
             again, _ = _judge("paper", "relative", folds, base, cand)
@@ -347,7 +364,8 @@ class TestRelativePaperEdges:
         six, base6, _cand6 = _improved_losing(6)
         assert nonempty_fold_count(six) == 6
         assert meets_min_folds(nonempty_fold_count(six))
-        six_rel = decide_relative_paper_checks(six, [t.pnl for t in base6], fast)
+        six_rel = decide_relative_paper_checks(
+            six, [t.pnl for t in base6], fast, _PASSING_TRIAL)
         assert any(
             "meets_min_folds: 6 ≥ 6" in r and "eligible" in r
             for r in six_rel.reasons)
@@ -468,7 +486,7 @@ class TestRelativePaperEdges:
         pnls = [t.pnl for t in base]
         fast = dict(bootstrap_resamples=50, bootstrap_seed=1)
         deferred = decide_relative_paper_checks(
-            folds, pnls, RelativeGateConfig(**fast))
+            folds, pnls, RelativeGateConfig(**fast), _PASSING_TRIAL)
         assert deferred.passed, deferred.reasons
         assert any("span not configured" in r for r in deferred.reasons)
         late = decide_relative_paper_checks(
@@ -479,7 +497,7 @@ class TestRelativePaperEdges:
                    for r in late.reasons)
         early = decide_relative_paper_checks(
             folds, pnls, RelativeGateConfig(
-                post_backfill_start="2026-05-01", **fast))
+                post_backfill_start="2026-05-01", **fast), _PASSING_TRIAL)
         assert early.passed, early.reasons
         assert any("post-backfill folds: 6 ≥ 2" in r and "✓" in r
                    for r in early.reasons)

@@ -143,16 +143,25 @@ evolution:
   # when the last trade exit is at least this many calendar days ago.
   # Default 7. Set 0 to disable the idle line entirely. Not a credential.
   idle_warn_days: 7
-  # P1 promotion gate. Stays "absolute" in this change: PBO/DSR are
-  # not applied yet, so the full Q2 gate is not on. The default flips
-  # to "relative" once that trial-penalty gate exists. "relative" is
-  # the paper path only. Real-money modes ignore paper_gate.
-  # real_gate is accepted only as "absolute"; any other value is ignored.
-  paper_gate: absolute
+  # P1 promotion gate. Default is "relative" now that the Saturday
+  # grid scores DSR and PBO (P2). "relative" is the paper path only.
+  # Real-money modes ignore paper_gate and keep the absolute PF floor.
+  # Set "absolute" to restore the old paper rule. real_gate is accepted
+  # only as "absolute"; any other value is ignored.
+  paper_gate: relative
   real_gate: absolute
+  # Saturday knob search. "grid_batch" (default) pre-registers a grid
+  # over the class's eligible knobs (at most 48 settings, at most 2
+  # knobs together) and picks with DSR, PBO, and the plateau rule.
+  # The model does not pick the setting; it may only explain the
+  # winner. "llm_one" keeps the old one-change plan. Classes that are
+  # not on the knob grid stay on the plan either way.
+  search: grid_batch
   # Thresholds used when paper_gate is relative. Approved Q2 values.
   # post_backfill_start empty defers the "≥2 folds after backfill" check
-  # until a span date is set. PBO / DSR are not read here.
+  # until a span date is set. min_divergent_folds must be >= 2; a
+  # smaller value falls back to 3. DSR / PBO thresholds live under
+  # trial_penalty, not here.
   relative:
     min_nonempty_folds: 6
     min_divergent_folds: 3
@@ -164,6 +173,19 @@ evolution:
     min_post_backfill_folds: 2
     post_backfill_start: ""
     fold_days: 14
+  # P2 trial penalty and grid caps. DSR must be strictly above dsr_min
+  # and PBO strictly below pbo_max. The caps are hard: a larger
+  # max_settings / max_joint_knobs / max_values_per_knob falls back to
+  # 48 / 2 / 4. plateau_band 0.50 means a neighbour's mean fold Δ has
+  # to sit within 50% of the chosen point's Δ and be positive.
+  # Not a credential.
+  trial_penalty:
+    dsr_min: 0.90
+    pbo_max: 0.50
+    max_settings: 48
+    max_joint_knobs: 2
+    max_values_per_knob: 4
+    plateau_band: 0.50
   # Recommend-only. A hit writes a log / changelog / report line.
   # It does not disable the bot, stop evolution, or edit live settings.
   retire:

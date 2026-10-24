@@ -66,9 +66,9 @@ these names:
   → ``final_status=skip``
 * ``no_change`` → ``no_change``
 * ``refused`` — Saturday knob plan refused on an eligible class
-* ``plan_unusable``, ``no_source``, ``knob_apply``, ``codegen``,
-  ``insufficient_bars``, ``validation``, ``pipeline_error`` → ``fail``
-  or, for a clean validation pass, ``pass``
+* ``plan_unusable``, ``grid_no_pick``, ``no_source``, ``knob_apply``,
+  ``codegen``, ``insufficient_bars``, ``validation``, ``pipeline_error``
+  → ``fail`` or, for a clean validation pass, ``pass``
 
 A write error is logged and swallowed. Each record is one
 ``write()`` of a complete line in binary append mode, then ``flush``.

@@ -1,14 +1,18 @@
 """P1: relative paper-promotion gate and a recommend-only retire flag.
 
 The real-money path keeps ``ABS_PF_FLOOR`` and every current gate. The
-paper path uses those same rules until ``evolution.paper_gate`` is
-``relative``. Retirement never disables a bot, never writes settings or
-an allowlist, and never changes a pool status — it only returns text
-for a log line, a changelog entry, and a report.
+paper path uses the relative rule. ``evolution.paper_gate`` defaults to
+``relative`` now that the grid's DSR and PBO scores exist; ``absolute``
+is still the real-money rule and is still what a paper bot uses when
+the key is set back to ``absolute``. Retirement never disables a bot,
+never writes settings or an allowlist, and never changes a pool status
+— it only returns text for a log line, a changelog entry, and a report.
 
-PBO, DSR, scaled month-slack, and the structural lane are other changes.
-This module does not compute them. A missing post-backfill span (no
-start date configured) defers that one check instead of failing it.
+DSR and PBO are computed by the grid search and passed in as
+``TrialEvidence``. On the relative path a missing score is a miss, not
+a pass. This module does not run CSCV itself. Scaled month-slack and
+the structural lane are other changes. A missing post-backfill span
+(no start date configured) defers that one check instead of failing it.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .fitness import MIN_TRADES
+from .trial_penalty import TrialEvidence
 from .pipeline import (
     EvolutionVerdict,
     Fold,
@@ -29,12 +34,24 @@ from .pipeline import (
     window_stats,
 )
 
-# Approved defaults (Nova Q2 / Q3). ``paper_gate`` stays absolute so a
-# deploy that does not opt in keeps today's verdicts.
+# Approved defaults (Nova Q2 / Q3 / Q5). ``paper_gate`` is relative:
+# the trial penalty (DSR / PBO) is part of this gate. Real money does
+# not read ``paper_gate``.
+DEFAULT_PAPER_GATE = "relative"
 DEFAULT_BOOTSTRAP_RESAMPLES = 10_000
 DEFAULT_BOOTSTRAP_SEED = 20261024
 DEFAULT_MIN_NONEMPTY_FOLDS = 6
 DEFAULT_MIN_DIVERGENT_FOLDS = 3
+# A configured floor below this is rejected. 1 divergent fold is not a
+# majority sample. The approved default stays 3.
+MIN_DIVERGENT_FOLDS_BOUND = 2
+DEFAULT_DSR_MIN = 0.90
+DEFAULT_PBO_MAX = 0.50
+DEFAULT_MAX_SETTINGS = 48
+DEFAULT_MAX_JOINT_KNOBS = 2
+DEFAULT_MAX_VALUES_PER_KNOB = 4
+DEFAULT_PLATEAU_BAND = 0.50
+DEFAULT_SEARCH = "grid_batch"
 DEFAULT_FOLD_MAJORITY = 0.60
 DEFAULT_BOOTSTRAP_ALPHA = 0.10
 DEFAULT_EFFECT_SIZE_SIGMA = 0.25
@@ -80,6 +97,22 @@ class RelativeGateConfig:
     # Empty: the ≥2 post-backfill check is deferred (backfill is separate).
     post_backfill_start: str = ""
     fold_days: int = DEFAULT_FOLD_DAYS
+    # Trial-penalty thresholds (Q2). Stored here so the relative check
+    # logs the same numbers the grid used. Parsed from ``trial_penalty``.
+    dsr_min: float = DEFAULT_DSR_MIN
+    pbo_max: float = DEFAULT_PBO_MAX
+
+
+@dataclass(frozen=True)
+class TrialPenaltyConfig:
+    """Grid caps and the DSR / PBO thresholds. Logged with the search."""
+
+    dsr_min: float = DEFAULT_DSR_MIN
+    pbo_max: float = DEFAULT_PBO_MAX
+    max_settings: int = DEFAULT_MAX_SETTINGS
+    max_joint_knobs: int = DEFAULT_MAX_JOINT_KNOBS
+    max_values_per_knob: int = DEFAULT_MAX_VALUES_PER_KNOB
+    plateau_band: float = DEFAULT_PLATEAU_BAND
 
 
 @dataclass(frozen=True)
@@ -100,9 +133,11 @@ class RetireConfig:
 
 @dataclass(frozen=True)
 class EvolutionGateConfig:
-    paper_gate: str = "absolute"
+    paper_gate: str = DEFAULT_PAPER_GATE
     real_gate: str = "absolute"
+    search: str = DEFAULT_SEARCH
     relative: RelativeGateConfig = field(default_factory=RelativeGateConfig)
+    trial: TrialPenaltyConfig = field(default_factory=TrialPenaltyConfig)
     retire: RetireConfig = field(default_factory=RetireConfig)
     # Empty when every *present* threshold was in range. A missing key
     # stays at its default and does not warn. An out-of-range key falls
@@ -162,12 +197,13 @@ def _float_or(value, default: float, *, lo: float, hi: float) -> float:
 
 
 def _present_open_float(mapping: dict, key: str, default: float, *,
-                        lo: float, hi: float, warnings: list[str]) -> float:
+                        lo: float, hi: float, warnings: list[str],
+                        prefix: str = "relative") -> float:
     """Open interval ``(lo, hi)``. A missing key keeps the default quietly."""
     if key not in mapping:
         return default
     value = mapping[key]
-    label = f"relative.{key}"
+    label = f"{prefix}.{key}"
     if isinstance(value, bool):
         x = None
     else:
@@ -184,12 +220,13 @@ def _present_open_float(mapping: dict, key: str, default: float, *,
 
 
 def _present_closed_int(mapping: dict, key: str, default: int, *,
-                        lo: int, hi: int, warnings: list[str]) -> int:
+                        lo: int, hi: int, warnings: list[str],
+                        prefix: str = "relative") -> int:
     """Closed interval ``[lo, hi]``. A missing key keeps the default quietly."""
     if key not in mapping:
         return default
     value = mapping[key]
-    label = f"relative.{key}"
+    label = f"{prefix}.{key}"
     n = None
     if isinstance(value, bool):
         n = None
@@ -217,20 +254,47 @@ def _mapping(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def bounded_min_divergent_folds(value) -> int:
+    """The divergent-fold floor the relative gate actually uses.
+
+    Values below 2 or above 30 are not a configured floor. They become
+    the approved default (3). Two is the smallest number that can be
+    asked to agree.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_DIVERGENT_FOLDS
+    if isinstance(value, bool) or n < MIN_DIVERGENT_FOLDS_BOUND or n > 30:
+        return DEFAULT_MIN_DIVERGENT_FOLDS
+    return n
+
+
 def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
     """Parse ``evolution:`` . Missing or junk keys fall back to the defaults.
 
     ``real_gate`` other than ``absolute`` is stored as ``absolute``.
-    The real-money path has no relative mode.
+    The real-money path has no relative mode. ``paper_gate`` defaults
+    to ``relative``. ``search`` defaults to ``grid_batch``.
     """
     evo = _mapping(evo)
     rel = _mapping(evo.get("relative"))
     ret = _mapping(evo.get("retire"))
-    paper = _choice(evo.get("paper_gate", "absolute"), _PAPER_GATE_VALUES,
-                    "absolute")
+    pen = _mapping(evo.get("trial_penalty"))
+    raw_paper = evo.get("paper_gate", DEFAULT_PAPER_GATE)
+    paper = _choice(raw_paper, _PAPER_GATE_VALUES, DEFAULT_PAPER_GATE)
+    raw_search = evo.get("search", DEFAULT_SEARCH)
+    search = _choice(raw_search, ("grid_batch", "llm_one"), DEFAULT_SEARCH)
     # Any non-absolute value, including "relative", is coerced.
     real = "absolute"
     warnings: list[str] = []
+    if "paper_gate" in evo and paper != str(raw_paper).strip().lower():
+        warnings.append(
+            f"paper_gate {raw_paper!r} is not absolute|relative; "
+            f"using {paper}")
+    if "search" in evo and search != str(raw_search).strip().lower():
+        warnings.append(
+            f"search {raw_search!r} is not grid_batch|llm_one; using {search}")
     # 0 or 1 makes majority / alpha / effect size trivial. A fold floor
     # of 1 (or above 30) is not the approved sample. Rejected values
     # fall back; absent keys do not warn.
@@ -246,15 +310,37 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
     effect_size_sigma = _present_open_float(
         rel, "effect_size_sigma", DEFAULT_EFFECT_SIZE_SIGMA,
         lo=0.0, hi=1.0, warnings=warnings)
+    # Below 2 is not a floor (one divergent fold cannot agree with
+    # itself). Above 30 is not the approved sample. Both fall back.
+    min_divergent = _present_closed_int(
+        rel, "min_divergent_folds", DEFAULT_MIN_DIVERGENT_FOLDS,
+        lo=MIN_DIVERGENT_FOLDS_BOUND, hi=30, warnings=warnings)
+    dsr_min = _present_open_float(
+        pen, "dsr_min", DEFAULT_DSR_MIN, lo=0.0, hi=1.0,
+        warnings=warnings, prefix="trial_penalty")
+    pbo_max = _present_open_float(
+        pen, "pbo_max", DEFAULT_PBO_MAX, lo=0.0, hi=1.0,
+        warnings=warnings, prefix="trial_penalty")
+    max_settings = _present_closed_int(
+        pen, "max_settings", DEFAULT_MAX_SETTINGS, lo=1, hi=48,
+        warnings=warnings, prefix="trial_penalty")
+    max_joint = _present_closed_int(
+        pen, "max_joint_knobs", DEFAULT_MAX_JOINT_KNOBS, lo=1, hi=2,
+        warnings=warnings, prefix="trial_penalty")
+    max_values = _present_closed_int(
+        pen, "max_values_per_knob", DEFAULT_MAX_VALUES_PER_KNOB, lo=1, hi=4,
+        warnings=warnings, prefix="trial_penalty")
+    plateau_band = _present_open_float(
+        pen, "plateau_band", DEFAULT_PLATEAU_BAND, lo=0.0, hi=1.0,
+        warnings=warnings, prefix="trial_penalty")
     return EvolutionGateConfig(
         paper_gate=paper,
         real_gate=real,
+        search=search,
         warnings=tuple(warnings),
         relative=RelativeGateConfig(
             min_nonempty_folds=min_nonempty,
-            min_divergent_folds=_int_or(
-                rel.get("min_divergent_folds"), DEFAULT_MIN_DIVERGENT_FOLDS,
-                minimum=1),
+            min_divergent_folds=min_divergent,
             fold_majority=fold_majority,
             bootstrap_alpha=bootstrap_alpha,
             bootstrap_resamples=_int_or(
@@ -270,6 +356,16 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
                 rel.get("post_backfill_start") or "").strip(),
             fold_days=_int_or(
                 rel.get("fold_days"), DEFAULT_FOLD_DAYS, minimum=1),
+            dsr_min=dsr_min,
+            pbo_max=pbo_max,
+        ),
+        trial=TrialPenaltyConfig(
+            dsr_min=dsr_min,
+            pbo_max=pbo_max,
+            max_settings=max_settings,
+            max_joint_knobs=max_joint,
+            max_values_per_knob=max_values,
+            plateau_band=plateau_band,
         ),
         retire=RetireConfig(
             min_trades=_int_or(
@@ -309,7 +405,7 @@ def resolve_promotion_gate(trading_mode: str, paper_gate: str,
     stay absolute and are not treated as paper. Comparison is exact:
     no strip and no case fold.
     """
-    paper = _choice(paper_gate, _PAPER_GATE_VALUES, "absolute")
+    paper = _choice(paper_gate, _PAPER_GATE_VALUES, DEFAULT_PAPER_GATE)
     real_note = ""
     if (real_gate or "").strip().lower() not in ("", "absolute"):
         real_note = (
@@ -529,27 +625,32 @@ def meets_min_folds(n_folds: int, minimum: int = DEFAULT_MIN_NONEMPTY_FOLDS) -> 
 def decide_relative_paper_checks(
         folds: list[Fold],
         base_trade_pnls: list[float],
-        config: RelativeGateConfig | None = None) -> EvolutionVerdict:
-    """Fold floor, bootstrap, effect size, and the post-backfill count.
+        config: RelativeGateConfig | None = None,
+        trial: TrialEvidence | None = None) -> EvolutionVerdict:
+    """Fold floor, bootstrap, effect size, post-backfill, DSR, and PBO.
 
     ``meets_min_folds`` (≥ 6 non-empty folds) is required here. A miss
     is a FAIL with its own reason line. Majority, collapse guards, and
-    month gates are applied by the callers. PBO and DSR are named in
-    the reason list and are not treated as a pass — they belong to a
-    later change, which is why ``paper_gate`` stays ``absolute`` until
-    that change lands.
+    month gates are applied by the callers. The divergent floor logged
+    here is ``bounded_min_divergent_folds`` (at least 2; out of range
+    becomes 3), the same number ``assemble_promotion_verdict`` passes
+    into the multi-fold check.
+
+    DSR and PBO come from the pre-registered grid (``trial``). They are
+    required. A missing score, DSR ≤ ``dsr_min``, or PBO ≥ ``pbo_max``
+    is a miss. This function does not recompute CSCV.
     """
     cfg = config or RelativeGateConfig()
+    divergent_floor = bounded_min_divergent_folds(cfg.min_divergent_folds)
     reasons = [
         f"paper relative thresholds: nonempty≥{cfg.min_nonempty_folds} "
-        f"divergent≥{cfg.min_divergent_folds} "
+        f"divergent≥{divergent_floor} "
         f"majority≥{cfg.fold_majority:.0%} "
         f"bootstrap p<{cfg.bootstrap_alpha:g} "
         f"effect≥{cfg.effect_size_sigma:g}×σ "
         f"post-backfill≥{cfg.min_post_backfill_folds} "
+        f"DSR>{cfg.dsr_min:g} PBO<{cfg.pbo_max:g} "
         f"seed={cfg.bootstrap_seed} resamples={cfg.bootstrap_resamples}",
-        "PBO and DSR not applied on this path (separate trial-penalty "
-        "change); they are not treated as a pass",
     ]
     passed = True
 
@@ -611,6 +712,38 @@ def decide_relative_paper_checks(
             f"non-empty with start ≥ {start}: {'✓' if ok else '✗'}")
         passed = passed and ok
 
+    if trial is None:
+        reasons.append(
+            "PBO and DSR: not supplied — required on the relative paper "
+            "path (the grid trial penalty). Not a pass ✗")
+        passed = False
+    else:
+        dsr = trial.dsr
+        pbo = trial.pbo
+        dsr_ok = (
+            isinstance(dsr, (int, float))
+            and not isinstance(dsr, bool)
+            and math.isfinite(float(dsr))
+            and float(dsr) > cfg.dsr_min
+        )
+        pbo_ok = (
+            isinstance(pbo, (int, float))
+            and not isinstance(pbo, bool)
+            and math.isfinite(float(pbo))
+            and float(pbo) < cfg.pbo_max
+        )
+        dsr_txt = "n/a" if dsr is None else f"{float(dsr):.4f}"
+        pbo_txt = "n/a" if pbo is None else f"{float(pbo):.4f}"
+        reasons.append(
+            f"DSR {dsr_txt} > {cfg.dsr_min:g} "
+            f"(N={trial.n_trials} N_eff={trial.n_eff:.4g} "
+            f"ρ̄={trial.rho_bar:.4g}): {'✓' if dsr_ok else '✗'}")
+        reasons.append(
+            f"PBO {pbo_txt} < {cfg.pbo_max:g} "
+            f"(CSCV partitions={trial.partitions}): "
+            f"{'✓' if pbo_ok else '✗'}")
+        passed = passed and dsr_ok and pbo_ok
+
     return EvolutionVerdict(passed, reasons)
 
 
@@ -653,17 +786,20 @@ def assemble_promotion_verdict(
         window_verdict: EvolutionVerdict,
         bars=None,
         month_gate=None,
+        trial: TrialEvidence | None = None,
 ) -> PromotionAssembly:
     """AND month gates, multi-fold, the walk-forward window, and (paper
-    relative only) the bootstrap / effect-size checks.
+    relative only) the bootstrap / effect-size / DSR / PBO checks.
 
     ``window_verdict`` must already have been built with
     ``require_abs_pf=abs_pf_required(gate)`` so the holdout PF floor
     matches this mode. This function does not rewrite ``window_verdict``.
 
     On the relative path the multi-fold divergent floor is
-    ``relative.min_divergent_folds``, the same number the threshold
-    line logs. The absolute path keeps ``MIN_DIVERGENT_FOLDS``.
+    ``bounded_min_divergent_folds(relative.min_divergent_folds)`` — at
+    least 2, and the same number the threshold line logs. The absolute
+    path keeps ``MIN_DIVERGENT_FOLDS``. ``trial`` is the grid's DSR and
+    PBO. The relative path requires it.
 
     ``bars`` and ``month_gate`` are forwarded to ``decide_month_gates``.
     This module does not compute the scaled slack. Omitting both keeps
@@ -671,6 +807,7 @@ def assemble_promotion_verdict(
     """
     relative = gate.mode == "relative"
     rel_cfg = gate_cfg.relative
+    divergent_floor = bounded_min_divergent_folds(rel_cfg.min_divergent_folds)
     month = decide_month_gates(
         base_trades, cand_trades,
         holdout_start=holdout_start,
@@ -682,14 +819,15 @@ def assemble_promotion_verdict(
         folds, criteria,
         require_abs_pf=not relative,
         min_nonempty=(rel_cfg.min_nonempty_folds if relative else None),
-        min_divergent=(rel_cfg.min_divergent_folds if relative else None),
+        min_divergent=(divergent_floor if relative else None),
         majority=(rel_cfg.fold_majority if relative else None),
     )
     parts = [month, mf, window_verdict]
     relative_verdict = None
     if relative:
         relative_verdict = decide_relative_paper_checks(
-            folds, baseline_pnls_in_folds(base_trades, folds), rel_cfg)
+            folds, baseline_pnls_in_folds(base_trades, folds), rel_cfg,
+            trial)
         parts.append(relative_verdict)
     return PromotionAssembly(
         verdict=combine_evolution_verdicts(*parts),
