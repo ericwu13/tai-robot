@@ -162,23 +162,44 @@ def atomic_write_json(path: str, payload: dict, *, sleep=None,
         raise
 
 
-def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
-    """Move ``tmp`` onto ``path``. Retry PermissionError only."""
+def call_retrying_permission_error(action, *, sleep_fn=None):
+    """Call ``action`` up to 4 times. Retry ``PermissionError`` only.
+
+    Windows sharing violations surface as ``PermissionError`` (WinError
+    5). The budget is the heartbeat writer's: 4 attempts, backing off
+    5/10/20 ms. Any other exception fails on the first attempt. The
+    final ``PermissionError`` is re-raised and is not logged here.
+    ``sleep_fn`` overrides the backoff sleep (tests).
+    """
+    pause = _sleep if sleep_fn is None else sleep_fn
     for attempt in range(_REPLACE_ATTEMPTS):
         try:
-            os.replace(tmp, path)
-            return
-        except PermissionError as exc:
+            return action()
+        except PermissionError:
             if attempt + 1 >= _REPLACE_ATTEMPTS:
-                # Callers (tick / call_com) must not log this again.
-                exc.hb_logged = True  # type: ignore[attr-defined]
-                note_heartbeat_failure(
-                    "heartbeat os.replace failed for "
-                    f"{os.path.basename(path) or path}: "
-                    f"[{type(exc).__name__}] {exc}",
-                    monotonic=monotonic)
                 raise
-            sleep_fn(_REPLACE_BACKOFF_S[attempt])
+            pause(_REPLACE_BACKOFF_S[attempt])
+
+
+def replace_retrying_permission_error(tmp: str, path: str, *, sleep_fn=None) -> None:
+    """Move ``tmp`` onto ``path``. Retry ``PermissionError`` only."""
+    call_retrying_permission_error(
+        lambda: os.replace(tmp, path), sleep_fn=sleep_fn)
+
+
+def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
+    """Move ``tmp`` onto ``path``. Retry PermissionError only."""
+    try:
+        replace_retrying_permission_error(tmp, path, sleep_fn=sleep_fn)
+    except PermissionError as exc:
+        # Callers (tick / call_com) must not log this again.
+        exc.hb_logged = True  # type: ignore[attr-defined]
+        note_heartbeat_failure(
+            "heartbeat os.replace failed for "
+            f"{os.path.basename(path) or path}: "
+            f"[{type(exc).__name__}] {exc}",
+            monotonic=monotonic)
+        raise
 
 
 def _remove_with_retry(path: str, *, sleep=None, monotonic=None) -> None:

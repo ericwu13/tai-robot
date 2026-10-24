@@ -225,6 +225,20 @@ evolution:
       gate3_k: 0.5
       floor: 3000
       cap: 15000
+  # evolution_history.jsonl lives in each bot directory, next to
+  # evolution_watermark.json. It is append-only: one JSON line per
+  # evolution attempt (skip, no_change, refused, fail, pass). The file
+  # is not size-capped and is not rotated. Growth is left unbounded on
+  # purpose — trimming could drop the weeks a retire streak is derived
+  # from. One weekend line per bot stays small; delete or archive the
+  # file by hand if it ever needs a bound. There is no settings key
+  # for this file. Not a credential.
+  # A second evolution run on the same bot is refused while one is
+  # already running in this process (manual Evolve during the Saturday
+  # auto run). That guard is in-memory. It does not use the bot's
+  # process .lock and it does not write a state file.
+  # assess_retirement still reads the changelog. Switching that reader
+  # to this history file is a later follow-up.
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON
