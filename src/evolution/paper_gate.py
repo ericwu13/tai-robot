@@ -69,6 +69,9 @@ DEFAULT_RETIRE_CONSECUTIVE_WEEKS = 4
 DEFAULT_RETIRE_IDLE_DAYS = 7
 DEFAULT_RETIRE_STRUCTURAL_QUIET_DAYS = 60
 DEFAULT_FOLD_DAYS = 14
+# Same width as the design/walk-forward holdout. A selection fold
+# narrower than that window overlaps the OOS bars.
+DEFAULT_HOLDOUT_DAYS = 14
 
 _PAPER_GATE_VALUES = ("absolute", "relative")
 _REAL_MONEY_MODES = ("semi_auto", "auto", "live", "full_auto")
@@ -311,6 +314,34 @@ def bounded_min_divergent_folds(value) -> int:
     return parsed
 
 
+def _holdout_days_from_mapping(evo: dict) -> int:
+    """Walk-forward OOS length. Missing or unusable stays at 14.
+
+    This is the bar anchor (``bars[-1].dt - holdout_days``), not the
+    fold width. Junk is the same quiet fallback ``_int_or`` uses.
+    """
+    if "holdout_days" not in evo:
+        return DEFAULT_HOLDOUT_DAYS
+    return _int_or(evo.get("holdout_days"), DEFAULT_HOLDOUT_DAYS, minimum=1)
+
+
+def _fold_days_covering_holdout(fold_days: int, holdout_days: int,
+                                warnings: list[str]) -> int:
+    """Refuse a selection fold that is narrower than the OOS window.
+
+    The safe width is the default 14 when that already covers the
+    holdout, and the holdout length when the holdout is longer.
+    """
+    if fold_days >= holdout_days:
+        return fold_days
+    safe = (holdout_days if holdout_days > DEFAULT_FOLD_DAYS
+            else DEFAULT_FOLD_DAYS)
+    warnings.append(
+        f"relative.fold_days {fold_days} < holdout_days {holdout_days}; "
+        f"a selection fold would overlap the OOS window; using {safe}")
+    return safe
+
+
 def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
     """Parse ``evolution:`` . Missing or junk keys fall back to the defaults.
 
@@ -395,6 +426,13 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
     plateau_band = _present_open_float(
         pen, "plateau_band", DEFAULT_PLATEAU_BAND, lo=0.0, hi=1.0,
         warnings=warnings, prefix="trial_penalty")
+    # Resolve before the warnings tuple is copied. The constructor
+    # evaluates that tuple first, so a warning appended inside a later
+    # argument would be dropped.
+    fold_days = _fold_days_covering_holdout(
+        _int_or(rel.get("fold_days"), DEFAULT_FOLD_DAYS, minimum=1),
+        _holdout_days_from_mapping(evo),
+        warnings)
     return EvolutionGateConfig(
         paper_gate=paper,
         real_gate=real,
@@ -416,8 +454,7 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
                 DEFAULT_MIN_POST_BACKFILL_FOLDS, minimum=0),
             post_backfill_start=str(
                 rel.get("post_backfill_start") or "").strip(),
-            fold_days=_int_or(
-                rel.get("fold_days"), DEFAULT_FOLD_DAYS, minimum=1),
+            fold_days=fold_days,
             dsr_min=dsr_min,
             pbo_max=pbo_max,
         ),

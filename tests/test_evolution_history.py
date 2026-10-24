@@ -903,6 +903,52 @@ def test_relative_fail_keeps_retire_passed_false(tmp_path, monkeypatch):
     assert row["gates"]["promotion_gate"]["passed"] is False
 
 
+def test_grid_no_pick_appends_a_history_line(tmp_path, monkeypatch):
+    """A grid that selects nothing still writes evolution_history.jsonl.
+
+    The line uses the same append helper as the other exits. The
+    watermark does not move and the model is not asked to pick.
+    """
+    from src.evolution.grid_search import GridOutcome
+    from tests.test_evolution_min_design_trades import _InlineThread
+
+    def _no_pick(**kwargs):
+        return GridOutcome(
+            None, ("plateau / DSR / PBO not met",), (), None,
+            "Grid selected nothing.")
+
+    monkeypatch.setattr(
+        "src.evolution.grid_search.grid_search_applies",
+        lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "src.evolution.grid_search.run_grid_on_bars", _no_pick)
+    advanced = []
+    monkeypatch.setattr(
+        "src.evolution.notify.maybe_advance_watermark",
+        lambda *args, **kwargs: advanced.append(args))
+    chat = MagicMock()
+    chat.send_message.return_value = _HIST_PLAN
+    chat.one_shot.return_value = _HIST_CODE
+    chat.max_tokens = 1024
+    chat.conversation = []
+    _patch_validation(monkeypatch, passed=True)
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    app = _validation_app(tmp_path, chat, paper_gate="relative")
+    rb.BacktestApp._start_evolution_pipeline(
+        app, "preamble", ["design trade"], "", app._result,
+        auto_run=False, holdout_days=14, bot_dir=str(tmp_path),
+        design_cut_idx=1)
+    rows = load_evolution_history(evolution_history_path(tmp_path))
+    assert app.errors == [], app.chat
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["final_status"] == "fail"
+    assert row["reason_kind"] == "grid_no_pick"
+    assert "watermark" in row["reason"].lower()
+    assert chat.send_message.call_count == 0
+    assert advanced == []
+
+
 def test_absolute_mode_does_not_count_a_retire_week(tmp_path, monkeypatch):
     app, rows = _run_validation(
         monkeypatch, tmp_path, paper_gate="absolute", passed=True)

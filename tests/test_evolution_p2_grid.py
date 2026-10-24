@@ -337,6 +337,30 @@ class TestSearchSwitch:
         assert "relative.fold_days" in src
         assert "gate_for_trial" in src
 
+    def test_fold_days_narrower_than_the_holdout_falls_back(self):
+        narrow = evolution_gate_config_from_mapping({
+            "paper_gate": "relative",
+            "holdout_days": 14,
+            "relative": {"fold_days": 7},
+        })
+        assert narrow.paper_gate == "relative"
+        assert narrow.real_gate == "absolute"
+        assert narrow.relative.fold_days == 14
+        assert any(
+            "fold_days 7 < holdout_days 14" in line
+            for line in narrow.warnings)
+        longer_holdout = evolution_gate_config_from_mapping({
+            "holdout_days": 21,
+        })
+        assert longer_holdout.relative.fold_days == 21
+        assert longer_holdout.paper_gate == "relative"
+        covered = evolution_gate_config_from_mapping({
+            "holdout_days": 14,
+            "relative": {"fold_days": 21},
+        })
+        assert covered.relative.fold_days == 21
+        assert not any("OOS window" in line for line in covered.warnings)
+
 
 class TestDivergentFloorAndDefault:
     def test_min_divergent_folds_out_of_range_uses_the_q2_default(self):
@@ -744,6 +768,107 @@ class TestHoldoutIsNotUsedToPick:
         assert (end - start).days == 14
         assert plain.holdout.fold_days == 14
         assert plain.holdout.end > late
+
+    def test_planted_gap_before_the_midnight_fold_does_not_change_the_pick(
+            self, monkeypatch):
+        """Default 14/14 still leaks ~10h if selection stops at the fold.
+
+        Folds round the last exit up to midnight. The walk-forward
+        holdout starts at the last bar minus 14 days. A 13:45 close
+        leaves 2026-05-18 13:45–2026-05-19 00:00 inside the previous
+        fold. A huge PnL planted there must not move the pick, and the
+        holdout window must start at the bar anchor.
+        """
+        from datetime import datetime, timedelta
+        from types import SimpleNamespace
+
+        from src.backtest.broker import OrderSide, Trade
+        from src.evolution.grid_search import run_grid_on_bars
+        from src.evolution.pipeline import ABResult
+        from src.market_data.models import Bar
+
+        last_exit = datetime(2026, 6, 1, 13, 45)
+        fold_end = datetime(2026, 6, 2)
+        # Eight selection folds, then the midnight holdout fold. The
+        # baseline's last exit is last_exit, so the fold anchor is
+        # fold_end and the bar holdout starts 10h15m earlier.
+        fold_starts = [
+            fold_end - timedelta(days=14 * (9 - i)) for i in range(9)]
+        inside = [start + timedelta(days=3) for start in fold_starts[:8]]
+        inside.append(last_exit)
+        leak = datetime(2026, 5, 18, 18, 0)
+        holdout_anchor = last_exit - timedelta(days=14)
+
+        def _trade(when, pnl):
+            return Trade(
+                tag="L", side=OrderSide.LONG, qty=1, entry_price=1,
+                exit_price=1, entry_bar_index=0, exit_bar_index=1,
+                pnl=int(pnl), exit_dt=when.strftime("%Y-%m-%d %H:%M"))
+
+        def _selection(ema, i):
+            value = {60: 30, 70: 20, 80: 24}.get(int(ema), 1)
+            if i == 0:
+                return value - 1
+            if i == 1:
+                return value + 1
+            return value
+
+        def fake_backtest(strategy_cls, bars, point_value, name,
+                          capital_base=0):
+            ema = int(getattr(strategy_cls(), "ema_period", 50))
+            planted = bars[-1].close >= 90000
+            if ema == 50:
+                trades = [_trade(when, 0) for when in inside]
+            else:
+                trades = [
+                    _trade(inside[i], _selection(ema, i)) for i in range(8)
+                ]
+                trades.append(_trade(inside[8], 5))
+                # Neighbours only. Counted under fold anchoring, this
+                # knocks the centre off the plateau.
+                if planted and ema != 70:
+                    trades.append(_trade(leak, 100000))
+            return ABResult(
+                name=name, result=SimpleNamespace(trades=trades))
+
+        def three_settings(baseline, eligibility, trial=None):
+            return [
+                {"ema_period": 60},
+                {"ema_period": 70},
+                {"ema_period": 80},
+            ]
+
+        monkeypatch.setattr(
+            "src.evolution.pipeline.run_ab_backtest", fake_backtest)
+        monkeypatch.setattr(
+            "src.evolution.grid_search.build_search_settings", three_settings)
+        source = (
+            "from src.backtest.strategy import BacktestStrategy\n\n"
+            + inspect.getsource(DynamicExitPullbackHoldoutProbe)
+        )
+        bars = [
+            Bar(symbol="T", dt=datetime(2026, 1, 1, 9, 0),
+                open=100, high=110, low=90, close=100,
+                volume=1, interval=900),
+            Bar(symbol="T", dt=last_exit,
+                open=100, high=110, low=90, close=90000,
+                volume=1, interval=900),
+        ]
+        outcome = run_grid_on_bars(
+            strategy_cls=DynamicExitPullbackHoldoutProbe,
+            source=source,
+            bars=bars,
+            point_value=1,
+            capital_base=100000,
+            evo={},
+            fold_days=14,
+        )
+        assert outcome.selected == {"ema_period": 70}
+        assert outcome.holdout is not None
+        assert outcome.holdout.start == holdout_anchor.strftime(
+            "%Y-%m-%d %H:%M")
+        assert outcome.holdout.start <= leak.strftime("%Y-%m-%d %H:%M")
+        assert leak.strftime("%Y-%m-%d %H:%M") < outcome.holdout.end
 
 
 class TestNoGridEvidenceUsesAbsolute:

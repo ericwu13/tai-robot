@@ -46,6 +46,7 @@ from .knobs import (
 )
 from .paper_gate import (
     TrialPenaltyConfig,
+    _holdout_days_from_mapping,
     evolution_gate_config_from_mapping,
 )
 from .trial_penalty import (
@@ -656,6 +657,34 @@ def _split_holdout(bounds):
     return list(bounds[:-1]), bounds[-1]
 
 
+def _anchor_bounds(bounds, holdout_start: str):
+    """End selection at the earlier of the last fold and the OOS window.
+
+    Folds round the last exit up to the next midnight, then step back
+    ``fold_days``. The walk-forward holdout is ``bars[-1].dt`` minus
+    ``holdout_days``, which is earlier by the hours left in that day
+    (about 10h when the last bar is the 13:45 day close). That slice
+    sits in the previous fold. Moving the cutoff to the earlier start
+    puts it in the holdout, so selection does not read it.
+    """
+    if not bounds or not holdout_start:
+        return list(bounds)
+    selection, holdout = _split_holdout(bounds)
+    if holdout is None:
+        return list(bounds)
+    last_start, last_end = holdout
+    cutoff = min(last_start, holdout_start)
+    if cutoff >= last_start:
+        return list(bounds)
+    trimmed = []
+    for start, end in selection:
+        if end <= cutoff:
+            trimmed.append((start, end))
+        elif start < cutoff:
+            trimmed.append((start, cutoff))
+    return trimmed + [(cutoff, last_end)]
+
+
 def run_grid_on_bars(
         *,
         strategy_cls,
@@ -674,12 +703,15 @@ def run_grid_on_bars(
     ``fold_days`` is the fold width (``evolution.relative.fold_days``).
     It is not the design holdout length. The last fold is withheld from
     DSR, PBO, and the plateau, and is reported on the chosen point as
-    the OOS check. Trades that exit after the baseline's last exit stay
-    in that holdout window.
+    the OOS check. The selection cutoff is the earlier of that fold's
+    start and the walk-forward holdout (the last bar minus
+    ``holdout_days``), so a midnight-aligned fold cannot keep the tail
+    of the OOS window. Trades that exit after the baseline's last exit
+    stay in that holdout window.
     """
     from src.ai.code_sandbox import load_strategy_from_source
 
-    from .pipeline import run_ab_backtest
+    from .pipeline import holdout_window_start, run_ab_backtest
 
     cfg = evolution_gate_config_from_mapping(evo if isinstance(evo, dict) else {})
     name = getattr(strategy_cls, "__name__", "") or ""
@@ -710,7 +742,11 @@ def run_grid_on_bars(
         return GridOutcome(
             None, reasons_head + (text,), tuple(settings), None, text)
     base_trades = list(base_ab.result.trades or [])
-    raw_bounds = _baseline_bounds(base_trades, int(fold_days), int(max_folds))
+    holdout_days = _holdout_days_from_mapping(
+        evo if isinstance(evo, dict) else {})
+    raw_bounds = _anchor_bounds(
+        _baseline_bounds(base_trades, int(fold_days), int(max_folds)),
+        holdout_window_start(bars, holdout_days))
     selection_bounds, holdout_bound = _split_holdout(raw_bounds)
     if holdout_bound is None or len(selection_bounds) < 2:
         return GridOutcome(

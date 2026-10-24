@@ -175,6 +175,8 @@ evolution:
     effect_size_sigma: 0.25
     min_post_backfill_folds: 2
     post_backfill_start: ""
+    # Must be >= holdout_days. A narrower fold overlaps the OOS window
+    # and falls back to 14, or to holdout_days when that is longer.
     fold_days: 14
   # P2 trial penalty and grid caps. DSR must be strictly above dsr_min
   # and PBO strictly below pbo_max. The caps are hard: a larger
