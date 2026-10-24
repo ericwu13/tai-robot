@@ -177,6 +177,45 @@ evolution:
     bootstrap_resamples: 10000
     bootstrap_seed: 20261024
     fold_days: 14
+  # P5 月閘門。預設維持現況：最新月 = 最新出場月份，閘門 1 固定
+  # 5,000 元寬限，閘門 3 要求 Δ ≥ 0。把 latest_def 改成 merge_stub、
+  # slack.mode 改成 scaled 才啟用新規則。不是憑證。
+  #
+  # P5 month gates. Defaults keep current verdicts: the latest month is
+  # the newest exit month, gate 1 allows a flat 5,000 TWD, and gate 3
+  # requires Δ ≥ 0. Set latest_def to merge_stub and slack.mode to
+  # scaled to enable the new rules. Not a credential.
+  month_gate:
+    # max_exit_month（預設）: 任一側最新出場的 YYYY-MM。
+    # merge_stub: 該月在價格 K 棒裡的不同交易日少於 min_sessions 時，
+    #   併入前一個月。交易日數來自 K 棒開盤日，不看日曆、也不數成交筆數。
+    #
+    # max_exit_month (default): newest YYYY-MM among dated exits.
+    # merge_stub: if that month has fewer than min_sessions distinct
+    #   trading dates in the price bars, fold it into the previous
+    #   month. Dates are bar open dates, not a calendar and not a
+    #   trade count.
+    latest_def: max_exit_month
+    min_sessions: 12
+    slack:
+      # flat（預設）: 閘門 1 用 flat_twd；閘門 3 仍是 Δ ≥ 0。
+      # scaled: 閘門 1 寬限 = clamp(k × σ × sqrt(n), floor, cap)。
+      #   σ 是基準策略在先前月份每筆損益的樣本標準差（n−1）。
+      #   n 是候選策略在該區塊的成交筆數。閘門 3 用 gate3_k × 該寬限
+      #   （預設一半）。
+      #
+      # flat (default): gate 1 uses flat_twd; gate 3 stays Δ ≥ 0.
+      # scaled: gate 1 slack = clamp(k × σ × sqrt(n), floor, cap).
+      #   σ is the sample standard deviation (n−1) of the baseline's
+      #   per-trade PnL in the prior-months block. n is the candidate's
+      #   trade count in that block. Gate 3 uses gate3_k × that slack
+      #   (default half).
+      mode: flat
+      flat_twd: 5000
+      k: 1.0
+      gate3_k: 0.5
+      floor: 3000
+      cap: 15000
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON

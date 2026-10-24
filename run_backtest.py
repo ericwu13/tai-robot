@@ -5748,7 +5748,8 @@ class BacktestApp:
                 run_multifold_validation,
                 format_weekend_verdict_block, format_month_gates_debug,
                 holdout_window_start,
-                eligible_for_validated_pool)
+                eligible_for_validated_pool,
+                month_gate_config_from_mapping)
             from src.evolution.paper_gate import (
                 WeekRecord,
                 abs_pf_required,
@@ -5992,6 +5993,10 @@ class BacktestApp:
                     evolution_gate_raw)
                 for warning in evo_gate_cfg.warnings:
                     _log(f"EVO gate config: {warning}")
+                month_gate_cfg = month_gate_config_from_mapping(
+                    evolution_gate_raw)
+                for warning in month_gate_cfg.warnings:
+                    _log(f"EVO month gate config: {warning}")
                 # Decision time, not a start-of-run snapshot. Running
                 # runner: its trading_mode. Idle or missing: configured
                 # mode only — unknown stays unknown (absolute gate).
@@ -6097,6 +6102,8 @@ class BacktestApp:
                     holdout_start=ho_start,
                     criteria=directives["criteria"],
                     window_verdict=window_verdict,
+                    bars=bars,
+                    month_gate=month_gate_cfg,
                 )
                 verdict = assembled.verdict
                 # assemble_promotion_verdict threads decide_month_gates'

@@ -1,11 +1,12 @@
-"""Issue #154 — partial current month is logged, not re-defined.
+"""Issue #154 — partial current month is logged, not re-defined by default.
 
-The 10-10 Evo1 ema60 PASS is the current rule: ``latest = max(months)``
+The 10-10 Evo1 ema60 PASS is still the default rule: ``latest = max(months)``
 picks the October stub, whose delta is −260 against a +3240 edge
 (−8.0% ≤ 50%). September's +5890 (181.8% of that edge) sits in the
 prior block and clears the ablation floor. This module pins that
-PASS, records the observation, and xfail-pins the desired FAIL until
-CEO latest-month semantics land.
+PASS. P5 ``merge_stub`` (fewer than 12 price-bar sessions) folds the
+stub and that same shape FAILs; that test opts into the config because
+the shipped default stays ``max_exit_month``.
 
 The #153 9/26 gold pin stays in ``test_evolution_issue153`` and must
 still FAIL. Existing PASS fixtures there are not modified.
@@ -18,8 +19,6 @@ import inspect
 import json
 import textwrap
 from pathlib import Path
-
-import pytest
 
 import run_backtest as rb
 from src.backtest.broker import OrderSide, Trade
@@ -225,19 +224,37 @@ class TestShareAppliedTracksPositiveEdge:
 
 
 class TestOctStubDesiredFail:
-    @pytest.mark.xfail(strict=True, reason="pending CEO latest-month semantics")
     def test_partial_october_should_fail_share_cap(self):
         """A short October stub must not be the only month the share cap sees.
 
-        September's +5890 is 181.8% of the +3240 edge. Under CEO
-        latest-month semantics this shape FAILs (calendar-month
-        dominated). Today's ``latest = max(months)`` PASSes, so this
-        test is expected to fail until that definition changes.
+        September's +5890 is 181.8% of the +3240 edge. With
+        ``latest_def=merge_stub`` and 11 distinct October dates in the
+        price bars, October folds into September and this shape FAILs
+        (calendar-month dominated). The default ``max_exit_month`` call
+        still PASSes; that pin is ``TestOctStubCurrentPass``.
         """
-        v = _verdict()
+        from datetime import datetime
+
+        from src.evolution.pipeline import MonthGateConfig
+
+        # Eleven bar-open dates. Not a calendar count and not the one
+        # October trade in the fixture.
+        bars = [type("B", (), {"dt": datetime(2026, 10, day)})()
+                for day in range(1, 12)]
+        data = _load()
+        base, cand = _books(data)
+        v = decide_month_gates(
+            base, cand,
+            holdout_start=data["holdout_start"],
+            bars=bars,
+            month_gate=MonthGateConfig(latest_def="merge_stub"),
+        )
         text = "\n".join(v.reasons)
         assert not v.passed, text
         assert "calendar-month dominated" in text
+        assert v.month_gates["folded_from"] == "2026-10"
+        assert v.month_gates["latest"] == "2026-09"
+        assert v.month_gates["latest_sessions"] == 11
 
 
 class TestIssue153GoldPinStillFails:
