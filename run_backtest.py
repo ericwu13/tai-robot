@@ -6398,8 +6398,9 @@ class BacktestApp:
                         _gate_raw = (dict(evolution_gate_raw)
                                      if isinstance(evolution_gate_raw, dict)
                                      else {})
-                        # Default is a spawn child. `_grid_in_process` is
-                        # the test seam (monkeypatched run_grid_on_bars).
+                        # Default is a spawn child. `_grid_in_process` runs
+                        # the same job on this thread. A parent patch of
+                        # run_grid_on_bars does not apply inside the child.
                         grid_result = run_grid_isolated(
                             GridJob(
                                 source=strategy_source or "",

@@ -13,6 +13,8 @@ import inspect
 import os
 import threading
 import time
+
+import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from src.evolution.grid_process import (
     GridProcessFailure,
     audit_child_imports,
     burn_child_entry,
+    drain_race_child_entry,
     payload_child_entry,
     run_grid_isolated,
     silent_child_entry,
@@ -461,6 +464,98 @@ def test_stop_file_terminates_the_sweep_and_releases_the_guard(
     assert "stop" in rows[0]["reason"].lower()
     assert advanced == []
     assert chat.send_message.call_count == 0
+
+
+def test_final_drain_reads_a_payload_sent_after_the_empty_poll(
+        tmp_path, monkeypatch):
+    """A payload that lands after an empty poll must not be dropped.
+
+    The first poll tells the child to send and exit, waits until that
+    process is dead, then reports an empty pipe without reading. The
+    production final drain is the next poll, with timeout 0. Removing
+    that drain reports "no result" and this assertion fails. A poll
+    that already sees the bytes returns from the main loop and never
+    reaches the drain, so it would not kill that mutant.
+    """
+    import src.evolution.grid_process as gp
+
+    go = tmp_path / "GO"
+    real_poll = gp._poll_message
+    holder: dict = {}
+    reads: list[float] = []
+
+    def _poll(recv_conn, timeout):
+        if not reads and "first" not in holder:
+            holder["first"] = True
+            go.write_text("go\n", encoding="utf-8")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                proc = holder.get("proc")
+                if proc is not None and proc.pid and not proc.is_alive():
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError(
+                    "child was still alive when the empty poll returned")
+            return "empty", None
+        kind, message = real_poll(recv_conn, timeout)
+        if kind == "msg":
+            reads.append(float(timeout))
+        return kind, message
+
+    real_get_context = gp.multiprocessing.get_context
+
+    def _get_context(method=None):
+        ctx = real_get_context(method)
+        real_process = ctx.Process
+
+        def _process(*args, **kwargs):
+            proc = real_process(*args, **kwargs)
+            holder["proc"] = proc
+            return proc
+
+        ctx.Process = _process
+        return ctx
+
+    monkeypatch.setattr(gp, "_poll_message", _poll)
+    monkeypatch.setattr(gp.multiprocessing, "get_context", _get_context)
+    job = GridJob(
+        source="",
+        class_name="",
+        bars=(),
+        point_value=1,
+        capital_base=1,
+        evo={
+            "go_file": str(go),
+            "nbytes": 64,
+            "go_timeout_s": 8,
+        },
+    )
+    result = run_grid_isolated(
+        job,
+        timeout_s=10,
+        entry=drain_race_child_entry,
+        poll_s=0.05,
+    )
+    assert result == b"Q" * 64, result
+    assert reads == [0.0], reads
+
+
+def test_gui_stop_sets_evolution_cancel():
+    """K6: GUI stop raises _evolution_cancel before the rest of teardown.
+
+    The worker test below sets the flag itself. This one calls
+    ``_stop_live``. The flag starts false. Later teardown has nothing
+    to tear down, so it raises, and the flag is already true.
+    """
+    import types
+
+    import run_backtest as rb
+
+    app = types.SimpleNamespace(_evolution_cancel=False)
+    with pytest.raises(AttributeError):
+        rb.BacktestApp._stop_live(app)
+    assert app._evolution_cancel is True
 
 
 def test_gui_stop_flag_terminates_the_sweep(tmp_path, monkeypatch):

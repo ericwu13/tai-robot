@@ -1301,7 +1301,6 @@ def test_reserve_exception_refuses_without_the_grid_and_releases_the_guard(
     from tests.test_evolution_d1_knobs import _chat
     from tests.test_evolution_issue164 import (
         DynamicExitPullbackV3, _DiscordLog, _InlineThread, _wiring_app)
-    import src.evolution.grid_search as grid_mod
     import src.evolution.structural_lane as lane_mod
 
     rb._evolution_guard_clear()
@@ -1320,7 +1319,10 @@ def test_reserve_exception_refuses_without_the_grid_and_releases_the_guard(
     def _boom(*_args, **_kwargs):
         raise RuntimeError("ledger blew up")
 
-    monkeypatch.setattr(grid_mod, "run_grid_on_bars", _grid)
+    # The worker calls run_grid_isolated. Patching run_grid_on_bars
+    # misses that call: the child rebuilds the class before the grid.
+    monkeypatch.setattr(
+        "src.evolution.grid_process.run_grid_isolated", _grid)
     monkeypatch.setattr(lane_mod, "reserve_structural_slot", _boom)
     chat = _chat()
     app = _wiring_app(tmp_path, chat)
@@ -1358,7 +1360,6 @@ def test_structural_saturday_replaces_the_grid_other_saturdays_run_it(
     from tests.test_evolution_d1_knobs import _chat
     from tests.test_evolution_issue164 import (
         DynamicExitPullbackV3, _DiscordLog, _InlineThread, _wiring_app)
-    import src.evolution.grid_search as grid_mod
 
     rb._evolution_guard_clear()
     monkeypatch.setattr(rb, "_discord", _DiscordLog())
@@ -1370,7 +1371,13 @@ def test_structural_saturday_replaces_the_grid_other_saturdays_run_it(
         return types.SimpleNamespace(
             selected=None, reasons=["no plateau"], rationale="", evidence=None)
 
-    monkeypatch.setattr(grid_mod, "run_grid_on_bars", _grid)
+    # Patch the isolation entry the worker actually calls. A parent
+    # patch of run_grid_on_bars does not apply in the spawn child, and
+    # `_grid_in_process` still fails here: the child rebuilds
+    # DynamicExitPullbackV3 from inspect.getsource and reports
+    # "class not found" before the patched grid function runs.
+    monkeypatch.setattr(
+        "src.evolution.grid_process.run_grid_isolated", _grid)
     chat = _chat()
     chat.send_message.return_value = (
         "```json\n{\"action\": \"no_change\"}\n```\n")

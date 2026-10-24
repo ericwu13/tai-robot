@@ -6,7 +6,10 @@
 ``run_grid_on_bars`` path. ``--hang`` sleeps in the spawn child so a
 STOP file or a short ``--timeout-s`` can be checked. ``--timeout-s``
 is this process only. It is not a settings key and it does not change
-the live 20-minute bound.
+the live 20-minute bound. ``--payload-bytes N`` has the child build
+and send an N-byte blob through the real pipe. The blob is not put in
+the pickled job. A result that is not a ``GridOutcome`` exits
+non-zero, including that blob.
 
 The only write is a STOP file path under a fresh temp directory.
 Nothing reads ``settings.yaml`` and nothing is written under ``data/``.
@@ -27,6 +30,7 @@ from src.evolution.grid_process import (
     GridJob,
     GridProcessFailure,
     hang_child_entry,
+    payload_child_entry,
     run_grid_isolated,
 )
 from src.market_data.models import Bar
@@ -97,14 +101,22 @@ def sample_bars(n: int) -> tuple:
     )
 
 
-def _smoke_job(*, bars: int, hang: bool, timeout_s: float) -> GridJob:
+def _smoke_job(
+        *, bars: int, hang: bool, timeout_s: float, payload_bytes: int = 0,
+) -> GridJob:
     evo = {
         "search": "grid_batch",
         "holdout_days": 14,
         "relative": {"fold_days": 14},
         "trial_penalty": {"max_settings": _SMOKE_MAX_SETTINGS},
     }
-    if hang:
+    if payload_bytes:
+        # The child builds the blob. A large bytes object in this dict
+        # would be pickled into the spawn bootstrap pipe and can deadlock
+        # before the child starts.
+        evo["nbytes"] = int(payload_bytes)
+        evo["mode"] = "payload"
+    elif hang:
         # Outlive the parent's timeout so the child is still asleep
         # when STOP or --timeout-s fires.
         evo["hang_seconds"] = max(3600.0, float(timeout_s) + 60.0)
@@ -140,7 +152,9 @@ def _summarize(result) -> tuple[str, str]:
         n = len(result.settings or ())
         selected = result.selected if result.selected else None
         return "ok", _one_line(f"settings={n} selected={selected!s}")
-    return "ok", _one_line(type(result).__name__)
+    # A hang that finishes, or a pipe-test blob, is not trial evidence.
+    # Exit non-zero so a Windows gate cannot treat it as a grid pass.
+    return "crash", _one_line(f"not a grid outcome: {type(result).__name__}")
 
 
 def run_grid_smoke(
@@ -148,6 +162,7 @@ def run_grid_smoke(
         bars: int = _DEFAULT_BARS,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
         hang: bool = False,
+        payload_bytes: int = 0,
         in_process: bool = False,
         stop_dir: str | None = None,
         poll_s: float = 0.2,
@@ -171,7 +186,15 @@ def run_grid_smoke(
             shown = "none" if not pid else str(int(pid))
             echo(f"grid-smoke: child_pid={shown}")
 
-    job = _smoke_job(bars=bars, hang=hang, timeout_s=timeout_s)
+    job = _smoke_job(
+        bars=bars, hang=hang, timeout_s=timeout_s,
+        payload_bytes=payload_bytes)
+    if payload_bytes:
+        entry = payload_child_entry
+    elif hang:
+        entry = hang_child_entry
+    else:
+        entry = None
     started = time.monotonic()
     result = run_grid_isolated(
         job,
@@ -179,7 +202,7 @@ def run_grid_smoke(
         stop_check=_stop,
         in_process=in_process,
         poll_s=poll_s,
-        entry=hang_child_entry if hang else None,
+        entry=entry,
         on_start=_started,
     )
     elapsed = time.monotonic() - started
@@ -225,6 +248,16 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         "--hang", action="store_true",
         help="sleep in the child instead of running the grid, for STOP and timeout checks",
     )
+    parser.add_argument(
+        "--payload-bytes", type=int, default=0,
+        help=(
+            "child sends this many bytes through the real pipe "
+            "(built in the child, not in the pickled job). "
+            "Use a value over 8192 to pass the Windows pipe buffer. "
+            "Not a settings key. The result is not a grid outcome, "
+            "so the process exits non-zero."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -240,16 +273,29 @@ def main(argv: list[str] | None = None) -> int:
         # argparse uses exit status 2. Timeout also uses 2, so a bad
         # flag must not look like a smoke timeout.
         return 1
-    if args.bars < 1 or args.timeout_s <= 0:
+    if args.bars < 1 or args.timeout_s <= 0 or args.payload_bytes < 0:
         print("grid-smoke: outcome=usage", flush=True)
-        print("grid-smoke: detail=--bars must be >= 1 and --timeout-s must be > 0",
+        print("grid-smoke: detail=--bars must be >= 1, --timeout-s must be > 0, "
+              "and --payload-bytes must be >= 0",
+              flush=True)
+        return _EXIT["usage"]
+    if args.hang and args.payload_bytes:
+        print("grid-smoke: outcome=usage", flush=True)
+        print("grid-smoke: detail=--hang and --payload-bytes cannot be combined",
               flush=True)
         return _EXIT["usage"]
 
     stop_dir = tempfile.mkdtemp(prefix="tai-grid-smoke-")
     stop_file = os.path.join(stop_dir, _STOP_NAME)
-    mode = "hang" if args.hang else "grid"
+    if args.payload_bytes:
+        mode = "payload"
+    elif args.hang:
+        mode = "hang"
+    else:
+        mode = "grid"
     print(f"grid-smoke: mode={mode}", flush=True)
+    if args.payload_bytes:
+        print(f"grid-smoke: payload_bytes={int(args.payload_bytes)}", flush=True)
     print(f"grid-smoke: stop_file={stop_file}", flush=True)
     print(f"grid-smoke: timeout_s={args.timeout_s:g}", flush=True)
     print("grid-smoke: note=timeout is this process only; not a settings key",
@@ -262,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
         bars=args.bars,
         timeout_s=args.timeout_s,
         hang=args.hang,
+        payload_bytes=int(args.payload_bytes),
         in_process=False,
         stop_dir=stop_dir,
         echo=_echo,

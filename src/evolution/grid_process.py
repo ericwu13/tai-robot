@@ -7,9 +7,16 @@ runs the same function in a ``spawn`` child and waits on this thread.
 
 Spawn is required. Linux would otherwise fork a process that already
 owns Tk and COM. Windows and a PyInstaller frozen EXE only support
-spawn. The child imports this module. The module import is stdlib
-only, so the child does not import Tk, COM, the Capital API, or start
-a bot. The grid stack is imported inside the child function.
+spawn.
+
+Importing this module loads only the stdlib (multiprocessing, os,
+time, traceback, dataclasses). That does not keep the child off every
+other import. ``grid_child_entry`` imports the evolution grid stack,
+and that stack imports the backtest code it needs. The child must not
+import Tk, COM/comtypes, the Capital API, or the live bot
+(``run_backtest``, ``src.live``, ``src.ui``). Those are the imports
+``audit_child_imports`` treats as forbidden. The grid stack itself is
+expected.
 
 The job is picklable (bars, strategy source, class name, grid config).
 The child returns a picklable ``GridOutcome``, including trial evidence.
@@ -168,6 +175,34 @@ def payload_child_entry(job: GridJob, conn) -> None:
 def silent_child_entry(job: GridJob, conn) -> None:
     """Exit without a result. Tests the empty-pipe crash. Not used by the bot."""
     return
+
+
+def drain_race_child_entry(job: GridJob, conn) -> None:
+    """Send a small payload after a go-file appears, then exit.
+
+    Tests the parent's final non-blocking read. Not used by the bot.
+    The parent creates the go-file from inside an empty poll and does
+    not read until this process has exited, so the payload is waiting
+    in the pipe when the liveness check first sees a dead child. The
+    blob is built here. It is not part of the pickled job.
+    """
+    evo = job.evo if isinstance(job.evo, dict) else {}
+    path = str(evo.get("go_file") or "")
+    deadline = time.monotonic() + float(evo.get("go_timeout_s", 8))
+    while time.monotonic() < deadline:
+        if path and os.path.isfile(path):
+            break
+        time.sleep(0.01)
+    else:
+        return
+    blob = b"Q" * int(evo.get("nbytes", 32))
+    try:
+        conn.send(("ok", blob))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def hang_child_entry(job: GridJob, conn) -> None:
@@ -415,10 +450,12 @@ def run_grid_isolated(
     that exits without a message is a crash with no trial evidence.
     The Tk thread is not this thread.
 
-    ``in_process=True`` runs ``entry`` on the calling thread. Tests
-    set it so a monkeypatched ``run_grid_on_bars`` stays in-process.
-    The live worker leaves it false. ``on_start`` is called with the
-    child pid after spawn, or with None on the in-process path.
+    ``in_process=True`` runs ``entry`` on the calling thread. The live
+    worker leaves it false. That path still rebuilds the strategy
+    class from source before ``run_grid_on_bars``, so a parent
+    monkeypatch of ``run_grid_on_bars`` is not a substitute for
+    patching this function. ``on_start`` is called with the child pid
+    after spawn, or with None on the in-process path.
     """
     fn = grid_child_entry if entry is None else entry
     if in_process:
