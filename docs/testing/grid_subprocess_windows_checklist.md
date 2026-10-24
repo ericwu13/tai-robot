@@ -1,13 +1,13 @@
 # Windows frozen-EXE checklist — grid sweep subprocess
 
 Operator checklist for the spawn-child grid sweep (PR #194, code commit
-`e919dd162e4158b9ea4343cb5cd859def613f1f6`).
+`cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb`).
 
 Run this on the Windows test host **oreopie**, and only inside
 `C:\tai-test-194\`. That folder is a fresh copy. It does not log into
 the broker and it does not use a chat API key.
 
-The binary under test is built from `e919dd162e4158b9ea4343cb5cd859def613f1f6`.
+The binary under test is built from `cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb`.
 This checklist is a later docs commit on the same branch. Do not build
 from a dirty tree, and do not publish a GitHub release.
 
@@ -66,7 +66,7 @@ do not run it.
 - The test EXE is `C:\tai-test-194\app\tai_backtest.exe`. Leave every
   other `tai_backtest.exe` running.
 
-## Build (clean venv, pinned spec, commit e919dd1)
+## Build (clean venv, pinned spec, commit cf58c7c)
 
 No GitHub Actions workflow builds this EXE. Build it on oreopie, inside
 the test folder. The spec is `tai_backtest.spec` (PyInstaller `--onedir`,
@@ -88,9 +88,9 @@ cd C:\tai-test-194
 git clone https://github.com/ericwu13/tai-robot.git src
 cd C:\tai-test-194\src
 git fetch origin
-git checkout e919dd162e4158b9ea4343cb5cd859def613f1f6
+git checkout cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb
 git rev-parse HEAD
-# expect e919dd162e4158b9ea4343cb5cd859def613f1f6
+# expect cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb
 
 if (-not (Test-Path .\src\strategies)) {
   New-Item -ItemType Directory -Force .\src\strategies | Out-Null
@@ -111,7 +111,7 @@ Copy-Item settings.example.yaml settings.yaml
 python build_release.py --skip-release
 ```
 
-Pass: `git rev-parse HEAD` prints `e919dd162e4158b9ea4343cb5cd859def613f1f6`,
+Pass: `git rev-parse HEAD` prints `cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb`,
 `python -m pip show pyinstaller` prints Version 6.19.0,
 `python -m pip show comtypes` prints Version 1.4.15,
 PyInstaller exits 0, and these exist:
@@ -133,7 +133,7 @@ Copy-Item -Recurse C:\tai-test-194\src\dist\tai_backtest C:\tai-test-194\app
 ## What the smoke entry does
 
 ```text
-C:\tai-test-194\app\tai_backtest.exe --grid-subprocess-smoke [--bars N] [--timeout-s S] [--hang]
+C:\tai-test-194\app\tai_backtest.exe --grid-subprocess-smoke [--bars N] [--timeout-s S] [--hang] [--payload-bytes N]
 ```
 
 This exits before Tk and COM. It does not read `settings.yaml`, does not
@@ -150,6 +150,12 @@ memory and calls `run_grid_isolated` (spawn).
 - `--timeout-s S` is the wait for this process only. It is not a
   `settings.yaml` key and it does not change the live bot's 20-minute
   grid timeout. The smoke default when the flag is omitted is 120 seconds.
+- `--payload-bytes N` makes the child build and send an N-byte blob
+  through the real spawn pipe. The blob is not in the pickled job.
+  That result is not a `GridOutcome`, so the process exits **1**
+  (`outcome=crash`, detail `not a grid outcome`). Exit 1 here means
+  the pipe carried the blob. Exit 2 means the wait timed out, which
+  is a failure for this gate. Do not combine it with `--hang`.
 
 The process prints these lines, flushed as they happen:
 
@@ -362,6 +368,37 @@ Pass:
 Fail: the child is still alive after about 15 seconds, the outcome is
 not `timeout`, or the run waited the live 20-minute bound.
 
+## (f) Payload larger than the 8 KB Windows pipe
+
+The parent must read the result while the child is still running. A
+blob bigger than the Windows pipe buffer (8 KB) used to block the child
+in `send`. This step uses the smoke flag. It does not need a chat API
+key and it does not run the grid.
+
+```powershell
+cd C:\tai-test-194\app
+.\tai_backtest.exe --grid-subprocess-smoke --payload-bytes 70000 --timeout-s 60
+echo "exit=$LASTEXITCODE"
+```
+
+`70000` is over 8 KB. The child builds those bytes. They are not in the
+pickled job.
+
+Pass:
+
+- The process returns within well under 60 seconds. It does not hang.
+- Exit code is **1**, not 0 and not 2.
+- Output contains `grid-smoke: mode=payload`, `payload_bytes=70000`,
+  `outcome=crash`, and `not a grid outcome`.
+- `result_bytes` is greater than 70000 (the printed size is the pickled
+  blob, which is slightly larger than the raw bytes).
+- The `--multiprocessing-fork` PID is gone afterwards.
+- No Tk window, no broker login, no API-key prompt.
+
+Fail: the process hits `outcome=timeout` or is still alive at 60 seconds,
+`result_bytes` is under 70000, or the exit code is 0. Exit code 0 would
+mean the smoke treated a non-grid payload as a grid pass.
+
 ## Cleanup — test PIDs only
 
 When the notes are done, a smoke process should already have exited. If
@@ -391,7 +428,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'tai_backtest.exe'" |
 ```
 host: oreopie
 test root: C:\tai-test-194\
-commit built: e919dd162e4158b9ea4343cb5cd859def613f1f6
+commit built: cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb
 BUILD_INFO.json commit / dirty:
 pyinstaller version (must be 6.19.0):
 comtypes version (must be 1.4.15):
@@ -429,6 +466,13 @@ grid mode: outcome / result_bytes / detail:
 (e) elapsed_s:
 (e) child gone (yes/no):
 (e) settings key or env var used to shorten the live timeout (must be no):
+
+(f) command: --grid-subprocess-smoke --payload-bytes 70000 --timeout-s 60
+(f) exit code (must be 1, not 0 or 2):
+(f) outcome=crash and "not a grid outcome" (yes/no):
+(f) result_bytes (must be > 70000):
+(f) returned without hanging (yes/no):
+(f) child gone (yes/no):
 
 cleanup: Stop-Process -Id used only for ExecutablePath under C:\tai-test-194\ (yes/no)
 taskkill /IM or Stop-Process -Name used (must be no):
