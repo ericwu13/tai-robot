@@ -7738,6 +7738,9 @@ class BacktestApp:
             self._tick_watchdog.on_session_resubscribe()
 
         elif action == "reconnect":
+            # Fast ladder and the stood-down slow retry both return this
+            # action, so both use the #178 path below: _on_disconnected
+            # notes the link host. There is no second reconnect mechanism.
             _log_debug(
                 f"[WATCHDOG] action=reconnect — elapsed={mins}m > RECONNECT_TIMEOUT, "
                 "forcing _on_disconnected()")

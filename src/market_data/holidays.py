@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import holidays as _holidays
+import yaml
 
 
 _logger = logging.getLogger(__name__)
@@ -137,8 +138,38 @@ def _parse_closure_dates(text: str) -> frozenset[date]:
     return frozenset(found)
 
 
+def _dates_from_yaml_node(node) -> set[date]:
+    """Dates yaml.safe_load already resolved, plus ISO dates inside strings.
+
+    ``datetime`` is a ``date`` subclass, so it is handled first. A bad
+    token inside one string is skipped by ``_parse_closure_dates``.
+    """
+    found: set[date] = set()
+    if node is None or isinstance(node, (bool, int, float)):
+        return found
+    if isinstance(node, datetime):
+        found.add(node.date())
+    elif isinstance(node, date):
+        found.add(node)
+    elif isinstance(node, str):
+        found.update(_parse_closure_dates(node))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            found.update(_dates_from_yaml_node(item))
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            found.update(_dates_from_yaml_node(key))
+            found.update(_dates_from_yaml_node(value))
+    return found
+
+
 def load_closure_override_dates() -> frozenset[date]:
-    """Dates in the closures file. Empty when the file is missing or unreadable."""
+    """Dates in the closures file. Empty when the file is missing or unreadable.
+
+    A missing file is silent. Bad bytes, a ``ValueError``, or a YAML
+    parse error log one warning and yield no dates — the line regex does
+    not run on a document YAML refused.
+    """
     global _closures_cache
     path = closures_override_path()
     key = str(path)
@@ -152,10 +183,11 @@ def load_closure_override_dates() -> frozenset[date]:
         return _closures_cache[2]
     try:
         text = path.read_text(encoding="utf-8-sig")
-    except OSError as exc:
+        loaded = yaml.safe_load(text)
+        dates = _parse_closure_dates(text) | _dates_from_yaml_node(loaded)
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
         _logger.warning("closures override unreadable, ignoring it: %s", exc)
-        return frozenset()
-    dates = _parse_closure_dates(text)
+        dates = frozenset()
     _closures_cache = (key, mtime_ns, dates)
     return dates
 

@@ -1,7 +1,9 @@
 """Issue #179: emergency closures must not reconnect all session.
 
-Pre-fix, TickWatchdog.check returned "reconnect" for the whole scheduled
-session whenever the feed was silent. A closures file did not exist, so
+Pre-fix, TickWatchdog.check returned "reconnect" about every 10 minutes
+whenever the schedule said open. After N fast reconnects the watchdog
+retries on a slow interval (same reconnect action). A date listed in the
+closures file costs no reconnects. A closures file did not exist, so
 is_taifex_holiday could not express a typhoon day.
 """
 
@@ -10,7 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,7 @@ from src.market_data.holidays import (
     _parse_closure_dates,
     closures_override_path,
     is_taifex_holiday,
+    load_closure_override_dates,
 )
 
 
@@ -71,10 +74,11 @@ def _drive(wd: TickWatchdog, start: datetime, end: datetime, *, history: bool):
 
 
 class TestZeroTickStanddown:
-    """A simulated closed day reconnects at most N times, then idles."""
+    """A silent session does N fast reconnects, then slow ones, until the next open."""
 
     @pytest.mark.parametrize("limit,history", [(1, False), (3, False), (1, True), (3, True)])
-    def test_closed_day_at_most_n_then_none_until_next_open(self, limit, history):
+    def test_dead_session_slow_retries_at_the_interval(self, limit, history):
+        interval = TickWatchdog.SLOW_RETRY_INTERVAL
         wd = TickWatchdog(zero_tick_reconnect_limit=limit)
         wd.active = True
         # Friday 2026-10-23: schedule says open (typhoon day was not a
@@ -89,26 +93,41 @@ class TestZeroTickStanddown:
         reconnects = [t for t, action, _stood in actions if action == "reconnect"]
         before = [t for t in reconnects if t < next_open]
         after = [t for t in reconnects if t >= next_open]
+        fast, slow = before[:limit], before[limit:]
 
-        assert len(before) == limit
-        assert max(before) < _ts(_taipei_dt(2026, 10, 23, 12, 0))
-        # The climb after reconnect N still warns until the next reconnect
-        # would fire; that decision stands down. From then until the next
-        # open the watchdog is idle.
-        idle = [
+        assert len(fast) == limit
+        assert max(fast) < _ts(_taipei_dt(2026, 10, 23, 12, 0))
+        # No clock reset: every later poll is already past the 10-min
+        # timeout, so the fast ones are one poll apart. History replay
+        # restarts the clock, so the next fast one waits out the timeout.
+        fast_step = 630 if history else 30
+        assert [fast[i + 1] - fast[i] for i in range(len(fast) - 1)] == (
+            [fast_step] * (limit - 1)
+        )
+        assert slow
+        assert slow[0] - fast[-1] == interval
+        assert [slow[i + 1] - slow[i] for i in range(len(slow) - 1)] == (
+            [interval] * (len(slow) - 1)
+        )
+        # While stood down the only action is the slow reconnect. Warn
+        # and resubscribe belong to the fast ladder.
+        while_down = [
             action for t, action, stood in actions
-            if stood and max(before) < t < next_open
+            if stood and fast[-1] < t < next_open
         ]
-        assert idle
-        assert set(idle) == {None}
+        assert set(while_down) <= {None, "reconnect"}
+        assert "reconnect" in while_down
 
-        # Next session open resets the counter, so a still-silent feed
-        # may reconnect again, and only up to N.
+        # Next session open restores the fast ladder, so a still-silent
+        # feed may reconnect again, and only up to N before 15:25.
         assert 1 <= len(after) <= limit
 
-    def test_default_limit_is_provisional_three(self):
+    def test_default_limits_are_provisional(self):
         assert TickWatchdog.ZERO_TICK_RECONNECT_LIMIT == 3
-        assert TickWatchdog().zero_tick_reconnect_limit == 3
+        assert TickWatchdog.SLOW_RETRY_INTERVAL == 30 * 60
+        wd = TickWatchdog()
+        assert wd.zero_tick_reconnect_limit == 3
+        assert wd.slow_retry_interval == 30 * 60
 
     def test_live_tick_breaks_the_consecutive_streak(self):
         wd = TickWatchdog(zero_tick_reconnect_limit=2)
@@ -140,9 +159,10 @@ class TestZeroTickStanddown:
         assert action == "reconnect"
         action, _t = _check_at(wd, tick, 730)
         assert action is None
-        # Saturday 02:00 is still Friday's night session.
+        # Saturday 02:00 is still Friday's night session, so the slow
+        # retry fires. It is not a new session and not a weekend holiday.
         action, _t = _check_at(wd, _taipei_dt(2026, 10, 24, 2, 0))
-        assert action is None
+        assert action == "reconnect"
         # Monday day open is the next session.
         action, _t = _check_at(wd, _taipei_dt(2026, 10, 26, 8, 50))
         assert action == "session_resubscribe"
@@ -175,10 +195,61 @@ class TestZeroTickStanddown:
         with _patch_now(dt):
             assert wd.check(now=_ts(dt)) == "reconnect"
 
+    def test_live_tick_restores_the_fast_ladder(self):
+        wd = TickWatchdog(zero_tick_reconnect_limit=1, slow_retry_interval=1800)
+        wd.active = True
+        start = _taipei_dt(2026, 10, 23, 9, 0)
+        wd.last_tick_time = _ts(start)
+        action, _t = _check_at(wd, start, 700)
+        assert action == "reconnect"
+        assert wd._stood_down is True
+
+        # Still inside the slow interval: no blind reconnect, no fast rung.
+        action, _t = _check_at(wd, start, 760)
+        assert action is None
+
+        tick_at = _ts(start) + 800
+        tick_dt = datetime.fromtimestamp(tick_at, tz=_TZ_TAIPEI)
+        with _patch_now(tick_dt), patch("src.live.tick_watchdog.time.time", return_value=tick_at):
+            wd.on_tick()
+        assert wd._stood_down is False
+        assert wd._zero_tick_reconnects == 0
+        assert wd._last_slow_retry_at is None
+
+        # Normal mode is the fast ladder again, well before the 30-min mark.
+        action, _t = _check_at(wd, start, 800 + 150)
+        assert action == "warn"
+        action, _t = _check_at(wd, start, 800 + 360)
+        assert action == "resubscribe"
+        action, _t = _check_at(wd, start, 800 + 700)
+        assert action == "reconnect"
+        assert 700 < wd.slow_retry_interval
+
+    def test_same_timestamp_counts_once(self):
+        wd = TickWatchdog(zero_tick_reconnect_limit=3)
+        wd.active = True
+        dt = _taipei_dt(2026, 10, 23, 10, 0)
+        t = _ts(dt)
+        wd.last_tick_time = t - 700
+        with _patch_now(dt):
+            assert wd.check(now=t) == "reconnect"
+            assert wd.check(now=t) == "reconnect"
+        assert wd._zero_tick_reconnects == 1
+
     def test_stale_replay_is_not_passed_as_a_live_tick(self):
         text = (Path(__file__).resolve().parents[1] / "run_backtest.py").read_text(
             encoding="utf-8")
         assert "live=tick_age <= HISTORY_STALENESS_SECONDS" in text
+
+    def test_slow_retry_uses_the_link_host_reconnect_path(self):
+        text = (Path(__file__).resolve().parents[1] / "run_backtest.py").read_text(
+            encoding="utf-8")
+        start = text.index('elif action == "reconnect":')
+        handler = text[start:text.index('elif action == "resubscribe":')]
+        assert "_on_disconnected()" in handler
+        disc = text.index("def _on_disconnected")
+        body = text[disc:text.index("def _manual_reconnect")]
+        assert "note_connection" in body
 
 
 @pytest.fixture
@@ -260,3 +331,60 @@ class TestClosureOverride:
         path = closures_override_path()
         assert path.name == "taifex_closures.yaml"
         assert path.parent == Path(__file__).resolve().parents[1]
+
+    def test_non_utf8_bytes_return_no_dates_and_warn(self, closure_file, caplog):
+        # A latin-1 fallback would keep the date. UTF-8 must not.
+        closure_file.write_bytes(b"\xff\xfe2026-04-16\n")
+        with caplog.at_level(logging.WARNING, logger="src.market_data.holidays"):
+            assert load_closure_override_dates() == frozenset()
+            assert is_taifex_holiday(date(2026, 4, 16)) is False
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "unreadable" in warnings[0].getMessage()
+
+    def test_yaml_parse_error_returns_no_dates_and_warns(self, closure_file, caplog):
+        # The first line is a real date. A regex fallback would keep it.
+        closure_file.write_text("2026-04-16\n:\n  - [\n", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="src.market_data.holidays"):
+            assert load_closure_override_dates() == frozenset()
+            assert is_taifex_holiday(date(2026, 4, 16)) is False
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "unreadable" in warnings[0].getMessage()
+
+    def test_value_error_returns_no_dates_and_warns(self, closure_file, caplog, monkeypatch):
+        closure_file.write_text("2026-04-16\n", encoding="utf-8")
+        real = Path.read_text
+
+        def boom(self, *args, **kwargs):
+            if self == closure_file:
+                raise ValueError("bad closure value")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        with caplog.at_level(logging.WARNING, logger="src.market_data.holidays"):
+            assert load_closure_override_dates() == frozenset()
+            assert is_taifex_holiday(date(2026, 4, 16)) is False
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+
+
+class TestListedClosureCostsNoReconnects:
+    def test_listed_date_costs_zero_reconnects(self, closure_file, caplog):
+        closure_file.write_text("2026-10-23\n", encoding="utf-8")
+        wd = TickWatchdog(zero_tick_reconnect_limit=1, slow_retry_interval=1800)
+        wd.active = True
+        start = _taipei_dt(2026, 10, 23, 9, 0)
+        wd.last_tick_time = _ts(start)
+        with caplog.at_level(logging.WARNING, logger="src.market_data.holidays"):
+            for delta in (700, 700 + 1800, 700 + 3600):
+                action, _t = _check_at(wd, start, delta)
+                assert action is None
+            # Same open date's night session is the same closure.
+            night = _taipei_dt(2026, 10, 23, 22, 0)
+            wd.last_tick_time = _ts(night) - timedelta(hours=2).total_seconds()
+            action, _t = _check_at(wd, night)
+            assert action is None
+        assert wd._zero_tick_reconnects == 0
+        holiday_logs = [r for r in caplog.records if r.getMessage().startswith("holiday")]
+        assert holiday_logs

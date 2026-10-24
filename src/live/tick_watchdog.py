@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from .live_runner import is_market_open, minutes_until_session_close, _TZ_TAIPEI
 
 _logger = logging.getLogger(__name__)
+
+# A holidays failure must not kill check(). Warned once, then the ladder
+# runs as if no closure file were present.
+_closure_check_broken = False
 
 
 def _crossed_session_gap(last_ts: float, now_ts: float) -> bool:
@@ -85,6 +89,43 @@ def _scheduled_session_key(dt: datetime | None = None) -> str | None:
     return f"{dt.date().isoformat()}|NIGHT"
 
 
+def _session_open_date(dt: datetime | None = None) -> date | None:
+    """OPEN date of the scheduled session, or None when the schedule is closed."""
+    key = _scheduled_session_key(dt)
+    if key is None:
+        return None
+    return date.fromisoformat(key.split("|", 1)[0])
+
+
+def _closure_blocks() -> bool:
+    """True when this session's open date is listed as an emergency closure.
+
+    Only the closures file blocks reconnects. The static holiday calendar
+    stays out of this decision: a public holiday still looks open on the
+    schedule, and Saturday is a holiday in that calendar while Friday
+    night is still trading until 05:00. A listed date calls
+    ``is_taifex_holiday`` so the existing ``holiday`` log still fires.
+    A weekend session date is never blocked here.
+    """
+    global _closure_check_broken
+    open_day = _session_open_date()
+    if open_day is None or open_day.weekday() >= 5:
+        return False
+    try:
+        from ..market_data.holidays import (
+            is_taifex_holiday,
+            load_closure_override_dates,
+        )
+        if open_day not in load_closure_override_dates():
+            return False
+        return bool(is_taifex_holiday(open_day))
+    except Exception as exc:
+        if not _closure_check_broken:
+            _closure_check_broken = True
+            _logger.warning("closure stand-down check failed: %s", exc)
+        return False
+
+
 class TickWatchdog:
     """Monitors tick freshness and decides when to resubscribe or reconnect.
 
@@ -106,13 +147,18 @@ class TickWatchdog:
     RECONNECT_TIMEOUT = 600      # 10 min: full reconnect (re-login)
     RESUBSCRIBE_COOLDOWN = 180   # 3 min: don't retry resubscribe within this window
     NEAR_CLOSE_SUPPRESS = 10     # suppress within 10 min of session close
-    # Consecutive reconnects that produced no live tick before this watchdog
-    # stops asking and idles until the next scheduled session opens.
-    # Provisional (issue #179): PENDING CEO decision. 3 is a conservative
-    # per-session cap — a few attempts, then stop hammering a silent feed.
+    # Consecutive fast reconnects that produced no live tick. After this
+    # the watchdog keeps using the same reconnect action, but on a slow
+    # interval, until the next scheduled session opens or a live tick
+    # arrives. Both numbers are provisional (issue #179): PENDING CEO.
     ZERO_TICK_RECONNECT_LIMIT = 3
+    SLOW_RETRY_INTERVAL = 30 * 60
 
-    def __init__(self, zero_tick_reconnect_limit: int | None = None):
+    def __init__(
+        self,
+        zero_tick_reconnect_limit: int | None = None,
+        slow_retry_interval: int | None = None,
+    ):
         self.active: bool = False
         self.last_tick_time: float = 0.0
         self.grace_until: float = 0.0   # suppress warnings until this time
@@ -127,20 +173,27 @@ class TickWatchdog:
             if zero_tick_reconnect_limit is None
             else int(zero_tick_reconnect_limit)
         )
+        self.slow_retry_interval: int = (
+            self.SLOW_RETRY_INTERVAL
+            if slow_retry_interval is None
+            else int(slow_retry_interval)
+        )
         self._zero_tick_reconnects: int = 0
         self._stood_down: bool = False
         self._stand_down_session: str | None = None
         self._last_reconnect_counted_at: float | None = None
+        self._last_slow_retry_at: float | None = None
 
     def on_tick(self, *, live: bool = True) -> None:
         """Call when a tick is received (live or history).
 
         Restarts the staleness clock and the resubscribe cooldown. A live
-        tick clears the zero-tick reconnect streak (issue #179): the feed
-        is alive, so the failures were not consecutive. A history-replay
-        tick (``live=False``) restarts the clock only. Stale replay is how
-        a closed day still reconnects about every 10 minutes; counting
-        those as live would make the stand-down unreachable.
+        tick restores normal mode (issue #179): the streak, the stand-down,
+        and the slow-retry anchor are cleared, so the fast ladder runs
+        again. A history-replay tick (``live=False``) restarts the clock
+        only. Stale replay is how a closed day still reconnects about
+        every 10 minutes; counting those as live would make the cap
+        unreachable.
         """
         self.last_tick_time = time.time()
         self.last_resubscribe = 0.0
@@ -197,6 +250,7 @@ class TickWatchdog:
         self._stood_down = False
         self._stand_down_session = None
         self._last_reconnect_counted_at = None
+        self._last_slow_retry_at = None
 
     def _release_standdown_on_new_session(self) -> bool:
         """Clear stand-down when a later scheduled session is open.
@@ -213,7 +267,7 @@ class TickWatchdog:
         return True
 
     def _note_zero_tick_reconnect(self, now: float) -> str | None:
-        """Count one reconnect decision. Idle once the cap is passed.
+        """Count one fast reconnect. The Nth one arms the slow retry.
 
         The same ``now`` does not count twice. Repeated polls while the
         clock stays stale each count: with no ticks at all, ``check``
@@ -223,24 +277,53 @@ class TickWatchdog:
             self._zero_tick_reconnects += 1
             self._last_reconnect_counted_at = now
         if self._zero_tick_reconnects > self.zero_tick_reconnect_limit:
-            self._enter_standdown()
+            self._enter_standdown(now)
             return None
-        # The Nth reconnect is still issued. Later checks idle, including
+        # The Nth reconnect is still issued, and it anchors the slow
+        # retry. Later checks in this session use that interval, including
         # when a history replay restarts the staleness clock.
         if self._zero_tick_reconnects == self.zero_tick_reconnect_limit:
-            self._enter_standdown()
+            self._enter_standdown(now)
         return "reconnect"
 
-    def _enter_standdown(self) -> None:
+    def _enter_standdown(self, now: float) -> None:
         if self._stood_down:
             return
         self._stood_down = True
         self._stand_down_session = _scheduled_session_key(_schedule_now())
+        self._last_slow_retry_at = now
         _logger.warning(
-            "zero-tick reconnect stand-down after %s reconnects "
-            "until next session open",
+            "zero-tick reconnect stand-down after %s reconnects; "
+            "slow retry every %ss until a live tick or the next session",
             self.zero_tick_reconnect_limit,
+            self.slow_retry_interval,
         )
+
+    def _slow_retry(self, now: float) -> str | None:
+        """Same ``reconnect`` action as the fast ladder, on a slow cadence.
+
+        The anchor is the Nth fast reconnect (or the previous slow one).
+        Returning ``reconnect`` keeps the #178 path: the caller hands it
+        to ``_on_disconnected``, which notes the link host.
+        """
+        anchor = self._last_slow_retry_at
+        if anchor is not None and now - anchor < self.slow_retry_interval:
+            return None
+        self._last_slow_retry_at = now
+        return "reconnect"
+
+    def _check_slow_retry(self, now: float | None) -> str | None:
+        """Slow reconnect while stood down in the same scheduled session."""
+        if not is_market_open():
+            return None
+        mins_left = minutes_until_session_close(self.order_symbol)
+        if mins_left is None or mins_left <= self.NEAR_CLOSE_SUPPRESS:
+            return None
+        if now is None:
+            now = time.time()
+        if now < self.grace_until:
+            return None
+        return self._slow_retry(now)
 
     def check(self, now: float | None = None) -> str | None:
         """Check tick health and return the action needed.
@@ -256,17 +339,22 @@ class TickWatchdog:
             "reconnect" — no ticks for >10min, force full reconnect
             "session_resubscribe" — new session opened, resubscribe immediately
 
-        After ``zero_tick_reconnect_limit`` consecutive reconnects with no
-        live tick, returns None (idle) until the next scheduled session
-        opens, then the counter resets (issue #179).
+        After ``zero_tick_reconnect_limit`` consecutive fast reconnects
+        with no live tick, further reconnects in this session fire at
+        ``slow_retry_interval`` (issue #179). A live tick or the next
+        scheduled session open restores the fast ladder. A date listed
+        in the closures file returns None and costs no reconnects.
         """
         if not self.active or not self.last_tick_time:
+            return None
+        # Listed emergency closure: do not spend a fast or slow reconnect.
+        if _closure_blocks():
             return None
         # Side effect: a new open session clears stand-down before the
         # ladder runs, so the open can resubscribe and, if still silent,
         # reconnect again up to the cap.
         if self._stood_down and not self._release_standdown_on_new_session():
-            return None
+            return self._check_slow_retry(now)
         if not is_market_open():
             return None
 
@@ -318,7 +406,8 @@ class TickWatchdog:
 
         # Reconnect wins unconditionally once we hit the threshold —
         # cooldown does NOT suppress escalation. The zero-tick cap does:
-        # past N silent reconnects we idle instead of forcing another.
+        # past N silent reconnects the same action waits for the slow
+        # interval instead of firing on every poll.
         if elapsed > self.RECONNECT_TIMEOUT:
             return self._note_zero_tick_reconnect(now)
 
