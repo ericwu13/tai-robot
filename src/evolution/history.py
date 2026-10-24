@@ -67,8 +67,17 @@ these names:
   ``insufficient_bars``, ``validation``, ``pipeline_error`` → ``fail``
   or, for a clean validation pass, ``pass``
 
-A write error is logged and swallowed. Readers skip a missing file,
-an undecodable file, and any line that is not a JSON object.
+A write error is logged and swallowed. ``os.replace`` retries
+``PermissionError`` (Windows WinError 5) with the heartbeat writer's
+bounded backoff (``replace_retrying_permission_error``). The final
+failure is a warning and does not propagate into the evolution run.
+Readers skip a missing file, an undecodable file, and any line that
+is not a JSON object.
+
+The file is not size-capped and is not rotated. One line per attempt
+is small, and trimming it would drop weeks ``weeks_from_history``
+still needs. Delete or archive the file by hand if it ever needs a
+bound. There is no settings key for a cap.
 """
 
 from __future__ import annotations
@@ -79,6 +88,8 @@ import math
 import os
 from dataclasses import asdict
 from datetime import datetime
+
+from src.live.main_heartbeat import replace_retrying_permission_error
 
 from .paper_gate import (
     WeekRecord,
@@ -434,14 +445,17 @@ def build_evolution_record(
     return record
 
 
-def append_evolution_history(path, record, *, log=None) -> bool:
+def append_evolution_history(path, record, *, log=None, sleep=None) -> bool:
     """Append one JSON line. Never raises.
 
     The previous file is replaced only after the new contents are on
-    disk (temp file in the same directory, fsync, ``os.replace``). A
-    failure leaves the previous bytes in place. An existing file that
-    cannot be decoded as UTF-8 is left untouched and the failure is
-    logged. A missing file is created.
+    disk (temp file in the same directory, fsync, ``os.replace``).
+    ``os.replace`` uses the heartbeat writer's bounded
+    ``PermissionError`` retry. A final failure, including an exhausted
+    retry, logs a warning and leaves the previous bytes in place. An
+    existing file that cannot be decoded as UTF-8 is left untouched
+    and the failure is logged. A missing file is created. ``sleep``
+    overrides the retry backoff (tests). The file is not trimmed.
     """
     path = os.fspath(path)
     tmp = None
@@ -467,9 +481,16 @@ def append_evolution_history(path, record, *, log=None) -> bool:
             handle.write(blob)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        replace_retrying_permission_error(tmp, path, sleep_fn=sleep)
         tmp = None
         return True
+    except PermissionError as exc:
+        _report(
+            log,
+            "warning: evolution history append failed: "
+            f"[{type(exc).__name__}] {exc}",
+        )
+        return False
     except Exception as exc:
         _report(log, f"evolution history append failed: [{type(exc).__name__}] {exc}")
         return False

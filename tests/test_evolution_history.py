@@ -308,6 +308,69 @@ def test_replace_failure_keeps_previous_bytes_and_does_not_raise(tmp_path, monke
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_replace_permission_error_retries_then_succeeds(tmp_path, monkeypatch):
+    """First N PermissionErrors, then success: line kept, no warning."""
+    from src.live import main_heartbeat as hb
+
+    path = tmp_path / HISTORY_FILENAME
+    assert append_evolution_history(path, {"bot": "first", "final_status": "skip"})
+    before = path.read_bytes()
+    sleeps = []
+    calls = {"n": 0}
+    real = os.replace
+
+    def wrapped(src, dst):
+        calls["n"] += 1
+        if calls["n"] < hb._REPLACE_ATTEMPTS:
+            raise PermissionError("busy")
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", wrapped)
+    logs = []
+    assert append_evolution_history(
+        path, {"bot": "second", "final_status": "pass"},
+        log=logs.append, sleep=lambda delay: sleeps.append(delay),
+    ) is True
+    assert calls["n"] == hb._REPLACE_ATTEMPTS
+    assert sleeps == list(hb._REPLACE_BACKOFF_S)
+    assert logs == []
+    assert path.read_bytes().startswith(before)
+    assert [row["bot"] for row in load_evolution_history(path)] == [
+        "first", "second"]
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_replace_permission_error_always_fails_warns_without_raising(
+        tmp_path, monkeypatch):
+    """Every attempt fails: warning, previous bytes kept, no raise."""
+    from src.live import main_heartbeat as hb
+
+    path = tmp_path / HISTORY_FILENAME
+    assert append_evolution_history(path, {"bot": "first", "final_status": "skip"})
+    before = path.read_bytes()
+    calls = {"n": 0}
+    sleeps = []
+
+    def wrapped(_src, _dst):
+        calls["n"] += 1
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "replace", wrapped)
+    logs = []
+    assert append_evolution_history(
+        path, {"bot": "second", "final_status": "fail"},
+        log=logs.append, sleep=lambda delay: sleeps.append(delay),
+    ) is False
+    assert calls["n"] == hb._REPLACE_ATTEMPTS
+    assert sleeps == list(hb._REPLACE_BACKOFF_S)
+    assert path.read_bytes() == before
+    assert load_evolution_history(path) == [
+        {"bot": "first", "final_status": "skip"}]
+    assert logs and "warning" in logs[0].lower()
+    assert "PermissionError" in logs[0]
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_successful_append_keeps_the_previous_line_as_a_prefix(tmp_path):
     path = tmp_path / "nested" / HISTORY_FILENAME
     assert append_evolution_history(path, {"bot": "first", "final_status": "skip"})

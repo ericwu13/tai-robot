@@ -159,6 +159,16 @@ What is identical: the design/holdout split, the walk-forward validation, the ve
 
 ---
 
+## 7.1 Gate-decision history
+
+Every evolution attempt appends one JSON line to `data/live/{symbol}_{bot}/evolution_history.jsonl` (next to `evolution_watermark.json`). The line covers `skip`, `no_change`, `refused`, `fail`, and `pass`, including the deep, multifold, month, and promotion-gate reasons. `retire_week` stores `{at, evaluated, passed}` so a #188 streak can be derived with `weeks_from_history`.
+
+The file is append-only and **not size-capped or rotated**. Growth is unbounded on purpose: one line per attempt is small, and trimming the tail would drop weeks the streak derivation still needs. Delete or archive the file by hand if it ever needs a bound. There is no settings key for a cap. A write failure (including a Windows `os.replace` sharing violation after the heartbeat writer's bounded retry) is logged as a warning and does not stop the evolution run.
+
+`assess_retirement` keeps reading the changelog (`weeks_from_changelog`). Switching that live reader to this history file is a later follow-up, so an empty history file does not reset an existing changelog streak.
+
+---
+
 ## 8. Key files
 
 | File | Role |
@@ -171,7 +181,8 @@ What is identical: the design/holdout split, the walk-forward validation, the ve
 | `run_backtest.py` | GUI glue: `_bot_evolution` (orchestration), `_start_evolution_pipeline` (worker thread, AI calls, API fetch), `_check_weekly_evolution` (post-close trigger), `_build_evolution_context`. |
 | `data/live/{symbol}_{bot}/evolution_watermark.json` | Per-bot design-cut high-water mark (gitignored). |
 | `data/live/{symbol}_{bot}/evolution.json` | Per-bot fitness baseline (best composite so far). |
-| `data/changelog.json` | Audit trail of applied changes (`initiated_by` = `ai` or `human`). |
+| `data/live/{symbol}_{bot}/evolution_history.jsonl` | Append-only gate-decision log, one JSON line per attempt. Not size-capped or rotated (see §7.1). |
+| `data/changelog.json` | Audit trail of applied changes (`initiated_by` = `ai` or `human`). `assess_retirement` still reads this file. |
 
 ---
 
