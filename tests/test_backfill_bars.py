@@ -10,10 +10,14 @@ import pytest
 
 from src.evolution.backfill import (
     FIRST_TRADE_DATE,
+    MAX_FOLDS,
     MIN_FOLDS,
+    BackfillError,
     BackfillPathError,
     build_parser,
     closure_table,
+    daily_bar_stamp,
+    load_input_csv,
     main,
     multifold_count,
     resolve_output_dir,
@@ -387,6 +391,277 @@ def test_cross_check_mismatch_blocks_write(tmp_path):
     assert report.cross_check == "mismatch"
     assert report.wrote is False
     assert _snapshot(tmp_path) == before
+
+
+def _priced(symbol: str, dt: datetime, price: int, interval: int) -> Bar:
+    return Bar(symbol, dt, price, price + 2, price - 2, price + 1, 3, interval)
+
+
+def _session_bars(symbol: str, day: date, session: str, price: int, interval: int) -> list[Bar]:
+    return [
+        _priced(symbol, dt, price, interval)
+        for dt in session_bar_opens(day, session, interval)
+    ]
+
+
+def _read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or []), list(reader)
+
+
+def test_daily_bars_match_broker_stamp_and_night_assignment(tmp_path):
+    """2026-10-05 1-minute bars become one broker-convention daily row.
+
+    Monday's day session belongs to the previous trading day (outside
+    this span). Monday's night session is the 2026-10-05 bar, stamped
+    the way data/TXF1_1D.csv stamps a daylight-time trading day.
+    """
+    day = date(2026, 10, 5)
+    day_bars = _session_bars("TX00", day, "day", 1000, 60)
+    night_bars = _session_bars("TX00", day, "night", 5000, 60)
+    report = run_backfill(
+        day_bars + night_bars,
+        symbol="TX00", start=day, end=day,
+        repo_root=tmp_path, write=True, resolution="1m",
+        announcements=(),
+    )
+    assert report.ok, report.message
+    path = tmp_path / "data" / "backfill" / "TXF1" / "bars_1D.csv"
+    header, rows = _read_rows(path)
+    assert header == ["datetime", "open", "high", "low", "close", "volume"]
+    assert len(rows) == 1
+    stamp = daily_bar_stamp(day).strftime("%Y/%m/%d %H:%M")
+    assert stamp == "2026/10/05 00:00"
+    assert rows[0]["datetime"] == stamp
+    assert rows[0]["open"] == str(night_bars[0].open)
+    assert rows[0]["close"] == str(night_bars[-1].close)
+    assert rows[0]["high"] == str(night_bars[0].high)
+    assert rows[0]["low"] == str(night_bars[0].low)
+    assert rows[0]["volume"] == str(sum(bar.volume for bar in night_bars))
+    assert "res" not in rows[0]
+
+
+def test_daily_bar_joins_night_with_the_next_trading_day(tmp_path):
+    """Friday night and Monday's day session share Friday's daily bar."""
+    friday = date(2026, 5, 8)
+    monday = date(2026, 5, 11)
+    bars = (
+        _session_bars("TX00", friday, "day", 1100, 900)
+        + _session_bars("TX00", friday, "night", 2200, 900)
+        + _session_bars("TX00", monday, "day", 3300, 900)
+        + _session_bars("TX00", monday, "night", 4400, 900)
+    )
+    report = run_backfill(
+        bars, symbol="TX00", start=friday, end=monday,
+        repo_root=tmp_path, write=True, resolution="15m",
+        announcements=(),
+    )
+    assert report.ok, report.message
+    _, rows = _read_rows(tmp_path / "data" / "backfill" / "TXF1" / "bars_1D.csv")
+    assert [row["datetime"] for row in rows] == [
+        "2026/05/08 00:00",
+        "2026/05/11 00:00",
+    ]
+    friday_row, monday_row = rows
+    assert friday_row["open"] == "2200"  # Friday 15:00, not Friday's day session
+    assert friday_row["close"] == "3301"  # Monday day-session close
+    assert monday_row["open"] == "4400"
+    assert monday_row["close"] == "4401"
+
+
+def test_winter_daily_stamp_is_previous_evening(tmp_path):
+    day = date(2026, 1, 9)
+    bars = _session_bars("TX00", day, "day", 1000, 900) + _session_bars(
+        "TX00", day, "night", 2000, 900,
+    )
+    report = run_backfill(
+        bars, symbol="TX00", start=day, end=day,
+        repo_root=tmp_path, write=True, resolution="15m",
+        announcements=(),
+    )
+    assert report.ok, report.message
+    _, rows = _read_rows(tmp_path / "data" / "backfill" / "TXF1" / "bars_1D.csv")
+    assert len(rows) == 1
+    assert rows[0]["datetime"] == "2026/01/08 23:00"
+    assert rows[0]["open"] == "2000"
+
+
+@pytest.mark.parametrize(
+    ("trading_day", "stamp"),
+    [
+        (date(2026, 10, 5), "2026/10/05 00:00"),
+        (date(2026, 1, 9), "2026/01/08 23:00"),
+        (date(2025, 11, 3), "2025/11/02 23:00"),
+        (date(2025, 10, 31), "2025/10/31 00:00"),
+        (date(2012, 5, 8), "2012/05/08 00:00"),
+        (date(2012, 11, 5), "2012/11/04 23:00"),
+    ],
+)
+def test_daily_bar_stamp_matches_broker_clock(trading_day, stamp):
+    assert daily_bar_stamp(trading_day).strftime("%Y/%m/%d %H:%M") == stamp
+
+
+@pytest.mark.parametrize("name", ["TXF1_1D.csv", "TMF1_1D.csv"])
+def test_stamp_matches_checked_in_broker_cache_when_present(name):
+    path = Path("data") / name
+    if not path.is_file():
+        pytest.skip("broker daily cache is not in this checkout")
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        assert reader.fieldnames[:6] == [
+            "datetime", "open", "high", "low", "close", "volume",
+        ]
+        assert "res" not in (reader.fieldnames or [])
+        for row in reader:
+            seen = datetime.strptime(row["datetime"], "%Y/%m/%d %H:%M")
+            trading_day = seen.date() if seen.hour == 0 else seen.date() + timedelta(days=1)
+            assert daily_bar_stamp(trading_day) == seen
+
+
+def test_write_refuses_overwrite_unless_force(tmp_path, capsys):
+    bars = _complete("TX00", _START, _END)
+    csv_path = _write_csv(tmp_path / "in.csv", bars)
+    args = [
+        "--input", str(csv_path),
+        "--symbol", "TX00",
+        "--start", _START.isoformat(),
+        "--end", _END.isoformat(),
+        "--resolution", "15m",
+        "--write",
+    ]
+    assert main(args, repo_root=tmp_path) == 0
+    target = tmp_path / "data" / "backfill" / "TXF1" / "bars_15m.csv"
+    original = target.read_bytes()
+    sentinel = original + b"\nSENTINEL"
+    target.write_bytes(sentinel)
+    before = _snapshot(tmp_path)
+
+    code = main(args, repo_root=tmp_path)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "force" in captured.err.lower()
+    assert _snapshot(tmp_path) == before
+    assert target.read_bytes() == sentinel
+
+    dry = [arg for arg in args if arg != "--write"]
+    assert main(dry, repo_root=tmp_path) == 0
+    assert target.read_bytes() == sentinel
+    assert build_parser().parse_args(
+        ["--input", "x.csv", "--symbol", "TX00"]
+    ).force is False
+
+    assert main(args + ["--force"], repo_root=tmp_path) == 0
+    assert target.read_bytes() == original
+
+    with pytest.raises(BackfillPathError):
+        run_backfill(
+            bars, symbol="TX00", start=_START, end=_END,
+            repo_root=tmp_path, output_dir=tmp_path / "data" / "live",
+            write=True, force=True, resolution="15m",
+        )
+    assert not (tmp_path / "data" / "live").exists()
+
+
+def test_duplicate_timestamp_keeps_the_first_bar(tmp_path):
+    bars = _complete("TX00", _START, _END)
+    first = bars[0]
+    duplicate = Bar(
+        first.symbol, first.dt, 9000, 9002, 8998, 9001, 7, first.interval,
+    )
+    report = run_backfill(
+        bars + [duplicate],
+        symbol="TX00", start=_START, end=_END,
+        repo_root=tmp_path, write=True, resolution="15m",
+    )
+    assert report.ok, report.message
+    assert report.bars_duplicate == 1
+    _, rows = _read_rows(tmp_path / "data" / "backfill" / "TXF1" / "bars_15m.csv")
+    assert len(rows) == len(bars)
+    stamped = first.dt.strftime("%Y/%m/%d %H:%M")
+    matched = [row for row in rows if row["datetime"] == stamped]
+    assert len(matched) == 1
+    assert matched[0]["close"] == str(first.close)
+    assert matched[0]["close"] != "9001"
+
+
+def test_require_folds_boundary(tmp_path):
+    bars = _complete("TX00", _START, _END)
+    passed = run_backfill(
+        bars, symbol="TX00", start=_START, end=_END,
+        repo_root=tmp_path, write=True, resolution="15m",
+        require_folds=0,
+    )
+    assert passed.ok, passed.message
+    assert passed.wrote is True
+    count = passed.fold_count
+    assert count > 0
+
+    equal = run_backfill(
+        bars, symbol="TX00", start=_START, end=_END,
+        repo_root=tmp_path, write=True, force=True, resolution="15m",
+        require_folds=count,
+    )
+    assert equal.ok, equal.message
+    assert equal.wrote is True
+
+    before = _snapshot(tmp_path)
+    short = run_backfill(
+        bars, symbol="TX00", start=_START, end=_END,
+        repo_root=tmp_path, write=True, force=True, resolution="15m",
+        require_folds=count + 1,
+    )
+    assert not short.ok
+    assert short.wrote is False
+    assert str(count) in short.message
+    assert str(count + 1) in short.message
+    assert _snapshot(tmp_path) == before
+
+
+def test_multifold_count_edges():
+    instant = datetime(2026, 10, 5, 13, 30)
+    assert multifold_count(instant, instant) == 1
+    # end = 2026-10-06, so the first window opens 2026-09-22.
+    # Equality must not count as "still before the window".
+    assert multifold_count(datetime(2026, 9, 22), instant) == 1
+    assert multifold_count(datetime(2026, 9, 21, 23, 59), instant) == 2
+    assert multifold_count(datetime(2020, 1, 1), instant) == MAX_FOLDS
+    # A midnight last bar anchors at the next midnight (2026-10-07),
+    # the same date+1 rule analyze_folds uses.
+    midnight = datetime(2026, 10, 6)
+    assert multifold_count(datetime(2026, 9, 23), midnight) == 1
+    assert multifold_count(datetime(2026, 9, 22), midnight) == 2
+    assert multifold_count(midnight, instant) == 0
+
+
+def test_malformed_csv_includes_parse_error(tmp_path, capsys):
+    path = tmp_path / "bad.csv"
+    path.write_text(
+        "datetime,open,high,low,close,volume\nnot-a-date,1,1,1,1,1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BackfillError) as raised:
+        load_input_csv(path)
+    message = str(raised.value)
+    assert "not-a-date" in message
+    assert "does not match format" in message
+
+    code = main(
+        ["--input", str(path), "--symbol", "TX00",
+         "--start", _START.isoformat(), "--end", _END.isoformat(),
+         "--write"],
+        repo_root=tmp_path,
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "not-a-date" in captured.err
+    assert "does not match format" in captured.err
+    assert not (tmp_path / "data" / "backfill").exists()
+
+    empty = tmp_path / "empty.csv"
+    empty.write_text("datetime,open,high,low,close,volume\n", encoding="utf-8")
+    with pytest.raises(BackfillError, match="no bars"):
+        load_input_csv(empty)
 
 
 def _write_csv(path: Path, bars: list[Bar]) -> Path:

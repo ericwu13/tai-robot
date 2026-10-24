@@ -22,6 +22,9 @@ python scripts/backfill_bars.py --input broker_1m.csv --symbol TX00 --write
 - Exchange closures are marked and skipped. Missing bars are a failed
   validation report. The script does not forward-fill or synthesize bars.
 - A failed validation writes nothing, including on `--write`.
+- `--write` refuses to replace a file that already exists unless `--force`
+  is also passed. `--force` does not allow a path outside `data/backfill/`,
+  and a dry-run ignores it.
 
 ## Source
 
@@ -35,14 +38,27 @@ python scripts/backfill_bars.py --input broker_1m.csv --symbol TX00 --write
 
 ## Resolution and layout
 
-Native bars are 1-minute. 15m / 1H / H4 / 1D are derived with
-`aggregate_bars`, the same function live uses. The 1D file is one bar
-per session (day and night), not the TAIFEX official daily print.
+Native bars are 1-minute. 15m / 1H / H4 are derived with
+`aggregate_bars`, the same function live uses. `bars_1D.csv` is not
+that aggregate. It is one bar per trading day in the broker daily
+K-line layout (`kline_config.CACHE_SUFFIXES` `(4, 1)` → `_1D.csv`,
+the same files as `data/TXF1_1D.csv` / `data/TMF1_1D.csv`):
+
+- Header `datetime,open,high,low,close,volume` (no `res` column).
+- Timestamp is 04:00 UTC on the trading day, written as
+  America/New_York wall time: `YYYY/MM/DD 00:00` on that date during
+  US daylight time, and `YYYY/MM/DD 23:00` on the previous date during
+  US standard time.
+- The bar holds the night session that opens on that trading day
+  (15:00 TWT through 05:00 the next morning) plus the day session of
+  the next trading day. Friday night is in Friday's bar together with
+  Monday's day session. Sunday night is not in any daily bar. A
+  trading day outside the requested span is omitted.
 
 If the broker history is only 15-minute for the older span, pass
-`--resolution 15m` (or let auto-detect choose it). Every output row is
-marked `res=15m`. There is no synthetic 1-minute file. Intrabar-sensitive
-checks must refuse that span.
+`--resolution 15m` (or let auto-detect choose it). Every intraday output
+row is marked `res=15m`. The daily file has no `res` column. There is no
+synthetic 1-minute file. Intrabar-sensitive checks must refuse that span.
 
 ```
 data/backfill/closures.csv
@@ -72,9 +88,10 @@ A session is closed when any of these say so:
 
 The session key is the session **open** date. A night bar after midnight
 belongs to the previous date. A holiday closes that date's day session
-and the night session that **opens** on that date. The previous date's
-night, which ends on the holiday morning, is still expected unless an
-announcement marks it.
+and the night session that **opens** on that date. The night that opens
+on the previous weekday and ends on the holiday morning is still treated
+as expected-open unless an announcement marks it. That treatment is
+pending confirmation of the TAIFEX rule and is intentionally unchanged.
 
 ## Folds
 

@@ -2,11 +2,13 @@
 
 Reads broker K-line bars (the same feed live uses), drops any bar that
 falls on an exchange closure, and writes 1-minute history plus the
-15m/1H/H4/1D aggregates under ``data/backfill/`` only.
+15m/1H/H4 aggregates and a broker-convention daily file under
+``data/backfill/`` only.
 
 Dry-run is the default. ``write=True`` (CLI ``--write``) is required
 before any file is created, and every path is refused unless it
-resolves inside ``data/backfill/``. The live tree — other ``data/``
+resolves inside ``data/backfill/``. An existing target is left untouched
+unless ``force=True`` (CLI ``--force``). The live tree — other ``data/``
 children, settings, state, votes, locks — is never written.
 
 Closures come from ``src.market_data.holidays`` (weekends, Taiwan
@@ -29,7 +31,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src.backtest.data_loader import load_bars_from_csv
+from src.backtest.data_loader import _DATE_FORMATS
 from src.live.bar_aggregator import aggregate_bars
 from src.market_data.holidays import (
     is_taifex_holiday,
@@ -61,17 +63,21 @@ _DERIVED: dict[str, tuple[tuple[str, int], ...]] = {
         ("bars_15m.csv", 900),
         ("bars_1H.csv", 3600),
         ("bars_H4.csv", 14400),
-        ("bars_1D.csv", 86400),
     ),
     "15m": (
         ("bars_15m.csv", 900),
         ("bars_1H.csv", 3600),
         ("bars_H4.csv", 14400),
-        ("bars_1D.csv", 86400),
     ),
 }
 _REASONS = frozenset({"holiday", "typhoon", "halt"})
 _TAIPEI = ZoneInfo("Asia/Taipei")
+_UTC = ZoneInfo("UTC")
+_NEW_YORK = ZoneInfo("America/New_York")
+# How far to walk back when a day session belongs to the previous
+# trading day (a lunar-new-year closure is shorter than this).
+_DAILY_LOOKBACK_DAYS = 30
+_DAILY_HEADER = ["datetime", "open", "high", "low", "close", "volume"]
 
 
 class BackfillPathError(ValueError):
@@ -313,6 +319,93 @@ def session_bar_opens(session_date: date, session: str, interval_seconds: int) -
     return opens
 
 
+def daily_bar_stamp(trading_day: date) -> datetime:
+    """Naive timestamp of the broker daily K-line for ``trading_day``.
+
+    ``data/TXF1_1D.csv`` and ``data/TMF1_1D.csv`` (kline type 4, cache
+    suffix ``_1D.csv``) label one bar per trading day at 04:00 UTC,
+    written as America/New_York wall time. During US daylight time that
+    is ``YYYY/MM/DD 00:00`` on ``trading_day``. During US standard time
+    it is ``YYYY/MM/DD 23:00`` on the previous calendar date. The same
+    string is the US Pacific wall time of that date's 15:00 TWT night open.
+    """
+    instant = datetime(
+        trading_day.year, trading_day.month, trading_day.day,
+        4, 0, tzinfo=_UTC,
+    )
+    return instant.astimezone(_NEW_YORK).replace(tzinfo=None)
+
+
+def build_daily_bars(
+    kept: list[Bar],
+    start: date,
+    end: date,
+    announcements: tuple[Announcement, ...] | None = None,
+) -> list[Bar]:
+    """One broker-convention daily bar per trading day inside the span.
+
+    The night session that opens on trading day D (15:00 D through 05:00
+    the next morning) and the day session of the next trading day share
+    D's bar. Friday night therefore joins Monday's day session, and
+    Sunday night is not part of any daily bar. A trading day outside
+    ``[start, end]`` is not emitted, so a day session whose previous
+    trading day is outside the span is left out of ``bars_1D``.
+    """
+    lookback = start - timedelta(days=_DAILY_LOOKBACK_DAYS)
+    closed = {
+        (row.day, row.session)
+        for row in closure_table(lookback, end, announcements)
+    }
+
+    def is_trading(day: date) -> bool:
+        return (day, "day") not in closed
+
+    previous: dict[date, date | None] = {}
+
+    def previous_trading_day(day: date) -> date | None:
+        if day in previous:
+            return previous[day]
+        cursor = day - timedelta(days=1)
+        found: date | None = None
+        while cursor >= lookback:
+            if is_trading(cursor):
+                found = cursor
+                break
+            cursor -= timedelta(days=1)
+        previous[day] = found
+        return found
+
+    groups: dict[date, list[Bar]] = {}
+    for bar in kept:
+        located = session_of(bar.dt)
+        if located is None:
+            continue
+        session_day, session_name = located
+        if session_name == "night":
+            trading_day = session_day if is_trading(session_day) else None
+        else:
+            trading_day = previous_trading_day(session_day)
+        if trading_day is None or trading_day < start or trading_day > end:
+            continue
+        groups.setdefault(trading_day, []).append(bar)
+
+    daily: list[Bar] = []
+    for trading_day in sorted(groups):
+        members = sorted(groups[trading_day], key=lambda bar: bar.dt)
+        first = members[0]
+        daily.append(Bar(
+            symbol=first.symbol,
+            dt=daily_bar_stamp(trading_day),
+            open=first.open,
+            high=max(bar.high for bar in members),
+            low=min(bar.low for bar in members),
+            close=members[-1].close,
+            volume=sum(bar.volume for bar in members),
+            interval=86400,
+        ))
+    return daily
+
+
 def _calendar_reason(day: date) -> tuple[str, str] | None:
     """Reason from the static calendar only (not the operator file)."""
     import holidays as _holidays
@@ -500,6 +593,19 @@ def _csv_bytes(bars: list[Bar], resolution: str) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
+def _daily_csv_bytes(bars: list[Bar]) -> bytes:
+    """Broker daily layout: no ``res`` column, stamp from ``daily_bar_stamp``."""
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(_DAILY_HEADER)
+    for bar in bars:
+        writer.writerow([
+            bar.dt.strftime("%Y/%m/%d %H:%M"),
+            bar.open, bar.high, bar.low, bar.close, bar.volume,
+        ])
+    return buf.getvalue().encode("utf-8")
+
+
 def _closures_csv_bytes(rows: list[ClosureRow]) -> bytes:
     buf = io.StringIO(newline="")
     writer = csv.writer(buf, lineterminator="\n")
@@ -526,6 +632,7 @@ def _payloads(
     report_json: str,
     prefix: str,
     derived: list[tuple[str, list[Bar]]] | None = None,
+    daily: list[Bar] | None = None,
 ) -> list[tuple[str, bytes]]:
     """Repo-relative paths under ``data/backfill`` and their bytes."""
     files: list[tuple[str, bytes]] = [
@@ -533,12 +640,26 @@ def _payloads(
     ]
     for rel, bars in (derived if derived is not None else _derived_files(kept, resolution, prefix)):
         files.append((rel, _csv_bytes(bars, resolution)))
+    files.append((
+        f"data/backfill/{prefix}/bars_1D.csv",
+        _daily_csv_bytes(daily if daily is not None else []),
+    ))
     files.append((f"data/backfill/{prefix}/report.json", report_json.encode("utf-8")))
     return files
 
 
-def _write_payloads(payloads: list[tuple[str, bytes]], repo_root: Path) -> list[str]:
-    """Write payloads. Re-check every path. Create nothing outside backfill."""
+def _write_payloads(
+    payloads: list[tuple[str, bytes]],
+    repo_root: Path,
+    *,
+    force: bool = False,
+) -> list[str]:
+    """Write payloads. Re-check every path. Create nothing outside backfill.
+
+    Every target is resolved before any byte is written. An existing
+    file is refused unless ``force`` is set. ``force`` does not relax
+    the ``data/backfill/`` path guard.
+    """
     repo = repo_root.resolve()
     checked: list[tuple[Path, bytes, str]] = []
     for rel, data in payloads:
@@ -546,6 +667,12 @@ def _write_payloads(payloads: list[tuple[str, bytes]], repo_root: Path) -> list[
             raise BackfillPathError(f"refusing path outside data/backfill/: {rel}")
         path = resolve_output_dir(repo / rel, repo)
         checked.append((path, data, rel))
+    existing = [rel for path, _, rel in checked if path.is_file()]
+    if existing and not force:
+        listed = ", ".join(existing)
+        raise BackfillError(
+            f"refusing to overwrite existing file {listed}; pass --force"
+        )
     written: list[str] = []
     for path, data, rel in checked:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -570,12 +697,15 @@ def run_backfill(
     cross_check: list[Bar] | None = None,
     announcements: tuple[Announcement, ...] | None = None,
     require_folds: int = 0,
+    force: bool = False,
 ) -> BackfillReport:
     """Validate ``bars`` and, only when ``write`` is set and the report
     passes, write under ``data/backfill/``.
 
     ``write`` defaults to False. A target outside ``data/backfill/``
-    raises ``BackfillPathError`` before any file is created.
+    raises ``BackfillPathError`` before any file is created. ``force``
+    is required to replace a file that already exists; it does not
+    permit a path outside ``data/backfill/``.
     """
     # Refuse before building the report so a bad target never looks successful
     # and a dry-run cannot point at the live tree.
@@ -748,15 +878,19 @@ def run_backfill(
 
     if write and report.ok:
         derived = _derived_files(kept, chosen, prefix)
+        daily = build_daily_bars(kept, start, end, announcements)
+        daily_rel = f"data/backfill/{prefix}/bars_1D.csv"
         report.files_written = (
             ["data/backfill/closures.csv"]
             + [rel for rel, _ in derived]
-            + [f"data/backfill/{prefix}/report.json"]
+            + [daily_rel, f"data/backfill/{prefix}/report.json"]
         )
         report.wrote = True
-        payloads = _payloads(kept, chosen, rows, report.to_json(), prefix, derived)
+        payloads = _payloads(
+            kept, chosen, rows, report.to_json(), prefix, derived, daily,
+        )
         try:
-            report.files_written = _write_payloads(payloads, repo_root)
+            report.files_written = _write_payloads(payloads, repo_root, force=force)
         except Exception:
             report.wrote = False
             raise
@@ -768,13 +902,106 @@ def _overlap(kept: list[Bar], official: list[Bar]) -> bool:
     return any(bar.dt.date() in ours for bar in official)
 
 
+def _parse_bar_dt(text: str) -> datetime:
+    """Parse one timestamp. The ``ValueError`` text is the caller's error."""
+    if text is None:
+        raise ValueError("datetime is empty")
+    stripped = text.strip()
+    if stripped.isdigit():
+        return datetime.fromtimestamp(int(stripped), tz=_TAIPEI).replace(tzinfo=None)
+    last: ValueError | None = None
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(stripped, fmt)
+        except ValueError as exc:
+            last = exc
+    raise last if last is not None else ValueError(f"unrecognized datetime {text!r}")
+
+
 def load_input_csv(path: Path, *, interval: int = 60) -> list[Bar]:
-    """Read an OHLCV CSV. The interval is replaced once resolution is known."""
+    """Read an OHLCV CSV. The interval is replaced once resolution is known.
+
+    A row that cannot be parsed raises ``BackfillError`` whose message
+    includes the underlying ``ValueError`` (or decode error). An empty
+    but well-formed file still reports that it has no bars.
+    """
     if not path.is_file():
         raise BackfillError(f"input CSV not found: {path}")
-    bars = load_bars_from_csv(path, symbol="BACKFILL", interval=interval)
+    try:
+        handle = path.open(encoding="utf-8", newline="")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BackfillError(f"malformed CSV {path}: {exc}") from exc
+    bars: list[Bar] = []
+    with handle:
+        try:
+            header = handle.readline()
+        except UnicodeDecodeError as exc:
+            raise BackfillError(f"malformed CSV {path}: {exc}") from exc
+        if not header.strip():
+            raise BackfillError(f"input CSV has no bars: {path}")
+        handle.seek(0)
+        if header.lower().startswith(("datetime", "date", "time", "dt")):
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            lower_map = {name.lower(): name for name in fieldnames}
+            dt_key = next(
+                (lower_map[key] for key in ("datetime", "date", "dt", "time") if key in lower_map),
+                None,
+            )
+            if dt_key is None:
+                raise BackfillError(f"malformed CSV {path}: no datetime column")
+            open_key = lower_map.get("open", "")
+            high_key = lower_map.get("high", "")
+            low_key = lower_map.get("low", "")
+            close_key = lower_map.get("close", "")
+            vol_key = lower_map.get("volume", "")
+            for row in reader:
+                if not any((value or "").strip() for value in row.values()):
+                    continue
+                try:
+                    dt = _parse_bar_dt(row[dt_key])
+                    bars.append(Bar(
+                        symbol="BACKFILL",
+                        dt=dt,
+                        open=int(float(row[open_key])) if open_key else 0,
+                        high=int(float(row[high_key])) if high_key else 0,
+                        low=int(float(row[low_key])) if low_key else 0,
+                        close=int(float(row[close_key])) if close_key else 0,
+                        volume=int(float(row[vol_key])) if vol_key else 0,
+                        interval=interval,
+                    ))
+                except (KeyError, ValueError, TypeError) as exc:
+                    raise BackfillError(
+                        f"malformed CSV {path} line {reader.line_num}: {exc}"
+                    ) from exc
+        else:
+            for lineno, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 6:
+                    raise BackfillError(
+                        f"malformed CSV {path} line {lineno}: expected 6 fields, got {len(parts)}"
+                    )
+                try:
+                    dt = _parse_bar_dt(parts[0])
+                    bars.append(Bar(
+                        symbol="BACKFILL",
+                        dt=dt,
+                        open=int(float(parts[1])),
+                        high=int(float(parts[2])),
+                        low=int(float(parts[3])),
+                        close=int(float(parts[4])),
+                        volume=int(float(parts[5])),
+                        interval=interval,
+                    ))
+                except (ValueError, TypeError) as exc:
+                    raise BackfillError(
+                        f"malformed CSV {path} line {lineno}: {exc}"
+                    ) from exc
     if not bars:
         raise BackfillError(f"input CSV has no bars: {path}")
+    bars.sort(key=lambda bar: bar.dt)
     return bars
 
 
@@ -825,6 +1052,12 @@ def build_parser():
         help="Write files under data/backfill/. Omit to dry-run (no files created).",
     )
     parser.add_argument(
+        "--force", action="store_true",
+        help="With --write, replace files that already exist under data/backfill/. "
+             "Without --force, --write refuses to overwrite. Ignored on a dry-run. "
+             "Does not permit a path outside data/backfill/.",
+    )
+    parser.add_argument(
         "--cross-check", default=None,
         help="Optional TAIFEX official daily CSV. Closes are compared (0.1%%). "
              "Never used as the bar source.",
@@ -868,6 +1101,7 @@ def main(argv: list[str] | None = None, *, repo_root: Path | None = None) -> int
             resolution=resolution,
             cross_check=official,
             require_folds=args.require_folds,
+            force=bool(args.force),
         )
     except (BackfillPathError, BackfillError) as exc:
         print(str(exc), file=sys.stderr)
