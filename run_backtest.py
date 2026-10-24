@@ -523,6 +523,10 @@ def _load_settings():
             # 0 disables the line entirely.
             cfg["evolution_idle_warn_days"] = _nonneg_int(
                 evo.get("idle_warn_days", 7), 7)
+            # Raw evolution mapping for the P1 gate parser. This section
+            # has no credentials. Parsing (and the absolute-real coerce)
+            # lives in src.evolution.paper_gate.
+            cfg["evolution_gate_raw"] = dict(evo) if isinstance(evo, dict) else {}
             # News/event framework (src.news). Paths are written by an
             # external n8n workflow; empty paths keep the feature inert.
             # Defaults mirror src.config.settings.NewsConfig exactly.
@@ -5666,6 +5670,11 @@ class BacktestApp:
         capital_base = self._evolution_capital_base()
         live = (self._live_runner is not None
                 and self._live_runner.state != LiveState.IDLE)
+        # Snapshotted with the rest of the worker inputs. Real-money
+        # modes stay on the absolute PF floor even if paper_gate is relative.
+        promotion_trading_mode = (
+            getattr(self, "_trading_mode", "paper") if live else "backtest")
+        evolution_gate_raw = self._settings.get("evolution_gate_raw") or {}
         if live:
             baseline_cls = type(self._live_runner.strategy)
             point_value = self._live_runner.point_value
@@ -5723,10 +5732,20 @@ class BacktestApp:
                 parse_plan_directives, next_candidate_name, run_ab_backtest,
                 decide_verdict,
                 run_deep_validation, decide_deep_verdict,
-                run_multifold_validation, decide_multifold_verdict,
-                decide_month_gates, combine_evolution_verdicts,
+                run_multifold_validation,
                 format_weekend_verdict_block, holdout_window_start,
                 eligible_for_validated_pool)
+            from src.evolution.paper_gate import (
+                WeekRecord,
+                abs_pf_required,
+                assemble_promotion_verdict,
+                assess_retirement,
+                emit_retire_recommendation,
+                evolution_gate_config_from_mapping,
+                relative_eval_summary,
+                resolve_promotion_gate,
+                weeks_from_changelog,
+            )
             bars = evo_data["bars"]
             data_origin = evo_data["origin"]
 
@@ -5948,6 +5967,17 @@ class BacktestApp:
                     f"({len(bars)} × {feed_iv // 60}min bars "
                     f"≈ {native_est} native bars)")
 
+                evo_gate_cfg = evolution_gate_config_from_mapping(
+                    evolution_gate_raw)
+                evo_gate = resolve_promotion_gate(
+                    promotion_trading_mode,
+                    evo_gate_cfg.paper_gate,
+                    str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
+                )
+                if evo_gate.note:
+                    _log(f"EVO gate: {evo_gate.note}")
+                evo_require_abs_pf = abs_pf_required(evo_gate)
+
                 # Walk-forward (SEE spec: 90d train / 90d test + Monte
                 # Carlo) when data allows; scaled windows on shorter
                 # spans; simple single-window A/B as last resort.
@@ -5980,7 +6010,8 @@ class BacktestApp:
                         f"候選 {candidate_cls.__name__}", tr_d, te_d,
                         monte_carlo=True, capital_base=capital_base)
                     window_verdict = decide_deep_verdict(
-                        baseline_res, candidate_res, directives["criteria"])
+                        baseline_res, candidate_res, directives["criteria"],
+                        require_abs_pf=evo_require_abs_pf)
                     cl_base_m = (baseline_res.test.metrics
                                  if baseline_res.test.result else None)
                     cl_cand_m = (candidate_res.test.metrics
@@ -6003,7 +6034,8 @@ class BacktestApp:
                         f"候選 {candidate_cls.__name__}",
                         capital_base=capital_base)
                     window_verdict = decide_verdict(
-                        baseline_res, candidate_res, directives["criteria"])
+                        baseline_res, candidate_res, directives["criteria"],
+                        require_abs_pf=evo_require_abs_pf)
                     cl_base_m = baseline_res.metrics
                     cl_cand_m = candidate_res.metrics
 
@@ -6013,17 +6045,24 @@ class BacktestApp:
                 folds, mf_base, mf_cand = run_multifold_validation(
                     baseline_cls, candidate_cls, bars, point_value,
                     capital_base=capital_base)
-                mf_verdict = decide_multifold_verdict(
-                    folds, directives["criteria"])
                 base_trades = (list(mf_base.result.trades)
                                if mf_base.result is not None else [])
                 cand_trades = (list(mf_cand.result.trades)
                                if mf_cand.result is not None else [])
                 ho_start = holdout_window_start(bars, te_d or holdout_days)
-                month_verdict = decide_month_gates(
-                    base_trades, cand_trades, holdout_start=ho_start)
-                verdict = combine_evolution_verdicts(
-                    month_verdict, mf_verdict, window_verdict)
+                # Paper relative drops the absolute PF floors and ANDs the
+                # bootstrap / effect-size checks. Real money stays absolute.
+                # The retire recommendation below does not feed this verdict.
+                verdict = assemble_promotion_verdict(
+                    gate=evo_gate,
+                    gate_cfg=evo_gate_cfg,
+                    folds=folds,
+                    base_trades=base_trades,
+                    cand_trades=cand_trades,
+                    holdout_start=ho_start,
+                    criteria=directives["criteria"],
+                    window_verdict=window_verdict,
+                )
 
                 # Clean PASS → StrategyPool validated only. Never
                 # StrategyStore.save and never STRATEGIES[...].
@@ -6103,6 +6142,62 @@ class BacktestApp:
                 if verdict.passed and not pool_id:
                     block += ("\nPool promotion failed — nothing was registered "
                               "and STRATEGIES was not updated.")
+                # Recommend-only. A failure here must not change the verdict
+                # or the pool promotion above, and must not touch live state.
+                try:
+                    append_changelog = None
+                    prior_weeks = []
+                    try:
+                        from src.daily_report.changelog import (
+                            append_changelog as _append_changelog,
+                            load_changelog,
+                        )
+                        append_changelog = _append_changelog
+                        prior_weeks = weeks_from_changelog(
+                            load_changelog(), display_name)
+                    except Exception as hist_err:
+                        _log("EVO retire history unread: "
+                             f"[{type(hist_err).__name__}] {hist_err}")
+                    evaluated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    weeks = list(prior_weeks)
+                    if evo_gate.mode == "relative":
+                        weeks.append(WeekRecord(
+                            at=evaluated_at, evaluated=True,
+                            passed=bool(verdict.passed)))
+                        if append_changelog is not None:
+                            try:
+                                append_changelog(
+                                    strategy_name=display_name,
+                                    version_before=base_cls_name,
+                                    version_after=base_cls_name,
+                                    change_summary=relative_eval_summary(
+                                        bool(verdict.passed), evaluated_at),
+                                    initiated_by="ai",
+                                )
+                            except Exception as rec_err:
+                                _log("EVO relative-gate record failed: "
+                                     f"[{type(rec_err).__name__}] {rec_err}")
+                    rec = assess_retirement(
+                        base_trades,
+                        weeks=weeks,
+                        structural_graduations=[],
+                        now=datetime.now(),
+                        config=evo_gate_cfg.retire,
+                    )
+                    report_lines: list[str] = []
+                    emit_retire_recommendation(
+                        rec,
+                        log=_log,
+                        changelog=(append_changelog if rec.recommend else None),
+                        report=report_lines,
+                        strategy_name=display_name,
+                        version=base_cls_name,
+                    )
+                    if report_lines:
+                        block += "\n" + "\n".join(report_lines)
+                except Exception as retire_err:
+                    _log("EVO retire recommendation failed: "
+                         f"[{type(retire_err).__name__}] {retire_err}")
                 ui(self._remove_last_system_line)
                 ui(self._append_chat, "system", block)
                 if verdict.passed and pool_id:
