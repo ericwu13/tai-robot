@@ -30,9 +30,15 @@ must be one of `long` / `short` / `idle`.
 
 ## Redeploy
 
-**Headless (paper / auto):** the `deploy` skill —
-`python run_bot_cli.py deploy --symbol S --bot B [--strategy …] --detach --wait-ready 240`
-from the main tree; resume is automatic, `stop --wait 120` stops it.
+**Headless (paper / auto):** the `deploy` skill. Resume is automatic;
+`stop --wait 120` stops it.
+
+- Packaged install (no Python): from the EXE folder,
+  `tai_backtest.exe deploy --symbol S --bot B [--strategy …] --mode paper --detach --wait-ready 240`.
+  The child process is `tai_backtest.exe`, not `python.exe`.
+- Source checkout (oreopie), main tree:
+  `python run_bot_cli.py deploy --symbol S --bot B [--strategy …] --detach --wait-ready 240`.
+  The child process is `python.exe` running `run_bot_cli.py`.
 
 **Workbench (required for `semi_auto`, which needs the order-confirm dialog):**
 

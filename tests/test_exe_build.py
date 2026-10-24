@@ -695,7 +695,9 @@ def test_hook_source_calls_guarded_helper():
     assert "def ensure_comtypes_gen" in src
     assert "e.name != 'comtypes.gen'" in src
     assert "e.name != 'comtypes'" in src
-    guard = "if not _is_multiprocessing_child() and not _is_grid_smoke():"
+    # The old guard named two hook-local helpers. The call is now inside
+    # should_install_comtypes(), which is false only for those two shapes.
+    guard = "if should_install_comtypes():"
     call = "\n        ensure_comtypes_gen(cache_dir)\n"
     assert src.count(call) == 1
     assert src.index(call) > src.index(guard)

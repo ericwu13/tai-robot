@@ -38,6 +38,32 @@
     google_api_key: "AIza..."        # Google API Key
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Headless（無介面）部署
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+不需要安裝 Python，也不需要 git。請在「安裝資料夾」開 cmd 或 PowerShell
+（先 cd 到 tai_backtest.exe 所在的資料夾），再貼上指令。
+
+  tai_backtest.exe list
+  tai_backtest.exe strategies
+  tai_backtest.exe deploy --symbol TMF00 --bot smoke1 --strategy "策略顯示名稱" --mode paper --detach --wait-ready 240
+  tai_backtest.exe status --symbol TMF00 --bot smoke1 --json
+  tai_backtest.exe stop --symbol TMF00 --bot smoke1 --wait 60
+  tai_backtest.exe deploy --symbol TMF00 --bot smoke1 --mode paper --resume --detach --wait-ready 240
+
+說明：
+  - 請先用 paper（模擬）。auto 會送出真實委託，只有在你明確要實單時才用。
+  - semi_auto 無介面不支援（需要畫面上的下單確認）。請改開 GUI（雙擊 tai_backtest.exe）。
+  - 沒有參數、--help，或第一個字不是上面的指令時，會打開 GUI，跟雙擊一樣。
+  - 帳號密碼來自同資料夾的 settings.yaml，或環境變數 TAI_USER_ID / TAI_PASSWORD。
+    不要把帳號密碼寫進捷徑或工作排程器的參數。
+  - 必須在「已登入的桌面工作階段」執行（程式會開一個隱藏的視窗並使用 COM）。
+    不支援註冊成 Windows 服務，也不支援以 LocalSystem 執行。
+    工作排程器請選「只在使用者登入時執行」，
+    「開始於」設成安裝資料夾，並比照 GUI 做解除封鎖與系統管理員註冊。
+  - 紀錄在 data\live\{商品}_{機器人名稱}\cli_stdout.log。
+    list / status 看到的機器人和 GUI 部署的是同一批資料夾。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 常見問題：
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 問題：程式閃退 / 無法啟動

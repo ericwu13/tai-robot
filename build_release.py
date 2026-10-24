@@ -42,6 +42,7 @@ Build-integrity guard (added after the v2.13.0 mismatch, where the
 published EXE was built from a checkout lacking the regime code):
 
   1. Refuses to package when tracked SOURCE (src/, run_backtest.py,
+     run_bot_cli.py, tai_backtest.spec, runtime_hook_comtypes.py,
      version.py) has uncommitted changes — a dirty tree can't be traced
      back to a commit. Override with --allow-dirty.
   2. Refuses to package when the bundled ``_internal/src`` does not match
@@ -70,7 +71,10 @@ DIST_DIR = os.path.join("dist", "tai_backtest")
 ZIP_NAME = f"tai_backtest_v{VERSION}_win_x64.zip"
 
 # Tracked paths whose uncommitted state would make the build untraceable.
-SOURCE_PATHS = ["src", "run_backtest.py", "version.py"]
+SOURCE_PATHS = [
+    "src", "run_backtest.py", "run_bot_cli.py", "tai_backtest.spec",
+    "runtime_hook_comtypes.py", "version.py",
+]
 
 # Pinned toolchain consumed by ``build()`` before PyInstaller runs.
 # PyInstaller 6.22.3 + comtypes 1.4.17 omit ``comtypes.gen`` and the EXE

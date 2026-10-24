@@ -7,7 +7,8 @@ Two backtest buttons:
 Multi-symbol support via SYMBOL_CONFIG (TX00, MTX00).
 
 Usage:
-  python run_backtest.py
+  python run_backtest.py                 # GUI workbench
+  python run_backtest.py list            # headless CLI (see run_bot_cli.py)
 """
 
 from version import APP_VERSION
@@ -20,14 +21,21 @@ import sys
 
 # Frozen EXE spawn children re-execute this file as __main__. This has
 # to run before Tk, COM, or the Capital API are imported and before
-# main() starts a bot. A child sees --multiprocessing-fork, runs the
-# grid payload, and exits here. The headless entry is run_bot_cli.py.
-# The grid-smoke flag is the key-free parent: it also exits here, so
-# this process never opens a Tk window or talks to the broker.
+# main() starts a bot. freeze_support() is first so a Windows frozen
+# child can run its payload and exit. Classification uses
+# src.paths.skips_gui_and_com, the same helper as the comtypes hook, so
+# a spawn child and the grid-smoke parent never reach the CLI router.
+# The headless entry is run_bot_cli.py.
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-    if "--grid-subprocess-smoke" in sys.argv:
+    from src.paths import dispatch_entry
+    _kind, _routed = dispatch_entry(sys.argv)
+    if _kind == "spawn":
+        raise SystemExit(0)
+    if _kind == "grid_smoke":
+        # ``--grid-subprocess-smoke`` (anywhere in argv). grid_smoke.main
+        # owns --payload-bytes and the non-GridOutcome exit 1.
         from src.evolution.grid_smoke import main as _grid_smoke_main
         raise SystemExit(_grid_smoke_main(sys.argv))
 
@@ -42,15 +50,13 @@ from tkinter import ttk, filedialog, simpledialog, messagebox
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
-# Ensure src is importable — handle PyInstaller frozen EXE
-if getattr(sys, 'frozen', False):
-    # --onedir: EXE is in dist/tai_backtest/, _MEIPASS == EXE dir
-    # --onefile: EXE extracts to temp _MEI dir
-    bundle_root = sys._MEIPASS
-    project_root = os.path.dirname(sys.executable)
-else:
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    bundle_root = project_root
+# Ensure src is importable — handle PyInstaller frozen EXE.
+# The frozen check lives in src.paths so the GUI and the headless CLI
+# share one definition (install dir for data/live, _MEIPASS for the bundle).
+from src.paths import bundle_root as _bundle_root, project_root as _project_root
+
+project_root = _project_root()
+bundle_root = _bundle_root()
 
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -11066,5 +11072,19 @@ def main():
 
 
 if __name__ == "__main__":
-    # freeze_support() already ran at the top of this module, before Tk.
+    # freeze_support() and the spawn / grid-smoke exits already ran at the
+    # top of this module, before Tk was imported. Classify again with the
+    # same helper: a CLI subcommand goes to run_bot_cli, anything else that
+    # is still here is the GUI. Spawn and grid-smoke must not fall through
+    # into main() if the top exit was skipped.
+    from src.paths import dispatch_entry
+    kind, routed = dispatch_entry(sys.argv)
+    if kind == "cli":
+        # Lazy: the GUI path must not import the CLI driver, and must not
+        # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
+        # that init (once) via run_bot_cli → headless_app._boot.
+        import run_bot_cli
+        sys.exit(run_bot_cli.main(routed))
+    if kind != "gui":
+        raise SystemExit(0)
     main()

@@ -119,6 +119,18 @@ a = Analysis(
         'src.updater',
         # Tk workbench theme / widgets / labels (Phase 1 UI modernization)
         'src.ui', 'src.ui.theme', 'src.ui.widgets', 'src.ui.raster', 'src.ui.labels',
+        # Headless CLI (Option A, #177). Append-only: #194 inserts
+        # grid_process/grid_search/grid_smoke next to regime_pipeline,
+        # and #195 inserts comtypes.gen next to the other comtypes
+        # names plus strategies_datas() in datas. Keep every name from
+        # all three; do not duplicate one that already appears above.
+        # src.ai.strategy_store is already listed with the AI modules.
+        'run_bot_cli',
+        'src.paths',
+        'src.live.headless',
+        'src.live.headless_app',
+        'src.live.deploy_request',
+        'src.live.session_store',
     ],
     hookspath=[],
     hooksconfig={},

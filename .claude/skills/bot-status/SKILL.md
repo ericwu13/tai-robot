@@ -52,6 +52,10 @@ Healthy vs unhealthy:
 - **Never delete a `.lock` by hand.** The app self-heals a stale lock on
   the next deploy of that bot. Deleting one manually can let a second
   instance attach to the same account.
+- **Liveness is the lock PID, not the image name.** A packaged bot (GUI
+  or headless) is `tai_backtest.exe`. A source headless bot is
+  `python.exe` with `run_bot_cli.py` on the command line. Do not require
+  one name or the other.
 - **Log silence in a closed gap is normal** — 13:46–14:59 and 05:01–08:44
   TPE, plus weekends and TAIFEX holidays. The helper only applies the
   10-minute freshness rule when `current_session(now)` is not None.
