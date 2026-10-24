@@ -6083,7 +6083,15 @@ class BacktestApp:
                 # assemble_promotion_verdict threads decide_month_gates'
                 # observation out. The PASS changelog below forwards it.
                 month_verdict = assembled.month_verdict
-                _log(format_month_gates_debug(month_verdict.month_gates))
+                # Debug-only. A logging failure must not abort validation.
+                try:
+                    _log(format_month_gates_debug(month_verdict.month_gates))
+                except Exception as e:
+                    try:
+                        _log(f"EVO month gates log failed: "
+                             f"[{type(e).__name__}] {e}")
+                    except Exception:
+                        pass
 
                 # Clean PASS → StrategyPool validated only. Never
                 # StrategyStore.save and never STRATEGIES[...].

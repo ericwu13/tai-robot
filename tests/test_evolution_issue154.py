@@ -69,6 +69,50 @@ def _pipeline_src() -> str:
         inspect.getsource(rb.BacktestApp._start_evolution_pipeline))
 
 
+def _month_gate_log_try(src: str) -> str:
+    """Source of the try that directly guards the month-gate debug line.
+
+    The evolution worker is itself a try. Pick the smallest try whose
+    text contains the debug call so the worker's outer handler is not
+    the one under test.
+    """
+    tree = ast.parse(src)
+    matches: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        segment = ast.get_source_segment(src, node)
+        if segment and "format_month_gates_debug" in segment:
+            matches.append(segment)
+    if not matches:
+        raise AssertionError("month-gate debug log is not inside try/except")
+    return min(matches, key=len)
+
+
+def _normalize_source_segment(segment: str) -> str:
+    """``ast.get_source_segment`` drops the indent on the first line only.
+
+    Shift the remaining lines back by their common indent so the snippet
+    parses and executes on its own.
+    """
+    lines = segment.splitlines()
+    indents = [
+        len(line) - len(line.lstrip(" "))
+        for line in lines[1:]
+        if line.strip()
+    ]
+    if not indents:
+        return segment
+    cut = min(indents)
+    normalized = [lines[0]]
+    for line in lines[1:]:
+        if line.strip():
+            normalized.append(line[cut:])
+        else:
+            normalized.append("")
+    return "\n".join(normalized)
+
+
 class TestOctStubCurrentPass:
     """10-10 shape under the rule that is shipped today."""
 
@@ -113,6 +157,7 @@ class TestOctStubCurrentPass:
         assert block["latest_delta"] == -260
         assert block["share_pct"] == -8.0
         assert block["share_applied"] is True
+        assert block["edge"] > 0
         assert block["ablation_slack"] == 8500
         assert block["base_prior_net"] == 33190
         assert block["cand_prior_net"] == 36690
@@ -155,6 +200,28 @@ class TestOctStubCurrentPass:
         assert "share=-8.0%" in text
         assert "ablation_slack=+8500" in text
         assert "2026-09" in text and "2026-10" in text
+
+
+class TestShareAppliedTracksPositiveEdge:
+    """``share_applied=edge > 0`` forced to True still passes the 10-10
+    case. A non-positive edge is what kills that mutant."""
+
+    def test_share_applied_is_false_when_edge_is_not_positive(self):
+        zero_base = [_trade("2026-10-01 10:00", 100, 1)]
+        zero_cand = [_trade("2026-10-01 10:00", 100, 2)]
+        zero = decide_month_gates(
+            zero_base, zero_cand, holdout_start="2026-09-01 00:00")
+        assert zero.month_gates["edge"] == 0
+        assert zero.month_gates["share_applied"] is False
+        assert any("share gate not applied" in r for r in zero.reasons)
+
+        neg_base = [_trade("2026-10-01 10:00", 100, 1)]
+        neg_cand = [_trade("2026-10-01 10:00", 0, 2)]
+        neg = decide_month_gates(
+            neg_base, neg_cand, holdout_start="2026-09-01 00:00")
+        assert neg.month_gates["edge"] == -100
+        assert neg.month_gates["share_applied"] is False
+        assert any("share gate not applied" in r for r in neg.reasons)
 
 
 class TestOctStubDesiredFail:
@@ -211,3 +278,55 @@ class TestMonthGateLoggingWired:
             and node.args[0].func.id == "format_month_gates_debug"
         ]
         assert len(logs) == 1
+        guarded = _month_gate_log_try(src)
+        assert guarded.strip().startswith("try:")
+        assert "except Exception" in guarded
+        assert call < src.index(guarded) < combined
+        # The handler records the failure and does not re-raise.
+        guard_tree = ast.parse(_normalize_source_segment(guarded))
+        try_node = guard_tree.body[0]
+        assert isinstance(try_node, ast.Try)
+        assert try_node.handlers
+        assert all(
+            isinstance(h.type, ast.Name) and h.type.id == "Exception"
+            for h in try_node.handlers)
+        assert not any(isinstance(n, ast.Raise) for n in ast.walk(try_node))
+
+    def test_log_failure_does_not_escape(self):
+        src = _pipeline_src()
+        segment = _normalize_source_segment(_month_gate_log_try(src))
+        month_verdict = type("V", (), {"month_gates": {"passed": True}})()
+
+        logged: list[str] = []
+
+        def _ok(msg):
+            logged.append(msg)
+
+        exec(segment, {
+            "_log": _ok,
+            "format_month_gates_debug": lambda block: "EVO month gates: verdict=PASS",
+            "month_verdict": month_verdict,
+        })
+        assert logged == ["EVO month gates: verdict=PASS"]
+
+        def _format_boom(block):
+            raise ValueError("bad observation")
+
+        logged.clear()
+        exec(segment, {
+            "_log": _ok,
+            "format_month_gates_debug": _format_boom,
+            "month_verdict": month_verdict,
+        })
+        assert len(logged) == 1
+        assert "EVO month gates log failed:" in logged[0]
+        assert "ValueError" in logged[0]
+
+        def _log_boom(msg):
+            raise OSError("debug.log unavailable")
+
+        exec(segment, {
+            "_log": _log_boom,
+            "format_month_gates_debug": lambda block: "EVO month gates: verdict=PASS",
+            "month_verdict": month_verdict,
+        })
