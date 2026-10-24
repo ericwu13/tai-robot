@@ -431,9 +431,13 @@ def test_v2199_checklist_is_one_combined_oreopie_run():
     assert "MainWindowHandle" in text
     assert "conhost.exe" in text
     assert "from src.paths import skips_gui_and_com" in text
-    assert "outcome=ok" in text
-    assert "(f) exit code (must be 0; exit 1 is a fail):" in text
-    assert "exit code (must be 1)" not in text
+    assert "(f) exit code (must be 1):" in text
+    assert "outcome=crash" in text
+    assert "not a grid outcome" in text
+    assert "result_bytes` is greater than 131072" in text
+    assert "(f) elapsed_s (must be below --timeout-s 60, no hang):" in text
+    assert "An exit 1 without both" in text
+    assert "(f) exit code (must be 0; exit 1 is a fail):" not in text
 
 
 def test_install_notes_document_headless_exe():

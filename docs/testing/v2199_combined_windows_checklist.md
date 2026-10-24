@@ -175,9 +175,10 @@ confirm that PID is gone before the smoke gates.
 ## #194 gates (a) through (f)
 
 Same pass rules as `docs/testing/grid_subprocess_windows_checklist.md`,
-with this folder and this payload size, except gate (f) below. The
-smoke flag exits before Tk and COM. It does not read `settings.yaml`
-and does not use the network.
+with this folder and payload size 131072 on gate (f). The smoke flag
+exits before Tk and COM. It does not read `settings.yaml` and does not
+use the network. Gate (f) is spelled out below: exit 1 is a pass only
+together with the non-grid text, the payload size, and a prompt return.
 
 Snapshot command (test processes only):
 
@@ -249,8 +250,10 @@ for this.
 ### (f) Payload larger than the 8 KB Windows pipe
 
 Use **131072** bytes (over the 8 KB pipe). The child builds the blob.
-It is not in the pickled job. This checklist does not change the
-smoke command's exit codes. It only changes what counts as a pass.
+It is not in the pickled job. With `--payload-bytes` the child returns
+a blob that is not a `GridOutcome`, so the smoke exits **1** with
+`outcome=crash` and the text `not a grid outcome`. That is the design.
+This checklist does not change those exit codes.
 
 ```powershell
 .\tai_backtest.exe --grid-subprocess-smoke --payload-bytes 131072 --timeout-s 60
@@ -259,18 +262,21 @@ echo "exit=$LASTEXITCODE"
 
 Pass, all of these:
 
-- Returns well under 60 seconds. It does not hang.
-- Exit code is **0**.
-- Output contains `outcome=ok`.
-- Output contains `payload_bytes=131072`, and `result_bytes` is greater
-  than 131072 (the expected payload size).
+- The process returns promptly and does not hang. Record `elapsed_s`
+  from the smoke output. It must be below the `--timeout-s` used on
+  this command (60).
+- Exit code is **1**.
+- Output contains `outcome=crash`.
+- stdout or stderr contains `not a grid outcome`.
+- `result_bytes` is greater than 131072.
 - The `--multiprocessing-fork` PID is gone.
 - No Tk window, no broker login, no API-key prompt.
 
-Exit code **1** is not a pass. 1 is also the crash code, so a crash
-must not be recorded as a successful payload. Fail on exit 1, on any
-outcome other than `ok`, on `outcome=timeout`, if the process is still
-alive at 60 seconds, or if `result_bytes` is not greater than 131072.
+An exit 1 without both the `not a grid outcome` text and
+`result_bytes` > 131072 is a FAIL. That keeps this gate distinct from
+a real crash, which also exits 1. Also fail on `outcome=timeout`, on
+`elapsed_s` that is not below 60, if the process is still alive at the
+timeout, or on exit code 0 or 2.
 
 ## Frozen hook imports src.paths
 
@@ -370,10 +376,11 @@ grid mode: exit code (must be 0) / outcome / result_bytes:
 (d) outcome=stopped and exit code 3 (yes/no):
 (e) outcome=timeout, exit code 2, elapsed_s about 8:
 (f) command: --grid-subprocess-smoke --payload-bytes 131072 --timeout-s 60
-(f) exit code (must be 0; exit 1 is a fail):
-(f) outcome=ok (must be yes):
-(f) payload_bytes (must be 131072):
+(f) exit code (must be 1):
+(f) outcome=crash (must be yes):
+(f) stdout/stderr contains "not a grid outcome" (must be yes):
 (f) result_bytes (must be > 131072):
+(f) elapsed_s (must be below --timeout-s 60, no hang):
 
 cleanup: Stop-Process -Id only for ExecutablePath under C:\tai-test-177\ (yes/no)
 taskkill /IM or Stop-Process -Name used (must be no):
