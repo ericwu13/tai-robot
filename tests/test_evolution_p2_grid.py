@@ -32,9 +32,11 @@ from src.evolution.grid_search import (
 )
 from src.evolution.knobs import knob_proposal_rejection
 from src.evolution.paper_gate import (
+    DEFAULT_MIN_DIVERGENT_FOLDS,
     TrialPenaltyConfig,
     bounded_min_divergent_folds,
     evolution_gate_config_from_mapping,
+    resolve_promotion_gate,
 )
 from src.evolution.trial_penalty import (
     choose_partitions,
@@ -327,12 +329,18 @@ class TestSearchSwitch:
 
 
 class TestDivergentFloorAndDefault:
-    def test_min_divergent_folds_below_two_falls_back(self):
+    def test_min_divergent_folds_out_of_range_uses_the_q2_default(self):
+        # Q2 fold majority: "≥ 3 divergent folds". The fallback is that
+        # named default, and Q2 is what sets the number to 3.
+        q2_default = DEFAULT_MIN_DIVERGENT_FOLDS
+        assert q2_default == 3
         assert bounded_min_divergent_folds(2) == 2
-        assert bounded_min_divergent_folds(1) == 3
-        assert bounded_min_divergent_folds(0) == 3
+        assert bounded_min_divergent_folds(1) == q2_default
+        assert bounded_min_divergent_folds(0) == q2_default
+        assert bounded_min_divergent_folds(True) == q2_default
         assert bounded_min_divergent_folds(30) == 30
-        assert bounded_min_divergent_folds(31) == 3
+        assert bounded_min_divergent_folds(31) == q2_default
+        assert bounded_min_divergent_folds("nope") == q2_default
         kept = evolution_gate_config_from_mapping({
             "relative": {"min_divergent_folds": 2},
         })
@@ -341,12 +349,12 @@ class TestDivergentFloorAndDefault:
         low = evolution_gate_config_from_mapping({
             "relative": {"min_divergent_folds": 1},
         })
-        assert low.relative.min_divergent_folds == 3
+        assert low.relative.min_divergent_folds == q2_default
         assert any("min_divergent_folds" in w for w in low.warnings)
         high = evolution_gate_config_from_mapping({
             "relative": {"min_divergent_folds": 31},
         })
-        assert high.relative.min_divergent_folds == 3
+        assert high.relative.min_divergent_folds == q2_default
         assert any("min_divergent_folds" in w for w in high.warnings)
 
     def test_relative_gate_uses_the_bounded_floor(self):
@@ -408,7 +416,7 @@ class TestDivergentFloorAndDefault:
         evo = data["evolution"]
         assert evo["paper_gate"] == "relative"
         assert evo["search"] == "grid_batch"
-        assert evo["relative"]["min_divergent_folds"] == 3
+        assert evo["relative"]["min_divergent_folds"] == DEFAULT_MIN_DIVERGENT_FOLDS
         assert evo["trial_penalty"]["max_settings"] == 48
         assert evo["trial_penalty"]["dsr_min"] == pytest.approx(0.90)
         assert evo["trial_penalty"]["pbo_max"] == pytest.approx(0.50)
@@ -416,3 +424,26 @@ class TestDivergentFloorAndDefault:
         blank = evolution_gate_config_from_mapping({})
         assert cfg == blank
         assert cfg.paper_gate == "relative"
+
+    def test_invalid_paper_gate_falls_back_to_absolute_with_a_warning(self):
+        cfg = evolution_gate_config_from_mapping({"paper_gate": "nope"})
+        assert cfg.paper_gate == "absolute"
+        assert any("warning" in w and "paper_gate" in w for w in cfg.warnings)
+        gate = resolve_promotion_gate("paper", "nope", "absolute")
+        assert gate.mode == "absolute"
+        assert "warning" in gate.note
+        assert "absolute" in gate.note
+        # A missing key is still relative, and only on a known paper mode.
+        blank = evolution_gate_config_from_mapping({})
+        assert blank.paper_gate == "relative"
+        assert blank.warnings == ()
+        known = resolve_promotion_gate("backtest", blank.paper_gate, "absolute")
+        assert known.mode == "relative"
+        assert known.note == ""
+
+    def test_unknown_trading_mode_falls_back_to_absolute_with_a_warning(self):
+        gate = resolve_promotion_gate("shadow", "relative", "absolute")
+        assert gate.mode == "absolute"
+        assert "warning" in gate.note
+        assert "absolute" in gate.note
+        assert "is real money" not in gate.note

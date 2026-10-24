@@ -2,9 +2,11 @@
 
 The real-money path keeps ``ABS_PF_FLOOR`` and every current gate. The
 paper path uses the relative rule. ``evolution.paper_gate`` defaults to
-``relative`` now that the grid's DSR and PBO scores exist; ``absolute``
-is still the real-money rule and is still what a paper bot uses when
-the key is set back to ``absolute``. Retirement never disables a bot,
+``relative`` for the exact modes ``paper`` and ``backtest``. An invalid
+value, and any trading mode that is not one of those two, falls back
+to ``absolute`` and warns. ``absolute`` is still the real-money rule
+and is still what a paper bot uses when the key is set back to it.
+Retirement never disables a bot,
 never writes settings or an allowlist, and never changes a pool status
 — it only returns text for a log line, a changelog entry, and a report.
 
@@ -41,10 +43,14 @@ DEFAULT_PAPER_GATE = "relative"
 DEFAULT_BOOTSTRAP_RESAMPLES = 10_000
 DEFAULT_BOOTSTRAP_SEED = 20261024
 DEFAULT_MIN_NONEMPTY_FOLDS = 6
+# Nova Q2 fold majority: "≥ 3 divergent folds". An out-of-range
+# ``relative.min_divergent_folds`` falls back to this name. The 3 is
+# Q2's figure, not a second literal in the fallback.
 DEFAULT_MIN_DIVERGENT_FOLDS = 3
 # A configured floor below this is rejected. 1 divergent fold is not a
-# majority sample. The approved default stays 3.
+# majority sample. Values above 30 are outside the approved sample.
 MIN_DIVERGENT_FOLDS_BOUND = 2
+MAX_DIVERGENT_FOLDS_BOUND = 30
 DEFAULT_DSR_MIN = 0.90
 DEFAULT_PBO_MAX = 0.50
 DEFAULT_MAX_SETTINGS = 48
@@ -254,18 +260,34 @@ def _mapping(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def recognized_paper_gate(value) -> str | None:
+    """``absolute`` or ``relative`` after strip and case-fold, else None.
+
+    ``None`` is an invalid value. The caller falls back to absolute and
+    warns. A missing config key is not passed here: that absence is the
+    relative default, and only for a known paper or backtest mode.
+    """
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in _PAPER_GATE_VALUES:
+            return key
+    return None
+
+
 def bounded_min_divergent_folds(value) -> int:
     """The divergent-fold floor the relative gate actually uses.
 
     Values below 2 or above 30 are not a configured floor. They become
-    the approved default (3). Two is the smallest number that can be
-    asked to agree.
+    ``DEFAULT_MIN_DIVERGENT_FOLDS``, which is Q2's "≥ 3 divergent
+    folds". Two is the smallest number that can be asked to agree.
     """
     try:
         n = int(value)
     except (TypeError, ValueError):
         return DEFAULT_MIN_DIVERGENT_FOLDS
-    if isinstance(value, bool) or n < MIN_DIVERGENT_FOLDS_BOUND or n > 30:
+    if (isinstance(value, bool)
+            or n < MIN_DIVERGENT_FOLDS_BOUND
+            or n > MAX_DIVERGENT_FOLDS_BOUND):
         return DEFAULT_MIN_DIVERGENT_FOLDS
     return n
 
@@ -274,24 +296,31 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
     """Parse ``evolution:`` . Missing or junk keys fall back to the defaults.
 
     ``real_gate`` other than ``absolute`` is stored as ``absolute``.
-    The real-money path has no relative mode. ``paper_gate`` defaults
-    to ``relative``. ``search`` defaults to ``grid_batch``.
+    The real-money path has no relative mode. A missing ``paper_gate``
+    is ``relative``. A present but invalid value is ``absolute`` and
+    warns (fail closed, as in #188). ``search`` defaults to
+    ``grid_batch``.
     """
     evo = _mapping(evo)
     rel = _mapping(evo.get("relative"))
     ret = _mapping(evo.get("retire"))
     pen = _mapping(evo.get("trial_penalty"))
-    raw_paper = evo.get("paper_gate", DEFAULT_PAPER_GATE)
-    paper = _choice(raw_paper, _PAPER_GATE_VALUES, DEFAULT_PAPER_GATE)
+    warnings: list[str] = []
+    if "paper_gate" not in evo:
+        paper = DEFAULT_PAPER_GATE
+    else:
+        recognized = recognized_paper_gate(evo.get("paper_gate"))
+        if recognized is None:
+            paper = "absolute"
+            warnings.append(
+                f"warning: paper_gate {evo.get('paper_gate')!r} is not "
+                f"absolute|relative; using absolute")
+        else:
+            paper = recognized
     raw_search = evo.get("search", DEFAULT_SEARCH)
     search = _choice(raw_search, ("grid_batch", "llm_one"), DEFAULT_SEARCH)
     # Any non-absolute value, including "relative", is coerced.
     real = "absolute"
-    warnings: list[str] = []
-    if "paper_gate" in evo and paper != str(raw_paper).strip().lower():
-        warnings.append(
-            f"paper_gate {raw_paper!r} is not absolute|relative; "
-            f"using {paper}")
     if "search" in evo and search != str(raw_search).strip().lower():
         warnings.append(
             f"search {raw_search!r} is not grid_batch|llm_one; using {search}")
@@ -314,7 +343,8 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
     # itself). Above 30 is not the approved sample. Both fall back.
     min_divergent = _present_closed_int(
         rel, "min_divergent_folds", DEFAULT_MIN_DIVERGENT_FOLDS,
-        lo=MIN_DIVERGENT_FOLDS_BOUND, hi=30, warnings=warnings)
+        lo=MIN_DIVERGENT_FOLDS_BOUND, hi=MAX_DIVERGENT_FOLDS_BOUND,
+        warnings=warnings)
     dsr_min = _present_open_float(
         pen, "dsr_min", DEFAULT_DSR_MIN, lo=0.0, hi=1.0,
         warnings=warnings, prefix="trial_penalty")
@@ -399,36 +429,45 @@ def resolve_promotion_gate(trading_mode: str, paper_gate: str,
                            real_gate: str) -> PromotionGate:
     """Relative only for the exact strings ``paper`` and ``backtest``.
 
-    ``semi_auto``, ``auto``, ``live``, and ``full_auto`` are real money
-    and stay absolute, with a note that says so. ``""``, ``None``, and
-    any other value — including a different case or surrounding space —
-    stay absolute and are not treated as paper. Comparison is exact:
-    no strip and no case fold.
+    Those two modes use ``relative`` only when ``paper_gate`` is the
+    recognized value ``relative``. An invalid ``paper_gate`` falls back
+    to absolute and the note is a warning. ``semi_auto``, ``auto``,
+    ``live``, and ``full_auto`` are real money and stay absolute.
+    ``""``, ``None``, and any other trading mode — including a different
+    case or surrounding space — stay absolute, with a warning, and are
+    not treated as paper. Mode comparison is exact: no strip and no
+    case fold.
     """
-    paper = _choice(paper_gate, _PAPER_GATE_VALUES, DEFAULT_PAPER_GATE)
-    real_note = ""
+    recognized = recognized_paper_gate(paper_gate)
+    notes: list[str] = []
+    if recognized is None:
+        paper = "absolute"
+        notes.append(
+            f"warning: paper_gate {paper_gate!r} is not absolute|relative; "
+            f"using absolute")
+    else:
+        paper = recognized
     if (real_gate or "").strip().lower() not in ("", "absolute"):
-        real_note = (
+        notes.append(
             f"real_gate {real_gate!r} ignored; real-money path stays absolute"
         )
     mode_key = trading_mode if isinstance(trading_mode, str) else ""
     if mode_key in _REAL_MONEY_MODES:
-        note = (
+        notes.insert(
+            0,
             f"trading mode {mode_key} is real money; "
-            f"paper_gate={paper} does not apply"
+            f"paper_gate={paper} does not apply",
         )
-        if real_note:
-            note = f"{note}; {real_note}"
-        return PromotionGate("absolute", note)
+        return PromotionGate("absolute", "; ".join(notes))
     if mode_key in _RELATIVE_MODES:
         if paper == "relative":
-            return PromotionGate("relative", real_note)
-        return PromotionGate("absolute", real_note)
+            return PromotionGate("relative", "; ".join(notes))
+        return PromotionGate("absolute", "; ".join(notes))
     label = mode_key if mode_key else "(empty)"
-    return PromotionGate(
-        "absolute",
-        f"trading mode {label} is not paper; absolute gate",
-    )
+    notes.append(
+        f"warning: trading mode {label} is not a known paper or backtest "
+        f"mode; using absolute")
+    return PromotionGate("absolute", "; ".join(notes))
 
 
 def evolution_promotion_mode(*, runner, runner_idle: bool, configured_mode):

@@ -143,11 +143,13 @@ evolution:
   # when the last trade exit is at least this many calendar days ago.
   # Default 7. Set 0 to disable the idle line entirely. Not a credential.
   idle_warn_days: 7
-  # P1 promotion gate. Default is "relative" now that the Saturday
-  # grid scores DSR and PBO (P2). "relative" is the paper path only.
-  # Real-money modes ignore paper_gate and keep the absolute PF floor.
-  # Set "absolute" to restore the old paper rule. real_gate is accepted
-  # only as "absolute"; any other value is ignored.
+  # P1 promotion gate. Default is "relative" for the exact modes
+  # paper and backtest, now that the Saturday grid scores DSR and PBO.
+  # An invalid paper_gate value falls back to absolute and warns.
+  # An unknown trading mode does the same. Real-money modes ignore
+  # paper_gate and keep the absolute PF floor. Set "absolute" to
+  # restore the old paper rule. real_gate is accepted only as
+  # "absolute"; any other value is ignored.
   paper_gate: relative
   real_gate: absolute
   # Saturday knob search. "grid_batch" (default) pre-registers a grid
@@ -159,8 +161,9 @@ evolution:
   search: grid_batch
   # Thresholds used when paper_gate is relative. Approved Q2 values.
   # post_backfill_start empty defers the "≥2 folds after backfill" check
-  # until a span date is set. min_divergent_folds must be >= 2; a
-  # smaller value falls back to 3. DSR / PBO thresholds live under
+  # until a span date is set. min_divergent_folds must be >= 2 and
+  # at most 30. Anything outside that falls back to the Q2 default
+  # (≥ 3 divergent folds). DSR / PBO thresholds live under
   # trial_penalty, not here.
   relative:
     min_nonempty_folds: 6

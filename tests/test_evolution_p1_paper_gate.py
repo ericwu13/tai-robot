@@ -224,14 +224,14 @@ class TestGateConfig:
         blank = evolution_gate_config_from_mapping({})
         assert cfg == blank
 
-    def test_junk_paper_gate_uses_the_relative_default_and_real_gate_cannot_go_relative(self):
+    def test_junk_paper_gate_falls_back_to_absolute_and_real_gate_cannot_go_relative(self):
         cfg = evolution_gate_config_from_mapping({
             "paper_gate": "nope",
             "real_gate": "relative",
         })
-        assert cfg.paper_gate == "relative"
+        assert cfg.paper_gate == "absolute"
         assert cfg.real_gate == "absolute"
-        assert any("paper_gate" in w for w in cfg.warnings)
+        assert any("warning" in w and "paper_gate" in w for w in cfg.warnings)
         forced = resolve_promotion_gate("paper", "relative", "relative")
         assert forced.mode == "relative"
         assert "ignored" in forced.note
