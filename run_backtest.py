@@ -536,6 +536,27 @@ def _load_settings():
             cfg["evolution_knob_ineligible_fallback"] = (
                 normalize_knob_ineligible_fallback(
                     evo.get("knob_ineligible_fallback", "none")))
+            # P6 / structural lane. A missing saturday_mode is propose.
+            # "promote" is an explicit opt-in. The lane stays off.
+            # A failure here must not drop news/regime settings below.
+            try:
+                from src.evolution.structural_lane import settings_from_evolution
+                _lane_settings = settings_from_evolution(
+                    evo if isinstance(evo, dict) else {})
+                cfg.update(_lane_settings)
+                _lane_warnings = (
+                    (_lane_settings.get("evolution_structural_lane") or {})
+                    .get("warnings") or [])
+                for _lane_warning in _lane_warnings:
+                    _log(f"EVO structural lane config: {_lane_warning}")
+            except Exception as exc:
+                cfg["evolution_saturday_mode"] = "propose"
+                cfg["evolution_structural_lane"] = {"enabled": False}
+                try:
+                    _log("evolution structural lane config failed: "
+                         f"[{type(exc).__name__}] {exc}")
+                except Exception:
+                    pass
             # News/event framework (src.news). Paths are written by an
             # external n8n workflow; empty paths keep the feature inert.
             # Defaults mirror src.config.settings.NewsConfig exactly.
@@ -5524,7 +5545,12 @@ class BacktestApp:
             # class + source + grid key does not re-record or move the
             # watermark; a new source hash or grid hash is re-evaluated.
             # knob_ineligible_fallback never selects weekly codegen.
-            # Eligible classes are untouched.
+            # Eligible classes are untouched. structural_only is the
+            # ineligible class that the enabled monthly lane admitted;
+            # it must not fall through into weekly codegen, and it must
+            # not append the knob-ineligible skip — that attempt
+            # continues as the structural run and writes one history line.
+            structural_only = False
             if auto_run and _evo_cls is not None:
                 from src.evolution.knobs import (
                     normalize_knob_ineligible_fallback, settle_knob_ineligibility)
@@ -5542,8 +5568,19 @@ class BacktestApp:
                             _discord.notify_evolution(msg)
                         except Exception:
                             pass
-                    _remember("skip", reason_kind="knob_ineligible", reason=msg)
-                    return
+                    from src.evolution.structural_lane import (
+                        ineligible_structural_divert, lane_config_from_settings)
+                    if lane_config_from_settings(self._settings).get("enabled"):
+                        structural_only = ineligible_structural_divert(
+                            self._settings,
+                            fallback=_knob_fallback,
+                            bot_id=BacktestApp._structural_bot_id(self),
+                            month=_taipei_now().strftime("%Y-%m"),
+                            ledger_path=BacktestApp._structural_ledger_path(self),
+                        )
+                    if not structural_only:
+                        _remember("skip", reason_kind="knob_ineligible", reason=msg)
+                        return
 
             if watermark and cut_idx <= omitted:
                 # No NEW design-window trades since the last run — the recent
@@ -5720,12 +5757,39 @@ class BacktestApp:
                    + len(source_section) + 300)
             # The grid does not send the trade payload to a model to pick a
             # setting, so a large payload must not drop an eligible class
-            # back onto the plan-only LLM path.
+            # back onto the plan-only LLM path. The monthly structural
+            # turn is a different lane: when it launches, it replaces the
+            # grid for this Saturday. A used slot falls through to the grid.
             from src.evolution.grid_search import grid_search_applies
             _use_grid = auto and grid_search_applies(
                 _evo_cls, _evo_source,
                 self._settings.get("evolution_gate_raw") or {})
-            if auto and (est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT or _use_grid):
+            from src.evolution.structural_lane import lane_config_from_settings
+            _lane_on = bool(
+                lane_config_from_settings(self._settings).get("enabled"))
+            launched = False
+            if (auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT
+                    and auto_run and (structural_only or _lane_on)):
+                # The monthly structural turn is a different lane from
+                # the knob grid. It uses the same in-process guard
+                # (guard_held) and the same history append. A class
+                # admitted only because it is knob-ineligible must not
+                # fall through into weekly codegen if the launch refuses.
+                launched = BacktestApp._maybe_launch_structural(
+                    self, preamble, sent_lines, source_section, result,
+                    auto_run=auto_run, holdout_days=holdout_days,
+                    bot_dir=bot_dir, design_cut_idx=cut_idx,
+                    watermark=watermark, source=_evo_source,
+                    structural_only=structural_only)
+            if launched is True:
+                handed = True
+            elif launched == "refused" or structural_only:
+                # Refusal already appended the one history line and
+                # did not start a worker. The finally releases the guard.
+                # A reserve failure ("refused") does not run the grid.
+                pass
+            elif auto and (
+                    est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT or _use_grid):
                 self._start_evolution_pipeline(
                     preamble, sent_lines, source_section, result,
                     auto_run=auto_run, holdout_days=holdout_days,
@@ -5859,12 +5923,151 @@ class BacktestApp:
 
         return "\n".join(lines) + "\n\n"
 
+    def _structural_bot_id(self) -> str:
+        """Lane identity from the symbol and the strategy name. Not a bot list."""
+        from src.evolution.structural_lane import sanitize_bot_id
+        runner = getattr(self, "_live_runner", None)
+        symbol = str(getattr(runner, "symbol", "") or "")
+        name = ""
+        try:
+            name = str(self.strategy_var.get() or "")
+        except Exception:
+            name = ""
+        cls_name = ""
+        strat = getattr(runner, "strategy", None)
+        if strat is not None:
+            cls_name = type(strat).__name__
+        raw = "_".join(part for part in (symbol, name or cls_name) if part)
+        return sanitize_bot_id(raw)
+
+    def _structural_ledger_path(self):
+        """Shared lane ledger. Empty config uses data/evolution/, not settings."""
+        from src.evolution.structural_lane import lane_config_from_settings
+        cfg = lane_config_from_settings(getattr(self, "_settings", {}) or {})
+        raw = str(cfg.get("ledger_path") or "").strip()
+        if raw:
+            return Path(raw)
+        return Path(project_root) / "data" / "evolution" / "structural_lane.json"
+
+    def _maybe_launch_structural(self, preamble, sent_lines, source_section,
+                                 result, auto_run, holdout_days, bot_dir,
+                                 design_cut_idx, structural_only: bool,
+                                 watermark=None, source: str = "") -> bool:
+        """Start one structural-lane run, or return False to keep the knob path.
+
+        Reserves the monthly slot before the pipeline so a failed codegen
+        cannot be re-rolled the same month. Writes the ledger only.
+        The caller already holds the in-process evolution guard. This
+        method does not take another lock. A structural-only refusal
+        appends the one history line for the attempt and starts no worker.
+        """
+        from src.evolution.structural_lane import (
+            admission_decision, lane_config_from_settings, load_ledger,
+            reserve_structural_slot, structural_plan_block)
+        cfg = lane_config_from_settings(self._settings)
+        if not cfg.get("enabled"):
+            return False
+        bot_id = BacktestApp._structural_bot_id(self)
+        month = _taipei_now().strftime("%Y-%m")
+        ledger_path = BacktestApp._structural_ledger_path(self)
+        fallback = str(
+            self._settings.get("evolution_knob_ineligible_fallback") or "")
+
+        def _refuse(reason: str) -> bool:
+            note = f"EVO structural lane not run: {reason}"
+            _log(note)
+            try:
+                self._append_chat("system", note)
+            except Exception:
+                pass
+            if not structural_only:
+                return False
+            if _discord is not None and getattr(_discord, "enabled", False):
+                try:
+                    _discord.notify_evolution(note)
+                except Exception:
+                    pass
+            _persist_evolution_history(
+                bot_dir,
+                bot=self.strategy_var.get(),
+                class_name=_evolution_class_name(self),
+                source=source or "",
+                cut_idx=design_cut_idx,
+                watermark=watermark,
+                final_status="refused",
+                reason_kind="refused",
+                reason=note,
+                ai_calls=0,
+                thresholds_raw=self._settings.get("evolution_gate_raw"),
+            )
+            return False
+
+        decision = admission_decision(
+            enabled=True,
+            ineligible=bool(structural_only),
+            fallback=fallback,
+            bot_id=bot_id,
+            month=month,
+            ledger=load_ledger(ledger_path),
+            config=cfg,
+        )
+        if not decision.admit:
+            return _refuse(decision.reason)
+        reserved = reserve_structural_slot(
+            ledger_path, bot_id=bot_id, month=month, config=cfg,
+            now=_taipei_now(), ineligible=bool(structural_only),
+            fallback=fallback)
+        if not reserved.admit:
+            return _refuse(reserved.reason)
+        _log("EVO structural lane: this Saturday is the monthly structural "
+             "turn; the knob grid is not run")
+        self._start_evolution_pipeline(
+            preamble + "\n" + structural_plan_block(),
+            sent_lines, source_section, result,
+            auto_run=auto_run, holdout_days=holdout_days,
+            bot_dir=bot_dir, design_cut_idx=design_cut_idx,
+            watermark=watermark, guard_held=True,
+            structural_lane=True,
+            structural_ledger=str(ledger_path),
+            structural_bot_id=bot_id,
+            structural_month=month)
+        return True
+
+    def _write_saturday_proposal(self, *, status: str, evidence: dict,
+                                 lane: str, form: str = "",
+                                 ledger_path: str = "", bot_id: str = "",
+                                 month: str = "", touch_slot: bool = False,
+                                 incubation: dict | None = None) -> str:
+        """Record a proposal. Does not promote, save, or edit settings."""
+        from src.evolution.structural_lane import (
+            format_proposal_notice, record_proposal)
+        ledger = ledger_path or str(BacktestApp._structural_ledger_path(self))
+        bot = bot_id or BacktestApp._structural_bot_id(self)
+        when = month or _taipei_now().strftime("%Y-%m")
+        body = record_proposal(
+            Path(ledger).parent,
+            bot_id=bot,
+            month=when,
+            lane=lane,
+            status=status,
+            evidence=evidence,
+            form=form,
+            ledger_path=ledger if (touch_slot or incubation is not None) else None,
+            touch_slot=touch_slot,
+            incubation=incubation,
+        )
+        return format_proposal_notice(body)
+
     def _start_evolution_pipeline(self, preamble: str, trade_lines: list[str],
                                   source_section: str, result,
                                   auto_run: bool = False,
                                   holdout_days: int = 14,
                                   bot_dir=None, design_cut_idx: int = 0,
-                                  watermark=None, guard_held: bool = False) -> None:
+                                  watermark=None, guard_held: bool = False,
+                                  structural_lane: bool = False,
+                                  structural_ledger: str = "",
+                                  structural_bot_id: str = "",
+                                  structural_month: str = "") -> None:
         """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
 
         One click, no manual steps until deployment: the plan's own
@@ -5873,12 +6076,12 @@ class BacktestApp:
         candidate in the StrategyPool to ``validated`` only — it does
         NOT write the StrategyStore and does NOT register STRATEGIES
         (issue #153). Deploying to live trading stays manual by design.
-        An eligible knob class is searched by the pre-registered grid
-        (at most 48 settings, at most 2 knobs together). DSR, PBO, and
-        the plateau pick the setting. The model may only explain it.
-        ``evolution.search: llm_one`` keeps the one-change plan.
-        Structural codegen stays the path for classes that are not on
-        the knob grid.
+        Saturday auto on a knob-grid class applies an allowlisted knob
+        grid (max 2). The monthly structural lane is separate and stays
+        off unless ``evolution.structural_lane.enabled``. Propose mode
+        records evidence and does not promote the pool. Both of those
+        Saturday paths append the same evolution-history line and use
+        the same in-process run guard. Neither adds a lock or a cap.
 
         Runs in a worker thread; every Tk touch goes through root.after.
         """
@@ -6056,6 +6259,23 @@ class BacktestApp:
                         except Exception:
                             pass
 
+                def _record_structural(status: str, evidence: dict,
+                                       form: str = "") -> str:
+                    # Proposal artifact only. The history line is _remember.
+                    if not structural_lane:
+                        return ""
+                    try:
+                        return BacktestApp._write_saturday_proposal(
+                            self, status=status, evidence=evidence,
+                            lane="structural", form=form,
+                            ledger_path=structural_ledger,
+                            bot_id=structural_bot_id, month=structural_month,
+                            touch_slot=True)
+                    except Exception as e:
+                        _log("EVO structural proposal record failed: "
+                             f"[{type(e).__name__}] {e}")
+                        return ""
+
                 try:
                     # ── Phase 1: grid search, or the evolution plan ──
                     # Eligible knob classes are scored on a pre-registered
@@ -6066,7 +6286,10 @@ class BacktestApp:
                     grid_trial = None
                     _knob_apply = None
                     grid_outcome = None
-                    if grid_search_applies(
+                    _structural_form = ""
+                    # The monthly structural Saturday replaces the grid.
+                    # Other runs search the pre-registered knob grid.
+                    if (not structural_lane) and grid_search_applies(
                             baseline_cls, strategy_source, evolution_gate_raw):
                         ui(self._append_chat, "system",
                            "EVO 1/3: 預先登記的旋鈕網格評分中（模型不挑選設定）。"
@@ -6157,11 +6380,40 @@ class BacktestApp:
                         if directives["action"] == "no_change":
                             msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
                                    "Plan says no change — pipeline stops here.")
+                            if structural_lane:
+                                notice = _record_structural("refused", {
+                                    "reason": "plan said no_change",
+                                    "dsr_trials": 0,
+                                })
+                                if notice:
+                                    msg = msg + "\n" + notice
                             ui(self._append_chat, "system", msg)
                             if auto_run:
                                 _notify_discord(msg)
                             _remember("no_change", "no_change", msg)
                             return
+                        # Structural lane: the plan must name one menu form.
+                        # A knob-only plan is refused. The month slot stays used.
+                        # This return is before the watermark. History is the
+                        # same append as every other refusal.
+                        if structural_lane:
+                            from src.evolution.structural_lane import parse_structural_form
+                            _structural_form = parse_structural_form(plan) or ""
+                            if not _structural_form:
+                                notice = _record_structural("refused", {
+                                    "reason": "plan did not name exactly one structural form",
+                                    "dsr_trials": 0,
+                                })
+                                msg = ("🧬 EVO structural lane refused: the plan did not "
+                                       "name exactly one menu form. This month's slot is "
+                                       "used. Nothing was applied.")
+                                if notice:
+                                    msg = msg + "\n" + notice
+                                ui(self._append_chat, "system", msg)
+                                if auto_run:
+                                    _notify_discord(msg)
+                                _remember("refused", "refused", msg)
+                                return
                         # Issue #153: an eligible class with an off-grid / structural
                         # plan is refused BEFORE the watermark, so that plan does
                         # not burn next week's delta.
@@ -6171,7 +6423,7 @@ class BacktestApp:
                         # _bot_evolution settles this before the AI call; this is
                         # the backstop if a plan was already in hand.
                         _knob_apply = None
-                        if auto_run and baseline_cls is not None:
+                        if auto_run and baseline_cls is not None and not structural_lane:
                             from src.evolution.knobs import (
                                 is_knob_not_applicable_reason,
                                 normalize_knob_ineligible_fallback,
@@ -6247,7 +6499,61 @@ class BacktestApp:
                     candidate_cls = None
                     code = ""
                     last_err = ""
-                    if _knob_apply:
+                    if structural_lane:
+                        # One attempt. This is not the Saturday codegen retry loop.
+                        ui(self._append_chat, "system",
+                           f"EVO 2/3: structural lane form {_structural_form} — "
+                           f"one codegen attempt, no retry, as {candidate_name}...")
+                        from src.evolution.structural_lane import (
+                            structural_codegen_prompt)
+                        gen_msg = structural_codegen_prompt(
+                            source=strategy_source,
+                            plan=plan,
+                            candidate_name=candidate_name,
+                            form=_structural_form,
+                            context=STRATEGY_CODE_CONTEXT,
+                        )
+                        try:
+                            ai_calls += 1
+                            resp = self._chat_client.one_shot(
+                                gen_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                                max_tokens=_CODE_GEN_MAX_TOKENS,
+                                call_site="evolution_codegen_structural",
+                                model=heavy_model)
+                            code = extract_python_code(resp) or ""
+                            if not code:
+                                last_err = "no ```python code block found in the response"
+                            else:
+                                candidate_cls = load_strategy_from_source(code)
+                                if (name_err := check_candidate_name(
+                                        candidate_cls, candidate_name)):
+                                    candidate_cls = None
+                                    last_err = name_err
+                        except (CodeValidationError, CodeExecutionError) as e:
+                            candidate_cls = None
+                            last_err = str(e)
+                        except Exception as e:
+                            candidate_cls = None
+                            last_err = f"AI API error — [{type(e).__name__}] {e}"
+                            _log(f"EVO structural codegen failed: {last_err}")
+                        if candidate_cls is None:
+                            notice = _record_structural("refused", {
+                                "reason": last_err,
+                                "form": _structural_form,
+                                "dsr_trials": 0,
+                                "sandbox_ok": False,
+                            }, form=_structural_form)
+                            msg = (f"🧬 EVO structural lane FAIL: one codegen attempt "
+                                   f"failed — {last_err}. No retry this month. "
+                                   f"Nothing was applied.")
+                            if notice:
+                                msg = msg + "\n" + notice
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "codegen", msg)
+                            return
+                    elif _knob_apply:
                         ui(self._append_chat, "system",
                            f"EVO 2/3: Saturday knob mode — applying {_knob_apply} "
                            f"as {candidate_name} (no codegen)...")
@@ -6344,6 +6650,16 @@ class BacktestApp:
                                f"available — not enough for a meaningful validation "
                                f"backtest. Plan + candidate generated but NOT "
                                f"validated/saved; run a TV/API backtest manually.")
+                        if structural_lane:
+                            notice = _record_structural("refused", {
+                                "reason": "native bars below 150",
+                                "form": _structural_form,
+                                "native_bars": native_est,
+                                "sandbox_ok": True,
+                                "dsr_trials": 0,
+                            }, form=_structural_form)
+                            if notice:
+                                msg = msg + "\n" + notice
                         ui(self._append_chat, "system", msg)
                         if auto_run:
                             _notify_discord(msg)
@@ -6498,8 +6814,20 @@ class BacktestApp:
 
                     # Clean PASS → StrategyPool validated only. Never
                     # StrategyStore.save and never STRATEGIES[...].
+                    # Propose mode and the structural lane skip the pool.
+                    # They still append the same history line below.
                     pool_id = ""
-                    if eligible_for_validated_pool(verdict):
+                    _proposal_notice = ""
+                    from src.evolution.structural_lane import (
+                        normalize_saturday_mode, pool_promotion_allowed)
+                    _promote_pool = pool_promotion_allowed(
+                        saturday_mode=self._settings.get(
+                            "evolution_saturday_mode", "propose"),
+                        structural_lane=structural_lane,
+                        eligible=eligible_for_validated_pool(verdict),
+                        auto_run=auto_run,
+                    )
+                    if _promote_pool:
                         try:
                             from src.evolution.pool import (
                                 StrategyPool, default_pool_path,
@@ -6571,10 +6899,116 @@ class BacktestApp:
                                 )
                             except Exception as e:
                                 _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+                    elif structural_lane or (
+                            auto_run and normalize_saturday_mode(
+                                self._settings.get("evolution_saturday_mode"))
+                            == "propose"):
+                        # Evidence only. The proposal file does not replace
+                        # the history line written after the Discord verdict.
+                        try:
+                            from src.evolution.paper_gate import PromotionGate
+                            from src.evolution.structural_lane import (
+                                lane_config_from_settings, make_incubation,
+                                structural_paper_decision)
+                            _lane_cfg = lane_config_from_settings(self._settings)
+                            _q2_passed = False
+                            _q2_reasons: list[str] = []
+                            _paper_reasons: list[str] = []
+                            _paper_ok = False
+                            _incubation = None
+                            _form = _structural_form if structural_lane else ""
+                            if structural_lane:
+                                _q2_window = (
+                                    decide_deep_verdict(
+                                        baseline_res, candidate_res,
+                                        directives["criteria"],
+                                        require_abs_pf=False)
+                                    if tr_d else
+                                    decide_verdict(
+                                        baseline_res, candidate_res,
+                                        directives["criteria"],
+                                        require_abs_pf=False))
+                                _q2 = assemble_promotion_verdict(
+                                    gate=PromotionGate(
+                                        "relative",
+                                        "structural lane Q2; Saturday gate unchanged"),
+                                    gate_cfg=evo_gate_cfg,
+                                    folds=folds,
+                                    base_trades=base_trades,
+                                    cand_trades=cand_trades,
+                                    holdout_start=ho_start,
+                                    criteria=directives["criteria"],
+                                    window_verdict=_q2_window,
+                                    bars=bars,
+                                    month_gate=month_gate_cfg,
+                                    trial=None,
+                                )
+                                _q2_passed = (
+                                    bool(_q2.verdict.passed)
+                                    and not bool(_q2.verdict.provisional))
+                                _q2_reasons = list(_q2.verdict.reasons)
+                                _penalty = getattr(
+                                    self, "_structural_trial_penalty", None) or {}
+                                _paper_ok, _paper_reasons = structural_paper_decision(
+                                    sandbox_ok=True,
+                                    native_bars=native_est,
+                                    q2_passed=_q2_passed,
+                                    pbo=_penalty.get("pbo") if isinstance(
+                                        _penalty, dict) else None,
+                                    dsr=_penalty.get("dsr") if isinstance(
+                                        _penalty, dict) else None,
+                                    config=_lane_cfg,
+                                )
+                                _bt_mean = None
+                                if cand_trades:
+                                    _bt_mean = (
+                                        sum(int(getattr(t, "pnl", 0) or 0)
+                                            for t in cand_trades)
+                                        / len(cand_trades))
+                                _incubation = make_incubation(
+                                    bot_id=(structural_bot_id
+                                            or BacktestApp._structural_bot_id(self)),
+                                    month=(structural_month
+                                           or _taipei_now().strftime("%Y-%m")),
+                                    form=_form,
+                                    status=("paper_recommended" if _paper_ok
+                                            else "not_admitted"),
+                                    backtest_mean_pnl=_bt_mean,
+                                )
+                            _proposal_notice = BacktestApp._write_saturday_proposal(
+                                self,
+                                status="proposed",
+                                evidence={
+                                    "verdict_passed": bool(verdict.passed),
+                                    "reasons": list(verdict.reasons),
+                                    "q2_passed": _q2_passed,
+                                    "q2_reasons": _q2_reasons,
+                                    "paper_reasons": _paper_reasons,
+                                    "paper_recommended": _paper_ok,
+                                    "native_bars": native_est,
+                                    "sandbox_ok": True,
+                                    "dsr_trials": 1 if structural_lane else 0,
+                                    "knob_apply": _knob_apply,
+                                    "candidate": candidate_cls.__name__,
+                                },
+                                lane=("structural" if structural_lane else "saturday"),
+                                form=_form,
+                                ledger_path=structural_ledger,
+                                bot_id=structural_bot_id,
+                                month=structural_month,
+                                touch_slot=bool(structural_lane),
+                                incubation=_incubation,
+                            )
+                        except Exception as e:
+                            _log("EVO proposal record failed: "
+                                 f"[{type(e).__name__}] {e}")
+                            _proposal_notice = ""
 
                     block = format_weekend_verdict_block(
                         verdict, folds, data_desc, pool_promoted=pool_id)
-                    if verdict.passed and not pool_id:
+                    if _proposal_notice:
+                        block += "\n" + _proposal_notice
+                    elif verdict.passed and not pool_id:
                         block += ("\nPool promotion failed — nothing was registered "
                                   "and STRATEGIES was not updated.")
                     # Recommend-only. A failure here must not change the verdict
@@ -6613,10 +7047,21 @@ class BacktestApp:
                                 except Exception as rec_err:
                                     _log("EVO relative-gate record failed: "
                                          f"[{type(rec_err).__name__}] {rec_err}")
+                        _grad_stamps: list[str] = []
+                        try:
+                            from src.evolution.structural_lane import (
+                                applied_graduation_stamps, load_ledger)
+                            _grad_stamps = applied_graduation_stamps(
+                                load_ledger(structural_ledger or str(
+                                    BacktestApp._structural_ledger_path(self))))
+                        except Exception as stamp_err:
+                            _log("EVO graduation stamps unread: "
+                                 f"[{type(stamp_err).__name__}] {stamp_err}")
+                            _grad_stamps = []
                         rec = assess_retirement(
                             base_trades,
                             weeks=weeks,
-                            structural_graduations=[],
+                            structural_graduations=_grad_stamps,
                             now=datetime.now(),
                             config=evo_gate_cfg.retire,
                         )
@@ -6629,6 +7074,21 @@ class BacktestApp:
                             strategy_name=display_name,
                             version=base_cls_name,
                         )
+                        if structural_lane or (
+                                structural_ledger and os.path.exists(
+                                    structural_ledger)):
+                            from src.evolution.structural_lane import (
+                                structural_saturday_followup)
+                            structural_saturday_followup(
+                                structural_ledger or str(
+                                    BacktestApp._structural_ledger_path(self)),
+                                observations=(),
+                                log=_log,
+                                changelog=append_changelog,
+                                report=report_lines,
+                                strategy_name=display_name,
+                                version=base_cls_name,
+                            )
                         if report_lines:
                             block += "\n" + "\n".join(report_lines)
                     except Exception as retire_err:
@@ -6636,7 +7096,11 @@ class BacktestApp:
                              f"[{type(retire_err).__name__}] {retire_err}")
                     ui(self._remove_last_system_line)
                     ui(self._append_chat, "system", block)
-                    if verdict.passed and pool_id:
+                    if _proposal_notice:
+                        status = ("🧬 EVO PROPOSAL — nothing applied ("
+                                  + ("verdict pass" if verdict.passed
+                                     else "verdict fail") + ")")
+                    elif verdict.passed and pool_id:
                         status = ("🧬 EVO PASS — pool validated, "
                                   "not added to STRATEGIES")
                     elif verdict.passed:
@@ -6653,7 +7117,11 @@ class BacktestApp:
                             _discord.evolution_verdict(verdict.passed, block)
                         except Exception:
                             pass
-                    if verdict.passed and pool_id:
+                    if _proposal_notice and verdict.passed:
+                        history_reason = "proposal recorded; nothing applied"
+                    elif _proposal_notice:
+                        history_reason = "proposal recorded; validation failed"
+                    elif verdict.passed and pool_id:
                         history_reason = ""
                     elif verdict.passed:
                         history_reason = "pool promotion failed"

@@ -114,8 +114,10 @@ evolution:
   capital_base_twd: 100000
   # Classes with fewer than 2 rewritable Saturday-grid knobs are excluded
   # from the weekly run. "none" (default) does not codegen them.
-  # "structural_lane" is reserved for a later monthly lane and also does
-  # not enable weekly codegen. Any other value is treated as "none".
+  # "structural_lane" is the fallback name for the monthly lane. It does
+  # not enable weekly codegen, and it does not run the lane by itself.
+  # The lane runs only when structural_lane.enabled is true.
+  # Any other value is treated as "none".
   knob_ineligible_fallback: "none"
   # 僅星期六自動演化：設計窗交易數低於此值時，不呼叫 AI 演化計畫
   # （0 次 AI 呼叫，水位線不前進），聊天室／Discord 顯示
@@ -262,10 +264,34 @@ evolution:
   # for this file. Not a credential.
   # A second evolution run on the same bot is refused while one is
   # already running in this process (manual Evolve during the Saturday
-  # auto run). That guard is in-memory. It does not use the bot's
-  # process .lock and it does not write a state file.
+  # auto run, including a structural-lane or propose-mode run). That
+  # guard is in-memory. It does not use the bot's process .lock and it
+  # does not write a state file.
   # assess_retirement still reads the changelog. Switching that reader
   # to this history file is a later follow-up.
+  # Saturday auto run. "propose" (default) writes a proposal file with
+  # the verdict evidence and does not promote the pool, write
+  # StrategyStore, or change a bot. "promote" is an explicit opt-in
+  # that keeps the StrategyPool validated-on-PASS path. Propose mode
+  # still appends the same evolution_history.jsonl line. The manual
+  # Evolve button is not this flag.
+  saturday_mode: "propose"
+  # Monthly structural lane. Off by default. Distinct from the knob grid:
+  # one named form, one candidate per bot per calendar month, no retry,
+  # at most 3 outstanding paper recommendations. Graduation is text only.
+  # paper_days inside this block is ignored (Nova Q6: 21 sessions and
+  # 20 paper trades, timeout at 45). The same key elsewhere is not this
+  # warning. ledger_path empty → data/evolution/structural_lane.json.
+  # A structural Saturday uses the same history file and the same
+  # in-process run guard. It does not add a lock or a size cap.
+  structural_lane:
+    enabled: false
+    per_bot_per_month: 1
+    max_in_paper: 3
+    min_paper_sessions: 21
+    min_paper_trades: 20
+    timeout_sessions: 45
+    ledger_path: ""
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON

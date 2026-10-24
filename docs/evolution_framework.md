@@ -163,7 +163,7 @@ What is identical: the design/holdout split, the walk-forward validation, the ve
 
 ## 7.1 Gate-decision history
 
-Every evolution attempt appends one JSON line to `data/live/{symbol}_{bot}/evolution_history.jsonl` (next to `evolution_watermark.json`). The line covers `skip`, `no_change`, `refused`, `fail`, and `pass`, including the deep, multifold, month, and promotion-gate reasons. `retire_week` stores `{at, evaluated, passed}` so a #188 streak can be derived with `weeks_from_history`.
+Every evolution attempt appends one JSON line to `data/live/{symbol}_{bot}/evolution_history.jsonl` (next to `evolution_watermark.json`). The line covers `skip`, `no_change`, `refused`, `fail`, and `pass`, including the deep, multifold, month, and promotion-gate reasons. `retire_week` stores `{at, evaluated, passed}` so a #188 streak can be derived with `weeks_from_history`. A structural-lane Saturday and a `saturday_mode: propose` Saturday use this same append and the same in-process run guard. They do not add a lock, a second history file, or a size cap. The proposal file is a separate artifact and does not replace the history line.
 
 The file is append-only and **not size-capped or rotated**. Growth is unbounded on purpose: one line per attempt is small, and trimming the tail would drop weeks the streak derivation still needs. Delete or archive the file by hand if it ever needs a bound. There is no settings key for a cap. Each record is one `write()` of a complete line (binary append, then flush). Opening the file retries a Windows `PermissionError` (WinError 5) with the heartbeat writer's bounded backoff. A final write failure is logged as a warning and does not stop the evolution run. The writer does not take a file lock and does not touch the bot's process `.lock`.
 
@@ -225,6 +225,15 @@ evolution:
       gate3_k: 0.5               # strict check uses this fraction of the scaled allowance
       floor: 3000
       cap: 15000
+  saturday_mode: "propose"  # "propose" (default) | "promote" (explicit opt-in)
+                             # propose records evidence and applies nothing
+  structural_lane:
+    enabled: false           # monthly lane, off until set; not the knob grid
+    per_bot_per_month: 1
+    max_in_paper: 3
+    min_paper_sessions: 21
+    min_paper_trades: 20
+    timeout_sessions: 45
 
 trading:
   allow_live_override: false   # NOTE: lives under `trading:`, not `evolution:`
@@ -238,13 +247,20 @@ trading:
 | `evolution.validation` | `"deep"` | Validation method (see §6). `"simple"` skips the walk-forward split and Monte Carlo. |
 | `evolution.min_design_trades` | `30` | Saturday/automatic path only: skip the AI plan call while the design window has fewer trades than this (`waiting for sample: N/<threshold>`, 0 AI calls, watermark unchanged). The manual Evolve button is exempt and logs `below min_design_trades (N/30), manual override`. `0` disables the check. Does not change the fitness `MIN_TRADES` gate. |
 | `evolution.idle_warn_days` | `7` | On a watermark skip, append `idle N days since last exit <date>` when the last exit is at least this many calendar days ago. `0` disables the line. |
-| `evolution.knob_ineligible_fallback` | `"none"` | Weekly handling of a knob-grid class with fewer than 2 rewritable knobs. `"none"` excludes it and logs `excluded: <class> — <reason>; fallback=none` every Saturday. `"structural_lane"` only changes that logged mode; it does not enable weekly codegen. |
+| `evolution.knob_ineligible_fallback` | `"none"` | Weekly handling of a knob-grid class with fewer than 2 rewritable knobs. `"none"` excludes it and logs `excluded: <class> — <reason>; fallback=none` every Saturday. `"structural_lane"` only changes that logged mode; it does not enable weekly codegen. The monthly lane runs only when `structural_lane.enabled` is also true. |
 | `evolution.paper_gate` | `"relative"` | Exact modes `paper` and `backtest` only. `"relative"` requires the fold bootstrap, the effect size, DSR > `trial_penalty.dsr_min`, and PBO < `trial_penalty.pbo_max`. An invalid value, or an unknown trading mode, falls back to absolute and warns. `"absolute"` restores the PF ≥ 1 floors. Real-money modes ignore this key. |
 | `evolution.search` | `"grid_batch"` | Eligible knob classes: the grid selects the setting. `"llm_one"` asks the model for one change, as before. |
 | `evolution.trial_penalty` | DSR 0.90, PBO 0.50, 48 / 2 / 4, band 0.50 | Caps and the pass lines for the grid. Values above the caps fall back. `relative.min_divergent_folds` must be ≥ 2 and ≤ 30; anything else falls back to the Q2 default (≥ 3 divergent folds). |
 | `evolution.month_gate.latest_def` | `"merge_stub"` | Fold the newest exit month into the previous month when it has fewer than `min_sessions` TAIFEX trading dates in the price bars. A night session (15:00–05:00) belongs to the next trading day, so one night is one date and Friday night maps to Monday. `"max_exit_month"` opts out and keeps the newest exit month. |
 | `evolution.month_gate.min_sessions` | `12` | Session-count threshold for the stub fold. |
 | `evolution.month_gate.slack.mode` | `"scaled"` | Gate 1 allowance is `clamp(k × σ × sqrt(n), floor, cap)` TWD. σ is the baseline's prior-block per-trade sample standard deviation; n is the candidate's prior-block trade count. Gate 3 uses `gate3_k` of that allowance (half by default). `"flat"` opts out: gate 1 uses `flat_twd` and gate 3 requires Δ ≥ 0. |
+| `evolution.saturday_mode` | `"propose"` | Saturday auto run. `"propose"` writes a proposal file with the verdict evidence and does not promote the pool, write StrategyStore, or change a bot. `"promote"` is the explicit opt-in that keeps the StrategyPool validated-on-PASS path. The manual Evolve button is not this flag. |
+| `evolution.structural_lane.enabled` | `false` | Monthly structural lane, separate from the knob grid. One named form from a fixed menu, one codegen attempt, no retry that month. Default off. |
+| `evolution.structural_lane.per_bot_per_month` | `1` | Structural candidates per bot per calendar month. |
+| `evolution.structural_lane.max_in_paper` | `3` | Outstanding paper *recommendations* across bots. A recommendation does not put a bot into paper. |
+| `evolution.structural_lane.min_paper_sessions` | `21` | Paper sessions before graduation can be recommended (Nova Q6). |
+| `evolution.structural_lane.min_paper_trades` | `20` | Paper trades before graduation can be recommended. |
+| `evolution.structural_lane.timeout_sessions` | `45` | After this many sessions the incubation is recommended closed as inconclusive. |
 | **`trading.allow_live_override`** | `false` | **Not an evolution key.** It gates the live **hot-swap mode switch** — whether a `mode_override.json` file (or the UI) may switch the running bot to fully-automatic `auto` mode. Documented here because it governs how much autonomy a live bot has; evolution itself never deploys or switches modes. |
 
 ---
