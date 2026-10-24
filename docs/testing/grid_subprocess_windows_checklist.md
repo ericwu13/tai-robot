@@ -1,15 +1,21 @@
 # Windows frozen-EXE checklist — grid sweep subprocess
 
 Operator checklist for the spawn-child grid sweep (PR #194, code commit
-`644eac97d83c0246fbecd9d9497ec6818b0c8c04`).
+`12eefef2473007df10df7cb35533869ac72476a3`).
 
 Run this on the Windows test host **oreopie**, and only inside
 `C:\tai-test-194\`. That folder is a fresh copy with its own `data\`
 directory. It does not log into the broker.
 
-The binary under test is built from `644eac97`. This checklist is a later
-docs commit on the same branch. Do not build from a dirty tree, and do not
-publish a GitHub release.
+The binary under test is built from `12eefef2473007df10df7cb35533869ac72476a3`.
+This checklist is a later docs commit on the same branch. Do not build
+from a dirty tree, and do not publish a GitHub release.
+
+Do not build `644eac97`. That commit reads the result pipe only after the
+child exits. A pickled grid result larger than the Windows pipe buffer
+(8 KB) blocks the child in `send`, and the parent then waits until the
+20-minute timeout. `12eefef` receives the payload while the child is
+still running, then joins it.
 
 ## Do not touch the live bots
 
@@ -59,7 +65,7 @@ do not run it.
 - The test workbench is `C:\tai-test-194\app\tai_backtest.exe`. Leave
   every other `tai_backtest.exe` running.
 
-## Build (clean venv, pinned spec, commit 644eac97)
+## Build (clean venv, pinned spec, commit 12eefef)
 
 No GitHub Actions workflow builds this EXE. Build it on oreopie, inside
 the test folder. The spec is `tai_backtest.spec` (PyInstaller `--onedir`,
@@ -75,9 +81,9 @@ cd C:\tai-test-194
 git clone https://github.com/ericwu13/tai-robot.git src
 cd C:\tai-test-194\src
 git fetch origin
-git checkout 644eac97d83c0246fbecd9d9497ec6818b0c8c04
+git checkout 12eefef2473007df10df7cb35533869ac72476a3
 git rev-parse HEAD
-# expect 644eac97d83c0246fbecd9d9497ec6818b0c8c04
+# expect 12eefef2473007df10df7cb35533869ac72476a3
 
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -90,7 +96,7 @@ Copy-Item settings.example.yaml settings.yaml
 python build_release.py --skip-release
 ```
 
-Pass: `git rev-parse HEAD` prints `644eac97d83c0246fbecd9d9497ec6818b0c8c04`,
+Pass: `git rev-parse HEAD` prints `12eefef2473007df10df7cb35533869ac72476a3`,
 PyInstaller exits 0, and these exist:
 
 - `C:\tai-test-194\src\dist\tai_backtest\tai_backtest.exe`
@@ -180,7 +186,7 @@ The grid runs only when all of the following are true:
    that key.
 4. Still in Settings, click **匯入 Import**. Choose
    `C:\tai-test-194\src\dynamic_exit_pullback_strategy_v2.py`
-   (present at `644eac97`). Confirm the import. The strategy combo should
+   (present at `12eefef`). Confirm the import. The strategy combo should
    show `AI: DynamicExitPullbackStrategyV2`.
 5. Set the backtest range to more than 14 days (Start well before End).
 6. Click **TAIFEX 回測 Backtest**. Accept the daily-bar warning. This
@@ -320,7 +326,7 @@ timeout. The constant is `DEFAULT_GRID_TIMEOUT_S = 20 * 60` (1200 seconds)
 in `src/evolution/grid_process.py`. The worker uses the instance attribute
 `_grid_timeout_s` when a test sets it, and otherwise uses 1200. The frozen
 EXE never sets that attribute. Do not edit the constant and do not invent
-a setting. A binary built from `644eac97` cannot be told to time out early.
+a setting. A binary built from `12eefef` cannot be told to time out early.
 
 The worker polls stop every 0.2 seconds (`poll_s` default in
 `run_grid_isolated`). On timeout or stop it calls `TerminateProcess` and
@@ -422,7 +428,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'tai_backtest.exe'" |
 ```
 host: oreopie
 test root: C:\tai-test-194\
-commit built: 644eac97d83c0246fbecd9d9497ec6818b0c8c04
+commit built: 12eefef2473007df10df7cb35533869ac72476a3
 BUILD_INFO.json commit / dirty:
 exe path (must be C:\tai-test-194\app\tai_backtest.exe):
 settings broker fields empty (yes/no):
