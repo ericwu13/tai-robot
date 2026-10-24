@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 
 import pytest
 
@@ -742,3 +743,185 @@ def test_leave_monitor_is_stamped_via_call_com():
     send_at = app.find("skO.SendFutureOrderCLR")
     assert send_at != -1
     assert "call_com(" in app[max(0, send_at - 120):send_at]
+
+
+def test_call_com_off_main_thread_queues_stamp_for_main_drain(
+        tmp_path, monkeypatch, caplog):
+    """Issue #180: RequestStockList on a reconnect worker must not raise.
+
+    ``call_com`` queues the inflight stamp. The main thread writes it when
+    it drains the queue. A direct ``HeartbeatWriter.write`` still raises
+    off the main thread — that assertion is not the queue.
+
+    Mutation: without the queue, ``drain_queued_stamps`` leaves
+    ``inflight_com_call`` unset (the pre-fix skip) and this test fails.
+    Writing the stamp on the worker instead raises ``MainThreadHeartbeatError``
+    and the traceback assertions fail.
+    """
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write(now=1.0)
+    hb._writer = writer
+    hb._reset_offthread_stamps()
+
+    writes = []
+    real_write = HeartbeatWriter.write
+
+    def spy(self, now=None):
+        writes.append(threading.current_thread())
+        return real_write(self, now)
+
+    monkeypatch.setattr(HeartbeatWriter, "write", spy)
+
+    entered = threading.Event()
+    release = threading.Event()
+    box = {}
+    tracebacks = []
+    hooked = []
+
+    def _hook(args):
+        hooked.append("".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback)))
+
+    monkeypatch.setattr(threading, "excepthook", _hook)
+
+    def request_stock_list():
+        entered.set()
+        assert release.wait(timeout=5)
+        return 0
+
+    def run():
+        try:
+            box["result"] = hb.call_com("RequestStockList", request_stock_list)
+        except BaseException:
+            tracebacks.append(traceback.format_exc())
+
+    thread = threading.Thread(target=run, name="reconnect-worker")
+    try:
+        with caplog.at_level(logging.ERROR, logger="src.live.main_heartbeat"):
+            thread.start()
+            assert entered.wait(timeout=2), "worker did not enter call_com"
+            # The worker must not have written. The file is still the
+            # baseline until the main thread drains.
+            before = json.loads(
+                (tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+            assert before["inflight_com_call"] is None
+            assert before["ts"] == 1.0
+            assert writes == []
+
+            hb.drain_queued_stamps()
+            stamped = json.loads(
+                (tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+            inflight = stamped.get("inflight_com_call") or {}
+            # Mutation check: pre-fix skip never publishes this name.
+            assert inflight.get("name") == "RequestStockList"
+            assert writes, "drain did not write the stamp"
+            assert all(t is threading.main_thread() for t in writes), (
+                "stamp was written off the main thread")
+
+            release.set()
+            thread.join(timeout=5)
+        assert thread.is_alive() is False
+        assert tracebacks == []
+        assert hooked == []
+        assert box.get("result") == 0
+        assert "Traceback" not in caplog.text
+        assert "Tk main thread" not in caplog.text
+        assert "MainThreadHeartbeatError" not in caplog.text
+
+        # The call has returned. The next main-thread drain clears it
+        # so a finished RequestStockList cannot sit in heartbeat.json.
+        hb.tick()
+        cleared = json.loads(
+            (tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+        assert cleared["inflight_com_call"] is None
+        assert all(t is threading.main_thread() for t in writes)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        hb._writer = None
+        hb._reset_offthread_stamps()
+
+
+def test_offthread_call_com_reraises_broker_exception(tmp_path):
+    """A worker COM failure is the broker exception, not a heartbeat error."""
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write(now=1.0)
+    hb._writer = writer
+    hb._reset_offthread_stamps()
+    box = {}
+
+    def boom():
+        raise RuntimeError("skcom")
+
+    def run():
+        try:
+            hb.call_com("RequestStockList", boom)
+        except RuntimeError as exc:
+            box["err"] = exc
+        except BaseException:
+            box["trace"] = traceback.format_exc()
+
+    thread = threading.Thread(target=run, name="reconnect-worker")
+    try:
+        thread.start()
+        thread.join(timeout=5)
+        assert thread.is_alive() is False
+        assert str(box.get("err")) == "skcom"
+        assert "trace" not in box
+        hb.drain_queued_stamps()
+        cleared = json.loads(
+            (tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+        assert cleared["inflight_com_call"] is None
+    finally:
+        thread.join(timeout=5)
+        hb._writer = None
+        hb._reset_offthread_stamps()
+
+
+def test_offthread_queue_does_not_clobber_main_thread_stamp(tmp_path):
+    """A queued RequestStockList must not replace an open main-thread stamp."""
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write(now=1.0)
+    hb._writer = writer
+    hb._reset_offthread_stamps()
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    seen = {}
+
+    def worker_fn():
+        worker_entered.set()
+        assert release_worker.wait(timeout=5)
+        return 1
+
+    def main_fn():
+        data = json.loads(
+            (tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+        seen["during"] = (data.get("inflight_com_call") or {}).get("name")
+        thread = threading.Thread(
+            target=lambda: hb.call_com("RequestStockList", worker_fn),
+            name="reconnect-worker")
+        seen["thread"] = thread
+        thread.start()
+        assert worker_entered.wait(timeout=2)
+        hb.drain_queued_stamps()
+        data = json.loads(
+            (tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+        seen["after_drain"] = (data.get("inflight_com_call") or {}).get("name")
+        return 0
+
+    try:
+        assert hb.call_com("SendFutureOrderCLR", main_fn) == 0
+        assert seen["during"] == "SendFutureOrderCLR"
+        assert seen["after_drain"] == "SendFutureOrderCLR"
+        hb.drain_queued_stamps()
+        restored = json.loads(
+            (tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+        assert (restored.get("inflight_com_call") or {}).get("name") == (
+            "RequestStockList")
+    finally:
+        release_worker.set()
+        thread = seen.get("thread")
+        if thread is not None:
+            thread.join(timeout=5)
+        hb._writer = None
+        hb._reset_offthread_stamps()

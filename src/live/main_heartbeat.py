@@ -621,6 +621,101 @@ _writer: HeartbeatWriter | None = None
 _watchdog: HangWatchdog | None = None
 _guard = threading.Lock()
 
+# Off-thread call_com (reconnect worker) must not write heartbeat.json.
+# It pushes a token onto this stack; the main thread drains it. Direct
+# HeartbeatWriter.write still asserts the main thread.
+_stamp_lock = threading.Lock()
+_stamp_stack: list[dict] = []
+_stamp_dirty = False
+_stamp_seq = 0
+# >0 while the main thread is inside a stamped call_com. Drain must not
+# replace that inflight name with a queued worker call.
+_main_stamp_depth = 0
+
+
+def _reset_offthread_stamps() -> None:
+    """Drop queued off-thread stamps. ``start`` / ``stop`` and tests."""
+    global _stamp_dirty
+    with _stamp_lock:
+        _stamp_stack.clear()
+        _stamp_dirty = False
+
+
+def _queue_offthread_begin(name: str) -> int:
+    """Remember an in-flight call started off the main thread. No file write."""
+    global _stamp_seq, _stamp_dirty
+    with _stamp_lock:
+        _stamp_seq += 1
+        token = _stamp_seq
+        _stamp_stack.append({
+            "token": token,
+            "name": str(name),
+            "start_ts": time.time(),
+        })
+        _stamp_dirty = True
+        return token
+
+
+def _queue_offthread_end(token: int) -> None:
+    """Drop the matching in-flight call. No file write."""
+    global _stamp_dirty
+    with _stamp_lock:
+        _stamp_stack[:] = [
+            item for item in _stamp_stack if item["token"] != token]
+        _stamp_dirty = True
+
+
+def _mark_offthread_dirty_if_pending() -> None:
+    """A main-thread call_com just cleared ``_inflight``. Republish a worker."""
+    global _stamp_dirty
+    with _stamp_lock:
+        if _stamp_stack:
+            _stamp_dirty = True
+
+
+def drain_queued_stamps() -> None:
+    """Write stamps queued by off-thread ``call_com``. Main thread only.
+
+    A caller that is not the main thread returns without writing and
+    without raising. While a main-thread ``call_com`` holds the inflight
+    slot, this returns without consuming the queue. Direct
+    ``HeartbeatWriter.write`` still raises ``MainThreadHeartbeatError``
+    off the main thread.
+    """
+    global _stamp_dirty
+    if threading.current_thread() is not threading.main_thread():
+        return
+    if _main_stamp_depth > 0:
+        return
+    writer = _writer
+    with _stamp_lock:
+        if not _stamp_dirty:
+            return
+        snapshot = [dict(item) for item in _stamp_stack]
+        _stamp_dirty = False
+        if writer is None:
+            _stamp_stack.clear()
+            return
+    # Oldest still-open call. A newer overlap must not hide it, and one
+    # write publishes the net state (no begin-then-end flash).
+    desired = snapshot[0] if snapshot else None
+    try:
+        if desired is None:
+            writer._inflight = None
+        else:
+            writer._inflight = {
+                "name": desired["name"],
+                "start_ts": desired["start_ts"],
+            }
+        writer.write()
+    except Exception as exc:
+        label = desired["name"] if desired else "end"
+        _report_stamp_failure(
+            exc,
+            "heartbeat queued stamp failed for "
+            f"{label}; the broker result is unchanged: "
+            f"[{type(exc).__name__}] {exc}")
+
 
 def _rotate_hang_artifacts(bot_dir: str) -> None:
     """Move hang.json and hang_stacks.txt aside. Best-effort.
@@ -654,6 +749,7 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
     later tick can retry.
     """
     global _writer, _watchdog
+    _reset_offthread_stamps()
     _rotate_hang_artifacts(bot_dir)
     writer = HeartbeatWriter(bot_dir)
     try:
@@ -692,7 +788,12 @@ def set_link_state(state: dict | None) -> None:
 
 
 def tick() -> None:
-    """One main-loop heartbeat. No-op when the bot is not deployed."""
+    """One main-loop heartbeat. No-op when the bot is not deployed.
+
+    Drains stamps queued by off-thread ``call_com`` first, so a reconnect
+    worker's inflight name is written on this thread.
+    """
+    drain_queued_stamps()
     writer = _writer
     if writer is not None:
         writer.write()
@@ -709,6 +810,7 @@ def stop() -> None:
     shows a new, fresh timestamp, so a gap in the file cannot double-alert.
     """
     global _writer
+    _reset_offthread_stamps()
     with _guard:
         writer = _writer
         _writer = None
@@ -741,33 +843,14 @@ def _emit_com_return(name: str, elapsed_ms: float, *, failed: bool) -> None:
         logger.debug("COM return log failed for %s", name, exc_info=True)
 
 
-def call_com(name: str, fn, *args, **kwargs):
-    """Run a broker/COM call, stamping inflight_com_call around it.
+def _call_com_queued(name: str, fn, args, kwargs):
+    """Run ``fn`` on a worker. Queue the stamp; do not touch the file.
 
-    The stamp is written only on the main thread, and only when a writer
-    is installed. Otherwise ``fn`` runs unchanged — login before deploy,
-    and any background caller, keep their existing behavior. The heartbeat
-    writer itself still rejects a background-thread write.
-
-    Start and end stamps are best-effort. A failed ``os.replace`` (Windows
-    keeps the file locked while a reader holds it) must not skip ``fn``
-    and must not replace ``fn``'s return value or exception.
-
-    After ``fn`` returns or raises, the duration is logged. That log is
-    also best-effort and does not add a COM call or change control flow.
+    A reconnect worker's ``RequestStockList`` lands here. Calling
+    ``end_inflight`` would write through ``_assert_main_thread`` and
+    raise. The stamp waits for ``drain_queued_stamps`` on the main thread.
     """
-    writer = _writer
-    on_main = threading.current_thread() is threading.main_thread()
-    stamp = writer is not None and on_main
-    if stamp:
-        try:
-            writer.begin_inflight(name)
-        except Exception as exc:
-            _report_stamp_failure(
-                exc,
-                "heartbeat start stamp failed for "
-                f"{name}; the COM call still runs: "
-                f"[{type(exc).__name__}] {exc}")
+    token = _queue_offthread_begin(name)
     started = time.perf_counter()
     outcome = None
     error = None
@@ -776,15 +859,73 @@ def call_com(name: str, fn, *args, **kwargs):
     except BaseException as exc:
         error = exc
     elapsed_ms = (time.perf_counter() - started) * 1000.0
+    _queue_offthread_end(token)
+    _emit_com_return(name, elapsed_ms, failed=error is not None)
+    if error is not None:
+        raise error
+    return outcome
+
+
+def call_com(name: str, fn, *args, **kwargs):
+    """Run a broker/COM call, stamping inflight_com_call around it.
+
+    The stamp is written only on the main thread, and only when a writer
+    is installed. A background caller queues the begin/end stamp; ``tick``
+    drains that queue onto the file. ``fn`` still runs on the caller.
+    Login before deploy (no writer) is unchanged. Direct
+    ``HeartbeatWriter.write`` still rejects a background thread.
+
+    Start and end stamps are best-effort. A failed ``os.replace`` (Windows
+    keeps the file locked while a reader holds it) must not skip ``fn``
+    and must not replace ``fn``'s return value or exception.
+
+    After ``fn`` returns or raises, the duration is logged. That log is
+    also best-effort and does not add a COM call or change control flow.
+    """
+    global _main_stamp_depth
+    writer = _writer
+    on_main = threading.current_thread() is threading.main_thread()
+    if writer is not None and not on_main:
+        return _call_com_queued(name, fn, args, kwargs)
+    stamp = writer is not None and on_main
     if stamp:
+        _main_stamp_depth += 1
+    outcome = None
+    error = None
+    elapsed_ms = 0.0
+    try:
+        if stamp:
+            try:
+                writer.begin_inflight(name)
+            except Exception as exc:
+                _report_stamp_failure(
+                    exc,
+                    "heartbeat start stamp failed for "
+                    f"{name}; the COM call still runs: "
+                    f"[{type(exc).__name__}] {exc}")
+        started = time.perf_counter()
         try:
-            writer.end_inflight()
-        except Exception as exc:
-            _report_stamp_failure(
-                exc,
-                "heartbeat end stamp failed for "
-                f"{name}; the broker result is unchanged: "
-                f"[{type(exc).__name__}] {exc}")
+            outcome = fn(*args, **kwargs)
+        except BaseException as exc:
+            error = exc
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if stamp:
+            try:
+                writer.end_inflight()
+            except Exception as exc:
+                _report_stamp_failure(
+                    exc,
+                    "heartbeat end stamp failed for "
+                    f"{name}; the broker result is unchanged: "
+                    f"[{type(exc).__name__}] {exc}")
+    finally:
+        if stamp:
+            _main_stamp_depth -= 1
+    if stamp:
+        # end_inflight cleared the slot. If a worker call is still open,
+        # publish it now that this thread is out of its own stamp.
+        _mark_offthread_dirty_if_pending()
+        drain_queued_stamps()
     _emit_com_return(name, elapsed_ms, failed=error is not None)
     if error is not None:
         raise error
