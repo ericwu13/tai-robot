@@ -446,6 +446,7 @@ class TestRelativePaperEdges:
             base_trades=base, cand_trades=cand,
             holdout_start=folds[-1].start, criteria=None,
             window_verdict=EvolutionVerdict(True, ["window held ✓"]),
+            trial=_PASSING_TRIAL,
         )
         reasons = assembled.verdict.reasons
         assert any("divergent≥5" in r for r in reasons)

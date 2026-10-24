@@ -6072,6 +6072,13 @@ class BacktestApp:
                            "EVO 1/3: 預先登記的旋鈕網格評分中（模型不挑選設定）。"
                            "Pre-registered knob grid — the model does not "
                            "pick the setting.")
+                        from src.evolution.paper_gate import (
+                            evolution_gate_config_from_mapping as _evo_gate_cfg,
+                        )
+                        _grid_fold_days = _evo_gate_cfg(
+                            evolution_gate_raw
+                            if isinstance(evolution_gate_raw, dict) else {}
+                        ).relative.fold_days
                         grid_outcome = run_grid_on_bars(
                             strategy_cls=baseline_cls,
                             source=strategy_source,
@@ -6079,7 +6086,7 @@ class BacktestApp:
                             point_value=point_value,
                             capital_base=capital_base,
                             evo=evolution_gate_raw,
-                            fold_days=holdout_days,
+                            fold_days=int(_grid_fold_days),
                         )
                         for line in grid_outcome.reasons:
                             _log(line)
@@ -6374,9 +6381,16 @@ class BacktestApp:
                         evo_gate_cfg.paper_gate,
                         str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
                     )
-                    if evo_gate.note:
+                    from src.evolution.paper_gate import gate_for_trial
+                    # Walk-forward uses the fallback (absolute when this run
+                    # has no grid trial). assemble_promotion_verdict applies
+                    # the same fallback and puts the log line on the verdict.
+                    _scored_gate, _no_grid_line = gate_for_trial(evo_gate, grid_trial)
+                    if _no_grid_line:
+                        _log(_scored_gate.note or _no_grid_line)
+                    elif evo_gate.note:
                         _log(f"EVO gate: {evo_gate.note}")
-                    evo_require_abs_pf = abs_pf_required(evo_gate)
+                    evo_require_abs_pf = abs_pf_required(_scored_gate)
 
                     # Walk-forward (SEE spec: 90d train / 90d test + Monte
                     # Carlo) when data allows; scaled windows on shorter
@@ -6444,6 +6458,7 @@ class BacktestApp:
                     # keeps prior-months collapse / calendar-month dominated.
                     folds, mf_base, mf_cand = run_multifold_validation(
                         baseline_cls, candidate_cls, bars, point_value,
+                        fold_days=int(evo_gate_cfg.relative.fold_days),
                         capital_base=capital_base)
                     base_trades = (list(mf_base.result.trades)
                                    if mf_base.result is not None else [])

@@ -24,14 +24,19 @@ point's Δ (``|neighbour − chosen| ≤ band × |chosen|``). A point with
 no evaluated neighbour is not on the plateau. The pick is the centre
 of that set (closest to the median coordinate), not the maximum Δ.
 The centre must also clear DSR > 0.90 and the trial set must clear
-PBO < 0.50. Missing either one selects nothing. There is no fallback
-to the best Sharpe and no fallback to an LLM pick.
+PBO < 0.50. DSR and PBO are computed on the per-fold Δ versus the
+baseline (candidate fold PnL minus baseline fold PnL), not on absolute
+PnL. The most recent fold (``folds[-1]``, the holdout) is not in that
+matrix. It is scored only after a point is chosen, as the OOS check.
+Missing DSR or PBO selects nothing. There is no fallback to the best
+Sharpe and no fallback to an LLM pick.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from .knobs import (
     class_knob_eligibility,
@@ -104,6 +109,30 @@ class GridOutcome:
     settings: tuple
     evidence: TrialEvidence | None
     rationale: str
+    # The chosen point's holdout window. None when nothing was selected.
+    # This window is not an input to DSR, PBO, or the plateau.
+    holdout: "HoldoutObservation | None" = None
+
+
+@dataclass(frozen=True)
+class HoldoutObservation:
+    """OOS check on ``folds[-1]`` for the chosen point only.
+
+    ``end`` may extend past the baseline's last exit so a candidate
+    trade after that exit is still in this window. ``fold_days`` is the
+    width the selection folds used. ``selection_start`` / ``selection_end``
+    are one of those folds, so a caller can see the width without
+    reading the holdout (whose end may have been extended).
+    """
+
+    start: str
+    end: str
+    base_pnl: float
+    cand_pnl: float
+    delta: float
+    fold_days: int
+    selection_start: str
+    selection_end: str
 
 
 def _same(a, b) -> bool:
@@ -205,6 +234,35 @@ def iter_search_settings(
     return singles + joints
 
 
+def _is_atr_pair(item: dict) -> bool:
+    """A two-knob setting whose keys are both ATR knobs."""
+    if len(item) != 2:
+        return False
+    return all(str(key).startswith("atr_") for key in item)
+
+
+def _reserve_pair_slots(settings: list[dict], cap: int) -> list[dict]:
+    """Keep every ATR×ATR pair inside ``cap``, then fill from the front.
+
+    Singles are registered first, so a plain prefix cut drops the ATR
+    pairs of a 4-knob class (they sit at the end). Those pairs are
+    reserved. Whatever room is left takes singles, then the other
+    pairs, in the original order. A grid with no ATR pair is unchanged
+    from a prefix cut.
+    """
+    if cap <= 0:
+        return []
+    if len(settings) <= cap:
+        return list(settings)
+    atr_pairs = [item for item in settings if _is_atr_pair(item)]
+    rest = [item for item in settings if not _is_atr_pair(item)]
+    reserved = atr_pairs[:cap]
+    room = cap - len(reserved)
+    keep = {id(item) for item in reserved}
+    keep.update(id(item) for item in rest[:room])
+    return [item for item in settings if id(item) in keep]
+
+
 def build_search_settings(
         baseline: dict,
         eligibility_grid: dict,
@@ -213,11 +271,12 @@ def build_search_settings(
     cfg = trial or TrialPenaltyConfig()
     cap, joint_cap, value_cap = _clamp_caps(
         cfg.max_settings, cfg.max_joint_knobs, cfg.max_values_per_knob)
-    return iter_search_settings(
+    full = iter_search_settings(
         baseline, eligibility_grid,
         max_joint_knobs=joint_cap,
         max_values_per_knob=value_cap,
-    )[:cap]
+    )
+    return _reserve_pair_slots(full, cap)
 
 
 def _axes(baseline: dict, eligibility_grid: dict) -> tuple[list[str], list[tuple]]:
@@ -366,6 +425,28 @@ def _point_knobs(point: GridPoint) -> dict:
     return dict(point.knobs)
 
 
+def _deltas_vs(point: GridPoint, baseline_point: GridPoint) -> list[float] | None:
+    """Per-fold Δ: candidate fold PnL minus the baseline's same fold.
+
+    DSR and PBO score this, not the absolute PnL. A length mismatch or
+    a non-finite value is not a trial.
+    """
+    if len(point.fold_pnls) != len(baseline_point.fold_pnls):
+        return None
+    if not point.fold_pnls:
+        return None
+    out: list[float] = []
+    for cand, base in zip(point.fold_pnls, baseline_point.fold_pnls):
+        try:
+            delta = float(cand) - float(base)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(delta):
+            return None
+        out.append(delta)
+    return out
+
+
 def select_grid(
         points: list[GridPoint],
         baseline_point: GridPoint,
@@ -376,8 +457,13 @@ def select_grid(
         preregistered: list[dict]) -> GridOutcome:
     """Score the pre-registered points and pick the plateau centre.
 
-    DSR is computed for every point (same N_eff, that point's Sharpe).
-    PBO is one number for the whole fold × configuration matrix.
+    DSR and PBO use the per-fold Δ against ``baseline_point`` (candidate
+    minus baseline), not absolute fold PnL. DSR is computed for every
+    point (same N_eff, that point's Sharpe of Δ). PBO is one number for
+    the whole fold × configuration matrix of those deltas. SR0 is the
+    Bailey & López de Prado expected maximum, from the cross-trial
+    Sharpe dispersion and N_eff — not zero unless there is no selection
+    premium.
     """
     band = trial.plateau_band
     reasons: list[str] = [
@@ -388,17 +474,25 @@ def select_grid(
         f"plateau band {band:g}; DSR > {trial.dsr_min:g}; "
         f"PBO < {trial.pbo_max:g})",
     ]
-    columns = [list(point.fold_pnls) for point in points]
-    n_trials = len(points)
+    # Absolute PnL of a profitable baseline would put every near-copy
+    # at DSR ≈ 1. The penalty is on the improvement, fold by fold.
+    delta_of: list[list[float] | None] = [
+        _deltas_vs(point, baseline_point) for point in points
+    ]
+    columns = [col for col in delta_of if col is not None]
+    n_trials = len(columns)
     rho = mean_pairwise_correlation(columns) if n_trials else 0.0
     n_eff = effective_trial_count(n_trials, rho)
     sharpes = [sharpe_ratio(col) for col in columns]
     sharpe_std = trial_sharpe_std(
         [s for s in sharpes if s is not None])
     dsrs: list[float | None] = []
-    for point in points:
+    for col in delta_of:
+        if col is None:
+            dsrs.append(None)
+            continue
         dsrs.append(score_configuration(
-            list(point.fold_pnls), n_eff=n_eff, sharpe_std=sharpe_std))
+            col, n_eff=n_eff, sharpe_std=sharpe_std))
     matrix = [list(row) for row in zip(*columns)] if columns else []
     pbo, partitions = probability_of_backtest_overfitting(matrix)
     reasons.append(
@@ -522,6 +616,46 @@ def _baseline_bounds(base_trades, fold_days: int, max_folds: int):
     return [(fold.start, fold.end) for fold in folds]
 
 
+def _exclusive_after(stamp: str) -> str:
+    """One minute after ``stamp``, so a half-open window still contains it."""
+    dt = datetime.strptime(stamp[:16], "%Y-%m-%d %H:%M") + timedelta(minutes=1)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _cover_trades_after_baseline(bounds, trade_lists):
+    """Extend the last window so exits after the baseline's last exit count.
+
+    The last window is the holdout. Selection does not read it. A
+    candidate that keeps trading after the baseline has stopped still
+    shows those trades on the OOS check.
+    """
+    if not bounds:
+        return bounds
+    _start, end = bounds[-1]
+    latest = ""
+    for trades in trade_lists:
+        for trade in trades or []:
+            exit_dt = getattr(trade, "exit_dt", "") or ""
+            if exit_dt and exit_dt >= end and exit_dt > latest:
+                latest = exit_dt
+    if not latest:
+        return list(bounds)
+    updated = list(bounds)
+    updated[-1] = (_start, _exclusive_after(latest))
+    return updated
+
+
+def _split_holdout(bounds):
+    """``(selection_bounds, holdout_bound)``. The last fold is the holdout.
+
+    Fewer than two folds leaves nothing to select on: the only window
+    would be the OOS holdout.
+    """
+    if len(bounds) < 2:
+        return [], None
+    return list(bounds[:-1]), bounds[-1]
+
+
 def run_grid_on_bars(
         *,
         strategy_cls,
@@ -537,6 +671,11 @@ def run_grid_on_bars(
     The setting list is fixed before the first candidate backtest.
     A setting that fails to load is logged and is not a trial. Fold
     windows come from the baseline only, so every column shares rows.
+    ``fold_days`` is the fold width (``evolution.relative.fold_days``).
+    It is not the design holdout length. The last fold is withheld from
+    DSR, PBO, and the plateau, and is reported on the chosen point as
+    the OOS check. Trades that exit after the baseline's last exit stay
+    in that holdout window.
     """
     from src.ai.code_sandbox import load_strategy_from_source
 
@@ -571,26 +710,19 @@ def run_grid_on_bars(
         return GridOutcome(
             None, reasons_head + (text,), tuple(settings), None, text)
     base_trades = list(base_ab.result.trades or [])
-    bounds = _baseline_bounds(base_trades, int(fold_days), int(max_folds))
-    if len(bounds) < 2:
+    raw_bounds = _baseline_bounds(base_trades, int(fold_days), int(max_folds))
+    selection_bounds, holdout_bound = _split_holdout(raw_bounds)
+    if holdout_bound is None or len(selection_bounds) < 2:
         return GridOutcome(
             None,
             reasons_head + (
-                f"only {len(bounds)} baseline folds — nothing selected",),
+                f"only {len(raw_bounds)} baseline folds — the last is the "
+                f"holdout and is excluded from selection; nothing selected",),
             tuple(settings), None,
-            "Grid selected nothing. Not enough folds.")
-    base_pnls = tuple(_fold_sum(base_trades, start, end) for start, end in bounds)
-    base_coords = _coords_of({}, keys, baseline)
-    baseline_point = GridPoint(
-        knobs=(),
-        coords=base_coords,
-        index=_index_tuple(base_coords, axes),
-        fold_pnls=base_pnls,
-        mean_delta=0.0,
-        is_baseline=True,
-    )
-    evaluated = {_coord_key(base_coords): baseline_point}
-    points: list[GridPoint] = []
+            "Grid selected nothing. Not enough folds outside the holdout.")
+    # Backtests first. The holdout end is extended only after every
+    # trade list exists, and only the selection folds are scored.
+    loaded: list[tuple[dict, list]] = []
     skipped: list[str] = []
     for i, knobs in enumerate(settings):
         try:
@@ -604,33 +736,74 @@ def run_grid_on_bars(
                     f"setting {_fmt_knobs(knobs)} not evaluated: "
                     f"{ab.error or 'no result'}")
                 continue
-            trades = list(ab.result.trades or [])
-            pnls = tuple(_fold_sum(trades, start, end) for start, end in bounds)
-            deltas = tuple(c - b for c, b in zip(pnls, base_pnls))
-            coords = _coords_of(knobs, keys, baseline)
-            point = GridPoint(
-                knobs=tuple(knobs.items()),
-                coords=coords,
-                index=_index_tuple(coords, axes),
-                fold_pnls=pnls,
-                mean_delta=_mean(deltas),
-                is_baseline=False,
-            )
-            evaluated[_coord_key(coords)] = point
-            points.append(point)
+            loaded.append((knobs, list(ab.result.trades or [])))
         except Exception as exc:
             skipped.append(
                 f"setting {_fmt_knobs(knobs)} not evaluated: "
                 f"{type(exc).__name__}: {exc}")
+    bounds = _cover_trades_after_baseline(
+        raw_bounds, [base_trades] + [trades for _knobs, trades in loaded])
+    selection_bounds, holdout_bound = _split_holdout(bounds)
+    base_pnls = tuple(
+        _fold_sum(base_trades, start, end) for start, end in selection_bounds)
+    base_coords = _coords_of({}, keys, baseline)
+    baseline_point = GridPoint(
+        knobs=(),
+        coords=base_coords,
+        index=_index_tuple(base_coords, axes),
+        fold_pnls=base_pnls,
+        mean_delta=0.0,
+        is_baseline=True,
+    )
+    evaluated = {_coord_key(base_coords): baseline_point}
+    points: list[GridPoint] = []
+    trades_for: dict[tuple, list] = {}
+    for knobs, trades in loaded:
+        pnls = tuple(
+            _fold_sum(trades, start, end) for start, end in selection_bounds)
+        deltas = tuple(c - b for c, b in zip(pnls, base_pnls))
+        coords = _coords_of(knobs, keys, baseline)
+        point = GridPoint(
+            knobs=tuple(sorted(knobs.items())),
+            coords=coords,
+            index=_index_tuple(coords, axes),
+            fold_pnls=pnls,
+            mean_delta=_mean(deltas),
+            is_baseline=False,
+        )
+        evaluated[_coord_key(coords)] = point
+        points.append(point)
+        trades_for[point.knobs] = trades
     outcome = select_grid(
         points, baseline_point, evaluated, axes, cfg.trial,
         preregistered=settings)
+    holdout = None
+    oos_line = None
+    if outcome.selected is not None and holdout_bound is not None:
+        selected_key = tuple(sorted(outcome.selected.items()))
+        chosen_trades = trades_for.get(selected_key, [])
+        hs, he = holdout_bound
+        base_h = _fold_sum(base_trades, hs, he)
+        cand_h = _fold_sum(chosen_trades, hs, he)
+        sel_start, sel_end = selection_bounds[0]
+        holdout = HoldoutObservation(
+            start=hs, end=he, base_pnl=base_h, cand_pnl=cand_h,
+            delta=cand_h - base_h, fold_days=int(fold_days),
+            selection_start=sel_start, selection_end=sel_end,
+        )
+        oos_line = (
+            f"OOS holdout {hs} → {he} (excluded from selection, "
+            f"fold_days={int(fold_days)}): chosen cand {cand_h:g} "
+            f"base {base_h:g} Δ {cand_h - base_h:g}"
+        )
+    reasons = outcome.reasons
     if skipped:
+        reasons = tuple(skipped) + reasons
+    if oos_line is not None:
+        reasons = reasons + (oos_line,)
+    if skipped or oos_line is not None:
         outcome = GridOutcome(
-            outcome.selected,
-            tuple(skipped) + outcome.reasons,
-            outcome.settings,
-            outcome.evidence,
-            outcome.rationale,
+            outcome.selected, reasons, outcome.settings,
+            outcome.evidence, outcome.rationale, holdout,
         )
     return outcome

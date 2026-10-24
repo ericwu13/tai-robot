@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 import run_backtest as rb
+from src.backtest.strategy import BacktestStrategy
 from src.evolution.grid_search import (
     HARD_MAX_SETTINGS,
     SEARCH_KNOB_CATALOG,
@@ -39,6 +40,7 @@ from src.evolution.paper_gate import (
     resolve_promotion_gate,
 )
 from src.evolution.trial_penalty import (
+    TrialEvidence,
     choose_partitions,
     cscv_pbo,
     deflated_sharpe_ratio,
@@ -132,13 +134,13 @@ class TestKnownPenaltyValues:
     def test_pbo_known_fraction_on_the_symmetric_split(self):
         # First half rewards column 0, second half rewards column 1.
         # C(8, 4) = 70 splits. The 36 splits that take 2 rows from each
-        # half tie, and the in-sample best (lowest index) lands on the
-        # OOS median, so they are not counted. The other 34 land strictly
-        # below. 34/70.
+        # half tie, and the in-sample best lands on the OOS median.
+        # A tie with the median counts as overfit (<=, not strict <),
+        # and the other 34 land strictly below. 70/70.
         col_a = [1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0]
         col_b = [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0]
         matrix = [list(row) for row in zip(col_a, col_b)]
-        assert cscv_pbo(matrix, 8) == pytest.approx(34 / 70)
+        assert cscv_pbo(matrix, 8) == pytest.approx(70 / 70)
 
     def test_partition_count_is_8_or_10(self):
         assert choose_partitions(7) is None
@@ -159,8 +161,13 @@ class TestGridCaps:
         capped = build_search_settings(_BASE, _DEP)
         assert len(full) > HARD_MAX_SETTINGS
         assert len(capped) == HARD_MAX_SETTINGS
-        assert capped == full[:HARD_MAX_SETTINGS]
         assert all(1 <= len(item) <= 2 for item in full)
+        atr_pairs = [
+            item for item in full
+            if len(item) == 2 and all(key.startswith("atr_") for key in item)
+        ]
+        assert atr_pairs
+        assert all(item in capped for item in atr_pairs)
         singles = [item for item in capped if len(item) == 1]
         pairs = [item for item in capped if len(item) == 2]
         assert singles and pairs
@@ -326,6 +333,9 @@ class TestSearchSwitch:
         # LLM plan parser is the other branch.
         assert src.index("dict(grid_outcome.selected)") < src.index(
             "parse_plan_directives(plan)")
+        assert "fold_days=holdout_days" not in src
+        assert "relative.fold_days" in src
+        assert "gate_for_trial" in src
 
 
 class TestDivergentFloorAndDefault:
@@ -341,6 +351,18 @@ class TestDivergentFloorAndDefault:
         assert bounded_min_divergent_folds(30) == 30
         assert bounded_min_divergent_folds(31) == q2_default
         assert bounded_min_divergent_folds("nope") == q2_default
+        # 2.5 and 2.7 are not truncated to 2. The parser warns and
+        # uses the same Q2 default the check uses.
+        assert bounded_min_divergent_folds(2.5) == q2_default
+        assert bounded_min_divergent_folds(2.7) == q2_default
+        assert bounded_min_divergent_folds(2.0) == 2
+        for raw in (2.5, 2.7):
+            parsed = evolution_gate_config_from_mapping({
+                "relative": {"min_divergent_folds": raw},
+            })
+            assert parsed.relative.min_divergent_folds == q2_default
+            assert any("min_divergent_folds" in w and str(raw) in w
+                       for w in parsed.warnings)
         kept = evolution_gate_config_from_mapping({
             "relative": {"min_divergent_folds": 2},
         })
@@ -392,11 +414,15 @@ class TestDivergentFloorAndDefault:
             "relative": {"min_divergent_folds": 2},
         })
         gate = resolve_promotion_gate("paper", cfg.paper_gate, "absolute")
+        kept_trial = TrialEvidence(
+            dsr=0.97, pbo=0.10, n_trials=4, n_eff=3.0,
+            rho_bar=0.0, partitions=8)
         two = assemble_promotion_verdict(
             gate=gate, gate_cfg=cfg, folds=folds(2),
             base_trades=[], cand_trades=[],
             holdout_start="2026-07-10 00:00", criteria=None,
             window_verdict=EvolutionVerdict(True, ["window held ✓"]),
+            trial=kept_trial,
         )
         assert any("divergent≥2" in r for r in two.verdict.reasons)
         assert any("divergent folds:" in r and "≥ 2" in r and "✓" in r
@@ -406,6 +432,7 @@ class TestDivergentFloorAndDefault:
             base_trades=[], cand_trades=[],
             holdout_start="2026-07-10 00:00", criteria=None,
             window_verdict=EvolutionVerdict(True, ["window held ✓"]),
+            trial=kept_trial,
         )
         assert any("divergent folds:" in r and "≥ 2" in r and "✗" in r
                    for r in one.verdict.reasons)
@@ -447,3 +474,350 @@ class TestDivergentFloorAndDefault:
         assert "warning" in gate.note
         assert "absolute" in gate.note
         assert "is real money" not in gate.note
+
+
+def _logged_dsr(reasons) -> list[float]:
+    found = []
+    for line in reasons:
+        if "DSR=" not in line or "DSR=n/a" in line:
+            continue
+        # "DSR=0.5000" or "DSR 0.5000" — the per-setting line uses DSR=.
+        token = line.split("DSR=", 1)[1].split()[0]
+        found.append(float(token))
+    return found
+
+
+class TestDeltaPenaltyAndGates:
+    def test_dsr_known_value_includes_sr0(self):
+        # Bailey & López de Prado (2014): SR0 from cross-trial dispersion
+        # and N, then DSR = Φ((SR - SR0) / SE). Written out here so a
+        # change to the formula cannot pass by calling itself.
+        observed, sharpe_std, n_trials, n_obs = 0.5, 0.4, 20.0, 30
+        skew, kurt = 0.0, 3.0
+        gamma = 0.5772156649015328606
+        sr0 = sharpe_std * (
+            (1.0 - gamma) * norm_ppf(1.0 - 1.0 / n_trials)
+            + gamma * norm_ppf(1.0 - 1.0 / (n_trials * math.e))
+        )
+        var = (
+            1.0 - skew * observed
+            + ((kurt - 1.0) / 4.0) * observed * observed
+        ) / (n_obs - 1)
+        expected = norm_cdf((observed - sr0) / math.sqrt(var))
+        assert sr0 == pytest.approx(0.7602831804724796, abs=1e-12)
+        assert expected == pytest.approx(0.09316650204349813, abs=1e-12)
+        got = deflated_sharpe_ratio(
+            observed, sharpe_std, n_trials, n_obs, skew, kurt)
+        assert got == pytest.approx(expected, abs=1e-12)
+
+    def test_sr0_zero_is_not_the_deflated_sharpe(self):
+        # Same inputs as the pinned value. SR0 is about 0.76, so DSR is
+        # about 0.09. A mutant that sets SR0 = 0 reports the
+        # probabilistic Sharpe instead, which is above 0.99.
+        got = deflated_sharpe_ratio(0.5, 0.4, 20, 30, 0.0, 3.0)
+        no_penalty = deflated_sharpe_ratio(0.5, 0.0, 20, 30, 0.0, 3.0)
+        assert got < 0.2
+        assert no_penalty > 0.99
+        assert got < no_penalty - 0.5
+
+    def test_profitable_baseline_variants_are_not_dsr_one(self):
+        # Absolute PnL of a winning baseline puts every near-copy at
+        # DSR ≈ 1. The grid scores Δ, which here is noise around 0.
+        base = [100.0, 102, 101, 103, 100, 104, 101, 102]
+        noise = [0.5, -0.2, 0.4, -0.1, 0.3, -0.2, 0.2, 0.1]
+        axis = ((50, 60, 70),)
+        baseline = GridPoint(
+            knobs=(), coords=(50,), index=(0,),
+            fold_pnls=tuple(base), mean_delta=0.0, is_baseline=True)
+        points = []
+        for idx, scale in ((1, 1.0), (2, 0.8)):
+            pnls = tuple(b + scale * n for b, n in zip(base, noise))
+            delta = [c - b for c, b in zip(pnls, base)]
+            points.append(GridPoint(
+                knobs=(("ema_period", 50 + 10 * idx),),
+                coords=(50 + 10 * idx,), index=(idx,),
+                fold_pnls=pnls, mean_delta=sum(delta) / len(delta),
+            ))
+        evaluated = _evaluated([baseline, *points])
+        outcome = select_grid(
+            points, baseline, evaluated, list(axis), TrialPenaltyConfig(),
+            preregistered=[{"ema_period": 60}, {"ema_period": 70}])
+        logged = _logged_dsr(outcome.reasons)
+        assert logged
+        assert all(value < 0.9 for value in logged)
+
+    def test_dsr_gate_rejects_a_plateau_centre(self):
+        # Centre is the edge point (mean 1.25). Its DSR is ~0 because a
+        # far point inflates SR0. PBO is 0 (that far point dominates).
+        # Turning the DSR comparison off would select the centre.
+        axis = ((40, 50, 60, 70),)
+        baseline = _ema_point(50, 1, [0.0] * 8, baseline=True)
+
+        def _pt(value, index, pnls):
+            return _ema_point(value, index, pnls)
+
+        centre = _pt(70, 3, [5, -4, 6, -3, 4, -2, 5, -1])
+        neighbour = _pt(60, 2, [4, -3, 5, -2, 3, -1, 4, 0])
+        far = _pt(40, 0, [20, 21, 19, 20, 22, 18, 20, 20])
+        points = [far, neighbour, centre]
+        evaluated = _evaluated([baseline, *points])
+        assert on_plateau(
+            centre, immediate_neighbours(centre, evaluated, list(axis)), 0.50)
+        outcome = select_grid(
+            points, baseline, evaluated, list(axis), TrialPenaltyConfig(),
+            preregistered=[{"ema_period": v} for v in (40, 60, 70)])
+        assert outcome.selected is None
+        assert any("DSR" in line and "✗" in line for line in outcome.reasons)
+
+    def test_pbo_gate_rejects_a_plateau_centre(self):
+        # Two mirror-image columns. With "<=" the CSCV PBO is 1. DSR of
+        # each column is ~1 (identical Sharpes, so SR0 is 0). The edge
+        # point is on the plateau. Turning the PBO comparison off would
+        # select it.
+        axis = ((50, 60, 70),)
+        baseline = _ema_point(50, 0, [0.0] * 8, baseline=True)
+        inner = _ema_point(60, 1, [1, 1, 1, 1, 3, 3, 3, 3])
+        edge = _ema_point(70, 2, [3, 3, 3, 3, 1, 1, 1, 1])
+        points = [inner, edge]
+        evaluated = _evaluated([baseline, *points])
+        assert on_plateau(
+            edge, immediate_neighbours(edge, evaluated, list(axis)), 0.50)
+        outcome = select_grid(
+            points, baseline, evaluated, list(axis), TrialPenaltyConfig(),
+            preregistered=[{"ema_period": 60}, {"ema_period": 70}])
+        assert outcome.selected is None
+        assert any("PBO" in line and "✗" in line for line in outcome.reasons)
+
+    def test_fold_days_sets_the_window_not_a_silent_default(self):
+        from datetime import datetime, timedelta
+
+        from src.backtest.broker import OrderSide, Trade
+        from src.evolution.grid_search import _baseline_bounds
+
+        def _trade(when):
+            return Trade(
+                tag="L", side=OrderSide.LONG, qty=1, entry_price=1,
+                exit_price=1, entry_bar_index=0, exit_bar_index=1,
+                pnl=0, exit_dt=when.strftime("%Y-%m-%d %H:%M"))
+
+        last = datetime(2026, 6, 1, 12, 0)
+        trades = [
+            _trade(last - timedelta(days=20 * i)) for i in range(6)
+        ]
+
+        def _span(bounds):
+            start, end = bounds[0]
+            return (
+                datetime.strptime(end, "%Y-%m-%d %H:%M")
+                - datetime.strptime(start, "%Y-%m-%d %H:%M")
+            )
+
+        wide = _baseline_bounds(trades, 14, 10)
+        narrow = _baseline_bounds(trades, 7, 10)
+        assert _span(wide).days == 14
+        assert _span(narrow).days == 7
+
+
+class DynamicExitPullbackHoldoutProbe(BacktestStrategy):
+    """Knob class whose backtest is replaced in the holdout test."""
+
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 50)
+        self.atr_period = kwargs.get("atr_period", 14)
+
+    def on_bar(self, bar, data_store, broker):
+        return None
+
+    def required_bars(self):
+        return 1
+
+
+class TestHoldoutIsNotUsedToPick:
+    def test_perturbing_the_holdout_does_not_change_the_pick(self, monkeypatch):
+        from datetime import datetime, timedelta
+        from types import SimpleNamespace
+
+        from src.backtest.broker import OrderSide, Trade
+        from src.evolution.grid_search import run_grid_on_bars
+        from src.evolution.pipeline import ABResult
+        from src.market_data.models import Bar
+
+        last = datetime(2026, 6, 1, 12, 0)
+        dates = [
+            (last - timedelta(days=14 * (8 - i))).strftime("%Y-%m-%d %H:%M")
+            for i in range(9)
+        ]
+        late = "2026-06-03 12:00"
+
+        def _trade(when, pnl):
+            return Trade(
+                tag="L", side=OrderSide.LONG, qty=1, entry_price=1,
+                exit_price=1, entry_bar_index=0, exit_bar_index=1,
+                pnl=int(pnl), exit_dt=when)
+
+        def _selection(ema, i):
+            value = {60: 30, 70: 20, 80: 24}.get(int(ema), 1)
+            if i == 0:
+                return value - 1
+            if i == 1:
+                return value + 1
+            return value
+
+        def _holdout(ema, perturbed):
+            ema = int(ema)
+            if perturbed and ema == 70:
+                return -100000
+            if perturbed and ema == 80:
+                return 40000
+            return {60: 30, 70: 20, 80: 24}.get(ema, 1)
+
+        def fake_backtest(strategy_cls, bars, point_value, name,
+                          capital_base=0):
+            ema = int(getattr(strategy_cls(), "ema_period", 50))
+            perturbed = bars[-1].close >= 90000
+            if ema == 50:
+                trades = [_trade(when, 0) for when in dates]
+            else:
+                trades = [
+                    _trade(dates[i], _selection(ema, i)) for i in range(8)
+                ]
+                trades.append(_trade(dates[8], _holdout(ema, perturbed)))
+                # After the baseline's last exit. Selection must ignore
+                # it; the OOS window must keep it.
+                trades.append(_trade(late, 777))
+            return ABResult(
+                name=name, result=SimpleNamespace(trades=trades))
+
+        def three_settings(baseline, eligibility, trial=None):
+            return [
+                {"ema_period": 60},
+                {"ema_period": 70},
+                {"ema_period": 80},
+            ]
+
+        monkeypatch.setattr(
+            "src.evolution.pipeline.run_ab_backtest", fake_backtest)
+        monkeypatch.setattr(
+            "src.evolution.grid_search.build_search_settings", three_settings)
+        source = (
+            "from src.backtest.strategy import BacktestStrategy\n\n"
+            + inspect.getsource(DynamicExitPullbackHoldoutProbe)
+        )
+
+        def _bars(close):
+            return [
+                Bar(symbol="T", dt=datetime(2026, 1, 1, 9, 0),
+                    open=100, high=110, low=90, close=100,
+                    volume=1, interval=900),
+                Bar(symbol="T", dt=datetime(2026, 6, 3, 9, 0),
+                    open=100, high=110, low=90, close=close,
+                    volume=1, interval=900),
+            ]
+
+        def _run(close):
+            return run_grid_on_bars(
+                strategy_cls=DynamicExitPullbackHoldoutProbe,
+                source=source,
+                bars=_bars(close),
+                point_value=1,
+                capital_base=100000,
+                evo={},
+                fold_days=14,
+            )
+
+        plain = _run(100)
+        moved = _run(90000)
+        assert plain.selected == {"ema_period": 70}
+        assert moved.selected == {"ema_period": 70}
+        assert plain.holdout is not None and moved.holdout is not None
+        # The June 1 holdout trade (20, or -100000 once perturbed) plus
+        # the trade after the baseline's last exit (777).
+        assert plain.holdout.cand_pnl == pytest.approx(20 + 777)
+        assert moved.holdout.cand_pnl == pytest.approx(-100000 + 777)
+        assert plain.holdout.base_pnl == pytest.approx(0)
+        assert plain.holdout.delta == pytest.approx(plain.holdout.cand_pnl)
+        assert "excluded from selection" in " ".join(plain.reasons)
+        start = datetime.strptime(
+            plain.holdout.selection_start, "%Y-%m-%d %H:%M")
+        end = datetime.strptime(
+            plain.holdout.selection_end, "%Y-%m-%d %H:%M")
+        assert (end - start).days == 14
+        assert plain.holdout.fold_days == 14
+        assert plain.holdout.end > late
+
+
+class TestNoGridEvidenceUsesAbsolute:
+    def test_missing_trial_does_not_pass_and_falls_back(self):
+        from datetime import datetime, timedelta
+
+        from src.evolution.paper_gate import (
+            NO_GRID_EVIDENCE_LOG,
+            assemble_promotion_verdict,
+            decide_relative_paper_checks,
+            gate_for_trial,
+        )
+        from src.evolution.pipeline import (
+            EvolutionVerdict,
+            Fold,
+            window_stats,
+        )
+
+        def _rows(origin, pnls):
+            return [
+                type("T", (), {
+                    "pnl": pnl,
+                    "exit_dt": (origin + timedelta(hours=1 + j)
+                                ).strftime("%Y-%m-%d %H:%M"),
+                })()
+                for j, pnl in enumerate(pnls)
+            ]
+
+        folds, base, cand = [], [], []
+        for i in range(6):
+            origin = datetime(2026, 5, 1) + timedelta(days=14 * i)
+            end = origin + timedelta(days=14)
+            b = _rows(origin, [100, -400])
+            c = _rows(origin, [100, -200])
+            bs, cs = window_stats(b), window_stats(c)
+            folds.append(Fold(
+                start=origin.strftime("%Y-%m-%d %H:%M"),
+                end=end.strftime("%Y-%m-%d %H:%M"),
+                base=bs, cand=cs, shared=0, base_only=2, cand_only=2,
+                delta=cs.pnl - bs.pnl,
+            ))
+            base.extend(b)
+            cand.extend(c)
+
+        # A mutant that treats "no grid result" as a relative pass makes
+        # this True: the folds clear the other relative checks.
+        from src.evolution.paper_gate import RelativeGateConfig
+        direct = decide_relative_paper_checks(
+            folds, [t.pnl for t in base],
+            RelativeGateConfig(bootstrap_resamples=200, bootstrap_seed=1),
+            None,
+        )
+        assert direct.passed is False
+        assert any("Not a pass" in r for r in direct.reasons)
+
+        cfg = evolution_gate_config_from_mapping({
+            "paper_gate": "relative",
+            "search": "llm_one",
+            "relative": {"bootstrap_resamples": 200, "bootstrap_seed": 1},
+        })
+        gate = resolve_promotion_gate("paper", cfg.paper_gate, "absolute")
+        fallen, line = gate_for_trial(gate, None)
+        assert fallen.mode == "absolute"
+        assert line == NO_GRID_EVIDENCE_LOG
+        assembled = assemble_promotion_verdict(
+            gate=gate, gate_cfg=cfg, folds=folds,
+            base_trades=base, cand_trades=cand,
+            holdout_start=folds[-1].start, criteria=None,
+            window_verdict=EvolutionVerdict(True, ["window held ✓"]),
+            trial=None,
+        )
+        text = "\n".join(assembled.verdict.reasons)
+        assert NO_GRID_EVIDENCE_LOG in text
+        assert "not supplied" not in text
+        assert any("holdout fold PF" in r and "✗" in r
+                   for r in assembled.verdict.reasons)
+        assert assembled.verdict.passed is False

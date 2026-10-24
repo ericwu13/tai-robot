@@ -274,22 +274,41 @@ def recognized_paper_gate(value) -> str | None:
     return None
 
 
+def _as_bounded_divergent(value) -> int | None:
+    """An in-range integer floor, or None when the value is not one.
+
+    Non-integers such as 2.5 and 2.7 are None. ``int(2.5)`` is 2, and
+    that truncation is not a configured floor. Integer-valued floats
+    (2.0, 3.0) are accepted. Bools are not integers here.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        n = int(value)
+    else:
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return None
+    if n < MIN_DIVERGENT_FOLDS_BOUND or n > MAX_DIVERGENT_FOLDS_BOUND:
+        return None
+    return n
+
+
 def bounded_min_divergent_folds(value) -> int:
     """The divergent-fold floor the relative gate actually uses.
 
-    Values below 2 or above 30 are not a configured floor. They become
+    Values below 2, above 30, or not an integer become
     ``DEFAULT_MIN_DIVERGENT_FOLDS``, which is Q2's "≥ 3 divergent
     folds". Two is the smallest number that can be asked to agree.
+    2.5 and 2.7 fall back; they are not truncated to 2.
     """
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
+    parsed = _as_bounded_divergent(value)
+    if parsed is None:
         return DEFAULT_MIN_DIVERGENT_FOLDS
-    if (isinstance(value, bool)
-            or n < MIN_DIVERGENT_FOLDS_BOUND
-            or n > MAX_DIVERGENT_FOLDS_BOUND):
-        return DEFAULT_MIN_DIVERGENT_FOLDS
-    return n
+    return parsed
 
 
 def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
@@ -340,11 +359,24 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
         rel, "effect_size_sigma", DEFAULT_EFFECT_SIZE_SIGMA,
         lo=0.0, hi=1.0, warnings=warnings)
     # Below 2 is not a floor (one divergent fold cannot agree with
-    # itself). Above 30 is not the approved sample. Both fall back.
-    min_divergent = _present_closed_int(
-        rel, "min_divergent_folds", DEFAULT_MIN_DIVERGENT_FOLDS,
-        lo=MIN_DIVERGENT_FOLDS_BOUND, hi=MAX_DIVERGENT_FOLDS_BOUND,
-        warnings=warnings)
+    # itself). Above 30 is not the approved sample. Non-integers
+    # (2.5, 2.7) are the same rejection as an out-of-range integer:
+    # Q2's default, plus a warning. The check below uses the same
+    # predicate, so the logged floor cannot disagree with the parser.
+    if "min_divergent_folds" not in rel:
+        min_divergent = DEFAULT_MIN_DIVERGENT_FOLDS
+    else:
+        raw_divergent = rel.get("min_divergent_folds")
+        parsed_divergent = _as_bounded_divergent(raw_divergent)
+        if parsed_divergent is None:
+            warnings.append(
+                f"relative.min_divergent_folds {raw_divergent!r} is not "
+                f"an integer in [{MIN_DIVERGENT_FOLDS_BOUND}, "
+                f"{MAX_DIVERGENT_FOLDS_BOUND}]; using default "
+                f"{DEFAULT_MIN_DIVERGENT_FOLDS}")
+            min_divergent = DEFAULT_MIN_DIVERGENT_FOLDS
+        else:
+            min_divergent = parsed_divergent
     dsr_min = _present_open_float(
         pen, "dsr_min", DEFAULT_DSR_MIN, lo=0.0, hi=1.0,
         warnings=warnings, prefix="trial_penalty")
@@ -468,6 +500,32 @@ def resolve_promotion_gate(trading_mode: str, paper_gate: str,
         f"warning: trading mode {label} is not a known paper or backtest "
         f"mode; using absolute")
     return PromotionGate("absolute", "; ".join(notes))
+
+
+# Logged when a paper bot is on the relative gate but this run has no
+# grid trial (llm_one, or a class that is not on the knob grid). The
+# absolute PF floor decides. Missing evidence is not a relative pass
+# and not an automatic relative fail.
+NO_GRID_EVIDENCE_LOG = (
+    "EVO gate: no grid trial evidence — the paper relative gate falls "
+    "back to the absolute PF floor (search=llm_one, or this class is "
+    "not on the knob grid). Not an automatic relative fail."
+)
+
+
+def gate_for_trial(gate: PromotionGate, trial) -> tuple[PromotionGate, str]:
+    """Absolute fallback when the relative gate has no grid evidence.
+
+    A relative gate with a trial is unchanged. A relative gate with
+    ``trial is None`` becomes absolute and returns
+    ``NO_GRID_EVIDENCE_LOG``. Real-money gates are already absolute.
+    """
+    if gate.mode == "relative" and trial is None:
+        note = NO_GRID_EVIDENCE_LOG
+        if gate.note:
+            note = f"{gate.note}; {NO_GRID_EVIDENCE_LOG}"
+        return PromotionGate("absolute", note), NO_GRID_EVIDENCE_LOG
+    return gate, ""
 
 
 def evolution_promotion_mode(*, runner, runner_idle: bool, configured_mode):
@@ -838,12 +896,16 @@ def assemble_promotion_verdict(
     ``bounded_min_divergent_folds(relative.min_divergent_folds)`` — at
     least 2, and the same number the threshold line logs. The absolute
     path keeps ``MIN_DIVERGENT_FOLDS``. ``trial`` is the grid's DSR and
-    PBO. The relative path requires it.
+    PBO. The relative path requires it. With no trial (``llm_one``, or
+    a class that is not on the knob grid) the gate falls back to
+    absolute and the verdict carries ``NO_GRID_EVIDENCE_LOG`` instead
+    of failing the relative checks for a missing score.
 
     ``bars`` and ``month_gate`` are forwarded to ``decide_month_gates``.
     This module does not compute the scaled slack. Omitting both keeps
     the pre-P5 month gates.
     """
+    gate, fallback_line = gate_for_trial(gate, trial)
     relative = gate.mode == "relative"
     rel_cfg = gate_cfg.relative
     divergent_floor = bounded_min_divergent_folds(rel_cfg.min_divergent_folds)
@@ -868,8 +930,11 @@ def assemble_promotion_verdict(
             folds, baseline_pnls_in_folds(base_trades, folds), rel_cfg,
             trial)
         parts.append(relative_verdict)
+    verdict = combine_evolution_verdicts(*parts)
+    if fallback_line:
+        verdict.reasons.insert(0, fallback_line)
     return PromotionAssembly(
-        verdict=combine_evolution_verdicts(*parts),
+        verdict=verdict,
         month_verdict=month,
         window_verdict=window_verdict,
         multifold_verdict=mf,

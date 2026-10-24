@@ -199,9 +199,16 @@ def sample_moments(returns: list[float]) -> tuple[float, float] | None:
 def expected_maximum_sharpe(n_trials: float, sharpe_std: float) -> float:
     """Expected maximum Sharpe under a null of zero, given ``n_trials``.
 
-    ``sharpe_std`` is the cross-sectional sample standard deviation of
-    the trial Sharpe ratios, not the estimation error of one Sharpe.
-    One trial (or a non-positive dispersion) has no selection premium.
+    Bailey & López de Prado (2014), "The Deflated Sharpe Ratio":
+
+        SR0 = σ_SR * ((1 - γ) Z^{-1}(1 - 1/N) + γ Z^{-1}(1 - 1/(N*e)))
+
+    ``N`` is the effective trial count. ``σ_SR`` (``sharpe_std``) is the
+    cross-trial standard deviation of the Sharpe ratios, not the
+    estimation error of one Sharpe. ``γ`` is the Euler-Mascheroni
+    constant. One trial, or a non-positive dispersion, has no selection
+    premium, so SR0 is 0. Forcing SR0 to 0 for N > 1 drops the penalty
+    and is not this formula.
     """
     if not math.isfinite(n_trials) or n_trials <= 1.0:
         return 0.0
@@ -221,8 +228,15 @@ def deflated_sharpe_ratio(
         kurtosis: float) -> float | None:
     """Probability that the true Sharpe exceeds 0 after the trial penalty.
 
-    None when the estimation variance is not positive or an input is
-    non-finite. The caller treats None as a miss.
+    Bailey & López de Prado (2014), "The Deflated Sharpe Ratio":
+
+        DSR = Z[ (SR - SR0) / SE(SR) ]
+        SE(SR) = sqrt( (1 - γ3*SR + ((γ4 - 1)/4)*SR^2) / (T - 1) )
+
+    ``SR0`` is ``expected_maximum_sharpe`` (0 only when N ≤ 1 or the
+    cross-trial dispersion is 0). ``γ3`` is skewness and ``γ4`` is
+    non-excess kurtosis. None when the estimation variance is not
+    positive or an input is non-finite. The caller treats None as a miss.
     """
     if n_obs < 2:
         return None
@@ -328,13 +342,14 @@ def _median(values: list[float]) -> float:
 
 
 def cscv_pbo(matrix: list[list[float]], partitions: int) -> float | None:
-    """Fraction of CSCV splits whose in-sample best is below the OOS median.
+    """Fraction of CSCV splits whose in-sample best is overfit out of sample.
 
     ``matrix[t][j]`` is configuration ``j`` in fold ``t``. ``partitions``
     must be an even integer >= 2 and must not exceed the row count.
-    Ties for the in-sample best take the lowest column index. "Below"
-    is strict, so a configuration that lands on the median does not
-    count as overfit on that split. None when the matrix cannot be split.
+    Ties for the in-sample best take the lowest column index. Overfit
+    means the in-sample best's out-of-sample score is less than or equal
+    to the OOS median (a tie with the median counts). None when the
+    matrix cannot be split.
     """
     if partitions < 2 or partitions % 2 != 0:
         return None
@@ -381,7 +396,7 @@ def cscv_pbo(matrix: list[list[float]], partitions: int) -> float | None:
         oos_score = [
             sum(columns[j][t] for t in oos_rows) for j in range(n_cols)
         ]
-        if oos_score[best] < _median(oos_score):
+        if oos_score[best] <= _median(oos_score):
             below += 1
         total += 1
     if total == 0:
