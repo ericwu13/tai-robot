@@ -17,6 +17,16 @@ def _is_multiprocessing_child(argv=None) -> bool:
     return len(args) >= 2 and args[1] == "--multiprocessing-fork"
 
 
+def _is_grid_smoke(argv=None) -> bool:
+    """True for the key-free ``--grid-subprocess-smoke`` parent.
+
+    That process must not import COM. The spawn child is recognized by
+    ``_is_multiprocessing_child`` and is also skipped.
+    """
+    args = sys.argv if argv is None else argv
+    return "--grid-subprocess-smoke" in args
+
+
 if getattr(sys, 'frozen', False):
     _bundle_dir = sys._MEIPASS
 
@@ -50,8 +60,9 @@ if getattr(sys, 'frozen', False):
 
     # ── comtypes ──
     # The grid child is a frozen re-exec of this EXE. It must not import
-    # COM. PATH / PYTHONNET above do not import comtypes.
-    if not _is_multiprocessing_child():
+    # COM. The smoke parent does not either. PATH / PYTHONNET above do
+    # not import comtypes.
+    if not _is_multiprocessing_child() and not _is_grid_smoke():
         cache_dir = os.path.join(
             os.path.dirname(sys.executable), '_comtypes_cache')
         os.makedirs(cache_dir, exist_ok=True)

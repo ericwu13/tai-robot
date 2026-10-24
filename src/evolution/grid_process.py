@@ -170,6 +170,24 @@ def silent_child_entry(job: GridJob, conn) -> None:
     return
 
 
+def hang_child_entry(job: GridJob, conn) -> None:
+    """Sleep until the parent kills this process. Smoke only.
+
+    ``--grid-subprocess-smoke --hang`` uses this so a STOP file or a
+    short ``--timeout-s`` can be observed. It does not run the grid.
+    """
+    evo = job.evo if isinstance(job.evo, dict) else {}
+    seconds = float(evo.get("hang_seconds", 3600))
+    time.sleep(max(0.0, seconds))
+    try:
+        conn.send(("ok", "hang-finished"))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def burn_child_entry(job: GridJob, conn) -> None:
     """CPU-bound or failing stand-in. Tests only. Not used by the bot.
 
@@ -383,7 +401,8 @@ def run_grid_isolated(
         stop_check=None,
         in_process: bool = False,
         poll_s: float = 0.2,
-        entry=None):
+        entry=None,
+        on_start=None):
     """Run the grid and return a ``GridOutcome`` or ``GridProcessFailure``.
 
     The default waits on a spawn child. Each pass checks ``stop_check``,
@@ -398,12 +417,15 @@ def run_grid_isolated(
 
     ``in_process=True`` runs ``entry`` on the calling thread. Tests
     set it so a monkeypatched ``run_grid_on_bars`` stays in-process.
-    The live worker leaves it false.
+    The live worker leaves it false. ``on_start`` is called with the
+    child pid after spawn, or with None on the in-process path.
     """
     fn = grid_child_entry if entry is None else entry
     if in_process:
         if stop_check is not None and stop_check():
             return GridProcessFailure("stopped", "stop requested")
+        if on_start is not None:
+            on_start(None)
         return _run_in_process(fn, job)
 
     ctx = multiprocessing.get_context("spawn")
@@ -419,6 +441,8 @@ def run_grid_isolated(
                 "crash",
                 f"could not start grid child: {type(exc).__name__}: {exc}",
                 proc.pid)
+        if on_start is not None:
+            on_start(proc.pid)
         try:
             send_conn.close()
             send_closed = True

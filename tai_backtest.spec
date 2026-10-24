@@ -98,6 +98,7 @@ a = Analysis(
         'src.evolution.regime_fitness', 'src.evolution.regime_pipeline',
         # Saturday grid sweep runs in a spawn child of the frozen EXE.
         'src.evolution.grid_process', 'src.evolution.grid_search',
+        'src.evolution.grid_smoke',
         # Utils
         'src.utils.time_utils',
         # Self-update

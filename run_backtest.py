@@ -22,9 +22,14 @@ import sys
 # to run before Tk, COM, or the Capital API are imported and before
 # main() starts a bot. A child sees --multiprocessing-fork, runs the
 # grid payload, and exits here. The headless entry is run_bot_cli.py.
+# The grid-smoke flag is the key-free parent: it also exits here, so
+# this process never opens a Tk window or talks to the broker.
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
+    if "--grid-subprocess-smoke" in sys.argv:
+        from src.evolution.grid_smoke import main as _grid_smoke_main
+        raise SystemExit(_grid_smoke_main(sys.argv))
 
 import inspect
 import queue

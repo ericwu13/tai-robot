@@ -136,7 +136,7 @@ def test_grid_process_module_import_is_stdlib_only():
 def test_freeze_support_runs_before_tk_and_before_the_headless_bot():
     gui = (ROOT / "run_backtest.py").read_text(encoding="utf-8")
     assert gui.index("multiprocessing.freeze_support()") < gui.index(
-        "import tkinter")
+        "--grid-subprocess-smoke") < gui.index("import tkinter")
     cli = (ROOT / "run_bot_cli.py").read_text(encoding="utf-8")
     assert cli.index("multiprocessing.freeze_support()") < cli.index(
         "from src.live.headless")
@@ -150,8 +150,13 @@ def test_frozen_hook_skips_comtypes_for_the_grid_child():
     assert hook._is_multiprocessing_child(
         ["tai_backtest.exe", "--multiprocessing-fork", "parent_pid=1"])
     assert not hook._is_multiprocessing_child(["tai_backtest.exe"])
+    assert hook._is_grid_smoke(
+        ["tai_backtest.exe", "--grid-subprocess-smoke", "--hang"])
+    assert not hook._is_grid_smoke(
+        ["tai_backtest.exe", "--multiprocessing-fork"])
     src = (ROOT / "runtime_hook_comtypes.py").read_text(encoding="utf-8")
     assert "_is_multiprocessing_child" in src
+    assert "_is_grid_smoke" in src
     assert "import comtypes.gen" in src
 
 
