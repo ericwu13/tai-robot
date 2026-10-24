@@ -13,6 +13,10 @@ a bot. The grid stack is imported inside the child function.
 
 The job is picklable (bars, strategy source, class name, grid config).
 The child returns a picklable ``GridOutcome``, including trial evidence.
+The parent reads that result while the child is still running. Reading
+only after the child exits deadlocks: ``send`` blocks once the payload
+fills the OS pipe (8 KB on Windows, 64 KB on Linux) and the child never
+reaches exit.
 
 ``in_process=True`` is the test seam. It runs the same function on the
 calling thread and holds the GIL. Production leaves it false. A timeout
@@ -148,6 +152,24 @@ def grid_child_entry(job: GridJob, conn) -> None:
             pass
 
 
+def payload_child_entry(job: GridJob, conn) -> None:
+    """Send ``b"Q" * nbytes``. Tests the pipe drain. Not used by the bot."""
+    evo = job.evo if isinstance(job.evo, dict) else {}
+    blob = b"Q" * int(evo.get("nbytes", 0))
+    try:
+        conn.send(("ok", blob))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def silent_child_entry(job: GridJob, conn) -> None:
+    """Exit without a result. Tests the empty-pipe crash. Not used by the bot."""
+    return
+
+
 def burn_child_entry(job: GridJob, conn) -> None:
     """CPU-bound or failing stand-in. Tests only. Not used by the bot.
 
@@ -277,24 +299,77 @@ def _run_in_process(fn, job):
     return GridProcessFailure("crash", text)
 
 
-def _read_result(proc, recv_conn):
-    pid = proc.pid
+def _join_after_receipt(proc) -> None:
+    """The payload is already in hand. Reap the child, then return it."""
+    try:
+        proc.join(2.0)
+    except Exception:
+        pass
+    if _alive(proc):
+        _terminate(proc)
+
+
+def _exit_code(proc):
     try:
         proc.join(0.2)
     except Exception:
         pass
-    code = proc.exitcode
+    return proc.exitcode
+
+
+def _no_result(proc) -> GridProcessFailure:
+    pid = proc.pid
+    # A clean exit closes the pipe just before the process is reaped.
+    # Join before terminate so that exit code survives.
+    code = _exit_code(proc)
+    if _alive(proc):
+        _terminate(proc)
+        code = proc.exitcode
+    return GridProcessFailure(
+        "crash", f"grid child exited {code} with no result", pid)
+
+
+def _pipe_failed(proc, exc) -> GridProcessFailure:
+    pid = proc.pid
+    code = _exit_code(proc)
+    return GridProcessFailure(
+        "crash",
+        f"grid child pipe failed ({type(exc).__name__}: {exc}); "
+        f"exit {code}",
+        pid)
+
+
+def _poll_message(recv_conn, timeout):
+    """``("msg", item)``, ``("eof", None)``, ``("empty", None)``, or ``("err", exc)``.
+
+    ``poll`` uses a short timeout so the caller can still notice STOP,
+    the deadline, and a dead child. A positive poll then ``recv``s.
+    That read is what lets a large ``send`` finish.
+    """
     try:
-        if not recv_conn.poll(1.0):
-            return GridProcessFailure(
-                "crash", f"grid child exited {code} with no result", pid)
-        status, payload = recv_conn.recv()
-    except (EOFError, OSError, ValueError) as exc:
+        ready = recv_conn.poll(0.0 if timeout <= 0 else timeout)
+    except EOFError:
+        return "eof", None
+    except (OSError, ValueError) as exc:
+        return "err", exc
+    if not ready:
+        return "empty", None
+    try:
+        return "msg", recv_conn.recv()
+    except EOFError:
+        return "eof", None
+    except (OSError, ValueError) as exc:
+        return "err", exc
+
+
+def _decode_message(proc, message):
+    pid = proc.pid
+    _join_after_receipt(proc)
+    try:
+        status, payload = message
+    except (TypeError, ValueError):
         return GridProcessFailure(
-            "crash",
-            f"grid child pipe failed ({type(exc).__name__}: {exc}); "
-            f"exit {code}",
-            pid)
+            "crash", f"grid child sent {message!r}", pid)
     if status == "ok":
         return payload
     text = payload if isinstance(payload, str) else repr(payload)
@@ -311,10 +386,15 @@ def run_grid_isolated(
         entry=None):
     """Run the grid and return a ``GridOutcome`` or ``GridProcessFailure``.
 
-    The default waits on a spawn child. ``stop_check`` is polled from
-    this thread; when it returns true the child is terminated. A child
-    that is still alive at ``timeout_s`` is terminated. The Tk thread
-    is not this thread.
+    The default waits on a spawn child. Each pass checks ``stop_check``,
+    polls the result pipe for a short slice, then checks the deadline
+    and whether the child is still alive. The result is received as soon as
+    it is readable, which drains the pipe so a payload larger than the
+    OS buffer cannot stick the child in ``send``. The child is joined
+    after that receipt. ``stop_check`` true, or a still-running child
+    with an empty pipe at ``timeout_s``, terminates the child. A child
+    that exits without a message is a crash with no trial evidence.
+    The Tk thread is not this thread.
 
     ``in_process=True`` runs ``entry`` on the calling thread. Tests
     set it so a monkeypatched ``run_grid_on_bars`` stays in-process.
@@ -346,20 +426,37 @@ def run_grid_isolated(
             pass
         deadline = time.monotonic() + float(timeout_s)
         poll = 0.05 if not poll_s or poll_s <= 0 else float(poll_s)
-        while _alive(proc):
+        while True:
+            # STOP wins over a payload that has not been read yet, same
+            # as killing a child that has not exited.
             if stop_check is not None and stop_check():
                 _terminate(proc)
                 return GridProcessFailure(
                     "stopped", "stop requested", proc.pid)
             remaining = deadline - time.monotonic()
+            slice_s = 0.0 if remaining <= 0 else min(poll, remaining)
+            kind, message = _poll_message(recv_conn, slice_s)
+            if kind == "msg":
+                return _decode_message(proc, message)
+            if kind == "err":
+                return _pipe_failed(proc, message)
+            if kind == "eof" or not _alive(proc):
+                # The write end may have closed between the empty poll
+                # and the liveness check. One more non-blocking read
+                # before calling the pipe empty.
+                if kind != "eof":
+                    kind, message = _poll_message(recv_conn, 0.0)
+                    if kind == "msg":
+                        return _decode_message(proc, message)
+                    if kind == "err":
+                        return _pipe_failed(proc, message)
+                return _no_result(proc)
             if remaining <= 0:
                 _terminate(proc)
                 return GridProcessFailure(
                     "timeout",
                     f"grid child exceeded {float(timeout_s):g}s",
                     proc.pid)
-            proc.join(min(poll, remaining))
-        return _read_result(proc, recv_conn)
     finally:
         if not send_closed:
             try:

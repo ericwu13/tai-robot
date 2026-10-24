@@ -21,7 +21,9 @@ from src.evolution.grid_process import (
     GridProcessFailure,
     audit_child_imports,
     burn_child_entry,
+    payload_child_entry,
     run_grid_isolated,
+    silent_child_entry,
 )
 from src.market_data.models import Bar
 
@@ -250,6 +252,44 @@ def test_child_crash_is_no_grid_evidence():
     assert failure.kind == "crash"
     assert "3" in failure.detail
     _assert_dead(failure.pid)
+
+
+def test_child_exit_without_a_result_is_a_crash():
+    """K10: a clean exit that never sent a message is no trial evidence."""
+    failure = run_grid_isolated(
+        _job(), timeout_s=15, entry=silent_child_entry, poll_s=0.05)
+    assert isinstance(failure, GridProcessFailure), failure
+    assert failure.kind == "crash"
+    assert "no result" in failure.detail
+    assert "exited 0" in failure.detail
+    _assert_dead(failure.pid)
+
+
+def test_large_subprocess_result_is_read_before_the_child_exits():
+    """A payload bigger than the OS pipe buffer must come back.
+
+    The parent used to recv only after the child exited. ``send`` blocks
+    once the pipe is full (8 KB on Windows, 64 KB on Linux), the child
+    never exits, and the bounded timeout below turns that deadlock into
+    a timeout failure. Spawn and the real result pipe are the production
+    path (``in_process`` stays false).
+    """
+    import pickle
+
+    n = 128 * 1024
+    assert n > 64 * 1024
+    assert len(pickle.dumps(("ok", b"Q" * n))) > 64 * 1024
+    started = time.monotonic()
+    result = run_grid_isolated(
+        _job(nbytes=n),
+        timeout_s=20,
+        entry=payload_child_entry,
+        poll_s=0.05,
+    )
+    elapsed = time.monotonic() - started
+    assert isinstance(result, bytes), result
+    assert result == b"Q" * n
+    assert elapsed < 20, elapsed
 
 
 def test_child_exception_is_a_crash_result():
