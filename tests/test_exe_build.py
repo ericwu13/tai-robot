@@ -8,6 +8,7 @@ tests run on Linux — they do not launch a Windows EXE.
 """
 
 import importlib
+import importlib.abc
 import os
 import sys
 import types
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 
 import build_release
-from runtime_hook_comtypes import ensure_comtypes_gen
+from runtime_hook_comtypes import _install_comtypes_gen, ensure_comtypes_gen
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -107,6 +108,7 @@ def test_strategies_datas_refuses_to_wipe_project_root(tmp_path):
 def test_spec_uses_placeholder_and_hiddenimports_comtypes_gen():
     spec = (REPO / "tai_backtest.spec").read_text(encoding="utf-8")
     assert "strategies_datas(SPECPATH)" in spec
+    assert "sys.path.insert(0, SPECPATH)" in spec
     assert "('strategies', 'strategies')" not in spec
     assert '("strategies", "strategies")' not in spec
     assert "'comtypes.gen'" in spec
@@ -120,6 +122,14 @@ def test_requirements_build_pins_known_good_toolchain():
     pins = build_release.parse_pinned_requirements(text)
     assert pins["PyInstaller"] == "6.19.0"
     assert pins["comtypes"] == "1.4.15"
+    # The 1.4.15 wheel has no gen/; hooks-contrib floats with PyInstaller.
+    assert "does not ship comtypes/gen" in text
+    assert "pyinstaller-hooks-contrib" in text
+    assert "not pinned" in text
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "--no-install" in readme
+    assert "dedicated build virtualenv" in readme
+    assert "does not ship a `comtypes/gen/`" in readme
 
 
 def test_parse_pinned_requirements_rejects_unpinned_and_duplicates():
@@ -216,6 +226,43 @@ def test_ensure_build_requirements_exits_when_still_wrong(tmp_path):
         )
 
 
+def test_build_no_install_skips_pip(monkeypatch, capsys):
+    order = []
+
+    def fake_ensure(root):
+        order.append("ensure")
+
+    def fake_warn(root):
+        order.append("warn")
+        print("Not installing requirements-build.txt (--no-install).")
+        return {}
+
+    def fake_strategies(root):
+        order.append("strategies")
+        return []
+
+    def fake_run(cmd, cwd=None):
+        order.append("pyinstaller")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(build_release, "ensure_build_requirements", fake_ensure)
+    monkeypatch.setattr(build_release, "warn_build_requirements", fake_warn)
+    monkeypatch.setattr(build_release, "strategies_datas", fake_strategies)
+    monkeypatch.setattr(build_release.subprocess, "run", fake_run)
+
+    build_release.build(install_requirements=False)
+
+    assert order == ["warn", "strategies", "pyinstaller"]
+    assert "--no-install" in capsys.readouterr().out
+
+
+def test_main_wires_no_install_flag():
+    import inspect
+    src = inspect.getsource(build_release.main)
+    assert '"--no-install"' in src
+    assert "install_requirements=not args.no_install" in src
+
+
 def test_build_installs_pins_and_stages_strategies_before_pyinstaller(monkeypatch):
     order = []
 
@@ -246,7 +293,7 @@ def test_build_installs_pins_and_stages_strategies_before_pyinstaller(monkeypatc
 
 
 def test_ensure_comtypes_gen_creates_package_when_import_fails(tmp_path):
-    """The guarded path: ``import comtypes.gen`` raises, the hook does not."""
+    """Swallowed case: the missing module is ``comtypes.gen`` itself."""
     snapshot = _comtypes_snapshot()
     cache = tmp_path / "_comtypes_cache"
     pkg = tmp_path / "comtypes_pkg"
@@ -313,8 +360,80 @@ def test_ensure_comtypes_gen_prepends_cache_when_already_importable(tmp_path):
         _restore_comtypes(snapshot)
 
 
+def test_ensure_comtypes_gen_reraises_when_gen_itself_is_broken(tmp_path):
+    """Re-raised case: comtypes.gen imports something else that is missing."""
+    snapshot = _comtypes_snapshot()
+    root = tmp_path / "py"
+    gen_dir = root / "comtypes" / "gen"
+    gen_dir.mkdir(parents=True)
+    (root / "comtypes" / "__init__.py").write_text("", encoding="utf-8")
+    (gen_dir / "__init__.py").write_text(
+        "import definitely_not_a_real_module_xyz\n", encoding="utf-8",
+    )
+    sys.path.insert(0, str(root))
+    try:
+        for name in list(sys.modules):
+            if name == "comtypes" or name.startswith("comtypes."):
+                sys.modules.pop(name, None)
+        with pytest.raises(ModuleNotFoundError) as exc:
+            ensure_comtypes_gen(str(tmp_path / "cache"))
+        assert exc.value.name == "definitely_not_a_real_module_xyz"
+    finally:
+        sys.path.remove(str(root))
+        _restore_comtypes(snapshot)
+
+
+class _BlockComtypes(importlib.abc.MetaPathFinder):
+    def __init__(self, missing_name):
+        self.missing_name = missing_name
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "comtypes" or fullname.startswith("comtypes."):
+            raise ModuleNotFoundError(
+                f"No module named {self.missing_name!r}",
+                name=self.missing_name,
+            )
+        return None
+
+
+def test_install_comtypes_gen_swallows_only_missing_comtypes(tmp_path):
+    """Swallowed case for the installer: ``e.name == 'comtypes'``."""
+    snapshot = _comtypes_snapshot()
+    blocker = _BlockComtypes("comtypes")
+    sys.meta_path.insert(0, blocker)
+    cache = tmp_path / "cache"
+    init_py = cache / "__init__.py"
+    try:
+        for name in list(sys.modules):
+            if name == "comtypes" or name.startswith("comtypes."):
+                sys.modules.pop(name, None)
+        assert _install_comtypes_gen(str(cache), str(init_py)) is None
+    finally:
+        sys.meta_path.remove(blocker)
+        _restore_comtypes(snapshot)
+
+
+def test_install_comtypes_gen_reraises_other_missing_imports(tmp_path):
+    """Re-raised case: comtypes failed because a different module is missing."""
+    snapshot = _comtypes_snapshot()
+    blocker = _BlockComtypes("comtypes.client")
+    sys.meta_path.insert(0, blocker)
+    try:
+        for name in list(sys.modules):
+            if name == "comtypes" or name.startswith("comtypes."):
+                sys.modules.pop(name, None)
+        with pytest.raises(ModuleNotFoundError) as exc:
+            _install_comtypes_gen(str(tmp_path / "cache"),
+                                  str(tmp_path / "cache" / "__init__.py"))
+        assert exc.value.name == "comtypes.client"
+    finally:
+        sys.meta_path.remove(blocker)
+        _restore_comtypes(snapshot)
+
+
 def test_hook_source_calls_guarded_helper():
     src = (REPO / "runtime_hook_comtypes.py").read_text(encoding="utf-8")
     assert "def ensure_comtypes_gen" in src
-    assert "except ModuleNotFoundError" in src
+    assert "e.name != 'comtypes.gen'" in src
+    assert "e.name != 'comtypes'" in src
     assert "ensure_comtypes_gen(cache_dir)" in src

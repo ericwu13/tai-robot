@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import glob
 import os
+import sys
 import importlib
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
@@ -23,6 +24,9 @@ _holidays_datas = collect_data_files('holidays')
 # not have the directory, and PyInstaller aborts if a datas source is
 # missing. Never point datas at that tree — a developer build would ship
 # their private strategies. Stage an empty placeholder instead.
+# ``python -m PyInstaller`` puts the cwd on sys.path; the ``pyinstaller``
+# entry-point script does not. SPECPATH is the spec file's directory.
+sys.path.insert(0, SPECPATH)
 from build_release import strategies_datas
 _strategies_datas = strategies_datas(SPECPATH)
 
@@ -55,11 +59,10 @@ a = Analysis(
         # Must include ALL submodules — see note above about dynamic import.
         *_holidays_submodules,
         # COM (Capital API) — include submodules PyInstaller's analysis misses.
-        # ``comtypes.gen`` is generated at runtime. PyInstaller 6.22.3 with
-        # comtypes 1.4.17 leaves it out of the bundle and the EXE crashes in
-        # runtime_hook_comtypes.py. Force-include it when the installed
-        # package ships it; the runtime hook still builds the package in
-        # the writable cache if this import is missing at startup.
+        # comtypes wheels do not ship comtypes/gen. Force-include the name
+        # when a build environment has generated it; the runtime hook
+        # creates the package in the writable cache when the import is
+        # simply missing.
         'comtypes', 'comtypes.client', 'comtypes.stream',
         'comtypes.client._code_cache', 'comtypes.client._generate',
         'comtypes.gen',

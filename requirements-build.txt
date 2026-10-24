@@ -1,11 +1,20 @@
 # Build toolchain for tai_backtest.exe. build_release.py installs this file
-# before it runs PyInstaller.
+# before it runs PyInstaller, unless --no-install is passed.
 #
-# These pins are load-bearing. PyInstaller 6.22.3 + comtypes 1.4.17
-# produces an EXE that dies at startup in runtime_hook_comtypes.py:
-#   ModuleNotFoundError: No module named 'comtypes.gen'
-# PyInstaller 6.19.0 + comtypes 1.4.15 starts. Do not unpin or float
-# these without a Windows EXE smoke launch (the hook is guarded, but the
-# pin is what the release build is known to work with).
+# Use a dedicated build virtualenv. Installing this file into a dev or
+# live venv can downgrade comtypes there.
+#
+# The runtime hook is the real startup fix. The comtypes 1.4.15 wheel
+# (and 1.4.17) does not ship comtypes/gen/, so `import comtypes.gen`
+# fails until runtime_hook_comtypes.py creates that package in the
+# writable cache. These pins are secondary: they keep the toolchain on
+# the pair an operator already smoked (PyInstaller 6.19.0 + comtypes
+# 1.4.15). PyInstaller 6.22.3 + comtypes 1.4.17 was the crashing pair
+# before the hook handled a missing comtypes.gen.
+#
+# pyinstaller-hooks-contrib is not pinned. PyInstaller 6.19.0 requires
+# pyinstaller-hooks-contrib>=2026.0, so pip may install any newer
+# release that satisfies that. No specific hooks-contrib version was
+# recorded with the Windows smoke.
 PyInstaller==6.19.0
 comtypes==1.4.15

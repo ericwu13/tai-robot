@@ -55,32 +55,38 @@ The app can be packaged as a standalone Windows EXE using PyInstaller (--onedir 
 
 ### Build Steps
 
-The EXE toolchain is pinned in `requirements-build.txt`:
-
-- `PyInstaller==6.19.0`
-- `comtypes==1.4.15`
-
-Those pins are load-bearing. PyInstaller 6.22.3 with comtypes 1.4.17 builds an EXE that dies at startup in `runtime_hook_comtypes.py` (`ModuleNotFoundError: No module named 'comtypes.gen'`). 6.19.0 + 1.4.15 does not. Do not float them without launching the EXE on Windows.
+Use a dedicated build virtualenv. `build_release.py` installs `requirements-build.txt` into the **active** environment, which can downgrade `comtypes` in a dev or live venv. `.venv-build/` is gitignored.
 
 ```bash
-# From the project root. build_release.py installs the pins when they
-# are missing or different, then runs PyInstaller. --skip-release builds
-# and zips only (no GitHub release, no Discord).
+python -m venv .venv-build
+# Windows: .venv-build\Scripts\activate
+# POSIX:   source .venv-build/bin/activate
 python build_release.py --skip-release
 ```
 
-Equivalent direct invocation, after the same pins are installed:
+`--skip-release` builds and zips only (no GitHub release, no Discord). `--no-install` skips the pip install and builds with whatever is already in the active environment:
+
+```bash
+python build_release.py --skip-release --no-install
+```
+
+`requirements-build.txt` pins `PyInstaller==6.19.0` and `comtypes==1.4.15`. Those pins are secondary. The comtypes 1.4.15 wheel does not ship a `comtypes/gen/` package (1.4.17 does not either), so `import comtypes.gen` fails until the runtime hook creates it. That hook is the startup fix. `pyinstaller-hooks-contrib` is not pinned: PyInstaller 6.19.0 requires `pyinstaller-hooks-contrib>=2026.0`, and pip may install any newer release that satisfies that. No specific hooks-contrib version was recorded with the Windows smoke.
+
+Direct invocation, from the same dedicated venv, after the pins are installed:
 
 ```bash
 pip install -r requirements-build.txt
 python -m PyInstaller tai_backtest.spec --noconfirm
+# or: pyinstaller tai_backtest.spec --noconfirm
 ```
+
+The spec inserts `SPECPATH` onto `sys.path` so `import build_release` works for the `pyinstaller` entry-point script as well as `python -m PyInstaller`.
 
 Output: `dist/tai_backtest/tai_backtest.exe`
 
 `strategies/` is gitignored and holds per-machine AI strategies. A fresh clone does not have that directory. The spec does not bundle it. At build time it stages an empty placeholder under `build/strategies_placeholder/` (a `README.txt` only) so PyInstaller has a datas source, and private `.py` files are never copied into the EXE. Saved strategies are loaded at runtime from the `strategies/` directory next to `tai_backtest.exe`, which the app creates on first use.
 
-`runtime_hook_comtypes.py` points `comtypes.gen` at a writable `_comtypes_cache` next to the EXE. If the frozen bundle did not collect `comtypes.gen`, the hook creates that package in the cache instead of crashing. The spec also lists `comtypes.gen` in `hiddenimports` so a build with the pinned comtypes collects the real package. Confirming the EXE process actually starts still requires Windows.
+`runtime_hook_comtypes.py` points `comtypes.gen` at a writable `_comtypes_cache` next to the EXE. If that package is missing (`ModuleNotFoundError.name == 'comtypes.gen'`), the hook creates it in the cache. A broken `comtypes.gen` whose own import failed is not swallowed. The spec also lists `comtypes.gen` in `hiddenimports`. Confirming the EXE process actually starts still requires Windows.
 
 ### Build Files
 

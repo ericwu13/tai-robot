@@ -4,6 +4,13 @@ Usage:
     python build_release.py          # build + zip
     python build_release.py --skip-build  # zip only (reuse existing dist/)
     python build_release.py --allow-dirty # permit uncommitted source
+    python build_release.py --skip-release --no-install
+        # build without pip-installing requirements-build.txt
+
+Use a dedicated build virtualenv. The default path installs
+``requirements-build.txt`` into the active environment, which can
+downgrade ``comtypes`` in a dev or live venv. ``--no-install`` skips
+that pip install.
 
 Build-integrity guard (added after the v2.13.0 mismatch, where the
 published EXE was built from a checkout lacking the regime code):
@@ -303,10 +310,38 @@ def ensure_build_requirements(
     return pins
 
 
-def build():
+def warn_build_requirements(project_root: str) -> dict[str, str | None]:
+    """Report pin drift without running pip.
+
+    Used by ``--no-install``. Returns the unsatisfied pins (empty when
+    the active environment already matches).
+    """
+    root = os.path.abspath(project_root or ".")
+    req_path = os.path.join(root, BUILD_REQUIREMENTS)
+    with open(req_path, encoding="utf-8") as fh:
+        pins = parse_pinned_requirements(fh.read())
+    bad = unsatisfied_pins(pins, _installed_version)
+    print(f"Not installing {BUILD_REQUIREMENTS} (--no-install).")
+    if not bad:
+        listed = ", ".join(f"{name}=={ver}" for name, ver in pins.items())
+        print(f"Build dependencies OK ({listed})")
+        return bad
+    print("WARNING: active environment does not match the pins:")
+    for name, got in bad.items():
+        have = got or "not installed"
+        print(f"  {name}: want {pins[name]}, have {have}")
+    print("The runtime hook still creates comtypes.gen when that package")
+    print("is missing. The pins are secondary.")
+    return bad
+
+
+def build(*, install_requirements: bool = True):
     print(f"=== Building tai_backtest v{VERSION} ===")
     root = os.path.dirname(os.path.abspath(__file__)) or "."
-    ensure_build_requirements(root)
+    if install_requirements:
+        ensure_build_requirements(root)
+    else:
+        warn_build_requirements(root)
     strategies_datas(root)
     result = subprocess.run(
         [sys.executable, "-m", "PyInstaller", "tai_backtest.spec", "--noconfirm"],
@@ -576,6 +611,11 @@ def main():
                         help="Permit packaging with uncommitted source changes")
     parser.add_argument("--skip-release", action="store_true",
                         help="Skip GitHub release creation (build + package only)")
+    parser.add_argument("--no-install", action="store_true",
+                        help="Do not pip-install requirements-build.txt into "
+                             "the active environment. Use a dedicated build "
+                             "venv for a normal build so comtypes is not "
+                             "downgraded in a dev or live venv.")
     parser.add_argument("--notify-only", action="store_true",
                         help="Skip build/package, just send Discord notification")
     parser.add_argument("--force-notify", action="store_true",
@@ -603,7 +643,7 @@ def main():
         notes_file = verify_release_notes()
 
     if not args.skip_build:
-        build()
+        build(install_requirements=not args.no_install)
 
     # Guard: the packaged binary must match the committed source. This is
     # the check that would have prevented the v2.13.0 stale-EXE ship.

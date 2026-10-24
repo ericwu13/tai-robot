@@ -31,12 +31,16 @@ def _is_grid_smoke(argv=None) -> bool:
 def _install_comtypes_gen(cache_dir, init_py):
     """Register ``comtypes.gen`` from ``cache_dir`` when it was not bundled.
 
-    Returns the module, or None when ``comtypes`` itself is missing.
+    Returns the module, or None when ``comtypes`` itself is missing
+    (``ModuleNotFoundError.name == 'comtypes'``). Any other missing
+    import is re-raised so a broken ``comtypes`` package still crashes.
     """
     import importlib.util
     try:
         import comtypes
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as e:
+        if e.name != 'comtypes':
+            raise
         return None
 
     spec = importlib.util.spec_from_file_location(
@@ -66,11 +70,13 @@ def _install_comtypes_gen(cache_dir, init_py):
 def ensure_comtypes_gen(cache_dir):
     """Make ``comtypes.gen`` importable and point it at ``cache_dir``.
 
-    PyInstaller 6.22.3 + comtypes 1.4.17 do not ship ``comtypes.gen`` in
-    the frozen bundle. An unguarded ``import comtypes.gen`` in this hook
-    then raises ModuleNotFoundError and the EXE exits before the UI
-    starts. Create the package in the writable cache when that happens.
-    When the import already works, still prefer ``cache_dir`` so generated
+    The comtypes wheels (including 1.4.15) do not ship ``comtypes/gen``.
+    An unguarded ``import comtypes.gen`` in this hook then raises
+    ModuleNotFoundError and the EXE exits before the UI starts. Create
+    the package in the writable cache only when that module itself is
+    missing (``e.name == 'comtypes.gen'``). A gen package that fails
+    because one of its own imports is missing is re-raised. When the
+    import already works, still prefer ``cache_dir`` so generated
     wrappers are written somewhere the bundle can update.
     """
     import importlib
@@ -83,7 +89,11 @@ def ensure_comtypes_gen(cache_dir):
 
     try:
         import comtypes.gen as gen
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as e:
+        # Only an absent comtypes.gen is recoverable. A broken package
+        # whose own import failed (e.name is that other module) must crash.
+        if e.name != 'comtypes.gen':
+            raise
         gen = _install_comtypes_gen(cache_dir, init_py)
 
     if gen is None:
