@@ -7004,7 +7004,9 @@ class BacktestApp:
 
         # Route Discord and LiveRunner logging into the app's _log()
         for logger_name in ("src.live.discord_notify", "src.live.live_runner",
-                            "src.live.regime_switching_runner"):
+                            "src.live.regime_switching_runner",
+                            "src.live.tick_watchdog",
+                            "src.market_data.holidays"):
             mod_logger = logging.getLogger(logger_name)
             if not any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
                 h = _AppLogHandler()
@@ -7865,7 +7867,11 @@ class BacktestApp:
             # deliver the entire live stream through OnNotifyHistoryTicksLONG,
             # so a flag-only gate starves the watchdog while ticks pour in and
             # forces a pointless resubscribe every 5 minutes.
-            self._tick_watchdog.on_tick()
+            # Issue #179: a stale replay tick restarts the staleness clock
+            # (that is why a silent day reconnects about every 10 min) but
+            # is not a live tick, so it must not clear the zero-tick streak.
+            self._tick_watchdog.on_tick(
+                live=tick_age <= HISTORY_STALENESS_SECONDS)
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
             # earlier doesn't carry over.

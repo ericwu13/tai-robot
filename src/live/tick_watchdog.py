@@ -6,10 +6,13 @@ check() every 30s and acts on the returned action.
 
 from __future__ import annotations
 
+import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .live_runner import is_market_open, minutes_until_session_close, _TZ_TAIPEI
+
+_logger = logging.getLogger(__name__)
 
 
 def _crossed_session_gap(last_ts: float, now_ts: float) -> bool:
@@ -44,6 +47,44 @@ def _crossed_session_gap(last_ts: float, now_ts: float) -> bool:
     return False
 
 
+def _schedule_now() -> datetime:
+    """Wall clock the schedule uses.
+
+    Looked up on ``live_runner`` so a test patch of
+    ``src.live.live_runner._taipei_now`` applies here too.
+    """
+    from . import live_runner
+    return live_runner._taipei_now()
+
+
+def _scheduled_session_key(dt: datetime | None = None) -> str | None:
+    """Identity of the scheduled session containing ``dt``.
+
+    This follows ``is_market_open`` only. It does not consult
+    ``is_taifex_holiday``: an emergency closure still looks open on the
+    clock, which is the bug the zero-tick stand-down exists for. The
+    night session keeps its OPEN date, so midnight is not a new session
+    (``2026-10-23|NIGHT`` from Fri 15:00 through Sat 05:00).
+
+    None when the schedule says closed (intraday gap, weekend, Sunday).
+    """
+    if dt is None:
+        dt = _schedule_now()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_TZ_TAIPEI)
+    else:
+        dt = dt.astimezone(_TZ_TAIPEI)
+    if not is_market_open(dt):
+        return None
+    minutes = dt.hour * 60 + dt.minute
+    if minutes < 5 * 60:
+        open_day = (dt - timedelta(days=1)).date()
+        return f"{open_day.isoformat()}|NIGHT"
+    if minutes < 13 * 60 + 45:
+        return f"{dt.date().isoformat()}|DAY"
+    return f"{dt.date().isoformat()}|NIGHT"
+
+
 class TickWatchdog:
     """Monitors tick freshness and decides when to resubscribe or reconnect.
 
@@ -65,8 +106,13 @@ class TickWatchdog:
     RECONNECT_TIMEOUT = 600      # 10 min: full reconnect (re-login)
     RESUBSCRIBE_COOLDOWN = 180   # 3 min: don't retry resubscribe within this window
     NEAR_CLOSE_SUPPRESS = 10     # suppress within 10 min of session close
+    # Consecutive reconnects that produced no live tick before this watchdog
+    # stops asking and idles until the next scheduled session opens.
+    # Provisional (issue #179): PENDING CEO decision. 3 is a conservative
+    # per-session cap — a few attempts, then stop hammering a silent feed.
+    ZERO_TICK_RECONNECT_LIMIT = 3
 
-    def __init__(self):
+    def __init__(self, zero_tick_reconnect_limit: int | None = None):
         self.active: bool = False
         self.last_tick_time: float = 0.0
         self.grace_until: float = 0.0   # suppress warnings until this time
@@ -76,15 +122,30 @@ class TickWatchdog:
         # Without this, the watchdog uses the default 13:45 close and warns
         # between 13:30 and 13:35 on settlement day (issue #66).
         self.order_symbol: str | None = None
+        self.zero_tick_reconnect_limit: int = (
+            self.ZERO_TICK_RECONNECT_LIMIT
+            if zero_tick_reconnect_limit is None
+            else int(zero_tick_reconnect_limit)
+        )
+        self._zero_tick_reconnects: int = 0
+        self._stood_down: bool = False
+        self._stand_down_session: str | None = None
+        self._last_reconnect_counted_at: float | None = None
 
-    def on_tick(self) -> None:
-        """Call when a real tick is received (live or history).
+    def on_tick(self, *, live: bool = True) -> None:
+        """Call when a tick is received (live or history).
 
-        Resets staleness + resubscribe cooldown — a real tick means the
-        connection is healthy.
+        Restarts the staleness clock and the resubscribe cooldown. A live
+        tick clears the zero-tick reconnect streak (issue #179): the feed
+        is alive, so the failures were not consecutive. A history-replay
+        tick (``live=False``) restarts the clock only. Stale replay is how
+        a closed day still reconnects about every 10 minutes; counting
+        those as live would make the stand-down unreachable.
         """
         self.last_tick_time = time.time()
         self.last_resubscribe = 0.0
+        if live:
+            self._clear_zero_tick_standdown()
 
     def on_resubscribe(self) -> None:
         """Call when a resubscribe attempt was issued.
@@ -128,6 +189,58 @@ class TickWatchdog:
         self.grace_until = 0.0
         self.last_resubscribe = 0.0
         self.order_symbol = None
+        self._clear_zero_tick_standdown()
+
+    def _clear_zero_tick_standdown(self) -> None:
+        """Forget a zero-tick streak. The limit itself stays."""
+        self._zero_tick_reconnects = 0
+        self._stood_down = False
+        self._stand_down_session = None
+        self._last_reconnect_counted_at = None
+
+    def _release_standdown_on_new_session(self) -> bool:
+        """Clear stand-down when a later scheduled session is open.
+
+        Returns True when stand-down was cleared. A closed gap stays
+        stood down: the next open is what resets the counter.
+        """
+        if not self._stood_down:
+            return False
+        key = _scheduled_session_key(_schedule_now())
+        if key is None or key == self._stand_down_session:
+            return False
+        self._clear_zero_tick_standdown()
+        return True
+
+    def _note_zero_tick_reconnect(self, now: float) -> str | None:
+        """Count one reconnect decision. Idle once the cap is passed.
+
+        The same ``now`` does not count twice. Repeated polls while the
+        clock stays stale each count: with no ticks at all, ``check``
+        would otherwise return ``reconnect`` every poll for the session.
+        """
+        if self._last_reconnect_counted_at != now:
+            self._zero_tick_reconnects += 1
+            self._last_reconnect_counted_at = now
+        if self._zero_tick_reconnects > self.zero_tick_reconnect_limit:
+            self._enter_standdown()
+            return None
+        # The Nth reconnect is still issued. Later checks idle, including
+        # when a history replay restarts the staleness clock.
+        if self._zero_tick_reconnects == self.zero_tick_reconnect_limit:
+            self._enter_standdown()
+        return "reconnect"
+
+    def _enter_standdown(self) -> None:
+        if self._stood_down:
+            return
+        self._stood_down = True
+        self._stand_down_session = _scheduled_session_key(_schedule_now())
+        _logger.warning(
+            "zero-tick reconnect stand-down after %s reconnects "
+            "until next session open",
+            self.zero_tick_reconnect_limit,
+        )
 
     def check(self, now: float | None = None) -> str | None:
         """Check tick health and return the action needed.
@@ -142,8 +255,17 @@ class TickWatchdog:
             "resubscribe" — no ticks for >5min, try re-subscribing
             "reconnect" — no ticks for >10min, force full reconnect
             "session_resubscribe" — new session opened, resubscribe immediately
+
+        After ``zero_tick_reconnect_limit`` consecutive reconnects with no
+        live tick, returns None (idle) until the next scheduled session
+        opens, then the counter resets (issue #179).
         """
         if not self.active or not self.last_tick_time:
+            return None
+        # Side effect: a new open session clears stand-down before the
+        # ladder runs, so the open can resubscribe and, if still silent,
+        # reconnect again up to the cap.
+        if self._stood_down and not self._release_standdown_on_new_session():
             return None
         if not is_market_open():
             return None
@@ -195,9 +317,10 @@ class TickWatchdog:
             return None
 
         # Reconnect wins unconditionally once we hit the threshold —
-        # cooldown does NOT suppress escalation.
+        # cooldown does NOT suppress escalation. The zero-tick cap does:
+        # past N silent reconnects we idle instead of forcing another.
         if elapsed > self.RECONNECT_TIMEOUT:
-            return "reconnect"
+            return self._note_zero_tick_reconnect(now)
 
         if elapsed > self.RESUBSCRIBE_TIMEOUT:
             # Suppress repeated resubscribes within the cooldown window

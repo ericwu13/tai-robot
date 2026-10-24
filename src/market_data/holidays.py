@@ -8,18 +8,36 @@ override set for TAIFEX-specific deviations:
 
 Update the override sets at the start of each year if TAIFEX publishes
 adjustments not yet reflected in the ``holidays`` package.
+
+Emergency closures (typhoon and similar) are not in that calendar. An
+operator lists them in ``taifex_closures.yaml`` next to ``settings.yaml``
+(see ``taifex_closures.example.yaml``). A missing file changes nothing.
+This module does not scrape TAIFEX notices.
 """
 
 from __future__ import annotations
 
 import calendar
 import logging
+import re
+import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import holidays as _holidays
 
 
 _logger = logging.getLogger(__name__)
+
+# Operator file. Gitignored. The example file is never read from here.
+CLOSURES_OVERRIDE_FILENAME = "taifex_closures.yaml"
+
+_CLOSURE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+# (path, mtime_ns, dates). A missing file is not cached so creating one
+# is picked up on the next call.
+_closures_cache: tuple[str, int, frozenset[date]] | None = None
+_logged_closure_dates: set[date] = set()
 
 # Manual overrides — only add dates that disagree with the `holidays` package.
 # Keep small; they should be rare exceptions.
@@ -84,8 +102,81 @@ def holiday_calendar_health(year: int | None = None) -> tuple[bool, str]:
     return True, f"{len(days)} TW public holidays for {y}"
 
 
+def closures_override_path() -> Path:
+    """Path of the local emergency-closure file. It may not exist.
+
+    Frozen EXE: next to the executable, same place as ``settings.yaml``.
+    Source checkout: repository root.
+    """
+    if getattr(sys, "frozen", False):
+        root = Path(sys.executable).resolve().parent
+    else:
+        root = Path(__file__).resolve().parents[2]
+    return root / CLOSURES_OVERRIDE_FILENAME
+
+
+def _parse_closure_dates(text: str) -> frozenset[date]:
+    """ISO dates on non-comment lines. A bad token is skipped.
+
+    ``YYYY-MM-DD`` and ``YYYY-MM-DD DAY`` both close the whole date.
+    A listed date is a full-day holiday; the optional session word does
+    not narrow it.
+    """
+    found: set[date] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _CLOSURE_DATE_RE.search(stripped)
+        if match is None:
+            continue
+        try:
+            found.add(date.fromisoformat(match.group(1)))
+        except ValueError:
+            continue
+    return frozenset(found)
+
+
+def load_closure_override_dates() -> frozenset[date]:
+    """Dates in the closures file. Empty when the file is missing or unreadable."""
+    global _closures_cache
+    path = closures_override_path()
+    key = str(path)
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return frozenset()
+    if (_closures_cache is not None
+            and _closures_cache[0] == key
+            and _closures_cache[1] == mtime_ns):
+        return _closures_cache[2]
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        _logger.warning("closures override unreadable, ignoring it: %s", exc)
+        return frozenset()
+    dates = _parse_closure_dates(text)
+    _closures_cache = (key, mtime_ns, dates)
+    return dates
+
+
+def _log_closure_holiday(d: date) -> None:
+    """Log once per date. The message contains ``holiday`` (issue #179)."""
+    if d in _logged_closure_dates:
+        return
+    _logged_closure_dates.add(d)
+    _logger.warning("holiday %s", d.isoformat())
+
+
 def is_taifex_holiday(d: date) -> bool:
-    """True if TAIFEX is closed on ``d`` (weekend, public holiday, or override)."""
+    """True if TAIFEX is closed on ``d`` (weekend, public holiday, or override).
+
+    A date listed in the closures file is closed even on a normal weekday.
+    A missing file leaves this function on the static calendar only.
+    """
+    if d in load_closure_override_dates():
+        _log_closure_holiday(d)
+        return True
     if d in OVERRIDE_TRADING:
         return False
     if d in OVERRIDE_HOLIDAYS:
