@@ -16,6 +16,7 @@ from src.evolution.backfill import (
     BackfillPathError,
     build_parser,
     closure_table,
+    build_daily_bars,
     daily_bar_stamp,
     load_input_csv,
     main,
@@ -662,6 +663,88 @@ def test_malformed_csv_includes_parse_error(tmp_path, capsys):
     empty.write_text("datetime,open,high,low,close,volume\n", encoding="utf-8")
     with pytest.raises(BackfillError, match="no bars"):
         load_input_csv(empty)
+
+
+def _write_headerless_close(path: Path, bars: list[Bar], interval: int) -> Path:
+    """Capital K-line export: no header, each stamp is the bar close."""
+    delta = timedelta(seconds=interval)
+    lines = []
+    for bar in bars:
+        label = bar.dt + delta
+        lines.append(
+            f"{label.strftime('%m/%d/%Y %H:%M')},"
+            f"{bar.open},{bar.high},{bar.low},{bar.close},{bar.volume}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_headerless_close_labeled_1m_validates_with_no_gaps(tmp_path):
+    bars = _complete("TX00", _START, _END, interval=60)
+    path = _write_headerless_close(tmp_path / "kline_1m.csv", bars, 60)
+    loaded = load_input_csv(path)
+    stamps = {bar.dt for bar in loaded}
+    assert datetime(2026, 9, 24, 8, 45) in stamps
+    assert datetime(2026, 9, 24, 13, 45) not in stamps
+    assert datetime(2026, 9, 25, 5, 0) not in stamps
+    report = run_backfill(
+        loaded, symbol="TX00", start=_START, end=_END,
+        repo_root=tmp_path, write=False,
+    )
+    assert report.ok, report.message
+    assert report.gaps == []
+    assert report.resolution == "1m"
+    code = main(
+        ["--input", str(path), "--symbol", "TX00",
+         "--start", _START.isoformat(), "--end", _END.isoformat()],
+        repo_root=tmp_path,
+    )
+    assert code == 0
+    assert not (tmp_path / "data" / "backfill").exists()
+
+
+def test_headerless_close_labeled_15m_validates_with_no_gaps(tmp_path):
+    bars = _complete("TX00", _START, _END, interval=900)
+    path = _write_headerless_close(tmp_path / "kline_15m.csv", bars, 900)
+    loaded = load_input_csv(path)
+    stamps = {bar.dt for bar in loaded}
+    assert datetime(2026, 9, 24, 8, 45) in stamps
+    assert datetime(2026, 9, 24, 13, 45) not in stamps
+    assert datetime(2026, 9, 25, 5, 0) not in stamps
+    report = run_backfill(
+        loaded, symbol="TX00", start=_START, end=_END,
+        repo_root=tmp_path, write=False, resolution="15m",
+    )
+    assert report.ok, report.message
+    assert report.gaps == []
+    assert report.resolution == "15m"
+    assert len(loaded) == len(bars)
+
+
+def test_lny_reopening_day_follows_the_calendar_previous_trading_day():
+    """2026-02-23's day session joins the previous calendar-open day.
+
+    The broker daily file keys a bar at trading day 2026-02-20. The
+    closure calendar marks that Friday a public holiday and leaves
+    2026-02-13 open, so the session rule yields 2026-02-13. Forcing
+    2026-02-20 would also mark its day and night expected-open. The
+    date is not hardcoded.
+    """
+    anchor = date(2026, 2, 13)
+    reopen = date(2026, 2, 23)
+    bars = _session_bars("TX00", anchor, "night", 2200, 900) + _session_bars(
+        "TX00", reopen, "day", 3300, 900,
+    )
+    daily = build_daily_bars(bars, anchor, reopen, announcements=())
+    by_stamp = {bar.dt: bar for bar in daily}
+    feb13 = daily_bar_stamp(anchor)
+    feb20 = daily_bar_stamp(date(2026, 2, 20))
+    assert feb13 == datetime(2026, 2, 12, 23, 0)
+    assert feb20 == datetime(2026, 2, 19, 23, 0)
+    assert feb13 in by_stamp
+    assert feb20 not in by_stamp
+    assert by_stamp[feb13].open == 2200
+    assert by_stamp[feb13].close == 3301
 
 
 def _write_csv(path: Path, bars: list[Bar]) -> Path:

@@ -53,7 +53,15 @@ the same files as `data/TXF1_1D.csv` / `data/TMF1_1D.csv`):
   (15:00 TWT through 05:00 the next morning) plus the day session of
   the next trading day. Friday night is in Friday's bar together with
   Monday's day session. Sunday night is not in any daily bar. A
-  trading day outside the requested span is omitted.
+  trading day outside the requested span is omitted. The next trading
+  day comes from the closure calendar. The 2026-02-23 Lunar New Year
+  reopening day session therefore joins 2026-02-13 (2026-02-20 is a
+  public holiday on that calendar). The broker daily file keys a bar
+  at 2026-02-20; that key is not produced by the calendar rule and is
+  not hardcoded.
+- Open, high, and low are taken from the grouped sessions. Close and
+  volume are the last close and the summed volume. They are not
+  guaranteed identical to the broker's daily file.
 
 If the broker history is only 15-minute for the older span, pass
 `--resolution 15m` (or let auto-detect choose it). Every intraday output

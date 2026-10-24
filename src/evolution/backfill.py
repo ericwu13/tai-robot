@@ -16,6 +16,10 @@ public holidays, and the operator ``taifex_closures.yaml``) plus the
 market-wide announcement list below. A closed session is omitted.
 Missing bars are reported as gaps. Nothing is forward-filled.
 
+``bars_1D.csv`` uses the broker's daily timestamp and session grouping.
+Its close and volume are aggregated from those sessions and are not
+guaranteed identical to the broker's daily file.
+
 Nova Q4 (2026-10-24). This module does not call the broker and does
 not download a third-party vendor feed.
 """
@@ -31,7 +35,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src.backtest.data_loader import _DATE_FORMATS
+from src.backtest.data_loader import _DATE_FORMATS, normalize_bar_label_to_open
 from src.live.bar_aggregator import aggregate_bars
 from src.market_data.holidays import (
     is_taifex_holiday,
@@ -350,6 +354,20 @@ def build_daily_bars(
     Sunday night is not part of any daily bar. A trading day outside
     ``[start, end]`` is not emitted, so a day session whose previous
     trading day is outside the span is left out of ``bars_1D``.
+
+    The previous trading day is the previous date whose day session the
+    closure calendar leaves open. That is not the broker's daily key when
+    the calendar and the cache disagree. The 2026-02-23 reopening day
+    session joins 2026-02-13 here: 2026-02-20 is a public holiday and
+    2026-02-13 is open. The broker file keys a bar at 2026-02-20
+    (stamp ``2026/02/19 23:00``). That key is not derivable from this
+    rule without marking 2026-02-20 open, which would also expect its
+    day and night sessions. It is not hardcoded.
+
+    Open/high/low follow the grouped sessions. Close and volume are the
+    last close and the summed volume of those bars. They are not
+    guaranteed identical to the broker daily file (settlement close and
+    the exchange's own volume).
     """
     lookback = start - timedelta(days=_DAILY_LOOKBACK_DAYS)
     closed = {
@@ -1002,7 +1020,31 @@ def load_input_csv(path: Path, *, interval: int = 60) -> list[Bar]:
     if not bars:
         raise BackfillError(f"input CSV has no bars: {path}")
     bars.sort(key=lambda bar: bar.dt)
+    # Headerless Capital exports label each bar by its close. Shift them
+    # back to open time with the spacing in the file, so a 15-minute
+    # export is not moved by the default 60-second interval.
+    spacing = _detect_bar_interval(bars)
+    if spacing:
+        bars = normalize_bar_label_to_open(bars, spacing)
+        bars.sort(key=lambda bar: bar.dt)
     return bars
+
+
+def _detect_bar_interval(bars: list[Bar]) -> int:
+    """Most common in-session spacing, in seconds. 0 when it cannot be told.
+
+    Session breaks and holiday gaps are wider than 1000s and are ignored,
+    so a 1-minute file yields 60 and a 15-minute file yields 900.
+    """
+    stamps = sorted({bar.dt for bar in bars})
+    counts: dict[int, int] = {}
+    for prev, nxt in zip(stamps, stamps[1:]):
+        delta = int((nxt - prev).total_seconds())
+        if 50 <= delta <= 1000:
+            counts[delta] = counts.get(delta, 0) + 1
+    if not counts:
+        return 0
+    return max(counts, key=lambda delta: (counts[delta], -delta))
 
 
 def _parse_date(text: str, flag: str) -> date:
