@@ -26,12 +26,15 @@ downgrade ``comtypes`` in a dev or live venv.
 
 The Capital API SDK (``CapitalAPI_2.13.57/.../SKDLLPythonTester/libs``)
 is gitignored. ``prepare_capital_sdk_binaries()`` refuses to build when
-that directory is missing or has no ``SKCOM.dll``, so a fresh clone
-cannot ship an EXE with an empty ``_internal/libs``. Set
-``TAI_CAPITAL_SDK_DIR`` to the libs directory when the SDK lives
-elsewhere. Opt out with ``TAI_ALLOW_MISSING_CAPITAL_SDK=1`` or
-``--allow-missing-broker-sdk``. The PyInstaller spec calls the same
-helper, so a raw ``pyinstaller`` run fails too. When the default libs
+that directory is missing either required broker DLL
+(``REQUIRED_BROKER_DLLS``: ``SKCOM.dll`` and ``CTSecuritiesATL.dll``)
+or either file is empty, so a fresh clone cannot ship an EXE with an
+empty ``_internal/libs``. Set ``TAI_CAPITAL_SDK_DIR`` to the libs
+directory when the SDK lives elsewhere. A relative value is resolved
+against the project root (the spec's ``SPECPATH`` on a raw PyInstaller
+run). Opt out only with ``TAI_ALLOW_MISSING_CAPITAL_SDK=1`` or
+``--allow-missing-broker-sdk``; any other value warns and does not
+opt out. The spec calls the same helper. When the default libs
 directory is present, the bundled binaries are the historical ``*.dll``
 glob into ``libs`` — no extra datas.
 
@@ -75,11 +78,12 @@ SOURCE_PATHS = ["src", "run_backtest.py", "version.py"]
 BUILD_REQUIREMENTS = "requirements-build.txt"
 
 # Broker DLLs. The spec used to skip a missing directory and still exit 0.
-# Keep this relative string identical to the historical ``sdk_libs`` join:
-# ``prepare_capital_sdk_binaries()`` with no project_root globs it as-is.
+# Keep this relative string identical to the historical ``sdk_libs`` join
+# so a present SDK at the default path still globs the same ``*.dll`` files.
+# ``REQUIRED_BROKER_DLLS`` is the only list of files the build demands.
 ENV_CAPITAL_SDK_DIR = "TAI_CAPITAL_SDK_DIR"
 ENV_ALLOW_MISSING_CAPITAL_SDK = "TAI_ALLOW_MISSING_CAPITAL_SDK"
-BROKER_DLL_NAME = "SKCOM.dll"
+REQUIRED_BROKER_DLLS = ("SKCOM.dll", "CTSecuritiesATL.dll")
 DEFAULT_CAPITAL_SDK_LIBS = os.path.join(
     "CapitalAPI_2.13.57",
     "CapitalAPI_2.13.57_PythonExample",
@@ -471,30 +475,65 @@ def resolve_install_request(*, install_build_deps: bool, no_install: bool) -> bo
 
 
 def resolve_capital_sdk_libs(environ=None, *, project_root=None) -> str:
-    """Libs directory that should contain ``SKCOM.dll``.
+    """Libs directory that should contain the required broker DLLs.
 
     Order: ``TAI_CAPITAL_SDK_DIR``, then the historical default path.
     An explicit env var that does not exist is not replaced with the
-    default. With no ``project_root``, the default stays the relative
-    string the spec has always globbed, so a present SDK produces the
-    same binaries list as before.
+    default. A relative env var is joined to ``project_root`` (the spec
+    directory on a raw PyInstaller run, the ``build_release.py``
+    directory otherwise). With no env var, the default stays the
+    relative historical string when ``project_root`` is omitted or is
+    the working directory, so a present SDK produces the same binaries
+    list as before.
     """
     if environ is None:
         environ = os.environ
     override = (environ.get(ENV_CAPITAL_SDK_DIR) or "").strip()
     if override:
-        if project_root and not os.path.isabs(override):
-            return os.path.join(project_root, override)
-        return override
+        if os.path.isabs(override) or not project_root:
+            return override
+        return os.path.join(project_root, override)
     if project_root:
         return os.path.join(project_root, DEFAULT_CAPITAL_SDK_LIBS)
     return DEFAULT_CAPITAL_SDK_LIBS
 
 
+def _sdk_glob_dir(resolved: str, *, project_root, has_override: bool) -> str:
+    """Directory ``collect_capital_sdk_binaries`` should glob.
+
+    A relative ``TAI_CAPITAL_SDK_DIR`` stays on ``resolved`` (already
+    joined to ``project_root``). The default path stays the historical
+    relative string when that string points at ``resolved``, so the
+    PyInstaller TOC matches the pre-check spec.
+    """
+    if has_override or not project_root:
+        return resolved
+    relative = DEFAULT_CAPITAL_SDK_LIBS
+    under_root = os.path.join(project_root, relative)
+    if os.path.abspath(relative) == os.path.abspath(under_root):
+        return relative
+    return resolved
+
+
 def _capital_sdk_opt_out(environ, allow_missing_flag: bool) -> bool:
+    """True only for the flag or ``TAI_ALLOW_MISSING_CAPITAL_SDK=1``.
+
+    Any other non-empty value prints a warning and does not opt out.
+    """
     if allow_missing_flag:
         return True
-    return (environ.get(ENV_ALLOW_MISSING_CAPITAL_SDK) or "").strip() == "1"
+    raw = environ.get(ENV_ALLOW_MISSING_CAPITAL_SDK)
+    if raw is None:
+        return False
+    value = raw.strip()
+    if value == "" or value == "1":
+        return value == "1"
+    print(
+        f"WARNING: {ENV_ALLOW_MISSING_CAPITAL_SDK}={value!r} does not opt out "
+        "of the Capital SDK check. Only '1' opts out. The build stays "
+        "fail-closed when a required broker DLL is missing or empty."
+    )
+    return False
 
 
 def collect_capital_sdk_binaries(libs_dir: str) -> list[tuple[str, str]]:
@@ -506,39 +545,56 @@ def collect_capital_sdk_binaries(libs_dir: str) -> list[tuple[str, str]]:
     return dll_binaries
 
 
-def _broker_dll_present(libs_dir: str) -> bool:
-    return os.path.isfile(os.path.join(libs_dir, BROKER_DLL_NAME))
+def required_broker_dll_problems(libs_dir: str) -> list[str]:
+    """``'{name} is missing'`` or ``'{name} is empty'`` for each bad DLL.
+
+    Both names in ``REQUIRED_BROKER_DLLS`` are reported. A missing
+    directory reports every required file as missing. Empty means size 0.
+    """
+    problems = []
+    directory_exists = os.path.isdir(libs_dir)
+    for name in REQUIRED_BROKER_DLLS:
+        path = os.path.join(libs_dir, name)
+        if not directory_exists or not os.path.isfile(path):
+            problems.append(f"{name} is missing")
+        elif os.path.getsize(path) == 0:
+            problems.append(f"{name} is empty")
+    return problems
 
 
-def _fail_missing_capital_sdk(libs_dir: str) -> None:
+def _fail_missing_capital_sdk(libs_dir: str, problems: list[str]) -> None:
+    detail = "; ".join(problems)
     if not os.path.isdir(libs_dir):
-        why = "directory does not exist"
-    else:
-        why = f"no {BROKER_DLL_NAME} broker DLL in that directory"
+        detail = f"directory does not exist; {detail}"
+    required = ", ".join(REQUIRED_BROKER_DLLS)
     print(
         "ERROR: Capital API broker DLLs not found — refusing to build an EXE "
         "with an empty _internal/libs.\n"
-        f"       Expected path: {libs_dir} ({why}).\n"
+        f"       Expected path: {libs_dir}.\n"
+        f"       {detail}.\n"
+        f"       Required (each with nonzero size): {required}.\n"
         f"       Default path: {DEFAULT_CAPITAL_SDK_LIBS}\n"
         f"       Set {ENV_CAPITAL_SDK_DIR} to the libs directory that contains "
-        f"{BROKER_DLL_NAME}.\n"
+        "them. A relative value is resolved against the project root.\n"
         f"       CI or Linux test builds can set {ENV_ALLOW_MISSING_CAPITAL_SDK}=1 "
-        "or pass --allow-missing-broker-sdk."
+        "(only the value 1 opts out) or pass --allow-missing-broker-sdk."
     )
     raise SystemExit(1)
 
 
 def _warn_capital_sdk_opt_out(libs_dir: str, *, present: bool) -> None:
     banner = "!" * 72
+    required = ", ".join(REQUIRED_BROKER_DLLS)
     if present:
         detail = (
-            f"Broker DLL {BROKER_DLL_NAME} was found at {libs_dir} and will "
-            "still be bundled."
+            f"Required broker DLLs ({required}) were found at {libs_dir} "
+            "and will still be bundled."
         )
     else:
         detail = (
-            f"Broker DLL {BROKER_DLL_NAME} was NOT found at {libs_dir}. "
-            "The EXE will have no _internal/libs broker DLLs."
+            f"Required broker DLLs ({required}) were NOT all present at "
+            f"{libs_dir}. The EXE will have no complete _internal/libs "
+            "broker set."
         )
     print(
         f"{banner}\n"
@@ -554,25 +610,30 @@ def _warn_capital_sdk_opt_out(libs_dir: str, *, present: bool) -> None:
 def prepare_capital_sdk_binaries(
     environ=None, *, project_root=None, allow_missing_flag: bool = False,
 ) -> list[tuple[str, str]]:
-    """Return ``(dll, 'libs')`` tuples, or exit 1 if the broker SDK is absent.
+    """Return ``(dll, 'libs')`` tuples, or exit 1 if a required DLL is bad.
 
+    Both names in ``REQUIRED_BROKER_DLLS`` must exist and be nonzero.
     Opt-out (``TAI_ALLOW_MISSING_CAPITAL_SDK=1`` or ``allow_missing_flag``)
     prints a warning and falls through to the historical glob (empty
-    when the directory is missing). A present SDK is still bundled: the
-    opt-out does not drop DLLs that are actually there. Call this with
-    no ``project_root`` from the spec so the default path stays relative.
+    when the directory is missing). Any other value of that env var
+    warns and does not opt out. A present SDK is still bundled in full
+    (every ``*.dll``, not only the required pair).
     """
     if environ is None:
         environ = os.environ
+    override = (environ.get(ENV_CAPITAL_SDK_DIR) or "").strip()
     libs_dir = resolve_capital_sdk_libs(environ, project_root=project_root)
+    glob_dir = _sdk_glob_dir(
+        libs_dir, project_root=project_root, has_override=bool(override),
+    )
     # Historical spec loop, unchanged. The gate below only decides
-    # whether a missing broker DLL aborts the build.
-    binaries = collect_capital_sdk_binaries(libs_dir)
-    present = _broker_dll_present(libs_dir)
+    # whether a missing or empty required DLL aborts the build.
+    binaries = collect_capital_sdk_binaries(glob_dir)
+    problems = required_broker_dll_problems(libs_dir)
     opted_out = _capital_sdk_opt_out(environ, allow_missing_flag)
-    if not present:
+    if problems:
         if not opted_out:
-            _fail_missing_capital_sdk(libs_dir)
+            _fail_missing_capital_sdk(libs_dir, problems)
         _warn_capital_sdk_opt_out(libs_dir, present=False)
         return binaries
     if opted_out:
@@ -588,10 +649,12 @@ def build(*, install_requirements: bool = False, allow_missing_broker_sdk: bool 
     the target interpreter (``.venv-build`` when it exists).
 
     The Capital SDK check runs before pip and before PyInstaller. A
-    missing broker DLL aborts with exit code 1 unless
-    ``allow_missing_broker_sdk`` or ``TAI_ALLOW_MISSING_CAPITAL_SDK=1``
-    is set. The flag is exported into the environment so the spec,
-    which repeats the check, sees the same opt-out.
+    missing or empty required broker DLL (``REQUIRED_BROKER_DLLS``)
+    aborts with exit code 1 unless ``allow_missing_broker_sdk`` or
+    ``TAI_ALLOW_MISSING_CAPITAL_SDK=1`` is set. Any other value of that
+    env var warns and does not opt out. The flag is exported into the
+    environment so the spec, which repeats the check, sees the same
+    opt-out.
     """
     root = os.path.dirname(os.path.abspath(__file__)) or "."
     if allow_missing_broker_sdk:

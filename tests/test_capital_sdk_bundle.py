@@ -55,7 +55,8 @@ def test_missing_dir_exits_and_names_path_and_env(tmp_path, capsys):
     assert expected in out
     assert "TAI_CAPITAL_SDK_DIR" in out
     assert build_release.DEFAULT_CAPITAL_SDK_LIBS in out
-    assert "SKCOM.dll" in out
+    assert "SKCOM.dll is missing" in out
+    assert "CTSecuritiesATL.dll is missing" in out
 
 
 def test_empty_dir_exits(tmp_path, capsys):
@@ -71,7 +72,8 @@ def test_empty_dir_exits(tmp_path, capsys):
     out = capsys.readouterr().out
     assert str(libs) in out
     assert "TAI_CAPITAL_SDK_DIR" in out
-    assert "SKCOM.dll" in out
+    assert "SKCOM.dll is missing" in out
+    assert "CTSecuritiesATL.dll is missing" in out
 
 
 def test_non_broker_dll_does_not_count(tmp_path, capsys):
@@ -82,7 +84,10 @@ def test_non_broker_dll_does_not_count(tmp_path, capsys):
             environ={}, project_root=str(root),
         )
     assert exc.value.code == 1
-    assert "TAI_CAPITAL_SDK_DIR" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "TAI_CAPITAL_SDK_DIR" in out
+    assert "SKCOM.dll is missing" in out
+    assert "CTSecuritiesATL.dll is missing" in out
 
 
 def test_env_override_supplies_broker_dlls(tmp_path):
@@ -143,15 +148,21 @@ def test_opt_out_flag_warns_without_env(tmp_path, capsys):
     assert "WARNING" in capsys.readouterr().out
 
 
-def test_opt_out_requires_exact_one(tmp_path):
+@pytest.mark.parametrize("value", ["true", "yes", "TRUE", "0"])
+def test_unrecognized_opt_out_warns_and_fails_closed(tmp_path, capsys, value):
     root = tmp_path / "ci"
     root.mkdir()
     with pytest.raises(SystemExit) as exc:
         build_release.prepare_capital_sdk_binaries(
-            environ={build_release.ENV_ALLOW_MISSING_CAPITAL_SDK: "true"},
+            environ={build_release.ENV_ALLOW_MISSING_CAPITAL_SDK: value},
             project_root=str(root),
         )
     assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "Only '1' opts out" in out
+    assert repr(value) in out
+    assert "SKCOM.dll is missing" in out
 
 
 def test_present_sdk_matches_historical_spec_glob(tmp_path, monkeypatch, capsys):
@@ -206,7 +217,7 @@ def test_default_path_constant_is_the_historical_spec_path():
 
 def test_spec_checks_sdk_and_adds_no_datas():
     spec = (REPO / "tai_backtest.spec").read_text(encoding="utf-8")
-    assert "dll_binaries = prepare_capital_sdk_binaries()" in spec
+    assert "dll_binaries = prepare_capital_sdk_binaries(project_root=SPECPATH)" in spec
     assert "if os.path.isdir(sdk_libs)" not in spec
     assert "binaries=dll_binaries" in spec
     datas = spec.split("datas=[", 1)[1].split("],", 1)[0]
@@ -225,6 +236,10 @@ def test_readme_names_sdk_path_and_env():
     assert "TAI_CAPITAL_SDK_DIR" in readme
     assert "TAI_ALLOW_MISSING_CAPITAL_SDK" in readme
     assert "--allow-missing-broker-sdk" in readme
+    assert "CTSecuritiesATL.dll" in readme
+    assert "Only the value `1` opts out" in readme
+    assert "SPECPATH" in readme
+    assert "relative value is resolved against the project root" in readme
     assert (
         "CapitalAPI_2.13.57/CapitalAPI_2.13.57_PythonExample/"
         "SKDLLPythonTester/libs"
@@ -303,3 +318,186 @@ def test_main_forwards_allow_missing_broker_sdk(monkeypatch):
         "build_release.py", "--skip-release", "--allow-missing-broker-sdk",
     ]) == (False, True)
     assert run(["build_release.py", "--skip-release"]) == (False, False)
+
+
+# ── both required DLLs, spec path and build() ───────────────────────
+
+
+_PARTIAL_DLL_CASES = [
+    ({"SKCOM.dll": b"SK"}, "CTSecuritiesATL.dll is missing"),
+    ({"CTSecuritiesATL.dll": b"CT"}, "SKCOM.dll is missing"),
+    ({"SKCOM.dll": b"", "CTSecuritiesATL.dll": b"CT"}, "SKCOM.dll is empty"),
+    (
+        {"SKCOM.dll": b"SK", "CTSecuritiesATL.dll": b""},
+        "CTSecuritiesATL.dll is empty",
+    ),
+]
+
+
+def _other_problem_phrases(problem: str) -> list[str]:
+    phrases = []
+    for name in build_release.REQUIRED_BROKER_DLLS:
+        for kind in ("is missing", "is empty"):
+            phrase = f"{name} {kind}"
+            if phrase != problem:
+                phrases.append(phrase)
+    return phrases
+
+
+@pytest.mark.parametrize("payloads,problem", _PARTIAL_DLL_CASES)
+def test_spec_path_rejects_partial_or_empty_dll(tmp_path, capsys, payloads, problem):
+    """The spec calls ``prepare_capital_sdk_binaries(project_root=SPECPATH)``."""
+    root = tmp_path / "spec-root"
+    libs = _libs(root)
+    libs.mkdir(parents=True)
+    for name, data in payloads.items():
+        (libs / name).write_bytes(data)
+    with pytest.raises(SystemExit) as exc:
+        build_release.prepare_capital_sdk_binaries(
+            environ={}, project_root=str(root),
+        )
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert problem in out
+    for phrase in _other_problem_phrases(problem):
+        assert phrase not in out
+
+
+def test_spec_path_both_nonzero_matches_historical_glob(tmp_path, monkeypatch, capsys):
+    _stage(tmp_path, "SKCOM.dll", "CTSecuritiesATL.dll", "SKProxyLIB.dll")
+    monkeypatch.chdir(tmp_path)
+    got = build_release.prepare_capital_sdk_binaries(
+        environ={}, project_root=str(tmp_path),
+    )
+    assert got == _historical_spec_binaries(build_release.DEFAULT_CAPITAL_SDK_LIBS)
+    assert all(not os.path.isabs(src) for src, _dest in got)
+    assert all(dest == "libs" for _src, dest in got)
+    out = capsys.readouterr().out
+    assert "ERROR" not in out
+    assert "WARNING" not in out
+
+
+def _silence_build_side_effects(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, cwd=None):
+        calls.append(list(cmd))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(build_release.subprocess, "run", fake_run)
+    monkeypatch.setattr(build_release, "strategies_datas", lambda _root: [])
+    monkeypatch.setattr(build_release, "warn_build_requirements", lambda _root: {})
+    return calls
+
+
+@pytest.mark.parametrize("payloads,problem", _PARTIAL_DLL_CASES)
+def test_build_rejects_partial_or_empty_dll(monkeypatch, tmp_path, capsys, payloads, problem):
+    libs = tmp_path / "libs"
+    libs.mkdir()
+    for name, data in payloads.items():
+        (libs / name).write_bytes(data)
+    monkeypatch.setenv(build_release.ENV_CAPITAL_SDK_DIR, str(libs))
+    monkeypatch.setenv(build_release.ENV_ALLOW_MISSING_CAPITAL_SDK, "")
+    calls = _silence_build_side_effects(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        build_release.build()
+    assert exc.value.code == 1
+    assert calls == []
+    out = capsys.readouterr().out
+    assert problem in out
+    for phrase in _other_problem_phrases(problem):
+        assert phrase not in out
+    assert "=== Building" not in out
+
+
+def test_build_both_nonzero_reaches_pyinstaller(monkeypatch, tmp_path, capsys):
+    libs = tmp_path / "libs"
+    libs.mkdir()
+    (libs / "SKCOM.dll").write_bytes(b"SK")
+    (libs / "CTSecuritiesATL.dll").write_bytes(b"CT")
+    (libs / "SKProxyLIB.dll").write_bytes(b"PX")
+    monkeypatch.setenv(build_release.ENV_CAPITAL_SDK_DIR, str(libs))
+    monkeypatch.setenv(build_release.ENV_ALLOW_MISSING_CAPITAL_SDK, "")
+    calls = _silence_build_side_effects(monkeypatch)
+    build_release.build()
+    assert calls and calls[0][1:3] == ["-m", "PyInstaller"]
+    out = capsys.readouterr().out
+    assert "ERROR" not in out
+    assert "is missing" not in out
+    assert "is empty" not in out
+
+
+def test_relative_sdk_dir_resolves_against_project_root_not_cwd(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    rel = os.path.join("vendor", "libs")
+    libs = project / "vendor" / "libs"
+    libs.mkdir(parents=True)
+    (libs / "SKCOM.dll").write_bytes(b"SK")
+    (libs / "CTSecuritiesATL.dll").write_bytes(b"CT")
+    elsewhere = tmp_path / "elsewhere"
+    decoy = elsewhere / "vendor" / "libs"
+    decoy.mkdir(parents=True)
+    (decoy / "SKCOM.dll").write_bytes(b"NO")
+    (decoy / "CTSecuritiesATL.dll").write_bytes(b"NO")
+    monkeypatch.chdir(elsewhere)
+    got = build_release.prepare_capital_sdk_binaries(
+        environ={build_release.ENV_CAPITAL_SDK_DIR: rel},
+        project_root=str(project),
+    )
+    blobs = {os.path.basename(src): Path(src).read_bytes() for src, dest in got}
+    assert blobs == {"CTSecuritiesATL.dll": b"CT", "SKCOM.dll": b"SK"}
+    assert {dest for _src, dest in got} == {"libs"}
+
+
+def test_build_passes_script_directory_as_project_root(monkeypatch):
+    seen = {}
+
+    def fake_prepare(environ=None, *, project_root=None, allow_missing_flag=False):
+        seen["project_root"] = project_root
+        env = os.environ if environ is None else environ
+        seen["sdk"] = env.get(build_release.ENV_CAPITAL_SDK_DIR)
+        return []
+
+    monkeypatch.setattr(build_release, "prepare_capital_sdk_binaries", fake_prepare)
+    monkeypatch.setenv(
+        build_release.ENV_CAPITAL_SDK_DIR, os.path.join("vendor", "libs"),
+    )
+    _silence_build_side_effects(monkeypatch)
+    build_release.build()
+    root = os.path.dirname(os.path.abspath(build_release.__file__))
+    assert seen["project_root"] == root
+    assert seen["sdk"] == os.path.join("vendor", "libs")
+
+
+def test_build_unrecognized_opt_out_fails_before_pyinstaller(
+    monkeypatch, tmp_path, capsys,
+):
+    monkeypatch.setenv(build_release.ENV_CAPITAL_SDK_DIR, str(tmp_path / "missing"))
+    monkeypatch.setenv(build_release.ENV_ALLOW_MISSING_CAPITAL_SDK, "yes")
+    calls = []
+    monkeypatch.setattr(
+        build_release.subprocess, "run", lambda *_a, **_k: calls.append(True),
+    )
+    with pytest.raises(SystemExit) as exc:
+        build_release.build()
+    assert exc.value.code == 1
+    assert calls == []
+    out = capsys.readouterr().out
+    assert "Only '1' opts out" in out
+    assert repr("yes") in out
+
+
+def test_unrecognized_opt_out_does_not_drop_a_present_sdk(tmp_path, capsys):
+    libs = _stage(tmp_path, "SKCOM.dll", "CTSecuritiesATL.dll")
+    got = build_release.prepare_capital_sdk_binaries(
+        environ={build_release.ENV_ALLOW_MISSING_CAPITAL_SDK: "yes"},
+        project_root=str(tmp_path),
+    )
+    assert got == _historical_spec_binaries(str(libs))
+    out = capsys.readouterr().out
+    assert "Only '1' opts out" in out
+    assert "ERROR" not in out
+
+
+def test_required_broker_dlls_are_the_shared_pair():
+    assert build_release.REQUIRED_BROKER_DLLS == ("SKCOM.dll", "CTSecuritiesATL.dll")

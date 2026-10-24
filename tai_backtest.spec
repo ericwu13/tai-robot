@@ -29,12 +29,14 @@ sys.path.insert(0, SPECPATH)
 from build_release import prepare_capital_sdk_binaries, strategies_datas
 _strategies_datas = strategies_datas(SPECPATH)
 
-# Broker DLLs. Missing SDK fails the build (exit 1) instead of shipping
-# an empty _internal/libs. Do not pass project_root: the default path
-# stays the historical relative libs string, so a present SDK bundles
-# the same *.dll files and no new datas. Opt out with
-# TAI_ALLOW_MISSING_CAPITAL_SDK=1.
-dll_binaries = prepare_capital_sdk_binaries()
+# Broker DLLs. Missing or empty SKCOM.dll / CTSecuritiesATL.dll fails
+# the build (exit 1) instead of shipping an empty _internal/libs.
+# project_root=SPECPATH resolves a relative TAI_CAPITAL_SDK_DIR against
+# the spec directory, matching build_release.py. When that env var is
+# unset and the cwd is the spec directory, the glob stays the historical
+# relative libs path, so a present SDK bundles the same *.dll files.
+# Opt out only with TAI_ALLOW_MISSING_CAPITAL_SDK=1.
+dll_binaries = prepare_capital_sdk_binaries(project_root=SPECPATH)
 
 a = Analysis(
     ['run_backtest.py'],
