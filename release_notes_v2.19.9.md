@@ -76,7 +76,20 @@
 
 ## 已知問題／待定關卡 Known issues / pending gates
 
-- **#157**：[PLACEHOLDER] `EnterMonitorLONG` 重連當機根因狀態：#178 移除重新登入路徑，根因仍待 TY 確認。 / [PLACEHOLDER] root-cause status of the `EnterMonitorLONG` reconnect crash: #178 removes the relogin path; root cause still to be confirmed (TY).
+**已知問題（#157）：** 券商連線中斷後重新連線時，機器人偶爾可能當機或凍結。最常發生在開盤前幾分鐘。
+- **已確認：** 所有記錄到的當機或停止回應，都發生在斷線後於同一程序內重新連線的過程中；新啟動的機器人從未當機。故障是券商原生 SKCOM 函式庫內的 Windows 存取違規（access violation），程式無法攔截。
+- **尚未確認：** SKCOM 內部的確切缺陷。SKCOM 為閉源，且每次當機的故障位置不同。
+- **本版變更：** 重新連線改由新的連線狀態機處理（#178）。重新連線時不再呼叫 LeaveMonitor，只在關閉時呼叫。在部位核對完成前會阻擋新的進場。多次失敗後會維持斷線狀態、發出警示，並等待手動 Reconnect。尚未經長時間測試證實能消除此當機。
+- **本版未包含：** 將券商連線移至獨立程序（#169）未包含在本版，因此重新連線仍在同一程序內進行。
+- **對使用者的影響：** 若發生此問題，機器人會結束或停止回應，且不會自動重啟。任何未平倉部位在重啟機器人前將失去自動出場管理。收到斷線警示後，請檢查機器人，若已停止或凍結請重新啟動。
+
+**Known issue (#157):** Rarely, a bot can crash or freeze while it reconnects after the broker connection drops. This is most likely in the few minutes before a session opens.
+- **Confirmed:** Every recorded crash or hang happened during an in-process reconnect after a disconnect, and a freshly started bot has never crashed. The fault is a Windows access violation inside the broker's native SKCOM library, which the app can't catch.
+- **Not confirmed:** The exact defect inside SKCOM. It's closed source, and the faulting location varies between crashes.
+- **What changed in this build:** Reconnects now run through a new connection state machine (#178). It no longer calls LeaveMonitor during a reconnect, only at shutdown. It blocks new entries until positions are reconciled. After repeated failures it stays disconnected, alerts, and waits for a manual Reconnect. It hasn't yet been proven in a soak to eliminate the crash.
+- **Not in this build:** Moving the broker into its own process (#169) isn't included, so a reconnect still happens inside the same process.
+- **User impact:** If it happens, the bot exits or stops responding and does not restart itself. Any open position loses automatic exit management until you restart the bot. After a disconnect alert, check the bot and restart it if it's down or frozen.
+
 - **#192 GIL 卡頓**：由 #194 解決（pending merge）。 / **#192 GIL stall**: resolved by #194 (pending merge).
 - **#195**：任何建置前必須合併。 / must be merged before any build.
 
