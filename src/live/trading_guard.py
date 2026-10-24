@@ -164,9 +164,25 @@ class TradingGuard:
         return d
 
     def clear_halt(self) -> None:
-        """Manual reset of halted state after human verification."""
+        """Manual reset of halted state after human verification.
+
+        Does not clear ``fill_pending``. A refused resume holds that
+        gate with the poller stopped; the Live-tab action calls
+        :meth:`clear_fill_pending` instead.
+        """
         self.halted = False
         self.halt_reason = ""
+
+    def clear_fill_pending(self) -> None:
+        """Release a stuck in-flight fill gate. Does not send an order.
+
+        Clears ``fill_pending`` (the entry and exit gate) and drops any
+        deferred close so a later save cannot restore them. Does not
+        confirm the entry and does not touch ``halted``.
+        """
+        self.fill_pending = False
+        self.fill_pending_type = ""
+        self._deferred_close = None
 
     # ── Session resume reconciliation (issue #79) ──
 

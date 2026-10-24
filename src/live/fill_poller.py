@@ -143,8 +143,12 @@ class FillPoller:
 
         Returns FillPollAction telling the caller what to do next.
         """
+        # Always replace the previous run's resume bookkeeping, including
+        # the no-COM return below. A later live order must not inherit
+        # expected_sign/resumed — a stale long sign would reject a short
+        # fill, and a stale resumed flag would refuse a normal timeout.
         self._expected_sign = expected_sign
-        self._resumed = resumed
+        self._resumed = bool(resumed)
         if not com_available:
             # Auto-confirm immediately when COM unavailable
             self._guard.on_fill_confirmed()

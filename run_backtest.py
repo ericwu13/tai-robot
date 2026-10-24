@@ -1141,6 +1141,11 @@ class BacktestApp:
                     # Fill polling: track position from OI callbacks
                     if self._trading_guard.fill_pending and self._live_runner:
                         self._update_fill_poll_position(data, parsed)
+                    # A resume that refused because the snapshot had not
+                    # arrived yet re-checks once this row settles the book.
+                    self._recheck_resume_after_snapshot(
+                        settled=self._oi_row_settles_resume_recheck(
+                            data, parsed))
                 elif kind == "future_rights":
                     parsed = _parse_future_rights(data)
                     if parsed:
@@ -1849,6 +1854,10 @@ class BacktestApp:
         # Fill confirmation polling (auto mode) — uses OpenInterest position change
         self._fill_poller = FillPoller(self._trading_guard)
         self._fill_poll_timer_id = None
+        # Set when a resume refuses to arm because the OI snapshot has
+        # not arrived yet. A later OnOpenInterest row re-runs that check.
+        # Cleared on deploy, stop, manual clear, and once the book is known.
+        self._resume_snapshot_recheck: dict | None = None
         # Per-order real fill prices from OnNewData (issue #92)
         self._fill_tracker = RealFillTracker()
         self._real_fill_count: int = 0
@@ -2274,8 +2283,16 @@ class BacktestApp:
                                            style="Card.TButton",
                                            command=self._manual_close)
         self.btn_manual_close.pack(side=tk.LEFT)
+        # Refused resume holds fill_pending with the poller stopped.
+        # This is the in-app release. It does not send an order.
+        self.btn_clear_fill = ttk.Button(
+            order_btns, text="清除成交等待 Clear Fill Pending",
+            style="Card.TButton",
+            command=self._clear_fill_pending)
+        self.btn_clear_fill.pack(side=tk.LEFT, padx=S(6, 0))
         # Disable until live bot is running with semi-auto
-        for btn in (self.btn_manual_buy, self.btn_manual_sell, self.btn_manual_close):
+        for btn in (self.btn_manual_buy, self.btn_manual_sell,
+                    self.btn_manual_close, self.btn_clear_fill):
             btn.config(state=tk.DISABLED)
 
         acct_frame = ttk.Frame(mid, style="Card.TFrame", padding=S(14, 10, 14, 12))
@@ -6493,6 +6510,18 @@ class BacktestApp:
     def _reconcile_resumed_guard(self, resume_session, trading_mode, symbol) -> None:
         """Restore the fill gate and restart its poller (issues #79, #168).
 
+        The session/mode/symbol are kept so a snapshot that arrives after
+        this call can re-run the same check. See
+        :meth:`_recheck_resume_after_snapshot`.
+        """
+        self._resume_check_session = resume_session
+        self._resume_check_mode = trading_mode
+        self._resume_check_symbol = symbol
+        self._reconcile_resumed_guard_body(resume_session, trading_mode, symbol)
+
+    def _reconcile_resumed_guard_body(self, resume_session, trading_mode, symbol) -> None:
+        """Restore the fill gate and restart its poller (issues #79, #168).
+
         ``reset()`` on deploy cleared ``fill_pending``. A persisted
         in-flight order is put back so it is not sent twice. The fill
         poller was reset in the same breath, and deal-row confirmation
@@ -6633,11 +6662,16 @@ class BacktestApp:
           and an in-flight exit is "already flat").
         * COM is down. ``start()`` would auto-confirm with no fill.
 
-        The gate stays up and an alert is raised. A mismatched book
-        drops the deferred close. On the flat branch a missing snapshot
-        or COM drops it too, so it cannot be replayed later.
+        The gate stays up and an alert is raised. A mismatched book, or
+        COM down, drops the deferred close so it cannot be replayed.
+        A missing snapshot with COM up keeps the close: the OnOpenInterest
+        reply is often ~4s late, and the same check runs again when it
+        lands. A match then arms with ``expected_sign`` and ``resumed``.
+        A mismatch drops the close and leaves the gate up.
         """
         if not outcome.get("kept_inflight") or not self._trading_guard.fill_pending:
+            self._resume_snapshot_recheck = None
+            self._sync_clear_fill_button()
             return
         action_type = self._trading_guard.fill_pending_type or "entry"
         sim_open = bool(
@@ -6649,11 +6683,25 @@ class BacktestApp:
             _com_available and skO is not None and self._futures_account)
         directed = sim_open or bool(close_side)
         mismatch = directed and not real_ok
-        # Flat sim + a saved close: a missing snapshot or COM is the
-        # same hazard as a mismatch, because there is no position side
-        # to constrain the poller.
-        drop_close = mismatch or (
-            bool(close_side) and (not snapshot_received or not com_ok))
+        # Missing snapshot + COM up: hold the close and remember the
+        # session so the late row can re-run this function. Dropping it
+        # now would erase the side a flat book needs, and the next save
+        # would persist a gate that can no longer be checked.
+        await_snapshot = (not snapshot_received) and com_ok
+        if await_snapshot:
+            self._resume_snapshot_recheck = {
+                "session": getattr(self, "_resume_check_session", None),
+                "mode": getattr(self, "_resume_check_mode", None),
+                "symbol": getattr(self, "_resume_check_symbol", None),
+            }
+            drop_close = False
+        else:
+            self._resume_snapshot_recheck = None
+            # Known-bad book, or no COM: the close must not survive to
+            # be replayed. A flat sim has no position side to constrain
+            # a later poller, so a missing COM drops it too.
+            drop_close = mismatch or (
+                bool(close_side) and (not snapshot_received or not com_ok))
         if mismatch or not snapshot_received or not com_ok:
             if drop_close:
                 self._trading_guard._deferred_close = None
@@ -6671,8 +6719,11 @@ class BacktestApp:
                 f"poller was not started ({why}). "
                 "Real account does not match, the position snapshot has "
                 "not arrived, or COM is unavailable. "
-                "Orders stay blocked until you review the position.",
+                "Orders stay blocked until you review the position. "
+                "Clear Fill Pending on the Live tab releases the gate "
+                "without sending an order.",
             )
+            self._sync_clear_fill_button()
             return
         side = close_side
         if sim_open and self._live_runner and self._live_runner.broker.position_side:
@@ -6696,6 +6747,150 @@ class BacktestApp:
                 "New real orders stay blocked until the fill confirms "
                 "or the poller times out and downgrades to semi-auto.",
             )
+        self._sync_clear_fill_button()
+
+    def _resume_order_prefix(self) -> str:
+        """Order-symbol prefix for the resume book check (TX / TM / MT)."""
+        symbol = getattr(self, "_resume_check_symbol", None) or ""
+        if not symbol:
+            runner = getattr(self, "_live_runner", None)
+            symbol = getattr(runner, "symbol", "") if runner else ""
+        order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+        return order_sym[:2] if order_sym else ""
+
+    def _oi_row_settles_resume_recheck(self, data, parsed) -> bool:
+        """True when this OI callback is enough to re-check a held resume.
+
+        A foreign product row is not the book. Wait for this bot's
+        product, for ``001`` (flat), or for the ``##`` end marker.
+        """
+        if not getattr(self, "_resume_snapshot_recheck", None):
+            return False
+        if not getattr(self._account_monitor, "oi_snapshot_received", False):
+            return False
+        if isinstance(parsed, dict):
+            prefix = self._resume_order_prefix()
+            product = str(parsed.get("product") or "")
+            try:
+                qty = int(parsed.get("qty") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            return bool(prefix) and product.startswith(prefix) and qty != 0
+        text = data if isinstance(data, str) else ""
+        first = text.split(",")[0].strip() if text else ""
+        return first in ("001", "##")
+
+    def _recheck_resume_after_snapshot(self, *, settled: bool = True) -> None:
+        """Re-run resume reconciliation after a late OI snapshot.
+
+        Only a refusal caused by a missing snapshot (COM was up) sets
+        ``_resume_snapshot_recheck``. A matching book arms the poller
+        with ``expected_sign`` and ``resumed=True``. A mismatch keeps
+        the gate, drops the deferred close, and alerts. An opposite
+        book or a COM-down refusal is not re-opened here.
+        """
+        pending = getattr(self, "_resume_snapshot_recheck", None)
+        if not pending or not settled:
+            return
+        if not getattr(self._account_monitor, "oi_snapshot_received", False):
+            return
+        guard = getattr(self, "_trading_guard", None)
+        if guard is None or not guard.fill_pending:
+            self._resume_snapshot_recheck = None
+            return
+        poller = getattr(self, "_fill_poller", None)
+        if poller is not None and poller.active:
+            self._resume_snapshot_recheck = None
+            return
+        if getattr(self, "_live_runner", None) is None:
+            self._resume_snapshot_recheck = None
+            return
+        session = pending.get("session")
+        mode = pending.get("mode")
+        symbol = pending.get("symbol")
+        # Consume before re-entry. A snapshot that is now present does
+        # not set the flag again, so this cannot loop.
+        self._resume_snapshot_recheck = None
+        if not isinstance(session, dict) or not mode or not symbol:
+            return
+        self._live_log_msg(
+            "[RESUME] Late position snapshot — re-checking in-flight fill",
+            "status",
+        )
+        self._reconcile_resumed_guard(session, mode, symbol)
+
+    def _fill_pending_clearable(self) -> bool:
+        """True when a refused resume is holding the gate with no poller.
+
+        An active poller is the normal in-flight wait. Clearing it would
+        race a confirm. The button is only for the stuck refusal.
+        """
+        guard = getattr(self, "_trading_guard", None)
+        runner = getattr(self, "_live_runner", None)
+        poller = getattr(self, "_fill_poller", None)
+        if guard is None or runner is None or not guard.fill_pending:
+            return False
+        if poller is not None and poller.active:
+            return False
+        return True
+
+    def _sync_clear_fill_button(self) -> None:
+        """Enable Clear Fill Pending only while a refused resume holds the gate."""
+        btn = getattr(self, "btn_clear_fill", None)
+        if btn is None:
+            return
+        state = tk.NORMAL if self._fill_pending_clearable() else tk.DISABLED
+        try:
+            btn.config(state=state)
+        except tk.TclError:
+            pass
+
+    def _clear_fill_pending(self) -> bool:
+        """Operator action: drop a fill gate a refused resume left held.
+
+        Clears ``fill_pending`` and the deferred close, resets the
+        poller without confirming, and saves so the gate does not come
+        back from session.json. Does not send or replay an order.
+        """
+        if not self._fill_pending_clearable():
+            self._live_log_msg(
+                "[RESUME] Clear fill pending refused — no held gate, "
+                "or the fill poller is still active.",
+                "status",
+            )
+            return False
+        # Drop the late-snapshot recheck first so a row that arrives
+        # during the save cannot put the gate back.
+        self._resume_snapshot_recheck = None
+        timer = getattr(self, "_fill_poll_timer_id", None)
+        if timer is not None:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:
+                pass
+            self._fill_poll_timer_id = None
+        poller = getattr(self, "_fill_poller", None)
+        if poller is not None:
+            poller.reset()
+        held_type = self._trading_guard.fill_pending_type or "entry"
+        self._trading_guard.clear_fill_pending()
+        runner = getattr(self, "_live_runner", None)
+        save = getattr(runner, "_auto_save_session", None) if runner else None
+        if callable(save):
+            save()
+        self._live_log_msg(
+            f"[RESUME] Operator cleared fill pending ({held_type}). "
+            "Deferred close dropped. No order sent.",
+            "status",
+        )
+        self._alert(
+            "已清除成交等待 Fill Pending Cleared",
+            f"Operator cleared the in-flight {held_type} fill gate. "
+            "The deferred close was dropped. No order was sent. "
+            "Review the real position before new orders.",
+        )
+        self._sync_clear_fill_button()
+        return True
 
     def _deploy_live_from(self, req: DeployRequest) -> bool:
         """Deploy a live bot from an already-resolved request.
@@ -6731,6 +6926,7 @@ class BacktestApp:
         self._trading_guard.daily_loss_limit = loss_limit
         self._trading_guard.reset()
         self._fill_poller.reset()
+        self._resume_snapshot_recheck = None
         # Issue #92: clear any leftover session-end exit-fill wait from a
         # prior deploy so a fresh bot never defers its first report.
         self._session_end_exit_pending = False
@@ -9272,6 +9468,7 @@ class BacktestApp:
             state = tk.DISABLED
         for btn in (self.btn_manual_buy, self.btn_manual_sell, self.btn_manual_close):
             btn.config(state=state)
+        self._sync_clear_fill_button()
 
     def _query_real_account(self):
         """Query real account positions and equity from Capital API."""
@@ -9645,6 +9842,7 @@ class BacktestApp:
             self._stop_main_heartbeat()
             self._live_runner = None
             self._regime_manager = None
+            self._resume_snapshot_recheck = None
             self._trading_guard.reset()
             _close_debug_log()
 
