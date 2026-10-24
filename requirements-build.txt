@@ -9,7 +9,8 @@
 #
 # The flag also installs this project into that interpreter
 # (pip install -e .), so the EXE build sees pyyaml, keyring, httpx,
-# lightweight-charts, pandas, and holidays. This file only pins the
+# lightweight-charts, pandas, and holidays. That install always runs,
+# including when the pins below already match. This file only pins the
 # toolchain.
 #
 # The runtime hook is the real startup fix. The comtypes 1.4.15 wheel

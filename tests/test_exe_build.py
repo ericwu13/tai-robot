@@ -170,21 +170,56 @@ def _write_req(tmp_path, body="PyInstaller==6.19.0\ncomtypes==1.4.15\n"):
     (tmp_path / "requirements-build.txt").write_text(body, encoding="utf-8")
 
 
-def test_ensure_build_requirements_skips_pip_when_pinned(tmp_path):
+def test_ensure_build_requirements_installs_even_when_pins_match(tmp_path):
+    """Matching pins still get ``pip install -e .`` on the target interpreter."""
     _write_req(tmp_path)
+    target = str(tmp_path / ".venv-build" / "bin" / "python")
     calls = []
+    checked = []
+    matched = {"PyInstaller": "6.19.0", "comtypes": "1.4.15"}
+
+    def version_of(name):
+        checked.append(name)
+        return matched[name]
 
     def runner(cmd):
-        calls.append(cmd)
+        calls.append(list(cmd))
         return types.SimpleNamespace(returncode=0)
 
     pins = build_release.ensure_build_requirements(
         str(tmp_path),
         runner=runner,
-        version_of={"PyInstaller": "6.19.0", "comtypes": "1.4.15"}.get,
+        version_of=version_of,
+        python=target,
     )
     assert pins["comtypes"] == "1.4.15"
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0][0] == target
+    assert calls[0][1:4] == ["-m", "pip", "install"]
+    root = os.path.abspath(str(tmp_path))
+    assert calls[0][calls[0].index("-e") + 1] == root
+    assert calls[0][-2] == "-r"
+    assert calls[0][-1].endswith("requirements-build.txt")
+    # One pass over the pins before pip, and one after.
+    assert checked == ["PyInstaller", "comtypes", "PyInstaller", "comtypes"]
+
+
+def test_query_dist_version_missing_interpreter_exits(capsys):
+    missing = "/no/such/interpreter"
+
+    def runner(cmd, **kwargs):
+        raise OSError(2, "No such file or directory", cmd[0])
+
+    with pytest.raises(SystemExit) as exc:
+        build_release.query_dist_version(
+            missing, "PyInstaller", runner=runner,
+        )
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "could not query" in out
+    assert "PyInstaller" in out
+    assert missing in out
+    assert "Traceback" not in out
 
 
 def test_ensure_build_requirements_installs_when_unpinned_combo(tmp_path):

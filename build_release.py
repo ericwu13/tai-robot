@@ -16,9 +16,11 @@ nothing. ``--install-build-deps`` is the opt-in. It installs this
 project (``pip install -e .``: pyyaml, keyring, httpx,
 lightweight-charts, pandas, holidays) and ``requirements-build.txt``
 into ``.venv-build`` when that interpreter exists; otherwise it warns
-and names the active interpreter before installing there. Pin checks
-before and after the install query that same interpreter. Installing
-there can downgrade ``comtypes`` in a dev or live venv.
+and names the active interpreter before installing there. The install
+always runs, including when the PyInstaller and comtypes pins already
+match, so the project packages are present. Pin checks before and after
+the install query that same interpreter. Installing there can
+downgrade ``comtypes`` in a dev or live venv.
 
 Build-integrity guard (added after the v2.13.0 mismatch, where the
 published EXE was built from a checkout lacking the regime code):
@@ -285,7 +287,11 @@ def query_dist_version(python: str, dist_name: str, *, runner=None):
     """
     cmd = [python, "-c", _VERSION_PROBE, dist_name]
     run = runner or subprocess.run
-    result = run(cmd, capture_output=True, text=True)
+    try:
+        result = run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        print(f"ERROR: could not query {dist_name} in {python}: {exc}")
+        sys.exit(1)
     code = getattr(result, "returncode", 1)
     if code == 0:
         text = (getattr(result, "stdout", "") or "").strip()
@@ -315,8 +321,9 @@ def ensure_build_requirements(
     """Install this project and ``requirements-build.txt`` into ``python``.
 
     ``python`` is the interpreter that receives the packages (default:
-    this process). Pin checks before and after the install query that
-    same interpreter.
+    this process). The pip install always runs, including when the
+    pins already match: those pins do not cover the project packages.
+    Pin checks before and after the install query that same interpreter.
     ``runner`` and ``version_of`` exist so tests can avoid pip and a real
     environment. ``runner`` is called like ``subprocess.run(cmd)`` for
     pip and like ``subprocess.run(cmd, capture_output=True, text=True)``
@@ -337,15 +344,15 @@ def ensure_build_requirements(
     if not bad:
         listed = ", ".join(f"{name}=={ver}" for name, ver in pins.items())
         print(f"Build dependencies OK ({listed})")
-        return pins
-
-    print(f"Build dependencies do not match {BUILD_REQUIREMENTS}:")
-    for name, want in pins.items():
-        if name in bad:
-            have = bad[name] or "not installed"
-            print(f"  {name}: want {want}, have {have}")
-    # -e . brings in the project (pyyaml, keyring, httpx,
-    # lightweight-charts, pandas, holidays). -r pins the toolchain.
+    else:
+        print(f"Build dependencies do not match {BUILD_REQUIREMENTS}:")
+        for name, want in pins.items():
+            if name in bad:
+                have = bad[name] or "not installed"
+                print(f"  {name}: want {want}, have {have}")
+    # Always install. Matching pins do not mean the project (pyyaml,
+    # keyring, httpx, lightweight-charts, pandas, holidays) is present.
+    # -e . installs the project. -r pins the toolchain.
     cmd = [py, "-m", "pip", "install", "-e", root, "-r", req_path]
     print(f"Installing the project and pinned build dependencies with {py}")
     print(f"  {' '.join(cmd)}")

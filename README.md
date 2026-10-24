@@ -61,7 +61,7 @@ The app can be packaged as a standalone Windows EXE using PyInstaller (--onedir 
 python build_release.py --skip-release
 ```
 
-A fresh `.venv-build` needs this project's packages as well as the toolchain. PyInstaller analyzes imports of pyyaml, keyring, httpx, lightweight-charts, pandas, and holidays. `--install-build-deps` installs both into the target interpreter: `pip install -e .` (those packages) and `pip install -r requirements-build.txt` (the pins). Pin checks before and after that install query the same interpreter, and PyInstaller runs with it. Prefer a dedicated build venv (`.venv-build/`, gitignored) so comtypes is not downgraded in a dev or live venv. When `.venv-build` exists, the flag installs into its interpreter. Otherwise it prints a warning naming the active interpreter (`sys.executable`) and installs there.
+A fresh `.venv-build` needs this project's packages as well as the toolchain. PyInstaller analyzes imports of pyyaml, keyring, httpx, lightweight-charts, pandas, and holidays. `--install-build-deps` always installs both into the target interpreter, including when the PyInstaller and comtypes pins already match: `pip install -e .` (those packages) and `pip install -r requirements-build.txt` (the pins). Pin checks before and after that install query the same interpreter, and PyInstaller runs with it. Prefer a dedicated build venv (`.venv-build/`, gitignored) so comtypes is not downgraded in a dev or live venv. When `.venv-build` exists, the flag installs into its interpreter. Otherwise it prints a warning naming the active interpreter (`sys.executable`) and installs there.
 
 ```bash
 python -m venv .venv-build
