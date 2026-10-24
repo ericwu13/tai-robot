@@ -527,6 +527,15 @@ def _load_settings():
             # has no credentials. Parsing (and the absolute-real coerce)
             # lives in src.evolution.paper_gate.
             cfg["evolution_gate_raw"] = dict(evo) if isinstance(evo, dict) else {}
+            # D1: classes with fewer than 2 rewritable grid knobs are
+            # excluded from the weekly run. "none" (default) does not
+            # codegen. "structural_lane" is reserved for a later monthly
+            # lane and also does not enable weekly codegen. Any other
+            # value, including "codegen", is treated as "none".
+            from src.evolution.knobs import normalize_knob_ineligible_fallback
+            cfg["evolution_knob_ineligible_fallback"] = (
+                normalize_knob_ineligible_fallback(
+                    evo.get("knob_ineligible_fallback", "none")))
             # News/event framework (src.news). Paths are written by an
             # external n8n workflow; empty paths keep the feature inert.
             # Defaults mirror src.config.settings.NewsConfig exactly.
@@ -5314,9 +5323,9 @@ class BacktestApp:
             if _evo_cls is not None:
                 _evo_source = self._resolve_strategy_source(
                     self.strategy_var.get(), _evo_cls)
-            # Issue #164: a DynamicExitPullback* name is not enough. Do
-            # not inject the MANDATORY knob block for a class the grid
-            # cannot read or rewrite.
+            # D1: the block lists only the knobs this class can rewrite.
+            # Fewer than 2 rewritable grid knobs → no MANDATORY block,
+            # and the settle below excludes the class before the AI call.
             knob_note = saturday_knob_directives_if_eligible(
                 _evo_cls, _evo_source)
         holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
@@ -5330,19 +5339,24 @@ class BacktestApp:
                    if cut else len(result.trades))
         holdout_count = len(result.trades) - cut_idx
 
-        # Issue #164 option (iii): an ineligible class is deterministic.
-        # Record it once (class name + source hash), alert once, and
-        # advance the watermark. The same key returns here with no AI
-        # call and no second alert. A new hash falls through and is
-        # re-evaluated. No codegen fallback. Eligible classes are untouched.
+        # D1: per-class knob grid. A class with fewer than 2 rewritable
+        # grid knobs (or that cannot be read) is excluded from weekly
+        # codegen. Every Saturday emits one exclusion line. The same
+        # class + source + grid key does not re-record or move the
+        # watermark; a new source hash or grid hash is re-evaluated.
+        # knob_ineligible_fallback never selects weekly codegen.
+        # Eligible classes are untouched.
         if auto_run and _evo_cls is not None:
-            from src.evolution.knobs import settle_knob_ineligibility
+            from src.evolution.knobs import (
+                normalize_knob_ineligible_fallback, settle_knob_ineligibility)
+            _knob_fallback = normalize_knob_ineligible_fallback(
+                self._settings.get("evolution_knob_ineligible_fallback"))
             _knob_settle, _knob_reason = settle_knob_ineligibility(
-                bot_dir, _evo_cls, _evo_source, cut_idx)
-            if _knob_settle == "skip":
-                return
-            if _knob_settle == "recorded":
-                msg = f"🧬 EVO {_knob_reason}"
+                bot_dir, _evo_cls, _evo_source, cut_idx,
+                fallback=_knob_fallback)
+            if _knob_settle in ("skip", "recorded"):
+                msg = _knob_reason
+                _log(msg)
                 self._append_chat("system", msg)
                 if _discord is not None and _discord.enabled:
                     try:
@@ -5811,27 +5825,32 @@ class BacktestApp:
                 # Issue #153: an eligible class with an off-grid / structural
                 # plan is refused BEFORE the watermark, so that plan does
                 # not burn next week's delta.
-                # Issue #164 option (iii): an ineligible class is recorded
-                # once and the watermark advances. No codegen fallback.
+                # D1: an ineligible class is excluded from weekly codegen.
+                # The exclusion line is emitted every Saturday, including
+                # when this class+source+grid was already recorded.
                 # _bot_evolution settles this before the AI call; this is
                 # the backstop if a plan was already in hand.
                 _knob_apply = None
                 if auto_run and baseline_cls is not None:
                     from src.evolution.knobs import (
-                        is_knob_not_applicable_reason, saturday_knob_decision,
-                        settle_knob_ineligibility)
+                        is_knob_not_applicable_reason,
+                        normalize_knob_ineligible_fallback,
+                        saturday_knob_decision, settle_knob_ineligibility)
                     rejection, _knob_apply = saturday_knob_decision(
                         baseline_cls.__name__, directives.get("knobs"),
                         baseline_cls, strategy_source)
                     if rejection:
                         if is_knob_not_applicable_reason(rejection):
+                            _knob_fallback = normalize_knob_ineligible_fallback(
+                                self._settings.get(
+                                    "evolution_knob_ineligible_fallback"))
                             action, why = settle_knob_ineligibility(
                                 bot_dir, baseline_cls, strategy_source,
-                                design_cut_idx)
-                            if action == "recorded":
-                                msg = f"🧬 EVO {why}"
-                                ui(self._append_chat, "system", msg)
-                                _notify_discord(msg)
+                                design_cut_idx, fallback=_knob_fallback)
+                            if action in ("recorded", "skip") and why:
+                                ui(self._append_chat, "system", why)
+                                _notify_discord(why)
+                                _log(why)
                             return
                         msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
                         ui(self._append_chat, "system", msg)

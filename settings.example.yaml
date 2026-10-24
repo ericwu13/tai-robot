@@ -112,6 +112,11 @@ evolution:
   # window reports 100-226%. 0 / negative falls back to the default.
   # Not a credential; changing it only rescales evolution scores.
   capital_base_twd: 100000
+  # Classes with fewer than 2 rewritable Saturday-grid knobs are excluded
+  # from the weekly run. "none" (default) does not codegen them.
+  # "structural_lane" is reserved for a later monthly lane and also does
+  # not enable weekly codegen. Any other value is treated as "none".
+  knob_ineligible_fallback: "none"
   # 僅星期六自動演化：設計窗交易數低於此值時，不呼叫 AI 演化計畫
   # （0 次 AI 呼叫，水位線不前進），聊天室／Discord 顯示
   # waiting for sample: N/<門檻>。預設 30，與 fitness.MIN_TRADES 相同，
