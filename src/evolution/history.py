@@ -66,9 +66,13 @@ these names:
   → ``final_status=skip``
 * ``no_change`` → ``no_change``
 * ``refused`` — Saturday knob plan refused on an eligible class
-* ``plan_unusable``, ``grid_no_pick``, ``no_source``, ``knob_apply``,
-  ``codegen``, ``insufficient_bars``, ``validation``, ``pipeline_error``
-  → ``fail`` or, for a clean validation pass, ``pass``
+* ``plan_unusable``, ``grid_no_pick``, ``grid_failed``, ``no_source``,
+  ``knob_apply``, ``codegen``, ``insufficient_bars``, ``validation``,
+  ``pipeline_error``
+  → ``fail`` or, for a clean validation pass, ``pass``.
+  ``grid_failed`` is a sweep that produced no trial evidence because
+  the subprocess timed out, crashed, or was stopped. Same exit as
+  ``grid_no_pick``: watermark unchanged, model not asked to pick.
 
 A write error is logged and swallowed. Each record is one
 ``write()`` of a complete line in binary append mode, then ``flush``.

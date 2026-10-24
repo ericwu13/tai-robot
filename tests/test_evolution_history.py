@@ -934,6 +934,9 @@ def test_grid_no_pick_appends_a_history_line(tmp_path, monkeypatch):
     _patch_validation(monkeypatch, passed=True)
     monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
     app = _validation_app(tmp_path, chat, paper_gate="relative")
+    # The monkeypatch replaces run_grid_on_bars in this process. The
+    # live default would spawn a child that cannot see the patch.
+    app._grid_in_process = True
     rb.BacktestApp._start_evolution_pipeline(
         app, "preamble", ["design trade"], "", app._result,
         auto_run=False, holdout_days=14, bot_dir=str(tmp_path),
