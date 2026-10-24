@@ -140,23 +140,24 @@ def test_spawn_process_exits_before_gui():
 
 
 def test_grid_smoke_process_does_not_enter_gui():
-    """The smoke flag must finish (not sit in the Tk mainloop).
+    """The smoke flag finishes in grid_smoke, not in the Tk mainloop.
 
-    grid_smoke.py arrives with #194. Until then the process exits on the
-    import, still before Tk. Either way it must not hang.
+    ``--payload-bytes`` is not a GridOutcome, so #194's smoke exits 1.
+    The router must not swallow the flag and open the GUI.
     """
     import subprocess
     proc = subprocess.run(
         [sys.executable, str(REPO / "run_backtest.py"),
-         "--grid-subprocess-smoke"],
-        cwd=REPO, capture_output=True, text=True, timeout=30,
+         "--grid-subprocess-smoke", "--payload-bytes", "64",
+         "--timeout-s", "20"],
+        cwd=REPO, capture_output=True, text=True, timeout=40,
     )
     combined = proc.stdout + proc.stderr
     assert "mainloop" not in combined
-    # Not the GUI path. #194's module is absent on this branch, so the
-    # import fails; once it exists the smoke main returns on its own.
-    if proc.returncode != 0:
-        assert "grid_smoke" in combined
+    assert "Traceback" not in combined
+    assert proc.returncode == 1
+    assert "grid-smoke: mode=payload" in combined
+    assert "not a grid outcome" in combined
 
 
 def test_comtypes_hook_skips_only_spawn_and_smoke():
@@ -388,6 +389,25 @@ def test_redeploy_recipe_names_exe_and_source_headless():
     assert "semi_auto" in text
     assert "GUI" in text
     assert "mode_override.json" in text
+
+
+def test_v2199_checklist_is_one_combined_oreopie_run():
+    text = (REPO / "docs/testing/v2199_combined_windows_checklist.md").read_text(
+        encoding="utf-8")
+    assert "C:\\tai-test-177\\" in text
+    assert ".venv-build\\Scripts\\python.exe" in text
+    assert "pip install -e ." in text
+    assert "requirements-build.txt" in text
+    assert "build_release.py --skip-release" in text
+    assert "--payload-bytes 131072" in text
+    assert "--mode paper" in text
+    assert "ExecutablePath" in text
+    assert "Stop-Process -Id" in text
+    assert "taskkill /IM tai_backtest.exe" in text
+    assert "README.txt" in text
+    assert "_comtypes_cache" in text
+    assert "needs Eric's go-ahead" in text
+    assert "Do not run `Activate.ps1`" in text
 
 
 def test_install_notes_document_headless_exe():
