@@ -682,4 +682,22 @@ def test_hook_source_calls_guarded_helper():
     assert "def ensure_comtypes_gen" in src
     assert "e.name != 'comtypes.gen'" in src
     assert "e.name != 'comtypes'" in src
-    assert "ensure_comtypes_gen(cache_dir)" in src
+    guard = "if not _is_multiprocessing_child() and not _is_grid_smoke():"
+    call = "\n        ensure_comtypes_gen(cache_dir)\n"
+    assert src.count(call) == 1
+    assert src.index(call) > src.index(guard)
+
+
+def test_grid_checklist_builds_in_venv_build_not_system_python():
+    text = (
+        REPO / "docs/testing/grid_subprocess_windows_checklist.md"
+    ).read_text(encoding="utf-8")
+    assert ".venv-build\\Scripts\\python.exe" in text
+    assert "pip install -e ." in text
+    assert "--install-build-deps" in text
+    assert "cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb" in text
+    assert "Do not run `Activate.ps1`" in text
+    assert ".\\.venv\\Scripts\\Activate.ps1" not in text
+    assert "py -3.13 -m venv .venv-build" in text
+    assert "py -3.13 -m venv .venv\n" not in text
+    assert "python build_release.py" not in text
