@@ -185,6 +185,8 @@ evolution:
   holdout_days: 14         # most-recent-N-days withheld from the AI and used as the OOS test window
   min_design_trades: 30    # automatic path only: skip the plan call below this count; 0 disables
   idle_warn_days: 7        # watermark-skip idle line; 0 disables the line
+  knob_ineligible_fallback: "none"  # "none" (default) | "structural_lane"
+                                    # neither value enables weekly codegen
 
 trading:
   allow_live_override: false   # NOTE: lives under `trading:`, not `evolution:`
@@ -198,6 +200,7 @@ trading:
 | `evolution.validation` | `"deep"` | Validation method (see §6). `"simple"` skips the walk-forward split and Monte Carlo. |
 | `evolution.min_design_trades` | `30` | Saturday/automatic path only: skip the AI plan call while the design window has fewer trades than this (`waiting for sample: N/<threshold>`, 0 AI calls, watermark unchanged). The manual Evolve button is exempt and logs `below min_design_trades (N/30), manual override`. `0` disables the check. Does not change the fitness `MIN_TRADES` gate. |
 | `evolution.idle_warn_days` | `7` | On a watermark skip, append `idle N days since last exit <date>` when the last exit is at least this many calendar days ago. `0` disables the line. |
+| `evolution.knob_ineligible_fallback` | `"none"` | Weekly handling of a knob-grid class with fewer than 2 rewritable knobs. `"none"` excludes it and logs `excluded: <class> — <reason>; fallback=none` every Saturday. `"structural_lane"` only changes that logged mode; it does not enable weekly codegen. |
 | **`trading.allow_live_override`** | `false` | **Not an evolution key.** It gates the live **hot-swap mode switch** — whether a `mode_override.json` file (or the UI) may switch the running bot to fully-automatic `auto` mode. Documented here because it governs how much autonomy a live bot has; evolution itself never deploys or switches modes. |
 
 ---

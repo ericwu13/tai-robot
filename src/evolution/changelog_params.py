@@ -2,8 +2,10 @@
 
 Two sources, chosen by the path that produced the candidate:
 
-* Knob path — the allowlisted defaults read off the baseline instance,
-  and those defaults with the applied knob dict merged on top.
+* Knob path — the allowlisted defaults read off the baseline instance
+  for the class's effective grid (``class_knob_eligibility``), and those
+  defaults with the applied knob dict merged on top. A knob the class
+  does not expose is not read, so it cannot raise ``KeyError``.
 * Codegen path — public class-body assignments whose values are
   literals. ``__init__`` signature defaults and ``kwargs.get`` defaults
   are not class-level; they are left out. When a side cannot be parsed,
@@ -16,6 +18,7 @@ becomes ``None`` plus a reason so the changelog write still happens.
 from __future__ import annotations
 
 import ast
+import inspect
 from typing import Any
 
 _MISSING = object()
@@ -38,7 +41,8 @@ def evolution_changelog_params(
     """
     try:
         if isinstance(knob_apply, dict) and knob_apply:
-            return _knob_params(baseline_cls, knob_apply)
+            return _knob_params(
+                baseline_cls, knob_apply, baseline_source or "")
         name = baseline_name or getattr(baseline_cls, "__name__", "") or ""
         return _codegen_params(
             baseline_source or "",
@@ -50,21 +54,45 @@ def evolution_changelog_params(
         return None, None, f"unparseable: {type(e).__name__}: {e}"
 
 
+def _eligibility_source(baseline_cls, baseline_source: str) -> str:
+    """Class text for ``class_knob_eligibility``.
+
+    ``inspect.getsource`` is the class itself. An exec'd strategy has
+    no retrievable source, so the caller-supplied text is the fallback.
+    A changelog call may pass an unrelated snippet as
+    ``baseline_source``; that must not hide knobs the class declares.
+    """
+    try:
+        got = inspect.getsource(baseline_cls)
+    except (OSError, TypeError):
+        got = ""
+    return got or (baseline_source or "")
+
+
 def _knob_params(
     baseline_cls: type | None,
     knob_apply: dict,
+    baseline_source: str = "",
 ) -> tuple[dict | None, dict | None, str | None]:
     if baseline_cls is None:
         return None, None, "unparseable: knob path has no baseline class"
-    from src.evolution.knobs import knob_grid_for, read_strategy_knobs
+    from src.evolution.knobs import (
+        class_knob_eligibility, knob_grid_for, read_strategy_knobs)
 
     class_name = getattr(baseline_cls, "__name__", "") or ""
     grid = knob_grid_for(class_name)
     if not grid:
         return None, None, (
             f"unparseable: no knob grid for {class_name or 'baseline'}")
+    # Effective grid only. The full master grid KeyErrors on a class
+    # that does not expose every key (atr_buffer_mult on a 3-knob class).
+    effective, reason = class_knob_eligibility(
+        baseline_cls, grid, _eligibility_source(baseline_cls, baseline_source))
+    if not effective:
+        detail = reason or "class exposes no rewritable grid knobs"
+        return None, None, f"unparseable: {detail}"
     try:
-        raw = read_strategy_knobs(baseline_cls, grid)
+        raw = read_strategy_knobs(baseline_cls, effective)
     except Exception as e:
         return None, None, (
             f"unparseable: could not read baseline knobs "

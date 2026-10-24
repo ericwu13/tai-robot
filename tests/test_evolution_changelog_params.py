@@ -22,19 +22,36 @@ def _use_changelog(monkeypatch, tmp_path):
     monkeypatch.setattr(cl, "_CHANGELOG_PATH", tmp_path / "changelog.json")
 
 
+class DynamicExitPullbackProbe:
+    """No-arg class exposing every allowlisted knob. Not a live bot.
+
+    Defaults are literal ``kwargs.get`` values so the per-class grid
+    includes every master-grid key. The class-body ``ema_period`` is a
+    decoy; the knob path reads the instance.
+    """
+
+    ema_period = 999
+
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 40)
+        self.atr_period = kwargs.get("atr_period", 10)
+        self.atr_stop_mult = kwargs.get("atr_stop_mult", 2.0)
+        self.atr_buffer_mult = kwargs.get("atr_buffer_mult", 0.3)
+
+
+class DynamicExitPullbackNoBuffer:
+    """Three literal knobs. No ``atr_buffer_mult`` — the 2.10 shape."""
+
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 50)
+        self.atr_period = kwargs.get("atr_period", 14)
+        self.atr_stop_mult = kwargs.get("atr_stop_mult", 2.5)
+
+
 def _knob_probe():
-    """No-arg class exposing every allowlisted knob. Not a live bot."""
-    defaults = {}
-    for key, options in DYNAMIC_EXIT_PULLBACK_GRID.items():
-        defaults[key] = options[0]
-
-    class DynamicExitPullbackProbe:
-        ema_period = 999  # class-level decoy; knob path reads the instance
-
-        def __init__(self, **kwargs):
-            for key, default in defaults.items():
-                setattr(self, key, kwargs.get(key, default))
-
+    """Instance defaults for the full-grid probe. Not a live bot."""
+    defaults = read_strategy_knobs(
+        DynamicExitPullbackProbe, DYNAMIC_EXIT_PULLBACK_GRID)
     return DynamicExitPullbackProbe, defaults
 
 
@@ -116,6 +133,35 @@ class TestEvolutionChangelogParams:
         loaded = load_changelog()
         assert loaded[0]["params_before"]
         assert loaded[0]["params_after"]["ema_period"] == applied_ema
+
+    def test_knob_path_omits_a_knob_the_class_lacks(self, tmp_path, monkeypatch):
+        """A class without atr_buffer_mult must not KeyError on the full grid.
+
+        The snapshot is the effective per-class grid only.
+        """
+        _use_changelog(monkeypatch, tmp_path)
+        entry = _record(
+            knob_apply={"ema_period": 60},
+            baseline_cls=DynamicExitPullbackNoBuffer,
+            baseline_source=_BASE_SOURCE,
+            candidate_source=_CAND_SOURCE,
+            candidate_name="AlphaEvo1",
+        )
+        assert entry["params_before"] == {
+            "ema_period": 50,
+            "atr_period": 14,
+            "atr_stop_mult": 2.5,
+        }
+        assert "atr_buffer_mult" not in entry["params_before"]
+        assert "atr_buffer_mult" not in entry["params_after"]
+        assert entry["params_after"]["ema_period"] == 60
+        assert entry["params_after"]["atr_period"] == 14
+        assert entry["params_after"]["atr_stop_mult"] == 2.5
+        assert "params_reason" not in entry
+        assert "KeyError" not in str(entry)
+        loaded = load_changelog()
+        assert "atr_buffer_mult" not in loaded[0]["params_before"]
+        assert loaded[0]["params_after"]["ema_period"] == 60
 
     def test_codegen_path_pass_entry_has_params(self, tmp_path, monkeypatch):
         _use_changelog(monkeypatch, tmp_path)

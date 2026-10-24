@@ -1,19 +1,17 @@
-"""Issue #164 — a custom DynamicExitPullback* without every grid knob.
+"""Issue #164 / D1 — per-class knob grids, not all-or-nothing.
 
 Knob-mode eligibility used to be ``"DynamicExitPullback" in class_name``.
 ``read_strategy_knobs`` then raised ``KeyError: 'atr_buffer_mult'`` for a
 V3-like class, and the Saturday run stopped before the watermark with a
 cryptic refusal that repeated every week.
 
-These tests fail against the pre-fix ``knobs.py``: ``knob_mode_ineligible``
-did not exist, and ``saturday_knob_decision`` returned
-``could not read baseline knobs (KeyError: 'atr_buffer_mult')``.
-
-Option (iii): an ineligible class is recorded once as ``not applicable``,
-keyed on class name plus source hash, and the watermark advances. The
-same key is not retried or re-alerted. A new hash is re-evaluated.
-No codegen fallback. Off-grid refusals on an eligible class still stop
-before the watermark.
+D1: the grid is the knobs the class actually exposes. V3 (ema_period,
+atr_period, atr_stop_mult) is eligible on that 3-knob grid. A class with
+fewer than 2 rewritable grid knobs is still recorded as ``not applicable``
+(class + source hash + grid hash) and the watermark advances once. Every
+later Saturday repeats ``excluded: <class> — <reason>; fallback=<mode>``
+and does not codegen. A new source hash or grid hash is re-evaluated.
+Off-grid refusals on an eligible class still stop before the watermark.
 """
 
 from __future__ import annotations
@@ -30,6 +28,8 @@ import run_backtest as rb
 from src.evolution.knobs import (
     DYNAMIC_EXIT_PULLBACK_GRID,
     KNOB_NOT_APPLICABLE,
+    class_knob_eligibility,
+    format_knob_exclusion_line,
     knob_applicability_key,
     knob_mode_ineligible,
     load_knob_not_applicable,
@@ -39,10 +39,7 @@ from src.evolution.knobs import (
 )
 from src.evolution.notify import load_watermark
 
-_V3_REASON = (
-    "knob mode not applicable: DynamicExitPullbackV3 lacks knobs "
-    "[atr_buffer_mult]; skipping knob mode"
-)
+_V3_GRID_KEYS = ("ema_period", "atr_period", "atr_stop_mult")
 
 
 class DynamicExitPullbackV3:
@@ -57,6 +54,19 @@ class DynamicExitPullbackMissingTwo:
     def __init__(self, **kwargs):
         self.ema_period = kwargs.get("ema_period", 50)
         self.atr_period = kwargs.get("atr_period", 14)
+
+
+class DynamicExitPullbackOneKnob:
+    """One rewritable grid knob — below the D1 minimum of 2."""
+
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 50)
+
+
+_ONE_KNOB_REASON = (
+    "knob mode not applicable: DynamicExitPullbackOneKnob has 1 "
+    "rewritable grid knob [ema_period] (need >= 2); skipping knob mode"
+)
 
 
 _COMPUTED_KNOB = 50
@@ -114,6 +124,12 @@ _IN_MEMORY_V3 = _IN_MEMORY_V2.replace(
     "",
 )
 
+_IN_MEMORY_ONE = textwrap.dedent("""\
+class DynamicExitPullbackInMemory:
+    def __init__(self, **kwargs):
+        self.ema_period = kwargs.get("ema_period", 50)
+""")
+
 
 def _exec_in_memory(source: str):
     namespace: dict = {}
@@ -122,29 +138,38 @@ def _exec_in_memory(source: str):
 
 
 class TestKnobModeIneligible:
-    def test_v3_missing_buffer_is_a_clear_refusal_not_keyerror(self):
-        reason = knob_mode_ineligible(
-            DynamicExitPullbackV3, DYNAMIC_EXIT_PULLBACK_GRID,
-            inspect.getsource(DynamicExitPullbackV3))
-        assert reason == _V3_REASON
-        assert "KeyError" not in reason
-        # A one-knob change that would be legal on V2 is not a partial grid.
+    def test_v3_missing_buffer_is_a_three_knob_grid_not_keyerror(self):
+        source = inspect.getsource(DynamicExitPullbackV3)
+        effective, reason = class_knob_eligibility(
+            DynamicExitPullbackV3, DYNAMIC_EXIT_PULLBACK_GRID, source)
+        assert reason == ""
+        assert tuple(effective) == _V3_GRID_KEYS
+        assert "atr_buffer_mult" not in effective
+        assert knob_mode_ineligible(
+            DynamicExitPullbackV3, DYNAMIC_EXIT_PULLBACK_GRID, source) == ""
         decision, applied = saturday_knob_decision(
             "DynamicExitPullbackV3", {"ema_period": 60},
             DynamicExitPullbackV3)
-        assert applied is None
-        assert decision == _V3_REASON
-        assert decision
+        assert decision == ""
+        assert applied == {"ema_period": 60}
+        assert "KeyError" not in decision
+        refused, not_applied = saturday_knob_decision(
+            "DynamicExitPullbackV3", {"atr_buffer_mult": 0.5},
+            DynamicExitPullbackV3)
+        assert not_applied is None
+        assert "not allowlisted" in refused
 
-    def test_missing_knobs_are_listed_in_grid_order(self):
-        reason, applied = saturday_knob_decision(
+    def test_two_exposed_knobs_are_eligible_in_grid_order(self):
+        source = inspect.getsource(DynamicExitPullbackMissingTwo)
+        effective, reason = class_knob_eligibility(
+            DynamicExitPullbackMissingTwo, DYNAMIC_EXIT_PULLBACK_GRID, source)
+        assert reason == ""
+        assert list(effective) == ["ema_period", "atr_period"]
+        decision, applied = saturday_knob_decision(
             "DynamicExitPullbackMissingTwo", {"ema_period": 60},
             DynamicExitPullbackMissingTwo)
-        assert applied is None
-        assert reason == (
-            "knob mode not applicable: DynamicExitPullbackMissingTwo "
-            "lacks knobs [atr_stop_mult, atr_buffer_mult]; skipping knob mode"
-        )
+        assert decision == ""
+        assert applied == {"ema_period": 60}
 
     def test_nonliteral_defaults_are_ineligible(self):
         inst = DynamicExitPullbackNonLiteral()
@@ -154,9 +179,10 @@ class TestKnobModeIneligible:
         reason = knob_mode_ineligible(
             DynamicExitPullbackNonLiteral, DYNAMIC_EXIT_PULLBACK_GRID, source)
         assert reason == (
-            "knob mode not applicable: DynamicExitPullbackNonLiteral lacks "
-            "a literal kwargs.get default for knobs [ema_period, "
-            "atr_period, atr_stop_mult, atr_buffer_mult]; skipping knob mode"
+            "knob mode not applicable: DynamicExitPullbackNonLiteral has 0 "
+            "rewritable grid knobs [] (need >= 2); not rewritable "
+            "[ema_period, atr_period, atr_stop_mult, atr_buffer_mult]; "
+            "skipping knob mode"
         )
         decision, applied = saturday_knob_decision(
             "DynamicExitPullbackNonLiteral", {"ema_period": 60},
@@ -165,16 +191,19 @@ class TestKnobModeIneligible:
         assert decision == reason
         assert "KeyError" not in decision
 
-    def test_only_nonliteral_knobs_are_named(self):
+    def test_nonliteral_knob_drops_out_of_an_otherwise_eligible_grid(self):
         source = inspect.getsource(DynamicExitPullbackBufferComputed)
-        reason = knob_mode_ineligible(
+        effective, reason = class_knob_eligibility(
             DynamicExitPullbackBufferComputed, DYNAMIC_EXIT_PULLBACK_GRID,
             source)
-        assert reason == (
-            "knob mode not applicable: DynamicExitPullbackBufferComputed "
-            "lacks a literal kwargs.get default for knobs "
-            "[atr_buffer_mult]; skipping knob mode"
-        )
+        assert reason == ""
+        assert list(effective) == ["ema_period", "atr_period", "atr_stop_mult"]
+        assert "atr_buffer_mult" not in effective
+        decision, applied = saturday_knob_decision(
+            "DynamicExitPullbackBufferComputed", {"ema_period": 60},
+            DynamicExitPullbackBufferComputed, source)
+        assert decision == ""
+        assert applied == {"ema_period": 60}
 
     def test_instantiation_failure_is_ineligible(self):
         reason = knob_mode_ineligible(
@@ -228,19 +257,17 @@ class TestKnobModeIneligible:
         assert ok == ""
         assert knobs == {"ema_period": 60}
 
-    def test_in_memory_source_missing_buffer_is_the_clear_refusal(self):
+    def test_in_memory_source_missing_buffer_keeps_the_three_knob_grid(self):
         assert "atr_buffer_mult" not in _IN_MEMORY_V3
         cls = _exec_in_memory(_IN_MEMORY_V3)
-        reason = (
-            "knob mode not applicable: DynamicExitPullbackInMemory "
-            "lacks knobs [atr_buffer_mult]; skipping knob mode"
-        )
-        assert knob_mode_ineligible(
-            cls, DYNAMIC_EXIT_PULLBACK_GRID, _IN_MEMORY_V3) == reason
+        effective, reason = class_knob_eligibility(
+            cls, DYNAMIC_EXIT_PULLBACK_GRID, _IN_MEMORY_V3)
+        assert reason == ""
+        assert tuple(effective) == _V3_GRID_KEYS
         decision, applied = saturday_knob_decision(
             cls.__name__, {"ema_period": 60}, cls, _IN_MEMORY_V3)
-        assert applied is None
-        assert decision == reason
+        assert decision == ""
+        assert applied == {"ema_period": 60}
         assert "KeyError" not in decision
 
     def test_raising_knob_property_is_a_refusal_not_an_error(self):
@@ -259,18 +286,23 @@ class TestKnobModeIneligible:
 
 
 class TestKnobPromptGate:
-    def test_prompt_omits_knob_directives_for_ineligible_class(self):
-        source = inspect.getsource(DynamicExitPullbackV3)
-        note = saturday_knob_directives_if_eligible(
-            DynamicExitPullbackV3, source)
-        assert note == ""
-        assert "MANDATORY" not in note
+    def test_prompt_uses_the_class_grid_and_omits_ineligible_classes(self):
+        one = saturday_knob_directives_if_eligible(
+            DynamicExitPullbackOneKnob,
+            inspect.getsource(DynamicExitPullbackOneKnob))
+        assert one == ""
+        v3_note = saturday_knob_directives_if_eligible(
+            DynamicExitPullbackV3, inspect.getsource(DynamicExitPullbackV3))
+        assert "Saturday auto knob mode (MANDATORY on this weekly run)" in v3_note
+        assert "atr_stop_mult" in v3_note
+        assert "atr_buffer_mult" not in v3_note
         from dynamic_exit_pullback_strategy_v2 import (
             DynamicExitPullbackStrategyV2)
         v2_note = saturday_knob_directives_if_eligible(
             DynamicExitPullbackStrategyV2,
             inspect.getsource(DynamicExitPullbackStrategyV2))
         assert "Saturday auto knob mode (MANDATORY on this weekly run)" in v2_note
+        assert "atr_buffer_mult" in v2_note
         src = textwrap.dedent(inspect.getsource(rb.BacktestApp._bot_evolution))
         assert "saturday_knob_directives_if_eligible" in src
         assert "knob_note = saturday_knob_directives()" not in src
@@ -282,7 +314,8 @@ class TestKnobPromptGate:
         evo = textwrap.dedent(inspect.getsource(rb.BacktestApp._bot_evolution))
         assert evo.index("settle_knob_ineligibility") < evo.index(
             "No new design-window trades")
-        assert evo.index('== "skip"') < evo.index('== "recorded"')
+        # skip and recorded share one branch, so a repeat week still logs.
+        assert 'in ("skip", "recorded")' in evo
         assert evo.index("settle_knob_ineligibility") < evo.index(
             "_start_evolution_pipeline")
         src = textwrap.dedent(
@@ -307,67 +340,75 @@ class TestKnobPromptGate:
 _AT = "2026-10-17 05:05:00"
 
 
+def _one_knob_line(reason: str = _ONE_KNOB_REASON) -> str:
+    return format_knob_exclusion_line(
+        "DynamicExitPullbackOneKnob", reason, "none")
+
+
 class TestKnobNotApplicable:
     def test_ineligible_recorded_once_and_watermark_advances(self, tmp_path):
-        source = inspect.getsource(DynamicExitPullbackV3)
-        action, reason = settle_knob_ineligibility(
-            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+        source = inspect.getsource(DynamicExitPullbackOneKnob)
+        action, line = settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackOneKnob, source, 12, at=_AT)
         assert action == "recorded"
-        assert reason == _V3_REASON
+        assert line == _one_knob_line()
         rec = load_knob_not_applicable(tmp_path)
-        key = knob_applicability_key("DynamicExitPullbackV3", source)
+        key = knob_applicability_key("DynamicExitPullbackOneKnob", source)
         assert rec["outcome"] == KNOB_NOT_APPLICABLE == "not applicable"
         assert rec["class_name"] == key["class_name"]
         assert rec["source_hash"] == key["source_hash"]
-        assert rec["reason"] == _V3_REASON
+        assert rec["grid_hash"] == key["grid_hash"]
+        assert rec["reason"] == _ONE_KNOB_REASON
+        assert rec["fallback"] == "none"
         assert rec["at"] == _AT
         assert load_watermark(tmp_path) == {"trade_count": 12, "at": _AT}
 
-    def test_second_run_same_key_skips_silently(self, tmp_path):
-        source = inspect.getsource(DynamicExitPullbackV3)
+    def test_second_run_same_key_logs_again_without_rerecording(self, tmp_path):
+        source = inspect.getsource(DynamicExitPullbackOneKnob)
         settle_knob_ineligibility(
-            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+            tmp_path, DynamicExitPullbackOneKnob, source, 12, at=_AT)
         rec = load_knob_not_applicable(tmp_path)
         mark = load_watermark(tmp_path)
-        action, reason = settle_knob_ineligibility(
-            tmp_path, DynamicExitPullbackV3, source, 40,
+        action, line = settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackOneKnob, source, 40,
             at="2026-10-24 05:05:00")
         assert action == "skip"
-        assert reason == ""
+        assert line == _one_knob_line()
         assert load_knob_not_applicable(tmp_path) == rec
         assert load_watermark(tmp_path) == mark
 
     def test_source_hash_change_reevaluates(self, tmp_path):
-        source = inspect.getsource(DynamicExitPullbackV3)
+        source = inspect.getsource(DynamicExitPullbackOneKnob)
         settle_knob_ineligibility(
-            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+            tmp_path, DynamicExitPullbackOneKnob, source, 12, at=_AT)
         edited = source + "\n# edited knob source\n"
         assert knob_applicability_key(
-            "DynamicExitPullbackV3", edited)["source_hash"] != (
+            "DynamicExitPullbackOneKnob", edited)["source_hash"] != (
             knob_applicability_key(
-                "DynamicExitPullbackV3", source)["source_hash"])
-        action, reason = settle_knob_ineligibility(
-            tmp_path, DynamicExitPullbackV3, edited, 18,
+                "DynamicExitPullbackOneKnob", source)["source_hash"])
+        action, line = settle_knob_ineligibility(
+            tmp_path, DynamicExitPullbackOneKnob, edited, 18,
             at="2026-10-24 05:05:00")
         assert action == "recorded"
-        assert reason == _V3_REASON
+        assert line == _one_knob_line()
         rec = load_knob_not_applicable(tmp_path)
-        assert rec["class_name"] == "DynamicExitPullbackV3"
+        assert rec["class_name"] == "DynamicExitPullbackOneKnob"
         assert rec["source_hash"] == knob_applicability_key(
-            "DynamicExitPullbackV3", edited)["source_hash"]
+            "DynamicExitPullbackOneKnob", edited)["source_hash"]
         assert rec["outcome"] == "not applicable"
         assert load_watermark(tmp_path)["trade_count"] == 18
 
     def test_class_name_is_part_of_the_key(self, tmp_path):
-        source = inspect.getsource(DynamicExitPullbackV3)
+        source = inspect.getsource(DynamicExitPullbackOneKnob)
         settle_knob_ineligibility(
-            tmp_path, DynamicExitPullbackV3, source, 12, at=_AT)
+            tmp_path, DynamicExitPullbackOneKnob, source, 12, at=_AT)
         other = type(
-            "DynamicExitPullbackOther", (DynamicExitPullbackV3,), {})
-        action, reason = settle_knob_ineligibility(
+            "DynamicExitPullbackOther", (DynamicExitPullbackOneKnob,), {})
+        action, line = settle_knob_ineligibility(
             tmp_path, other, source, 15, at="2026-10-24 05:05:00")
         assert action == "recorded"
-        assert "lacks knobs [atr_buffer_mult]" in reason
+        assert "DynamicExitPullbackOther" in line
+        assert "has 1 rewritable grid knob [ema_period]" in line
         assert load_knob_not_applicable(tmp_path)["class_name"] == (
             "DynamicExitPullbackOther")
 
@@ -375,8 +416,8 @@ class TestKnobNotApplicable:
         from dynamic_exit_pullback_strategy_v2 import (
             DynamicExitPullbackStrategyV2)
         settle_knob_ineligibility(
-            tmp_path, DynamicExitPullbackV3,
-            inspect.getsource(DynamicExitPullbackV3), 12, at=_AT)
+            tmp_path, DynamicExitPullbackOneKnob,
+            inspect.getsource(DynamicExitPullbackOneKnob), 12, at=_AT)
         source = inspect.getsource(DynamicExitPullbackStrategyV2)
         action, reason = settle_knob_ineligibility(
             tmp_path, DynamicExitPullbackStrategyV2, source, 99,
@@ -385,18 +426,19 @@ class TestKnobNotApplicable:
         assert reason == ""
         assert load_watermark(tmp_path)["trade_count"] == 12
         assert load_knob_not_applicable(tmp_path)["class_name"] == (
-            "DynamicExitPullbackV3")
+            "DynamicExitPullbackOneKnob")
         ok, knobs = saturday_knob_decision(
             "DynamicExitPullbackStrategyV2", {"ema_period": 60},
             DynamicExitPullbackStrategyV2, source)
         assert ok == ""
         assert knobs == {"ema_period": 60}
-        # The edited in-memory class is eligible, so the old record
-        # does not keep it skipped and the watermark stays put.
+        # An eligible class is not kept skipped by an older record, and
+        # the watermark stays put. A still-ineligible in-memory class
+        # re-records.
         good = _exec_in_memory(_IN_MEMORY_V2)
-        bad = _exec_in_memory(_IN_MEMORY_V3)
+        bad = _exec_in_memory(_IN_MEMORY_ONE)
         again, _ = settle_knob_ineligibility(
-            tmp_path, bad, _IN_MEMORY_V3, 12, at=_AT)
+            tmp_path, bad, _IN_MEMORY_ONE, 12, at=_AT)
         assert again == "recorded"
         action, reason = settle_knob_ineligibility(
             tmp_path, good, _IN_MEMORY_V2, 40, at="2026-10-24 05:05:00")
@@ -411,20 +453,20 @@ class TestKnobNotApplicable:
 class DynamicExitPullbackStub:
     """Ineligible live class for the ``_bot_evolution`` / backstop calls.
 
-    Missing ``atr_buffer_mult`` — the same shape as the #164 V3 report.
+    One rewritable grid knob, so weekly codegen must not run.
     """
 
     def __init__(self, **kwargs):
         self.ema_period = kwargs.get("ema_period", 50)
-        self.atr_period = kwargs.get("atr_period", 14)
-        self.atr_stop_mult = kwargs.get("atr_stop_mult", 2.5)
 
 
 _STUB_SOURCE = inspect.getsource(DynamicExitPullbackStub)
 _STUB_REASON = (
-    "knob mode not applicable: DynamicExitPullbackStub lacks knobs "
-    "[atr_buffer_mult]; skipping knob mode"
+    "knob mode not applicable: DynamicExitPullbackStub has 1 "
+    "rewritable grid knob [ema_period] (need >= 2); skipping knob mode"
 )
+_STUB_LINE = format_knob_exclusion_line(
+    "DynamicExitPullbackStub", _STUB_REASON, "none")
 # Usable action=change plan. The backstop sits after this plan call;
 # codegen (``one_shot``) must not run for an ineligible class.
 _CHANGE_PLAN = (
@@ -573,15 +615,15 @@ class TestKnobSettleWiring:
         assert mark is not None and mark["trade_count"] == 1
         assert chat.send_message.call_count == 0
         assert chat.one_shot.call_count == 0
-        assert app.chat == [("system", f"🧬 EVO {_STUB_REASON}")]
-        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
+        assert app.chat == [("system", _STUB_LINE)]
+        assert discord.msgs == [_STUB_LINE]
 
         rb.BacktestApp._bot_evolution(app, auto_run=True)
 
         assert load_knob_not_applicable(tmp_path) == rec
         assert load_watermark(tmp_path) == mark
-        assert app.chat == [("system", f"🧬 EVO {_STUB_REASON}")]
-        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
+        assert app.chat == [("system", _STUB_LINE), ("system", _STUB_LINE)]
+        assert discord.msgs == [_STUB_LINE, _STUB_LINE]
         assert chat.send_message.call_count == 0
         assert chat.one_shot.call_count == 0
 
@@ -613,7 +655,7 @@ class TestKnobSettleWiring:
         mark = load_watermark(bot_dir)
         assert mark is not None and mark["trade_count"] == 4
         assert chat.one_shot.call_count == 0
-        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
+        assert discord.msgs == [_STUB_LINE]
         assert not any("Saturday knob mode refused" in m for m in discord.msgs)
         assert sum(1 for _role, text in app.chat if _STUB_REASON in text) == 1
 
@@ -625,8 +667,8 @@ class TestKnobSettleWiring:
         assert load_knob_not_applicable(bot_dir) == rec
         assert load_watermark(bot_dir) == mark
         assert chat.one_shot.call_count == 0
-        assert discord.msgs == [f"🧬 EVO {_STUB_REASON}"]
-        assert sum(1 for _role, text in app.chat if _STUB_REASON in text) == 1
+        assert discord.msgs == [_STUB_LINE, _STUB_LINE]
+        assert sum(1 for _role, text in app.chat if _STUB_REASON in text) == 2
         assert not any(
             "Saturday knob mode refused" in text or "No new design-window" in text
             for _role, text in app.chat)

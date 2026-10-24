@@ -1,4 +1,4 @@
-"""Saturday allowlisted knob mode (issue #153).
+"""Saturday allowlisted knob mode (issue #153, #164, D1).
 
 Weekend auto-evolution must not codegen an off-grid stretch such as
 EMA 50→80. DynamicExitPullback* may change at most two knobs, and only
@@ -6,14 +6,31 @@ to the discrete values below. Structural edits escalate; they are not
 applied on the Saturday path.
 
 Issue #164: the class name is only a candidate. Knob mode applies when
-the class instantiates with no arguments, exposes every grid knob, and
-each knob has a literal ``kwargs.get`` default that
-``rewrite_knob_source`` can replace. An ineligible class is recorded
-once as ``not applicable``, keyed on class name plus source hash, and
-the watermark advances (option iii). The same key is not retried or
-re-alerted; a new hash is re-evaluated. There is no codegen fallback.
-Off-grid proposals on an eligible class still stop before the watermark.
-The substring grid match stays; an explicit class opt-in is a follow-up.
+the class instantiates with no arguments and each knob it rewrites has
+a literal ``kwargs.get`` default. An ineligible class is recorded as
+``not applicable`` and the watermark advances (option iii).
+
+D1: the Saturday grid is per class. It is the intersection of the master
+grid with the knobs that class exposes as literal ``kwargs.get``
+defaults, and the class needs at least ``MIN_CLASS_KNOBS`` (2) of them.
+A class that exposes ``ema_period``, ``atr_period``, and
+``atr_stop_mult`` (and not ``atr_buffer_mult``) gets that 3-knob grid.
+A class with fewer than 2 rewritable grid knobs is excluded from weekly
+codegen.
+
+The not-applicable cache key is class name + source hash + grid hash.
+The same key does not re-record or move the watermark, but every
+Saturday still emits ``excluded: <class> — <reason>; fallback=<mode>``.
+A new source hash or a new grid hash is re-evaluated, so widening the
+grid cannot leave a class stale-excluded. Eligibility is computed
+before the cache is consulted.
+
+``evolution.knob_ineligible_fallback`` is ``none`` (default) or
+``structural_lane``. Neither value selects the weekly codegen path.
+The structural lane itself is a later change; this module only records
+the configured mode on the exclusion line. Off-grid proposals on an
+eligible class still stop before the watermark. The substring grid
+match stays; an explicit class opt-in is a follow-up.
 """
 
 from __future__ import annotations
@@ -21,11 +38,23 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
 
+logger = logging.getLogger(__name__)
+
 MAX_AUTO_KNOBS = 2
+# Intersection of the master grid with the knobs a class can rewrite.
+# Fewer than this and the class is excluded from weekly codegen (D1).
+MIN_CLASS_KNOBS = 2
+
+# Weekly codegen stays off. ``structural_lane`` is recorded on the
+# exclusion line for a later monthly lane; it is not a Saturday path.
+FALLBACK_NONE = "none"
+FALLBACK_STRUCTURAL_LANE = "structural_lane"
+KNOB_INELIGIBLE_FALLBACK_DEFAULT = FALLBACK_NONE
 
 # 80 and 90 are intentionally absent — the #153 evo1 failure.
 DYNAMIC_EXIT_PULLBACK_GRID: dict[str, tuple] = {
@@ -104,60 +133,115 @@ def _knob_list(keys) -> str:
     return "[" + ", ".join(keys) + "]"
 
 
-def knob_mode_ineligible(strategy_cls, grid, source) -> str:
-    """``""`` when Saturday knob mode can read and rewrite ``strategy_cls``.
+def normalize_knob_ineligible_fallback(value) -> str:
+    """``structural_lane`` or ``none``.
 
-    Otherwise a reason: no-arg instantiation failed, a grid knob is
-    missing on the instance, reading a grid knob raised (anything other
-    than ``AttributeError``), or a grid knob has no literal
-    ``kwargs.get("key", <num>)`` default.
+    Any other spelling, including the retired ``codegen`` value, is
+    ``none``. This setting never selects weekly Saturday codegen.
+    """
+    text = str(value or "").strip().lower()
+    if text == FALLBACK_STRUCTURAL_LANE:
+        return FALLBACK_STRUCTURAL_LANE
+    return FALLBACK_NONE
+
+
+def format_knob_exclusion_line(class_name: str, reason: str,
+                               fallback: str | None = None) -> str:
+    """One Saturday line for a class excluded from weekly evolution."""
+    mode = normalize_knob_ineligible_fallback(fallback)
+    return f"excluded: {class_name} — {reason}; fallback={mode}"
+
+
+def knob_grid_hash(grid: dict | None) -> str:
+    """Stable id of a grid's keys and discrete values, in grid order."""
+    items = []
+    for key, values in (grid or {}).items():
+        items.append([
+            str(key),
+            [render_knob_default(str(key), v) for v in values],
+        ])
+    blob = json.dumps(items, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _few_knobs_reason(name: str, rewritable: list[str],
+                      not_rewritable: list[str]) -> str:
+    n = len(rewritable)
+    noun = "knob" if n == 1 else "knobs"
+    text = (f"knob mode not applicable: {name} has {n} "
+            f"rewritable grid {noun} {_knob_list(rewritable)} "
+            f"(need >= {MIN_CLASS_KNOBS})")
+    if not_rewritable:
+        text += f"; not rewritable {_knob_list(not_rewritable)}"
+    return text + "; skipping knob mode"
+
+
+def class_knob_eligibility(strategy_cls, grid, source) -> tuple[dict, str]:
+    """``(effective_grid, reason)`` for one class against ``grid``.
+
+    ``reason == ""`` when the class exposes at least ``MIN_CLASS_KNOBS``
+    rewritable grid knobs. ``effective_grid`` is those knobs, in master
+    grid order, with the master value tuples. A missing attribute is
+    not in the intersection. A knob with no literal ``kwargs.get``
+    default is not rewritable. No-arg instantiation failure, or a knob
+    whose getter raises, excludes the class (the refusal must not escape
+    ``saturday_knob_decision``).
     """
     name = getattr(strategy_cls, "__name__", None) or str(strategy_cls)
     try:
         inst = strategy_cls()
     except Exception as e:
-        return (f"knob mode not applicable: {name} no-arg instantiation "
-                f"failed ({type(e).__name__}: {e}); skipping knob mode")
-    missing = []
+        return {}, (f"knob mode not applicable: {name} no-arg instantiation "
+                    f"failed ({type(e).__name__}: {e}); skipping knob mode")
+    exposed: list[str] = []
     for key in grid:
         try:
             getattr(inst, key)
         except AttributeError:
-            missing.append(key)
+            continue
         except Exception as e:
             # Outside the instantiation try on purpose: a property that
             # raises RuntimeError must become a refusal, not an EVO ERROR
             # that escapes saturday_knob_decision (#164).
-            return (f"knob mode not applicable: {name} knob {key} "
-                    f"raised {type(e).__name__}; skipping knob mode")
-    if missing:
-        return (f"knob mode not applicable: {name} lacks knobs "
-                f"{_knob_list(missing)}; skipping knob mode")
-    nonliteral = [
-        key for key in grid
-        if not _has_literal_knob_default(source, key)
-    ]
-    if nonliteral:
-        return (f"knob mode not applicable: {name} lacks a literal "
-                f"kwargs.get default for knobs {_knob_list(nonliteral)}; "
-                f"skipping knob mode")
-    return ""
+            return {}, (f"knob mode not applicable: {name} knob {key} "
+                        f"raised {type(e).__name__}; skipping knob mode")
+        exposed.append(key)
+    text = source or ""
+    rewritable = [key for key in exposed if _has_literal_knob_default(text, key)]
+    not_rewritable = [key for key in exposed if key not in rewritable]
+    effective = {key: grid[key] for key in rewritable}
+    if len(rewritable) >= MIN_CLASS_KNOBS:
+        return effective, ""
+    return effective, _few_knobs_reason(name, rewritable, not_rewritable)
+
+
+def knob_mode_ineligible(strategy_cls, grid, source) -> str:
+    """``""`` when Saturday knob mode can read and rewrite ``strategy_cls``.
+
+    Otherwise a reason: no-arg instantiation failed, a grid knob's getter
+    raised (anything other than ``AttributeError``), or the class has
+    fewer than ``MIN_CLASS_KNOBS`` literal ``kwargs.get`` grid knobs.
+    """
+    _grid, reason = class_knob_eligibility(strategy_cls, grid, source)
+    return reason
 
 
 def saturday_knob_directives_if_eligible(strategy_cls, source: str) -> str:
-    """MANDATORY knob block, or ``""`` when the class is not knob-eligible.
+    """MANDATORY knob block for this class's grid, or ``""``.
 
-    The Saturday prompt must not demand a grid the class cannot satisfy
-    (issue #164).
+    The Saturday prompt lists only the knobs the class can rewrite
+    (D1). A class with fewer than ``MIN_CLASS_KNOBS`` gets no block.
     """
     if strategy_cls is None:
         return ""
     grid = knob_grid_for(getattr(strategy_cls, "__name__", None))
     if not grid:
         return ""
-    if knob_mode_ineligible(strategy_cls, grid, source or ""):
+    effective, reason = class_knob_eligibility(
+        strategy_cls, grid, source or "")
+    if reason or len(effective) < MIN_CLASS_KNOBS:
         return ""
-    return saturday_knob_directives()
+    return saturday_knob_directives(effective)
 
 
 def knob_proposal_rejection(proposal, baseline: dict, grid: dict,
@@ -206,13 +290,13 @@ def saturday_knob_decision(class_name, proposal, strategy_cls,
     """``(rejection, knobs_to_apply)``.
 
     Non-grid strategies return ``("", None)`` so the caller keeps codegen.
-    A grid class that cannot be instantiated, is missing a grid knob, or
-    has no literal ``kwargs.get`` default returns ``(reason, None)``.
-    The caller records that once and advances the watermark (issue #164,
-    option iii: no codegen fallback, no weekly retry of the same source).
-    A valid grid proposal returns ``("", {knob: value})``.
-    A refused Saturday plan on an eligible class returns ``(reason, None)``
-    and the caller stops before the watermark.
+    A grid class that cannot be instantiated, whose knob getter raises,
+    or that has fewer than ``MIN_CLASS_KNOBS`` rewritable grid knobs
+    returns ``(reason, None)``. The caller excludes it from weekly
+    codegen (D1; no Saturday codegen fallback). A valid proposal on the
+    class's own grid returns ``("", {knob: value})``. A refused Saturday
+    plan on an eligible class returns ``(reason, None)`` and the caller
+    stops before the watermark.
 
     ``source`` is the strategy text ``rewrite_knob_source`` would edit.
     ``None`` falls back to ``inspect.getsource`` so existing callers keep
@@ -223,20 +307,20 @@ def saturday_knob_decision(class_name, proposal, strategy_cls,
         return "", None
     if source is None:
         source = _class_source(strategy_cls)
-    # Before read_strategy_knobs: a missing knob used to raise KeyError
-    # and the cryptic refusal repeated every Saturday (#164).
-    reason = knob_mode_ineligible(strategy_cls, grid, source)
+    # Per-class grid: only knobs this class can rewrite. A missing
+    # attribute used to KeyError inside read_strategy_knobs (#164).
+    effective, reason = class_knob_eligibility(strategy_cls, grid, source)
     if reason:
         return reason, None
     try:
-        baseline = read_strategy_knobs(strategy_cls, grid)
+        baseline = read_strategy_knobs(strategy_cls, effective)
     except Exception as e:
         return (f"could not read baseline knobs "
                 f"({type(e).__name__}: {e}) — {_ESCALATE}", None)
-    reason = knob_proposal_rejection(proposal, baseline, grid)
+    reason = knob_proposal_rejection(proposal, baseline, effective)
     if reason:
         return reason, None
-    return "", changed_knobs(proposal, baseline, grid)
+    return "", changed_knobs(proposal, baseline, effective)
 
 
 def is_knob_not_applicable_reason(reason: str | None) -> bool:
@@ -244,10 +328,21 @@ def is_knob_not_applicable_reason(reason: str | None) -> bool:
     return (reason or "").startswith("knob mode not applicable:")
 
 
-def knob_applicability_key(class_name: str, source: str) -> dict[str, str]:
-    """Cache key: class name plus the sha256 of the strategy source."""
+def knob_applicability_key(class_name: str, source: str,
+                           grid: dict | None = None) -> dict[str, str]:
+    """Cache key: class name, source sha256, and the grid hash.
+
+    ``grid`` defaults to the master grid for ``class_name``. A change
+    to that grid must not reuse a not-applicable record (D1).
+    """
+    if grid is None:
+        grid = knob_grid_for(class_name) or {}
     digest = hashlib.sha256((source or "").encode("utf-8")).hexdigest()
-    return {"class_name": class_name or "", "source_hash": digest}
+    return {
+        "class_name": class_name or "",
+        "source_hash": digest,
+        "grid_hash": knob_grid_hash(grid),
+    }
 
 
 def knob_not_applicable_path(bot_dir) -> str:
@@ -272,24 +367,29 @@ def load_knob_not_applicable(bot_dir) -> dict | None:
 
 
 def _same_not_applicable(record: dict | None, class_name: str,
-                         source: str) -> bool:
+                         source: str, grid: dict | None) -> bool:
     if not record:
         return False
-    key = knob_applicability_key(class_name, source)
+    key = knob_applicability_key(class_name, source, grid)
     return (record.get("class_name") == key["class_name"]
-            and record.get("source_hash") == key["source_hash"])
+            and record.get("source_hash") == key["source_hash"]
+            and record.get("grid_hash") == key["grid_hash"])
 
 
 def save_knob_not_applicable(bot_dir, class_name: str, source: str,
-                             reason: str, at: str) -> dict:
-    """Write the one not-applicable outcome for this class and source."""
+                             reason: str, at: str,
+                             grid: dict | None = None,
+                             fallback: str | None = None) -> dict:
+    """Write the one not-applicable outcome for this class, source, and grid."""
     os.makedirs(os.fspath(bot_dir), exist_ok=True)
-    key = knob_applicability_key(class_name, source)
+    key = knob_applicability_key(class_name, source, grid)
     payload = {
         "outcome": KNOB_NOT_APPLICABLE,
         "class_name": key["class_name"],
         "source_hash": key["source_hash"],
+        "grid_hash": key["grid_hash"],
         "reason": reason,
+        "fallback": normalize_knob_ineligible_fallback(fallback),
         "at": at,
     }
     path = knob_not_applicable_path(bot_dir)
@@ -301,35 +401,51 @@ def save_knob_not_applicable(bot_dir, class_name: str, source: str,
 
 
 def settle_knob_ineligibility(bot_dir, strategy_cls, source: str,
-                              trade_count: int, at: str | None = None):
-    """``(action, reason)`` for one Saturday look at a live class.
+                              trade_count: int, at: str | None = None,
+                              fallback: str | None = None):
+    """``(action, line)`` for one Saturday look at a live class.
 
     ``action`` is ``not_grid`` (codegen stays available), ``eligible``
-    (knob mode proceeds; nothing is written), ``skip`` (this class and
-    source hash were already recorded — caller returns with no alert),
-    or ``recorded`` (first time, or a new hash: outcome stored, watermark
-    advanced, caller alerts once). No codegen fallback.
+    (knob mode proceeds; nothing is written), ``skip`` (this class,
+    source hash, and grid hash were already recorded — caller does not
+    re-record or move the watermark), or ``recorded`` (first time, or a
+    new source/grid hash: outcome stored, watermark advanced).
+
+    ``skip`` and ``recorded`` both return the weekly exclusion line and
+    log it. There is no weekly codegen fallback. ``fallback`` is only
+    the mode written on that line (``none`` or ``structural_lane``).
     """
+    mode = normalize_knob_ineligible_fallback(fallback)
     if strategy_cls is None:
         return "not_grid", ""
     name = getattr(strategy_cls, "__name__", "") or ""
     grid = knob_grid_for(name)
     if not grid:
         return "not_grid", ""
-    reason = knob_mode_ineligible(strategy_cls, grid, source or "")
+    source = source or ""
+    # Eligibility first. A stale not-applicable file must not keep a
+    # class excluded after its grid (or its exposed knobs) changes.
+    _effective, reason = class_knob_eligibility(strategy_cls, grid, source)
     if not reason:
         return "eligible", ""
-    source = source or ""
-    if bot_dir and _same_not_applicable(
-            load_knob_not_applicable(bot_dir), name, source):
-        return "skip", ""
-    if at is None:
-        at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
-    if bot_dir:
-        save_knob_not_applicable(bot_dir, name, source, reason, at)
-        from src.evolution.notify import save_watermark
-        save_watermark(bot_dir, int(trade_count), at=at)
-    return "recorded", reason
+    same = bool(bot_dir) and _same_not_applicable(
+        load_knob_not_applicable(bot_dir), name, source, grid)
+    if same:
+        stored = load_knob_not_applicable(bot_dir) or {}
+        reason = stored.get("reason") or reason
+        action = "skip"
+    else:
+        if at is None:
+            at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+        if bot_dir:
+            save_knob_not_applicable(
+                bot_dir, name, source, reason, at, grid=grid, fallback=mode)
+            from src.evolution.notify import save_watermark
+            save_watermark(bot_dir, int(trade_count), at=at)
+        action = "recorded"
+    line = format_knob_exclusion_line(name, reason, mode)
+    logger.info(line)
+    return action, line
 
 
 def iter_knob_candidates(baseline: dict, grid: dict | None = None,
@@ -378,28 +494,51 @@ def rewrite_knob_source(source: str, base_name: str, candidate_name: str,
     return text
 
 
-def saturday_knob_directives() -> str:
-    """Prompt trailer for the Saturday plan. No numeric holdout criteria."""
-    g = DYNAMIC_EXIT_PULLBACK_GRID
+def saturday_knob_directives(grid: dict | None = None) -> str:
+    """Prompt trailer for the Saturday plan. No numeric holdout criteria.
+
+    ``grid`` defaults to the full master grid, which keeps the V2 prompt
+    unchanged. A per-class grid omits knobs the class cannot rewrite.
+    """
+    g = DYNAMIC_EXIT_PULLBACK_GRID if grid is None else grid
+    if not g:
+        return ""
 
     def _vals(key: str) -> str:
         return ", ".join(render_knob_default(key, v) for v in g[key])
 
+    bullets = []
+    for key in g:
+        if key == "ema_period":
+            bullets.append(
+                f"- ema_period: {_vals('ema_period')} "
+                "(80 and 90 are out of auto)")
+        else:
+            bullets.append(f"- {key}: {_vals(key)}")
+    if "ema_period" in g:
+        example = '{"action": "change", "knobs": {"ema_period": 60}}'
+        ema_ban = "Do NOT propose ema_period 80 or 90.\n"
+    else:
+        example_key = next(iter(g))
+        example_val = render_knob_default(
+            example_key, g[example_key][-1])
+        example = (
+            '{"action": "change", "knobs": {'
+            f'"{example_key}": {example_val}'
+            "}}"
+        )
+        ema_ban = ""
     return (
         "## Saturday auto knob mode (MANDATORY on this weekly run)\n"
         "Apply an allowlisted discrete grid only. Change at most "
         f"{MAX_AUTO_KNOBS} knobs (prefer exactly one). "
         "Do not invent values between the grid points.\n"
-        f"- ema_period: {_vals('ema_period')} "
-        "(80 and 90 are out of auto)\n"
-        f"- atr_period: {_vals('atr_period')}\n"
-        f"- atr_stop_mult: {_vals('atr_stop_mult')}\n"
-        f"- atr_buffer_mult: {_vals('atr_buffer_mult')}\n"
+        + "\n".join(bullets) + "\n"
         "Put the change in the directives JSON, for example:\n"
         "```json\n"
-        '{"action": "change", "knobs": {"ema_period": 60}}\n'
+        f"{example}\n"
         "```\n"
         "Structural changes are not applied on Saturday: "
         f"{_ESCALATE}.\n"
-        "Do NOT propose ema_period 80 or 90.\n\n"
+        f"{ema_ban}\n"
     )
