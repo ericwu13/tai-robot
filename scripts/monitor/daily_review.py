@@ -3,6 +3,13 @@
     C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/daily_review.py [--discord]
                                                                                           [--settings PATH]
                                                                                           [--no-report-file]
+                                                                                          [--no-remote]
+
+Remote hosts (``scripts/monitor/remote.py``, configured only in the
+gitignored tailscale hosts file) are fetched over ssh and reviewed with
+the same checks; their sections are titled ``<SECTION> @<host>``.  When a
+remote host runs the news bridge, this PC's BRIDGE and N8N sections stand
+down — n8n here is stopped on purpose.
 
 Best run ~05:10-05:30 TPE, just after the night session closes and the
 regime classification/record pass has landed.  (The OS clock here is
@@ -35,6 +42,9 @@ from scripts.monitor.common import (  # noqa: E402
     Finding, bot_name, default_base_dir, discover_bot_dirs, fmt_findings,
     guard_stdout, load_settings, now_tpe, pid_alive, post_discord, read_json,
     read_lock_pid, redact, resolve_news_path, setting, verdict,
+)
+from scripts.monitor.remote import (  # noqa: E402
+    fetch_snapshot, load_hosts, relocated_bots, remote_sections,
 )
 
 HEALTH_URL = "http://localhost:5678/healthz"
@@ -147,16 +157,17 @@ def check_n8n(now):
 
 # ── summary ─────────────────────────────────────────────────────────────
 
-def _bot_one_liners(base_dir: str):
+def _bot_one_liners(base_dir: str, pid_alive_fn=pid_alive, exclude=(),
+                    suffix: str = ""):
     """Compact per-bot lines for LIVE bots only; the rest are counted.
 
     Liveness is the PID, not the lock file: ``data/live`` is full of
     retired bots whose lock was never cleaned.
     """
     running, idle = [], 0
-    for bot_dir in discover_bot_dirs(base_dir):
+    for bot_dir in discover_bot_dirs(base_dir, exclude):
         has_lock, pid = read_lock_pid(bot_dir)
-        if not has_lock or pid is None or not pid_alive(pid):
+        if not has_lock or pid is None or not pid_alive_fn(pid):
             idle += 1
             continue
         data = read_json(os.path.join(bot_dir, "session.json")) or {}
@@ -164,13 +175,13 @@ def _bot_one_liners(base_dir: str):
         leg = data.get("active_leg") or "-"
         strategy = data.get("strategy", "?")
         running.append(
-            f"• {bot_name(bot_dir)}: {leg}/{strategy} | "
+            f"• {bot_name(bot_dir)}{suffix}: {leg}/{strategy} | "
             f"{data.get('trading_mode', '?')} | pnl "
             f"{broker.get('_cumulative_pnl', 0):+} | lock pid {pid}")
     return running, idle
 
 
-def _bridge_one_liners(now, settings):
+def _bridge_one_liners(now, settings, suffix: str = ""):
     out = []
     try:
         from src.news.vote_status import vote_chip
@@ -184,23 +195,40 @@ def _bridge_one_liners(now, settings):
             sess.key if sess else "", now)
         for st in report.sources:
             flag = "STALE" if st.stale else ("?" if not st.known else "ok")
-            out.append(f"• {st.source} [{flag}] {vote_chip(st)}")
+            out.append(f"• {st.source}{suffix} [{flag}] {vote_chip(st)}")
     except Exception as exc:  # noqa: BLE001
         out.append(f"• bridge status unavailable ({type(exc).__name__})")
     return out
 
 
-def build_summary(now, grade: str, findings, base_dir: str, settings: dict) -> str:
+def build_summary(now, grade: str, findings, base_dir: str, settings: dict,
+                  remotes=()) -> str:
     """Discord-sized digest (<= 1900 chars), fully redacted."""
     parts = [f"{VERDICT_ICON.get(grade, '')} tai-robot daily review — "
              f"{now.strftime('%Y-%m-%d')} (TPE)"]
 
-    running, idle = _bot_one_liners(base_dir)
+    remotes = list(remotes)
+    running, idle = _bot_one_liners(
+        base_dir, exclude=relocated_bots(s.host for s in remotes))
+    for snap in remotes:
+        if snap.error:
+            running.append(f"• {snap.host.name}: UNREACHABLE — "
+                           f"{', '.join(snap.host.bots) or 'bridge'} unverified")
+            continue
+        more, _idle = _bot_one_liners(snap.live_dir, snap.pid_alive,
+                                      suffix=f"@{snap.host.name}")
+        running.extend(more)
     parts.extend(running[:MAX_SUMMARY_BOTS])
     if len(running) > MAX_SUMMARY_BOTS:
         parts.append(f"• …{len(running) - MAX_SUMMARY_BOTS} more running bots")
     parts.append(f"• {idle} idle bot dir(s) (no live lock)")
-    parts.extend(_bridge_one_liners(now, settings))
+    bridge_hosts = [s for s in remotes if s.host.runs_bridge]
+    if not bridge_hosts:
+        parts.extend(_bridge_one_liners(now, settings))
+    for snap in bridge_hosts:
+        if not snap.error:
+            parts.extend(_bridge_one_liners(now, snap.bridge_settings(),
+                                            suffix=f"@{snap.host.name}"))
 
     # P3 is informational (retired dirs, "suppressed by design") and would
     # crowd out the actionable rows — summarise it as a count only.
@@ -223,19 +251,55 @@ def build_summary(now, grade: str, findings, base_dir: str, settings: dict) -> s
     return text
 
 
-def run_review(now, settings: dict, base_dir: str):
-    """Run every check. Returns ``(grade, findings, full_report_text)``."""
+def _with_note(fn, note):
+    def run():
+        findings, lines = fn()
+        return findings, ([note] if note else []) + list(lines)
+    return run
+
+
+def _bridge_moved(hosts):
+    names = ", ".join(h.name for h in hosts)
+    return ([], [f"the news bridge (W1-W4) runs on {names} — see BRIDGE @{names}; "
+                 f"this PC's news.* files are no longer written"])
+
+
+def _n8n_moved(hosts):
+    names = ", ".join(h.name for h in hosts)
+    return ([], [f"n8n-service on this PC is intentionally stopped (Manual) since "
+                 f"the bridge moved to {names} as scheduled tasks — see "
+                 f"TASKS @{names}. Not checked."])
+
+
+def run_review(now, settings: dict, base_dir: str, remotes=()):
+    """Run every check. Returns ``(grade, findings, full_report_text)``.
+
+    ``remotes``: fetched ``RemoteSnapshot`` objects.  Bots they own are
+    excluded locally (the copy here is stale), and a remote bridge host
+    replaces this PC's BRIDGE/N8N sections.
+    """
     signal_path = resolve_news_path(setting(settings, "news.signal_path"), _REPO)
     bridge_dir = os.path.dirname(signal_path) if signal_path else ""
+    remotes = list(remotes)
+    moved = relocated_bots(s.host for s in remotes)
+    bridge_hosts = [s.host for s in remotes if s.host.runs_bridge]
+    note = (f"relocated (checked on their host, local copy ignored): "
+            f"{', '.join(sorted(moved))}" if moved else "")
 
     sections = [
-        ("BOTS", lambda: check_bots(now, base_dir)),
-        ("REGIME", lambda: check_regime(now, base_dir)),
-        ("BRIDGE", lambda: check_bridge(now, settings, base_dir)),
-        ("LOGS", lambda: check_logs(now, base_dir, bridge_dir)),
-        ("DEPLOY", lambda: check_deploy(settings, base_dir)),
-        ("N8N", lambda: check_n8n(now)),
+        ("BOTS", _with_note(lambda: check_bots(now, base_dir, exclude=moved), note)),
+        ("REGIME", _with_note(lambda: check_regime(now, base_dir, exclude=moved), note)),
+        ("BRIDGE", (lambda: _bridge_moved(bridge_hosts)) if bridge_hosts
+         else (lambda: check_bridge(now, settings, base_dir))),
+        ("LOGS", lambda: check_logs(now, base_dir, bridge_dir, exclude=moved,
+                                    scan_n8n=not bridge_hosts)),
+        ("DEPLOY", lambda: check_deploy(settings, base_dir, exclude=moved,
+                                        news_wiring=not bridge_hosts)),
+        ("N8N", (lambda: _n8n_moved(bridge_hosts)) if bridge_hosts
+         else (lambda: check_n8n(now))),
     ]
+    for snap in remotes:
+        sections.extend(remote_sections(now, snap))
 
     all_findings = []
     body = [f"# tai-robot daily review — {now.strftime('%Y-%m-%d %H:%M:%S')} TPE", ""]
@@ -267,16 +331,23 @@ def main() -> int:
     ap.add_argument("--settings", help="path to settings.yaml")
     ap.add_argument("--no-report-file", action="store_true",
                     help="skip writing data/monitor/daily_review_<date>.md")
+    ap.add_argument("--no-remote", action="store_true",
+                    help="skip the ssh fetch of remote hosts")
+    ap.add_argument("--hosts", help="path to the tailscale hosts file")
+    ap.add_argument("--base-dir", help="bot directory root (default: this "
+                                       "tree's data/live)")
     args = ap.parse_args()
 
     now = now_tpe()
     settings = load_settings(args.settings)
-    base_dir = default_base_dir()
+    base_dir = args.base_dir or default_base_dir()
+    remotes = [] if args.no_remote else [
+        fetch_snapshot(h) for h in load_hosts(args.hosts)]
 
-    grade, findings, report = run_review(now, settings, base_dir)
+    grade, findings, report = run_review(now, settings, base_dir, remotes)
     print(report)
 
-    summary = build_summary(now, grade, findings, base_dir, settings)
+    summary = build_summary(now, grade, findings, base_dir, settings, remotes)
     print("\n--- discord summary ---")
     print(summary)
 

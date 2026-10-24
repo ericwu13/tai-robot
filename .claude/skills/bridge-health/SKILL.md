@@ -13,6 +13,27 @@ Read-only over the paths in `settings.yaml` (`news.signal_path`,
 `news.regime_vote_path`, `news.events_path`, `news.rss_state_file`) —
 normally `C:\Users\eric8\n8n-bridge\`. Never consumes or deletes a vote.
 
+## Where the bridge runs (since 2026-10-24: the second trading PC)
+
+W1-W4 run as `\TaiRobot\Bridge-*` scheduled tasks on the host whose
+`monitor.bridge_dir` is set in the gitignored tailscale hosts file
+(`steven`). This PC's `C:\Users\eric8\n8n-bridge\` is no longer written,
+so `check_bridge.py` above reports a frozen copy. Check the live one:
+
+```bash
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/remote.py --check bridge
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/remote.py --check tasks
+```
+
+One ssh call fetches the bridge files (log tails only) into
+`data/monitor/remote/<host>/bridge/` with remote mtimes kept, then runs
+this same check over that copy — every rule below applies unchanged. The
+"consumed by" lookup reads the remote bots' `news_ledger.json`, which is
+where the consumer of that signal lives. `TASKS` adds: a task whose last
+result is not 0/running/queued, a Disabled task, or a traceback in its
+`task_<W>.last.log` = P2; host clock skew >5 min = P2; host unreachable
+= P1 (bridge UNVERIFIED, not proven dead).
+
 ## Rule zero — absence is not failure
 
 A missing vote file is the **normal resting state**:
@@ -62,11 +83,13 @@ Signal reject reasons split cleanly:
   and guessing the offset would turn an 8-hour-old signal into a fresh one.
 - An empty `news.regime_vote_path` in settings means votes are written but
   never consumed — see `deploy-check`.
-- Don't restart the n8n service casually while a night session is open
-  (15:00–05:00 TPE): it interrupts W2's 2-minute night-tier polling.
+- This PC's n8n-service is stopped on purpose since the move — never
+  start it (see `n8n-debug`). On the bridge host, don't re-run the W2
+  task casually while a night session is open (15:00–05:00 TPE).
 
 ## Next steps
 
-- a workflow actually failed / a cron never fired → the `n8n-debug` skill
-  (`status`, `execs --workflow W3 --errors`, `detail <id>`)
+- a task actually failed / never fired → `remote.py --check tasks`, then
+  the `n8n-debug` skill (its first section covers the scheduled tasks;
+  `status`/`execs`/`detail` cover pre-2026-10-24 n8n history)
 - votes arriving but the regime not moving → `regime-health`
