@@ -6,12 +6,15 @@ Designed to FAIL on pre-fix master:
   gate only annotated the prompt);
 * a watermark skip never mentioned how long the book had been idle.
 
-Default ``evolution.min_design_trades`` is 30 (fitness.MIN_TRADES).
-That skip is an approved behavior change for samples under the
-threshold. ``0`` disables it. Bots at or above the threshold keep the
-previous plan-call path. Fitness math and watermark advance rules are
-unchanged: a skip returns before any AI call and before any watermark
-write.
+Default ``evolution.min_design_trades`` is 30 (fitness.MIN_TRADES) on
+the Saturday/automatic path only. The manual Evolve button is exempt:
+it logs ``below min_design_trades (N/30), manual override`` and still
+calls the plan model. ``0`` disables the automatic check. Bots at or
+above the threshold keep the previous plan-call path.
+
+``evolution.idle_warn_days: 0`` disables the idle line. Fitness math
+and watermark advance rules are unchanged: an automatic skip returns
+before any AI call and before any watermark write.
 """
 
 from __future__ import annotations
@@ -181,8 +184,7 @@ def test_idle_notice_boundary_uses_calendar_days():
         "idle 7 days since last exit 2026-10-17")
     assert rb._evolution_idle_notice(
         [_trade("2026-10-18 00:01")], now, 7) == ""
-    assert rb._evolution_idle_notice(trades, now, 0) == (
-        "idle 7 days since last exit 2026-10-17")
+    assert rb._evolution_idle_notice(trades, now, 0) == ""
 
 
 def test_idle_notice_parses_seconds_and_ignores_future():
@@ -211,6 +213,7 @@ def test_eighteen_design_trades_skip_plan_call_and_keep_watermark(
     assert _ai_calls(chat) == 0, app.errors
     text = _chat_text(app)
     assert "waiting for sample: 18/30" in text
+    assert "manual override" not in text
     assert any("waiting for sample: 18/30" in m for m in discord.msgs)
     assert load_watermark(tmp_path) == before
     assert app.dialogs == []
@@ -289,13 +292,24 @@ def test_holdout_trades_do_not_count_toward_the_sample(tmp_path, monkeypatch):
     assert "waiting for sample: 18/30" in _chat_text(app)
 
 
-def test_manual_under_threshold_also_skips(tmp_path, monkeypatch):
+def test_manual_below_threshold_bypasses_gate_and_logs_override(
+        tmp_path, monkeypatch):
+    """The on-demand Evolve button is exempt. It still calls the plan
+    model and logs the override line. no_change does not advance the
+    watermark."""
+    save_watermark(tmp_path, 2, at="2026-02-01 08:00:00")
+    before = load_watermark(tmp_path)
     chat = _chat()
     app = _app(tmp_path, _design_book(18), chat)
     discord = _run(monkeypatch, app, auto_run=False)
-    assert _ai_calls(chat) == 0
-    assert "waiting for sample: 18/30" in _chat_text(app)
-    assert discord.msgs == []
+
+    assert chat.send_message.call_count == 1, app.errors or _chat_text(app)
+    assert chat.one_shot.call_count == 0
+    text = _chat_text(app)
+    assert "below min_design_trades (18/30), manual override" in text
+    assert "waiting for sample:" not in text
+    assert all("waiting for sample:" not in m for m in discord.msgs)
+    assert load_watermark(tmp_path) == before
     assert app.dialogs == []
 
 
@@ -320,6 +334,20 @@ def test_watermark_skip_adds_idle_line_at_default_seven_days(
     assert any(line in m for m in discord.msgs)
     assert _ai_calls(chat) == 0
     assert load_watermark(tmp_path) == before
+
+
+def test_idle_warn_days_zero_disables_the_line(tmp_path, monkeypatch):
+    """0 turns the idle line off even when the book has been quiet for weeks."""
+    _freeze_now(monkeypatch, datetime(2026, 10, 24, 6, 0, tzinfo=_TPE))
+    trades = [_trade("2026-10-01 10:00") for _ in range(4)]
+    save_watermark(tmp_path, len(trades), at="2026-10-02 05:00:00")
+    chat = _chat()
+    app = _app(tmp_path, trades, chat, {"evolution_idle_warn_days": 0})
+    discord = _run(monkeypatch, app)
+    text = _chat_text(app)
+    assert "No new design-window trades" in text
+    assert "idle " not in text
+    assert all("idle " not in m for m in discord.msgs)
 
 
 def test_watermark_skip_omits_idle_line_below_warn_days(tmp_path, monkeypatch):
@@ -391,3 +419,38 @@ def test_settings_junk_min_design_falls_back_to_30(tmp_path, monkeypatch, bad):
     cfg = _cfg(tmp_path, monkeypatch,
                f"evolution:\n  min_design_trades: {bad}\n")
     assert cfg["evolution_min_design_trades"] == 30
+
+
+def test_settings_idle_warn_days_zero_is_kept(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path, monkeypatch, "evolution:\n  idle_warn_days: 0\n")
+    assert cfg["evolution_idle_warn_days"] == 0
+
+
+def test_min_trades_import_failure_does_not_skip_later_settings(
+        tmp_path, monkeypatch):
+    """A failure importing MIN_TRADES must not abort the rest of the file.
+
+    idle_warn_days, news, and regime are parsed after that import. The
+    design-trade default falls back to 30 and parsing continues.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _boom(name, *args, **kwargs):
+        if name == "src.evolution.fitness":
+            raise ImportError("fitness unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _boom)
+    cfg = _cfg(
+        tmp_path, monkeypatch,
+        "evolution:\n  cadence: weekly\n  idle_warn_days: 9\n"
+        "news:\n  signal_path: sig.json\n"
+        "regime:\n  long_strategy: LongLeg\n")
+    assert cfg["evolution_cadence"] == "weekly"
+    assert cfg["evolution_capital_base_twd"] == 100_000
+    assert cfg["evolution_min_design_trades"] == 30
+    assert cfg["evolution_idle_warn_days"] == 9
+    assert cfg["news_signal_path"] == "sig.json"
+    assert cfg["regime_long_strategy"] == "LongLeg"

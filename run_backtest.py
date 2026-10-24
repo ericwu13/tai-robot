@@ -500,15 +500,27 @@ def _load_settings():
                 _cap_base = 0
             cfg["evolution_capital_base_twd"] = (
                 _cap_base if _cap_base > 0 else 100000)
-            # min_design_trades: skip the AI plan call while the design
-            # window is smaller than this. Default is fitness.MIN_TRADES
-            # (30) — an approved behavior change for sub-30 samples. 0
-            # disables the check. Does not change the fitness gate.
-            from src.evolution.fitness import MIN_TRADES
+            # min_design_trades: Saturday/automatic runs skip the AI plan
+            # call while the design window is smaller than this. Default
+            # is fitness.MIN_TRADES (30). The manual Evolve button is
+            # exempt. 0 disables the check. The import is guarded so a
+            # failure here cannot skip idle_warn_days or the settings
+            # that follow (news, regime, …).
+            try:
+                from src.evolution.fitness import MIN_TRADES as _min_trades_default
+            except Exception as exc:
+                _min_trades_default = 30
+                try:
+                    _log("evolution.min_design_trades default import failed: "
+                         f"[{type(exc).__name__}] {exc}")
+                except Exception:
+                    pass
             cfg["evolution_min_design_trades"] = _nonneg_int(
-                evo.get("min_design_trades", MIN_TRADES), MIN_TRADES)
+                evo.get("min_design_trades", _min_trades_default),
+                _min_trades_default)
             # idle_warn_days: on a watermark skip, append an idle line
             # once the last exit is at least this many calendar days ago.
+            # 0 disables the line entirely.
             cfg["evolution_idle_warn_days"] = _nonneg_int(
                 evo.get("idle_warn_days", 7), 7)
             # News/event framework (src.news). Paths are written by an
@@ -633,8 +645,8 @@ def _evolution_omitted_count(total_trades: int, watermark: dict | None) -> int:
 def _nonneg_int(value, default: int) -> int:
     """Parse ``value`` as an int >= 0. Junk and negatives use ``default``.
 
-    ``0`` is a real setting (it disables the design-trade plan skip), so
-    a zero is kept and is not treated as missing.
+    ``0`` is kept. Callers treat it as off: it disables the automatic
+    design-trade plan skip, and it disables the idle line.
     """
     try:
         n = int(value)
@@ -661,11 +673,12 @@ def _evolution_idle_notice(trades, now: datetime, warn_days: int) -> str:
     """``idle N days since last exit YYYY-MM-DD``, or ``""``.
 
     Calendar days on ``now``'s clock face (Taipei wall time; a tz is
-    stripped, not converted). Empty when the last exit is missing,
-    unparseable, in the future, or strictly younger than ``warn_days``.
-    ``N >= warn_days`` includes the boundary day.
+    stripped, not converted). Empty when ``warn_days`` is 0 (the line
+    is disabled), the last exit is missing, unparseable, in the future,
+    or strictly younger than ``warn_days``. ``N >= warn_days`` includes
+    the boundary day.
     """
-    if warn_days < 0:
+    if warn_days <= 0:
         return ""
     latest = ""
     for t in trades or []:
@@ -5341,6 +5354,7 @@ class BacktestApp:
             # D5: a long gap since the last exit is a different skip from
             # "trades are still aging through the holdout". Append the
             # idle line only at/above evolution.idle_warn_days (default 7).
+            # 0 disables the line.
             idle = _evolution_idle_notice(
                 result.trades, _taipei_now(),
                 _nonneg_int(
@@ -5396,31 +5410,41 @@ class BacktestApp:
                 self._append_chat("system", msg)
             return
 
-        # D4: do not spend a plan call on a design window that is still
-        # below min_design_trades. Default 30 (fitness.MIN_TRADES) is an
-        # approved skip — bots at or above the threshold are unchanged.
-        # 0 disables the check. The fitness composite gate is not touched,
-        # and this return does not advance the watermark.
+        # D4: Saturday / automatic runs do not spend a plan call on a
+        # design window below min_design_trades. Default 30
+        # (fitness.MIN_TRADES) applies to that path only. 0 disables
+        # the check. The manual Evolve button is exempt: it logs an
+        # override line and continues into the plan call. Fitness math
+        # is unchanged, and the automatic return does not advance the
+        # watermark.
         from src.evolution.fitness import MIN_TRADES
         min_design = _nonneg_int(
             self._settings.get("evolution_min_design_trades", MIN_TRADES),
             MIN_TRADES)
         if min_design > 0 and cut_idx < min_design:
-            msg = (
-                f"🧬 EVO: 設計窗只有 {cut_idx} 筆交易，未達 "
-                f"min_design_trades={min_design}，本次不呼叫 AI，水位線不變。\n"
-                f"waiting for sample: {cut_idx}/{min_design}\n"
-                f"Design window has {cut_idx} trades, below "
-                f"min_design_trades={min_design}. No AI plan call; "
-                f"watermark unchanged.")
-            self.set_status(f"🧬 EVO: waiting for sample: {cut_idx}/{min_design}")
-            self._append_chat("system", msg)
-            if auto_run and _discord is not None and _discord.enabled:
-                try:
-                    _discord.notify_evolution(msg)
-                except Exception:
-                    pass
-            return
+            if not auto_run:
+                self._append_chat(
+                    "system",
+                    "🧬 EVO: 手動演化不受設計窗樣本門檻限制，仍呼叫 AI 計畫。"
+                    f"below min_design_trades ({cut_idx}/{min_design}), "
+                    f"manual override")
+            else:
+                msg = (
+                    f"🧬 EVO: 設計窗只有 {cut_idx} 筆交易，未達 "
+                    f"min_design_trades={min_design}，本次不呼叫 AI，水位線不變。\n"
+                    f"waiting for sample: {cut_idx}/{min_design}\n"
+                    f"Design window has {cut_idx} trades, below "
+                    f"min_design_trades={min_design}. No AI plan call; "
+                    f"watermark unchanged.")
+                self.set_status(
+                    f"🧬 EVO: waiting for sample: {cut_idx}/{min_design}")
+                self._append_chat("system", msg)
+                if _discord is not None and _discord.enabled:
+                    try:
+                        _discord.notify_evolution(msg)
+                    except Exception:
+                        pass
+                return
 
         # Rebuild the metrics report from design-known trades only — the
         # full-history report would leak holdout aggregates into design.
