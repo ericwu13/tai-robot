@@ -196,9 +196,11 @@ class TestEvolutionChangelogParams:
         assert "params_reason=params_reason" in window
         assert "evolution_changelog_params(" in src
         # Verdict combination and the Discord payload are still the same call.
-        assert "verdict = combine_evolution_verdicts(" in src
+        # The worker goes through assemble_promotion_verdict; that helper
+        # is what calls combine_evolution_verdicts.
+        assert "assembled = assemble_promotion_verdict(" in src
         assert "evolution_verdict(verdict.passed, block)" in src
-        assert src.index("combine_evolution_verdicts(") < src.index(
+        assert src.index("assemble_promotion_verdict(") < src.index(
             "append_changelog(")
 
 

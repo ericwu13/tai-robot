@@ -138,6 +138,40 @@ evolution:
   # when the last trade exit is at least this many calendar days ago.
   # Default 7. Set 0 to disable the idle line entirely. Not a credential.
   idle_warn_days: 7
+  # P1 promotion gate. Stays "absolute" in this change: PBO/DSR are
+  # not applied yet, so the full Q2 gate is not on. The default flips
+  # to "relative" once that trial-penalty gate exists. "relative" is
+  # the paper path only. Real-money modes ignore paper_gate.
+  # real_gate is accepted only as "absolute"; any other value is ignored.
+  paper_gate: absolute
+  real_gate: absolute
+  # Thresholds used when paper_gate is relative. Approved Q2 values.
+  # post_backfill_start empty defers the "≥2 folds after backfill" check
+  # until a span date is set. PBO / DSR are not read here.
+  relative:
+    min_nonempty_folds: 6
+    min_divergent_folds: 3
+    fold_majority: 0.60
+    bootstrap_alpha: 0.10
+    bootstrap_resamples: 10000
+    bootstrap_seed: 20261024
+    effect_size_sigma: 0.25
+    min_post_backfill_folds: 2
+    post_backfill_start: ""
+    fold_days: 14
+  # Recommend-only. A hit writes a log / changelog / report line.
+  # It does not disable the bot, stop evolution, or edit live settings.
+  retire:
+    min_trades: 150
+    pf_below: 0.95
+    upper_q: 0.90
+    consecutive_weeks: 4
+    min_eligible_trades: 30
+    idle_days: 7
+    structural_quiet_days: 60
+    bootstrap_resamples: 10000
+    bootstrap_seed: 20261024
+    fold_days: 14
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON

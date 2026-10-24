@@ -400,17 +400,23 @@ class EvolutionVerdict:
     # Holdout sits in the latest calendar month and the prior-month OOS
     # check did not clear (issue #153). Never a pool promotion.
     provisional: bool = False
+    # Per-month observation. None until a caller fills it. Present so a
+    # merge can read ``month_verdict.month_gates`` without AttributeError.
+    month_gates: dict | None = None
 
 
 def decide_verdict(baseline: ABResult, candidate: ABResult,
-                   criteria: dict[str, float] | None) -> EvolutionVerdict:
+                   criteria: dict[str, float] | None, *,
+                   require_abs_pf: bool = True) -> EvolutionVerdict:
     """PASS/FAIL the candidate.
 
     With plan criteria: every specified criterion must hold (absolute
     checks on the candidate). Without: default guard — candidate must
     not be worse than baseline on profit factor AND max drawdown.
-    Either way the trade floor and the ABS_PF_FLOOR profitability floor
-    apply — neither can be overridden by the plan's criteria.
+    Either way the trade floor applies. The ABS_PF_FLOOR profitability
+    floor applies unless ``require_abs_pf`` is false (paper relative
+    path only — the real-money path never clears that flag). The plan's
+    criteria cannot override either floor while it is in force.
     """
     if candidate.error:
         return EvolutionVerdict(False, [f"candidate backtest error: {candidate.error}"])
@@ -431,14 +437,22 @@ def decide_verdict(baseline: ABResult, candidate: ABResult,
             f"{base_n if base_n else '?'}) ) — looks like the change "
             f"filtered (nearly) everything away")
 
-    # Absolute profitability floor — applies in BOTH paths and cannot be
-    # relaxed by the plan's criteria (issue #99).
-    pf_ok = cm.profit_factor >= ABS_PF_FLOOR
+    # Absolute profitability floor — applies on the real-money path and
+    # on the paper path while paper_gate is absolute. The plan's criteria
+    # cannot relax it. The paper relative path drops it (P1); collapse
+    # guards and the trade floor stay.
     cpf_abs = ("INF" if cm.profit_factor == float("inf")
                else f"{cm.profit_factor:.2f}")
-    reasons.append(
-        f"hard floor: PF {cpf_abs} ≥ {ABS_PF_FLOOR:g} (absolute — a "
-        f"net-losing candidate can never pass): {'✓' if pf_ok else '✗'}")
+    if require_abs_pf:
+        pf_ok = cm.profit_factor >= ABS_PF_FLOOR
+        reasons.append(
+            f"hard floor: PF {cpf_abs} ≥ {ABS_PF_FLOOR:g} (absolute — a "
+            f"net-losing candidate can never pass): {'✓' if pf_ok else '✗'}")
+    else:
+        pf_ok = True
+        reasons.append(
+            f"hard floor: PF {cpf_abs} — absolute PF ≥ {ABS_PF_FLOOR:g} "
+            f"dropped on the paper relative path (real-money path keeps it)")
 
     if criteria:
         passed = floor_ok and pf_ok
@@ -639,7 +653,8 @@ def run_deep_validation(strategy_cls, bars, point_value: int, name: str,
 
 
 def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
-                        criteria: dict[str, float] | None) -> EvolutionVerdict:
+                        criteria: dict[str, float] | None, *,
+                        require_abs_pf: bool = True) -> EvolutionVerdict:
     """Walk-forward verdict: the OUT-OF-SAMPLE test window decides.
 
     Gates, in order: candidate must run in the test window; the mutation
@@ -648,8 +663,8 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
     composite must not be below the baseline's (skipped when both are
     gated by small samples); then the plan's criteria / default guard
     apply to the test-window metrics via ``decide_verdict`` (which also
-    enforces the trade floor AND the absolute ABS_PF_FLOOR — that is the
-    delegation path that keeps a net-losing holdout from passing).
+    enforces the trade floor AND, unless the paper relative path cleared
+    ``require_abs_pf``, the absolute ABS_PF_FLOOR).
     """
     if candidate.test.error:
         return EvolutionVerdict(
@@ -760,7 +775,8 @@ def decide_deep_verdict(baseline: DeepResult, candidate: DeepResult,
         passed = passed and ok
 
     sub = decide_verdict(baseline.test, candidate.test,
-                         holdout_criteria or None)
+                         holdout_criteria or None,
+                         require_abs_pf=require_abs_pf)
     reasons.extend(sub.reasons)
     passed = passed and sub.passed
 
@@ -1033,18 +1049,29 @@ def _fmt_pf(pf: float) -> str:
 
 def decide_multifold_verdict(
         folds: list[Fold],
-        criteria: dict[str, float] | None = None) -> EvolutionVerdict:
+        criteria: dict[str, float] | None = None, *,
+        require_abs_pf: bool = True,
+        min_nonempty: int | None = None,
+        min_divergent: int | None = None,
+        majority: float | None = None) -> EvolutionVerdict:
     """PASS/FAIL from pooled, paired out-of-sample evidence.
 
     Gates (all ANDed, every one leaves a reason line): the most recent
     fold must be profitable in absolute terms (ABS_PF_FLOOR — the
-    issue #99 loophole); the mutation must have expressed itself; at
-    least ``MIN_NONEMPTY_FOLDS`` folds have candidate trades and at
-    least ``MIN_DIVERGENT_FOLDS`` folds actually differ (issue #153,
-    checked before majority); the candidate must beat the baseline in
-    at least half the folds where the two differ; and the paired total
-    must be positive. Plan criteria, when given, apply to the
-    candidate's AGGREGATE across all folds.
+    issue #99 loophole) unless ``require_abs_pf`` is false; the mutation
+    must have expressed itself; at least ``min_nonempty`` (default
+    ``MIN_NONEMPTY_FOLDS``) folds have candidate trades and at least
+    ``min_divergent`` (default ``MIN_DIVERGENT_FOLDS``) folds actually
+    differ (issue #153, checked before majority); the candidate must
+    beat the baseline in at least
+    half the folds where the two differ (or ``majority``, when given);
+    and the paired total must be positive. Plan criteria, when given,
+    apply to the candidate's AGGREGATE across all folds.
+
+    The default arguments reproduce the real-money / absolute path.
+    The paper relative path passes ``require_abs_pf=False``, a higher
+    nonempty floor, and a 60% majority. It does not change fold
+    construction.
     """
     if not folds:
         return EvolutionVerdict(
@@ -1059,13 +1086,20 @@ def decide_multifold_verdict(
     passed = True
 
     # 1. Holdout floor — the most recent fold is the real out-of-sample
-    #    window; a net-losing one can never pass, baseline or no baseline.
+    #    window. On the absolute path a net-losing one can never pass.
+    #    The paper relative path drops that PF floor and keeps the
+    #    "no trades in the holdout" failure.
     holdout = folds[-1]
     if holdout.cand.n == 0:
         reasons.append(
             f"holdout fold ({holdout.start} → {holdout.end}): candidate made "
             f"no trades in the holdout fold ✗")
         passed = False
+    elif not require_abs_pf:
+        reasons.append(
+            f"holdout fold PF {_fmt_pf(holdout.cand.profit_factor)} — "
+            f"absolute PF ≥ {ABS_PF_FLOOR:g} dropped on the paper relative "
+            f"path (real-money path keeps it)")
     else:
         pf_ok = holdout.cand.profit_factor >= ABS_PF_FLOOR
         note = ("✓" if pf_ok else
@@ -1094,16 +1128,20 @@ def decide_multifold_verdict(
     #     folds is a coin flip; a candidate that barely traded cannot
     #     claim a majority.
     nonempty = [f for f in folds if f.cand.n > 0]
-    n_ok = len(nonempty) >= MIN_NONEMPTY_FOLDS
+    nonempty_floor = (MIN_NONEMPTY_FOLDS if min_nonempty is None
+                      else int(min_nonempty))
+    n_ok = len(nonempty) >= nonempty_floor
     reasons.append(
-        f"non-empty folds: {len(nonempty)} ≥ {MIN_NONEMPTY_FOLDS} "
+        f"non-empty folds: {len(nonempty)} ≥ {nonempty_floor} "
         f"(cand.n>0): {'✓' if n_ok else '✗'}")
     passed = passed and n_ok
 
     div_folds = [f for f in folds if f.delta != 0]
-    d_ok = len(div_folds) >= MIN_DIVERGENT_FOLDS
+    divergent_floor = (MIN_DIVERGENT_FOLDS if min_divergent is None
+                       else int(min_divergent))
+    d_ok = len(div_folds) >= divergent_floor
     reasons.append(
-        f"divergent folds: {len(div_folds)} ≥ {MIN_DIVERGENT_FOLDS} "
+        f"divergent folds: {len(div_folds)} ≥ {divergent_floor} "
         f"before majority: {'✓' if d_ok else '✗'}")
     passed = passed and d_ok
 
@@ -1112,10 +1150,17 @@ def decide_multifold_verdict(
     #    and are excluded from the count.
     if div_folds:
         wins = sum(1 for f in div_folds if f.delta > 0)
-        ok = wins * 2 >= len(div_folds)
+        if majority is None:
+            ok = wins * 2 >= len(div_folds)
+            need = "需 ≥ half"
+        else:
+            # Integer compare: 3/5 >= 0.60 must not fail on binary rounding.
+            threshold = float(majority)
+            ok = wins * 1000 >= int(round(threshold * 1000)) * len(div_folds)
+            need = f"需 ≥ {threshold:.0%}"
         reasons.append(
             f"fold majority: candidate wins {wins}/{len(div_folds)} divergent "
-            f"folds (需 ≥ half): {'✓' if ok else '✗'}")
+            f"folds ({need}): {'✓' if ok else '✗'}")
         passed = passed and ok
     else:
         reasons.append(
@@ -1312,6 +1357,7 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
                        holdout_start: str | None = None,
                        slack_twd: int = PRIOR_MONTH_SLACK_TWD,
                        share_max: float = LATEST_MONTH_EDGE_SHARE_MAX,
+                       drop_prior_pf_floor: bool = False,
                        ) -> EvolutionVerdict:
     """Prior-month floor, latest-month edge share, holdout placement.
 
@@ -1328,6 +1374,10 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
        block must show candidate PF ≥ 1 and Δ ≥ 0. Otherwise the
        verdict is provisional and must never auto-save. An unknown
        holdout start fails closed the same way.
+
+    ``drop_prior_pf_floor`` (paper relative path only) skips gate 3's
+    PF ≥ 1 requirement and still requires Δ ≥ 0. Latest-month identity
+    and the slack formula are unchanged.
     """
     base_b = _by_month(base_trades)
     cand_b = _by_month(cand_trades)
@@ -1401,6 +1451,18 @@ def decide_month_gates(base_trades: list, cand_trades: list, *,
             f"holdout≠latest-month-only: deep holdout starts "
             f"{holdout_start} outside latest calendar month {label} — "
             f"gate not applied ✓")
+    elif drop_prior_pf_floor:
+        if delta_ok:
+            reasons.append(
+                f"holdout≠latest-month-only: paper relative drops prior-month "
+                f"PF ≥ 1 (measured {pf_txt}); Δ {_signed(delta)} ≥ 0 ✓")
+        else:
+            reasons.append(
+                f"holdout≠latest-month-only: paper relative drops prior-month "
+                f"PF ≥ 1 (measured {pf_txt}); Δ {_signed(delta)} ≥ 0: ✗ — "
+                f"provisional, never auto-save")
+            passed = False
+            provisional = True
     elif pf_ok and delta_ok:
         reasons.append(
             f"holdout≠latest-month-only: prior-month OOS PF {pf_txt} ≥ 1 ✓ "

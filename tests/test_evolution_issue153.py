@@ -286,16 +286,27 @@ class TestPipelineWiring:
     def test_saturday_and_deep_path_ands_multifold_and_month(self):
         src = _pipeline_src()
         assert "run_multifold_validation" in src
-        assert "decide_multifold_verdict" in src
-        assert "decide_month_gates" in src
-        assert "combine_evolution_verdicts" in src
+        assert "assemble_promotion_verdict" in src
         assert "format_weekend_verdict_block" in src
         assert "eligible_for_validated_pool" in src
-        assert src.index("decide_month_gates") < src.index(
-            "combine_evolution_verdicts")
+        assert src.index("assembled = assemble_promotion_verdict") < src.index(
+            "eligible_for_validated_pool(verdict)")
+        assert src.index("verdict = assembled.verdict") < src.index(
+            "eligible_for_validated_pool(verdict)")
         assert src.index("block = format_weekend_verdict_block") < src.index(
             "evolution_verdict(verdict.passed, block)")
         assert "evolution_verdict(verdict.passed, block)" in src
+        # Month + multi-fold are still ANDed; the call moved into the
+        # P1 helper so the paper/real switch cannot drop either layer.
+        from src.evolution.paper_gate import assemble_promotion_verdict
+        helper = textwrap.dedent(inspect.getsource(assemble_promotion_verdict))
+        assert "decide_multifold_verdict" in helper
+        assert "decide_month_gates" in helper
+        assert "combine_evolution_verdicts" in helper
+        assert helper.index("decide_month_gates") < helper.index(
+            "decide_multifold_verdict")
+        assert helper.index("decide_month_gates") < helper.index(
+            "combine_evolution_verdicts")
 
     def test_pass_does_not_autosave_strategy_store(self):
         src = _pipeline_src()
