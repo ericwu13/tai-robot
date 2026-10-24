@@ -552,6 +552,47 @@ def test_zero_pass_note_silent_once_changelog_exists(tmp_path, repo):
         messages(findings)
 
 
+def test_zero_pass_note_fires_on_an_empty_changelog_list(tmp_path, repo):
+    write_json(repo / "data" / "changelog.json", [])
+    make_bot(tmp_path, watermark={"trade_count": 127, "at": "2026-08-29 05:05:01"},
+             pid=4242)
+    write_usage(repo, [(DUE_ROW_UTC, "bot_evolution")])
+    findings, _ = run(tmp_path, repo)
+    assert any("never PASSed a candidate" in m
+               for m in messages(findings, "P3")), messages(findings, "P3")
+
+
+def test_zero_pass_note_ignores_relative_gate_markers(tmp_path, repo):
+    write_json(repo / "data" / "changelog.json", [
+        {"change_summary":
+         "EVO_RELATIVE_GATE record only; no strategy change; "
+         "passed=false at=2026-10-03T05:00:00"},
+        {"change_summary":
+         "  EVO_RELATIVE_GATE record only; passed=true at=2026-10-10T05:00:00"},
+    ])
+    make_bot(tmp_path, watermark={"trade_count": 127, "at": "2026-08-29 05:05:01"},
+             pid=4242)
+    write_usage(repo, [(DUE_ROW_UTC, "bot_evolution")])
+    findings, lines = run(tmp_path, repo)
+    assert any("never PASSed a candidate" in m
+               for m in messages(findings, "P3")), messages(findings, "P3")
+    assert any("changelog.json: present" in ln for ln in lines)
+
+
+def test_zero_pass_note_silent_when_a_real_entry_mentions_the_marker(tmp_path, repo):
+    write_json(repo / "data" / "changelog.json", [{
+        "change_summary":
+        "promotion_gate=relative; auto-evolution pool-validated; "
+        "plan excerpt: EVO_RELATIVE_GATE passed=false at=2026-10-03T05:00:00",
+    }])
+    make_bot(tmp_path, watermark={"trade_count": 127, "at": "2026-08-29 05:05:01"},
+             pid=4242)
+    write_usage(repo, [(DUE_ROW_UTC, "bot_evolution")])
+    findings, _ = run(tmp_path, repo)
+    assert not any("never PASSed" in m for m in messages(findings)), \
+        messages(findings)
+
+
 # ── read-only contract ──────────────────────────────────────────────────
 
 def test_check_never_touches_bot_state(tmp_path, repo):

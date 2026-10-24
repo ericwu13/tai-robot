@@ -54,10 +54,16 @@ _REAL_MONEY_MODES = ("semi_auto", "auto", "live", "full_auto")
 # written, so they cannot count toward the retire streak. This is a
 # record of a verdict, not a strategy change.
 RELATIVE_EVAL_MARKER = "EVO_RELATIVE_GATE"
+# Anchored at the start of the summary. A search anywhere in the line
+# would treat the same text inside an AI plan excerpt as a real
+# Saturday record.
 _EVAL_RE = re.compile(
-    r"passed=(true|false)\b.*\bat=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})",
+    rf"^{re.escape(RELATIVE_EVAL_MARKER)}\b.*?"
+    r"\bpassed=(true|false)\b.*?\bat="
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})",
     re.IGNORECASE,
 )
+_RELATIVE_MODES = ("paper", "backtest")
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,10 @@ class EvolutionGateConfig:
     real_gate: str = "absolute"
     relative: RelativeGateConfig = field(default_factory=RelativeGateConfig)
     retire: RetireConfig = field(default_factory=RetireConfig)
+    # Empty when every *present* threshold was in range. A missing key
+    # stays at its default and does not warn. An out-of-range key falls
+    # back to the default and leaves one string here.
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -152,6 +162,52 @@ def _float_or(value, default: float, *, lo: float, hi: float) -> float:
     return x
 
 
+def _present_open_float(mapping: dict, key: str, default: float, *,
+                        lo: float, hi: float, warnings: list[str]) -> float:
+    """Open interval ``(lo, hi)``. A missing key keeps the default quietly."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    label = f"relative.{key}"
+    if isinstance(value, bool):
+        x = None
+    else:
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            x = None
+    if x is None or not math.isfinite(x) or not (lo < x < hi):
+        warnings.append(
+            f"{label} {value!r} outside ({lo:g}, {hi:g}); "
+            f"using default {default}")
+        return default
+    return x
+
+
+def _present_closed_int(mapping: dict, key: str, default: int, *,
+                        lo: int, hi: int, warnings: list[str]) -> int:
+    """Closed interval ``[lo, hi]``. A missing key keeps the default quietly."""
+    if key not in mapping:
+        return default
+    value = mapping[key]
+    label = f"relative.{key}"
+    n = None
+    if isinstance(value, bool):
+        n = None
+    elif isinstance(value, float) and not value.is_integer():
+        n = None
+    else:
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            n = None
+    if n is None or n < lo or n > hi:
+        warnings.append(
+            f"{label} {value!r} outside [{lo}, {hi}]; using default {default}")
+        return default
+    return n
+
+
 def _choice(value, allowed: tuple[str, ...], default: str) -> str:
     if isinstance(value, str) and value.strip().lower() in allowed:
         return value.strip().lower()
@@ -175,30 +231,39 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
                     "absolute")
     # Any non-absolute value, including "relative", is coerced.
     real = "absolute"
+    warnings: list[str] = []
+    # 0 or 1 makes majority / alpha / effect size trivial. A fold floor
+    # of 1 (or above 30) is not the approved sample. Rejected values
+    # fall back; absent keys do not warn.
+    min_nonempty = _present_closed_int(
+        rel, "min_nonempty_folds", DEFAULT_MIN_NONEMPTY_FOLDS,
+        lo=6, hi=30, warnings=warnings)
+    fold_majority = _present_open_float(
+        rel, "fold_majority", DEFAULT_FOLD_MAJORITY,
+        lo=0.0, hi=1.0, warnings=warnings)
+    bootstrap_alpha = _present_open_float(
+        rel, "bootstrap_alpha", DEFAULT_BOOTSTRAP_ALPHA,
+        lo=0.0, hi=1.0, warnings=warnings)
+    effect_size_sigma = _present_open_float(
+        rel, "effect_size_sigma", DEFAULT_EFFECT_SIZE_SIGMA,
+        lo=0.0, hi=1.0, warnings=warnings)
     return EvolutionGateConfig(
         paper_gate=paper,
         real_gate=real,
+        warnings=tuple(warnings),
         relative=RelativeGateConfig(
-            min_nonempty_folds=_int_or(
-                rel.get("min_nonempty_folds"), DEFAULT_MIN_NONEMPTY_FOLDS,
-                minimum=1),
+            min_nonempty_folds=min_nonempty,
             min_divergent_folds=_int_or(
                 rel.get("min_divergent_folds"), DEFAULT_MIN_DIVERGENT_FOLDS,
                 minimum=1),
-            fold_majority=_float_or(
-                rel.get("fold_majority"), DEFAULT_FOLD_MAJORITY,
-                lo=0.0, hi=1.0),
-            bootstrap_alpha=_float_or(
-                rel.get("bootstrap_alpha"), DEFAULT_BOOTSTRAP_ALPHA,
-                lo=0.0, hi=1.0),
+            fold_majority=fold_majority,
+            bootstrap_alpha=bootstrap_alpha,
             bootstrap_resamples=_int_or(
                 rel.get("bootstrap_resamples"), DEFAULT_BOOTSTRAP_RESAMPLES,
                 minimum=1),
             bootstrap_seed=_int_or(
                 rel.get("bootstrap_seed"), DEFAULT_BOOTSTRAP_SEED),
-            effect_size_sigma=_float_or(
-                rel.get("effect_size_sigma"), DEFAULT_EFFECT_SIZE_SIGMA,
-                lo=0.0, hi=100.0),
+            effect_size_sigma=effect_size_sigma,
             min_post_backfill_folds=_int_or(
                 rel.get("min_post_backfill_folds"),
                 DEFAULT_MIN_POST_BACKFILL_FOLDS, minimum=0),
@@ -237,19 +302,21 @@ def evolution_gate_config_from_mapping(evo: dict | None) -> EvolutionGateConfig:
 
 def resolve_promotion_gate(trading_mode: str, paper_gate: str,
                            real_gate: str) -> PromotionGate:
-    """Paper may be relative. Real money is always absolute.
+    """Relative only for the exact strings ``paper`` and ``backtest``.
 
-    ``backtest`` and ``paper`` follow ``paper_gate``. ``semi_auto``,
-    ``auto``, ``live``, and ``full_auto`` ignore a relative paper gate.
-    An unknown mode stays absolute.
+    ``semi_auto``, ``auto``, ``live``, and ``full_auto`` are real money
+    and stay absolute, with a note that says so. ``""``, ``None``, and
+    any other value — including a different case or surrounding space —
+    stay absolute and are not treated as paper. Comparison is exact:
+    no strip and no case fold.
     """
-    mode_key = (trading_mode or "").strip().lower()
     paper = _choice(paper_gate, _PAPER_GATE_VALUES, "absolute")
     real_note = ""
     if (real_gate or "").strip().lower() not in ("", "absolute"):
         real_note = (
             f"real_gate {real_gate!r} ignored; real-money path stays absolute"
         )
+    mode_key = trading_mode if isinstance(trading_mode, str) else ""
     if mode_key in _REAL_MONEY_MODES:
         note = (
             f"trading mode {mode_key} is real money; "
@@ -258,14 +325,40 @@ def resolve_promotion_gate(trading_mode: str, paper_gate: str,
         if real_note:
             note = f"{note}; {real_note}"
         return PromotionGate("absolute", note)
-    if mode_key in ("paper", "backtest", ""):
+    if mode_key in _RELATIVE_MODES:
         if paper == "relative":
             return PromotionGate("relative", real_note)
         return PromotionGate("absolute", real_note)
+    label = mode_key if mode_key else "(empty)"
     return PromotionGate(
         "absolute",
-        f"trading mode {mode_key or '(empty)'} is not paper; absolute gate",
+        f"trading mode {label} is not paper; absolute gate",
     )
+
+
+def evolution_promotion_mode(*, runner, runner_idle: bool, configured_mode):
+    """Mode the promotion gate should read at decision time.
+
+    A running runner contributes its own ``trading_mode``, so a mid-run
+    switch is the mode that is judged. An idle or missing runner
+    contributes only the bot's configured mode. This never invents
+    ``backtest`` or ``paper`` — an unknown configured mode stays
+    unknown, and the resolver then keeps the absolute gate.
+    """
+    if runner is not None and not runner_idle:
+        return getattr(runner, "trading_mode", None)
+    return configured_mode
+
+
+def gate_provenance(mode: str) -> str:
+    """Tag a PASS record with the gate that actually cleared it.
+
+    Anything other than the two real modes is recorded as absolute, so
+    a later real-money deploy can see that the absolute floor was the
+    one that passed.
+    """
+    label = mode if mode in ("absolute", "relative") else "absolute"
+    return f"promotion_gate={label}"
 
 
 def abs_pf_required(gate: PromotionGate) -> bool:
@@ -315,6 +408,14 @@ def paired_fold_bootstrap_p(deltas: list[float], *, resamples: int,
     """
     if not deltas:
         return 1.0, 0.0
+    # NaN and ±inf fail closed. ``nan <= 0`` is False, so leaving them
+    # in the resample loop would report p=0 and pass the alpha check.
+    try:
+        finite = all(math.isfinite(d) for d in deltas)
+    except TypeError:
+        finite = False
+    if not finite:
+        return 1.0, float("nan")
     n = len(deltas)
     observed = sum(deltas) / n
     if resamples <= 0:
@@ -514,6 +615,24 @@ def decide_relative_paper_checks(
     return EvolutionVerdict(passed, reasons)
 
 
+@dataclass(frozen=True)
+class PromotionAssembly:
+    """Combined verdict plus the month-gate observation.
+
+    ``month_verdict.month_gates`` is always an attribute (None until a
+    later change fills the per-month dict). A merge can pass
+    ``month_gates=month_verdict.month_gates`` without NameError or
+    AttributeError.
+    """
+
+    verdict: EvolutionVerdict
+    month_verdict: EvolutionVerdict
+
+    @property
+    def month_gates(self):
+        return self.month_verdict.month_gates
+
+
 def assemble_promotion_verdict(
         *,
         gate: PromotionGate,
@@ -524,13 +643,17 @@ def assemble_promotion_verdict(
         holdout_start: str | None,
         criteria: dict | None,
         window_verdict: EvolutionVerdict,
-) -> EvolutionVerdict:
+) -> PromotionAssembly:
     """AND month gates, multi-fold, the walk-forward window, and (paper
     relative only) the bootstrap / effect-size checks.
 
     ``window_verdict`` must already have been built with
     ``require_abs_pf=abs_pf_required(gate)`` so the holdout PF floor
     matches this mode. This function does not rewrite ``window_verdict``.
+
+    On the relative path the multi-fold divergent floor is
+    ``relative.min_divergent_folds``, the same number the threshold
+    line logs. The absolute path keeps ``MIN_DIVERGENT_FOLDS``.
     """
     relative = gate.mode == "relative"
     rel_cfg = gate_cfg.relative
@@ -543,13 +666,17 @@ def assemble_promotion_verdict(
         folds, criteria,
         require_abs_pf=not relative,
         min_nonempty=(rel_cfg.min_nonempty_folds if relative else None),
+        min_divergent=(rel_cfg.min_divergent_folds if relative else None),
         majority=(rel_cfg.fold_majority if relative else None),
     )
     parts = [month, mf, window_verdict]
     if relative:
         parts.append(decide_relative_paper_checks(
             folds, baseline_pnls_in_folds(base_trades, folds), rel_cfg))
-    return combine_evolution_verdicts(*parts)
+    return PromotionAssembly(
+        verdict=combine_evolution_verdicts(*parts),
+        month_verdict=month,
+    )
 
 
 def _dated_trades(trades: list) -> list:
@@ -627,10 +754,10 @@ def weeks_from_changelog(entries: list[dict] | None,
             continue
         if str(entry.get("strategy") or "") != strategy_name:
             continue
-        summary = str(entry.get("change_summary") or "")
-        if RELATIVE_EVAL_MARKER not in summary:
-            continue
-        match = _EVAL_RE.search(summary)
+        summary = str(entry.get("change_summary") or "").lstrip()
+        # match, not search: the marker has to lead the entry. The same
+        # words inside an AI plan excerpt must not count as a Saturday.
+        match = _EVAL_RE.match(summary)
         if match is None:
             continue
         found.append(WeekRecord(

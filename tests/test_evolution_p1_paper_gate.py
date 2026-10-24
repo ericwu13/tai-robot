@@ -7,7 +7,10 @@ Retirement returns a recommendation and does not change bot state.
 
 from __future__ import annotations
 
+import ast
 import inspect
+import math
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,6 +19,7 @@ import pytest
 import yaml
 
 import run_backtest as rb
+import src.evolution.paper_gate as paper_gate
 from src.backtest.metrics import PerformanceMetrics
 from src.evolution.paper_gate import (
     RelativeGateConfig,
@@ -29,6 +33,8 @@ from src.evolution.paper_gate import (
     meets_min_folds,
     nonempty_fold_count,
     evolution_gate_config_from_mapping,
+    evolution_promotion_mode,
+    gate_provenance,
     mean_pnl_upper_bound,
     paired_fold_bootstrap_p,
     relative_eval_summary,
@@ -122,13 +128,13 @@ def _judge(trading_mode, paper_gate, folds, base, cand, *, real_gate="absolute",
         window = EvolutionVerdict(True, ["walk-forward collapse guards held ✓"])
     if holdout_start is None and folds:
         holdout_start = folds[-1].start
-    verdict = assemble_promotion_verdict(
+    assembled = assemble_promotion_verdict(
         gate=gate, gate_cfg=cfg, folds=folds,
         base_trades=base, cand_trades=cand,
         holdout_start=holdout_start, criteria=None,
         window_verdict=window,
     )
-    return verdict, gate
+    return assembled.verdict, gate
 
 
 def _ab(n: int, pf: float, dd: int) -> ABResult:
@@ -226,6 +232,71 @@ class TestGateConfig:
         assert backtest.mode == "relative"
         assert not abs_pf_required(paper)
         assert resolve_promotion_gate("paper", "absolute", "absolute").mode == "absolute"
+
+    @pytest.mark.parametrize("mode", ["semi_auto", "auto", "live", "full_auto"])
+    def test_each_real_money_mode_is_absolute_and_named_as_such(self, mode):
+        # Membership kills a mutant that drops "auto" from the tuple:
+        # an unknown mode is also absolute, so the mode alone is not enough.
+        assert mode in paper_gate._REAL_MONEY_MODES
+        gate = resolve_promotion_gate(mode, "relative", "absolute")
+        assert gate.mode == "absolute"
+        assert "is real money" in gate.note
+        assert abs_pf_required(gate)
+
+    @pytest.mark.parametrize(
+        "mode", ["", None, "shadow", "Paper", " backtest", "paper ", "AUTO"])
+    def test_empty_none_and_nonexact_modes_stay_absolute(self, mode):
+        gate = resolve_promotion_gate(mode, "relative", "absolute")
+        assert gate.mode == "absolute"
+        assert "is real money" not in gate.note
+        assert abs_pf_required(gate)
+
+    def test_out_of_range_thresholds_fall_back_with_a_warning(self):
+        cfg = evolution_gate_config_from_mapping({
+            "relative": {
+                "fold_majority": 0,
+                "effect_size_sigma": 1,
+                "bootstrap_alpha": 1.0,
+                "min_nonempty_folds": 1,
+            },
+        })
+        assert cfg.relative.fold_majority == pytest.approx(0.60)
+        assert cfg.relative.effect_size_sigma == pytest.approx(0.25)
+        assert cfg.relative.bootstrap_alpha == pytest.approx(0.10)
+        assert cfg.relative.min_nonempty_folds == 6
+        text = " ".join(cfg.warnings)
+        for key in ("fold_majority", "effect_size_sigma",
+                    "bootstrap_alpha", "min_nonempty_folds"):
+            assert key in text
+
+    def test_absent_threshold_keys_do_not_warn(self):
+        assert evolution_gate_config_from_mapping({}).warnings == ()
+        assert evolution_gate_config_from_mapping(
+            {"relative": {}}).warnings == ()
+
+    def test_in_range_thresholds_are_kept(self):
+        cfg = evolution_gate_config_from_mapping({
+            "relative": {
+                "fold_majority": 0.999,
+                "effect_size_sigma": 0.01,
+                "bootstrap_alpha": 0.5,
+                "min_nonempty_folds": 6,
+            },
+        })
+        assert cfg.warnings == ()
+        assert cfg.relative.fold_majority == pytest.approx(0.999)
+        assert cfg.relative.min_nonempty_folds == 6
+        top = evolution_gate_config_from_mapping({
+            "relative": {"min_nonempty_folds": 30},
+        })
+        assert top.warnings == ()
+        assert top.relative.min_nonempty_folds == 30
+        over = evolution_gate_config_from_mapping({
+            "relative": {"min_nonempty_folds": 31, "fold_majority": 1},
+        })
+        assert over.relative.min_nonempty_folds == 6
+        assert over.relative.fold_majority == pytest.approx(0.60)
+        assert len(over.warnings) == 2
 
 
 # ── pass / fail edges ─────────────────────────────────────────────────
@@ -326,6 +397,58 @@ class TestRelativePaperEdges:
         )
         assert any("seed=7" in r and "p 0.0000" in r and "✓" in r
                    for r in verdict.reasons)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_fold_deltas_fail_the_bootstrap_closed(self, bad):
+        p_value, observed = paired_fold_bootstrap_p(
+            [10.0, bad], resamples=50, seed=1)
+        assert p_value == 1.0
+        assert math.isnan(observed)
+        folds, _, _ = _improved_losing()
+        folds[0].delta = bad
+        verdict = decide_relative_paper_checks(
+            folds, [100, -400] * 6,
+            RelativeGateConfig(bootstrap_resamples=20, bootstrap_seed=1),
+        )
+        assert not verdict.passed
+        assert any("paired fold bootstrap" in r and "✗" in r
+                   for r in verdict.reasons)
+
+    def test_relative_path_logs_the_configured_divergent_floor(self):
+        folds, base, cand = _improved_losing()
+        for fold in folds[3:]:
+            fold.delta = 0
+        cfg = evolution_gate_config_from_mapping({
+            "paper_gate": "relative",
+            "relative": {"min_divergent_folds": 5, "bootstrap_resamples": 20},
+        })
+        gate = resolve_promotion_gate("paper", cfg.paper_gate, "absolute")
+        assembled = assemble_promotion_verdict(
+            gate=gate, gate_cfg=cfg, folds=folds,
+            base_trades=base, cand_trades=cand,
+            holdout_start=folds[-1].start, criteria=None,
+            window_verdict=EvolutionVerdict(True, ["window held ✓"]),
+        )
+        reasons = assembled.verdict.reasons
+        assert any("divergent≥5" in r for r in reasons)
+        assert any("divergent folds:" in r and "≥ 5" in r and "✗" in r
+                   for r in reasons)
+        # Absolute path keeps the constant floor, so the logged number
+        # still matches the check that ran.
+        abs_cfg = evolution_gate_config_from_mapping({
+            "paper_gate": "absolute",
+            "relative": {"min_divergent_folds": 5},
+        })
+        abs_gate = resolve_promotion_gate("auto", "absolute", "absolute")
+        absolute = assemble_promotion_verdict(
+            gate=abs_gate, gate_cfg=abs_cfg, folds=folds,
+            base_trades=base, cand_trades=cand,
+            holdout_start=folds[-1].start, criteria=None,
+            window_verdict=EvolutionVerdict(True, ["window held ✓"]),
+        )
+        assert any("divergent folds:" in r and "≥ 3" in r
+                   for r in absolute.verdict.reasons)
+        assert not any("≥ 5" in r for r in absolute.verdict.reasons)
 
     def test_effect_size_rejects_a_tiny_improvement(self):
         folds = []
@@ -530,6 +653,21 @@ class TestRetireRecommendation:
         assert len(dep) == 1 and dep[0].passed is False
         assert len(bb) == 1 and bb[0].passed is True
         assert weeks_from_changelog(entries, "SomeOtherFamily") == []
+        # The marker inside an AI plan excerpt is not a Saturday record.
+        leaked = (
+            "promotion_gate=relative; auto-evolution pool-validated; "
+            "plan excerpt: EVO_RELATIVE_GATE record only; no strategy "
+            "change; passed=false at=2026-10-03T05:00:00"
+        )
+        assert weeks_from_changelog(
+            [{"strategy": "DynamicExitPullback", "change_summary": leaked}],
+            "DynamicExitPullback",
+        ) == []
+        padded = "  " + fail
+        assert weeks_from_changelog(
+            [{"strategy": "DynamicExitPullback", "change_summary": padded}],
+            "DynamicExitPullback",
+        )[0].passed is False
 
     def test_emit_recommends_without_touching_bot_state(self):
         bot = {"trading_mode": "auto", "enabled": True, "pool_status": "live"}
@@ -580,8 +718,127 @@ class TestRetireRecommendation:
         assert src.index("rec = assess_retirement") < src.index(
             "evolution_verdict(verdict.passed, block)")
         assert "verdict.passed =" not in src
+        # Retire still runs on an absolute gate: the call sits after the
+        # relative-only record block, not inside it.
+        assert src.index('if evo_gate.mode == "relative"') < src.index(
+            "rec = assess_retirement")
         gate_src = Path("src/evolution/paper_gate.py").read_text(encoding="utf-8")
         assert "StrategyPool" not in gate_src
         assert "settings.yaml" not in gate_src
         assert "session.json" not in gate_src
         assert "trading_mode =" not in gate_src
+
+
+def _pipeline_tree():
+    src = textwrap.dedent(
+        inspect.getsource(rb.BacktestApp._start_evolution_pipeline))
+    return src, ast.parse(src)
+
+
+class TestPromotionProvenance:
+    def test_assemble_exposes_month_verdict(self):
+        folds, base, cand = _improved_losing()
+        cfg, gate = _gate("paper", "relative")
+        assembled = assemble_promotion_verdict(
+            gate=gate, gate_cfg=cfg, folds=folds,
+            base_trades=base, cand_trades=cand,
+            holdout_start=folds[-1].start, criteria=None,
+            window_verdict=EvolutionVerdict(True, ["window held ✓"]),
+        )
+        month_verdict = assembled.month_verdict
+        assert month_verdict is not None
+        assert hasattr(month_verdict, "month_gates")
+        assert month_verdict.month_gates is None
+        assert assembled.month_gates is None
+        # The expression a #181 merge writes must resolve.
+        assert month_verdict.month_gates is assembled.month_gates
+
+    def test_pass_records_name_the_gate_that_passed(self):
+        assert gate_provenance("relative") == "promotion_gate=relative"
+        assert gate_provenance("absolute") == "promotion_gate=absolute"
+        assert gate_provenance("nope") == "promotion_gate=absolute"
+        src = inspect.getsource(rb.BacktestApp._start_evolution_pipeline)
+        notes_at = src.index("record_validated_candidate(")
+        summary_at = src.index("change_summary=")
+        fail_at = src.index("EVO changelog append failed")
+        assert "gate_provenance(evo_gate.mode)" in src[notes_at:summary_at]
+        assert "gate_provenance(evo_gate.mode)" in src[summary_at:fail_at]
+        # Provenance leads the summary, ahead of the plan excerpt.
+        assert src.index("gate_provenance(evo_gate.mode)") < src.index(
+            "plan excerpt:")
+        bind = src.index("month_verdict = assembled.month_verdict")
+        assert bind < summary_at
+        assert "month_gates=" not in src
+
+    def test_idle_evolve_uses_configured_mode_and_never_invents_one(self):
+        class _Runner:
+            def __init__(self, mode):
+                self.trading_mode = mode
+
+        running = evolution_promotion_mode(
+            runner=_Runner("semi_auto"), runner_idle=False,
+            configured_mode="paper")
+        assert running == "semi_auto"
+        switched = evolution_promotion_mode(
+            runner=_Runner("auto"), runner_idle=False,
+            configured_mode="paper")
+        assert switched == "auto"
+        idle = evolution_promotion_mode(
+            runner=_Runner("paper"), runner_idle=True,
+            configured_mode="semi_auto")
+        assert idle == "semi_auto"
+        missing = evolution_promotion_mode(
+            runner=None, runner_idle=True, configured_mode=None)
+        assert missing is None
+        assert missing != "backtest"
+        assert missing != "paper"
+        unknown = evolution_promotion_mode(
+            runner=None, runner_idle=True, configured_mode="weird")
+        gate = resolve_promotion_gate(unknown, "relative", "absolute")
+        assert gate.mode == "absolute"
+        assert "is real money" not in gate.note
+        # Configured paper, runner idle: relative is allowed because
+        # that is the bot's mode, not a substitute.
+        paper = resolve_promotion_gate(
+            evolution_promotion_mode(
+                runner=None, runner_idle=True, configured_mode="paper"),
+            "relative", "absolute")
+        assert paper.mode == "relative"
+
+    def test_worker_resolves_mode_at_decision_time(self):
+        src, tree = _pipeline_tree()
+        assert "promotion_trading_mode" not in src
+        assert 'else "backtest"' not in src
+        assert '"paper") if live' not in src
+        worker = src.split("def _worker", 1)[1]
+        assert worker.index("evolution_promotion_mode(") < worker.index(
+            "resolve_promotion_gate(")
+        assert "LiveState.IDLE" in worker
+        assert "EVO gate config:" in worker
+        calls = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "resolve_promotion_gate"
+        ]
+        assert len(calls) == 1
+        arg0 = calls[0].args[0]
+        # A string constant ("paper") would let a live semi_auto bot
+        # take the relative gate. The argument has to be the name the
+        # helper returned.
+        assert isinstance(arg0, ast.Name)
+        assert not isinstance(arg0, ast.Constant)
+        assert arg0.id == "promotion_mode"
+        assigns = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "promotion_mode"
+                    for t in n.targets)
+        ]
+        assert len(assigns) == 1
+        call = assigns[0].value
+        assert isinstance(call, ast.Call)
+        assert isinstance(call.func, ast.Name)
+        assert call.func.id == "evolution_promotion_mode"
+        kwargs = {kw.arg: kw.value for kw in call.keywords}
+        assert not isinstance(kwargs["configured_mode"], ast.Constant)
+        assert not isinstance(kwargs["runner"], ast.Constant)

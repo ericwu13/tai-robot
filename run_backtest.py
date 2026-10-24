@@ -5667,13 +5667,12 @@ class BacktestApp:
         total_trades = len(trade_lines)
 
         # Snapshot everything the worker needs while on the main thread.
+        # The promotion mode is read inside the worker, at decision time:
+        # a running runner's trading_mode (a mid-run switch is visible),
+        # otherwise the bot's configured mode. Never a silent backtest.
         capital_base = self._evolution_capital_base()
         live = (self._live_runner is not None
                 and self._live_runner.state != LiveState.IDLE)
-        # Snapshotted with the rest of the worker inputs. Real-money
-        # modes stay on the absolute PF floor even if paper_gate is relative.
-        promotion_trading_mode = (
-            getattr(self, "_trading_mode", "paper") if live else "backtest")
         evolution_gate_raw = self._settings.get("evolution_gate_raw") or {}
         if live:
             baseline_cls = type(self._live_runner.strategy)
@@ -5742,6 +5741,8 @@ class BacktestApp:
                 assess_retirement,
                 emit_retire_recommendation,
                 evolution_gate_config_from_mapping,
+                evolution_promotion_mode,
+                gate_provenance,
                 relative_eval_summary,
                 resolve_promotion_gate,
                 weeks_from_changelog,
@@ -5969,8 +5970,22 @@ class BacktestApp:
 
                 evo_gate_cfg = evolution_gate_config_from_mapping(
                     evolution_gate_raw)
+                for warning in evo_gate_cfg.warnings:
+                    _log(f"EVO gate config: {warning}")
+                # Decision time, not a start-of-run snapshot. Running
+                # runner: its trading_mode. Idle or missing: configured
+                # mode only — unknown stays unknown (absolute gate).
+                runner = getattr(self, "_live_runner", None)
+                runner_idle = (
+                    runner is None
+                    or getattr(runner, "state", None) == LiveState.IDLE)
+                promotion_mode = evolution_promotion_mode(
+                    runner=runner,
+                    runner_idle=runner_idle,
+                    configured_mode=getattr(self, "_trading_mode", None),
+                )
                 evo_gate = resolve_promotion_gate(
-                    promotion_trading_mode,
+                    promotion_mode,
                     evo_gate_cfg.paper_gate,
                     str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
                 )
@@ -6053,7 +6068,7 @@ class BacktestApp:
                 # Paper relative drops the absolute PF floors and ANDs the
                 # bootstrap / effect-size checks. Real money stays absolute.
                 # The retire recommendation below does not feed this verdict.
-                verdict = assemble_promotion_verdict(
+                assembled = assemble_promotion_verdict(
                     gate=evo_gate,
                     gate_cfg=evo_gate_cfg,
                     folds=folds,
@@ -6063,6 +6078,13 @@ class BacktestApp:
                     criteria=directives["criteria"],
                     window_verdict=window_verdict,
                 )
+                verdict = assembled.verdict
+                # Bound before the PASS changelog so a merge can read
+                # month_verdict.month_gates without NameError. The value
+                # is not forwarded: this changelog signature has no
+                # month_gates parameter yet.
+                month_verdict = assembled.month_verdict
+                month_verdict.month_gates
 
                 # Clean PASS → StrategyPool validated only. Never
                 # StrategyStore.save and never STRATEGIES[...].
@@ -6087,7 +6109,8 @@ class BacktestApp:
                             notes=(
                                 "issue #153 weekend evo PASS — StrategyPool "
                                 "validated only; StrategyStore / STRATEGIES "
-                                "auto-save blocked"),
+                                "auto-save blocked; "
+                                f"{gate_provenance(evo_gate.mode)}"),
                         )
                     except Exception as e:
                         _log(f"EVO pool promote failed: [{type(e).__name__}] {e}")
@@ -6121,6 +6144,7 @@ class BacktestApp:
                                 version_before=base_cls_name,
                                 version_after=candidate_cls.__name__,
                                 change_summary=(
+                                    f"{gate_provenance(evo_gate.mode)}; "
                                     f"auto-evolution pool-validated only "
                                     f"(StrategyStore auto-save blocked, #153); "
                                     f"validation={'walk-forward' if tr_d else 'simple A/B'}"

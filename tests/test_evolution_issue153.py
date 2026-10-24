@@ -289,7 +289,9 @@ class TestPipelineWiring:
         assert "assemble_promotion_verdict" in src
         assert "format_weekend_verdict_block" in src
         assert "eligible_for_validated_pool" in src
-        assert src.index("verdict = assemble_promotion_verdict") < src.index(
+        assert src.index("assembled = assemble_promotion_verdict") < src.index(
+            "eligible_for_validated_pool(verdict)")
+        assert src.index("verdict = assembled.verdict") < src.index(
             "eligible_for_validated_pool(verdict)")
         assert src.index("block = format_weekend_verdict_block") < src.index(
             "evolution_verdict(verdict.passed, block)")

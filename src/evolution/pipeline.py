@@ -400,6 +400,9 @@ class EvolutionVerdict:
     # Holdout sits in the latest calendar month and the prior-month OOS
     # check did not clear (issue #153). Never a pool promotion.
     provisional: bool = False
+    # Per-month observation. None until a caller fills it. Present so a
+    # merge can read ``month_verdict.month_gates`` without AttributeError.
+    month_gates: dict | None = None
 
 
 def decide_verdict(baseline: ABResult, candidate: ABResult,
@@ -1049,6 +1052,7 @@ def decide_multifold_verdict(
         criteria: dict[str, float] | None = None, *,
         require_abs_pf: bool = True,
         min_nonempty: int | None = None,
+        min_divergent: int | None = None,
         majority: float | None = None) -> EvolutionVerdict:
     """PASS/FAIL from pooled, paired out-of-sample evidence.
 
@@ -1057,8 +1061,9 @@ def decide_multifold_verdict(
     issue #99 loophole) unless ``require_abs_pf`` is false; the mutation
     must have expressed itself; at least ``min_nonempty`` (default
     ``MIN_NONEMPTY_FOLDS``) folds have candidate trades and at least
-    ``MIN_DIVERGENT_FOLDS`` folds actually differ (issue #153, checked
-    before majority); the candidate must beat the baseline in at least
+    ``min_divergent`` (default ``MIN_DIVERGENT_FOLDS``) folds actually
+    differ (issue #153, checked before majority); the candidate must
+    beat the baseline in at least
     half the folds where the two differ (or ``majority``, when given);
     and the paired total must be positive. Plan criteria, when given,
     apply to the candidate's AGGREGATE across all folds.
@@ -1132,9 +1137,11 @@ def decide_multifold_verdict(
     passed = passed and n_ok
 
     div_folds = [f for f in folds if f.delta != 0]
-    d_ok = len(div_folds) >= MIN_DIVERGENT_FOLDS
+    divergent_floor = (MIN_DIVERGENT_FOLDS if min_divergent is None
+                       else int(min_divergent))
+    d_ok = len(div_folds) >= divergent_floor
     reasons.append(
-        f"divergent folds: {len(div_folds)} ≥ {MIN_DIVERGENT_FOLDS} "
+        f"divergent folds: {len(div_folds)} ≥ {divergent_floor} "
         f"before majority: {'✓' if d_ok else '✗'}")
     passed = passed and d_ok
 

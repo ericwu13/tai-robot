@@ -371,6 +371,35 @@ def _check_eligibility(base_dir, pid_alive_fn, lines, findings) -> None:
         base_dir))
 
 
+# A relative-gate Saturday record is not a candidate PASS. Matching is
+# anchored: the summary must start with the marker, so the same words
+# inside an AI plan excerpt still count as a real entry.
+_RELATIVE_GATE_MARKER = "EVO_RELATIVE_GATE"
+
+
+def _changelog_counts_as_pass(path: str) -> bool:
+    """True when changelog.json records something other than a marker.
+
+    A missing file does not count. A non-list payload — including the
+    legacy ``{"entries": []}`` shape — still counts as present, matching
+    the previous file-exists check. A list counts only when some entry
+    is not a pure ``EVO_RELATIVE_GATE`` record. An empty list, or a list
+    of only those markers, is not a PASS.
+    """
+    if not os.path.isfile(path):
+        return False
+    data = read_json(path)
+    if not isinstance(data, list):
+        return True
+    for entry in data:
+        if not isinstance(entry, dict):
+            return True
+        summary = str(entry.get("change_summary") or "").lstrip()
+        if not summary.startswith(_RELATIVE_GATE_MARKER):
+            return True
+    return False
+
+
 def _check_zero_pass(repo_root, lines, findings) -> None:
     """Has the pipeline ever PASSed a candidate?
 
@@ -378,11 +407,16 @@ def _check_zero_pass(repo_root, lines, findings) -> None:
     class in strategies/index.json.  Neither existing says something
     structural about the verdict gates rejecting every candidate — it is
     not an outage, so it is P3 and never gates the verdict.
+
+    ``EVO_RELATIVE_GATE`` rows are verdict records, not promotions. A
+    changelog that contains only those markers does not silence this
+    finding.
     """
     lines.append("--- pass history")
     changelog = os.path.join(repo_root, "data", "changelog.json")
     index_path = os.path.join(repo_root, "strategies", "index.json")
     has_changelog = os.path.isfile(changelog)
+    counts_as_pass = _changelog_counts_as_pass(changelog)
 
     entries = read_json(index_path)
     evo = []
@@ -393,7 +427,7 @@ def _check_zero_pass(repo_root, lines, findings) -> None:
     lines.append(f"changelog.json: {'present' if has_changelog else 'absent'}")
     lines.append(f"Evo-suffixed strategies in index.json: "
                  f"{', '.join(evo) if evo else 'none'}")
-    if has_changelog or evo:
+    if counts_as_pass or evo:
         return
     findings.append(Finding(
         "P3", "evolution",
