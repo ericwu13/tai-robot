@@ -655,6 +655,42 @@ def _evolution_omitted_count(total_trades: int, watermark: dict | None) -> int:
     return min(int(watermark.get("trade_count", 0) or 0), total_trades)
 
 
+def _persist_evolution_history(bot_dir, **fields) -> None:
+    """Append one evolution-history line. Never raises and never logs success.
+
+    A missing ``bot_dir`` is a no-op (no per-bot file). Write failures
+    are logged inside the helper.
+    """
+    try:
+        from src.evolution.history import record_evolution_attempt
+        record_evolution_attempt(bot_dir, log=_log, **fields)
+    except Exception as exc:
+        try:
+            _log("evolution history append failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+
+
+def _evolution_bot_dir(app) -> str | None:
+    """Live bot directory, or None when evolution is not on a running bot."""
+    runner = getattr(app, "_live_runner", None)
+    if runner is None or getattr(runner, "state", None) == LiveState.IDLE:
+        return None
+    return getattr(runner, "bot_dir", None) or None
+
+
+def _evolution_class_name(app, strategy_cls=None) -> str:
+    """Class name for a history row. Empty when no strategy is in hand."""
+    if strategy_cls is not None:
+        return getattr(strategy_cls, "__name__", "") or ""
+    runner = getattr(app, "_live_runner", None)
+    strategy = getattr(runner, "strategy", None) if runner is not None else None
+    if strategy is not None:
+        return type(strategy).__name__
+    return ""
+
+
 def _nonneg_int(value, default: int) -> int:
     """Parse ``value`` as an int >= 0. Junk and negatives use ``default``.
 
@@ -5285,8 +5321,34 @@ class BacktestApp:
                         _discord.notify_evolution(msg)
                     except Exception:
                         pass
+            try:
+                _persist_evolution_history(
+                    _evolution_bot_dir(self),
+                    bot=self.strategy_var.get(),
+                    class_name=_evolution_class_name(self),
+                    final_status="skip",
+                    reason_kind="no_trades",
+                    reason=msg,
+                    ai_calls=0,
+                    thresholds_raw=self._settings.get("evolution_gate_raw"),
+                )
+            except Exception:
+                pass
             return
         if not self._ensure_chat_client():
+            try:
+                _persist_evolution_history(
+                    _evolution_bot_dir(self),
+                    bot=self.strategy_var.get(),
+                    class_name=_evolution_class_name(self),
+                    final_status="skip",
+                    reason_kind="no_chat_client",
+                    reason="chat client unavailable",
+                    ai_calls=0,
+                    thresholds_raw=self._settings.get("evolution_gate_raw"),
+                )
+            except Exception:
+                pass
             return
         result, report, timeframe_line, source_section, trade_lines = payload
 
@@ -5339,6 +5401,32 @@ class BacktestApp:
                    if cut else len(result.trades))
         holdout_count = len(result.trades) - cut_idx
 
+        def _remember(final_status, reason_kind, reason="", **extra):
+            # History is written after the chat/Discord lines above the
+            # call, and this function never raises, so a disk error cannot
+            # change those messages or skip the return.
+            try:
+                fields = dict(
+                    bot=self.strategy_var.get(),
+                    class_name=_evolution_class_name(self, _evo_cls),
+                    source=_evo_source or "",
+                    cut_idx=cut_idx,
+                    watermark=watermark,
+                    thresholds_raw=self._settings.get("evolution_gate_raw"),
+                    final_status=final_status,
+                    reason_kind=reason_kind,
+                    reason=reason,
+                    ai_calls=0,
+                )
+                fields.update(extra)
+                _persist_evolution_history(bot_dir, **fields)
+            except Exception as exc:
+                try:
+                    _log("evolution history append failed: "
+                         f"[{type(exc).__name__}] {exc}")
+                except Exception:
+                    pass
+
         # D1: per-class knob grid. A class with fewer than 2 rewritable
         # grid knobs (or that cannot be read) is excluded from weekly
         # codegen. Every Saturday emits one exclusion line. The same
@@ -5363,6 +5451,7 @@ class BacktestApp:
                         _discord.notify_evolution(msg)
                     except Exception:
                         pass
+                _remember("skip", reason_kind="knob_ineligible", reason=msg)
                 return
 
         if watermark and cut_idx <= omitted:
@@ -5390,6 +5479,7 @@ class BacktestApp:
                         _discord.notify_evolution(msg)
                     except Exception:
                         pass
+                _remember("skip", reason_kind="watermark", reason=msg)
                 return
             # Manual click: allow an explicit full-design-history re-run
             # (the holdout stays withheld either way).
@@ -5402,6 +5492,11 @@ class BacktestApp:
                     f"仍要以完整訓練歷史重新執行嗎？\n"
                     f"Re-run on the full design history anyway? "
                     f"(holdout stays withheld){idle_suffix}"):
+                _remember(
+                    "skip", reason_kind="watermark",
+                    reason=(
+                        f"No new design-window trades since last evolution "
+                        f"({watermark['at']}) — re-run declined.{idle_suffix}"))
                 return
             omitted = 0  # full design-history re-run; cut unchanged
         sent_lines = trade_lines[omitted:cut_idx]
@@ -5426,6 +5521,7 @@ class BacktestApp:
                         pass
             else:
                 self._append_chat("system", msg)
+            _remember("skip", reason_kind="no_design_window", reason=msg)
             return
 
         # D4: Saturday / automatic runs do not spend a plan call on a
@@ -5462,6 +5558,7 @@ class BacktestApp:
                         _discord.notify_evolution(msg)
                     except Exception:
                         pass
+                _remember("skip", reason_kind="min_design_trades", reason=msg)
                 return
 
         # Rebuild the metrics report from design-known trades only — the
@@ -5534,13 +5631,18 @@ class BacktestApp:
             self._start_evolution_pipeline(
                 preamble, sent_lines, source_section, result,
                 auto_run=auto_run, holdout_days=holdout_days,
-                bot_dir=bot_dir, design_cut_idx=cut_idx)
+                bot_dir=bot_dir, design_cut_idx=cut_idx,
+                watermark=watermark)
         else:
             if auto:
                 self._append_chat(
                     "system",
                     "EVO: payload too large for the auto-pipeline — "
                     "falling back to plan-only mode.")
+            _remember(
+                "skip", reason_kind="plan_only",
+                reason=("payload too large for the auto-pipeline — plan-only mode"
+                        if auto else "auto-pipeline disabled — plan-only mode"))
             self._dispatch_trade_analysis(
                 preamble, sent_lines, source_section, len(sent_lines),
                 label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
@@ -5658,7 +5760,8 @@ class BacktestApp:
                                   source_section: str, result,
                                   auto_run: bool = False,
                                   holdout_days: int = 14,
-                                  bot_dir=None, design_cut_idx: int = 0) -> None:
+                                  bot_dir=None, design_cut_idx: int = 0,
+                                  watermark=None) -> None:
         """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
 
         One click, no manual steps until deployment: the plan's own
@@ -5776,8 +5879,72 @@ class BacktestApp:
                     except Exception:
                         pass
 
+            ai_calls = 0
+            plan = ""
+            directives = None
+            history_written = False
+
+            def _remember(final_status, reason_kind, reason="", **extra):
+                # One record per attempt. Building the gate blocks and
+                # the append both stay inside this function so a disk or
+                # shaping error cannot skip the Discord verdict or turn
+                # into a second pipeline-error notice.
+                nonlocal history_written
+                if history_written:
+                    return
+                gate_keys = (
+                    "assembled", "folds", "baseline_res", "candidate_res",
+                    "gate", "gate_cfg")
+                try:
+                    if extra.get("assembled") is not None and "gates" not in extra:
+                        from src.evolution.history import validation_gates
+                        extra["gates"] = validation_gates(
+                            assembled=extra.pop("assembled"),
+                            folds=extra.pop("folds", None),
+                            baseline_res=extra.pop("baseline_res", None),
+                            candidate_res=extra.pop("candidate_res", None),
+                            gate=extra.pop("gate", None),
+                            gate_cfg=extra.pop("gate_cfg", None),
+                        )
+                    else:
+                        for key in gate_keys:
+                            extra.pop(key, None)
+                except Exception as exc:
+                    for key in gate_keys:
+                        extra.pop(key, None)
+                    try:
+                        _log("evolution history gate block failed: "
+                             f"[{type(exc).__name__}] {exc}")
+                    except Exception:
+                        pass
+                history_written = True
+                try:
+                    _persist_evolution_history(
+                        bot_dir,
+                        bot=display_name,
+                        class_name=(baseline_cls.__name__ if baseline_cls else ""),
+                        source=strategy_source or "",
+                        cut_idx=design_cut_idx,
+                        watermark=watermark,
+                        plan_excerpt=plan,
+                        directives=directives,
+                        ai_calls=ai_calls,
+                        thresholds_raw=evolution_gate_raw,
+                        final_status=final_status,
+                        reason_kind=reason_kind,
+                        reason=reason,
+                        **extra,
+                    )
+                except Exception as exc:
+                    try:
+                        _log("evolution history append failed: "
+                             f"[{type(exc).__name__}] {exc}")
+                    except Exception:
+                        pass
+
             try:
                 # ── Phase 1: evolution plan ──
+                ai_calls += 1
                 plan = self._chat_client.send_message(
                     context, call_site="bot_evolution", model=heavy_model,
                     # Thinking tokens share this budget — the codegen
@@ -5814,6 +5981,7 @@ class BacktestApp:
                     ui(self._append_chat, "system", msg)
                     if auto_run:
                         _notify_discord(msg)
+                    _remember("fail", "plan_unusable", msg)
                     return
 
                 directives = parse_plan_directives(plan)
@@ -5823,6 +5991,7 @@ class BacktestApp:
                     ui(self._append_chat, "system", msg)
                     if auto_run:
                         _notify_discord(msg)
+                    _remember("no_change", "no_change", msg)
                     return
                 # Issue #153: an eligible class with an off-grid / structural
                 # plan is refused BEFORE the watermark, so that plan does
@@ -5853,11 +6022,13 @@ class BacktestApp:
                                 ui(self._append_chat, "system", why)
                                 _notify_discord(why)
                                 _log(why)
+                            _remember("skip", "knob_ineligible", why or rejection)
                             return
                         msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
                         ui(self._append_chat, "system", msg)
                         if auto_run:
                             _notify_discord(msg)
+                        _remember("refused", "refused", msg)
                         return
                 # Issue #125: watermark advances only after a completed
                 # plan with action=change — never at launch. no_change
@@ -5876,6 +6047,7 @@ class BacktestApp:
                     ui(self._append_chat, "system", msg)
                     if auto_run:
                         _notify_discord(msg)
+                    _remember("fail", "no_source", msg)
                     return
 
                 # ── Phase 2: Saturday knob grid, else candidate codegen ──
@@ -5907,6 +6079,7 @@ class BacktestApp:
                         ui(self._append_chat, "system", msg)
                         if auto_run:
                             _notify_discord(msg)
+                        _remember("fail", "knob_apply", msg)
                         return
                 if candidate_cls is None:
                     ui(self._append_chat, "system",
@@ -5932,6 +6105,7 @@ class BacktestApp:
                             # this loop entirely, so the advertised "one retry"
                             # never happened for API failures and the error died
                             # in the outer handler with no Discord notice.
+                            ai_calls += 1
                             resp = self._chat_client.one_shot(
                                 msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
                                 max_tokens=_CODE_GEN_MAX_TOKENS,
@@ -5963,6 +6137,7 @@ class BacktestApp:
                     ui(self._append_chat, "system", msg)
                     if auto_run:
                         _notify_discord(msg)
+                    _remember("fail", "codegen", msg)
                     return
 
                 # ── Phase 3: validation backtest ──
@@ -5981,6 +6156,7 @@ class BacktestApp:
                     ui(self._append_chat, "system", msg)
                     if auto_run:
                         _notify_discord(msg)
+                    _remember("fail", "insufficient_bars", msg)
                     return
 
                 data_desc = (
@@ -6202,6 +6378,7 @@ class BacktestApp:
                               "and STRATEGIES was not updated.")
                 # Recommend-only. A failure here must not change the verdict
                 # or the pool promotion above, and must not touch live state.
+                evaluated_at = None
                 try:
                     append_changelog = None
                     prior_weeks = []
@@ -6275,9 +6452,39 @@ class BacktestApp:
                         _discord.evolution_verdict(verdict.passed, block)
                     except Exception:
                         pass
+                if verdict.passed and pool_id:
+                    history_reason = ""
+                elif verdict.passed:
+                    history_reason = "pool promotion failed"
+                else:
+                    history_reason = "validation failed"
+                _remember(
+                    "pass" if verdict.passed else "fail",
+                    "validation",
+                    history_reason,
+                    provisional=bool(verdict.provisional),
+                    assembled=assembled,
+                    folds=folds,
+                    baseline_res=baseline_res,
+                    candidate_res=candidate_res,
+                    gate=evo_gate,
+                    gate_cfg=evo_gate_cfg,
+                    retire_evaluated=(evo_gate.mode == "relative"),
+                    retire_passed=bool(verdict.passed),
+                    ts=evaluated_at,
+                    capture_params=True,
+                    knob_apply=_knob_apply,
+                    baseline_cls=baseline_cls,
+                    baseline_source=strategy_source or "",
+                    candidate_source=code or "",
+                    candidate_name=candidate_cls.__name__,
+                    baseline_name=base_cls_name,
+                )
             except Exception as e:
                 _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 err_msg = str(e)
+                _remember("fail", "pipeline_error",
+                          f"[{type(e).__name__}] {err_msg}")
                 # Built INSIDE the except — Python 3.13 deletes `e` on exit.
                 # Weekly-auto runs must not die silently (issue #108): a
                 # plan-phase failure only reached the log before this.

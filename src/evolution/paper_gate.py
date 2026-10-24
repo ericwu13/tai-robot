@@ -622,10 +622,19 @@ class PromotionAssembly:
     later change fills the per-month dict). A merge can pass
     ``month_gates=month_verdict.month_gates`` without NameError or
     AttributeError.
+
+    ``window_verdict``, ``multifold_verdict``, and ``relative_verdict``
+    are the same objects that were ANDed into ``verdict``. They do not
+    change the combined decision. History persistence reads them so each
+    gate's reasons can be stored separately. ``relative_verdict`` is
+    None on the absolute path.
     """
 
     verdict: EvolutionVerdict
     month_verdict: EvolutionVerdict
+    window_verdict: EvolutionVerdict | None = None
+    multifold_verdict: EvolutionVerdict | None = None
+    relative_verdict: EvolutionVerdict | None = None
 
     @property
     def month_gates(self):
@@ -677,12 +686,17 @@ def assemble_promotion_verdict(
         majority=(rel_cfg.fold_majority if relative else None),
     )
     parts = [month, mf, window_verdict]
+    relative_verdict = None
     if relative:
-        parts.append(decide_relative_paper_checks(
-            folds, baseline_pnls_in_folds(base_trades, folds), rel_cfg))
+        relative_verdict = decide_relative_paper_checks(
+            folds, baseline_pnls_in_folds(base_trades, folds), rel_cfg)
+        parts.append(relative_verdict)
     return PromotionAssembly(
         verdict=combine_evolution_verdicts(*parts),
         month_verdict=month,
+        window_verdict=window_verdict,
+        multifold_verdict=mf,
+        relative_verdict=relative_verdict,
     )
 
 
