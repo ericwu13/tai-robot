@@ -21,6 +21,10 @@ env/
 # User config (contains credentials)
 settings.yaml
 
+# Local TAIFEX emergency closures (copy from taifex_closures.example.yaml).
+# A missing file is normal. Do not commit real closure dates.
+taifex_closures.yaml
+
 # Logs and data
 logs/
 *.log
