@@ -66,21 +66,36 @@ do not run it.
 - The test EXE is `C:\tai-test-194\app\tai_backtest.exe`. Leave every
   other `tai_backtest.exe` running.
 
-## Build (clean venv, pinned spec, commit cf58c7c)
+## Build (`.venv-build`, pinned spec, commit cf58c7c)
 
 No GitHub Actions workflow builds this EXE. Build it on oreopie, inside
 the test folder. The spec is `tai_backtest.spec` (PyInstaller `--onedir`,
 `console=True`, runtime hook `runtime_hook_comtypes.py`).
 
-`python build_release.py` with no flags creates a GitHub release and can
-send Discord. Use `--skip-release`.
+`build_release.py` with no flags creates a GitHub release and can send
+Discord. Use `--skip-release`.
 
-Known build workarounds (separate build PR):
+Build in `.venv-build`, not the system Python. Do not run `Activate.ps1`.
+A bare `python` is the system interpreter when activation did not run.
+Every `pip` command and `build_release.py` below uses
+`.\.venv-build\Scripts\python.exe`.
 
-- If `src\strategies` is missing, create it empty before PyInstaller.
-- Pin PyInstaller **6.19.0** and comtypes **1.4.15**.
-- This branch's spec also lists a top-level `strategies` datas entry.
-  Create that empty too if it is missing, or Analysis fails.
+The gate still checks out `cf58c7c`. That commit predates
+`--install-build-deps` and `requirements-build.txt`, so this checklist
+installs the same set that flag installs on the build-fix branch: the
+project (`pip install -e .`: pyyaml, keyring, httpx, lightweight-charts,
+pandas, holidays) plus PyInstaller **6.19.0** and comtypes **1.4.15**.
+`cf58c7c`'s `build_release.py --skip-release` does not pip-install. The
+`.venv-build` interpreter is the one that runs PyInstaller.
+
+That commit's spec still lists a top-level `strategies` datas entry, and
+`src\strategies` may be missing. Create both empty before PyInstaller, or
+Analysis fails. The spec on the stacked build-fix branch does not: it
+calls `strategies_datas(SPECPATH)`, which stages
+`build\strategies_placeholder`, and it lists `comtypes.gen` plus
+`src.evolution.grid_process`, `grid_search`, and `grid_smoke`. Do not
+build that later spec for this gate. The binary under test stays
+`cf58c7c`.
 
 ```powershell
 New-Item -ItemType Directory -Force C:\tai-test-194 | Out-Null
@@ -99,21 +114,22 @@ if (-not (Test-Path .\strategies)) {
   New-Item -ItemType Directory -Force .\strategies | Out-Null
 }
 
-py -3.13 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install pyyaml keyring httpx lightweight-charts pandas holidays comtypes==1.4.15 pyinstaller==6.19.0
+py -3.13 -m venv .venv-build
+$py = ".\.venv-build\Scripts\python.exe"
+& $py -m pip install --upgrade pip
+& $py -m pip install -e .
+& $py -m pip install comtypes==1.4.15 pyinstaller==6.19.0
 
 Copy-Item settings.example.yaml settings.yaml
 # Do not paste live credentials or a live chat API key into this file.
 # The smoke command does not read it.
 
-python build_release.py --skip-release
+& $py build_release.py --skip-release
 ```
 
 Pass: `git rev-parse HEAD` prints `cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb`,
-`python -m pip show pyinstaller` prints Version 6.19.0,
-`python -m pip show comtypes` prints Version 1.4.15,
+`.\.venv-build\Scripts\python.exe -m pip show pyinstaller` prints Version 6.19.0,
+`.\.venv-build\Scripts\python.exe -m pip show comtypes` prints Version 1.4.15,
 PyInstaller exits 0, and these exist:
 
 - `C:\tai-test-194\src\dist\tai_backtest\tai_backtest.exe`
@@ -430,8 +446,8 @@ host: oreopie
 test root: C:\tai-test-194\
 commit built: cf58c7c3f9836ac67ef57544fe0f167bccc3c7fb
 BUILD_INFO.json commit / dirty:
-pyinstaller version (must be 6.19.0):
-comtypes version (must be 1.4.15):
+pyinstaller version (must be 6.19.0, from .venv-build\Scripts\python.exe):
+comtypes version (must be 1.4.15, from .venv-build\Scripts\python.exe):
 src\strategies created empty if it was missing (yes/no):
 exe path (must be C:\tai-test-194\app\tai_backtest.exe):
 live settings or live API key copied in (must be no):
