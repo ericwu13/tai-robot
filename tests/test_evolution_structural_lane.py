@@ -873,10 +873,18 @@ def test_proposal_files_are_timestamped_and_never_overwrite(tmp_path):
     assert first["path"] != second["path"]
     assert Path(first["path"]).read_bytes() == raw
     assert "20261024T080000" in Path(first["path"]).name
+    assert "2026-W43" in Path(first["path"]).name
     assert Path(second["path"]).name.startswith(Path(first["path"]).stem)
+    later = record_proposal(
+        tmp_path / "lane", bot_id=_BREAKOUT, month="2026-10",
+        lane="structural", status="proposed",
+        evidence={"n": 3}, now=datetime(2026, 10, 31, 8, 0, 0))
+    assert later["path"] != first["path"]
+    assert "2026-W44" in Path(later["path"]).name
+    assert Path(first["path"]).read_bytes() == raw
     assert Path(second["path"]).name.endswith("-2.json")
     assert json.loads(raw.decode("utf-8"))["evidence"]["n"] == 1
-    assert len(list((tmp_path / "lane" / "proposals").glob("*.json"))) == 2
+    assert len(list((tmp_path / "lane" / "proposals").glob("*.json"))) == 3
 
 
 def test_applied_at_never_survives_a_lane_write(tmp_path):
@@ -1210,8 +1218,170 @@ def test_default_lane_runs_propose_and_adds_no_pool_row(
     assert body["applied"] is False
     assert body["pool_promoted"] is False
     assert "applied_at" not in body
+    assert "class HistBaseEvo1" in body["source_code"]
+    assert "def on_bar" in body["source_code"]
+    assert body["source_code"] != body["evidence"].get("candidate")
     rows = load_evolution_history(evolution_history_path(tmp_path / "bot"))
     assert len(rows) == 1, rows
     assert rows[0]["final_status"] == "pass"
     assert rows[0]["reason"] == "proposal recorded; nothing applied"
     assert rb._evolution_in_progress == set()
+
+
+def test_proposal_stores_candidate_source_not_just_the_class_name(tmp_path):
+    source = "class SideSplit:\n    def on_bar(self):\n        return None\n"
+    body = record_proposal(
+        tmp_path / "lane",
+        bot_id=_BREAKOUT,
+        month="2026-10",
+        lane="structural",
+        status="proposed",
+        form="side_split",
+        evidence={"candidate": "SideSplit", "dsr_trials": 1},
+        source_code=source,
+        now=_NOW,
+    )
+    saved = json.loads(Path(body["path"]).read_text(encoding="utf-8"))
+    assert saved["source_code"] == source
+    assert saved["evidence"]["candidate"] == "SideSplit"
+    assert saved["source_code"] != saved["evidence"]["candidate"]
+    assert "def on_bar" in saved["source_code"]
+    assert "source_code" not in saved["evidence"]
+
+
+def test_concurrent_reserve_from_two_bots_loses_no_entry(tmp_path, monkeypatch):
+    """Two bots reserving together both keep a slot. There is no file lock."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import src.evolution.structural_lane as lane_mod
+
+    monkeypatch.setattr(
+        lane_mod, "_ledger_write_pause", lambda: time.sleep(0.05))
+    ledger = tmp_path / "structural_lane.json"
+    cfg = default_lane_config()
+    src = Path("src/evolution/structural_lane.py").read_text(encoding="utf-8")
+    assert "fcntl" not in src
+    assert "portalocker" not in src
+    assert "FileLock" not in src
+    assert "_LEDGER_LOCK" in src
+
+    def _reserve(bot_id):
+        return reserve_structural_slot(
+            ledger, bot_id=bot_id, month="2026-10", config=cfg, now=_NOW)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.map(_reserve, ("bot-a", "bot-b"))
+    assert first.admit and second.admit
+    slots = load_ledger(ledger)["slots"]
+    assert {row["bot_id"] for row in slots} == {"bot-a", "bot-b"}
+    assert len(slots) == 2
+    assert all(row["applied"] is False for row in slots)
+
+
+def test_reserve_exception_refuses_without_the_grid_and_releases_the_guard(
+        tmp_path, monkeypatch):
+    """A reserve failure logs, writes one history line, and does not sweep the grid.
+
+    Returning False from the except would start the knob grid for an
+    eligible class. The run guard must be clear afterwards.
+    """
+    import inspect
+    import types
+    from tests.test_evolution_d1_knobs import _chat
+    from tests.test_evolution_issue164 import (
+        DynamicExitPullbackV3, _DiscordLog, _InlineThread, _wiring_app)
+    import src.evolution.grid_search as grid_mod
+    import src.evolution.structural_lane as lane_mod
+
+    rb._evolution_guard_clear()
+    launch = inspect.getsource(rb.BacktestApp._maybe_launch_structural)
+    assert "reserve failed" in launch
+    assert 'return "refused"' in launch
+    assert ".lock" not in launch
+    monkeypatch.setattr(rb, "_discord", _DiscordLog())
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    grid_calls = []
+
+    def _grid(*_args, **_kwargs):
+        grid_calls.append(1)
+        raise AssertionError("knob grid ran after a reserve failure")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("ledger blew up")
+
+    monkeypatch.setattr(grid_mod, "run_grid_on_bars", _grid)
+    monkeypatch.setattr(lane_mod, "reserve_structural_slot", _boom)
+    chat = _chat()
+    app = _wiring_app(tmp_path, chat)
+    app._live_runner.strategy = DynamicExitPullbackV3()
+    app.strategy_var = types.SimpleNamespace(get=lambda: "DynamicExitPullbackV3")
+    app._resolve_strategy_source = (
+        lambda name, cls: inspect.getsource(DynamicExitPullbackV3))
+    app._settings["evolution_min_design_trades"] = 0
+    app._settings["evolution_structural_lane"] = {
+        "enabled": True,
+        "ledger_path": str(tmp_path / "lane.json"),
+    }
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    assert grid_calls == []
+    assert chat.send_message.call_count == 0
+    assert chat.one_shot.call_count == 0
+    assert rb._evolution_in_progress == set()
+    from src.evolution.history import (
+        evolution_history_path, load_evolution_history)
+    rows = load_evolution_history(evolution_history_path(tmp_path))
+    assert len(rows) == 1, rows
+    assert rows[0]["final_status"] == "refused"
+    assert rows[0]["reason_kind"] == "refused"
+    assert "reserve failed" in rows[0]["reason"]
+    assert "RuntimeError" in rows[0]["reason"]
+    assert any("reserve failed" in text for _role, text in app.chat)
+    rb._evolution_guard_clear()
+
+
+def test_structural_saturday_replaces_the_grid_other_saturdays_run_it(
+        tmp_path, monkeypatch):
+    """The free monthly slot replaces that Saturday's grid. The next one runs it."""
+    import inspect
+    import types
+    from tests.test_evolution_d1_knobs import _chat
+    from tests.test_evolution_issue164 import (
+        DynamicExitPullbackV3, _DiscordLog, _InlineThread, _wiring_app)
+    import src.evolution.grid_search as grid_mod
+
+    rb._evolution_guard_clear()
+    monkeypatch.setattr(rb, "_discord", _DiscordLog())
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    grid_calls = []
+
+    def _grid(*_args, **_kwargs):
+        grid_calls.append(1)
+        return types.SimpleNamespace(
+            selected=None, reasons=["no plateau"], rationale="", evidence=None)
+
+    monkeypatch.setattr(grid_mod, "run_grid_on_bars", _grid)
+    chat = _chat()
+    chat.send_message.return_value = (
+        "```json\n{\"action\": \"no_change\"}\n```\n")
+    app = _wiring_app(tmp_path, chat)
+    app._live_runner.strategy = DynamicExitPullbackV3()
+    app.strategy_var = types.SimpleNamespace(get=lambda: "DynamicExitPullbackV3")
+    app._resolve_strategy_source = (
+        lambda name, cls: inspect.getsource(DynamicExitPullbackV3))
+    app._settings["evolution_min_design_trades"] = 0
+    app._settings["evolution_saturday_mode"] = "propose"
+    app._settings["evolution_structural_lane"] = {
+        "enabled": True,
+        "ledger_path": str(tmp_path / "lane.json"),
+    }
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    assert grid_calls == []
+    assert chat.send_message.call_count == 1
+    from src.evolution.structural_lane import load_ledger
+    assert len(load_ledger(tmp_path / "lane.json")["slots"]) == 1
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    assert grid_calls == [1]
+    assert chat.send_message.call_count == 1
+    assert rb._evolution_in_progress == set()
+    rb._evolution_guard_clear()

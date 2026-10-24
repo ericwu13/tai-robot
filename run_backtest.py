@@ -6017,10 +6017,48 @@ class BacktestApp:
         )
         if not decision.admit:
             return _refuse(decision.reason)
-        reserved = reserve_structural_slot(
-            ledger_path, bot_id=bot_id, month=month, config=cfg,
-            now=_taipei_now(), ineligible=bool(structural_only),
-            fallback=fallback)
+        try:
+            reserved = reserve_structural_slot(
+                ledger_path, bot_id=bot_id, month=month, config=cfg,
+                now=_taipei_now(), ineligible=bool(structural_only),
+                fallback=fallback)
+        except Exception as exc:
+            # A failed reserve is a clean refusal. Do not fall through
+            # to the weekly plan or the knob grid. The caller leaves
+            # handed False, so the run guard is released.
+            note = ("EVO structural lane reserve failed: "
+                    f"[{type(exc).__name__}] {exc}")
+            _log(note)
+            try:
+                self._append_chat("system", note)
+            except Exception:
+                pass
+            try:
+                if _discord is not None and getattr(_discord, "enabled", False):
+                    _discord.notify_evolution(note)
+            except Exception:
+                pass
+            try:
+                _persist_evolution_history(
+                    bot_dir,
+                    bot=self.strategy_var.get(),
+                    class_name=_evolution_class_name(self),
+                    source=source or "",
+                    cut_idx=design_cut_idx,
+                    watermark=watermark,
+                    final_status="refused",
+                    reason_kind="refused",
+                    reason=note,
+                    ai_calls=0,
+                    thresholds_raw=self._settings.get("evolution_gate_raw"),
+                )
+            except Exception as hist_exc:
+                try:
+                    _log("evolution history append failed: "
+                         f"[{type(hist_exc).__name__}] {hist_exc}")
+                except Exception:
+                    pass
+            return "refused"
         if not reserved.admit:
             return _refuse(reserved.reason)
         _log("EVO structural lane: this Saturday is the monthly structural "
@@ -6041,7 +6079,8 @@ class BacktestApp:
                                  lane: str, form: str = "",
                                  ledger_path: str = "", bot_id: str = "",
                                  month: str = "", touch_slot: bool = False,
-                                 incubation: dict | None = None) -> str:
+                                 incubation: dict | None = None,
+                                 source_code: str = "") -> str:
         """Record a proposal. Does not promote, save, or edit settings."""
         from src.evolution.structural_lane import (
             format_proposal_notice, record_proposal)
@@ -6059,6 +6098,7 @@ class BacktestApp:
             ledger_path=ledger if (touch_slot or incubation is not None) else None,
             touch_slot=touch_slot,
             incubation=incubation,
+            source_code=source_code,
         )
         return format_proposal_notice(body)
 
@@ -6081,12 +6121,16 @@ class BacktestApp:
         NOT write the StrategyStore and does NOT register STRATEGIES
         (issue #153). Deploying to live trading stays manual by design.
         Saturday auto on a knob-grid class applies an allowlisted knob
-        grid (max 2) only when the structural lane is off. The monthly
-        lane is on unless ``evolution.structural_lane.enabled`` is
-        boolean false, and it still only proposes. Propose mode records
-        evidence and does not promote the pool. Both of those
-        Saturday paths append the same evolution-history line and use
-        the same in-process run guard. Neither adds a lock or a cap.
+        grid (max 2) on Saturdays that are not this month's structural
+        turn. The structural Saturday replaces that grid run. Other
+        Saturdays run the grid. The lane is on unless
+        ``evolution.structural_lane.enabled`` is boolean false, and it
+        still only proposes. Propose mode records evidence and does not
+        promote the pool. Both Saturday paths append the same
+        evolution-history line and use the same per-bot run guard.
+        The shared lane ledger uses one process-wide threading lock
+        around reserve, record, and save. There is no file lock and
+        no history cap.
 
         Runs in a worker thread; every Tk touch goes through root.after.
         """
@@ -7003,6 +7047,7 @@ class BacktestApp:
                                 month=structural_month,
                                 touch_slot=bool(structural_lane),
                                 incubation=_incubation,
+                                source_code=(code if structural_lane else ""),
                             )
                         except Exception as e:
                             _log("EVO proposal record failed: "

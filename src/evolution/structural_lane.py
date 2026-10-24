@@ -19,9 +19,24 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+# One process-wide lock, shared by every bot in this process. It covers
+# the ledger read-modify-write (reserve, record, save). It is not a file lock.
+_LEDGER_LOCK = threading.RLock()
+
+# Test seam. Production leaves this None. A callable runs after a ledger
+# read and before the matching write, inside ``_LEDGER_LOCK``.
+_ledger_write_pause = None
+
+
+def _pause_ledger_write() -> None:
+    hook = _ledger_write_pause
+    if hook is not None:
+        hook()
 
 # Nova Q6 menu. The id is what the plan must name. The text is the
 # only change that form is allowed to make.
@@ -252,7 +267,10 @@ def settings_from_evolution(evo: dict | None) -> dict:
 
 
 def lane_config_from_settings(settings) -> dict:
-    """A partial settings dict still gets the disabled defaults."""
+    """A partial settings dict still gets the lane defaults.
+
+    A missing block leaves ``enabled`` true. A non-boolean value is off.
+    """
     raw = {}
     if isinstance(settings, dict):
         candidate = settings.get("evolution_structural_lane")
@@ -388,17 +406,18 @@ def _atomic_json(path: Path, payload: dict) -> None:
 
 
 def save_ledger(path, ledger: dict) -> None:
-    """Replace the ledger file. This does not take a file lock.
+    """Replace the ledger file under the process-wide ledger lock.
 
-    One bot's evolution runs are serialized by the in-process guard.
-    A cross-process lock around this read-modify-write is a later
-    cleanup, not this change.
+    Every bot in this process shares ``_LEDGER_LOCK``. Callers that
+    already hold it (reserve, record, the Saturday follow-up) re-enter
+    it. This does not take a file lock.
     """
-    body = {
-        "slots": list(ledger.get("slots") or []),
-        "incubations": list(ledger.get("incubations") or []),
-    }
-    _atomic_json(Path(path), body)
+    with _LEDGER_LOCK:
+        body = {
+            "slots": list(ledger.get("slots") or []),
+            "incubations": list(ledger.get("incubations") or []),
+        }
+        _atomic_json(Path(path), body)
 
 
 def count_in_paper(ledger: dict) -> int:
@@ -476,9 +495,22 @@ def reserve_structural_slot(path, *, bot_id: str, month: str, config: dict,
                             fallback: str = "") -> Admission:
     """Consume this bot's month. A second call the same month refuses.
 
-    Writes only ``path``. Returns the admission that was applied.
+    The process-wide ledger lock is held from the read through the save,
+    so two bots reserving together cannot drop a slot. Writes only
+    ``path``. Returns the admission that was applied. This does not
+    take a file lock.
     """
+    with _LEDGER_LOCK:
+        return _reserve_structural_slot_locked(
+            path, bot_id=bot_id, month=month, config=config, now=now,
+            ineligible=ineligible, fallback=fallback)
+
+
+def _reserve_structural_slot_locked(path, *, bot_id: str, month: str,
+                                    config: dict, now: datetime | None,
+                                    ineligible: bool, fallback: str) -> Admission:
     ledger = load_ledger(path)
+    _pause_ledger_write()
     decision = admission_decision(
         enabled=bool(config.get("enabled")),
         ineligible=ineligible,
@@ -518,10 +550,15 @@ def _touch_slot(ledger: dict, bot_id: str, month: str, form: str,
 
 
 def _proposal_path(root, bot_id: str, month: str, lane: str, moment: datetime) -> Path:
-    """One new file per attempt. A later attempt does not replace an earlier one."""
+    """One new file per attempt. A later week in the same month does not replace it.
+
+    The stem carries the ISO week and a timestamp, so two Saturdays in
+    one month never share a filename.
+    """
     directory = Path(root) / "proposals"
     stamp = moment.strftime("%Y%m%dT%H%M%S%f")
-    stem = f"{sanitize_bot_id(bot_id)}-{month}-{lane}-{stamp}"
+    iso_week = moment.strftime("%G-W%V")
+    stem = f"{sanitize_bot_id(bot_id)}-{month}-{lane}-{iso_week}-{stamp}"
     path = directory / f"{stem}.json"
     suffix = 2
     while path.exists():
@@ -535,6 +572,7 @@ def record_proposal(root, *, bot_id: str, month: str, lane: str, status: str,
                     ledger_path=None, touch_slot: bool = False,
                     incubation: dict | None = None,
                     now: datetime | None = None,
+                    source_code: str = "",
                     promote=None, save_store=None, write_settings=None,
                     write_allowlist=None, mutate_strategies=None) -> dict:
     """Write the proposal artifact. The callable arguments are ignored.
@@ -542,12 +580,34 @@ def record_proposal(root, *, bot_id: str, month: str, lane: str, status: str,
     They are accepted so a propose-mode caller cannot apply a candidate
     by handing this function the pool, store, or settings writer.
     ``applied`` is forced false even if ``evidence`` says otherwise.
+    ``source_code`` is the candidate source. A class name is not a
+    substitute. The process-wide ledger lock covers this write and the
+    ledger update that follows. This does not take a file lock.
     """
+    with _LEDGER_LOCK:
+        return _record_proposal_locked(
+            root, bot_id=bot_id, month=month, lane=lane, status=status,
+            evidence=evidence, form=form, ledger_path=ledger_path,
+            touch_slot=touch_slot, incubation=incubation, now=now,
+            source_code=source_code, promote=promote, save_store=save_store,
+            write_settings=write_settings, write_allowlist=write_allowlist,
+            mutate_strategies=mutate_strategies)
+
+
+def _record_proposal_locked(root, *, bot_id: str, month: str, lane: str,
+                            status: str, evidence, form: str, ledger_path,
+                            touch_slot: bool, incubation, now, source_code: str,
+                            promote, save_store, write_settings, write_allowlist,
+                            mutate_strategies) -> dict:
     del promote, save_store, write_settings, write_allowlist, mutate_strategies
     moment = now or datetime.now()
     payload = dict(evidence or {})
     payload.pop("applied", None)
     payload.pop("applied_at", None)
+    code_text = source_code if isinstance(source_code, str) else ""
+    if not code_text and isinstance(payload.get("source_code"), str):
+        code_text = payload["source_code"]
+    payload.pop("source_code", None)
     dsr_trials = payload.get("dsr_trials")
     if not isinstance(dsr_trials, int) or isinstance(dsr_trials, bool):
         dsr_trials = 1 if lane == "structural" and status == "proposed" else 0
@@ -564,6 +624,7 @@ def record_proposal(root, *, bot_id: str, month: str, lane: str, status: str,
         "strategy_store_saved": False,
         "pool_promoted": False,
         "dsr_trials": dsr_trials,
+        "source_code": code_text,
         "evidence": payload,
     }
     path = _proposal_path(root, bot_id, month, lane, moment)
@@ -938,11 +999,26 @@ def structural_saturday_followup(ledger_path, *, observations=(),
 
     Writes the ledger only when a stored row's status or session count
     changes. Does not write settings, an allowlist, or a strategy.
-    A missing ledger is a no-op.
+    A missing ledger is a no-op. The process-wide ledger lock is held
+    from the read through the save. This does not take a file lock.
     """
+    with _LEDGER_LOCK:
+        return _structural_saturday_followup_locked(
+            ledger_path, observations=observations, config=config, log=log,
+            changelog=changelog, report=report, strategy_name=strategy_name,
+            version=version)
+
+
+def _structural_saturday_followup_locked(ledger_path, *, observations=(),
+                                         config: dict | None = None,
+                                         log=None, changelog=None,
+                                         report: list | None = None,
+                                         strategy_name: str = "",
+                                         version: str = "unchanged") -> list[str]:
     if not ledger_path or not Path(ledger_path).exists():
         return []
     ledger = load_ledger(ledger_path)
+    _pause_ledger_write()
     if ledger.get("unreadable"):
         return []
     cfg = config or default_lane_config()

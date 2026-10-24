@@ -285,9 +285,11 @@ evolution:
   # paper_days inside this block is ignored (Nova Q6: 21 sessions and
   # 20 paper trades, timeout at 45). The same key elsewhere is not this
   # warning. ledger_path empty → data/evolution/structural_lane.json.
-  # A structural Saturday uses the same history file and the same
-  # in-process run guard. It does not add a lock or a size cap.
-  # The ledger read-modify-write has no file lock; that lock is deferred.
+  # The month's structural Saturday replaces that day's knob-grid
+  # sweep. Other Saturdays run the grid. The lane uses the same history
+  # file and the same per-bot run guard. It does not add a history cap.
+  # The shared ledger has one process-wide threading lock around
+  # reserve, record, and save. There is no file lock.
   structural_lane:
     enabled: true
     per_bot_per_month: 1
