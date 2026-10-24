@@ -148,19 +148,31 @@ def test_freeze_support_runs_before_tk_and_before_the_headless_bot():
 
 
 def test_frozen_hook_skips_comtypes_for_the_grid_child():
-    import runtime_hook_comtypes as hook
+    """Same argv cases as the old hook locals, through one shared helper.
 
-    assert hook._is_multiprocessing_child(
-        ["tai_backtest.exe", "--multiprocessing-fork", "parent_pid=1"])
-    assert not hook._is_multiprocessing_child(["tai_backtest.exe"])
-    assert hook._is_grid_smoke(
-        ["tai_backtest.exe", "--grid-subprocess-smoke", "--hang"])
-    assert not hook._is_grid_smoke(
-        ["tai_backtest.exe", "--multiprocessing-fork"])
+    ``runtime_hook_comtypes._is_multiprocessing_child`` and
+    ``_is_grid_smoke`` were replaced by ``src.paths`` so the EXE entry
+    and the hook cannot disagree. Fork is still only argv[1]. The smoke
+    flag is still anywhere. A plain EXE still installs the gen cache.
+    """
+    import runtime_hook_comtypes as hook
+    from src.paths import is_grid_smoke, is_multiprocessing_child
+
+    fork = ["tai_backtest.exe", "--multiprocessing-fork", "parent_pid=1"]
+    smoke = ["tai_backtest.exe", "--grid-subprocess-smoke", "--hang"]
+    assert is_multiprocessing_child(fork)
+    assert not is_multiprocessing_child(["tai_backtest.exe"])
+    assert is_grid_smoke(smoke)
+    assert not is_grid_smoke(fork)
+    assert not hook.should_install_comtypes(fork)
+    assert not hook.should_install_comtypes(smoke)
+    assert hook.should_install_comtypes(["tai_backtest.exe"])
     src = (ROOT / "runtime_hook_comtypes.py").read_text(encoding="utf-8")
-    assert "_is_multiprocessing_child" in src
-    assert "_is_grid_smoke" in src
+    assert "should_install_comtypes" in src
+    assert "skips_gui_and_com" in src
     assert "import comtypes.gen" in src
+    assert "def _is_multiprocessing_child" not in src
+    assert "def _is_grid_smoke" not in src
 
 
 def test_trial_evidence_matches_the_in_process_sweep():

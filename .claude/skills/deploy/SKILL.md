@@ -1,6 +1,6 @@
 ---
 name: deploy
-description: Deploy, restart or stop a tai-robot live bot headlessly with run_bot_cli.py — resolve the strategy name, gate real-order modes on explicit user consent, launch the bot as a detached process, and confirm it reached tick subscription. Use when asked to deploy/start/restart/stop a bot, to bring a bot back after a release or crash, or to run a bot without the Tk workbench.
+description: Deploy, restart or stop a tai-robot live bot headlessly with run_bot_cli.py (source) or tai_backtest.exe (packaged install) — resolve the strategy name, gate real-order modes on explicit user consent, launch the bot as a detached process, and confirm it reached tick subscription. Use when asked to deploy/start/restart/stop a bot, to bring a bot back after a release or crash, or to run a bot without the Tk workbench.
 ---
 
 # Deploy (headless)
@@ -14,9 +14,28 @@ cd C:\Users\eric8\gitRepos\tai-robot
 python run_bot_cli.py <command> ...
 ```
 
-Running python out of the main tree is what every bot does; *editing* it
-is still forbidden (see `fix-pr`). A git worktree cannot deploy — it has
-no `settings.yaml`, no `CapitalAPI_2.13.57/`, and a different `data/live`.
+Packaged install (no Python on PATH) — same subcommands, from the folder
+that contains `tai_backtest.exe`:
+
+```
+cd C:\path\to\tai_backtest
+tai_backtest.exe <command> ...
+```
+
+The EXE routes `deploy|stop|list|status|strategies|backtest` into the CLI
+and returns that command's exit code. No arguments, `-h`/`--help`, or an
+unknown first token opens the GUI (double-click stays the workbench).
+`--detach` spawns another `tai_backtest.exe` with the subcommand first
+(no `.py` argument, not `python.exe`). `semi_auto` is still refused.
+The process needs a logged-in desktop session; do not install it as a
+Windows service or a task set to run when the user is logged off.
+Source checkouts (oreopie) keep `python run_bot_cli.py`.
+
+Running python out of the main tree is what every source bot does;
+*editing* it is still forbidden (see `fix-pr`). A git worktree cannot
+deploy — it has no `settings.yaml`, no `CapitalAPI_2.13.57/`, and a
+different `data/live`. A packaged bot's `data\live` lives next to the
+EXE, the same directory the GUI uses.
 
 ## Commands
 

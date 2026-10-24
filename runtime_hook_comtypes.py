@@ -1,9 +1,10 @@
 """PyInstaller runtime hook: frozen-EXE fixups for comtypes and pythonnet.
 
 1. comtypes.gen: writable cache directory next to EXE. The package is
-   created there when the frozen bundle did not collect it. Skipped in a
-   multiprocessing spawn child (`--multiprocessing-fork`) and in the
-   key-free grid smoke parent so the grid sweep does not import COM.
+   created there when the frozen bundle did not collect it. Installed
+   for the GUI and for CLI subcommands (deploy needs COM). Skipped for
+   a multiprocessing spawn child and for the key-free grid-smoke parent
+   via src.paths.skips_gui_and_com — the same helper run_backtest uses.
 2. pythonnet: set PYTHONNET_PYDLL so Python.Runtime.dll finds the Python
    shared library in both the main process and multiprocessing children.
 3. PATH: prepend _MEIPASS so the .NET CLR can resolve native DLLs.
@@ -12,20 +13,14 @@ import os
 import sys
 
 
-def _is_multiprocessing_child(argv=None) -> bool:
-    """True when this frozen process is a spawn child, not the bot."""
-    args = sys.argv if argv is None else argv
-    return len(args) >= 2 and args[1] == "--multiprocessing-fork"
+def should_install_comtypes(argv=None) -> bool:
+    """False only for a spawn child or the grid-smoke parent.
 
-
-def _is_grid_smoke(argv=None) -> bool:
-    """True for the key-free ``--grid-subprocess-smoke`` parent.
-
-    That process must not import COM. The spawn child is recognized by
-    ``_is_multiprocessing_child`` and is also skipped.
+    CLI deploy/start and the GUI still return True so the gen cache is
+    installed. The argv test lives in src.paths (one helper).
     """
-    args = sys.argv if argv is None else argv
-    return "--grid-subprocess-smoke" in args
+    from src.paths import skips_gui_and_com
+    return not skips_gui_and_com(argv)
 
 
 def _install_comtypes_gen(cache_dir, init_py):
@@ -162,10 +157,10 @@ if getattr(sys, 'frozen', False):
         os.environ['PATH'] = _bundle_dir + os.pathsep + _path
 
     # ── comtypes ──
-    # The grid child is a frozen re-exec of this EXE. It must not import
-    # COM. The smoke parent does not either. PATH / PYTHONNET above do
-    # not import comtypes.
-    if not _is_multiprocessing_child() and not _is_grid_smoke():
+    # PATH / PYTHONNET above do not import comtypes. The GUI and CLI
+    # (deploy needs COM) install the gen cache. Spawn children and the
+    # grid-smoke parent skip it.
+    if should_install_comtypes():
         cache_dir = os.path.join(
             os.path.dirname(sys.executable), '_comtypes_cache')
         ensure_comtypes_gen(cache_dir)
