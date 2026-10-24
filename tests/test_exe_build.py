@@ -132,6 +132,12 @@ def test_requirements_build_pins_known_good_toolchain():
     assert "does **not** pip-install" in readme
     assert ".venv-build" in readme
     assert "does not ship a `comtypes/gen/`" in readme
+    assert "pip install -e ." in readme
+    for package in (
+        "pyyaml", "keyring", "httpx", "lightweight-charts", "pandas", "holidays",
+    ):
+        assert package in readme
+    assert "pip install -e ." in text
 
 
 def test_parse_pinned_requirements_rejects_unpinned_and_duplicates():
@@ -198,6 +204,9 @@ def test_ensure_build_requirements_installs_when_unpinned_combo(tmp_path):
     assert calls and calls[0][-2] == "-r"
     assert calls[0][-1].endswith("requirements-build.txt")
     assert "pip" in calls[0]
+    root = os.path.abspath(str(tmp_path))
+    editable = calls[0].index("-e")
+    assert calls[0][editable + 1] == root
 
 
 def test_ensure_build_requirements_exits_when_pip_fails(tmp_path):
@@ -253,33 +262,169 @@ def test_build_default_never_calls_pip(monkeypatch):
     assert calls[0][1:3] == ["-m", "PyInstaller"]
 
 
+def _probe_result(store, dist_name):
+    ver = store.get(dist_name)
+    if ver:
+        return types.SimpleNamespace(returncode=0, stdout=ver, stderr="")
+    return types.SimpleNamespace(returncode=3, stdout="", stderr="")
+
+
+def _install_into(store):
+    store["PyInstaller"] = "6.19.0"
+    store["comtypes"] = "1.4.15"
+
+
+def _fake_target_run(calls, *, target, target_store, host_store):
+    """Answer version probes from the interpreter named in argv[0].
+
+    pip into ``target`` fills ``target_store`` only. pip into any other
+    interpreter fills ``host_store``. A check that reads the host, or a
+    pip/PyInstaller argv that is not ``target``, cannot satisfy a test
+    that expects the target to end up pinned.
+    """
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        argv = list(cmd)
+        calls.append(argv)
+        if len(argv) >= 2 and argv[1] == "-c":
+            store = target_store if argv[0] == target else host_store
+            return _probe_result(store, argv[-1])
+        if "pip" in argv:
+            if argv[0] == target:
+                _install_into(target_store)
+            else:
+                _install_into(host_store)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return fake_run
+
+
+def _assert_pip_and_pyinstaller(calls, interpreter):
+    indexed = list(enumerate(calls))
+    probes = [
+        (i, cmd) for i, cmd in indexed if len(cmd) >= 2 and cmd[1] == "-c"
+    ]
+    pip_cmds = [
+        (i, cmd) for i, cmd in indexed if "pip" in cmd and "-m" in cmd
+    ]
+    pyinstaller = [
+        cmd for _i, cmd in indexed
+        if len(cmd) >= 3 and cmd[1:3] == ["-m", "PyInstaller"]
+    ]
+    assert len(pip_cmds) == 1, "install was skipped or repeated"
+    pip_at, pip = pip_cmds[0]
+    assert pip[0] == interpreter
+    assert pip[1:4] == ["-m", "pip", "install"]
+    assert "-e" in pip
+    root = os.path.dirname(os.path.abspath(build_release.__file__))
+    assert os.path.abspath(pip[pip.index("-e") + 1]) == root
+    assert pip[-2] == "-r"
+    assert pip[-1].endswith("requirements-build.txt")
+    before = [cmd for i, cmd in probes if i < pip_at]
+    after = [cmd for i, cmd in probes if i > pip_at]
+    assert before, "no version check before pip"
+    assert after, "no version check after pip"
+    assert all(cmd[0] == interpreter for cmd in before)
+    assert all(cmd[0] == interpreter for cmd in after)
+    assert {cmd[-1] for cmd in before} >= {"PyInstaller", "comtypes"}
+    assert {cmd[-1] for cmd in after} >= {"PyInstaller", "comtypes"}
+    assert pyinstaller and pyinstaller[0][0] == interpreter
+    return pip
+
+
 def test_build_install_build_deps_calls_pip(monkeypatch):
-    calls = _record_subprocess(monkeypatch)
-    versions = {}
-
-    def version_of(name):
-        return versions.get(name)
-
-    def fake_run(cmd, cwd=None):
-        calls.append(list(cmd))
-        if "pip" in cmd:
-            versions["PyInstaller"] = "6.19.0"
-            versions["comtypes"] = "1.4.15"
-        return types.SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(build_release.subprocess, "run", fake_run)
-    monkeypatch.setattr(build_release, "_installed_version", version_of)
+    """No .venv-build: pip, both pin checks, and PyInstaller use this interpreter."""
+    calls = []
+    store = {}
+    monkeypatch.setattr(
+        build_release.subprocess, "run",
+        _fake_target_run(
+            calls, target=sys.executable, target_store=store, host_store={},
+        ),
+    )
+    monkeypatch.setattr(build_release, "strategies_datas", lambda root: [])
     monkeypatch.setattr(build_release, "_dedicated_build_python", lambda root: None)
+    # In-process metadata stays empty. A check that ignores the target's
+    # probe and reads this process fails the post-install check.
+    monkeypatch.setattr(build_release, "_installed_version", lambda _name: None)
 
     build_release.build(install_requirements=True)
 
-    pip_cmds = [cmd for cmd in calls if "pip" in cmd]
-    assert len(pip_cmds) == 1
-    assert pip_cmds[0][0] == sys.executable
-    assert pip_cmds[0][1:4] == ["-m", "pip", "install"]
-    assert pip_cmds[0][-1].endswith("requirements-build.txt")
-    pyinstaller = [cmd for cmd in calls if "PyInstaller" in cmd]
-    assert pyinstaller and pyinstaller[0][0] == sys.executable
+    _assert_pip_and_pyinstaller(calls, sys.executable)
+
+
+def test_install_passes_when_host_lacks_pins_and_target_gains_them(
+    monkeypatch, tmp_path,
+):
+    """Running Python lacks the pins. The target gains them, so the build passes."""
+    win = tmp_path / ".venv-build" / "Scripts" / "python.exe"
+    win.parent.mkdir(parents=True)
+    win.write_text("", encoding="utf-8")
+    target = str(win)
+    assert build_release._dedicated_build_python(str(tmp_path)) == target
+
+    calls = []
+    target_store = {}
+    host_store = {}
+    real_lookup = build_release._dedicated_build_python
+
+    def lookup(_root):
+        return real_lookup(str(tmp_path))
+
+    monkeypatch.setattr(build_release, "_dedicated_build_python", lookup)
+    monkeypatch.setattr(build_release, "_installed_version", lambda _name: None)
+    monkeypatch.setattr(build_release, "strategies_datas", lambda root: [])
+    monkeypatch.setattr(
+        build_release.subprocess, "run",
+        _fake_target_run(
+            calls, target=target, target_store=target_store, host_store=host_store,
+        ),
+    )
+
+    build_release.build(install_requirements=True)
+
+    _assert_pip_and_pyinstaller(calls, target)
+    assert target_store == {"PyInstaller": "6.19.0", "comtypes": "1.4.15"}
+    assert host_store == {}
+
+
+def test_install_still_runs_when_host_has_pins_and_target_does_not(
+    monkeypatch, tmp_path,
+):
+    """Host pins must not skip the install. The target is what gets checked."""
+    target = str(tmp_path / ".venv-build" / "bin" / "python")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8"):
+        pass
+    pins = {"PyInstaller": "6.19.0", "comtypes": "1.4.15"}
+    calls = []
+    target_store = {}
+    host_store = dict(pins)
+    monkeypatch.setattr(
+        build_release, "_dedicated_build_python", lambda _root: target,
+    )
+    monkeypatch.setattr(build_release, "_installed_version", lambda name: pins.get(name))
+    monkeypatch.setattr(build_release, "strategies_datas", lambda root: [])
+    monkeypatch.setattr(
+        build_release.subprocess, "run",
+        _fake_target_run(
+            calls, target=target, target_store=target_store, host_store=host_store,
+        ),
+    )
+
+    build_release.build(install_requirements=True)
+
+    _assert_pip_and_pyinstaller(calls, target)
+    assert target_store == pins
+
+
+def test_dedicated_build_python_finds_windows_scripts(tmp_path):
+    """The Windows candidate is ``.venv-build/Scripts/python.exe`` and nothing else."""
+    win = tmp_path / ".venv-build" / "Scripts" / "python.exe"
+    win.parent.mkdir(parents=True)
+    win.write_text("", encoding="utf-8")
+    assert not (tmp_path / ".venv-build" / "bin" / "python").exists()
+    assert build_release._dedicated_build_python(str(tmp_path)) == str(win)
 
 
 def test_install_opt_in_prefers_venv_build_python(monkeypatch, tmp_path, capsys):
@@ -323,6 +468,36 @@ def test_main_wires_install_flags():
     assert '"--install-build-deps"' in src
     assert '"--no-install"' in src
     assert "resolve_install_request(" in src
+
+
+def test_main_passes_install_build_deps(monkeypatch):
+    """``main`` must hand the flag to ``build``, not merely accept it."""
+    seen = []
+
+    def fake_build(*, install_requirements=False):
+        seen.append(install_requirements)
+
+    monkeypatch.setattr(build_release, "build", fake_build)
+    monkeypatch.setattr(build_release, "git_commit_info", lambda: ("abc", False))
+    monkeypatch.setattr(build_release, "verify_bundle_matches_source", lambda: None)
+    monkeypatch.setattr(build_release, "write_build_stamp", lambda *_a, **_k: None)
+    monkeypatch.setattr(build_release, "package", lambda: "dist/x.zip")
+    monkeypatch.setattr(build_release, "write_checksum", lambda _path: "dist/x.zip.sha256")
+
+    def run(argv):
+        seen.clear()
+        monkeypatch.setattr(sys, "argv", argv)
+        build_release.main()
+        assert len(seen) == 1
+        return seen[0]
+
+    assert run(["build_release.py", "--skip-release", "--install-build-deps"]) is True
+    assert run(["build_release.py", "--skip-release"]) is False
+    assert run(["build_release.py", "--skip-release", "--no-install"]) is False
+    assert run([
+        "build_release.py", "--skip-release",
+        "--install-build-deps", "--no-install",
+    ]) is True
 
 
 # ── runtime hook (Linux, comtypes mocked) ───────────────────────────

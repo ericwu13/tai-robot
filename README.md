@@ -61,10 +61,23 @@ The app can be packaged as a standalone Windows EXE using PyInstaller (--onedir 
 python build_release.py --skip-release
 ```
 
-To install `requirements-build.txt`, pass `--install-build-deps`. Prefer a dedicated build venv (`.venv-build/`, gitignored) so comtypes is not downgraded in a dev or live venv. When `.venv-build` exists, that flag installs into its interpreter and runs PyInstaller with it. Otherwise it prints a warning naming the active interpreter (`sys.executable`) and installs there.
+A fresh `.venv-build` needs this project's packages as well as the toolchain. PyInstaller analyzes imports of pyyaml, keyring, httpx, lightweight-charts, pandas, and holidays. `--install-build-deps` installs both into the target interpreter: `pip install -e .` (those packages) and `pip install -r requirements-build.txt` (the pins). Pin checks before and after that install query the same interpreter, and PyInstaller runs with it. Prefer a dedicated build venv (`.venv-build/`, gitignored) so comtypes is not downgraded in a dev or live venv. When `.venv-build` exists, the flag installs into its interpreter. Otherwise it prints a warning naming the active interpreter (`sys.executable`) and installs there.
 
 ```bash
 python -m venv .venv-build
+# POSIX — manual equivalent of the flag
+.venv-build/bin/python -m pip install -e .
+.venv-build/bin/python -m pip install -r requirements-build.txt
+.venv-build/bin/python -m PyInstaller tai_backtest.spec --noconfirm
+# Windows
+.venv-build\Scripts\python -m pip install -e .
+.venv-build\Scripts\python -m pip install -r requirements-build.txt
+.venv-build\Scripts\python -m PyInstaller tai_backtest.spec --noconfirm
+```
+
+`--install-build-deps` runs that `pip install -e .` and the requirements file on the target interpreter, then builds:
+
+```bash
 # POSIX
 .venv-build/bin/python build_release.py --skip-release --install-build-deps
 # Windows
@@ -73,11 +86,12 @@ python -m venv .venv-build
 
 `requirements-build.txt` pins `PyInstaller==6.19.0` and `comtypes==1.4.15`. Those pins are secondary. The comtypes 1.4.15 wheel does not ship a `comtypes/gen/` package (1.4.17 does not either), so `import comtypes.gen` fails until the runtime hook creates it. That hook is the startup fix. `pyinstaller-hooks-contrib` is not pinned: PyInstaller 6.19.0 requires `pyinstaller-hooks-contrib>=2026.0`, and pip may install any newer release that satisfies that. No specific hooks-contrib version was recorded with the Windows smoke.
 
-The #194 Windows checklist (`docs/testing/grid_subprocess_windows_checklist.md` on that branch) installs the pins with its own `pip install` inside `C:\tai-test-194\src\.venv`, then runs `python build_release.py --skip-release`. That command does not pip-install. The empty `src\strategies` and `strategies` directories in that checklist are for the commit it checks out, which predates this spec.
+The #194 Windows checklist (`docs/testing/grid_subprocess_windows_checklist.md` on that branch) installs pyyaml, keyring, httpx, lightweight-charts, pandas, holidays plus the pins with its own `pip install` inside `C:\tai-test-194\src\.venv`, then runs `python build_release.py --skip-release`. That command does not pip-install. The empty `src\strategies` and `strategies` directories in that checklist are for the commit it checks out, which predates this spec.
 
-Direct invocation, after the pins are installed in the interpreter you intend to build with:
+Direct invocation, after the project and the pins are installed in the interpreter you intend to build with:
 
 ```bash
+pip install -e .
 pip install -r requirements-build.txt
 python -m PyInstaller tai_backtest.spec --noconfirm
 # or: pyinstaller tai_backtest.spec --noconfirm
@@ -96,7 +110,7 @@ Output: `dist/tai_backtest/tai_backtest.exe`
 | File | Purpose |
 |------|---------|
 | `requirements-build.txt` | Pinned PyInstaller and comtypes for the EXE build |
-| `build_release.py` | Runs the spec and zips the dist. Does not pip-install unless `--install-build-deps` |
+| `build_release.py` | Runs the spec and zips the dist. Does not pip-install unless `--install-build-deps` (then `pip install -e .` and the pins, into the target interpreter) |
 | `tai_backtest.spec` | PyInstaller build specification (--onedir mode) |
 | `runtime_hook_comtypes.py` | Runtime hook for writable comtypes.gen cache |
 

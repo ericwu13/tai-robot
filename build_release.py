@@ -7,13 +7,18 @@ Usage:
     python build_release.py --skip-release
         # build + zip only. Does not pip-install (the default).
     python build_release.py --skip-release --install-build-deps
-        # also pip-install requirements-build.txt. Prefers .venv-build.
+        # also pip-install -e . and requirements-build.txt into the
+        # target interpreter (prefers .venv-build), then run PyInstaller
+        # with that same interpreter.
 
 The default never runs pip. ``--no-install`` is accepted and changes
-nothing. ``--install-build-deps`` is the opt-in. It installs into
-``.venv-build`` when that interpreter exists; otherwise it warns and
-names the active interpreter before installing there. That can
-downgrade ``comtypes`` in a dev or live venv.
+nothing. ``--install-build-deps`` is the opt-in. It installs this
+project (``pip install -e .``: pyyaml, keyring, httpx,
+lightweight-charts, pandas, holidays) and ``requirements-build.txt``
+into ``.venv-build`` when that interpreter exists; otherwise it warns
+and names the active interpreter before installing there. Pin checks
+before and after the install query that same interpreter. Installing
+there can downgrade ``comtypes`` in a dev or live venv.
 
 Build-integrity guard (added after the v2.13.0 mismatch, where the
 published EXE was built from a checkout lacking the regime code):
@@ -259,6 +264,38 @@ def _installed_version(dist_name: str) -> str | None:
         return None
 
 
+# Query one distribution inside a chosen interpreter. Exit 3 means the
+# distribution is not installed there. Any other non-zero exit is a
+# probe failure (the interpreter itself could not run).
+_VERSION_PROBE = (
+    "import importlib.metadata, sys\n"
+    "try:\n"
+    "    print(importlib.metadata.version(sys.argv[1]), end='')\n"
+    "except importlib.metadata.PackageNotFoundError:\n"
+    "    raise SystemExit(3)\n"
+)
+
+
+def query_dist_version(python: str, dist_name: str, *, runner=None):
+    """Return the installed version of ``dist_name`` inside ``python``.
+
+    ``None`` when that interpreter does not have the distribution.
+    ``runner`` is called like ``subprocess.run(cmd, capture_output=True,
+    text=True)``.
+    """
+    cmd = [python, "-c", _VERSION_PROBE, dist_name]
+    run = runner or subprocess.run
+    result = run(cmd, capture_output=True, text=True)
+    code = getattr(result, "returncode", 1)
+    if code == 0:
+        text = (getattr(result, "stdout", "") or "").strip()
+        return text or None
+    if code == 3:
+        return None
+    print(f"ERROR: could not query {dist_name} in {python} (exit {code})")
+    sys.exit(1)
+
+
 def unsatisfied_pins(
     pins: dict[str, str], version_of,
 ) -> dict[str, str | None]:
@@ -275,12 +312,15 @@ def ensure_build_requirements(
     project_root: str | None = None, *, runner=None, version_of=None,
     python: str | None = None,
 ) -> dict[str, str]:
-    """Install ``requirements-build.txt`` when the environment doesn't match.
+    """Install this project and ``requirements-build.txt`` into ``python``.
 
     ``python`` is the interpreter that receives the packages (default:
-    this process). ``runner`` and ``version_of`` exist so tests can avoid
-    pip and the real environment. ``runner`` is called like
-    ``subprocess.run(cmd)``.
+    this process). Pin checks before and after the install query that
+    same interpreter.
+    ``runner`` and ``version_of`` exist so tests can avoid pip and a real
+    environment. ``runner`` is called like ``subprocess.run(cmd)`` for
+    pip and like ``subprocess.run(cmd, capture_output=True, text=True)``
+    for version probes.
     """
     root = os.path.abspath(
         project_root or os.path.dirname(os.path.abspath(__file__)) or "."
@@ -289,7 +329,10 @@ def ensure_build_requirements(
     req_path = os.path.join(root, BUILD_REQUIREMENTS)
     with open(req_path, encoding="utf-8") as fh:
         pins = parse_pinned_requirements(fh.read())
-    version_of = version_of or _installed_version
+    run = runner or subprocess.run
+    if version_of is None:
+        def version_of(name, _py=py, _run=run):
+            return query_dist_version(_py, name, runner=_run)
     bad = unsatisfied_pins(pins, version_of)
     if not bad:
         listed = ", ".join(f"{name}=={ver}" for name, ver in pins.items())
@@ -301,10 +344,11 @@ def ensure_build_requirements(
         if name in bad:
             have = bad[name] or "not installed"
             print(f"  {name}: want {want}, have {have}")
-    cmd = [py, "-m", "pip", "install", "-r", req_path]
-    print(f"Installing pinned build dependencies with {py}")
+    # -e . brings in the project (pyyaml, keyring, httpx,
+    # lightweight-charts, pandas, holidays). -r pins the toolchain.
+    cmd = [py, "-m", "pip", "install", "-e", root, "-r", req_path]
+    print(f"Installing the project and pinned build dependencies with {py}")
     print(f"  {' '.join(cmd)}")
-    run = runner or subprocess.run
     result = run(cmd)
     if getattr(result, "returncode", 1) != 0:
         print(f"ERROR: failed to install {BUILD_REQUIREMENTS}")
@@ -370,6 +414,7 @@ def _python_for_install(project_root: str) -> str:
         return dedicated
     print("WARNING: --install-build-deps will pip-install into this interpreter:")
     print(f"  {sys.executable}")
+    print("The install is pip install -e . plus requirements-build.txt.")
     print("That can downgrade comtypes in a dev or live venv.")
     print("Prefer a dedicated build venv and re-run with its python:")
     print("  python -m venv .venv-build")
@@ -392,6 +437,12 @@ def resolve_install_request(*, install_build_deps: bool, no_install: bool) -> bo
 
 
 def build(*, install_requirements: bool = False):
+    """Build the EXE. PyInstaller runs on the same interpreter as any install.
+
+    With ``install_requirements``, pin checks, ``pip install -e .``,
+    ``pip install -r requirements-build.txt``, and PyInstaller all use
+    the target interpreter (``.venv-build`` when it exists).
+    """
     print(f"=== Building tai_backtest v{VERSION} ===")
     root = os.path.dirname(os.path.abspath(__file__)) or "."
     py = sys.executable
@@ -670,11 +721,13 @@ def main():
     parser.add_argument("--skip-release", action="store_true",
                         help="Skip GitHub release creation (build + package only)")
     parser.add_argument("--install-build-deps", action="store_true",
-                        help="pip-install requirements-build.txt before "
-                             "PyInstaller. Uses .venv-build when that "
-                             "interpreter exists; otherwise installs into "
-                             "the active interpreter and prints its path. "
-                             "Can downgrade comtypes in a dev or live venv.")
+                        help="pip-install -e . and requirements-build.txt "
+                             "into the target interpreter, then run "
+                             "PyInstaller with it. Uses .venv-build when "
+                             "that interpreter exists; otherwise installs "
+                             "into the active interpreter and prints its "
+                             "path. Can downgrade comtypes in a dev or "
+                             "live venv.")
     parser.add_argument("--no-install", action="store_true",
                         help="Accepted no-op. The build does not pip-install "
                              "unless --install-build-deps is also set.")

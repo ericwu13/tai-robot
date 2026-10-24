@@ -5,7 +5,12 @@
 # Prefer a dedicated build virtualenv (.venv-build). --install-build-deps
 # uses that interpreter when it exists. Otherwise it warns and names the
 # active interpreter before installing there, which can downgrade comtypes
-# in a dev or live venv.
+# in a dev or live venv. Pin checks query that same interpreter.
+#
+# The flag also installs this project into that interpreter
+# (pip install -e .), so the EXE build sees pyyaml, keyring, httpx,
+# lightweight-charts, pandas, and holidays. This file only pins the
+# toolchain.
 #
 # The runtime hook is the real startup fix. The comtypes 1.4.15 wheel
 # (and 1.4.17) does not ship comtypes/gen/, so `import comtypes.gen`
