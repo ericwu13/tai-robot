@@ -6057,6 +6057,8 @@ class BacktestApp:
                     if pool_id:
                         try:
                             from src.daily_report.changelog import append_changelog
+                            from src.evolution.changelog_params import (
+                                evolution_changelog_params)
 
                             def _mdict(m):
                                 if m is None:
@@ -6067,6 +6069,14 @@ class BacktestApp:
                                         "pf": pf,
                                         "max_dd_pct": round(m.max_drawdown_pct, 2),
                                         "win_rate": round(m.win_rate, 3)}
+                            params_before, params_after, params_reason = (
+                                evolution_changelog_params(
+                                    knob_apply=_knob_apply,
+                                    baseline_cls=baseline_cls,
+                                    baseline_source=strategy_source or "",
+                                    candidate_source=code or "",
+                                    candidate_name=candidate_cls.__name__,
+                                ))
                             append_changelog(
                                 strategy_name=display_name,
                                 version_before=base_cls_name,
@@ -6081,6 +6091,9 @@ class BacktestApp:
                                 initiated_by="ai",
                                 metrics_before=_mdict(cl_base_m),
                                 metrics_after=_mdict(cl_cand_m),
+                                params_before=params_before,
+                                params_after=params_after,
+                                params_reason=params_reason,
                             )
                         except Exception as e:
                             _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
