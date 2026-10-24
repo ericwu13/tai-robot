@@ -1,6 +1,6 @@
 # v2.19.9
 
-> 草稿 / DRAFT. Base: master `cad71dd9` (#194, #195 merged). #172, #177 and #197 are **pending merge**. No build, tag or publish yet.
+> 草稿 / DRAFT. Base: master `0a98197c` (#194, #195, #197 merged). #172 and #177 are **pending merge**. No tag or publish yet.
 
 ## 修復與功能 Fixes & features
 
@@ -62,8 +62,6 @@
   **#194** (merged `747d4dcd`): the Saturday grid runs in a spawned subprocess instead of the live process, so it no longer holds the GIL and stalls Tk (ticks, fill polling, STOP file). Bounded at 20 min; timeout/crash/stop kills the child, picks nothing, watermark unchanged. Adds `--grid-subprocess-smoke`.
 - **#177（pending merge）**：發行版 `tai_backtest.exe` 直接支援無介面指令（`deploy`／`stop`／`list`／`status`／`strategies`／`backtest`），不另出第二個 EXE。雙擊、沒有參數、或無法辨識的第一個參數仍開 GUI。`--mode` 只接受 `paper` 與 `auto`；`semi_auto` 請用 GUI。不改下單、成交、還原或重連。
   **#177 (pending merge)**: the release `tai_backtest.exe` routes headless commands (`deploy` / `stop` / `list` / `status` / `strategies` / `backtest`); no second EXE. Double-click, no args, or an unknown first token still opens the GUI. `--mode` accepts `paper` and `auto` only; `semi_auto` stays on the GUI. No order, fill, restore or reconnect changes.
-- **#197（pending merge）**：缺少群益 Capital API SDK 時建置會明確失敗（exit 1），不再產出沒有 `_internal/libs` 券商 DLL 的 EXE。SDK `libs` 目錄由 `TAI_CAPITAL_SDK_DIR` 指定，否則用預設 `CapitalAPI_2.13.57/…/SKDLLPythonTester/libs`；`SKCOM.dll` 與 `CTSecuritiesATL.dll` 必須存在且非空。僅能以 `TAI_ALLOW_MISSING_CAPITAL_SDK=1` 或 `--allow-missing-broker-sdk` 可略過（CI／Linux 測試用）。
-  **#197 (pending merge)**: the build now fails loudly (exit 1) when the Capital API SDK is missing, instead of shipping an EXE with no `_internal/libs` broker DLLs. The SDK `libs` directory comes from `TAI_CAPITAL_SDK_DIR`, else the default `CapitalAPI_2.13.57/…/SKDLLPythonTester/libs`; `SKCOM.dll` and `CTSecuritiesATL.dll` must both be present and nonzero. Opt out only with `TAI_ALLOW_MISSING_CAPITAL_SDK=1` or `--allow-missing-broker-sdk` (CI / Linux test builds).
 - **#172（pending merge）**：#171 的後續修正。被 `BLOCK_FILL_PENDING` 擋下的延遲平倉（deferred close）在成交逾時或重啟後可能留下，之後在下一筆 auto 進場確認時被重播（新空單多一筆賣出，或同方向進場反被平倉）。修正：僅在進場 `fill_pending` 中才保存／還原 `deferred_close`；`FillPoller.timeout()` 在任何釋放成交閘門的逾時（進場與出場）都清除它。不改 BrokerPort／`broker.py`。進場逾時後不對帳實際部位仍是追蹤中的後續問題。
   **#172 (pending merge)**: fix-forward for #171. A deferred close (stored when `TRADE_CLOSE` is blocked by `BLOCK_FILL_PENDING`) could survive a fill timeout or a restart and be replayed on the next auto entry confirm (an extra sell on a new short, or a same-side entry closed instead). Fix: `deferred_close` is saved/restored only while an entry `fill_pending` is in flight, and `FillPoller.timeout()` clears it on every timeout that drops the fill gate (entry and exit). No BrokerPort / `broker.py` changes. Not reconciling the real book after an entry timeout remains a tracked follow-up.
 
@@ -71,6 +69,8 @@
 
 - **#195**（merge `cad71dd9`）：修正乾淨 clone 的 EXE 建置（不再打包 gitignored 的 `strategies/`，改用空白佔位）與 `comtypes.gen` 啟動當機（runtime hook 在 `_comtypes_cache` 建立 `comtypes.gen`）；固定 PyInstaller 6.19.0、comtypes 1.4.15。
   **#195** (merged `cad71dd9`): fixes fresh-clone EXE builds (bundles an empty placeholder instead of the gitignored `strategies/`) and the `comtypes.gen` startup crash (runtime hook creates `comtypes.gen` in `_comtypes_cache`); pins PyInstaller 6.19.0 and comtypes 1.4.15.
+- **#197**（merge `0a98197c`）：找不到群益 Capital API SDK 券商 DLL 時，建置會明確失敗（exit 1），不再產出 `_internal\libs` 是空的 EXE。建置前請將 `TAI_CAPITAL_SDK_DIR` 指向 SDK 的 `…\SKDLLPythonTester\libs` 資料夾（未設定時使用 repo 內預設 `CapitalAPI_2.13.57/…/SKDLLPythonTester/libs`；相對路徑以 spec 目錄為準）。`SKCOM.dll` 與 `CTSecuritiesATL.dll` 必須都存在且非空，否則錯誤訊息會指出缺少或為空的檔案。僅能以 `TAI_ALLOW_MISSING_CAPITAL_SDK=1` 或 `--allow-missing-broker-sdk` 略過（CI／Linux 測試建置用，產出的 EXE 無法連券商）；其他 `TAI_ALLOW_MISSING_CAPITAL_SDK` 值只會警告，仍會失敗。SDK 存在時打包的 DLL 與先前相同。
+  **#197** (merged `0a98197c`): the build now refuses to finish (exit 1) when the Capital API broker DLLs are missing, instead of shipping an EXE with an empty `_internal\libs`. Before building, point `TAI_CAPITAL_SDK_DIR` at the SDK's `…\SKDLLPythonTester\libs` folder (unset: the in-repo default `CapitalAPI_2.13.57/…/SKDLLPythonTester/libs`; a relative path resolves against the spec directory). `SKCOM.dll` and `CTSecuritiesATL.dll` must both be present and nonzero; the error names the missing or empty file. The only opt-outs are `TAI_ALLOW_MISSING_CAPITAL_SDK=1` or `--allow-missing-broker-sdk` (CI / Linux test builds; that EXE can't reach the broker). Any other `TAI_ALLOW_MISSING_CAPITAL_SDK` value warns and still fails. With the SDK present, the bundled DLLs are unchanged.
 
 ## 升級注意 Upgrade notes
 
@@ -78,6 +78,7 @@
 - 有週六 `auto_run` 的 bot 需新版並重啟。注意預設行為改變：`saturday_mode: propose`（不再自動提升 pool）、`search: grid_batch`、`paper_gate: relative`、月門檻 `merge_stub` + `scaled`。 / Bots with Saturday `auto_run` need the new build + restart. Default behaviour changes: `saturday_mode: propose` (no automatic pool promotion), `search: grid_batch`, `paper_gate: relative`, month gates `merge_stub` + `scaled`.
 - `settings.example.yaml` 新增 `evolution` 鍵 / new `evolution` keys: `min_design_trades`, `idle_warn_days`, `knob_ineligible_fallback`, `paper_gate`, `real_gate`, `search`, `saturday_mode`, `relative.*`, `trial_penalty.*`, `retire.*`, `month_gate.*` (`latest_def`, `min_sessions`, `slack.*`), `structural_lane.*`. 可選本機檔 / optional local file: `taifex_closures.yaml`.
 - 無介面操作（#177，pending merge）：在安裝資料夾執行 `tai_backtest.exe deploy`（部署）、`tai_backtest.exe stop`（停止）、`tai_backtest.exe list`（列出）、`tai_backtest.exe status`（狀態）。`--mode` 只有 `paper`／`auto`；`semi_auto` 請用 GUI。需在已登入的桌面工作階段執行（不支援 Windows 服務／LocalSystem）。 / Headless (#177, pending merge): from the install folder run `tai_backtest.exe deploy`, `tai_backtest.exe stop`, `tai_backtest.exe list`, `tai_backtest.exe status`. `--mode` is `paper` or `auto` only; `semi_auto` stays on the GUI. Requires a logged-in desktop session (not a Windows service / LocalSystem).
+- 自行建置者（#197）：執行 `build_release.py` 前設定 `TAI_CAPITAL_SDK_DIR=<SDK>\…\SKDLLPythonTester\libs`，否則缺少 SDK 時建置會失敗。一般使用者下載發行版 zip 不受影響。 / Builders (#197): set `TAI_CAPITAL_SDK_DIR=<SDK>\…\SKDLLPythonTester\libs` before `build_release.py`, or the build fails when the SDK isn't in the checkout. Operators using the release zip are unaffected.
 - `evolution_history.jsonl` 不會自動截斷，需要時手動封存。 / `evolution_history.jsonl` is never trimmed; archive by hand if needed.
 - DEGRADED 時新進場被封鎖，請按 Reconnect 或重啟。 / In DEGRADED, new entries are blocked: press Reconnect or restart.
 
@@ -99,6 +100,7 @@
 
 - **#192 GIL 卡頓**：已由 #194 解決（網格改在 spawn 子程序執行）。 / **#192 GIL stall**: resolved by #194 (the grid now runs in a spawned subprocess).
 - **#195**：已合併（`cad71dd9`），建置需要的修正已在 master。 / merged (`cad71dd9`); the build fix is on master.
+- **#197**：已合併（`0a98197c`）。 / merged (`0a98197c`).
 
 ## 開發者 Developer
 
