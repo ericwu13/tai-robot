@@ -642,7 +642,11 @@ class TestPromotionWiring:
             and isinstance(node.func, ast.Name)
             and node.func.id == "assemble_promotion_verdict"
         ]
-        assert len(calls) == 1
-        names = {kw.arg for kw in calls[0].keywords}
-        assert "bars" in names
-        assert "month_gate" in names
+        # Saturday verdict and the structural-lane Q2 both go through
+        # the same helper, and both forward the price bars and the
+        # parsed month-gate config.
+        assert len(calls) == 2
+        for call in calls:
+            names = {kw.arg for kw in call.keywords}
+            assert "bars" in names
+            assert "month_gate" in names

@@ -27,10 +27,11 @@ before the cache is consulted.
 
 ``evolution.knob_ineligible_fallback`` is ``none`` (default) or
 ``structural_lane``. Neither value selects the weekly codegen path.
-The structural lane itself is a later change; this module only records
-the configured mode on the exclusion line. Off-grid proposals on an
-eligible class still stop before the watermark. The substring grid
-match stays; an explicit class opt-in is a follow-up.
+The monthly lane lives in ``structural_lane.py`` and is on unless
+``evolution.structural_lane.enabled`` is boolean false. This module
+only records the configured mode on the exclusion line. Off-grid
+proposals on an eligible class still stop before the watermark. The
+substring grid match stays; an explicit class opt-in is a follow-up.
 """
 
 from __future__ import annotations

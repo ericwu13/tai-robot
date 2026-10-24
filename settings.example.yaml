@@ -114,8 +114,10 @@ evolution:
   capital_base_twd: 100000
   # Classes with fewer than 2 rewritable Saturday-grid knobs are excluded
   # from the weekly run. "none" (default) does not codegen them.
-  # "structural_lane" is reserved for a later monthly lane and also does
-  # not enable weekly codegen. Any other value is treated as "none".
+  # "structural_lane" is the fallback name for the monthly lane. It does
+  # not enable weekly codegen, and it does not run the lane by itself.
+  # The lane is on unless structural_lane.enabled is boolean false.
+  # Any other value is treated as "none".
   knob_ineligible_fallback: "none"
   # 僅星期六自動演化：設計窗交易數低於此值時，不呼叫 AI 演化計畫
   # （0 次 AI 呼叫，水位線不前進），聊天室／Discord 顯示
@@ -262,10 +264,47 @@ evolution:
   # for this file. Not a credential.
   # A second evolution run on the same bot is refused while one is
   # already running in this process (manual Evolve during the Saturday
-  # auto run). That guard is in-memory. It does not use the bot's
-  # process .lock and it does not write a state file.
+  # auto run, including a structural-lane or propose-mode run). That
+  # guard is in-memory. It does not use the bot's process .lock and it
+  # does not write a state file.
   # assess_retirement still reads the changelog. Switching that reader
   # to this history file is a later follow-up.
+  # Saturday auto run. "propose" (default) writes a proposal file with
+  # the verdict evidence and does not promote the pool, write
+  # StrategyStore, or change a bot. "promote" is an explicit opt-in
+  # that keeps the StrategyPool validated-on-PASS path. Propose mode
+  # still appends the same evolution_history.jsonl line. The manual
+  # Evolve button is not this flag.
+  saturday_mode: "propose"
+  # Monthly structural lane. On by default, and still propose-only.
+  # Distinct from the knob grid: one named form, one candidate per bot
+  # per calendar month, no retry, at most 3 outstanding paper
+  # recommendations. It never promotes the pool, writes settings, or
+  # changes a live or paper strategy. Boolean false is the off switch.
+  # A non-boolean enabled value stays off. Graduation is text only.
+  # paper_days inside this block is ignored (Nova Q6: 21 sessions and
+  # 20 paper trades, timeout at 45). The same key elsewhere is not this
+  # warning. ledger_path empty → data/evolution/structural_lane.json.
+  # The month's structural Saturday replaces that day's knob-grid
+  # sweep. Other Saturdays run the grid. The lane uses the same history
+  # file and the same per-bot run guard. It does not add a history cap.
+  # Paper and backtest Q2 use the relative gate. Structural dsr_min
+  # is 0.95; the grid's trial_penalty.dsr_min stays 0.90. The candidate
+  # must beat the baseline on the selection folds. PBO is computed and
+  # shown, and it is not a pass condition (two-column CSCV does not
+  #   discriminate). Real money stays absolute. paper_recommended is text only.
+  # The shared ledger has one process-wide threading lock around
+  # reserve, record, and save. One GUI per tree is the supported
+  # model. There is no cross-process lock and no file lock.
+  structural_lane:
+    enabled: true
+    dsr_min: 0.95              # this lane only; grid trial_penalty.dsr_min stays 0.90
+    per_bot_per_month: 1
+    max_in_paper: 3
+    min_paper_sessions: 21
+    min_paper_trades: 20
+    timeout_sessions: 45
+    ledger_path: ""
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON
