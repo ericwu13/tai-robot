@@ -2,10 +2,13 @@
 
 One JSON object per line, at ``{bot_dir}/evolution_history.jsonl``.
 Live bots keep that file next to ``evolution_watermark.json`` under
-``data/live/{symbol}_{bot}/``. A run with no bot directory does not
-write (there is no per-bot file to append to). Tests pass a temporary
-directory. This module never reads settings, never writes a lock, a
-vote, or session state, and never raises to its caller.
+``data/live/{symbol}_{bot}/``. A run with no bot directory, or a bot directory that does not exist,
+does not write and does not create the directory. Tests pass a
+temporary directory that already exists. This module never reads
+settings, never writes a lock, a vote, or session state, and never
+raises to its caller. A second evolution run on the same bot is
+refused in-process before it gets here; this writer does not take a
+file lock and does not touch the bot's process ``.lock``.
 
 Schema (one object per attempt). Keys the plan named are stored under
 these names:
@@ -67,12 +70,14 @@ these names:
   ``insufficient_bars``, ``validation``, ``pipeline_error`` → ``fail``
   or, for a clean validation pass, ``pass``
 
-A write error is logged and swallowed. ``os.replace`` retries
-``PermissionError`` (Windows WinError 5) with the heartbeat writer's
-bounded backoff (``replace_retrying_permission_error``). The final
-failure is a warning and does not propagate into the evolution run.
-Readers skip a missing file, an undecodable file, and any line that
-is not a JSON object.
+A write error is logged and swallowed. Each record is one
+``write()`` of a complete line in binary append mode, then ``flush``.
+Opening the file retries ``PermissionError`` (Windows WinError 5)
+with the heartbeat writer's bounded backoff
+(``call_retrying_permission_error``). The final failure is a warning
+and does not propagate into the evolution run. Readers skip a missing
+file and any line that is not a UTF-8 JSON object. The file is not
+rewritten, so a bad line stays where it is and later lines are kept.
 
 The file is not size-capped and is not rotated. One line per attempt
 is small, and trimming it would drop weeks ``weeks_from_history``
@@ -87,9 +92,9 @@ import json
 import math
 import os
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 
-from src.live.main_heartbeat import replace_retrying_permission_error
+from src.live.main_heartbeat import call_retrying_permission_error
 
 from .paper_gate import (
     WeekRecord,
@@ -131,22 +136,54 @@ def _finite(value):
     return number
 
 
+def _numpy_scalar(value):
+    """Python value of a numpy scalar, or None when ``value`` is not one.
+
+    Numpy integers and floats are not ``int`` / ``float`` subclasses, so
+    they would otherwise be stored as null. ``.item()`` returns the
+    matching Python scalar. The app does not import numpy.
+    """
+    module = getattr(type(value), "__module__", "") or ""
+    if module != "numpy" and not module.startswith("numpy."):
+        return None
+    item = getattr(value, "item", None)
+    if not callable(item):
+        return None
+    try:
+        return item()
+    except Exception:
+        return None
+
+
 def _json_ready(value):
-    """A JSON value. Non-finite floats become null. Unknown objects drop."""
+    """A JSON value. Non-finite floats become null. Unknown objects drop.
+
+    Numpy ints and floats become Python numbers. ``datetime`` and
+    ``date`` become ``YYYY-MM-DDTHH:MM:SS`` and ``YYYY-MM-DD``.
+    """
     if value is None or isinstance(value, str):
         return value
     if isinstance(value, bool):
         return value
-    if isinstance(value, int):
+    # Exact builtin types. np.float64 is a float subclass and must not
+    # be stored as a numpy scalar; .item() turns it into a Python float.
+    if type(value) is int:
         return value
-    if isinstance(value, float):
+    if type(value) is float:
         if not math.isfinite(value):
             return None
         return value
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%dT%H:%M:%S")
+    if isinstance(value, date):
+        return value.isoformat()
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_ready(item) for item in value]
+    scalar = _numpy_scalar(value)
+    if scalar is not None and scalar is not value:
+        return _json_ready(scalar)
     return None
 
 
@@ -445,44 +482,50 @@ def build_evolution_record(
     return record
 
 
+def _open_binary_append(path):
+    """Open ``path`` for a binary append. Retried on ``PermissionError``."""
+    return open(path, "ab")
+
+
 def append_evolution_history(path, record, *, log=None, sleep=None) -> bool:
     """Append one JSON line. Never raises.
 
-    The previous file is replaced only after the new contents are on
-    disk (temp file in the same directory, fsync, ``os.replace``).
-    ``os.replace`` uses the heartbeat writer's bounded
-    ``PermissionError`` retry. A final failure, including an exhausted
-    retry, logs a warning and leaves the previous bytes in place. An
-    existing file that cannot be decoded as UTF-8 is left untouched
-    and the failure is logged. A missing file is created. ``sleep``
-    overrides the retry backoff (tests). The file is not trimmed.
+    One ``write()`` of the complete line, in binary append mode, then
+    ``flush``. The open retries ``PermissionError`` with the heartbeat
+    writer's bounded backoff. A final failure logs a warning and leaves
+    the previous bytes in place. A missing parent directory is not
+    created. ``sleep`` overrides the retry backoff (tests). The file is
+    not trimmed.
     """
     path = os.fspath(path)
-    tmp = None
+    handle = None
     try:
         payload = _json_ready(record)
         if not isinstance(payload, dict):
             raise TypeError("evolution history record must be an object")
         line = json.dumps(
             payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        blob = line + "\n"
+        blob = (line + "\n").encode("utf-8")
         directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        existing = ""
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as handle:
-                existing = handle.read()
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(existing)
-            handle.write(blob)
-            handle.flush()
-            os.fsync(handle.fileno())
-        replace_retrying_permission_error(tmp, path, sleep_fn=sleep)
-        tmp = None
+        if directory and not os.path.isdir(directory):
+            _report(
+                log,
+                "warning: evolution history append skipped: directory missing",
+            )
+            return False
+        # A pre-existing file that does not end in a newline would glue
+        # this record onto its last line. The separator is part of the
+        # same write as the record.
+        prefix = b""
+        if os.path.isfile(path) and os.path.getsize(path):
+            with open(path, "rb") as existing:
+                existing.seek(-1, os.SEEK_END)
+                if existing.read(1) != b"\n":
+                    prefix = b"\n"
+        handle = call_retrying_permission_error(
+            lambda: _open_binary_append(path), sleep_fn=sleep)
+        handle.write(prefix + blob)
+        handle.flush()
         return True
     except PermissionError as exc:
         _report(
@@ -495,9 +538,9 @@ def append_evolution_history(path, record, *, log=None, sleep=None) -> bool:
         _report(log, f"evolution history append failed: [{type(exc).__name__}] {exc}")
         return False
     finally:
-        if tmp:
+        if handle is not None:
             try:
-                os.remove(tmp)
+                handle.close()
             except OSError:
                 pass
 
@@ -505,21 +548,24 @@ def append_evolution_history(path, record, *, log=None, sleep=None) -> bool:
 def load_evolution_history(path) -> list[dict]:
     """Records in file order.
 
-    A missing file, an unreadable file, and a non-UTF-8 file yield
-    ``[]``. Lines that are not a JSON object are skipped. Valid lines
-    around a corrupt line are kept.
+    A missing or unreadable file yields ``[]``. A line that is not
+    UTF-8 or not a JSON object is skipped. Valid lines around a bad
+    line are kept.
     """
     path = os.fspath(path)
     if not os.path.exists(path):
         return []
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
-    except (OSError, UnicodeError):
+        with open(path, "rb") as handle:
+            raw_text = handle.read()
+    except OSError:
         return []
     found = []
-    for raw in text.splitlines():
-        line = raw.strip()
+    for raw in raw_text.splitlines():
+        try:
+            line = raw.decode("utf-8").strip()
+        except UnicodeError:
+            continue
         if not line:
             continue
         try:
@@ -545,10 +591,13 @@ def record_evolution_attempt(bot_dir, *, log=None, thresholds_raw=None,
                              **fields) -> bool:
     """Build one record and append it under ``bot_dir``. Never raises.
 
-    ``bot_dir`` empty → False, no log (no per-bot file). Write failures
-    are logged through ``log`` and return False.
+    ``bot_dir`` empty or not an existing directory → False, no log,
+    and the directory is not created. Write failures are logged
+    through ``log`` and return False.
     """
     if not bot_dir:
+        return False
+    if not os.path.isdir(os.fspath(bot_dir)):
         return False
     try:
         if (capture_params and params_before is None and params_after is None

@@ -162,26 +162,29 @@ def atomic_write_json(path: str, payload: dict, *, sleep=None,
         raise
 
 
-def replace_retrying_permission_error(tmp: str, path: str, *, sleep_fn=None) -> None:
-    """Move ``tmp`` onto ``path``. Retry ``PermissionError`` only.
+def call_retrying_permission_error(action, *, sleep_fn=None):
+    """Call ``action`` up to 4 times. Retry ``PermissionError`` only.
 
-    Windows ``os.replace`` raises ``PermissionError`` (WinError 5,
-    sharing violation) while a reader holds the destination without
-    ``FILE_SHARE_DELETE``. The budget is the heartbeat writer's: 4
-    attempts, backing off 5/10/20 ms. Any other exception fails on the
-    first attempt. The final ``PermissionError`` is re-raised and is
-    not logged here — callers decide whether to warn or re-raise.
+    Windows sharing violations surface as ``PermissionError`` (WinError
+    5). The budget is the heartbeat writer's: 4 attempts, backing off
+    5/10/20 ms. Any other exception fails on the first attempt. The
+    final ``PermissionError`` is re-raised and is not logged here.
     ``sleep_fn`` overrides the backoff sleep (tests).
     """
     pause = _sleep if sleep_fn is None else sleep_fn
     for attempt in range(_REPLACE_ATTEMPTS):
         try:
-            os.replace(tmp, path)
-            return
+            return action()
         except PermissionError:
             if attempt + 1 >= _REPLACE_ATTEMPTS:
                 raise
             pause(_REPLACE_BACKOFF_S[attempt])
+
+
+def replace_retrying_permission_error(tmp: str, path: str, *, sleep_fn=None) -> None:
+    """Move ``tmp`` onto ``path``. Retry ``PermissionError`` only."""
+    call_retrying_permission_error(
+        lambda: os.replace(tmp, path), sleep_fn=sleep_fn)
 
 
 def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:

@@ -27,6 +27,7 @@ from src.evolution.history import (
     weeks_from_history,
 )
 from src.evolution.paper_gate import (
+    PromotionAssembly,
     RetireConfig,
     assess_retirement,
     assemble_promotion_verdict,
@@ -94,6 +95,7 @@ def test_fail_run_records_deep_multifold_month_and_promotion(tmp_path):
         gate=gate, gate_cfg=cfg,
     )
     bot_dir = tmp_path / "bot"
+    bot_dir.mkdir()
     assert record_evolution_attempt(
         bot_dir,
         bot="Probe",
@@ -277,29 +279,38 @@ def test_corrupt_lines_are_skipped_and_preserved(tmp_path):
         "ok", "also", "new"]
 
 
-def test_undecodable_file_is_left_untouched(tmp_path):
+def test_bad_bytes_are_skipped_and_a_later_line_is_appended(tmp_path):
     path = tmp_path / HISTORY_FILENAME
-    raw = b"\xff\xfe not utf8"
-    path.write_bytes(raw)
+    path.write_bytes(b"\xff\xfe not utf8\n")
     assert load_evolution_history(path) == []
-    logs = []
     assert append_evolution_history(
-        path, {"bot": "x", "final_status": "skip"}, log=logs.append) is False
-    assert path.read_bytes() == raw
-    assert logs and "evolution history append failed" in logs[0]
+        path, {"bot": "x", "final_status": "skip"}) is True
+    raw = path.read_bytes()
+    assert raw.startswith(b"\xff\xfe not utf8\n")
+    assert [row["bot"] for row in load_evolution_history(path)] == ["x"]
     assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.lock")) == []
 
 
-def test_replace_failure_keeps_previous_bytes_and_does_not_raise(tmp_path, monkeypatch):
+def test_write_failure_keeps_previous_bytes_and_does_not_raise(tmp_path, monkeypatch):
+    import src.evolution.history as history_mod
+
     path = tmp_path / HISTORY_FILENAME
     assert append_evolution_history(path, {"bot": "first", "final_status": "skip"})
     before = path.read_bytes()
     logs = []
+    real_open = history_mod._open_binary_append
 
-    def _boom(src, dst):
-        raise OSError("disk full")
+    def wrapped(target):
+        handle = real_open(target)
 
-    monkeypatch.setattr(os, "replace", _boom)
+        def _boom(_data):
+            raise OSError("disk full")
+
+        handle.write = _boom
+        return handle
+
+    monkeypatch.setattr(history_mod, "_open_binary_append", wrapped)
     assert append_evolution_history(
         path, {"bot": "second", "final_status": "fail"}, log=logs.append) is False
     assert path.read_bytes() == before
@@ -308,8 +319,9 @@ def test_replace_failure_keeps_previous_bytes_and_does_not_raise(tmp_path, monke
     assert list(tmp_path.glob("*.tmp")) == []
 
 
-def test_replace_permission_error_retries_then_succeeds(tmp_path, monkeypatch):
-    """First N PermissionErrors, then success: line kept, no warning."""
+def test_open_permission_error_retries_then_succeeds(tmp_path, monkeypatch):
+    """First N PermissionErrors on open, then success: line kept, no warning."""
+    import src.evolution.history as history_mod
     from src.live import main_heartbeat as hb
 
     path = tmp_path / HISTORY_FILENAME
@@ -317,15 +329,15 @@ def test_replace_permission_error_retries_then_succeeds(tmp_path, monkeypatch):
     before = path.read_bytes()
     sleeps = []
     calls = {"n": 0}
-    real = os.replace
+    real_open = history_mod._open_binary_append
 
-    def wrapped(src, dst):
+    def wrapped(target):
         calls["n"] += 1
         if calls["n"] < hb._REPLACE_ATTEMPTS:
             raise PermissionError("busy")
-        return real(src, dst)
+        return real_open(target)
 
-    monkeypatch.setattr(os, "replace", wrapped)
+    monkeypatch.setattr(history_mod, "_open_binary_append", wrapped)
     logs = []
     assert append_evolution_history(
         path, {"bot": "second", "final_status": "pass"},
@@ -338,11 +350,13 @@ def test_replace_permission_error_retries_then_succeeds(tmp_path, monkeypatch):
     assert [row["bot"] for row in load_evolution_history(path)] == [
         "first", "second"]
     assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.lock")) == []
 
 
-def test_replace_permission_error_always_fails_warns_without_raising(
+def test_open_permission_error_always_fails_warns_without_raising(
         tmp_path, monkeypatch):
-    """Every attempt fails: warning, previous bytes kept, no raise."""
+    """Every open attempt fails: warning, previous bytes kept, no raise."""
+    import src.evolution.history as history_mod
     from src.live import main_heartbeat as hb
 
     path = tmp_path / HISTORY_FILENAME
@@ -351,11 +365,11 @@ def test_replace_permission_error_always_fails_warns_without_raising(
     calls = {"n": 0}
     sleeps = []
 
-    def wrapped(_src, _dst):
+    def wrapped(_target):
         calls["n"] += 1
         raise PermissionError("denied")
 
-    monkeypatch.setattr(os, "replace", wrapped)
+    monkeypatch.setattr(history_mod, "_open_binary_append", wrapped)
     logs = []
     assert append_evolution_history(
         path, {"bot": "second", "final_status": "fail"},
@@ -371,8 +385,77 @@ def test_replace_permission_error_always_fails_warns_without_raising(
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_sequential_appends_keep_every_line_in_order(tmp_path):
+    path = tmp_path / HISTORY_FILENAME
+    for i in range(20):
+        assert append_evolution_history(
+            path, {"bot": "Probe", "n": i, "final_status": "skip"}) is True
+    raw = path.read_bytes()
+    lines = [line for line in raw.splitlines() if line]
+    assert len(lines) == 20
+    assert [json.loads(line)["n"] for line in lines] == list(range(20))
+    assert [row["n"] for row in load_evolution_history(path)] == list(range(20))
+    assert list(tmp_path.glob("*.lock")) == []
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_missing_bot_directory_is_not_created(tmp_path):
+    missing = tmp_path / "no-such-bot"
+    logs = []
+    assert record_evolution_attempt(
+        missing, bot="Probe", final_status="skip", reason_kind="watermark",
+        log=logs.append) is False
+    assert not missing.exists()
+    assert logs == []
+    not_dir = tmp_path / "not-a-dir"
+    not_dir.write_text("x", encoding="utf-8")
+    assert record_evolution_attempt(not_dir, bot="Probe", log=logs.append) is False
+    assert not_dir.read_text(encoding="utf-8") == "x"
+    assert logs == []
+    assert list(tmp_path.glob(HISTORY_FILENAME)) == []
+
+
+def test_numpy_scalars_and_datetimes_are_serialized(tmp_path):
+    import numpy as np
+
+    when = datetime(2026, 10, 24, 5, 5, 1)
+    record = build_evolution_record(
+        bot="Probe",
+        final_status="fail",
+        reason_kind="validation",
+        params_before={
+            "ema": np.int64(80),
+            "scale": np.float64(1.25),
+            "at": when,
+            "day": when.date(),
+            "bad": np.float64("nan"),
+        },
+        thresholds={"n": np.int32(4)},
+    )
+    before = record["params_before"]
+    assert before["ema"] == 80 and type(before["ema"]) is int
+    assert before["scale"] == 1.25 and type(before["scale"]) is float
+    assert before["at"] == "2026-10-24T05:05:01"
+    assert before["day"] == "2026-10-24"
+    assert before["bad"] is None
+    assert record["thresholds"]["n"] == 4 and type(record["thresholds"]["n"]) is int
+    path = tmp_path / HISTORY_FILENAME
+    assert append_evolution_history(path, record) is True
+    loaded = load_evolution_history(path)[0]
+    assert loaded["params_before"]["ema"] == 80
+    assert loaded["params_before"]["scale"] == 1.25
+    assert loaded["params_before"]["at"] == "2026-10-24T05:05:01"
+    assert loaded["params_before"]["day"] == "2026-10-24"
+    assert loaded["thresholds"]["n"] == 4
+    text = path.read_text(encoding="utf-8")
+    assert '"ema":80' in text
+    assert '"bad":null' in text
+
+
 def test_successful_append_keeps_the_previous_line_as_a_prefix(tmp_path):
-    path = tmp_path / "nested" / HISTORY_FILENAME
+    directory = tmp_path / "nested"
+    directory.mkdir()
+    path = directory / HISTORY_FILENAME
     assert append_evolution_history(path, {"bot": "first", "final_status": "skip"})
     first = path.read_bytes()
     assert first.endswith(b"\n")
@@ -383,15 +466,24 @@ def test_successful_append_keeps_the_previous_line_as_a_prefix(tmp_path):
 
 
 def test_log_callback_failure_does_not_raise(tmp_path, monkeypatch):
-    path = tmp_path / HISTORY_FILENAME
+    import src.evolution.history as history_mod
 
-    def _boom(src, dst):
-        raise OSError("nope")
+    path = tmp_path / HISTORY_FILENAME
+    real_open = history_mod._open_binary_append
+
+    def wrapped(target):
+        handle = real_open(target)
+
+        def _boom(_data):
+            raise OSError("nope")
+
+        handle.write = _boom
+        return handle
 
     def _log(_msg):
         raise RuntimeError("log sink down")
 
-    monkeypatch.setattr(os, "replace", _boom)
+    monkeypatch.setattr(history_mod, "_open_binary_append", wrapped)
     assert append_evolution_history(path, {"bot": "x"}, log=_log) is False
 
 
@@ -609,3 +701,372 @@ def test_worker_writes_history_after_the_discord_verdict():
                  "no_design_window", "plan_only"):
         assert f'reason_kind="{kind}"' in evo or f"reason_kind=\"{kind}\"" in evo
         assert kind in evo
+
+
+# ── worker behavior (mutants) and the in-process overlap guard ────────
+
+
+_HIST_BASE = """
+from src.backtest.strategy import BacktestStrategy
+
+
+class HistBase(BacktestStrategy):
+    kline_type = 0
+    kline_minute = 1
+
+    def required_bars(self):
+        return 1
+
+    def on_bar(self, bar, data_store, broker):
+        return None
+"""
+
+_HIST_CAND = """
+from src.backtest.strategy import BacktestStrategy
+
+
+class HistBaseEvo1(BacktestStrategy):
+    kline_type = 0
+    kline_minute = 1
+
+    def required_bars(self):
+        return 1
+
+    def on_bar(self, bar, data_store, broker):
+        return None
+"""
+
+_HIST_PLAN = '```json\n{"action": "change"}\n```\n'
+_HIST_CODE = "```python\n" + _HIST_CAND + "\n```\n"
+
+
+def _hist_bars(n=200):
+    from datetime import timedelta
+    from src.market_data.models import Bar
+
+    start = datetime(2026, 1, 5, 9, 0)
+    return [
+        Bar(
+            symbol="TXF",
+            dt=start + timedelta(minutes=i),
+            open=20000, high=20010, low=19990, close=20000,
+            volume=1, interval=60,
+        )
+        for i in range(n)
+    ]
+
+
+def _assembly(passed: bool):
+    month = EvolutionVerdict(
+        True, ["month held"], month_gates={"passed": True, "reasons": ["month held"]})
+    verdict = EvolutionVerdict(
+        bool(passed), ["combined"], provisional=False,
+        month_gates=month.month_gates)
+    return PromotionAssembly(
+        verdict=verdict,
+        month_verdict=month,
+        window_verdict=EvolutionVerdict(bool(passed), ["window held"]),
+        multifold_verdict=EvolutionVerdict(bool(passed), ["folds held"]),
+        relative_verdict=None,
+    )
+
+
+def _validation_app(bot_dir, chat, *, paper_gate: str):
+    import types
+    from src.ai.code_sandbox import load_strategy_from_source
+    from src.live.live_runner import LiveState
+
+    cls = load_strategy_from_source(_HIST_BASE)
+    bars = _hist_bars()
+    runner = types.SimpleNamespace(
+        state=LiveState.RUNNING,
+        bot_dir=str(bot_dir),
+        strategy=cls(),
+        trading_mode="paper",
+        point_value=200,
+        target_interval=60,
+        symbol="TXF",
+        get_bars=lambda: list(bars),
+    )
+    result = types.SimpleNamespace(trades=[], strategy_name="HistBase", metrics=None)
+    app = types.SimpleNamespace(
+        _live_runner=runner,
+        _settings={
+            "evolution_holdout_days": 14,
+            "evolution_auto_pipeline": True,
+            "evolution_capital_base_twd": 100000,
+            "evolution_validation": "simple",
+            "evolution_gate_raw": {
+                "paper_gate": paper_gate,
+                "real_gate": "absolute",
+            },
+            "ai_provider": "anthropic",
+            "ultra_mode": False,
+        },
+        _chat_client=chat,
+        _REVIEW_SINGLE_SHOT_CHAR_LIMIT=600_000,
+        _quote_connected=False,
+        _live_warmup_mode=False,
+        _evo_fetch_cb=None,
+        _trading_mode="paper",
+        _last_bars=[],
+        _strategy_store=types.SimpleNamespace(list_strategies=lambda: []),
+        strategy_var=types.SimpleNamespace(get=lambda: "HistBase"),
+        chat=[],
+        errors=[],
+        root=types.SimpleNamespace(after=lambda delay, fn, *args: fn(*args)),
+        btn_send=types.SimpleNamespace(config=lambda **kwargs: None),
+        _result=result,
+    )
+    app._resolve_strategy_source = lambda name, cls: _HIST_BASE
+    app._append_chat = lambda role, text: app.chat.append((role, text))
+    app.set_status = lambda msg: None
+    app._on_chat_response = lambda plan: None
+    app._on_chat_error = lambda msg: app.errors.append(msg)
+    app._remove_last_system_line = lambda: None
+    app._evolution_capital_base = types.MethodType(
+        rb.BacktestApp._evolution_capital_base, app)
+    return app
+
+
+def _patch_validation(monkeypatch, *, passed: bool):
+    import types
+    import src.daily_report.changelog as changelog
+    import src.evolution.paper_gate as paper_gate
+    import src.evolution.pipeline as pipeline
+
+    side = types.SimpleNamespace(
+        metrics=None, fitness=None, error="", result=types.SimpleNamespace(trades=[]))
+    monkeypatch.setattr(pipeline, "run_ab_backtest", lambda *args, **kwargs: side)
+    monkeypatch.setattr(
+        pipeline, "run_multifold_validation",
+        lambda *args, **kwargs: ([], side, side))
+    monkeypatch.setattr(pipeline, "eligible_for_validated_pool", lambda verdict: False)
+    monkeypatch.setattr(
+        paper_gate, "assemble_promotion_verdict",
+        lambda **kwargs: _assembly(passed))
+    monkeypatch.setattr(changelog, "append_changelog", lambda **kwargs: None)
+    monkeypatch.setattr(changelog, "load_changelog", lambda: [])
+
+
+def _run_validation(monkeypatch, bot_dir, *, paper_gate: str, passed: bool):
+    from tests.test_evolution_min_design_trades import _InlineThread
+
+    chat = MagicMock()
+    chat.send_message.return_value = _HIST_PLAN
+    chat.one_shot.return_value = _HIST_CODE
+    chat.max_tokens = 1024
+    chat.conversation = []
+    _patch_validation(monkeypatch, passed=passed)
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    app = _validation_app(bot_dir, chat, paper_gate=paper_gate)
+    rb.BacktestApp._start_evolution_pipeline(
+        app, "preamble", ["design trade"], "", app._result,
+        auto_run=False, holdout_days=14, bot_dir=str(bot_dir),
+        design_cut_idx=1)
+    rows = load_evolution_history(evolution_history_path(bot_dir))
+    return app, rows
+
+
+def test_relative_pass_records_an_evaluated_retire_week(tmp_path, monkeypatch):
+    app, rows = _run_validation(
+        monkeypatch, tmp_path, paper_gate="relative", passed=True)
+    assert app.errors == [], app.chat
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["final_status"] == "pass"
+    assert row["reason_kind"] == "validation"
+    assert row["retire_week"]["evaluated"] is True
+    assert row["retire_week"]["passed"] is True
+    assert row["gates"]["promotion_gate"]["mode"] == "relative"
+    assert row["gates"]["promotion_gate"]["passed"] is True
+    assert row["gates"]["deep"]["reasons"]
+    assert row["gates"]["month"]["passed"] is True
+
+
+def test_relative_fail_keeps_retire_passed_false(tmp_path, monkeypatch):
+    app, rows = _run_validation(
+        monkeypatch, tmp_path, paper_gate="relative", passed=False)
+    assert app.errors == [], app.chat
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["final_status"] == "fail"
+    assert row["reason_kind"] == "validation"
+    assert row["retire_week"]["evaluated"] is True
+    assert row["retire_week"]["passed"] is False
+    assert row["gates"]["promotion_gate"]["passed"] is False
+
+
+def test_absolute_mode_does_not_count_a_retire_week(tmp_path, monkeypatch):
+    app, rows = _run_validation(
+        monkeypatch, tmp_path, paper_gate="absolute", passed=True)
+    assert app.errors == [], app.chat
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["final_status"] == "pass"
+    assert row["reason_kind"] == "validation"
+    assert row["gates"]["promotion_gate"]["mode"] == "absolute"
+    assert row["retire_week"]["evaluated"] is False
+    assert row["retire_week"]["passed"] is False
+
+
+def test_failure_after_the_validation_row_does_not_append_another(
+        tmp_path, monkeypatch):
+    def _sealed():
+        raise RuntimeError("sealed")
+
+    monkeypatch.setattr(rb, "_evolution_history_sealed", _sealed)
+    app, rows = _run_validation(
+        monkeypatch, tmp_path, paper_gate="relative", passed=True)
+    assert app.errors and "sealed" in app.errors[0]
+    assert len(rows) == 1, rows
+    assert rows[0]["reason_kind"] == "validation"
+    assert rows[0]["final_status"] == "pass"
+    assert rows[0]["retire_week"]["evaluated"] is True
+    assert rows[0]["retire_week"]["passed"] is True
+
+
+def test_pipeline_error_is_recorded_and_the_guard_is_released(
+        tmp_path, monkeypatch):
+    from tests.test_evolution_min_design_trades import (
+        _NO_CHANGE, _InlineThread, _app, _design_book)
+
+    rb._evolution_guard_clear()
+    chat = MagicMock()
+    chat.max_tokens = 1024
+    chat.conversation = []
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("plan exploded")
+
+    chat.send_message.side_effect = _explode
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    app = _app(tmp_path, _design_book(30), chat)
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    rows = load_evolution_history(evolution_history_path(tmp_path))
+    assert len(rows) == 1, (rows, app.chat, app.errors)
+    assert rows[0]["reason_kind"] == "pipeline_error"
+    assert rows[0]["final_status"] == "fail"
+    assert "plan exploded" in rows[0]["reason"]
+
+    chat.send_message.side_effect = None
+    chat.send_message.return_value = _NO_CHANGE
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    rows = load_evolution_history(evolution_history_path(tmp_path))
+    assert len(rows) == 2, rows
+    assert rows[1]["reason_kind"] == "no_change"
+    assert not any("already running" in text for _role, text in app.chat)
+    rb._evolution_guard_clear()
+
+
+def test_second_run_is_refused_while_the_first_is_active(tmp_path, monkeypatch):
+    import threading
+    import time
+    from tests.test_evolution_min_design_trades import (
+        _DiscordLog, _NO_CHANGE, _app, _design_book)
+
+    rb._evolution_guard_clear()
+    entered = threading.Event()
+    release = threading.Event()
+    chat = MagicMock()
+    chat.max_tokens = 1024
+    chat.conversation = []
+
+    def _block(*args, **kwargs):
+        entered.set()
+        release.wait(5)
+        return _NO_CHANGE
+
+    chat.send_message.side_effect = _block
+    app = _app(tmp_path, _design_book(30), chat)
+    discord = _DiscordLog()
+    logs = []
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(rb, "_log", logs.append)
+    try:
+        rb.BacktestApp._bot_evolution(app, auto_run=True)
+        assert entered.wait(5), app.chat
+        rb.BacktestApp._bot_evolution(app, auto_run=False)
+        assert any("already running" in line for line in logs)
+        assert any("already running" in text for _role, text in app.chat)
+        assert any("already running" in msg for msg in discord.msgs)
+        assert any("manual Evolve" in text for _role, text in app.chat)
+        assert load_evolution_history(evolution_history_path(tmp_path)) == []
+    finally:
+        release.set()
+        rb._evolution_guard_clear()
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        rows = load_evolution_history(evolution_history_path(tmp_path))
+        if any(row["reason_kind"] == "no_change" for row in rows):
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("first run did not finish after the guard released")
+
+    chat.send_message.side_effect = None
+    chat.send_message.return_value = _NO_CHANGE
+    before = len(discord.msgs)
+    rb.BacktestApp._bot_evolution(app, auto_run=True)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        rows = load_evolution_history(evolution_history_path(tmp_path))
+        if len(rows) >= 2:
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError(load_evolution_history(evolution_history_path(tmp_path)))
+    assert rows[-1]["reason_kind"] == "no_change"
+    assert discord.msgs[before:] == [] or not any(
+        "already running" in msg for msg in discord.msgs[before:])
+    rb._evolution_guard_clear()
+
+
+def test_different_bots_do_not_block_each_other(tmp_path, monkeypatch):
+    import threading
+    import time
+    from tests.test_evolution_min_design_trades import (
+        _NO_CHANGE, _app, _design_book)
+
+    rb._evolution_guard_clear()
+    entered = threading.Event()
+    release = threading.Event()
+    busy = MagicMock()
+    busy.max_tokens = 1024
+    busy.conversation = []
+
+    def _block(*args, **kwargs):
+        entered.set()
+        release.wait(5)
+        return _NO_CHANGE
+
+    busy.send_message.side_effect = _block
+    bot_a = tmp_path / "bot-a"
+    bot_b = tmp_path / "bot-b"
+    bot_a.mkdir()
+    bot_b.mkdir()
+    app_a = _app(bot_a, _design_book(30), busy)
+    other = MagicMock()
+    other.max_tokens = 1024
+    other.conversation = []
+    other.send_message.return_value = _NO_CHANGE
+    app_b = _app(bot_b, _design_book(30), other)
+    try:
+        rb.BacktestApp._bot_evolution(app_a, auto_run=True)
+        assert entered.wait(5), app_a.chat
+        rb.BacktestApp._bot_evolution(app_b, auto_run=True)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            rows_b = load_evolution_history(evolution_history_path(bot_b))
+            if rows_b:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(app_b.chat)
+        assert rows_b[0]["reason_kind"] == "no_change"
+        assert not any("already running" in text for _role, text in app_b.chat)
+        assert load_evolution_history(evolution_history_path(bot_a)) == []
+    finally:
+        release.set()
+        rb._evolution_guard_clear()

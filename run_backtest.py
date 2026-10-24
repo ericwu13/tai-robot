@@ -680,6 +680,87 @@ def _evolution_bot_dir(app) -> str | None:
     return getattr(runner, "bot_dir", None) or None
 
 
+_evolution_guard_lock = threading.Lock()
+_evolution_in_progress: set[str] = set()
+
+
+def _evolution_run_key(app, bot_dir=None) -> str:
+    """Identity of one bot's evolution run.
+
+    A live bot is its directory. Two bots do not share a key. A run
+    with no bot directory is keyed by the app object, so two workbench
+    windows do not block each other. This is not the process ``.lock``.
+    """
+    directory = bot_dir if bot_dir else _evolution_bot_dir(app)
+    if directory:
+        try:
+            return "dir:" + os.path.normcase(os.path.abspath(os.fspath(directory)))
+        except (TypeError, ValueError, OSError):
+            pass
+    return f"app:{id(app)}"
+
+
+def _evolution_try_begin(key: str) -> bool:
+    """Mark ``key`` in progress. False when a run already holds it."""
+    with _evolution_guard_lock:
+        if key in _evolution_in_progress:
+            return False
+        _evolution_in_progress.add(key)
+        return True
+
+
+def _evolution_end(key: str) -> None:
+    """Drop ``key``. A second release is a no-op."""
+    with _evolution_guard_lock:
+        _evolution_in_progress.discard(key)
+
+
+def _evolution_guard_clear() -> None:
+    """Drop every in-progress mark. Tests only."""
+    with _evolution_guard_lock:
+        _evolution_in_progress.clear()
+
+
+def _refuse_overlapping_evolution(app, *, auto_run: bool) -> None:
+    """Log and, on the paths that talk to the operator, say why we skipped.
+
+    A manual Evolve click and the Saturday auto run share one process,
+    so the second one must not start a second worker. The bot process
+    ``.lock`` is left alone.
+    """
+    which = "手動演化 manual Evolve" if not auto_run else "自動演化 weekly auto"
+    msg = (
+        f"🧬 EVO: 這個機器人已有一輪演化在執行，{which} 本次略過。"
+        f"Evolution already running for this bot — {which} was skipped."
+    )
+    try:
+        _log(msg)
+    except Exception:
+        pass
+    try:
+        app.set_status(msg)
+    except Exception:
+        pass
+    try:
+        app._append_chat("system", msg)
+    except Exception:
+        pass
+    if _discord is not None and getattr(_discord, "enabled", False):
+        try:
+            _discord.notify_evolution(msg)
+        except Exception:
+            pass
+
+
+def _evolution_history_sealed() -> None:
+    """No-op after the validation history row is stored.
+
+    A raise here enters the pipeline-error handler. That handler
+    records a row only when this attempt has not already stored one.
+    """
+    return None
+
+
 def _evolution_class_name(app, strategy_cls=None) -> str:
     """Class name for a history row. Empty when no strategy is in hand."""
     if strategy_cls is not None:
@@ -5309,346 +5390,357 @@ class BacktestApp:
         not a free-form trade analysis. On-demand counterpart to the
         weekly automatic fitness check.
         """
-        payload = self._gather_analysis_payload()
-        if payload is None:
-            msg = ("🧬 EVO: 無交易紀錄，演化引擎無資料可分析。"
-                   "No trades recorded — evolution has no data to analyze.")
-            self.set_status("無交易紀錄 No trades for evolution")
-            if auto_run:
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
-            try:
-                _persist_evolution_history(
-                    _evolution_bot_dir(self),
-                    bot=self.strategy_var.get(),
-                    class_name=_evolution_class_name(self),
-                    final_status="skip",
-                    reason_kind="no_trades",
-                    reason=msg,
-                    ai_calls=0,
-                    thresholds_raw=self._settings.get("evolution_gate_raw"),
-                )
-            except Exception:
-                pass
+        key = _evolution_run_key(self)
+        if not _evolution_try_begin(key):
+            _refuse_overlapping_evolution(self, auto_run=auto_run)
             return
-        if not self._ensure_chat_client():
-            try:
-                _persist_evolution_history(
-                    _evolution_bot_dir(self),
-                    bot=self.strategy_var.get(),
-                    class_name=_evolution_class_name(self),
-                    final_status="skip",
-                    reason_kind="no_chat_client",
-                    reason="chat client unavailable",
-                    ai_calls=0,
-                    thresholds_raw=self._settings.get("evolution_gate_raw"),
-                )
-            except Exception:
-                pass
-            return
-        result, report, timeframe_line, source_section, trade_lines = payload
-
-        # Exclude trades a previous evolution run already analyzed —
-        # re-sending them invites re-justifying changes from the same
-        # sample. Aggregate metrics + fitness still cover the full
-        # history; only the per-trade list is windowed.
-        watermark = None
-        live = (self._live_runner is not None
-                and self._live_runner.state != LiveState.IDLE)
-        bot_dir = getattr(self._live_runner, "bot_dir", None) if live else None
-        if bot_dir:
-            from src.evolution.notify import load_watermark
-            watermark = load_watermark(bot_dir)
-        omitted = _evolution_omitted_count(len(trade_lines), watermark)
-
-        # Design/holdout split (walk-forward discipline): the most recent
-        # holdout_days of evidence are WITHHELD from the AI — the plan is
-        # designed on the older train window only and validated by
-        # backtesting the unseen holdout. The cut rolls forward each
-        # cycle, so this week's holdout becomes next week's design data.
-        from src.evolution.pipeline import (
-            compute_design_cut, design_cutoff_index, plan_sample_rule,
-            plan_directives_block)
-        knob_note = ""
-        _evo_cls = None
-        _evo_source = ""
-        if auto_run:
-            from src.evolution.knobs import saturday_knob_directives_if_eligible
-            if live and getattr(self._live_runner, "strategy", None) is not None:
-                _evo_cls = type(self._live_runner.strategy)
-            else:
-                _evo_cls = STRATEGIES.get(self.strategy_var.get())
-            if _evo_cls is not None:
-                _evo_source = self._resolve_strategy_source(
-                    self.strategy_var.get(), _evo_cls)
-            # D1: the block lists only the knobs this class can rewrite.
-            # Fewer than 2 rewritable grid knobs → no MANDATORY block,
-            # and the settle below excludes the class before the AI call.
-            knob_note = saturday_knob_directives_if_eligible(
-                _evo_cls, _evo_source)
-        holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
-        cut = compute_design_cut(result.trades, holdout_days)
-        # Scan from 0, NOT from the watermark: a watermark saved past the
-        # cut (e.g. by a pre-holdout build) would otherwise yield
-        # cut_idx == len(trades) and silently destroy the holdout on the
-        # full-re-run path (observed: "Holdout (0 trades)" while trade
-        # #65 sat in the AI payload).
-        cut_idx = (design_cutoff_index(result.trades, 0, cut)
-                   if cut else len(result.trades))
-        holdout_count = len(result.trades) - cut_idx
-
-        def _remember(final_status, reason_kind, reason="", **extra):
-            # History is written after the chat/Discord lines above the
-            # call, and this function never raises, so a disk error cannot
-            # change those messages or skip the return.
-            try:
-                fields = dict(
-                    bot=self.strategy_var.get(),
-                    class_name=_evolution_class_name(self, _evo_cls),
-                    source=_evo_source or "",
-                    cut_idx=cut_idx,
-                    watermark=watermark,
-                    thresholds_raw=self._settings.get("evolution_gate_raw"),
-                    final_status=final_status,
-                    reason_kind=reason_kind,
-                    reason=reason,
-                    ai_calls=0,
-                )
-                fields.update(extra)
-                _persist_evolution_history(bot_dir, **fields)
-            except Exception as exc:
+        handed = False
+        try:
+            payload = self._gather_analysis_payload()
+            if payload is None:
+                msg = ("🧬 EVO: 無交易紀錄，演化引擎無資料可分析。"
+                       "No trades recorded — evolution has no data to analyze.")
+                self.set_status("無交易紀錄 No trades for evolution")
+                if auto_run:
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
                 try:
-                    _log("evolution history append failed: "
-                         f"[{type(exc).__name__}] {exc}")
+                    _persist_evolution_history(
+                        _evolution_bot_dir(self),
+                        bot=self.strategy_var.get(),
+                        class_name=_evolution_class_name(self),
+                        final_status="skip",
+                        reason_kind="no_trades",
+                        reason=msg,
+                        ai_calls=0,
+                        thresholds_raw=self._settings.get("evolution_gate_raw"),
+                    )
                 except Exception:
                     pass
-
-        # D1: per-class knob grid. A class with fewer than 2 rewritable
-        # grid knobs (or that cannot be read) is excluded from weekly
-        # codegen. Every Saturday emits one exclusion line. The same
-        # class + source + grid key does not re-record or move the
-        # watermark; a new source hash or grid hash is re-evaluated.
-        # knob_ineligible_fallback never selects weekly codegen.
-        # Eligible classes are untouched.
-        if auto_run and _evo_cls is not None:
-            from src.evolution.knobs import (
-                normalize_knob_ineligible_fallback, settle_knob_ineligibility)
-            _knob_fallback = normalize_knob_ineligible_fallback(
-                self._settings.get("evolution_knob_ineligible_fallback"))
-            _knob_settle, _knob_reason = settle_knob_ineligibility(
-                bot_dir, _evo_cls, _evo_source, cut_idx,
-                fallback=_knob_fallback)
-            if _knob_settle in ("skip", "recorded"):
-                msg = _knob_reason
-                _log(msg)
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
-                _remember("skip", reason_kind="knob_ineligible", reason=msg)
                 return
+            if not self._ensure_chat_client():
+                try:
+                    _persist_evolution_history(
+                        _evolution_bot_dir(self),
+                        bot=self.strategy_var.get(),
+                        class_name=_evolution_class_name(self),
+                        final_status="skip",
+                        reason_kind="no_chat_client",
+                        reason="chat client unavailable",
+                        ai_calls=0,
+                        thresholds_raw=self._settings.get("evolution_gate_raw"),
+                    )
+                except Exception:
+                    pass
+                return
+            result, report, timeframe_line, source_section, trade_lines = payload
 
-        if watermark and cut_idx <= omitted:
-            # No NEW design-window trades since the last run — the recent
-            # trades are all inside the holdout and become design
-            # evidence next cycle as the cut rolls forward.
-            # D5: a long gap since the last exit is a different skip from
-            # "trades are still aging through the holdout". Append the
-            # idle line only at/above evolution.idle_warn_days (default 7).
-            # 0 disables the line.
-            idle = _evolution_idle_notice(
-                result.trades, _taipei_now(),
-                _nonneg_int(
-                    self._settings.get("evolution_idle_warn_days", 7), 7))
-            idle_suffix = f"\n{idle}" if idle else ""
+            # Exclude trades a previous evolution run already analyzed —
+            # re-sending them invites re-justifying changes from the same
+            # sample. Aggregate metrics + fitness still cover the full
+            # history; only the per-trade list is windowed.
+            watermark = None
+            live = (self._live_runner is not None
+                    and self._live_runner.state != LiveState.IDLE)
+            bot_dir = getattr(self._live_runner, "bot_dir", None) if live else None
+            if bot_dir:
+                from src.evolution.notify import load_watermark
+                watermark = load_watermark(bot_dir)
+            omitted = _evolution_omitted_count(len(trade_lines), watermark)
+
+            # Design/holdout split (walk-forward discipline): the most recent
+            # holdout_days of evidence are WITHHELD from the AI — the plan is
+            # designed on the older train window only and validated by
+            # backtesting the unseen holdout. The cut rolls forward each
+            # cycle, so this week's holdout becomes next week's design data.
+            from src.evolution.pipeline import (
+                compute_design_cut, design_cutoff_index, plan_sample_rule,
+                plan_directives_block)
+            knob_note = ""
+            _evo_cls = None
+            _evo_source = ""
             if auto_run:
-                msg = (f"🧬 EVO (weekly auto): 訓練窗無新交易（最近 "
-                       f"{holdout_days} 天為保留測試集），跳過。"
-                       f"No new design-window trades since last evolution "
-                       f"({watermark['at']}) — recent trades are in the "
-                       f"holdout; skipped.{idle_suffix}")
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
-                _remember("skip", reason_kind="watermark", reason=msg)
-                return
-            # Manual click: allow an explicit full-design-history re-run
-            # (the holdout stays withheld either way).
-            if not messagebox.askyesno(
-                    "Bot Evolution",
-                    f"上次演化（{watermark['at']}）後訓練窗沒有新交易\n"
-                    f"（最近 {holdout_days} 天為保留測試集，不提供給 AI）。\n"
-                    f"No new design-window trades since the last evolution — "
-                    f"recent trades are inside the {holdout_days}d holdout.\n\n"
-                    f"仍要以完整訓練歷史重新執行嗎？\n"
-                    f"Re-run on the full design history anyway? "
-                    f"(holdout stays withheld){idle_suffix}"):
-                _remember(
-                    "skip", reason_kind="watermark",
-                    reason=(
-                        f"No new design-window trades since last evolution "
-                        f"({watermark['at']}) — re-run declined.{idle_suffix}"))
-                return
-            omitted = 0  # full design-history re-run; cut unchanged
-        sent_lines = trade_lines[omitted:cut_idx]
-        if not sent_lines:
-            msg = (f"🧬 EVO: 訓練窗沒有交易（資料太新，全部 "
-                   f"{len(trade_lines)} 筆交易都在最近 {holdout_days} 天"
-                   f"保留測試集內）。機器人需運行超過 {holdout_days} 天，"
-                   f"交易才會進入設計窗供 AI 分析。"
-                   f"No design-window trades yet — all {len(trade_lines)} "
-                   f"trades are inside the {holdout_days}d holdout. "
-                   f"The bot needs to run for >{holdout_days} days before "
-                   f"trades age into the design window for AI analysis.")
-            self.set_status(
-                "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
-                "yet — session younger than the holdout.")
-            if auto_run:
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
-            else:
-                self._append_chat("system", msg)
-            _remember("skip", reason_kind="no_design_window", reason=msg)
-            return
+                from src.evolution.knobs import saturday_knob_directives_if_eligible
+                if live and getattr(self._live_runner, "strategy", None) is not None:
+                    _evo_cls = type(self._live_runner.strategy)
+                else:
+                    _evo_cls = STRATEGIES.get(self.strategy_var.get())
+                if _evo_cls is not None:
+                    _evo_source = self._resolve_strategy_source(
+                        self.strategy_var.get(), _evo_cls)
+                # D1: the block lists only the knobs this class can rewrite.
+                # Fewer than 2 rewritable grid knobs → no MANDATORY block,
+                # and the settle below excludes the class before the AI call.
+                knob_note = saturday_knob_directives_if_eligible(
+                    _evo_cls, _evo_source)
+            holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
+            cut = compute_design_cut(result.trades, holdout_days)
+            # Scan from 0, NOT from the watermark: a watermark saved past the
+            # cut (e.g. by a pre-holdout build) would otherwise yield
+            # cut_idx == len(trades) and silently destroy the holdout on the
+            # full-re-run path (observed: "Holdout (0 trades)" while trade
+            # #65 sat in the AI payload).
+            cut_idx = (design_cutoff_index(result.trades, 0, cut)
+                       if cut else len(result.trades))
+            holdout_count = len(result.trades) - cut_idx
 
-        # D4: Saturday / automatic runs do not spend a plan call on a
-        # design window below min_design_trades. Default 30
-        # (fitness.MIN_TRADES) applies to that path only. 0 disables
-        # the check. The manual Evolve button is exempt: it logs an
-        # override line and continues into the plan call. Fitness math
-        # is unchanged, and the automatic return does not advance the
-        # watermark.
-        from src.evolution.fitness import MIN_TRADES
-        min_design = _nonneg_int(
-            self._settings.get("evolution_min_design_trades", MIN_TRADES),
-            MIN_TRADES)
-        if min_design > 0 and cut_idx < min_design:
-            if not auto_run:
-                self._append_chat(
-                    "system",
-                    "🧬 EVO: 手動演化不受設計窗樣本門檻限制，仍呼叫 AI 計畫。"
-                    f"below min_design_trades ({cut_idx}/{min_design}), "
-                    f"manual override")
-            else:
-                msg = (
-                    f"🧬 EVO: 設計窗只有 {cut_idx} 筆交易，未達 "
-                    f"min_design_trades={min_design}，本次不呼叫 AI，水位線不變。\n"
-                    f"waiting for sample: {cut_idx}/{min_design}\n"
-                    f"Design window has {cut_idx} trades, below "
-                    f"min_design_trades={min_design}. No AI plan call; "
-                    f"watermark unchanged.")
+            def _remember(final_status, reason_kind, reason="", **extra):
+                # History is written after the chat/Discord lines above the
+                # call, and this function never raises, so a disk error cannot
+                # change those messages or skip the return.
+                try:
+                    fields = dict(
+                        bot=self.strategy_var.get(),
+                        class_name=_evolution_class_name(self, _evo_cls),
+                        source=_evo_source or "",
+                        cut_idx=cut_idx,
+                        watermark=watermark,
+                        thresholds_raw=self._settings.get("evolution_gate_raw"),
+                        final_status=final_status,
+                        reason_kind=reason_kind,
+                        reason=reason,
+                        ai_calls=0,
+                    )
+                    fields.update(extra)
+                    _persist_evolution_history(bot_dir, **fields)
+                except Exception as exc:
+                    try:
+                        _log("evolution history append failed: "
+                             f"[{type(exc).__name__}] {exc}")
+                    except Exception:
+                        pass
+
+            # D1: per-class knob grid. A class with fewer than 2 rewritable
+            # grid knobs (or that cannot be read) is excluded from weekly
+            # codegen. Every Saturday emits one exclusion line. The same
+            # class + source + grid key does not re-record or move the
+            # watermark; a new source hash or grid hash is re-evaluated.
+            # knob_ineligible_fallback never selects weekly codegen.
+            # Eligible classes are untouched.
+            if auto_run and _evo_cls is not None:
+                from src.evolution.knobs import (
+                    normalize_knob_ineligible_fallback, settle_knob_ineligibility)
+                _knob_fallback = normalize_knob_ineligible_fallback(
+                    self._settings.get("evolution_knob_ineligible_fallback"))
+                _knob_settle, _knob_reason = settle_knob_ineligibility(
+                    bot_dir, _evo_cls, _evo_source, cut_idx,
+                    fallback=_knob_fallback)
+                if _knob_settle in ("skip", "recorded"):
+                    msg = _knob_reason
+                    _log(msg)
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                    _remember("skip", reason_kind="knob_ineligible", reason=msg)
+                    return
+
+            if watermark and cut_idx <= omitted:
+                # No NEW design-window trades since the last run — the recent
+                # trades are all inside the holdout and become design
+                # evidence next cycle as the cut rolls forward.
+                # D5: a long gap since the last exit is a different skip from
+                # "trades are still aging through the holdout". Append the
+                # idle line only at/above evolution.idle_warn_days (default 7).
+                # 0 disables the line.
+                idle = _evolution_idle_notice(
+                    result.trades, _taipei_now(),
+                    _nonneg_int(
+                        self._settings.get("evolution_idle_warn_days", 7), 7))
+                idle_suffix = f"\n{idle}" if idle else ""
+                if auto_run:
+                    msg = (f"🧬 EVO (weekly auto): 訓練窗無新交易（最近 "
+                           f"{holdout_days} 天為保留測試集），跳過。"
+                           f"No new design-window trades since last evolution "
+                           f"({watermark['at']}) — recent trades are in the "
+                           f"holdout; skipped.{idle_suffix}")
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                    _remember("skip", reason_kind="watermark", reason=msg)
+                    return
+                # Manual click: allow an explicit full-design-history re-run
+                # (the holdout stays withheld either way).
+                if not messagebox.askyesno(
+                        "Bot Evolution",
+                        f"上次演化（{watermark['at']}）後訓練窗沒有新交易\n"
+                        f"（最近 {holdout_days} 天為保留測試集，不提供給 AI）。\n"
+                        f"No new design-window trades since the last evolution — "
+                        f"recent trades are inside the {holdout_days}d holdout.\n\n"
+                        f"仍要以完整訓練歷史重新執行嗎？\n"
+                        f"Re-run on the full design history anyway? "
+                        f"(holdout stays withheld){idle_suffix}"):
+                    _remember(
+                        "skip", reason_kind="watermark",
+                        reason=(
+                            f"No new design-window trades since last evolution "
+                            f"({watermark['at']}) — re-run declined.{idle_suffix}"))
+                    return
+                omitted = 0  # full design-history re-run; cut unchanged
+            sent_lines = trade_lines[omitted:cut_idx]
+            if not sent_lines:
+                msg = (f"🧬 EVO: 訓練窗沒有交易（資料太新，全部 "
+                       f"{len(trade_lines)} 筆交易都在最近 {holdout_days} 天"
+                       f"保留測試集內）。機器人需運行超過 {holdout_days} 天，"
+                       f"交易才會進入設計窗供 AI 分析。"
+                       f"No design-window trades yet — all {len(trade_lines)} "
+                       f"trades are inside the {holdout_days}d holdout. "
+                       f"The bot needs to run for >{holdout_days} days before "
+                       f"trades age into the design window for AI analysis.")
                 self.set_status(
-                    f"🧬 EVO: waiting for sample: {cut_idx}/{min_design}")
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
-                _remember("skip", reason_kind="min_design_trades", reason=msg)
+                    "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
+                    "yet — session younger than the holdout.")
+                if auto_run:
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                else:
+                    self._append_chat("system", msg)
+                _remember("skip", reason_kind="no_design_window", reason=msg)
                 return
 
-        # Rebuild the metrics report from design-known trades only — the
-        # full-history report would leak holdout aggregates into design.
-        design_known = result.trades[:cut_idx]
-        d_eq, d_cum = [], 0
-        for t in design_known:
-            d_cum += t.pnl
-            d_eq.append(d_cum)
-        # Same capital base as the fitness composite — a 0 seed would
-        # reprint the zero-peak MaxDD% sentinel #119/#120 removed there.
-        report = format_report(
-            f"{result.strategy_name} — 設計窗 design window (holdout excluded)",
-            calculate_metrics(
-                design_known, d_eq,
-                initial_balance=self._evolution_capital_base()))
+            # D4: Saturday / automatic runs do not spend a plan call on a
+            # design window below min_design_trades. Default 30
+            # (fitness.MIN_TRADES) applies to that path only. 0 disables
+            # the check. The manual Evolve button is exempt: it logs an
+            # override line and continues into the plan call. Fitness math
+            # is unchanged, and the automatic return does not advance the
+            # watermark.
+            from src.evolution.fitness import MIN_TRADES
+            min_design = _nonneg_int(
+                self._settings.get("evolution_min_design_trades", MIN_TRADES),
+                MIN_TRADES)
+            if min_design > 0 and cut_idx < min_design:
+                if not auto_run:
+                    self._append_chat(
+                        "system",
+                        "🧬 EVO: 手動演化不受設計窗樣本門檻限制，仍呼叫 AI 計畫。"
+                        f"below min_design_trades ({cut_idx}/{min_design}), "
+                        f"manual override")
+                else:
+                    msg = (
+                        f"🧬 EVO: 設計窗只有 {cut_idx} 筆交易，未達 "
+                        f"min_design_trades={min_design}，本次不呼叫 AI，水位線不變。\n"
+                        f"waiting for sample: {cut_idx}/{min_design}\n"
+                        f"Design window has {cut_idx} trades, below "
+                        f"min_design_trades={min_design}. No AI plan call; "
+                        f"watermark unchanged.")
+                    self.set_status(
+                        f"🧬 EVO: waiting for sample: {cut_idx}/{min_design}")
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                    _remember("skip", reason_kind="min_design_trades", reason=msg)
+                    return
 
-        evolution_context = self._build_evolution_context(
-            result, watermark=watermark, omitted_count=omitted,
-            design_upto=cut_idx, holdout_count=holdout_count,
-            holdout_days=holdout_days)
+            # Rebuild the metrics report from design-known trades only — the
+            # full-history report would leak holdout aggregates into design.
+            design_known = result.trades[:cut_idx]
+            d_eq, d_cum = [], 0
+            for t in design_known:
+                d_cum += t.pnl
+                d_eq.append(d_cum)
+            # Same capital base as the fitness composite — a 0 seed would
+            # reprint the zero-peak MaxDD% sentinel #119/#120 removed there.
+            report = format_report(
+                f"{result.strategy_name} — 設計窗 design window (holdout excluded)",
+                calculate_metrics(
+                    design_known, d_eq,
+                    initial_balance=self._evolution_capital_base()))
 
-        preamble = (
-            f"🧬 Bot Evolution — 策略演化計畫\n"
-            f"以下是累積的交易數據與演化適應度評分，請產出一份具體的策略演化計畫。\n"
-            f"Below are accumulated trades and the evolution fitness score. "
-            f"Produce a concrete Evolution Plan.\n\n"
-            f"{evolution_context}"
-            f"## Required output structure (MUST FOLLOW)\n"
-            f"1. **表現總結 Performance summary** — 2-3 sentences covering the data "
-            f"period; if [real] trades exist, compare simulated vs real performance.\n"
-            f"2. **有效部分 What's working** — 2-3 aspects that must NOT be changed.\n"
-            f"3. **問題診斷 Diagnosis** — the single biggest weakness, with evidence "
-            f"from specific trades (cite trade numbers from the list).\n"
-            f"4. **演化計畫 Evolution plan** — EXACTLY ONE concrete change: one "
-            f"parameter (state old → new value) OR one structural change. MANDATORY: "
-            f"scan the trade list and estimate \"removes ~N losers, ~M winners\". "
-            f"{plan_sample_rule(cut_idx, len(sent_lines))}\n"
-            f"5. **驗證與回退 Validation & revert** — how to verify the change "
-            f"(backtest period, which metric must improve by how much) and the "
-            f"condition under which to revert.\n\n"
-            f"## Rules\n"
-            f"- ONE change maximum. Over-optimization is the #1 cause of strategy "
-            f"degradation.\n"
-            f"- If metrics are acceptable (PF > 1.3, DD < 25%, WR > 40%), the plan "
-            f"is「不修改，繼續運行 no change — keep running」.\n"
-            f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
-            f"instead.\n"
-            f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
-            f"{plan_directives_block()}\n"
-            f"{knob_note}"
-            f"## 保留測試集 Holdout (unseen validation data)\n"
-            f"The most recent {holdout_days} days of evidence "
-            f"({holdout_count} trades) are WITHHELD from everything in this "
-            f"message. Your plan will be validated by backtesting on that "
-            f"unseen window — design a change that should GENERALIZE, not "
-            f"one that chases the most recent trades.\n\n"
-            f"{report}\n\n"
-            f"{timeframe_line}\n"
-        )
+            evolution_context = self._build_evolution_context(
+                result, watermark=watermark, omitted_count=omitted,
+                design_upto=cut_idx, holdout_count=holdout_count,
+                holdout_days=holdout_days)
 
-        # Auto-pipeline: plan → codegen → A/B validation → verdict in one
-        # click. Needs the single-shot path (the plan response must be
-        # captured to drive codegen); oversized payloads degrade to the
-        # plan-only chunked delivery.
-        auto = self._settings.get("evolution_auto_pipeline", True)
-        est = (len(preamble) + sum(len(l) + 1 for l in sent_lines)
-               + len(source_section) + 300)
-        if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
-            self._start_evolution_pipeline(
-                preamble, sent_lines, source_section, result,
-                auto_run=auto_run, holdout_days=holdout_days,
-                bot_dir=bot_dir, design_cut_idx=cut_idx,
-                watermark=watermark)
-        else:
-            if auto:
-                self._append_chat(
-                    "system",
-                    "EVO: payload too large for the auto-pipeline — "
-                    "falling back to plan-only mode.")
-            _remember(
-                "skip", reason_kind="plan_only",
-                reason=("payload too large for the auto-pipeline — plan-only mode"
-                        if auto else "auto-pipeline disabled — plan-only mode"))
-            self._dispatch_trade_analysis(
-                preamble, sent_lines, source_section, len(sent_lines),
-                label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
-            # Issue #125: plan-only fallback does not parse ``action``,
-            # so the watermark stays frozen (does not burn next week's
-            # delta). Auto-pipeline saves after action=change.
+            preamble = (
+                f"🧬 Bot Evolution — 策略演化計畫\n"
+                f"以下是累積的交易數據與演化適應度評分，請產出一份具體的策略演化計畫。\n"
+                f"Below are accumulated trades and the evolution fitness score. "
+                f"Produce a concrete Evolution Plan.\n\n"
+                f"{evolution_context}"
+                f"## Required output structure (MUST FOLLOW)\n"
+                f"1. **表現總結 Performance summary** — 2-3 sentences covering the data "
+                f"period; if [real] trades exist, compare simulated vs real performance.\n"
+                f"2. **有效部分 What's working** — 2-3 aspects that must NOT be changed.\n"
+                f"3. **問題診斷 Diagnosis** — the single biggest weakness, with evidence "
+                f"from specific trades (cite trade numbers from the list).\n"
+                f"4. **演化計畫 Evolution plan** — EXACTLY ONE concrete change: one "
+                f"parameter (state old → new value) OR one structural change. MANDATORY: "
+                f"scan the trade list and estimate \"removes ~N losers, ~M winners\". "
+                f"{plan_sample_rule(cut_idx, len(sent_lines))}\n"
+                f"5. **驗證與回退 Validation & revert** — how to verify the change "
+                f"(backtest period, which metric must improve by how much) and the "
+                f"condition under which to revert.\n\n"
+                f"## Rules\n"
+                f"- ONE change maximum. Over-optimization is the #1 cause of strategy "
+                f"degradation.\n"
+                f"- If metrics are acceptable (PF > 1.3, DD < 25%, WR > 40%), the plan "
+                f"is「不修改，繼續運行 no change — keep running」.\n"
+                f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
+                f"instead.\n"
+                f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
+                f"{plan_directives_block()}\n"
+                f"{knob_note}"
+                f"## 保留測試集 Holdout (unseen validation data)\n"
+                f"The most recent {holdout_days} days of evidence "
+                f"({holdout_count} trades) are WITHHELD from everything in this "
+                f"message. Your plan will be validated by backtesting on that "
+                f"unseen window — design a change that should GENERALIZE, not "
+                f"one that chases the most recent trades.\n\n"
+                f"{report}\n\n"
+                f"{timeframe_line}\n"
+            )
+
+            # Auto-pipeline: plan → codegen → A/B validation → verdict in one
+            # click. Needs the single-shot path (the plan response must be
+            # captured to drive codegen); oversized payloads degrade to the
+            # plan-only chunked delivery.
+            auto = self._settings.get("evolution_auto_pipeline", True)
+            est = (len(preamble) + sum(len(l) + 1 for l in sent_lines)
+                   + len(source_section) + 300)
+            if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
+                self._start_evolution_pipeline(
+                    preamble, sent_lines, source_section, result,
+                    auto_run=auto_run, holdout_days=holdout_days,
+                    bot_dir=bot_dir, design_cut_idx=cut_idx,
+                    watermark=watermark, guard_held=True)
+                handed = True
+            else:
+                if auto:
+                    self._append_chat(
+                        "system",
+                        "EVO: payload too large for the auto-pipeline — "
+                        "falling back to plan-only mode.")
+                _remember(
+                    "skip", reason_kind="plan_only",
+                    reason=("payload too large for the auto-pipeline — plan-only mode"
+                            if auto else "auto-pipeline disabled — plan-only mode"))
+                self._dispatch_trade_analysis(
+                    preamble, sent_lines, source_section, len(sent_lines),
+                    label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
+                # Issue #125: plan-only fallback does not parse ``action``,
+                # so the watermark stays frozen (does not burn next week's
+                # delta). Auto-pipeline saves after action=change.
+
+        finally:
+            if not handed:
+                _evolution_end(key)
 
     def _evolution_capital_base(self) -> int:
         """Starting equity the evolution drawdown PERCENTAGE is measured
@@ -5761,7 +5853,7 @@ class BacktestApp:
                                   auto_run: bool = False,
                                   holdout_days: int = 14,
                                   bot_dir=None, design_cut_idx: int = 0,
-                                  watermark=None) -> None:
+                                  watermark=None, guard_held: bool = False) -> None:
         """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
 
         One click, no manual steps until deployment: the plan's own
@@ -5775,790 +5867,817 @@ class BacktestApp:
 
         Runs in a worker thread; every Tk touch goes through root.after.
         """
-        context = (
-            preamble
-            + f"交易明細 Trade Details ({len(trade_lines)} trades):\n"
-            + "\n".join(trade_lines)
-            + source_section
-        )
-        total_trades = len(trade_lines)
-
-        # Snapshot everything the worker needs while on the main thread.
-        # The promotion mode is read inside the worker, at decision time:
-        # a running runner's trading_mode (a mid-run switch is visible),
-        # otherwise the bot's configured mode. Never a silent backtest.
-        capital_base = self._evolution_capital_base()
-        live = (self._live_runner is not None
-                and self._live_runner.state != LiveState.IDLE)
-        evolution_gate_raw = self._settings.get("evolution_gate_raw") or {}
-        if live:
-            baseline_cls = type(self._live_runner.strategy)
-            point_value = self._live_runner.point_value
-            native_sec = self._live_runner.target_interval
-        else:
-            baseline_cls = STRATEGIES.get(self.strategy_var.get())
-            native_sec = (self._last_bars[0].interval
-                          if self._last_bars else 900)
-            try:
-                point_value = int(self.pv_var.get())
-            except (ValueError, TypeError):
-                point_value = 200
-
-        def _fallback_bars() -> tuple[list, str]:
-            """Best locally-available validation data (no API fetch)."""
-            if live:
-                # Full session history from the bot's daily 1-min CSVs
-                # beats the in-memory aggregated bars (~warmup window);
-                # BacktestEngine aggregates 1-min feeds to the strategy's
-                # native timeframe internally.
-                from src.live.live_runner import load_1m_bars_from_csvs
-                mem_bars = self._live_runner.get_bars()
-                csv_bars = load_1m_bars_from_csvs(
-                    self._live_runner.bot_dir, self._live_runner.symbol)
-
-                def _span(bs):
-                    return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
-                if csv_bars and _span(csv_bars) >= _span(mem_bars):
-                    return csv_bars, "bot 1m CSV history"
-                return mem_bars, "in-memory session bars"
-            return list(self._last_bars or []), "last backtest dataset"
-        display_name = self.strategy_var.get()
-        strategy_source = self._resolve_strategy_source(display_name, baseline_cls)
-        taken = {cls.__name__ for cls in STRATEGIES.values()}
+        key = _evolution_run_key(self, bot_dir)
+        if not guard_held:
+            if not _evolution_try_begin(key):
+                _refuse_overlapping_evolution(self, auto_run=auto_run)
+                return
+        started = False
         try:
-            taken |= {e["class_name"] for e in self._strategy_store.list_strategies()}
-        except Exception:
-            pass
-
-        heavy_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
-            ultra_mode=self._settings.get("ultra_mode", False))
-
-        validation = self._settings.get("evolution_validation", "deep")
-        # Validation data + provenance, filled by the dispatch logic at the
-        # bottom (possibly after an async API fetch) before _worker starts.
-        evo_data: dict = {"bars": [], "origin": ""}
-
-        def ui(fn, *args):
-            self.root.after(0, fn, *args)
-
-        def _worker():
-            from src.evolution.pipeline import (
-                check_candidate_name, plan_unusable_reason,
-                parse_plan_directives, next_candidate_name, run_ab_backtest,
-                decide_verdict,
-                run_deep_validation, decide_deep_verdict,
-                run_multifold_validation,
-                format_weekend_verdict_block, format_month_gates_debug,
-                holdout_window_start,
-                eligible_for_validated_pool,
-                month_gate_config_from_mapping)
-            from src.evolution.paper_gate import (
-                WeekRecord,
-                abs_pf_required,
-                assemble_promotion_verdict,
-                assess_retirement,
-                emit_retire_recommendation,
-                evolution_gate_config_from_mapping,
-                evolution_promotion_mode,
-                gate_provenance,
-                relative_eval_summary,
-                resolve_promotion_gate,
-                weeks_from_changelog,
+            context = (
+                preamble
+                + f"交易明細 Trade Details ({len(trade_lines)} trades):\n"
+                + "\n".join(trade_lines)
+                + source_section
             )
-            bars = evo_data["bars"]
-            data_origin = evo_data["origin"]
+            total_trades = len(trade_lines)
 
-            def _notify_discord(msg: str) -> None:
-                # DiscordNotifier._send spawns its own thread — safe to
-                # call from this worker. Best-effort, never kills the run.
-                # Evolution-pipeline status → the evolution channel.
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
-
-            ai_calls = 0
-            plan = ""
-            directives = None
-            history_written = False
-
-            def _remember(final_status, reason_kind, reason="", **extra):
-                # One record per attempt. Building the gate blocks and
-                # the append both stay inside this function so a disk or
-                # shaping error cannot skip the Discord verdict or turn
-                # into a second pipeline-error notice.
-                nonlocal history_written
-                if history_written:
-                    return
-                gate_keys = (
-                    "assembled", "folds", "baseline_res", "candidate_res",
-                    "gate", "gate_cfg")
+            # Snapshot everything the worker needs while on the main thread.
+            # The promotion mode is read inside the worker, at decision time:
+            # a running runner's trading_mode (a mid-run switch is visible),
+            # otherwise the bot's configured mode. Never a silent backtest.
+            capital_base = self._evolution_capital_base()
+            live = (self._live_runner is not None
+                    and self._live_runner.state != LiveState.IDLE)
+            evolution_gate_raw = self._settings.get("evolution_gate_raw") or {}
+            if live:
+                baseline_cls = type(self._live_runner.strategy)
+                point_value = self._live_runner.point_value
+                native_sec = self._live_runner.target_interval
+            else:
+                baseline_cls = STRATEGIES.get(self.strategy_var.get())
+                native_sec = (self._last_bars[0].interval
+                              if self._last_bars else 900)
                 try:
-                    if extra.get("assembled") is not None and "gates" not in extra:
-                        from src.evolution.history import validation_gates
-                        extra["gates"] = validation_gates(
-                            assembled=extra.pop("assembled"),
-                            folds=extra.pop("folds", None),
-                            baseline_res=extra.pop("baseline_res", None),
-                            candidate_res=extra.pop("candidate_res", None),
-                            gate=extra.pop("gate", None),
-                            gate_cfg=extra.pop("gate_cfg", None),
-                        )
-                    else:
+                    point_value = int(self.pv_var.get())
+                except (ValueError, TypeError):
+                    point_value = 200
+
+            def _fallback_bars() -> tuple[list, str]:
+                """Best locally-available validation data (no API fetch)."""
+                if live:
+                    # Full session history from the bot's daily 1-min CSVs
+                    # beats the in-memory aggregated bars (~warmup window);
+                    # BacktestEngine aggregates 1-min feeds to the strategy's
+                    # native timeframe internally.
+                    from src.live.live_runner import load_1m_bars_from_csvs
+                    mem_bars = self._live_runner.get_bars()
+                    csv_bars = load_1m_bars_from_csvs(
+                        self._live_runner.bot_dir, self._live_runner.symbol)
+
+                    def _span(bs):
+                        return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
+                    if csv_bars and _span(csv_bars) >= _span(mem_bars):
+                        return csv_bars, "bot 1m CSV history"
+                    return mem_bars, "in-memory session bars"
+                return list(self._last_bars or []), "last backtest dataset"
+            display_name = self.strategy_var.get()
+            strategy_source = self._resolve_strategy_source(display_name, baseline_cls)
+            taken = {cls.__name__ for cls in STRATEGIES.values()}
+            try:
+                taken |= {e["class_name"] for e in self._strategy_store.list_strategies()}
+            except Exception:
+                pass
+
+            heavy_model = model_for_tier(
+                self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+                ultra_mode=self._settings.get("ultra_mode", False))
+
+            validation = self._settings.get("evolution_validation", "deep")
+            # Validation data + provenance, filled by the dispatch logic at the
+            # bottom (possibly after an async API fetch) before _worker starts.
+            evo_data: dict = {"bars": [], "origin": ""}
+
+            def ui(fn, *args):
+                self.root.after(0, fn, *args)
+
+            def _worker():
+                from src.evolution.pipeline import (
+                    check_candidate_name, plan_unusable_reason,
+                    parse_plan_directives, next_candidate_name, run_ab_backtest,
+                    decide_verdict,
+                    run_deep_validation, decide_deep_verdict,
+                    run_multifold_validation,
+                    format_weekend_verdict_block, format_month_gates_debug,
+                    holdout_window_start,
+                    eligible_for_validated_pool,
+                    month_gate_config_from_mapping)
+                from src.evolution.paper_gate import (
+                    WeekRecord,
+                    abs_pf_required,
+                    assemble_promotion_verdict,
+                    assess_retirement,
+                    emit_retire_recommendation,
+                    evolution_gate_config_from_mapping,
+                    evolution_promotion_mode,
+                    gate_provenance,
+                    relative_eval_summary,
+                    resolve_promotion_gate,
+                    weeks_from_changelog,
+                )
+                bars = evo_data["bars"]
+                data_origin = evo_data["origin"]
+
+                def _notify_discord(msg: str) -> None:
+                    # DiscordNotifier._send spawns its own thread — safe to
+                    # call from this worker. Best-effort, never kills the run.
+                    # Evolution-pipeline status → the evolution channel.
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+
+                ai_calls = 0
+                plan = ""
+                directives = None
+                history_written = False
+
+                def _remember(final_status, reason_kind, reason="", **extra):
+                    # One record per attempt. Building the gate blocks and
+                    # the append both stay inside this function so a disk or
+                    # shaping error cannot skip the Discord verdict or turn
+                    # into a second pipeline-error notice.
+                    nonlocal history_written
+                    if history_written:
+                        return
+                    gate_keys = (
+                        "assembled", "folds", "baseline_res", "candidate_res",
+                        "gate", "gate_cfg")
+                    try:
+                        if extra.get("assembled") is not None and "gates" not in extra:
+                            from src.evolution.history import validation_gates
+                            extra["gates"] = validation_gates(
+                                assembled=extra.pop("assembled"),
+                                folds=extra.pop("folds", None),
+                                baseline_res=extra.pop("baseline_res", None),
+                                candidate_res=extra.pop("candidate_res", None),
+                                gate=extra.pop("gate", None),
+                                gate_cfg=extra.pop("gate_cfg", None),
+                            )
+                        else:
+                            for key in gate_keys:
+                                extra.pop(key, None)
+                    except Exception as exc:
                         for key in gate_keys:
                             extra.pop(key, None)
-                except Exception as exc:
-                    for key in gate_keys:
-                        extra.pop(key, None)
-                    try:
-                        _log("evolution history gate block failed: "
-                             f"[{type(exc).__name__}] {exc}")
-                    except Exception:
-                        pass
-                history_written = True
-                try:
-                    _persist_evolution_history(
-                        bot_dir,
-                        bot=display_name,
-                        class_name=(baseline_cls.__name__ if baseline_cls else ""),
-                        source=strategy_source or "",
-                        cut_idx=design_cut_idx,
-                        watermark=watermark,
-                        plan_excerpt=plan,
-                        directives=directives,
-                        ai_calls=ai_calls,
-                        thresholds_raw=evolution_gate_raw,
-                        final_status=final_status,
-                        reason_kind=reason_kind,
-                        reason=reason,
-                        **extra,
-                    )
-                except Exception as exc:
-                    try:
-                        _log("evolution history append failed: "
-                             f"[{type(exc).__name__}] {exc}")
-                    except Exception:
-                        pass
-
-            try:
-                # ── Phase 1: evolution plan ──
-                ai_calls += 1
-                plan = self._chat_client.send_message(
-                    context, call_site="bot_evolution", model=heavy_model,
-                    # Thinking tokens share this budget — the codegen
-                    # calls already get _CODE_GEN_MAX_TOKENS, so give the
-                    # plan the same floor (issue #108).
-                    max_tokens=max(self._chat_client.max_tokens,
-                                   _CODE_GEN_MAX_TOKENS))
-                conv = self._chat_client.conversation
-                if len(conv) >= 2 and conv[-2].get("role") == "user":
-                    conv[-2]["content"] = (
-                        f"[bot evolution payload — {total_trades} trades, "
-                        f"trimmed to save tokens]")
-                ui(self._on_chat_response, plan)
-
-                # Issue #108: an empty / token-truncated plan must stop the
-                # run HERE — before the watermark and before codegen.
-                # parse_plan_directives degrades to action="change" by
-                # design, so without this gate a zero-text response burned
-                # the trade delta and fed codegen a plan of nothing.
-                if (unusable := plan_unusable_reason(plan)):
-                    msg = (
-                        f"🧬 EVO 中止 ABORT: 計畫回應無法使用（{unusable}）。"
-                        f"本次未消耗任何交易資料（watermark 未前進），"
-                        f"下次執行會重跑同一批交易。"
-                        f"建議在 settings.yaml 將 ai.max_tokens 提高到 "
-                        f"≥{_CODE_GEN_MAX_TOKENS}（思考 token 與輸出共用額度）。\n"
-                        f"Plan response unusable ({unusable}) — the model's "
-                        f"reply was empty or cut off by the token limit. "
-                        f"Nothing was consumed: the watermark did NOT "
-                        f"advance and the next run retries the same trades. "
-                        f"Raise `ai.max_tokens` in settings.yaml to "
-                        f"≥{_CODE_GEN_MAX_TOKENS} (thinking tokens share the "
-                        f"output budget).")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    _remember("fail", "plan_unusable", msg)
-                    return
-
-                directives = parse_plan_directives(plan)
-                if directives["action"] == "no_change":
-                    msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
-                           "Plan says no change — pipeline stops here.")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    _remember("no_change", "no_change", msg)
-                    return
-                # Issue #153: an eligible class with an off-grid / structural
-                # plan is refused BEFORE the watermark, so that plan does
-                # not burn next week's delta.
-                # D1: an ineligible class is excluded from weekly codegen.
-                # The exclusion line is emitted every Saturday, including
-                # when this class+source+grid was already recorded.
-                # _bot_evolution settles this before the AI call; this is
-                # the backstop if a plan was already in hand.
-                _knob_apply = None
-                if auto_run and baseline_cls is not None:
-                    from src.evolution.knobs import (
-                        is_knob_not_applicable_reason,
-                        normalize_knob_ineligible_fallback,
-                        saturday_knob_decision, settle_knob_ineligibility)
-                    rejection, _knob_apply = saturday_knob_decision(
-                        baseline_cls.__name__, directives.get("knobs"),
-                        baseline_cls, strategy_source)
-                    if rejection:
-                        if is_knob_not_applicable_reason(rejection):
-                            _knob_fallback = normalize_knob_ineligible_fallback(
-                                self._settings.get(
-                                    "evolution_knob_ineligible_fallback"))
-                            action, why = settle_knob_ineligibility(
-                                bot_dir, baseline_cls, strategy_source,
-                                design_cut_idx, fallback=_knob_fallback)
-                            if action in ("recorded", "skip") and why:
-                                ui(self._append_chat, "system", why)
-                                _notify_discord(why)
-                                _log(why)
-                            _remember("skip", "knob_ineligible", why or rejection)
-                            return
-                        msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
-                        ui(self._append_chat, "system", msg)
-                        if auto_run:
-                            _notify_discord(msg)
-                        _remember("refused", "refused", msg)
-                        return
-                # Issue #125: watermark advances only after a completed
-                # plan with action=change — never at launch. no_change
-                # returned above; a later codegen/validation FAIL does
-                # not un-save (the plan already consumed this delta).
-                try:
-                    from src.evolution.notify import maybe_advance_watermark
-                    maybe_advance_watermark(
-                        bot_dir, design_cut_idx, directives["action"])
-                except Exception as e:
-                    _log(f"evolution watermark save failed: "
-                         f"[{type(e).__name__}] {e}")
-                if not strategy_source:
-                    msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
-                           "Strategy source unavailable — plan-only.")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    _remember("fail", "no_source", msg)
-                    return
-
-                # ── Phase 2: Saturday knob grid, else candidate codegen ──
-                base_cls_name = baseline_cls.__name__ if baseline_cls else "Strategy"
-                candidate_name = next_candidate_name(base_cls_name, taken)
-                candidate_cls = None
-                code = ""
-                last_err = ""
-                if _knob_apply:
-                    ui(self._append_chat, "system",
-                       f"EVO 2/3: Saturday knob mode — applying {_knob_apply} "
-                       f"as {candidate_name} (no codegen)...")
-                    try:
-                        from src.evolution.knobs import rewrite_knob_source
-                        code = rewrite_knob_source(
-                            strategy_source, base_cls_name, candidate_name,
-                            _knob_apply)
-                        candidate_cls = load_strategy_from_source(code)
-                        if (name_err := check_candidate_name(
-                                candidate_cls, candidate_name)):
-                            candidate_cls = None
-                            last_err = name_err
-                    except Exception as e:
-                        candidate_cls = None
-                        last_err = (f"knob apply failed — [{type(e).__name__}] {e}")
-                    if candidate_cls is None:
-                        msg = (f"🧬 EVO FAIL: Saturday knob apply failed — "
-                               f"{last_err}. structural/codegen escalate, not auto.")
-                        ui(self._append_chat, "system", msg)
-                        if auto_run:
-                            _notify_discord(msg)
-                        _remember("fail", "knob_apply", msg)
-                        return
-                if candidate_cls is None:
-                    ui(self._append_chat, "system",
-                       f"EVO 2/3: generating candidate strategy {candidate_name}...")
-                    gen_msg = (
-                        f"{STRATEGY_CODE_CONTEXT}\n\n"
-                        f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
-                        f"## Evolution plan to apply\n{plan}\n\n"
-                        f"## Task\n"
-                        f"Apply EXACTLY the single change specified in the evolution "
-                        f"plan to the strategy above. Keep ALL other logic identical. "
-                        f"The class MUST be named `{candidate_name}` and keep the same "
-                        f"kline_type / kline_minute. Output ONLY one ```python code "
-                        f"block containing the complete strategy file."
-                    )
-                    for attempt in (1, 2):
-                        msg = gen_msg if attempt == 1 else (
-                            gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
-                            f"Fix the problem and output the complete corrected code.")
                         try:
-                            # The API call is INSIDE the try (issue #108): a
-                            # transient model outage (Gemini 503) used to escape
-                            # this loop entirely, so the advertised "one retry"
-                            # never happened for API failures and the error died
-                            # in the outer handler with no Discord notice.
-                            ai_calls += 1
-                            resp = self._chat_client.one_shot(
-                                msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
-                                max_tokens=_CODE_GEN_MAX_TOKENS,
-                                call_site=f"evolution_codegen_{attempt}",
-                                model=heavy_model)
-                            code = extract_python_code(resp) or ""
-                            if not code:
-                                last_err = "no ```python code block found in the response"
-                                continue
+                            _log("evolution history gate block failed: "
+                                 f"[{type(exc).__name__}] {exc}")
+                        except Exception:
+                            pass
+                    history_written = True
+                    try:
+                        _persist_evolution_history(
+                            bot_dir,
+                            bot=display_name,
+                            class_name=(baseline_cls.__name__ if baseline_cls else ""),
+                            source=strategy_source or "",
+                            cut_idx=design_cut_idx,
+                            watermark=watermark,
+                            plan_excerpt=plan,
+                            directives=directives,
+                            ai_calls=ai_calls,
+                            thresholds_raw=evolution_gate_raw,
+                            final_status=final_status,
+                            reason_kind=reason_kind,
+                            reason=reason,
+                            **extra,
+                        )
+                    except Exception as exc:
+                        try:
+                            _log("evolution history append failed: "
+                                 f"[{type(exc).__name__}] {exc}")
+                        except Exception:
+                            pass
+
+                try:
+                    # ── Phase 1: evolution plan ──
+                    ai_calls += 1
+                    plan = self._chat_client.send_message(
+                        context, call_site="bot_evolution", model=heavy_model,
+                        # Thinking tokens share this budget — the codegen
+                        # calls already get _CODE_GEN_MAX_TOKENS, so give the
+                        # plan the same floor (issue #108).
+                        max_tokens=max(self._chat_client.max_tokens,
+                                       _CODE_GEN_MAX_TOKENS))
+                    conv = self._chat_client.conversation
+                    if len(conv) >= 2 and conv[-2].get("role") == "user":
+                        conv[-2]["content"] = (
+                            f"[bot evolution payload — {total_trades} trades, "
+                            f"trimmed to save tokens]")
+                    ui(self._on_chat_response, plan)
+
+                    # Issue #108: an empty / token-truncated plan must stop the
+                    # run HERE — before the watermark and before codegen.
+                    # parse_plan_directives degrades to action="change" by
+                    # design, so without this gate a zero-text response burned
+                    # the trade delta and fed codegen a plan of nothing.
+                    if (unusable := plan_unusable_reason(plan)):
+                        msg = (
+                            f"🧬 EVO 中止 ABORT: 計畫回應無法使用（{unusable}）。"
+                            f"本次未消耗任何交易資料（watermark 未前進），"
+                            f"下次執行會重跑同一批交易。"
+                            f"建議在 settings.yaml 將 ai.max_tokens 提高到 "
+                            f"≥{_CODE_GEN_MAX_TOKENS}（思考 token 與輸出共用額度）。\n"
+                            f"Plan response unusable ({unusable}) — the model's "
+                            f"reply was empty or cut off by the token limit. "
+                            f"Nothing was consumed: the watermark did NOT "
+                            f"advance and the next run retries the same trades. "
+                            f"Raise `ai.max_tokens` in settings.yaml to "
+                            f"≥{_CODE_GEN_MAX_TOKENS} (thinking tokens share the "
+                            f"output budget).")
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        _remember("fail", "plan_unusable", msg)
+                        return
+
+                    directives = parse_plan_directives(plan)
+                    if directives["action"] == "no_change":
+                        msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
+                               "Plan says no change — pipeline stops here.")
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        _remember("no_change", "no_change", msg)
+                        return
+                    # Issue #153: an eligible class with an off-grid / structural
+                    # plan is refused BEFORE the watermark, so that plan does
+                    # not burn next week's delta.
+                    # D1: an ineligible class is excluded from weekly codegen.
+                    # The exclusion line is emitted every Saturday, including
+                    # when this class+source+grid was already recorded.
+                    # _bot_evolution settles this before the AI call; this is
+                    # the backstop if a plan was already in hand.
+                    _knob_apply = None
+                    if auto_run and baseline_cls is not None:
+                        from src.evolution.knobs import (
+                            is_knob_not_applicable_reason,
+                            normalize_knob_ineligible_fallback,
+                            saturday_knob_decision, settle_knob_ineligibility)
+                        rejection, _knob_apply = saturday_knob_decision(
+                            baseline_cls.__name__, directives.get("knobs"),
+                            baseline_cls, strategy_source)
+                        if rejection:
+                            if is_knob_not_applicable_reason(rejection):
+                                _knob_fallback = normalize_knob_ineligible_fallback(
+                                    self._settings.get(
+                                        "evolution_knob_ineligible_fallback"))
+                                action, why = settle_knob_ineligibility(
+                                    bot_dir, baseline_cls, strategy_source,
+                                    design_cut_idx, fallback=_knob_fallback)
+                                if action in ("recorded", "skip") and why:
+                                    ui(self._append_chat, "system", why)
+                                    _notify_discord(why)
+                                    _log(why)
+                                _remember("skip", "knob_ineligible", why or rejection)
+                                return
+                            msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("refused", "refused", msg)
+                            return
+                    # Issue #125: watermark advances only after a completed
+                    # plan with action=change — never at launch. no_change
+                    # returned above; a later codegen/validation FAIL does
+                    # not un-save (the plan already consumed this delta).
+                    try:
+                        from src.evolution.notify import maybe_advance_watermark
+                        maybe_advance_watermark(
+                            bot_dir, design_cut_idx, directives["action"])
+                    except Exception as e:
+                        _log(f"evolution watermark save failed: "
+                             f"[{type(e).__name__}] {e}")
+                    if not strategy_source:
+                        msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
+                               "Strategy source unavailable — plan-only.")
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        _remember("fail", "no_source", msg)
+                        return
+
+                    # ── Phase 2: Saturday knob grid, else candidate codegen ──
+                    base_cls_name = baseline_cls.__name__ if baseline_cls else "Strategy"
+                    candidate_name = next_candidate_name(base_cls_name, taken)
+                    candidate_cls = None
+                    code = ""
+                    last_err = ""
+                    if _knob_apply:
+                        ui(self._append_chat, "system",
+                           f"EVO 2/3: Saturday knob mode — applying {_knob_apply} "
+                           f"as {candidate_name} (no codegen)...")
+                        try:
+                            from src.evolution.knobs import rewrite_knob_source
+                            code = rewrite_knob_source(
+                                strategy_source, base_cls_name, candidate_name,
+                                _knob_apply)
                             candidate_cls = load_strategy_from_source(code)
-                            # load_strategy_from_source returns the first
-                            # BacktestStrategy subclass whatever it is named.
-                            # A kept base-class name would collide with the
-                            # live strategy (issue #114). Discard it and
-                            # spend the retry correcting the name.
                             if (name_err := check_candidate_name(
                                     candidate_cls, candidate_name)):
                                 candidate_cls = None
                                 last_err = name_err
-                                continue
-                            break
-                        except (CodeValidationError, CodeExecutionError) as e:
-                            last_err = str(e)
                         except Exception as e:
-                            last_err = f"AI API error — [{type(e).__name__}] {e}"
-                            _log(f"EVO codegen attempt {attempt} failed: {last_err}")
-                if candidate_cls is None:
-                    msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    _remember("fail", "codegen", msg)
-                    return
-
-                # ── Phase 3: validation backtest ──
-                # The feed may be 1-min CSVs or API bars (engine
-                # aggregates sub-native feeds internally) — size guards
-                # in NATIVE bars, not feed bars.
-                feed_iv = bars[0].interval if bars else 0
-                native_est = len(bars)
-                if feed_iv and native_sec > feed_iv:
-                    native_est = len(bars) * feed_iv // native_sec
-                if native_est < 150:
-                    msg = (f"🧬 EVO: only ~{native_est} native bars of data "
-                           f"available — not enough for a meaningful validation "
-                           f"backtest. Plan + candidate generated but NOT "
-                           f"validated/saved; run a TV/API backtest manually.")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    _remember("fail", "insufficient_bars", msg)
-                    return
-
-                data_desc = (
-                    f"{data_origin}: "
-                    f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
-                    f"({len(bars)} × {feed_iv // 60}min bars "
-                    f"≈ {native_est} native bars)")
-
-                evo_gate_cfg = evolution_gate_config_from_mapping(
-                    evolution_gate_raw)
-                for warning in evo_gate_cfg.warnings:
-                    _log(f"EVO gate config: {warning}")
-                month_gate_cfg = month_gate_config_from_mapping(
-                    evolution_gate_raw)
-                for warning in month_gate_cfg.warnings:
-                    _log(f"EVO month gate config: {warning}")
-                # Decision time, not a start-of-run snapshot. Running
-                # runner: its trading_mode. Idle or missing: configured
-                # mode only — unknown stays unknown (absolute gate).
-                runner = getattr(self, "_live_runner", None)
-                runner_idle = (
-                    runner is None
-                    or getattr(runner, "state", None) == LiveState.IDLE)
-                promotion_mode = evolution_promotion_mode(
-                    runner=runner,
-                    runner_idle=runner_idle,
-                    configured_mode=getattr(self, "_trading_mode", None),
-                )
-                evo_gate = resolve_promotion_gate(
-                    promotion_mode,
-                    evo_gate_cfg.paper_gate,
-                    str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
-                )
-                if evo_gate.note:
-                    _log(f"EVO gate: {evo_gate.note}")
-                evo_require_abs_pf = abs_pf_required(evo_gate)
-
-                # Walk-forward (SEE spec: 90d train / 90d test + Monte
-                # Carlo) when data allows; scaled windows on shorter
-                # spans; simple single-window A/B as last resort.
-                span_days = ((bars[-1].dt - bars[0].dt).days
-                             if len(bars) >= 2 else 0)
-                # Walk-forward windows aligned with the design/holdout
-                # split: the test window IS the holdout (the design never
-                # saw it); the train window is up to 90d of pre-holdout
-                # data. Too little pre-holdout history (< 14d) → walk-
-                # forward is meaningless, degrade to simple A/B.
-                tr_d = te_d = 0
-                if validation == "deep":
-                    from src.evolution.evaluator import DEEP_TRAIN_DAYS
-                    te_d = holdout_days
-                    tr_d = min(DEEP_TRAIN_DAYS, max(0, span_days - te_d))
-                    if tr_d < 14:
-                        tr_d = 0
-
-                if tr_d:
-                    ui(self._append_chat, "system",
-                       f"EVO 3/3: walk-forward + multi-fold + month gates — "
-                       f"train {tr_d}d / test {te_d}d + Monte Carlo "
-                       f"({base_cls_name} vs {candidate_cls.__name__})...")
-                    baseline_res = run_deep_validation(
-                        baseline_cls, bars, point_value, "基準 baseline",
-                        tr_d, te_d, monte_carlo=False,
-                        capital_base=capital_base)
-                    candidate_res = run_deep_validation(
-                        candidate_cls, bars, point_value,
-                        f"候選 {candidate_cls.__name__}", tr_d, te_d,
-                        monte_carlo=True, capital_base=capital_base)
-                    window_verdict = decide_deep_verdict(
-                        baseline_res, candidate_res, directives["criteria"],
-                        require_abs_pf=evo_require_abs_pf)
-                    cl_base_m = (baseline_res.test.metrics
-                                 if baseline_res.test.result else None)
-                    cl_cand_m = (candidate_res.test.metrics
-                                 if candidate_res.test.result else None)
-                else:
-                    if validation == "deep":
+                            candidate_cls = None
+                            last_err = (f"knob apply failed — [{type(e).__name__}] {e}")
+                        if candidate_cls is None:
+                            msg = (f"🧬 EVO FAIL: Saturday knob apply failed — "
+                                   f"{last_err}. structural/codegen escalate, not auto.")
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "knob_apply", msg)
+                            return
+                    if candidate_cls is None:
                         ui(self._append_chat, "system",
-                           f"EVO: data span {span_days}d too short for "
-                           f"walk-forward — using simple A/B plus multi-fold "
-                           f"and month gates.")
-                    ui(self._append_chat, "system",
-                       f"EVO 3/3: A/B + multi-fold + month gates on {len(bars)} × "
-                       f"{feed_iv // 60}min bars ≈ {native_est} native bars "
-                       f"({base_cls_name} vs {candidate_cls.__name__})...")
-                    baseline_res = run_ab_backtest(
-                        baseline_cls, bars, point_value, "基準 baseline",
-                        capital_base=capital_base)
-                    candidate_res = run_ab_backtest(
-                        candidate_cls, bars, point_value,
-                        f"候選 {candidate_cls.__name__}",
-                        capital_base=capital_base)
-                    window_verdict = decide_verdict(
-                        baseline_res, candidate_res, directives["criteria"],
-                        require_abs_pf=evo_require_abs_pf)
-                    cl_base_m = baseline_res.metrics
-                    cl_cand_m = candidate_res.metrics
-
-                # Issue #153: multi-fold + month gates on the same bars.
-                # Month reasons are combined first so Discord truncation
-                # keeps prior-months collapse / calendar-month dominated.
-                folds, mf_base, mf_cand = run_multifold_validation(
-                    baseline_cls, candidate_cls, bars, point_value,
-                    capital_base=capital_base)
-                base_trades = (list(mf_base.result.trades)
-                               if mf_base.result is not None else [])
-                cand_trades = (list(mf_cand.result.trades)
-                               if mf_cand.result is not None else [])
-                ho_start = holdout_window_start(bars, te_d or holdout_days)
-                # Paper relative drops the absolute PF floors and ANDs the
-                # bootstrap / effect-size checks. Real money stays absolute.
-                # The retire recommendation below does not feed this verdict.
-                assembled = assemble_promotion_verdict(
-                    gate=evo_gate,
-                    gate_cfg=evo_gate_cfg,
-                    folds=folds,
-                    base_trades=base_trades,
-                    cand_trades=cand_trades,
-                    holdout_start=ho_start,
-                    criteria=directives["criteria"],
-                    window_verdict=window_verdict,
-                    bars=bars,
-                    month_gate=month_gate_cfg,
-                )
-                verdict = assembled.verdict
-                # assemble_promotion_verdict threads decide_month_gates'
-                # observation out. The PASS changelog below forwards it.
-                month_verdict = assembled.month_verdict
-                # Debug-only. A logging failure must not abort validation.
-                try:
-                    _log(format_month_gates_debug(month_verdict.month_gates))
-                except Exception as e:
-                    try:
-                        _log(f"EVO month gates log failed: "
-                             f"[{type(e).__name__}] {e}")
-                    except Exception:
-                        pass
-
-                # Clean PASS → StrategyPool validated only. Never
-                # StrategyStore.save and never STRATEGIES[...].
-                pool_id = ""
-                if eligible_for_validated_pool(verdict):
-                    try:
-                        from src.evolution.pool import (
-                            StrategyPool, default_pool_path,
-                            record_validated_candidate)
-                        wf = 0.0
-                        fit = getattr(
-                            getattr(candidate_res, "test", None), "fitness", None)
-                        if fit is None:
-                            fit = getattr(candidate_res, "fitness", None)
-                        if fit is not None:
-                            wf = float(fit.composite)
-                        pool_id = record_validated_candidate(
-                            StrategyPool(default_pool_path()),
-                            name=candidate_cls.__name__,
-                            source_code=code,
-                            walkforward_fitness=wf,
-                            notes=(
-                                "issue #153 weekend evo PASS — StrategyPool "
-                                "validated only; StrategyStore / STRATEGIES "
-                                "auto-save blocked; "
-                                f"{gate_provenance(evo_gate.mode)}"),
+                           f"EVO 2/3: generating candidate strategy {candidate_name}...")
+                        gen_msg = (
+                            f"{STRATEGY_CODE_CONTEXT}\n\n"
+                            f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
+                            f"## Evolution plan to apply\n{plan}\n\n"
+                            f"## Task\n"
+                            f"Apply EXACTLY the single change specified in the evolution "
+                            f"plan to the strategy above. Keep ALL other logic identical. "
+                            f"The class MUST be named `{candidate_name}` and keep the same "
+                            f"kline_type / kline_minute. Output ONLY one ```python code "
+                            f"block containing the complete strategy file."
                         )
+                        for attempt in (1, 2):
+                            msg = gen_msg if attempt == 1 else (
+                                gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
+                                f"Fix the problem and output the complete corrected code.")
+                            try:
+                                # The API call is INSIDE the try (issue #108): a
+                                # transient model outage (Gemini 503) used to escape
+                                # this loop entirely, so the advertised "one retry"
+                                # never happened for API failures and the error died
+                                # in the outer handler with no Discord notice.
+                                ai_calls += 1
+                                resp = self._chat_client.one_shot(
+                                    msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                                    max_tokens=_CODE_GEN_MAX_TOKENS,
+                                    call_site=f"evolution_codegen_{attempt}",
+                                    model=heavy_model)
+                                code = extract_python_code(resp) or ""
+                                if not code:
+                                    last_err = "no ```python code block found in the response"
+                                    continue
+                                candidate_cls = load_strategy_from_source(code)
+                                # load_strategy_from_source returns the first
+                                # BacktestStrategy subclass whatever it is named.
+                                # A kept base-class name would collide with the
+                                # live strategy (issue #114). Discard it and
+                                # spend the retry correcting the name.
+                                if (name_err := check_candidate_name(
+                                        candidate_cls, candidate_name)):
+                                    candidate_cls = None
+                                    last_err = name_err
+                                    continue
+                                break
+                            except (CodeValidationError, CodeExecutionError) as e:
+                                last_err = str(e)
+                            except Exception as e:
+                                last_err = f"AI API error — [{type(e).__name__}] {e}"
+                                _log(f"EVO codegen attempt {attempt} failed: {last_err}")
+                    if candidate_cls is None:
+                        msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        _remember("fail", "codegen", msg)
+                        return
+
+                    # ── Phase 3: validation backtest ──
+                    # The feed may be 1-min CSVs or API bars (engine
+                    # aggregates sub-native feeds internally) — size guards
+                    # in NATIVE bars, not feed bars.
+                    feed_iv = bars[0].interval if bars else 0
+                    native_est = len(bars)
+                    if feed_iv and native_sec > feed_iv:
+                        native_est = len(bars) * feed_iv // native_sec
+                    if native_est < 150:
+                        msg = (f"🧬 EVO: only ~{native_est} native bars of data "
+                               f"available — not enough for a meaningful validation "
+                               f"backtest. Plan + candidate generated but NOT "
+                               f"validated/saved; run a TV/API backtest manually.")
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        _remember("fail", "insufficient_bars", msg)
+                        return
+
+                    data_desc = (
+                        f"{data_origin}: "
+                        f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
+                        f"({len(bars)} × {feed_iv // 60}min bars "
+                        f"≈ {native_est} native bars)")
+
+                    evo_gate_cfg = evolution_gate_config_from_mapping(
+                        evolution_gate_raw)
+                    for warning in evo_gate_cfg.warnings:
+                        _log(f"EVO gate config: {warning}")
+                    month_gate_cfg = month_gate_config_from_mapping(
+                        evolution_gate_raw)
+                    for warning in month_gate_cfg.warnings:
+                        _log(f"EVO month gate config: {warning}")
+                    # Decision time, not a start-of-run snapshot. Running
+                    # runner: its trading_mode. Idle or missing: configured
+                    # mode only — unknown stays unknown (absolute gate).
+                    runner = getattr(self, "_live_runner", None)
+                    runner_idle = (
+                        runner is None
+                        or getattr(runner, "state", None) == LiveState.IDLE)
+                    promotion_mode = evolution_promotion_mode(
+                        runner=runner,
+                        runner_idle=runner_idle,
+                        configured_mode=getattr(self, "_trading_mode", None),
+                    )
+                    evo_gate = resolve_promotion_gate(
+                        promotion_mode,
+                        evo_gate_cfg.paper_gate,
+                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
+                    )
+                    if evo_gate.note:
+                        _log(f"EVO gate: {evo_gate.note}")
+                    evo_require_abs_pf = abs_pf_required(evo_gate)
+
+                    # Walk-forward (SEE spec: 90d train / 90d test + Monte
+                    # Carlo) when data allows; scaled windows on shorter
+                    # spans; simple single-window A/B as last resort.
+                    span_days = ((bars[-1].dt - bars[0].dt).days
+                                 if len(bars) >= 2 else 0)
+                    # Walk-forward windows aligned with the design/holdout
+                    # split: the test window IS the holdout (the design never
+                    # saw it); the train window is up to 90d of pre-holdout
+                    # data. Too little pre-holdout history (< 14d) → walk-
+                    # forward is meaningless, degrade to simple A/B.
+                    tr_d = te_d = 0
+                    if validation == "deep":
+                        from src.evolution.evaluator import DEEP_TRAIN_DAYS
+                        te_d = holdout_days
+                        tr_d = min(DEEP_TRAIN_DAYS, max(0, span_days - te_d))
+                        if tr_d < 14:
+                            tr_d = 0
+
+                    if tr_d:
+                        ui(self._append_chat, "system",
+                           f"EVO 3/3: walk-forward + multi-fold + month gates — "
+                           f"train {tr_d}d / test {te_d}d + Monte Carlo "
+                           f"({base_cls_name} vs {candidate_cls.__name__})...")
+                        baseline_res = run_deep_validation(
+                            baseline_cls, bars, point_value, "基準 baseline",
+                            tr_d, te_d, monte_carlo=False,
+                            capital_base=capital_base)
+                        candidate_res = run_deep_validation(
+                            candidate_cls, bars, point_value,
+                            f"候選 {candidate_cls.__name__}", tr_d, te_d,
+                            monte_carlo=True, capital_base=capital_base)
+                        window_verdict = decide_deep_verdict(
+                            baseline_res, candidate_res, directives["criteria"],
+                            require_abs_pf=evo_require_abs_pf)
+                        cl_base_m = (baseline_res.test.metrics
+                                     if baseline_res.test.result else None)
+                        cl_cand_m = (candidate_res.test.metrics
+                                     if candidate_res.test.result else None)
+                    else:
+                        if validation == "deep":
+                            ui(self._append_chat, "system",
+                               f"EVO: data span {span_days}d too short for "
+                               f"walk-forward — using simple A/B plus multi-fold "
+                               f"and month gates.")
+                        ui(self._append_chat, "system",
+                           f"EVO 3/3: A/B + multi-fold + month gates on {len(bars)} × "
+                           f"{feed_iv // 60}min bars ≈ {native_est} native bars "
+                           f"({base_cls_name} vs {candidate_cls.__name__})...")
+                        baseline_res = run_ab_backtest(
+                            baseline_cls, bars, point_value, "基準 baseline",
+                            capital_base=capital_base)
+                        candidate_res = run_ab_backtest(
+                            candidate_cls, bars, point_value,
+                            f"候選 {candidate_cls.__name__}",
+                            capital_base=capital_base)
+                        window_verdict = decide_verdict(
+                            baseline_res, candidate_res, directives["criteria"],
+                            require_abs_pf=evo_require_abs_pf)
+                        cl_base_m = baseline_res.metrics
+                        cl_cand_m = candidate_res.metrics
+
+                    # Issue #153: multi-fold + month gates on the same bars.
+                    # Month reasons are combined first so Discord truncation
+                    # keeps prior-months collapse / calendar-month dominated.
+                    folds, mf_base, mf_cand = run_multifold_validation(
+                        baseline_cls, candidate_cls, bars, point_value,
+                        capital_base=capital_base)
+                    base_trades = (list(mf_base.result.trades)
+                                   if mf_base.result is not None else [])
+                    cand_trades = (list(mf_cand.result.trades)
+                                   if mf_cand.result is not None else [])
+                    ho_start = holdout_window_start(bars, te_d or holdout_days)
+                    # Paper relative drops the absolute PF floors and ANDs the
+                    # bootstrap / effect-size checks. Real money stays absolute.
+                    # The retire recommendation below does not feed this verdict.
+                    assembled = assemble_promotion_verdict(
+                        gate=evo_gate,
+                        gate_cfg=evo_gate_cfg,
+                        folds=folds,
+                        base_trades=base_trades,
+                        cand_trades=cand_trades,
+                        holdout_start=ho_start,
+                        criteria=directives["criteria"],
+                        window_verdict=window_verdict,
+                        bars=bars,
+                        month_gate=month_gate_cfg,
+                    )
+                    verdict = assembled.verdict
+                    # assemble_promotion_verdict threads decide_month_gates'
+                    # observation out. The PASS changelog below forwards it.
+                    month_verdict = assembled.month_verdict
+                    # Debug-only. A logging failure must not abort validation.
+                    try:
+                        _log(format_month_gates_debug(month_verdict.month_gates))
                     except Exception as e:
-                        _log(f"EVO pool promote failed: [{type(e).__name__}] {e}")
-                        pool_id = ""
-
-                    if pool_id:
                         try:
-                            from src.daily_report.changelog import append_changelog
-                            from src.evolution.changelog_params import (
-                                evolution_changelog_params)
+                            _log(f"EVO month gates log failed: "
+                                 f"[{type(e).__name__}] {e}")
+                        except Exception:
+                            pass
 
-                            def _mdict(m):
-                                if m is None:
-                                    return None
-                                pf = (None if m.profit_factor == float("inf")
-                                      else round(m.profit_factor, 3))
-                                return {"trades": m.total_trades, "pnl": m.total_pnl,
-                                        "pf": pf,
-                                        "max_dd_pct": round(m.max_drawdown_pct, 2),
-                                        "win_rate": round(m.win_rate, 3)}
-                            params_before, params_after, params_reason = (
-                                evolution_changelog_params(
-                                    knob_apply=_knob_apply,
-                                    baseline_cls=baseline_cls,
-                                    baseline_source=strategy_source or "",
-                                    candidate_source=code or "",
-                                    candidate_name=candidate_cls.__name__,
-                                ))
-                            append_changelog(
-                                strategy_name=display_name,
-                                version_before=base_cls_name,
-                                version_after=candidate_cls.__name__,
-                                change_summary=(
-                                    f"{gate_provenance(evo_gate.mode)}; "
-                                    f"auto-evolution pool-validated only "
-                                    f"(StrategyStore auto-save blocked, #153); "
-                                    f"validation={'walk-forward' if tr_d else 'simple A/B'}"
-                                    f"+multifold+month; "
-                                    f"criteria={directives['criteria']}; "
-                                    f"plan excerpt: {plan[:300]}"),
-                                initiated_by="ai",
-                                metrics_before=_mdict(cl_base_m),
-                                metrics_after=_mdict(cl_cand_m),
-                                params_before=params_before,
-                                params_after=params_after,
-                                params_reason=params_reason,
-                                month_gates=month_verdict.month_gates,
+                    # Clean PASS → StrategyPool validated only. Never
+                    # StrategyStore.save and never STRATEGIES[...].
+                    pool_id = ""
+                    if eligible_for_validated_pool(verdict):
+                        try:
+                            from src.evolution.pool import (
+                                StrategyPool, default_pool_path,
+                                record_validated_candidate)
+                            wf = 0.0
+                            fit = getattr(
+                                getattr(candidate_res, "test", None), "fitness", None)
+                            if fit is None:
+                                fit = getattr(candidate_res, "fitness", None)
+                            if fit is not None:
+                                wf = float(fit.composite)
+                            pool_id = record_validated_candidate(
+                                StrategyPool(default_pool_path()),
+                                name=candidate_cls.__name__,
+                                source_code=code,
+                                walkforward_fitness=wf,
+                                notes=(
+                                    "issue #153 weekend evo PASS — StrategyPool "
+                                    "validated only; StrategyStore / STRATEGIES "
+                                    "auto-save blocked; "
+                                    f"{gate_provenance(evo_gate.mode)}"),
                             )
                         except Exception as e:
-                            _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+                            _log(f"EVO pool promote failed: [{type(e).__name__}] {e}")
+                            pool_id = ""
 
-                block = format_weekend_verdict_block(
-                    verdict, folds, data_desc, pool_promoted=pool_id)
-                if verdict.passed and not pool_id:
-                    block += ("\nPool promotion failed — nothing was registered "
-                              "and STRATEGIES was not updated.")
-                # Recommend-only. A failure here must not change the verdict
-                # or the pool promotion above, and must not touch live state.
-                evaluated_at = None
-                try:
-                    append_changelog = None
-                    prior_weeks = []
-                    try:
-                        from src.daily_report.changelog import (
-                            append_changelog as _append_changelog,
-                            load_changelog,
-                        )
-                        append_changelog = _append_changelog
-                        prior_weeks = weeks_from_changelog(
-                            load_changelog(), display_name)
-                    except Exception as hist_err:
-                        _log("EVO retire history unread: "
-                             f"[{type(hist_err).__name__}] {hist_err}")
-                    evaluated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                    weeks = list(prior_weeks)
-                    if evo_gate.mode == "relative":
-                        weeks.append(WeekRecord(
-                            at=evaluated_at, evaluated=True,
-                            passed=bool(verdict.passed)))
-                        if append_changelog is not None:
+                        if pool_id:
                             try:
+                                from src.daily_report.changelog import append_changelog
+                                from src.evolution.changelog_params import (
+                                    evolution_changelog_params)
+
+                                def _mdict(m):
+                                    if m is None:
+                                        return None
+                                    pf = (None if m.profit_factor == float("inf")
+                                          else round(m.profit_factor, 3))
+                                    return {"trades": m.total_trades, "pnl": m.total_pnl,
+                                            "pf": pf,
+                                            "max_dd_pct": round(m.max_drawdown_pct, 2),
+                                            "win_rate": round(m.win_rate, 3)}
+                                params_before, params_after, params_reason = (
+                                    evolution_changelog_params(
+                                        knob_apply=_knob_apply,
+                                        baseline_cls=baseline_cls,
+                                        baseline_source=strategy_source or "",
+                                        candidate_source=code or "",
+                                        candidate_name=candidate_cls.__name__,
+                                    ))
                                 append_changelog(
                                     strategy_name=display_name,
                                     version_before=base_cls_name,
-                                    version_after=base_cls_name,
-                                    change_summary=relative_eval_summary(
-                                        bool(verdict.passed), evaluated_at),
+                                    version_after=candidate_cls.__name__,
+                                    change_summary=(
+                                        f"{gate_provenance(evo_gate.mode)}; "
+                                        f"auto-evolution pool-validated only "
+                                        f"(StrategyStore auto-save blocked, #153); "
+                                        f"validation={'walk-forward' if tr_d else 'simple A/B'}"
+                                        f"+multifold+month; "
+                                        f"criteria={directives['criteria']}; "
+                                        f"plan excerpt: {plan[:300]}"),
                                     initiated_by="ai",
+                                    metrics_before=_mdict(cl_base_m),
+                                    metrics_after=_mdict(cl_cand_m),
+                                    params_before=params_before,
+                                    params_after=params_after,
+                                    params_reason=params_reason,
+                                    month_gates=month_verdict.month_gates,
                                 )
-                            except Exception as rec_err:
-                                _log("EVO relative-gate record failed: "
-                                     f"[{type(rec_err).__name__}] {rec_err}")
-                    rec = assess_retirement(
-                        base_trades,
-                        weeks=weeks,
-                        structural_graduations=[],
-                        now=datetime.now(),
-                        config=evo_gate_cfg.retire,
-                    )
-                    report_lines: list[str] = []
-                    emit_retire_recommendation(
-                        rec,
-                        log=_log,
-                        changelog=(append_changelog if rec.recommend else None),
-                        report=report_lines,
-                        strategy_name=display_name,
-                        version=base_cls_name,
-                    )
-                    if report_lines:
-                        block += "\n" + "\n".join(report_lines)
-                except Exception as retire_err:
-                    _log("EVO retire recommendation failed: "
-                         f"[{type(retire_err).__name__}] {retire_err}")
-                ui(self._remove_last_system_line)
-                ui(self._append_chat, "system", block)
-                if verdict.passed and pool_id:
-                    status = ("🧬 EVO PASS — pool validated, "
-                              "not added to STRATEGIES")
-                elif verdict.passed:
-                    status = ("🧬 EVO PASS — pool promotion failed; "
-                              "nothing registered")
-                else:
-                    status = "🧬 EVO FAIL — candidate rejected"
-                ui(self.set_status, status)
-                # Verdict goes to Discord from BOTH manual and weekly-auto
-                # runs (manual too, per user: testing + visibility). The
-                # block carries multi-fold and month reasons (issue #153).
-                if _discord is not None and _discord.enabled:
+                            except Exception as e:
+                                _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+
+                    block = format_weekend_verdict_block(
+                        verdict, folds, data_desc, pool_promoted=pool_id)
+                    if verdict.passed and not pool_id:
+                        block += ("\nPool promotion failed — nothing was registered "
+                                  "and STRATEGIES was not updated.")
+                    # Recommend-only. A failure here must not change the verdict
+                    # or the pool promotion above, and must not touch live state.
+                    evaluated_at = None
                     try:
-                        _discord.evolution_verdict(verdict.passed, block)
-                    except Exception:
-                        pass
-                if verdict.passed and pool_id:
-                    history_reason = ""
-                elif verdict.passed:
-                    history_reason = "pool promotion failed"
-                else:
-                    history_reason = "validation failed"
-                _remember(
-                    "pass" if verdict.passed else "fail",
-                    "validation",
-                    history_reason,
-                    provisional=bool(verdict.provisional),
-                    assembled=assembled,
-                    folds=folds,
-                    baseline_res=baseline_res,
-                    candidate_res=candidate_res,
-                    gate=evo_gate,
-                    gate_cfg=evo_gate_cfg,
-                    retire_evaluated=(evo_gate.mode == "relative"),
-                    retire_passed=bool(verdict.passed),
-                    ts=evaluated_at,
-                    capture_params=True,
-                    knob_apply=_knob_apply,
-                    baseline_cls=baseline_cls,
-                    baseline_source=strategy_source or "",
-                    candidate_source=code or "",
-                    candidate_name=candidate_cls.__name__,
-                    baseline_name=base_cls_name,
-                )
-            except Exception as e:
-                _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
-                err_msg = str(e)
-                _remember("fail", "pipeline_error",
-                          f"[{type(e).__name__}] {err_msg}")
-                # Built INSIDE the except — Python 3.13 deletes `e` on exit.
-                # Weekly-auto runs must not die silently (issue #108): a
-                # plan-phase failure only reached the log before this.
-                # Manual runs stay Discord-quiet, like the other EVO
-                # failure branches above.
-                if auto_run:
-                    _notify_discord(
-                        f"🧬 EVO ERROR: [{type(e).__name__}] {e}")
-                ui(self._on_chat_error, err_msg)
-            finally:
-                ui(lambda: self.btn_send.config(state=tk.NORMAL))
+                        append_changelog = None
+                        prior_weeks = []
+                        try:
+                            from src.daily_report.changelog import (
+                                append_changelog as _append_changelog,
+                                load_changelog,
+                            )
+                            append_changelog = _append_changelog
+                            prior_weeks = weeks_from_changelog(
+                                load_changelog(), display_name)
+                        except Exception as hist_err:
+                            _log("EVO retire history unread: "
+                                 f"[{type(hist_err).__name__}] {hist_err}")
+                        evaluated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                        weeks = list(prior_weeks)
+                        if evo_gate.mode == "relative":
+                            weeks.append(WeekRecord(
+                                at=evaluated_at, evaluated=True,
+                                passed=bool(verdict.passed)))
+                            if append_changelog is not None:
+                                try:
+                                    append_changelog(
+                                        strategy_name=display_name,
+                                        version_before=base_cls_name,
+                                        version_after=base_cls_name,
+                                        change_summary=relative_eval_summary(
+                                            bool(verdict.passed), evaluated_at),
+                                        initiated_by="ai",
+                                    )
+                                except Exception as rec_err:
+                                    _log("EVO relative-gate record failed: "
+                                         f"[{type(rec_err).__name__}] {rec_err}")
+                        rec = assess_retirement(
+                            base_trades,
+                            weeks=weeks,
+                            structural_graduations=[],
+                            now=datetime.now(),
+                            config=evo_gate_cfg.retire,
+                        )
+                        report_lines: list[str] = []
+                        emit_retire_recommendation(
+                            rec,
+                            log=_log,
+                            changelog=(append_changelog if rec.recommend else None),
+                            report=report_lines,
+                            strategy_name=display_name,
+                            version=base_cls_name,
+                        )
+                        if report_lines:
+                            block += "\n" + "\n".join(report_lines)
+                    except Exception as retire_err:
+                        _log("EVO retire recommendation failed: "
+                             f"[{type(retire_err).__name__}] {retire_err}")
+                    ui(self._remove_last_system_line)
+                    ui(self._append_chat, "system", block)
+                    if verdict.passed and pool_id:
+                        status = ("🧬 EVO PASS — pool validated, "
+                                  "not added to STRATEGIES")
+                    elif verdict.passed:
+                        status = ("🧬 EVO PASS — pool promotion failed; "
+                                  "nothing registered")
+                    else:
+                        status = "🧬 EVO FAIL — candidate rejected"
+                    ui(self.set_status, status)
+                    # Verdict goes to Discord from BOTH manual and weekly-auto
+                    # runs (manual too, per user: testing + visibility). The
+                    # block carries multi-fold and month reasons (issue #153).
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.evolution_verdict(verdict.passed, block)
+                        except Exception:
+                            pass
+                    if verdict.passed and pool_id:
+                        history_reason = ""
+                    elif verdict.passed:
+                        history_reason = "pool promotion failed"
+                    else:
+                        history_reason = "validation failed"
+                    _remember(
+                        "pass" if verdict.passed else "fail",
+                        "validation",
+                        history_reason,
+                        provisional=bool(verdict.provisional),
+                        assembled=assembled,
+                        folds=folds,
+                        baseline_res=baseline_res,
+                        candidate_res=candidate_res,
+                        gate=evo_gate,
+                        gate_cfg=evo_gate_cfg,
+                        retire_evaluated=(evo_gate.mode == "relative"),
+                        retire_passed=bool(verdict.passed),
+                        ts=evaluated_at,
+                        capture_params=True,
+                        knob_apply=_knob_apply,
+                        baseline_cls=baseline_cls,
+                        baseline_source=strategy_source or "",
+                        candidate_source=code or "",
+                        candidate_name=candidate_cls.__name__,
+                        baseline_name=base_cls_name,
+                    )
+                    _evolution_history_sealed()
+                except Exception as e:
+                    _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+                    err_msg = str(e)
+                    _remember("fail", "pipeline_error",
+                              f"[{type(e).__name__}] {err_msg}")
+                    # Built INSIDE the except — Python 3.13 deletes `e` on exit.
+                    # Weekly-auto runs must not die silently (issue #108): a
+                    # plan-phase failure only reached the log before this.
+                    # Manual runs stay Discord-quiet, like the other EVO
+                    # failure branches above.
+                    if auto_run:
+                        _notify_discord(
+                            f"🧬 EVO ERROR: [{type(e).__name__}] {e}")
+                    ui(self._on_chat_error, err_msg)
+                finally:
+                    try:
+                        ui(lambda: self.btn_send.config(state=tk.NORMAL))
+                    finally:
+                        _evolution_end(key)
 
-        def _launch(launch_bars, origin):
-            evo_data["bars"] = launch_bars
-            evo_data["origin"] = origin
-            self._append_chat(
-                "user",
-                "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
-            self.btn_send.config(state=tk.DISABLED)
-            self._append_chat(
-                "system",
-                f"EVO 1/3: analyzing {total_trades} trades, "
-                f"generating evolution plan... (validation data: {origin})")
-            threading.Thread(target=_worker, daemon=True).start()
+            def _launch(launch_bars, origin):
+                nonlocal started
+                evo_data["bars"] = launch_bars
+                evo_data["origin"] = origin
+                self._append_chat(
+                    "user",
+                    "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
+                self.btn_send.config(state=tk.DISABLED)
+                self._append_chat(
+                    "system",
+                    f"EVO 1/3: analyzing {total_trades} trades, "
+                    f"generating evolution plan... (validation data: {origin})")
+                threading.Thread(target=_worker, daemon=True).start()
+                started = True
+                return True
 
-        # ── Validation data dispatch ──
-        # Deep walk-forward wants train+test (+buffer) days of native
-        # bars. Fetch via Capital API when the quote session is up and
-        # the live bot is in steady RUNNING state (KLine routing goes to
-        # the backtest fetcher then — warmup/poll flags are False).
-        # Everything else falls back to local data.
-        can_api_fetch = (
-            validation == "deep" and live and self._quote_connected
-            and not self._live_warmup_mode
-            and self._live_runner.state == LiveState.RUNNING
-            and baseline_cls is not None
-            and self._evo_fetch_cb is None  # no fetch already in flight
-        )
-        if can_api_fetch:
-            from src.evolution.evaluator import DEEP_TRAIN_DAYS, DEEP_TEST_DAYS
-            need_days = DEEP_TRAIN_DAYS + DEEP_TEST_DAYS + 14  # warmup buffer
-            now_tpe = _taipei_now()
-            start = (now_tpe - timedelta(days=need_days)).strftime("%Y%m%d")
-            end = now_tpe.strftime("%Y%m%d")
-            symbol = self._live_runner.symbol
-            kt = baseline_cls.kline_type
-            km = baseline_cls.kline_minute
-            self._append_chat(
-                "system",
-                f"EVO 0/3: fetching ~{need_days}d of {km}min bars via "
-                f"Capital API for walk-forward validation...")
-            self._fetcher.start_api_fetch(symbol, kt, km, start, end)
+            # ── Validation data dispatch ──
+            # Deep walk-forward wants train+test (+buffer) days of native
+            # bars. Fetch via Capital API when the quote session is up and
+            # the live bot is in steady RUNNING state (KLine routing goes to
+            # the backtest fetcher then — warmup/poll flags are False).
+            # Everything else falls back to local data.
+            can_api_fetch = (
+                validation == "deep" and live and self._quote_connected
+                and not self._live_warmup_mode
+                and self._live_runner.state == LiveState.RUNNING
+                and baseline_cls is not None
+                and self._evo_fetch_cb is None  # no fetch already in flight
+            )
+            if can_api_fetch:
+                from src.evolution.evaluator import DEEP_TRAIN_DAYS, DEEP_TEST_DAYS
+                need_days = DEEP_TRAIN_DAYS + DEEP_TEST_DAYS + 14  # warmup buffer
+                now_tpe = _taipei_now()
+                start = (now_tpe - timedelta(days=need_days)).strftime("%Y%m%d")
+                end = now_tpe.strftime("%Y%m%d")
+                symbol = self._live_runner.symbol
+                kt = baseline_cls.kline_type
+                km = baseline_cls.kline_minute
+                self._append_chat(
+                    "system",
+                    f"EVO 0/3: fetching ~{need_days}d of {km}min bars via "
+                    f"Capital API for walk-forward validation...")
+                self._fetcher.start_api_fetch(symbol, kt, km, start, end)
 
-            def _on_evo_fetch_done(ok: bool):
-                # Deploy keeps the fetch buttons disabled during a live
-                # session — restore that invariant (the chunk-loop error
-                # path calls _enable_buttons()).
-                self.btn_api.config(state=tk.DISABLED)
-                self.btn_tv.config(state=tk.DISABLED)
-                api_bars = self._fetcher.get_api_bars() if ok else []
-                if api_bars:
-                    _launch(api_bars, f"Capital API ({need_days}d requested)")
-                else:
-                    fb, origin = _fallback_bars()
-                    self._append_chat(
-                        "system",
-                        f"EVO: API fetch failed — falling back to {origin}.")
-                    _launch(fb, origin)
+                def _on_evo_fetch_done(ok: bool):
+                    # Deploy keeps the fetch buttons disabled during a live
+                    # session — restore that invariant (the chunk-loop error
+                    # path calls _enable_buttons()). The guard stays held
+                    # until the worker finishes. A failure before launch
+                    # releases it here so a crashed fetch cannot wedge the bot.
+                    launched = False
+                    try:
+                        self.btn_api.config(state=tk.DISABLED)
+                        self.btn_tv.config(state=tk.DISABLED)
+                        api_bars = self._fetcher.get_api_bars() if ok else []
+                        if api_bars:
+                            launched = _launch(
+                                api_bars, f"Capital API ({need_days}d requested)")
+                        else:
+                            fb, origin = _fallback_bars()
+                            self._append_chat(
+                                "system",
+                                f"EVO: API fetch failed — falling back to {origin}.")
+                            launched = _launch(fb, origin)
+                    finally:
+                        if not launched:
+                            _evolution_end(key)
 
-            self._evo_fetch_cb = _on_evo_fetch_done
-            self._fetch_next_chunk()
-        else:
-            fb, origin = _fallback_bars()
-            _launch(fb, origin)
+                self._evo_fetch_cb = _on_evo_fetch_done
+                self._fetch_next_chunk()
+                started = True
+            else:
+                fb, origin = _fallback_bars()
+                _launch(fb, origin)
+
+        finally:
+            if not started:
+                _evolution_end(key)
 
     # ══════════════════════════════════════════════════════════════
     #  LIVE TRADING METHODS

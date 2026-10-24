@@ -233,6 +233,10 @@ evolution:
   # from. One weekend line per bot stays small; delete or archive the
   # file by hand if it ever needs a bound. There is no settings key
   # for this file. Not a credential.
+  # A second evolution run on the same bot is refused while one is
+  # already running in this process (manual Evolve during the Saturday
+  # auto run). That guard is in-memory. It does not use the bot's
+  # process .lock and it does not write a state file.
   # assess_retirement still reads the changelog. Switching that reader
   # to this history file is a later follow-up.
 
