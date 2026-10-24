@@ -139,6 +139,8 @@ The plan is **advisory**. The full path from plan to deployed strategy:
    A PASS with < 30 holdout trades is flagged **PROVISIONAL**.
 5. **On PASS** — the candidate is saved to the StrategyStore, appears in the dropdown as `AI: …EvoN`, and is logged to `data/changelog.json` with `initiated_by="ai"`. **Deployment is NOT automatic.**
 
+**Eligible knob classes do not ask the model to pick.** Saturday and the manual Evolve button share this path. When `evolution.search` is `grid_batch` (the default) and the class has at least two rewritable grid knobs, the pipeline pre-registers a grid (at most 48 settings, at most two knobs varied together, at most four values per knob on a pair). Each setting is scored on the per-fold change versus the baseline (not absolute PnL) with the Deflated Sharpe Ratio and CSCV PBO (8 partitions at 8–9 selection folds, 10 at 10 or more). The most recent fold is the holdout: it is not used to pick the setting, and it is still the out-of-sample check on the point that was chosen. Fold width is `evolution.relative.fold_days`, not `holdout_days`. The selection cutoff is the earlier of that last fold's start and the walk-forward holdout (the last bar minus `holdout_days`), so the midnight round-up cannot leave the tail of the OOS window inside a selection fold. `relative.fold_days` below `holdout_days` is refused: the width falls back to 14, or to `holdout_days` when that is longer. The pick is the centre of the plateau — neighbours must also beat the baseline — and only if DSR > 0.90 and PBO < 0.50. The model may write a rationale afterwards; it cannot change the setting. `search: llm_one` restores the one-change plan. A grid that selects nothing does not advance the watermark. Paper promotion (`evolution.paper_gate`, default `relative` for the exact modes `paper` and `backtest`) requires those same DSR and PBO numbers. An invalid `paper_gate` value, or an unknown trading mode, falls back to absolute and warns. Real-money modes stay on the absolute PF floor.
+
 **Applying a change manually** (the human-in-the-loop path, also valid for plan-only mode): the plan lives in the chat, so ask the chat to apply it and click **Generate Strategy**, backtest the new version against the plan's own criteria, then **Save** + redeploy, or discard per the plan's revert condition. Either way, redeploy on the **same bot session** so the broker history, watermark, and fitness baseline carry over (the deploy dialog asks before reverting your strategy selection — answer "deploy selected").
 
 **Forward incubation (recommended).** A PASS is an *in-sample-adjacent* result, not proof of live edge. Deploy the candidate in **paper mode** on the same session for **≥14 days / ≥30 trades** before switching to `semi_auto` — the future is the only true out-of-sample test (mirrors the pool's `eligible_for_live` thresholds).
@@ -151,7 +153,7 @@ The toolbar **🧬 進化 Evolution** button runs the same pipeline on demand. U
 
 Differences from the weekly auto run:
 - **No-new-design-trades handling.** Weekly auto **skips silently** (with a Discord notice). The manual button instead shows a **re-run dialog**: "no new design-window trades since the last evolution — re-run on the full design history anyway? (holdout stays withheld)." Answering *yes* re-analyzes the whole design window (`omitted` reset to 0); the 14-day holdout is still withheld from the AI either way. When that skip's last exit is at least `evolution.idle_warn_days` calendar days ago, both messages gain `idle N days since last exit <date>`. `idle_warn_days: 0` leaves the line off.
-- **Small design window.** `evolution.min_design_trades` (default 30) gates the Saturday/automatic plan call only. The manual button bypasses it and logs `below min_design_trades (N/30), manual override` before the plan call.
+- **Small design window.** `evolution.min_design_trades` (default 30) gates the Saturday/automatic path only. The manual button bypasses it and logs `below min_design_trades (N/30), manual override` before the pipeline. An eligible knob class then runs the grid instead of the plan call.
 - **Verdict visibility.** Both the manual and weekly runs post the verdict block to Discord (manual included, for testing/visibility) and to the chat log.
 - **Ultra mode.** Whichever model the 🚀 session toggle / settings default selects is used for the plan and codegen (heavy tier).
 
@@ -177,6 +179,9 @@ A second evolution run on the same bot is refused while one is already in progre
 |---|---|
 | `src/evolution/fitness.py` | Pure scoring: composite from Sharpe/Sortino/drawdown/PF/win-rate/consistency/regime; `MIN_TRADES=30` gate; drawdown stored in **percent** units. |
 | `src/evolution/pipeline.py` | The auto-pipeline logic: `parse_plan_directives`, `compute_design_cut` / `design_cutoff_index`, `split_train_test`, `run_deep_validation`, `decide_deep_verdict`, candidate naming, verdict formatting. Pure & unit-tested. |
+| `src/evolution/grid_search.py` | Pre-registered knob grid, plateau centre, and the selection. The model is not an input. |
+| `src/evolution/trial_penalty.py` | Deflated Sharpe Ratio and CSCV PBO (S = 8 or 10). |
+| `src/evolution/paper_gate.py` | Relative paper gate (default) and the recommend-only retire flag. Real money stays absolute. |
 | `src/evolution/notify.py` | Watermark (`load_watermark`/`save_watermark`), fitness baseline (`evolution.json`), cadence gates (`should_run_evolution_check`, `is_post_close_evolution_window`), Discord improvement notification. |
 | `src/evolution/evaluator.py` | Standalone two-phase batch evaluator (screen/deep) for the future GA. The pipeline borrows only `DEEP_TRAIN_DAYS` and `monte_carlo_robustness` from it. |
 | `src/evolution/pool.py` | SQLite "gene pool" with lineage + status pipeline and `eligible_for_live` promotion gate. **Scaffolding — not wired into the live loop yet.** |
@@ -200,6 +205,16 @@ evolution:
   idle_warn_days: 7        # watermark-skip idle line; 0 disables the line
   knob_ineligible_fallback: "none"  # "none" (default) | "structural_lane"
                                     # neither value enables weekly codegen
+  paper_gate: relative     # paper path. real-money modes stay absolute
+  real_gate: absolute
+  search: grid_batch       # grid_batch (default) | llm_one
+  trial_penalty:
+    dsr_min: 0.90          # chosen point must be strictly above this
+    pbo_max: 0.50          # trial-set PBO must be strictly below this
+    max_settings: 48
+    max_joint_knobs: 2
+    max_values_per_knob: 4
+    plateau_band: 0.50
   month_gate:
     latest_def: merge_stub       # merge_stub (default) | max_exit_month (opt out)
     min_sessions: 12             # fold the newest month below this many TAIFEX dates
@@ -224,6 +239,9 @@ trading:
 | `evolution.min_design_trades` | `30` | Saturday/automatic path only: skip the AI plan call while the design window has fewer trades than this (`waiting for sample: N/<threshold>`, 0 AI calls, watermark unchanged). The manual Evolve button is exempt and logs `below min_design_trades (N/30), manual override`. `0` disables the check. Does not change the fitness `MIN_TRADES` gate. |
 | `evolution.idle_warn_days` | `7` | On a watermark skip, append `idle N days since last exit <date>` when the last exit is at least this many calendar days ago. `0` disables the line. |
 | `evolution.knob_ineligible_fallback` | `"none"` | Weekly handling of a knob-grid class with fewer than 2 rewritable knobs. `"none"` excludes it and logs `excluded: <class> — <reason>; fallback=none` every Saturday. `"structural_lane"` only changes that logged mode; it does not enable weekly codegen. |
+| `evolution.paper_gate` | `"relative"` | Exact modes `paper` and `backtest` only. `"relative"` requires the fold bootstrap, the effect size, DSR > `trial_penalty.dsr_min`, and PBO < `trial_penalty.pbo_max`. An invalid value, or an unknown trading mode, falls back to absolute and warns. `"absolute"` restores the PF ≥ 1 floors. Real-money modes ignore this key. |
+| `evolution.search` | `"grid_batch"` | Eligible knob classes: the grid selects the setting. `"llm_one"` asks the model for one change, as before. |
+| `evolution.trial_penalty` | DSR 0.90, PBO 0.50, 48 / 2 / 4, band 0.50 | Caps and the pass lines for the grid. Values above the caps fall back. `relative.min_divergent_folds` must be ≥ 2 and ≤ 30; anything else falls back to the Q2 default (≥ 3 divergent folds). |
 | `evolution.month_gate.latest_def` | `"merge_stub"` | Fold the newest exit month into the previous month when it has fewer than `min_sessions` TAIFEX trading dates in the price bars. A night session (15:00–05:00) belongs to the next trading day, so one night is one date and Friday night maps to Monday. `"max_exit_month"` opts out and keeps the newest exit month. |
 | `evolution.month_gate.min_sessions` | `12` | Session-count threshold for the stub fold. |
 | `evolution.month_gate.slack.mode` | `"scaled"` | Gate 1 allowance is `clamp(k × σ × sqrt(n), floor, cap)` TWD. σ is the baseline's prior-block per-trade sample standard deviation; n is the candidate's prior-block trade count. Gate 3 uses `gate3_k` of that allowance (half by default). `"flat"` opts out: gate 1 uses `flat_twd` and gate 3 requires Δ ≥ 0. |
