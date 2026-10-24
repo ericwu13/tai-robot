@@ -138,9 +138,10 @@ evolution:
   # when the last trade exit is at least this many calendar days ago.
   # Default 7. Set 0 to disable the idle line entirely. Not a credential.
   idle_warn_days: 7
-  # P1 promotion gate. "absolute" (default) keeps today's PF ≥ 1 floors.
-  # "relative" is the paper path only: bootstrap, 60% fold majority,
-  # effect size. Real-money modes ignore paper_gate and stay absolute.
+  # P1 promotion gate. Stays "absolute" in this change: PBO/DSR are
+  # not applied yet, so the full Q2 gate is not on. The default flips
+  # to "relative" once that trial-penalty gate exists. "relative" is
+  # the paper path only. Real-money modes ignore paper_gate.
   # real_gate is accepted only as "absolute"; any other value is ignored.
   paper_gate: absolute
   real_gate: absolute

@@ -413,15 +413,31 @@ def baseline_pnls_in_folds(trades: list, folds: list[Fold]) -> list[int]:
     return out
 
 
+def nonempty_fold_count(folds: list[Fold] | None) -> int:
+    """Folds in which the candidate actually traded."""
+    return sum(1 for f in (folds or []) if f.cand.n > 0)
+
+
+def meets_min_folds(n_folds: int, minimum: int = DEFAULT_MIN_NONEMPTY_FOLDS) -> bool:
+    """True when the relative gate has enough non-empty folds (default ≥ 6).
+
+    Fewer than ``minimum`` is not eligible: the relative verdict FAILs.
+    """
+    return int(n_folds) >= int(minimum)
+
+
 def decide_relative_paper_checks(
         folds: list[Fold],
         base_trade_pnls: list[float],
         config: RelativeGateConfig | None = None) -> EvolutionVerdict:
-    """Bootstrap, effect size, and the post-backfill fold count.
+    """Fold floor, bootstrap, effect size, and the post-backfill count.
 
-    Fold-count, majority, collapse guards, and month gates are applied
-    by the callers. PBO and DSR are named in the reason list and are
-    not treated as a pass — they belong to a later change.
+    ``meets_min_folds`` (≥ 6 non-empty folds) is required here. A miss
+    is a FAIL with its own reason line. Majority, collapse guards, and
+    month gates are applied by the callers. PBO and DSR are named in
+    the reason list and are not treated as a pass — they belong to a
+    later change, which is why ``paper_gate`` stays ``absolute`` until
+    that change lands.
     """
     cfg = config or RelativeGateConfig()
     reasons = [
@@ -436,6 +452,19 @@ def decide_relative_paper_checks(
         "change); they are not treated as a pass",
     ]
     passed = True
+
+    n_nonempty = nonempty_fold_count(folds)
+    fold_ok = meets_min_folds(n_nonempty, cfg.min_nonempty_folds)
+    if fold_ok:
+        reasons.append(
+            f"meets_min_folds: {n_nonempty} ≥ {cfg.min_nonempty_folds} "
+            f"non-empty folds: eligible ✓")
+    else:
+        reasons.append(
+            f"meets_min_folds: {n_nonempty} ≥ {cfg.min_nonempty_folds} "
+            f"non-empty folds: FAIL ✗ — not enough folds for the "
+            f"relative paper gate")
+        passed = False
 
     deltas = [float(f.delta) for f in folds]
     p_value, observed = paired_fold_bootstrap_p(

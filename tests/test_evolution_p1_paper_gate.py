@@ -26,6 +26,8 @@ from src.evolution.paper_gate import (
     assess_retirement,
     decide_relative_paper_checks,
     emit_retire_recommendation,
+    meets_min_folds,
+    nonempty_fold_count,
     evolution_gate_config_from_mapping,
     mean_pnl_upper_bound,
     paired_fold_bootstrap_p,
@@ -253,12 +255,32 @@ class TestRelativePaperEdges:
             assert again.passed is paper.passed
             assert again.reasons == paper.reasons
 
-    def test_five_nonempty_folds_fail_the_relative_floor(self):
-        folds, base, cand = _improved_losing(5)
-        verdict, _ = _judge("paper", "relative", folds, base, cand)
-        assert not verdict.passed
-        assert any("non-empty folds: 5 ≥ 6" in r and "✗" in r
-                   for r in verdict.reasons)
+    def test_five_folds_fail_meets_min_folds_six_are_eligible(self):
+        assert meets_min_folds(5) is False
+        assert meets_min_folds(6) is True
+        assert meets_min_folds(7) is True
+        fast = RelativeGateConfig(bootstrap_resamples=50, bootstrap_seed=1)
+
+        five, base5, cand5 = _improved_losing(5)
+        assert nonempty_fold_count(five) == 5
+        five_rel = decide_relative_paper_checks(five, [t.pnl for t in base5], fast)
+        assert not five_rel.passed
+        assert any(
+            "meets_min_folds: 5 ≥ 6" in r and "FAIL" in r
+            for r in five_rel.reasons)
+        five_promo, _gate = _judge("paper", "relative", five, base5, cand5)
+        assert not five_promo.passed
+        assert any("meets_min_folds: 5 ≥ 6" in r and "FAIL" in r
+                   for r in five_promo.reasons)
+
+        six, base6, _cand6 = _improved_losing(6)
+        assert nonempty_fold_count(six) == 6
+        assert meets_min_folds(nonempty_fold_count(six))
+        six_rel = decide_relative_paper_checks(six, [t.pnl for t in base6], fast)
+        assert any(
+            "meets_min_folds: 6 ≥ 6" in r and "eligible" in r
+            for r in six_rel.reasons)
+        assert six_rel.passed, six_rel.reasons
 
     def test_majority_threshold_is_sixty_percent(self):
         # 3/5 = 60% passes the relative majority; 2/5 does not.
