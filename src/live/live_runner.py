@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable
 
@@ -75,11 +75,101 @@ _AM_CLOSE = (13, 45)  # 13:45 — back-month + non-settlement days
 _AM_CLOSE_SETTLEMENT = (13, 30)  # front-month on settlement day (3rd Wed)
 _PM_OPEN = (15, 0)    # 15:00
 # Night session closes at 05:00 next day
+_NIGHT_CLOSE_MIN = 5 * 60
+
+# One warning per process when the holiday/closure lookup raises.
+_holiday_schedule_warned = False
 
 
 def _taipei_now() -> datetime:
     """Return current time in Taipei timezone."""
     return datetime.now(_TZ_TAIPEI)
+
+
+def _as_taipei(dt: datetime | None) -> datetime:
+    """Naive datetimes are Taipei wall time. Aware ones convert to Taipei."""
+    if dt is None:
+        return _taipei_now()
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_TZ_TAIPEI)
+    return dt.astimezone(_TZ_TAIPEI)
+
+
+def _session_open_date(dt: datetime) -> date:
+    """OPEN date of the clock session containing a Taipei ``dt``.
+
+    The 00:00-05:00 night tail belongs to the previous calendar day.
+    Callers use this only when the clock says a session is open, so a
+    Monday-before-05:00 instant never reaches here.
+    """
+    if dt.hour * 60 + dt.minute < _NIGHT_CLOSE_MIN:
+        return (dt - timedelta(days=1)).date()
+    return dt.date()
+
+
+def _clock_session_key(dt: datetime) -> str | None:
+    """Session key from the clock schedule, ignoring the holiday calendar.
+
+    ``dt`` is Taipei time. Weekend rules match the historical
+    ``is_market_open`` clock: Saturday is open only for the 00:00-05:00
+    Friday-night tail, Sunday is closed, and Monday has no night
+    carryover before 05:00.
+    """
+    weekday = dt.weekday()  # Mon=0, Sun=6
+    minutes = dt.hour * 60 + dt.minute
+
+    # Saturday: only the Friday-night tail (00:00-05:00).
+    if weekday == 5:
+        if minutes >= _NIGHT_CLOSE_MIN:
+            return None
+        return f"{_session_open_date(dt).isoformat()}|NIGHT"
+
+    if weekday == 6:
+        return None
+
+    am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]
+    am_close = _AM_CLOSE[0] * 60 + _AM_CLOSE[1]
+    pm_open = _PM_OPEN[0] * 60 + _PM_OPEN[1]
+
+    # Monday: no night carryover (the market was closed Sunday).
+    if weekday == 0 and minutes < _NIGHT_CLOSE_MIN:
+        return None
+    if am_open <= minutes < am_close:
+        return f"{_session_open_date(dt).isoformat()}|DAY"
+    if minutes >= pm_open or minutes < _NIGHT_CLOSE_MIN:
+        return f"{_session_open_date(dt).isoformat()}|NIGHT"
+    return None
+
+
+def session_for(dt: datetime | None = None) -> str | None:
+    """Scheduled session key, or None when that session is closed.
+
+    The key is ``YYYY-MM-DD|DAY`` or ``YYYY-MM-DD|NIGHT``, dated by the
+    session OPEN date (the night tail after midnight keeps the previous
+    day's key). A weekday open date that ``is_taifex_holiday`` reports
+    closed — public calendar or the closures file — yields None. That
+    covers the holiday's DAY and NIGHT sessions and the 00:00-05:00 tail
+    of a night that opened on the holiday. The tail of a night that
+    opened on a trading day stays open (Friday into Saturday, and the
+    night before a Monday holiday).
+
+    If the holiday lookup raises, the clock key is returned (fail open)
+    and one warning is logged for the process (issue #198).
+    """
+    global _holiday_schedule_warned
+    dt = _as_taipei(dt)
+    key = _clock_session_key(dt)
+    if key is None:
+        return None
+    try:
+        from ..market_data.holidays import is_taifex_holiday
+        if is_taifex_holiday(_session_open_date(dt)):
+            return None
+    except Exception as exc:
+        if not _holiday_schedule_warned:
+            _holiday_schedule_warned = True
+            logger.warning("holiday schedule check failed: %s", exc)
+    return key
 
 
 def is_market_open(dt: datetime | None = None) -> bool:
@@ -88,42 +178,12 @@ def is_market_open(dt: datetime | None = None) -> bool:
     Uses Taipei time (UTC+8). Closed on weekends (Sat/Sun).
     Sessions: AM 08:45-13:45, PM/Night 15:00-05:00+1
     Weekend rule: closes Sat 05:00, reopens Mon 08:45.
+    The Sat 00:00-05:00 tail is Friday night.
+
+    Delegates to ``session_for``. A weekday TAIFEX holiday on the
+    session OPEN date is closed, including that night's tail.
     """
-    if dt is None:
-        dt = _taipei_now()
-    elif dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_TZ_TAIPEI)
-
-    weekday = dt.weekday()  # Mon=0, Sun=6
-
-    # Saturday: only night session carryover from Friday (00:00-05:00)
-    if weekday == 5:  # Saturday
-        h, m = dt.hour, dt.minute
-        return h * 60 + m < 5 * 60
-
-    # Sunday: fully closed
-    if weekday == 6:
-        return False
-
-    h, m = dt.hour, dt.minute
-    t = h * 60 + m
-
-    am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]     # 525
-    am_close = _AM_CLOSE[0] * 60 + _AM_CLOSE[1]   # 825
-    pm_open = _PM_OPEN[0] * 60 + _PM_OPEN[1]      # 900
-    night_close = 5 * 60                            # 300
-
-    # Monday: no night carryover (market was closed Sun)
-    if weekday == 0 and t < night_close:
-        return False
-
-    if am_open <= t < am_close:
-        return True
-    if t >= pm_open:
-        return True
-    if t < night_close:
-        return True
-    return False
+    return session_for(dt) is not None
 
 
 def seconds_until_market_open() -> int:
