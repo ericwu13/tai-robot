@@ -9,12 +9,22 @@ night. Friday 2026-10-23 night, including its Saturday tail, stays open.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
-from src.live.live_runner import _TZ_TAIPEI, is_market_open, session_for
-from src.live.tick_watchdog import TickWatchdog, _scheduled_session_key
+from src.live.live_runner import (
+    _TZ_TAIPEI,
+    _clock_session_key,
+    is_market_open,
+    seconds_until_market_open,
+    session_for,
+)
+from src.live.tick_watchdog import (
+    TickWatchdog,
+    _crossed_session_gap,
+    _scheduled_session_key,
+)
 
 
 def _taipei(year, month, day, hour, minute, second=0):
@@ -210,3 +220,151 @@ def test_holiday_lookup_failure_fails_open_once(monkeypatch, caplog):
         if "holiday schedule check failed" in r.getMessage()
     ]
     assert len(warnings) == 1
+
+
+def _secs(hours: float) -> int:
+    return int(round(hours * 3600))
+
+
+def test_holiday_night_tail_waits_for_the_same_morning():
+    """Tue 2026-10-27 02:00 is the closed tail of Monday's holiday night.
+
+    The next open is Tue 08:45 (6.75h), not Wed 08:45 (30.75h).
+    """
+    now = _taipei(2026, 10, 27, 2, 0)
+    assert session_for(now) is None
+    assert seconds_until_market_open(now) == _secs(6.75)
+    assert now + timedelta(seconds=_secs(6.75)) == _taipei(2026, 10, 27, 8, 45)
+
+
+def test_lny_reopen_morning_is_the_same_day():
+    """Mon 2026-02-23 02:00 is the first session after Lunar New Year.
+
+    Feb 20 is the last holiday. The next open is Mon 08:45 (6.75h).
+    """
+    now = _taipei(2026, 2, 23, 2, 0)
+    assert session_for(now) is None
+    assert seconds_until_market_open(now) == _secs(6.75)
+    assert now + timedelta(seconds=_secs(6.75)) == _taipei(2026, 2, 23, 8, 45)
+
+
+def _first_session_open(now: datetime) -> datetime:
+    """Earliest minute at or after ``now`` that ``session_for`` calls open."""
+    cursor = now.replace(second=0, microsecond=0)
+    if cursor < now:
+        cursor += timedelta(minutes=1)
+    for _ in range(16 * 24 * 60):
+        if cursor >= now and session_for(cursor) is not None:
+            return cursor
+        cursor += timedelta(minutes=1)
+    raise AssertionError(f"no session open within 16 days of {now}")
+
+
+_NEXT_OPEN_SAMPLES = (
+    _taipei(2026, 10, 27, 2, 0),    # holiday-night tail
+    _taipei(2026, 10, 27, 4, 30),
+    _taipei(2026, 2, 23, 2, 0),     # LNY reopen
+    _taipei(2026, 10, 26, 2, 0),    # holiday Monday before 05:00
+    _taipei(2026, 10, 26, 9, 0),    # holiday DAY
+    _taipei(2026, 10, 26, 13, 50),  # holiday afternoon gap
+    _taipei(2026, 10, 26, 16, 0),   # holiday NIGHT
+    _taipei(2026, 10, 24, 10, 0),   # Saturday; Monday is the holiday
+    _taipei(2026, 10, 25, 12, 0),   # Sunday
+    _taipei(2026, 10, 23, 6, 0),    # Friday morning gap
+    _taipei(2026, 10, 23, 14, 0),   # Friday afternoon gap
+    _taipei(2026, 10, 23, 10, 0),   # Friday DAY, already open
+    _taipei(2026, 10, 23, 23, 0),   # Friday NIGHT, already open
+    _taipei(2026, 10, 21, 2, 0),    # ordinary night tail, already open
+    _taipei(2026, 3, 2, 3, 0),      # Monday before 05:00, no Sunday night
+    _taipei(2026, 3, 7, 10, 0),     # Saturday after a trading Friday
+)
+
+
+@pytest.mark.parametrize(
+    "now",
+    _NEXT_OPEN_SAMPLES,
+    ids=lambda dt: dt.strftime("%Y-%m-%d %H:%M"),
+)
+def test_seconds_until_market_open_lands_on_first_session_for(now):
+    """The delay ends on the first minute session_for is not None."""
+    secs = seconds_until_market_open(now)
+    if session_for(now) is not None:
+        assert secs == 0
+        return
+    assert secs > 0
+    target = now + timedelta(seconds=secs)
+    assert target == _first_session_open(now)
+    assert session_for(target) is not None
+    assert session_for(target - timedelta(seconds=1)) is None
+
+
+def test_weekday_night_tail_key_is_previous_open_date():
+    """Tue 00:30 keeps Monday's NIGHT key.
+
+    A wall-date key in the clock night branch would say Tuesday|NIGHT.
+    2026-03-03 is a Tuesday and 2026-03-02 trades.
+    """
+    dt = _taipei(2026, 3, 3, 0, 30)
+    assert _clock_session_key(dt) == "2026-03-02|NIGHT"
+    assert session_for(dt) == "2026-03-02|NIGHT"
+    assert _scheduled_session_key(dt) == "2026-03-02|NIGHT"
+
+
+def test_gap_walk_treats_a_clock_open_holiday_as_closed():
+    """09:00-12:00 on the holiday is inside the clock DAY session.
+
+    The walk returns closed because session_for does, not because the
+    clock has a gap.
+    """
+    start = _taipei(2026, 10, 26, 9, 0)
+    end = _taipei(2026, 10, 26, 12, 0)
+    assert _clock_session_key(start) == "2026-10-26|DAY"
+    assert _clock_session_key(end) == "2026-10-26|DAY"
+    assert session_for(start) is None
+    assert _crossed_session_gap(_ts(start), _ts(end)) is True
+
+
+def test_slow_retry_guard_skips_holiday_when_minutes_remain():
+    """The slow-retry guard itself sees the holiday.
+
+    minutes_until_session_close is patched to a large value so it cannot
+    be what suppresses the retry.
+    """
+    wd = TickWatchdog(zero_tick_reconnect_limit=1, slow_retry_interval=60)
+    wd._stood_down = True
+    wd._stand_down_session = "2026-10-23|NIGHT"
+    wd._last_slow_retry_at = 0.0
+    holiday = _taipei(2026, 10, 26, 10, 0)
+    assert _clock_session_key(holiday) == "2026-10-26|DAY"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("src.live.live_runner._taipei_now", lambda: holiday)
+        mp.setattr(
+            "src.live.tick_watchdog.minutes_until_session_close",
+            lambda order_symbol=None: 180,
+        )
+        assert wd._check_slow_retry(_ts(holiday)) is None
+    assert wd._stood_down is True
+    assert wd._zero_tick_reconnects == 0
+
+
+def test_check_guard_skips_holiday_when_minutes_remain():
+    """check() returns before the ladder on a holiday.
+
+    minutes_until_session_close is patched so the settlement/near-close
+    gate cannot be what returns None. A stale tick inside the holiday
+    morning would otherwise reconnect or session_resubscribe.
+    """
+    wd = TickWatchdog()
+    wd.active = True
+    holiday = _taipei(2026, 10, 26, 10, 0)
+    wd.last_tick_time = _ts(holiday) - 900
+    assert _clock_session_key(holiday) is not None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("src.live.live_runner._taipei_now", lambda: holiday)
+        mp.setattr(
+            "src.live.tick_watchdog.minutes_until_session_close",
+            lambda order_symbol=None: 180,
+        )
+        assert wd.check(now=_ts(holiday)) is None
+    assert wd._zero_tick_reconnects == 0
+    assert wd._stood_down is False

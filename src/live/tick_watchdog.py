@@ -31,17 +31,13 @@ def _crossed_session_gap(last_ts: float, now_ts: float) -> bool:
     """
     if now_ts <= last_ts:
         return False
-    last_dt = datetime.fromtimestamp(last_ts, tz=_TZ_TAIPEI)
-    # If last tick was itself during closed market, definitely a gap.
-    # session_for is None on a weekday holiday as well as a clock gap,
-    # so a holiday is a session boundary for the next real open.
-    if session_for(last_dt) is None:
-        return True
-    # Walk the interval in 5-min steps looking for a closed sample.
-    # Real session gaps are >= 75 min (13:45-15:00) or >= 225 min (05:00-08:45),
-    # so 5-min stride catches them with tens of iterations max.
+    # Walk from the last tick in 5-min steps. A sample session_for calls
+    # closed — clock gap or weekday holiday — is a session boundary.
+    # Real gaps are >= 75 min (13:45-15:00) or >= 225 min (05:00-08:45),
+    # so a 5-min stride catches them. The last tick itself is the first
+    # sample, which is why a tick during a closed holiday returns immediately.
     step = 300
-    t = last_ts + step
+    t = last_ts
     while t < now_ts:
         if session_for(datetime.fromtimestamp(t, tz=_TZ_TAIPEI)) is None:
             return True

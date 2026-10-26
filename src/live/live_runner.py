@@ -186,46 +186,50 @@ def is_market_open(dt: datetime | None = None) -> bool:
     return session_for(dt) is not None
 
 
-def seconds_until_market_open() -> int:
+def _next_session_open(now: datetime) -> datetime | None:
+    """First later DAY 08:45 or NIGHT 15:00 that ``session_for`` calls open.
+
+    ``now`` is Taipei time and the market is closed. Skipping a whole
+    holiday (or a Monday holiday's night tail) lands on the next session
+    that actually trades, not on the next clock boundary.
+    """
+    for ahead in range(16):
+        day = (now + timedelta(days=ahead)).date()
+        for hour, minute in (_AM_OPEN, _PM_OPEN):
+            open_dt = datetime(
+                day.year, day.month, day.day, hour, minute, tzinfo=_TZ_TAIPEI,
+            )
+            if open_dt <= now:
+                continue
+            if session_for(open_dt) is not None:
+                return open_dt
+    return None
+
+
+def seconds_until_market_open(now: datetime | None = None) -> int:
     """Return seconds until the next market session opens, or 0 if already open.
 
     Sessions: AM 08:45-13:45, PM/Night 15:00-05:00+1.
-    Reconnect should be scheduled ~2 min before open to allow login time.
+    The target is the first later instant ``session_for`` reports open, so
+    a 00:00-05:00 tail after a weekday holiday waits for that morning's
+    08:45 when that day trades (issue #198). Reconnect should be scheduled
+    ~2 min before open to allow login time.
     """
-    now = _taipei_now()
-    if is_market_open(now):
+    now = _as_taipei(now)
+    if session_for(now) is not None:
         return 0
-
-    weekday = now.weekday()
-    h, m = now.hour, now.minute
-    t = h * 60 + m
-
-    am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]   # 525
-    pm_open = _PM_OPEN[0] * 60 + _PM_OPEN[1]    # 900
-
-    # Sunday: next open is Monday 08:45
-    if weekday == 6:
+    nxt = _next_session_open(now)
+    if nxt is None:
+        # No session inside the lookahead. Keep a finite delay so a caller
+        # does not treat a closed market as already open.
+        am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]
+        t = now.hour * 60 + now.minute
         return (24 * 60 - t + am_open) * 60
-
-    # Saturday after 05:00: next open is Monday 08:45
-    if weekday == 5:
-        return ((24 * 60 - t) + 24 * 60 + am_open) * 60
-
-    # Weekday gaps:
-    # 05:00-08:45 → next open at 08:45 (AM)
-    if 5 * 60 <= t < am_open:
-        return (am_open - t) * 60
-
-    # 13:45-15:00 → next open at 15:00 (PM/Night)
-    if _AM_CLOSE[0] * 60 + _AM_CLOSE[1] <= t < pm_open:
-        return (pm_open - t) * 60
-
-    # Monday 00:00-05:00 (closed, no Fri carryover)
-    if weekday == 0 and t < 5 * 60:
-        return (am_open - t) * 60
-
-    # Fallback: try AM open tomorrow
-    return (24 * 60 - t + am_open) * 60
+    delta = (nxt - now).total_seconds()
+    secs = int(delta)
+    if now + timedelta(seconds=secs) < nxt:
+        secs += 1
+    return max(0, secs)
 
 
 def _am_close_minutes(order_symbol: str | None = None,
