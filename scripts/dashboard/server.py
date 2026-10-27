@@ -171,7 +171,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--base-dir", default=default_base_dir(),
                    help="bot root (default: data/live of this checkout)")
+    p.add_argument("--bind-wait", type=float, default=0.0, metavar="SECONDS",
+                   help="keep retrying an address that cannot be bound yet "
+                        "(at boot the Tailscale IP appears after the task starts)")
     return p
+
+
+def _make_server(addr: str, port: int):
+    cls = ThreadingHTTPServer
+    if ":" in addr:
+        cls = type("V6Server", (ThreadingHTTPServer,),
+                   {"address_family": socket.AF_INET6})
+    srv = cls((addr, port), DashboardHandler)
+    srv.daemon_threads = True
+    return srv
+
+
+def bind_servers(binds, port: int, wait_s: float, *, make=_make_server,
+                 sleep=time.sleep, monotonic=time.monotonic,
+                 retry_every_s: float = 5.0) -> list:
+    """One server per address. An address that cannot be bound yet is
+    retried until ``wait_s`` has passed; then everything bound so far is
+    closed and the last OSError is raised."""
+    deadline = monotonic() + wait_s
+    servers = []
+    try:
+        for addr in binds:
+            while True:
+                try:
+                    servers.append(make(addr, port))
+                    break
+                except OSError as exc:
+                    if monotonic() >= deadline:
+                        raise
+                    print(f"waiting for {addr}:{port} ({exc})", file=sys.stderr, flush=True)
+                    sleep(retry_every_s)
+    except OSError:
+        for srv in servers:
+            srv.server_close()
+        raise
+    return servers
 
 
 def main(argv=None) -> int:
@@ -192,15 +231,12 @@ def main(argv=None) -> int:
 
     DashboardHandler.base_dir = os.path.abspath(args.base_dir)
     DashboardHandler.lwc_path = lwc_js_path()
-    servers = []
+    try:
+        servers = bind_servers(binds, args.port, args.bind_wait)
+    except OSError as exc:
+        print(f"cannot listen: {exc}", file=sys.stderr)
+        return 3
     for addr in binds:
-        cls = ThreadingHTTPServer
-        if ":" in addr:
-            cls = type("V6Server", (ThreadingHTTPServer,),
-                       {"address_family": socket.AF_INET6})
-        srv = cls((addr, args.port), DashboardHandler)
-        srv.daemon_threads = True
-        servers.append(srv)
         host = f"[{addr}]" if ":" in addr else addr
         print(f"dashboard: http://{host}:{args.port}/  (bots: {DashboardHandler.base_dir})",
               flush=True)

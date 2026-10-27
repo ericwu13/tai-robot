@@ -339,3 +339,64 @@ def test_missing_local_chart_bundle_is_404(live_server, monkeypatch):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(live_server + "/static/lwc.js")
     assert exc.value.code == 404
+
+
+class _FakeClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+class _FakeServer:
+    def __init__(self, addr):
+        self.addr, self.closed = addr, False
+
+    def server_close(self):
+        self.closed = True
+
+
+def test_bind_waits_for_tailscale_ip_at_boot():
+    clock, attempts = _FakeClock(), []
+
+    def make(addr, port):
+        attempts.append(addr)
+        if addr.startswith("100.") and clock.t < 20:
+            raise OSError(10049, "address not available yet")
+        return _FakeServer(addr)
+
+    servers = server.bind_servers(["127.0.0.1", "100.74.0.1"], 8765, 60, make=make,
+                                  sleep=clock.sleep, monotonic=clock.monotonic)
+    assert [s.addr for s in servers] == ["127.0.0.1", "100.74.0.1"]
+    assert attempts.count("100.74.0.1") == 5
+
+
+def test_bind_gives_up_after_wait_and_closes_bound_servers():
+    clock, made = _FakeClock(), []
+
+    def make(addr, port):
+        if addr.startswith("100."):
+            raise OSError(10049, "address not available")
+        made.append(_FakeServer(addr))
+        return made[-1]
+
+    with pytest.raises(OSError):
+        server.bind_servers(["127.0.0.1", "100.74.0.1"], 8765, 30, make=make,
+                            sleep=clock.sleep, monotonic=clock.monotonic)
+    assert made and all(s.closed for s in made)
+
+
+def test_bind_without_wait_fails_fast():
+    clock = _FakeClock()
+
+    def make(addr, port):
+        raise OSError(10049, "address not available")
+
+    with pytest.raises(OSError):
+        server.bind_servers(["100.74.0.1"], 8765, 0, make=make,
+                            sleep=clock.sleep, monotonic=clock.monotonic)
+    assert clock.t == 0
