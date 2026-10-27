@@ -42,6 +42,7 @@ from scripts.monitor.common import (  # noqa: E402
     newest_debug_logs, pid_alive, print_report, read_json, read_lock_pid,
     tail_text,
 )
+from src.utils import fileio  # noqa: E402
 
 # A live bot writes a status/tick line well inside this window.
 STALE_LOG_MINUTES = 10.0
@@ -81,7 +82,7 @@ def count_decisions(now: datetime, bot_dir: str, action: str):
     cutoff = now - timedelta(hours=24)
     count = 0
     try:
-        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        with fileio.open_shared_text(path, errors="replace", newline="") as f:
             for row in csv.reader(f):
                 if len(row) < 4 or (row[3] or "").strip() != action:
                     continue
@@ -241,14 +242,11 @@ def _position_open(broker: dict) -> bool:
 def _load_session_data(sess_path: str):
     """Session dict, or None when the file is unreadable.
 
-    ``load_session`` first, then ``read_json``. This is the source HUNG
-    grading and the ALIVE frozen-log grade both use.
+    Same result as ``load_session``, read through the shared opener so
+    the bot's own ``save_session`` cannot fail against this reader. This
+    is the source HUNG grading and the ALIVE frozen-log grade both use.
     """
-    try:
-        from src.live.session_store import load_session
-        return load_session(sess_path)
-    except Exception:  # noqa: BLE001
-        return read_json(sess_path)
+    return read_json(sess_path)
 
 
 def _session_position_open(bot_dir: str) -> bool:
@@ -312,8 +310,9 @@ def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid, *,
     return "ALIVE", detail
 
 
-# Plain open() on Windows does not share delete access, so a reader can
-# collide with the writer's os.replace. Retry only PermissionError.
+# The shared opener lets the bot delete heartbeat.json under us, but its
+# os.replace still fails while any handle is open (the writer retries).
+# A sharing violation on our open is retried here; only PermissionError.
 _HEARTBEAT_READ_ATTEMPTS = 3
 _HEARTBEAT_READ_BACKOFF_S = 0.010
 
@@ -323,7 +322,7 @@ def _heartbeat_sleep(seconds: float) -> None:
 
 
 def _open_heartbeat(path: str):
-    return open(path, encoding="utf-8")
+    return fileio.open_shared_text(path)
 
 
 def _read_heartbeat_json(path, *, sleep=None):
