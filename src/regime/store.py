@@ -11,6 +11,8 @@ import json
 import logging
 import os
 
+from src.live.main_heartbeat import replace_retrying_permission_error
+
 from .state_machine import RegimeState
 from .selector import Recommendation
 
@@ -94,6 +96,17 @@ def load_state(path: str) -> RegimeState:
     return s
 
 
+def _replace(tmp: str, path: str) -> None:
+    """Move ``tmp`` onto ``path``, outlasting one monitor read.
+
+    On Windows ``os.replace`` fails against ANY open handle on the target,
+    even the FILE_SHARE_DELETE one ``src.utils.fileio`` gives the ops
+    monitor and dashboard. Retry the sharing violation with the heartbeat
+    writer's budget (4 attempts, <=35 ms); anything else raises at once.
+    """
+    replace_retrying_permission_error(tmp, path)
+
+
 def save_state(path: str, state: RegimeState, rec: Recommendation, session_date: str):
     import dataclasses
     d = dataclasses.asdict(state)
@@ -109,7 +122,7 @@ def save_state(path: str, state: RegimeState, rec: Recommendation, session_date:
         json.dump(d, f, indent=2, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _replace(tmp, path)
 
 
 def write_placeholder_state(path: str) -> None:
@@ -129,7 +142,7 @@ def write_placeholder_state(path: str) -> None:
         json.dump(d, f, indent=2, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _replace(tmp, path)
 
 
 def migrate_legacy_history(csv_path: str) -> None:
@@ -171,7 +184,7 @@ def _atomic_write_rows(csv_path: str, rows: list) -> None:
         csv.writer(f).writerows(rows)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, csv_path)
+    _replace(tmp, csv_path)
 
 
 def _read_rows(csv_path: str) -> list:
