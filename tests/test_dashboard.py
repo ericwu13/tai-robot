@@ -537,3 +537,22 @@ def test_tailscale_lookup_gives_up_after_wait():
     clock = _FakeClock()
     assert server.wait_for_tailscale_ip(12, lookup=lambda: None, sleep=clock.sleep,
                                         monotonic=clock.monotonic) is None
+
+
+def test_cdn_fallback_is_pinned_with_sri():
+    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+    assert 'integrity = "sha384-' in html and 'crossOrigin = "anonymous"' in html
+    assert "lightweight-charts@4.1.3/" in html
+
+
+def test_detail_log_applies_monitor_redact(tmp_path):
+    d = make_bot(tmp_path)
+    secret_hook = "https://discord.com/api/webhooks/" + FAKE_CHANNEL + "/" + "X" * 60
+    (d / "debug_20261026.log").write_text(
+        f"[2026-10-26 09:00:00.000 TPE] post {secret_hook}\n"
+        "[2026-10-26 09:00:01.000 TPE] key sk-ant-placeholder-value\n", encoding="utf-8")
+    text = "\n".join(line["text"] for line in
+                     snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["log"])
+    assert "discord.com/api/webhooks" not in text
+    assert "sk-ant-placeholder-value" not in text
