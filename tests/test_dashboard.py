@@ -334,7 +334,7 @@ def test_server_is_get_only(live_server):
     req = urllib.request.Request(live_server + "/api/fleet", data=b"x", method="POST")
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=10)
-    assert exc.value.code == 501
+    assert exc.value.code == 405
 
 
 def test_refuses_non_tailscale_bind(capsys):
@@ -732,3 +732,192 @@ def test_head_line_reads_csv_header_with_bom(tmp_path):
     p.write_bytes("﻿date,session\n1,2\n".encode("utf-8"))
     assert fileio.head_line(str(p)) == "date,session"
     assert fileio.head_line(str(tmp_path / "missing.csv")) is None
+
+
+# ── controls (--enable-control) ─────────────────────────────────────────
+
+def _set_mode(d, mode, position=None):
+    sess = json.loads((d / "session.json").read_text(encoding="utf-8"))
+    sess["trading_mode"] = mode
+    if position:
+        sess["broker"].update(position)
+    (d / "session.json").write_text(json.dumps(sess), encoding="utf-8")
+
+
+@pytest.fixture
+def control_server(tmp_path, monkeypatch):
+    base = tmp_path / "live"
+    base.mkdir()
+    make_bot(base)                                    # paper, running
+    auto = make_bot(base, name="TMF00_real")
+    _set_mode(auto, "auto")
+    make_bot(base, name="TMF00_gone", lock_pid=None, hb_age_s=None)
+    log = tmp_path / "control_log.csv"
+    monkeypatch.setattr(server.DashboardHandler, "base_dir", str(base))
+    monkeypatch.setattr(server.DashboardHandler, "cache", server._Cache(0))
+    monkeypatch.setattr(server.DashboardHandler, "control_enabled", True)
+    monkeypatch.setattr(server.DashboardHandler, "control_log", str(log))
+    # The fixtures' lock PID is fake; treat it as alive for both modules.
+    monkeypatch.setattr(snapshot, "pid_alive", _alive)
+    monkeypatch.setattr(snapshot.bot_summary, "__kwdefaults__",
+                        {"pid_alive_fn": _alive})
+    srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.DashboardHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}", base, log
+    srv.shutdown()
+    srv.server_close()
+
+
+def _post(url, payload, *, headers=None, raw=None):
+    h = {"Content-Type": "application/json", "X-Dashboard-Control": "1"}
+    h.update(headers or {})
+    req = urllib.request.Request(url + "/api/control", method="POST", headers=h,
+                                 data=raw if raw is not None else json.dumps(payload).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        try:
+            return exc.code, json.loads(body)
+        except ValueError:
+            return exc.code, {}
+
+
+def _log_rows(log):
+    import csv
+    with open(log, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def test_controls_are_off_by_default(live_server):
+    status, _ = _post(live_server, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"})
+    assert status == 405
+    assert json.loads(_get(live_server + "/api/fleet")[2])["control_enabled"] is False
+
+
+def test_stop_writes_the_headless_stop_file(control_server):
+    from src.live.headless import stop_requested
+    url, base, log = control_server
+    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"})
+    assert (status, body["ok"]) == (200, True)
+    assert stop_requested(str(base / "TMF00_alpha"))          # what headless_app polls
+    fleet = json.loads(_get(url + "/api/fleet")[2])
+    alpha = next(b for b in fleet["bots"] if b["id"] == "TMF00_alpha")
+    assert alpha["pending"] == {"stop": True, "mode": None}
+    assert fleet["control_enabled"] is True
+    rows = _log_rows(log)
+    assert [(r["bot"], r["action"], r["result"]) for r in rows] == [("TMF00_alpha", "stop", "accepted")]
+
+
+def test_stop_needs_the_typed_bot_name(control_server):
+    url, base, log = control_server
+    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "yes"})
+    assert (status, body["ok"]) == (409, False)
+    assert not (base / "TMF00_alpha" / "STOP").exists()
+    assert _log_rows(log)[0]["result"] == "refused"
+
+
+def test_stop_refused_for_a_bot_that_is_not_running(control_server):
+    url, base, _ = control_server
+    status, _ = _post(url, {"id": "TMF00_gone", "action": "stop", "confirm": "gone"})
+    assert status == 409 and not (base / "TMF00_gone" / "STOP").exists()
+
+
+def test_switch_to_paper_writes_what_live_runner_consumes(control_server):
+    from src.live.live_runner import LiveRunner
+    url, base, _ = control_server
+    status, body = _post(url, {"id": "TMF00_real", "action": "paper", "confirm": "paper"})
+    assert (status, body["ok"]) == (200, True)
+    real = base / "TMF00_real"
+    assert snapshot.pending(str(real))["mode"] == "paper"
+    # The bot's own reader accepts the file and removes it.
+    runner = object.__new__(LiveRunner)
+    runner.bot_dir = str(real)
+    runner._reloading_flag = False
+    runner._reload_started_at = None
+    assert runner._check_mode_override() == "paper"
+    assert not (real / "mode_override.json").exists()
+
+
+@pytest.mark.parametrize("action", ["auto", "semi_auto", "real", "full_auto", "AUTO", ""])
+def test_nothing_can_switch_a_bot_up_to_real_orders(control_server, action):
+    url, base, log = control_server
+    for bot in ("TMF00_alpha", "TMF00_real"):
+        for confirm in (action, "paper", bot.split("_", 1)[1]):   # every confirm the UI sends
+            status, body = _post(url, {"id": bot, "action": action, "confirm": confirm})
+            assert status == 409 and body["ok"] is False
+            assert not (base / bot / "mode_override.json").exists()
+            assert not (base / bot / "STOP").exists()
+
+
+def test_apply_writes_nothing_for_an_unknown_action(tmp_path):
+    from scripts.dashboard import control
+    with pytest.raises(control.ControlRefused):
+        control.apply("auto", str(tmp_path), "127.0.0.1")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_paper_refused_when_already_paper_pending_or_holding(control_server):
+    url, base, _ = control_server
+    assert _post(url, {"id": "TMF00_alpha", "action": "paper", "confirm": "paper"})[0] == 409
+    assert _post(url, {"id": "TMF00_real", "action": "paper", "confirm": "paper"})[0] == 200
+    assert _post(url, {"id": "TMF00_real", "action": "paper", "confirm": "paper"})[0] == 409
+    (base / "TMF00_real" / "mode_override.json").unlink()
+    _set_mode(base / "TMF00_real", "auto", position={
+        "position_size": 1, "position_side": "LONG", "entry_price": 45000})
+    status, body = _post(url, {"id": "TMF00_real", "action": "paper", "confirm": "paper"})
+    assert status == 409 and "持倉" in body["message"]
+    assert not (base / "TMF00_real" / "mode_override.json").exists()
+
+
+@pytest.mark.parametrize("headers,raw,code", [
+    ({"X-Dashboard-Control": ""}, None, 403),                     # no custom header
+    ({"Content-Type": "text/plain"}, None, 403),                  # form-able content type
+    ({"Origin": "http://attacker.example"}, None, 403),           # cross-site page
+    ({"Host": "attacker.example"}, None, 403),                    # DNS rebinding
+    ({}, b"{not json", 400),
+    ({}, b"x" * 5000, 400),
+    ({}, json.dumps({"id": "TMF00_alpha", "action": "stop", "confirm": 1}).encode(), 400),
+])
+def test_control_rejects_cross_site_and_malformed_requests(control_server, headers, raw, code):
+    url, base, _ = control_server
+    status, _ = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"},
+                      headers=headers, raw=raw)
+    assert status == code
+    assert not (base / "TMF00_alpha" / "STOP").exists()
+
+
+def test_same_origin_request_is_accepted(control_server):
+    url, base, _ = control_server
+    status, _ = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"},
+                      headers={"Origin": url})
+    assert status == 200 and (base / "TMF00_alpha" / "STOP").exists()
+
+
+def test_control_cannot_reach_outside_the_bot_root(control_server):
+    url, base, _ = control_server
+    for bot in ("../TMF00_alpha", "..", "TMF00_alpha/..", "C:\\Windows"):
+        status, body = _post(url, {"id": bot, "action": "stop", "confirm": "alpha"})
+        assert status == 409 and body["ok"] is False
+    assert not any(p.name == "STOP" for p in base.rglob("STOP"))
+
+
+def test_control_log_defaults_next_to_the_bot_root(tmp_path, monkeypatch):
+    calls = {}
+    monkeypatch.setattr(server, "bind_servers",
+                        lambda *a, **k: calls.setdefault("bound", True) and (_ for _ in ()).throw(OSError("stop")))
+    assert server.main(["--base-dir", str(tmp_path / "data" / "live"), "--enable-control"]) == 3
+    assert server.DashboardHandler.control_enabled is True
+    assert server.DashboardHandler.control_log == str(tmp_path / "data" / "dashboard_control_log.csv")
+    monkeypatch.setattr(server.DashboardHandler, "control_enabled", False)
+
+
+def test_control_log_redacts_and_survives_unwritable_path(tmp_path):
+    from scripts.dashboard import control
+    log = tmp_path / "log.csv"
+    control.log_request(str(log), client="127.0.0.1", bot_id="b", action="stop",
+                        result="error", detail=f"channel={FAKE_CHANNEL}")
+    assert FAKE_CHANNEL not in log.read_text(encoding="utf-8")
+    control.log_request(str(tmp_path / "missing" / "dir" / "log.csv"), client="x",
+                        bot_id="b", action="stop", result="ok", detail="")   # no raise

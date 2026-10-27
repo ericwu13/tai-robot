@@ -70,6 +70,26 @@ tbody tr:last-child td { border-bottom: 0; }
 .banner { display: none; margin-bottom: 12px; padding: 10px 14px; border-radius: 8px;
   background: var(--bad-bg); color: var(--bad); font-weight: 700; }
 .banner.show { display: block; }
+.controls { display: inline-flex; gap: 8px; margin-left: auto; }
+button.danger { color: #fff; background: var(--bad); border-color: var(--bad); font-weight: 700; }
+button.danger:disabled, button.primary:disabled { opacity: .45; cursor: not-allowed; }
+button.primary { color: #fff; background: var(--ok); border-color: var(--ok); font-weight: 700; }
+.pend { display: inline-block; margin-left: 6px; padding: 1px 8px; border-radius: 6px; font-size: 12px;
+  color: var(--warn); background: var(--warn-bg); font-weight: 700; white-space: nowrap; }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text);
+  padding: 0; width: min(440px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+.dlg { padding: 18px 20px; display: grid; gap: 12px; }
+.dlg h3 { margin: 0; font-size: 17px; }
+.dlg p { margin: 0; }
+.dlg .warn { color: var(--bad); font-weight: 700; }
+.dlg input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 10px; }
+.dlg .row { display: flex; gap: 8px; justify-content: flex-end; }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 20;
+  padding: 10px 16px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line);
+  box-shadow: 0 6px 24px rgba(0,0,0,.25); max-width: calc(100vw - 32px); }
+.toast.bad { color: var(--bad); font-weight: 700; }
 button, select { font: inherit; color: var(--text); background: var(--panel);
   border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; cursor: pointer; }
 button:hover, select:hover { border-color: var(--muted); }
@@ -167,6 +187,11 @@ pre.log .P3 { color: var(--muted); }
       <span id="d-state"></span>
       <span id="d-mode"></span>
       <span class="sub" id="d-strategy"></span>
+      <span id="d-pending"></span>
+      <span class="controls" id="d-controls" hidden>
+        <button class="primary" id="btn-paper">改為模擬</button>
+        <button class="danger" id="btn-stop">停止機器人</button>
+      </span>
     </div>
     <div class="tiles" id="d-tiles"></div>
     <div class="panel" id="d-regime" hidden style="margin-bottom:16px">
@@ -215,6 +240,13 @@ pre.log .P3 { color: var(--muted); }
     </div>
   </section>
 </main>
+<dialog id="dlg"><form method="dialog" class="dlg" id="dlg-form">
+  <h3 id="dlg-title"></h3>
+  <div id="dlg-body"></div>
+  <div class="row"><button value="cancel" formnovalidate>取消</button>
+    <button id="dlg-ok" value="ok"></button></div>
+</form></dialog>
+<div class="toast" id="toast" hidden></div>
 
 <script>
 // Defined before the tag below: its onerror fires before later scripts parse.
@@ -315,6 +347,12 @@ function priceCell(sim, real) {
   if (!real || real === sim) return fmtInt(sim);
   return el("span", null, fmtInt(sim), el("div", { class: "sub" }, "實際 " + fmtInt(real)));
 }
+function pendingChip(p) {
+  if (!p) return null;
+  if (p.stop) return el("span", { class: "pend" }, "停止中…");
+  if (p.mode) return el("span", { class: "pend" }, "待切換" + (MODE[p.mode] || p.mode));
+  return null;
+}
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
 
@@ -322,6 +360,67 @@ const App = {
   fleet: null, lastOk: 0, current: null, detail: null, chart: null, candles: null,
   equityChart: null, equity: null, band: null, iv: 60, fitNext: true,
   bars: [], markers: [], oldestDay: null, hasMore: false, loadingOlder: false,
+
+  // Controls: a confirm dialog, then one POST; the bot applies it from its
+  // own STOP / mode_override.json polling, and the pending chip shows the
+  // request until the bot consumes it.
+  confirmControl(action) {
+    const b = this.detail && this.detail.bot;
+    if (!b) return;
+    const real = b.trading_mode && b.trading_mode !== "paper";
+    const body = [];
+    let check = () => true;
+    if (action === "stop") {
+      $("dlg-title").textContent = `停止 ${b.bot_name}？`;
+      body.push(el("p", null, "機器人會在數秒內正常停止。停止後不會自動重啟，需要重新部署。"));
+      if (real && b.position) body.push(el("p", { class: "warn" },
+        `這是實單機器人且持有 ${SIDE[b.position.side] || b.position.side} ${b.position.size} 口：停止時會以市價送出實單平倉。`));
+      body.push(el("p", null, "請輸入機器人名稱以確認："));
+      const input = el("input", { id: "dlg-input", autocomplete: "off", placeholder: b.bot_name });
+      body.push(input);
+      check = () => input.value.trim() === b.bot_name;
+      input.addEventListener("input", () => { $("dlg-ok").disabled = !check(); });
+      $("dlg-ok").textContent = "停止"; $("dlg-ok").className = "danger";
+    } else {
+      $("dlg-title").textContent = `將 ${b.bot_name} 改為模擬？`;
+      body.push(el("p", null, "改為模擬後不再送出實單。會在下一根策略 K 棒時套用"
+        + (b.interval_s ? `（最長約 ${b.interval_s / 60} 分鐘）` : "") + "。"));
+      body.push(el("p", null, "有持倉、等待成交或重播歷史時，機器人會拒絕切換。"));
+      body.push(el("p", { class: "sub" }, "機器人重新啟動後會回到部署時指定的模式。"));
+      $("dlg-ok").textContent = "改為模擬"; $("dlg-ok").className = "primary";
+    }
+    $("dlg-body").replaceChildren(...body);
+    $("dlg-ok").disabled = !check();
+    const dlg = $("dlg");
+    dlg.onclose = () => {
+      if (dlg.returnValue !== "ok" || !check()) return;
+      this.sendControl(action, action === "stop" ? $("dlg-input").value.trim() : "paper");
+    };
+    dlg.returnValue = "";
+    dlg.showModal();
+  },
+
+  async sendControl(action, confirm) {
+    const id = this.current;
+    try {
+      const r = await fetch("/api/control", { method: "POST", cache: "no-store",
+        headers: { "Content-Type": "application/json", "X-Dashboard-Control": "1" },
+        body: JSON.stringify({ id, action, confirm }) });
+      const j = await r.json().catch(() => ({ ok: false, message: "伺服器回應無法解析" }));
+      this.toast(j.message || (j.ok ? "已送出" : "操作失敗"), !j.ok);
+    } catch (e) {
+      this.toast("無法連線到監控伺服器", true);
+    }
+    this.refreshFleet();
+    this.refreshDetail();
+  },
+
+  toast(msg, bad) {
+    const t = $("toast");
+    t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); t.hidden = false;
+    clearTimeout(this._toastTimer);
+    this._toastTimer = setTimeout(() => { t.hidden = true; }, 6000);
+  },
 
   async getJson(url) {
     const r = await fetch(url, { cache: "no-store" });
@@ -399,7 +498,7 @@ const App = {
         rg ? el("div", { class: "rg-line" }, "盤勢", rgChip(rg.effective),
           LEG[rg.active_leg] || "空手", rg.pause ? el("span", { title: "翻轉計數暫停中" }, "⏸ 暫停") : null) : null);
       const tr = el("tr", { onclick: () => this.open(b.id) },
-        td("", chip(b.state), "first"),
+        td("", el("span", null, chip(b.state), pendingChip(b.pending)), "first"),
         td("機器人", name, "first"),
         td("模式", modeBadge(b.trading_mode)),
         td("持倉", positionText(b.position)),
@@ -487,6 +586,13 @@ const App = {
     $("d-state").replaceChildren(chip(b.state));
     $("d-strategy").textContent = b.strategy + (b.interval_s ? `・${b.interval_s / 60} 分 K 策略` : "");
     $("d-mode").replaceChildren(modeBadge(b.trading_mode));
+    $("d-pending").replaceChildren(pendingChip(b.pending) || "");
+    const alive = ["RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT"].includes(b.state);
+    const p = b.pending || {};
+    $("d-controls").hidden = !(this.fleet && this.fleet.control_enabled) || !alive;
+    $("btn-stop").disabled = !!p.stop;
+    $("btn-paper").hidden = b.trading_mode === "paper";
+    $("btn-paper").disabled = !!(p.stop || p.mode);
     $("d-tiles").replaceChildren(
       tile("持倉", positionText(b.position)),
       tile("最新價", b.last_price ? fmtInt(b.last_price) : "—"),
@@ -712,6 +818,8 @@ const App = {
       this.renderFleet();
     });
     $("back").addEventListener("click", () => { location.hash = ""; });
+    $("btn-stop").addEventListener("click", () => this.confirmControl("stop"));
+    $("btn-paper").addEventListener("click", () => this.confirmControl("paper"));
     for (const btn of $("d-iv").children) btn.addEventListener("click", () => {
       this.iv = Number(btn.dataset.iv); this.fitNext = true;
       for (const b of $("d-iv").children) b.classList.toggle("on", b === btn);
