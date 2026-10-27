@@ -75,6 +75,13 @@ python test_kline.py       # COM-based KLine history GUI
 - `semi_auto` is refused headless (needs the order-confirm dialog). Stop = `STOP` file in the bot dir or Ctrl+C → normal `_stop_live()`.
 - `deploy --detach --wait-ready N` spawns the bot detached (stdout → `{bot_dir}/cli_stdout.log`) and returns 0 on `Tick subscription active` under the child's own lock, the child's exit code if it died, 6 if still starting. The `deploy` skill (`.claude/skills/deploy`) is the agent-facing procedure with its safety gates; it runs from the MAIN tree (worktrees have no settings/SDK/data).
 
+## Bot Dashboard (scripts/dashboard)
+- `python -m scripts.dashboard.server [--tailscale] [--base-dir <data/live>] [--port 8765]` — read-only zh-TW web page over every bot dir: fleet table + per-bot candles/trades/decisions/log. Stdlib only. Binds loopback by default; `--tailscale` adds the tailnet IP; clients outside loopback/100.64.0.0/10/fd7a:115c:a1e0::/48 get 403.
+- **Never writes to a bot dir.** Liveness reuses `check_bots.classify_heartbeat` + `common.pid_alive` (never `LiveRunner.check_lock`, which deletes stale locks), so page and monitor agree.
+- **All reads go through `fileio.open_shared` (FILE_SHARE_DELETE).** A plain `open()` reader on Windows makes `save_session` raise (its `os.replace` fails against ANY open handle, and the remove-then-rename fallback needs share-delete) and blocks `.lock` removal on clean stop. `tests/test_dashboard.py` pins both directions.
+- Log lines pass `redact_line` (monitor `redact` + Discord snowflakes + TW-ID shapes) before leaving the box. Times use `bar_dt`/trade strings (TPE); chart times are TPE wall-clock encoded as UTC.
+- Colors follow 紅漲綠跌 (red = profit/up). Health states use blue/orange so they never read as P&L. `trading_mode != "paper"` shows a 實單 badge.
+
 ## Conventions
 - Python 3.13+ on Windows 11
 - Snake_case for functions/variables, PascalCase for classes

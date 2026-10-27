@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>機器人監控</title>
+<style>
+:root {
+  --bg: #f5f6f8; --panel: #ffffff; --line: #e3e6eb; --text: #1c2330; --muted: #6b7484;
+  --up: #d23c3c; --down: #1f9d55;              /* 紅漲綠跌 */
+  --ok: #2b6fd6; --ok-bg: #e7effc;
+  --warn: #b86e00; --warn-bg: #fff3dc;
+  --bad: #c2410c; --bad-bg: #ffe8dc;
+  --off: #8a93a3; --off-bg: #eef0f3;
+  --row-hover: #f0f4fb;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1319; --panel: #171c24; --line: #262d38; --text: #e3e7ee; --muted: #8d97a8;
+    --up: #f06464; --down: #3fbf74;
+    --ok: #6ea2ff; --ok-bg: #1a2a45;
+    --warn: #f0b04a; --warn-bg: #3a2c12;
+    --bad: #ff8a5b; --bad-bg: #42221a;
+    --off: #7c8596; --off-bg: #222833;
+    --row-hover: #1d2430;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", system-ui, sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+  padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5; }
+h1 { font-size: 18px; margin: 0; font-weight: 700; }
+.host { color: var(--muted); }
+.spacer { flex: 1; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+  border-radius: 999px; font-size: 13px; white-space: nowrap; }
+.chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.s-ok { color: var(--ok); background: var(--ok-bg); }
+.s-warn { color: var(--warn); background: var(--warn-bg); }
+.s-bad { color: var(--bad); background: var(--bad-bg); font-weight: 700; }
+.s-off { color: var(--off); background: var(--off-bg); }
+.updated { color: var(--muted); font-size: 13px; }
+.updated.stale { color: var(--bad); font-weight: 700; }
+main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.tile .k { color: var(--muted); font-size: 13px; }
+.tile .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 0 0 10px; }
+.toolbar label { color: var(--muted); font-size: 13px; display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 13px; background: var(--panel); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:last-child td { border-bottom: 0; }
+#fleet tbody tr { cursor: pointer; }
+#fleet tbody tr:hover { background: var(--row-hover); }
+.scroll-x { overflow-x: auto; }
+.alert { color: var(--bad); }
+.up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
+.name { font-weight: 700; }
+.sub { color: var(--muted); font-size: 12px; }
+.trunc { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.empty { padding: 24px; text-align: center; color: var(--muted); }
+.banner { display: none; margin-bottom: 12px; padding: 10px 14px; border-radius: 8px;
+  background: var(--bad-bg); color: var(--bad); font-weight: 700; }
+.banner.show { display: block; }
+button, select { font: inherit; color: var(--text); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+button:hover, select:hover { border-color: var(--muted); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
+.seg button:last-child { border-right: 0; }
+.seg button.on { background: var(--ok-bg); color: var(--ok); font-weight: 700; }
+.detail-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 12px; }
+.detail-head h2 { margin: 0; font-size: 20px; }
+.chart { height: 380px; }
+.chart.small { height: 160px; }
+.section-title { font-weight: 700; padding: 10px 14px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.grid2 { display: grid; gap: 16px; margin-top: 16px; }
+.tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid var(--line); }
+.tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 12px; color: var(--muted); }
+.tabs button.on { color: var(--text); border-bottom-color: var(--ok); font-weight: 700; }
+.scroll { overflow: auto; max-height: 520px; }
+pre.log { margin: 0; padding: 10px 14px; font: 12px/1.55 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; word-break: break-all; }
+pre.log .P1 { color: var(--bad); font-weight: 700; }
+pre.log .P2 { color: var(--warn); }
+pre.log .P3 { color: var(--muted); }
+.legend { color: var(--muted); font-size: 12px; font-weight: 400; }
+.mode { font-size: 13px; color: var(--muted); }
+.mode.real { color: #fff; background: var(--bad); padding: 1px 8px; border-radius: 6px; font-weight: 700; }
+[hidden] { display: none !important; }
+
+/* Phone: the fleet table becomes one card per bot, no sideways scroll. */
+@media (max-width: 760px) {
+  main { padding: 12px 16px; }
+  #fleet thead { display: none; }
+  #fleet, #fleet tbody, #fleet tr, #fleet td { display: block; width: 100%; }
+  #fleet tr { border-bottom: 1px solid var(--line); padding: 8px 4px; }
+  #fleet td { border: 0; padding: 3px 10px; white-space: normal; text-align: left; display: flex; justify-content: space-between; gap: 12px; }
+  #fleet td::before { content: attr(data-label); color: var(--muted); font-size: 13px; }
+  #fleet td.first::before { content: none; }
+  .trunc { max-width: none; }
+  .chart { height: 300px; }
+  .scroll.wide { overflow-x: auto; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>機器人監控</h1>
+  <span class="host" id="host"></span>
+  <span class="chip s-off" id="market">讀取中…</span>
+  <span class="spacer"></span>
+  <span class="updated" id="updated"></span>
+</header>
+<main>
+  <div class="banner" id="banner">無法連線到監控伺服器，畫面上的資料可能已過時。</div>
+
+  <section id="fleet-view">
+    <div class="tiles" id="tiles"></div>
+    <div class="toolbar">
+      <label><input type="checkbox" id="show-retired"> 顯示已停用的機器人</label>
+      <span class="legend">點選任一列查看圖表、交易與日誌。損益顏色：紅＝獲利、綠＝虧損。</span>
+    </div>
+    <div class="panel scroll-x">
+      <table id="fleet">
+        <thead><tr>
+          <th>狀態</th><th>機器人</th><th>模式</th><th>持倉</th>
+          <th class="num">未實現</th><th class="num">今日已實現</th><th class="num">累計損益</th>
+          <th class="num">交易數</th><th class="num">勝率</th><th>最後決策</th><th>心跳</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="detail-view" hidden>
+    <div class="detail-head">
+      <button id="back">← 返回總覽</button>
+      <h2 id="d-name"></h2>
+      <span id="d-state"></span>
+      <span id="d-mode"></span>
+      <span class="sub" id="d-strategy"></span>
+    </div>
+    <div class="tiles" id="d-tiles"></div>
+    <div class="panel">
+      <div class="section-title">
+        <span>K 線</span>
+        <select id="d-day" aria-label="日期"></select>
+        <span class="seg" id="d-iv">
+          <button data-iv="60">1分</button><button data-iv="300">5分</button>
+          <button data-iv="900">15分</button><button data-iv="3600">60分</button>
+        </span>
+        <span class="legend">▲ 進場　▼ 出場（時間為台北時間）</span>
+      </div>
+      <div class="chart" id="d-chart"></div>
+      <div class="empty" id="d-chart-empty" hidden>這一天沒有 K 線資料</div>
+    </div>
+    <div class="grid2">
+      <div class="panel">
+        <div class="section-title">累計已實現損益</div>
+        <div class="chart small" id="d-equity"></div>
+        <div class="empty" id="d-equity-empty" hidden>尚無已平倉交易</div>
+      </div>
+      <div class="panel">
+        <div class="tabs" id="d-tabs">
+          <button data-tab="trades" class="on">交易紀錄</button>
+          <button data-tab="decisions">決策紀錄</button>
+          <button data-tab="log">日誌</button>
+        </div>
+        <div class="scroll wide" data-pane="trades"><table id="d-trades"><thead><tr>
+          <th>方向</th><th>進場時間</th><th class="num">進場價</th><th>出場時間</th>
+          <th class="num">出場價</th><th class="num">損益</th><th>出場原因</th><th>來源</th>
+        </tr></thead><tbody></tbody></table></div>
+        <div class="scroll wide" data-pane="decisions" hidden><table id="d-decisions"><thead><tr>
+          <th>K 線時間</th><th>動作</th><th>方向</th><th class="num">價格</th><th>原因</th>
+        </tr></thead><tbody></tbody></table></div>
+        <div class="scroll" data-pane="log" hidden>
+          <div class="section-title"><span class="sub" id="d-logfile"></span>
+            <span class="legend">敏感資訊（頻道 ID、帳號）已遮蔽</span></div>
+          <pre class="log" id="d-log"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/lwc.js" onerror="loadCdnCharts()"></script>
+<script>
+"use strict";
+function loadCdnCharts() {
+  const s = document.createElement("script");
+  s.src = "https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js";
+  s.onload = () => { if (window.App) window.App.onChartsReady(); };
+  document.head.appendChild(s);
+}
+
+const STATE = {
+  RUNNING:      ["運作中", "s-ok"],
+  NO_HEARTBEAT: ["運作中（無心跳）", "s-ok"],
+  LAGGING:      ["延遲", "s-warn"],
+  UNKNOWN:      ["狀態不明", "s-warn"],
+  HUNG:         ["⚠ 卡住", "s-bad"],
+  CRASHED:      ["⚠ 異常終止", "s-bad"],
+  STOPPED:      ["已停止", "s-off"],
+};
+const STATE_ORDER = ["HUNG", "CRASHED", "LAGGING", "UNKNOWN", "RUNNING", "NO_HEARTBEAT", "STOPPED"];
+const MODE = { paper: "模擬", semi_auto: "半自動・實單", auto: "全自動・實單" };
+function modeBadge(m) {
+  const real = m && m !== "paper";
+  return el("span", { class: real ? "mode real" : "mode" }, MODE[m] || m || "—");
+}
+const SIDE = { LONG: "多", SHORT: "空" };
+const ACTION = {
+  ENTRY: "進場訊號", ENTRY_FILL: "進場成交", CLOSE: "平倉", TRADE_CLOSE: "出場",
+  FORCE_CLOSE: "強制平倉", REAL_EXIT_CONFIRMED: "實單出場確認",
+  REAL_ORDER_SKIPPED: "實單略過", REAL_ORDER_TIMEOUT: "實單確認逾時",
+  REAL_ORDER_BLOCKED: "實單被擋", SIGNAL_BLOCKED: "訊號被擋", NEWS_SUPPRESSED: "新聞抑制",
+};
+const EXIT_TAG = { force_close: "強制平倉", session_end: "收盤平倉", stop: "停損", stop_loss: "停損",
+  take_profit: "停利", limit: "限價出場", manual: "手動平倉" };
+const SOURCE = { paper: "模擬", real: "實單" };
+
+const $ = (id) => document.getElementById(id);
+function el(tag, props, ...kids) {
+  const n = document.createElement(tag);
+  if (props) for (const [k, v] of Object.entries(props)) {
+    if (k === "class") n.className = v; else if (k === "data") Object.assign(n.dataset, v);
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+  }
+  for (const c of kids) if (c !== null && c !== undefined) n.append(c instanceof Node ? c : String(c));
+  return n;
+}
+const fmtInt = (v) => Number(v).toLocaleString("zh-TW");
+function money(v) {
+  if (v === null || v === undefined) return el("span", { class: "muted" }, "—");
+  const cls = v > 0 ? "up" : v < 0 ? "down" : "muted";
+  return el("span", { class: cls }, (v > 0 ? "+" : "") + fmtInt(v));
+}
+function ago(sec) {
+  if (sec === null || sec === undefined) return "—";
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + " 秒前";
+  if (sec < 3600) return Math.floor(sec / 60) + " 分鐘前";
+  if (sec < 86400) return Math.floor(sec / 3600) + " 小時前";
+  return Math.floor(sec / 86400) + " 天前";
+}
+function chip(state) {
+  const [label, cls] = STATE[state] || [state, "s-warn"];
+  return el("span", { class: "chip " + cls }, label);
+}
+function positionText(p) {
+  if (!p) return el("span", { class: "muted" }, "空手");
+  const price = p.real_entry_price || p.entry_price;
+  return el("span", { class: p.side === "LONG" ? "up" : "down" },
+    `${SIDE[p.side] || p.side} ${p.size} 口 @ ${fmtInt(price)}`);
+}
+function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
+function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
+
+const App = {
+  fleet: null, lastOk: 0, current: null, detail: null, chart: null, candles: null,
+  equityChart: null, equity: null, iv: 60, fitNext: true,
+
+  async getJson(url) {
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    return r.json();
+  },
+
+  async refreshFleet() {
+    try {
+      this.fleet = await this.getJson("/api/fleet");
+      this.lastOk = Date.now();
+      $("banner").classList.remove("show");
+      this.renderHeader();
+      if (!this.current) this.renderFleet();
+    } catch (e) {
+      $("banner").classList.add("show");
+    }
+    this.renderUpdated();
+  },
+
+  renderHeader() {
+    const f = this.fleet;
+    $("host").textContent = f.host ? "主機：" + f.host : "";
+    const m = f.market, mk = $("market");
+    if (m.degraded) { mk.className = "chip s-warn"; mk.textContent = "休市判斷不可用（假日曆異常）"; }
+    else if (m.session === "DAY") { mk.className = "chip s-ok"; mk.textContent = `日盤交易中・${m.closes_at} 收盤`; }
+    else if (m.session === "NIGHT") { mk.className = "chip s-ok"; mk.textContent = `夜盤交易中・${m.closes_at} 收盤`; }
+    else { mk.className = "chip s-off"; mk.textContent = "休市中"; }
+  },
+
+  renderUpdated() {
+    const u = $("updated");
+    if (!this.lastOk) { u.textContent = ""; return; }
+    const s = (Date.now() - this.lastOk) / 1000;
+    u.textContent = `資料更新：${this.fleet.now.slice(11)}（${ago(s)}）`;
+    u.classList.toggle("stale", s > 30);
+  },
+
+  visibleBots() {
+    const all = this.fleet ? this.fleet.bots : [];
+    const showRetired = $("show-retired").checked;
+    return all.filter((b) => showRetired || b.active)
+      .sort((a, b) => STATE_ORDER.indexOf(a.state) - STATE_ORDER.indexOf(b.state)
+        || a.id.localeCompare(b.id, "zh-Hant"));
+  },
+
+  renderFleet() {
+    const bots = this.visibleBots();
+    const live = bots.filter((b) => ["RUNNING", "NO_HEARTBEAT", "LAGGING"].includes(b.state)).length;
+    const problems = bots.filter((b) => ["HUNG", "CRASHED", "LAGGING", "UNKNOWN"].includes(b.state)).length;
+    const holding = bots.filter((b) => b.position).length;
+    const sum = (k) => bots.reduce((a, b) => a + (b[k] || 0), 0);
+    const unreal = bots.reduce((a, b) => a + ((b.position && b.position.unrealized) || 0), 0);
+    $("tiles").replaceChildren(
+      tile("運作中", `${live} / ${bots.length}`),
+      tile("需要注意", el("span", { class: problems ? "alert" : "" }, String(problems))),
+      tile("持倉中", String(holding)),
+      tile("實單機器人", String(bots.filter((b) => b.trading_mode && b.trading_mode !== "paper").length)),
+      tile("未實現損益", money(unreal)),
+      tile("今日已實現", money(sum("pnl_today"))),
+      tile("累計損益", money(sum("pnl_total"))),
+    );
+    const body = $("fleet").tBodies[0];
+    if (!bots.length) {
+      body.replaceChildren(el("tr", null, el("td", { colspan: "11", class: "empty" }, "目前沒有機器人")));
+      return;
+    }
+    body.replaceChildren(...bots.map((b) => {
+      const d = b.last_decision;
+      const hb = b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s)
+        : (b.state === "STOPPED" ? "最後活動 " + ago(b.last_activity_age_s) : "—");
+      const name = el("div", null, el("div", { class: "name" }, b.bot_name),
+        el("div", { class: "sub trunc", title: b.strategy }, `${b.symbol}・${b.strategy || "—"}`));
+      const tr = el("tr", { onclick: () => this.open(b.id) },
+        td("", chip(b.state), "first"),
+        td("機器人", name, "first"),
+        td("模式", modeBadge(b.trading_mode)),
+        td("持倉", positionText(b.position)),
+        td("未實現", money(b.position ? b.position.unrealized : null), "num"),
+        td("今日已實現", money(b.pnl_today), "num"),
+        td("累計損益", money(b.pnl_total), "num"),
+        td("交易數", fmtInt(b.trades), "num"),
+        td("勝率", b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%", "num"),
+        td("最後決策", d ? el("span", { title: d.reason }, `${d.bar_dt.slice(5)} ${ACTION[d.action] || d.action}`) : "—"),
+        td("心跳", hb + (b.inflight_call ? `（等待 ${b.inflight_call}）` : "")),
+      );
+      return tr;
+    }));
+  },
+
+  // ── detail ──
+  open(id) { location.hash = "bot=" + encodeURIComponent(id); },
+
+  route() {
+    const m = location.hash.match(/^#bot=(.+)$/);
+    this.current = m ? decodeURIComponent(m[1]) : null;
+    $("fleet-view").hidden = !!this.current;
+    $("detail-view").hidden = !this.current;
+    if (this.current) { this.fitNext = true; this.ivInit = true; this.day = null; this.refreshDetail(); }
+    else if (this.fleet) this.renderFleet();
+    window.scrollTo(0, 0);
+  },
+
+  async refreshDetail() {
+    if (!this.current) return;
+    const id = this.current;
+    const q = "/api/bot?id=" + encodeURIComponent(id) + (this.day ? "&day=" + this.day : "");
+    try {
+      const d = await this.getJson(q);
+      if (id !== this.current) return;
+      this.detail = d; this.lastOk = Date.now();
+      $("banner").classList.remove("show");
+      this.renderDetail();
+    } catch (e) {
+      $("banner").classList.add("show");
+    }
+  },
+
+  renderDetail() {
+    const d = this.detail, b = d.bot;
+    $("d-name").textContent = `${b.bot_name}（${b.symbol}）`;
+    $("d-state").replaceChildren(chip(b.state));
+    $("d-strategy").textContent = b.strategy + (b.interval_s ? `・${b.interval_s / 60} 分 K 策略` : "");
+    $("d-mode").replaceChildren(modeBadge(b.trading_mode));
+    $("d-tiles").replaceChildren(
+      tile("持倉", positionText(b.position)),
+      tile("最新價", b.last_price ? fmtInt(b.last_price) : "—"),
+      tile("未實現", money(b.position ? b.position.unrealized : null)),
+      tile("今日已實現", money(b.pnl_today)),
+      tile("累計損益", money(b.pnl_total)),
+      tile("交易數 / 勝率", `${fmtInt(b.trades)} / ${b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%"}`),
+      tile("心跳", b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s) : "—"),
+    );
+    const sel = $("d-day");
+    sel.replaceChildren(...d.days.map((x) => el("option", { value: x },
+      `${x.slice(0, 4)}/${x.slice(4, 6)}/${x.slice(6)}`)));
+    if (d.day) sel.value = d.day;
+    if (this.ivInit) { if ([60, 300, 900, 3600].includes(b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
+    for (const btn of $("d-iv").children) btn.classList.toggle("on", Number(btn.dataset.iv) === this.iv);
+    this.drawCharts();
+
+    $("d-trades").tBodies[0].replaceChildren(...(d.trades.length ? d.trades.map((t) => el("tr", null,
+      el("td", { class: t.side === "LONG" ? "up" : "down" }, SIDE[t.side] || t.side),
+      el("td", null, t.entry_dt.slice(0, 16)),
+      el("td", { class: "num" }, fmtInt(t.real_entry_price || t.entry_price)),
+      el("td", null, t.exit_dt.slice(0, 16)),
+      el("td", { class: "num" }, t.exit_price ? fmtInt(t.real_exit_price || t.exit_price) : "—"),
+      el("td", { class: "num" }, money(t.pnl)),
+      el("td", null, EXIT_TAG[t.exit_tag] || t.exit_tag || "—"),
+      el("td", null, SOURCE[t.source] || t.source || "—"),
+    )) : [el("tr", null, el("td", { colspan: "8", class: "empty" }, "尚無交易"))]));
+
+    $("d-decisions").tBodies[0].replaceChildren(...(d.decisions.length ? d.decisions.map((r) => el("tr", null,
+      el("td", null, r.bar_dt),
+      el("td", null, ACTION[r.action] || r.action),
+      el("td", null, SIDE[r.side] || r.side || "—"),
+      el("td", { class: "num" }, r.price ? fmtInt(r.price) : "—"),
+      el("td", { class: "trunc", title: r.reason }, r.reason),
+    )) : [el("tr", null, el("td", { colspan: "5", class: "empty" }, "尚無決策紀錄"))]));
+
+    $("d-logfile").textContent = d.log_file ? "檔案：" + d.log_file + "（最後 " + d.log.length + " 行）" : "沒有日誌";
+    const pre = $("d-log"), atBottom = pre.parentElement.scrollTop + pre.parentElement.clientHeight >= pre.parentElement.scrollHeight - 20;
+    pre.replaceChildren(...d.log.map((l) => el("span", { class: l.sev }, l.text + "\n")));
+    if (atBottom) pre.parentElement.scrollTop = pre.parentElement.scrollHeight;
+  },
+
+  css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); },
+
+  ensureCharts() {
+    if (this.chart || !window.LightweightCharts) return !!this.chart;
+    const base = () => ({
+      layout: { background: { color: this.css("--panel") }, textColor: this.css("--muted"),
+        fontFamily: getComputedStyle(document.body).fontFamily },
+      grid: { vertLines: { color: this.css("--line") }, horzLines: { color: this.css("--line") } },
+      rightPriceScale: { borderColor: this.css("--line") },
+      timeScale: { borderColor: this.css("--line"), timeVisible: true, secondsVisible: false },
+      localization: { locale: "zh-TW", priceFormatter: (p) => fmtInt(Math.round(p)) },
+      autoSize: true,
+    });
+    this.chart = LightweightCharts.createChart($("d-chart"), base());
+    const up = this.css("--up"), down = this.css("--down");
+    this.candles = this.chart.addCandlestickSeries({ upColor: up, downColor: down,
+      wickUpColor: up, wickDownColor: down, borderVisible: false });
+    this.equityChart = LightweightCharts.createChart($("d-equity"), base());
+    this.equity = this.equityChart.addBaselineSeries({ baseValue: { type: "price", price: 0 },
+      topLineColor: up, bottomLineColor: down,
+      topFillColor1: "transparent", topFillColor2: "transparent",
+      bottomFillColor1: "transparent", bottomFillColor2: "transparent", lineWidth: 2 });
+    return true;
+  },
+
+  onChartsReady() { if (this.detail) this.drawCharts(); },
+
+  aggregate(bars, iv) {
+    if (iv === 60) return bars;
+    const out = [];
+    let cur = null;
+    for (const b of bars) {
+      // Buckets start at the session open (08:45 day, 15:00 night), like BarAggregator.
+      const mod = ((b.time % 86400) + 86400) % 86400;
+      const nightEarly = mod < 5 * 3600;
+      const anchor = b.time - mod + (mod >= 15 * 3600 ? 15 * 3600 : nightEarly ? -9 * 3600 : 8 * 3600 + 45 * 60);
+      const t = anchor + Math.floor((b.time - anchor) / iv) * iv;
+      if (!cur || cur.time !== t) {
+        if (cur) out.push(cur);
+        cur = { time: t, open: b.open, high: b.high, low: b.low, close: b.close };
+      } else {
+        cur.high = Math.max(cur.high, b.high); cur.low = Math.min(cur.low, b.low); cur.close = b.close;
+      }
+    }
+    if (cur) out.push(cur);
+    return out;
+  },
+
+  drawCharts() {
+    const d = this.detail;
+    if (!d || !this.ensureCharts()) return;
+    const bars = this.aggregate(d.bars, this.iv);
+    $("d-chart-empty").hidden = bars.length > 0;
+    $("d-chart").hidden = bars.length === 0;
+    this.candles.setData(bars);
+    const snap = (t) => {   // a marker must sit on an existing candle
+      let lo = 0, hi = bars.length - 1, best = bars.length ? bars[0].time : t;
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (bars[mid].time <= t) { best = bars[mid].time; lo = mid + 1; } else hi = mid - 1; }
+      return best;
+    };
+    const up = this.css("--up"), down = this.css("--down");
+    this.candles.setMarkers(d.markers.map((m) => m.kind === "entry"
+      ? { time: snap(m.time), position: m.long ? "belowBar" : "aboveBar", shape: m.long ? "arrowUp" : "arrowDown",
+          color: m.long ? up : down, text: (m.long ? "多 " : "空 ") + fmtInt(m.price) }
+      : { time: snap(m.time), position: m.long ? "aboveBar" : "belowBar", shape: m.long ? "arrowDown" : "arrowUp",
+          color: this.css("--muted"), text: "出 " + (m.pnl > 0 ? "+" : "") + fmtInt(m.pnl) }));
+    $("d-equity-empty").hidden = d.equity.length > 0;
+    $("d-equity").hidden = d.equity.length === 0;
+    this.equity.setData(d.equity);
+    if (this.fitNext) { this.chart.timeScale().fitContent(); this.equityChart.timeScale().fitContent(); this.fitNext = false; }
+  },
+
+  init() {
+    try { $("show-retired").checked = localStorage.getItem("showRetired") === "1"; } catch (e) {}
+    $("show-retired").addEventListener("change", (e) => {
+      try { localStorage.setItem("showRetired", e.target.checked ? "1" : "0"); } catch (err) {}
+      this.renderFleet();
+    });
+    $("back").addEventListener("click", () => { location.hash = ""; });
+    $("d-day").addEventListener("change", (e) => { this.day = e.target.value; this.fitNext = true; this.refreshDetail(); });
+    for (const btn of $("d-iv").children) btn.addEventListener("click", () => {
+      this.iv = Number(btn.dataset.iv); this.fitNext = true;
+      for (const b of $("d-iv").children) b.classList.toggle("on", b === btn);
+      this.drawCharts();
+    });
+    for (const btn of $("d-tabs").children) btn.addEventListener("click", () => {
+      for (const b of $("d-tabs").children) b.classList.toggle("on", b === btn);
+      for (const p of document.querySelectorAll("[data-pane]")) p.hidden = p.dataset.pane !== btn.dataset.tab;
+    });
+    window.addEventListener("hashchange", () => this.route());
+    this.refreshFleet().then(() => this.route());
+    setInterval(() => this.refreshFleet(), 5000);
+    setInterval(() => this.refreshDetail(), 10000);
+    setInterval(() => this.renderUpdated(), 1000);
+  },
+};
+window.App = App;
+App.init();
+</script>
+</body>
+</html>
