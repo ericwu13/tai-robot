@@ -117,7 +117,7 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, arm_headless_file_guard, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.tick_watchdog import TickWatchdog
 from src.live.main_heartbeat import call_com, set_com_return_logger
@@ -8345,6 +8345,17 @@ class BacktestApp:
         if callable(_set_guard):
             _set_guard(self._trading_guard.to_dict)
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
+        # Fail closed: only an attended GUI deploy (origin exactly "gui"
+        # and this app is not headless) may honor a live mode from
+        # mode_override.json. A missing request or origin arms the guard.
+        # This does not change trading_mode assigned above, so
+        # `deploy --mode auto` stays an explicit deploy choice.
+        _origin = getattr(req, "origin", None) if req is not None else None
+        arm_headless_file_guard(
+            self._live_runner,
+            app_headless=bool(getattr(self, "_headless", False)),
+            origin=_origin,
+        )
         self._live_runner.on_mode_changed = self._on_mode_changed
         self._live_runner.mode_switch_veto = (
             lambda: "真實委託等待成交中 real order fill pending"

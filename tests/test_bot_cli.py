@@ -16,7 +16,7 @@ import pytest
 import run_backtest as rb
 from src.live import headless as hl
 from src.live.deploy_request import DeployRequest
-from src.live.headless_app import HeadlessBotApp
+from src.live.headless_app import DeployDriver, HeadlessBotApp
 
 
 # ── DeployRequest ↔ dialog tuple ──
@@ -318,6 +318,23 @@ def test_build_request_paper_defaults():
 def test_semi_auto_is_refused_headless():
     with pytest.raises(SystemExit):  # argparse choices
         _deploy_args("--mode", "semi_auto")
+
+
+def test_deploy_mode_auto_is_an_explicit_headless_choice():
+    """`deploy --mode auto` stays a deploy-time choice, not a file drop."""
+    req = hl.build_deploy_request(
+        _deploy_args("--strategy", "x", "--mode", "auto"), None)
+    assert req.trading_mode == "auto"
+    assert req.origin == "cli"
+    assert hl.HEADLESS_MODES == ("paper", "auto")
+
+
+def test_headless_deploy_arms_mode_override_guard():
+    """Both headless entry points arm the file guard; the GUI origin does not."""
+    src = inspect.getsource(rb.BacktestApp._deploy_live_continue)
+    assert "arm_headless_file_guard(" in src
+    driver_src = inspect.getsource(DeployDriver._deploy)
+    assert "runner._headless = True" in driver_src
 
 
 def test_regime_requires_both_legs_unless_resuming():

@@ -246,6 +246,12 @@ class DeployDriver(_Driver):
     def _deploy(self) -> None:
         clear_stop_file(self.bot_dir)  # a stale STOP would stop us instantly
         ok = self.app._deploy_live_from(self.req)
+        runner = self.app._live_runner
+        if runner is not None:
+            # This process is the headless driver. Arm even when the
+            # deploy request was tagged gui — a file drop must not
+            # escalate it. deploy --mode auto already set trading_mode.
+            runner._headless = True
         if not ok or self.app._live_runner is None:
             why = "; ".join(f"{t}: {m.splitlines()[0]}" for t, m in self.app.alerts) \
                 or self.app.status_var.get()

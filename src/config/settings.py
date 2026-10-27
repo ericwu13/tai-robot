@@ -53,7 +53,7 @@ class TradingConfig:
     order_type: str = "2"     # "2"=auto new/close
     trade_type: int = 0       # 0=ROD, 1=IOC, 2=FOK
     price_flag: int = 0       # 0=market, 1=limit
-    allow_live_override: bool = False  # allows mode_override.json to set "auto"
+    allow_live_override: bool = False  # GUI: mode_override.json may set "auto". Headless refuses it.
 
 
 @dataclass

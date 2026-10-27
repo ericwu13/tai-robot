@@ -439,6 +439,26 @@ def load_1m_bars_from_csvs(bot_dir: str, symbol: str) -> list[Bar]:
     return [out[k] for k in sorted(out)]
 
 
+# Modes a dropped mode_override.json may select on a headless bot.
+# Fail closed: paper is a downgrade (or a no-op). ``auto``, ``real``,
+# ``semi_auto``, and any other value are live or real-money escalations
+# and are refused. There is no settings or flag bypass.
+_HEADLESS_FILE_MODES = frozenset({"paper"})
+
+
+def arm_headless_file_guard(runner, *, app_headless: bool,
+                            origin: str | None) -> None:
+    """Arm mode_override.json live-mode refusal on an unattended deploy.
+
+    Fail closed: the guard stays off only for an attended GUI deploy
+    (``app_headless`` is false and ``origin`` is exactly ``"gui"``).
+    A headless app, a CLI origin, or a missing origin arms it. This does
+    not change ``trading_mode`` — ``deploy --mode auto`` is assigned by
+    the caller and is not a file drop.
+    """
+    runner._headless = bool(app_headless) or origin != "gui"
+
+
 class LiveRunner:
     """Orchestrates live bar processing without touching COM.
 
@@ -545,6 +565,13 @@ class LiveRunner:
 
         # Hot-swap mode switching (Feature 2)
         self._allow_live_override: bool = False
+        # Set by arm_headless_file_guard on an unattended deploy. While
+        # True, mode_override.json may only select paper — auto, real,
+        # semi_auto, and any other value are refused. allow_live_override
+        # and user_confirmed do not bypass it. Default False so the GUI
+        # dropdown and GUI file hot-swap stay as they are. deploy --mode
+        # auto assigns trading_mode directly and does not consult this.
+        self._headless: bool = False
         self.on_mode_changed: Callable[[str, str], None] | None = None
         # Optional external veto: returns a reason string to block the
         # switch, or None to allow it. The GUI wires this to the
@@ -686,8 +713,35 @@ class LiveRunner:
             self._reload_started_at = None
         self._reloading_flag = value
 
+    def _refuse_headless_file_mode(self, mode) -> bool:
+        """Refuse a live/real mode_override.json on a headless bot.
+
+        Returns True when the mode must not be applied. The caller has
+        already removed the file, so a refused drop is not re-read on
+        the next bar. ``None`` (the file named no mode) is not a refusal.
+        The GUI path (``_headless`` false) is not this method's concern.
+        """
+        if not self._headless:
+            return False
+        if mode is None or mode in _HEADLESS_FILE_MODES:
+            return False
+        msg = (
+            f"[MODE] headless refused mode_override.json trading_mode={mode!r} "
+            f"— a file drop cannot switch a headless bot to a live or "
+            f"real-money mode; staying on {self.trading_mode!r} (file removed)"
+        )
+        logger.warning("%s", msg)
+        self._emit("on_status", msg)
+        return True
+
     def _check_mode_override(self) -> str | None:
-        """Read and consume a mode_override.json file from the bot directory."""
+        """Read and consume a mode_override.json file from the bot directory.
+
+        Headless bots (``_headless``) accept only ``paper`` from this file.
+        ``auto``, ``real``, and any other live or real-money mode are
+        refused, the file is still removed, and the current mode is left
+        unchanged. ``allow_live_override`` does not bypass that.
+        """
         # Issue #79: never consume/apply a mode override during warmup or
         # history replay. Applying one mid-replay races with the resume UI
         # sync and makes the mode tag disappear until the user manually
@@ -734,7 +788,14 @@ class LiveRunner:
             with open(override_path, "r") as f:
                 data = json.load(f)
             os.remove(override_path)
-            return data.get("trading_mode")
+            mode = data.get("trading_mode")
+            # File is already gone, so a refusal is not re-applied next poll.
+            # The GUI dropdown calls _apply_mode_switch directly and never
+            # reaches this guard. deploy --mode auto assigns trading_mode
+            # and does not read this file.
+            if self._refuse_headless_file_mode(mode):
+                return None
+            return mode
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -745,6 +806,10 @@ class LiveRunner:
         GUI confirmation dialog — that bypasses the allow_live_override
         gate, which exists to stop UNATTENDED switches to auto (a dropped
         mode_override.json file has no human in the loop).
+
+        A headless file drop never relies on this gate. ``_check_mode_override``
+        refuses auto/real/any other non-paper mode before calling here, and
+        ``user_confirmed`` cannot bypass that refusal.
         """
         if new_mode == self.trading_mode:
             return

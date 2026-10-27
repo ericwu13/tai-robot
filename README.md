@@ -230,6 +230,13 @@ Notes:
   `TAI_USER_ID` / `TAI_PASSWORD` environment variables override them.
 - `--mode semi_auto` is refused: it needs a human on the 10-second
   order-confirm dialog. Headless modes are `paper` and `auto`.
+- A running headless bot ignores a `mode_override.json` that asks for
+  `auto`, `real`, `semi_auto`, or any other live/real-money mode, even
+  when `trading.allow_live_override` is true. The file is removed (the
+  same consume as a GUI hot-swap) and a warning is logged; the current
+  mode stays as it is. A file that asks for `paper` still applies.
+  `deploy --mode auto` is unchanged — that flag is an explicit deploy
+  choice, not a file drop. The GUI hot-swap path is unchanged.
 - Resume rules match the GUI: `--strategy` on a resumed bot deploys the
   selected strategy (keeps history/watermark); without it the saved strategy
   is used. `--new` refuses to resume, `--resume` refuses to start fresh.
