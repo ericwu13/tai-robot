@@ -324,3 +324,18 @@ def test_server_is_get_only(live_server):
 def test_refuses_non_tailscale_bind(capsys):
     assert server.main(["--bind", "0.0.0.0"]) == 2
     assert "refusing" in capsys.readouterr().err
+
+
+def test_cdn_fallback_defined_before_local_chart_script():
+    """onerror on /static/lwc.js fires before later <script> blocks parse,
+    so the fallback must already exist (blank chart on Steven otherwise)."""
+    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+    assert html.index("function loadCdnCharts") < html.index('src="/static/lwc.js"')
+
+
+def test_missing_local_chart_bundle_is_404(live_server, monkeypatch):
+    monkeypatch.setattr(server.DashboardHandler, "lwc_path", None)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(live_server + "/static/lwc.js")
+    assert exc.value.code == 404
