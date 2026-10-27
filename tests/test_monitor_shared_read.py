@@ -20,12 +20,16 @@ import pytest
 import scripts.monitor.check_bots as cb
 import scripts.monitor.common as common
 from scripts.monitor.check_bots import check_bots
+from scripts.monitor.check_evolution import check_evolution
 from scripts.monitor.check_regime import check_regime
 from src.live.session_store import load_session, save_session
 from src.utils import fileio
 from tests.test_monitor_checks import (
     HEALTHY_STATE, NOW, NOW_IN_SESSION, make_live_bot, make_regime_bot,
     write_heartbeat,
+)
+from tests.test_monitor_evolution import (
+    NOW as EVO_NOW, make_bot, start_line, write_debug_log, write_usage,
 )
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="Windows sharing semantics")
@@ -190,3 +194,55 @@ def test_check_regime_reads_bot_files_only_through_shared_opener(tmp_path, monke
     check_regime(NOW, str(tmp_path / "live"))
     assert {"regime_state.json", "session.json", "regime_history.csv",
             "decisions.csv"} <= opened, opened
+
+
+def test_check_evolution_reads_usage_and_debug_log_only_through_shared_opener(
+        tmp_path, monkeypatch):
+    """ai_usage.csv and the debug-log scan go through the shared opener.
+
+    Plain ``open()`` is forbidden anywhere under the temp tree, which
+    holds the bot directory and the usage ledger. The opened-set check
+    is what keeps the guard from passing without reading those files.
+    """
+    bot = make_bot(tmp_path, name="TMF00_bot")
+    write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:25")])
+    write_usage(tmp_path, [("2026-08-28T21:05:49+00:00", "bot_evolution")])
+    opened = _forbid_plain_open_under(monkeypatch, tmp_path)
+    check_evolution(EVO_NOW, str(tmp_path / "live"), str(tmp_path),
+                    pid_alive_fn=lambda pid: True)
+    assert {"ai_usage.csv", "debug_20260815.log"} <= opened, opened
+
+
+def test_read_json_invalid_utf8_matches_master(tmp_path):
+    """Master opens with strict UTF-8 and returns None.
+
+    ``UnicodeDecodeError`` is a ``ValueError``, so the failure is not
+    raised. The bytes are valid JSON once a lenient decode replaces or
+    drops the bad byte, which is what a ``errors="replace"`` mutant
+    would return instead of None.
+    """
+    path = tmp_path / "session.json"
+    path.write_bytes(b'{"k":"\xff"}')
+    assert common.read_json(str(path)) is None
+
+
+def test_read_lock_pid_unreadable_lock_is_present_without_a_pid(
+        tmp_path, monkeypatch):
+    """An unreadable lock still exists: ``(True, None)``, never ``(False, None)``.
+
+    Invalid bytes decode leniently and then fail ``int()``. An open that
+    raises is swallowed by ``read_text`` and takes the same branch.
+    """
+    bot = tmp_path / "bot"
+    bot.mkdir()
+    lock = bot / ".lock"
+    lock.write_bytes(b"\xff\xfe")
+    assert common.read_lock_pid(str(bot)) == (True, None)
+
+    lock.write_text("4242", encoding="utf-8")
+
+    def raising(path):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(fileio, "open_shared", raising)
+    assert common.read_lock_pid(str(bot)) == (True, None)
