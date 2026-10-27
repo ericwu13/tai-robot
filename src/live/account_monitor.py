@@ -285,9 +285,12 @@ class AccountMonitor:
         # can reset (issue #202). ``_oi_answered_gen == -1`` means nothing
         # has been answered. ``_oi_saw_001`` is this generation's no-data
         # marker; a ``##`` end marker is an empty book only after it.
+        # ``_oi_flat_conflict`` means a position row was already credited
+        # and a later ``001`` disagreed. The book stays UNKNOWN.
         self._oi_query_gen: int = _allocate_oi_generation()
         self._oi_answered_gen: int = -1
         self._oi_saw_001: bool = False
+        self._oi_flat_conflict: bool = False
 
     @property
     def oi_query_generation(self) -> int:
@@ -312,6 +315,7 @@ class AccountMonitor:
         """
         self._oi_query_gen = _allocate_oi_generation()
         self._oi_saw_001 = False
+        self._oi_flat_conflict = False
         self.clear_positions()
         return self._oi_query_gen
 
@@ -321,6 +325,11 @@ class AccountMonitor:
 
     def _mark_oi_answered(self) -> None:
         self._oi_answered_gen = self._oi_query_gen
+
+    def _mark_oi_unknown(self) -> None:
+        """Drop this generation's answer. Rows already stored stay put."""
+        if self._oi_answered_gen == self._oi_query_gen:
+            self._oi_answered_gen = -1
 
     def reset(self) -> None:
         """Clear all state."""
@@ -332,6 +341,7 @@ class AccountMonitor:
         # this reset cannot match the generation allocated here.
         self._oi_answered_gen = -1
         self._oi_saw_001 = False
+        self._oi_flat_conflict = False
         self._oi_query_gen = _allocate_oi_generation()
 
     # ── Position tracking ──
@@ -376,11 +386,14 @@ class AccountMonitor:
 
         ``001`` is an answered empty book. The evidenced flat sequence is
         ``001`` then ``##`` (#139). A ``##`` end marker counts as that
-        empty book only when this generation already saw ``001``. A bare
-        ``##``, or ``970``/``980`` followed by ``##``, leaves the query
-        unanswered. ``##`` after real rows completes the snapshot and
-        does not wipe them. A generation other than the latest query is
-        ``stale`` and changes nothing.
+        empty book only when this generation already saw ``001`` and no
+        position row. A bare ``##``, or ``970``/``980`` followed by ``##``,
+        leaves the query unanswered. ``##`` after real rows completes the
+        snapshot and does not wipe them. A ``001`` (and the ``##`` that
+        follows it) after rows were already credited to this generation
+        is a conflict: the rows stay, and the book is UNKNOWN. A
+        generation other than the latest query is ``stale`` and changes
+        nothing.
         """
         if not self._accepts_oi_generation(generation):
             return "stale"
@@ -391,10 +404,17 @@ class AccountMonitor:
             return "position"
         first = text.split(",")[0].strip() if text else ""
         if first == "001":
+            if self.positions or self._oi_flat_conflict:
+                self._oi_flat_conflict = True
+                self._mark_oi_unknown()
+                return "ignored"
             self._oi_saw_001 = True
             self.set_flat()
             return "flat"
         if first == "##":
+            if self._oi_flat_conflict:
+                self._mark_oi_unknown()
+                return "ignored"
             if self.positions:
                 self._mark_oi_answered()
                 return "end"

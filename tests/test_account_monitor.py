@@ -490,6 +490,30 @@ class TestOiSnapshotFlag:
         assert m.has_open_positions() is True
         assert len(m.positions) == 1
 
+    def test_001_after_credited_rows_stays_unknown(self):
+        """A later ``001``+``##`` must not wipe rows already in this generation.
+
+        Deploy can credit its position row first. An older fill-poll's
+        ``001`` then ``##`` may carry the same generation tag. That pair
+        used to call ``set_flat`` and the book read flat while TXF was open.
+        """
+        m = AccountMonitor()
+        gen = m.begin_oi_query()
+        row = "TF,ACCT,TXFD0,B,1,0,22500.0,15,2,ID"
+        assert m.apply_open_interest(row, generation=gen) == "position"
+        assert m.oi_snapshot_received is True
+        assert m.has_open_positions() is True
+
+        assert m.apply_open_interest("001,查無資料", generation=gen) == "ignored"
+        assert m.oi_snapshot_received is False
+        assert m.has_open_positions() is True
+        assert m.positions[0]["product"] == "TXFD0"
+
+        assert m.apply_open_interest("##", generation=gen) == "ignored"
+        assert m.oi_snapshot_received is False
+        assert m.has_open_positions() is True
+        assert m.positions[0]["product"] == "TXFD0"
+
     def test_stale_reply_not_credited_and_clear_keeps_valid_reply(self):
         """Issue #202: credit a reply only to the latest query.
 
@@ -538,6 +562,46 @@ class TestOiSnapshotFlag:
         assert other != tagged and other != restarted
         assert second.apply_open_interest(row, generation=tagged) == "stale"
         assert second.apply_open_interest(row, generation=restarted) == "stale"
+        assert second.oi_snapshot_received is False
+
+    def test_reset_does_not_rewind_the_generation_clock(self):
+        """Successive generations on one monitor only move forward.
+
+        ``reset()`` assigning generation 0, or zeroing the module clock
+        before the next allocation, reuses a number already issued.
+        """
+        m = AccountMonitor()
+        issued = [m.oi_query_generation]
+        issued.append(m.begin_oi_query())
+        m.reset()
+        issued.append(m.oi_query_generation)
+        issued.append(m.begin_oi_query())
+        assert issued == sorted(set(issued))
+        assert all(b > a for a, b in zip(issued, issued[1:]))
+        row = "TF,ACCT,TXFD0,B,1,0,22500.0,15,2,ID"
+        for old in issued[:-1]:
+            assert m.apply_open_interest(row, generation=old) == "stale"
+        assert m.oi_snapshot_received is False
+
+    def test_new_monitor_does_not_restart_the_generation_clock(self):
+        """A new AccountMonitor continues the process-wide clock.
+
+        A per-instance counter restarts near 1 and accepts a row tagged
+        on an earlier monitor.
+        """
+        first = AccountMonitor()
+        high = first.oi_query_generation
+        high = max(high, first.begin_oi_query())
+        first.reset()
+        high = max(high, first.oi_query_generation, first.begin_oi_query())
+        second = AccountMonitor()
+        assert second.oi_query_generation > high
+        nxt = second.begin_oi_query()
+        assert nxt > high
+        row = "TF,ACCT,TXFD0,B,1,0,22500.0,15,2,ID"
+        assert second.apply_open_interest(row, generation=high) == "stale"
+        assert second.apply_open_interest(
+            row, generation=first.oi_query_generation) == "stale"
         assert second.oi_snapshot_received is False
 
     def test_nonzero_open_interest_code_is_rejected(self):
