@@ -153,7 +153,13 @@ def _forbid_plain_open_under(monkeypatch, root):
 
     def shared(path):
         opened.add(os.path.basename(os.fspath(path)))
-        return real_shared(path)
+        # The non-Windows fallback inside open_shared is itself a builtin
+        # open(); let it through so the guard only trips on direct opens.
+        builtins.open = real_open
+        try:
+            return real_shared(path)
+        finally:
+            builtins.open = plain
 
     monkeypatch.setattr(builtins, "open", plain)
     monkeypatch.setattr(fileio, "open_shared", shared)
