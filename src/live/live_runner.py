@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable
 
@@ -75,11 +75,101 @@ _AM_CLOSE = (13, 45)  # 13:45 — back-month + non-settlement days
 _AM_CLOSE_SETTLEMENT = (13, 30)  # front-month on settlement day (3rd Wed)
 _PM_OPEN = (15, 0)    # 15:00
 # Night session closes at 05:00 next day
+_NIGHT_CLOSE_MIN = 5 * 60
+
+# One warning per process when the holiday/closure lookup raises.
+_holiday_schedule_warned = False
 
 
 def _taipei_now() -> datetime:
     """Return current time in Taipei timezone."""
     return datetime.now(_TZ_TAIPEI)
+
+
+def _as_taipei(dt: datetime | None) -> datetime:
+    """Naive datetimes are Taipei wall time. Aware ones convert to Taipei."""
+    if dt is None:
+        return _taipei_now()
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_TZ_TAIPEI)
+    return dt.astimezone(_TZ_TAIPEI)
+
+
+def _session_open_date(dt: datetime) -> date:
+    """OPEN date of the clock session containing a Taipei ``dt``.
+
+    The 00:00-05:00 night tail belongs to the previous calendar day.
+    Callers use this only when the clock says a session is open, so a
+    Monday-before-05:00 instant never reaches here.
+    """
+    if dt.hour * 60 + dt.minute < _NIGHT_CLOSE_MIN:
+        return (dt - timedelta(days=1)).date()
+    return dt.date()
+
+
+def _clock_session_key(dt: datetime) -> str | None:
+    """Session key from the clock schedule, ignoring the holiday calendar.
+
+    ``dt`` is Taipei time. Weekend rules match the historical
+    ``is_market_open`` clock: Saturday is open only for the 00:00-05:00
+    Friday-night tail, Sunday is closed, and Monday has no night
+    carryover before 05:00.
+    """
+    weekday = dt.weekday()  # Mon=0, Sun=6
+    minutes = dt.hour * 60 + dt.minute
+
+    # Saturday: only the Friday-night tail (00:00-05:00).
+    if weekday == 5:
+        if minutes >= _NIGHT_CLOSE_MIN:
+            return None
+        return f"{_session_open_date(dt).isoformat()}|NIGHT"
+
+    if weekday == 6:
+        return None
+
+    am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]
+    am_close = _AM_CLOSE[0] * 60 + _AM_CLOSE[1]
+    pm_open = _PM_OPEN[0] * 60 + _PM_OPEN[1]
+
+    # Monday: no night carryover (the market was closed Sunday).
+    if weekday == 0 and minutes < _NIGHT_CLOSE_MIN:
+        return None
+    if am_open <= minutes < am_close:
+        return f"{_session_open_date(dt).isoformat()}|DAY"
+    if minutes >= pm_open or minutes < _NIGHT_CLOSE_MIN:
+        return f"{_session_open_date(dt).isoformat()}|NIGHT"
+    return None
+
+
+def session_for(dt: datetime | None = None) -> str | None:
+    """Scheduled session key, or None when that session is closed.
+
+    The key is ``YYYY-MM-DD|DAY`` or ``YYYY-MM-DD|NIGHT``, dated by the
+    session OPEN date (the night tail after midnight keeps the previous
+    day's key). A weekday open date that ``is_taifex_holiday`` reports
+    closed — public calendar or the closures file — yields None. That
+    covers the holiday's DAY and NIGHT sessions and the 00:00-05:00 tail
+    of a night that opened on the holiday. The tail of a night that
+    opened on a trading day stays open (Friday into Saturday, and the
+    night before a Monday holiday).
+
+    If the holiday lookup raises, the clock key is returned (fail open)
+    and one warning is logged for the process (issue #198).
+    """
+    global _holiday_schedule_warned
+    dt = _as_taipei(dt)
+    key = _clock_session_key(dt)
+    if key is None:
+        return None
+    try:
+        from ..market_data.holidays import is_taifex_holiday
+        if is_taifex_holiday(_session_open_date(dt)):
+            return None
+    except Exception as exc:
+        if not _holiday_schedule_warned:
+            _holiday_schedule_warned = True
+            logger.warning("holiday schedule check failed: %s", exc)
+    return key
 
 
 def is_market_open(dt: datetime | None = None) -> bool:
@@ -88,84 +178,58 @@ def is_market_open(dt: datetime | None = None) -> bool:
     Uses Taipei time (UTC+8). Closed on weekends (Sat/Sun).
     Sessions: AM 08:45-13:45, PM/Night 15:00-05:00+1
     Weekend rule: closes Sat 05:00, reopens Mon 08:45.
+    The Sat 00:00-05:00 tail is Friday night.
+
+    Delegates to ``session_for``. A weekday TAIFEX holiday on the
+    session OPEN date is closed, including that night's tail.
     """
-    if dt is None:
-        dt = _taipei_now()
-    elif dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_TZ_TAIPEI)
-
-    weekday = dt.weekday()  # Mon=0, Sun=6
-
-    # Saturday: only night session carryover from Friday (00:00-05:00)
-    if weekday == 5:  # Saturday
-        h, m = dt.hour, dt.minute
-        return h * 60 + m < 5 * 60
-
-    # Sunday: fully closed
-    if weekday == 6:
-        return False
-
-    h, m = dt.hour, dt.minute
-    t = h * 60 + m
-
-    am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]     # 525
-    am_close = _AM_CLOSE[0] * 60 + _AM_CLOSE[1]   # 825
-    pm_open = _PM_OPEN[0] * 60 + _PM_OPEN[1]      # 900
-    night_close = 5 * 60                            # 300
-
-    # Monday: no night carryover (market was closed Sun)
-    if weekday == 0 and t < night_close:
-        return False
-
-    if am_open <= t < am_close:
-        return True
-    if t >= pm_open:
-        return True
-    if t < night_close:
-        return True
-    return False
+    return session_for(dt) is not None
 
 
-def seconds_until_market_open() -> int:
+def _next_session_open(now: datetime) -> datetime | None:
+    """First later DAY 08:45 or NIGHT 15:00 that ``session_for`` calls open.
+
+    ``now`` is Taipei time and the market is closed. Skipping a whole
+    holiday (or a Monday holiday's night tail) lands on the next session
+    that actually trades, not on the next clock boundary.
+    """
+    for ahead in range(16):
+        day = (now + timedelta(days=ahead)).date()
+        for hour, minute in (_AM_OPEN, _PM_OPEN):
+            open_dt = datetime(
+                day.year, day.month, day.day, hour, minute, tzinfo=_TZ_TAIPEI,
+            )
+            if open_dt <= now:
+                continue
+            if session_for(open_dt) is not None:
+                return open_dt
+    return None
+
+
+def seconds_until_market_open(now: datetime | None = None) -> int:
     """Return seconds until the next market session opens, or 0 if already open.
 
     Sessions: AM 08:45-13:45, PM/Night 15:00-05:00+1.
-    Reconnect should be scheduled ~2 min before open to allow login time.
+    The target is the first later instant ``session_for`` reports open, so
+    a 00:00-05:00 tail after a weekday holiday waits for that morning's
+    08:45 when that day trades (issue #198). Reconnect should be scheduled
+    ~2 min before open to allow login time.
     """
-    now = _taipei_now()
-    if is_market_open(now):
+    now = _as_taipei(now)
+    if session_for(now) is not None:
         return 0
-
-    weekday = now.weekday()
-    h, m = now.hour, now.minute
-    t = h * 60 + m
-
-    am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]   # 525
-    pm_open = _PM_OPEN[0] * 60 + _PM_OPEN[1]    # 900
-
-    # Sunday: next open is Monday 08:45
-    if weekday == 6:
+    nxt = _next_session_open(now)
+    if nxt is None:
+        # No session inside the lookahead. Keep a finite delay so a caller
+        # does not treat a closed market as already open.
+        am_open = _AM_OPEN[0] * 60 + _AM_OPEN[1]
+        t = now.hour * 60 + now.minute
         return (24 * 60 - t + am_open) * 60
-
-    # Saturday after 05:00: next open is Monday 08:45
-    if weekday == 5:
-        return ((24 * 60 - t) + 24 * 60 + am_open) * 60
-
-    # Weekday gaps:
-    # 05:00-08:45 → next open at 08:45 (AM)
-    if 5 * 60 <= t < am_open:
-        return (am_open - t) * 60
-
-    # 13:45-15:00 → next open at 15:00 (PM/Night)
-    if _AM_CLOSE[0] * 60 + _AM_CLOSE[1] <= t < pm_open:
-        return (pm_open - t) * 60
-
-    # Monday 00:00-05:00 (closed, no Fri carryover)
-    if weekday == 0 and t < 5 * 60:
-        return (am_open - t) * 60
-
-    # Fallback: try AM open tomorrow
-    return (24 * 60 - t + am_open) * 60
+    delta = (nxt - now).total_seconds()
+    secs = int(delta)
+    if now + timedelta(seconds=secs) < nxt:
+        secs += 1
+    return max(0, secs)
 
 
 def _am_close_minutes(order_symbol: str | None = None,
