@@ -1,4 +1,4 @@
-"""One RequestTicks resubscribe per session while quote-stuck DEGRADED.
+"""One recovery attempt per session while quote-stuck DEGRADED.
 
 The retry key is ``session_for``'s open-date key, held on
 ``QuoteStuckRecovery`` for the process. LeaveMonitor / login are not
@@ -228,6 +228,60 @@ def test_host_sends_request_ticks_once_per_session(monkeypatch):
     at_time(_t(2026, 10, 27, 15))
     app._maybe_quote_stuck_resubscribe()
     assert sent == ["ticks", "ticks"]
+
+
+def test_clear_stuck_ignores_other_degrade_reasons():
+    from tests.test_link_state_machine import pair
+
+    machine, _fake = pair()
+    machine.degraded = True
+    machine.degraded_reason = "login_failures"
+    machine.entries_blocked = True
+    machine.orders_paused = True
+    machine.quote = LinkPhase.READY
+    assert machine.clear_stuck_after_ticks() is None
+    assert machine.degraded
+    assert machine.degraded_reason == "login_failures"
+    assert machine.entries_blocked
+    assert machine.orders_paused
+    assert machine.quote == LinkPhase.READY
+
+
+def test_clear_stuck_does_not_unblock_until_reply_reconciled():
+    from tests.test_link_state_machine import pair
+
+    machine, _fake = pair()
+    machine.degraded = True
+    machine.degraded_reason = "stuck"
+    machine.entries_blocked = True
+    machine.orders_paused = True
+    machine.quote = LinkPhase.DOWN
+    machine.reply = LinkPhase.READY
+    machine.reply_reconciled = False
+    alert = machine.clear_stuck_after_ticks()
+    assert alert == "RECOVERED: ticks resumed after quote resubscribe"
+    assert not machine.degraded
+    assert machine.quote == LinkPhase.READY
+    assert machine.entries_blocked
+    assert machine.orders_paused
+
+
+def test_live_tick_consumes_the_awaiting_flag():
+    recovery = QuoteStuckRecovery()
+    assert _consider(recovery, _t(2026, 10, 27, 10)) == "resubscribe"
+    assert recovery.on_live_tick() is True
+    assert recovery.on_live_tick() is False
+
+
+def test_entering_degraded_clears_the_previous_quote_probe():
+    from tests.test_link_state_machine import pair
+
+    machine, _fake = pair()
+    machine.last_quote_is_connected = 2
+    machine._degrade(_t(2026, 10, 27, 10), "stuck")
+    assert machine.degraded
+    assert machine.degraded_reason == "stuck"
+    assert machine.last_quote_is_connected is None
 
 
 def test_host_live_tick_clears_degraded():

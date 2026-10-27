@@ -1,9 +1,11 @@
-"""One market-data resubscribe per open session while quote-stuck DEGRADED.
+"""One recovery attempt per open session while quote-stuck DEGRADED.
 
 The link machine (#178) enters DEGRADED with reason ``stuck`` and then
 only probes ``IsConnected``. When that read is 1 or 2 the quote link is
 still up, so the recovery is the existing RequestTicks resubscribe, not
-LeaveMonitor, EnterMonitor, login, or logout.
+LeaveMonitor, EnterMonitor, login, or logout. This object decides once.
+The host's RequestTicks helper may still retry a return code >= 3000
+on its own.
 
 The retry key is ``session_for``'s open-date key (``YYYY-MM-DD|DAY`` or
 ``YYYY-MM-DD|NIGHT``). It lives on this object, which the app holds for
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class QuoteStuckRecovery:
-    """Decides the one-shot resubscribe. Does not call the broker."""
+    """Decides the one recovery attempt per session. Does not call the broker."""
 
     def __init__(self) -> None:
         self._attempted_key: str | None = None

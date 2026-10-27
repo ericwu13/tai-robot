@@ -1815,9 +1815,11 @@ class BacktestApp:
         self._maybe_quote_stuck_resubscribe()
 
     def _maybe_quote_stuck_resubscribe(self) -> None:
-        """One RequestTicks resubscribe per open session while quote-stuck.
+        """One recovery attempt per open session while quote-stuck.
 
-        LeaveMonitor, EnterMonitor, login, and logout are not called.
+        The decision fires once. ``_resubscribe_ticks`` may still retry
+        RequestTicks when the return code is >= 3000. LeaveMonitor,
+        EnterMonitor, login, and logout are not called.
         The link machine stays DEGRADED until a live tick or a manual
         Reconnect. A closed session, including a holiday or a closures
         file date, does not consume the session key.
@@ -2127,7 +2129,8 @@ class BacktestApp:
         self._ticks_requested_at: float = 0.0
         self._first_tick_after_request_logged: bool = False
         self._tick_watchdog = TickWatchdog()  # tick health monitoring
-        # One RequestTicks resubscribe per session while quote-stuck DEGRADED.
+        # One recovery attempt per session while quote-stuck DEGRADED.
+        # _resubscribe_ticks may retry a >=3000 code on its own.
         # The key lives here for the process; a restart may try again.
         self._quote_stuck = QuoteStuckRecovery()
         self._live_poll_id = None  # root.after() id for cancellation

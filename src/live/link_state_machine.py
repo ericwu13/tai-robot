@@ -362,7 +362,7 @@ class LinkStateMachine:
         self._arm_reply_stuck_after_manual(now)
 
     def clear_stuck_after_ticks(self) -> str | None:
-        """Live ticks after the one-shot resubscribe. Clears stuck DEGRADED.
+        """Live ticks after the one recovery attempt. Clears stuck DEGRADED.
 
         Does not call the broker: no LeaveMonitor, EnterMonitor, Login,
         logout, or ConnectByID. Other degrade reasons stay. A quote that
@@ -844,6 +844,9 @@ class LinkStateMachine:
             return
         self.degraded = True
         self.degraded_reason = reason
+        # The previous episode's probe must not authorise a recovery
+        # before this episode has read IsConnected for itself.
+        self.last_quote_is_connected = None
         self.entries_blocked = True
         self.orders_paused = True
         self._login_permitted = False

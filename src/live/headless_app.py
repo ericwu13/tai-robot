@@ -38,8 +38,9 @@ from src.live.headless import (
     EXIT_BACKTEST_FAILED, EXIT_BOT_STOPPED, EXIT_DEPLOY_REFUSED, EXIT_LOGIN,
     EXIT_NO_COM, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE,
     HeadlessConfigError, HeadlessPolicy, apply_control_command,
-    build_deploy_request, clear_stop_file, consume_control_file,
-    policy_from_args, resolve_strategy_name, stop_requested,
+    archive_stale_control, build_deploy_request, clear_stop_file,
+    consume_control_file, policy_from_args, resolve_strategy_name,
+    stop_requested,
 )
 from src.live.live_runner import LiveRunner
 from src.live.session_store import load_session
@@ -255,6 +256,9 @@ class DeployDriver(_Driver):
                 or self.app.status_var.get()
             self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
             return
+        archived = archive_stale_control(self.bot_dir)
+        if archived:
+            rb._log(f"[HEADLESS] archived stale CONTROL to {archived}")
         rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP, "
                 f"CONTROL, and Ctrl+C every 2s")
         self.root.after(self.POLL_MS, self._poll)
@@ -262,6 +266,18 @@ class DeployDriver(_Driver):
     def _poll(self) -> None:
         if self.exit_code is not None:
             return
+        try:
+            self._poll_once()
+        except Exception as e:
+            rb._log(f"[HEADLESS] poll failed: [{type(e).__name__}] {e}")
+        finally:
+            # A CONTROL decode error or a raising reconnect must not be
+            # the last poll. Stop and bot-stopped set exit_code first,
+            # so they do not schedule another turn.
+            if self.exit_code is None:
+                self.root.after(self.POLL_MS, self._poll)
+
+    def _poll_once(self) -> None:
         app = self.app
         if self._stop_flag or stop_requested(self.bot_dir):
             why = "signal" if self._stop_flag else "STOP file"
@@ -276,7 +292,10 @@ class DeployDriver(_Driver):
         if app._live_runner is None:
             self.finish(EXIT_BOT_STOPPED, "bot stopped on its own — see the debug log")
             return
-        self._poll_control()
+        try:
+            self._poll_control()
+        except Exception as e:
+            rb._log(f"[HEADLESS] CONTROL failed: [{type(e).__name__}] {e}")
         hb = self.args.heartbeat_min
         if hb and time.monotonic() - self._last_heartbeat >= hb * 60:
             self._last_heartbeat = time.monotonic()
@@ -299,7 +318,6 @@ class DeployDriver(_Driver):
                         f"{link}")
             except Exception as e:
                 rb._log(f"[HEADLESS] heartbeat failed: {e}")
-        self.root.after(self.POLL_MS, self._poll)
 
     def _poll_control(self) -> None:
         """Apply ``CONTROL`` once. ``auto`` and ``real`` are rejected."""

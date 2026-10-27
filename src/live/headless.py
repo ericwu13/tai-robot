@@ -36,6 +36,7 @@ CLI_COMMANDS = frozenset({
 STOP_FILENAME = "STOP"
 CONTROL_FILENAME = "CONTROL"
 CONTROL_ACK_FILENAME = "CONTROL.ack"
+CONTROL_STALE_FILENAME = "CONTROL.stale"
 
 # Exit codes (documented in README "Headless CLI")
 EXIT_OK = 0
@@ -199,6 +200,9 @@ def clear_stop_file(bot_dir: str) -> None:
 # to ``CONTROL.ack`` before applying it, so a command runs once.
 # Accepted lines: ``reconnect`` and ``set-mode paper``.
 # ``set-mode auto``, ``set-mode real``, and anything else are rejected.
+# UTF-8 (with or without a BOM) and UTF-16 with a BOM are accepted.
+# A file already present at deploy is renamed to ``CONTROL.stale`` and
+# is not applied.
 
 def control_file_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, CONTROL_FILENAME)
@@ -206,6 +210,22 @@ def control_file_path(bot_dir: str) -> str:
 
 def control_ack_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, CONTROL_ACK_FILENAME)
+
+
+def control_stale_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, CONTROL_STALE_FILENAME)
+
+
+def _decode_control_bytes(data: bytes) -> str:
+    """Decode CONTROL text. PowerShell 5.1 ``echo`` writes UTF-16 LE + BOM.
+
+    A UTF-8 BOM is stripped. Bytes that are not valid in the chosen
+    encoding are replaced, so a bad file still becomes text the caller
+    can reject.
+    """
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("utf-8-sig", errors="replace")
 
 
 def parse_control_command(text: str) -> tuple[str, str | None]:
@@ -233,22 +253,44 @@ def consume_control_file(bot_dir: str) -> str | None:
     """Read ``CONTROL`` and rename it to ``CONTROL.ack``.
 
     Returns the file text, or None when there is no file (including a
-    second call). The rename happens before the caller applies the
-    command, so a crash cannot apply it twice.
+    second call) or the file could not be read or renamed. A file that
+    was read is always renamed, including when the bytes are not valid
+    text: the returned string is then something ``parse_control_command``
+    rejects. The rename happens before the caller applies the command,
+    so a crash cannot apply it twice.
     """
     path = control_file_path(bot_dir)
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        with open(path, "rb") as f:
+            data = f.read()
     except OSError:
         return None
+    try:
+        text = _decode_control_bytes(data)
+    except (OSError, ValueError, UnicodeError):
+        text = "\ufffd"
     try:
         os.replace(path, control_ack_path(bot_dir))
     except OSError:
         return None
     return text
+
+
+def archive_stale_control(bot_dir: str) -> str | None:
+    """Rename a pre-existing ``CONTROL`` to ``CONTROL.stale``.
+
+    Returns the archive path, or None when there was no file. A deploy
+    calls this so a command left from the previous run is not applied
+    on the first poll.
+    """
+    path = control_file_path(bot_dir)
+    if not os.path.isfile(path):
+        return None
+    stale = control_stale_path(bot_dir)
+    os.replace(path, stale)
+    return stale
 
 
 def apply_control_command(

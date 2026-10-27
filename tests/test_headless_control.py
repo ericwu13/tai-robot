@@ -172,6 +172,137 @@ def test_readme_documents_the_control_file():
     text = Path("README.md").read_text(encoding="utf-8")
     assert "data/live/{symbol}_{bot}/CONTROL" in text
     assert "CONTROL.ack" in text
+    assert "CONTROL.stale" in text
     assert "set-mode paper" in text
     assert "set-mode auto" in text
     assert "set-mode real" in text
+
+
+def _poll_driver(bot, runner, reconnect):
+    from src.live.headless_app import DeployDriver
+
+    driver = DeployDriver.__new__(DeployDriver)
+    driver.bot_dir = bot
+    driver.exit_code = None
+    driver._stop_flag = False
+    driver._stop_via_us = False
+    driver._last_heartbeat = 0.0
+    driver.args = type("Args", (), {"heartbeat_min": 0})()
+    scheduled = []
+
+    class _Root:
+        def after(self, ms, fn):
+            scheduled.append((ms, fn))
+
+        def quit(self):
+            return None
+
+    driver.root = _Root()
+    driver.app = type("A", (), {})()
+    driver.app._manual_reconnect = reconnect
+    driver.app._live_runner = runner
+    driver.app._stop_live = lambda: None
+    driver.scheduled = scheduled
+    return driver
+
+
+def _rescheduled(driver):
+    return [fn for _ms, fn in driver.scheduled if fn == driver._poll]
+
+
+def test_utf16_reconnect_is_applied_and_acked(tmp_path):
+    bot = str(tmp_path / "TX00_ps")
+    os.makedirs(bot)
+    path = control_file_path(bot)
+    with open(path, "wb") as f:
+        f.write("reconnect\r\n".encode("utf-16"))
+    called = []
+    driver = _poll_driver(bot, _runner(tmp_path), lambda: called.append("reconnect"))
+    driver._poll()
+    assert called == ["reconnect"]
+    assert not os.path.exists(path)
+    assert os.path.isfile(control_ack_path(bot))
+    assert _rescheduled(driver) == [driver._poll]
+    text = Path(control_ack_path(bot)).read_bytes()
+    assert text.startswith((b"\xff\xfe", b"\xfe\xff"))
+
+
+def test_utf8_bom_reconnect_is_applied(tmp_path):
+    bot = str(tmp_path / "TX00_bom")
+    path = _write(bot, "")
+    with open(path, "wb") as f:
+        f.write(b"\xef\xbb\xbfreconnect\n")
+    text = consume_control_file(bot)
+    result, calls, _logs = _apply(text)
+    assert result == "reconnect"
+    assert calls["reconnect"] == 1
+    assert not os.path.exists(path)
+
+
+def test_garbage_control_is_acked_and_the_poll_continues(tmp_path):
+    bot = str(tmp_path / "TX00_bin")
+    os.makedirs(bot)
+    path = control_file_path(bot)
+    with open(path, "wb") as f:
+        f.write(b"\x80\x81\xff\x00not-a-command")
+    called = []
+    driver = _poll_driver(bot, _runner(tmp_path), lambda: called.append("reconnect"))
+    driver._poll()
+    assert called == []
+    assert not os.path.exists(path)
+    assert os.path.isfile(control_ack_path(bot))
+    assert _rescheduled(driver) == [driver._poll]
+    driver.scheduled.clear()
+    driver._poll()
+    assert driver.exit_code is None
+    assert _rescheduled(driver) == [driver._poll]
+
+
+def test_raising_reconnect_keeps_the_poll_alive_and_stop_works(tmp_path):
+    from src.live.headless import EXIT_OK, request_stop
+
+    bot = str(tmp_path / "TX00_boom")
+    _write(bot, "reconnect\n")
+
+    def boom():
+        raise RuntimeError("reconnect blew up")
+
+    stopped = []
+    driver = _poll_driver(bot, _runner(tmp_path), boom)
+    driver.app._stop_live = lambda: stopped.append("stopped")
+    driver._poll()
+    assert driver.exit_code is None
+    assert _rescheduled(driver) == [driver._poll]
+    assert not os.path.exists(control_file_path(bot))
+    driver.scheduled.clear()
+    request_stop(bot, "test")
+    driver._poll()
+    assert stopped == ["stopped"]
+    assert driver.exit_code == EXIT_OK
+    assert _rescheduled(driver) == []
+
+
+def test_deploy_archives_stale_control(tmp_path):
+    from src.live.headless_app import DeployDriver
+
+    bot = str(tmp_path / "TX00_stale")
+    path = _write(bot, "set-mode paper\n")
+    driver = DeployDriver.__new__(DeployDriver)
+    driver.bot_dir = bot
+    driver.req = object()
+    scheduled = []
+
+    class _Root:
+        def after(self, ms, fn):
+            scheduled.append((ms, fn))
+
+    driver.root = _Root()
+    driver.app = type("A", (), {})()
+    driver.app._deploy_live_from = lambda req: True
+    driver.app._live_runner = object()
+    driver.app.alerts = []
+    driver._deploy()
+    assert not os.path.exists(path)
+    stale = Path(bot) / "CONTROL.stale"
+    assert stale.read_text(encoding="utf-8").strip() == "set-mode paper"
+    assert scheduled and scheduled[0][1] == driver._poll

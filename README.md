@@ -251,8 +251,12 @@ Notes:
   `set-mode paper` switches the running bot to paper and honours the
   mode-switch veto (an open fill, for example, keeps the current mode).
   `set-mode auto`, `set-mode real`, and any other text are rejected and
-  logged, including when `allow_live_override` is set. GUI bots do not
-  read this file.
+  logged, including when `allow_live_override` is set. A UTF-8 BOM and
+  UTF-16 with a BOM (what Windows PowerShell 5.1 writes for
+  `echo reconnect > CONTROL`) are both read. A `CONTROL` file already
+  in the bot directory when the bot is deployed is renamed to
+  `CONTROL.stale` and is not applied; write the command after the bot
+  is running. GUI bots do not read this file.
 - `--detach` re-runs the command as a detached child (stdout appended to
   `data/live/{symbol}_{bot}/cli_stdout.log`) and, with `--wait-ready N`,
   returns `0` once the child owns the lock and logged `Tick subscription
