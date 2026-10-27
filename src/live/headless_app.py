@@ -17,6 +17,9 @@ The drivers (``run_deploy`` / ``run_backtest``) sequence login → ready →
 deploy → poll on ``root.after`` and report an exit code. The STOP file in
 the bot directory (``run_bot_cli.py stop``) and Ctrl+C both trigger the
 GUI's normal ``_stop_live`` (force-close, session save, daily report).
+A ``CONTROL`` file in that directory is consumed once per poll:
+``reconnect`` calls ``_manual_reconnect``; ``set-mode paper`` calls
+``_apply_mode_switch``. ``auto`` and ``real`` are rejected.
 """
 
 from __future__ import annotations
@@ -34,8 +37,9 @@ from src.live.deploy_request import DeployRequest
 from src.live.headless import (
     EXIT_BACKTEST_FAILED, EXIT_BOT_STOPPED, EXIT_DEPLOY_REFUSED, EXIT_LOGIN,
     EXIT_NO_COM, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE,
-    HeadlessConfigError, HeadlessPolicy, build_deploy_request,
-    clear_stop_file, policy_from_args, resolve_strategy_name, stop_requested,
+    HeadlessConfigError, HeadlessPolicy, apply_control_command,
+    build_deploy_request, clear_stop_file, consume_control_file,
+    policy_from_args, resolve_strategy_name, stop_requested,
 )
 from src.live.live_runner import LiveRunner
 from src.live.session_store import load_session
@@ -251,8 +255,8 @@ class DeployDriver(_Driver):
                 or self.app.status_var.get()
             self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
             return
-        rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP "
-                "and Ctrl+C every 2s")
+        rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP, "
+                f"CONTROL, and Ctrl+C every 2s")
         self.root.after(self.POLL_MS, self._poll)
 
     def _poll(self) -> None:
@@ -272,6 +276,7 @@ class DeployDriver(_Driver):
         if app._live_runner is None:
             self.finish(EXIT_BOT_STOPPED, "bot stopped on its own — see the debug log")
             return
+        self._poll_control()
         hb = self.args.heartbeat_min
         if hb and time.monotonic() - self._last_heartbeat >= hb * 60:
             self._last_heartbeat = time.monotonic()
@@ -295,6 +300,26 @@ class DeployDriver(_Driver):
             except Exception as e:
                 rb._log(f"[HEADLESS] heartbeat failed: {e}")
         self.root.after(self.POLL_MS, self._poll)
+
+    def _poll_control(self) -> None:
+        """Apply ``CONTROL`` once. ``auto`` and ``real`` are rejected."""
+        text = consume_control_file(self.bot_dir)
+        if text is None:
+            return
+        runner = self.app._live_runner
+
+        def set_mode(mode: str) -> None:
+            if runner is None:
+                rb._log("[HEADLESS] CONTROL set-mode ignored — no runner")
+                return
+            runner._apply_mode_switch(mode)
+
+        apply_control_command(
+            text,
+            reconnect=self.app._manual_reconnect,
+            set_mode=set_mode,
+            log=lambda msg: rb._log(f"[HEADLESS] {msg}"),
+        )
 
 
 class BacktestDriver(_Driver):

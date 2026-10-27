@@ -1,9 +1,9 @@
 """Pure helpers for the headless bot CLI (``run_bot_cli.py``).
 
 Nothing in here imports Tk or COM — argument parsing, request building,
-strategy-name resolution, the STOP-file control channel, and the bot
-directory scan are all plain functions so they can be unit-tested and
-reused by scripts/monitor. The Tk-bound driver lives in
+strategy-name resolution, the STOP-file and CONTROL-file channels, and
+the bot directory scan are all plain functions so they can be unit-tested
+and reused by scripts/monitor. The Tk-bound driver lives in
 ``src/live/headless_app.py``.
 """
 
@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -33,6 +34,8 @@ CLI_COMMANDS = frozenset({
 })
 
 STOP_FILENAME = "STOP"
+CONTROL_FILENAME = "CONTROL"
+CONTROL_ACK_FILENAME = "CONTROL.ack"
 
 # Exit codes (documented in README "Headless CLI")
 EXIT_OK = 0
@@ -188,6 +191,93 @@ def clear_stop_file(bot_dir: str) -> None:
         os.remove(stop_file_path(bot_dir))
     except OSError:
         pass
+
+
+# ── CONTROL-file channel (headless only) ──
+#
+# One command in ``{bot_dir}/CONTROL``. The running bot renames the file
+# to ``CONTROL.ack`` before applying it, so a command runs once.
+# Accepted lines: ``reconnect`` and ``set-mode paper``.
+# ``set-mode auto``, ``set-mode real``, and anything else are rejected.
+
+def control_file_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, CONTROL_FILENAME)
+
+
+def control_ack_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, CONTROL_ACK_FILENAME)
+
+
+def parse_control_command(text: str) -> tuple[str, str | None]:
+    """Return ``(kind, arg)``.
+
+    ``kind`` is ``reconnect``, ``set-mode``, or ``reject``. ``arg`` is
+    ``paper`` for a paper switch, or the rejected line.
+    """
+    line = ""
+    for raw in (text or "").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        line = stripped
+        break
+    parts = line.split()
+    if parts == ["reconnect"]:
+        return "reconnect", None
+    if parts == ["set-mode", "paper"]:
+        return "set-mode", "paper"
+    return "reject", line
+
+
+def consume_control_file(bot_dir: str) -> str | None:
+    """Read ``CONTROL`` and rename it to ``CONTROL.ack``.
+
+    Returns the file text, or None when there is no file (including a
+    second call). The rename happens before the caller applies the
+    command, so a crash cannot apply it twice.
+    """
+    path = control_file_path(bot_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    try:
+        os.replace(path, control_ack_path(bot_dir))
+    except OSError:
+        return None
+    return text
+
+
+def apply_control_command(
+    text: str,
+    *,
+    reconnect: Callable[[], None],
+    set_mode: Callable[[str], None],
+    log: Callable[[str], None],
+) -> str:
+    """Apply one consumed command.
+
+    ``set-mode paper`` calls ``set_mode`` (the live runner's
+    ``_apply_mode_switch``), which honours ``mode_switch_veto``.
+    ``set-mode auto``, ``set-mode real``, and any other text are
+    rejected here — ``allow_live_override`` is not consulted.
+    Returns ``reconnect``, ``set-mode paper``, or ``reject``.
+    """
+    kind, arg = parse_control_command(text)
+    if kind == "reconnect":
+        log("CONTROL reconnect")
+        reconnect()
+        return "reconnect"
+    if kind == "set-mode" and arg == "paper":
+        log("CONTROL set-mode paper")
+        set_mode("paper")
+        return "set-mode paper"
+    shown = arg if arg else (text or "").strip()
+    log(f"CONTROL rejected: {shown!r}")
+    return "reject"
 
 
 # ── Detached launch (deploy --detach) ──

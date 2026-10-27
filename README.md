@@ -238,6 +238,21 @@ Notes:
   `--allow-existing-position` is given.
 - Ctrl+C is the same as `stop`. Only CLI-started bots poll the STOP file; a
   GUI bot is stopped from the workbench.
+- A running headless bot also polls `data/live/{symbol}_{bot}/CONTROL`
+  every 2 seconds. Write one line; the bot renames the file to
+  `CONTROL.ack` and applies it once:
+
+  ```
+  reconnect
+  set-mode paper
+  ```
+
+  `reconnect` uses the same path as the workbench Reconnect button.
+  `set-mode paper` switches the running bot to paper and honours the
+  mode-switch veto (an open fill, for example, keeps the current mode).
+  `set-mode auto`, `set-mode real`, and any other text are rejected and
+  logged, including when `allow_live_override` is set. GUI bots do not
+  read this file.
 - `--detach` re-runs the command as a detached child (stdout appended to
   `data/live/{symbol}_{bot}/cli_stdout.log`) and, with `--wait-ready N`,
   returns `0` once the child owns the lock and logged `Tick subscription

@@ -130,6 +130,7 @@ from src.live.connection_monitor import ConnectionMonitor
 from src.live.com_broker_port import ComBrokerPort
 from src.live.link_host import adopt_after_process_login
 from src.live.link_state_machine import KIND_CONN_ERROR
+from src.live.quote_stuck_recovery import QuoteStuckRecovery
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
     RealFillTracker, parse_fulfill_report, match_fill_in_report,
@@ -1811,6 +1812,57 @@ class BacktestApp:
             self._on_link_alert(alert)
         if alerts or force:
             self._publish_link_heartbeat()
+        self._maybe_quote_stuck_resubscribe()
+
+    def _maybe_quote_stuck_resubscribe(self) -> None:
+        """One RequestTicks resubscribe per open session while quote-stuck.
+
+        LeaveMonitor, EnterMonitor, login, and logout are not called.
+        The link machine stays DEGRADED until a live tick or a manual
+        Reconnect. A closed session, including a holiday or a closures
+        file date, does not consume the session key.
+        """
+        host = getattr(self, "_link_host", None)
+        recovery = getattr(self, "_quote_stuck", None)
+        if host is None or recovery is None:
+            return
+        machine = host.machine
+        decision = recovery.consider(
+            degraded=machine.degraded,
+            reason=machine.degraded_reason,
+            quote_state=machine.last_quote_is_connected,
+            now=_taipei_now(),
+        )
+        if decision != "resubscribe":
+            return
+        _log(
+            f"[QUOTE-STUCK] one resubscribe for {recovery.attempted_key} "
+            f"(IsConnected={machine.last_quote_is_connected}); no reconnect"
+        )
+        if not getattr(self, "_live_runner", None):
+            _log("[QUOTE-STUCK] resubscribe not sent — no live runner; "
+                 "staying DEGRADED")
+            return
+        self._resubscribe_ticks()
+        _log("[QUOTE-STUCK] RequestTicks sent; waiting for ticks")
+
+    def _clear_quote_stuck_if_ticks_resumed(self) -> None:
+        """A live tick after the one-shot. Clears stuck DEGRADED only."""
+        recovery = getattr(self, "_quote_stuck", None)
+        if recovery is None or not recovery.on_live_tick():
+            return
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            _log("[QUOTE-STUCK] ticks resumed; link machine absent; "
+                 "staying DEGRADED")
+            return
+        alert = host.machine.clear_stuck_after_ticks()
+        if not alert:
+            _log("[QUOTE-STUCK] ticks resumed; DEGRADED already clear")
+            return
+        _log(f"[RECONNECT] {alert}")
+        self._apply_link_gate()
+        self._publish_link_heartbeat()
 
     def _apply_link_gate(self) -> None:
         host = getattr(self, "_link_host", None)
@@ -2075,6 +2127,9 @@ class BacktestApp:
         self._ticks_requested_at: float = 0.0
         self._first_tick_after_request_logged: bool = False
         self._tick_watchdog = TickWatchdog()  # tick health monitoring
+        # One RequestTicks resubscribe per session while quote-stuck DEGRADED.
+        # The key lives here for the process; a restart may try again.
+        self._quote_stuck = QuoteStuckRecovery()
         self._live_poll_id = None  # root.after() id for cancellation
         self._last_status_poll_wall: float = 0.0  # freeze/wake detection (issue #98)
         self._live_warmup_mode: bool = False
@@ -9240,8 +9295,10 @@ class BacktestApp:
             # Issue #179: a stale replay tick restarts the staleness clock
             # (that is why a silent day reconnects about every 10 min) but
             # is not a live tick, so it must not clear the zero-tick streak.
-            self._tick_watchdog.on_tick(
-                live=tick_age <= HISTORY_STALENESS_SECONDS)
+            live_tick = tick_age <= HISTORY_STALENESS_SECONDS
+            self._tick_watchdog.on_tick(live=live_tick)
+            if live_tick:
+                self._clear_quote_stuck_if_ticks_resumed()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
             # earlier doesn't carry over.
