@@ -36,6 +36,42 @@ class TestStart:
         assert fp.active
         assert fp.pos_before == 0
 
+    def test_start_replaces_stale_resume_settings(self):
+        """A later start() must not keep the previous resume sign.
+
+        Mutant G11: delete the expected_sign/resumed assignments in
+        start(). The next live order inherits resumed=True and a long
+        sign, so a short fill is rejected and a normal timeout refuses
+        to confirm.
+        """
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", -1, expected_sign=1, resumed=True)
+        assert fp._expected_sign == 1
+        assert fp._resumed is True
+
+        g.on_fill_pending("entry")
+        action = fp.start("entry", 0)
+        assert action.type == "start_polling"
+        assert fp._expected_sign is None
+        assert fp._resumed is False
+        confirmed = fp.on_position_update(-1)
+        assert confirmed is not None and confirmed.type == "confirmed"
+
+    def test_start_replaces_resume_settings_when_com_is_down(self):
+        """The no-COM return is still a start(). It must wipe the stale sign.
+
+        A mutant that assigns expected_sign only after the COM check
+        leaves the previous resume settings in place.
+        """
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", -1, expected_sign=1, resumed=True)
+        action = fp.start("entry", 0, com_available=False)
+        assert action.type == "no_com"
+        assert fp._expected_sign is None
+        assert fp._resumed is False
+
     def test_normal_exit(self):
         fp, g = _make_poller()
         action = fp.start("exit", 1)

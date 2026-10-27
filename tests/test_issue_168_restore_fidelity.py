@@ -844,42 +844,70 @@ def test_flat_sim_deferred_long_does_not_confirm_real_short(monkeypatch):
     assert verdict == guard.BLOCK_FILL_PENDING
 
 
-def test_flat_deferred_close_missing_book_drops_close(monkeypatch):
-    """Flat sim + saved close: no snapshot, or no COM, drops the close.
+def test_flat_deferred_close_without_com_is_dropped(monkeypatch):
+    """Flat sim + saved close + COM down: drop the close, do not arm.
 
-    Arming either way has no position side to constrain the poller, so
-    the close must not be left for a later confirm to replay.
+    ``start()`` would auto-confirm with no fill. There is no later
+    snapshot that can safely re-arm, so the close must not be left
+    for a confirm to replay.
     """
     import run_backtest as rb
 
-    cases = (
-        ("snapshot", True, False, 0),
-        ("com", False, True, 1),
+    app = _resume_guard_app(position_size=0)
+    app._account_monitor = SimpleNamespace(
+        get_signed_position=lambda prefix: 1,
+        oi_snapshot_received=True,
+        positions=[],
     )
-    for name, com_on, snapshot, signed in cases:
-        app = _resume_guard_app(position_size=0)
-        app._account_monitor = SimpleNamespace(
-            get_signed_position=lambda prefix, signed=signed: signed,
-            oi_snapshot_received=snapshot,
-            positions=[],
-        )
-        monkeypatch.setattr(rb, "_com_available", com_on)
-        if com_on:
-            monkeypatch.setattr(rb, "skO", object())
-        app._reconcile_resumed_guard(
-            _guard_session("entry", {
-                "action": "TRADE_CLOSE", "side": "LONG", "price": 22400,
-            }),
-            "auto",
-            "TX00",
-        )
-        guard = app._trading_guard
-        assert app._fill_poller.active is False, name
-        assert guard.fill_pending is True, name
-        assert guard._deferred_close is None, name
-        assert guard.real_entry_confirmed is False, name
-        assert app._alerts, name
-        assert "not started" in app._alerts[0][1], name
+    monkeypatch.setattr(rb, "_com_available", False)
+    app._reconcile_resumed_guard(
+        _guard_session("entry", {
+            "action": "TRADE_CLOSE", "side": "LONG", "price": 22400,
+        }),
+        "auto",
+        "TX00",
+    )
+    guard = app._trading_guard
+    assert app._fill_poller.active is False
+    assert guard.fill_pending is True
+    assert guard._deferred_close is None
+    assert guard.real_entry_confirmed is False
+    assert app._alerts
+    assert "not started" in app._alerts[0][1]
+    assert app._resume_snapshot_recheck is None
+
+
+def test_flat_deferred_close_without_snapshot_is_held(monkeypatch):
+    """Missing snapshot keeps the close and the gate, and does not arm.
+
+    The OI reply is often a few seconds late. Dropping the close here
+    would erase the side, and the next save would persist a gate that
+    can no longer be checked. The poller stays stopped, so the close
+    cannot be replayed until a later snapshot re-runs the check.
+    """
+    app = _resume_guard_app(position_size=0)
+    app._account_monitor = SimpleNamespace(
+        get_signed_position=lambda prefix: 0,
+        oi_snapshot_received=False,
+        positions=[],
+    )
+    _enable_fill_com(monkeypatch)
+    app._reconcile_resumed_guard(
+        _guard_session("entry", {
+            "action": "TRADE_CLOSE", "side": "LONG", "price": 22400,
+        }),
+        "auto",
+        "TX00",
+    )
+    guard = app._trading_guard
+    assert app._fill_poller.active is False
+    assert guard.fill_pending is True
+    assert guard._deferred_close["side"] == "LONG"
+    assert guard.real_entry_confirmed is False
+    assert app._alerts
+    assert "not started" in app._alerts[0][1]
+    assert app._resume_snapshot_recheck is not None
+    assert app._fill_poller.on_position_update(-1) is None
 
 
 def test_flat_deferred_close_wires_expected_sign_to_poller(monkeypatch):
