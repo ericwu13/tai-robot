@@ -201,8 +201,11 @@ def clear_stop_file(bot_dir: str) -> None:
 # Accepted lines: ``reconnect`` and ``set-mode paper``.
 # ``set-mode auto``, ``set-mode real``, and anything else are rejected.
 # UTF-8 (with or without a BOM) and UTF-16 with a BOM are accepted.
+# Invalid bytes are rejected as garbage and still acknowledged.
 # A file already present at deploy is renamed to ``CONTROL.stale`` and
-# is not applied.
+# is not applied. If that rename fails, the file is deleted; if the
+# delete also fails, its (mtime, size) is remembered and that exact
+# file is ignored until it changes.
 
 def control_file_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, CONTROL_FILENAME)
@@ -219,13 +222,12 @@ def control_stale_path(bot_dir: str) -> str:
 def _decode_control_bytes(data: bytes) -> str:
     """Decode CONTROL text. PowerShell 5.1 ``echo`` writes UTF-16 LE + BOM.
 
-    A UTF-8 BOM is stripped. Bytes that are not valid in the chosen
-    encoding are replaced, so a bad file still becomes text the caller
-    can reject.
+    A UTF-8 BOM is stripped. Invalid bytes raise ``UnicodeDecodeError``
+    so the caller can reject the file as one garbage token.
     """
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return data.decode("utf-16", errors="replace")
-    return data.decode("utf-8-sig", errors="replace")
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
 
 
 def parse_control_command(text: str) -> tuple[str, str | None]:
@@ -278,19 +280,59 @@ def consume_control_file(bot_dir: str) -> str | None:
     return text
 
 
-def archive_stale_control(bot_dir: str) -> str | None:
-    """Rename a pre-existing ``CONTROL`` to ``CONTROL.stale``.
+def control_fingerprint(bot_dir: str) -> tuple:
+    """Identity of the CONTROL file currently in ``bot_dir``.
 
-    Returns the archive path, or None when there was no file. A deploy
-    calls this so a command left from the previous run is not applied
-    on the first poll.
+    ``("stat", mtime_ns, size)`` when the file can be stat'd. A different
+    tuple means the file changed and may be applied. ``("missing",)``
+    when there is no file. ``("unreadable",)`` when it exists but stat
+    fails.
+    """
+    path = control_file_path(bot_dir)
+    if not os.path.exists(path):
+        return ("missing",)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ("unreadable",)
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+    return ("stat", int(mtime_ns), int(st.st_size))
+
+
+def quarantine_stale_control(bot_dir: str) -> tuple[str, str | tuple | None]:
+    """Move a pre-existing ``CONTROL`` aside before the first poll.
+
+    Returns ``(status, detail)``:
+
+    - ``absent`` — no CONTROL file (detail is None)
+    - ``archived`` — renamed to ``CONTROL.stale`` (detail is that path)
+    - ``deleted`` — the rename failed and the file was removed
+    - ``ignored`` — rename and delete both failed; detail is
+      ``control_fingerprint`` so a later poll can skip that exact file
+
+    ``OSError`` from the rename (a directory at ``CONTROL.stale``, a
+    Windows sharing violation, a read-only archive) is caught here.
+    Callers log a warning from the status and still start the poll.
     """
     path = control_file_path(bot_dir)
     if not os.path.isfile(path):
-        return None
+        return "absent", None
     stale = control_stale_path(bot_dir)
-    os.replace(path, stale)
-    return stale
+    try:
+        os.replace(path, stale)
+    except OSError:
+        return _drop_or_ignore_stale_control(bot_dir)
+    return "archived", stale
+
+
+def _drop_or_ignore_stale_control(bot_dir: str) -> tuple[str, tuple | None]:
+    """Delete CONTROL after a failed archive, or fingerprint it."""
+    path = control_file_path(bot_dir)
+    try:
+        os.remove(path)
+    except OSError:
+        return "ignored", control_fingerprint(bot_dir)
+    return "deleted", None
 
 
 def apply_control_command(

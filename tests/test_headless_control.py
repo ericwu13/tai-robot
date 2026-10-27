@@ -283,26 +283,175 @@ def test_raising_reconnect_keeps_the_poll_alive_and_stop_works(tmp_path):
 
 
 def test_deploy_archives_stale_control(tmp_path):
-    from src.live.headless_app import DeployDriver
-
     bot = str(tmp_path / "TX00_stale")
     path = _write(bot, "set-mode paper\n")
+    driver = _deploy_driver(bot, object())
+    driver._deploy()
+    assert not os.path.exists(path)
+    stale = Path(bot) / "CONTROL.stale"
+    assert stale.read_text(encoding="utf-8").strip() == "set-mode paper"
+    assert driver.scheduled and driver.scheduled[0][1] == driver._poll
+
+
+def _deploy_driver(bot, runner):
+    from src.live.headless_app import DeployDriver
+
     driver = DeployDriver.__new__(DeployDriver)
     driver.bot_dir = bot
     driver.req = object()
+    driver.exit_code = None
+    driver._stop_flag = False
+    driver._stop_via_us = False
+    driver._last_heartbeat = 0.0
+    driver._ignored_control = None
+    driver._ignored_control_logged = False
+    driver.args = type("Args", (), {"heartbeat_min": 0})()
     scheduled = []
 
     class _Root:
         def after(self, ms, fn):
             scheduled.append((ms, fn))
 
+        def quit(self):
+            return None
+
     driver.root = _Root()
     driver.app = type("A", (), {})()
     driver.app._deploy_live_from = lambda req: True
-    driver.app._live_runner = object()
+    driver.app._live_runner = runner
     driver.app.alerts = []
+    driver.app._manual_reconnect = lambda: None
+    driver.app._stop_live = lambda: None
+    driver.scheduled = scheduled
+    return driver
+
+
+def _replace_raises_for_stale(monkeypatch, exc):
+    real_replace = os.replace
+
+    def _replace(src, dst):
+        if str(dst).endswith("CONTROL.stale"):
+            raise exc
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("src.live.headless.os.replace", _replace)
+
+
+def test_deploy_when_stale_archive_is_a_directory(tmp_path):
+    """A directory at CONTROL.stale must not skip the poll or apply the file."""
+    from src.live.headless import EXIT_OK, request_stop
+
+    bot = str(tmp_path / "TX00_dir")
+    _write(bot, "set-mode paper\n")
+    os.mkdir(os.path.join(bot, "CONTROL.stale"))
+    runner = _runner(tmp_path, "auto")
+    driver = _deploy_driver(bot, runner)
     driver._deploy()
+    assert _rescheduled(driver) == [driver._poll]
+    assert runner.trading_mode == "auto"
+    assert not os.path.exists(control_file_path(bot))
+    driver.scheduled.clear()
+    driver._poll()
+    assert runner.trading_mode == "auto"
+    request_stop(bot, "test")
+    driver.scheduled.clear()
+    driver._poll()
+    assert driver.exit_code == EXIT_OK
+    assert runner.trading_mode == "auto"
+
+
+def test_deploy_when_archive_replace_raises_permission_error(tmp_path, monkeypatch):
+    from src.live.headless import EXIT_OK, request_stop
+
+    bot = str(tmp_path / "TX00_perm")
+    _write(bot, "reconnect\n")
+    _replace_raises_for_stale(monkeypatch, PermissionError("sharing violation"))
+    called = []
+    runner = _runner(tmp_path, "auto")
+    driver = _deploy_driver(bot, runner)
+    driver.app._manual_reconnect = lambda: called.append("reconnect")
+    driver._deploy()
+    assert _rescheduled(driver) == [driver._poll]
+    driver.scheduled.clear()
+    driver._poll()
+    assert called == []
+    assert runner.trading_mode == "auto"
+    assert not os.path.exists(control_file_path(bot))
+    request_stop(bot, "test")
+    driver.scheduled.clear()
+    driver._poll()
+    assert driver.exit_code == EXIT_OK
+    assert called == []
+
+
+def test_undeletable_stale_control_is_ignored_until_it_changes(tmp_path, monkeypatch):
+    bot = str(tmp_path / "TX00_stuck")
+    _write(bot, "set-mode paper\n")
+    _replace_raises_for_stale(monkeypatch, PermissionError("sharing violation"))
+    real_remove = os.remove
+
+    def _remove(path):
+        if os.path.basename(path) == "CONTROL":
+            raise PermissionError("read-only")
+        return real_remove(path)
+
+    monkeypatch.setattr("src.live.headless.os.remove", _remove)
+    runner = _runner(tmp_path, "auto")
+    driver = _deploy_driver(bot, runner)
+    driver._deploy()
+    assert _rescheduled(driver) == [driver._poll]
+    assert driver._ignored_control is not None
+    driver.scheduled.clear()
+    driver._poll()
+    assert runner.trading_mode == "auto"
+    assert os.path.isfile(control_file_path(bot))
+    _write(bot, "set-mode paper\n\n")
+    driver.scheduled.clear()
+    driver._poll()
+    assert runner.trading_mode == "paper"
+    assert not os.path.exists(control_file_path(bot))
+
+
+def test_invalid_utf8_control_is_one_rejected_token(tmp_path):
+    bot = str(tmp_path / "TX00_bin2")
+    os.makedirs(bot)
+    path = control_file_path(bot)
+    with open(path, "wb") as f:
+        f.write(b"\x80\x81\xff\x00not-a-command")
+    text = consume_control_file(bot)
+    assert text == "\ufffd"
+    result, calls, logs = _apply(text)
+    assert result == "reject"
+    assert calls["reconnect"] == 0
+    assert calls["modes"] == []
+    assert any("\ufffd" in line for line in logs)
     assert not os.path.exists(path)
-    stale = Path(bot) / "CONTROL.stale"
-    assert stale.read_text(encoding="utf-8").strip() == "set-mode paper"
-    assert scheduled and scheduled[0][1] == driver._poll
+    assert os.path.isfile(control_ack_path(bot))
+
+
+def test_failed_stop_leaves_stop_file_and_retries(tmp_path):
+    from src.live.headless import EXIT_OK, request_stop, stop_requested
+
+    bot = str(tmp_path / "TX00_stop")
+    os.makedirs(bot)
+    calls = []
+
+    def _stop():
+        calls.append("stop")
+        if len(calls) == 1:
+            raise RuntimeError("stop blew up")
+
+    driver = _poll_driver(bot, _runner(tmp_path), lambda: None)
+    driver.app._stop_live = _stop
+    request_stop(bot, "test")
+    driver._poll()
+    assert calls == ["stop"]
+    assert stop_requested(bot)
+    assert driver.exit_code is None
+    assert _rescheduled(driver) == [driver._poll]
+    driver.scheduled.clear()
+    driver._poll()
+    assert calls == ["stop", "stop"]
+    assert driver.exit_code == EXIT_OK
+    assert not stop_requested(bot)
+    assert _rescheduled(driver) == []

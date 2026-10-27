@@ -38,9 +38,9 @@ from src.live.headless import (
     EXIT_BACKTEST_FAILED, EXIT_BOT_STOPPED, EXIT_DEPLOY_REFUSED, EXIT_LOGIN,
     EXIT_NO_COM, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE,
     HeadlessConfigError, HeadlessPolicy, apply_control_command,
-    archive_stale_control, build_deploy_request, clear_stop_file,
-    consume_control_file, policy_from_args, resolve_strategy_name,
-    stop_requested,
+    build_deploy_request, clear_stop_file, consume_control_file,
+    control_fingerprint, policy_from_args, quarantine_stale_control,
+    request_stop, resolve_strategy_name, stop_requested,
 )
 from src.live.live_runner import LiveRunner
 from src.live.session_store import load_session
@@ -192,6 +192,8 @@ class DeployDriver(_Driver):
         self.bot_dir = ""
         self._last_heartbeat = time.monotonic()
         self._stop_via_us = False
+        self._ignored_control: tuple | None = None
+        self._ignored_control_logged = False
 
     def start(self) -> None:
         app, args = self.app, self.args
@@ -250,18 +252,39 @@ class DeployDriver(_Driver):
 
     def _deploy(self) -> None:
         clear_stop_file(self.bot_dir)  # a stale STOP would stop us instantly
-        ok = self.app._deploy_live_from(self.req)
-        if not ok or self.app._live_runner is None:
-            why = "; ".join(f"{t}: {m.splitlines()[0]}" for t, m in self.app.alerts) \
-                or self.app.status_var.get()
-            self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
-            return
-        archived = archive_stale_control(self.bot_dir)
-        if archived:
-            rb._log(f"[HEADLESS] archived stale CONTROL to {archived}")
-        rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP, "
-                f"CONTROL, and Ctrl+C every 2s")
-        self.root.after(self.POLL_MS, self._poll)
+        # Quarantine before the runner starts. A failed rename is an
+        # OSError inside quarantine_stale_control; it must not escape
+        # after the bot is already trading.
+        self._note_stale_control()
+        try:
+            ok = self.app._deploy_live_from(self.req)
+            runner = getattr(self.app, "_live_runner", None)
+            if not ok or runner is None:
+                why = "; ".join(f"{t}: {m.splitlines()[0]}" for t, m in self.app.alerts) \
+                    or self.app.status_var.get()
+                self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
+            else:
+                rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP, "
+                        f"CONTROL, and Ctrl+C every 2s")
+        finally:
+            # Once a runner exists, the poll is scheduled even if the
+            # deploy log raised. A refused deploy sets exit_code and
+            # does not schedule another turn.
+            runner = getattr(self.app, "_live_runner", None)
+            if runner is not None and getattr(self, "exit_code", None) is None:
+                self.root.after(self.POLL_MS, self._poll)
+
+    def _note_stale_control(self) -> None:
+        status, detail = quarantine_stale_control(self.bot_dir)
+        self._ignored_control = detail if status == "ignored" else None
+        self._ignored_control_logged = False
+        if status == "archived":
+            rb._log(f"[HEADLESS] archived stale CONTROL to {detail}")
+        elif status == "deleted":
+            rb._log("[HEADLESS] warning: could not archive stale CONTROL; deleted it")
+        elif status == "ignored":
+            rb._log("[HEADLESS] warning: could not archive or delete stale CONTROL; "
+                    "ignoring it until the file changes")
 
     def _poll(self) -> None:
         if self.exit_code is not None:
@@ -282,11 +305,23 @@ class DeployDriver(_Driver):
         if self._stop_flag or stop_requested(self.bot_dir):
             why = "signal" if self._stop_flag else "STOP file"
             rb._log(f"[HEADLESS] stop requested via {why} — stopping bot")
-            self._stop_via_us = True
             try:
                 app._stop_live()
-            finally:
-                clear_stop_file(self.bot_dir)
+            except Exception as e:
+                # Leave STOP in place (recreate it after a signal-only
+                # stop) so the next poll retries. Do not finish EXIT_OK
+                # while the bot may still be running.
+                rb._log(f"[HEADLESS] stop failed: [{type(e).__name__}] {e}; "
+                        f"STOP stays so the next poll retries")
+                if not stop_requested(self.bot_dir):
+                    try:
+                        request_stop(self.bot_dir, "retry after stop failed")
+                    except OSError as e2:
+                        rb._log(f"[HEADLESS] could not recreate STOP: "
+                                f"[{type(e2).__name__}] {e2}")
+                return
+            self._stop_via_us = True
+            clear_stop_file(self.bot_dir)
             self.finish(EXIT_OK, "bot stopped")
             return
         if app._live_runner is None:
@@ -321,6 +356,8 @@ class DeployDriver(_Driver):
 
     def _poll_control(self) -> None:
         """Apply ``CONTROL`` once. ``auto`` and ``real`` are rejected."""
+        if self._stale_control_still_ignored():
+            return
         text = consume_control_file(self.bot_dir)
         if text is None:
             return
@@ -338,6 +375,27 @@ class DeployDriver(_Driver):
             set_mode=set_mode,
             log=lambda msg: rb._log(f"[HEADLESS] {msg}"),
         )
+
+    def _stale_control_still_ignored(self) -> bool:
+        """Skip a CONTROL file whose archive and delete both failed.
+
+        A matching fingerprint is the same file and is never applied.
+        A missing file, or a different size or mtime, clears the ignore
+        so a command written after deploy can run.
+        """
+        ignored = getattr(self, "_ignored_control", None)
+        if ignored is None:
+            return False
+        current = control_fingerprint(self.bot_dir)
+        if current == ignored and current != ("missing",):
+            if not getattr(self, "_ignored_control_logged", False):
+                rb._log("[HEADLESS] warning: stale CONTROL still present; "
+                        "not applying it")
+                self._ignored_control_logged = True
+            return True
+        self._ignored_control = None
+        self._ignored_control_logged = False
+        return False
 
 
 class BacktestDriver(_Driver):
