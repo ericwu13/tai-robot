@@ -9295,9 +9295,12 @@ class BacktestApp:
             # Issue #179: a stale replay tick restarts the staleness clock
             # (that is why a silent day reconnects about every 10 min) but
             # is not a live tick, so it must not clear the zero-tick streak.
-            live_tick = tick_age <= HISTORY_STALENESS_SECONDS
-            self._tick_watchdog.on_tick(live=live_tick)
-            if live_tick:
+            self._tick_watchdog.on_tick(
+                live=tick_age <= HISTORY_STALENESS_SECONDS)
+            # A fresh tick is the only proof the one-shot resubscribe
+            # worked. Stale replay restarts the watchdog clock and must
+            # not clear DEGRADED.
+            if tick_age <= HISTORY_STALENESS_SECONDS:
                 self._clear_quote_stuck_if_ticks_resumed()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
