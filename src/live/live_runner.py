@@ -440,23 +440,39 @@ def load_1m_bars_from_csvs(bot_dir: str, symbol: str) -> list[Bar]:
 
 
 # Modes a dropped mode_override.json may select on a headless bot.
-# Fail closed: paper is a downgrade (or a no-op). ``auto``, ``real``,
-# ``semi_auto``, and any other value are live or real-money escalations
-# and are refused. There is no settings or flag bypass.
+# Fail closed: only the exact string ``paper`` is a downgrade (or a
+# no-op). ``auto``, ``real``, ``semi_auto``, ``" paper "``, ``"PAPER"``,
+# and any non-string JSON value are refused. There is no settings or
+# flag bypass. Membership is tested only after ``isinstance(mode, str)``
+# so a list or dict cannot raise TypeError into the bar path.
 _HEADLESS_FILE_MODES = frozenset({"paper"})
 
+# One warning per minute when a refused file cannot be removed. A stuck
+# file is re-read every bar; the refusal still does not change the mode.
+_MODE_OVERRIDE_REMOVE_WARN_S = 60.0
 
-def arm_headless_file_guard(runner, *, app_headless: bool,
-                            origin: str | None) -> None:
+
+def arm_headless_file_guard(runner, *, app_headless: bool = True,
+                            origin: str | None = None) -> None:
     """Arm mode_override.json live-mode refusal on an unattended deploy.
 
-    Fail closed: the guard stays off only for an attended GUI deploy
-    (``app_headless`` is false and ``origin`` is exactly ``"gui"``).
-    A headless app, a CLI origin, or a missing origin arms it. This does
-    not change ``trading_mode`` — ``deploy --mode auto`` is assigned by
-    the caller and is not a file drop.
+    ``arm_headless_file_guard(runner)`` always arms. Fail closed: the
+    guard stays off only for an attended GUI deploy (``app_headless`` is
+    false and ``origin`` is exactly ``"gui"``). A headless app, a CLI
+    origin, or a missing origin arms it. This does not change
+    ``trading_mode`` — ``deploy --mode auto`` is assigned by the caller
+    and is not a file drop.
+
+    ``setattr`` is guarded. A bare ``object()`` fake (and anything else
+    that rejects new attributes) must not raise into deploy.
     """
-    runner._headless = bool(app_headless) or origin != "gui"
+    armed = bool(app_headless) or origin != "gui"
+    try:
+        setattr(runner, "_headless", armed)
+    except (AttributeError, TypeError):
+        logger.debug(
+            "headless file guard not set on %s",
+            type(runner).__name__, exc_info=True)
 
 
 class LiveRunner:
@@ -572,6 +588,9 @@ class LiveRunner:
         # dropdown and GUI file hot-swap stay as they are. deploy --mode
         # auto assigns trading_mode directly and does not consult this.
         self._headless: bool = False
+        # monotonic timestamps for rate-limited mode_override warnings.
+        self._mode_override_remove_warn_at: float | None = None
+        self._mode_override_error_warn_at: float | None = None
         self.on_mode_changed: Callable[[str, str], None] | None = None
         # Optional external veto: returns a reason string to block the
         # switch, or None to allow it. The GUI wires this to the
@@ -713,35 +732,99 @@ class LiveRunner:
             self._reload_started_at = None
         self._reloading_flag = value
 
-    def _refuse_headless_file_mode(self, mode) -> bool:
-        """Refuse a live/real mode_override.json on a headless bot.
+    def _warn_mode_override_rate_limited(self, attr: str, message: str) -> None:
+        """Log ``message`` at warning, at most once per minute."""
+        now = time.monotonic()
+        last = getattr(self, attr, None)
+        if last is not None and now - last < _MODE_OVERRIDE_REMOVE_WARN_S:
+            return
+        setattr(self, attr, now)
+        logger.warning("%s", message)
 
-        Returns True when the mode must not be applied. The caller has
-        already removed the file, so a refused drop is not re-read on
-        the next bar. ``None`` (the file named no mode) is not a refusal.
+    def _consume_refused_override(self, path: str) -> None:
+        """Drop a refused mode_override.json so the next bar does not re-apply it.
+
+        Rename to ``mode_override.json.refused`` first (an audit copy).
+        If that fails, remove the file. One rate-limited warning if the
+        remove also fails; the mode is still left unchanged.
+        """
+        archive = path + ".refused"
+        try:
+            os.replace(path, archive)
+            return
+        except OSError:
+            logger.debug(
+                "could not archive refused mode_override.json to %s",
+                archive, exc_info=True)
+        try:
+            os.remove(path)
+        except OSError as exc:
+            self._warn_mode_override_rate_limited(
+                "_mode_override_remove_warn_at",
+                "[MODE] could not remove refused mode_override.json "
+                f"({type(exc).__name__}: {exc}); trading mode unchanged",
+            )
+
+    def _refuse_headless_file_mode(self, mode) -> bool:
+        """Refuse a live/real or unusable mode_override.json on a headless bot.
+
+        Returns True when the mode must not be applied. Only the exact
+        string ``paper`` is accepted. ``None``, numbers, lists, dicts,
+        and any other string are refusals. The caller consumes the file.
         The GUI path (``_headless`` false) is not this method's concern.
         """
         if not self._headless:
             return False
-        if mode is None or mode in _HEADLESS_FILE_MODES:
+        if isinstance(mode, str) and mode in _HEADLESS_FILE_MODES:
             return False
         msg = (
             f"[MODE] headless refused mode_override.json trading_mode={mode!r} "
             f"— a file drop cannot switch a headless bot to a live or "
-            f"real-money mode; staying on {self.trading_mode!r} (file removed)"
+            f"real-money mode; staying on {self.trading_mode!r} (file consumed)"
         )
         logger.warning("%s", msg)
         self._emit("on_status", msg)
         return True
 
+    def _reject_bad_override(self, path: str, shown) -> None:
+        """Consume an override that must not be applied. Never raises."""
+        try:
+            if self._headless:
+                self._refuse_headless_file_mode(shown)
+                self._consume_refused_override(path)
+                return
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        except Exception:
+            logger.debug("rejecting mode_override.json failed", exc_info=True)
+
     def _check_mode_override(self) -> str | None:
         """Read and consume a mode_override.json file from the bot directory.
 
-        Headless bots (``_headless``) accept only ``paper`` from this file.
-        ``auto``, ``real``, and any other live or real-money mode are
-        refused, the file is still removed, and the current mode is left
-        unchanged. ``allow_live_override`` does not bypass that.
+        Headless bots (``_headless``) accept only the exact string
+        ``paper`` from this file. ``auto``, ``real``, any other string,
+        and any non-string JSON value are refused, the file is consumed,
+        and the current mode is left unchanged. ``allow_live_override``
+        does not bypass that. Nothing here is allowed to raise into the
+        bar path: a failure logs (rate-limited) and returns None.
         """
+        try:
+            return self._read_mode_override()
+        except Exception as exc:
+            try:
+                self._warn_mode_override_rate_limited(
+                    "_mode_override_error_warn_at",
+                    "[MODE] mode_override.json check failed "
+                    f"({type(exc).__name__}); trading mode unchanged",
+                )
+            except Exception:
+                pass
+            return None
+
+    def _read_mode_override(self) -> str | None:
+        """Body of ``_check_mode_override``. May raise; the wrapper catches."""
         # Issue #79: never consume/apply a mode override during warmup or
         # history replay. Applying one mid-replay races with the resume UI
         # sync and makes the mode tag disappear until the user manually
@@ -787,17 +870,28 @@ class LiveRunner:
                 return None
             with open(override_path, "r") as f:
                 data = json.load(f)
-            os.remove(override_path)
-            mode = data.get("trading_mode")
-            # File is already gone, so a refusal is not re-applied next poll.
-            # The GUI dropdown calls _apply_mode_switch directly and never
-            # reaches this guard. deploy --mode auto assigns trading_mode
-            # and does not read this file.
-            if self._refuse_headless_file_mode(mode):
-                return None
-            return mode
         except (json.JSONDecodeError, OSError):
             return None
+        # isinstance before any membership test: a list or dict is not
+        # hashable, and data.get on a JSON array or string raises.
+        # The GUI dropdown calls _apply_mode_switch directly and never
+        # reaches this guard. deploy --mode auto assigns trading_mode
+        # and does not read this file.
+        if not isinstance(data, dict):
+            self._reject_bad_override(override_path, data)
+            return None
+        mode = data.get("trading_mode")
+        if not isinstance(mode, str):
+            self._reject_bad_override(override_path, mode)
+            return None
+        if self._headless and mode not in _HEADLESS_FILE_MODES:
+            self._reject_bad_override(override_path, mode)
+            return None
+        try:
+            os.remove(override_path)
+        except OSError:
+            return None
+        return mode
 
     def _apply_mode_switch(self, new_mode: str, *, user_confirmed: bool = False) -> None:
         """Switch trading mode if safe to do so.

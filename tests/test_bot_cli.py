@@ -329,12 +329,51 @@ def test_deploy_mode_auto_is_an_explicit_headless_choice():
     assert hl.HEADLESS_MODES == ("paper", "auto")
 
 
-def test_headless_deploy_arms_mode_override_guard():
-    """Both headless entry points arm the file guard; the GUI origin does not."""
-    src = inspect.getsource(rb.BacktestApp._deploy_live_continue)
-    assert "arm_headless_file_guard(" in src
-    driver_src = inspect.getsource(DeployDriver._deploy)
-    assert "runner._headless = True" in driver_src
+def test_deploy_driver_arms_a_real_runner_and_tolerates_a_bare_object(tmp_path):
+    """DeployDriver arms through the helper, not a bare attribute write.
+
+    A real LiveRunner gets ``_headless``. A bare ``object()`` — the shape
+    used by the pre-deploy position fakes — must not raise AttributeError.
+    """
+    from src.backtest.strategy import BacktestStrategy
+    from src.live.live_runner import LiveRunner
+
+    class _Quiet(BacktestStrategy):
+        kline_type = 0
+        kline_minute = 1
+
+        def on_bar(self, bar, data_store, broker):
+            pass
+
+        def required_bars(self):
+            return 1
+
+    scheduled: list = []
+
+    def _drive(runner):
+        driver = DeployDriver.__new__(DeployDriver)
+        driver.bot_dir = str(tmp_path / "bot")
+        os.makedirs(driver.bot_dir, exist_ok=True)
+        driver.app = SimpleNamespace(
+            _deploy_live_from=lambda req: True,
+            _live_runner=runner,
+            alerts=[],
+            status_var=SimpleNamespace(get=lambda: ""),
+        )
+        driver.req = object()
+        driver.root = SimpleNamespace(after=lambda *a, **k: scheduled.append(a))
+        driver.POLL_MS = 2000
+        scheduled.clear()
+        driver._deploy()
+        assert scheduled, "arming raised before the poll was scheduled"
+
+    _drive(object())
+    real = LiveRunner(_Quiet(), "TX00", log_dir=str(tmp_path / "real"))
+    assert real._headless is False
+    assert real.trading_mode == "paper"
+    _drive(real)
+    assert real._headless is True
+    assert real.trading_mode == "paper"
 
 
 def test_regime_requires_both_legs_unless_resuming():

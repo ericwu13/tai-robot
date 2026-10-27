@@ -232,9 +232,11 @@ Notes:
   order-confirm dialog. Headless modes are `paper` and `auto`.
 - A running headless bot ignores a `mode_override.json` that asks for
   `auto`, `real`, `semi_auto`, or any other live/real-money mode, even
-  when `trading.allow_live_override` is true. The file is removed (the
-  same consume as a GUI hot-swap) and a warning is logged; the current
-  mode stays as it is. A file that asks for `paper` still applies.
+  when `trading.allow_live_override` is true. The file is renamed to
+  `mode_override.json.refused` (or removed if the rename fails) and a
+  warning is logged; the current mode stays as it is. A non-string
+  payload is refused the same way. A file that asks for exactly `paper`
+  still applies (`PAPER` and ` paper ` do not).
   `deploy --mode auto` is unchanged — that flag is an explicit deploy
   choice, not a file drop. The GUI hot-swap path is unchanged.
 - Resume rules match the GUI: `--strategy` on a resumed bot deploys the
