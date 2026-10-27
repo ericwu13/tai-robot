@@ -1428,6 +1428,15 @@ class BacktestApp:
                             and self._trading_guard.fill_pending
                             and self._live_runner):
                         self._update_fill_poll_position(raw, parsed)
+                    # #173's late-resume recheck belongs on a credited row.
+                    # The methods are absent until that PR lands; keep this
+                    # call (and drop a second insert) when resolving the
+                    # _process_ui_queue conflict.
+                    if outcome != "stale":
+                        _recheck = getattr(self, "_recheck_resume_after_snapshot", None)
+                        _settles = getattr(self, "_oi_row_settles_resume_recheck", None)
+                        if _recheck is not None and _settles is not None:
+                            _recheck(settled=_settles(raw, parsed))
                 elif kind == "future_rights":
                     parsed = _parse_future_rights(data)
                     if parsed:
@@ -1906,6 +1915,9 @@ class BacktestApp:
             _log_debug("[RECONNECT] reconcile skipped — no futures account yet")
             return
         try:
+            # A new query, same as the account refresh. The generation
+            # moves forward so this reply cannot complete a later deploy.
+            self._account_monitor.begin_oi_query()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
                      user_id, account, 1)
         except Exception as e:
@@ -10240,7 +10252,12 @@ class BacktestApp:
             self._on_fill_timeout()
             return
 
-        # Request fresh position data via COM
+        # Request fresh position data via COM. This poll fires every 3s
+        # and the callback is often ~4s behind, so it does not call
+        # begin_oi_query(): that would clear the book and leave it
+        # UNKNOWN for the whole fill wait. A tail "##" still cannot
+        # flatten a later deploy — "##" answers empty only after "001"
+        # in that generation (issue #202).
         try:
             user_id = self.login_user_var.get().strip()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,

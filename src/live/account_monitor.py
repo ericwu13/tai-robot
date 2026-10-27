@@ -255,6 +255,17 @@ def fmt_money(val: str) -> str:
         return val
 
 
+# Monotonic across reset() and across AccountMonitor instances. A row
+# tagged for an earlier query must not match a later object's generation 1.
+_oi_generation_clock = 0
+
+
+def _allocate_oi_generation() -> int:
+    global _oi_generation_clock
+    _oi_generation_clock += 1
+    return _oi_generation_clock
+
+
 # ── AccountMonitor class ──
 
 class AccountMonitor:
@@ -271,14 +282,16 @@ class AccountMonitor:
         # An empty ``positions`` list means "we don't know yet", NOT "the
         # account is flat" — the callback is asynchronous. Which query a
         # reply answers is the generation below, not a flag ``clear_positions``
-        # can reset (issue #202). Generation 0 is "no explicit query yet";
-        # ``_oi_answered_gen == -1`` means nothing has been answered.
-        self._oi_query_gen: int = 0
+        # can reset (issue #202). ``_oi_answered_gen == -1`` means nothing
+        # has been answered. ``_oi_saw_001`` is this generation's no-data
+        # marker; a ``##`` end marker is an empty book only after it.
+        self._oi_query_gen: int = _allocate_oi_generation()
         self._oi_answered_gen: int = -1
+        self._oi_saw_001: bool = False
 
     @property
     def oi_query_generation(self) -> int:
-        """Generation of the latest ``begin_oi_query`` (0 if none yet)."""
+        """Generation of the latest query on this monitor."""
         return self._oi_query_gen
 
     @property
@@ -297,7 +310,8 @@ class AccountMonitor:
         generation's answer stays recorded, but it no longer satisfies
         ``oi_snapshot_received``.
         """
-        self._oi_query_gen += 1
+        self._oi_query_gen = _allocate_oi_generation()
+        self._oi_saw_001 = False
         self.clear_positions()
         return self._oi_query_gen
 
@@ -314,8 +328,11 @@ class AccountMonitor:
         self.rights.clear()
         self._prev_fill_counts.clear()
         # Full state wipe → the snapshot we held is gone too; back to unknown.
-        self._oi_query_gen = 0
+        # The generation clock only moves forward, so a row tagged before
+        # this reset cannot match the generation allocated here.
         self._oi_answered_gen = -1
+        self._oi_saw_001 = False
+        self._oi_query_gen = _allocate_oi_generation()
 
     # ── Position tracking ──
 
@@ -341,7 +358,7 @@ class AccountMonitor:
         self.positions.clear()
 
     def set_flat(self, *, generation: int | None = None) -> bool:
-        """Record an answered empty book (``001``, or a ``##`` with no rows).
+        """Record an answered empty book (``001``, the no-data marker).
 
         Returns False when ``generation`` is not the latest query, without
         clearing positions that belong to that newer query.
@@ -357,12 +374,13 @@ class AccountMonitor:
 
         Returns ``position``, ``flat``, ``end``, ``stale``, or ``ignored``.
 
-        ``001`` is an answered empty book. A ``##`` end marker with no
-        position rows in this snapshot is the same empty answer (issue
-        #202). ``##`` after real rows only completes the snapshot — it
-        does not wipe them. ``970`` / ``980`` are errors, not an answer.
-        A generation other than the latest query is ``stale`` and changes
-        nothing.
+        ``001`` is an answered empty book. The evidenced flat sequence is
+        ``001`` then ``##`` (#139). A ``##`` end marker counts as that
+        empty book only when this generation already saw ``001``. A bare
+        ``##``, or ``970``/``980`` followed by ``##``, leaves the query
+        unanswered. ``##`` after real rows completes the snapshot and
+        does not wipe them. A generation other than the latest query is
+        ``stale`` and changes nothing.
         """
         if not self._accepts_oi_generation(generation):
             return "stale"
@@ -373,14 +391,17 @@ class AccountMonitor:
             return "position"
         first = text.split(",")[0].strip() if text else ""
         if first == "001":
+            self._oi_saw_001 = True
             self.set_flat()
             return "flat"
         if first == "##":
             if self.positions:
                 self._mark_oi_answered()
                 return "end"
-            self.set_flat()
-            return "flat"
+            if self._oi_saw_001:
+                self.set_flat()
+                return "flat"
+            return "ignored"
         return "ignored"
 
     def update_rights(self, parsed: dict) -> None:

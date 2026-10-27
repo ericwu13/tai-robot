@@ -424,19 +424,61 @@ class TestOiSnapshotFlag:
         m = AccountMonitor()
         assert m.oi_snapshot_received is False
 
-    def test_hash_terminator_alone_is_an_empty_snapshot(self):
-        """Issue #202: a ``##``-only reply is an answered empty book.
+    def test_bare_hash_is_not_an_answered_flat_book(self):
+        """Issue #202 QA: a ``##`` with no ``001`` in this generation stays UNKNOWN.
 
-        Pre-fix the end marker was ignored, so a flat account that did not
-        also send ``001`` left ``oi_snapshot_received`` false and the
-        deploy wait timed out.
+        The evidenced flat sequence is ``001,查無資料`` then ``##`` (#139).
+        A bare end marker used to be credited as flat.
         """
         m = AccountMonitor()
         gen = m.begin_oi_query()
         assert m.oi_snapshot_received is False
-        assert m.apply_open_interest("##," + "," * 10, generation=gen) == "flat"
+        assert m.apply_open_interest("##," + "," * 10, generation=gen) == "ignored"
+        assert m.oi_snapshot_received is False
+        assert m.positions == []
+        assert m.has_open_positions() is False
+
+    def test_001_then_hash_is_an_empty_snapshot(self):
+        """``001`` followed by ``##`` is the answered empty book."""
+        m = AccountMonitor()
+        gen = m.begin_oi_query()
+        assert m.apply_open_interest("001,查無資料", generation=gen) == "flat"
+        assert m.oi_snapshot_received is True
+        assert m.apply_open_interest("##", generation=gen) == "flat"
         assert m.oi_snapshot_received is True
         assert m.positions == []
+        assert m.has_open_positions() is False
+
+    @pytest.mark.parametrize("code", ["970", "980"])
+    def test_error_then_hash_stays_unknown(self, code):
+        """Issue #202 QA: an error reply then ``##`` must not read as flat.
+
+        On master the error was ignored and the book stayed UNKNOWN.
+        """
+        m = AccountMonitor()
+        gen = m.begin_oi_query()
+        assert m.apply_open_interest(f"{code},error", generation=gen) == "ignored"
+        assert m.apply_open_interest("##", generation=gen) == "ignored"
+        assert m.oi_snapshot_received is False
+        assert m.has_open_positions() is False
+
+    def test_tail_hash_after_generation_bump_is_not_flat(self):
+        """Issue #202 QA: a streaming reply's tail ``##`` is not this query's flat.
+
+        The position row was tagged for the previous generation. Deploy
+        bumps the generation, then the end marker arrives. That marker
+        must leave the new query UNKNOWN (a real TXF book was in the
+        earlier row).
+        """
+        m = AccountMonitor()
+        older = m.begin_oi_query()
+        row = "TF,ACCT,TXFD0,B,1,0,22500.0,15,2,ID"
+        assert m.apply_open_interest(row, generation=older) == "position"
+        assert m.has_open_positions() is True
+        latest = m.begin_oi_query()
+        assert latest != older
+        assert m.apply_open_interest("##", generation=latest) == "ignored"
+        assert m.oi_snapshot_received is False
         assert m.has_open_positions() is False
 
     def test_hash_after_rows_does_not_clear_them(self):
@@ -458,6 +500,7 @@ class TestOiSnapshotFlag:
         """
         m = AccountMonitor()
         old = m.begin_oi_query()
+        assert m.apply_open_interest("001,查無資料", generation=old) == "flat"
         assert m.apply_open_interest("##", generation=old) == "flat"
         assert m.oi_snapshot_received is True
         m.clear_positions()
@@ -470,9 +513,32 @@ class TestOiSnapshotFlag:
         assert m.apply_open_interest("001,查無資料", generation=old) == "stale"
         assert m.oi_snapshot_received is False
         assert m.positions == []
+        assert m.apply_open_interest("##", generation=latest) == "ignored"
+        assert m.oi_snapshot_received is False
+        assert m.apply_open_interest("001,查無資料", generation=latest) == "flat"
         assert m.apply_open_interest("##", generation=latest) == "flat"
         assert m.oi_snapshot_received is True
         assert m.has_open_positions() is False
+
+    def test_generation_clock_is_monotonic_across_reset_and_instances(self):
+        """A row tagged before reset or on another monitor must not match gen 1."""
+        first = AccountMonitor()
+        tagged = first.begin_oi_query()
+        first.reset()
+        assert first.oi_query_generation != tagged
+        assert first.oi_snapshot_received is False
+        restarted = first.begin_oi_query()
+        assert restarted != tagged
+        row = "TF,ACCT,TXFD0,B,1,0,22500.0,15,2,ID"
+        assert first.apply_open_interest(row, generation=tagged) == "stale"
+        assert first.oi_snapshot_received is False
+
+        second = AccountMonitor()
+        other = second.begin_oi_query()
+        assert other != tagged and other != restarted
+        assert second.apply_open_interest(row, generation=tagged) == "stale"
+        assert second.apply_open_interest(row, generation=restarted) == "stale"
+        assert second.oi_snapshot_received is False
 
     def test_nonzero_open_interest_code_is_rejected(self):
         """Issue #202: non-zero GetOpenInterestGW means the snapshot will not arrive."""

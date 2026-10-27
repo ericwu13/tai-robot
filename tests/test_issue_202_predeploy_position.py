@@ -1,7 +1,8 @@
 """Issue #202: pre-deploy OpenInterest must fail closed on UNKNOWN.
 
-An empty ``##`` reply is an answered flat book. A reply is credited only
-to the query that was in flight when it was enqueued. A non-zero
+``001`` then ``##`` is an answered flat book. A bare ``##``, or an
+error followed by ``##``, leaves the book UNKNOWN. A reply is credited
+only to the query that was in flight when it was enqueued. A non-zero
 ``GetOpenInterestGW`` code, a timeout, or an exception refuses a
 semi_auto/auto deploy. Paper is unchanged. ``--allow-existing-position``
 does not allow an unknown book.
@@ -40,21 +41,28 @@ def _drain_ui_queue() -> None:
             return
 
 
-def test_empty_hash_reply_answers_via_the_callback_and_clear_keeps_it():
-    """``##`` through OnOpenInterest is an empty snapshot.
+def _oi_app(monitor, *, fill_pending=False, on_fill=None):
+    return SimpleNamespace(
+        _account_monitor=monitor,
+        real_pos_var=SimpleNamespace(set=lambda text: None),
+        _trading_guard=SimpleNamespace(fill_pending=fill_pending),
+        _live_runner=SimpleNamespace(symbol="TX00") if fill_pending else None,
+        _update_real_account_display=lambda: None,
+        _update_fill_poll_position=on_fill or (lambda raw, parsed: None),
+    )
+
+
+def test_001_then_hash_answers_via_the_callback_and_clear_keeps_it():
+    """``001`` then ``##`` through OnOpenInterest is an empty snapshot.
 
     A row queued for the previous query is not credited after
     ``begin_oi_query``. ``clear_positions`` does not drop the answer.
+    A bare ``##`` on the new generation stays UNKNOWN.
     """
     monitor = AccountMonitor()
     flat_labels = []
-    app = SimpleNamespace(
-        _account_monitor=monitor,
-        real_pos_var=SimpleNamespace(set=lambda text: flat_labels.append(text)),
-        _trading_guard=SimpleNamespace(fill_pending=False),
-        _live_runner=None,
-        _update_real_account_display=lambda: None,
-    )
+    app = _oi_app(monitor)
+    app.real_pos_var = SimpleNamespace(set=lambda text: flat_labels.append(text))
     previous_app = rb._app
     rb._app = app
     try:
@@ -69,16 +77,81 @@ def test_empty_hash_reply_answers_via_the_callback_and_clear_keeps_it():
 
         rb.SKOrderLibEvents().OnOpenInterest("##")
         rb.BacktestApp._process_ui_queue(app)
+        assert monitor.oi_snapshot_received is False
+
+        rb.SKOrderLibEvents().OnOpenInterest("001,查無資料")
+        rb.SKOrderLibEvents().OnOpenInterest("##")
+        rb.BacktestApp._process_ui_queue(app)
         assert monitor.oi_snapshot_received is True
         assert monitor.positions == []
         assert monitor.has_open_positions() is False
-        assert flat_labels == ["Flat (無持倉)"]
+        assert flat_labels == ["Flat (無持倉)", "Flat (無持倉)"]
         monitor.clear_positions()
         assert monitor.oi_snapshot_received is True
         assert monitor.positions == []
     finally:
         rb._app = previous_app
         _drain_ui_queue()
+
+
+def test_stale_row_does_not_update_fill_poll_while_fill_pending():
+    """A row tagged for an older query must not confirm a fill.
+
+    Replacing ``outcome != "stale"`` with ``True`` in the queue handler
+    calls ``_update_fill_poll_position`` for this row.
+    """
+    monitor = AccountMonitor()
+    updates = []
+    app = _oi_app(
+        monitor, fill_pending=True,
+        on_fill=lambda raw, parsed: updates.append((raw, parsed)),
+    )
+    previous_app = rb._app
+    rb._app = app
+    try:
+        _drain_ui_queue()
+        older = monitor.begin_oi_query()
+        latest = monitor.begin_oi_query()
+        row = "TF,ACCT,TXFD0,B,1,0,22500.0,15,2,ID"
+        rb._ui_queue.put_nowait(("open_interest", (row, older)))
+        rb.BacktestApp._process_ui_queue(app)
+        assert updates == []
+        assert monitor.oi_snapshot_received is False
+
+        rb._ui_queue.put_nowait(("open_interest", (row, latest)))
+        rb.BacktestApp._process_ui_queue(app)
+        assert len(updates) == 1
+        assert updates[0][1]["product"] == "TXFD0"
+    finally:
+        rb._app = previous_app
+        _drain_ui_queue()
+
+
+def test_machine_reconcile_starts_a_new_oi_generation(monkeypatch):
+    """A reconnect reconcile is its own query, so its reply cannot finish a later deploy."""
+    monitor = AccountMonitor()
+    before = monitor.begin_oi_query()
+    monitor.set_flat()
+    assert monitor.oi_snapshot_received is True
+    app = SimpleNamespace(
+        _account_monitor=monitor,
+        login_user_var=_Var("user"),
+        _futures_account="F0123456",
+    )
+    calls = []
+
+    def _call_com(name, fn, *args, **kwargs):
+        calls.append((name, monitor.oi_query_generation))
+        return 0
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetOpenInterestGW=lambda *a: 0))
+    monkeypatch.setattr(rb, "call_com", _call_com)
+    rb.BacktestApp._on_machine_reconcile(app)
+    assert calls == [("GetOpenInterestGW", monitor.oi_query_generation)]
+    assert monitor.oi_query_generation != before
+    assert monitor.oi_snapshot_received is False
+    assert monitor.positions == []
 
 
 def test_allow_flags_are_independent():
@@ -109,7 +182,8 @@ class _Gate:
 
 
 def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
-              answer_snapshot=False, use_driver=True, gui_answer=None):
+              answer_snapshot=False, bare_hash=False, use_driver=True,
+              gui_answer=None):
     """Drive ``_deploy_live_from`` up to the position gate.
 
     ``gui_answer`` uses the real GUI ``_confirm`` (messagebox is patched
@@ -182,7 +256,12 @@ def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
             raise RuntimeError("gw down")
         if answer_snapshot and name == "GetOpenInterestGW":
             gen = app._account_monitor.oi_query_generation
-            app._account_monitor.apply_open_interest("##", generation=gen)
+            if bare_hash:
+                app._account_monitor.apply_open_interest("##", generation=gen)
+            else:
+                app._account_monitor.apply_open_interest(
+                    "001,查無資料", generation=gen)
+                app._account_monitor.apply_open_interest("##", generation=gen)
         return code
 
     _drain_ui_queue()
@@ -278,7 +357,22 @@ def test_allow_existing_position_alone_still_refuses_unknown(monkeypatch):
     assert gate.confirms[0][0] == hl.TITLE_UNKNOWN_POSITION
 
 
-def test_empty_hash_snapshot_allows_auto_without_unknown_dialog(monkeypatch):
+def test_bare_hash_snapshot_refuses_auto(monkeypatch):
+    """A deploy whose only reply is ``##`` stays UNKNOWN and is refused."""
+    gate = _run_gate(
+        monkeypatch, mode="auto",
+        policy=hl.HeadlessPolicy(),
+        code=0,
+        answer_snapshot=True,
+        bare_hash=True,
+    )
+    assert gate.continued == []
+    assert gate.exit_code == hl.EXIT_DEPLOY_REFUSED
+    assert gate.confirms and gate.confirms[0][0] == hl.TITLE_UNKNOWN_POSITION
+    assert gate.app._account_monitor.oi_snapshot_received is False
+
+
+def test_001_then_hash_allows_auto_without_unknown_dialog(monkeypatch):
     gate = _run_gate(
         monkeypatch, mode="auto",
         policy=hl.HeadlessPolicy(),
