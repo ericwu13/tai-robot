@@ -20,6 +20,7 @@ from src.live.account_monitor import (
     close_order_side,
     oi_product_match,
     product_signed_position,
+    open_interest_query_rejected,
 )
 
 
@@ -423,12 +424,63 @@ class TestOiSnapshotFlag:
         m = AccountMonitor()
         assert m.oi_snapshot_received is False
 
-    def test_clear_positions_invalidates_snapshot(self):
+    def test_hash_terminator_alone_is_an_empty_snapshot(self):
+        """Issue #202: a ``##``-only reply is an answered empty book.
+
+        Pre-fix the end marker was ignored, so a flat account that did not
+        also send ``001`` left ``oi_snapshot_received`` false and the
+        deploy wait timed out.
+        """
         m = AccountMonitor()
-        m.set_flat()
-        assert m.oi_snapshot_received is True
-        m.clear_positions()          # a fresh query is now in flight
+        gen = m.begin_oi_query()
         assert m.oi_snapshot_received is False
+        assert m.apply_open_interest("##," + "," * 10, generation=gen) == "flat"
+        assert m.oi_snapshot_received is True
+        assert m.positions == []
+        assert m.has_open_positions() is False
+
+    def test_hash_after_rows_does_not_clear_them(self):
+        m = AccountMonitor()
+        gen = m.begin_oi_query()
+        row = "TF,ACCT,TM0000,B,1,0,44774.0,15,2,ID"
+        assert m.apply_open_interest(row, generation=gen) == "position"
+        assert m.apply_open_interest("##", generation=gen) == "end"
+        assert m.has_open_positions() is True
+        assert len(m.positions) == 1
+
+    def test_stale_reply_not_credited_and_clear_keeps_valid_reply(self):
+        """Issue #202: credit a reply only to the latest query.
+
+        Pre-fix every query shared one flag, and ``clear_positions`` reset
+        it, so a reply that had already answered the current query was
+        dropped. A reply tagged for an older query must not complete the
+        latest one either.
+        """
+        m = AccountMonitor()
+        old = m.begin_oi_query()
+        assert m.apply_open_interest("##", generation=old) == "flat"
+        assert m.oi_snapshot_received is True
+        m.clear_positions()
+        assert m.oi_snapshot_received is True
+        assert m.positions == []
+
+        latest = m.begin_oi_query()
+        assert latest != old
+        assert m.oi_snapshot_received is False
+        assert m.apply_open_interest("001,查無資料", generation=old) == "stale"
+        assert m.oi_snapshot_received is False
+        assert m.positions == []
+        assert m.apply_open_interest("##", generation=latest) == "flat"
+        assert m.oi_snapshot_received is True
+        assert m.has_open_positions() is False
+
+    def test_nonzero_open_interest_code_is_rejected(self):
+        """Issue #202: non-zero GetOpenInterestGW means the snapshot will not arrive."""
+        assert open_interest_query_rejected(0) is False
+        assert open_interest_query_rejected(None) is False
+        assert open_interest_query_rejected(1) is True
+        assert open_interest_query_rejected(5) is True
+        assert open_interest_query_rejected("3") is True
 
     def test_add_position_marks_received(self):
         m = AccountMonitor()

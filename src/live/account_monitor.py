@@ -40,6 +40,22 @@ class FillsResult:
 
 # ── Pure parsing functions (moved from run_backtest.py) ──
 
+def open_interest_query_rejected(code) -> bool:
+    """True when ``GetOpenInterestGW`` will not deliver a snapshot.
+
+    ``0`` is success. ``None`` means the caller did not receive a code, so
+    the deploy path still waits for the callback. Any other value is a
+    broker rejection: the position is UNKNOWN and waiting cannot help
+    (issue #202).
+    """
+    if code is None:
+        return False
+    try:
+        return int(code) != 0
+    except (TypeError, ValueError):
+        return True
+
+
 def parse_open_interest(bstr: str) -> dict | None:
     """Parse OnOpenInterest callback data into a dict.
 
@@ -252,10 +268,45 @@ class AccountMonitor:
         self.positions: list[dict] = []
         self.rights: dict = {}
         self._prev_fill_counts: dict[str, int] = {}
-        # False until an OnOpenInterest snapshot has actually landed. An empty
-        # `positions` list means "we don't know yet", NOT "the account is
-        # flat" — the callback is asynchronous and has been seen ~4s late.
-        self.oi_snapshot_received: bool = False
+        # An empty ``positions`` list means "we don't know yet", NOT "the
+        # account is flat" — the callback is asynchronous. Which query a
+        # reply answers is the generation below, not a flag ``clear_positions``
+        # can reset (issue #202). Generation 0 is "no explicit query yet";
+        # ``_oi_answered_gen == -1`` means nothing has been answered.
+        self._oi_query_gen: int = 0
+        self._oi_answered_gen: int = -1
+
+    @property
+    def oi_query_generation(self) -> int:
+        """Generation of the latest ``begin_oi_query`` (0 if none yet)."""
+        return self._oi_query_gen
+
+    @property
+    def oi_snapshot_received(self) -> bool:
+        """True only when the latest query has been answered.
+
+        A reply captured under an older generation does not count, and
+        ``clear_positions`` does not clear this.
+        """
+        return self._oi_answered_gen == self._oi_query_gen
+
+    def begin_oi_query(self) -> int:
+        """Start a GetOpenInterestGW query and return its generation token.
+
+        Clears the position list so the reply can rebuild it. The previous
+        generation's answer stays recorded, but it no longer satisfies
+        ``oi_snapshot_received``.
+        """
+        self._oi_query_gen += 1
+        self.clear_positions()
+        return self._oi_query_gen
+
+    def _accepts_oi_generation(self, generation: int | None) -> bool:
+        """Untagged callers credit the current query. A mismatched token does not."""
+        return generation is None or generation == self._oi_query_gen
+
+    def _mark_oi_answered(self) -> None:
+        self._oi_answered_gen = self._oi_query_gen
 
     def reset(self) -> None:
         """Clear all state."""
@@ -263,27 +314,74 @@ class AccountMonitor:
         self.rights.clear()
         self._prev_fill_counts.clear()
         # Full state wipe → the snapshot we held is gone too; back to unknown.
-        self.oi_snapshot_received = False
+        self._oi_query_gen = 0
+        self._oi_answered_gen = -1
 
     # ── Position tracking ──
 
-    def add_position(self, parsed: dict) -> None:
-        """Add a parsed open interest entry."""
+    def add_position(self, parsed: dict, *, generation: int | None = None) -> bool:
+        """Add a parsed open interest entry for ``generation``.
+
+        Returns False when ``generation`` is not the latest query. The
+        position list is left unchanged in that case.
+        """
+        if not self._accepts_oi_generation(generation):
+            return False
         self.positions.append(parsed)
-        self.oi_snapshot_received = True
+        self._mark_oi_answered()
+        return True
 
     def clear_positions(self) -> None:
-        """Clear position list (before rebuilding from callbacks)."""
-        self.positions.clear()
-        # A fresh query is in flight — invalidate the previous snapshot so a
-        # racing reader can tell "not answered yet" from "answered: flat".
-        self.oi_snapshot_received = False
+        """Clear the position list.
 
-    def set_flat(self) -> None:
-        """Called when '001' (no positions) is received."""
+        Does not change whether the current query has been answered.
+        Starting a new query is ``begin_oi_query`` — a shared flag reset
+        here used to drop a reply that had already landed (issue #202).
+        """
         self.positions.clear()
-        # '001' IS an answer: the account really is flat.
-        self.oi_snapshot_received = True
+
+    def set_flat(self, *, generation: int | None = None) -> bool:
+        """Record an answered empty book (``001``, or a ``##`` with no rows).
+
+        Returns False when ``generation`` is not the latest query, without
+        clearing positions that belong to that newer query.
+        """
+        if not self._accepts_oi_generation(generation):
+            return False
+        self.positions.clear()
+        self._mark_oi_answered()
+        return True
+
+    def apply_open_interest(self, raw: str, *, generation: int | None = None) -> str:
+        """Apply one OnOpenInterest row. Credit it only to the latest query.
+
+        Returns ``position``, ``flat``, ``end``, ``stale``, or ``ignored``.
+
+        ``001`` is an answered empty book. A ``##`` end marker with no
+        position rows in this snapshot is the same empty answer (issue
+        #202). ``##`` after real rows only completes the snapshot — it
+        does not wipe them. ``970`` / ``980`` are errors, not an answer.
+        A generation other than the latest query is ``stale`` and changes
+        nothing.
+        """
+        if not self._accepts_oi_generation(generation):
+            return "stale"
+        text = raw if isinstance(raw, str) else ""
+        parsed = parse_open_interest(text)
+        if parsed is not None:
+            self.add_position(parsed)
+            return "position"
+        first = text.split(",")[0].strip() if text else ""
+        if first == "001":
+            self.set_flat()
+            return "flat"
+        if first == "##":
+            if self.positions:
+                self._mark_oi_answered()
+                return "end"
+            self.set_flat()
+            return "flat"
+        return "ignored"
 
     def update_rights(self, parsed: dict) -> None:
         """Store parsed future rights data."""

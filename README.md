@@ -235,7 +235,11 @@ Notes:
   is used. `--new` refuses to resume, `--resume` refuses to start fresh.
 - A real-order deploy waits for the futures account from the API and, like
   the GUI, aborts if the account already holds a position unless
-  `--allow-existing-position` is given.
+  `--allow-existing-position` is given. If that position query fails, is
+  rejected, or times out, the book is UNKNOWN and the deploy is refused
+  (exit 4) unless `--allow-unknown-position` is given. The two flags are
+  independent. The GUI asks on the Unknown Position dialog with the
+  default button on No.
 - Ctrl+C is the same as `stop`. Only CLI-started bots poll the STOP file; a
   GUI bot is stopped from the workbench.
 - `--detach` re-runs the command as a detached child (stdout appended to
