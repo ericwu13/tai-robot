@@ -197,6 +197,9 @@ pre.log .P3 { color: var(--muted); }
 // The local copy 404s where the lightweight_charts package is absent (Steven).
 function loadCdnCharts() {
   const s = document.createElement("script");
+  // SRI pins the unpkg fallback (sha384 of lightweight-charts 4.1.3 standalone).
+  s.crossOrigin = "anonymous";
+  s.integrity = "sha384-JZigAjwiaZtkUbA44CWkPaT3iBb/mU5pO6QOANp+OqHd4q+1+7MG1kzp2OOP9ZfP";
   s.src = "https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js";
   s.onload = () => { if (window.App) window.App.onChartsReady(); };
   document.head.appendChild(s);

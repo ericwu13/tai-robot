@@ -10,7 +10,11 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
 
 GET only, nothing is ever written to a bot directory. Clients outside
 loopback and the Tailscale ranges are refused even if a bind address
-would let them connect.
+would let them connect. The Host header must be a bound address with
+its port, ``localhost:<port>``, ``127.0.0.1:<port>``, or the MagicDNS
+name passed to ``--magic-dns`` (never hardcoded). Any other Host,
+including a missing one, is 421 so a DNS-rebinding page cannot read
+the API.
 """
 
 from __future__ import annotations
@@ -51,6 +55,118 @@ def client_allowed(addr: str) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
     return any(ip in net for net in ALLOWED_NETS)
+
+
+def _parse_ip(text: str):
+    """IP address, or None. IPv4-mapped IPv6 is unwrapped. Zone ids are dropped."""
+    raw = (text or "").strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    raw = raw.split("%", 1)[0].strip()
+    if not raw:
+        return None
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        return ip.ipv4_mapped
+    return ip
+
+
+def normalize_magic_dns(value: str) -> str:
+    """Hostname from ``--magic-dns``, or ``""`` when it is not a hostname.
+
+    An address belongs on ``--bind``, not here. The result is lowercase
+    ASCII (IDNA) with one optional ``:port`` suffix removed.
+    """
+    name = (value or "").strip().rstrip(".").lower()
+    if not name:
+        return ""
+    if ":" in name:
+        host, _, maybe_port = name.rpartition(":")
+        if host and maybe_port.isdigit():
+            name = host
+        else:
+            return ""
+    try:
+        name = name.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    if len(name) > 253 or ".." in name:
+        return ""
+    labels = name.split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            return ""
+        if label.startswith("-") or label.endswith("-"):
+            return ""
+        if not all(c.isalnum() or c == "-" for c in label):
+            return ""
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return name
+    return ""
+
+
+def _split_host_header(value: str) -> tuple[str, int] | None:
+    """``(host, port)`` from one Host header value. Port is required."""
+    got = str(value).strip().lower()
+    if not got or any(c in got for c in " \t\r\n/@\\#?"):
+        return None
+    if got.startswith("["):
+        end = got.find("]")
+        if end <= 1:
+            return None
+        host, rest = got[1:end], got[end + 1:]
+        if not rest.startswith(":"):
+            return None
+        port_s = rest[1:]
+    elif got.count(":") == 1:
+        host, _, port_s = got.partition(":")
+    else:
+        return None
+    if not host or not port_s.isdigit() or len(port_s) > 5:
+        return None
+    port = int(port_s)
+    if not 1 <= port <= 65535:
+        return None
+    return host.rstrip("."), port
+
+
+def host_header_allowed(value: str | None, *, binds, port: int,
+                        magic_dns: str = "") -> bool:
+    """True when Host is one of the bound addresses, loopback, or MagicDNS.
+
+    Compared with the listening port. Names match exactly (not as a
+    suffix), so ``evil.example`` and ``localhost.evil.example`` fail.
+    """
+    if value is None:
+        return False
+    parsed = _split_host_header(value)
+    if parsed is None or parsed[1] != int(port):
+        return False
+    host = parsed[0]
+    try:
+        host_name = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        host_name = host
+    names = {"localhost"}
+    magic = normalize_magic_dns(magic_dns)
+    if magic:
+        names.add(magic)
+    if host_name in names:
+        return True
+    ip = _parse_ip(host)
+    if ip is None:
+        return False
+    allowed = {ipaddress.ip_address("127.0.0.1")}
+    for addr in binds:
+        bound = _parse_ip(str(addr))
+        if bound is not None:
+            allowed.add(bound)
+    return ip in allowed
 
 
 def lwc_js_path() -> str | None:
@@ -98,6 +214,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
     host_label = socket.gethostname()
     cache = _Cache(CACHE_TTL_S)
     lwc_path: str | None = None
+    # Every address main() listens on. The accepting socket's address is
+    # added per request, so a test server that never sets this still
+    # allows its own bind.
+    bind_addrs: tuple[str, ...] = ()
+    magic_dns: str = ""
 
     def log_message(self, fmt, *args):  # access log is noise; errors still print
         pass
@@ -112,9 +233,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _host_allowed(self) -> bool:
+        # Exactly one Host. A duplicate is the usual way to slip a second
+        # name past a parser that reads only the first value.
+        values = self.headers.get_all("Host") if self.headers is not None else None
+        if not values or len(values) != 1:
+            return False
+        try:
+            bound_addr = self.server.server_address[0]
+            bound_port = int(self.server.server_address[1])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return False
+        binds = list(self.bind_addrs)
+        if bound_addr:
+            binds.append(bound_addr)
+        return host_header_allowed(
+            values[0], binds=binds, port=bound_port, magic_dns=self.magic_dns)
+
     def do_GET(self):  # noqa: N802 — http.server API
         if not client_allowed(self.client_address[0]):
             self._send(403, b"forbidden", "text/plain; charset=utf-8")
+            return
+        # DNS rebinding: the peer IP is loopback (or the tailnet) while the
+        # browser's Host is an attacker-controlled name. Refuse that name.
+        if not self._host_allowed():
+            self._send(421, b"misdirected", "text/plain; charset=utf-8")
             return
         url = urlparse(self.path)
         query = parse_qs(url.query)
@@ -174,6 +317,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bind-wait", type=float, default=0.0, metavar="SECONDS",
                    help="keep retrying an address that cannot be bound yet "
                         "(at boot the Tailscale IP appears after the task starts)")
+    p.add_argument("--magic-dns", default="", metavar="NAME",
+                   help="Tailscale MagicDNS hostname allowed in the Host "
+                        "header (example: machine.tailnet.ts.net). "
+                        "Not detected; an address belongs on --bind")
     return p
 
 
@@ -215,6 +362,13 @@ def bind_servers(binds, port: int, wait_s: float, *, make=_make_server,
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    magic = ""
+    if str(args.magic_dns or "").strip():
+        magic = normalize_magic_dns(args.magic_dns)
+        if not magic:
+            print("--magic-dns must be a hostname, not an IP or URL",
+                  file=sys.stderr)
+            return 2
     binds = list(dict.fromkeys(args.bind or ["127.0.0.1"]))
     if args.tailscale:
         ts_ip = tailscale_ipv4()
@@ -231,6 +385,8 @@ def main(argv=None) -> int:
 
     DashboardHandler.base_dir = os.path.abspath(args.base_dir)
     DashboardHandler.lwc_path = lwc_js_path()
+    DashboardHandler.bind_addrs = tuple(binds)
+    DashboardHandler.magic_dns = magic
     try:
         servers = bind_servers(binds, args.port, args.bind_wait)
     except OSError as exc:

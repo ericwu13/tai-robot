@@ -3,6 +3,8 @@
 Everything here reads files the bots already write; nothing is created,
 modified or deleted. All file access goes through ``fileio`` so a read
 can never make a bot's ``os.replace``/``os.remove`` fail on Windows.
+Symlinks are not followed: a linked bot directory is skipped, and a
+linked file inside a bot directory is not read.
 
 Liveness reuses the daily monitor's own rules (``classify_heartbeat``,
 ``pid_alive``, ``RECENT_CRASH_DAYS``) so the page and the monitor digest
@@ -86,10 +88,74 @@ def chart_time(dt: datetime) -> int:
     return int(wall.timestamp())
 
 
+def _contained(root: str, path: str) -> bool:
+    """True when ``path`` resolves inside ``root`` and no component is a symlink.
+
+    A ``debug_*.log`` symlink can point outside the bot root, and a linked
+    bot directory would otherwise be listed and served. Both are skipped.
+    """
+    if not root or not path:
+        return False
+    try:
+        root_n = os.path.normpath(root)
+        path_n = os.path.normpath(path)
+        rel = os.path.relpath(path_n, root_n)
+    except (OSError, ValueError):
+        return False
+    if os.path.isabs(rel):
+        return False
+    cur = root_n
+    for part in rel.split(os.sep):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return False
+        cur = os.path.join(cur, part)
+        try:
+            if os.path.islink(cur):
+                return False
+        except OSError:
+            return False
+    try:
+        root_real = os.path.realpath(root_n)
+        path_real = os.path.realpath(path_n)
+        return os.path.commonpath([root_real, path_real]) == root_real
+    except (OSError, ValueError):
+        return False
+
+
+def _readable(bot_dir: str, path: str) -> bool:
+    """File ``path`` may be read for this bot. The bot dir itself must not be a link."""
+    if not bot_dir or os.path.islink(bot_dir):
+        return False
+    root = os.path.dirname(os.path.normpath(bot_dir))
+    if not root:
+        return False
+    return _contained(root, path)
+
+
+def _read_text(bot_dir: str, path: str, max_bytes: int | None = None) -> str | None:
+    if not _readable(bot_dir, path):
+        return None
+    return fileio.read_text(path, max_bytes)
+
+
+def _read_json(bot_dir: str, path: str):
+    if not _readable(bot_dir, path):
+        return None
+    return fileio.read_json(path)
+
+
+def _tail(bot_dir: str, path: str, n: int, max_bytes: int = 256_000) -> list[str]:
+    if not _readable(bot_dir, path):
+        return []
+    return fileio.tail_lines(path, n, max_bytes=max_bytes)
+
+
 def read_lock(bot_dir: str) -> tuple[bool, int | None]:
     """``(lock_exists, pid_or_None)``. Shared open: never blocks a stop."""
     path = os.path.join(bot_dir, ".lock")
-    if not os.path.isfile(path):
+    if not _readable(bot_dir, path) or not os.path.isfile(path):
         return False, None
     text = fileio.read_text(path)
     if text is None:
@@ -101,7 +167,9 @@ def read_lock(bot_dir: str) -> tuple[bool, int | None]:
 
 
 def _newest(bot_dir: str, pattern: re.Pattern) -> list[tuple[str, str]]:
-    """``[(yyyymmdd, path)]`` newest first."""
+    """``[(yyyymmdd, path)]`` newest first. A symlinked bot dir is not listed."""
+    if not bot_dir or os.path.islink(bot_dir):
+        return []
     out = []
     try:
         names = os.listdir(bot_dir)
@@ -109,8 +177,11 @@ def _newest(bot_dir: str, pattern: re.Pattern) -> list[tuple[str, str]]:
         return out
     for name in names:
         m = pattern.match(name)
-        if m:
-            out.append((m.group(1), os.path.join(bot_dir, name)))
+        if not m:
+            continue
+        path = os.path.join(bot_dir, name)
+        if _readable(bot_dir, path):
+            out.append((m.group(1), path))
     out.sort(reverse=True)
     return out
 
@@ -123,8 +194,11 @@ def _mtime(path: str) -> float | None:
 
 
 def last_activity_ts(bot_dir: str) -> float | None:
-    stamps = [_mtime(os.path.join(bot_dir, n))
-              for n in ("session.json", "decisions.csv", HEARTBEAT_FILENAME)]
+    stamps = []
+    for name in ("session.json", "decisions.csv", HEARTBEAT_FILENAME):
+        path = os.path.join(bot_dir, name)
+        if _readable(bot_dir, path):
+            stamps.append(_mtime(path))
     logs = _newest(bot_dir, _DEBUG_RE)
     if logs:
         stamps.append(_mtime(logs[0][1]))
@@ -145,7 +219,7 @@ def bot_state(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
     UNKNOWN   lock file unreadable
     """
     has_lock, pid = read_lock(bot_dir)
-    hb = fileio.read_json(os.path.join(bot_dir, HEARTBEAT_FILENAME))
+    hb = _read_json(bot_dir, os.path.join(bot_dir, HEARTBEAT_FILENAME))
     out = {"state": "STOPPED", "pid": pid, "heartbeat_age_s": None,
            "inflight_call": "", "inflight_age_s": None}
     if not has_lock:
@@ -178,7 +252,7 @@ def _strategy_label(sess: dict) -> str:
 def last_bar(bot_dir: str) -> tuple[datetime | None, int | None]:
     """Newest 1-min bar's ``(open time, close)`` from the newest bars file."""
     for _day, path in _newest(bot_dir, _BARS_RE)[:2]:
-        for line in reversed(fileio.tail_lines(path, 5, max_bytes=4096)):
+        for line in reversed(_tail(bot_dir, path, 5, max_bytes=4096)):
             parts = line.split(",")
             if len(parts) < 5:
                 continue
@@ -191,7 +265,7 @@ def last_bar(bot_dir: str) -> tuple[datetime | None, int | None]:
 
 def read_decisions(bot_dir: str, n: int) -> list[dict]:
     path = os.path.join(bot_dir, "decisions.csv")
-    lines = fileio.tail_lines(path, n + 1)
+    lines = _tail(bot_dir, path, n + 1)
     rows = []
     for row in csv.reader(io.StringIO("\n".join(lines))):
         if len(row) < 8 or row[0] == "datetime":
@@ -228,10 +302,13 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
                                     else round(now.timestamp() - activity)),
             **bot_state(now, bot_dir, pid_alive_fn=pid_alive_fn,
                         activity_ts=activity)}
-    sess = fileio.read_json(os.path.join(bot_dir, "session.json"))
+    sess = _read_json(bot_dir, os.path.join(bot_dir, "session.json"))
     sess = sess if isinstance(sess, dict) else {}
     broker = sess.get("broker") if isinstance(sess.get("broker"), dict) else {}
-    trades = broker.get("trades") if isinstance(broker.get("trades"), list) else []
+    # A string or null in trades used to raise and drop the whole fleet.
+    raw_trades = broker.get("trades")
+    trades = ([t for t in raw_trades if isinstance(t, dict)]
+              if isinstance(raw_trades, list) else [])
     point_value = _to_int(sess.get("point_value") or broker.get("point_value"), 1)
     today = now.astimezone(TZ_TPE).date().isoformat()
     bar_dt, last_close = last_bar(bot_dir)
@@ -275,17 +352,24 @@ def market_state(now: datetime) -> dict:
             "degraded": False}
 
 
+def iter_bot_dirs(base_dir: str):
+    """Discovered bot dirs that resolve inside ``base_dir``. Symlinks are skipped."""
+    for d in discover_bot_dirs(base_dir):
+        if _contained(base_dir, d):
+            yield d
+
+
 def fleet(now: datetime, base_dir: str, *, host: str = "",
           pid_alive_fn=pid_alive) -> dict:
     bots = [bot_summary(now, d, pid_alive_fn=pid_alive_fn)
-            for d in discover_bot_dirs(base_dir)]
+            for d in iter_bot_dirs(base_dir)]
     return {"host": host, "now": now.astimezone(TZ_TPE).strftime("%Y-%m-%d %H:%M:%S"),
             "market": market_state(now), "bots": bots}
 
 
 def find_bot_dir(base_dir: str, bot_id: str) -> str | None:
     """Exact basename match among discovered bots — never a joined user path."""
-    for d in discover_bot_dirs(base_dir):
+    for d in iter_bot_dirs(base_dir):
         if os.path.basename(os.path.normpath(d)) == bot_id:
             return d
     return None
@@ -297,7 +381,7 @@ def read_bars(path: str) -> list[dict]:
     One out-of-order time silently blanks a lightweight-charts pane
     (issue #97), so the order is enforced here, not trusted.
     """
-    text = fileio.read_text(path)
+    text = _read_text(os.path.dirname(path), path)
     if not text:
         return []
     by_time: dict[int, dict] = {}
@@ -368,7 +452,7 @@ def bot_detail(now: datetime, bot_dir: str, day: str | None = None, *,
     if day not in days:
         day = days[0] if days else None
     bars = read_bars(dict(bar_files)[day]) if day else []
-    sess = fileio.read_json(os.path.join(bot_dir, "session.json"))
+    sess = _read_json(bot_dir, os.path.join(bot_dir, "session.json"))
     broker = (sess or {}).get("broker") if isinstance(sess, dict) else None
     raw_trades = (broker or {}).get("trades") if isinstance(broker, dict) else None
     trades = [_trade_row(t) for t in (raw_trades or []) if isinstance(t, dict)]
@@ -378,7 +462,7 @@ def bot_detail(now: datetime, bot_dir: str, day: str | None = None, *,
     log_path = logs.get(day) or (logs[max(logs)] if logs else None)
     log_lines = []
     if log_path:
-        for line in fileio.tail_lines(log_path, MAX_LOG_LINES):
+        for line in _tail(bot_dir, log_path, MAX_LOG_LINES):
             clean = redact_line(line)
             log_lines.append({"text": clean, "sev": log_severity(clean)})
     return {"bot": summary, "days": days, "day": day, "bars": bars,

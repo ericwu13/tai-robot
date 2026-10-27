@@ -6,12 +6,15 @@ never changes a bot directory, it agrees with the monitor about
 liveness, and nothing sensitive leaves through the page.
 """
 
+import http.client
 import json
 import os
+import socket
 import threading
 import urllib.error
 import urllib.request
 from datetime import datetime
+from urllib.parse import urlparse
 
 import pytest
 
@@ -196,6 +199,26 @@ def test_summary_pnl_today_and_win_rate(tmp_path):
     assert s["last_decision"]["bar_dt"] == "2026-10-26 09:15"   # bar_dt, not col 0
 
 
+def test_non_dict_trades_do_not_drop_the_fleet(tmp_path):
+    """One malformed trades entry must not 500 /api/fleet for every bot."""
+    d = make_bot(tmp_path, trades=[_trade(500, "2026-10-26 09:30:00")])
+    sess_path = d / "session.json"
+    sess = json.loads(sess_path.read_text(encoding="utf-8"))
+    sess["broker"]["trades"] = ["x", sess["broker"]["trades"][0], None]
+    sess_path.write_text(json.dumps(sess), encoding="utf-8")
+    make_bot(tmp_path, "TX00_beta", trades=[_trade(-100, "2026-10-26 09:40:00")])
+    data = snapshot.fleet(NOW, str(tmp_path), pid_alive_fn=_alive)
+    by_id = {b["id"]: b for b in data["bots"]}
+    assert set(by_id) == {"TMF00_alpha", "TX00_beta"}
+    assert by_id["TMF00_alpha"]["trades"] == 1
+    assert by_id["TMF00_alpha"]["trades_today"] == 1
+    assert by_id["TMF00_alpha"]["pnl_today"] == 500
+    assert by_id["TMF00_alpha"]["win_rate"] == pytest.approx(1)
+    assert by_id["TX00_beta"]["pnl_today"] == -100
+    det = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)
+    assert [t["pnl"] for t in det["trades"]] == [500]
+
+
 @pytest.mark.parametrize("side,real,expected", [
     ("LONG", 0, (45100 - 45000) * 2 * 10),
     ("LONG", 45050, (45100 - 45050) * 2 * 10),   # confirmed real fill wins
@@ -252,6 +275,31 @@ def test_detail_log_is_redacted_and_flagged(tmp_path):
     assert det["day"] == "20261026" and det["days"] == ["20261026"]
 
 
+# Placeholder shapes. Not a live webhook, key, or token.
+_WEBHOOK = ("https://discord.com/api/webhooks/123456789012345678/"
+            "placeholderToken")
+_KEY = "sk-ant-placeholder-key"
+_TOKEN = "P" * 50
+
+
+def test_detail_log_applies_monitor_redact(tmp_path):
+    """Replacing redact(text) with text must fail: webhooks, keys, long tokens."""
+    assert len(_TOKEN) >= 50
+    d = make_bot(tmp_path)
+    log = d / "debug_20261026.log"
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(f"[2026-10-26 09:00:03.000 TPE] webhook {_WEBHOOK}\n")
+        fh.write(f"[2026-10-26 09:00:04.000 TPE] key {_KEY}\n")
+        fh.write(f"[2026-10-26 09:00:05.000 TPE] token {_TOKEN}\n")
+    det = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)
+    text = "\n".join(line["text"] for line in det["log"])
+    assert _WEBHOOK not in text
+    assert "discord.com/api/webhooks" not in text
+    assert "<webhook>" in text
+    assert _KEY not in text and "<key>" in text
+    assert _TOKEN not in text and "<token>" in text
+
+
 def test_find_bot_dir_exact_match_only(tmp_path):
     make_bot(tmp_path)
     assert snapshot.find_bot_dir(str(tmp_path), "TMF00_alpha")
@@ -266,6 +314,59 @@ def test_snapshot_never_modifies_bot_dir(tmp_path):
     snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)
     after = {n: (os.path.getmtime(d / n), os.path.getsize(d / n)) for n in os.listdir(d)}
     assert after == before
+
+
+def _try_symlink(src, dst):
+    try:
+        os.symlink(os.fspath(src), os.fspath(dst),
+                   target_is_directory=os.path.isdir(src))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available")
+
+
+def test_symlink_log_outside_base_is_not_served(tmp_path):
+    base = tmp_path / "live"
+    d = make_bot(base)
+    outside = tmp_path / "secret.txt"
+    outside.write_text("OUTSIDE-FILE-MARKER\n", encoding="utf-8")
+    log = d / "debug_20261026.log"
+    log.unlink()
+    _try_symlink(outside, log)
+    det = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)
+    blob = json.dumps(det)
+    assert "OUTSIDE-FILE-MARKER" not in blob
+    assert det["log"] == []
+    assert det["log_file"] == ""
+    assert det["bot"]["strategy"] == "Demo"
+
+
+def test_symlink_session_outside_base_is_not_read(tmp_path):
+    base = tmp_path / "live"
+    d = make_bot(base)
+    outside = tmp_path / "outside-session.json"
+    outside.write_text(json.dumps({
+        "strategy": "LEAKED", "trading_mode": "paper", "point_value": 10,
+        "broker": {"trades": [], "_cumulative_pnl": 99999, "position_size": 0},
+    }), encoding="utf-8")
+    sess = d / "session.json"
+    sess.unlink()
+    _try_symlink(outside, sess)
+    summary = snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)
+    assert summary["strategy"] == ""
+    assert summary["pnl_total"] == 0
+    assert summary["state"] == "RUNNING"
+    assert "LEAKED" not in json.dumps(summary)
+
+
+def test_symlinked_bot_dir_is_skipped(tmp_path):
+    base = tmp_path / "live"
+    base.mkdir()
+    make_bot(tmp_path / "elsewhere")
+    _try_symlink(tmp_path / "elsewhere" / "TMF00_alpha", base / "TMF00_alpha")
+    make_bot(base, "TX00_real")
+    data = snapshot.fleet(NOW, str(base), pid_alive_fn=_alive)
+    assert [b["id"] for b in data["bots"]] == ["TX00_real"]
+    assert snapshot.find_bot_dir(str(base), "TMF00_alpha") is None
 
 
 # ── server ──────────────────────────────────────────────────────────────
@@ -326,12 +427,28 @@ def test_refuses_non_tailscale_bind(capsys):
     assert "refusing" in capsys.readouterr().err
 
 
+_LWC_SRI = "sha384-JZigAjwiaZtkUbA44CWkPaT3iBb/mU5pO6QOANp+OqHd4q+1+7MG1kzp2OOP9ZfP"
+
+
+def _dashboard_html() -> str:
+    path = os.path.join(os.path.dirname(server.__file__), "static", "index.html")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
 def test_cdn_fallback_defined_before_local_chart_script():
     """onerror on /static/lwc.js fires before later <script> blocks parse,
     so the fallback must already exist (blank chart on Steven otherwise)."""
-    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
-                encoding="utf-8").read()
+    html = _dashboard_html()
     assert html.index("function loadCdnCharts") < html.index('src="/static/lwc.js"')
+
+
+def test_cdn_fallback_has_sri():
+    html = _dashboard_html()
+    assert _LWC_SRI in html
+    assert 's.crossOrigin = "anonymous"' in html
+    assert html.index(_LWC_SRI) < html.index("document.head.appendChild(s)")
+    assert html.index('s.crossOrigin = "anonymous"') < html.index(_LWC_SRI)
 
 
 def test_missing_local_chart_bundle_is_404(live_server, monkeypatch):
@@ -400,3 +517,143 @@ def test_bind_without_wait_fails_fast():
         server.bind_servers(["100.74.0.1"], 8765, 0, make=make,
                             sleep=clock.sleep, monotonic=clock.monotonic)
     assert clock.t == 0
+
+
+# ── host allowlist (DNS rebinding) and the per-request peer gate ────────
+
+def test_host_header_allowlist_matrix():
+    kw = dict(binds=["127.0.0.1", "::1"], port=8765,
+              magic_dns="Machine.Tailnet.ts.net")
+    assert server.host_header_allowed("127.0.0.1:8765", **kw)
+    assert server.host_header_allowed("localhost:8765", **kw)
+    assert server.host_header_allowed("[::1]:8765", **kw)
+    assert server.host_header_allowed("machine.tailnet.ts.net:8765", **kw)
+    assert server.host_header_allowed(None, **kw) is False
+    assert server.host_header_allowed("", **kw) is False
+    assert server.host_header_allowed("evil.example", **kw) is False
+    assert server.host_header_allowed("evil.example:8765", **kw) is False
+    assert server.host_header_allowed("127.0.0.1:1", **kw) is False
+    assert server.host_header_allowed("localhost.evil.example:8765", **kw) is False
+    # Documentation address (RFC 5737), not a bound address.
+    assert server.host_header_allowed("192.0.2.8:8765", **kw) is False
+    bare = dict(binds=["127.0.0.1"], port=8765, magic_dns="")
+    assert server.host_header_allowed("machine.tailnet.ts.net:8765", **bare) is False
+
+
+def test_magic_dns_flag_rejects_non_names(capsys):
+    assert server.normalize_magic_dns("machine.tailnet.ts.net") == "machine.tailnet.ts.net"
+    assert server.normalize_magic_dns("Machine.Tailnet.ts.net.") == "machine.tailnet.ts.net"
+    assert server.normalize_magic_dns("127.0.0.1") == ""
+    assert server.normalize_magic_dns("not a host") == ""
+    assert server.normalize_magic_dns("") == ""
+    assert server.main(["--magic-dns", "not a host"]) == 2
+    assert "magic-dns" in capsys.readouterr().err
+
+
+def _server_port(live_server: str) -> int:
+    return urlparse(live_server).port
+
+
+def _http(port: int, host_header: str | None, path: str = "/api/fleet") -> tuple[int, bytes]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        if host_header is None:
+            conn.putrequest("GET", path, skip_host=True)
+            conn.putheader("Connection", "close")
+            conn.endheaders()
+        else:
+            conn.request("GET", path, headers={
+                "Host": host_header, "Connection": "close"})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def test_evil_host_is_rejected(live_server):
+    port = _server_port(live_server)
+    for host in ("evil.example", f"evil.example:{port}"):
+        status, body = _http(port, host)
+        assert status == 421
+        assert b"TMF00_alpha" not in body
+        assert b"misdirected" in body
+
+
+def test_allowed_hosts_return_fleet(live_server):
+    port = _server_port(live_server)
+    for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LocalHost:{port}"):
+        status, body = _http(port, host)
+        assert status == 200
+        assert json.loads(body)["bots"][0]["id"] == "TMF00_alpha"
+
+
+def test_missing_host_header_is_rejected(live_server):
+    status, body = _http(_server_port(live_server), None)
+    assert status == 421
+    assert b"TMF00_alpha" not in body
+
+
+def test_duplicate_host_header_is_rejected(live_server):
+    port = _server_port(live_server)
+    raw = (f"GET /api/fleet HTTP/1.1\r\n"
+           f"Host: 127.0.0.1:{port}\r\n"
+           f"Host: evil.example:{port}\r\n"
+           f"Connection: close\r\n\r\n").encode()
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.settimeout(5)
+        sock.sendall(raw)
+        sock.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            data += chunk
+    status = int(data.split(b"\r\n", 1)[0].split()[1])
+    assert status == 421
+    assert b"TMF00_alpha" not in data
+
+
+def test_configured_magic_dns_host_is_allowed(live_server, monkeypatch):
+    monkeypatch.setattr(server.DashboardHandler, "magic_dns", "machine.tailnet.ts.net")
+    port = _server_port(live_server)
+    status, body = _http(port, f"machine.tailnet.ts.net:{port}")
+    assert status == 200
+    assert json.loads(body)["bots"][0]["id"] == "TMF00_alpha"
+    status, body = _http(port, f"Machine.Tailnet.ts.net:{port}")
+    assert status == 200 and b"TMF00_alpha" in body
+    status, body = _http(port, f"other.tailnet.ts.net:{port}")
+    assert status == 421 and b"TMF00_alpha" not in body
+
+
+def test_magic_dns_host_rejected_when_unset(live_server):
+    port = _server_port(live_server)
+    status, body = _http(port, f"machine.tailnet.ts.net:{port}")
+    assert status == 421
+    assert b"TMF00_alpha" not in body
+
+
+class _DisallowedPeer(server.ThreadingHTTPServer):
+    def get_request(self):
+        request, addr = super().get_request()
+        # RFC 5737 documentation address. Not a host, and outside the peer allowlist.
+        return request, ("192.0.2.8", addr[1])
+
+
+def test_disallowed_peer_gets_403(tmp_path, monkeypatch):
+    """HTTP-level peer gate. A non-allowlisted client_address is 403."""
+    assert server.client_allowed("192.0.2.8") is False
+    make_bot(tmp_path)
+    monkeypatch.setattr(server.DashboardHandler, "base_dir", str(tmp_path))
+    monkeypatch.setattr(server.DashboardHandler, "cache", server._Cache(0))
+    srv = _DisallowedPeer(("127.0.0.1", 0), server.DashboardHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        status, body = _http(port, f"127.0.0.1:{port}")
+        assert status == 403
+        assert b"forbidden" in body
+        assert b"TMF00_alpha" not in body
+    finally:
+        srv.shutdown()
+        srv.server_close()
