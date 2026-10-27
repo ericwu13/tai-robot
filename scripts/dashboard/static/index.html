@@ -133,7 +133,7 @@ pre.log .P3 { color: var(--muted); }
       <table id="fleet">
         <thead><tr>
           <th>狀態</th><th>機器人</th><th>模式</th><th>持倉</th>
-          <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日已實現</th><th class="num">累計損益</th>
+          <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日</th><th class="num">累計損益</th>
           <th class="num">交易數</th><th class="num">勝率</th><th>最後決策</th><th>心跳</th>
         </tr></thead>
         <tbody></tbody>
@@ -340,7 +340,7 @@ const App = {
       tile("持倉中", String(holding)),
       tile("實單機器人", String(bots.filter((b) => b.trading_mode && b.trading_mode !== "paper").length)),
       tile("未實現損益", money(unreal)),
-      tile("本交易日已實現", money(sum("pnl_today"))),
+      tile("本交易日", money(sum("pnl_today"))),
       tile("累計損益", money(sum("pnl_total"))),
     );
     const body = $("fleet").tBodies[0];
@@ -360,7 +360,7 @@ const App = {
         td("模式", modeBadge(b.trading_mode)),
         td("持倉", positionText(b.position)),
         td("未實現", money(b.position ? b.position.unrealized : null), "num"),
-        td("本交易日已實現", money(b.pnl_today), "num"),
+        td("本交易日", money(b.pnl_today), "num"),
         td("累計損益", money(b.pnl_total), "num"),
         td("交易數", fmtInt(b.trades), "num"),
         td("勝率", b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%", "num"),
@@ -409,7 +409,7 @@ const App = {
       tile("持倉", positionText(b.position)),
       tile("最新價", b.last_price ? fmtInt(b.last_price) : "—"),
       tile("未實現", money(b.position ? b.position.unrealized : null)),
-      tile("本交易日已實現", money(b.pnl_today)),
+      tile("本交易日", money(b.pnl_today)),
       tile("累計損益", money(b.pnl_total)),
       tile("交易數 / 勝率", `${fmtInt(b.trades)} / ${b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%"}`),
       tile("心跳", b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s) : "—"),
