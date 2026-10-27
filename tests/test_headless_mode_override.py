@@ -248,28 +248,218 @@ def test_non_exact_paper_is_refused(tmp_path, caplog, mode):
                for r in caplog.records)
 
 
-def test_refused_file_remove_oserror_is_rate_limited(tmp_path, caplog, monkeypatch):
+def _busy(*_a, **_k):
+    raise OSError("busy")
+
+
+def _refusal_warnings(caplog):
+    return [r for r in caplog.records if "headless refused" in r.getMessage()]
+
+
+def _write_raw(path: str, text: str, mtime_ns: int | None = None) -> None:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    if mtime_ns is not None:
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+
+
+def test_stuck_refused_file_warns_once_until_the_bytes_change(
+        tmp_path, caplog, monkeypatch):
+    """Rename and remove both fail. One warning per exact file, then silence.
+
+    Rewriting the same size at the same mtime (FAT / some network shares)
+    still counts as a new file because the content hash changed.
+    """
     runner = _runner(tmp_path, "paper")
     runner._headless = True
     runner.suppress_strategy = True
-    _drop(runner, "auto")
-
-    def _busy(*_a, **_k):
-        raise OSError("busy")
-
+    statuses = []
+    runner.on("on_status", lambda msg: statuses.append(msg))
+    path = os.path.join(runner.bot_dir, "mode_override.json")
+    _write_raw(path, '{"trading_mode":"auto"}')
     monkeypatch.setattr("src.live.live_runner.os.replace", _busy)
     monkeypatch.setattr("src.live.live_runner.os.remove", _busy)
 
-    def _remove_warnings():
-        return [r for r in caplog.records if "could not remove" in r.getMessage()]
+    def _refused_status():
+        return [s for s in statuses if "headless refused" in s]
+
+    with caplog.at_level(logging.WARNING, logger="src.live.live_runner"):
+        for minute in range(5):
+            runner._process_aggregated_bar(_bar(minute))
+        assert len(_refusal_warnings(caplog)) == 1
+        assert len(_refused_status()) == 1
+        assert len([r for r in caplog.records if "could not remove" in r.getMessage()]) == 1
+        assert runner.trading_mode == "paper"
+        assert len(runner.data_store) == 5
+        assert os.path.isfile(path)
+        # The old 60s clock must not be what suppresses the next bars.
+        runner._mode_override_remove_warn_at = time.monotonic() - 61
+        runner._process_aggregated_bar(_bar(5))
+        assert len(_refusal_warnings(caplog)) == 1
+        assert len(_refused_status()) == 1
+
+        st = os.stat(path)
+        _write_raw(path, '{"trading_mode":"real"}', mtime_ns=st.st_mtime_ns)
+        again = os.stat(path)
+        assert again.st_size == st.st_size
+        assert again.st_mtime_ns == st.st_mtime_ns
+        runner._process_aggregated_bar(_bar(6))
+
+    assert len(_refusal_warnings(caplog)) == 2
+    assert len(_refused_status()) == 2
+    assert any(repr("real") in r.getMessage() for r in _refusal_warnings(caplog))
+    assert runner.trading_mode == "paper"
+    assert runner.broker.trade_source == "paper"
+    assert len(runner.data_store) == 7
+    assert os.path.isfile(path)
+
+
+def test_stuck_paper_file_applies_once_then_is_ignored(
+        tmp_path, caplog, monkeypatch):
+    """A paper file we cannot delete switches once, then is left alone."""
+    runner = _runner(tmp_path, "auto")
+    runner._headless = True
+    runner.suppress_strategy = True
+    statuses = []
+    runner.on("on_status", lambda msg: statuses.append(msg))
+    path = os.path.join(runner.bot_dir, "mode_override.json")
+    _write_raw(path, '{"trading_mode":"paper"}')
+    monkeypatch.setattr("src.live.live_runner.os.replace", _busy)
+    monkeypatch.setattr("src.live.live_runner.os.remove", _busy)
+
+    def _switched():
+        return [s for s in statuses if "switched" in s]
 
     with caplog.at_level(logging.WARNING, logger="src.live.live_runner"):
         runner._process_aggregated_bar(_bar(0))
-        runner._process_aggregated_bar(_bar(1))
-        assert len(_remove_warnings()) == 1
-        assert len(runner._aggregated_bars) == 2
         assert runner.trading_mode == "paper"
-        runner._mode_override_remove_warn_at = time.monotonic() - 61
-        runner._process_aggregated_bar(_bar(2))
-        assert len(_remove_warnings()) == 2
-        assert len(runner.data_store) == 3
+        assert runner.broker.trade_source == "paper"
+        assert len(_switched()) == 1
+        assert any("applied once" in s for s in statuses)
+        assert _refusal_warnings(caplog) == []
+        for minute in range(1, 4):
+            runner._process_aggregated_bar(_bar(minute))
+        assert runner.trading_mode == "paper"
+        assert len(_switched()) == 1
+        assert len([s for s in statuses if "applied once" in s]) == 1
+        assert os.path.isfile(path)
+        assert not os.path.exists(path + ".refused")
+
+        st = os.stat(path)
+        _write_raw(path, '{"trading_mode":"auto"}', mtime_ns=st.st_mtime_ns)
+        runner._process_aggregated_bar(_bar(4))
+
+    assert runner.trading_mode == "paper"
+    assert len(_refusal_warnings(caplog)) == 1
+    assert any(repr("auto") in s for s in statuses)
+    assert len(runner.data_store) == 5
+
+
+def test_check_mode_override_exception_does_not_drop_the_bar(
+        tmp_path, caplog, monkeypatch):
+    """The outer except Exception is what keeps a raising check off the bar."""
+    runner = _runner(tmp_path, "paper")
+    runner._headless = True
+    runner.suppress_strategy = True
+
+    def _boom():
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(runner, "_read_mode_override", _boom)
+    with caplog.at_level(logging.WARNING, logger="src.live.live_runner"):
+        runner._process_aggregated_bar(_bar(0))
+
+    assert runner.trading_mode == "paper"
+    assert len(runner.data_store) == 1
+    assert len(runner._aggregated_bars) == 1
+    assert any(
+        "check failed" in r.getMessage() and "RuntimeError" in r.getMessage()
+        for r in caplog.records)
+
+
+def test_invalid_json_is_logged_and_consumed_once(tmp_path, caplog):
+    runner = _runner(tmp_path, "paper")
+    runner._headless = True
+    runner.suppress_strategy = True
+    path = os.path.join(runner.bot_dir, "mode_override.json")
+    with open(path, "wb") as f:
+        f.write(b"")
+
+    with caplog.at_level(logging.WARNING, logger="src.live.live_runner"):
+        for minute in range(3):
+            runner._process_aggregated_bar(_bar(minute))
+
+    assert runner.trading_mode == "paper"
+    assert len(runner.data_store) == 3
+    assert not os.path.exists(path)
+    assert os.path.isfile(path + ".refused")
+    invalid = [r for r in caplog.records if "not valid JSON" in r.getMessage()]
+    assert len(invalid) == 1
+    assert "headless refused" in invalid[0].getMessage()
+
+
+def test_bom_prefixed_json_is_decoded(tmp_path, caplog):
+    runner = _runner(tmp_path, "auto")
+    runner._headless = True
+    runner.suppress_strategy = True
+    path = os.path.join(runner.bot_dir, "mode_override.json")
+    with open(path, "wb") as f:
+        f.write(b'\xef\xbb\xbf{"trading_mode":"paper"}')
+
+    with caplog.at_level(logging.WARNING, logger="src.live.live_runner"):
+        runner._process_aggregated_bar(_bar(0))
+
+    assert runner.trading_mode == "paper"
+    assert not os.path.exists(path)
+    assert not os.path.exists(path + ".refused")
+    assert not any("not valid JSON" in r.getMessage() for r in caplog.records)
+
+    with open(path, "wb") as f:
+        f.write(b'\xef\xbb\xbf{"trading_mode":"auto"}')
+    with caplog.at_level(logging.WARNING, logger="src.live.live_runner"):
+        runner._process_aggregated_bar(_bar(1))
+
+    assert runner.trading_mode == "paper"
+    assert not os.path.exists(path)
+    assert os.path.isfile(path + ".refused")
+    assert any("headless refused" in r.getMessage() and repr("auto") in r.getMessage()
+               for r in caplog.records)
+
+
+def test_refused_archive_keeps_the_previous_copy(tmp_path):
+    runner = _runner(tmp_path, "paper")
+    runner._headless = True
+    path = _drop(runner, "auto")
+    assert _poll(runner) is None
+    with open(path + ".refused", encoding="utf-8") as f:
+        first = f.read()
+    assert "auto" in first
+
+    _drop(runner, "real")
+    assert _poll(runner) is None
+    with open(path + ".refused", encoding="utf-8") as f:
+        latest = f.read()
+    with open(path + ".refused.1", encoding="utf-8") as f:
+        previous = f.read()
+    assert "real" in latest
+    assert "auto" in previous
+    assert not os.path.exists(path)
+
+
+def test_gui_invalid_json_is_removed_without_a_headless_warning(tmp_path, caplog):
+    runner = _runner(tmp_path, "paper")
+    assert runner._headless is False
+    path = os.path.join(runner.bot_dir, "mode_override.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{")
+
+    with caplog.at_level(logging.WARNING, logger="src.live.live_runner"):
+        assert _poll(runner) is None
+        assert _poll(runner) is None
+
+    assert runner.trading_mode == "paper"
+    assert not os.path.exists(path)
+    assert not os.path.exists(path + ".refused")
+    assert len(caplog.records) == 1
+    assert "not valid JSON" in caplog.records[0].getMessage()
+    assert "headless refused" not in caplog.records[0].getMessage()

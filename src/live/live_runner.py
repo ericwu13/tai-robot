@@ -8,6 +8,7 @@ State machine: IDLE → WARMING_UP → RUNNING → STOPPED
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -447,9 +448,35 @@ def load_1m_bars_from_csvs(bot_dir: str, symbol: str) -> list[Bar]:
 # so a list or dict cannot raise TypeError into the bar path.
 _HEADLESS_FILE_MODES = frozenset({"paper"})
 
-# One warning per minute when a refused file cannot be removed. A stuck
-# file is re-read every bar; the refusal still does not change the mode.
+# One warning per minute when a mode_override check raises. A refused
+# file that cannot be renamed or removed is not on this clock: it is
+# fingerprinted and ignored until that exact file changes.
 _MODE_OVERRIDE_REMOVE_WARN_S = 60.0
+
+
+def mode_override_fingerprint(path: str) -> tuple:
+    """Identity of a mode_override.json we could not consume.
+
+    ``("stat", mtime_ns, size, sha256)`` when the file can be stat'd.
+    The hash is part of the identity so a same-size, same-mtime rewrite
+    (FAT, some network shares) is a different file and is read again.
+    ``("missing",)`` when the path is gone. ``("unreadable",)`` when
+    stat fails. A stat that works but a read that fails uses an empty
+    digest, so a later successful read does not match it.
+    """
+    if not os.path.exists(path):
+        return ("missing",)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ("unreadable",)
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        digest = ""
+    return ("stat", int(mtime_ns), int(st.st_size), digest)
 
 
 def arm_headless_file_guard(runner, *, app_headless: bool = True,
@@ -591,6 +618,11 @@ class LiveRunner:
         # monotonic timestamps for rate-limited mode_override warnings.
         self._mode_override_remove_warn_at: float | None = None
         self._mode_override_error_warn_at: float | None = None
+        # Fingerprint of a mode_override.json whose rename and remove
+        # both failed. That exact file is ignored (still never applied
+        # as a live mode). A different mtime, size, or content hash is
+        # a new file and is evaluated again.
+        self._ignored_mode_override: tuple | None = None
         self.on_mode_changed: Callable[[str, str], None] | None = None
         # Optional external veto: returns a reason string to block the
         # switch, or None to allow it. The GUI wires this to the
@@ -741,16 +773,32 @@ class LiveRunner:
         setattr(self, attr, now)
         logger.warning("%s", message)
 
-    def _consume_refused_override(self, path: str) -> None:
+    def _rotated_refused_path(self, archive: str) -> str:
+        """A free ``mode_override.json.refused.N`` path. Never the live file."""
+        n = 1
+        while n < 10000:
+            candidate = f"{archive}.{n}"
+            if not os.path.exists(candidate):
+                return candidate
+            n += 1
+        return f"{archive}.{time.time_ns()}"
+
+    def _consume_refused_override(self, path: str, fingerprint: tuple) -> None:
         """Drop a refused mode_override.json so the next bar does not re-apply it.
 
         Rename to ``mode_override.json.refused`` first (an audit copy).
-        If that fails, remove the file. One rate-limited warning if the
-        remove also fails; the mode is still left unchanged.
+        An older ``.refused`` is moved to ``.refused.N`` first, so a newer
+        refusal does not destroy the previous copy. If the rename fails,
+        remove the file. If that also fails, remember ``fingerprint`` and
+        warn once; later bars with that exact file return before this
+        method. The mode is still left unchanged.
         """
         archive = path + ".refused"
         try:
+            if os.path.exists(archive):
+                os.replace(archive, self._rotated_refused_path(archive))
             os.replace(path, archive)
+            self._ignored_mode_override = None
             return
         except OSError:
             logger.debug(
@@ -759,11 +807,15 @@ class LiveRunner:
         try:
             os.remove(path)
         except OSError as exc:
-            self._warn_mode_override_rate_limited(
-                "_mode_override_remove_warn_at",
+            self._ignored_mode_override = fingerprint
+            logger.warning(
                 "[MODE] could not remove refused mode_override.json "
-                f"({type(exc).__name__}: {exc}); trading mode unchanged",
+                "(%s: %s); trading mode unchanged; ignoring this file "
+                "until it changes",
+                type(exc).__name__, exc,
             )
+            return
+        self._ignored_mode_override = None
 
     def _refuse_headless_file_mode(self, mode) -> bool:
         """Refuse a live/real or unusable mode_override.json on a headless bot.
@@ -786,19 +838,51 @@ class LiveRunner:
         self._emit("on_status", msg)
         return True
 
-    def _reject_bad_override(self, path: str, shown) -> None:
+    def _reject_bad_override(self, path: str, shown, fingerprint: tuple) -> None:
         """Consume an override that must not be applied. Never raises."""
         try:
             if self._headless:
                 self._refuse_headless_file_mode(shown)
-                self._consume_refused_override(path)
+                self._consume_refused_override(path, fingerprint)
                 return
             try:
                 os.remove(path)
             except OSError:
-                pass
+                self._ignored_mode_override = fingerprint
+            else:
+                self._ignored_mode_override = None
         except Exception:
             logger.debug("rejecting mode_override.json failed", exc_info=True)
+
+    def _reject_invalid_json(self, path: str, fingerprint: tuple) -> None:
+        """Log and consume a file that is not JSON. Never raises.
+
+        Empty, truncated, and undecodable files used to stay in place and
+        be re-read on every bar. A UTF-8 BOM in front of valid JSON is
+        decoded by the caller and does not reach here.
+        """
+        try:
+            if self._headless:
+                msg = (
+                    "[MODE] headless refused mode_override.json "
+                    "(not valid JSON); staying on "
+                    f"{self.trading_mode!r} (file consumed)"
+                )
+                logger.warning("%s", msg)
+                self._emit("on_status", msg)
+                self._consume_refused_override(path, fingerprint)
+                return
+            logger.warning(
+                "[MODE] ignored mode_override.json (not valid JSON)")
+            try:
+                os.remove(path)
+            except OSError:
+                self._ignored_mode_override = fingerprint
+            else:
+                self._ignored_mode_override = None
+        except Exception:
+            logger.debug("rejecting invalid mode_override.json failed",
+                         exc_info=True)
 
     def _check_mode_override(self) -> str | None:
         """Read and consume a mode_override.json file from the bot directory.
@@ -865,12 +949,23 @@ class LiveRunner:
                     pass
                 return None
         override_path = os.path.join(self.bot_dir, "mode_override.json")
+        if not os.path.exists(override_path):
+            return None
+        # Same bytes we already refused or already applied, and could
+        # not delete. Skip the warning and do not apply again.
+        fingerprint = mode_override_fingerprint(override_path)
+        if (self._ignored_mode_override is not None
+                and fingerprint == self._ignored_mode_override):
+            return None
         try:
-            if not os.path.exists(override_path):
-                return None
-            with open(override_path, "r") as f:
+            # utf-8-sig: a BOM-prefixed object is valid JSON, not a
+            # stuck malformed file.
+            with open(override_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._reject_invalid_json(override_path, fingerprint)
+            return None
+        except OSError:
             return None
         # isinstance before any membership test: a list or dict is not
         # hashable, and data.get on a JSON array or string raises.
@@ -878,19 +973,30 @@ class LiveRunner:
         # reaches this guard. deploy --mode auto assigns trading_mode
         # and does not read this file.
         if not isinstance(data, dict):
-            self._reject_bad_override(override_path, data)
+            self._reject_bad_override(override_path, data, fingerprint)
             return None
         mode = data.get("trading_mode")
         if not isinstance(mode, str):
-            self._reject_bad_override(override_path, mode)
+            self._reject_bad_override(override_path, mode, fingerprint)
             return None
         if self._headless and mode not in _HEADLESS_FILE_MODES:
-            self._reject_bad_override(override_path, mode)
+            self._reject_bad_override(override_path, mode, fingerprint)
             return None
         try:
             os.remove(override_path)
-        except OSError:
-            return None
+        except OSError as exc:
+            # Accepted mode (headless: exact paper). Apply it once, then
+            # ignore this exact file. A changed file is read again.
+            self._ignored_mode_override = fingerprint
+            msg = (
+                "[MODE] could not remove mode_override.json after reading "
+                f"trading_mode={mode!r} ({type(exc).__name__}: {exc}); "
+                "applied once and ignoring this file until it changes"
+            )
+            logger.warning("%s", msg)
+            self._emit("on_status", msg)
+            return mode
+        self._ignored_mode_override = None
         return mode
 
     def _apply_mode_switch(self, new_mode: str, *, user_confirmed: bool = False) -> None:
