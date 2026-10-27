@@ -400,3 +400,140 @@ def test_bind_without_wait_fails_fast():
         server.bind_servers(["100.74.0.1"], 8765, 0, make=make,
                             sleep=clock.sleep, monotonic=clock.monotonic)
     assert clock.t == 0
+
+
+# ── review fixes (PR #200) ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("text,leak", [
+    ("acct F1111111112222 ok", "1111111112222"),          # futures account shape
+    ("order L11112222 sent", "L11112222"),                 # client/order id
+    (f"channel_{FAKE_CHANNEL} send", FAKE_CHANNEL),        # no \b before the id
+    ("user f111111111 login", "f111111111"),               # lowercase TW-id shape
+])
+def test_redaction_covers_repo_id_shapes(text, leak):
+    assert leak not in snapshot.redact_line(text)
+
+
+def test_dead_lock_without_any_activity_is_crash(tmp_path):
+    d = make_bot(tmp_path, lock_pid=DEAD_PID)
+    assert snapshot.bot_state(NOW, str(d), pid_alive_fn=_alive,
+                              activity_ts=None)["state"] == "CRASHED"
+
+
+def test_one_malformed_bot_does_not_blank_the_fleet(tmp_path):
+    make_bot(tmp_path, name="TMF00_good")
+    bad = make_bot(tmp_path, name="TMF00_bad")
+    (bad / "session.json").write_text(
+        '{"point_value": 10, "broker": {"_cumulative_pnl": Infinity, '
+        '"position_size": 1, "position_side": "LONG", "entry_price": 45000, '
+        '"trades": [null, {"pnl": Infinity, "exit_dt": "2026-10-26 09:00"}]}}',
+        encoding="utf-8")
+    (bad / "bars_1m_20261026.csv").write_text(
+        "datetime,open,high,low,close,volume\n2026/10/26 09:15,inf,inf,inf,inf,1\n",
+        encoding="utf-8")
+    bots = {b["id"]: b for b in snapshot.fleet(NOW, str(tmp_path), pid_alive_fn=_alive)["bots"]}
+    assert bots["TMF00_good"]["state"] == "RUNNING"
+    assert "TMF00_bad" in bots
+    snapshot.bot_detail(NOW, str(bad), pid_alive_fn=_alive)
+
+
+def test_one_bot_raising_is_isolated(tmp_path, monkeypatch):
+    make_bot(tmp_path, name="TMF00_good")
+    make_bot(tmp_path, name="TMF00_bad")
+    real = snapshot.bot_summary
+
+    def flaky(now, bot_dir, **kw):
+        if bot_dir.endswith("TMF00_bad"):
+            raise RuntimeError(f"boom {FAKE_CHANNEL}")
+        return real(now, bot_dir, **kw)
+
+    monkeypatch.setattr(snapshot, "bot_summary", flaky)
+    bots = {b["id"]: b for b in snapshot.fleet(NOW, str(tmp_path), pid_alive_fn=_alive)["bots"]}
+    assert bots["TMF00_bad"]["state"] == "UNKNOWN"
+    assert FAKE_CHANNEL not in bots["TMF00_bad"]["error"]
+    assert bots["TMF00_good"]["state"] == "RUNNING"
+
+
+def test_pnl_today_is_the_taifex_trading_day(tmp_path):
+    # Monday 10:00: the trading day began Friday 15:00 (night session).
+    trades = [_trade(700, "2026-10-23 16:30:00"),     # Fri night → counts
+              _trade(-200, "2026-10-26 09:50:00"),    # Mon day → counts
+              _trade(1000, "2026-10-23 13:40:00")]    # Fri day → previous day
+    d = make_bot(tmp_path, trades=trades)
+    s = snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)
+    assert (s["pnl_today"], s["trades_today"]) == (500, 2)
+    assert s["trading_day_start"] == "2026-10-23 15:00"
+
+
+def test_session_json_reopened_only_when_it_changes(tmp_path, monkeypatch):
+    d = make_bot(tmp_path)
+    snapshot._session_cache.clear()
+    opens = []
+    real = fileio.read_json
+    monkeypatch.setattr(fileio, "read_json", lambda p: opens.append(p) or real(p))
+    for _ in range(3):
+        snapshot.read_session(str(d))
+    assert len(opens) == 1
+    sj = d / "session.json"
+    sj.write_text(json.dumps({"strategy": "Changed", "broker": {}}), encoding="utf-8")
+    os.utime(sj, ns=(os.stat(sj).st_atime_ns, os.stat(sj).st_mtime_ns + 10**9))
+    assert snapshot.read_session(str(d))["strategy"] == "Changed"
+    assert len(opens) == 2
+
+
+def test_session_garbage_keeps_last_good_copy(tmp_path):
+    d = make_bot(tmp_path)
+    snapshot._session_cache.clear()
+    assert snapshot.read_session(str(d))["strategy"] == "Demo"
+    sj = d / "session.json"
+    sj.write_text('{"strategy": "Dem', encoding="utf-8")
+    os.utime(sj, ns=(os.stat(sj).st_atime_ns, os.stat(sj).st_mtime_ns + 10**9))
+    assert snapshot.read_session(str(d))["strategy"] == "Demo"
+
+
+@pytest.mark.parametrize("host,ok", [
+    (None, True), ("localhost:8765", True), ("127.0.0.1:8765", True), ("[::1]:8765", True),
+    ("100.74.0.1:8765", True), ("steven:8765", True), ("Steven.tail1234.ts.net", True),
+    ("attacker.example", False), ("attacker.example:8765", False),
+    ("steven.attacker.example", False), ("evil.ts.net", False),
+])
+def test_host_allowed_blocks_dns_rebinding(host, ok):
+    assert server.host_allowed(host, {"127.0.0.1", "100.74.0.1"}, "Steven") is ok
+
+
+def test_server_rejects_foreign_host_header(live_server):
+    req = urllib.request.Request(live_server + "/api/fleet",
+                                 headers={"Host": "attacker.example"})
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=10)
+    assert exc.value.code == 403
+
+
+def test_bound_address_serves_before_later_ones_bind():
+    clock, served = _FakeClock(), []
+
+    def make(addr, port):
+        if addr.startswith("100.") and clock.t < 20:
+            raise OSError(10049, "not yet")
+        return _FakeServer(addr)
+
+    def on_bound(addr, srv):
+        served.append((addr, clock.t))
+
+    server.bind_servers(["127.0.0.1", "100.74.0.1"], 8765, 60, make=make,
+                        on_bound=on_bound, sleep=clock.sleep, monotonic=clock.monotonic)
+    assert served[0] == ("127.0.0.1", 0)       # localhost up immediately
+    assert served[1][0] == "100.74.0.1" and served[1][1] >= 20
+
+
+def test_tailscale_lookup_waits_at_boot():
+    clock, answers = _FakeClock(), iter([None, None, "100.74.0.1"])
+    ip = server.wait_for_tailscale_ip(60, lookup=lambda: next(answers),
+                                      sleep=clock.sleep, monotonic=clock.monotonic)
+    assert ip == "100.74.0.1" and clock.t == 10
+
+
+def test_tailscale_lookup_gives_up_after_wait():
+    clock = _FakeClock()
+    assert server.wait_for_tailscale_ip(12, lookup=lambda: None, sleep=clock.sleep,
+                                        monotonic=clock.monotonic) is None

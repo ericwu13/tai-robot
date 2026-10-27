@@ -30,6 +30,7 @@ from scripts.monitor.common import (
     TZ_TPE, discover_bot_dirs, pid_alive, redact,
 )
 from scripts.dashboard import fileio
+from src.utils.log_redact import scrub_ids
 
 # A stopped bot with no file activity in this window is retired and is
 # hidden unless the viewer asks for it.
@@ -42,13 +43,15 @@ MAX_DAYS = 14
 _BARS_RE = re.compile(r"^bars_1m_(\d{8})\.csv$")
 _DEBUG_RE = re.compile(r"^debug_(\d{8})\.log$")
 # Discord channel/user IDs (snowflakes) and TW national-ID-shaped values
-# appear in debug logs; neither may leave the box through the page.
-_RE_SNOWFLAKE = re.compile(r"\b\d{17,20}\b")
-_RE_TW_ID = re.compile(r"\b[A-Z][12]\d{8}\b")
+# appear in debug logs; neither may leave the box through the page. Digit
+# lookarounds, not \b: "channel_<id>" has no word boundary before the id.
+_RE_SNOWFLAKE = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
+_RE_TW_ID = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][12]\d{8}(?!\d)")
 
 
 def redact_line(text: str) -> str:
-    out = redact(text)
+    """Monitor redaction + Capital account/order ids + snowflakes + TW ids."""
+    out = scrub_ids(redact(text))
     out = _RE_SNOWFLAKE.sub("<id>", out)
     return _RE_TW_ID.sub("<id>", out)
 
@@ -65,7 +68,7 @@ def log_severity(line: str) -> str:
 def _to_int(value, default: int = 0) -> int:
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # Infinity / NaN in JSON
         return default
 
 
@@ -124,7 +127,8 @@ def _mtime(path: str) -> float | None:
 
 def last_activity_ts(bot_dir: str) -> float | None:
     stamps = [_mtime(os.path.join(bot_dir, n))
-              for n in ("session.json", "decisions.csv", HEARTBEAT_FILENAME)]
+              for n in (".lock", "session.json", "decisions.csv",
+                        HEARTBEAT_FILENAME, "regime_state.json")]
     logs = _newest(bot_dir, _DEBUG_RE)
     if logs:
         stamps.append(_mtime(logs[0][1]))
@@ -139,8 +143,11 @@ def bot_state(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
     RUNNING   lock PID alive, heartbeat fresh
     LAGGING   lock PID alive, heartbeat missed a few ticks (monitor STALE)
     HUNG      lock PID alive, main loop stopped pumping
-    NO_HEARTBEAT  lock PID alive, no usable heartbeat (older build)
-    CRASHED   lock left behind by a dead PID, bot active recently
+    NO_HEARTBEAT  lock PID alive, heartbeat missing/corrupt/foreign PID.
+              Liveness is unproven (the monitor's UNKNOWN), so the page
+              flags it rather than calling it running.
+    CRASHED   lock left behind by a dead PID, bot active recently or with
+              no activity evidence at all (monitor grades both P1)
     STOPPED   no lock (clean stop), or a dead-PID lock on a retired bot
     UNKNOWN   lock file unreadable
     """
@@ -154,7 +161,7 @@ def bot_state(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
         out["state"] = "UNKNOWN"
         return out
     if not pid_alive_fn(pid):
-        recent = (activity_ts is not None and
+        recent = (activity_ts is None or
                   now.timestamp() - activity_ts <= RECENT_CRASH_DAYS * 86400)
         out["state"] = "CRASHED" if recent else "STOPPED"
         return out
@@ -219,6 +226,47 @@ def _position(broker: dict, point_value: int, last_close: int | None) -> dict | 
             "unrealized": unrealized}
 
 
+_session_cache: dict[str, tuple[int, int, dict]] = {}
+
+
+def read_session(bot_dir: str) -> dict:
+    """session.json, re-read only when its size or mtime changed.
+
+    Every open of session.json, even a share-delete one, turns the bot's
+    next ``os.replace`` into the remove-then-rename fallback; a crash
+    between those two steps would lose the file. The file changes on
+    trade events, so polling its stat keeps content opens rare.
+    """
+    path = os.path.join(bot_dir, "session.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        _session_cache.pop(path, None)
+        return {}
+    hit = _session_cache.get(path)
+    if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2]
+    data = fileio.read_json(path)
+    if not isinstance(data, dict):
+        return hit[2] if hit else {}        # mid-write garbage: keep last good
+    _session_cache[path] = (st.st_mtime_ns, st.st_size, data)
+    return data
+
+
+def trading_day_start(now: datetime) -> datetime:
+    """Start of the TAIFEX trading day containing ``now``: the most recent
+    night-session open (15:00 TPE of the previous business day). Falls
+    back to TPE midnight when the session calendar is unavailable."""
+    try:
+        from src.regime.switch_logic import latest_night_session
+        night = latest_night_session(now)
+        if night is not None:
+            return night.open_dt.astimezone(TZ_TPE)
+    except Exception:  # noqa: BLE001 — a broken calendar must not break the page
+        pass
+    return now.astimezone(TZ_TPE).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     name = os.path.basename(os.path.normpath(bot_dir))
     activity = last_activity_ts(bot_dir)
@@ -228,12 +276,15 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
                                     else round(now.timestamp() - activity)),
             **bot_state(now, bot_dir, pid_alive_fn=pid_alive_fn,
                         activity_ts=activity)}
-    sess = fileio.read_json(os.path.join(bot_dir, "session.json"))
-    sess = sess if isinstance(sess, dict) else {}
+    sess = read_session(bot_dir)
     broker = sess.get("broker") if isinstance(sess.get("broker"), dict) else {}
     trades = broker.get("trades") if isinstance(broker.get("trades"), list) else []
+    trades = [t for t in trades if isinstance(t, dict)]
     point_value = _to_int(sess.get("point_value") or broker.get("point_value"), 1)
-    today = now.astimezone(TZ_TPE).date().isoformat()
+    day_start = trading_day_start(now)
+    todays = [t for t in trades
+              if (exit_dt := parse_tpe(t.get("exit_dt"))) is not None
+              and exit_dt >= day_start]
     bar_dt, last_close = last_bar(bot_dir)
     wins = sum(1 for t in trades if _to_int(t.get("pnl")) > 0)
     info.update({
@@ -244,10 +295,9 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
         "trades": len(trades),
         "win_rate": round(wins / len(trades), 3) if trades else None,
         "pnl_total": _to_int(broker.get("_cumulative_pnl")),
-        "pnl_today": sum(_to_int(t.get("pnl")) for t in trades
-                         if str(t.get("exit_dt") or "")[:10] == today),
-        "trades_today": sum(1 for t in trades
-                            if str(t.get("exit_dt") or "")[:10] == today),
+        "pnl_today": sum(_to_int(t.get("pnl")) for t in todays),
+        "trades_today": len(todays),
+        "trading_day_start": day_start.strftime("%Y-%m-%d %H:%M"),
         "position": _position(broker, point_value, last_close),
         "last_price": last_close,
         "last_bar_dt": bar_dt.strftime("%Y-%m-%d %H:%M") if bar_dt else "",
@@ -260,6 +310,20 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     info["active"] = running or (
         activity is not None and now.timestamp() - activity <= ACTIVE_DAYS * 86400)
     return info
+
+
+def _broken_bot(bot_dir: str, exc: Exception) -> dict:
+    """Stand-in row so one malformed directory cannot blank the fleet."""
+    name = os.path.basename(os.path.normpath(bot_dir))
+    return {"id": name, "symbol": name.partition("_")[0],
+            "bot_name": name.partition("_")[2] or name, "state": "UNKNOWN",
+            "error": redact_line(f"{type(exc).__name__}: {exc}"), "pid": None,
+            "heartbeat_age_s": None, "inflight_call": "", "inflight_age_s": None,
+            "last_activity_age_s": None, "strategy": "", "trading_mode": "",
+            "interval_s": 0, "point_value": 1, "trades": 0, "win_rate": None,
+            "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
+            "last_price": None, "last_bar_dt": "", "saved_at": "",
+            "last_decision": None, "active": True}
 
 
 def market_state(now: datetime) -> dict:
@@ -277,8 +341,12 @@ def market_state(now: datetime) -> dict:
 
 def fleet(now: datetime, base_dir: str, *, host: str = "",
           pid_alive_fn=pid_alive) -> dict:
-    bots = [bot_summary(now, d, pid_alive_fn=pid_alive_fn)
-            for d in discover_bot_dirs(base_dir)]
+    bots = []
+    for d in discover_bot_dirs(base_dir):
+        try:
+            bots.append(bot_summary(now, d, pid_alive_fn=pid_alive_fn))
+        except Exception as exc:  # noqa: BLE001 — isolate one bad bot dir
+            bots.append(_broken_bot(d, exc))
     return {"host": host, "now": now.astimezone(TZ_TPE).strftime("%Y-%m-%d %H:%M:%S"),
             "market": market_state(now), "bots": bots}
 
@@ -310,7 +378,7 @@ def read_bars(path: str) -> list[dict]:
             continue
         try:
             o, h, lo, c = (int(float(x)) for x in parts[1:5])
-        except ValueError:
+        except (ValueError, OverflowError):
             continue
         t = chart_time(dt)
         by_time[t] = {"time": t, "open": o, "high": h, "low": lo, "close": c,
@@ -368,8 +436,8 @@ def bot_detail(now: datetime, bot_dir: str, day: str | None = None, *,
     if day not in days:
         day = days[0] if days else None
     bars = read_bars(dict(bar_files)[day]) if day else []
-    sess = fileio.read_json(os.path.join(bot_dir, "session.json"))
-    broker = (sess or {}).get("broker") if isinstance(sess, dict) else None
+    sess = read_session(bot_dir)
+    broker = sess.get("broker")
     raw_trades = (broker or {}).get("trades") if isinstance(broker, dict) else None
     trades = [_trade_row(t) for t in (raw_trades or []) if isinstance(t, dict)]
     markers = trade_markers(trades, bars[0]["time"], bars[-1]["time"] + 59) if bars else []

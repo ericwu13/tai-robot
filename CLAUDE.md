@@ -79,7 +79,8 @@ python test_kline.py       # COM-based KLine history GUI
 - `python -m scripts.dashboard.server [--tailscale] [--base-dir <data/live>] [--port 8765]` — read-only zh-TW web page over every bot dir: fleet table + per-bot candles/trades/decisions/log. Stdlib only. Binds loopback by default; `--tailscale` adds the tailnet IP; clients outside loopback/100.64.0.0/10/fd7a:115c:a1e0::/48 get 403.
 - **Never writes to a bot dir.** Liveness reuses `check_bots.classify_heartbeat` + `common.pid_alive` (never `LiveRunner.check_lock`, which deletes stale locks), so page and monitor agree.
 - **All reads go through `fileio.open_shared` (FILE_SHARE_DELETE).** A plain `open()` reader on Windows makes `save_session` raise (its `os.replace` fails against ANY open handle, and the remove-then-rename fallback needs share-delete) and blocks `.lock` removal on clean stop. `tests/test_dashboard.py` pins both directions.
-- Log lines pass `redact_line` (monitor `redact` + Discord snowflakes + TW-ID shapes) before leaving the box. Times use `bar_dt`/trade strings (TPE); chart times are TPE wall-clock encoded as UTC.
+- Log lines pass `redact_line` (monitor `redact` + `log_redact.scrub_ids` + Discord snowflakes + TW-ID shapes) before leaving the box. Requests whose `Host` is not localhost/a bound address/the machine name (or its MagicDNS `*.ts.net`) get 403 — DNS-rebinding guard.
+- `session.json` is re-read only when its stat changes (`read_session`): every open turns the bot's next `os.replace` into the non-atomic remove+rename fallback. A live PID with no usable heartbeat is NO_HEARTBEAT (orange, needs attention), never "running" — the monitor treats it as UNKNOWN. Times use `bar_dt`/trade strings (TPE); chart times are TPE wall-clock encoded as UTC.
 - Colors follow 紅漲綠跌 (red = profit/up). Health states use blue/orange so they never read as P&L. `trading_mode != "paper"` shows a 實單 badge.
 
 ## Conventions

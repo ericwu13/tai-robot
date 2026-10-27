@@ -133,7 +133,7 @@ pre.log .P3 { color: var(--muted); }
       <table id="fleet">
         <thead><tr>
           <th>狀態</th><th>機器人</th><th>模式</th><th>持倉</th>
-          <th class="num">未實現</th><th class="num">今日已實現</th><th class="num">累計損益</th>
+          <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日已實現</th><th class="num">累計損益</th>
           <th class="num">交易數</th><th class="num">勝率</th><th>最後決策</th><th>心跳</th>
         </tr></thead>
         <tbody></tbody>
@@ -208,14 +208,14 @@ function loadCdnCharts() {
 
 const STATE = {
   RUNNING:      ["運作中", "s-ok"],
-  NO_HEARTBEAT: ["運作中（無心跳）", "s-ok"],
+  NO_HEARTBEAT: ["無心跳・無法確認", "s-warn"],
   LAGGING:      ["延遲", "s-warn"],
   UNKNOWN:      ["狀態不明", "s-warn"],
   HUNG:         ["⚠ 卡住", "s-bad"],
   CRASHED:      ["⚠ 異常終止", "s-bad"],
   STOPPED:      ["已停止", "s-off"],
 };
-const STATE_ORDER = ["HUNG", "CRASHED", "LAGGING", "UNKNOWN", "RUNNING", "NO_HEARTBEAT", "STOPPED"];
+const STATE_ORDER = ["HUNG", "CRASHED", "NO_HEARTBEAT", "LAGGING", "UNKNOWN", "RUNNING", "STOPPED"];
 const MODE = { paper: "模擬", semi_auto: "半自動・實單", auto: "全自動・實單" };
 function modeBadge(m) {
   const real = m && m !== "paper";
@@ -265,6 +265,12 @@ function positionText(p) {
   const price = p.real_entry_price || p.entry_price;
   return el("span", { class: p.side === "LONG" ? "up" : "down" },
     `${SIDE[p.side] || p.side} ${p.size} 口 @ ${fmtInt(price)}`);
+}
+// 損益 is the broker's simulated P&L, so the row shows the simulated price it
+// came from; a confirmed real fill that differs is shown underneath.
+function priceCell(sim, real) {
+  if (!real || real === sim) return fmtInt(sim);
+  return el("span", null, fmtInt(sim), el("div", { class: "sub" }, "實際 " + fmtInt(real)));
 }
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
@@ -320,8 +326,8 @@ const App = {
 
   renderFleet() {
     const bots = this.visibleBots();
-    const live = bots.filter((b) => ["RUNNING", "NO_HEARTBEAT", "LAGGING"].includes(b.state)).length;
-    const problems = bots.filter((b) => ["HUNG", "CRASHED", "LAGGING", "UNKNOWN"].includes(b.state)).length;
+    const live = bots.filter((b) => ["RUNNING", "LAGGING"].includes(b.state)).length;
+    const problems = bots.filter((b) => ["HUNG", "CRASHED", "NO_HEARTBEAT", "LAGGING", "UNKNOWN"].includes(b.state)).length;
     const holding = bots.filter((b) => b.position).length;
     const sum = (k) => bots.reduce((a, b) => a + (b[k] || 0), 0);
     const unreal = bots.reduce((a, b) => a + ((b.position && b.position.unrealized) || 0), 0);
@@ -331,7 +337,7 @@ const App = {
       tile("持倉中", String(holding)),
       tile("實單機器人", String(bots.filter((b) => b.trading_mode && b.trading_mode !== "paper").length)),
       tile("未實現損益", money(unreal)),
-      tile("今日已實現", money(sum("pnl_today"))),
+      tile("本交易日已實現", money(sum("pnl_today"))),
       tile("累計損益", money(sum("pnl_total"))),
     );
     const body = $("fleet").tBodies[0];
@@ -351,12 +357,12 @@ const App = {
         td("模式", modeBadge(b.trading_mode)),
         td("持倉", positionText(b.position)),
         td("未實現", money(b.position ? b.position.unrealized : null), "num"),
-        td("今日已實現", money(b.pnl_today), "num"),
+        td("本交易日已實現", money(b.pnl_today), "num"),
         td("累計損益", money(b.pnl_total), "num"),
         td("交易數", fmtInt(b.trades), "num"),
         td("勝率", b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%", "num"),
         td("最後決策", d ? el("span", { title: d.reason }, `${d.bar_dt.slice(5)} ${ACTION[d.action] || d.action}`) : "—"),
-        td("心跳", hb + (b.inflight_call ? `（等待 ${b.inflight_call}）` : "")),
+        td("心跳", b.error ? el("span", { class: "alert", title: b.error }, "資料讀取失敗") : hb + (b.inflight_call ? `（等待 ${b.inflight_call}）` : "")),
       );
       return tr;
     }));
@@ -400,7 +406,7 @@ const App = {
       tile("持倉", positionText(b.position)),
       tile("最新價", b.last_price ? fmtInt(b.last_price) : "—"),
       tile("未實現", money(b.position ? b.position.unrealized : null)),
-      tile("今日已實現", money(b.pnl_today)),
+      tile("本交易日已實現", money(b.pnl_today)),
       tile("累計損益", money(b.pnl_total)),
       tile("交易數 / 勝率", `${fmtInt(b.trades)} / ${b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%"}`),
       tile("心跳", b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s) : "—"),
@@ -416,9 +422,9 @@ const App = {
     $("d-trades").tBodies[0].replaceChildren(...(d.trades.length ? d.trades.map((t) => el("tr", null,
       el("td", { class: t.side === "LONG" ? "up" : "down" }, SIDE[t.side] || t.side),
       el("td", null, t.entry_dt.slice(0, 16)),
-      el("td", { class: "num" }, fmtInt(t.real_entry_price || t.entry_price)),
+      el("td", { class: "num" }, priceCell(t.entry_price, t.real_entry_price)),
       el("td", null, t.exit_dt.slice(0, 16)),
-      el("td", { class: "num" }, t.exit_price ? fmtInt(t.real_exit_price || t.exit_price) : "—"),
+      el("td", { class: "num" }, t.exit_price ? priceCell(t.exit_price, t.real_exit_price) : "—"),
       el("td", { class: "num" }, money(t.pnl)),
       el("td", null, EXIT_TAG[t.exit_tag] || t.exit_tag || "—"),
       el("td", null, SOURCE[t.source] || t.source || "—"),

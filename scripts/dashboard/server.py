@@ -88,6 +88,26 @@ class _Cache:
             return body
 
 
+def host_allowed(host_header: str | None, bound: set[str], machine: str) -> bool:
+    """DNS-rebinding guard: a page on attacker.example that re-points its
+    name at 127.0.0.1 or a 100.x address still sends ``Host:
+    attacker.example``. Accept only loopback names, the bound addresses,
+    this machine's name and its MagicDNS name. No header (non-browser
+    HTTP/1.0 clients) is allowed: rebinding needs a browser, which always
+    sends one."""
+    if not host_header:
+        return True
+    host = host_header.strip().lower()
+    if host.startswith("["):                      # [ipv6]:port
+        host = host[1:host.find("]")] if "]" in host else host[1:]
+    elif host.count(":") == 1:                    # name:port / ipv4:port
+        host = host.split(":", 1)[0]
+    machine = machine.lower()
+    if host in {"localhost", "127.0.0.1", "::1", machine} | bound:
+        return True
+    return host.startswith(machine + ".") and host.endswith(".ts.net")
+
+
 def _json(payload) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -98,6 +118,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     host_label = socket.gethostname()
     cache = _Cache(CACHE_TTL_S)
     lwc_path: str | None = None
+    bound_hosts: set[str] = set()
 
     def log_message(self, fmt, *args):  # access log is noise; errors still print
         pass
@@ -113,7 +134,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802 — http.server API
-        if not client_allowed(self.client_address[0]):
+        if not client_allowed(self.client_address[0]) or not host_allowed(
+                self.headers.get("Host"), self.bound_hosts, self.host_label):
             self._send(403, b"forbidden", "text/plain; charset=utf-8")
             return
         url = urlparse(self.path)
@@ -147,6 +169,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as exc:  # noqa: BLE001 — answer, don't drop the socket
+            sys.stderr.write(f"dashboard: {url.path} failed: {type(exc).__name__}: {exc}\n")
+            try:
+                self._send(500, _json({"error": "internal error"}),
+                           "application/json; charset=utf-8")
+            except OSError:
+                pass
 
 
 def tailscale_ipv4() -> str | None:
@@ -188,41 +217,54 @@ def _make_server(addr: str, port: int):
 
 
 def bind_servers(binds, port: int, wait_s: float, *, make=_make_server,
-                 sleep=time.sleep, monotonic=time.monotonic,
+                 on_bound=None, sleep=time.sleep, monotonic=time.monotonic,
                  retry_every_s: float = 5.0) -> list:
-    """One server per address. An address that cannot be bound yet is
-    retried until ``wait_s`` has passed; then everything bound so far is
-    closed and the last OSError is raised."""
+    """One server per address, each handed to ``on_bound`` as soon as it
+    binds (so localhost serves while a later address is still waiting).
+    An address that cannot be bound yet is retried until ``wait_s`` has
+    passed; then everything bound so far is closed and the OSError raised."""
     deadline = monotonic() + wait_s
     servers = []
     try:
         for addr in binds:
             while True:
                 try:
-                    servers.append(make(addr, port))
+                    srv = make(addr, port)
                     break
                 except OSError as exc:
                     if monotonic() >= deadline:
                         raise
                     print(f"waiting for {addr}:{port} ({exc})", file=sys.stderr, flush=True)
                     sleep(retry_every_s)
+            servers.append(srv)
+            if on_bound:
+                on_bound(addr, srv)
     except OSError:
         for srv in servers:
+            if on_bound:            # its serve_forever thread is running
+                srv.shutdown()
             srv.server_close()
         raise
     return servers
 
 
+def wait_for_tailscale_ip(wait_s: float, *, lookup=None, sleep=time.sleep,
+                          monotonic=time.monotonic, retry_every_s: float = 5.0):
+    """``tailscale ip -4`` retried until ``wait_s`` passes (at boot the
+    service comes up after the task starts). None if it never answers."""
+    lookup = lookup or tailscale_ipv4
+    deadline = monotonic() + wait_s
+    while True:
+        ip = lookup()
+        if ip or monotonic() >= deadline:
+            return ip
+        print("waiting for Tailscale to report an IPv4", file=sys.stderr, flush=True)
+        sleep(retry_every_s)
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     binds = list(dict.fromkeys(args.bind or ["127.0.0.1"]))
-    if args.tailscale:
-        ts_ip = tailscale_ipv4()
-        if not ts_ip:
-            print("tailscale ip -4 returned nothing; is Tailscale up?", file=sys.stderr)
-            return 2
-        if ts_ip not in binds:
-            binds.append(ts_ip)
     for addr in binds:
         if not client_allowed(addr):
             print(f"refusing to bind {addr}: only loopback/Tailscale addresses",
@@ -231,18 +273,27 @@ def main(argv=None) -> int:
 
     DashboardHandler.base_dir = os.path.abspath(args.base_dir)
     DashboardHandler.lwc_path = lwc_js_path()
-    try:
-        servers = bind_servers(binds, args.port, args.bind_wait)
-    except OSError as exc:
-        print(f"cannot listen: {exc}", file=sys.stderr)
-        return 3
-    for addr in binds:
+    DashboardHandler.bound_hosts = {a.lower() for a in binds}
+
+    def serve(addr, srv):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
         host = f"[{addr}]" if ":" in addr else addr
         print(f"dashboard: http://{host}:{args.port}/  (bots: {DashboardHandler.base_dir})",
               flush=True)
-    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
-    for t in threads:
-        t.start()
+
+    try:
+        servers = bind_servers(binds, args.port, args.bind_wait, on_bound=serve)
+        if args.tailscale:
+            ts_ip = wait_for_tailscale_ip(args.bind_wait)
+            if not ts_ip:
+                print("tailscale ip -4 returned nothing; is Tailscale up?", file=sys.stderr)
+                raise SystemExit(2)
+            if ts_ip.lower() not in DashboardHandler.bound_hosts:
+                DashboardHandler.bound_hosts.add(ts_ip.lower())
+                servers += bind_servers([ts_ip], args.port, args.bind_wait, on_bound=serve)
+    except OSError as exc:
+        print(f"cannot listen: {exc}", file=sys.stderr)
+        return 3
     try:
         while True:
             time.sleep(3600)
