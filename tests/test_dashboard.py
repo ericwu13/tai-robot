@@ -306,6 +306,22 @@ def test_server_routes(live_server):
     assert json.loads(body)["bot"]["id"] == "TMF00_alpha"
 
 
+def test_trading_day_pnl_label_is_ben_jiaoyi_ri(live_server):
+    """pnl_today is the TAIFEX trading day (night session + day session).
+
+    The zh-TW label is 本交易日. The calendar-day word 今日 must not
+    name that column, and there is no English "Today" label for it.
+    """
+    status, ctype, body = _get(live_server + "/")
+    assert status == 200 and ctype.startswith("text/html")
+    page = body.decode("utf-8")
+    assert page.count("本交易日") == 4
+    assert 'title="自最近一次夜盤開盤（15:00）起">本交易日</th>' in page
+    assert "本交易日已實現" not in page
+    assert "今日" not in page
+    assert "Today" not in page
+
+
 @pytest.mark.parametrize("path", ["/api/bot?id=../TMF00_alpha", "/api/bot?id=",
                                   "/etc/passwd", "/static/../server.py"])
 def test_server_rejects_unknown_paths(live_server, path):
