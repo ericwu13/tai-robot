@@ -315,6 +315,12 @@ def load_news_paths(settings_path: str) -> dict | None:
         return None
     root = os.path.dirname(os.path.abspath(settings_path))
     out = {}
+    # Per-source vote age limits (hours) the runner applies at classify
+    # time; the app's default when the key is absent.
+    limits = news.get("nightly_vote_max_age_h", {"W2": 4.0})
+    out["vote_age_limits_h"] = {
+        str(k).upper(): float(v) for k, v in (limits.items() if isinstance(limits, dict) else [])
+        if isinstance(v, (int, float)) and not isinstance(v, bool)}
     for key in NEWS_PATH_KEYS:
         value = str(news.get(key) or "")
         if key == "rss_state_file" and not value:
@@ -325,13 +331,11 @@ def load_news_paths(settings_path: str) -> dict | None:
 
 
 def default_settings_path(base_dir: str) -> str:
-    """settings.yaml of the install that owns ``base_dir`` (<install>/data/live),
-    else this checkout's."""
+    """settings.yaml of the install that owns ``base_dir`` (<install>/data/live).
+    No fallback to another install's file: when it is missing the vote
+    section says so instead of showing some other install's bridges."""
     install = os.path.dirname(os.path.dirname(os.path.abspath(base_dir)))
-    candidate = os.path.join(install, "settings.yaml")
-    if os.path.isfile(candidate):
-        return candidate
-    return os.path.join(_REPO, "settings.yaml")
+    return os.path.join(install, "settings.yaml")
 
 
 def build_parser() -> argparse.ArgumentParser:

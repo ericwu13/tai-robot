@@ -399,27 +399,33 @@ function tradeRealCell(t) {
 // External regime votes (W2 cross-market / W3 RSS / W4 chips) and the news
 // breaker, shaped by src.news.vote_status like the desktop regime tab.
 const VOTE_DIR = { "trending-up": ["↑ 趨勢向上", "up"], "trending-down": ["↓ 趨勢向下", "down"] };
+const BREAKER_DIR = { bearish: "偏空", bullish: "偏多" };
+const BREAKER_SEV = { critical: "嚴重", high: "高", medium: "中", low: "低" };
 function votesBlock(v, newsEnabled) {
   if (!v) return el("div", { class: "sub" }, "投票資訊無法讀取");
   const box = el("div", { class: "votes" });
-  if (v.configured) {
+  if (!v.consumes_votes) {
+    box.append(el("div", { class: "sub" }, "此機器人未啟用 --news，不讀取外部投票"));
+  } else if (v.configured) {
     box.append(el("div", { class: "head" },
       `外部投票（下一次分類 ${sessionKey(v.tonight)} 使用；過期的不計入）`));
     for (const s of v.sources) {
       const cls = !s.known ? "off" : s.stale ? "stale" : "ok";
       const state = !s.known ? "狀態不明" : s.stale ? "停滯" : "運作中";
       let vote;
-      if (s.vote) vote = el("span", { class: "rg " + VOTE_DIR[s.vote][1] }, VOTE_DIR[s.vote][0]);
+      if (s.vote && !s.will_count) vote = el("span", { class: "muted", title: s.why_not }, VOTE_DIR[s.vote][0] + "（將失效）");
+      else if (s.vote) vote = el("span", { class: "rg " + VOTE_DIR[s.vote][1] }, VOTE_DIR[s.vote][0]);
       else if (s.vote_expired) vote = el("span", { class: "muted", title: s.vote_target }, "過期（" + sessionKey(s.vote_target) + "）");
       else vote = el("span", { class: "muted" }, "無投票");
       box.append(el("div", { class: "vote-row" },
         el("span", { class: "dot " + cls, title: state }, s.label),
         vote,
-        el("span", { class: "sub trunc", title: s.context }, (s.stale ? "⚠ 停滯　" : "") + (s.context || "")),
+        el("span", { class: "sub trunc", title: s.why_not || s.context },
+          (s.stale ? "⚠ 停滯　" : "") + (s.why_not || s.context || "")),
         el("span", { class: "sub" }, s.last_check ? "最後檢查 " + s.last_check : "")));
     }
   } else {
-    box.append(el("div", { class: "sub" }, "未設定投票路徑（settings.yaml news.regime_vote_path）"));
+    box.append(el("div", { class: "sub" }, "找不到投票設定（安裝目錄的 settings.yaml news.regime_vote_path）"));
   }
   box.append(el("div", { class: "sub" },
     `上次分類（${sessionKey(v.last_assessed)}）消耗的投票：${v.consumed || "—"}` + (v.consumed_rule ? `（規則 ${v.consumed_rule}）` : "")));
@@ -428,8 +434,11 @@ function votesBlock(v, newsEnabled) {
     const parts = [];
     if (b.signal_suppressed) {
       parts.push(el("span", { class: "pend" }, "新聞斷路器：已觸發"));
-      const dir = VOTE_DIR[b.direction] ? VOTE_DIR[b.direction][0] : (b.direction || "");
-      parts.push(el("span", null, [dir, b.severity, b.since ? "自 " + b.since : ""].filter(Boolean).join("・")));
+      const dir = BREAKER_DIR[b.direction] || b.direction || "";
+      const sev = BREAKER_SEV[b.severity] || b.severity || "";
+      parts.push(el("span", null, [dir, sev, b.since ? "自 " + b.since : ""].filter(Boolean).join("・")));
+      parts.push(el("span", { class: b.blocks_active_leg ? "alert" : "sub" },
+        b.blocks_active_leg ? "目前方向暫停交易" : "目前方向不受影響（只擋相反方向）"));
       if (b.reason) parts.push(el("span", { class: "sub trunc", title: b.reason }, b.reason));
     } else {
       parts.push(el("span", { class: "chip s-ok" }, "新聞斷路器：正常"));

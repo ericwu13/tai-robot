@@ -20,7 +20,7 @@ import csv
 import io
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from scripts.monitor.check_bots import (
     HEARTBEAT_FILENAME, RECENT_CRASH_DAYS, classify_heartbeat,
@@ -573,8 +573,7 @@ def regime_summary(state: dict | None, sess: dict) -> dict | None:
             "pause": _pause(state),
             "next_action": str(nxt.get("action") or ""),
             "classified": bool(state.get("last_assessed")),
-            "news_suppressed": bool(isinstance(sess.get("news"), dict) and (
-                sess["news"].get("signal_suppressed") or sess["news"].get("event_suppressed")))}
+            "news_suppressed": _news_blocks_leg(sess)}
 
 
 def regime_flags(now: datetime, bot_dir: str, state: dict | None) -> list[dict]:
@@ -643,8 +642,51 @@ def regime_band(history: list[dict]) -> list[dict]:
 
 
 def _read_json_dict(path: str):
-    data = fileio.read_json(path)
-    return data if isinstance(data, dict) else None
+    """Vote / bridge-state JSON, re-read only when the file changed.
+
+    The bridges replace these files with a bare ``os.replace`` (no
+    retry), and any open handle makes that replace fail, losing the vote
+    or state write. A stat-gated read opens a file only right after a
+    bridge wrote it, minutes before its next write.
+    """
+    return _read_if_changed(path, fileio.read_json, lambda d: isinstance(d, dict))
+
+
+def _news_blocks_leg(sess: dict) -> bool:
+    """Does the news breaker stop the ACTIVE leg right now? The runner's
+    own rule (``BreakerState.gates_leg`` with the bot's suppress scope),
+    not just "a breaker is set": under ``conflicting_leg`` a bearish
+    signal leaves a short leg trading."""
+    news = sess.get("news")
+    if not isinstance(news, dict):
+        return False
+    try:
+        from src.news.circuit_breaker import BreakerState
+        state = BreakerState.from_dict(news)
+        return bool(state.gates_leg(str(sess.get("active_leg") or "idle"),
+                                    str(sess.get("news_suppress_scope") or "both")))
+    except Exception:  # noqa: BLE001 — fall back to "set means blocked"
+        return bool(news.get("signal_suppressed") or news.get("event_suppressed"))
+
+
+def _vote_will_count(vote: dict, limits: dict, classify_at: datetime) -> tuple[bool, str]:
+    """``(counts, why_not)`` for a pending vote at the coming classification,
+    the runner's rule (``_read_regime_vote``): older than its source's
+    ``nightly_vote_max_age_h`` at classify time is dropped unless it was
+    hot-lane admitted for that session."""
+    source = str(vote.get("source") or "").split("-")[0].strip().upper()
+    limit = (limits or {}).get(source)
+    if limit is None:
+        return True, ""
+    if vote.get("admitted_at"):
+        return True, ""
+    fired = parse_tpe(str(vote.get("fired_at") or ""))
+    if fired is None:
+        return True, ""
+    age_h = (classify_at - fired).total_seconds() / 3600.0
+    if age_h > float(limit):
+        return False, f"分類時已超過 {float(limit):g} 小時（{age_h:.1f} 小時），將不計入"
+    return True, ""
 
 
 # The desktop tab's labels are bilingual; the page is zh-TW only.
@@ -674,15 +716,27 @@ def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
     paths = news_paths or {}
     sources = []
     tonight = ""
-    if paths.get("regime_vote_path") or paths.get("signal_path"):
+    # The runner reads votes only with a news config (``--news``); for any
+    # other regime bot a pending vote is never used.
+    consumes = bool(sess.get("news_enabled"))
+    if consumes and (paths.get("regime_vote_path") or paths.get("signal_path")):
+        from src.news.vote_status import read_pending_votes
         upcoming = upcoming_night_session(now)
         tonight = upcoming.key if upcoming else ""
+        classify_at = (upcoming.close_dt - timedelta(minutes=2)) if upcoming else now
+        raw_votes = read_pending_votes(paths.get("regime_vote_path", ""), tonight,
+                                       _read_json_dict)
         report = collect_vote_status(paths.get("regime_vote_path", ""),
                                      paths.get("signal_path", ""),
                                      paths.get("rss_state_file", ""),
                                      tonight, now, read_json=_read_json_dict)
         for st in report.sources:
-            sources.append({"source": st.source,
+            counts, why_not = (True, "")
+            if st.vote:
+                counts, why_not = _vote_will_count(raw_votes.get(st.source) or {},
+                                                   paths.get("vote_age_limits_h") or {},
+                                                   classify_at)
+            sources.append({"source": st.source, "will_count": counts, "why_not": why_not,
                             "label": _VOTE_LABELS.get(st.source, redact_line(st.label)),
                             "vote": st.vote, "vote_expired": st.vote_expired,
                             "vote_target": st.vote_target, "known": st.known,
@@ -697,6 +751,7 @@ def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
         suppressed_24h = None
     return {
         "configured": bool(sources),
+        "consumes_votes": consumes,
         "tonight": tonight,
         "sources": sources,
         "consumed": redact_line(_zh_consumed(consumed_votes_line(feats))),
@@ -704,6 +759,7 @@ def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
         "last_assessed": str(state.get("last_assessed") or ""),
         "news_enabled": bool(sess.get("news_enabled")),
         "breaker": {
+            "blocks_active_leg": _news_blocks_leg(sess),
             "signal_suppressed": bool(news.get("signal_suppressed")),
             "event_suppressed": bool(news.get("event_suppressed")),
             "reason": redact_line(str(news.get("suppressed_reason") or "")),
