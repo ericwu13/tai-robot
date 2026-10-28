@@ -359,7 +359,8 @@ function td(label, content, cls) { return el("td", { class: cls || "", data: { l
 const App = {
   fleet: null, lastOk: 0, current: null, detail: null, chart: null, candles: null,
   equityChart: null, equity: null, band: null, iv: 60, fitNext: true,
-  bars: [], markers: [], oldestDay: null, hasMore: false, loadingOlder: false,
+  bars: [], markers: [], oldestDay: null, newestDay: null, hasMore: false,
+  loadingOlder: false, barsLoaded: false,
 
   // Controls: a confirm dialog, then one POST; the bot applies it from its
   // own STOP / mode_override.json polling, and the pending chip shows the
@@ -528,7 +529,8 @@ const App = {
     $("detail-view").hidden = !this.current;
     if (this.current) {
       this.fitNext = true; this.ivInit = true;
-      this.bars = []; this.markers = []; this.oldestDay = null; this.hasMore = false;
+      this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
+      this.hasMore = false; this.barsLoaded = false; this.equityFitted = false;
       this.detail = null;
       this.refreshDetail().then(() => this.loadBars("initial"));
     }
@@ -545,7 +547,9 @@ const App = {
       this.detail = d; this.lastOk = Date.now();
       $("banner").classList.remove("show");
       this.renderDetail();
-      if (this.bars.length) this.loadBars("latest");
+      // Until a first window has come back, keep asking for it (a bot with
+      // no bars file yet, or a failed first load, must not stay blank).
+      this.loadBars(this.barsLoaded ? "latest" : "initial");
     } catch (e) {
       $("banner").classList.add("show");
     }
@@ -553,18 +557,29 @@ const App = {
 
   // Candles come in windows of daily files stitched into one series:
   // "initial" = newest few days, "older" = the days before what is loaded
-  // (prepended as the viewer scrolls left), "latest" = newest day, merged.
+  // (prepended as the viewer scrolls left), "latest" = every day from the
+  // newest loaded one on, merged (a tab asleep across midnight fills its
+  // gap; a gap longer than one window reloads from scratch).
   async loadBars(kind) {
     const id = this.current;
     if (!id || (kind === "older" && (this.loadingOlder || !this.hasMore || !this.oldestDay))) return;
     let q = "/api/bars?id=" + encodeURIComponent(id);
     if (kind === "older") q += "&before=" + this.oldestDay;
-    if (kind === "latest") q += "&days=1";
+    if (kind === "latest") q += "&days=10&after=" + (this.newestDay || "00000000");
     if (kind === "older") { this.loadingOlder = true; $("d-loading").hidden = false; }
     try {
       const w = await this.getJson(q);
       if (id !== this.current) return;
+      if (kind === "latest" && !w.complete) {   // asleep for too long: start over
+        this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
+        this.barsLoaded = false; this.fitNext = true;
+        return this.loadBars("initial");
+      }
       if (kind !== "latest") { this.oldestDay = w.oldest_day || this.oldestDay; this.hasMore = w.has_more; }
+      if (kind !== "older" && w.newest_day && (!this.newestDay || w.newest_day > this.newestDay)) {
+        this.newestDay = w.newest_day;
+      }
+      if (kind === "initial") this.barsLoaded = true;
       this.mergeBars(w.bars, w.markers);
       this.drawCharts(kind === "older");
     } catch (e) {
@@ -712,11 +727,12 @@ const App = {
     this.band = this.chart.addHistogramSeries({ priceScaleId: "band", lastValueVisible: false,
       priceLineVisible: false, priceFormat: { type: "volume" } });
     this.chart.priceScale("band").applyOptions({ scaleMargins: { top: 0.96, bottom: 0 }, visible: false });
-    // Only the viewer's own scrolling pages in older days. setData and the
-    // view restore after a prepend fire this too; reacting to those would
-    // chain-load every bars file the bot has ever written.
+    // Near the left edge, page in older days. lightweight-charts fires this
+    // asynchronously, including after the page's own setData; what bounds
+    // the chain is that drawCharts shifts the view right by the candles it
+    // prepended, so loading stops once the visible range is filled.
     this.chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-      if (!this.programmatic && range && range.from < 40) this.loadBars("older");
+      if (range && range.from < 40) this.loadBars("older");
     });
     this.equityChart = LightweightCharts.createChart($("d-equity"), base());
     this.equity = this.equityChart.addBaselineSeries({ baseValue: { type: "price", price: 0 },
@@ -772,14 +788,13 @@ const App = {
   drawCharts(keepView) {
     if (!this.ensureCharts()) return;
     const bars = this.aggregate(this.bars, this.iv);
-    $("d-chart-empty").hidden = bars.length > 0 || !this.oldestDay;
+    $("d-chart-empty").hidden = bars.length > 0 || !this.barsLoaded;
     $("d-chart").hidden = bars.length === 0;
     // Prepending older days must not move what the viewer is looking at:
     // shift the logical range by the number of candles added in front.
     const ts = this.chart.timeScale();
     const view = keepView ? ts.getVisibleLogicalRange() : null;
     const added = view ? bars.length - (this.drawnCount || 0) : 0;
-    this.programmatic = true;
     this.candles.setData(bars);
     this.drawnCount = bars.length;
     this.band.setData(this.bandData(bars));
@@ -796,7 +811,6 @@ const App = {
           color: this.css("--muted"), text: "出 " + (m.pnl > 0 ? "+" : "") + fmtInt(m.pnl) }));
     if (view) ts.setVisibleLogicalRange({ from: view.from + added, to: view.to + added });
     else if (this.fitNext && bars.length) { this.showRecent(bars); this.fitNext = false; }
-    this.programmatic = false;
   },
 
   // Open on roughly the latest trading day; older ones are a drag away.
