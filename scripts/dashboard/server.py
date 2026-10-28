@@ -7,7 +7,7 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
 
     GET /api/fleet               every bot under data/live
     GET /api/bot?id=<dir>        one bot: trades, decisions, log, regime
-    GET /api/bars?id=<dir>[&before=YYYYMMDD][&days=N]
+    GET /api/bars?id=<dir>[&before=YYYYMMDD|&after=YYYYMMDD][&days=N]
                                  stitched 1-min candles + trade markers
 
 GET only, nothing is ever written to a bot directory. Clients outside
@@ -169,8 +169,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif url.path == "/api/bars":
                 bot_id = (query.get("id") or [""])[0]
                 before = (query.get("before") or [""])[0]
-                if before and not (len(before) == 8 and before.isdigit()):
-                    self._send(400, _json({"error": "before must be YYYYMMDD"}),
+                after = (query.get("after") or [""])[0]
+                if any(v and not (len(v) == 8 and v.isdigit()) for v in (before, after)):
+                    self._send(400, _json({"error": "before/after must be YYYYMMDD"}),
                                "application/json; charset=utf-8")
                     return
                 try:
@@ -182,8 +183,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send(404, _json({"error": "no such bot"}),
                                "application/json; charset=utf-8")
                     return
-                body = self.cache.get(f"bars:{bot_id}:{before}:{days}", lambda: _json(
-                    snapshot.bars_window(bot_dir, before or None, days)))
+                body = self.cache.get(f"bars:{bot_id}:{before}:{after}:{days}", lambda: _json(
+                    snapshot.bars_window(bot_dir, before or None, days, after or None)))
                 self._send(200, body, "application/json; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain; charset=utf-8")

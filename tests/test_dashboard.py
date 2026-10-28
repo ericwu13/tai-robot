@@ -483,7 +483,7 @@ def test_pnl_today_is_the_taifex_trading_day(tmp_path):
 
 def test_session_json_reopened_only_when_it_changes(tmp_path, monkeypatch):
     d = make_bot(tmp_path)
-    snapshot._session_cache.clear()
+    snapshot._stat_cache.clear()
     opens = []
     real = fileio.read_json
     monkeypatch.setattr(fileio, "read_json", lambda p: opens.append(p) or real(p))
@@ -499,7 +499,7 @@ def test_session_json_reopened_only_when_it_changes(tmp_path, monkeypatch):
 
 def test_session_garbage_keeps_last_good_copy(tmp_path):
     d = make_bot(tmp_path)
-    snapshot._session_cache.clear()
+    snapshot._stat_cache.clear()
     assert snapshot.read_session(str(d))["strategy"] == "Demo"
     sj = d / "session.json"
     sj.write_text('{"strategy": "Dem', encoding="utf-8")
@@ -703,10 +703,74 @@ def test_regime_detail_history_band_and_monitor_flags(tmp_path):
     assert {f["sev"] for f in r["flags"]} <= {"P1", "P2", "P3"}
 
 
-def test_stopped_regime_bot_flags_are_demoted(tmp_path):
+def _age_bot(d, day="2026-10-20"):
+    """Make every activity marker predate the last completed night (10-23)."""
+    old = datetime.fromisoformat(f"{day}T09:00:00+08:00").timestamp()
+    (d / "debug_20261026.log").write_text(f"[{day} 09:00:00.000 TPE] last line\n",
+                                          encoding="utf-8")
+    for p in d.iterdir():
+        os.utime(p, (old, old))
+
+
+def _monitor_findings(base, bot):
+    from scripts.monitor.check_regime import check_regime
+    findings, _ = check_regime(NOW, str(base))
+    return {(f.level, snapshot.redact_line(f.message)) for f in findings
+            if f.message.split(": ", 1)[0].endswith(bot) or f"{bot}:" in f.message}
+
+
+@pytest.mark.parametrize("scenario", ["active", "stopped-before-the-night",
+                                      "active-corrupt", "stopped-corrupt"])
+def test_regime_flags_match_the_monitor(tmp_path, scenario):
+    """Every flag the page shows is a finding check_regime reports for the
+    same directory, at the same severity (including its stopped-bot demotion,
+    which keys on activity since the last completed night, not on the lock)."""
+    d = make_regime_bot(tmp_path)
+    if "corrupt" in scenario:
+        (d / "regime_state.json").write_text("{not json", encoding="utf-8")
+    if scenario.startswith("stopped"):
+        (d / ".lock").unlink()
+        _age_bot(d)
+    flags = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]["flags"]
+    assert flags
+    monitor = _monitor_findings(tmp_path, "TMF00_regime")
+    for f in flags:
+        assert (f["sev"], f["text"]) in monitor, (f, monitor)
+    if scenario.startswith("stopped"):
+        assert {f["sev"] for f in flags} == {"P3"}
+    else:
+        assert {f["sev"] for f in flags} != {"P3"}
+    if scenario == "active-corrupt":
+        assert flags[0]["sev"] == "P1"
+
+
+def test_clean_stop_during_the_night_is_not_demoted(tmp_path):
+    """No lock, but active since the last night opened: the monitor still
+    grades it (a bot that stopped mid-night can have missed its run)."""
     d = make_regime_bot(tmp_path, lock_pid=None, hb_age_s=None)
-    r = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]
-    assert r["flags"] and {f["sev"] for f in r["flags"]} == {"P3"}
+    flags = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]["flags"]
+    assert any(f["sev"] != "P3" for f in flags)
+
+
+def test_regime_files_are_reread_only_when_they_change(tmp_path, monkeypatch):
+    d = make_regime_bot(tmp_path, history_rows=[
+        "2026-10-23,NIGHT,,,,,,,x,trending-up,1,hold,,,auto,0,0,S,false,,paper,,"])
+    snapshot._stat_cache.clear()
+    opened = []
+    real_json, real_head = fileio.read_json, fileio.head_line
+    monkeypatch.setattr(fileio, "read_json", lambda p: opened.append(os.path.basename(p)) or real_json(p))
+    monkeypatch.setattr(fileio, "head_line", lambda p, *a: opened.append(os.path.basename(p)) or real_head(p, *a))
+    for _ in range(3):
+        snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)
+        snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)
+    assert opened.count("regime_state.json") == 1
+    assert opened.count("regime_history.csv") == 1
+    st = d / "regime_state.json"
+    st.write_text(st.read_text(encoding="utf-8").replace("2026-10-07", "2026-10-08"),
+                  encoding="utf-8")
+    os.utime(st, ns=(os.stat(st).st_atime_ns, os.stat(st).st_mtime_ns + 10**9))
+    assert snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)["regime"]["since"] == "2026-10-08"
+    assert opened.count("regime_state.json") == 2
 
 
 def test_regime_reason_and_history_are_redacted(tmp_path):
@@ -724,7 +788,21 @@ def test_corrupt_regime_files_do_not_break_detail(tmp_path):
     (d / "regime_state.json").write_text("{not json", encoding="utf-8")
     (d / "regime_history.csv").write_bytes(b"\xff\xfe garbage\n,,\n")
     r = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]
-    assert r["flags"][0]["sev"] == "P2" and r["history"] == []
+    assert r["flags"][0]["sev"] == "P1" and r["history"] == []     # as check_regime
+
+
+def test_bars_after_returns_every_day_since_and_flags_long_gaps(tmp_path):
+    """The 10 s refresh asks for every file from its newest loaded day on, so
+    a tab that slept across midnight fills the gap instead of skipping it."""
+    d = make_bot(tmp_path)
+    _bars_file(d, "20261024", [("2026/10/24 04:58", 7)])
+    w = snapshot.bars_window(str(d), after="20261024", days=10)
+    assert [b["close"] for b in w["bars"]][0] == 7 and w["complete"] is True
+    assert w["newest_day"] == "20261026"
+    for day in range(1, 12):
+        _bars_file(d, f"202610{day:02d}", [(f"2026/10/{day:02d} 09:00", day)])
+    w = snapshot.bars_window(str(d), after="20261001", days=10)
+    assert w["complete"] is False             # page reloads instead of leaving a hole
 
 
 def test_head_line_reads_csv_header_with_bom(tmp_path):

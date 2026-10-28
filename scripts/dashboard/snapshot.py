@@ -225,31 +225,40 @@ def _position(broker: dict, point_value: int, last_close: int | None) -> dict | 
             "unrealized": unrealized}
 
 
-_session_cache: dict[str, tuple[int, int, dict]] = {}
+_stat_cache: dict[str, tuple[int, int, object]] = {}
 
 
-def read_session(bot_dir: str) -> dict:
-    """session.json, re-read only when its size or mtime changed.
+def _read_if_changed(path: str, load, valid):
+    """``load(path)``, re-run only when the file's size or mtime changed.
 
-    Every open of session.json, even a share-delete one, turns the bot's
-    next ``os.replace`` into the remove-then-rename fallback; a crash
-    between those two steps would lose the file. The file changes on
-    trade events, so polling its stat keeps content opens rare.
+    Any open handle, even a share-delete one, makes the bot's next
+    ``os.replace`` onto that file fail: session.json then falls back to a
+    non-atomic remove+rename, and the regime store writers have no
+    fallback at all (a failed save loses a classification, a history row
+    or the executed flag). These files change on trade events or once a
+    night, so polling their stat keeps content opens rare. Returns None
+    when the file is missing; mid-write garbage keeps the last good value.
     """
-    path = os.path.join(bot_dir, "session.json")
     try:
         st = os.stat(path)
     except OSError:
-        _session_cache.pop(path, None)
-        return {}
-    hit = _session_cache.get(path)
+        _stat_cache.pop(path, None)
+        return None
+    hit = _stat_cache.get(path)
     if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
         return hit[2]
-    data = fileio.read_json(path)
-    if not isinstance(data, dict):
-        return hit[2] if hit else {}        # mid-write garbage: keep last good
-    _session_cache[path] = (st.st_mtime_ns, st.st_size, data)
+    data = load(path)
+    if not valid(data):
+        return hit[2] if hit else None
+    _stat_cache[path] = (st.st_mtime_ns, st.st_size, data)
     return data
+
+
+def read_session(bot_dir: str) -> dict:
+    """session.json, re-read only when it changed (see ``_read_if_changed``)."""
+    data = _read_if_changed(os.path.join(bot_dir, "session.json"),
+                            fileio.read_json, lambda d: isinstance(d, dict))
+    return data if isinstance(data, dict) else {}
 
 
 def trading_day_start(now: datetime) -> datetime:
@@ -434,18 +443,23 @@ BARS_DAYS_MAX = 10
 
 
 def bars_window(bot_dir: str, before: str | None = None,
-                days: int = BARS_DAYS_DEFAULT) -> dict:
+                days: int = BARS_DAYS_DEFAULT, after: str | None = None) -> dict:
     """1-min candles from up to ``days`` daily files, stitched into one series.
 
     ``before`` (YYYYMMDD) pages backwards: only files strictly older are
-    read, so the page can prepend history as the viewer scrolls left. A
-    night session split across two calendar files comes back in one piece.
-    Markers cover every trade entry/exit inside the returned span.
+    read, so the page can prepend history as the viewer scrolls left.
+    ``after`` refreshes forwards: every file from that day on, so a tab
+    that slept across midnight fills the gap; ``complete`` is False when
+    more files than ``days`` qualify and the page should reload instead.
+    A night session split across two calendar files comes back in one
+    piece. Markers cover every trade entry/exit inside the returned span.
     """
     days = max(1, min(int(days), BARS_DAYS_MAX))
     files = _newest(bot_dir, _BARS_RE)
     if before:
         files = [(d, path) for d, path in files if d < before]
+    if after:
+        files = [(d, path) for d, path in files if d >= after]
     chunk, rest = files[:days], files[days:]
     by_time: dict[int, dict] = {}
     for _day, path in reversed(chunk):          # oldest first; later wins
@@ -459,7 +473,7 @@ def bars_window(bot_dir: str, before: str | None = None,
     return {"bars": bars, "markers": markers,
             "oldest_day": chunk[-1][0] if chunk else (before or ""),
             "newest_day": chunk[0][0] if chunk else "",
-            "has_more": bool(rest)}
+            "has_more": bool(rest), "complete": not (after and rest)}
 
 
 def _session_trades(bot_dir: str) -> list[dict]:
@@ -478,13 +492,20 @@ def _is_regime_bot(sess: dict) -> bool:
 
 
 def read_regime_state(bot_dir: str) -> dict | None:
-    state = fileio.read_json(os.path.join(bot_dir, "regime_state.json"))
-    return state if isinstance(state, dict) else None
+    """regime_state.json, re-read only when it changed."""
+    return _read_if_changed(os.path.join(bot_dir, "regime_state.json"),
+                            fileio.read_json, lambda d: isinstance(d, dict))
 
 
 def read_regime_history(bot_dir: str, n: int = REGIME_HISTORY_ROWS) -> list[dict]:
-    """Last ``n`` rows of regime_history.csv as dicts (header from line 1)."""
-    path = os.path.join(bot_dir, "regime_history.csv")
+    """Last ``n`` rows of regime_history.csv, re-read only when it changed."""
+    rows = _read_if_changed(os.path.join(bot_dir, "regime_history.csv"),
+                            lambda p: _load_regime_history(p, n),
+                            lambda r: isinstance(r, list))
+    return rows or []
+
+
+def _load_regime_history(path: str, n: int) -> list[dict]:
     header = fileio.head_line(path)
     if not header:
         return []
@@ -526,22 +547,37 @@ def regime_summary(state: dict | None, sess: dict) -> dict | None:
             "classified": bool(state.get("last_assessed"))}
 
 
-def regime_flags(now: datetime, bot_dir: str, state: dict,
-                 running: bool = True) -> list[dict]:
-    """The daily monitor's own per-state findings (check_regime._check_state),
-    so the page and the digest flag the same things. Like check_regime, a
-    stopped bot's findings are demoted to P3: it cannot classify or apply."""
+def regime_flags(now: datetime, bot_dir: str, state: dict | None) -> list[dict]:
+    """The daily monitor's own state findings, graded the way check_regime
+    grades them: ``_check_state`` (or its P1 for a corrupt/missing state
+    file), then demoted to P3 with the same tag when the bot showed no
+    activity since the last completed night opened (``_was_running``).
+    Only regime deploys reach here, so the non-regime demotion never applies."""
     try:
         from scripts.monitor import check_regime as cr
+        from scripts.monitor.common import Finding
         sl = cr._switch_logic()
         degraded, _detail = cr._holiday_calendar_status(now, sl)
+        name = os.path.basename(os.path.normpath(bot_dir))
         lines, findings = [], []
-        cr._check_state(now, bot_dir, os.path.basename(os.path.normpath(bot_dir)),
-                        state, sl, lines, findings, calendar_degraded=degraded)
+        if isinstance(state, dict):
+            cr._check_state(now, bot_dir, name, state, sl, lines, findings,
+                            calendar_degraded=degraded)
+        else:
+            findings.append(Finding(
+                "P1", "regime",
+                f"{name}: regime_state.json is corrupt or unreadable — the "
+                f"brain cannot restore its regime across a restart"))
+        active = cr._was_running(bot_dir, sl.last_completed_night(now) if sl else None)
     except Exception as exc:  # noqa: BLE001 — flags are advisory
         return [{"sev": "P3", "text": redact_line(f"regime check unavailable: {exc}")}]
-    return [{"sev": f.level if running else "P3", "text": redact_line(f.message)}
-            for f in findings]
+    out = []
+    for f in findings:
+        if not active and f.level != "P3":
+            out.append({"sev": "P3", "text": redact_line(f"[stopped bot] {f.message}")})
+        else:
+            out.append({"sev": f.level, "text": redact_line(f.message)})
+    return out
 
 
 def _history_row(row: dict) -> dict:
@@ -571,11 +607,11 @@ def regime_band(history: list[dict]) -> list[dict]:
     return band
 
 
-def regime_detail(now: datetime, bot_dir: str, sess: dict,
-                  running: bool = True) -> dict | None:
+def regime_detail(now: datetime, bot_dir: str, sess: dict) -> dict | None:
     if not _is_regime_bot(sess):
         return None
-    state = read_regime_state(bot_dir) or {}
+    raw_state = read_regime_state(bot_dir)
+    state = raw_state or {}
     history = read_regime_history(bot_dir)
     feats = state.get("last_features") if isinstance(state.get("last_features"), dict) else {}
     nxt = state.get("next_session") if isinstance(state.get("next_session"), dict) else {}
@@ -600,8 +636,7 @@ def regime_detail(now: datetime, bot_dir: str, sess: dict,
                      and not isinstance(feats.get(k), bool)},
         "votes": [redact_line(str(v)) for v in (feats.get("_vote_sources") or [])
                   if isinstance(v, (str, int, float))],
-        "flags": (regime_flags(now, bot_dir, state, running) if state else
-                  [{"sev": "P2", "text": "regime_state.json missing or unreadable"}]),
+        "flags": regime_flags(now, bot_dir, raw_state),
         "history": [_history_row(r) for r in reversed(history)],
         "band": regime_band(history),
     }
@@ -624,5 +659,4 @@ def bot_detail(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
             "decisions": list(reversed(read_decisions(bot_dir, MAX_DECISIONS))),
             "log_file": os.path.basename(log_path) if log_path else "",
             "log": log_lines,
-            "regime": regime_detail(now, bot_dir, sess,
-                                    running=summary["state"] not in ("STOPPED",))}
+            "regime": regime_detail(now, bot_dir, sess)}
