@@ -30,6 +30,7 @@ from scripts.monitor.common import (
     TZ_TPE, discover_bot_dirs, pid_alive, redact,
 )
 from scripts.dashboard import fileio
+from src.live.headless import stop_requested
 from src.utils.log_redact import scrub_ids
 
 # A stopped bot with no file activity in this window is retired and is
@@ -315,11 +316,29 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     info["last_decision"] = decisions[-1] if decisions else None
     info["regime"] = (regime_summary(read_regime_state(bot_dir), sess)
                       if _is_regime_bot(sess) else None)
+    info["pending"] = pending(bot_dir)
     running = info["state"] in ("RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT",
                                 "CRASHED", "UNKNOWN")
     info["active"] = running or (
         activity is not None and now.timestamp() - activity <= ACTIVE_DAYS * 86400)
     return info
+
+
+# The file LiveRunner._check_mode_override consumes (src/live/live_runner.py).
+MODE_OVERRIDE_FILENAME = "mode_override.json"
+
+
+def mode_override_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, MODE_OVERRIDE_FILENAME)
+
+
+def pending(bot_dir: str) -> dict:
+    """Control files written but not yet consumed by the bot: the headless
+    STOP file, and a queued mode_override.json (applied at the next bar)."""
+    data = fileio.read_json(mode_override_path(bot_dir))
+    mode = data.get("trading_mode") if isinstance(data, dict) else None
+    return {"stop": stop_requested(bot_dir),
+            "mode": mode if isinstance(mode, str) else None}
 
 
 def _broken_bot(bot_dir: str, exc: Exception) -> dict:
@@ -333,7 +352,8 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "interval_s": 0, "point_value": 1, "trades": 0, "win_rate": None,
             "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
             "last_price": None, "last_bar_dt": "", "saved_at": "",
-            "last_decision": None, "regime": None, "active": True}
+            "last_decision": None, "regime": None,
+            "pending": {"stop": False, "mode": None}, "active": True}
 
 
 def market_state(now: datetime) -> dict:

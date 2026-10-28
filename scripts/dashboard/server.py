@@ -10,9 +10,18 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
     GET /api/bars?id=<dir>[&before=YYYYMMDD|&after=YYYYMMDD][&days=N]
                                  stitched 1-min candles + trade markers
 
-GET only, nothing is ever written to a bot directory. Clients outside
-loopback and the Tailscale ranges are refused even if a bind address
-would let them connect.
+Read-only by default: nothing is written to a bot directory. With
+``--enable-control`` one more route exists,
+
+    POST /api/control  {"id", "action": "stop"|"paper", "confirm"}
+
+which writes the bot's own STOP / mode_override.json files (see
+``control.py``; nothing can switch a bot up to real orders) and logs
+every request to the control log.
+
+Clients outside loopback and the Tailscale ranges are refused even if a
+bind address would let them connect, and so are requests whose Host
+header names something else (DNS rebinding).
 """
 
 from __future__ import annotations
@@ -33,11 +42,16 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from scripts.dashboard import snapshot  # noqa: E402
+from scripts.dashboard import control, snapshot  # noqa: E402
 from scripts.monitor.common import default_base_dir, now_tpe  # noqa: E402
 
 DEFAULT_PORT = 8765
 CACHE_TTL_S = 3.0
+MAX_CONTROL_BODY = 4096
+# A custom header turns any cross-site request into a CORS preflight, which
+# this server never answers (no OPTIONS handler) -- so a page on another
+# origin cannot drive the controls even through the viewer's own browser.
+CONTROL_HEADER = "X-Dashboard-Control"
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 # Loopback plus Tailscale's CGNAT (IPv4) and ULA (IPv6) ranges.
@@ -77,6 +91,10 @@ class _Cache:
         self.ttl_s = ttl_s
         self._lock = threading.Lock()
         self._items: dict[str, tuple[float, bytes]] = {}
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
 
     def get(self, key: str, build) -> bytes:
         with self._lock:
@@ -121,6 +139,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     cache = _Cache(CACHE_TTL_S)
     lwc_path: str | None = None
     bound_hosts: set[str] = set()
+    control_enabled = False
+    control_log = ""
 
     def log_message(self, fmt, *args):  # access log is noise; errors still print
         pass
@@ -135,10 +155,69 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):  # noqa: N802 — http.server API
-        if not client_allowed(self.client_address[0]) or not host_allowed(
+    def _allowed(self) -> bool:
+        if client_allowed(self.client_address[0]) and host_allowed(
                 self.headers.get("Host"), self.bound_hosts, self.host_label):
-            self._send(403, b"forbidden", "text/plain; charset=utf-8")
+            return True
+        self._send(403, b"forbidden", "text/plain; charset=utf-8")
+        return False
+
+    def do_POST(self):  # noqa: N802 — http.server API
+        if not self._allowed():
+            return
+        if urlparse(self.path).path != "/api/control" or not self.control_enabled:
+            self._send(405, b"method not allowed", "text/plain; charset=utf-8")
+            return
+        client = self.client_address[0]
+
+        def reply(code, ok, msg, *, log=None):
+            if log:   # requests rejected before control.handle are audited too
+                control.log_request(self.control_log, client=client, bot_id="",
+                                    action="", result=log, detail=msg)
+            self._send(code, _json({"ok": ok, "message": msg}),
+                       "application/json; charset=utf-8")
+
+        # Same origin means exactly this page's scheme://host:port. A missing
+        # Origin (non-browser client) is allowed; "null" (sandboxed or
+        # file:// pages) is not.
+        origin = self.headers.get("Origin")
+        same_origin = origin is None or origin == f"http://{self.headers.get('Host', '')}"
+        if (self.headers.get(CONTROL_HEADER) != "1"
+                or not (self.headers.get("Content-Type") or "").startswith("application/json")
+                or not same_origin):
+            reply(403, False, "forbidden", log="forbidden")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 < length <= MAX_CONTROL_BODY:
+            reply(400, False, "bad request", log="bad request")
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if (not isinstance(body, dict)
+                or not all(isinstance(body.get(k), str) for k in ("id", "action", "confirm"))
+                or not isinstance(body.get("position_ack", ""), str)):
+            reply(400, False, "bad request", log="bad request")
+            return
+        try:
+            ok, message = control.handle(
+                now_tpe(), self.base_dir, body["id"], body["action"], body["confirm"],
+                client=client, log_path=self.control_log,
+                position_ack=body.get("position_ack", ""))
+        except Exception as exc:  # noqa: BLE001 — answer, don't drop the socket
+            sys.stderr.write(f"dashboard: control failed: {type(exc).__name__}: {exc}\n")
+            reply(500, False, "internal error")
+            return
+        if ok:
+            self.cache.clear()      # show the pending state on the next poll
+        reply(200 if ok else 409, ok, message)
+
+    def do_GET(self):  # noqa: N802 — http.server API
+        if not self._allowed():
             return
         url = urlparse(self.path)
         query = parse_qs(url.query)
@@ -153,8 +232,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 with open(self.lwc_path, "rb") as f:
                     self._send(200, f.read(), "application/javascript")
             elif url.path == "/api/fleet":
-                body = self.cache.get("fleet", lambda: _json(snapshot.fleet(
-                    now_tpe(), self.base_dir, host=self.host_label)))
+                body = self.cache.get("fleet", lambda: _json({
+                    **snapshot.fleet(now_tpe(), self.base_dir, host=self.host_label),
+                    "control_enabled": self.control_enabled}))
                 self._send(200, body, "application/json; charset=utf-8")
             elif url.path == "/api/bot":
                 bot_id = (query.get("id") or [""])[0]
@@ -221,6 +301,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--base-dir", default=default_base_dir(),
                    help="bot root (default: data/live of this checkout)")
+    p.add_argument("--enable-control", action="store_true",
+                   help="allow stop / switch-to-paper from the page (off = read-only)")
+    p.add_argument("--control-log", default="",
+                   help="audit CSV for control requests "
+                        "(default: dashboard_control_log.csv next to --base-dir)")
     p.add_argument("--bind-wait", type=float, default=0.0, metavar="SECONDS",
                    help="keep retrying an address that cannot be bound yet "
                         "(at boot the Tailscale IP appears after the task starts)")
@@ -293,13 +378,17 @@ def main(argv=None) -> int:
             return 2
 
     DashboardHandler.base_dir = os.path.abspath(args.base_dir)
+    DashboardHandler.control_enabled = bool(args.enable_control)
+    DashboardHandler.control_log = args.control_log or os.path.join(
+        os.path.dirname(DashboardHandler.base_dir), "dashboard_control_log.csv")
     DashboardHandler.lwc_path = lwc_js_path()
     DashboardHandler.bound_hosts = {a.lower() for a in binds}
 
     def serve(addr, srv):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         host = f"[{addr}]" if ":" in addr else addr
-        print(f"dashboard: http://{host}:{args.port}/  (bots: {DashboardHandler.base_dir})",
+        print(f"dashboard: http://{host}:{args.port}/  (bots: {DashboardHandler.base_dir}"
+              f"{'; controls ON, log ' + DashboardHandler.control_log if args.enable_control else ''})",
               flush=True)
 
     try:
