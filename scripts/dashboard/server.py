@@ -6,7 +6,9 @@
 Serves one page plus two JSON endpoints built from ``snapshot``:
 
     GET /api/fleet               every bot under data/live
-    GET /api/bot?id=<dir>&day=   one bot: candles, trades, decisions, log
+    GET /api/bot?id=<dir>        one bot: trades, decisions, log, regime
+    GET /api/bars?id=<dir>[&before=YYYYMMDD|&after=YYYYMMDD][&days=N]
+                                 stitched 1-min candles + trade markers
 
 GET only, nothing is ever written to a bot directory. Clients outside
 loopback and the Tailscale ranges are refused even if a bind address
@@ -156,14 +158,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200, body, "application/json; charset=utf-8")
             elif url.path == "/api/bot":
                 bot_id = (query.get("id") or [""])[0]
-                day = (query.get("day") or [""])[0] or None
                 bot_dir = snapshot.find_bot_dir(self.base_dir, bot_id)
                 if not bot_dir:
                     self._send(404, _json({"error": "no such bot"}),
                                "application/json; charset=utf-8")
                     return
-                body = self.cache.get(f"bot:{bot_id}:{day}", lambda: _json(
-                    snapshot.bot_detail(now_tpe(), bot_dir, day)))
+                body = self.cache.get(f"bot:{bot_id}", lambda: _json(
+                    snapshot.bot_detail(now_tpe(), bot_dir)))
+                self._send(200, body, "application/json; charset=utf-8")
+            elif url.path == "/api/bars":
+                bot_id = (query.get("id") or [""])[0]
+                before = (query.get("before") or [""])[0]
+                after = (query.get("after") or [""])[0]
+                if any(v and not (len(v) == 8 and v.isdigit()) for v in (before, after)):
+                    self._send(400, _json({"error": "before/after must be YYYYMMDD"}),
+                               "application/json; charset=utf-8")
+                    return
+                try:
+                    days = int((query.get("days") or [str(snapshot.BARS_DAYS_DEFAULT)])[0])
+                except ValueError:
+                    days = snapshot.BARS_DAYS_DEFAULT
+                bot_dir = snapshot.find_bot_dir(self.base_dir, bot_id)
+                if not bot_dir:
+                    self._send(404, _json({"error": "no such bot"}),
+                               "application/json; charset=utf-8")
+                    return
+                body = self.cache.get(f"bars:{bot_id}:{before}:{after}:{days}", lambda: _json(
+                    snapshot.bars_window(bot_dir, before or None, days, after or None)))
                 self._send(200, body, "application/json; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain; charset=utf-8")

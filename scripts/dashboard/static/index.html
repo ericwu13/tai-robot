@@ -93,6 +93,25 @@ pre.log .P1 { color: var(--bad); font-weight: 700; }
 pre.log .P2 { color: var(--warn); }
 pre.log .P3 { color: var(--muted); }
 .legend { color: var(--muted); font-size: 12px; font-weight: 400; }
+.rg { display: inline-block; padding: 1px 8px; border-radius: 6px; font-size: 13px; font-weight: 700; white-space: nowrap; }
+.rg.up { color: #fff; background: var(--up); }
+.rg.down { color: #fff; background: var(--down); }
+.rg.range { color: var(--ok); background: var(--ok-bg); }
+.rg.trans { color: var(--warn); background: var(--warn-bg); }
+.rg.none { color: var(--off); background: var(--off-bg); }
+.rg-line { display: flex; gap: 6px; align-items: center; margin-top: 3px; font-size: 12px; color: var(--muted); }
+.regime-body { padding: 12px 14px; display: grid; gap: 12px; }
+.regime-body .tiles { margin: 0; }
+.regime-body .tile .v { font-size: 17px; }
+.feat { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+.feat b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+.flags { display: grid; gap: 6px; }
+.flag { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+.sev { font-size: 12px; font-weight: 700; padding: 0 6px; border-radius: 5px; }
+.sev.P1 { color: #fff; background: var(--bad); }
+.sev.P2 { color: var(--warn); background: var(--warn-bg); }
+.sev.P3 { color: var(--off); background: var(--off-bg); }
+.scroll.short { max-height: 280px; }
 .mode { font-size: 13px; color: var(--muted); }
 .mode.real { color: #fff; background: var(--bad); padding: 1px 8px; border-radius: 6px; font-weight: 700; }
 [hidden] { display: none !important; }
@@ -150,18 +169,23 @@ pre.log .P3 { color: var(--muted); }
       <span class="sub" id="d-strategy"></span>
     </div>
     <div class="tiles" id="d-tiles"></div>
+    <div class="panel" id="d-regime" hidden style="margin-bottom:16px">
+      <div class="section-title"><span>盤勢切換</span><span class="legend" id="d-regime-note"></span></div>
+      <div class="regime-body" id="d-regime-body"></div>
+    </div>
     <div class="panel">
       <div class="section-title">
         <span>K 線</span>
-        <select id="d-day" aria-label="日期"></select>
         <span class="seg" id="d-iv">
           <button data-iv="60">1分</button><button data-iv="300">5分</button>
           <button data-iv="900">15分</button><button data-iv="3600">60分</button>
         </span>
-        <span class="legend">▲ 進場　▼ 出場（時間為台北時間）</span>
+        <span class="legend">▲ 進場　▼ 出場（時間為台北時間）　往左拖曳載入更早的 K 線</span>
+        <span class="legend" id="d-band-legend" hidden>底部色帶＝盤勢：<span class="rg up">趨勢向上</span> <span class="rg down">趨勢向下</span> <span class="rg range">盤整</span> <span class="rg trans">轉換中</span></span>
+        <span class="legend" id="d-loading" hidden>載入中…</span>
       </div>
       <div class="chart" id="d-chart"></div>
-      <div class="empty" id="d-chart-empty" hidden>這一天沒有 K 線資料</div>
+      <div class="empty" id="d-chart-empty" hidden>沒有 K 線資料</div>
     </div>
     <div class="grid2">
       <div class="panel">
@@ -234,6 +258,22 @@ const ACTION = {
 const EXIT_TAG = { force_close: "強制平倉", session_end: "收盤平倉", stop: "停損", stop_loss: "停損",
   take_profit: "停利", limit: "限價出場", manual: "手動平倉" };
 const SOURCE = { paper: "模擬", real: "實單" };
+const REGIME = {
+  "trending-up": ["趨勢向上", "up"], "trending-down": ["趨勢向下", "down"],
+  "range-bound": ["盤整", "range"], "transitional": ["轉換中", "trans"],
+};
+const RG_ACTION = { hold: "維持", sit_out: "空手觀望", deploy_long: "啟用多方", deploy_short: "啟用空方",
+  deploy_long_half: "多方（半倉）", deploy_short_half: "空方（半倉）" };
+const LEG = { long: "多方", short: "空方" };
+const SLOT = { NIGHT: "夜盤", DAY: "日盤" };
+function rgChip(regime) {
+  const [label, cls] = REGIME[regime] || [regime || "未判斷", "none"];
+  return el("span", { class: "rg " + cls }, label);
+}
+function sessionKey(key) {   // "2026-10-23|NIGHT" → "2026-10-23 夜盤"
+  const [date, slot] = String(key || "").split("|");
+  return date ? `${date} ${SLOT[slot] || slot || ""}`.trim() : "—";
+}
 
 const $ = (id) => document.getElementById(id);
 function el(tag, props, ...kids) {
@@ -280,7 +320,9 @@ function td(label, content, cls) { return el("td", { class: cls || "", data: { l
 
 const App = {
   fleet: null, lastOk: 0, current: null, detail: null, chart: null, candles: null,
-  equityChart: null, equity: null, iv: 60, fitNext: true,
+  equityChart: null, equity: null, band: null, iv: 60, fitNext: true,
+  bars: [], markers: [], oldestDay: null, newestDay: null, hasMore: false,
+  loadingOlder: false, barsLoaded: false,
 
   async getJson(url) {
     const r = await fetch(url, { cache: "no-store" });
@@ -352,8 +394,11 @@ const App = {
       const d = b.last_decision;
       const hb = b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s)
         : (b.state === "STOPPED" ? "最後活動 " + ago(b.last_activity_age_s) : "—");
+      const rg = b.regime;
       const name = el("div", null, el("div", { class: "name" }, b.bot_name),
-        el("div", { class: "sub trunc", title: b.strategy }, `${b.symbol}・${b.strategy || "—"}`));
+        el("div", { class: "sub trunc", title: b.strategy }, `${b.symbol}・${b.strategy || "—"}`),
+        rg ? el("div", { class: "rg-line" }, "盤勢", rgChip(rg.effective),
+          LEG[rg.active_leg] || "空手", rg.pause ? el("span", { title: "翻轉計數暫停中" }, "⏸ 暫停") : null) : null);
       const tr = el("tr", { onclick: () => this.open(b.id) },
         td("", chip(b.state), "first"),
         td("機器人", name, "first"),
@@ -379,7 +424,13 @@ const App = {
     this.current = m ? decodeURIComponent(m[1]) : null;
     $("fleet-view").hidden = !!this.current;
     $("detail-view").hidden = !this.current;
-    if (this.current) { this.fitNext = true; this.ivInit = true; this.day = null; this.refreshDetail(); }
+    if (this.current) {
+      this.fitNext = true; this.ivInit = true;
+      this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
+      this.hasMore = false; this.barsLoaded = false; this.equityFitted = false;
+      this.detail = null;
+      this.refreshDetail().then(() => this.loadBars("initial"));
+    }
     else if (this.fleet) this.renderFleet();
     window.scrollTo(0, 0);
   },
@@ -387,16 +438,62 @@ const App = {
   async refreshDetail() {
     if (!this.current) return;
     const id = this.current;
-    const q = "/api/bot?id=" + encodeURIComponent(id) + (this.day ? "&day=" + this.day : "");
     try {
-      const d = await this.getJson(q);
+      const d = await this.getJson("/api/bot?id=" + encodeURIComponent(id));
       if (id !== this.current) return;
       this.detail = d; this.lastOk = Date.now();
       $("banner").classList.remove("show");
       this.renderDetail();
+      // Until a first window has come back, keep asking for it (a bot with
+      // no bars file yet, or a failed first load, must not stay blank).
+      this.loadBars(this.barsLoaded ? "latest" : "initial");
     } catch (e) {
       $("banner").classList.add("show");
     }
+  },
+
+  // Candles come in windows of daily files stitched into one series:
+  // "initial" = newest few days, "older" = the days before what is loaded
+  // (prepended as the viewer scrolls left), "latest" = every day from the
+  // newest loaded one on, merged (a tab asleep across midnight fills its
+  // gap; a gap longer than one window reloads from scratch).
+  async loadBars(kind) {
+    const id = this.current;
+    if (!id || (kind === "older" && (this.loadingOlder || !this.hasMore || !this.oldestDay))) return;
+    let q = "/api/bars?id=" + encodeURIComponent(id);
+    if (kind === "older") q += "&before=" + this.oldestDay;
+    if (kind === "latest") q += "&days=10&after=" + (this.newestDay || "00000000");
+    if (kind === "older") { this.loadingOlder = true; $("d-loading").hidden = false; }
+    try {
+      const w = await this.getJson(q);
+      if (id !== this.current) return;
+      if (kind === "latest" && !w.complete) {   // asleep for too long: start over
+        this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
+        this.barsLoaded = false; this.fitNext = true;
+        return this.loadBars("initial");
+      }
+      if (kind !== "latest") { this.oldestDay = w.oldest_day || this.oldestDay; this.hasMore = w.has_more; }
+      if (kind !== "older" && w.newest_day && (!this.newestDay || w.newest_day > this.newestDay)) {
+        this.newestDay = w.newest_day;
+      }
+      if (kind === "initial") this.barsLoaded = true;
+      this.mergeBars(w.bars, w.markers);
+      this.drawCharts(kind === "older");
+    } catch (e) {
+      $("banner").classList.add("show");
+    } finally {
+      if (kind === "older") { this.loadingOlder = false; $("d-loading").hidden = true; }
+    }
+  },
+
+  mergeBars(bars, markers) {
+    const byTime = new Map(this.bars.map((b) => [b.time, b]));
+    for (const b of bars) byTime.set(b.time, b);
+    this.bars = [...byTime.values()].sort((a, b) => a.time - b.time);
+    const key = (m) => `${m.time}|${m.kind}|${m.price}`;
+    const marks = new Map(this.markers.map((m) => [key(m), m]));
+    for (const m of markers) marks.set(key(m), m);
+    this.markers = [...marks.values()].sort((a, b) => a.time - b.time);
   },
 
   renderDetail() {
@@ -414,13 +511,10 @@ const App = {
       tile("交易數 / 勝率", `${fmtInt(b.trades)} / ${b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%"}`),
       tile("心跳", b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s) : "—"),
     );
-    const sel = $("d-day");
-    sel.replaceChildren(...d.days.map((x) => el("option", { value: x },
-      `${x.slice(0, 4)}/${x.slice(4, 6)}/${x.slice(6)}`)));
-    if (d.day) sel.value = d.day;
+    this.renderRegime(d.regime);
     if (this.ivInit) { if ([60, 300, 900, 3600].includes(b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
     for (const btn of $("d-iv").children) btn.classList.toggle("on", Number(btn.dataset.iv) === this.iv);
-    this.drawCharts();
+    this.drawEquity();
 
     $("d-trades").tBodies[0].replaceChildren(...(d.trades.length ? d.trades.map((t) => el("tr", null,
       el("td", { class: t.side === "LONG" ? "up" : "down" }, SIDE[t.side] || t.side),
@@ -447,6 +541,61 @@ const App = {
     if (atBottom) pre.parentElement.scrollTop = pre.parentElement.scrollHeight;
   },
 
+  renderRegime(r) {
+    $("d-regime").hidden = !r;
+    $("d-band-legend").hidden = !r;
+    if (!r) return;
+    const n = r.next || {};
+    const legStrategy = r.active_leg === "long" ? r.long_strategy : r.active_leg === "short" ? r.short_strategy : "";
+    const sub = (text) => el("div", { class: "sub" }, text);
+    const tiles = el("div", { class: "tiles" },
+      tile("目前盤勢", el("div", null, rgChip(r.effective), r.since ? sub("自 " + r.since) : null)),
+      tile("執行中", el("div", null, LEG[r.active_leg] || "空手", legStrategy ? sub(legStrategy) : null)),
+      tile(`下一盤計畫${n.date ? "（依 " + n.date + " 夜盤判斷）" : ""}`, el("div", null,
+        RG_ACTION[n.action] || n.action || "—", n.strategy ? sub(n.strategy) : null,
+        sub(n.executed ? "✓ 已套用" + (n.executed_at ? " " + n.executed_at.slice(0, 16) : "") : "尚未套用"))),
+      tile("確認進度", el("div", null, rgChip(r.pending_label || r.raw),
+        sub(`連續 ${r.pending_count} 夜・最近原始判斷：${(REGIME[r.raw] || [r.raw || "—"])[0]}`))),
+      tile("翻轉暫停", r.pause
+        ? el("div", null, "⏸ 暫停中", sub(`至第 ${r.pause.until_session} 夜（目前第 ${r.pause.session_count} 夜）`))
+        : "無"),
+      tile("最近判斷", el("div", null, sessionKey(r.last_assessed),
+        r.manual_override && r.manual_override !== "auto" ? sub("手動指定：" + r.manual_override) : null)),
+    );
+    const f = r.features || {};
+    const num = (v, digits) => (typeof v === "number" ? v.toLocaleString("zh-TW", { maximumFractionDigits: digits }) : "—");
+    const feat = el("div", { class: "feat" },
+      el("span", null, "ADX ", el("b", null, num(f.adx, 1))),
+      el("span", null, "+DI ", el("b", null, num(f.plus_di, 1))),
+      el("span", null, "−DI ", el("b", null, num(f.minus_di, 1))),
+      el("span", null, "ATR 比 ", el("b", null, num(f.atr_ratio, 2))),
+      el("span", null, "EMA 斜率 ", el("b", null, num(f.ema_slope, 1))),
+      el("span", null, "收盤 / EMA50 ", el("b", null, `${num(f.last_close, 0)} / ${num(f.ema_50, 0)}`)),
+      el("span", null, "外部投票 ", el("b", null, r.votes && r.votes.length ? r.votes.join("、") : "無")),
+      el("span", null, "新聞 ", el("b", null, r.news_enabled ? "啟用" : "未啟用")),
+    );
+    const flags = r.flags && r.flags.length
+      ? el("div", { class: "flags" }, ...r.flags.map((x) => el("div", { class: "flag" },
+          el("span", { class: "sev " + x.sev }, x.sev), el("span", null, x.text))))
+      : el("div", { class: "sub" }, "監控檢查：無異常");
+    const rows = (r.history || []).map((h) => el("tr", null,
+      el("td", null, h.date), el("td", null, SLOT[h.session] || h.session),
+      el("td", null, h.effective_regime ? rgChip(h.effective_regime) : "—"),
+      el("td", null, (REGIME[h.raw_regime] || [h.raw_regime || "—"])[0]),
+      el("td", { class: "num" }, h.confirm_count || "—"),
+      el("td", null, RG_ACTION[h.decision] || h.decision || "—"),
+      el("td", { class: "trunc", title: h.strategy_active }, h.strategy_active || "—"),
+      el("td", null, h.applied === "true" ? "✓" : h.applied === "false" ? "否" : "—"),
+      el("td", { class: "num" }, money(h.pnl)),
+      el("td", { class: "num" }, h.trades || "0")));
+    const table = el("div", { class: "scroll short wide" }, el("table", null,
+      el("thead", null, el("tr", null, ...["日期", "盤別", "有效盤勢", "原始", "確認", "決策", "執行策略", "已套用"]
+        .map((h) => el("th", null, h)), el("th", { class: "num" }, "損益"), el("th", { class: "num" }, "交易"))),
+      el("tbody", null, ...(rows.length ? rows : [el("tr", null, el("td", { colspan: "10", class: "empty" }, "尚無紀錄"))]))));
+    $("d-regime-note").textContent = "與每日監控相同的檢查規則";
+    $("d-regime-body").replaceChildren(tiles, feat, flags, table);
+  },
+
   css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); },
 
   ensureCharts() {
@@ -464,6 +613,17 @@ const App = {
     const up = this.css("--up"), down = this.css("--down");
     this.candles = this.chart.addCandlestickSeries({ upColor: up, downColor: down,
       wickUpColor: up, wickDownColor: down, borderVisible: false });
+    this.chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: 0.08 } });
+    this.band = this.chart.addHistogramSeries({ priceScaleId: "band", lastValueVisible: false,
+      priceLineVisible: false, priceFormat: { type: "volume" } });
+    this.chart.priceScale("band").applyOptions({ scaleMargins: { top: 0.96, bottom: 0 }, visible: false });
+    // Near the left edge, page in older days. lightweight-charts fires this
+    // asynchronously, including after the page's own setData; what bounds
+    // the chain is that drawCharts shifts the view right by the candles it
+    // prepended, so loading stops once the visible range is filled.
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      if (range && range.from < 40) this.loadBars("older");
+    });
     this.equityChart = LightweightCharts.createChart($("d-equity"), base());
     this.equity = this.equityChart.addBaselineSeries({ baseValue: { type: "price", price: 0 },
       topLineColor: up, bottomLineColor: down,
@@ -472,7 +632,27 @@ const App = {
     return true;
   },
 
-  onChartsReady() { if (this.detail) this.drawCharts(); },
+  onChartsReady() { if (this.detail) { this.drawCharts(); this.drawEquity(); } },
+
+  rgba(hex, a) {
+    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+    return m ? `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${a})` : hex;
+  },
+
+  bandData(bars) {
+    const band = (this.detail && this.detail.regime && this.detail.regime.band) || [];
+    if (!band.length) return [];
+    const color = { up: this.css("--up"), down: this.css("--down"), range: this.css("--ok"), trans: this.css("--warn") };
+    const out = [];
+    let i = -1;
+    for (const b of bars) {
+      while (i + 1 < band.length && band[i + 1].time <= b.time) i++;
+      if (i < 0) continue;
+      const cls = (REGIME[band[i].regime] || [null, "none"])[1];
+      out.push({ time: b.time, value: 1, color: this.rgba(color[cls] || this.css("--off"), 0.7) });
+    }
+    return out;
+  },
 
   aggregate(bars, iv) {
     if (iv === 60) return bars;
@@ -495,28 +675,48 @@ const App = {
     return out;
   },
 
-  drawCharts() {
-    const d = this.detail;
-    if (!d || !this.ensureCharts()) return;
-    const bars = this.aggregate(d.bars, this.iv);
-    $("d-chart-empty").hidden = bars.length > 0;
+  drawCharts(keepView) {
+    if (!this.ensureCharts()) return;
+    const bars = this.aggregate(this.bars, this.iv);
+    $("d-chart-empty").hidden = bars.length > 0 || !this.barsLoaded;
     $("d-chart").hidden = bars.length === 0;
+    // Prepending older days must not move what the viewer is looking at:
+    // shift the logical range by the number of candles added in front.
+    const ts = this.chart.timeScale();
+    const view = keepView ? ts.getVisibleLogicalRange() : null;
+    const added = view ? bars.length - (this.drawnCount || 0) : 0;
     this.candles.setData(bars);
+    this.drawnCount = bars.length;
+    this.band.setData(this.bandData(bars));
     const snap = (t) => {   // a marker must sit on an existing candle
       let lo = 0, hi = bars.length - 1, best = bars.length ? bars[0].time : t;
       while (lo <= hi) { const mid = (lo + hi) >> 1; if (bars[mid].time <= t) { best = bars[mid].time; lo = mid + 1; } else hi = mid - 1; }
       return best;
     };
     const up = this.css("--up"), down = this.css("--down");
-    this.candles.setMarkers(d.markers.map((m) => m.kind === "entry"
+    this.candles.setMarkers(this.markers.map((m) => m.kind === "entry"
       ? { time: snap(m.time), position: m.long ? "belowBar" : "aboveBar", shape: m.long ? "arrowUp" : "arrowDown",
           color: m.long ? up : down, text: (m.long ? "多 " : "空 ") + fmtInt(m.price) }
       : { time: snap(m.time), position: m.long ? "aboveBar" : "belowBar", shape: m.long ? "arrowDown" : "arrowUp",
           color: this.css("--muted"), text: "出 " + (m.pnl > 0 ? "+" : "") + fmtInt(m.pnl) }));
+    if (view) ts.setVisibleLogicalRange({ from: view.from + added, to: view.to + added });
+    else if (this.fitNext && bars.length) { this.showRecent(bars); this.fitNext = false; }
+  },
+
+  // Open on roughly the latest trading day; older ones are a drag away.
+  showRecent(bars) {
+    const span = { 60: 300, 300: 200, 900: 96, 3600: 40 }[this.iv] || 100;
+    const last = bars.length - 1;
+    this.chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, last - span), to: last + 3 });
+  },
+
+  drawEquity() {
+    const d = this.detail;
+    if (!d || !this.ensureCharts()) return;
     $("d-equity-empty").hidden = d.equity.length > 0;
     $("d-equity").hidden = d.equity.length === 0;
     this.equity.setData(d.equity);
-    if (this.fitNext) { this.chart.timeScale().fitContent(); this.equityChart.timeScale().fitContent(); this.fitNext = false; }
+    if (!this.equityFitted) { this.equityChart.timeScale().fitContent(); this.equityFitted = true; }
   },
 
   init() {
@@ -526,7 +726,6 @@ const App = {
       this.renderFleet();
     });
     $("back").addEventListener("click", () => { location.hash = ""; });
-    $("d-day").addEventListener("change", (e) => { this.day = e.target.value; this.fitNext = true; this.refreshDetail(); });
     for (const btn of $("d-iv").children) btn.addEventListener("click", () => {
       this.iv = Number(btn.dataset.iv); this.fitNext = true;
       for (const b of $("d-iv").children) b.classList.toggle("on", b === btn);

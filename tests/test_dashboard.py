@@ -249,7 +249,7 @@ def test_detail_log_is_redacted_and_flagged(tmp_path):
     assert FAKE_CHANNEL not in text
     assert FAKE_USER_ID not in text
     assert [line["sev"] for line in det["log"]] == ["", "P1", ""]
-    assert det["day"] == "20261026" and det["days"] == ["20261026"]
+    assert "bars" not in det and det["log_file"] == "debug_20261026.log"
 
 
 def test_find_bot_dir_exact_match_only(tmp_path):
@@ -483,7 +483,7 @@ def test_pnl_today_is_the_taifex_trading_day(tmp_path):
 
 def test_session_json_reopened_only_when_it_changes(tmp_path, monkeypatch):
     d = make_bot(tmp_path)
-    snapshot._session_cache.clear()
+    snapshot._stat_cache.clear()
     opens = []
     real = fileio.read_json
     monkeypatch.setattr(fileio, "read_json", lambda p: opens.append(p) or real(p))
@@ -499,7 +499,7 @@ def test_session_json_reopened_only_when_it_changes(tmp_path, monkeypatch):
 
 def test_session_garbage_keeps_last_good_copy(tmp_path):
     d = make_bot(tmp_path)
-    snapshot._session_cache.clear()
+    snapshot._stat_cache.clear()
     assert snapshot.read_session(str(d))["strategy"] == "Demo"
     sj = d / "session.json"
     sj.write_text('{"strategy": "Dem', encoding="utf-8")
@@ -572,3 +572,241 @@ def test_detail_log_applies_monitor_redact(tmp_path):
                      snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["log"])
     assert "discord.com/api/webhooks" not in text
     assert "sk-ant-placeholder-value" not in text
+
+
+# ── continuous K-lines (bars_window) ────────────────────────────────────
+
+def _bars_file(d, day, rows):
+    (d / f"bars_1m_{day}.csv").write_text(
+        "datetime,open,high,low,close,volume\n"
+        + "".join(f"{t},100,101,99,{c},1\n" for t, c in rows), encoding="utf-8")
+
+
+def test_bars_window_stitches_the_night_across_midnight(tmp_path):
+    d = make_bot(tmp_path)
+    _bars_file(d, "20261022", [("2026/10/22 23:58", 1), ("2026/10/22 23:59", 2)])
+    _bars_file(d, "20261023", [("2026/10/23 00:00", 3), ("2026/10/23 00:01", 4)])
+    w = snapshot.bars_window(str(d), before="20261024", days=2)
+    assert [b["close"] for b in w["bars"]] == [1, 2, 3, 4]
+    times = [b["time"] for b in w["bars"]]
+    assert times == sorted(times) and len(set(times)) == 4
+    assert (w["oldest_day"], w["newest_day"], w["has_more"]) == ("20261022", "20261023", False)
+
+
+def test_bars_window_pages_backwards_without_overlap(tmp_path):
+    d = make_bot(tmp_path)
+    for day in ("20261020", "20261021", "20261022", "20261023"):
+        _bars_file(d, day, [(f"{day[:4]}/{day[4:6]}/{day[6:]} 09:00", int(day[-2:]))])
+    first = snapshot.bars_window(str(d), days=2)
+    assert first["newest_day"] == "20261026" and first["has_more"] is True
+    seen = {b["time"] for b in first["bars"]}
+    older = snapshot.bars_window(str(d), before=first["oldest_day"], days=2)
+    assert not seen & {b["time"] for b in older["bars"]}
+    last = snapshot.bars_window(str(d), before=older["oldest_day"], days=2)
+    assert last["has_more"] is False and [b["close"] for b in last["bars"]] == [20]
+
+
+def test_bars_window_caps_days_and_carries_markers(tmp_path):
+    d = make_bot(tmp_path, trades=[_trade(500, "2026-10-26 09:16:20")])
+    w = snapshot.bars_window(str(d), days=999)
+    assert [m["kind"] for m in w["markers"]] == ["exit"]
+    for day in range(1, 16):
+        _bars_file(d, f"202610{day:02d}", [(f"2026/10/{day:02d} 09:00", day)])
+    w = snapshot.bars_window(str(d), days=999)
+    assert w["has_more"] is True
+    assert len({b["time"] for b in w["bars"]}) <= snapshot.BARS_DAYS_MAX * 2
+
+
+@pytest.mark.parametrize("query,code", [
+    ("id=TMF00_alpha", 200), ("id=TMF00_alpha&before=20261027&days=2", 200),
+    ("id=TMF00_alpha&days=x", 200), ("id=TMF00_alpha&before=../etc", 400),
+    ("id=TMF00_alpha&before=2026102", 400), ("id=../TMF00_alpha", 404),
+])
+def test_bars_route_validates_input(live_server, query, code):
+    url = live_server + "/api/bars?" + query
+    if code == 200:
+        assert _get(url)[0] == 200
+    else:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(url)
+        assert exc.value.code == code
+
+
+# ── regime panel ────────────────────────────────────────────────────────
+
+REGIME_HEADER = ("date,session,adx,plus_di,minus_di,atr_ratio,ema_slope,close,raw_regime,"
+                 "effective_regime,confirm_count,decision,strategy_deployed,dry_run,override,"
+                 "pnl,trades,strategy_active,applied,applied_at,trading_mode,votes,vote_rule")
+
+
+def make_regime_bot(base, *, state=None, history_rows=(), **kw):
+    d = make_bot(base, name="TMF00_regime", **kw)
+    sess = json.loads((d / "session.json").read_text(encoding="utf-8"))
+    sess.update(regime_mode=True, active_leg="short", long_strategy="LongS",
+                short_strategy="ShortS", news_enabled=False)
+    (d / "session.json").write_text(json.dumps(sess), encoding="utf-8")
+    st = {"effective_regime": "trending-down", "effective_since": "2026-10-07",
+          "raw_regime": "trending-down", "pending_label": "trending-down",
+          "pending_count": 2, "paused_until_session": 50, "session_count": 49,
+          "manual_override": "auto", "last_assessed": "2026-10-23|NIGHT",
+          "key_format": "open-date",
+          "last_features": {"adx": 57.2, "plus_di": 8.8, "minus_di": 34.7,
+                            "atr_ratio": 0.94, "ema_slope": -337.5, "_vote_sources": []},
+          "next_session": {"date": "2026-10-23", "action": "hold", "strategy": "",
+                           "reason": "pause", "executed": False}}
+    st.update(state or {})
+    (d / "regime_state.json").write_text(json.dumps(st), encoding="utf-8")
+    (d / "regime_history.csv").write_text(
+        REGIME_HEADER + "\n" + "".join(r + "\n" for r in history_rows), encoding="utf-8")
+    return d
+
+
+def test_non_regime_bot_has_no_regime_view(tmp_path):
+    d = make_bot(tmp_path)
+    (d / "regime_state.json").write_text('{"effective_regime": "trending-up"}')  # leftover
+    assert snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)["regime"] is None
+    assert snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"] is None
+
+
+def test_regime_summary_for_fleet_row(tmp_path):
+    d = make_regime_bot(tmp_path)
+    rg = snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)["regime"]
+    assert rg == {"effective": "trending-down", "since": "2026-10-07", "active_leg": "short",
+                  "pause": {"until_session": 50, "session_count": 49},
+                  "next_action": "hold", "classified": True}
+
+
+def test_pause_matches_monitor_rule():
+    assert snapshot._pause({"paused_until_session": 49, "session_count": 49}) is not None
+    assert snapshot._pause({"paused_until_session": 48, "session_count": 49}) is None
+    assert snapshot._pause({"paused_until_session": True, "session_count": 0}) is None
+
+
+def test_regime_detail_history_band_and_monitor_flags(tmp_path):
+    rows = ["2026-10-22,NIGHT,48.4,10.2,47.6,0.92,-347.7,46291.0,trending-down,trending-down,1,"
+            "hold,,,auto,0.0,0,ShortS,false,,paper,,",
+            "2026-10-23,DAY,,,,,,,,,,,,,,1200.0,2,ShortS,,,paper,,",
+            "2026-10-23,NIGHT,57.2,8.8,34.7,0.94,-337.5,45654.0,trending-down,trending-down,2,"
+            "hold,,,auto,-300.0,1,ShortS,false,,paper,,"]
+    d = make_regime_bot(tmp_path, history_rows=rows)
+    r = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]
+    assert [h["date"] + h["session"] for h in r["history"]] == \
+        ["2026-10-23NIGHT", "2026-10-23DAY", "2026-10-22NIGHT"]          # newest first
+    assert r["history"][1]["pnl"] == 1200
+    # NIGHT classifications take effect at that night's close (open + 14 h).
+    assert [b["time"] for b in r["band"]] == [
+        snapshot.chart_time(datetime(2026, 10, 23, 5, 0, tzinfo=TZ_TPE)),
+        snapshot.chart_time(datetime(2026, 10, 24, 5, 0, tzinfo=TZ_TPE))]
+    assert r["features"]["adx"] == 57.2 and "_vote_sources" not in r["features"]
+    texts = " ".join(f["text"] for f in r["flags"])
+    assert "flip-counter pause active" in texts                      # check_regime's own rule
+    assert {f["sev"] for f in r["flags"]} <= {"P1", "P2", "P3"}
+
+
+def _age_bot(d, day="2026-10-20"):
+    """Make every activity marker predate the last completed night (10-23)."""
+    old = datetime.fromisoformat(f"{day}T09:00:00+08:00").timestamp()
+    (d / "debug_20261026.log").write_text(f"[{day} 09:00:00.000 TPE] last line\n",
+                                          encoding="utf-8")
+    for p in d.iterdir():
+        os.utime(p, (old, old))
+
+
+def _monitor_findings(base, bot):
+    from scripts.monitor.check_regime import check_regime
+    findings, _ = check_regime(NOW, str(base))
+    return {(f.level, snapshot.redact_line(f.message)) for f in findings
+            if f.message.split(": ", 1)[0].endswith(bot) or f"{bot}:" in f.message}
+
+
+@pytest.mark.parametrize("scenario", ["active", "stopped-before-the-night",
+                                      "active-corrupt", "stopped-corrupt"])
+def test_regime_flags_match_the_monitor(tmp_path, scenario):
+    """Every flag the page shows is a finding check_regime reports for the
+    same directory, at the same severity (including its stopped-bot demotion,
+    which keys on activity since the last completed night, not on the lock)."""
+    d = make_regime_bot(tmp_path)
+    if "corrupt" in scenario:
+        (d / "regime_state.json").write_text("{not json", encoding="utf-8")
+    if scenario.startswith("stopped"):
+        (d / ".lock").unlink()
+        _age_bot(d)
+    flags = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]["flags"]
+    assert flags
+    monitor = _monitor_findings(tmp_path, "TMF00_regime")
+    for f in flags:
+        assert (f["sev"], f["text"]) in monitor, (f, monitor)
+    if scenario.startswith("stopped"):
+        assert {f["sev"] for f in flags} == {"P3"}
+    else:
+        assert {f["sev"] for f in flags} != {"P3"}
+    if scenario == "active-corrupt":
+        assert flags[0]["sev"] == "P1"
+
+
+def test_clean_stop_during_the_night_is_not_demoted(tmp_path):
+    """No lock, but active since the last night opened: the monitor still
+    grades it (a bot that stopped mid-night can have missed its run)."""
+    d = make_regime_bot(tmp_path, lock_pid=None, hb_age_s=None)
+    flags = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]["flags"]
+    assert any(f["sev"] != "P3" for f in flags)
+
+
+def test_regime_files_are_reread_only_when_they_change(tmp_path, monkeypatch):
+    d = make_regime_bot(tmp_path, history_rows=[
+        "2026-10-23,NIGHT,,,,,,,x,trending-up,1,hold,,,auto,0,0,S,false,,paper,,"])
+    snapshot._stat_cache.clear()
+    opened = []
+    real_json, real_head = fileio.read_json, fileio.head_line
+    monkeypatch.setattr(fileio, "read_json", lambda p: opened.append(os.path.basename(p)) or real_json(p))
+    monkeypatch.setattr(fileio, "head_line", lambda p, *a: opened.append(os.path.basename(p)) or real_head(p, *a))
+    for _ in range(3):
+        snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)
+        snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)
+    assert opened.count("regime_state.json") == 1
+    assert opened.count("regime_history.csv") == 1
+    st = d / "regime_state.json"
+    st.write_text(st.read_text(encoding="utf-8").replace("2026-10-07", "2026-10-08"),
+                  encoding="utf-8")
+    os.utime(st, ns=(os.stat(st).st_atime_ns, os.stat(st).st_mtime_ns + 10**9))
+    assert snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)["regime"]["since"] == "2026-10-08"
+    assert opened.count("regime_state.json") == 2
+
+
+def test_regime_reason_and_history_are_redacted(tmp_path):
+    d = make_regime_bot(tmp_path, state={"next_session": {
+        "action": "hold", "reason": f"note channel={FAKE_CHANNEL}"}},
+        history_rows=[f"2026-10-23,NIGHT,,,,,,,x,trending-up,1,hold,,,auto,0,0,"
+                      f"user {FAKE_USER_ID},false,,paper,,"])
+    r = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]
+    blob = json.dumps(r, ensure_ascii=False)
+    assert FAKE_CHANNEL not in blob and FAKE_USER_ID not in blob
+
+
+def test_corrupt_regime_files_do_not_break_detail(tmp_path):
+    d = make_regime_bot(tmp_path)
+    (d / "regime_state.json").write_text("{not json", encoding="utf-8")
+    (d / "regime_history.csv").write_bytes(b"\xff\xfe garbage\n,,\n")
+    r = snapshot.bot_detail(NOW, str(d), pid_alive_fn=_alive)["regime"]
+    assert r["flags"][0]["sev"] == "P1" and r["history"] == []     # as check_regime
+
+
+def test_bars_after_returns_every_day_since_and_flags_long_gaps(tmp_path):
+    """The 10 s refresh asks for every file from its newest loaded day on, so
+    a tab that slept across midnight fills the gap instead of skipping it."""
+    d = make_bot(tmp_path)
+    _bars_file(d, "20261024", [("2026/10/24 04:58", 7)])
+    w = snapshot.bars_window(str(d), after="20261024", days=10)
+    assert [b["close"] for b in w["bars"]][0] == 7 and w["complete"] is True
+    assert w["newest_day"] == "20261026"
+    for day in range(1, 12):
+        _bars_file(d, f"202610{day:02d}", [(f"2026/10/{day:02d} 09:00", day)])
+    w = snapshot.bars_window(str(d), after="20261001", days=10)
+    assert w["complete"] is False             # page reloads instead of leaving a hole
+
+
+def test_head_line_reads_csv_header_with_bom(tmp_path):
+    p = tmp_path / "h.csv"
+    p.write_bytes("﻿date,session\n1,2\n".encode("utf-8"))
+    assert fileio.head_line(str(p)) == "date,session"
+    assert fileio.head_line(str(tmp_path / "missing.csv")) is None
