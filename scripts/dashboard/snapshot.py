@@ -29,7 +29,7 @@ from scripts.monitor.check_logs import PATTERNS
 from scripts.monitor.common import (
     TZ_TPE, discover_bot_dirs, pid_alive, redact,
 )
-from scripts.dashboard import fileio
+from scripts.dashboard import fileio, real_pnl
 from src.live.headless import stop_requested
 from src.utils.log_redact import scrub_ids
 
@@ -311,6 +311,7 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
         "last_price": last_close,
         "last_bar_dt": bar_dt.strftime("%Y-%m-%d %H:%M") if bar_dt else "",
         "saved_at": str(sess.get("saved_at") or ""),
+        "real": real_pnl.summarize(trades, point_value, day_start),
     })
     decisions = read_decisions(bot_dir, 1)
     info["last_decision"] = decisions[-1] if decisions else None
@@ -351,7 +352,7 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "last_activity_age_s": None, "strategy": "", "trading_mode": "",
             "interval_s": 0, "point_value": 1, "trades": 0, "win_rate": None,
             "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
-            "last_price": None, "last_bar_dt": "", "saved_at": "",
+            "last_price": None, "last_bar_dt": "", "saved_at": "", "real": None,
             "last_decision": None, "regime": None,
             "pending": {"stop": False, "mode": None}, "active": True}
 
@@ -416,8 +417,15 @@ def read_bars(path: str) -> list[dict]:
     return [by_time[t] for t in sorted(by_time)]
 
 
-def _trade_row(t: dict) -> dict:
-    return {"side": str(t.get("side") or ""), "qty": _to_int(t.get("qty"), 1),
+def _trade_row(t: dict, point_value: int | None = None) -> dict:
+    """One trade for the page. With ``point_value`` it also carries the
+    real-order classification (``real_pnl.classify``)."""
+    extra = {}
+    if point_value is not None:
+        c = real_pnl.classify(t, point_value)
+        extra = {"real_status": c["status"], "real_pnl": c["real_pnl"],
+                 "real_reason": c["reason"]}
+    return {**extra, "side": str(t.get("side") or ""), "qty": _to_int(t.get("qty"), 1),
             "entry_dt": str(t.get("entry_dt") or ""),
             "entry_price": _to_int(t.get("entry_price")),
             "real_entry_price": _to_int(t.get("real_entry_price")),
@@ -666,7 +674,7 @@ def bot_detail(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     """Everything for the bot page except candles (``bars_window``)."""
     summary = bot_summary(now, bot_dir, pid_alive_fn=pid_alive_fn)
     sess = read_session(bot_dir)
-    trades = [_trade_row(t) for t in _session_trades(bot_dir)]
+    trades = [_trade_row(t, summary["point_value"]) for t in _session_trades(bot_dir)]
     logs = _newest(bot_dir, _DEBUG_RE)
     log_path = logs[0][1] if logs else None
     log_lines = []
