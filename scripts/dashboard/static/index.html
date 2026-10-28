@@ -172,7 +172,7 @@ pre.log .P3 { color: var(--muted); }
       <table id="fleet">
         <thead><tr>
           <th>狀態</th><th>機器人</th><th>模式</th><th>持倉</th>
-          <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日</th><th class="num">累計損益</th>
+          <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日</th><th class="num" title="模擬成交價計算">模擬累計</th><th class="num" title="實際成交價計算，未扣手續費及期交稅">實單累計</th>
           <th class="num">交易數</th><th class="num">勝率</th><th>最後決策</th><th>心跳</th>
         </tr></thead>
         <tbody></tbody>
@@ -226,7 +226,7 @@ pre.log .P3 { color: var(--muted); }
         </div>
         <div class="scroll wide" data-pane="trades"><table id="d-trades"><thead><tr>
           <th>方向</th><th>進場時間</th><th class="num">進場價</th><th>出場時間</th>
-          <th class="num">出場價</th><th class="num">損益</th><th>出場原因</th><th>來源</th>
+          <th class="num">出場價</th><th class="num">模擬損益</th><th class="num">實單損益</th><th>出場原因</th><th>來源</th>
         </tr></thead><tbody></tbody></table></div>
         <div class="scroll wide" data-pane="decisions" hidden><table id="d-decisions"><thead><tr>
           <th>K 線時間</th><th>動作</th><th>方向</th><th class="num">價格</th><th>原因</th>
@@ -352,6 +352,41 @@ function pendingChip(p) {
   if (p.stop) return el("span", { class: "pend" }, "停止中…");
   if (p.mode) return el("span", { class: "pend" }, "待切換" + (MODE[p.mode] || p.mode));
   return null;
+}
+// Real-order P&L comes from recorded fill prices (scripts/dashboard/real_pnl.py).
+// Gross: before broker fees and the futures transaction tax.
+function realCell(r) {
+  if (!r) return el("span", { class: "muted" }, "—");
+  if (!r.trades) return el("span", { class: "muted", title: `${r.unreliable + r.missing} 筆實單價格不可靠或缺失，不計入` }, "無可信資料");
+  return el("span", { title: `${r.trades} 筆實單（含估 ${r.estimated}）；滑價 ${r.slippage_total > 0 ? "+" : ""}${fmtInt(r.slippage_total)}` },
+    money(r.pnl_total));
+}
+function realTiles(r) {
+  if (!r) return [];
+  const excluded = r.unreliable + r.missing;
+  const parts = [];
+  if (r.unreliable) parts.push(`${r.unreliable} 筆成交價不可靠（${r.trusted_from} 前記錄或價格異常）`);
+  if (r.missing) parts.push(`${r.missing} 筆無成交價`);
+  const note = excluded ? `不計入：${parts.join("、")}` : "未扣手續費及期交稅";
+  if (!r.trades) return [tile("實單損益", el("div", null, el("span", { class: "muted" }, "無可信資料"), el("div", { class: "sub" }, note)))];
+  return [
+    tile("實單累計損益", el("div", null, money(r.pnl_total),
+      el("div", { class: "sub" }, `${r.trades} 筆實單${r.estimated ? `（含估 ${r.estimated}）` : ""}`))),
+    tile("本交易日實單", el("div", null, money(r.pnl_today),
+      el("div", { class: "sub" }, `${r.trades_today} 筆`))),
+    tile("滑價（實單−模擬）", el("div", null, money(r.slippage_total),
+      el("div", { class: "sub" }, `同批交易模擬 ${r.sim_pnl_same_trades > 0 ? "+" : ""}${fmtInt(r.sim_pnl_same_trades)}`))),
+    tile("實單備註", el("div", { class: "sub" }, "未扣手續費及期交稅" + (excluded ? "；" + note : ""))),
+  ];
+}
+function tradeRealCell(t) {
+  switch (t.real_status) {
+    case "real": return money(t.real_pnl);
+    case "estimated": return el("span", { title: t.real_reason }, money(t.real_pnl), el("span", { class: "sub" }, " 估"));
+    case "unreliable": return el("span", { class: "muted", title: t.real_reason }, "不可靠");
+    case "missing": return el("span", { class: "muted", title: t.real_reason }, "無成交價");
+    default: return el("span", { class: "muted" }, "—");
+  }
 }
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
@@ -486,11 +521,16 @@ const App = {
       tile("實單機器人", String(bots.filter((b) => b.trading_mode && b.trading_mode !== "paper").length)),
       tile("未實現損益", money(unreal)),
       tile("本交易日", money(sum("pnl_today"))),
-      tile("累計損益", money(sum("pnl_total"))),
+      tile("模擬累計損益", money(sum("pnl_total"))),
+      ...(bots.some((b) => b.real && b.real.trades)
+        ? [tile("實單累計損益", el("div", null,
+            money(bots.reduce((a, b) => a + ((b.real && b.real.pnl_total) || 0), 0)),
+            el("div", { class: "sub" }, "未扣手續費及期交稅")))]
+        : []),
     );
     const body = $("fleet").tBodies[0];
     if (!bots.length) {
-      body.replaceChildren(el("tr", null, el("td", { colspan: "11", class: "empty" }, "目前沒有機器人")));
+      body.replaceChildren(el("tr", null, el("td", { colspan: "12", class: "empty" }, "目前沒有機器人")));
       return;
     }
     body.replaceChildren(...bots.map((b) => {
@@ -509,7 +549,8 @@ const App = {
         td("持倉", positionText(b.position)),
         td("未實現", money(b.position ? b.position.unrealized : null), "num"),
         td("本交易日", money(b.pnl_today), "num"),
-        td("累計損益", money(b.pnl_total), "num"),
+        td("模擬累計", money(b.pnl_total), "num"),
+        td("實單累計", realCell(b.real), "num"),
         td("交易數", fmtInt(b.trades), "num"),
         td("勝率", b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%", "num"),
         td("最後決策", d ? el("span", { title: d.reason }, `${d.bar_dt.slice(5)} ${ACTION[d.action] || d.action}`) : "—"),
@@ -617,9 +658,10 @@ const App = {
       tile("最新價", b.last_price ? fmtInt(b.last_price) : "—"),
       tile("未實現", money(b.position ? b.position.unrealized : null)),
       tile("本交易日", money(b.pnl_today)),
-      tile("累計損益", money(b.pnl_total)),
+      tile("模擬累計損益", money(b.pnl_total)),
       tile("交易數 / 勝率", `${fmtInt(b.trades)} / ${b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%"}`),
       tile("心跳", b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s) : "—"),
+      ...realTiles(b.real),
     );
     this.renderRegime(d.regime);
     if (this.ivInit) { if ([60, 300, 900, 3600].includes(b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
@@ -633,9 +675,10 @@ const App = {
       el("td", null, t.exit_dt.slice(0, 16)),
       el("td", { class: "num" }, t.exit_price ? priceCell(t.exit_price, t.real_exit_price) : "—"),
       el("td", { class: "num" }, money(t.pnl)),
+      el("td", { class: "num" }, tradeRealCell(t)),
       el("td", null, EXIT_TAG[t.exit_tag] || t.exit_tag || "—"),
       el("td", null, SOURCE[t.source] || t.source || "—"),
-    )) : [el("tr", null, el("td", { colspan: "8", class: "empty" }, "尚無交易"))]));
+    )) : [el("tr", null, el("td", { colspan: "9", class: "empty" }, "尚無交易"))]));
 
     $("d-decisions").tBodies[0].replaceChildren(...(d.decisions.length ? d.decisions.map((r) => el("tr", null,
       el("td", null, r.bar_dt),
