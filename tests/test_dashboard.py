@@ -315,8 +315,9 @@ def test_trading_day_pnl_label_is_ben_jiaoyi_ri(live_server):
     status, ctype, body = _get(live_server + "/")
     assert status == 200 and ctype.startswith("text/html")
     page = body.decode("utf-8")
-    assert page.count("本交易日") == 4
+    assert page.count("本交易日") == 5          # 4 simulated + the real-order tile
     assert 'title="自最近一次夜盤開盤（15:00）起">本交易日</th>' in page
+    assert 'tile("本交易日實單"' in page
     assert "本交易日已實現" not in page
     assert "今日" not in page
     assert "Today" not in page
