@@ -49,6 +49,7 @@ EXIT_BACKTEST_FAILED = 7
 # run_backtest.py — keep them byte-identical.
 TITLE_STRATEGY_CHANGE = "策略更換 Strategy Change"
 TITLE_EXISTING_POSITION = "帳戶有持倉 Existing Position"
+TITLE_UNKNOWN_POSITION = "持倉未知 Unknown Position"
 TITLE_DATA_RANGE = "資料範圍不足 Insufficient Data Range"
 
 
@@ -62,6 +63,7 @@ class HeadlessPolicy:
 
     use_selected_strategy: bool = False    # resume: deploy --strategy, not the saved one
     allow_existing_position: bool = False  # real account already holds a position
+    allow_unknown_position: bool = False   # --allow-unknown-position only
     accept_data_range: bool = True         # backtest: less data than requested
 
     def answer(self, title: str) -> bool:
@@ -69,6 +71,8 @@ class HeadlessPolicy:
             return self.use_selected_strategy
         if title == TITLE_EXISTING_POSITION:
             return self.allow_existing_position
+        if title == TITLE_UNKNOWN_POSITION:
+            return self.allow_unknown_position
         if title == TITLE_DATA_RANGE:
             return self.accept_data_range
         # Unknown question: decline. A new GUI prompt must be wired here
@@ -160,6 +164,7 @@ def policy_from_args(args: argparse.Namespace) -> HeadlessPolicy:
     return HeadlessPolicy(
         use_selected_strategy=bool(getattr(args, "strategy", "")),
         allow_existing_position=bool(getattr(args, "allow_existing_position", False)),
+        allow_unknown_position=bool(getattr(args, "allow_unknown_position", False)),
         accept_data_range=True,
     )
 
@@ -516,6 +521,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="suppress only the conflicting leg")
     d.add_argument("--allow-existing-position", action="store_true",
                    help="deploy even if the real account already holds a position")
+    d.add_argument("--allow-unknown-position", action="store_true",
+                   help="deploy even if the real position is UNKNOWN "
+                        "(query failed or timed out); does not allow a known open position")
     d.add_argument("--login-timeout", type=int, default=90,
                    help="seconds to wait for the quote connection (default 90)")
     d.add_argument("--heartbeat-min", type=int, default=5,
