@@ -125,6 +125,7 @@ from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
+    open_interest_query_rejected,
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.com_broker_port import ComBrokerPort
@@ -1227,7 +1228,17 @@ class SKOrderLibEvents:
         _ui_queue.put_nowait(("order_result", (nCode, bstrMessage)))
 
     def OnOpenInterest(self, bstrData):
-        _ui_queue.put_nowait(("open_interest", bstrData))
+        # Tag the row with the query that is in flight NOW. A reply that
+        # was already queued under an older generation must not complete
+        # a later GetOpenInterestGW (issue #202). The API has no request
+        # id; enqueue time is the correlation we have.
+        payload: str | tuple = bstrData
+        app = _app
+        monitor = getattr(app, "_account_monitor", None) if app is not None else None
+        generation = getattr(monitor, "oi_query_generation", None) if monitor is not None else None
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            payload = (bstrData, generation)
+        _ui_queue.put_nowait(("open_interest", payload))
 
     def OnFutureRights(self, bstrData):
         _ui_queue.put_nowait(("future_rights", bstrData))
@@ -1235,6 +1246,28 @@ class SKOrderLibEvents:
 
 _parse_open_interest = parse_open_interest  # re-export from account_monitor
 _parse_future_rights = parse_future_rights  # re-export from account_monitor
+
+
+def _split_open_interest_event(data) -> tuple[str, int | None]:
+    """Return ``(raw, generation)`` for one queued OnOpenInterest event.
+
+    The callback tags the row with the query generation current when the
+    row was enqueued. An untagged string is credited to whatever query is
+    current when the queue is processed.
+    """
+    if (
+        isinstance(data, tuple)
+        and len(data) == 2
+        and isinstance(data[1], int)
+        and not isinstance(data[1], bool)
+    ):
+        raw = data[0]
+        if not isinstance(raw, str):
+            raw = "" if raw is None else str(raw)
+        return raw, data[1]
+    if isinstance(data, str):
+        return data, None
+    return ("" if data is None else str(data)), None
 
 
 class BacktestApp:
@@ -1379,19 +1412,31 @@ class BacktestApp:
                             entries = [e.strip() for e in raw.split(";") if e.strip()]
                             _log(f"期貨商品列表(mkt={market_no}): {len(entries)} symbols")
                 elif kind == "open_interest":
-                    parsed = _parse_open_interest(data)
-                    if parsed:
-                        self._account_monitor.add_position(parsed)
+                    raw, oi_generation = _split_open_interest_event(data)
+                    outcome = self._account_monitor.apply_open_interest(
+                        raw, generation=oi_generation)
+                    parsed = _parse_open_interest(raw) if outcome == "position" else None
+                    if outcome == "position":
                         self._update_real_account_display()
-                    else:
-                        first = data.split(",")[0].strip() if data else ""
-                        if first == "001":
-                            self._account_monitor.set_flat()
-                            self.real_pos_var.set("Flat (無持倉)")
-                    _log(f"未平倉 OpenInterest: {_redact_open_interest(data)}")
-                    # Fill polling: track position from OI callbacks
-                    if self._trading_guard.fill_pending and self._live_runner:
-                        self._update_fill_poll_position(data, parsed)
+                    elif outcome == "flat":
+                        self.real_pos_var.set("Flat (無持倉)")
+                    _log(f"未平倉 OpenInterest: {_redact_open_interest(raw)}")
+                    # Fill polling: track position from OI callbacks.
+                    # A stale row belongs to an older query and must not
+                    # confirm a fill (issue #202).
+                    if (outcome != "stale"
+                            and self._trading_guard.fill_pending
+                            and self._live_runner):
+                        self._update_fill_poll_position(raw, parsed)
+                    # #173's late-resume recheck belongs on a credited row.
+                    # The methods are absent until that PR lands; keep this
+                    # call (and drop a second insert) when resolving the
+                    # _process_ui_queue conflict.
+                    if outcome != "stale":
+                        _recheck = getattr(self, "_recheck_resume_after_snapshot", None)
+                        _settles = getattr(self, "_oi_row_settles_resume_recheck", None)
+                        if _recheck is not None and _settles is not None:
+                            _recheck(settled=_settles(raw, parsed))
                 elif kind == "future_rights":
                     parsed = _parse_future_rights(data)
                     if parsed:
@@ -1870,6 +1915,9 @@ class BacktestApp:
             _log_debug("[RECONNECT] reconcile skipped — no futures account yet")
             return
         try:
+            # A new query, same as the account refresh. The generation
+            # moves forward so this reply cannot complete a later deploy.
+            self._account_monitor.begin_oi_query()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
                      user_id, account, 1)
         except Exception as e:
@@ -7836,14 +7884,20 @@ class BacktestApp:
 
     # ── Dialog seams (overridden by the headless CLI, src/live/headless_app.py) ──
 
-    def _confirm(self, title: str, message: str) -> bool:
+    def _confirm(self, title: str, message: str, *, default_no: bool = False) -> bool:
         """Yes/No question on the deploy + backtest paths.
 
         The GUI asks the user; ``HeadlessBotApp`` answers from its policy
         flags. Every interactive question on these paths MUST go through
         here so the CLI never blocks on a hidden dialog.
+
+        ``default_no`` selects the No button. The unknown-position prompt
+        uses it (issue #202). Other prompts keep the toolkit default (Yes).
         """
-        return bool(messagebox.askyesno(title, message))
+        options = {}
+        if default_no:
+            options["default"] = messagebox.NO
+        return bool(messagebox.askyesno(title, message, **options))
 
     def _alert(self, title: str, message: str) -> None:
         """Error popup on the deploy path (log-only when headless)."""
@@ -8216,13 +8270,34 @@ class BacktestApp:
             return False
 
         def _after_oi_wait() -> bool:
-            if (trading_mode in ("semi_auto", "auto") and self._futures_account
-                    and not self._account_monitor.oi_snapshot_received):
-                _log(
-                    "持倉查詢逾時 Position snapshot not received within "
-                    f"{OI_SNAPSHOT_TIMEOUT_S:.0f}s — treating real position "
-                    "as UNKNOWN"
+            # Fail closed (issue #202). A missing snapshot used to log
+            # UNKNOWN and deploy anyway, because an empty position list
+            # skipped the Existing Position confirm. Paper has no real book.
+            real_book = trading_mode in ("semi_auto", "auto") and self._futures_account
+            query_failed = bool(getattr(self, "_predeploy_oi_failed", False))
+            if real_book and (query_failed or not self._account_monitor.oi_snapshot_received):
+                detail = getattr(self, "_predeploy_oi_unknown_reason", "") or (
+                    f"not received within {OI_SNAPSHOT_TIMEOUT_S:.0f}s"
                 )
+                _log(
+                    "持倉未知 Position UNKNOWN "
+                    f"({detail}) — real-order deploy needs confirmation"
+                )
+                proceed = self._confirm(
+                    "持倉未知 Unknown Position",
+                    "無法確認帳戶未平倉部位（查詢失敗、被拒或逾時）。\n"
+                    "Real position is UNKNOWN (query failed, rejected, or timed out).\n\n"
+                    "部署可能在已有持倉時送出實單。\n"
+                    "Deploying may send real orders while a position is already open.\n\n"
+                    "是否仍要部署？\n"
+                    "Deploy anyway?",
+                    default_no=True,
+                )
+                if not proceed:
+                    self.set_status(
+                        "部署取消：持倉未知 Deploy cancelled: real position UNKNOWN",
+                        "warn")
+                    return False
             if trading_mode in ("semi_auto", "auto") and self._futures_account:
                 if self._account_monitor.has_open_positions():
                     pos_parts = []
@@ -8249,20 +8324,36 @@ class BacktestApp:
                 news_enabled, news_tier2_enabled, news_directional,
                 resume_session, trading_mode, bot_name)
 
-        # Semi-auto: check for pre-existing real positions before deploy
+        # Real-order deploy: query the book, then fail closed on UNKNOWN.
+        # Paper skips this. A non-zero GetOpenInterestGW code is UNKNOWN
+        # immediately — the callback is not coming (issue #202).
+        self._predeploy_oi_failed = False
+        self._predeploy_oi_unknown_reason = ""
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
             try:
                 user_id = self.login_user_var.get().strip()
-                self._account_monitor.clear_positions()
-                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                         user_id, self._futures_account, 1)
-                # The OnOpenInterest reply arrives asynchronously through the
-                # UI queue — observed ~4s after the query. GUI waits via an
-                # after(100) poll so the Tk thread is not frozen; headless
-                # falls back to a blocking drain (no update_idletasks).
-                if self._oi_wait_must_block():
+                # New generation. clear_positions() must not be what drops
+                # the previous answer; only this query can complete it.
+                self._account_monitor.begin_oi_query()
+                code = call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                                user_id, self._futures_account, 1)
+                _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
+                if open_interest_query_rejected(code):
+                    self._predeploy_oi_failed = True
+                    self._predeploy_oi_unknown_reason = (
+                        f"GetOpenInterestGW code={code}"
+                    )
+                    _log(
+                        "持倉查詢被拒 Pre-deploy GetOpenInterestGW rejected: "
+                        f"code={code} — real position UNKNOWN"
+                    )
+                elif self._oi_wait_must_block():
+                    # The OnOpenInterest reply arrives asynchronously through
+                    # the UI queue — observed ~4s after the query. Headless
+                    # drains the queue here (no update_idletasks).
                     self._wait_oi_snapshot_blocking()
                 else:
+                    # GUI: after(100) poll so the Tk thread is not frozen.
                     _deadline = time.time() + OI_SNAPSHOT_TIMEOUT_S
 
                     def _poll_oi():
@@ -8279,6 +8370,8 @@ class BacktestApp:
                     self.root.after(100, _poll_oi)
                     return True
             except Exception as e:
+                self._predeploy_oi_failed = True
+                self._predeploy_oi_unknown_reason = f"{type(e).__name__}: {e}"
                 _log(f"部署前持倉查詢失敗 Pre-deploy position check failed: {e}")
         return _after_oi_wait()
 
@@ -10159,7 +10252,12 @@ class BacktestApp:
             self._on_fill_timeout()
             return
 
-        # Request fresh position data via COM
+        # Request fresh position data via COM. This poll fires every 3s
+        # and the callback is often ~4s behind, so it does not call
+        # begin_oi_query(): that would clear the book and leave it
+        # UNKNOWN for the whole fill wait. A tail "##" still cannot
+        # flatten a later deploy — "##" answers empty only after "001"
+        # in that generation (issue #202).
         try:
             user_id = self.login_user_var.get().strip()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
@@ -10646,7 +10744,9 @@ class BacktestApp:
             return
         user_id = self.login_user_var.get().strip()
         try:
-            self._account_monitor.clear_positions()  # will be rebuilt from callbacks
+            # Latest query only. clear_positions() does not drop an
+            # answer that already landed for the current generation.
+            self._account_monitor.begin_oi_query()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
                      user_id, self._futures_account, 1)
             call_com("GetFutureRights", skO.GetFutureRights,

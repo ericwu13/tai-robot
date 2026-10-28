@@ -60,7 +60,9 @@ class HeadlessBotApp(rb.BacktestApp):
 
     # ── dialog seams ──
 
-    def _confirm(self, title: str, message: str) -> bool:
+    def _confirm(self, title: str, message: str, **_kwargs) -> bool:
+        # ``default_no`` is a GUI button default. Headless answers from
+        # the policy flag for this title and ignores it.
         answer = self.policy.answer(title)
         rb._log(f"[HEADLESS] {title} -> {'YES' if answer else 'NO'}")
         return answer
