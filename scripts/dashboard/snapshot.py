@@ -647,6 +647,16 @@ def _read_json_dict(path: str):
     return data if isinstance(data, dict) else None
 
 
+# The desktop tab's labels are bilingual; the page is zh-TW only.
+_VOTE_LABELS = {"W2": "W2 跨市場", "W3": "W3 RSS 新聞", "W4": "W4 籌碼"}
+
+
+def _zh_consumed(line: str) -> str:
+    """vote_status.consumed_votes_line without its English glosses."""
+    return (line.replace("無投票 none", "無投票")
+                .replace(" — 加速確認 accelerated confirm", "（加速確認）"))
+
+
 def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
                 news_paths: dict | None) -> dict | None:
     """External regime votes and the news breaker, as the GUI regime tab
@@ -672,7 +682,8 @@ def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
                                      paths.get("rss_state_file", ""),
                                      tonight, now, read_json=_read_json_dict)
         for st in report.sources:
-            sources.append({"source": st.source, "label": redact_line(st.label),
+            sources.append({"source": st.source,
+                            "label": _VOTE_LABELS.get(st.source, redact_line(st.label)),
                             "vote": st.vote, "vote_expired": st.vote_expired,
                             "vote_target": st.vote_target, "known": st.known,
                             "stale": st.stale, "last_check": st.last_check[:16].replace("T", " "),
@@ -688,7 +699,7 @@ def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
         "configured": bool(sources),
         "tonight": tonight,
         "sources": sources,
-        "consumed": redact_line(consumed_votes_line(feats)),
+        "consumed": redact_line(_zh_consumed(consumed_votes_line(feats))),
         "consumed_rule": redact_line(str(feats.get("_vote_rule") or "")),
         "last_assessed": str(state.get("last_assessed") or ""),
         "news_enabled": bool(sess.get("news_enabled")),

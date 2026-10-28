@@ -68,6 +68,7 @@ def test_votes_match_the_desktop_regime_tab(tmp_path):
     assert by["W3"]["vote"] == "trending-down" and by["W4"]["vote_expired"] is True
     assert by["W2"]["vote"] == "" and "SOX" in by["W2"]["context"]
     assert "W3" in v["consumed"] and "加速" in v["consumed"] and v["consumed_rule"] == "quorum"
+    assert "accelerated" not in v["consumed"] and by["W3"]["label"] == "W3 RSS 新聞"
 
 
 def test_stale_bridge_is_flagged(tmp_path):
