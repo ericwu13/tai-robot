@@ -132,6 +132,14 @@ pre.log .P3 { color: var(--muted); }
 .sev.P2 { color: var(--warn); background: var(--warn-bg); }
 .sev.P3 { color: var(--off); background: var(--off-bg); }
 .scroll.short { max-height: 280px; }
+.votes { display: grid; gap: 8px; }
+.votes .head { font-size: 13px; color: var(--muted); }
+.vote-row { display: grid; grid-template-columns: minmax(150px, 1.2fr) minmax(110px, .8fr) 2fr auto; gap: 8px 14px; align-items: center; font-size: 13px; }
+.vote-row .dot { display: inline-flex; align-items: center; gap: 6px; }
+.vote-row .dot::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.vote-row .ok { color: var(--ok); } .vote-row .stale { color: var(--warn); } .vote-row .off { color: var(--off); }
+.breaker { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 13px; }
+@media (max-width: 760px) { .vote-row { grid-template-columns: 1fr 1fr; } }
 .mode { font-size: 13px; color: var(--muted); }
 .mode.real { color: #fff; background: var(--bad); padding: 1px 8px; border-radius: 6px; font-weight: 700; }
 [hidden] { display: none !important; }
@@ -388,6 +396,50 @@ function tradeRealCell(t) {
     default: return el("span", { class: "muted" }, "—");
   }
 }
+// External regime votes (W2 cross-market / W3 RSS / W4 chips) and the news
+// breaker, shaped by src.news.vote_status like the desktop regime tab.
+const VOTE_DIR = { "trending-up": ["↑ 趨勢向上", "up"], "trending-down": ["↓ 趨勢向下", "down"] };
+function votesBlock(v, newsEnabled) {
+  if (!v) return el("div", { class: "sub" }, "投票資訊無法讀取");
+  const box = el("div", { class: "votes" });
+  if (v.configured) {
+    box.append(el("div", { class: "head" },
+      `外部投票（下一次分類 ${sessionKey(v.tonight)} 使用；過期的不計入）`));
+    for (const s of v.sources) {
+      const cls = !s.known ? "off" : s.stale ? "stale" : "ok";
+      const state = !s.known ? "狀態不明" : s.stale ? "停滯" : "運作中";
+      let vote;
+      if (s.vote) vote = el("span", { class: "rg " + VOTE_DIR[s.vote][1] }, VOTE_DIR[s.vote][0]);
+      else if (s.vote_expired) vote = el("span", { class: "muted", title: s.vote_target }, "過期（" + sessionKey(s.vote_target) + "）");
+      else vote = el("span", { class: "muted" }, "無投票");
+      box.append(el("div", { class: "vote-row" },
+        el("span", { class: "dot " + cls, title: state }, s.label),
+        vote,
+        el("span", { class: "sub trunc", title: s.context }, (s.stale ? "⚠ 停滯　" : "") + (s.context || "")),
+        el("span", { class: "sub" }, s.last_check ? "最後檢查 " + s.last_check : "")));
+    }
+  } else {
+    box.append(el("div", { class: "sub" }, "未設定投票路徑（settings.yaml news.regime_vote_path）"));
+  }
+  box.append(el("div", { class: "sub" },
+    `上次分類（${sessionKey(v.last_assessed)}）消耗的投票：${v.consumed || "—"}` + (v.consumed_rule ? `（規則 ${v.consumed_rule}）` : "")));
+  if (newsEnabled || v.news_enabled) {
+    const b = v.breaker || {};
+    const parts = [];
+    if (b.signal_suppressed) {
+      parts.push(el("span", { class: "pend" }, "新聞斷路器：已觸發"));
+      const dir = VOTE_DIR[b.direction] ? VOTE_DIR[b.direction][0] : (b.direction || "");
+      parts.push(el("span", null, [dir, b.severity, b.since ? "自 " + b.since : ""].filter(Boolean).join("・")));
+      if (b.reason) parts.push(el("span", { class: "sub trunc", title: b.reason }, b.reason));
+    } else {
+      parts.push(el("span", { class: "chip s-ok" }, "新聞斷路器：正常"));
+    }
+    if (b.event_suppressed) parts.push(el("span", { class: "pend" }, "事件暫停：" + (b.event_name || "")));
+    if (typeof b.suppressed_bars_24h === "number") parts.push(el("span", { class: "sub" }, `近 24 小時被新聞抑制 ${b.suppressed_bars_24h} 根 K 棒`));
+    box.append(el("div", { class: "breaker" }, ...parts));
+  }
+  return box;
+}
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
 
@@ -541,7 +593,8 @@ const App = {
       const name = el("div", null, el("div", { class: "name" }, b.bot_name),
         el("div", { class: "sub trunc", title: b.strategy }, `${b.symbol}・${b.strategy || "—"}`),
         rg ? el("div", { class: "rg-line" }, "盤勢", rgChip(rg.effective),
-          LEG[rg.active_leg] || "空手", rg.pause ? el("span", { title: "翻轉計數暫停中" }, "⏸ 暫停") : null) : null);
+          LEG[rg.active_leg] || "空手", rg.pause ? el("span", { title: "翻轉計數暫停中" }, "⏸ 暫停") : null,
+          rg.news_suppressed ? el("span", { class: "pend" }, "新聞抑制中") : null) : null);
       const tr = el("tr", { onclick: () => this.open(b.id) },
         td("", el("span", null, chip(b.state), pendingChip(b.pending)), "first"),
         td("機器人", name, "first"),
@@ -739,14 +792,15 @@ const App = {
       el("td", null, RG_ACTION[h.decision] || h.decision || "—"),
       el("td", { class: "trunc", title: h.strategy_active }, h.strategy_active || "—"),
       el("td", null, h.applied === "true" ? "✓" : h.applied === "false" ? "否" : "—"),
+      el("td", null, h.votes || "—"),
       el("td", { class: "num" }, money(h.pnl)),
       el("td", { class: "num" }, h.trades || "0")));
     const table = el("div", { class: "scroll short wide" }, el("table", null,
-      el("thead", null, el("tr", null, ...["日期", "盤別", "有效盤勢", "原始", "確認", "決策", "執行策略", "已套用"]
+      el("thead", null, el("tr", null, ...["日期", "盤別", "有效盤勢", "原始", "確認", "決策", "執行策略", "已套用", "投票"]
         .map((h) => el("th", null, h)), el("th", { class: "num" }, "損益"), el("th", { class: "num" }, "交易"))),
-      el("tbody", null, ...(rows.length ? rows : [el("tr", null, el("td", { colspan: "10", class: "empty" }, "尚無紀錄"))]))));
+      el("tbody", null, ...(rows.length ? rows : [el("tr", null, el("td", { colspan: "11", class: "empty" }, "尚無紀錄"))]))));
     $("d-regime-note").textContent = "與每日監控相同的檢查規則";
-    $("d-regime-body").replaceChildren(tiles, feat, flags, table);
+    $("d-regime-body").replaceChildren(tiles, feat, flags, votesBlock(r.vote_status, r.news_enabled), table);
   },
 
   css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); },

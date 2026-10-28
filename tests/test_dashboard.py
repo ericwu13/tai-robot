@@ -674,7 +674,7 @@ def test_regime_summary_for_fleet_row(tmp_path):
     rg = snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)["regime"]
     assert rg == {"effective": "trending-down", "since": "2026-10-07", "active_leg": "short",
                   "pause": {"until_session": 50, "session_count": 49},
-                  "next_action": "hold", "classified": True}
+                  "next_action": "hold", "classified": True, "news_suppressed": False}
 
 
 def test_pause_matches_monitor_rule():
