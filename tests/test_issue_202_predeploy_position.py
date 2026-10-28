@@ -138,6 +138,7 @@ def test_machine_reconcile_starts_a_new_oi_generation(monkeypatch):
         login_user_var=_Var("user"),
         _futures_account="F0123456",
     )
+    app._requery_open_interest = lambda tag: rb.BacktestApp._requery_open_interest(app, tag)
     calls = []
 
     def _call_com(name, fn, *args, **kwargs):
