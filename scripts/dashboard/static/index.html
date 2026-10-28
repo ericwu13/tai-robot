@@ -364,7 +364,10 @@ function realCell(r) {
 function realTiles(r) {
   if (!r) return [];
   const excluded = r.unreliable + r.missing;
-  const note = excluded ? `${excluded} 筆不計入（${r.trusted_from} 前的成交價不可靠或價格異常）` : "未扣手續費及期交稅";
+  const parts = [];
+  if (r.unreliable) parts.push(`${r.unreliable} 筆成交價不可靠（${r.trusted_from} 前記錄或價格異常）`);
+  if (r.missing) parts.push(`${r.missing} 筆無成交價`);
+  const note = excluded ? `不計入：${parts.join("、")}` : "未扣手續費及期交稅";
   if (!r.trades) return [tile("實單損益", el("div", null, el("span", { class: "muted" }, "無可信資料"), el("div", { class: "sub" }, note)))];
   return [
     tile("實單累計損益", el("div", null, money(r.pnl_total),

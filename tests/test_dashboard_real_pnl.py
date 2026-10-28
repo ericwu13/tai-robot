@@ -77,9 +77,27 @@ def test_one_recorded_fill_is_an_estimate_with_the_sim_price():
     assert "exit" in c["reason"]
 
 
-def test_paper_trade_with_a_late_real_price_is_not_a_real_order():
-    t = trade(source="paper", real_exit=44950)
-    assert real_pnl.classify(t, PV)["status"] == ""
+def test_paper_labelled_trade_with_a_real_fill_is_still_a_real_order():
+    """The broker relabels a trade "paper" when its ENTRY confirmation was
+    lost, even though the order reached the account. A recorded real exit
+    proves it went out, so it must not vanish from the real figures."""
+    t = trade(source="paper", side="SHORT", entry=45000, exit_=44900, real_exit=44950)
+    c = real_pnl.classify(t, PV)
+    assert c["status"] == "estimated" and c["real_pnl"] == (45000 - 44950) * PV
+    assert real_pnl.classify(trade(source="paper"), PV)["status"] == ""
+    s = real_pnl.summarize([t], PV, DAY_START)
+    assert s is not None and s["trades"] == 1
+
+
+def test_unknown_side_is_unreliable_not_short():
+    t = trade(side="", real_entry=45000, real_exit=44950)
+    c = real_pnl.classify(t, PV)
+    assert c["status"] == "unreliable" and "side" in c["reason"]
+
+
+def test_missing_exit_fill_says_the_position_may_be_open():
+    c = real_pnl.classify(trade(real_entry=45000), PV)
+    assert c["status"] == "estimated" and "may still be open" in c["reason"]
 
 
 def test_pre_source_field_trades_count_by_their_prices():
@@ -108,12 +126,13 @@ def test_summary_totals_today_and_exclusions():
         trade(real_entry=45000, real_exit=45811, exit_dt="2026-06-27 04:58:00",    # unreliable
               entry_dt="2026-06-26 15:00:00"),
         trade(source="real"),                                                      # missing
-        trade(source="paper", real_exit=44000),                                    # not real
+        trade(source="paper", real_exit=44000),                                    # real order, absurd exit
+        trade(source="paper"),                                                     # not real
     ]
     s = real_pnl.summarize(trades, PV, DAY_START)
     assert s["pnl_total"] == 500 + 1000 + 1000
     assert (s["pnl_today"], s["trades_today"]) == (2000, 2)
-    assert (s["trades"], s["estimated"], s["unreliable"], s["missing"]) == (3, 1, 1, 1)
+    assert (s["trades"], s["estimated"], s["unreliable"], s["missing"]) == (3, 1, 2, 1)
     assert s["sim_pnl_same_trades"] == 3 * 1000
     assert s["slippage_total"] == s["pnl_total"] - s["sim_pnl_same_trades"]
 

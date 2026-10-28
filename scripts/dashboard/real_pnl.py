@@ -24,6 +24,17 @@ Per trade:
     ""          not a real-order trade
 
 All amounts are gross: before broker fees and the futures transaction tax.
+
+Known limits (no field in the data can tell these apart):
+- the boundary is #92's SHIP date; a bot still running an older build
+  after it would record day averages with later timestamps;
+- the entry side is gated by the same date although it never depended
+  on #92 (OpenInterest ``avg_cost`` since #45, deal rows later), which
+  only makes the rule more conservative;
+- the ``avg_cost`` entry fallback matches a 2-character product prefix
+  and blends if another position on the same commodity is open;
+- with partial fills only the first deal row is kept (all live bots
+  trade one lot).
 """
 
 from __future__ import annotations
@@ -66,9 +77,16 @@ def _price_check(real: int, sim: int, when: datetime | None) -> str:
 
 
 def is_real_order(trade: dict) -> bool:
-    source = str(trade.get("source") or "")
-    if source:
-        return source == "real"
+    """``source == "real"``, or any recorded real fill price.
+
+    The broker relabels a trade "paper" when no real ENTRY fill was
+    confirmed, which also happens when the order did reach the account
+    but its confirmation was lost (a dropped race, an OpenInterest error,
+    a missed deal row). A recorded real price is proof an order went out,
+    so such a trade is still a real order, judged by its prices.
+    """
+    if str(trade.get("source") or "") == "real":
+        return True
     return bool(_int(trade.get("real_entry_price")) or _int(trade.get("real_exit_price")))
 
 
@@ -83,6 +101,9 @@ def classify(trade: dict, point_value: int) -> dict:
         out.update(status="missing", reason="no recorded fill price")
         return out
     problems = []
+    side = str(trade.get("side") or "").upper()
+    if side not in ("LONG", "SHORT"):
+        problems.append(f"unknown side {side or '(none)'}")
     if real_entry:
         why = _price_check(real_entry, sim_entry,
                            _parse(trade.get("real_entry_dt")) or _parse(trade.get("entry_dt")))
@@ -98,13 +119,14 @@ def classify(trade: dict, point_value: int) -> dict:
         return out
     entry = real_entry or sim_entry
     exit_ = real_exit or sim_exit
-    sign = 1 if str(trade.get("side") or "").upper() == "LONG" else -1
+    sign = 1 if side == "LONG" else -1
     qty = _int(trade.get("qty")) or 1
     real_pnl = (exit_ - entry) * sign * qty * point_value
     out.update(status="real" if real_entry and real_exit else "estimated",
                real_pnl=real_pnl, slippage=real_pnl - _int(trade.get("pnl")))
     if out["status"] == "estimated":
-        out["reason"] = ("exit" if not real_exit else "entry") + " fill not recorded; sim price used"
+        out["reason"] = ("exit fill not recorded (the position may still be open); sim price used"
+                         if not real_exit else "entry fill not recorded; sim price used")
     return out
 
 
