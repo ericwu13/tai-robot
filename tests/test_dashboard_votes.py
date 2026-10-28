@@ -145,16 +145,17 @@ def test_no_settings_means_no_vote_rows_but_consumed_still_shown(tmp_path):
 def test_load_news_paths_reads_only_vote_paths(tmp_path):
     install = tmp_path / "tai_backtest"
     (install / "data" / "live").mkdir(parents=True)
+    absolute_vote = (tmp_path / "bridge" / "regime_vote.json").as_posix()   # absolute on any OS
     (install / "settings.yaml").write_text(
         "login:\n  user_id: F111111111\n  password: hunter2\n"
-        "news:\n  regime_vote_path: C:\\bridge\\regime_vote.json\n"
+        f"news:\n  regime_vote_path: '{absolute_vote}'\n"
         "  signal_path: bridge/signal.json\n", encoding="utf-8")
     sp = server.default_settings_path(str(install / "data" / "live"))
     assert sp == str(install / "settings.yaml")
     paths = server.load_news_paths(sp)
     assert set(paths) == {"regime_vote_path", "signal_path", "rss_state_file", "vote_age_limits_h"}
     assert paths["vote_age_limits_h"] == {"W2": 4.0}             # the app's default
-    assert paths["regime_vote_path"] == "C:\\bridge\\regime_vote.json"
+    assert paths["regime_vote_path"] == absolute_vote
     assert paths["signal_path"] == os.path.join(str(install), "bridge/signal.json")
     assert paths["rss_state_file"] == os.path.join(str(install), "data/rss_scorer_state.json")
     assert "hunter2" not in json.dumps(paths)
