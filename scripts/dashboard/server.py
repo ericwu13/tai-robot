@@ -168,34 +168,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if urlparse(self.path).path != "/api/control" or not self.control_enabled:
             self._send(405, b"method not allowed", "text/plain; charset=utf-8")
             return
-        reply = lambda code, ok, msg: self._send(  # noqa: E731
-            code, _json({"ok": ok, "message": msg}), "application/json; charset=utf-8")
+        client = self.client_address[0]
+
+        def reply(code, ok, msg, *, log=None):
+            if log:   # requests rejected before control.handle are audited too
+                control.log_request(self.control_log, client=client, bot_id="",
+                                    action="", result=log, detail=msg)
+            self._send(code, _json({"ok": ok, "message": msg}),
+                       "application/json; charset=utf-8")
+
+        # Same origin means exactly this page's scheme://host:port. A missing
+        # Origin (non-browser client) is allowed; "null" (sandboxed or
+        # file:// pages) is not.
         origin = self.headers.get("Origin")
+        same_origin = origin is None or origin == f"http://{self.headers.get('Host', '')}"
         if (self.headers.get(CONTROL_HEADER) != "1"
                 or not (self.headers.get("Content-Type") or "").startswith("application/json")
-                or (origin and not host_allowed(urlparse(origin).netloc,
-                                                self.bound_hosts, self.host_label))):
-            reply(403, False, "forbidden")
+                or not same_origin):
+            reply(403, False, "forbidden", log="forbidden")
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = -1
         if not 0 < length <= MAX_CONTROL_BODY:
-            reply(400, False, "bad request")
+            reply(400, False, "bad request", log="bad request")
             return
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             body = None
-        if not isinstance(body, dict) or not all(
-                isinstance(body.get(k), str) for k in ("id", "action", "confirm")):
-            reply(400, False, "bad request")
+        if (not isinstance(body, dict)
+                or not all(isinstance(body.get(k), str) for k in ("id", "action", "confirm"))
+                or not isinstance(body.get("position_ack", ""), str)):
+            reply(400, False, "bad request", log="bad request")
             return
         try:
             ok, message = control.handle(
                 now_tpe(), self.base_dir, body["id"], body["action"], body["confirm"],
-                client=self.client_address[0], log_path=self.control_log)
+                client=client, log_path=self.control_log,
+                position_ack=body.get("position_ack", ""))
         except Exception as exc:  # noqa: BLE001 — answer, don't drop the socket
             sys.stderr.write(f"dashboard: control failed: {type(exc).__name__}: {exc}\n")
             reply(500, False, "internal error")

@@ -367,7 +367,12 @@ const App = {
   confirmControl(action) {
     const b = this.detail && this.detail.bot;
     if (!b) return;
-    const real = b.trading_mode && b.trading_mode !== "paper";
+    // Bind the request to the bot and position this dialog was opened for:
+    // navigating while it is open must not retarget it, and the server
+    // refuses a stop whose position no longer matches the warning shown.
+    const botId = b.id;
+    const posAck = b.position ? `${b.position.side}:${b.position.size}` : "flat";
+    const real = b.trading_mode !== "paper";   // unknown mode counts as real
     const body = [];
     let check = () => true;
     if (action === "stop") {
@@ -394,18 +399,17 @@ const App = {
     const dlg = $("dlg");
     dlg.onclose = () => {
       if (dlg.returnValue !== "ok" || !check()) return;
-      this.sendControl(action, action === "stop" ? $("dlg-input").value.trim() : "paper");
+      this.sendControl(botId, action, action === "stop" ? $("dlg-input").value.trim() : "paper", posAck);
     };
     dlg.returnValue = "";
     dlg.showModal();
   },
 
-  async sendControl(action, confirm) {
-    const id = this.current;
+  async sendControl(id, action, confirm, positionAck) {
     try {
       const r = await fetch("/api/control", { method: "POST", cache: "no-store",
         headers: { "Content-Type": "application/json", "X-Dashboard-Control": "1" },
-        body: JSON.stringify({ id, action, confirm }) });
+        body: JSON.stringify({ id, action, confirm, position_ack: positionAck }) });
       const j = await r.json().catch(() => ({ ok: false, message: "伺服器回應無法解析" }));
       this.toast(j.message || (j.ok ? "已送出" : "操作失敗"), !j.ok);
     } catch (e) {

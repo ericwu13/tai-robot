@@ -752,6 +752,13 @@ def control_server(tmp_path, monkeypatch):
     auto = make_bot(base, name="TMF00_real")
     _set_mode(auto, "auto")
     make_bot(base, name="TMF00_gone", lock_pid=None, hb_age_s=None)
+    # Controls are judged against the real clock: give the live fixtures a
+    # heartbeat that is fresh now, not relative to the fixed test NOW.
+    import time as _time
+    for hb in base.glob("*/heartbeat.json"):
+        data = json.loads(hb.read_text())
+        data["ts"] = _time.time()
+        hb.write_text(json.dumps(data))
     log = tmp_path / "control_log.csv"
     monkeypatch.setattr(server.DashboardHandler, "base_dir", str(base))
     monkeypatch.setattr(server.DashboardHandler, "cache", server._Cache(0))
@@ -761,6 +768,9 @@ def control_server(tmp_path, monkeypatch):
     monkeypatch.setattr(snapshot, "pid_alive", _alive)
     monkeypatch.setattr(snapshot.bot_summary, "__kwdefaults__",
                         {"pid_alive_fn": _alive})
+    from scripts.dashboard import control
+    monkeypatch.setattr(control, "process_command_line",
+                        lambda pid: r'"C:\bots\tai_backtest.exe" deploy --symbol TMF00 --bot x')
     srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.DashboardHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}", base, log
@@ -791,7 +801,7 @@ def _log_rows(log):
 
 
 def test_controls_are_off_by_default(live_server):
-    status, _ = _post(live_server, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"})
+    status, _ = _post(live_server, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha", "position_ack": "flat"})
     assert status == 405
     assert json.loads(_get(live_server + "/api/fleet")[2])["control_enabled"] is False
 
@@ -799,7 +809,7 @@ def test_controls_are_off_by_default(live_server):
 def test_stop_writes_the_headless_stop_file(control_server):
     from src.live.headless import stop_requested
     url, base, log = control_server
-    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"})
+    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha", "position_ack": "flat"})
     assert (status, body["ok"]) == (200, True)
     assert stop_requested(str(base / "TMF00_alpha"))          # what headless_app polls
     fleet = json.loads(_get(url + "/api/fleet")[2])
@@ -882,7 +892,7 @@ def test_paper_refused_when_already_paper_pending_or_holding(control_server):
 ])
 def test_control_rejects_cross_site_and_malformed_requests(control_server, headers, raw, code):
     url, base, _ = control_server
-    status, _ = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"},
+    status, _ = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha", "position_ack": "flat"},
                       headers=headers, raw=raw)
     assert status == code
     assert not (base / "TMF00_alpha" / "STOP").exists()
@@ -890,7 +900,7 @@ def test_control_rejects_cross_site_and_malformed_requests(control_server, heade
 
 def test_same_origin_request_is_accepted(control_server):
     url, base, _ = control_server
-    status, _ = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"},
+    status, _ = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha", "position_ack": "flat"},
                       headers={"Origin": url})
     assert status == 200 and (base / "TMF00_alpha" / "STOP").exists()
 
@@ -921,3 +931,103 @@ def test_control_log_redacts_and_survives_unwritable_path(tmp_path):
     assert FAKE_CHANNEL not in log.read_text(encoding="utf-8")
     control.log_request(str(tmp_path / "missing" / "dir" / "log.csv"), client="x",
                         bot_id="b", action="stop", result="ok", detail="")   # no raise
+
+
+# ── #212 review fixes ───────────────────────────────────────────────────
+
+def test_stop_refused_when_position_changed_since_the_dialog(control_server):
+    """The market-close warning came from a snapshot; a stale ack is refused."""
+    url, base, _ = control_server
+    real = base / "TMF00_real"
+    _set_mode(real, "auto", position={"position_size": 1, "position_side": "LONG",
+                                      "entry_price": 45000})
+    status, body = _post(url, {"id": "TMF00_real", "action": "stop", "confirm": "real",
+                               "position_ack": "flat"})
+    assert status == 409 and "持倉" in body["message"]
+    assert not (real / "STOP").exists()
+    status, _ = _post(url, {"id": "TMF00_real", "action": "stop", "confirm": "real",
+                            "position_ack": "LONG:1"})
+    assert status == 200 and (real / "STOP").exists()
+
+
+@pytest.mark.parametrize("cmdline,expect", [
+    (r'"C:\x\tai_backtest.exe"', "GUI"),                    # GUI EXE, no deploy
+    ("python run_backtest.py", "GUI"),
+    (None, "無法確認"),                                        # unreadable
+])
+def test_stop_refused_for_bots_that_never_read_stop(control_server, monkeypatch,
+                                                    cmdline, expect):
+    from scripts.dashboard import control
+    monkeypatch.setattr(control, "process_command_line", lambda pid: cmdline)
+    url, base, _ = control_server
+    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha",
+                               "position_ack": "flat"})
+    assert status == 409 and expect in body["message"]
+    assert not (base / "TMF00_alpha" / "STOP").exists()
+
+
+@pytest.mark.parametrize("cmdline,headless", [
+    (r'"C:\b\tai_robot_v2199\tai_backtest\tai_backtest.exe" deploy --symbol TMF00 --bot A', True),
+    (r"C:\venv\python.exe run_bot_cli.py deploy --bot A --mode paper", True),
+    (r'"C:\b\tai_backtest.exe"', False),
+    ("python run_backtest.py", False),
+    ("", None), (None, None),
+])
+def test_is_headless(cmdline, headless):
+    from scripts.dashboard import control
+    assert control.is_headless(cmdline) is headless
+
+
+def test_hung_bot_is_refused(control_server):
+    url, base, _ = control_server
+    hb = base / "TMF00_alpha" / "heartbeat.json"
+    data = json.loads(hb.read_text())
+    data["ts"] -= 3600
+    hb.write_text(json.dumps(data))
+    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha",
+                               "position_ack": "flat"})
+    assert status == 409 and "卡住" in body["message"]
+    assert not (base / "TMF00_alpha" / "STOP").exists()
+
+
+@pytest.mark.parametrize("origin,code", [
+    ("http://localhost:5678", 403),      # same host, other port
+    ("https://{host}", 403),             # other scheme
+    ("null", 403),                       # sandboxed / file:// page
+    ("http://{host}", 200),              # this page
+])
+def test_origin_must_be_exactly_this_page(control_server, origin, code):
+    url, base, _ = control_server
+    host = url.split("://", 1)[1]
+    status, _ = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha",
+                            "position_ack": "flat"},
+                      headers={"Origin": origin.format(host=host)})
+    assert status == code
+    assert (base / "TMF00_alpha" / "STOP").exists() is (code == 200)
+
+
+def test_every_rejected_request_is_audited(control_server):
+    url, _, log = control_server
+    _post(url, {"id": "nope", "action": "stop", "confirm": "x"})                  # unknown bot
+    _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha"},
+          headers={"X-Dashboard-Control": ""})                                     # 403
+    _post(url, None, raw=b"{bad")                                                  # 400
+    results = [r["result"] for r in _log_rows(log)]
+    assert results == ["refused", "forbidden", "bad request"]
+
+
+def test_audit_log_neutralises_spreadsheet_formulas(tmp_path):
+    from scripts.dashboard import control
+    log = tmp_path / "log.csv"
+    control.log_request(str(log), client="127.0.0.1", bot_id="=HYPERLINK(1)",
+                        action="+cmd", result="refused", detail="@x")
+    rows = _log_rows(log)
+    assert rows[0]["bot"] == "'=HYPERLINK(1)" and rows[0]["action"] == "'+cmd"
+    assert rows[0]["detail"] == "'@x"
+
+
+def test_unwritable_audit_log_is_reported(tmp_path, capsys):
+    from scripts.dashboard import control
+    control.log_request(str(tmp_path), client="c", bot_id="b", action="stop",
+                        result="accepted", detail="d")
+    assert "control log" in capsys.readouterr().err
