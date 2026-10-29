@@ -130,7 +130,13 @@ from src.live.account_monitor import (
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.com_broker_port import ComBrokerPort
 from src.live.link_host import adopt_after_process_login
-from src.live.link_state_machine import KIND_CONN_ERROR
+from src.live.link_state_machine import KIND_CONN_ERROR, KIND_READY
+from src.live.reply_link_poller import (
+    REPLY_POLL_S, ReplyLinkPoller, format_event_sink,
+)
+from src.live.reply_watch import (
+    ReplyChannelWatch, describe_return_code, mark_reply_arrived,
+)
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
     RealFillTracker, parse_fulfill_report, match_fill_in_report,
@@ -957,6 +963,11 @@ def _open_debug_log(bot_dir: str) -> None:
     _debug_log_file.write(f"\n{'='*60}\n")
     _debug_log_file.write(f"Session started at {tpe.strftime('%Y-%m-%d %H:%M:%S')}\n")
     _debug_log_file.write(f"{'='*60}\n")
+    # Login / ConnectByID / adopt ran before this file existed.
+    pending = list(_boot_log_lines)
+    _boot_log_lines.clear()
+    for earlier in pending:
+        _debug_log_file.write(earlier + "\n")
     _debug_log_file.flush()
 
 
@@ -992,6 +1003,33 @@ _ui_queue: queue.Queue = queue.Queue()
 
 
 
+# Lines emitted before deploy opens the per-bot debug file. Login and
+# ConnectByID run first; the file opens when the bot is deployed.
+_BOOT_LOG_NEEDLES = (
+    "LOGIN OK",
+    "Logging in",
+    "登入中",
+    "登入成功",
+    "ConnectByID",
+    "OnComplete",
+    "link machine adopted",
+    "event-sink",
+)
+_boot_log_lines: list[str] = []
+_BOOT_LOG_CAP = 200
+
+
+def _remember_boot_line(line: str) -> None:
+    """Keep early-boot lines until the debug file exists. Never raises."""
+    if _debug_log_file is not None:
+        return
+    if not any(needle in line for needle in _BOOT_LOG_NEEDLES):
+        return
+    if len(_boot_log_lines) >= _BOOT_LOG_CAP:
+        return
+    _boot_log_lines.append(line)
+
+
 def _log(msg):
     tpe = _taipei_now()
     local = datetime.now()
@@ -1002,6 +1040,7 @@ def _log(msg):
     else:
         line = f"[{ts_tpe} TPE / {ts_local} local] {msg}"
     print(line, flush=True)
+    _remember_boot_line(line)
     if _debug_log_file:
         try:
             _debug_log_file.write(line + "\n")
@@ -1041,6 +1080,7 @@ def _log_debug(msg):
     else:
         line = f"[{ts_tpe} TPE / {ts_local} local] [DEBUG] {msg}"
     print(line, flush=True)
+    _remember_boot_line(line)
     if _debug_log_file:
         try:
             _debug_log_file.write(line + "\n")
@@ -1072,6 +1112,64 @@ def _log_reply_link_state(value, *, where: str) -> None:
     _log_debug(
         f"[RECONNECT] reply-link IsConnectedByID={value} at {where} "
         f"tid={threading.get_ident()}")
+
+
+_reply_logger = logging.getLogger("tai.reply_watch")
+
+
+def _log_reply_error(msg: str) -> None:
+    """ERROR line for the reply-channel diagnostic. Never raises.
+
+    The logging record is ERROR so a log scrape can filter on level.
+    ``_log`` also writes it into the session debug file operators grep.
+    """
+    try:
+        _reply_logger.error("%s", msg)
+    except Exception:
+        pass
+    try:
+        _log(msg)
+    except Exception:
+        pass
+
+
+def _notify_reply_silent(message: str) -> None:
+    """One Discord alert via the deploy notifier. Never raises.
+
+    The notifier is read at send time. Deploy builds it after login, and
+    the watchdog fires 60s after login, so the instance may not exist yet
+    when the timer is armed.
+    """
+    try:
+        discord = _discord
+        if discord is None or not getattr(discord, "enabled", False):
+            return
+        discord.notify(message)
+    except Exception as exc:
+        _log_reply_error(
+            f"[CONN] discord alert failed: [{type(exc).__name__}] {exc}")
+
+
+def _log_connect_by_id_result(code) -> None:
+    """Log the ConnectByID return code. Never raises into login.
+
+    Uses SKCenterLib_GetReturnCodeMessage when that lookup exists and
+    succeeds. Otherwise the raw code is logged on its own.
+    """
+    try:
+        lookup = None
+        center = skC
+        if center is not None:
+            candidate = getattr(center, "SKCenterLib_GetReturnCodeMessage", None)
+            if callable(candidate):
+                lookup = candidate
+        text = describe_return_code(code, lookup)
+        _log(f"[CONN] ConnectByID returned {text}")
+    except Exception:
+        try:
+            _log(f"[CONN] ConnectByID returned {code}")
+        except Exception:
+            pass
 
 
 set_com_return_logger(_log_com_return)
@@ -1200,12 +1298,17 @@ class SKReplyLibEvent:
 
     def OnConnect(self, bstrUserID, nErrorCode):
         _ui_queue.put_nowait(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
+        # Queue only. after_cancel runs on the main thread when this drains.
+        _ui_queue.put_nowait(("reply_seen", "OnConnect"))
+        mark_reply_arrived("OnConnect")
 
     def OnComplete(self, bstrUserID):
         del bstrUserID
         _ui_queue.put_nowait((
             "log_debug", "[CONN] OnComplete — reply backfill finished"))
         _ui_queue.put_nowait(("link", ("complete",)))
+        _ui_queue.put_nowait(("reply_seen", "OnComplete"))
+        mark_reply_arrived("OnComplete")
 
     def OnSolaceReplyDisconnect(self, bstrUserID):
         """§4-3-h. Flag only — do not ConnectByID from this callback."""
@@ -1362,6 +1465,8 @@ class BacktestApp:
                     _route_to_log_widget(line, level)
                 elif kind == "link":
                     self._apply_link_flag(data)
+                elif kind == "reply_seen":
+                    self._note_reply_channel(data)
                 elif kind == "conn":
                     if data == "ready":
                         # Ready (3003) is the only state we treat as fully
@@ -1835,6 +1940,8 @@ class BacktestApp:
         if name == "connection":
             _name, kind, code = data
             host.note_connection(int(kind), int(code), now)
+            if int(kind) == KIND_READY and int(code) == 0:
+                self._poll_reply_link("3003")
         elif name == "reply_disconnect":
             host.note_reply_disconnect(now)
         elif name == "complete":
@@ -3742,6 +3849,187 @@ class BacktestApp:
 
     # ── COM Login ──
 
+    def _ensure_reply_watch(self) -> ReplyChannelWatch:
+        """The one login diagnostic. GUI and headless share ``root.after``."""
+        watch = getattr(self, "_reply_watch", None)
+        if watch is not None:
+            return watch
+        watch = ReplyChannelWatch(
+            schedule=self.root.after,
+            cancel=self._cancel_reply_after,
+            log_error=_log_reply_error,
+            log_info=_log,
+            notify=_notify_reply_silent,
+            probe=self._probe_reply_connected,
+            on_silent=self._poller_silent_due,
+        )
+        self._reply_watch = watch
+        return watch
+
+    def _cancel_reply_after(self, token) -> None:
+        self.root.after_cancel(token)
+
+    def _arm_reply_channel_watch(self, user_id: str) -> None:
+        """Schedule the diagnostics. Never raises into ``_do_login``."""
+        try:
+            self._ensure_reply_watch().arm(user_id)
+        except Exception as exc:
+            _log_reply_error(
+                "[CONN] reply-channel watch arm failed: "
+                f"[{type(exc).__name__}] {exc}")
+
+    def _note_reply_channel(self, kind: str) -> None:
+        """Main-thread cancel after a queued OnConnect or OnComplete."""
+        label = str(kind) if kind is not None else ""
+        watch = getattr(self, "_reply_watch", None)
+        if watch is not None:
+            try:
+                watch.note_reply(label)
+            except Exception as exc:
+                _log_reply_error(
+                    "[CONN] reply watch cancel failed: "
+                    f"[{type(exc).__name__}] {exc}")
+        poller = getattr(self, "_reply_poller", None)
+        if poller is not None:
+            try:
+                poller.note_reply_event(label)
+            except Exception as exc:
+                _log_reply_error(
+                    "[CONN] reply poll event failed: "
+                    f"[{type(exc).__name__}] {exc}")
+
+    def _reply_machine(self):
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return None
+        return host.machine
+
+    def _ensure_reply_poller(self) -> ReplyLinkPoller:
+        poller = getattr(self, "_reply_poller", None)
+        if poller is not None:
+            return poller
+        poller = ReplyLinkPoller(
+            self._reply_machine,
+            read=self._read_reply_link,
+            connect=self._connect_reply_for_poll,
+            notify=_notify_reply_silent,
+            log_error=_log_reply_error,
+            log_info=_log,
+            reschedule_silent=self._rearm_reply_silent,
+        )
+        self._reply_poller = poller
+        return poller
+
+    def _rearm_reply_silent(self) -> None:
+        watch = getattr(self, "_reply_watch", None)
+        if watch is not None:
+            watch.rearm_silent()
+
+    def _poller_silent_due(self) -> None:
+        """60s timer. The poller alerts once per episode without READY."""
+        poller = getattr(self, "_reply_poller", None)
+        if poller is None:
+            _log_reply_error(
+                "[CONN] REPLY CHANNEL SILENT — no reply READY within 60s")
+            _notify_reply_silent(
+                "[CONN] REPLY CHANNEL SILENT — no reply READY within 60s")
+            return
+        poller.consider_silent(_taipei_now(), force=True)
+
+    def _read_reply_link(self) -> int:
+        user_id = self.login_user_var.get().strip()
+        return int(self._read_is_connected_by_id(user_id))
+
+    def _read_is_connected_by_id(self, user_id: str):
+        return call_com(
+            "IsConnectedByID", skR.SKReplyLib_IsConnectedByID, user_id)
+
+    def _connect_reply_for_poll(self, user_id: str):
+        """One ConnectByID from the poller. Logs the return code. No logout."""
+        code = call_com(
+            "ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+        _log_connect_by_id_result(code)
+        return code
+
+    def _start_reply_poller(self) -> None:
+        """60s poll after the link machine exists. Never raises."""
+        try:
+            poller = self._ensure_reply_poller()
+            poller.note_login(_taipei_now())
+            self._schedule_reply_poll()
+        except Exception as exc:
+            _log_reply_error(
+                "[CONN] reply poller start failed: "
+                f"[{type(exc).__name__}] {exc}")
+
+    def _schedule_reply_poll(self) -> None:
+        token = getattr(self, "_reply_poll_token", None)
+        if token is not None:
+            try:
+                self.root.after_cancel(token)
+            except Exception:
+                pass
+        self._reply_poll_token = self.root.after(
+            int(REPLY_POLL_S * 1000), self._on_reply_poll)
+
+    def _on_reply_poll(self) -> None:
+        self._reply_poll_token = None
+        try:
+            self._poll_reply_link("60s")
+        finally:
+            try:
+                self._schedule_reply_poll()
+            except Exception:
+                pass
+
+    def _poll_reply_link(self, cause: str) -> None:
+        """Read IsConnectedByID and apply it. Never raises into the caller."""
+        try:
+            poller = getattr(self, "_reply_poller", None)
+            if poller is None:
+                return
+            _log_debug(f"[CONN] reply poll ({cause})")
+            poller.poll(_taipei_now())
+            self._apply_link_gate()
+            self._schedule_reply_backoff()
+            if poller.ready:
+                watch = getattr(self, "_reply_watch", None)
+                if watch is not None:
+                    watch.note_reply("IsConnectedByID")
+        except Exception as exc:
+            _log_reply_error(
+                "[CONN] reply poll failed: "
+                f"[{type(exc).__name__}] {exc}")
+
+    def _schedule_reply_backoff(self) -> None:
+        poller = getattr(self, "_reply_poller", None)
+        if poller is None:
+            return
+        delay = poller.pending_delay_s(_taipei_now())
+        token = getattr(self, "_reply_backoff_token", None)
+        if token is not None:
+            try:
+                self.root.after_cancel(token)
+            except Exception:
+                pass
+            self._reply_backoff_token = None
+        if delay is None:
+            return
+        self._reply_backoff_token = self.root.after(
+            max(0, int(delay * 1000)), self._on_reply_backoff)
+
+    def _on_reply_backoff(self) -> None:
+        self._reply_backoff_token = None
+        self._poll_reply_link("backoff")
+
+    def _probe_reply_connected(self, user_id: str):
+        """One IsConnectedByID read, 30s after login. Logged only.
+
+        Not a link-machine tick and not a reconnect. The value is not
+        applied to order gating. The 60s poll is a separate read.
+        """
+        return self._read_is_connected_by_id(user_id)
+
     def _manual_login(self):
         """Login button handler — reads credentials from the form."""
         if not _com_available:
@@ -3799,7 +4087,11 @@ class BacktestApp:
             _log(f"登入成功 LOGIN OK (code={code})")
             self.login_status_var.set("登入成功 Logged in")
 
-            call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            reply_code = call_com(
+                "ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            _log_connect_by_id_result(reply_code)
+            # Timers only. A failure here must not abort the rest of login.
+            self._arm_reply_channel_watch(user_id)
             code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
             _log(f"進入報價監控 EnterMonitorLONG: code={code}")
 
@@ -3815,6 +4107,7 @@ class BacktestApp:
 
             self.set_status("連線中 Connecting...")
             self._adopt_link_machine()
+            self._start_reply_poller()
             self.root.after(3000, self._check_connection)
 
         except Exception as e:
@@ -11142,6 +11435,17 @@ class BacktestApp:
 _com_event_handlers: list = []
 
 
+def _bind_event_sink(kind: str, com_obj, handler, get_events):
+    """Register one sink and log its identity. Never raises."""
+    sink = get_events(com_obj, handler)
+    try:
+        _log(format_event_sink(
+            kind, sink, handler, sys.modules[__name__], os.getpid()))
+    except Exception as exc:
+        _log(f"[CONN] event-sink {kind} log failed: [{type(exc).__name__}] {exc}")
+    return sink
+
+
 def register_com_events() -> None:
     """Attach the SKCOM event handler classes to the COM objects."""
     if not _com_available:
@@ -11149,14 +11453,17 @@ def register_com_events() -> None:
     import comtypes.client
     quote_event = SKQuoteLibEvents()
     _com_event_handlers.append(quote_event)
-    _com_event_handlers.append(comtypes.client.GetEvents(skQ, quote_event))
+    _com_event_handlers.append(
+        _bind_event_sink("quote", skQ, quote_event, comtypes.client.GetEvents))
     reply_event = SKReplyLibEvent()
     _com_event_handlers.append(reply_event)
-    _com_event_handlers.append(comtypes.client.GetEvents(skR, reply_event))
+    _com_event_handlers.append(
+        _bind_event_sink("reply", skR, reply_event, comtypes.client.GetEvents))
     if skO is not None:
         order_event = SKOrderLibEvents()
         _com_event_handlers.append(order_event)
-        _com_event_handlers.append(comtypes.client.GetEvents(skO, order_event))
+        _com_event_handlers.append(
+            _bind_event_sink("order", skO, order_event, comtypes.client.GetEvents))
 
 
 def main():

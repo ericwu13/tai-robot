@@ -289,6 +289,52 @@ class LinkStateMachine:
         self.reply_reconciled = False
         self.entries_blocked = False
 
+    def note_polled_down(self, now: datetime) -> None:
+        """IsConnectedByID==0. Same pause as a reply disconnect. No port call.
+
+        The reply poller sends the one ConnectByID on its own backoff.
+        ``_reply_awaiting_complete`` stays set so ``_kick_reply`` does not
+        send another. Logout is not a reply-poll operation.
+        """
+        self._saw_reply_disconnect = True
+        self._reply_down_at = now
+        self.reply = LinkPhase.DOWN
+        self.reply_reconciled = False
+        self.orders_paused = True
+        self.entries_blocked = True
+        self._pending_complete = False
+        self._reply_stuck_since = None
+        self._down_without_reply_event_since = None
+        self._unreconciled_since = None
+        self._reply_awaiting_complete = True
+
+    def note_polled_ready(self, now: datetime) -> None:
+        """IsConnectedByID==1. Reply READY, no ConnectByID, no reconcile call.
+
+        The event-driven un-degrade path keeps entries blocked until
+        OnComplete, because that callback is what reconciles. This poll
+        is the mitigation for a sink that never delivers OnComplete, so
+        READY lifts the entry pause (``orders_paused``) without calling
+        ``reconcile_positions`` or ``release_orders``. Quote readiness is
+        still required before entries actually open.
+        """
+        del now
+        if self._terminal_degrade():
+            return
+        self.reply = LinkPhase.READY
+        self.reply_reconciled = True
+        self.orders_paused = False
+        self.entries_blocked = False
+        self._reply_awaiting_complete = False
+        self._reply_connect_started_at = None
+        self._pending_complete = False
+        self._unreconciled_since = None
+        self._reply_down_at = None
+        # Leave ``degraded`` alone. Quote-stuck (#203) stays degraded
+        # until ticks resume; this poll must not clear that. Reply READY
+        # still lifts ``orders_paused``. ``entries_allowed`` stays false
+        # while the machine is degraded, so a stuck quote is not opened.
+
     def shutdown(self, now: datetime) -> None:
         """User shutdown. The only ``LeaveMonitor`` call site.
 
