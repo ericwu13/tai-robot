@@ -432,6 +432,7 @@ def _trade_row(t: dict, point_value: int | None = None) -> dict:
             "exit_dt": str(t.get("exit_dt") or ""),
             "exit_price": _to_int(t.get("exit_price")),
             "real_exit_price": _to_int(t.get("real_exit_price")),
+            "real_exit_estimated": bool(t.get("real_exit_estimated", False)),
             "pnl": _to_int(t.get("pnl")), "exit_tag": str(t.get("exit_tag") or ""),
             "source": str(t.get("source") or "")}
 
