@@ -582,47 +582,81 @@ def test_remove_missing_marker_is_quiet(tmp_path, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_deploy_start_writes_the_marker(tmp_path, monkeypatch):
+def test_start_does_not_write_the_marker_before_the_lock(tmp_path, monkeypatch):
     from src.live.headless_app import DeployDriver
     monkeypatch.setattr(rb, "project_root", str(tmp_path))
 
-    def past_marker(*_a, **_k):
-        raise RuntimeError("past the marker")
+    def past_start(*_a, **_k):
+        raise RuntimeError("past start")
 
-    monkeypatch.setattr("src.live.headless_app.load_session", past_marker)
+    monkeypatch.setattr("src.live.headless_app.load_session", past_start)
     driver = DeployDriver.__new__(DeployDriver)
     driver.app = SimpleNamespace()
     driver.args = SimpleNamespace(symbol="TMF00", bot="night1")
     driver.bot_dir = ""
-    with pytest.raises(RuntimeError, match="past the marker"):
+    with pytest.raises(RuntimeError, match="past start"):
         driver.start()
-    marker = tmp_path / "data" / "live" / "TMF00_night1" / "headless.json"
-    body = json.loads(marker.read_text(encoding="utf-8"))
+    assert not (tmp_path / "data" / "live" / "TMF00_night1" / "headless.json").exists()
+
+
+def test_marker_is_written_only_after_deploy_holds_the_lock(tmp_path):
+    from src.live.headless_app import DeployDriver
+    bot = tmp_path / "data" / "live" / "TMF00_night1"
+    driver = DeployDriver.__new__(DeployDriver)
+    driver.bot_dir = str(bot)
+    driver.req = SimpleNamespace()
+    driver.exit_code = None
+    driver.root = SimpleNamespace(after=lambda *_a, **_k: None)
+    driver.app = SimpleNamespace(
+        _deploy_live_from=lambda req: True,
+        _live_runner=object(),
+        alerts=[],
+        status_var=SimpleNamespace(get=lambda: ""),
+    )
+    driver._deploy()
+    body = json.loads((bot / "headless.json").read_text(encoding="utf-8"))
     assert body["pid"] == os.getpid()
     assert body["started_at"]
-    assert not (marker.parent / "headless.json.tmp").exists()
+    assert not (bot / "headless.json.tmp").exists()
 
 
-def test_start_continues_when_marker_write_fails(tmp_path, monkeypatch, capsys):
+def test_refused_deploy_does_not_replace_the_owners_marker(tmp_path):
     from src.live.headless_app import DeployDriver
-    monkeypatch.setattr(rb, "project_root", str(tmp_path))
-    live = tmp_path / "data" / "live"
-    live.parent.mkdir(parents=True)
-    live.write_text("not a directory")
-    seen = {}
-
-    def past_marker(*_a, **_k):
-        seen["called"] = True
-        raise RuntimeError("continued")
-
-    monkeypatch.setattr("src.live.headless_app.load_session", past_marker)
+    bot = tmp_path / "TMF00_owner"
+    assert hl.write_headless_marker(str(bot), pid=111, started_at="2026-10-29T21:00:00+08:00")
     driver = DeployDriver.__new__(DeployDriver)
-    driver.app = SimpleNamespace()
-    driver.args = SimpleNamespace(symbol="TMF00", bot="night1")
-    driver.bot_dir = ""
-    with pytest.raises(RuntimeError, match="continued"):
-        driver.start()
-    assert seen.get("called") is True
+    driver.bot_dir = str(bot)
+    driver.req = SimpleNamespace()
+    driver.exit_code = None
+    driver.app = SimpleNamespace(
+        _deploy_live_from=lambda req: False,
+        _live_runner=None,
+        alerts=[("Bot Name Conflict", "locked")],
+        status_var=SimpleNamespace(get=lambda: ""),
+    )
+    driver.finish = lambda code, message="": setattr(driver, "exit_code", code)
+    driver._deploy()
+    assert json.loads((bot / "headless.json").read_text(encoding="utf-8"))["pid"] == 111
+    assert driver.exit_code == hl.EXIT_DEPLOY_REFUSED
+
+
+def test_deploy_continues_when_marker_write_fails(tmp_path, capsys):
+    from src.live.headless_app import DeployDriver
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("x")
+    driver = DeployDriver.__new__(DeployDriver)
+    driver.bot_dir = str(blocked / "TMF00_b")
+    driver.req = SimpleNamespace()
+    driver.exit_code = None
+    driver.root = SimpleNamespace(after=lambda *_a, **_k: None)
+    driver.app = SimpleNamespace(
+        _deploy_live_from=lambda req: True,
+        _live_runner=object(),
+        alerts=[],
+        status_var=SimpleNamespace(get=lambda: ""),
+    )
+    driver._deploy()
+    assert driver.exit_code is None
     assert "headless marker write failed" in capsys.readouterr().err
 
 
@@ -656,7 +690,7 @@ def test_drive_removes_marker_when_the_loop_raises(tmp_path):
 
         def start(self):
             hl.write_headless_marker(
-                self.bot_dir, pid=1, started_at="2026-10-29T21:00:00+08:00")
+                self.bot_dir, pid=os.getpid(), started_at="2026-10-29T21:00:00+08:00")
 
     def boom():
         raise RuntimeError("tk died")
@@ -665,6 +699,50 @@ def test_drive_removes_marker_when_the_loop_raises(tmp_path):
     with pytest.raises(RuntimeError, match="tk died"):
         _drive_until_exit(Driver(), app)
     assert not os.path.exists(hl.headless_marker_path(str(bot)))
+
+
+def test_exit_does_not_remove_another_process_marker(tmp_path):
+    """A refused second instance's finally must leave the owner's marker."""
+    from src.live.headless_app import _drive_until_exit
+    bot = tmp_path / "TMF00_owner"
+    assert hl.write_headless_marker(str(bot), pid=111, started_at="2026-10-29T21:00:00+08:00")
+
+    class Driver:
+        bot_dir = str(bot)
+        exit_code = hl.EXIT_DEPLOY_REFUSED
+
+        def start(self):
+            return
+
+    app = SimpleNamespace(root=SimpleNamespace(mainloop=lambda: None))
+    assert _drive_until_exit(Driver(), app) == hl.EXIT_DEPLOY_REFUSED
+    body = json.loads((bot / "headless.json").read_text(encoding="utf-8"))
+    assert body["pid"] == 111
+
+
+def test_gui_deploy_removes_a_stale_marker_and_headless_does_not(tmp_path):
+    bot = tmp_path / "TMF00_gui"
+    bot.mkdir()
+    assert hl.write_headless_marker(str(bot), pid=111, started_at="2026-10-29T21:00:00+08:00")
+    gui = rb.BacktestApp.__new__(rb.BacktestApp)
+    gui._drop_stale_headless_marker(str(bot))
+    assert not (bot / "headless.json").exists()
+    assert hl.write_headless_marker(str(bot), pid=111, started_at="2026-10-29T21:00:00+08:00")
+    from src.live.headless_app import HeadlessBotApp
+    headless = HeadlessBotApp.__new__(HeadlessBotApp)
+    headless._drop_stale_headless_marker(str(bot))
+    assert (bot / "headless.json").is_file()
+    src = inspect.getsource(rb.BacktestApp._deploy_live_from)
+    assert src.index("check_lock") < src.index("_drop_stale_headless_marker")
+
+
+def test_process_create_time_is_unavailable_off_windows():
+    if os.name == "nt":
+        created = hl.process_create_time(os.getpid())
+        assert created is None or created.tzinfo is not None
+    else:
+        assert hl.process_create_time(os.getpid()) is None
+        assert hl.process_create_time(0) is None
 
 
 def test_read_lock_never_deletes_stale_lock(tmp_path):

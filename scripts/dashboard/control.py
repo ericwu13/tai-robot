@@ -1,8 +1,10 @@
 """Opt-in bot controls for the dashboard (``--enable-control``).
 
-Two actions, and only for a process that left a live headless marker
-(``headless.json`` whose pid is still alive). The GUI live loop does not
-poll ``STOP``, so a GUI bot is refused and nothing is written:
+Two actions, and only for a process that left a live headless marker.
+The marker's pid must equal the lock pid and be strictly alive (access
+denied does not count). When the process creation time can be read,
+``started_at`` must match it. The GUI live loop does not poll ``STOP``,
+so a GUI bot is refused and nothing is written:
 
 - ``stop``  -> the headless ``STOP`` file (``src.live.headless.request_stop``),
   checked every 2 s; the bot runs its normal ``_stop_live()``. A real-money
@@ -61,19 +63,20 @@ def position_key(summary: dict) -> str:
     return f"{pos.get('side', '')}:{pos.get('size', '')}"
 
 
-def _require_live_headless(bot_dir: str, pid_alive_fn) -> None:
-    """Refuse unless the marker exists, parses, and its pid is alive.
+def _require_live_headless(bot_dir: str) -> None:
+    """Refuse unless the marker is a live headless process holding the lock.
 
     Called from ``check`` and again from ``apply`` immediately before a
-    write. A GUI bot, a stale marker, and a malformed marker all take this
-    path, and none of them create a control file.
+    write. Uses the strict pid check (access denied is not alive), not the
+    lock-staleness helper. A GUI bot, a stale or reused pid, and a
+    malformed marker all take this path, and none of them create a file.
     """
-    if not snapshot.headless_live(bot_dir, pid_alive_fn):
+    if not snapshot.headless_live(bot_dir):
         raise ControlRefused(GUI_CONTROL_MESSAGE)
 
 
 def check(action: str, summary: dict, bot_dir: str, confirm: str,
-          position_ack: str = "", *, pid_alive_fn=None) -> None:
+          position_ack: str = "") -> None:
     """Raise ControlRefused unless ``action`` may be applied right now."""
     if action not in ACTIONS:
         raise ControlRefused("不支援的操作")
@@ -81,7 +84,7 @@ def check(action: str, summary: dict, bot_dir: str, confirm: str,
         raise ControlRefused("機器人主程式卡住，不會讀取控制指令")
     if summary.get("state") not in _ALIVE_STATES:
         raise ControlRefused("機器人目前沒有在執行")
-    _require_live_headless(bot_dir, pid_alive_fn or snapshot.pid_alive)
+    _require_live_headless(bot_dir)
     now_pending = pending(bot_dir)
     if now_pending["stop"]:
         raise ControlRefused("已送出停止指令，等待機器人停止中")
@@ -120,7 +123,7 @@ def _atomic_write_json(path: str, payload: dict) -> None:
         raise
 
 
-def apply(action: str, bot_dir: str, client: str, *, pid_alive_fn=None) -> str:
+def apply(action: str, bot_dir: str, client: str) -> str:
     """Write the control file. Returns the message shown to the user.
 
     The marker is read again here, after ``check``. A bot that is no longer
@@ -128,7 +131,7 @@ def apply(action: str, bot_dir: str, client: str, *, pid_alive_fn=None) -> str:
     """
     if action not in ACTIONS:
         raise ControlRefused("不支援的操作")
-    _require_live_headless(bot_dir, pid_alive_fn or snapshot.pid_alive)
+    _require_live_headless(bot_dir)
     if action == "stop":
         request_stop(bot_dir, reason=f"dashboard stop from {client}")
         return "已送出停止指令；機器人會在數秒內停止（之後需重新部署才會再啟動）"
@@ -174,8 +177,8 @@ def handle(now, base_dir: str, bot_id: str, action: str, confirm: str,
     alive = pid_alive_fn or snapshot.pid_alive
     summary = snapshot.bot_summary(now, bot_dir, pid_alive_fn=alive)
     try:
-        check(action, summary, bot_dir, confirm, position_ack, pid_alive_fn=alive)
-        message = apply(action, bot_dir, client, pid_alive_fn=alive)
+        check(action, summary, bot_dir, confirm, position_ack)
+        message = apply(action, bot_dir, client)
     except ControlRefused as exc:
         log_request(log_path, client=client, bot_id=bot_id, action=action,
                     result="refused", detail=str(exc))

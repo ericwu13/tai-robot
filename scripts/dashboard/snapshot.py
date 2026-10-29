@@ -27,10 +27,13 @@ from scripts.monitor.check_bots import (
 )
 from scripts.monitor.check_logs import PATTERNS
 from scripts.monitor.common import (
-    TZ_TPE, discover_bot_dirs, pid_alive, redact,
+    TZ_TPE, discover_bot_dirs, pid_alive, pid_alive_strict, redact,
 )
 from scripts.dashboard import fileio, real_pnl
-from src.live.headless import headless_marker_path, parse_headless_marker, stop_requested
+from src.live.headless import (
+    headless_marker_path, parse_headless_marker, process_create_time,
+    stop_requested,
+)
 from src.utils.log_redact import scrub_ids
 
 # A stopped bot with no file activity in this window is retired and is
@@ -334,20 +337,56 @@ def mode_override_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, MODE_OVERRIDE_FILENAME)
 
 
-def headless_live(bot_dir: str, pid_alive_fn=pid_alive) -> bool:
-    """True when ``headless.json`` parses and the pid it names is alive.
+# Process creation time and the marker's started_at are both second-resolution.
+_CREATE_TIME_TOLERANCE_S = 2.0
 
-    The headless deploy writes that marker and deletes it on the way out.
-    A GUI bot never has one. The read goes through ``fileio`` so it cannot
-    block the bot's ``os.remove`` of the marker on Windows.
+
+def _parse_started_at(text: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def headless_live(bot_dir: str, pid_alive_fn=None, *, create_time_fn=None) -> bool:
+    """True when this directory's running process is the headless deploy.
+
+    The marker must parse, its pid must be the lock pid, and that pid must
+    be strictly alive (access denied is not alive). When the process
+    creation time can be read, ``started_at`` has to match it. A missing
+    creation time leaves the lock-pid check in charge. The read goes
+    through ``fileio`` so it cannot block the bot's ``os.remove``.
     """
     marker = parse_headless_marker(fileio.read_json(headless_marker_path(bot_dir)))
     if marker is None:
         return False
+    has_lock, lock_pid = read_lock(bot_dir)
+    if not has_lock or lock_pid != marker["pid"]:
+        return False
+    alive = pid_alive_strict if pid_alive_fn is None else pid_alive_fn
     try:
-        return bool(pid_alive_fn(marker["pid"]))
+        if not alive(marker["pid"]):
+            return False
     except Exception:  # noqa: BLE001 — an unreadable pid is not a live headless bot
         return False
+    try:
+        created = (process_create_time if create_time_fn is None else create_time_fn)(
+            marker["pid"])
+    except Exception:  # noqa: BLE001 — a failed clock read must not fail open
+        return False
+    if created is None:
+        return True
+    if not isinstance(created, datetime):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    started = _parse_started_at(marker["started_at"])
+    if started is None:
+        return False
+    return abs((created - started).total_seconds()) <= _CREATE_TIME_TOLERANCE_S
 
 
 def pending(bot_dir: str) -> dict:

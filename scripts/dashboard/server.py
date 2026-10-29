@@ -18,7 +18,8 @@ Read-only by default: nothing is written to a bot directory. With
 which writes the bot's own STOP / mode_override.json files only when a
 live ``headless.json`` marker is present (see ``control.py``; nothing can
 switch a bot up to real orders, and a GUI bot is refused with no file
-written) and logs every request to the control log.
+written) and logs every request to the control log (install dir, outside data/,
+unless ``--control-log`` is set).
 
 Clients outside loopback and the Tailscale ranges are refused even if a
 bind address would let them connect, and so are requests whose Host
@@ -339,6 +340,16 @@ def default_settings_path(base_dir: str) -> str:
     return os.path.join(install, "settings.yaml")
 
 
+def default_control_log_path(base_dir: str) -> str:
+    """Audit CSV in the install directory, outside ``data/``.
+
+    ``--base-dir`` is ``<install>/data/live``. The log sits next to
+    ``settings.yaml``. ``--control-log`` overrides this.
+    """
+    install = os.path.dirname(os.path.dirname(os.path.abspath(base_dir)))
+    return os.path.join(install, "dashboard_control_log.csv")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Read-only tai-robot bot dashboard")
     p.add_argument("--bind", action="append", default=[],
@@ -352,7 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="allow stop / switch-to-paper from the page (off = read-only)")
     p.add_argument("--control-log", default="",
                    help="audit CSV for control requests "
-                        "(default: dashboard_control_log.csv next to --base-dir)")
+                        "(default: dashboard_control_log.csv in the install "
+                        "dir, outside data/; two levels above --base-dir)")
     p.add_argument("--settings", default="",
                    help="settings.yaml for the vote/news paths "
                         "(default: the install's, two levels above --base-dir)")
@@ -429,8 +441,8 @@ def main(argv=None) -> int:
 
     DashboardHandler.base_dir = os.path.abspath(args.base_dir)
     DashboardHandler.control_enabled = bool(args.enable_control)
-    DashboardHandler.control_log = args.control_log or os.path.join(
-        os.path.dirname(DashboardHandler.base_dir), "dashboard_control_log.csv")
+    DashboardHandler.control_log = (
+        args.control_log or default_control_log_path(DashboardHandler.base_dir))
     DashboardHandler.lwc_path = lwc_js_path()
     DashboardHandler.news_paths = load_news_paths(
         args.settings or default_settings_path(DashboardHandler.base_dir))

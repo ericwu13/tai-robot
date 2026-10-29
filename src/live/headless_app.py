@@ -35,7 +35,7 @@ from src.live.headless import (
     EXIT_BACKTEST_FAILED, EXIT_BOT_STOPPED, EXIT_DEPLOY_REFUSED, EXIT_LOGIN,
     EXIT_NO_COM, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE,
     HeadlessConfigError, HeadlessPolicy, build_deploy_request,
-    clear_stop_file, policy_from_args, remove_headless_marker,
+    clear_stop_file, policy_from_args, remove_headless_marker_if_ours,
     resolve_strategy_name, stop_requested, write_headless_marker,
 )
 from src.live.live_runner import LiveRunner
@@ -71,6 +71,12 @@ class HeadlessBotApp(rb.BacktestApp):
     def _alert(self, title: str, message: str) -> None:
         self.alerts.append((title, message))
         rb._log(f"[HEADLESS ERROR] {title}: {message}")
+
+    def _drop_stale_headless_marker(self, bot_dir: str) -> None:
+        # The GUI hook deletes a crashed run's marker. This process writes
+        # its own after the lock is held, and must not drop one that is
+        # already there before that write.
+        return
 
     def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc,
                                    price, action_type, price_source="",
@@ -195,9 +201,9 @@ class DeployDriver(_Driver):
         app, args = self.app, self.args
         base_dir = os.path.join(rb.project_root, "data", "live")
         self.bot_dir = LiveRunner.bot_dir_for(base_dir, args.symbol, args.bot)
-        # Dashboard stop/paper key off this file. A GUI deploy never writes
-        # it. OSError is logged inside the helper and must not abort deploy.
-        write_headless_marker(self.bot_dir)
+        # The marker is written in _deploy, after acquire_lock. Writing it
+        # here would let a refused second instance replace, then delete,
+        # the running bot's marker.
         session = load_session(os.path.join(self.bot_dir, "session.json"))
         if args.resume and session is None:
             self.finish(EXIT_USAGE, f"--resume but no session.json in {self.bot_dir}")
@@ -257,6 +263,8 @@ class DeployDriver(_Driver):
                 or self.app.status_var.get()
             self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
             return
+        # acquire_lock has run. OSError is logged inside the helper.
+        write_headless_marker(self.bot_dir)
         rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP "
                 "and Ctrl+C every 2s")
         self.root.after(self.POLL_MS, self._poll)
@@ -397,7 +405,7 @@ def _drive_until_exit(driver, app) -> int:
     finally:
         bot_dir = getattr(driver, "bot_dir", "") or ""
         if bot_dir:
-            remove_headless_marker(bot_dir)
+            remove_headless_marker_if_ours(bot_dir)
 
 
 def run_backtest(args) -> int:
