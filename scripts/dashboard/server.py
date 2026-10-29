@@ -199,16 +199,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             body = None
+        loss_limit = body.get("loss_limit") if isinstance(body, dict) else None
         if (not isinstance(body, dict)
                 or not all(isinstance(body.get(k), str) for k in ("id", "action", "confirm"))
-                or not isinstance(body.get("position_ack", ""), str)):
+                or not isinstance(body.get("position_ack", ""), str)
+                or not isinstance(body.get("real_ack", ""), str)
+                or not (loss_limit is None or (isinstance(loss_limit, int)
+                                               and not isinstance(loss_limit, bool)))):
             reply(400, False, "bad request", log="bad request")
             return
         try:
             ok, message = control.handle(
                 now_tpe(), self.base_dir, body["id"], body["action"], body["confirm"],
                 client=client, log_path=self.control_log,
-                position_ack=body.get("position_ack", ""))
+                position_ack=body.get("position_ack", ""),
+                loss_limit=loss_limit, real_ack=body.get("real_ack", ""))
         except Exception as exc:  # noqa: BLE001 — answer, don't drop the socket
             sys.stderr.write(f"dashboard: control failed: {type(exc).__name__}: {exc}\n")
             reply(500, False, "internal error")
