@@ -1909,21 +1909,28 @@ class BacktestApp:
         The OnOpenInterest callback is async. The entry gate follows the
         machine (OnComplete + this call), not that later callback.
         """
+        self._requery_open_interest("[RECONNECT] reconcile")
+
+    def _requery_open_interest(self, tag: str) -> None:
+        """Start a fresh OpenInterest snapshot as a query of its own.
+
+        The generation moves forward (and the book is cleared) so the
+        reply cannot complete a later deploy, and an older reply cannot
+        be read as this one (issue #202).
+        """
         if not _com_available or skO is None:
             return
         user_id = self.login_user_var.get().strip()
         account = getattr(self, "_futures_account", "") or ""
         if not user_id or not account:
-            _log_debug("[RECONNECT] reconcile skipped — no futures account yet")
+            _log_debug(f"{tag} skipped — no futures account yet")
             return
         try:
-            # A new query, same as the account refresh. The generation
-            # moves forward so this reply cannot complete a later deploy.
             self._account_monitor.begin_oi_query()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
                      user_id, account, 1)
         except Exception as e:
-            _log(f"[RECONNECT] reconcile raised: [{type(e).__name__}] {e}")
+            _log(f"{tag} raised: [{type(e).__name__}] {e}")
 
     def _on_machine_release_orders(self) -> None:
         _log_debug("[RECONNECT] orders released after OnComplete reconcile")
@@ -10400,6 +10407,16 @@ class BacktestApp:
                 self._handle_semi_auto_order(deferred)
             else:
                 _log(f"FILL CONFIRM DONE: no deferred close to replay")
+
+        # A confirmed exit makes the OpenInterest snapshot stale. The fill
+        # poll does not open a query generation, so its "001" lands in the
+        # account poll's generation next to the pre-exit row, and #204
+        # reads that as a conflict: the row stays and the book shows a
+        # position the account no longer holds until the next account
+        # poll. Re-snapshot as a query of its own instead (same path as a
+        # reconnect reconcile).
+        if poller_action_type == "exit":
+            self._requery_open_interest("FILL CONFIRM: exit re-snapshot")
 
     def _real_exit_price_from_broker(self) -> int:
         """The OnNewData-recorded real exit price of the latest trade.
