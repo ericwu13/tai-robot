@@ -22,7 +22,10 @@ from .session_store import load_session
 
 # Modes the CLI may deploy. semi_auto needs a human clicking the 10-second
 # order-confirm dialog — headless it would silently skip every real order,
-# which is worse than refusing.
+# which is worse than refusing. A later mode_override.json cannot add a
+# live mode: a headless runner refuses auto, real, semi_auto, and any
+# other non-paper value from that file. ``deploy --mode auto`` is the
+# explicit deploy choice and is not that file.
 HEADLESS_MODES = ("paper", "auto")
 
 # Subcommands the release EXE routes to this CLI. An empty argv, -h/--help,
