@@ -125,6 +125,7 @@ from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
+    open_interest_query_rejected,
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.com_broker_port import ComBrokerPort
@@ -132,7 +133,9 @@ from src.live.link_host import adopt_after_process_login
 from src.live.link_state_machine import KIND_CONN_ERROR
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
-    RealFillTracker, parse_fulfill_report, match_fill_in_report,
+    RealFillTracker, parse_fulfill_report, parse_new_data,
+    is_fulfill_rate_limited, next_exit_fill_retry, mask_new_data_row,
+    FR_MIN_GAP_MS, FR_RETRY_WINDOW_MS,
 )
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
@@ -1227,7 +1230,17 @@ class SKOrderLibEvents:
         _ui_queue.put_nowait(("order_result", (nCode, bstrMessage)))
 
     def OnOpenInterest(self, bstrData):
-        _ui_queue.put_nowait(("open_interest", bstrData))
+        # Tag the row with the query that is in flight NOW. A reply that
+        # was already queued under an older generation must not complete
+        # a later GetOpenInterestGW (issue #202). The API has no request
+        # id; enqueue time is the correlation we have.
+        payload: str | tuple = bstrData
+        app = _app
+        monitor = getattr(app, "_account_monitor", None) if app is not None else None
+        generation = getattr(monitor, "oi_query_generation", None) if monitor is not None else None
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            payload = (bstrData, generation)
+        _ui_queue.put_nowait(("open_interest", payload))
 
     def OnFutureRights(self, bstrData):
         _ui_queue.put_nowait(("future_rights", bstrData))
@@ -1235,6 +1248,28 @@ class SKOrderLibEvents:
 
 _parse_open_interest = parse_open_interest  # re-export from account_monitor
 _parse_future_rights = parse_future_rights  # re-export from account_monitor
+
+
+def _split_open_interest_event(data) -> tuple[str, int | None]:
+    """Return ``(raw, generation)`` for one queued OnOpenInterest event.
+
+    The callback tags the row with the query generation current when the
+    row was enqueued. An untagged string is credited to whatever query is
+    current when the queue is processed.
+    """
+    if (
+        isinstance(data, tuple)
+        and len(data) == 2
+        and isinstance(data[1], int)
+        and not isinstance(data[1], bool)
+    ):
+        raw = data[0]
+        if not isinstance(raw, str):
+            raw = "" if raw is None else str(raw)
+        return raw, data[1]
+    if isinstance(data, str):
+        return data, None
+    return ("" if data is None else str(data)), None
 
 
 class BacktestApp:
@@ -1379,19 +1414,31 @@ class BacktestApp:
                             entries = [e.strip() for e in raw.split(";") if e.strip()]
                             _log(f"期貨商品列表(mkt={market_no}): {len(entries)} symbols")
                 elif kind == "open_interest":
-                    parsed = _parse_open_interest(data)
-                    if parsed:
-                        self._account_monitor.add_position(parsed)
+                    raw, oi_generation = _split_open_interest_event(data)
+                    outcome = self._account_monitor.apply_open_interest(
+                        raw, generation=oi_generation)
+                    parsed = _parse_open_interest(raw) if outcome == "position" else None
+                    if outcome == "position":
                         self._update_real_account_display()
-                    else:
-                        first = data.split(",")[0].strip() if data else ""
-                        if first == "001":
-                            self._account_monitor.set_flat()
-                            self.real_pos_var.set("Flat (無持倉)")
-                    _log(f"未平倉 OpenInterest: {_redact_open_interest(data)}")
-                    # Fill polling: track position from OI callbacks
-                    if self._trading_guard.fill_pending and self._live_runner:
-                        self._update_fill_poll_position(data, parsed)
+                    elif outcome == "flat":
+                        self.real_pos_var.set("Flat (無持倉)")
+                    _log(f"未平倉 OpenInterest: {_redact_open_interest(raw)}")
+                    # Fill polling: track position from OI callbacks.
+                    # A stale row belongs to an older query and must not
+                    # confirm a fill (issue #202).
+                    if (outcome != "stale"
+                            and self._trading_guard.fill_pending
+                            and self._live_runner):
+                        self._update_fill_poll_position(raw, parsed)
+                    # #173's late-resume recheck belongs on a credited row.
+                    # The methods are absent until that PR lands; keep this
+                    # call (and drop a second insert) when resolving the
+                    # _process_ui_queue conflict.
+                    if outcome != "stale":
+                        _recheck = getattr(self, "_recheck_resume_after_snapshot", None)
+                        _settles = getattr(self, "_oi_row_settles_resume_recheck", None)
+                        if _recheck is not None and _settles is not None:
+                            _recheck(settled=_settles(raw, parsed))
                 elif kind == "future_rights":
                     parsed = _parse_future_rights(data)
                     if parsed:
@@ -1870,6 +1917,9 @@ class BacktestApp:
             _log_debug("[RECONNECT] reconcile skipped — no futures account yet")
             return
         try:
+            # A new query, same as the account refresh. The generation
+            # moves forward so this reply cannot complete a later deploy.
+            self._account_monitor.begin_oi_query()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
                      user_id, account, 1)
         except Exception as e:
@@ -2116,6 +2166,7 @@ class BacktestApp:
         # Backoff retry state for exit fill price polling (issue #92).
         self._exit_fill_retry_timer: int | None = None
         self._exit_fill_retry_ctx: dict | None = None
+        self._exit_fill_stopped: bool = False
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -7836,14 +7887,20 @@ class BacktestApp:
 
     # ── Dialog seams (overridden by the headless CLI, src/live/headless_app.py) ──
 
-    def _confirm(self, title: str, message: str) -> bool:
+    def _confirm(self, title: str, message: str, *, default_no: bool = False) -> bool:
         """Yes/No question on the deploy + backtest paths.
 
         The GUI asks the user; ``HeadlessBotApp`` answers from its policy
         flags. Every interactive question on these paths MUST go through
         here so the CLI never blocks on a hidden dialog.
+
+        ``default_no`` selects the No button. The unknown-position prompt
+        uses it (issue #202). Other prompts keep the toolkit default (Yes).
         """
-        return bool(messagebox.askyesno(title, message))
+        options = {}
+        if default_no:
+            options["default"] = messagebox.NO
+        return bool(messagebox.askyesno(title, message, **options))
 
     def _alert(self, title: str, message: str) -> None:
         """Error popup on the deploy path (log-only when headless)."""
@@ -8216,13 +8273,34 @@ class BacktestApp:
             return False
 
         def _after_oi_wait() -> bool:
-            if (trading_mode in ("semi_auto", "auto") and self._futures_account
-                    and not self._account_monitor.oi_snapshot_received):
-                _log(
-                    "持倉查詢逾時 Position snapshot not received within "
-                    f"{OI_SNAPSHOT_TIMEOUT_S:.0f}s — treating real position "
-                    "as UNKNOWN"
+            # Fail closed (issue #202). A missing snapshot used to log
+            # UNKNOWN and deploy anyway, because an empty position list
+            # skipped the Existing Position confirm. Paper has no real book.
+            real_book = trading_mode in ("semi_auto", "auto") and self._futures_account
+            query_failed = bool(getattr(self, "_predeploy_oi_failed", False))
+            if real_book and (query_failed or not self._account_monitor.oi_snapshot_received):
+                detail = getattr(self, "_predeploy_oi_unknown_reason", "") or (
+                    f"not received within {OI_SNAPSHOT_TIMEOUT_S:.0f}s"
                 )
+                _log(
+                    "持倉未知 Position UNKNOWN "
+                    f"({detail}) — real-order deploy needs confirmation"
+                )
+                proceed = self._confirm(
+                    "持倉未知 Unknown Position",
+                    "無法確認帳戶未平倉部位（查詢失敗、被拒或逾時）。\n"
+                    "Real position is UNKNOWN (query failed, rejected, or timed out).\n\n"
+                    "部署可能在已有持倉時送出實單。\n"
+                    "Deploying may send real orders while a position is already open.\n\n"
+                    "是否仍要部署？\n"
+                    "Deploy anyway?",
+                    default_no=True,
+                )
+                if not proceed:
+                    self.set_status(
+                        "部署取消：持倉未知 Deploy cancelled: real position UNKNOWN",
+                        "warn")
+                    return False
             if trading_mode in ("semi_auto", "auto") and self._futures_account:
                 if self._account_monitor.has_open_positions():
                     pos_parts = []
@@ -8249,20 +8327,36 @@ class BacktestApp:
                 news_enabled, news_tier2_enabled, news_directional,
                 resume_session, trading_mode, bot_name)
 
-        # Semi-auto: check for pre-existing real positions before deploy
+        # Real-order deploy: query the book, then fail closed on UNKNOWN.
+        # Paper skips this. A non-zero GetOpenInterestGW code is UNKNOWN
+        # immediately — the callback is not coming (issue #202).
+        self._predeploy_oi_failed = False
+        self._predeploy_oi_unknown_reason = ""
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
             try:
                 user_id = self.login_user_var.get().strip()
-                self._account_monitor.clear_positions()
-                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                         user_id, self._futures_account, 1)
-                # The OnOpenInterest reply arrives asynchronously through the
-                # UI queue — observed ~4s after the query. GUI waits via an
-                # after(100) poll so the Tk thread is not frozen; headless
-                # falls back to a blocking drain (no update_idletasks).
-                if self._oi_wait_must_block():
+                # New generation. clear_positions() must not be what drops
+                # the previous answer; only this query can complete it.
+                self._account_monitor.begin_oi_query()
+                code = call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                                user_id, self._futures_account, 1)
+                _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
+                if open_interest_query_rejected(code):
+                    self._predeploy_oi_failed = True
+                    self._predeploy_oi_unknown_reason = (
+                        f"GetOpenInterestGW code={code}"
+                    )
+                    _log(
+                        "持倉查詢被拒 Pre-deploy GetOpenInterestGW rejected: "
+                        f"code={code} — real position UNKNOWN"
+                    )
+                elif self._oi_wait_must_block():
+                    # The OnOpenInterest reply arrives asynchronously through
+                    # the UI queue — observed ~4s after the query. Headless
+                    # drains the queue here (no update_idletasks).
                     self._wait_oi_snapshot_blocking()
                 else:
+                    # GUI: after(100) poll so the Tk thread is not frozen.
                     _deadline = time.time() + OI_SNAPSHOT_TIMEOUT_S
 
                     def _poll_oi():
@@ -8279,6 +8373,8 @@ class BacktestApp:
                     self.root.after(100, _poll_oi)
                     return True
             except Exception as e:
+                self._predeploy_oi_failed = True
+                self._predeploy_oi_unknown_reason = f"{type(e).__name__}: {e}"
                 _log(f"部署前持倉查詢失敗 Pre-deploy position check failed: {e}")
         return _after_oi_wait()
 
@@ -9987,8 +10083,14 @@ class BacktestApp:
                     else:
                         bar_idx = (broker.trades[-1].exit_bar_index
                                    if broker.trades else -1)
+                    report_side = "B" if buy_sell == 0 else "S"
+                    # Report rows use N (new) / O (offset). An exit, including
+                    # sNewClose=2 (auto) that flattens a position, is O.
+                    report_nc = "N" if action_type == "entry" else "O"
                     self._fill_tracker.register_order(
-                        str(message), action_type, bar_idx, sim_price)
+                        str(message), action_type, bar_idx, sim_price,
+                        product=order_symbol, side=report_side,
+                        new_close=report_nc, send_time=_taipei_now())
                     if action_type == "exit":
                         self._last_exit_order_seq = str(message).strip()
                 if _discord and _discord.enabled:
@@ -10159,7 +10261,12 @@ class BacktestApp:
             self._on_fill_timeout()
             return
 
-        # Request fresh position data via COM
+        # Request fresh position data via COM. This poll fires every 3s
+        # and the callback is often ~4s behind, so it does not call
+        # begin_oi_query(): that would clear the book and leave it
+        # UNKNOWN for the whole fill wait. A tail "##" still cannot
+        # flatten a later deploy — "##" answers empty only after "001"
+        # in that generation (issue #202).
         try:
             user_id = self.login_user_var.get().strip()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
@@ -10192,9 +10299,9 @@ class BacktestApp:
         # ENTRY: OnNewData deal row if already arrived, else OpenInterest
         # avg_cost (identical for a 1-lot position).
         # EXIT: OnNewData deal row recorded on trades[-1].real_exit_price
-        # (issue #92). If OnNewData is slow, a backoff retry chain polls
-        # GetFulfillReport(1) (per-fill detail, matched by seq no) up to
-        # ~60s; after exhaustion the sim price goes out with "(est.)" and
+        # (issue #92). If that row never arrives, a retry chain polls
+        # GetFulfillReport(1) (per-fill detail, issue #218) for about 90s.
+        # Exhaustion keeps the sim price, marks the trade estimated, and
         # a late OnNewData/poll sends a Discord correction.
         fill_price = ""
         _exit_fill_deferred = False
@@ -10264,14 +10371,15 @@ class BacktestApp:
         self._live_log_msg(
             f"{result.message}{price_str}", "entry")
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
-        if _discord and _discord.enabled:
-            if _exit_fill_deferred:
-                self._start_exit_fill_retry(
-                    result.action_type, fill_price,
-                    self._active_strategy_name())
-            else:
-                _discord.fill_confirmed(result.action_type, fill_price,
-                                        strategy=self._active_strategy_name())
+        # The report poll is the real-exit price path. It runs whether or
+        # not Discord is configured. Only the messages are gated.
+        if _exit_fill_deferred:
+            self._start_exit_fill_retry(
+                result.action_type, fill_price,
+                self._active_strategy_name())
+        elif _discord and _discord.enabled:
+            _discord.fill_confirmed(result.action_type, fill_price,
+                                    strategy=self._active_strategy_name())
 
         # Issue #50: replay any deferred close that was blocked by
         # BLOCK_FILL_PENDING. Now that the entry fill is confirmed
@@ -10305,49 +10413,97 @@ class BacktestApp:
             return 0
         return getattr(broker.trades[-1], "real_exit_price", 0)
 
-    # ── Exit fill price retry with backoff (issue #92) ──
+    # ── Exit fill price retry (issue #92, layout fixed in #218) ──
     #
-    # OnNewData is the primary source but can be slow. GetFulfillReport(1)
-    # (per-fill detail, NOT format 4 which merges by commodity) is polled
-    # as a backup — the seq no from SendFutureOrderCLR identifies our fill
-    # among all fills on the account.
+    # OnNewData is the primary per-fill source but can be silent.
+    # GetFulfillReport(1) is the backup. Format-1 rows have no order
+    # seq, so the match is the book number captured from the accept
+    # row, then a product-family / side / new-close / qty / time
+    # fallback. The broker rejects a second query inside 5s (M999);
+    # polls stay FR_MIN_GAP_MS apart and the chain stops at about 90s.
+    # M999 is a backoff, not a used attempt.
 
-    _EXIT_FILL_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000]
+    def _exit_fill_unresolved(self) -> bool:
+        """An exit was sent and its broker price is not on the trade yet."""
+        if self._exit_fill_retry_ctx is not None:
+            return True
+        if not self._last_exit_order_seq:
+            return False
+        return self._real_exit_price_from_broker() == 0
+
+    def _cancel_exit_fill_retry(self) -> None:
+        """Drop a pending exit-fill poll so a stop cannot save later.
+
+        Tk ``after`` runs on the main thread. Cancelling the token and
+        clearing the context means the callback does not run, and a
+        callback that already started will not write the session once
+        it sees ``_exit_fill_stopped``.
+
+        The pending trade keeps its simulated exit price and is marked
+        ``real_exit_estimated``. Stop's own session save persists that.
+        A trade that already has a real exit price is left alone.
+        """
+        pending = getattr(self, "_exit_fill_retry_ctx", None)
+        timer = getattr(self, "_exit_fill_retry_timer", None)
+        root = getattr(self, "root", None)
+        if timer is not None and root is not None:
+            try:
+                root.after_cancel(timer)
+            except Exception:
+                pass
+        if pending is not None:
+            runner = getattr(self, "_live_runner", None)
+            broker = getattr(runner, "broker", None) if runner is not None else None
+            mark = getattr(broker, "mark_real_exit_estimated", None)
+            if mark is not None:
+                try:
+                    mark()
+                except Exception as exc:
+                    _log(f"EXIT FILL RETRY: stop mark estimated failed: {exc}")
+        self._exit_fill_retry_timer = None
+        self._exit_fill_retry_ctx = None
+        self._exit_fill_stopped = True
 
     def _start_exit_fill_retry(self, action_type: str,
                                fallback_price: str,
                                strategy: str) -> None:
-        """Begin the backoff retry chain for exit fill price."""
+        """Begin the exit-fill poll. First query waits out the 5s limit."""
+        self._exit_fill_stopped = False
         self._exit_fill_retry_ctx = {
             "action_type": action_type,
             "fallback_price": fallback_price,
             "strategy": strategy,
             "attempt": 0,
+            "started": time.monotonic(),
         }
-        delay = self._EXIT_FILL_RETRY_DELAYS_MS[0]
+        delay = FR_MIN_GAP_MS
         _log(f"EXIT FILL RETRY START: seq={self._last_exit_order_seq} "
-             f"schedule={self._EXIT_FILL_RETRY_DELAYS_MS}ms")
+             f"gap={delay}ms window={FR_RETRY_WINDOW_MS}ms")
         self._exit_fill_retry_timer = self.root.after(
             delay, self._poll_exit_fill_step)
 
     def _poll_exit_fill_step(self) -> None:
         """One step of the exit fill price retry chain."""
         self._exit_fill_retry_timer = None
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
         ctx = self._exit_fill_retry_ctx
         if ctx is None:
             return
-        attempt = ctx["attempt"]
-        ctx["attempt"] = attempt + 1
+        elapsed_ms = int((time.monotonic() - ctx["started"]) * 1000)
         seq = self._last_exit_order_seq
 
         real_px = self._real_exit_price_from_broker()
         source = "OnNewData"
+        rate_limited = False
         if not real_px:
-            real_px = self._poll_exit_fill_via_report(seq)
+            real_px, rate_limited = self._poll_exit_fill_via_report(seq)
             source = "GetFulfillReport(1)"
 
-        _log(f"EXIT FILL RETRY #{attempt}: real_px={real_px} source={source} "
-             f"seq={seq}")
+        _log(f"EXIT FILL RETRY: real_px={real_px} source={source} "
+             f"seq={seq} attempt={ctx['attempt']} elapsed_ms={elapsed_ms} "
+             f"rate_limited={rate_limited}")
 
         if real_px:
             self._exit_fill_retry_ctx = None
@@ -10358,35 +10514,49 @@ class BacktestApp:
                     strategy=ctx["strategy"])
             return
 
-        next_idx = attempt + 1
-        if next_idx < len(self._EXIT_FILL_RETRY_DELAYS_MS):
-            delay = self._EXIT_FILL_RETRY_DELAYS_MS[next_idx]
-            _log(f"EXIT FILL RETRY: scheduling attempt #{next_idx} in {delay}ms")
+        delay, attempt, exhausted = next_exit_fill_retry(
+            ctx["attempt"], elapsed_ms, rate_limited=rate_limited)
+        ctx["attempt"] = attempt
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
+        if not exhausted and delay is not None:
+            why = "M999 rate limit, attempt not consumed" if rate_limited else "no match"
+            _log(f"EXIT FILL RETRY: {why}; scheduling in {delay}ms "
+                 f"(attempt={attempt})")
             self._exit_fill_retry_timer = self.root.after(
                 delay, self._poll_exit_fill_step)
             return
 
         self._exit_fill_retry_ctx = None
+        if getattr(self, "_exit_fill_stopped", False):
+            _log("EXIT FILL RETRY: stopped before exhaustion save")
+            return
         fill_price = ctx["fallback_price"]
-        estimated = bool(fill_price)
-        if estimated:
+        marked = False
+        if self._live_runner:
+            marked = self._live_runner.broker.mark_real_exit_estimated()
+            try:
+                self._live_runner._auto_save_session()
+            except Exception as exc:
+                _log(f"EXIT FILL RETRY: session re-save failed: {exc}")
+        if fill_price:
             self._est_notified_exit_seq = seq
-        _log(f"EXIT FILL RETRY EXHAUSTED after {len(self._EXIT_FILL_RETRY_DELAYS_MS)} "
-             f"attempts (~61s). Sending estimated={estimated} "
-             f"fill_price={fill_price!r} seq={seq}")
+        _log(f"EXIT FILL RETRY EXHAUSTED (~{FR_RETRY_WINDOW_MS // 1000}s). "
+             f"Keeping sim price fill_price={fill_price!r} seq={seq} "
+             f"real_exit_estimated={marked}")
         if _discord and _discord.enabled:
-            _discord.fill_confirmed(
-                ctx["action_type"], fill_price,
-                strategy=ctx["strategy"], estimated=estimated)
+            _discord.exit_fill_unconfirmed(
+                fill_price, strategy=ctx["strategy"])
 
-    def _poll_exit_fill_via_report(self, target_seq: str) -> int:
-        """Poll GetFulfillReport(1) for the exit fill price by seq no.
+    def _poll_exit_fill_via_report(self, target_seq: str) -> tuple[int, bool]:
+        """Poll GetFulfillReport(1). ``(price, rate_limited)``.
 
-        Format 1 = per-fill detail (each fill is a separate row).
-        Returns the integer fill price if matched, 0 if not found.
+        Price is 0 when nothing was assigned. ``rate_limited`` is True
+        on M999 — the caller backs off and does not consume an attempt.
         """
         if not target_seq or not _com_available or skO is None:
-            return 0
+            return 0, False
         try:
             user_id = self.login_user_var.get().strip()
             fills_raw = call_com(
@@ -10394,43 +10564,61 @@ class BacktestApp:
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
-            return 0
+            return 0, False
 
         if isinstance(fills_raw, (tuple, list)):
             fills_raw = fills_raw[0] if fills_raw else ""
         if not fills_raw or not isinstance(fills_raw, str):
             _log("EXIT FILL POLL: GetFulfillReport(1) returned empty")
-            return 0
+            return 0, False
+        if is_fulfill_rate_limited(fills_raw):
+            _log("EXIT FILL POLL: M999 rate limit — backoff, attempt not consumed")
+            return 0, True
 
+        acct = self._futures_account or ""
         for j, raw_line in enumerate(fills_raw.split("\n")):
             if j < 5 and raw_line.strip():
-                _log(f"EXIT FILL POLL raw[{j}]: {raw_line.strip()}")
+                _log(f"EXIT FILL POLL raw[{j}]: "
+                     f"{mask_new_data_row(raw_line.strip(), acct)}")
         rows = parse_fulfill_report(fills_raw)
         _log(f"EXIT FILL POLL: {len(rows)} rows, target_seq={target_seq}")
         for i, row in enumerate(rows):
-            if i < 5 or row.seq_no == target_seq:
-                _log(f"EXIT FILL POLL row[{i}]: seq={row.seq_no} "
-                     f"side={row.side} nc={row.new_close} qty={row.qty} "
-                     f"price={row.price} match={row.seq_no == target_seq}")
+            if i < 5:
+                _log(f"EXIT FILL POLL row[{i}]: book={row.book_no} "
+                     f"product={row.product} side={row.side} nc={row.new_close} "
+                     f"qty={row.qty} price={row.price} "
+                     f"time={row.date} {row.time}")
 
-        price = match_fill_in_report(rows, target_seq)
-        if not price:
-            _log(f"EXIT FILL POLL: target_seq={target_seq} not matched")
-            return 0
+        match = self._fill_tracker.match_report(target_seq, rows)
+        if match.reason == "ambiguous":
+            _log(f"EXIT FILL POLL: ambiguous ({match.candidates} candidates), "
+                 f"assigning nothing seq={target_seq}")
+            return 0, False
+        if not match.price:
+            _log(f"EXIT FILL POLL: target_seq={target_seq} not matched "
+                 f"reason={match.reason}")
+            return 0, False
+
+        skew = "n/a" if match.skew_s is None else f"{match.skew_s:.0f}s"
+        _log(f"EXIT FILL POLL: row_time - send_time = {skew} "
+             f"price={match.price} via {match.reason} seq={target_seq}")
 
         broker = self._live_runner.broker if self._live_runner else None
+        accepted = False
         if broker:
             last = broker.trades[-1] if broker.trades else None
             if last and last.real_exit_price == 0:
                 fill_dt = _taipei_now().replace(tzinfo=None
                     ).strftime("%Y-%m-%d %H:%M:%S")
                 accepted = broker.try_set_real_exit_price(
-                    price,
+                    match.price,
                     exit_bar_index=getattr(last, "exit_bar_index", -1),
                     fill_dt=fill_dt)
-                _log(f"EXIT FILL POLL: wrote real_exit_price={price} "
-                     f"accepted={accepted}")
-        return price
+                _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
+                     f"via {match.reason} accepted={accepted}")
+        if accepted:
+            self._fill_tracker.note_credited(match.row_key)
+        return match.price, False
 
     def _on_new_data(self, raw: str) -> None:
         """SKReplyLib.OnNewData — real-time per-order report (issue #92).
@@ -10442,10 +10630,14 @@ class BacktestApp:
         Rows for orders this bot didn't send (another bot or a manual
         order on the same account) don't match the tracker and are ignored.
         """
-        redacted = raw
-        if self._futures_account:
-            redacted = redacted.replace(self._futures_account, "***")
+        redacted = mask_new_data_row(raw, self._futures_account or "")
         _log(f"回報 OnNewData: {redacted}")
+        # Issue #218: a masked copy of deal rows while an exit price is
+        # still missing. Diagnostic only — this does not change matching.
+        parsed = parse_new_data(raw)
+        if (parsed is not None and parsed.row_type == "D"
+                and self._exit_fill_unresolved()):
+            _log(f"OnNewData D exit (masked): {redacted}")
         fill = self._fill_tracker.on_new_data(raw)
         if fill is None or not self._live_runner:
             return
@@ -10646,7 +10838,9 @@ class BacktestApp:
             return
         user_id = self.login_user_var.get().strip()
         try:
-            self._account_monitor.clear_positions()  # will be rebuilt from callbacks
+            # Latest query only. clear_positions() does not drop an
+            # answer that already landed for the current generation.
+            self._account_monitor.begin_oi_query()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
                      user_id, self._futures_account, 1)
             call_com("GetFutureRights", skO.GetFutureRights,
@@ -10876,6 +11070,9 @@ class BacktestApp:
         # flag and terminates that child so a GUI stop does not wait
         # out the sweep. The headless STOP file is polled the same way.
         self._evolution_cancel = True
+        # Before the rest of teardown. A poll that fires after stop
+        # would mark and save whatever runner is current.
+        self._cancel_exit_fill_retry()
         self._stop_account_polling()
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
