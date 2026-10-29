@@ -42,7 +42,7 @@ def gfr(book="a1006", book_long="0000001006", date="20261030", time="041606",
     f[0] = "TF"
     f[1] = "FUT"
     f[2] = "TAIFEX"
-    f[3] = "F020000"
+    f[3] = ""  # firm code left blank; not part of the match
     f[4] = "000"
     f[5] = account
     f[6] = "0000000"
@@ -316,7 +316,7 @@ def test_m999_is_a_rate_limit_not_a_row():
 
 def test_retry_gap_is_five_and_a_half_seconds():
     delay, attempt, exhausted = next_exit_fill_retry(
-        0, 0, rate_limited=False, matched=False)
+        0, 0, rate_limited=False)
     assert delay == 5500
     assert delay == FR_MIN_GAP_MS
     assert attempt == 1 and not exhausted
@@ -328,7 +328,7 @@ def test_m999_does_not_consume_an_attempt_and_the_window_still_ends():
     exhausted = False
     for _ in range(30):
         delay, attempt, exhausted = next_exit_fill_retry(
-            attempt, elapsed, rate_limited=True, matched=False)
+            attempt, elapsed, rate_limited=True)
         if exhausted:
             break
         assert delay == 5500
@@ -340,20 +340,20 @@ def test_m999_does_not_consume_an_attempt_and_the_window_still_ends():
 
 def test_retry_window_schedules_at_ninety_seconds_and_not_past_it():
     delay, _attempt, exhausted = next_exit_fill_retry(
-        1, 84_500, rate_limited=False, matched=False)
+        1, 84_500, rate_limited=False)
     assert delay == 5500 and not exhausted
     delay, _attempt, exhausted = next_exit_fill_retry(
-        1, 85_000, rate_limited=False, matched=False)
+        1, 85_000, rate_limited=False)
     assert delay is None and exhausted
 
 
 def test_counted_attempt_budget_still_stops_a_chain_inside_the_window():
     delay, attempt, exhausted = next_exit_fill_retry(
-        15, 1_000, rate_limited=False, matched=False)
+        15, 1_000, rate_limited=False)
     assert delay is None and exhausted and attempt == 16
     # The same spot, but M999, still has an attempt left.
     delay, attempt, exhausted = next_exit_fill_retry(
-        15, 1_000, rate_limited=True, matched=False)
+        15, 1_000, rate_limited=True)
     assert delay == 5500 and not exhausted and attempt == 15
 
 
@@ -408,7 +408,175 @@ def test_dashboard_shows_est_next_to_estimated_real_pnl():
     import scripts.dashboard.server as server
     html = open(os.path.join(os.path.dirname(server.__file__),
                              "static", "index.html"), encoding="utf-8").read()
-    assert 't.real_exit_estimated ? " est."' in html
+    # One visible mark, the same 估 the rest of the page uses. The
+    # distinct reason stays in the tooltip.
+    cell = html.split("function tradeRealCell", 1)[1].split("function ", 1)[0]
+    assert '" 估"' in cell
+    assert "est." not in cell
+
+
+def test_in_window_opposite_side_assigns_nothing():
+    send = datetime(2026, 10, 30, 4, 16, 6)
+    raw = gfr(side="B", nc="O", price="11111.0000", time="041606")
+    match = match_fill_in_report(parse_fulfill_report(raw), _query(send))
+    assert match.price == 0
+
+
+def test_in_window_new_row_does_not_fill_a_close():
+    send = datetime(2026, 10, 30, 4, 16, 6)
+    raw = gfr(side="S", nc="N", price="11111.0000", time="041606")
+    match = match_fill_in_report(parse_fulfill_report(raw), _query(send))
+    assert match.price == 0
+
+
+def test_in_window_qty_2_assigns_nothing():
+    send = datetime(2026, 10, 30, 4, 16, 6)
+    raw = gfr(qty="2", price="11111.0000", time="041606")
+    match = match_fill_in_report(parse_fulfill_report(raw), _query(send))
+    assert match.price == 0
+
+
+def test_duplicate_book_number_is_ambiguous():
+    """Two rows share a book. The second would be a unique fallback
+    if the book-hit ambiguity return were skipped."""
+    send = datetime(2026, 10, 30, 4, 16, 6)
+    raw = "\n".join([
+        gfr(book="a1006", book_long="0000001006", price="45906.0000",
+            time="041606", side="S", nc="O"),
+        gfr(book="a1006", book_long="0000001999", price="11111.0000",
+            time="041606", side="B", nc="N"),
+    ])
+    match = match_fill_in_report(
+        parse_fulfill_report(raw), _query(send, book="a1006"))
+    assert match.price == 0
+    assert match.reason == "ambiguous"
+
+
+def test_long_book_number_alone_matches_outside_the_window():
+    """Fallback cannot see this row. Only field [8] equals the book."""
+    send = datetime(2026, 10, 30, 4, 16, 6)
+    raw = gfr(book="a1006", book_long="0000001006", price="45906.0000",
+              date="20261030", time="120000")
+    match = match_fill_in_report(
+        parse_fulfill_report(raw), _query(send, book="0000001006"))
+    assert match.price == 45906
+    assert match.reason == "book"
+    assert match.skew_s == (datetime(2026, 10, 30, 12, 0, 0) - send).total_seconds()
+
+
+def test_front_month_rolls_at_the_settlement_night_open():
+    # 2026-11-18 is the November settlement day. The day session is
+    # still the expiring contract. The 15:00 night session is December.
+    day = datetime(2026, 11, 18, 10, 0)
+    night = datetime(2026, 11, 18, 15, 0)
+    assert front_month_contract("TMF", day) == "TMFK6"
+    assert front_month_contract("TMF", night) == "TMFL6"
+    assert front_month_contract("TMF", datetime(2026, 11, 18, 22, 30)) == "TMFL6"
+    send = datetime(2026, 11, 18, 15, 1, 0)
+    nxt = gfr(product="TMFL6", date="20261118", time="150100",
+              price="46000.0000")
+    old = gfr(product="TMFK6", date="20261118", time="150100",
+              price="45900.0000")
+    assert match_fill_in_report(
+        parse_fulfill_report(nxt), _query(send)).price == 46000
+    assert match_fill_in_report(
+        parse_fulfill_report(old), _query(send)).price == 0
+
+
+def test_second_exit_does_not_take_the_first_rows_from_the_same_report(monkeypatch):
+    """Two exits, one report. The second must not be credited the first row.
+
+    Goes through ``_poll_exit_fill_via_report`` so a no-op
+    ``note_credited`` fails: both rows sit in the second window, and
+    only the credit removes the first.
+    """
+    import run_backtest as rb
+    from types import SimpleNamespace
+
+    from src.live.fill_report import RealFillTracker
+
+    send1 = datetime(2026, 10, 30, 4, 16, 10)
+    send2 = datetime(2026, 10, 30, 4, 16, 20)
+    raw = "\n".join([
+        gfr(book="a1001", book_long="0000001001", price="45906.0000",
+            time="041618"),
+        gfr(book="a1002", book_long="0000001002", price="45920.0000",
+            time="041620"),
+    ])
+    tracker = RealFillTracker()
+    tracker.register_order(
+        "1000000000001", "exit", bar_index=7, sim_price=45900,
+        product="TM0000", side="S", new_close="O", send_time=send1)
+    tracker._orders["1000000000001"]["book_no"] = "a1001"
+    tracker.register_order(
+        "1000000000002", "exit", bar_index=8, sim_price=45910,
+        product="TM0000", side="S", new_close="O", send_time=send2)
+
+    broker = SimulatedBroker(point_value=10)
+    broker.trades.append(Trade(
+        tag="Long", side=OrderSide.LONG, qty=1, entry_price=46000,
+        exit_price=45900, entry_bar_index=1, exit_bar_index=7, pnl=-1000,
+        source="real", real_entry_price=46010))
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._fill_tracker = tracker
+    app._futures_account = "0000"
+    app.login_user_var = SimpleNamespace(get=lambda: "user")
+    app._live_runner = SimpleNamespace(broker=broker)
+    app._last_exit_order_seq = "1000000000001"
+    logs = []
+    monkeypatch.setattr(rb, "_log", lambda msg: logs.append(msg))
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetFulfillReport=object()))
+    monkeypatch.setattr(rb, "call_com", lambda *args, **kwargs: raw)
+
+    first, limited = app._poll_exit_fill_via_report("1000000000001")
+    second, limited2 = app._poll_exit_fill_via_report("1000000000002")
+    assert first == 45906 and not limited
+    assert second == 45920 and not limited2
+    assert broker.trades[-1].real_exit_price == 45906
+    assert any("row_time - send_time = " in line for line in logs)
+
+
+def test_stop_cancels_the_exit_fill_timer_and_does_not_save():
+    import run_backtest as rb
+    from types import SimpleNamespace
+
+    from tests.test_issue_168_restore_fidelity import _Root
+
+    saves = []
+    broker = SimulatedBroker(point_value=10)
+    broker.trades.append(Trade(
+        tag="Long", side=OrderSide.LONG, qty=1, entry_price=46000,
+        exit_price=45928, entry_bar_index=1, exit_bar_index=2, pnl=-720,
+        source="real", real_entry_price=46010))
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.root = _Root()
+    app._evolution_cancel = False
+    app._exit_fill_stopped = False
+    app._live_runner = SimpleNamespace(
+        broker=broker,
+        _auto_save_session=lambda: saves.append("save"),
+    )
+    app._exit_fill_retry_ctx = {
+        "action_type": "exit",
+        "fallback_price": "45928",
+        "strategy": "s",
+        "attempt": 15,
+        "started": 0,
+    }
+    app._exit_fill_retry_timer = app.root.after(5500, app._poll_exit_fill_step)
+    import pytest
+    with pytest.raises(AttributeError):
+        app._stop_live()
+    assert app._evolution_cancel is True
+    assert app._exit_fill_retry_timer is None
+    assert app._exit_fill_retry_ctx is None
+    assert app._exit_fill_stopped is True
+    assert app.root.pending == {}
+    app._poll_exit_fill_step()
+    assert saves == []
+    assert broker.trades[-1].real_exit_estimated is False
 
 
 def test_mask_keeps_the_price_and_drops_the_account():

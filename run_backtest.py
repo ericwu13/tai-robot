@@ -2166,6 +2166,7 @@ class BacktestApp:
         # Backoff retry state for exit fill price polling (issue #92).
         self._exit_fill_retry_timer: int | None = None
         self._exit_fill_retry_ctx: dict | None = None
+        self._exit_fill_stopped: bool = False
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -10429,10 +10430,30 @@ class BacktestApp:
             return False
         return self._real_exit_price_from_broker() == 0
 
+    def _cancel_exit_fill_retry(self) -> None:
+        """Drop a pending exit-fill poll so a stop cannot save later.
+
+        Tk ``after`` runs on the main thread. Cancelling the token and
+        clearing the context means the callback does not run, and a
+        callback that already started will not write the session once
+        it sees ``_exit_fill_stopped``.
+        """
+        timer = getattr(self, "_exit_fill_retry_timer", None)
+        root = getattr(self, "root", None)
+        if timer is not None and root is not None:
+            try:
+                root.after_cancel(timer)
+            except Exception:
+                pass
+        self._exit_fill_retry_timer = None
+        self._exit_fill_retry_ctx = None
+        self._exit_fill_stopped = True
+
     def _start_exit_fill_retry(self, action_type: str,
                                fallback_price: str,
                                strategy: str) -> None:
         """Begin the exit-fill poll. First query waits out the 5s limit."""
+        self._exit_fill_stopped = False
         self._exit_fill_retry_ctx = {
             "action_type": action_type,
             "fallback_price": fallback_price,
@@ -10449,6 +10470,9 @@ class BacktestApp:
     def _poll_exit_fill_step(self) -> None:
         """One step of the exit fill price retry chain."""
         self._exit_fill_retry_timer = None
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
         ctx = self._exit_fill_retry_ctx
         if ctx is None:
             return
@@ -10476,9 +10500,11 @@ class BacktestApp:
             return
 
         delay, attempt, exhausted = next_exit_fill_retry(
-            ctx["attempt"], elapsed_ms,
-            rate_limited=rate_limited, matched=False)
+            ctx["attempt"], elapsed_ms, rate_limited=rate_limited)
         ctx["attempt"] = attempt
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
         if not exhausted and delay is not None:
             why = "M999 rate limit, attempt not consumed" if rate_limited else "no match"
             _log(f"EXIT FILL RETRY: {why}; scheduling in {delay}ms "
@@ -10488,6 +10514,9 @@ class BacktestApp:
             return
 
         self._exit_fill_retry_ctx = None
+        if getattr(self, "_exit_fill_stopped", False):
+            _log("EXIT FILL RETRY: stopped before exhaustion save")
+            return
         fill_price = ctx["fallback_price"]
         marked = False
         if self._live_runner:
@@ -10554,6 +10583,10 @@ class BacktestApp:
             _log(f"EXIT FILL POLL: target_seq={target_seq} not matched "
                  f"reason={match.reason}")
             return 0, False
+
+        skew = "n/a" if match.skew_s is None else f"{match.skew_s:.0f}s"
+        _log(f"EXIT FILL POLL: row_time - send_time = {skew} "
+             f"price={match.price} via {match.reason} seq={target_seq}")
 
         broker = self._live_runner.broker if self._live_runner else None
         accepted = False
@@ -11022,6 +11055,9 @@ class BacktestApp:
         # flag and terminates that child so a GUI stop does not wait
         # out the sweep. The headless STOP file is polled the same way.
         self._evolution_cancel = True
+        # Before the rest of teardown. A poll that fires after stop
+        # would mark and save whatever runner is current.
+        self._cancel_exit_fill_retry()
         self._stop_account_polling()
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)

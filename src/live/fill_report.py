@@ -127,6 +127,13 @@ class RealFillTracker:
 
     Rows whose seq no was never registered (another bot or a manual order
     on the same account) are ignored — that isolation is the point.
+
+    ``_credited`` is per process. Two bots on one account do not share
+    it. If the other bot's same-family close is the only row inside our
+    window and our own row is missing, that row would be credited here.
+    Two in-window candidates are refused, so the residual risk is a
+    single foreign row and a missing own row. Low risk: the own row was
+    already in the first report poll in the cases this covers.
     """
 
     _MAX_ORDERS = 32  # bound memory; far above any realistic open-order count
@@ -321,11 +328,16 @@ class FillQuery:
 @dataclass(frozen=True)
 class FillMatch:
     """``price`` 0 means nothing was assigned. ``reason`` is
-    ``book``, ``fallback``, ``none``, or ``ambiguous``."""
+    ``book``, ``fallback``, ``none``, or ``ambiguous``.
+
+    ``skew_s`` is ``row_time - send_time`` in seconds when a row was
+    chosen, so a clock skew past the 2s lower bound shows up in the log.
+    """
     price: int
     reason: str
     row_key: tuple | None = None
     candidates: int = 0
+    skew_s: float | None = None
 
 
 def is_fulfill_rate_limited(raw: str) -> bool:
@@ -408,11 +420,25 @@ def product_family(symbol: str) -> str:
 
 
 def front_month_contract(family: str, when: datetime | None) -> str:
-    """Front-month contract for ``family`` at ``when``, or ""."""
+    """Front-month contract for ``family`` at ``when``, or "".
+
+    ``get_near_month_symbol`` keeps the expiring month for the whole
+    settlement calendar day (it rolls only once the day is past the
+    3rd Wednesday). The night session that opens at 15:00 on settlement
+    day trades the next month — the expiring contract has already
+    settled at 13:30. Shift that night onto the next calendar day so
+    the existing helper rolls. The 00:00–05:00 tail of the night that
+    opened the evening before settlement stays on the expiring month,
+    because that clock is still before 15:00.
+    """
     if not family or when is None:
         return ""
     try:
-        return get_near_month_symbol(family, when).upper()
+        from src.market_data.holidays import is_settlement_day
+        clock = when.replace(tzinfo=None) if when.tzinfo else when
+        if clock.hour >= 15 and is_settlement_day(clock):
+            clock = clock + timedelta(days=1)
+        return get_near_month_symbol(family, clock).upper()
     except Exception:
         return ""
 
@@ -447,6 +473,15 @@ def _in_send_window(row: FulfillReportRow, send_time: datetime | None) -> bool:
     lower = send_s - timedelta(seconds=FALLBACK_BEFORE_S)
     upper = send_s + timedelta(seconds=FALLBACK_AFTER_S)
     return lower <= row_dt <= upper
+
+
+def _skew_s(row: FulfillReportRow, send_time: datetime | None) -> float | None:
+    """``row_time - send_time`` in seconds, send truncated to the second."""
+    row_dt = _row_dt(row)
+    if row_dt is None or send_time is None:
+        return None
+    send = send_time.replace(tzinfo=None) if send_time.tzinfo else send_time
+    return (row_dt - send.replace(microsecond=0)).total_seconds()
 
 
 def _book_equal(row: FulfillReportRow, book: str) -> bool:
@@ -484,6 +519,9 @@ def match_fill_in_report(rows: list[FulfillReportRow],
     is in that set. Two months, or two rows, assign nothing.
 
     Rows in ``credited`` were already written onto an earlier trade.
+    That set lives on one process. Another bot on the same account
+    does not see it, so a lone foreign row in our window can be
+    cross-credited if our own row is absent. Two candidates are refused.
     """
     credited = credited or set()
     usable = [r for r in rows
@@ -495,7 +533,8 @@ def match_fill_in_report(rows: list[FulfillReportRow],
         if len(hits) == 1:
             row = hits[0]
             return FillMatch(int(round(row.price)), "book",
-                             report_row_key(row), 1)
+                             report_row_key(row), 1,
+                             _skew_s(row, query.send_time))
         if len(hits) > 1:
             return FillMatch(0, "ambiguous", None, len(hits))
 
@@ -514,23 +553,22 @@ def match_fill_in_report(rows: list[FulfillReportRow],
         return FillMatch(0, "ambiguous", None, len(candidates))
     row = candidates[0]
     return FillMatch(int(round(row.price)), "fallback",
-                     report_row_key(row), 1)
+                     report_row_key(row), 1,
+                     _skew_s(row, query.send_time))
 
 
 def next_exit_fill_retry(attempt: int, elapsed_ms: int, *,
-                         rate_limited: bool, matched: bool
+                         rate_limited: bool,
                          ) -> tuple[int | None, int, bool]:
     """``(delay_ms, attempt, exhausted)`` after one exit-fill poll.
 
-    ``delay_ms`` is None when the chain stops. ``exhausted`` is True
-    only when it stops without a fill. A rate-limited poll (M999) does
-    not consume an attempt; the next poll is still ``FR_MIN_GAP_MS``
-    later. No poll is scheduled that would start after
-    ``FR_RETRY_WINDOW_MS`` from the retry start. ``elapsed_ms`` is how
-    long the chain has already been running.
+    Called only when the poll did not match. ``delay_ms`` is None when
+    the chain stops. ``exhausted`` is True when it stops without a fill.
+    A rate-limited poll (M999) does not consume an attempt; the next
+    poll is still ``FR_MIN_GAP_MS`` later. No poll is scheduled that
+    would start after ``FR_RETRY_WINDOW_MS`` from the retry start.
+    ``elapsed_ms`` is how long the chain has already been running.
     """
-    if matched:
-        return None, attempt, False
     new_attempt = attempt if rate_limited else attempt + 1
     if new_attempt >= FR_MAX_ATTEMPTS:
         return None, new_attempt, True
