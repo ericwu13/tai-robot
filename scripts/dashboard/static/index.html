@@ -390,7 +390,8 @@ function realTiles(r) {
 function tradeRealCell(t) {
   switch (t.real_status) {
     case "real": return money(t.real_pnl);
-    case "estimated": return el("span", { title: t.real_reason }, money(t.real_pnl), el("span", { class: "sub" }, " 估"));
+    case "estimated": return el("span", { title: t.real_reason }, money(t.real_pnl),
+      el("span", { class: "sub" }, t.real_exit_estimated ? " est." : " 估"));
     case "unreliable": return el("span", { class: "muted", title: t.real_reason }, "不可靠");
     case "missing": return el("span", { class: "muted", title: t.real_reason }, "無成交價");
     default: return el("span", { class: "muted" }, "—");
