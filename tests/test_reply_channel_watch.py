@@ -237,7 +237,7 @@ def test_reply_watchdog_fires_once_at_60s_when_silent(monkeypatch, caplog):
     # The 60s poll timer stays armed. The silent callback does not alert twice.
     assert app.root.token_for(60_000) is not None
     assert discord.messages == [
-        "[CONN] REPLY CHANNEL SILENT — no reply READY within 60s"
+        "[CONN] REPLY CHANNEL SILENT — no reply event within 60s"
     ]
     assert sum("REPLY CHANNEL SILENT" in line for line in logged) == 1
     assert any(

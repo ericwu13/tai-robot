@@ -1320,7 +1320,10 @@ class SKReplyLibEvent:
     def OnNewData(self, bstrUserID, bstrData):
         # Real-time per-order report — the only per-fill price source in
         # the Capital API (issue #92). Enqueued like every other COM event.
+        # OnNewData is a reply event for the silent-sink watchdog.
         _ui_queue.put_nowait(("new_data", bstrData))
+        _ui_queue.put_nowait(("reply_seen", "OnNewData"))
+        mark_reply_arrived("OnNewData")
 
 
 class SKOrderLibEvents:
@@ -2044,8 +2047,38 @@ class BacktestApp:
             _log_debug(
                 f"[RECONNECT] link heartbeat skipped: [{type(e).__name__}] {e}")
 
+    def _cancel_reply_poll(self) -> None:
+        """Stop the reply poll and its backoff timer.
+
+        Window close and headless teardown both call ``_shutdown_link``.
+        Capital API 2.13.57 has no LogOut; this is the logout path.
+        A timer that already fired must not schedule another.
+        """
+        for name in ("_reply_poll_token", "_reply_backoff_token"):
+            token = getattr(self, name, None)
+            if token is None:
+                continue
+            try:
+                self.root.after_cancel(token)
+            except Exception:
+                pass
+            setattr(self, name, None)
+        poller = getattr(self, "_reply_poller", None)
+        if poller is not None:
+            try:
+                poller.stop()
+            except Exception:
+                pass
+        watch = getattr(self, "_reply_watch", None)
+        if watch is not None:
+            try:
+                watch.note_reply("shutdown")
+            except Exception:
+                pass
+
     def _shutdown_link(self) -> None:
         """User shutdown. The only LeaveMonitor the live host asks for."""
+        self._cancel_reply_poll()
         host = getattr(self, "_link_host", None)
         if host is None:
             return
@@ -3926,7 +3959,11 @@ class BacktestApp:
             watch.rearm_silent()
 
     def _poller_silent_due(self) -> None:
-        """60s timer. The poller alerts once per episode without READY."""
+        """60s timer. Alerts once per episode with no reply event.
+
+        A poll of IsConnectedByID==1 does not cancel this. Only
+        OnConnect, OnComplete, or OnNewData does.
+        """
         poller = getattr(self, "_reply_poller", None)
         if poller is None:
             _log_reply_error(
@@ -3935,6 +3972,18 @@ class BacktestApp:
                 "[CONN] REPLY CHANNEL SILENT — no reply READY within 60s")
             return
         poller.consider_silent(_taipei_now(), force=True)
+
+    def _note_real_order_sent(self) -> None:
+        """Start a silent episode from this real order. Never raises."""
+        poller = getattr(self, "_reply_poller", None)
+        if poller is None:
+            return
+        try:
+            poller.note_order_sent(_taipei_now())
+        except Exception as exc:
+            _log_reply_error(
+                "[CONN] reply order episode failed: "
+                f"[{type(exc).__name__}] {exc}")
 
     def _read_reply_link(self) -> int:
         user_id = self.login_user_var.get().strip()
@@ -3974,9 +4023,15 @@ class BacktestApp:
 
     def _on_reply_poll(self) -> None:
         self._reply_poll_token = None
+        poller = getattr(self, "_reply_poller", None)
+        if poller is not None and poller.stopped:
+            return
         try:
             self._poll_reply_link("60s")
         finally:
+            poller = getattr(self, "_reply_poller", None)
+            if poller is not None and poller.stopped:
+                return
             try:
                 self._schedule_reply_poll()
             except Exception:
@@ -3992,10 +4047,6 @@ class BacktestApp:
             poller.poll(_taipei_now())
             self._apply_link_gate()
             self._schedule_reply_backoff()
-            if poller.ready:
-                watch = getattr(self, "_reply_watch", None)
-                if watch is not None:
-                    watch.note_reply("IsConnectedByID")
         except Exception as exc:
             _log_reply_error(
                 "[CONN] reply poll failed: "
@@ -10360,6 +10411,7 @@ class BacktestApp:
             if code == 0:
                 self._live_log_msg(f"實單已送出 Order sent: {message}", action_type)
                 _log(f"REAL ORDER OK: {message}")
+                self._note_real_order_sent()
                 self._last_real_order_side = buy_sell  # track for close button
                 # Track the seq no so OnNewData deal rows can be matched
                 # back to this order (issue #92). Bar-index snapshot taken
@@ -11440,7 +11492,7 @@ def _bind_event_sink(kind: str, com_obj, handler, get_events):
     sink = get_events(com_obj, handler)
     try:
         _log(format_event_sink(
-            kind, sink, handler, sys.modules[__name__], os.getpid()))
+            kind, sink, handler, sys.modules[__name__], source=com_obj))
     except Exception as exc:
         _log(f"[CONN] event-sink {kind} log failed: [{type(exc).__name__}] {exc}")
     return sink

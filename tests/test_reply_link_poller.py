@@ -19,9 +19,10 @@ from src.live.link_state_machine import (
     LinkStateMachine,
 )
 from src.live.reply_link_poller import (
+    REPLY_CONNECT_ATTEMPT_CAP,
     SILENT_ALERT,
+    STILL_DOWN_ALERT,
     ReplyLinkPoller,
-    apply_quote_stuck_recovery,
     backoff_delay_s,
     format_event_sink,
 )
@@ -229,15 +230,14 @@ def test_quote_stuck_recovery_does_not_connect_or_lift_reply_pause():
     poller.observe(0, down_at)
     assert machine.orders_paused is True
     assert host.entries_allowed() is False
-    # Quote-stuck recovery leaves the reply pause in place and connects nothing.
-    apply_quote_stuck_recovery(machine)
+    # The machine's stuck tick must not ConnectByID or lift the pause.
+    # #203 resubscribes quotes and must not do either of those either.
     machine.tick(down_at + timedelta(seconds=1))
     assert machine.orders_paused is True
     assert _connects(port) == 0
     poller.observe(0, down_at + timedelta(seconds=5))
     assert _connects(port) == 1
     machine.tick(down_at + timedelta(seconds=6))
-    apply_quote_stuck_recovery(machine)
     assert _connects(port) == 1
     assert machine.orders_paused is True
     assert "logout" not in port.calls
@@ -248,23 +248,52 @@ def test_quote_stuck_recovery_does_not_connect_or_lift_reply_pause():
     assert _connects(port) == 1
 
 
-def test_event_sink_line_names_identity_iid_module_and_pid():
+def test_event_sink_line_names_identity_iid_module_and_pid(monkeypatch):
+    import os
+    import sys
+    import types
+
     import run_backtest as rb
 
-    class _Sink:
-        _iid = "IID-REPLY"
+    for name in ("comtypes", "comtypes.client", "comtypes.client._events"):
+        module = sys.modules.get(name)
+        if module is None:
+            module = types.ModuleType(name)
+            module.__path__ = []
+            sys.modules[name] = module
+    sys.modules["comtypes"].client = sys.modules["comtypes.client"]
+    sys.modules["comtypes.client"]._events = sys.modules["comtypes.client._events"]
+    events = sys.modules["comtypes.client._events"]
+
+    class _Iface:
+        _iid_ = "{11111111-2222-3333-4444-555555555555}"
+
+    monkeypatch.setattr(
+        events, "FindOutgoingInterface", lambda source: _Iface(), raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", "C:/bundle", raising=False)
 
     handler = object()
-    line = format_event_sink("reply", _Sink(), handler, rb, 4242)
+    source = object()
+    line = format_event_sink("reply", object(), handler, rb, source=source)
     assert "event-sink reply" in line
-    assert "iid=IID-REPLY" in line
+    assert "iid={11111111-2222-3333-4444-555555555555}" in line
     assert "sink_id=" in line
     assert f"handler_id={id(handler)}" in line
     assert f"module={rb.__name__}" in line
     assert f"module_id={id(rb)}" in line
-    assert "main_id=" in line
-    assert f"run_backtest_id={id(rb)}" in line
-    assert "pid=4242" in line
+    assert f"file={rb.__file__}" in line
+    assert "frozen=1" in line
+    assert "meipass=C:/bundle" in line
+    assert "modules=" in line
+    assert "run_backtest" in line.split("modules=", 1)[1].split(" pid=", 1)[0]
+    assert f"pid={os.getpid()}" in line
+    assert f"ppid={os.getppid()}" in line
+    assert "start=" in line
+    assert "comtypes=" in line
+    assert "gen_dir=" in line
+    assert "LOGIN" not in line
+    assert "account" not in line.lower()
 
 
 def test_startup_lines_land_in_the_debug_log(tmp_path):
@@ -293,3 +322,200 @@ def test_startup_lines_land_in_the_debug_log(tmp_path):
         "link machine adopted",
     ):
         assert needle in text
+
+
+def test_ready_but_silent_sink_alerts_once_without_pausing():
+    """Steven's case: IsConnectedByID==1 and no reply event.
+
+    Exactly one SILENT alert. The poll must not set orders_paused or
+    the entry gate.
+    """
+    alerts: list[str] = []
+    port, machine, host, poller = _build(alerts)
+    guard = TradingGuard()
+    guard.on_entry_sent()
+    port.reply_state = 1
+    poller.note_login(T0)
+    poller.poll(T0 + timedelta(seconds=30))
+    assert poller.consider_silent(T0 + timedelta(seconds=61), force=True) is True
+    assert poller.consider_silent(T0 + timedelta(seconds=62), force=True) is False
+    assert alerts == [SILENT_ALERT]
+    assert machine.orders_paused is False
+    _gate(host, guard)
+    assert guard.link_entries_blocked is False
+    assert guard.decide("auto", "ENTRY_FILL", "LONG")[0] == guard.SEND_ENTRY
+    assert _connects(port) == 0
+
+
+def test_on_new_data_and_order_sent_are_reply_episodes():
+    alerts: list[str] = []
+    _port, machine, _host, poller = _build(alerts)
+    poller.observe(1, T0)
+    poller.note_reply_event("OnNewData")
+    assert poller.consider_silent(T0 + timedelta(seconds=61), force=True) is False
+    sent = T0 + timedelta(minutes=5)
+    poller.note_order_sent(sent)
+    assert machine.orders_paused is False
+    assert poller.consider_silent(sent + timedelta(seconds=61), force=True) is True
+    assert poller.consider_silent(sent + timedelta(seconds=62), force=True) is False
+    assert alerts == [SILENT_ALERT]
+
+
+def test_after_shutdown_no_connect_spam():
+    """Reed's probe: machine is gone, 20 polls of 0, zero ConnectByID."""
+    connects: list[str] = []
+    poller = ReplyLinkPoller(
+        lambda: None,
+        read=lambda: 0,
+        connect=lambda user: connects.append(user),
+        notify=lambda _msg: None,
+        log_error=lambda _msg: None,
+        log_info=lambda _msg: None,
+        reschedule_silent=lambda: None,
+    )
+    start = T0
+    poller.note_login(start)
+    for i in range(20):
+        poller.poll(start + timedelta(seconds=60 * i))
+    assert connects == []
+
+
+def test_empty_user_id_skips_connect():
+    alerts: list[str] = []
+    port, machine, _host, poller = _build(alerts)
+    machine.config.user_id = ""
+    port.reply_state = 0
+    poller.observe(0, T0)
+    poller.observe(0, T0 + timedelta(seconds=5))
+    assert _connects(port) == 0
+    assert machine.orders_paused is True
+
+
+def test_connect_attempt_ceiling_stops_and_alerts_once():
+    alerts: list[str] = []
+    port, _machine, _host, poller = _build(alerts)
+    port.reply_state = 0
+    poller.observe(0, T0)
+    due = poller._next_connect_at
+    for _ in range(REPLY_CONNECT_ATTEMPT_CAP + 2):
+        if due is None:
+            break
+        poller.observe(0, due)
+        due = poller._next_connect_at
+    assert _connects(port) == REPLY_CONNECT_ATTEMPT_CAP
+    assert alerts.count(STILL_DOWN_ALERT) == 1
+    assert STILL_DOWN_ALERT != SILENT_ALERT
+    poller.observe(0, T0 + timedelta(hours=3))
+    assert _connects(port) == REPLY_CONNECT_ATTEMPT_CAP
+
+
+def test_non_binary_poll_does_not_pause_or_connect():
+    logs: list[str] = []
+    port, machine, _host, poller = _build([])
+    poller._log_info = logs.append
+    machine.orders_paused = False
+    machine.reply = LinkPhase.READY
+    machine.reply_reconciled = True
+    poller.observe(7, T0 + timedelta(seconds=1))
+    assert machine.orders_paused is False
+    assert machine.reply == LinkPhase.READY
+    assert _connects(port) == 0
+    assert any("ignored" in line for line in logs)
+
+
+def test_terminal_degrade_blocks_polled_ready():
+    """M8: note_polled_ready must keep a terminal degrade paused."""
+    alerts: list[str] = []
+    _port, machine, host, poller = _build(alerts)
+    machine.degraded_reason = "login_failures"
+    machine.orders_paused = True
+    before = machine.reply
+    poller.observe(1, T0)
+    assert machine.reply == before
+    assert machine.orders_paused is True
+    assert host.entries_allowed() is False
+
+
+def test_3003_triggers_reply_poll():
+    """M10: a Ready (3003) flag polls the reply link. 3002 does not."""
+    import run_backtest as rb
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    seen: list[str] = []
+
+    class _Host:
+        def note_connection(self, kind, code, now):
+            self.last = (int(kind), int(code))
+
+    app._link_host = _Host()
+    app._poll_reply_link = lambda cause: seen.append(cause)
+    app._dispatch_link_flag(("connection", 3003, 0))
+    assert seen == ["3003"]
+    app._dispatch_link_flag(("connection", 3002, 0))
+    assert seen == ["3003"]
+
+
+def test_shutdown_cancels_poll_and_backoff_tokens():
+    import run_backtest as rb
+
+    class _Root:
+        def __init__(self):
+            self.pending: dict = {}
+            self._n = 0
+
+        def after(self, _ms, fn, *args):
+            self._n += 1
+            token = f"t{self._n}"
+            self.pending[token] = (fn, args)
+            return token
+
+        def after_cancel(self, token):
+            self.pending.pop(token, None)
+
+    connects: list[str] = []
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.root = _Root()
+    app._link_host = None
+    app._reply_watch = None
+    app._reply_poller = ReplyLinkPoller(
+        lambda: None,
+        read=lambda: 0,
+        connect=lambda user: connects.append(user),
+        notify=lambda _msg: None,
+        log_error=lambda _msg: None,
+        log_info=lambda _msg: None,
+        reschedule_silent=lambda: None,
+    )
+    app._reply_poller.note_login(T0)
+    app._reply_poll_token = app.root.after(60000, app._on_reply_poll)
+    app._reply_backoff_token = app.root.after(5000, app._on_reply_backoff)
+    app._shutdown_link()
+    assert app._reply_poll_token is None
+    assert app._reply_backoff_token is None
+    assert app.root.pending == {}
+    app._on_reply_poll()
+    assert app.root.pending == {}
+    for i in range(20):
+        app._reply_poller.poll(T0 + timedelta(seconds=60 * i))
+    assert connects == []
+
+
+def test_on_new_data_is_queued_as_a_reply_event():
+    import queue
+
+    import run_backtest as rb
+
+    while True:
+        try:
+            rb._ui_queue.get_nowait()
+        except queue.Empty:
+            break
+    rb.SKReplyLibEvent().OnNewData("user", "row")
+    queued = []
+    while True:
+        try:
+            queued.append(rb._ui_queue.get_nowait())
+        except queue.Empty:
+            break
+    assert ("reply_seen", "OnNewData") in queued
+    assert ("new_data", "row") in queued
