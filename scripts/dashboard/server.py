@@ -139,6 +139,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     cache = _Cache(CACHE_TTL_S)
     lwc_path: str | None = None
     bound_hosts: set[str] = set()
+    news_paths: dict | None = None
     control_enabled = False
     control_log = ""
 
@@ -244,7 +245,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                "application/json; charset=utf-8")
                     return
                 body = self.cache.get(f"bot:{bot_id}", lambda: _json(
-                    snapshot.bot_detail(now_tpe(), bot_dir)))
+                    snapshot.bot_detail(now_tpe(), bot_dir, news_paths=self.news_paths)))
                 self._send(200, body, "application/json; charset=utf-8")
             elif url.path == "/api/bars":
                 bot_id = (query.get("id") or [""])[0]
@@ -292,6 +293,51 @@ def tailscale_ipv4() -> str | None:
     return None
 
 
+NEWS_PATH_KEYS = ("regime_vote_path", "signal_path", "rss_state_file")
+
+
+def load_news_paths(settings_path: str) -> dict | None:
+    """The three vote-related ``news.*`` paths from the bots' settings.yaml,
+    absolutised against that file's folder (the app resolves them against
+    its own install folder, which is where its settings.yaml lives).
+    Nothing else is read out of the file, and the paths never reach a
+    client. The W3 state file falls back to the scorer's own default.
+    """
+    try:
+        import yaml
+        from scripts.dashboard import fileio
+        text = fileio.read_text(settings_path)
+        data = yaml.safe_load(text) if text else None
+    except Exception:  # noqa: BLE001 — votes are optional
+        return None
+    news = (data or {}).get("news") if isinstance(data, dict) else None
+    if not isinstance(news, dict):
+        return None
+    root = os.path.dirname(os.path.abspath(settings_path))
+    out = {}
+    # Per-source vote age limits (hours) the runner applies at classify
+    # time; the app's default when the key is absent.
+    limits = news.get("nightly_vote_max_age_h", {"W2": 4.0})
+    out["vote_age_limits_h"] = {
+        str(k).upper(): float(v) for k, v in (limits.items() if isinstance(limits, dict) else [])
+        if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    for key in NEWS_PATH_KEYS:
+        value = str(news.get(key) or "")
+        if key == "rss_state_file" and not value:
+            value = "data/rss_scorer_state.json"
+        out[key] = (value if not value or os.path.isabs(value)
+                    else os.path.join(root, value))
+    return out
+
+
+def default_settings_path(base_dir: str) -> str:
+    """settings.yaml of the install that owns ``base_dir`` (<install>/data/live).
+    No fallback to another install's file: when it is missing the vote
+    section says so instead of showing some other install's bridges."""
+    install = os.path.dirname(os.path.dirname(os.path.abspath(base_dir)))
+    return os.path.join(install, "settings.yaml")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Read-only tai-robot bot dashboard")
     p.add_argument("--bind", action="append", default=[],
@@ -306,6 +352,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--control-log", default="",
                    help="audit CSV for control requests "
                         "(default: dashboard_control_log.csv next to --base-dir)")
+    p.add_argument("--settings", default="",
+                   help="settings.yaml for the vote/news paths "
+                        "(default: the install's, two levels above --base-dir)")
     p.add_argument("--bind-wait", type=float, default=0.0, metavar="SECONDS",
                    help="keep retrying an address that cannot be bound yet "
                         "(at boot the Tailscale IP appears after the task starts)")
@@ -382,6 +431,8 @@ def main(argv=None) -> int:
     DashboardHandler.control_log = args.control_log or os.path.join(
         os.path.dirname(DashboardHandler.base_dir), "dashboard_control_log.csv")
     DashboardHandler.lwc_path = lwc_js_path()
+    DashboardHandler.news_paths = load_news_paths(
+        args.settings or default_settings_path(DashboardHandler.base_dir))
     DashboardHandler.bound_hosts = {a.lower() for a in binds}
 
     def serve(addr, srv):

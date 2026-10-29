@@ -20,7 +20,7 @@ import csv
 import io
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from scripts.monitor.check_bots import (
     HEARTBEAT_FILENAME, RECENT_CRASH_DAYS, classify_heartbeat,
@@ -572,7 +572,8 @@ def regime_summary(state: dict | None, sess: dict) -> dict | None:
             "active_leg": str(sess.get("active_leg") or ""),
             "pause": _pause(state),
             "next_action": str(nxt.get("action") or ""),
-            "classified": bool(state.get("last_assessed"))}
+            "classified": bool(state.get("last_assessed")),
+            "news_suppressed": _news_blocks_leg(sess)}
 
 
 def regime_flags(now: datetime, bot_dir: str, state: dict | None) -> list[dict]:
@@ -614,6 +615,11 @@ def _history_row(row: dict) -> dict:
             "votes", "adx", "close")
     out = {k: redact_line(str(row.get(k) or "")) for k in keep}
     out["pnl"] = _to_int(row.get("pnl"))
+    try:
+        from src.regime.episodes import format_votes_cell
+        out["votes"] = redact_line(format_votes_cell(str(row.get("votes") or "")))
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -635,7 +641,139 @@ def regime_band(history: list[dict]) -> list[dict]:
     return band
 
 
-def regime_detail(now: datetime, bot_dir: str, sess: dict) -> dict | None:
+def _read_json_dict(path: str):
+    """Vote / bridge-state JSON, re-read only when the file changed.
+
+    The bridges replace these files with a bare ``os.replace`` (no
+    retry), and any open handle makes that replace fail, losing the vote
+    or state write. A stat-gated read opens a file only right after a
+    bridge wrote it, minutes before its next write.
+    """
+    return _read_if_changed(path, fileio.read_json, lambda d: isinstance(d, dict))
+
+
+def _news_blocks_leg(sess: dict) -> bool:
+    """Does the news breaker stop the ACTIVE leg right now? The runner's
+    own rule (``BreakerState.gates_leg`` with the bot's suppress scope),
+    not just "a breaker is set": under ``conflicting_leg`` a bearish
+    signal leaves a short leg trading."""
+    news = sess.get("news")
+    if not isinstance(news, dict):
+        return False
+    try:
+        from src.news.circuit_breaker import BreakerState
+        state = BreakerState.from_dict(news)
+        return bool(state.gates_leg(str(sess.get("active_leg") or "idle"),
+                                    str(sess.get("news_suppress_scope") or "both")))
+    except Exception:  # noqa: BLE001 — fall back to "set means blocked"
+        return bool(news.get("signal_suppressed") or news.get("event_suppressed"))
+
+
+def _vote_will_count(vote: dict, limits: dict, classify_at: datetime) -> tuple[bool, str]:
+    """``(counts, why_not)`` for a pending vote at the coming classification,
+    the runner's rule (``_read_regime_vote``): older than its source's
+    ``nightly_vote_max_age_h`` at classify time is dropped unless it was
+    hot-lane admitted for that session."""
+    source = str(vote.get("source") or "").split("-")[0].strip().upper()
+    limit = (limits or {}).get(source)
+    if limit is None:
+        return True, ""
+    if vote.get("admitted_at"):
+        return True, ""
+    fired = parse_tpe(str(vote.get("fired_at") or ""))
+    if fired is None:
+        return True, ""
+    age_h = (classify_at - fired).total_seconds() / 3600.0
+    if age_h > float(limit):
+        return False, f"分類時已超過 {float(limit):g} 小時（{age_h:.1f} 小時），將不計入"
+    return True, ""
+
+
+# The desktop tab's labels are bilingual; the page is zh-TW only.
+_VOTE_LABELS = {"W2": "W2 跨市場", "W3": "W3 RSS 新聞", "W4": "W4 籌碼"}
+
+
+def _zh_consumed(line: str) -> str:
+    """vote_status.consumed_votes_line without its English glosses."""
+    return (line.replace("無投票 none", "無投票")
+                .replace(" — 加速確認 accelerated confirm", "（加速確認）"))
+
+
+def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
+                news_paths: dict | None) -> dict | None:
+    """External regime votes and the news breaker, as the GUI regime tab
+    shows them (``src.news.vote_status``), read without blocking the bot.
+
+    *news_paths* = ``{"regime_vote_path", "signal_path", "rss_state_file"}``
+    from the bot's settings.yaml; None when the dashboard has no settings.
+    Paths never leave the server.
+    """
+    try:
+        from src.news.vote_status import collect_vote_status, consumed_votes_line
+        from src.regime.switch_logic import upcoming_night_session
+    except Exception:  # noqa: BLE001 — votes are advisory
+        return None
+    paths = news_paths or {}
+    sources = []
+    tonight = ""
+    # The runner reads votes only with a news config (``--news``); for any
+    # other regime bot a pending vote is never used.
+    consumes = bool(sess.get("news_enabled"))
+    if consumes and (paths.get("regime_vote_path") or paths.get("signal_path")):
+        from src.news.vote_status import read_pending_votes
+        upcoming = upcoming_night_session(now)
+        tonight = upcoming.key if upcoming else ""
+        classify_at = (upcoming.close_dt - timedelta(minutes=2)) if upcoming else now
+        raw_votes = read_pending_votes(paths.get("regime_vote_path", ""), tonight,
+                                       _read_json_dict)
+        report = collect_vote_status(paths.get("regime_vote_path", ""),
+                                     paths.get("signal_path", ""),
+                                     paths.get("rss_state_file", ""),
+                                     tonight, now, read_json=_read_json_dict)
+        for st in report.sources:
+            counts, why_not = (True, "")
+            if st.vote:
+                counts, why_not = _vote_will_count(raw_votes.get(st.source) or {},
+                                                   paths.get("vote_age_limits_h") or {},
+                                                   classify_at)
+            sources.append({"source": st.source, "will_count": counts, "why_not": why_not,
+                            "label": _VOTE_LABELS.get(st.source, redact_line(st.label)),
+                            "vote": st.vote, "vote_expired": st.vote_expired,
+                            "vote_target": st.vote_target, "known": st.known,
+                            "stale": st.stale, "last_check": st.last_check[:16].replace("T", " "),
+                            "context": redact_line(st.context)})
+    feats = state.get("last_features") if isinstance(state.get("last_features"), dict) else {}
+    news = sess.get("news") if isinstance(sess.get("news"), dict) else {}
+    try:
+        from scripts.monitor.check_bots import count_decisions
+        suppressed_24h = count_decisions(now, bot_dir, "NEWS_SUPPRESSED")
+    except Exception:  # noqa: BLE001
+        suppressed_24h = None
+    return {
+        "configured": bool(sources),
+        "consumes_votes": consumes,
+        "tonight": tonight,
+        "sources": sources,
+        "consumed": redact_line(_zh_consumed(consumed_votes_line(feats))),
+        "consumed_rule": redact_line(str(feats.get("_vote_rule") or "")),
+        "last_assessed": str(state.get("last_assessed") or ""),
+        "news_enabled": bool(sess.get("news_enabled")),
+        "breaker": {
+            "blocks_active_leg": _news_blocks_leg(sess),
+            "signal_suppressed": bool(news.get("signal_suppressed")),
+            "event_suppressed": bool(news.get("event_suppressed")),
+            "reason": redact_line(str(news.get("suppressed_reason") or "")),
+            "event_name": redact_line(str(news.get("event_name") or "")),
+            "direction": str(news.get("signal_direction") or ""),
+            "severity": str(news.get("signal_severity") or ""),
+            "since": str(news.get("signal_suppressed_at") or "")[:16].replace("T", " "),
+            "suppressed_bars_24h": suppressed_24h,
+        },
+    }
+
+
+def regime_detail(now: datetime, bot_dir: str, sess: dict,
+                  news_paths: dict | None = None) -> dict | None:
     if not _is_regime_bot(sess):
         return None
     raw_state = read_regime_state(bot_dir)
@@ -667,10 +805,12 @@ def regime_detail(now: datetime, bot_dir: str, sess: dict) -> dict | None:
         "flags": regime_flags(now, bot_dir, raw_state),
         "history": [_history_row(r) for r in reversed(history)],
         "band": regime_band(history),
+        "vote_status": vote_detail(now, bot_dir, sess, state, news_paths),
     }
 
 
-def bot_detail(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
+def bot_detail(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
+               news_paths: dict | None = None) -> dict:
     """Everything for the bot page except candles (``bars_window``)."""
     summary = bot_summary(now, bot_dir, pid_alive_fn=pid_alive_fn)
     sess = read_session(bot_dir)
@@ -687,4 +827,4 @@ def bot_detail(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
             "decisions": list(reversed(read_decisions(bot_dir, MAX_DECISIONS))),
             "log_file": os.path.basename(log_path) if log_path else "",
             "log": log_lines,
-            "regime": regime_detail(now, bot_dir, sess)}
+            "regime": regime_detail(now, bot_dir, sess, news_paths)}
