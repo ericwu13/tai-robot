@@ -15,6 +15,29 @@ C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bo
 tai-monitor pins from the regime-health skill. Optional arg: a different
 `data/live` base directory.)
 
+## Bots on another PC
+
+A bot listed under a host's `monitor.bots` in the gitignored tailscale
+hosts file runs THERE (since 2026-10-24: `TMF00_08-04-rss-機器人` on
+`steven`). The directory of the same name in this tree's `data/live` is
+a stale copy left by the move — the daily review ignores it, and so must
+you. Check the real one:
+
+```bash
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/remote.py --check bots
+```
+
+One ssh call copies `.lock`, `heartbeat.json`, `session.json`, the
+regime/decision files and the newest two debug-log tails into
+`data/monitor/remote/<host>/live/<bot>/` (remote mtimes kept) and probes
+the lock PID with `Get-Process` on that host — same rules as below. Two
+differences: a configured remote bot with **no `.lock` is P2** (it was
+put there to run; locally "no lock" is P3 because `data/live` is mostly
+retired bots), and a missing bot directory is P2. Host unreachable = P1
+"UNVERIFIED". To restart it, use the `deploy` skill on that host over
+`tailscale-ssh` (that host also has a `\TaiRobot\Launch-08-04-rss`
+scheduled task — `remote.py --check tasks` shows its last run).
+
 ## What it reads
 
 | Artefact | Fact it establishes |

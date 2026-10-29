@@ -362,7 +362,7 @@ def _check_decisions(now, bot_dir, name, lines, findings):
             os.path.join(bot_dir, "decisions.csv")))
 
 
-def check_regime(now: datetime, base_dir: str):
+def check_regime(now: datetime, base_dir: str, exclude=()):
     """``(findings, report_lines)`` for every regime-switching bot."""
     findings = []
     lines = []
@@ -382,7 +382,7 @@ def check_regime(now: datetime, base_dir: str):
             f"({calendar_detail}) — missed-night P1 suppressed")
     lines.append("")
 
-    dirs = [d for d in discover_bot_dirs(base_dir)
+    dirs = [d for d in discover_bot_dirs(base_dir, exclude)
             if os.path.isfile(os.path.join(d, "regime_state.json"))]
     if not dirs:
         lines.append(f"no regime bots under {base_dir}")

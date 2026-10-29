@@ -393,8 +393,13 @@ def _build_info(repo_root: str, lines, findings) -> None:
             path))
 
 
-def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
-    """``(findings, report_lines)`` for every deployed bot directory."""
+def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive,
+               exclude=(), build_info: bool = True):
+    """``(findings, report_lines)`` for every deployed bot directory.
+
+    ``build_info=False`` for a remote mirror — this tree's packaged EXE
+    says nothing about another host's build.
+    """
     findings = []
     lines = []
 
@@ -403,7 +408,7 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
     lines.append(f"session: {session.key if session else 'CLOSED (gap/weekend/holiday)'}")
     lines.append("")
 
-    bot_dirs = discover_bot_dirs(base_dir)
+    bot_dirs = discover_bot_dirs(base_dir, exclude)
     if not bot_dirs:
         lines.append(f"no bot directories under {base_dir}")
         return findings, lines
@@ -585,7 +590,8 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
         _check_order_timeouts(now, bot_dir, name, lines, findings)
 
     lines.append("")
-    _build_info(_REPO, lines, findings)
+    if build_info:
+        _build_info(_REPO, lines, findings)
     return findings, lines
 
 
