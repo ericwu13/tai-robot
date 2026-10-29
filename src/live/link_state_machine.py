@@ -189,6 +189,10 @@ class LinkStateMachine:
 
     degraded: bool = False
     degraded_reason: str = ""
+    # Last degraded-probe ``IsConnected`` value. The host's one-shot
+    # quote resubscribe reads this. The probe still never calls
+    # EnterMonitor, LeaveMonitor, ConnectByID, or Login.
+    last_quote_is_connected: int | None = None
     entries_blocked: bool = False
     orders_paused: bool = True
     reply_reconciled: bool = False
@@ -356,6 +360,35 @@ class LinkStateMachine:
         if self._down_without_reply_event_since is not None:
             self._down_without_reply_event_since = now
         self._arm_reply_stuck_after_manual(now)
+
+    def clear_stuck_after_ticks(self) -> str | None:
+        """Live ticks after the one recovery attempt. Clears stuck DEGRADED.
+
+        Does not call the broker: no LeaveMonitor, EnterMonitor, Login,
+        logout, or ConnectByID. Other degrade reasons stay. A quote that
+        was abandoned while ``IsConnected`` was still 1 or 2 is marked
+        READY so the next tick does not start another stuck window.
+        Entries open only when the reply is already reconciled.
+        """
+        if not self.degraded or self.degraded_reason != "stuck":
+            return None
+        self.degraded = False
+        self.degraded_reason = ""
+        self._quote_stuck_since = None
+        if self.quote != LinkPhase.READY:
+            self.quote = LinkPhase.READY
+            self._pending_3003 = False
+            self._quote_connect_started_at = None
+        if (
+            self.quote == LinkPhase.READY
+            and self.reply == LinkPhase.READY
+            and self.reply_reconciled
+        ):
+            self.entries_blocked = False
+            self.orders_paused = False
+        alert = "RECOVERED: ticks resumed after quote resubscribe"
+        self.alerts.append(alert)
+        return alert
 
     def snapshot(self) -> dict:
         """State a later heartbeat can publish. This method writes nothing."""
@@ -811,6 +844,9 @@ class LinkStateMachine:
             return
         self.degraded = True
         self.degraded_reason = reason
+        # The previous episode's probe must not authorise a recovery
+        # before this episode has read IsConnected for itself.
+        self.last_quote_is_connected = None
         self.entries_blocked = True
         self.orders_paused = True
         self._login_permitted = False
@@ -1141,5 +1177,5 @@ class LinkStateMachine:
         elapsed = (now - self._last_probe_at).total_seconds()
         if elapsed < self.config.probe_interval_s:
             return
-        self.port.is_connected()
+        self.last_quote_is_connected = self.port.is_connected()
         self._last_probe_at = now
