@@ -25,17 +25,21 @@ import csv
 import json
 import os
 import re
+import uuid
 import subprocess
 import sys
 import threading
 from datetime import datetime
 
 from scripts.dashboard import snapshot
-from scripts.dashboard.snapshot import mode_override_path, pending
+from scripts.dashboard.snapshot import mode_override_path, mode_request_path, pending
 from scripts.monitor.common import TZ_TPE
 from src.live.headless import request_stop
 
-ACTIONS = ("stop", "paper")
+ACTIONS = ("stop", "paper", "auto")
+# Bounds for the real-money daily loss limit an auto switch sets (NT$).
+LOSS_LIMIT_MIN, LOSS_LIMIT_MAX = 1, 10_000_000
+REAL_ACK = "實單"
 # Lock held by a live process whose main loop is pumping. A HUNG loop never
 # reads STOP; accepting it would stop (and close) whenever the loop
 # recovers, possibly hours later, so it is refused.
@@ -90,7 +94,7 @@ def position_key(summary: dict) -> str:
 
 
 def check(action: str, summary: dict, bot_dir: str, confirm: str,
-          position_ack: str = "") -> None:
+          position_ack: str = "", loss_limit=None, real_ack: str = "") -> None:
     """Raise ControlRefused unless ``action`` may be applied right now."""
     if action not in ACTIONS:
         raise ControlRefused("不支援的操作")
@@ -101,6 +105,10 @@ def check(action: str, summary: dict, bot_dir: str, confirm: str,
     now_pending = pending(bot_dir)
     if now_pending["stop"]:
         raise ControlRefused("已送出停止指令，等待機器人停止中")
+    result = now_pending.get("result") or {}
+    if action in ("paper", "auto") and (now_pending.get("request")
+                                         or result.get("status") == "checking"):
+        raise ControlRefused("已有模式切換請求處理中，請等待結果")
     if action == "stop":
         if confirm != summary.get("bot_name"):
             raise ControlRefused("請輸入機器人名稱以確認停止")
@@ -113,6 +121,21 @@ def check(action: str, summary: dict, bot_dir: str, confirm: str,
             raise ControlRefused("無法確認機器人的執行方式，未送出停止指令")
         if not headless:
             raise ControlRefused("這是 GUI 部署的機器人，不會讀取停止檔；請在機器人視窗中停止")
+        return
+    if action == "auto":
+        # The bot re-checks everything (real account, fill pending, replay)
+        # before it switches; these are the cheap refusals up front.
+        if not summary.get("supports_mode_request"):
+            raise ControlRefused("此機器人的版本不支援即時切換實單，請先更新機器人")
+        if confirm != summary.get("bot_name") or real_ack != REAL_ACK:
+            raise ControlRefused("請輸入機器人名稱與「實單」以確認")
+        if (not isinstance(loss_limit, int) or isinstance(loss_limit, bool)
+                or not LOSS_LIMIT_MIN <= loss_limit <= LOSS_LIMIT_MAX):
+            raise ControlRefused("請輸入有效的每日虧損上限（新台幣）")
+        if summary.get("trading_mode") == "auto":
+            raise ControlRefused("已經是實單模式")
+        if summary.get("position"):
+            raise ControlRefused("目前有模擬持倉，請等部位平倉後再切換")
         return
     # paper
     if confirm != "paper":
@@ -141,12 +164,33 @@ def _atomic_write_json(path: str, payload: dict) -> None:
         raise
 
 
-def apply(action: str, bot_dir: str, client: str) -> str:
-    """Write the control file. Returns the message shown to the user."""
+def _mode_request(mode: str, client: str, loss_limit=None) -> dict:
+    req = {"request_id": uuid.uuid4().hex, "mode": mode, "requested_by": client,
+           "requested_at": datetime.now(TZ_TPE).isoformat(timespec="seconds")}
+    if loss_limit is not None:
+        req["loss_limit"] = int(loss_limit)
+    return req
+
+
+def apply(action: str, bot_dir: str, client: str, *, live_channel: bool = False,
+          loss_limit=None) -> str:
+    """Write the control file. Returns the message shown to the user.
+
+    ``auto`` goes only through the live mode-request channel, where the
+    bot checks the real account before switching. ``paper`` uses that
+    channel when the bot has it (applies within seconds), else the legacy
+    mode_override.json (applied at the next strategy bar).
+    """
     if action == "stop":
         request_stop(bot_dir, reason=f"dashboard stop from {client}")
         return "已送出停止指令；機器人會在數秒內停止（之後需重新部署才會再啟動）"
-    if action == "paper":   # the only mode this module ever writes
+    if action == "auto" and live_channel:
+        _atomic_write_json(mode_request_path(bot_dir), _mode_request("auto", client, loss_limit))
+        return "已送出切換實單請求；機器人正在檢查帳戶持倉，結果會顯示在頁面上"
+    if action == "paper" and live_channel:
+        _atomic_write_json(mode_request_path(bot_dir), _mode_request("paper", client))
+        return "已送出切換模擬指令；數秒內套用"
+    if action == "paper":
         _atomic_write_json(mode_override_path(bot_dir), {"trading_mode": "paper"})
         return "已送出切換模擬指令；會在下一根策略 K 棒時套用"
     raise ControlRefused("不支援的操作")
@@ -179,7 +223,7 @@ def log_request(log_path: str, *, client: str, bot_id: str, action: str,
 
 def handle(now, base_dir: str, bot_id: str, action: str, confirm: str,
            client: str, log_path: str, *, position_ack: str = "",
-           pid_alive_fn=None) -> tuple[bool, str]:
+           loss_limit=None, real_ack: str = "", pid_alive_fn=None) -> tuple[bool, str]:
     """Validate, apply and log one control request. ``(ok, message)``."""
     bot_dir = snapshot.find_bot_dir(base_dir, bot_id)
     if not bot_dir:
@@ -189,8 +233,10 @@ def handle(now, base_dir: str, bot_id: str, action: str, confirm: str,
     kw = {"pid_alive_fn": pid_alive_fn} if pid_alive_fn else {}
     summary = snapshot.bot_summary(now, bot_dir, **kw)
     try:
-        check(action, summary, bot_dir, confirm, position_ack)
-        message = apply(action, bot_dir, client)
+        check(action, summary, bot_dir, confirm, position_ack, loss_limit, real_ack)
+        message = apply(action, bot_dir, client,
+                        live_channel=bool(summary.get("supports_mode_request")),
+                        loss_limit=loss_limit)
     except ControlRefused as exc:
         log_request(log_path, client=client, bot_id=bot_id, action=action,
                     result="refused", detail=str(exc))

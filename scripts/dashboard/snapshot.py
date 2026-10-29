@@ -318,6 +318,7 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     info["regime"] = (regime_summary(read_regime_state(bot_dir), sess)
                       if _is_regime_bot(sess) else None)
     info["pending"] = pending(bot_dir)
+    info["supports_mode_request"] = supports_mode_request(bot_dir, info.get("pid"))
     running = info["state"] in ("RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT",
                                 "CRASHED", "UNKNOWN")
     info["active"] = running or (
@@ -333,13 +334,55 @@ def mode_override_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, MODE_OVERRIDE_FILENAME)
 
 
+# Live mode-switch channel (headless bots that advertise it): the
+# dashboard writes mode_request.json, the bot answers in
+# mode_request_result.json, and capabilities.json says the running process
+# polls the channel (its pid must be the lock's pid, so a file left by an
+# older build never enables the controls).
+MODE_REQUEST_FILENAME = "mode_request.json"
+MODE_RESULT_FILENAME = "mode_request_result.json"
+CAPABILITIES_FILENAME = "capabilities.json"
+
+
+def mode_request_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, MODE_REQUEST_FILENAME)
+
+
+def supports_mode_request(bot_dir: str, lock_pid) -> bool:
+    caps = fileio.read_json(os.path.join(bot_dir, CAPABILITIES_FILENAME))
+    if not isinstance(caps, dict) or caps.get("mode_request") != 1:
+        return False
+    try:
+        return lock_pid is not None and int(caps.get("pid")) == int(lock_pid)
+    except (TypeError, ValueError):
+        return False
+
+
+def _mode_result(bot_dir: str) -> dict | None:
+    data = fileio.read_json(os.path.join(bot_dir, MODE_RESULT_FILENAME))
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "")
+    if status not in ("checking", "accepted", "refused"):
+        return None
+    return {"request_id": redact_line(str(data.get("request_id") or ""))[:64],
+            "mode": str(data.get("mode") or ""), "status": status,
+            "reason": redact_line(str(data.get("reason") or ""))[:300],
+            "at": str(data.get("at") or "")[:19].replace("T", " ")}
+
+
 def pending(bot_dir: str) -> dict:
     """Control files written but not yet consumed by the bot: the headless
-    STOP file, and a queued mode_override.json (applied at the next bar)."""
+    STOP file, a queued mode_override.json (applied at the next bar), a
+    queued live mode request, and the bot's latest answer to one."""
     data = fileio.read_json(mode_override_path(bot_dir))
     mode = data.get("trading_mode") if isinstance(data, dict) else None
+    req = fileio.read_json(mode_request_path(bot_dir))
+    req_mode = req.get("mode") if isinstance(req, dict) else None
     return {"stop": stop_requested(bot_dir),
-            "mode": mode if isinstance(mode, str) else None}
+            "mode": mode if isinstance(mode, str) else None,
+            "request": req_mode if isinstance(req_mode, str) else None,
+            "result": _mode_result(bot_dir)}
 
 
 def _broken_bot(bot_dir: str, exc: Exception) -> dict:
@@ -354,7 +397,8 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
             "last_price": None, "last_bar_dt": "", "saved_at": "", "real": None,
             "last_decision": None, "regime": None,
-            "pending": {"stop": False, "mode": None}, "active": True}
+            "pending": {"stop": False, "mode": None, "request": None, "result": None},
+            "supports_mode_request": False, "active": True}
 
 
 def market_state(now: datetime) -> dict:

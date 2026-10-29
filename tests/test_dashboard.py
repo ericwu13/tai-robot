@@ -893,7 +893,7 @@ def test_stop_writes_the_headless_stop_file(control_server):
     assert stop_requested(str(base / "TMF00_alpha"))          # what headless_app polls
     fleet = json.loads(_get(url + "/api/fleet")[2])
     alpha = next(b for b in fleet["bots"] if b["id"] == "TMF00_alpha")
-    assert alpha["pending"] == {"stop": True, "mode": None}
+    assert alpha["pending"] == {"stop": True, "mode": None, "request": None, "result": None}
     assert fleet["control_enabled"] is True
     rows = _log_rows(log)
     assert [(r["bot"], r["action"], r["result"]) for r in rows] == [("TMF00_alpha", "stop", "accepted")]
@@ -937,6 +937,7 @@ def test_nothing_can_switch_a_bot_up_to_real_orders(control_server, action):
             status, body = _post(url, {"id": bot, "action": action, "confirm": confirm})
             assert status == 409 and body["ok"] is False
             assert not (base / bot / "mode_override.json").exists()
+            assert not (base / bot / "mode_request.json").exists()
             assert not (base / bot / "STOP").exists()
 
 

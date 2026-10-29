@@ -198,6 +198,7 @@ pre.log .P3 { color: var(--muted); }
       <span id="d-pending"></span>
       <span class="controls" id="d-controls" hidden>
         <button class="primary" id="btn-paper">改為模擬</button>
+        <button class="danger" id="btn-auto">改為實單</button>
         <button class="danger" id="btn-stop">停止機器人</button>
       </span>
     </div>
@@ -355,6 +356,18 @@ function priceCell(sim, real) {
   if (!real || real === sim) return fmtInt(sim);
   return el("span", null, fmtInt(sim), el("div", { class: "sub" }, "實際 " + fmtInt(real)));
 }
+function requestChip(p) {
+  if (!p) return null;
+  if (p.request) return el("span", { class: "pend" }, "切換" + (MODE[p.request] || p.request) + "：已送出，等待機器人");
+  const r = p.result;
+  if (!r || !r.at) return null;
+  const age = (Date.now() - Date.parse(r.at.replace(" ", "T") + "+08:00")) / 1000;
+  if (r.status !== "checking" && !(age >= 0 && age < 900)) return null;
+  const target = MODE[r.mode] || r.mode;
+  if (r.status === "checking") return el("span", { class: "pend" }, `切換${target}：檢查帳戶持倉中…`);
+  if (r.status === "accepted") return el("span", { class: "chip s-ok" }, `已切換為${target}`);
+  return el("span", { class: "pend", title: r.reason }, `切換${target}被拒：${r.reason}`);
+}
 function pendingChip(p) {
   if (!p) return null;
   if (p.stop) return el("span", { class: "pend" }, "停止中…");
@@ -484,10 +497,28 @@ const App = {
       check = () => input.value.trim() === b.bot_name;
       input.addEventListener("input", () => { $("dlg-ok").disabled = !check(); });
       $("dlg-ok").textContent = "停止"; $("dlg-ok").className = "danger";
+    } else if (action === "auto") {
+      $("dlg-title").textContent = `將 ${b.bot_name} 改為實單（全自動）？`;
+      body.push(el("p", { class: "warn" }, "改為實單後，機器人會用真實帳戶自動下單，可能造成實際虧損。"));
+      body.push(el("p", null, "機器人會先查詢帳戶持倉：帳戶已有任何未平倉部位、查詢失敗或逾時、等待成交中或重播歷史時，都會拒絕切換。結果會顯示在頁面上。"));
+      body.push(el("p", { class: "sub" }, "機器人重新啟動後會回到部署時指定的模式（模擬）。"));
+      body.push(el("p", null, "每日虧損上限（新台幣）："));
+      const limit = el("input", { id: "dlg-limit", type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "例如 10000" });
+      body.push(limit);
+      body.push(el("p", null, "請輸入機器人名稱："));
+      const name = el("input", { id: "dlg-input", autocomplete: "off", placeholder: b.bot_name });
+      body.push(name);
+      body.push(el("p", null, "並輸入「實單」："));
+      const ack = el("input", { id: "dlg-ack", autocomplete: "off", placeholder: "實單" });
+      body.push(ack);
+      check = () => name.value.trim() === b.bot_name && ack.value.trim() === "實單"
+        && /^[0-9]+$/.test(limit.value.trim()) && Number(limit.value) >= 1;
+      for (const i of [limit, name, ack]) i.addEventListener("input", () => { $("dlg-ok").disabled = !check(); });
+      $("dlg-ok").textContent = "改為實單"; $("dlg-ok").className = "danger";
     } else {
       $("dlg-title").textContent = `將 ${b.bot_name} 改為模擬？`;
-      body.push(el("p", null, "改為模擬後不再送出實單。會在下一根策略 K 棒時套用"
-        + (b.interval_s ? `（最長約 ${b.interval_s / 60} 分鐘）` : "") + "。"));
+      body.push(el("p", null, "改為模擬後不再送出實單。" + (b.supports_mode_request ? "數秒內套用。"
+        : "會在下一根策略 K 棒時套用" + (b.interval_s ? `（最長約 ${b.interval_s / 60} 分鐘）` : "") + "。")));
       body.push(el("p", null, "有持倉、等待成交或重播歷史時，機器人會拒絕切換。"));
       body.push(el("p", { class: "sub" }, "機器人重新啟動後會回到部署時指定的模式。"));
       $("dlg-ok").textContent = "改為模擬"; $("dlg-ok").className = "primary";
@@ -497,17 +528,22 @@ const App = {
     const dlg = $("dlg");
     dlg.onclose = () => {
       if (dlg.returnValue !== "ok" || !check()) return;
-      this.sendControl(botId, action, action === "stop" ? $("dlg-input").value.trim() : "paper", posAck);
+      if (action === "auto") {
+        this.sendControl(botId, action, $("dlg-input").value.trim(), posAck,
+          { loss_limit: Number($("dlg-limit").value.trim()), real_ack: $("dlg-ack").value.trim() });
+      } else {
+        this.sendControl(botId, action, action === "stop" ? $("dlg-input").value.trim() : "paper", posAck);
+      }
     };
     dlg.returnValue = "";
     dlg.showModal();
   },
 
-  async sendControl(id, action, confirm, positionAck) {
+  async sendControl(id, action, confirm, positionAck, extra) {
     try {
       const r = await fetch("/api/control", { method: "POST", cache: "no-store",
         headers: { "Content-Type": "application/json", "X-Dashboard-Control": "1" },
-        body: JSON.stringify({ id, action, confirm, position_ack: positionAck }) });
+        body: JSON.stringify({ id, action, confirm, position_ack: positionAck, ...(extra || {}) }) });
       const j = await r.json().catch(() => ({ ok: false, message: "伺服器回應無法解析" }));
       this.toast(j.message || (j.ok ? "已送出" : "操作失敗"), !j.ok);
     } catch (e) {
@@ -709,13 +745,17 @@ const App = {
     $("d-state").replaceChildren(chip(b.state));
     $("d-strategy").textContent = b.strategy + (b.interval_s ? `・${b.interval_s / 60} 分 K 策略` : "");
     $("d-mode").replaceChildren(modeBadge(b.trading_mode));
-    $("d-pending").replaceChildren(pendingChip(b.pending) || "");
+    $("d-pending").replaceChildren(pendingChip(b.pending) || "", requestChip(b.pending) || "");
     const alive = ["RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT"].includes(b.state);
     const p = b.pending || {};
     $("d-controls").hidden = !(this.fleet && this.fleet.control_enabled) || !alive;
     $("btn-stop").disabled = !!p.stop;
+    const busy = !!(p.stop || p.mode || p.request || (p.result && p.result.status === "checking"));
     $("btn-paper").hidden = b.trading_mode === "paper";
-    $("btn-paper").disabled = !!(p.stop || p.mode);
+    $("btn-paper").disabled = busy;
+    // Real money only through the bot's live channel, which checks the account.
+    $("btn-auto").hidden = b.trading_mode === "auto" || !b.supports_mode_request;
+    $("btn-auto").disabled = busy || !!b.position;
     $("d-tiles").replaceChildren(
       tile("持倉", positionText(b.position)),
       tile("最新價", b.last_price ? fmtInt(b.last_price) : "—"),
@@ -945,6 +985,7 @@ const App = {
     $("back").addEventListener("click", () => { location.hash = ""; });
     $("btn-stop").addEventListener("click", () => this.confirmControl("stop"));
     $("btn-paper").addEventListener("click", () => this.confirmControl("paper"));
+    $("btn-auto").addEventListener("click", () => this.confirmControl("auto"));
     for (const btn of $("d-iv").children) btn.addEventListener("click", () => {
       this.iv = Number(btn.dataset.iv); this.fitNext = true;
       for (const b of $("d-iv").children) b.classList.toggle("on", b === btn);

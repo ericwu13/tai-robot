@@ -140,6 +140,7 @@ from src.live.fill_report import (
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
 from src.live.deploy_request import DeployRequest
+from src.live import mode_request as _mreq
 from src.market_data.kline_config import (
     TV_INTERVALS, INTERVAL_SECONDS, SYMBOL_CONFIG, CACHE_SUFFIXES,
     LIVE_CHART_TIMEFRAMES, resolve_order_symbol, get_near_month_symbol,
@@ -9550,6 +9551,195 @@ class BacktestApp:
                 _discord.mode_switched(old_mode, new_mode)
             except Exception:
                 pass  # best-effort; a notification failure must not break the switch
+
+    # ── Dashboard mode request (headless; src/live/mode_request.py) ──
+
+    def _mode_request_tracker(self) -> "_mreq.ModeRequestTracker":
+        tracker = getattr(self, "_mode_req_tracker", None)
+        if tracker is None:
+            tracker = _mreq.ModeRequestTracker()
+            self._mode_req_tracker = tracker
+        return tracker
+
+    def _mode_switch_state(self) -> "_mreq.SwitchState":
+        runner = self._live_runner
+        guard = self._trading_guard
+        broker = getattr(runner, "broker", None) if runner is not None else None
+        return _mreq.SwitchState(
+            current_mode=self._trading_mode,
+            has_runner=runner is not None,
+            sim_position_open=int(getattr(broker, "position_size", 0) or 0) > 0,
+            fill_pending=bool(guard.fill_pending),
+            fill_poller_active=bool(self._fill_poller.active),
+            replaying=bool(runner is not None and (
+                getattr(runner, "_is_reloading", False)
+                or getattr(runner, "suppress_strategy", False))),
+            order_lib_ready=bool(
+                _com_available and skO is not None
+                and getattr(self, "_logged_in", False)),
+            has_futures_account=bool(self._futures_account),
+            guard_halted=bool(guard.halted),
+            guard_paused=bool(guard.paused),
+            link_entries_blocked=bool(getattr(guard, "link_entries_blocked", False)),
+        )
+
+    def _service_mode_request(self, bot_dir: str) -> None:
+        """Consume ``mode_request.json``; called on the headless 2 s poll.
+
+        Main thread. An auto request starts an OpenInterest query and
+        returns; later polls finish it (never blocks Tk).
+        """
+        runner = self._live_runner
+        bot_dir = getattr(runner, "bot_dir", None) or bot_dir
+        tracker = self._mode_request_tracker()
+        if tracker.pending is not None:
+            self._continue_auto_mode_request(bot_dir)
+        req, err = _mreq.consume_request(bot_dir)
+        if err is not None:
+            if tracker.seen(err.request_id):
+                return
+            tracker.mark_handled(err.request_id)
+            self._finish_mode_request(
+                bot_dir, err.request_id, err.mode, _mreq.STATUS_REFUSED, err.reason)
+            return
+        if req is None:
+            return
+        if tracker.seen(req.request_id):
+            _log(f"[MODE REQUEST] duplicate request_id={req.request_id} ignored")
+            return
+        tracker.mark_handled(req.request_id)
+        if tracker.pending is not None:
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+                "已有模式切換請求處理中，請稍後再試", req)
+            return
+        reason = _mreq.gate_reason(req, self._mode_switch_state())
+        if reason:
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED, reason, req)
+            return
+        if req.mode == "paper":
+            self._apply_requested_mode(bot_dir, req)
+            return
+        self._start_auto_mode_request(bot_dir, req)
+
+    def _start_auto_mode_request(self, bot_dir: str, req) -> None:
+        """Fresh OpenInterest query, same as the pre-deploy check (#202)."""
+        user_id = self.login_user_var.get().strip()
+        try:
+            self._account_monitor.begin_oi_query()
+            code = call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                            user_id, self._futures_account, 1)
+        except Exception as e:
+            _log(f"[MODE REQUEST] GetOpenInterestGW failed: [{type(e).__name__}] {e}")
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+                f"持倉未知（查詢失敗：{type(e).__name__}）", req)
+            return
+        _log(f"[MODE REQUEST] GetOpenInterestGW code={code} id={req.request_id}")
+        if open_interest_query_rejected(code):
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+                f"持倉未知（持倉查詢被拒 code={code}）", req)
+            return
+        self._mode_request_tracker().start(req, OI_SNAPSHOT_TIMEOUT_S)
+        self._finish_mode_request(
+            bot_dir, req.request_id, req.mode, _mreq.STATUS_CHECKING,
+            "查詢帳戶持倉中", req)
+
+    def _continue_auto_mode_request(self, bot_dir: str) -> None:
+        tracker = self._mode_request_tracker()
+        monitor = self._account_monitor
+        step = tracker.poll(monitor.oi_snapshot_received)
+        if step in (tracker.WAITING, tracker.IDLE):
+            return
+        req = tracker.finish()
+
+        def _refuse(reason: str) -> None:
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED, reason, req)
+
+        if step == tracker.TIMEOUT:
+            _refuse(f"持倉未知（逾時：{tracker.timeout_s:.0f} 秒內未收到帳戶持倉回報）")
+            return
+        if monitor.has_open_positions():
+            _refuse("帳戶已有未平倉部位，拒絕切換至全自動："
+                    + _mreq.format_positions(monitor.positions))
+            return
+        # The book was flat when the reply landed. Re-check everything else:
+        # a sim entry, a fill or a replay may have started while we waited.
+        reason = _mreq.gate_reason(req, self._mode_switch_state())
+        if reason:
+            _refuse(reason)
+            return
+        guard = self._trading_guard
+        runner = self._live_runner
+        saved = (guard.daily_loss_limit, runner.daily_loss_limit)
+        guard.arm_for_live_switch(req.loss_limit)
+        runner.daily_loss_limit = req.loss_limit
+        if not self._apply_requested_mode(bot_dir, req):
+            guard.daily_loss_limit, runner.daily_loss_limit = saved
+
+    def _apply_requested_mode(self, bot_dir: str, req) -> bool:
+        """Apply through ``LiveRunner._apply_mode_switch``; True on success."""
+        runner = self._live_runner
+        emitted: list[str] = []
+        callbacks = getattr(runner, "_callbacks", None)
+        hook = emitted.append
+        if isinstance(callbacks, dict):
+            callbacks.setdefault("on_status", []).append(hook)
+        try:
+            # The dashboard confirmed with a human; the gate on unattended
+            # auto overrides (allow_live_override) does not apply.
+            runner._apply_mode_switch(req.mode, user_confirmed=(req.mode == "auto"))
+        finally:
+            if isinstance(callbacks, dict):
+                try:
+                    callbacks.get("on_status", []).remove(hook)
+                except ValueError:
+                    pass
+        if runner.trading_mode == req.mode and self._trading_mode == req.mode:
+            if req.mode == "auto":
+                self._live_log_msg(
+                    "*** 全自動模式 AUTO MODE — 模擬成交後自動下單 "
+                    f"(每日虧損上限 {req.loss_limit:,} NTD) ***", "exit")
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_ACCEPTED,
+                f"已切換至{_mreq.mode_label(req.mode)}模式", req)
+            return True
+        why = next((m for m in emitted if str(m).startswith("[MODE]")), "")
+        self._finish_mode_request(
+            bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+            f"模式切換被拒：{why or '狀態未改變'}", req)
+        return False
+
+    def _finish_mode_request(self, bot_dir: str, request_id: str, mode: str,
+                             status: str, reason: str, req=None) -> None:
+        """Result file, audit row, live log, and a Discord notice on a refused auto."""
+        at = _taipei_now().isoformat(timespec="seconds")
+        try:
+            _mreq.write_result(
+                bot_dir, _mreq.result_payload(request_id, mode, status, reason, at))
+        except Exception as e:
+            _log(f"[MODE REQUEST] result write failed: [{type(e).__name__}] {e}")
+        if status == _mreq.STATUS_CHECKING:
+            _log(f"[MODE REQUEST] {mode} id={request_id}: {reason}")
+            return
+        by = getattr(req, "requested_by", "") if req is not None else ""
+        audit = f"{status} mode={mode or '?'} id={request_id or '?'} by={by or '?'}: {reason}"
+        try:
+            self._log_order_decision("MODE_SWITCH_REQUEST", audit)
+        except Exception as e:
+            _log(f"[MODE REQUEST] audit row failed: [{type(e).__name__}] {e}")
+        verdict = "已接受 accepted" if status == _mreq.STATUS_ACCEPTED else "已拒絕 refused"
+        self._live_log_msg(
+            f"[MODE REQUEST] 模式切換請求{verdict} → {mode or '?'}: {reason}", "status")
+        if status == _mreq.STATUS_REFUSED and mode == "auto":
+            if _discord is not None and _discord.enabled:
+                try:
+                    _discord.mode_switch_refused(mode, reason, by)
+                except Exception:
+                    pass  # best-effort
 
     def _on_live_bar(self, bar):
         """Callback when an aggregated bar is processed.
