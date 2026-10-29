@@ -30,7 +30,7 @@ from scripts.monitor.common import (
     TZ_TPE, discover_bot_dirs, pid_alive, redact,
 )
 from scripts.dashboard import fileio, real_pnl
-from src.live.headless import stop_requested
+from src.live.headless import headless_marker_path, parse_headless_marker, stop_requested
 from src.utils.log_redact import scrub_ids
 
 # A stopped bot with no file activity in this window is retired and is
@@ -318,6 +318,7 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     info["regime"] = (regime_summary(read_regime_state(bot_dir), sess)
                       if _is_regime_bot(sess) else None)
     info["pending"] = pending(bot_dir)
+    info["headless"] = headless_live(bot_dir, pid_alive_fn)
     running = info["state"] in ("RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT",
                                 "CRASHED", "UNKNOWN")
     info["active"] = running or (
@@ -331,6 +332,22 @@ MODE_OVERRIDE_FILENAME = "mode_override.json"
 
 def mode_override_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, MODE_OVERRIDE_FILENAME)
+
+
+def headless_live(bot_dir: str, pid_alive_fn=pid_alive) -> bool:
+    """True when ``headless.json`` parses and the pid it names is alive.
+
+    The headless deploy writes that marker and deletes it on the way out.
+    A GUI bot never has one. The read goes through ``fileio`` so it cannot
+    block the bot's ``os.remove`` of the marker on Windows.
+    """
+    marker = parse_headless_marker(fileio.read_json(headless_marker_path(bot_dir)))
+    if marker is None:
+        return False
+    try:
+        return bool(pid_alive_fn(marker["pid"]))
+    except Exception:  # noqa: BLE001 — an unreadable pid is not a live headless bot
+        return False
 
 
 def pending(bot_dir: str) -> dict:
@@ -354,7 +371,8 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
             "last_price": None, "last_bar_dt": "", "saved_at": "", "real": None,
             "last_decision": None, "regime": None,
-            "pending": {"stop": False, "mode": None}, "active": True}
+            "pending": {"stop": False, "mode": None}, "headless": False,
+            "active": True}
 
 
 def market_state(now: datetime) -> dict:

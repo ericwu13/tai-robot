@@ -506,6 +506,167 @@ def test_spawn_detached_runs_and_logs(tmp_path):
 
 # ── read-only lock probe ──
 
+# ── headless.json marker (dashboard controls are headless-only) ──
+
+def test_write_marker_records_pid_and_started_at(tmp_path):
+    bot = str(tmp_path / "TMF00_b")
+    assert hl.write_headless_marker(
+        bot, pid=4242, started_at="2026-10-29T21:00:00+08:00") is True
+    path = hl.headless_marker_path(bot)
+    assert json.loads(open(path, encoding="utf-8").read()) == {
+        "pid": 4242, "started_at": "2026-10-29T21:00:00+08:00"}
+    assert not os.path.exists(path + ".tmp")
+
+
+def test_write_marker_uses_this_process_when_pid_is_omitted(tmp_path):
+    bot = str(tmp_path / "TMF00_b")
+    assert hl.write_headless_marker(bot) is True
+    body = json.loads(open(hl.headless_marker_path(bot), encoding="utf-8").read())
+    assert body["pid"] == os.getpid()
+    assert isinstance(body["started_at"], str) and body["started_at"].strip()
+
+
+@pytest.mark.parametrize("data", [
+    None, [], {}, "nope",
+    {"pid": True, "started_at": "t"},
+    {"pid": 0, "started_at": "t"},
+    {"pid": -3, "started_at": "t"},
+    {"pid": 4},
+    {"pid": "4", "started_at": "t"},
+    {"pid": 4, "started_at": ""},
+    {"pid": 4, "started_at": "  "},
+    {"pid": 4, "started_at": 1},
+])
+def test_parse_headless_marker_rejects_malformed(data):
+    assert hl.parse_headless_marker(data) is None
+
+
+def test_parse_headless_marker_keeps_pid_and_started_at():
+    assert hl.parse_headless_marker(
+        {"pid": 5, "started_at": "2026-10-29T21:00:00+08:00", "extra": 1}
+    ) == {"pid": 5, "started_at": "2026-10-29T21:00:00+08:00"}
+
+
+def test_write_marker_tolerates_oserror(tmp_path, monkeypatch, capsys):
+    real_replace = os.replace
+
+    def boom(src, dst):
+        if str(dst).endswith(hl.HEADLESS_MARKER_FILENAME):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", boom)
+    bot = str(tmp_path / "b")
+    assert hl.write_headless_marker(
+        bot, pid=1, started_at="2026-10-29T21:00:00+08:00") is False
+    assert "headless marker write failed" in capsys.readouterr().err
+    assert not os.path.exists(hl.headless_marker_path(bot))
+    assert not os.path.exists(hl.headless_marker_path(bot) + ".tmp")
+
+
+def test_remove_marker_tolerates_oserror(tmp_path, monkeypatch, capsys):
+    bot = str(tmp_path / "b")
+    assert hl.write_headless_marker(bot, pid=1, started_at="2026-10-29T21:00:00+08:00")
+
+    def boom(path):
+        raise OSError("busy")
+
+    monkeypatch.setattr(os, "remove", boom)
+    hl.remove_headless_marker(bot)
+    assert "headless marker remove failed" in capsys.readouterr().err
+    assert os.path.isfile(hl.headless_marker_path(bot))
+
+
+def test_remove_missing_marker_is_quiet(tmp_path, capsys):
+    hl.remove_headless_marker(str(tmp_path / "missing"))
+    assert capsys.readouterr().err == ""
+
+
+def test_deploy_start_writes_the_marker(tmp_path, monkeypatch):
+    from src.live.headless_app import DeployDriver
+    monkeypatch.setattr(rb, "project_root", str(tmp_path))
+
+    def past_marker(*_a, **_k):
+        raise RuntimeError("past the marker")
+
+    monkeypatch.setattr("src.live.headless_app.load_session", past_marker)
+    driver = DeployDriver.__new__(DeployDriver)
+    driver.app = SimpleNamespace()
+    driver.args = SimpleNamespace(symbol="TMF00", bot="night1")
+    driver.bot_dir = ""
+    with pytest.raises(RuntimeError, match="past the marker"):
+        driver.start()
+    marker = tmp_path / "data" / "live" / "TMF00_night1" / "headless.json"
+    body = json.loads(marker.read_text(encoding="utf-8"))
+    assert body["pid"] == os.getpid()
+    assert body["started_at"]
+    assert not (marker.parent / "headless.json.tmp").exists()
+
+
+def test_start_continues_when_marker_write_fails(tmp_path, monkeypatch, capsys):
+    from src.live.headless_app import DeployDriver
+    monkeypatch.setattr(rb, "project_root", str(tmp_path))
+    live = tmp_path / "data" / "live"
+    live.parent.mkdir(parents=True)
+    live.write_text("not a directory")
+    seen = {}
+
+    def past_marker(*_a, **_k):
+        seen["called"] = True
+        raise RuntimeError("continued")
+
+    monkeypatch.setattr("src.live.headless_app.load_session", past_marker)
+    driver = DeployDriver.__new__(DeployDriver)
+    driver.app = SimpleNamespace()
+    driver.args = SimpleNamespace(symbol="TMF00", bot="night1")
+    driver.bot_dir = ""
+    with pytest.raises(RuntimeError, match="continued"):
+        driver.start()
+    assert seen.get("called") is True
+    assert "headless marker write failed" in capsys.readouterr().err
+
+
+def test_drive_removes_marker_on_clean_exit(tmp_path):
+    from src.live.headless_app import _drive_until_exit
+    bot = tmp_path / "TMF00_b"
+    looped = []
+
+    class Driver:
+        bot_dir = str(bot)
+        exit_code = 0
+
+        def start(self):
+            assert hl.write_headless_marker(
+                self.bot_dir, pid=os.getpid(), started_at="2026-10-29T21:00:00+08:00")
+            assert os.path.isfile(hl.headless_marker_path(self.bot_dir))
+
+    app = SimpleNamespace(root=SimpleNamespace(mainloop=lambda: looped.append(1)))
+    assert _drive_until_exit(Driver(), app) == 0
+    assert looped == []
+    assert not os.path.exists(hl.headless_marker_path(str(bot)))
+
+
+def test_drive_removes_marker_when_the_loop_raises(tmp_path):
+    from src.live.headless_app import _drive_until_exit
+    bot = tmp_path / "TMF00_b"
+
+    class Driver:
+        bot_dir = str(bot)
+        exit_code = None
+
+        def start(self):
+            hl.write_headless_marker(
+                self.bot_dir, pid=1, started_at="2026-10-29T21:00:00+08:00")
+
+    def boom():
+        raise RuntimeError("tk died")
+
+    app = SimpleNamespace(root=SimpleNamespace(mainloop=boom))
+    with pytest.raises(RuntimeError, match="tk died"):
+        _drive_until_exit(Driver(), app)
+    assert not os.path.exists(hl.headless_marker_path(str(bot)))
+
+
 def test_read_lock_never_deletes_stale_lock(tmp_path):
     """LiveRunner.check_lock deletes stale locks; list/status must not."""
     bot_dir = str(tmp_path / "TX00_b")

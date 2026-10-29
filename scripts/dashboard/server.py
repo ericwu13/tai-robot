@@ -15,9 +15,10 @@ Read-only by default: nothing is written to a bot directory. With
 
     POST /api/control  {"id", "action": "stop"|"paper", "confirm"}
 
-which writes the bot's own STOP / mode_override.json files (see
-``control.py``; nothing can switch a bot up to real orders) and logs
-every request to the control log.
+which writes the bot's own STOP / mode_override.json files only when a
+live ``headless.json`` marker is present (see ``control.py``; nothing can
+switch a bot up to real orders, and a GUI bot is refused with no file
+written) and logs every request to the control log.
 
 Clients outside loopback and the Tailscale ranges are refused even if a
 bind address would let them connect, and so are requests whose Host

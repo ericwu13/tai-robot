@@ -195,6 +195,79 @@ def clear_stop_file(bot_dir: str) -> None:
         pass
 
 
+# ── Headless marker ──
+# The dashboard may stop a bot or switch it to paper only when this file
+# is present and its pid is still alive. The GUI live loop does not poll
+# STOP, so a GUI bot must never look controllable. Write is atomic; both
+# write and remove log OSError and keep the bot running.
+
+HEADLESS_MARKER_FILENAME = "headless.json"
+
+
+def headless_marker_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, HEADLESS_MARKER_FILENAME)
+
+
+def parse_headless_marker(data) -> dict | None:
+    """``{"pid": int, "started_at": str}`` or None when the marker is unusable."""
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    started = data.get("started_at")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if not isinstance(started, str) or not started.strip():
+        return None
+    return {"pid": pid, "started_at": started}
+
+
+def _log_marker(op: str, path: str, exc: BaseException) -> None:
+    sys.stderr.write(
+        f"[HEADLESS] headless marker {op} failed ({path}): "
+        f"{type(exc).__name__}: {exc}\n")
+
+
+def write_headless_marker(bot_dir: str, *, pid: int | None = None,
+                          started_at: str | None = None) -> bool:
+    """Atomically write ``headless.json``. OSError is logged and never raised.
+
+    Returns True when the marker is in place. The running process's pid is
+    recorded unless ``pid`` is passed (tests).
+    """
+    path = headless_marker_path(bot_dir)
+    payload = {
+        "pid": int(os.getpid() if pid is None else pid),
+        "started_at": started_at or datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(bot_dir, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log_marker("write", path, exc)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def remove_headless_marker(bot_dir: str) -> None:
+    """Delete ``headless.json``. A missing file is quiet; other OSErrors are logged."""
+    path = headless_marker_path(bot_dir)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _log_marker("remove", path, exc)
+
+
 # ── Detached launch (deploy --detach) ──
 
 CLI_STDOUT_NAME = "cli_stdout.log"

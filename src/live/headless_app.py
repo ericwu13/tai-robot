@@ -35,7 +35,8 @@ from src.live.headless import (
     EXIT_BACKTEST_FAILED, EXIT_BOT_STOPPED, EXIT_DEPLOY_REFUSED, EXIT_LOGIN,
     EXIT_NO_COM, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE,
     HeadlessConfigError, HeadlessPolicy, build_deploy_request,
-    clear_stop_file, policy_from_args, resolve_strategy_name, stop_requested,
+    clear_stop_file, policy_from_args, remove_headless_marker,
+    resolve_strategy_name, stop_requested, write_headless_marker,
 )
 from src.live.live_runner import LiveRunner
 from src.live.session_store import load_session
@@ -194,6 +195,9 @@ class DeployDriver(_Driver):
         app, args = self.app, self.args
         base_dir = os.path.join(rb.project_root, "data", "live")
         self.bot_dir = LiveRunner.bot_dir_for(base_dir, args.symbol, args.bot)
+        # Dashboard stop/paper key off this file. A GUI deploy never writes
+        # it. OSError is logged inside the helper and must not abort deploy.
+        write_headless_marker(self.bot_dir)
         session = load_session(os.path.join(self.bot_dir, "session.json"))
         if args.resume and session is None:
             self.finish(EXIT_USAGE, f"--resume but no session.json in {self.bot_dir}")
@@ -377,11 +381,23 @@ def run_deploy(args) -> int:
     if app is None:
         return code
     driver = DeployDriver(app, args)
-    driver.start()
-    if driver.exit_code is None:
-        app.root.mainloop()
-    _teardown(app)
-    return driver.exit_code if driver.exit_code is not None else EXIT_BOT_STOPPED
+    try:
+        return _drive_until_exit(driver, app)
+    finally:
+        _teardown(app)
+
+
+def _drive_until_exit(driver, app) -> int:
+    """Run deploy until the bot exits. The marker is removed in ``finally``."""
+    try:
+        driver.start()
+        if driver.exit_code is None:
+            app.root.mainloop()
+        return driver.exit_code if driver.exit_code is not None else EXIT_BOT_STOPPED
+    finally:
+        bot_dir = getattr(driver, "bot_dir", "") or ""
+        if bot_dir:
+            remove_headless_marker(bot_dir)
 
 
 def run_backtest(args) -> int:

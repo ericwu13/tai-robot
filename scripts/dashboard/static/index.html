@@ -197,6 +197,7 @@ pre.log .P3 { color: var(--muted); }
       <span class="sub" id="d-strategy"></span>
       <span id="d-pending"></span>
       <span class="controls" id="d-controls" hidden>
+        <span class="sub" id="d-controls-hint" hidden>GUI 機器人，請在程式中操作</span>
         <button class="primary" id="btn-paper">改為模擬</button>
         <button class="danger" id="btn-stop">停止機器人</button>
       </span>
@@ -711,10 +712,15 @@ const App = {
     $("d-pending").replaceChildren(pendingChip(b.pending) || "");
     const alive = ["RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT"].includes(b.state);
     const p = b.pending || {};
+    // Stop and paper only for a live headless.json marker. A GUI bot keeps
+    // the buttons on screen, disabled, with the hint — the server refuses
+    // the same request if the page is bypassed.
+    const headless = !!b.headless;
     $("d-controls").hidden = !(this.fleet && this.fleet.control_enabled) || !alive;
-    $("btn-stop").disabled = !!p.stop;
+    $("d-controls-hint").hidden = headless;
+    $("btn-stop").disabled = !headless || !!p.stop;
     $("btn-paper").hidden = b.trading_mode === "paper";
-    $("btn-paper").disabled = !!(p.stop || p.mode);
+    $("btn-paper").disabled = !headless || !!(p.stop || p.mode);
     $("d-tiles").replaceChildren(
       tile("持倉", positionText(b.position)),
       tile("最新價", b.last_price ? fmtInt(b.last_price) : "—"),
