@@ -299,6 +299,17 @@ class DiscordNotifier:
             f"{old_label} → {new_label}"
         )
 
+    def mode_switch_refused(self, new_mode: str, reason: str,
+                            requested_by: str = "") -> None:
+        """A dashboard mode request was refused by the bot's own checks."""
+        label = _MODE_LABELS.get(new_mode, new_mode)
+        who = f"（請求者 {requested_by[:64]}）" if requested_by else ""
+        self._send(
+            f"{self._header()}\n"
+            f"⛔ **模式切換被拒 Mode Switch Refused** → {label}{who}\n"
+            f"{reason}"
+        )
+
     def force_close_failed(self, symbol: str, attempts: int, last_error: str) -> None:
         self._send(
             f"{self._header()}\n"

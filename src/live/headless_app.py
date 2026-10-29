@@ -38,6 +38,7 @@ from src.live.headless import (
     clear_stop_file, policy_from_args, resolve_strategy_name, stop_requested,
 )
 from src.live.live_runner import LiveRunner
+from src.live import mode_request as mreq
 from src.live.session_store import load_session
 
 
@@ -247,6 +248,8 @@ class DeployDriver(_Driver):
 
     def _deploy(self) -> None:
         clear_stop_file(self.bot_dir)  # a stale STOP would stop us instantly
+        # A mode request left from a previous run must not apply to this one.
+        mreq.clear_stale_request(self.bot_dir)
         ok = self.app._deploy_live_from(self.req)
         if not ok or self.app._live_runner is None:
             why = "; ".join(f"{t}: {m.splitlines()[0]}" for t, m in self.app.alerts) \
@@ -255,7 +258,17 @@ class DeployDriver(_Driver):
             return
         rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP "
                 "and Ctrl+C every 2s")
+        self._write_capabilities()
         self.root.after(self.POLL_MS, self._poll)
+
+    def _write_capabilities(self) -> None:
+        """Advertise the mode-request channel. The dashboard offers it
+        only while this pid matches the bot's lock pid."""
+        bot_dir = getattr(self.app._live_runner, "bot_dir", None) or self.bot_dir
+        try:
+            mreq.write_capabilities(bot_dir, os.getpid(), rb.APP_VERSION)
+        except Exception as e:
+            rb._log(f"[HEADLESS] capabilities.json not written: [{type(e).__name__}] {e}")
 
     def _poll(self) -> None:
         if self.exit_code is not None:
@@ -274,6 +287,10 @@ class DeployDriver(_Driver):
         if app._live_runner is None:
             self.finish(EXIT_BOT_STOPPED, "bot stopped on its own — see the debug log")
             return
+        try:
+            app._service_mode_request(self.bot_dir)
+        except Exception as e:
+            rb._log(f"[HEADLESS] mode request failed: [{type(e).__name__}] {e}")
         hb = self.args.heartbeat_min
         if hb and time.monotonic() - self._last_heartbeat >= hb * 60:
             self._last_heartbeat = time.monotonic()
