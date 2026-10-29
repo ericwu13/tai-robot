@@ -430,6 +430,19 @@ def front_month_contract(family: str, when: datetime | None) -> str:
     the existing helper rolls. The 00:00–05:00 tail of the night that
     opened the evening before settlement stays on the expiring month,
     because that clock is still before 15:00.
+
+    Fail-safe edges, left as estimated rather than guessed:
+
+    - A fill from 13:30 to 13:45 on settlement day. The expiring
+      contract has already settled at 13:30, but this helper still
+      names that month until 15:00. The row's next-month product does
+      not match, so the exit stays estimated.
+    - A settlement date moved off the 3rd Wednesday because that
+      Wednesday is a holiday. ``get_near_month_symbol`` does not follow
+      ``settlement_day``. The fallback misses and the exit stays
+      estimated.
+
+    Neither case invents a price.
     """
     if not family or when is None:
         return ""
@@ -491,12 +504,24 @@ def _book_equal(row: FulfillReportRow, book: str) -> bool:
     return book == row.book_no or book == row.book_long
 
 
-def _fallback_ok(row: FulfillReportRow, query: FillQuery) -> bool:
+def _row_identity_ok(row: FulfillReportRow, query: FillQuery) -> bool:
+    """Qty 1, and the side and new/close we sent.
+
+    Shared by the book-number path and the fallback. A book number that
+    points at the wrong side, an opening fill, or a multi-lot row is
+    not our 1-lot exit.
+    """
     if row.qty != 1:
         return False
     if query.side and row.side != query.side.strip().upper():
         return False
     if query.new_close and row.new_close != query.new_close.strip().upper():
+        return False
+    return True
+
+
+def _fallback_ok(row: FulfillReportRow, query: FillQuery) -> bool:
+    if not _row_identity_ok(row, query):
         return False
     if not _in_send_window(row, query.send_time):
         return False
@@ -529,7 +554,8 @@ def match_fill_in_report(rows: list[FulfillReportRow],
 
     book = (query.book_no or "").strip()
     if book:
-        hits = [r for r in usable if _book_equal(r, book)]
+        hits = [r for r in usable
+                if _book_equal(r, book) and _row_identity_ok(r, query)]
         if len(hits) == 1:
             row = hits[0]
             return FillMatch(int(round(row.price)), "book",

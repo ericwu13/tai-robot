@@ -10371,14 +10371,15 @@ class BacktestApp:
         self._live_log_msg(
             f"{result.message}{price_str}", "entry")
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
-        if _discord and _discord.enabled:
-            if _exit_fill_deferred:
-                self._start_exit_fill_retry(
-                    result.action_type, fill_price,
-                    self._active_strategy_name())
-            else:
-                _discord.fill_confirmed(result.action_type, fill_price,
-                                        strategy=self._active_strategy_name())
+        # The report poll is the real-exit price path. It runs whether or
+        # not Discord is configured. Only the messages are gated.
+        if _exit_fill_deferred:
+            self._start_exit_fill_retry(
+                result.action_type, fill_price,
+                self._active_strategy_name())
+        elif _discord and _discord.enabled:
+            _discord.fill_confirmed(result.action_type, fill_price,
+                                    strategy=self._active_strategy_name())
 
         # Issue #50: replay any deferred close that was blocked by
         # BLOCK_FILL_PENDING. Now that the entry fill is confirmed
@@ -10437,7 +10438,12 @@ class BacktestApp:
         clearing the context means the callback does not run, and a
         callback that already started will not write the session once
         it sees ``_exit_fill_stopped``.
+
+        The pending trade keeps its simulated exit price and is marked
+        ``real_exit_estimated``. Stop's own session save persists that.
+        A trade that already has a real exit price is left alone.
         """
+        pending = getattr(self, "_exit_fill_retry_ctx", None)
         timer = getattr(self, "_exit_fill_retry_timer", None)
         root = getattr(self, "root", None)
         if timer is not None and root is not None:
@@ -10445,6 +10451,15 @@ class BacktestApp:
                 root.after_cancel(timer)
             except Exception:
                 pass
+        if pending is not None:
+            runner = getattr(self, "_live_runner", None)
+            broker = getattr(runner, "broker", None) if runner is not None else None
+            mark = getattr(broker, "mark_real_exit_estimated", None)
+            if mark is not None:
+                try:
+                    mark()
+                except Exception as exc:
+                    _log(f"EXIT FILL RETRY: stop mark estimated failed: {exc}")
         self._exit_fill_retry_timer = None
         self._exit_fill_retry_ctx = None
         self._exit_fill_stopped = True

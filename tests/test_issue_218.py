@@ -437,19 +437,39 @@ def test_in_window_qty_2_assigns_nothing():
 
 
 def test_duplicate_book_number_is_ambiguous():
-    """Two rows share a book. The second would be a unique fallback
-    if the book-hit ambiguity return were skipped."""
+    """Two rows share a book and both look like our close.
+
+    The noon row is outside the fallback window, so skipping the
+    book-hit ambiguity return would assign the in-window price.
+    """
     send = datetime(2026, 10, 30, 4, 16, 6)
     raw = "\n".join([
         gfr(book="a1006", book_long="0000001006", price="45906.0000",
             time="041606", side="S", nc="O"),
-        gfr(book="a1006", book_long="0000001999", price="11111.0000",
-            time="041606", side="B", nc="N"),
+        gfr(book="a1006", book_long="0000001006", price="11111.0000",
+            time="120000", side="S", nc="O"),
     ])
     match = match_fill_in_report(
         parse_fulfill_report(raw), _query(send, book="a1006"))
     assert match.price == 0
     assert match.reason == "ambiguous"
+
+
+def test_book_match_rejects_wrong_side_new_close_or_qty():
+    """A matching book is not enough when the row is not our 1-lot close."""
+    send = datetime(2026, 10, 30, 4, 16, 6)
+    cases = [
+        gfr(book="a1006", side="B", nc="O", qty="1", price="11111.0000",
+            time="041606"),
+        gfr(book="a1006", side="S", nc="N", qty="1", price="11111.0000",
+            time="041606"),
+        gfr(book="a1006", side="S", nc="O", qty="2", price="11111.0000",
+            time="041606"),
+    ]
+    for raw in cases:
+        match = match_fill_in_report(
+            parse_fulfill_report(raw), _query(send, book="a1006"))
+        assert match.price == 0, raw
 
 
 def test_long_book_number_alone_matches_outside_the_window():
@@ -566,17 +586,140 @@ def test_stop_cancels_the_exit_fill_timer_and_does_not_save():
         "started": 0,
     }
     app._exit_fill_retry_timer = app.root.after(5500, app._poll_exit_fill_step)
+
+    def _rest_of_teardown():
+        raise RuntimeError("teardown continues")
+
+    # The next teardown step is stubbed so the test does not depend on
+    # _stop_live crashing on a missing attribute.
+    app._stop_account_polling = _rest_of_teardown
     import pytest
-    with pytest.raises(AttributeError):
+    with pytest.raises(RuntimeError, match="teardown continues"):
         app._stop_live()
     assert app._evolution_cancel is True
     assert app._exit_fill_retry_timer is None
     assert app._exit_fill_retry_ctx is None
     assert app._exit_fill_stopped is True
     assert app.root.pending == {}
+    # Sim price kept, and the unfinished exit is marked estimated.
+    # The exhaustion session save does not run.
+    assert broker.trades[-1].exit_price == 45928
+    assert broker.trades[-1].real_exit_price == 0
+    assert broker.trades[-1].real_exit_estimated is True
     app._poll_exit_fill_step()
     assert saves == []
+
+
+def _fire_one(root):
+    token, (_ms, fn, args) = next(iter(root.pending.items()))
+    root.pending.pop(token)
+    fn(*args)
+
+
+def _exit_confirm_app(monkeypatch, raw, *, exit_price=45928, exit_bar=2):
+    """Minimal app whose exit confirm starts the report poll."""
+    import run_backtest as rb
+    from types import SimpleNamespace
+
+    from src.live.discord_notify import DiscordNotifier
+    from src.live.fill_poller import FillPoller
+    from src.live.fill_report import RealFillTracker
+    from src.live.trading_guard import TradingGuard
+    from tests.test_issue_168_restore_fidelity import _Root
+
+    send = datetime(2026, 10, 30, 4, 16, 6)
+    guard = TradingGuard()
+    guard.on_fill_pending("exit")
+    poller = FillPoller(guard)
+    poller.start("exit", 1, com_available=True, entry_bar_index=1)
+    broker = SimulatedBroker(point_value=10)
+    broker.trades.append(Trade(
+        tag="Long", side=OrderSide.LONG, qty=1, entry_price=46000,
+        exit_price=exit_price, entry_bar_index=1, exit_bar_index=exit_bar,
+        pnl=(exit_price - 46000) * 10, source="real", real_entry_price=46010))
+    tracker = RealFillTracker()
+    tracker.register_order(
+        "1000000000001", "exit", bar_index=exit_bar, sim_price=exit_price,
+        product="TM0000", side="S", new_close="O", send_time=send)
+    sent = []
+    notifier = DiscordNotifier("", "")
+    notifier._send = lambda content, channel_id="": sent.append(content)
+    monkeypatch.setattr(rb, "_discord", notifier)
+    monkeypatch.setattr(rb, "_log", lambda msg: None)
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetFulfillReport=object()))
+    monkeypatch.setattr(rb, "call_com", lambda *args, **kwargs: raw)
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.root = _Root()
+    app._fill_poller = poller
+    app._trading_guard = guard
+    app._fill_poll_timer_id = None
+    app._fill_tracker = tracker
+    app._futures_account = "0000"
+    app.login_user_var = SimpleNamespace(get=lambda: "user")
+    app._last_exit_order_seq = "1000000000001"
+    app._exit_fill_stopped = True  # a previous stop left the flag set
+    app._exit_fill_retry_timer = None
+    app._exit_fill_retry_ctx = None
+    app._live_runner = SimpleNamespace(
+        broker=broker, symbol="TMF00", _auto_save_session=lambda: None)
+    app._live_log_msg = lambda *args, **kwargs: None
+    app._log_order_decision = lambda *args, **kwargs: None
+    app._active_strategy_name = lambda: "S"
+    return app, broker, sent, notifier
+
+
+def test_discord_off_still_polls_and_applies_the_real_price(monkeypatch):
+    raw = gfr(time="041606", price="45906.0000")
+    app, broker, sent, notifier = _exit_confirm_app(monkeypatch, raw)
+    assert notifier.enabled is False
+    app._on_fill_confirmed()
+    assert app.root.pending, "exit-fill poll was not scheduled"
+    _fire_one(app.root)
+    assert broker.trades[-1].real_exit_price == 45906
     assert broker.trades[-1].real_exit_estimated is False
+    assert sent == []
+
+
+def test_discord_off_exhaustion_marks_estimated_and_sends_nothing(monkeypatch):
+    app, broker, sent, notifier = _exit_confirm_app(monkeypatch, "")
+    assert notifier.enabled is False
+    app._on_fill_confirmed()
+    for _ in range(20):
+        if not app.root.pending:
+            break
+        _fire_one(app.root)
+    assert broker.trades[-1].real_exit_estimated is True
+    assert broker.trades[-1].real_exit_price == 0
+    assert broker.trades[-1].exit_price == 45928
+    assert sent == []
+
+
+def test_stop_then_restart_still_matches_the_next_exit(monkeypatch):
+    raw = gfr(time="041606", price="45906.0000")
+    app, broker, sent, _notifier = _exit_confirm_app(
+        monkeypatch, raw, exit_price=45900)
+    app._start_exit_fill_retry("exit", "45900", "s")
+    app._cancel_exit_fill_retry()
+    assert broker.trades[-1].real_exit_estimated is True
+    assert app._exit_fill_stopped is True
+
+    broker.trades.append(Trade(
+        tag="Long", side=OrderSide.LONG, qty=1, entry_price=46100,
+        exit_price=46050, entry_bar_index=3, exit_bar_index=4, pnl=-500,
+        source="real", real_entry_price=46110))
+    app._fill_tracker.register_order(
+        "1000000000002", "exit", bar_index=4, sim_price=46050,
+        product="TM0000", side="S", new_close="O",
+        send_time=datetime(2026, 10, 30, 4, 16, 6))
+    app._last_exit_order_seq = "1000000000002"
+    app._start_exit_fill_retry("exit", "46050", "s")
+    assert app._exit_fill_stopped is False
+    _fire_one(app.root)
+    assert broker.trades[-1].real_exit_price == 45906
+    assert broker.trades[-1].real_exit_estimated is False
+    assert sent == []
 
 
 def test_mask_keeps_the_price_and_drops_the_account():
