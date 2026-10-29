@@ -845,11 +845,14 @@ def control_server(tmp_path, monkeypatch):
     monkeypatch.setattr(server.DashboardHandler, "control_log", str(log))
     # The fixtures' lock PID is fake; treat it as alive for both modules.
     monkeypatch.setattr(snapshot, "pid_alive", _alive)
+    monkeypatch.setattr(snapshot, "pid_alive_strict", _alive)
     monkeypatch.setattr(snapshot.bot_summary, "__kwdefaults__",
                         {"pid_alive_fn": _alive})
-    from scripts.dashboard import control
-    monkeypatch.setattr(control, "process_command_line",
-                        lambda pid: r'"C:\bots\tai_backtest.exe" deploy --symbol TMF00 --bot x')
+    # alpha and real are headless (live marker). gone is a stopped GUI bot.
+    from src.live.headless import write_headless_marker
+    for name in ("TMF00_alpha", "TMF00_real"):
+        assert write_headless_marker(
+            str(base / name), pid=ALIVE_PID, started_at="2026-10-29T21:00:00+08:00")
     srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.DashboardHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}", base, log
@@ -925,6 +928,11 @@ def test_switch_to_paper_writes_what_live_runner_consumes(control_server):
     runner.bot_dir = str(real)
     runner._reloading_flag = False
     runner._reload_started_at = None
+    # Harmless on master. Required once #207's headless file guard reads them.
+    runner._headless = False
+    runner._ignored_mode_override = None
+    runner._mode_override_remove_warn_at = None
+    runner._mode_override_error_warn_at = None
     assert runner._check_mode_override() == "paper"
     assert not (real / "mode_override.json").exists()
 
@@ -992,13 +1000,20 @@ def test_control_cannot_reach_outside_the_bot_root(control_server):
     assert not any(p.name == "STOP" for p in base.rglob("STOP"))
 
 
-def test_control_log_defaults_next_to_the_bot_root(tmp_path, monkeypatch):
+def test_control_log_defaults_outside_data(tmp_path, monkeypatch):
     calls = {}
     monkeypatch.setattr(server, "bind_servers",
                         lambda *a, **k: calls.setdefault("bound", True) and (_ for _ in ()).throw(OSError("stop")))
-    assert server.main(["--base-dir", str(tmp_path / "data" / "live"), "--enable-control"]) == 3
+    base = tmp_path / "data" / "live"
+    assert server.main(["--base-dir", str(base), "--enable-control"]) == 3
     assert server.DashboardHandler.control_enabled is True
-    assert server.DashboardHandler.control_log == str(tmp_path / "data" / "dashboard_control_log.csv")
+    # <install>/dashboard_control_log.csv, not inside data/.
+    assert server.DashboardHandler.control_log == str(tmp_path / "dashboard_control_log.csv")
+    assert os.path.basename(os.path.dirname(server.DashboardHandler.control_log)) != "data"
+    custom = tmp_path / "audit" / "controls.csv"
+    assert server.main(["--base-dir", str(base), "--enable-control",
+                        "--control-log", str(custom)]) == 3
+    assert server.DashboardHandler.control_log == str(custom)
     monkeypatch.setattr(server.DashboardHandler, "control_enabled", False)
 
 
@@ -1029,32 +1044,263 @@ def test_stop_refused_when_position_changed_since_the_dialog(control_server):
     assert status == 200 and (real / "STOP").exists()
 
 
-@pytest.mark.parametrize("cmdline,expect", [
-    (r'"C:\x\tai_backtest.exe"', "GUI"),                    # GUI EXE, no deploy
-    ("python run_backtest.py", "GUI"),
-    (None, "無法確認"),                                        # unreadable
+_CONTROL_FILES = ("STOP", "CONTROL", "mode_override.json")
+
+
+def _assert_no_control_files(bot):
+    for name in _CONTROL_FILES:
+        assert not (bot / name).exists(), name
+
+
+@pytest.mark.parametrize("bot_id,payload", [
+    ("TMF00_alpha", {"action": "stop", "confirm": "alpha", "position_ack": "flat"}),
+    ("TMF00_real", {"action": "paper", "confirm": "paper"}),
+    ("TMF00_real", {"action": "stop", "confirm": "real", "position_ack": "flat"}),
 ])
-def test_stop_refused_for_bots_that_never_read_stop(control_server, monkeypatch,
-                                                    cmdline, expect):
-    from scripts.dashboard import control
-    monkeypatch.setattr(control, "process_command_line", lambda pid: cmdline)
-    url, base, _ = control_server
+def test_gui_bot_without_marker_is_refused_and_writes_nothing(control_server, bot_id, payload):
+    """A GUI bot never polls STOP. Refusing must not leave an orphan file."""
+    url, base, log = control_server
+    bot = base / bot_id
+    (bot / "headless.json").unlink()
+    before = {p.name for p in bot.iterdir()}
+    status, body = _post(url, {"id": bot_id, **payload})
+    assert status == 409 and body["ok"] is False
+    assert body["message"] == "GUI 機器人，請在程式中操作"
+    _assert_no_control_files(bot)
+    assert {p.name for p in bot.iterdir()} == before
+    row = _log_rows(log)[-1]
+    assert (row["bot"], row["action"], row["result"]) == (bot_id, payload["action"], "refused")
+    assert row["detail"] == "GUI 機器人，請在程式中操作"
+
+
+def test_live_headless_marker_allows_stop_and_paper(control_server):
+    url, base, log = control_server
     status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha",
                                "position_ack": "flat"})
-    assert status == 409 and expect in body["message"]
-    assert not (base / "TMF00_alpha" / "STOP").exists()
+    assert (status, body["ok"]) == (200, True)
+    assert (base / "TMF00_alpha" / "STOP").is_file()
+    assert not (base / "TMF00_alpha" / "CONTROL").exists()
+    assert not (base / "TMF00_alpha" / "mode_override.json").exists()
+    status, body = _post(url, {"id": "TMF00_real", "action": "paper", "confirm": "paper"})
+    assert (status, body["ok"]) == (200, True)
+    assert (base / "TMF00_real" / "mode_override.json").is_file()
+    assert not (base / "TMF00_real" / "STOP").exists()
+    assert not (base / "TMF00_real" / "CONTROL").exists()
+    assert [r["result"] for r in _log_rows(log)] == ["accepted", "accepted"]
 
 
-@pytest.mark.parametrize("cmdline,headless", [
-    (r'"C:\b\tai_robot_v2199\tai_backtest\tai_backtest.exe" deploy --symbol TMF00 --bot A', True),
-    (r"C:\venv\python.exe run_bot_cli.py deploy --bot A --mode paper", True),
-    (r'"C:\b\tai_backtest.exe"', False),
-    ("python run_backtest.py", False),
-    ("", None), (None, None),
+@pytest.mark.parametrize("bot_id,payload", [
+    ("TMF00_alpha", {"action": "stop", "confirm": "alpha", "position_ack": "flat"}),
+    ("TMF00_real", {"action": "paper", "confirm": "paper"}),
 ])
-def test_is_headless(cmdline, headless):
+def test_stale_marker_with_dead_pid_is_refused(control_server, bot_id, payload):
+    """The lock pid is alive; only the marker pid is dead. That is not headless."""
+    from src.live.headless import write_headless_marker
+    url, base, log = control_server
+    bot = base / bot_id
+    assert write_headless_marker(str(bot), pid=DEAD_PID, started_at="2026-10-29T21:00:00+08:00")
+    status, body = _post(url, {"id": bot_id, **payload})
+    assert status == 409 and body["ok"] is False
+    assert body["message"] == "GUI 機器人，請在程式中操作"
+    _assert_no_control_files(bot)
+    assert _log_rows(log)[-1]["result"] == "refused"
+
+
+@pytest.mark.parametrize("text", [
+    "{",
+    "[]",
+    "{}",
+    '{"pid": "4242", "started_at": "2026-10-29T21:00:00+08:00"}',
+    '{"pid": 0, "started_at": "2026-10-29T21:00:00+08:00"}',
+    '{"pid": 4242}',
+    '{"started_at": "2026-10-29T21:00:00+08:00"}',
+    '{"pid": true, "started_at": "2026-10-29T21:00:00+08:00"}',
+])
+def test_malformed_marker_is_refused(control_server, text):
+    url, base, log = control_server
+    bot = base / "TMF00_real"
+    (bot / "headless.json").write_text(text, encoding="utf-8")
+    for payload in ({"action": "stop", "confirm": "real", "position_ack": "flat"},
+                    {"action": "paper", "confirm": "paper"}):
+        status, body = _post(url, {"id": "TMF00_real", **payload})
+        assert status == 409 and body["ok"] is False
+        assert body["message"] == "GUI 機器人，請在程式中操作"
+    _assert_no_control_files(bot)
+    assert all(r["result"] == "refused" for r in _log_rows(log))
+
+
+def test_gui_bot_with_a_wrong_confirm_still_says_gui(control_server):
+    """The GUI refusal is decided before the typed-name check.
+
+    Removing the marker check from ``check`` (and leaving it only in
+    ``apply``) would report the name mismatch instead.
+    """
+    url, base, log = control_server
+    bot = base / "TMF00_alpha"
+    (bot / "headless.json").unlink()
+    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop",
+                               "confirm": "not-the-name", "position_ack": "flat"})
+    assert status == 409 and body["ok"] is False
+    assert body["message"] == "GUI 機器人，請在程式中操作"
+    _assert_no_control_files(bot)
+    assert _log_rows(log)[-1]["detail"] == "GUI 機器人，請在程式中操作"
+
+
+def test_live_pid_that_is_not_the_lock_pid_is_refused(control_server, monkeypatch):
+    """A reused pid that is alive, but is not the process holding .lock."""
+    from src.live.headless import write_headless_marker
+    monkeypatch.setattr(snapshot, "pid_alive_strict",
+                        lambda pid: pid in (ALIVE_PID, 7777))
+    url, base, _ = control_server
+    bot = base / "TMF00_alpha"
+    assert write_headless_marker(str(bot), pid=7777, started_at="2026-10-29T21:00:00+08:00")
+    status, body = _post(url, {"id": "TMF00_alpha", "action": "stop", "confirm": "alpha",
+                               "position_ack": "flat"})
+    assert status == 409 and body["message"] == "GUI 機器人，請在程式中操作"
+    _assert_no_control_files(bot)
+
+
+def test_reused_pid_with_mismatched_creation_time_is_refused(control_server, monkeypatch):
+    from datetime import datetime, timezone
+    from src.live.headless import write_headless_marker
+    monkeypatch.setattr(
+        snapshot, "process_create_time",
+        lambda pid: datetime(2020, 1, 1, tzinfo=timezone.utc))
+    url, base, _ = control_server
+    bot = base / "TMF00_real"
+    assert write_headless_marker(
+        str(bot), pid=ALIVE_PID, started_at="2026-10-29T21:00:00+08:00")
+    status, body = _post(url, {"id": "TMF00_real", "action": "paper", "confirm": "paper"})
+    assert status == 409 and body["message"] == "GUI 機器人，請在程式中操作"
+    _assert_no_control_files(bot)
+    # The same pid with a matching creation time is still headless.
+    monkeypatch.setattr(
+        snapshot, "process_create_time",
+        lambda pid: datetime.fromisoformat("2026-10-29T21:00:00+08:00"))
+    status, body = _post(url, {"id": "TMF00_real", "action": "paper", "confirm": "paper"})
+    assert (status, body["ok"]) == (200, True)
+    assert (bot / "mode_override.json").is_file()
+
+
+def test_access_denied_is_refused(control_server, monkeypatch):
+    """Strict liveness: a pid we cannot inspect is not a headless bot.
+
+    The bot state still uses the loose helper (the fixture's ``_alive``),
+    so the row stays RUNNING. Only the marker gate goes strict.
+    """
+    monkeypatch.setattr(snapshot, "pid_alive_strict", lambda pid: False)
+    url, base, _ = control_server
+    for bot_id, payload in (
+            ("TMF00_alpha", {"action": "stop", "confirm": "alpha", "position_ack": "flat"}),
+            ("TMF00_real", {"action": "paper", "confirm": "paper"})):
+        status, body = _post(url, {"id": bot_id, **payload})
+        assert status == 409 and body["message"] == "GUI 機器人，請在程式中操作"
+        _assert_no_control_files(base / bot_id)
+
+
+def test_headless_live_treats_a_raising_pid_check_as_not_live(tmp_path):
+    from src.live.headless import write_headless_marker
+    d = make_bot(tmp_path, lock_pid=ALIVE_PID)
+    assert write_headless_marker(str(d), pid=ALIVE_PID, started_at="2026-10-29T21:00:00+08:00")
+
+    def boom(pid):
+        raise RuntimeError("probe failed")
+
+    assert snapshot.headless_live(str(d), pid_alive_fn=boom) is False
+
+
+def test_apply_refuses_a_gui_bot_without_writing(tmp_path):
+    """The write path itself refuses. Removing the check in apply() writes STOP."""
     from scripts.dashboard import control
-    assert control.is_headless(cmdline) is headless
+    bot = tmp_path / "TMF00_gui"
+    bot.mkdir()
+    for action in ("stop", "paper"):
+        with pytest.raises(control.ControlRefused, match="GUI 機器人"):
+            control.apply(action, str(bot), "127.0.0.1")
+    _assert_no_control_files(bot)
+    assert list(bot.iterdir()) == []
+
+
+@pytest.mark.parametrize("bot_id,payload", [
+    ("TMF00_alpha", {"action": "stop", "confirm": "alpha", "position_ack": "flat"}),
+    ("TMF00_real", {"action": "paper", "confirm": "paper"}),
+])
+def test_apply_rechecks_the_marker_and_writes_nothing(control_server, monkeypatch,
+                                                     bot_id, payload):
+    """check() saw a live marker. apply() must read it again before writing."""
+    from scripts.dashboard import control
+    url, base, log = control_server
+    bot = base / bot_id
+    real_apply = control.apply
+
+    def drop_marker_then_apply(action, bot_dir, client, **kwargs):
+        os.remove(os.path.join(bot_dir, "headless.json"))
+        return real_apply(action, bot_dir, client, **kwargs)
+
+    monkeypatch.setattr(control, "apply", drop_marker_then_apply)
+    status, body = _post(url, {"id": bot_id, **payload})
+    assert status == 409 and body["ok"] is False
+    assert body["message"] == "GUI 機器人，請在程式中操作"
+    _assert_no_control_files(bot)
+    assert _log_rows(log)[-1]["result"] == "refused"
+
+
+def test_summary_headless_flag_follows_the_marker(tmp_path, monkeypatch):
+    from src.live.headless import write_headless_marker
+    # Creation time is unavailable here; the lock pid decides. The mismatch
+    # test covers the clock when it can be read.
+    monkeypatch.setattr(snapshot, "process_create_time", lambda pid: None)
+    d = make_bot(tmp_path, lock_pid=os.getpid())
+
+    def alive(pid):
+        return pid == os.getpid()
+
+    assert snapshot.bot_summary(NOW, str(d), pid_alive_fn=alive)["headless"] is False
+    assert write_headless_marker(str(d), pid=os.getpid(), started_at="2026-10-29T21:00:00+08:00")
+    assert snapshot.bot_summary(NOW, str(d), pid_alive_fn=alive)["headless"] is True
+    assert write_headless_marker(str(d), pid=DEAD_PID, started_at="2026-10-29T21:00:00+08:00")
+    assert snapshot.bot_summary(NOW, str(d), pid_alive_fn=alive)["headless"] is False
+    (d / "headless.json").write_text("{", encoding="utf-8")
+    assert snapshot.bot_summary(NOW, str(d), pid_alive_fn=alive)["headless"] is False
+
+
+def test_fleet_reports_the_headless_marker(tmp_path, monkeypatch):
+    """The page's flag comes from the API, judged with the real pid helper."""
+    from src.live.headless import write_headless_marker
+    monkeypatch.setattr(snapshot, "process_create_time", lambda pid: None)
+    base = tmp_path / "live"
+    alpha = make_bot(base, lock_pid=os.getpid())
+    make_bot(base, name="TMF00_gui", lock_pid=os.getpid())
+    assert write_headless_marker(
+        str(alpha), pid=os.getpid(), started_at="2026-10-29T21:00:00+08:00")
+    monkeypatch.setattr(server.DashboardHandler, "base_dir", str(base))
+    monkeypatch.setattr(server.DashboardHandler, "cache", server._Cache(0))
+    srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.DashboardHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}"
+        fleet = json.loads(_get(url + "/api/fleet")[2])
+        by_id = {b["id"]: b for b in fleet["bots"]}
+        assert by_id["TMF00_alpha"]["headless"] is True
+        assert by_id["TMF00_gui"]["headless"] is False
+        detail = json.loads(_get(url + "/api/bot?id=TMF00_alpha")[2])
+        assert detail["bot"]["headless"] is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_page_disables_controls_unless_the_marker_is_live():
+    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+    assert 'id="d-controls-hint"' in html
+    assert "GUI 機器人，請在程式中操作" in html
+    assert "const headless = !!b.headless;" in html
+    # Hint is hidden only for a live headless bot. Removing this line
+    # leaves the hint up on a headless bot (or hides it on a GUI bot).
+    assert '$("d-controls-hint").hidden = headless;' in html
+    assert "!headless || !!p.stop" in html
+    assert "!headless || !!(p.stop || p.mode)" in html
 
 
 def test_hung_bot_is_refused(control_server):

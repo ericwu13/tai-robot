@@ -15,7 +15,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .deploy_request import DeployRequest
 from .session_store import load_session
@@ -193,6 +193,164 @@ def clear_stop_file(bot_dir: str) -> None:
         os.remove(stop_file_path(bot_dir))
     except OSError:
         pass
+
+
+# ── Headless marker ──
+# The dashboard may stop a bot or switch it to paper only when this file
+# is present and its pid is still alive. The GUI live loop does not poll
+# STOP, so a GUI bot must never look controllable. Write is atomic; both
+# write and remove log OSError and keep the bot running.
+
+HEADLESS_MARKER_FILENAME = "headless.json"
+
+
+def headless_marker_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, HEADLESS_MARKER_FILENAME)
+
+
+def parse_headless_marker(data) -> dict | None:
+    """``{"pid": int, "started_at": str}`` or None when the marker is unusable."""
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    started = data.get("started_at")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if not isinstance(started, str) or not started.strip():
+        return None
+    return {"pid": pid, "started_at": started}
+
+
+def process_create_time(pid: int) -> datetime | None:
+    """Process creation time, or None when it cannot be read.
+
+    Windows uses GetProcessTimes (psutil is not a dependency). Other
+    platforms return None: the lock-pid check then stands alone. Access
+    denied and any OSError return None. Never raises.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0 or os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel_t = wintypes.FILETIME()
+            user_t = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                    handle, ctypes.byref(created), ctypes.byref(exited),
+                    ctypes.byref(kernel_t), ctypes.byref(user_t)):
+                return None
+            ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+            # FILETIME is 100-ns ticks since 1601-01-01 UTC.
+            unix = ticks / 10_000_000 - 11644473600
+            return datetime.fromtimestamp(unix, tz=timezone.utc)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 — a clock we cannot read is "unavailable"
+        return None
+
+
+def _marker_started_at(pid: int, started_at: str | None) -> str:
+    if started_at:
+        return started_at
+    created = process_create_time(pid)
+    if created is not None:
+        if created.tzinfo is None:
+            created = created.astimezone()
+        return created.isoformat(timespec="seconds")
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _log_marker(op: str, path: str, exc: BaseException) -> None:
+    sys.stderr.write(
+        f"[HEADLESS] headless marker {op} failed ({path}): "
+        f"{type(exc).__name__}: {exc}\n")
+
+
+def write_headless_marker(bot_dir: str, *, pid: int | None = None,
+                          started_at: str | None = None) -> bool:
+    """Atomically write ``headless.json``. OSError is logged and never raised.
+
+    Returns True when the marker is in place. The running process's pid is
+    recorded unless ``pid`` is passed (tests).
+    """
+    path = headless_marker_path(bot_dir)
+    owner = int(os.getpid() if pid is None else pid)
+    payload = {
+        "pid": owner,
+        "started_at": _marker_started_at(owner, started_at),
+    }
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(bot_dir, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log_marker("write", path, exc)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def remove_headless_marker(bot_dir: str) -> None:
+    """Delete ``headless.json``. A missing file is quiet; other OSErrors are logged."""
+    path = headless_marker_path(bot_dir)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _log_marker("remove", path, exc)
+
+
+def remove_headless_marker_if_ours(bot_dir: str, *, pid: int | None = None) -> None:
+    """Delete the marker only when it names this process.
+
+    A second instance that loses the lock must not remove the running
+    bot's marker on the way out. A missing or unreadable file is left
+    alone. OSError on the remove is logged and never raised.
+    """
+    path = headless_marker_path(bot_dir)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    marker = parse_headless_marker(data)
+    if marker is None:
+        return
+    mine = int(os.getpid() if pid is None else pid)
+    if marker["pid"] != mine:
+        return
+    remove_headless_marker(bot_dir)
 
 
 # ── Detached launch (deploy --detach) ──

@@ -194,6 +194,58 @@ def discover_bot_dirs(base_dir: str) -> list:
     return found
 
 
+# OpenProcess / os.kill failure that means "a process exists but we cannot
+# inspect it". Lock staleness treats that as alive. The dashboard's
+# headless-marker gate does not.
+_ERROR_ACCESS_DENIED = 5
+_STILL_ACTIVE = 259
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _open_failed_liveness(last_error: int, *, access_denied_is_alive: bool) -> bool:
+    """Answer when OpenProcess returns no handle."""
+    if last_error == _ERROR_ACCESS_DENIED:
+        return bool(access_denied_is_alive)
+    return False
+
+
+def _pid_alive_windows(pid: int, *, access_denied_is_alive: bool) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return _open_failed_liveness(
+            ctypes.get_last_error(), access_denied_is_alive=access_denied_is_alive)
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # can't tell — stay conservative
+        return exit_code.value == _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_alive(pid: int, *, access_denied_is_alive: bool) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid, access_denied_is_alive=access_denied_is_alive)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return access_denied_is_alive
+    except OSError:
+        return False
+
+
 def pid_alive(pid: int) -> bool:
     """Read-only Windows PID liveness.
 
@@ -203,39 +255,16 @@ def pid_alive(pid: int) -> bool:
     failure is reported as ALIVE — a lock we cannot verify must never be
     called stale.  Unlike ``check_lock`` this deletes nothing.
     """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
+    return _pid_alive(pid, access_denied_is_alive=True)
 
-        process_query_limited_information = 0x1000
-        error_access_denied = 5
-        still_active = 259
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.OpenProcess(
-            process_query_limited_information, False, pid)
-        if not handle:
-            return ctypes.get_last_error() == error_access_denied
-        try:
-            exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return True
-            return exit_code.value == still_active
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+def pid_alive_strict(pid: int) -> bool:
+    """``pid_alive`` for the headless-marker gate: access denied is not alive.
+
+    A pid reused by SYSTEM or another user must not unlock stop / paper.
+    Other callers keep ``pid_alive`` (access denied stays alive).
+    """
+    return _pid_alive(pid, access_denied_is_alive=False)
 
 
 def read_lock_pid(bot_dir: str):

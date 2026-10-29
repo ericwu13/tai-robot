@@ -7864,6 +7864,15 @@ class BacktestApp:
             return
         self.live_regime_var.set("[Regime] 停用 disabled")
 
+    def _drop_stale_headless_marker(self, bot_dir: str) -> None:
+        """GUI deploy: delete a headless.json left by a crashed CLI bot.
+
+        Called only after the lock check says this process may own the
+        directory. ``HeadlessBotApp`` overrides this and does not delete.
+        """
+        from src.live.headless import remove_headless_marker
+        remove_headless_marker(bot_dir)
+
     def _deploy_live(self):
         """Start live bot: create runner, fetch warmup, subscribe to ticks."""
         if not self._quote_connected and not _tv_available:
@@ -8268,6 +8277,13 @@ class BacktestApp:
                 "請使用不同的名稱 Please use a different name.",
             )
             return False
+        # The lock is free, so this process will own the directory. A GUI
+        # deploy drops a headless.json left by a crash; HeadlessBotApp
+        # overrides the hook and writes its own marker after acquire_lock.
+        # Test doubles that aren't a BacktestApp simply have no hook.
+        drop_marker = getattr(self, "_drop_stale_headless_marker", None)
+        if drop_marker is not None:
+            drop_marker(bot_dir)
 
         def _after_oi_wait() -> bool:
             # Fail closed (issue #202). A missing snapshot used to log
