@@ -142,6 +142,9 @@ pre.log .P3 { color: var(--muted); }
 @media (max-width: 760px) { .vote-row { grid-template-columns: 1fr 1fr; } }
 .mode { font-size: 13px; color: var(--muted); }
 .mode.real { color: #fff; background: var(--bad); padding: 1px 8px; border-radius: 6px; font-weight: 700; }
+/* Holding marker. Neutral on purpose — 紅/綠 are P&L, 藍/橙 are health. */
+.held { background: var(--off-bg); color: var(--text); border: 1px solid var(--line);
+  padding: 0 6px; border-radius: 6px; font-size: 12px; font-weight: 700; margin-right: 6px; }
 [hidden] { display: none !important; }
 
 /* Phone: the fleet table becomes one card per bot, no sideways scroll. */
@@ -343,11 +346,16 @@ function chip(state) {
   const [label, cls] = STATE[state] || [state, "s-warn"];
   return el("span", { class: "chip " + cls }, label);
 }
+// The 持倉 pill is deliberately neutral: 紅/綠 mean P&L direction and 藍/橙 mean
+// health, so a holding marker in any of them would be misread. Side keeps its
+// own up/down colour on the text next to it.
 function positionText(p) {
   if (!p) return el("span", { class: "muted" }, "空手");
   const price = p.real_entry_price || p.entry_price;
-  return el("span", { class: p.side === "LONG" ? "up" : "down" },
-    `${SIDE[p.side] || p.side} ${p.size} 口 @ ${fmtInt(price)}`);
+  return el("span", null,
+    el("span", { class: "held", title: "持有部位" }, "持倉"),
+    el("span", { class: p.side === "LONG" ? "up" : "down" },
+      `${SIDE[p.side] || p.side} ${p.size} 口 @ ${fmtInt(price)}`));
 }
 // 損益 is the broker's simulated P&L, so the row shows the simulated price it
 // came from; a confirmed real fill that differs is shown underneath.
@@ -561,11 +569,17 @@ const App = {
     u.classList.toggle("stale", s > 30);
   },
 
+  // Health tier first, then holders above flat bots inside the tier: an open
+  // position is what you act on, and a dead bot still holding one is why the
+  // tier stays the outer key. `position` is null when flat (snapshot._position
+  // returns None for size <= 0), so a broken bot row sorts as flat.
   visibleBots() {
     const all = this.fleet ? this.fleet.bots : [];
     const showRetired = $("show-retired").checked;
+    const held = (b) => (b.position ? 1 : 0);
     return all.filter((b) => showRetired || b.active)
       .sort((a, b) => STATE_ORDER.indexOf(a.state) - STATE_ORDER.indexOf(b.state)
+        || held(b) - held(a)
         || a.id.localeCompare(b.id, "zh-Hant"));
   },
 
