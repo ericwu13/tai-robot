@@ -392,9 +392,11 @@ def test_new_non_regime_bot_requires_strategy():
     assert req.is_resume
 
 
-def test_news_flags_need_regime():
-    with pytest.raises(hl.HeadlessConfigError, match="--news only"):
-        hl.build_deploy_request(_deploy_args("--strategy", "x", "--news"), None)
+def test_news_without_regime_is_accepted_subflags_still_need_news():
+    """Issue #223: --news is per-bot. --regime is still required for legs."""
+    req = hl.build_deploy_request(
+        _deploy_args("--strategy", "x", "--news"), None)
+    assert req.news_enabled and not req.regime_enabled
     with pytest.raises(hl.HeadlessConfigError, match="require --news"):
         hl.build_deploy_request(
             _deploy_args("--regime", "--long-strategy", "L", "--short-strategy", "S",

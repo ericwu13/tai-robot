@@ -469,6 +469,26 @@ function votesBlock(v, newsEnabled) {
   }
   return box;
 }
+function riskOffText(r) {
+  if (!r || !r.enabled) return "risk-off: off";
+  const flags = [r.directional ? "directional" : "", r.tier2 ? "tier2" : ""].filter(Boolean).join("+");
+  const gate = r.gate === "suppressed" ? "suppressed" : "clear";
+  const hb = r.heartbeat_age_sec != null ? ago(r.heartbeat_age_sec) : (r.heartbeat_status || "—");
+  let text = "risk-off: on";
+  if (flags) text += " (" + flags + ")";
+  text += " · " + gate;
+  if (r.gate_reason) text += " · " + r.gate_reason;
+  text += " · hb " + hb;
+  return text;
+}
+function riskOffTitle(r) {
+  if (!r || !r.enabled) return "risk-off: off";
+  const s = r.sources || {};
+  const age = (v) => (v == null ? "—" : Math.round(v) + "s");
+  return ["signal " + age(s.signal_age_sec), "heartbeat " + age(s.heartbeat_age_sec),
+    "events " + age(s.events_age_sec), "votes " + age(s.votes_age_sec),
+    r.entries_blocked_reason || ""].filter(Boolean).join(" · ");
+}
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
 
@@ -627,6 +647,7 @@ const App = {
       const rg = b.regime;
       const name = el("div", null, el("div", { class: "name" }, b.bot_name),
         el("div", { class: "sub trunc", title: b.strategy }, `${b.symbol}・${b.strategy || "—"}`),
+        el("div", { class: "sub trunc", title: riskOffTitle(b.risk_off) }, riskOffText(b.risk_off)),
         rg ? el("div", { class: "rg-line" }, "盤勢", rgChip(rg.effective),
           LEG[rg.active_leg] || "空手", rg.pause ? el("span", { title: pauseInfo(rg.pause).title }, "🔒 方向鎖定") : null,
           rg.news_suppressed ? el("span", { class: "pend" }, "新聞抑制中") : null) : null);
@@ -754,6 +775,7 @@ const App = {
       tile("模擬累計損益", money(b.pnl_total)),
       tile("交易數 / 勝率", `${fmtInt(b.trades)} / ${b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%"}`),
       tile("心跳", b.heartbeat_age_s !== null ? ago(b.heartbeat_age_s) : "—"),
+      tile("風險關閉", el("div", { title: riskOffTitle(b.risk_off) }, riskOffText(b.risk_off))),
       ...realTiles(b.real),
     );
     this.renderRegime(d.regime);

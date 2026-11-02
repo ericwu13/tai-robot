@@ -162,10 +162,13 @@ class TestDisabled:
     def test_no_news_cfg_reads_nothing(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path)
         calls = []
-        monkeypatch.setattr(rsr, "read_signal",
+        import src.news.news_breaker as nb
+        monkeypatch.setattr(nb, "read_signal",
                             lambda *a, **k: calls.append("signal") or (None, ""))
-        monkeypatch.setattr(rsr, "load_events",
+        monkeypatch.setattr(nb, "load_events",
                             lambda *a, **k: calls.append("events") or ([], ""))
+        monkeypatch.setattr(nb, "read_heartbeat",
+                            lambda *a, **k: calls.append("heartbeat") or (None, "missing"))
         assert runner._check_news(IN_SESSION) == []
         assert runner.on_status_poll(IN_SESSION) == []
         assert calls == []
@@ -174,8 +177,11 @@ class TestDisabled:
     def test_disabled_flag_reads_nothing(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, _news_cfg(tmp_path, enabled=False))
         calls = []
-        monkeypatch.setattr(rsr, "read_signal",
+        import src.news.news_breaker as nb
+        monkeypatch.setattr(nb, "read_signal",
                             lambda *a, **k: calls.append("signal") or (None, ""))
+        monkeypatch.setattr(nb, "read_heartbeat",
+                            lambda *a, **k: calls.append("heartbeat") or (None, "missing"))
         _write_signal(tmp_path / "signal.json")
         runner._check_news(IN_SESSION)
         assert calls == []
@@ -217,8 +223,12 @@ class TestRiskOff:
         assert runner.broker.trades == []
         assert runner.news_idle is True
 
-    def test_suppression_blocks_strategy_but_keeps_bars(self, tmp_path):
-        """news_idle must behave like regime_idle: data flows, trading stops."""
+    def test_suppression_runs_the_strategy_and_keeps_bars(self, tmp_path):
+        """Issue #223 R2: news_idle is an entry filter, not an early return.
+
+        A mutant that restores the pre-#223 ``return`` before
+        ``strategy.on_bar`` fails this test (``ran`` stays empty).
+        """
         runner = _make_runner(tmp_path, _news_cfg(tmp_path))
         _write_signal(tmp_path / "signal.json")
         runner._check_news(IN_SESSION)
@@ -230,13 +240,8 @@ class TestRiskOff:
 
         before = len(runner.data_store)
         runner._process_aggregated_bar(_fresh_bar(runner))
-        assert ran == []                       # no trading
+        assert ran == [1]                      # strategy still runs
         assert len(runner.data_store) == before + 1   # bars still flow
-
-        # Positive control: the next bar trades once suppression lifts.
-        runner.news_idle = False
-        runner._process_aggregated_bar(_fresh_bar(runner))
-        assert ran == [1]
 
     def test_clear_releases(self, tmp_path):
         runner = _make_runner(tmp_path, _news_cfg(tmp_path))
@@ -450,9 +455,9 @@ class TestCalendarGate:
         assert runner._calendar_stale_warned is True
 
     def test_gate_deferred_while_a_position_is_open(self, tmp_path):
-        """An events.json refreshed mid-trade must not freeze the open
-        position's stop management — news_idle short-circuits
-        _process_aggregated_bar before the strategy ever runs."""
+        """An events.json refreshed mid-trade must not surprise-flatten.
+        The calendar planner still waits until the position is flat
+        (issue #223 keeps stops alive once a gate does engage)."""
         runner = _make_runner(tmp_path, _news_cfg(tmp_path))
         _open_position(runner)
         _write_events(tmp_path / "events.json",
@@ -499,8 +504,9 @@ class TestCalendarGate:
         runner = _make_runner(tmp_path, _news_cfg(tmp_path))
         _write_events(tmp_path / "events.json", [])
         parses = []
-        real = rsr.load_events
-        monkeypatch.setattr(rsr, "load_events",
+        import src.news.news_breaker as nb
+        real = nb.load_events
+        monkeypatch.setattr(nb, "load_events",
                             lambda p: parses.append(p) or real(p))
         for i in range(10):
             runner._check_news(IN_SESSION + timedelta(seconds=30 * i))
@@ -510,8 +516,9 @@ class TestCalendarGate:
         runner = _make_runner(tmp_path, _news_cfg(tmp_path))
         _write_events(tmp_path / "events.json", [])
         parses = []
-        real = rsr.load_events
-        monkeypatch.setattr(rsr, "load_events",
+        import src.news.news_breaker as nb
+        real = nb.load_events
+        monkeypatch.setattr(nb, "load_events",
                             lambda p: parses.append(p) or real(p))
         runner._check_news(IN_SESSION)
         runner._check_news(IN_SESSION + timedelta(seconds=301))

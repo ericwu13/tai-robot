@@ -320,6 +320,7 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     info["last_decision"] = decisions[-1] if decisions else None
     info["regime"] = (regime_summary(read_regime_state(bot_dir), sess)
                       if _is_regime_bot(sess) else None)
+    info["risk_off"] = risk_off_view(sess)
     info["pending"] = pending(bot_dir)
     info["headless"] = headless_live(bot_dir, pid_alive_fn)
     running = info["state"] in ("RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT",
@@ -410,6 +411,7 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
             "last_price": None, "last_bar_dt": "", "saved_at": "", "real": None,
             "last_decision": None, "regime": None,
+            "risk_off": risk_off_view({}),
             "pending": {"stop": False, "mode": None}, "headless": False,
             "active": True}
 
@@ -708,6 +710,60 @@ def _read_json_dict(path: str):
     bridge wrote it, minutes before its next write.
     """
     return _read_if_changed(path, fileio.read_json, lambda d: isinstance(d, dict))
+
+
+def _opt_age(value) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return round(float(value), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def risk_off_view(sess: dict) -> dict:
+    """Fleet/detail risk-off block. Always present.
+
+    A bot with no ``news_enabled`` key (an older session.json) is
+    explicitly off, never a blank. Source ages are what the bot last
+    wrote into ``news_health``; this reader does not open the bridge
+    files.
+    """
+    if not isinstance(sess, dict):
+        sess = {}
+    enabled = bool(sess.get("news_enabled"))
+    scope = str(sess.get("news_suppress_scope") or "both")
+    health = sess.get("news_health") if isinstance(sess.get("news_health"), dict) else {}
+    news = sess.get("news") if isinstance(sess.get("news"), dict) else {}
+    gate = str(health.get("gate") or "")
+    if not enabled:
+        gate = "off"
+    elif gate not in ("suppressed", "clear", "off"):
+        suppressed = bool(news.get("signal_suppressed") or news.get("event_suppressed"))
+        gate = "suppressed" if suppressed else "clear"
+    reason = str(health.get("gate_reason") or news.get("suppressed_reason") or "")
+    block_reason = str(health.get("entries_blocked_reason") or "")
+    hb_age = _opt_age(health.get("heartbeat_age_sec")) if enabled else None
+    sources = {
+        "signal_age_sec": _opt_age(health.get("signal_age_sec")) if enabled else None,
+        "heartbeat_age_sec": hb_age,
+        "events_age_sec": _opt_age(health.get("events_age_sec")) if enabled else None,
+        "votes_age_sec": _opt_age(health.get("votes_age_sec")) if enabled else None,
+    }
+    return {
+        "enabled": enabled,
+        "directional": enabled and scope == "conflicting_leg",
+        "tier2": enabled and bool(sess.get("news_tier2_enabled")),
+        "scope": scope if enabled else "",
+        "gate": gate,
+        "gate_reason": redact_line(reason) if enabled else "",
+        "blocks_entries": bool(health.get("entries_blocked")) if enabled else False,
+        "entries_blocked_reason": redact_line(block_reason) if enabled else "",
+        "heartbeat_age_sec": hb_age,
+        "heartbeat_status": str(health.get("heartbeat_status") or "") if enabled else "",
+        "sources": sources,
+        "label": "risk-off: on" if enabled else "risk-off: off",
+    }
 
 
 def _news_blocks_leg(sess: dict) -> bool:

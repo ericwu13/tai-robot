@@ -5,45 +5,20 @@ NIGHT session, swaps between long/short strategies at session boundaries,
 and tracks genuine switching P&L from its own SimulatedBroker.
 
 Phase 2 of the news framework hangs off the same 30s poll: after the
-regime steps, ``_check_news`` reads the circuit-breaker signal file and
-the scheduled-event calendar and executes whatever
-``src.news.circuit_breaker`` plans. All branching lives in that pure
-module; everything here is execution.
+regime steps, ``_check_news`` (the shared ``NewsBreaker``) reads the
+circuit-breaker signal file and the scheduled-event calendar. Branching
+lives in ``src.news.circuit_breaker``; this class only adds the
+regime-only hooks (revert, tier-2 deploy, event-risk stamp).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 
-from ..news.circuit_breaker import (
-    CLEAR_EVENT,
-    DEPLOY_NEWS,
-    DISCORD,
-    FLATTEN,
-    SRC_EVENT,
-    SRC_SIGNAL,
-    STAMP_EVENT,
-    STAMP_NOTICE,
-    SUPPRESS,
-    UNSUPPRESS,
-    BreakerState,
-    plan_calendar_gate,
-    plan_signal_actions,
-    plan_suppression_maintenance,
-    should_revert_news,
-)
-from ..news.event_calendar import (
-    active_event,
-    calendar_stale,
-    load_events,
-    next_session,
-    read_updated_at,
-    upcoming_event,
-)
-from ..news.signal_file import SignalLedger, read_signal
+from ..news.circuit_breaker import should_revert_news
+from ..news.event_calendar import next_session
 from ..regime.manager import RegimeManager
 from ..regime.state_machine import RegimeConfig
 from ..regime.switch_logic import (
@@ -120,6 +95,7 @@ class RegimeSwitchingRunner(LiveRunner):
             strategy, symbol, point_value=point_value,
             log_dir=log_dir, bot_name=bot_name,
             strategy_display_name=strategy_display_name or "Regime Switching",
+            news_cfg=news_cfg,
         )
         self.regime_idle = True
         self._regime_cfg = regime_cfg
@@ -145,54 +121,9 @@ class RegimeSwitchingRunner(LiveRunner):
         # Callback fired on strategy swap — wired to DiscordNotifier by the GUI
         self.on_regime_swap_cb: Callable[[str, str, str], None] | None = None
 
-        # ── News circuit breaker (Phase 2) ──
-        # Disabled by default: _news_enabled False means _check_news
-        # returns before touching the filesystem, so a bot without a news
-        # config behaves exactly as it did before this feature existed.
-        self._news_cfg = news_cfg
-        self._news_enabled = bool(news_cfg is not None and news_cfg.enabled)
-        self._breaker_state = BreakerState()
-        self._ledger: SignalLedger | None = None
-        if self._news_enabled:
-            # A missing ledger_path must NOT mean "no dedup" — without a
-            # ledger a single risk_off re-flattens on every 30s poll for
-            # its whole freshness window. Default it into the bot folder.
-            ledger_path = news_cfg.ledger_path or os.path.join(
-                self.bot_dir, "news_ledger.json")
-            try:
-                self._ledger = SignalLedger(ledger_path)
-            except Exception as e:
-                # No ledger = no exactly-once guarantee. Acting on every
-                # poll is worse than not acting, so shut the feature off.
-                self._news_enabled = False
-                logger.warning(
-                    "[NEWS] Could not open signal ledger %s: %s — "
-                    "news framework DISABLED for this session",
-                    ledger_path, e)
-        # Always log the FINAL news state — a deploy that silently dropped the
-        # flag (or lost it to the ledger-failure path above) must be visible in
-        # the log instead of going unnoticed.
-        if self._news_enabled:
-            logger.info(
-                "[NEWS] 新聞斷路器啟用 News circuit breaker ENABLED "
-                "(tier2=%s, signal=%s, votes=%s)",
-                self._news_cfg.tier2_enabled,
-                self._news_cfg.signal_path,
-                getattr(self._news_cfg, "regime_vote_path", ""))
-        else:
-            logger.info(
-                "[NEWS] 新聞斷路器停用 News circuit breaker DISABLED "
-                "for this deploy")
-        # Event-calendar cache (path mtime + last parse time)
-        self._events_cache: list = []
-        self._events_updated_at: str = ""
-        self._events_mtime: float = -1.0
-        self._events_read_at: datetime | None = None
-        self._events_error: str = ""
-        self._calendar_stale_warned: bool = False
-        # Callback for news announcements — wired to the regime Discord
-        # channel by the GUI. Never holds an ID itself.
-        self.on_news_notify_cb: Callable[[str], None] | None = None
+        # Votes are a regime input. A plain runner leaves this False and
+        # never stats the vote file.
+        self.reads_regime_votes = True
 
         # Re-arm any unexecuted recommendation from a prior run
         pending = self._manager.get_pending_recommendation()
@@ -538,87 +469,9 @@ class RegimeSwitchingRunner(LiveRunner):
             logger.warning("[REGIME-VOTE] failed to read votes: %s", exc)
             return []
 
-    # ── News circuit breaker (Phase 2) ──
-
-    def _check_news(self, now) -> list[str]:
-        """Signal → revert → calendar. Returns GUI status lines.
-
-        Each step is isolated: a broken calendar file must not stop the
-        signal from being read, and neither can take the 30s poll down.
-        """
-        if not self._news_enabled:
-            return []
-        if now is None:
-            now = datetime.now(_TZ_TAIPEI)
-        elif now.tzinfo is None:
-            now = now.replace(tzinfo=_TZ_TAIPEI)
-        lines: list[str] = []
-        # Maintenance runs LAST so it sees post-signal/post-calendar
-        # state: a risk_off re-fired this same poll has already
-        # refreshed the session stamp (no false expiry), and the
-        # reminder reflects what is still standing after the calendar
-        # stamped or cleared its gate.
-        for step, label in ((self._check_news_signal, "signal"),
-                            (self._check_news_revert, "revert"),
-                            (self._check_event_calendar, "calendar"),
-                            (self._check_news_maintenance, "maintenance")):
-            try:
-                lines.extend(step(now))
-            except Exception as e:
-                logger.exception("[NEWS] %s step failed: %s", label, e)
-                lines.append(f"[NEWS] {label} error: {e}")
-        return lines
-
-    def _check_news_signal(self, now) -> list[str]:
-        """Read the circuit-breaker signal file and execute its plan."""
-        cfg = self._news_cfg
-        signal, reject = read_signal(
-            cfg.signal_path, now, cfg.max_signal_age_sec)
-        if signal is None:
-            # The overwhelmingly common case is "no file" — debug, not
-            # a warning, or a bot with no pending signal logs every 30s.
-            if reject:
-                logger.debug("[NEWS] no actionable signal: %s", reject)
-            return []
-
-        consumed = (self._ledger.is_consumed(signal.signal_id)
-                    if self._ledger is not None else False)
-        side = self.broker.position_side
-        decision = plan_signal_actions(
-            signal,
-            consumed,
-            cfg.tier2_enabled,
-            self.broker.has_open_position(),
-            self._breaker_state,
-            in_replay=bool(self.suppress_strategy or self._is_reloading),
-            suppress_scope=getattr(cfg, "suppress_scope", "both") or "both",
-            position_side=side.value.lower() if side else "",
-            session_key=self._news_session_key(now),
-        )
-        if not decision:
-            return []
-        logger.info("[NEWS] Acting on signal %s (%s)",
-                    signal.signal_id, signal.action)
-        return self._execute_breaker(decision, now,
-                                     label=f"signal {signal.action}")
-
-    def _check_news_maintenance(self, now) -> list[str]:
-        """Expire an unrefreshed signal suppression; remind while gated.
-
-        Pure decision in :func:`plan_suppression_maintenance`; this is
-        wiring only. Skipped during replay — the restored suppression
-        must survive until the poll loop sees a real session key.
-        """
-        if self.suppress_strategy or self._is_reloading:
-            return []
-        st = self._breaker_state
-        if not st.suppressed:
-            return []
-        decision = plan_suppression_maintenance(
-            st, self._news_session_key(now))
-        if not decision:
-            return []
-        return self._execute_breaker(decision, now, label="maintenance")
+    # News poll, ledger, calendar and heartbeat live on NewsBreaker
+    # (self._check_news). This class keeps the regime-only hooks the
+    # shared breaker calls: revert, tier-2 deploy, event-risk stamp.
 
     def _check_news_revert(self, now) -> list[str]:
         """Hand a deployed event strategy back to regime control.
@@ -661,155 +514,6 @@ class RegimeSwitchingRunner(LiveRunner):
         self._emit("on_status", line)
         return [line]
 
-    def _check_event_calendar(self, now) -> list[str]:
-        """Stamp/clear ``_event_risk`` from the scheduled-event calendar."""
-        cfg = self._news_cfg
-        if not cfg.events_path:
-            return []
-        events = self._load_events_cached(now)
-        stale = calendar_stale(self._events_updated_at, now)
-        if stale:
-            if not self._calendar_stale_warned:
-                self._calendar_stale_warned = True
-                detail = (self._events_error
-                          or f"updated_at={self._events_updated_at!r}")
-                logger.warning(
-                    "[NEWS] Event calendar unusable or stale (%s) — "
-                    "event gating disabled (fail open)", detail)
-        else:
-            self._calendar_stale_warned = False
-
-        min_sev = cfg.calendar_min_severity or "high"
-        act_ev = None if stale else active_event(events, now, min_sev)
-        up_ev = None if stale else upcoming_event(events, now, min_sev)
-        has_position = self.broker.has_open_position()
-        decision = plan_calendar_gate(act_ev, up_ev, stale,
-                                      self._breaker_state, has_position)
-        if not decision:
-            if (act_ev or up_ev) and has_position:
-                # Deferred: suppression freezes the bar pipeline before
-                # the strategy runs, which would strand an open trade
-                # without stop management. Gating waits for it to exit.
-                logger.debug(
-                    "[NEWS] Event gate deferred while a position is open: %s",
-                    (act_ev or up_ev).name)
-            return []
-        return self._execute_breaker(decision, now, label="calendar")
-
-    def _load_events_cached(self, now) -> list:
-        """Parse the calendar at most every 5 min (or when mtime moves)."""
-        path = self._news_cfg.events_path
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            mtime = -1.0
-        expired = (
-            self._events_read_at is None
-            or (now - self._events_read_at).total_seconds() >= _EVENTS_REFRESH_SEC
-        )
-        if mtime != self._events_mtime or expired:
-            events, err = load_events(path)
-            self._events_cache = events
-            self._events_updated_at = read_updated_at(path)
-            self._events_mtime = mtime
-            self._events_read_at = now
-            if err and err != self._events_error:
-                logger.warning("[NEWS] Event calendar: %s", err)
-            self._events_error = err
-        return self._events_cache
-
-    def _execute_breaker(self, decision, now, label: str) -> list[str]:
-        """Run a planned action list, then ALWAYS mark the signal consumed.
-
-        The ledger write lives in ``finally`` on purpose: an action that
-        throws (swap refused, Discord down, disk full) must not leave the
-        signal armed to be re-executed on the next 30s poll — a risk_off
-        that flattens on every poll for its whole freshness window is
-        exactly the failure the ledger exists to prevent.
-        """
-        lines: list[str] = []
-        mark_id = decision.consumed_id
-        try:
-            for act in decision.executable:
-                line = self._apply_breaker_action(act, now)
-                if line:
-                    lines.append(line)
-                    self._emit("on_status", line)
-        except Exception as e:
-            logger.exception("[NEWS] Action failed (%s): %s", label, e)
-            self._news_notify(
-                f"⚠️ **新聞斷路器執行失敗 News breaker action failed** "
-                f"(`{label}`)\n`[{type(e).__name__}] {e}`\n"
-                "訊號已標記為已處理，不會重試 signal marked consumed, no retry")
-            lines.append(f"[NEWS] {label} action error: {e}")
-        finally:
-            if mark_id and self._ledger is not None:
-                self._ledger.mark_consumed(mark_id)
-            self._sync_news_idle()
-            self._auto_save_session()
-        return lines
-
-    def _apply_breaker_action(self, act, now) -> str:
-        """Execute ONE planned action. Returns a status line (or "")."""
-        st = self._breaker_state
-        kind = act.kind
-
-        if kind == FLATTEN:
-            price = self.force_close_position(act.arg, act.reason)
-            if price:
-                return f"[NEWS] Flattened @ {price:,} — {act.reason}"
-            return "[NEWS] Flatten skipped — already flat"
-
-        if kind in (SUPPRESS, UNSUPPRESS):
-            on = kind == SUPPRESS
-            # Per-source, never a shared boolean: a `clear` releasing the
-            # signal source must leave an event gate standing.
-            if act.arg == SRC_EVENT:
-                st.event_suppressed = on
-            elif act.arg == SRC_SIGNAL:
-                st.signal_suppressed = on
-                # Direction/severity gate per-leg; the session key is the
-                # expiry anchor (a re-fired risk_off refreshes it).
-                st.signal_direction = act.direction if on else ""
-                st.signal_severity = act.severity if on else ""
-                st.signal_session_key = act.session_key if on else ""
-                st.signal_suppressed_at = (
-                    now.strftime("%Y-%m-%d %H:%M") if on else "")
-            else:
-                logger.warning("[NEWS] Unknown suppression source: %r", act.arg)
-                return ""
-            if on:
-                st.suppressed_reason = act.reason
-            elif not st.suppressed:
-                st.suppressed_reason = ""
-            verb = "suppressed" if on else "released"
-            return f"[NEWS] Entries {verb} ({act.arg}): {act.reason}"
-
-        if kind == STAMP_NOTICE:
-            st.notice_session_key = act.arg
-            return ""
-
-        if kind == DEPLOY_NEWS:
-            return self._deploy_news_strategy(act.arg, now)
-
-        if kind == STAMP_EVENT:
-            st.event_name = act.arg
-            self._manager.set_event_risk(act.arg)
-            return f"[NEWS] Event risk stamped: {act.arg}"
-
-        if kind == CLEAR_EVENT:
-            prev = st.event_name
-            st.event_name = ""
-            self._manager.set_event_risk("")
-            return f"[NEWS] Event risk cleared: {prev}"
-
-        if kind == DISCORD:
-            self._news_notify(act.reason)
-            return ""
-
-        logger.warning("[NEWS] Unknown breaker action kind: %r", kind)
-        return ""
-
     def _deploy_news_strategy(self, direction: str, now) -> str:
         """Emergency swap to the forced-entry event strategy.
 
@@ -849,37 +553,13 @@ class RegimeSwitchingRunner(LiveRunner):
 
     def _news_session_key(self, now) -> str:
         """The session a news deploy belongs to: live one, else the next."""
-        sess = current_session(now)
-        if sess is not None:
-            return sess.key
-        nxt = next_session(now)
-        return nxt.key if nxt is not None else ""
+        return self._news.session_key(now)
 
-    def _sync_news_idle(self) -> None:
-        """Mirror the breaker's suppression onto the bar pipeline.
+    def stamp_event_risk(self, name: str) -> None:
+        self._manager.set_event_risk(name)
 
-        Leg-aware: under ``suppress_scope=conflicting_leg`` a directional
-        suppression gates only the leg it would hurt, so this must be
-        re-run whenever ``_active_leg`` changes, not just when the
-        breaker state does — a leg swap can flip the gate either way.
-        """
-        scope = (getattr(self._news_cfg, "suppress_scope", "both") or "both"
-                 if self._news_cfg is not None else "both")
-        st = self._breaker_state
-        self.news_idle = st.gates_leg(self._active_leg, scope)
-        self.news_idle_reason = st.suppressed_reason if self.news_idle else ""
-
-    def _news_notify(self, message: str) -> None:
-        if not message or not callable(self.on_news_notify_cb):
-            return
-        try:
-            self.on_news_notify_cb(message)
-        except Exception:
-            pass  # best-effort; Discord must never break the poll
-
-    @property
-    def breaker_state(self) -> BreakerState:
-        return self._breaker_state
+    def clear_event_risk(self) -> None:
+        self._manager.set_event_risk("")
 
     # ── Classifier bar supply ──
 
@@ -923,25 +603,9 @@ class RegimeSwitchingRunner(LiveRunner):
 
     def restore_session(self, session_data: dict) -> int:
         n = super().restore_session(session_data)
-        # News breaker state first: a risk_off suppression must survive a
-        # restart, otherwise a crash-and-resume silently re-enables
-        # entries the operator (or n8n) deliberately shut off. A saved
-        # "news_*" leg is NOT re-instantiated below — the revert step
-        # hands the bot back to regime control at the next gap.
-        #
-        # Only when news is enabled for THIS deploy. Restoring a
-        # suppression into a bot the user just opted out of would idle it
-        # with no poller left to ever clear the flag.
-        if self._news_enabled:
-            self._breaker_state = BreakerState.from_dict(session_data.get("news"))
-            self._sync_news_idle()
-            if self._breaker_state.suppressed:
-                logger.info("[NEWS] Restored suppression from session: %s",
-                            self._breaker_state.suppressed_reason or "(no reason)")
-        elif session_data.get("news"):
-            logger.info("[NEWS] Ignoring persisted breaker state — news is "
-                        "disabled for this deploy")
-
+        # super() restored the breaker while _active_leg was still idle.
+        # A saved "news_*" leg is NOT re-instantiated below — the revert
+        # step hands the bot back to regime control at the next gap.
         saved_leg = session_data.get("active_leg", "idle")
         if saved_leg in ("long", "short"):
             name = (self._long_strategy_name if saved_leg == "long"
@@ -988,17 +652,11 @@ class RegimeSwitchingRunner(LiveRunner):
                 "active_leg": self._active_leg,
                 "long_strategy": self._long_strategy_name,
                 "short_strategy": self._short_strategy_name,
-                # Per-bot news enablement, so the deploy dialog can
-                # pre-tick this bot's own choice on resume (settings.yaml
-                # only supplies the default for a brand-new bot).
-                "news_enabled": self._news_enabled,
-                "news_tier2_enabled": bool(
-                    self._news_cfg.tier2_enabled if self._news_cfg else False),
-                "news_suppress_scope": (
-                    getattr(self._news_cfg, "suppress_scope", "both")
-                    if self._news_cfg else "both"),
-                "news": self._breaker_state.to_dict(),
             })
+            # Per-bot news enablement, so the deploy dialog can pre-tick
+            # this bot's own choice on resume. Same fields a plain runner
+            # writes — one writer, NewsBreaker.session_fields.
+            data.update(self._news.session_fields())
             save_session(self._session_path, data)
         except Exception:
             pass

@@ -48,9 +48,12 @@ def _resolve(settings=None, *, regime=True, news=True, tier2=False,
 # ── Gating ──
 
 class TestGating:
-    def test_regime_off_is_none_even_with_news_ticked(self):
-        """The breaker rides RegimeSwitchingRunner's poll — no regime, no news."""
-        assert _resolve(regime=False, news=True) is None
+    def test_plain_bot_news_resolves_without_regime(self):
+        """Issue #223: --news does not require --regime. A plain bot gets
+        the same NewsConfig a regime bot would."""
+        cfg = _resolve(regime=False, news=True)
+        assert cfg is not None and cfg.enabled is True
+        assert cfg.signal_path.endswith("sig.json")
 
     def test_regime_off_and_news_off_is_none(self):
         assert _resolve(regime=False, news=False) is None

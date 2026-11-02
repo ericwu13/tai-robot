@@ -382,6 +382,72 @@ def save_state(path: Path, state: dict) -> None:
     os.replace(tmp, path)
 
 
+# os.replace on Windows raises PermissionError while any reader holds the
+# destination. Same budget as regime store._replace (#208): 4 attempts,
+# backing off 5/10/20 ms. Only PermissionError is retried. _sleep is
+# module-level so tests can inject a fake. This bridge stays stdlib-only,
+# so the helper is inlined instead of imported from the bot.
+_REPLACE_ATTEMPTS = 4
+_REPLACE_BACKOFF_S = (0.005, 0.010, 0.020)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _replace_heartbeat(tmp: str, path: str) -> None:
+    """Move ``tmp`` onto ``path``. Retry PermissionError only."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= _REPLACE_ATTEMPTS:
+                raise
+            _sleep(_REPLACE_BACKOFF_S[attempt])
+
+
+def write_heartbeat_file(path: str | os.PathLike, now: datetime, source: str = "w2") -> None:
+    """Rewrite the W2 liveness file. Schema is src.news.heartbeat (version 1).
+
+    Inlined so this bridge stays stdlib-only. The age limit is NOT here —
+    the bot reads DEFAULT_MAX_HEARTBEAT_AGE_SEC. Never raises: a completed
+    quote pass must not be reported as failed because the heartbeat write
+    failed. ``os.replace`` retries ``PermissionError`` with a short backoff
+    so one shared read does not drop the cycle's liveness stamp.
+    """
+    try:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=_TZ_TAIPEI)
+        payload = {
+            "version": 1,
+            "source": source,
+            "written_at": now.isoformat(),
+        }
+        path = str(path)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_heartbeat(tmp, path)
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  heartbeat write failed: {type(e).__name__}: {e}")
+
+
+def _heartbeat_path(args) -> str:
+    return str(getattr(args, "heartbeat_out", None) or getattr(args, "heartbeat_path", None) or "")
+
+
+def _emit_heartbeat(args, now: datetime) -> None:
+    path = _heartbeat_path(args)
+    if path:
+        write_heartbeat_file(path, now)
+
+
 def night_session_key(now: datetime) -> str:
     """Return the NIGHT session key this vote targets.
 
@@ -648,6 +714,7 @@ def check_once(args, state: dict) -> dict:
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_result"] = summary
     append_log(log_path_for(args), f"{now:%Y-%m-%d %H:%M:%S} TPE | {summary}")
+    _emit_heartbeat(args, now)
 
     return state
 
@@ -655,6 +722,9 @@ def check_once(args, state: dict) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cross-market monitor -> signal.json")
     ap.add_argument("--signal-out", required=True, help="signal.json path the bot reads")
+    ap.add_argument("--heartbeat-out", default=None,
+                    help="W2 liveness JSON rewritten every cycle "
+                         "(settings news.heartbeat_path when omitted)")
     ap.add_argument("--vote-out", default=None,
                     help="regime_vote.json path (regime confirmation acceleration)")
     ap.add_argument("--once", action="store_true", help="single check then exit")
@@ -683,6 +753,11 @@ def main() -> int:
             news = _cfg.get("news", {}) or {}
             if not args.discord_webhook:
                 args.discord_webhook = news.get("discord_webhook") or None
+            if not args.heartbeat_out:
+                raw = str(news.get("heartbeat_path", "") or "")
+                if raw and not os.path.isabs(raw):
+                    raw = os.path.join(os.path.dirname(os.path.abspath(args.settings)), raw)
+                args.heartbeat_path = raw
             if getattr(args, "w2_hot_lane_enabled", None) is None:
                 args.w2_hot_lane_enabled = bool(
                     news.get("w2_hot_lane_enabled", False))
@@ -698,6 +773,7 @@ def main() -> int:
     if args.force_fire:
         sid = write_signal(args.signal_out, args.force_fire,
                            f"manual --force-fire {args.force_fire}", "manual-tap")
+        _emit_heartbeat(args, datetime.now(_TZ_TAIPEI))
         post_discord(args.discord_webhook,
                      f"🖐️ 手動訊號 manual signal written: `{args.force_fire}`")
         append_log(log_path_for(args),
@@ -717,6 +793,7 @@ def main() -> int:
                 save_state(state_path, state)
             else:
                 print(f"[{datetime.now(_TZ_TAIPEI):%H:%M}] outside active window — idle")
+                _emit_heartbeat(args, datetime.now(_TZ_TAIPEI))
             time.sleep(args.loop)
     else:
         state = check_once(args, state)
