@@ -53,6 +53,9 @@ must be one of `long` / `short` / `idle`.
 
 - **`mode_override.json` can only flip `trading_mode` on an ALREADY
   RUNNING bot.** It cannot start one, and it is not a deploy mechanism.
+  A headless bot refuses `auto`, `real`, and any other live/real-money
+  mode from that file (`allow_live_override` does not bypass it); `paper`
+  still applies. `deploy --mode auto` is unchanged.
 - **Empty `news.regime_vote_path` is the historical miswiring**: with `""`
   the runner's `_read_regime_vote` is inert, so every W2/W3/W4 vote file
   expires unread and the regime brain silently runs vote-free. It looks

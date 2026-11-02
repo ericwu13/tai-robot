@@ -40,9 +40,10 @@ from src.live.headless import (
     HeadlessConfigError, HeadlessPolicy, apply_control_command,
     build_deploy_request, clear_stop_file, consume_control_file,
     control_fingerprint, policy_from_args, quarantine_stale_control,
-    request_stop, resolve_strategy_name, stop_requested,
+    remove_headless_marker_if_ours, request_stop, resolve_strategy_name,
+    stop_requested, write_headless_marker,
 )
-from src.live.live_runner import LiveRunner
+from src.live.live_runner import LiveRunner, arm_headless_file_guard
 from src.live import mode_request as mreq
 from src.live.session_store import load_session
 
@@ -76,6 +77,12 @@ class HeadlessBotApp(rb.BacktestApp):
     def _alert(self, title: str, message: str) -> None:
         self.alerts.append((title, message))
         rb._log(f"[HEADLESS ERROR] {title}: {message}")
+
+    def _drop_stale_headless_marker(self, bot_dir: str) -> None:
+        # The GUI hook deletes a crashed run's marker. This process writes
+        # its own after the lock is held, and must not drop one that is
+        # already there before that write.
+        return
 
     def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc,
                                    price, action_type, price_source="",
@@ -202,6 +209,9 @@ class DeployDriver(_Driver):
         app, args = self.app, self.args
         base_dir = os.path.join(rb.project_root, "data", "live")
         self.bot_dir = LiveRunner.bot_dir_for(base_dir, args.symbol, args.bot)
+        # The marker is written in _deploy, after acquire_lock. Writing it
+        # here would let a refused second instance replace, then delete,
+        # the running bot's marker.
         session = load_session(os.path.join(self.bot_dir, "session.json"))
         if args.resume and session is None:
             self.finish(EXIT_USAGE, f"--resume but no session.json in {self.bot_dir}")
@@ -264,19 +274,30 @@ class DeployDriver(_Driver):
         try:
             ok = self.app._deploy_live_from(self.req)
             runner = getattr(self.app, "_live_runner", None)
+            if runner is not None:
+                # This process is the headless driver. Arm even when the
+                # deploy request was tagged gui — a file drop must not
+                # escalate it. deploy --mode auto already set trading_mode.
+                # Guarded setattr: a bare object() fake must not raise.
+                arm_headless_file_guard(runner)
             if not ok or runner is None:
                 why = "; ".join(f"{t}: {m.splitlines()[0]}" for t, m in self.app.alerts) \
                     or self.app.status_var.get()
                 self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
             else:
+                # acquire_lock has run. OSError is logged inside the helper.
+                write_headless_marker(self.bot_dir)
                 rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP, "
                         f"CONTROL, and Ctrl+C every 2s")
                 self._write_capabilities()
         finally:
             # Once a runner exists, the poll is scheduled even if the
             # deploy log raised. A refused deploy sets exit_code and
-            # does not schedule another turn.
+            # does not schedule another turn. Arm again here so a runner
+            # created before that raise is still guarded.
             runner = getattr(self.app, "_live_runner", None)
+            if runner is not None:
+                arm_headless_file_guard(runner)
             if runner is not None and getattr(self, "exit_code", None) is None:
                 self.root.after(self.POLL_MS, self._poll)
 
@@ -495,11 +516,23 @@ def run_deploy(args) -> int:
     if app is None:
         return code
     driver = DeployDriver(app, args)
-    driver.start()
-    if driver.exit_code is None:
-        app.root.mainloop()
-    _teardown(app)
-    return driver.exit_code if driver.exit_code is not None else EXIT_BOT_STOPPED
+    try:
+        return _drive_until_exit(driver, app)
+    finally:
+        _teardown(app)
+
+
+def _drive_until_exit(driver, app) -> int:
+    """Run deploy until the bot exits. The marker is removed in ``finally``."""
+    try:
+        driver.start()
+        if driver.exit_code is None:
+            app.root.mainloop()
+        return driver.exit_code if driver.exit_code is not None else EXIT_BOT_STOPPED
+    finally:
+        bot_dir = getattr(driver, "bot_dir", "") or ""
+        if bot_dir:
+            remove_headless_marker_if_ours(bot_dir)
 
 
 def run_backtest(args) -> int:

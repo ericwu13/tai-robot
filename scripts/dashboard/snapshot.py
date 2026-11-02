@@ -27,10 +27,13 @@ from scripts.monitor.check_bots import (
 )
 from scripts.monitor.check_logs import PATTERNS
 from scripts.monitor.common import (
-    TZ_TPE, discover_bot_dirs, pid_alive, redact,
+    TZ_TPE, discover_bot_dirs, pid_alive, pid_alive_strict, redact,
 )
 from scripts.dashboard import fileio, real_pnl
-from src.live.headless import stop_requested
+from src.live.headless import (
+    headless_marker_path, parse_headless_marker, process_create_time,
+    stop_requested,
+)
 from src.utils.log_redact import scrub_ids
 
 # A stopped bot with no file activity in this window is retired and is
@@ -319,6 +322,7 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
                       if _is_regime_bot(sess) else None)
     info["pending"] = pending(bot_dir)
     info["supports_mode_request"] = supports_mode_request(bot_dir, info.get("pid"))
+    info["headless"] = headless_live(bot_dir, pid_alive_fn)
     running = info["state"] in ("RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT",
                                 "CRASHED", "UNKNOWN")
     info["active"] = running or (
@@ -371,6 +375,58 @@ def _mode_result(bot_dir: str) -> dict | None:
             "at": str(data.get("at") or "")[:19].replace("T", " ")}
 
 
+# Process creation time and the marker's started_at are both second-resolution.
+_CREATE_TIME_TOLERANCE_S = 2.0
+
+
+def _parse_started_at(text: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def headless_live(bot_dir: str, pid_alive_fn=None, *, create_time_fn=None) -> bool:
+    """True when this directory's running process is the headless deploy.
+
+    The marker must parse, its pid must be the lock pid, and that pid must
+    be strictly alive (access denied is not alive). When the process
+    creation time can be read, ``started_at`` has to match it. A missing
+    creation time leaves the lock-pid check in charge. The read goes
+    through ``fileio`` so it cannot block the bot's ``os.remove``.
+    """
+    marker = parse_headless_marker(fileio.read_json(headless_marker_path(bot_dir)))
+    if marker is None:
+        return False
+    has_lock, lock_pid = read_lock(bot_dir)
+    if not has_lock or lock_pid != marker["pid"]:
+        return False
+    alive = pid_alive_strict if pid_alive_fn is None else pid_alive_fn
+    try:
+        if not alive(marker["pid"]):
+            return False
+    except Exception:  # noqa: BLE001 — an unreadable pid is not a live headless bot
+        return False
+    try:
+        created = (process_create_time if create_time_fn is None else create_time_fn)(
+            marker["pid"])
+    except Exception:  # noqa: BLE001 — a failed clock read must not fail open
+        return False
+    if created is None:
+        return True
+    if not isinstance(created, datetime):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    started = _parse_started_at(marker["started_at"])
+    if started is None:
+        return False
+    return abs((created - started).total_seconds()) <= _CREATE_TIME_TOLERANCE_S
+
+
 def pending(bot_dir: str) -> dict:
     """Control files written but not yet consumed by the bot: the headless
     STOP file, a queued mode_override.json (applied at the next bar), a
@@ -398,7 +454,7 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "last_price": None, "last_bar_dt": "", "saved_at": "", "real": None,
             "last_decision": None, "regime": None,
             "pending": {"stop": False, "mode": None, "request": None, "result": None},
-            "supports_mode_request": False, "active": True}
+            "supports_mode_request": False, "headless": False, "active": True}
 
 
 def market_state(now: datetime) -> dict:
