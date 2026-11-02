@@ -1,9 +1,9 @@
 """Pure helpers for the headless bot CLI (``run_bot_cli.py``).
 
 Nothing in here imports Tk or COM — argument parsing, request building,
-strategy-name resolution, the STOP-file control channel, and the bot
-directory scan are all plain functions so they can be unit-tested and
-reused by scripts/monitor. The Tk-bound driver lives in
+strategy-name resolution, the STOP-file and CONTROL-file channels, and
+the bot directory scan are all plain functions so they can be unit-tested
+and reused by scripts/monitor. The Tk-bound driver lives in
 ``src/live/headless_app.py``.
 """
 
@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -33,6 +34,9 @@ CLI_COMMANDS = frozenset({
 })
 
 STOP_FILENAME = "STOP"
+CONTROL_FILENAME = "CONTROL"
+CONTROL_ACK_FILENAME = "CONTROL.ack"
+CONTROL_STALE_FILENAME = "CONTROL.stale"
 
 # Exit codes (documented in README "Headless CLI")
 EXIT_OK = 0
@@ -49,6 +53,7 @@ EXIT_BACKTEST_FAILED = 7
 # run_backtest.py — keep them byte-identical.
 TITLE_STRATEGY_CHANGE = "策略更換 Strategy Change"
 TITLE_EXISTING_POSITION = "帳戶有持倉 Existing Position"
+TITLE_UNKNOWN_POSITION = "持倉未知 Unknown Position"
 TITLE_DATA_RANGE = "資料範圍不足 Insufficient Data Range"
 
 
@@ -62,6 +67,7 @@ class HeadlessPolicy:
 
     use_selected_strategy: bool = False    # resume: deploy --strategy, not the saved one
     allow_existing_position: bool = False  # real account already holds a position
+    allow_unknown_position: bool = False   # --allow-unknown-position only
     accept_data_range: bool = True         # backtest: less data than requested
 
     def answer(self, title: str) -> bool:
@@ -69,6 +75,8 @@ class HeadlessPolicy:
             return self.use_selected_strategy
         if title == TITLE_EXISTING_POSITION:
             return self.allow_existing_position
+        if title == TITLE_UNKNOWN_POSITION:
+            return self.allow_unknown_position
         if title == TITLE_DATA_RANGE:
             return self.accept_data_range
         # Unknown question: decline. A new GUI prompt must be wired here
@@ -160,6 +168,7 @@ def policy_from_args(args: argparse.Namespace) -> HeadlessPolicy:
     return HeadlessPolicy(
         use_selected_strategy=bool(getattr(args, "strategy", "")),
         allow_existing_position=bool(getattr(args, "allow_existing_position", False)),
+        allow_unknown_position=bool(getattr(args, "allow_unknown_position", False)),
         accept_data_range=True,
     )
 
@@ -188,6 +197,176 @@ def clear_stop_file(bot_dir: str) -> None:
         os.remove(stop_file_path(bot_dir))
     except OSError:
         pass
+
+
+# ── CONTROL-file channel (headless only) ──
+#
+# One command in ``{bot_dir}/CONTROL``. The running bot renames the file
+# to ``CONTROL.ack`` before applying it, so a command runs once.
+# Accepted lines: ``reconnect`` and ``set-mode paper``.
+# ``set-mode auto``, ``set-mode real``, and anything else are rejected.
+# UTF-8 (with or without a BOM) and UTF-16 with a BOM are accepted.
+# Invalid bytes are rejected as garbage and still acknowledged.
+# A file already present at deploy is renamed to ``CONTROL.stale`` and
+# is not applied. If that rename fails, the file is deleted; if the
+# delete also fails, its (mtime, size) is remembered and that exact
+# file is ignored until it changes.
+
+def control_file_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, CONTROL_FILENAME)
+
+
+def control_ack_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, CONTROL_ACK_FILENAME)
+
+
+def control_stale_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, CONTROL_STALE_FILENAME)
+
+
+def _decode_control_bytes(data: bytes) -> str:
+    """Decode CONTROL text. PowerShell 5.1 ``echo`` writes UTF-16 LE + BOM.
+
+    A UTF-8 BOM is stripped. Invalid bytes raise ``UnicodeDecodeError``
+    so the caller can reject the file as one garbage token.
+    """
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
+
+
+def parse_control_command(text: str) -> tuple[str, str | None]:
+    """Return ``(kind, arg)``.
+
+    ``kind`` is ``reconnect``, ``set-mode``, or ``reject``. ``arg`` is
+    ``paper`` for a paper switch, or the rejected line.
+    """
+    line = ""
+    for raw in (text or "").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        line = stripped
+        break
+    parts = line.split()
+    if parts == ["reconnect"]:
+        return "reconnect", None
+    if parts == ["set-mode", "paper"]:
+        return "set-mode", "paper"
+    return "reject", line
+
+
+def consume_control_file(bot_dir: str) -> str | None:
+    """Read ``CONTROL`` and rename it to ``CONTROL.ack``.
+
+    Returns the file text, or None when there is no file (including a
+    second call) or the file could not be read or renamed. A file that
+    was read is always renamed, including when the bytes are not valid
+    text: the returned string is then something ``parse_control_command``
+    rejects. The rename happens before the caller applies the command,
+    so a crash cannot apply it twice.
+    """
+    path = control_file_path(bot_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    try:
+        text = _decode_control_bytes(data)
+    except (OSError, ValueError, UnicodeError):
+        text = "\ufffd"
+    try:
+        os.replace(path, control_ack_path(bot_dir))
+    except OSError:
+        return None
+    return text
+
+
+def control_fingerprint(bot_dir: str) -> tuple:
+    """Identity of the CONTROL file currently in ``bot_dir``.
+
+    ``("stat", mtime_ns, size)`` when the file can be stat'd. A different
+    tuple means the file changed and may be applied. ``("missing",)``
+    when there is no file. ``("unreadable",)`` when it exists but stat
+    fails.
+    """
+    path = control_file_path(bot_dir)
+    if not os.path.exists(path):
+        return ("missing",)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ("unreadable",)
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+    return ("stat", int(mtime_ns), int(st.st_size))
+
+
+def quarantine_stale_control(bot_dir: str) -> tuple[str, str | tuple | None]:
+    """Move a pre-existing ``CONTROL`` aside before the first poll.
+
+    Returns ``(status, detail)``:
+
+    - ``absent`` — no CONTROL file (detail is None)
+    - ``archived`` — renamed to ``CONTROL.stale`` (detail is that path)
+    - ``deleted`` — the rename failed and the file was removed
+    - ``ignored`` — rename and delete both failed; detail is
+      ``control_fingerprint`` so a later poll can skip that exact file
+
+    ``OSError`` from the rename (a directory at ``CONTROL.stale``, a
+    Windows sharing violation, a read-only archive) is caught here.
+    Callers log a warning from the status and still start the poll.
+    """
+    path = control_file_path(bot_dir)
+    if not os.path.isfile(path):
+        return "absent", None
+    stale = control_stale_path(bot_dir)
+    try:
+        os.replace(path, stale)
+    except OSError:
+        return _drop_or_ignore_stale_control(bot_dir)
+    return "archived", stale
+
+
+def _drop_or_ignore_stale_control(bot_dir: str) -> tuple[str, tuple | None]:
+    """Delete CONTROL after a failed archive, or fingerprint it."""
+    path = control_file_path(bot_dir)
+    try:
+        os.remove(path)
+    except OSError:
+        return "ignored", control_fingerprint(bot_dir)
+    return "deleted", None
+
+
+def apply_control_command(
+    text: str,
+    *,
+    reconnect: Callable[[], None],
+    set_mode: Callable[[str], None],
+    log: Callable[[str], None],
+) -> str:
+    """Apply one consumed command.
+
+    ``set-mode paper`` calls ``set_mode`` (the live runner's
+    ``_apply_mode_switch``), which honours ``mode_switch_veto``.
+    ``set-mode auto``, ``set-mode real``, and any other text are
+    rejected here — ``allow_live_override`` is not consulted.
+    Returns ``reconnect``, ``set-mode paper``, or ``reject``.
+    """
+    kind, arg = parse_control_command(text)
+    if kind == "reconnect":
+        log("CONTROL reconnect")
+        reconnect()
+        return "reconnect"
+    if kind == "set-mode" and arg == "paper":
+        log("CONTROL set-mode paper")
+        set_mode("paper")
+        return "set-mode paper"
+    shown = arg if arg else (text or "").strip()
+    log(f"CONTROL rejected: {shown!r}")
+    return "reject"
 
 
 # ── Detached launch (deploy --detach) ──
@@ -516,6 +695,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="suppress only the conflicting leg")
     d.add_argument("--allow-existing-position", action="store_true",
                    help="deploy even if the real account already holds a position")
+    d.add_argument("--allow-unknown-position", action="store_true",
+                   help="deploy even if the real position is UNKNOWN "
+                        "(query failed or timed out); does not allow a known open position")
     d.add_argument("--login-timeout", type=int, default=90,
                    help="seconds to wait for the quote connection (default 90)")
     d.add_argument("--heartbeat-min", type=int, default=5,

@@ -163,8 +163,15 @@ class TestZeroTickStanddown:
         # retry fires. It is not a new session and not a weekend holiday.
         action, _t = _check_at(wd, _taipei_dt(2026, 10, 24, 2, 0))
         assert action == "reconnect"
-        # Monday day open is the next session.
+        # Monday 2026-10-26 is a TAIFEX holiday (issue #198). The
+        # stand-down must not release and must not count another reconnect.
+        held = wd._zero_tick_reconnects
         action, _t = _check_at(wd, _taipei_dt(2026, 10, 26, 8, 50))
+        assert action is None
+        assert wd._stood_down is True
+        assert wd._zero_tick_reconnects == held
+        # Tuesday day open is the next real session.
+        action, _t = _check_at(wd, _taipei_dt(2026, 10, 27, 8, 45))
         assert action == "session_resubscribe"
 
     def test_reset_clears_standdown_inside_the_session(self):
@@ -182,18 +189,21 @@ class TestZeroTickStanddown:
         action, _t = _check_at(wd, start, 730 + 700)
         assert action == "reconnect"
 
-    def test_public_holiday_schedule_still_allows_one_reconnect(self):
-        """The static calendar is not wired into the watchdog.
+    def test_public_holiday_costs_no_reconnect(self):
+        """Issue #198: a static public holiday is closed.
 
-        2026-01-01 is a Thursday public holiday. The schedule at 10:00 is
-        still open, so the first stale-tick reconnect is unchanged.
+        2026-01-01 is a Thursday public holiday. The schedule at 10:00
+        used to look open and spend a reconnect. It now stays quiet and
+        does not count a stand-down.
         """
         wd = TickWatchdog()
         wd.active = True
         dt = _taipei_dt(2026, 1, 1, 10, 0)
         wd.last_tick_time = _ts(dt) - 700
         with _patch_now(dt):
-            assert wd.check(now=_ts(dt)) == "reconnect"
+            assert wd.check(now=_ts(dt)) is None
+        assert wd._zero_tick_reconnects == 0
+        assert wd._stood_down is False
 
     def test_live_tick_restores_the_fast_ladder(self):
         wd = TickWatchdog(zero_tick_reconnect_limit=1, slow_retry_interval=1800)
