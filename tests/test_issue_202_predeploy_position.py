@@ -10,7 +10,9 @@ does not allow an unknown book.
 
 from __future__ import annotations
 
+import os
 import queue
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -281,7 +283,9 @@ def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
 
     driver = DeployDriver.__new__(DeployDriver)
     driver.app = app
-    driver.bot_dir = "issue202-not-a-live-tree"
+    # A successful headless deploy writes headless.json here. Keep it out of
+    # the repo (and out of data/).
+    driver.bot_dir = os.path.join(tempfile.gettempdir(), "issue202-not-a-live-tree")
     driver.req = req
     driver.exit_code = None
     driver.root = app.root
