@@ -13,11 +13,11 @@ a regime bot — so they fail if the check stops noticing them.
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from scripts.monitor.check_evolution import check_evolution, last_due
+from scripts.monitor.check_evolution import check_evolution, last_due, slot_outcome
 from scripts.monitor.common import TZ_TPE
 
 NOW = datetime(2026, 9, 2, 12, 0, tzinfo=TZ_TPE)      # Wednesday
@@ -700,7 +700,11 @@ def test_changelog_pass_is_read_as_machine_local_time(tmp_path, repo):
     local = pass_at.astimezone().replace(tzinfo=None)
     write_json(repo / "data" / "changelog.json", [
         {"date": local.strftime("%Y-%m-%d %H:%M:%S"),
+         "version_before": "DynamicExitPullbackStrategyV2",
          "version_after": "DynamicExitPullbackStrategyV2Evo1",
+         "change_summary":
+         "promotion_gate=relative; auto-evolution pool-validated; "
+         "plan excerpt: EVO_RELATIVE_GATE passed=false at=2026-08-29T05:20:00",
          "initiated_by": "ai"}])
     findings, lines = run(tmp_path, repo)
     assert any("PASS (changelog only; pool validation not observed): "
@@ -720,7 +724,9 @@ def test_changelog_only_pass_is_not_labelled_pool_validated(tmp_path, repo):
     local = pass_at.astimezone().replace(tzinfo=None)
     write_json(repo / "data" / "changelog.json", [
         {"date": local.strftime("%Y-%m-%d %H:%M:%S"),
+         "version_before": "DynamicExitPullbackStrategyV2",
          "version_after": "DynamicExitPullbackStrategyV2Evo1",
+         "change_summary": "auto-evolution pool-validated",
          "initiated_by": "ai"}])
     _, lines = run(tmp_path, repo)
     assert any(ln.startswith(
@@ -765,3 +771,132 @@ def test_pool_db_is_opened_read_only(tmp_path, repo):
     run(tmp_path, repo)
     assert db.read_bytes() == before
     assert not (repo / "data" / "evolution_pool.db-journal").exists()
+
+
+def _local_changelog_stamp(when_tpe: datetime) -> str:
+    """Machine-local naive stamp, the shape ``append_changelog`` writes."""
+    return when_tpe.astimezone().replace(tzinfo=None).strftime(
+        "%Y-%m-%d %H:%M:%S")
+
+
+def _relative_gate_marker(when_tpe: datetime, *, passed: bool) -> dict:
+    flag = "true" if passed else "false"
+    at = when_tpe.strftime("%Y-%m-%dT%H:%M:%S")
+    return {
+        "date": _local_changelog_stamp(when_tpe),
+        "strategy": "BbandSmaShortV3",
+        "version_before": "BbandSmaShortV3",
+        "version_after": "BbandSmaShortV3",
+        "change_summary": (
+            "EVO_RELATIVE_GATE record only; no strategy change; "
+            f"passed={flag} at={at}"),
+        "initiated_by": "ai",
+    }
+
+
+def test_relative_gate_fail_marker_is_not_a_pass(tmp_path, repo):
+    """A FAIL Saturday writes only an EVO_RELATIVE_GATE row (#188).
+
+    That row is not a promotion. Reporting it as a changelog PASS is
+    the bug Reed reproduced: slot_outcome returned the base class.
+    """
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    write_json(repo / "data" / "changelog.json", [
+        _relative_gate_marker(DUE + timedelta(minutes=15), passed=False),
+    ])
+    findings, lines = run(tmp_path, repo)
+    assert not any(ln.startswith("PASS") for ln in lines), lines
+    assert any("candidate designed (watermark advanced; knob mode or "
+               "codegen stopped early): TMF00_0422 at 05:05 TPE" in ln
+               for ln in lines), lines
+    assert not any("stopped at plan phase" in m for m in messages(findings)), \
+        messages(findings)
+    assert not any("BbandSmaShortV3" in ln and "PASS" in ln for ln in lines), \
+        lines
+
+
+def test_relative_gate_marker_alone_does_not_suppress_plan_phase_p3(tmp_path, repo):
+    """No watermark advance and no real promotion: the marker must not
+    hide the plan-phase P3 the way a counted PASS would."""
+    make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    padded = _relative_gate_marker(DUE + timedelta(minutes=25), passed=False)
+    padded["change_summary"] = "  " + padded["change_summary"]
+    write_json(repo / "data" / "changelog.json", [
+        _relative_gate_marker(DUE + timedelta(minutes=15), passed=False),
+        _relative_gate_marker(DUE + timedelta(minutes=20), passed=True),
+        padded,
+    ])
+    findings, lines = run(tmp_path, repo)
+    assert not any(ln.startswith("PASS") for ln in lines), lines
+    assert any("stopped at plan phase" in m
+               for m in messages(findings, "P3")), messages(findings, "P3")
+
+
+def test_pool_uri_requests_read_only_mode(tmp_path, repo, monkeypatch):
+    """``?mode=ro`` has to be on the connect URI.
+
+    ``test_pool_db_is_opened_read_only`` only compares file bytes. A
+    SELECT-only read-write open does not rewrite the file, so dropping
+    the mode would still pass that test.
+    """
+    import scripts.monitor.check_evolution as ce
+
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    write_pool(repo, [("XEvo1", "validated", "2026-08-28T21:29:25+00:00")])
+    seen = []
+    real_connect = ce.sqlite3.connect
+
+    def capture(database, *args, **kwargs):
+        seen.append((database, kwargs.get("uri", False)))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(ce.sqlite3, "connect", capture)
+    _findings, lines = run(tmp_path, repo)
+    assert seen, "pool database was not opened"
+    database, uri_flag = seen[0]
+    assert uri_flag is True
+    assert "mode=ro" in str(database)
+    assert any("PASS: XEvo1 pool-validated at 05:29 TPE" in ln
+               for ln in lines), lines
+
+
+@pytest.mark.parametrize("delta,inside", [
+    (timedelta(minutes=-30), False),
+    (timedelta(0), True),
+    (timedelta(hours=3), True),
+    (timedelta(hours=4), False),
+])
+def test_pool_slot_window_bounds(repo, delta, inside):
+    """Inclusive [due, due+3h].
+
+    due-30min is outside, so a lower bound moved 1h earlier fails.
+    due+4h is outside, so a 24h window fails. The two edges stay inside.
+    """
+    when = DUE + delta
+    utc = when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    write_pool(repo, [("BoundEvo1", "validated", utc)])
+    _advanced, passes, via_changelog = slot_outcome(DUE, [], str(repo))
+    hit = any(name == "BoundEvo1" for name, _ts in passes)
+    assert hit is inside
+    assert via_changelog is False
+
+
+@pytest.mark.parametrize("delta,inside", [
+    (timedelta(minutes=-30), False),
+    (timedelta(0), True),
+    (timedelta(hours=3), True),
+    (timedelta(hours=4), False),
+])
+def test_watermark_slot_window_bounds(tmp_path, delta, inside):
+    """The watermark advance uses the same [due, due+3h] window."""
+    when = DUE + delta
+    mark = {"trade_count": 172, "at": when.strftime("%Y-%m-%d %H:%M:%S")}
+    rows = [(str(tmp_path / "live" / "TMF00_0422"), mark, None)]
+    advanced, passes, via_changelog = slot_outcome(DUE, rows, str(tmp_path))
+    hit = any(name == "TMF00_0422" for name, _ts in advanced)
+    assert hit is inside
+    assert passes == []
+    assert via_changelog is False

@@ -365,13 +365,18 @@ def read_changelog_passes(path: str):
     Its ``date`` is ``datetime.now()``: machine-LOCAL naive time, NOT TPE
     (this box runs UTC-7), so it is read as local time and converted.
     Fallback only; the pool's UTC stamp is the authoritative PASS record.
+
+    ``EVO_RELATIVE_GATE`` rows are verdict records, not promotions
+    (issue #188).  They are skipped with the same anchored prefix as
+    ``_changelog_counts_as_pass``, so a FAIL Saturday is not reported
+    as a changelog PASS.
     """
     data = read_json(path)
     if not isinstance(data, list):
         return []
     out = []
     for entry in data:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or _is_relative_gate_marker(entry):
             continue
         try:
             local = datetime.strptime(str(entry.get("date", "")).strip(),
@@ -397,9 +402,9 @@ def slot_outcome(due, rows, repo_root):
     ``passes`` = ``[(name, ts)]`` for pool-validated candidates created
     in the window; changelog.json is consulted only when the pool has
     none (a pool promote failure skips the changelog too, so the two
-    never disagree in the other direction).  ``via_changelog`` is True
-    when ``passes`` came from that fallback — those are not pool
-    validations.
+    never disagree in the other direction).  Marker rows are not
+    passes.  ``via_changelog`` is True when ``passes`` came from that
+    fallback — those are not pool validations.
     """
     due = to_tpe(due)
     advanced = []
@@ -522,6 +527,19 @@ def _check_eligibility(base_dir, pid_alive_fn, lines, findings) -> None:
 _RELATIVE_GATE_MARKER = "EVO_RELATIVE_GATE"
 
 
+def _is_relative_gate_marker(entry) -> bool:
+    """True when ``entry`` is a pure ``EVO_RELATIVE_GATE`` changelog row.
+
+    Shared by the zero-pass note and the slot changelog fallback.
+    Non-dicts are not markers.  The summary is matched after lstrip, and
+    only at the start.
+    """
+    if not isinstance(entry, dict):
+        return False
+    summary = str(entry.get("change_summary") or "").lstrip()
+    return summary.startswith(_RELATIVE_GATE_MARKER)
+
+
 def _changelog_counts_as_pass(path: str) -> bool:
     """True when changelog.json records something other than a marker.
 
@@ -536,13 +554,7 @@ def _changelog_counts_as_pass(path: str) -> bool:
     data = read_json(path)
     if not isinstance(data, list):
         return True
-    for entry in data:
-        if not isinstance(entry, dict):
-            return True
-        summary = str(entry.get("change_summary") or "").lstrip()
-        if not summary.startswith(_RELATIVE_GATE_MARKER):
-            return True
-    return False
+    return any(not _is_relative_gate_marker(entry) for entry in data)
 
 
 def _check_zero_pass(repo_root, lines, findings) -> None:
