@@ -310,6 +310,16 @@ const RG_ACTION = { hold: "維持", sit_out: "空手觀望", deploy_long: "啟�
   deploy_long_half: "多方（半倉）", deploy_short_half: "空方（半倉）" };
 const LEG = { long: "多方", short: "空方" };
 const SLOT = { NIGHT: "夜盤", DAY: "日盤" };
+// Flip-counter pause: the regime engine will not switch INTO a trend (or
+// reverse) until it lifts. The active leg keeps trading, and a move to
+// range-bound (sit out) still applies, so it is a switch lock, not a halt.
+function pauseInfo(p) {
+  const left = Math.max(0, p.until_session - p.session_count);
+  return {
+    left,
+    title: `翻轉次數過多，暫停切換多空方向：目前部位照常交易，轉為盤整（空手）仍會套用。還鎖定 ${left} 夜。`,
+  };
+}
 function rgChip(regime) {
   const [label, cls] = REGIME[regime] || [regime || "未判斷", "none"];
   return el("span", { class: "rg " + cls }, label);
@@ -618,7 +628,7 @@ const App = {
       const name = el("div", null, el("div", { class: "name" }, b.bot_name),
         el("div", { class: "sub trunc", title: b.strategy }, `${b.symbol}・${b.strategy || "—"}`),
         rg ? el("div", { class: "rg-line" }, "盤勢", rgChip(rg.effective),
-          LEG[rg.active_leg] || "空手", rg.pause ? el("span", { title: "翻轉計數暫停中" }, "⏸ 暫停") : null,
+          LEG[rg.active_leg] || "空手", rg.pause ? el("span", { title: pauseInfo(rg.pause).title }, "🔒 方向鎖定") : null,
           rg.news_suppressed ? el("span", { class: "pend" }, "新聞抑制中") : null) : null);
       const tr = el("tr", { onclick: () => this.open(b.id) },
         td("", el("span", null, chip(b.state), pendingChip(b.pending)), "first"),
@@ -792,9 +802,11 @@ const App = {
         sub(n.executed ? "✓ 已套用" + (n.executed_at ? " " + n.executed_at.slice(0, 16) : "") : "尚未套用"))),
       tile("確認進度", el("div", null, rgChip(r.pending_label || r.raw),
         sub(`連續 ${r.pending_count} 夜・最近原始判斷：${(REGIME[r.raw] || [r.raw || "—"])[0]}`))),
-      tile("翻轉暫停", r.pause
-        ? el("div", null, "⏸ 暫停中", sub(`至第 ${r.pause.until_session} 夜（目前第 ${r.pause.session_count} 夜）`))
-        : "無"),
+      tile("多空切換", r.pause
+        ? el("div", { title: pauseInfo(r.pause).title }, "🔒 方向鎖定",
+            sub(`還鎖定 ${pauseInfo(r.pause).left} 夜（至第 ${r.pause.until_session} 夜，目前第 ${r.pause.session_count} 夜）`),
+            sub("目前部位照常交易"))
+        : "可切換"),
       tile("最近判斷", el("div", null, sessionKey(r.last_assessed),
         r.manual_override && r.manual_override !== "auto" ? sub("手動指定：" + r.manual_override) : null)),
     );

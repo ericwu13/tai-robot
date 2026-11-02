@@ -1447,3 +1447,17 @@ def test_unwritable_audit_log_is_reported(tmp_path, capsys):
     control.log_request(str(tmp_path), client="c", bot_id="b", action="stop",
                         result="accepted", detail="d")
     assert "control log" in capsys.readouterr().err
+
+
+def test_flip_pause_is_labelled_as_a_switch_lock_not_a_trading_halt():
+    """The flip-counter pause freezes trend ENTRIES (switching legs); the
+    active leg keeps trading. A bare 「⏸ 暫停」 beside 多方 read as a halt."""
+    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+    assert "⏸ 暫停" not in html
+    assert "方向鎖定" in html
+    helper = html[html.index("function pauseInfo"):]
+    helper = helper[:helper.index("\n}\n")]
+    assert "照常交易" in helper                      # says the leg still trades
+    assert "until_session - p.session_count" in helper   # nights left, not a raw index
+    assert "pauseInfo(rg.pause)" in html and "pauseInfo(r.pause)" in html
