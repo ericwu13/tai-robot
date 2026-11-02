@@ -16,7 +16,7 @@ import pytest
 import run_backtest as rb
 from src.live import headless as hl
 from src.live.deploy_request import DeployRequest
-from src.live.headless_app import HeadlessBotApp
+from src.live.headless_app import DeployDriver, HeadlessBotApp
 
 
 # ── DeployRequest ↔ dialog tuple ──
@@ -318,6 +318,62 @@ def test_build_request_paper_defaults():
 def test_semi_auto_is_refused_headless():
     with pytest.raises(SystemExit):  # argparse choices
         _deploy_args("--mode", "semi_auto")
+
+
+def test_deploy_mode_auto_is_an_explicit_headless_choice():
+    """`deploy --mode auto` stays a deploy-time choice, not a file drop."""
+    req = hl.build_deploy_request(
+        _deploy_args("--strategy", "x", "--mode", "auto"), None)
+    assert req.trading_mode == "auto"
+    assert req.origin == "cli"
+    assert hl.HEADLESS_MODES == ("paper", "auto")
+
+
+def test_deploy_driver_arms_a_real_runner_and_tolerates_a_bare_object(tmp_path):
+    """DeployDriver arms through the helper, not a bare attribute write.
+
+    A real LiveRunner gets ``_headless``. A bare ``object()`` — the shape
+    used by the pre-deploy position fakes — must not raise AttributeError.
+    """
+    from src.backtest.strategy import BacktestStrategy
+    from src.live.live_runner import LiveRunner
+
+    class _Quiet(BacktestStrategy):
+        kline_type = 0
+        kline_minute = 1
+
+        def on_bar(self, bar, data_store, broker):
+            pass
+
+        def required_bars(self):
+            return 1
+
+    scheduled: list = []
+
+    def _drive(runner):
+        driver = DeployDriver.__new__(DeployDriver)
+        driver.bot_dir = str(tmp_path / "bot")
+        os.makedirs(driver.bot_dir, exist_ok=True)
+        driver.app = SimpleNamespace(
+            _deploy_live_from=lambda req: True,
+            _live_runner=runner,
+            alerts=[],
+            status_var=SimpleNamespace(get=lambda: ""),
+        )
+        driver.req = object()
+        driver.root = SimpleNamespace(after=lambda *a, **k: scheduled.append(a))
+        driver.POLL_MS = 2000
+        scheduled.clear()
+        driver._deploy()
+        assert scheduled, "arming raised before the poll was scheduled"
+
+    _drive(object())
+    real = LiveRunner(_Quiet(), "TX00", log_dir=str(tmp_path / "real"))
+    assert real._headless is False
+    assert real.trading_mode == "paper"
+    _drive(real)
+    assert real._headless is True
+    assert real.trading_mode == "paper"
 
 
 def test_regime_requires_both_legs_unless_resuming():

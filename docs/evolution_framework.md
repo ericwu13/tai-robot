@@ -272,7 +272,7 @@ trading:
 | `evolution.structural_lane.min_paper_sessions` | `21` | Paper sessions before graduation can be recommended (Nova Q6). |
 | `evolution.structural_lane.min_paper_trades` | `20` | Paper trades before graduation can be recommended. |
 | `evolution.structural_lane.timeout_sessions` | `45` | After this many sessions the incubation is recommended closed as inconclusive. |
-| **`trading.allow_live_override`** | `false` | **Not an evolution key.** It gates the live **hot-swap mode switch** — whether a `mode_override.json` file (or the UI) may switch the running bot to fully-automatic `auto` mode. Documented here because it governs how much autonomy a live bot has; evolution itself never deploys or switches modes. |
+| **`trading.allow_live_override`** | `false` | **Not an evolution key.** It gates the live **hot-swap mode switch** — whether a `mode_override.json` file (or the UI) may switch the running bot to fully-automatic `auto` mode. A headless bot ignores this flag for that file: `auto`, `real`, and any other live/real-money mode are refused and the file is removed; `paper` still applies. `deploy --mode auto` is a separate, explicit deploy choice. Documented here because it governs how much autonomy a live bot has; evolution itself never deploys or switches modes. |
 
 ---
 
