@@ -115,6 +115,15 @@ def resolve_strategy_name(query: str, names) -> str:
 
 # ── Deploy request ──
 
+def _resume_flag(cli_on: bool, session: dict | None, key: str) -> bool:
+    """CLI True wins. Otherwise a saved key is restored. A missing key is off."""
+    if cli_on:
+        return True
+    if isinstance(session, dict) and key in session:
+        return bool(session[key])
+    return False
+
+
 def build_deploy_request(args: argparse.Namespace,
                          resume_session: dict | None) -> DeployRequest:
     """Validate CLI args and build the DeployRequest the GUI path consumes."""
@@ -143,11 +152,22 @@ def build_deploy_request(args: argparse.Namespace,
             and not (resume_session and resume_session.get("strategy")):
         raise HeadlessConfigError("--strategy is required for a new non-regime bot")
 
-    news_enabled = bool(args.news)
-    if (args.news_tier2 or args.news_directional) and not news_enabled:
+    # --news is per-bot and off unless this command passes it or a resume
+    # session already saved it. A session written before the field existed
+    # has no key and stays off. CLI True wins; CLI False does not clear a
+    # saved True (there is no --no-news, and a resume without the flags
+    # must not drop the breaker).
+    news_enabled = _resume_flag(bool(args.news), resume_session, "news_enabled")
+    news_tier2 = _resume_flag(
+        bool(args.news_tier2), resume_session, "news_tier2_enabled")
+    if bool(args.news_directional):
+        news_directional = True
+    elif isinstance(resume_session, dict) and "news_suppress_scope" in resume_session:
+        news_directional = resume_session.get("news_suppress_scope") == "conflicting_leg"
+    else:
+        news_directional = False
+    if (news_tier2 or news_directional) and not news_enabled:
         raise HeadlessConfigError("--news-tier2 / --news-directional require --news")
-    if news_enabled and not (regime_enabled or resumed_regime):
-        raise HeadlessConfigError("--news only applies to regime bots (--regime)")
 
     return DeployRequest(
         bot_name=args.bot,
@@ -158,8 +178,8 @@ def build_deploy_request(args: argparse.Namespace,
         regime_long=regime_long,
         regime_short=regime_short,
         news_enabled=news_enabled,
-        news_tier2_enabled=bool(args.news_tier2),
-        news_directional=bool(args.news_directional),
+        news_tier2_enabled=news_tier2,
+        news_directional=news_directional,
         origin="cli",
     )
 
@@ -689,7 +709,9 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--regime", action="store_true", help="regime-switching bot")
     d.add_argument("--long-strategy", default="", help="regime long leg")
     d.add_argument("--short-strategy", default="", help="regime short leg")
-    d.add_argument("--news", action="store_true", help="news circuit breaker (regime only)")
+    d.add_argument("--news", action="store_true",
+                   help="per-bot risk-off breaker (plain or regime; off unless "
+                        "passed or restored from session.json)")
     d.add_argument("--news-tier2", action="store_true")
     d.add_argument("--news-directional", action="store_true",
                    help="suppress only the conflicting leg")

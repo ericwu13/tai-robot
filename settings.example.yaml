@@ -323,6 +323,11 @@ evolution:
 news:
   enabled: false             # dialog default only — per-bot checkbox decides
   signal_path: ""            # circuit-breaker signal JSON (risk_off / deploy_* / clear)
+  # W2 monitor liveness file, rewritten every cycle. signal.json is not a
+  # substitute: it is written only on a breach. The age limit is
+  # src/news/heartbeat.py DEFAULT_MAX_HEARTBEAT_AGE_SEC (provisional,
+  # currently 15 min) — not copied here, so it cannot drift.
+  heartbeat_path: ""
   events_path: ""            # scheduled-event calendar JSON (CPI, FOMC, ...)
   ledger_path: ""            # consumed signal_id ledger — gives exactly-once acting
   regime_vote_path: ""       # regime-vote sidecar JSON — cross-market confirmation acceleration

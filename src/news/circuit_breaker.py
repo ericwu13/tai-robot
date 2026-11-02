@@ -496,18 +496,15 @@ def plan_calendar_gate(
     gap sits the coming session out before it opens.  ``active_ev`` wins
     when both match.
 
-    **Deferred while a position is open.**  Suppression stops the whole
-    bar pipeline before the strategy runs, so it is only safe under an
-    "suppressed ⇒ flat" invariant.  ``risk_off`` preserves that invariant
-    by flattening in the same batch; a calendar gate must NOT — it is
+    **Deferred while a position is open.**  A calendar gate is
     pre-emptive, not an emergency, and flattening on a scheduled event
-    the bot is already positioned through would be a surprise exit.  So
-    when an event would newly gate while a position is open, this returns
-    NO actions at all: the open trade keeps its normal stop/exit
-    management, and the 30s poll re-plans until the position closes on
-    its own terms, at which point the gate engages.  (Without this, an
-    events.json refreshed mid-session would freeze an open position's
-    exit management until the event window ended.)
+    the bot is already positioned through would be a surprise exit.
+    ``risk_off`` still flattens in the same batch.  When an event would
+    newly gate while a position is open, this returns NO actions: the
+    open trade keeps its own stop, and the 30s poll re-plans until the
+    position closes, at which point the gate engages.  Issue #223 makes
+    a gate that DOES engage entry-only (stops keep running), but this
+    planner still waits — engaging mid-trade would change 08-04-rss.
 
     A STALE calendar fails OPEN: no new gating, and any gate this module
     previously stamped is released.  A forgotten n8n job must not be able

@@ -453,6 +453,7 @@ class LiveRunner:
         log_dir: str | None = None,
         bot_name: str = "",
         strategy_display_name: str = "",
+        news_cfg=None,
     ):
         self.strategy = strategy
         self.symbol = symbol
@@ -559,20 +560,105 @@ class LiveRunner:
         # from suppress_strategy (cleared on every reconnect replay).
         self.regime_idle: bool = False
 
-        # News circuit breaker: same "no trading, keep the data flowing"
-        # semantics as regime_idle, but owned by src.news so a `clear`
-        # signal or an event window ending cannot accidentally un-idle a
-        # regime sit_out (and vice versa). Mirrored (leg-aware) from
-        # BreakerState by RegimeSwitchingRunner._sync_news_idle, which
-        # also fills news_idle_reason for the NEWS_SUPPRESSED audit rows.
+        # News circuit breaker (issue #223). news_idle blocks NEW entries
+        # only — stops, TRADE_CLOSE, FORCE_CLOSE and flatten still run.
+        # Distinct from regime_idle, which still skips the strategy.
+        # Mirrored from BreakerState by NewsBreaker.sync_idle.
         self.news_idle: bool = False
         self.news_idle_reason: str = ""
+        # Set by NewsBreaker when a real bot's W2 heartbeat is stale.
+        # Empty on paper (warning only) and when the heartbeat is fresh.
+        self.heartbeat_entry_block: str = ""
+        # Directional gate leg for a plain bot. Regime runners use
+        # _active_leg instead. "" is fully gated under conflicting_leg.
+        self._news_leg: str = ""
+        self.on_news_notify_cb: Callable[[str], None] | None = None
+        self.reads_regime_votes: bool = False
 
         # Daily-report dedupe key: "{date}_{session}" (e.g.
         # "2026-07-21_DAY") of the last emitted report. Persisted in
         # session.json so a restart can't re-send the same session's report.
         # Keyed by session so DAY+NIGHT bots fire separate reports.
         self._last_report_key: str | None = None
+        self._attach_news(news_cfg)
+
+    def _attach_news(self, news_cfg) -> None:
+        """Install the shared breaker. A second call replaces it (regime
+        builds the disabled one in super(), then the real config)."""
+        from ..news.news_breaker import NewsBreaker
+        self._news = NewsBreaker(self, news_cfg)
+        self.heartbeat_entry_block = ""
+
+    def _entry_block_reason(self) -> str:
+        """Why NEW entries are dropped this bar. Empty means entries pass.
+
+        News/calendar suppression, or a stale W2 heartbeat on a real bot.
+        This is not a TradingGuard flag: it does not set fill_pending,
+        link_entries_blocked, or halted, so #204/#222 still gate any
+        ENTRY_FILL that actually reaches decide(), and exits are not
+        blocked a second time.
+        """
+        if self.news_idle:
+            return self.news_idle_reason or "news circuit breaker"
+        return self.heartbeat_entry_block or ""
+
+    def poll_news(self, now=None) -> list[str]:
+        """30s news poll for a plain bot. Regime bots run this from
+        ``on_status_poll`` instead — the GUI must not call both."""
+        return self._check_news(now)
+
+    def _check_news(self, now=None) -> list[str]:
+        return self._news.poll(now)
+
+    def _sync_news_idle(self) -> None:
+        self._news.sync_idle()
+
+    def _news_notify(self, message: str) -> None:
+        self._news.notify(message)
+
+    @property
+    def _news_enabled(self) -> bool:
+        return bool(self._news.enabled)
+
+    @_news_enabled.setter
+    def _news_enabled(self, value: bool) -> None:
+        self._news.enabled = bool(value)
+
+    @property
+    def _news_cfg(self):
+        return self._news.cfg
+
+    @property
+    def _breaker_state(self):
+        return self._news.state
+
+    @_breaker_state.setter
+    def _breaker_state(self, value) -> None:
+        self._news.state = value
+
+    @property
+    def breaker_state(self):
+        return self._news.state
+
+    @property
+    def _ledger(self):
+        return self._news.ledger
+
+    @property
+    def _events_mtime(self) -> float:
+        return self._news.events_mtime
+
+    @_events_mtime.setter
+    def _events_mtime(self, value: float) -> None:
+        self._news.events_mtime = value
+
+    @property
+    def _calendar_stale_warned(self) -> bool:
+        return self._news.calendar_stale_warned
+
+    @_calendar_stale_warned.setter
+    def _calendar_stale_warned(self, value: bool) -> None:
+        self._news.calendar_stale_warned = bool(value)
 
     # ── Lock file ──
 
@@ -1238,21 +1324,14 @@ class LiveRunner:
         idx = self._bar_index
         self._bar_index += 1
 
-        # During history catchup, regime idle, or a news suppression, only
-        # build bar state — no trading
-        if self.suppress_strategy or self.regime_idle or self.news_idle:
-            # Audit trail for suppressed windows: one row per bar the
-            # news gate (and nothing else) swallowed, so a post-hoc
-            # replay (scripts/replay_bars.py) can show what the strategy
-            # would have done — the breaker keeps its own track record
-            # instead of silently filtering live away from the backtest.
-            # Only when news_idle is the BINDING block: replay catchup
-            # bars and regime sit-outs are not missed trading.
-            if self.news_idle and not self.suppress_strategy \
-                    and not self.regime_idle:
-                self._log_decision(
-                    bar, "NEWS_SUPPRESSED", "", "", bar.close,
-                    self.news_idle_reason or "news circuit breaker")
+        # History catchup and regime sit-out still skip the strategy.
+        # A news, calendar, or heartbeat gate does not (issue #223 R2):
+        # the strategy runs so stops, TRADE_CLOSE, session-end close,
+        # FORCE_CLOSE and flatten still happen. Only NEW entries are
+        # dropped further down. That drop is not a TradingGuard flag —
+        # fill_pending / link_entries_blocked stay the #204/#222
+        # ENTRY_FILL gates and still apply to any entry that fills.
+        if self.suppress_strategy or self.regime_idle:
             return
 
         ctx = self.broker.context
@@ -1301,6 +1380,12 @@ class LiveRunner:
             if self.restored_without_stop:
                 block_new_entries = True
 
+            # Issue #223: drop entries the strategy just queued. Exits and
+            # market closes stay in their pending lists and fill below.
+            entry_block = self._entry_block_reason()
+            if entry_block and len(self.broker._pending_entries) > old_entries:
+                del self.broker._pending_entries[old_entries:]
+
             # Detect new entry/exit decisions
             if len(self.broker._pending_entries) > old_entries:
                 for order in self.broker._pending_entries[old_entries:]:
@@ -1328,6 +1413,15 @@ class LiveRunner:
                 self.broker.check_exits(
                     idx, bar.open, bar.high, bar.low, bar.close, fill_dt)
                 self._check_for_trade_close(bar, idx)
+
+        # One audit row per bar the entry gate (and nothing else) held.
+        # Replay and the dashboard's suppressed-bar count read this.
+        # Skipped when replay or regime_idle already returned above —
+        # those bars are not missed trading.
+        entry_block = self._entry_block_reason()
+        if entry_block:
+            self._log_decision(
+                bar, "NEWS_SUPPRESSED", "", "", bar.close, entry_block)
 
         # Fill entry orders and market closes.
         # Use wall-clock fill_dt (not synthetic bar boundary) so trade
@@ -2007,6 +2101,11 @@ class LiveRunner:
             "broker": self.broker.to_dict(),
             "last_report_key": self._last_report_key,
         }
+        # Stubs that call this without __init__ have no breaker. A real
+        # runner always does, and the flags are what --resume reads.
+        news = getattr(self, "_news", None)
+        if news is not None:
+            data.update(news.session_fields())
         # Exit levels must not drop the broker snapshot or the report
         # key when a partial runner (or a throwing strategy) can't
         # produce them.
@@ -2143,6 +2242,14 @@ class LiveRunner:
         self._awaiting_restore_tick = self._restored_open_position
         if self._restored_open_position:
             self._reconcile_restored_exits(alert=False)
+        # News breaker state after the broker, so a restored suppression
+        # is applied to the restored position. Opted-out deploys ignore
+        # a saved gate (nothing would ever clear it). Stubs that skip
+        # __init__ have no breaker; leaving them alone keeps resume of
+        # the report key working.
+        news = getattr(self, "_news", None)
+        if news is not None:
+            news.restore(session_data)
         return len(self.broker.trades)
 
     # Emit a progress tick every N bars during reload so the GUI can keep

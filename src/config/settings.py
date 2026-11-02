@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from ..news.heartbeat import DEFAULT_MAX_HEARTBEAT_AGE_SEC
 from ..utils.errors import ConfigError
 
 
@@ -84,6 +85,11 @@ class NewsConfig:
     events_path: str = ""          # scheduled-event calendar JSON
     ledger_path: str = ""          # consumed signal_id ledger JSON
     regime_vote_path: str = ""     # regime-vote sidecar JSON (confirmation acceleration)
+    # W2 monitor liveness file. Empty until settings.yaml points at it.
+    # The age limit is DEFAULT_MAX_HEARTBEAT_AGE_SEC (provisional) — the
+    # only place that number is defined.
+    heartbeat_path: str = ""
+    max_heartbeat_age_sec: int = DEFAULT_MAX_HEARTBEAT_AGE_SEC
     max_signal_age_sec: int = 900
     tier2_enabled: bool = False    # forced-entry event strategies
     calendar_min_severity: str = "high"

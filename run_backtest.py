@@ -367,10 +367,10 @@ def _resolve_news_config(
 
     Precedence:
 
-    - ``regime_enabled`` False → None. The breaker rides
-      ``RegimeSwitchingRunner.on_status_poll``; a plain LiveRunner has
-      nowhere to hang it.
-    - ``news_enabled`` False → None (this deploy opted out).
+    - ``news_enabled`` False → None (this deploy opted out). A plain
+      LiveRunner and a regime runner share one breaker, so ``--news``
+      does not require ``--regime``. ``regime_enabled`` is accepted
+      for callers that still pass it and does not gate the result.
     - otherwise a NewsConfig whose paths/age/severity come from
       settings.yaml and whose ``tier2_enabled`` / ``suppress_scope``
       come from THIS deploy's checkboxes — forced-entry and
@@ -378,8 +378,9 @@ def _resolve_news_config(
 
     Returning None rather than a disabled NewsConfig keeps the runner's
     "no news config → never touch the filesystem" path the default.
+    ``regime_enabled`` is ignored: ``--news`` is per-bot (#223).
     """
-    if not regime_enabled or not news_enabled:
+    if not news_enabled:
         return None
     from src.config.settings import NewsConfig
     _defaults = NewsConfig()
@@ -391,6 +392,11 @@ def _resolve_news_config(
             settings.get("news_events_path", ""), base_dir),
         ledger_path=_resolve_news_path(
             settings.get("news_ledger_path", ""), base_dir),
+        heartbeat_path=_resolve_news_path(
+            settings.get("news_heartbeat_path", ""), base_dir),
+        max_heartbeat_age_sec=int(settings.get(
+            "news_max_heartbeat_age_sec", _defaults.max_heartbeat_age_sec)
+            or _defaults.max_heartbeat_age_sec),
         # Must stay wired: with "" here the runner's _read_regime_vote
         # is inert and W2/W3/W4 vote files expire unread.
         regime_vote_path=_resolve_news_path(
@@ -596,6 +602,15 @@ def _load_settings():
             cfg["news_signal_path"] = str(news.get("signal_path", "") or "")
             cfg["news_events_path"] = str(news.get("events_path", "") or "")
             cfg["news_ledger_path"] = str(news.get("ledger_path", "") or "")
+            cfg["news_heartbeat_path"] = str(news.get("heartbeat_path", "") or "")
+            from src.news.heartbeat import DEFAULT_MAX_HEARTBEAT_AGE_SEC
+            _hb_age = news.get("max_heartbeat_age_sec", None)
+            try:
+                cfg["news_max_heartbeat_age_sec"] = (
+                    DEFAULT_MAX_HEARTBEAT_AGE_SEC if _hb_age in (None, "")
+                    else int(_hb_age))
+            except (TypeError, ValueError):
+                cfg["news_max_heartbeat_age_sec"] = DEFAULT_MAX_HEARTBEAT_AGE_SEC
             cfg["news_regime_vote_path"] = str(
                 news.get("regime_vote_path", "") or "")
             # W3 scorer state (regime tab liveness display only)
@@ -7814,10 +7829,9 @@ class BacktestApp:
 
         # News circuit breaker — PER-BOT, not global: the rollout runs a
         # news-enabled bot beside an untouched baseline, so one risk_off
-        # must not flatten both. Lives inside the regime reveal because the
-        # breaker rides RegimeSwitchingRunner's 30s poll. Settings supply
-        # the remembered defaults; a resumed bot's session.json overrides
-        # them in on_select(), exactly like the regime strategy pair.
+        # must not flatten both. Available on a plain bot and a regime bot
+        # (both call NewsBreaker). Settings supply the remembered defaults;
+        # a resumed bot's session.json overrides them in on_select().
         news_var = tk.BooleanVar(
             value=bool(self._settings.get("news_enabled", False)))
         news_tier2_var = tk.BooleanVar(
@@ -7858,10 +7872,11 @@ class BacktestApp:
         def _toggle_regime_widgets():
             if regime_var.get():
                 regime_strat_frame.pack(fill=tk.X, pady=S(8, 4))
-                news_frame.pack(fill=tk.X, pady=S(4, 0))
             else:
                 regime_strat_frame.pack_forget()
-                news_frame.pack_forget()
+            # Risk-off is not regime-only (#223). Keep the checkboxes
+            # visible for a single-strategy deploy.
+            news_frame.pack(fill=tk.X, pady=S(4, 0))
             _toggle_news_widgets()
             # Content height changed — refresh the scroll region so the newly
             # revealed dropdowns are reachable.
@@ -8451,19 +8466,19 @@ class BacktestApp:
         strategy = strategy_cls()
 
         log_dir = os.path.join(project_root, "data", "live")
+        # PER-BOT: only this deploy's checkbox turns the breaker on, so
+        # a news bot and a baseline bot can run side by side. Plain and
+        # regime runners share NewsBreaker (#223).
+        news_cfg = _resolve_news_config(
+            self._settings,
+            regime_enabled=is_regime_deploy,
+            news_enabled=news_enabled,
+            tier2_enabled=news_tier2_enabled,
+            suppress_scope=("conflicting_leg" if news_directional
+                            else "both"),
+        )
         if is_regime_deploy:
             from src.live.regime_switching_runner import RegimeSwitchingRunner
-            # PER-BOT: only this deploy's checkbox turns the breaker on, so
-            # a news bot and a baseline bot can run side by side. A plain
-            # LiveRunner deploy never gets news gating.
-            news_cfg = _resolve_news_config(
-                self._settings,
-                regime_enabled=is_regime_deploy,
-                news_enabled=news_enabled,
-                tier2_enabled=news_tier2_enabled,
-                suppress_scope=("conflicting_leg" if news_directional
-                                else "both"),
-            )
             self._live_runner = RegimeSwitchingRunner(
                 strategy, symbol, point_value=point_value,
                 log_dir=log_dir, bot_name=bot_name,
@@ -8482,12 +8497,25 @@ class BacktestApp:
                      f"events={bool(news_cfg.events_path)})")
             self._regime_manager = self._live_runner.regime_manager
         else:
+            # news_cfg is keyword-only on LiveRunner. A test double that
+            # mirrors the old signature must still construct.
+            _runner_kw = {}
+            if "news_cfg" in getattr(LiveRunner.__init__, "__code__",
+                                     type("", (), {"co_varnames": ()})()).co_varnames:
+                _runner_kw["news_cfg"] = news_cfg
             self._live_runner = LiveRunner(
                 strategy, symbol, point_value=point_value,
                 log_dir=log_dir, bot_name=bot_name,
                 strategy_display_name=self.strategy_var.get(),
+                **_runner_kw,
             )
             self._regime_manager = None
+            if news_cfg is not None:
+                _log(f"新聞框架已啟用 News framework enabled "
+                     f"(plain bot, tier2={news_cfg.tier2_enabled}, "
+                     f"scope={news_cfg.suppress_scope}, "
+                     f"signal={bool(news_cfg.signal_path)}, "
+                     f"heartbeat={bool(news_cfg.heartbeat_path)})")
         self._live_runner.acquire_lock()
         self._live_runner.trading_mode = trading_mode
         self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
@@ -8975,9 +9003,30 @@ class BacktestApp:
         self._check_session_end_report()
         self._check_weekly_evolution()
         self._check_regime_poll()
+        self._check_news_poll()
         self._live_poll_id = self.root.after(
             self._STATUS_POLL_INTERVAL_S * 1000,
             self._schedule_status_update)
+
+    def _check_news_poll(self):
+        """News breaker for a plain LiveRunner.
+
+        Regime bots already run it inside ``on_status_poll``. Calling both
+        would double-act on a signal that the ledger has not consumed yet
+        only if the first poll threw before the ledger write — still wrong
+        to run twice. ``on_status_poll`` stays the regime detector
+        (evolution is disabled for those bots); do not add it to LiveRunner.
+        """
+        runner = self._live_runner
+        if runner is None or hasattr(runner, "on_status_poll"):
+            return
+        poll = getattr(runner, "poll_news", None)
+        if not callable(poll):
+            return
+        try:
+            poll()
+        except Exception as e:
+            _log(f"[NEWS] poll error: {e}")
 
     def _check_regime_poll(self):
         """Run regime orchestration poll for RegimeSwitchingRunner bots."""
