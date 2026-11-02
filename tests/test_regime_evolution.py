@@ -6,11 +6,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta
 
 import pytest
 
 from src.regime.state_machine import RegimeConfig
-from src.regime.config_loader import build_regime_config, _load_evolved_params
+from src.regime.config_loader import (
+    EVOLVED_MAX_AGE_DAYS, _load_evolved_params, build_regime_config,
+)
 from src.evolution.regime_fitness import (
     compute_label_accuracy,
     compute_weighted_pnl,
@@ -114,7 +117,9 @@ class TestEvolvedParamsOverlay:
             "adx_enter": 20.0,
             "adx_strong": 35.0,
             "confirm_sessions": 1,
-            "evolved_at": "2026-08-01",
+            # Relative to today: a fixed date ages out of the
+            # EVOLVED_MAX_AGE_DAYS window and the test starts failing.
+            "evolved_at": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
             "fitness_score": 0.65,
         }))
         settings = _make_settings()
@@ -122,6 +127,15 @@ class TestEvolvedParamsOverlay:
         assert cfg.adx_enter == 20.0
         assert cfg.adx_strong == 35.0
         assert cfg.confirm_sessions == 1
+
+    def test_evolved_params_inside_max_age_still_apply(self, tmp_path):
+        evolved_dir = tmp_path / "data" / "regime"
+        evolved_dir.mkdir(parents=True)
+        at = datetime.now() - timedelta(days=EVOLVED_MAX_AGE_DAYS - 1)
+        (evolved_dir / "regime_evolved_params.json").write_text(json.dumps({
+            "adx_enter": 20.0, "evolved_at": at.strftime("%Y-%m-%d")}))
+        cfg = build_regime_config(_make_settings(), base_dir=str(tmp_path))
+        assert cfg.adx_enter == 20.0
 
     def test_stale_evolved_params_ignored(self, tmp_path):
         evolved_dir = tmp_path / "data" / "regime"
