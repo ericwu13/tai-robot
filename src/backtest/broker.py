@@ -89,6 +89,10 @@ class Trade:
     real_entry_dt: str = ""
     real_exit_price: int = 0    # from OnNewData deal rows (issue #92)
     real_exit_dt: str = ""
+    # Issue #218: the exit retry ended without a broker fill. The sim
+    # exit price is kept and real_exit_price stays 0. The dashboard
+    # shows "est." next to the real P&L.
+    real_exit_estimated: bool = False
     source: str = ""            # "backtest", "paper", or "real"
     # Display name of the strategy whose signal OPENED this trade. In
     # regime mode one bot's restored history spans several strategies
@@ -611,6 +615,22 @@ class SimulatedBroker:
             return False
         last.real_exit_price = int(price)
         last.real_exit_dt = fill_dt
+        last.real_exit_estimated = False
+        return True
+
+    def mark_real_exit_estimated(self) -> bool:
+        """The exit-fill retry ended without a broker price.
+
+        Keeps the simulated exit price and leaves ``real_exit_price``
+        at 0. A later confirmed fill still writes through
+        ``try_set_real_exit_price`` and clears the flag.
+        """
+        if not self.trades:
+            return False
+        last = self.trades[-1]
+        if last.real_exit_price != 0:
+            return False
+        last.real_exit_estimated = True
         return True
 
     def force_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
@@ -652,6 +672,7 @@ class SimulatedBroker:
                     "real_entry_dt": t.real_entry_dt,
                     "real_exit_price": t.real_exit_price,
                     "real_exit_dt": t.real_exit_dt,
+                    "real_exit_estimated": t.real_exit_estimated,
                     "source": t.source,
                     "strategy": t.strategy,
                 }
@@ -710,6 +731,7 @@ class SimulatedBroker:
                 real_entry_dt=t.get("real_entry_dt", ""),
                 real_exit_price=t.get("real_exit_price", 0),
                 real_exit_dt=t.get("real_exit_dt", ""),
+                real_exit_estimated=bool(t.get("real_exit_estimated", False)),
                 source=t.get("source", ""),
                 strategy=t.get("strategy", ""),
             )

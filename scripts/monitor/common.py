@@ -13,6 +13,10 @@ Time: everything semantic is Asia/Taipei.  The repo convention is the
 fixed offset ``timezone(timedelta(hours=8))`` (``src.regime.switch_logic``
 ``_TZ_TAIPEI``) — not zoneinfo.  The OS clock on this box runs UTC-7, so a
 naive ``datetime.now()`` must never be compared against a TPE log stamp.
+
+Reads of live bot files go through ``src.utils.fileio`` (FILE_SHARE_DELETE),
+never plain ``open()``: on Windows a plain-open handle makes the bot's
+``save_session`` raise and its clean-stop ``.lock`` removal fail.
 """
 
 from __future__ import annotations
@@ -24,6 +28,8 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+
+from src.utils import fileio
 
 TZ_TPE = timezone(timedelta(hours=8))
 
@@ -243,10 +249,12 @@ def read_lock_pid(bot_dir: str):
     lock = os.path.join(bot_dir, ".lock")
     if not os.path.isfile(lock):
         return False, None
+    text = fileio.read_text(lock)
+    if text is None:
+        return True, None
     try:
-        with open(lock, encoding="utf-8", errors="replace") as f:
-            return True, int(f.read().strip())
-    except (OSError, ValueError):
+        return True, int(text.strip())
+    except ValueError:
         return True, None
 
 
@@ -254,10 +262,12 @@ def read_lock_pid(bot_dir: str):
 
 def read_json(path):
     """Parse a JSON file; ``None`` on any failure."""
+    raw = fileio.read_bytes(path)
+    if raw is None:
+        return None
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
+        return json.loads(raw.decode("utf-8"))
+    except ValueError:
         return None
 
 
@@ -265,7 +275,7 @@ def tail_text(path, max_bytes: int = 2_000_000) -> str:
     """Last ``max_bytes`` of a text file, decoded leniently. "" on failure."""
     try:
         size = os.path.getsize(path)
-        with open(path, "rb") as f:
+        with fileio.open_shared(path) as f:
             if size > max_bytes:
                 f.seek(size - max_bytes)
             raw = f.read()

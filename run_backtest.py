@@ -137,9 +137,12 @@ from src.live.reply_link_poller import (
 from src.live.reply_watch import (
     ReplyChannelWatch, describe_return_code, mark_reply_arrived,
 )
+from src.live.quote_stuck_recovery import QuoteStuckRecovery
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
-    RealFillTracker, parse_fulfill_report, match_fill_in_report,
+    RealFillTracker, parse_fulfill_report, parse_new_data,
+    is_fulfill_rate_limited, next_exit_fill_retry, mask_new_data_row,
+    FR_MIN_GAP_MS, FR_RETRY_WINDOW_MS,
 )
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
@@ -1966,6 +1969,59 @@ class BacktestApp:
             self._on_link_alert(alert)
         if alerts or force:
             self._publish_link_heartbeat()
+        self._maybe_quote_stuck_resubscribe()
+
+    def _maybe_quote_stuck_resubscribe(self) -> None:
+        """One recovery attempt per open session while quote-stuck.
+
+        The decision fires once. ``_resubscribe_ticks`` may still retry
+        RequestTicks when the return code is >= 3000. LeaveMonitor,
+        EnterMonitor, login, and logout are not called.
+        The link machine stays DEGRADED until a live tick or a manual
+        Reconnect. A closed session, including a holiday or a closures
+        file date, does not consume the session key.
+        """
+        host = getattr(self, "_link_host", None)
+        recovery = getattr(self, "_quote_stuck", None)
+        if host is None or recovery is None:
+            return
+        machine = host.machine
+        decision = recovery.consider(
+            degraded=machine.degraded,
+            reason=machine.degraded_reason,
+            quote_state=machine.last_quote_is_connected,
+            now=_taipei_now(),
+        )
+        if decision != "resubscribe":
+            return
+        _log(
+            f"[QUOTE-STUCK] one resubscribe for {recovery.attempted_key} "
+            f"(IsConnected={machine.last_quote_is_connected}); no reconnect"
+        )
+        if not getattr(self, "_live_runner", None):
+            _log("[QUOTE-STUCK] resubscribe not sent — no live runner; "
+                 "staying DEGRADED")
+            return
+        self._resubscribe_ticks()
+        _log("[QUOTE-STUCK] RequestTicks sent; waiting for ticks")
+
+    def _clear_quote_stuck_if_ticks_resumed(self) -> None:
+        """A live tick after the one-shot. Clears stuck DEGRADED only."""
+        recovery = getattr(self, "_quote_stuck", None)
+        if recovery is None or not recovery.on_live_tick():
+            return
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            _log("[QUOTE-STUCK] ticks resumed; link machine absent; "
+                 "staying DEGRADED")
+            return
+        alert = host.machine.clear_stuck_after_ticks()
+        if not alert:
+            _log("[QUOTE-STUCK] ticks resumed; DEGRADED already clear")
+            return
+        _log(f"[RECONNECT] {alert}")
+        self._apply_link_gate()
+        self._publish_link_heartbeat()
 
     def _apply_link_gate(self) -> None:
         host = getattr(self, "_link_host", None)
@@ -2263,6 +2319,10 @@ class BacktestApp:
         self._ticks_requested_at: float = 0.0
         self._first_tick_after_request_logged: bool = False
         self._tick_watchdog = TickWatchdog()  # tick health monitoring
+        # One recovery attempt per session while quote-stuck DEGRADED.
+        # _resubscribe_ticks may retry a >=3000 code on its own.
+        # The key lives here for the process; a restart may try again.
+        self._quote_stuck = QuoteStuckRecovery()
         self._live_poll_id = None  # root.after() id for cancellation
         self._last_status_poll_wall: float = 0.0  # freeze/wake detection (issue #98)
         self._live_warmup_mode: bool = False
@@ -2304,6 +2364,7 @@ class BacktestApp:
         # Backoff retry state for exit fill price polling (issue #92).
         self._exit_fill_retry_timer: int | None = None
         self._exit_fill_retry_ctx: dict | None = None
+        self._exit_fill_stopped: bool = False
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -9679,6 +9740,11 @@ class BacktestApp:
             # is not a live tick, so it must not clear the zero-tick streak.
             self._tick_watchdog.on_tick(
                 live=tick_age <= HISTORY_STALENESS_SECONDS)
+            # A fresh tick is the only proof the one-shot resubscribe
+            # worked. Stale replay restarts the watchdog clock and must
+            # not clear DEGRADED.
+            if tick_age <= HISTORY_STALENESS_SECONDS:
+                self._clear_quote_stuck_if_ticks_resumed()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
             # earlier doesn't carry over.
@@ -10425,8 +10491,14 @@ class BacktestApp:
                     else:
                         bar_idx = (broker.trades[-1].exit_bar_index
                                    if broker.trades else -1)
+                    report_side = "B" if buy_sell == 0 else "S"
+                    # Report rows use N (new) / O (offset). An exit, including
+                    # sNewClose=2 (auto) that flattens a position, is O.
+                    report_nc = "N" if action_type == "entry" else "O"
                     self._fill_tracker.register_order(
-                        str(message), action_type, bar_idx, sim_price)
+                        str(message), action_type, bar_idx, sim_price,
+                        product=order_symbol, side=report_side,
+                        new_close=report_nc, send_time=_taipei_now())
                     if action_type == "exit":
                         self._last_exit_order_seq = str(message).strip()
                 if _discord and _discord.enabled:
@@ -10635,9 +10707,9 @@ class BacktestApp:
         # ENTRY: OnNewData deal row if already arrived, else OpenInterest
         # avg_cost (identical for a 1-lot position).
         # EXIT: OnNewData deal row recorded on trades[-1].real_exit_price
-        # (issue #92). If OnNewData is slow, a backoff retry chain polls
-        # GetFulfillReport(1) (per-fill detail, matched by seq no) up to
-        # ~60s; after exhaustion the sim price goes out with "(est.)" and
+        # (issue #92). If that row never arrives, a retry chain polls
+        # GetFulfillReport(1) (per-fill detail, issue #218) for about 90s.
+        # Exhaustion keeps the sim price, marks the trade estimated, and
         # a late OnNewData/poll sends a Discord correction.
         fill_price = ""
         _exit_fill_deferred = False
@@ -10707,14 +10779,15 @@ class BacktestApp:
         self._live_log_msg(
             f"{result.message}{price_str}", "entry")
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
-        if _discord and _discord.enabled:
-            if _exit_fill_deferred:
-                self._start_exit_fill_retry(
-                    result.action_type, fill_price,
-                    self._active_strategy_name())
-            else:
-                _discord.fill_confirmed(result.action_type, fill_price,
-                                        strategy=self._active_strategy_name())
+        # The report poll is the real-exit price path. It runs whether or
+        # not Discord is configured. Only the messages are gated.
+        if _exit_fill_deferred:
+            self._start_exit_fill_retry(
+                result.action_type, fill_price,
+                self._active_strategy_name())
+        elif _discord and _discord.enabled:
+            _discord.fill_confirmed(result.action_type, fill_price,
+                                    strategy=self._active_strategy_name())
 
         # Issue #50: replay any deferred close that was blocked by
         # BLOCK_FILL_PENDING. Now that the entry fill is confirmed
@@ -10748,49 +10821,97 @@ class BacktestApp:
             return 0
         return getattr(broker.trades[-1], "real_exit_price", 0)
 
-    # ── Exit fill price retry with backoff (issue #92) ──
+    # ── Exit fill price retry (issue #92, layout fixed in #218) ──
     #
-    # OnNewData is the primary source but can be slow. GetFulfillReport(1)
-    # (per-fill detail, NOT format 4 which merges by commodity) is polled
-    # as a backup — the seq no from SendFutureOrderCLR identifies our fill
-    # among all fills on the account.
+    # OnNewData is the primary per-fill source but can be silent.
+    # GetFulfillReport(1) is the backup. Format-1 rows have no order
+    # seq, so the match is the book number captured from the accept
+    # row, then a product-family / side / new-close / qty / time
+    # fallback. The broker rejects a second query inside 5s (M999);
+    # polls stay FR_MIN_GAP_MS apart and the chain stops at about 90s.
+    # M999 is a backoff, not a used attempt.
 
-    _EXIT_FILL_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000]
+    def _exit_fill_unresolved(self) -> bool:
+        """An exit was sent and its broker price is not on the trade yet."""
+        if self._exit_fill_retry_ctx is not None:
+            return True
+        if not self._last_exit_order_seq:
+            return False
+        return self._real_exit_price_from_broker() == 0
+
+    def _cancel_exit_fill_retry(self) -> None:
+        """Drop a pending exit-fill poll so a stop cannot save later.
+
+        Tk ``after`` runs on the main thread. Cancelling the token and
+        clearing the context means the callback does not run, and a
+        callback that already started will not write the session once
+        it sees ``_exit_fill_stopped``.
+
+        The pending trade keeps its simulated exit price and is marked
+        ``real_exit_estimated``. Stop's own session save persists that.
+        A trade that already has a real exit price is left alone.
+        """
+        pending = getattr(self, "_exit_fill_retry_ctx", None)
+        timer = getattr(self, "_exit_fill_retry_timer", None)
+        root = getattr(self, "root", None)
+        if timer is not None and root is not None:
+            try:
+                root.after_cancel(timer)
+            except Exception:
+                pass
+        if pending is not None:
+            runner = getattr(self, "_live_runner", None)
+            broker = getattr(runner, "broker", None) if runner is not None else None
+            mark = getattr(broker, "mark_real_exit_estimated", None)
+            if mark is not None:
+                try:
+                    mark()
+                except Exception as exc:
+                    _log(f"EXIT FILL RETRY: stop mark estimated failed: {exc}")
+        self._exit_fill_retry_timer = None
+        self._exit_fill_retry_ctx = None
+        self._exit_fill_stopped = True
 
     def _start_exit_fill_retry(self, action_type: str,
                                fallback_price: str,
                                strategy: str) -> None:
-        """Begin the backoff retry chain for exit fill price."""
+        """Begin the exit-fill poll. First query waits out the 5s limit."""
+        self._exit_fill_stopped = False
         self._exit_fill_retry_ctx = {
             "action_type": action_type,
             "fallback_price": fallback_price,
             "strategy": strategy,
             "attempt": 0,
+            "started": time.monotonic(),
         }
-        delay = self._EXIT_FILL_RETRY_DELAYS_MS[0]
+        delay = FR_MIN_GAP_MS
         _log(f"EXIT FILL RETRY START: seq={self._last_exit_order_seq} "
-             f"schedule={self._EXIT_FILL_RETRY_DELAYS_MS}ms")
+             f"gap={delay}ms window={FR_RETRY_WINDOW_MS}ms")
         self._exit_fill_retry_timer = self.root.after(
             delay, self._poll_exit_fill_step)
 
     def _poll_exit_fill_step(self) -> None:
         """One step of the exit fill price retry chain."""
         self._exit_fill_retry_timer = None
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
         ctx = self._exit_fill_retry_ctx
         if ctx is None:
             return
-        attempt = ctx["attempt"]
-        ctx["attempt"] = attempt + 1
+        elapsed_ms = int((time.monotonic() - ctx["started"]) * 1000)
         seq = self._last_exit_order_seq
 
         real_px = self._real_exit_price_from_broker()
         source = "OnNewData"
+        rate_limited = False
         if not real_px:
-            real_px = self._poll_exit_fill_via_report(seq)
+            real_px, rate_limited = self._poll_exit_fill_via_report(seq)
             source = "GetFulfillReport(1)"
 
-        _log(f"EXIT FILL RETRY #{attempt}: real_px={real_px} source={source} "
-             f"seq={seq}")
+        _log(f"EXIT FILL RETRY: real_px={real_px} source={source} "
+             f"seq={seq} attempt={ctx['attempt']} elapsed_ms={elapsed_ms} "
+             f"rate_limited={rate_limited}")
 
         if real_px:
             self._exit_fill_retry_ctx = None
@@ -10801,35 +10922,49 @@ class BacktestApp:
                     strategy=ctx["strategy"])
             return
 
-        next_idx = attempt + 1
-        if next_idx < len(self._EXIT_FILL_RETRY_DELAYS_MS):
-            delay = self._EXIT_FILL_RETRY_DELAYS_MS[next_idx]
-            _log(f"EXIT FILL RETRY: scheduling attempt #{next_idx} in {delay}ms")
+        delay, attempt, exhausted = next_exit_fill_retry(
+            ctx["attempt"], elapsed_ms, rate_limited=rate_limited)
+        ctx["attempt"] = attempt
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
+        if not exhausted and delay is not None:
+            why = "M999 rate limit, attempt not consumed" if rate_limited else "no match"
+            _log(f"EXIT FILL RETRY: {why}; scheduling in {delay}ms "
+                 f"(attempt={attempt})")
             self._exit_fill_retry_timer = self.root.after(
                 delay, self._poll_exit_fill_step)
             return
 
         self._exit_fill_retry_ctx = None
+        if getattr(self, "_exit_fill_stopped", False):
+            _log("EXIT FILL RETRY: stopped before exhaustion save")
+            return
         fill_price = ctx["fallback_price"]
-        estimated = bool(fill_price)
-        if estimated:
+        marked = False
+        if self._live_runner:
+            marked = self._live_runner.broker.mark_real_exit_estimated()
+            try:
+                self._live_runner._auto_save_session()
+            except Exception as exc:
+                _log(f"EXIT FILL RETRY: session re-save failed: {exc}")
+        if fill_price:
             self._est_notified_exit_seq = seq
-        _log(f"EXIT FILL RETRY EXHAUSTED after {len(self._EXIT_FILL_RETRY_DELAYS_MS)} "
-             f"attempts (~61s). Sending estimated={estimated} "
-             f"fill_price={fill_price!r} seq={seq}")
+        _log(f"EXIT FILL RETRY EXHAUSTED (~{FR_RETRY_WINDOW_MS // 1000}s). "
+             f"Keeping sim price fill_price={fill_price!r} seq={seq} "
+             f"real_exit_estimated={marked}")
         if _discord and _discord.enabled:
-            _discord.fill_confirmed(
-                ctx["action_type"], fill_price,
-                strategy=ctx["strategy"], estimated=estimated)
+            _discord.exit_fill_unconfirmed(
+                fill_price, strategy=ctx["strategy"])
 
-    def _poll_exit_fill_via_report(self, target_seq: str) -> int:
-        """Poll GetFulfillReport(1) for the exit fill price by seq no.
+    def _poll_exit_fill_via_report(self, target_seq: str) -> tuple[int, bool]:
+        """Poll GetFulfillReport(1). ``(price, rate_limited)``.
 
-        Format 1 = per-fill detail (each fill is a separate row).
-        Returns the integer fill price if matched, 0 if not found.
+        Price is 0 when nothing was assigned. ``rate_limited`` is True
+        on M999 — the caller backs off and does not consume an attempt.
         """
         if not target_seq or not _com_available or skO is None:
-            return 0
+            return 0, False
         try:
             user_id = self.login_user_var.get().strip()
             fills_raw = call_com(
@@ -10837,43 +10972,61 @@ class BacktestApp:
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
-            return 0
+            return 0, False
 
         if isinstance(fills_raw, (tuple, list)):
             fills_raw = fills_raw[0] if fills_raw else ""
         if not fills_raw or not isinstance(fills_raw, str):
             _log("EXIT FILL POLL: GetFulfillReport(1) returned empty")
-            return 0
+            return 0, False
+        if is_fulfill_rate_limited(fills_raw):
+            _log("EXIT FILL POLL: M999 rate limit — backoff, attempt not consumed")
+            return 0, True
 
+        acct = self._futures_account or ""
         for j, raw_line in enumerate(fills_raw.split("\n")):
             if j < 5 and raw_line.strip():
-                _log(f"EXIT FILL POLL raw[{j}]: {raw_line.strip()}")
+                _log(f"EXIT FILL POLL raw[{j}]: "
+                     f"{mask_new_data_row(raw_line.strip(), acct)}")
         rows = parse_fulfill_report(fills_raw)
         _log(f"EXIT FILL POLL: {len(rows)} rows, target_seq={target_seq}")
         for i, row in enumerate(rows):
-            if i < 5 or row.seq_no == target_seq:
-                _log(f"EXIT FILL POLL row[{i}]: seq={row.seq_no} "
-                     f"side={row.side} nc={row.new_close} qty={row.qty} "
-                     f"price={row.price} match={row.seq_no == target_seq}")
+            if i < 5:
+                _log(f"EXIT FILL POLL row[{i}]: book={row.book_no} "
+                     f"product={row.product} side={row.side} nc={row.new_close} "
+                     f"qty={row.qty} price={row.price} "
+                     f"time={row.date} {row.time}")
 
-        price = match_fill_in_report(rows, target_seq)
-        if not price:
-            _log(f"EXIT FILL POLL: target_seq={target_seq} not matched")
-            return 0
+        match = self._fill_tracker.match_report(target_seq, rows)
+        if match.reason == "ambiguous":
+            _log(f"EXIT FILL POLL: ambiguous ({match.candidates} candidates), "
+                 f"assigning nothing seq={target_seq}")
+            return 0, False
+        if not match.price:
+            _log(f"EXIT FILL POLL: target_seq={target_seq} not matched "
+                 f"reason={match.reason}")
+            return 0, False
+
+        skew = "n/a" if match.skew_s is None else f"{match.skew_s:.0f}s"
+        _log(f"EXIT FILL POLL: row_time - send_time = {skew} "
+             f"price={match.price} via {match.reason} seq={target_seq}")
 
         broker = self._live_runner.broker if self._live_runner else None
+        accepted = False
         if broker:
             last = broker.trades[-1] if broker.trades else None
             if last and last.real_exit_price == 0:
                 fill_dt = _taipei_now().replace(tzinfo=None
                     ).strftime("%Y-%m-%d %H:%M:%S")
                 accepted = broker.try_set_real_exit_price(
-                    price,
+                    match.price,
                     exit_bar_index=getattr(last, "exit_bar_index", -1),
                     fill_dt=fill_dt)
-                _log(f"EXIT FILL POLL: wrote real_exit_price={price} "
-                     f"accepted={accepted}")
-        return price
+                _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
+                     f"via {match.reason} accepted={accepted}")
+        if accepted:
+            self._fill_tracker.note_credited(match.row_key)
+        return match.price, False
 
     def _on_new_data(self, raw: str) -> None:
         """SKReplyLib.OnNewData — real-time per-order report (issue #92).
@@ -10885,10 +11038,14 @@ class BacktestApp:
         Rows for orders this bot didn't send (another bot or a manual
         order on the same account) don't match the tracker and are ignored.
         """
-        redacted = raw
-        if self._futures_account:
-            redacted = redacted.replace(self._futures_account, "***")
+        redacted = mask_new_data_row(raw, self._futures_account or "")
         _log(f"回報 OnNewData: {redacted}")
+        # Issue #218: a masked copy of deal rows while an exit price is
+        # still missing. Diagnostic only — this does not change matching.
+        parsed = parse_new_data(raw)
+        if (parsed is not None and parsed.row_type == "D"
+                and self._exit_fill_unresolved()):
+            _log(f"OnNewData D exit (masked): {redacted}")
         fill = self._fill_tracker.on_new_data(raw)
         if fill is None or not self._live_runner:
             return
@@ -11321,6 +11478,9 @@ class BacktestApp:
         # flag and terminates that child so a GUI stop does not wait
         # out the sweep. The headless STOP file is polled the same way.
         self._evolution_cancel = True
+        # Before the rest of teardown. A poll that fires after stop
+        # would mark and save whatever runner is current.
+        self._cancel_exit_fill_retry()
         self._stop_account_polling()
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
