@@ -45,6 +45,9 @@ STATUS_CHECKING = "checking"
 STATUS_ACCEPTED = "accepted"
 STATUS_REFUSED = "refused"
 
+# At most one Discord notice per this many seconds for refused auto requests.
+REFUSED_NOTICE_INTERVAL_S = 300.0
+
 # A request is a handful of short fields. Anything larger is not one.
 MAX_REQUEST_BYTES = 16 * 1024
 
@@ -259,11 +262,18 @@ class ModeRequestTracker:
 
     def __init__(self, *, clock: Callable[[], float] | None = None,
                  history: int = 64):
-        self._clock = clock or time.monotonic
+        self.clock = clock or time.monotonic
         self._handled: deque[str] = deque(maxlen=history)
         self.pending: ModeRequest | None = None
         self.timeout_s: float = 0.0
         self._deadline: float = 0.0
+        # AccountMonitor.rights_seq when the query went out; only a reply
+        # stored after it answers this request.
+        self.rights_seq_at_start: int = 0
+        # Final result whose write failed; retried on the next poll so the
+        # dashboard is not left showing "checking".
+        self.unwritten: tuple[str, dict] | None = None
+        self._last_notice: float | None = None
 
     def seen(self, request_id: str) -> bool:
         return bool(request_id) and request_id in self._handled
@@ -272,10 +282,11 @@ class ModeRequestTracker:
         if request_id and request_id not in self._handled:
             self._handled.append(request_id)
 
-    def start(self, req: ModeRequest, timeout_s: float) -> None:
+    def start(self, req: ModeRequest, timeout_s: float, *, rights_seq: int = 0) -> None:
         self.pending = req
         self.timeout_s = float(timeout_s)
-        self._deadline = self._clock() + self.timeout_s
+        self._deadline = self.clock() + self.timeout_s
+        self.rights_seq_at_start = int(rights_seq)
 
     def poll(self, snapshot_received: bool) -> str:
         """An answered snapshot wins over the deadline."""
@@ -283,9 +294,18 @@ class ModeRequestTracker:
             return self.IDLE
         if snapshot_received:
             return self.ANSWERED
-        if self._clock() >= self._deadline:
+        if self.clock() >= self._deadline:
             return self.TIMEOUT
         return self.WAITING
+
+    def allow_refused_notice(self) -> bool:
+        """Rate limit for Discord notices about refused auto requests."""
+        now = self.clock()
+        if (self._last_notice is not None
+                and now - self._last_notice < REFUSED_NOTICE_INTERVAL_S):
+            return False
+        self._last_notice = now
+        return True
 
     def finish(self) -> ModeRequest | None:
         req, self.pending = self.pending, None

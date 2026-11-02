@@ -40,6 +40,11 @@ ACTIONS = ("stop", "paper", "auto")
 # Bounds for the real-money daily loss limit an auto switch sets (NT$).
 LOSS_LIMIT_MIN, LOSS_LIMIT_MAX = 1, 10_000_000
 REAL_ACK = "實單"
+# The bot answers an auto request within seconds (OI_SNAPSHOT_TIMEOUT_S).
+# A "checking" result older than this means the bot died or never wrote
+# its answer; it stops blocking new requests (the bot itself still refuses
+# a second request while one is in flight).
+MODE_CHECKING_STALE_S = 120
 # Lock held by a live process whose main loop is pumping. A HUNG loop never
 # reads STOP; accepting it would stop (and close) whenever the loop
 # recovers, possibly hours later, so it is refused.
@@ -49,6 +54,9 @@ _ALIVE_STATES = ("RUNNING", "LAGGING", "NO_HEARTBEAT")
 _HEADLESS_CMD = re.compile(r"(run_bot_cli|tai_backtest)\S*\s.*\bdeploy\b", re.IGNORECASE)
 
 _log_lock = threading.Lock()
+# Serialises check() + apply(): the HTTP server is threaded, and two
+# requests that both pass check() would both write a mode request.
+_control_lock = threading.Lock()
 
 
 class ControlRefused(Exception):
@@ -93,8 +101,20 @@ def position_key(summary: dict) -> str:
     return f"{pos.get('side', '')}:{pos.get('size', '')}"
 
 
+def _checking_in_progress(result: dict, now: datetime) -> bool:
+    if result.get("status") != "checking":
+        return False
+    try:
+        at = datetime.strptime(result.get("at") or "", "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ_TPE)
+    except ValueError:
+        return False
+    age = (now - at).total_seconds()
+    return -60 <= age < MODE_CHECKING_STALE_S
+
+
 def check(action: str, summary: dict, bot_dir: str, confirm: str,
-          position_ack: str = "", loss_limit=None, real_ack: str = "") -> None:
+          position_ack: str = "", loss_limit=None, real_ack: str = "", *,
+          now: datetime | None = None) -> None:
     """Raise ControlRefused unless ``action`` may be applied right now."""
     if action not in ACTIONS:
         raise ControlRefused("不支援的操作")
@@ -106,9 +126,14 @@ def check(action: str, summary: dict, bot_dir: str, confirm: str,
     if now_pending["stop"]:
         raise ControlRefused("已送出停止指令，等待機器人停止中")
     result = now_pending.get("result") or {}
-    if action in ("paper", "auto") and (now_pending.get("request")
-                                         or result.get("status") == "checking"):
-        raise ControlRefused("已有模式切換請求處理中，請等待結果")
+    if action in ("paper", "auto"):
+        if now_pending.get("request") or _checking_in_progress(
+                result, now or datetime.now(TZ_TPE)):
+            raise ControlRefused("已有模式切換請求處理中，請等待結果")
+        # A queued mode_override.json applies at the next bar and would
+        # undo an auto switch made in the meantime.
+        if now_pending["mode"]:
+            raise ControlRefused("已有模式切換等待套用")
     if action == "stop":
         if confirm != summary.get("bot_name"):
             raise ControlRefused("請輸入機器人名稱以確認停止")
@@ -142,14 +167,12 @@ def check(action: str, summary: dict, bot_dir: str, confirm: str,
         raise ControlRefused("缺少確認")
     if summary.get("trading_mode") == "paper":
         raise ControlRefused("已經是模擬模式")
-    if now_pending["mode"]:
-        raise ControlRefused("已有模式切換等待套用")
     if summary.get("position"):
         raise ControlRefused("目前有持倉，機器人會拒絕切換；請等部位平倉後再試")
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
-    tmp = path + ".dashboard.tmp"
+    tmp = f"{path}.{uuid.uuid4().hex}.dashboard.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f)
         f.flush()
@@ -233,10 +256,11 @@ def handle(now, base_dir: str, bot_id: str, action: str, confirm: str,
     kw = {"pid_alive_fn": pid_alive_fn} if pid_alive_fn else {}
     summary = snapshot.bot_summary(now, bot_dir, **kw)
     try:
-        check(action, summary, bot_dir, confirm, position_ack, loss_limit, real_ack)
-        message = apply(action, bot_dir, client,
-                        live_channel=bool(summary.get("supports_mode_request")),
-                        loss_limit=loss_limit)
+        with _control_lock:
+            check(action, summary, bot_dir, confirm, position_ack, loss_limit, real_ack)
+            message = apply(action, bot_dir, client,
+                            live_channel=bool(summary.get("supports_mode_request")),
+                            loss_limit=loss_limit)
     except ControlRefused as exc:
         log_request(log_path, client=client, bot_id=bot_id, action=action,
                     result="refused", detail=str(exc))

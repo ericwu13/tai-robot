@@ -7,7 +7,9 @@ updates.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 
 # ── Data classes ──
@@ -275,9 +277,14 @@ class AccountMonitor:
     No Tkinter, no COM dependencies.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or time.monotonic
         self.positions: list[dict] = []
         self.rights: dict = {}
+        # Bumped on every stored OnFutureRights reply, so a caller can wait
+        # for a reply newer than its own query.
+        self.rights_seq: int = 0
+        self._oi_query_started_at: float | None = None
         self._prev_fill_counts: dict[str, int] = {}
         # An empty ``positions`` list means "we don't know yet", NOT "the
         # account is flat" — the callback is asynchronous. Which query a
@@ -316,8 +323,19 @@ class AccountMonitor:
         self._oi_query_gen = _allocate_oi_generation()
         self._oi_saw_001 = False
         self._oi_flat_conflict = False
+        self._oi_query_started_at = self._clock()
         self.clear_positions()
         return self._oi_query_gen
+
+    def oi_query_in_flight(self, window_s: float) -> bool:
+        """True while the latest query is unanswered and under ``window_s`` old.
+
+        Rows are tagged with the query current when they are queued, so a
+        late reply to this query would be credited to the next one.
+        """
+        if self.oi_snapshot_received or self._oi_query_started_at is None:
+            return False
+        return self._clock() - self._oi_query_started_at < window_s
 
     def _accepts_oi_generation(self, generation: int | None) -> bool:
         """Untagged callers credit the current query. A mismatched token does not."""
@@ -427,6 +445,7 @@ class AccountMonitor:
     def update_rights(self, parsed: dict) -> None:
         """Store parsed future rights data."""
         self.rights = parsed
+        self.rights_seq += 1
 
     def get_signed_position(self, prefix: str, market: str | None = None) -> int:
         """Get signed position qty matching a symbol prefix.

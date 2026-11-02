@@ -9589,8 +9589,19 @@ class BacktestApp:
         runner = self._live_runner
         bot_dir = getattr(runner, "bot_dir", None) or bot_dir
         tracker = self._mode_request_tracker()
+        if tracker.unwritten is not None:
+            path, payload = tracker.unwritten
+            try:
+                _mreq.write_result(path, payload)
+                tracker.unwritten = None
+            except Exception as e:
+                _log(f"[MODE REQUEST] result write retry failed: [{type(e).__name__}] {e}")
         if tracker.pending is not None:
             self._continue_auto_mode_request(bot_dir)
+        elif self._account_monitor.oi_query_in_flight(OI_SNAPSHOT_TIMEOUT_S):
+            # A late reply to that query would answer ours. Leave the
+            # request file for a later poll.
+            return
         req, err = _mreq.consume_request(bot_dir)
         if err is not None:
             if tracker.seen(err.request_id):
@@ -9621,25 +9632,29 @@ class BacktestApp:
         self._start_auto_mode_request(bot_dir, req)
 
     def _start_auto_mode_request(self, bot_dir: str, req) -> None:
-        """Fresh OpenInterest query, same as the pre-deploy check (#202)."""
+        """Fresh OpenInterest query, same as the pre-deploy check (#202),
+        and a fresh FutureRights query for today's net P&L."""
         user_id = self.login_user_var.get().strip()
-        try:
-            self._account_monitor.begin_oi_query()
-            code = call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                            user_id, self._futures_account, 1)
-        except Exception as e:
-            _log(f"[MODE REQUEST] GetOpenInterestGW failed: [{type(e).__name__}] {e}")
-            self._finish_mode_request(
-                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
-                f"持倉未知（查詢失敗：{type(e).__name__}）", req)
-            return
-        _log(f"[MODE REQUEST] GetOpenInterestGW code={code} id={req.request_id}")
-        if open_interest_query_rejected(code):
-            self._finish_mode_request(
-                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
-                f"持倉未知（持倉查詢被拒 code={code}）", req)
-            return
-        self._mode_request_tracker().start(req, OI_SNAPSHOT_TIMEOUT_S)
+        monitor = self._account_monitor
+        rights_seq = monitor.rights_seq
+        for name, label in (("GetOpenInterestGW", "持倉"), ("GetFutureRights", "帳戶權益數")):
+            try:
+                if name == "GetOpenInterestGW":
+                    monitor.begin_oi_query()
+                code = call_com(name, getattr(skO, name), user_id, self._futures_account, 1)
+            except Exception as e:
+                _log(f"[MODE REQUEST] {name} failed: [{type(e).__name__}] {e}")
+                self._finish_mode_request(
+                    bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+                    f"{label}未知（查詢失敗：{type(e).__name__}）", req)
+                return
+            _log(f"[MODE REQUEST] {name} code={code} id={req.request_id}")
+            if open_interest_query_rejected(code):
+                self._finish_mode_request(
+                    bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+                    f"{label}未知（查詢被拒 code={code}）", req)
+                return
+        self._mode_request_tracker().start(req, OI_SNAPSHOT_TIMEOUT_S, rights_seq=rights_seq)
         self._finish_mode_request(
             bot_dir, req.request_id, req.mode, _mreq.STATUS_CHECKING,
             "查詢帳戶持倉中", req)
@@ -9647,7 +9662,10 @@ class BacktestApp:
     def _continue_auto_mode_request(self, bot_dir: str) -> None:
         tracker = self._mode_request_tracker()
         monitor = self._account_monitor
-        step = tracker.poll(monitor.oi_snapshot_received)
+        oi_done = monitor.oi_snapshot_received
+        holding = oi_done and monitor.has_open_positions()
+        rights_done = monitor.rights_seq > tracker.rights_seq_at_start
+        step = tracker.poll(holding or (oi_done and rights_done))
         if step in (tracker.WAITING, tracker.IDLE):
             return
         req = tracker.finish()
@@ -9657,11 +9675,23 @@ class BacktestApp:
                 bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED, reason, req)
 
         if step == tracker.TIMEOUT:
-            _refuse(f"持倉未知（逾時：{tracker.timeout_s:.0f} 秒內未收到帳戶持倉回報）")
+            what = "持倉" if not oi_done else "帳戶權益數"
+            _refuse(f"{what}未知（逾時：{tracker.timeout_s:.0f} 秒內未收到{what}回報）")
             return
-        if monitor.has_open_positions():
+        if holding:
             _refuse("帳戶已有未平倉部位，拒絕切換至全自動："
                     + _mreq.format_positions(monitor.positions))
+            return
+        # A paper bot never checked the account's day P&L against a limit.
+        # Check it against the new one now, or a real entry could go out
+        # before the next account poll pauses the guard.
+        display = monitor.compute_display()
+        if not display.valid:
+            _refuse("帳戶權益數未知（無法解析帳戶淨損益）")
+            return
+        net = display.net_pnl_int
+        if net < -req.loss_limit:
+            _refuse(f"帳戶淨損益 {net:+,} 已超過每日虧損上限 -{req.loss_limit:,}，拒絕切換至全自動")
             return
         # The book was flat when the reply landed. Re-check everything else:
         # a sim entry, a fill or a replay may have started while we waited.
@@ -9673,6 +9703,7 @@ class BacktestApp:
         runner = self._live_runner
         saved = (guard.daily_loss_limit, runner.daily_loss_limit)
         guard.arm_for_live_switch(req.loss_limit)
+        guard.update_pnl(net)
         runner.daily_loss_limit = req.loss_limit
         if not self._apply_requested_mode(bot_dir, req):
             guard.daily_loss_limit, runner.daily_loss_limit = saved
@@ -9714,11 +9745,15 @@ class BacktestApp:
                              status: str, reason: str, req=None) -> None:
         """Result file, audit row, live log, and a Discord notice on a refused auto."""
         at = _taipei_now().isoformat(timespec="seconds")
+        payload = _mreq.result_payload(request_id, mode, status, reason, at)
+        tracker = self._mode_request_tracker()
+        tracker.unwritten = None
         try:
-            _mreq.write_result(
-                bot_dir, _mreq.result_payload(request_id, mode, status, reason, at))
+            _mreq.write_result(bot_dir, payload)
         except Exception as e:
             _log(f"[MODE REQUEST] result write failed: [{type(e).__name__}] {e}")
+            if status != _mreq.STATUS_CHECKING:
+                tracker.unwritten = (bot_dir, payload)
         if status == _mreq.STATUS_CHECKING:
             _log(f"[MODE REQUEST] {mode} id={request_id}: {reason}")
             return
@@ -9732,7 +9767,9 @@ class BacktestApp:
         self._live_log_msg(
             f"[MODE REQUEST] 模式切換請求{verdict} → {mode or '?'}: {reason}", "status")
         if status == _mreq.STATUS_REFUSED and mode == "auto":
-            if _discord is not None and _discord.enabled:
+            if not tracker.allow_refused_notice():
+                _log("[MODE REQUEST] Discord notice skipped (rate limit)")
+            elif _discord is not None and _discord.enabled:
                 try:
                     _discord.mode_switch_refused(mode, reason, by)
                 except Exception:

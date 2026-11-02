@@ -10,8 +10,16 @@ offered only when the running process advertises the channel
 from __future__ import annotations
 
 import json
+import os
+import re
+import threading
+import time
+from datetime import datetime, timedelta
 
 import pytest
+
+from scripts.dashboard import control, server
+from scripts.monitor.common import TZ_TPE
 
 from tests.test_dashboard import (  # noqa: F401  (fixture)
     ALIVE_PID, FAKE_CHANNEL, _get, _post, _set_mode, control_server,
@@ -21,6 +29,12 @@ from tests.test_dashboard import (  # noqa: F401  (fixture)
 def _caps(bot_dir, pid=ALIVE_PID, mode_request=1):
     (bot_dir / "capabilities.json").write_text(json.dumps(
         {"mode_request": mode_request, "pid": pid, "version": "2.19.11"}))
+
+
+def _checking(bot_dir, age_s):
+    at = (datetime.now(TZ_TPE) - timedelta(seconds=age_s)).isoformat(timespec="seconds")
+    (bot_dir / "mode_request_result.json").write_text(json.dumps(
+        {"request_id": "x", "mode": "auto", "status": "checking", "reason": "", "at": at}))
 
 
 def _auto(url, bot="TMF00_alpha", name="alpha", ack="實單", limit=10000, **extra):
@@ -77,8 +91,7 @@ def test_auto_refused_when_holding_already_auto_or_busy(control_server):
     status, body = _auto(url)
     assert status == 409 and "持倉" in body["message"]
     _set_mode(alpha, "paper", position={"position_size": 0})
-    (alpha / "mode_request_result.json").write_text(json.dumps(
-        {"request_id": "x", "mode": "auto", "status": "checking", "reason": "", "at": "2026-10-28T10:00:00"}))
+    _checking(alpha, 5)
     status, body = _auto(url)
     assert status == 409 and "處理中" in body["message"]
     (alpha / "mode_request_result.json").unlink()
@@ -140,3 +153,82 @@ def test_auto_is_audited(control_server):
     with open(log, encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     assert [(r["action"], r["result"]) for r in rows] == [("auto", "refused"), ("auto", "accepted")]
+
+
+def test_stale_checking_result_stops_blocking(control_server):
+    """A bot that died, or failed its final write, mid-check must not lock
+    both buttons forever."""
+    url, base, _ = control_server
+    alpha = base / "TMF00_alpha"
+    _caps(alpha)
+    _checking(alpha, control.MODE_CHECKING_STALE_S + 5)
+    assert _auto(url)[0] == 200
+
+
+def test_auto_refused_while_a_paper_override_is_queued(control_server):
+    """A queued mode_override.json would revert the switch at the next bar."""
+    url, base, _ = control_server
+    alpha = base / "TMF00_alpha"
+    _caps(alpha)
+    (alpha / "mode_override.json").write_text(json.dumps({"trading_mode": "paper"}))
+    status, body = _auto(url)
+    assert status == 409 and "等待套用" in body["message"]
+    assert not (alpha / "mode_request.json").exists()
+
+
+def test_concurrent_requests_queue_exactly_one(control_server, monkeypatch):
+    url, base, log = control_server
+    _caps(base / "TMF00_alpha")
+    real_write = control._atomic_write_json
+
+    def _slow_write(path, payload):
+        time.sleep(0.3)            # widen the check -> write window
+        real_write(path, payload)
+
+    monkeypatch.setattr(control, "_atomic_write_json", _slow_write)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(_auto(url)[0]))
+               for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == [200, 409, 409]
+    import csv
+    with open(log, encoding="utf-8") as f:
+        outcomes = sorted(r["result"] for r in csv.DictReader(f))
+    assert outcomes == ["accepted", "refused", "refused"]   # refused, not a write error
+
+
+def test_dashboard_writes_use_their_own_temp_file(tmp_path, monkeypatch):
+    seen = []
+    real_replace = os.replace
+
+    def _spy(src, dst):
+        seen.append(os.path.basename(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _spy)
+    for _ in range(2):
+        control._atomic_write_json(str(tmp_path / "mode_request.json"), {"a": 1})
+    assert len(set(seen)) == 2
+    assert sorted(os.listdir(tmp_path)) == ["mode_request.json"]
+
+
+def _page():
+    return open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+
+
+def test_page_uses_the_same_checking_age_limit():
+    m = re.search(r"const CHECKING_STALE_S = (\d+);", _page())
+    assert m and int(m.group(1)) == control.MODE_CHECKING_STALE_S
+
+
+def test_page_shows_switched_only_when_the_bot_is_in_that_mode():
+    """After a fill-timeout downgrade the bot is back in paper; the
+    15-minute 已切換為實單 chip must not keep saying otherwise."""
+    page = _page()
+    body = page[page.index("function requestChip"):page.index("function pendingChip")]
+    assert re.search(r'r\.status === "accepted" && tradingMode === r\.mode', body), body
+    assert "requestChip(b.pending, b.trading_mode)" in page

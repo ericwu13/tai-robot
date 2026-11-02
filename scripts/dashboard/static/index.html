@@ -356,16 +356,32 @@ function priceCell(sim, real) {
   if (!real || real === sim) return fmtInt(sim);
   return el("span", null, fmtInt(sim), el("div", { class: "sub" }, "實際 " + fmtInt(real)));
 }
-function requestChip(p) {
+// Same as control.MODE_CHECKING_STALE_S: a "checking" answer older than
+// this means the bot died or never wrote its result.
+const CHECKING_STALE_S = 120;
+function resultAge(r) {
+  return (Date.now() - Date.parse(r.at.replace(" ", "T") + "+08:00")) / 1000;
+}
+function checkingNow(r) {
+  if (!r || r.status !== "checking" || !r.at) return false;
+  const age = resultAge(r);
+  return age >= -60 && age < CHECKING_STALE_S;
+}
+function requestChip(p, tradingMode) {
   if (!p) return null;
   if (p.request) return el("span", { class: "pend" }, "切換" + (MODE[p.request] || p.request) + "：已送出，等待機器人");
   const r = p.result;
   if (!r || !r.at) return null;
-  const age = (Date.now() - Date.parse(r.at.replace(" ", "T") + "+08:00")) / 1000;
-  if (r.status !== "checking" && !(age >= 0 && age < 900)) return null;
+  const age = resultAge(r);
+  if (!(age >= -60 && age < 900)) return null;
   const target = MODE[r.mode] || r.mode;
-  if (r.status === "checking") return el("span", { class: "pend" }, `切換${target}：檢查帳戶持倉中…`);
-  if (r.status === "accepted") return el("span", { class: "chip s-ok" }, `已切換為${target}`);
+  if (r.status === "checking") {
+    return checkingNow(r) ? el("span", { class: "pend" }, `切換${target}：檢查帳戶持倉中…`)
+      : el("span", { class: "pend" }, `切換${target}：機器人未回覆檢查結果`);
+  }
+  // A later downgrade (e.g. fill timeout) puts the bot back in paper.
+  if (r.status === "accepted" && tradingMode === r.mode) return el("span", { class: "chip s-ok" }, `已切換為${target}`);
+  if (r.status === "accepted") return null;
   return el("span", { class: "pend", title: r.reason }, `切換${target}被拒：${r.reason}`);
 }
 function pendingChip(p) {
@@ -499,7 +515,7 @@ const App = {
     } else if (action === "auto") {
       $("dlg-title").textContent = `將 ${b.bot_name} 改為實單（全自動）？`;
       body.push(el("p", { class: "warn" }, "改為實單後，機器人會用真實帳戶自動下單，可能造成實際虧損。"));
-      body.push(el("p", null, "機器人會先查詢帳戶持倉：帳戶已有任何未平倉部位、查詢失敗或逾時、等待成交中或重播歷史時，都會拒絕切換。結果會顯示在頁面上。"));
+      body.push(el("p", null, "機器人會先查詢帳戶持倉：帳戶已有任何未平倉部位、帳戶淨損益（券商權益數回報）已超過下方的每日虧損上限、查詢失敗或逾時、等待成交中或重播歷史時，都會拒絕切換。結果會顯示在頁面上。"));
       body.push(el("p", { class: "sub" }, "機器人重新啟動後會回到部署時指定的模式（模擬）。"));
       body.push(el("p", null, "每日虧損上限（新台幣）："));
       const limit = el("input", { id: "dlg-limit", type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "例如 10000" });
@@ -744,12 +760,12 @@ const App = {
     $("d-state").replaceChildren(chip(b.state));
     $("d-strategy").textContent = b.strategy + (b.interval_s ? `・${b.interval_s / 60} 分 K 策略` : "");
     $("d-mode").replaceChildren(modeBadge(b.trading_mode));
-    $("d-pending").replaceChildren(pendingChip(b.pending) || "", requestChip(b.pending) || "");
+    $("d-pending").replaceChildren(pendingChip(b.pending) || "", requestChip(b.pending, b.trading_mode) || "");
     const alive = ["RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT"].includes(b.state);
     const p = b.pending || {};
     $("d-controls").hidden = !(this.fleet && this.fleet.control_enabled) || !alive;
     $("btn-stop").disabled = !!p.stop;
-    const busy = !!(p.stop || p.mode || p.request || (p.result && p.result.status === "checking"));
+    const busy = !!(p.stop || p.mode || p.request || checkingNow(p.result));
     $("btn-paper").hidden = b.trading_mode === "paper";
     $("btn-paper").disabled = busy;
     // Real money only through the bot's live channel, which checks the account.

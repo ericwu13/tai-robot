@@ -39,6 +39,15 @@ ACCT = "F1111111"
 POSITION_ROW = f"TF,{ACCT},TXFD0,B,1,0,22500.0,15,2,ID"
 
 
+def _rights(realized=0, fee=0, tax=0, float_pnl=0):
+    """An OnFutureRights row; net = realized - fee - tax + float_pnl."""
+    vals = ["0"] * 35
+    vals[1], vals[2], vals[3], vals[11] = (str(float_pnl), str(fee), str(tax),
+                                           str(realized))
+    vals[25] = "TWD"
+    return ",".join(vals)
+
+
 class _Var:
     def __init__(self, value=""):
         self.value = value
@@ -132,6 +141,16 @@ class _Harness:
             events.OnOpenInterest(row)
         rb.BacktestApp._process_ui_queue(self.app)
 
+    def rights(self, row=None):
+        rb.SKOrderLibEvents().OnFutureRights(row or _rights())
+        rb.BacktestApp._process_ui_queue(self.app)
+
+    def flat(self):
+        """Both replies of a flat account with no loss today, then a poll."""
+        self.oi("001,查無資料", "##")
+        self.rights()
+        self.poll()
+
     def result(self):
         with open(mreq.result_path(self.bot_dir), encoding="utf-8") as fh:
             return json.load(fh)
@@ -165,14 +184,14 @@ def harness(tmp_path, monkeypatch):
     app._futures_account = ACCT
     app._logged_in = True
     app.login_user_var = _Var("F1111111111")
-    app._account_monitor = AccountMonitor()
+    clock = _Clock()
+    app._account_monitor = AccountMonitor(clock=clock)
     app.real_pos_var = _Var()
     app._update_real_account_display = lambda: None
     app.trading_mode_var = _Var()
     app._mode_key_to_combo = {"paper": "模擬 Paper", "semi_auto": "半自動 Semi-Auto",
                               "auto": "全自動 Auto"}
     app._live_runner = runner
-    clock = _Clock()
     app._mode_req_tracker = mreq.ModeRequestTracker(clock=clock)
 
     # Same wiring as _deploy_live_continue.
@@ -193,7 +212,8 @@ def harness(tmp_path, monkeypatch):
 
     discord = _Discord()
     monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetOpenInterestGW=lambda *a: 0))
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetOpenInterestGW=lambda *a: 0,
+                                                   GetFutureRights=lambda *a: 0))
     monkeypatch.setattr(rb, "call_com", _call_com)
     monkeypatch.setattr(rb, "_discord", discord)
     monkeypatch.setattr(rb, "_app", app)
@@ -218,14 +238,18 @@ def test_flat_account_accepts_auto_and_arms_real_orders(harness):
     h.app._trading_guard.real_entry_confirmed = True  # stale from an earlier stint
     h.request(loss_limit=3000)
     h.poll()
-    assert [c[0] for c in h.com_calls] == ["GetOpenInterestGW"]
-    assert h.com_calls[0][1] == ("F1111111111", ACCT, 1)
+    assert [c[0] for c in h.com_calls] == ["GetOpenInterestGW", "GetFutureRights"]
+    assert h.com_calls[0][1] == h.com_calls[1][1] == ("F1111111111", ACCT, 1)
     res = h.result()
     assert res["status"] == "checking" and res["request_id"] == "a1b2c3"
     assert not os.path.exists(mreq.request_path(h.bot_dir)), "request not consumed"
     _assert_paper(h)  # never switched before the reply
 
     h.oi("001,查無資料", "##")
+    h.poll()
+    assert h.result()["status"] == "checking"  # equity not in yet
+    _assert_paper(h)
+    h.rights(_rights(realized=-1200, fee=50, tax=30, float_pnl=200))  # net -1,080
     h.poll()
 
     res = h.result()
@@ -349,8 +373,7 @@ def test_sim_position_opened_while_waiting_refuses(harness):
     h.request()
     h.poll()
     h.runner.broker.position_size = 1  # a sim entry filled meanwhile
-    h.oi("001,查無資料", "##")
-    h.poll()
+    h.flat()
     res = h.result()
     assert res["status"] == "refused" and "模擬部位" in res["reason"]
     assert h.app._trading_mode == "paper" and h.runner.trading_mode == "paper"
@@ -362,11 +385,172 @@ def test_replay_started_while_waiting_refuses(harness):
     h.request()
     h.poll()
     h.runner.suppress_strategy = True
-    h.oi("001,查無資料", "##")
-    h.poll()
+    h.flat()
     res = h.result()
     assert res["status"] == "refused" and "回放" in res["reason"]
     _assert_paper(h)
+
+
+def test_account_past_the_new_loss_limit_refuses_auto(harness):
+    """A paper bot never evaluated the account's day P&L against a limit.
+    Accepting auto here would let a real entry go out before the next 30 s
+    account poll paused it."""
+    h = harness
+    h.request(loss_limit=3000)
+    h.poll()
+    h.oi("001,查無資料", "##")
+    h.rights(_rights(realized=-3500, fee=60, tax=40, float_pnl=500))  # net -3,100
+    h.poll()
+    res = h.result()
+    assert res["status"] == "refused" and "虧損上限" in res["reason"], res
+    _assert_paper(h)
+    assert h.app._trading_guard.daily_loss_limit == 1000
+    assert h.runner.daily_loss_limit == 1000
+    assert h.discord.switched == []
+
+
+def test_account_at_the_new_loss_limit_is_accepted_and_recorded(harness):
+    h = harness
+    h.request(loss_limit=3000)
+    h.poll()
+    h.oi("001,查無資料", "##")
+    h.rights(_rights(realized=-3000))                                   # net -3,000
+    h.poll()
+    assert h.result()["status"] == "accepted"
+    guard = h.app._trading_guard
+    assert guard.paused is False
+    # The guard starts the stint knowing today's net, not a stale value.
+    guard.update_pnl(-3001)
+    assert guard.paused is True
+
+
+def test_equity_stored_before_the_request_does_not_answer(harness):
+    h = harness
+    h.rights(_rights())                       # an earlier 30 s poll's reply
+    h.request()
+    h.poll()
+    h.oi("001,查無資料", "##")
+    h.poll()
+    assert h.result()["status"] == "checking"
+    _assert_paper(h)
+
+
+def test_unparseable_equity_refuses(harness):
+    h = harness
+    h.request()
+    h.poll()
+    h.oi("001,查無資料", "##")
+    bad = _rights().split(",")
+    bad[11] = "abc"
+    h.rights(",".join(bad))
+    h.poll()
+    res = h.result()
+    assert res["status"] == "refused" and "權益" in res["reason"]
+    _assert_paper(h)
+
+
+def test_equity_timeout_refuses(harness):
+    h = harness
+    h.request()
+    h.poll()
+    h.oi("001,查無資料", "##")
+    h.poll()
+    h.clock.t += rb.OI_SNAPSHOT_TIMEOUT_S + 1
+    h.poll()
+    res = h.result()
+    assert res["status"] == "refused" and "權益" in res["reason"] and "逾時" in res["reason"]
+    _assert_paper(h)
+
+
+@pytest.mark.parametrize("code", [5, RuntimeError("gw down")])
+def test_rejected_equity_query_refuses(harness, code):
+    h = harness
+    real = h.code_box
+
+    def _call_com(name, fn, *args, **kwargs):
+        h.com_calls.append((name, args))
+        if name == "GetFutureRights":
+            if isinstance(code, Exception):
+                raise code
+            return code
+        return 0
+
+    rb.call_com = _call_com
+    h.request()
+    h.poll()
+    res = h.result()
+    assert res["status"] == "refused" and "權益" in res["reason"]
+    assert h.app._mode_req_tracker.pending is None
+    assert real["code"] == 0
+    _assert_paper(h)
+
+
+def test_position_reply_refuses_without_waiting_for_equity(harness):
+    h = harness
+    h.request()
+    h.poll()
+    h.oi(POSITION_ROW, "##")
+    h.poll()
+    assert h.result()["status"] == "refused"
+
+
+def test_request_waits_while_an_earlier_position_query_is_unanswered(harness):
+    """Rows are tagged with the query current when they are queued, so a
+    late reply to the 30 s poll's query would answer the switch's query."""
+    h = harness
+    h.app._account_monitor.begin_oi_query()   # the 30 s account poll
+    h.request()
+    h.poll()
+    assert h.com_calls == []
+    assert os.path.exists(mreq.request_path(h.bot_dir)), "consumed while in flight"
+    h.clock.t += rb.OI_SNAPSHOT_TIMEOUT_S     # that query never answered
+    h.poll()
+    assert [c[0] for c in h.com_calls] == ["GetOpenInterestGW", "GetFutureRights"]
+    assert h.result()["status"] == "checking"
+
+
+def test_request_proceeds_once_the_earlier_query_answered(harness):
+    h = harness
+    h.app._account_monitor.begin_oi_query()
+    h.oi("001,查無資料", "##")
+    h.request()
+    h.poll()
+    assert [c[0] for c in h.com_calls] == ["GetOpenInterestGW", "GetFutureRights"]
+
+
+def test_failed_final_result_write_is_retried(harness, monkeypatch):
+    h = harness
+    h.request()
+    h.poll()
+    real_write = mreq.write_result
+    fail = {"n": 1}
+
+    def _flaky(bot_dir, payload):
+        if payload["status"] != "checking" and fail["n"]:
+            fail["n"] -= 1
+            raise PermissionError("locked by a reader")
+        return real_write(bot_dir, payload)
+
+    monkeypatch.setattr(mreq, "write_result", _flaky)
+    h.flat()
+    assert h.result()["status"] == "checking"     # the write failed
+    assert h.app._trading_mode == "auto"
+    h.poll()
+    assert h.result()["status"] == "accepted"
+
+
+def test_refused_auto_discord_notices_are_rate_limited(harness):
+    h = harness
+    h.runner.broker.position_size = 1
+    for i in range(3):
+        h.request(request_id=f"r{i}")
+        h.poll()
+        assert h.result()["status"] == "refused"
+    assert len(h.discord.refused) == 1
+    h.clock.t += mreq.REFUSED_NOTICE_INTERVAL_S
+    h.request(request_id="r9")
+    h.poll()
+    assert len(h.discord.refused) == 2
 
 
 # ── gates checked before any query ──
@@ -456,9 +640,8 @@ def test_second_request_while_checking_refuses(harness):
     res = h.result()
     assert res["request_id"] == "second" and res["status"] == "refused"
     assert "處理中" in res["reason"]
-    assert len(h.com_calls) == 1
-    h.oi("001,查無資料", "##")
-    h.poll()
+    assert len(h.com_calls) == 2
+    h.flat()
     res = h.result()
     assert res["request_id"] == "first" and res["status"] == "accepted"
 
@@ -488,8 +671,7 @@ def test_duplicate_request_id_is_ignored(harness):
     h = harness
     h.request()
     h.poll()
-    h.oi("001,查無資料", "##")
-    h.poll()
+    h.flat()
     assert h.result()["status"] == "accepted"
     # Switch back to paper by hand, then replay the same request id.
     h.runner._apply_mode_switch("paper")
@@ -498,7 +680,7 @@ def test_duplicate_request_id_is_ignored(harness):
     h.poll()
     assert not os.path.exists(mreq.request_path(h.bot_dir))
     assert h.result() == before
-    assert len(h.com_calls) == 1
+    assert len(h.com_calls) == 2
     _assert_paper(h)
 
 
