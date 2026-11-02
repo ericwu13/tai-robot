@@ -258,10 +258,28 @@ def _read_if_changed(path: str, load, valid):
     return data
 
 
-def read_session(bot_dir: str) -> dict:
-    """session.json, re-read only when it changed (see ``_read_if_changed``)."""
-    data = _read_if_changed(os.path.join(bot_dir, "session.json"),
-                            fileio.read_json, lambda d: isinstance(d, dict))
+def read_session(bot_dir: str, *, fresh: bool = False) -> dict:
+    """session.json, re-read only when it changed (see ``_read_if_changed``).
+
+    ``fresh=True`` always reads the bytes. A control decision must not
+    trust the stat cache: a rewrite that keeps the same size inside one
+    timestamp tick is otherwise invisible, and a closed position still
+    looks open.
+    """
+    path = os.path.join(bot_dir, "session.json")
+    if fresh:
+        data = fileio.read_json(path)
+        if not isinstance(data, dict):
+            _stat_cache.pop(path, None)
+            return {}
+        try:
+            st = os.stat(path)
+        except OSError:
+            _stat_cache.pop(path, None)
+        else:
+            _stat_cache[path] = (st.st_mtime_ns, st.st_size, data)
+        return data
+    data = _read_if_changed(path, fileio.read_json, lambda d: isinstance(d, dict))
     return data if isinstance(data, dict) else {}
 
 
@@ -279,7 +297,8 @@ def trading_day_start(now: datetime) -> datetime:
     return now.astimezone(TZ_TPE).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
+def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
+                fresh: bool = False) -> dict:
     name = os.path.basename(os.path.normpath(bot_dir))
     activity = last_activity_ts(bot_dir)
     info = {"id": name, "symbol": name.partition("_")[0],
@@ -288,7 +307,7 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
                                     else round(now.timestamp() - activity)),
             **bot_state(now, bot_dir, pid_alive_fn=pid_alive_fn,
                         activity_ts=activity)}
-    sess = read_session(bot_dir)
+    sess = read_session(bot_dir, fresh=fresh)
     broker = sess.get("broker") if isinstance(sess.get("broker"), dict) else {}
     trades = broker.get("trades") if isinstance(broker.get("trades"), list) else []
     trades = [t for t in trades if isinstance(t, dict)]
@@ -321,6 +340,8 @@ def bot_summary(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive) -> dict:
     info["regime"] = (regime_summary(read_regime_state(bot_dir), sess)
                       if _is_regime_bot(sess) else None)
     info["pending"] = pending(bot_dir)
+    info["supports_mode_request"] = supports_mode_request(
+        bot_dir, pid_alive_fn)
     info["headless"] = headless_live(bot_dir, pid_alive_fn)
     running = info["state"] in ("RUNNING", "LAGGING", "HUNG", "NO_HEARTBEAT",
                                 "CRASHED", "UNKNOWN")
@@ -335,6 +356,43 @@ MODE_OVERRIDE_FILENAME = "mode_override.json"
 
 def mode_override_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, MODE_OVERRIDE_FILENAME)
+
+
+# Live mode-switch channel: the dashboard writes mode_request.json, the
+# bot answers in mode_request_result.json, and headless.json carries
+# ``mode_request: 1``. The flag counts only together with the marker's
+# pid, lock pid and started_at checks (``headless_live``).
+MODE_REQUEST_FILENAME = "mode_request.json"
+MODE_RESULT_FILENAME = "mode_request_result.json"
+
+
+def mode_request_path(bot_dir: str) -> str:
+    return os.path.join(bot_dir, MODE_REQUEST_FILENAME)
+
+
+def supports_mode_request(bot_dir: str, pid_alive_fn=None, *,
+                          create_time_fn=None) -> bool:
+    """True when this live headless process polls the mode-request channel."""
+    raw = fileio.read_json(headless_marker_path(bot_dir))
+    if not isinstance(raw, dict):
+        return False
+    flag = raw.get("mode_request")
+    if type(flag) is not int or flag != 1:
+        return False
+    return headless_live(bot_dir, pid_alive_fn, create_time_fn=create_time_fn)
+
+
+def _mode_result(bot_dir: str) -> dict | None:
+    data = fileio.read_json(os.path.join(bot_dir, MODE_RESULT_FILENAME))
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "")
+    if status not in ("checking", "accepted", "refused"):
+        return None
+    return {"request_id": redact_line(str(data.get("request_id") or ""))[:64],
+            "mode": str(data.get("mode") or ""), "status": status,
+            "reason": redact_line(str(data.get("reason") or ""))[:300],
+            "at": str(data.get("at") or "")[:19].replace("T", " ")}
 
 
 # Process creation time and the marker's started_at are both second-resolution.
@@ -391,11 +449,16 @@ def headless_live(bot_dir: str, pid_alive_fn=None, *, create_time_fn=None) -> bo
 
 def pending(bot_dir: str) -> dict:
     """Control files written but not yet consumed by the bot: the headless
-    STOP file, and a queued mode_override.json (applied at the next bar)."""
+    STOP file, a queued mode_override.json (applied at the next bar), a
+    queued live mode request, and the bot's latest answer to one."""
     data = fileio.read_json(mode_override_path(bot_dir))
     mode = data.get("trading_mode") if isinstance(data, dict) else None
+    req = fileio.read_json(mode_request_path(bot_dir))
+    req_mode = req.get("mode") if isinstance(req, dict) else None
     return {"stop": stop_requested(bot_dir),
-            "mode": mode if isinstance(mode, str) else None}
+            "mode": mode if isinstance(mode, str) else None,
+            "request": req_mode if isinstance(req_mode, str) else None,
+            "result": _mode_result(bot_dir)}
 
 
 def _broken_bot(bot_dir: str, exc: Exception) -> dict:
@@ -410,8 +473,8 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
             "last_price": None, "last_bar_dt": "", "saved_at": "", "real": None,
             "last_decision": None, "regime": None,
-            "pending": {"stop": False, "mode": None}, "headless": False,
-            "active": True}
+            "pending": {"stop": False, "mode": None, "request": None, "result": None},
+            "supports_mode_request": False, "headless": False, "active": True}
 
 
 def market_state(now: datetime) -> dict:

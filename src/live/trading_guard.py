@@ -93,6 +93,19 @@ class TradingGuard:
         self.halt_reason = ""
         self._deferred_close = None
 
+    def arm_for_live_switch(self, daily_loss_limit: int) -> None:
+        """Prepare for a live paper -> auto switch on a verified-flat book.
+
+        Deploy gets this from ``reset()``. A live switch must not inherit
+        a ``real_entry_confirmed`` left by an earlier real-mode stint: with
+        it set, the next sim exit is SEND_EXIT and sNewClose=2 can open a
+        naked position on a flat account. ``paused`` / ``halted`` /
+        ``link_entries_blocked`` are kept — the switch refuses on them.
+        """
+        self.daily_loss_limit = int(daily_loss_limit)
+        self.real_entry_confirmed = False
+        self._deferred_close = None
+
     # ── Entry / exit gating ──
 
     def check_entry(self, trading_mode: str) -> tuple[bool, str]:
