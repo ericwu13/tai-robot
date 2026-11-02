@@ -6,12 +6,29 @@ webhook or ``verdict`` mis-grades, every downstream report is wrong.
 
 from datetime import datetime, timedelta
 
+import os
+
 from scripts.monitor.common import (
-    TZ_TPE, Finding, first_ts_in_line, last_tpe_timestamp, read_lock_pid,
-    redact, resolve_news_path, setting, verdict,
+    TZ_TPE, Finding, _open_failed_liveness, first_ts_in_line, last_tpe_timestamp,
+    pid_alive, pid_alive_strict, read_lock_pid, redact, resolve_news_path,
+    setting, verdict,
 )
 
 NOW = datetime(2026, 8, 25, 6, 0, tzinfo=TZ_TPE)
+
+
+def test_pid_alive_strict_refuses_access_denied(monkeypatch):
+    """Lock checks stay fail-open. The headless-marker gate does not."""
+    def denied(pid, sig):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "kill", denied)
+    if os.name != "nt":
+        assert pid_alive(4242) is True
+        assert pid_alive_strict(4242) is False
+    assert _open_failed_liveness(5, access_denied_is_alive=True) is True
+    assert _open_failed_liveness(5, access_denied_is_alive=False) is False
+    assert _open_failed_liveness(2, access_denied_is_alive=True) is False
 
 
 # ── redaction ───────────────────────────────────────────────────────────
