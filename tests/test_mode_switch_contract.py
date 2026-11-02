@@ -8,6 +8,7 @@ and what the bot writes back, the dashboard reads.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 from scripts.dashboard import control, snapshot
 from src.live import mode_request as mreq
@@ -16,6 +17,12 @@ from src.live import mode_request as mreq
 def test_file_names_match():
     assert snapshot.MODE_REQUEST_FILENAME == mreq.REQUEST_FILENAME
     assert snapshot.MODE_RESULT_FILENAME == mreq.RESULT_FILENAME
+
+
+def test_dashboard_requested_at_is_timezone_aware():
+    """control._mode_request stamps Taipei time with an offset."""
+    at = datetime.fromisoformat(control._mode_request("paper", "127.0.0.1")["requested_at"])
+    assert at.tzinfo is not None and at.utcoffset() is not None
 
 
 def _live_marker(tmp_path, monkeypatch):

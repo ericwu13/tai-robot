@@ -10108,6 +10108,9 @@ class BacktestApp:
         if reason is None and req.mode == "auto":
             if not getattr(runner, "_dashboard_auto_opt_in", False):
                 reason = "此機器人未在設定中允許從儀表板切換實單"
+            elif not getattr(runner, "_allow_live_override", False):
+                # Before any GetOpenInterestGW / GetFutureRights call.
+                reason = "設定 allow_live_override 為關閉，拒絕切換實單"
             else:
                 cap = getattr(runner, "_mode_switch_loss_cap",
                               _mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD)
