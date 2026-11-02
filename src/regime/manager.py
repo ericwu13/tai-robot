@@ -17,6 +17,7 @@ from .store import (
     load_state, save_state, append_history,
     record_session_result, migrate_legacy_history,
     session_result_pending, write_placeholder_state,
+    _replace,
 )
 
 logger = logging.getLogger(__name__)
@@ -268,7 +269,9 @@ class RegimeManager:
                 json.dump(d, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self._state_path)
+            # Same retry as the store: a monitor read's PermissionError
+            # must not leave last_features unpersisted.
+            _replace(tmp, self._state_path)
         except Exception as e:
             logger.warning("[REGIME] Could not persist last_features: %s", e)
 
@@ -299,7 +302,9 @@ class RegimeManager:
                 json.dump(d, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self._state_path)
+            # A swallowed PermissionError here leaves executed=False, so a
+            # restart re-arms a recommendation this process already applied.
+            _replace(tmp, self._state_path)
         except Exception as e:
             logger.exception("[REGIME] Error marking recommendation executed: %s", e)
 
