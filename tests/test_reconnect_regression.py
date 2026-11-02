@@ -327,7 +327,12 @@ class TestKeptReconnectDiagnostics:
         assert "set_com_return_logger(_log_com_return)" in rb_source
 
     def test_reply_link_state_helper_does_not_call_skcom(self, rb_source: str):
-        """IsConnectedByID is logged only from a value the caller already has."""
+        """The reconnect helper logs a value the caller already holds.
+
+        Issue #219 reads it from ``_read_is_connected_by_id`` only
+        (the 30s log and the 60s poll). Reconnect and this helper still
+        must not call it.
+        """
         match = re.search(
             r"def _log_reply_link_state\(.*?\n(?=def )",
             rb_source,
@@ -338,7 +343,20 @@ class TestKeptReconnectDiagnostics:
         assert "call_com(" not in body
         assert "SKReplyLib_" not in body
         assert "reply-link IsConnectedByID=" in body
-        assert "SKReplyLib_IsConnectedByID" not in rb_source
+        assert rb_source.count("SKReplyLib_IsConnectedByID") == 1
+        probe = re.search(
+            r"def _read_is_connected_by_id\(self.*?(?=\n    def )",
+            rb_source,
+            re.DOTALL,
+        )
+        assert probe and "SKReplyLib_IsConnectedByID" in probe.group(0)
+        reconnect = re.search(
+            r"def _attempt_reconnect\(self\):(.*?)\n    def ",
+            rb_source,
+            re.DOTALL,
+        )
+        assert reconnect
+        assert "SKReplyLib_IsConnectedByID" not in reconnect.group(1)
 
     def test_faulthandler_armed_at_deploy(self, rb_source: str):
         assert "def enable_reconnect_faulthandler(" in rb_source
