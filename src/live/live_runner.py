@@ -954,8 +954,10 @@ class LiveRunner:
         # Same bytes we already refused or already applied, and could
         # not delete. Skip the warning and do not apply again.
         fingerprint = mode_override_fingerprint(override_path)
-        if (self._ignored_mode_override is not None
-                and fingerprint == self._ignored_mode_override):
+        # Default None: a runner built without __init__ (the dashboard
+        # paper-switch contract) has not stored an ignored fingerprint.
+        ignored = getattr(self, "_ignored_mode_override", None)
+        if ignored is not None and fingerprint == ignored:
             return None
         try:
             # utf-8-sig: a BOM-prefixed object is valid JSON, not a
@@ -979,7 +981,10 @@ class LiveRunner:
         if not isinstance(mode, str):
             self._reject_bad_override(override_path, mode, fingerprint)
             return None
-        if self._headless and mode not in _HEADLESS_FILE_MODES:
+        # Default False matches LiveRunner.__init__. Missing means the
+        # GUI path: exact paper still applies, and auto still depends on
+        # allow_live_override. A headless deploy sets this True.
+        if getattr(self, "_headless", False) and mode not in _HEADLESS_FILE_MODES:
             self._reject_bad_override(override_path, mode, fingerprint)
             return None
         try:
