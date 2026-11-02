@@ -65,6 +65,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
 .name { font-weight: 700; }
 .sub { color: var(--muted); font-size: 12px; }
+/* Trade-list day grouping header (本交易日 / 先前). */
+tr.grp td { background: var(--off-bg); color: var(--muted); font-weight: 700;
+  font-size: 12px; padding: 5px 10px; }
 .trunc { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .empty { padding: 24px; text-align: center; color: var(--muted); }
 .banner { display: none; margin-bottom: 12px; padding: 10px 14px; border-radius: 8px;
@@ -183,7 +186,7 @@ pre.log .P3 { color: var(--muted); }
       <table id="fleet">
         <thead><tr>
           <th>狀態</th><th>機器人</th><th>模式</th><th>持倉</th>
-          <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日</th><th class="num" title="模擬成交價計算">模擬累計</th><th class="num" title="實際成交價計算，未扣手續費及期交稅">實單累計</th>
+          <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日</th><th class="num" title="模擬成交價計算">模擬累計</th><th class="num" title="實際成交價計算，未扣手續費及期交稅">實單累計</th><th class="num" title="自最近一次夜盤開盤（15:00）起平倉的實單損益。僅計入進出場皆有可信成交價的交易，不含估算；未扣手續費及期交稅">本交易日實單</th>
           <th class="num">交易數</th><th class="num">勝率</th><th>最後決策</th><th>心跳</th>
         </tr></thead>
         <tbody></tbody>
@@ -417,6 +420,15 @@ function realCell(r) {
   return el("span", { title: `${r.trades} 筆實單（含估 ${r.estimated}）；滑價 ${r.slippage_total > 0 ? "+" : ""}${fmtInt(r.slippage_total)}` },
     money(r.pnl_total));
 }
+// The trading-day real P&L is real-ONLY (both fills recorded and trusted),
+// unlike the running 實單累計 which also counts "estimated". On a day with two
+// trades an estimate would dominate, so the stricter rule is the honest one
+// here; "—" means nothing qualifying closed this trading day.
+function realDayCell(r) {
+  if (!r || !r.trades_today_real) return el("span", { class: "muted" }, "—");
+  return el("span", { title: `${r.trades_today_real} 筆實單於本交易日平倉（雙邊皆有可信成交價）` },
+    money(r.pnl_today_real));
+}
 function realTiles(r) {
   if (!r) return [];
   const excluded = r.unreliable + r.missing;
@@ -632,6 +644,47 @@ const App = {
     u.classList.toggle("stale", s > 30);
   },
 
+  // Trades are newest-first, so everything closed this trading day sits at the
+  // top: one 本交易日 header above them carrying the real-only subtotal, one 先前
+  // header below. Both are dropped when the split would leave a side empty.
+  tradeRows(d) {
+    const trades = d.trades;
+    if (!trades.length) {
+      return [el("tr", null, el("td", { colspan: "9", class: "empty" }, "尚無交易"))];
+    }
+    const dayStart = (d.bot && d.bot.trading_day_start) || "";
+    // Both are "YYYY-MM-DD HH:MM" in TPE, so a string compare is the date
+    // compare. Partition by the predicate rather than slicing by a count:
+    // bot_detail only reverses the stored order, so a history that was not
+    // appended strictly in close order would otherwise land rows in the
+    // wrong group while the header count still looked right.
+    const inDay = (t) => !!dayStart && (t.exit_dt || "").slice(0, 16) >= dayStart;
+    const today = trades.filter(inDay);
+    const older = trades.filter((t) => !inDay(t));
+    const n = today.length;
+    const r = (d.bot && d.bot.real) || null;
+    const head = (label, ...extra) => el("tr", { class: "grp" },
+      el("td", { colspan: "9" }, label, ...extra));
+    const row = (t) => el("tr", null,
+      el("td", { class: t.side === "LONG" ? "up" : "down" }, SIDE[t.side] || t.side),
+      el("td", null, t.entry_dt.slice(0, 16)),
+      el("td", { class: "num" }, priceCell(t.entry_price, t.real_entry_price)),
+      el("td", null, t.exit_dt.slice(0, 16)),
+      el("td", { class: "num" }, t.exit_price ? priceCell(t.exit_price, t.real_exit_price) : "—"),
+      el("td", { class: "num" }, money(t.pnl)),
+      el("td", { class: "num" }, tradeRealCell(t)),
+      el("td", null, EXIT_TAG[t.exit_tag] || t.exit_tag || "—"),
+      el("td", null, SOURCE[t.source] || t.source || "—"),
+    );
+    if (!n || !older.length) return trades.map(row);
+    const sub = r && r.trades_today_real
+      ? el("span", { class: "sub" }, "　實單 ", money(r.pnl_today_real),
+          `（${r.trades_today_real} 筆）`)
+      : el("span", { class: "sub" }, "　本交易日無可信實單");
+    return [head(`本交易日（${n} 筆）`, sub), ...today.map(row),
+      head("先前"), ...older.map(row)];
+  },
+
   // Health tier first, then holders above flat bots inside the tier: an open
   // position is what you act on, and a dead bot still holding one is why the
   // tier stays the outer key. `position` is null when flat (snapshot._position
@@ -669,7 +722,7 @@ const App = {
     );
     const body = $("fleet").tBodies[0];
     if (!bots.length) {
-      body.replaceChildren(el("tr", null, el("td", { colspan: "12", class: "empty" }, "目前沒有機器人")));
+      body.replaceChildren(el("tr", null, el("td", { colspan: "13", class: "empty" }, "目前沒有機器人")));
       return;
     }
     body.replaceChildren(...bots.map((b) => {
@@ -691,6 +744,7 @@ const App = {
         td("本交易日", money(b.pnl_today), "num"),
         td("模擬累計", money(b.pnl_total), "num"),
         td("實單累計", realCell(b.real), "num"),
+        td("本交易日實單", realDayCell(b.real), "num"),
         td("交易數", fmtInt(b.trades), "num"),
         td("勝率", b.win_rate === null ? "—" : Math.round(b.win_rate * 100) + "%", "num"),
         td("最後決策", d ? el("span", { title: d.reason }, `${d.bar_dt.slice(5)} ${ACTION[d.action] || d.action}`) : "—"),
@@ -817,17 +871,7 @@ const App = {
     for (const btn of $("d-iv").children) btn.classList.toggle("on", Number(btn.dataset.iv) === this.iv);
     this.drawEquity();
 
-    $("d-trades").tBodies[0].replaceChildren(...(d.trades.length ? d.trades.map((t) => el("tr", null,
-      el("td", { class: t.side === "LONG" ? "up" : "down" }, SIDE[t.side] || t.side),
-      el("td", null, t.entry_dt.slice(0, 16)),
-      el("td", { class: "num" }, priceCell(t.entry_price, t.real_entry_price)),
-      el("td", null, t.exit_dt.slice(0, 16)),
-      el("td", { class: "num" }, t.exit_price ? priceCell(t.exit_price, t.real_exit_price) : "—"),
-      el("td", { class: "num" }, money(t.pnl)),
-      el("td", { class: "num" }, tradeRealCell(t)),
-      el("td", null, EXIT_TAG[t.exit_tag] || t.exit_tag || "—"),
-      el("td", null, SOURCE[t.source] || t.source || "—"),
-    )) : [el("tr", null, el("td", { colspan: "9", class: "empty" }, "尚無交易"))]));
+    $("d-trades").tBodies[0].replaceChildren(...this.tradeRows(d));
 
     $("d-decisions").tBodies[0].replaceChildren(...(d.decisions.length ? d.decisions.map((r) => el("tr", null,
       el("td", null, r.bar_dt),
