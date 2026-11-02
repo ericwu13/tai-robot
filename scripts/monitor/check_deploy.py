@@ -25,14 +25,28 @@ from scripts.monitor.common import (  # noqa: E402
 VALID_LEGS = {"long", "short", "idle"}
 
 REDEPLOY_RECIPE = (
-    "manual redeploy (there is NO headless deploy — the deploy dialog is a "
-    "GUI modal):",
-    "  1. start dist\\tai_backtest\\tai_backtest.exe",
-    "  2. log in (Capital API credentials)",
-    "  3. open the 部署 (deploy) tab",
-    "  4. pick the saved session row for the bot — the dialog pre-fills "
+    "redeploy — paper/auto may be headless; semi_auto needs the GUI "
+    "(order-confirm dialog):",
+    "  headless from a packaged install (no Python required). cd to the "
+    "folder that contains tai_backtest.exe:",
+    "    tai_backtest.exe deploy --symbol S --bot B --strategy \"<name>\" "
+    "--mode paper --detach --wait-ready 240",
+    "    tai_backtest.exe stop --symbol S --bot B --wait 60",
+    "  headless from a source checkout (oreopie / dev), main tree:",
+    "    python run_bot_cli.py deploy --symbol S --bot B --strategy \"<name>\" "
+    "--mode paper --detach --wait-ready 240",
+    "  the headless child is tai_backtest.exe when packaged, or python.exe "
+    "running run_bot_cli.py from source. Both write "
+    "data\\live\\{symbol}_{bot}\\cli_stdout.log and the same session.json "
+    "the GUI uses.",
+    "  GUI (required for semi_auto; also valid for paper/auto):",
+    "    1. start tai_backtest.exe (double-click the install, or "
+    "dist\\tai_backtest\\tai_backtest.exe from a source tree)",
+    "    2. log in (Capital API credentials)",
+    "    3. open the 部署 (deploy) tab",
+    "    4. pick the saved session row for the bot — the dialog pre-fills "
     "strategy/mode/legs from session.json",
-    "  5. deploy; the runner re-acquires .lock and resumes from session.json",
+    "    5. deploy; the runner re-acquires .lock and resumes from session.json",
     "note: mode_override.json can only flip trading_mode on an ALREADY "
     "RUNNING bot — it cannot start one.",
 )

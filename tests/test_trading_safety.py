@@ -186,6 +186,22 @@ class TestDecideConfirmEntry:
         assert verdict == g.CONFIRM_ENTRY
         assert details["buy_sell"] == 1
 
+    def test_link_gate_blocks_entries_and_keeps_exits(self):
+        g = TradingGuard()
+        g.link_entries_blocked = True
+        verdict, details = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert verdict == g.BLOCK_LINK
+        assert "reconcile" in details["reason"]
+        g.on_entry_sent()
+        exit_verdict, _exit_details = g.decide("auto", "TRADE_CLOSE", "LONG")
+        assert exit_verdict == g.SEND_EXIT
+        force, _force_details = g.decide("auto", "FORCE_CLOSE", "LONG")
+        assert force == g.SEND_EXIT
+        g.reset()
+        assert g.link_entries_blocked is True
+        still, _details = g.decide("auto", "ENTRY_FILL", "LONG")
+        assert still == g.BLOCK_LINK
+
 
 class TestDecideBuySellDirection:
     """Verify buy/sell direction is correct for all action/side combos."""

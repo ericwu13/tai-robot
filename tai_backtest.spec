@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-import glob
 import os
+import sys
 import importlib
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
@@ -19,15 +19,24 @@ _lwc_js = os.path.join(_lwc_dir, 'js')
 _holidays_submodules = collect_submodules('holidays')
 _holidays_datas = collect_data_files('holidays')
 
-# Collect SDK DLLs
-sdk_libs = os.path.join(
-    'CapitalAPI_2.13.57', 'CapitalAPI_2.13.57_PythonExample',
-    'SKDLLPythonTester', 'libs',
-)
-dll_binaries = []
-if os.path.isdir(sdk_libs):
-    for dll in glob.glob(os.path.join(sdk_libs, '*.dll')):
-        dll_binaries.append((dll, 'libs'))
+# ``strategies/`` is gitignored (private AI strategies). A fresh clone does
+# not have the directory, and PyInstaller aborts if a datas source is
+# missing. Never point datas at that tree — a developer build would ship
+# their private strategies. Stage an empty placeholder instead.
+# ``python -m PyInstaller`` puts the cwd on sys.path; the ``pyinstaller``
+# entry-point script does not. SPECPATH is the spec file's directory.
+sys.path.insert(0, SPECPATH)
+from build_release import prepare_capital_sdk_binaries, strategies_datas
+_strategies_datas = strategies_datas(SPECPATH)
+
+# Broker DLLs. Missing or empty SKCOM.dll / CTSecuritiesATL.dll fails
+# the build (exit 1) instead of shipping an empty _internal/libs.
+# project_root=SPECPATH resolves a relative TAI_CAPITAL_SDK_DIR against
+# the spec directory, matching build_release.py. When that env var is
+# unset and the cwd is the spec directory, the glob stays the historical
+# relative libs path, so a present SDK bundles the same *.dll files.
+# Opt out only with TAI_ALLOW_MISSING_CAPITAL_SDK=1.
+dll_binaries = prepare_capital_sdk_binaries(project_root=SPECPATH)
 
 a = Analysis(
     ['run_backtest.py'],
@@ -35,7 +44,7 @@ a = Analysis(
     binaries=dll_binaries,
     datas=[
         ('src', 'src'),
-        ('strategies', 'strategies'),
+        *_strategies_datas,
         ('settings.example.yaml', '.'),
         (_lwc_js, 'lightweight_charts/js'),
         *_holidays_datas,
@@ -47,9 +56,14 @@ a = Analysis(
         # TAIFEX settlement-day detection (3rd Wed early close)
         # Must include ALL submodules — see note above about dynamic import.
         *_holidays_submodules,
-        # COM (Capital API) — include submodules PyInstaller's analysis misses
+        # COM (Capital API) — include submodules PyInstaller's analysis misses.
+        # comtypes wheels do not ship comtypes/gen. Force-include the name
+        # when a build environment has generated it; the runtime hook
+        # creates the package in the writable cache when the import is
+        # simply missing.
         'comtypes', 'comtypes.client', 'comtypes.stream',
         'comtypes.client._code_cache', 'comtypes.client._generate',
+        'comtypes.gen',
         # TradingView data feed (optional)
         'tvDatafeed', 'websocket', 'websocket._abnf', 'websocket._core',
         'websocket._exceptions', 'websocket._http', 'websocket._logging',
@@ -96,12 +110,27 @@ a = Analysis(
         'src.regime.episodes', 'src.regime.replay',
         # Regime gene evolution (deferred import in the evolution pipeline)
         'src.evolution.regime_fitness', 'src.evolution.regime_pipeline',
+        # Saturday grid sweep runs in a spawn child of the frozen EXE.
+        'src.evolution.grid_process', 'src.evolution.grid_search',
+        'src.evolution.grid_smoke',
         # Utils
         'src.utils.time_utils',
         # Self-update
         'src.updater',
         # Tk workbench theme / widgets / labels (Phase 1 UI modernization)
         'src.ui', 'src.ui.theme', 'src.ui.widgets', 'src.ui.raster', 'src.ui.labels',
+        # Headless CLI (Option A, #177). Append-only: #194 inserts
+        # grid_process/grid_search/grid_smoke next to regime_pipeline,
+        # and #195 inserts comtypes.gen next to the other comtypes
+        # names plus strategies_datas() in datas. Keep every name from
+        # all three; do not duplicate one that already appears above.
+        # src.ai.strategy_store is already listed with the AI modules.
+        'run_bot_cli',
+        'src.paths',
+        'src.live.headless',
+        'src.live.headless_app',
+        'src.live.deploy_request',
+        'src.live.session_store',
     ],
     hookspath=[],
     hooksconfig={},

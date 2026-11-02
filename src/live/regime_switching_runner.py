@@ -974,23 +974,16 @@ class RegimeSwitchingRunner(LiveRunner):
         # gates per leg.
         if self._news_enabled:
             self._sync_news_idle()
+        # The leg swap above replaces the strategy instance. Re-arm exits
+        # against THAT instance's exit_levels(), not the one super() saw.
+        if self._restored_open_position:
+            self._reconcile_restored_exits(alert=False)
         return n
 
     def _auto_save_session(self) -> None:
         try:
-            data = {
-                "strategy": self.strategy_display_name,
-                "symbol": self.symbol,
-                "bot_name": self.bot_name,
-                "point_value": self.point_value,
-                "target_interval": self.target_interval,
-                "trading_mode": self.trading_mode,
-                "daily_loss_limit": self.daily_loss_limit,
-                "started_at": self._started_at,
-                "saved_at": datetime.now().isoformat(timespec="seconds"),
-                "bar_index": self._bar_index,
-                "broker": self.broker.to_dict(),
-                "last_report_key": self._last_report_key,
+            data = super()._base_session_data()
+            data.update({
                 "regime_mode": True,
                 "active_leg": self._active_leg,
                 "long_strategy": self._long_strategy_name,
@@ -1005,7 +998,7 @@ class RegimeSwitchingRunner(LiveRunner):
                     getattr(self._news_cfg, "suppress_scope", "both")
                     if self._news_cfg else "both"),
                 "news": self._breaker_state.to_dict(),
-            }
+            })
             save_session(self._session_path, data)
         except Exception:
             pass

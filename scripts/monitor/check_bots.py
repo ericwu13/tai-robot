@@ -24,8 +24,10 @@ holidays, python-dateutil, PyYAML and six.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
@@ -40,6 +42,7 @@ from scripts.monitor.common import (  # noqa: E402
     newest_debug_logs, pid_alive, print_report, read_json, read_lock_pid,
     tail_text,
 )
+from src.utils import fileio  # noqa: E402
 
 # A live bot writes a status/tick line well inside this window.
 STALE_LOG_MINUTES = 10.0
@@ -79,7 +82,7 @@ def count_decisions(now: datetime, bot_dir: str, action: str):
     cutoff = now - timedelta(hours=24)
     count = 0
     try:
-        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        with fileio.open_shared_text(path, errors="replace", newline="") as f:
             for row in csv.reader(f):
                 if len(row) < 4 or (row[3] or "").strip() != action:
                     continue
@@ -239,14 +242,11 @@ def _position_open(broker: dict) -> bool:
 def _load_session_data(sess_path: str):
     """Session dict, or None when the file is unreadable.
 
-    ``load_session`` first, then ``read_json``. This is the source HUNG
-    grading and the ALIVE frozen-log grade both use.
+    Same result as ``load_session``, read through the shared opener so
+    the bot's own ``save_session`` cannot fail against this reader. This
+    is the source HUNG grading and the ALIVE frozen-log grade both use.
     """
-    try:
-        from src.live.session_store import load_session
-        return load_session(sess_path)
-    except Exception:  # noqa: BLE001
-        return read_json(sess_path)
+    return read_json(sess_path)
 
 
 def _session_position_open(bot_dir: str) -> bool:
@@ -310,7 +310,52 @@ def classify_heartbeat(now: datetime, hb, pid_alive_fn, lock_pid, *,
     return "ALIVE", detail
 
 
+# The shared opener lets the bot delete heartbeat.json under us, but its
+# os.replace still fails while any handle is open (the writer retries).
+# A sharing violation on our open is retried here; only PermissionError.
+_HEARTBEAT_READ_ATTEMPTS = 3
+_HEARTBEAT_READ_BACKOFF_S = 0.010
+
+
+def _heartbeat_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _open_heartbeat(path: str):
+    return fileio.open_shared_text(path)
+
+
+def _read_heartbeat_json(path, *, sleep=None):
+    """``(payload, kind)``.
+
+    ``kind`` is ``None`` on success, ``"busy"`` when PermissionError
+    survives 3 attempts at 10 ms, or ``"corrupt"`` for invalid JSON and
+    any other read error. Busy is not corrupt: the file is locked, not
+    truncated.
+    """
+    sleep_fn = _heartbeat_sleep if sleep is None else sleep
+    for attempt in range(_HEARTBEAT_READ_ATTEMPTS):
+        try:
+            with _open_heartbeat(path) as handle:
+                data = json.load(handle)
+        except PermissionError:
+            if attempt + 1 >= _HEARTBEAT_READ_ATTEMPTS:
+                return None, "busy"
+            sleep_fn(_HEARTBEAT_READ_BACKOFF_S)
+            continue
+        except ValueError:
+            return None, "corrupt"
+        except OSError:
+            return None, "corrupt"
+        if data is None:
+            return None, "corrupt"
+        return data, None
+    return None, "busy"
+
+
 def _format_heartbeat(state: str, detail: dict) -> str:
+    if state == "UNKNOWN" and detail.get("busy"):
+        return "  heartbeat: UNKNOWN (busy heartbeat.json)"
     if state == "UNKNOWN" and detail.get("corrupt"):
         return "  heartbeat: UNKNOWN (corrupt heartbeat.json)"
     if state == "UNKNOWN" and not detail:
@@ -407,8 +452,11 @@ def check_bots(now: datetime, base_dir: str, pid_alive_fn=pid_alive):
         if hb_file_missing:
             hb_state, hb_detail = "UNKNOWN", {}
         else:
-            raw_hb = read_json(hb_path)
-            if raw_hb is None:
+            raw_hb, read_kind = _read_heartbeat_json(hb_path)
+            if read_kind == "busy":
+                raw_hb = None
+                hb_state, hb_detail = "UNKNOWN", {"busy": True}
+            elif raw_hb is None:
                 hb_state, hb_detail = "UNKNOWN", {"corrupt": True}
             else:
                 hb_state, hb_detail = classify_heartbeat(

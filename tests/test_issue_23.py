@@ -22,11 +22,14 @@ class TestTickWatchdogSessionResubscribe:
         # Simulate a tick received during market hours, then market closes
         wd.last_tick_time = time.time() - 7200  # 2 hours ago
 
-        # Mock: market is now open, but last tick was during closed hours
-        with patch("src.live.tick_watchdog.is_market_open") as mock_open, \
+        # Mock: market is now open, but last tick was during closed hours.
+        # session_for is the schedule (issue #198): a key means open, None closed.
+        with patch("src.live.tick_watchdog.session_for") as mock_session, \
              patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
-            # Current time: market is open; last tick time: market was closed
-            mock_open.side_effect = lambda dt=None: dt is None
+            # No dt: the check's "now" is open. A dt: that sample is closed.
+            mock_session.side_effect = (
+                lambda dt=None: "2026-03-02|DAY" if dt is None else None
+            )
             action = wd.check()
 
         assert action == "session_resubscribe"
@@ -38,7 +41,7 @@ class TestTickWatchdogSessionResubscribe:
         wd.last_tick_time = time.time() - 600  # 10 min ago (stale)
         wd.set_grace(60)  # 60s grace
 
-        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+        with patch("src.live.tick_watchdog.session_for", return_value="2026-03-02|DAY"), \
              patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
             action = wd.check()
 
@@ -51,7 +54,7 @@ class TestTickWatchdogSessionResubscribe:
         now = time.time()
         wd.last_tick_time = now - 700  # 11+ minutes ago
 
-        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+        with patch("src.live.tick_watchdog.session_for", return_value="2026-03-02|DAY"), \
              patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
             action = wd.check(now=now)
 
@@ -63,7 +66,7 @@ class TestTickWatchdogSessionResubscribe:
         wd.active = True
         now = time.time()
 
-        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+        with patch("src.live.tick_watchdog.session_for", return_value="2026-03-02|DAY"), \
              patch("src.live.tick_watchdog.minutes_until_session_close", return_value=120):
             # 2.5 min stale -> warn
             wd.last_tick_time = now - 150
@@ -92,6 +95,6 @@ class TestTickWatchdogSessionResubscribe:
         now = time.time()
         wd.last_tick_time = now - 400  # stale enough to trigger
 
-        with patch("src.live.tick_watchdog.is_market_open", return_value=True), \
+        with patch("src.live.tick_watchdog.session_for", return_value="2026-03-02|DAY"), \
              patch("src.live.tick_watchdog.minutes_until_session_close", return_value=5):
             assert wd.check(now=now) is None

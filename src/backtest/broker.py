@@ -11,6 +11,45 @@ class OrderSide(Enum):
     SHORT = "SHORT"
 
 
+def _opt_price(value) -> int | None:
+    """Coerce a persisted price to a positive int, or None if absent/invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def _orders_from_dicts(raw) -> list:
+    """Rebuild exit orders from a session list. Junk rows are skipped."""
+    if not isinstance(raw, list):
+        return []
+    orders = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        side_raw = item.get("side")
+        try:
+            side = OrderSide(side_raw) if side_raw else OrderSide.LONG
+        except ValueError:
+            side = OrderSide.LONG
+        try:
+            qty = int(item.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        orders.append(Order(
+            tag=str(item.get("tag") or ""),
+            side=side,
+            qty=qty,
+            limit=_opt_price(item.get("limit")),
+            stop=_opt_price(item.get("stop")),
+            from_entry=str(item.get("from_entry") or ""),
+        ))
+    return orders
+
+
 def _mode_to_source(mode: str) -> str:
     """Map a trading mode to a trade source tag."""
     if mode in ("semi_auto", "auto"):
@@ -50,6 +89,10 @@ class Trade:
     real_entry_dt: str = ""
     real_exit_price: int = 0    # from OnNewData deal rows (issue #92)
     real_exit_dt: str = ""
+    # Issue #218: the exit retry ended without a broker fill. The sim
+    # exit price is kept and real_exit_price stays 0. The dashboard
+    # shows "est." next to the real P&L.
+    real_exit_estimated: bool = False
     source: str = ""            # "backtest", "paper", or "real"
     # Display name of the strategy whose signal OPENED this trade. In
     # regime mode one bot's restored history spans several strategies
@@ -572,6 +615,22 @@ class SimulatedBroker:
             return False
         last.real_exit_price = int(price)
         last.real_exit_dt = fill_dt
+        last.real_exit_estimated = False
+        return True
+
+    def mark_real_exit_estimated(self) -> bool:
+        """The exit-fill retry ended without a broker price.
+
+        Keeps the simulated exit price and leaves ``real_exit_price``
+        at 0. A later confirmed fill still writes through
+        ``try_set_real_exit_price`` and clears the flag.
+        """
+        if not self.trades:
+            return False
+        last = self.trades[-1]
+        if last.real_exit_price != 0:
+            return False
+        last.real_exit_estimated = True
         return True
 
     def force_close(self, bar_index: int, close: int, bar_dt: str = "") -> None:
@@ -613,6 +672,7 @@ class SimulatedBroker:
                     "real_entry_dt": t.real_entry_dt,
                     "real_exit_price": t.real_exit_price,
                     "real_exit_dt": t.real_exit_dt,
+                    "real_exit_estimated": t.real_exit_estimated,
                     "source": t.source,
                     "strategy": t.strategy,
                 }
@@ -622,6 +682,19 @@ class SimulatedBroker:
             "_cumulative_pnl": self._cumulative_pnl,
             "_bar_index": self._bar_index,
             "_exit_bar_index": self._exit_bar_index,
+            # Issue #168: exit orders live only in memory unless persisted.
+            # A restart otherwise restores the position with no stop/TP.
+            "pending_exits": [
+                {
+                    "tag": o.tag,
+                    "side": o.side.value if o.side else None,
+                    "qty": o.qty,
+                    "limit": o.limit,
+                    "stop": o.stop,
+                    "from_entry": o.from_entry,
+                }
+                for o in self._pending_exits
+            ],
         }
 
     @classmethod
@@ -629,7 +702,8 @@ class SimulatedBroker:
         """Restore broker state from a serialized dict.
 
         All new fields use ``.get()`` with safe defaults so old session
-        files (before issue #45) load without error.
+        files (before issue #45, and before pending exits in #168) load
+        without error.
         """
         broker = cls(
             point_value=data.get("point_value", 1),
@@ -657,6 +731,7 @@ class SimulatedBroker:
                 real_entry_dt=t.get("real_entry_dt", ""),
                 real_exit_price=t.get("real_exit_price", 0),
                 real_exit_dt=t.get("real_exit_dt", ""),
+                real_exit_estimated=bool(t.get("real_exit_estimated", False)),
                 source=t.get("source", ""),
                 strategy=t.get("strategy", ""),
             )
@@ -666,4 +741,16 @@ class SimulatedBroker:
         broker._cumulative_pnl = data.get("_cumulative_pnl", 0)
         broker._bar_index = data.get("_bar_index", 0)
         broker._exit_bar_index = data.get("_exit_bar_index", -1)
+        # Issue #168: a flat book must not inherit exits. A stale SL left
+        # in the session would close the NEXT trade (check_exits and
+        # check_tick_exit both walk _pending_exits, and nothing else
+        # clears them after from_dict).
+        pending = _orders_from_dicts(data.get("pending_exits"))
+        try:
+            size = int(broker.position_size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0:
+            pending = []
+        broker._pending_exits = pending
         return broker

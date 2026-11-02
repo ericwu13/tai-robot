@@ -500,6 +500,111 @@ class TestChangelog:
         assert entry["metrics_after"]["profit_factor"] == 1.5
         assert entry["initiated_by"] == "ai"
 
+    def test_month_gates_block_is_additive_for_existing_readers(
+            self, tmp_path, monkeypatch):
+        """A ``month_gates`` key must not change what legacy readers see.
+
+        ``load_changelog`` / ``recent_changes`` return the raw objects.
+        Entries written before the key existed still load, and a reader
+        that only knows the original fields still finds every one of
+        them on both old and new entries.
+        """
+        import src.daily_report.changelog as cl
+        path = tmp_path / "changelog.json"
+        monkeypatch.setattr(cl, "_CHANGELOG_PATH", path)
+
+        legacy_on_disk = {
+            "date": "2026-10-09 14:29:25",
+            "strategy": "DynamicExitPullback",
+            "version_before": "V2",
+            "version_after": "Evo1",
+            "change_summary": "pool-validated only",
+            "initiated_by": "ai",
+            "metrics_before": {"trades": 277, "pnl": -5350, "pf": 0.904},
+            "metrics_after": {"trades": 261, "pnl": 3840, "pf": 1.073},
+            "params_before": None,
+            "params_after": None,
+        }
+        path.write_text(
+            json.dumps([legacy_on_disk], indent=2), encoding="utf-8")
+
+        loaded = load_changelog()
+        assert loaded == [legacy_on_disk]
+        assert "month_gates" not in loaded[0]
+
+        block = {
+            "latest": "2026-10",
+            "latest_label": "Oct",
+            "edge": 3240,
+            "share_pct": -8.0,
+            "ablation_slack": 8500,
+            "passed": True,
+            "months": [
+                {"month": "2026-09", "base_net": 10000,
+                 "cand_net": 15890, "delta": 5890},
+                {"month": "2026-10", "base_net": -9740,
+                 "cand_net": -10000, "delta": -260},
+            ],
+            "reasons": ["Oct share -260/3240 = -8.0% ≤ 50%: ✓"],
+        }
+        untouched = append_changelog(
+            strategy_name="SMA Cross",
+            version_before="1.0",
+            version_after="1.1",
+            change_summary="human edit with no month gates",
+        )
+        assert "month_gates" not in untouched
+
+        recorded = append_changelog(
+            strategy_name="DynamicExitPullback",
+            version_before="V2",
+            version_after="Evo1",
+            change_summary="pool-validated only",
+            initiated_by="ai",
+            metrics_before=legacy_on_disk["metrics_before"],
+            metrics_after=legacy_on_disk["metrics_after"],
+            month_gates=block,
+        )
+        assert recorded["month_gates"] == block
+
+        entries = load_changelog()
+        assert len(entries) == 3
+        assert entries[0] == legacy_on_disk
+        assert "month_gates" not in entries[1]
+        assert entries[2]["month_gates"]["latest"] == "2026-10"
+        assert entries[2]["month_gates"]["edge"] == 3240
+
+        legacy_keys = (
+            "date", "strategy", "version_before", "version_after",
+            "change_summary", "initiated_by", "metrics_before",
+            "metrics_after", "params_before", "params_after",
+        )
+
+        def _legacy_view(entry: dict) -> dict:
+            return {key: entry[key] for key in legacy_keys}
+
+        views = [_legacy_view(entry) for entry in entries]
+        assert views[0]["strategy"] == "DynamicExitPullback"
+        assert views[0]["metrics_after"]["pnl"] == 3840
+        assert views[1]["change_summary"] == "human edit with no month gates"
+        assert views[2]["initiated_by"] == "ai"
+        assert views[2]["metrics_before"]["trades"] == 277
+        # The extra key is ignored by the legacy projection.
+        assert "month_gates" not in views[2]
+
+        recent = recent_changes(n=2)
+        assert recent[0]["month_gates"] == block
+        assert "month_gates" not in recent[1]
+        assert _legacy_view(recent[0])["version_after"] == "Evo1"
+        assert _legacy_view(recent[1])["strategy"] == "SMA Cross"
+
+        # Round-trip through the file a reader opens directly.
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(raw, list)
+        assert all(key in raw[0] for key in legacy_keys)
+        assert all(key in raw[2] for key in legacy_keys)
+        assert raw[2]["month_gates"]["share_pct"] == -8.0
+
 
 # ---------------------------------------------------------------------------
 # Discord notifier daily_report method

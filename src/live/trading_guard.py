@@ -25,12 +25,62 @@ class TradingGuard:
         self.fill_pending_type: str = ""  # "entry" or "exit"
         self.halted: bool = False
         self.halt_reason: str = ""
+        # Process-level link gate (#157 P2). Not cleared by reset(): a
+        # deploy must not reopen entries while the reply is unreconciled.
+        self.link_entries_blocked: bool = False
 
         # Deferred close (issue #50). When a TRADE_CLOSE is blocked by
         # BLOCK_FILL_PENDING, the decision is stored here. When
         # _on_fill_confirmed("entry") fires, the caller pops and replays
         # the deferred close so the real exit order isn't permanently lost.
         self._deferred_close: dict | None = None
+
+    def to_dict(self) -> dict:
+        """Snapshot the in-flight fill gate for session.json (issue #168).
+
+        Only the fields resume must not forget. ``real_entry_confirmed``
+        stays with :meth:`restore_confirmed_position` so a stale snapshot
+        cannot un-confirm a position the #79 reconcile just accepted.
+        """
+        # A deferred close is only replayed when the ENTRY it was waiting
+        # on confirms. Saving it after that entry has timed out (or beside
+        # an in-flight exit) lets the next entry confirm send it.
+        deferred = self._deferred_close
+        keep_close = (
+            bool(self.fill_pending)
+            and self.fill_pending_type == "entry"
+            and isinstance(deferred, dict)
+        )
+        return {
+            "fill_pending": bool(self.fill_pending),
+            "fill_pending_type": self.fill_pending_type if self.fill_pending else "",
+            "deferred_close": dict(deferred) if keep_close else None,
+        }
+
+    def restore_inflight(self, data: dict) -> None:
+        """Put a persisted in-flight fill back after resume (issue #168).
+
+        ``reset()`` on deploy and :meth:`restore_confirmed_position` both
+        clear ``fill_pending`` and the deferred close. An exit that was
+        already sent, and not yet confirmed, has to stay pending so resume
+        does not send a second one. Does not touch ``real_entry_confirmed``.
+        """
+        if not isinstance(data, dict):
+            return
+        pending = bool(data.get("fill_pending", False))
+        kind = str(data.get("fill_pending_type") or "")
+        self.fill_pending = pending
+        self.fill_pending_type = kind if pending else ""
+        # Same gate as to_dict. restore_confirmed_position() has already
+        # cleared a stale close on the open-and-matching branch; putting
+        # the snapshot back unconditionally undoes that clear. A file
+        # written before this gate (fill_pending false, close still set)
+        # must not come back either.
+        deferred = data.get("deferred_close")
+        if pending and kind == "entry" and isinstance(deferred, dict):
+            self._deferred_close = dict(deferred)
+        else:
+            self._deferred_close = None
 
     def reset(self) -> None:
         """Reset all state (called on new deploy)."""
@@ -50,6 +100,8 @@ class TradingGuard:
 
         Returns (allowed, reason).
         """
+        if self.link_entries_blocked:
+            return False, "link down: entries blocked until reply reconcile"
         if self.paused:
             return False, f"daily loss limit reached ({self.daily_loss_limit:,} NTD)"
         return True, ""
@@ -198,6 +250,7 @@ class TradingGuard:
     CONFIRM_ENTRY = "confirm_entry"          # show dialog (semi-auto mode)
     BLOCK_FILL_PENDING = "block_fill_pending"  # waiting for prior fill
     BLOCK_HALTED = "block_halted"            # system halted after fill timeout
+    BLOCK_LINK = "block_link"                # quote/reply not reconciled (#157)
 
     def decide(self, trading_mode: str, action: str, side: str) -> tuple[str, dict]:
         """Decide what to do with a simulated fill.
@@ -245,7 +298,12 @@ class TradingGuard:
                     f"waiting for {self.fill_pending_type} fill confirmation")
                 return self.BLOCK_FILL_PENDING, details
 
-        # Entry: check daily loss limit
+        # Entry: link gate, then daily loss limit. Exits are not link-gated.
+        # FORCE_CLOSE and TRADE_CLOSE keep the #168/#171 policy.
+        if action == "ENTRY_FILL" and self.link_entries_blocked:
+            details["reason"] = "link down: entries blocked until reply reconcile"
+            return self.BLOCK_LINK, details
+
         if action == "ENTRY_FILL":
             allowed, reason = self.check_entry(trading_mode)
             if not allowed:
@@ -277,3 +335,36 @@ class TradingGuard:
             return {"trade_type": 1, "new_close": 0}  # IOC, new
         else:
             return {"trade_type": 0, "new_close": 2}  # ROD, auto (exchange decides)
+
+
+def apply_resume_guard(
+    guard: TradingGuard,
+    *,
+    position_open: bool,
+    real_ok: bool,
+    persisted: dict | None,
+) -> dict:
+    """Reconcile the guard on resume (issues #79 and #168).
+
+    Returns ``{"cleared_stale": bool, "kept_inflight": bool}``.
+
+    #79: an inherited open position whose real entry already happened must
+    set ``real_entry_confirmed``, otherwise every exit is SKIP_EXIT. That
+    reconcile also clears ``fill_pending`` — correct only when nothing
+    in-flight was saved.
+
+    #168: a persisted in-flight ``fill_pending`` / deferred close is put
+    back afterwards. ``reset()`` at deploy has already wiped them; without
+    the put-back an exit that was sent last session is sent again.
+    Legacy sessions (``persisted is None``) keep the #79 clear.
+    """
+    cleared = False
+    if position_open and real_ok:
+        cleared = bool(guard.restore_confirmed_position())
+    kept = False
+    if isinstance(persisted, dict):
+        guard.restore_inflight(persisted)
+        kept = bool(persisted.get("fill_pending"))
+        if kept:
+            cleared = False
+    return {"cleared_stale": cleared, "kept_inflight": kept}

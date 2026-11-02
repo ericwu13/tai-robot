@@ -444,6 +444,15 @@ class TestNightSessionKey:
         assert rss_scorer.night_session_key(dt) == "2026-08-07|NIGHT"
 
 
+# ── Gemini model id ────────────────────────────────────────────────────
+# Google deprecated gemini-3.5-flash (changelog 2026-10-08). Requests to
+# that id are routed to gemini-3.6-flash; pin the stable replacement so a
+# stale constant fails here instead of in production.
+
+def test_gemini_model_is_3_6_flash():
+    assert rss_scorer.GEMINI_MODEL == "gemini-3.6-flash"
+
+
 # ── Gemini request payload ─────────────────────────────────────────────
 # Upcoming Gemini models return 400 INVALID_ARGUMENT when a request
 # includes temperature / topP / topK / thinkingBudget (any casing).
@@ -517,6 +526,8 @@ class TestScoreArticleGeminiPayload:
         assert result == {"direction": "neutral", "confidence": 0.2, "reason": "routine"}
         assert "generativelanguage.googleapis.com" in captured["url"]
         assert ":generateContent" in captured["url"]
+        assert f"/models/{rss_scorer.GEMINI_MODEL}:" in captured["url"]
+        assert "gemini-3.5" not in captured["url"]
         body = captured["body"]
         assert body["generationConfig"]["maxOutputTokens"] == 1024
         assert forbidden_gemini_keys(body) == []

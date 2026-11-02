@@ -112,6 +112,199 @@ evolution:
   # window reports 100-226%. 0 / negative falls back to the default.
   # Not a credential; changing it only rescales evolution scores.
   capital_base_twd: 100000
+  # Classes with fewer than 2 rewritable Saturday-grid knobs are excluded
+  # from the weekly run. "none" (default) does not codegen them.
+  # "structural_lane" is the fallback name for the monthly lane. It does
+  # not enable weekly codegen, and it does not run the lane by itself.
+  # The lane is on unless structural_lane.enabled is boolean false.
+  # Any other value is treated as "none".
+  knob_ineligible_fallback: "none"
+  # 僅星期六自動演化：設計窗交易數低於此值時，不呼叫 AI 演化計畫
+  # （0 次 AI 呼叫，水位線不前進），聊天室／Discord 顯示
+  # waiting for sample: N/<門檻>。預設 30，與 fitness.MIN_TRADES 相同，
+  # 只套用在自動路徑。手動「進化」按鈕不受此門檻限制，會記錄
+  # below min_design_trades (N/30), manual override 並仍呼叫 AI。
+  # 已達門檻的自動路徑行為不變。填 0 代表關閉此檢查。
+  # 適應度 composite 的 30 筆 gating 數學不變。
+  #
+  # Saturday/automatic runs only: skip the AI plan call while the
+  # design window has fewer trades than this. The chat/Discord line is
+  # "waiting for sample: N/<threshold>". 0 AI calls, watermark unchanged.
+  # Default 30 (fitness.MIN_TRADES) applies to the automatic path only.
+  # The manual Evolve button is exempt: it logs
+  # "below min_design_trades (N/30), manual override" and still calls
+  # the AI. Bots at or above the threshold keep today's automatic path.
+  # Set 0 to disable the check. Does not change fitness math or gate
+  # semantics. Not a credential.
+  min_design_trades: 30
+  # 水位線跳過（訓練窗沒有新交易）時，若距上次出場已達此日曆天數，
+  # 附加一行 idle N days since last exit <date>。預設 7。填 0 代表
+  # 完全不附加這一行。
+  #
+  # On a watermark skip, append "idle N days since last exit <date>"
+  # when the last trade exit is at least this many calendar days ago.
+  # Default 7. Set 0 to disable the idle line entirely. Not a credential.
+  idle_warn_days: 7
+  # P1 promotion gate. Default is "relative" for the exact modes
+  # paper and backtest, now that the Saturday grid scores DSR and PBO.
+  # An invalid paper_gate value falls back to absolute and warns.
+  # An unknown trading mode does the same. Real-money modes ignore
+  # paper_gate and keep the absolute PF floor. Set "absolute" to
+  # restore the old paper rule. real_gate is accepted only as
+  # "absolute"; any other value is ignored.
+  paper_gate: relative
+  real_gate: absolute
+  # Saturday knob search. "grid_batch" (default) pre-registers a grid
+  # over the class's eligible knobs (at most 48 settings, at most 2
+  # knobs together) and picks with DSR, PBO, and the plateau rule.
+  # The model does not pick the setting; it may only explain the
+  # winner. "llm_one" keeps the old one-change plan. Classes that are
+  # not on the knob grid stay on the plan either way.
+  search: grid_batch
+  # Thresholds used when paper_gate is relative. Approved Q2 values.
+  # post_backfill_start empty defers the "≥2 folds after backfill" check
+  # until a span date is set. min_divergent_folds must be >= 2 and
+  # at most 30. Anything outside that falls back to the Q2 default
+  # (≥ 3 divergent folds). DSR / PBO thresholds live under
+  # trial_penalty, not here.
+  relative:
+    min_nonempty_folds: 6
+    min_divergent_folds: 3
+    fold_majority: 0.60
+    bootstrap_alpha: 0.10
+    bootstrap_resamples: 10000
+    bootstrap_seed: 20261024
+    effect_size_sigma: 0.25
+    min_post_backfill_folds: 2
+    post_backfill_start: ""
+    # Must be >= holdout_days. A narrower fold overlaps the OOS window
+    # and falls back to 14, or to holdout_days when that is longer.
+    fold_days: 14
+  # P2 trial penalty and grid caps. DSR must be strictly above dsr_min
+  # and PBO strictly below pbo_max. The caps are hard: a larger
+  # max_settings / max_joint_knobs / max_values_per_knob falls back to
+  # 48 / 2 / 4. plateau_band 0.50 means a neighbour's mean fold Δ has
+  # to sit within 50% of the chosen point's Δ and be positive.
+  # Not a credential.
+  trial_penalty:
+    dsr_min: 0.90
+    pbo_max: 0.50
+    max_settings: 48
+    max_joint_knobs: 2
+    max_values_per_knob: 4
+    plateau_band: 0.50
+  # Recommend-only. A hit writes a log / changelog / report line.
+  # It does not disable the bot, stop evolution, or edit live settings.
+  retire:
+    min_trades: 150
+    pf_below: 0.95
+    upper_q: 0.90
+    consecutive_weeks: 4
+    min_eligible_trades: 30
+    idle_days: 7
+    structural_quiet_days: 60
+    bootstrap_resamples: 10000
+    bootstrap_seed: 20261024
+    fold_days: 14
+  # P5 月閘門。預設就是新規則：最新月的台指交易日少於
+  # min_sessions 時併入前一個月；閘門 1 寬限是 1 個標準誤，
+  # 夾在 floor 與 cap 之間；閘門 3 用該寬限的一半。
+  # 要回到舊規則，把 latest_def 設成 max_exit_month、slack.mode 設成 flat。
+  # 不是憑證。
+  #
+  # P5 month gates. The defaults ARE the new rule: a newest month with
+  # fewer than min_sessions TAIFEX trading dates folds into the previous
+  # month, gate 1's allowance is one standard error clamped to
+  # [floor, cap], and gate 3 uses half of that allowance. Opt out with
+  # latest_def: max_exit_month and slack.mode: flat (flat 5,000 TWD,
+  # gate 3 requires Δ ≥ 0). Not a credential.
+  month_gate:
+    # merge_stub（預設）: 該月在價格 K 棒裡的台指交易日少於
+    #   min_sessions 時，併入前一個月。夜盤（15:00 到隔天 05:00）
+    #   算下一個交易日，所以跨午夜的同一夜只算一個日期；週五夜盤
+    #   算到週一。不看日曆天數，也不數成交筆數。
+    # max_exit_month: 停用折疊，最新月永遠是最新出場的 YYYY-MM。
+    #
+    # merge_stub (default): if that month has fewer than min_sessions
+    #   TAIFEX trading dates in the price bars, fold it into the
+    #   previous month. A night session (15:00 through 05:00 the next
+    #   morning) belongs to the next trading day, so one night is one
+    #   date and Friday night maps to Monday. Not a calendar length
+    #   and not a trade count.
+    # max_exit_month: opt out of the fold. Latest stays the newest
+    #   exit month.
+    latest_def: merge_stub
+    min_sessions: 12
+    slack:
+      # scaled（預設）: 閘門 1 寬限 = clamp(k × σ × sqrt(n), floor, cap)。
+      #   σ 是基準策略在先前月份每筆損益的樣本標準差（n−1）。
+      #   n 是候選策略在該區塊的成交筆數。閘門 3 用 gate3_k × 該寬限
+      #   （預設一半）。
+      # flat: 停用縮放。閘門 1 用 flat_twd；閘門 3 仍是 Δ ≥ 0。
+      #
+      # scaled (default): gate 1 slack = clamp(k × σ × sqrt(n), floor, cap).
+      #   σ is the sample standard deviation (n−1) of the baseline's
+      #   per-trade PnL in the prior-months block. n is the candidate's
+      #   trade count in that block. Gate 3 uses gate3_k × that slack
+      #   (default half).
+      # flat: opt out. Gate 1 uses flat_twd; gate 3 stays Δ ≥ 0.
+      mode: scaled
+      flat_twd: 5000
+      k: 1.0
+      gate3_k: 0.5
+      floor: 3000
+      cap: 15000
+  # evolution_history.jsonl lives in each bot directory, next to
+  # evolution_watermark.json. It is append-only: one JSON line per
+  # evolution attempt (skip, no_change, refused, fail, pass). The file
+  # is not size-capped and is not rotated. Growth is left unbounded on
+  # purpose — trimming could drop the weeks a retire streak is derived
+  # from. One weekend line per bot stays small; delete or archive the
+  # file by hand if it ever needs a bound. There is no settings key
+  # for this file. Not a credential.
+  # A second evolution run on the same bot is refused while one is
+  # already running in this process (manual Evolve during the Saturday
+  # auto run, including a structural-lane or propose-mode run). That
+  # guard is in-memory. It does not use the bot's process .lock and it
+  # does not write a state file.
+  # assess_retirement still reads the changelog. Switching that reader
+  # to this history file is a later follow-up.
+  # Saturday auto run. "propose" (default) writes a proposal file with
+  # the verdict evidence and does not promote the pool, write
+  # StrategyStore, or change a bot. "promote" is an explicit opt-in
+  # that keeps the StrategyPool validated-on-PASS path. Propose mode
+  # still appends the same evolution_history.jsonl line. The manual
+  # Evolve button is not this flag.
+  saturday_mode: "propose"
+  # Monthly structural lane. On by default, and still propose-only.
+  # Distinct from the knob grid: one named form, one candidate per bot
+  # per calendar month, no retry, at most 3 outstanding paper
+  # recommendations. It never promotes the pool, writes settings, or
+  # changes a live or paper strategy. Boolean false is the off switch.
+  # A non-boolean enabled value stays off. Graduation is text only.
+  # paper_days inside this block is ignored (Nova Q6: 21 sessions and
+  # 20 paper trades, timeout at 45). The same key elsewhere is not this
+  # warning. ledger_path empty → data/evolution/structural_lane.json.
+  # The month's structural Saturday replaces that day's knob-grid
+  # sweep. Other Saturdays run the grid. The lane uses the same history
+  # file and the same per-bot run guard. It does not add a history cap.
+  # Paper and backtest Q2 use the relative gate. Structural dsr_min
+  # is 0.95; the grid's trial_penalty.dsr_min stays 0.90. The candidate
+  # must beat the baseline on the selection folds. PBO is computed and
+  # shown, and it is not a pass condition (two-column CSCV does not
+  #   discriminate). Real money stays absolute. paper_recommended is text only.
+  # The shared ledger has one process-wide threading lock around
+  # reserve, record, and save. One GUI per tree is the supported
+  # model. There is no cross-process lock and no file lock.
+  structural_lane:
+    enabled: true
+    dsr_min: 0.95              # this lane only; grid trial_penalty.dsr_min stays 0.90
+    per_bot_per_month: 1
+    max_in_paper: 3
+    min_paper_sessions: 21
+    min_paper_trades: 20
+    timeout_sessions: 45
+    ledger_path: ""
 
 # ── News / event framework ─────────────────────────────────────────────
 # Scheduled-event calendar + circuit-breaker signal, both written as JSON

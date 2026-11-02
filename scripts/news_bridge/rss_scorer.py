@@ -67,7 +67,7 @@ EMA_HALF_LIFE_HOURS: float = 2.0
 EMA_DECAY: float = math.exp(-math.log(2) * 0.5 / EMA_HALF_LIFE_HOURS)
 
 ARTICLE_MAX_AGE_HOURS = 4
-GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
 LOG_NAME = "rss_scorer.log"

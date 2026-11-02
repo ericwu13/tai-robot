@@ -1,0 +1,29 @@
+# Build toolchain for tai_backtest.exe. build_release.py does not install
+# this file unless --install-build-deps is passed. --no-install is accepted
+# and is a no-op (not installing is already the default).
+#
+# Prefer a dedicated build virtualenv (.venv-build). --install-build-deps
+# uses that interpreter when it exists. Otherwise it warns and names the
+# active interpreter before installing there, which can downgrade comtypes
+# in a dev or live venv. Pin checks query that same interpreter.
+#
+# The flag also installs this project into that interpreter
+# (pip install -e .), so the EXE build sees pyyaml, keyring, httpx,
+# lightweight-charts, pandas, and holidays. That install always runs,
+# including when the pins below already match. This file only pins the
+# toolchain.
+#
+# The runtime hook is the real startup fix. The comtypes 1.4.15 wheel
+# (and 1.4.17) does not ship comtypes/gen/, so `import comtypes.gen`
+# fails until runtime_hook_comtypes.py creates that package in the
+# writable cache. These pins are secondary: they keep the toolchain on
+# the pair an operator already smoked (PyInstaller 6.19.0 + comtypes
+# 1.4.15). PyInstaller 6.22.3 + comtypes 1.4.17 was the crashing pair
+# before the hook handled a missing comtypes.gen.
+#
+# pyinstaller-hooks-contrib is not pinned. PyInstaller 6.19.0 requires
+# pyinstaller-hooks-contrib>=2026.0, so pip may install any newer
+# release that satisfies that. No specific hooks-contrib version was
+# recorded with the Windows smoke.
+PyInstaller==6.19.0
+comtypes==1.4.15

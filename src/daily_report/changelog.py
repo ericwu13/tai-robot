@@ -40,6 +40,8 @@ def append_changelog(
     metrics_after: dict | None = None,
     params_before: dict | None = None,
     params_after: dict | None = None,
+    params_reason: str | None = None,
+    month_gates: dict | None = None,
 ) -> dict:
     """Append a new entry to the strategy changelog.
 
@@ -51,6 +53,11 @@ def append_changelog(
     initiated_by : "human" or "ai"
     metrics_before / metrics_after : performance metrics dicts (optional)
     params_before / params_after : strategy parameter dicts (optional)
+    params_reason : why a params dict is None (optional). Stored only
+        when non-empty, so entries written without it keep the same keys.
+    month_gates : optional decide_month_gates observation. When given,
+        stored under the additive ``month_gates`` key. Omitted when
+        None so entries written without it keep the original key set.
 
     Returns
     -------
@@ -70,6 +77,12 @@ def append_changelog(
         "params_before": params_before,
         "params_after": params_after,
     }
+    # Omitted when empty so the key set stays stable. Additive alongside
+    # the optional month_gates block below.
+    if params_reason:
+        entry["params_reason"] = params_reason
+    if month_gates is not None:
+        entry["month_gates"] = month_gates
 
     entries.append(entry)
     _save_raw(entries)

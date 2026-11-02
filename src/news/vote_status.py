@@ -77,7 +77,8 @@ def _read_json(path) -> dict | None:
         return None
 
 
-def read_pending_votes(base_path: str | None, tonight_key: str = "") -> dict:
+def read_pending_votes(base_path: str | None, tonight_key: str = "",
+                       read_json=None) -> dict:
     """Best per-source vote file, keyed by upper-cased source ("W2"...).
 
     Read-only — never consumes. Malformed files are skipped. The key
@@ -93,10 +94,11 @@ def read_pending_votes(base_path: str | None, tonight_key: str = "") -> dict:
     """
     if not base_path:
         return {}
+    read_json = read_json or _read_json
     stem, ext = os.path.splitext(str(base_path))
     votes = {}
     for fpath in glob.glob(f"{stem}_*{ext}"):
-        data = _read_json(fpath)
+        data = read_json(fpath)
         if not data or data.get("direction") not in ("trending-up", "trending-down"):
             continue
         source = str(data.get("source", "")).split("-")[0].upper()
@@ -142,11 +144,11 @@ def _liveness(status: SourceStatus, state: dict | None, now: datetime) -> None:
     status.stale = age_h > STALE_AFTER_H.get(status.source, 24.0)
 
 
-def _w2_status(signal_path: str, now: datetime) -> SourceStatus:
+def _w2_status(signal_path: str, now: datetime, read_json=_read_json) -> SourceStatus:
     st = SourceStatus("W2", label=SOURCE_LABELS["W2"])
     state = None
     if signal_path:
-        state = _read_json(os.path.join(os.path.dirname(str(signal_path)) or ".",
+        state = read_json(os.path.join(os.path.dirname(str(signal_path)) or ".",
                                         "monitor_state.json"))
     _liveness(st, state, now)
     if state and not st.context:
@@ -154,9 +156,9 @@ def _w2_status(signal_path: str, now: datetime) -> SourceStatus:
     return st
 
 
-def _w3_status(rss_state_file: str, now: datetime) -> SourceStatus:
+def _w3_status(rss_state_file: str, now: datetime, read_json=_read_json) -> SourceStatus:
     st = SourceStatus("W3", label=SOURCE_LABELS["W3"])
-    state = _read_json(rss_state_file) if rss_state_file else None
+    state = read_json(rss_state_file) if rss_state_file else None
     _liveness(st, state, now)
     if state and not st.context:
         net = state.get("session_net")
@@ -168,11 +170,11 @@ def _w3_status(rss_state_file: str, now: datetime) -> SourceStatus:
     return st
 
 
-def _w4_status(regime_vote_path: str, now: datetime) -> SourceStatus:
+def _w4_status(regime_vote_path: str, now: datetime, read_json=_read_json) -> SourceStatus:
     st = SourceStatus("W4", label=SOURCE_LABELS["W4"])
     state = None
     if regime_vote_path:
-        state = _read_json(os.path.join(os.path.dirname(str(regime_vote_path)) or ".",
+        state = read_json(os.path.join(os.path.dirname(str(regime_vote_path)) or ".",
                                         ".chips_state.json"))
     if state is not None and "last_check" not in state:
         # Pre-upgrade sidecar (OI history only): best effort — the
@@ -195,18 +197,22 @@ def collect_vote_status(
     rss_state_file: str,
     tonight_key: str,
     now: datetime,
+    read_json=None,
 ) -> VoteStatusReport:
     """Assemble per-source rows for the regime tab's vote section.
 
     *tonight_key* is the session key the NEXT classification will use
     (``"YYYY-MM-DD|NIGHT"``); pending votes are valid only when their
-    ``expires_after_session`` matches it exactly.
+    ``expires_after_session`` matches it exactly. *read_json* replaces
+    the plain-``open`` reader (the dashboard passes a share-delete one
+    so it never blocks the bot deleting a vote file it consumed).
     """
-    pending = read_pending_votes(regime_vote_path, tonight_key)
+    read_json = read_json or _read_json
+    pending = read_pending_votes(regime_vote_path, tonight_key, read_json)
     report = VoteStatusReport(tonight_key=tonight_key)
-    for status in (_w2_status(signal_path, now),
-                   _w3_status(rss_state_file, now),
-                   _w4_status(regime_vote_path, now)):
+    for status in (_w2_status(signal_path, now, read_json),
+                   _w3_status(rss_state_file, now, read_json),
+                   _w4_status(regime_vote_path, now, read_json)):
         vote = pending.get(status.source)
         if vote:
             target = str(vote.get("expires_after_session", ""))

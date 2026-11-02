@@ -218,6 +218,27 @@ class TestTimeout:
         assert not g.real_entry_confirmed  # assumed closed
         assert not fp.active
 
+    def test_resumed_entry_opposite_sign_is_not_assumed_filled(self):
+        """A resumed long must not be confirmed by a short book or by timeout."""
+        fp, g = _make_poller(timeout=10.0)
+        g.on_fill_pending("entry")
+        fp.start("entry", -1, expected_sign=1, resumed=True)
+        assert fp.on_position_update(-1) is None
+        result = fp.timeout()
+        assert not g.real_entry_confirmed
+        assert g.fill_pending
+        assert "NOT confirmed" in result.message
+
+    def test_resumed_entry_matching_sign_still_times_out_as_filled(self):
+        """A resumed long whose book is already long may assume the fill."""
+        fp, g = _make_poller(timeout=10.0)
+        g.on_fill_pending("entry")
+        fp.start("entry", 1, expected_sign=1, resumed=True)
+        result = fp.timeout()
+        assert g.real_entry_confirmed
+        assert not g.fill_pending
+        assert result.action_type == "entry"
+
     def test_timeout_message_bilingual(self):
         fp, g = _make_poller()
         g.on_fill_pending("entry")

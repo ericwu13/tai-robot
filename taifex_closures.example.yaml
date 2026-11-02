@@ -1,0 +1,21 @@
+# Manual TAIFEX emergency closures (typhoon and similar).
+#
+# Copy this file to taifex_closures.yaml in the same directory as
+# settings.yaml (next to the program when running the frozen EXE).
+# taifex_closures.yaml is gitignored. If that file is missing,
+# is_taifex_holiday is unchanged.
+#
+# A date listed in the live file is a full-day holiday: is_taifex_holiday
+# returns True and logs "holiday". One ISO date per line, or a YAML list.
+# An optional session word (DAY or NIGHT) is accepted and does not narrow
+# the day. Lines starting with # are ignored. A file that is not valid
+# UTF-8 or not valid YAML is ignored (no dates) and a warning is logged.
+#
+# This example is not the live override and contains no closure dates.
+# Do not scrape TAIFEX notices into this file.
+#
+# YYYY-MM-DD
+# YYYY-MM-DD DAY
+# YYYY-MM-DD NIGHT
+# dates:
+#   - YYYY-MM-DD

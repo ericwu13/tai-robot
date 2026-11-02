@@ -55,17 +55,75 @@ The app can be packaged as a standalone Windows EXE using PyInstaller (--onedir 
 
 ### Build Steps
 
+`build_release.py` does **not** pip-install into the active interpreter. A normal build uses whatever PyInstaller and comtypes that interpreter already has. `--no-install` is accepted and does the same thing. `--skip-release` builds and zips only (no GitHub release, no Discord).
+
 ```bash
-# From the project root
+python build_release.py --skip-release
+```
+
+A fresh `.venv-build` needs this project's packages as well as the toolchain. PyInstaller analyzes imports of pyyaml, keyring, httpx, lightweight-charts, pandas, and holidays. `--install-build-deps` always installs both into the target interpreter, including when the PyInstaller and comtypes pins already match: `pip install -e .` (those packages) and `pip install -r requirements-build.txt` (the pins). Pin checks before and after that install query the same interpreter, and PyInstaller runs with it. Prefer a dedicated build venv (`.venv-build/`, gitignored) so comtypes is not downgraded in a dev or live venv. When `.venv-build` exists, the flag installs into its interpreter. Otherwise it prints a warning naming the active interpreter (`sys.executable`) and installs there.
+
+```bash
+python -m venv .venv-build
+# POSIX — manual equivalent of the flag
+.venv-build/bin/python -m pip install -e .
+.venv-build/bin/python -m pip install -r requirements-build.txt
+.venv-build/bin/python -m PyInstaller tai_backtest.spec --noconfirm
+# Windows
+.venv-build\Scripts\python -m pip install -e .
+.venv-build\Scripts\python -m pip install -r requirements-build.txt
+.venv-build\Scripts\python -m PyInstaller tai_backtest.spec --noconfirm
+```
+
+`--install-build-deps` runs that `pip install -e .` and the requirements file on the target interpreter, then builds:
+
+```bash
+# POSIX
+.venv-build/bin/python build_release.py --skip-release --install-build-deps
+# Windows
+.venv-build\Scripts\python build_release.py --skip-release --install-build-deps
+```
+
+`requirements-build.txt` pins `PyInstaller==6.19.0` and `comtypes==1.4.15`. Those pins are secondary. The comtypes 1.4.15 wheel does not ship a `comtypes/gen/` package (1.4.17 does not either), so `import comtypes.gen` fails until the runtime hook creates it. That hook is the startup fix. `pyinstaller-hooks-contrib` is not pinned: PyInstaller 6.19.0 requires `pyinstaller-hooks-contrib>=2026.0`, and pip may install any newer release that satisfies that. No specific hooks-contrib version was recorded with the Windows smoke.
+
+The #194 Windows checklist (`docs/testing/grid_subprocess_windows_checklist.md`) checks out `cf58c7c`, which predates `--install-build-deps`. It creates `.venv-build` and runs `.\.venv-build\Scripts\python.exe` for `pip install -e .` (pyyaml, keyring, httpx, lightweight-charts, pandas, holidays) plus the pins, then that same interpreter runs `build_release.py --skip-release`. That command does not pip-install. Do not Activate, and do not build with the system Python. The empty `src\strategies` and `strategies` directories in that checklist are for the commit it checks out, whose spec still lists `('strategies', 'strategies')`. This branch's spec stages a placeholder instead.
+
+Direct invocation, after the project and the pins are installed in the interpreter you intend to build with:
+
+```bash
+pip install -e .
+pip install -r requirements-build.txt
 python -m PyInstaller tai_backtest.spec --noconfirm
+# or: pyinstaller tai_backtest.spec --noconfirm
+```
+
+The spec inserts `SPECPATH` onto `sys.path` so `import build_release` works for the `pyinstaller` entry-point script as well as `python -m PyInstaller`.
+
+The Capital API SDK is gitignored. A worktree or fresh clone has no `CapitalAPI_2.13.57/` tree. Broker DLLs are read from this libs directory. `SKCOM.dll` and `CTSecuritiesATL.dll` must both be present and nonzero (`run_backtest.py` registers `CTSecuritiesATL.dll`, and `SKCOM.dll` loads its sibling DLLs from the same folder):
+
+`CapitalAPI_2.13.57/CapitalAPI_2.13.57_PythonExample/SKDLLPythonTester/libs`
+
+`tai_backtest.spec` and `build_release.py` both refuse to build when that directory is missing or either required DLL is missing or empty. The error names the file. Set `TAI_CAPITAL_SDK_DIR` to a libs directory that contains both files when the SDK lives outside the repo. A relative value is resolved against the project root — the directory that contains `tai_backtest.spec` (`SPECPATH` on a raw `pyinstaller` run) — not the shell's current directory. CI and Linux test builds that are not packaging a broker EXE can set `TAI_ALLOW_MISSING_CAPITAL_SDK=1` or pass `--allow-missing-broker-sdk`. Only the value `1` opts out; `true` or `yes` prints a warning and the build still fails. The opt-out prints a warning and the build continues; if a required DLL is still absent, the EXE has no broker DLLs.
+
+```bash
+export TAI_CAPITAL_SDK_DIR=/path/to/SKDLLPythonTester/libs
+# or, relative to the project root:
+export TAI_CAPITAL_SDK_DIR=CapitalAPI_2.13.57/CapitalAPI_2.13.57_PythonExample/SKDLLPythonTester/libs
+python build_release.py --skip-release
 ```
 
 Output: `dist/tai_backtest/tai_backtest.exe`
+
+`strategies/` is gitignored and holds per-machine AI strategies. A fresh clone does not have that directory. The spec does not bundle it. At build time it stages an empty placeholder under `build/strategies_placeholder/` (a `README.txt` only) so PyInstaller has a datas source, and private `.py` files are never copied into the EXE. Saved strategies are loaded at runtime from the `strategies/` directory next to `tai_backtest.exe`, which the app creates on first use.
+
+`runtime_hook_comtypes.py` points `comtypes.gen` at a writable `_comtypes_cache` next to the EXE. If that package is missing (`ModuleNotFoundError.name == 'comtypes.gen'`), the hook creates it in the cache. A broken `comtypes.gen` whose own import failed is not swallowed. The spec also lists `comtypes.gen` in `hiddenimports`. Confirming the EXE process actually starts still requires Windows.
 
 ### Build Files
 
 | File | Purpose |
 |------|---------|
+| `requirements-build.txt` | Pinned PyInstaller and comtypes for the EXE build |
+| `build_release.py` | Runs the spec and zips the dist. Does not pip-install unless `--install-build-deps` (then `pip install -e .` and the pins, into the target interpreter) |
 | `tai_backtest.spec` | PyInstaller build specification (--onedir mode) |
 | `runtime_hook_comtypes.py` | Runtime hook for writable comtypes.gen cache |
 
@@ -73,7 +131,8 @@ Output: `dist/tai_backtest/tai_backtest.exe`
 
 - SDK DLLs (8 files from `CapitalAPI_2.13.57/.../libs/`) into `_internal/libs/`
 - `lightweight_charts/js/` (WebGL chart assets)
-- `data/`, `src/`, `strategies/` directories
+- `src/`
+- an empty `strategies/` placeholder (private `strategies/` is not packaged)
 - `settings.example.yaml` as config template
 
 ## Deploying the EXE
@@ -118,13 +177,30 @@ tai_backtest/
 
 ## Headless CLI (deploy bots without the GUI)
 
-`run_bot_cli.py` drives the **same** live-bot code as the workbench — it
+The headless CLI drives the **same** live-bot code as the workbench — it
 constructs `BacktestApp` on a hidden Tk window, so order handling, fill
 tracking, reconnects, session-end close and regime polling are identical to
-a GUI deploy. Only the dialogs are replaced by flags. Use it from scripts,
-scheduled tasks, or agents.
+a GUI deploy. Only the dialogs are replaced by flags.
+
+Two ways to invoke it. Source checkouts (oreopie) use `python run_bot_cli.py`.
+A packaged install has no Python on PATH: run `tai_backtest.exe <command>`
+from the folder that contains the EXE. The EXE routes
+`deploy|stop|list|status|strategies|backtest` to the CLI and exits with
+that command's code. No arguments, `-h`/`--help`, or an unknown first
+token opens the GUI (double-click is unchanged). v2.19.2 shipped the
+source CLI; that tag's note that headless "ships in this tag" did not
+route the release EXE. Headless from `tai_backtest.exe` starts with the
+cut that contains this packaging change.
 
 ```bash
+# --- packaged install (cmd / PowerShell, cd to the EXE folder) ---
+tai_backtest.exe strategies
+tai_backtest.exe list
+tai_backtest.exe status --symbol TMF00 --bot night1 --json
+tai_backtest.exe deploy --symbol TMF00 --bot night1 --strategy "H4 Bollinger Long" --mode paper --detach --wait-ready 240
+tai_backtest.exe stop --symbol TMF00 --bot night1 --wait 60
+
+# --- source checkout ---
 python run_bot_cli.py strategies                       # display names (incl. saved AI: ...)
 python run_bot_cli.py list                             # every data/live/{symbol}_{bot} + lock state
 python run_bot_cli.py status --symbol TMF00 --bot night1 --json
@@ -159,14 +235,44 @@ Notes:
   is used. `--new` refuses to resume, `--resume` refuses to start fresh.
 - A real-order deploy waits for the futures account from the API and, like
   the GUI, aborts if the account already holds a position unless
-  `--allow-existing-position` is given.
+  `--allow-existing-position` is given. If that position query fails, is
+  rejected, or times out, the book is UNKNOWN and the deploy is refused
+  (exit 4) unless `--allow-unknown-position` is given. The two flags are
+  independent. The GUI asks on the Unknown Position dialog with the
+  default button on No.
 - Ctrl+C is the same as `stop`. Only CLI-started bots poll the STOP file; a
-  GUI bot is stopped from the workbench.
+  GUI bot is stopped from the workbench. If the stop itself fails, the STOP
+  file stays (a signal-only stop writes one) and the next poll tries again.
+- A running headless bot also polls `data/live/{symbol}_{bot}/CONTROL`
+  every 2 seconds. Write one line; the bot renames the file to
+  `CONTROL.ack` and applies it once:
+
+  ```
+  reconnect
+  set-mode paper
+  ```
+
+  `reconnect` uses the same path as the workbench Reconnect button.
+  `set-mode paper` switches the running bot to paper and honours the
+  mode-switch veto (an open fill, for example, keeps the current mode).
+  `set-mode auto`, `set-mode real`, and any other text are rejected and
+  logged, including when `allow_live_override` is set. A UTF-8 BOM and
+  UTF-16 with a BOM (what Windows PowerShell 5.1 writes for
+  `echo reconnect > CONTROL`) are both read. A `CONTROL` file already
+  in the bot directory when the bot is deployed is renamed to
+  `CONTROL.stale` and is not applied. If that rename fails, the file is
+  deleted; if the delete also fails, the bot remembers the file's size
+  and modification time and ignores that file until it changes. The
+  STOP / CONTROL poll still starts. Write the command after the bot is
+  running. GUI bots do not read this file.
 - `--detach` re-runs the command as a detached child (stdout appended to
   `data/live/{symbol}_{bot}/cli_stdout.log`) and, with `--wait-ready N`,
   returns `0` once the child owns the lock and logged `Tick subscription
   active`, the child's exit code if it died first, or `6` if it is still
-  starting after N seconds (the child keeps running).
+  starting after N seconds (the child keeps running). From the EXE the
+  child is `tai_backtest.exe <subcommand> …` (no `.py` argument). From
+  source it is `python run_bot_cli.py <subcommand> …`. Both use the same
+  `data/live` directory as the GUI, so `list`/`status` see either kind of bot.
 - Agents: the `deploy` skill (`.claude/skills/deploy`) wraps all of this
   with the safety gates (mode consent, not-already-running, strategy
   resolution, resume vs switch).

@@ -99,8 +99,9 @@ def _app(bot_dir: str):
     app._heartbeat_active = False
     app._heartbeat_after_id = None
     app._bot_dir = bot_dir
-    # Present before and after the #158 reconnect merge. This branch does
-    # not read them; #158's _attempt_reconnect / stop path does.
+    # The half-up controller is gone. These attributes are unused by
+    # the pre-#158 reconnect path; leave them so a stray read cannot
+    # AttributeError inside a wiring test.
     app._reconnect_schedule = SimpleNamespace(
         note_fired=lambda: None,
         suspend=lambda *_a, **_k: None,
@@ -109,11 +110,8 @@ def _app(bot_dir: str):
         cancel_all=lambda *_a, **_k: None,
     )
     app._quote_ready_timer_id = None
-    # Master has ReconnectController. Construct it so _attempt_reconnect
-    # and stop can call it. _check_reconnection reads the wait below.
-    controller_cls = getattr(rb, "ReconnectController", None)
-    app._reconnect_controller = controller_cls() if controller_cls else None
-    app._reconnect_ready_wait_s = getattr(controller_cls, "READY_WAIT_S", 3)
+    app._reconnect_controller = None
+    app._reconnect_ready_wait_s = 3
     return app
 
 
@@ -181,6 +179,10 @@ def test_deploy_wires_heartbeat_tick_and_stop(tmp_path, monkeypatch):
         assert ok is True
         hb_path = os.path.join(bot_dir, "heartbeat.json")
         assert os.path.isfile(hb_path)
+        # The in-process watchdog reads this snapshot, not the file, so
+        # tick/stop do not os.replace or os.remove against an open handle.
+        snap = hb._read_snapshot(hb_path)
+        assert snap is not None and snap["pid"] == os.getpid()
         assert app._heartbeat_active is True
         assert len(app.root.pending) == 1
         ms = app.root.fire_one()
@@ -191,6 +193,7 @@ def test_deploy_wires_heartbeat_tick_and_stop(tmp_path, monkeypatch):
         _stop_attrs(app)
         app._stop_live()
         assert not os.path.isfile(hb_path)
+        assert hb._read_snapshot(hb_path) is None
     finally:
         _cleanup()
 
@@ -392,6 +395,42 @@ def test_first_write_failure_still_arms_later_ticks(tmp_path, monkeypatch):
         _cleanup()
 
 
+def test_tick_replace_failure_is_rate_limited_in_bot_log(tmp_path, monkeypatch, capsys):
+    """Final os.replace failures reach _log once, not logger.exception per tick."""
+    bot_dir = str(tmp_path / "bot")
+    os.makedirs(bot_dir, exist_ok=True)
+    app = _app(bot_dir)
+    app._live_runner = SimpleNamespace(bot_dir=bot_dir)
+    clock = {"t": 5_000.0}
+    hb.reset_replace_failure_log()
+    monkeypatch.setattr(hb, "_sleep", lambda _delay: None)
+    monkeypatch.setattr(hb, "_monotonic", lambda: clock["t"])
+    try:
+        app._start_main_heartbeat()
+        assert hb._replace_failure_log is rb._log
+        capsys.readouterr()
+
+        def boom(_src, _dst):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(hb.os, "replace", boom)
+        app.root.fire_one()
+        first = capsys.readouterr().out
+        assert first.count("heartbeat os.replace failed") == 1
+        assert "tick failed" not in first
+        assert "suppressed" not in first
+        app.root.fire_one()
+        assert "heartbeat os.replace failed" not in capsys.readouterr().out
+        clock["t"] += hb._REPLACE_LOG_INTERVAL_S
+        app.root.fire_one()
+        third = capsys.readouterr().out
+        assert "heartbeat os.replace failed" in third
+        assert "1 suppressed" in third
+    finally:
+        _cleanup()
+        hb.reset_replace_failure_log()
+
+
 def test_send_future_order_stamps_inflight(tmp_path, monkeypatch):
     """The real send path stamps inflight_com_call. A comment does not."""
     import sys
@@ -451,8 +490,10 @@ def test_send_future_order_stamps_inflight(tmp_path, monkeypatch):
     assert seen.get("name") == "SendFutureOrderCLR"
 
 
-def test_check_reconnection_stamps_is_connected(tmp_path, monkeypatch):
-    """The reconnect probe wraps IsConnected. Unwrapping it leaves no stamp."""
+def test_is_connected_probe_is_stamped(tmp_path):
+    """The machine's IsConnected probe goes through call_com."""
+    from src.live.com_broker_port import ComBrokerPort
+
     bot_dir = str(tmp_path / "bot")
     os.makedirs(bot_dir, exist_ok=True)
     writer = hb.HeartbeatWriter(bot_dir)
@@ -466,92 +507,26 @@ def test_check_reconnection_stamps_is_connected(tmp_path, monkeypatch):
         seen["name"] = inflight.get("name")
         return 0
 
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(
-        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
-    app = _app(bot_dir)
-    app._quote_connected = False
-    app._conn_monitor = SimpleNamespace(attempt=1)
-    scheduled = []
-    app._schedule_reconnect = lambda: scheduled.append(True)
+    port = ComBrokerPort(
+        call=hb.call_com,
+        libs=lambda: (None, SimpleNamespace(SKQuoteLib_IsConnected=is_connected), None, None),
+        credentials=lambda: ("user", "secret"),
+        on_subscribe=lambda: None,
+        on_reconcile=lambda: None,
+        on_release=lambda: None,
+    )
     try:
-        app._check_reconnection()
-    finally:
-        hb._writer = None
-        _cleanup()
-    assert seen.get("name") == "IsConnected"
-    assert scheduled == [True]
-
-
-def _stamp_during(writer):
-    def is_connected():
-        data = json.loads(open(writer.path, encoding="utf-8").read())
-        inflight = data.get("inflight_com_call") or {}
-        return inflight.get("name")
-    return is_connected
-
-
-def test_probe_reconnect_is_connected_is_stamped(tmp_path, monkeypatch):
-    """_probe_reconnect_is_connected stamps IsConnected before it returns."""
-    bot_dir = str(tmp_path / "bot")
-    os.makedirs(bot_dir, exist_ok=True)
-    writer = hb.HeartbeatWriter(bot_dir)
-    writer.write()
-    hb._writer = writer
-    seen = {}
-
-    def is_connected():
-        seen["name"] = _stamp_during(writer)()
-        return 2
-
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(
-        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
-    app = _app(bot_dir)
-    try:
-        assert app._probe_reconnect_is_connected() == 2
+        assert port.is_connected() == 0
     finally:
         hb._writer = None
         _cleanup()
     assert seen.get("name") == "IsConnected"
 
 
-def test_attempt_reconnect_pre_decide_is_connected_is_stamped(tmp_path, monkeypatch):
-    """The IsConnected probe before decide is wrapped. Unwrapping leaves no stamp."""
-    bot_dir = str(tmp_path / "bot")
-    os.makedirs(bot_dir, exist_ok=True)
-    writer = hb.HeartbeatWriter(bot_dir)
-    writer.write()
-    hb._writer = writer
-    seen = {}
+def test_leave_monitor_is_stamped_on_shutdown(tmp_path):
+    """User shutdown stamps LeaveMonitor. Reconnect does not call it."""
+    from src.live.com_broker_port import ComBrokerPort
 
-    def is_connected():
-        seen["name"] = _stamp_during(writer)()
-        return 2
-
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(
-        rb, "skQ", SimpleNamespace(SKQuoteLib_IsConnected=is_connected))
-    app = _app(bot_dir)
-    app._quote_connected = False
-    app._conn_monitor = SimpleNamespace(attempt=0)
-    app._reconnect_timer_id = None
-    app.login_user_var = _Var("user")
-    app.login_pass_var = _Var("secret")
-    app.btn_reconnect = _Widget()
-    # Half-up and still before open+90, so decide skips and never reaches
-    # LeaveMonitor. The stamp under test is the probe before decide.
-    app._reconnect_controller._previous_attempt_missed_ready = True
-    try:
-        app._attempt_reconnect()
-    finally:
-        hb._writer = None
-        _cleanup()
-    assert seen.get("name") == "IsConnected"
-
-
-def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):
-    """Behavior, not a source grep: inflight name during the COM call."""
     bot_dir = str(tmp_path / "bot")
     os.makedirs(bot_dir, exist_ok=True)
     writer = hb.HeartbeatWriter(bot_dir)
@@ -565,26 +540,21 @@ def test_leave_monitor_is_stamped_by_call_com(tmp_path, monkeypatch):
         seen["name"] = inflight.get("name")
         return 0
 
-    skq = SimpleNamespace(
-        SKQuoteLib_LeaveMonitor=leave,
-        SKQuoteLib_EnterMonitorLONG=lambda: 0,
+    port = ComBrokerPort(
+        call=hb.call_com,
+        libs=lambda: (
+            None,
+            SimpleNamespace(SKQuoteLib_LeaveMonitor=leave),
+            None,
+            None,
+        ),
+        credentials=lambda: ("user", "secret"),
+        on_subscribe=lambda: None,
+        on_reconcile=lambda: None,
+        on_release=lambda: None,
     )
-    skc = SimpleNamespace(
-        SKCenterLib_LogOut=lambda _user: 0,
-        SKCenterLib_LoginSetQuote=lambda *_a: 0,
-        SKCenterLib_GetReturnCodeMessage=lambda _code: "",
-    )
-    skr = SimpleNamespace(SKReplyLib_ConnectByID=lambda _user: 0)
-    monkeypatch.setattr(rb, "_com_available", True)
-    monkeypatch.setattr(rb, "skQ", skq)
-    monkeypatch.setattr(rb, "skC", skc)
-    monkeypatch.setattr(rb, "skR", skr)
-    app = _app(bot_dir)
-    app._conn_monitor = SimpleNamespace(attempt=0, reset=lambda: None)
-    app.login_user_var = _Var("user")
-    app.login_pass_var = _Var("secret")
     try:
-        app._attempt_reconnect()
+        assert port.leave_monitor() == 0
     finally:
         hb._writer = None
         _cleanup()

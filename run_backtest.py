@@ -7,7 +7,8 @@ Two backtest buttons:
 Multi-symbol support via SYMBOL_CONFIG (TX00, MTX00).
 
 Usage:
-  python run_backtest.py
+  python run_backtest.py                 # GUI workbench
+  python run_backtest.py list            # headless CLI (see run_bot_cli.py)
 """
 
 from version import APP_VERSION
@@ -17,6 +18,27 @@ import faulthandler
 import logging
 import os
 import sys
+
+# Frozen EXE spawn children re-execute this file as __main__. This has
+# to run before Tk, COM, or the Capital API are imported and before
+# main() starts a bot. freeze_support() is first so a Windows frozen
+# child can run its payload and exit. Classification uses
+# src.paths.skips_gui_and_com, the same helper as the comtypes hook, so
+# a spawn child and the grid-smoke parent never reach the CLI router.
+# The headless entry is run_bot_cli.py.
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    from src.paths import dispatch_entry
+    _kind, _routed = dispatch_entry(sys.argv)
+    if _kind == "spawn":
+        raise SystemExit(0)
+    if _kind == "grid_smoke":
+        # ``--grid-subprocess-smoke`` (anywhere in argv). grid_smoke.main
+        # owns --payload-bytes and the non-GridOutcome exit 1.
+        from src.evolution.grid_smoke import main as _grid_smoke_main
+        raise SystemExit(_grid_smoke_main(sys.argv))
+
 import inspect
 import queue
 import threading
@@ -28,15 +50,13 @@ from tkinter import ttk, filedialog, simpledialog, messagebox
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
-# Ensure src is importable — handle PyInstaller frozen EXE
-if getattr(sys, 'frozen', False):
-    # --onedir: EXE is in dist/tai_backtest/, _MEIPASS == EXE dir
-    # --onefile: EXE extracts to temp _MEI dir
-    bundle_root = sys._MEIPASS
-    project_root = os.path.dirname(sys.executable)
-else:
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    bundle_root = project_root
+# Ensure src is importable — handle PyInstaller frozen EXE.
+# The frozen check lives in src.paths so the GUI and the headless CLI
+# share one definition (install dir for data/live, _MEIPASS for the bundle).
+from src.paths import bundle_root as _bundle_root, project_root as _project_root
+
+project_root = _project_root()
+bundle_root = _bundle_root()
 
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -97,39 +117,26 @@ from src.ai.pine_exporter import export_to_pine
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, is_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
-from src.live.trading_guard import TradingGuard
+from src.live.live_runner import LiveRunner, LiveState, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
+from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.tick_watchdog import TickWatchdog
-from src.live.main_heartbeat import call_com
+from src.live.main_heartbeat import call_com, set_com_return_logger
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
+    open_interest_query_rejected,
 )
 from src.live.connection_monitor import ConnectionMonitor
-from src.live.reconnect_controller import (
-    ACTION_ALREADY_CONNECTED,
-    ACTION_SKIP_TEARDOWN_WAIT,
-    ESCALATION_LOG,
-    FORCED_TEARDOWN_LOG,
-    HALF_UP_TEARDOWN_CONFIRM,
-    HALF_UP_CONFIRM_UNAVAILABLE_LOG,
-    HALF_UP_YES_STALE_LOG,
-    IS_CONNECTING,
-    OPERATOR_DECLINED_HALF_UP_LOG,
-    OPERATOR_FORCED_HALF_UP_P1,
-    ReconnectController,
-    ReconnectSchedule,
-    headless_half_up_refusal_phrase,
-    in_live_session,
-    pop_calendar_degraded_p1,
-    pop_session_clock_warnings,
-    seconds_since_session_open,
-    seconds_until_next_session_open,
-)
+from src.live.com_broker_port import ComBrokerPort
+from src.live.link_host import adopt_after_process_login
+from src.live.link_state_machine import KIND_CONN_ERROR
+from src.live.quote_stuck_recovery import QuoteStuckRecovery
 from src.live.fill_poller import FillPoller
 from src.live.fill_report import (
-    RealFillTracker, parse_fulfill_report, match_fill_in_report,
+    RealFillTracker, parse_fulfill_report, parse_new_data,
+    is_fulfill_rate_limited, next_exit_fill_retry, mask_new_data_row,
+    FR_MIN_GAP_MS, FR_RETRY_WINDOW_MS,
 )
 from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
@@ -517,6 +524,67 @@ def _load_settings():
                 _cap_base = 0
             cfg["evolution_capital_base_twd"] = (
                 _cap_base if _cap_base > 0 else 100000)
+            # min_design_trades: Saturday/automatic runs skip the AI plan
+            # call while the design window is smaller than this. Default
+            # is fitness.MIN_TRADES (30). The manual Evolve button is
+            # exempt. 0 disables the check. The import is guarded so a
+            # failure here cannot skip idle_warn_days or the settings
+            # that follow (news, regime, …).
+            try:
+                from src.evolution.fitness import MIN_TRADES as _min_trades_default
+            except Exception as exc:
+                _min_trades_default = 30
+                try:
+                    _log("evolution.min_design_trades default import failed: "
+                         f"[{type(exc).__name__}] {exc}")
+                except Exception:
+                    pass
+            cfg["evolution_min_design_trades"] = _nonneg_int(
+                evo.get("min_design_trades", _min_trades_default),
+                _min_trades_default)
+            # idle_warn_days: on a watermark skip, append an idle line
+            # once the last exit is at least this many calendar days ago.
+            # 0 disables the line entirely.
+            cfg["evolution_idle_warn_days"] = _nonneg_int(
+                evo.get("idle_warn_days", 7), 7)
+            # Raw evolution mapping for the P1 gate parser. This section
+            # has no credentials. Parsing (and the absolute-real coerce)
+            # lives in src.evolution.paper_gate.
+            cfg["evolution_gate_raw"] = dict(evo) if isinstance(evo, dict) else {}
+            # D1: classes with fewer than 2 rewritable grid knobs are
+            # excluded from the weekly run. "none" (default) does not
+            # codegen. "structural_lane" is reserved for a later monthly
+            # lane and also does not enable weekly codegen. Any other
+            # value, including "codegen", is treated as "none".
+            from src.evolution.knobs import normalize_knob_ineligible_fallback
+            cfg["evolution_knob_ineligible_fallback"] = (
+                normalize_knob_ineligible_fallback(
+                    evo.get("knob_ineligible_fallback", "none")))
+            # P6 / structural lane. A missing saturday_mode is propose.
+            # "promote" is an explicit opt-in. A missing structural_lane
+            # block leaves the lane on. It still only proposes: the pool
+            # guard is unchanged. Boolean false is the off switch.
+            # A failure here must not drop news/regime settings below.
+            # The exception fallback leaves the lane off so a broken
+            # parser cannot start a structural run.
+            try:
+                from src.evolution.structural_lane import settings_from_evolution
+                _lane_settings = settings_from_evolution(
+                    evo if isinstance(evo, dict) else {})
+                cfg.update(_lane_settings)
+                _lane_warnings = (
+                    (_lane_settings.get("evolution_structural_lane") or {})
+                    .get("warnings") or [])
+                for _lane_warning in _lane_warnings:
+                    _log(f"EVO structural lane config: {_lane_warning}")
+            except Exception as exc:
+                cfg["evolution_saturday_mode"] = "propose"
+                cfg["evolution_structural_lane"] = {"enabled": False}
+                try:
+                    _log("evolution structural lane config failed: "
+                         f"[{type(exc).__name__}] {exc}")
+                except Exception:
+                    pass
             # News/event framework (src.news). Paths are written by an
             # external n8n workflow; empty paths keep the feature inert.
             # Defaults mirror src.config.settings.NewsConfig exactly.
@@ -634,6 +702,176 @@ def _evolution_omitted_count(total_trades: int, watermark: dict | None) -> int:
     if not watermark:
         return 0
     return min(int(watermark.get("trade_count", 0) or 0), total_trades)
+
+
+def _persist_evolution_history(bot_dir, **fields) -> None:
+    """Append one evolution-history line. Never raises and never logs success.
+
+    A missing ``bot_dir`` is a no-op (no per-bot file). Write failures
+    are logged inside the helper.
+    """
+    try:
+        from src.evolution.history import record_evolution_attempt
+        record_evolution_attempt(bot_dir, log=_log, **fields)
+    except Exception as exc:
+        try:
+            _log("evolution history append failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+
+
+def _evolution_bot_dir(app) -> str | None:
+    """Live bot directory, or None when evolution is not on a running bot."""
+    runner = getattr(app, "_live_runner", None)
+    if runner is None or getattr(runner, "state", None) == LiveState.IDLE:
+        return None
+    return getattr(runner, "bot_dir", None) or None
+
+
+_evolution_guard_lock = threading.Lock()
+_evolution_in_progress: set[str] = set()
+
+
+def _evolution_run_key(app, bot_dir=None) -> str:
+    """Identity of one bot's evolution run.
+
+    A live bot is its directory. Two bots do not share a key. A run
+    with no bot directory is keyed by the app object, so two workbench
+    windows do not block each other. This is not the process ``.lock``.
+    """
+    directory = bot_dir if bot_dir else _evolution_bot_dir(app)
+    if directory:
+        try:
+            return "dir:" + os.path.normcase(os.path.abspath(os.fspath(directory)))
+        except (TypeError, ValueError, OSError):
+            pass
+    return f"app:{id(app)}"
+
+
+def _evolution_try_begin(key: str) -> bool:
+    """Mark ``key`` in progress. False when a run already holds it."""
+    with _evolution_guard_lock:
+        if key in _evolution_in_progress:
+            return False
+        _evolution_in_progress.add(key)
+        return True
+
+
+def _evolution_end(key: str) -> None:
+    """Drop ``key``. A second release is a no-op."""
+    with _evolution_guard_lock:
+        _evolution_in_progress.discard(key)
+
+
+def _evolution_guard_clear() -> None:
+    """Drop every in-progress mark. Tests only."""
+    with _evolution_guard_lock:
+        _evolution_in_progress.clear()
+
+
+def _refuse_overlapping_evolution(app, *, auto_run: bool) -> None:
+    """Log and, on the paths that talk to the operator, say why we skipped.
+
+    A manual Evolve click and the Saturday auto run share one process,
+    so the second one must not start a second worker. The bot process
+    ``.lock`` is left alone.
+    """
+    which = "手動演化 manual Evolve" if not auto_run else "自動演化 weekly auto"
+    msg = (
+        f"🧬 EVO: 這個機器人已有一輪演化在執行，{which} 本次略過。"
+        f"Evolution already running for this bot — {which} was skipped."
+    )
+    try:
+        _log(msg)
+    except Exception:
+        pass
+    try:
+        app.set_status(msg)
+    except Exception:
+        pass
+    try:
+        app._append_chat("system", msg)
+    except Exception:
+        pass
+    if _discord is not None and getattr(_discord, "enabled", False):
+        try:
+            _discord.notify_evolution(msg)
+        except Exception:
+            pass
+
+
+def _evolution_history_sealed() -> None:
+    """No-op after the validation history row is stored.
+
+    A raise here enters the pipeline-error handler. That handler
+    records a row only when this attempt has not already stored one.
+    """
+    return None
+
+
+def _evolution_class_name(app, strategy_cls=None) -> str:
+    """Class name for a history row. Empty when no strategy is in hand."""
+    if strategy_cls is not None:
+        return getattr(strategy_cls, "__name__", "") or ""
+    runner = getattr(app, "_live_runner", None)
+    strategy = getattr(runner, "strategy", None) if runner is not None else None
+    if strategy is not None:
+        return type(strategy).__name__
+    return ""
+
+
+def _nonneg_int(value, default: int) -> int:
+    """Parse ``value`` as an int >= 0. Junk and negatives use ``default``.
+
+    ``0`` is kept. Callers treat it as off: it disables the automatic
+    design-trade plan skip, and it disables the idle line.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if n >= 0 else default
+
+
+def _parse_exit_stamp(text: str) -> datetime | None:
+    """Trade exit stamp → naive datetime. Accepts the engine's two shapes."""
+    if not text:
+        return None
+    raw = str(text).strip()
+    for fmt, n in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16),
+                   ("%Y-%m-%d", 10)):
+        try:
+            return datetime.strptime(raw[:n], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _evolution_idle_notice(trades, now: datetime, warn_days: int) -> str:
+    """``idle N days since last exit YYYY-MM-DD``, or ``""``.
+
+    Calendar days on ``now``'s clock face (Taipei wall time; a tz is
+    stripped, not converted). Empty when ``warn_days`` is 0 (the line
+    is disabled), the last exit is missing, unparseable, in the future,
+    or strictly younger than ``warn_days``. ``N >= warn_days`` includes
+    the boundary day.
+    """
+    if warn_days <= 0:
+        return ""
+    latest = ""
+    for t in trades or []:
+        ed = getattr(t, "exit_dt", "") or ""
+        if ed > latest:
+            latest = ed
+    exit_dt = _parse_exit_stamp(latest)
+    if exit_dt is None:
+        return ""
+    now_naive = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
+    days = (now_naive.date() - exit_dt.date()).days
+    if days < warn_days:
+        return ""
+    return f"idle {days} days since last exit {exit_dt.strftime('%Y-%m-%d')}"
 
 
 def _read_persisted_ultra_mode() -> bool:
@@ -815,6 +1053,33 @@ def _log_debug(msg):
     _route_to_log_widget(line, "debug")
 
 
+def _log_com_return(name: str, elapsed_ms: float, failed: bool) -> None:
+    """P0: how long the SKCOM call took, written as it returns.
+
+    Logging only. The caller already invoked the COM method; this does
+    not make another one and does not branch on the elapsed time.
+    """
+    status = "raised" if failed else "returned"
+    _log_debug(
+        f"[COM] {name} {status} in {elapsed_ms:.0f} ms "
+        f"tid={threading.get_ident()}")
+
+
+def _log_reply_link_state(value, *, where: str) -> None:
+    """Log a reply-link value the caller already holds.
+
+    Does not call SKCOM. Reconnect does not call this helper: nothing
+    on the pre-#158 path reads the reply link, and a probe would change
+    the call sequence under investigation.
+    """
+    _log_debug(
+        f"[RECONNECT] reply-link IsConnectedByID={value} at {where} "
+        f"tid={threading.get_ident()}")
+
+
+set_com_return_logger(_log_com_return)
+
+
 def _route_to_log_widget(line: str, level: str = "info") -> None:
     """Append a formatted line to the Log tab. Off-thread callers enqueue.
 
@@ -869,6 +1134,8 @@ class SKQuoteLibEvents:
             3033: "Abnormal — abnormal disconnect, triggering disconnect",
         }.get(nKind, f"unknown kind={nKind}")
         _ui_queue.put_nowait(("log_debug", f"[CONN] kind={nKind} {kind_label} code={nCode} — {meaning}"))
+        # Flag only. The main-thread drain calls the link machine. No SKCOM here.
+        _ui_queue.put_nowait(("link", ("connection", int(nKind), int(nCode))))
         if nKind == 3003 and nCode == 0:
             _ui_queue.put_nowait(("conn", "ready"))
         elif nKind == 3002 and nCode == 0:
@@ -938,7 +1205,17 @@ class SKReplyLibEvent:
         _ui_queue.put_nowait(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
 
     def OnComplete(self, bstrUserID):
-        pass
+        del bstrUserID
+        _ui_queue.put_nowait((
+            "log_debug", "[CONN] OnComplete — reply backfill finished"))
+        _ui_queue.put_nowait(("link", ("complete",)))
+
+    def OnSolaceReplyDisconnect(self, bstrUserID):
+        """§4-3-h. Flag only — do not ConnectByID from this callback."""
+        del bstrUserID
+        _ui_queue.put_nowait(("log", "回報斷線 REPLY DISCONNECT"))
+        _ui_queue.put_nowait(("log_debug", "[CONN] OnSolaceReplyDisconnect"))
+        _ui_queue.put_nowait(("link", ("reply_disconnect",)))
 
     def OnNewData(self, bstrUserID, bstrData):
         # Real-time per-order report — the only per-fill price source in
@@ -954,7 +1231,17 @@ class SKOrderLibEvents:
         _ui_queue.put_nowait(("order_result", (nCode, bstrMessage)))
 
     def OnOpenInterest(self, bstrData):
-        _ui_queue.put_nowait(("open_interest", bstrData))
+        # Tag the row with the query that is in flight NOW. A reply that
+        # was already queued under an older generation must not complete
+        # a later GetOpenInterestGW (issue #202). The API has no request
+        # id; enqueue time is the correlation we have.
+        payload: str | tuple = bstrData
+        app = _app
+        monitor = getattr(app, "_account_monitor", None) if app is not None else None
+        generation = getattr(monitor, "oi_query_generation", None) if monitor is not None else None
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            payload = (bstrData, generation)
+        _ui_queue.put_nowait(("open_interest", payload))
 
     def OnFutureRights(self, bstrData):
         _ui_queue.put_nowait(("future_rights", bstrData))
@@ -962,6 +1249,28 @@ class SKOrderLibEvents:
 
 _parse_open_interest = parse_open_interest  # re-export from account_monitor
 _parse_future_rights = parse_future_rights  # re-export from account_monitor
+
+
+def _split_open_interest_event(data) -> tuple[str, int | None]:
+    """Return ``(raw, generation)`` for one queued OnOpenInterest event.
+
+    The callback tags the row with the query generation current when the
+    row was enqueued. An untagged string is credited to whatever query is
+    current when the queue is processed.
+    """
+    if (
+        isinstance(data, tuple)
+        and len(data) == 2
+        and isinstance(data[1], int)
+        and not isinstance(data[1], bool)
+    ):
+        raw = data[0]
+        if not isinstance(raw, str):
+            raw = "" if raw is None else str(raw)
+        return raw, data[1]
+    if isinstance(data, str):
+        return data, None
+    return ("" if data is None else str(data)), None
 
 
 class BacktestApp:
@@ -1054,6 +1363,8 @@ class BacktestApp:
                 elif kind == "log_ui":
                     level, line = data
                     _route_to_log_widget(line, level)
+                elif kind == "link":
+                    self._apply_link_flag(data)
                 elif kind == "conn":
                     if data == "ready":
                         # Ready (3003) is the only state we treat as fully
@@ -1068,7 +1379,8 @@ class BacktestApp:
                         self.set_status("已連線 Connected - Ready", "ok")
                         self._set_conn_dot("ok")
                         self.login_status_var.set("已連線 Connected")
-                        self._on_reconnected()
+                        # Resubscribe is the machine's subscribe_quotes,
+                        # which runs on the following tick after 3003.
                     elif data == "quote":
                         # Bug A: Quote (3002) is intermediate, NOT fully
                         # connected. RequestTicks may return OK on a session
@@ -1078,7 +1390,7 @@ class BacktestApp:
                         self._set_conn_dot("warn")
                         self._on_quote_intermediate()
                     elif data == "disconnected":
-                        self._on_disconnected()
+                        self._on_disconnected(from_event=True)
                 elif kind == "account":
                     # Parse account data: "TF,branch,,account,..." format
                     parts = data.split(",") if isinstance(data, str) else []
@@ -1103,19 +1415,31 @@ class BacktestApp:
                             entries = [e.strip() for e in raw.split(";") if e.strip()]
                             _log(f"期貨商品列表(mkt={market_no}): {len(entries)} symbols")
                 elif kind == "open_interest":
-                    parsed = _parse_open_interest(data)
-                    if parsed:
-                        self._account_monitor.add_position(parsed)
+                    raw, oi_generation = _split_open_interest_event(data)
+                    outcome = self._account_monitor.apply_open_interest(
+                        raw, generation=oi_generation)
+                    parsed = _parse_open_interest(raw) if outcome == "position" else None
+                    if outcome == "position":
                         self._update_real_account_display()
-                    else:
-                        first = data.split(",")[0].strip() if data else ""
-                        if first == "001":
-                            self._account_monitor.set_flat()
-                            self.real_pos_var.set("Flat (無持倉)")
-                    _log(f"未平倉 OpenInterest: {_redact_open_interest(data)}")
-                    # Fill polling: track position from OI callbacks
-                    if self._trading_guard.fill_pending and self._live_runner:
-                        self._update_fill_poll_position(data, parsed)
+                    elif outcome == "flat":
+                        self.real_pos_var.set("Flat (無持倉)")
+                    _log(f"未平倉 OpenInterest: {_redact_open_interest(raw)}")
+                    # Fill polling: track position from OI callbacks.
+                    # A stale row belongs to an older query and must not
+                    # confirm a fill (issue #202).
+                    if (outcome != "stale"
+                            and self._trading_guard.fill_pending
+                            and self._live_runner):
+                        self._update_fill_poll_position(raw, parsed)
+                    # #173's late-resume recheck belongs on a credited row.
+                    # The methods are absent until that PR lands; keep this
+                    # call (and drop a second insert) when resolving the
+                    # _process_ui_queue conflict.
+                    if outcome != "stale":
+                        _recheck = getattr(self, "_recheck_resume_after_snapshot", None)
+                        _settles = getattr(self, "_oi_row_settles_resume_recheck", None)
+                        if _recheck is not None and _settles is not None:
+                            _recheck(settled=_settles(raw, parsed))
                 elif kind == "future_rights":
                     parsed = _parse_future_rights(data)
                     if parsed:
@@ -1157,6 +1481,7 @@ class BacktestApp:
         runs on the main thread via root.after() and processes queued events.
         """
         self._process_ui_queue()
+        self._link_host_tick()
         self.root.after(100, self._drain_ui_queue)
 
     def set_status(self, msg, level: str = "info") -> None:
@@ -1319,12 +1644,10 @@ class BacktestApp:
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
         _log(
             "報價未就緒 Quote (3002) seen but Ready (3003) did not arrive "
-            f"after {waited:.0f}s — triggering reconnect")
+            f"after {waited:.0f}s — link machine keeps waiting (no re-login)")
         _log_debug(
-            f"[CONN] Ready (3003) timeout after {waited:.1f}s — forcing reconnect")
-        # Treat as a connection failure: kick the reconnect ladder so the
-        # GUI re-runs login+EnterMonitor cleanly instead of waiting forever.
-        self._on_disconnected()
+            f"[CONN] Ready (3003) timeout after {waited:.1f}s — "
+            "machine owns the wait; no LeaveMonitor")
 
     def _cancel_quote_ready_timer(self, reason: str) -> None:
         """Cancel the Quote→Ready watchdog timer if armed."""
@@ -1337,8 +1660,13 @@ class BacktestApp:
             self._quote_ready_timer_id = None
             self._quote_intermediate_seen_at = 0.0
 
-    def _on_disconnected(self):
-        """Handle connection loss: pause live feed, start auto-reconnect."""
+    def _on_disconnected(self, *, from_event: bool = False):
+        """Handle connection loss: pause the feed. The link machine reconnects.
+
+        ``from_event`` is an OnConnection 3021/3033 that was already queued.
+        The watchdog path is not, so it flags a quote-down for the machine.
+        Neither path calls LeaveMonitor or LoginSetQuote.
+        """
         if not self._quote_connected:
             _log_debug(
                 "[STATE] _on_disconnected called but _quote_connected already False — "
@@ -1346,17 +1674,18 @@ class BacktestApp:
             return  # already handling disconnect
         self._cancel_quote_ready_timer("disconnected")
         self._set_quote_connected(False, "_on_disconnected")
-        # A server-side 3021/3033 (or an equivalent forced disconnect) is a
-        # down session. The next LeaveMonitor is attempt #1, which is safe.
-        # Do not carry a half-up latch across that boundary.
-        self._reconnect_controller.on_clean_disconnect()
-        # Drop any earlier reconnect timer before the new one is armed, so
-        # a second disconnect cannot leave two pending callbacks.
-        self._cancel_reconnect_timer()
         self.set_status("斷線 Disconnected", "error")
         self._set_conn_dot("err")
         self.login_status_var.set("斷線 Disconnected")
-        self.btn_login.config(state=tk.NORMAL)
+        # The process-start login stays. A second Login button press would
+        # call LoginSetQuote again. Reconnect is the machine's button.
+        if getattr(self, "_link_host", None) is None:
+            self.btn_login.config(state=tk.NORMAL)
+        else:
+            self.btn_login.config(state=tk.DISABLED)
+            if not from_event:
+                self._link_host.note_connection(
+                    KIND_CONN_ERROR, 0, _taipei_now())
         self.btn_reconnect.config(state=tk.NORMAL)
         _log("斷線 Connection lost")
 
@@ -1372,229 +1701,51 @@ class BacktestApp:
             f"(caller=_on_disconnected)")
         self._schedule_reconnect()
 
-    def _probe_reconnect_is_connected(self):
-        """``SKQuoteLib_IsConnected()``, or None when it cannot be read."""
-        if not _com_available:
-            return None
-        try:
-            _log_reconnect_call("IsConnected")
-            return call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
-        except Exception as e:
-            _log_debug(
-                f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
-                f"[{type(e).__name__}] {e}")
-            return None
-
-    def _reconnect_bot_id(self) -> str:
-        runner = getattr(self, "_live_runner", None)
-        name = getattr(runner, "bot_name", None) if runner is not None else None
-        if name:
-            return str(name)
-        return "unknown"
-
-    def _half_up_manual_p1(self, phrase: str, is_connected, since: float) -> str:
-        secs_to_open = 0 if since >= 0 else int(-since)
-        return (
-            f"[RECONNECT] P1 {phrase} "
-            f"bot={self._reconnect_bot_id()} IsConnected={is_connected} "
-            f"secs_to_open={secs_to_open}"
-        )
-
-    def _tk_confirm_half_up_teardown(self, message: str, *, default: str = "no") -> bool:
-        """GUI confirm on the Tk thread. The default button is No."""
-        return bool(messagebox.askyesno(
-            "重連 Reconnect", message, default=default))
-
-    def _ask_half_up_teardown(self) -> bool:
-        """Injectable confirm. Tests set ``_half_up_confirm_fn(message, default=)``."""
-        fn = getattr(self, "_half_up_confirm_fn", None)
-        if fn is None:
-            fn = self._tk_confirm_half_up_teardown
-        return bool(fn(HALF_UP_TEARDOWN_CONFIRM, default="no"))
-
-    def _suspend_reconnect_slot(self) -> None:
-        """Drop the shared after id while the confirm modal is up."""
-        root = getattr(self, "root", None)
-        if root is None:
-            return
-        self._reconnect_schedule.suspend(root.after_cancel)
-
-    def _resume_reconnect_slot(self) -> None:
-        """Put back the skip poll ``_suspend_reconnect_slot`` held.
-
-        Resume re-arms the full delay on purpose (the safe direction).
-        The next probe waits the whole interval again.
-        """
-        root = getattr(self, "root", None)
-        if root is None:
-            return
-        self._reconnect_schedule.resume(
-            after=root.after, after_cancel=root.after_cancel)
-
-    def _half_up_manual_snapshot(self):
-        """Trigger tuple, or None when this press is not the confirm case.
-
-        The rule is manual (this method is only reached from the button),
-        half-up with no Ready since the last EnterMonitor,
-        ``IsConnected()==2`` or a failed probe (None), and either the
-        holiday-aware clock is still before open+90 or the calendar
-        lookup is degraded (open+90 cannot be trusted). The tuple also
-        freezes the attempt counter and the forced-teardown allowance
-        for the Yes re-check. Anything else returns None: no dialog,
-        no extra alert.
-        """
-        is_connected = self._probe_reconnect_is_connected()
-        if not self._reconnect_controller.is_half_up():
-            return None
-        since = self._reconnect_seconds_since_open()
-        if not self._reconnect_controller.manual_half_up_needs_confirm(
-            is_connected, since
-        ):
-            return None
-        return (
-            is_connected,
-            since,
-            self._conn_monitor.attempt,
-            self._reconnect_controller.forced_teardown_used,
-        )
-
-    def _half_up_yes_blocked(self, attempt: int, forced_used: bool) -> bool:
-        """True when Yes must not tear down.
-
-        The attempt counter and the allowance must still match the
-        pre-dialog snapshot, no reconnect handshake is in flight, and
-        the probe is still half-up (``IsConnected()==2``) or None.
-        Ready, 0, and 1 are a different session.
-        """
-        ctrl = self._reconnect_controller
-        if self._conn_monitor.attempt != attempt:
-            return True
-        if ctrl.forced_teardown_used != forced_used:
-            return True
-        if ctrl.handshake_open:
-            return True
-        is_connected = self._probe_reconnect_is_connected()
-        if is_connected not in (IS_CONNECTING, None):
-            return True
-        if not ctrl.is_half_up():
-            return True
-        return False
-
-    def _refuse_half_up_manual(self, is_connected, since) -> None:
-        """Headless has no dialog. One IsConnected read already happened.
-
-        A degraded calendar uses its own phrase. A healthy clock that
-        is still before open+90 keeps the original text.
-        """
-        self._raise_reconnect_alert(self._half_up_manual_p1(
-            headless_half_up_refusal_phrase(), is_connected, since))
-        self.btn_reconnect.config(state=tk.NORMAL)
-
-    def _decline_half_up_manual(self) -> None:
-        """The confirm dialog could not be shown. Never a teardown.
-
-        This is not an operator No — no dialog was shown — so the log
-        line is the TclError refusal, not ``operator declined``.
-        """
-        self._resume_reconnect_slot()
-        _log(HALF_UP_CONFIRM_UNAVAILABLE_LOG)
-        self.btn_reconnect.config(state=tk.NORMAL)
-
-    def _confirm_half_up_manual(self, trigger) -> bool:
-        """Ask, then True only when Yes is still the same handshake.
-
-        False means the caller must not touch the broker. The shared
-        timer slot is cancelled before ``askyesno`` and re-armed after
-        it returns, including No and TclError.
-        """
-        is_connected, since, attempt, forced_used = trigger
-        if getattr(self, "_headless_reconnect", False):
-            self._refuse_half_up_manual(is_connected, since)
-            return False
-        self._suspend_reconnect_slot()
-        try:
-            confirmed = self._ask_half_up_teardown()
-        except tk.TclError:
-            self._decline_half_up_manual()
-            self._raise_reconnect_alert(self._half_up_manual_p1(
-                headless_half_up_refusal_phrase(), is_connected, since))
-            return False
-        self._resume_reconnect_slot()
-        if not confirmed:
-            _log(OPERATOR_DECLINED_HALF_UP_LOG)
-            self.btn_reconnect.config(state=tk.NORMAL)
-            return False
-        if self._half_up_yes_blocked(attempt, forced_used):
-            _log(HALF_UP_YES_STALE_LOG)
-            self.btn_reconnect.config(state=tk.NORMAL)
-            return False
-        fresh = self._probe_reconnect_is_connected()
-        fresh_since = self._reconnect_seconds_since_open()
-        self._raise_reconnect_alert(self._half_up_manual_p1(
-            OPERATOR_FORCED_HALF_UP_P1, fresh, fresh_since))
-        return True
-
     def _manual_reconnect(self):
-        """Manual reconnect triggered by user button click."""
-        # Before open+90 a half-up session, including a failed IsConnected
-        # probe, asks first. No and TclError never fall through to the
-        # teardown below, whatever the clock or the probe did meanwhile.
-        # Yes does, only when that same handshake is still half-up or None.
-        trigger = self._half_up_manual_snapshot()
-        if trigger is not None and not self._confirm_half_up_manual(trigger):
-            return
-        # Cancel reconnect, Ready-wait, and skip-poll callbacks together.
-        self._cancel_reconnect_timer()
+        """Manual Reconnect button. Calls the machine, then one tick.
+
+        While the machine is not DEGRADED, ``manual_reconnect`` is the
+        no-op the machine already defines (no second teardown). There is
+        no LeaveMonitor and no LoginSetQuote on this path.
+        """
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
         self._cancel_quote_ready_timer("manual_reconnect")
 
-        self._set_quote_connected(False, "_manual_reconnect")
         self.btn_reconnect.config(state=tk.DISABLED)
-        # The button tears down, including a half-up session whose one
-        # automatic forced teardown was already used. Before open+90 that
-        # only happens after the operator confirms.
-        self._reconnect_controller.on_operator_reconnect()
         action = self._conn_monitor.on_manual_reconnect()
         self.set_status(action.message, "warn")
         self._set_conn_dot("warn")
         self.login_status_var.set("重連中 Reconnecting...")
-        _log("手動重連 Manual reconnect triggered")
+        _log("手動重連 Manual reconnect — link machine")
         _log_debug(
             "[STATE] ConnectionMonitor: is_active=True, attempt=0 "
             "(caller=_manual_reconnect)")
-
-        self._attempt_reconnect(manual=True)
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            _log("手動重連 Manual reconnect: link machine not adopted yet")
+            self.btn_reconnect.config(state=tk.NORMAL)
+            return
+        try:
+            alerts = host.manual_reconnect(_taipei_now())
+        except Exception as e:
+            _log(f"[RECONNECT] manual reconnect raised: [{type(e).__name__}] {e}")
+            alerts = []
+        self._apply_link_gate()
+        for alert in alerts:
+            self._on_link_alert(alert)
+        self._publish_link_heartbeat()
+        self.btn_reconnect.config(state=tk.NORMAL)
 
     def _schedule_reconnect(self):
-        """Schedule the next reconnection attempt via ConnectionMonitor.
-
-        The session flag and the seconds-until-open both come from the
-        holiday-aware helpers. A weekday TAIFEX holiday is closed even
-        though the weekend-only market clock says it is open.
-        """
+        """Schedule the next reconnection attempt via ConnectionMonitor."""
         action = self._conn_monitor.schedule_next(
             has_live_runner=bool(self._live_runner),
-            market_open=in_live_session(),
-            secs_until_open=seconds_until_next_session_open(),
+            market_open=is_market_open(),
+            secs_until_open=seconds_until_market_open(),
         )
-        self._emit_session_clock_warnings()
         self._execute_reconnect_action(action)
-
-    def _reconnect_seconds_since_open(self) -> int:
-        """Holiday-aware seconds since open, then any queued clock WARN."""
-        since = seconds_since_session_open()
-        self._emit_session_clock_warnings()
-        return since
-
-    def _emit_session_clock_warnings(self) -> None:
-        """Send a lookup-failure or clock-disagreement WARN to log and Discord."""
-        for message in pop_session_clock_warnings():
-            self._raise_reconnect_alert(message)
-
-    def _emit_calendar_degraded_p1(self) -> None:
-        """One P1 when a degraded calendar withheld the forced teardown."""
-        message = pop_calendar_degraded_p1()
-        if message:
-            self._raise_reconnect_alert(message)
 
     def _execute_reconnect_action(self, action):
         """Thin dispatcher: execute a ReconnectAction from ConnectionMonitor."""
@@ -1612,260 +1763,253 @@ class BacktestApp:
                 self.btn_reconnect.config(state=tk.NORMAL)
             if self._live_runner:
                 self._live_log_msg(action.message, "status")
-            self._arm_reconnect_callback(
-                "reconnect", action.delay_seconds * 1000, self._attempt_reconnect)
+            self._reconnect_timer_id = self.root.after(
+                action.delay_seconds * 1000, self._attempt_reconnect)
             return
 
-    def _arm_reconnect_callback(self, kind: str, delay_ms: int, callback) -> None:
-        """Arm the one reconnect/ready/skip slot, cancelling whatever it held."""
-        self._reconnect_timer_id = self._reconnect_schedule.arm(
-            kind,
-            delay_ms,
-            callback,
-            after=self.root.after,
-            after_cancel=self.root.after_cancel,
+    def _attempt_reconnect(self):
+        """One link-machine tick, scheduled by ConnectionMonitor for UI backoff.
+
+        The steady pump is ``_drain_ui_queue``. This method does not call
+        the broker. Process-start login stays in ``_do_login``.
+        """
+        self._reconnect_timer_id = None
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            _log_debug(
+                "[RECONNECT] tick skipped — link machine not adopted "
+                "(process-start login has not completed)")
+            return
+        _log_debug("[RECONNECT] link machine tick")
+        self._link_host_tick(force=True)
+
+    def _sk_libs(self):
+        return skC, skQ, skR, skO
+
+    def _link_credentials(self) -> tuple[str, str]:
+        return (
+            self.login_user_var.get().strip(),
+            self.login_pass_var.get().strip(),
         )
 
-    def _cancel_reconnect_timer(self) -> None:
-        """Cancel reconnect, Ready-wait, and skip-poll callbacks."""
-        self._reconnect_schedule.cancel_all(self.root.after_cancel)
-        self._reconnect_timer_id = None
+    def _adopt_link_machine(self) -> None:
+        """One machine per process, after a successful ``_do_login``.
 
-    def _raise_reconnect_alert(self, message: str) -> None:
-        """Operator-visible reconnect alert: the log pane and Discord.
-
-        ``_log_debug`` alone does not reach the operator. ``_discord.notify``
-        is the same path settlement-day and other live alerts use.
+        See ``adopt_after_process_login``. A second call is a no-op.
+        Flags that arrived before the machine existed are applied now.
         """
-        _log(message)
+        if getattr(self, "_link_host", None) is not None:
+            return
+        user_id = self.login_user_var.get().strip()
+        self._link_host = adopt_after_process_login(
+            ComBrokerPort(
+                call=call_com,
+                libs=self._sk_libs,
+                credentials=self._link_credentials,
+                on_subscribe=self._on_reconnected,
+                on_reconcile=self._on_machine_reconcile,
+                on_release=self._on_machine_release_orders,
+                before_call=_log_reconnect_call,
+            ),
+            now=_taipei_now(),
+            user_id=user_id,
+        )
+        _log_debug(
+            "[RECONNECT] link machine adopted after process-start login "
+            "(one per app process; start() not called)")
+        pending = list(getattr(self, "_link_flags_pending", []) or [])
+        self._link_flags_pending = []
+        for item in pending:
+            self._dispatch_link_flag(item)
+
+    def _apply_link_flag(self, data) -> None:
+        """Main thread. Queues a machine flag. No broker call."""
+        if getattr(self, "_link_host", None) is None:
+            self._link_flags_pending.append(data)
+            return
+        self._dispatch_link_flag(data)
+
+    def _dispatch_link_flag(self, data) -> None:
+        host = self._link_host
+        if host is None:
+            return
+        now = _taipei_now()
+        name = data[0] if data else ""
+        if name == "connection":
+            _name, kind, code = data
+            host.note_connection(int(kind), int(code), now)
+        elif name == "reply_disconnect":
+            host.note_reply_disconnect(now)
+        elif name == "complete":
+            host.note_complete(now)
+
+    def _link_host_tick(self, *, force: bool = False) -> None:
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        now = _taipei_now()
+        try:
+            alerts = host.tick(now) if force else host.maybe_tick(now)
+        except Exception as e:
+            _log(f"[RECONNECT] link machine tick raised: "
+                 f"[{type(e).__name__}] {e}")
+            return
+        self._apply_link_gate()
+        for alert in alerts:
+            self._on_link_alert(alert)
+        if alerts or force:
+            self._publish_link_heartbeat()
+        self._maybe_quote_stuck_resubscribe()
+
+    def _maybe_quote_stuck_resubscribe(self) -> None:
+        """One recovery attempt per open session while quote-stuck.
+
+        The decision fires once. ``_resubscribe_ticks`` may still retry
+        RequestTicks when the return code is >= 3000. LeaveMonitor,
+        EnterMonitor, login, and logout are not called.
+        The link machine stays DEGRADED until a live tick or a manual
+        Reconnect. A closed session, including a holiday or a closures
+        file date, does not consume the session key.
+        """
+        host = getattr(self, "_link_host", None)
+        recovery = getattr(self, "_quote_stuck", None)
+        if host is None or recovery is None:
+            return
+        machine = host.machine
+        decision = recovery.consider(
+            degraded=machine.degraded,
+            reason=machine.degraded_reason,
+            quote_state=machine.last_quote_is_connected,
+            now=_taipei_now(),
+        )
+        if decision != "resubscribe":
+            return
+        _log(
+            f"[QUOTE-STUCK] one resubscribe for {recovery.attempted_key} "
+            f"(IsConnected={machine.last_quote_is_connected}); no reconnect"
+        )
+        if not getattr(self, "_live_runner", None):
+            _log("[QUOTE-STUCK] resubscribe not sent — no live runner; "
+                 "staying DEGRADED")
+            return
+        self._resubscribe_ticks()
+        _log("[QUOTE-STUCK] RequestTicks sent; waiting for ticks")
+
+    def _clear_quote_stuck_if_ticks_resumed(self) -> None:
+        """A live tick after the one-shot. Clears stuck DEGRADED only."""
+        recovery = getattr(self, "_quote_stuck", None)
+        if recovery is None or not recovery.on_live_tick():
+            return
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            _log("[QUOTE-STUCK] ticks resumed; link machine absent; "
+                 "staying DEGRADED")
+            return
+        alert = host.machine.clear_stuck_after_ticks()
+        if not alert:
+            _log("[QUOTE-STUCK] ticks resumed; DEGRADED already clear")
+            return
+        _log(f"[RECONNECT] {alert}")
+        self._apply_link_gate()
+        self._publish_link_heartbeat()
+
+    def _apply_link_gate(self) -> None:
+        host = getattr(self, "_link_host", None)
+        guard = getattr(self, "_trading_guard", None)
+        if host is None or guard is None:
+            return
+        allowed = host.entries_allowed()
+        guard.link_entries_blocked = not allowed
+        if allowed:
+            if getattr(self, "_link_gate_latched", False):
+                self._link_gate_latched = False
+                self.set_status("已連線 Connected — entries open", "ok")
+                self._set_conn_dot("ok")
+            return
+        if host.machine.degraded:
+            return
+        if not getattr(self, "_link_gate_latched", False):
+            self._link_gate_latched = True
+            self.set_status(
+                "進場暫停 Entries blocked until reply reconcile", "warn")
+            self._set_conn_dot("warn")
+
+    def _on_link_alert(self, alert: str) -> None:
+        _log(f"[RECONNECT] {alert}")
+        level = "error" if str(alert).startswith("DEGRADED") else "warn"
+        self.set_status(alert, level)
+        if str(alert).startswith("DEGRADED"):
+            self._set_conn_dot("err")
+            if hasattr(self, "login_status_var"):
+                self.login_status_var.set("降級 DEGRADED — 手動重連")
+            if hasattr(self, "btn_reconnect"):
+                self.btn_reconnect.config(state=tk.NORMAL)
+            timer = getattr(self, "_reconnect_timer_id", None)
+            if timer is not None:
+                try:
+                    self.root.after_cancel(timer)
+                except Exception:
+                    pass
+                self._reconnect_timer_id = None
         if _discord is not None and _discord.enabled:
             try:
-                _discord.notify(message)
+                _discord.notify(f"⚠️ {alert}")
             except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] Discord alert failed: "
-                    f"[{type(e).__name__}] {e}")
+                _log(f"[RECONNECT] discord alert failed: [{type(e).__name__}] {e}")
 
-    def _defer_half_up_teardown(self, decision, attempt_n: int) -> None:
-        """Skip LeaveMonitor, or stop the loop after the forced teardown."""
-        self._emit_calendar_degraded_p1()
-        _log(
-            "重連暫緩 Reconnect deferred — session still connecting, "
-            "not calling LeaveMonitor")
-        _log_debug(
-            f"[RECONNECT] Attempt #{attempt_n} skipping LeaveMonitor "
-            f"+ LogOut — {decision.reason}")
-        if self._reconnect_controller.record_skip_poll():
-            self._raise_reconnect_alert(ESCALATION_LOG)
-            self.btn_reconnect.config(state=tk.NORMAL)
-            return
-        self._arm_reconnect_callback(
-            "skip", decision.wait_seconds * 1000, self._check_reconnection)
+    def _on_machine_reconcile(self) -> None:
+        """Refresh open interest. The machine clears the gate in this tick.
 
-    def _attempt_reconnect(self, manual: bool = False):
-        """Try to re-login and reconnect to quote service.
-
-        Bug B: a teardown-and-login attempt calls
-        ``SKQuoteLib_LeaveMonitor()`` first (best-effort) so we start
-        from a clean COM state. ``SKCenterLib_LogOut`` is not in Capital
-        API 2.13.57 and is called only when the COM object actually has it.
-
-        Issue #157: LeaveMonitor on a half-up session (no Ready, 
-        ``IsConnected()==2``) faults or hangs. The controller skips it
-        until open+90s, then allows one forced teardown per disconnect.
-        The skip returns before the Bug B call below.
+        The OnOpenInterest callback is async. The entry gate follows the
+        machine (OnComplete + this call), not that later callback.
         """
-        # This callback is the armed timer, already popped by Tk.
-        self._reconnect_schedule.note_fired()
-        self._reconnect_timer_id = None
-        attempt_n = self._conn_monitor.attempt + 1  # number we'll attempt now
-        if self._quote_connected:
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} aborted — _quote_connected "
-                "is already True (likely reconnected via another path)")
-            return  # already reconnected (e.g. by manual login)
-
-        _log(f"嘗試重連 Attempting reconnect #{self._conn_monitor.attempt}")
-
-        try:
-            if not _com_available:
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} aborted — _com_available=False")
-                self._schedule_reconnect()
-                return
-
-            # Re-login
-            user_id = self.login_user_var.get().strip()
-            password = self.login_pass_var.get().strip()
-            if not user_id or not password:
-                _log("重連失敗 Reconnect failed: no credentials")
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} aborted — no credentials")
-                self._schedule_reconnect()
-                return
-
-            # ── Issue #157: guard LeaveMonitor on a half-up pre-session ──
-            # Probe before any teardown. A probe failure is passed as None
-            # so the controller can refuse a blind LeaveMonitor.
-            is_connected = None
-            try:
-                _log_reconnect_call("IsConnected")
-                is_connected = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
-            except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] IsConnected() probe raised (treated as unknown): "
-                    f"[{type(e).__name__}] {e}")
-            since_open = self._reconnect_seconds_since_open()
-            decision = self._reconnect_controller.decide(
-                is_connected,
-                seconds_since_open=since_open,
-                manual=manual,
-            )
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} guard={decision.action} "
-                f"IsConnected()={is_connected} manual={manual} — {decision.reason}")
-            if decision.action == ACTION_ALREADY_CONNECTED:
-                self._check_reconnection()
-                return
-            if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
-                self._defer_half_up_teardown(decision, attempt_n)
-                return
-
-            if decision.forced_teardown:
-                self._reconnect_controller.note_forced_teardown()
-                self._raise_reconnect_alert(FORCED_TEARDOWN_LOG)
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} starting — calling LeaveMonitor "
-                "(cleanup) before fresh LoginSetQuote")
-            self._reconnect_controller.on_attempt_started()
-
-            # ── Bug B: best-effort COM teardown before fresh login ──
-            # LeaveMonitor swallows errors — the prior session may already
-            # be half-torn-down. LogOut is not in Capital API 2.13.57; an
-            # unguarded call always raises AttributeError and never runs.
-            _log_reconnect_call("LeaveMonitor")
-            try:
-                leave_code = call_com("LeaveMonitor", skQ.SKQuoteLib_LeaveMonitor)
-                _log_debug(
-                    f"[RECONNECT] LeaveMonitor returned {leave_code}")
-            except Exception as e:
-                _log_debug(
-                    f"[RECONNECT] LeaveMonitor raised (ignored): "
-                    f"[{type(e).__name__}] {e}")
-            if hasattr(skC, "SKCenterLib_LogOut"):
-                _log_reconnect_call("LogOut")
-                try:
-                    logout_code = call_com("LogOut", skC.SKCenterLib_LogOut, user_id)
-                    _log_debug(
-                        f"[RECONNECT] LogOut returned {logout_code}")
-                except Exception as e:
-                    _log_debug(
-                        f"[RECONNECT] LogOut raised (ignored): "
-                        f"[{type(e).__name__}] {e}")
-            else:
-                _log_debug(
-                    "[RECONNECT] LogOut skipped — SKCenterLib_LogOut "
-                    "is not in this Capital API")
-            self._logged_in = False
-            _log_debug(
-                f"[RECONNECT] Cleanup done — calling LoginSetQuote")
-
-            _log_reconnect_call("LoginSetQuote")
-            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
-                            user_id, password, "Y")
-            _log_debug(f"[RECONNECT] LoginSetQuote returned {code}")
-            if code != 0 and code < 2000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
-                _log(f"重連登入失敗 Reconnect login failed: {msg}")
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} FAILED at LoginSetQuote — "
-                    f"code={code} msg={msg}")
-                self._reconnect_controller.on_attempt_failed()
-                self._schedule_reconnect()
-                return
-
-            self._logged_in = True
-            _log_reconnect_call("ConnectByID")
-            reply_code = call_com("ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
-            _log_reconnect_call("EnterMonitorLONG")
-            enter_code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
-            _log_debug(
-                f"[RECONNECT] ConnectByID returned {reply_code}, "
-                f"EnterMonitorLONG returned {enter_code}")
-            wait_s = self._reconnect_controller.ready_wait_seconds()
-            self._reconnect_ready_wait_s = wait_s
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} waiting {wait_s}s for Ready (3003) "
-                f"(seconds_since_open={since_open})")
-
-            # Poll for connection (OnConnection callback will set _quote_connected).
-            # Same slot as the reconnect and skip timers.
-            self._arm_reconnect_callback("ready", wait_s * 1000, self._check_reconnection)
-
-        except Exception as e:
-            _log(f"重連異常 Reconnect error: {e}")
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} raised: "
-                f"[{type(e).__name__}] {e}")
-            self._reconnect_controller.on_attempt_failed()
-            self._schedule_reconnect()
-
-    def _check_reconnection(self):
-        """Poll IsConnected after reconnect login attempt."""
-        attempt_n = self._conn_monitor.attempt
-        self._reconnect_schedule.note_fired()
-        self._reconnect_timer_id = None
-        if self._quote_connected:
-            self._reconnect_controller.on_ready()
-            _log_debug(
-                f"[RECONNECT] Attempt #{attempt_n} SUCCESS — Ready received "
-                "(handled by _on_reconnected via _drain_ui_queue)")
-            return  # success, handled by _on_reconnected via _drain_ui_queue
-        waited = self._reconnect_ready_wait_s
-        ic = None
-        try:
-            _log_reconnect_call("IsConnected")
-            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
-            _log_debug(
-                f"[RECONNECT] IsConnected()={ic} after {waited}s poll "
-                f"(attempt #{attempt_n})")
-            if ic == 1:
-                self._set_quote_connected(True, "_check_reconnection(IsConnected==1)")
-                self.btn_api.config(state=tk.NORMAL)
-                self.btn_deploy.config(state=tk.NORMAL)
-                self.btn_login.config(state=tk.DISABLED)
-                self.btn_reconnect.config(state=tk.NORMAL)
-                self.set_status("已連線 Connected - Ready", "ok")
-                self._set_conn_dot("ok")
-                self.login_status_var.set("已連線 Connected")
-                _log_debug(
-                    f"[RECONNECT] Attempt #{attempt_n} SUCCESS — "
-                    "IsConnected==1, fallback path")
-                self._on_reconnected()
-                return
-        except Exception as e:
-            _log_debug(
-                f"[RECONNECT] IsConnected() raised (ignored): "
-                f"[{type(e).__name__}] {e}")
-            ic = None
-        # Issue #157: a half-up pre-session session must be polled, not
-        # torn down. on_attempt_failed latches "missed Ready" first so the
-        # guard stays armed across polls.
-        self._reconnect_controller.on_attempt_failed()
-        decision = self._reconnect_controller.decide(
-            ic, seconds_since_open=self._reconnect_seconds_since_open())
-        if decision.action == ACTION_SKIP_TEARDOWN_WAIT:
-            self._defer_half_up_teardown(decision, attempt_n)
+        if not _com_available or skO is None:
             return
-        # Not connected yet — schedule next reconnect attempt
-        _log_debug(
-            f"[RECONNECT] Attempt #{attempt_n} FAILED — timed out waiting "
-            f"for Ready after {waited}s, scheduling next attempt")
-        self._schedule_reconnect()
+        user_id = self.login_user_var.get().strip()
+        account = getattr(self, "_futures_account", "") or ""
+        if not user_id or not account:
+            _log_debug("[RECONNECT] reconcile skipped — no futures account yet")
+            return
+        try:
+            # A new query, same as the account refresh. The generation
+            # moves forward so this reply cannot complete a later deploy.
+            self._account_monitor.begin_oi_query()
+            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                     user_id, account, 1)
+        except Exception as e:
+            _log(f"[RECONNECT] reconcile raised: [{type(e).__name__}] {e}")
+
+    def _on_machine_release_orders(self) -> None:
+        _log_debug("[RECONNECT] orders released after OnComplete reconcile")
+
+    def _publish_link_heartbeat(self) -> None:
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        from src.live.main_heartbeat import set_link_state
+        try:
+            set_link_state(host.snapshot())
+        except Exception as e:
+            _log_debug(
+                f"[RECONNECT] link heartbeat skipped: [{type(e).__name__}] {e}")
+
+    def _shutdown_link(self) -> None:
+        """User shutdown. The only LeaveMonitor the live host asks for."""
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        try:
+            host.shutdown(_taipei_now())
+        except Exception as e:
+            _log(f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
+        self._link_host = None
 
     def _on_reconnected(self):
-        """Handle successful reconnection: re-subscribe ticks if live bot is running."""
-        self._reconnect_controller.on_ready()
+        """Resubscribe after the machine has seen quote READY (3003).
+
+        Called from ``ComBrokerPort.subscribe_quotes`` only. The 3003 UI
+        branch updates buttons and does not subscribe by itself.
+        """
         self._conn_monitor.on_connected()
         _log_debug(
             "[STATE] ConnectionMonitor: is_active=False, attempt=0 "
@@ -1873,7 +2017,9 @@ class BacktestApp:
         # A successful Ready resets the Bug C warn ladder — any earlier
         # transient IsConnected!=1 reads are irrelevant once we're back up.
         self._warn_disconnect_count = 0
-        self._cancel_reconnect_timer()
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
 
         if self._live_runner and self._live_runner.state == LiveState.RUNNING:
             self._live_log_msg("已重連 Reconnected — resubscribing ticks", "status")
@@ -2016,12 +2162,11 @@ class BacktestApp:
         self._trading_guard = TradingGuard()  # safety checks for real orders
         # Reconnection state
         self._conn_monitor = ConnectionMonitor()
-        # Issue #157: gates LeaveMonitor while a pre-session handshake is
-        # still connecting (IsConnected()==2, Ready never arrived).
-        self._reconnect_controller = ReconnectController()
-        self._reconnect_schedule = ReconnectSchedule()
         self._reconnect_timer_id = None
-        self._reconnect_ready_wait_s: int = ReconnectController.READY_WAIT_S
+        # One link machine per app process. None until _do_login succeeds.
+        self._link_host = None
+        self._link_flags_pending: list = []
+        self._link_gate_latched = False
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
         self._quote_ready_timer_id = None
         self._quote_intermediate_seen_at: float = 0.0
@@ -2034,6 +2179,10 @@ class BacktestApp:
         self._ticks_requested_at: float = 0.0
         self._first_tick_after_request_logged: bool = False
         self._tick_watchdog = TickWatchdog()  # tick health monitoring
+        # One recovery attempt per session while quote-stuck DEGRADED.
+        # _resubscribe_ticks may retry a >=3000 code on its own.
+        # The key lives here for the process; a restart may try again.
+        self._quote_stuck = QuoteStuckRecovery()
         self._live_poll_id = None  # root.after() id for cancellation
         self._last_status_poll_wall: float = 0.0  # freeze/wake detection (issue #98)
         self._live_warmup_mode: bool = False
@@ -2075,6 +2224,7 @@ class BacktestApp:
         # Backoff retry state for exit fill price polling (issue #92).
         self._exit_fill_retry_timer: int | None = None
         self._exit_fill_retry_ctx: dict | None = None
+        self._exit_fill_stopped: bool = False
         self._live_history_done: bool = False
         self._live_tick_count: int = 0
         self._live_history_tick_count: int = 0
@@ -3412,8 +3562,9 @@ class BacktestApp:
             pass
 
     def _on_closing(self):
-        """Handle window close: auto-save chat, then destroy."""
+        """Handle window close: auto-save chat, drop the quote link, destroy."""
         self._auto_save_chat()
+        self._shutdown_link()
         self.root.destroy()
 
     # ══════════════════════════════════════════════════════════════
@@ -3724,6 +3875,7 @@ class BacktestApp:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
 
             self.set_status("連線中 Connecting...")
+            self._adopt_link_machine()
             self.root.after(3000, self._check_connection)
 
         except Exception as e:
@@ -5392,203 +5544,411 @@ class BacktestApp:
         not a free-form trade analysis. On-demand counterpart to the
         weekly automatic fitness check.
         """
-        payload = self._gather_analysis_payload()
-        if payload is None:
-            msg = ("🧬 EVO: 無交易紀錄，演化引擎無資料可分析。"
-                   "No trades recorded — evolution has no data to analyze.")
-            self.set_status("無交易紀錄 No trades for evolution")
-            if auto_run:
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
+        key = _evolution_run_key(self)
+        if not _evolution_try_begin(key):
+            _refuse_overlapping_evolution(self, auto_run=auto_run)
             return
-        if not self._ensure_chat_client():
-            return
-        result, report, timeframe_line, source_section, trade_lines = payload
+        handed = False
+        try:
+            payload = self._gather_analysis_payload()
+            if payload is None:
+                msg = ("🧬 EVO: 無交易紀錄，演化引擎無資料可分析。"
+                       "No trades recorded — evolution has no data to analyze.")
+                self.set_status("無交易紀錄 No trades for evolution")
+                if auto_run:
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                try:
+                    _persist_evolution_history(
+                        _evolution_bot_dir(self),
+                        bot=self.strategy_var.get(),
+                        class_name=_evolution_class_name(self),
+                        final_status="skip",
+                        reason_kind="no_trades",
+                        reason=msg,
+                        ai_calls=0,
+                        thresholds_raw=self._settings.get("evolution_gate_raw"),
+                    )
+                except Exception:
+                    pass
+                return
+            if not self._ensure_chat_client():
+                try:
+                    _persist_evolution_history(
+                        _evolution_bot_dir(self),
+                        bot=self.strategy_var.get(),
+                        class_name=_evolution_class_name(self),
+                        final_status="skip",
+                        reason_kind="no_chat_client",
+                        reason="chat client unavailable",
+                        ai_calls=0,
+                        thresholds_raw=self._settings.get("evolution_gate_raw"),
+                    )
+                except Exception:
+                    pass
+                return
+            result, report, timeframe_line, source_section, trade_lines = payload
 
-        # Exclude trades a previous evolution run already analyzed —
-        # re-sending them invites re-justifying changes from the same
-        # sample. Aggregate metrics + fitness still cover the full
-        # history; only the per-trade list is windowed.
-        watermark = None
-        live = (self._live_runner is not None
-                and self._live_runner.state != LiveState.IDLE)
-        bot_dir = getattr(self._live_runner, "bot_dir", None) if live else None
-        if bot_dir:
-            from src.evolution.notify import load_watermark
-            watermark = load_watermark(bot_dir)
-        omitted = _evolution_omitted_count(len(trade_lines), watermark)
+            # Exclude trades a previous evolution run already analyzed —
+            # re-sending them invites re-justifying changes from the same
+            # sample. Aggregate metrics + fitness still cover the full
+            # history; only the per-trade list is windowed.
+            watermark = None
+            live = (self._live_runner is not None
+                    and self._live_runner.state != LiveState.IDLE)
+            bot_dir = getattr(self._live_runner, "bot_dir", None) if live else None
+            if bot_dir:
+                from src.evolution.notify import load_watermark
+                watermark = load_watermark(bot_dir)
+            omitted = _evolution_omitted_count(len(trade_lines), watermark)
 
-        # Design/holdout split (walk-forward discipline): the most recent
-        # holdout_days of evidence are WITHHELD from the AI — the plan is
-        # designed on the older train window only and validated by
-        # backtesting the unseen holdout. The cut rolls forward each
-        # cycle, so this week's holdout becomes next week's design data.
-        from src.evolution.pipeline import (
-            compute_design_cut, design_cutoff_index, plan_sample_rule,
-            plan_directives_block)
-        knob_note = ""
-        if auto_run:
-            from src.evolution.knobs import (
-                knob_grid_for, saturday_knob_directives)
+            # Design/holdout split (walk-forward discipline): the most recent
+            # holdout_days of evidence are WITHHELD from the AI — the plan is
+            # designed on the older train window only and validated by
+            # backtesting the unseen holdout. The cut rolls forward each
+            # cycle, so this week's holdout becomes next week's design data.
+            from src.evolution.pipeline import (
+                compute_design_cut, design_cutoff_index, plan_sample_rule,
+                plan_directives_block)
+            knob_note = ""
+            _evo_cls = None
+            _evo_source = ""
+            # Class and source are resolved for both the Saturday run and the
+            # manual button. The grid (P2) selects knob settings on either
+            # path when the class is eligible. The weekly exclusion settle
+            # stays Saturday-only.
             if live and getattr(self._live_runner, "strategy", None) is not None:
-                _evo_cls_name = type(self._live_runner.strategy).__name__
+                _evo_cls = type(self._live_runner.strategy)
             else:
-                _evo_obj = STRATEGIES.get(self.strategy_var.get())
-                _evo_cls_name = _evo_obj.__name__ if _evo_obj else ""
-            if knob_grid_for(_evo_cls_name):
-                knob_note = saturday_knob_directives()
-        holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
-        cut = compute_design_cut(result.trades, holdout_days)
-        # Scan from 0, NOT from the watermark: a watermark saved past the
-        # cut (e.g. by a pre-holdout build) would otherwise yield
-        # cut_idx == len(trades) and silently destroy the holdout on the
-        # full-re-run path (observed: "Holdout (0 trades)" while trade
-        # #65 sat in the AI payload).
-        cut_idx = (design_cutoff_index(result.trades, 0, cut)
-                   if cut else len(result.trades))
-        holdout_count = len(result.trades) - cut_idx
-
-        if watermark and cut_idx <= omitted:
-            # No NEW design-window trades since the last run — the recent
-            # trades are all inside the holdout and become design
-            # evidence next cycle as the cut rolls forward.
+                _evo_cls = STRATEGIES.get(self.strategy_var.get())
+            if _evo_cls is not None:
+                _evo_source = self._resolve_strategy_source(
+                    self.strategy_var.get(), _evo_cls)
             if auto_run:
-                msg = (f"🧬 EVO (weekly auto): 訓練窗無新交易（最近 "
-                       f"{holdout_days} 天為保留測試集），跳過。"
-                       f"No new design-window trades since last evolution "
-                       f"({watermark['at']}) — recent trades are in the "
-                       f"holdout; skipped.")
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
+                from src.evolution.knobs import saturday_knob_directives_if_eligible
+                # D1: the block lists only the knobs this class can rewrite.
+                # Fewer than 2 rewritable grid knobs → no MANDATORY block,
+                # and the settle below excludes the class before the AI call.
+                knob_note = saturday_knob_directives_if_eligible(
+                    _evo_cls, _evo_source)
+            holdout_days = int(self._settings.get("evolution_holdout_days", 14) or 14)
+            cut = compute_design_cut(result.trades, holdout_days)
+            # Scan from 0, NOT from the watermark: a watermark saved past the
+            # cut (e.g. by a pre-holdout build) would otherwise yield
+            # cut_idx == len(trades) and silently destroy the holdout on the
+            # full-re-run path (observed: "Holdout (0 trades)" while trade
+            # #65 sat in the AI payload).
+            cut_idx = (design_cutoff_index(result.trades, 0, cut)
+                       if cut else len(result.trades))
+            holdout_count = len(result.trades) - cut_idx
+
+            def _remember(final_status, reason_kind, reason="", **extra):
+                # History is written after the chat/Discord lines above the
+                # call, and this function never raises, so a disk error cannot
+                # change those messages or skip the return.
+                try:
+                    fields = dict(
+                        bot=self.strategy_var.get(),
+                        class_name=_evolution_class_name(self, _evo_cls),
+                        source=_evo_source or "",
+                        cut_idx=cut_idx,
+                        watermark=watermark,
+                        thresholds_raw=self._settings.get("evolution_gate_raw"),
+                        final_status=final_status,
+                        reason_kind=reason_kind,
+                        reason=reason,
+                        ai_calls=0,
+                    )
+                    fields.update(extra)
+                    _persist_evolution_history(bot_dir, **fields)
+                except Exception as exc:
                     try:
-                        _discord.notify_evolution(msg)
+                        _log("evolution history append failed: "
+                             f"[{type(exc).__name__}] {exc}")
                     except Exception:
                         pass
+
+            # D1: per-class knob grid. A class with fewer than 2 rewritable
+            # grid knobs (or that cannot be read) is excluded from weekly
+            # codegen. Every Saturday emits one exclusion line. The same
+            # class + source + grid key does not re-record or move the
+            # watermark; a new source hash or grid hash is re-evaluated.
+            # knob_ineligible_fallback never selects weekly codegen.
+            # Eligible classes are untouched. structural_only is the
+            # ineligible class that the enabled monthly lane admitted;
+            # it must not fall through into weekly codegen, and it must
+            # not append the knob-ineligible skip — that attempt
+            # continues as the structural run and writes one history line.
+            structural_only = False
+            if auto_run and _evo_cls is not None:
+                from src.evolution.knobs import (
+                    normalize_knob_ineligible_fallback, settle_knob_ineligibility)
+                _knob_fallback = normalize_knob_ineligible_fallback(
+                    self._settings.get("evolution_knob_ineligible_fallback"))
+                _knob_settle, _knob_reason = settle_knob_ineligibility(
+                    bot_dir, _evo_cls, _evo_source, cut_idx,
+                    fallback=_knob_fallback)
+                if _knob_settle in ("skip", "recorded"):
+                    msg = _knob_reason
+                    _log(msg)
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                    from src.evolution.structural_lane import (
+                        ineligible_structural_divert, lane_config_from_settings)
+                    if lane_config_from_settings(self._settings).get("enabled"):
+                        structural_only = ineligible_structural_divert(
+                            self._settings,
+                            fallback=_knob_fallback,
+                            bot_id=BacktestApp._structural_bot_id(self),
+                            month=_taipei_now().strftime("%Y-%m"),
+                            ledger_path=BacktestApp._structural_ledger_path(self),
+                        )
+                    if not structural_only:
+                        _remember("skip", reason_kind="knob_ineligible", reason=msg)
+                        return
+
+            if watermark and cut_idx <= omitted:
+                # No NEW design-window trades since the last run — the recent
+                # trades are all inside the holdout and become design
+                # evidence next cycle as the cut rolls forward.
+                # D5: a long gap since the last exit is a different skip from
+                # "trades are still aging through the holdout". Append the
+                # idle line only at/above evolution.idle_warn_days (default 7).
+                # 0 disables the line.
+                idle = _evolution_idle_notice(
+                    result.trades, _taipei_now(),
+                    _nonneg_int(
+                        self._settings.get("evolution_idle_warn_days", 7), 7))
+                idle_suffix = f"\n{idle}" if idle else ""
+                if auto_run:
+                    msg = (f"🧬 EVO (weekly auto): 訓練窗無新交易（最近 "
+                           f"{holdout_days} 天為保留測試集），跳過。"
+                           f"No new design-window trades since last evolution "
+                           f"({watermark['at']}) — recent trades are in the "
+                           f"holdout; skipped.{idle_suffix}")
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                    _remember("skip", reason_kind="watermark", reason=msg)
+                    return
+                # Manual click: allow an explicit full-design-history re-run
+                # (the holdout stays withheld either way).
+                if not messagebox.askyesno(
+                        "Bot Evolution",
+                        f"上次演化（{watermark['at']}）後訓練窗沒有新交易\n"
+                        f"（最近 {holdout_days} 天為保留測試集，不提供給 AI）。\n"
+                        f"No new design-window trades since the last evolution — "
+                        f"recent trades are inside the {holdout_days}d holdout.\n\n"
+                        f"仍要以完整訓練歷史重新執行嗎？\n"
+                        f"Re-run on the full design history anyway? "
+                        f"(holdout stays withheld){idle_suffix}"):
+                    _remember(
+                        "skip", reason_kind="watermark",
+                        reason=(
+                            f"No new design-window trades since last evolution "
+                            f"({watermark['at']}) — re-run declined.{idle_suffix}"))
+                    return
+                omitted = 0  # full design-history re-run; cut unchanged
+            sent_lines = trade_lines[omitted:cut_idx]
+            if not sent_lines:
+                msg = (f"🧬 EVO: 訓練窗沒有交易（資料太新，全部 "
+                       f"{len(trade_lines)} 筆交易都在最近 {holdout_days} 天"
+                       f"保留測試集內）。機器人需運行超過 {holdout_days} 天，"
+                       f"交易才會進入設計窗供 AI 分析。"
+                       f"No design-window trades yet — all {len(trade_lines)} "
+                       f"trades are inside the {holdout_days}d holdout. "
+                       f"The bot needs to run for >{holdout_days} days before "
+                       f"trades age into the design window for AI analysis.")
+                self.set_status(
+                    "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
+                    "yet — session younger than the holdout.")
+                if auto_run:
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                else:
+                    self._append_chat("system", msg)
+                _remember("skip", reason_kind="no_design_window", reason=msg)
                 return
-            # Manual click: allow an explicit full-design-history re-run
-            # (the holdout stays withheld either way).
-            if not messagebox.askyesno(
-                    "Bot Evolution",
-                    f"上次演化（{watermark['at']}）後訓練窗沒有新交易\n"
-                    f"（最近 {holdout_days} 天為保留測試集，不提供給 AI）。\n"
-                    f"No new design-window trades since the last evolution — "
-                    f"recent trades are inside the {holdout_days}d holdout.\n\n"
-                    f"仍要以完整訓練歷史重新執行嗎？\n"
-                    f"Re-run on the full design history anyway? "
-                    f"(holdout stays withheld)"):
-                return
-            omitted = 0  # full design-history re-run; cut unchanged
-        sent_lines = trade_lines[omitted:cut_idx]
-        if not sent_lines:
-            msg = (f"🧬 EVO: 訓練窗沒有交易（資料太新，全部 "
-                   f"{len(trade_lines)} 筆交易都在最近 {holdout_days} 天"
-                   f"保留測試集內）。機器人需運行超過 {holdout_days} 天，"
-                   f"交易才會進入設計窗供 AI 分析。"
-                   f"No design-window trades yet — all {len(trade_lines)} "
-                   f"trades are inside the {holdout_days}d holdout. "
-                   f"The bot needs to run for >{holdout_days} days before "
-                   f"trades age into the design window for AI analysis.")
-            self.set_status(
-                "🧬 EVO: 訓練窗沒有交易（資料太新）No design-window trades "
-                "yet — session younger than the holdout.")
-            if auto_run:
-                self._append_chat("system", msg)
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
+
+            # D4: Saturday / automatic runs do not spend a plan call on a
+            # design window below min_design_trades. Default 30
+            # (fitness.MIN_TRADES) applies to that path only. 0 disables
+            # the check. The manual Evolve button is exempt: it logs an
+            # override line and continues into the plan call. Fitness math
+            # is unchanged, and the automatic return does not advance the
+            # watermark.
+            from src.evolution.fitness import MIN_TRADES
+            min_design = _nonneg_int(
+                self._settings.get("evolution_min_design_trades", MIN_TRADES),
+                MIN_TRADES)
+            if min_design > 0 and cut_idx < min_design:
+                if not auto_run:
+                    self._append_chat(
+                        "system",
+                        "🧬 EVO: 手動演化不受設計窗樣本門檻限制，仍呼叫 AI 計畫。"
+                        f"below min_design_trades ({cut_idx}/{min_design}), "
+                        f"manual override")
+                else:
+                    msg = (
+                        f"🧬 EVO: 設計窗只有 {cut_idx} 筆交易，未達 "
+                        f"min_design_trades={min_design}，本次不呼叫 AI，水位線不變。\n"
+                        f"waiting for sample: {cut_idx}/{min_design}\n"
+                        f"Design window has {cut_idx} trades, below "
+                        f"min_design_trades={min_design}. No AI plan call; "
+                        f"watermark unchanged.")
+                    self.set_status(
+                        f"🧬 EVO: waiting for sample: {cut_idx}/{min_design}")
+                    self._append_chat("system", msg)
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+                    _remember("skip", reason_kind="min_design_trades", reason=msg)
+                    return
+
+            # Rebuild the metrics report from design-known trades only — the
+            # full-history report would leak holdout aggregates into design.
+            design_known = result.trades[:cut_idx]
+            d_eq, d_cum = [], 0
+            for t in design_known:
+                d_cum += t.pnl
+                d_eq.append(d_cum)
+            # Same capital base as the fitness composite — a 0 seed would
+            # reprint the zero-peak MaxDD% sentinel #119/#120 removed there.
+            report = format_report(
+                f"{result.strategy_name} — 設計窗 design window (holdout excluded)",
+                calculate_metrics(
+                    design_known, d_eq,
+                    initial_balance=self._evolution_capital_base()))
+
+            evolution_context = self._build_evolution_context(
+                result, watermark=watermark, omitted_count=omitted,
+                design_upto=cut_idx, holdout_count=holdout_count,
+                holdout_days=holdout_days)
+
+            preamble = (
+                f"🧬 Bot Evolution — 策略演化計畫\n"
+                f"以下是累積的交易數據與演化適應度評分，請產出一份具體的策略演化計畫。\n"
+                f"Below are accumulated trades and the evolution fitness score. "
+                f"Produce a concrete Evolution Plan.\n\n"
+                f"{evolution_context}"
+                f"## Required output structure (MUST FOLLOW)\n"
+                f"1. **表現總結 Performance summary** — 2-3 sentences covering the data "
+                f"period; if [real] trades exist, compare simulated vs real performance.\n"
+                f"2. **有效部分 What's working** — 2-3 aspects that must NOT be changed.\n"
+                f"3. **問題診斷 Diagnosis** — the single biggest weakness, with evidence "
+                f"from specific trades (cite trade numbers from the list).\n"
+                f"4. **演化計畫 Evolution plan** — EXACTLY ONE concrete change: one "
+                f"parameter (state old → new value) OR one structural change. MANDATORY: "
+                f"scan the trade list and estimate \"removes ~N losers, ~M winners\". "
+                f"{plan_sample_rule(cut_idx, len(sent_lines))}\n"
+                f"5. **驗證與回退 Validation & revert** — how to verify the change "
+                f"(backtest period, which metric must improve by how much) and the "
+                f"condition under which to revert.\n\n"
+                f"## Rules\n"
+                f"- ONE change maximum. Over-optimization is the #1 cause of strategy "
+                f"degradation.\n"
+                f"- If metrics are acceptable (PF > 1.3, DD < 25%, WR > 40%), the plan "
+                f"is「不修改，繼續運行 no change — keep running」.\n"
+                f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
+                f"instead.\n"
+                f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
+                f"{plan_directives_block()}\n"
+                f"{knob_note}"
+                f"## 保留測試集 Holdout (unseen validation data)\n"
+                f"The most recent {holdout_days} days of evidence "
+                f"({holdout_count} trades) are WITHHELD from everything in this "
+                f"message. Your plan will be validated by backtesting on that "
+                f"unseen window — design a change that should GENERALIZE, not "
+                f"one that chases the most recent trades.\n\n"
+                f"{report}\n\n"
+                f"{timeframe_line}\n"
+            )
+
+            # Auto-pipeline: plan → codegen → A/B validation → verdict in one
+            # click. Needs the single-shot path (the plan response must be
+            # captured to drive codegen); oversized payloads degrade to the
+            # plan-only chunked delivery.
+            auto = self._settings.get("evolution_auto_pipeline", True)
+            est = (len(preamble) + sum(len(l) + 1 for l in sent_lines)
+                   + len(source_section) + 300)
+            # The grid does not send the trade payload to a model to pick a
+            # setting, so a large payload must not drop an eligible class
+            # back onto the plan-only LLM path. The monthly structural
+            # turn is a different lane: when it launches, it replaces the
+            # grid for this Saturday. A used slot falls through to the grid.
+            from src.evolution.grid_search import grid_search_applies
+            _use_grid = auto and grid_search_applies(
+                _evo_cls, _evo_source,
+                self._settings.get("evolution_gate_raw") or {})
+            from src.evolution.structural_lane import lane_config_from_settings
+            _lane_on = bool(
+                lane_config_from_settings(self._settings).get("enabled"))
+            launched = False
+            if (auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT
+                    and auto_run and (structural_only or _lane_on)):
+                # The monthly structural turn is a different lane from
+                # the knob grid. It uses the same in-process guard
+                # (guard_held) and the same history append. A class
+                # admitted only because it is knob-ineligible must not
+                # fall through into weekly codegen if the launch refuses.
+                launched = BacktestApp._maybe_launch_structural(
+                    self, preamble, sent_lines, source_section, result,
+                    auto_run=auto_run, holdout_days=holdout_days,
+                    bot_dir=bot_dir, design_cut_idx=cut_idx,
+                    watermark=watermark, source=_evo_source,
+                    structural_only=structural_only)
+            if launched is True:
+                handed = True
+            elif launched == "refused" or structural_only:
+                # Refusal already appended the one history line and
+                # did not start a worker. The finally releases the guard.
+                # A reserve failure ("refused") does not run the grid.
+                pass
+            elif auto and (
+                    est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT or _use_grid):
+                self._start_evolution_pipeline(
+                    preamble, sent_lines, source_section, result,
+                    auto_run=auto_run, holdout_days=holdout_days,
+                    bot_dir=bot_dir, design_cut_idx=cut_idx,
+                    watermark=watermark, guard_held=True)
+                handed = True
             else:
-                self._append_chat("system", msg)
-            return
+                if auto:
+                    self._append_chat(
+                        "system",
+                        "EVO: payload too large for the auto-pipeline — "
+                        "falling back to plan-only mode.")
+                _remember(
+                    "skip", reason_kind="plan_only",
+                    reason=("payload too large for the auto-pipeline — plan-only mode"
+                            if auto else "auto-pipeline disabled — plan-only mode"))
+                self._dispatch_trade_analysis(
+                    preamble, sent_lines, source_section, len(sent_lines),
+                    label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
+                # Issue #125: plan-only fallback does not parse ``action``,
+                # so the watermark stays frozen (does not burn next week's
+                # delta). Auto-pipeline saves after action=change.
 
-        # Rebuild the metrics report from design-known trades only — the
-        # full-history report would leak holdout aggregates into design.
-        design_known = result.trades[:cut_idx]
-        d_eq, d_cum = [], 0
-        for t in design_known:
-            d_cum += t.pnl
-            d_eq.append(d_cum)
-        # Same capital base as the fitness composite — a 0 seed would
-        # reprint the zero-peak MaxDD% sentinel #119/#120 removed there.
-        report = format_report(
-            f"{result.strategy_name} — 設計窗 design window (holdout excluded)",
-            calculate_metrics(
-                design_known, d_eq,
-                initial_balance=self._evolution_capital_base()))
-
-        evolution_context = self._build_evolution_context(
-            result, watermark=watermark, omitted_count=omitted,
-            design_upto=cut_idx, holdout_count=holdout_count,
-            holdout_days=holdout_days)
-
-        preamble = (
-            f"🧬 Bot Evolution — 策略演化計畫\n"
-            f"以下是累積的交易數據與演化適應度評分，請產出一份具體的策略演化計畫。\n"
-            f"Below are accumulated trades and the evolution fitness score. "
-            f"Produce a concrete Evolution Plan.\n\n"
-            f"{evolution_context}"
-            f"## Required output structure (MUST FOLLOW)\n"
-            f"1. **表現總結 Performance summary** — 2-3 sentences covering the data "
-            f"period; if [real] trades exist, compare simulated vs real performance.\n"
-            f"2. **有效部分 What's working** — 2-3 aspects that must NOT be changed.\n"
-            f"3. **問題診斷 Diagnosis** — the single biggest weakness, with evidence "
-            f"from specific trades (cite trade numbers from the list).\n"
-            f"4. **演化計畫 Evolution plan** — EXACTLY ONE concrete change: one "
-            f"parameter (state old → new value) OR one structural change. MANDATORY: "
-            f"scan the trade list and estimate \"removes ~N losers, ~M winners\". "
-            f"{plan_sample_rule(cut_idx, len(sent_lines))}\n"
-            f"5. **驗證與回退 Validation & revert** — how to verify the change "
-            f"(backtest period, which metric must improve by how much) and the "
-            f"condition under which to revert.\n\n"
-            f"## Rules\n"
-            f"- ONE change maximum. Over-optimization is the #1 cause of strategy "
-            f"degradation.\n"
-            f"- If metrics are acceptable (PF > 1.3, DD < 25%, WR > 40%), the plan "
-            f"is「不修改，繼續運行 no change — keep running」.\n"
-            f"- No fabricated statistics — say \"建議回測驗證 backtest to verify\" "
-            f"instead.\n"
-            f"- Bias toward simplicity: prefer removing conditions over adding them.\n\n"
-            f"{plan_directives_block()}\n"
-            f"{knob_note}"
-            f"## 保留測試集 Holdout (unseen validation data)\n"
-            f"The most recent {holdout_days} days of evidence "
-            f"({holdout_count} trades) are WITHHELD from everything in this "
-            f"message. Your plan will be validated by backtesting on that "
-            f"unseen window — design a change that should GENERALIZE, not "
-            f"one that chases the most recent trades.\n\n"
-            f"{report}\n\n"
-            f"{timeframe_line}\n"
-        )
-
-        # Auto-pipeline: plan → codegen → A/B validation → verdict in one
-        # click. Needs the single-shot path (the plan response must be
-        # captured to drive codegen); oversized payloads degrade to the
-        # plan-only chunked delivery.
-        auto = self._settings.get("evolution_auto_pipeline", True)
-        est = (len(preamble) + sum(len(l) + 1 for l in sent_lines)
-               + len(source_section) + 300)
-        if auto and est <= self._REVIEW_SINGLE_SHOT_CHAR_LIMIT:
-            self._start_evolution_pipeline(
-                preamble, sent_lines, source_section, result,
-                auto_run=auto_run, holdout_days=holdout_days,
-                bot_dir=bot_dir, design_cut_idx=cut_idx)
-        else:
-            if auto:
-                self._append_chat(
-                    "system",
-                    "EVO: payload too large for the auto-pipeline — "
-                    "falling back to plan-only mode.")
-            self._dispatch_trade_analysis(
-                preamble, sent_lines, source_section, len(sent_lines),
-                label="🧬 Bot Evolution: 請產出策略演化計畫", call_site="bot_evolution")
-            # Issue #125: plan-only fallback does not parse ``action``,
-            # so the watermark stays frozen (does not burn next week's
-            # delta). Auto-pipeline saves after action=change.
+        finally:
+            if not handed:
+                _evolution_end(key)
 
     def _evolution_capital_base(self) -> int:
         """Starting equity the evolution drawdown PERCENTAGE is measured
@@ -5696,11 +6056,191 @@ class BacktestApp:
 
         return "\n".join(lines) + "\n\n"
 
+    def _structural_bot_id(self) -> str:
+        """Lane identity from the symbol and the strategy name. Not a bot list."""
+        from src.evolution.structural_lane import sanitize_bot_id
+        runner = getattr(self, "_live_runner", None)
+        symbol = str(getattr(runner, "symbol", "") or "")
+        name = ""
+        try:
+            name = str(self.strategy_var.get() or "")
+        except Exception:
+            name = ""
+        cls_name = ""
+        strat = getattr(runner, "strategy", None)
+        if strat is not None:
+            cls_name = type(strat).__name__
+        raw = "_".join(part for part in (symbol, name or cls_name) if part)
+        return sanitize_bot_id(raw)
+
+    def _structural_ledger_path(self):
+        """Shared lane ledger. Empty config uses data/evolution/, not settings."""
+        from src.evolution.structural_lane import lane_config_from_settings
+        cfg = lane_config_from_settings(getattr(self, "_settings", {}) or {})
+        raw = str(cfg.get("ledger_path") or "").strip()
+        if raw:
+            return Path(raw)
+        return Path(project_root) / "data" / "evolution" / "structural_lane.json"
+
+    def _maybe_launch_structural(self, preamble, sent_lines, source_section,
+                                 result, auto_run, holdout_days, bot_dir,
+                                 design_cut_idx, structural_only: bool,
+                                 watermark=None, source: str = "") -> bool:
+        """Start one structural-lane run, or return False to keep the knob path.
+
+        Reserves the monthly slot before the pipeline so a failed codegen
+        cannot be re-rolled the same month. Writes the ledger only.
+        The caller already holds the in-process evolution guard. This
+        method does not take another lock. A structural-only refusal
+        appends the one history line for the attempt and starts no worker.
+        """
+        from src.evolution.structural_lane import (
+            admission_decision, lane_config_from_settings, load_ledger,
+            reserve_structural_slot, structural_plan_block)
+        cfg = lane_config_from_settings(self._settings)
+        if not cfg.get("enabled"):
+            return False
+        bot_id = BacktestApp._structural_bot_id(self)
+        month = _taipei_now().strftime("%Y-%m")
+        ledger_path = BacktestApp._structural_ledger_path(self)
+        fallback = str(
+            self._settings.get("evolution_knob_ineligible_fallback") or "")
+
+        def _refuse(reason: str) -> bool:
+            note = f"EVO structural lane not run: {reason}"
+            _log(note)
+            try:
+                self._append_chat("system", note)
+            except Exception:
+                pass
+            if not structural_only:
+                return False
+            if _discord is not None and getattr(_discord, "enabled", False):
+                try:
+                    _discord.notify_evolution(note)
+                except Exception:
+                    pass
+            _persist_evolution_history(
+                bot_dir,
+                bot=self.strategy_var.get(),
+                class_name=_evolution_class_name(self),
+                source=source or "",
+                cut_idx=design_cut_idx,
+                watermark=watermark,
+                final_status="refused",
+                reason_kind="refused",
+                reason=note,
+                ai_calls=0,
+                thresholds_raw=self._settings.get("evolution_gate_raw"),
+            )
+            return False
+
+        decision = admission_decision(
+            enabled=True,
+            ineligible=bool(structural_only),
+            fallback=fallback,
+            bot_id=bot_id,
+            month=month,
+            ledger=load_ledger(ledger_path),
+            config=cfg,
+        )
+        if not decision.admit:
+            return _refuse(decision.reason)
+        try:
+            reserved = reserve_structural_slot(
+                ledger_path, bot_id=bot_id, month=month, config=cfg,
+                now=_taipei_now(), ineligible=bool(structural_only),
+                fallback=fallback)
+        except Exception as exc:
+            # A failed reserve is a clean refusal. Do not fall through
+            # to the weekly plan or the knob grid. The caller leaves
+            # handed False, so the run guard is released.
+            note = ("EVO structural lane reserve failed: "
+                    f"[{type(exc).__name__}] {exc}")
+            _log(note)
+            try:
+                self._append_chat("system", note)
+            except Exception:
+                pass
+            try:
+                if _discord is not None and getattr(_discord, "enabled", False):
+                    _discord.notify_evolution(note)
+            except Exception:
+                pass
+            try:
+                _persist_evolution_history(
+                    bot_dir,
+                    bot=self.strategy_var.get(),
+                    class_name=_evolution_class_name(self),
+                    source=source or "",
+                    cut_idx=design_cut_idx,
+                    watermark=watermark,
+                    final_status="refused",
+                    reason_kind="refused",
+                    reason=note,
+                    ai_calls=0,
+                    thresholds_raw=self._settings.get("evolution_gate_raw"),
+                )
+            except Exception as hist_exc:
+                try:
+                    _log("evolution history append failed: "
+                         f"[{type(hist_exc).__name__}] {hist_exc}")
+                except Exception:
+                    pass
+            return "refused"
+        if not reserved.admit:
+            return _refuse(reserved.reason)
+        _log("EVO structural lane: this Saturday is the monthly structural "
+             "turn; the knob grid is not run")
+        self._start_evolution_pipeline(
+            preamble + "\n" + structural_plan_block(),
+            sent_lines, source_section, result,
+            auto_run=auto_run, holdout_days=holdout_days,
+            bot_dir=bot_dir, design_cut_idx=design_cut_idx,
+            watermark=watermark, guard_held=True,
+            structural_lane=True,
+            structural_ledger=str(ledger_path),
+            structural_bot_id=bot_id,
+            structural_month=month)
+        return True
+
+    def _write_saturday_proposal(self, *, status: str, evidence: dict,
+                                 lane: str, form: str = "",
+                                 ledger_path: str = "", bot_id: str = "",
+                                 month: str = "", touch_slot: bool = False,
+                                 incubation: dict | None = None,
+                                 source_code: str = "") -> str:
+        """Record a proposal. Does not promote, save, or edit settings."""
+        from src.evolution.structural_lane import (
+            format_proposal_notice, record_proposal)
+        ledger = ledger_path or str(BacktestApp._structural_ledger_path(self))
+        bot = bot_id or BacktestApp._structural_bot_id(self)
+        when = month or _taipei_now().strftime("%Y-%m")
+        body = record_proposal(
+            Path(ledger).parent,
+            bot_id=bot,
+            month=when,
+            lane=lane,
+            status=status,
+            evidence=evidence,
+            form=form,
+            ledger_path=ledger if (touch_slot or incubation is not None) else None,
+            touch_slot=touch_slot,
+            incubation=incubation,
+            source_code=source_code,
+        )
+        return format_proposal_notice(body)
+
     def _start_evolution_pipeline(self, preamble: str, trade_lines: list[str],
                                   source_section: str, result,
                                   auto_run: bool = False,
                                   holdout_days: int = 14,
-                                  bot_dir=None, design_cut_idx: int = 0) -> None:
+                                  bot_dir=None, design_cut_idx: int = 0,
+                                  watermark=None, guard_held: bool = False,
+                                  structural_lane: bool = False,
+                                  structural_ledger: str = "",
+                                  structural_bot_id: str = "",
+                                  structural_month: str = "") -> None:
         """🧬 auto-pipeline: plan → codegen → A/B validation → verdict.
 
         One click, no manual steps until deployment: the plan's own
@@ -5709,528 +6249,1298 @@ class BacktestApp:
         candidate in the StrategyPool to ``validated`` only — it does
         NOT write the StrategyStore and does NOT register STRATEGIES
         (issue #153). Deploying to live trading stays manual by design.
-        Saturday auto on DynamicExitPullback* applies an allowlisted
-        knob grid (max 2); structural codegen is not the auto path.
+        Saturday auto on a knob-grid class applies an allowlisted knob
+        grid (max 2) on Saturdays that are not this month's structural
+        turn. The structural Saturday replaces that grid run. Other
+        Saturdays run the grid. The lane is on unless
+        ``evolution.structural_lane.enabled`` is boolean false, and it
+        still only proposes. Propose mode records evidence and does not
+        promote the pool. Both Saturday paths append the same
+        evolution-history line and use the same per-bot run guard.
+        The shared lane ledger uses one process-wide threading lock
+        around reserve, record, and save. There is no file lock and
+        no history cap.
 
         Runs in a worker thread; every Tk touch goes through root.after.
         """
-        context = (
-            preamble
-            + f"交易明細 Trade Details ({len(trade_lines)} trades):\n"
-            + "\n".join(trade_lines)
-            + source_section
-        )
-        total_trades = len(trade_lines)
-
-        # Snapshot everything the worker needs while on the main thread.
-        capital_base = self._evolution_capital_base()
-        live = (self._live_runner is not None
-                and self._live_runner.state != LiveState.IDLE)
-        if live:
-            baseline_cls = type(self._live_runner.strategy)
-            point_value = self._live_runner.point_value
-            native_sec = self._live_runner.target_interval
-        else:
-            baseline_cls = STRATEGIES.get(self.strategy_var.get())
-            native_sec = (self._last_bars[0].interval
-                          if self._last_bars else 900)
-            try:
-                point_value = int(self.pv_var.get())
-            except (ValueError, TypeError):
-                point_value = 200
-
-        def _fallback_bars() -> tuple[list, str]:
-            """Best locally-available validation data (no API fetch)."""
-            if live:
-                # Full session history from the bot's daily 1-min CSVs
-                # beats the in-memory aggregated bars (~warmup window);
-                # BacktestEngine aggregates 1-min feeds to the strategy's
-                # native timeframe internally.
-                from src.live.live_runner import load_1m_bars_from_csvs
-                mem_bars = self._live_runner.get_bars()
-                csv_bars = load_1m_bars_from_csvs(
-                    self._live_runner.bot_dir, self._live_runner.symbol)
-
-                def _span(bs):
-                    return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
-                if csv_bars and _span(csv_bars) >= _span(mem_bars):
-                    return csv_bars, "bot 1m CSV history"
-                return mem_bars, "in-memory session bars"
-            return list(self._last_bars or []), "last backtest dataset"
-        display_name = self.strategy_var.get()
-        strategy_source = self._resolve_strategy_source(display_name, baseline_cls)
-        taken = {cls.__name__ for cls in STRATEGIES.values()}
+        key = _evolution_run_key(self, bot_dir)
+        if not guard_held:
+            if not _evolution_try_begin(key):
+                _refuse_overlapping_evolution(self, auto_run=auto_run)
+                return
+        started = False
+        # A previous stop must not cancel this run. _stop_live sets the
+        # flag again if the operator stops while this run is in flight.
+        self._evolution_cancel = False
         try:
-            taken |= {e["class_name"] for e in self._strategy_store.list_strategies()}
-        except Exception:
-            pass
+            context = (
+                preamble
+                + f"交易明細 Trade Details ({len(trade_lines)} trades):\n"
+                + "\n".join(trade_lines)
+                + source_section
+            )
+            total_trades = len(trade_lines)
 
-        heavy_model = model_for_tier(
-            self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
-            ultra_mode=self._settings.get("ultra_mode", False))
-
-        validation = self._settings.get("evolution_validation", "deep")
-        # Validation data + provenance, filled by the dispatch logic at the
-        # bottom (possibly after an async API fetch) before _worker starts.
-        evo_data: dict = {"bars": [], "origin": ""}
-
-        def ui(fn, *args):
-            self.root.after(0, fn, *args)
-
-        def _worker():
-            from src.evolution.pipeline import (
-                check_candidate_name, plan_unusable_reason,
-                parse_plan_directives, next_candidate_name, run_ab_backtest,
-                decide_verdict,
-                run_deep_validation, decide_deep_verdict,
-                run_multifold_validation, decide_multifold_verdict,
-                decide_month_gates, combine_evolution_verdicts,
-                format_weekend_verdict_block, holdout_window_start,
-                eligible_for_validated_pool)
-            bars = evo_data["bars"]
-            data_origin = evo_data["origin"]
-
-            def _notify_discord(msg: str) -> None:
-                # DiscordNotifier._send spawns its own thread — safe to
-                # call from this worker. Best-effort, never kills the run.
-                # Evolution-pipeline status → the evolution channel.
-                if _discord is not None and _discord.enabled:
-                    try:
-                        _discord.notify_evolution(msg)
-                    except Exception:
-                        pass
-
-            try:
-                # ── Phase 1: evolution plan ──
-                plan = self._chat_client.send_message(
-                    context, call_site="bot_evolution", model=heavy_model,
-                    # Thinking tokens share this budget — the codegen
-                    # calls already get _CODE_GEN_MAX_TOKENS, so give the
-                    # plan the same floor (issue #108).
-                    max_tokens=max(self._chat_client.max_tokens,
-                                   _CODE_GEN_MAX_TOKENS))
-                conv = self._chat_client.conversation
-                if len(conv) >= 2 and conv[-2].get("role") == "user":
-                    conv[-2]["content"] = (
-                        f"[bot evolution payload — {total_trades} trades, "
-                        f"trimmed to save tokens]")
-                ui(self._on_chat_response, plan)
-
-                # Issue #108: an empty / token-truncated plan must stop the
-                # run HERE — before the watermark and before codegen.
-                # parse_plan_directives degrades to action="change" by
-                # design, so without this gate a zero-text response burned
-                # the trade delta and fed codegen a plan of nothing.
-                if (unusable := plan_unusable_reason(plan)):
-                    msg = (
-                        f"🧬 EVO 中止 ABORT: 計畫回應無法使用（{unusable}）。"
-                        f"本次未消耗任何交易資料（watermark 未前進），"
-                        f"下次執行會重跑同一批交易。"
-                        f"建議在 settings.yaml 將 ai.max_tokens 提高到 "
-                        f"≥{_CODE_GEN_MAX_TOKENS}（思考 token 與輸出共用額度）。\n"
-                        f"Plan response unusable ({unusable}) — the model's "
-                        f"reply was empty or cut off by the token limit. "
-                        f"Nothing was consumed: the watermark did NOT "
-                        f"advance and the next run retries the same trades. "
-                        f"Raise `ai.max_tokens` in settings.yaml to "
-                        f"≥{_CODE_GEN_MAX_TOKENS} (thinking tokens share the "
-                        f"output budget).")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    return
-
-                directives = parse_plan_directives(plan)
-                if directives["action"] == "no_change":
-                    msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
-                           "Plan says no change — pipeline stops here.")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    return
-                # Issue #153: Saturday knob mode refuses off-grid /
-                # structural plans BEFORE the watermark, so a rejected
-                # EMA80-class plan does not burn next week's delta.
-                _knob_apply = None
-                if auto_run and baseline_cls is not None:
-                    from src.evolution.knobs import saturday_knob_decision
-                    rejection, _knob_apply = saturday_knob_decision(
-                        baseline_cls.__name__, directives.get("knobs"),
-                        baseline_cls)
-                    if rejection:
-                        msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
-                        ui(self._append_chat, "system", msg)
-                        if auto_run:
-                            _notify_discord(msg)
-                        return
-                # Issue #125: watermark advances only after a completed
-                # plan with action=change — never at launch. no_change
-                # returned above; a later codegen/validation FAIL does
-                # not un-save (the plan already consumed this delta).
+            # Snapshot everything the worker needs while on the main thread.
+            # The promotion mode is read inside the worker, at decision time:
+            # a running runner's trading_mode (a mid-run switch is visible),
+            # otherwise the bot's configured mode. Never a silent backtest.
+            capital_base = self._evolution_capital_base()
+            live = (self._live_runner is not None
+                    and self._live_runner.state != LiveState.IDLE)
+            evolution_gate_raw = self._settings.get("evolution_gate_raw") or {}
+            if live:
+                baseline_cls = type(self._live_runner.strategy)
+                point_value = self._live_runner.point_value
+                native_sec = self._live_runner.target_interval
+            else:
+                baseline_cls = STRATEGIES.get(self.strategy_var.get())
+                native_sec = (self._last_bars[0].interval
+                              if self._last_bars else 900)
                 try:
-                    from src.evolution.notify import maybe_advance_watermark
-                    maybe_advance_watermark(
-                        bot_dir, design_cut_idx, directives["action"])
-                except Exception as e:
-                    _log(f"evolution watermark save failed: "
-                         f"[{type(e).__name__}] {e}")
-                if not strategy_source:
-                    msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
-                           "Strategy source unavailable — plan-only.")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    return
+                    point_value = int(self.pv_var.get())
+                except (ValueError, TypeError):
+                    point_value = 200
 
-                # ── Phase 2: Saturday knob grid, else candidate codegen ──
-                base_cls_name = baseline_cls.__name__ if baseline_cls else "Strategy"
-                candidate_name = next_candidate_name(base_cls_name, taken)
-                candidate_cls = None
-                code = ""
-                last_err = ""
-                if _knob_apply:
-                    ui(self._append_chat, "system",
-                       f"EVO 2/3: Saturday knob mode — applying {_knob_apply} "
-                       f"as {candidate_name} (no codegen)...")
+            def _fallback_bars() -> tuple[list, str]:
+                """Best locally-available validation data (no API fetch)."""
+                if live:
+                    # Full session history from the bot's daily 1-min CSVs
+                    # beats the in-memory aggregated bars (~warmup window);
+                    # BacktestEngine aggregates 1-min feeds to the strategy's
+                    # native timeframe internally.
+                    from src.live.live_runner import load_1m_bars_from_csvs
+                    mem_bars = self._live_runner.get_bars()
+                    csv_bars = load_1m_bars_from_csvs(
+                        self._live_runner.bot_dir, self._live_runner.symbol)
+
+                    def _span(bs):
+                        return (bs[-1].dt - bs[0].dt) if len(bs) >= 2 else timedelta(0)
+                    if csv_bars and _span(csv_bars) >= _span(mem_bars):
+                        return csv_bars, "bot 1m CSV history"
+                    return mem_bars, "in-memory session bars"
+                return list(self._last_bars or []), "last backtest dataset"
+            display_name = self.strategy_var.get()
+            strategy_source = self._resolve_strategy_source(display_name, baseline_cls)
+            taken = {cls.__name__ for cls in STRATEGIES.values()}
+            try:
+                taken |= {e["class_name"] for e in self._strategy_store.list_strategies()}
+            except Exception:
+                pass
+
+            heavy_model = model_for_tier(
+                self._settings.get("ai_provider", PROVIDER_ANTHROPIC), "heavy",
+                ultra_mode=self._settings.get("ultra_mode", False))
+
+            validation = self._settings.get("evolution_validation", "deep")
+            # Validation data + provenance, filled by the dispatch logic at the
+            # bottom (possibly after an async API fetch) before _worker starts.
+            evo_data: dict = {"bars": [], "origin": ""}
+
+            def ui(fn, *args):
+                self.root.after(0, fn, *args)
+
+            def _worker():
+                from src.evolution.pipeline import (
+                    check_candidate_name, plan_unusable_reason,
+                    parse_plan_directives, next_candidate_name, run_ab_backtest,
+                    decide_verdict,
+                    run_deep_validation, decide_deep_verdict,
+                    run_multifold_validation,
+                    format_weekend_verdict_block, format_month_gates_debug,
+                    holdout_window_start,
+                    eligible_for_validated_pool,
+                    month_gate_config_from_mapping)
+                from src.evolution.paper_gate import (
+                    WeekRecord,
+                    abs_pf_required,
+                    assemble_promotion_verdict,
+                    assess_retirement,
+                    emit_retire_recommendation,
+                    evolution_gate_config_from_mapping,
+                    evolution_promotion_mode,
+                    gate_provenance,
+                    relative_eval_summary,
+                    resolve_promotion_gate,
+                    weeks_from_changelog,
+                )
+                bars = evo_data["bars"]
+                data_origin = evo_data["origin"]
+
+                def _notify_discord(msg: str) -> None:
+                    # DiscordNotifier._send spawns its own thread — safe to
+                    # call from this worker. Best-effort, never kills the run.
+                    # Evolution-pipeline status → the evolution channel.
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.notify_evolution(msg)
+                        except Exception:
+                            pass
+
+                ai_calls = 0
+                plan = ""
+                directives = None
+                history_written = False
+
+                def _remember(final_status, reason_kind, reason="", **extra):
+                    # One record per attempt. Building the gate blocks and
+                    # the append both stay inside this function so a disk or
+                    # shaping error cannot skip the Discord verdict or turn
+                    # into a second pipeline-error notice.
+                    nonlocal history_written
+                    if history_written:
+                        return
+                    gate_keys = (
+                        "assembled", "folds", "baseline_res", "candidate_res",
+                        "gate", "gate_cfg")
                     try:
-                        from src.evolution.knobs import rewrite_knob_source
-                        code = rewrite_knob_source(
-                            strategy_source, base_cls_name, candidate_name,
-                            _knob_apply)
-                        candidate_cls = load_strategy_from_source(code)
-                        if (name_err := check_candidate_name(
-                                candidate_cls, candidate_name)):
-                            candidate_cls = None
-                            last_err = name_err
+                        if extra.get("assembled") is not None and "gates" not in extra:
+                            from src.evolution.history import validation_gates
+                            extra["gates"] = validation_gates(
+                                assembled=extra.pop("assembled"),
+                                folds=extra.pop("folds", None),
+                                baseline_res=extra.pop("baseline_res", None),
+                                candidate_res=extra.pop("candidate_res", None),
+                                gate=extra.pop("gate", None),
+                                gate_cfg=extra.pop("gate_cfg", None),
+                            )
+                        else:
+                            for key in gate_keys:
+                                extra.pop(key, None)
+                    except Exception as exc:
+                        for key in gate_keys:
+                            extra.pop(key, None)
+                        try:
+                            _log("evolution history gate block failed: "
+                                 f"[{type(exc).__name__}] {exc}")
+                        except Exception:
+                            pass
+                    history_written = True
+                    try:
+                        _persist_evolution_history(
+                            bot_dir,
+                            bot=display_name,
+                            class_name=(baseline_cls.__name__ if baseline_cls else ""),
+                            source=strategy_source or "",
+                            cut_idx=design_cut_idx,
+                            watermark=watermark,
+                            plan_excerpt=plan,
+                            directives=directives,
+                            ai_calls=ai_calls,
+                            thresholds_raw=evolution_gate_raw,
+                            final_status=final_status,
+                            reason_kind=reason_kind,
+                            reason=reason,
+                            **extra,
+                        )
+                    except Exception as exc:
+                        try:
+                            _log("evolution history append failed: "
+                                 f"[{type(exc).__name__}] {exc}")
+                        except Exception:
+                            pass
+
+                def _record_structural(status: str, evidence: dict,
+                                       form: str = "") -> str:
+                    # Proposal artifact only. The history line is _remember.
+                    if not structural_lane:
+                        return ""
+                    try:
+                        return BacktestApp._write_saturday_proposal(
+                            self, status=status, evidence=evidence,
+                            lane="structural", form=form,
+                            ledger_path=structural_ledger,
+                            bot_id=structural_bot_id, month=structural_month,
+                            touch_slot=True)
                     except Exception as e:
-                        candidate_cls = None
-                        last_err = (f"knob apply failed — [{type(e).__name__}] {e}")
-                    if candidate_cls is None:
-                        msg = (f"🧬 EVO FAIL: Saturday knob apply failed — "
-                               f"{last_err}. structural/codegen escalate, not auto.")
+                        _log("EVO structural proposal record failed: "
+                             f"[{type(e).__name__}] {e}")
+                        return ""
+
+                try:
+                    # ── Phase 1: grid search, or the evolution plan ──
+                    # Eligible knob classes are scored on a pre-registered
+                    # grid. The model does not pick the setting. llm_one and
+                    # classes that are not on the knob grid keep the plan.
+                    from src.evolution.grid_process import (
+                        DEFAULT_GRID_TIMEOUT_S,
+                        GridJob,
+                        GridProcessFailure,
+                        grid_failure_message,
+                        run_grid_isolated,
+                    )
+                    from src.evolution.grid_search import (
+                        explanation_prompt, grid_search_applies)
+                    grid_trial = None
+                    _knob_apply = None
+                    grid_outcome = None
+                    _structural_form = ""
+                    _structural_codegen_attempts = 0
+                    _structural_trial = None
+                    # The monthly structural Saturday replaces the grid.
+                    # Other runs search the pre-registered knob grid.
+                    if (not structural_lane) and grid_search_applies(
+                            baseline_cls, strategy_source, evolution_gate_raw):
+                        ui(self._append_chat, "system",
+                           "EVO 1/3: 預先登記的旋鈕網格評分中（模型不挑選設定）。"
+                           "Pre-registered knob grid — the model does not "
+                           "pick the setting.")
+                        from src.evolution.paper_gate import (
+                            evolution_gate_config_from_mapping as _evo_gate_cfg,
+                        )
+                        _grid_fold_days = _evo_gate_cfg(
+                            evolution_gate_raw
+                            if isinstance(evolution_gate_raw, dict) else {}
+                        ).relative.fold_days
+
+                        def _grid_stop_requested() -> bool:
+                            # GUI stop sets the flag. Headless `STOP` is a
+                            # file in the bot directory. Either one kills
+                            # the grid child; this thread only polls.
+                            if getattr(self, "_evolution_cancel", False):
+                                return True
+                            if not bot_dir:
+                                return False
+                            try:
+                                from src.live.headless import stop_requested
+                                return bool(stop_requested(bot_dir))
+                            except Exception:
+                                return False
+
+                        _timeout = getattr(self, "_grid_timeout_s", None)
+                        if _timeout is None:
+                            _timeout = DEFAULT_GRID_TIMEOUT_S
+                        _gate_raw = (dict(evolution_gate_raw)
+                                     if isinstance(evolution_gate_raw, dict)
+                                     else {})
+                        # Default is a spawn child. `_grid_in_process` runs
+                        # the same job on this thread. A parent patch of
+                        # run_grid_on_bars does not apply inside the child.
+                        grid_result = run_grid_isolated(
+                            GridJob(
+                                source=strategy_source or "",
+                                class_name=(baseline_cls.__name__
+                                            if baseline_cls is not None
+                                            else ""),
+                                bars=tuple(bars),
+                                point_value=int(point_value),
+                                capital_base=int(capital_base),
+                                evo=_gate_raw,
+                                fold_days=int(_grid_fold_days),
+                            ),
+                            timeout_s=float(_timeout),
+                            stop_check=_grid_stop_requested,
+                            in_process=bool(
+                                getattr(self, "_grid_in_process", False)),
+                        )
+                        if isinstance(grid_result, GridProcessFailure):
+                            # No trial evidence. Same exit as a grid that
+                            # selected nothing: no model pick, watermark
+                            # stays, one history line. The finally below
+                            # releases the evolution guard.
+                            _log(
+                                "EVO grid subprocess "
+                                f"{grid_result.kind} pid={grid_result.pid}: "
+                                f"{grid_result.detail}")
+                            msg = grid_failure_message(grid_result)
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "grid_failed", msg)
+                            return
+                        grid_outcome = grid_result
+                        for line in grid_outcome.reasons:
+                            _log(line)
+                        if grid_outcome.selected is None:
+                            msg = (
+                                "🧬 EVO: 網格沒有選出設定（高原 / DSR / PBO 未過）。"
+                                "本次未消耗任何交易資料（watermark 未前進）。\n"
+                                "Grid selected no setting (plateau / DSR / PBO). "
+                                "Nothing was consumed: the watermark did NOT "
+                                "advance.\n"
+                                + "\n".join(grid_outcome.reasons))
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "grid_no_pick", msg)
+                            return
+                        plan = grid_outcome.rationale
+                        directives = {
+                            "action": "change",
+                            "knobs": dict(grid_outcome.selected),
+                            "criteria": None,
+                        }
+                        _knob_apply = dict(grid_outcome.selected)
+                        grid_trial = grid_outcome.evidence
+                    if grid_outcome is None:
+                        # ── Evolution plan (LLM picks only on this branch) ──
+                        ai_calls += 1
+                        plan = self._chat_client.send_message(
+                            context, call_site="bot_evolution", model=heavy_model,
+                            # Thinking tokens share this budget — the codegen
+                            # calls already get _CODE_GEN_MAX_TOKENS, so give the
+                            # plan the same floor (issue #108).
+                            max_tokens=max(self._chat_client.max_tokens,
+                                           _CODE_GEN_MAX_TOKENS))
+                        conv = self._chat_client.conversation
+                        if len(conv) >= 2 and conv[-2].get("role") == "user":
+                            conv[-2]["content"] = (
+                                f"[bot evolution payload — {total_trades} trades, "
+                                f"trimmed to save tokens]")
+                        ui(self._on_chat_response, plan)
+
+                        # Issue #108: an empty / token-truncated plan must stop the
+                        # run HERE — before the watermark and before codegen.
+                        # parse_plan_directives degrades to action="change" by
+                        # design, so without this gate a zero-text response burned
+                        # the trade delta and fed codegen a plan of nothing.
+                        if (unusable := plan_unusable_reason(plan)):
+                            msg = (
+                                f"🧬 EVO 中止 ABORT: 計畫回應無法使用（{unusable}）。"
+                                f"本次未消耗任何交易資料（watermark 未前進），"
+                                f"下次執行會重跑同一批交易。"
+                                f"建議在 settings.yaml 將 ai.max_tokens 提高到 "
+                                f"≥{_CODE_GEN_MAX_TOKENS}（思考 token 與輸出共用額度）。\n"
+                                f"Plan response unusable ({unusable}) — the model's "
+                                f"reply was empty or cut off by the token limit. "
+                                f"Nothing was consumed: the watermark did NOT "
+                                f"advance and the next run retries the same trades. "
+                                f"Raise `ai.max_tokens` in settings.yaml to "
+                                f"≥{_CODE_GEN_MAX_TOKENS} (thinking tokens share the "
+                                f"output budget).")
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "plan_unusable", msg)
+                            return
+
+                        directives = parse_plan_directives(plan)
+                        if directives["action"] == "no_change":
+                            msg = ("🧬 EVO: 計畫為「不修改」— pipeline 結束。"
+                                   "Plan says no change — pipeline stops here.")
+                            if structural_lane:
+                                notice = _record_structural("refused", {
+                                    "reason": "plan said no_change",
+                                    "dsr_trials": 0,
+                                })
+                                if notice:
+                                    msg = msg + "\n" + notice
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("no_change", "no_change", msg)
+                            return
+                        # Structural lane: the plan must name one menu form.
+                        # A knob-only plan is refused. The month slot stays used.
+                        # This return is before the watermark. History is the
+                        # same append as every other refusal.
+                        if structural_lane:
+                            from src.evolution.structural_lane import parse_structural_form
+                            _structural_form = parse_structural_form(plan) or ""
+                            if not _structural_form:
+                                notice = _record_structural("refused", {
+                                    "reason": "plan did not name exactly one structural form",
+                                    "dsr_trials": 0,
+                                })
+                                msg = ("🧬 EVO structural lane refused: the plan did not "
+                                       "name exactly one menu form. This month's slot is "
+                                       "used. Nothing was applied.")
+                                if notice:
+                                    msg = msg + "\n" + notice
+                                ui(self._append_chat, "system", msg)
+                                if auto_run:
+                                    _notify_discord(msg)
+                                _remember("refused", "refused", msg)
+                                return
+                        # Issue #153: an eligible class with an off-grid / structural
+                        # plan is refused BEFORE the watermark, so that plan does
+                        # not burn next week's delta.
+                        # D1: an ineligible class is excluded from weekly codegen.
+                        # The exclusion line is emitted every Saturday, including
+                        # when this class+source+grid was already recorded.
+                        # _bot_evolution settles this before the AI call; this is
+                        # the backstop if a plan was already in hand.
+                        _knob_apply = None
+                        if auto_run and baseline_cls is not None and not structural_lane:
+                            from src.evolution.knobs import (
+                                is_knob_not_applicable_reason,
+                                normalize_knob_ineligible_fallback,
+                                saturday_knob_decision, settle_knob_ineligibility)
+                            rejection, _knob_apply = saturday_knob_decision(
+                                baseline_cls.__name__, directives.get("knobs"),
+                                baseline_cls, strategy_source)
+                            if rejection:
+                                if is_knob_not_applicable_reason(rejection):
+                                    _knob_fallback = normalize_knob_ineligible_fallback(
+                                        self._settings.get(
+                                            "evolution_knob_ineligible_fallback"))
+                                    action, why = settle_knob_ineligibility(
+                                        bot_dir, baseline_cls, strategy_source,
+                                        design_cut_idx, fallback=_knob_fallback)
+                                    if action in ("recorded", "skip") and why:
+                                        ui(self._append_chat, "system", why)
+                                        _notify_discord(why)
+                                        _log(why)
+                                    _remember("skip", "knob_ineligible", why or rejection)
+                                    return
+                                msg = (f"🧬 EVO Saturday knob mode refused: {rejection}")
+                                ui(self._append_chat, "system", msg)
+                                if auto_run:
+                                    _notify_discord(msg)
+                                _remember("refused", "refused", msg)
+                                return
+                    # Issue #125: watermark advances only after a completed
+                    # plan with action=change — never at launch. no_change
+                    # returned above; a later codegen/validation FAIL does
+                    # not un-save (the plan already consumed this delta).
+                    try:
+                        from src.evolution.notify import maybe_advance_watermark
+                        maybe_advance_watermark(
+                            bot_dir, design_cut_idx, directives["action"])
+                    except Exception as e:
+                        _log(f"evolution watermark save failed: "
+                             f"[{type(e).__name__}] {e}")
+                    if grid_outcome is not None:
+                        # The setting is already chosen. This call only
+                        # explains it. A failure keeps the mechanical line.
+                        try:
+                            ai_calls += 1
+                            explained = self._chat_client.one_shot(
+                                explanation_prompt(
+                                    grid_outcome.selected, grid_outcome.reasons),
+                                system_prompt=(
+                                    "You explain a knob setting that has already "
+                                    "been selected. Do NOT propose a different "
+                                    "setting. Do NOT output directives JSON."),
+                                max_tokens=max(self._chat_client.max_tokens,
+                                               _CODE_GEN_MAX_TOKENS),
+                                call_site="evolution_grid_explain",
+                                model=heavy_model)
+                            if explained and explained.strip():
+                                plan = explained.strip()
+                        except Exception as e:
+                            _log(f"EVO grid explanation failed: "
+                                 f"[{type(e).__name__}] {e}")
+                        ui(self._on_chat_response, plan)
+                    if not strategy_source:
+                        msg = ("🧬 EVO: 無法取得策略原始碼 — 僅產出計畫。"
+                               "Strategy source unavailable — plan-only.")
                         ui(self._append_chat, "system", msg)
                         if auto_run:
                             _notify_discord(msg)
+                        _remember("fail", "no_source", msg)
                         return
-                if candidate_cls is None:
-                    ui(self._append_chat, "system",
-                       f"EVO 2/3: generating candidate strategy {candidate_name}...")
-                    gen_msg = (
-                        f"{STRATEGY_CODE_CONTEXT}\n\n"
-                        f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
-                        f"## Evolution plan to apply\n{plan}\n\n"
-                        f"## Task\n"
-                        f"Apply EXACTLY the single change specified in the evolution "
-                        f"plan to the strategy above. Keep ALL other logic identical. "
-                        f"The class MUST be named `{candidate_name}` and keep the same "
-                        f"kline_type / kline_minute. Output ONLY one ```python code "
-                        f"block containing the complete strategy file."
-                    )
-                    for attempt in (1, 2):
-                        msg = gen_msg if attempt == 1 else (
-                            gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
-                            f"Fix the problem and output the complete corrected code.")
+
+                    # ── Phase 2: Saturday knob grid, else candidate codegen ──
+                    base_cls_name = baseline_cls.__name__ if baseline_cls else "Strategy"
+                    candidate_name = next_candidate_name(base_cls_name, taken)
+                    candidate_cls = None
+                    code = ""
+                    last_err = ""
+                    if structural_lane:
+                        # One attempt. This is not the Saturday codegen retry loop.
+                        # A failed attempt still counts toward DSR's trial count.
+                        _structural_codegen_attempts += 1
+                        ui(self._append_chat, "system",
+                           f"EVO 2/3: structural lane form {_structural_form} — "
+                           f"one codegen attempt, no retry, as {candidate_name}...")
+                        from src.evolution.structural_lane import (
+                            structural_codegen_prompt)
+                        gen_msg = structural_codegen_prompt(
+                            source=strategy_source,
+                            plan=plan,
+                            candidate_name=candidate_name,
+                            form=_structural_form,
+                            context=STRATEGY_CODE_CONTEXT,
+                        )
                         try:
-                            # The API call is INSIDE the try (issue #108): a
-                            # transient model outage (Gemini 503) used to escape
-                            # this loop entirely, so the advertised "one retry"
-                            # never happened for API failures and the error died
-                            # in the outer handler with no Discord notice.
+                            ai_calls += 1
                             resp = self._chat_client.one_shot(
-                                msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                                gen_msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
                                 max_tokens=_CODE_GEN_MAX_TOKENS,
-                                call_site=f"evolution_codegen_{attempt}",
+                                call_site="evolution_codegen_structural",
                                 model=heavy_model)
                             code = extract_python_code(resp) or ""
                             if not code:
                                 last_err = "no ```python code block found in the response"
-                                continue
+                            else:
+                                candidate_cls = load_strategy_from_source(code)
+                                if (name_err := check_candidate_name(
+                                        candidate_cls, candidate_name)):
+                                    candidate_cls = None
+                                    last_err = name_err
+                        except (CodeValidationError, CodeExecutionError) as e:
+                            candidate_cls = None
+                            last_err = str(e)
+                        except Exception as e:
+                            candidate_cls = None
+                            last_err = f"AI API error — [{type(e).__name__}] {e}"
+                            _log(f"EVO structural codegen failed: {last_err}")
+                        if candidate_cls is None:
+                            notice = _record_structural("refused", {
+                                "reason": last_err,
+                                "form": _structural_form,
+                                "dsr_trials": _structural_codegen_attempts,
+                                "sandbox_ok": False,
+                            }, form=_structural_form)
+                            msg = (f"🧬 EVO structural lane FAIL: one codegen attempt "
+                                   f"failed — {last_err}. No retry this month. "
+                                   f"Nothing was applied.")
+                            if notice:
+                                msg = msg + "\n" + notice
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "codegen", msg)
+                            return
+                    elif _knob_apply:
+                        ui(self._append_chat, "system",
+                           f"EVO 2/3: Saturday knob mode — applying {_knob_apply} "
+                           f"as {candidate_name} (no codegen)...")
+                        try:
+                            from src.evolution.knobs import rewrite_knob_source
+                            code = rewrite_knob_source(
+                                strategy_source, base_cls_name, candidate_name,
+                                _knob_apply)
                             candidate_cls = load_strategy_from_source(code)
-                            # load_strategy_from_source returns the first
-                            # BacktestStrategy subclass whatever it is named.
-                            # A kept base-class name would collide with the
-                            # live strategy (issue #114). Discard it and
-                            # spend the retry correcting the name.
                             if (name_err := check_candidate_name(
                                     candidate_cls, candidate_name)):
                                 candidate_cls = None
                                 last_err = name_err
-                                continue
-                            break
-                        except (CodeValidationError, CodeExecutionError) as e:
-                            last_err = str(e)
                         except Exception as e:
-                            last_err = f"AI API error — [{type(e).__name__}] {e}"
-                            _log(f"EVO codegen attempt {attempt} failed: {last_err}")
-                if candidate_cls is None:
-                    msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    return
-
-                # ── Phase 3: validation backtest ──
-                # The feed may be 1-min CSVs or API bars (engine
-                # aggregates sub-native feeds internally) — size guards
-                # in NATIVE bars, not feed bars.
-                feed_iv = bars[0].interval if bars else 0
-                native_est = len(bars)
-                if feed_iv and native_sec > feed_iv:
-                    native_est = len(bars) * feed_iv // native_sec
-                if native_est < 150:
-                    msg = (f"🧬 EVO: only ~{native_est} native bars of data "
-                           f"available — not enough for a meaningful validation "
-                           f"backtest. Plan + candidate generated but NOT "
-                           f"validated/saved; run a TV/API backtest manually.")
-                    ui(self._append_chat, "system", msg)
-                    if auto_run:
-                        _notify_discord(msg)
-                    return
-
-                data_desc = (
-                    f"{data_origin}: "
-                    f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
-                    f"({len(bars)} × {feed_iv // 60}min bars "
-                    f"≈ {native_est} native bars)")
-
-                # Walk-forward (SEE spec: 90d train / 90d test + Monte
-                # Carlo) when data allows; scaled windows on shorter
-                # spans; simple single-window A/B as last resort.
-                span_days = ((bars[-1].dt - bars[0].dt).days
-                             if len(bars) >= 2 else 0)
-                # Walk-forward windows aligned with the design/holdout
-                # split: the test window IS the holdout (the design never
-                # saw it); the train window is up to 90d of pre-holdout
-                # data. Too little pre-holdout history (< 14d) → walk-
-                # forward is meaningless, degrade to simple A/B.
-                tr_d = te_d = 0
-                if validation == "deep":
-                    from src.evolution.evaluator import DEEP_TRAIN_DAYS
-                    te_d = holdout_days
-                    tr_d = min(DEEP_TRAIN_DAYS, max(0, span_days - te_d))
-                    if tr_d < 14:
-                        tr_d = 0
-
-                if tr_d:
-                    ui(self._append_chat, "system",
-                       f"EVO 3/3: walk-forward + multi-fold + month gates — "
-                       f"train {tr_d}d / test {te_d}d + Monte Carlo "
-                       f"({base_cls_name} vs {candidate_cls.__name__})...")
-                    baseline_res = run_deep_validation(
-                        baseline_cls, bars, point_value, "基準 baseline",
-                        tr_d, te_d, monte_carlo=False,
-                        capital_base=capital_base)
-                    candidate_res = run_deep_validation(
-                        candidate_cls, bars, point_value,
-                        f"候選 {candidate_cls.__name__}", tr_d, te_d,
-                        monte_carlo=True, capital_base=capital_base)
-                    window_verdict = decide_deep_verdict(
-                        baseline_res, candidate_res, directives["criteria"])
-                    cl_base_m = (baseline_res.test.metrics
-                                 if baseline_res.test.result else None)
-                    cl_cand_m = (candidate_res.test.metrics
-                                 if candidate_res.test.result else None)
-                else:
-                    if validation == "deep":
+                            candidate_cls = None
+                            last_err = (f"knob apply failed — [{type(e).__name__}] {e}")
+                        if candidate_cls is None:
+                            msg = (f"🧬 EVO FAIL: Saturday knob apply failed — "
+                                   f"{last_err}. structural/codegen escalate, not auto.")
+                            ui(self._append_chat, "system", msg)
+                            if auto_run:
+                                _notify_discord(msg)
+                            _remember("fail", "knob_apply", msg)
+                            return
+                    if candidate_cls is None:
                         ui(self._append_chat, "system",
-                           f"EVO: data span {span_days}d too short for "
-                           f"walk-forward — using simple A/B plus multi-fold "
-                           f"and month gates.")
-                    ui(self._append_chat, "system",
-                       f"EVO 3/3: A/B + multi-fold + month gates on {len(bars)} × "
-                       f"{feed_iv // 60}min bars ≈ {native_est} native bars "
-                       f"({base_cls_name} vs {candidate_cls.__name__})...")
-                    baseline_res = run_ab_backtest(
-                        baseline_cls, bars, point_value, "基準 baseline",
-                        capital_base=capital_base)
-                    candidate_res = run_ab_backtest(
-                        candidate_cls, bars, point_value,
-                        f"候選 {candidate_cls.__name__}",
-                        capital_base=capital_base)
-                    window_verdict = decide_verdict(
-                        baseline_res, candidate_res, directives["criteria"])
-                    cl_base_m = baseline_res.metrics
-                    cl_cand_m = candidate_res.metrics
-
-                # Issue #153: multi-fold + month gates on the same bars.
-                # Month reasons are combined first so Discord truncation
-                # keeps prior-months collapse / calendar-month dominated.
-                folds, mf_base, mf_cand = run_multifold_validation(
-                    baseline_cls, candidate_cls, bars, point_value,
-                    capital_base=capital_base)
-                mf_verdict = decide_multifold_verdict(
-                    folds, directives["criteria"])
-                base_trades = (list(mf_base.result.trades)
-                               if mf_base.result is not None else [])
-                cand_trades = (list(mf_cand.result.trades)
-                               if mf_cand.result is not None else [])
-                ho_start = holdout_window_start(bars, te_d or holdout_days)
-                month_verdict = decide_month_gates(
-                    base_trades, cand_trades, holdout_start=ho_start)
-                verdict = combine_evolution_verdicts(
-                    month_verdict, mf_verdict, window_verdict)
-
-                # Clean PASS → StrategyPool validated only. Never
-                # StrategyStore.save and never STRATEGIES[...].
-                pool_id = ""
-                if eligible_for_validated_pool(verdict):
-                    try:
-                        from src.evolution.pool import (
-                            StrategyPool, default_pool_path,
-                            record_validated_candidate)
-                        wf = 0.0
-                        fit = getattr(
-                            getattr(candidate_res, "test", None), "fitness", None)
-                        if fit is None:
-                            fit = getattr(candidate_res, "fitness", None)
-                        if fit is not None:
-                            wf = float(fit.composite)
-                        pool_id = record_validated_candidate(
-                            StrategyPool(default_pool_path()),
-                            name=candidate_cls.__name__,
-                            source_code=code,
-                            walkforward_fitness=wf,
-                            notes=(
-                                "issue #153 weekend evo PASS — StrategyPool "
-                                "validated only; StrategyStore / STRATEGIES "
-                                "auto-save blocked"),
+                           f"EVO 2/3: generating candidate strategy {candidate_name}...")
+                        gen_msg = (
+                            f"{STRATEGY_CODE_CONTEXT}\n\n"
+                            f"## Current strategy source\n```python\n{strategy_source}\n```\n\n"
+                            f"## Evolution plan to apply\n{plan}\n\n"
+                            f"## Task\n"
+                            f"Apply EXACTLY the single change specified in the evolution "
+                            f"plan to the strategy above. Keep ALL other logic identical. "
+                            f"The class MUST be named `{candidate_name}` and keep the same "
+                            f"kline_type / kline_minute. Output ONLY one ```python code "
+                            f"block containing the complete strategy file."
                         )
+                        for attempt in (1, 2):
+                            msg = gen_msg if attempt == 1 else (
+                                gen_msg + f"\n\n## Previous attempt failed\n{last_err}\n"
+                                f"Fix the problem and output the complete corrected code.")
+                            try:
+                                # The API call is INSIDE the try (issue #108): a
+                                # transient model outage (Gemini 503) used to escape
+                                # this loop entirely, so the advertised "one retry"
+                                # never happened for API failures and the error died
+                                # in the outer handler with no Discord notice.
+                                ai_calls += 1
+                                resp = self._chat_client.one_shot(
+                                    msg, system_prompt=CODE_GEN_SYSTEM_PROMPT,
+                                    max_tokens=_CODE_GEN_MAX_TOKENS,
+                                    call_site=f"evolution_codegen_{attempt}",
+                                    model=heavy_model)
+                                code = extract_python_code(resp) or ""
+                                if not code:
+                                    last_err = "no ```python code block found in the response"
+                                    continue
+                                candidate_cls = load_strategy_from_source(code)
+                                # load_strategy_from_source returns the first
+                                # BacktestStrategy subclass whatever it is named.
+                                # A kept base-class name would collide with the
+                                # live strategy (issue #114). Discard it and
+                                # spend the retry correcting the name.
+                                if (name_err := check_candidate_name(
+                                        candidate_cls, candidate_name)):
+                                    candidate_cls = None
+                                    last_err = name_err
+                                    continue
+                                break
+                            except (CodeValidationError, CodeExecutionError) as e:
+                                last_err = str(e)
+                            except Exception as e:
+                                last_err = f"AI API error — [{type(e).__name__}] {e}"
+                                _log(f"EVO codegen attempt {attempt} failed: {last_err}")
+                    if candidate_cls is None:
+                        msg = f"🧬 EVO FAIL: candidate generation failed twice — {last_err}"
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        _remember("fail", "codegen", msg)
+                        return
+
+                    # ── Phase 3: validation backtest ──
+                    # The feed may be 1-min CSVs or API bars (engine
+                    # aggregates sub-native feeds internally) — size guards
+                    # in NATIVE bars, not feed bars.
+                    feed_iv = bars[0].interval if bars else 0
+                    native_est = len(bars)
+                    if feed_iv and native_sec > feed_iv:
+                        native_est = len(bars) * feed_iv // native_sec
+                    if native_est < 150:
+                        msg = (f"🧬 EVO: only ~{native_est} native bars of data "
+                               f"available — not enough for a meaningful validation "
+                               f"backtest. Plan + candidate generated but NOT "
+                               f"validated/saved; run a TV/API backtest manually.")
+                        if structural_lane:
+                            notice = _record_structural("refused", {
+                                "reason": "native bars below 150",
+                                "form": _structural_form,
+                                "native_bars": native_est,
+                                "sandbox_ok": True,
+                                "dsr_trials": 0,
+                            }, form=_structural_form)
+                            if notice:
+                                msg = msg + "\n" + notice
+                        ui(self._append_chat, "system", msg)
+                        if auto_run:
+                            _notify_discord(msg)
+                        _remember("fail", "insufficient_bars", msg)
+                        return
+
+                    data_desc = (
+                        f"{data_origin}: "
+                        f"{bars[0].dt:%Y-%m-%d %H:%M} → {bars[-1].dt:%Y-%m-%d %H:%M} "
+                        f"({len(bars)} × {feed_iv // 60}min bars "
+                        f"≈ {native_est} native bars)")
+
+                    evo_gate_cfg = evolution_gate_config_from_mapping(
+                        evolution_gate_raw)
+                    for warning in evo_gate_cfg.warnings:
+                        _log(f"EVO gate config: {warning}")
+                    month_gate_cfg = month_gate_config_from_mapping(
+                        evolution_gate_raw)
+                    for warning in month_gate_cfg.warnings:
+                        _log(f"EVO month gate config: {warning}")
+                    # Decision time, not a start-of-run snapshot. Running
+                    # runner: its trading_mode. Idle or missing: configured
+                    # mode only — unknown stays unknown (absolute gate).
+                    runner = getattr(self, "_live_runner", None)
+                    runner_idle = (
+                        runner is None
+                        or getattr(runner, "state", None) == LiveState.IDLE)
+                    promotion_mode = evolution_promotion_mode(
+                        runner=runner,
+                        runner_idle=runner_idle,
+                        configured_mode=getattr(self, "_trading_mode", None),
+                    )
+                    evo_gate = resolve_promotion_gate(
+                        promotion_mode,
+                        evo_gate_cfg.paper_gate,
+                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
+                    )
+                    from src.evolution.paper_gate import gate_for_trial
+                    # Walk-forward uses the fallback (absolute when this run
+                    # has no grid trial). assemble_promotion_verdict applies
+                    # the same fallback and puts the log line on the verdict.
+                    _scored_gate, _no_grid_line = gate_for_trial(evo_gate, grid_trial)
+                    if _no_grid_line:
+                        _log(_scored_gate.note or _no_grid_line)
+                    elif evo_gate.note:
+                        _log(f"EVO gate: {evo_gate.note}")
+                    evo_require_abs_pf = abs_pf_required(_scored_gate)
+
+                    # Walk-forward (SEE spec: 90d train / 90d test + Monte
+                    # Carlo) when data allows; scaled windows on shorter
+                    # spans; simple single-window A/B as last resort.
+                    span_days = ((bars[-1].dt - bars[0].dt).days
+                                 if len(bars) >= 2 else 0)
+                    # Walk-forward windows aligned with the design/holdout
+                    # split: the test window IS the holdout (the design never
+                    # saw it); the train window is up to 90d of pre-holdout
+                    # data. Too little pre-holdout history (< 14d) → walk-
+                    # forward is meaningless, degrade to simple A/B.
+                    tr_d = te_d = 0
+                    if validation == "deep":
+                        from src.evolution.evaluator import DEEP_TRAIN_DAYS
+                        te_d = holdout_days
+                        tr_d = min(DEEP_TRAIN_DAYS, max(0, span_days - te_d))
+                        if tr_d < 14:
+                            tr_d = 0
+
+                    if tr_d:
+                        ui(self._append_chat, "system",
+                           f"EVO 3/3: walk-forward + multi-fold + month gates — "
+                           f"train {tr_d}d / test {te_d}d + Monte Carlo "
+                           f"({base_cls_name} vs {candidate_cls.__name__})...")
+                        baseline_res = run_deep_validation(
+                            baseline_cls, bars, point_value, "基準 baseline",
+                            tr_d, te_d, monte_carlo=False,
+                            capital_base=capital_base)
+                        candidate_res = run_deep_validation(
+                            candidate_cls, bars, point_value,
+                            f"候選 {candidate_cls.__name__}", tr_d, te_d,
+                            monte_carlo=True, capital_base=capital_base)
+                        window_verdict = decide_deep_verdict(
+                            baseline_res, candidate_res, directives["criteria"],
+                            require_abs_pf=evo_require_abs_pf)
+                        cl_base_m = (baseline_res.test.metrics
+                                     if baseline_res.test.result else None)
+                        cl_cand_m = (candidate_res.test.metrics
+                                     if candidate_res.test.result else None)
+                    else:
+                        if validation == "deep":
+                            ui(self._append_chat, "system",
+                               f"EVO: data span {span_days}d too short for "
+                               f"walk-forward — using simple A/B plus multi-fold "
+                               f"and month gates.")
+                        ui(self._append_chat, "system",
+                           f"EVO 3/3: A/B + multi-fold + month gates on {len(bars)} × "
+                           f"{feed_iv // 60}min bars ≈ {native_est} native bars "
+                           f"({base_cls_name} vs {candidate_cls.__name__})...")
+                        baseline_res = run_ab_backtest(
+                            baseline_cls, bars, point_value, "基準 baseline",
+                            capital_base=capital_base)
+                        candidate_res = run_ab_backtest(
+                            candidate_cls, bars, point_value,
+                            f"候選 {candidate_cls.__name__}",
+                            capital_base=capital_base)
+                        window_verdict = decide_verdict(
+                            baseline_res, candidate_res, directives["criteria"],
+                            require_abs_pf=evo_require_abs_pf)
+                        cl_base_m = baseline_res.metrics
+                        cl_cand_m = candidate_res.metrics
+
+                    # Issue #153: multi-fold + month gates on the same bars.
+                    # Month reasons are combined first so Discord truncation
+                    # keeps prior-months collapse / calendar-month dominated.
+                    folds, mf_base, mf_cand = run_multifold_validation(
+                        baseline_cls, candidate_cls, bars, point_value,
+                        fold_days=int(evo_gate_cfg.relative.fold_days),
+                        capital_base=capital_base)
+                    base_trades = (list(mf_base.result.trades)
+                                   if mf_base.result is not None else [])
+                    cand_trades = (list(mf_cand.result.trades)
+                                   if mf_cand.result is not None else [])
+                    ho_start = holdout_window_start(bars, te_d or holdout_days)
+                    # Paper relative drops the absolute PF floors and ANDs the
+                    # bootstrap / effect-size checks plus the grid's DSR and
+                    # PBO (grid_trial). Real money stays absolute. The retire
+                    # recommendation below does not feed this verdict.
+                    assembled = assemble_promotion_verdict(
+                        gate=evo_gate,
+                        gate_cfg=evo_gate_cfg,
+                        folds=folds,
+                        base_trades=base_trades,
+                        cand_trades=cand_trades,
+                        holdout_start=ho_start,
+                        criteria=directives["criteria"],
+                        window_verdict=window_verdict,
+                        bars=bars,
+                        month_gate=month_gate_cfg,
+                        trial=grid_trial,
+                    )
+                    verdict = assembled.verdict
+                    # assemble_promotion_verdict threads decide_month_gates'
+                    # observation out. The PASS changelog below forwards it.
+                    month_verdict = assembled.month_verdict
+                    # Debug-only. A logging failure must not abort validation.
+                    try:
+                        _log(format_month_gates_debug(month_verdict.month_gates))
                     except Exception as e:
-                        _log(f"EVO pool promote failed: [{type(e).__name__}] {e}")
-                        pool_id = ""
-
-                    if pool_id:
                         try:
-                            from src.daily_report.changelog import append_changelog
+                            _log(f"EVO month gates log failed: "
+                                 f"[{type(e).__name__}] {e}")
+                        except Exception:
+                            pass
 
-                            def _mdict(m):
-                                if m is None:
-                                    return None
-                                pf = (None if m.profit_factor == float("inf")
-                                      else round(m.profit_factor, 3))
-                                return {"trades": m.total_trades, "pnl": m.total_pnl,
-                                        "pf": pf,
-                                        "max_dd_pct": round(m.max_drawdown_pct, 2),
-                                        "win_rate": round(m.win_rate, 3)}
-                            append_changelog(
-                                strategy_name=display_name,
-                                version_before=base_cls_name,
-                                version_after=candidate_cls.__name__,
-                                change_summary=(
-                                    f"auto-evolution pool-validated only "
-                                    f"(StrategyStore auto-save blocked, #153); "
-                                    f"validation={'walk-forward' if tr_d else 'simple A/B'}"
-                                    f"+multifold+month; "
-                                    f"criteria={directives['criteria']}; "
-                                    f"plan excerpt: {plan[:300]}"),
-                                initiated_by="ai",
-                                metrics_before=_mdict(cl_base_m),
-                                metrics_after=_mdict(cl_cand_m),
+                    # Clean PASS → StrategyPool validated only. Never
+                    # StrategyStore.save and never STRATEGIES[...].
+                    # Propose mode and the structural lane skip the pool.
+                    # They still append the same history line below.
+                    pool_id = ""
+                    _proposal_notice = ""
+                    from src.evolution.structural_lane import (
+                        normalize_saturday_mode, pool_promotion_allowed)
+                    _promote_pool = pool_promotion_allowed(
+                        saturday_mode=self._settings.get(
+                            "evolution_saturday_mode", "propose"),
+                        structural_lane=structural_lane,
+                        eligible=eligible_for_validated_pool(verdict),
+                        auto_run=auto_run,
+                    )
+                    if _promote_pool:
+                        try:
+                            from src.evolution.pool import (
+                                StrategyPool, default_pool_path,
+                                record_validated_candidate)
+                            wf = 0.0
+                            fit = getattr(
+                                getattr(candidate_res, "test", None), "fitness", None)
+                            if fit is None:
+                                fit = getattr(candidate_res, "fitness", None)
+                            if fit is not None:
+                                wf = float(fit.composite)
+                            pool_id = record_validated_candidate(
+                                StrategyPool(default_pool_path()),
+                                name=candidate_cls.__name__,
+                                source_code=code,
+                                walkforward_fitness=wf,
+                                notes=(
+                                    "issue #153 weekend evo PASS — StrategyPool "
+                                    "validated only; StrategyStore / STRATEGIES "
+                                    "auto-save blocked; "
+                                    f"{gate_provenance(evo_gate.mode)}"),
                             )
                         except Exception as e:
-                            _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+                            _log(f"EVO pool promote failed: [{type(e).__name__}] {e}")
+                            pool_id = ""
 
-                block = format_weekend_verdict_block(
-                    verdict, folds, data_desc, pool_promoted=pool_id)
-                if verdict.passed and not pool_id:
-                    block += ("\nPool promotion failed — nothing was registered "
-                              "and STRATEGIES was not updated.")
-                ui(self._remove_last_system_line)
-                ui(self._append_chat, "system", block)
-                if verdict.passed and pool_id:
-                    status = ("🧬 EVO PASS — pool validated, "
-                              "not added to STRATEGIES")
-                elif verdict.passed:
-                    status = ("🧬 EVO PASS — pool promotion failed; "
-                              "nothing registered")
-                else:
-                    status = "🧬 EVO FAIL — candidate rejected"
-                ui(self.set_status, status)
-                # Verdict goes to Discord from BOTH manual and weekly-auto
-                # runs (manual too, per user: testing + visibility). The
-                # block carries multi-fold and month reasons (issue #153).
-                if _discord is not None and _discord.enabled:
+                        if pool_id:
+                            try:
+                                from src.daily_report.changelog import append_changelog
+                                from src.evolution.changelog_params import (
+                                    evolution_changelog_params)
+
+                                def _mdict(m):
+                                    if m is None:
+                                        return None
+                                    pf = (None if m.profit_factor == float("inf")
+                                          else round(m.profit_factor, 3))
+                                    return {"trades": m.total_trades, "pnl": m.total_pnl,
+                                            "pf": pf,
+                                            "max_dd_pct": round(m.max_drawdown_pct, 2),
+                                            "win_rate": round(m.win_rate, 3)}
+                                params_before, params_after, params_reason = (
+                                    evolution_changelog_params(
+                                        knob_apply=_knob_apply,
+                                        baseline_cls=baseline_cls,
+                                        baseline_source=strategy_source or "",
+                                        candidate_source=code or "",
+                                        candidate_name=candidate_cls.__name__,
+                                    ))
+                                append_changelog(
+                                    strategy_name=display_name,
+                                    version_before=base_cls_name,
+                                    version_after=candidate_cls.__name__,
+                                    change_summary=(
+                                        f"{gate_provenance(evo_gate.mode)}; "
+                                        f"auto-evolution pool-validated only "
+                                        f"(StrategyStore auto-save blocked, #153); "
+                                        f"validation={'walk-forward' if tr_d else 'simple A/B'}"
+                                        f"+multifold+month; "
+                                        f"criteria={directives['criteria']}; "
+                                        f"plan excerpt: {plan[:300]}"),
+                                    initiated_by="ai",
+                                    metrics_before=_mdict(cl_base_m),
+                                    metrics_after=_mdict(cl_cand_m),
+                                    params_before=params_before,
+                                    params_after=params_after,
+                                    params_reason=params_reason,
+                                    month_gates=month_verdict.month_gates,
+                                )
+                            except Exception as e:
+                                _log(f"EVO changelog append failed: [{type(e).__name__}] {e}")
+                    elif structural_lane or (
+                            auto_run and normalize_saturday_mode(
+                                self._settings.get("evolution_saturday_mode"))
+                            == "propose"):
+                        # Evidence only. The proposal file does not replace
+                        # the history line written after the Discord verdict.
+                        try:
+                            from src.evolution.structural_lane import (
+                                lane_config_from_settings, make_incubation,
+                                structural_paper_decision)
+                            _lane_cfg = lane_config_from_settings(self._settings)
+                            _q2_passed = False
+                            _q2_reasons: list[str] = []
+                            _paper_reasons: list[str] = []
+                            _paper_ok = False
+                            _incubation = None
+                            _form = _structural_form if structural_lane else ""
+                            _selection_winner = False
+                            if structural_lane:
+                                # Paper and backtest use the relative gate.
+                                # Real money stays absolute. A real trial
+                                # keeps the relative path from falling
+                                # back to absolute the way trial=None does.
+                                from dataclasses import replace
+                                from src.evolution.grid_search import (
+                                    structural_selection_pnls)
+                                from src.evolution.trial_penalty import (
+                                    selection_fold_winner,
+                                    structural_trial_evidence)
+                                _base_pnls, _cand_pnls = structural_selection_pnls(
+                                    base_trades, cand_trades,
+                                    fold_days=int(evo_gate_cfg.relative.fold_days),
+                                    holdout_start=ho_start,
+                                )
+                                _attempt_columns: list = (
+                                    [None] * max(0, _structural_codegen_attempts - 1)
+                                    + [_cand_pnls or None])
+                                _structural_trial = structural_trial_evidence(
+                                    baseline_folds=_base_pnls,
+                                    attempts=_attempt_columns,
+                                )
+                                self._structural_trial_penalty = _structural_trial
+                                _selection_winner = selection_fold_winner(
+                                    _base_pnls, _cand_pnls)
+                                _log(
+                                    "EVO structural trial: "
+                                    f"DSR={_structural_trial.dsr} "
+                                    f"PBO={_structural_trial.pbo} informational "
+                                    f"N={_structural_trial.n_trials} "
+                                    f"selection_winner={_selection_winner}")
+                                # Lane DSR bar, not the grid's 0.90. PBO is
+                                # logged by the relative check and is not a
+                                # pass condition on this lane.
+                                _structural_gate_cfg = replace(
+                                    evo_gate_cfg,
+                                    relative=replace(
+                                        evo_gate_cfg.relative,
+                                        dsr_min=float(_lane_cfg["dsr_min"]),
+                                    ),
+                                )
+                                _q2_abs = abs_pf_required(evo_gate)
+                                _q2_window = (
+                                    decide_deep_verdict(
+                                        baseline_res, candidate_res,
+                                        directives["criteria"],
+                                        require_abs_pf=_q2_abs)
+                                    if tr_d else
+                                    decide_verdict(
+                                        baseline_res, candidate_res,
+                                        directives["criteria"],
+                                        require_abs_pf=_q2_abs))
+                                _q2 = assemble_promotion_verdict(
+                                    gate=evo_gate,
+                                    gate_cfg=_structural_gate_cfg,
+                                    folds=folds,
+                                    base_trades=base_trades,
+                                    cand_trades=cand_trades,
+                                    holdout_start=ho_start,
+                                    criteria=directives["criteria"],
+                                    window_verdict=_q2_window,
+                                    bars=bars,
+                                    month_gate=month_gate_cfg,
+                                    trial=_structural_trial,
+                                    pbo_required=False,
+                                )
+                                _q2_passed = (
+                                    bool(_q2.verdict.passed)
+                                    and not bool(_q2.verdict.provisional)
+                                    and _selection_winner)
+                                _q2_reasons = list(_q2.verdict.reasons)
+                                _q2_reasons.append(
+                                    "selection-fold winner vs baseline: "
+                                    + ("pass" if _selection_winner else "FAIL"))
+                                _paper_ok, _paper_reasons = structural_paper_decision(
+                                    sandbox_ok=True,
+                                    native_bars=native_est,
+                                    q2_passed=_q2_passed,
+                                    pbo=_structural_trial.pbo,
+                                    dsr=_structural_trial.dsr,
+                                    config=_lane_cfg,
+                                    selection_winner=_selection_winner,
+                                )
+                                _bt_mean = None
+                                if cand_trades:
+                                    _bt_mean = (
+                                        sum(int(getattr(t, "pnl", 0) or 0)
+                                            for t in cand_trades)
+                                        / len(cand_trades))
+                                _incubation = make_incubation(
+                                    bot_id=(structural_bot_id
+                                            or BacktestApp._structural_bot_id(self)),
+                                    month=(structural_month
+                                           or _taipei_now().strftime("%Y-%m")),
+                                    form=_form,
+                                    status=("paper_recommended" if _paper_ok
+                                            else "not_admitted"),
+                                    backtest_mean_pnl=_bt_mean,
+                                )
+                            _proposal_notice = BacktestApp._write_saturday_proposal(
+                                self,
+                                status="proposed",
+                                evidence={
+                                    "verdict_passed": bool(verdict.passed),
+                                    "reasons": list(verdict.reasons),
+                                    "q2_passed": _q2_passed,
+                                    "q2_reasons": _q2_reasons,
+                                    "paper_reasons": _paper_reasons,
+                                    "paper_recommended": _paper_ok,
+                                    "native_bars": native_est,
+                                    "sandbox_ok": True,
+                                    "pbo": (None if _structural_trial is None
+                                            else _structural_trial.pbo),
+                                    "dsr": (None if _structural_trial is None
+                                            else _structural_trial.dsr),
+                                    "selection_winner": (
+                                        _selection_winner if structural_lane
+                                        else None),
+                                    "dsr_trials": (
+                                        _structural_trial.n_trials
+                                        if structural_lane and _structural_trial is not None
+                                        else 0),
+                                    "knob_apply": _knob_apply,
+                                    "candidate": candidate_cls.__name__,
+                                },
+                                lane=("structural" if structural_lane else "saturday"),
+                                form=_form,
+                                ledger_path=structural_ledger,
+                                bot_id=structural_bot_id,
+                                month=structural_month,
+                                touch_slot=bool(structural_lane),
+                                incubation=_incubation,
+                                source_code=(code if structural_lane else ""),
+                            )
+                        except Exception as e:
+                            _log("EVO proposal record failed: "
+                                 f"[{type(e).__name__}] {e}")
+                            _proposal_notice = ""
+
+                    block = format_weekend_verdict_block(
+                        verdict, folds, data_desc, pool_promoted=pool_id)
+                    if _proposal_notice:
+                        block += "\n" + _proposal_notice
+                    elif verdict.passed and not pool_id:
+                        block += ("\nPool promotion failed — nothing was registered "
+                                  "and STRATEGIES was not updated.")
+                    # Recommend-only. A failure here must not change the verdict
+                    # or the pool promotion above, and must not touch live state.
+                    evaluated_at = None
                     try:
-                        _discord.evolution_verdict(verdict.passed, block)
-                    except Exception:
-                        pass
-            except Exception as e:
-                _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
-                err_msg = str(e)
-                # Built INSIDE the except — Python 3.13 deletes `e` on exit.
-                # Weekly-auto runs must not die silently (issue #108): a
-                # plan-phase failure only reached the log before this.
-                # Manual runs stay Discord-quiet, like the other EVO
-                # failure branches above.
-                if auto_run:
-                    _notify_discord(
-                        f"🧬 EVO ERROR: [{type(e).__name__}] {e}")
-                ui(self._on_chat_error, err_msg)
-            finally:
-                ui(lambda: self.btn_send.config(state=tk.NORMAL))
+                        append_changelog = None
+                        prior_weeks = []
+                        try:
+                            from src.daily_report.changelog import (
+                                append_changelog as _append_changelog,
+                                load_changelog,
+                            )
+                            append_changelog = _append_changelog
+                            prior_weeks = weeks_from_changelog(
+                                load_changelog(), display_name)
+                        except Exception as hist_err:
+                            _log("EVO retire history unread: "
+                                 f"[{type(hist_err).__name__}] {hist_err}")
+                        evaluated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                        weeks = list(prior_weeks)
+                        if evo_gate.mode == "relative":
+                            weeks.append(WeekRecord(
+                                at=evaluated_at, evaluated=True,
+                                passed=bool(verdict.passed)))
+                            if append_changelog is not None:
+                                try:
+                                    append_changelog(
+                                        strategy_name=display_name,
+                                        version_before=base_cls_name,
+                                        version_after=base_cls_name,
+                                        change_summary=relative_eval_summary(
+                                            bool(verdict.passed), evaluated_at),
+                                        initiated_by="ai",
+                                    )
+                                except Exception as rec_err:
+                                    _log("EVO relative-gate record failed: "
+                                         f"[{type(rec_err).__name__}] {rec_err}")
+                        _grad_stamps: list[str] = []
+                        try:
+                            from src.evolution.structural_lane import (
+                                applied_graduation_stamps, load_ledger)
+                            _grad_stamps = applied_graduation_stamps(
+                                load_ledger(structural_ledger or str(
+                                    BacktestApp._structural_ledger_path(self))))
+                        except Exception as stamp_err:
+                            _log("EVO graduation stamps unread: "
+                                 f"[{type(stamp_err).__name__}] {stamp_err}")
+                            _grad_stamps = []
+                        rec = assess_retirement(
+                            base_trades,
+                            weeks=weeks,
+                            structural_graduations=_grad_stamps,
+                            now=datetime.now(),
+                            config=evo_gate_cfg.retire,
+                        )
+                        report_lines: list[str] = []
+                        emit_retire_recommendation(
+                            rec,
+                            log=_log,
+                            changelog=(append_changelog if rec.recommend else None),
+                            report=report_lines,
+                            strategy_name=display_name,
+                            version=base_cls_name,
+                        )
+                        if structural_lane or (
+                                structural_ledger and os.path.exists(
+                                    structural_ledger)):
+                            from src.evolution.structural_lane import (
+                                structural_saturday_followup)
+                            structural_saturday_followup(
+                                structural_ledger or str(
+                                    BacktestApp._structural_ledger_path(self)),
+                                observations=(),
+                                log=_log,
+                                changelog=append_changelog,
+                                report=report_lines,
+                                strategy_name=display_name,
+                                version=base_cls_name,
+                            )
+                        if report_lines:
+                            block += "\n" + "\n".join(report_lines)
+                    except Exception as retire_err:
+                        _log("EVO retire recommendation failed: "
+                             f"[{type(retire_err).__name__}] {retire_err}")
+                    ui(self._remove_last_system_line)
+                    ui(self._append_chat, "system", block)
+                    if _proposal_notice:
+                        status = ("🧬 EVO PROPOSAL — nothing applied ("
+                                  + ("verdict pass" if verdict.passed
+                                     else "verdict fail") + ")")
+                    elif verdict.passed and pool_id:
+                        status = ("🧬 EVO PASS — pool validated, "
+                                  "not added to STRATEGIES")
+                    elif verdict.passed:
+                        status = ("🧬 EVO PASS — pool promotion failed; "
+                                  "nothing registered")
+                    else:
+                        status = "🧬 EVO FAIL — candidate rejected"
+                    ui(self.set_status, status)
+                    # Verdict goes to Discord from BOTH manual and weekly-auto
+                    # runs (manual too, per user: testing + visibility). The
+                    # block carries multi-fold and month reasons (issue #153).
+                    if _discord is not None and _discord.enabled:
+                        try:
+                            _discord.evolution_verdict(verdict.passed, block)
+                        except Exception:
+                            pass
+                    if _proposal_notice and verdict.passed:
+                        history_reason = "proposal recorded; nothing applied"
+                    elif _proposal_notice:
+                        history_reason = "proposal recorded; validation failed"
+                    elif verdict.passed and pool_id:
+                        history_reason = ""
+                    elif verdict.passed:
+                        history_reason = "pool promotion failed"
+                    else:
+                        history_reason = "validation failed"
+                    _remember(
+                        "pass" if verdict.passed else "fail",
+                        "validation",
+                        history_reason,
+                        provisional=bool(verdict.provisional),
+                        assembled=assembled,
+                        folds=folds,
+                        baseline_res=baseline_res,
+                        candidate_res=candidate_res,
+                        gate=evo_gate,
+                        gate_cfg=evo_gate_cfg,
+                        retire_evaluated=(evo_gate.mode == "relative"),
+                        retire_passed=bool(verdict.passed),
+                        ts=evaluated_at,
+                        capture_params=True,
+                        knob_apply=_knob_apply,
+                        baseline_cls=baseline_cls,
+                        baseline_source=strategy_source or "",
+                        candidate_source=code or "",
+                        candidate_name=candidate_cls.__name__,
+                        baseline_name=base_cls_name,
+                    )
+                    _evolution_history_sealed()
+                except Exception as e:
+                    _log(f"EVO pipeline error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
+                    err_msg = str(e)
+                    _remember("fail", "pipeline_error",
+                              f"[{type(e).__name__}] {err_msg}")
+                    # Built INSIDE the except — Python 3.13 deletes `e` on exit.
+                    # Weekly-auto runs must not die silently (issue #108): a
+                    # plan-phase failure only reached the log before this.
+                    # Manual runs stay Discord-quiet, like the other EVO
+                    # failure branches above.
+                    if auto_run:
+                        _notify_discord(
+                            f"🧬 EVO ERROR: [{type(e).__name__}] {e}")
+                    ui(self._on_chat_error, err_msg)
+                finally:
+                    try:
+                        ui(lambda: self.btn_send.config(state=tk.NORMAL))
+                    finally:
+                        _evolution_end(key)
 
-        def _launch(launch_bars, origin):
-            evo_data["bars"] = launch_bars
-            evo_data["origin"] = origin
-            self._append_chat(
-                "user",
-                "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
-            self.btn_send.config(state=tk.DISABLED)
-            self._append_chat(
-                "system",
-                f"EVO 1/3: analyzing {total_trades} trades, "
-                f"generating evolution plan... (validation data: {origin})")
-            threading.Thread(target=_worker, daemon=True).start()
+            def _launch(launch_bars, origin):
+                nonlocal started
+                evo_data["bars"] = launch_bars
+                evo_data["origin"] = origin
+                self._append_chat(
+                    "user",
+                    "🧬 Bot Evolution (auto-pipeline): 請產出策略演化計畫\n" + context)
+                self.btn_send.config(state=tk.DISABLED)
+                self._append_chat(
+                    "system",
+                    f"EVO 1/3: analyzing {total_trades} trades, "
+                    f"generating evolution plan... (validation data: {origin})")
+                threading.Thread(target=_worker, daemon=True).start()
+                started = True
+                return True
 
-        # ── Validation data dispatch ──
-        # Deep walk-forward wants train+test (+buffer) days of native
-        # bars. Fetch via Capital API when the quote session is up and
-        # the live bot is in steady RUNNING state (KLine routing goes to
-        # the backtest fetcher then — warmup/poll flags are False).
-        # Everything else falls back to local data.
-        can_api_fetch = (
-            validation == "deep" and live and self._quote_connected
-            and not self._live_warmup_mode
-            and self._live_runner.state == LiveState.RUNNING
-            and baseline_cls is not None
-            and self._evo_fetch_cb is None  # no fetch already in flight
-        )
-        if can_api_fetch:
-            from src.evolution.evaluator import DEEP_TRAIN_DAYS, DEEP_TEST_DAYS
-            need_days = DEEP_TRAIN_DAYS + DEEP_TEST_DAYS + 14  # warmup buffer
-            now_tpe = _taipei_now()
-            start = (now_tpe - timedelta(days=need_days)).strftime("%Y%m%d")
-            end = now_tpe.strftime("%Y%m%d")
-            symbol = self._live_runner.symbol
-            kt = baseline_cls.kline_type
-            km = baseline_cls.kline_minute
-            self._append_chat(
-                "system",
-                f"EVO 0/3: fetching ~{need_days}d of {km}min bars via "
-                f"Capital API for walk-forward validation...")
-            self._fetcher.start_api_fetch(symbol, kt, km, start, end)
+            # ── Validation data dispatch ──
+            # Deep walk-forward wants train+test (+buffer) days of native
+            # bars. Fetch via Capital API when the quote session is up and
+            # the live bot is in steady RUNNING state (KLine routing goes to
+            # the backtest fetcher then — warmup/poll flags are False).
+            # Everything else falls back to local data.
+            can_api_fetch = (
+                validation == "deep" and live and self._quote_connected
+                and not self._live_warmup_mode
+                and self._live_runner.state == LiveState.RUNNING
+                and baseline_cls is not None
+                and self._evo_fetch_cb is None  # no fetch already in flight
+            )
+            if can_api_fetch:
+                from src.evolution.evaluator import DEEP_TRAIN_DAYS, DEEP_TEST_DAYS
+                need_days = DEEP_TRAIN_DAYS + DEEP_TEST_DAYS + 14  # warmup buffer
+                now_tpe = _taipei_now()
+                start = (now_tpe - timedelta(days=need_days)).strftime("%Y%m%d")
+                end = now_tpe.strftime("%Y%m%d")
+                symbol = self._live_runner.symbol
+                kt = baseline_cls.kline_type
+                km = baseline_cls.kline_minute
+                self._append_chat(
+                    "system",
+                    f"EVO 0/3: fetching ~{need_days}d of {km}min bars via "
+                    f"Capital API for walk-forward validation...")
+                self._fetcher.start_api_fetch(symbol, kt, km, start, end)
 
-            def _on_evo_fetch_done(ok: bool):
-                # Deploy keeps the fetch buttons disabled during a live
-                # session — restore that invariant (the chunk-loop error
-                # path calls _enable_buttons()).
-                self.btn_api.config(state=tk.DISABLED)
-                self.btn_tv.config(state=tk.DISABLED)
-                api_bars = self._fetcher.get_api_bars() if ok else []
-                if api_bars:
-                    _launch(api_bars, f"Capital API ({need_days}d requested)")
-                else:
-                    fb, origin = _fallback_bars()
-                    self._append_chat(
-                        "system",
-                        f"EVO: API fetch failed — falling back to {origin}.")
-                    _launch(fb, origin)
+                def _on_evo_fetch_done(ok: bool):
+                    # Deploy keeps the fetch buttons disabled during a live
+                    # session — restore that invariant (the chunk-loop error
+                    # path calls _enable_buttons()). The guard stays held
+                    # until the worker finishes. A failure before launch
+                    # releases it here so a crashed fetch cannot wedge the bot.
+                    launched = False
+                    try:
+                        self.btn_api.config(state=tk.DISABLED)
+                        self.btn_tv.config(state=tk.DISABLED)
+                        api_bars = self._fetcher.get_api_bars() if ok else []
+                        if api_bars:
+                            launched = _launch(
+                                api_bars, f"Capital API ({need_days}d requested)")
+                        else:
+                            fb, origin = _fallback_bars()
+                            self._append_chat(
+                                "system",
+                                f"EVO: API fetch failed — falling back to {origin}.")
+                            launched = _launch(fb, origin)
+                    finally:
+                        if not launched:
+                            _evolution_end(key)
 
-            self._evo_fetch_cb = _on_evo_fetch_done
-            self._fetch_next_chunk()
-        else:
-            fb, origin = _fallback_bars()
-            _launch(fb, origin)
+                self._evo_fetch_cb = _on_evo_fetch_done
+                self._fetch_next_chunk()
+                started = True
+            else:
+                fb, origin = _fallback_bars()
+                _launch(fb, origin)
+
+        finally:
+            if not started:
+                _evolution_end(key)
 
     # ══════════════════════════════════════════════════════════════
     #  LIVE TRADING METHODS
@@ -6635,18 +7945,239 @@ class BacktestApp:
 
     # ── Dialog seams (overridden by the headless CLI, src/live/headless_app.py) ──
 
-    def _confirm(self, title: str, message: str) -> bool:
+    def _confirm(self, title: str, message: str, *, default_no: bool = False) -> bool:
         """Yes/No question on the deploy + backtest paths.
 
         The GUI asks the user; ``HeadlessBotApp`` answers from its policy
         flags. Every interactive question on these paths MUST go through
         here so the CLI never blocks on a hidden dialog.
+
+        ``default_no`` selects the No button. The unknown-position prompt
+        uses it (issue #202). Other prompts keep the toolkit default (Yes).
         """
-        return bool(messagebox.askyesno(title, message))
+        options = {}
+        if default_no:
+            options["default"] = messagebox.NO
+        return bool(messagebox.askyesno(title, message, **options))
 
     def _alert(self, title: str, message: str) -> None:
         """Error popup on the deploy path (log-only when headless)."""
         messagebox.showerror(title, message)
+
+    def _on_restore_alert(self, message: str) -> None:
+        """Alert when a resumed position has no recoverable stop (issue #168).
+
+        Headless overrides ``_alert`` and only records it, so a detached
+        bot is not blocked on a hidden dialog.
+        """
+        self._alert("恢復後沒有停損 No Stop After Restore", message)
+
+    def _reconcile_resumed_guard(self, resume_session, trading_mode, symbol) -> None:
+        """Restore the fill gate and restart its poller (issues #79, #168).
+
+        ``reset()`` on deploy cleared ``fill_pending``. A persisted
+        in-flight order is put back so it is not sent twice. The fill
+        poller was reset in the same breath, and deal-row confirmation
+        only runs while ``_fill_poller.active``. Without restarting it,
+        every later real order — protective exits included — stays
+        ``BLOCK_FILL_PENDING`` with nothing but a log line. The flat
+        path is the same hazard: a restored entry gate blocks entries
+        and exits. Both paths arm the poller below.
+        """
+        persisted_guard = None
+        if isinstance(resume_session, dict):
+            raw_guard = resume_session.get("trading_guard")
+            if isinstance(raw_guard, dict):
+                persisted_guard = raw_guard
+        outcome = {"cleared_stale": False, "kept_inflight": False}
+        # Paper has no real book, so the sim position is the match.
+        # semi_auto/auto overwrite this from the OI snapshot.
+        real_ok, real_reason = True, "match"
+        sim_open = self._live_runner.broker.position_size > 0
+        if sim_open:
+            # Real-money hazard (issue #79 review): the restored SIM broker
+            # can hold a position even when the REAL account is FLAT (user
+            # closed overnight, or the entry was skipped last session).
+            # Confirming a real entry in that state lets the bot auto-send a
+            # close (sNewClose=2) against a flat account — OPENING a naked
+            # position. Only reconcile the guard if the real account (queried
+            # ~90 lines above via GetOpenInterestGW) also shows a position
+            # for this symbol. Paper mode has no real account, so the sim
+            # position alone is authoritative there.
+            # A bare `!= 0` was direction-agnostic: a real SHORT would
+            # "confirm" a sim LONG, and the auto close (sNewClose=2) would
+            # then be sent in the WRONG direction — adding to the real
+            # position instead of closing it. Require a direction match,
+            # and never read an un-answered snapshot as "flat".
+            if trading_mode in ("semi_auto", "auto"):
+                order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+                prefix = order_sym[:2] if order_sym else ""
+                sim_side = (self._live_runner.broker.position_side.value
+                            if self._live_runner.broker.position_side else "")
+                real_ok, real_reason = resume_real_position_ok(
+                    self._account_monitor.get_signed_position(prefix),
+                    sim_side,
+                    self._account_monitor.oi_snapshot_received,
+                )
+            outcome = apply_resume_guard(
+                self._trading_guard,
+                position_open=True,
+                real_ok=real_ok,
+                persisted=persisted_guard,
+            )
+            if real_ok:
+                if outcome["cleared_stale"]:
+                    self._live_log_msg(
+                        "[RESUME] Cleared stale fill_pending — position already "
+                        "confirmed from previous session", "status")
+                self._live_log_msg(
+                    "[RESUME] Restored confirmed real position — exits/"
+                    "force-close re-enabled", "status")
+            elif real_reason == "opposite":
+                self._live_log_msg(
+                    "[RESUME] Real account position is OPPOSITE to sim — NOT "
+                    "confirming entry. Manual review required.", "status")
+            elif real_reason == "unknown":
+                self._live_log_msg(
+                    "[RESUME] Real position UNKNOWN (持倉快照未收到 position "
+                    "snapshot not received) — NOT confirming entry. Manual "
+                    "review required.", "status")
+            else:
+                self._live_log_msg(
+                    "[RESUME] Real account flat but sim has position — NOT "
+                    "confirming entry. Manual review required.", "status")
+            if outcome["kept_inflight"]:
+                self._live_log_msg(
+                    "[RESUME] Kept in-flight fill_pending — "
+                    "not sending a new exit", "status")
+        elif persisted_guard is not None:
+            outcome = apply_resume_guard(
+                self._trading_guard,
+                position_open=False,
+                real_ok=False,
+                persisted=persisted_guard,
+            )
+            if outcome["kept_inflight"]:
+                self._live_log_msg(
+                    "[RESUME] Kept in-flight fill_pending — "
+                    "not sending a new exit", "status")
+            # Sim is flat, so position_side cannot name the entry. A
+            # deferred close still does: side LONG means the in-flight
+            # entry was a long. The real book has to match that side.
+            # Otherwise the poller is started with expected_sign=None,
+            # any non-zero OI confirms it, and the close is replayed
+            # into the opposite real position.
+            if trading_mode in ("semi_auto", "auto"):
+                close_side = self._deferred_close_side()
+                if close_side:
+                    order_sym = SYMBOL_CONFIG.get(symbol, {}).get(
+                        "order_symbol", "")
+                    prefix = order_sym[:2] if order_sym else ""
+                    real_ok, real_reason = resume_real_position_ok(
+                        self._account_monitor.get_signed_position(prefix),
+                        close_side,
+                        self._account_monitor.oi_snapshot_received,
+                    )
+                    if not real_ok:
+                        self._live_log_msg(
+                            "[RESUME] Flat sim, deferred close "
+                            f"{close_side} does not match the real book "
+                            f"({real_reason}) — NOT re-arming. "
+                            "Manual review required.",
+                            "status")
+        self._arm_resumed_fill_poll(
+            outcome, real_ok=real_ok, real_reason=real_reason)
+
+    def _deferred_close_side(self) -> str:
+        """Side named by a restored deferred close, or \"\"."""
+        deferred = self._trading_guard._deferred_close
+        if not isinstance(deferred, dict):
+            return ""
+        side = str(deferred.get("side") or "").upper()
+        return side if side in ("LONG", "SHORT") else ""
+
+    def _arm_resumed_fill_poll(self, outcome: dict, *,
+                               real_ok: bool, real_reason: str) -> None:
+        """Restart fill polling for an order that was in flight at resume.
+
+        Deploy has already ``reset()`` the poller. Putting ``fill_pending``
+        back without this leaves the gate closed forever: OnNewData will
+        not clear it (``_fill_poller.active`` is required) and the timeout
+        that downgrades to semi-auto never starts.
+
+        Do not arm when that would confirm the wrong book (issue #168):
+
+        * the sim is open and ``real_ok`` is False, or the sim is flat
+          but a deferred close names a side the real book does not hold.
+          The entry poller would otherwise treat any non-zero OI as the
+          fill and replay that close into the opposite position.
+        * the OI snapshot has not arrived (``get_signed_position`` is 0,
+          and an in-flight exit is "already flat").
+        * COM is down. ``start()`` would auto-confirm with no fill.
+
+        The gate stays up and an alert is raised. A mismatched book
+        drops the deferred close. On the flat branch a missing snapshot
+        or COM drops it too, so it cannot be replayed later.
+        """
+        if not outcome.get("kept_inflight") or not self._trading_guard.fill_pending:
+            return
+        action_type = self._trading_guard.fill_pending_type or "entry"
+        sim_open = bool(
+            self._live_runner and self._live_runner.broker.position_size > 0)
+        close_side = "" if sim_open else self._deferred_close_side()
+        snapshot_received = bool(
+            getattr(self._account_monitor, "oi_snapshot_received", False))
+        com_ok = bool(
+            _com_available and skO is not None and self._futures_account)
+        directed = sim_open or bool(close_side)
+        mismatch = directed and not real_ok
+        # Flat sim + a saved close: a missing snapshot or COM is the
+        # same hazard as a mismatch, because there is no position side
+        # to constrain the poller.
+        drop_close = mismatch or (
+            bool(close_side) and (not snapshot_received or not com_ok))
+        if mismatch or not snapshot_received or not com_ok:
+            if drop_close:
+                self._trading_guard._deferred_close = None
+            why = real_reason if mismatch else (
+                "no_com" if not com_ok else "unknown")
+            self._live_log_msg(
+                "[RESUME] In-flight "
+                f"{action_type} fill NOT re-armed ({why}). "
+                "Orders stay blocked — manual review required.",
+                "status",
+            )
+            self._alert(
+                "恢復後成交需人工核對 Manual Review",
+                f"In-flight {action_type} fill was restored but the fill "
+                f"poller was not started ({why}). "
+                "Real account does not match, the position snapshot has "
+                "not arrived, or COM is unavailable. "
+                "Orders stay blocked until you review the position.",
+            )
+            return
+        side = close_side
+        if sim_open and self._live_runner and self._live_runner.broker.position_side:
+            side = self._live_runner.broker.position_side.value or ""
+        expected_sign = 1 if side == "LONG" else -1 if side == "SHORT" else None
+        self._live_log_msg(
+            "[RESUME] In-flight "
+            f"{action_type} fill restored — restarting fill poller. "
+            "Real orders stay blocked until it confirms or times out.",
+            "status",
+        )
+        self._start_fill_polling(
+            action_type, expected_sign=expected_sign, resumed=True)
+        # Still pending: the poller is armed and the gate is held on
+        # purpose. Say so. A log line alone is how this used to stick.
+        # Headless records ``_alert`` and does not block on a dialog.
+        if self._trading_guard.fill_pending and self._fill_poller.active:
+            self._alert(
+                "恢復後成交確認未完成 Fill Still Pending",
+                f"In-flight {action_type} fill was restored. "
+                "New real orders stay blocked until the fill confirms "
+                "or the poller times out and downgrades to semi-auto.",
+            )
 
     def _deploy_live_from(self, req: DeployRequest) -> bool:
         """Deploy a live bot from an already-resolved request.
@@ -6800,13 +8331,34 @@ class BacktestApp:
             return False
 
         def _after_oi_wait() -> bool:
-            if (trading_mode in ("semi_auto", "auto") and self._futures_account
-                    and not self._account_monitor.oi_snapshot_received):
-                _log(
-                    "持倉查詢逾時 Position snapshot not received within "
-                    f"{OI_SNAPSHOT_TIMEOUT_S:.0f}s — treating real position "
-                    "as UNKNOWN"
+            # Fail closed (issue #202). A missing snapshot used to log
+            # UNKNOWN and deploy anyway, because an empty position list
+            # skipped the Existing Position confirm. Paper has no real book.
+            real_book = trading_mode in ("semi_auto", "auto") and self._futures_account
+            query_failed = bool(getattr(self, "_predeploy_oi_failed", False))
+            if real_book and (query_failed or not self._account_monitor.oi_snapshot_received):
+                detail = getattr(self, "_predeploy_oi_unknown_reason", "") or (
+                    f"not received within {OI_SNAPSHOT_TIMEOUT_S:.0f}s"
                 )
+                _log(
+                    "持倉未知 Position UNKNOWN "
+                    f"({detail}) — real-order deploy needs confirmation"
+                )
+                proceed = self._confirm(
+                    "持倉未知 Unknown Position",
+                    "無法確認帳戶未平倉部位（查詢失敗、被拒或逾時）。\n"
+                    "Real position is UNKNOWN (query failed, rejected, or timed out).\n\n"
+                    "部署可能在已有持倉時送出實單。\n"
+                    "Deploying may send real orders while a position is already open.\n\n"
+                    "是否仍要部署？\n"
+                    "Deploy anyway?",
+                    default_no=True,
+                )
+                if not proceed:
+                    self.set_status(
+                        "部署取消：持倉未知 Deploy cancelled: real position UNKNOWN",
+                        "warn")
+                    return False
             if trading_mode in ("semi_auto", "auto") and self._futures_account:
                 if self._account_monitor.has_open_positions():
                     pos_parts = []
@@ -6833,20 +8385,36 @@ class BacktestApp:
                 news_enabled, news_tier2_enabled, news_directional,
                 resume_session, trading_mode, bot_name)
 
-        # Semi-auto: check for pre-existing real positions before deploy
+        # Real-order deploy: query the book, then fail closed on UNKNOWN.
+        # Paper skips this. A non-zero GetOpenInterestGW code is UNKNOWN
+        # immediately — the callback is not coming (issue #202).
+        self._predeploy_oi_failed = False
+        self._predeploy_oi_unknown_reason = ""
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
             try:
                 user_id = self.login_user_var.get().strip()
-                self._account_monitor.clear_positions()
-                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                         user_id, self._futures_account, 1)
-                # The OnOpenInterest reply arrives asynchronously through the
-                # UI queue — observed ~4s after the query. GUI waits via an
-                # after(100) poll so the Tk thread is not frozen; headless
-                # falls back to a blocking drain (no update_idletasks).
-                if self._oi_wait_must_block():
+                # New generation. clear_positions() must not be what drops
+                # the previous answer; only this query can complete it.
+                self._account_monitor.begin_oi_query()
+                code = call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                                user_id, self._futures_account, 1)
+                _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
+                if open_interest_query_rejected(code):
+                    self._predeploy_oi_failed = True
+                    self._predeploy_oi_unknown_reason = (
+                        f"GetOpenInterestGW code={code}"
+                    )
+                    _log(
+                        "持倉查詢被拒 Pre-deploy GetOpenInterestGW rejected: "
+                        f"code={code} — real position UNKNOWN"
+                    )
+                elif self._oi_wait_must_block():
+                    # The OnOpenInterest reply arrives asynchronously through
+                    # the UI queue — observed ~4s after the query. Headless
+                    # drains the queue here (no update_idletasks).
                     self._wait_oi_snapshot_blocking()
                 else:
+                    # GUI: after(100) poll so the Tk thread is not frozen.
                     _deadline = time.time() + OI_SNAPSHOT_TIMEOUT_S
 
                     def _poll_oi():
@@ -6863,6 +8431,8 @@ class BacktestApp:
                     self.root.after(100, _poll_oi)
                     return True
             except Exception as e:
+                self._predeploy_oi_failed = True
+                self._predeploy_oi_unknown_reason = f"{type(e).__name__}: {e}"
                 _log(f"部署前持倉查詢失敗 Pre-deploy position check failed: {e}")
         return _after_oi_wait()
 
@@ -6922,6 +8492,12 @@ class BacktestApp:
         self._live_runner.trading_mode = trading_mode
         self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
+        # Issue #168: snapshot the guard into session.json on each save.
+        # Do not rebind self._trading_guard — the fill poller holds it.
+        # A runner double that has no session writer simply skips this.
+        _set_guard = getattr(self._live_runner, "set_guard_state_provider", None)
+        if callable(_set_guard):
+            _set_guard(self._trading_guard.to_dict)
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
         self._live_runner.on_mode_changed = self._on_mode_changed
         self._live_runner.mode_switch_veto = (
@@ -6929,7 +8505,7 @@ class BacktestApp:
             if self._trading_guard.fill_pending else None
         )
 
-        # Open debug log file in bot directory. A faulthandler open
+        # Open debug log, then arm the native dump. A faulthandler open
         # failure must not abort the deploy.
         _open_debug_log(self._live_runner.bot_dir)
         try:
@@ -6949,7 +8525,9 @@ class BacktestApp:
 
         # Route Discord and LiveRunner logging into the app's _log()
         for logger_name in ("src.live.discord_notify", "src.live.live_runner",
-                            "src.live.regime_switching_runner"):
+                            "src.live.regime_switching_runner",
+                            "src.live.tick_watchdog",
+                            "src.market_data.holidays"):
             mod_logger = logging.getLogger(logger_name)
             if not any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
                 h = _AppLogHandler()
@@ -7028,62 +8606,10 @@ class BacktestApp:
                     f"[RESUME] Active leg restored: {_leg_label} ({_strat})",
                     "status")
 
-            # Issue #79: reconcile the safety guard with the restored position.
-            # guard.reset() (line above at deploy) cleared real_entry_confirmed
-            # and fill_pending, but the restored broker may already hold an
-            # open position from the previous session. Without this, every
-            # exit/force-close is SKIP_EXIT'd (real_entry_confirmed=False) and
-            # any stale fill_pending would BLOCK_FILL_PENDING the close forever
-            # — the live position stays stuck open until the user manually
-            # switches trading modes.
-            if self._live_runner.broker.position_size > 0:
-                # Real-money hazard (issue #79 review): the restored SIM broker
-                # can hold a position even when the REAL account is FLAT (user
-                # closed overnight, or the entry was skipped last session).
-                # Confirming a real entry in that state lets the bot auto-send a
-                # close (sNewClose=2) against a flat account — OPENING a naked
-                # position. Only reconcile the guard if the real account (queried
-                # ~90 lines above via GetOpenInterestGW) also shows a position
-                # for this symbol. Paper mode has no real account, so the sim
-                # position alone is authoritative there.
-                # A bare `!= 0` was direction-agnostic: a real SHORT would
-                # "confirm" a sim LONG, and the auto close (sNewClose=2) would
-                # then be sent in the WRONG direction — adding to the real
-                # position instead of closing it. Require a direction match,
-                # and never read an un-answered snapshot as "flat".
-                real_ok, real_reason = True, "match"
-                if trading_mode in ("semi_auto", "auto"):
-                    order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
-                    prefix = order_sym[:2] if order_sym else ""
-                    sim_side = (self._live_runner.broker.position_side.value
-                                if self._live_runner.broker.position_side else "")
-                    real_ok, real_reason = resume_real_position_ok(
-                        self._account_monitor.get_signed_position(prefix),
-                        sim_side,
-                        self._account_monitor.oi_snapshot_received,
-                    )
-                if real_ok:
-                    cleared = self._trading_guard.restore_confirmed_position()
-                    if cleared:
-                        self._live_log_msg(
-                            "[RESUME] Cleared stale fill_pending — position already "
-                            "confirmed from previous session", "status")
-                    self._live_log_msg(
-                        "[RESUME] Restored confirmed real position — exits/"
-                        "force-close re-enabled", "status")
-                elif real_reason == "opposite":
-                    self._live_log_msg(
-                        "[RESUME] Real account position is OPPOSITE to sim — NOT "
-                        "confirming entry. Manual review required.", "status")
-                elif real_reason == "unknown":
-                    self._live_log_msg(
-                        "[RESUME] Real position UNKNOWN (持倉快照未收到 position "
-                        "snapshot not received) — NOT confirming entry. Manual "
-                        "review required.", "status")
-                else:
-                    self._live_log_msg(
-                        "[RESUME] Real account flat but sim has position — NOT "
-                        "confirming entry. Manual review required.", "status")
+            # Issue #79 + #168: reconcile the guard with the restored
+            # position and, when an order was in flight, restart the fill
+            # poller. See _reconcile_resumed_guard.
+            self._reconcile_resumed_guard(resume_session, trading_mode, symbol)
 
             # Issue #79 (sub-problem C): explicitly re-sync the mode tag now,
             # before warmup/replay begins. The var was set at deploy time, but
@@ -7125,6 +8651,7 @@ class BacktestApp:
         self._live_runner.on("on_bar", lambda b: self.root.after(0, self._on_live_bar, b))
         self._live_runner.on("on_decision", lambda d: self.root.after(0, self._on_live_decision, d))
         self._live_runner.on("on_status", lambda s: self.root.after(0, self._live_log_msg, s, "status"))
+        self._live_runner.on("on_alert", lambda m: self.root.after(0, self._on_restore_alert, m))
         self._live_runner.on("on_daily_report", lambda r: self.root.after(0, self._on_live_daily_report, r))
 
         # Set data source for live mode
@@ -7732,6 +9259,9 @@ class BacktestApp:
             self._tick_watchdog.on_session_resubscribe()
 
         elif action == "reconnect":
+            # Fast ladder and the stood-down slow retry both return this
+            # action, so both use the #178 path below: _on_disconnected
+            # notes the link host. There is no second reconnect mechanism.
             _log_debug(
                 f"[WATCHDOG] action=reconnect — elapsed={mins}m > RECONNECT_TIMEOUT, "
                 "forcing _on_disconnected()")
@@ -7861,7 +9391,16 @@ class BacktestApp:
             # deliver the entire live stream through OnNotifyHistoryTicksLONG,
             # so a flag-only gate starves the watchdog while ticks pour in and
             # forces a pointless resubscribe every 5 minutes.
-            self._tick_watchdog.on_tick()
+            # Issue #179: a stale replay tick restarts the staleness clock
+            # (that is why a silent day reconnects about every 10 min) but
+            # is not a live tick, so it must not clear the zero-tick streak.
+            self._tick_watchdog.on_tick(
+                live=tick_age <= HISTORY_STALENESS_SECONDS)
+            # A fresh tick is the only proof the one-shot resubscribe
+            # worked. Stale replay restarts the watchdog clock and must
+            # not clear DEGRADED.
+            if tick_age <= HISTORY_STALENESS_SECONDS:
+                self._clear_quote_stuck_if_ticks_resumed()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
             # earlier doesn't carry over.
@@ -7961,7 +9500,10 @@ class BacktestApp:
             simulate=bool(simulate),
         )
 
-        # Real-time TP/SL check on every tick (fills at exact price)
+        # Real-time TP/SL check on every tick (fills at exact price).
+        # Issue #168: restored exits are already on the broker, so the
+        # first live tick — this call, once history replay has finished —
+        # evaluates them immediately. A gapped stop fills at the tick.
         if self._live_runner and self._live_history_done:
             tick_dt = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
             result = self._live_runner.check_tick_exit(price, tick_dt)
@@ -8309,6 +9851,13 @@ class BacktestApp:
                     f"延遲平倉已儲存 Deferred close stored: {action}", "status")
             return
 
+        if verdict == guard.BLOCK_LINK:
+            self._live_log_msg(
+                f"實單暫停 Link blocked: {details['reason']}", "status")
+            self._live_runner.log_blocked_signal(
+                action, side, price, "LINK_ENTRIES_BLOCKED", details["reason"])
+            return
+
         if verdict == guard.BLOCK_ENTRY:
             self._live_log_msg(
                 f"實單暫停 Order blocked: {details['reason']}", "status")
@@ -8597,8 +10146,14 @@ class BacktestApp:
                     else:
                         bar_idx = (broker.trades[-1].exit_bar_index
                                    if broker.trades else -1)
+                    report_side = "B" if buy_sell == 0 else "S"
+                    # Report rows use N (new) / O (offset). An exit, including
+                    # sNewClose=2 (auto) that flattens a position, is O.
+                    report_nc = "N" if action_type == "entry" else "O"
                     self._fill_tracker.register_order(
-                        str(message), action_type, bar_idx, sim_price)
+                        str(message), action_type, bar_idx, sim_price,
+                        product=order_symbol, side=report_side,
+                        new_close=report_nc, send_time=_taipei_now())
                     if action_type == "exit":
                         self._last_exit_order_seq = str(message).strip()
                 if _discord and _discord.enabled:
@@ -8725,7 +10280,9 @@ class BacktestApp:
                     self.root.after_cancel(self._fill_poll_timer_id)
                 self._on_fill_confirmed()
 
-    def _start_fill_polling(self, action_type: str) -> None:
+    def _start_fill_polling(self, action_type: str, *,
+                            expected_sign: int | None = None,
+                            resumed: bool = False) -> None:
         """Start polling OpenInterest for position change after order sent."""
         com_ok = _com_available and skO is not None and bool(self._futures_account)
         # Snapshot broker.entry_bar_index so _on_fill_confirmed can later
@@ -8735,7 +10292,9 @@ class BacktestApp:
                          if self._live_runner else 0)
         action = self._fill_poller.start(
             action_type, self._get_signed_position(), com_available=com_ok,
-            entry_bar_index=entry_bar_idx)
+            entry_bar_index=entry_bar_idx,
+            expected_sign=expected_sign,
+            resumed=resumed)
 
         if action.type == "no_com":
             _log(f"FILL POLL: {action.message}")
@@ -8765,7 +10324,12 @@ class BacktestApp:
             self._on_fill_timeout()
             return
 
-        # Request fresh position data via COM
+        # Request fresh position data via COM. This poll fires every 3s
+        # and the callback is often ~4s behind, so it does not call
+        # begin_oi_query(): that would clear the book and leave it
+        # UNKNOWN for the whole fill wait. A tail "##" still cannot
+        # flatten a later deploy — "##" answers empty only after "001"
+        # in that generation (issue #202).
         try:
             user_id = self.login_user_var.get().strip()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
@@ -8798,9 +10362,9 @@ class BacktestApp:
         # ENTRY: OnNewData deal row if already arrived, else OpenInterest
         # avg_cost (identical for a 1-lot position).
         # EXIT: OnNewData deal row recorded on trades[-1].real_exit_price
-        # (issue #92). If OnNewData is slow, a backoff retry chain polls
-        # GetFulfillReport(1) (per-fill detail, matched by seq no) up to
-        # ~60s; after exhaustion the sim price goes out with "(est.)" and
+        # (issue #92). If that row never arrives, a retry chain polls
+        # GetFulfillReport(1) (per-fill detail, issue #218) for about 90s.
+        # Exhaustion keeps the sim price, marks the trade estimated, and
         # a late OnNewData/poll sends a Discord correction.
         fill_price = ""
         _exit_fill_deferred = False
@@ -8870,14 +10434,15 @@ class BacktestApp:
         self._live_log_msg(
             f"{result.message}{price_str}", "entry")
         self._log_order_decision("FILL_CONFIRMED", f"{result.action_type}{price_str}")
-        if _discord and _discord.enabled:
-            if _exit_fill_deferred:
-                self._start_exit_fill_retry(
-                    result.action_type, fill_price,
-                    self._active_strategy_name())
-            else:
-                _discord.fill_confirmed(result.action_type, fill_price,
-                                        strategy=self._active_strategy_name())
+        # The report poll is the real-exit price path. It runs whether or
+        # not Discord is configured. Only the messages are gated.
+        if _exit_fill_deferred:
+            self._start_exit_fill_retry(
+                result.action_type, fill_price,
+                self._active_strategy_name())
+        elif _discord and _discord.enabled:
+            _discord.fill_confirmed(result.action_type, fill_price,
+                                    strategy=self._active_strategy_name())
 
         # Issue #50: replay any deferred close that was blocked by
         # BLOCK_FILL_PENDING. Now that the entry fill is confirmed
@@ -8911,49 +10476,97 @@ class BacktestApp:
             return 0
         return getattr(broker.trades[-1], "real_exit_price", 0)
 
-    # ── Exit fill price retry with backoff (issue #92) ──
+    # ── Exit fill price retry (issue #92, layout fixed in #218) ──
     #
-    # OnNewData is the primary source but can be slow. GetFulfillReport(1)
-    # (per-fill detail, NOT format 4 which merges by commodity) is polled
-    # as a backup — the seq no from SendFutureOrderCLR identifies our fill
-    # among all fills on the account.
+    # OnNewData is the primary per-fill source but can be silent.
+    # GetFulfillReport(1) is the backup. Format-1 rows have no order
+    # seq, so the match is the book number captured from the accept
+    # row, then a product-family / side / new-close / qty / time
+    # fallback. The broker rejects a second query inside 5s (M999);
+    # polls stay FR_MIN_GAP_MS apart and the chain stops at about 90s.
+    # M999 is a backoff, not a used attempt.
 
-    _EXIT_FILL_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000]
+    def _exit_fill_unresolved(self) -> bool:
+        """An exit was sent and its broker price is not on the trade yet."""
+        if self._exit_fill_retry_ctx is not None:
+            return True
+        if not self._last_exit_order_seq:
+            return False
+        return self._real_exit_price_from_broker() == 0
+
+    def _cancel_exit_fill_retry(self) -> None:
+        """Drop a pending exit-fill poll so a stop cannot save later.
+
+        Tk ``after`` runs on the main thread. Cancelling the token and
+        clearing the context means the callback does not run, and a
+        callback that already started will not write the session once
+        it sees ``_exit_fill_stopped``.
+
+        The pending trade keeps its simulated exit price and is marked
+        ``real_exit_estimated``. Stop's own session save persists that.
+        A trade that already has a real exit price is left alone.
+        """
+        pending = getattr(self, "_exit_fill_retry_ctx", None)
+        timer = getattr(self, "_exit_fill_retry_timer", None)
+        root = getattr(self, "root", None)
+        if timer is not None and root is not None:
+            try:
+                root.after_cancel(timer)
+            except Exception:
+                pass
+        if pending is not None:
+            runner = getattr(self, "_live_runner", None)
+            broker = getattr(runner, "broker", None) if runner is not None else None
+            mark = getattr(broker, "mark_real_exit_estimated", None)
+            if mark is not None:
+                try:
+                    mark()
+                except Exception as exc:
+                    _log(f"EXIT FILL RETRY: stop mark estimated failed: {exc}")
+        self._exit_fill_retry_timer = None
+        self._exit_fill_retry_ctx = None
+        self._exit_fill_stopped = True
 
     def _start_exit_fill_retry(self, action_type: str,
                                fallback_price: str,
                                strategy: str) -> None:
-        """Begin the backoff retry chain for exit fill price."""
+        """Begin the exit-fill poll. First query waits out the 5s limit."""
+        self._exit_fill_stopped = False
         self._exit_fill_retry_ctx = {
             "action_type": action_type,
             "fallback_price": fallback_price,
             "strategy": strategy,
             "attempt": 0,
+            "started": time.monotonic(),
         }
-        delay = self._EXIT_FILL_RETRY_DELAYS_MS[0]
+        delay = FR_MIN_GAP_MS
         _log(f"EXIT FILL RETRY START: seq={self._last_exit_order_seq} "
-             f"schedule={self._EXIT_FILL_RETRY_DELAYS_MS}ms")
+             f"gap={delay}ms window={FR_RETRY_WINDOW_MS}ms")
         self._exit_fill_retry_timer = self.root.after(
             delay, self._poll_exit_fill_step)
 
     def _poll_exit_fill_step(self) -> None:
         """One step of the exit fill price retry chain."""
         self._exit_fill_retry_timer = None
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
         ctx = self._exit_fill_retry_ctx
         if ctx is None:
             return
-        attempt = ctx["attempt"]
-        ctx["attempt"] = attempt + 1
+        elapsed_ms = int((time.monotonic() - ctx["started"]) * 1000)
         seq = self._last_exit_order_seq
 
         real_px = self._real_exit_price_from_broker()
         source = "OnNewData"
+        rate_limited = False
         if not real_px:
-            real_px = self._poll_exit_fill_via_report(seq)
+            real_px, rate_limited = self._poll_exit_fill_via_report(seq)
             source = "GetFulfillReport(1)"
 
-        _log(f"EXIT FILL RETRY #{attempt}: real_px={real_px} source={source} "
-             f"seq={seq}")
+        _log(f"EXIT FILL RETRY: real_px={real_px} source={source} "
+             f"seq={seq} attempt={ctx['attempt']} elapsed_ms={elapsed_ms} "
+             f"rate_limited={rate_limited}")
 
         if real_px:
             self._exit_fill_retry_ctx = None
@@ -8964,35 +10577,49 @@ class BacktestApp:
                     strategy=ctx["strategy"])
             return
 
-        next_idx = attempt + 1
-        if next_idx < len(self._EXIT_FILL_RETRY_DELAYS_MS):
-            delay = self._EXIT_FILL_RETRY_DELAYS_MS[next_idx]
-            _log(f"EXIT FILL RETRY: scheduling attempt #{next_idx} in {delay}ms")
+        delay, attempt, exhausted = next_exit_fill_retry(
+            ctx["attempt"], elapsed_ms, rate_limited=rate_limited)
+        ctx["attempt"] = attempt
+        if getattr(self, "_exit_fill_stopped", False):
+            self._exit_fill_retry_ctx = None
+            return
+        if not exhausted and delay is not None:
+            why = "M999 rate limit, attempt not consumed" if rate_limited else "no match"
+            _log(f"EXIT FILL RETRY: {why}; scheduling in {delay}ms "
+                 f"(attempt={attempt})")
             self._exit_fill_retry_timer = self.root.after(
                 delay, self._poll_exit_fill_step)
             return
 
         self._exit_fill_retry_ctx = None
+        if getattr(self, "_exit_fill_stopped", False):
+            _log("EXIT FILL RETRY: stopped before exhaustion save")
+            return
         fill_price = ctx["fallback_price"]
-        estimated = bool(fill_price)
-        if estimated:
+        marked = False
+        if self._live_runner:
+            marked = self._live_runner.broker.mark_real_exit_estimated()
+            try:
+                self._live_runner._auto_save_session()
+            except Exception as exc:
+                _log(f"EXIT FILL RETRY: session re-save failed: {exc}")
+        if fill_price:
             self._est_notified_exit_seq = seq
-        _log(f"EXIT FILL RETRY EXHAUSTED after {len(self._EXIT_FILL_RETRY_DELAYS_MS)} "
-             f"attempts (~61s). Sending estimated={estimated} "
-             f"fill_price={fill_price!r} seq={seq}")
+        _log(f"EXIT FILL RETRY EXHAUSTED (~{FR_RETRY_WINDOW_MS // 1000}s). "
+             f"Keeping sim price fill_price={fill_price!r} seq={seq} "
+             f"real_exit_estimated={marked}")
         if _discord and _discord.enabled:
-            _discord.fill_confirmed(
-                ctx["action_type"], fill_price,
-                strategy=ctx["strategy"], estimated=estimated)
+            _discord.exit_fill_unconfirmed(
+                fill_price, strategy=ctx["strategy"])
 
-    def _poll_exit_fill_via_report(self, target_seq: str) -> int:
-        """Poll GetFulfillReport(1) for the exit fill price by seq no.
+    def _poll_exit_fill_via_report(self, target_seq: str) -> tuple[int, bool]:
+        """Poll GetFulfillReport(1). ``(price, rate_limited)``.
 
-        Format 1 = per-fill detail (each fill is a separate row).
-        Returns the integer fill price if matched, 0 if not found.
+        Price is 0 when nothing was assigned. ``rate_limited`` is True
+        on M999 — the caller backs off and does not consume an attempt.
         """
         if not target_seq or not _com_available or skO is None:
-            return 0
+            return 0, False
         try:
             user_id = self.login_user_var.get().strip()
             fills_raw = call_com(
@@ -9000,43 +10627,61 @@ class BacktestApp:
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
-            return 0
+            return 0, False
 
         if isinstance(fills_raw, (tuple, list)):
             fills_raw = fills_raw[0] if fills_raw else ""
         if not fills_raw or not isinstance(fills_raw, str):
             _log("EXIT FILL POLL: GetFulfillReport(1) returned empty")
-            return 0
+            return 0, False
+        if is_fulfill_rate_limited(fills_raw):
+            _log("EXIT FILL POLL: M999 rate limit — backoff, attempt not consumed")
+            return 0, True
 
+        acct = self._futures_account or ""
         for j, raw_line in enumerate(fills_raw.split("\n")):
             if j < 5 and raw_line.strip():
-                _log(f"EXIT FILL POLL raw[{j}]: {raw_line.strip()}")
+                _log(f"EXIT FILL POLL raw[{j}]: "
+                     f"{mask_new_data_row(raw_line.strip(), acct)}")
         rows = parse_fulfill_report(fills_raw)
         _log(f"EXIT FILL POLL: {len(rows)} rows, target_seq={target_seq}")
         for i, row in enumerate(rows):
-            if i < 5 or row.seq_no == target_seq:
-                _log(f"EXIT FILL POLL row[{i}]: seq={row.seq_no} "
-                     f"side={row.side} nc={row.new_close} qty={row.qty} "
-                     f"price={row.price} match={row.seq_no == target_seq}")
+            if i < 5:
+                _log(f"EXIT FILL POLL row[{i}]: book={row.book_no} "
+                     f"product={row.product} side={row.side} nc={row.new_close} "
+                     f"qty={row.qty} price={row.price} "
+                     f"time={row.date} {row.time}")
 
-        price = match_fill_in_report(rows, target_seq)
-        if not price:
-            _log(f"EXIT FILL POLL: target_seq={target_seq} not matched")
-            return 0
+        match = self._fill_tracker.match_report(target_seq, rows)
+        if match.reason == "ambiguous":
+            _log(f"EXIT FILL POLL: ambiguous ({match.candidates} candidates), "
+                 f"assigning nothing seq={target_seq}")
+            return 0, False
+        if not match.price:
+            _log(f"EXIT FILL POLL: target_seq={target_seq} not matched "
+                 f"reason={match.reason}")
+            return 0, False
+
+        skew = "n/a" if match.skew_s is None else f"{match.skew_s:.0f}s"
+        _log(f"EXIT FILL POLL: row_time - send_time = {skew} "
+             f"price={match.price} via {match.reason} seq={target_seq}")
 
         broker = self._live_runner.broker if self._live_runner else None
+        accepted = False
         if broker:
             last = broker.trades[-1] if broker.trades else None
             if last and last.real_exit_price == 0:
                 fill_dt = _taipei_now().replace(tzinfo=None
                     ).strftime("%Y-%m-%d %H:%M:%S")
                 accepted = broker.try_set_real_exit_price(
-                    price,
+                    match.price,
                     exit_bar_index=getattr(last, "exit_bar_index", -1),
                     fill_dt=fill_dt)
-                _log(f"EXIT FILL POLL: wrote real_exit_price={price} "
-                     f"accepted={accepted}")
-        return price
+                _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
+                     f"via {match.reason} accepted={accepted}")
+        if accepted:
+            self._fill_tracker.note_credited(match.row_key)
+        return match.price, False
 
     def _on_new_data(self, raw: str) -> None:
         """SKReplyLib.OnNewData — real-time per-order report (issue #92).
@@ -9048,10 +10693,14 @@ class BacktestApp:
         Rows for orders this bot didn't send (another bot or a manual
         order on the same account) don't match the tracker and are ignored.
         """
-        redacted = raw
-        if self._futures_account:
-            redacted = redacted.replace(self._futures_account, "***")
+        redacted = mask_new_data_row(raw, self._futures_account or "")
         _log(f"回報 OnNewData: {redacted}")
+        # Issue #218: a masked copy of deal rows while an exit price is
+        # still missing. Diagnostic only — this does not change matching.
+        parsed = parse_new_data(raw)
+        if (parsed is not None and parsed.row_type == "D"
+                and self._exit_fill_unresolved()):
+            _log(f"OnNewData D exit (masked): {redacted}")
         fill = self._fill_tracker.on_new_data(raw)
         if fill is None or not self._live_runner:
             return
@@ -9252,7 +10901,9 @@ class BacktestApp:
             return
         user_id = self.login_user_var.get().strip()
         try:
-            self._account_monitor.clear_positions()  # will be rebuilt from callbacks
+            # Latest query only. clear_positions() does not drop an
+            # answer that already landed for the current generation.
+            self._account_monitor.begin_oi_query()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
                      user_id, self._futures_account, 1)
             call_com("GetFutureRights", skO.GetFutureRights,
@@ -9392,7 +11043,7 @@ class BacktestApp:
         It dumps stacks, writes hang.json, and sends one Discord P1 per
         hang episode (re-armed only after the heartbeat recovers).
         """
-        from src.live.main_heartbeat import start
+        from src.live.main_heartbeat import set_replace_failure_logger, start
         runner = self._live_runner
         if runner is None:
             return
@@ -9403,8 +11054,8 @@ class BacktestApp:
                 _discord.notify(message)
 
         def _p2_start_failed(exc: BaseException) -> None:
-            # Python logging in main_heartbeat is not wired to the bot
-            # log. This is the path Discord and the debug file can see.
+            # One-shot deploy failure. Distinct from the rate-limited
+            # os.replace line, which goes through _log via the sink below.
             _log(f"[HEARTBEAT] start failed: [{type(exc).__name__}] {exc}")
             if _discord is not None and _discord.enabled:
                 try:
@@ -9421,6 +11072,11 @@ class BacktestApp:
         # MainThreadHeartbeatError is re-raised by start() and lands here.
         # A first-write OSError is returned on the writer: log the P2 and
         # still arm the tick so a later tick retries.
+        # Stamp failures used to call logger.exception, which never
+        # reached this bot log, and every tick failure was logged.
+        # The sink is _log. The writer rate-limits the final
+        # os.replace failure: the first line, then at most one per 10 min.
+        set_replace_failure_logger(_log)
         try:
             writer = start(runner.bot_dir, alert_fn=_alert)
         except Exception as e:
@@ -9439,14 +11095,20 @@ class BacktestApp:
 
     def _on_main_heartbeat(self) -> None:
         """root.after tick. This is the only periodic writer."""
-        from src.live.main_heartbeat import tick
+        from src.live.main_heartbeat import note_heartbeat_failure, tick
         self._heartbeat_after_id = None
         if not getattr(self, "_heartbeat_active", False):
             return
+        self._publish_link_heartbeat()
         try:
             tick()
         except Exception as e:
-            _log(f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
+            # A final os.replace failure is already in the bot log via
+            # the rate-limited sink (hb_logged). Anything else still
+            # goes to _log, through the same 10-minute limit.
+            if not getattr(e, "hb_logged", False):
+                note_heartbeat_failure(
+                    f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
         if getattr(self, "_heartbeat_active", False):
             self._arm_heartbeat_tick()
 
@@ -9467,14 +11129,21 @@ class BacktestApp:
 
     def _stop_live(self):
         """Stop the live bot and restore UI."""
+        # The grid sweep runs in another process. The worker polls this
+        # flag and terminates that child so a GUI stop does not wait
+        # out the sweep. The headless STOP file is polled the same way.
+        self._evolution_cancel = True
+        # Before the rest of teardown. A poll that fires after stop
+        # would mark and save whatever runner is current.
+        self._cancel_exit_fill_retry()
         self._stop_account_polling()
         if self._live_poll_id:
             self.root.after_cancel(self._live_poll_id)
             self._live_poll_id = None
-        self._cancel_reconnect_timer()
-        self._cancel_quote_ready_timer("stop_live")
+        if self._reconnect_timer_id:
+            self.root.after_cancel(self._reconnect_timer_id)
+            self._reconnect_timer_id = None
         self._conn_monitor.reset()
-        self._reconnect_controller.reset()
 
         if self._warmup_timeout_id:
             self.root.after_cancel(self._warmup_timeout_id)
@@ -9663,6 +11332,19 @@ def main():
 
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
+    # freeze_support() and the spawn / grid-smoke exits already ran at the
+    # top of this module, before Tk was imported. Classify again with the
+    # same helper: a CLI subcommand goes to run_bot_cli, anything else that
+    # is still here is the GUI. Spawn and grid-smoke must not fall through
+    # into main() if the top exit was skipped.
+    from src.paths import dispatch_entry
+    kind, routed = dispatch_entry(sys.argv)
+    if kind == "cli":
+        # Lazy: the GUI path must not import the CLI driver, and must not
+        # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
+        # that init (once) via run_bot_cli → headless_app._boot.
+        import run_bot_cli
+        sys.exit(run_bot_cli.main(routed))
+    if kind != "gui":
+        raise SystemExit(0)
     main()
