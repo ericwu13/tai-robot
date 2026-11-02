@@ -1,9 +1,11 @@
 # v2.19.11
 
-> 草稿 / DRAFT — 尚未打 tag 或發布 / not tagged or published. Base: master `2c1d1ae6` (v2.19.10 `115a0447` + #201 #216 #224 #162 #221 #222 #207 #227). #208 尚未合併，不包含在內 / #208 is still open and not included.
+> 草稿 / DRAFT — 尚未打 tag 或發布 / not tagged or published. Base: master `fb51ddcc` (v2.19.10 `115a0447` + #201 #216 #224 #162 #221 #222 #207 #227 #208).
 
 ## EXE 變更 EXE changes
 
+- **#208**（squash `fb51ddcc`）：regime 存檔（`regime_state.json`、placeholder 狀態、歷史 CSV 的原子寫入，以及 manager 的 `last_features` 與「建議已執行」寫入）改為遇到 `PermissionError` 時重試，最多 4 次、退避 5／10／20 毫秒（共約 35 毫秒），與心跳寫入相同。Windows 上監控或儀表板正在讀檔時，`os.replace` 會失敗；先前會讓 regime 存檔出錯，或使「建議已執行」未保存而在重啟後再次觸發。其他錯誤仍立即拋出；檔案被佔用超過重試時間仍會失敗。
+  **#208** (squash `fb51ddcc`): regime store writes (`regime_state.json`, the placeholder state, the history CSV atomic writes, and the manager's `last_features` and recommendation-executed writes) now retry `PermissionError` up to 4 attempts with 5/10/20 ms backoff (about 35 ms total), the same budget as the heartbeat writer. On Windows `os.replace` fails while the monitor or dashboard has the file open; before, that could fail a regime save, or leave a recommendation marked not executed so a restart re-armed it. Any other error still raises at once, and a handle held longer than the retry budget still fails.
 - **#207**（squash `6f69ff15`，實單安全防護 real-money safety guard）：headless bot 的 `mode_override.json` 只接受 `"paper"`。要求 `auto`、`real`、`semi_auto`、其他字串或非字串值（以及無效 JSON）一律拒絕，即使 `allow_live_override` 為 true；目前模式不變，檔案改名為 `mode_override.json.refused`（舊的 refused 移為 `.refused.N`；改名失敗則刪除，再失敗則以指紋忽略該檔直到其變更）。操作者看到的是 bot 日誌與狀態列的警告 `[MODE] headless refused mode_override.json trading_mode=... staying on '<mode>' (file consumed)`；不發 Discord／警報、bot 不退出、無退出碼。`deploy --mode auto` 不受影響。GUI 部署（origin 為 gui 且非 headless）的熱切換不變；缺少 origin 時預設啟用防護（fail closed）。headless 驅動在 `_deploy` 的 try 與 finally 都會啟用防護。
   **#207** (squash `6f69ff15`, real-money safety guard): a headless bot's `mode_override.json` accepts only `"paper"`. `auto`, `real`, `semi_auto`, any other string, any non-string value, and invalid JSON are refused, even with `allow_live_override: true`. The mode stays unchanged and the file is renamed to `mode_override.json.refused` (an older one moves to `.refused.N`; if the rename fails it is deleted; if that fails the exact file is fingerprinted and ignored until it changes). The operator sees a warning in the bot log and status line: `[MODE] headless refused mode_override.json trading_mode=... staying on '<mode>' (file consumed)`. There is no Discord alert, no exit, and no exit code. `deploy --mode auto` is unchanged. GUI deploys (origin gui and not headless) keep file hot-swap as before; a missing origin arms the guard (fail closed). The headless driver arms it in both the try and the finally of `_deploy`.
 - **#222**（squash `d77d8aef`，緩解 #219）：回報（reply）連線靜默時的輪詢與新進場暫停。v2.19.9 起回報事件可能未送達 Python，連線狀態機看不到回報斷線、也不會送 `ConnectByID`。現每 60 秒及每次 3003 輪詢 `IsConnectedByID`：回傳 `0` 時暫停新的實單進場（沿用 `orders_paused`／`link_entries_blocked`），並依 5、10、30、60 秒退避送 `ConnectByID`，10 次未恢復即再發警告並停止重試；回傳 `1` 時標記回報 READY 並解除該暫停。登入、偵測到斷線或送出實單後 60 秒內沒有任何 OnConnect／OnComplete／OnNewData，會發 `REPLY CHANNEL SILENT` 警告（不暫停）。出場與平倉一律允許。不呼叫登出。GUI 與 headless 共用。另增加回報事件診斷日誌（不含帳號資料）。根因（事件分派）仍待查。
@@ -26,6 +28,7 @@
 
 ## 風險 Risks
 
+- **#208**：重試只涵蓋短暫的讀取（約 35 毫秒）；若其他程式長時間佔用 regime 檔案，存檔仍會失敗，行為與 v2.19.10 相同。 / **#208**: the retry only covers brief reads (about 35 ms); a process holding a regime file longer still makes the save fail, as in v2.19.10.
 - **#207**：之前以 `mode_override.json` 將 headless bot 升為 auto 的流程不再有效（只能以 `deploy --mode auto` 重新部署）；拒絕只寫日誌、不發警報，需看日誌或 `.refused` 檔確認。 / **#207**: any workflow that promoted a headless bot to auto by dropping `mode_override.json` stops working (redeploy with `deploy --mode auto` instead). A refusal only logs, with no alert, so check the bot log or the `.refused` file.
 - **#222 暫停進場**：若 `IsConnectedByID` 誤報 0，或 10 次重試後仍未恢復，新進場會持續暫停（出場仍允許），直到回報恢復或手動處理；此為緩解，根因未解。 / **#222 entry pause**: a false `0`, or a link that stays down after 10 attempts, keeps new entries paused (exits still allowed) until the reply recovers or someone intervenes. It is a mitigation; the root cause is open.
 - **#222 警告量**：靜默監測可能在回報正常但事件未送達時發出警告。 / **#222 alert noise**: the silent-sink watchdog can alert when the link is up but events are not delivered.
@@ -34,7 +37,7 @@
 ## 升級注意 Upgrade / redeploy notes
 
 - 將監控與儀表板的程式碼更新到 master 並重新啟動。 / Update the monitor and dashboard checkouts to master and restart them.
-- **換 EXE**（#207、#221、#222 屬 EXE 變更）：正常停止 bot，保留 v2.19.10 資料夾或 zip，解壓 v2.19.11 取代 `tai_backtest.exe` 與 `_internal\`（保留 `settings.yaml`、`data\`、`strategies\`、`taifex_closures.yaml`），重新啟動並確認標題為 v2.19.11。設定檔格式不變。 / **EXE swap** (#207, #221 and #222 change the EXE): stop the bot cleanly, keep the v2.19.10 folder or zip, unzip v2.19.11 and replace `tai_backtest.exe` and `_internal\` (keep `settings.yaml`, `data\`, `strategies\`, `taifex_closures.yaml`), relaunch and check the title shows v2.19.11. No settings change.
+- **換 EXE**（#207、#208、#221、#222 屬 EXE 變更）：正常停止 bot，保留 v2.19.10 資料夾或 zip，解壓 v2.19.11 取代 `tai_backtest.exe` 與 `_internal\`（保留 `settings.yaml`、`data\`、`strategies\`、`taifex_closures.yaml`），重新啟動並確認標題為 v2.19.11。設定檔格式不變。 / **EXE swap** (#207, #208, #221 and #222 change the EXE): stop the bot cleanly, keep the v2.19.10 folder or zip, unzip v2.19.11 and replace `tai_backtest.exe` and `_internal\` (keep `settings.yaml`, `data\`, `strategies\`, `taifex_closures.yaml`), relaunch and check the title shows v2.19.11. No settings change.
 
 ## 回退 Rollback
 
@@ -45,5 +48,4 @@
 
 - **儀表板停止僅限 headless（已由 #221 收緊）**：GUI bot 仍不讀 `STOP`；#221 現會在 GUI bot 停用按鈕且不寫入檔案，取代 v2.19.10 的「僅 headless 有效」注意事項。 / **Dashboard stop is headless-only (now enforced by #221)**: GUI bots still do not poll `STOP`; #221 now disables the buttons for GUI bots and writes nothing, replacing v2.19.10's "headless-only until #221" caveat.
 - **#219 根因**：回報事件分派根因仍待查。 / **#219 root cause**: reply event dispatch is still under investigation.
-- **#208 未包含**：尚未合併。 / **#208 not included**: not merged yet.
 - 假日缺漏 [#209](https://github.com/ericwu13/tai-robot/issues/209) 同 v2.19.10。 / Holiday gap [#209](https://github.com/ericwu13/tai-robot/issues/209) unchanged from v2.19.10.
