@@ -502,6 +502,12 @@ def _load_settings():
             # Trading
             trading = data.get("trading", {})
             cfg["allow_live_override"] = trading.get("allow_live_override", False)
+            # Per-bot dashboard auto. Only boolean true opts in. A loss
+            # ceiling may lower the confirmed cap and never raises it.
+            cfg["dashboard_auto_opt_in"] = _mreq.parse_dashboard_auto_opt_in(
+                trading.get("dashboard_auto_opt_in"))
+            cfg["mode_switch_max_loss_ntd"] = _mreq.parse_mode_switch_loss_caps(
+                trading.get("mode_switch_max_loss_ntd"))
             # Evolution: "weekly" (default) = fitness/improvement check only
             # on the trading week's last session (Sat AM close); "daily" =
             # every session end (the pre-2.12 behavior).
@@ -8860,6 +8866,11 @@ class BacktestApp:
         if callable(_set_guard):
             _set_guard(self._trading_guard.to_dict)
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
+        _opt_in = self._settings.get("dashboard_auto_opt_in") or frozenset()
+        self._live_runner._dashboard_auto_opt_in = bot_name in _opt_in
+        _caps = self._settings.get("mode_switch_max_loss_ntd") or {}
+        self._live_runner._mode_switch_loss_cap = _mreq.effective_loss_cap(
+            _caps.get(bot_name))
         # Fail closed: only an attended GUI deploy (origin exactly "gui"
         # and this app is not headless) may honor a live mode from
         # mode_override.json. A missing request or origin arms the guard.
@@ -10017,11 +10028,22 @@ class BacktestApp:
             link_entries_blocked=bool(getattr(guard, "link_entries_blocked", False)),
         )
 
+    def _mode_request_now(self):
+        clock = getattr(self, "_mode_request_clock", None)
+        if callable(clock):
+            return clock()
+        return _taipei_now()
+
+    def _control_file_pending(self, bot_dir: str) -> bool:
+        from src.live.headless import control_file_path
+        return os.path.isfile(control_file_path(bot_dir))
+
     def _service_mode_request(self, bot_dir: str) -> None:
         """Consume ``mode_request.json``; called on the headless 2 s poll.
 
         Main thread. An auto request starts an OpenInterest query and
-        returns; later polls finish it (never blocks Tk).
+        returns; later polls finish it (never blocks Tk). A pending
+        CONTROL file owns this tick: the mode request is refused.
         """
         runner = self._live_runner
         bot_dir = getattr(runner, "bot_dir", None) or bot_dir
@@ -10033,6 +10055,30 @@ class BacktestApp:
                 tracker.unwritten = None
             except Exception as e:
                 _log(f"[MODE REQUEST] result write retry failed: [{type(e).__name__}] {e}")
+        control_pending = self._control_file_pending(bot_dir)
+        if control_pending and tracker.pending is not None:
+            req = tracker.finish()
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+                "已有 CONTROL 指令待處理，請稍後再試", req)
+        if control_pending:
+            if not os.path.isfile(_mreq.request_path(bot_dir)):
+                return
+            req, err = _mreq.consume_request(bot_dir)
+            if err is not None:
+                if not tracker.seen(err.request_id):
+                    tracker.mark_handled(err.request_id)
+                    self._finish_mode_request(
+                        bot_dir, err.request_id, err.mode, _mreq.STATUS_REFUSED,
+                        err.reason)
+                return
+            if req is None or tracker.seen(req.request_id):
+                return
+            tracker.mark_handled(req.request_id)
+            self._finish_mode_request(
+                bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
+                "已有 CONTROL 指令待處理，請稍後再試", req)
+            return
         if tracker.pending is not None:
             self._continue_auto_mode_request(bot_dir)
         elif self._account_monitor.oi_query_in_flight(OI_SNAPSHOT_TIMEOUT_S):
@@ -10058,7 +10104,16 @@ class BacktestApp:
                 bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED,
                 "已有模式切換請求處理中，請稍後再試", req)
             return
-        reason = _mreq.gate_reason(req, self._mode_switch_state())
+        reason = _mreq.expiry_reason(req.requested_at, self._mode_request_now())
+        if reason is None and req.mode == "auto":
+            if not getattr(runner, "_dashboard_auto_opt_in", False):
+                reason = "此機器人未在設定中允許從儀表板切換實單"
+            else:
+                cap = getattr(runner, "_mode_switch_loss_cap",
+                              _mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD)
+                reason = _mreq.loss_limit_reason(req.loss_limit, cap)
+        if reason is None:
+            reason = _mreq.gate_reason(req, self._mode_switch_state())
         if reason:
             self._finish_mode_request(
                 bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED, reason, req)
@@ -10138,12 +10193,17 @@ class BacktestApp:
             return
         guard = self._trading_guard
         runner = self._live_runner
-        saved = (guard.daily_loss_limit, runner.daily_loss_limit)
+        saved = (guard.daily_loss_limit, runner.daily_loss_limit,
+                 guard._last_net_pnl, guard.paused)
         guard.arm_for_live_switch(req.loss_limit)
         guard.update_pnl(net)
         runner.daily_loss_limit = req.loss_limit
         if not self._apply_requested_mode(bot_dir, req):
-            guard.daily_loss_limit, runner.daily_loss_limit = saved
+            # The switch was refused. Do not leave this attempt's account
+            # P&L (or a pause it caused) on a bot that is still in paper.
+            guard.daily_loss_limit, runner.daily_loss_limit = saved[0], saved[1]
+            guard._last_net_pnl = saved[2]
+            guard.paused = saved[3]
 
     def _apply_requested_mode(self, bot_dir: str, req) -> bool:
         """Apply through ``LiveRunner._apply_mode_switch``; True on success."""
@@ -10154,9 +10214,9 @@ class BacktestApp:
         if isinstance(callbacks, dict):
             callbacks.setdefault("on_status", []).append(hook)
         try:
-            # The dashboard confirmed with a human; the gate on unattended
-            # auto overrides (allow_live_override) does not apply.
-            runner._apply_mode_switch(req.mode, user_confirmed=(req.mode == "auto"))
+            # user_confirmed is the GUI dialog only. A dashboard request
+            # does not bypass allow_live_override.
+            runner._apply_mode_switch(req.mode, user_confirmed=False)
         finally:
             if isinstance(callbacks, dict):
                 try:

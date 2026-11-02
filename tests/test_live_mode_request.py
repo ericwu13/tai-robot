@@ -20,7 +20,7 @@ import glob
 import json
 import os
 import queue
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +36,7 @@ from src.live.live_runner import LiveRunner
 from src.live.trading_guard import TradingGuard
 
 ACCT = "F1111111"
+_NOW = datetime(2026, 11, 2, 10, 0, tzinfo=rb._TZ_TAIPEI)
 POSITION_ROW = f"TF,{ACCT},TXFD0,B,1,0,22500.0,15,2,ID"
 
 
@@ -124,7 +125,8 @@ class _Harness:
 
     def request(self, mode="auto", loss_limit=3000, request_id="a1b2c3", **extra):
         body = {"request_id": request_id, "mode": mode, "loss_limit": loss_limit,
-                "requested_by": "tester", "requested_at": "2026-10-28T10:00:00+08:00"}
+                "requested_by": "tester",
+                "requested_at": _NOW.isoformat(timespec="seconds")}
         body.update(extra)
         self.write_raw(json.dumps(body))
 
@@ -171,6 +173,9 @@ def harness(tmp_path, monkeypatch):
     runner.suppress_strategy = False
     runner.trading_mode = "paper"
     runner.broker.trade_source = rb._mode_to_source("paper")
+    runner._allow_live_override = True
+    runner._dashboard_auto_opt_in = True
+    runner._mode_switch_loss_cap = mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD
 
     app = rb.BacktestApp.__new__(rb.BacktestApp)
     app.root = _Root()
@@ -193,6 +198,7 @@ def harness(tmp_path, monkeypatch):
                               "auto": "全自動 Auto"}
     app._live_runner = runner
     app._mode_req_tracker = mreq.ModeRequestTracker(clock=clock)
+    app._mode_request_clock = lambda: _NOW
 
     # Same wiring as _deploy_live_continue.
     runner.daily_loss_limit = guard.daily_loss_limit
@@ -740,8 +746,8 @@ def _driver(tmp_path, app):
     return driver
 
 
-def test_deploy_clears_stale_request_and_writes_capabilities(tmp_path):
-    for name in (mreq.REQUEST_FILENAME, mreq.RESULT_FILENAME, mreq.CAPABILITIES_FILENAME):
+def test_deploy_clears_stale_request_and_marks_the_headless_file(tmp_path):
+    for name in (mreq.REQUEST_FILENAME, mreq.RESULT_FILENAME):
         (tmp_path / name).write_text('{"request_id": "old", "mode": "auto"}',
                                      encoding="utf-8")
     seen = {}
@@ -758,26 +764,23 @@ def test_deploy_clears_stale_request_and_writes_capabilities(tmp_path):
     driver = _driver(tmp_path, app)
     driver._deploy()
     assert seen["stale"] == [False, False]
-    caps = json.loads((tmp_path / mreq.CAPABILITIES_FILENAME).read_text(encoding="utf-8"))
-    assert caps == {"mode_request": 1, "pid": os.getpid(), "version": rb.APP_VERSION}
+    marker = json.loads((tmp_path / "headless.json").read_text(encoding="utf-8"))
+    assert marker["mode_request"] == 1 and marker["pid"] == os.getpid()
+    assert "started_at" in marker
+    assert not (tmp_path / "capabilities.json").exists()
 
 
-def test_refused_deploy_writes_no_capabilities(tmp_path):
+def test_refused_deploy_writes_no_marker_capability(tmp_path):
     app = SimpleNamespace(root=_Root(), alerts=[("x", "y")], _live_runner=None,
                           status_var=_Var(), _deploy_live_from=lambda req: False)
     driver = _driver(tmp_path, app)
     driver._deploy()
-    assert not (tmp_path / mreq.CAPABILITIES_FILENAME).exists()
+    assert not (tmp_path / "headless.json").exists()
+    assert not (tmp_path / "capabilities.json").exists()
 
 
-def test_capabilities_never_create_a_bot_dir(tmp_path):
+def test_result_write_never_creates_a_bot_dir(tmp_path):
     missing = tmp_path / "not-a-bot"
-    app = SimpleNamespace(root=_Root(), alerts=[], status_var=_Var(),
-                          _live_runner=object())
-    app._deploy_live_from = lambda req: True
-    driver = _driver(missing, app)
-    driver._deploy()
-    assert not missing.exists()
     with pytest.raises(FileNotFoundError):
         mreq.write_result(str(missing), mreq.result_payload("r", "auto", "refused", "x", "t"))
     assert not missing.exists()
@@ -850,3 +853,164 @@ def test_result_written_atomically_leaves_no_temp(tmp_path):
     data = json.loads((tmp_path / mreq.RESULT_FILENAME).read_text(encoding="utf-8"))
     assert data == {"request_id": "r", "mode": "auto", "status": "refused",
                     "reason": "原因", "at": "t"}
+
+
+# ── opt-in, cap, expiry, one owner, P&L clear ──
+
+def test_allow_live_override_false_is_not_bypassed(harness):
+    """Restoring user_confirmed=True on the dashboard path makes this fail."""
+    h = harness
+    h.runner._allow_live_override = False
+    seen = {}
+    real = h.runner._apply_mode_switch
+
+    def wrapped(new_mode, user_confirmed=False):
+        seen["user_confirmed"] = user_confirmed
+        return real(new_mode, user_confirmed=user_confirmed)
+
+    h.runner._apply_mode_switch = wrapped
+    h.request()
+    h.poll()
+    h.flat()
+    assert seen.get("user_confirmed") is False
+    assert h.runner.trading_mode == "paper"
+    assert "allow_live_override" in h.result()["reason"]
+    assert h.com_calls  # reached the account check, then the real gate
+
+
+def test_auto_refused_when_the_bot_is_not_opted_in(harness):
+    h = harness
+    h.runner._dashboard_auto_opt_in = False
+    h.runner._allow_live_override = True
+    h.request()
+    h.poll()
+    res = h.result()
+    assert res["status"] == "refused" and "設定" in res["reason"]
+    assert h.com_calls == []
+    assert h.runner.trading_mode == "paper"
+
+
+def test_loss_cap_accepts_the_cap_and_refuses_above_zero_and_missing(harness):
+    h = harness
+    cap = mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD
+    h.request(loss_limit=cap + 1, request_id="over")
+    h.poll()
+    res = h.result()
+    assert res["status"] == "refused" and str(cap) in res["reason"].replace(",", "")
+    assert h.com_calls == []
+    h.request(loss_limit=0, request_id="zero")
+    h.poll()
+    assert h.result()["status"] == "refused" and "loss_limit" in h.result()["reason"]
+    h.write_raw(json.dumps({"request_id": "miss", "mode": "auto",
+                            "requested_at": _NOW.isoformat(timespec="seconds")}))
+    h.poll()
+    assert h.result()["status"] == "refused" and "loss_limit" in h.result()["reason"]
+    assert h.com_calls == []
+    h.request(loss_limit=cap, request_id="atcap")
+    h.poll()
+    h.flat()
+    assert h.result()["status"] == "accepted", h.result()
+    assert h.app._trading_guard.daily_loss_limit == cap
+
+
+def test_per_bot_settings_can_lower_the_cap_but_not_raise_it(harness):
+    assert mreq.effective_loss_cap(None) == mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD
+    assert mreq.effective_loss_cap(50_000_000) == mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD
+    assert mreq.effective_loss_cap(mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD) == (
+        mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD)
+    assert mreq.effective_loss_cap(10_000) == 10_000
+    assert mreq.effective_loss_cap(True) == mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD
+    assert mreq.effective_loss_cap(0) == mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD
+    assert mreq.parse_dashboard_auto_opt_in(
+        {"A": True, "B": "true", "C": 1, "D": False}) == frozenset({"A"})
+    h = harness
+    h.runner._mode_switch_loss_cap = mreq.effective_loss_cap(10_000)
+    h.request(loss_limit=10_001, request_id="above")
+    h.poll()
+    assert h.result()["status"] == "refused" and h.com_calls == []
+    h.request(loss_limit=10_000, request_id="at")
+    h.poll()
+    h.flat()
+    assert h.result()["status"] == "accepted"
+
+
+@pytest.mark.parametrize("age,accepted", [(59, True), (60, True), (61, False)])
+def test_request_age_boundary(harness, age, accepted):
+    h = harness
+    at = (_NOW - timedelta(seconds=age)).isoformat(timespec="seconds")
+    h.request(requested_at=at, request_id=f"age{age}")
+    h.poll()
+    if not accepted:
+        assert h.result()["status"] == "refused" and "60" in h.result()["reason"]
+        assert h.com_calls == []
+        return
+    h.flat()
+    assert h.result()["status"] == "accepted", h.result()
+
+
+@pytest.mark.parametrize("skew,accepted", [(5, True), (6, False)])
+def test_request_future_skew(harness, skew, accepted):
+    h = harness
+    at = (_NOW + timedelta(seconds=skew)).isoformat(timespec="seconds")
+    h.request(requested_at=at, request_id=f"fut{skew}")
+    h.poll()
+    if not accepted:
+        assert h.result()["status"] == "refused" and "超前" in h.result()["reason"]
+        assert h.com_calls == []
+        return
+    h.flat()
+    assert h.result()["status"] == "accepted", h.result()
+
+
+def test_missing_requested_at_is_refused(harness):
+    h = harness
+    h.request(requested_at="", request_id="notime")
+    h.poll()
+    assert h.result()["status"] == "refused" and "requested_at" in h.result()["reason"]
+    assert h.com_calls == []
+    h.write_raw(json.dumps({"request_id": "absent", "mode": "auto", "loss_limit": 1000}))
+    h.poll()
+    assert h.result()["status"] == "refused" and "requested_at" in h.result()["reason"]
+
+
+def test_refused_switch_clears_the_stored_pnl(harness):
+    h = harness
+    h.runner.mode_switch_veto = lambda: "外部否決 veto"
+    h.app._trading_guard._last_net_pnl = 0
+    h.request(loss_limit=3000)
+    h.poll()
+    h.oi("001,查無資料", "##")
+    h.rights(_rights(realized=-500))
+    h.poll()
+    assert h.result()["status"] == "refused" and "veto" in h.result()["reason"]
+    assert h.runner.trading_mode == "paper"
+    assert h.app._trading_guard._last_net_pnl == 0
+    assert h.app._trading_guard.daily_loss_limit == 1000
+
+
+def test_control_file_pending_refuses_mode_request_on_the_same_tick(harness):
+    h = harness
+    h.runner._apply_mode_switch("auto", user_confirmed=True)
+    assert h.runner.trading_mode == "auto"
+    driver = _driver(h.bot_dir, h.app)
+    reconnects = []
+    h.app._manual_reconnect = lambda: reconnects.append(1)
+    with open(os.path.join(h.bot_dir, "CONTROL"), "w", encoding="utf-8") as fh:
+        fh.write("reconnect\n")
+    h.request(mode="paper", request_id="tick1")
+    driver._poll_once()
+    res = h.result()
+    assert res["status"] == "refused" and "CONTROL" in res["reason"]
+    assert h.runner.trading_mode == "auto"
+    assert reconnects == [1]
+    assert not os.path.exists(os.path.join(h.bot_dir, "CONTROL"))
+
+
+def test_example_settings_opt_in_nobody():
+    import yaml
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "settings.example.yaml"), encoding="utf-8") as fh:
+        trading = yaml.safe_load(fh)["trading"]
+    assert trading["allow_live_override"] is False
+    assert mreq.parse_dashboard_auto_opt_in(trading["dashboard_auto_opt_in"]) == frozenset()
+    assert mreq.parse_mode_switch_loss_caps(trading["mode_switch_max_loss_ntd"]) == {}

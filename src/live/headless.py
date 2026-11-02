@@ -297,11 +297,14 @@ def _log_marker(op: str, path: str, exc: BaseException) -> None:
 
 
 def write_headless_marker(bot_dir: str, *, pid: int | None = None,
-                          started_at: str | None = None) -> bool:
+                          started_at: str | None = None,
+                          mode_request: bool = False) -> bool:
     """Atomically write ``headless.json``. OSError is logged and never raised.
 
     Returns True when the marker is in place. The running process's pid is
-    recorded unless ``pid`` is passed (tests).
+    recorded unless ``pid`` is passed (tests). ``mode_request=True`` folds
+    the live paper/auto channel into this marker (``mode_request: 1``).
+    The dashboard still requires the pid, lock pid and ``started_at`` checks.
     """
     path = headless_marker_path(bot_dir)
     owner = int(os.getpid() if pid is None else pid)
@@ -309,6 +312,8 @@ def write_headless_marker(bot_dir: str, *, pid: int | None = None,
         "pid": owner,
         "started_at": _marker_started_at(owner, started_at),
     }
+    if mode_request:
+        payload["mode_request"] = 1
     tmp = path + ".tmp"
     try:
         os.makedirs(bot_dir, exist_ok=True)

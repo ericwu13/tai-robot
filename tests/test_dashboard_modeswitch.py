@@ -2,9 +2,9 @@
 
 The dashboard only writes ``mode_request.json``; the bot checks the real
 account and answers in ``mode_request_result.json``. Real money (auto) is
-offered only when the running process advertises the channel
-(``capabilities.json`` with the lock's pid), and only with the bot name,
-「實單」 and a loss limit.
+offered only when ``headless.json`` advertises ``mode_request: 1`` and
+its pid, lock pid and started_at checks pass, the bot is opted in, and
+the caller sends the bot name, 「實單」 and a loss limit inside the cap.
 """
 
 from __future__ import annotations
@@ -18,17 +18,28 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from scripts.dashboard import control, server
+from scripts.dashboard import control, server, snapshot
 from scripts.monitor.common import TZ_TPE
+from src.live.headless import write_headless_marker
 
 from tests.test_dashboard import (  # noqa: F401  (fixture)
     ALIVE_PID, FAKE_CHANNEL, _get, _post, _set_mode, control_server,
 )
 
 
+@pytest.fixture(autouse=True)
+def _opted_in_dashboard():
+    """These tests cover a bot Eric allowed. The default policy is closed."""
+    server.DashboardHandler.live_switch_policy = control.LiveSwitchPolicy(
+        allow_live_override=True, opt_in=frozenset({"alpha", "real"}))
+    yield
+    server.DashboardHandler.live_switch_policy = control.LiveSwitchPolicy()
+
+
 def _caps(bot_dir, pid=ALIVE_PID, mode_request=1):
-    (bot_dir / "capabilities.json").write_text(json.dumps(
-        {"mode_request": mode_request, "pid": pid, "version": "2.19.11"}))
+    assert write_headless_marker(
+        str(bot_dir), pid=pid, started_at="2026-10-29T21:00:00+08:00",
+        mode_request=bool(mode_request))
 
 
 def _checking(bot_dir, age_s):
@@ -223,6 +234,85 @@ def _page():
 def test_page_uses_the_same_checking_age_limit():
     m = re.search(r"const CHECKING_STALE_S = (\d+);", _page())
     assert m and int(m.group(1)) == control.MODE_CHECKING_STALE_S
+
+
+def test_page_says_a_restart_returns_to_the_command_line_mode():
+    page = _page()
+    assert page.count("命令列指定的模式（--mode）") >= 2
+
+
+def test_auto_refused_unless_settings_opt_in_and_allow_live_override(control_server):
+    url, base, _ = control_server
+    alpha = base / "TMF00_alpha"
+    _caps(alpha)
+    server.DashboardHandler.live_switch_policy = control.LiveSwitchPolicy()
+    status, body = _auto(url)
+    assert status == 409 and "allow_live_override" in body["message"]
+    assert not (alpha / "mode_request.json").exists()
+    server.DashboardHandler.live_switch_policy = control.LiveSwitchPolicy(
+        allow_live_override=True, opt_in=frozenset())
+    status, body = _auto(url)
+    assert status == 409 and "允許" in body["message"]
+    assert not (alpha / "mode_request.json").exists()
+
+
+def test_not_running_is_refused_even_when_the_marker_is_live(tmp_path, monkeypatch):
+    """Deletes of the alive-state gate must fail this test.
+
+    The marker check is forced live, so a CRASHED stop is refused only by
+    ``state not in _ALIVE_STATES``. Auto also refuses LAGGING: real orders
+    require RUNNING.
+    """
+    monkeypatch.setattr(snapshot, "headless_live", lambda *a, **k: True)
+    bot = tmp_path / "TMF00_alpha"
+    bot.mkdir()
+    summary = {"state": "CRASHED", "bot_name": "alpha", "trading_mode": "paper",
+               "position": None, "supports_mode_request": True, "pid": 1}
+    with pytest.raises(control.ControlRefused, match="沒有在執行"):
+        control.check("stop", summary, str(bot), "alpha", "flat")
+    summary["state"] = "LAGGING"
+    policy = control.LiveSwitchPolicy(
+        allow_live_override=True, opt_in=frozenset({"alpha"}))
+    with pytest.raises(control.ControlRefused, match="運作中"):
+        control.check("auto", summary, str(bot), "alpha", "flat", 1000, "實單",
+                      policy=policy)
+    summary["state"] = "NO_HEARTBEAT"
+    with pytest.raises(control.ControlRefused, match="運作中"):
+        control.check("auto", summary, str(bot), "alpha", "flat", 1000, "實單",
+                      policy=policy)
+
+
+def test_control_sees_a_same_size_session_rewrite(control_server, monkeypatch):
+    """The stat cache keys on mtime and size. Closing a 1-lot position
+    writes the same number of bytes; on a coarse timestamp that rewrite
+    is invisible and auto stays 409 after the result file is removed.
+    Control reads session.json fresh, so the closed position is seen.
+    """
+    url, base, _ = control_server
+    alpha = base / "TMF00_alpha"
+    _caps(alpha)
+    real_stat = os.stat
+    frozen = {}
+
+    def _stat(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        text = os.fspath(path)
+        if text.endswith("session.json") and "TMF00_alpha" in text:
+            frozen.setdefault("st", st)
+            return frozen["st"]
+        return st
+
+    monkeypatch.setattr(snapshot.os, "stat", _stat)
+    held = {"position_size": 1, "position_side": "LONG", "entry_price": 45000}
+    _set_mode(alpha, "paper", position=held)
+    status, body = _auto(url)
+    assert status == 409 and "持倉" in body["message"]
+    held_bytes = (alpha / "session.json").read_bytes()
+    _set_mode(alpha, "paper", position={"position_size": 0})
+    # Same size is the cache key's blind spot. 1 lot and 0 lots are one digit.
+    assert len((alpha / "session.json").read_bytes()) == len(held_bytes)
+    assert _auto(url)[0] == 200
+    assert (alpha / "mode_request.json").is_file()
 
 
 def test_page_shows_switched_only_when_the_bot_is_in_that_mode():

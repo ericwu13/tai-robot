@@ -21,7 +21,16 @@ trading:
   order_type: "2"            # "2"=auto new/close
   trade_type: 0              # 0=ROD, 1=IOC, 2=FOK
   price_flag: 0              # 0=market, 1=limit
-  allow_live_override: false  # GUI only: mode_override.json may switch to "auto". Headless bots refuse auto/real from that file.
+  allow_live_override: false  # GUI only: mode_override.json may switch to "auto". Headless bots refuse auto/real from that file. A dashboard switch to auto is also refused while this is false.
+  # Per-bot opt-in for a dashboard switch into real orders (auto).
+  # Only a boolean true opts that bot in. Missing names stay off.
+  # allow_live_override: false still refuses the switch. Do not opt a
+  # bot in here unless that bot was explicitly allowed.
+  dashboard_auto_opt_in: {}
+  # Optional per-bot ceiling (NT$) for that switch. May only lower
+  # MAX_MODE_SWITCH_LOSS_LIMIT_NTD (NT$20,000, confirmed by Eric on
+  # 2026-11-02). A higher number is ignored.
+  mode_switch_max_loss_ntd: {}
 
 strategy:
   name: "ma_crossover"

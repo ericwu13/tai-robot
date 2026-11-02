@@ -526,7 +526,7 @@ const App = {
       $("dlg-title").textContent = `將 ${b.bot_name} 改為實單（全自動）？`;
       body.push(el("p", { class: "warn" }, "改為實單後，機器人會用真實帳戶自動下單，可能造成實際虧損。"));
       body.push(el("p", null, "機器人會先查詢帳戶持倉：帳戶已有任何未平倉部位、帳戶淨損益（券商權益數回報）已超過下方的每日虧損上限、查詢失敗或逾時、等待成交中或重播歷史時，都會拒絕切換。結果會顯示在頁面上。"));
-      body.push(el("p", { class: "sub" }, "機器人重新啟動後會回到部署時指定的模式（模擬）。"));
+      body.push(el("p", { class: "sub" }, "重新啟動後會回到命令列指定的模式（--mode），這次切換與虧損上限都不會保留。"));
       body.push(el("p", null, "每日虧損上限（新台幣）："));
       const limit = el("input", { id: "dlg-limit", type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "例如 10000" });
       body.push(limit);
@@ -545,7 +545,7 @@ const App = {
       body.push(el("p", null, "改為模擬後不再送出實單。" + (b.supports_mode_request ? "數秒內套用。"
         : "會在下一根策略 K 棒時套用" + (b.interval_s ? `（最長約 ${b.interval_s / 60} 分鐘）` : "") + "。")));
       body.push(el("p", null, "有持倉、等待成交或重播歷史時，機器人會拒絕切換。"));
-      body.push(el("p", { class: "sub" }, "機器人重新啟動後會回到部署時指定的模式。"));
+      body.push(el("p", { class: "sub" }, "重新啟動後會回到命令列指定的模式（--mode），儀表板的切換不會保留。"));
       $("dlg-ok").textContent = "改為模擬"; $("dlg-ok").className = "primary";
     }
     $("dlg-body").replaceChildren(...body);

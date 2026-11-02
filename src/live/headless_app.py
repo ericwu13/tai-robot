@@ -286,10 +286,11 @@ class DeployDriver(_Driver):
                 self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
             else:
                 # acquire_lock has run. OSError is logged inside the helper.
-                write_headless_marker(self.bot_dir)
+                # mode_request lives on the marker. A separate
+                # capabilities.json is not written.
+                write_headless_marker(self.bot_dir, mode_request=True)
                 rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP, "
                         f"CONTROL, and Ctrl+C every 2s")
-                self._write_capabilities()
         finally:
             # Once a runner exists, the poll is scheduled even if the
             # deploy log raised. A refused deploy sets exit_code and
@@ -312,15 +313,6 @@ class DeployDriver(_Driver):
         elif status == "ignored":
             rb._log("[HEADLESS] warning: could not archive or delete stale CONTROL; "
                     "ignoring it until the file changes")
-
-    def _write_capabilities(self) -> None:
-        """Advertise the mode-request channel. The dashboard offers it
-        only while this pid matches the bot's lock pid."""
-        bot_dir = getattr(self.app._live_runner, "bot_dir", None) or self.bot_dir
-        try:
-            mreq.write_capabilities(bot_dir, os.getpid(), rb.APP_VERSION)
-        except Exception as e:
-            rb._log(f"[HEADLESS] capabilities.json not written: [{type(e).__name__}] {e}")
 
     def _poll(self) -> None:
         if self.exit_code is not None:

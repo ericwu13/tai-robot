@@ -279,6 +279,16 @@ Notes:
   and modification time and ignores that file until it changes. The
   STOP / CONTROL poll still starts. Write the command after the bot is
   running. GUI bots do not read this file.
+- A dashboard switch to real orders (`auto`) is a separate file,
+  `mode_request.json`. It is off unless that bot's name is boolean true
+  under `trading.dashboard_auto_opt_in`, and it is refused while
+  `trading.allow_live_override` is false. The loss limit cannot exceed
+  NT$20,000 (confirmed 2026-11-02); `trading.mode_switch_max_loss_ntd`
+  may lower that per bot and cannot raise it. A request older than 60
+  seconds, or more than 5 seconds ahead of the bot, is refused. The bot
+  must be RUNNING. A restart returns to the command-line `--mode`. The
+  channel is advertised on `headless.json` (`mode_request: 1`) and is
+  refused while a `CONTROL` file is still waiting.
 - `--detach` re-runs the command as a detached child (stdout appended to
   `data/live/{symbol}_{bot}/cli_stdout.log`) and, with `--wait-ready N`,
   returns `0` once the child owns the lock and logged `Tick subscription

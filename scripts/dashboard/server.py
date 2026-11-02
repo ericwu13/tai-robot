@@ -144,6 +144,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     news_paths: dict | None = None
     control_enabled = False
     control_log = ""
+    live_switch_policy = control.LiveSwitchPolicy()
 
     def log_message(self, fmt, *args):  # access log is noise; errors still print
         pass
@@ -215,7 +216,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 now_tpe(), self.base_dir, body["id"], body["action"], body["confirm"],
                 client=client, log_path=self.control_log,
                 position_ack=body.get("position_ack", ""),
-                loss_limit=loss_limit, real_ack=body.get("real_ack", ""))
+                loss_limit=loss_limit, real_ack=body.get("real_ack", ""),
+                policy=self.live_switch_policy)
         except Exception as exc:  # noqa: BLE001 — answer, don't drop the socket
             sys.stderr.write(f"dashboard: control failed: {type(exc).__name__}: {exc}\n")
             reply(500, False, "internal error")
@@ -337,6 +339,31 @@ def load_news_paths(settings_path: str) -> dict | None:
     return out
 
 
+def load_live_switch_policy(settings_path: str) -> control.LiveSwitchPolicy:
+    """Per-bot dashboard auto opt-in from settings.yaml. Missing file = closed.
+
+    Only boolean true opts a bot in. A loss ceiling may lower the confirmed
+    cap and never raises it. Nothing from this file is sent to a client.
+    """
+    try:
+        import yaml
+        from scripts.dashboard import fileio
+        text = fileio.read_text(settings_path)
+        data = yaml.safe_load(text) if text else None
+    except Exception:  # noqa: BLE001 — a bad settings file stays closed
+        return control.LiveSwitchPolicy()
+    trading = (data or {}).get("trading") if isinstance(data, dict) else None
+    if not isinstance(trading, dict):
+        return control.LiveSwitchPolicy()
+    from src.live import mode_request as mreq
+    return control.LiveSwitchPolicy(
+        allow_live_override=trading.get("allow_live_override") is True,
+        opt_in=mreq.parse_dashboard_auto_opt_in(trading.get("dashboard_auto_opt_in")),
+        loss_caps=mreq.parse_mode_switch_loss_caps(
+            trading.get("mode_switch_max_loss_ntd")),
+    )
+
+
 def default_settings_path(base_dir: str) -> str:
     """settings.yaml of the install that owns ``base_dir`` (<install>/data/live).
     No fallback to another install's file: when it is missing the vote
@@ -449,8 +476,9 @@ def main(argv=None) -> int:
     DashboardHandler.control_log = (
         args.control_log or default_control_log_path(DashboardHandler.base_dir))
     DashboardHandler.lwc_path = lwc_js_path()
-    DashboardHandler.news_paths = load_news_paths(
-        args.settings or default_settings_path(DashboardHandler.base_dir))
+    settings_path = args.settings or default_settings_path(DashboardHandler.base_dir)
+    DashboardHandler.news_paths = load_news_paths(settings_path)
+    DashboardHandler.live_switch_policy = load_live_switch_policy(settings_path)
     DashboardHandler.bound_hosts = {a.lower() for a in binds}
 
     def serve(addr, srv):

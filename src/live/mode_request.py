@@ -18,8 +18,10 @@ File contract (the dashboard is built against it):
 - ``mode_request_result.json`` (bot, tmp + os.replace):
   ``{"request_id", "mode", "status": "checking"|"accepted"|"refused",
   "reason", "at"}``
-- ``capabilities.json`` (headless app, after a successful deploy):
-  ``{"mode_request": 1, "pid", "version"}``
+- The live channel is advertised on the headless marker (``headless.json``
+  ``mode_request: 1``), not a separate capabilities file. The dashboard
+  accepts it only when that marker's pid, lock pid and ``started_at``
+  checks pass.
 """
 
 from __future__ import annotations
@@ -30,16 +32,24 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Iterable
 
 from .main_heartbeat import atomic_write_json, call_retrying_permission_error
 
 REQUEST_FILENAME = "mode_request.json"
 RESULT_FILENAME = "mode_request_result.json"
-CAPABILITIES_FILENAME = "capabilities.json"
-CAPABILITY_MODE_REQUEST = 1
 
 REQUEST_MODES = ("paper", "auto")
+
+# Confirmed by Eric on 2026-11-02. A per-bot settings value may lower
+# this cap and must never raise it.
+MAX_MODE_SWITCH_LOSS_LIMIT_NTD = 20_000
+
+# A request older than this, or timestamped more than the future skew
+# ahead of the bot's clock, is refused. Missing timestamps are refused.
+REQUEST_MAX_AGE_S = 60
+REQUEST_FUTURE_SKEW_S = 5
 
 STATUS_CHECKING = "checking"
 STATUS_ACCEPTED = "accepted"
@@ -137,8 +147,68 @@ def result_path(bot_dir: str) -> str:
     return os.path.join(bot_dir, RESULT_FILENAME)
 
 
-def capabilities_path(bot_dir: str) -> str:
-    return os.path.join(bot_dir, CAPABILITIES_FILENAME)
+def effective_loss_cap(per_bot) -> int:
+    """The hard cap, or a per-bot value that lowers it. Never raised.
+
+    A missing, non-integer, non-positive, or higher value leaves the
+    confirmed cap in place.
+    """
+    if _is_int(per_bot) and 0 < per_bot < MAX_MODE_SWITCH_LOSS_LIMIT_NTD:
+        return int(per_bot)
+    return MAX_MODE_SWITCH_LOSS_LIMIT_NTD
+
+
+def loss_limit_reason(loss_limit, cap: int) -> str | None:
+    """Why an auto ``loss_limit`` is refused, or None when it is inside ``cap``."""
+    if not _is_int(loss_limit) or loss_limit <= 0:
+        return "全自動需要有效的每日虧損上限 loss_limit（正整數）"
+    if loss_limit > cap:
+        return f"每日虧損上限 {loss_limit:,} 超過允許上限 {cap:,} 新台幣"
+    return None
+
+
+def parse_dashboard_auto_opt_in(raw) -> frozenset[str]:
+    """Bot names whose settings value is boolean True. Anything else is off."""
+    if not isinstance(raw, dict):
+        return frozenset()
+    return frozenset(
+        str(name) for name, flag in raw.items()
+        if flag is True and str(name).strip()
+    )
+
+
+def parse_mode_switch_loss_caps(raw) -> dict[str, int]:
+    """Per-bot ceilings that lower the hard cap. Higher values are dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for name, value in raw.items():
+        if _is_int(value) and 0 < value < MAX_MODE_SWITCH_LOSS_LIMIT_NTD:
+            out[str(name)] = int(value)
+    return out
+
+
+def expiry_reason(requested_at: str, now: datetime) -> str | None:
+    """Why ``requested_at`` is too old, too far ahead, or missing.
+
+    ``age > 60`` s is refused (exactly 60 s is still accepted). A timestamp
+    more than 5 s in the future is refused (exactly 5 s is accepted).
+    A naive timestamp is read in ``now``'s timezone.
+    """
+    if not isinstance(requested_at, str) or not requested_at.strip():
+        return "請求缺少時間 requested_at"
+    try:
+        at = datetime.fromisoformat(requested_at.strip())
+    except ValueError:
+        return "請求時間 requested_at 無法解析"
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=now.tzinfo)
+    age = (now - at).total_seconds()
+    if age > REQUEST_MAX_AGE_S:
+        return "請求已超過 60 秒，已拒絕"
+    if age < -REQUEST_FUTURE_SKEW_S:
+        return "請求時間超前超過 5 秒，已拒絕"
+    return None
 
 
 def _remove(path: str, *, sleep_fn=None) -> bool:
@@ -335,22 +405,11 @@ def write_result(bot_dir: str, payload: dict) -> None:
     atomic_write_json(result_path(bot_dir), payload)
 
 
-def capabilities_payload(pid: int, version: str) -> dict:
-    return {"mode_request": CAPABILITY_MODE_REQUEST, "pid": int(pid),
-            "version": version}
-
-
-def write_capabilities(bot_dir: str, pid: int, version: str) -> None:
-    _require_bot_dir(bot_dir)
-    atomic_write_json(capabilities_path(bot_dir), capabilities_payload(pid, version))
-
-
 def clear_stale_request(bot_dir: str) -> None:
     """Drop a request/result left from a previous run (deploy start).
 
-    ``capabilities.json`` goes too: it is rewritten after this deploy
-    succeeds, and a stale one must not advertise controls meanwhile.
+    The headless marker is not touched here: it is rewritten after this
+    deploy holds the lock, and a stale one fails the pid check.
     """
-    for path in (request_path(bot_dir), result_path(bot_dir),
-                 capabilities_path(bot_dir)):
+    for path in (request_path(bot_dir), result_path(bot_dir)):
         _remove(path)
