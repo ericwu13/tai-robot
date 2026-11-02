@@ -131,7 +131,9 @@ class TestEvolvedParamsOverlay:
     def test_evolved_params_inside_max_age_still_apply(self, tmp_path):
         evolved_dir = tmp_path / "data" / "regime"
         evolved_dir.mkdir(parents=True)
-        at = datetime.now() - timedelta(days=EVOLVED_MAX_AGE_DAYS - 1)
+        # Two days inside, not one: a midnight tick between writing and
+        # loading must not push the age past the window.
+        at = datetime.now() - timedelta(days=EVOLVED_MAX_AGE_DAYS - 2)
         (evolved_dir / "regime_evolved_params.json").write_text(json.dumps({
             "adx_enter": 20.0, "evolved_at": at.strftime("%Y-%m-%d")}))
         cfg = build_regime_config(_make_settings(), base_dir=str(tmp_path))
