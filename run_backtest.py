@@ -8976,6 +8976,16 @@ class BacktestApp:
             self._live_runner.on_news_notify_cb = lambda msg: (
                 _discord.notify_regime(msg) if _discord is not None and _discord.enabled else None
             )
+        # After the Discord callback is wired. A real --news bot with an
+        # empty heartbeat_path fails closed and blocks every entry; say
+        # so in the deploy log. The breaker no-ops for paper and for a
+        # path that is set. Fail-closed behaviour is unchanged.
+        _news = getattr(self._live_runner, "_news", None)
+        _warn_hb = getattr(_news, "warn_unconfigured_heartbeat", None)
+        if callable(_warn_hb):
+            _hb_warn = _warn_hb() or ""
+            if _hb_warn:
+                _log(_hb_warn)
 
         # Debug: log resolved order symbol and query stock list
         order_sym = resolve_order_symbol(symbol)

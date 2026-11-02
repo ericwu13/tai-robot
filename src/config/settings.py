@@ -86,8 +86,9 @@ class NewsConfig:
     ledger_path: str = ""          # consumed signal_id ledger JSON
     regime_vote_path: str = ""     # regime-vote sidecar JSON (confirmation acceleration)
     # W2 monitor liveness file. Empty until settings.yaml points at it.
-    # The age limit is DEFAULT_MAX_HEARTBEAT_AGE_SEC (provisional) — the
-    # only place that number is defined.
+    # The age limit is DEFAULT_MAX_HEARTBEAT_AGE_SEC (confirmed
+    # 2026-11-02) — the only place that number is defined. An empty path
+    # on a real --news bot blocks every new entry (fail closed).
     heartbeat_path: str = ""
     max_heartbeat_age_sec: int = DEFAULT_MAX_HEARTBEAT_AGE_SEC
     max_signal_age_sec: int = 900

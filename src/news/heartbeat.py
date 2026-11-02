@@ -5,9 +5,9 @@ cannot stand in for it: that file is written only when a breach fires, so a
 quiet monitor and a dead monitor look the same.
 
 ``DEFAULT_MAX_HEARTBEAT_AGE_SEC`` is the one definition of the age limit.
-It is a provisional default (Eric, via Selina, 2026-10-29) and may change
-before this ships. Callers must read it from here — NewsConfig's field
-default, the settings loader, and the resolver all do.
+Eric confirmed 900 seconds (15 minutes) on 2026-11-02. Callers must read
+it from here — NewsConfig's field default, the settings loader, and the
+resolver all do.
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
-# Provisional. Do not copy this number into settings, the runner, or the
-# monitor. Change it here if the paper soak says 15 minutes is wrong.
+# Confirmed by Eric on 2026-11-02. Do not copy this number into settings,
+# the runner, or the monitor. Change it here if a later decision says
+# 15 minutes is wrong.
 DEFAULT_MAX_HEARTBEAT_AGE_SEC = 900
 
 HEARTBEAT_VERSION = 1
@@ -72,7 +73,9 @@ def read_heartbeat(
 
     Age comes from ``written_at`` when that stamp parses. A naive stamp
     is corrupt, matching the signal file: the monitor host is not
-    assumed to be local. Never raises.
+    assumed to be local. ``FileNotFoundError`` from ``open`` (the file
+    disappeared between the exists check and the read) is ``missing``,
+    not ``corrupt``. Never raises.
     """
     if now is None:
         now = datetime.now(_TZ_TAIPEI)
@@ -86,6 +89,8 @@ def read_heartbeat(
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        return None, "missing"
     except (OSError, ValueError):
         return None, "corrupt"
     if not isinstance(data, dict) or data.get("version") != HEARTBEAT_VERSION:

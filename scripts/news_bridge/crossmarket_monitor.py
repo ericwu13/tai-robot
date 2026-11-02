@@ -382,13 +382,39 @@ def save_state(path: Path, state: dict) -> None:
     os.replace(tmp, path)
 
 
+# os.replace on Windows raises PermissionError while any reader holds the
+# destination. Same budget as regime store._replace (#208): 4 attempts,
+# backing off 5/10/20 ms. Only PermissionError is retried. _sleep is
+# module-level so tests can inject a fake. This bridge stays stdlib-only,
+# so the helper is inlined instead of imported from the bot.
+_REPLACE_ATTEMPTS = 4
+_REPLACE_BACKOFF_S = (0.005, 0.010, 0.020)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _replace_heartbeat(tmp: str, path: str) -> None:
+    """Move ``tmp`` onto ``path``. Retry PermissionError only."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= _REPLACE_ATTEMPTS:
+                raise
+            _sleep(_REPLACE_BACKOFF_S[attempt])
+
+
 def write_heartbeat_file(path: str | os.PathLike, now: datetime, source: str = "w2") -> None:
     """Rewrite the W2 liveness file. Schema is src.news.heartbeat (version 1).
 
     Inlined so this bridge stays stdlib-only. The age limit is NOT here —
     the bot reads DEFAULT_MAX_HEARTBEAT_AGE_SEC. Never raises: a completed
     quote pass must not be reported as failed because the heartbeat write
-    failed.
+    failed. ``os.replace`` retries ``PermissionError`` with a short backoff
+    so one shared read does not drop the cycle's liveness stamp.
     """
     try:
         if now.tzinfo is None:
@@ -407,7 +433,7 @@ def write_heartbeat_file(path: str | os.PathLike, now: datetime, source: str = "
             json.dump(payload, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_heartbeat(tmp, path)
     except Exception as e:                                    # noqa: BLE001
         print(f"  heartbeat write failed: {type(e).__name__}: {e}")
 

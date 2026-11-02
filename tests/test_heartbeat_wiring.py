@@ -198,6 +198,75 @@ def test_deploy_wires_heartbeat_tick_and_stop(tmp_path, monkeypatch):
         _cleanup()
 
 
+def test_deploy_warns_real_news_bot_when_heartbeat_path_is_empty(
+        tmp_path, monkeypatch, capsys):
+    """Deploy calls the breaker warning after mode and Discord are set."""
+    bot_dir = str(tmp_path / "bot")
+    _install_runner(monkeypatch, bot_dir)
+    warned = {}
+
+    class FakeNews:
+        def warn_unconfigured_heartbeat(self):
+            host = warned["runner"]
+            warned["mode"] = host.trading_mode
+            warned["cb"] = host.on_news_notify_cb
+            return "all entries will be blocked"
+
+    class RecordingRunner:
+        def __init__(self, strategy, symbol, point_value=0, log_dir="",
+                     bot_name="", strategy_display_name="", news_cfg=None):
+            self.bot_dir = bot_dir
+            self.symbol = symbol
+            self.broker = SimpleNamespace(
+                trade_source=None, position_size=0, position_side=None)
+            self.strategy_display_name = strategy_display_name
+            self.trading_mode = "paper"
+            self.on_news_notify_cb = None
+            self._news = FakeNews()
+            self.news_cfg = news_cfg
+            warned["runner"] = self
+
+        def acquire_lock(self):
+            self.locked = True
+
+        def on(self, *_a, **_k):
+            return None
+
+        def stop(self):
+            return {"trades": 0, "pnl": 0, "bars_1m": 0, "bars_agg": 0}
+
+    monkeypatch.setattr(rb, "LiveRunner", RecordingRunner)
+    sent = []
+
+    class FakeNotifier:
+        def __init__(self, *_a, **_k):
+            self.enabled = True
+
+        def bot_deployed(self, **_k):
+            return None
+
+        def notify_regime(self, message):
+            sent.append(message)
+
+    monkeypatch.setattr(
+        "src.live.discord_notify.DiscordNotifier", FakeNotifier)
+    app = _app(bot_dir)
+    app._settings = {}
+    app._start_live_warmup = lambda: None
+    try:
+        ok = app._deploy_live_continue(
+            None, _Strategy, False, None, True, False, False,
+            None, "auto", "wirebot")
+        assert ok is True
+        assert warned["mode"] == "auto"
+        assert callable(warned["cb"])
+        warned["cb"]("all entries will be blocked")
+        assert sent == ["all entries will be blocked"]
+        assert "all entries will be blocked" in capsys.readouterr().out
+    finally:
+        _cleanup()
+
+
 def test_deploy_continues_when_heartbeat_start_raises(tmp_path, monkeypatch):
     bot_dir = str(tmp_path / "bot")
     _install_runner(monkeypatch, bot_dir)

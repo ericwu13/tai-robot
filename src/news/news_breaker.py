@@ -80,6 +80,8 @@ class NewsBreaker:
         self.health = _Health()
         # Last discord condition: None (never), "stale", "ok".
         self._hb_alert: str | None = None
+        # Deploy warning for an empty heartbeat_path on a real bot.
+        self._hb_unconfigured_warned: bool = False
         if self.enabled:
             ledger_path = news_cfg.ledger_path or os.path.join(
                 host.bot_dir, "news_ledger.json")
@@ -237,6 +239,38 @@ class NewsBreaker:
                 logger.warning("[NEWS] Event calendar: %s", err)
             self.events_error = err
         return self.events_cache
+
+    def warn_unconfigured_heartbeat(self) -> str:
+        """Warn once when a real ``--news`` bot has no heartbeat path.
+
+        An empty or missing ``heartbeat_path`` still fails closed: the
+        next poll blocks every new entry. This only makes that obvious
+        at deploy. Paper mode is unchanged (entries stay open). Returns
+        the warning text, or ``""`` when there is nothing to say.
+        """
+        if self._hb_unconfigured_warned or not self.enabled:
+            return ""
+        path = str(getattr(self.cfg, "heartbeat_path", "") or "")
+        if path:
+            return ""
+        mode = str(getattr(self.host, "trading_mode", _PAPER_MODE) or "")
+        if mode == _PAPER_MODE:
+            return ""
+        self._hb_unconfigured_warned = True
+        text = (
+            "⚠️ **W2 心跳未設定 W2 heartbeat UNCONFIGURED** — "
+            "實單將阻擋全部進場 all entries will be blocked\n"
+            f"模式 Mode: `{mode}`\n"
+            "news.heartbeat_path is empty or unset. "
+            "A real bot with --news blocks every new entry until the path "
+            "is set and the W2 monitor is writing it.\n"
+            "出場、停損、強制平倉不受影響 "
+            "exits, stops and FORCE_CLOSE are not blocked"
+        )
+        flat = text.replace("\n", " | ")
+        logger.warning("[NEWS] %s", flat)
+        self.notify(text)
+        return flat
 
     def _check_heartbeat(self, now: datetime) -> list[str]:
         """Fail closed for real bots. Paper logs a warning and keeps trading.

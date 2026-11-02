@@ -325,8 +325,12 @@ news:
   signal_path: ""            # circuit-breaker signal JSON (risk_off / deploy_* / clear)
   # W2 monitor liveness file, rewritten every cycle. signal.json is not a
   # substitute: it is written only on a breach. The age limit is
-  # src/news/heartbeat.py DEFAULT_MAX_HEARTBEAT_AGE_SEC (provisional,
-  # currently 15 min) — not copied here, so it cannot drift.
+  # src/news/heartbeat.py DEFAULT_MAX_HEARTBEAT_AGE_SEC (confirmed
+  # 2026-11-02, 15 min) — not copied here, so it cannot drift.
+  # Empty or unset on a real (non-paper) bot deployed with --news blocks
+  # every new entry. Point this at the file the W2 monitor writes with
+  # --heartbeat-out. Paper mode only warns. See
+  # docs/news_framework_n8n_setup.md (§3, heartbeat file).
   heartbeat_path: ""
   events_path: ""            # scheduled-event calendar JSON (CPI, FOMC, ...)
   ledger_path: ""            # consumed signal_id ledger — gives exactly-once acting

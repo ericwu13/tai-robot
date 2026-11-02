@@ -433,7 +433,7 @@ def test_entry_filter_does_not_touch_trading_guard(tmp_path):
 # ── R3: heartbeat ──
 
 def test_heartbeat_age_constant_is_the_only_definition():
-    """Provisional default lives in one assignment. Callers reference it."""
+    """Confirmed default lives in one assignment. Callers reference it."""
     assert DEFAULT_MAX_HEARTBEAT_AGE_SEC == 900
     assert NewsConfig().max_heartbeat_age_sec == DEFAULT_MAX_HEARTBEAT_AGE_SEC
     root = Path(__file__).resolve().parents[1]
@@ -531,6 +531,187 @@ def test_monitor_heartbeat_file_matches_the_reader(tmp_path):
     age, status = read_heartbeat(path, IN_SESSION, DEFAULT_MAX_HEARTBEAT_AGE_SEC)
     assert status == "ok"
     assert age is not None and abs(age) < 1
+
+
+def test_future_skew(tmp_path):
+    """A stamp 121s ahead is stale. Exactly 120s is still inside the window.
+
+    Dropping the future-skew half of the age check (heartbeat.py) leaves
+    the +121s stamp ``ok``. That mutant has to fail here.
+    """
+    path = tmp_path / "w2_heartbeat.json"
+    now = IN_SESSION
+    write_heartbeat(path, now + timedelta(seconds=120))
+    age, status = read_heartbeat(path, now)
+    assert status == "ok"
+    assert age == pytest.approx(-120.0)
+
+    write_heartbeat(path, now + timedelta(seconds=121))
+    age, status = read_heartbeat(path, now)
+    assert status == "stale"
+    assert age == pytest.approx(-121.0)
+
+
+def test_open_file_not_found_is_missing_not_corrupt(tmp_path, monkeypatch):
+    """exists() then a vanished file is the replace race. It is not corrupt."""
+    path = tmp_path / "w2_heartbeat.json"
+    monkeypatch.setattr(
+        "src.news.heartbeat.os.path.exists", lambda _p: True)
+    age, status = read_heartbeat(path, IN_SESSION)
+    assert age is None
+    assert status == "missing"
+
+
+def test_open_permission_error_stays_corrupt(tmp_path, monkeypatch):
+    path = tmp_path / "w2_heartbeat.json"
+    path.write_text("{}", encoding="utf-8")
+    real_open = open
+
+    def boom(file, *args, **kwargs):
+        if str(file) == str(path):
+            raise PermissionError("denied")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", boom)
+    _age, status = read_heartbeat(str(path), IN_SESSION)
+    assert status == "corrupt"
+
+
+def test_monitor_replace_retries_one_permission_error(tmp_path, monkeypatch, capsys):
+    import scripts.news_bridge.crossmarket_monitor as cm
+
+    path = tmp_path / "w2_heartbeat.json"
+    path.write_text("old", encoding="utf-8")
+    calls = {"n": 0}
+    real = cm.os.replace
+
+    def fake(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("busy")
+        return real(src, dst)
+
+    monkeypatch.setattr(cm.os, "replace", fake)
+    sleeps = []
+    monkeypatch.setattr(cm, "_sleep", lambda delay: sleeps.append(delay))
+    write_heartbeat_file(path, IN_SESSION)
+    assert calls["n"] == 2
+    assert sleeps == [0.005]
+    assert "heartbeat write failed" not in capsys.readouterr().out
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["version"] == 1
+    assert data["source"] == "w2"
+
+
+def test_monitor_replace_stops_after_four_permission_errors(
+        tmp_path, monkeypatch, capsys):
+    import scripts.news_bridge.crossmarket_monitor as cm
+
+    path = tmp_path / "w2_heartbeat.json"
+    path.write_text('{"written_at": "old"}', encoding="utf-8")
+    calls = {"n": 0}
+
+    def fake(src, dst):
+        calls["n"] += 1
+        raise PermissionError("busy")
+
+    monkeypatch.setattr(cm.os, "replace", fake)
+    sleeps = []
+    monkeypatch.setattr(cm, "_sleep", lambda delay: sleeps.append(delay))
+    write_heartbeat_file(path, IN_SESSION)
+    assert calls["n"] == 4
+    assert sleeps == [0.005, 0.010, 0.020]
+    assert "PermissionError" in capsys.readouterr().out
+    assert "old" in path.read_text(encoding="utf-8")
+
+
+def test_monitor_replace_does_not_retry_other_errors(
+        tmp_path, monkeypatch, capsys):
+    import scripts.news_bridge.crossmarket_monitor as cm
+
+    path = tmp_path / "w2_heartbeat.json"
+    calls = {"n": 0}
+
+    def fake(src, dst):
+        calls["n"] += 1
+        raise OSError("disk")
+
+    monkeypatch.setattr(cm.os, "replace", fake)
+    sleeps = []
+    monkeypatch.setattr(cm, "_sleep", lambda delay: sleeps.append(delay))
+    write_heartbeat_file(path, IN_SESSION)
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert "OSError" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", ["auto", "semi_auto", ""])
+def test_real_news_bot_warns_when_heartbeat_path_is_empty(tmp_path, caplog, mode):
+    cfg = _cfg(tmp_path, "empty", heartbeat_path="")
+    runner = _plain_named(tmp_path, cfg, "empty", mode=mode or "auto")
+    if mode == "":
+        runner.trading_mode = ""
+    notes = []
+    runner.on_news_notify_cb = notes.append
+    caplog.set_level(logging.WARNING)
+    text = runner._news.warn_unconfigured_heartbeat()
+    assert "all entries will be blocked" in text
+    assert "all entries will be blocked" in notes[0]
+    warnings = [r for r in caplog.records if "all entries will be blocked" in r.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert runner._news.warn_unconfigured_heartbeat() == ""
+    assert len(notes) == 1
+
+    if mode == "auto":
+        runner._check_news(IN_SESSION)
+        assert runner.heartbeat_entry_block
+        assert "unconfigured" in runner.heartbeat_entry_block
+        assert len([n for n in notes if "all entries will be blocked" in n]) == 1
+        assert len([n for n in notes if "heartbeat STALE" in n]) == 1
+
+
+def test_unset_heartbeat_path_warns_like_empty(tmp_path):
+    cfg = _cfg(tmp_path, "unset", heartbeat_path="")
+    del cfg.heartbeat_path
+    runner = _plain_named(tmp_path, cfg, "unset", mode="auto")
+    notes = []
+    runner.on_news_notify_cb = notes.append
+    text = runner._news.warn_unconfigured_heartbeat()
+    assert "all entries will be blocked" in text
+    assert notes
+
+
+def test_paper_and_configured_path_do_not_warn_on_deploy(tmp_path, caplog):
+    caplog.set_level(logging.WARNING)
+    paper = _plain_named(
+        tmp_path, _cfg(tmp_path, "paper", heartbeat_path=""), "paper", mode="paper")
+    notes = []
+    paper.on_news_notify_cb = notes.append
+    assert paper._news.warn_unconfigured_heartbeat() == ""
+    assert notes == []
+
+    configured = _plain_named(tmp_path, _cfg(tmp_path, "set"), "set", mode="auto")
+    notes2 = []
+    configured.on_news_notify_cb = notes2.append
+    assert configured._news.warn_unconfigured_heartbeat() == ""
+    assert notes2 == []
+
+    off = _plain_named(
+        tmp_path, _cfg(tmp_path, "off", enabled=False, heartbeat_path=""),
+        "off", mode="auto")
+    assert off._news.warn_unconfigured_heartbeat() == ""
+    assert not any("all entries will be blocked" in r.getMessage() for r in caplog.records)
+
+
+def test_unconfigured_warning_without_discord_still_logs(tmp_path, caplog):
+    cfg = _cfg(tmp_path, "nodiscord", heartbeat_path="")
+    runner = _plain_named(tmp_path, cfg, "nodiscord", mode="auto")
+    runner.on_news_notify_cb = None
+    caplog.set_level(logging.WARNING)
+    text = runner._news.warn_unconfigured_heartbeat()
+    assert "all entries will be blocked" in text
+    assert any("all entries will be blocked" in r.getMessage() for r in caplog.records)
 
 
 # ── Dashboard field ──

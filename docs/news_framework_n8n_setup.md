@@ -198,6 +198,21 @@ outcome, and how many fetches came back empty. `fetch-fail` counts closed-market
 too, so a high count during a single session's hours is normal. The file self-trims to its
 last 2000 lines past ~1 MB, and a failed log write never aborts the monitoring pass.
 
+**Heartbeat file — required before a real `--news` bot.** Every pass also
+rewrites a liveness file (`--heartbeat-out`, or `news.heartbeat_path` from
+settings when that flag is omitted). `signal.json` cannot stand in for it:
+that file is written only when a breach fires, so a quiet monitor and a
+dead monitor look the same.
+
+`news.heartbeat_path` ships empty. A real bot — any trading mode other than
+`paper` — deployed with `--news` while that path is empty or unset
+**blocks every new entry** until the path is set and the file stays younger
+than `DEFAULT_MAX_HEARTBEAT_AGE_SEC` (900 seconds, confirmed 2026-11-02).
+Stops, market exits, and FORCE_CLOSE still run. Deploy logs a warning and,
+when Discord is configured, posts the same warning. Paper mode only warns
+and keeps trading. Do not deploy a real `--news` bot until the monitor is
+writing this file. The block is fail-closed on purpose.
+
 ---
 
 ## 4. Workflow W3 — RSS + Gemini scorer (advisory + evidence)
@@ -252,6 +267,9 @@ news:
   enabled: true                  # deploy-dialog DEFAULT only (see below)
   signal_path: "C:/n8n-bridge/signal.json"
   events_path: "C:/n8n-bridge/events.json"
+  # Required for any real (non-paper) bot that runs with --news.
+  # Empty blocks every new entry. Same path as the monitor's --heartbeat-out.
+  heartbeat_path: "C:/n8n-bridge/w2_heartbeat.json"
   ledger_path: ""                # empty = bot dir default
   max_signal_age_sec: 900
   tier2_enabled: false           # deploy-dialog DEFAULT only; keep false until
@@ -269,10 +287,13 @@ news bot and the baseline bot read the same `settings.yaml`, but only the one wh
 checkbox was ticked gets the breaker, so a `risk_off` never flattens both.
 
 The paths, `max_signal_age_sec` and `calendar_min_severity` ARE shared — they describe
-the n8n files themselves, not a policy choice.
+the n8n files themselves, not a policy choice. `heartbeat_path` is shared the
+same way. See §3: a real `--news` bot with that path empty or unset blocks
+every new entry.
 
-News gating runs **only on regime-switching deploys** (bot type 2). Plain LiveRunner
-bots ignore all of it, and the checkboxes are hidden unless regime switching is on.
+`--news` is per bot. It runs on a plain LiveRunner and on a regime runner,
+and it stays off unless this deploy passes it (a resumed bot keeps the flag
+it saved).
 
 ---
 
