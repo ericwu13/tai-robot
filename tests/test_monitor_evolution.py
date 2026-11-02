@@ -13,11 +13,11 @@ a regime bot — so they fail if the check stops noticing them.
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from scripts.monitor.check_evolution import check_evolution, last_due
+from scripts.monitor.check_evolution import check_evolution, last_due, slot_outcome
 from scripts.monitor.common import TZ_TPE
 
 NOW = datetime(2026, 9, 2, 12, 0, tzinfo=TZ_TPE)      # Wednesday
@@ -149,8 +149,11 @@ def test_missed_saturday_is_p2(tmp_path, repo):
 
 
 def test_plan_phase_only_is_p3_not_p2(tmp_path, repo):
-    """Reaching the plan phase and stopping is a verdict, not an outage."""
-    make_bot(tmp_path, watermark={"trade_count": 127, "at": "2026-08-29 05:05:01"},
+    """Reaching the plan phase and stopping is a verdict, not an outage.
+
+    A no_change plan does not advance the watermark (issue #125), so it
+    still carries the previous Saturday's stamp."""
+    make_bot(tmp_path, watermark={"trade_count": 127, "at": "2026-08-22 05:05:01"},
              pid=4242)
     write_usage(repo, [(DUE_ROW_UTC, "bot_evolution"),
                        ("2026-08-28T21:06:06+00:00", "bot_evolution")])
@@ -604,3 +607,296 @@ def test_check_never_touches_bot_state(tmp_path, repo):
     run(tmp_path, repo, alive=False)
     after = {p.name: p.read_bytes() for p in bot.iterdir() if p.is_file()}
     assert before == after, "monitoring must never mutate bot state"
+
+
+# ── issue #161: knob-mode candidates and pool PASSes ────────────────────
+#
+# Saturday knob mode (#153/#154) evaluates a candidate with NO codegen
+# model call, so the due day's ledger holds only bot_evolution rows.  The
+# real 2026-10-10 shape: plan(action=change) -> knob ema_period 50->60 ->
+# PASS -> validated pool row + changelog entry, watermark advanced at
+# 05:05:54 TPE — and the monitor still said "stopped at plan phase".
+
+import sqlite3  # noqa: E402
+
+
+def write_pool(repo, rows):
+    """``rows`` = ``[(name, status, created_at_utc_iso), ...]`` in a
+    StrategyPool-shaped ``data/evolution_pool.db``."""
+    (repo / "data").mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(repo / "data" / "evolution_pool.db")
+    try:
+        conn.execute("CREATE TABLE strategies (id TEXT PRIMARY KEY, "
+                     "name TEXT NOT NULL, status TEXT NOT NULL, "
+                     "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                     "walkforward_fitness REAL NOT NULL DEFAULT 0.0, "
+                     "notes TEXT NOT NULL DEFAULT '')")
+        for i, (name, status, created) in enumerate(rows):
+            conn.execute("INSERT INTO strategies (id, name, status, created_at, "
+                         "updated_at) VALUES (?, ?, ?, ?, ?)",
+                         (str(i), name, status, created, created))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Plan calls only — the knob path never writes an evolution_codegen row.
+KNOB_USAGE = [(DUE_ROW_UTC, "bot_evolution"),
+              ("2026-08-28T21:05:54+00:00", "bot_evolution")]
+KNOB_MARK = {"trade_count": 172, "at": "2026-08-29 05:05:54"}
+
+
+def test_knob_mode_candidate_is_not_called_plan_only(tmp_path, repo):
+    """FAILS pre-fix: watermark advanced inside the slot = the plan said
+    change and a candidate was designed, codegen row or not.  The advance
+    is not a pool PASS — counting watermark-advanced bots as PASS must
+    not print a PASS: line."""
+    bot = make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:28")])
+    write_usage(repo, KNOB_USAGE)
+    findings, lines = run(tmp_path, repo)
+    assert not any("stopped at plan phase" in m for m in messages(findings)), \
+        messages(findings)
+    assert any("candidate designed (watermark advanced; knob mode or "
+               "codegen stopped early)" in ln
+               and "TMF00_0422" in ln and "at 05:05 TPE" in ln
+               for ln in lines), lines
+    assert not any("PASS:" in ln for ln in lines), lines
+    assert not has_level(findings, "P1") and not has_level(findings, "P2"), \
+        messages(findings)
+
+
+def test_knob_mode_pass_reports_the_pool_validated_candidate(tmp_path, repo):
+    """FAILS pre-fix: the 2026-10-10 PASS, reported as "no candidate".
+    The pool's created_at is UTC — 21:29:25Z is 05:29 TPE on the due day."""
+    bot = make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:28")])
+    write_usage(repo, KNOB_USAGE)
+    write_pool(repo, [
+        ("DynamicExitPullbackStrategyV2Evo1", "validated",
+         "2026-08-28T21:29:25+00:00"),
+        ("OlderEvo1", "validated", "2026-08-21T21:29:25+00:00"),
+        ("RejectedEvo2", "candidate", "2026-08-28T21:20:00+00:00"),
+    ])
+    findings, lines = run(tmp_path, repo)
+    assert not any("stopped at plan phase" in m for m in messages(findings)), \
+        messages(findings)
+    assert any("PASS: DynamicExitPullbackStrategyV2Evo1 pool-validated at "
+               "05:29 TPE" in ln for ln in lines), lines
+    assert not any("OlderEvo1" in ln or "RejectedEvo2" in ln
+                   for ln in lines), lines
+    assert not has_level(findings, "P1") and not has_level(findings, "P2"), \
+        messages(findings)
+
+
+def test_changelog_pass_is_read_as_machine_local_time(tmp_path, repo):
+    """FAILS pre-fix.  With no pool DB, the changelog entry is the PASS
+    record — and its ``date`` is machine-LOCAL naive time (the real one
+    read "2026-10-09 14:29:25" for 05:29 TPE), so it must be converted,
+    never read as TPE."""
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    pass_at = datetime(2026, 8, 29, 5, 29, 25, tzinfo=TZ_TPE)
+    local = pass_at.astimezone().replace(tzinfo=None)
+    write_json(repo / "data" / "changelog.json", [
+        {"date": local.strftime("%Y-%m-%d %H:%M:%S"),
+         "version_before": "DynamicExitPullbackStrategyV2",
+         "version_after": "DynamicExitPullbackStrategyV2Evo1",
+         "change_summary":
+         "promotion_gate=relative; auto-evolution pool-validated; "
+         "plan excerpt: EVO_RELATIVE_GATE passed=false at=2026-08-29T05:20:00",
+         "initiated_by": "ai"}])
+    findings, lines = run(tmp_path, repo)
+    assert any("PASS (changelog only; pool validation not observed): "
+               "DynamicExitPullbackStrategyV2Evo1 at 05:29 TPE" in ln
+               for ln in lines), lines
+    assert not any("pool-validated" in ln for ln in lines), lines
+
+
+def test_changelog_only_pass_is_not_labelled_pool_validated(tmp_path, repo):
+    """A pool that exists but has no in-slot validated row falls back to
+    the changelog.  That line must not claim pool validation, and an
+    older pool PASS stays out of the slot."""
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    write_pool(repo, [("OlderEvo1", "validated", "2026-08-21T21:29:25+00:00")])
+    pass_at = datetime(2026, 8, 29, 5, 29, 25, tzinfo=TZ_TPE)
+    local = pass_at.astimezone().replace(tzinfo=None)
+    write_json(repo / "data" / "changelog.json", [
+        {"date": local.strftime("%Y-%m-%d %H:%M:%S"),
+         "version_before": "DynamicExitPullbackStrategyV2",
+         "version_after": "DynamicExitPullbackStrategyV2Evo1",
+         "change_summary": "auto-evolution pool-validated",
+         "initiated_by": "ai"}])
+    _, lines = run(tmp_path, repo)
+    assert any(ln.startswith(
+        "PASS (changelog only; pool validation not observed): "
+        "DynamicExitPullbackStrategyV2Evo1 at 05:29 TPE")
+        for ln in lines), lines
+    assert not any("pool-validated" in ln or "OlderEvo1" in ln
+                   for ln in lines), lines
+
+
+def test_plan_only_slot_still_p3_despite_an_old_pool_pass(tmp_path, repo):
+    """The plan-only reading survives the fix: no codegen row, the
+    watermark still on last week's stamp, and the pool's only validated
+    row is from a previous Saturday."""
+    bot = make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_debug_log(bot, "20260815", [start_line("2026-08-29 05:05:28")])
+    write_usage(repo, KNOB_USAGE)
+    write_pool(repo, [("OlderEvo1", "validated", "2026-08-21T21:29:25+00:00")])
+    findings, lines = run(tmp_path, repo)
+    assert any("stopped at plan phase" in m
+               for m in messages(findings, "P3")), messages(findings)
+    assert not any("knob mode" in ln or ln.startswith("PASS:")
+                   for ln in lines), lines
+
+
+def test_unreadable_pool_db_is_tolerated(tmp_path, repo):
+    """A corrupt / non-sqlite pool file must not crash the monitor."""
+    make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    (repo / "data" / "evolution_pool.db").write_bytes(b"not a database")
+    findings, _ = run(tmp_path, repo)
+    assert any("stopped at plan phase" in m
+               for m in messages(findings, "P3")), messages(findings)
+
+
+def test_pool_db_is_opened_read_only(tmp_path, repo):
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    write_pool(repo, [("XEvo1", "validated", "2026-08-28T21:29:25+00:00")])
+    db = repo / "data" / "evolution_pool.db"
+    before = db.read_bytes()
+    run(tmp_path, repo)
+    assert db.read_bytes() == before
+    assert not (repo / "data" / "evolution_pool.db-journal").exists()
+
+
+def _local_changelog_stamp(when_tpe: datetime) -> str:
+    """Machine-local naive stamp, the shape ``append_changelog`` writes."""
+    return when_tpe.astimezone().replace(tzinfo=None).strftime(
+        "%Y-%m-%d %H:%M:%S")
+
+
+def _relative_gate_marker(when_tpe: datetime, *, passed: bool) -> dict:
+    flag = "true" if passed else "false"
+    at = when_tpe.strftime("%Y-%m-%dT%H:%M:%S")
+    return {
+        "date": _local_changelog_stamp(when_tpe),
+        "strategy": "BbandSmaShortV3",
+        "version_before": "BbandSmaShortV3",
+        "version_after": "BbandSmaShortV3",
+        "change_summary": (
+            "EVO_RELATIVE_GATE record only; no strategy change; "
+            f"passed={flag} at={at}"),
+        "initiated_by": "ai",
+    }
+
+
+def test_relative_gate_fail_marker_is_not_a_pass(tmp_path, repo):
+    """A FAIL Saturday writes only an EVO_RELATIVE_GATE row (#188).
+
+    That row is not a promotion. Reporting it as a changelog PASS is
+    the bug Reed reproduced: slot_outcome returned the base class.
+    """
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    write_json(repo / "data" / "changelog.json", [
+        _relative_gate_marker(DUE + timedelta(minutes=15), passed=False),
+    ])
+    findings, lines = run(tmp_path, repo)
+    assert not any(ln.startswith("PASS") for ln in lines), lines
+    assert any("candidate designed (watermark advanced; knob mode or "
+               "codegen stopped early): TMF00_0422 at 05:05 TPE" in ln
+               for ln in lines), lines
+    assert not any("stopped at plan phase" in m for m in messages(findings)), \
+        messages(findings)
+    assert not any("BbandSmaShortV3" in ln and "PASS" in ln for ln in lines), \
+        lines
+
+
+def test_relative_gate_marker_alone_does_not_suppress_plan_phase_p3(tmp_path, repo):
+    """No watermark advance and no real promotion: the marker must not
+    hide the plan-phase P3 the way a counted PASS would."""
+    make_bot(tmp_path, watermark=PREV_SLOT, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    padded = _relative_gate_marker(DUE + timedelta(minutes=25), passed=False)
+    padded["change_summary"] = "  " + padded["change_summary"]
+    write_json(repo / "data" / "changelog.json", [
+        _relative_gate_marker(DUE + timedelta(minutes=15), passed=False),
+        _relative_gate_marker(DUE + timedelta(minutes=20), passed=True),
+        padded,
+    ])
+    findings, lines = run(tmp_path, repo)
+    assert not any(ln.startswith("PASS") for ln in lines), lines
+    assert any("stopped at plan phase" in m
+               for m in messages(findings, "P3")), messages(findings, "P3")
+
+
+def test_pool_uri_requests_read_only_mode(tmp_path, repo, monkeypatch):
+    """``?mode=ro`` has to be on the connect URI.
+
+    ``test_pool_db_is_opened_read_only`` only compares file bytes. A
+    SELECT-only read-write open does not rewrite the file, so dropping
+    the mode would still pass that test.
+    """
+    import scripts.monitor.check_evolution as ce
+
+    make_bot(tmp_path, watermark=KNOB_MARK, pid=4242)
+    write_usage(repo, KNOB_USAGE)
+    write_pool(repo, [("XEvo1", "validated", "2026-08-28T21:29:25+00:00")])
+    seen = []
+    real_connect = ce.sqlite3.connect
+
+    def capture(database, *args, **kwargs):
+        seen.append((database, kwargs.get("uri", False)))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(ce.sqlite3, "connect", capture)
+    _findings, lines = run(tmp_path, repo)
+    assert seen, "pool database was not opened"
+    database, uri_flag = seen[0]
+    assert uri_flag is True
+    assert "mode=ro" in str(database)
+    assert any("PASS: XEvo1 pool-validated at 05:29 TPE" in ln
+               for ln in lines), lines
+
+
+@pytest.mark.parametrize("delta,inside", [
+    (timedelta(minutes=-30), False),
+    (timedelta(0), True),
+    (timedelta(hours=3), True),
+    (timedelta(hours=4), False),
+])
+def test_pool_slot_window_bounds(repo, delta, inside):
+    """Inclusive [due, due+3h].
+
+    due-30min is outside, so a lower bound moved 1h earlier fails.
+    due+4h is outside, so a 24h window fails. The two edges stay inside.
+    """
+    when = DUE + delta
+    utc = when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    write_pool(repo, [("BoundEvo1", "validated", utc)])
+    _advanced, passes, via_changelog = slot_outcome(DUE, [], str(repo))
+    hit = any(name == "BoundEvo1" for name, _ts in passes)
+    assert hit is inside
+    assert via_changelog is False
+
+
+@pytest.mark.parametrize("delta,inside", [
+    (timedelta(minutes=-30), False),
+    (timedelta(0), True),
+    (timedelta(hours=3), True),
+    (timedelta(hours=4), False),
+])
+def test_watermark_slot_window_bounds(tmp_path, delta, inside):
+    """The watermark advance uses the same [due, due+3h] window."""
+    when = DUE + delta
+    mark = {"trade_count": 172, "at": when.strftime("%Y-%m-%d %H:%M:%S")}
+    rows = [(str(tmp_path / "live" / "TMF00_0422"), mark, None)]
+    advanced, passes, via_changelog = slot_outcome(DUE, rows, str(tmp_path))
+    hit = any(name == "TMF00_0422" for name, _ts in advanced)
+    assert hit is inside
+    assert passes == []
+    assert via_changelog is False
