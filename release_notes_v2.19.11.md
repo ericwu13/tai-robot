@@ -1,6 +1,6 @@
 # v2.19.11
 
-> 草稿 / DRAFT — 尚未打 tag 或發布 / not tagged or published. Base: master `6f69ff15` (v2.19.10 `115a0447` + #201 #216 #224 #162 #221 #222 #207). #208 尚未合併，不包含在內 / #208 is still open and not included.
+> 草稿 / DRAFT — 尚未打 tag 或發布 / not tagged or published. Base: master `2c1d1ae6` (v2.19.10 `115a0447` + #201 #216 #224 #162 #221 #222 #207 #227). #208 尚未合併，不包含在內 / #208 is still open and not included.
 
 ## EXE 變更 EXE changes
 
@@ -15,7 +15,7 @@
 ## 開發／維運 Developer / ops
 
 - **監控 Monitor — #201 `0bf9d180`、#162 `19cfeaba`**：#201 監控腳本改用 FILE_SHARE_DELETE 讀取 bot 檔案（新增 `src/utils/fileio.py`，僅供監控使用），不會再阻擋 bot 存檔或刪除；#162 `check_evolution` 能辨識週六 knob-mode 候選與 pool PASS（修正 #161）。 / #201: monitor scripts read live bot files with FILE_SHARE_DELETE (new `src/utils/fileio.py`, used only by the monitor), so they cannot block a bot's save or delete. #162: `check_evolution` recognises Saturday knob-mode candidates and pool PASSes (fixes #161).
-- **儀表板 Dashboard — #216 `a9f71c36`、#221**：#216 持有部位的 bot 在其健康分級中置頂，並顯示持倉標籤；#221 的儀表板端見上。 / #216: bots holding a position float to the top of their health tier with a holding pill; #221's dashboard side is described above.
+- **儀表板 Dashboard — #216 `a9f71c36`、#221、#227 `2c1d1ae6`**：#216 持有部位的 bot 在其健康分級中置頂，並顯示持倉標籤；#221 的儀表板端見上；#227 regime 翻轉計數暫停改標為「🔒 方向鎖定」（原「⏸ 暫停」易誤解為停止交易），詳細頁「多空切換」顯示還鎖定幾夜與「目前部位照常交易」，僅改頁面，API 與 `snapshot.py` 不變。 / #216: bots holding a position float to the top of their health tier with a holding pill; #221's dashboard side is described above; #227: the regime flip-counter pause is now labelled 🔒 方向鎖定 (direction lock) instead of ⏸ 暫停, which read as a trading halt; the detail tile 多空切換 shows nights left and that the current leg keeps trading. Page only; API and `snapshot.py` unchanged.
 - **測試／CI Tests — #224 `d58e4e63`**（僅測試 test-only）：regime 演化測試不再固定日期。 / regime evolution fixture no longer pinned to a fixed date.
 
 ## 操作影響 Operator impact
