@@ -48,7 +48,9 @@ REDEPLOY_RECIPE = (
     "strategy/mode/legs from session.json",
     "    5. deploy; the runner re-acquires .lock and resumes from session.json",
     "note: mode_override.json can only flip trading_mode on an ALREADY "
-    "RUNNING bot — it cannot start one.",
+    "RUNNING bot — it cannot start one. A headless bot ignores a file "
+    "that asks for auto, real, or any other live mode (paper still applies). "
+    "deploy --mode auto is unchanged.",
 )
 
 _NEWS_KEYS = (

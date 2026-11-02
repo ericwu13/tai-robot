@@ -43,7 +43,7 @@ from src.live.headless import (
     remove_headless_marker_if_ours, request_stop, resolve_strategy_name,
     stop_requested, write_headless_marker,
 )
-from src.live.live_runner import LiveRunner
+from src.live.live_runner import LiveRunner, arm_headless_file_guard
 from src.live.session_store import load_session
 
 
@@ -271,6 +271,12 @@ class DeployDriver(_Driver):
         try:
             ok = self.app._deploy_live_from(self.req)
             runner = getattr(self.app, "_live_runner", None)
+            if runner is not None:
+                # This process is the headless driver. Arm even when the
+                # deploy request was tagged gui — a file drop must not
+                # escalate it. deploy --mode auto already set trading_mode.
+                # Guarded setattr: a bare object() fake must not raise.
+                arm_headless_file_guard(runner)
             if not ok or runner is None:
                 why = "; ".join(f"{t}: {m.splitlines()[0]}" for t, m in self.app.alerts) \
                     or self.app.status_var.get()
@@ -283,8 +289,11 @@ class DeployDriver(_Driver):
         finally:
             # Once a runner exists, the poll is scheduled even if the
             # deploy log raised. A refused deploy sets exit_code and
-            # does not schedule another turn.
+            # does not schedule another turn. Arm again here so a runner
+            # created before that raise is still guarded.
             runner = getattr(self.app, "_live_runner", None)
+            if runner is not None:
+                arm_headless_file_guard(runner)
             if runner is not None and getattr(self, "exit_code", None) is None:
                 self.root.after(self.POLL_MS, self._poll)
 
