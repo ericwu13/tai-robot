@@ -44,6 +44,7 @@ from src.live.headless import (
     stop_requested, write_headless_marker,
 )
 from src.live.live_runner import LiveRunner, arm_headless_file_guard
+from src.live import mode_request as mreq
 from src.live.session_store import load_session
 
 
@@ -268,6 +269,8 @@ class DeployDriver(_Driver):
         # OSError inside quarantine_stale_control; it must not escape
         # after the bot is already trading.
         self._note_stale_control()
+        # A mode request left from a previous run must not apply to this one.
+        mreq.clear_stale_request(self.bot_dir)
         try:
             ok = self.app._deploy_live_from(self.req)
             runner = getattr(self.app, "_live_runner", None)
@@ -283,7 +286,9 @@ class DeployDriver(_Driver):
                 self.finish(EXIT_DEPLOY_REFUSED, f"deploy refused: {why}")
             else:
                 # acquire_lock has run. OSError is logged inside the helper.
-                write_headless_marker(self.bot_dir)
+                # mode_request lives on the marker. A separate
+                # capabilities.json is not written.
+                write_headless_marker(self.bot_dir, mode_request=True)
                 rb._log(f"[HEADLESS] deployed — polling STOP file {self.bot_dir}\\STOP, "
                         f"CONTROL, and Ctrl+C every 2s")
         finally:
@@ -350,6 +355,10 @@ class DeployDriver(_Driver):
         if app._live_runner is None:
             self.finish(EXIT_BOT_STOPPED, "bot stopped on its own — see the debug log")
             return
+        try:
+            app._service_mode_request(self.bot_dir)
+        except Exception as e:
+            rb._log(f"[HEADLESS] mode request failed: [{type(e).__name__}] {e}")
         try:
             self._poll_control()
         except Exception as e:

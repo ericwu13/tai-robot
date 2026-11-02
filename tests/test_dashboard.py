@@ -938,7 +938,14 @@ def control_server(tmp_path, monkeypatch):
     monkeypatch.setattr(snapshot, "pid_alive", _alive)
     monkeypatch.setattr(snapshot, "pid_alive_strict", _alive)
     monkeypatch.setattr(snapshot.bot_summary, "__kwdefaults__",
-                        {"pid_alive_fn": _alive})
+                        {"pid_alive_fn": _alive, "fresh": False})
+    # fleet() binds pid_alive_fn at definition. The page must use the
+    # same fake liveness as control.handle, or mode_request looks unsupported.
+    monkeypatch.setattr(snapshot.fleet, "__kwdefaults__",
+                        {"host": "", "pid_alive_fn": _alive})
+    # The lock pid is fake. Do not ask the OS when that pid was created:
+    # a live process that happens to own it would fail the marker check.
+    monkeypatch.setattr(snapshot, "process_create_time", lambda pid: None)
     # alpha and real are headless (live marker). gone is a stopped GUI bot.
     from src.live.headless import write_headless_marker
     for name in ("TMF00_alpha", "TMF00_real"):
@@ -987,7 +994,7 @@ def test_stop_writes_the_headless_stop_file(control_server):
     assert stop_requested(str(base / "TMF00_alpha"))          # what headless_app polls
     fleet = json.loads(_get(url + "/api/fleet")[2])
     alpha = next(b for b in fleet["bots"] if b["id"] == "TMF00_alpha")
-    assert alpha["pending"] == {"stop": True, "mode": None}
+    assert alpha["pending"] == {"stop": True, "mode": None, "request": None, "result": None}
     assert fleet["control_enabled"] is True
     rows = _log_rows(log)
     assert [(r["bot"], r["action"], r["result"]) for r in rows] == [("TMF00_alpha", "stop", "accepted")]
@@ -1036,6 +1043,7 @@ def test_nothing_can_switch_a_bot_up_to_real_orders(control_server, action):
             status, body = _post(url, {"id": bot, "action": action, "confirm": confirm})
             assert status == 409 and body["ok"] is False
             assert not (base / bot / "mode_override.json").exists()
+            assert not (base / bot / "mode_request.json").exists()
             assert not (base / bot / "STOP").exists()
 
 
@@ -1391,7 +1399,8 @@ def test_page_disables_controls_unless_the_marker_is_live():
     # leaves the hint up on a headless bot (or hides it on a GUI bot).
     assert '$("d-controls-hint").hidden = headless;' in html
     assert "!headless || !!p.stop" in html
-    assert "!headless || !!(p.stop || p.mode)" in html
+    assert ("!headless || !!(p.stop || p.mode || p.request || checkingNow(p.result))"
+            in html)
 
 
 def test_hung_bot_is_refused(control_server):

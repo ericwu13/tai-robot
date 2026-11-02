@@ -608,6 +608,11 @@ class LiveRunner:
 
         # Hot-swap mode switching (Feature 2)
         self._allow_live_override: bool = False
+        # Dashboard paper→auto. Off unless this bot's settings opt it in.
+        # A per-bot loss ceiling may only lower the confirmed cap.
+        self._dashboard_auto_opt_in: bool = False
+        from .mode_request import MAX_MODE_SWITCH_LOSS_LIMIT_NTD
+        self._mode_switch_loss_cap: int = MAX_MODE_SWITCH_LOSS_LIMIT_NTD
         # Set by arm_headless_file_guard on an unattended deploy. While
         # True, mode_override.json may only select paper — auto, real,
         # semi_auto, and any other value are refused. allow_live_override
