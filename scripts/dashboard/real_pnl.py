@@ -125,8 +125,11 @@ def classify(trade: dict, point_value: int) -> dict:
     out.update(status="real" if real_entry and real_exit else "estimated",
                real_pnl=real_pnl, slippage=real_pnl - _int(trade.get("pnl")))
     if out["status"] == "estimated":
-        out["reason"] = ("exit fill not recorded (the position may still be open); sim price used"
-                         if not real_exit else "entry fill not recorded; sim price used")
+        if not real_exit and trade.get("real_exit_estimated"):
+            out["reason"] = ("exit fill not captured; sim price kept (est.)")
+        else:
+            out["reason"] = ("exit fill not recorded (the position may still be open); sim price used"
+                             if not real_exit else "entry fill not recorded; sim price used")
     return out
 
 

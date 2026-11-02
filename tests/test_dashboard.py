@@ -8,6 +8,9 @@ liveness, and nothing sensitive leaves through the page.
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -561,6 +564,94 @@ def test_cdn_fallback_is_pinned_with_sri():
                 encoding="utf-8").read()
     assert 'integrity = "sha384-' in html and 'crossOrigin = "anonymous"' in html
     assert "lightweight-charts@4.1.3/" in html
+
+
+def _index_html() -> str:
+    return open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+
+
+def _sorted_ids_under_node(bots):
+    """Order ``bots`` with the page's own ``visibleBots()`` comparator.
+
+    The fleet sort lives in index.html and this repo has no JS test runner, so
+    the comparator is extracted from the shipped file and executed verbatim.
+    A source-text assertion alone would still pass with the key order
+    reverted, which is the failure that matters here.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node unavailable — cannot execute the page comparator")
+    html = _index_html()
+    order = re.search(r"const STATE_ORDER = (\[[^\]]*\]);", html)
+    held = re.search(r"const held = (\(b\) => [^;]+);", html)
+    cmp_ = re.search(r"\.sort\((\(a, b\) =>[\s\S]*?)\);", html)
+    assert order and held and cmp_, "could not extract the fleet comparator"
+    prog = (f"const STATE_ORDER = {order.group(1)};\n"
+            f"const held = {held.group(1)};\n"
+            f"const cmp = {cmp_.group(1)};\n"
+            "const bots = JSON.parse(process.argv[1]);\n"
+            "console.log(JSON.stringify(bots.sort(cmp).map((b) => b.id)));\n")
+    run = subprocess.run([node, "-e", prog, json.dumps(bots)],
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def test_running_bot_with_position_sorts_above_flat(tmp_path):
+    """A holder floats over a flat bot in the same health tier.
+
+    The flat bot is named so that the name tiebreaker would put it FIRST —
+    only the position key can move the holder above it.
+    """
+    live = tmp_path / "live"
+    make_bot(live, "TMF00_aflat")
+    make_bot(live, "TMF00_zheld", position={"position_size": 1,
+                                            "position_side": "LONG",
+                                            "entry_price": 45900})
+    bots = snapshot.fleet(NOW, str(live), pid_alive_fn=_alive)["bots"]
+    assert {b["state"] for b in bots} == {"RUNNING"}, "premise: same health tier"
+    assert [b["id"] for b in bots if b["position"]] == ["TMF00_zheld"]
+
+    assert _sorted_ids_under_node(bots) == ["TMF00_zheld", "TMF00_aflat"]
+
+
+def test_health_tier_still_outranks_an_open_position(tmp_path):
+    """Tier stays the OUTER key — position only reorders inside a tier.
+
+    The unhealthy bot is flat AND named last, so neither the position key nor
+    the name tiebreaker would lift it: only the tier can.
+    """
+    live = tmp_path / "live"
+    make_bot(live, "TMF00_aheld", position={"position_size": 1,
+                                            "position_side": "LONG",
+                                            "entry_price": 45900})
+    # live PID, no usable heartbeat -> NO_HEARTBEAT, a tier above RUNNING.
+    make_bot(live, "TMF00_zstale", lock_pid=ALIVE_PID, hb_age_s=None)
+    bots = snapshot.fleet(NOW, str(live), pid_alive_fn=_alive)["bots"]
+    states = {b["id"]: b["state"] for b in bots}
+    assert states == {"TMF00_aheld": "RUNNING", "TMF00_zstale": "NO_HEARTBEAT"}
+    assert [b["id"] for b in bots if b["position"]] == ["TMF00_aheld"]
+
+    assert _sorted_ids_under_node(bots) == ["TMF00_zstale", "TMF00_aheld"]
+
+
+def test_fleet_sort_keys_are_ordered_tier_then_position_then_name():
+    """CI without node still pins the key ORDER (not just the key's presence)."""
+    html = _index_html()
+    block = html[html.index("visibleBots()"):]
+    block = block[:block.index("},")]
+    tier = block.index("STATE_ORDER.indexOf")
+    pos = block.index("held(b) - held(a)")
+    name = block.index("localeCompare")
+    assert tier < pos < name, block
+
+
+def test_held_position_gets_a_fleet_row_marker():
+    """The 持倉 pill must be neutral — 紅/綠 are P&L, 藍/橙 are health."""
+    html = _index_html()
+    assert 'class: "held"' in html
+    assert re.search(r"\.held\s*\{[^}]*--off-bg", html), "held pill is not neutral"
 
 
 def test_detail_log_applies_monitor_redact(tmp_path):
