@@ -34,6 +34,7 @@ from scripts.monitor.common import (  # noqa: E402
     TZ_TPE, Finding, bot_name, default_base_dir, discover_bot_dirs,
     guard_stdout, last_activity, print_report, read_json,
 )
+from src.utils import fileio  # noqa: E402
 
 # NEWS_SUPPRESSED rows above this in 24h means the news gate is eating a
 # whole session's bars rather than gating a shock window.
@@ -251,7 +252,7 @@ def _check_history(now, bot_dir, name, lines, findings):
         lines.append("  history: no regime_history.csv")
         return
     try:
-        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        with fileio.open_shared_text(path, errors="replace", newline="") as f:
             rows = list(csv.reader(f))
     except OSError:
         lines.append("  history: unreadable")

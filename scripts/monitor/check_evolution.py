@@ -51,6 +51,7 @@ from scripts.monitor.common import (  # noqa: E402
     newest_debug_logs, pid_alive, print_report, read_json, read_lock_pid,
     to_tpe,
 )
+from src.utils import fileio  # noqa: E402
 
 # The AI pipeline runs from this Saturday slot (TPE); the fitness check
 # that rewrites evolution.json fires ~7 min earlier.
@@ -105,7 +106,7 @@ def read_usage(path: str):
         return None
     runs = {}
     try:
-        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        with fileio.open_shared_text(path, errors="replace", newline="") as f:
             for row in csv.reader(f):
                 if len(row) < 2:
                     continue
@@ -162,7 +163,7 @@ def find_start(bot_dir: str, due: datetime):
         if not _spans_due(path, due):
             continue
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
+            with fileio.open_shared_text(path, errors="replace") as f:
                 for line in f:
                     if START_MARKER not in line:
                         continue

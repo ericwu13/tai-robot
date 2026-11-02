@@ -184,6 +184,28 @@ class DiscordNotifier:
             f"{strat_str}"
         )
 
+    def exit_fill_unconfirmed(self, sim_price: str = "",
+                              strategy: str = "") -> None:
+        """The exit-fill retry ended without a broker price (issue #218).
+
+        Distinct from :meth:`fill_confirmed` with ``estimated=True``: that
+        one still reads as a fill confirmation. This one says the broker
+        price was never captured and the simulated price is what stands.
+        """
+        price_str = ""
+        if sim_price:
+            try:
+                price_str = f" @**{float(sim_price):,.1f}**"
+            except (TypeError, ValueError):
+                price_str = f" @{sim_price}"
+        strat_str = f"\n策略 Strategy: `{strategy}`" if strategy else ""
+        self._send(
+            f"{self._header()}\n"
+            f"⚠️ **出場成交價未確認 Exit Fill Unconfirmed**{price_str} (est.)\n"
+            f"券商成交價未取得，沿用模擬價。Broker fill was not captured; "
+            f"the simulated price is kept.{strat_str}"
+        )
+
     def fill_price_correction(self, action_type: str, real_price: int,
                               est_price: int, strategy: str = "") -> None:
         """Follow-up when the real fill price arrives after an (est.) notice."""

@@ -790,11 +790,15 @@ def test_poll_services_mode_request_and_survives_errors(tmp_path):
         calls.append(bot_dir)
         raise RuntimeError("boom")
 
+    reconnects = []
     app = SimpleNamespace(root=_Root(), _live_runner=object(),
-                          _service_mode_request=_service)
+                          _service_mode_request=_service,
+                          _manual_reconnect=lambda: reconnects.append(1))
+    (tmp_path / "CONTROL").write_text("reconnect\n", encoding="utf-8")
     driver = _driver(tmp_path, app)
     driver._poll()
     assert calls == [str(tmp_path)]
+    assert reconnects == [1], "a mode-request error skipped the CONTROL channel"
     assert driver.exit_code is None
     assert app.root.pending, "poll did not reschedule after a mode-request error"
 
