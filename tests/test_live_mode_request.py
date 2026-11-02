@@ -857,25 +857,18 @@ def test_result_written_atomically_leaves_no_temp(tmp_path):
 
 # ── opt-in, cap, expiry, one owner, P&L clear ──
 
-def test_allow_live_override_false_is_not_bypassed(harness):
-    """Restoring user_confirmed=True on the dashboard path makes this fail."""
+def test_allow_live_override_false_is_refused_before_any_broker_query(harness):
+    """The opt-in neighbour check refuses before GetOpenInterestGW."""
     h = harness
     h.runner._allow_live_override = False
-    seen = {}
-    real = h.runner._apply_mode_switch
-
-    def wrapped(new_mode, user_confirmed=False):
-        seen["user_confirmed"] = user_confirmed
-        return real(new_mode, user_confirmed=user_confirmed)
-
-    h.runner._apply_mode_switch = wrapped
+    h.runner._dashboard_auto_opt_in = True
     h.request()
     h.poll()
-    h.flat()
-    assert seen.get("user_confirmed") is False
+    res = h.result()
+    assert res["status"] == "refused" and "allow_live_override" in res["reason"]
+    assert h.com_calls == []
     assert h.runner.trading_mode == "paper"
-    assert "allow_live_override" in h.result()["reason"]
-    assert h.com_calls  # reached the account check, then the real gate
+    assert h.app._trading_mode == "paper"
 
 
 def test_auto_refused_when_the_bot_is_not_opted_in(harness):
@@ -888,6 +881,25 @@ def test_auto_refused_when_the_bot_is_not_opted_in(harness):
     assert res["status"] == "refused" and "設定" in res["reason"]
     assert h.com_calls == []
     assert h.runner.trading_mode == "paper"
+
+
+def test_loss_cap_constant_is_twenty_thousand():
+    assert mreq.MAX_MODE_SWITCH_LOSS_LIMIT_NTD == 20_000
+
+
+def test_literal_20001_is_refused_and_20000_is_accepted(harness):
+    """Literals, not constant+1, so a 10_000_000 cap mutant fails here."""
+    h = harness
+    h.request(loss_limit=20_001, request_id="over-literal")
+    h.poll()
+    assert h.result()["status"] == "refused", h.result()
+    assert h.com_calls == []
+    assert h.runner.trading_mode == "paper"
+    h.request(loss_limit=20_000, request_id="at-literal")
+    h.poll()
+    h.flat()
+    assert h.result()["status"] == "accepted", h.result()
+    assert h.app._trading_guard.daily_loss_limit == 20_000
 
 
 def test_loss_cap_accepts_the_cap_and_refuses_above_zero_and_missing(harness):
@@ -960,6 +972,17 @@ def test_request_future_skew(harness, skew, accepted):
         return
     h.flat()
     assert h.result()["status"] == "accepted", h.result()
+
+
+def test_naive_requested_at_is_refused(harness):
+    """The dashboard always writes a timezone. A bare local timestamp is not one."""
+    h = harness
+    h.request(requested_at="2026-11-02T10:00:00", request_id="naive")
+    h.poll()
+    res = h.result()
+    assert res["status"] == "refused" and "時區" in res["reason"]
+    assert h.com_calls == []
+    assert h.runner.trading_mode == "paper"
 
 
 def test_missing_requested_at_is_refused(harness):

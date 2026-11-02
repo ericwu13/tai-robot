@@ -193,7 +193,8 @@ def expiry_reason(requested_at: str, now: datetime) -> str | None:
 
     ``age > 60`` s is refused (exactly 60 s is still accepted). A timestamp
     more than 5 s in the future is refused (exactly 5 s is accepted).
-    A naive timestamp is read in ``now``'s timezone.
+    The dashboard writes timezone-aware ISO timestamps. A naive one is
+    refused rather than read in the bot's local zone.
     """
     if not isinstance(requested_at, str) or not requested_at.strip():
         return "請求缺少時間 requested_at"
@@ -202,7 +203,7 @@ def expiry_reason(requested_at: str, now: datetime) -> str | None:
     except ValueError:
         return "請求時間 requested_at 無法解析"
     if at.tzinfo is None:
-        at = at.replace(tzinfo=now.tzinfo)
+        return "請求時間 requested_at 缺少時區"
     age = (now - at).total_seconds()
     if age > REQUEST_MAX_AGE_S:
         return "請求已超過 60 秒，已拒絕"
