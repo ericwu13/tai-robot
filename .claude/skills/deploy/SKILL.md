@@ -50,7 +50,7 @@ EXE, the same directory the GUI uses.
 Deploy flags: `--strategy "<name or unique substring>"`, `--mode paper|auto`
 (default paper), `--loss-limit NTD`, `--regime --long-strategy … --short-strategy …`,
 `--news [--news-tier2] [--news-directional]`, `--new` / `--resume`,
-`--allow-existing-position`, `--point-value N`.
+`--allow-existing-position`, `--allow-unknown-position`, `--point-value N`.
 
 ## Gates — check ALL before the deploy command
 
@@ -76,7 +76,12 @@ Deploy flags: `--strategy "<name or unique substring>"`, `--mode paper|auto`
    `--strategy` and let the saved one load.
 5. **`--allow-existing-position` only on explicit instruction.** It means
    the real account already holds a position the bot did not open; the
-   bot will never send exits for it.
+   bot will never send exits for it. It does **not** allow a deploy when
+   the position query failed or timed out (UNKNOWN).
+6. **`--allow-unknown-position` only on explicit instruction.** It deploys
+   when the pre-deploy OpenInterest query was rejected, raised, or did not
+   answer in time. Do not pass it just because `--allow-existing-position`
+   was used.
 
 ## Procedure
 

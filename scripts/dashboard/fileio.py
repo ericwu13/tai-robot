@@ -110,3 +110,15 @@ def tail_lines(path: str, n: int, max_bytes: int = 256_000) -> list[str]:
     if truncated and lines:
         lines = lines[1:]
     return lines[-n:] if n else []
+
+
+def head_line(path: str, max_bytes: int = 4096) -> str | None:
+    """First line (a CSV header). None when unreadable or empty."""
+    try:
+        with open_shared(path) as f:
+            raw = f.read(max_bytes)
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return raw.decode("utf-8-sig", errors="replace").splitlines()[0]
