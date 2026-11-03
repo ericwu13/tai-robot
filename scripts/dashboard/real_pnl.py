@@ -142,9 +142,16 @@ def summarize(trades: list[dict], point_value: int, day_start: datetime) -> dict
     counted = [(t, c) for t, c in rows if c["status"] in COUNTED]
     today = [(t, c) for t, c in counted
              if (dt := _parse(t.get("exit_dt"))) is not None and dt >= day_start]
+    # Today's figure is also published real-ONLY. "estimated" substitutes the
+    # simulated price for the side that was never recorded, which is fine in a
+    # running total but misreads as "what the account made today" on a day
+    # whose handful of trades are mostly estimates.
+    today_real = [(t, c) for t, c in today if c["status"] == "real"]
     return {
         "pnl_total": sum(c["real_pnl"] for _, c in counted),
         "pnl_today": sum(c["real_pnl"] for _, c in today),
+        "pnl_today_real": sum(c["real_pnl"] for _, c in today_real),
+        "trades_today_real": len(today_real),
         "sim_pnl_same_trades": sum(_int(t.get("pnl")) for t, _ in counted),
         "slippage_total": sum(c["slippage"] for _, c in counted),
         "trades": len(counted),
