@@ -20,6 +20,7 @@ import faulthandler
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -40,6 +41,12 @@ DEFAULT_INFLIGHT_HUNG_S = 60.0
 DEFAULT_POLL_S = 2.0
 # Repeat the P1 while the main thread stays hung. Alert only.
 DEFAULT_REALERT_S = 600.0
+# How many archived hang episodes to keep. Current hang.json /
+# hang_stacks.txt are never counted and never deleted here.
+HANG_ARCHIVE_KEEP = 10
+_HANG_JSON_ARCHIVE = re.compile(r"^hang_(\d{8}-\d{6})(?:_(\d+))?\.json$")
+_HANG_STACKS_ARCHIVE = re.compile(
+    r"^hang_stacks_(\d{8}-\d{6})(?:_(\d+))?\.txt$")
 HEARTBEAT_INTERVAL_MS = 5000
 
 # Park an idle watchdog for this long so a finished test does not spin.
@@ -679,20 +686,70 @@ _watchdog: HangWatchdog | None = None
 _guard = threading.Lock()
 
 
-def _rotate_hang_artifacts(bot_dir: str) -> None:
-    """Move hang.json and hang_stacks.txt aside. Best-effort.
+def _archive_stamp(path: str) -> str:
+    """``YYYYmmdd-HHMMSS`` from the file's own mtime."""
+    return time.strftime(
+        "%Y%m%d-%H%M%S", time.localtime(os.path.getmtime(path)))
 
-    A clean stop leaves them in place so the episode can be read. The next
-    deploy must not keep reporting that old episode.
+
+def _unique_archive_name(directory: str, prefix: str, stamp: str, ext: str) -> str:
+    """A name that does not already exist. A collision gets ``_2``, ``_3``, ..."""
+    candidate = f"{prefix}{stamp}{ext}"
+    if not os.path.exists(os.path.join(directory, candidate)):
+        return candidate
+    n = 2
+    while True:
+        candidate = f"{prefix}{stamp}_{n}{ext}"
+        if not os.path.exists(os.path.join(directory, candidate)):
+            return candidate
+        n += 1
+
+
+def _archive_one(directory: str, name: str, prefix: str, ext: str) -> None:
+    src = os.path.join(directory, name)
+    if not os.path.isfile(src):
+        return
+    try:
+        dest = os.path.join(
+            directory, _unique_archive_name(directory, prefix, _archive_stamp(src), ext))
+        os.replace(src, dest)
+    except OSError:
+        logger.exception("hang file archive failed for %s", name)
+
+
+def _prune_hang_archives(bot_dir: str, keep: int = HANG_ARCHIVE_KEEP) -> None:
+    """Drop the oldest archived episodes past ``keep``. Never the live files."""
+    try:
+        names = os.listdir(bot_dir)
+    except OSError:
+        logger.exception("hang archive list failed")
+        return
+    for pattern in (_HANG_JSON_ARCHIVE, _HANG_STACKS_ARCHIVE):
+        matched = [name for name in names if pattern.match(name)]
+
+        def _key(name: str, pattern=pattern):
+            match = pattern.match(name)
+            suffix = int(match.group(2) or 0)
+            return (match.group(1), suffix)
+
+        matched.sort(key=_key)
+        stale = matched[:-keep] if keep > 0 else matched
+        for name in stale:
+            try:
+                os.remove(os.path.join(bot_dir, name))
+            except OSError:
+                logger.exception("hang archive prune failed for %s", name)
+
+
+def _archive_hang_artifacts(bot_dir: str) -> None:
+    """Rename the previous episode to hang_<mtime>. Keep the newest 10.
+
+    A failed rename is logged and the file stays where it is. This does
+    not delete hang.json or hang_stacks.txt except by a successful rename.
     """
-    for name in (HANG_FILENAME, STACKS_FILENAME):
-        path = os.path.join(bot_dir, name)
-        if not os.path.isfile(path):
-            continue
-        try:
-            os.replace(path, path + ".prev")
-        except OSError:
-            logger.exception("hang file rotate failed for %s", name)
+    _archive_one(bot_dir, HANG_FILENAME, "hang_", ".json")
+    _archive_one(bot_dir, STACKS_FILENAME, "hang_stacks_", ".txt")
+    _prune_hang_archives(bot_dir)
 
 
 def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
@@ -711,7 +768,7 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
     later tick can retry.
     """
     global _writer, _watchdog
-    _rotate_hang_artifacts(bot_dir)
+    _archive_hang_artifacts(bot_dir)
     writer = HeartbeatWriter(bot_dir)
     try:
         writer.write()

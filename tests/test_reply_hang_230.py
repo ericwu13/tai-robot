@@ -8,6 +8,8 @@ are the Python sink methods.
 from __future__ import annotations
 
 import ast
+import logging
+import os
 import queue
 import time
 from pathlib import Path
@@ -202,3 +204,85 @@ def test_hung_alert_repeats_while_still_hung(tmp_path):
         assert all("manual restart: Mira" in item for item in alerts[:2])
     finally:
         watchdog.disable()
+
+
+def _plant_hang(directory: Path, stamp: str, hang: str, stacks: str) -> None:
+    when = time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S"))
+    for name, text in (("hang.json", hang), ("hang_stacks.txt", stacks)):
+        path = directory / name
+        path.write_text(text, encoding="utf-8")
+        os.utime(path, (when, when))
+
+
+def _stop_watchdog() -> None:
+    hb.stop()
+    if hb._watchdog is not None:
+        hb._watchdog.disable()
+
+
+def test_two_restarts_keep_both_hang_archives(tmp_path):
+    _plant_hang(tmp_path, "20261103-120000", "ep1", "stacks1")
+    try:
+        hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
+        _plant_hang(tmp_path, "20261103-120002", "ep2", "stacks2")
+        hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
+        assert not (tmp_path / "hang.json").exists()
+        assert not (tmp_path / "hang_stacks.txt").exists()
+        first = tmp_path / "hang_20261103-120000.json"
+        second = tmp_path / "hang_20261103-120002.json"
+        assert first.read_text(encoding="utf-8") == "ep1"
+        assert second.read_text(encoding="utf-8") == "ep2"
+        assert (tmp_path / "hang_stacks_20261103-120000.txt").read_text(
+            encoding="utf-8") == "stacks1"
+        assert (tmp_path / "hang_stacks_20261103-120002.txt").read_text(
+            encoding="utf-8") == "stacks2"
+    finally:
+        _stop_watchdog()
+
+
+def test_hang_archives_prune_the_oldest_past_ten(tmp_path):
+    for i in range(1, 11):
+        (tmp_path / f"hang_20261101-{i:06d}.json").write_text(
+            f"old{i}", encoding="utf-8")
+    _plant_hang(tmp_path, "20261101-000011", "newest", "stacks")
+    try:
+        hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
+        names = sorted(path.name for path in tmp_path.glob("hang_*.json"))
+        assert "hang_20261101-000001.json" not in names
+        assert "hang_20261101-000011.json" in names
+        assert len(names) == hb.HANG_ARCHIVE_KEEP
+        assert (tmp_path / "hang_20261101-000011.json").read_text(
+            encoding="utf-8") == "newest"
+        assert (tmp_path / "hang.json").exists() is False
+        assert (tmp_path / "hang_stacks.txt").exists() is False
+    finally:
+        _stop_watchdog()
+
+
+def test_hang_archive_rename_failure_leaves_the_file(tmp_path, monkeypatch, caplog):
+    (tmp_path / "hang.json").write_text("keep-me", encoding="utf-8")
+    (tmp_path / "hang_stacks.txt").write_text("keep-stacks", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(hb.os, "replace", boom)
+    try:
+        with caplog.at_level(logging.ERROR, logger="src.live.main_heartbeat"):
+            hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
+        assert (tmp_path / "hang.json").read_text(encoding="utf-8") == "keep-me"
+        assert (tmp_path / "hang_stacks.txt").read_text(encoding="utf-8") == "keep-stacks"
+        assert any("archive failed" in rec.message for rec in caplog.records)
+    finally:
+        _stop_watchdog()
+
+
+def test_start_with_no_hang_file_does_not_create_an_archive(tmp_path):
+    try:
+        hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
+        assert list(tmp_path.glob("hang_*.json")) == []
+        assert list(tmp_path.glob("hang_stacks_*.txt")) == []
+        assert not (tmp_path / "hang.json").exists()
+        assert not (tmp_path / "hang_stacks.txt").exists()
+    finally:
+        _stop_watchdog()

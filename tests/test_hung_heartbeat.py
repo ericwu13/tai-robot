@@ -472,10 +472,15 @@ def test_start_rotates_hang_artifacts(tmp_path):
     (tmp_path / "hang_stacks.txt").write_text("old-stacks", encoding="utf-8")
     try:
         hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
-        assert (tmp_path / "hang.json.prev").read_text(encoding="utf-8") == "old-hang"
-        assert (tmp_path / "hang_stacks.txt.prev").read_text(encoding="utf-8") == "old-stacks"
         assert not (tmp_path / "hang.json").exists()
         assert not (tmp_path / "hang_stacks.txt").exists()
+        assert not (tmp_path / "hang.json.prev").exists()
+        archived = list(tmp_path.glob("hang_*.json"))
+        stacks = list(tmp_path.glob("hang_stacks_*.txt"))
+        assert len(archived) == 1
+        assert archived[0].read_text(encoding="utf-8") == "old-hang"
+        assert len(stacks) == 1
+        assert stacks[0].read_text(encoding="utf-8") == "old-stacks"
     finally:
         hb.stop()
         if hb._watchdog is not None:
