@@ -573,6 +573,11 @@ class LiveRunner:
 
         # Tracking
         self._bar_index = 0  # running bar index for broker
+        # Issue #235: trades whose close was already logged. Keyed on a
+        # stable trade identity so _check_for_trade_close cannot emit a
+        # second TRADE_CLOSE for the same close (force-close, tick exit,
+        # or a repeated call on the same bar).
+        self._logged_trade_closes: set[tuple] = set()
         self._seen_1m_dts: set[datetime] = set()  # for dedup
         self._1m_bars: deque[Bar] = deque(maxlen=5000)  # raw 1-min bars
         self._aggregated_bars: list[Bar] = []  # all completed aggregated bars
@@ -1410,8 +1415,10 @@ class LiveRunner:
                 # match the NEXT bar and fire a duplicate TRADE_CLOSE.
                 self.broker._close_position(
                     order.tag, fill_price, self._bar_index - 1)
-                # Log and save
+                # Log and save. Claim the trade first so a later bar's
+                # _check_for_trade_close cannot log this close again.
                 last_trade = self.broker.trades[-1]
+                self._claim_trade_close_log(last_trade)
                 # Create a minimal bar for logging (use TWT time)
                 log_bar = Bar(symbol=self.symbol,
                               dt=datetime.now(_TZ_TAIPEI).replace(tzinfo=None),
@@ -1628,18 +1635,60 @@ class LiveRunner:
 
         self._emit("on_bar", bar)
 
+    def _trade_close_identity(self, trade: Trade) -> tuple:
+        """Stable identity of one closed trade (not object id).
+
+        Two logs of the same close — a force-close plus the next bar, a
+        tick exit plus ``_check_for_trade_close``, or a repeated call —
+        share this key (issue #235).
+        """
+        side = trade.side.value if trade.side is not None else ""
+        return (
+            trade.entry_bar_index,
+            trade.exit_bar_index,
+            trade.entry_dt,
+            trade.exit_dt,
+            side,
+            trade.entry_price,
+            trade.exit_price,
+            trade.qty,
+            trade.tag,
+        )
+
+    def _claim_trade_close_log(self, trade: Trade) -> bool:
+        """Return True the first time this trade's close is logged.
+
+        A later claim for the same identity returns False. Callers that
+        already emitted the close (FORCE_CLOSE, tick TRADE_CLOSE) claim
+        so ``_check_for_trade_close`` will not emit another row.
+        """
+        key = self._trade_close_identity(trade)
+        if key in self._logged_trade_closes:
+            return False
+        self._logged_trade_closes.add(key)
+        return True
+
     def _check_for_trade_close(self, bar: Bar, idx: int) -> None:
-        """Check if a trade was just closed by check_exits."""
-        if self.broker.trades and self.broker.trades[-1].exit_bar_index == idx:
-            trade = self.broker.trades[-1]
-            exit_type = self.broker.last_exit_type or "close"
-            exit_limit = self.broker.last_exit_limit
-            self._log_decision(
-                bar, "TRADE_CLOSE", trade.side.value, trade.exit_tag,
-                trade.exit_price, f"PnL={trade.pnl:+}",
-                exit_type=exit_type, exit_limit=exit_limit,
-            )
-            self._auto_save_session()
+        """Check if a trade was just closed by check_exits.
+
+        Idempotent per trade identity: the same close is logged once
+        (issue #235). A force-close or tick exit that already claimed
+        the trade, or a second call on the same bar, does not emit
+        another TRADE_CLOSE.
+        """
+        if not self.broker.trades or self.broker.trades[-1].exit_bar_index != idx:
+            return
+        trade = self.broker.trades[-1]
+        if not self._claim_trade_close_log(trade):
+            return
+        exit_type = self.broker.last_exit_type or "close"
+        exit_limit = self.broker.last_exit_limit
+        self._log_decision(
+            bar, "TRADE_CLOSE", trade.side.value, trade.exit_tag,
+            trade.exit_price, f"PnL={trade.pnl:+}",
+            exit_type=exit_type, exit_limit=exit_limit,
+        )
+        self._auto_save_session()
 
     def _entry_fill_price(self, bar: Bar) -> tuple[int, str]:
         """Next-open entry fill price + source label, matching backtest.
@@ -1856,6 +1905,20 @@ class LiveRunner:
             return bars
         return aggregate_bars(list(self._1m_bars), interval)
 
+    def force_close_bar_index(self) -> int:
+        """Bar index a force-close must book.
+
+        ``_process_aggregated_bar`` increments ``_bar_index`` before the
+        strategy runs, so when a session-end close or an emergency
+        flatten fires, ``_bar_index`` is the index the next bar will
+        get. Booking the close there makes ``_check_for_trade_close``
+        match that next bar and log a second TRADE_CLOSE (issue #235).
+        The tick-exit path already passes ``_bar_index - 1``. Floor at
+        the entry bar so the exit is never stamped before the trade
+        opened.
+        """
+        return max(self._bar_index - 1, self.broker.entry_bar_index)
+
     def force_close_position(self, tag: str, reason: str) -> int:
         """Force-close any open position and emit a FORCE_CLOSE decision.
 
@@ -1888,7 +1951,13 @@ class LiveRunner:
         # NB: _log_decision runs AFTER force_close has closed the
         # position, so position_side is already None here — read the
         # just-appended trade's side (trades[-1]) for the log row.
-        self.broker.force_close(self._bar_index, exit_price, last_close_dt)
+        # Issue #235: book the last processed bar, not _bar_index (the
+        # next bar), and claim the trade so the next bar cannot log a
+        # second TRADE_CLOSE for this close.
+        self.broker.force_close(
+            self.force_close_bar_index(), exit_price, last_close_dt)
+        if self.broker.trades:
+            self._claim_trade_close_log(self.broker.trades[-1])
         self._log_decision(
             last_bar, "FORCE_CLOSE",
             self.broker.trades[-1].side.value if self.broker.trades else "",
