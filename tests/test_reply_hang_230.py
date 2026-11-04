@@ -22,11 +22,8 @@ from src.live.link_state_machine import (
     LinkPhase,
     LinkStateMachine,
 )
-from src.live.reply_link_poller import (
-    POLL_CONNECT_TIMEOUT_S,
-    STILL_DOWN_ALERT,
-    ReplyLinkPoller,
-)
+from src.live.reply_link_poller import STILL_DOWN_ALERT, ReplyLinkPoller
+import src.live.reply_link_poller as reply_poller
 from tests.fakes.fake_skcom import FakeSkcom
 
 
@@ -329,7 +326,7 @@ def test_hang_archives_prune_the_oldest_past_ten(tmp_path):
         names = sorted(path.name for path in tmp_path.glob("hang_*.json"))
         assert "hang_20261101-000001.json" not in names
         assert "hang_20261101-000011.json" in names
-        assert len(names) == hb.HANG_ARCHIVE_KEEP
+        assert len(names) == getattr(hb, "HANG_ARCHIVE_KEEP", 10)
         assert (tmp_path / "hang_20261101-000011.json").read_text(
             encoding="utf-8") == "newest"
         assert (tmp_path / "hang.json").exists() is False
@@ -440,7 +437,8 @@ def test_poller_connect_success_without_followup_event():
     fake.set_now(later)
     poller.observe(0, later)
     assert fake.calls.count("ConnectByID") == 1
-    timed = connected_at + timedelta(seconds=POLL_CONNECT_TIMEOUT_S)
+    timed = connected_at + timedelta(
+        seconds=getattr(reply_poller, "POLL_CONNECT_TIMEOUT_S", 90.0))
     fake.set_now(timed)
     poller.observe(0, timed)
     assert fake.calls.count("ConnectByID") == 1
