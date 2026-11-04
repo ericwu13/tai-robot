@@ -4157,9 +4157,16 @@ class BacktestApp:
             "IsConnectedByID", skR.SKReplyLib_IsConnectedByID, user_id)
 
     def _connect_reply_for_poll(self, user_id: str):
-        """One ConnectByID from the poller. Logs the return code. No logout."""
-        code = call_com(
-            "ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+        """One ConnectByID from the poller, through the machine port.
+
+        The poller has already been permitted by the link machine. The
+        SKCOM call lives on that port. Logs the return code. No logout.
+        """
+        machine = self._reply_machine()
+        port = getattr(machine, "port", None) if machine is not None else None
+        if port is None:
+            return None
+        code = port.connect_reply(user_id)
         _log_connect_by_id_result(code)
         return code
 

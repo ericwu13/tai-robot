@@ -152,23 +152,19 @@ def test_poll_reconnects_pauses_and_alerts_without_reply_events():
     assert "reconcile_positions" not in port.calls
     assert "release_orders" not in port.calls
 
-    # Still inside the 5s step: a second reading must not connect.
-    poller.observe(0, down_at + timedelta(seconds=4))
+    # Still inside the settle: a second reading must not connect.
+    poller.observe(0, down_at + timedelta(seconds=5))
     assert _connects(port) == 0
 
-    # One ConnectByID per backoff step: 5, then 10, then 30, then 60, then 60.
-    steps = [5, 10, 30, 60, 60]
-    cursor = down_at
-    for expected in range(1, len(steps) + 1):
-        cursor = cursor + timedelta(seconds=steps[expected - 1])
-        before = _connects(port)
-        poller.observe(0, cursor)
-        assert _connects(port) == before + 1
-        poller.observe(0, cursor)
-        assert _connects(port) == before + 1, "one ConnectByID per backoff step"
-    assert poller.pending_delay_s(cursor) == 60
-    # The 105s step is past 60s of the drop. One alert, and only one,
-    # even though later steps keep polling.
+    # Three clean 0s spanning the 10s settle: exactly one ConnectByID.
+    # Later readings in the same episode do not send another.
+    poller.observe(0, down_at + timedelta(seconds=15))
+    assert _connects(port) == 1
+    cursor = down_at + timedelta(seconds=40)
+    poller.observe(0, cursor)
+    assert _connects(port) == 1, "one ConnectByID per down episode"
+    # Past 60s of the drop. One silent alert, and only one.
+    poller.observe(0, down_at + timedelta(seconds=60))
     assert alerts == [SILENT_ALERT]
     assert "REPLY CHANNEL SILENT" in alerts[0]
     assert poller.consider_silent(cursor, force=True) is False
@@ -235,16 +231,18 @@ def test_quote_stuck_recovery_does_not_connect_or_lift_reply_pause():
     machine.tick(down_at + timedelta(seconds=1))
     assert machine.orders_paused is True
     assert _connects(port) == 0
+    # Inside the settle, and before three clean 0s: no ConnectByID.
     poller.observe(0, down_at + timedelta(seconds=5))
+    assert _connects(port) == 0
+    poller.observe(0, down_at + timedelta(seconds=15))
     assert _connects(port) == 1
-    machine.tick(down_at + timedelta(seconds=6))
+    machine.tick(down_at + timedelta(seconds=16))
     assert _connects(port) == 1
     assert machine.orders_paused is True
     assert "logout" not in port.calls
-    # 3003 is not a second connect by itself; the poll on that event
-    # still obeys the backoff (this reading is inside the 10s step).
-    machine.on_connection(KIND_READY, 0, down_at + timedelta(seconds=6))
-    poller.observe(0, down_at + timedelta(seconds=6))
+    # 3003 is not a second connect. The in-flight call is not repeated.
+    machine.on_connection(KIND_READY, 0, down_at + timedelta(seconds=16))
+    poller.observe(0, down_at + timedelta(seconds=16))
     assert _connects(port) == 1
 
 
@@ -392,8 +390,12 @@ def test_empty_user_id_skips_connect():
 
 
 def test_connect_attempt_ceiling_stops_and_alerts_once():
+    """Login's ConnectByID is still in flight. Polls of 0 do not send another.
+
+    After the 90s timeout the poller degrades, alerts once, and stops.
+    """
     alerts: list[str] = []
-    port, _machine, _host, poller = _build(alerts)
+    port, machine, _host, poller = _build(alerts)
     port.reply_state = 0
     poller.observe(0, T0)
     due = poller._next_connect_at
@@ -402,11 +404,12 @@ def test_connect_attempt_ceiling_stops_and_alerts_once():
             break
         poller.observe(0, due)
         due = poller._next_connect_at
-    assert _connects(port) == REPLY_CONNECT_ATTEMPT_CAP
+    assert _connects(port) == 0
+    assert machine.degraded is True
     assert alerts.count(STILL_DOWN_ALERT) == 1
     assert STILL_DOWN_ALERT != SILENT_ALERT
     poller.observe(0, T0 + timedelta(hours=3))
-    assert _connects(port) == REPLY_CONNECT_ATTEMPT_CAP
+    assert _connects(port) == 0
 
 
 def test_non_binary_poll_does_not_pause_or_connect():

@@ -16,6 +16,17 @@ from pathlib import Path
 
 import run_backtest as rb
 import src.live.main_heartbeat as hb
+from src.live.link_state_machine import (
+    LinkMachineConfig,
+    LinkPhase,
+    LinkStateMachine,
+)
+from src.live.reply_link_poller import (
+    POLL_CONNECT_TIMEOUT_S,
+    STILL_DOWN_ALERT,
+    ReplyLinkPoller,
+)
+from tests.fakes.fake_skcom import FakeSkcom
 
 
 def _drain() -> list:
@@ -286,3 +297,160 @@ def test_start_with_no_hang_file_does_not_create_an_archive(tmp_path):
         assert not (tmp_path / "hang_stacks.txt").exists()
     finally:
         _stop_watchdog()
+
+
+_T0 = __import__("datetime").datetime(2026, 11, 3, 15, 31, 6)
+
+
+def _poll_world(alerts: list[str]):
+    fake = FakeSkcom(reply_settle_s=10)
+    machine = LinkStateMachine(
+        fake, LinkMachineConfig(user_id="U", reply_settle_s=10, stuck_limit_s=300))
+    machine.adopt_after_process_login(_T0)
+    machine.quote = LinkPhase.READY
+    poller = ReplyLinkPoller(
+        lambda: machine,
+        read=lambda: 0,
+        connect=lambda user: fake.connect_reply(user),
+        notify=alerts.append,
+        log_error=lambda _msg: None,
+        log_info=lambda _msg: None,
+        reschedule_silent=lambda: None,
+    )
+    poller.note_login(_T0)
+    return fake, machine, poller
+
+
+def test_poller_connect_success_without_followup_event():
+    """One ConnectByID, then no follow-up event: return, reschedule, no second call."""
+    from datetime import timedelta
+
+    alerts: list[str] = []
+    scheduled: list[int] = []
+
+    class _Root:
+        def after(self, ms, fn, *args):
+            scheduled.append(int(ms))
+            return "tok"
+
+        def after_cancel(self, token):
+            return None
+
+    # The poll returns. The next poll is on the after chain.
+    lone = ReplyLinkPoller(
+        lambda: None,
+        read=lambda: 0,
+        connect=lambda _user: None,
+        notify=alerts.append,
+        log_error=lambda _msg: None,
+        log_info=lambda _msg: None,
+        reschedule_silent=lambda: None,
+    )
+    lone.note_login(_T0)
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._reply_poller = lone
+    app._reply_backoff_token = None
+    app.root = _Root()
+    app._link_host = None
+    app._trading_guard = None
+    app._poll_reply_link("60s")
+    assert scheduled, "next poll was not scheduled"
+
+    fake, machine, poller = _poll_world(alerts)
+    fake.set_now(_T0)
+    poller.observe(1, _T0)
+    down = _T0 + timedelta(seconds=1)
+    fake.set_now(down)
+    poller.observe(0, down)
+    poller.observe(0, down + timedelta(seconds=5))
+    assert fake.calls.count("ConnectByID") == 0
+    connected_at = down + timedelta(seconds=15)
+    fake.set_now(connected_at)
+    poller.observe(0, connected_at)
+    assert fake.calls.count("ConnectByID") == 1
+    later = connected_at + timedelta(seconds=30)
+    fake.set_now(later)
+    poller.observe(0, later)
+    assert fake.calls.count("ConnectByID") == 1
+    timed = connected_at + timedelta(seconds=POLL_CONNECT_TIMEOUT_S)
+    fake.set_now(timed)
+    poller.observe(0, timed)
+    assert fake.calls.count("ConnectByID") == 1
+    assert machine.degraded is True
+    assert STILL_DOWN_ALERT in alerts
+    assert "SimulatedAV" not in " ".join(alerts)
+
+
+def test_poller_connect_refused_while_rebuild_inflight():
+    alerts: list[str] = []
+    fake, machine, poller = _poll_world(alerts)
+    assert machine._reply_awaiting_complete is True
+    fake.set_now(_T0)
+    poller.observe(0, _T0)
+    poller.observe(0, _T0 + __import__("datetime").timedelta(seconds=15))
+    poller.observe(0, _T0 + __import__("datetime").timedelta(seconds=45))
+    assert fake.calls.count("ConnectByID") == 0
+
+
+def test_poller_connect_waits_settle_after_poll0():
+    alerts: list[str] = []
+    fake, _machine, poller = _poll_world(alerts)
+    poller.observe(1, _T0)
+    down = _T0 + __import__("datetime").timedelta(seconds=2)
+    fake.set_now(down)
+    poller.observe(0, down)
+    poller.observe(0, down + __import__("datetime").timedelta(seconds=5))
+    assert fake.calls.count("ConnectByID") == 0
+
+
+def test_recent_two_blocks_poller_connect():
+    alerts: list[str] = []
+    fake, _machine, poller = _poll_world(alerts)
+    poller.observe(1, _T0)
+    down = _T0 + __import__("datetime").timedelta(minutes=1)
+    poller.observe(0, down)
+    poller.observe(2, down + __import__("datetime").timedelta(seconds=3))
+    poller.observe(0, down + __import__("datetime").timedelta(seconds=5))
+    assert fake.calls.count("ConnectByID") == 0
+
+
+def test_too_few_or_too_short_zero_run_blocks_connect():
+    alerts: list[str] = []
+    fake, _machine, poller = _poll_world(alerts)
+    poller.observe(1, _T0)
+    down = _T0 + __import__("datetime").timedelta(minutes=1)
+    # Two 0s spanning the settle are still too few.
+    poller.observe(0, down)
+    poller.observe(0, down + __import__("datetime").timedelta(seconds=15))
+    assert fake.calls.count("ConnectByID") == 0
+    # Three 0s inside the settle are too short a span.
+    fresh = down + __import__("datetime").timedelta(minutes=5)
+    poller.observe(1, fresh)
+    poller.observe(0, fresh)
+    poller.observe(0, fresh + __import__("datetime").timedelta(seconds=4))
+    poller.observe(0, fresh + __import__("datetime").timedelta(seconds=6))
+    assert fake.calls.count("ConnectByID") == 0
+
+
+def test_connect_by_id_call_sites_are_login_and_the_machine_port():
+    """SKReplyLib_ConnectByID is only the login call and the machine port."""
+    app_lines = []
+    for lineno, line in enumerate(
+            Path("run_backtest.py").read_text(encoding="utf-8").splitlines(), 1):
+        if "SKReplyLib_ConnectByID" in line and not line.strip().startswith("#"):
+            app_lines.append((lineno, line.strip()))
+    assert len(app_lines) == 1
+    src_hits = []
+    for path in Path("src").rglob("*.py"):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "SKReplyLib_ConnectByID" not in line:
+                continue
+            if line.strip().startswith("#"):
+                continue
+            src_hits.append((path.as_posix(), lineno, line.strip()))
+    port_hits = [hit for hit in src_hits if hit[0].endswith("com_broker_port.py")]
+    assert len(port_hits) == 1
+    other = [hit for hit in src_hits if not hit[0].endswith("com_broker_port.py")]
+    assert other == [] or all(
+        hit[0].endswith("broker_port.py") for hit in other
+    )
