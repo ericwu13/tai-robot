@@ -1215,149 +1215,220 @@ def _route_to_log_widget(line: str, level: str = "info") -> None:
         pass
 
 
+def _safe_event_put(item) -> None:
+    """Queue one COM event. A full queue must not raise into the sink."""
+    try:
+        _ui_queue.put_nowait(item)
+    except Exception as exc:
+        _log_reply_error(
+            f"[CONN] event queue failed: [{type(exc).__name__}] {exc}")
+
+
+def _log_event_failure(method: str, exc: BaseException) -> None:
+    _log_reply_error(
+        f"[CONN] {method} handler failed: [{type(exc).__name__}] {exc}")
+
+
 # ── COM Event handlers ──
+# Every sink method takes the vendor arguments plus ``*_extra``. An
+# arity drift must not raise inside the COM callback (issue #230).
+# The flag is queued before any log line. No broker calls here.
 
 class SKQuoteLibEvents:
-    def OnNotifyStockList(self, sMarketNo, bstrStockData):
-        _ui_queue.put_nowait(("stock_list", (sMarketNo, bstrStockData)))
+    def OnNotifyStockList(self, sMarketNo, bstrStockData, *_extra):
+        _safe_event_put(("stock_list", (sMarketNo, bstrStockData)))
 
-    def OnConnection(self, nKind, nCode):
-        kind_names = {3001: "Reply", 3002: "Quote", 3003: "Ready",
-                      3021: "ConnError", 3033: "Abnormal"}
-        kind_label = kind_names.get(nKind, str(nKind))
-        # Only queue.put_nowait() is safe from COM background threads.
-        # root.after() is NOT safe — it calls into Tcl/Tk C code which
-        # is not thread-safe and corrupts the GIL in Python 3.13.
-        _ui_queue.put_nowait(("log", f"報價連線 QUOTE CONN: {kind_label} code={nCode}"))
-        # Structured DEBUG line per OnConnection event — meaning of each kind
-        # is documented inline so a future debugger can read it cold.
-        meaning = {
-            3001: "Reply — order/reply channel up (intermediate, NOT fully connected)",
-            3002: "Quote — quote channel up (intermediate, waiting for Ready 3003)",
-            3003: "Ready — fully connected, marking quote_connected=True",
-            3021: "ConnError — connection error, triggering disconnect",
-            3033: "Abnormal — abnormal disconnect, triggering disconnect",
-        }.get(nKind, f"unknown kind={nKind}")
-        _ui_queue.put_nowait(("log_debug", f"[CONN] kind={nKind} {kind_label} code={nCode} — {meaning}"))
-        # Flag only. The main-thread drain calls the link machine. No SKCOM here.
-        _ui_queue.put_nowait(("link", ("connection", int(nKind), int(nCode))))
-        if nKind == 3003 and nCode == 0:
-            _ui_queue.put_nowait(("conn", "ready"))
-        elif nKind == 3002 and nCode == 0:
-            _ui_queue.put_nowait(("conn", "quote"))
-        elif nKind in (3021, 3033):
-            _ui_queue.put_nowait(("conn", "disconnected"))
+    def OnConnection(self, nKind, nCode, *_extra):
+        try:
+            kind = int(nKind)
+            code = int(nCode)
+        except (TypeError, ValueError):
+            kind, code = nKind, nCode
+        # Flag first. The main-thread drain calls the link machine.
+        _safe_event_put(("link", ("connection", kind, code)))
+        try:
+            kind_names = {3001: "Reply", 3002: "Quote", 3003: "Ready",
+                          3021: "ConnError", 3033: "Abnormal"}
+            kind_label = kind_names.get(kind, str(kind))
+            # Only queue.put_nowait() is safe from COM background threads.
+            # root.after() is NOT safe — it calls into Tcl/Tk C code which
+            # is not thread-safe and corrupts the GIL in Python 3.13.
+            _safe_event_put(("log", f"報價連線 QUOTE CONN: {kind_label} code={code}"))
+            meaning = {
+                3001: "Reply — order/reply channel up (intermediate, NOT fully connected)",
+                3002: "Quote — quote channel up (intermediate, waiting for Ready 3003)",
+                3003: "Ready — fully connected, marking quote_connected=True",
+                3021: "ConnError — connection error, triggering disconnect",
+                3033: "Abnormal — abnormal disconnect, triggering disconnect",
+            }.get(kind, f"unknown kind={kind}")
+            _safe_event_put((
+                "log_debug",
+                f"[CONN] kind={kind} {kind_label} code={code} — {meaning}"))
+            if kind == 3003 and code == 0:
+                _safe_event_put(("conn", "ready"))
+            elif kind == 3002 and code == 0:
+                _safe_event_put(("conn", "quote"))
+            elif kind in (3021, 3033):
+                _safe_event_put(("conn", "disconnected"))
+        except Exception as exc:
+            _log_event_failure("OnConnection", exc)
 
-    def OnNotifyKLineData(self, bstrStockNo, bstrData):
-        if not _app:
-            return
-        # Route data based on current mode
-        if _app._live_warmup_mode:
-            _app._live_warmup_data.append(bstrData)
-        elif _app._live_polling:
-            _app._live_poll_data.append(bstrData)
-        else:
-            _app._fetcher.on_kline_data(bstrData)
-            n = _app._fetcher.total_bar_count
-            if n <= 3:
-                _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
+    def OnNotifyKLineData(self, bstrStockNo, bstrData, *_extra):
+        try:
+            if not _app:
+                return
+            if _app._live_warmup_mode:
+                _app._live_warmup_data.append(bstrData)
+            elif _app._live_polling:
+                _app._live_poll_data.append(bstrData)
+            else:
+                _app._fetcher.on_kline_data(bstrData)
+                n = _app._fetcher.total_bar_count
+                if n <= 3:
+                    _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
+        except Exception as exc:
+            _log_event_failure("OnNotifyKLineData", exc)
 
-    def OnKLineComplete(self, nCode):
-        if not _app:
-            return
-        if _app._live_warmup_mode:
-            _log(f"暖機完成 Warmup KLine complete: {len(_app._live_warmup_data)} bars, code={nCode}")
-            _app.root.after(100, _app._on_live_warmup_complete)
-        elif _app._live_polling:
-            _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
-            _app.root.after(100, _app._on_live_poll_complete)
-        else:
-            chunk_n = _app._fetcher.chunk_bar_count
-            total_n = _app._fetcher.total_bar_count
-            _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
-            _app.root.after(100, _app._on_chunk_complete)
+    def OnKLineComplete(self, nCode, *_extra):
+        try:
+            if not _app:
+                return
+            if _app._live_warmup_mode:
+                _log(f"暖機完成 Warmup KLine complete: {len(_app._live_warmup_data)} bars, code={nCode}")
+                _app.root.after(100, _app._on_live_warmup_complete)
+            elif _app._live_polling:
+                _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
+                _app.root.after(100, _app._on_live_poll_complete)
+            else:
+                chunk_n = _app._fetcher.chunk_bar_count
+                total_n = _app._fetcher.total_bar_count
+                _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
+                _app.root.after(100, _app._on_chunk_complete)
+        except Exception as exc:
+            _log_event_failure("OnKLineComplete", exc)
 
-    def OnNotifyQuoteLONG(self, sMarketNo, nStockIdx):
-        pass
+    def OnNotifyQuoteLONG(self, sMarketNo, nStockIdx, *_extra):
+        return None
 
     def OnNotifyHistoryTicksLONG(self, sMarketNo, nStockIdx, nPtr,
                                 lDate, lTimehms, lTimemillismicros,
-                                nBid, nAsk, nClose, nQty, nSimulate):
+                                nBid, nAsk, nClose, nQty, nSimulate, *_extra):
         # Minimal work on COM thread — just enqueue raw data.
         # Accessing Python objects (like _app) from COM thread crashes GIL in 3.13.
-        _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                nBid, nAsk, nClose, nQty, nSimulate, True))
+        try:
+            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
+                                    nBid, nAsk, nClose, nQty, nSimulate, True))
+        except Exception as exc:
+            _log_event_failure("OnNotifyHistoryTicksLONG", exc)
 
     def OnNotifyTicksLONG(self, sMarketNo, nStockIdx, nPtr,
                           lDate, lTimehms, lTimemillismicros,
-                          nBid, nAsk, nClose, nQty, nSimulate):
-        _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                nBid, nAsk, nClose, nQty, nSimulate, False))
+                          nBid, nAsk, nClose, nQty, nSimulate, *_extra):
+        try:
+            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
+                                    nBid, nAsk, nClose, nQty, nSimulate, False))
+        except Exception as exc:
+            _log_event_failure("OnNotifyTicksLONG", exc)
 
     def OnNotifyBest5LONG(self, *args):
-        pass
+        return None
 
-    def OnNotifyServerTime(self, sHour, sMinute, sSecond, nTotal):
-        pass
+    def OnNotifyServerTime(self, sHour, sMinute, sSecond, nTotal, *_extra):
+        return None
 
 
 class SKReplyLibEvent:
-    def OnReplyMessage(self, bstrUserID, bstrMessage):
-        _ui_queue.put_nowait(("log", f"回報 REPLY: {bstrMessage}"))
+    def OnReplyMessage(self, bstrUserID, bstrMessage, *_extra):
+        _safe_event_put(("log", f"回報 REPLY: {bstrMessage}"))
         return -1
 
-    def OnConnect(self, bstrUserID, nErrorCode):
-        _ui_queue.put_nowait(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
+    def OnConnect(self, bstrUserID, nErrorCode, *_extra):
         # Queue only. after_cancel runs on the main thread when this drains.
-        _ui_queue.put_nowait(("reply_seen", "OnConnect"))
-        mark_reply_arrived("OnConnect")
+        _safe_event_put(("reply_seen", "OnConnect"))
+        try:
+            _safe_event_put(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
+            mark_reply_arrived("OnConnect")
+        except Exception as exc:
+            _log_event_failure("OnConnect", exc)
 
-    def OnComplete(self, bstrUserID):
+    def OnComplete(self, bstrUserID, *_extra):
         del bstrUserID
-        _ui_queue.put_nowait((
-            "log_debug", "[CONN] OnComplete — reply backfill finished"))
-        _ui_queue.put_nowait(("link", ("complete",)))
-        _ui_queue.put_nowait(("reply_seen", "OnComplete"))
-        mark_reply_arrived("OnComplete")
+        _safe_event_put(("link", ("complete",)))
+        _safe_event_put(("reply_seen", "OnComplete"))
+        try:
+            _safe_event_put((
+                "log_debug", "[CONN] OnComplete — reply backfill finished"))
+            mark_reply_arrived("OnComplete")
+        except Exception as exc:
+            _log_event_failure("OnComplete", exc)
 
-    def OnSolaceReplyDisconnect(self, bstrUserID):
-        """§4-3-h. Flag only — do not ConnectByID from this callback."""
+    def OnSolaceReplyDisconnect(self, bstrUserID, nErrorCode=None, *_extra):
+        """§4-3-h. Flag only. 3002 = clean, 3033 = session down.
+
+        The link flag is queued before the code is logged. Do not
+        reconnect from this callback.
+        """
         del bstrUserID
-        _ui_queue.put_nowait(("log", "回報斷線 REPLY DISCONNECT"))
-        _ui_queue.put_nowait(("log_debug", "[CONN] OnSolaceReplyDisconnect"))
-        _ui_queue.put_nowait(("link", ("reply_disconnect",)))
+        _safe_event_put(("link", ("reply_disconnect",)))
+        try:
+            _safe_event_put((
+                "log", f"回報斷線 REPLY DISCONNECT code={nErrorCode}"))
+            _safe_event_put((
+                "log_debug",
+                f"[CONN] OnSolaceReplyDisconnect code={nErrorCode}"))
+        except Exception as exc:
+            _log_event_failure("OnSolaceReplyDisconnect", exc)
 
-    def OnNewData(self, bstrUserID, bstrData):
+    def OnSolaceReplyConnection(self, bstrUserID, nErrorCode=None, *_extra):
+        """Log-only. The reply sink saw the Solace session come up."""
+        del bstrUserID
+        _safe_event_put(("reply_seen", "OnSolaceReplyConnection"))
+        try:
+            _safe_event_put((
+                "log_debug",
+                f"[CONN] OnSolaceReplyConnection code={nErrorCode}"))
+            mark_reply_arrived("OnSolaceReplyConnection")
+        except Exception as exc:
+            _log_event_failure("OnSolaceReplyConnection", exc)
+
+    def OnNewData(self, bstrUserID, bstrData, *_extra):
         # Real-time per-order report — the only per-fill price source in
         # the Capital API (issue #92). Enqueued like every other COM event.
         # OnNewData is a reply event for the silent-sink watchdog.
-        _ui_queue.put_nowait(("new_data", bstrData))
-        _ui_queue.put_nowait(("reply_seen", "OnNewData"))
-        mark_reply_arrived("OnNewData")
+        _safe_event_put(("new_data", bstrData))
+        _safe_event_put(("reply_seen", "OnNewData"))
+        try:
+            mark_reply_arrived("OnNewData")
+        except Exception as exc:
+            _log_event_failure("OnNewData", exc)
 
 
 class SKOrderLibEvents:
-    def OnAccount(self, bstrLogInID, bstrAccountData):
-        _ui_queue.put_nowait(("account", bstrAccountData))
+    def OnAccount(self, bstrLogInID, bstrAccountData, *_extra):
+        _safe_event_put(("account", bstrAccountData))
 
-    def OnAsyncOrder(self, nThreadID, nCode, bstrMessage):
-        _ui_queue.put_nowait(("order_result", (nCode, bstrMessage)))
+    def OnAsyncOrder(self, nThreadID, nCode, bstrMessage, *_extra):
+        _safe_event_put(("order_result", (nCode, bstrMessage)))
 
-    def OnOpenInterest(self, bstrData):
+    def OnOpenInterest(self, bstrData, *_extra):
         # Tag the row with the query that is in flight NOW. A reply that
         # was already queued under an older generation must not complete
         # a later GetOpenInterestGW (issue #202). The API has no request
         # id; enqueue time is the correlation we have.
-        payload: str | tuple = bstrData
-        app = _app
-        monitor = getattr(app, "_account_monitor", None) if app is not None else None
-        generation = getattr(monitor, "oi_query_generation", None) if monitor is not None else None
-        if isinstance(generation, int) and not isinstance(generation, bool):
-            payload = (bstrData, generation)
-        _ui_queue.put_nowait(("open_interest", payload))
+        try:
+            payload: str | tuple = bstrData
+            app = _app
+            monitor = getattr(app, "_account_monitor", None) if app is not None else None
+            generation = getattr(monitor, "oi_query_generation", None) if monitor is not None else None
+            if isinstance(generation, int) and not isinstance(generation, bool):
+                payload = (bstrData, generation)
+        except Exception as exc:
+            _log_event_failure("OnOpenInterest", exc)
+            payload = bstrData
+        _safe_event_put(("open_interest", payload))
 
-    def OnFutureRights(self, bstrData):
-        _ui_queue.put_nowait(("future_rights", bstrData))
+    def OnFutureRights(self, bstrData, *_extra):
+        _safe_event_put(("future_rights", bstrData))
 
 
 _parse_open_interest = parse_open_interest  # re-export from account_monitor
