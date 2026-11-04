@@ -4177,19 +4177,34 @@ class BacktestApp:
                 pass
 
     def _poll_reply_link(self, cause: str) -> None:
-        """Read IsConnectedByID and apply it. Never raises into the caller."""
+        """Read IsConnectedByID and apply it. Never raises into the caller.
+
+        The entry gate and the backoff timer run in ``finally``, so a
+        raising read cannot leave entries un-gated or the poll unscheduled.
+        """
         try:
             poller = getattr(self, "_reply_poller", None)
             if poller is None:
                 return
             _log_debug(f"[CONN] reply poll ({cause})")
             poller.poll(_taipei_now())
-            self._apply_link_gate()
-            self._schedule_reply_backoff()
         except Exception as exc:
             _log_reply_error(
                 "[CONN] reply poll failed: "
                 f"[{type(exc).__name__}] {exc}")
+        finally:
+            try:
+                self._apply_link_gate()
+            except Exception as exc:
+                _log_reply_error(
+                    "[CONN] reply gate failed: "
+                    f"[{type(exc).__name__}] {exc}")
+            try:
+                self._schedule_reply_backoff()
+            except Exception as exc:
+                _log_reply_error(
+                    "[CONN] reply backoff schedule failed: "
+                    f"[{type(exc).__name__}] {exc}")
 
     def _schedule_reply_backoff(self) -> None:
         poller = getattr(self, "_reply_poller", None)

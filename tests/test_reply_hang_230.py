@@ -80,3 +80,35 @@ def test_reply_handlers_accept_com_arity():
         for item in queued
     )
     assert ("reply_seen", "OnNewData") in queued
+
+
+def test_poll_reply_link_reschedules_when_poll_raises():
+    """A raising poll still re-arms the entry gate and the backoff timer."""
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    gated = []
+    scheduled = []
+
+    class _Poller:
+        stopped = False
+
+        def poll(self, now):
+            raise RuntimeError("poll blew")
+
+        def pending_delay_s(self, now):
+            return 5.0
+
+    class _Root:
+        def after(self, ms, fn, *args):
+            scheduled.append(ms)
+            return "tok"
+
+        def after_cancel(self, token):
+            return None
+
+    app._reply_poller = _Poller()
+    app._reply_backoff_token = None
+    app.root = _Root()
+    app._apply_link_gate = lambda: gated.append("gate")
+    app._poll_reply_link("backoff")
+    assert gated == ["gate"]
+    assert scheduled == [5000]
