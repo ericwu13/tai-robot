@@ -8,6 +8,7 @@ are the Python sink methods.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import queue
@@ -497,6 +498,49 @@ def test_too_few_or_too_short_zero_run_blocks_connect():
     poller.observe(0, fresh + __import__("datetime").timedelta(seconds=4))
     poller.observe(0, fresh + __import__("datetime").timedelta(seconds=6))
     assert fake.calls.count("ConnectByID") == 0
+
+
+def test_poller_connect_by_id_stamps_inflight_around_the_call(tmp_path):
+    """ConnectByID is the inflight name while the call runs, and null after."""
+    writer = hb.HeartbeatWriter(str(tmp_path))
+    hb._writer = writer
+    seen = {}
+
+    def connect(user):
+        payload = json.loads((tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+        seen["during"] = (payload.get("inflight_com_call") or {}).get("name")
+        seen["user"] = user
+        return 0
+
+    try:
+        assert hb.call_com("ConnectByID", connect, "U") == 0
+    finally:
+        hb._writer = None
+    after = json.loads((tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+    assert seen == {"during": "ConnectByID", "user": "U"}
+    assert after["inflight_com_call"] is None
+
+
+def test_stamp_write_failure_is_logged_every_time(tmp_path, monkeypatch):
+    logged = []
+    hb.reset_replace_failure_log()
+    hb.set_replace_failure_logger(logged.append)
+    writer = hb.HeartbeatWriter(str(tmp_path))
+    hb._writer = writer
+
+    def deny(src, dst):
+        raise PermissionError("busy")
+
+    monkeypatch.setattr(hb.os, "replace", deny)
+    try:
+        hb.call_com("ConnectByID", lambda: 0)
+        hb.call_com("ConnectByID", lambda: 0)
+    finally:
+        hb._writer = None
+        hb.set_replace_failure_logger(None)
+        hb.reset_replace_failure_log()
+    assert len(logged) >= 4
+    assert all("ConnectByID" in line or "os.replace" in line for line in logged)
 
 
 def test_connect_by_id_call_sites_are_login_and_the_machine_port():

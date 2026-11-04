@@ -197,6 +197,20 @@ def replace_retrying_permission_error(tmp: str, path: str, *, sleep_fn=None) -> 
         lambda: os.replace(tmp, path), sleep_fn=sleep_fn)
 
 
+# call_com increments this around a stamped broker call. A stamp-write
+# failure is logged on every attempt. Ordinary heartbeat ticks stay
+# on the 10-minute limit.
+_stamp_calls = 0
+
+
+def _log_stamp_failure(message: str) -> None:
+    """Every stamp-write failure. Not rate-limited."""
+    try:
+        _replace_failure_log(message)
+    except Exception:
+        logger.exception("stamp failure log raised")
+
+
 def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
     """Move ``tmp`` onto ``path``. Retry PermissionError only."""
     try:
@@ -204,11 +218,15 @@ def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
     except PermissionError as exc:
         # Callers (tick / call_com) must not log this again.
         exc.hb_logged = True  # type: ignore[attr-defined]
-        note_heartbeat_failure(
+        message = (
             "heartbeat os.replace failed for "
             f"{os.path.basename(path) or path}: "
-            f"[{type(exc).__name__}] {exc}",
-            monotonic=monotonic)
+            f"[{type(exc).__name__}] {exc}"
+        )
+        if _stamp_calls:
+            _log_stamp_failure(message)
+        else:
+            note_heartbeat_failure(message, monotonic=monotonic)
         raise
 
 
@@ -423,15 +441,14 @@ def read_heartbeat(path: str, *, sleep=None) -> dict | None:
 
 
 def _report_stamp_failure(exc: BaseException, message: str) -> None:
-    """Rate-limited stamp log. Skip when the writer already logged it.
+    """Log a stamp-write failure every time. Skip when already logged.
 
-    ``logger.exception`` on every COM call would miss the bot log (the
-    main_heartbeat logger is not attached there) and would ignore the
-    10-minute limit. The installed sink is ``_log`` while a bot is up.
+    A PermissionError during the stamp was logged above, with no rate
+    limit. Any other failure is logged here, also with no rate limit.
     """
     if getattr(exc, "hb_logged", False):
         return
-    note_heartbeat_failure(message)
+    _log_stamp_failure(message)
 
 
 def _inflight_age(hb: dict, now: float) -> tuple[dict | None, float | None]:
@@ -858,6 +875,9 @@ def _emit_com_return(name: str, elapsed_ms: float, *, failed: bool) -> None:
 def call_com(name: str, fn, *args, **kwargs):
     """Run a broker/COM call, stamping inflight_com_call around it.
 
+    The stamp is written before ``fn`` and cleared after it returns.
+    A failed stamp write is logged on every attempt.
+
     The stamp is written only on the main thread, and only when a writer
     is installed. Otherwise ``fn`` runs unchanged — login before deploy,
     and any background caller, keep their existing behavior. The heartbeat
@@ -870,6 +890,15 @@ def call_com(name: str, fn, *args, **kwargs):
     After ``fn`` returns or raises, the duration is logged. That log is
     also best-effort and does not add a COM call or change control flow.
     """
+    global _stamp_calls
+    _stamp_calls += 1
+    try:
+        return _call_com_body(name, fn, args, kwargs)
+    finally:
+        _stamp_calls -= 1
+
+
+def _call_com_body(name, fn, args, kwargs):
     writer = _writer
     on_main = threading.current_thread() is threading.main_thread()
     stamp = writer is not None and on_main
