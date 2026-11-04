@@ -50,11 +50,42 @@ def clear_reply_arrived() -> None:
     _take_arrived()
 
 
+# Names already used by the link machine, plus the success code.
+# ConnectByID logging must not call SKCOM to translate a return value.
+# 2003 is SK_WARNING_LOGIN_ALREADY. 9996 is SK_ERROR_UPDATE_API_REQUIRED.
+SK_RETURN_CODE_NAMES = {
+    0: "SK_SUCCESS",
+    2003: "SK_WARNING_LOGIN_ALREADY",
+    9996: "SK_ERROR_UPDATE_API_REQUIRED",
+}
+
+
+def format_return_code(code, lookup=None) -> str:
+    """Static name first. Unknown codes use ``lookup`` or the raw number.
+
+    A code in ``SK_RETURN_CODE_NAMES`` never calls ``lookup``. Pass
+    ``lookup=None`` to forbid a SKCOM call, which is what ConnectByID
+    logging does.
+    """
+    try:
+        number = int(code)
+    except (TypeError, ValueError):
+        return str(code)
+    name = SK_RETURN_CODE_NAMES.get(number)
+    if name is not None:
+        return f"{number} {name}"
+    if lookup is None:
+        return str(number)
+    return describe_return_code(number, lookup)
+
+
 def describe_return_code(code, lookup) -> str:
     """SKCOM message when ``lookup`` works, otherwise the raw code.
 
     ``lookup`` is ``SKCenterLib_GetReturnCodeMessage`` or None. A missing
     lookup, an empty message, or a raised error all fall back to ``code``.
+    Known codes should go through :func:`format_return_code` first so
+    this lookup is not used for them.
     """
     if not callable(lookup):
         return str(code)

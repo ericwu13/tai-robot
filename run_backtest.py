@@ -135,7 +135,7 @@ from src.live.reply_link_poller import (
     REPLY_POLL_S, ReplyLinkPoller, format_event_sink,
 )
 from src.live.reply_watch import (
-    ReplyChannelWatch, describe_return_code, mark_reply_arrived,
+    ReplyChannelWatch, format_return_code, mark_reply_arrived,
 )
 from src.live.quote_stuck_recovery import QuoteStuckRecovery
 from src.live.fill_poller import FillPoller
@@ -1160,20 +1160,34 @@ def _notify_reply_silent(message: str) -> None:
             f"[CONN] discord alert failed: [{type(exc).__name__}] {exc}")
 
 
+def _stamped_return_lookup(code):
+    """Vendor text for an unknown code. Stamped, and only when asked.
+
+    Known codes never reach this. The attribute is resolved here so the
+    call site is ``call_com``, not a raw main-thread COM call.
+    """
+    center = skC
+    if center is None:
+        return None
+    fn = getattr(center, "SKCenterLib_GetReturnCodeMessage", None)
+    if not callable(fn):
+        return None
+    return call_com("GetReturnCodeMessage", fn, code)
+
+
+def _return_code_text(code) -> str:
+    """Static table first. Unknown codes may ask SKCOM through call_com."""
+    return format_return_code(code, _stamped_return_lookup)
+
+
 def _log_connect_by_id_result(code) -> None:
     """Log the ConnectByID return code. Never raises into login.
 
-    Uses SKCenterLib_GetReturnCodeMessage when that lookup exists and
-    succeeds. Otherwise the raw code is logged on its own.
+    Static table only. 0 is SK_SUCCESS. Anything else unnamed is the
+    raw code. This does not call SKCOM.
     """
     try:
-        lookup = None
-        center = skC
-        if center is not None:
-            candidate = getattr(center, "SKCenterLib_GetReturnCodeMessage", None)
-            if callable(candidate):
-                lookup = candidate
-        text = describe_return_code(code, lookup)
+        text = format_return_code(code)
         _log(f"[CONN] ConnectByID returned {text}")
     except Exception:
         try:
@@ -1650,7 +1664,7 @@ class BacktestApp:
                         if self._live_runner:
                             self._live_log_msg(f"實單成功 Order OK: {msg}", "entry")
                     else:
-                        err = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                        err = _return_code_text(code)
                         _log(f"委託失敗 Order FAILED: code={code} {err} {msg}")
                         self.set_status(f"委託失敗 Order FAILED: {err}", "error")
                         if self._live_runner:
@@ -2297,7 +2311,7 @@ class BacktestApp:
                 f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
                 f"subscription sent (retry={_retry})")
             if code != 0 and code >= 3000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
                 _log_debug(
                     f"[TICKS] RequestTicks FAILED: code={code} msg={msg}")
@@ -4277,7 +4291,7 @@ class BacktestApp:
             code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
                             user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
                 if code == 1097:
                     _log("提示: 請確認已安裝群益API憑證 (從券商網站下載安裝)")
@@ -4411,7 +4425,7 @@ class BacktestApp:
                 chunk.minute_num)
 
             if code != 0:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 _log(f"請求結果 Result: code={code} {msg}")
                 if code >= 3000:
                     self.set_status(f"錯誤 Error: {msg}", "error")
@@ -9217,7 +9231,7 @@ class BacktestApp:
                 "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 _log(f"暖機查詢失敗 Warmup fetch failed: code={code} {msg}")
                 self._live_log_msg(
                     f"暖機查詢失敗 Warmup failed: code={code} {msg}", "status")
@@ -9382,7 +9396,7 @@ class BacktestApp:
             else:
                 code = result
             if code != 0 and code >= 3000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 self._live_log_msg(f"訂閱失敗 Tick subscribe failed: {msg}", "status")
                 self._stop_live()
                 return
@@ -10925,7 +10939,7 @@ class BacktestApp:
                 )
                 return True
             else:
-                err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                err_msg = _return_code_text(code)
                 self._live_log_msg(f"實單失敗 Order FAILED: code={code} {err_msg} | {message}", "exit")
                 _log(f"REAL ORDER FAILED: code={code} err={err_msg} msg={message}")
                 if _discord and _discord.enabled:

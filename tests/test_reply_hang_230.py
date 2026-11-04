@@ -7,7 +7,10 @@ are the Python sink methods.
 
 from __future__ import annotations
 
+import ast
 import queue
+import time
+from pathlib import Path
 
 import run_backtest as rb
 
@@ -112,3 +115,44 @@ def test_poll_reply_link_reschedules_when_poll_raises():
     app._poll_reply_link("backoff")
     assert gated == ["gate"]
     assert scheduled == [5000]
+
+
+def test_connect_by_id_log_never_calls_return_lookup(monkeypatch):
+    """A lookup that would sleep or raise is not used for ConnectByID."""
+    called = []
+    slept = []
+
+    def lookup(code):
+        called.append(code)
+        time.sleep(30)
+        raise RuntimeError("lookup")
+
+    class _Center:
+        def SKCenterLib_GetReturnCodeMessage(self, code):
+            return lookup(code)
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(rb, "skC", _Center())
+    logged = []
+    monkeypatch.setattr(rb, "_log", logged.append)
+    rb._log_connect_by_id_result(0)
+    rb._log_connect_by_id_result(151)
+    assert called == []
+    assert slept == []
+    text = "\n".join(logged)
+    assert "0 SK_SUCCESS" in text
+    assert "returned 151" in text
+    assert "SK_SUCCESS" not in text.split("returned 151", 1)[-1]
+
+
+def test_no_unwrapped_get_return_code_message():
+    """No main-thread call of SKCenterLib_GetReturnCodeMessage remains."""
+    tree = ast.parse(Path("run_backtest.py").read_text(encoding="utf-8"))
+    naked = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "SKCenterLib_GetReturnCodeMessage"
+    ]
+    assert naked == []
