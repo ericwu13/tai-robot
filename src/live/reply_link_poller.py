@@ -238,10 +238,10 @@ class ReplyLinkPoller:
         """OnConnect, OnComplete, or OnNewData. This episode is not silent.
 
         OnComplete also ends a poller reconnect: the machine owns the
-        release. Further backoff connects are cancelled, and the
-        attempt counter is cleared even if the next poll still reads
-        0, so a later drop gets one fresh ConnectByID. The other two
-        events only close the silent window.
+        release. Further backoff connects are cancelled. The attempt
+        counter is cleared here as hygiene. It is not read, and the
+        next fresh down clears it too, so this does not add a connect.
+        The other two events only close the silent window.
         """
         if self._stopped:
             return
@@ -252,6 +252,8 @@ class ReplyLinkPoller:
             self._ready = True
             self._next_connect_at = None
             self._capped = False
+            # Hygiene. _attempts is not read. The next fresh down
+            # clears it too, so this does not change who may connect.
             self._attempts = 0
             self._step = 0
             self._ceiling_alerted = False

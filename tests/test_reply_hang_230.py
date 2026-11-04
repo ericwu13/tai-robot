@@ -881,7 +881,11 @@ def test_entry_gate_waits_for_equity_refresh_after_release(monkeypatch):
     _drain()
     app._account_monitor = SimpleNamespace(
         update_rights=lambda parsed: order.append("rights"))
-    app._update_real_account_display = lambda: guard.update_pnl(0)
+    def _show_rights():
+        guard.update_pnl(0)
+        return True
+
+    app._update_real_account_display = _show_rights
     fields = ["0"] * 35
     fields[0] = "100000"
     fields[6] = "100000"
@@ -1095,15 +1099,17 @@ def test_no_further_connect_after_give_up_at_t_plus_150():
 
 
 def test_connect_return_code_is_logged_at_the_call():
-    """A non-zero ConnectByID is logged when it returns, before the 90s alert."""
-    logs: list[str] = []
+    """A non-zero ConnectByID is an error line when it returns, before the 90s alert."""
+    info: list[str] = []
+    errors: list[str] = []
     alerts: list[str] = []
     fake, machine, poller = _poll_world(alerts)
-    poller._log_info = logs.append
-    poller._log_error = logs.append
+    poller._log_info = info.append
+    poller._log_error = errors.append
     poller._connect = lambda _user: 151
     _drop_then_connect(fake, poller)
-    assert any("ConnectByID returned 151" in line for line in logs)
+    assert any("ConnectByID returned 151" in line for line in errors)
+    assert not any("ConnectByID returned 151" in line for line in info)
     assert STILL_DOWN_ALERT not in alerts
     assert machine.degraded is False
 
@@ -1281,23 +1287,20 @@ def _held_alert_lines(lines: list[str]) -> list[str]:
     ]
 
 
-def _release_equity_hold_via_update_pnl(app) -> None:
-    """Successful rights callback: update_pnl, then the hold drops."""
+def _rights_row() -> str:
+    fields = ["0"] * 35
+    fields[0] = "100000"
+    fields[6] = "100000"
+    fields[31] = "80000"
+    return ",".join(fields)
+
+
+def _arm_rights_display(app) -> None:
     from types import SimpleNamespace
 
     from src.live.account_monitor import AccountMonitor
 
-    monitor = AccountMonitor()
-    monitor.update_rights({
-        "equity": "100000",
-        "available": "80000",
-        "float_pnl": "0",
-        "realized_pnl": "0",
-        "realized_cost": "0",
-        "tax": "0",
-        "maint_rate": "100",
-    })
-    app._account_monitor = monitor
+    app._account_monitor = AccountMonitor()
     blank = SimpleNamespace(set=lambda _value: None)
     for name in (
         "real_equity_var", "real_available_var", "real_pnl_var",
@@ -1305,16 +1308,25 @@ def _release_equity_hold_via_update_pnl(app) -> None:
         "real_loss_limit_var", "real_maint_var",
     ):
         setattr(app, name, blank)
-    app._update_real_account_display()
+
+
+def _release_equity_hold_via_future_rights(app) -> None:
+    """The future_rights handler ends the hold and clears the alert latch."""
+    _arm_rights_display(app)
+    _drain()
+    rb._ui_queue.put_nowait(("future_rights", _rights_row()))
+    app._process_ui_queue()
+    assert app._equity_refresh_owed is False
     assert app._equity_refresh_held_alerted is False
-    app._equity_refresh_owed = False
-    app._apply_link_gate()
 
 
 def test_equity_held_alert_fires_once_per_hold(monkeypatch):
     """Failed entry attempts and failed rights reads share one alert."""
+    from datetime import timedelta
+
     logs: list[str] = []
     notices: list[str] = []
+    now = [_T0]
 
     def call_com(name, fn, *args, **kwargs):
         return 151
@@ -1328,9 +1340,13 @@ def test_equity_held_alert_fires_once_per_hold(monkeypatch):
     monkeypatch.setattr(rb, "_log", logs.append)
     monkeypatch.setattr(rb, "_discord", _Discord())
     app, guard = _equity_refresh_app(monkeypatch, call_com)
+    app._equity_refresh_clock = lambda: now[0]
     app._apply_link_gate()
+    now[0] = _T0 + timedelta(seconds=rb.EQUITY_REFRESH_RETRY_S)
     app._refresh_equity_before_entries()
+    now[0] = _T0 + timedelta(seconds=rb.EQUITY_REFRESH_RETRY_S * 2)
     app._apply_link_gate()
+    now[0] = _T0 + timedelta(seconds=rb.EQUITY_REFRESH_RETRY_S * 3)
     app._refresh_equity_before_entries()
     alerts = _held_alert_lines(logs) + _held_alert_lines(notices)
     assert len(alerts) == 2
@@ -1367,7 +1383,7 @@ def test_equity_held_alert_fires_again_after_the_hold_releases(monkeypatch):
     assert len(_held_alert_lines(logs)) == 1
     assert len(notices) == 1
 
-    _release_equity_hold_via_update_pnl(app)
+    _release_equity_hold_via_future_rights(app)
     assert guard.link_entries_blocked is False
     assert len(_held_alert_lines(logs)) == 1
     assert len(notices) == 1
@@ -1385,3 +1401,156 @@ def test_equity_held_alert_fires_again_after_the_hold_releases(monkeypatch):
     assert len(notices) == 2
     assert guard.link_entries_blocked is True
     assert "ACCT" not in "\n".join(notices)
+
+
+def _discord_log(monkeypatch):
+    logs: list[str] = []
+    notices: list[str] = []
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, msg):
+            notices.append(msg)
+
+    monkeypatch.setattr(rb, "_log", logs.append)
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    return logs, notices
+
+
+def _second_hold(app, when):
+    from datetime import timedelta
+
+    poller = app._reply_poller
+    poller.observe(0, when)
+    app._apply_link_gate()
+    assert app._equity_refresh_owed is True
+    assert app._equity_refresh_held_alerted is False
+    poller.observe(1, when + timedelta(seconds=5))
+    app._apply_link_gate()
+
+
+def test_equity_refresh_retries_once_per_five_seconds(monkeypatch):
+    """Ten gate passes inside the retry gap send one GetFutureRights."""
+    from datetime import timedelta
+
+    calls: list[str] = []
+    now = [_T0]
+
+    def call_com(name, fn, *args, **kwargs):
+        calls.append(name)
+        return 151
+
+    monkeypatch.setattr(rb, "_log", lambda _msg: None)
+    app, _guard = _equity_refresh_app(monkeypatch, call_com)
+    app._equity_refresh_clock = lambda: now[0]
+    for i in range(10):
+        now[0] = _T0 + timedelta(seconds=0.4 * i)
+        app._apply_link_gate()
+    assert calls == ["GetFutureRights"]
+    now[0] = _T0 + timedelta(seconds=rb.EQUITY_REFRESH_RETRY_S)
+    app._apply_link_gate()
+    assert calls == ["GetFutureRights", "GetFutureRights"]
+
+
+def test_second_hold_alerts_after_paper_release(monkeypatch):
+    from datetime import timedelta
+
+    logs, notices = _discord_log(monkeypatch)
+
+    def call_com(name, fn, *args, **kwargs):
+        return 151
+
+    app, _guard = _equity_refresh_app(monkeypatch, call_com)
+    app._apply_link_gate()
+    assert len(_held_alert_lines(logs)) == 1
+    app._trading_mode = "paper"
+    app._apply_link_gate()
+    assert app._equity_refresh_owed is False
+    assert app._equity_refresh_held_alerted is False
+    assert len(notices) == 1
+    app._trading_mode = "auto"
+    _second_hold(app, _T0 + timedelta(seconds=90))
+    assert len(_held_alert_lines(logs)) == 2
+    assert len(notices) == 2
+
+
+def test_second_hold_alerts_after_zero_loss_limit_release(monkeypatch):
+    """daily_loss_limit 0 skips update_pnl. The rights handler still re-arms."""
+    from datetime import timedelta
+
+    logs, notices = _discord_log(monkeypatch)
+
+    def call_com(name, fn, *args, **kwargs):
+        return 151
+
+    app, guard = _equity_refresh_app(monkeypatch, call_com)
+    app._apply_link_gate()
+    assert len(notices) == 1
+    guard.daily_loss_limit = 0
+    _arm_rights_display(app)
+    app._account_monitor.update_rights({
+        "equity": "100000",
+        "available": "80000",
+        "float_pnl": "0",
+        "realized_pnl": "0",
+        "realized_cost": "0",
+        "tax": "0",
+        "maint_rate": "100",
+    })
+    app._update_real_account_display()
+    assert app._equity_refresh_held_alerted is True
+    assert app._equity_refresh_owed is True
+    _release_equity_hold_via_future_rights(app)
+    assert len(notices) == 1
+    _second_hold(app, _T0 + timedelta(seconds=100))
+    assert len(_held_alert_lines(logs)) == 2
+    assert len(notices) == 2
+
+
+def test_unrelated_display_refresh_does_not_clear_the_held_latch(monkeypatch):
+    """An open-interest display runs update_pnl and leaves the hold's latch set."""
+    from datetime import timedelta
+
+    logs, notices = _discord_log(monkeypatch)
+
+    def call_com(name, fn, *args, **kwargs):
+        return 151
+
+    app, _guard = _equity_refresh_app(monkeypatch, call_com)
+    now = [_T0]
+    app._equity_refresh_clock = lambda: now[0]
+    app._apply_link_gate()
+    assert app._equity_refresh_held_alerted is True
+    _arm_rights_display(app)
+    app._account_monitor.update_rights({
+        "equity": "100000",
+        "available": "80000",
+        "float_pnl": "0",
+        "realized_pnl": "0",
+        "realized_cost": "0",
+        "tax": "0",
+        "maint_rate": "100",
+    })
+    app._update_real_account_display()
+    assert app._equity_refresh_owed is True
+    assert app._equity_refresh_held_alerted is True
+    now[0] = _T0 + timedelta(seconds=rb.EQUITY_REFRESH_RETRY_S)
+    app._refresh_equity_before_entries()
+    assert len(_held_alert_lines(logs)) == 1
+    assert len(notices) == 1
+
+
+def test_held_alert_stays_quiet_when_nothing_is_owed(monkeypatch):
+    logs, notices = _discord_log(monkeypatch)
+
+    def call_com(name, fn, *args, **kwargs):
+        return 0
+
+    app, _guard = _equity_refresh_app(monkeypatch, call_com)
+    app._equity_refresh_owed = False
+    app._equity_refresh_held_alerted = False
+    app._alert_equity_refresh_held("GetFutureRights returned 151")
+    assert _held_alert_lines(logs) == []
+    assert notices == []
+    assert app._equity_refresh_held_alerted is False
