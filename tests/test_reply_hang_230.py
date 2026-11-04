@@ -447,6 +447,12 @@ def test_poller_connect_success_without_followup_event():
     assert fake.calls.count("ConnectByID") == 1
     assert machine.degraded is True
     assert STILL_DOWN_ALERT in alerts
+    _still = (
+        f"{reply_poller.POLL_CONNECT_TIMEOUT_S:g}s after one ConnectByID"
+    )
+    assert _still in STILL_DOWN_ALERT
+    assert "no further automatic reconnect" in STILL_DOWN_ALERT
+    assert "operator reconnect or restart needed" in STILL_DOWN_ALERT
     assert "SimulatedAV" not in " ".join(alerts)
 
 
@@ -721,6 +727,12 @@ def test_poll_connect_timeout_degrades_without_a_later_ready():
     assert fake.calls.count("ConnectByID") == 1
     assert machine.degraded is True
     assert STILL_DOWN_ALERT in alerts
+    _still = (
+        f"{reply_poller.POLL_CONNECT_TIMEOUT_S:g}s after one ConnectByID"
+    )
+    assert _still in STILL_DOWN_ALERT
+    assert "entries paused" in STILL_DOWN_ALERT
+    assert "no further automatic reconnect" in STILL_DOWN_ALERT
     assert machine.reply != LinkPhase.READY
 
 

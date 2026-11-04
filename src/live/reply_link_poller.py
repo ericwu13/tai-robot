@@ -19,10 +19,12 @@ does not mean OnConnect, OnComplete, or OnNewData arrived. The silent
 alert fires when no reply event arrives within 60s of login, of a
 detected drop, or of a real order being sent. It does not pause entries.
 
-After ``REPLY_CONNECT_ATTEMPT_CAP`` (10) ConnectByID calls with the
-link still down, one distinct alert is sent and retries stop. A later
-``IsConnectedByID==1`` or a new drop clears the counter. An operator
-reconnect or a process restart is what starts another series.
+One ``ConnectByID`` per down episode. If the reply is still down
+``POLL_CONNECT_TIMEOUT_S`` seconds after that call, one alert is sent:
+entries stay paused and there is no further automatic reconnect. An
+operator reconnect or a process restart is what brings the link back.
+``REPLY_CONNECT_ATTEMPT_CAP`` is only a defensive backstop. It cannot
+be reached while a single call is issued per drop.
 
 #203 quote-stuck recovery resubscribes ticks. It must not call
 ``ConnectByID`` and must not clear ``orders_paused`` while this poll
@@ -40,9 +42,9 @@ from datetime import datetime, timedelta
 REPLY_BACKOFF_S = (5, 10, 30, 60)
 REPLY_POLL_S = 60
 SILENT_AFTER_S = 60
-# Stop ConnectByID after this many attempts in one down episode.
-# Ten attempts span the 5/10/30/60 schedule and several capped 60s
-# steps (about eight minutes) without hammering SKCOM all session.
+# Defensive backstop only. One ConnectByID is issued per drop, so this
+# cap cannot be reached on that path. The CAP+2 loop in
+# tests/test_reply_link_poller.py still pins the branch.
 REPLY_CONNECT_ATTEMPT_CAP = 10
 # Consecutive clean 0 readings, spanning at least the reply settle,
 # before the one ConnectByID. A 2 breaks the run.
@@ -54,9 +56,10 @@ SILENT_ALERT = (
     "[CONN] REPLY CHANNEL SILENT — no reply event within 60s"
 )
 STILL_DOWN_ALERT = (
-    "[CONN] reply link still down after "
-    f"{REPLY_CONNECT_ATTEMPT_CAP} ConnectByID attempts; "
-    "entries paused; retry stopped"
+    "[CONN] reply link still down "
+    f"{POLL_CONNECT_TIMEOUT_S:g}s after one ConnectByID; "
+    "entries paused; no further automatic reconnect; "
+    "operator reconnect or restart needed"
 )
 
 
