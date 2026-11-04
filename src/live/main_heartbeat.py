@@ -197,10 +197,14 @@ def replace_retrying_permission_error(tmp: str, path: str, *, sleep_fn=None) -> 
         lambda: os.replace(tmp, path), sleep_fn=sleep_fn)
 
 
-# call_com increments this around a stamped broker call. A stamp-write
-# failure is logged on every attempt. Ordinary heartbeat ticks stay
-# on the 10-minute limit.
-_stamp_calls = 0
+# Per-thread depth of call_com. A background stamp must not change the
+# main thread's rate limit. A stamp-write failure is logged on every
+# attempt. Ordinary heartbeat ticks stay on the 10-minute limit.
+_stamp_depth = threading.local()
+
+
+def _stamp_depth_value() -> int:
+    return int(getattr(_stamp_depth, "n", 0) or 0)
 
 
 def _log_stamp_failure(message: str) -> None:
@@ -223,7 +227,7 @@ def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
             f"{os.path.basename(path) or path}: "
             f"[{type(exc).__name__}] {exc}"
         )
-        if _stamp_calls:
+        if _stamp_depth_value():
             _log_stamp_failure(message)
         else:
             note_heartbeat_failure(message, monotonic=monotonic)
@@ -689,8 +693,7 @@ class HangWatchdog:
             f"main thread heartbeat age={age_txt}s "
             f"inflight_com_call={name or 'none'} ({reason}). "
             f"mode={mode} entries_blocked={entries} position_open={position}. "
-            f"Process was NOT killed or restarted. "
-            f"process NOT restarted; manual restart: Mira"
+            f"Process was NOT killed or restarted; manual restart: Mira"
         )
         if self.alert_fn is None:
             return
@@ -774,7 +777,8 @@ def _archive_hang_artifacts(bot_dir: str) -> None:
 
 def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
           inflight_hung_s: float = DEFAULT_INFLIGHT_HUNG_S,
-          poll_s: float = DEFAULT_POLL_S) -> HeartbeatWriter:
+          poll_s: float = DEFAULT_POLL_S,
+          realert_s: float = DEFAULT_REALERT_S) -> HeartbeatWriter:
     """Install the writer, publish one heartbeat, and start the watchdog.
 
     Must run on the Tk main thread (the first write asserts it). Calling
@@ -803,12 +807,12 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
         if _watchdog is None:
             _watchdog = HangWatchdog(
                 bot_dir, hung_s=hung_s, inflight_hung_s=inflight_hung_s,
-                poll_s=poll_s, alert_fn=alert_fn)
+                poll_s=poll_s, alert_fn=alert_fn, realert_s=realert_s)
             _watchdog.start()
         else:
             _watchdog.configure(
                 bot_dir, hung_s=hung_s, inflight_hung_s=inflight_hung_s,
-                poll_s=poll_s, alert_fn=alert_fn)
+                poll_s=poll_s, alert_fn=alert_fn, realert_s=realert_s)
     return writer
 
 
@@ -893,12 +897,11 @@ def call_com(name: str, fn, *args, **kwargs):
     After ``fn`` returns or raises, the duration is logged. That log is
     also best-effort and does not add a COM call or change control flow.
     """
-    global _stamp_calls
-    _stamp_calls += 1
+    _stamp_depth.n = _stamp_depth_value() + 1
     try:
         return _call_com_body(name, fn, args, kwargs)
     finally:
-        _stamp_calls -= 1
+        _stamp_depth.n = _stamp_depth_value() - 1
 
 
 def _call_com_body(name, fn, args, kwargs):

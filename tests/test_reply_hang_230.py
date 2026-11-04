@@ -258,8 +258,8 @@ def test_hung_alert_names_mode_position_and_manual_restart(tmp_path):
         assert "mode=REAL" in text
         assert "entries_blocked=True" in text
         assert "position_open=True" in text
-        assert "process NOT restarted; manual restart: Mira" in text
-        assert "Process was NOT killed or restarted" in text
+        assert "Process was NOT killed or restarted; manual restart: Mira" in text
+        assert text.count("restarted") == 1
     finally:
         watchdog.disable()
 
@@ -277,7 +277,10 @@ def test_hung_alert_repeats_while_still_hung(tmp_path):
         while time.monotonic() < deadline and len(alerts) < 2:
             time.sleep(0.02)
         assert len(alerts) >= 2
-        assert all("manual restart: Mira" in item for item in alerts[:2])
+        assert all(
+            "Process was NOT killed or restarted; manual restart: Mira" in item
+            for item in alerts[:2]
+        )
     finally:
         watchdog.disable()
 
@@ -517,6 +520,32 @@ def test_poller_connect_by_id_stamps_inflight_around_the_call(tmp_path):
     after = json.loads((tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
     assert seen == {"during": "ConnectByID", "user": "U"}
     assert after["inflight_com_call"] is None
+
+
+def test_realert_interval_is_a_start_argument(tmp_path):
+    try:
+        hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0, realert_s=12.0)
+        assert hb._watchdog is not None
+        assert hb._watchdog.realert_s == 12.0
+    finally:
+        _stop_watchdog()
+
+
+def test_stamp_depth_stays_on_the_calling_thread():
+    import threading
+
+    seen = {}
+
+    def worker():
+        def body():
+            seen["during"] = hb._stamp_depth_value()
+        hb.call_com("Background", body)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert seen["during"] == 1
+    assert hb._stamp_depth_value() == 0
 
 
 def test_wake_gap_rebase_logs_the_gap(tmp_path, caplog):
@@ -800,6 +829,73 @@ def test_entry_gate_waits_for_equity_refresh_after_release(monkeypatch):
     assert order == ["release", "refresh", "entry-gate"]
     assert guard.link_entries_blocked is False
     assert guard.decide("auto", "ENTRY_FILL", "LONG")[0] == guard.SEND_ENTRY
+
+
+def test_auto_switch_refused_while_reply_down(tmp_path, monkeypatch):
+    """A switch to REAL does not query the account while the reply link is down."""
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    import src.live.mode_request as mreq
+    from src.live.fill_poller import FillPoller
+    from src.live.trading_guard import TradingGuard
+
+    now = datetime(2026, 11, 3, 15, 31, tzinfo=rb._TZ_TAIPEI)
+    body = {
+        "request_id": "req-down",
+        "mode": "auto",
+        "loss_limit": 3000,
+        "requested_by": "tester",
+        "requested_at": now.isoformat(timespec="seconds"),
+    }
+    (tmp_path / "mode_request.json").write_text(
+        json.dumps(body), encoding="utf-8")
+    queries: list[str] = []
+    guard = TradingGuard()
+    guard.reset()
+    runner = SimpleNamespace(
+        bot_dir=str(tmp_path),
+        trading_mode="paper",
+        _dashboard_auto_opt_in=True,
+        _allow_live_override=True,
+        _mode_switch_loss_cap=20_000,
+        _is_reloading=False,
+        suppress_strategy=False,
+        broker=SimpleNamespace(position_size=0),
+        csv_logger=None,
+    )
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._live_runner = runner
+    app._trading_guard = guard
+    app._fill_poller = FillPoller(guard)
+    app._trading_mode = "paper"
+    app._futures_account = "ACCT"
+    app._logged_in = True
+    app.login_user_var = SimpleNamespace(get=lambda: "U")
+    app._reply_poller = SimpleNamespace(down=True)
+    app._link_host = None
+    app._account_monitor = SimpleNamespace(
+        oi_query_in_flight=lambda _timeout: False)
+    app._mode_request_clock = lambda: now
+    app._live_log_msg = lambda *args, **kwargs: None
+    app._log_order_decision = lambda *args, **kwargs: None
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(
+        GetOpenInterestGW=lambda *a: 0,
+        GetFutureRights=lambda *a: 0,
+    ))
+    monkeypatch.setattr(
+        rb, "call_com",
+        lambda name, fn, *args, **kwargs: queries.append(name) or 0)
+    monkeypatch.setattr(rb, "_discord", None)
+    app._service_mode_request(str(tmp_path))
+    assert queries == []
+    result = json.loads(
+        (tmp_path / "mode_request_result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "refused"
+    assert "連線" in result["reason"]
+    assert app._trading_mode == "paper"
+    assert not (tmp_path / mreq.REQUEST_FILENAME).exists()
 
 
 def test_exit_fill_during_reply_down_confirms_without_downgrade(monkeypatch):
