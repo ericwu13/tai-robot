@@ -1,8 +1,9 @@
 """Issue #230 — reply-disconnect arity, poller gates, and hang evidence.
 
-Each test in this module fails on v2.19.11 (00e67b4) and passes once
-the fix on this branch is in place. COM is not loaded; the handlers
-are the Python sink methods.
+The original cases fail on v2.19.11 (00e67b4). Later cases pin the
+#231 review: one ConnectByID per drop, the equity refresh, and the
+guard mutants. COM is not loaded; the handlers are the Python sink
+methods.
 """
 
 from __future__ import annotations
@@ -537,20 +538,55 @@ def test_realert_interval_is_a_start_argument(tmp_path):
         _stop_watchdog()
 
 
+def test_default_realert_interval_is_ten_minutes(tmp_path):
+    """M14: the 10-minute repeat is the default, not only a passed-in value."""
+    assert hb.DEFAULT_REALERT_S == 600.0
+    watchdog = hb.HangWatchdog(str(tmp_path), alert_fn=lambda _msg: None)
+    assert watchdog.realert_s == 600.0
+    try:
+        hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
+        assert hb._watchdog is not None
+        assert hb._watchdog.realert_s == hb.DEFAULT_REALERT_S
+    finally:
+        _stop_watchdog()
+
+
 def test_stamp_depth_stays_on_the_calling_thread():
+    """N11: two overlapping call_com bodies each see depth 1.
+
+    A shared counter would show 2 on the second thread. The main
+    thread stays at 0 the whole time.
+    """
     import threading
 
+    inside = threading.Event()
+    release = threading.Event()
     seen = {}
 
-    def worker():
+    def first():
         def body():
-            seen["during"] = hb._stamp_depth_value()
-        hb.call_com("Background", body)
+            seen["first"] = hb._stamp_depth_value()
+            inside.set()
+            release.wait(2)
+        hb.call_com("First", body)
 
-    thread = threading.Thread(target=worker)
-    thread.start()
-    thread.join()
-    assert seen["during"] == 1
+    def second():
+        def body():
+            seen["second"] = hb._stamp_depth_value()
+        hb.call_com("Second", body)
+
+    lead = threading.Thread(target=first)
+    lead.start()
+    assert inside.wait(2)
+    # The lead thread is inside call_com. Main is not.
+    assert hb._stamp_depth_value() == 0
+    follow = threading.Thread(target=second)
+    follow.start()
+    follow.join()
+    release.set()
+    lead.join()
+    assert seen["first"] == 1
+    assert seen["second"] == 1
     assert hb._stamp_depth_value() == 0
 
 
@@ -820,8 +856,8 @@ def test_entry_gate_waits_for_equity_refresh_after_release(monkeypatch):
     def call_com(name, fn, *args, **kwargs):
         order.append("refresh")
         assert guard.link_entries_blocked is True
-        app._equity_refresh_owed = False
-        guard.update_pnl(0)
+        # The owed flag stays set until OnFutureRights runs. The call
+        # itself is only the request.
         return 0
 
     monkeypatch.setattr(rb, "_com_available", True)
@@ -837,8 +873,24 @@ def test_entry_gate_waits_for_equity_refresh_after_release(monkeypatch):
     order.append("release")
     poller.observe(1, down + __import__("datetime").timedelta(seconds=5))
     app._apply_link_gate()
+    assert order == ["release", "refresh"]
+    assert app._equity_refresh_owed is True
+    assert app._equity_refresh_sent is True
+    assert guard.link_entries_blocked is True
+
+    _drain()
+    app._account_monitor = SimpleNamespace(
+        update_rights=lambda parsed: order.append("rights"))
+    app._update_real_account_display = lambda: guard.update_pnl(0)
+    fields = ["0"] * 35
+    fields[0] = "100000"
+    fields[6] = "100000"
+    fields[31] = "80000"
+    rb._ui_queue.put_nowait(("future_rights", ",".join(fields)))
+    app._process_ui_queue()
     order.append("entry-gate")
-    assert order == ["release", "refresh", "entry-gate"]
+    assert order == ["release", "refresh", "rights", "entry-gate"]
+    assert app._equity_refresh_owed is False
     assert guard.link_entries_blocked is False
     assert guard.decide("auto", "ENTRY_FILL", "LONG")[0] == guard.SEND_ENTRY
 
@@ -962,3 +1014,261 @@ def test_exit_fill_during_reply_down_confirms_without_downgrade(monkeypatch):
     assert app._trading_mode == "auto"
     assert alerts == []
     assert guard.halted is False
+
+
+def _drop_then_connect(fake, poller):
+    """One gated ConnectByID. Returns the time of that call."""
+    from datetime import timedelta
+
+    fake.set_now(_T0)
+    poller.observe(1, _T0)
+    down = _T0 + timedelta(seconds=1)
+    fake.set_now(down)
+    poller.observe(0, down)
+    poller.observe(0, down + timedelta(seconds=5))
+    connected = down + timedelta(seconds=15)
+    fake.set_now(connected)
+    poller.observe(0, connected)
+    return down, connected
+
+
+def test_on_complete_resets_attempt_counter_while_polls_read_zero():
+    """OnComplete clears the one attempt even though the next poll is still 0.
+
+    A later drop then gets its own ConnectByID. A poll of 1 is not
+    what clears the counter.
+    """
+    from datetime import timedelta
+
+    alerts: list[str] = []
+    connects: list[int] = []
+    fake, machine, poller = _poll_world(alerts)
+    poller._connect = lambda _user: connects.append(0) or 0
+    down, connected = _drop_then_connect(fake, poller)
+    assert len(connects) == 1
+    assert poller._attempts == 1
+    done = connected + timedelta(seconds=1)
+    fake.set_now(done)
+    fake.note_on_complete()
+    machine.on_complete(done)
+    poller.note_reply_event("OnComplete")
+    assert poller._attempts == 0
+    assert poller._capped is False
+    assert poller._step == 0
+    machine.tick(done)
+    assert machine.reply == LinkPhase.READY
+    # The link still polls 0. That is a new down, and it gets one call.
+    later = done + timedelta(seconds=1)
+    fake.set_now(later)
+    poller.observe(0, later)
+    poller.observe(0, later + timedelta(seconds=5))
+    again = later + timedelta(seconds=20)
+    fake.set_now(again)
+    poller.observe(0, again)
+    assert len(connects) == 2
+    poller.observe(0, again + timedelta(seconds=60))
+    assert len(connects) == 2
+    assert down < connected
+
+
+def test_no_further_connect_after_give_up_at_t_plus_150():
+    """After _give_up, a poll at T+150s from the drop sends no ConnectByID."""
+    from datetime import timedelta
+
+    alerts: list[str] = []
+    fake, machine, poller = _poll_world(alerts)
+    down, connected = _drop_then_connect(fake, poller)
+    assert fake.calls.count("ConnectByID") == 1
+    timeout = connected + timedelta(
+        seconds=reply_poller.POLL_CONNECT_TIMEOUT_S)
+    fake.set_now(timeout)
+    poller.observe(0, timeout)
+    assert machine.degraded is True
+    assert STILL_DOWN_ALERT in alerts
+    assert fake.calls.count("ConnectByID") == 1
+    later = down + timedelta(seconds=150)
+    assert later > timeout
+    fake.set_now(later)
+    poller.observe(0, later)
+    assert fake.calls.count("ConnectByID") == 1
+    assert alerts.count(STILL_DOWN_ALERT) == 1
+
+
+def test_connect_return_code_is_logged_at_the_call():
+    """A non-zero ConnectByID is logged when it returns, before the 90s alert."""
+    logs: list[str] = []
+    alerts: list[str] = []
+    fake, machine, poller = _poll_world(alerts)
+    poller._log_info = logs.append
+    poller._log_error = logs.append
+    poller._connect = lambda _user: 151
+    _drop_then_connect(fake, poller)
+    assert any("ConnectByID returned 151" in line for line in logs)
+    assert STILL_DOWN_ALERT not in alerts
+    assert machine.degraded is False
+
+
+def test_zero_run_is_bounded_and_keeps_the_settle_anchor():
+    """A long run of 0s stays capped, and the first stamp still sets the span."""
+    from datetime import timedelta
+
+    fake, _machine, poller = _poll_world([])
+    poller.observe(1, _T0)
+    start = _T0 + timedelta(minutes=2)
+    fake.set_now(start)
+    poller.observe(0, start)
+    far = start + timedelta(seconds=100)
+    fake.set_now(far)
+    poller.observe(0, far)
+    cap = reply_poller.POLL_ZERO_HISTORY_CAP
+    assert cap >= reply_poller.POLL_CONNECT_MIN_ZEROS
+    for i in range(cap + 5):
+        moment = far + timedelta(milliseconds=i)
+        fake.set_now(moment)
+        poller.observe(0, moment)
+    assert len(poller._zero_at) == cap
+    assert poller._zero_at[0] == start
+    assert poller._zeros_ready(10.0) is True
+
+
+def test_may_poll_connect_refuses_while_a_call_is_in_flight():
+    """M5: the machine itself refuses, not only the poller's inflight check."""
+    from datetime import timedelta
+
+    fake = FakeSkcom(reply_settle_s=10)
+    machine = LinkStateMachine(
+        fake, LinkMachineConfig(user_id="U", reply_settle_s=10, stuck_limit_s=300))
+    machine.adopt_after_process_login(_T0)
+    machine.quote = LinkPhase.READY
+    machine._reply_awaiting_complete = True
+    machine._reply_connect_started_at = _T0
+    machine._reply_down_at = _T0 - timedelta(seconds=30)
+    now = _T0 + timedelta(seconds=5)
+    assert machine.may_poll_connect(now) is False
+    assert machine._reply_connect_started_at == _T0
+
+
+def test_may_poll_connect_refuses_before_the_settle():
+    """M6: may_poll_connect has its own settle gate."""
+    from datetime import timedelta
+
+    fake = FakeSkcom(reply_settle_s=10)
+    machine = LinkStateMachine(
+        fake, LinkMachineConfig(user_id="U", reply_settle_s=10, stuck_limit_s=300))
+    machine.adopt_after_process_login(_T0)
+    machine.quote = LinkPhase.READY
+    machine._reply_awaiting_complete = False
+    now = _T0 + timedelta(minutes=1)
+    machine._reply_down_at = now
+    assert machine.may_poll_connect(now) is False
+    assert machine._reply_awaiting_complete is False
+    later = now + timedelta(seconds=10)
+    assert machine.may_poll_connect(later) is True
+    assert machine._reply_awaiting_complete is True
+
+
+def test_tick_after_poll_of_zero_sends_no_connect():
+    """M7: a machine tick must not ConnectByID while the poller owns the link."""
+    from datetime import timedelta
+
+    fake, machine, poller = _poll_world([])
+    fake.set_now(_T0)
+    poller.observe(1, _T0)
+    down = _T0 + timedelta(minutes=1)
+    fake.set_now(down)
+    poller.observe(0, down)
+    assert machine._poller_owns_connect is True
+    assert fake.calls.count("ConnectByID") == 0
+    tick_at = down + timedelta(seconds=30)
+    fake.set_now(tick_at)
+    machine.tick(tick_at)
+    assert fake.calls.count("ConnectByID") == 0
+
+
+def _equity_refresh_app(monkeypatch, call_com):
+    """Auto-mode app whose reply just came back and still owes equity."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from src.live.link_host import LinkHost
+    from src.live.trading_guard import TradingGuard
+
+    fake, machine, poller = _poll_world([])
+    host = LinkHost(machine)
+    guard = TradingGuard(daily_loss_limit=10000)
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._link_host = host
+    app._trading_guard = guard
+    app._reply_poller = poller
+    app._trading_mode = "auto"
+    app._logged_in = True
+    app._futures_account = "ACCT"
+    app.login_user_var = SimpleNamespace(get=lambda: "U")
+    app._equity_refresh_owed = False
+    app._equity_refresh_sent = False
+    app.set_status = lambda *args, **kwargs: None
+    app._set_conn_dot = lambda *args, **kwargs: None
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetFutureRights=lambda *a: 0))
+    monkeypatch.setattr(rb, "call_com", call_com)
+    down = _T0 + timedelta(seconds=30)
+    fake.set_now(down)
+    poller.observe(0, down)
+    app._apply_link_gate()
+    assert app._equity_refresh_owed is True
+    poller.observe(1, down + timedelta(seconds=5))
+    return app, guard
+
+
+def test_equity_refresh_resets_sent_when_the_call_raises(monkeypatch):
+    logs: list[str] = []
+    notices: list[str] = []
+
+    def call_com(name, fn, *args, **kwargs):
+        raise RuntimeError("rights down")
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, msg):
+            notices.append(msg)
+
+    monkeypatch.setattr(rb, "_log", logs.append)
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    app, guard = _equity_refresh_app(monkeypatch, call_com)
+    app._apply_link_gate()
+    text = "\n".join(logs + notices)
+    assert app._equity_refresh_sent is False
+    assert app._equity_refresh_owed is True
+    assert guard.link_entries_blocked is True
+    assert "entries held: equity never refreshed" in text
+    assert "RuntimeError" in text
+    assert "ACCT" not in text
+    assert notices
+
+
+def test_equity_refresh_resets_sent_on_a_nonzero_code(monkeypatch):
+    logs: list[str] = []
+    notices: list[str] = []
+
+    def call_com(name, fn, *args, **kwargs):
+        return 151
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, msg):
+            notices.append(msg)
+
+    monkeypatch.setattr(rb, "_log", logs.append)
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    app, guard = _equity_refresh_app(monkeypatch, call_com)
+    app._apply_link_gate()
+    text = "\n".join(logs + notices)
+    assert app._equity_refresh_sent is False
+    assert app._equity_refresh_owed is True
+    assert guard.link_entries_blocked is True
+    assert "GetFutureRights returned 151" in text
+    assert "entries held: equity never refreshed" in text
+    assert "ACCT" not in text
+    assert notices

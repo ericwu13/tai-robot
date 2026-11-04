@@ -11767,13 +11767,49 @@ class BacktestApp:
         self._equity_refresh_sent = True
         user_id = self.login_user_var.get().strip()
         try:
-            call_com(
+            code = call_com(
                 "GetFutureRights", skO.GetFutureRights,
                 user_id, self._futures_account, 1)
         except Exception as exc:
-            _log(
-                "[CONN] equity refresh failed: "
-                f"[{type(exc).__name__}] {exc}")
+            self._equity_refresh_sent = False
+            detail = f"[{type(exc).__name__}] {exc}"
+            _log(f"[CONN] equity refresh failed: {detail}")
+            self._alert_equity_refresh_held(detail)
+            return
+        if self._equity_refresh_code_failed(code):
+            self._equity_refresh_sent = False
+            detail = f"GetFutureRights returned {code}"
+            _log(f"[CONN] equity refresh failed: {detail}")
+            self._alert_equity_refresh_held(detail)
+
+    @staticmethod
+    def _equity_refresh_code_failed(code) -> bool:
+        """True when GetFutureRights returned a non-zero code."""
+        if isinstance(code, bool) or code is None:
+            return False
+        try:
+            number = int(code)
+        except (TypeError, ValueError):
+            return False
+        return number != 0
+
+    def _alert_equity_refresh_held(self, detail: str) -> None:
+        """Entries stay shut because the fresh equity read did not land."""
+        if not getattr(self, "_equity_refresh_owed", False):
+            return
+        msg = (
+            "[CONN] entries held: equity never refreshed "
+            f"({detail}); new entries stay paused"
+        )
+        _log(msg)
+        discord = _discord
+        if discord is not None and getattr(discord, "enabled", False):
+            try:
+                discord.notify(f"⚠️ {msg}")
+            except Exception as exc:
+                _log(
+                    "[CONN] equity refresh discord failed: "
+                    f"[{type(exc).__name__}] {exc}")
 
     def _query_real_account(self):
         """Query real account positions and equity from Capital API."""

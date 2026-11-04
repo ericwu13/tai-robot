@@ -23,8 +23,8 @@ One ``ConnectByID`` per down episode. If the reply is still down
 ``POLL_CONNECT_TIMEOUT_S`` seconds after that call, one alert is sent:
 entries stay paused and there is no further automatic reconnect. An
 operator reconnect or a process restart is what brings the link back.
-``REPLY_CONNECT_ATTEMPT_CAP`` is only a defensive backstop. It cannot
-be reached while a single call is issued per drop.
+OnComplete clears that attempt even when the polls still read 0, so
+the next drop gets one fresh call.
 
 #203 quote-stuck recovery resubscribes ticks. It must not call
 ``ConnectByID`` and must not clear ``orders_paused`` while this poll
@@ -42,15 +42,14 @@ from datetime import datetime, timedelta
 REPLY_BACKOFF_S = (5, 10, 30, 60)
 REPLY_POLL_S = 60
 SILENT_AFTER_S = 60
-# Defensive backstop only. One ConnectByID is issued per drop, so this
-# cap cannot be reached on that path. The CAP+2 loop in
-# tests/test_reply_link_poller.py still pins the branch.
-REPLY_CONNECT_ATTEMPT_CAP = 10
 # Consecutive clean 0 readings, spanning at least the reply settle,
 # before the one ConnectByID. A 2 breaks the run.
 POLL_CONNECT_MIN_ZEROS = 3
 # One call per down episode. No release by then: degrade, alert, stop.
 POLL_CONNECT_TIMEOUT_S = 90.0
+# Bound on the clean-0 timestamps. The first stamp stays, so the
+# settle span is still the whole run. Only newer samples are dropped.
+POLL_ZERO_HISTORY_CAP = 32
 
 SILENT_ALERT = (
     "[CONN] REPLY CHANNEL SILENT — no reply event within 60s"
@@ -158,9 +157,10 @@ def format_event_sink(kind: str, sink, handler, module, source=None) -> str:
 class ReplyLinkPoller:
     """Clock-driven reply poll. The host supplies ``read`` and ``connect``.
 
-    ``read`` returns IsConnectedByID. ``connect`` sends one ConnectByID
-    and logs its return code. Neither may log out. ``notify`` is the
-    Discord path. Failures are logged and swallowed.
+    ``read`` returns IsConnectedByID. ``connect`` sends one ConnectByID.
+    This poller logs that call's return code when it comes back, before
+    any timeout alert. Neither may log out. ``notify`` is the Discord
+    path. Failures are logged and swallowed.
     """
 
     def __init__(
@@ -238,7 +238,9 @@ class ReplyLinkPoller:
         """OnConnect, OnComplete, or OnNewData. This episode is not silent.
 
         OnComplete also ends a poller reconnect: the machine owns the
-        release. Further backoff connects are cancelled. The other two
+        release. Further backoff connects are cancelled, and the
+        attempt counter is cleared even if the next poll still reads
+        0, so a later drop gets one fresh ConnectByID. The other two
         events only close the silent window.
         """
         if self._stopped:
@@ -250,6 +252,9 @@ class ReplyLinkPoller:
             self._ready = True
             self._next_connect_at = None
             self._capped = False
+            self._attempts = 0
+            self._step = 0
+            self._ceiling_alerted = False
 
     def note_order_sent(self, now: datetime) -> None:
         """A real order went out. Alert if no reply event follows.
@@ -427,16 +432,14 @@ class ReplyLinkPoller:
             return
         self._attempts += 1
         try:
-            self._connect(user_id)
+            code = self._connect(user_id)
             self._connects += 1
         except Exception as exc:
             self._safe_error(
                 "[CONN] ConnectByID raised: "
                 f"[{type(exc).__name__}] {exc}")
-        if self._attempts >= REPLY_CONNECT_ATTEMPT_CAP:
-            self._capped = True
-            self._next_connect_at = None
-            self._notify_ceiling()
+            return
+        self._log_connect_code(code)
 
     def _clear_zero_run(self) -> None:
         self._zero_at = []
@@ -452,6 +455,11 @@ class ReplyLinkPoller:
             self._blocked_by_two = False
             self._zero_at = []
         self._zero_at.append(now)
+        if len(self._zero_at) > POLL_ZERO_HISTORY_CAP:
+            # Index 0 is the run anchor. Drop the oldest samples after
+            # it so a long outage cannot grow this list without end.
+            tail = POLL_ZERO_HISTORY_CAP - 1
+            self._zero_at = [self._zero_at[0], *self._zero_at[-tail:]]
 
     def _settle_s(self, machine) -> float:
         config = getattr(machine, "config", None)
@@ -502,6 +510,24 @@ class ReplyLinkPoller:
             return self._machine_getter()
         except Exception:
             return None
+
+    def _log_connect_code(self, code) -> None:
+        """Log the ConnectByID return code at the call, not at timeout."""
+        line = f"[CONN] ConnectByID returned {code}"
+        if isinstance(code, bool):
+            number = None
+        else:
+            try:
+                number = int(code)
+            except (TypeError, ValueError):
+                number = None
+        if number not in (None, 0):
+            self._safe_error(line)
+            return
+        try:
+            self._log_info(line)
+        except Exception:
+            pass
 
     def _safe_error(self, msg: str) -> None:
         try:
