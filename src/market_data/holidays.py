@@ -21,6 +21,7 @@ import calendar
 import logging
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -35,10 +36,18 @@ CLOSURES_OVERRIDE_FILENAME = "taifex_closures.yaml"
 
 _CLOSURE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
-# (path, mtime_ns, dates). A missing file is not cached so creating one
-# is picked up on the next call.
-_closures_cache: tuple[str, int, frozenset[date]] | None = None
+# (path, mtime_ns or None, dates). mtime None means the last stat found
+# no file. ``stat`` runs at most once per ``CLOSURE_STAT_INTERVAL_S``;
+# a missing file or an edit is picked up on the next check after that
+# window, still by comparing mtime (issue #233).
+CLOSURE_STAT_INTERVAL_S = 60.0
+_closures_cache: tuple[str, int | None, frozenset[date]] | None = None
+_closures_checked_mono: float | None = None
 _logged_closure_dates: set[date] = set()
+
+# (year, id(country_holidays)) -> dates. Keying on the function keeps a
+# monkeypatched lookup from receiving a cached real year, and the reverse.
+_tw_holiday_cache: dict[tuple[int, int], frozenset[date]] = {}
 
 # Manual overrides — only add dates that disagree with the `holidays` package.
 # Keep small; they should be rare exceptions.
@@ -56,18 +65,30 @@ _MONTH_CODES = "ABCDEFGHIJKL"  # A=Jan .. L=Dec
 _tw_holidays_broken: bool = False
 
 
+def _monotonic() -> float:
+    return time.monotonic()
+
+
 def _tw_public_holidays(year: int) -> frozenset[date]:
     """Return TW public holidays for ``year`` as a set of dates.
 
-    Falls back to an empty set (weekends-only detection) if the
-    ``holidays`` package cannot resolve the TW country module — this
-    happens in poorly-bundled frozen EXEs where
-    ``holidays.countries.taiwan`` wasn't collected (issue #58).  A
-    single warning is logged so the operator sees the degradation.
+    The set is built once per year for the life of the process. Falls
+    back to an empty set (weekends-only detection) if the ``holidays``
+    package cannot resolve the TW country module — this happens in
+    poorly-bundled frozen EXEs where ``holidays.countries.taiwan``
+    wasn't collected (issue #58). A single warning is logged so the
+    operator sees the degradation. The empty fallback is memoized too,
+    so a broken package is not rebuilt on every status poll.
     """
     global _tw_holidays_broken
+    year = int(year)
+    fn = _holidays.country_holidays
+    key = (year, id(fn))
+    cached = _tw_holiday_cache.get(key)
+    if cached is not None:
+        return cached
     try:
-        return frozenset(_holidays.country_holidays("TW", years=year))
+        days = frozenset(fn("TW", years=year))
     except Exception as e:
         if not _tw_holidays_broken:
             _tw_holidays_broken = True
@@ -76,7 +97,9 @@ def _tw_public_holidays(year: int) -> frozenset[date]:
                 "weekend-only check. Settlement days that coincide with "
                 "public holidays may be mis-dated. Cause: %s", e,
             )
-        return frozenset()
+        days = frozenset()
+    _tw_holiday_cache[key] = days
+    return days
 
 
 def holiday_calendar_health(year: int | None = None) -> tuple[bool, str]:
@@ -169,17 +192,30 @@ def load_closure_override_dates() -> frozenset[date]:
     A missing file is silent. Bad bytes, a ``ValueError``, or a YAML
     parse error log one warning and yield no dates — the line regex does
     not run on a document YAML refused.
+
+    ``stat`` runs at most once per ``CLOSURE_STAT_INTERVAL_S``. Inside
+    that window the previous answer is returned unchanged. After it, the
+    mtime is compared again and a changed file is reloaded.
     """
-    global _closures_cache
+    global _closures_cache, _closures_checked_mono
     path = closures_override_path()
     key = str(path)
+    now = _monotonic()
+    if (_closures_cache is not None
+            and _closures_cache[0] == key
+            and _closures_checked_mono is not None
+            and now - _closures_checked_mono < CLOSURE_STAT_INTERVAL_S):
+        return _closures_cache[2]
     try:
         mtime_ns = path.stat().st_mtime_ns
     except OSError:
+        _closures_cache = (key, None, frozenset())
+        _closures_checked_mono = now
         return frozenset()
     if (_closures_cache is not None
             and _closures_cache[0] == key
             and _closures_cache[1] == mtime_ns):
+        _closures_checked_mono = now
         return _closures_cache[2]
     try:
         text = path.read_text(encoding="utf-8-sig")
@@ -189,6 +225,7 @@ def load_closure_override_dates() -> frozenset[date]:
         _logger.warning("closures override unreadable, ignoring it: %s", exc)
         dates = frozenset()
     _closures_cache = (key, mtime_ns, dates)
+    _closures_checked_mono = now
     return dates
 
 

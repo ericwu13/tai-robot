@@ -27,6 +27,11 @@ from src.live.main_heartbeat import (
 )
 
 
+def _p1(alerts) -> list:
+    """Per-bot HUNG lines. A host-stall rollup is additive and not one of these."""
+    return [item for item in alerts if "P1 HUNG" in item]
+
+
 def test_background_thread_cannot_write_heartbeat(tmp_path):
     writer = HeartbeatWriter(str(tmp_path))
     box = {}
@@ -115,9 +120,9 @@ def test_blocking_leave_monitor_detected_once_without_exit(tmp_path):
             while time.monotonic() < deadline:
                 hang_path = tmp_path / hb.HANG_FILENAME
                 stacks_path = tmp_path / hb.STACKS_FILENAME
-                if hang_path.is_file() and stacks_path.is_file() and alerts:
+                if hang_path.is_file() and stacks_path.is_file() and _p1(alerts):
                     time.sleep(0.3)  # several watchdog polls while still hung
-                    seen["alerts_while_hung"] = len(alerts)
+                    seen["alerts_while_hung"] = len(_p1(alerts))
                     return
                 time.sleep(0.02)
         finally:
@@ -141,7 +146,7 @@ def test_blocking_leave_monitor_detected_once_without_exit(tmp_path):
     assert stacks.strip()
     assert "fake_leave_monitor" in stacks
     assert seen.get("alerts_while_hung") == 1
-    assert len(alerts) == 1
+    assert len(_p1(alerts)) == 1
     assert "P1" in alerts[0]
     assert "LeaveMonitor" in alerts[0]
     assert os.getpid() == pid
@@ -158,19 +163,25 @@ def test_watchdog_rearms_only_after_recovery(tmp_path):
     try:
         writer.write(now=time.time() - 5)
         deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and len(alerts) < 1:
+        while time.monotonic() < deadline and len(_p1(alerts)) < 1:
             time.sleep(0.02)
-        assert len(alerts) == 1
+        assert len(_p1(alerts)) == 1
         time.sleep(0.25)
-        assert len(alerts) == 1, "second alert fired before recovery"
+        assert len(_p1(alerts)) == 1, "second P1 fired before recovery"
         writer.write()  # fresh heartbeat — recovery
-        time.sleep(0.2)
-        assert len(alerts) == 1
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not any(
+                "RECOVERED" in item for item in alerts):
+            time.sleep(0.02)
+        assert sum("P1" in item for item in alerts) == 1
+        assert sum("RECOVERED" in item for item in alerts) == 1
         writer.write(now=time.time() - 5)
         deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and len(alerts) < 2:
+        while time.monotonic() < deadline and sum(
+                "P1" in item for item in alerts) < 2:
             time.sleep(0.02)
-        assert len(alerts) == 2
+        assert sum("P1" in item for item in alerts) == 2
+        assert sum("RECOVERED" in item for item in alerts) == 1
         assert os.getpid() > 0
         assert watchdog._thread.is_alive()
     finally:
@@ -252,7 +263,7 @@ def test_default_thresholds_and_strict_boundaries(tmp_path):
     watchdog._check_once(90.0)
     assert alerts == []
     watchdog._check_once(90.01)
-    assert len(alerts) == 1
+    assert len(_p1(alerts)) == 1
 
     alerts.clear()
     inflight_dir = tmp_path / "inflight"
@@ -265,8 +276,8 @@ def test_default_thresholds_and_strict_boundaries(tmp_path):
     watchdog._check_once(60.0)
     assert alerts == []
     watchdog._check_once(60.01)
-    assert len(alerts) == 1
-    assert "LeaveMonitor" in alerts[0]
+    assert len(_p1(alerts)) == 1
+    assert "LeaveMonitor" in _p1(alerts)[0]
 
 
 def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_path, monkeypatch):
@@ -285,7 +296,7 @@ def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_pat
     watchdog._seen_mono = time.monotonic() - 91.0
     monkeypatch.setattr(hb.time, "time", lambda: 1.0)
     watchdog._check_once()
-    assert len(alerts) == 1, "backward wall jump must not hide a real stall"
+    assert len(_p1(alerts)) == 1, "backward wall jump must not hide a real stall"
 
     alerts.clear()
     sleep_dir = tmp_path / "sleep"
@@ -318,7 +329,7 @@ def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_pat
     watchdog._seen_mono = time.monotonic() - 91.0
     watchdog._last_loop_mono = time.monotonic() - (watchdog.poll_s * 2)
     watchdog._poll()
-    assert len(alerts) == 1
+    assert len(_p1(alerts)) == 1
 
 
 def test_alert_goes_out_when_dump_fails_and_missing_file_does_not_rearm(tmp_path, monkeypatch):
@@ -334,24 +345,25 @@ def test_alert_goes_out_when_dump_fails_and_missing_file_does_not_rearm(tmp_path
     monkeypatch.setattr(hb, "dump_thread_stacks", boom)
     watchdog._check_once(0.0)
     watchdog._check_once(100.0)
-    assert len(alerts) == 1
+    assert len(_p1(alerts)) == 1
     watchdog._check_once(200.0)
-    assert len(alerts) == 1
+    assert len(_p1(alerts)) == 1
     os.remove(writer.path)
     watchdog._check_once(300.0)
     assert watchdog._latched is True
     (tmp_path / "heartbeat.json").write_bytes(b"{broken")
     watchdog._check_once(400.0)
     assert watchdog._latched is True
-    assert len(alerts) == 1
+    assert len(_p1(alerts)) == 1
     (tmp_path / "heartbeat.json").write_bytes(raw)
     watchdog._check_once(500.0)
-    assert len(alerts) == 1, "same heartbeat must not send a second P1"
+    assert len(_p1(alerts)) == 1, "same heartbeat must not send a second P1"
     writer.write()
     watchdog._check_once(500.1)
     assert watchdog._latched is False
     watchdog._check_once(700.0)
-    assert len(alerts) == 2
+    assert sum("P1" in item for item in alerts) == 2
+    assert sum("RECOVERED" in item for item in alerts) == 1
 
 
 def test_watchdog_default_poll_waits_two_seconds(tmp_path, monkeypatch):
@@ -649,8 +661,8 @@ def test_watchdog_reads_snapshot_not_a_replaced_file(tmp_path):
     watchdog = HangWatchdog(str(tmp_path), hung_s=90.0, alert_fn=alerts.append)
     watchdog._check_once(0.0)
     watchdog._check_once(100.0)
-    assert len(alerts) == 1
-    assert "P1" in alerts[0]
+    assert len(_p1(alerts)) == 1
+    assert "P1" in _p1(alerts)[0]
 
 
 def test_call_com_exhausted_replace_logs_once(tmp_path, monkeypatch, caplog):

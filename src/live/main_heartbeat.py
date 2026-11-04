@@ -10,8 +10,10 @@ PID check still says ALIVE. This module:
   sends a Discord P1 when the main thread is hung
 
 The watchdog never exits, kills, or restarts the process. It repeats the
-P1 every 10 minutes while the hang lasts. The latch clears only after
-the heartbeat recovers.
+P1 every 10 minutes while the hang lasts. When the heartbeat advances
+again, the latch clears and one ``[HANG] RECOVERED`` alert is sent
+(issue #233). A host stall that hangs three or more bots inside 120 s
+also sends one additive rollup; that rollup never replaces a bot's P1.
 """
 
 from __future__ import annotations
@@ -512,6 +514,11 @@ class HangWatchdog:
         self._seen_inflight_mono = 0.0
         self._last_loop_mono: float | None = None
         self._latched_ts: float | None = None
+        # Set when this episode latches. Recovery measures stall from the
+        # first sight of the frozen heartbeat, not from the 90 s threshold.
+        self._episode_origin_mono: float | None = None
+        self._episode_reason: str | None = None
+        self._episode_top_frame: str = ""
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -552,6 +559,9 @@ class HangWatchdog:
         self._seen_inflight_mono = 0.0
         self._last_loop_mono = None
         self._latched_ts = None
+        self._episode_origin_mono = None
+        self._episode_reason = None
+        self._episode_top_frame = ""
         self._wake.set()
 
     def _loop(self) -> None:
@@ -634,11 +644,10 @@ class HangWatchdog:
             # Re-arm only when a new timestamp is actually fresh. A missing
             # file, an unreadable file, or a wake-gap rebase of the same
             # ts must not clear the latch (that would send a second P1).
+            # A heartbeat that never went HUNG does not alert.
             if (self._latched and ts is not None and ts != self._latched_ts
                     and hb_stall is not None and hb_stall <= self.hung_s):
-                self._latched = False
-                self._latched_ts = None
-                self._last_alert_mono = None
+                self._on_recovered(now_mono)
             return
         reason = "inflight_com_call" if hung_inflight else "heartbeat"
         age = hb_stall
@@ -653,9 +662,16 @@ class HangWatchdog:
             return
         # Latch first so a slow send cannot double-fire. The alert goes out
         # before the dump and hang.json: a full disk must not eat the P1.
+        # The host-stall rollup is recorded after that P1 and never instead
+        # of it (issue #233).
         self._latched = True
         self._latched_ts = ts
         self._last_alert_mono = now_mono
+        self._episode_reason = reason
+        self._episode_origin_mono = (
+            self._seen_inflight_mono if reason == "inflight_com_call"
+            else self._seen_mono)
+        self._episode_top_frame = _main_thread_top_frame()
         self._send_hung_alert(hb, reason, age, inflight)
         stacks_path = os.path.join(self.bot_dir, STACKS_FILENAME)
         try:
@@ -674,6 +690,7 @@ class HangWatchdog:
             atomic_write_json(os.path.join(self.bot_dir, HANG_FILENAME), hang)
         except Exception:
             logger.exception("hang watchdog hang.json write failed")
+        self._publish_host_hung(hb, reason)
 
     def _send_hung_alert(self, hb: dict, reason: str, age, inflight) -> None:
         """One P1. Names mode, the entry gate, and whether a position is open.
@@ -695,12 +712,117 @@ class HangWatchdog:
             f"mode={mode} entries_blocked={entries} position_open={position}. "
             f"Process was NOT killed or restarted; manual restart: Mira"
         )
+        self._emit_alert(message)
+
+    def _emit_alert(self, message: str) -> None:
         if self.alert_fn is None:
             return
         try:
             self.alert_fn(message)
         except Exception:
             logger.exception("hang watchdog alert failed")
+
+    def _on_recovered(self, now_mono: float) -> None:
+        """One RECOVERED for this episode. A bot that was never HUNG never gets here."""
+        reason = self._episode_reason or "heartbeat"
+        top = self._episode_top_frame or "unknown"
+        origin = self._episode_origin_mono
+        if origin is None:
+            origin = now_mono
+        stall_s = max(0.0, float(now_mono) - float(origin))
+        # Clear the latch before the send. A second poll must not alert again.
+        self._latched = False
+        self._latched_ts = None
+        self._last_alert_mono = None
+        self._episode_origin_mono = None
+        self._episode_reason = None
+        self._episode_top_frame = ""
+        recovered_at = time.time()
+        message = (
+            f"[HANG] RECOVERED after {stall_s:.0f} s "
+            f"(reason={reason}, top frame={top})"
+        )
+        logger.warning("%s", message)
+        self._emit_alert(message)
+        self._write_recovery(recovered_at, stall_s)
+        self._publish_host_recovered(stall_s, recovered_at)
+
+    def _write_recovery(self, recovered_at: float, stall_s: float) -> None:
+        """Add ``recovered_at`` and ``stall_s`` to this episode's hang.json."""
+        path = os.path.join(self.bot_dir, HANG_FILENAME)
+        data: dict = {}
+        try:
+            with open(path, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+        data["recovered_at"] = recovered_at
+        data["stall_s"] = stall_s
+        try:
+            atomic_write_json(path, data)
+        except Exception:
+            logger.exception("hang watchdog recovery write failed")
+
+    def _publish_host_hung(self, hb: dict, reason: str) -> None:
+        """Tell the shared marker this bot is HUNG. Never skips the P1 above."""
+        try:
+            from src.live.host_stall import record_hung
+            link = hb.get("link") if isinstance(hb.get("link"), dict) else {}
+            mode = str(link.get("mode", "") or "")
+            real = mode.strip().upper() in {"REAL", "AUTO", "SEMI_AUTO"}
+            record_hung(
+                self.bot_dir,
+                reason=reason,
+                real=real,
+                now=time.time(),
+                pid=os.getpid(),
+                alert_fn=self.alert_fn,
+            )
+        except Exception:
+            logger.exception("host stall record failed")
+
+    def _publish_host_recovered(self, stall_s: float, recovered_at: float) -> None:
+        try:
+            from src.live.host_stall import record_recovered
+            record_recovered(
+                self.bot_dir,
+                stall_s=stall_s,
+                recovered_at=recovered_at,
+                now=time.time(),
+                alert_fn=self.alert_fn,
+            )
+        except Exception:
+            logger.exception("host stall recovery record failed")
+
+
+def _main_thread_top_frame() -> str:
+    """Innermost frame of the main thread, for the RECOVERED line.
+
+    The watchdog thread reads that thread from outside, so the frame is
+    whatever it is blocked in (``call_com``, a file replace, Tk). A check
+    that runs on the main thread walks out of this file so the label is
+    the caller rather than this helper.
+    """
+    try:
+        ident = threading.main_thread().ident
+        frame = sys._current_frames().get(ident) if ident is not None else None
+    except Exception:
+        return "unknown"
+    if frame is None:
+        return "unknown"
+    if threading.current_thread() is threading.main_thread():
+        here = os.path.abspath(__file__)
+        while frame is not None and os.path.abspath(frame.f_code.co_filename) == here:
+            frame = frame.f_back
+        if frame is None:
+            return "unknown"
+    code = frame.f_code
+    return (
+        f"{code.co_name} "
+        f"({os.path.basename(code.co_filename)}:{frame.f_lineno})"
+    )
 
 
 # Process-wide install used by the Tk app. Tests may bind their own pair.
