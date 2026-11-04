@@ -444,12 +444,9 @@ def test_poller_connect_success_without_followup_event():
         seconds=getattr(reply_poller, "POLL_CONNECT_TIMEOUT_S", 90.0))
     fake.set_now(timed)
     poller.observe(0, timed)
-    # The timeout tick releases the in-flight call and does not send
-    # another on the same tick, and does not degrade yet.
     assert fake.calls.count("ConnectByID") == 1
-    assert machine.degraded is False
-    assert machine._reply_awaiting_complete is False
-    assert STILL_DOWN_ALERT not in alerts
+    assert machine.degraded is True
+    assert STILL_DOWN_ALERT in alerts
     assert "SimulatedAV" not in " ".join(alerts)
 
 
@@ -703,12 +700,7 @@ def test_unknown_return_code_lookup_is_stamped(tmp_path, monkeypatch):
     assert text.startswith("151")
 
 
-def test_poll_connect_timeout_releases_without_a_second_call_or_ready():
-    """90s with no ready reading releases the one in-flight call.
-
-    It does not send another ConnectByID on that tick and does not
-    degrade. There is still no poll of 1.
-    """
+def test_poll_connect_timeout_degrades_without_a_later_ready():
     from datetime import timedelta
 
     alerts: list[str] = []
@@ -723,71 +715,13 @@ def test_poll_connect_timeout_releases_without_a_second_call_or_ready():
     fake.set_now(connected)
     poller.observe(0, connected)
     assert fake.calls.count("ConnectByID") == 1
-    assert machine._reply_awaiting_complete is True
     timed = connected + timedelta(seconds=getattr(reply_poller, "POLL_CONNECT_TIMEOUT_S", 90.0))
     fake.set_now(timed)
     poller.observe(0, timed)
     assert fake.calls.count("ConnectByID") == 1
-    assert machine._reply_awaiting_complete is False
-    assert machine.degraded is False
-    assert STILL_DOWN_ALERT not in alerts
+    assert machine.degraded is True
+    assert STILL_DOWN_ALERT in alerts
     assert machine.reply != LinkPhase.READY
-
-
-def test_nonzero_or_raised_connect_releases_inflight_immediately():
-    """A failed ConnectByID does not stay in flight for 90s."""
-    from datetime import timedelta
-
-    from src.live.reply_link_poller import ReplyLinkPoller
-
-    def _run(connect):
-        machine = LinkStateMachine(
-            connect, LinkMachineConfig(user_id="U", reply_settle_s=10))
-        # The port is the connect callable's machine via a tiny port.
-        port_calls = []
-
-        class _Port:
-            def connect_reply(self, user_id):
-                port_calls.append(user_id)
-                return connect(user_id)
-
-        machine.port = _Port()
-        machine.adopt_after_process_login(_T0)
-        machine.quote = LinkPhase.READY
-        machine._reply_awaiting_complete = False
-        machine._reply_connect_started_at = None
-        machine.reply = LinkPhase.READY
-        poller = ReplyLinkPoller(
-            lambda: machine,
-            read=lambda: 0,
-            connect=lambda user: machine.port.connect_reply(user),
-            notify=lambda _msg: None,
-            log_error=lambda _msg: None,
-            log_info=lambda _msg: None,
-            reschedule_silent=lambda: None,
-        )
-        poller.note_login(_T0)
-        down = _T0 + timedelta(minutes=1)
-        poller.observe(0, down)
-        poller.observe(0, down + timedelta(seconds=5))
-        poller.observe(0, down + timedelta(seconds=15))
-        return machine, port_calls, poller
-
-    machine, calls, _poller = _run(lambda _user: 5)
-    assert calls == ["U"]
-    assert machine._reply_awaiting_complete is False
-
-    raised = []
-
-    def boom(_user):
-        raised.append(1)
-        raise RuntimeError("connect blew")
-
-    machine2, calls2, _poller2 = _run(boom)
-    assert calls2 == ["U"]
-    assert raised == [1]
-    assert machine2._reply_awaiting_complete is False
-    assert machine2.degraded is False
 
 
 def test_account_hold_released_by_poll_of_1_and_by_on_complete(monkeypatch):

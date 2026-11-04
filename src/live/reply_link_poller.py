@@ -12,9 +12,7 @@ span the reply settle, and only when the link machine permits it. A
 reading of 2 means SKCOM is reconnecting itself and breaks that run.
 ``1`` marks the reply READY on the poll path and lifts that pause. It
 never logs out. A connect stays in flight until OnComplete, a poll of
-1, a non-zero return, a raised call, or ``POLL_CONNECT_TIMEOUT_S``.
-After that timeout another gated call is allowed, up to
-``REPLY_CONNECT_ATTEMPT_CAP``. Only then does the poller degrade.
+1, or ``POLL_CONNECT_TIMEOUT_S``.
 
 Poll READY and a reply event are different facts. ``IsConnectedByID==1``
 does not mean OnConnect, OnComplete, or OnNewData arrived. The silent
@@ -60,16 +58,6 @@ STILL_DOWN_ALERT = (
     f"{REPLY_CONNECT_ATTEMPT_CAP} ConnectByID attempts; "
     "entries paused; retry stopped"
 )
-
-
-def _connect_code_ok(code) -> bool:
-    """True only for a numeric 0. None and any other code release the call."""
-    if code is None or isinstance(code, bool):
-        return False
-    try:
-        return int(code) == 0
-    except (TypeError, ValueError):
-        return False
 
 
 def backoff_delay_s(step: int) -> int:
@@ -427,12 +415,7 @@ class ReplyLinkPoller:
         started = self._inflight_started(machine)
         if started is not None:
             if (now - started).total_seconds() >= POLL_CONNECT_TIMEOUT_S:
-                # One call is still the rule. The 90s mark releases it
-                # so a later backoff tick may send the next gated call.
-                # The tenth unanswered call degrades.
-                self._release_inflight(machine)
-                if self._attempts >= REPLY_CONNECT_ATTEMPT_CAP:
-                    self._give_up(machine, now)
+                self._give_up(machine, now)
             return
         if not self._zeros_ready(self._settle_s(machine)):
             return
@@ -440,21 +423,17 @@ class ReplyLinkPoller:
         if callable(ask) and not ask(now):
             return
         self._attempts += 1
-        accepted = False
         try:
-            code = self._connect(user_id)
+            self._connect(user_id)
             self._connects += 1
-            accepted = _connect_code_ok(code)
         except Exception as exc:
             self._safe_error(
                 "[CONN] ConnectByID raised: "
                 f"[{type(exc).__name__}] {exc}")
-            self._release_inflight(machine)
-        else:
-            if not accepted:
-                self._release_inflight(machine)
-        if self._attempts >= REPLY_CONNECT_ATTEMPT_CAP and not accepted:
-            self._give_up(machine, now)
+        if self._attempts >= REPLY_CONNECT_ATTEMPT_CAP:
+            self._capped = True
+            self._next_connect_at = None
+            self._notify_ceiling()
 
     def _clear_zero_run(self) -> None:
         self._zero_at = []
@@ -489,19 +468,8 @@ class ReplyLinkPoller:
             return None
         return getattr(machine, "_reply_connect_started_at", None)
 
-    def _release_inflight(self, machine) -> None:
-        fn = getattr(machine, "release_poll_connect", None)
-        if not callable(fn):
-            return
-        try:
-            fn()
-        except Exception as exc:
-            self._safe_error(
-                "[CONN] reply connect release failed: "
-                f"[{type(exc).__name__}] {exc}")
-
     def _give_up(self, machine, now: datetime) -> None:
-        """Cap reached. Degrade, alert once, do not connect again."""
+        """Timeout with no release. Degrade, alert once, do not connect again."""
         self._capped = True
         self._next_connect_at = None
         try:
