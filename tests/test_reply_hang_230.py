@@ -633,6 +633,125 @@ def test_connect_by_id_call_sites_are_login_and_the_machine_port():
     )
 
 
+def test_quote_connecting_refuses_poller_connect():
+    from datetime import timedelta
+
+    fake, machine, poller = _poll_world([])
+    fake.set_now(_T0)
+    poller.observe(1, _T0)
+    machine.quote = LinkPhase.CONNECTING
+    down = _T0 + timedelta(minutes=1)
+    fake.set_now(down)
+    poller.observe(0, down)
+    poller.observe(0, down + timedelta(seconds=5))
+    poller.observe(0, down + timedelta(seconds=15))
+    assert fake.calls.count("ConnectByID") == 0
+
+
+def test_unknown_return_code_lookup_is_stamped(tmp_path, monkeypatch):
+    writer = hb.HeartbeatWriter(str(tmp_path))
+    hb._writer = writer
+    seen = {}
+
+    def lookup(code):
+        payload = json.loads((tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+        seen["name"] = (payload.get("inflight_com_call") or {}).get("name")
+        return "vendor text"
+
+    class _Center:
+        def SKCenterLib_GetReturnCodeMessage(self, code):
+            return lookup(code)
+
+    monkeypatch.setattr(rb, "skC", _Center())
+    try:
+        text = rb._return_code_text(151)
+    finally:
+        hb._writer = None
+    assert seen["name"] == "GetReturnCodeMessage"
+    assert text.startswith("151")
+
+
+def test_poll_connect_timeout_degrades_without_a_later_ready():
+    from datetime import timedelta
+
+    alerts: list[str] = []
+    fake, machine, poller = _poll_world(alerts)
+    fake.set_now(_T0)
+    poller.observe(1, _T0)
+    down = _T0 + timedelta(seconds=1)
+    fake.set_now(down)
+    poller.observe(0, down)
+    poller.observe(0, down + timedelta(seconds=5))
+    connected = down + timedelta(seconds=15)
+    fake.set_now(connected)
+    poller.observe(0, connected)
+    assert fake.calls.count("ConnectByID") == 1
+    timed = connected + timedelta(seconds=getattr(reply_poller, "POLL_CONNECT_TIMEOUT_S", 90.0))
+    fake.set_now(timed)
+    poller.observe(0, timed)
+    assert fake.calls.count("ConnectByID") == 1
+    assert machine.degraded is True
+    assert STILL_DOWN_ALERT in alerts
+    assert machine.reply != LinkPhase.READY
+
+
+def test_account_hold_released_by_poll_of_1_and_by_on_complete(monkeypatch):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    def _app_for(poller, machine):
+        app = rb.BacktestApp.__new__(rb.BacktestApp)
+        app._reply_poller = poller
+        app._link_host = SimpleNamespace(machine=machine)
+        app._logged_in = True
+        app._futures_account = "ACCT"
+        app.login_user_var = SimpleNamespace(get=lambda: "U")
+        app._account_monitor = SimpleNamespace(begin_oi_query=lambda: None)
+        return app
+
+    queries: list[str] = []
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(
+        GetOpenInterestGW=lambda *a: 0,
+        GetFutureRights=lambda *a: 0,
+    ))
+    monkeypatch.setattr(
+        rb, "call_com",
+        lambda name, fn, *args, **kwargs: queries.append(name) or 0)
+
+    fake, machine, poller = _poll_world([])
+    down = _T0 + timedelta(seconds=20)
+    fake.set_now(down)
+    poller.observe(0, down)
+    app = _app_for(poller, machine)
+    assert app._account_query_blocked() is True
+    app._query_real_account()
+    assert queries == []
+    poller.observe(1, down + timedelta(seconds=5))
+    assert app._account_query_blocked() is False
+    app._query_real_account()
+    assert queries == ["GetOpenInterestGW", "GetFutureRights"]
+
+    queries.clear()
+    fake2, machine2, poller2 = _poll_world([])
+    down2 = _T0 + timedelta(seconds=20)
+    fake2.set_now(down2)
+    poller2.observe(0, down2)
+    app2 = _app_for(poller2, machine2)
+    assert app2._account_query_blocked() is True
+    app2._query_real_account()
+    assert queries == []
+    done = down2 + timedelta(seconds=30)
+    fake2.set_now(done)
+    fake2.note_on_complete()
+    machine2.on_complete(done)
+    poller2.note_reply_event("OnComplete")
+    machine2.tick(done)
+    assert app2._account_query_blocked() is False
+    app2._query_real_account()
+    assert queries == ["GetOpenInterestGW", "GetFutureRights"]
+
+
 def test_entry_gate_waits_for_equity_refresh_after_release(monkeypatch):
     """Release, then refresh equity, then the entry gate may pass."""
     from types import SimpleNamespace
