@@ -108,7 +108,8 @@ def test_stall_then_advance_sends_one_hung_and_one_recovered(
         writer.write()
         watchdog._check_once(130.0)
     assert len(_recovered(alerts)) == 1
-    assert "after 130 s" in _recovered(alerts)[0]
+    assert _recovered(alerts)[0].startswith(
+        "[HANG] TXF_One RECOVERED after 130 s")
     assert "reason=heartbeat" in _recovered(alerts)[0]
     assert "top frame=" in _recovered(alerts)[0]
     assert "test_stall_then_advance_sends_one_hung_and_one_recovered" in (
@@ -134,8 +135,14 @@ def test_stall_then_advance_sends_one_hung_and_one_recovered(
     assert _stall_rollups(alerts) == []
 
 
-def test_recovered_names_the_blocked_main_frame(tmp_path):
-    """The watchdog thread reads the main thread's frame while it is stuck."""
+def test_recovered_names_the_blocked_main_frame(tmp_path, monkeypatch):
+    """The RECOVERED line names the bot and the injected main-thread frame.
+
+    No watchdog thread. A live thread plus ``disable()`` that did not join
+    raced later tests that patch ``os.replace``.
+    """
+    clock = {"t": 1_700_000_000.0}
+    monkeypatch.setattr(hb.time, "time", lambda: clock["t"])
     alerts: list[str] = []
     root = tmp_path / "live"
     bot = root / "TXF_Blocked"
@@ -143,41 +150,22 @@ def test_recovered_names_the_blocked_main_frame(tmp_path):
     writer = HeartbeatWriter(str(bot))
     writer.write()
     watchdog = HangWatchdog(
-        str(bot), hung_s=0.25, poll_s=0.05, alert_fn=alerts.append)
-    watchdog.start()
-    release = [False]
-    entered = threading.Event()
-
-    def blocked_on_purpose():
-        entered.set()
-        while not release[0]:
-            pass
-
-    def waiter():
-        if not entered.wait(timeout=2):
-            release[0] = True
-            return
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and not _p1(alerts):
-            time.sleep(0.02)
-        release[0] = True
-
-    threading.Thread(target=waiter, name="hang-release", daemon=True).start()
-    try:
-        blocked_on_purpose()
-        writer.write()
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and not _recovered(alerts):
-            time.sleep(0.02)
-    finally:
-        release[0] = True
-        watchdog.disable()
+        str(bot), hung_s=90.0, alert_fn=alerts.append,
+        top_frame_fn=lambda: "blocked_on_purpose (live.py:10)")
+    watchdog._check_once(0.0)
+    watchdog._check_once(100.0)
+    clock["t"] = 1_700_000_140.0
+    writer.write()
+    watchdog._check_once(140.0)
     assert len(_p1(alerts)) == 1
-    assert len(_recovered(alerts)) == 1
-    assert "blocked_on_purpose" in _recovered(alerts)[0]
+    assert _recovered(alerts) == [
+        "[HANG] TXF_Blocked RECOVERED after 140 s "
+        "(reason=heartbeat, top frame=blocked_on_purpose (live.py:10))"
+    ]
+    assert watchdog._thread is None
     hang = json.loads((bot / "hang.json").read_text(encoding="utf-8"))
-    assert hang["stall_s"] > 0.25
-    assert isinstance(hang["recovered_at"], float)
+    assert hang["stall_s"] == 140.0
+    assert hang["recovered_at"] == 1_700_000_140.0
 
 
 def test_two_bots_do_not_roll_up_three_do_and_real_p1_is_kept(
@@ -223,9 +211,12 @@ def test_two_bots_do_not_roll_up_three_do_and_real_p1_is_kept(
     assert len(_p1(paper2)) == 1
     rollups = _stall_rollups(real + paper1 + paper2)
     assert len(rollups) == 1
+    p1_at = next(i for i, item in enumerate(paper2) if "P1 HUNG" in item)
+    roll_at = next(i for i, item in enumerate(paper2) if "bots stalled" in item)
+    assert p1_at < roll_at
     assert rollups[0] == (
         "[HANG] host stall: 3 bots stalled within 90 s; "
-        "per-bot alerts follow"
+        "per-bot alerts were sent"
     )
     marker = json.loads((fleet / "host_stall.json").read_text(encoding="utf-8"))
     assert marker["v"] == 1
@@ -262,7 +253,7 @@ def test_hangs_outside_120s_do_not_roll_up(tmp_path, monkeypatch):
     _boot(edge, "TXF_C", "paper", clock, 1_120.0, edge_lists[2])
     rollups = _stall_rollups(edge_lists[0] + edge_lists[1] + edge_lists[2])
     assert rollups == [
-        "[HANG] host stall: 3 bots stalled within 120 s; per-bot alerts follow"
+        "[HANG] host stall: 3 bots stalled within 120 s; per-bot alerts were sent"
     ]
 
 
@@ -304,7 +295,7 @@ def test_stale_and_corrupt_markers_do_not_break_the_rollup(tmp_path, monkeypatch
     _boot(root, "TXF_C", "REAL", clock, now + 2, lists[2])
     rollups = _stall_rollups(lists[0] + lists[1] + lists[2])
     assert rollups == [
-        "[HANG] host stall: 3 bots stalled within 2 s; per-bot alerts follow"
+        "[HANG] host stall: 3 bots stalled within 2 s; per-bot alerts were sent"
     ]
     assert len(_p1(lists[2])) == 1
     episodes = host_stall.read_episodes(str(root), now=now + 2)
@@ -351,10 +342,133 @@ def test_concurrent_writers_keep_every_bot_and_one_rollup(tmp_path):
     assert episodes["TXF_B0"]["real"] is True
     stalls = _stall_rollups(alerts)
     assert len(stalls) == 1
-    assert "per-bot alerts follow" in stalls[0]
+    assert "per-bot alerts were sent" in stalls[0]
     marker = json.loads((root / "host_stall.json").read_text(encoding="utf-8"))
     assert marker["v"] == 1
     assert isinstance(marker["episodes"], dict)
+
+
+def test_recovery_rollup_waits_for_every_bot_in_the_window(tmp_path, monkeypatch):
+    """Bots at 0/1/2/3 s. Recovering the first three must not say 3/3."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(hb.time, "time", lambda: clock["t"])
+    root = tmp_path / "live"
+    bots = []
+    for i, name in enumerate(("TXF_A", "TXF_B", "TXF_C", "TXF_D")):
+        alerts: list[str] = []
+        wd, writer = _boot(root, name, "paper", clock, float(i), alerts)
+        bots.append((wd, writer, alerts))
+    early = [item for _wd, _writer, alerts in bots[:3] for item in alerts]
+    assert len(_stall_rollups(early)) == 1
+    for i in range(3):
+        wd, writer, _alerts = bots[i]
+        _recover(writer, wd, clock, 50.0 + i, 150.0 + i)
+    mid = [item for _wd, _writer, alerts in bots for item in alerts]
+    assert _recovery_rollups(mid) == []
+    wd, writer, _alerts = bots[3]
+    _recover(writer, wd, clock, 60.0, 180.0)
+    done = [item for _wd, _writer, alerts in bots for item in alerts]
+    assert _recovery_rollups(done) == [
+        "[HANG] host stall: 4/4 recovered, max stall 180 s"
+    ]
+
+
+def test_unrecovered_claim_outside_the_window_does_not_block(tmp_path):
+    """A claim whose bot never recovers must not suppress the next window."""
+    root = tmp_path / "live"
+    root.mkdir()
+    old: list[str] = []
+    base = 10_000.0
+    for i, name in enumerate(("TXF_OldA", "TXF_OldB", "TXF_OldC")):
+        bot = root / name
+        bot.mkdir()
+        host_stall.record_hung(
+            str(bot), reason="heartbeat", real=False,
+            now=base - 500.0 + i, pid=10 + i, alert_fn=old.append)
+    assert len(_stall_rollups(old)) == 1
+    # Still inside 120 s of that claim: a second trio is the same incident.
+    same: list[str] = []
+    for i, name in enumerate(("TXF_SameA", "TXF_SameB", "TXF_SameC")):
+        bot = root / name
+        bot.mkdir()
+        host_stall.record_hung(
+            str(bot), reason="heartbeat", real=False,
+            now=base - 400.0 + i, pid=20 + i, alert_fn=same.append)
+    assert _stall_rollups(same) == []
+    fresh: list[str] = []
+    for i, name in enumerate(("TXF_NewA", "TXF_NewB", "TXF_NewC")):
+        bot = root / name
+        bot.mkdir()
+        host_stall.record_hung(
+            str(bot), reason="heartbeat", real=True if i == 0 else False,
+            now=base + i, pid=30 + i, alert_fn=fresh.append)
+    assert len(_stall_rollups(fresh)) == 1
+    assert "per-bot alerts were sent" in _stall_rollups(fresh)[0]
+    assert os.path.isfile(root / "host_stall.claim")
+
+
+def test_two_writers_replace_a_stale_claim_once(tmp_path):
+    """Losing the retire race must not unlink the winner's new claim."""
+    root = tmp_path / "live"
+    root.mkdir()
+    (root / "host_stall.claim").write_text(json.dumps({
+        "bots": ["TXF_Gone"],
+        "hung_at": {"TXF_Gone": 1.0},
+        "span_s": 0.0,
+        "sent_at": 1.0,
+    }), encoding="utf-8")
+    alerts: list[str] = []
+    lock = threading.Lock()
+
+    def alert(message: str) -> None:
+        with lock:
+            alerts.append(message)
+
+    barrier = threading.Barrier(8)
+
+    def work(i: int) -> None:
+        bot = root / f"TXF_R{i}"
+        bot.mkdir()
+        barrier.wait()
+        host_stall.record_hung(
+            str(bot), reason="heartbeat", real=False,
+            now=20_000.0 + i, pid=100 + i, alert_fn=alert)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(_stall_rollups(alerts)) == 1
+    claim = json.loads((root / "host_stall.claim").read_text(encoding="utf-8"))
+    assert "TXF_Gone" not in claim["bots"]
+    assert len(claim["bots"]) >= 3
+
+
+def test_holiday_failure_is_retried_on_the_next_call(monkeypatch, caplog):
+    import src.market_data.holidays as hol
+
+    hol._tw_holiday_cache.clear()
+    hol._tw_holidays_broken = False
+    calls = {"n": 0}
+
+    def boom(*_a, **_k):
+        calls["n"] += 1
+        raise RuntimeError("TW calendar down")
+
+    monkeypatch.setattr(hol._holidays, "country_holidays", boom)
+    missing = Path("/tmp/tai-robot-no-closures-233-retry")
+    monkeypatch.setattr(hol, "closures_override_path", lambda: missing)
+    hol._closures_cache = None
+    hol._closures_checked_mono = None
+    with caplog.at_level(logging.WARNING, logger="src.market_data.holidays"):
+        assert hol.is_taifex_holiday(date(2026, 4, 15)) is False
+        assert hol.is_taifex_holiday(date(2026, 4, 16)) is False
+    assert calls["n"] == 2
+    warnings = [r for r in caplog.records if "weekend-only" in r.getMessage()]
+    assert len(warnings) == 1
+    hol._tw_holiday_cache.clear()
+    hol._tw_holidays_broken = False
 
 
 def test_holiday_answers_unchanged_and_built_once_per_year(monkeypatch):

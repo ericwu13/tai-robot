@@ -22,9 +22,11 @@ Marker layout, all under the deploy root:
 
 A missing file is an empty marker. JSON that does not parse, or an
 episode without a numeric ``hung_at``, is ignored and logged once.
-Episodes older than ``HOST_STALL_STALE_S`` do not count. A claim older
-than that, or a claim that does not parse, is dropped so a later
-incident can alert. No settings key.
+Episodes older than ``HOST_STALL_STALE_S`` do not count. A claim whose
+bots are outside the current 120 s window (recovered, crashed, or
+older) is renamed aside so the next incident can alert. The rename is
+the only removal: a process that loses the race does not unlink the
+winner's new claim. No settings key.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -118,15 +121,6 @@ def _read_json(path: str) -> dict | None:
         _warn_corrupt(path)
         return None
     return data
-
-
-def _unlink(path: str) -> None:
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        return
-    except OSError:
-        logger.exception("host stall marker remove failed for %s", path)
 
 
 def _number(value) -> float | None:
@@ -259,7 +253,7 @@ def _stall_message(cluster: list[dict]) -> str:
     span = max(ep["hung_at"] for ep in cluster) - min(ep["hung_at"] for ep in cluster)
     return (
         f"[HANG] host stall: {len(cluster)} bots stalled within {span:.0f} s; "
-        f"per-bot alerts follow"
+        f"per-bot alerts were sent"
     )
 
 
@@ -295,42 +289,116 @@ def _write_mirror(root: str, episodes: dict[str, dict]) -> None:
         logger.exception("host stall marker write failed")
 
 
-def _drop_claim(root: str) -> None:
-    _unlink(_claim_path(root))
-    _unlink(_recovery_path(root))
+def _claim_bots(claim) -> set[str]:
+    bots = claim.get("bots") if isinstance(claim, dict) else None
+    if not isinstance(bots, list):
+        return set()
+    return {str(bot) for bot in bots}
 
 
-def _prepare_claim(root: str, now: float, cluster: list[dict]) -> None:
-    """Drop a claim that belongs to a finished or unreadable incident."""
+def _covers(claim, cluster: list[dict]) -> bool:
+    """True when ``claim`` already announced this window.
+
+    Bots outside the window (recovered, crashed, or older than 120 s)
+    do not keep their claim. That used to block the next rollup for up
+    to ``HOST_STALL_STALE_S``.
+    """
+    names = _claim_bots(claim)
+    if not names:
+        return False
+    return bool(names & {ep["bot"] for ep in cluster})
+
+
+def _read_bytes(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.exception("host stall claim read failed")
+        return None
+
+
+def _restore_claim(dest: str, path: str) -> None:
+    """Put ``dest`` back on the claim name if we renamed the wrong file."""
+    try:
+        os.link(dest, path)
+        return
+    except FileExistsError:
+        return
+    except OSError:
+        pass
+    try:
+        os.rename(dest, path)
+    except OSError:
+        logger.exception("host stall claim restore failed")
+
+
+def _retire_if_bytes(root: str, expected: bytes) -> str:
+    """Rename the claim aside only when it is still ``expected``.
+
+    A rename that moves a newer claim (the other writer's) is undone.
+    Returns ``retired``, ``absent``, ``changed``, ``lost``, or ``error``.
+    """
     path = _claim_path(root)
-    if not os.path.exists(path):
-        return
-    claim = _read_json(path)
-    if claim is None:
-        _drop_claim(root)
-        return
-    sent_at = _number(claim.get("sent_at"))
-    if sent_at is None or now - sent_at > HOST_STALL_STALE_S:
-        _drop_claim(root)
-        return
-    if not os.path.exists(_recovery_path(root)):
-        return
-    hung = claim.get("hung_at")
-    if not isinstance(hung, dict) or not cluster:
-        return
-    times = [n for n in (_number(v) for v in hung.values()) if n is not None]
-    if not times:
-        _drop_claim(root)
-        return
-    earliest = min(ep["hung_at"] for ep in cluster)
-    if earliest > max(times):
-        _drop_claim(root)
+    current = _read_bytes(path)
+    if current is None:
+        return "absent" if not os.path.lexists(path) else "error"
+    if current != expected:
+        return "changed"
+    dest = f"{path}.retired-{time.time_ns()}"
+    try:
+        os.rename(path, dest)
+    except FileNotFoundError:
+        return "lost"
+    except OSError:
+        logger.exception("host stall claim retire failed")
+        return "error"
+    moved = _read_bytes(dest)
+    if moved != expected:
+        _restore_claim(dest, path)
+        return "changed"
+    recovery = _recovery_path(root)
+    if os.path.lexists(recovery):
+        try:
+            os.rename(recovery, f"{recovery}.retired-{time.time_ns()}")
+        except OSError:
+            pass
+    return "retired"
+
+
+def _release_stale_claim(root: str, cluster: list[dict]) -> bool:
+    """True when this caller may try to create the stall claim.
+
+    ``False`` means a claim for this window is already in place, or this
+    caller moved the wrong file and put it back. It must not unlink.
+    """
+    path = _claim_path(root)
+    blob = _read_bytes(path)
+    if blob is None:
+        return not os.path.lexists(path)
+    try:
+        claim = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        claim = None
+    if _covers(claim, cluster):
+        return False
+    status = _retire_if_bytes(root, blob)
+    if status in ("retired", "absent"):
+        return True
+    if status == "lost":
+        # The other writer retired the same bytes. Link dedupes the create
+        # if they have not published the replacement yet.
+        return not os.path.lexists(path)
+    return False
 
 
 def _maybe_send_stall(root: str, episodes: dict[str, dict], now: float, alert_fn) -> None:
     cluster = _cluster(episodes)
-    _prepare_claim(root, now, cluster)
     if len(cluster) < HOST_STALL_MIN_BOTS:
+        return
+    if not _release_stale_claim(root, cluster):
         return
     if os.path.exists(_claim_path(root)):
         return
@@ -358,29 +426,23 @@ def _maybe_send_recovery(root: str, episodes: dict[str, dict], alert_fn) -> None
         return
     if os.path.exists(_recovery_path(root)):
         return
+    # Every bot still inside the stall window, including one that hung
+    # after the claim was written. "3/3" while a fourth is HUNG is wrong.
+    cluster = _cluster(episodes)
+    if len(cluster) < HOST_STALL_MIN_BOTS:
+        return
     claim = _read_json(claim_path)
-    if claim is None:
+    if not _covers(claim, cluster):
         return
-    bots = claim.get("bots")
-    if not isinstance(bots, list) or not bots:
+    if any(ep.get("recovered_at") is None for ep in cluster):
         return
-    names = [str(bot) for bot in bots]
-    stalls: list[float] = []
-    for name in names:
-        episode = episodes.get(name)
-        if episode is None or episode.get("recovered_at") is None:
-            return
-        stall = episode.get("stall_s")
-        if stall is not None:
-            stalls.append(float(stall))
+    names = [ep["bot"] for ep in cluster]
+    stalls = [float(ep["stall_s"]) for ep in cluster if ep.get("stall_s") is not None]
     max_stall = max(stalls) if stalls else 0.0
     payload = {
         "bots": names,
         "max_stall_s": max_stall,
-        "sent_at": max(
-            (episodes[name]["recovered_at"] for name in names),
-            default=0.0,
-        ),
+        "sent_at": max(float(ep["recovered_at"]) for ep in cluster),
     }
     try:
         won = _claim(_recovery_path(root), payload)

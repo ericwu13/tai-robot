@@ -136,6 +136,9 @@ def test_blocking_leave_monitor_detected_once_without_exit(tmp_path):
 
         hb.call_com("LeaveMonitor", fake_leave_monitor)
     finally:
+        # The hang itself must not stop the watchdog. disable() then joins it.
+        still_running = (
+            watchdog._thread is not None and watchdog._thread.is_alive())
         hb._writer = None
         watchdog.disable()
 
@@ -150,7 +153,8 @@ def test_blocking_leave_monitor_detected_once_without_exit(tmp_path):
     assert "P1" in alerts[0]
     assert "LeaveMonitor" in alerts[0]
     assert os.getpid() == pid
-    assert watchdog._thread is not None and watchdog._thread.is_alive()
+    assert still_running
+    assert watchdog._thread is not None and not watchdog._thread.is_alive()
 
 
 def test_watchdog_rearms_only_after_recovery(tmp_path):

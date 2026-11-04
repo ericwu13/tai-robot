@@ -45,9 +45,11 @@ _closures_cache: tuple[str, int | None, frozenset[date]] | None = None
 _closures_checked_mono: float | None = None
 _logged_closure_dates: set[date] = set()
 
-# (year, id(country_holidays)) -> dates. Keying on the function keeps a
-# monkeypatched lookup from receiving a cached real year, and the reverse.
-_tw_holiday_cache: dict[tuple[int, int], frozenset[date]] = {}
+# year -> (the country_holidays callable that built the set, dates).
+# The cache holds the callable, so a collected monkeypatch cannot reuse
+# an id and still match: a different object misses. Failures are not
+# stored; the next call tries the package again.
+_tw_holiday_cache: dict[int, tuple[object, frozenset[date]]] = {}
 
 # Manual overrides — only add dates that disagree with the `holidays` package.
 # Keep small; they should be rare exceptions.
@@ -72,21 +74,20 @@ def _monotonic() -> float:
 def _tw_public_holidays(year: int) -> frozenset[date]:
     """Return TW public holidays for ``year`` as a set of dates.
 
-    The set is built once per year for the life of the process. Falls
-    back to an empty set (weekends-only detection) if the ``holidays``
-    package cannot resolve the TW country module — this happens in
-    poorly-bundled frozen EXEs where ``holidays.countries.taiwan``
-    wasn't collected (issue #58). A single warning is logged so the
-    operator sees the degradation. The empty fallback is memoized too,
-    so a broken package is not rebuilt on every status poll.
+    A successful set is kept for the year. Falls back to an empty set
+    (weekends-only detection) if the ``holidays`` package cannot resolve
+    the TW country module — this happens in poorly-bundled frozen EXEs
+    where ``holidays.countries.taiwan`` wasn't collected (issue #58).
+    A single warning is logged so the operator sees the degradation.
+    That empty fallback is not cached: the next call tries the package
+    again, so a transient failure does not stick for the process.
     """
     global _tw_holidays_broken
     year = int(year)
     fn = _holidays.country_holidays
-    key = (year, id(fn))
-    cached = _tw_holiday_cache.get(key)
-    if cached is not None:
-        return cached
+    cached = _tw_holiday_cache.get(year)
+    if cached is not None and cached[0] is fn:
+        return cached[1]
     try:
         days = frozenset(fn("TW", years=year))
     except Exception as e:
@@ -97,8 +98,8 @@ def _tw_public_holidays(year: int) -> frozenset[date]:
                 "weekend-only check. Settlement days that coincide with "
                 "public holidays may be mis-dated. Cause: %s", e,
             )
-        days = frozenset()
-    _tw_holiday_cache[key] = days
+        return frozenset()
+    _tw_holiday_cache[year] = (fn, days)
     return days
 
 

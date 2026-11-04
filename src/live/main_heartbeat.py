@@ -9,11 +9,13 @@ PID check still says ALIVE. This module:
 - runs a daemon watchdog that dumps stacks, writes ``hang.json``, and
   sends a Discord P1 when the main thread is hung
 
-The watchdog never exits, kills, or restarts the process. It repeats the
-P1 every 10 minutes while the hang lasts. When the heartbeat advances
-again, the latch clears and one ``[HANG] RECOVERED`` alert is sent
-(issue #233). A host stall that hangs three or more bots inside 120 s
-also sends one additive rollup; that rollup never replaces a bot's P1.
+The watchdog does not kill or restart the process. It repeats the
+P1 every 10 minutes while the hang lasts. ``disable`` asks the thread
+to return and joins it, so a poll cannot outlive ``stop``. When the
+heartbeat advances again, the latch clears and one
+``[HANG] <bot> RECOVERED`` alert is sent (issue #233). A host stall
+that hangs three or more bots inside 120 s also sends one additive
+rollup; that rollup never replaces a bot's P1.
 """
 
 from __future__ import annotations
@@ -52,8 +54,10 @@ _HANG_STACKS_ARCHIVE = re.compile(
 HEARTBEAT_INTERVAL_MS = 5000
 
 # Park an idle watchdog for this long so a finished test does not spin.
-# The thread stays alive — it does not exit.
 _IDLE_PARK_S = 3600.0
+# disable() waits this long for the thread to leave its poll and return.
+# A poll is file IO, not a broker call, so this is a shutdown bound.
+_DISABLE_JOIN_S = 2.0
 
 # os.replace on Windows raises PermissionError (WinError 5 / sharing
 # violation) while a reader holds the destination without FILE_SHARE_DELETE.
@@ -492,7 +496,8 @@ class HangWatchdog:
     def __init__(self, bot_dir: str, *, hung_s: float = DEFAULT_HUNG_S,
                  inflight_hung_s: float = DEFAULT_INFLIGHT_HUNG_S,
                  poll_s: float = DEFAULT_POLL_S, alert_fn=None,
-                 realert_s: float = DEFAULT_REALERT_S):
+                 realert_s: float = DEFAULT_REALERT_S,
+                 top_frame_fn=None):
         self.bot_dir = bot_dir
         self.hung_s = float(hung_s)
         self.inflight_hung_s = float(inflight_hung_s)
@@ -519,21 +524,38 @@ class HangWatchdog:
         self._episode_origin_mono: float | None = None
         self._episode_reason: str | None = None
         self._episode_top_frame: str = ""
+        # disable() sets this so the thread returns and can be joined.
+        # A poll left running was still inside os.replace after the test
+        # that started it had moved on (issue #233 review).
+        self._stop = False
+        # Tests inject the RECOVERED frame. None reads the main thread.
+        self._top_frame_fn = top_frame_fn
 
     def start(self) -> None:
+        self._stop = False
+        self._enabled = True
         if self._thread is not None and self._thread.is_alive():
-            self._enabled = True
             self._wake.set()
             return
-        self._enabled = True
         self._thread = threading.Thread(
             target=self._loop, name="hang-watchdog", daemon=True)
         self._thread.start()
 
     def disable(self) -> None:
-        """Stop checking, but do not let the thread return."""
+        """Stop checking and wait until the thread has left its poll.
+
+        The join is bounded (``_DISABLE_JOIN_S``). ``start`` / ``configure``
+        spawn a new thread if this one has returned. Joining from the
+        watchdog thread itself would deadlock, so that caller only sets
+        the flag.
+        """
         self._enabled = False
+        self._stop = True
         self._wake.set()
+        thread = self._thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(_DISABLE_JOIN_S)
 
     def configure(self, bot_dir: str, *, hung_s: float | None = None,
                   inflight_hung_s: float | None = None,
@@ -562,18 +584,28 @@ class HangWatchdog:
         self._episode_origin_mono = None
         self._episode_reason = None
         self._episode_top_frame = ""
+        self._stop = False
+        self._enabled = True
         self._wake.set()
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._loop, name="hang-watchdog", daemon=True)
+            self._thread.start()
 
     def _loop(self) -> None:
-        # Intentional infinite loop. A hang must not take the process down,
-        # and stopping the bot must not kill this thread either.
-        while True:
-            enabled = self._enabled and bool(self.bot_dir)
+        # Returns when disable() sets ``_stop``. A hang does not set that
+        # flag, so a hung bot does not take the process down. disable()
+        # joins this thread so the poll cannot outlive the caller.
+        while not self._stop:
+            enabled = (
+                (not self._stop) and self._enabled and bool(self.bot_dir))
             if enabled:
                 try:
                     self._poll()
                 except Exception:
                     logger.exception("hang watchdog check failed")
+            if self._stop:
+                break
             self._wake.wait(self.poll_s if enabled else _IDLE_PARK_S)
             self._wake.clear()
 
@@ -671,7 +703,7 @@ class HangWatchdog:
         self._episode_origin_mono = (
             self._seen_inflight_mono if reason == "inflight_com_call"
             else self._seen_mono)
-        self._episode_top_frame = _main_thread_top_frame()
+        self._episode_top_frame = self._capture_top_frame()
         self._send_hung_alert(hb, reason, age, inflight)
         stacks_path = os.path.join(self.bot_dir, STACKS_FILENAME)
         try:
@@ -714,6 +746,15 @@ class HangWatchdog:
         )
         self._emit_alert(message)
 
+    def _capture_top_frame(self) -> str:
+        fn = self._top_frame_fn
+        if fn is None:
+            return _main_thread_top_frame()
+        try:
+            return str(fn())
+        except Exception:
+            return "unknown"
+
     def _emit_alert(self, message: str) -> None:
         if self.alert_fn is None:
             return
@@ -738,8 +779,9 @@ class HangWatchdog:
         self._episode_reason = None
         self._episode_top_frame = ""
         recovered_at = time.time()
+        bot = os.path.basename(self.bot_dir) or "bot"
         message = (
-            f"[HANG] RECOVERED after {stall_s:.0f} s "
+            f"[HANG] {bot} RECOVERED after {stall_s:.0f} s "
             f"(reason={reason}, top frame={top})"
         )
         logger.warning("%s", message)
