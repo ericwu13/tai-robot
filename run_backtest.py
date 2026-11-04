@@ -1651,6 +1651,11 @@ class BacktestApp:
                         _log(f"帳戶資料 Account: equity={parsed.get('equity')} "
                              f"available={parsed.get('available')} "
                              f"float_pnl={parsed.get('float_pnl')}")
+                        if getattr(self, "_equity_refresh_owed", False):
+                            # Loss-limit update ran inside the display
+                            # refresh. Entries may open only after that.
+                            self._equity_refresh_owed = False
+                            self._apply_link_gate()
                     _log(f"權益數 FutureRights: {_redact_future_rights(data)}")
                 elif kind == "new_data":
                     try:
@@ -2120,7 +2125,23 @@ class BacktestApp:
         guard = getattr(self, "_trading_guard", None)
         if host is None or guard is None:
             return
-        allowed = host.entries_allowed()
+        if self._account_query_blocked():
+            # Rights go stale while the periodic poll is held. Entries
+            # stay shut until a fresh equity read follows the release.
+            self._equity_refresh_owed = True
+            self._equity_refresh_sent = False
+        elif (
+            getattr(self, "_equity_refresh_owed", False)
+            and host.entries_allowed()
+        ):
+            if getattr(self, "_trading_mode", "paper") not in ("semi_auto", "auto"):
+                self._equity_refresh_owed = False
+            else:
+                self._refresh_equity_before_entries()
+        allowed = (
+            host.entries_allowed()
+            and not getattr(self, "_equity_refresh_owed", False)
+        )
         guard.link_entries_blocked = not allowed
         if allowed:
             if getattr(self, "_link_gate_latched", False):
@@ -10844,7 +10865,24 @@ class BacktestApp:
             self._live_log_msg("實單失敗 Order FAILED: no futures account", "exit")
             return False
 
-        # Margin check for new positions (entries)
+        # Margin check for new positions (entries). A reply recovery
+        # owes a fresh equity read before this check can pass: the loss
+        # limit and the margin both use the last rights snapshot.
+        if action_type == "entry" and getattr(self, "_equity_refresh_owed", False):
+            self._refresh_equity_before_entries()
+            if getattr(self, "_equity_refresh_owed", False):
+                self._live_log_msg(
+                    "實單暫停 Entry held until equity refresh", "status")
+                self._log_order_decision(
+                    "REAL_ORDER_BLOCKED", "equity stale after reply recovery")
+                return False
+            if self._trading_guard.paused:
+                msg = (
+                    f"daily loss limit reached "
+                    f"({self._trading_guard.daily_loss_limit:,} NTD)")
+                self._live_log_msg(msg, "exit")
+                self._log_order_decision("REAL_ORDER_BLOCKED", msg)
+                return False
         if action_type == "entry" and self._account_monitor.rights:
             try:
                 available = float(self._account_monitor.rights.get("available", "0"))
@@ -11709,6 +11747,29 @@ class BacktestApp:
             reply == LinkPhase.CONNECTING
             and bool(getattr(machine, "_poller_owns_connect", False))
         )
+
+    def _refresh_equity_before_entries(self) -> None:
+        """One GetFutureRights after the reply hold lifts. No wait.
+
+        The entry gate stays shut until that reply is applied. A second
+        call while the request is already out does not send another.
+        """
+        if getattr(self, "_equity_refresh_sent", False):
+            return
+        if not _com_available or skO is None or not self._logged_in:
+            return
+        if not self._futures_account:
+            return
+        self._equity_refresh_sent = True
+        user_id = self.login_user_var.get().strip()
+        try:
+            call_com(
+                "GetFutureRights", skO.GetFutureRights,
+                user_id, self._futures_account, 1)
+        except Exception as exc:
+            _log(
+                "[CONN] equity refresh failed: "
+                f"[{type(exc).__name__}] {exc}")
 
     def _query_real_account(self):
         """Query real account positions and equity from Capital API."""

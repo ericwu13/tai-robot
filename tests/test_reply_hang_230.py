@@ -633,6 +633,56 @@ def test_connect_by_id_call_sites_are_login_and_the_machine_port():
     )
 
 
+def test_entry_gate_waits_for_equity_refresh_after_release(monkeypatch):
+    """Release, then refresh equity, then the entry gate may pass."""
+    from types import SimpleNamespace
+
+    from src.live.link_host import LinkHost
+    from src.live.trading_guard import TradingGuard
+
+    order: list[str] = []
+    fake, machine, poller = _poll_world([])
+    host = LinkHost(machine)
+    guard = TradingGuard(daily_loss_limit=10000)
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._link_host = host
+    app._trading_guard = guard
+    app._reply_poller = poller
+    app._trading_mode = "auto"
+    app._logged_in = True
+    app._futures_account = "ACCT"
+    app.login_user_var = SimpleNamespace(get=lambda: "U")
+    app._equity_refresh_owed = False
+    app._equity_refresh_sent = False
+    app.set_status = lambda *args, **kwargs: None
+    app._set_conn_dot = lambda *args, **kwargs: None
+
+    def call_com(name, fn, *args, **kwargs):
+        order.append("refresh")
+        assert guard.link_entries_blocked is True
+        app._equity_refresh_owed = False
+        guard.update_pnl(0)
+        return 0
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetFutureRights=lambda *a: 0))
+    monkeypatch.setattr(rb, "call_com", call_com)
+
+    down = _T0 + __import__("datetime").timedelta(seconds=30)
+    poller.observe(0, down)
+    app._apply_link_gate()
+    assert guard.link_entries_blocked is True
+    assert app._equity_refresh_owed is True
+
+    order.append("release")
+    poller.observe(1, down + __import__("datetime").timedelta(seconds=5))
+    app._apply_link_gate()
+    order.append("entry-gate")
+    assert order == ["release", "refresh", "entry-gate"]
+    assert guard.link_entries_blocked is False
+    assert guard.decide("auto", "ENTRY_FILL", "LONG")[0] == guard.SEND_ENTRY
+
+
 def test_exit_fill_during_reply_down_confirms_without_downgrade(monkeypatch):
     """An exit fill still queries the position while the reply link is down."""
     from types import SimpleNamespace
