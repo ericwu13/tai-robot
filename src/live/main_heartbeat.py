@@ -286,6 +286,13 @@ def _snapshot_key(path: str) -> str:
     return os.path.abspath(path)
 
 
+def _loss_number(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _copy_heartbeat(payload: dict) -> dict:
     inflight = payload.get("inflight_com_call")
     copied = {
@@ -297,6 +304,10 @@ def _copy_heartbeat(payload: dict) -> dict:
     link = payload.get("link")
     if isinstance(link, dict):
         copied["link"] = dict(link)
+    # Same loss-guard fields as the file. The link snapshot is untouched.
+    for key in ("loss_paused", "loss_net", "loss_limit"):
+        if key in payload:
+            copied[key] = payload[key]
     return copied
 
 
@@ -344,6 +355,8 @@ class HeartbeatWriter:
         self._inflight: dict | None = None
         # Optional #157 link snapshot. None keeps the historical payload.
         self.link_state: dict | None = None
+        # Loss-guard fields (#234). None omits them (pre-#234 payload).
+        self.loss_state: dict | None = None
         # Set by start() when the first write fails for a reason other
         # than MainThreadHeartbeatError. The writer is still installed.
         self.initial_write_error: BaseException | None = None
@@ -366,6 +379,12 @@ class HeartbeatWriter:
         }
         if self.link_state is not None:
             payload["link"] = self.link_state
+        loss = self.loss_state
+        if isinstance(loss, dict):
+            # Trading-guard pause. Not orders_paused / entries_allowed.
+            payload["loss_paused"] = bool(loss.get("loss_paused"))
+            payload["loss_net"] = _loss_number(loss.get("loss_net"))
+            payload["loss_limit"] = _loss_number(loss.get("loss_limit"))
         atomic_write_json(self.path, payload)
         _publish_snapshot(self.path, payload)
 
@@ -827,6 +846,26 @@ def set_link_state(state: dict | None) -> None:
     if writer is None:
         return
     writer.link_state = None if state is None else dict(state)
+
+
+def set_loss_state(state: dict | None) -> None:
+    """Publish the loss-guard snapshot on the next heartbeat write.
+
+    ``loss_paused``, ``loss_net`` and ``loss_limit`` are top-level keys.
+    They are not link-machine fields. ``None`` leaves them off the file,
+    which is the pre-#234 payload. The watchdog ignores them.
+    """
+    writer = _writer
+    if writer is None:
+        return
+    if state is None:
+        writer.loss_state = None
+        return
+    writer.loss_state = {
+        "loss_paused": bool(state.get("loss_paused")),
+        "loss_net": _loss_number(state.get("loss_net")),
+        "loss_limit": _loss_number(state.get("loss_limit")),
+    }
 
 
 def tick() -> None:
