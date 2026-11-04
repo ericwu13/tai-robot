@@ -1,16 +1,16 @@
 # v2.19.12
 
-> 草稿 / DRAFT — 尚未打 tag 或發布 / not tagged or published. Base: master `fc1943b6` (v2.19.11 `00e67b4d` + #229). #231 待合併 / pending merge.
+> 草稿 / DRAFT — 尚未打 tag 或發布 / not tagged or published. Base: master `d044f186` (v2.19.11 `00e67b4d` + #229 + #231).
 
 ## EXE 變更 EXE changes
 
-- **#231（待合併 / pending merge）**：修正 #230 回報連線中斷後卡住的問題。
+- **#231**（squash `d044f186`）：修正 #230 回報連線中斷後卡住的問題。
   - 依程式順序：回報連線輪詢第一次讀到中斷（0）時，立即暫停新進場；接著在連續 0 讀數涵蓋回報穩定時間後，嘗試一次 `ConnectByID`；若該次呼叫後 90 秒連線仍未恢復，bot 降級、新進場維持暫停，並送出一次警示：`[CONN] reply link still down 90s after one ConnectByID; entries paused; no further automatic reconnect; operator reconnect or restart needed`。之後需由操作人員手動重連或重啟；沒有自動重試。
   - 中斷期間暫停定期帳戶查詢（`GetOpenInterestGW`／`GetFutureRights`），但成交確認的部位查詢照常執行，出場成交仍可確認，不會因 10 秒成交逾時而降級。
   - 連線恢復後，全自動／半自動會先查詢一次帳戶權益（`GetFutureRights`）並套用，之後才允許新進場；虧損上限與保證金檢查使用新數值。
   - 回報連線中斷時，儀表板切換為全自動（實單）的請求會被拒絕，且不查詢券商；bot 維持原模式。
   - 另含：SKCOM 事件參數個數相容、輪詢例外後重新啟用回報閘門、卡住警示註明模式與部位、卡住證據依修改時間封存、時戳寫入失敗與看門狗時間跳躍均記錄。
-  **#231 (pending merge)**: fixes the #230 hang after a reply-link drop.
+  **#231** (squash `d044f186`): fixes the #230 hang after a reply-link drop.
   - In the code's order: entries pause on the first down (0) reply-link poll reading; after consecutive 0 readings that span the reply settle, one `ConnectByID` is tried; if the link is not back 90 s after that call, the bot degrades, keeps entries paused and sends one alert: `[CONN] reply link still down 90s after one ConnectByID; entries paused; no further automatic reconnect; operator reconnect or restart needed`. An operator reconnect or restart is then needed; there are no automatic retries.
   - During the drop the periodic account poll (`GetOpenInterestGW`/`GetFutureRights`) is held, but the fill-confirmation position query still runs, so exit fills confirm and the 10 s fill timeout does not downgrade the bot.
   - After recovery, auto/semi-auto bots read and apply equity (`GetFutureRights`) once before new entries reopen; the loss-limit and margin checks use the fresh value.
@@ -28,7 +28,7 @@
 
 ## 風險 Risks
 
-- **#231 單次重連**：每次中斷只重連一次；90 秒內未恢復即需人工處理，新進場維持暫停（出場仍可成交確認）。 / **#231 single reconnect**: one reconnect per drop; if it is not back within 90 s an operator must act, and new entries stay paused (exits still confirm).
+- **#231 單次重連**：每次中斷只重連一次；`ConnectByID` 後 90 秒仍未恢復即需人工處理，新進場維持暫停（出場仍可成交確認）。 / **#231 single reconnect**: one reconnect per drop; if it is not back 90 s after the one ConnectByID an operator must act, and new entries stay paused (exits still confirm).
 - **#231 恢復後進場延遲**：新進場要等權益查詢回覆後才開放，查詢未回覆時會持續擋住新進場。 / **#231 entry delay after recovery**: entries wait for the equity reply; if it never arrives, entries stay held.
 - **#229**：僅儀表板顯示，無交易行為變更。 / **#229**: dashboard display only, no trading change.
 
