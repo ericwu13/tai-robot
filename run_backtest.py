@@ -2190,7 +2190,17 @@ class BacktestApp:
             return
         from src.live.main_heartbeat import set_link_state
         try:
-            set_link_state(host.snapshot())
+            snap = host.snapshot()
+            mode = getattr(self, "_trading_mode", "paper") or "paper"
+            snap["mode"] = "REAL" if mode in ("auto", "semi_auto") else "paper"
+            runner = getattr(self, "_live_runner", None)
+            broker = getattr(runner, "broker", None) if runner is not None else None
+            try:
+                size = int(getattr(broker, "position_size", 0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            snap["position_open"] = size > 0
+            set_link_state(snap)
         except Exception as e:
             _log_debug(
                 f"[RECONNECT] link heartbeat skipped: [{type(e).__name__}] {e}")
@@ -11802,8 +11812,10 @@ class BacktestApp:
         """Arm heartbeat.json on the Tk main loop and the hang watchdog.
 
         The watchdog thread never exits, kills, or restarts the process.
-        It dumps stacks, writes hang.json, and sends one Discord P1 per
-        hang episode (re-armed only after the heartbeat recovers).
+        It dumps stacks, writes hang.json, and sends a Discord P1 when
+        the main thread is hung. The P1 repeats every 10 minutes while
+        the hang lasts, and the latch clears only after the heartbeat
+        recovers.
         """
         from src.live.main_heartbeat import set_replace_failure_logger, start
         runner = self._live_runner

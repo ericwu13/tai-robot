@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import run_backtest as rb
+import src.live.main_heartbeat as hb
 
 
 def _drain() -> list:
@@ -156,3 +157,48 @@ def test_no_unwrapped_get_return_code_message():
         and node.func.attr == "SKCenterLib_GetReturnCodeMessage"
     ]
     assert naked == []
+
+
+def test_hung_alert_names_mode_position_and_manual_restart(tmp_path):
+    alerts = []
+    writer = hb.HeartbeatWriter(str(tmp_path))
+    writer.link_state = {
+        "entries_blocked": True,
+        "mode": "REAL",
+        "position_open": True,
+    }
+    writer.write()
+    watchdog = hb.HangWatchdog(
+        str(tmp_path), hung_s=0.15, poll_s=0.05, alert_fn=alerts.append)
+    watchdog.start()
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not alerts:
+            time.sleep(0.02)
+        assert alerts
+        text = alerts[0]
+        assert "mode=REAL" in text
+        assert "entries_blocked=True" in text
+        assert "position_open=True" in text
+        assert "process NOT restarted; manual restart: Mira" in text
+        assert "Process was NOT killed or restarted" in text
+    finally:
+        watchdog.disable()
+
+
+def test_hung_alert_repeats_while_still_hung(tmp_path):
+    alerts = []
+    writer = hb.HeartbeatWriter(str(tmp_path))
+    writer.write()
+    watchdog = hb.HangWatchdog(
+        str(tmp_path), hung_s=0.12, poll_s=0.04, alert_fn=alerts.append)
+    watchdog.realert_s = 0.2
+    watchdog.start()
+    try:
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline and len(alerts) < 2:
+            time.sleep(0.02)
+        assert len(alerts) >= 2
+        assert all("manual restart: Mira" in item for item in alerts[:2])
+    finally:
+        watchdog.disable()

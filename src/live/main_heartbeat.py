@@ -7,10 +7,11 @@ PID check still says ALIVE. This module:
 - writes ``heartbeat.json`` atomically, and only from the main thread
 - stamps ``inflight_com_call`` around broker/COM calls
 - runs a daemon watchdog that dumps stacks, writes ``hang.json``, and
-  sends one Discord P1 per hang episode
+  sends a Discord P1 when the main thread is hung
 
-The watchdog never exits, kills, or restarts the process. Re-arm happens
-only after the heartbeat recovers.
+The watchdog never exits, kills, or restarts the process. It repeats the
+P1 every 10 minutes while the hang lasts. The latch clears only after
+the heartbeat recovers.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ STACKS_FILENAME = "hang_stacks.txt"
 DEFAULT_HUNG_S = 90.0
 DEFAULT_INFLIGHT_HUNG_S = 60.0
 DEFAULT_POLL_S = 2.0
+# Repeat the P1 while the main thread stays hung. Alert only.
+DEFAULT_REALERT_S = 600.0
 HEARTBEAT_INTERVAL_MS = 5000
 
 # Park an idle watchdog for this long so a finished test does not spin.
@@ -256,12 +259,16 @@ def _snapshot_key(path: str) -> str:
 
 def _copy_heartbeat(payload: dict) -> dict:
     inflight = payload.get("inflight_com_call")
-    return {
+    copied = {
         "ts": payload.get("ts"),
         "pid": payload.get("pid"),
         "inflight_com_call": (
             dict(inflight) if isinstance(inflight, dict) else inflight),
     }
+    link = payload.get("link")
+    if isinstance(link, dict):
+        copied["link"] = dict(link)
+    return copied
 
 
 def _publish_snapshot(path: str, payload: dict) -> None:
@@ -454,13 +461,16 @@ class HangWatchdog:
 
     def __init__(self, bot_dir: str, *, hung_s: float = DEFAULT_HUNG_S,
                  inflight_hung_s: float = DEFAULT_INFLIGHT_HUNG_S,
-                 poll_s: float = DEFAULT_POLL_S, alert_fn=None):
+                 poll_s: float = DEFAULT_POLL_S, alert_fn=None,
+                 realert_s: float = DEFAULT_REALERT_S):
         self.bot_dir = bot_dir
         self.hung_s = float(hung_s)
         self.inflight_hung_s = float(inflight_hung_s)
         self.poll_s = float(poll_s)
+        self.realert_s = float(realert_s)
         self.alert_fn = alert_fn
         self._latched = False
+        self._last_alert_mono: float | None = None
         self._enabled = True
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -492,7 +502,8 @@ class HangWatchdog:
 
     def configure(self, bot_dir: str, *, hung_s: float | None = None,
                   inflight_hung_s: float | None = None,
-                  poll_s: float | None = None, alert_fn=None) -> None:
+                  poll_s: float | None = None, alert_fn=None,
+                  realert_s: float | None = None) -> None:
         self.bot_dir = bot_dir
         if hung_s is not None:
             self.hung_s = float(hung_s)
@@ -500,10 +511,13 @@ class HangWatchdog:
             self.inflight_hung_s = float(inflight_hung_s)
         if poll_s is not None:
             self.poll_s = float(poll_s)
+        if realert_s is not None:
+            self.realert_s = float(realert_s)
         if alert_fn is not None:
             self.alert_fn = alert_fn
         self._enabled = True
         self._latched = False
+        self._last_alert_mono = None
         self._seen_ts = None
         self._seen_mono = 0.0
         self._seen_inflight_key = None
@@ -593,31 +607,25 @@ class HangWatchdog:
                     and hb_stall is not None and hb_stall <= self.hung_s):
                 self._latched = False
                 self._latched_ts = None
+                self._last_alert_mono = None
             return
+        reason = "inflight_com_call" if hung_inflight else "heartbeat"
+        age = hb_stall
+        inflight, _inflight_wall = _inflight_age(hb, time.time())
         if self._latched:
+            # Still hung. Repeat the P1 on the configured interval.
+            # Do not kill, restart, or dump stacks again.
+            last = self._last_alert_mono
+            if last is None or now_mono - last >= self.realert_s:
+                self._last_alert_mono = now_mono
+                self._send_hung_alert(hb, reason, age, inflight)
             return
         # Latch first so a slow send cannot double-fire. The alert goes out
         # before the dump and hang.json: a full disk must not eat the P1.
         self._latched = True
         self._latched_ts = ts
-        reason = "inflight_com_call" if hung_inflight else "heartbeat"
-        age = hb_stall
-        inflight, _inflight_wall = _inflight_age(hb, time.time())
-        name = ""
-        if isinstance(inflight, dict):
-            name = str(inflight.get("name") or "")
-        age_txt = f"{age:.0f}" if age is not None else "?"
-        message = (
-            f"🚨 **P1 HUNG** `{os.path.basename(self.bot_dir)}` "
-            f"main thread heartbeat age={age_txt}s "
-            f"inflight_com_call={name or 'none'} ({reason}). "
-            f"Process was NOT killed or restarted."
-        )
-        if self.alert_fn is not None:
-            try:
-                self.alert_fn(message)
-            except Exception:
-                logger.exception("hang watchdog alert failed")
+        self._last_alert_mono = now_mono
+        self._send_hung_alert(hb, reason, age, inflight)
         stacks_path = os.path.join(self.bot_dir, STACKS_FILENAME)
         try:
             dump_thread_stacks(stacks_path)
@@ -635,6 +643,34 @@ class HangWatchdog:
             atomic_write_json(os.path.join(self.bot_dir, HANG_FILENAME), hang)
         except Exception:
             logger.exception("hang watchdog hang.json write failed")
+
+    def _send_hung_alert(self, hb: dict, reason: str, age, inflight) -> None:
+        """One P1. Names mode, the entry gate, and whether a position is open.
+
+        The process is not killed or restarted. Mira restarts it by hand.
+        """
+        name = ""
+        if isinstance(inflight, dict):
+            name = str(inflight.get("name") or "")
+        age_txt = f"{age:.0f}" if age is not None else "?"
+        link = hb.get("link") if isinstance(hb.get("link"), dict) else {}
+        mode = link.get("mode", "unknown")
+        entries = link.get("entries_blocked", "unknown")
+        position = link.get("position_open", "unknown")
+        message = (
+            f"🚨 **P1 HUNG** `{os.path.basename(self.bot_dir)}` "
+            f"main thread heartbeat age={age_txt}s "
+            f"inflight_com_call={name or 'none'} ({reason}). "
+            f"mode={mode} entries_blocked={entries} position_open={position}. "
+            f"Process was NOT killed or restarted. "
+            f"process NOT restarted; manual restart: Mira"
+        )
+        if self.alert_fn is None:
+            return
+        try:
+            self.alert_fn(message)
+        except Exception:
+            logger.exception("hang watchdog alert failed")
 
 
 # Process-wide install used by the Tk app. Tests may bind their own pair.
