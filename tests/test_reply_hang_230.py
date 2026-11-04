@@ -521,6 +521,20 @@ def test_poller_connect_by_id_stamps_inflight_around_the_call(tmp_path):
     assert after["inflight_com_call"] is None
 
 
+def test_wake_gap_rebase_logs_the_gap(tmp_path, caplog):
+    writer = hb.HeartbeatWriter(str(tmp_path))
+    writer.write()
+    watchdog = hb.HangWatchdog(
+        str(tmp_path), hung_s=90.0, poll_s=0.05, alert_fn=lambda _msg: None)
+    watchdog._last_loop_mono = time.monotonic() - 5.0
+    with caplog.at_level(logging.WARNING, logger="src.live.main_heartbeat"):
+        watchdog._poll()
+    matched = [rec.message for rec in caplog.records if "wake-gap rebase" in rec.message]
+    assert matched
+    assert "gap=" in matched[0]
+    assert "5." in matched[0] or "4." in matched[0]
+
+
 def test_stamp_write_failure_is_logged_every_time(tmp_path, monkeypatch):
     logged = []
     hb.reset_replace_failure_log()

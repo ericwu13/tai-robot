@@ -574,6 +574,9 @@ class HangWatchdog:
         # Do not clear the latch — a hang that started before the sleep is
         # still the same episode.
         if gap > max(self.poll_s * 5.0, 1.0):
+            logger.warning(
+                "hang watchdog wake-gap rebase gap=%.3fs poll_s=%.3fs",
+                gap, self.poll_s)
             self._rebase(now_mono)
             return
         self._check_once(now_mono)
