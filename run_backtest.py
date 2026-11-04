@@ -10267,6 +10267,10 @@ class BacktestApp:
                 reason = _mreq.loss_limit_reason(req.loss_limit, cap)
         if reason is None:
             reason = _mreq.gate_reason(req, self._mode_switch_state())
+        if reason is None and req.mode == "auto" and self._account_query_blocked():
+            # Rights and the book are stale while the reply link is down.
+            # Do not query, and do not switch to REAL.
+            reason = "報價／回報連線未恢復，實單進場暫停中，請稍後再試"
         if reason:
             self._finish_mode_request(
                 bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED, reason, req)
