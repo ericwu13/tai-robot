@@ -472,10 +472,15 @@ def test_start_rotates_hang_artifacts(tmp_path):
     (tmp_path / "hang_stacks.txt").write_text("old-stacks", encoding="utf-8")
     try:
         hb.start(str(tmp_path), hung_s=90.0, poll_s=30.0)
-        assert (tmp_path / "hang.json.prev").read_text(encoding="utf-8") == "old-hang"
-        assert (tmp_path / "hang_stacks.txt.prev").read_text(encoding="utf-8") == "old-stacks"
         assert not (tmp_path / "hang.json").exists()
         assert not (tmp_path / "hang_stacks.txt").exists()
+        assert not (tmp_path / "hang.json.prev").exists()
+        archived = list(tmp_path.glob("hang_*.json"))
+        stacks = list(tmp_path.glob("hang_stacks_*.txt"))
+        assert len(archived) == 1
+        assert archived[0].read_text(encoding="utf-8") == "old-hang"
+        assert len(stacks) == 1
+        assert stacks[0].read_text(encoding="utf-8") == "old-stacks"
     finally:
         hb.stop()
         if hb._watchdog is not None:
@@ -649,7 +654,12 @@ def test_watchdog_reads_snapshot_not_a_replaced_file(tmp_path):
 
 
 def test_call_com_exhausted_replace_logs_once(tmp_path, monkeypatch, caplog):
-    """Stamp failures go through the rate-limited sink, not logger.exception."""
+    """Each stamp write logs its failure. Retries are not extra lines.
+
+    The start stamp and the end stamp are two writes. Both are logged.
+    They are not folded into the 10-minute heartbeat limit, and they
+    do not go through logger.exception.
+    """
     hb.reset_replace_failure_log()
     lines = []
     hb.set_replace_failure_logger(lines.append)
@@ -664,9 +674,9 @@ def test_call_com_exhausted_replace_logs_once(tmp_path, monkeypatch, caplog):
         hb._writer = None
         hb.set_replace_failure_logger(None)
         hb.reset_replace_failure_log()
-    assert len(lines) == 1
-    assert "os.replace failed" in lines[0]
-    assert "suppressed" not in lines[0]
+    assert len(lines) == 2
+    assert all("os.replace failed" in line for line in lines)
+    assert all("suppressed" not in line for line in lines)
     assert caplog.records == []
 
 

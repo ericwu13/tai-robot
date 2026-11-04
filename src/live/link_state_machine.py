@@ -228,6 +228,9 @@ class LinkStateMachine:
     # clock hits stuck_limit and we degrade again.
     _unreconciled_since: datetime | None = None
     _reconcile_pending_noted: bool = False
+    # A poll of 0 owns the next ConnectByID. ``_kick_reply`` must not
+    # send another. Cleared when the reply is ready or OnComplete lands.
+    _poller_owns_connect: bool = False
 
     # ── events: flags only ───────────────────────────────────────────
 
@@ -296,12 +299,16 @@ class LinkStateMachine:
     def note_polled_down(self, now: datetime) -> None:
         """IsConnectedByID==0. Same pause as a reply disconnect. No port call.
 
-        The reply poller sends the one ConnectByID on its own backoff.
-        ``_reply_awaiting_complete`` stays set so ``_kick_reply`` does not
-        send another. Logout is not a reply-poll operation.
+        The poller asks :meth:`may_poll_connect` before the one
+        ConnectByID. An already in-flight rebuild stays in flight so a
+        poll of 0 is not permission to call again. Logout is not a
+        reply-poll operation.
         """
+        inflight = self._reply_awaiting_complete
+        started = self._reply_connect_started_at
         self._saw_reply_disconnect = True
-        self._reply_down_at = now
+        if not inflight:
+            self._reply_down_at = now
         self.reply = LinkPhase.DOWN
         self.reply_reconciled = False
         self.orders_paused = True
@@ -310,7 +317,9 @@ class LinkStateMachine:
         self._reply_stuck_since = None
         self._down_without_reply_event_since = None
         self._unreconciled_since = None
-        self._reply_awaiting_complete = True
+        self._poller_owns_connect = True
+        self._reply_awaiting_complete = inflight
+        self._reply_connect_started_at = started if inflight else None
 
     def note_polled_ready(self, now: datetime) -> None:
         """IsConnectedByID==1. Reply READY, no ConnectByID, no reconcile call.
@@ -334,6 +343,7 @@ class LinkStateMachine:
         self._pending_complete = False
         self._unreconciled_since = None
         self._reply_down_at = None
+        self._poller_owns_connect = False
         # Leave ``degraded`` alone. Quote-stuck (#203) stays degraded
         # until ticks resume; this poll must not clear that. Reply READY
         # still lifts ``orders_paused``. ``entries_allowed`` stays false
@@ -665,7 +675,46 @@ class LinkStateMachine:
 
     # ── reply link ───────────────────────────────────────────────────
 
+    def may_poll_connect(self, now: datetime) -> bool:
+        """Whether the poller may send the one ConnectByID. No port call.
+
+        Refuses while a reply rebuild is in flight, while quote
+        EnterMonitor is in flight, or before the reply settle has
+        elapsed. On permit, records the call as in flight. OnComplete
+        or a poll of 1 releases it.
+        """
+        if self._shut_down or self._reply_awaiting_complete:
+            return False
+        if self.quote == LinkPhase.CONNECTING:
+            return False
+        anchor = self._reply_down_at
+        if anchor is None:
+            return False
+        if self.rules.reply_settle:
+            elapsed = (now - anchor).total_seconds()
+            if elapsed < self.config.reply_settle_s:
+                return False
+        self._reply_awaiting_complete = True
+        self.reply = LinkPhase.CONNECTING
+        self._reply_connect_started_at = now
+        self._pending_complete = False
+        return True
+
+    def note_poll_connect_timeout(self, now: datetime) -> None:
+        """The poller's ConnectByID was not released. Degrade. Do not retry."""
+        self._degrade(now, "reply_connect_timeout")
+
     def _kick_reply(self, now: datetime) -> None:
+        # The poller owns ConnectByID after a poll of 0. Do not send
+        # another from tick. A pending OnComplete still finishes.
+        if self._poller_owns_connect:
+            if (
+                self._reply_awaiting_complete
+                and self._pending_complete
+            ):
+                self._finish_reply()
+                self._clear_reply_stuck_clocks()
+            return
         # OUR safety design, not a vendor rule: ConnectByID was already
         # accepted and OnComplete has not arrived. Do not call it again.
         if (
@@ -758,6 +807,7 @@ class LinkStateMachine:
         self._settle_before_stuck = False
         self._unreconciled_since = None
         self._reconcile_pending_noted = False
+        self._poller_owns_connect = False
 
     def _complete_is_actionable(self) -> bool:
         """OnComplete still belongs to this episode.

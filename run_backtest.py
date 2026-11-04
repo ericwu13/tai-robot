@@ -130,12 +130,12 @@ from src.live.account_monitor import (
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.com_broker_port import ComBrokerPort
 from src.live.link_host import adopt_after_process_login
-from src.live.link_state_machine import KIND_CONN_ERROR, KIND_READY
+from src.live.link_state_machine import KIND_CONN_ERROR, KIND_READY, LinkPhase
 from src.live.reply_link_poller import (
     REPLY_POLL_S, ReplyLinkPoller, format_event_sink,
 )
 from src.live.reply_watch import (
-    ReplyChannelWatch, describe_return_code, mark_reply_arrived,
+    ReplyChannelWatch, format_return_code, mark_reply_arrived,
 )
 from src.live.quote_stuck_recovery import QuoteStuckRecovery
 from src.live.fill_poller import FillPoller
@@ -1160,20 +1160,34 @@ def _notify_reply_silent(message: str) -> None:
             f"[CONN] discord alert failed: [{type(exc).__name__}] {exc}")
 
 
+def _stamped_return_lookup(code):
+    """Vendor text for an unknown code. Stamped, and only when asked.
+
+    Known codes never reach this. The attribute is resolved here so the
+    call site is ``call_com``, not a raw main-thread COM call.
+    """
+    center = skC
+    if center is None:
+        return None
+    fn = getattr(center, "SKCenterLib_GetReturnCodeMessage", None)
+    if not callable(fn):
+        return None
+    return call_com("GetReturnCodeMessage", fn, code)
+
+
+def _return_code_text(code) -> str:
+    """Static table first. Unknown codes may ask SKCOM through call_com."""
+    return format_return_code(code, _stamped_return_lookup)
+
+
 def _log_connect_by_id_result(code) -> None:
     """Log the ConnectByID return code. Never raises into login.
 
-    Uses SKCenterLib_GetReturnCodeMessage when that lookup exists and
-    succeeds. Otherwise the raw code is logged on its own.
+    Static table only. 0 is SK_SUCCESS. Anything else unnamed is the
+    raw code. This does not call SKCOM.
     """
     try:
-        lookup = None
-        center = skC
-        if center is not None:
-            candidate = getattr(center, "SKCenterLib_GetReturnCodeMessage", None)
-            if callable(candidate):
-                lookup = candidate
-        text = describe_return_code(code, lookup)
+        text = format_return_code(code)
         _log(f"[CONN] ConnectByID returned {text}")
     except Exception:
         try:
@@ -1215,149 +1229,220 @@ def _route_to_log_widget(line: str, level: str = "info") -> None:
         pass
 
 
+def _safe_event_put(item) -> None:
+    """Queue one COM event. A full queue must not raise into the sink."""
+    try:
+        _ui_queue.put_nowait(item)
+    except Exception as exc:
+        _log_reply_error(
+            f"[CONN] event queue failed: [{type(exc).__name__}] {exc}")
+
+
+def _log_event_failure(method: str, exc: BaseException) -> None:
+    _log_reply_error(
+        f"[CONN] {method} handler failed: [{type(exc).__name__}] {exc}")
+
+
 # ── COM Event handlers ──
+# Every sink method takes the vendor arguments plus ``*_extra``. An
+# arity drift must not raise inside the COM callback (issue #230).
+# The flag is queued before any log line. No broker calls here.
 
 class SKQuoteLibEvents:
-    def OnNotifyStockList(self, sMarketNo, bstrStockData):
-        _ui_queue.put_nowait(("stock_list", (sMarketNo, bstrStockData)))
+    def OnNotifyStockList(self, sMarketNo, bstrStockData, *_extra):
+        _safe_event_put(("stock_list", (sMarketNo, bstrStockData)))
 
-    def OnConnection(self, nKind, nCode):
-        kind_names = {3001: "Reply", 3002: "Quote", 3003: "Ready",
-                      3021: "ConnError", 3033: "Abnormal"}
-        kind_label = kind_names.get(nKind, str(nKind))
-        # Only queue.put_nowait() is safe from COM background threads.
-        # root.after() is NOT safe — it calls into Tcl/Tk C code which
-        # is not thread-safe and corrupts the GIL in Python 3.13.
-        _ui_queue.put_nowait(("log", f"報價連線 QUOTE CONN: {kind_label} code={nCode}"))
-        # Structured DEBUG line per OnConnection event — meaning of each kind
-        # is documented inline so a future debugger can read it cold.
-        meaning = {
-            3001: "Reply — order/reply channel up (intermediate, NOT fully connected)",
-            3002: "Quote — quote channel up (intermediate, waiting for Ready 3003)",
-            3003: "Ready — fully connected, marking quote_connected=True",
-            3021: "ConnError — connection error, triggering disconnect",
-            3033: "Abnormal — abnormal disconnect, triggering disconnect",
-        }.get(nKind, f"unknown kind={nKind}")
-        _ui_queue.put_nowait(("log_debug", f"[CONN] kind={nKind} {kind_label} code={nCode} — {meaning}"))
-        # Flag only. The main-thread drain calls the link machine. No SKCOM here.
-        _ui_queue.put_nowait(("link", ("connection", int(nKind), int(nCode))))
-        if nKind == 3003 and nCode == 0:
-            _ui_queue.put_nowait(("conn", "ready"))
-        elif nKind == 3002 and nCode == 0:
-            _ui_queue.put_nowait(("conn", "quote"))
-        elif nKind in (3021, 3033):
-            _ui_queue.put_nowait(("conn", "disconnected"))
+    def OnConnection(self, nKind, nCode, *_extra):
+        try:
+            kind = int(nKind)
+            code = int(nCode)
+        except (TypeError, ValueError):
+            kind, code = nKind, nCode
+        # Flag first. The main-thread drain calls the link machine.
+        _safe_event_put(("link", ("connection", kind, code)))
+        try:
+            kind_names = {3001: "Reply", 3002: "Quote", 3003: "Ready",
+                          3021: "ConnError", 3033: "Abnormal"}
+            kind_label = kind_names.get(kind, str(kind))
+            # Only queue.put_nowait() is safe from COM background threads.
+            # root.after() is NOT safe — it calls into Tcl/Tk C code which
+            # is not thread-safe and corrupts the GIL in Python 3.13.
+            _safe_event_put(("log", f"報價連線 QUOTE CONN: {kind_label} code={code}"))
+            meaning = {
+                3001: "Reply — order/reply channel up (intermediate, NOT fully connected)",
+                3002: "Quote — quote channel up (intermediate, waiting for Ready 3003)",
+                3003: "Ready — fully connected, marking quote_connected=True",
+                3021: "ConnError — connection error, triggering disconnect",
+                3033: "Abnormal — abnormal disconnect, triggering disconnect",
+            }.get(kind, f"unknown kind={kind}")
+            _safe_event_put((
+                "log_debug",
+                f"[CONN] kind={kind} {kind_label} code={code} — {meaning}"))
+            if kind == 3003 and code == 0:
+                _safe_event_put(("conn", "ready"))
+            elif kind == 3002 and code == 0:
+                _safe_event_put(("conn", "quote"))
+            elif kind in (3021, 3033):
+                _safe_event_put(("conn", "disconnected"))
+        except Exception as exc:
+            _log_event_failure("OnConnection", exc)
 
-    def OnNotifyKLineData(self, bstrStockNo, bstrData):
-        if not _app:
-            return
-        # Route data based on current mode
-        if _app._live_warmup_mode:
-            _app._live_warmup_data.append(bstrData)
-        elif _app._live_polling:
-            _app._live_poll_data.append(bstrData)
-        else:
-            _app._fetcher.on_kline_data(bstrData)
-            n = _app._fetcher.total_bar_count
-            if n <= 3:
-                _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
+    def OnNotifyKLineData(self, bstrStockNo, bstrData, *_extra):
+        try:
+            if not _app:
+                return
+            if _app._live_warmup_mode:
+                _app._live_warmup_data.append(bstrData)
+            elif _app._live_polling:
+                _app._live_poll_data.append(bstrData)
+            else:
+                _app._fetcher.on_kline_data(bstrData)
+                n = _app._fetcher.total_bar_count
+                if n <= 3:
+                    _log(f"K線原始資料 Raw KLine [{n}]: {bstrData!r}")
+        except Exception as exc:
+            _log_event_failure("OnNotifyKLineData", exc)
 
-    def OnKLineComplete(self, nCode):
-        if not _app:
-            return
-        if _app._live_warmup_mode:
-            _log(f"暖機完成 Warmup KLine complete: {len(_app._live_warmup_data)} bars, code={nCode}")
-            _app.root.after(100, _app._on_live_warmup_complete)
-        elif _app._live_polling:
-            _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
-            _app.root.after(100, _app._on_live_poll_complete)
-        else:
-            chunk_n = _app._fetcher.chunk_bar_count
-            total_n = _app._fetcher.total_bar_count
-            _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
-            _app.root.after(100, _app._on_chunk_complete)
+    def OnKLineComplete(self, nCode, *_extra):
+        try:
+            if not _app:
+                return
+            if _app._live_warmup_mode:
+                _log(f"暖機完成 Warmup KLine complete: {len(_app._live_warmup_data)} bars, code={nCode}")
+                _app.root.after(100, _app._on_live_warmup_complete)
+            elif _app._live_polling:
+                _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
+                _app.root.after(100, _app._on_live_poll_complete)
+            else:
+                chunk_n = _app._fetcher.chunk_bar_count
+                total_n = _app._fetcher.total_bar_count
+                _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
+                _app.root.after(100, _app._on_chunk_complete)
+        except Exception as exc:
+            _log_event_failure("OnKLineComplete", exc)
 
-    def OnNotifyQuoteLONG(self, sMarketNo, nStockIdx):
-        pass
+    def OnNotifyQuoteLONG(self, sMarketNo, nStockIdx, *_extra):
+        return None
 
     def OnNotifyHistoryTicksLONG(self, sMarketNo, nStockIdx, nPtr,
                                 lDate, lTimehms, lTimemillismicros,
-                                nBid, nAsk, nClose, nQty, nSimulate):
+                                nBid, nAsk, nClose, nQty, nSimulate, *_extra):
         # Minimal work on COM thread — just enqueue raw data.
         # Accessing Python objects (like _app) from COM thread crashes GIL in 3.13.
-        _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                nBid, nAsk, nClose, nQty, nSimulate, True))
+        try:
+            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
+                                    nBid, nAsk, nClose, nQty, nSimulate, True))
+        except Exception as exc:
+            _log_event_failure("OnNotifyHistoryTicksLONG", exc)
 
     def OnNotifyTicksLONG(self, sMarketNo, nStockIdx, nPtr,
                           lDate, lTimehms, lTimemillismicros,
-                          nBid, nAsk, nClose, nQty, nSimulate):
-        _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                nBid, nAsk, nClose, nQty, nSimulate, False))
+                          nBid, nAsk, nClose, nQty, nSimulate, *_extra):
+        try:
+            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
+                                    nBid, nAsk, nClose, nQty, nSimulate, False))
+        except Exception as exc:
+            _log_event_failure("OnNotifyTicksLONG", exc)
 
     def OnNotifyBest5LONG(self, *args):
-        pass
+        return None
 
-    def OnNotifyServerTime(self, sHour, sMinute, sSecond, nTotal):
-        pass
+    def OnNotifyServerTime(self, sHour, sMinute, sSecond, nTotal, *_extra):
+        return None
 
 
 class SKReplyLibEvent:
-    def OnReplyMessage(self, bstrUserID, bstrMessage):
-        _ui_queue.put_nowait(("log", f"回報 REPLY: {bstrMessage}"))
+    def OnReplyMessage(self, bstrUserID, bstrMessage, *_extra):
+        _safe_event_put(("log", f"回報 REPLY: {bstrMessage}"))
         return -1
 
-    def OnConnect(self, bstrUserID, nErrorCode):
-        _ui_queue.put_nowait(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
+    def OnConnect(self, bstrUserID, nErrorCode, *_extra):
         # Queue only. after_cancel runs on the main thread when this drains.
-        _ui_queue.put_nowait(("reply_seen", "OnConnect"))
-        mark_reply_arrived("OnConnect")
+        _safe_event_put(("reply_seen", "OnConnect"))
+        try:
+            _safe_event_put(("log", f"回報連線 REPLY CONN: code={nErrorCode}"))
+            mark_reply_arrived("OnConnect")
+        except Exception as exc:
+            _log_event_failure("OnConnect", exc)
 
-    def OnComplete(self, bstrUserID):
+    def OnComplete(self, bstrUserID, *_extra):
         del bstrUserID
-        _ui_queue.put_nowait((
-            "log_debug", "[CONN] OnComplete — reply backfill finished"))
-        _ui_queue.put_nowait(("link", ("complete",)))
-        _ui_queue.put_nowait(("reply_seen", "OnComplete"))
-        mark_reply_arrived("OnComplete")
+        _safe_event_put(("link", ("complete",)))
+        _safe_event_put(("reply_seen", "OnComplete"))
+        try:
+            _safe_event_put((
+                "log_debug", "[CONN] OnComplete — reply backfill finished"))
+            mark_reply_arrived("OnComplete")
+        except Exception as exc:
+            _log_event_failure("OnComplete", exc)
 
-    def OnSolaceReplyDisconnect(self, bstrUserID):
-        """§4-3-h. Flag only — do not ConnectByID from this callback."""
+    def OnSolaceReplyDisconnect(self, bstrUserID, nErrorCode=None, *_extra):
+        """§4-3-h. Flag only. 3002 = clean, 3033 = session down.
+
+        The link flag is queued before the code is logged. Do not
+        reconnect from this callback.
+        """
         del bstrUserID
-        _ui_queue.put_nowait(("log", "回報斷線 REPLY DISCONNECT"))
-        _ui_queue.put_nowait(("log_debug", "[CONN] OnSolaceReplyDisconnect"))
-        _ui_queue.put_nowait(("link", ("reply_disconnect",)))
+        _safe_event_put(("link", ("reply_disconnect",)))
+        try:
+            _safe_event_put((
+                "log", f"回報斷線 REPLY DISCONNECT code={nErrorCode}"))
+            _safe_event_put((
+                "log_debug",
+                f"[CONN] OnSolaceReplyDisconnect code={nErrorCode}"))
+        except Exception as exc:
+            _log_event_failure("OnSolaceReplyDisconnect", exc)
 
-    def OnNewData(self, bstrUserID, bstrData):
+    def OnSolaceReplyConnection(self, bstrUserID, nErrorCode=None, *_extra):
+        """Log-only. The reply sink saw the Solace session come up."""
+        del bstrUserID
+        _safe_event_put(("reply_seen", "OnSolaceReplyConnection"))
+        try:
+            _safe_event_put((
+                "log_debug",
+                f"[CONN] OnSolaceReplyConnection code={nErrorCode}"))
+            mark_reply_arrived("OnSolaceReplyConnection")
+        except Exception as exc:
+            _log_event_failure("OnSolaceReplyConnection", exc)
+
+    def OnNewData(self, bstrUserID, bstrData, *_extra):
         # Real-time per-order report — the only per-fill price source in
         # the Capital API (issue #92). Enqueued like every other COM event.
         # OnNewData is a reply event for the silent-sink watchdog.
-        _ui_queue.put_nowait(("new_data", bstrData))
-        _ui_queue.put_nowait(("reply_seen", "OnNewData"))
-        mark_reply_arrived("OnNewData")
+        _safe_event_put(("new_data", bstrData))
+        _safe_event_put(("reply_seen", "OnNewData"))
+        try:
+            mark_reply_arrived("OnNewData")
+        except Exception as exc:
+            _log_event_failure("OnNewData", exc)
 
 
 class SKOrderLibEvents:
-    def OnAccount(self, bstrLogInID, bstrAccountData):
-        _ui_queue.put_nowait(("account", bstrAccountData))
+    def OnAccount(self, bstrLogInID, bstrAccountData, *_extra):
+        _safe_event_put(("account", bstrAccountData))
 
-    def OnAsyncOrder(self, nThreadID, nCode, bstrMessage):
-        _ui_queue.put_nowait(("order_result", (nCode, bstrMessage)))
+    def OnAsyncOrder(self, nThreadID, nCode, bstrMessage, *_extra):
+        _safe_event_put(("order_result", (nCode, bstrMessage)))
 
-    def OnOpenInterest(self, bstrData):
+    def OnOpenInterest(self, bstrData, *_extra):
         # Tag the row with the query that is in flight NOW. A reply that
         # was already queued under an older generation must not complete
         # a later GetOpenInterestGW (issue #202). The API has no request
         # id; enqueue time is the correlation we have.
-        payload: str | tuple = bstrData
-        app = _app
-        monitor = getattr(app, "_account_monitor", None) if app is not None else None
-        generation = getattr(monitor, "oi_query_generation", None) if monitor is not None else None
-        if isinstance(generation, int) and not isinstance(generation, bool):
-            payload = (bstrData, generation)
-        _ui_queue.put_nowait(("open_interest", payload))
+        try:
+            payload: str | tuple = bstrData
+            app = _app
+            monitor = getattr(app, "_account_monitor", None) if app is not None else None
+            generation = getattr(monitor, "oi_query_generation", None) if monitor is not None else None
+            if isinstance(generation, int) and not isinstance(generation, bool):
+                payload = (bstrData, generation)
+        except Exception as exc:
+            _log_event_failure("OnOpenInterest", exc)
+            payload = bstrData
+        _safe_event_put(("open_interest", payload))
 
-    def OnFutureRights(self, bstrData):
-        _ui_queue.put_nowait(("future_rights", bstrData))
+    def OnFutureRights(self, bstrData, *_extra):
+        _safe_event_put(("future_rights", bstrData))
 
 
 _parse_open_interest = parse_open_interest  # re-export from account_monitor
@@ -1566,6 +1651,11 @@ class BacktestApp:
                         _log(f"帳戶資料 Account: equity={parsed.get('equity')} "
                              f"available={parsed.get('available')} "
                              f"float_pnl={parsed.get('float_pnl')}")
+                        if getattr(self, "_equity_refresh_owed", False):
+                            # Loss-limit update ran inside the display
+                            # refresh. Entries may open only after that.
+                            self._equity_refresh_owed = False
+                            self._apply_link_gate()
                     _log(f"權益數 FutureRights: {_redact_future_rights(data)}")
                 elif kind == "new_data":
                     try:
@@ -1579,7 +1669,7 @@ class BacktestApp:
                         if self._live_runner:
                             self._live_log_msg(f"實單成功 Order OK: {msg}", "entry")
                     else:
-                        err = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                        err = _return_code_text(code)
                         _log(f"委託失敗 Order FAILED: code={code} {err} {msg}")
                         self.set_status(f"委託失敗 Order FAILED: {err}", "error")
                         if self._live_runner:
@@ -2035,7 +2125,23 @@ class BacktestApp:
         guard = getattr(self, "_trading_guard", None)
         if host is None or guard is None:
             return
-        allowed = host.entries_allowed()
+        if self._account_query_blocked():
+            # Rights go stale while the periodic poll is held. Entries
+            # stay shut until a fresh equity read follows the release.
+            self._equity_refresh_owed = True
+            self._equity_refresh_sent = False
+        elif (
+            getattr(self, "_equity_refresh_owed", False)
+            and host.entries_allowed()
+        ):
+            if getattr(self, "_trading_mode", "paper") not in ("semi_auto", "auto"):
+                self._equity_refresh_owed = False
+            else:
+                self._refresh_equity_before_entries()
+        allowed = (
+            host.entries_allowed()
+            and not getattr(self, "_equity_refresh_owed", False)
+        )
         guard.link_entries_blocked = not allowed
         if allowed:
             if getattr(self, "_link_gate_latched", False):
@@ -2105,7 +2211,17 @@ class BacktestApp:
             return
         from src.live.main_heartbeat import set_link_state
         try:
-            set_link_state(host.snapshot())
+            snap = host.snapshot()
+            mode = getattr(self, "_trading_mode", "paper") or "paper"
+            snap["mode"] = "REAL" if mode in ("auto", "semi_auto") else "paper"
+            runner = getattr(self, "_live_runner", None)
+            broker = getattr(runner, "broker", None) if runner is not None else None
+            try:
+                size = int(getattr(broker, "position_size", 0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            snap["position_open"] = size > 0
+            set_link_state(snap)
         except Exception as e:
             _log_debug(
                 f"[RECONNECT] link heartbeat skipped: [{type(e).__name__}] {e}")
@@ -2226,7 +2342,7 @@ class BacktestApp:
                 f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
                 f"subscription sent (retry={_retry})")
             if code != 0 and code >= 3000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 self._live_log_msg(f"重新訂閱失敗 Resubscribe failed: {msg}", "status")
                 _log_debug(
                     f"[TICKS] RequestTicks FAILED: code={code} msg={msg}")
@@ -4062,9 +4178,16 @@ class BacktestApp:
             "IsConnectedByID", skR.SKReplyLib_IsConnectedByID, user_id)
 
     def _connect_reply_for_poll(self, user_id: str):
-        """One ConnectByID from the poller. Logs the return code. No logout."""
-        code = call_com(
-            "ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+        """One ConnectByID from the poller, through the machine port.
+
+        The poller has already been permitted by the link machine. The
+        SKCOM call lives on that port. Logs the return code. No logout.
+        """
+        machine = self._reply_machine()
+        port = getattr(machine, "port", None) if machine is not None else None
+        if port is None:
+            return None
+        code = port.connect_reply(user_id)
         _log_connect_by_id_result(code)
         return code
 
@@ -4106,19 +4229,34 @@ class BacktestApp:
                 pass
 
     def _poll_reply_link(self, cause: str) -> None:
-        """Read IsConnectedByID and apply it. Never raises into the caller."""
+        """Read IsConnectedByID and apply it. Never raises into the caller.
+
+        The entry gate and the backoff timer run in ``finally``, so a
+        raising read cannot leave entries un-gated or the poll unscheduled.
+        """
         try:
             poller = getattr(self, "_reply_poller", None)
             if poller is None:
                 return
             _log_debug(f"[CONN] reply poll ({cause})")
             poller.poll(_taipei_now())
-            self._apply_link_gate()
-            self._schedule_reply_backoff()
         except Exception as exc:
             _log_reply_error(
                 "[CONN] reply poll failed: "
                 f"[{type(exc).__name__}] {exc}")
+        finally:
+            try:
+                self._apply_link_gate()
+            except Exception as exc:
+                _log_reply_error(
+                    "[CONN] reply gate failed: "
+                    f"[{type(exc).__name__}] {exc}")
+            try:
+                self._schedule_reply_backoff()
+            except Exception as exc:
+                _log_reply_error(
+                    "[CONN] reply backoff schedule failed: "
+                    f"[{type(exc).__name__}] {exc}")
 
     def _schedule_reply_backoff(self) -> None:
         poller = getattr(self, "_reply_poller", None)
@@ -4139,7 +4277,19 @@ class BacktestApp:
 
     def _on_reply_backoff(self) -> None:
         self._reply_backoff_token = None
-        self._poll_reply_link("backoff")
+        try:
+            self._poll_reply_link("backoff")
+        finally:
+            # The poll helper re-arms too. This still runs when that
+            # helper itself raises, so the after-chain cannot die here.
+            try:
+                self._apply_link_gate()
+            except Exception:
+                pass
+            try:
+                self._schedule_reply_backoff()
+            except Exception:
+                pass
 
     def _probe_reply_connected(self, user_id: str):
         """One IsConnectedByID read, 30s after login. Logged only.
@@ -4191,7 +4341,7 @@ class BacktestApp:
             code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
                             user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
                 if code == 1097:
                     _log("提示: 請確認已安裝群益API憑證 (從券商網站下載安裝)")
@@ -4325,7 +4475,7 @@ class BacktestApp:
                 chunk.minute_num)
 
             if code != 0:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 _log(f"請求結果 Result: code={code} {msg}")
                 if code >= 3000:
                     self.set_status(f"錯誤 Error: {msg}", "error")
@@ -9131,7 +9281,7 @@ class BacktestApp:
                 "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 _log(f"暖機查詢失敗 Warmup fetch failed: code={code} {msg}")
                 self._live_log_msg(
                     f"暖機查詢失敗 Warmup failed: code={code} {msg}", "status")
@@ -9296,7 +9446,7 @@ class BacktestApp:
             else:
                 code = result
             if code != 0 and code >= 3000:
-                msg = skC.SKCenterLib_GetReturnCodeMessage(code)
+                msg = _return_code_text(code)
                 self._live_log_msg(f"訂閱失敗 Tick subscribe failed: {msg}", "status")
                 self._stop_live()
                 return
@@ -10117,6 +10267,10 @@ class BacktestApp:
                 reason = _mreq.loss_limit_reason(req.loss_limit, cap)
         if reason is None:
             reason = _mreq.gate_reason(req, self._mode_switch_state())
+        if reason is None and req.mode == "auto" and self._account_query_blocked():
+            # Rights and the book are stale while the reply link is down.
+            # Do not query, and do not switch to REAL.
+            reason = "報價／回報連線未恢復，實單進場暫停中，請稍後再試"
         if reason:
             self._finish_mode_request(
                 bot_dir, req.request_id, req.mode, _mreq.STATUS_REFUSED, reason, req)
@@ -10715,7 +10869,24 @@ class BacktestApp:
             self._live_log_msg("實單失敗 Order FAILED: no futures account", "exit")
             return False
 
-        # Margin check for new positions (entries)
+        # Margin check for new positions (entries). A reply recovery
+        # owes a fresh equity read before this check can pass: the loss
+        # limit and the margin both use the last rights snapshot.
+        if action_type == "entry" and getattr(self, "_equity_refresh_owed", False):
+            self._refresh_equity_before_entries()
+            if getattr(self, "_equity_refresh_owed", False):
+                self._live_log_msg(
+                    "實單暫停 Entry held until equity refresh", "status")
+                self._log_order_decision(
+                    "REAL_ORDER_BLOCKED", "equity stale after reply recovery")
+                return False
+            if self._trading_guard.paused:
+                msg = (
+                    f"daily loss limit reached "
+                    f"({self._trading_guard.daily_loss_limit:,} NTD)")
+                self._live_log_msg(msg, "exit")
+                self._log_order_decision("REAL_ORDER_BLOCKED", msg)
+                return False
         if action_type == "entry" and self._account_monitor.rights:
             try:
                 available = float(self._account_monitor.rights.get("available", "0"))
@@ -10839,7 +11010,7 @@ class BacktestApp:
                 )
                 return True
             else:
-                err_msg = skC.SKCenterLib_GetReturnCodeMessage(code) if skC else str(code)
+                err_msg = _return_code_text(code)
                 self._live_log_msg(f"實單失敗 Order FAILED: code={code} {err_msg} | {message}", "exit")
                 _log(f"REAL ORDER FAILED: code={code} err={err_msg} msg={message}")
                 if _discord and _discord.enabled:
@@ -10992,6 +11163,9 @@ class BacktestApp:
         # UNKNOWN for the whole fill wait. A tail "##" still cannot
         # flatten a later deploy — "##" answers empty only after "001"
         # in that generation (issue #202).
+        # The periodic account poll is held while the reply link is
+        # down. This fill check is not: an exit must still be able to
+        # confirm, or the 10s timeout downgrades the bot.
         try:
             user_id = self.login_user_var.get().strip()
             call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
@@ -11557,8 +11731,55 @@ class BacktestApp:
         for btn in (self.btn_manual_buy, self.btn_manual_sell, self.btn_manual_close):
             btn.config(state=state)
 
+    def _account_query_blocked(self) -> bool:
+        """Hold the periodic account poll while the reply link is down.
+
+        Fill confirmation and exit/flatten queries do not use this.
+        A polled-ready reading or OnComplete releases the hold. The
+        login CONNECTING state, before any down reading, does not.
+        """
+        poller = getattr(self, "_reply_poller", None)
+        if poller is not None and getattr(poller, "down", False):
+            return True
+        machine = self._reply_machine()
+        if machine is None:
+            return False
+        reply = getattr(machine, "reply", None)
+        if reply == LinkPhase.DOWN:
+            return True
+        return (
+            reply == LinkPhase.CONNECTING
+            and bool(getattr(machine, "_poller_owns_connect", False))
+        )
+
+    def _refresh_equity_before_entries(self) -> None:
+        """One GetFutureRights after the reply hold lifts. No wait.
+
+        The entry gate stays shut until that reply is applied. A second
+        call while the request is already out does not send another.
+        """
+        if getattr(self, "_equity_refresh_sent", False):
+            return
+        if not _com_available or skO is None or not self._logged_in:
+            return
+        if not self._futures_account:
+            return
+        self._equity_refresh_sent = True
+        user_id = self.login_user_var.get().strip()
+        try:
+            call_com(
+                "GetFutureRights", skO.GetFutureRights,
+                user_id, self._futures_account, 1)
+        except Exception as exc:
+            _log(
+                "[CONN] equity refresh failed: "
+                f"[{type(exc).__name__}] {exc}")
+
     def _query_real_account(self):
         """Query real account positions and equity from Capital API."""
+        if self._account_query_blocked():
+            _log_debug("[CONN] account query deferred: reply link down")
+            return
         if not _com_available or skO is None or not self._logged_in or not self._futures_account:
             return
         user_id = self.login_user_var.get().strip()
@@ -11702,8 +11923,10 @@ class BacktestApp:
         """Arm heartbeat.json on the Tk main loop and the hang watchdog.
 
         The watchdog thread never exits, kills, or restarts the process.
-        It dumps stacks, writes hang.json, and sends one Discord P1 per
-        hang episode (re-armed only after the heartbeat recovers).
+        It dumps stacks, writes hang.json, and sends a Discord P1 when
+        the main thread is hung. The P1 repeats every 10 minutes while
+        the hang lasts, and the latch clears only after the heartbeat
+        recovers.
         """
         from src.live.main_heartbeat import set_replace_failure_logger, start
         runner = self._live_runner
@@ -11761,18 +11984,23 @@ class BacktestApp:
         self._heartbeat_after_id = None
         if not getattr(self, "_heartbeat_active", False):
             return
-        self._publish_link_heartbeat()
         try:
-            tick()
-        except Exception as e:
-            # A final os.replace failure is already in the bot log via
-            # the rate-limited sink (hb_logged). Anything else still
-            # goes to _log, through the same 10-minute limit.
-            if not getattr(e, "hb_logged", False):
-                note_heartbeat_failure(
-                    f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
-        if getattr(self, "_heartbeat_active", False):
-            self._arm_heartbeat_tick()
+            self._publish_link_heartbeat()
+            try:
+                tick()
+            except Exception as e:
+                # A final os.replace failure is already in the bot log via
+                # the rate-limited sink (hb_logged). Anything else still
+                # goes to _log, through the same 10-minute limit.
+                if not getattr(e, "hb_logged", False):
+                    note_heartbeat_failure(
+                        f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
+        finally:
+            if getattr(self, "_heartbeat_active", False):
+                try:
+                    self._arm_heartbeat_tick()
+                except Exception:
+                    pass
 
     def _stop_main_heartbeat(self) -> None:
         from src.live.main_heartbeat import stop

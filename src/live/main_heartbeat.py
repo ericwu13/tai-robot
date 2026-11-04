@@ -7,10 +7,11 @@ PID check still says ALIVE. This module:
 - writes ``heartbeat.json`` atomically, and only from the main thread
 - stamps ``inflight_com_call`` around broker/COM calls
 - runs a daemon watchdog that dumps stacks, writes ``hang.json``, and
-  sends one Discord P1 per hang episode
+  sends a Discord P1 when the main thread is hung
 
-The watchdog never exits, kills, or restarts the process. Re-arm happens
-only after the heartbeat recovers.
+The watchdog never exits, kills, or restarts the process. It repeats the
+P1 every 10 minutes while the hang lasts. The latch clears only after
+the heartbeat recovers.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import faulthandler
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -37,6 +39,14 @@ STACKS_FILENAME = "hang_stacks.txt"
 DEFAULT_HUNG_S = 90.0
 DEFAULT_INFLIGHT_HUNG_S = 60.0
 DEFAULT_POLL_S = 2.0
+# Repeat the P1 while the main thread stays hung. Alert only.
+DEFAULT_REALERT_S = 600.0
+# How many archived hang episodes to keep. Current hang.json /
+# hang_stacks.txt are never counted and never deleted here.
+HANG_ARCHIVE_KEEP = 10
+_HANG_JSON_ARCHIVE = re.compile(r"^hang_(\d{8}-\d{6})(?:_(\d+))?\.json$")
+_HANG_STACKS_ARCHIVE = re.compile(
+    r"^hang_stacks_(\d{8}-\d{6})(?:_(\d+))?\.txt$")
 HEARTBEAT_INTERVAL_MS = 5000
 
 # Park an idle watchdog for this long so a finished test does not spin.
@@ -187,6 +197,24 @@ def replace_retrying_permission_error(tmp: str, path: str, *, sleep_fn=None) -> 
         lambda: os.replace(tmp, path), sleep_fn=sleep_fn)
 
 
+# Per-thread depth of call_com. A background stamp must not change the
+# main thread's rate limit. A stamp-write failure is logged on every
+# attempt. Ordinary heartbeat ticks stay on the 10-minute limit.
+_stamp_depth = threading.local()
+
+
+def _stamp_depth_value() -> int:
+    return int(getattr(_stamp_depth, "n", 0) or 0)
+
+
+def _log_stamp_failure(message: str) -> None:
+    """Every stamp-write failure. Not rate-limited."""
+    try:
+        _replace_failure_log(message)
+    except Exception:
+        logger.exception("stamp failure log raised")
+
+
 def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
     """Move ``tmp`` onto ``path``. Retry PermissionError only."""
     try:
@@ -194,11 +222,15 @@ def _replace_into_place(tmp: str, path: str, *, sleep_fn, monotonic) -> None:
     except PermissionError as exc:
         # Callers (tick / call_com) must not log this again.
         exc.hb_logged = True  # type: ignore[attr-defined]
-        note_heartbeat_failure(
+        message = (
             "heartbeat os.replace failed for "
             f"{os.path.basename(path) or path}: "
-            f"[{type(exc).__name__}] {exc}",
-            monotonic=monotonic)
+            f"[{type(exc).__name__}] {exc}"
+        )
+        if _stamp_depth_value():
+            _log_stamp_failure(message)
+        else:
+            note_heartbeat_failure(message, monotonic=monotonic)
         raise
 
 
@@ -256,12 +288,16 @@ def _snapshot_key(path: str) -> str:
 
 def _copy_heartbeat(payload: dict) -> dict:
     inflight = payload.get("inflight_com_call")
-    return {
+    copied = {
         "ts": payload.get("ts"),
         "pid": payload.get("pid"),
         "inflight_com_call": (
             dict(inflight) if isinstance(inflight, dict) else inflight),
     }
+    link = payload.get("link")
+    if isinstance(link, dict):
+        copied["link"] = dict(link)
+    return copied
 
 
 def _publish_snapshot(path: str, payload: dict) -> None:
@@ -409,15 +445,14 @@ def read_heartbeat(path: str, *, sleep=None) -> dict | None:
 
 
 def _report_stamp_failure(exc: BaseException, message: str) -> None:
-    """Rate-limited stamp log. Skip when the writer already logged it.
+    """Log a stamp-write failure every time. Skip when already logged.
 
-    ``logger.exception`` on every COM call would miss the bot log (the
-    main_heartbeat logger is not attached there) and would ignore the
-    10-minute limit. The installed sink is ``_log`` while a bot is up.
+    A PermissionError during the stamp was logged above, with no rate
+    limit. Any other failure is logged here, also with no rate limit.
     """
     if getattr(exc, "hb_logged", False):
         return
-    note_heartbeat_failure(message)
+    _log_stamp_failure(message)
 
 
 def _inflight_age(hb: dict, now: float) -> tuple[dict | None, float | None]:
@@ -454,13 +489,16 @@ class HangWatchdog:
 
     def __init__(self, bot_dir: str, *, hung_s: float = DEFAULT_HUNG_S,
                  inflight_hung_s: float = DEFAULT_INFLIGHT_HUNG_S,
-                 poll_s: float = DEFAULT_POLL_S, alert_fn=None):
+                 poll_s: float = DEFAULT_POLL_S, alert_fn=None,
+                 realert_s: float = DEFAULT_REALERT_S):
         self.bot_dir = bot_dir
         self.hung_s = float(hung_s)
         self.inflight_hung_s = float(inflight_hung_s)
         self.poll_s = float(poll_s)
+        self.realert_s = float(realert_s)
         self.alert_fn = alert_fn
         self._latched = False
+        self._last_alert_mono: float | None = None
         self._enabled = True
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -492,7 +530,8 @@ class HangWatchdog:
 
     def configure(self, bot_dir: str, *, hung_s: float | None = None,
                   inflight_hung_s: float | None = None,
-                  poll_s: float | None = None, alert_fn=None) -> None:
+                  poll_s: float | None = None, alert_fn=None,
+                  realert_s: float | None = None) -> None:
         self.bot_dir = bot_dir
         if hung_s is not None:
             self.hung_s = float(hung_s)
@@ -500,10 +539,13 @@ class HangWatchdog:
             self.inflight_hung_s = float(inflight_hung_s)
         if poll_s is not None:
             self.poll_s = float(poll_s)
+        if realert_s is not None:
+            self.realert_s = float(realert_s)
         if alert_fn is not None:
             self.alert_fn = alert_fn
         self._enabled = True
         self._latched = False
+        self._last_alert_mono = None
         self._seen_ts = None
         self._seen_mono = 0.0
         self._seen_inflight_key = None
@@ -536,6 +578,9 @@ class HangWatchdog:
         # Do not clear the latch — a hang that started before the sleep is
         # still the same episode.
         if gap > max(self.poll_s * 5.0, 1.0):
+            logger.warning(
+                "hang watchdog wake-gap rebase gap=%.3fs poll_s=%.3fs",
+                gap, self.poll_s)
             self._rebase(now_mono)
             return
         self._check_once(now_mono)
@@ -593,31 +638,25 @@ class HangWatchdog:
                     and hb_stall is not None and hb_stall <= self.hung_s):
                 self._latched = False
                 self._latched_ts = None
+                self._last_alert_mono = None
             return
+        reason = "inflight_com_call" if hung_inflight else "heartbeat"
+        age = hb_stall
+        inflight, _inflight_wall = _inflight_age(hb, time.time())
         if self._latched:
+            # Still hung. Repeat the P1 on the configured interval.
+            # Do not kill, restart, or dump stacks again.
+            last = self._last_alert_mono
+            if last is None or now_mono - last >= self.realert_s:
+                self._last_alert_mono = now_mono
+                self._send_hung_alert(hb, reason, age, inflight)
             return
         # Latch first so a slow send cannot double-fire. The alert goes out
         # before the dump and hang.json: a full disk must not eat the P1.
         self._latched = True
         self._latched_ts = ts
-        reason = "inflight_com_call" if hung_inflight else "heartbeat"
-        age = hb_stall
-        inflight, _inflight_wall = _inflight_age(hb, time.time())
-        name = ""
-        if isinstance(inflight, dict):
-            name = str(inflight.get("name") or "")
-        age_txt = f"{age:.0f}" if age is not None else "?"
-        message = (
-            f"🚨 **P1 HUNG** `{os.path.basename(self.bot_dir)}` "
-            f"main thread heartbeat age={age_txt}s "
-            f"inflight_com_call={name or 'none'} ({reason}). "
-            f"Process was NOT killed or restarted."
-        )
-        if self.alert_fn is not None:
-            try:
-                self.alert_fn(message)
-            except Exception:
-                logger.exception("hang watchdog alert failed")
+        self._last_alert_mono = now_mono
+        self._send_hung_alert(hb, reason, age, inflight)
         stacks_path = os.path.join(self.bot_dir, STACKS_FILENAME)
         try:
             dump_thread_stacks(stacks_path)
@@ -636,6 +675,33 @@ class HangWatchdog:
         except Exception:
             logger.exception("hang watchdog hang.json write failed")
 
+    def _send_hung_alert(self, hb: dict, reason: str, age, inflight) -> None:
+        """One P1. Names mode, the entry gate, and whether a position is open.
+
+        The process is not killed or restarted. Mira restarts it by hand.
+        """
+        name = ""
+        if isinstance(inflight, dict):
+            name = str(inflight.get("name") or "")
+        age_txt = f"{age:.0f}" if age is not None else "?"
+        link = hb.get("link") if isinstance(hb.get("link"), dict) else {}
+        mode = link.get("mode", "unknown")
+        entries = link.get("entries_blocked", "unknown")
+        position = link.get("position_open", "unknown")
+        message = (
+            f"🚨 **P1 HUNG** `{os.path.basename(self.bot_dir)}` "
+            f"main thread heartbeat age={age_txt}s "
+            f"inflight_com_call={name or 'none'} ({reason}). "
+            f"mode={mode} entries_blocked={entries} position_open={position}. "
+            f"Process was NOT killed or restarted; manual restart: Mira"
+        )
+        if self.alert_fn is None:
+            return
+        try:
+            self.alert_fn(message)
+        except Exception:
+            logger.exception("hang watchdog alert failed")
+
 
 # Process-wide install used by the Tk app. Tests may bind their own pair.
 _writer: HeartbeatWriter | None = None
@@ -643,25 +709,76 @@ _watchdog: HangWatchdog | None = None
 _guard = threading.Lock()
 
 
-def _rotate_hang_artifacts(bot_dir: str) -> None:
-    """Move hang.json and hang_stacks.txt aside. Best-effort.
+def _archive_stamp(path: str) -> str:
+    """``YYYYmmdd-HHMMSS`` from the file's own mtime."""
+    return time.strftime(
+        "%Y%m%d-%H%M%S", time.localtime(os.path.getmtime(path)))
 
-    A clean stop leaves them in place so the episode can be read. The next
-    deploy must not keep reporting that old episode.
+
+def _unique_archive_name(directory: str, prefix: str, stamp: str, ext: str) -> str:
+    """A name that does not already exist. A collision gets ``_2``, ``_3``, ..."""
+    candidate = f"{prefix}{stamp}{ext}"
+    if not os.path.exists(os.path.join(directory, candidate)):
+        return candidate
+    n = 2
+    while True:
+        candidate = f"{prefix}{stamp}_{n}{ext}"
+        if not os.path.exists(os.path.join(directory, candidate)):
+            return candidate
+        n += 1
+
+
+def _archive_one(directory: str, name: str, prefix: str, ext: str) -> None:
+    src = os.path.join(directory, name)
+    if not os.path.isfile(src):
+        return
+    try:
+        dest = os.path.join(
+            directory, _unique_archive_name(directory, prefix, _archive_stamp(src), ext))
+        os.replace(src, dest)
+    except OSError:
+        logger.exception("hang file archive failed for %s", name)
+
+
+def _prune_hang_archives(bot_dir: str, keep: int = HANG_ARCHIVE_KEEP) -> None:
+    """Drop the oldest archived episodes past ``keep``. Never the live files."""
+    try:
+        names = os.listdir(bot_dir)
+    except OSError:
+        logger.exception("hang archive list failed")
+        return
+    for pattern in (_HANG_JSON_ARCHIVE, _HANG_STACKS_ARCHIVE):
+        matched = [name for name in names if pattern.match(name)]
+
+        def _key(name: str, pattern=pattern):
+            match = pattern.match(name)
+            suffix = int(match.group(2) or 0)
+            return (match.group(1), suffix)
+
+        matched.sort(key=_key)
+        stale = matched[:-keep] if keep > 0 else matched
+        for name in stale:
+            try:
+                os.remove(os.path.join(bot_dir, name))
+            except OSError:
+                logger.exception("hang archive prune failed for %s", name)
+
+
+def _archive_hang_artifacts(bot_dir: str) -> None:
+    """Rename the previous episode to hang_<mtime>. Keep the newest 10.
+
+    A failed rename is logged and the file stays where it is. This does
+    not delete hang.json or hang_stacks.txt except by a successful rename.
     """
-    for name in (HANG_FILENAME, STACKS_FILENAME):
-        path = os.path.join(bot_dir, name)
-        if not os.path.isfile(path):
-            continue
-        try:
-            os.replace(path, path + ".prev")
-        except OSError:
-            logger.exception("hang file rotate failed for %s", name)
+    _archive_one(bot_dir, HANG_FILENAME, "hang_", ".json")
+    _archive_one(bot_dir, STACKS_FILENAME, "hang_stacks_", ".txt")
+    _prune_hang_archives(bot_dir)
 
 
 def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
           inflight_hung_s: float = DEFAULT_INFLIGHT_HUNG_S,
-          poll_s: float = DEFAULT_POLL_S) -> HeartbeatWriter:
+          poll_s: float = DEFAULT_POLL_S,
+          realert_s: float = DEFAULT_REALERT_S) -> HeartbeatWriter:
     """Install the writer, publish one heartbeat, and start the watchdog.
 
     Must run on the Tk main thread (the first write asserts it). Calling
@@ -675,7 +792,7 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
     later tick can retry.
     """
     global _writer, _watchdog
-    _rotate_hang_artifacts(bot_dir)
+    _archive_hang_artifacts(bot_dir)
     writer = HeartbeatWriter(bot_dir)
     try:
         writer.write()
@@ -690,12 +807,12 @@ def start(bot_dir: str, alert_fn=None, *, hung_s: float = DEFAULT_HUNG_S,
         if _watchdog is None:
             _watchdog = HangWatchdog(
                 bot_dir, hung_s=hung_s, inflight_hung_s=inflight_hung_s,
-                poll_s=poll_s, alert_fn=alert_fn)
+                poll_s=poll_s, alert_fn=alert_fn, realert_s=realert_s)
             _watchdog.start()
         else:
             _watchdog.configure(
                 bot_dir, hung_s=hung_s, inflight_hung_s=inflight_hung_s,
-                poll_s=poll_s, alert_fn=alert_fn)
+                poll_s=poll_s, alert_fn=alert_fn, realert_s=realert_s)
     return writer
 
 
@@ -765,6 +882,9 @@ def _emit_com_return(name: str, elapsed_ms: float, *, failed: bool) -> None:
 def call_com(name: str, fn, *args, **kwargs):
     """Run a broker/COM call, stamping inflight_com_call around it.
 
+    The stamp is written before ``fn`` and cleared after it returns.
+    A failed stamp write is logged on every attempt.
+
     The stamp is written only on the main thread, and only when a writer
     is installed. Otherwise ``fn`` runs unchanged — login before deploy,
     and any background caller, keep their existing behavior. The heartbeat
@@ -777,6 +897,14 @@ def call_com(name: str, fn, *args, **kwargs):
     After ``fn`` returns or raises, the duration is logged. That log is
     also best-effort and does not add a COM call or change control flow.
     """
+    _stamp_depth.n = _stamp_depth_value() + 1
+    try:
+        return _call_com_body(name, fn, args, kwargs)
+    finally:
+        _stamp_depth.n = _stamp_depth_value() - 1
+
+
+def _call_com_body(name, fn, args, kwargs):
     writer = _writer
     on_main = threading.current_thread() is threading.main_thread()
     stamp = writer is not None and on_main

@@ -6,20 +6,25 @@ arrive, so a dropped reply stayed up in the machine and entries were
 never paused.
 
 This poller reads ``IsConnectedByID`` (the caller does the COM call).
-``0`` pauses new entries and schedules one ``ConnectByID`` per backoff
-step (5/10/30/60 seconds, then 60). ``1`` marks the reply READY on the
-poll path and lifts that pause. It never logs out. A connect already in
-flight is not duplicated inside one backoff step.
+``0`` pauses new entries. One ``ConnectByID`` is sent per down episode,
+and only after ``POLL_CONNECT_MIN_ZEROS`` consecutive 0 readings that
+span the reply settle, and only when the link machine permits it. A
+reading of 2 means SKCOM is reconnecting itself and breaks that run.
+``1`` marks the reply READY on the poll path and lifts that pause. It
+never logs out. A connect stays in flight until OnComplete, a poll of
+1, or ``POLL_CONNECT_TIMEOUT_S``.
 
 Poll READY and a reply event are different facts. ``IsConnectedByID==1``
 does not mean OnConnect, OnComplete, or OnNewData arrived. The silent
 alert fires when no reply event arrives within 60s of login, of a
 detected drop, or of a real order being sent. It does not pause entries.
 
-After ``REPLY_CONNECT_ATTEMPT_CAP`` (10) ConnectByID calls with the
-link still down, one distinct alert is sent and retries stop. A later
-``IsConnectedByID==1`` or a new drop clears the counter. An operator
-reconnect or a process restart is what starts another series.
+One ``ConnectByID`` per down episode. If the reply is still down
+``POLL_CONNECT_TIMEOUT_S`` seconds after that call, one alert is sent:
+entries stay paused and there is no further automatic reconnect. An
+operator reconnect or a process restart is what brings the link back.
+``REPLY_CONNECT_ATTEMPT_CAP`` is only a defensive backstop. It cannot
+be reached while a single call is issued per drop.
 
 #203 quote-stuck recovery resubscribes ticks. It must not call
 ``ConnectByID`` and must not clear ``orders_paused`` while this poll
@@ -37,18 +42,24 @@ from datetime import datetime, timedelta
 REPLY_BACKOFF_S = (5, 10, 30, 60)
 REPLY_POLL_S = 60
 SILENT_AFTER_S = 60
-# Stop ConnectByID after this many attempts in one down episode.
-# Ten attempts span the 5/10/30/60 schedule and several capped 60s
-# steps (about eight minutes) without hammering SKCOM all session.
+# Defensive backstop only. One ConnectByID is issued per drop, so this
+# cap cannot be reached on that path. The CAP+2 loop in
+# tests/test_reply_link_poller.py still pins the branch.
 REPLY_CONNECT_ATTEMPT_CAP = 10
+# Consecutive clean 0 readings, spanning at least the reply settle,
+# before the one ConnectByID. A 2 breaks the run.
+POLL_CONNECT_MIN_ZEROS = 3
+# One call per down episode. No release by then: degrade, alert, stop.
+POLL_CONNECT_TIMEOUT_S = 90.0
 
 SILENT_ALERT = (
     "[CONN] REPLY CHANNEL SILENT — no reply event within 60s"
 )
 STILL_DOWN_ALERT = (
-    "[CONN] reply link still down after "
-    f"{REPLY_CONNECT_ATTEMPT_CAP} ConnectByID attempts; "
-    "entries paused; retry stopped"
+    "[CONN] reply link still down "
+    f"{POLL_CONNECT_TIMEOUT_S:g}s after one ConnectByID; "
+    "entries paused; no further automatic reconnect; "
+    "operator reconnect or restart needed"
 )
 
 
@@ -183,6 +194,8 @@ class ReplyLinkPoller:
         self._stopped = False
         self._next_connect_at: datetime | None = None
         self._connects = 0
+        self._zero_at: list[datetime] = []
+        self._blocked_by_two = False
 
     @property
     def connect_count(self) -> int:
@@ -218,6 +231,8 @@ class ReplyLinkPoller:
         self._capped = False
         self._ceiling_alerted = False
         self._next_connect_at = None
+        self._zero_at = []
+        self._blocked_by_two = False
 
     def note_reply_event(self, kind: str) -> None:
         """OnConnect, OnComplete, or OnNewData. This episode is not silent.
@@ -268,9 +283,15 @@ class ReplyLinkPoller:
             return
         try:
             if state == 1:
+                self._clear_zero_run()
                 self._on_ready(now)
             elif state == 0:
+                self._note_zero(now)
                 self._on_down(now)
+            elif state == 2:
+                self._note_two()
+                self._log_info(
+                    "[CONN] IsConnectedByID=2 poll (SKCOM reconnecting)")
             else:
                 self._log_info(f"[CONN] IsConnectedByID={state} poll ignored")
             self.consider_silent(now, force=False)
@@ -346,6 +367,7 @@ class ReplyLinkPoller:
         self._step = 0
         self._attempts = 0
         self._capped = False
+        self._clear_zero_run()
         # Leave the silent episode open. IsConnectedByID==1 is not
         # OnConnect, OnComplete, or OnNewData.
 
@@ -389,11 +411,21 @@ class ReplyLinkPoller:
         # reconnect. Either case must not call ConnectByID.
         if machine is None or not user_id:
             return
-        # One connect for this step. The next wait is capped at 60s
-        # until REPLY_CONNECT_ATTEMPT_CAP, then retries stop.
+        # Keep checking on the backoff clock. The call itself is once
+        # per down episode, and only when the gates below all pass.
         self._step += 1
-        self._attempts += 1
         self._next_connect_at = now + timedelta(seconds=backoff_delay_s(self._step))
+        started = self._inflight_started(machine)
+        if started is not None:
+            if (now - started).total_seconds() >= POLL_CONNECT_TIMEOUT_S:
+                self._give_up(machine, now)
+            return
+        if not self._zeros_ready(self._settle_s(machine)):
+            return
+        ask = getattr(machine, "may_poll_connect", None)
+        if callable(ask) and not ask(now):
+            return
+        self._attempts += 1
         try:
             self._connect(user_id)
             self._connects += 1
@@ -405,6 +437,53 @@ class ReplyLinkPoller:
             self._capped = True
             self._next_connect_at = None
             self._notify_ceiling()
+
+    def _clear_zero_run(self) -> None:
+        self._zero_at = []
+        self._blocked_by_two = False
+
+    def _note_two(self) -> None:
+        """SKCOM is reconnecting itself. The clean-0 run starts over."""
+        self._zero_at = []
+        self._blocked_by_two = True
+
+    def _note_zero(self, now: datetime) -> None:
+        if self._blocked_by_two:
+            self._blocked_by_two = False
+            self._zero_at = []
+        self._zero_at.append(now)
+
+    def _settle_s(self, machine) -> float:
+        config = getattr(machine, "config", None)
+        settle = getattr(config, "reply_settle_s", None)
+        if isinstance(settle, (int, float)) and not isinstance(settle, bool):
+            return float(settle)
+        return 10.0
+
+    def _zeros_ready(self, settle_s: float) -> bool:
+        if self._blocked_by_two or len(self._zero_at) < POLL_CONNECT_MIN_ZEROS:
+            return False
+        span = (self._zero_at[-1] - self._zero_at[0]).total_seconds()
+        return span >= float(settle_s)
+
+    def _inflight_started(self, machine):
+        if not getattr(machine, "_reply_awaiting_complete", False):
+            return None
+        return getattr(machine, "_reply_connect_started_at", None)
+
+    def _give_up(self, machine, now: datetime) -> None:
+        """Timeout with no release. Degrade, alert once, do not connect again."""
+        self._capped = True
+        self._next_connect_at = None
+        try:
+            note = getattr(machine, "note_poll_connect_timeout", None)
+            if callable(note):
+                note(now)
+        except Exception as exc:
+            self._safe_error(
+                "[CONN] reply connect timeout failed: "
+                f"[{type(exc).__name__}] {exc}")
+        self._notify_ceiling()
 
     def _notify_ceiling(self) -> None:
         if self._ceiling_alerted:
