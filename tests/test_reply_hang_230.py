@@ -99,6 +99,73 @@ def test_reply_handlers_accept_com_arity():
     assert ("reply_seen", "OnNewData") in queued
 
 
+def test_backoff_callback_reschedules_on_exception():
+    """_on_reply_backoff re-arms the gate and the timer when its body raises."""
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    gated = []
+    scheduled = []
+
+    class _Poller:
+        stopped = False
+
+        def pending_delay_s(self, now):
+            return 5.0
+
+    class _Root:
+        def after(self, ms, fn, *args):
+            scheduled.append(ms)
+            return "tok"
+
+        def after_cancel(self, token):
+            return None
+
+    app._reply_poller = _Poller()
+    app._reply_backoff_token = "old"
+    app.root = _Root()
+    app._apply_link_gate = lambda: gated.append("gate")
+
+    def _boom(cause):
+        raise RuntimeError(f"poll {cause}")
+
+    app._poll_reply_link = _boom
+    try:
+        app._on_reply_backoff()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("backoff body did not raise")
+    assert gated == ["gate"]
+    assert scheduled == [5000]
+    assert app._reply_backoff_token == "tok"
+
+
+def test_main_heartbeat_reschedules_when_body_raises():
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    scheduled = []
+
+    class _Root:
+        def after(self, ms, fn, *args):
+            scheduled.append(ms)
+            return "hb"
+
+    app.root = _Root()
+    app._heartbeat_active = True
+    app._heartbeat_after_id = "old"
+
+    def _boom():
+        raise RuntimeError("publish")
+
+    app._publish_link_heartbeat = _boom
+    try:
+        app._on_main_heartbeat()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("heartbeat body did not raise")
+    assert scheduled == [hb.HEARTBEAT_INTERVAL_MS]
+    assert app._heartbeat_after_id == "hb"
+
+
 def test_poll_reply_link_reschedules_when_poll_raises():
     """A raising poll still re-arms the entry gate and the backoff timer."""
     app = rb.BacktestApp.__new__(rb.BacktestApp)

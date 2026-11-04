@@ -4256,7 +4256,19 @@ class BacktestApp:
 
     def _on_reply_backoff(self) -> None:
         self._reply_backoff_token = None
-        self._poll_reply_link("backoff")
+        try:
+            self._poll_reply_link("backoff")
+        finally:
+            # The poll helper re-arms too. This still runs when that
+            # helper itself raises, so the after-chain cannot die here.
+            try:
+                self._apply_link_gate()
+            except Exception:
+                pass
+            try:
+                self._schedule_reply_backoff()
+            except Exception:
+                pass
 
     def _probe_reply_connected(self, user_id: str):
         """One IsConnectedByID read, 30s after login. Logged only.
@@ -11880,18 +11892,23 @@ class BacktestApp:
         self._heartbeat_after_id = None
         if not getattr(self, "_heartbeat_active", False):
             return
-        self._publish_link_heartbeat()
         try:
-            tick()
-        except Exception as e:
-            # A final os.replace failure is already in the bot log via
-            # the rate-limited sink (hb_logged). Anything else still
-            # goes to _log, through the same 10-minute limit.
-            if not getattr(e, "hb_logged", False):
-                note_heartbeat_failure(
-                    f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
-        if getattr(self, "_heartbeat_active", False):
-            self._arm_heartbeat_tick()
+            self._publish_link_heartbeat()
+            try:
+                tick()
+            except Exception as e:
+                # A final os.replace failure is already in the bot log via
+                # the rate-limited sink (hb_logged). Anything else still
+                # goes to _log, through the same 10-minute limit.
+                if not getattr(e, "hb_logged", False):
+                    note_heartbeat_failure(
+                        f"[HEARTBEAT] tick failed: [{type(e).__name__}] {e}")
+        finally:
+            if getattr(self, "_heartbeat_active", False):
+                try:
+                    self._arm_heartbeat_tick()
+                except Exception:
+                    pass
 
     def _stop_main_heartbeat(self) -> None:
         from src.live.main_heartbeat import stop
