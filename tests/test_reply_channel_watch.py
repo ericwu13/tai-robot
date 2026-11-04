@@ -206,7 +206,8 @@ def test_connect_by_id_return_code_is_logged(monkeypatch):
     assert enabled == []
     assert ("錯誤 Error", "error") not in [(m, lv) for m, lv in statuses]
     assert libs.calls.index("ConnectByID") < libs.calls.index("EnterMonitorLONG")
-    assert "[CONN] ConnectByID returned 151 reply connect rejected" in logged
+    assert "[CONN] ConnectByID returned 151" in logged
+    assert "reply connect rejected" not in "\n".join(logged)
 
 
 def test_connect_by_id_logs_raw_code_when_lookup_unavailable(monkeypatch):
