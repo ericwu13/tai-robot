@@ -11120,17 +11120,16 @@ class BacktestApp:
         # begin_oi_query(): that would clear the book and leave it
         # UNKNOWN for the whole fill wait. A tail "##" still cannot
         # flatten a later deploy — "##" answers empty only after "001"
-        # in that generation (issue #202). Held while the reply link is
-        # down; the timer below still re-arms.
-        if self._account_query_blocked():
-            _log_debug("[CONN] fill poll deferred: reply link down")
-        else:
-            try:
-                user_id = self.login_user_var.get().strip()
-                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                         user_id, self._futures_account, 1)
-            except Exception as e:
-                _log(f"FILL POLL: GetOpenInterestGW error: {e}")
+        # in that generation (issue #202).
+        # The periodic account poll is held while the reply link is
+        # down. This fill check is not: an exit must still be able to
+        # confirm, or the 10s timeout downgrades the bot.
+        try:
+            user_id = self.login_user_var.get().strip()
+            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                     user_id, self._futures_account, 1)
+        except Exception as e:
+            _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
         _log(f"FILL POLL: {action.message}")
         self._fill_poll_timer_id = self.root.after(
@@ -11691,10 +11690,10 @@ class BacktestApp:
             btn.config(state=state)
 
     def _account_query_blocked(self) -> bool:
-        """Hold GetOpenInterestGW and GetFutureRights while reply is down.
+        """Hold the periodic account poll while the reply link is down.
 
-        A polled-ready reading or OnComplete (which clears the poller's
-        down flag before the reconcile query) releases the hold. The
+        Fill confirmation and exit/flatten queries do not use this.
+        A polled-ready reading or OnComplete releases the hold. The
         login CONNECTING state, before any down reading, does not.
         """
         poller = getattr(self, "_reply_poller", None)

@@ -631,3 +631,57 @@ def test_connect_by_id_call_sites_are_login_and_the_machine_port():
     assert other == [] or all(
         hit[0].endswith("broker_port.py") for hit in other
     )
+
+
+def test_exit_fill_during_reply_down_confirms_without_downgrade(monkeypatch):
+    """An exit fill still queries the position while the reply link is down."""
+    from types import SimpleNamespace
+
+    from src.live.fill_poller import FillPoller
+    from src.live.trading_guard import TradingGuard
+
+    queries: list[str] = []
+    alerts: list[str] = []
+    guard = TradingGuard()
+    guard.on_fill_pending("exit")
+    fill = FillPoller(guard, timeout=10.0)
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._trading_guard = guard
+    app._fill_poller = fill
+    app._trading_mode = "auto"
+    app._live_runner = SimpleNamespace(
+        trading_mode="auto",
+        broker=SimpleNamespace(trade_source="real"),
+        symbol="TX00",
+    )
+    app._fill_poll_timer_id = None
+    app._futures_account = "ACCT"
+    app._logged_in = True
+    app.login_user_var = SimpleNamespace(get=lambda: "U")
+    app.trading_mode_var = SimpleNamespace(set=lambda _value: None)
+    app._reply_poller = SimpleNamespace(down=True)
+    app._link_host = None
+    app.root = SimpleNamespace(
+        after=lambda _ms, _fn, *args: "tok",
+        after_cancel=lambda _token: None,
+    )
+    assert app._account_query_blocked() is True
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetOpenInterestGW=lambda *a: 0))
+    monkeypatch.setattr(
+        rb, "call_com",
+        lambda name, fn, *args, **kwargs: queries.append(name) or 0)
+    monkeypatch.setattr(rb, "_discord", SimpleNamespace(
+        enabled=True,
+        fill_timeout_downgrade=lambda *args: alerts.append("downgrade"),
+    ))
+
+    started = fill.start("exit", current_position=-1)
+    assert started.type == "start_polling"
+    app._poll_fill_confirmation()
+    assert queries == ["GetOpenInterestGW"]
+    confirmed = fill.on_position_update(0)
+    assert confirmed is not None and confirmed.type == "confirmed"
+    assert app._trading_mode == "auto"
+    assert alerts == []
+    assert guard.halted is False
