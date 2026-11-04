@@ -9639,7 +9639,13 @@ class BacktestApp:
         exit_price, price_src = self._get_latest_price()
         if exit_price <= 0:
             exit_price = last_bar.close
-        runner.broker.force_close(runner._bar_index, exit_price, last_close_dt)
+        # Issue #235: book the last processed bar, not _bar_index (the
+        # next bar). Claim the trade so the next bar's
+        # _check_for_trade_close cannot log a second TRADE_CLOSE.
+        runner.broker.force_close(
+            runner.force_close_bar_index(), exit_price, last_close_dt)
+        if runner.broker.trades:
+            runner._claim_trade_close_log(runner.broker.trades[-1])
         runner._log_decision(
             last_bar, "FORCE_CLOSE", side,
             "session_end", exit_price,
