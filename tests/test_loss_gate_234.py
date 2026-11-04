@@ -19,6 +19,7 @@ import pytest
 import run_backtest as rb
 import src.live.main_heartbeat as hb
 from src.live.account_monitor import AccountMonitor
+from src.live.deploy_request import DeployRequest
 from src.live.fill_poller import FillPoller
 from src.live.trading_guard import TradingGuard
 
@@ -345,6 +346,168 @@ def test_equity_hold_alerts_once_and_keeps_holding(monkeypatch):
 
     app._handle_semi_auto_order(_entry())
     assert "SendFutureOrderCLR" not in calls
+
+
+@pytest.mark.parametrize("mode, armed", [
+    ("auto", True),
+    ("semi_auto", True),
+    ("paper", False),
+])
+def test_deploy_live_from_arms_the_hold_for_real_modes_only(mode, armed):
+    """The production arm inside ``_deploy_live_from``, not the test helper.
+
+    An unknown strategy returns after that arm and before any bot dir
+    is created. Deleting the arm leaves ``_equity_refresh_owed`` unset.
+    """
+    app = SimpleNamespace(
+        symbol_var=_Var("TMF00"),
+        strategy_var=_Var("not-a-real-strategy"),
+        bot_name_var=_Var(),
+        trading_mode_var=_Var(),
+        pv_var=_Var("10"),
+        mode_combo=SimpleNamespace(config=lambda **_kwargs: None),
+        _mode_key_to_combo={
+            "paper": "Paper",
+            "semi_auto": "Semi",
+            "auto": "Auto",
+        },
+        _settings={},
+        _trading_guard=TradingGuard(daily_loss_limit=1),
+        _fill_poller=SimpleNamespace(reset=lambda: None),
+        _session_end_exit_pending=True,
+        set_status=lambda *_args, **_kwargs: None,
+    )
+    req = DeployRequest(
+        bot_name="loss-gate", trading_mode=mode, loss_limit="10000")
+    assert rb.BacktestApp._deploy_live_from(app, req) is False
+    assert app._trading_mode == mode
+    assert app._equity_refresh_owed is armed
+    if armed:
+        assert app._equity_hold_since is not None
+        assert app._equity_refresh_sent is False
+    else:
+        assert app._equity_hold_since is None
+
+
+def test_paper_to_real_switch_holds_entries_at_net_zero(monkeypatch):
+    """A hot-swap onto real orders must not enter while net is still 0."""
+    calls, _orders = _install_com(monkeypatch)
+    for new_mode in ("auto", "semi_auto"):
+        app = _app("paper")
+        app.trading_mode_var = _Var()
+        app._mode_key_to_combo = {
+            "paper": "Paper", "semi_auto": "Semi", "auto": "Auto",
+        }
+        app._trading_guard._last_net_pnl = 0
+        assert app._trading_guard.paused is False
+        app._on_mode_changed("paper", new_mode)
+        assert app._trading_mode == new_mode
+        assert app._equity_refresh_owed is True
+        assert app._trading_guard.link_entries_blocked is True
+        app._handle_semi_auto_order(_entry())
+        assert "SendFutureOrderCLR" not in calls
+        assert "Entry held until equity refresh" in app.live_log.text()
+        calls.clear()
+
+
+def test_switch_within_real_modes_does_not_rearm_the_hold():
+    """auto↔semi_auto keeps the hold it already has. Leaving real does not arm."""
+    app = _app("auto")
+    app.trading_mode_var = _Var()
+    app._mode_key_to_combo = {
+        "paper": "Paper", "semi_auto": "Semi", "auto": "Auto",
+    }
+    app._equity_refresh_owed = False
+    app._equity_hold_since = None
+    app._on_mode_changed("auto", "semi_auto")
+    assert app._trading_mode == "semi_auto"
+    assert app._equity_refresh_owed is False
+    assert app._equity_hold_since is None
+
+    app._trading_mode = "auto"
+    app._equity_refresh_owed = True
+    app._equity_hold_since = 123.0
+    app._equity_refresh_sent = True
+    app._on_mode_changed("semi_auto", "auto")
+    assert app._equity_refresh_owed is True
+    assert app._equity_hold_since == 123.0
+    assert app._equity_refresh_sent is True
+
+    app._equity_refresh_owed = False
+    app._equity_hold_since = None
+    app._on_mode_changed("auto", "paper")
+    assert app._trading_mode == "paper"
+    assert app._equity_refresh_owed is False
+
+
+def test_non_real_mode_other_than_paper_also_arms_on_the_way_to_auto():
+    app = _app("paper")
+    app.trading_mode_var = _Var()
+    app._mode_key_to_combo = {"paper": "Paper", "auto": "Auto", "semi_auto": "Semi"}
+    app._equity_refresh_owed = False
+    app._on_mode_changed("", "auto")
+    assert app._equity_refresh_owed is True
+    assert app._equity_hold_since is not None
+
+
+def test_paper_link_gate_releases_the_equity_hold():
+    """M9: the paper branch of ``_apply_link_gate`` must clear the hold."""
+    app = _app("paper")
+    app._equity_refresh_owed = True
+    app._equity_hold_since = 1.0
+    app._equity_refresh_sent = True
+    app._apply_link_gate()
+    assert app._equity_refresh_owed is False
+    assert app._equity_hold_since is None
+    assert app._trading_guard.link_entries_blocked is False
+
+    real = _app("auto")
+    real._equity_refresh_owed = True
+    real._equity_hold_since = 1.0
+    real._apply_link_gate()
+    assert real._equity_refresh_owed is True
+    assert real._trading_guard.link_entries_blocked is True
+
+
+def test_equity_alert_is_suppressed_while_the_reply_link_is_down(monkeypatch):
+    """#231 already alerts while queries are blocked. This note waits."""
+    notes: list[str] = []
+    monkeypatch.setattr(
+        rb, "_discord",
+        SimpleNamespace(enabled=True, notify=notes.append))
+    app = _app("auto")
+    app._equity_refresh_owed = True
+    app._equity_hold_alerted = False
+    app._equity_hold_since = time.monotonic() - (rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 1)
+    app._reply_poller = SimpleNamespace(down=True)
+    app._note_equity_hold_timeout()
+    assert notes == []
+    assert app._equity_hold_alerted is False
+    assert app._equity_refresh_owed is True
+
+    app._reply_poller = SimpleNamespace(down=False)
+    app._note_equity_hold_timeout()
+    app._note_equity_hold_timeout()
+    assert len(notes) == 1
+    assert "held" in notes[0]
+
+
+def test_heartbeat_tick_sends_the_equity_hold_alert(monkeypatch):
+    """M10: the alert is fired from ``_on_main_heartbeat``, not only the helper."""
+    notes: list[str] = []
+    monkeypatch.setattr(
+        rb, "_discord",
+        SimpleNamespace(enabled=True, notify=notes.append))
+    app = _app("auto")
+    app._heartbeat_active = True
+    app._equity_refresh_owed = True
+    app._equity_hold_alerted = False
+    app._equity_hold_since = time.monotonic() - (rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 1)
+    app._on_main_heartbeat()
+    assert len(notes) == 1
+    assert "held" in notes[0]
+    assert app._equity_refresh_owed is True
+    assert app._heartbeat_after_id is not None
 
 
 def test_debug_log_is_per_deploy_not_rotated(tmp_path, monkeypatch):

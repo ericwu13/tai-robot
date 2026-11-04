@@ -10208,6 +10208,14 @@ class BacktestApp:
         self._trading_mode = new_mode
         combo_label = self._mode_key_to_combo.get(new_mode, new_mode)
         self.trading_mode_var.set(combo_label)
+        # Paper never ran update_pnl, so the guard's net is still 0.
+        # A switch onto real orders has to wait for a rights reply
+        # before a new entry, same as a real deploy. A real→real switch
+        # keeps the hold it already has.
+        real_modes = ("semi_auto", "auto")
+        if new_mode in real_modes and old_mode not in real_modes:
+            _configure_equity_entry_hold(self, True)
+            self._apply_link_gate()
         if _discord is not None and _discord.enabled:
             try:
                 _discord.mode_switched(old_mode, new_mode)
@@ -11864,6 +11872,12 @@ class BacktestApp:
             if not getattr(self, "_equity_refresh_owed", False):
                 return
             if getattr(self, "_trading_mode", "paper") not in ("semi_auto", "auto"):
+                return
+            # A down reply link already has #231's [CONN] alert. This
+            # 90s note is only for a link that is up and still has no
+            # rights reply. Do not latch the alert while queries are
+            # blocked, so it can still fire once the link is back.
+            if self._account_query_blocked():
                 return
             since = getattr(self, "_equity_hold_since", None)
             if since is None:
