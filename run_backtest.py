@@ -130,7 +130,7 @@ from src.live.account_monitor import (
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.com_broker_port import ComBrokerPort
 from src.live.link_host import adopt_after_process_login
-from src.live.link_state_machine import KIND_CONN_ERROR, KIND_READY
+from src.live.link_state_machine import KIND_CONN_ERROR, KIND_READY, LinkPhase
 from src.live.reply_link_poller import (
     REPLY_POLL_S, ReplyLinkPoller, format_event_sink,
 )
@@ -11120,13 +11120,17 @@ class BacktestApp:
         # begin_oi_query(): that would clear the book and leave it
         # UNKNOWN for the whole fill wait. A tail "##" still cannot
         # flatten a later deploy — "##" answers empty only after "001"
-        # in that generation (issue #202).
-        try:
-            user_id = self.login_user_var.get().strip()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, self._futures_account, 1)
-        except Exception as e:
-            _log(f"FILL POLL: GetOpenInterestGW error: {e}")
+        # in that generation (issue #202). Held while the reply link is
+        # down; the timer below still re-arms.
+        if self._account_query_blocked():
+            _log_debug("[CONN] fill poll deferred: reply link down")
+        else:
+            try:
+                user_id = self.login_user_var.get().strip()
+                call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
+                         user_id, self._futures_account, 1)
+            except Exception as e:
+                _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
         _log(f"FILL POLL: {action.message}")
         self._fill_poll_timer_id = self.root.after(
@@ -11686,8 +11690,32 @@ class BacktestApp:
         for btn in (self.btn_manual_buy, self.btn_manual_sell, self.btn_manual_close):
             btn.config(state=state)
 
+    def _account_query_blocked(self) -> bool:
+        """Hold GetOpenInterestGW and GetFutureRights while reply is down.
+
+        A polled-ready reading or OnComplete (which clears the poller's
+        down flag before the reconcile query) releases the hold. The
+        login CONNECTING state, before any down reading, does not.
+        """
+        poller = getattr(self, "_reply_poller", None)
+        if poller is not None and getattr(poller, "down", False):
+            return True
+        machine = self._reply_machine()
+        if machine is None:
+            return False
+        reply = getattr(machine, "reply", None)
+        if reply == LinkPhase.DOWN:
+            return True
+        return (
+            reply == LinkPhase.CONNECTING
+            and bool(getattr(machine, "_poller_owns_connect", False))
+        )
+
     def _query_real_account(self):
         """Query real account positions and equity from Capital API."""
+        if self._account_query_blocked():
+            _log_debug("[CONN] account query deferred: reply link down")
+            return
         if not _com_available or skO is None or not self._logged_in or not self._futures_account:
             return
         user_id = self.login_user_var.get().strip()

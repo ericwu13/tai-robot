@@ -557,6 +557,60 @@ def test_stamp_write_failure_is_logged_every_time(tmp_path, monkeypatch):
     assert all("ConnectByID" in line or "os.replace" in line for line in logged)
 
 
+def test_no_account_query_between_down_poll_and_ready(monkeypatch):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    queries: list[str] = []
+
+    class _Port:
+        def connect_reply(self, user_id):
+            return 0
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: 0
+
+    machine = LinkStateMachine(
+        _Port(), LinkMachineConfig(user_id="U", reply_settle_s=10))
+    machine.adopt_after_process_login(_T0)
+    machine.quote = LinkPhase.READY
+    poller = ReplyLinkPoller(
+        lambda: machine,
+        read=lambda: 0,
+        connect=lambda _user: 0,
+        notify=lambda _msg: None,
+        log_error=lambda _msg: None,
+        log_info=lambda _msg: None,
+        reschedule_silent=lambda: None,
+    )
+    poller.note_login(_T0)
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._reply_poller = poller
+    app._link_host = SimpleNamespace(machine=machine)
+    app._logged_in = True
+    app._futures_account = "ACCT"
+    app.login_user_var = SimpleNamespace(get=lambda: "U")
+    app._account_monitor = SimpleNamespace(begin_oi_query=lambda: None)
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(
+        GetOpenInterestGW=lambda *args: 0,
+        GetFutureRights=lambda *args: 0,
+    ))
+    monkeypatch.setattr(
+        rb, "call_com", lambda name, fn, *args, **kwargs: queries.append(name) or 0)
+
+    poller.observe(1, _T0)
+    app._query_real_account()
+    assert queries == ["GetOpenInterestGW", "GetFutureRights"]
+    queries.clear()
+    poller.observe(0, _T0 + timedelta(seconds=70))
+    app._query_real_account()
+    assert queries == []
+    poller.observe(1, _T0 + timedelta(seconds=80))
+    app._query_real_account()
+    assert queries == ["GetOpenInterestGW", "GetFutureRights"]
+
+
 def test_connect_by_id_call_sites_are_login_and_the_machine_port():
     """SKReplyLib_ConnectByID is only the login call and the machine port."""
     app_lines = []
