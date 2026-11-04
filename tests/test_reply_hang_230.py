@@ -1272,3 +1272,116 @@ def test_equity_refresh_resets_sent_on_a_nonzero_code(monkeypatch):
     assert "entries held: equity never refreshed" in text
     assert "ACCT" not in text
     assert notices
+
+
+def _held_alert_lines(lines: list[str]) -> list[str]:
+    return [
+        line for line in lines
+        if "entries held: equity never refreshed" in line
+    ]
+
+
+def _release_equity_hold_via_update_pnl(app) -> None:
+    """Successful rights callback: update_pnl, then the hold drops."""
+    from types import SimpleNamespace
+
+    from src.live.account_monitor import AccountMonitor
+
+    monitor = AccountMonitor()
+    monitor.update_rights({
+        "equity": "100000",
+        "available": "80000",
+        "float_pnl": "0",
+        "realized_pnl": "0",
+        "realized_cost": "0",
+        "tax": "0",
+        "maint_rate": "100",
+    })
+    app._account_monitor = monitor
+    blank = SimpleNamespace(set=lambda _value: None)
+    for name in (
+        "real_equity_var", "real_available_var", "real_pnl_var",
+        "real_realized_var", "real_fees_var", "real_net_var",
+        "real_loss_limit_var", "real_maint_var",
+    ):
+        setattr(app, name, blank)
+    app._update_real_account_display()
+    assert app._equity_refresh_held_alerted is False
+    app._equity_refresh_owed = False
+    app._apply_link_gate()
+
+
+def test_equity_held_alert_fires_once_per_hold(monkeypatch):
+    """Failed entry attempts and failed rights reads share one alert."""
+    logs: list[str] = []
+    notices: list[str] = []
+
+    def call_com(name, fn, *args, **kwargs):
+        return 151
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, msg):
+            notices.append(msg)
+
+    monkeypatch.setattr(rb, "_log", logs.append)
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    app, guard = _equity_refresh_app(monkeypatch, call_com)
+    app._apply_link_gate()
+    app._refresh_equity_before_entries()
+    app._apply_link_gate()
+    app._refresh_equity_before_entries()
+    alerts = _held_alert_lines(logs) + _held_alert_lines(notices)
+    assert len(alerts) == 2
+    assert len(_held_alert_lines(logs)) == 1
+    assert len(notices) == 1
+    assert app._equity_refresh_held_alerted is True
+    assert app._equity_refresh_owed is True
+    assert guard.link_entries_blocked is True
+    assert sum("equity refresh failed" in line for line in logs) >= 2
+    assert "ACCT" not in "\n".join(alerts)
+
+
+def test_equity_held_alert_fires_again_after_the_hold_releases(monkeypatch):
+    """A new hold after update_pnl gets its own alert. The old one does not repeat."""
+    from datetime import timedelta
+
+    logs: list[str] = []
+    notices: list[str] = []
+
+    def call_com(name, fn, *args, **kwargs):
+        raise RuntimeError("rights down")
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, msg):
+            notices.append(msg)
+
+    monkeypatch.setattr(rb, "_log", logs.append)
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    app, guard = _equity_refresh_app(monkeypatch, call_com)
+    app._apply_link_gate()
+    app._refresh_equity_before_entries()
+    assert len(_held_alert_lines(logs)) == 1
+    assert len(notices) == 1
+
+    _release_equity_hold_via_update_pnl(app)
+    assert guard.link_entries_blocked is False
+    assert len(_held_alert_lines(logs)) == 1
+    assert len(notices) == 1
+
+    poller = app._reply_poller
+    again = _T0 + timedelta(seconds=80)
+    poller.observe(0, again)
+    app._apply_link_gate()
+    assert app._equity_refresh_owed is True
+    assert app._equity_refresh_held_alerted is False
+    poller.observe(1, again + timedelta(seconds=5))
+    app._apply_link_gate()
+    app._refresh_equity_before_entries()
+    assert len(_held_alert_lines(logs)) == 2
+    assert len(notices) == 2
+    assert guard.link_entries_blocked is True
+    assert "ACCT" not in "\n".join(notices)

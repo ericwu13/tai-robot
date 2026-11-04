@@ -11794,9 +11794,18 @@ class BacktestApp:
         return number != 0
 
     def _alert_equity_refresh_held(self, detail: str) -> None:
-        """Entries stay shut because the fresh equity read did not land."""
+        """One entries-held alert per equity-refresh hold.
+
+        The latch is set when this alert fires. Later failed entry
+        attempts and later GetFutureRights errors in the same hold
+        stay quiet. It clears only when a successful refresh runs
+        ``update_pnl``.
+        """
         if not getattr(self, "_equity_refresh_owed", False):
             return
+        if getattr(self, "_equity_refresh_held_alerted", False):
+            return
+        self._equity_refresh_held_alerted = True
         msg = (
             "[CONN] entries held: equity never refreshed "
             f"({detail}); new entries stay paused"
@@ -11868,6 +11877,10 @@ class BacktestApp:
                     self.real_loss_limit_var.set(
                         f"{net:+,} / -{guard.daily_loss_limit:,}")
                 triggered = guard.update_pnl(net)
+                if getattr(self, "_equity_refresh_owed", False):
+                    # The rights callback is releasing this hold.
+                    # A later hold may alert again.
+                    self._equity_refresh_held_alerted = False
                 if triggered:
                     self._live_log_msg(
                         f"已達每日虧損上限 Daily loss limit: net={net:+,} "
