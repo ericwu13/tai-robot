@@ -390,26 +390,37 @@ def test_empty_user_id_skips_connect():
 
 
 def test_connect_attempt_ceiling_stops_and_alerts_once():
-    """Login's ConnectByID is still in flight. Polls of 0 do not send another.
+    """After a released call, further gated attempts run up to the cap.
 
-    After the 90s timeout the poller degrades, alerts once, and stops.
+    One call is in flight at a time. The tenth unanswered call degrades
+    and alerts once. A later poll does not send an eleventh.
     """
+    from src.live.reply_link_poller import POLL_CONNECT_TIMEOUT_S
+
     alerts: list[str] = []
     port, machine, _host, poller = _build(alerts)
-    port.reply_state = 0
-    poller.observe(0, T0)
-    due = poller._next_connect_at
-    for _ in range(REPLY_CONNECT_ATTEMPT_CAP + 2):
-        if due is None:
-            break
-        poller.observe(0, due)
-        due = poller._next_connect_at
-    assert _connects(port) == 0
+    poller.observe(1, T0)
+    cursor = T0 + timedelta(seconds=1)
+    poller.observe(0, cursor)
+    steps = 0
+    while _connects(port) < REPLY_CONNECT_ATTEMPT_CAP and not machine.degraded:
+        steps += 1
+        assert steps < 40, "connect cap was not reached"
+        cursor = cursor + timedelta(seconds=max(POLL_CONNECT_TIMEOUT_S, 15))
+        before = _connects(port)
+        inflight = machine._reply_awaiting_complete
+        poller.observe(0, cursor)
+        if inflight and _connects(port) != before:
+            raise AssertionError("a second ConnectByID while one was in flight")
+    assert _connects(port) == REPLY_CONNECT_ATTEMPT_CAP
+    assert machine.degraded is False
+    cursor = cursor + timedelta(seconds=POLL_CONNECT_TIMEOUT_S)
+    poller.observe(0, cursor)
     assert machine.degraded is True
     assert alerts.count(STILL_DOWN_ALERT) == 1
     assert STILL_DOWN_ALERT != SILENT_ALERT
-    poller.observe(0, T0 + timedelta(hours=3))
-    assert _connects(port) == 0
+    poller.observe(0, cursor + timedelta(hours=3))
+    assert _connects(port) == REPLY_CONNECT_ATTEMPT_CAP
 
 
 def test_non_binary_poll_does_not_pause_or_connect():

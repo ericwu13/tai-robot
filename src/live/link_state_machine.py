@@ -700,8 +700,19 @@ class LinkStateMachine:
         self._pending_complete = False
         return True
 
+    def release_poll_connect(self) -> None:
+        """The poller's ConnectByID ended without the reply coming up.
+
+        Drops the in-flight flag so a later gated call can run. Does not
+        mark the reply ready and does not call the port.
+        """
+        self._reply_awaiting_complete = False
+        self._reply_connect_started_at = None
+        if self.reply == LinkPhase.CONNECTING:
+            self.reply = LinkPhase.DOWN
+
     def note_poll_connect_timeout(self, now: datetime) -> None:
-        """The poller's ConnectByID was not released. Degrade. Do not retry."""
+        """Ten gated attempts were not released. Degrade. Do not retry."""
         self._degrade(now, "reply_connect_timeout")
 
     def _kick_reply(self, now: datetime) -> None:
