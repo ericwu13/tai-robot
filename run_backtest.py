@@ -2153,7 +2153,10 @@ class BacktestApp:
         guard = getattr(self, "_trading_guard", None)
         if host is None or guard is None:
             return
-        if self._account_query_blocked():
+        blocked = self._account_query_blocked()
+        was_blocked = bool(getattr(self, "_equity_query_was_blocked", False))
+        self._equity_query_was_blocked = blocked
+        if blocked:
             # Rights go stale while the periodic poll is held. Entries
             # stay shut until a fresh equity read follows the release.
             fresh = not getattr(self, "_equity_refresh_owed", False)
@@ -2162,8 +2165,13 @@ class BacktestApp:
             if fresh:
                 self._equity_hold_since = time.monotonic()
                 self._equity_hold_alerted = False
-        elif (
-            getattr(self, "_equity_refresh_owed", False)
+        elif was_blocked and getattr(self, "_equity_refresh_owed", False):
+            # The outage may already be longer than the 90s bound.
+            # Start that bound when a rights query can actually go out.
+            self._equity_hold_since = time.monotonic()
+        if (
+            not blocked
+            and getattr(self, "_equity_refresh_owed", False)
             and host.entries_allowed()
         ):
             if getattr(self, "_trading_mode", "paper") not in ("semi_auto", "auto"):
@@ -11881,8 +11889,8 @@ class BacktestApp:
                 return
             # A down reply link already has #231's [CONN] alert. This
             # 90s note is only for a link that is up and still has no
-            # rights reply. Do not latch the alert while queries are
-            # blocked, so it can still fire once the link is back.
+            # rights reply. Do not latch it while queries are blocked.
+            # _apply_link_gate restarts the clock when the link returns.
             if self._account_query_blocked():
                 return
             since = getattr(self, "_equity_hold_since", None)
@@ -12010,7 +12018,14 @@ class BacktestApp:
                         f"< -{guard.daily_loss_limit:,} NTD — 實單暫停 orders paused",
                         "exit")
                     if _discord and _discord.enabled:
-                        _discord.daily_loss_limit(net, guard.daily_loss_limit)
+                        try:
+                            _discord.daily_loss_limit(net, guard.daily_loss_limit)
+                        except Exception as exc:
+                            # update_pnl already ran. A notify failure must
+                            # not skip the return that releases the startup hold.
+                            _log(
+                                "[CONN] daily loss limit notify failed: "
+                                f"[{type(exc).__name__}] {exc}")
             else:
                 self.real_loss_limit_var.set("--")
         else:

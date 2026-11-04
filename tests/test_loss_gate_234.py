@@ -357,7 +357,9 @@ def test_deploy_live_from_arms_the_hold_for_real_modes_only(mode, armed):
     """The production arm inside ``_deploy_live_from``, not the test helper.
 
     An unknown strategy returns after that arm and before any bot dir
-    is created. Deleting the arm leaves ``_equity_refresh_owed`` unset.
+    is created. Removing the arm fails auto and semi_auto (2 of 3).
+    Paper expects the hold to be clear, so that case cannot catch a
+    removed arm.
     """
     app = SimpleNamespace(
         symbol_var=_Var("TMF00"),
@@ -381,12 +383,13 @@ def test_deploy_live_from_arms_the_hold_for_real_modes_only(mode, armed):
         bot_name="loss-gate", trading_mode=mode, loss_limit="10000")
     assert rb.BacktestApp._deploy_live_from(app, req) is False
     assert app._trading_mode == mode
-    assert app._equity_refresh_owed is armed
+    # Missing means not armed. Paper stays green if the arm call is gone.
+    assert getattr(app, "_equity_refresh_owed", False) is armed
     if armed:
         assert app._equity_hold_since is not None
         assert app._equity_refresh_sent is False
     else:
-        assert app._equity_hold_since is None
+        assert getattr(app, "_equity_hold_since", None) is None
 
 
 def test_paper_to_real_switch_holds_entries_at_net_zero(monkeypatch):
@@ -490,6 +493,53 @@ def test_equity_alert_is_suppressed_while_the_reply_link_is_down(monkeypatch):
     app._note_equity_hold_timeout()
     assert len(notes) == 1
     assert "held" in notes[0]
+
+
+def test_equity_hold_clock_restarts_when_the_reply_link_returns(monkeypatch):
+    """A link-down longer than 90s must not alert on the tick it recovers."""
+    notes: list[str] = []
+    monkeypatch.setattr(
+        rb, "_discord",
+        SimpleNamespace(enabled=True, notify=notes.append))
+    app = _app("auto")
+    app._equity_refresh_owed = True
+    app._equity_hold_alerted = False
+    app._equity_hold_since = time.monotonic() - (rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 5)
+    app._reply_poller = SimpleNamespace(down=True)
+    app._apply_link_gate()
+    app._note_equity_hold_timeout()
+    assert notes == []
+    stale = app._equity_hold_since
+
+    app._reply_poller = SimpleNamespace(down=False)
+    before = time.monotonic()
+    app._apply_link_gate()
+    assert app._equity_refresh_owed is True
+    assert app._equity_hold_since >= before
+    assert app._equity_hold_since != stale
+    app._note_equity_hold_timeout()
+    assert notes == []
+    assert app._equity_hold_alerted is False
+
+
+def test_discord_loss_limit_raise_does_not_stick_the_hold(monkeypatch, capsys):
+    """update_pnl has run. A Discord raise must still release the hold."""
+    def _boom(_net, _limit):
+        raise RuntimeError("discord down")
+
+    monkeypatch.setattr(
+        rb, "_discord",
+        SimpleNamespace(enabled=True, daily_loss_limit=_boom))
+    app = _app("auto")
+    app._reset_trading_guard_for_deploy()
+    assert app._equity_refresh_owed is True
+    _push_rights(app, _rights(realized_pnl="-10042"))
+    assert app._trading_guard.paused is True
+    assert app._trading_guard._last_net_pnl == -10042
+    assert app._equity_refresh_owed is False
+    logged = capsys.readouterr().out
+    assert "RuntimeError" in logged
+    assert "discord down" in logged
 
 
 def test_heartbeat_tick_sends_the_equity_hold_alert(monkeypatch):
