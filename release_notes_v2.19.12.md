@@ -5,13 +5,13 @@
 ## EXE 變更 EXE changes
 
 - **#231（待合併 / pending merge）**：修正 #230 回報連線中斷後卡住的問題。
-  - 回報連線輪詢讀到 0 時，立即暫停新進場（與回報斷線相同），並在連續 0 讀數涵蓋回報穩定時間後，每次中斷只送出一次 `ConnectByID`。該次連線在 OnComplete 或讀到 1 前視為進行中；90 秒內未恢復即降級、送出一次警示，該次中斷不再重連。沒有重試序列。
+  - 依程式順序：回報連線輪詢第一次讀到中斷（0）時，立即暫停新進場；接著在連續 0 讀數涵蓋回報穩定時間後，嘗試一次 `ConnectByID`；若該次呼叫後 90 秒連線仍未恢復，bot 降級、新進場維持暫停，並送出一次警示：`[CONN] reply link still down 90s after one ConnectByID; entries paused; no further automatic reconnect; operator reconnect or restart needed`。之後需由操作人員手動重連或重啟；沒有自動重試。
   - 中斷期間暫停定期帳戶查詢（`GetOpenInterestGW`／`GetFutureRights`），但成交確認的部位查詢照常執行，出場成交仍可確認，不會因 10 秒成交逾時而降級。
   - 連線恢復後，全自動／半自動會先查詢一次帳戶權益（`GetFutureRights`）並套用，之後才允許新進場；虧損上限與保證金檢查使用新數值。
   - 回報連線中斷時，儀表板切換為全自動（實單）的請求會被拒絕，且不查詢券商；bot 維持原模式。
   - 另含：SKCOM 事件參數個數相容、輪詢例外後重新啟用回報閘門、卡住警示註明模式與部位、卡住證據依修改時間封存、時戳寫入失敗與看門狗時間跳躍均記錄。
   **#231 (pending merge)**: fixes the #230 hang after a reply-link drop.
-  - A reply-link poll reading of 0 pauses new entries at once (same as a reply disconnect). After consecutive 0 readings that span the reply settle, one `ConnectByID` is sent per drop. It stays in flight until OnComplete or a reading of 1; if the link is not back within 90 s the bot degrades, sends one alert, and does not reconnect again for that drop. There is no retry series.
+  - In the code's order: entries pause on the first down (0) reply-link poll reading; after consecutive 0 readings that span the reply settle, one `ConnectByID` is tried; if the link is not back 90 s after that call, the bot degrades, keeps entries paused and sends one alert: `[CONN] reply link still down 90s after one ConnectByID; entries paused; no further automatic reconnect; operator reconnect or restart needed`. An operator reconnect or restart is then needed; there are no automatic retries.
   - During the drop the periodic account poll (`GetOpenInterestGW`/`GetFutureRights`) is held, but the fill-confirmation position query still runs, so exit fills confirm and the 10 s fill timeout does not downgrade the bot.
   - After recovery, auto/semi-auto bots read and apply equity (`GetFutureRights`) once before new entries reopen; the loss-limit and margin checks use the fresh value.
   - While the reply link is down, a dashboard request to switch to auto (real) is refused without any broker query; the bot stays on its current mode.
@@ -24,7 +24,7 @@
 ## 操作影響 Operator impact
 
 - **#229**：更新並重啟儀表板後才會出現新欄位；不影響 bot。 / **#229**: the new column appears after the dashboard is updated and restarted; bots are unaffected.
-- **#231**：回報連線中斷時新進場會暫停，恢復後先更新權益才重新開放；若 90 秒內未恢復會收到一次「reply link still down」警示且不再自動重連，需人工重連或重啟。 / **#231**: new entries pause during a reply-link drop and reopen only after an equity refresh; if the link is not back within 90 s you get one "reply link still down" alert and the bot does not reconnect on its own, so reconnect or restart it.
+- **#231**：回報連線中斷時新進場會暫停，恢復後先更新權益才重新開放；若 `ConnectByID` 後 90 秒仍未恢復，會收到一次警示 `[CONN] reply link still down 90s after one ConnectByID; entries paused; no further automatic reconnect; operator reconnect or restart needed`，且不再自動重連，需人工重連或重啟。 / **#231**: new entries pause during a reply-link drop and reopen only after an equity refresh; if the link is not back 90 s after the one `ConnectByID` you get one alert, `[CONN] reply link still down 90s after one ConnectByID; entries paused; no further automatic reconnect; operator reconnect or restart needed`, and the bot does not reconnect on its own, so reconnect or restart it.
 
 ## 風險 Risks
 
