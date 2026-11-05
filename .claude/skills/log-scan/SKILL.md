@@ -13,6 +13,12 @@ Scans, per bot directory, the newest two `debug_YYYYMMDD.log` files from
 the **last 7 days** (older logs are archaeology from retired test bots),
 plus `n8n-service.log` and `~/.n8n/n8nEventLog.log`.
 
+Bots on another PC (a host's `monitor.bots` in the tailscale hosts file —
+the 08-04-rss bot on `steven` since 2026-10-24) are scanned with
+`scripts/monitor/remote.py --check logs` over a fetched copy of their
+newest two log tails; the daily review skips their stale local copy and,
+once the bridge is remote, the frozen local n8n logs too.
+
 ## Pattern → severity
 
 The app's log handler prints **no levelname**, so severity comes from the

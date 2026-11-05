@@ -1,9 +1,41 @@
 ---
 name: n8n-debug
-description: Self-serve diagnosis of the local n8n news-bridge instance (W1-W5 workflows) — find why a workflow failed, never fired, or isn't imported/active, without the user in the loop. Use when a bridge script errors, a vote/signal file is missing, a Discord alert didn't arrive, or an n8n workflow/execution needs inspecting.
+description: Self-serve diagnosis of the news bridge (W1-W5) — since 2026-10-24 W1-W4 run as scheduled tasks on the second trading PC and this PC's n8n is intentionally stopped; covers both the remote tasks and the historical local n8n instance (why a workflow failed, never fired, or isn't imported/active). Use when a bridge script errors, a vote/signal file is missing, a Discord alert didn't arrive, or an n8n workflow/execution needs inspecting.
 ---
 
 # n8n News-Bridge Debugging
+
+## Read first — n8n on this PC is STOPPED ON PURPOSE (since 2026-10-24)
+
+W1 calendar, W2 cross-market, W3 RSS and W4 chips moved off this PC's
+n8n onto the second trading PC (the `steven` entry in the tailscale
+hosts file) as Windows scheduled tasks under `\TaiRobot\`
+(`Bridge-W1-calendar`, `Bridge-W2-crossmarket`, `Bridge-W3-rss`,
+`Bridge-W4-chips`). They write the same files as before (signal.json,
+events.json, regime_vote_w*.json, rss_scorer_state.json,
+.chips_state.json, monitor.log, chips_monitor.log) plus one
+`task_<W>.last.log` per task, into that host's `bridge_dir`.
+
+- `n8n-service` here is **STOPPED and set to Manual on purpose**. A
+  STOPPED state / unreachable healthz is NOT an incident — never start,
+  restart or "fix" it: it would run a second copy of W1-W4 (duplicate
+  Discord alerts) against files nobody reads any more.
+- The daily review knows this: with a bridge host in the hosts file its
+  N8N section stands down and `TASKS @steven` replaces it.
+- Diagnose the live bridge with the remote check, not this PC's DB:
+
+  ```bash
+  C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/remote.py --check tasks   # task state, last result, task_<W>.last.log
+  C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/remote.py --check bridge  # vote/signal/events/log liveness
+  ```
+
+  The fetched copy lands in `data/monitor/remote/<host>/bridge/` (read
+  `task_<W>.last.log` there for the last run's output). For anything
+  deeper, shell into the host per the `tailscale-ssh` skill and run
+  `Get-ScheduledTaskInfo -TaskPath '\TaiRobot\' -TaskName <name>`.
+- Everything below (DB, event log, `n8n_query.py`) now describes the
+  **historical** local instance — useful for executions before
+  2026-10-24, and as the recipe if the bridge ever moves back.
 
 Everything here works **without the n8n UI, without the REST API key, and
 without asking the user** — via the n8n SQLite DB (read-only), the event

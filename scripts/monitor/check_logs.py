@@ -131,13 +131,19 @@ def _scan_n8n_events(now, findings, lines) -> None:
             N8N_EVENT_LOG))
 
 
-def check_logs(now: datetime, base_dir: str, bridge_dir: str):
-    """``(findings, report_lines)`` from bot debug logs + bridge/n8n logs."""
+def check_logs(now: datetime, base_dir: str, bridge_dir: str, exclude=(),
+               scan_n8n: bool = True):
+    """``(findings, report_lines)`` from bot debug logs + bridge/n8n logs.
+
+    ``scan_n8n=False`` when this PC no longer hosts the bridge: the n8n
+    service log is not time-windowed, so a frozen tail would re-report an
+    old traceback forever.
+    """
     findings = []
     lines = [f"now: {now.strftime('%Y-%m-%d %H:%M:%S')} TPE", ""]
 
     lines.insert(1, f"scanning debug logs from the last {LOG_LOOKBACK_DAYS} days")
-    for bot_dir in discover_bot_dirs(base_dir):
+    for bot_dir in discover_bot_dirs(base_dir, exclude):
         logs = recent_logs(now, bot_dir)
         if not logs:
             continue
@@ -150,6 +156,10 @@ def check_logs(now: datetime, base_dir: str, bridge_dir: str):
             lines.extend(section)
 
     lines.append("")
+    if not scan_n8n:
+        if not findings:
+            lines.append("no known error patterns found")
+        return findings, lines
     service_log = os.path.join(bridge_dir, "n8n-service.log") if bridge_dir else ""
     if service_log and os.path.isfile(service_log):
         section = []

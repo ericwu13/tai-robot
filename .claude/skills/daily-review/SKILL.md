@@ -23,6 +23,17 @@ C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/daily_re
 ```
 
 Always exits 0; writes `data/monitor/daily_review_<TPE date>.md`.
+
+Remote hosts: every host with a `monitor:` block in the gitignored
+tailscale hosts file (`steven`: the W1-W4 bridge tasks + the 08-04-rss
+regime bot since 2026-10-24) is fetched over ONE ssh call each and gets
+its own `BOTS/REGIME/BRIDGE/LOGS/DEPLOY/TASKS @<host>` sections; their
+findings carry `area@host`. With a bridge host configured, this PC's
+BRIDGE and N8N sections stand down (n8n here is stopped on purpose — a
+STOPPED n8n-service is never a finding), and the stale local copy of a
+relocated bot is ignored. A host the fetch cannot reach is ONE P1
+"UNVERIFIED" — say so in the digest; do not report its bots/bridge as
+dead. `--no-remote` skips the fetch (offline triage only).
 Verdict: 🟢 GREEN = no P1/P2 · 🟡 YELLOW = P2 · 🔴 RED = P1. Then one
 call: `gh issue list --state open --limit 15 --json
 number,title,createdAt,updatedAt,author` — issues created/updated in the
@@ -43,7 +54,7 @@ findings + exact paths:
 | bridge | `.claude/skills/bridge-health/SKILL.md` |
 | logs | `.claude/skills/log-scan/SKILL.md` (escalate: `debug`) |
 | deploy | `.claude/skills/deploy-check/SKILL.md` |
-| n8n | `.claude/skills/n8n-debug/SKILL.md` |
+| n8n / TASKS @host | `.claude/skills/n8n-debug/SKILL.md` |
 | fresh GitHub issue | `.claude/skills/issue-triage/SKILL.md` |
 
 Each agent answers: live or not, **new vs chronic** (full history, not

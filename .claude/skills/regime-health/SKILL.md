@@ -39,6 +39,20 @@ checker report a degraded calendar instead of a missed night.
 Read-only over `data/live/<bot>/regime_state.json`, `regime_history.csv`,
 `decisions.csv`, and the `news` block of `session.json`.
 
+**The regime bot runs on another PC since 2026-10-24.**
+`TMF00_08-04-rss-機器人` is listed under `steven`'s `monitor.bots` in the
+gitignored tailscale hosts file; this tree's `data/live` copy is frozen
+at the 2026-10-23 move and must not be read as the brain's state (its
+"stopped bot" / missed-night rows are archaeology). Check the live one —
+same checker, run over a fetched copy:
+
+```bash
+C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/remote.py --check regime
+```
+
+The copy lands in `data/monitor/remote/<host>/live/<bot>/`; read
+`regime_state.json` / `regime_history.csv` there.
+
 ## Session identity (get this right first)
 
 A session is identified by its **OPEN date**. The night opening Mon 15:00
