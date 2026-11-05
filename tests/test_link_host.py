@@ -510,7 +510,13 @@ def test_gui_and_headless_share_the_reconnect_method():
     for forbidden in _FORBIDDEN:
         assert forbidden not in text, forbidden
     assert "link={snap['quote']}/{snap['reply']}" in text
-    assert "entries_blocked={snap['entries_blocked']}" in text
+    # The heartbeat still consumes the LINK gate, but reports the
+    # composite: a daily-loss-limit pause also blocks entries, and
+    # printing the link gate alone read entries_blocked=False beside a
+    # bot that refused every entry for a day (2026-11-04).
+    assert 'snap["entries_blocked"]' in text
+    assert "entries_blocked={bool(gates)}" in text
+    assert '"loss_limit"' in text
     assert "_shutdown_link" in text
 
 

@@ -370,13 +370,28 @@ class DeployDriver(_Driver):
                 st = app._live_runner.get_status()
                 link = ""
                 host = getattr(app, "_link_host", None)
+                guard = getattr(app, "_trading_guard", None)
+                # entries_blocked on the link snapshot is the LINK gate only.
+                # A daily-loss-limit pause also blocks entries, and reading
+                # entries_blocked=False beside a blocked bot is how the
+                # 2026-11-04 pause went unnoticed for a day. Report the
+                # composite, and name the gate that is actually holding.
+                paused = bool(getattr(guard, "paused", False))
                 if host is not None:
                     snap = host.snapshot()
+                    gates = []
+                    if snap["entries_blocked"]:
+                        gates.append("link")
+                    if paused:
+                        gates.append("loss_limit")
                     link = (
                         f" link={snap['quote']}/{snap['reply']}"
                         f" degraded={snap['degraded']}"
-                        f" entries_blocked={snap['entries_blocked']}"
+                        f" entries_blocked={bool(gates)}"
+                        f"{'(' + '+'.join(gates) + ')' if gates else ''}"
                     )
+                elif paused:
+                    link = " entries_blocked=True(loss_limit)"
                 rb._log(f"[HEADLESS] heartbeat: state={st['state']} pos={st['position']} "
                         f"trades={st['trades']} pnl={st['pnl']:+,} "
                         f"bars={st['bars_1m']}/{st['bars_agg']} "
