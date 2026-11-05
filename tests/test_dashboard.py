@@ -1474,3 +1474,60 @@ def test_flip_pause_is_labelled_as_a_switch_lock_not_a_trading_halt():
     assert "照常交易" in helper                      # says the leg still trades
     assert "until_session - p.session_count" in helper   # nights left, not a raw index
     assert "pauseInfo(rg.pause)" in html and "pauseInfo(r.pause)" in html
+
+
+def test_loss_status_paused_shows_the_badge_and_the_numbers():
+    view = snapshot.loss_status({
+        "loss_paused": True, "loss_net": -21340, "loss_limit": 20000,
+    })
+    assert view["paused"] is True
+    assert view["badge"] == "PAUSED"
+    assert view["title"] == "Daily loss limit reached"
+    assert view["text"] == "net -21,340 / limit 20,000"
+
+
+def test_loss_status_not_paused_has_no_badge():
+    view = snapshot.loss_status({
+        "loss_paused": False, "loss_net": -10, "loss_limit": 10000,
+    })
+    assert view["paused"] is False
+    assert view["badge"] == ""
+    assert view["title"] == ""
+    assert view["text"] == "net -10 / limit 10,000"
+
+
+def test_loss_status_limit_zero_is_off():
+    view = snapshot.loss_status({
+        "loss_paused": False, "loss_net": -100, "loss_limit": 0,
+    })
+    assert view["badge"] == ""
+    assert view["text"] == "net -100 / limit off"
+
+
+def test_loss_status_missing_fields_shows_nothing():
+    assert snapshot.loss_status(None) is None
+    assert snapshot.loss_status({}) is None
+    assert snapshot.loss_status({"ts": 1, "pid": 2}) is None
+    assert snapshot.loss_status("older-heartbeat") is None
+
+
+def test_fleet_row_reads_the_loss_pause_from_the_heartbeat(tmp_path):
+    d = make_bot(tmp_path)
+    hb = json.loads((d / "heartbeat.json").read_text(encoding="utf-8"))
+    hb.update({"loss_paused": True, "loss_net": -21340, "loss_limit": 20000})
+    (d / "heartbeat.json").write_text(json.dumps(hb), encoding="utf-8")
+    row = snapshot.bot_summary(NOW, str(d), pid_alive_fn=_alive)
+    assert row["loss"]["badge"] == "PAUSED"
+    assert row["loss"]["text"] == "net -21,340 / limit 20,000"
+    bare = make_bot(tmp_path, name="TX00_plain")
+    assert snapshot.bot_summary(NOW, str(bare), pid_alive_fn=_alive)["loss"] is None
+
+
+def test_fleet_page_renders_the_paused_badge_on_the_bot_row():
+    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+    assert "function lossBadge" in html
+    assert 'class: "chip loss-paused"' in html
+    assert "Daily loss limit reached" in html
+    assert "lossBadge(b.loss)" in html
+    assert "lossText(b.loss)" in html
