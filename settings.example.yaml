@@ -381,6 +381,8 @@ news:
     - "https://www.investing.com/rss/news.rss"
   rss_interval_minutes: 30
   rss_state_file: "data/rss_scorer_state.json"
+  rss_news_log: ""                # W3 per-article history (JSONL) for the dashboard's 新聞訊號 view;
+                                  #   empty = news/news_log.jsonl beside rss_state_file
   discord_webhook: ""             # Discord webhook URL for W2/W3 bridge alerts
 
 # ── Regime switching ───────────────────────────────────────────────────
