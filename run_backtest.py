@@ -197,21 +197,30 @@ OI_SNAPSHOT_TIMEOUT_S = 5.0
 # warmup (30s) plus one rights round-trip so a normal start does not page.
 EQUITY_ENTRY_HOLD_TIMEOUT_S = 90.0
 
+# A rejected GetFutureRights clears the sent flag. The UI drain calls
+# the gate every 100 ms, so without this gap a persistent reject would
+# query about 10 times a second. Not a settings key.
+EQUITY_REFRESH_RETRY_S = 5.0
+
 
 def _configure_equity_entry_hold(app, hold: bool) -> None:
     """Arm or clear the real/auto startup entry hold.
 
     Attribute writes only, so a deploy stand-in that is not a
-    ``BacktestApp`` can run the same path.
+    ``BacktestApp`` can run the same path. The entries-held alert
+    latch resets on both arms and releases. There is one latch:
+    the 90s note and a failed GetFutureRights share it.
     """
     if hold:
         app._equity_refresh_owed = True
         app._equity_refresh_sent = False
         app._equity_hold_since = time.monotonic()
-        app._equity_hold_alerted = False
+        app._equity_refresh_retry_at = None
+        app._equity_refresh_held_alerted = False
     else:
         app._equity_refresh_owed = False
         app._equity_hold_since = None
+        app._equity_refresh_held_alerted = False
 
 # Registry of available backtest strategies
 STRATEGIES: dict[str, type[BacktestStrategy]] = {
@@ -1680,9 +1689,12 @@ class BacktestApp:
                              f"float_pnl={parsed.get('float_pnl')}")
                         # Entries stay held until this reply has gone
                         # through update_pnl. A parsed-but-unusable
-                        # payload does not open them.
+                        # payload does not open them. daily_loss_limit 0
+                        # still runs update_pnl, so a valid reply ends
+                        # the hold and the shared alert latch.
                         if applied and getattr(self, "_equity_refresh_owed", False):
                             self._release_equity_entry_hold()
+                            self._equity_refresh_held_alerted = False
                             self._apply_link_gate()
                     _log(f"權益數 FutureRights: {_redact_future_rights(data)}")
                 elif kind == "new_data":
@@ -2162,9 +2174,10 @@ class BacktestApp:
             fresh = not getattr(self, "_equity_refresh_owed", False)
             self._equity_refresh_owed = True
             self._equity_refresh_sent = False
+            self._equity_refresh_held_alerted = False
+            self._equity_refresh_retry_at = None
             if fresh:
                 self._equity_hold_since = time.monotonic()
-                self._equity_hold_alerted = False
         elif was_blocked and getattr(self, "_equity_refresh_owed", False):
             # The outage may already be longer than the 90s bound.
             # Start that bound when a rights query can actually go out.
@@ -2176,6 +2189,7 @@ class BacktestApp:
         ):
             if getattr(self, "_trading_mode", "paper") not in ("semi_auto", "auto"):
                 self._release_equity_entry_hold()
+                self._equity_refresh_held_alerted = False
             else:
                 self._refresh_equity_before_entries()
         allowed = (
@@ -11859,6 +11873,13 @@ class BacktestApp:
             and bool(getattr(machine, "_poller_owns_connect", False))
         )
 
+    def _equity_refresh_now(self):
+        """Clock for the equity-refresh retry gap. Tests may replace it."""
+        clock = getattr(self, "_equity_refresh_clock", None)
+        if callable(clock):
+            return clock()
+        return _taipei_now()
+
     def _reset_trading_guard_for_deploy(self) -> None:
         """reset() clears a loss pause. Real/auto then waits for rights.
 
@@ -11898,9 +11919,9 @@ class BacktestApp:
                 return
             if time.monotonic() - float(since) < EQUITY_ENTRY_HOLD_TIMEOUT_S:
                 return
-            if getattr(self, "_equity_hold_alerted", False):
+            if getattr(self, "_equity_refresh_held_alerted", False):
                 return
-            self._equity_hold_alerted = True
+            self._equity_refresh_held_alerted = True
             msg = (
                 "權益數逾時未回 Equity reply not received — "
                 "new entries stay held"
@@ -11920,14 +11941,18 @@ class BacktestApp:
         except Exception as exc:
             _log_debug(
                 f"[CONN] equity hold check failed: [{type(exc).__name__}] {exc}")
-
     def _refresh_equity_before_entries(self) -> None:
         """One GetFutureRights after the reply hold lifts. No wait.
 
         The entry gate stays shut until that reply is applied. A second
         call while the request is already out does not send another.
+        A rejected call may be tried again, at most once per
+        ``EQUITY_REFRESH_RETRY_S``.
         """
         if getattr(self, "_equity_refresh_sent", False):
+            return
+        retry_at = getattr(self, "_equity_refresh_retry_at", None)
+        if retry_at is not None and self._equity_refresh_now() < retry_at:
             return
         if not _com_available or skO is None or not self._logged_in:
             return
@@ -11936,13 +11961,65 @@ class BacktestApp:
         self._equity_refresh_sent = True
         user_id = self.login_user_var.get().strip()
         try:
-            call_com(
+            code = call_com(
                 "GetFutureRights", skO.GetFutureRights,
                 user_id, self._futures_account, 1)
         except Exception as exc:
-            _log(
-                "[CONN] equity refresh failed: "
+            self._note_equity_refresh_failed(
                 f"[{type(exc).__name__}] {exc}")
+            return
+        if self._equity_refresh_code_failed(code):
+            self._note_equity_refresh_failed(
+                f"GetFutureRights returned {code}")
+
+    def _note_equity_refresh_failed(self, detail: str) -> None:
+        """Sent flag drops, and the next try waits out the retry gap."""
+        self._equity_refresh_sent = False
+        self._equity_refresh_retry_at = (
+            self._equity_refresh_now()
+            + timedelta(seconds=EQUITY_REFRESH_RETRY_S))
+        _log(f"[CONN] equity refresh failed: {detail}")
+        self._alert_equity_refresh_held(detail)
+
+    @staticmethod
+    def _equity_refresh_code_failed(code) -> bool:
+        """True when GetFutureRights returned a non-zero code."""
+        if isinstance(code, bool) or code is None:
+            return False
+        try:
+            number = int(code)
+        except (TypeError, ValueError):
+            return False
+        return number != 0
+
+    def _alert_equity_refresh_held(self, detail: str) -> None:
+        """One entries-held alert per equity-refresh hold.
+
+        The latch is set when this alert fires. Later failed entry
+        attempts and later GetFutureRights errors in the same hold
+        stay quiet. It clears when a new hold is armed, when the
+        future_rights handler releases the hold (daily_loss_limit 0
+        included), or when the paper branch drops the hold. A display
+        refresh that runs update_pnl does not clear it.
+        """
+        if not getattr(self, "_equity_refresh_owed", False):
+            return
+        if getattr(self, "_equity_refresh_held_alerted", False):
+            return
+        self._equity_refresh_held_alerted = True
+        msg = (
+            "[CONN] entries held: equity never refreshed "
+            f"({detail}); new entries stay paused"
+        )
+        _log(msg)
+        discord = _discord
+        if discord is not None and getattr(discord, "enabled", False):
+            try:
+                discord.notify(f"⚠️ {msg}")
+            except Exception as exc:
+                _log(
+                    "[CONN] equity refresh discord failed: "
+                    f"[{type(exc).__name__}] {exc}")
 
     def _query_real_account(self):
         """Query real account positions and equity from Capital API."""
@@ -12011,6 +12088,11 @@ class BacktestApp:
                 else:
                     self.real_loss_limit_var.set("--")
                 triggered = guard.update_pnl(net)
+                # Not a hold release. An open-interest refresh also
+                # lands here while the equity hold is still owed, so
+                # this must not clear _equity_refresh_held_alerted.
+                # The latch clears when a new hold is armed and when
+                # the hold is released.
                 applied = True
                 if triggered:
                     self._live_log_msg(
@@ -12027,6 +12109,9 @@ class BacktestApp:
                                 "[CONN] daily loss limit notify failed: "
                                 f"[{type(exc).__name__}] {exc}")
             else:
+                # Paper does not run update_pnl and does not clear the
+                # entries-held latch. The paper branch of the link gate
+                # releases the hold.
                 self.real_loss_limit_var.set("--")
         else:
             self.real_fees_var.set(d.fees)

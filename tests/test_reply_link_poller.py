@@ -1,10 +1,10 @@
 """Issue #219 — reply poll when SKReply events never arrive.
 
 IsConnectedByID goes 1, then 0, then 1. No OnConnect / OnComplete /
-OnSolaceReplyDisconnect is delivered. The poller must reconnect once
-per backoff step, pause entries on 0, lift that pause on 1, keep
-exits allowed, cap the backoff at 60s, never log out, and alert once
-per down episode.
+OnSolaceReplyDisconnect is delivered. The poller sends one ConnectByID
+per down episode, pauses entries on 0, lifts that pause on 1, keeps
+exits allowed, caps the backoff wait at 60s, never logs out, and
+alerts once when the 90s timeout expires.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from src.live.link_state_machine import (
     LinkStateMachine,
 )
 from src.live.reply_link_poller import (
-    REPLY_CONNECT_ATTEMPT_CAP,
+    POLL_CONNECT_TIMEOUT_S,
     SILENT_ALERT,
     STILL_DOWN_ALERT,
     ReplyLinkPoller,
@@ -389,26 +389,26 @@ def test_empty_user_id_skips_connect():
     assert machine.orders_paused is True
 
 
-def test_connect_attempt_ceiling_stops_and_alerts_once():
+def test_login_inflight_timeout_stops_without_another_connect():
     """Login's ConnectByID is still in flight. Polls of 0 do not send another.
 
-    After the 90s timeout the poller degrades, alerts once, and stops.
+    After the 90s timeout the poller degrades, alerts once, and stays
+    stopped. A later poll still does not call ConnectByID.
     """
     alerts: list[str] = []
     port, machine, _host, poller = _build(alerts)
     port.reply_state = 0
     poller.observe(0, T0)
     due = poller._next_connect_at
-    for _ in range(REPLY_CONNECT_ATTEMPT_CAP + 2):
-        if due is None:
-            break
+    deadline = T0 + timedelta(seconds=POLL_CONNECT_TIMEOUT_S + 150)
+    while due is not None and due <= deadline:
         poller.observe(0, due)
         due = poller._next_connect_at
     assert _connects(port) == 0
     assert machine.degraded is True
     assert alerts.count(STILL_DOWN_ALERT) == 1
     assert STILL_DOWN_ALERT != SILENT_ALERT
-    poller.observe(0, T0 + timedelta(hours=3))
+    poller.observe(0, deadline + timedelta(hours=1))
     assert _connects(port) == 0
 
 
