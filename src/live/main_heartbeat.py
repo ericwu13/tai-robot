@@ -528,18 +528,32 @@ class HangWatchdog:
         # A poll left running was still inside os.replace after the test
         # that started it had moved on (issue #233 review).
         self._stop = False
+        # Held across the exit check and start()'s spawn. The thread clears
+        # _running under this lock before it returns, so start() cannot see
+        # a dying thread and leave the watchdog dead.
+        self._life = threading.Lock()
+        self._running = False
+        # Test seam. Called after _running is cleared and before return.
+        self._on_exit = None
         # Tests inject the RECOVERED frame. None reads the main thread.
         self._top_frame_fn = top_frame_fn
 
     def start(self) -> None:
-        self._stop = False
-        self._enabled = True
-        if self._thread is not None and self._thread.is_alive():
-            self._wake.set()
-            return
-        self._thread = threading.Thread(
-            target=self._loop, name="hang-watchdog", daemon=True)
-        self._thread.start()
+        self._ensure_thread()
+
+    def _ensure_thread(self) -> None:
+        """Spawn unless the current thread is still inside its loop."""
+        with self._life:
+            self._stop = False
+            self._enabled = True
+            if (self._running and self._thread is not None
+                    and self._thread.is_alive()):
+                self._wake.set()
+                return
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._loop, name="hang-watchdog", daemon=True)
+            self._thread.start()
 
     def disable(self) -> None:
         """Stop checking and wait until the thread has left its poll.
@@ -549,10 +563,11 @@ class HangWatchdog:
         watchdog thread itself would deadlock, so that caller only sets
         the flag.
         """
-        self._enabled = False
-        self._stop = True
-        self._wake.set()
-        thread = self._thread
+        with self._life:
+            self._enabled = False
+            self._stop = True
+            self._wake.set()
+            thread = self._thread
         if (thread is not None and thread.is_alive()
                 and thread is not threading.current_thread()):
             thread.join(_DISABLE_JOIN_S)
@@ -584,30 +599,52 @@ class HangWatchdog:
         self._episode_origin_mono = None
         self._episode_reason = None
         self._episode_top_frame = ""
-        self._stop = False
-        self._enabled = True
-        self._wake.set()
-        if self._thread is None or not self._thread.is_alive():
-            self._thread = threading.Thread(
-                target=self._loop, name="hang-watchdog", daemon=True)
-            self._thread.start()
+        self._ensure_thread()
+
+    def _stopping(self) -> bool:
+        """Clear ``_running`` and report whether this thread should return."""
+        with self._life:
+            if not self._stop:
+                return False
+            self._running = False
+            return True
+
+    def _run_exit_hook(self) -> None:
+        hook = self._on_exit
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            logger.exception("hang watchdog exit hook failed")
 
     def _loop(self) -> None:
         # Returns when disable() sets ``_stop``. A hang does not set that
         # flag, so a hung bot does not take the process down. disable()
         # joins this thread so the poll cannot outlive the caller.
-        while not self._stop:
-            enabled = (
-                (not self._stop) and self._enabled and bool(self.bot_dir))
-            if enabled:
-                try:
-                    self._poll()
-                except Exception:
-                    logger.exception("hang watchdog check failed")
-            if self._stop:
-                break
-            self._wake.wait(self.poll_s if enabled else _IDLE_PARK_S)
-            self._wake.clear()
+        # ``_running`` drops under ``_life`` before the exit hook, so a
+        # start() racing this return spawns a replacement.
+        try:
+            while True:
+                if self._stopping():
+                    self._run_exit_hook()
+                    return
+                enabled = (
+                    (not self._stop) and self._enabled and bool(self.bot_dir))
+                if enabled:
+                    try:
+                        self._poll()
+                    except Exception:
+                        logger.exception("hang watchdog check failed")
+                if self._stopping():
+                    self._run_exit_hook()
+                    return
+                self._wake.wait(self.poll_s if enabled else _IDLE_PARK_S)
+                self._wake.clear()
+        finally:
+            with self._life:
+                if self._thread is threading.current_thread():
+                    self._running = False
 
     def _poll(self) -> None:
         """One watchdog wake. A huge gap is this thread sleeping, not a hang."""

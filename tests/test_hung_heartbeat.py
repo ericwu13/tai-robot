@@ -370,6 +370,59 @@ def test_alert_goes_out_when_dump_fails_and_missing_file_does_not_rearm(tmp_path
     assert sum("RECOVERED" in item for item in alerts) == 1
 
 
+def test_disable_joins_the_parked_watchdog(tmp_path, monkeypatch):
+    """disable() does not return while the watchdog is still in _poll.
+
+    Removing the join leaves the thread alive inside the blocked poll.
+    """
+    release = threading.Event()
+    entered = threading.Event()
+
+    def slow(self):
+        entered.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(HangWatchdog, "_poll", slow)
+    watchdog = HangWatchdog(str(tmp_path), poll_s=0.01)
+    watchdog.start()
+    assert entered.wait(2)
+    releaser = threading.Thread(
+        target=lambda: (time.sleep(0.05), release.set()), daemon=True)
+    releaser.start()
+    watchdog.disable()
+    # Sampled before joining the releaser. Without thread.join, disable
+    # returns while the watchdog is still inside the blocked poll.
+    alive_after_disable = (
+        watchdog._thread is not None and watchdog._thread.is_alive())
+    releaser.join(timeout=2)
+    assert not alive_after_disable
+
+
+def test_start_during_exit_respawns_the_watchdog(tmp_path):
+    """start() that overlaps thread exit must not leave the watchdog dead."""
+    watchdog = HangWatchdog(str(tmp_path), poll_s=0.05)
+    watchdog.start()
+    assert watchdog._thread is not None and watchdog._thread.is_alive()
+    gate = threading.Event()
+
+    def on_exit():
+        gate.set()
+        time.sleep(0.2)
+
+    watchdog._on_exit = on_exit
+    restarter = threading.Thread(target=lambda: (gate.wait(2), watchdog.start()))
+    restarter.start()
+    try:
+        watchdog.disable()
+        restarter.join(timeout=2)
+        assert watchdog._thread is not None and watchdog._thread.is_alive()
+        assert watchdog._running is True
+    finally:
+        watchdog._on_exit = None
+        watchdog.disable()
+        assert watchdog._thread is not None and not watchdog._thread.is_alive()
+
+
 def test_watchdog_default_poll_waits_two_seconds(tmp_path, monkeypatch):
     """DEFAULT_POLL_S is 2s. A 60s wait is a different watchdog."""
     waits = []

@@ -14,19 +14,17 @@ Marker layout, all under the deploy root:
 - ``host_stall.d/<bot>.json`` — one episode per bot. A bot writes only
   its own file (temp file + ``os.replace``), so two bots cannot tear
   each other's episode.
-- ``host_stall.claim`` — exclusive record that the stall rollup was
-  sent. Created with ``os.link`` onto a finished temp file, so the name
-  appears only once the JSON is complete. ``FileExistsError`` means
-  another process already sent it.
-- ``host_stall.recovery`` — the same gate for the recovery rollup.
+- ``host_stall.claim.<N>`` — generation N of the stall rollup. The
+  file is created with ``os.link`` of a finished temp file (``O_EXCL``
+  when hard links are unavailable), so exactly one writer publishes
+  that generation. Older generations are left in place.
+- ``host_stall.recovery.<N>`` — the recovery rollup for generation N,
+  created the same way.
 
 A missing file is an empty marker. JSON that does not parse, or an
 episode without a numeric ``hung_at``, is ignored and logged once.
-Episodes older than ``HOST_STALL_STALE_S`` do not count. A claim whose
-bots are outside the current 120 s window (recovered, crashed, or
-older) is renamed aside so the next incident can alert. The rename is
-the only removal: a process that loses the race does not unlink the
-winner's new claim. No settings key.
+Nothing in this module renames or unlinks a claim name. A new incident
+publishes the next generation instead. No settings key.
 """
 
 from __future__ import annotations
@@ -36,7 +34,6 @@ import logging
 import os
 import re
 import tempfile
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +50,13 @@ CLAIM_FILENAME = "host_stall.claim"
 RECOVERY_FILENAME = "host_stall.recovery"
 
 _BOT_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+_CLAIM_GEN = re.compile(r"^host_stall\.claim\.(\d+)$")
+_RECOVERY_GEN = re.compile(r"^host_stall\.recovery\.(\d+)$")
 _corrupt_logged: set[str] = set()
+
+# Test seam. Called after a new generation number is chosen and before
+# the exclusive create. None in production.
+_before_claim_create = None
 
 
 def _warn_corrupt(path: str) -> None:
@@ -97,14 +100,6 @@ def _episode_dir(root: str) -> str:
 
 def _episode_path(root: str, bot: str) -> str:
     return os.path.join(_episode_dir(root), _episode_filename(bot))
-
-
-def _claim_path(root: str) -> str:
-    return os.path.join(root, CLAIM_FILENAME)
-
-
-def _recovery_path(root: str) -> str:
-    return os.path.join(root, RECOVERY_FILENAME)
 
 
 def _read_json(path: str) -> dict | None:
@@ -181,21 +176,29 @@ def read_episodes(root: str, now: float) -> dict[str, dict]:
     return found
 
 
-def _cluster(episodes: dict[str, dict]) -> list[dict]:
-    """Episodes whose ``hung_at`` values sit inside one window.
+def _window(episodes: dict[str, dict], *, end: float) -> list[dict]:
+    """Episodes within ``HOST_STALL_WINDOW_S`` of ``end`` on either side.
 
-    The window ends at the newest ``hung_at``. A hang that started more
-    than ``HOST_STALL_WINDOW_S`` before that is a different incident.
+    Anchoring on a fixed ``end`` keeps an older incident visible after a
+    later hang. Anchoring on the newest ``hung_at`` would drop that
+    incident and swallow its recovery rollup.
     """
-    if not episodes:
-        return []
-    latest = max(ep["hung_at"] for ep in episodes.values())
+    lo = end - HOST_STALL_WINDOW_S
+    hi = end + HOST_STALL_WINDOW_S
     grouped = [
         ep for ep in episodes.values()
-        if latest - ep["hung_at"] <= HOST_STALL_WINDOW_S
+        if lo <= ep["hung_at"] <= hi
     ]
     grouped.sort(key=lambda ep: (ep["hung_at"], ep["bot"]))
     return grouped
+
+
+def _cluster(episodes: dict[str, dict]) -> list[dict]:
+    """The stall window that ends at the newest ``hung_at``."""
+    if not episodes:
+        return []
+    latest = max(ep["hung_at"] for ep in episodes.values())
+    return _window(episodes, end=latest)
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -275,13 +278,18 @@ def _emit(alert_fn, message: str) -> None:
 
 
 def _write_mirror(root: str, episodes: dict[str, dict]) -> None:
+    claims = _claims(root)
+    rollup = claims[-1][1] if claims else None
+    recovery = None
+    if claims:
+        recovery = _read_json(_recovery_file(root, claims[-1][0]))
     payload = {
         "v": 1,
         "window_s": HOST_STALL_WINDOW_S,
         "min_bots": HOST_STALL_MIN_BOTS,
         "episodes": episodes,
-        "rollup": _read_json(_claim_path(root)),
-        "recovery": _read_json(_recovery_path(root)),
+        "rollup": rollup,
+        "recovery": recovery,
     }
     try:
         _write_json_atomic(_marker_path(root), payload)
@@ -296,161 +304,150 @@ def _claim_bots(claim) -> set[str]:
     return {str(bot) for bot in bots}
 
 
-def _covers(claim, cluster: list[dict]) -> bool:
-    """True when ``claim`` already announced this window.
-
-    Bots outside the window (recovered, crashed, or older than 120 s)
-    do not keep their claim. That used to block the next rollup for up
-    to ``HOST_STALL_STALE_S``.
-    """
-    names = _claim_bots(claim)
-    if not names:
-        return False
-    return bool(names & {ep["bot"] for ep in cluster})
-
-
-def _read_bytes(path: str) -> bytes | None:
+def _generations(root: str, pattern: re.Pattern) -> list[tuple[int, str]]:
     try:
-        with open(path, "rb") as handle:
-            return handle.read()
+        names = os.listdir(root)
     except FileNotFoundError:
-        return None
+        return []
     except OSError:
-        logger.exception("host stall claim read failed")
-        return None
+        logger.exception("host stall claim list failed")
+        return []
+    found = []
+    for name in names:
+        match = pattern.match(name)
+        if match:
+            found.append((int(match.group(1)), os.path.join(root, name)))
+    found.sort()
+    return found
 
 
-def _restore_claim(dest: str, path: str) -> None:
-    """Put ``dest`` back on the claim name if we renamed the wrong file."""
-    try:
-        os.link(dest, path)
-        return
-    except FileExistsError:
-        return
-    except OSError:
-        pass
-    try:
-        os.rename(dest, path)
-    except OSError:
-        logger.exception("host stall claim restore failed")
+def _claim_file(root: str, generation: int) -> str:
+    return os.path.join(root, f"{CLAIM_FILENAME}.{generation}")
 
 
-def _retire_if_bytes(root: str, expected: bytes) -> str:
-    """Rename the claim aside only when it is still ``expected``.
+def _recovery_file(root: str, generation: int) -> str:
+    return os.path.join(root, f"{RECOVERY_FILENAME}.{generation}")
 
-    A rename that moves a newer claim (the other writer's) is undone.
-    Returns ``retired``, ``absent``, ``changed``, ``lost``, or ``error``.
+
+def _claims(root: str) -> list[tuple[int, dict]]:
+    """Readable claim generations, oldest first. Unreadable files stay."""
+    out = []
+    for generation, path in _generations(root, _CLAIM_GEN):
+        data = _read_json(path)
+        if isinstance(data, dict) and _claim_bots(data):
+            out.append((generation, data))
+    return out
+
+
+def _covers(claim: dict, cluster: list[dict]) -> bool:
+    """True when this claim already announced ``cluster``."""
+    return bool(_claim_bots(claim) & {ep["bot"] for ep in cluster})
+
+
+def _incident(episodes: dict[str, dict], claim: dict) -> list[dict]:
+    """Bots in the claim's own window, not the newest hang on the host.
+
+    The window is ``[end - 120s, end + 120s]`` around the claim's latest
+    ``hung_at``. A bot that hangs more than 120 s later is a new incident
+    and does not erase this one's recovery.
     """
-    path = _claim_path(root)
-    current = _read_bytes(path)
-    if current is None:
-        return "absent" if not os.path.lexists(path) else "error"
-    if current != expected:
-        return "changed"
-    dest = f"{path}.retired-{time.time_ns()}"
-    try:
-        os.rename(path, dest)
-    except FileNotFoundError:
-        return "lost"
-    except OSError:
-        logger.exception("host stall claim retire failed")
-        return "error"
-    moved = _read_bytes(dest)
-    if moved != expected:
-        _restore_claim(dest, path)
-        return "changed"
-    recovery = _recovery_path(root)
-    if os.path.lexists(recovery):
-        try:
-            os.rename(recovery, f"{recovery}.retired-{time.time_ns()}")
-        except OSError:
-            pass
-    return "retired"
+    hung = claim.get("hung_at")
+    times = []
+    if isinstance(hung, dict):
+        for value in hung.values():
+            number = _number(value)
+            if number is not None:
+                times.append(number)
+    if not times:
+        return []
+    return _window(episodes, end=max(times))
 
 
-def _release_stale_claim(root: str, cluster: list[dict]) -> bool:
-    """True when this caller may try to create the stall claim.
-
-    ``False`` means a claim for this window is already in place, or this
-    caller moved the wrong file and put it back. It must not unlink.
-    """
-    path = _claim_path(root)
-    blob = _read_bytes(path)
-    if blob is None:
-        return not os.path.lexists(path)
-    try:
-        claim = json.loads(blob.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        claim = None
-    if _covers(claim, cluster):
-        return False
-    status = _retire_if_bytes(root, blob)
-    if status in ("retired", "absent"):
-        return True
-    if status == "lost":
-        # The other writer retired the same bytes. Link dedupes the create
-        # if they have not published the replacement yet.
-        return not os.path.lexists(path)
-    return False
+def _publish_claim(path: str, payload: dict) -> bool:
+    hook = _before_claim_create
+    if hook is not None:
+        hook()
+    return _claim(path, payload)
 
 
 def _maybe_send_stall(root: str, episodes: dict[str, dict], now: float, alert_fn) -> None:
     cluster = _cluster(episodes)
     if len(cluster) < HOST_STALL_MIN_BOTS:
         return
-    if not _release_stale_claim(root, cluster):
-        return
-    if os.path.exists(_claim_path(root)):
-        return
-    payload = {
-        "bots": [ep["bot"] for ep in cluster],
-        "span_s": (
-            max(ep["hung_at"] for ep in cluster)
-            - min(ep["hung_at"] for ep in cluster)
-        ),
-        "hung_at": {ep["bot"]: ep["hung_at"] for ep in cluster},
-        "sent_at": now,
-    }
-    try:
-        won = _claim(_claim_path(root), payload)
-    except OSError:
-        logger.exception("host stall claim failed")
-        return
-    if won:
+    # A writer can observe "no covering claim", then another writer can
+    # link the generation this one was about to choose. Retry. If this
+    # writer still wins a higher generation, it does not alert when an
+    # earlier generation already covers the same bots, and it deletes
+    # only the file it just created.
+    for _attempt in range(8):
+        if any(_covers(claim, cluster) for _gen, claim in _claims(root)):
+            return
+        numbers = [gen for gen, _path in _generations(root, _CLAIM_GEN)]
+        generation = (max(numbers) if numbers else 0) + 1
+        path = _claim_file(root, generation)
+        payload = {
+            "generation": generation,
+            "bots": [ep["bot"] for ep in cluster],
+            "span_s": (
+                max(ep["hung_at"] for ep in cluster)
+                - min(ep["hung_at"] for ep in cluster)
+            ),
+            "hung_at": {ep["bot"]: ep["hung_at"] for ep in cluster},
+            "sent_at": now,
+        }
+        try:
+            won = _publish_claim(path, payload)
+        except OSError:
+            logger.exception("host stall claim failed")
+            return
+        if not won:
+            continue
+        earlier = [
+            claim for gen, claim in _claims(root)
+            if gen < generation and _covers(claim, cluster)
+        ]
+        if earlier:
+            try:
+                os.unlink(path)
+            except OSError:
+                logger.exception("host stall redundant claim remove failed")
+            return
         _emit(alert_fn, _stall_message(cluster))
+        return
 
 
 def _maybe_send_recovery(root: str, episodes: dict[str, dict], alert_fn) -> None:
-    claim_path = _claim_path(root)
-    if not os.path.exists(claim_path):
-        return
-    if os.path.exists(_recovery_path(root)):
-        return
-    # Every bot still inside the stall window, including one that hung
-    # after the claim was written. "3/3" while a fourth is HUNG is wrong.
-    cluster = _cluster(episodes)
-    if len(cluster) < HOST_STALL_MIN_BOTS:
-        return
-    claim = _read_json(claim_path)
-    if not _covers(claim, cluster):
-        return
-    if any(ep.get("recovered_at") is None for ep in cluster):
-        return
-    names = [ep["bot"] for ep in cluster]
-    stalls = [float(ep["stall_s"]) for ep in cluster if ep.get("stall_s") is not None]
-    max_stall = max(stalls) if stalls else 0.0
-    payload = {
-        "bots": names,
-        "max_stall_s": max_stall,
-        "sent_at": max(float(ep["recovered_at"]) for ep in cluster),
-    }
-    try:
-        won = _claim(_recovery_path(root), payload)
-    except OSError:
-        logger.exception("host stall recovery claim failed")
-        return
-    if won:
-        _emit(alert_fn, _recovery_message(len(names), max_stall))
+    for generation, claim in _claims(root):
+        path = _recovery_file(root, generation)
+        if os.path.exists(path):
+            continue
+        # The claim's own window, including a bot that hung just after the
+        # claim. A hang more than 120 s later is not a member, so it cannot
+        # swallow this "K/K recovered".
+        members = _incident(episodes, claim)
+        if len(members) < HOST_STALL_MIN_BOTS:
+            continue
+        if any(ep.get("recovered_at") is None for ep in members):
+            continue
+        names = [ep["bot"] for ep in members]
+        stalls = [
+            float(ep["stall_s"]) for ep in members
+            if ep.get("stall_s") is not None
+        ]
+        max_stall = max(stalls) if stalls else 0.0
+        payload = {
+            "generation": generation,
+            "bots": names,
+            "max_stall_s": max_stall,
+            "sent_at": max(float(ep["recovered_at"]) for ep in members),
+        }
+        try:
+            won = _claim(path, payload)
+        except OSError:
+            logger.exception("host stall recovery claim failed")
+            return
+        if won:
+            _emit(alert_fn, _recovery_message(len(names), max_stall))
 
 
 def record_hung(bot_dir: str, *, reason: str, real: bool, now: float,

@@ -39,6 +39,17 @@ def _recovery_rollups(alerts: list[str]) -> list[str]:
     return [item for item in alerts if "recovered, max stall" in item]
 
 
+def _latest_claim(root: Path) -> dict:
+    numbered = []
+    for path in root.glob("host_stall.claim.*"):
+        suffix = path.name.rsplit(".", 1)[-1]
+        if suffix.isdigit():
+            numbered.append((int(suffix), path))
+    assert numbered, "no claim generation was published"
+    path = max(numbered)[1]
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _boot(root: Path, name: str, mode: str, clock: dict, hung_at: float,
           alerts: list[str]) -> tuple[HangWatchdog, HeartbeatWriter]:
     bot = root / name
@@ -287,7 +298,7 @@ def test_stale_and_corrupt_markers_do_not_break_the_rollup(tmp_path, monkeypatch
     (episode_dir / "TXF_Aged.json").write_text(json.dumps(aged), encoding="utf-8")
     (episode_dir / "broken.json").write_text("{not-json", encoding="utf-8")
     (root / "host_stall.json").write_text("{not-json", encoding="utf-8")
-    (root / "host_stall.claim").write_text("{not-json", encoding="utf-8")
+    (root / "host_stall.claim.1").write_text("{not-json", encoding="utf-8")
 
     lists = [[], [], []]
     _boot(root, "TXF_A", "paper", clock, now, lists[0])
@@ -305,7 +316,7 @@ def test_stale_and_corrupt_markers_do_not_break_the_rollup(tmp_path, monkeypatch
     marker = json.loads((root / "host_stall.json").read_text(encoding="utf-8"))
     assert marker["v"] == 1
     assert "TXF_Old" not in marker["episodes"]
-    claim = json.loads((root / "host_stall.claim").read_text(encoding="utf-8"))
+    claim = _latest_claim(root)
     assert claim["bots"] == ["TXF_A", "TXF_B", "TXF_C"]
     assert (episode_dir / "broken.json").is_file()
 
@@ -404,45 +415,123 @@ def test_unrecovered_claim_outside_the_window_does_not_block(tmp_path):
             now=base + i, pid=30 + i, alert_fn=fresh.append)
     assert len(_stall_rollups(fresh)) == 1
     assert "per-bot alerts were sent" in _stall_rollups(fresh)[0]
-    assert os.path.isfile(root / "host_stall.claim")
+    assert _latest_claim(root)["bots"] == ["TXF_NewA", "TXF_NewB", "TXF_NewC"]
 
 
 def test_two_writers_replace_a_stale_claim_once(tmp_path):
-    """Losing the retire race must not unlink the winner's new claim."""
+    """Eight writers publish the next generation. Exactly one links it.
+
+    Episodes are on disk before any publisher runs, so every writer sees
+    the same full window. The barrier then sits between choosing
+    generation 2 and ``os.link``. Generation 1 is not renamed or removed.
+    """
     root = tmp_path / "live"
     root.mkdir()
-    (root / "host_stall.claim").write_text(json.dumps({
+    stale = {
+        "generation": 1,
         "bots": ["TXF_Gone"],
         "hung_at": {"TXF_Gone": 1.0},
         "span_s": 0.0,
         "sent_at": 1.0,
-    }), encoding="utf-8")
+    }
+    original = json.dumps(stale)
+    (root / "host_stall.claim.1").write_text(original, encoding="utf-8")
+    episode_dir = root / "host_stall.d"
+    episode_dir.mkdir()
+    now = 20_000.0
+    for i in range(8):
+        episode = {
+            "bot": f"TXF_R{i}",
+            "pid": 100 + i,
+            "hung_at": now + i,
+            "reason": "heartbeat",
+            "real": False,
+            "recovered_at": None,
+            "stall_s": None,
+        }
+        (episode_dir / f"TXF_R{i}.json").write_text(
+            json.dumps(episode), encoding="utf-8")
     alerts: list[str] = []
     lock = threading.Lock()
+    barrier = threading.Barrier(8)
 
     def alert(message: str) -> None:
         with lock:
             alerts.append(message)
 
-    barrier = threading.Barrier(8)
+    def hooked() -> None:
+        barrier.wait(timeout=5)
 
-    def work(i: int) -> None:
-        bot = root / f"TXF_R{i}"
+    episodes = host_stall.read_episodes(str(root), now + 10)
+    host_stall._before_claim_create = hooked
+    try:
+        def work() -> None:
+            host_stall._maybe_send_stall(
+                str(root), episodes, now + 10, alert)
+
+        threads = [threading.Thread(target=work) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        host_stall._before_claim_create = None
+    assert len(_stall_rollups(alerts)) == 1
+    assert (root / "host_stall.claim.1").read_text(encoding="utf-8") == original
+    claim = _latest_claim(root)
+    assert claim["generation"] == 2
+    assert "TXF_Gone" not in claim["bots"]
+    assert len(claim["bots"]) == 8
+
+
+def test_later_hang_does_not_swallow_the_original_recovery(tmp_path):
+    """A bot more than 120 s later must not erase the first group's K/K."""
+    root = tmp_path / "live"
+    root.mkdir()
+    alerts: list[str] = []
+    for i, name in enumerate(("TXF_A", "TXF_B", "TXF_C")):
+        bot = root / name
         bot.mkdir()
-        barrier.wait()
         host_stall.record_hung(
             str(bot), reason="heartbeat", real=False,
-            now=20_000.0 + i, pid=100 + i, alert_fn=alert)
-
-    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+            now=1_000.0 + i, pid=i + 1, alert_fn=alerts.append)
     assert len(_stall_rollups(alerts)) == 1
-    claim = json.loads((root / "host_stall.claim").read_text(encoding="utf-8"))
-    assert "TXF_Gone" not in claim["bots"]
-    assert len(claim["bots"]) >= 3
+    late = root / "TXF_D"
+    late.mkdir()
+    host_stall.record_hung(
+        str(late), reason="heartbeat", real=False,
+        now=1_200.0, pid=4, alert_fn=alerts.append)
+    assert len(_stall_rollups(alerts)) == 1
+    for i, name in enumerate(("TXF_A", "TXF_B", "TXF_C", "TXF_D")):
+        host_stall.record_recovered(
+            str(root / name), stall_s=30.0 + i, recovered_at=1_300.0 + i,
+            now=1_300.0 + i, alert_fn=alerts.append)
+    assert _recovery_rollups(alerts) == [
+        "[HANG] host stall: 3/3 recovered, max stall 32 s"
+    ]
+
+
+def test_holiday_cache_misses_when_the_callable_changes(monkeypatch):
+    """A different country_holidays callable must not reuse the cached year."""
+    import src.market_data.holidays as hol
+
+    hol._tw_holiday_cache.clear()
+    missing = Path("/tmp/tai-robot-no-closures-233-callable")
+    monkeypatch.setattr(hol, "closures_override_path", lambda: missing)
+    hol._closures_cache = None
+    hol._closures_checked_mono = None
+    assert hol.is_taifex_holiday(date(2026, 4, 15)) is False
+    real = hol._holidays.country_holidays
+    calls = {"n": 0}
+
+    def wrapped(code, years=None, **kwargs):
+        calls["n"] += 1
+        return real(code, years=years, **kwargs)
+
+    monkeypatch.setattr(hol._holidays, "country_holidays", wrapped)
+    assert hol.is_taifex_holiday(date(2026, 4, 16)) is False
+    assert calls["n"] == 1
+    hol._tw_holiday_cache.clear()
 
 
 def test_holiday_failure_is_retried_on_the_next_call(monkeypatch, caplog):
