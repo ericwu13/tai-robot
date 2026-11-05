@@ -11942,7 +11942,9 @@ class BacktestApp:
         def _alert(message: str) -> None:
             _log(message)
             if _discord is not None and _discord.enabled:
-                _discord.notify(message)
+                # P1 HUNG must survive a full notifier queue. The P2
+                # start-failure notice below stays routine.
+                _discord.notify(message, priority=True)
 
         def _p2_start_failed(exc: BaseException) -> None:
             # One-shot deploy failure. Distinct from the rate-limited

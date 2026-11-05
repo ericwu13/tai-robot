@@ -198,6 +198,35 @@ def test_deploy_wires_heartbeat_tick_and_stop(tmp_path, monkeypatch):
         _cleanup()
 
 
+def test_hung_alert_notifies_discord_as_priority(tmp_path, monkeypatch):
+    """The hang watchdog's alert is the P1 HUNG send. It must opt into
+    priority so a full notifier queue parks it instead of dropping it.
+    """
+    bot_dir = str(tmp_path / "bot")
+    _install_runner(monkeypatch, bot_dir)
+    app = _app(bot_dir)
+    app._start_live_warmup = lambda: None
+    notes = []
+
+    class _RecordingDiscord:
+        enabled = True
+
+        def notify(self, message, *, priority=False):
+            notes.append((message, priority))
+
+    previous = rb._discord
+    try:
+        assert app._deploy_live_continue(
+            None, _Strategy, False, None, False, False, False,
+            None, "paper", "wirebot") is True
+        rb._discord = _RecordingDiscord()
+        hb._watchdog.alert_fn("P1 HUNG probe")
+        assert notes == [("P1 HUNG probe", True)]
+    finally:
+        rb._discord = previous
+        _cleanup()
+
+
 def test_deploy_continues_when_heartbeat_start_raises(tmp_path, monkeypatch):
     bot_dir = str(tmp_path / "bot")
     _install_runner(monkeypatch, bot_dir)

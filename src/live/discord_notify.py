@@ -1,14 +1,17 @@
 """Discord bot notifications for live trading events.
 
 Sends non-blocking notifications to a Discord channel via bot token + REST API.
-All sends run in a background thread to avoid blocking the main/Tkinter thread.
+One daemon worker drains a bounded queue so a send never blocks the Tk thread
+and a stalled POST cannot spawn a thread per message.
 """
 
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 from version import APP_VERSION
@@ -20,18 +23,21 @@ _API_BASE = "https://discord.com/api/v10"
 
 # Send budget. ``httpx``'s timeout bounds connect/read/write but NOT
 # ``socket.getaddrinfo`` — name resolution is an uninterruptible C call.
-# On 2026-11-04 every bot on one host had _post threads parked in
+# On 2026-11-04 every bot on the live host had _post threads parked in
 # getaddrinfo for 90+ s while this client was already configured with a
 # 10 s timeout, so the timeout alone is not a containment story.
 #
-# What IS containable is the queue behind a stalled send: the shared
-# client is guarded by ``_http_lock``, so one wedged thread used to park
-# every later notification behind it for as long as the stall lasted.
-# The lock wait is therefore bounded and a backed-up notifier drops the
-# message instead of adding another daemon thread.
+# What is containable is the queue in front of that stall. One worker
+# thread owns the shared client. Callers enqueue without blocking. When
+# the queue is full, routine messages are counted and dropped; priority
+# messages (HUNG, order, trade, exit) wait in a small backlog and are
+# flushed in arrival order once a send succeeds. The 429 backoff stays
+# inside the worker, so a retry already in flight is not a new enqueue
+# and cannot be dropped for queue pressure.
 HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
-LOCK_WAIT_S = 15.0
+SEND_QUEUE_MAX = 8
+PRIORITY_BACKLOG_MAX = 8
 
 # Trading mode → readable bilingual label for the mode-switch notification.
 _MODE_LABELS = {
@@ -67,6 +73,16 @@ class DiscordNotifier:
         self._symbol = symbol
         self._http: "httpx.Client | None" = None
         self._http_lock = threading.Lock()
+        # One worker, one bounded queue. ``put_nowait`` is the only enqueue
+        # the Tk thread (and the hang watchdog) ever do.
+        self._queue: queue.Queue = queue.Queue(maxsize=SEND_QUEUE_MAX)
+        self._priority_backlog: deque = deque()
+        self._state_lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+        self._worker_lock = threading.Lock()
+        self._dropped = 0
+        self._late = 0
+        self._priority_overflow = 0
         if self._token and self._channel_id:
             if not self._evolution_channel_id:
                 logger.warning(
@@ -89,15 +105,22 @@ class DiscordNotifier:
         """Pick the target channel, falling back to the main channel."""
         return channel_id or self._channel_id
 
-    def _send(self, content: str, channel_id: str = "") -> None:
-        """Send a message via Discord bot REST API in a background thread.
+    def _send(self, content: str, channel_id: str = "", *,
+              priority: bool = False) -> None:
+        """Enqueue one message. Never blocks the caller.
 
         ``channel_id`` optionally overrides the default channel (used to
         route evolution logs / daily reports to their own channels). Empty
         → the main channel.
 
-        Retries up to 3 times with exponential backoff (1s, 2s, 4s) on
-        HTTP 429 (rate-limited). Logs a warning if all retries exhaust.
+        ``priority`` defaults to False. Routine messages are dropped when
+        the queue is full. Priority messages are parked in
+        :data:`PRIORITY_BACKLOG_MAX` and flushed in order after a send
+        succeeds. The default stays routine so a caller that does not opt
+        in cannot fill that backlog.
+
+        HTTP 429 is retried by the worker (1s, 2s, 4s), not by enqueueing
+        again, so a retry cannot be dropped because the queue is full.
         """
         if not self.enabled:
             return
@@ -108,56 +131,157 @@ class DiscordNotifier:
             "Discord send attempt: channel=%s, msg_len=%d, bot=%s",
             target, len(content), self._bot_name,
         )
-
-        def _post():
+        self._ensure_worker()
+        item = (content, target, priority)
+        # One attempt. The ``return`` is the drop: it must not fall through
+        # into a send, and it must not ``continue`` (that spins on a full
+        # queue and blocks the caller, which is the Tk thread).
+        while True:
             try:
-                url = f"{_API_BASE}/channels/{target}/messages"
-                headers = {
-                    "Authorization": f"Bot {self._token}",
-                    "Content-Type": "application/json",
-                }
-                delay = 1.0
-                for attempt in range(3):
-                    if not self._http_lock.acquire(timeout=LOCK_WAIT_S):
-                        logger.warning(
-                            "Discord send dropped: notifier busy > %.0fs "
-                            "(channel=%s, bot=%s). A stalled send must not "
-                            "queue more threads behind it.",
-                            LOCK_WAIT_S, target, self._bot_name,
+                self._queue.put_nowait(item)
+                return
+            except queue.Full:
+                self._on_queue_full(item, priority)
+                return
+
+    def _ensure_worker(self) -> None:
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            return
+        with self._worker_lock:
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name="discord-notify",
+                daemon=True,
+            )
+            self._worker = worker
+            worker.start()
+
+    def _on_queue_full(self, item, priority: bool) -> None:
+        """Queue is full. Park a priority message, or count a routine drop.
+
+        Returns without sending. A stalled POST must not be done on the
+        caller, and a full queue must not start another thread.
+        """
+        if priority:
+            with self._state_lock:
+                if len(self._priority_backlog) < PRIORITY_BACKLOG_MAX:
+                    self._priority_backlog.append(item)
+                    return
+                self._priority_overflow += 1
+            logger.warning(
+                "Discord priority backlog overflow (bot=%s). "
+                "A stalled send filled the priority backlog.",
+                self._bot_name,
+            )
+            return
+        with self._state_lock:
+            self._dropped += 1
+        logger.warning(
+            "Discord send dropped: notifier queue full (bot=%s). "
+            "A stalled send must not queue more work behind it.",
+            self._bot_name,
+        )
+        return
+
+    def _worker_loop(self) -> None:
+        while True:
+            item, from_backlog, queued = self._next_item()
+            content, target, _priority = item
+            try:
+                ok = self._deliver(content, target)
+                if from_backlog and ok:
+                    with self._state_lock:
+                        self._late += 1
+                if ok:
+                    # Catch-up runs before task_done so this item's success
+                    # and the one summary stay in that order.
+                    self._post_stall_summary()
+            finally:
+                if queued:
+                    self._queue.task_done()
+
+    def _next_item(self):
+        """Priority backlog first, then the main queue. Blocks on the queue."""
+        with self._state_lock:
+            if self._priority_backlog:
+                return self._priority_backlog.popleft(), True, False
+        return self._queue.get(), False, True
+
+    def _post_stall_summary(self) -> None:
+        """One catch-up line after a successful send, once the backlog is empty."""
+        with self._state_lock:
+            if self._priority_backlog:
+                return
+            dropped = self._dropped
+            late = self._late
+            overflow = self._priority_overflow
+            if dropped == 0 and late == 0 and overflow == 0:
+                return
+            # Clear first so this post cannot enqueue a second summary.
+            self._dropped = 0
+            self._late = 0
+            self._priority_overflow = 0
+        text = (
+            f"Discord was stalled: {dropped} messages dropped, "
+            f"{late} delivered late"
+        )
+        if overflow:
+            text += f", {overflow} priority overflow"
+        self._deliver(f"{self._header()}\n{text}", self._channel_id)
+
+    def _deliver(self, content: str, target: str) -> bool:
+        """POST one message. Retry HTTP 429 with backoff 1s, 2s, 4s.
+
+        Returns True when Discord accepted the message. The lock is not
+        held across the backoff sleep, and a 429 never re-enters the queue.
+        """
+        try:
+            url = f"{_API_BASE}/channels/{target}/messages"
+            headers = {
+                "Authorization": f"Bot {self._token}",
+                "Content-Type": "application/json",
+            }
+            delay = 1.0
+            for _attempt in range(3):
+                with self._http_lock:
+                    client = self._get_http()
+                    resp = client.post(url, json={"content": content},
+                                       headers=headers)
+                if resp.status_code != 429:
+                    if resp.status_code >= 400:
+                        logger.error(
+                            "Discord send failed: HTTP %d → %s "
+                            "(channel=%s, bot=%s)",
+                            resp.status_code, resp.text[:500], target,
+                            self._bot_name,
                         )
-                        return
-                    try:
-                        client = self._get_http()
-                        resp = client.post(url, json={"content": content},
-                                           headers=headers)
-                    finally:
-                        self._http_lock.release()
-                    if resp.status_code != 429:
-                        if resp.status_code >= 400:
-                            logger.error(
-                                "Discord send failed: HTTP %d → %s "
-                                "(channel=%s, bot=%s)",
-                                resp.status_code, resp.text[:500], target,
-                                self._bot_name,
-                            )
-                        return
-                    time.sleep(delay)
-                    delay *= 2
-                logger.warning(
-                    "Discord send failed after 3 retries (429 rate-limited), "
-                    "channel=%s, bot=%s", target, self._bot_name,
-                )
-            except Exception:
-                logger.exception(
-                    "Discord send error (channel=%s, bot=%s)",
-                    target, self._bot_name,
-                )
+                        return False
+                    return True
+                time.sleep(delay)
+                delay *= 2
+            logger.warning(
+                "Discord send failed after 3 retries (429 rate-limited), "
+                "channel=%s, bot=%s", target, self._bot_name,
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "Discord send error (channel=%s, bot=%s)",
+                target, self._bot_name,
+            )
+            return False
 
-        threading.Thread(target=_post, daemon=True).start()
+    def notify(self, message: str, *, priority: bool = False) -> None:
+        """Public method to send a free-form notification with the bot header.
 
-    def notify(self, message: str) -> None:
-        """Public method to send a free-form notification with the bot header."""
-        self._send(f"{self._header()}\n{message}")
+        ``priority`` defaults to False (routine). The HUNG alert passes
+        True; order, trade, and exit methods opt in themselves.
+        """
+        self._send(f"{self._header()}\n{message}", priority=priority)
 
     def notify_evolution(self, message: str) -> None:
         """Free-form notification routed to the evolution channel.
@@ -187,7 +311,8 @@ class DiscordNotifier:
             f"{strat_line}"
             f"方向: **{side}** | 商品: `{symbol}` | "
             f"價格: {price_label} | 模擬價: {sim_price:,}\n"
-            f"委託編號: `{order_id}`"
+            f"委託編號: `{order_id}`",
+            priority=True,
         )
 
     def order_failed(self, side: str, symbol: str, code: int, error: str) -> None:
@@ -195,7 +320,8 @@ class DiscordNotifier:
             f"{self._header()}\n"
             f"❌ **委託失敗 Order Failed**\n"
             f"方向: {side} | 商品: `{symbol}` | "
-            f"錯誤碼: {code} | {error}"
+            f"錯誤碼: {code} | {error}",
+            priority=True,
         )
 
     def fill_confirmed(self, action_type: str, fill_price: str = "",
@@ -207,7 +333,8 @@ class DiscordNotifier:
         self._send(
             f"{self._header()}\n"
             f"✅ **成交確認 Fill Confirmed** ({action_type}){price_str}"
-            f"{strat_str}"
+            f"{strat_str}",
+            priority=True,
         )
 
     def exit_fill_unconfirmed(self, sim_price: str = "",
@@ -229,7 +356,8 @@ class DiscordNotifier:
             f"{self._header()}\n"
             f"⚠️ **出場成交價未確認 Exit Fill Unconfirmed**{price_str} (est.)\n"
             f"券商成交價未取得，沿用模擬價。Broker fill was not captured; "
-            f"the simulated price is kept.{strat_str}"
+            f"the simulated price is kept.{strat_str}",
+            priority=True,
         )
 
     def fill_price_correction(self, action_type: str, real_price: int,
@@ -240,14 +368,16 @@ class DiscordNotifier:
             f"{self._header()}\n"
             f"🔁 **成交價更正 Fill Price Correction** ({action_type}) "
             f"@**{real_price:,}** (原估 est. was {est_price:,})"
-            f"{strat_str}"
+            f"{strat_str}",
+            priority=True,
         )
 
     def fill_timeout_downgrade(self, action_type: str, timeout_s: float) -> None:
         self._send(
             f"{self._header()}\n"
             f"⚠️ **成交超時 Fill Timeout** ({action_type}, {timeout_s:.0f}s)\n"
-            f"已降級為半自動 Downgraded to semi-auto"
+            f"已降級為半自動 Downgraded to semi-auto",
+            priority=True,
         )
 
     def bot_deployed(self, strategy: str, mode: str,
@@ -364,7 +494,8 @@ class DiscordNotifier:
             f"🚨 **強制平倉失敗 FORCE CLOSE FAILED** 🚨\n"
             f"商品: `{symbol}` | 重試: {attempts} 次\n"
             f"最後錯誤: {last_error}\n"
-            f"**需要立即人工介入！Position may still be open!**"
+            f"**需要立即人工介入！Position may still be open!**",
+            priority=True,
         )
 
     def daily_loss_limit(self, net_pnl: int, limit: int) -> None:
