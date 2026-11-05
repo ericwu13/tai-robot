@@ -103,7 +103,11 @@ class _Stall:
                 self.release.wait()
             return _response(200)
 
-        monkeypatch.setattr(self.n, "_get_http", lambda: _client(post))
+        client = _client(post)
+        # Keep the mock on the instance. A worker still running after
+        # the monkeypatch is undone must not open a real connection.
+        self.n._http = client
+        monkeypatch.setattr(self.n, "_get_http", lambda: client)
 
     def arm(self):
         self.n._send("WEDGE")
@@ -185,7 +189,9 @@ def test_a_normal_send_still_takes_the_lock_and_posts(monkeypatch):
         posted.append(json["content"])
         return _response(200)
 
-    monkeypatch.setattr(n, "_get_http", lambda: _client(post))
+    client = _client(post)
+    n._http = client
+    monkeypatch.setattr(n, "_get_http", lambda: client)
     with _spy_threads() as born:
         n._send("one")
         n._send("two")
@@ -211,7 +217,9 @@ def test_lock_is_released_when_the_post_raises(monkeypatch):
             raise OSError("name resolution failed")
         return _response(200)
 
-    monkeypatch.setattr(n, "_get_http", lambda: _client(post))
+    client = _client(post)
+    n._http = client
+    monkeypatch.setattr(n, "_get_http", lambda: client)
     with _spy_threads() as born:
         n._send("boom")
         n._send("next")
@@ -377,7 +385,9 @@ def test_429_retry_is_not_dropped_when_the_queue_fills(monkeypatch):
             return _response(429, "slow down")
         return _response(200)
 
-    monkeypatch.setattr(n, "_get_http", lambda: _client(post))
+    client = _client(post)
+    n._http = client
+    monkeypatch.setattr(n, "_get_http", lambda: client)
     sleeps = []
     real_sleep = time.sleep
 
@@ -402,3 +412,186 @@ def test_429_retry_is_not_dropped_when_the_queue_fills(monkeypatch):
     assert len(summaries) == 1
     assert "4 messages dropped, 0 delivered late" in summaries[0]
     assert "429 rate-limited" not in summaries[0]
+
+
+def test_risk_notices_survive_a_full_queue(monkeypatch):
+    """Loss limit, refused mode, mode change, idle entries, news flatten,
+    and a connection alert stay in the backlog. A regime recommendation
+    does not.
+    """
+    stall = _Stall(monkeypatch)
+    needles = [
+        "Daily Loss Limit",
+        "Mode Switch Refused",
+        "Trading Mode Switched",
+        "Signals Suppressed",
+        "flattened + entries suppressed",
+        "REPLY CHANNEL SILENT",
+    ]
+    try:
+        stall.arm()
+        for i in range(discord_notify.SEND_QUEUE_MAX):
+            stall.n._send(f"queued-{i}")
+        stall.n.notify_regime("regime advice only")
+        stall.n.daily_loss_limit(-5000, 10000)
+        stall.n.mode_switch_refused("auto", "open position")
+        stall.n.mode_switched("paper", "auto")
+        stall.n.regime_idle_warning()
+        stall.n.notify_regime("flattened + entries suppressed", priority=True)
+        stall.n.notify("REPLY CHANNEL SILENT", priority=True)
+        assert stall.n._dropped == 1
+        assert len(stall.n._priority_backlog) == len(needles)
+        stall.free()
+        _wait_until(lambda: _drained(stall.n, stall.posted))
+        assert "regime advice only" not in stall.posted
+        summaries = _summaries(stall.posted)
+        assert len(summaries) == 1
+        assert (
+            f"1 messages dropped, {len(needles)} delivered late"
+            in summaries[0]
+        )
+
+        def at(needle):
+            for i, body in enumerate(stall.posted):
+                if needle in body:
+                    return i
+            raise AssertionError(f"{needle} was not delivered")
+
+        order = [at(needle) for needle in needles]
+        assert len(set(order)) == len(order)
+        assert order == sorted(order)
+        assert order[-1] < at("Discord was stalled:")
+    finally:
+        stall.free()
+
+
+def test_failed_stall_summary_keeps_the_counts(monkeypatch):
+    """A summary that Discord rejects must be retried with the same counts."""
+    stall = _Stall(monkeypatch)
+    summary_codes = []
+
+    def post(url, json=None, headers=None):
+        body = json["content"]
+        stall.posted.append(body)
+        stall.calls += 1
+        if stall.calls == 1:
+            stall.started.set()
+            stall.release.wait()
+            return _response(200)
+        if "Discord was stalled:" in body:
+            code = 500 if not summary_codes else 200
+            summary_codes.append(code)
+            return _response(code, "no" if code == 500 else "")
+        return _response(200)
+
+    # Replace the wedge client's post. _Stall already installed one.
+    client = _client(post)
+    stall.n._http = client
+    monkeypatch.setattr(stall.n, "_get_http", lambda: client)
+    extra_dropped = 3
+    try:
+        stall.arm()
+        for i in range(discord_notify.SEND_QUEUE_MAX):
+            stall.n._send(f"queued-{i}")
+        for i in range(extra_dropped):
+            stall.n._send(f"drop-{i}")
+        assert stall.n._dropped == extra_dropped
+        stall.free()
+        _wait_until(lambda: summary_codes == [500, 200])
+        _wait_until(lambda: _drained(stall.n, stall.posted))
+        assert summary_codes == [500, 200]
+        summaries = _summaries(stall.posted)
+        assert len(summaries) == 2
+        phrase = f"{extra_dropped} messages dropped, 0 delivered late"
+        assert all(phrase in body for body in summaries)
+        assert stall.n._dropped == 0
+    finally:
+        stall.free()
+
+
+def test_raising_send_does_not_kill_the_worker(monkeypatch):
+    """One raised delivery is retried once, then the next message still goes.
+
+    The worker that took the first item is the one that delivers the next.
+    A dead thread would leave the already-queued message sitting there.
+    """
+    n = _notifier()
+    calls = []
+    posted = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_deliver(content, target):
+        calls.append(content)
+        if content == "boom":
+            if not started.is_set():
+                started.set()
+                release.wait()
+            raise RuntimeError("boom")
+        posted.append(content)
+        return True
+
+    n._http = _client(lambda *a, **k: _response(200))
+    monkeypatch.setattr(n, "_deliver", fake_deliver)
+    try:
+        n._send("boom")
+        assert started.wait(2), "worker did not take the raising send"
+        worker = n._worker
+        n._send("ok-msg")
+        release.set()
+        _wait_until(
+            lambda: "ok-msg" in posted
+            and calls.count("boom") >= 1 + discord_notify.WORKER_SEND_RETRIES)
+        assert calls.count("boom") == 1 + discord_notify.WORKER_SEND_RETRIES
+        assert "ok-msg" in posted
+        assert n._worker is worker
+        assert worker.is_alive()
+    finally:
+        release.set()
+
+
+def test_link_settlement_and_news_call_sites_are_priority(monkeypatch):
+    """The connection, settlement, and news-breaker call sites opt in."""
+    import run_backtest as rb
+
+    notes = []
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, message, *, priority=False):
+            notes.append(("notify", message, priority))
+
+        def notify_regime(self, message, *, priority=False):
+            notes.append(("regime", message, priority))
+
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    monkeypatch.setattr(rb, "_log", lambda *a, **k: None)
+    monkeypatch.setattr(rb, "_log_reply_error", lambda *a, **k: None)
+
+    rb._notify_reply_silent("REPLY CHANNEL SILENT")
+    rb._notify_news("flattened + entries suppressed")
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.set_status = lambda *a, **k: None
+    app._set_conn_dot = lambda *a, **k: None
+    app._live_log_msg = lambda *a, **k: None
+    app._on_link_alert("DEGRADED reply down")
+
+    import src.market_data.holidays as holidays
+    app._live_runner = type("R", (), {"symbol": "TXF00"})()
+    monkeypatch.setattr(holidays, "is_settlement_day", lambda now: True)
+    monkeypatch.setattr(holidays, "is_front_month_contract", lambda sym, now: True)
+    monkeypatch.setattr(rb, "resolve_order_symbol", lambda symbol: symbol)
+    app._notify_if_settlement_day()
+
+    assert ("notify", "REPLY CHANNEL SILENT", True) in [
+        (kind, msg, flag) for kind, msg, flag in notes
+    ]
+    assert notes[0] == ("notify", "REPLY CHANNEL SILENT", True)
+    assert notes[1] == ("regime", "flattened + entries suppressed", True)
+    assert notes[2][0] == "notify" and notes[2][2] is True
+    assert "DEGRADED reply down" in notes[2][1]
+    assert notes[3][2] is True
+    assert "SETTLEMENT DAY" in notes[3][1]
+    assert "entries blocked" in notes[3][1]

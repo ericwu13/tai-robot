@@ -38,6 +38,9 @@ HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
 SEND_QUEUE_MAX = 8
 PRIORITY_BACKLOG_MAX = 8
+# A send that raises is put back this many times, then abandoned so the
+# next notification still goes out. Zero would drop it on the first error.
+WORKER_SEND_RETRIES = 1
 
 # Trading mode → readable bilingual label for the mode-switch notification.
 _MODE_LABELS = {
@@ -188,11 +191,17 @@ class DiscordNotifier:
         return
 
     def _worker_loop(self) -> None:
+        """Drain the queue. One raised send must not kill the thread."""
         while True:
-            item, from_backlog, queued = self._next_item()
-            content, target, _priority = item
+            item = None
+            from_backlog = False
+            queued = False
+            sent_ok = False
             try:
+                item, from_backlog, queued = self._next_item()
+                content, target = item[0], item[1]
                 ok = self._deliver(content, target)
+                sent_ok = True
                 if from_backlog and ok:
                     with self._state_lock:
                         self._late += 1
@@ -200,9 +209,38 @@ class DiscordNotifier:
                     # Catch-up runs before task_done so this item's success
                     # and the one summary stay in that order.
                     self._post_stall_summary()
+            except Exception:
+                logger.exception(
+                    "Discord worker error (bot=%s)", self._bot_name)
+                # The item was already popped. Put it back once so a
+                # transient error does not lose a backlog message, then
+                # keep looping. A second failure is abandoned.
+                if item is not None and not sent_ok:
+                    self._retry_failed_item(item, from_backlog)
             finally:
                 if queued:
                     self._queue.task_done()
+
+    def _retry_failed_item(self, item, from_backlog: bool) -> None:
+        """Requeue a send that raised, at most ``WORKER_SEND_RETRIES`` times."""
+        tries = item[3] if len(item) > 3 else 0
+        if tries >= WORKER_SEND_RETRIES:
+            return
+        restored = (item[0], item[1], item[2], tries + 1)
+        if from_backlog or item[2]:
+            with self._state_lock:
+                self._priority_backlog.appendleft(restored)
+            return
+        try:
+            self._queue.put_nowait(restored)
+        except queue.Full:
+            with self._state_lock:
+                self._dropped += 1
+            logger.warning(
+                "Discord send dropped: notifier queue full (bot=%s). "
+                "A stalled send must not queue more work behind it.",
+                self._bot_name,
+            )
 
     def _next_item(self):
         """Priority backlog first, then the main queue. Blocks on the queue."""
@@ -212,7 +250,12 @@ class DiscordNotifier:
         return self._queue.get(), False, True
 
     def _post_stall_summary(self) -> None:
-        """One catch-up line after a successful send, once the backlog is empty."""
+        """One catch-up line after a successful send, once the backlog is empty.
+
+        Counters are cleared only after Discord accepts the summary. A
+        failed post leaves them in place so the next success tries again.
+        Drops that arrive during the post itself stay for that next line.
+        """
         with self._state_lock:
             if self._priority_backlog:
                 return
@@ -221,17 +264,18 @@ class DiscordNotifier:
             overflow = self._priority_overflow
             if dropped == 0 and late == 0 and overflow == 0:
                 return
-            # Clear first so this post cannot enqueue a second summary.
-            self._dropped = 0
-            self._late = 0
-            self._priority_overflow = 0
         text = (
             f"Discord was stalled: {dropped} messages dropped, "
             f"{late} delivered late"
         )
         if overflow:
             text += f", {overflow} priority overflow"
-        self._deliver(f"{self._header()}\n{text}", self._channel_id)
+        if not self._deliver(f"{self._header()}\n{text}", self._channel_id):
+            return
+        with self._state_lock:
+            self._dropped = max(0, self._dropped - dropped)
+            self._late = max(0, self._late - late)
+            self._priority_overflow = max(0, self._priority_overflow - overflow)
 
     def _deliver(self, content: str, target: str) -> bool:
         """POST one message. Retry HTTP 429 with backoff 1s, 2s, 4s.
@@ -278,8 +322,10 @@ class DiscordNotifier:
     def notify(self, message: str, *, priority: bool = False) -> None:
         """Public method to send a free-form notification with the bot header.
 
-        ``priority`` defaults to False (routine). The HUNG alert passes
-        True; order, trade, and exit methods opt in themselves.
+        ``priority`` defaults to False (routine). The HUNG alert, link
+        and reply-channel alerts, and the settlement-day notice pass
+        True. Order, trade, exit, loss-limit, and mode-switch methods
+        opt in themselves.
         """
         self._send(f"{self._header()}\n{message}", priority=priority)
 
@@ -451,7 +497,8 @@ class DiscordNotifier:
             f"⚠️ **策略訊號暫停 Signals Suppressed**\n"
             f"Bot 處於 regime-idle 狀態，等待市場分類結果。"
             f"在套用 regime 前不會進行任何交易。\n"
-            f"Awaiting regime classification — no trades until regime is applied."
+            f"Awaiting regime classification — no trades until regime is applied.",
+            priority=True,
         )
 
     def bot_stopped(self, trades: int, pnl: int) -> None:
@@ -474,7 +521,8 @@ class DiscordNotifier:
         self._send(
             f"{self._header()}\n"
             f"🔄 **交易模式切換 Trading Mode Switched**\n"
-            f"{old_label} → {new_label}"
+            f"{old_label} → {new_label}",
+            priority=True,
         )
 
     def mode_switch_refused(self, new_mode: str, reason: str,
@@ -485,7 +533,8 @@ class DiscordNotifier:
         self._send(
             f"{self._header()}\n"
             f"⛔ **模式切換被拒 Mode Switch Refused** → {label}{who}\n"
-            f"{reason}"
+            f"{reason}",
+            priority=True,
         )
 
     def force_close_failed(self, symbol: str, attempts: int, last_error: str) -> None:
@@ -502,7 +551,8 @@ class DiscordNotifier:
         self._send(
             f"{self._header()}\n"
             f"🚫 **每日虧損上限 Daily Loss Limit**\n"
-            f"淨損益: {net_pnl:+,} | 上限: -{limit:,}"
+            f"淨損益: {net_pnl:+,} | 上限: -{limit:,}",
+            priority=True,
         )
 
     def strategy_improved(
@@ -632,6 +682,15 @@ class DiscordNotifier:
             self._regime_channel_id,
         )
 
-    def notify_regime(self, message: str) -> None:
-        """Free-form notification routed to the regime channel."""
-        self._send(f"{self._header()}\n{message}", self._regime_channel_id)
+    def notify_regime(self, message: str, *, priority: bool = False) -> None:
+        """Free-form notification routed to the regime channel.
+
+        ``priority`` defaults to False. The news circuit breaker passes
+        True (flatten, entries held, clear, action failure). A regime
+        recommendation stays routine.
+        """
+        body = f"{self._header()}\n{message}"
+        if priority:
+            self._send(body, self._regime_channel_id, priority=True)
+            return
+        self._send(body, self._regime_channel_id)
