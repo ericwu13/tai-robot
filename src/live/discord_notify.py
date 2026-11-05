@@ -18,6 +18,21 @@ logger = logging.getLogger(__name__)
 _TPE = timezone(timedelta(hours=8))
 _API_BASE = "https://discord.com/api/v10"
 
+# Send budget. ``httpx``'s timeout bounds connect/read/write but NOT
+# ``socket.getaddrinfo`` — name resolution is an uninterruptible C call.
+# On 2026-11-04 every bot on one host had _post threads parked in
+# getaddrinfo for 90+ s while this client was already configured with a
+# 10 s timeout, so the timeout alone is not a containment story.
+#
+# What IS containable is the queue behind a stalled send: the shared
+# client is guarded by ``_http_lock``, so one wedged thread used to park
+# every later notification behind it for as long as the stall lasted.
+# The lock wait is therefore bounded and a backed-up notifier drops the
+# message instead of adding another daemon thread.
+HTTP_TIMEOUT_S = 10.0
+CONNECT_TIMEOUT_S = 5.0
+LOCK_WAIT_S = 15.0
+
 # Trading mode → readable bilingual label for the mode-switch notification.
 _MODE_LABELS = {
     "paper": "模擬 Paper",
@@ -62,7 +77,8 @@ class DiscordNotifier:
         """Lazily create a shared httpx.Client for connection pooling."""
         if self._http is None:
             import httpx
-            self._http = httpx.Client(timeout=10)
+            self._http = httpx.Client(
+                timeout=httpx.Timeout(HTTP_TIMEOUT_S, connect=CONNECT_TIMEOUT_S))
         return self._http
 
     @property
@@ -102,10 +118,20 @@ class DiscordNotifier:
                 }
                 delay = 1.0
                 for attempt in range(3):
-                    with self._http_lock:
+                    if not self._http_lock.acquire(timeout=LOCK_WAIT_S):
+                        logger.warning(
+                            "Discord send dropped: notifier busy > %.0fs "
+                            "(channel=%s, bot=%s). A stalled send must not "
+                            "queue more threads behind it.",
+                            LOCK_WAIT_S, target, self._bot_name,
+                        )
+                        return
+                    try:
                         client = self._get_http()
                         resp = client.post(url, json={"content": content},
                                            headers=headers)
+                    finally:
+                        self._http_lock.release()
                     if resp.status_code != 429:
                         if resp.status_code >= 400:
                             logger.error(
