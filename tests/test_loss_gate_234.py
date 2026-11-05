@@ -329,7 +329,7 @@ def test_equity_hold_alerts_once_and_keeps_holding(monkeypatch):
     notes: list[str] = []
     monkeypatch.setattr(
         rb, "_discord",
-        SimpleNamespace(enabled=True, notify=notes.append))
+        SimpleNamespace(enabled=True, notify=lambda msg, **_kw: notes.append(msg)))
     app = _app("auto")
     app._reset_trading_guard_for_deploy()
     app._apply_link_gate()
@@ -477,7 +477,7 @@ def test_equity_alert_is_suppressed_while_the_reply_link_is_down(monkeypatch):
     notes: list[str] = []
     monkeypatch.setattr(
         rb, "_discord",
-        SimpleNamespace(enabled=True, notify=notes.append))
+        SimpleNamespace(enabled=True, notify=lambda msg, **_kw: notes.append(msg)))
     app = _app("auto")
     app._equity_refresh_owed = True
     app._equity_refresh_held_alerted = False
@@ -500,7 +500,7 @@ def test_equity_hold_clock_restarts_when_the_reply_link_returns(monkeypatch):
     notes: list[str] = []
     monkeypatch.setattr(
         rb, "_discord",
-        SimpleNamespace(enabled=True, notify=notes.append))
+        SimpleNamespace(enabled=True, notify=lambda msg, **_kw: notes.append(msg)))
     app = _app("auto")
     app._equity_refresh_owed = True
     app._equity_refresh_held_alerted = False
@@ -562,7 +562,7 @@ def test_ten_failing_rights_ticks_alert_once_and_send_no_order(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_com_available", True)
@@ -606,7 +606,7 @@ def test_held_alert_latch_resets_when_the_hold_is_released(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_com_available", True)
@@ -658,7 +658,7 @@ def test_heartbeat_tick_sends_the_equity_hold_alert(monkeypatch):
     notes: list[str] = []
     monkeypatch.setattr(
         rb, "_discord",
-        SimpleNamespace(enabled=True, notify=notes.append))
+        SimpleNamespace(enabled=True, notify=lambda msg, **_kw: notes.append(msg)))
     app = _app("auto")
     app._heartbeat_active = True
     app._equity_refresh_owed = True

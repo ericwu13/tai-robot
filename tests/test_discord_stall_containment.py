@@ -595,3 +595,49 @@ def test_link_settlement_and_news_call_sites_are_priority(monkeypatch):
     assert notes[3][2] is True
     assert "SETTLEMENT DAY" in notes[3][1]
     assert "entries blocked" in notes[3][1]
+
+
+def test_equity_hold_alerts_survive_a_full_queue(monkeypatch):
+    """The immediate entries-held alert and the 90s still-held note are
+    priority. Removing either flag drops that body while the queue is full.
+    """
+    import run_backtest as rb
+
+    stall = _Stall(monkeypatch)
+    previous = rb._discord
+    needles = (
+        "[CONN] entries held: equity never refreshed",
+        "Equity reply not received",
+    )
+    try:
+        stall.arm()
+        for i in range(discord_notify.SEND_QUEUE_MAX):
+            stall.n._send(f"queued-{i}")
+        monkeypatch.setattr(rb, "_discord", stall.n)
+        monkeypatch.setattr(rb, "_log", lambda *a, **k: None)
+        monkeypatch.setattr(rb, "_log_debug", lambda *a, **k: None)
+        app = rb.BacktestApp.__new__(rb.BacktestApp)
+        app._equity_refresh_owed = True
+        app._trading_mode = "auto"
+        app._equity_refresh_held_alerted = False
+        app._live_log_msg = lambda *a, **k: None
+        app._alert_equity_refresh_held("no rights")
+        app._equity_refresh_held_alerted = False
+        app._equity_hold_since = time.monotonic() - (
+            rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 5)
+        app._note_equity_hold_timeout()
+        assert stall.n._dropped == 0
+        assert len(stall.n._priority_backlog) == len(needles)
+        stall.free()
+        _wait_until(lambda: _drained(stall.n, stall.posted))
+        for needle in needles:
+            assert any(needle in body for body in stall.posted), needle
+        summaries = _summaries(stall.posted)
+        assert len(summaries) == 1
+        assert (
+            f"0 messages dropped, {len(needles)} delivered late"
+            in summaries[0]
+        )
+    finally:
+        stall.free()
+        rb._discord = previous

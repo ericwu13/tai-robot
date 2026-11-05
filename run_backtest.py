@@ -11950,7 +11950,7 @@ class BacktestApp:
                 pass
             if _discord is not None and getattr(_discord, "enabled", False):
                 try:
-                    _discord.notify(f"⚠️ {msg}")
+                    _discord.notify(f"⚠️ {msg}", priority=True)
                 except Exception as exc:
                     _log(
                         "[CONN] equity hold alert failed: "
@@ -12032,7 +12032,7 @@ class BacktestApp:
         discord = _discord
         if discord is not None and getattr(discord, "enabled", False):
             try:
-                discord.notify(f"⚠️ {msg}")
+                discord.notify(f"⚠️ {msg}", priority=True)
             except Exception as exc:
                 _log(
                     "[CONN] equity refresh discord failed: "

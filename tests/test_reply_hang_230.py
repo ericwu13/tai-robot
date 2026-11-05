@@ -1236,7 +1236,7 @@ def test_equity_refresh_resets_sent_when_the_call_raises(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1263,7 +1263,7 @@ def test_equity_refresh_resets_sent_on_a_nonzero_code(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1334,7 +1334,7 @@ def test_equity_held_alert_fires_once_per_hold(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1372,7 +1372,7 @@ def test_equity_held_alert_fires_again_after_the_hold_releases(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1410,7 +1410,7 @@ def _discord_log(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
