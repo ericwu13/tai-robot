@@ -669,7 +669,7 @@ def test_watchdog_reads_snapshot_not_a_replaced_file(tmp_path):
     assert "P1" in _p1(alerts)[0]
 
 
-def test_call_com_exhausted_replace_logs_once(tmp_path, monkeypatch, caplog):
+def test_call_com_logs_every_stamp_write_failure(tmp_path, monkeypatch, caplog):
     """Each stamp write logs its failure. Retries are not extra lines.
 
     The start stamp and the end stamp are two writes. Both are logged.
