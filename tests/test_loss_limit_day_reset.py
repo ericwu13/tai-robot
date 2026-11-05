@@ -17,6 +17,8 @@ from datetime import datetime
 
 import pytest
 
+import run_backtest as rb
+from src.live.account_monitor import AccountMonitor
 from src.live.trading_guard import (
     DEFAULT_DAILY_LOSS_LIMIT_NTD,
     TradingGuard,
@@ -153,3 +155,55 @@ def test_a_still_losing_account_re_pauses_on_the_new_day():
     g.update_pnl(-10042, day_key=trading_day_key(datetime(2026, 11, 4, 20, 0)))
     assert g.paused, "a new day must not unblock an account still past the limit"
     assert g._pause_day_key == "2026-11-04"
+
+
+class _Var:
+    def __init__(self, value=""):
+        self.value = value
+
+    def set(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+def test_account_display_releases_a_pause_on_the_next_trading_day(monkeypatch):
+    """The live poll must hand ``update_pnl`` today's key.
+
+    Pause on day D, then a recovered rights reply on D+1. Dropping
+    ``day_key`` at ``_update_real_account_display`` leaves the pause
+    latched, and this fails.
+    """
+    guard = TradingGuard(daily_loss_limit=10000)
+    day_d = "2026-11-03"
+    assert guard.update_pnl(-10042, day_key=day_d) is True
+    assert guard.paused and guard._pause_day_key == day_d
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._trading_guard = guard
+    app._trading_mode = "auto"
+    monitor = AccountMonitor()
+    monitor.update_rights({
+        "equity": "0", "available": "0", "float_pnl": "0",
+        "realized_pnl": "0", "realized_cost": "0", "tax": "0",
+        "maint_rate": "0",
+    })
+    app._account_monitor = monitor
+    for name in (
+        "real_pos_var", "real_equity_var", "real_available_var",
+        "real_pnl_var", "real_realized_var", "real_fees_var",
+        "real_net_var", "real_loss_limit_var", "real_maint_var",
+    ):
+        setattr(app, name, _Var())
+    app._live_log_msg = lambda *a, **k: None
+    # 20:00 is the next trading day (open date 2026-11-04).
+    now = datetime(2026, 11, 4, 20, 0)
+    monkeypatch.setattr(rb, "_taipei_now", lambda: now)
+    monkeypatch.setattr(rb, "_discord", None)
+
+    rb.BacktestApp._update_real_account_display(app)
+
+    assert guard.paused is False
+    assert guard._pause_day_key == ""
+    assert guard.check_entry("auto")[0] is True

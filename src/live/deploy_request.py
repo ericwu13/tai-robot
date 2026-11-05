@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .trading_guard import DEFAULT_DAILY_LOSS_LIMIT_NTD
+
 
 TRADING_MODES = ("paper", "semi_auto", "auto")
 
@@ -27,7 +29,7 @@ class DeployRequest:
     bot_name: str
     resume_session: dict | None = None
     trading_mode: str = "paper"
-    loss_limit: str | int = "1000"
+    loss_limit: str | int = str(DEFAULT_DAILY_LOSS_LIMIT_NTD)
     regime_enabled: bool = False
     regime_long: str = ""
     regime_short: str = ""

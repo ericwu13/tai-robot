@@ -462,6 +462,33 @@ def _default_loss_limit(settings: dict) -> int:
     return value if value >= 0 else _tg.DEFAULT_DAILY_LOSS_LIMIT_NTD
 
 
+def parse_deploy_loss_limit(raw) -> int:
+    """NT$ limit from a deploy field.
+
+    Blank or non-numeric falls back to ``DEFAULT_DAILY_LOSS_LIMIT_NTD``.
+    An explicit 0 is kept, which turns the limit off. Negatives clamp
+    to 0, same as the previous ``max(0, int(...))``.
+    """
+    try:
+        return max(0, int(raw))
+    except (ValueError, TypeError):
+        return _tg.DEFAULT_DAILY_LOSS_LIMIT_NTD
+
+
+def loss_limit_for_gui_resume(session: dict | None, default: str) -> str:
+    """Loss-limit text when a saved bot row is selected.
+
+    An explicit ``daily_loss_limit``, including 0, replaces the dialog
+    default. A missing or null value leaves ``default`` in place.
+    """
+    if not isinstance(session, dict):
+        return default
+    saved = session.get("daily_loss_limit")
+    if saved is None:
+        return default
+    return str(saved)
+
+
 def _load_settings():
     cfg = {"user_id": "", "password": "", "authority_flag": 0}
     # Check user-writable project_root first, then parent dir (for dist/), then bundle
@@ -8209,9 +8236,9 @@ class BacktestApp:
                     saved_mode = sess.get("trading_mode", "paper")
                     if saved_mode in ("paper", "semi_auto", "auto"):
                         mode_var.set(saved_mode)
-                    saved_limit = sess.get("daily_loss_limit")
-                    if saved_limit is not None:
-                        loss_var.set(str(saved_limit))
+                    # Explicit saved value, including 0, wins. A missing
+                    # value leaves the pre-fill (``default``) untouched.
+                    loss_var.set(loss_limit_for_gui_resume(sess, loss_var.get()))
                     if sess.get("regime_mode"):
                         regime_var.set(True)
                         if sess.get("long_strategy"):
@@ -8728,10 +8755,7 @@ class BacktestApp:
         news_tier2_enabled = req.news_tier2_enabled
         news_directional = req.news_directional
         self._trading_mode = trading_mode
-        try:
-            loss_limit = max(0, int(loss_limit_str))
-        except (ValueError, TypeError):
-            loss_limit = 1000
+        loss_limit = parse_deploy_loss_limit(loss_limit_str)
         # Reconfigure the existing TradingGuard in place — do NOT rebind.
         # self._fill_poller was constructed with a reference to this instance
         # in __init__; rebinding would leave the poller clearing a stale
@@ -10380,7 +10404,11 @@ class BacktestApp:
         saved = (guard.daily_loss_limit, runner.daily_loss_limit,
                  guard._last_net_pnl, guard.paused, guard._pause_day_key)
         guard.arm_for_live_switch(req.loss_limit)
-        guard.update_pnl(net)
+        # Same clock as the account-display poll. A pause recorded on
+        # this attempt has to carry today's key, or the 15:00 boundary
+        # can never release it. The strict pre-check above makes a new
+        # pause unreachable today; the key is what keeps that fragile.
+        guard.update_pnl(net, day_key=_tg.trading_day_key(_taipei_now()))
         runner.daily_loss_limit = req.loss_limit
         if not self._apply_requested_mode(bot_dir, req):
             # The switch was refused. Do not leave this attempt's account

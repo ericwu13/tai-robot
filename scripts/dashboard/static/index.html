@@ -550,7 +550,7 @@ const App = {
       body.push(el("p", null, "機器人會先查詢帳戶持倉：帳戶已有任何未平倉部位、帳戶淨損益（券商權益數回報）已超過下方的每日虧損上限、查詢失敗或逾時、等待成交中或重播歷史時，都會拒絕切換。結果會顯示在頁面上。"));
       body.push(el("p", { class: "sub" }, "重新啟動後會回到命令列指定的模式（--mode），這次切換與虧損上限都不會保留。"));
       body.push(el("p", null, "每日虧損上限（新台幣）："));
-      const limit = el("input", { id: "dlg-limit", type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "例如 10000" });
+      const limit = el("input", { id: "dlg-limit", type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "例如 20000" });
       body.push(limit);
       body.push(el("p", null, "請輸入機器人名稱："));
       const name = el("input", { id: "dlg-input", autocomplete: "off", placeholder: b.bot_name });

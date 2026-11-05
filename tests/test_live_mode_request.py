@@ -1029,6 +1029,84 @@ def test_control_file_pending_refuses_mode_request_on_the_same_tick(harness):
     assert not os.path.exists(os.path.join(h.bot_dir, "CONTROL"))
 
 
+def test_failed_switch_restores_pause_day_key(harness, monkeypatch):
+    """A refused apply must put ``_pause_day_key`` back with ``paused``.
+
+    The pre-check refuses a net already past the requested limit, so
+    this lowers the guard's limit after ``arm_for_live_switch`` — the
+    fragile window Reed noted — and then makes the apply fail. Dropping
+    the rollback of ``_pause_day_key`` leaves the attempt's key behind.
+    """
+    h = harness
+    guard = h.app._trading_guard
+    guard._pause_day_key = "2026-11-03"
+    guard.paused = False
+    real_arm = guard.arm_for_live_switch
+
+    def _arm(limit):
+        real_arm(limit)
+        guard.daily_loss_limit = 1
+
+    guard.arm_for_live_switch = _arm
+    now = datetime(2026, 11, 4, 20, 0)
+    monkeypatch.setattr(rb, "_taipei_now", lambda: now)
+    during = {}
+    real_update = TradingGuard.update_pnl
+
+    def _update(self, net, day_key=""):
+        during["day_key"] = day_key
+        result = real_update(self, net, day_key=day_key)
+        during["key_after"] = self._pause_day_key
+        during["paused_after"] = self.paused
+        return result
+
+    monkeypatch.setattr(TradingGuard, "update_pnl", _update)
+
+    h.request(loss_limit=3000)
+    h.poll()
+    # Gates already passed. Apply itself still honours this flag.
+    h.runner._allow_live_override = False
+    h.oi("001,查無資料", "##")
+    h.rights(_rights(realized=-100))
+    h.poll()
+
+    assert h.result()["status"] == "refused"
+    assert during["paused_after"] is True
+    assert during["key_after"] == rb._tg.trading_day_key(now)
+    assert during["key_after"] != "2026-11-03"
+    assert guard.paused is False
+    assert guard._pause_day_key == "2026-11-03"
+    assert guard.daily_loss_limit == 1000
+    assert h.app._trading_mode == "paper"
+
+
+def test_switch_update_pnl_receives_the_trading_day_key(harness, monkeypatch):
+    """``_continue_auto_mode_request`` must pass today's key.
+
+    Dropping ``day_key`` on that ``update_pnl`` call leaves it ``""``.
+    """
+    h = harness
+    now = datetime(2026, 11, 4, 20, 0)
+    monkeypatch.setattr(rb, "_taipei_now", lambda: now)
+    seen = {}
+    real_update = TradingGuard.update_pnl
+
+    def _update(self, net, day_key=""):
+        seen["day_key"] = day_key
+        return real_update(self, net, day_key=day_key)
+
+    monkeypatch.setattr(TradingGuard, "update_pnl", _update)
+    h.request(loss_limit=3000)
+    h.poll()
+    h.oi("001,查無資料", "##")
+    h.rights(_rights(realized=-100))
+    h.poll()
+
+    assert h.result()["status"] == "accepted"
+    assert seen["day_key"] == rb._tg.trading_day_key(now) == "2026-11-04"
+    assert seen["day_key"] != ""
+
+
 def test_example_settings_opt_in_nobody():
     import yaml
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
