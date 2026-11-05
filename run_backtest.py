@@ -1179,6 +1179,22 @@ def _log_reply_error(msg: str) -> None:
         pass
 
 
+def _notify_news(message: str) -> None:
+    """Discord line for a news-breaker action. Never raises.
+
+    Flatten, entries held or released, and a breaker action that failed
+    are position risk. A regime recommendation uses ``notify_regime``
+    without this flag and stays droppable.
+    """
+    try:
+        discord = _discord
+        if discord is None or not getattr(discord, "enabled", False):
+            return
+        discord.notify_regime(message, priority=True)
+    except Exception as exc:
+        _log(f"[NEWS] discord alert failed: [{type(exc).__name__}] {exc}")
+
+
 def _notify_reply_silent(message: str) -> None:
     """One Discord alert via the deploy notifier. Never raises.
 
@@ -1190,7 +1206,7 @@ def _notify_reply_silent(message: str) -> None:
         discord = _discord
         if discord is None or not getattr(discord, "enabled", False):
             return
-        discord.notify(message)
+        discord.notify(message, priority=True)
     except Exception as exc:
         _log_reply_error(
             f"[CONN] discord alert failed: [{type(exc).__name__}] {exc}")
@@ -2233,7 +2249,7 @@ class BacktestApp:
                 self._reconnect_timer_id = None
         if _discord is not None and _discord.enabled:
             try:
-                _discord.notify(f"⚠️ {alert}")
+                _discord.notify(f"⚠️ {alert}", priority=True)
             except Exception as e:
                 _log(f"[RECONNECT] discord alert failed: [{type(e).__name__}] {e}")
 
@@ -9199,9 +9215,7 @@ class BacktestApp:
         # News circuit-breaker announcements share the regime channel
         # (falls back to the main channel when unconfigured).
         if hasattr(self._live_runner, "on_news_notify_cb"):
-            self._live_runner.on_news_notify_cb = lambda msg: (
-                _discord.notify_regime(msg) if _discord is not None and _discord.enabled else None
-            )
+            self._live_runner.on_news_notify_cb = _notify_news
 
         # Debug: log resolved order symbol and query stock list
         order_sym = resolve_order_symbol(symbol)
@@ -9671,7 +9685,7 @@ class BacktestApp:
         self._live_log_msg(msg, "exit")
         if _discord and _discord.enabled:
             try:
-                _discord.notify(msg)
+                _discord.notify(msg, priority=True)
             except Exception:
                 pass
 
@@ -11936,7 +11950,7 @@ class BacktestApp:
                 pass
             if _discord is not None and getattr(_discord, "enabled", False):
                 try:
-                    _discord.notify(f"⚠️ {msg}")
+                    _discord.notify(f"⚠️ {msg}", priority=True)
                 except Exception as exc:
                     _log(
                         "[CONN] equity hold alert failed: "
@@ -12018,7 +12032,7 @@ class BacktestApp:
         discord = _discord
         if discord is not None and getattr(discord, "enabled", False):
             try:
-                discord.notify(f"⚠️ {msg}")
+                discord.notify(f"⚠️ {msg}", priority=True)
             except Exception as exc:
                 _log(
                     "[CONN] equity refresh discord failed: "
@@ -12212,7 +12226,9 @@ class BacktestApp:
         def _alert(message: str) -> None:
             _log(message)
             if _discord is not None and _discord.enabled:
-                _discord.notify(message)
+                # P1 HUNG must survive a full notifier queue. The P2
+                # start-failure notice below stays routine.
+                _discord.notify(message, priority=True)
 
         def _p2_start_failed(exc: BaseException) -> None:
             # One-shot deploy failure. Distinct from the rate-limited
