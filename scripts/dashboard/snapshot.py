@@ -139,6 +139,44 @@ def last_activity_ts(bot_dir: str) -> float | None:
     return max(stamps) if stamps else None
 
 
+def _loss_int(value):
+    """Whole number from a heartbeat field, or None when it is not one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def loss_status(heartbeat) -> dict | None:
+    """Fleet-row view of the loss guard. None when the heartbeat is older.
+
+    ``loss_paused`` draws the PAUSED badge. ``loss_net`` and ``loss_limit``
+    draw the numbers. A limit of 0 is off. Missing keys show nothing.
+    """
+    if not isinstance(heartbeat, dict):
+        return None
+    if not any(key in heartbeat for key in ("loss_paused", "loss_net", "loss_limit")):
+        return None
+    paused = heartbeat.get("loss_paused") is True
+    net = _loss_int(heartbeat.get("loss_net")) if "loss_net" in heartbeat else None
+    limit = (_loss_int(heartbeat.get("loss_limit"))
+             if "loss_limit" in heartbeat else None)
+    parts = []
+    if net is not None:
+        parts.append(f"net {net:,}")
+    if limit is not None:
+        parts.append("limit off" if limit == 0 else f"limit {limit:,}")
+    return {
+        "paused": paused,
+        "badge": "PAUSED" if paused else "",
+        "title": "Daily loss limit reached" if paused else "",
+        "text": " / ".join(parts),
+    }
+
+
 def bot_state(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
               activity_ts: float | None = None) -> dict:
     """State code plus detail. Codes:
@@ -157,7 +195,8 @@ def bot_state(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
     has_lock, pid = read_lock(bot_dir)
     hb = fileio.read_json(os.path.join(bot_dir, HEARTBEAT_FILENAME))
     out = {"state": "STOPPED", "pid": pid, "heartbeat_age_s": None,
-           "inflight_call": "", "inflight_age_s": None}
+           "inflight_call": "", "inflight_age_s": None,
+           "loss": loss_status(hb)}
     if not has_lock:
         return out
     if pid is None:
@@ -472,7 +511,7 @@ def _broken_bot(bot_dir: str, exc: Exception) -> dict:
             "interval_s": 0, "point_value": 1, "trades": 0, "win_rate": None,
             "pnl_total": 0, "pnl_today": 0, "trades_today": 0, "position": None,
             "last_price": None, "last_bar_dt": "", "saved_at": "", "real": None,
-            "last_decision": None, "regime": None,
+            "last_decision": None, "regime": None, "loss": None,
             "pending": {"stop": False, "mode": None, "request": None, "result": None},
             "supports_mode_request": False, "headless": False, "active": True}
 
