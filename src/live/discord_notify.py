@@ -28,16 +28,18 @@ _API_BASE = "https://discord.com/api/v10"
 # 10 s timeout, so the timeout alone is not a containment story.
 #
 # What is containable is the queue in front of that stall. One worker
-# thread owns the shared client. Callers enqueue without blocking. When
-# the queue is full, routine messages are counted and dropped; priority
-# messages (HUNG, order, trade, exit) wait in a small backlog and are
-# flushed in arrival order once a send succeeds. The 429 backoff stays
-# inside the worker, so a retry already in flight is not a new enqueue
-# and cannot be dropped for queue pressure.
+# thread owns the shared client. Callers enqueue without blocking.
+# Nothing is dropped while fewer than SEND_QUEUE_MAX messages are
+# waiting. Once that queue is full, routine messages are counted and
+# dropped. Priority messages wait in their own backlog of the same
+# size and are flushed in arrival order once a send succeeds. They
+# are dropped only when that backlog is full too. The 429 backoff
+# stays inside the worker, so a retry already in flight is not a new
+# enqueue and cannot be dropped for queue pressure.
 HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
-SEND_QUEUE_MAX = 8
-PRIORITY_BACKLOG_MAX = 8
+SEND_QUEUE_MAX = 200
+PRIORITY_BACKLOG_MAX = 200
 # A send that raises is put back this many times, then abandoned so the
 # next notification still goes out. Zero would drop it on the first error.
 WORKER_SEND_RETRIES = 1

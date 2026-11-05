@@ -3,7 +3,8 @@
 On 2026-11-04 every bot on the live host had ``_post`` threads parked in
 ``socket.getaddrinfo`` for 90+ seconds. httpx bounds connect / read /
 write; it does not bound name resolution. The containment is one worker,
-a bounded queue, and a small priority backlog.
+a bounded queue of 200, and a priority backlog of the same size.
+A stall that queues fewer than that loses nothing.
 
 Tests 2 and 3 (``test_a_normal_send_still_takes_the_lock_and_posts`` and
 ``test_lock_is_released_when_the_post_raises``) used to fail on master
@@ -141,7 +142,7 @@ def test_send_is_dropped_when_the_notifier_is_already_wedged(caplog, monkeypatch
     "429 rate-limited" instead of leaving the send alone).
     """
     stall = _Stall(monkeypatch)
-    extra = 30
+    extra = discord_notify.SEND_QUEUE_MAX + 5
     try:
         stall.arm()
         with _spy_threads() as born:
@@ -149,7 +150,7 @@ def test_send_is_dropped_when_the_notifier_is_already_wedged(caplog, monkeypatch
                 def burst():
                     for i in range(extra):
                         stall.n._send(f"msg-{i}")
-                _run_bounded(burst)
+                _run_bounded(burst, timeout=3.0)
         # Master starts one thread per send. This branch starts none.
         assert len(born) <= 1
         drop_logs = [
@@ -171,7 +172,7 @@ def test_send_is_dropped_when_the_notifier_is_already_wedged(caplog, monkeypatch
         assert "msg-0" in bodies
         assert f"msg-{discord_notify.SEND_QUEUE_MAX - 1}" in bodies
         assert f"msg-{discord_notify.SEND_QUEUE_MAX}" not in bodies
-        assert "msg-29" not in bodies
+        assert f"msg-{extra - 1}" not in bodies
     finally:
         stall.free()
 
@@ -256,14 +257,14 @@ def test_client_timeout_is_explicit_per_phase():
 def test_wedged_send_bounds_threads_and_queue(monkeypatch):
     """Many sends behind one wedged POST stay on one worker and one queue."""
     stall = _Stall(monkeypatch)
-    burst_n = 40
+    burst_n = discord_notify.SEND_QUEUE_MAX + 15
     try:
         with _spy_threads() as born:
             stall.arm()
             def burst():
                 for i in range(burst_n):
                     stall.n._send(f"bulk-{i}")
-            _run_bounded(burst)
+            _run_bounded(burst, timeout=3.0)
         workers = [t for t in born if t.name == "discord-notify"]
         # The burst helper is the other thread. Send work did not add more.
         assert len(workers) == 1
@@ -641,3 +642,105 @@ def test_equity_hold_alerts_survive_a_full_queue(monkeypatch):
     finally:
         stall.free()
         rb._discord = previous
+
+
+def test_long_stall_keeps_fifty_mixed_messages_in_order(monkeypatch):
+    """About 50 mixed messages during a long stall are all delivered, in order.
+
+    Fifty is more than the old cap of 8 and less than 200. A cap of 8
+    drops the tail, so this test fails.
+    """
+    stall = _Stall(monkeypatch)
+    labels = [f"m-{i}" for i in range(50)]
+    try:
+        stall.arm()
+        for i, label in enumerate(labels):
+            stall.n._send(label, priority=(i % 5 == 0))
+        assert stall.n._dropped == 0
+        assert stall.n._priority_overflow == 0
+        assert len(stall.n._priority_backlog) == 0
+        assert stall.n._queue.qsize() == len(labels)
+        stall.free()
+        _wait_until(lambda: (
+            stall.n._queue.unfinished_tasks == 0
+            and stall.n._queue.qsize() == 0
+            and len(stall.n._priority_backlog) == 0
+            and stall.posted[:1] == ["WEDGE"]
+            and len(stall.posted) >= 1 + len(labels)
+        ))
+        assert stall.posted == ["WEDGE", *labels]
+        assert stall.n._dropped == 0
+        assert _summaries(stall.posted) == []
+    finally:
+        stall.free()
+
+
+def test_overflowing_200_routine_messages_sheds_only_those(caplog, monkeypatch):
+    """Past the routine cap, only the extra routine messages are dropped."""
+    stall = _Stall(monkeypatch)
+    extra = 7
+    cap = discord_notify.SEND_QUEUE_MAX
+    try:
+        stall.arm()
+        with caplog.at_level(logging.WARNING, logger="src.live.discord_notify"):
+            for i in range(cap + extra):
+                stall.n._send(f"routine-{i}")
+        assert stall.n._dropped == extra
+        assert stall.n._priority_overflow == 0
+        assert len(stall.n._priority_backlog) == 0
+        assert stall.n._queue.qsize() == cap
+        drop_logs = [
+            rec for rec in caplog.records
+            if "Discord send dropped" in rec.getMessage()
+        ]
+        assert len(drop_logs) == extra
+        assert {rec.levelno for rec in drop_logs} == {logging.WARNING}
+        stall.free()
+        _wait_until(lambda: _drained(stall.n, stall.posted))
+        assert f"routine-{cap - 1}" in stall.posted
+        assert f"routine-{cap}" not in stall.posted
+        assert f"routine-{cap + extra - 1}" not in stall.posted
+        summaries = _summaries(stall.posted)
+        assert len(summaries) == 1
+        assert f"{extra} messages dropped, 0 delivered late" in summaries[0]
+    finally:
+        stall.free()
+
+
+def test_priority_survives_a_routine_overflow(monkeypatch):
+    """A full routine queue sheds the next routine send and keeps priority.
+
+    Swapping the two branches would drop the priority line and deliver
+    the extra routine one instead.
+    """
+    stall = _Stall(monkeypatch)
+    extra = 4
+    cap = discord_notify.SEND_QUEUE_MAX
+    try:
+        stall.arm()
+        for i in range(cap + extra):
+            stall.n._send(f"routine-{i}")
+        stall.n._send("kept-priority", priority=True)
+        stall.n._send("kept-hung", priority=True)
+        assert stall.n._dropped == extra
+        assert stall.n._priority_overflow == 0
+        assert [item[0] for item in stall.n._priority_backlog] == [
+            "kept-priority", "kept-hung",
+        ]
+        stall.free()
+        _wait_until(lambda: _drained(stall.n, stall.posted))
+        assert "kept-priority" in stall.posted
+        assert "kept-hung" in stall.posted
+        assert f"routine-{cap}" not in stall.posted
+        assert f"routine-0" in stall.posted
+        summaries = _summaries(stall.posted)
+        assert len(summaries) == 1
+        assert f"{extra} messages dropped, 2 delivered late" in summaries[0]
+        priority_at = stall.posted.index("kept-priority")
+        hung_at = stall.posted.index("kept-hung")
+        summary_at = next(
+            i for i, body in enumerate(stall.posted)
+            if "Discord was stalled:" in body)
+        assert priority_at < hung_at < summary_at
+    finally:
+        stall.free()
