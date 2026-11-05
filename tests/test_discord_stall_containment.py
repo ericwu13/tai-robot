@@ -334,19 +334,22 @@ def test_priority_messages_survive_a_full_queue_and_flush_in_order(monkeypatch):
 
 
 def test_priority_backlog_overflow_is_counted(monkeypatch):
-    """Past the backlog cap, priority sends are counted and not delivered."""
+    """Past the priority cap, further priority sends are counted and not delivered.
+
+    Priority never occupies the routine queue, so the cap is the deque
+    alone.
+    """
     stall = _Stall(monkeypatch)
-    queued = discord_notify.SEND_QUEUE_MAX
     parked = discord_notify.PRIORITY_BACKLOG_MAX
     overflow = 2
-    total = queued + parked + overflow
+    total = parked + overflow
     try:
         stall.arm()
         for i in range(total):
             stall.n._send(f"prio-{i}", priority=True)
         assert len(stall.n._priority_backlog) == parked
         assert stall.n._priority_overflow == overflow
-        assert stall.n._queue.qsize() == queued
+        assert stall.n._queue.qsize() == 0
         stall.free()
         _wait_until(lambda: _drained(stall.n, stall.posted))
         summaries = _summaries(stall.posted)
@@ -355,11 +358,9 @@ def test_priority_backlog_overflow_is_counted(monkeypatch):
             f"0 messages dropped, {parked} delivered late, "
             f"{overflow} priority overflow"
         ) in summaries[0]
-        assert "prio-0" in stall.posted
-        # Backlog keeps arrival order and jumps ahead of the queued tail.
         backlog_at = [
             next(i for i, body in enumerate(stall.posted) if body == f"prio-{n}")
-            for n in range(queued, queued + parked)
+            for n in range(parked)
         ]
         assert backlog_at == sorted(backlog_at)
         summary_at = next(
@@ -645,32 +646,37 @@ def test_equity_hold_alerts_survive_a_full_queue(monkeypatch):
 
 
 def test_long_stall_keeps_fifty_mixed_messages_in_order(monkeypatch):
-    """About 50 mixed messages during a long stall are all delivered, in order.
+    """About 50 mixed messages during a long stall are all delivered.
 
-    Fifty is more than the old cap of 8 and less than 200. A cap of 8
-    drops the tail, so this test fails.
+    Priority stays ahead of routine, and each class stays in its own
+    FIFO order. Fifty is more than the old cap of 8 and less than 200.
+    A cap of 8 drops the routine tail, so this test fails.
     """
     stall = _Stall(monkeypatch)
     labels = [f"m-{i}" for i in range(50)]
+    priority = [label for i, label in enumerate(labels) if i % 5 == 0]
+    routine = [label for i, label in enumerate(labels) if i % 5 != 0]
     try:
         stall.arm()
         for i, label in enumerate(labels):
             stall.n._send(label, priority=(i % 5 == 0))
         assert stall.n._dropped == 0
         assert stall.n._priority_overflow == 0
-        assert len(stall.n._priority_backlog) == 0
-        assert stall.n._queue.qsize() == len(labels)
+        assert [item[0] for item in stall.n._priority_backlog] == priority
+        assert stall.n._queue.qsize() == len(routine)
         stall.free()
-        _wait_until(lambda: (
-            stall.n._queue.unfinished_tasks == 0
-            and stall.n._queue.qsize() == 0
-            and len(stall.n._priority_backlog) == 0
-            and stall.posted[:1] == ["WEDGE"]
-            and len(stall.posted) >= 1 + len(labels)
-        ))
-        assert stall.posted == ["WEDGE", *labels]
+        _wait_until(lambda: _drained(stall.n, stall.posted))
+        delivered = [
+            body for body in stall.posted if "Discord was stalled:" not in body
+        ]
+        assert delivered == ["WEDGE", *priority, *routine]
         assert stall.n._dropped == 0
-        assert _summaries(stall.posted) == []
+        summaries = _summaries(stall.posted)
+        assert len(summaries) == 1
+        assert (
+            f"0 messages dropped, {len(priority)} delivered late"
+            in summaries[0]
+        )
     finally:
         stall.free()
 
@@ -742,5 +748,41 @@ def test_priority_survives_a_routine_overflow(monkeypatch):
             i for i, body in enumerate(stall.posted)
             if "Discord was stalled:" in body)
         assert priority_at < hung_at < summary_at
+    finally:
+        stall.free()
+
+
+def test_daily_loss_limit_jumps_ahead_of_queued_routine(monkeypatch):
+    """A loss-limit alert queued behind routine traffic is the next send.
+
+    The in-flight POST finishes first. The loss-limit message is the
+    one after it, not after the 50 routine messages. Putting that alert
+    on the routine queue fails this.
+    """
+    stall = _Stall(monkeypatch)
+    try:
+        stall.arm()
+        for i in range(50):
+            stall.n._send(f"routine-{i}")
+        stall.n.daily_loss_limit(-12000, 10000)
+        assert stall.n._queue.qsize() == 50
+        assert len(stall.n._priority_backlog) == 1
+        assert "Daily Loss Limit" in stall.n._priority_backlog[0][0]
+        stall.free()
+        _wait_until(lambda: (
+            stall.n._queue.unfinished_tasks == 0
+            and stall.n._queue.qsize() == 0
+            and len(stall.n._priority_backlog) == 0
+            and any(body == "routine-49" for body in stall.posted)
+        ))
+        loss = [
+            i for i, body in enumerate(stall.posted)
+            if "Daily Loss Limit" in body
+        ]
+        assert loss == [1]
+        assert stall.posted[0] == "WEDGE"
+        routines = [body for body in stall.posted if body.startswith("routine-")]
+        assert routines == [f"routine-{i}" for i in range(50)]
+        assert stall.posted.index("routine-0") > loss[0]
     finally:
         stall.free()

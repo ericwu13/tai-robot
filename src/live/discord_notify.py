@@ -29,13 +29,15 @@ _API_BASE = "https://discord.com/api/v10"
 #
 # What is containable is the queue in front of that stall. One worker
 # thread owns the shared client. Callers enqueue without blocking.
-# Nothing is dropped while fewer than SEND_QUEUE_MAX messages are
-# waiting. Once that queue is full, routine messages are counted and
-# dropped. Priority messages wait in their own backlog of the same
-# size and are flushed in arrival order once a send succeeds. They
-# are dropped only when that backlog is full too. The 429 backoff
-# stays inside the worker, so a retry already in flight is not a new
-# enqueue and cannot be dropped for queue pressure.
+# Routine messages use a queue of SEND_QUEUE_MAX. Priority messages
+# always use their own deque, never that queue, so a risk alert waits
+# only for the send already in progress and the priority messages
+# ahead of it. Once the routine queue is full, routine messages are
+# counted and dropped. Priority messages are dropped only when their
+# own backlog of the same size is full. The worker drains the deque
+# before it takes anything routine. The 429 backoff stays inside the
+# worker, so a retry already in flight is not a new enqueue and
+# cannot be dropped for queue pressure.
 HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
 SEND_QUEUE_MAX = 200
@@ -83,8 +85,10 @@ class DiscordNotifier:
         self._queue: queue.Queue = queue.Queue(maxsize=SEND_QUEUE_MAX)
         self._priority_backlog: deque = deque()
         self._state_lock = threading.Lock()
+        self._work_ready = threading.Condition(self._state_lock)
         self._worker: threading.Thread | None = None
         self._worker_lock = threading.Lock()
+        self._in_flight = False
         self._dropped = 0
         self._late = 0
         self._priority_overflow = 0
@@ -118,11 +122,11 @@ class DiscordNotifier:
         route evolution logs / daily reports to their own channels). Empty
         → the main channel.
 
-        ``priority`` defaults to False. Routine messages are dropped when
-        the queue is full. Priority messages are parked in
-        :data:`PRIORITY_BACKLOG_MAX` and flushed in order after a send
-        succeeds. The default stays routine so a caller that does not opt
-        in cannot fill that backlog.
+        ``priority`` defaults to False. Routine messages use the bounded
+        queue and are dropped when it is full. Priority messages always
+        go to the priority deque, ahead of anything still routine, and
+        are dropped only when that deque is full. The default stays
+        routine so a caller that does not opt in cannot fill that deque.
 
         HTTP 429 is retried by the worker (1s, 2s, 4s), not by enqueueing
         again, so a retry cannot be dropped because the queue is full.
@@ -137,16 +141,23 @@ class DiscordNotifier:
             target, len(content), self._bot_name,
         )
         self._ensure_worker()
-        item = (content, target, priority)
+        item = (content, target, priority, 0, False)
+        if priority:
+            # Never the routine queue. A risk alert must not wait out
+            # the routine backlog.
+            self._enqueue_priority(item)
+            return
         # One attempt. The ``return`` is the drop: it must not fall through
         # into a send, and it must not ``continue`` (that spins on a full
         # queue and blocks the caller, which is the Tk thread).
         while True:
             try:
-                self._queue.put_nowait(item)
+                with self._state_lock:
+                    self._queue.put_nowait(item)
+                    self._work_ready.notify()
                 return
             except queue.Full:
-                self._on_queue_full(item, priority)
+                self._on_queue_full(item, False)
                 return
 
     def _ensure_worker(self) -> None:
@@ -165,23 +176,35 @@ class DiscordNotifier:
             self._worker = worker
             worker.start()
 
-    def _on_queue_full(self, item, priority: bool) -> None:
-        """Queue is full. Park a priority message, or count a routine drop.
-
-        Returns without sending. A stalled POST must not be done on the
-        caller, and a full queue must not start another thread.
-        """
-        if priority:
-            with self._state_lock:
-                if len(self._priority_backlog) < PRIORITY_BACKLOG_MAX:
-                    self._priority_backlog.append(item)
-                    return
-                self._priority_overflow += 1
-            logger.warning(
-                "Discord priority backlog overflow (bot=%s). "
-                "A stalled send filled the priority backlog.",
-                self._bot_name,
+    def _enqueue_priority(self, item) -> None:
+        """Park one priority message. Wake the worker; do not touch the queue."""
+        content, target, priority, tries, _waited = item
+        with self._state_lock:
+            waited = (
+                self._in_flight
+                or not self._queue.empty()
+                or len(self._priority_backlog) > 0
             )
+            if len(self._priority_backlog) >= PRIORITY_BACKLOG_MAX:
+                self._priority_overflow += 1
+                overflow = True
+            else:
+                self._priority_backlog.append(
+                    (content, target, priority, tries, waited))
+                self._work_ready.notify()
+                overflow = False
+        if not overflow:
+            return
+        logger.warning(
+            "Discord priority backlog overflow (bot=%s). "
+            "A stalled send filled the priority backlog.",
+            self._bot_name,
+        )
+
+    def _on_queue_full(self, item, priority: bool) -> None:
+        """Routine queue is full. Count the drop. Do not send on the caller."""
+        if priority:
+            self._enqueue_priority(item)
             return
         with self._state_lock:
             self._dropped += 1
@@ -201,10 +224,13 @@ class DiscordNotifier:
             sent_ok = False
             try:
                 item, from_backlog, queued = self._next_item()
+                with self._state_lock:
+                    self._in_flight = True
                 content, target = item[0], item[1]
                 ok = self._deliver(content, target)
                 sent_ok = True
-                if from_backlog and ok:
+                waited = item[4] if len(item) > 4 else False
+                if from_backlog and ok and waited:
                     with self._state_lock:
                         self._late += 1
                 if ok:
@@ -220,6 +246,8 @@ class DiscordNotifier:
                 if item is not None and not sent_ok:
                     self._retry_failed_item(item, from_backlog)
             finally:
+                with self._state_lock:
+                    self._in_flight = False
                 if queued:
                     self._queue.task_done()
 
@@ -228,13 +256,17 @@ class DiscordNotifier:
         tries = item[3] if len(item) > 3 else 0
         if tries >= WORKER_SEND_RETRIES:
             return
-        restored = (item[0], item[1], item[2], tries + 1)
+        waited = item[4] if len(item) > 4 else False
+        restored = (item[0], item[1], item[2], tries + 1, waited)
         if from_backlog or item[2]:
             with self._state_lock:
                 self._priority_backlog.appendleft(restored)
+                self._work_ready.notify()
             return
         try:
-            self._queue.put_nowait(restored)
+            with self._state_lock:
+                self._queue.put_nowait(restored)
+                self._work_ready.notify()
         except queue.Full:
             with self._state_lock:
                 self._dropped += 1
@@ -245,11 +277,17 @@ class DiscordNotifier:
             )
 
     def _next_item(self):
-        """Priority backlog first, then the main queue. Blocks on the queue."""
+        """Priority deque first, then one routine message.
+
+        Blocks until either side has work. A priority message enqueued
+        while this waits is taken before any routine message already queued.
+        """
         with self._state_lock:
+            while not self._priority_backlog and self._queue.empty():
+                self._work_ready.wait()
             if self._priority_backlog:
                 return self._priority_backlog.popleft(), True, False
-        return self._queue.get(), False, True
+            return self._queue.get_nowait(), False, True
 
     def _post_stall_summary(self) -> None:
         """One catch-up line after a successful send, once the backlog is empty.
