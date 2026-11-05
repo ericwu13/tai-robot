@@ -323,11 +323,19 @@ class TestClosureOverride:
         assert is_taifex_holiday(date(2026, 4, 16)) is False
         assert is_taifex_holiday(date(2026, 1, 1)) is True
 
-    def test_rewrite_is_picked_up(self, closure_file):
+    def test_rewrite_is_picked_up(self, closure_file, monkeypatch):
+        # Issue #233: stat is throttled to 60 s. Inside the window the
+        # previous answer stands; after it, the new mtime is loaded.
+        import src.market_data.holidays as hol
+
+        clock = {"t": 1_000.0}
+        monkeypatch.setattr(hol, "_monotonic", lambda: clock["t"])
         closure_file.write_text("2026-04-16\n", encoding="utf-8")
         assert is_taifex_holiday(date(2026, 4, 16)) is True
         closure_file.write_text("2026-04-17\n", encoding="utf-8")
         os.utime(closure_file, (time.time() + 10, time.time() + 10))
+        assert is_taifex_holiday(date(2026, 4, 16)) is True
+        clock["t"] += hol.CLOSURE_STAT_INTERVAL_S
         assert is_taifex_holiday(date(2026, 4, 16)) is False
         assert is_taifex_holiday(date(2026, 4, 17)) is True
 
