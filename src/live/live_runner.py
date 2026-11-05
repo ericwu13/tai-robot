@@ -595,7 +595,8 @@ class LiveRunner:
         self.trading_mode: str = "paper"  # "paper", "semi_auto", or "auto"
         self.broker.trade_source = _mode_to_source(self.trading_mode)
         self.broker.strategy_label = self.strategy_display_name
-        self.daily_loss_limit: int = 10000  # NTD, for session persistence
+        from .trading_guard import DEFAULT_DAILY_LOSS_LIMIT_NTD
+        self.daily_loss_limit: int = DEFAULT_DAILY_LOSS_LIMIT_NTD  # NTD, for session persistence
 
         # Issue #168: a resumed open position must keep a stop. The strategy
         # object is new, so levels it latched at entry are gone unless we

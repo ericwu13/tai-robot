@@ -6,6 +6,30 @@ unit-tested without Tkinter or COM dependencies.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
+# Default real-order daily loss limit, NT$. Distinct from
+# ``risk.max_daily_loss`` (``src/risk/rules.py``), which gates the
+# backtest/ExecutionEngine layer and never sees a real order.
+DEFAULT_DAILY_LOSS_LIMIT_NTD = 20000
+
+
+def trading_day_key(now: datetime) -> str:
+    """TAIFEX trading-day open date as ``YYYY-MM-DD``.
+
+    The day rolls at 15:00 TPE (night-session open), so 2026-11-04 20:00
+    and 2026-11-05 04:58 are the same trading day, keyed ``2026-11-04``.
+    Matches the repo's session identity convention (open date, not the
+    calendar date at poll time).
+
+    Deliberately pure arithmetic: no holiday calendar. A weekend or
+    holiday has no session, so a key that advances there is harmless —
+    and importing the calendar would make the loss gate inherit the
+    weekend-only degradation of issue #155.
+    """
+    local = now.date() if now.hour >= 15 else (now - timedelta(days=1)).date()
+    return local.isoformat()
+
 
 class TradingGuard:
     """Validates orders against safety rules before they are sent.
@@ -14,11 +38,17 @@ class TradingGuard:
     All mutating methods return a (allowed: bool, reason: str) tuple.
     """
 
-    def __init__(self, daily_loss_limit: int = 10000):
+    def __init__(self, daily_loss_limit: int = DEFAULT_DAILY_LOSS_LIMIT_NTD):
         self.daily_loss_limit: int = daily_loss_limit
         self.real_entry_confirmed: bool = False
         self.paused: bool = False  # True when daily loss limit hit
         self._last_net_pnl: int = 0
+        # Trading day the pause belongs to (``trading_day_key``). The
+        # pause is a latch: before this, only reset() on a fresh deploy
+        # cleared it, so a limit hit on 2026-11-04 12:55 was still
+        # blocking entries on 11-05 12:46 on a bot that had been up
+        # since 08-28. Cleared when the 15:00 TPE boundary is crossed.
+        self._pause_day_key: str = ""
 
         # Fill confirmation gate (auto mode only)
         self.fill_pending: bool = False
@@ -86,6 +116,7 @@ class TradingGuard:
         """Reset all state (called on new deploy)."""
         self.real_entry_confirmed = False
         self.paused = False
+        self._pause_day_key = ""
         self._last_net_pnl = 0
         self.fill_pending = False
         self.fill_pending_type = ""
@@ -240,16 +271,32 @@ class TradingGuard:
 
     # ── Daily loss limit ──
 
-    def update_pnl(self, net_pnl: int) -> bool:
+    def update_pnl(self, net_pnl: int, day_key: str = "") -> bool:
         """Update daily P&L and check loss limit.
+
+        ``day_key`` is the caller's ``trading_day_key(now)``. When it
+        differs from the day the pause was set on, the pause is released
+        first — the limit is per trading day, and ``net_pnl`` comes from
+        the broker's own day figure (``GetFutureRights``), which has
+        already rolled over to 0 by then. Omitting ``day_key`` keeps the
+        pre-existing latch behaviour, so callers that have no clock (and
+        the backtest-side tests) are unaffected.
+
+        The release fires only on a key CHANGE, never on every poll, so
+        a pause cannot be cleared mid-session.
 
         Returns True if the limit was JUST triggered (for one-time logging).
         """
+        if day_key and self.paused and self._pause_day_key \
+                and day_key != self._pause_day_key:
+            self.paused = False
+            self._pause_day_key = ""
         self._last_net_pnl = net_pnl
         if (self.daily_loss_limit > 0
                 and net_pnl < -self.daily_loss_limit
                 and not self.paused):
             self.paused = True
+            self._pause_day_key = day_key
             return True  # just triggered
         return False
 
