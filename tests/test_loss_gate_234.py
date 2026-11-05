@@ -480,12 +480,12 @@ def test_equity_alert_is_suppressed_while_the_reply_link_is_down(monkeypatch):
         SimpleNamespace(enabled=True, notify=notes.append))
     app = _app("auto")
     app._equity_refresh_owed = True
-    app._equity_hold_alerted = False
+    app._equity_refresh_held_alerted = False
     app._equity_hold_since = time.monotonic() - (rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 1)
     app._reply_poller = SimpleNamespace(down=True)
     app._note_equity_hold_timeout()
     assert notes == []
-    assert app._equity_hold_alerted is False
+    assert app._equity_refresh_held_alerted is False
     assert app._equity_refresh_owed is True
 
     app._reply_poller = SimpleNamespace(down=False)
@@ -503,7 +503,7 @@ def test_equity_hold_clock_restarts_when_the_reply_link_returns(monkeypatch):
         SimpleNamespace(enabled=True, notify=notes.append))
     app = _app("auto")
     app._equity_refresh_owed = True
-    app._equity_hold_alerted = False
+    app._equity_refresh_held_alerted = False
     app._equity_hold_since = time.monotonic() - (rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 5)
     app._reply_poller = SimpleNamespace(down=True)
     app._apply_link_gate()
@@ -519,7 +519,7 @@ def test_equity_hold_clock_restarts_when_the_reply_link_returns(monkeypatch):
     assert app._equity_hold_since != stale
     app._note_equity_hold_timeout()
     assert notes == []
-    assert app._equity_hold_alerted is False
+    assert app._equity_refresh_held_alerted is False
 
 
 def test_discord_loss_limit_raise_does_not_stick_the_hold(monkeypatch, capsys):
@@ -542,6 +542,117 @@ def test_discord_loss_limit_raise_does_not_stick_the_hold(monkeypatch, capsys):
     assert "discord down" in logged
 
 
+def test_ten_failing_rights_ticks_alert_once_and_send_no_order(monkeypatch):
+    """One GetFutureRights per 5s, one held alert, and no order.
+
+    The 90s note shares that latch. A second latch would send a second
+    Discord message here.
+    """
+    from datetime import datetime, timedelta
+
+    calls: list[str] = []
+    notices: list[str] = []
+    start = datetime(2026, 11, 4, 10, 0, tzinfo=rb._TZ_TAIPEI)
+    now = [start]
+
+    def call_com(name, fn, *args, **kwargs):
+        calls.append(name)
+        return 151
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, msg):
+            notices.append(msg)
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetFutureRights=lambda *_a: 151))
+    monkeypatch.setattr(rb, "call_com", call_com)
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    app = _app("auto")
+    app._equity_refresh_clock = lambda: now[0]
+    app._equity_refresh_owed = True
+    app._equity_refresh_sent = False
+    app._equity_refresh_held_alerted = False
+    for i in range(10):
+        now[0] = start + timedelta(seconds=rb.EQUITY_REFRESH_RETRY_S * i)
+        app._apply_link_gate()
+    assert calls == ["GetFutureRights"] * 10
+    assert "SendFutureOrderCLR" not in calls
+    app._handle_semi_auto_order(_entry())
+    assert "SendFutureOrderCLR" not in calls
+    assert app._equity_refresh_owed is True
+    assert app._trading_guard.link_entries_blocked is True
+    app._equity_hold_since = time.monotonic() - (rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 1)
+    app._note_equity_hold_timeout()
+    assert len(notices) == 1
+    assert "entries held" in notices[0]
+
+
+def test_held_alert_latch_resets_when_the_hold_is_released(monkeypatch):
+    """After a release the next hold may alert once more.
+
+    Dies if the shared latch is not cleared on release.
+    """
+    from datetime import datetime, timedelta
+
+    notices: list[str] = []
+    start = datetime(2026, 11, 4, 10, 0, tzinfo=rb._TZ_TAIPEI)
+    now = [start]
+
+    def call_com(name, fn, *args, **kwargs):
+        return 151
+
+    class _Discord:
+        enabled = True
+
+        def notify(self, msg):
+            notices.append(msg)
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(GetFutureRights=lambda *_a: 151))
+    monkeypatch.setattr(rb, "call_com", call_com)
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    app = _app("auto")
+    app._equity_refresh_clock = lambda: now[0]
+    app._equity_refresh_owed = True
+    app._equity_refresh_sent = False
+    app._apply_link_gate()
+    assert len(notices) == 1
+    assert app._equity_refresh_held_alerted is True
+
+    _push_rights(app, _rights(realized_pnl="0"))
+    assert app._equity_refresh_owed is False
+    assert app._equity_refresh_held_alerted is False
+    assert app._equity_refresh_retry_at is None
+    assert len(notices) == 1
+
+    now[0] = start + timedelta(seconds=rb.EQUITY_REFRESH_RETRY_S * 3)
+    app._arm_equity_entry_hold()
+    app._apply_link_gate()
+    assert app._equity_refresh_owed is True
+    assert len(notices) == 2
+
+
+def test_zero_loss_limit_releases_the_hold(monkeypatch):
+    """A limit of 0 still runs update_pnl, so a valid reply ends the hold.
+
+    Dies if ``applied`` is changed to require ``daily_loss_limit > 0``.
+    """
+    monkeypatch.setattr(rb, "_discord", None)
+    app = _app("auto")
+    app._trading_guard.daily_loss_limit = 0
+    app._equity_refresh_owed = True
+    app._equity_refresh_held_alerted = True
+    app._equity_refresh_retry_at = "stale"
+    _push_rights(app, _rights(realized_pnl="0"))
+    assert app._trading_guard.paused is False
+    assert app._trading_guard._last_net_pnl == 0
+    assert app._equity_refresh_owed is False
+    assert app._equity_refresh_held_alerted is False
+    assert app._equity_refresh_retry_at is None
+
+
 def test_heartbeat_tick_sends_the_equity_hold_alert(monkeypatch):
     """M10: the alert is fired from ``_on_main_heartbeat``, not only the helper."""
     notes: list[str] = []
@@ -551,7 +662,7 @@ def test_heartbeat_tick_sends_the_equity_hold_alert(monkeypatch):
     app = _app("auto")
     app._heartbeat_active = True
     app._equity_refresh_owed = True
-    app._equity_hold_alerted = False
+    app._equity_refresh_held_alerted = False
     app._equity_hold_since = time.monotonic() - (rb.EQUITY_ENTRY_HOLD_TIMEOUT_S + 1)
     app._on_main_heartbeat()
     assert len(notes) == 1

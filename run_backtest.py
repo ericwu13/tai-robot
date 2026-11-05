@@ -221,6 +221,7 @@ def _configure_equity_entry_hold(app, hold: bool) -> None:
         app._equity_refresh_owed = False
         app._equity_hold_since = None
         app._equity_refresh_held_alerted = False
+        app._equity_refresh_retry_at = None
 
 # Registry of available backtest strategies
 STRATEGIES: dict[str, type[BacktestStrategy]] = {
@@ -1695,6 +1696,7 @@ class BacktestApp:
                         if applied and getattr(self, "_equity_refresh_owed", False):
                             self._release_equity_entry_hold()
                             self._equity_refresh_held_alerted = False
+                            self._equity_refresh_retry_at = None
                             self._apply_link_gate()
                     _log(f"權益數 FutureRights: {_redact_future_rights(data)}")
                 elif kind == "new_data":
@@ -2190,6 +2192,7 @@ class BacktestApp:
             if getattr(self, "_trading_mode", "paper") not in ("semi_auto", "auto"):
                 self._release_equity_entry_hold()
                 self._equity_refresh_held_alerted = False
+                self._equity_refresh_retry_at = None
             else:
                 self._refresh_equity_before_entries()
         allowed = (
