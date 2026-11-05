@@ -148,6 +148,7 @@ from src.live.bug_reporter import build_bug_report
 from src.live.session_store import load_session, session_summary
 from src.live.deploy_request import DeployRequest
 from src.live import mode_request as _mreq
+from src.live import trading_guard as _tg
 from src.market_data.kline_config import (
     TV_INTERVALS, INTERVAL_SECONDS, SYMBOL_CONFIG, CACHE_SUFFIXES,
     LIVE_CHART_TIMEFRAMES, resolve_order_symbol, get_near_month_symbol,
@@ -483,6 +484,16 @@ def _normalize_vote_max_age(raw, default: dict) -> dict:
     return out
 
 
+def _default_loss_limit(settings: dict) -> int:
+    """Deploy-dialog pre-fill for the real-order daily loss limit (NT$)."""
+    try:
+        value = int(settings.get("daily_loss_limit_ntd",
+                                 _tg.DEFAULT_DAILY_LOSS_LIMIT_NTD))
+    except (TypeError, ValueError):
+        return _tg.DEFAULT_DAILY_LOSS_LIMIT_NTD
+    return value if value >= 0 else _tg.DEFAULT_DAILY_LOSS_LIMIT_NTD
+
+
 def _load_settings():
     cfg = {"user_id": "", "password": "", "authority_flag": 0}
     # Check user-writable project_root first, then parent dir (for dist/), then bundle
@@ -540,6 +551,12 @@ def _load_settings():
                 trading.get("dashboard_auto_opt_in"))
             cfg["mode_switch_max_loss_ntd"] = _mreq.parse_mode_switch_loss_caps(
                 trading.get("mode_switch_max_loss_ntd"))
+            # Pre-fill for the deploy dialog / CLI. The real-order gate
+            # is per deploy (persisted in session.json); this is only the
+            # default offered. Distinct from risk.max_daily_loss, which
+            # gates the backtest ExecutionEngine and never sends an order.
+            cfg["daily_loss_limit_ntd"] = trading.get(
+                "daily_loss_limit_ntd", _tg.DEFAULT_DAILY_LOSS_LIMIT_NTD)
             # Evolution: "weekly" (default) = fitness/improvement check only
             # on the trading week's last session (Sat AM close); "daily" =
             # every session end (the pre-2.12 behavior).
@@ -8368,7 +8385,7 @@ class BacktestApp:
         loss_frame.pack(anchor=tk.W, pady=S(10, 0))
         ttk.Label(loss_frame, text="每日虧損上限 Daily Loss Limit (NTD)",
                   style="Card.Dim.TLabel").pack(side=tk.LEFT, padx=S(0, 8))
-        loss_var = tk.StringVar(value="10000")
+        loss_var = tk.StringVar(value=str(_default_loss_limit(self._settings)))
         loss_entry = ttk.Entry(loss_frame, textvariable=loss_var, width=10,
                                style="Card.TEntry")
         loss_entry.pack(side=tk.LEFT)
@@ -10456,10 +10473,14 @@ class BacktestApp:
             return
         guard = self._trading_guard
         runner = self._live_runner
+        # _pause_day_key rides along: restoring `paused` without it would
+        # leave the pause keyless, and a keyless pause is never released
+        # by the trading-day boundary — the bot would silently fall back
+        # to the old latch until its next deploy.
         saved = (guard.daily_loss_limit, runner.daily_loss_limit,
-                 guard._last_net_pnl, guard.paused)
+                 guard._last_net_pnl, guard.paused, guard._pause_day_key)
         guard.arm_for_live_switch(req.loss_limit)
-        guard.update_pnl(net)
+        guard.update_pnl(net, day_key=_tg.trading_day_key(_taipei_now()))
         runner.daily_loss_limit = req.loss_limit
         if not self._apply_requested_mode(bot_dir, req):
             # The switch was refused. Do not leave this attempt's account
@@ -10467,6 +10488,7 @@ class BacktestApp:
             guard.daily_loss_limit, runner.daily_loss_limit = saved[0], saved[1]
             guard._last_net_pnl = saved[2]
             guard.paused = saved[3]
+            guard._pause_day_key = saved[4]
 
     def _apply_requested_mode(self, bot_dir: str, req) -> bool:
         """Apply through ``LiveRunner._apply_mode_switch``; True on success."""
@@ -12090,7 +12112,8 @@ class BacktestApp:
                             f"{net:+,} / -{guard.daily_loss_limit:,}")
                 else:
                     self.real_loss_limit_var.set("--")
-                triggered = guard.update_pnl(net)
+                triggered = guard.update_pnl(
+                    net, day_key=_tg.trading_day_key(_taipei_now()))
                 # Not a hold release. An open-interest refresh also
                 # lands here while the equity hold is still owed, so
                 # this must not clear _equity_refresh_held_alerted.
@@ -12114,7 +12137,10 @@ class BacktestApp:
             else:
                 # Paper does not run update_pnl and does not clear the
                 # entries-held latch. The paper branch of the link gate
-                # releases the hold.
+                # releases the hold. A pause carried in from a real mode
+                # still ends at the trading-day boundary, or the switch
+                # back to auto would be refused until a redeploy.
+                guard.roll_day(_tg.trading_day_key(_taipei_now()))
                 self.real_loss_limit_var.set("--")
         else:
             self.real_fees_var.set(d.fees)
