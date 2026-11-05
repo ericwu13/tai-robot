@@ -310,7 +310,12 @@ def _deploy_args(*extra):
 def test_build_request_paper_defaults():
     req = hl.build_deploy_request(_deploy_args("--strategy", "x"), None)
     assert req.trading_mode == "paper"
-    assert req.loss_limit == "1000"
+    # Was "1000" — out of step with the deploy dialog's own pre-fill and
+    # with MAX_MODE_SWITCH_LOSS_LIMIT_NTD. Both now come from
+    # trading_guard.DEFAULT_DAILY_LOSS_LIMIT_NTD. Paper never consults
+    # it (the gate is real-orders only); this is the value a later
+    # switch to auto would inherit.
+    assert req.loss_limit == str(hl.DEFAULT_DAILY_LOSS_LIMIT_NTD) == "20000"
     assert req.origin == "cli"
     assert not req.regime_enabled and not req.news_enabled
 

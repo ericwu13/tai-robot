@@ -18,6 +18,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from .trading_guard import DEFAULT_DAILY_LOSS_LIMIT_NTD
+
 from .deploy_request import DeployRequest
 from .session_store import load_session
 
@@ -845,7 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "overrides the saved strategy")
     d.add_argument("--point-value", type=int, default=None,
                    help="NTD per point (default: symbol's value)")
-    d.add_argument("--loss-limit", default="1000",
+    d.add_argument("--loss-limit", default=str(DEFAULT_DAILY_LOSS_LIMIT_NTD),
                    help="daily loss limit in NTD for real orders (0 = off)")
     resume = d.add_mutually_exclusive_group()
     resume.add_argument("--resume", action="store_true",
