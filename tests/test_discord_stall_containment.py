@@ -1,98 +1,141 @@
-"""A stalled Discord send must not queue later sends behind it.
+"""A stalled Discord send must not multiply threads or lose later messages.
 
 2026-11-04: every bot on one host had ``_post`` threads parked in
 ``socket.getaddrinfo`` for 90+ seconds while the shared ``httpx.Client``
 was already configured with a 10 s timeout. httpx bounds connect / read /
 write; it does not bound name resolution, which is an uninterruptible C
-call. So the timeout is not the containment story.
+call. Every notification spawned its own thread, so each stalled send
+queued more daemon threads behind the shared client.
 
-What is containable is the queue: ``_http_lock`` guards the shared
-client, so one wedged thread used to park every later notification
-behind it for the whole stall. These tests pin the bounded lock wait and
-the explicit per-phase timeout.
+The contract pinned here, all through the public ``_send`` path:
+
+* one worker thread per notifier, however long a send stalls;
+* messages behind a stall are delivered late and IN ORDER — never
+  dropped (fill confirmations, loss-limit and force-close-failed alerts
+  are among them);
+* only a backlog of MAX_PENDING sheds anything, oldest first;
+* a raising transport does not kill delivery of later messages.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 from src.live import discord_notify
 from src.live.discord_notify import DiscordNotifier
 
 
-def _extract_post_fn(notifier, content="hello"):
-    """Grab the ``_post`` closure from ``_send`` without starting a thread."""
-    captured = []
-    original_init = threading.Thread.__init__
-
-    def capture_target(self_t, *args, **kwargs):
-        original_init(self_t, *args, **kwargs)
-        if kwargs.get("target"):
-            captured.append(kwargs["target"])
-
-    with patch.object(threading.Thread, "__init__", capture_target), \
-         patch.object(threading.Thread, "start", lambda self: None):
-        notifier._send(content)
-    assert captured, "_send did not create a thread"
-    return captured[0]
+class _Resp:
+    status_code = 200
+    text = ""
 
 
-def _notifier():
-    return DiscordNotifier("token", "channel", bot_name="test")
+class _GatedClient:
+    """Fake httpx.Client whose POSTs block until ``gate`` is set."""
+
+    def __init__(self, fail_first: bool = False):
+        self.gate = threading.Event()
+        self.entered = threading.Event()
+        self.attempted: list[str] = []
+        self.posted: list[str] = []
+        self._fail_first = fail_first
+        self._lock = threading.Lock()
+
+    def post(self, url, json=None, headers=None):
+        content = json["content"]
+        with self._lock:
+            self.attempted.append(content)
+            first = len(self.attempted) == 1
+        self.entered.set()
+        self.gate.wait(10)
+        if first and self._fail_first:
+            raise OSError("name resolution failed")
+        with self._lock:
+            self.posted.append(content)
+        return _Resp()
 
 
-def test_send_is_dropped_when_the_notifier_is_already_wedged(monkeypatch):
-    """Lock held by a stalled send -> drop, do not block for the stall."""
-    monkeypatch.setattr(discord_notify, "LOCK_WAIT_S", 0.05)
-    n = _notifier()
-    post = _extract_post_fn(n)
-
-    client = MagicMock()
-    client.post = MagicMock(side_effect=AssertionError("must not POST"))
-    monkeypatch.setattr(n, "_get_http", lambda: client)
-
-    n._http_lock.acquire()                      # simulate the wedged thread
-    try:
-        post()                                  # must return, not hang
-    finally:
-        n._http_lock.release()
-
-    client.post.assert_not_called()
+def _wait_for(pred, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return pred()
 
 
-def test_a_normal_send_still_takes_the_lock_and_posts(monkeypatch):
-    """The bound must not break the ordinary path."""
-    monkeypatch.setattr(discord_notify, "LOCK_WAIT_S", 5.0)
-    n = _notifier()
-    post = _extract_post_fn(n)
-
-    resp = MagicMock(); resp.status_code = 200; resp.text = ""
-    client = MagicMock(); client.post = MagicMock(return_value=resp)
-    monkeypatch.setattr(n, "_get_http", lambda: client)
-
-    post()
-    assert client.post.call_count == 1
-    assert not n._http_lock.locked(), "lock must be released after the send"
+def _notifier(client):
+    n = DiscordNotifier("token", "channel", bot_name="test")
+    n._http = client
+    return n
 
 
-def test_lock_is_released_when_the_post_raises(monkeypatch):
-    """A raising transport must not leave the notifier permanently wedged."""
-    monkeypatch.setattr(discord_notify, "LOCK_WAIT_S", 5.0)
-    n = _notifier()
-    post = _extract_post_fn(n)
+def test_a_stalled_send_does_not_multiply_threads():
+    client = _GatedClient()
+    n = _notifier(client)
+    before = threading.active_count()
 
-    client = MagicMock()
-    client.post = MagicMock(side_effect=OSError("name resolution failed"))
-    monkeypatch.setattr(n, "_get_http", lambda: client)
+    for i in range(20):
+        n._send(f"m{i}")
+    assert client.entered.wait(5), "first send never reached the transport"
+    time.sleep(0.2)                       # let any per-send threads spawn
+    grown = threading.active_count() - before
 
-    post()                                      # _post swallows and logs
-    assert not n._http_lock.locked()
+    client.gate.set()
+    assert _wait_for(lambda: len(client.posted) == 20)
+    assert grown <= 1, f"{grown} threads for one stalled notifier"
+
+
+def test_messages_behind_a_stall_arrive_in_order_not_dropped(monkeypatch):
+    # The pre-fix design dropped anything that waited longer than its lock
+    # wait; model a stall longer than that wait (no-op on the new design).
+    monkeypatch.setattr(discord_notify, "LOCK_WAIT_S", 0.05, raising=False)
+    client = _GatedClient()
+    n = _notifier(client)
+
+    for i in range(10):
+        n._send(f"m{i}")
+    assert client.entered.wait(5)
+    time.sleep(0.3)                       # the stall
+    client.gate.set()
+
+    assert _wait_for(lambda: len(client.posted) == 10), client.posted
+    assert client.posted == [f"m{i}" for i in range(10)]
+
+
+def test_backlog_is_bounded_and_sheds_the_oldest(monkeypatch):
+    monkeypatch.setattr(discord_notify, "MAX_PENDING", 5, raising=False)
+    client = _GatedClient()
+    n = _notifier(client)
+
+    n._send("m0")
+    assert client.entered.wait(5)         # m0 is in flight, stalled
+    for i in range(1, 11):
+        n._send(f"m{i}")
+    client.gate.set()
+
+    assert _wait_for(lambda: len(client.posted) == 6), client.posted
+    time.sleep(0.1)
+    assert client.posted == ["m0", "m6", "m7", "m8", "m9", "m10"]
+
+
+def test_a_raising_post_does_not_stop_later_messages():
+    client = _GatedClient(fail_first=True)
+    client.gate.set()
+    n = _notifier(client)
+
+    n._send("a")
+    n._send("b")
+
+    assert _wait_for(lambda: client.posted == ["b"]), client.attempted
+    assert client.attempted == ["a", "b"]
 
 
 def test_client_timeout_is_explicit_per_phase():
     """A bare ``timeout=10`` hides the connect budget; pin both."""
-    n = _notifier()
+    n = DiscordNotifier("token", "channel", bot_name="test")
     created = {}
 
     class _FakeTimeout:

@@ -6,6 +6,7 @@ All sends run in a background thread to avoid blocking the main/Tkinter thread.
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
@@ -18,20 +19,21 @@ logger = logging.getLogger(__name__)
 _TPE = timezone(timedelta(hours=8))
 _API_BASE = "https://discord.com/api/v10"
 
-# Send budget. ``httpx``'s timeout bounds connect/read/write but NOT
+# Delivery model. ``httpx``'s timeout bounds connect/read/write but NOT
 # ``socket.getaddrinfo`` — name resolution is an uninterruptible C call.
 # On 2026-11-04 every bot on one host had _post threads parked in
-# getaddrinfo for 90+ s while this client was already configured with a
-# 10 s timeout, so the timeout alone is not a containment story.
+# getaddrinfo for 90+ s while this client already had a 10 s timeout, and
+# because every send spawned its own thread, each stalled send left more
+# daemon threads queued behind the shared client's lock.
 #
-# What IS containable is the queue behind a stalled send: the shared
-# client is guarded by ``_http_lock``, so one wedged thread used to park
-# every later notification behind it for as long as the stall lasted.
-# The lock wait is therefore bounded and a backed-up notifier drops the
-# message instead of adding another daemon thread.
+# So sends are not threads: ``_send`` appends to a bounded FIFO and ONE
+# worker thread per notifier delivers them in order. A stall delays later
+# messages (they arrive late, in order) instead of multiplying threads or
+# dropping them. Only if MAX_PENDING messages back up is anything shed —
+# oldest first, logged — so memory stays bounded through any stall.
 HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
-LOCK_WAIT_S = 15.0
+MAX_PENDING = 200
 
 # Trading mode → readable bilingual label for the mode-switch notification.
 _MODE_LABELS = {
@@ -66,7 +68,10 @@ class DiscordNotifier:
         self._bot_name = bot_name
         self._symbol = symbol
         self._http: "httpx.Client | None" = None
-        self._http_lock = threading.Lock()
+        # Pending (channel, content) pairs, drained by a single worker.
+        self._pending: "collections.deque[tuple[str, str]]" = collections.deque()
+        self._pending_cv = threading.Condition()
+        self._worker: "threading.Thread | None" = None
         if self._token and self._channel_id:
             if not self._evolution_channel_id:
                 logger.warning(
@@ -90,14 +95,14 @@ class DiscordNotifier:
         return channel_id or self._channel_id
 
     def _send(self, content: str, channel_id: str = "") -> None:
-        """Send a message via Discord bot REST API in a background thread.
+        """Queue a message for the background worker; never blocks.
 
         ``channel_id`` optionally overrides the default channel (used to
         route evolution logs / daily reports to their own channels). Empty
         → the main channel.
 
-        Retries up to 3 times with exponential backoff (1s, 2s, 4s) on
-        HTTP 429 (rate-limited). Logs a warning if all retries exhaust.
+        Messages are delivered in order by one worker thread (see the
+        delivery-model note at the top of this module).
         """
         if not self.enabled:
             return
@@ -105,55 +110,69 @@ class DiscordNotifier:
         if not target:
             return
         logger.debug(
-            "Discord send attempt: channel=%s, msg_len=%d, bot=%s",
+            "Discord send queued: channel=%s, msg_len=%d, bot=%s",
             target, len(content), self._bot_name,
         )
-
-        def _post():
-            try:
-                url = f"{_API_BASE}/channels/{target}/messages"
-                headers = {
-                    "Authorization": f"Bot {self._token}",
-                    "Content-Type": "application/json",
-                }
-                delay = 1.0
-                for attempt in range(3):
-                    if not self._http_lock.acquire(timeout=LOCK_WAIT_S):
-                        logger.warning(
-                            "Discord send dropped: notifier busy > %.0fs "
-                            "(channel=%s, bot=%s). A stalled send must not "
-                            "queue more threads behind it.",
-                            LOCK_WAIT_S, target, self._bot_name,
-                        )
-                        return
-                    try:
-                        client = self._get_http()
-                        resp = client.post(url, json={"content": content},
-                                           headers=headers)
-                    finally:
-                        self._http_lock.release()
-                    if resp.status_code != 429:
-                        if resp.status_code >= 400:
-                            logger.error(
-                                "Discord send failed: HTTP %d → %s "
-                                "(channel=%s, bot=%s)",
-                                resp.status_code, resp.text[:500], target,
-                                self._bot_name,
-                            )
-                        return
-                    time.sleep(delay)
-                    delay *= 2
+        with self._pending_cv:
+            if len(self._pending) >= MAX_PENDING:
+                shed_target, _ = self._pending.popleft()
                 logger.warning(
-                    "Discord send failed after 3 retries (429 rate-limited), "
-                    "channel=%s, bot=%s", target, self._bot_name,
+                    "Discord backlog full (%d pending): shed the oldest "
+                    "message (channel=%s, bot=%s)",
+                    MAX_PENDING, shed_target, self._bot_name,
                 )
-            except Exception:
-                logger.exception(
-                    "Discord send error (channel=%s, bot=%s)",
-                    target, self._bot_name,
-                )
+            self._pending.append((target, content))
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._drain, name="discord-notify", daemon=True)
+                self._worker.start()
+            self._pending_cv.notify()
 
-        threading.Thread(target=_post, daemon=True).start()
+    def _drain(self) -> None:
+        """Worker loop: deliver queued messages one at a time, forever."""
+        while True:
+            with self._pending_cv:
+                while not self._pending:
+                    self._pending_cv.wait()
+                target, content = self._pending.popleft()
+            self._deliver(target, content)
+
+    def _deliver(self, target: str, content: str) -> None:
+        """POST one message. Never raises — the worker must survive.
+
+        Retries up to 3 times with exponential backoff (1s, 2s, 4s) on
+        HTTP 429 (rate-limited). Logs a warning if all retries exhaust.
+        """
+        try:
+            url = f"{_API_BASE}/channels/{target}/messages"
+            headers = {
+                "Authorization": f"Bot {self._token}",
+                "Content-Type": "application/json",
+            }
+            delay = 1.0
+            for attempt in range(3):
+                resp = self._get_http().post(
+                    url, json={"content": content}, headers=headers)
+                if resp.status_code != 429:
+                    if resp.status_code >= 400:
+                        logger.error(
+                            "Discord send failed: HTTP %d → %s "
+                            "(channel=%s, bot=%s)",
+                            resp.status_code, resp.text[:500], target,
+                            self._bot_name,
+                        )
+                    return
+                time.sleep(delay)
+                delay *= 2
+            logger.warning(
+                "Discord send failed after 3 retries (429 rate-limited), "
+                "channel=%s, bot=%s", target, self._bot_name,
+            )
+        except Exception:
+            logger.exception(
+                "Discord send error (channel=%s, bot=%s)",
+                target, self._bot_name,
+            )
 
     def notify(self, message: str) -> None:
         """Public method to send a free-form notification with the bot header."""

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from unittest.mock import patch, MagicMock
 
@@ -22,21 +21,9 @@ class _FakeResponse:
 
 
 def _extract_post_fn(notifier, content):
-    """Extract the _post closure from _send without starting a thread."""
-    captured = []
-    original_thread_init = threading.Thread.__init__
-
-    def capture_target(self_t, *args, **kwargs):
-        original_thread_init(self_t, *args, **kwargs)
-        if kwargs.get("target"):
-            captured.append(kwargs["target"])
-
-    with patch.object(threading.Thread, "__init__", capture_target), \
-         patch.object(threading.Thread, "start", lambda self: None):
-        notifier._send(content)
-
-    assert captured, "_send did not create a thread"
-    return captured[0]
+    """One synchronous delivery attempt — what the worker runs per message."""
+    target = notifier._resolve_channel("")
+    return lambda: notifier._deliver(target, content)
 
 
 def _mock_client(post_fn):
