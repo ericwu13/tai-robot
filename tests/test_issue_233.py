@@ -484,6 +484,65 @@ def test_two_writers_replace_a_stale_claim_once(tmp_path):
     assert len(claim["bots"]) == 8
 
 
+def _hang_named(root: Path, names: tuple[str, ...], t0: float, alerts: list[str]) -> None:
+    for i, name in enumerate(names):
+        bot = root / name
+        bot.mkdir(exist_ok=True)
+        host_stall.record_hung(
+            str(bot), reason="heartbeat", real=False,
+            now=t0 + i, pid=i + 1, alert_fn=alerts.append)
+
+
+def _recover_named(root: Path, names: tuple[str, ...], t0: float, stall: float,
+                    alerts: list[str]) -> None:
+    for i, name in enumerate(names):
+        host_stall.record_recovered(
+            str(root / name), stall_s=stall + i, recovered_at=t0 + i,
+            now=t0 + i, alert_fn=alerts.append)
+
+
+def test_same_bots_roll_up_again_after_the_window(tmp_path):
+    """A later incident with the same names gets its own rollup and K/K.
+
+    Name overlap with an old claim is not enough. The new hung_at values
+    are more than 120 s after the first claim's window.
+    """
+    root = tmp_path / "live"
+    root.mkdir()
+    alerts: list[str] = []
+    names = ("TXF_A", "TXF_B", "TXF_C")
+    _hang_named(root, names, 1_000.0, alerts)
+    assert len(_stall_rollups(alerts)) == 1
+    _recover_named(root, names, 1_100.0, 10.0, alerts)
+    assert _recovery_rollups(alerts) == [
+        "[HANG] host stall: 3/3 recovered, max stall 12 s"
+    ]
+    _hang_named(root, names, 2_000.0, alerts)
+    assert len(_stall_rollups(alerts)) == 2
+    assert _latest_claim(root)["generation"] == 2
+    _recover_named(root, names, 2_100.0, 20.0, alerts)
+    assert _recovery_rollups(alerts) == [
+        "[HANG] host stall: 3/3 recovered, max stall 12 s",
+        "[HANG] host stall: 3/3 recovered, max stall 22 s",
+    ]
+
+
+def test_rehang_inside_the_window_stays_on_the_same_claim(tmp_path):
+    """One bot hanging again inside the claim window does not roll up twice."""
+    root = tmp_path / "live"
+    root.mkdir()
+    alerts: list[str] = []
+    names = ("TXF_A", "TXF_B", "TXF_C")
+    _hang_named(root, names, 1_000.0, alerts)
+    assert len(_stall_rollups(alerts)) == 1
+    # Claim end is 1002. 1050 is still inside [882, 1122].
+    host_stall.record_hung(
+        str(root / "TXF_A"), reason="heartbeat", real=False,
+        now=1_050.0, pid=1, alert_fn=alerts.append)
+    assert len(_stall_rollups(alerts)) == 1
+    assert _latest_claim(root)["generation"] == 1
+
+
 def test_later_hang_does_not_swallow_the_original_recovery(tmp_path):
     """A bot more than 120 s later must not erase the first group's K/K."""
     root = tmp_path / "live"

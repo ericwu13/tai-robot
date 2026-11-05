@@ -23,8 +23,11 @@ Marker layout, all under the deploy root:
 
 A missing file is an empty marker. JSON that does not parse, or an
 episode without a numeric ``hung_at``, is ignored and logged once.
-Nothing in this module renames or unlinks a claim name. A new incident
-publishes the next generation instead. No settings key.
+A claim covers a later hang only when that hang's ``hung_at`` is inside
+the claim's own 120 s window, so the same bot names can roll up again
+after the window. Generations are left on disk. The only unlink is a
+generation file this process just created, when an earlier generation
+already covers that same incident. No settings key.
 """
 
 from __future__ import annotations
@@ -339,9 +342,37 @@ def _claims(root: str) -> list[tuple[int, dict]]:
     return out
 
 
+def _claim_end(claim: dict) -> float | None:
+    hung = claim.get("hung_at")
+    times = []
+    if isinstance(hung, dict):
+        for value in hung.values():
+            number = _number(value)
+            if number is not None:
+                times.append(number)
+    if not times:
+        return None
+    return max(times)
+
+
 def _covers(claim: dict, cluster: list[dict]) -> bool:
-    """True when this claim already announced ``cluster``."""
-    return bool(_claim_bots(claim) & {ep["bot"] for ep in cluster})
+    """True when this claim already announced this incident.
+
+    Name overlap is not enough. The bot's current ``hung_at`` has to sit
+    inside the claim's own window, ``[end - 120s, end + 120s]``. The same
+    name hanging again after that window is a new incident and needs its
+    own generation.
+    """
+    end = _claim_end(claim)
+    if end is None:
+        return False
+    lo = end - HOST_STALL_WINDOW_S
+    hi = end + HOST_STALL_WINDOW_S
+    names = _claim_bots(claim)
+    return any(
+        ep["bot"] in names and lo <= ep["hung_at"] <= hi
+        for ep in cluster
+    )
 
 
 def _incident(episodes: dict[str, dict], claim: dict) -> list[dict]:
@@ -351,16 +382,10 @@ def _incident(episodes: dict[str, dict], claim: dict) -> list[dict]:
     ``hung_at``. A bot that hangs more than 120 s later is a new incident
     and does not erase this one's recovery.
     """
-    hung = claim.get("hung_at")
-    times = []
-    if isinstance(hung, dict):
-        for value in hung.values():
-            number = _number(value)
-            if number is not None:
-                times.append(number)
-    if not times:
+    end = _claim_end(claim)
+    if end is None:
         return []
-    return _window(episodes, end=max(times))
+    return _window(episodes, end=end)
 
 
 def _publish_claim(path: str, payload: dict) -> bool:
