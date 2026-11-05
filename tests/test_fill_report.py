@@ -237,7 +237,7 @@ def test_late_fill_for_previous_trade_is_rejected():
 def test_fill_price_correction_message_shape():
     n = DiscordNotifier("token", "channel", bot_name="0422", symbol="TMF00")
     sent = []
-    n._send = lambda content: sent.append(content)
+    n._send = lambda content, **_kw: sent.append(content)
     n.fill_price_correction("exit", 44622, 44589,
                             strategy="AI: DynamicExitPullbackStrategyV2")
     assert len(sent) == 1

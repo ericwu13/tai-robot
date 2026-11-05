@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from unittest.mock import patch, MagicMock
 
@@ -22,21 +21,14 @@ class _FakeResponse:
 
 
 def _extract_post_fn(notifier, content):
-    """Extract the _post closure from _send without starting a thread."""
-    captured = []
-    original_thread_init = threading.Thread.__init__
+    """Return the delivery body the worker runs for one message.
 
-    def capture_target(self_t, *args, **kwargs):
-        original_thread_init(self_t, *args, **kwargs)
-        if kwargs.get("target"):
-            captured.append(kwargs["target"])
-
-    with patch.object(threading.Thread, "__init__", capture_target), \
-         patch.object(threading.Thread, "start", lambda self: None):
-        notifier._send(content)
-
-    assert captured, "_send did not create a thread"
-    return captured[0]
+    HTTP 429 backoff lives here, not in the queue, so a retry already in
+    flight is not dropped when later sends fill the queue. Calling it
+    directly keeps the backoff assertions off the worker thread.
+    """
+    target = notifier._resolve_channel("")
+    return lambda: notifier._deliver(content, target)
 
 
 def _mock_client(post_fn):

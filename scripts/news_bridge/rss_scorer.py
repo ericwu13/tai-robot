@@ -37,6 +37,10 @@ Settings block (in settings.yaml under ``news``)::
         - ...
       rss_interval_minutes: 30
       rss_state_file: data/rss_scorer_state.json
+      rss_news_log: ""   # per-article JSONL history; empty = <state dir>/news/news_log.jsonl
+
+Every article Gemini scores is appended to that history (``rss_news_log.py``)
+so the dashboard's 新聞訊號 view can show what drove the vote.
 """
 from __future__ import annotations
 
@@ -55,6 +59,11 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import rss_news_log  # noqa: E402
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -133,6 +142,7 @@ def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
         "feeds": news.get("rss_feeds") or DEFAULT_FEEDS,
         "interval_minutes": int(news.get("rss_interval_minutes", 30)),
         "state_file": news.get("rss_state_file", "data/rss_scorer_state.json"),
+        "news_log_file": news.get("rss_news_log") or "",
         "gemini_api_key": ai.get("google_api_key", ""),
         "discord_webhook_url": discord_webhook or news.get("discord_webhook") or "",
     }
@@ -143,10 +153,12 @@ def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
 def fetch_feed(url: str) -> list[dict]:
     """Fetch and parse one RSS feed.  Returns list of article dicts.
 
-    Each dict has keys: guid, title, summary, published_dt (datetime, UTC).
+    Each dict has keys: guid, title, summary, published_dt (datetime, UTC),
+    link, source (publisher name for the news history).
     """
     import feedparser
     feed = feedparser.parse(url, request_headers=_UA)
+    feed_title = (getattr(feed, "feed", None) or {}).get("title", "")
     articles = []
     for entry in feed.entries:
         pub = entry.get("published_parsed") or entry.get("updated_parsed")
@@ -160,6 +172,8 @@ def fetch_feed(url: str) -> list[dict]:
             "title": entry.get("title", ""),
             "summary": entry.get("summary", ""),
             "published_dt": pub_dt,
+            "link": entry.get("link", ""),
+            "source": rss_news_log.source_name(entry.get("source"), feed_title, url),
         })
     return articles
 
@@ -566,6 +580,14 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
 
+    log_path = cfg.get("news_log_path")
+    if log_path and scored:
+        records = [rss_news_log.build_record(
+            item["article"], item["score"], scored_at=now, session=session_key,
+            run_net=net, session_net=cum) for item in scored]
+        if not rss_news_log.append(log_path, records):
+            print(f"  news history append failed: {log_path}")
+
     print(f"  run net: {net:+.2f}, session net: {cum:+.2f} -> vote: {direction or 'none'}")
     if api_error:
         print(f"  ⚠ Gemini API error: {api_error}")
@@ -595,6 +617,9 @@ def main() -> int:
                     help="regime_vote.json output path (overrides settings)")
     ap.add_argument("--state", default=None,
                     help="state file path (overrides settings)")
+    ap.add_argument("--news-log", default=None,
+                    help="per-article JSONL history (default: news.rss_news_log, "
+                         "else <state dir>/news/news_log.jsonl)")
     ap.add_argument("--once", action="store_true", help="single check then exit")
     ap.add_argument("--loop", action="store_true",
                     help="poll continuously at rss_interval_minutes")
@@ -610,6 +635,8 @@ def main() -> int:
 
     vote_out = args.vote_out or settings.get("news", {}).get("regime_vote_path", "")
     state_path = args.state or cfg["state_file"]
+    cfg["news_log_path"] = (args.news_log or cfg["news_log_file"]
+                            or rss_news_log.default_path(state_path))
 
     if not cfg["gemini_api_key"] and not args.force_fire:
         print("ERROR: ai.google_api_key not set in settings.yaml")

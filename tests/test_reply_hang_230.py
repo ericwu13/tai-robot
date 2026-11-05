@@ -275,12 +275,14 @@ def test_hung_alert_repeats_while_still_hung(tmp_path):
     watchdog.start()
     try:
         deadline = time.monotonic() + 2.5
-        while time.monotonic() < deadline and len(alerts) < 2:
+        while time.monotonic() < deadline and sum(
+                "P1 HUNG" in item for item in alerts) < 2:
             time.sleep(0.02)
-        assert len(alerts) >= 2
+        p1s = [item for item in alerts if "P1 HUNG" in item]
+        assert len(p1s) >= 2
         assert all(
             "Process was NOT killed or restarted; manual restart: Mira" in item
-            for item in alerts[:2]
+            for item in p1s[:2]
         )
     finally:
         watchdog.disable()
@@ -1236,7 +1238,7 @@ def test_equity_refresh_resets_sent_when_the_call_raises(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1263,7 +1265,7 @@ def test_equity_refresh_resets_sent_on_a_nonzero_code(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1334,7 +1336,7 @@ def test_equity_held_alert_fires_once_per_hold(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1372,7 +1374,7 @@ def test_equity_held_alert_fires_again_after_the_hold_releases(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)
@@ -1410,7 +1412,7 @@ def _discord_log(monkeypatch):
     class _Discord:
         enabled = True
 
-        def notify(self, msg):
+        def notify(self, msg, **_kw):
             notices.append(msg)
 
     monkeypatch.setattr(rb, "_log", logs.append)

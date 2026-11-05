@@ -151,6 +151,19 @@ pre.log .P3 { color: var(--muted); }
 /* Holding marker. Neutral on purpose — 紅/綠 are P&L, 藍/橙 are health. */
 .held { background: var(--off-bg); color: var(--text); border: 1px solid var(--line);
   padding: 0 6px; border-radius: 6px; font-size: 12px; font-weight: 700; margin-right: 6px; }
+/* 新聞訊號 view. Score colours follow 紅漲綠跌: bullish red, bearish green. */
+.nav button.on { background: var(--ok-bg); color: var(--ok); font-weight: 700; }
+#news td.news { white-space: normal; min-width: 280px; max-width: 640px; }
+#news td.news a { color: var(--text); font-weight: 600; text-decoration: none; }
+#news td.news a:hover { text-decoration: underline; color: var(--ok); }
+#news td.news .sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 640px; }
+.sc { display: inline-block; min-width: 76px; text-align: center; padding: 1px 8px; border-radius: 6px;
+  font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sc.bull { color: var(--up); background: var(--bad-bg); }
+.sc.bull.strong { color: #fff; background: var(--up); }
+.sc.bear { color: var(--down); background: var(--off-bg); }
+.sc.bear.strong { color: #fff; background: var(--down); }
+.sc.flat { color: var(--off); background: var(--off-bg); font-weight: 400; }
 [hidden] { display: none !important; }
 
 /* Phone: the fleet table becomes one card per bot, no sideways scroll. */
@@ -162,6 +175,14 @@ pre.log .P3 { color: var(--muted); }
   #fleet td { border: 0; padding: 3px 10px; white-space: normal; text-align: left; display: flex; justify-content: space-between; gap: 12px; }
   #fleet td::before { content: attr(data-label); color: var(--muted); font-size: 13px; }
   #fleet td.first::before { content: none; }
+  #news thead { display: none; }
+  #news, #news tbody, #news tr, #news td { display: block; width: 100%; }
+  #news tr { border-bottom: 1px solid var(--line); padding: 8px 4px; }
+  #news td { border: 0; padding: 3px 10px; white-space: normal; text-align: left; display: flex; justify-content: space-between; gap: 12px; }
+  #news td::before { content: attr(data-label); color: var(--muted); font-size: 13px; }
+  #news td.news { display: block; min-width: 0; }
+  #news td.news::before { content: none; }
+  #news td.news .sub { white-space: normal; }
   .trunc { max-width: none; }
   .chart { height: 300px; }
   .scroll.wide { overflow-x: auto; }
@@ -171,6 +192,9 @@ pre.log .P3 { color: var(--muted); }
 <body>
 <header>
   <h1>機器人監控</h1>
+  <span class="seg nav" id="nav">
+    <button data-view="" class="on">機器人</button><button data-view="news">新聞訊號</button>
+  </span>
   <span class="host" id="host"></span>
   <span class="chip s-off" id="market">讀取中…</span>
   <span class="spacer"></span>
@@ -191,6 +215,31 @@ pre.log .P3 { color: var(--muted); }
           <th>狀態</th><th>機器人</th><th>模式</th><th>持倉</th>
           <th class="num">未實現</th><th class="num" title="自最近一次夜盤開盤（15:00）起">本交易日</th><th class="num" title="模擬成交價計算">模擬累計</th><th class="num" title="實際成交價計算，未扣手續費及期交稅">實單累計</th><th class="num" title="自最近一次夜盤開盤（15:00）起平倉的實單損益。僅計入進出場皆有可信成交價的交易，不含估算；未扣手續費及期交稅">本交易日實單</th>
           <th class="num">交易數</th><th class="num">勝率</th><th>最後決策</th><th>心跳</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="news-view" hidden>
+    <div class="tiles" id="n-tiles"></div>
+    <div class="toolbar">
+      <label>盤別 <select id="n-session"><option value="">全部</option></select></label>
+      <label>分數 <select id="n-score">
+        <option value="">全部</option>
+        <option value="0.7:">強烈偏多（≥ +0.7）</option>
+        <option value="0.001:">偏多（&gt; 0）</option>
+        <option value="0:0">中性（0）</option>
+        <option value=":-0.001">偏空（&lt; 0）</option>
+        <option value=":-0.7">強烈偏空（≤ −0.7）</option>
+      </select></label>
+      <label>來源 <select id="n-source"><option value="">全部</option></select></label>
+      <span class="legend">W3 RSS 新聞評分（Gemini）。分數＝方向 × 信心，紅＝偏多、綠＝偏空。盤別＝該則新聞投票的目標夜盤。</span>
+    </div>
+    <div class="panel scroll-x">
+      <table id="news">
+        <thead><tr>
+          <th>時間</th><th>來源</th><th>新聞</th><th class="num">分數</th><th>盤別</th>
         </tr></thead>
         <tbody></tbody>
       </table>
@@ -524,6 +573,25 @@ function votesBlock(v, newsEnabled) {
   }
   return box;
 }
+// Signed article score → coloured pill. 紅漲綠跌: bullish red, bearish green.
+function scorePill(n) {
+  const s = Number(n.score) || 0;
+  const cls = s > 0 ? "bull" : s < 0 ? "bear" : "flat";
+  const strong = Math.abs(s) >= 0.7 ? " strong" : "";
+  const label = s > 0 ? "偏多" : s < 0 ? "偏空" : "中性";
+  const title = `${label}・信心 ${Number(n.confidence).toFixed(2)}` + (n.reason ? `\n${n.reason}` : "");
+  return el("span", { class: "sc " + cls + strong, title }, `${s > 0 ? "+" : ""}${s.toFixed(2)} ${label}`);
+}
+function newsTitle(n) {
+  // Links are http(s) only (checked by the scorer and again by the server).
+  const head = /^https?:\/\//i.test(n.link || "")
+    ? el("a", { href: n.link, target: "_blank", rel: "noopener noreferrer" }, n.title)
+    : el("span", { class: "name" }, n.title);
+  return el("div", null, head, n.summary ? el("span", { class: "sub", title: n.summary }, n.summary) : null);
+}
+function tpeShort(iso) { return iso ? iso.slice(5, 16).replace("T", " ") : "—"; }
+function isoAgo(iso) { const t = Date.parse(iso || ""); return Number.isNaN(t) ? null : (Date.now() - t) / 1000; }
+
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
 
@@ -531,7 +599,7 @@ const App = {
   fleet: null, lastOk: 0, current: null, detail: null, chart: null, candles: null,
   equityChart: null, equity: null, band: null, iv: 60, fitNext: true,
   bars: [], markers: [], oldestDay: null, newestDay: null, hasMore: false,
-  loadingOlder: false, barsLoaded: false,
+  loadingOlder: false, barsLoaded: false, newsOpen: false, news: null,
 
   // Controls: a confirm dialog, then one POST; the bot applies it from its
   // own STOP / mode_override.json polling, and the pending chip shows the
@@ -768,15 +836,88 @@ const App = {
     }));
   },
 
+  // ── 新聞訊號 ──
+  newsQuery() {
+    const q = new URLSearchParams();
+    const sess = $("n-session").value, src = $("n-source").value;
+    const [lo, hi] = ($("n-score").value || ":").split(":");
+    if (sess) q.set("session", sess);
+    if (src) q.set("source", src);
+    if (lo) q.set("min", lo);
+    if (hi) q.set("max", hi);
+    return "/api/news" + (q.toString() ? "?" + q : "");
+  },
+
+  async refreshNews() {
+    if (!this.newsOpen) return;
+    try {
+      const n = await this.getJson(this.newsQuery());
+      if (!this.newsOpen) return;
+      this.news = n; this.lastOk = Date.now();
+      $("banner").classList.remove("show");
+      this.renderNews();
+    } catch (e) {
+      $("banner").classList.add("show");
+    }
+  },
+
+  // Keep the current choice even when a refresh no longer lists it.
+  fillSelect(sel, values) {
+    const cur = sel.value;
+    const opts = [el("option", { value: "" }, "全部"),
+      ...values.map(([v, label]) => el("option", { value: v }, label))];
+    if (cur && !values.some(([v]) => v === cur)) opts.push(el("option", { value: cur }, cur));
+    sel.replaceChildren(...opts);
+    sel.value = cur;
+  },
+
+  renderNews() {
+    const n = this.news;
+    this.fillSelect($("n-session"), n.sessions.map((s) => [s, sessionKey(s)]));
+    this.fillSelect($("n-source"), n.sources.map((s) => [s.name, `${s.name}（${s.count}）`]));
+    const sm = n.summary || {};
+    const latest = n.latest;
+    const signed = (v, digits) => el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" },
+      `${v > 0 ? "+" : ""}${Number(v || 0).toFixed(digits)}`);
+    $("n-tiles").replaceChildren(
+      tile("新聞則數", n.matched === n.total ? fmtInt(n.total) : `${fmtInt(n.matched)} / ${fmtInt(n.total)}`),
+      tile("偏多 / 偏空 / 中性", el("span", null, el("span", { class: "up" }, fmtInt(sm.bullish || 0)), " / ",
+        el("span", { class: "down" }, fmtInt(sm.bearish || 0)), " / ", el("span", { class: "muted" }, fmtInt(sm.neutral || 0)))),
+      tile("分數合計", signed(sm.net, 2)),
+      tile("W3 盤別累計", latest
+        ? el("div", null, signed(latest.session_net, 2),
+            el("div", { class: "sub" }, `${sessionKey(latest.session)}・達 ±1.5 才投票`))
+        : "—"),
+      tile("最後評分", latest ? el("div", null, ago(isoAgo(latest.scored_at)),
+        el("div", { class: "sub" }, tpeShort(latest.scored_at))) : "—"),
+    );
+    const body = $("news").tBodies[0];
+    const empty = (text) => body.replaceChildren(el("tr", null, el("td", { colspan: "5", class: "empty" }, text)));
+    if (!n.available) return empty("找不到新聞紀錄的位置：請確認 settings.yaml 的 news 區段，或以 --news-log 指定");
+    if (!n.total) return empty("尚無新聞紀錄。W3 評分器更新到新版後，每次評分都會累積在這裡");
+    if (!n.items.length) return empty("沒有符合篩選條件的新聞");
+    body.replaceChildren(...n.items.map((x) => el("tr", null,
+      td("時間", el("span", { title: "評分於 " + tpeShort(x.scored_at) }, tpeShort(x.published_at))),
+      td("來源", el("span", { class: "trunc", title: x.source }, x.source)),
+      td("", newsTitle(x), "news"),
+      td("分數", scorePill(x), "num"),
+      td("盤別", sessionKey(x.session)),
+    )));
+  },
+
   // ── detail ──
   open(id) { location.hash = "bot=" + encodeURIComponent(id); },
 
   route() {
     const m = location.hash.match(/^#bot=(.+)$/);
     this.current = m ? decodeURIComponent(m[1]) : null;
-    $("fleet-view").hidden = !!this.current;
+    this.newsOpen = location.hash === "#news";
+    for (const b of $("nav").children) b.classList.toggle("on", (b.dataset.view === "news") === this.newsOpen);
+    $("fleet-view").hidden = !!this.current || this.newsOpen;
     $("detail-view").hidden = !this.current;
-    if (this.current) {
+    $("news-view").hidden = !this.newsOpen;
+    if (this.newsOpen) this.refreshNews();
+    else if (this.current) {
       this.fitNext = true; this.ivInit = true;
       this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
       this.hasMore = false; this.barsLoaded = false; this.equityFitted = false;
@@ -1101,10 +1242,15 @@ const App = {
       for (const b of $("d-tabs").children) b.classList.toggle("on", b === btn);
       for (const p of document.querySelectorAll("[data-pane]")) p.hidden = p.dataset.pane !== btn.dataset.tab;
     });
+    for (const btn of $("nav").children) btn.addEventListener("click", () => {
+      location.hash = btn.dataset.view;
+    });
+    for (const id of ["n-session", "n-score", "n-source"]) $(id).addEventListener("change", () => this.refreshNews());
     window.addEventListener("hashchange", () => this.route());
     this.refreshFleet().then(() => this.route());
     setInterval(() => this.refreshFleet(), 5000);
     setInterval(() => this.refreshDetail(), 10000);
+    setInterval(() => this.refreshNews(), 60000);
     setInterval(() => this.renderUpdated(), 1000);
   },
 };

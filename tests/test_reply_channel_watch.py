@@ -81,9 +81,11 @@ class _Discord:
     def __init__(self):
         self.enabled = True
         self.messages = []
+        self.priorities = []
 
-    def notify(self, message: str) -> None:
+    def notify(self, message: str, *, priority: bool = False) -> None:
         self.messages.append(message)
+        self.priorities.append(priority)
 
 
 class _Libs:
@@ -322,8 +324,9 @@ def test_discord_alert_contains_reply_channel_silent(monkeypatch):
     app, _libs, _logged, _statuses, _enabled = _login(monkeypatch)
     discord = _Discord()
 
-    def notify(message: str) -> None:
+    def notify(message: str, *, priority: bool = False) -> None:
         discord.messages.append(message)
+        discord.priorities.append(priority)
         raise RuntimeError("discord down")
 
     discord.notify = notify
@@ -332,6 +335,7 @@ def test_discord_alert_contains_reply_channel_silent(monkeypatch):
     fn(*args)
     assert len(discord.messages) == 1
     assert "REPLY CHANNEL SILENT" in discord.messages[0]
+    assert discord.priorities == [True]
 
 
 def test_watch_arm_failure_does_not_fail_login(monkeypatch):

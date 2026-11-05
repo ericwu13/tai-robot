@@ -153,7 +153,8 @@ def test_load_news_paths_reads_only_vote_paths(tmp_path):
     sp = server.default_settings_path(str(install / "data" / "live"))
     assert sp == str(install / "settings.yaml")
     paths = server.load_news_paths(sp)
-    assert set(paths) == {"regime_vote_path", "signal_path", "rss_state_file", "vote_age_limits_h"}
+    assert set(paths) == {"regime_vote_path", "signal_path", "rss_state_file", "rss_news_log",
+                          "vote_age_limits_h"}
     assert paths["vote_age_limits_h"] == {"W2": 4.0}             # the app's default
     assert paths["regime_vote_path"] == absolute_vote
     assert paths["signal_path"] == os.path.join(str(install), "bridge/signal.json")

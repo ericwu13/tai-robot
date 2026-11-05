@@ -9,6 +9,8 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
     GET /api/bot?id=<dir>        one bot: trades, decisions, log, regime
     GET /api/bars?id=<dir>[&before=YYYYMMDD|&after=YYYYMMDD][&days=N]
                                  stitched 1-min candles + trade markers
+    GET /api/news[?session=&source=&min=&max=&limit=]
+                                 W3 RSS scorer per-article history (新聞訊號)
 
 Read-only by default: nothing is written to a bot directory. With
 ``--enable-control`` one more route exists,
@@ -44,7 +46,8 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from scripts.dashboard import control, snapshot  # noqa: E402
+from scripts.dashboard import control, news_feed, snapshot  # noqa: E402
+from scripts.news_bridge import rss_news_log  # noqa: E402
 from scripts.monitor.common import default_base_dir, now_tpe  # noqa: E402
 
 DEFAULT_PORT = 8765
@@ -142,6 +145,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     lwc_path: str | None = None
     bound_hosts: set[str] = set()
     news_paths: dict | None = None
+    news_log_path: str | None = None
     control_enabled = False
     control_log = ""
     live_switch_policy = control.LiveSwitchPolicy()
@@ -276,6 +280,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 body = self.cache.get(f"bars:{bot_id}:{before}:{after}:{days}", lambda: _json(
                     snapshot.bars_window(bot_dir, before or None, days, after or None)))
                 self._send(200, body, "application/json; charset=utf-8")
+            elif url.path == "/api/news":
+                try:
+                    filters = news_feed.parse_query(query)
+                except news_feed.BadQuery as exc:
+                    self._send(400, _json({"error": str(exc)}),
+                               "application/json; charset=utf-8")
+                    return
+                key = "news:" + json.dumps(filters, sort_keys=True)
+                body = self.cache.get(key, lambda: _json(
+                    news_feed.news_feed(self.news_log_path, filters)))
+                self._send(200, body, "application/json; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain; charset=utf-8")
         except (BrokenPipeError, ConnectionResetError):
@@ -302,7 +317,7 @@ def tailscale_ipv4() -> str | None:
     return None
 
 
-NEWS_PATH_KEYS = ("regime_vote_path", "signal_path", "rss_state_file")
+NEWS_PATH_KEYS = ("regime_vote_path", "signal_path", "rss_state_file", "rss_news_log")
 
 
 def load_news_paths(settings_path: str) -> dict | None:
@@ -310,7 +325,9 @@ def load_news_paths(settings_path: str) -> dict | None:
     absolutised against that file's folder (the app resolves them against
     its own install folder, which is where its settings.yaml lives).
     Nothing else is read out of the file, and the paths never reach a
-    client. The W3 state file falls back to the scorer's own default.
+    client. The W3 state file falls back to the scorer's own default, and
+    the W3 per-article history to ``<state dir>/news/news_log.jsonl`` —
+    the same derivation the scorer uses.
     """
     try:
         import yaml
@@ -336,6 +353,8 @@ def load_news_paths(settings_path: str) -> dict | None:
             value = "data/rss_scorer_state.json"
         out[key] = (value if not value or os.path.isabs(value)
                     else os.path.join(root, value))
+    if not out["rss_news_log"]:
+        out["rss_news_log"] = rss_news_log.default_path(out["rss_state_file"])
     return out
 
 
@@ -400,6 +419,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--settings", default="",
                    help="settings.yaml for the vote/news paths "
                         "(default: the install's, two levels above --base-dir)")
+    p.add_argument("--news-log", default="",
+                   help="W3 news history JSONL for the 新聞訊號 view "
+                        "(default: news.rss_news_log in --settings, else "
+                        "news/news_log.jsonl beside the W3 state file)")
     p.add_argument("--bind-wait", type=float, default=0.0, metavar="SECONDS",
                    help="keep retrying an address that cannot be bound yet "
                         "(at boot the Tailscale IP appears after the task starts)")
@@ -478,6 +501,9 @@ def main(argv=None) -> int:
     DashboardHandler.lwc_path = lwc_js_path()
     settings_path = args.settings or default_settings_path(DashboardHandler.base_dir)
     DashboardHandler.news_paths = load_news_paths(settings_path)
+    DashboardHandler.news_log_path = (
+        os.path.abspath(args.news_log) if args.news_log
+        else (DashboardHandler.news_paths or {}).get("rss_news_log"))
     DashboardHandler.live_switch_policy = load_live_switch_policy(settings_path)
     DashboardHandler.bound_hosts = {a.lower() for a in binds}
 

@@ -271,26 +271,34 @@ class TradingGuard:
 
     # ── Daily loss limit ──
 
+    def roll_day(self, day_key: str) -> bool:
+        """Release a pause set on an earlier trading day.
+
+        The release fires only on a key CHANGE, never on every poll, so a
+        pause cannot be cleared mid-session. A pause set without a key is
+        never released here (its day is unknown). Returns True if released.
+        """
+        if day_key and self.paused and self._pause_day_key                 and day_key != self._pause_day_key:
+            self.paused = False
+            self._pause_day_key = ""
+            return True
+        return False
+
     def update_pnl(self, net_pnl: int, day_key: str = "") -> bool:
         """Update daily P&L and check loss limit.
 
-        ``day_key`` is the caller's ``trading_day_key(now)``. When it
-        differs from the day the pause was set on, the pause is released
-        first — the limit is per trading day, and ``net_pnl`` comes from
-        the broker's own day figure (``GetFutureRights``), which has
-        already rolled over to 0 by then. Omitting ``day_key`` keeps the
-        pre-existing latch behaviour, so callers that have no clock (and
-        the backtest-side tests) are unaffected.
-
-        The release fires only on a key CHANGE, never on every poll, so
-        a pause cannot be cleared mid-session.
+        ``day_key`` is the caller's ``trading_day_key(now)``. A pause from
+        an earlier trading day is released first (:meth:`roll_day`), then
+        the limit is re-checked against this ``net_pnl`` in the same call —
+        so if the broker figure (``GetFutureRights`` net) has not rolled
+        over yet, the guard re-pauses immediately, keyed to the new day,
+        and no entry can open in between. Fail closed: the release is only
+        as early as the broker's own reset. Omitting ``day_key`` keeps the
+        old latch behaviour.
 
         Returns True if the limit was JUST triggered (for one-time logging).
         """
-        if day_key and self.paused and self._pause_day_key \
-                and day_key != self._pause_day_key:
-            self.paused = False
-            self._pause_day_key = ""
+        self.roll_day(day_key)
         self._last_net_pnl = net_pnl
         if (self.daily_loss_limit > 0
                 and net_pnl < -self.daily_loss_limit

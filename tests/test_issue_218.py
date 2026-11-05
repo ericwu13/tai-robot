@@ -380,7 +380,7 @@ def test_exhaustion_marks_the_trade_and_round_trips():
 def test_discord_unconfirmed_warning_is_distinct():
     notifier = DiscordNotifier("token", "channel", bot_name="bot", symbol="TMF00")
     sent = []
-    notifier._send = lambda content: sent.append(content)
+    notifier._send = lambda content, **_kw: sent.append(content)
     notifier.exit_fill_unconfirmed("45928", strategy="DynamicExitPullbackStrategyV2")
     assert len(sent) == 1
     assert "出場成交價未確認" in sent[0]
@@ -643,7 +643,7 @@ def _exit_confirm_app(monkeypatch, raw, *, exit_price=45928, exit_bar=2):
         product="TM0000", side="S", new_close="O", send_time=send)
     sent = []
     notifier = DiscordNotifier("", "")
-    notifier._send = lambda content, channel_id="": sent.append(content)
+    notifier._send = lambda content, channel_id="", **_kw: sent.append(content)
     monkeypatch.setattr(rb, "_discord", notifier)
     monkeypatch.setattr(rb, "_log", lambda msg: None)
     monkeypatch.setattr(rb, "_com_available", True)

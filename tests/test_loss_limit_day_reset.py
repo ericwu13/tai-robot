@@ -119,9 +119,10 @@ def test_limit_of_zero_disables_the_gate():
 def test_the_2026_11_04_incident_timeline():
     """End to end on the real log timestamps.
 
-    ``GetFutureRights`` net is the broker's own DAILY figure: Steven read
-    -10,042 on 11-04 and 0 on 11-05 12:48. Production blocked the 11-05
-    12:46 entry; with the day release it is allowed.
+    Assumes the broker's ``GetFutureRights`` net has reset by the first
+    poll of the new trading day (Steven read -10,042 on 11-04 and 0 on
+    11-05 12:48; the exact reset time is not observed). If it has not,
+    see ``test_a_still_losing_account_re_pauses_on_the_new_day``.
 
     Note the 12:55 trip keys to 2026-11-03 — 12:55 is before the 15:00
     open, so it belongs to the session that opened the previous day.
@@ -207,3 +208,28 @@ def test_account_display_releases_a_pause_on_the_next_trading_day(monkeypatch):
     assert guard.paused is False
     assert guard._pause_day_key == ""
     assert guard.check_entry("auto")[0] is True
+
+
+# ── roll_day: the release without a P&L update (paper mode) ────────────
+
+def test_roll_day_releases_a_pause_carried_into_paper():
+    """Auto trips, the bot is switched to paper (no update_pnl there):
+    the next trading day must still end the pause, or switching back to
+    auto is refused until a redeploy."""
+    g = TradingGuard(daily_loss_limit=10000)
+    g.update_pnl(-10042, day_key=D4)
+    assert g.roll_day(D4) is False and g.paused      # same day: holds
+    assert g.roll_day(D5) is True
+    assert not g.paused and g._pause_day_key == ""
+
+
+def test_roll_day_never_releases_a_keyless_pause():
+    g = TradingGuard(daily_loss_limit=10000)
+    g.update_pnl(-10042)
+    assert g.roll_day(D5) is False and g.paused
+
+
+def test_roll_day_with_empty_key_is_a_no_op():
+    g = TradingGuard(daily_loss_limit=10000)
+    g.update_pnl(-10042, day_key=D4)
+    assert g.roll_day("") is False and g.paused
