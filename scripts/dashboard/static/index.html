@@ -145,6 +145,9 @@ pre.log .P3 { color: var(--muted); }
 @media (max-width: 760px) { .vote-row { grid-template-columns: 1fr 1fr; } }
 .mode { font-size: 13px; color: var(--muted); }
 .mode.real { color: #fff; background: var(--bad); padding: 1px 8px; border-radius: 6px; font-weight: 700; }
+/* Loss-limit pause. Purple so it is not read as P&L (red/green) or health (blue/orange). */
+.loss-paused { color: #fff; background: #6d28d9; font-weight: 700; margin-left: 6px; }
+.loss-paused::before { background: #fff; }
 /* Holding marker. Neutral on purpose — 紅/綠 are P&L, 藍/橙 are health. */
 .held { background: var(--off-bg); color: var(--text); border: 1px solid var(--line);
   padding: 0 6px; border-radius: 6px; font-size: 12px; font-weight: 700; margin-right: 6px; }
@@ -295,6 +298,17 @@ const MODE = { paper: "模擬", semi_auto: "半自動・實單", auto: "全自�
 function modeBadge(m) {
   const real = m && m !== "paper";
   return el("span", { class: real ? "mode real" : "mode" }, MODE[m] || m || "—");
+}
+function lossBadge(loss) {
+  if (!loss || loss.paused !== true) return null;
+  return el("span", {
+    class: "chip loss-paused",
+    title: loss.title || "Daily loss limit reached",
+  }, loss.badge || "PAUSED");
+}
+function lossText(loss) {
+  if (!loss || !loss.text) return null;
+  return el("div", { class: "sub" }, loss.text);
 }
 const SIDE = { LONG: "多", SHORT: "空" };
 const ACTION = {
@@ -738,7 +752,7 @@ const App = {
       const tr = el("tr", { onclick: () => this.open(b.id) },
         td("", el("span", null, chip(b.state), pendingChip(b.pending)), "first"),
         td("機器人", name, "first"),
-        td("模式", modeBadge(b.trading_mode)),
+        td("模式", el("div", null, modeBadge(b.trading_mode), lossBadge(b.loss), lossText(b.loss))),
         td("持倉", positionText(b.position)),
         td("未實現", money(b.position ? b.position.unrealized : null), "num"),
         td("本交易日", money(b.pnl_today), "num"),
