@@ -8752,15 +8752,24 @@ class BacktestApp:
                             f"({real_reason}) — NOT re-arming. "
                             "Manual review required.",
                             "status")
-        self._arm_resumed_fill_poll(
-            outcome, real_ok=real_ok, real_reason=real_reason)
+        # Restore the ledger before the poller can confirm. A synchronous
+        # already-flat exit otherwise runs confirm_latest on an empty registry.
+        # Paper does not resume the ledger: a fresh deploy stays flat.
         if trading_mode in ("semi_auto", "auto"):
             self._position_log_resume(symbol)
+        self._arm_resumed_fill_poll(
+            outcome, real_ok=real_ok, real_reason=real_reason)
 
     def _position_log_resume(self, symbol: str) -> None:
-        """RESUME record for a clean restart. Never raises."""
+        """Load the journal, then append one RESUME line if the inputs exist.
+
+        Replay runs before the price, symbol, and net reads. A failure
+        there is logged and skips the display line only. The restored
+        orders and fills stay. Called for semi_auto and auto, not paper.
+        """
         if getattr(self, "_position_ledger", None) is None:
             return
+        self._position_log("recover")
         try:
             broker = self._live_runner.broker
             net = (self._position_log_net()
@@ -11238,7 +11247,10 @@ class BacktestApp:
                         self._last_exit_order_seq = str(message).strip()
                 self._position_log(
                     "register_order", str(message), action_type, buy_sell, 1,
-                    order_symbol)
+                    order_symbol,
+                    oi_generation=getattr(
+                        getattr(self, "_account_monitor", None),
+                        "oi_query_generation", None))
                 if _discord and _discord.enabled:
                     _discord.order_sent(side_str, order_symbol, price_label,
                                         sim_price, str(message),
