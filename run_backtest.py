@@ -11238,7 +11238,10 @@ class BacktestApp:
                         self._last_exit_order_seq = str(message).strip()
                 self._position_log(
                     "register_order", str(message), action_type, buy_sell, 1,
-                    order_symbol)
+                    order_symbol,
+                    oi_generation=getattr(
+                        getattr(self, "_account_monitor", None),
+                        "oi_query_generation", None))
                 if _discord and _discord.enabled:
                     _discord.order_sent(side_str, order_symbol, price_label,
                                         sim_price, str(message),
