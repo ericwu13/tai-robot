@@ -8761,9 +8761,15 @@ class BacktestApp:
             outcome, real_ok=real_ok, real_reason=real_reason)
 
     def _position_log_resume(self, symbol: str) -> None:
-        """RESUME record for a clean restart. Never raises."""
+        """Load the journal, then append one RESUME line if the inputs exist.
+
+        Replay runs before the price, symbol, and net reads. A failure
+        there is logged and skips the display line only. The restored
+        orders and fills stay. Called for semi_auto and auto, not paper.
+        """
         if getattr(self, "_position_ledger", None) is None:
             return
+        self._position_log("recover")
         try:
             broker = self._live_runner.broker
             net = (self._position_log_net()
