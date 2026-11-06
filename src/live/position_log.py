@@ -11,24 +11,54 @@ beside the account net so a divergence is visible:
 
     data/live/<bot_id>/position_log.jsonl      (append-only, one JSON per line)
 
-Record::
+The file is an append-only event journal. A fill is written immediately,
+before the OpenInterest wait, so a crash cannot drop a known fill. The
+account net arrives later as a correlated status, never as a second fill.
+
+Events (new journals)::
+
+    ORDER         accepted order. Restores the in-memory registry only.
+                  Replaying it never creates a fill or changes position.
+    FILL          one own fill, ``net_status: "pending"``,
+                  ``net_position_after: null``. Counted once.
+    FILL_REFINE   a later deal price for a fill whose net is still open.
+                  Not a fill.
+    NET_UPDATE    correlated answer (``answered``), timeout
+                  (``unanswered``), or stop flush (``flush_unknown``).
+                  Not a fill. Unknown stays null — never 0 and never an
+                  average.
+    RESUME        explicit restart line. Does not change position.
+
+``read_records`` projects these to the logical record #250 readers use.
+Public names are unchanged::
 
     {"ts", "bot_id", "account", "product", "order_seq", "side": "BUY"|"SELL",
      "qty", "fill_price", "price_source": "deal"|"fill_poller"|"",
      "action": "ENTRY"|"EXIT"|"RESUME",
-     "net_position_after": int|null,   # account net, this product, AFTER the fill
-     "net_status": "answered"|"unanswered",
+     "net_position_after": int|null,
+     "net_status": "pending"|"answered"|"unanswered"|"flush_unknown",
      "bot_position_after": int}
 
-``net_position_after`` must describe the book after the fill, so a fill
-record waits for the first OpenInterest snapshot whose query STARTED after
-the fill (query generation newer than the one current at fill time) and
-completed (``end`` / ``flat``). If none completes within ``net_timeout_s``,
-or the bot stops first, the record is written with ``null`` and
-``net_status: "unanswered"`` — never a pre-fill net presented as post-fill.
+A line with no ``event`` and ``action`` ENTRY, EXIT, or RESUME is a
+finalized pre-change record. It is replayed as-is. Historical files are
+never rewritten, and ORDER lines are not invented for them.
 
-Every public method is safe to call from the trading path: failures are
-logged and swallowed.
+Replay rules:
+
+* Position comes from FILL lines and legacy ENTRY/EXIT lines (side and
+  qty), once per seq. It does not come from the account net, from ORDER,
+  from NET_UPDATE, or from RESUME.
+* ``_orders`` / ``_last_seq`` come from ORDER lines, so a restarted
+  fill poller can confirm an order that was accepted but not filled.
+* A FILL whose net is still pending is restored as pending, including
+  the OpenInterest generation captured at fill time, so a later snapshot
+  can answer it. The monotonic timeout restarts with the process.
+* A failed append is logged and not treated as durable. Nothing here
+  raises into the trading path.
+
+``net_position_after`` describes the book after the fill. A pending fill
+takes the first snapshot whose query generation is newer than the one
+current at fill time. Timeout and stop write null.
 """
 from __future__ import annotations
 
@@ -45,6 +75,13 @@ POSITION_LOG_NAME = "position_log.jsonl"
 NET_TIMEOUT_S = 120.0
 _TPE = timezone(timedelta(hours=8))
 _ACTIONS = {"entry": "ENTRY", "exit": "EXIT"}
+_TYPE_BY_ACTION = {"ENTRY": "entry", "EXIT": "exit"}
+_TERMINAL = {"answered", "unanswered", "flush_unknown"}
+_PUBLIC_KEYS = (
+    "ts", "bot_id", "account", "product", "order_seq", "side", "qty",
+    "fill_price", "price_source", "action", "net_position_after",
+    "net_status", "bot_position_after",
+)
 
 
 def _now_iso() -> str:
@@ -67,6 +104,11 @@ def _int_or_none(v):
         return None
 
 
+def _public_record(rec: dict) -> dict:
+    """Logical #250 shape. Internal event fields stay on disk only."""
+    return {key: rec.get(key) for key in _PUBLIC_KEYS}
+
+
 class PositionLedger:
     """One bot's own position from its own order seq numbers."""
 
@@ -85,7 +127,9 @@ class PositionLedger:
         self._orders: dict[str, dict] = {}       # seq -> sent order
         self._applied: set[str] = set()           # seqs already counted
         self._last_seq: dict[str, str] = {}       # action_type -> newest seq
-        self._pending: list[dict] = []            # records waiting for a net
+        self._pending: list[dict] = []            # fills waiting for a net
+        self._anon = 0
+        self._recover()
 
     # ── helpers ──
 
@@ -106,15 +150,161 @@ class PositionLedger:
             logger.warning("position log write failed (%s): %s", self.path, exc)
             return False
 
+    def _recover(self) -> None:
+        """Restore fills, pending nets, and accepted orders from the journal.
+
+        Best effort. A damaged row is skipped. A failure here must not raise.
+        """
+        try:
+            rows = read_raw_records(self.path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "position log replay failed (%s): %s", self.path, type(exc).__name__)
+            return
+        for row in rows:
+            try:
+                self._replay_one(row)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "position log replay skipped a row (%s): %s",
+                    self.path, type(exc).__name__)
+        self._bound_orders()
+
+    def _replay_one(self, rec: dict) -> None:
+        event = rec.get("event")
+        if event == "ORDER":
+            self._replay_order(rec)
+            return
+        if event == "FILL_REFINE":
+            self._replay_refine(rec)
+            return
+        if event == "NET_UPDATE":
+            # Status only. A net line never creates a fill or moves position,
+            # including when the fill line is missing.
+            seq = str(rec.get("order_seq") or "").strip()
+            if seq:
+                self._pending = [p for p in self._pending if p.get("order_seq") != seq]
+            return
+        action = rec.get("action")
+        if event == "RESUME" or action == "RESUME":
+            return
+        if event == "FILL" or (event in (None, "") and action in ("ENTRY", "EXIT")):
+            self._replay_fill(rec)
+
+    def _replay_order(self, rec: dict) -> None:
+        seq = str(rec.get("order_seq") or "").strip()
+        action = rec.get("action_type") or _TYPE_BY_ACTION.get(rec.get("action"), "")
+        if not seq or action not in _ACTIONS:
+            return
+        qty = max(1, _int_or_none(rec.get("qty")) or 1)
+        self._orders[seq] = {
+            "action": action,
+            "side": _side_code(rec.get("side")),
+            "qty": qty,
+            "product": rec.get("product") or "",
+            "oi_generation": _int_or_none(rec.get("oi_generation")),
+        }
+        self._last_seq[action] = seq
+
+    def _replay_fill(self, rec: dict) -> None:
+        seq = str(rec.get("order_seq") or "").strip()
+        if seq:
+            ident = seq
+        else:
+            self._anon += 1
+            ident = f"#{self._anon}"
+        if ident in self._applied:
+            return
+        side = _side_code(rec.get("side"))
+        if side not in ("BUY", "SELL"):
+            return
+        qty = _int_or_none(rec.get("qty"))
+        if qty is None or qty < 1:
+            qty = 1
+        self.position += qty if side == "BUY" else -qty
+        self._applied.add(ident)
+        action = rec.get("action_type") or _TYPE_BY_ACTION.get(rec.get("action"), "")
+        if seq and seq not in self._orders and action in _ACTIONS:
+            # In-memory only, so a still-open deal can refine the price.
+            # Nothing is appended: historical journals gain no ORDER line.
+            self._orders[seq] = {
+                "action": action, "side": side, "qty": qty,
+                "product": rec.get("product") or "",
+            }
+        status = rec.get("net_status")
+        if status in _TERMINAL:
+            return
+        public = _public_record(rec)
+        public["side"] = side
+        public["qty"] = qty
+        public["order_seq"] = seq
+        public["net_status"] = status or "pending"
+        public["net_position_after"] = None
+        self._pending.append({
+            **public,
+            "_gen": _int_or_none(rec.get("oi_generation")),
+            "_at": self._mono(),
+        })
+
+    def _replay_refine(self, rec: dict) -> None:
+        seq = str(rec.get("order_seq") or "").strip()
+        if not seq:
+            return
+        price = _int_or_none(rec.get("fill_price"))
+        source = rec.get("price_source") or "deal"
+        for pend in self._pending:
+            if pend.get("order_seq") == seq and pend.get("price_source") != "deal":
+                pend["fill_price"] = price
+                pend["price_source"] = source
+                return
+
+    def _bound_orders(self) -> None:
+        if len(self._orders) <= 256:
+            return
+        keep = set(self._last_seq.values())
+        keep.update(p.get("order_seq") for p in self._pending)
+        for old in list(self._orders):
+            if len(self._orders) <= 256:
+                break
+            if old in keep:
+                continue
+            self._orders.pop(old, None)
+
     # ── order / fill events ──
 
-    def register_order(self, seq, action_type: str, side, qty: int, product: str) -> None:
-        """An order THIS bot sent was accepted (SendFutureOrderCLR code 0)."""
+    def register_order(self, seq, action_type: str, side, qty: int, product: str,
+                       oi_generation: int | None = None) -> None:
+        """An order THIS bot sent was accepted (SendFutureOrderCLR code 0).
+
+        The ORDER line is appended before the registry is updated. A failed
+        append leaves the registry unchanged: a later restart must not
+        confirm an order that never became durable.
+        """
         seq = str(seq or "").strip()
         if not seq or action_type not in _ACTIONS:
             return
-        self._orders[seq] = {"action": action_type, "side": _side_code(side),
-                             "qty": max(1, _int_or_none(qty) or 1), "product": product}
+        side_code = _side_code(side)
+        n = max(1, _int_or_none(qty) or 1)
+        generation = _int_or_none(oi_generation)
+        event = {
+            "event": "ORDER",
+            "ts": self._now_iso(),
+            "bot_id": self.bot_id,
+            "account": self._account_no(),
+            "product": product,
+            "order_seq": seq,
+            "action": _ACTIONS[action_type],
+            "action_type": action_type,
+            "side": side_code,
+            "qty": n,
+            "oi_generation": generation,
+        }
+        if not self._write(event):
+            return
+        self._orders[seq] = {
+            "action": action_type, "side": side_code, "qty": n,
+            "product": product, "oi_generation": generation,
+        }
         self._last_seq[action_type] = seq
         if len(self._orders) > 256:                       # bound memory
             for old in list(self._orders)[:64]:
@@ -124,8 +314,10 @@ class PositionLedger:
                     qty: int | None = None) -> dict | None:
         """Count one fill of our own order. Each seq counts once.
 
-        A deal row arriving after the poller fallback already counted the
-        seq only upgrades a still-pending record's price.
+        The fill line is appended before position moves. A deal row arriving
+        after the poller fallback already counted the seq only upgrades a
+        still-pending record's price, and only after that upgrade is itself
+        appended.
         """
         seq = str(seq or "").strip()
         order = self._orders.get(seq)
@@ -133,24 +325,45 @@ class PositionLedger:
             return None                                   # not ours
         if seq in self._applied:
             if source == "deal":
-                for rec in self._pending:
-                    if rec["order_seq"] == seq and rec["price_source"] != "deal":
-                        rec["fill_price"] = _int_or_none(price)
-                        rec["price_source"] = "deal"
+                self._refine_pending(seq, price)
             return None
-        self._applied.add(seq)
         n = max(1, _int_or_none(qty) or order["qty"])
-        self.position += n if order["side"] == "BUY" else -n
+        new_pos = self.position + (n if order["side"] == "BUY" else -n)
         rec = {
             "ts": self._now_iso(), "bot_id": self.bot_id, "account": self._account_no(),
             "product": order["product"], "order_seq": seq, "side": order["side"],
             "qty": n, "fill_price": _int_or_none(price), "price_source": source,
             "action": _ACTIONS[order["action"]],
-            "net_position_after": None, "net_status": "unanswered",
-            "bot_position_after": self.position,
+            "net_position_after": None, "net_status": "pending",
+            "bot_position_after": new_pos,
         }
-        self._pending.append({**rec, "_gen": oi_generation, "_at": self._mono()})
+        generation = _int_or_none(oi_generation)
+        if not self._write({**rec, "event": "FILL", "oi_generation": generation}):
+            return None
+        self.position = new_pos
+        self._applied.add(seq)
+        self._pending.append({**rec, "_gen": generation, "_at": self._mono()})
         return rec
+
+    def _refine_pending(self, seq: str, price) -> None:
+        price_i = _int_or_none(price)
+        for rec in self._pending:
+            if rec["order_seq"] != seq or rec["price_source"] == "deal":
+                continue
+            event = {
+                "event": "FILL_REFINE",
+                "ts": self._now_iso(),
+                "bot_id": self.bot_id,
+                "account": self._account_no(),
+                "order_seq": seq,
+                "fill_price": price_i,
+                "price_source": "deal",
+            }
+            if not self._write(event):
+                return
+            rec["fill_price"] = price_i
+            rec["price_source"] = "deal"
+            return
 
     def confirm_latest(self, action_type: str, price, *, source: str,
                        oi_generation: int | None) -> dict | None:
@@ -164,14 +377,21 @@ class PositionLedger:
     # ── net position ──
 
     def on_oi_complete(self, generation: int | None, net: int) -> int:
-        """A snapshot completed. Write records whose fill predates its query."""
+        """A snapshot completed. Settle fills whose query generation is older.
+
+        The account net never creates a fill. A failed status append leaves
+        the fill pending so a later snapshot can try again.
+        """
         if generation is None or not self._pending:
             return 0
         written, keep = 0, []
         for rec in self._pending:
-            gen = rec["_gen"]
+            gen = rec.get("_gen")
             if gen is not None and generation > gen:
-                written += self._emit(rec, net)
+                if self._write(self._net_event(rec, net, "answered")):
+                    written += 1
+                else:
+                    keep.append(rec)
             else:
                 keep.append(rec)
         self._pending = keep
@@ -180,26 +400,40 @@ class PositionLedger:
     def flush_expired(self) -> int:
         now = self._mono()
         expired = [r for r in self._pending if now - r["_at"] >= self._timeout]
-        self._pending = [r for r in self._pending if now - r["_at"] < self._timeout]
-        return sum(self._emit(r, None) for r in expired)
+        keep = [r for r in self._pending if now - r["_at"] < self._timeout]
+        written, still = self._settle(expired, None, "unanswered")
+        self._pending = keep + still
+        return written
 
     def flush_all(self) -> int:
         pending, self._pending = self._pending, []
-        return sum(self._emit(r, None) for r in pending)
+        written, still = self._settle(pending, None, "flush_unknown")
+        self._pending = still
+        return written
 
-    def _emit(self, pending: dict, net) -> int:
-        rec = {k: v for k, v in pending.items() if not k.startswith("_")}
-        rec["net_position_after"] = net
-        rec["net_status"] = "answered" if net is not None else "unanswered"
-        return 1 if self._write(rec) else 0
+    def _settle(self, pending: list[dict], net, status: str) -> tuple[int, list]:
+        written, keep = 0, []
+        for rec in pending:
+            if self._write(self._net_event(rec, net, status)):
+                written += 1
+            else:
+                keep.append(rec)
+        return written, keep
+
+    def _net_event(self, pending: dict, net, status: str) -> dict:
+        rec = {k: v for k, v in pending.items() if not str(k).startswith("_")}
+        rec["event"] = "NET_UPDATE"
+        # null stays null. A real flat book is the integer 0, not a guess.
+        rec["net_position_after"] = None if net is None else _int_or_none(net)
+        rec["net_status"] = status
+        rec["net_ts"] = self._now_iso()
+        return rec
 
     # ── resume ──
 
     def resume(self, *, net: int | None, product: str, fill_price=None) -> dict:
-        """Clean restart: restore ``bot_position`` from the log's last record
-        and log a RESUME line with the account net seen at startup."""
-        last = last_record(self.path)
-        self.position = (_int_or_none(last.get("bot_position_after")) or 0) if last else 0
+        """Clean restart: log a RESUME line for the position already restored
+        from this bot's own fills. The line does not count a fill."""
         rec = {
             "ts": self._now_iso(), "bot_id": self.bot_id, "account": self._account_no(),
             "product": product, "order_seq": "", "side": "", "qty": 0,
@@ -208,14 +442,14 @@ class PositionLedger:
             "net_status": "answered" if net is not None else "unanswered",
             "bot_position_after": self.position,
         }
-        self._write(rec)
+        self._write({**rec, "event": "RESUME"})
         return rec
 
 
 # ── reading ────────────────────────────────────────────────────────────
 
-def read_records(path: str, limit: int | None = None) -> list[dict]:
-    """Records oldest-first; unparseable lines are skipped."""
+def read_raw_records(path: str) -> list[dict]:
+    """Journal events oldest-first. Unparseable lines are skipped."""
     out = []
     try:
         with open(path, encoding="utf-8") as f:
@@ -231,7 +465,69 @@ def read_records(path: str, limit: int | None = None) -> list[dict]:
                     out.append(rec)
     except OSError:
         return []
-    return out[-limit:] if limit else out
+    return out
+
+
+def project_logical_records(rows: list) -> list[dict]:
+    """Last effective #250 record for each own fill, in fill order.
+
+    ORDER lines are not records. NET_UPDATE and FILL_REFINE change the
+    matching fill's status or price. A net line with no fill in this
+    window is shown as that fill's snapshot (the tail may start mid-journal)
+    and is never used to invent a position from the account net. A finalized
+    legacy line, which has no ``event``, is already one logical record.
+    """
+    logical: list[dict] = []
+    index: dict[str, int] = {}
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        event = rec.get("event")
+        action = rec.get("action")
+        seq = str(rec.get("order_seq") or "").strip()
+        if event == "ORDER":
+            continue
+        if event == "FILL_REFINE":
+            if seq in index:
+                slot = logical[index[seq]]
+                if rec.get("fill_price") is not None:
+                    slot["fill_price"] = _int_or_none(rec.get("fill_price"))
+                if rec.get("price_source"):
+                    slot["price_source"] = rec.get("price_source")
+            continue
+        if event == "NET_UPDATE":
+            if seq in index:
+                slot = logical[index[seq]]
+                # Own position stays the fill's. The net line cannot replace it.
+                slot["net_position_after"] = rec.get("net_position_after")
+                slot["net_status"] = rec.get("net_status")
+                if rec.get("fill_price") is not None:
+                    slot["fill_price"] = rec.get("fill_price")
+                if rec.get("price_source"):
+                    slot["price_source"] = rec.get("price_source")
+            elif action in ("ENTRY", "EXIT"):
+                pub = _public_record(rec)
+                if seq:
+                    index[seq] = len(logical)
+                logical.append(pub)
+            continue
+        if event == "RESUME" or action == "RESUME":
+            logical.append(_public_record(rec))
+            continue
+        if event == "FILL" or (event in (None, "") and action in ("ENTRY", "EXIT")):
+            if seq and seq in index:
+                continue
+            pub = _public_record(rec)
+            if seq:
+                index[seq] = len(logical)
+            logical.append(pub)
+    return logical
+
+
+def read_records(path: str, limit: int | None = None) -> list[dict]:
+    """Logical records oldest-first. Unparseable lines are skipped."""
+    logical = project_logical_records(read_raw_records(path))
+    return logical[-limit:] if limit else logical
 
 
 def last_record(path: str) -> dict | None:
