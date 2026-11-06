@@ -11,6 +11,9 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
                                  stitched 1-min candles + trade markers
     GET /api/news[?session=&source=&min=&max=&limit=]
                                  W3 RSS scorer per-article history (新聞訊號)
+    GET /position-log/<bot_id>[?limit=N]
+                                 the bot's own fill-by-fill position vs the
+                                 account net (account number masked)
 
 Read-only by default: nothing is written to a bot directory. With
 ``--enable-control`` one more route exists,
@@ -40,13 +43,13 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from scripts.dashboard import control, news_feed, snapshot  # noqa: E402
+from scripts.dashboard import control, news_feed, position_log_view, snapshot  # noqa: E402
 from scripts.news_bridge import rss_news_log  # noqa: E402
 from scripts.monitor.common import default_base_dir, now_tpe  # noqa: E402
 
@@ -279,6 +282,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
                 body = self.cache.get(f"bars:{bot_id}:{before}:{after}:{days}", lambda: _json(
                     snapshot.bars_window(bot_dir, before or None, days, after or None)))
+                self._send(200, body, "application/json; charset=utf-8")
+            elif url.path.startswith("/position-log/"):
+                bot_id = unquote(url.path[len("/position-log/"):])
+                bot_dir = snapshot.find_bot_dir(self.base_dir, bot_id) if bot_id else None
+                if not bot_dir:
+                    self._send(404, _json({"error": "no such bot"}),
+                               "application/json; charset=utf-8")
+                    return
+                text = (query.get("limit") or [""])[0]
+                if text and not text.isdigit():
+                    self._send(400, _json({"error": "limit must be a positive integer"}),
+                               "application/json; charset=utf-8")
+                    return
+                limit = position_log_view.clamp_limit(int(text) if text else None)
+                body = self.cache.get(f"poslog:{bot_id}:{limit}", lambda: _json(
+                    position_log_view.position_log(bot_dir, bot_id, limit)))
                 self._send(200, body, "application/json; charset=utf-8")
             elif url.path == "/api/news":
                 try:
