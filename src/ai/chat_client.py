@@ -22,16 +22,18 @@ ANTHROPIC_API_VERSION = "2023-06-01"
 
 GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-# Default models per provider
+# Default models per provider.
+# gemini-2.5-pro redirects to gemini-3.8-flash on 2026-12-01.
 DEFAULT_MODELS = {
     PROVIDER_ANTHROPIC: "claude-sonnet-4-20250514",
-    PROVIDER_GOOGLE: "gemini-2.5-pro",
+    PROVIDER_GOOGLE: "gemini-3.8-flash",
 }
 
 # Tiered Gemini models — used by callers that want to pick light vs heavy reasoning.
 # ``ultra`` is reserved for the most capable model; only used when ``ultra_mode``
 # is enabled (via settings.yaml ``ai.ultra_mode`` or env ``ULTRA_MODE=1``).
-GOOGLE_MODEL_PRO = "gemini-2.5-pro"
+# The constant name is historical: the standard/heavy id is gemini-3.8-flash.
+GOOGLE_MODEL_PRO = "gemini-3.8-flash"
 GOOGLE_MODEL_FLASH = "gemini-2.5-flash"
 # NOTE: verified against ListModels 2026-06-11 — the GA name
 # "gemini-3.1-pro" does NOT exist on v1beta; only the -preview id does.
@@ -111,8 +113,8 @@ def model_for_tier(provider: str, tier: str, ultra_mode: bool = False) -> str | 
 
     ``tier`` is one of:
       * ``"light"`` — cheap/fast (chat, recap) → always flash
-      * ``"heavy"`` — quality matters (codegen, trade review) → pro by default,
-        or the ultra model when ``ultra_mode`` is True
+      * ``"heavy"`` — quality matters (codegen, trade review) → gemini-3.8-flash
+        by default, or the ultra model when ``ultra_mode`` is True
       * ``"ultra"`` — always the ultra model (explicit opt-in regardless of flag)
 
     For non-Google providers we return None so the user-configured model is
@@ -438,7 +440,9 @@ class ChatClient:
         else:
             system_instruction = None
 
-        # Convert conversation history to Gemini format
+        # Replay stored text only. This path does not use function calling,
+        # so Gemini 3 thought-signature checks do not apply. Do not attach a
+        # signature, tools, or sampling parameters.
         for msg in self.conversation:
             role = "user" if msg["role"] == "user" else "model"
             contents.append({
