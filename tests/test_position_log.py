@@ -1356,26 +1356,33 @@ def test_issue_254_v250_reader_keeps_position_behind_new_tails(tmp_path):
     assert view["bot_position"] == 1
 
 
-def test_issue_254_failed_anchor_append_is_not_a_successful_old_reader_line(tmp_path):
-    """Parent append and the #250 companion are not one success.
+def test_issue_254_failed_anchor_keeps_the_order_for_the_same_process_fill(tmp_path):
+    """The primary ORDER is the registry. The #250 anchor is best-effort.
 
     A failed first append leaves no line and no registry entry. A failed
-    companion leaves the ORDER line on disk, does not register it in
-    memory, and the #250 reader stays at 0. A later recover loads that
-    ORDER once and does not add a fill. A later successful companion is
-    a separate append; this does not undo the earlier line.
+    companion leaves the ORDER on disk and still registers it. The old
+    reader is 0 for that tail. The poller's confirm_latest then appends
+    the fill once; a deal row and the account net do not add another.
+    Recover of the unfilled tail restores position 1 and the exit seq.
+    A later successful order writes the anchor, and that reader returns 1.
     """
+    import shutil
+
+    import run_backtest as rb
+
     led = _ledger(tmp_path)
     led.register_order("s1", "entry", 0, 1, "TM0000")
     led.record_fill("s1", 100, source="deal", oi_generation=4)
+    assert led.position == 1
     real = led._append_line
 
-    def fail_first(record):
+    def fail_first(_record):
         return False
 
     led._append_line = fail_first
     led.register_order("gone", "exit", 1, 1, "TM0000")
     assert "gone" not in led._orders
+    assert led._last_seq.get("exit", "") == ""
     assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "ORDER"] == ["s1"]
 
     calls = {"n": 0}
@@ -1389,24 +1396,59 @@ def test_issue_254_failed_anchor_append_is_not_a_successful_old_reader_line(tmp_
     led._append_line = fail_second
     led.register_order("s2", "exit", 1, 1, "TM0000")
     assert calls["n"] == 2
-    assert "s2" not in led._orders
+    assert "s2" in led._orders
+    assert led._last_seq["exit"] == "s2"
+    assert led.position == 1
     assert _events(tmp_path)[-1]["event"] == "ORDER"
     assert _events(tmp_path)[-1]["order_seq"] == "s2"
     assert "bot_position_after" not in _events(tmp_path)[-1]
-    assert _v250_resume_position(str(tmp_path / POSITION_LOG_NAME)) == 0
+    path = str(tmp_path / POSITION_LOG_NAME)
+    assert _v250_resume_position(path) == 0
     assert sum(1 for e in _events(tmp_path) if e.get("event") == "FILL") == 1
 
+    held = tmp_path / "unfilled"
+    held.mkdir()
+    shutil.copy(tmp_path / POSITION_LOG_NAME, held / POSITION_LOG_NAME)
+    restored = _reopen(held)
+    restored.recover()
+    assert restored.position == 1
+    assert restored._applied == {"s1"}
+    assert "s2" in restored._orders
+    assert restored._last_seq["entry"] == "s1"
+    assert restored._last_seq["exit"] == "s2"
+    restored.register_order("later", "entry", 0, 1, "TM0000")
+    assert _events(held)[-1].get("event") is None
+    assert _events(held)[-1]["bot_position_after"] == 1
+    assert _v250_resume_position(str(held / POSITION_LOG_NAME)) == 1
+    assert sum(1 for e in _events(held) if e.get("event") == "FILL") == 1
+
     led._append_line = real
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._position_ledger = led
+    rec = app._position_log(
+        "confirm_latest", "exit", 90, source="fill_poller", oi_generation=5)
+    assert rec["order_seq"] == "s2" and rec["action"] == "EXIT"
+    assert rec["price_source"] == "fill_poller"
+    assert rec["net_position_after"] is None and rec["net_status"] == "pending"
+    assert rec["bot_position_after"] == 0 and led.position == 0
+    assert _events(tmp_path)[-1]["event"] == "FILL"
+    assert app._position_log(
+        "confirm_latest", "exit", 90, source="fill_poller", oi_generation=6) is None
+    assert led.record_fill("s2", 91, source="deal", oi_generation=5) is None
+    # s1 and s2 are both still pending. The snapshot writes two status
+    # lines and does not append another FILL.
+    assert led.on_oi_complete(6, 0) == 2
+    assert led.position == 0
+    assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "FILL"] == ["s1", "s2"]
+
     again = _reopen(tmp_path)
-    again.recover()
-    assert again.position == 1
-    assert again._applied == {"s1"}
-    assert "s2" in again._orders
-    assert sum(1 for e in _events(tmp_path) if e.get("event") == "FILL") == 1
-    again.register_order("s3", "entry", 0, 1, "TM0000")
-    assert _events(tmp_path)[-1].get("event") is None
-    assert _events(tmp_path)[-1]["bot_position_after"] == 1
-    assert _v250_resume_position(str(tmp_path / POSITION_LOG_NAME)) == 1
+    resumed = again.resume(net=0, product="TM0000")
+    assert again.position == 0
+    assert again._applied == {"s1", "s2"}
+    assert again._last_seq["entry"] == "s1"
+    assert again._last_seq["exit"] == "s2"
+    assert resumed["action"] == "RESUME" and resumed["bot_position_after"] == 0
+    assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "FILL"] == ["s1", "s2"]
 
 
 def test_issue_254_failed_read_can_be_retried(tmp_path, monkeypatch):

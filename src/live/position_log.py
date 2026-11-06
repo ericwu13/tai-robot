@@ -170,15 +170,14 @@ class PositionLedger:
 
         The anchor has no ``event`` key and the same order seq as the fill,
         so replay sets the saved position and does not count another lot.
+        It is compatibility for that old reader only. A failed companion
+        is logged by ``_append_line`` and does not change this result.
         """
         if not self._append_line(record):
             return False
         anchor = self._legacy_anchor
         if anchor and "bot_position_after" not in record:
-            # The event line is already on disk. A failed companion is not
-            # rolled back and is not reported as success.
-            if not self._append_line(dict(anchor)):
-                return False
+            self._append_line(dict(anchor))
         return True
 
     def _note_anchor(self, public: dict) -> None:
