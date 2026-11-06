@@ -175,7 +175,10 @@ class PositionLedger:
             return False
         anchor = self._legacy_anchor
         if anchor and "bot_position_after" not in record:
-            self._append_line(dict(anchor))
+            # The event line is already on disk. A failed companion is not
+            # rolled back and is not reported as success.
+            if not self._append_line(dict(anchor)):
+                return False
         return True
 
     def _note_anchor(self, public: dict) -> None:
@@ -191,14 +194,18 @@ class PositionLedger:
         """
         if self._recovered:
             return
-        self._recovered = True
-        self._recover()
+        # The flag is set only after a completed read. A failed read leaves
+        # it clear so the next call can load the file. A damaged row inside
+        # a completed read is skipped once; replaying the whole file again
+        # would reset clocks of fills this call already applied.
+        if self._recover():
+            self._recovered = True
 
-    def _recover(self) -> None:
+    def _recover(self) -> bool:
         """Replay from an empty slate. Does not write. May reset clocks.
 
-        Callers that must not disturb an already-loaded ledger use
-        :meth:`recover` instead.
+        Returns False when the file could not be read. Callers that must
+        not disturb an already-loaded ledger use :meth:`recover`.
         """
         self.position = 0
         self._orders = {}
@@ -212,7 +219,7 @@ class PositionLedger:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "position log replay failed (%s): %s", self.path, type(exc).__name__)
-            return
+            return False
         for row in rows:
             try:
                 self._replay_one(row)
@@ -221,6 +228,7 @@ class PositionLedger:
                     "position log replay skipped a row (%s): %s",
                     self.path, type(exc).__name__)
         self._bound_orders()
+        return True
 
     def _replay_one(self, rec: dict) -> None:
         if _is_legacy_line(rec):

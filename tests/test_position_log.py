@@ -1357,36 +1357,94 @@ def test_issue_254_v250_reader_keeps_position_behind_new_tails(tmp_path):
 
 
 def test_issue_254_failed_anchor_append_is_not_a_successful_old_reader_line(tmp_path):
-    """The event line and the #250 anchor are two appends.
+    """Parent append and the #250 companion are not one success.
 
-    If the second append fails, the order line remains and the anchor does
-    not. The #250 reader then still sees no bot_position_after. This test
-    records that gap. It does not claim the second write cannot fail.
+    A failed first append leaves no line and no registry entry. A failed
+    companion leaves the ORDER line on disk, does not register it in
+    memory, and the #250 reader stays at 0. A later recover loads that
+    ORDER once and does not add a fill. A later successful companion is
+    a separate append; this does not undo the earlier line.
     """
     led = _ledger(tmp_path)
     led.register_order("s1", "entry", 0, 1, "TM0000")
     led.record_fill("s1", 100, source="deal", oi_generation=4)
     real = led._append_line
+
+    def fail_first(record):
+        return False
+
+    led._append_line = fail_first
+    led.register_order("gone", "exit", 1, 1, "TM0000")
+    assert "gone" not in led._orders
+    assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "ORDER"] == ["s1"]
+
     calls = {"n": 0}
 
-    def flaky(record):
+    def fail_second(record):
         calls["n"] += 1
         if calls["n"] == 1:
             return real(record)
         return False
 
-    led._append_line = flaky
+    led._append_line = fail_second
     led.register_order("s2", "exit", 1, 1, "TM0000")
     assert calls["n"] == 2
+    assert "s2" not in led._orders
     assert _events(tmp_path)[-1]["event"] == "ORDER"
+    assert _events(tmp_path)[-1]["order_seq"] == "s2"
     assert "bot_position_after" not in _events(tmp_path)[-1]
     assert _v250_resume_position(str(tmp_path / POSITION_LOG_NAME)) == 0
-    assert "s2" in led._orders
+    assert sum(1 for e in _events(tmp_path) if e.get("event") == "FILL") == 1
+
     led._append_line = real
-    led.register_order("s3", "entry", 0, 1, "TM0000")
+    again = _reopen(tmp_path)
+    again.recover()
+    assert again.position == 1
+    assert again._applied == {"s1"}
+    assert "s2" in again._orders
+    assert sum(1 for e in _events(tmp_path) if e.get("event") == "FILL") == 1
+    again.register_order("s3", "entry", 0, 1, "TM0000")
     assert _events(tmp_path)[-1].get("event") is None
     assert _events(tmp_path)[-1]["bot_position_after"] == 1
     assert _v250_resume_position(str(tmp_path / POSITION_LOG_NAME)) == 1
+
+
+def test_issue_254_failed_read_can_be_retried(tmp_path, monkeypatch):
+    """A read that raises does not mark the ledger recovered.
+
+    The next recover() loads the same fill once. A damaged row inside a
+    read that did complete is skipped and does not unlock another replay.
+    """
+    from src.live import position_log as mod
+
+    led = _ledger(tmp_path)
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    led.record_fill("s1", 100, source="deal", oi_generation=4)
+    path = str(tmp_path / POSITION_LOG_NAME)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("{not-json\n")
+    fresh = _reopen(tmp_path)
+    real = mod.read_raw_records
+
+    def boom(file_path, **kwargs):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(mod, "read_raw_records", boom)
+    fresh.recover()
+    assert fresh._recovered is False
+    assert fresh.position == 0 and fresh._applied == set() and fresh._orders == {}
+    monkeypatch.setattr(mod, "read_raw_records", real)
+    fresh.recover()
+    assert fresh._recovered is True
+    assert fresh.position == 1 and fresh._applied == {"s1"}
+    stamp = fresh._pending[0]["_at"]
+    fresh._pending[0]["_gen"] = 7
+    fresh.recover()
+    assert fresh._pending[0]["_gen"] == 7
+    assert fresh._pending[0]["_at"] == stamp
+    text = (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8")
+    assert text.count('"event":"FILL"') == 1
+    assert text.endswith("{not-json\n")
 
 
 def test_issue_254_resume_inputs_fail_after_the_journal_is_loaded(tmp_path, monkeypatch):
