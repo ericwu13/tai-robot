@@ -119,6 +119,7 @@ _CODE_GEN_MAX_TOKENS = 16384
 # Live trading modules
 from src.live.live_runner import LiveRunner, LiveState, arm_headless_file_guard, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard, apply_resume_guard
+from src.live.position_log import PositionLedger
 from src.live.tick_watchdog import TickWatchdog
 from src.live.main_heartbeat import call_com, set_com_return_logger
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
@@ -1720,6 +1721,11 @@ class BacktestApp:
                     elif outcome == "flat":
                         self.real_pos_var.set("Flat (無持倉)")
                     _log(f"未平倉 OpenInterest: {_redact_open_interest(raw)}")
+                    if outcome in ("end", "flat") and self._live_runner:
+                        self._position_log(
+                            "on_oi_complete",
+                            getattr(getattr(self, "_account_monitor", None), "oi_query_generation", None),
+                            self._position_log_net())
                     # Fill polling: track position from OI callbacks.
                     # A stale row belongs to an older query and must not
                     # confirm a fill (issue #202).
@@ -2622,6 +2628,9 @@ class BacktestApp:
         # Per-order real fill prices from OnNewData (issue #92)
         self._fill_tracker = RealFillTracker()
         self._real_fill_count: int = 0
+        # Per-bot position log (data collection only; see position_log.py).
+        # Created per deploy; every call goes through _position_log().
+        self._position_ledger: PositionLedger | None = None
         self._last_exit_order_seq: str = ""
         # Seq no of the exit whose Discord notice went out with the
         # estimated price — a late OnNewData fill triggers a correction.
@@ -8745,6 +8754,52 @@ class BacktestApp:
                             "status")
         self._arm_resumed_fill_poll(
             outcome, real_ok=real_ok, real_reason=real_reason)
+        if trading_mode in ("semi_auto", "auto"):
+            self._position_log_resume(symbol)
+
+    def _position_log_resume(self, symbol: str) -> None:
+        """RESUME record for a clean restart. Never raises."""
+        if getattr(self, "_position_ledger", None) is None:
+            return
+        try:
+            broker = self._live_runner.broker
+            net = (self._position_log_net()
+                   if self._account_monitor.oi_snapshot_received else None)
+            price = (broker.effective_entry_price()
+                     if broker.position_size > 0 else None)
+            product = resolve_order_symbol(symbol)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"POSITION LOG: resume inputs failed: [{type(exc).__name__}] {exc}")
+            return
+        self._position_log("resume", net=net, product=product, fill_price=price)
+
+    def _position_log(self, method: str, *args, **kwargs):
+        """Call a PositionLedger method. Data collection only: it can never
+        raise into, or change, the trading path."""
+        ledger = getattr(self, "_position_ledger", None)
+        if ledger is None:
+            return None
+        try:
+            return getattr(ledger, method)(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"POSITION LOG: {method} failed: [{type(exc).__name__}] {exc}")
+            return None
+
+    def _position_log_net(self) -> int | None:
+        """Account net for this bot's product (futures book only).
+
+        Evaluated as an argument to ``_position_log``, i.e. outside its
+        guard, so it must not raise either: None = unknown.
+        """
+        try:
+            symbol = self._live_runner.symbol if self._live_runner else ""
+            order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+            prefix = order_sym[:2] if order_sym else ""
+            return int(self._account_monitor.get_signed_position(
+                prefix, FUTURES_OI_MARKET))
+        except Exception as exc:  # noqa: BLE001
+            _log(f"POSITION LOG: net read failed: [{type(exc).__name__}] {exc}")
+            return None
 
     def _deferred_close_side(self) -> str:
         """Side named by a restored deferred close, or \"\"."""
@@ -9155,6 +9210,10 @@ class BacktestApp:
             )
             self._regime_manager = None
         self._live_runner.acquire_lock()
+        self._position_ledger = PositionLedger(
+            self._live_runner.bot_dir,
+            bot_id=os.path.basename(os.path.normpath(self._live_runner.bot_dir)),
+            account=lambda: self._futures_account or "")
         self._live_runner.trading_mode = trading_mode
         self._live_runner.broker.trade_source = _mode_to_source(trading_mode)
         self._live_runner.daily_loss_limit = self._trading_guard.daily_loss_limit
@@ -11177,6 +11236,9 @@ class BacktestApp:
                         new_close=report_nc, send_time=_taipei_now())
                     if action_type == "exit":
                         self._last_exit_order_seq = str(message).strip()
+                self._position_log(
+                    "register_order", str(message), action_type, buy_sell, 1,
+                    order_symbol)
                 if _discord and _discord.enabled:
                     _discord.order_sent(side_str, order_symbol, price_label,
                                         sim_price, str(message),
@@ -11424,6 +11486,14 @@ class BacktestApp:
                         break
         _log(f"FILL CONFIRM PRICE: fill_price={fill_price!r} pos={pos} "
              f"type={poller_action_type}")
+        if poller_action_type in ("entry", "exit"):
+            try:
+                px = int(round(float(fill_price))) if fill_price else None
+            except (ValueError, TypeError):
+                px = None
+            self._position_log(
+                "confirm_latest", poller_action_type, px, source="fill_poller",
+                oi_generation=getattr(getattr(self, "_account_monitor", None), "oi_query_generation", None))
 
         # Guarded write of real_entry_price onto the broker (issue #45).
         # A late entry-fill callback arriving AFTER the sim position has
@@ -11728,6 +11798,13 @@ class BacktestApp:
         fill = self._fill_tracker.on_new_data(raw)
         if fill is None or not self._live_runner:
             return
+        # Every fill of our own order moves the bot's own position, even
+        # one the broker's per-trade guard rejects as belonging to an
+        # earlier trade — attribution is by seq, not by trade.
+        self._position_log(
+            "record_fill", fill.seq_no, fill.price, source="deal",
+            oi_generation=getattr(getattr(self, "_account_monitor", None), "oi_query_generation", None),
+            qty=fill.qty)
 
         self._real_fill_count += 1
         self.real_fills_var.set(f"{self._real_fill_count} 筆 trades")
@@ -12090,6 +12167,7 @@ class BacktestApp:
 
     def _query_real_account(self):
         """Query real account positions and equity from Capital API."""
+        self._position_log("flush_expired")
         if self._account_query_blocked():
             _log_debug("[CONN] account query deferred: reply link down")
             return
@@ -12511,6 +12589,10 @@ class BacktestApp:
             # thread blocked inside the stop-close COM call never reaches
             # here — the watchdog still sees the inflight stamp.
             self._stop_main_heartbeat()
+            # After the stop-close: a fill whose net never came is still
+            # written (net null) instead of being dropped with the runner.
+            self._position_log("flush_all")
+            self._position_ledger = None
             self._live_runner = None
             self._regime_manager = None
             self._trading_guard.reset()
