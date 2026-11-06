@@ -1248,46 +1248,81 @@ def test_issue_254_read_and_replay_do_not_rewrite_the_journal(tmp_path):
         "s", "leg"]
 
 
-def _v250_position(path: str):
-    """Position the #250 reader restores. Source is 49268a0 ``resume()``.
+def _v250_module():
+    """The unchanged position-log module from 49268a0.
 
-    Tag v2.19.17 (534c134) has no ``position_log.py``. The released EXE
-    does not read this file. 49268a0 is the first reader, and the version
-    string is still 2.19.17 because that reader has not been released.
+    Tag v2.19.17 (534c134) has no ``position_log.py``. This is the first
+    reader. ``resume`` uses the last line's ``bot_position_after`` or 0.
     """
-    from src.live.position_log import read_raw_records
+    import importlib.util
+    import inspect
+    import os
+    import subprocess
+    import tempfile
 
-    rows = read_raw_records(path)
-    last = rows[-1] if rows else None
-    if not last:
-        return 0
-    try:
-        number = int(last.get("bot_position_after"))
-    except (TypeError, ValueError):
-        number = 0
-    return number or 0
+    cached = getattr(_v250_module, "module", None)
+    if cached is not None:
+        return cached
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    blob = subprocess.check_output(
+        ["git", "show", "49268a0:src/live/position_log.py"], cwd=root)
+    fd, path = tempfile.mkstemp(suffix=".py")
+    os.write(fd, blob)
+    os.close(fd)
+    spec = importlib.util.spec_from_file_location("position_log_49268a0", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = inspect.getsource(module.PositionLedger.resume)
+    assert "last_record" in source and "bot_position_after" in source
+    _v250_module.module = module
+    return module
 
 
-def test_issue_254_old_reader_silently_flats_an_order_tail(tmp_path):
-    """The #250 formula is exact on an old file and silently flat on an ORDER tail.
+def _v250_resume_position(path: str) -> int:
+    """Exact #250 resume assignment, executed by that commit's module."""
+    module = _v250_module()
+    last = module.last_record(path)
+    return (module._int_or_none(last.get("bot_position_after")) or 0) if last else 0
 
-    That silent 0 is not a refusal. A cutoff has to live in the old reader;
-    this process does not add a migration line to force one.
+
+def test_issue_254_v250_reader_keeps_position_behind_new_tails(tmp_path):
+    """49268a0 last_record recovers a fill that is followed by an ORDER.
+
+    A legacy file is unchanged. A FILL tail and a NET_UPDATE tail already
+    carry bot_position_after. An ORDER or price-refine tail is followed by
+    one copy of that fill, with no event key, so the old reader is not 0
+    and this reader does not count a second lot.
     """
     original = _write_legacy(tmp_path)
-    assert _v250_position(str(tmp_path / POSITION_LOG_NAME)) == 0
+    assert _v250_resume_position(str(tmp_path / POSITION_LOG_NAME)) == 0
     assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8") == original
 
-    led = _ledger(tmp_path / "new")
+    filled = tmp_path / "fill"
+    filled.mkdir()
+    led = _ledger(filled)
     led.register_order("s1", "entry", 0, 1, "TM0000")
     led.record_fill("s1", 100, source="deal", oi_generation=4)
-    led.record_fill("s1", 105, source="deal", oi_generation=4)
-    led.on_oi_complete(5, 1)
+    assert _v250_resume_position(str(filled / POSITION_LOG_NAME)) == 1
+
+    led.on_oi_complete(5, 0)
+    assert _v250_resume_position(str(filled / POSITION_LOG_NAME)) == 1
+    assert _events(filled)[-1]["event"] == "NET_UPDATE"
+    assert _events(filled)[-1]["bot_position_after"] == 1
+
     led.register_order("s2", "exit", 1, 1, "TM0000")
-    path = str(tmp_path / "new" / POSITION_LOG_NAME)
-    assert _v250_position(path) == 0
-    last = _events(tmp_path / "new")[-1]
-    assert last["event"] == "ORDER" and "bot_position_after" not in last
+    assert _v250_resume_position(str(filled / POSITION_LOG_NAME)) == 1
+    anchor = _events(filled)[-1]
+    assert "event" not in anchor
+    assert anchor["order_seq"] == "s1" and anchor["bot_position_after"] == 1
+    assert anchor["action"] == "ENTRY"
+    again = _reopen(filled)
+    again.resume(net=0, product="TM0000")
+    assert again.position == 1
+    assert again._applied == {"s1"}
+    assert "s2" in again._orders and "s2" not in again._applied
+    view = position_log_view.position_log(str(filled), "TMF00_alpha")
+    assert [r["order_seq"] for r in view["records"] if r["action"] == "ENTRY"] == ["s1"]
+    assert view["bot_position"] == 1
 
 
 def test_issue_254_resume_inputs_fail_after_the_journal_is_loaded(tmp_path, monkeypatch):

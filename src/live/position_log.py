@@ -143,6 +143,7 @@ class PositionLedger:
         self._anon = 0
         self._recovered = False
         self._resume_written = False
+        self._legacy_anchor: dict | None = None
 
     # ── helpers ──
 
@@ -153,7 +154,7 @@ class PositionLedger:
             value = ""
         return str(value or "")
 
-    def _write(self, record: dict) -> bool:
+    def _append_line(self, record: dict) -> bool:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "a", encoding="utf-8", newline="\n") as f:
@@ -162,6 +163,23 @@ class PositionLedger:
         except Exception as exc:  # noqa: BLE001 — logging must not touch trading
             logger.warning("position log write failed (%s): %s", self.path, exc)
             return False
+
+    def _write(self, record: dict) -> bool:
+        """Append one event. If that line has no own-position field, append
+        the last fill in the shape #250's ``last_record`` already reads.
+
+        The anchor has no ``event`` key and the same order seq as the fill,
+        so replay sets the saved position and does not count another lot.
+        """
+        if not self._append_line(record):
+            return False
+        anchor = self._legacy_anchor
+        if anchor and "bot_position_after" not in record:
+            self._append_line(dict(anchor))
+        return True
+
+    def _note_anchor(self, public: dict) -> None:
+        self._legacy_anchor = {key: public.get(key) for key in _PUBLIC_KEYS}
 
     def recover(self) -> None:
         """Replay the journal once per ledger.
@@ -188,6 +206,7 @@ class PositionLedger:
         self._last_seq = {}
         self._pending = []
         self._anon = 0
+        self._legacy_anchor = None
         try:
             rows = read_raw_records(self.path)
         except Exception as exc:  # noqa: BLE001
@@ -243,9 +262,14 @@ class PositionLedger:
                         "action": kind, "side": side, "qty": qty,
                         "product": rec.get("product") or "",
                     }
+            self._note_anchor(rec)
         pos = _int_or_none(rec.get("bot_position_after"))
         if pos is not None:
             self.position = pos
+            if self._legacy_anchor is not None:
+                self._legacy_anchor["bot_position_after"] = self.position
+            elif action == "RESUME":
+                self._note_anchor(rec)
 
     def _replay_order(self, rec: dict) -> None:
         seq = str(rec.get("order_seq") or "").strip()
@@ -288,6 +312,7 @@ class PositionLedger:
                 "product": rec.get("product") or "",
             }
         status = rec.get("net_status")
+        self._note_anchor(_public_record(rec))
         if status in _TERMINAL:
             return
         public = _public_record(rec)
@@ -296,6 +321,7 @@ class PositionLedger:
         public["order_seq"] = seq
         public["net_status"] = status or "pending"
         public["net_position_after"] = None
+        self._note_anchor(public)
         # The number on the FILL line stays on disk. This process must not
         # compare it with a counter that started over at zero.
         self._pending.append({
@@ -401,6 +427,7 @@ class PositionLedger:
         self.position = new_pos
         self._applied.add(seq)
         self._pending.append({**rec, "_gen": generation, "_at": self._mono()})
+        self._note_anchor(rec)
         return rec
 
     def _refine_pending(self, seq: str, price) -> None:
@@ -421,6 +448,9 @@ class PositionLedger:
                 return
             rec["fill_price"] = price_i
             rec["price_source"] = "deal"
+            if self._legacy_anchor and self._legacy_anchor.get("order_seq") == seq:
+                self._legacy_anchor["fill_price"] = price_i
+                self._legacy_anchor["price_source"] = "deal"
             return
 
     def confirm_latest(self, action_type: str, price, *, source: str,
