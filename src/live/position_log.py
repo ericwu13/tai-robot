@@ -43,18 +43,27 @@ A line with no ``event`` and ``action`` ENTRY, EXIT, or RESUME is a
 finalized pre-change record. It is replayed as-is. Historical files are
 never rewritten, and ORDER lines are not invented for them.
 
-Replay rules:
+Replay rules, applied only by explicit ``resume()`` (a new ledger is flat):
 
-* Position comes from FILL lines and legacy ENTRY/EXIT lines (side and
-  qty), once per seq. It does not come from the account net, from ORDER,
-  from NET_UPDATE, or from RESUME.
-* ``_orders`` / ``_last_seq`` come from ORDER lines, so a restarted
-  fill poller can confirm an order that was accepted but not filled.
-* A FILL whose net is still pending is restored as pending, including
-  the OpenInterest generation captured at fill time, so a later snapshot
-  can answer it. The monotonic timeout restarts with the process.
-* A failed append is logged and not treated as durable. Nothing here
-  raises into the trading path.
+* A plain deploy does not adopt the previous journal. Inspection goes
+  through ``read_records``. The live ledger loads orders, pending nets,
+  and position only when ``resume()`` runs.
+* New ``FILL`` events move position by their signed qty, once per seq.
+  ``ORDER`` never does. ``NET_UPDATE`` never does. A new ``RESUME`` line
+  does not either.
+* A pre-change line (no ``event``) does not move position by its qty.
+  The last such line's ``bot_position_after`` is the baseline, which can
+  disagree with the signed sum. Its seqs are remembered so a later deal
+  does not count them again. No ORDER line is written for them.
+* A restored pending fill keeps the generation number on disk, but the
+  in-memory comparison uses a sentinel: the counter in
+  ``account_monitor`` restarts every process, so the stored number is
+  not compared with the new process. The first completed snapshot here
+  may answer it. The 120 s timeout clock also restarts with the process.
+* A failed append is logged and not treated as durable. In-memory
+  position moves only after that append succeeds, so a write error does
+  not leave a position the next restart cannot see. Nothing here raises
+  into the trading path.
 
 ``net_position_after`` describes the book after the fill. A pending fill
 takes the first snapshot whose query generation is newer than the one
@@ -77,6 +86,9 @@ _TPE = timezone(timedelta(hours=8))
 _ACTIONS = {"entry": "ENTRY", "exit": "EXIT"}
 _TYPE_BY_ACTION = {"ENTRY": "entry", "EXIT": "exit"}
 _TERMINAL = {"answered", "unanswered", "flush_unknown"}
+# Restored pending fills must not be compared with the previous process's
+# OpenInterest counter. Any completed snapshot in this process is newer.
+_RESTORED_OI_GEN = -1
 _PUBLIC_KEYS = (
     "ts", "bot_id", "account", "product", "order_seq", "side", "qty",
     "fill_price", "price_source", "action", "net_position_after",
@@ -129,7 +141,6 @@ class PositionLedger:
         self._last_seq: dict[str, str] = {}       # action_type -> newest seq
         self._pending: list[dict] = []            # fills waiting for a net
         self._anon = 0
-        self._recover()
 
     # ── helpers ──
 
@@ -151,10 +162,18 @@ class PositionLedger:
             return False
 
     def _recover(self) -> None:
-        """Restore fills, pending nets, and accepted orders from the journal.
+        """Load this journal into memory. Safe to call again.
 
-        Best effort. A damaged row is skipped. A failure here must not raise.
+        Replays from an empty slate, so a second call does not add the
+        same fill twice. A damaged row is skipped. A failure here must
+        not raise. ``__init__`` does not call this; ``resume()`` does.
         """
+        self.position = 0
+        self._orders = {}
+        self._applied = set()
+        self._last_seq = {}
+        self._pending = []
+        self._anon = 0
         try:
             rows = read_raw_records(self.path)
         except Exception as exc:  # noqa: BLE001
@@ -171,6 +190,9 @@ class PositionLedger:
         self._bound_orders()
 
     def _replay_one(self, rec: dict) -> None:
+        if _is_legacy_line(rec):
+            self._replay_legacy(rec)
+            return
         event = rec.get("event")
         if event == "ORDER":
             self._replay_order(rec)
@@ -185,11 +207,31 @@ class PositionLedger:
             if seq:
                 self._pending = [p for p in self._pending if p.get("order_seq") != seq]
             return
-        action = rec.get("action")
-        if event == "RESUME" or action == "RESUME":
+        if event == "RESUME" or rec.get("action") == "RESUME":
             return
-        if event == "FILL" or (event in (None, "") and action in ("ENTRY", "EXIT")):
+        if event == "FILL":
             self._replay_fill(rec)
+
+    def _replay_legacy(self, rec: dict) -> None:
+        """Pre-#252 line: snapshot baseline, seq remembered, qty not summed."""
+        action = rec.get("action")
+        seq = str(rec.get("order_seq") or "").strip()
+        if action in ("ENTRY", "EXIT") and seq:
+            self._applied.add(seq)
+            side = _side_code(rec.get("side"))
+            qty = _int_or_none(rec.get("qty"))
+            if qty is None or qty < 1:
+                qty = 1
+            if side in ("BUY", "SELL") and seq not in self._orders:
+                kind = _TYPE_BY_ACTION.get(action, "")
+                if kind:
+                    self._orders[seq] = {
+                        "action": kind, "side": side, "qty": qty,
+                        "product": rec.get("product") or "",
+                    }
+        pos = _int_or_none(rec.get("bot_position_after"))
+        if pos is not None:
+            self.position = pos
 
     def _replay_order(self, rec: dict) -> None:
         seq = str(rec.get("order_seq") or "").strip()
@@ -240,9 +282,11 @@ class PositionLedger:
         public["order_seq"] = seq
         public["net_status"] = status or "pending"
         public["net_position_after"] = None
+        # The number on the FILL line stays on disk. This process must not
+        # compare it with a counter that started over at zero.
         self._pending.append({
             **public,
-            "_gen": _int_or_none(rec.get("oi_generation")),
+            "_gen": _RESTORED_OI_GEN,
             "_at": self._mono(),
         })
 
@@ -432,8 +476,12 @@ class PositionLedger:
     # ── resume ──
 
     def resume(self, *, net: int | None, product: str, fill_price=None) -> dict:
-        """Clean restart: log a RESUME line for the position already restored
-        from this bot's own fills. The line does not count a fill."""
+        """Explicit restart. Replay the journal, then append a RESUME line.
+
+        The line records the restored own position. It does not count a
+        fill, and the account net does not replace that position.
+        """
+        self._recover()
         rec = {
             "ts": self._now_iso(), "bot_id": self.bot_id, "account": self._account_no(),
             "product": product, "order_seq": "", "side": "", "qty": 0,
@@ -558,6 +606,13 @@ def read_records(path: str, limit: int | None = None, *,
 def last_record(path: str) -> dict | None:
     recs = read_records(path, limit=1)
     return recs[-1] if recs else None
+
+
+def _is_legacy_line(rec: dict) -> bool:
+    """A finalized pre-#252 record: no event type, action ENTRY/EXIT/RESUME."""
+    if not isinstance(rec, dict) or rec.get("event") not in (None, ""):
+        return False
+    return rec.get("action") in ("ENTRY", "EXIT", "RESUME")
 
 
 def is_mismatch(rec: dict) -> bool:

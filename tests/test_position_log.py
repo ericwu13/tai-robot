@@ -168,15 +168,20 @@ def test_manual_order_between_fills_is_detectable(tmp_path):
 # ── deploy / resume ────────────────────────────────────────────────────
 
 def test_fresh_deploy_starts_flat(tmp_path):
-    """No journal yet: a new ledger is flat and does not create a file.
+    """A new ledger is flat, including when the directory already has a journal.
 
-    Reopening a journal that already has a fill restores that fill
-    (issue #252). Those cases live in the crash tests below; this one
-    pins only the empty directory.
+    Explicit resume() is what loads that journal. A plain construct does
+    not, matching a non-resume deploy on 49268a0.
     """
     led = _ledger(tmp_path)
     assert led.position == 0
     assert not (tmp_path / POSITION_LOG_NAME).exists()
+    led.register_order("a", "entry", 0, 1, "TM0000")
+    led.record_fill("a", 100, source="deal", oi_generation=1)
+    led.flush_all()
+    fresh = _ledger(tmp_path)
+    assert fresh.position == 0
+    assert fresh._orders == {} and fresh._pending == [] and fresh._applied == set()
 
 
 def test_clean_restart_restores_from_the_last_record_and_logs_resume(tmp_path):
@@ -349,7 +354,7 @@ def test_issue_252_fill_is_durable_before_oi_and_restores_once(tmp_path):
     assert fills[0]["bot_position_after"] == 1
 
     again = _reopen(tmp_path)
-    assert again.position == 1
+    assert again.position == 0
     rec = again.resume(net=None, product="TM0000")
     assert again.position == 1
     assert rec["action"] == "RESUME" and rec["bot_position_after"] == 1
@@ -380,6 +385,8 @@ def test_issue_252_fill_is_durable_before_oi_and_restores_once(tmp_path):
     short.register_order("s1", "entry", 1, 1, "TM0000")
     short.record_fill("s1", 44000, source="deal", oi_generation=3)
     restored = _reopen(sell_dir)
+    assert restored.position == 0
+    restored.resume(net=None, product="TM0000")
     assert restored.position == -1
     assert restored.record_fill("s1", 44000, source="deal", oi_generation=3) is None
     assert restored.position == -1
@@ -433,11 +440,14 @@ def test_issue_252_unfilled_orders_restore_and_order_alone_does_not_fill(tmp_pat
 
     again = _reopen(tmp_path)
     assert again.position == 0
-    assert _log(tmp_path) == []
+    assert again.confirm_latest("entry", 101, source="fill_poller", oi_generation=1) is None
+    again.resume(net=None, product="TM0000")
+    assert again.position == 0
+    assert [r for r in _log(tmp_path) if r["action"] in ("ENTRY", "EXIT")] == []
     # Account net must not invent an own fill for an order that never filled.
     assert again.on_oi_complete(99, 5) == 0
     assert again.position == 0
-    assert _log(tmp_path) == []
+    assert [r for r in _log(tmp_path) if r["action"] in ("ENTRY", "EXIT")] == []
 
     entry = again.confirm_latest("entry", 101, source="fill_poller", oi_generation=8)
     assert entry["order_seq"] == "e1"
@@ -462,8 +472,12 @@ def test_issue_252_restart_keeps_once_only_and_pending_deal_refine(tmp_path):
     led.register_order("b", "entry", 0, 1, "TXFD0")
     led.record_fill("b", 50, source="deal", oi_generation=4)
     assert led.position == 2
+    assert led.on_oi_complete(4, 9) == 0          # same process: query is not newer
+    assert led.position == 2
 
     again = _reopen(tmp_path)
+    assert again.position == 0
+    again.resume(net=None, product="TM0000")
     assert again.position == 2
     assert again.record_fill("a", 999, source="deal", oi_generation=4) is None
     assert again.confirm_latest("entry", 999, source="fill_poller", oi_generation=4) is None
@@ -474,10 +488,9 @@ def test_issue_252_restart_keeps_once_only_and_pending_deal_refine(tmp_path):
     # The other fill is untouched by A's late deal.
     assert logical["b"]["bot_position_after"] == 2
 
-    # A snapshot older than the fill's generation does not answer it; the
-    # next one does, once, without applying the position again.
-    assert again.on_oi_complete(4, 9) == 0
-    assert again.on_oi_complete(5, 2) == 2
+    # The stored generation is from the previous process. The first snapshot
+    # in this one answers both pending fills and does not move position.
+    assert again.on_oi_complete(1, 2) == 2
     assert again.position == 2
     answered = {r["order_seq"]: r for r in _log(tmp_path)}
     assert answered["a"]["net_status"] == "answered" and answered["a"]["net_position_after"] == 2
@@ -492,6 +505,8 @@ def test_issue_252_completed_seq_does_not_count_again_after_restart(tmp_path):
     led.record_fill("a", 100, source="deal", oi_generation=1)
     led.on_oi_complete(2, 1)
     again = _reopen(tmp_path)
+    assert again.position == 0
+    again.resume(net=1, product="TM0000")
     assert again.position == 1
     assert again.record_fill("a", 100, source="deal", oi_generation=3) is None
     assert again.confirm_latest("entry", 100, source="fill_poller", oi_generation=3) is None
@@ -539,23 +554,28 @@ def test_issue_252_legacy_finalized_lines_keep_position_and_are_not_rewritten(tm
     original = _write_legacy(tmp_path)
     assert _log(tmp_path) == _LEGACY
     assert all(row.get("event") != "ORDER" for row in _events(tmp_path))
+    plain = _reopen(tmp_path)
+    assert plain.position == 0 and plain._applied == set()
+    assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8") == original
     led = _reopen(tmp_path)
+    led.resume(net=0, product="TM0000", fill_price=44622)
     assert led.position == 0
     # Both finalized seqs are already counted, so a replayed deal cannot add a lot.
     assert led._applied >= {"leg-buy", "leg-sell"}
-    assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8") == original
-    assert _log(tmp_path) == _LEGACY
+    assert _log(tmp_path)[:3] == _LEGACY
     assert led.record_fill("leg-buy", 44774, source="deal", oi_generation=1) is None
     assert led.position == 0
-    # A journal that ends long restores +1, not the flat default.
+    # A journal that ends long restores +1 on resume, not on a plain open.
     long_dir = tmp_path / "long"
     long_dir.mkdir()
     (long_dir / POSITION_LOG_NAME).write_text(
         json.dumps(_LEGACY[0], ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8")
-    assert _reopen(long_dir).position == 1
+    assert _reopen(long_dir).position == 0
+    long = _reopen(long_dir)
+    long.resume(net=1, product="TM0000")
+    assert long.position == 1
     # A later explicit resume appends; it does not rewrite the history.
-    led.resume(net=0, product="TM0000", fill_price=44622)
     assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8").startswith(original)
     assert '"event":"ORDER"' not in (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8")
     historical = _log(tmp_path)[:3]
@@ -632,7 +652,10 @@ def test_issue_252_replay_skips_damaged_rows_and_a_failed_append_is_not_kept(tmp
             "action_type": "entry", "side": "BUY", "qty": 1, "product": "TM0000",
         }) + "\n",
         encoding="utf-8")
+    plain = _reopen(tmp_path)
+    assert plain.position == 0
     led = _reopen(tmp_path)
+    led.resume(net=None, product="TM0000")
     assert led.position == 1
     assert led.record_fill("leg-buy", 1, source="deal", oi_generation=1) is None
     assert led.position == 1
@@ -748,8 +771,13 @@ def test_issue_252_accepted_order_glue_survives_restart_into_resume_confirm(tmp_
     ]
     assert all(o.get("oi_generation") == 11 for o in orders)
 
-    # Process death. The new ledger is the only memory the next process has.
+    # Process death. Plain startup does not adopt the orders. Explicit
+    # resume does, and the resumed confirm then uses that seq.
+    plain = _reopen(bot)
+    assert plain.position == 0
+    assert plain.confirm_latest("entry", 101, source="fill_poller", oi_generation=1) is None
     restored = _reopen(bot)
+    restored.resume(net=None, product="TM0000")
     assert restored.position == 0
     app._position_ledger = restored
     guard = TradingGuard()
@@ -1026,3 +1054,191 @@ def test_issue_254_dashboard_read_uses_the_byte_bound(tmp_path, monkeypatch):
     assert out["records"] == [] and out["bot_position"] is None
     assert seen["limit"] == 2
     assert seen["max_bytes"] == position_log_view._TAIL_BYTES
+
+
+def test_issue_254_plain_startup_stays_flat_and_does_not_invent_a_close(tmp_path):
+    """A non-resume deploy must not adopt the previous journal.
+
+    Prior long 1, then a new accepted BUY, is +1. No synthetic SELL and
+    the old fill is not counted again.
+    """
+    led = _ledger(tmp_path)
+    led.register_order("old", "entry", 0, 1, "TM0000")
+    led.record_fill("old", 100, source="deal", oi_generation=4)
+    before = (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8")
+
+    fresh = _reopen(tmp_path)
+    assert fresh.position == 0
+    assert fresh._orders == {} and fresh._pending == [] and fresh._applied == set()
+    assert fresh.flush_all() == 0
+    assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8") == before
+    assert fresh.confirm_latest("entry", 100, source="fill_poller", oi_generation=1) is None
+
+    fresh.register_order("new", "entry", 0, 1, "TM0000")
+    rec = fresh.record_fill("new", 110, source="deal", oi_generation=1)
+    assert rec["order_seq"] == "new" and rec["bot_position_after"] == 1
+    assert fresh.position == 1
+    fills = [e for e in _events(tmp_path) if e.get("event") == "FILL"]
+    assert [e["order_seq"] for e in fills] == ["old", "new"]
+    assert [e for e in _events(tmp_path) if e.get("action") == "EXIT"] == []
+    assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8").startswith(before)
+
+
+def test_issue_254_resume_restores_long_once_and_the_unfilled_seq(tmp_path):
+    """Explicit resume restores the long once. An unfilled seq matches only then."""
+    held = tmp_path / "held"
+    held.mkdir()
+    led = _ledger(held)
+    led.register_order("old", "entry", 0, 1, "TM0000")
+    led.record_fill("old", 100, source="deal", oi_generation=4)
+    resumed = _reopen(held)
+    assert resumed.position == 0
+    rec = resumed.resume(net=1, product="TM0000", fill_price=100)
+    assert resumed.position == 1 and rec["bot_position_after"] == 1
+    assert resumed.record_fill("old", 100, source="deal", oi_generation=1) is None
+    assert resumed.confirm_latest("entry", 100, source="fill_poller", oi_generation=1) is None
+    assert resumed.position == 1
+    assert sum(1 for e in _events(held) if e.get("event") == "FILL") == 1
+
+    open_dir = tmp_path / "open"
+    open_dir.mkdir()
+    waiting = _ledger(open_dir)
+    waiting.register_order("e1", "entry", 0, 1, "TM0000", oi_generation=8)
+    plain = _reopen(open_dir)
+    assert plain.confirm_latest("entry", 101, source="fill_poller", oi_generation=1) is None
+    assert plain.position == 0
+    back = _reopen(open_dir)
+    back.resume(net=None, product="TM0000")
+    assert back.position == 0
+    hit = back.confirm_latest("entry", 101, source="fill_poller", oi_generation=1)
+    assert hit["order_seq"] == "e1" and hit["bot_position_after"] == 1
+    assert back.position == 1
+    assert back.on_oi_complete(2, 0) == 1
+    assert back.position == 1
+
+
+def test_issue_254_legacy_snapshot_is_the_resume_baseline(tmp_path):
+    """Pre-#252 last bot_position_after wins over the signed-qty sum.
+
+    Only a later FILL event moves that baseline. ORDER does not.
+    """
+    rows = [
+        {"ts": "t", "bot_id": "TMF00_alpha", "account": ACCT, "product": "TM0000",
+         "order_seq": "h1", "side": "BUY", "qty": 1, "fill_price": 10,
+         "price_source": "deal", "action": "ENTRY", "net_position_after": 1,
+         "net_status": "answered", "bot_position_after": 1},
+        {"ts": "t", "bot_id": "TMF00_alpha", "account": ACCT, "product": "TM0000",
+         "order_seq": "h2", "side": "SELL", "qty": 1, "fill_price": 11,
+         "price_source": "deal", "action": "EXIT", "net_position_after": 0,
+         "net_status": "answered", "bot_position_after": 0},
+        {"ts": "t", "bot_id": "TMF00_alpha", "account": ACCT, "product": "TM0000",
+         "order_seq": "h3", "side": "BUY", "qty": 1, "fill_price": 12,
+         "price_source": "deal", "action": "ENTRY", "net_position_after": 1,
+         "net_status": "answered", "bot_position_after": 1},
+        {"ts": "t", "bot_id": "TMF00_alpha", "account": ACCT, "product": "TM0000",
+         "order_seq": "", "side": "", "qty": 0, "fill_price": None,
+         "price_source": "", "action": "RESUME", "net_position_after": 3,
+         "net_status": "answered", "bot_position_after": 3},
+    ]
+    text = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+    (tmp_path / POSITION_LOG_NAME).write_text(text, encoding="utf-8")
+    plain = _reopen(tmp_path)
+    assert plain.position == 0 and plain._applied == set()
+    led = _reopen(tmp_path)
+    led.resume(net=3, product="TM0000")
+    assert led.position == 3
+    assert led._applied >= {"h1", "h2", "h3"}
+    assert led.record_fill("h1", 10, source="deal", oi_generation=1) is None
+    assert led.position == 3
+    assert '"event":"ORDER"' not in (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8")
+    led.register_order("h4", "entry", 0, 1, "TM0000")
+    assert led.position == 3
+    nxt = led.record_fill("h4", 20, source="deal", oi_generation=1)
+    assert nxt["bot_position_after"] == 4 and led.position == 4
+    assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8").startswith(text)
+
+
+def test_issue_254_restarted_pending_fill_ignores_the_old_oi_generation(tmp_path):
+    """A stored generation is not compared with the new process's counter.
+
+    Reed's pair is the contract: a fill saved at generation 900 and one
+    saved at generation 2 both accept the first snapshot of a new process
+    whose counter is at 3. The snapshot's flat net does not replace the
+    own buy, and the number on disk is left as it was written.
+    """
+    outcomes = []
+    for old_gen, new_gen in ((900, 3), (2, 3)):
+        folder = tmp_path / f"gen{old_gen}"
+        folder.mkdir()
+        led = _ledger(folder)
+        led.register_order("s", "entry", 0, 1, "TM0000", oi_generation=old_gen)
+        led.record_fill("s", 100, source="deal", oi_generation=old_gen)
+        plain = _reopen(folder)
+        # Ordinary startup has no pending bucket. A flat snapshot and a
+        # flush add no leg and do not adopt the old long.
+        assert plain.position == 0 and plain._pending == [] and plain._orders == {}
+        assert plain.on_oi_complete(new_gen, 0) == 0
+        assert plain.flush_all() == 0
+        assert plain.position == 0
+        resumed = _reopen(folder)
+        resumed.resume(net=None, product="TM0000")
+        assert resumed.position == 1 and "s" in resumed._orders
+        assert resumed._pending and resumed._pending[0]["order_seq"] == "s"
+        answered = resumed.on_oi_complete(new_gen, 0)
+        outcomes.append(answered)
+        assert resumed.position == 1
+        assert resumed.on_oi_complete(new_gen + 1, 0) == 0
+        [row] = [r for r in _log(folder) if r["action"] == "ENTRY"]
+        assert row["bot_position_after"] == 1 and row["net_position_after"] == 0
+        assert row["net_status"] == "answered"
+        assert [e for e in _events(folder) if e.get("action") == "EXIT"] == []
+        stored = [e for e in _events(folder) if e.get("event") == "FILL"]
+        assert stored[0]["oi_generation"] == old_gen
+    assert outcomes == [1, 1]
+
+
+def test_issue_254_read_and_replay_do_not_rewrite_the_journal(tmp_path):
+    """Recovery and the dashboard reader are read-only.
+
+    A truncated last line stays on disk and is not counted as a fill.
+    """
+    import hashlib
+
+    led = _ledger(tmp_path)
+    led.register_order("s", "entry", 0, 1, "TM0000", oi_generation=4)
+    led.record_fill("s", 101, source="fill_poller", oi_generation=4)
+    led.record_fill("s", 105, source="deal", oi_generation=4)
+    led.on_oi_complete(5, 1)
+    legacy = {
+        "ts": "t", "bot_id": "TMF00_alpha", "account": ACCT, "product": "TM0000",
+        "order_seq": "leg", "side": "BUY", "qty": 1, "fill_price": 9,
+        "price_source": "deal", "action": "ENTRY", "net_position_after": 1,
+        "net_status": "answered", "bot_position_after": 1,
+    }
+    path = tmp_path / POSITION_LOG_NAME
+    original = path.read_bytes()
+    path.write_bytes(original + (json.dumps(legacy, separators=(",", ":")) + "\n").encode())
+    intact = path.read_bytes()
+    stamp = path.stat().st_mtime_ns
+    digest = hashlib.sha256(intact).hexdigest()
+    from src.live.position_log import read_records
+    read_records(str(path))
+    read_records(str(path), 2, max_bytes=2_000_000)
+    viewer = _reopen(tmp_path)
+    viewer._recover()
+    viewer._recover()
+    assert path.read_bytes() == intact
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert path.stat().st_mtime_ns == stamp
+
+    cut = intact + b'{"event":"FILL","order_seq":"cut","side":"SELL"'
+    path.write_bytes(cut)
+    cut_stamp = path.stat().st_mtime_ns
+    resumed = _reopen(tmp_path)
+    resumed._recover()
+    assert path.read_bytes() == cut
+    assert path.stat().st_mtime_ns == cut_stamp
+    assert "cut" not in resumed._applied
+    assert resumed.position == 1  # legacy snapshot, not a fabricated short
+    assert [r["order_seq"] for r in read_records(str(path)) if r["action"] == "ENTRY"] == [
+        "s", "leg"]

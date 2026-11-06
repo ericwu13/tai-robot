@@ -8752,10 +8752,13 @@ class BacktestApp:
                             f"({real_reason}) — NOT re-arming. "
                             "Manual review required.",
                             "status")
-        self._arm_resumed_fill_poll(
-            outcome, real_ok=real_ok, real_reason=real_reason)
+        # Restore the ledger before the poller can confirm. A synchronous
+        # already-flat exit otherwise runs confirm_latest on an empty registry.
+        # Paper does not resume the ledger: a fresh deploy stays flat.
         if trading_mode in ("semi_auto", "auto"):
             self._position_log_resume(symbol)
+        self._arm_resumed_fill_poll(
+            outcome, real_ok=real_ok, real_reason=real_reason)
 
     def _position_log_resume(self, symbol: str) -> None:
         """RESUME record for a clean restart. Never raises."""
