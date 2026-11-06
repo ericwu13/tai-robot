@@ -141,6 +141,8 @@ class PositionLedger:
         self._last_seq: dict[str, str] = {}       # action_type -> newest seq
         self._pending: list[dict] = []            # fills waiting for a net
         self._anon = 0
+        self._recovered = False
+        self._resume_written = False
 
     # ── helpers ──
 
@@ -161,12 +163,24 @@ class PositionLedger:
             logger.warning("position log write failed (%s): %s", self.path, exc)
             return False
 
-    def _recover(self) -> None:
-        """Load this journal into memory. Safe to call again.
+    def recover(self) -> None:
+        """Replay the journal once per ledger.
 
-        Replays from an empty slate, so a second call does not add the
-        same fill twice. A damaged row is skipped. A failure here must
-        not raise. ``__init__`` does not call this; ``resume()`` does.
+        A second call does not reset ``_gen`` or the timeout clock of
+        fills already loaded in this process, and it does not append.
+        ``__init__`` does not call this. The explicit resume path does,
+        before it tries to build the optional RESUME line.
+        """
+        if self._recovered:
+            return
+        self._recovered = True
+        self._recover()
+
+    def _recover(self) -> None:
+        """Replay from an empty slate. Does not write. May reset clocks.
+
+        Callers that must not disturb an already-loaded ledger use
+        :meth:`recover` instead.
         """
         self.position = 0
         self._orders = {}
@@ -476,12 +490,15 @@ class PositionLedger:
     # ── resume ──
 
     def resume(self, *, net: int | None, product: str, fill_price=None) -> dict:
-        """Explicit restart. Replay the journal, then append a RESUME line.
+        """Replay once, then append at most one RESUME line.
 
-        The line records the restored own position. It does not count a
-        fill, and the account net does not replace that position.
+        The line is display only. It does not count a fill, and the
+        account net does not replace the restored position. A second call
+        does not replay and does not append another line.
         """
-        self._recover()
+        self.recover()
+        if self._resume_written:
+            return dict(self._resume_record)
         rec = {
             "ts": self._now_iso(), "bot_id": self.bot_id, "account": self._account_no(),
             "product": product, "order_seq": "", "side": "", "qty": 0,
@@ -490,31 +507,44 @@ class PositionLedger:
             "net_status": "answered" if net is not None else "unanswered",
             "bot_position_after": self.position,
         }
-        self._write({**rec, "event": "RESUME"})
+        if self._write({**rec, "event": "RESUME"}):
+            self._resume_written = True
+            self._resume_record = dict(rec)
         return rec
 
 
 # ── reading ────────────────────────────────────────────────────────────
 
-def read_raw_records(path: str, *, max_bytes: int | None = None) -> list[dict]:
+def read_raw_records(path: str, *, max_bytes: int | None = None,
+                     opener: Callable | None = None) -> list[dict]:
     """Journal events oldest-first. Unparseable lines are skipped.
 
     ``max_bytes`` reads only the tail of a large file. A partial first
-    line caused by that seek is dropped. ``None`` reads the whole file,
-    which is what ledger replay uses.
+    line caused by that seek is dropped. With neither ``max_bytes`` nor
+    ``opener``, ledger replay uses a normal text ``open``. ``opener`` is
+    ``opener(path) -> binary file``; the dashboard passes the shared
+    reader so a Windows handle allows delete.
     """
     try:
-        if max_bytes is None:
+        if max_bytes is None and opener is None:
             with open(path, encoding="utf-8") as f:
                 lines = f.readlines()
             truncated = False
         else:
-            with open(path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - max(0, int(max_bytes))))
-                blob = f.read()
-            truncated = size > len(blob)
+            if opener is None:
+                handle = open(path, "rb")
+            else:
+                handle = opener(path)
+            with handle as f:
+                if max_bytes is None:
+                    blob = f.read()
+                    truncated = False
+                else:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - max(0, int(max_bytes))))
+                    blob = f.read()
+                    truncated = size > len(blob)
             lines = blob.decode("utf-8", errors="replace").splitlines()
     except OSError:
         return []
@@ -591,7 +621,8 @@ def project_logical_records(rows: list) -> list[dict]:
 
 
 def read_records(path: str, limit: int | None = None, *,
-                 max_bytes: int | None = None) -> list[dict]:
+                 max_bytes: int | None = None,
+                 opener: Callable | None = None) -> list[dict]:
     """Logical records oldest-first.
 
     Every event in the read window is projected first. ``limit`` then
@@ -599,7 +630,8 @@ def read_records(path: str, limit: int | None = None, *,
     journal lines, so trailing ORDER events do not hide an earlier fill.
     ``max_bytes`` bounds a large file to its tail; ``None`` reads it all.
     """
-    logical = project_logical_records(read_raw_records(path, max_bytes=max_bytes))
+    logical = project_logical_records(
+        read_raw_records(path, max_bytes=max_bytes, opener=opener))
     return logical[-limit:] if limit else logical
 
 

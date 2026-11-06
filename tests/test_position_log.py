@@ -1047,6 +1047,7 @@ def test_issue_254_dashboard_read_uses_the_byte_bound(tmp_path, monkeypatch):
     def wrapped(path, limit=None, **kwargs):
         seen["limit"] = limit
         seen["max_bytes"] = kwargs.get("max_bytes")
+        seen["opener"] = kwargs.get("opener")
         return real(path, limit, **kwargs)
 
     monkeypatch.setattr(position_log_view, "read_records", wrapped)
@@ -1054,6 +1055,9 @@ def test_issue_254_dashboard_read_uses_the_byte_bound(tmp_path, monkeypatch):
     assert out["records"] == [] and out["bot_position"] is None
     assert seen["limit"] == 2
     assert seen["max_bytes"] == position_log_view._TAIL_BYTES
+    from scripts.dashboard import fileio
+    assert seen["opener"] is fileio.open_shared
+    assert fileio._FILE_SHARE_ALL == (0x1 | 0x2 | 0x4)
 
 
 def test_issue_254_plain_startup_stays_flat_and_does_not_invent_a_close(tmp_path):
@@ -1242,3 +1246,277 @@ def test_issue_254_read_and_replay_do_not_rewrite_the_journal(tmp_path):
     assert resumed.position == 1  # legacy snapshot, not a fabricated short
     assert [r["order_seq"] for r in read_records(str(path)) if r["action"] == "ENTRY"] == [
         "s", "leg"]
+
+
+def _v250_position(path: str):
+    """Position the #250 reader restores. Source is 49268a0 ``resume()``.
+
+    Tag v2.19.17 (534c134) has no ``position_log.py``. The released EXE
+    does not read this file. 49268a0 is the first reader, and the version
+    string is still 2.19.17 because that reader has not been released.
+    """
+    from src.live.position_log import read_raw_records
+
+    rows = read_raw_records(path)
+    last = rows[-1] if rows else None
+    if not last:
+        return 0
+    try:
+        number = int(last.get("bot_position_after"))
+    except (TypeError, ValueError):
+        number = 0
+    return number or 0
+
+
+def test_issue_254_old_reader_silently_flats_an_order_tail(tmp_path):
+    """The #250 formula is exact on an old file and silently flat on an ORDER tail.
+
+    That silent 0 is not a refusal. A cutoff has to live in the old reader;
+    this process does not add a migration line to force one.
+    """
+    original = _write_legacy(tmp_path)
+    assert _v250_position(str(tmp_path / POSITION_LOG_NAME)) == 0
+    assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8") == original
+
+    led = _ledger(tmp_path / "new")
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    led.record_fill("s1", 100, source="deal", oi_generation=4)
+    led.record_fill("s1", 105, source="deal", oi_generation=4)
+    led.on_oi_complete(5, 1)
+    led.register_order("s2", "exit", 1, 1, "TM0000")
+    path = str(tmp_path / "new" / POSITION_LOG_NAME)
+    assert _v250_position(path) == 0
+    last = _events(tmp_path / "new")[-1]
+    assert last["event"] == "ORDER" and "bot_position_after" not in last
+
+
+def test_issue_254_resume_inputs_fail_after_the_journal_is_loaded(tmp_path, monkeypatch):
+    """Replay runs before price, symbol, and net reads. A display failure
+    leaves the recovered fill and the accepted order in place, once.
+    """
+    import run_backtest as rb
+
+    led = _ledger(tmp_path)
+    led.register_order("filled", "entry", 0, 1, "TM0000")
+    led.record_fill("filled", 100, source="deal", oi_generation=4)
+    led.register_order("open", "entry", 0, 1, "TXFD0")
+
+    def _app(ledger, *, price=None, size=0, snapshot=False, net=0):
+        app = rb.BacktestApp.__new__(rb.BacktestApp)
+
+        class _Broker:
+            position_size = size
+
+            def effective_entry_price(self):
+                if isinstance(price, Exception):
+                    raise price
+                return price
+
+        app._position_ledger = ledger
+        app._live_runner = SimpleNamespace(
+            symbol="TX00", broker=_Broker(), csv_logger=None)
+        app._account_monitor = SimpleNamespace(
+            oi_snapshot_received=snapshot,
+            get_signed_position=lambda prefix: net,
+        )
+        app.live_log = SimpleNamespace(append=lambda *a, **k: None)
+        return app
+
+    fresh = _reopen(tmp_path)
+    app = _app(fresh, price=RuntimeError("price"), size=1)
+    rb.BacktestApp._position_log_resume(app, "TX00")
+    assert fresh.position == 1
+    assert fresh._applied == {"filled"}
+    assert set(fresh._orders) == {"filled", "open"}
+    assert [p["order_seq"] for p in fresh._pending] == ["filled"]
+    assert fresh._pending[0]["_gen"] == -1
+    assert [e for e in _events(tmp_path) if e.get("event") == "RESUME"] == []
+    assert sum(1 for e in _events(tmp_path) if e.get("event") == "FILL") == 1
+
+    class _BoomSize:
+        @property
+        def position_size(self):
+            raise RuntimeError("size")
+
+    sized = _reopen(tmp_path / "sized")
+    _ledger(tmp_path / "sized").register_order("only", "entry", 0, 1, "TM0000")
+    # The directory was empty of a fill; rebuild the known journal by copy.
+    (tmp_path / "sized" / POSITION_LOG_NAME).write_bytes(
+        (tmp_path / POSITION_LOG_NAME).read_bytes())
+    app2 = _app(sized)
+    app2._live_runner.broker = _BoomSize()
+    rb.BacktestApp._position_log_resume(app2, "TX00")
+    assert sized.position == 1 and "open" in sized._orders
+    assert [e for e in _events(tmp_path / "sized") if e.get("event") == "RESUME"] == []
+
+    real_resolve = rb.resolve_order_symbol
+    monkeypatch.setattr(
+        rb, "resolve_order_symbol",
+        lambda symbol: (_ for _ in ()).throw(RuntimeError("symbol")))
+    (tmp_path / "named").mkdir()
+    (tmp_path / "named" / POSITION_LOG_NAME).write_bytes(
+        (tmp_path / POSITION_LOG_NAME).read_bytes())
+    named = _reopen(tmp_path / "named")
+    app3 = _app(named, size=0, snapshot=False)
+    rb.BacktestApp._position_log_resume(app3, "TX00")
+    assert named.position == 1 and named._applied == {"filled"}
+    assert [e for e in _events(tmp_path / "named") if e.get("event") == "RESUME"] == []
+    monkeypatch.setattr(rb, "resolve_order_symbol", real_resolve)
+
+    def _net_boom(prefix):
+        raise RuntimeError("net")
+
+    netted = _reopen(tmp_path / "netted")
+    (tmp_path / "netted").mkdir()
+    (tmp_path / "netted" / POSITION_LOG_NAME).write_bytes(
+        (tmp_path / POSITION_LOG_NAME).read_bytes())
+    app4 = _app(netted, size=0, snapshot=True)
+    app4._account_monitor.get_signed_position = _net_boom
+    rb.BacktestApp._position_log_resume(app4, "TX00")
+    assert netted.position == 1 and "open" in netted._orders
+    assert netted._pending[0]["net_status"] == "pending"
+    # A later call whose inputs succeed writes one RESUME and does not
+    # count the fill again or reset the restored generation.
+    stamp = netted._pending[0]["_at"]
+    app4._account_monitor.get_signed_position = lambda prefix: 1
+    app4._account_monitor.oi_snapshot_received = True
+    rb.BacktestApp._position_log_resume(app4, "TX00")
+    assert netted.position == 1 and netted._pending[0]["_gen"] == -1
+    assert netted._pending[0]["_at"] == stamp
+    resumes = [e for e in _events(tmp_path / "netted") if e.get("event") == "RESUME"]
+    assert len(resumes) == 1 and resumes[0]["bot_position_after"] == 1
+    rb.BacktestApp._position_log_resume(app4, "TX00")
+    assert len([e for e in _events(tmp_path / "netted") if e.get("event") == "RESUME"]) == 1
+    assert sum(1 for e in _events(tmp_path / "netted") if e.get("event") == "FILL") == 1
+
+
+def test_issue_254_second_reconcile_does_not_replay(tmp_path):
+    """The real resume path on one ledger object runs recovery once.
+
+    A later call may still be the same GUI object. It must not reset the
+    generation or the timeout clock of a fill this process already holds.
+    """
+    import run_backtest as rb
+    from src.live.fill_poller import FillPoller
+    from src.live.trading_guard import TradingGuard
+
+    led = _ledger(tmp_path)
+    led.register_order("filled", "entry", 0, 1, "TM0000")
+    led.record_fill("filled", 100, source="deal", oi_generation=900)
+    original = (tmp_path / POSITION_LOG_NAME).read_bytes()
+    clock = _Clock()
+    app_led = _ledger(tmp_path, clock)
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.live_log = SimpleNamespace(append=lambda *a, **k: None)
+    app._alerts = []
+    app._alert = lambda title, msg: app._alerts.append((title, msg))
+    guard = TradingGuard()
+    guard.reset()
+    app._trading_guard = guard
+    app._fill_poller = FillPoller(guard, timeout=10.0)
+    app._fill_poller.reset()
+    app._fill_poll_timer_id = None
+    app._futures_account = ACCT
+    app._position_ledger = app_led
+    app.root = SimpleNamespace(after=lambda *a, **k: None, after_cancel=lambda *a: None)
+    app._live_runner = SimpleNamespace(
+        symbol="TX00",
+        broker=SimpleNamespace(
+            position_size=1,
+            position_side=SimpleNamespace(value="LONG"),
+            entry_bar_index=4,
+            effective_entry_price=lambda: 100,
+        ),
+    )
+    state = {"boom": True}
+
+    def price():
+        if state["boom"]:
+            raise RuntimeError("price")
+        return 100
+
+    app._live_runner.broker.effective_entry_price = price
+    app._account_monitor = SimpleNamespace(
+        get_signed_position=lambda *_a: 1,
+        oi_snapshot_received=True,
+    )
+    rb.BacktestApp._reconcile_resumed_guard(app, {}, "auto", "TX00")
+    assert app_led.position == 1
+    assert app_led._pending[0]["_gen"] == -1
+    assert [e for e in _events(tmp_path) if e.get("event") == "RESUME"] == []
+    held_at = app_led._pending[0]["_at"]
+    # This process then learns a real generation. A second reconcile must
+    # not put the sentinel back or move the clock.
+    app_led._pending[0]["_gen"] = 7
+    clock.t = 40
+    state["boom"] = False
+    rb.BacktestApp._reconcile_resumed_guard(app, {}, "auto", "TX00")
+    assert app_led._pending[0]["_gen"] == 7
+    assert app_led._pending[0]["_at"] == held_at
+    assert app_led.position == 1
+    assert len([e for e in _events(tmp_path) if e.get("event") == "RESUME"]) == 1
+    rb.BacktestApp._reconcile_resumed_guard(app, {}, "paper", "TX00")
+    assert len([e for e in _events(tmp_path) if e.get("event") == "RESUME"]) == 1
+    # Clearing the once-flag is the bypass: replay assigns a new sentinel
+    # and the clock value at that later call.
+    app_led._recovered = False
+    clock.t = 80
+    app_led.recover()
+    assert app_led._pending[0]["_gen"] == -1
+    assert app_led._pending[0]["_at"] == 80
+
+    paper_led = _reopen(tmp_path / "paper")
+    (tmp_path / "paper").mkdir()
+    (tmp_path / "paper" / POSITION_LOG_NAME).write_bytes(original)
+    app._position_ledger = paper_led
+    rb.BacktestApp._reconcile_resumed_guard(app, {}, "paper", "TX00")
+    assert paper_led.position == 0 and paper_led._recovered is False
+    assert [e for e in _events(tmp_path / "paper") if e.get("event") == "RESUME"] == []
+
+
+def test_issue_254_shared_opener_reads_the_bounded_tail(tmp_path):
+    """A caller-supplied binary opener is what the bounded read uses."""
+    from src.live.position_log import read_raw_records
+
+    body = b'{"event":"ORDER","order_seq":"a","action":"ENTRY"}\n{"event":"FILL","order_seq":"b","side":"BUY","qty":1,"action":"ENTRY","net_status":"pending","bot_position_after":1,"net_position_after":null}\n'
+    path = tmp_path / POSITION_LOG_NAME
+    path.write_bytes(b"PARTIAL" + body)
+    seen = []
+
+    class _Handle:
+        def __init__(self, blob):
+            self._blob = blob
+            self._pos = 0
+
+        def seek(self, offset, whence=0):
+            if whence == 2:
+                self._pos = len(self._blob) + offset
+            else:
+                self._pos = offset
+            return self._pos
+
+        def tell(self):
+            return self._pos
+
+        def read(self, n=-1):
+            if n is None or n < 0:
+                chunk = self._blob[self._pos:]
+                self._pos = len(self._blob)
+                return chunk
+            chunk = self._blob[self._pos:self._pos + n]
+            self._pos += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def opener(name):
+        seen.append(name)
+        return _Handle(path.read_bytes())
+
+    rows = read_raw_records(str(path), max_bytes=len(body), opener=opener)
+    assert seen == [str(path)]
+    assert [r["order_seq"] for r in rows] == ["b"]

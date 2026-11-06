@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 
+from scripts.dashboard import fileio
 from src.live.position_log import POSITION_LOG_NAME, is_mismatch, read_records
 
 DEFAULT_LIMIT = 200
@@ -34,7 +35,9 @@ def mask_account(account) -> str:
 def position_log(bot_dir: str, bot_id: str, limit: int = DEFAULT_LIMIT) -> dict:
     path = os.path.join(bot_dir, POSITION_LOG_NAME)
     records = []
-    for rec in read_records(path, clamp_limit(limit), max_bytes=_TAIL_BYTES):
+    for rec in read_records(
+            path, clamp_limit(limit), max_bytes=_TAIL_BYTES,
+            opener=fileio.open_shared):
         view = dict(rec)
         view["account"] = mask_account(view.get("account"))
         view["mismatch"] = is_mismatch(view)
