@@ -611,8 +611,7 @@ def test_issue_252_dashboard_projects_logical_fills_not_the_account_net(tmp_path
         "fill_price", "price_source", "action", "net_position_after",
         "net_status", "bot_position_after", "mismatch",
     }
-    # limit still bounds the response. The early marker is outside a 1-line tail
-    # whose last line is the net snapshot of this fill.
+    # limit is applied to logical rows, so this fill and its net are one record.
     out = position_log_view.position_log(str(bot), "TMF00_alpha", limit=1)
     assert len(out["records"]) == 1
     assert out["records"][0]["order_seq"] == "p1"
@@ -780,3 +779,250 @@ def test_issue_252_accepted_order_glue_survives_restart_into_resume_confirm(tmp_
     exit_fills = [e for e in _events(bot) if e.get("event") == "FILL" and e["order_seq"] == "2520000000002"]
     assert len(exit_fills) == 1
     assert exit_fills[0]["side"] == "SELL" and exit_fills[0]["action"] == "EXIT"
+
+
+# ── issue #254: dashboard limit is logical rows, not a raw-event tail ──
+
+def _view(tmp_path, limit=None):
+    if limit is None:
+        return position_log_view.position_log(str(tmp_path), "TMF00_alpha")
+    return position_log_view.position_log(str(tmp_path), "TMF00_alpha", limit=limit)
+
+
+def test_issue_254_order_only_raw_tail_still_shows_the_pending_fill(tmp_path):
+    """TY repro: limit=2 used to read only the last two ORDER lines and hide s1.
+
+    Orders alone still must not become a fill or a position.
+    """
+    led = _ledger(tmp_path)
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    led.register_order("s2", "exit", 1, 1, "TM0000")
+    led.register_order("s3", "entry", 0, 1, "TXFD0")
+    bare = _view(tmp_path, 2)
+    assert bare["records"] == []
+    assert bare["bot_position"] is None and bare["net_position"] is None
+
+    led2 = _ledger(tmp_path / "filled")
+    led2.register_order("s1", "entry", 0, 1, "TM0000")
+    led2.record_fill("s1", 44774, source="deal", oi_generation=4)
+    led2.register_order("s2", "exit", 1, 1, "TM0000")
+    led2.register_order("s3", "entry", 0, 1, "TXFD0")
+    out = _view(tmp_path / "filled", 2)
+    assert out["bot_position"] == 1
+    assert out["net_position"] is None
+    [rec] = out["records"]
+    assert rec["order_seq"] == "s1"
+    assert rec["action"] == "ENTRY" and rec["side"] == "BUY" and rec["qty"] == 1
+    assert rec["product"] == "TM0000"
+    assert rec["net_status"] == "pending" and rec["net_position_after"] is None
+    assert rec["bot_position_after"] == 1 and rec["fill_price"] == 44774
+    assert rec["account"] == "**********1234"
+    dumped = json.dumps(out)
+    assert ACCT not in dumped
+    assert "TXFD0" not in dumped and '"s2"' not in dumped and '"s3"' not in dumped
+
+
+def test_issue_254_limits_are_logical_rows_across_products(tmp_path):
+    """limit 1, 2, and the default keep logical fills, not the raw ORDER tail.
+
+    A net line cannot move another product's fill, and the account mask
+    stays the last four digits.
+    """
+    led = _ledger(tmp_path)
+    led.register_order("tm", "entry", 0, 1, "TM0000")
+    led.confirm_latest("entry", 101, source="fill_poller", oi_generation=2)
+    assert led.record_fill("tm", 105, source="deal", oi_generation=2) is None
+    led.register_order("tx", "entry", 1, 1, "TXFD0")
+    led.record_fill("tx", 50, source="deal", oi_generation=2)
+    led.on_oi_complete(3, 1)                 # answers both; same generation
+    # Hostile follow-up must not be required: trailing orders are the tail.
+    led.register_order("tail-a", "exit", 0, 1, "TXFD0")
+    led.register_order("tail-b", "entry", 0, 1, "TM0000")
+
+    one = _view(tmp_path, 1)
+    assert [r["order_seq"] for r in one["records"]] == ["tx"]
+    assert one["records"][0]["product"] == "TXFD0"
+    assert one["records"][0]["side"] == "SELL"
+    assert one["records"][0]["fill_price"] == 50
+    assert one["bot_position"] == 0
+    assert one["records"][0]["bot_position_after"] == 0
+    assert "TM0000" not in json.dumps(one["records"])
+
+    two = _view(tmp_path, 2)
+    assert [(r["order_seq"], r["product"], r["fill_price"], r["bot_position_after"])
+            for r in two["records"]] == [
+        ("tm", "TM0000", 105, 1),
+        ("tx", "TXFD0", 50, 0),
+    ]
+    assert two["records"][0]["price_source"] == "deal"
+    assert two["records"][0]["net_status"] == "answered"
+    assert two["records"][0]["net_position_after"] == 1
+    assert two["records"][1]["net_status"] == "answered"
+    assert two["bot_position"] == 0 and two["net_position"] == 1
+    assert two["records"][0]["account"] == position_log_view.mask_account(ACCT)
+    assert ACCT not in json.dumps(two)
+    assert "tail-a" not in json.dumps(two) and "tail-b" not in json.dumps(two)
+
+    full = _view(tmp_path)
+    assert [r["order_seq"] for r in full["records"]] == ["tm", "tx"]
+    assert full["count"] == 2
+
+
+def test_issue_254_default_limit_ignores_a_long_order_tail(tmp_path):
+    """More trailing ORDER lines than the default raw cap must not drop the fill."""
+    led = _ledger(tmp_path)
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    led.record_fill("s1", 100, source="deal", oi_generation=1)
+    for i in range(position_log_view.DEFAULT_LIMIT + 1):
+        led.register_order(f"o{i}", "entry", 0, 1, "TXFD0")
+    out = _view(tmp_path)
+    assert [r["order_seq"] for r in out["records"]] == ["s1"]
+    assert out["bot_position"] == 1
+    assert out["records"][0]["net_status"] == "pending"
+    assert out["records"][0]["product"] == "TM0000"
+    assert "TXFD0" not in json.dumps(out)
+
+
+def test_issue_254_net_update_correlates_outside_the_raw_tail(tmp_path):
+    """FILL and its NET_UPDATE merge even when the raw tail is later ORDER lines.
+
+    The net line's product and bot_position must not replace the fill's.
+    """
+    bot = tmp_path / "bot"
+    bot.mkdir()
+    fill = {
+        "event": "FILL", "ts": "2026-11-05T20:00:00+08:00", "bot_id": "TMF00_alpha",
+        "account": ACCT, "product": "TM0000", "order_seq": "s1", "side": "BUY",
+        "qty": 1, "fill_price": 100, "price_source": "deal", "action": "ENTRY",
+        "net_position_after": None, "net_status": "pending", "bot_position_after": 1,
+        "oi_generation": 3,
+    }
+    net = {
+        "event": "NET_UPDATE", "ts": "2026-11-05T20:00:30+08:00", "bot_id": "TMF00_alpha",
+        "account": ACCT, "product": "TXFD0", "order_seq": "s1", "side": "SELL",
+        "qty": 9, "fill_price": 100, "price_source": "deal", "action": "ENTRY",
+        "net_position_after": 5, "net_status": "answered", "bot_position_after": 99,
+    }
+    orders = [
+        {"event": "ORDER", "order_seq": "s2", "action": "EXIT", "action_type": "exit",
+         "side": "SELL", "qty": 1, "product": "TXFD0", "account": ACCT},
+        {"event": "ORDER", "order_seq": "s3", "action": "ENTRY", "action_type": "entry",
+         "side": "BUY", "qty": 1, "product": "TXFD0", "account": ACCT},
+    ]
+    lines = [fill, net, *orders]
+    (bot / POSITION_LOG_NAME).write_text(
+        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in lines),
+        encoding="utf-8")
+    out = _view(bot, 1)
+    assert out["bot_position"] == 1 and out["net_position"] == 5
+    [rec] = out["records"]
+    assert rec["order_seq"] == "s1" and rec["product"] == "TM0000"
+    assert rec["side"] == "BUY" and rec["qty"] == 1
+    assert rec["bot_position_after"] == 1 and rec["net_position_after"] == 5
+    assert rec["net_status"] == "answered" and rec["ts"] == "2026-11-05T20:00:00+08:00"
+    assert rec["account"] == "**********1234"
+    assert "TXFD0" not in json.dumps(out)
+    assert ACCT not in json.dumps(out)
+
+
+def test_issue_254_legacy_lines_survive_an_order_tail(tmp_path):
+    """Finalized ENTRY/EXIT/RESUME stay the logical rows. Later ORDERs add none."""
+    original = _write_legacy(tmp_path)
+    led = _reopen(tmp_path)
+    led.register_order("n1", "entry", 0, 1, "TXFD0")
+    led.register_order("n2", "exit", 1, 1, "TXFD0")
+    assert (tmp_path / POSITION_LOG_NAME).read_text(encoding="utf-8").startswith(original)
+
+    one = _view(tmp_path, 1)
+    assert [r["action"] for r in one["records"]] == ["RESUME"]
+    assert one["bot_position"] == 0 and one["net_position"] == 0
+    assert one["records"][0]["order_seq"] == ""
+
+    two = _view(tmp_path, 2)
+    assert [(r["action"], r["order_seq"], r["product"], r["bot_position_after"],
+             r["net_position_after"]) for r in two["records"]] == [
+        ("EXIT", "leg-sell", "TM0000", 0, 0),
+        ("RESUME", "", "TM0000", 0, 0),
+    ]
+    assert two["records"][0]["fill_price"] == 44622
+    assert "TXFD0" not in json.dumps(two)
+    assert "n1" not in json.dumps(two) and "n2" not in json.dumps(two)
+
+    full = _view(tmp_path)
+    assert [r["action"] for r in full["records"]] == ["ENTRY", "EXIT", "RESUME"]
+    assert [(r["order_seq"], r["bot_position_after"], r["net_position_after"], r["product"])
+            for r in full["records"]] == [
+        (row["order_seq"], row["bot_position_after"], row["net_position_after"], row["product"])
+        for row in _LEGACY
+    ]
+    assert full["records"][0]["account"] == "**********1234"
+    assert ACCT not in json.dumps(full)
+
+
+def test_issue_254_byte_window_projects_before_it_limits(tmp_path):
+    """A byte cap drops events outside the window. Inside it, limit is logical."""
+    from src.live.position_log import read_records
+
+    def line(obj):
+        return json.dumps(obj, separators=(",", ":"))
+
+    early = line({
+        "event": "FILL", "ts": "2026-11-05T19:00:00+08:00", "bot_id": "TMF00_alpha",
+        "account": ACCT, "product": "TM0000", "order_seq": "early", "side": "BUY",
+        "qty": 1, "fill_price": 1, "price_source": "deal", "action": "ENTRY",
+        "net_position_after": None, "net_status": "pending", "bot_position_after": 1,
+    })
+    late = line({
+        "event": "FILL", "ts": "2026-11-05T20:00:00+08:00", "bot_id": "TMF00_alpha",
+        "account": ACCT, "product": "TXFD0", "order_seq": "late", "side": "SELL",
+        "qty": 1, "fill_price": 50, "price_source": "fill_poller", "action": "ENTRY",
+        "net_position_after": None, "net_status": "pending", "bot_position_after": -1,
+    })
+    refine = line({
+        "event": "FILL_REFINE", "order_seq": "late", "fill_price": 55,
+        "price_source": "deal",
+    })
+    net = line({
+        "event": "NET_UPDATE", "ts": "2026-11-05T20:00:30+08:00", "bot_id": "TMF00_alpha",
+        "account": ACCT, "product": "TM0000", "order_seq": "late", "side": "BUY",
+        "qty": 4, "fill_price": 55, "price_source": "deal", "action": "ENTRY",
+        "net_position_after": 3, "net_status": "answered", "bot_position_after": 99,
+    })
+    order = line({
+        "event": "ORDER", "order_seq": "after", "action": "EXIT", "side": "BUY",
+        "qty": 1, "product": "TM0000", "account": ACCT,
+    })
+    pad = "\n".join(line({
+        "event": "ORDER", "order_seq": f"pad{i}", "action": "ENTRY", "side": "BUY",
+        "qty": 1, "product": "TM0000",
+    }) for i in range(30))
+    path = tmp_path / POSITION_LOG_NAME
+    path.write_text(early + "\n" + pad + "\n" + late + "\n" + refine + "\n" + net + "\n" + order + "\n",
+                    encoding="utf-8")
+    tail = (late + "\n" + refine + "\n" + net + "\n" + order + "\n").encode()
+    window = read_records(str(path), 2, max_bytes=len(tail) + 8)
+    assert [r["order_seq"] for r in window] == ["late"]
+    assert window[0]["product"] == "TXFD0"
+    assert window[0]["side"] == "SELL" and window[0]["qty"] == 1
+    assert window[0]["fill_price"] == 55 and window[0]["price_source"] == "deal"
+    assert window[0]["bot_position_after"] == -1
+    assert window[0]["net_position_after"] == 3 and window[0]["net_status"] == "answered"
+    whole = read_records(str(path), 5)
+    assert [r["order_seq"] for r in whole] == ["early", "late"]
+
+
+def test_issue_254_dashboard_read_uses_the_byte_bound(tmp_path, monkeypatch):
+    """The page must not scan an unbounded journal, and must not raw-tail it."""
+    seen = {}
+    real = position_log_view.read_records
+
+    def wrapped(path, limit=None, **kwargs):
+        seen["limit"] = limit
+        seen["max_bytes"] = kwargs.get("max_bytes")
+        return real(path, limit, **kwargs)
+
+    monkeypatch.setattr(position_log_view, "read_records", wrapped)
+    out = _view(tmp_path, 2)
+    assert out["records"] == [] and out["bot_position"] is None
+    assert seen["limit"] == 2
+    assert seen["max_bytes"] == position_log_view._TAIL_BYTES

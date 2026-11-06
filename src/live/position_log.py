@@ -448,23 +448,41 @@ class PositionLedger:
 
 # ── reading ────────────────────────────────────────────────────────────
 
-def read_raw_records(path: str) -> list[dict]:
-    """Journal events oldest-first. Unparseable lines are skipped."""
-    out = []
+def read_raw_records(path: str, *, max_bytes: int | None = None) -> list[dict]:
+    """Journal events oldest-first. Unparseable lines are skipped.
+
+    ``max_bytes`` reads only the tail of a large file. A partial first
+    line caused by that seek is dropped. ``None`` reads the whole file,
+    which is what ledger replay uses.
+    """
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(rec, dict):
-                    out.append(rec)
+        if max_bytes is None:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+            truncated = False
+        else:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max(0, int(max_bytes))))
+                blob = f.read()
+            truncated = size > len(blob)
+            lines = blob.decode("utf-8", errors="replace").splitlines()
     except OSError:
         return []
+    if truncated and lines:
+        lines = lines[1:]
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
     return out
 
 
@@ -524,9 +542,16 @@ def project_logical_records(rows: list) -> list[dict]:
     return logical
 
 
-def read_records(path: str, limit: int | None = None) -> list[dict]:
-    """Logical records oldest-first. Unparseable lines are skipped."""
-    logical = project_logical_records(read_raw_records(path))
+def read_records(path: str, limit: int | None = None, *,
+                 max_bytes: int | None = None) -> list[dict]:
+    """Logical records oldest-first.
+
+    Every event in the read window is projected first. ``limit`` then
+    keeps the last that many logical rows. It is not a count of raw
+    journal lines, so trailing ORDER events do not hide an earlier fill.
+    ``max_bytes`` bounds a large file to its tail; ``None`` reads it all.
+    """
+    logical = project_logical_records(read_raw_records(path, max_bytes=max_bytes))
     return logical[-limit:] if limit else logical
 
 
