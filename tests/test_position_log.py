@@ -1248,6 +1248,36 @@ def test_issue_254_read_and_replay_do_not_rewrite_the_journal(tmp_path):
         "s", "leg"]
 
 
+# Full SHA of the #250 reader. A shallow checkout does not have this object
+# until it is fetched. The ref is temporary and is not checked out.
+_V250_SHA = "49268a08796bf1572a5a9e30dfa83a845cc8582b"
+_V250_REF = "refs/temp/tai-robot-49268a0"
+
+
+def _ensure_v250_object(root: str) -> None:
+    """Fetch only 49268a0 into a temporary ref when the blob is missing."""
+    import subprocess
+
+    spec = f"{_V250_SHA}:src/live/position_log.py"
+    probe = subprocess.run(
+        ["git", "cat-file", "-e", spec],
+        cwd=root, capture_output=True)
+    if probe.returncode == 0:
+        return
+    fetched = subprocess.run(
+        ["git", "fetch", "--depth=1", "origin", f"{_V250_SHA}:{_V250_REF}"],
+        cwd=root, capture_output=True, text=True)
+    if fetched.returncode != 0:
+        raise AssertionError(
+            "could not fetch 49268a0 into a temporary ref:\n"
+            + fetched.stderr)
+    again = subprocess.run(
+        ["git", "cat-file", "-e", spec],
+        cwd=root, capture_output=True, text=True)
+    if again.returncode != 0:
+        raise AssertionError("49268a0 is still missing after the fetch")
+
+
 def _v250_module():
     """The unchanged position-log module from 49268a0.
 
@@ -1264,8 +1294,9 @@ def _v250_module():
     if cached is not None:
         return cached
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _ensure_v250_object(root)
     blob = subprocess.check_output(
-        ["git", "show", "49268a0:src/live/position_log.py"], cwd=root)
+        ["git", "show", f"{_V250_SHA}:src/live/position_log.py"], cwd=root)
     fd, path = tempfile.mkstemp(suffix=".py")
     os.write(fd, blob)
     os.close(fd)
@@ -1323,6 +1354,39 @@ def test_issue_254_v250_reader_keeps_position_behind_new_tails(tmp_path):
     view = position_log_view.position_log(str(filled), "TMF00_alpha")
     assert [r["order_seq"] for r in view["records"] if r["action"] == "ENTRY"] == ["s1"]
     assert view["bot_position"] == 1
+
+
+def test_issue_254_failed_anchor_append_is_not_a_successful_old_reader_line(tmp_path):
+    """The event line and the #250 anchor are two appends.
+
+    If the second append fails, the order line remains and the anchor does
+    not. The #250 reader then still sees no bot_position_after. This test
+    records that gap. It does not claim the second write cannot fail.
+    """
+    led = _ledger(tmp_path)
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    led.record_fill("s1", 100, source="deal", oi_generation=4)
+    real = led._append_line
+    calls = {"n": 0}
+
+    def flaky(record):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real(record)
+        return False
+
+    led._append_line = flaky
+    led.register_order("s2", "exit", 1, 1, "TM0000")
+    assert calls["n"] == 2
+    assert _events(tmp_path)[-1]["event"] == "ORDER"
+    assert "bot_position_after" not in _events(tmp_path)[-1]
+    assert _v250_resume_position(str(tmp_path / POSITION_LOG_NAME)) == 0
+    assert "s2" in led._orders
+    led._append_line = real
+    led.register_order("s3", "entry", 0, 1, "TM0000")
+    assert _events(tmp_path)[-1].get("event") is None
+    assert _events(tmp_path)[-1]["bot_position_after"] == 1
+    assert _v250_resume_position(str(tmp_path / POSITION_LOG_NAME)) == 1
 
 
 def test_issue_254_resume_inputs_fail_after_the_journal_is_loaded(tmp_path, monkeypatch):
