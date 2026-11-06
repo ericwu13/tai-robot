@@ -1,26 +1,19 @@
 """``GET /position-log/<bot_id>`` — the bot's own position log, read-only.
 
-Reads ``<bot_dir>/position_log.jsonl`` (written by
-``src/live/position_log.py``) through ``fileio`` so the bot's appends are
-never blocked. Raw journal events are projected to the logical #250
-record before they leave this process. ``bot_position`` is that record's
-``bot_position_after`` (the bot's own fills), never the account net.
-The account number is masked to its last 4 digits, as the dashboard does
+Reads at most ``_TAIL_BYTES`` from the end of
+``<bot_dir>/position_log.jsonl`` via :func:`read_records`. Every event in
+that window is projected to a logical #250 record, and ``limit`` then
+keeps the last that many logical rows. Trailing ORDER lines do not hide
+an earlier fill that is still inside the window. ``bot_position`` is
+``bot_position_after`` from those fills, never the account net. The
+account number is masked to its last 4 digits, as the dashboard does
 everywhere else.
-
-The byte cap and ``limit`` still bound the raw tail. A one-line tail is
-the last raw event; a net update carries the fill's public fields so that
-line still projects to the fill.
 """
 from __future__ import annotations
 
-import json
 import os
 
-from scripts.dashboard import fileio
-from src.live.position_log import (
-    POSITION_LOG_NAME, is_mismatch, project_logical_records,
-)
+from src.live.position_log import POSITION_LOG_NAME, is_mismatch, read_records
 
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 2000
@@ -40,19 +33,8 @@ def mask_account(account) -> str:
 
 def position_log(bot_dir: str, bot_id: str, limit: int = DEFAULT_LIMIT) -> dict:
     path = os.path.join(bot_dir, POSITION_LOG_NAME)
-    raw = []
-    for line in fileio.tail_lines(path, clamp_limit(limit), _TAIL_BYTES):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict):
-            raw.append(rec)
     records = []
-    for rec in project_logical_records(raw):
+    for rec in read_records(path, clamp_limit(limit), max_bytes=_TAIL_BYTES):
         view = dict(rec)
         view["account"] = mask_account(view.get("account"))
         view["mismatch"] = is_mismatch(view)
