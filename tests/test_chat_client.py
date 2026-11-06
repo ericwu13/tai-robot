@@ -9,6 +9,7 @@ import os
 
 from src.ai.chat_client import (
     ChatClient,
+    DEFAULT_MODELS,
     PROVIDER_ANTHROPIC,
     PROVIDER_GOOGLE,
     GOOGLE_MODEL_FLASH,
@@ -275,6 +276,65 @@ class TestGoogleSendMessage:
         assert contents[1]["role"] == "model"
         assert contents[2]["role"] == "user"
 
+    def test_multiturn_replays_text_without_thought_signature(self):
+        """3.8-flash may put thoughtSignature on a text part.
+
+        This path does not use function calling, so that signature is not
+        required on the next turn and must not be invented. History stays
+        text parts only: no signature, tools, or sampling parameters.
+        """
+        client = self._make_client()
+        client._client = MagicMock()
+
+        signed = MagicMock()
+        signed.status_code = 200
+        signed.json.return_value = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "First answer",
+                        "thoughtSignature": "sig-from-model",
+                    }],
+                },
+                "finishReason": "STOP",
+            }],
+        }
+        signed.text = json.dumps(signed.json.return_value)
+        client._client.post.side_effect = [
+            signed,
+            _google_response("Second answer"),
+        ]
+
+        client.send_message("msg1")
+        client.send_message("msg2")
+
+        assert client.conversation[1] == {
+            "role": "assistant", "content": "First answer",
+        }
+
+        second = client._client.post.call_args_list[1]
+        url = second.args[0]
+        payload = second.kwargs["json"]
+        headers = second.kwargs["headers"]
+
+        assert "gemini-3.8-flash" in url
+        assert ":generateContent" in url
+        assert headers == {"content-type": "application/json"}
+        assert "tools" not in payload
+        assert "toolConfig" not in payload
+        assert payload["contents"] == [
+            {"role": "user", "parts": [{"text": "msg1"}]},
+            {"role": "model", "parts": [{"text": "First answer"}]},
+            {"role": "user", "parts": [{"text": "msg2"}]},
+        ]
+        assert forbidden_gemini_keys(payload) == []
+        assert set(payload["generationConfig"]) == {"maxOutputTokens"}
+        dumped = json.dumps(payload)
+        assert "thoughtSignature" not in dumped
+        assert "thought_signature" not in dumped
+        assert "functionCall" not in dumped
+        assert "functionResponse" not in dumped
+
     def test_system_instruction_sent(self):
         client = self._make_client()
         client._client = MagicMock()
@@ -383,7 +443,8 @@ class TestChatClientGeneral:
 
     def test_default_model_google(self):
         client = ChatClient(api_key="test", provider=PROVIDER_GOOGLE)
-        assert "gemini" in client.model
+        assert client.model == "gemini-3.8-flash"
+        assert DEFAULT_MODELS[PROVIDER_GOOGLE] == "gemini-3.8-flash"
 
     def test_custom_model(self):
         client = ChatClient(api_key="test", model="custom-model-v1")
@@ -411,8 +472,9 @@ class TestModelForTier:
         assert model_for_tier(PROVIDER_GOOGLE, "light", ultra_mode=True) == GOOGLE_MODEL_FLASH
 
     def test_heavy_standard_returns_pro(self):
-        assert model_for_tier(PROVIDER_GOOGLE, "heavy") == GOOGLE_MODEL_PRO
-        assert model_for_tier(PROVIDER_GOOGLE, "heavy", ultra_mode=False) == GOOGLE_MODEL_PRO
+        assert GOOGLE_MODEL_PRO == "gemini-3.8-flash"
+        assert model_for_tier(PROVIDER_GOOGLE, "heavy") == "gemini-3.8-flash"
+        assert model_for_tier(PROVIDER_GOOGLE, "heavy", ultra_mode=False) == "gemini-3.8-flash"
 
     def test_heavy_with_ultra_mode_returns_ultra(self):
         assert model_for_tier(PROVIDER_GOOGLE, "heavy", ultra_mode=True) == GOOGLE_MODEL_ULTRA
@@ -473,6 +535,9 @@ class TestClassifyModel:
 
     def test_pro_standard(self):
         assert _classify_model("gemini-2.5-pro") == ("pro", "standard")
+
+    def test_heavy_default_classifies_as_flash(self):
+        assert _classify_model(GOOGLE_MODEL_PRO) == ("flash", "standard")
 
     def test_ultra_model(self):
         # The ultra model still has "pro" in its name; mode disambiguates.
