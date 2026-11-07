@@ -320,8 +320,9 @@ def test_trading_day_pnl_label_is_ben_jiaoyi_ri(live_server):
     page = body.decode("utf-8")
     # 4 simulated + the real-order tile, + 7 from the 本交易日實單 fleet column
     # and the trade-list day grouping (header, tooltip, cell title, group
-    # header, empty-day note, and two source comments).
-    assert page.count("本交易日") == 12
+    # header, empty-day note, and two source comments), + 2 from the 損益走勢
+    # chart (the current-session marker and the trade-table source comment).
+    assert page.count("本交易日") == 14
     assert 'title="自最近一次夜盤開盤（15:00）起">本交易日</th>' in page
     assert 'tile("本交易日實單"' in page
     assert ">本交易日實單</th>" in page         # the fleet column uses the same window
