@@ -10,6 +10,7 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
     GET /api/bars?id=<dir>[&before=YYYYMMDD|&after=YYYYMMDD][&days=N]
                                  stitched 1-min candles + trade markers
     GET /api/news[?session=&source=&min=&max=&limit=]
+    GET /api/news/pulse   (市場脈動: threshold gauge, votes, events, runs, drivers)
                                  W3 RSS scorer per-article history (新聞訊號)
     GET /position-log/<bot_id>[?limit=N]
                                  the bot's own fill-by-fill position vs the
@@ -49,7 +50,8 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from scripts.dashboard import control, news_feed, position_log_view, snapshot  # noqa: E402
+from scripts.dashboard import (  # noqa: E402
+    control, news_feed, news_pulse, position_log_view, snapshot)
 from scripts.news_bridge import rss_news_log  # noqa: E402
 from scripts.monitor.common import default_base_dir, now_tpe  # noqa: E402
 
@@ -310,6 +312,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 body = self.cache.get(key, lambda: _json(
                     news_feed.news_feed(self.news_log_path, filters)))
                 self._send(200, body, "application/json; charset=utf-8")
+            elif url.path == "/api/news/pulse":
+                body = self.cache.get("news-pulse", lambda: _json(news_pulse.pulse(
+                    now_tpe(), self.news_log_path, self.news_paths,
+                    snapshot._read_json_dict)))
+                self._send(200, body, "application/json; charset=utf-8")
             else:
                 self._send(404, b"not found", "text/plain; charset=utf-8")
         except (BrokenPipeError, ConnectionResetError):
@@ -336,7 +343,8 @@ def tailscale_ipv4() -> str | None:
     return None
 
 
-NEWS_PATH_KEYS = ("regime_vote_path", "signal_path", "rss_state_file", "rss_news_log")
+NEWS_PATH_KEYS = ("regime_vote_path", "signal_path", "rss_state_file", "rss_news_log",
+                  "events_path")
 
 
 def load_news_paths(settings_path: str) -> dict | None:

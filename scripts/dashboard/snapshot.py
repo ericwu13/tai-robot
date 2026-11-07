@@ -901,6 +901,7 @@ def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
                             "vote": st.vote, "vote_expired": st.vote_expired,
                             "vote_target": st.vote_target, "known": st.known,
                             "stale": st.stale, "last_check": st.last_check[:16].replace("T", " "),
+                            "failing": st.failing, "error": redact_line(st.error),
                             "context": redact_line(st.context)})
     feats = state.get("last_features") if isinstance(state.get("last_features"), dict) else {}
     news = sess.get("news") if isinstance(sess.get("news"), dict) else {}

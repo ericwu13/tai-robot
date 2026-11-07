@@ -158,6 +158,16 @@ def load_events(path: str | os.PathLike | None) -> tuple[list[EventEntry], str]:
     except (OSError, ValueError) as e:
         return [], f"malformed events file: {e}"
 
+    return parse_events(data)
+
+
+def parse_events(data: object) -> tuple[list[EventEntry], str]:
+    """An already-read events.json document → ``(events, error_reason)``.
+
+    Same contract as :func:`load_events`; split out so a reader that must
+    open the file its own way (the dashboard's share-delete read, which
+    never blocks W1's ``os.replace``) parses it identically.
+    """
     if not isinstance(data, dict):
         return [], "events file root is not a JSON object"
 

@@ -81,6 +81,14 @@ def _check_votes(now, paths, tonight_key, lines, findings):
                 f"{st.source} bridge stale (last_check {st.last_check or '?'}, "
                 f"threshold {STALE_AFTER_H.get(st.source, 24.0):g}h)",
                 paths["regime_vote_path"]))
+        elif st.failing:
+            # Alive (last_check fresh) but every recent scoring call failed:
+            # the vote silently stops.  Discord no longer posts each run.
+            findings.append(Finding(
+                "P2", "bridge",
+                f"{st.source} alive but scoring failing for {st.error_streak} "
+                f"run(s): {st.error}",
+                paths["rss_state_file"] if st.source == "W3" else paths["regime_vote_path"]))
         elif not st.known:
             findings.append(Finding(
                 "P3", "bridge",

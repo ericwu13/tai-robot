@@ -5394,7 +5394,7 @@ class BacktestApp:
         for i, st in enumerate(report.sources, start=1):
             if not st.known:
                 dot_state = "off"
-            elif st.stale:
+            elif st.stale or st.failing:
                 dot_state = "err"
             else:
                 dot_state = "ok"

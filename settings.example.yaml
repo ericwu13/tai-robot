@@ -390,6 +390,10 @@ news:
   rss_state_file: "data/rss_scorer_state.json"
   rss_news_log: ""                # W3 per-article history (JSONL) for the dashboard's 新聞訊號 view;
                                   #   empty = news/news_log.jsonl beside rss_state_file
+  rss_discord: errors             # what W3 posts to discord_webhook — the dashboard's
+                                  #   新聞訊號 view replaces the per-run embed:
+                                  #   off | errors (Gemini failing / recovered) |
+                                  #   changes (errors + vote written) | all (legacy per-run)
   discord_webhook: ""             # Discord webhook URL for W2/W3 bridge alerts
 
 # ── Regime switching ───────────────────────────────────────────────────

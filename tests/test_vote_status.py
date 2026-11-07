@@ -208,3 +208,31 @@ def test_consumed_votes_line():
     line = consumed_votes_line({"_vote_sources": ["W3:trending-up"],
                                 "_vote_accelerated": False})
     assert "accelerated" not in line
+
+
+def test_w3_fresh_but_failing_is_flagged(tmp_path):
+    """last_check is stamped even when every Gemini call failed — the
+    persisted error_streak is what tells "alive" from "scoring"."""
+    vote_p, sig_p, rss_p = _paths(tmp_path)
+    _write(Path(rss_p), {
+        "last_check": (NOW - timedelta(minutes=10)).isoformat(timespec="seconds"),
+        "session_net": 0.4, "error_streak": 3,
+        "last_error": "HTTP 404: model not found",
+        "last_error_at": (NOW - timedelta(minutes=10)).isoformat(timespec="seconds")})
+    w3 = next(s for s in collect_vote_status(vote_p, sig_p, rss_p, TONIGHT, NOW).sources
+              if s.source == "W3")
+    assert not w3.stale
+    assert w3.failing and w3.error_streak == 3
+    assert w3.error == "HTTP 404: model not found"
+    assert w3.context.startswith("⚠ 評分失敗")
+    assert "session net +0.40" in w3.context
+
+
+def test_w3_recovered_is_not_failing(tmp_path):
+    vote_p, sig_p, rss_p = _paths(tmp_path)
+    _write(Path(rss_p), {
+        "last_check": (NOW - timedelta(minutes=10)).isoformat(timespec="seconds"),
+        "error_streak": 0, "last_error": "HTTP 429: old"})
+    w3 = next(s for s in collect_vote_status(vote_p, sig_p, rss_p, TONIGHT, NOW).sources
+              if s.source == "W3")
+    assert not w3.failing and w3.error == ""

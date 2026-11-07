@@ -349,7 +349,7 @@ class TestCheckOnce:
         assert "last_check" in state
 
 
-# ── Embed gating: post only when something changed ───────────────────────
+# ── Embed gating, legacy ``rss_discord: all``: every scored run posts ─────
 
 class TestEmbedGating:
     def _cfg(self):
@@ -359,6 +359,7 @@ class TestEmbedGating:
             "state_file": "data/state.json",
             "gemini_api_key": "fake-key",
             "discord_webhook_url": "https://discord.example/webhook",
+            "discord_mode": "all",
         }
 
     @patch("rss_scorer.post_discord_embed")
@@ -665,9 +666,166 @@ class TestGeminiAPIError:
         mock_feeds.return_value = [_make_article("c1", "News")]
         mock_score.return_value = {"direction": "neutral", "confidence": 0.2, "reason": "x"}
 
-        rss_scorer.check_once(
-            self._cfg(webhook="https://discord.example/webhook"),
-            {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        cfg = self._cfg(webhook="https://discord.example/webhook")
+        cfg["discord_mode"] = "all"
+        rss_scorer.check_once(cfg, {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
 
         kwargs = mock_embed.call_args.kwargs
         assert kwargs.get("api_error") is None
+
+
+# ── news.rss_discord: the dashboard replaces the per-run embed ───────────
+
+class TestDiscordModeSetting:
+    @pytest.mark.parametrize("raw,mode", [
+        (None, "errors"), ("", "errors"), (False, "off"), ("off", "off"),
+        ("ERRORS", "errors"), (" changes ", "changes"), ("all", "all"),
+        ("bogus", "errors"), (True, "errors"),
+    ])
+    def test_parse(self, raw, mode):
+        assert rss_scorer.discord_mode(raw) == mode
+
+    def test_news_config_reads_setting(self):
+        cfg = rss_scorer.get_news_config({"news": {"rss_discord": "changes"}})
+        assert cfg["discord_mode"] == "changes"
+        assert rss_scorer.get_news_config({})["discord_mode"] == "errors"
+
+
+def _bull_articles(prefix, n=4):
+    return [_make_article(f"{prefix}{i}", f"Rally {prefix}{i}") for i in range(n)]
+
+
+_BULL = {"direction": "bullish", "confidence": 1.0, "reason": "surge"}
+_NEUTRAL = {"direction": "neutral", "confidence": 0.2, "reason": "x"}
+
+
+class TestDiscordModes:
+    def _cfg(self, mode):
+        return {
+            "feeds": ["https://example.com/rss"],
+            "interval_minutes": 30,
+            "state_file": "data/state.json",
+            "gemini_api_key": "fake-key",
+            "discord_webhook_url": "https://discord.example/webhook",
+            "discord_mode": mode,
+        }
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_errors_mode_routine_run_is_silent(self, mock_score, mock_feeds, mock_embed,
+                                               tmp_vote):
+        mock_feeds.return_value = _bull_articles("r")
+        mock_score.return_value = _BULL
+        state = rss_scorer.check_once(self._cfg("errors"), {"seen_guids": []}, tmp_vote,
+                                      now=_WEEKDAY_EVE)
+        assert mock_embed.call_count == 0
+        assert os.path.exists(_w3_path(tmp_vote))   # the vote itself still fires
+        assert state["error_streak"] == 0
+        assert state["last_success_at"].startswith("2026-08-04T20:00")
+        assert state["last_fetched"] == 4 and state["last_new"] == 4
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_error_posts_once_then_recovery_once(self, mock_score, mock_feeds, mock_embed,
+                                                 tmp_vote):
+        cfg = self._cfg("errors")
+        mock_feeds.return_value = [_make_article("x1", "News")]
+        mock_score.side_effect = rss_scorer.GeminiAPIError(404, "model not found")
+        state = rss_scorer.check_once(cfg, {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        assert mock_embed.call_count == 1
+        assert mock_embed.call_args.kwargs["api_error"] == "HTTP 404: model not found"
+        # Persisted: last_check alone would claim W3 is healthy.
+        assert state["error_streak"] == 1
+        assert state["last_error"] == "HTTP 404: model not found"
+        assert state["last_error_at"].startswith("2026-08-04T20:00")
+        assert "last_success_at" not in state
+
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(minutes=30))
+        assert mock_embed.call_count == 1            # still failing: no repeat
+        assert state["error_streak"] == 2
+
+        mock_score.side_effect = None
+        mock_score.return_value = _NEUTRAL
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(minutes=60))
+        assert mock_embed.call_count == 2
+        assert "recovered" in mock_embed.call_args.kwargs["note"]
+        assert state["error_streak"] == 0
+        assert state["error_notified"] is False
+        assert state["last_error"] == "HTTP 404: model not found"   # kept for history
+
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(minutes=90))
+        assert mock_embed.call_count == 2
+
+    @patch("rss_scorer.post_discord_embed", return_value=False)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_failed_error_send_is_retried(self, mock_score, mock_feeds, mock_embed, tmp_vote):
+        cfg = self._cfg("errors")
+        mock_feeds.return_value = [_make_article("y1", "News")]
+        mock_score.side_effect = rss_scorer.GeminiAPIError(429, "rate limited")
+        state = rss_scorer.check_once(cfg, {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        assert not state.get("error_notified")
+        rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE + timedelta(minutes=30))
+        assert mock_embed.call_count == 2
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_off_mode_never_posts_but_still_records(self, mock_score, mock_feeds,
+                                                    mock_embed, tmp_vote):
+        mock_feeds.return_value = [_make_article("z1", "News")]
+        mock_score.side_effect = rss_scorer.GeminiAPIError(429, "rate limited")
+        state = rss_scorer.check_once(self._cfg("off"), {"seen_guids": []}, tmp_vote,
+                                      now=_WEEKDAY_EVE)
+        assert mock_embed.call_count == 0
+        assert state["error_streak"] == 1
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_changes_mode_posts_vote_once_per_session(self, mock_score, mock_feeds,
+                                                      mock_embed, tmp_vote):
+        cfg = self._cfg("changes")
+        mock_score.return_value = _BULL
+        mock_feeds.return_value = _bull_articles("a")
+        state = rss_scorer.check_once(cfg, {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        assert mock_embed.call_count == 1
+        assert mock_embed.call_args.args[1] == "trending-up"
+        mock_feeds.return_value = _bull_articles("b")
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=_WEEKDAY_EVE + timedelta(minutes=30))
+        assert mock_embed.call_count == 1            # same session, same direction
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_errors_mode_does_not_post_votes(self, mock_score, mock_feeds, mock_embed,
+                                             tmp_vote):
+        mock_score.return_value = _BULL
+        mock_feeds.return_value = _bull_articles("c")
+        rss_scorer.check_once(self._cfg("errors"), {"seen_guids": []}, tmp_vote,
+                              now=_WEEKDAY_EVE)
+        assert mock_embed.call_count == 0
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    def test_weekend_notice_only_in_all_mode(self, mock_feeds, mock_embed, tmp_vote):
+        saturday = datetime(2026, 8, 8, 10, 0, tzinfo=_TPE)
+        for mode in ("off", "errors", "changes"):
+            rss_scorer.check_once(self._cfg(mode), {"seen_guids": []}, tmp_vote, now=saturday)
+        assert mock_embed.call_count == 0
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_skipped_count_recorded(self, mock_score, mock_feeds, tmp_vote):
+        mock_feeds.return_value = [_make_article("s1", "A"), _make_article("s2", "B")]
+        mock_score.side_effect = [_NEUTRAL, None]       # unparseable reply = skipped
+        state = rss_scorer.check_once(self._cfg("off"), {"seen_guids": []}, tmp_vote,
+                                      now=_WEEKDAY_EVE)
+        assert state["last_skipped"] == 1
+        assert state["last_articles_scored"] == 1

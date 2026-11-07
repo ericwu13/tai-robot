@@ -122,7 +122,8 @@ def news_feed(path: str | None, filters: dict | None = None) -> dict:
     if not path:
         return {"available": False, "reason": "no_settings", "items": [],
                 "sessions": [], "sources": [], "total": 0, "matched": 0,
-                "summary": {"bullish": 0, "bearish": 0, "neutral": 0, "net": 0.0},
+                "summary": {"bullish": 0, "bearish": 0, "neutral": 0, "net": 0.0,
+                            "net_clipped": 0.0},
                 "latest": None}
     items = read_items(path)
     latest = None
@@ -162,6 +163,9 @@ def news_feed(path: str | None, filters: dict | None = None) -> dict:
             "bearish": sum(1 for r in matched if r["direction"] == "bearish"),
             "neutral": sum(1 for r in matched if r["direction"] == "neutral"),
             "net": round(sum(r["score"] for r in matched), 3),
+            # What the vote actually sums: each article clipped to ±0.5
+            # (rss_scorer.aggregate_scores), before the per-run EMA decay.
+            "net_clipped": round(sum(max(-0.5, min(0.5, r["score"])) for r in matched), 3),
         },
         "latest": latest,
     }
