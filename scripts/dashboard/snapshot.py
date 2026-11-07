@@ -975,6 +975,11 @@ def bot_detail(now: datetime, bot_dir: str, *, pid_alive_fn=pid_alive,
     summary = bot_summary(now, bot_dir, pid_alive_fn=pid_alive_fn)
     sess = read_session(bot_dir)
     trades = [_trade_row(t, summary["point_value"]) for t in _session_trades(bot_dir)]
+    # Trading day of each exit, so the 損益走勢 chart can filter this list.
+    from scripts.dashboard.pnl_history import _SessionOf
+    session_of = _SessionOf()
+    for t in trades:
+        t["session"] = session_of(t["exit_dt"]) or ""
     logs = _newest(bot_dir, _DEBUG_RE)
     log_path = logs[0][1] if logs else None
     log_lines = []
