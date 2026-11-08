@@ -17,9 +17,15 @@ code reads them. Do not use them and do not ask the owner to export by hand.
 |---|---|---|---|
 | **Live bots' 1-min bars** | recent months, real live data (TPE) | Steven: `python -m scripts.research.data dashboard http://<Steven tailnet IP>:8765 TMF00_<bot> --days 120 --out bars.pkl` (read-only GET of `/api/bars`, pages 10 days per call). Local dirs: `… data dirs <bot_dir>…` | only since that bot's first deploy; gaps where it was down — `describe` prints gaps >4 days |
 | **TradingView** (tvDatafeed, no login) | longer history at 30m and above | `python -m scripts.research.data tv TMF00 1H --out tv_1h.pkl` → `kchart_fetcher.fetch_tv_dataframe` + `tv_dataframe_to_bars` (detects the source zone, converts to TPE) | **5,000 bars per request**: 30m ≈ 6 months, 1H ≈ 13 months, 4H ≈ 3.4 years, 1D ≈ back to 2012. 1-min ≈ 4–5 trading days (≈1,140 bars per day+night) |
-| **Capital COM KLine** | exchange-official history, any minute size | `run_bot_cli.py backtest --source api …` (logs in, chunked `RequestKLineAMByDate`) — or a script on the `test_kline.py` pattern | needs settings.yaml credentials + the SDK (main tree or an install, not a worktree). **On a TPE Sunday the quote service sits at `SKQuoteLib_IsConnected()==2` indefinitely — pull on a trading day.** |
+| **Capital COM KLine** | exchange-official history; same feed as the live bots (Capital 30m = our 1-min-derived 30m on overlap) | `run_bot_cli.py backtest --source api …` (logs in, chunked `RequestKLineAMByDate`) — or a script on the `test_kline.py` pattern | **Minute KLine (1–60m) only reaches back to 2025-11-28 (~11 months); daily (type 4) from 2010.** Earlier ranges return code 0 with 0 rows — silently, not an error. Needs settings.yaml credentials + the SDK (main tree or an install, not a worktree). |
 
 Gotchas:
+- **A headless COM pull needs a Tk message pump**: create `root = tk.Tk(); root.withdraw()` and loop
+  `root.update()` while waiting. With `comtypes.client.PumpEvents` no `OnConnection` event is
+  delivered and `SKQuoteLib_IsConnected()` stays at 2 forever — it looks like a weekend/service
+  outage but is not. Login → ready (3001 → 3003) takes ~13 s. `run_bot_cli.py backtest --source api`
+  already pumps Tk. A second login from this PC with the same account did not disturb the Steven
+  fleet (verified 2026-11-09, incl. the real-order bot) — still, ask the owner before logging in.
 - **Symbol mapping:** `SYMBOL_CONFIG` (`src/market_data/kline_config.py`)
   maps TMF00→`IMF1!` and MTX00→`TMF1!` on origin/master — both wrong. The
   fix (TMF00→`TMF1!`, MTX00→`MXF1!`) is draft PR #260; until it merges,

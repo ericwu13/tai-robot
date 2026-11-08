@@ -8,7 +8,9 @@ Sources, best first for recent history:
 * TradingView via tvDatafeed (``fetch_tv``) — no login, 5,000-bar cap per
   request (30m ≈ 6 months, 1H ≈ 13 months, 4H ≈ 3.4 years, 1D ≈ 2012).
   ``tv_dataframe_to_bars`` detects the source zone and converts to TPE.
-* Capital COM KLine — needs a login + the SDK; use
+* Capital COM KLine — minute history only from 2025-11-28 (daily from 2010;
+  earlier ranges return 0 rows silently); needs a login, the SDK and a Tk
+  message pump; use
   ``run_bot_cli.py backtest --source api`` instead of re-implementing it.
 
 Never use the committed ``data/*.csv`` exports: they stop at 2026-03 and
