@@ -594,7 +594,9 @@ def _trade_row(t: dict, point_value: int | None = None) -> dict:
             "real_exit_price": _to_int(t.get("real_exit_price")),
             "real_exit_estimated": bool(t.get("real_exit_estimated", False)),
             "pnl": _to_int(t.get("pnl")), "exit_tag": str(t.get("exit_tag") or ""),
-            "source": str(t.get("source") or "")}
+            "source": str(t.get("source") or ""),
+            "entry_order_seq": str(t.get("entry_order_seq") or ""),
+            "exit_order_seq": str(t.get("exit_order_seq") or "")}
 
 
 def trade_markers(trades: list[dict], t0: int, t1: int) -> list[dict]:

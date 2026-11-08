@@ -77,16 +77,27 @@ def _price_check(real: int, sim: int, when: datetime | None) -> str:
 
 
 def is_real_order(trade: dict) -> bool:
-    """``source == "real"``, or any recorded real fill price.
+    """``source == "real"``, a recorded order seq, or (legacy rows only)
+    any recorded real fill price.
 
     The broker relabels a trade "paper" when no real ENTRY fill was
     confirmed, which also happens when the order did reach the account
     but its confirmation was lost (a dropped race, an OpenInterest error,
-    a missed deal row). A recorded real price is proof an order went out,
-    so such a trade is still a real order, judged by its prices.
+    a missed deal row).
+
+    Builds that stamp ``entry_order_seq`` / ``exit_order_seq`` (the
+    SendFutureOrderCLR seq, written when the order is accepted) carry the
+    proof on the trade itself, so for those rows the seq decides and a
+    stray price is not proof. Older rows lack the keys; for them a recorded
+    real price is the only evidence an order went out. Pre-#92 paper rows
+    can also carry a day-average exit price planted from GetFulfillReport;
+    ``docs/real_order_signature.md`` is the log audit that clears those.
     """
     if str(trade.get("source") or "") == "real":
         return True
+    if "entry_order_seq" in trade or "exit_order_seq" in trade:
+        return bool(str(trade.get("entry_order_seq") or "").strip()
+                    or str(trade.get("exit_order_seq") or "").strip())
     return bool(_int(trade.get("real_entry_price")) or _int(trade.get("real_exit_price")))
 
 
