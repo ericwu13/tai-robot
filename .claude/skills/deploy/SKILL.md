@@ -137,12 +137,51 @@ gone, `session.json` `saved_at` is fresh, and a daily report was written.
 ### Over ssh (Steven)
 
 - `stop` is short-lived and safe over ssh (it writes `STOP` and waits).
-- **Do not rely on `--detach` surviving the ssh session.** It uses
+- **Do not run `deploy --detach` straight from the ssh session.** It uses
   `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` without breakaway, and
   processes started from a Steven ssh session have died on disconnect.
-  The bot also needs an interactive desktop. Launch through an interactive
-  scheduled task (pattern: `\TaiRobot\Launch-08-04-rss`) or ask the owner
-  to start it at Steven's desktop. UNVERIFIED: a fully remote first deploy.
+  The bot also needs an interactive desktop. Launch it through an
+  on-demand interactive scheduled task (recipe below).
+
+### First deploy of a new strategy on Steven (verified 2026-11-09)
+
+Worked first try for a new paper bot. Gates 1–6 still apply; a new
+strategy on a new bot is paper unless the owner says otherwise.
+
+1. **Install the strategy.** Download Steven's
+   `E:\tai_robot_v<ver>\tai_backtest\strategies\index.json` and back it up.
+   Locally, run the app's own write path against a copy of that folder:
+   `StrategyStore(<local copy dir>).save(class_name, source, description)`
+   (`src/ai/strategy_store.py`; it writes the `.py` and the index entry).
+   Validate the new index with the src venv python on Steven, check the
+   live `index.json` hash has not changed since you downloaded it, then
+   scp the `.py` and `index.json` into `strategies\`.
+   **Never edit `index.json` with PowerShell JSON cmdlets**: in PowerShell
+   5.1 `@(Get-Content … | ConvertFrom-Json)` wraps the whole array as ONE
+   element, re-serializing nests it, and `tai_backtest.exe strategies` (and
+   every bot restart) then crashes with `KeyError: 'class_name'`.
+2. **Verify:** `tai_backtest.exe strategies` lists `AI: <Class> [type=0 min=N]`.
+3. **Launch script** `C:\Users\Traderbot\tai_bridge_setup\launch_<bot>.ps1`:
+   `Set-Location` to the install, then
+   `.\tai_backtest.exe deploy --symbol TMF00 --bot <bot> --strategy "AI: <Class>" --mode paper <--new|--resume> --detach --wait-ready 600 *> <log>`
+   — `--resume` when the bot dir already has `session.json`, else `--new`.
+4. **On-demand task, no trigger:** `\TaiRobot\Launch-<bot>`, principal
+   Traderbot, LogonType **Interactive**, RunLevel Limited,
+   ExecutionTimeLimit 20 min, MultipleInstances IgnoreNew; then
+   `Start-ScheduledTask -TaskPath '\TaiRobot\' -TaskName Launch-<bot>`.
+   This works even while Traderbot's session shows `Disc` in `quser`.
+5. **Confirm three ways:** the launch log has `READY: … tick subscription
+   active`, the task's `LastTaskResult` is 0, and `/api/fleet` shows the bot
+   RUNNING with mode `paper`.
+
+Remote-exec notes: send scripts as `powershell -NoProfile -EncodedCommand
+<base64 UTF-16LE>`. A long payload overflows cmd's command-line limit and
+the error comes back as garbled cp950 — ship files with scp instead of
+embedding them. Restarting an existing Steven bot uses the same task
+pattern (`--resume`); read its mode first (gate 1).
+
+### More over-ssh rules
+
 - A launcher `TIMEOUT` is not proof of failure — confirm with `/api/fleet`
   or `status`, not the launcher alone.
 - Never stop processes by image name: `tai_backtest.exe` is every bot.

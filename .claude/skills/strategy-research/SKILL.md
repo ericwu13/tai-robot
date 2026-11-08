@@ -113,9 +113,18 @@ same engine on each bot's own live CSV history with its own gates
 (multifold, month gates, knob mode). A candidate from this skill reaches a
 bot only by the owner saving it as a strategy and redeploying (`deploy`).
 
+## 6. Handing a candidate over
+
+When the owner says to put a candidate on a paper bot, follow `deploy` →
+"First deploy of a new strategy on Steven": install through
+`StrategyStore.save` (never hand-edit `strategies\index.json`, never with
+PowerShell JSON cmdlets), check `tai_backtest.exe strategies`, launch via an
+on-demand interactive scheduled task, confirm READY + `/api/fleet`.
+
 ## Never
 
-- Never deploy a research candidate yourself; hand it to the owner.
+- Never deploy a research candidate without the owner's say-so in this
+  conversation; real-order modes need their explicit yes (`deploy` gate 1).
 - Never write to a Steven bot dir, `POST /api/control`, or the main tree.
 - Never commit `settings.yaml`, API keys, session JSONs containing keys,
   or bar dumps.
