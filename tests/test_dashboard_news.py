@@ -218,7 +218,9 @@ def test_filters_and_facets(tmp_path):
     narrowed = run(source="Reuters")
     assert narrowed["matched"] == 2 and narrowed["total"] == 4
     assert narrowed["sources"] == everything["sources"]          # facets stay full
-    assert narrowed["summary"] == {"bullish": 2, "bearish": 0, "neutral": 0, "net": 1.2}
+    # net = raw sum; net_clipped = what the vote sums (each article ±0.5)
+    assert narrowed["summary"] == {"bullish": 2, "bearish": 0, "neutral": 0, "net": 1.2,
+                                   "net_clipped": 0.8}
     assert len(run(limit="1")["items"]) == 1
 
 
