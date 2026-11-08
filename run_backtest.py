@@ -2565,7 +2565,7 @@ class BacktestApp:
         self._evo_fetch_cb = None  # Callable[[bool], None] | None
         # (ISO year, week) of the last weekly auto-evolution run — the 30s
         # poll fires the post-close pipeline exactly once per week.
-        self._weekly_evo_done: tuple | None = None
+        self._weekly_evo_done: str | None = None  # TPE ISO week key
 
         # Live trading state
         self._live_chart: LiveChart | None = None
@@ -9909,7 +9909,9 @@ class BacktestApp:
         force-close and final daily report are done, the market is
         quiet, and the week's data is complete. Latched per ISO week so
         the 30s poll fires it exactly once; a bot deployed later on
-        Saturday still gets its run on the first post-deploy poll.
+        Saturday still gets its run on the first post-deploy poll. The
+        latch is also a file in the bot directory, so restarting the bot
+        that Saturday does not run the pipeline a second time.
         """
         if not self._settings.get("evolution_auto_pipeline", True):
             return
@@ -9917,15 +9919,23 @@ class BacktestApp:
             return
         if hasattr(self._live_runner, 'on_status_poll'):
             return
-        from src.evolution.notify import is_post_close_evolution_window
-        if not is_post_close_evolution_window():
+        from src.evolution import notify as _evo_notify
+        if not _evo_notify.is_post_close_evolution_window():
             return
         if is_market_open():
             return  # safety: never compete with a live session
-        week_key = _taipei_now().isocalendar()[:2]
+        week_key = _evo_notify.weekly_slot_key(_taipei_now())
         if self._weekly_evo_done == week_key:
             return
         self._weekly_evo_done = week_key
+        bot_dir = getattr(self._live_runner, "bot_dir", None)
+        if _evo_notify.weekly_slot_taken(bot_dir, week_key):
+            self._live_log_msg(
+                f"🧬 本週自動演化已執行過（{week_key}），重啟後不重跑。"
+                f"Weekly auto-evolution already ran for {week_key}; "
+                "not re-running after restart.", "status")
+            return
+        _evo_notify.mark_weekly_slot(bot_dir, week_key)
         self._live_log_msg(
             "🧬 週末自動演化 Weekly auto-evolution (post-close) starting...",
             "status")

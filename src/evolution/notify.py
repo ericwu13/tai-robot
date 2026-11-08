@@ -170,6 +170,70 @@ def is_post_close_evolution_window(now: datetime | None = None) -> bool:
     return now.weekday() == 5 and (now.hour, now.minute) >= (5, 5)
 
 
+# ── Weekly slot latch ──
+# The 30 s poll fires the Saturday pipeline once per ISO week. An
+# in-memory latch alone let every bot restart later that Saturday run
+# the pipeline again (Steven, 2026-10-31 08:08 and 2026-11-07 06:14), so
+# the latch is also kept on disk next to the watermark. One small file
+# per bot; separate from evolution.json for the same reason as the
+# watermark (save_baseline rewrites that file wholesale).
+WEEKLY_SLOT_FILENAME = "evolution_weekly_slot.json"
+
+
+def weekly_slot_key(now: datetime | None = None) -> str:
+    """``YYYY-Www`` of the TPE ISO week. Naive ``now`` is TPE wall-clock."""
+    if now is None:
+        now = datetime.now(_TZ_TAIPEI)
+    elif now.tzinfo is not None:
+        now = now.astimezone(_TZ_TAIPEI)
+    year, week, _ = now.isocalendar()
+    return f"{year:04d}-W{week:02d}"
+
+
+def weekly_slot_path(bot_dir: str | os.PathLike) -> str:
+    return os.path.join(os.fspath(bot_dir), WEEKLY_SLOT_FILENAME)
+
+
+def weekly_slot_taken(bot_dir, key: str) -> bool:
+    """True when this bot's file says ``key`` already ran.
+
+    Missing or unreadable file, or no bot directory → False (run).
+    """
+    if not bot_dir:
+        return False
+    try:
+        with open(weekly_slot_path(bot_dir), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return isinstance(data, dict) and str(data.get("week", "")) == key
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def mark_weekly_slot(bot_dir, key: str, at: str | None = None) -> bool:
+    """Record that ``key`` has started for this bot. Never raises.
+
+    The bot directory is not created. False on any failure; the caller
+    keeps its in-memory latch, so a disk error never silences a run.
+    """
+    if not bot_dir:
+        return False
+    try:
+        if not os.path.isdir(os.fspath(bot_dir)):
+            return False
+        if at is None:
+            at = datetime.now(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+        path = weekly_slot_path(bot_dir)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"week": key, "at": at}, f)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        logger.warning("evolution weekly slot write failed: [%s] %s",
+                       type(exc).__name__, exc)
+        return False
+
+
 @dataclass
 class Baseline:
     """The "best composite so far" record persisted per bot.
