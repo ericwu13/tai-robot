@@ -23,8 +23,7 @@ _TZ_TPE = timezone(timedelta(hours=8))
 # (the dashboard must render even when the bridge code is broken).
 _FALLBACK_THRESHOLD = 1.5
 _FALLBACK_DECAY = 0.8409
-ARTICLE_CLIP = 0.5            # rss_scorer.aggregate_scores clips each article
-EROSION_POINTS = 1.5          # the embed's "Eroding" rule
+_FALLBACK_EROSION = 1.5       # rss_scorer.EROSION_POINTS (the embed's "Eroding" rule)
 RUN_HISTORY_DAYS = 3          # chart window
 DRIVERS_PER_SIDE = 3
 EVENTS_SHOWN = 4
@@ -38,8 +37,7 @@ def _scorer():
         return None
 
 
-def clip(score: float) -> float:
-    return max(-ARTICLE_CLIP, min(ARTICLE_CLIP, float(score)))
+clip = news_feed.clip          # the scorer's per-article clip (rss_scorer.ARTICLE_CLIP)
 
 
 def _ts(value: str) -> datetime | None:
@@ -117,7 +115,7 @@ def build_drivers(items: list[dict], session: str, decay: float) -> dict:
 # ── W3 state (what the Discord embed showed) ─────────────────────────────
 
 def w3_state(state: dict | None, now: datetime, tonight_session: str,
-             threshold: float) -> dict:
+             threshold: float, erosion: float = _FALLBACK_EROSION) -> dict:
     if not isinstance(state, dict):
         return {"known": False}
     key = str(state.get("session_key") or "")
@@ -126,15 +124,17 @@ def w3_state(state: dict | None, now: datetime, tonight_session: str,
     peak = _num(state.get("session_peak")) if current else 0.0
     recent = [_num(x) for x in (state.get("recent_runs") or [])
               if isinstance(x, (int, float))] if current else []
-    eroding = ((peak > 0 and net < peak - EROSION_POINTS)
-               or (peak < 0 and net > peak + EROSION_POINTS))
+    eroding = ((peak > 0 and net < peak - erosion)
+               or (peak < 0 and net > peak + erosion))
     streak = state.get("error_streak")
     streak = streak if isinstance(streak, int) and not isinstance(streak, bool) else 0
     direction = ("trending-up" if net >= threshold
                  else "trending-down" if net <= -threshold else "")
 
     def stamp(name):
-        return str(state.get(name) or "")[:19]
+        # Keep the +08:00 offset: the page computes ages with Date.parse,
+        # which reads an offset-less ISO string as the VIEWER's local time.
+        return news_feed._str(state.get(name), 40)
 
     def count(name):
         v = state.get(name)
@@ -214,6 +214,7 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
     scorer = _scorer()
     threshold = float(getattr(scorer, "SESSION_VOTE_THRESHOLD", _FALLBACK_THRESHOLD))
     decay = float(getattr(scorer, "EMA_DECAY", _FALLBACK_DECAY))
+    erosion = float(getattr(scorer, "EROSION_POINTS", _FALLBACK_EROSION))
     paths = news_paths or {}
     session = scorer.night_session_key(now) if scorer else ""
     items = news_feed.read_items(news_log_path) if news_log_path else []
@@ -223,10 +224,10 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
         "available": bool(news_paths) or bool(news_log_path),
         "now": now.isoformat(timespec="seconds"),
         "threshold": threshold,
-        "article_clip": ARTICLE_CLIP,
+        "article_clip": news_feed.article_clip(),
         "session": session,
         "weekend_pause": bool(scorer and scorer.in_weekend_pause(now)),
-        "w3": w3_state(state, now, session, threshold),
+        "w3": w3_state(state, now, session, threshold, erosion),
         "tonight": tonight,
         "votes": votes,
         "events": _events(now, paths.get("events_path", ""), read_json),

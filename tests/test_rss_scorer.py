@@ -728,6 +728,35 @@ class TestDiscordModes:
     @patch("rss_scorer.post_discord_embed", return_value=True)
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
+    def test_all_unusable_responses_count_as_failing(self, mock_score, mock_feeds,
+                                                     mock_embed, tmp_vote):
+        """HTTP 200 but no usable score in any response (changed shape, safety
+        block): not a GeminiAPIError, yet the vote has stopped just the same.
+        It must not reset error_streak and read healthy."""
+        mock_feeds.return_value = _bull_articles("u")
+        mock_score.return_value = None                 # every article [SKIP]
+        state = {"seen_guids": [], "error_streak": 0}
+        state = rss_scorer.check_once(self._cfg("errors"), state, tmp_vote, now=_WEEKDAY_EVE)
+        assert state["error_streak"] == 1
+        assert state["last_error"] == "no usable score in 4 Gemini response(s)"
+        assert state["last_skipped"] == 4
+        assert mock_embed.call_count == 1              # the one failure notice
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_some_unusable_responses_are_not_a_failure(self, mock_score, mock_feeds,
+                                                       mock_embed, tmp_vote):
+        mock_feeds.return_value = _bull_articles("p")
+        mock_score.side_effect = [None, _BULL, None, _BULL]
+        state = rss_scorer.check_once(self._cfg("errors"), {"seen_guids": []}, tmp_vote,
+                                      now=_WEEKDAY_EVE)
+        assert state["error_streak"] == 0 and state["last_skipped"] == 2
+        assert mock_embed.call_count == 0
+
+    @patch("rss_scorer.post_discord_embed", return_value=True)
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
     def test_error_posts_once_then_recovery_once(self, mock_score, mock_feeds, mock_embed,
                                                  tmp_vote):
         cfg = self._cfg("errors")

@@ -78,6 +78,12 @@ SESSION_VOTE_THRESHOLD: float = 1.5  # session EMA net required to fire a vote
 EMA_HALF_LIFE_HOURS: float = 2.0
 EMA_DECAY: float = math.exp(-math.log(2) * 0.5 / EMA_HALF_LIFE_HOURS)
 
+# Each article's signed score is clipped to ±ARTICLE_CLIP before summing.
+# The dashboard (scripts/dashboard/news_feed.py, news_pulse.py) imports
+# these so its numbers stay identical to the ones that fire the vote.
+ARTICLE_CLIP: float = 0.5
+EROSION_POINTS: float = 1.5   # session net this far back from its peak = "Eroding"
+
 ARTICLE_MAX_AGE_HOURS = 4
 GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -376,7 +382,7 @@ def aggregate_scores(scored: list[dict]) -> float:
             raw = -confidence
         else:
             continue
-        total += max(-0.5, min(0.5, raw))
+        total += max(-ARTICLE_CLIP, min(ARTICLE_CLIP, raw))
     return total
 
 
@@ -474,12 +480,12 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
     else:
         fields.append({"name": "Articles Scored", "value": str(len(scored)), "inline": True})
 
-    if session_peak > 0 and session_net is not None and session_net < session_peak - 1.5:
+    if session_peak > 0 and session_net is not None and session_net < session_peak - EROSION_POINTS:
         erosion = session_net - session_peak
         fields.append({"name": "Drawdown",
                        "value": f"⚠️ Eroding: peak +{session_peak:.1f} → now +{session_net:.1f} ({erosion:.1f})",
                        "inline": False})
-    elif session_peak < 0 and session_net is not None and session_net > session_peak + 1.5:
+    elif session_peak < 0 and session_net is not None and session_net > session_peak + EROSION_POINTS:
         erosion = session_net - session_peak
         fields.append({"name": "Drawdown",
                        "value": f"⚠️ Eroding: peak {session_peak:.1f} → now {session_net:.1f} (+{erosion:.1f})",
@@ -585,6 +591,20 @@ def record_scoring_result(state: dict, now: datetime, api_error: str | None,
         state["last_success_at"] = stamp
 
 
+def unusable_scores_error(scored: list[dict], scored_guids: list[str]) -> str | None:
+    """A failure description when Gemini answered every call but no answer
+    was usable (all [SKIP]), else None.
+
+    That is not a GeminiAPIError (HTTP 200, the body just lacks a score —
+    a changed response shape, a safety block), so score_articles reports
+    no api_error; left alone it would reset error_streak and read healthy
+    while the vote silently stops.
+    """
+    if scored_guids and not scored:
+        return f"no usable score in {len(scored_guids)} Gemini response(s)"
+    return None
+
+
 def notify_transitions(state: dict, mode: str, post, *, api_error: str | None,
                        vote_key: str = "") -> None:
     """Discord for the non-``all`` modes: state changes only.
@@ -643,6 +663,7 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     scored, scored_guids, api_error = score_articles(new_articles, cfg["gemini_api_key"])
     state = mark_seen(state, scored_guids)
+    api_error = api_error or unusable_scores_error(scored, scored_guids)
     record_scoring_result(state, now, api_error,
                           skipped=len(scored_guids) - len(scored))
 

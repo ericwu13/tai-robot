@@ -114,6 +114,35 @@ def test_w3_state_failing_eroding_and_threshold():
     assert st["last_fetched"] == 30 and st["last_scored"] == 0
 
 
+def test_w3_state_timestamps_keep_their_offset():
+    """The page ages these with Date.parse: an offset-less ISO string would be
+    read in the VIEWER's timezone (wrong anywhere outside Asia/Taipei)."""
+    st = news_pulse.w3_state({"session_key": SESSION, "last_check": "2026-08-04T20:30:00+08:00",
+                              "error_streak": 1, "last_error": "x",
+                              "last_error_at": "2026-08-04T20:30:00+08:00",
+                              "last_success_at": "2026-08-04T19:00:00+08:00"}, NOW, SESSION, 1.5)
+    assert st["last_check"] == "2026-08-04T20:30:00+08:00"
+    assert st["last_error_at"].endswith("+08:00") and st["last_success_at"].endswith("+08:00")
+
+
+def test_clip_and_erosion_come_from_the_scorer(monkeypatch):
+    monkeypatch.setattr(rss_scorer, "ARTICLE_CLIP", 0.4)
+    assert news_pulse.clip(0.9) == 0.4 and news_pulse.clip(-0.9) == -0.4
+    out = news_pulse.pulse(NOW, None, None, _reader)
+    assert out["article_clip"] == 0.4
+    st = news_pulse.w3_state({"session_key": SESSION, "session_net": 1.2, "session_peak": 2.0},
+                             NOW, SESSION, 1.5, erosion=0.5)
+    assert st["eroding"]                       # 2.0 → 1.2 is past a 0.5 erosion rule
+
+
+def test_read_items_reparses_when_the_log_changes(tmp_path):
+    log = tmp_path / "news" / "news_log.jsonl"
+    _write(log, [_row("a", 0.5, RUN1)])
+    assert [r["title"] for r in news_feed.read_items(str(log))] == ["a"]
+    _write(log, [_row("a", 0.5, RUN1), _row("b", -0.5, RUN2)])
+    assert sorted(r["title"] for r in news_feed.read_items(str(log))) == ["a", "b"]
+
+
 def test_w3_state_from_an_earlier_session_reads_as_zero_tonight():
     st = news_pulse.w3_state({"session_key": "2026-08-03|NIGHT", "session_net": -2.0,
                               "session_peak": -2.5, "recent_runs": [-1.0]},

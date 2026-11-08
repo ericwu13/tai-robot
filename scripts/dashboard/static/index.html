@@ -940,11 +940,14 @@ const App = {
       if (!this.newsOpen) return;
       this.news = n; this.pulse = p; this.lastOk = Date.now();
       $("banner").classList.remove("show");
-      this.renderPulse();
-      this.renderNews();
     } catch (e) {
       $("banner").classList.add("show");
+      return;
     }
+    // Rendered independently: a pulse rendering bug must not take the news
+    // list down with it (or masquerade as the connection-lost banner).
+    try { this.renderPulse(); } catch (e) { console.error("renderPulse", e); }
+    this.renderNews();
   },
 
   // Keep the current choice even when a refresh no longer lists it.
@@ -1003,7 +1006,10 @@ const App = {
       ));
     }
     body.replaceChildren(...out);
-    if (latest && latest.scored_at > (readSeen() || "")) writeSeen(latest.scored_at);
+    // Only what was on screen counts as seen; "新" = scored since you last looked.
+    if (latest && document.visibilityState === "visible" && latest.scored_at > (readSeen() || "")) {
+      writeSeen(latest.scored_at);
+    }
   },
 
   // 市場脈動: W3 gauge vs the vote threshold, tonight's votes, events, chart, drivers.
@@ -1502,6 +1508,12 @@ const App = {
     });
     for (const id of ["n-session", "n-score", "n-source"]) $(id).addEventListener("change", () => this.refreshNews());
     this.newsSeen = readSeen();
+    // Leaving the tab moves the "新" baseline to what was last shown, so a
+    // page left open overnight marks only the runs since you looked away.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") this.newsSeen = readSeen();
+      else if (this.news && this.newsOpen) this.renderNews();
+    });
     $("n-neutral").checked = readShowNeutral();
     $("n-neutral").addEventListener("change", () => { writeShowNeutral($("n-neutral").checked); if (this.news) this.renderNews(); });
     window.addEventListener("hashchange", () => this.route());
