@@ -11236,6 +11236,18 @@ class BacktestApp:
                         new_close=report_nc, send_time=_taipei_now())
                     if action_type == "exit":
                         self._last_exit_order_seq = str(message).strip()
+                    # Persist the seq on the trade itself, so the record
+                    # proves a real order went out even when its fill
+                    # confirmation is later lost (source stays "paper"
+                    # then). Best-effort: must never break the order path.
+                    try:
+                        stamped = broker.note_real_order_sent(
+                            action_type, str(message), bar_idx)
+                        if not stamped:
+                            _log(f"REAL ORDER SEQ not stamped: {action_type} "
+                                 f"seq={str(message).strip()} bar={bar_idx}")
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"REAL ORDER SEQ stamp failed: {exc}")
                 self._position_log(
                     "register_order", str(message), action_type, buy_sell, 1,
                     order_symbol)

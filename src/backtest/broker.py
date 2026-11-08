@@ -94,6 +94,13 @@ class Trade:
     # shows "est." next to the real P&L.
     real_exit_estimated: bool = False
     source: str = ""            # "backtest", "paper", or "real"
+    # SendFutureOrderCLR seq no of the real order sent for each leg, stamped
+    # when the broker accepted the order (REAL ORDER OK). "" = no real order
+    # was sent for that leg. Unlike ``source`` this does not wait for a fill
+    # confirmation, so a real order whose confirm was lost is still provable
+    # from the trade alone.
+    entry_order_seq: str = ""
+    exit_order_seq: str = ""
     # Display name of the strategy whose signal OPENED this trade. In
     # regime mode one bot's restored history spans several strategies
     # (manual redeploys on regime switches), so per-trade attribution
@@ -280,6 +287,9 @@ class SimulatedBroker:
         # strategy switch mid-position can't mislabel the open trade.
         self.strategy_label: str = ""
         self.entry_strategy: str = ""
+        # Seq no of the real entry order for the open position (see
+        # Trade.entry_order_seq); snapshotted into the Trade on close.
+        self.entry_order_seq: str = ""
 
         # Last exit metadata — read by live_runner to determine real order type
         self.last_exit_type: str = ""  # "limit", "stop", "close", "force_close"
@@ -397,6 +407,7 @@ class SimulatedBroker:
                 # (issue #45 late-arrival race).
                 self.real_entry_price = 0
                 self.real_entry_dt = ""
+                self.entry_order_seq = ""
         self._pending_entries.clear()
 
     def check_exits(self, bar_index: int, open_: int, high: int, low: int, close: int, bar_dt: str = "") -> None:
@@ -510,6 +521,7 @@ class SimulatedBroker:
             real_entry_dt=self.real_entry_dt,
             source=source,
             strategy=self.entry_strategy,
+            entry_order_seq=self.entry_order_seq,
         )
         self.trades.append(trade)
         self._cumulative_pnl += pnl
@@ -525,6 +537,7 @@ class SimulatedBroker:
         # when position_size == 0, so two layers of defense (issue #45).
         self.real_entry_price = 0
         self.real_entry_dt = ""
+        self.entry_order_seq = ""
         self._pending_exits.clear()
         self._exit_bar_index = bar_index
 
@@ -618,6 +631,32 @@ class SimulatedBroker:
         last.real_exit_estimated = False
         return True
 
+    def note_real_order_sent(self, action_type: str, seq: str, bar_index: int) -> bool:
+        """Stamp the seq no of a real order the broker accepted.
+
+        ``bar_index`` is the snapshot the caller took when the order went
+        out (the entry bar of the open position, or the exit bar of the
+        latest trade). The stamp is dropped, returning False, when it no
+        longer matches: flat / no trade, a different bar index, or a seq
+        already stamped for that leg (a retry keeps the first order's seq).
+        """
+        seq = str(seq or "").strip()
+        if not seq:
+            return False
+        if action_type == "entry":
+            if (self.position_size == 0 or self.entry_order_seq
+                    or self.entry_bar_index != bar_index):
+                return False
+            self.entry_order_seq = seq
+            return True
+        if not self.trades:
+            return False
+        last = self.trades[-1]
+        if last.exit_order_seq or last.exit_bar_index != bar_index:
+            return False
+        last.exit_order_seq = seq
+        return True
+
     def mark_real_exit_estimated(self) -> bool:
         """The exit-fill retry ended without a broker price.
 
@@ -660,6 +699,7 @@ class SimulatedBroker:
             "entry_strategy": self.entry_strategy,
             "real_entry_price": self.real_entry_price,
             "real_entry_dt": self.real_entry_dt,
+            "entry_order_seq": self.entry_order_seq,
             "trades": [
                 {
                     "tag": t.tag, "side": t.side.value, "qty": t.qty,
@@ -675,6 +715,8 @@ class SimulatedBroker:
                     "real_exit_estimated": t.real_exit_estimated,
                     "source": t.source,
                     "strategy": t.strategy,
+                    "entry_order_seq": t.entry_order_seq,
+                    "exit_order_seq": t.exit_order_seq,
                 }
                 for t in self.trades
             ],
@@ -719,6 +761,7 @@ class SimulatedBroker:
         broker.entry_strategy = data.get("entry_strategy", "")
         broker.real_entry_price = data.get("real_entry_price", 0)
         broker.real_entry_dt = data.get("real_entry_dt", "")
+        broker.entry_order_seq = str(data.get("entry_order_seq", "") or "")
         broker.trades = [
             Trade(
                 tag=t["tag"], side=OrderSide(t["side"]), qty=t["qty"],
@@ -734,6 +777,8 @@ class SimulatedBroker:
                 real_exit_estimated=bool(t.get("real_exit_estimated", False)),
                 source=t.get("source", ""),
                 strategy=t.get("strategy", ""),
+                entry_order_seq=str(t.get("entry_order_seq", "") or ""),
+                exit_order_seq=str(t.get("exit_order_seq", "") or ""),
             )
             for t in data.get("trades", [])
         ]
