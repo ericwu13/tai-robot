@@ -7,6 +7,8 @@ hosts:
     tailscale_ip: "100.x.x.x"
     user: "Traderbot"
     identity_file: "~/.ssh/id_ed25519_steven"
+    install_dir: "E:\tai_robot_vXXXX\tai_backtest"   # current release install; moves each release
+    dashboard_port: 8765
     notes: "Windows trading server"
   oreopie:
     tailscale_ip: "100.x.x.x"
