@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from scripts.dashboard import news_feed
+from scripts.dashboard import bridge_panels, news_feed
 
 _TZ_TPE = timezone(timedelta(hours=8))
 
@@ -233,4 +233,6 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
         "events": _events(now, paths.get("events_path", ""), read_json),
         "runs": build_runs(items, now),
         "drivers": build_drivers(items, session, decay),
+        "w2": bridge_panels.crossmarket(now, paths, read_json),
+        "w4": bridge_panels.chips(now, paths, read_json),
     }

@@ -35,7 +35,10 @@ every single day and can never turn positive.
                                     confirmation)
 
 The previous OI comes from the ``.chips_state.json`` sidecar, which
-records every fetched dataset — vote or not.
+records every fetched dataset — vote or not.  The same file keeps a
+display-only ``daily`` map (trade date → net OI, ΔOI, equity flow,
+decision, reason; last 60) written on decision passes only, for the
+dashboard 籌碼 panel; ``history`` stays the ΔOI baseline.
 
 There is no neutral vote — when uncertain the W4 vote file is DELETED so
 a stale vote can never linger (votes are also consumed by the classifier
@@ -126,6 +129,10 @@ WALK_BACK_TRADING_DAYS = 3
 
 STATE_NAME = ".chips_state.json"
 STATE_KEEP_DAYS = 10
+# ``daily``: one display row per DECIDED trade date for the dashboard 籌碼
+# panel (ΔOI, equity flow, decision, reason).  Separate from ``history``,
+# the ΔOI baseline, which it never touches.  Nothing reads it back.
+DAILY_KEEP_DAYS = 60
 LOG_NAME = "chips_monitor.log"
 LOG_MAX_BYTES = 1_000_000
 LOG_KEEP_LINES = 2000
@@ -495,6 +502,16 @@ def record_net_oi(state: dict, date_key: str, net_oi: float) -> dict:
     return state
 
 
+def record_daily(state: dict, date_key: str, row: dict) -> dict:
+    """Upsert the display row for *date_key*, keeping the newest
+    ``DAILY_KEEP_DAYS`` dates.  A malformed ``daily`` is replaced."""
+    daily = state.get("daily")
+    daily = dict(daily) if isinstance(daily, dict) else {}
+    daily[date_key] = row
+    state["daily"] = dict(sorted(daily.items())[-DAILY_KEEP_DAYS:])
+    return state
+
+
 def stamp_liveness(state: dict, now: datetime, summary: str) -> dict:
     """Stamp last_check/last_result (the W2/W3 liveness contract).
 
@@ -690,10 +707,47 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
         # outage no-vote stays retryable — a later slot may still turn
         # today's OI into a vote once the contradiction check can run.
         state["last_decided_date"] = date_key
+    record_daily(state, date_key, {
+        "net_oi": net_oi, "delta_oi": delta, "prev_date": prev_date,
+        "equity_net": equity_net, "decision": direction, "reason": reason,
+        "final": equity_net is not None, "session": session_key,
+        "at": now.isoformat(timespec="seconds"),
+    })
     save_state(spath, stamp_liveness(state, now, summary))
     append_log(Path(base_path).parent / LOG_NAME,
                f"{now:%Y-%m-%d %H:%M:%S} TPE | {summary}")
     return 0
+
+
+class _NoRunLog:
+    """Stand-in when src/news/bridge_runs.py cannot be loaded."""
+    result = ""
+    exit_code = None
+
+    def fail(self, error):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _run_recorder(bridge_dir, workflow: str):
+    """``bridge_runs.run_recorder`` (runs/<W>.jsonl for the dashboard's
+    工作流程 view), loaded by file path like ``_get_write_regime_vote``.
+    Bookkeeping only — a load failure degrades to a no-op."""
+    try:
+        import importlib.util
+        mod_path = Path(__file__).resolve().parents[2] / "src" / "news" / "bridge_runs.py"
+        spec = importlib.util.spec_from_file_location("bridge_runs", mod_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.run_recorder(bridge_dir, workflow)
+    except Exception as e:  # noqa: BLE001
+        print(f"  run log unavailable: {type(e).__name__}: {e}")
+        return _NoRunLog()
 
 
 def main() -> int:
@@ -739,8 +793,14 @@ def main() -> int:
         print(f"ERROR: --date must be YYYYMMDD, got {date_key!r}")
         return 1
 
-    return run_once(base_path, date_key, now, dry_run=args.dry_run,
-                    discord_webhook=discord_webhook, force=args.force)
+    if args.dry_run:
+        return run_once(base_path, date_key, now, dry_run=True,
+                        discord_webhook=discord_webhook, force=args.force)
+    with _run_recorder(Path(base_path).parent, "W4") as run:
+        run.exit_code = run_once(base_path, date_key, now,
+                                 discord_webhook=discord_webhook, force=args.force)
+        run.result = str(load_state(state_path_for(base_path)).get("last_result") or "")
+        return run.exit_code
 
 
 if __name__ == "__main__":

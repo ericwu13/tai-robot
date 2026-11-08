@@ -79,6 +79,13 @@ monitor_state.json, so "is the bridge still running?" is answerable from disk
 without waiting for an alert that may never be due::
 
     2026-08-06 15:02:03 TPE | fresh 2/11 (^N225 -0.99%, ^KS11 -4.81%) | fired: alert-down | vote: -
+
+Display numbers: every pass also writes ``<signal dir>/crossmarket_quotes.json``
+(per-symbol price/% vs thresholds, freshness, quorum, last fire) for the
+dashboard ticker strip.  Display-only, separate from monitor_state.json
+(dedup keys) and never raises; nothing reads it back into a decision.
+Each pass is also logged to ``<signal dir>/runs/W2.jsonl`` (``--force-fire``
+to ``runs/W5.jsonl``) via ``src/news/bridge_runs.py``.
 """
 from __future__ import annotations
 
@@ -171,6 +178,15 @@ NIGHT_START, NIGHT_END = 15, 5    # night session coverage (contiguous with DAY_
 LOG_NAME = "monitor.log"
 LOG_MAX_BYTES = 1_000_000
 LOG_KEEP_LINES = 2000
+
+# Display-only numbers for the dashboard ticker strip, beside signal.json.
+# Deliberately NOT inside monitor_state.json: that file holds the dedup
+# keys, and a failed save there re-fires risk_off.  Nothing reads this
+# file back into a decision.
+QUOTES_NAME = "crossmarket_quotes.json"
+QUOTES_VERSION = 1
+REPLACE_RETRIES = 3
+REPLACE_RETRY_SEC = 0.2
 
 _UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)", "Connection": "close"}
 
@@ -420,7 +436,7 @@ def in_active_window(now: datetime) -> bool:
     return now.hour >= NIGHT_START or now.hour < NIGHT_END
 
 
-def _collect_quotes(args) -> tuple[
+def _collect_quotes(args, records: dict | None = None) -> tuple[
         dict[str, dict], dict[str, list[str]], list[str], int, list[str]]:
     """Fetch every symbol once.
 
@@ -429,6 +445,10 @@ def _collect_quotes(args) -> tuple[
     the human-readable breach lines, *fetch_failures* counts symbols
     whose fetch returned nothing, and *session_rejects* lists symbols
     the period/tape guard dropped (so ``monitor.log`` can show them).
+
+    *records*, when given, is filled with one display row per symbol —
+    stale and failed ones included — for the ``crossmarket_quotes.json``
+    sidecar.  It never changes what the pass decides.
     """
     fresh: dict[str, dict] = {}
     breaches: dict[str, list[str]] = {
@@ -439,8 +459,17 @@ def _collect_quotes(args) -> tuple[
 
     for sym, cfg in SYMBOLS.items():
         down_th, up_th = cfg["down"], cfg["up"]
+        vote_down, vote_up = cfg["vote"]
         if args.min_move is not None:
             down_th, up_th = -args.min_move, args.min_move
+            vote_down, vote_up = -args.min_move, args.min_move
+        row = {"tier": cfg["tier"], "price": None, "prev_close": None,
+               "pct": None, "quote_time": None, "age_s": None,
+               "fresh": False, "stale_reason": "fetch_failed",
+               "down": down_th, "up": up_th,
+               "vote_down": vote_down, "vote_up": vote_up}
+        if records is not None:
+            records[sym] = row
         q = fetch_quote(sym)
         if q is None:
             fetch_failures += 1
@@ -467,6 +496,12 @@ def _collect_quotes(args) -> tuple[
             extra = ""
         print(f"  [{sym}] {q['pct']:+.2f}% (px {q['price']:.2f} vs pc "
               f"{q['prev_close']:.2f}, quote age {age:.0f}s{extra})")
+        row.update(price=q["price"], prev_close=q["prev_close"], pct=q["pct"],
+                   quote_time=int(q["quote_time"]), age_s=int(age),
+                   fresh=not stale,
+                   stale_reason=(session_reason
+                                 or (f"STALE > {max_age}s allowance" if age_stale
+                                     else None)))
         if stale:
             continue
         fresh[sym] = q
@@ -516,7 +551,9 @@ def check_once(args, state: dict) -> dict:
     print(f"[{now:%Y-%m-%d %H:%M:%S}] checking "
           f"{', '.join(SYMBOLS)} (min move override: {args.min_move or '-'})")
 
-    fresh, breaches, details, fetch_failures, session_rejects = _collect_quotes(args)
+    records: dict[str, dict] = {}
+    fresh, breaches, details, fetch_failures, session_rejects = _collect_quotes(
+        args, records)
     fired: list[str] = []
 
     # The vote direction IS the quorum: computed up front because the
@@ -648,8 +685,101 @@ def check_once(args, state: dict) -> dict:
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_result"] = summary
     append_log(log_path_for(args), f"{now:%Y-%m-%d %H:%M:%S} TPE | {summary}")
+    write_quotes_sidecar(args, now, records, fired, direction,
+                         vote_up_syms, vote_down_syms)
 
     return state
+
+
+def quotes_path_for(args) -> Path:
+    return Path(args.signal_out).parent / QUOTES_NAME
+
+
+def _dump_json_atomic(path: Path, payload: dict) -> None:
+    """tmp + os.replace, retried briefly: on Windows a reader holding the
+    file open makes the replace fail with PermissionError for a moment."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    for attempt in range(REPLACE_RETRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_RETRIES - 1:
+                raise
+            time.sleep(REPLACE_RETRY_SEC)
+
+
+def write_quotes_sidecar(args, now: datetime, records: dict, fired: list[str],
+                         direction: str | None, up_syms: list[str],
+                         down_syms: list[str]) -> bool:
+    """Write ``crossmarket_quotes.json`` for the dashboard.  Never raises.
+
+    ``last_fired`` carries the most recent pass that fired something new
+    (a ``(deduped)`` repeat is not a fire) across quiet passes, so the
+    strip can say when W2 last acted without parsing monitor.log.
+    """
+    try:
+        path = quotes_path_for(args)
+        last_fired = None
+        try:
+            with open(path, encoding="utf-8") as f:
+                prev = json.load(f)
+            if isinstance(prev, dict) and isinstance(prev.get("last_fired"), dict):
+                last_fired = prev["last_fired"]
+        except (OSError, ValueError):
+            pass
+        new = [f for f in fired if not f.endswith("(deduped)")]
+        if new:
+            last_fired = {"at": now.isoformat(timespec="seconds"), "what": new}
+        _dump_json_atomic(path, {
+            "version": QUOTES_VERSION,
+            "asof": now.isoformat(timespec="seconds"),
+            "quorum": {"direction": direction, "up": list(up_syms),
+                       "down": list(down_syms), "min_symbols": VOTE_MIN_SYMBOLS},
+            "fired": list(fired),
+            "last_fired": last_fired,
+            "fetch_failed": [s for s, r in records.items()
+                             if r.get("stale_reason") == "fetch_failed"],
+            "quotes": records,
+        })
+        return True
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  quotes sidecar write failed: {type(e).__name__}: {e}")
+        return False
+
+
+class _NoRunLog:
+    """Stand-in when src/news/bridge_runs.py cannot be loaded."""
+    result = ""
+    exit_code = None
+
+    def fail(self, error):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _run_recorder(bridge_dir, workflow: str):
+    """``bridge_runs.run_recorder`` (runs/<W>.jsonl for the dashboard's
+    工作流程 view), loaded by file path like ``_get_write_regime_vote``.
+    Bookkeeping only — a load failure degrades to a no-op."""
+    try:
+        import importlib.util
+        mod_path = Path(__file__).resolve().parents[2] / "src" / "news" / "bridge_runs.py"
+        spec = importlib.util.spec_from_file_location("bridge_runs", mod_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.run_recorder(bridge_dir, workflow)
+    except Exception as e:  # noqa: BLE001
+        print(f"  run log unavailable: {type(e).__name__}: {e}")
+        return _NoRunLog()
 
 
 def main() -> int:
@@ -695,14 +825,19 @@ def main() -> int:
         except Exception:
             pass
 
+    bridge_dir = Path(args.signal_out).parent
     if args.force_fire:
-        sid = write_signal(args.signal_out, args.force_fire,
-                           f"manual --force-fire {args.force_fire}", "manual-tap")
-        post_discord(args.discord_webhook,
-                     f"🖐️ 手動訊號 manual signal written: `{args.force_fire}`")
-        append_log(log_path_for(args),
-                   f"{datetime.now(_TZ_TAIPEI):%Y-%m-%d %H:%M:%S} TPE | "
-                   f"force-fire {args.force_fire} -> {sid[:8]}")
+        # The W5 manual tap is this same entry point with --force-fire.
+        with _run_recorder(bridge_dir, "W5") as run:
+            sid = write_signal(args.signal_out, args.force_fire,
+                               f"manual --force-fire {args.force_fire}", "manual-tap")
+            post_discord(args.discord_webhook,
+                         f"🖐️ 手動訊號 manual signal written: `{args.force_fire}`")
+            append_log(log_path_for(args),
+                       f"{datetime.now(_TZ_TAIPEI):%Y-%m-%d %H:%M:%S} TPE | "
+                       f"force-fire {args.force_fire} -> {sid[:8]}")
+            run.result = f"force-fire {args.force_fire} -> {sid[:8]}"
+            run.exit_code = 0
         return 0
 
     state_path = Path(args.signal_out).parent / "monitor_state.json"
@@ -713,14 +848,19 @@ def main() -> int:
               f"TPE, idle {NIGHT_END:02d}:00-{DAY_START:02d}:00)")
         while True:
             if in_active_window(datetime.now(_TZ_TAIPEI)):
-                state = check_once(args, state)
-                save_state(state_path, state)
+                with _run_recorder(bridge_dir, "W2") as run:
+                    state = check_once(args, state)
+                    save_state(state_path, state)
+                    run.result = str(state.get("last_result") or "")
             else:
                 print(f"[{datetime.now(_TZ_TAIPEI):%H:%M}] outside active window — idle")
             time.sleep(args.loop)
     else:
-        state = check_once(args, state)
-        save_state(state_path, state)
+        with _run_recorder(bridge_dir, "W2") as run:
+            state = check_once(args, state)
+            save_state(state_path, state)
+            run.result = str(state.get("last_result") or "")
+            run.exit_code = 0
     return 0
 
 

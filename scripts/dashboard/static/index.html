@@ -212,6 +212,59 @@ pre.log .P3 { color: var(--muted); }
   .chart.news { height: 200px; }
   .gauge .num { font-size: 26px; }
 }
+/* W2 跨市場報價 strip + W4 籌碼 panel (新聞訊號 view). 紅漲綠跌. */
+.mk-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 16px; margin-bottom: 16px; }
+.mk-body { padding: 10px 14px 14px; display: grid; gap: 10px; }
+.tgrp { display: grid; gap: 4px; }
+.tgrp h4 { margin: 4px 0 2px; font-size: 13px; font-weight: 700; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.trow { display: grid; grid-template-columns: minmax(118px, 1.1fr) 64px minmax(90px, 2fr) 92px; gap: 4px 10px;
+  align-items: center; font-size: 13px; }
+.trow .sym { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trow .sym b { font-weight: 600; }
+.trow .pct { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+.trow .th { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.trow.stale { opacity: .45; }
+.trow.stale .pct { font-weight: 400; }
+.brk { font-size: 11px; font-weight: 700; padding: 0 5px; border-radius: 4px; margin-left: 4px; }
+.brk.up { color: #fff; background: var(--up); } .brk.down { color: #fff; background: var(--down); }
+.pbar { position: relative; height: 10px; border-radius: 5px; background: var(--off-bg); overflow: hidden; }
+.pbar .fill { position: absolute; top: 0; bottom: 0; }
+.pbar .zero { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--muted); left: 50%; }
+.pbar .tick { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--text); opacity: .55; }
+.pbar .tick.vote { width: 0; border-left: 2px dotted var(--text); background: none; opacity: .4; }
+.qline { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--muted); }
+.qline b { color: var(--text); font-weight: 600; }
+.chips-head { display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: flex-end; }
+.chips-head .num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.spark { width: 100%; height: 56px; display: block; }
+.spark .line { fill: none; stroke: var(--ok); stroke-width: 1.6; }
+.spark .dot { fill: var(--ok); }
+.decision { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 13px; }
+table.mini th, table.mini td { padding: 5px 8px; font-size: 13px; }
+table.mini td.why { white-space: normal; min-width: 160px; }
+/* 工作流程 view */
+.wf-head { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 12px; }
+.hostb { display: inline-block; padding: 2px 10px; border-radius: 6px; font-size: 13px; font-weight: 700;
+  color: var(--warn); background: var(--warn-bg); }
+.hostb.same { color: var(--off); background: var(--off-bg); font-weight: 400; }
+#wf td.res { white-space: normal; min-width: 220px; max-width: 520px; }
+#wf td.res .err { color: var(--bad); font-weight: 700; display: block; }
+#wf .wid { font-weight: 700; margin-right: 6px; }
+@media (max-width: 760px) {
+  .mk-grid { grid-template-columns: 1fr; }
+  .trow { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .trow .pbar { grid-column: 1 / -1; order: 4; }
+  #wf thead, #chips-days thead { display: none; }
+  #wf, #wf tbody, #wf tr, #wf td, #chips-days, #chips-days tbody, #chips-days tr, #chips-days td { display: block; width: 100%; }
+  #wf tr, #chips-days tr { border-bottom: 1px solid var(--line); padding: 8px 4px; }
+  #wf td, #chips-days td { border: 0; padding: 3px 10px; white-space: normal; text-align: left;
+    display: flex; justify-content: space-between; gap: 12px; }
+  #wf td::before, #chips-days td::before { content: attr(data-label); color: var(--muted); font-size: 13px; flex: none; }
+  #wf td.first::before { content: none; }
+  #wf td.res, #chips-days td.why { display: block; min-width: 0; max-width: none; }
+  #wf td.res::before, #chips-days td.why::before { content: none; }
+  .chips-head .num { font-size: 22px; }
+}
 [hidden] { display: none !important; }
 
 /* Phone: the fleet table becomes one card per bot, no sideways scroll. */
@@ -241,7 +294,7 @@ pre.log .P3 { color: var(--muted); }
 <header>
   <h1>機器人監控</h1>
   <span class="seg nav" id="nav">
-    <button data-view="" class="on">機器人</button><button data-view="news">新聞訊號</button>
+    <button data-view="" class="on">機器人</button><button data-view="news">新聞訊號</button><button data-view="workflows">工作流程</button>
   </span>
   <span class="host" id="host"></span>
   <span class="chip s-off" id="market">讀取中…</span>
@@ -279,6 +332,18 @@ pre.log .P3 { color: var(--muted); }
       <div class="pmeta" id="n-meta"></div>
       <div class="events" id="n-events"></div>
     </div>
+    <div class="mk-grid">
+      <div class="panel">
+        <div class="section-title">W2 跨市場報價
+          <span class="legend" id="w2-note">漲跌幅對前收。實線＝警報門檻，點線＝投票門檻；灰色＝過舊或抓取失敗，不計入</span></div>
+        <div class="mk-body" id="w2-body"></div>
+      </div>
+      <div class="panel">
+        <div class="section-title">W4 籌碼・外資台指淨未平倉
+          <span class="legend">投票看的是單日變化（ΔOI），不是水位</span></div>
+        <div class="mk-body" id="w4-body"></div>
+      </div>
+    </div>
     <div class="news-grid">
       <div class="panel">
         <div class="section-title">情緒走勢
@@ -314,6 +379,23 @@ pre.log .P3 { color: var(--muted); }
         <tbody></tbody>
       </table>
     </div>
+  </section>
+
+  <section id="wf-view" hidden>
+    <div class="n-alert" id="wf-alert" hidden></div>
+    <div class="wf-head" id="wf-head"></div>
+    <div class="panel scroll-x">
+      <table id="wf">
+        <thead><tr>
+          <th>狀態</th><th>工作流程</th><th>排程</th><th>最後執行</th><th>下次</th>
+          <th class="num" title="近 24 小時的執行次數（失敗次數）">24 小時</th><th>最後結果</th><th>主機</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="toolbar" style="margin-top:10px"><span class="legend">
+      資料來源：橋接目錄的 runs/&lt;W&gt;.jsonl（新版橋接每次執行都會記錄），沒有時改讀各橋接自己的狀態檔。
+      停滯＝錯過排程；W2 只在 08:00–05:00 執行。僅供顯示，不影響投票。</span></div>
   </section>
 
   <section id="detail-view" hidden>
@@ -675,6 +757,61 @@ const W_LABEL = { W2: "W2 跨市場", W3: "W3 新聞", W4: "W4 籌碼" };
 const SEV_LABEL = { high: "高", medium: "中", low: "低" };
 function tpeShort(iso) { return iso ? iso.slice(5, 16).replace("T", " ") : "—"; }
 function isoAgo(iso) { const t = Date.parse(iso || ""); return Number.isNaN(t) ? null : (Date.now() - t) / 1000; }
+
+const WF_CLS = { ok: "s-ok", stale: "s-warn", bad: "s-bad", off: "s-off", unknown: "s-off", idle: "s-off" };
+function fmtSigned(v) { return v === null || v === undefined ? "—" : (v > 0 ? "+" : "") + fmtInt(Math.round(v)); }
+function signedInt(v) {
+  return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, fmtSigned(v));
+}
+function fmtUntil(iso) {
+  const t = Date.parse(iso || "");
+  if (Number.isNaN(t)) return "—";
+  const m = Math.round((t - Date.now()) / 60000);
+  const when = iso.slice(11, 16);
+  if (m <= 0) return when + "（即將）";
+  return when + (m < 60 ? `（${m} 分後）` : m < 1440 ? `（${Math.floor(m / 60)} 小時後）` : "（明天）");
+}
+// One horizontal bar per symbol: fill from 0 to the move, solid ticks at the
+// alert thresholds, dotted at the vote thresholds.
+function pctBar(r, css) {
+  const ths = [r.down, r.up, r.vote_down, r.vote_up].filter((v) => typeof v === "number").map(Math.abs);
+  const span = Math.max(3, ...ths.map((v) => v * 1.5), Math.abs(r.pct || 0) * 1.1);
+  const pos = (v) => Math.max(0, Math.min(100, 50 + (v / span) * 50));
+  const bar = el("div", { class: "pbar", title: `警報 ${r.down}% / +${r.up}%・投票 ${r.vote_down}% / +${r.vote_up}%` });
+  if (typeof r.pct === "number") {
+    const f = el("div", { class: "fill" });
+    f.style.left = (r.pct >= 0 ? 50 : pos(r.pct)) + "%";
+    f.style.right = (r.pct >= 0 ? 100 - pos(r.pct) : 50) + "%";
+    f.style.background = r.pct >= 0 ? css("--up") : css("--down");
+    bar.append(f);
+  }
+  bar.append(el("div", { class: "zero" }));
+  for (const [v, cls] of [[r.down, "tick"], [r.up, "tick"], [r.vote_down, "tick vote"], [r.vote_up, "tick vote"]]) {
+    if (typeof v !== "number") continue;
+    const t = el("div", { class: cls }); t.style.left = pos(v) + "%"; bar.append(t);
+  }
+  return bar;
+}
+function sparkline(points) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("class", "spark"); svg.setAttribute("viewBox", "0 0 300 56");
+  svg.setAttribute("preserveAspectRatio", "none");
+  const vals = points.map((p) => p.net_oi);
+  if (vals.length < 2) return svg;
+  const lo = Math.min(...vals), hi = Math.max(...vals), rng = hi - lo || 1;
+  const xy = vals.map((v, i) => [i * 300 / (vals.length - 1), 50 - ((v - lo) / rng) * 44]);
+  const line = document.createElementNS(NS, "polyline");
+  line.setAttribute("class", "line"); line.setAttribute("vector-effect", "non-scaling-stroke");
+  line.setAttribute("points", xy.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" "));
+  const dot = document.createElementNS(NS, "circle");
+  const [lx, ly] = xy[xy.length - 1];
+  dot.setAttribute("class", "dot"); dot.setAttribute("cx", lx); dot.setAttribute("cy", ly); dot.setAttribute("r", 3);
+  const title = document.createElementNS(NS, "title");
+  title.textContent = `${points[0].date} ${fmtInt(vals[0])} → ${points[points.length - 1].date} ${fmtInt(vals[vals.length - 1])}（最低 ${fmtInt(lo)}，最高 ${fmtInt(hi)}）`;
+  svg.append(title, line, dot);
+  return svg;
+}
 
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
@@ -1104,8 +1241,144 @@ const App = {
       ...(evs.length ? evs : [el("span", { class: "muted" },
         !ev.configured ? "未設定 news.events_path" : ev.error ? ev.error : "近期無事件")]));
 
+    this.renderStrip(p.w2 || {});
+    this.renderChips(p.w4 || {});
     this.renderDrivers();
     this.drawNewsChart();
+  },
+
+  renderStrip(w) {
+    const box = $("w2-body");
+    if (!w.configured) return box.replaceChildren(el("div", { class: "sub" }, "未設定 news.signal_path"));
+    if (!w.known) {
+      return box.replaceChildren(
+        el("div", { class: "sub" }, "W2 尚未寫出報價檔（crossmarket_quotes.json）：橋接主機上的程式更新後才會出現逐檔報價。"),
+        w.last_result ? el("div", { class: "qline" }, el("span", null, "最後一輪 ",
+          el("b", null, w.last_check ? ago(isoAgo(w.last_check)) : "—")), el("span", null, w.last_result)) : null);
+    }
+    const css = (n) => this.css(n);
+    const q = w.quorum || {};
+    const head = el("div", { class: "qline" },
+      el("span", { class: w.stale ? "chip s-warn" : w.idle ? "chip s-off" : "chip s-ok" },
+        w.stale ? "停滯" : w.idle ? "閒置（05:00–08:00）" : "運作中"),
+      el("span", null, "更新 ", el("b", null, w.age_s !== null ? ago(w.age_s) : "—")),
+      el("span", null, `票數（需 ${q.min_symbols} 檔同向）`,
+        el("b", null, el("span", { class: "up" }, `漲 ${(q.up || []).length}`), " / ",
+          el("span", { class: "down" }, `跌 ${(q.down || []).length}`)),
+        q.direction ? el("span", { class: "rg " + (q.direction === "trending-up" ? "up" : "down"), style: "margin-left:6px" },
+          q.direction === "trending-up" ? "達票數・偏多" : "達票數・偏空") : null),
+      el("span", null, "最後觸發 ", el("b", null, w.last_fired
+        ? `${tpeShort(w.last_fired.at)} ${w.last_fired.labels.join("、")}` : "—")),
+      w.fetch_failed ? el("span", { class: "alert" }, `抓取失敗 ${w.fetch_failed} 檔`) : null);
+    const groups = (w.groups || []).map((g) => el("div", { class: "tgrp" },
+      el("h4", null, g.label, el("span", { class: "legend" }, g.hint)),
+      ...(g.rows.length ? g.rows.map((r) => el("div", {
+          class: "trow" + (r.fresh ? "" : " stale"),
+          title: `${r.symbol}・${r.price !== null ? "價 " + r.price.toLocaleString("zh-TW", { maximumFractionDigits: 2 }) + " / 前收 " + r.prev_close.toLocaleString("zh-TW", { maximumFractionDigits: 2 }) : "無報價"}` +
+            (r.age_s !== null ? `・報價 ${ago(r.age_s)}` : "") + (r.stale_reason ? `\n${r.stale_label}：${r.stale_reason}` : "") },
+        el("span", { class: "sym" }, el("b", null, r.name), " ", el("span", { class: "sub" }, r.symbol),
+          r.breach ? el("span", { class: "brk " + r.breach }, r.breach === "up" ? "破上" : "破下") : null),
+        el("span", { class: "pct " + (r.fresh && r.pct > 0 ? "up" : r.fresh && r.pct < 0 ? "down" : "muted") },
+          r.pct === null ? "—" : (r.pct > 0 ? "+" : "") + r.pct.toFixed(2) + "%"),
+        pctBar(r, css),
+        el("span", { class: "th" }, r.fresh ? `±${Math.abs(r.up)}・票 ±${Math.abs(r.vote_up)}` : r.stale_label)))
+        : [el("div", { class: "sub" }, "—")])));
+    box.replaceChildren(head, ...groups);
+  },
+
+  renderChips(c) {
+    const box = $("w4-body");
+    if (!c.configured) return box.replaceChildren(el("div", { class: "sub" }, "未設定 news.regime_vote_path"));
+    if (!c.known) return box.replaceChildren(el("div", { class: "sub" }, "找不到 W4 狀態檔（.chips_state.json）"));
+    const L = c.latest || {};
+    const head = el("div", { class: "chips-head" },
+      el("div", null, el("div", { class: "sub" }, `淨未平倉（${L.date || "—"}）`),
+        el("div", { class: "num" }, L.net_oi !== undefined && L.net_oi !== null ? fmtInt(Math.round(L.net_oi)) : "—")),
+      el("div", null, el("div", { class: "sub" }, "單日變化 ΔOI"),
+        el("div", { class: "num" }, signedInt(L.delta_oi))),
+      el("div", { class: "sub" }, `口數・最後檢查 ${c.last_check ? ago(isoAgo(c.last_check)) : "—"}`));
+    const kids = [head, c.spark && c.spark.length > 1 ? sparkline(c.spark) : null];
+    const d = (c.days || [])[0];
+    if (d) {
+      kids.push(el("div", { class: "decision" },
+        el("span", { class: "sub" }, `W4 決策（${d.date} 資料 → ${sessionKey(d.session)}）`),
+        d.decision ? el("span", { class: "rg " + (d.decision === "trending-up" ? "up" : "down") }, d.decision_label)
+          : el("span", { class: "rg none" }, d.decision_label),
+        d.final ? null : el("span", { class: "pend" }, "待重試"),
+        el("span", null, d.reason_zh)));
+      const rows = c.days.map((x) => el("tr", null,
+        td("日期", x.date),
+        td("淨未平倉", x.net_oi === null ? "—" : fmtInt(Math.round(x.net_oi)), "num"),
+        td("ΔOI", signedInt(x.delta_oi), "num"),
+        td("外資現貨", x.equity_net === null ? "—" : signedText(x.equity_net / 1e8, 1) + " 億", "num"),
+        td("決策", x.decision ? el("span", { class: x.decision === "trending-up" ? "up" : "down" }, x.decision_label)
+          : el("span", { class: "muted" }, x.decision_label)),
+        td("", el("span", { class: "sub" }, x.reason_zh), "why")));
+      kids.push(el("div", { class: "scroll-x" }, el("table", { class: "mini", id: "chips-days" },
+        el("thead", null, el("tr", null, el("th", null, "日期"), el("th", { class: "num" }, "淨未平倉"),
+          el("th", { class: "num" }, "ΔOI"), el("th", { class: "num" }, "外資現貨"), el("th", null, "決策"), el("th", null, "原因"))),
+        el("tbody", null, ...rows))));
+    } else {
+      kids.push(el("div", { class: "sub" }, "逐日決策紀錄要等 W4 更新到新版才會出現。"),
+        c.last_result ? el("div", { class: "qline" }, el("span", null, c.last_result)) : null);
+    }
+    box.replaceChildren(...kids);
+  },
+
+  // ── 工作流程 ──
+  async refreshWorkflows() {
+    if (!this.wfOpen) return;
+    try {
+      const w = await this.getJson("/api/workflows");
+      if (!this.wfOpen) return;
+      this.wf = w; this.lastOk = Date.now();
+      $("banner").classList.remove("show");
+      this.renderWorkflows();
+    } catch (e) {
+      $("banner").classList.add("show");
+    }
+  },
+
+  renderWorkflows() {
+    const w = this.wf;
+    const body = $("wf").tBodies[0];
+    const alert = $("wf-alert");
+    if (!w.available) {
+      alert.hidden = true;
+      $("wf-head").replaceChildren();
+      return body.replaceChildren(el("tr", null, el("td", { colspan: "8", class: "empty" },
+        "找不到 news 設定（settings.yaml 的 news 區段），無法定位橋接目錄")));
+    }
+    const hosts = w.data_hosts || [];
+    $("wf-head").replaceChildren(
+      el("span", { class: "sub" }, "本機 " + (w.host || "—")),
+      hosts.length
+        ? el("span", { class: "hostb" + (w.foreign_host ? "" : " same"),
+            title: "寫入 runs/*.jsonl 的主機" },
+            w.foreign_host ? `資料主機：${hosts.join("、")}（不是本機）` : "資料主機＝本機")
+        : el("span", { class: "hostb same", title: "舊版橋接不記錄主機" }, "資料主機：未記錄"));
+    if (w.all_stale) {
+      alert.hidden = false;
+      alert.textContent = "⚠ 所有橋接資料都已停滯：這台主機的橋接目錄可能已凍結，排程在另一台主機執行。請改看橋接主機上的儀表板。";
+    } else {
+      alert.hidden = true;
+    }
+    body.replaceChildren(...w.rows.map((r) => el("tr", null,
+      td("", el("span", { class: "chip " + (WF_CLS[r.status] || "s-off") }, r.status_label), "first"),
+      td("工作流程", el("div", null, el("span", { class: "wid" }, r.id), r.name,
+        el("div", { class: "sub" }, r.desc))),
+      td("排程", r.schedule),
+      td("最後執行", r.last_run ? el("span", { title: r.last_run }, ago(r.age_s),
+        el("div", { class: "sub" }, tpeShort(r.last_run))) : "—"),
+      td("下次", r.next_due ? fmtUntil(r.next_due) : "—"),
+      td("24 小時", r.source === "runs" ? el("span", null, fmtInt(r.runs_24h),
+        r.fails_24h ? el("span", { class: "alert" }, `（失敗 ${r.fails_24h}）`) : null)
+        : el("span", { class: "muted", title: "舊版橋接不記錄每次執行" }, "—"), "num"),
+      td("", el("div", null, r.error ? el("span", { class: "err" }, r.error) : null,
+        r.result || (r.error || r.note ? "" : "—"),
+        r.note ? el("div", { class: "sub" }, r.note) : null), "res"),
+      td("主機", r.host || el("span", { class: "muted" }, "—")),
+    )));
   },
 
   renderDrivers() {
@@ -1170,11 +1443,15 @@ const App = {
     const m = location.hash.match(/^#bot=(.+)$/);
     this.current = m ? decodeURIComponent(m[1]) : null;
     this.newsOpen = location.hash === "#news";
-    for (const b of $("nav").children) b.classList.toggle("on", (b.dataset.view === "news") === this.newsOpen);
-    $("fleet-view").hidden = !!this.current || this.newsOpen;
+    this.wfOpen = location.hash === "#workflows";
+    const view = this.newsOpen ? "news" : this.wfOpen ? "workflows" : "";
+    for (const b of $("nav").children) b.classList.toggle("on", b.dataset.view === view);
+    $("fleet-view").hidden = !!this.current || this.newsOpen || this.wfOpen;
     $("detail-view").hidden = !this.current;
     $("news-view").hidden = !this.newsOpen;
+    $("wf-view").hidden = !this.wfOpen;
     if (this.newsOpen) this.refreshNews();
+    else if (this.wfOpen) this.refreshWorkflows();
     else if (this.current) {
       this.fitNext = true; this.ivInit = true;
       this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
@@ -1521,6 +1798,7 @@ const App = {
     setInterval(() => this.refreshFleet(), 5000);
     setInterval(() => this.refreshDetail(), 10000);
     setInterval(() => this.refreshNews(), 60000);
+    setInterval(() => this.refreshWorkflows(), 30000);
     setInterval(() => this.renderUpdated(), 1000);
   },
 };
