@@ -27,7 +27,7 @@ Per trade:
 
 Pre-#92 prices on a confirmed real order are replaced, not excluded: the
 June-July 2026 real trades made most of the account's gains, and their
-simulated P&L tracks the account balance within ~2k NTD a month (Steven
+simulated P&L tracks the account balance within ~2k NTD a month (2026-11
 audit, docs/real_order_signature.md), while the recorded day averages do
 not. Rows that are not ``source == "real"`` keep the exclusion: an
 unaudited legacy row with only a planted price may be a paper trade.
@@ -97,17 +97,18 @@ def is_real_order(trade: dict) -> bool:
     but its confirmation was lost (a dropped race, an OpenInterest error,
     a missed deal row).
 
-    Builds that stamp ``entry_order_seq`` / ``exit_order_seq`` (the
-    SendFutureOrderCLR seq, written when the order is accepted) carry the
-    proof on the trade itself, so for those rows the seq decides and a
-    stray price is not proof. Older rows lack the keys; for them a recorded
-    real price is the only evidence an order went out. Pre-#92 paper rows
+    Trades opened by builds that stamp ``entry_order_seq`` /
+    ``exit_order_seq`` (the SendFutureOrderCLR seq, written when the order
+    is accepted) carry ``seq_tracked: true``; for those the seq decides and
+    a stray price is not proof. Older trades lack the marker (a save by the
+    new build writes the seq keys as "" but keeps ``seq_tracked`` False),
+    so for them a recorded real price is still the evidence. Pre-#92 paper rows
     can also carry a day-average exit price planted from GetFulfillReport;
     ``docs/real_order_signature.md`` is the log audit that clears those.
     """
     if str(trade.get("source") or "") == "real":
         return True
-    if "entry_order_seq" in trade or "exit_order_seq" in trade:
+    if trade.get("seq_tracked") is True:
         return bool(str(trade.get("entry_order_seq") or "").strip()
                     or str(trade.get("exit_order_seq") or "").strip())
     return bool(_int(trade.get("real_entry_price")) or _int(trade.get("real_exit_price")))

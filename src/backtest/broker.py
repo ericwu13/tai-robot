@@ -101,6 +101,11 @@ class Trade:
     # from the trade alone.
     entry_order_seq: str = ""
     exit_order_seq: str = ""
+    # True when the position was opened by a build that stamps the seqs, so
+    # an empty seq really means "no real order". False on trades restored
+    # from older session files: there an empty seq says nothing and the
+    # dashboard keeps its legacy price rule (#258 review P2).
+    seq_tracked: bool = False
     # Display name of the strategy whose signal OPENED this trade. In
     # regime mode one bot's restored history spans several strategies
     # (manual redeploys on regime switches), so per-trade attribution
@@ -290,6 +295,13 @@ class SimulatedBroker:
         # Seq no of the real entry order for the open position (see
         # Trade.entry_order_seq); snapshotted into the Trade on close.
         self.entry_order_seq: str = ""
+        # Whether the open position was opened by this (seq-stamping) code;
+        # False for a position restored from an older session file.
+        self.entry_seq_tracked: bool = False
+        # Seq of a real EXIT order sent while the sim position was still
+        # open (stop-close sends the order before the sim force-close).
+        # Attached to that position's Trade when it closes.
+        self.pending_exit_order_seq: str = ""
 
         # Last exit metadata — read by live_runner to determine real order type
         self.last_exit_type: str = ""  # "limit", "stop", "close", "force_close"
@@ -408,6 +420,8 @@ class SimulatedBroker:
                 self.real_entry_price = 0
                 self.real_entry_dt = ""
                 self.entry_order_seq = ""
+                self.entry_seq_tracked = True
+                self.pending_exit_order_seq = ""
         self._pending_entries.clear()
 
     def check_exits(self, bar_index: int, open_: int, high: int, low: int, close: int, bar_dt: str = "") -> None:
@@ -522,6 +536,8 @@ class SimulatedBroker:
             source=source,
             strategy=self.entry_strategy,
             entry_order_seq=self.entry_order_seq,
+            exit_order_seq=self.pending_exit_order_seq,
+            seq_tracked=self.entry_seq_tracked,
         )
         self.trades.append(trade)
         self._cumulative_pnl += pnl
@@ -538,6 +554,8 @@ class SimulatedBroker:
         self.real_entry_price = 0
         self.real_entry_dt = ""
         self.entry_order_seq = ""
+        self.entry_seq_tracked = False
+        self.pending_exit_order_seq = ""
         self._pending_exits.clear()
         self._exit_bar_index = bar_index
 
@@ -639,6 +657,11 @@ class SimulatedBroker:
         latest trade). The stamp is dropped, returning False, when it no
         longer matches: flat / no trade, a different bar index, or a seq
         already stamped for that leg (a retry keeps the first order's seq).
+
+        An EXIT sent while the sim position is still open (the stop-close
+        path sends the order before the sim force-close) belongs to that
+        open position, not to the last closed trade: it is held in
+        ``pending_exit_order_seq`` and lands on the Trade at close.
         """
         seq = str(seq or "").strip()
         if not seq:
@@ -648,6 +671,11 @@ class SimulatedBroker:
                     or self.entry_bar_index != bar_index):
                 return False
             self.entry_order_seq = seq
+            return True
+        if self.position_size > 0:
+            if self.pending_exit_order_seq:
+                return False
+            self.pending_exit_order_seq = seq
             return True
         if not self.trades:
             return False
@@ -700,6 +728,8 @@ class SimulatedBroker:
             "real_entry_price": self.real_entry_price,
             "real_entry_dt": self.real_entry_dt,
             "entry_order_seq": self.entry_order_seq,
+            "entry_seq_tracked": self.entry_seq_tracked,
+            "pending_exit_order_seq": self.pending_exit_order_seq,
             "trades": [
                 {
                     "tag": t.tag, "side": t.side.value, "qty": t.qty,
@@ -717,6 +747,7 @@ class SimulatedBroker:
                     "strategy": t.strategy,
                     "entry_order_seq": t.entry_order_seq,
                     "exit_order_seq": t.exit_order_seq,
+                    "seq_tracked": t.seq_tracked,
                 }
                 for t in self.trades
             ],
@@ -762,6 +793,8 @@ class SimulatedBroker:
         broker.real_entry_price = data.get("real_entry_price", 0)
         broker.real_entry_dt = data.get("real_entry_dt", "")
         broker.entry_order_seq = str(data.get("entry_order_seq", "") or "")
+        broker.entry_seq_tracked = bool(data.get("entry_seq_tracked", False))
+        broker.pending_exit_order_seq = str(data.get("pending_exit_order_seq", "") or "")
         broker.trades = [
             Trade(
                 tag=t["tag"], side=OrderSide(t["side"]), qty=t["qty"],
@@ -779,6 +812,7 @@ class SimulatedBroker:
                 strategy=t.get("strategy", ""),
                 entry_order_seq=str(t.get("entry_order_seq", "") or ""),
                 exit_order_seq=str(t.get("exit_order_seq", "") or ""),
+                seq_tracked=bool(t.get("seq_tracked", False)),
             )
             for t in data.get("trades", [])
         ]

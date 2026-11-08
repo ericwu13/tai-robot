@@ -109,6 +109,18 @@ def orders_from(events):
     return uniq, fills, deploys
 
 
+def _covered(hours: set, when: datetime) -> bool:
+    """Log coverage for the whole match window, not just the leg's hour:
+    a window that crosses an hour boundary needs both hours logged, or an
+    order sent just across the boundary could be missed unseen."""
+    t, end = (when - WIN_BEFORE).replace(minute=0, second=0), when + WIN_AFTER
+    while t <= end:
+        if t.strftime("%Y-%m-%d %H") not in hours:
+            return False
+        t += timedelta(hours=1)
+    return True
+
+
 def mode_at(deploys, when):
     mode = ""
     for ts, m in deploys:
@@ -150,7 +162,7 @@ def classify(path: str) -> dict:
             o = orders[j] if j is not None else None
             if o is not None and o["ok"]:
                 used.add(j)
-            legs[leg] = {"order": o, "covered": when.strftime("%Y-%m-%d %H") in hours,
+            legs[leg] = {"order": o, "covered": _covered(hours, when),
                          "mode": mode_at(deploys, when)}
         e_ok = bool(legs["entry"]["order"] and legs["entry"]["order"]["ok"])
         x_ok = bool(legs["exit"]["order"] and legs["exit"]["order"]["ok"])

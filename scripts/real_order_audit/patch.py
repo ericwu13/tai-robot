@@ -1,7 +1,7 @@
 """Apply audited real/paper verdicts to a COPY of a bot's session.json.
 
 usage: python patch.py <session.json> <match.json> <out_session.json> <out_audit.json>
-       [--override IDX=VERDICT ...]
+       [--override IDX=VERDICT] [--override IDX=VERDICT] ...
 
 Changes only real-vs-paper fields:
   REAL / REAL_ENTRY_ONLY  -> source = "real"
@@ -14,20 +14,34 @@ aborts. Every change is written to the audit file with old -> new values.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
+
+VERDICTS = ("REAL", "REAL_ENTRY_ONLY", "REAL_EXIT_ONLY", "PAPER", "UNKNOWN")
 
 PAPER_CLEAR = {"real_entry_price": 0, "real_entry_dt": "", "real_exit_price": 0,
                "real_exit_dt": "", "real_exit_estimated": False}
 
 
-def main(argv):
-    sess_path, match_path, out_path, audit_path = argv[1:5]
+def _parse_args(argv):
+    ap = argparse.ArgumentParser(description="apply audited verdicts to a session.json copy")
+    for name in ("session", "match", "out_session", "out_audit"):
+        ap.add_argument(name)
+    ap.add_argument("--override", action="append", default=[], metavar="IDX=VERDICT",
+                    help="hand-reviewed verdict for one trade index; repeat per trade")
+    a = ap.parse_args(argv[1:])
     overrides = {}
-    if "--override" in argv:
-        for item in argv[argv.index("--override") + 1:]:
-            i, _, v = item.partition("=")
-            overrides[int(i)] = v
+    for item in a.override:
+        i, sep, v = item.partition("=")
+        if not sep or not i.strip().isdigit() or v not in VERDICTS:
+            ap.error(f"bad --override {item!r} (want IDX=one of {', '.join(VERDICTS)})")
+        overrides[int(i)] = v
+    return a.session, a.match, a.out_session, a.out_audit, overrides
+
+
+def main(argv):
+    sess_path, match_path, out_path, audit_path, overrides = _parse_args(argv)
     with open(sess_path, encoding="utf-8") as fh:
         sess = json.load(fh)
     with open(match_path, encoding="utf-8") as fh:
