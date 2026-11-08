@@ -6319,6 +6319,7 @@ class BacktestApp:
                         final_status=final_status,
                         reason_kind=reason_kind,
                         reason=reason,
+                        verdict_text=reason,
                         ai_calls=0,
                     )
                     fields.update(extra)
@@ -7034,6 +7035,10 @@ class BacktestApp:
                 plan = ""
                 directives = None
                 history_written = False
+                # Candidate code and class, set once Phase 2 builds them.
+                # _remember stores the code (FAILs too) for forward re-scoring.
+                code = ""
+                candidate_cls = None
 
                 def _remember(final_status, reason_kind, reason="", **extra):
                     # One record per attempt. Building the gate blocks and
@@ -7070,6 +7075,13 @@ class BacktestApp:
                             pass
                     history_written = True
                     try:
+                        # The full operator-visible text (Discord cuts it).
+                        extra.setdefault("verdict_text", reason)
+                        if code and "candidate_source" not in extra:
+                            extra["candidate_source"] = code
+                        if candidate_cls is not None:
+                            extra.setdefault(
+                                "candidate_name", candidate_cls.__name__)
                         _persist_evolution_history(
                             bot_dir,
                             bot=display_name,
@@ -8068,6 +8080,7 @@ class BacktestApp:
                         candidate_source=code or "",
                         candidate_name=candidate_cls.__name__,
                         baseline_name=base_cls_name,
+                        verdict_text=block,
                     )
                     _evolution_history_sealed()
                 except Exception as e:
