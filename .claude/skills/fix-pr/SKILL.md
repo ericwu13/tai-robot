@@ -31,8 +31,11 @@ release); this one ends at a draft PR and a comment on the issue.
 
 - Spawn ONE implementation agent, **model opus** (CLAUDE.md model
   preference), **isolation: worktree** — the main working tree is
-  off-limits: live bots run python processes out of it, and even a
-  branch checkout churns files under them.
+  off-limits: it is the owner's tree, usually behind origin/master, and a
+  checkout there churns their files. The agent's first steps: `git fetch
+  origin`, branch from `origin/master` (`git switch -c fix/issue-<N>
+  origin/master`), confirm `git rev-list --count HEAD..origin/master` = 0.
+  Never branch from the main tree's HEAD.
 - The agent's mandate: follow CLAUDE.md conventions; write unit tests
   **designed to FAIL against the pre-fix code** (state which ones fail
   pre-fix); grep for existing tests that PINNED the bug and rewrite them
@@ -40,7 +43,8 @@ release); this one ends at a draft PR and a comment on the issue.
   suite green (worktree note: `tests/test_session_replay.py` skips there
   because gitignored `data/` is absent — expected); commit on branch
   `fix/issue-<N>` (conventional message, ending with
-  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`); push;
+  the `Co-Authored-By:` line the session's attribution instructions give —
+  it names the model that actually wrote the commit); push;
   `gh pr create --draft` with Root cause / The fix / Tests / "Fixes #N"
   and the footer `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 - After it returns: verify with `gh pr view`, review the diff YOURSELF

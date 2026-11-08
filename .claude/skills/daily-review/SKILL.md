@@ -5,6 +5,18 @@ description: Orchestrate the full tai-robot health pipeline — fetch (monitor s
 
 # Daily Review — the orchestrator
 
+> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
+> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
+> run on **Steven**, not this PC. This PC's `data\live` holds only
+> retired/test bots and its n8n is stopped. Read live state from the
+> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
+> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
+> describes this PC only — never publish it as fleet health. Host map →
+> `start-here`. Run checkers from an up-to-date checkout
+> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
+> weeks behind.
+
 This skill sequences the pipeline; the knowledge lives in the stage
 skills. Keep every stage light: a GREEN day with no fresh issues costs
 one script run, one `gh` call, and zero subagents. The scheduled task
@@ -85,14 +97,16 @@ comment it on the issue per that skill.
 ## Timing
 
 Sweet spot **05:10–05:30 TPE**: night closed, classification + P&L
-recorded, DAY not yet open. This machine's OS clock is UTC-7 — 05:10 TPE
-= **14:10 local the PREVIOUS day**; schedulers use local time.
+recorded, DAY not yet open. 05:10 TPE = 14:10 local PDT / **13:10 local PST**
+the PREVIOUS day (this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there)). A local-time cron drifts one hour at each DST change.
 
 ## Gotchas
 
-- `data/live` holds ~30 retired test-bot dirs; their P3 "archaeology"
-  findings are expected noise — the digest carries live bots and P1/P2
-  only.
+- This PC's `data/live` holds only retired/test bots (the fleet is on
+  Steven); a local run's N8N section is expected P1 noise (n8n retired
+  2026-10-24) — drop it, never publish it.
+- `daily_review_<date>_grok.md` is Grok's parallel run (no Discord). A
+  fresh Grok file does not mean Claude reviewed.
 - Never pass the script's `--discord` flag from this pipeline — stage 4
   composes its own interpreted message; the flag posts the raw digest.
 - `data/` is gitignored; the report file is never committed.

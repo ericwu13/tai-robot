@@ -1,6 +1,6 @@
 ---
 name: n8n-debug
-description: Self-serve diagnosis of the local n8n news-bridge instance (W1-W5 workflows) — find why a workflow failed, never fired, or isn't imported/active, without the user in the loop. Use when a bridge script errors, a vote/signal file is missing, a Discord alert didn't arrive, or an n8n workflow/execution needs inspecting.
+description: HISTORY ONLY (local n8n stopped since 2026-10-24; current W1-W4 are Steven scheduled tasks — use bridge-health) — self-serve diagnosis of the retired local n8n news-bridge instance (W1-W5 workflows) — find why a workflow failed, never fired, or isn't imported/active, without the user in the loop. Use when a bridge script errors, a vote/signal file is missing, a Discord alert didn't arrive, or an n8n workflow/execution needs inspecting.
 ---
 
 # n8n News-Bridge Debugging
@@ -62,7 +62,7 @@ C:/Python313/python.exe .claude/skills/n8n-debug/scripts/n8n_query.py status
    `workflow.started` events = trigger not registered) → `status`
    (workflow INACTIVE? = imported but never published) → wrong firing
    HOUR = `GENERIC_TIMEZONE`/`TZ` envs lost from the service (memory:
-   the OS clock is UTC-7, n8n needs Asia/Taipei pinned).
+   the OS clock is US Pacific, n8n needs Asia/Taipei pinned).
 4. **"Workflow not in the list at all"** → `status` shows every
    `workflow_entity` row including ARCHIVED. Not there = never imported:
    `n8n import:workflow --input=<repo>/scripts/news_bridge/n8n/<file>.json`
