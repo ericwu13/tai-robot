@@ -18,10 +18,19 @@ data error, not slippage.
 
 Per trade:
     real        both prices trusted
-    estimated   one price trusted, the other never recorded (sim used)
+    estimated   one price trusted, the other never recorded (sim used); or a
+                CONFIRMED real order (``source == "real"``) whose pre-#92
+                prices were replaced by the simulated ones
     unreliable  a recorded price fails the trust rule (kept out of totals)
     missing     a real order with no recorded fill price at all
     ""          not a real-order trade
+
+Pre-#92 prices on a confirmed real order are replaced, not excluded: the
+June-July 2026 real trades made most of the account's gains, and their
+simulated P&L tracks the account balance within ~2k NTD a month (Steven
+audit, docs/real_order_signature.md), while the recorded day averages do
+not. Rows that are not ``source == "real"`` keep the exclusion: an
+unaudited legacy row with only a planted price may be a paper trade.
 
 All amounts are gross: before broker fees and the futures transaction tax.
 
@@ -67,10 +76,13 @@ def _parse(text) -> datetime | None:
         return None
 
 
+PRE_92 = "recorded before #92 (2026-07-26)"
+
+
 def _price_check(real: int, sim: int, when: datetime | None) -> str:
     """"" when the recorded real price is trustworthy, else the reason."""
     if when is None or when < REAL_PRICES_TRUSTED_FROM:
-        return "recorded before #92 (2026-07-26)"
+        return PRE_92
     if sim > 0 and abs(real - sim) > sim * IMPLAUSIBLE_FRACTION:
         return f"implausible fill price {real} (sim {sim})"
     return ""
@@ -111,19 +123,26 @@ def classify(trade: dict, point_value: int) -> dict:
     if not real_entry and not real_exit:
         out.update(status="missing", reason="no recorded fill price")
         return out
-    problems = []
+    problems, replaced = [], []
+    confirmed = str(trade.get("source") or "") == "real"
     side = str(trade.get("side") or "").upper()
     if side not in ("LONG", "SHORT"):
         problems.append(f"unknown side {side or '(none)'}")
     if real_entry:
         why = _price_check(real_entry, sim_entry,
                            _parse(trade.get("real_entry_dt")) or _parse(trade.get("entry_dt")))
-        if why:
+        if why == PRE_92 and confirmed:
+            real_entry = 0
+            replaced.append("entry")
+        elif why:
             problems.append(f"entry: {why}")
     if real_exit:
         why = _price_check(real_exit, sim_exit,
                            _parse(trade.get("real_exit_dt")) or _parse(trade.get("exit_dt")))
-        if why:
+        if why == PRE_92 and confirmed:
+            real_exit = 0
+            replaced.append("exit")
+        elif why:
             problems.append(f"exit: {why}")
     if problems:
         out.update(status="unreliable", reason="; ".join(problems))
@@ -135,7 +154,10 @@ def classify(trade: dict, point_value: int) -> dict:
     real_pnl = (exit_ - entry) * sign * qty * point_value
     out.update(status="real" if real_entry and real_exit else "estimated",
                real_pnl=real_pnl, slippage=real_pnl - _int(trade.get("pnl")))
-    if out["status"] == "estimated":
+    if replaced:
+        out["reason"] = (f"{' and '.join(replaced)} price recorded before #92 "
+                         "(2026-07-26); sim price used")
+    elif out["status"] == "estimated":
         if not real_exit and trade.get("real_exit_estimated"):
             out["reason"] = ("exit fill not captured; sim price kept (est.)")
         else:

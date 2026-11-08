@@ -49,12 +49,42 @@ def test_long_side_sign():
 
 
 def test_pre_92_day_average_exit_is_unreliable_even_when_plausible():
+    """An unaudited legacy row (no ``source``) with a pre-#92 price may be a
+    paper trade carrying a planted day average: keep it out of totals."""
     t = trade(exit_dt="2026-06-27 04:58:00", real_exit_dt="2026-06-27 04:58:38",
               entry_dt="2026-06-26 15:01:00", real_entry_dt="2026-06-26 15:01:02",
-              entry=45100, exit_=45012, real_entry=45104, real_exit=45811)
+              entry=45100, exit_=45012, real_entry=45104, real_exit=45811, source="")
     c = real_pnl.classify(t, PV)
     assert c["status"] == "unreliable" and "#92" in c["reason"]
     assert c["real_pnl"] is None
+
+
+def test_confirmed_pre_92_real_order_counts_at_the_sim_prices():
+    """A confirmed real order before #92 is real money: its day-average
+    prices (45811 here, 799 points off) are replaced by the simulated ones,
+    which track the account balance, instead of dropping the trade."""
+    t = trade(exit_dt="2026-06-27 04:58:00", real_exit_dt="2026-06-27 04:58:38",
+              entry_dt="2026-06-26 15:01:00", real_entry_dt="2026-06-26 15:01:02",
+              entry=45100, exit_=45012, real_entry=45104, real_exit=45811, source="real")
+    c = real_pnl.classify(t, PV)
+    assert c["status"] == "estimated" and "#92" in c["reason"]
+    assert c["real_pnl"] == (45100 - 45012) * PV == t["pnl"]
+    assert c["slippage"] == 0
+
+
+def test_pre_92_entry_with_a_post_92_exit_keeps_the_trusted_exit():
+    t = trade(entry_dt="2026-07-25 21:00:00", real_entry_dt="2026-07-25 21:00:02",
+              exit_dt="2026-07-27 09:00:00", real_exit_dt="2026-07-27 09:00:03",
+              entry=45000, exit_=44900, real_entry=45300, real_exit=44910)
+    c = real_pnl.classify(t, PV)
+    assert c["status"] == "estimated" and "entry price recorded before #92" in c["reason"]
+    assert c["real_pnl"] == (45000 - 44910) * PV
+
+
+def test_post_92_implausible_price_is_still_unreliable_on_a_confirmed_order():
+    t = trade(side="LONG", entry=46572, exit_=46600, real_entry=46570, real_exit=200,
+              source="real")
+    assert real_pnl.classify(t, PV)["status"] == "unreliable"
 
 
 def test_absurd_price_after_92_is_a_data_error_not_slippage():
@@ -112,8 +142,10 @@ def test_real_order_without_any_recorded_fill_is_missing():
 
 def test_fill_time_falls_back_to_the_trade_time():
     t = trade(real_entry=45001, real_exit=44899, real_entry_dt="", real_exit_dt="",
-              exit_dt="2026-07-10 04:58:00", entry_dt="2026-07-09 15:00:00")
+              exit_dt="2026-07-10 04:58:00", entry_dt="2026-07-09 15:00:00", source="")
     assert real_pnl.classify(t, PV)["status"] == "unreliable"
+    t["source"] = "real"
+    assert "before #92" in real_pnl.classify(t, PV)["reason"]
 
 
 def test_summary_totals_today_and_exclusions():
@@ -124,7 +156,7 @@ def test_summary_totals_today_and_exclusions():
         trade(real_entry=45000, real_exit=0, exit_dt="2026-10-26 10:00:00",        # est +1000, today
               entry_dt="2026-10-26 09:40:00"),
         trade(real_entry=45000, real_exit=45811, exit_dt="2026-06-27 04:58:00",    # unreliable
-              entry_dt="2026-06-26 15:00:00"),
+              entry_dt="2026-06-26 15:00:00", source=""),
         trade(source="real"),                                                      # missing
         trade(source="paper", real_exit=44000),                                    # real order, absurd exit
         trade(source="paper"),                                                     # not real
