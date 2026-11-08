@@ -269,6 +269,7 @@ def _position(broker: dict, point_value: int, last_close: int | None) -> dict | 
 
 
 _stat_cache: dict[str, tuple[int, int, object]] = {}
+RUN_LOG_TAIL = 800
 
 
 def _read_if_changed(path: str, load, valid):
@@ -810,6 +811,14 @@ def _read_json_dict(path: str):
     bridge wrote it, minutes before its next write.
     """
     return _read_if_changed(path, fileio.read_json, lambda d: isinstance(d, dict))
+
+
+def _read_run_lines(path: str):
+    """Tail of a bridge run log (``runs/<W>.jsonl``), stat-gated like
+    ``_read_json_dict``: the log is appended every pass and trimmed with
+    an ``os.replace`` an open handle would break."""
+    return _read_if_changed(path, lambda p: fileio.tail_lines(p, RUN_LOG_TAIL),
+                            lambda d: isinstance(d, list))
 
 
 def _news_blocks_leg(sess: dict) -> bool:

@@ -704,6 +704,37 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     return state
 
 
+class _NoRunLog:
+    """Stand-in when src/news/bridge_runs.py cannot be loaded."""
+    result = ""
+    exit_code = None
+
+    def fail(self, error):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _run_recorder(bridge_dir, workflow: str):
+    """``bridge_runs.run_recorder`` (runs/<W>.jsonl for the dashboard's
+    工作流程 view), loaded by file path like ``_get_write_regime_vote``.
+    Bookkeeping only — a load failure degrades to a no-op."""
+    try:
+        import importlib.util
+        mod_path = Path(__file__).resolve().parents[2] / "src" / "news" / "bridge_runs.py"
+        spec = importlib.util.spec_from_file_location("bridge_runs", mod_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.run_recorder(bridge_dir, workflow)
+    except Exception as e:  # noqa: BLE001
+        print(f"  run log unavailable: {type(e).__name__}: {e}")
+        return _NoRunLog()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="W3 RSS+Gemini news scorer")
     ap.add_argument("--settings", required=True, help="path to settings.yaml")
@@ -734,6 +765,9 @@ def main() -> int:
 
     if not cfg["gemini_api_key"] and not args.force_fire:
         print("ERROR: ai.google_api_key not set in settings.yaml")
+        with _run_recorder(Path(state_path).parent, "W3") as run:
+            run.exit_code = 1
+            run.fail("ai.google_api_key not set in settings.yaml")
         return 1
 
     if args.force_fire:
@@ -757,18 +791,34 @@ def main() -> int:
         interval = cfg["interval_minutes"] * 60
         print(f"looping every {cfg['interval_minutes']}m")
         while True:
-            state = check_once(cfg, state, vote_out)
-            save_state(state_path, state)
+            state = _recorded_pass(cfg, state, vote_out, state_path)
             append_log(log_dir / LOG_NAME,
                        f"{datetime.now(_TZ_TAIPEI):%Y-%m-%d %H:%M:%S} TPE | "
                        f"scored {state.get('last_articles_scored', 0)} | "
                        f"net {state.get('last_net_score', 0):+.2f}")
             time.sleep(interval)
     else:
-        state = check_once(cfg, state, vote_out)
-        save_state(state_path, state)
+        state = _recorded_pass(cfg, state, vote_out, state_path)
 
     return 0
+
+
+def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str) -> dict:
+    """One scoring pass + state save, logged to runs/W3.jsonl.  A pass
+    whose Gemini scoring failed (error_streak went up) is a failed run
+    even though the process itself carries on."""
+    with _run_recorder(Path(state_path).parent, "W3") as run:
+        before = int(state.get("error_streak") or 0)
+        state = check_once(cfg, state, vote_out)
+        save_state(state_path, state)
+        run.exit_code = 0
+        run.result = (f"fetched {state.get('last_fetched', '-')} | "
+                      f"new {state.get('last_new', '-')} | "
+                      f"scored {state.get('last_articles_scored', 0)} | "
+                      f"net {float(state.get('session_net') or 0):+.2f}")
+        if int(state.get("error_streak") or 0) > before:
+            run.fail(str(state.get("last_error") or "scoring failed"))
+    return state
 
 
 if __name__ == "__main__":
