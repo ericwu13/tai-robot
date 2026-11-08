@@ -7169,7 +7169,11 @@ class BacktestApp:
                         retire_config=gate_cfg.retire,
                         structural_ledger=(structural_ledger or str(
                             BacktestApp._structural_ledger_path(self))),
-                        structural_lane=bool(structural_lane),
+                        # Unchanged rule: the lane's own run, or a ledger
+                        # file this run was pointed at that exists.
+                        run_followup=bool(structural_lane or (
+                            structural_ledger
+                            and os.path.exists(structural_ledger))),
                         log=_log,
                     )
 

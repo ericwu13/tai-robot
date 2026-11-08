@@ -23,7 +23,6 @@ raises: a failure is logged and an empty report comes back.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -58,13 +57,15 @@ def run_retire_review(*, base_trades, strategy_name: str, version: str,
                       gate_mode: str, verdict_passed: bool,
                       retire_config: RetireConfig | None,
                       structural_ledger: str = "",
-                      structural_lane: bool = False,
+                      run_followup: bool = False,
                       log=None, now: datetime | None = None) -> RetireReview:
     """Record this Saturday and run the retire check. Never raises.
 
     ``gate_mode`` is the resolved promotion-gate mode. Only ``relative``
     records a week: skips and absolute (real-money) runs neither count
-    nor reset the not-improvable streak (#188).
+    nor reset the not-improvable streak (#188). ``structural_ledger`` is
+    the resolved lane ledger path; ``run_followup`` says whether the
+    structural incubation follow-up runs (the caller's rule).
     """
     moment = now or datetime.now()
     review = RetireReview(evaluated_at=moment.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -123,8 +124,7 @@ def run_retire_review(*, base_trades, strategy_name: str, version: str,
             strategy_name=strategy_name,
             version=version,
         )
-        if structural_lane or (
-                structural_ledger and os.path.exists(structural_ledger)):
+        if run_followup:
             from .structural_lane import structural_saturday_followup
             structural_saturday_followup(
                 structural_ledger,
