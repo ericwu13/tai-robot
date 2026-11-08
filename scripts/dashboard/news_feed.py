@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import threading
 
 from scripts.dashboard import fileio
 from scripts.news_bridge import rss_news_log
@@ -19,6 +21,24 @@ WINDOW_BYTES = 4_000_000
 DEFAULT_LIMIT = 300
 MAX_LIMIT = 1000
 _DIRECTIONS = ("bullish", "bearish", "neutral")
+
+
+def article_clip() -> float:
+    """The scorer's per-article clip (the vote sums clipped scores).
+
+    Imported lazily: the page must still render if the bridge code is
+    broken, so fall back to the value it has always had.
+    """
+    try:
+        from scripts.news_bridge import rss_scorer
+        return float(rss_scorer.ARTICLE_CLIP)
+    except Exception:  # noqa: BLE001 — advisory
+        return 0.5
+
+
+def clip(score: float) -> float:
+    c = article_clip()
+    return max(-c, min(c, float(score)))
 
 
 class BadQuery(ValueError):
@@ -99,8 +119,34 @@ def parse_query(query: dict) -> dict:
     return out
 
 
+# /api/news and /api/news/pulse both need the same parsed window on every
+# refresh; parse it once per (path, mtime, size) instead of once per call.
+_items_cache: dict = {}
+_items_lock = threading.Lock()
+
+
 def read_items(path: str) -> list[dict]:
-    """Newest-first rows from the newest WINDOW_LINES of the log."""
+    """Newest-first rows from the newest WINDOW_LINES of the log.
+
+    Callers must not mutate the returned rows (they are shared).
+    """
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    with _items_lock:
+        hit = _items_cache.get("v")
+        if key is not None and hit and hit[0] == key:
+            return list(hit[1])
+    rows = _parse_items(path)
+    if key is not None:
+        with _items_lock:
+            _items_cache["v"] = (key, rows)
+    return list(rows)
+
+
+def _parse_items(path: str) -> list[dict]:
     rows = []
     for line in fileio.tail_lines(path, WINDOW_LINES, WINDOW_BYTES):
         line = line.strip()
@@ -165,7 +211,7 @@ def news_feed(path: str | None, filters: dict | None = None) -> dict:
             "net": round(sum(r["score"] for r in matched), 3),
             # What the vote actually sums: each article clipped to ±0.5
             # (rss_scorer.aggregate_scores), before the per-run EMA decay.
-            "net_clipped": round(sum(max(-0.5, min(0.5, r["score"])) for r in matched), 3),
+            "net_clipped": round(sum(clip(r["score"]) for r in matched), 3),
         },
         "latest": latest,
     }

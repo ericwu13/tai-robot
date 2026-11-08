@@ -88,7 +88,7 @@ def _check_votes(now, paths, tonight_key, lines, findings):
                 "P2", "bridge",
                 f"{st.source} alive but scoring failing for {st.error_streak} "
                 f"run(s): {st.error}",
-                paths["rss_state_file"] if st.source == "W3" else paths["regime_vote_path"]))
+                paths["rss_state_file"]))   # only W3 reports failing
         elif not st.known:
             findings.append(Finding(
                 "P3", "bridge",
