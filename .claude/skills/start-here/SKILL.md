@@ -98,7 +98,7 @@ in your report — do not stall the task waiting for Fable.
 
 | Task | Skill |
 |---|---|
-| build / test a strategy, run backtests, pull TradingView or KLine data, drive the AI chat headlessly | `strategy-research` (planned — until it exists: `run_bot_cli.py backtest --source tv|api`, see `deploy`) |
+| build / test a strategy, run backtests, pull TradingView or KLine data, drive the AI chat headlessly | `strategy-research` |
 | is a bot alive? | `bot-status` (local dirs) — or `/api/fleet` for the Steven fleet |
 | deploy / restart / stop a bot | `deploy`, then `deploy-check` |
 | regime didn't switch / bot idle | `regime-health` |

@@ -176,4 +176,4 @@ gone, `session.json` `saved_at` is fresh, and a daily report was written.
 - regime bot idle after deploy → `regime-health`
 - host / install map → `start-here`; remote shell → `tailscale-ssh`;
   confirm READY remotely → dashboard `/api/fleet`
-- just want a backtest, not a bot → `strategy-research` (planned; for now the `backtest` subcommand)
+- just want a backtest, not a bot → `strategy-research` (`run_bot_cli.py backtest`, `scripts/research/`)
