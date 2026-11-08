@@ -7010,17 +7010,12 @@ class BacktestApp:
                     eligible_for_validated_pool,
                     month_gate_config_from_mapping)
                 from src.evolution.paper_gate import (
-                    WeekRecord,
                     abs_pf_required,
                     assemble_promotion_verdict,
-                    assess_retirement,
-                    emit_retire_recommendation,
                     evolution_gate_config_from_mapping,
                     evolution_promotion_mode,
                     gate_provenance,
-                    relative_eval_summary,
                     resolve_promotion_gate,
-                    weeks_from_changelog,
                 )
                 bars = evo_data["bars"]
                 data_origin = evo_data["origin"]
@@ -7114,6 +7109,57 @@ class BacktestApp:
                         _log("EVO structural proposal record failed: "
                              f"[{type(e).__name__}] {e}")
                         return ""
+
+                def _resolve_evo_gate():
+                    # Decision time, not a start-of-run snapshot. Running
+                    # runner: its trading_mode. Idle or missing: configured
+                    # mode only — unknown stays unknown (absolute gate).
+                    cfg = evolution_gate_config_from_mapping(evolution_gate_raw)
+                    runner = getattr(self, "_live_runner", None)
+                    runner_idle = (
+                        runner is None
+                        or getattr(runner, "state", None) == LiveState.IDLE)
+                    promotion_mode = evolution_promotion_mode(
+                        runner=runner,
+                        runner_idle=runner_idle,
+                        configured_mode=getattr(self, "_trading_mode", None),
+                    )
+                    gate = resolve_promotion_gate(
+                        promotion_mode,
+                        cfg.paper_gate,
+                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
+                    )
+                    return cfg, gate
+
+                def _incumbent_trades() -> list:
+                    # The incumbent's own trades on the validation bars
+                    # (one continuous run, as the multi-fold baseline).
+                    try:
+                        side = run_ab_backtest(
+                            baseline_cls, bars, point_value, "基準 baseline",
+                            capital_base=capital_base)
+                        res = getattr(side, "result", None)
+                        return list(res.trades) if res is not None else []
+                    except Exception as e:
+                        _log("EVO retire baseline backtest failed: "
+                             f"[{type(e).__name__}] {e}")
+                        return []
+
+                def _retire_review(gate_mode, verdict_passed, gate_cfg, trades):
+                    from src.evolution.retire_review import run_retire_review
+                    return run_retire_review(
+                        base_trades=trades,
+                        strategy_name=display_name,
+                        version=(baseline_cls.__name__ if baseline_cls
+                                 else "Strategy"),
+                        gate_mode=gate_mode,
+                        verdict_passed=verdict_passed,
+                        retire_config=gate_cfg.retire,
+                        structural_ledger=(structural_ledger or str(
+                            BacktestApp._structural_ledger_path(self))),
+                        structural_lane=bool(structural_lane),
+                        log=_log,
+                    )
 
                 try:
                     # ── Phase 1: grid search, or the evolution plan ──
@@ -7217,10 +7263,25 @@ class BacktestApp:
                                 "Nothing was consumed: the watermark did NOT "
                                 "advance.\n"
                                 + "\n".join(grid_outcome.reasons))
+                            # No setting in the incumbent's knob neighbourhood
+                            # beat it: under the relative gate that is a failed
+                            # Saturday for the #188 "not improvable" streak, so
+                            # the retire check runs here too (it used to be
+                            # skipped by this early return).
+                            _np_cfg, _np_gate = _resolve_evo_gate()
+                            _np_review = _retire_review(
+                                _np_gate.mode, False, _np_cfg,
+                                _incumbent_trades())
+                            if _np_review.report_lines:
+                                msg += "\n" + "\n".join(_np_review.report_lines)
                             ui(self._append_chat, "system", msg)
                             if auto_run:
                                 _notify_discord(msg)
-                            _remember("fail", "grid_no_pick", msg)
+                            _remember(
+                                "fail", "grid_no_pick", msg,
+                                retire_evaluated=(_np_gate.mode == "relative"),
+                                retire_passed=False,
+                                ts=_np_review.evaluated_at)
                             return
                         plan = grid_outcome.rationale
                         directives = {
@@ -7570,31 +7631,13 @@ class BacktestApp:
                         f"({len(bars)} × {feed_iv // 60}min bars "
                         f"≈ {native_est} native bars)")
 
-                    evo_gate_cfg = evolution_gate_config_from_mapping(
-                        evolution_gate_raw)
+                    evo_gate_cfg, evo_gate = _resolve_evo_gate()
                     for warning in evo_gate_cfg.warnings:
                         _log(f"EVO gate config: {warning}")
                     month_gate_cfg = month_gate_config_from_mapping(
                         evolution_gate_raw)
                     for warning in month_gate_cfg.warnings:
                         _log(f"EVO month gate config: {warning}")
-                    # Decision time, not a start-of-run snapshot. Running
-                    # runner: its trading_mode. Idle or missing: configured
-                    # mode only — unknown stays unknown (absolute gate).
-                    runner = getattr(self, "_live_runner", None)
-                    runner_idle = (
-                        runner is None
-                        or getattr(runner, "state", None) == LiveState.IDLE)
-                    promotion_mode = evolution_promotion_mode(
-                        runner=runner,
-                        runner_idle=runner_idle,
-                        configured_mode=getattr(self, "_trading_mode", None),
-                    )
-                    evo_gate = resolve_promotion_gate(
-                        promotion_mode,
-                        evo_gate_cfg.paper_gate,
-                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
-                    )
                     from src.evolution.paper_gate import gate_for_trial
                     # Walk-forward uses the fallback (absolute when this run
                     # has no grid trial). assemble_promotion_verdict applies
@@ -7964,87 +8007,13 @@ class BacktestApp:
                                   "and STRATEGIES was not updated.")
                     # Recommend-only. A failure here must not change the verdict
                     # or the pool promotion above, and must not touch live state.
-                    evaluated_at = None
-                    try:
-                        append_changelog = None
-                        prior_weeks = []
-                        try:
-                            from src.daily_report.changelog import (
-                                append_changelog as _append_changelog,
-                                load_changelog,
-                            )
-                            append_changelog = _append_changelog
-                            prior_weeks = weeks_from_changelog(
-                                load_changelog(), display_name)
-                        except Exception as hist_err:
-                            _log("EVO retire history unread: "
-                                 f"[{type(hist_err).__name__}] {hist_err}")
-                        evaluated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                        weeks = list(prior_weeks)
-                        if evo_gate.mode == "relative":
-                            weeks.append(WeekRecord(
-                                at=evaluated_at, evaluated=True,
-                                passed=bool(verdict.passed)))
-                            if append_changelog is not None:
-                                try:
-                                    append_changelog(
-                                        strategy_name=display_name,
-                                        version_before=base_cls_name,
-                                        version_after=base_cls_name,
-                                        change_summary=relative_eval_summary(
-                                            bool(verdict.passed), evaluated_at),
-                                        initiated_by="ai",
-                                    )
-                                except Exception as rec_err:
-                                    _log("EVO relative-gate record failed: "
-                                         f"[{type(rec_err).__name__}] {rec_err}")
-                        _grad_stamps: list[str] = []
-                        try:
-                            from src.evolution.structural_lane import (
-                                applied_graduation_stamps, load_ledger)
-                            _grad_stamps = applied_graduation_stamps(
-                                load_ledger(structural_ledger or str(
-                                    BacktestApp._structural_ledger_path(self))))
-                        except Exception as stamp_err:
-                            _log("EVO graduation stamps unread: "
-                                 f"[{type(stamp_err).__name__}] {stamp_err}")
-                            _grad_stamps = []
-                        rec = assess_retirement(
-                            base_trades,
-                            weeks=weeks,
-                            structural_graduations=_grad_stamps,
-                            now=datetime.now(),
-                            config=evo_gate_cfg.retire,
-                        )
-                        report_lines: list[str] = []
-                        emit_retire_recommendation(
-                            rec,
-                            log=_log,
-                            changelog=(append_changelog if rec.recommend else None),
-                            report=report_lines,
-                            strategy_name=display_name,
-                            version=base_cls_name,
-                        )
-                        if structural_lane or (
-                                structural_ledger and os.path.exists(
-                                    structural_ledger)):
-                            from src.evolution.structural_lane import (
-                                structural_saturday_followup)
-                            structural_saturday_followup(
-                                structural_ledger or str(
-                                    BacktestApp._structural_ledger_path(self)),
-                                observations=(),
-                                log=_log,
-                                changelog=append_changelog,
-                                report=report_lines,
-                                strategy_name=display_name,
-                                version=base_cls_name,
-                            )
-                        if report_lines:
-                            block += "\n" + "\n".join(report_lines)
-                    except Exception as retire_err:
-                        _log("EVO retire recommendation failed: "
-                             f"[{type(retire_err).__name__}] {retire_err}")
+                    # Shared with the grid no-pick exit (src/evolution/retire_review.py).
+                    _review = _retire_review(
+                        evo_gate.mode, bool(verdict.passed), evo_gate_cfg,
+                        base_trades)
+                    evaluated_at = _review.evaluated_at
+                    if _review.report_lines:
+                        block += "\n" + "\n".join(_review.report_lines)
                     ui(self._remove_last_system_line)
                     ui(self._append_chat, "system", block)
                     if _proposal_notice:
