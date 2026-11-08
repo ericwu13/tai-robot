@@ -4,7 +4,7 @@ Each W1-W5 pass appends one JSON line to ``<bridge dir>/runs/<W>.jsonl``::
 
     {"v": 1, "workflow": "W4", "started_at": ..., "finished_at": ...,
      "duration_s": 3.1, "ok": true, "exit_code": 0, "result": "...",
-     "error": "", "host": "STEVEN"}
+     "error": "", "host": "HOST-A"}
 
 so the dashboard's 工作流程 view can answer "did it run, when, did it
 work, on which machine" without parsing four log formats.  ``host`` is

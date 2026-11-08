@@ -240,19 +240,19 @@ def test_w4_missed_slot_is_stale(bridge):
 def test_run_log_wins_and_reports_host(bridge):
     put(bridge / "monitor_state.json", {"last_check": iso(NOW - timedelta(hours=3))})
     bridge_runs.record_run(bridge, "W2", ok=True, result="fresh 4/11",
-                           finished_at=NOW - timedelta(minutes=1), host="STEVEN")
+                           finished_at=NOW - timedelta(minutes=1), host="HOST-A")
     bridge_runs.record_run(bridge, "W4", ok=False, error="ValueError: x",
-                           finished_at=NOW - timedelta(minutes=5), host="STEVEN")
+                           finished_at=NOW - timedelta(minutes=5), host="HOST-A")
     bridge_runs.record_run(bridge, "W5", ok=True, result="force-fire clear",
-                           finished_at=NOW - timedelta(days=2), host="STEVEN")
+                           finished_at=NOW - timedelta(days=2), host="HOST-A")
     out = wf.workflows(NOW, paths_for(bridge), reader, run_lines, host="PC")
     rows = by_id(out)
     assert rows["W2"]["status"] == "ok" and rows["W2"]["source"] == "runs"
-    assert rows["W2"]["host"] == "STEVEN" and rows["W2"]["runs_24h"] == 1
+    assert rows["W2"]["host"] == "HOST-A" and rows["W2"]["runs_24h"] == 1
     assert rows["W4"]["status"] == "bad" and rows["W4"]["error"] == "ValueError: x"
     assert rows["W4"]["fails_24h"] == 1
     assert rows["W5"]["status"] == "ok"
-    assert out["data_hosts"] == ["STEVEN"] and out["foreign_host"] is True
+    assert out["data_hosts"] == ["HOST-A"] and out["foreign_host"] is True
 
 
 def test_same_host_is_not_foreign(bridge):
@@ -326,10 +326,10 @@ def test_workflows_endpoint(wf_server):
 
 def test_local_paths_never_reach_the_client(bridge):
     bridge_runs.record_run(bridge, "W4", ok=False, finished_at=NOW,
-                           error=r"FileNotFoundError: [Errno 2] No such file: 'C:\Users\Traderbot\n8n-bridge\x.json'")
+                           error=r"FileNotFoundError: [Errno 2] No such file: 'C:\Users\someuser\n8n-bridge\x.json'")
     bridge_runs.record_run(bridge, "W1", ok=False, finished_at=NOW,
                            error="OSError: /home/bot/n8n-bridge/events.json busy")
     rows = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))
-    assert "Traderbot" not in rows["W4"]["error"] and "x.json" in rows["W4"]["error"]
+    assert "someuser" not in rows["W4"]["error"] and "x.json" in rows["W4"]["error"]
     assert "/home/bot" not in rows["W1"]["error"] and "events.json" in rows["W1"]["error"]
     assert wf.scrub_paths("HTTP 429 quota") == "HTTP 429 quota"
