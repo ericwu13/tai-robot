@@ -242,15 +242,37 @@ def _entry_after(trade, start: datetime) -> bool:
         return False
 
 
+def bars_for_strategy(strategy, bars) -> list:
+    """``bars`` at the strategy's own timeframe.
+
+    The engine aggregates a 1-min feed only for strategies that declare
+    ``htf_intervals`` (``BacktestEngine._prepare_bars``). A single-TF
+    15-min strategy handed bot-dir 1-min CSVs would otherwise run on
+    1-min bars. Finer bars are aggregated up to the primary interval;
+    MTF strategies and bars already at (or above) it pass through.
+    """
+    from src.backtest.engine import strategy_primary_interval
+    from src.live.bar_aggregator import aggregate_bars
+    bars = list(bars)
+    if not bars or getattr(strategy, "htf_intervals", None):
+        return bars
+    primary = strategy_primary_interval(strategy)
+    if primary > 0 and 0 < int(bars[0].interval or 0) < primary:
+        return aggregate_bars(bars, primary)
+    return bars
+
+
 def backtest_trades(cls, bars, point_value: int, *, fill_mode: str = "next_open",
                     capital_base: int = 100_000) -> list:
     """Default-constructed ``cls`` over ``bars``. Raises on engine errors."""
     from src.backtest.engine import BacktestEngine
+    strategy = cls()
+    feed = bars_for_strategy(strategy, bars)
     engine = BacktestEngine(
-        cls(), point_value=int(point_value),
-        max_bars=max(5000, len(bars)), fill_mode=fill_mode,
+        strategy, point_value=int(point_value),
+        max_bars=max(5000, len(feed)), fill_mode=fill_mode,
         initial_balance=int(capital_base))
-    return list(engine.run(list(bars)).trades)
+    return list(engine.run(feed).trades)
 
 
 def _load(source: str):

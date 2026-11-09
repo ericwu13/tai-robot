@@ -316,3 +316,43 @@ def test_cli_scores_a_changelog_pass_by_class_name(tmp_path):
     assert s["delta"] < 0
     assert data["summary"]["pass"] == {"n": 1, "hits": 0,
                                        "total_delta": s["delta"]}
+
+
+# ── review fix 1: single-TF strategies are scored on their own timeframe ──
+
+_LONG_15M = _LONG.replace("kline_minute = 1", "kline_minute = 15").replace(
+    "LedgerLong", "LedgerLong15").replace('kwargs.get("hold", 30)', 'kwargs.get("hold", 3)')
+
+
+def _one_min_bars(days: int = 3):
+    from src.market_data.models import Bar
+    out, price = [], 20000
+    for d in range(days):
+        day = datetime(2026, 10, 5) + timedelta(days=d)
+        for m in range(240):
+            dt = day.replace(hour=9) + timedelta(minutes=m)
+            step = 3 if (m // 20) % 2 == 0 else -2
+            o, price = price, price + step
+            out.append(Bar(symbol="TMF00", dt=dt, open=o, high=max(o, price) + 1,
+                           low=min(o, price) - 1, close=price, volume=10,
+                           interval=60))
+    return out
+
+
+def test_single_tf_15m_strategy_gets_the_same_trades_from_1min_or_15m_bars():
+    from src.ai.code_sandbox import load_strategy_from_source
+    from src.evolution.forward_ledger import backtest_trades
+    from src.live.bar_aggregator import aggregate_bars
+
+    cls = load_strategy_from_source(_LONG_15M)
+    assert not getattr(cls(), "htf_intervals", None)
+    one_min = _one_min_bars()
+    fifteen = aggregate_bars(one_min, 900)
+
+    def key(trades):
+        return [(t.entry_dt, t.exit_dt, t.pnl) for t in trades]
+
+    from_15m = backtest_trades(cls, fifteen, 10)
+    from_1m = backtest_trades(cls, one_min, 10)
+    assert from_15m, "fixture must trade"
+    assert key(from_1m) == key(from_15m)
