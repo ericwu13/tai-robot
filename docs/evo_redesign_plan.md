@@ -1,9 +1,11 @@
 # Weekly evolution ("evo") redesign plan
 
-Status: draft for owner review, 2026-11-08. Phase 1 ships in the PR that adds
-this file; nothing in it changes a threshold, a holdout, a cadence, or
-what gets promoted. Every number below that is a policy choice sits in
-[Owner decisions](#owner-decisions). None of them is picked silently.
+Status: **owner decisions N1–N8 decided 2026-11-09 (TPE): every recommended
+default below was adopted** ("go with your recommendations"). Phase 1 ships in
+the PR that adds this file and changes no threshold, holdout, cadence, or
+promotion rule. The adopted numbers take effect only in the phase that
+implements each one (§4), each in its own PR. Every policy choice is in
+[Owner decisions](#owner-decisions).
 
 Line references are to `origin/master` at 865b910 unless marked "this PR".
 
@@ -176,9 +178,9 @@ Promotion is decided on paired forward evidence, never on one backtest.
 |---|---|---|---|
 | **1** | (a) retire check on the grid no-pick exit; (b) candidate source + full verdict text in history; (c) persisted Saturday slot; (d) #164 verified already fixed; (e) read-only forward ledger + CLI | No (but see N8 on how (a) counts a no-pick week) | **This PR (draft)** |
 | 1.5 | Run the ledger once on Steven's bot dirs + `strategies/` + changelog, attach the report to the PR | No (read-only). It needs a Steven session; it was not run from here | Pending |
-| 2 | Ledger on the Saturday slot + Discord summary; failed-idea memory in the prompt; validation `fill_mode` parity (D8) with a replay; backtest trades as the design sample for low-frequency bots (D12); confirm Steven's EXE runs the current gates | D8 changes verdict numbers: owner ack. D12: N5 cadence interacts | Next |
-| 3 | Family roster re-score; brief-driven proposals; patch codegen + invariance check; mechanical probes + dead-condition gate | N3, N5 | After 2 |
-| 4 | Absolute floor on paper; long untouched holdout; cumulative DSR; paired paper-shadow promotion; family allocator shadow | N1, N2, N4, N6, N7 | After 3, and after the ledger shows the current gate lift |
+| 2 | Ledger on the Saturday slot + Discord summary; failed-idea memory in the prompt; validation `fill_mode` parity (D8) with a replay; backtest trades as the design sample for low-frequency bots (D12); confirm Steven's EXE runs the current gates | Decided: D8 ships in its own PR with a before/after replay (owner ack 2026-11-09); N5 | Next |
+| 3 | Family roster re-score; brief-driven proposals; patch codegen + invariance check; mechanical probes + dead-condition gate | Decided: N3, N5 | After 2 |
+| 4 | Absolute floor on paper; long untouched holdout; cumulative DSR; paired paper-shadow promotion; family allocator shadow | Decided: N1, N2, N4, N6, N7 | After 3, and after the ledger shows the current gate lift |
 
 Exit criterion for the whole plan: **the ledger's PASS-vs-incumbent forward
 hit rate beats the FAIL hit rate** over at least 8 scored PASSes, and
@@ -187,10 +189,12 @@ recommends only.
 
 ## Owner decisions
 
-These are policy, not code. Each has a recommended default with its
-evidence. Nothing here is changed by this PR.
+These are policy, not code. **Decided 2026-11-09 (TPE): the owner adopted
+every recommended default in this table, including N8.** A later change to any
+row is an owner decision again; agents never retune them. Nothing here is
+changed by the Phase 1 PR; each row takes effect in the phase that implements it.
 
-| # | Decision | Today | Recommended default | Evidence |
+| # | Decision | Today | Adopted default (2026-11-09) | Evidence |
 |---|---|---|---|---|
 | N1 | **Holdout length** (untouched by the LLM, fixed per proposal) | 14 days, rolls into next week's design window (`paper_gate.py:74`) | **8 weeks (56 days)** | 11-07 holdout candidate trade counts were 8/2/4/10/3. Donchian 30m had 15 holdout trades in 14 days. V2Evo1 flipped sign between week 2 (+9.8k) and week 6 (−0.8k). Cost: minute KLine history only reaches back to 2025-11-28 (~11 months), so 8 weeks leaves ~9 months of design data. 6 weeks is the floor if that is too much |
 | N2 | **Paper-shadow weeks** before promotion | none (a PASS goes to the pool; deploy is manual) | **6 weeks**, with a 4-week minimum before any early reject | V2Evo1: +9.8k at week 2, −10.7k over weeks 3–6. Two weeks would have promoted a loser |
