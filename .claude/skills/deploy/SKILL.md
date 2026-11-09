@@ -1,25 +1,35 @@
 ---
 name: deploy
-description: Deploy, restart or stop a tai-robot live bot headlessly with run_bot_cli.py (source) or tai_backtest.exe (packaged install) — resolve the strategy name, gate real-order modes on explicit user consent, launch the bot as a detached process, and confirm it reached tick subscription. Use when asked to deploy/start/restart/stop a bot, to bring a bot back after a release or crash, or to run a bot without the Tk workbench.
+description: Deploy, restart or stop a tai-robot live bot headlessly with run_bot_cli.py (source) or tai_backtest.exe (packaged install) — resolve the strategy name, gate real-order modes on explicit user consent, launch the bot as a detached process, and confirm it reached tick subscription. Use when asked to deploy/start/restart/stop a bot, "restart the bots on Steven", "redeploy after the release/upgrade", "move bots to the new install", "bring <bot> back" after a crash, or to run a bot without the Tk workbench. The live fleet runs on Steven.
 ---
 
 # Deploy (headless)
 
 `run_bot_cli.py` runs the SAME live machinery as the workbench on a hidden
-Tk window, so a CLI bot behaves exactly like a GUI bot. Everything below
-runs from the **main working tree on `master`**:
+Tk window, so a CLI bot behaves exactly like a GUI bot.
+
+**Where the fleet runs (since 2026-10-25): on Steven, not this PC.** All
+live bots are `tai_backtest.exe deploy …` processes from the release
+install `E:\tai_robot_v<ver>\tai_backtest\` on Steven (the version folder
+moves with every release — read it from `hosts.local.yaml`
+`steven.install_dir` or the dashboard task's `--base-dir`; see
+`start-here`). Deploy, stop and restart them there via `tailscale-ssh`.
+Do **not** deploy from this PC unless the owner asks for a local bot:
+this PC's main tree is behind origin/master, and a local bot is an extra
+login on the same account.
+
+Packaged install (the Steven fleet) — from the folder that contains
+`tai_backtest.exe`:
 
 ```
-cd C:\Users\eric8\gitRepos\tai-robot
-python run_bot_cli.py <command> ...
-```
-
-Packaged install (no Python on PATH) — same subcommands, from the folder
-that contains `tai_backtest.exe`:
-
-```
-cd C:\path\to\tai_backtest
+cd E:\tai_robot_v<ver>\tai_backtest
 tai_backtest.exe <command> ...
+```
+
+Source checkout (only when the owner wants a bot run from source):
+
+```
+python run_bot_cli.py <command> ...
 ```
 
 The EXE routes `deploy|stop|list|status|strategies|backtest` into the CLI
@@ -29,10 +39,10 @@ unknown first token opens the GUI (double-click stays the workbench).
 (no `.py` argument, not `python.exe`). `semi_auto` is still refused.
 The process needs a logged-in desktop session; do not install it as a
 Windows service or a task set to run when the user is logged off.
-Source checkouts (oreopie) keep `python run_bot_cli.py`.
+Source checkouts keep `python run_bot_cli.py` (oreopie = this PC, no live
+bots since 2026-10-25).
 
-Running python out of the main tree is what every source bot does;
-*editing* it is still forbidden (see `fix-pr`). A git worktree cannot
+*Editing* the main tree is forbidden (see `fix-pr`). A git worktree cannot
 deploy — it has no `settings.yaml`, no `CapitalAPI_2.13.57/`, and a
 different `data/live`. A packaged bot's `data\live` lives next to the
 EXE, the same directory the GUI uses.
@@ -62,6 +72,11 @@ Deploy flags: `--strategy "<name or unique substring>"`, `--mode paper|auto`
    "resume as paper, or auto (real orders)?". `semi_auto` cannot run
    headless at all (10-second order-confirm dialog) — those bots restart
    from the workbench (`deploy-check` has the recipe).
+   **Before restarting any Steven bot, read its current mode** from the
+   dashboard `/api/fleet` (`mode`; the page shows 實單 for real orders) or
+   `status --json`. At least one Steven bot runs `--mode auto`: restarting
+   it without `--mode auto` silently demotes it to paper, and restarting
+   it with `--mode auto` needs the owner's yes in THIS conversation.
 2. **Not already running.** `status` must show `running: false`. If it is
    running, deploying again is refused (exit 4, lock conflict); a
    restart is `stop` first (below). `.lock` is never deleted by hand.
@@ -98,7 +113,7 @@ The launcher spawns the bot as a detached process (stdout →
 | Launcher prints | Exit | Meaning | Do |
 |---|---|---|---|
 | `READY: … tick subscription active` | 0 | logged in, warmup done, `RequestTicks` OK, `.lock` owned by the child | report PID + bot dir; done |
-| `EXITED: … code N` | N | the bot died before going live; the last 15 stdout lines are printed | read them: 2 = login/connection, 4 = deploy refused (lock, unknown strategy, position on account), 5 = warmup/subscription failed — see `debug_YYYYMMDD.log` |
+| `EXITED: … code N` | N | the bot died before going live; the last 15 stdout lines are printed | read them: 1 = usage / ambiguous strategy, 2 = login/connection, 3 = COM objects unavailable (SDK/registration), 4 = deploy refused (lock, unknown strategy, position on account), 5 = warmup/subscription failed — see `debug_YYYYMMDD.log` |
 | `TIMEOUT: PID … still running` | 6 | still warming up (long CSV reload on resume) | **the bot is still running** — poll `status` and tail `cli_stdout.log`, do not relaunch |
 
 Then confirm: `status` shows `running: true` with that PID, and the
@@ -119,6 +134,58 @@ gone, `session.json` `saved_at` is fresh, and a daily report was written.
 **Restart** = `stop --wait 120` → verify lock gone → `deploy … --detach`
 (resume is automatic; apply gate 1 to the mode).
 
+### Over ssh (Steven)
+
+- `stop` is short-lived and safe over ssh (it writes `STOP` and waits).
+- **Do not run `deploy --detach` straight from the ssh session.** It uses
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` without breakaway, and
+  processes started from a Steven ssh session have died on disconnect.
+  The bot also needs an interactive desktop. Launch it through an
+  on-demand interactive scheduled task (recipe below).
+
+### First deploy of a new strategy on Steven (verified 2026-11-09)
+
+Worked first try for a new paper bot. Gates 1–6 still apply; a new
+strategy on a new bot is paper unless the owner says otherwise.
+
+1. **Install the strategy.** Download Steven's
+   `E:\tai_robot_v<ver>\tai_backtest\strategies\index.json` and back it up.
+   Locally, run the app's own write path against a copy of that folder:
+   `StrategyStore(<local copy dir>).save(class_name, source, description)`
+   (`src/ai/strategy_store.py`; it writes the `.py` and the index entry).
+   Validate the new index with the src venv python on Steven, check the
+   live `index.json` hash has not changed since you downloaded it, then
+   scp the `.py` and `index.json` into `strategies\`.
+   **Never edit `index.json` with PowerShell JSON cmdlets**: in PowerShell
+   5.1 `@(Get-Content … | ConvertFrom-Json)` wraps the whole array as ONE
+   element, re-serializing nests it, and `tai_backtest.exe strategies` (and
+   every bot restart) then crashes with `KeyError: 'class_name'`.
+2. **Verify:** `tai_backtest.exe strategies` lists `AI: <Class> [type=0 min=N]`.
+3. **Launch script** `C:\Users\Traderbot\tai_bridge_setup\launch_<bot>.ps1`:
+   `Set-Location` to the install, then
+   `.\tai_backtest.exe deploy --symbol TMF00 --bot <bot> --strategy "AI: <Class>" --mode paper <--new|--resume> --detach --wait-ready 600 *> <log>`
+   — `--resume` when the bot dir already has `session.json`, else `--new`.
+4. **On-demand task, no trigger:** `\TaiRobot\Launch-<bot>`, principal
+   Traderbot, LogonType **Interactive**, RunLevel Limited,
+   ExecutionTimeLimit 20 min, MultipleInstances IgnoreNew; then
+   `Start-ScheduledTask -TaskPath '\TaiRobot\' -TaskName Launch-<bot>`.
+   This works even while Traderbot's session shows `Disc` in `quser`.
+5. **Confirm three ways:** the launch log has `READY: … tick subscription
+   active`, the task's `LastTaskResult` is 0, and `/api/fleet` shows the bot
+   RUNNING with mode `paper`.
+
+Remote-exec notes: send scripts as `powershell -NoProfile -EncodedCommand
+<base64 UTF-16LE>`. A long payload overflows cmd's command-line limit and
+the error comes back as garbled cp950 — ship files with scp instead of
+embedding them. Restarting an existing Steven bot uses the same task
+pattern (`--resume`); read its mode first (gate 1).
+
+### More over-ssh rules
+
+- A launcher `TIMEOUT` is not proof of failure — confirm with `/api/fleet`
+  or `status`, not the launcher alone.
+- Never stop processes by image name: `tai_backtest.exe` is every bot.
+
 ## Gotchas
 
 - Each bot process logs into the Capital API on its own — identical to
@@ -134,7 +201,8 @@ gone, `session.json` `saved_at` is fresh, and a daily report was written.
   not wrap it in a LocalSystem service or a scheduled task set to "run
   whether user is logged on or not".
 - Stdout timestamps are TPE (with local time appended when they differ);
-  the OS clock is UTC-7. `[AI] ultra_mode=…` on the first line is normal.
+  the host's OS clock is not TPE (this PC is US Pacific with DST — check
+  `date +%z`). `[AI] ultra_mode=…` on the first line is normal.
 - Never print credentials, channel IDs, or the account number — the CLI
   redacts them; keep it that way in reports.
 - Releases do not touch a running CLI bot; after merging a change the bot
@@ -145,3 +213,6 @@ gone, `session.json` `saved_at` is fresh, and a daily report was written.
 - confirm liveness later → `bot-status`
 - wiring doubts (news paths, Discord, regime legs) → `deploy-check`
 - regime bot idle after deploy → `regime-health`
+- host / install map → `start-here`; remote shell → `tailscale-ssh`;
+  confirm READY remotely → dashboard `/api/fleet`
+- just want a backtest, not a bot → `strategy-research` (`run_bot_cli.py backtest`, `scripts/research/`)

@@ -1,9 +1,21 @@
 ---
 name: regime-health
-description: Verify the regime-switching brain — did it classify last night, did the recommendation actually apply, is a flip pause or news suppression freezing it. Use when the regime didn't change, a strategy swap never happened, the bot sits idle, or a regime classification/vote needs auditing.
+description: Verify the regime-switching brain — did it classify last night, did the recommendation actually apply, is a flip pause or news suppression freezing it. Covers the Steven regime bots via the dashboard (/api/bot regime block). Use when the regime didn't change, a strategy swap never happened, the bot sits idle, or a regime classification/vote needs auditing.
 ---
 
 # Regime Health
+
+> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
+> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
+> run on **Steven**, not this PC. This PC's `data\live` holds only
+> retired/test bots and its n8n is stopped. Read live state from the
+> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
+> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
+> describes this PC only — never publish it as fleet health. Host map →
+> `start-here`. Run checkers from an up-to-date checkout
+> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
+> weeks behind.
 
 ```bash
 C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_regime.py

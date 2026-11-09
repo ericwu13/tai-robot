@@ -5,6 +5,18 @@ description: Verify a tai-robot deployment is wired correctly (news/vote paths, 
 
 # Deploy Check
 
+> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
+> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
+> run on **Steven**, not this PC. This PC's `data\live` holds only
+> retired/test bots and its n8n is stopped. Read live state from the
+> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
+> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
+> describes this PC only — never publish it as fleet health. Host map →
+> `start-here`. Run checkers from an up-to-date checkout
+> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
+> weeks behind.
+
 ```bash
 C:/Python313/python.exe -s scripts/monitor/check_deploy.py [--settings PATH]
 ```
@@ -61,7 +73,7 @@ must be one of `long` / `short` / `idle`.
   expires unread and the regime brain silently runs vote-free. It looks
   identical to "the bridges produced no votes" — check the setting first.
 - Relative news paths resolve against the project root, not the EXE's
-  cwd. Absolute paths are what n8n actually writes.
+  cwd. Absolute paths are what the Steven bridge tasks write (`C:\Users\Traderbot\n8n-bridge\`).
 - `session.json` is the deploy dialog's pre-fill source; if it is corrupt
   the dialog cannot restore the bot and a resume would start flat.
 - Never hardcode channel IDs, role IDs, tokens, or webhook URLs in source

@@ -1,6 +1,6 @@
 ---
 name: tailscale-ssh
-description: SSH to Tailscale hosts (Steven, oreopie, other tailnet nodes). Use when an agent needs remote shell on a trading PC over Tailscale. Credentials and the filled hosts map stay local — never commit keys or passwords.
+description: SSH to Tailscale hosts (Steven = the live trading PC, oreopie, other tailnet nodes). Use when an agent needs a remote shell or file on a trading PC — "ssh to Steven", "run this on Steven", "check the bots/bridge on Steven", "restart the dashboard", "read a Steven log". Credentials and the filled hosts map stay local — never commit keys or passwords.
 ---
 
 # Tailscale SSH
@@ -25,6 +25,29 @@ The real address is `tailscale_ip` in gitignored `hosts.local.yaml` (or `%USERPR
 | Client | Windows OpenSSH |
 
 `tailscale` CLI may be absent from PATH; the `100.x` IP is enough when Tailscale is up.
+
+From git-bash / the Bash tool:
+
+```bash
+ssh -F /dev/null -i ~/.ssh/id_ed25519_steven -o UserKnownHostsFile=~/.ssh/known_hosts \
+    -o BatchMode=yes -o ConnectTimeout=10 Traderbot@<Steven tailnet IP> "<cmd>"
+```
+
+## Gotchas (Steven)
+
+- git-bash ssh rejects the user's `~/.ssh/config` (UTF-8 BOM) — pass `-F /dev/null`.
+- The remote shell is **cmd**: pipes and quoting in an inline command break. For
+  anything non-trivial send `powershell -NoProfile -EncodedCommand <base64 UTF-16LE>`
+  and drop the trailing `#< CLIXML` noise. A piped `-Command -` script runs line by
+  line — keep each statement on one line.
+- Console output is cp950 unless the script sets UTF-8.
+- Processes started from the ssh session die when it disconnects. Start
+  long-running things via a scheduled task (or WMI `Win32_Process.Create`).
+- Never stop processes by image name (`tai_backtest.exe` = every bot; the dashboard
+  is a venv python pair) — stop by PID.
+- Never move the HEAD of `C:\Users\Traderbot\tai-robot-src` (bridge tasks) or
+  `C:\Users\Traderbot\tai-robot-dashboard` (dashboard + W3). Use a new worktree.
+- What runs where on Steven → `start-here`.
 
 ## Local hosts file
 

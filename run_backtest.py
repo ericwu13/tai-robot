@@ -110,6 +110,7 @@ from src.ai.code_sandbox import (
 )
 from src.ai.strategy_store import StrategyStore
 from src.ai.pine_exporter import export_to_pine
+from src.ai import review_payload
 
 # Code generation max output tokens.  Strategies are typically <300 lines,
 # so 16K output tokens is plenty.  Lower cap keeps the per-call price low
@@ -5799,38 +5800,8 @@ class BacktestApp:
     _REVIEW_CHUNK_BATCH_SIZE = 1500
 
     def _build_review_timeframe_line(self, strategy_cls) -> str:
-        """Return the Strategy Timeframe + Timezone note for AI Review prompts.
-
-        Explicit here so the AI does not mis-infer the bar interval from
-        session-aligned :45 timestamps (e.g. 09:45/10:45/13:45 for 60-min
-        AM bars can look like 15-min bars to a naive reader).
-        """
-        timeframe_line = ""
-        if strategy_cls is not None:
-            kt = getattr(strategy_cls, "kline_type", 0)
-            km = getattr(strategy_cls, "kline_minute", 0)
-            if kt == 0 and km:
-                if km % 60 == 0:
-                    label = f"{km // 60}-hour ({km}-minute)"
-                else:
-                    label = f"{km}-minute"
-                timeframe_line = (
-                    f"策略時框 Strategy Timeframe: {label} bars "
-                    f"(kline_type={kt}, kline_minute={km})\n"
-                )
-            elif kt == 4:
-                timeframe_line = f"策略時框 Strategy Timeframe: Daily bars (kline_type={kt})\n"
-            elif kt == 5:
-                timeframe_line = f"策略時框 Strategy Timeframe: Weekly bars (kline_type={kt})\n"
-            elif kt == 6:
-                timeframe_line = f"策略時框 Strategy Timeframe: Monthly bars (kline_type={kt})\n"
-        timeframe_line += (
-            "時區 Timezone: 所有 entry/exit 時間皆為台灣時間 (TWT/UTC+8)。\n"
-            "All entry/exit timestamps are Taiwan time (TWT/UTC+8). "
-            "Bars are TAIFEX session-aligned, so 60-minute AM bars may carry "
-            ":45 timestamps (08:45–13:45 session) — these are NOT 15-minute bars.\n"
-        )
-        return timeframe_line
+        """Strategy Timeframe + Timezone note (see ``review_payload``)."""
+        return review_payload.review_timeframe_line(strategy_cls)
 
     def _resolve_strategy_source(self, strategy_name: str, strategy_cls) -> str:
         """Resolve the strategy source code for the AI Review context."""
@@ -5877,64 +5848,14 @@ class BacktestApp:
         # Detect degradation vs previous review round
         cur_pf = result.metrics.profit_factor
         cur_dd = result.metrics.max_drawdown_pct
-        degradation_section = ""
-        if self._last_review_metrics is not None:
-            prev_pf = self._last_review_metrics["pf"]
-            prev_dd = self._last_review_metrics["dd_pct"]
-            pf_worse = cur_pf < prev_pf
-            dd_worse = cur_dd > prev_dd
-            if pf_worse or dd_worse:
-                degradation_section = (
-                    f"## ⚠ DEGRADATION DETECTED — REVERT FIRST ⚠\n"
-                    f"Previous review metrics: PF={prev_pf:.2f}, DD={prev_dd:.2f}%\n"
-                    f"Current metrics:         PF={cur_pf:.2f}, DD={cur_dd:.2f}%\n"
-                    f"{'  → Profit Factor DROPPED' if pf_worse else ''}"
-                    f"{'  → Max Drawdown INCREASED' if dd_worse else ''}\n\n"
-                    f"**MANDATORY**: The last change made things worse. Your ONLY "
-                    f"recommendation must be to REVERT the last change and return to "
-                    f"the previous version. Do NOT suggest new changes on top of a "
-                    f"degraded strategy. Do NOT try to fix the degradation by adding "
-                    f"more complexity. Say: \"上一次的修改使績效惡化，建議還原到修改前的版本。"
-                    f"The last change degraded performance — revert to the prior version "
-                    f"before attempting any new changes.\"\n"
-                    f"The ONLY exception is if you identify an obvious code BUG (e.g. "
-                    f"wrong operator, missing round()) that clearly caused the "
-                    f"degradation — in that case, suggest fixing that specific bug only.\n\n"
-                )
+        degradation_section = review_payload.degradation_section(
+            self._last_review_metrics, cur_pf, cur_dd)
 
         # Save current metrics for next review round comparison
         self._last_review_metrics = {"pf": cur_pf, "dd_pct": cur_dd}
 
-        preamble = (
-            f"以下是回測/實盤結果，請根據策略原始碼分析交易表現。\n"
-            f"Below are the backtest/live results. Analyze the trading performance.\n\n"
-            f"{degradation_section}"
-            f"## Analysis rules (MUST FOLLOW)\n"
-            f"1. **Identify what is WORKING first** — list 2-3 aspects that should NOT be changed.\n"
-            f"2. **Suggest at most ONE change** — never multiple simultaneous changes. "
-            f"Each change must be tested in isolation before adding the next.\n"
-            f"3. **Distinguish bugs from tuning** — a code bug (wrong comparison, missing round()) "
-            f"is a fix. Changing parameters or adding filters is tuning. Fix bugs first; "
-            f"tune ONE parameter at a time only.\n"
-            f"4. **MANDATORY: winner/loser impact count** — before suggesting ANY filter, "
-            f"condition, or parameter change, you MUST scan the trade list and estimate:\n"
-            f"   - How many LOSING trades would the change remove/avoid?\n"
-            f"   - How many WINNING trades would the change also remove/avoid?\n"
-            f"   - Present this as: \"Estimated impact: removes ~N losers, ~M winners\"\n"
-            f"   - If you cannot estimate (e.g. insufficient data), say so explicitly "
-            f"and do NOT recommend the change. A suggestion without impact analysis is "
-            f"not allowed.\n"
-            f"5. **Bias toward simplicity** — adding indicators, conditions, or parameters "
-            f"rarely improves robustness. If the strategy has >4 entry conditions, "
-            f"suggest REMOVING one before adding another.\n"
-            f"6. **No fabricated statistics** — do not invent expected win rates or "
-            f"improvements. Say \"建議回測驗證 / backtest to verify\" instead.\n"
-            f"7. **If metrics are acceptable** (PF > 1.3, DD < 25%, WR > 40%), "
-            f"say so and suggest NOT changing the strategy. Over-optimization is the "
-            f"#1 cause of strategy degradation.\n\n"
-            f"{report}\n\n"
-            f"{timeframe_line}\n"
-        )
+        preamble = review_payload.review_preamble(
+            report, timeframe_line, degradation_section)
 
         self._dispatch_trade_analysis(
             preamble, trade_lines, source_section, len(result.trades),
@@ -5959,27 +5880,9 @@ class BacktestApp:
         timeframe_line = self._build_review_timeframe_line(strategy_cls)
         strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
 
-        source_section = ""
-        if strategy_source:
-            source_section = (
-                f"\n\n策略原始碼 Strategy Source Code:\n"
-                f"```python\n{strategy_source}\n```"
-            )
-
-        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
-        # handle thousands of rows; chunked mode handles the rest.
-        trade_lines = []
-        for i, t in enumerate(result.trades, 1):
-            bars_held = t.exit_bar_index - t.entry_bar_index
-            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
-            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
-            src_mark = " [real]" if getattr(t, "source", "") == "real" else ""
-            trade_lines.append(
-                f"  {i}. {t.side.value} {t.tag}: "
-                f"entry={entry_dt} @{t.entry_price:,} → "
-                f"exit={exit_dt} @{t.exit_price:,} "
-                f"P&L={t.pnl:+,} ({bars_held} bars){src_mark}"
-            )
+        source_section = review_payload.source_section(strategy_source)
+        # ALL trade lines — no arbitrary cap; chunked mode handles size.
+        trade_lines = review_payload.trade_lines(result.trades)
         return result, report, timeframe_line, source_section, trade_lines
 
     def _dispatch_trade_analysis(self, preamble: str, trade_lines: list[str],
@@ -6018,12 +5921,8 @@ class BacktestApp:
                                      label: str = "AI Review: 請分析以下交易紀錄",
                                      call_site: str = "trade_review") -> None:
         """Send the full AI Review in a single API call."""
-        context = (
-            preamble
-            + f"交易明細 Trade Details ({total_trades} trades):\n"
-            + "\n".join(trade_lines)
-            + source_section
-        )
+        context = review_payload.single_shot_context(
+            preamble, trade_lines, source_section, total_trades)
 
         self._append_chat("user", label + "\n" + context)
         self.btn_send.config(state=tk.DISABLED)
