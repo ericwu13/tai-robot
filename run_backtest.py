@@ -809,6 +809,18 @@ def _persist_evolution_history(bot_dir, **fields) -> None:
                  f"[{type(exc).__name__}] {exc}")
         except Exception:
             pass
+    # One history line per attempt = the attempt reached an end. Close the
+    # persisted Saturday slot unless that end is a retryable infrastructure
+    # failure (pipeline_error, grid_failed, no_chat_client).
+    try:
+        from src.evolution.notify import finish_weekly_slot_for
+        finish_weekly_slot_for(bot_dir, str(fields.get("reason_kind") or ""))
+    except Exception as exc:
+        try:
+            _log("evolution weekly slot close failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
 
 
 def _evolution_bot_dir(app) -> str | None:
@@ -9914,8 +9926,11 @@ class BacktestApp:
         quiet, and the week's data is complete. Latched per ISO week so
         the 30s poll fires it exactly once; a bot deployed later on
         Saturday still gets its run on the first post-deploy poll. The
-        latch is also a file in the bot directory, so restarting the bot
-        that Saturday does not run the pipeline a second time.
+        latch is also a file in the bot directory (``started`` → ``done``
+        when the attempt's history line is written), so restarting the bot
+        after a finished run does not run the pipeline a second time,
+        while a run that died (or ended on a retryable infrastructure
+        error) is retried once ``SLOT_STARTED_GUARD_S`` has passed.
         """
         if not self._settings.get("evolution_auto_pipeline", True):
             return
@@ -9928,18 +9943,23 @@ class BacktestApp:
             return
         if is_market_open():
             return  # safety: never compete with a live session
-        week_key = _evo_notify.weekly_slot_key(_taipei_now())
+        now = _taipei_now()
+        week_key = _evo_notify.weekly_slot_key(now)
         if self._weekly_evo_done == week_key:
             return
-        self._weekly_evo_done = week_key
         bot_dir = getattr(self._live_runner, "bot_dir", None)
-        if _evo_notify.weekly_slot_taken(bot_dir, week_key):
-            self._live_log_msg(
-                f"🧬 本週自動演化已執行過（{week_key}），重啟後不重跑。"
-                f"Weekly auto-evolution already ran for {week_key}; "
-                "not re-running after restart.", "status")
+        if _evo_notify.weekly_slot_taken(bot_dir, week_key, now=now):
+            # Not latched in memory: a "started" slot inside its guard
+            # window is retried by a later poll once the window passes.
+            if getattr(self, "_weekly_evo_skip_logged", None) != week_key:
+                self._weekly_evo_skip_logged = week_key
+                self._live_log_msg(
+                    f"🧬 本週自動演化已執行或正在執行（{week_key}），重啟後不重跑。"
+                    f"Weekly auto-evolution for {week_key} already finished "
+                    "or may still be running; not starting another.", "status")
             return
-        _evo_notify.mark_weekly_slot(bot_dir, week_key)
+        self._weekly_evo_done = week_key
+        _evo_notify.mark_weekly_slot(bot_dir, week_key, now=now)
         self._live_log_msg(
             "🧬 週末自動演化 Weekly auto-evolution (post-close) starting...",
             "status")
