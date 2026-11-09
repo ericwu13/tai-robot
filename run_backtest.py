@@ -7291,25 +7291,31 @@ class BacktestApp:
                                 "Nothing was consumed: the watermark did NOT "
                                 "advance.\n"
                                 + "\n".join(grid_outcome.reasons))
-                            # No setting in the incumbent's knob neighbourhood
-                            # beat it: under the relative gate that is a failed
-                            # Saturday for the #188 "not improvable" streak, so
-                            # the retire check runs here too (it used to be
-                            # skipped by this early return).
-                            _np_cfg, _np_gate = _resolve_evo_gate()
-                            _np_review = _retire_review(
-                                _np_gate.mode, False, _np_cfg,
-                                _incumbent_trades())
-                            if _np_review.report_lines:
-                                msg += "\n" + "\n".join(_np_review.report_lines)
+                            # The grid scored its settings and none beat the
+                            # incumbent: under the relative gate that is a
+                            # failed Saturday for the #188 "not improvable"
+                            # streak, so the retire check runs here too (it
+                            # used to be skipped by this early return). A grid
+                            # that never got to score (no bars, too few folds,
+                            # baseline backtest failed, knobs unreadable) is a
+                            # data problem and records no week.
+                            _np_extra: dict = {}
+                            if grid_outcome.evaluated:
+                                _np_cfg, _np_gate = _resolve_evo_gate()
+                                _np_review = _retire_review(
+                                    _np_gate.mode, False, _np_cfg,
+                                    _incumbent_trades())
+                                if _np_review.report_lines:
+                                    msg += "\n" + "\n".join(
+                                        _np_review.report_lines)
+                                _np_extra = dict(
+                                    retire_evaluated=(_np_gate.mode == "relative"),
+                                    retire_passed=False,
+                                    ts=_np_review.evaluated_at)
                             ui(self._append_chat, "system", msg)
                             if auto_run:
                                 _notify_discord(msg)
-                            _remember(
-                                "fail", "grid_no_pick", msg,
-                                retire_evaluated=(_np_gate.mode == "relative"),
-                                retire_passed=False,
-                                ts=_np_review.evaluated_at)
+                            _remember("fail", "grid_no_pick", msg, **_np_extra)
                             return
                         plan = grid_outcome.rationale
                         directives = {

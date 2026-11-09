@@ -42,7 +42,7 @@ def _recent_trades(n: int = 40, pnl: int = -10) -> list[_T]:
 
 
 def _run_no_pick(monkeypatch, bot_dir, *, paper_gate="relative",
-                 changelog_rows=None, base_trades=None):
+                 changelog_rows=None, base_trades=None, evaluated=True):
     from src.evolution.grid_search import GridOutcome
     import src.daily_report.changelog as changelog
     import src.evolution.pipeline as pipeline
@@ -50,7 +50,7 @@ def _run_no_pick(monkeypatch, bot_dir, *, paper_gate="relative",
     def _no_pick(**kwargs):
         return GridOutcome(
             None, ("plateau / DSR / PBO not met",), (), None,
-            "Grid selected nothing.")
+            "Grid selected nothing.", evaluated=evaluated)
 
     monkeypatch.setattr(
         "src.evolution.grid_search.grid_search_applies",
@@ -218,3 +218,81 @@ def test_run_retire_review_records_week_only_on_relative(monkeypatch, mode, expe
         verdict_passed=False, retire_config=None)
     assert (len(seen["weeks"]) == 1) is expect_week
     assert bool(written) is expect_week
+
+
+# ── review fix 3: only an EVALUATED grid counts as a failed week ─────
+
+
+def test_unevaluated_no_pick_records_no_retire_week(tmp_path, monkeypatch):
+    """Too few folds / no bars / failed baseline: data, not 'not improvable'."""
+    app, rows, written, advanced, chat, backtests = _run_no_pick(
+        monkeypatch, tmp_path, evaluated=False)
+    assert app.errors == [], app.chat
+    row = rows[0]
+    assert row["reason_kind"] == "grid_no_pick"
+    assert row["retire_week"]["evaluated"] is False
+    assert not any(
+        str(w.get("change_summary", "")).startswith(RELATIVE_EVAL_MARKER)
+        for w in written)
+    assert backtests == []  # no retire backtest either
+    assert advanced == [] and chat.send_message.call_count == 0
+
+
+def _smoke_cls():
+    from src.ai.code_sandbox import load_strategy_from_source
+    from src.evolution.grid_smoke import _SMOKE_SOURCE
+    return load_strategy_from_source(_SMOKE_SOURCE), _SMOKE_SOURCE
+
+
+_SMOKE_EVO = {"search": "grid_batch", "holdout_days": 14,
+              "relative": {"fold_days": 14},
+              "trial_penalty": {"max_settings": 4}}
+
+
+@pytest.mark.parametrize("n_bars", [0, 10])
+def test_grid_without_enough_data_is_not_evaluated(n_bars):
+    from src.evolution.grid_search import run_grid_on_bars
+    from src.evolution.grid_smoke import sample_bars
+
+    cls, src = _smoke_cls()
+    out = run_grid_on_bars(
+        strategy_cls=cls, source=src, bars=sample_bars(n_bars) if n_bars else (),
+        point_value=200, capital_base=100000, evo=_SMOKE_EVO,
+        fold_days=14, max_folds=6)
+    assert out.selected is None
+    assert out.evaluated is False, out.reasons
+
+
+def test_grid_that_scored_its_settings_is_evaluated():
+    from src.evolution.grid_search import run_grid_on_bars
+    from src.evolution.grid_smoke import sample_bars
+
+    cls, src = _smoke_cls()
+    out = run_grid_on_bars(
+        strategy_cls=cls, source=src, bars=sample_bars(120),
+        point_value=200, capital_base=100000, evo=_SMOKE_EVO,
+        fold_days=14, max_folds=6)
+    assert out.evaluated is True, out.reasons
+
+
+def test_class_off_the_grid_is_not_evaluated():
+    from src.ai.code_sandbox import load_strategy_from_source
+    from src.evolution.grid_search import run_grid_on_bars
+    from tests.test_evolution_history import _HIST_BASE
+
+    out = run_grid_on_bars(
+        strategy_cls=load_strategy_from_source(_HIST_BASE), source=_HIST_BASE,
+        bars=(), point_value=200, capital_base=100000, evo=_SMOKE_EVO)
+    assert out.selected is None and out.evaluated is False
+
+
+def test_select_grid_with_no_scored_points_is_not_evaluated():
+    from src.evolution.grid_search import GridPoint, select_grid
+    from src.evolution.paper_gate import evolution_gate_config_from_mapping
+
+    base = GridPoint(knobs=(), coords=(50,), index=(0,), fold_pnls=(1.0,) * 8,
+                     mean_delta=0.0, is_baseline=True)
+    out = select_grid([], base, {(50,): base}, [("ema_period", (50,))],
+                      evolution_gate_config_from_mapping({}).trial,
+                      preregistered=[])
+    assert out.selected is None and out.evaluated is False
