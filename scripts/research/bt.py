@@ -3,8 +3,15 @@
 ``run`` builds the engine exactly as the workbench's 回測 button does
 (``run_backtest.py`` ``_execute_backtest``):
 ``BacktestEngine(strategy, point_value=pv, fill_mode="next_open")`` — the
-engine's own default is ``on_close``, so never omit ``fill_mode``. Feed
-1-min bars: the engine aggregates to the strategy's primary interval itself.
+engine's own default is ``on_close``, so never omit ``fill_mode``.
+
+Bar contract: the GUI fetches bars AT the strategy's timeframe, and
+``BacktestEngine`` aggregates 1-min input only for MTF strategies (non-empty
+``htf_intervals``) — a single-timeframe strategy sees exactly the bars it is
+given. ``run`` therefore aggregates finer intraday input to the strategy's
+``kline_minute`` first (``bars_for_strategy``), so 1-min bars are safe input
+for any intraday strategy. Daily/weekly/monthly strategies need bars of
+their own timeframe.
 
 Holdout discipline: pick a DESIGN window (shown to the AI / used for tuning)
 and a later HOLDOUT window that is never shown to the model or used to pick
@@ -54,12 +61,36 @@ def run(cls, bars, point_value: int, params: dict | None = None,
     if end:
         cutoff = datetime.fromisoformat(end + " 23:59")
         bars = [b for b in bars if b.dt <= cutoff]
-    engine = BacktestEngine(cls(**(params or {})), point_value=point_value,
-                            fill_mode="next_open")
-    result = engine.run(bars)
+    strategy = cls(**(params or {}))
+    engine = BacktestEngine(strategy, point_value=point_value, fill_mode="next_open")
+    result = engine.run(bars_for_strategy(strategy, bars))
     result.metrics = calculate_metrics(result.trades, result.equity_curve,
                                        initial_balance=initial_balance)
     return result
+
+
+def bars_for_strategy(strategy, bars):
+    """The bars ``BacktestEngine`` should get for ``strategy`` (see module docstring).
+
+    MTF strategies (``htf_intervals``) keep their 1-min input — the engine
+    aggregates those itself. A single-timeframe intraday strategy given
+    finer bars gets them aggregated to its ``kline_minute`` with the same
+    session-aligned aggregator the live bots use; bars already at (or above)
+    its timeframe pass through unchanged.
+    """
+    from src.backtest.engine import strategy_primary_interval
+    from src.live.bar_aggregator import aggregate_bars
+    if not bars or getattr(strategy, "htf_intervals", None):
+        return bars
+    if getattr(strategy, "kline_type", 0) != 0:
+        if bars[0].interval < 86400:
+            raise ValueError("daily/weekly/monthly strategy: pass bars of its own "
+                             "timeframe (e.g. a TradingView 1D pull), not intraday bars")
+        return bars
+    primary = strategy_primary_interval(strategy)
+    if primary <= 0 or bars[0].interval >= primary:
+        return bars
+    return aggregate_bars(bars, primary)
 
 
 def segment(trades, start: str, end: str) -> list:

@@ -167,7 +167,8 @@ class TestBt:
         import src.backtest.engine as engine_mod
         monkeypatch.setattr(engine_mod, "BacktestEngine", FakeEngine)
         bars = [_bar(datetime(2026, 11, d, 9, 0)) for d in (2, 3, 4)]
-        res = bt.run(lambda: object(), bars, 10, end="2026-11-03")
+        one_min = SimpleNamespace(kline_type=0, kline_minute=1, htf_intervals=[])
+        res = bt.run(lambda: one_min, bars, 10, end="2026-11-03")
         assert seen == {"point_value": 10, "fill_mode": "next_open", "n": 2}
         # metrics recomputed with the GUI balance, like _on_backtest_done
         assert res.metrics.initial_balance == bt.GUI_INITIAL_BALANCE
@@ -188,3 +189,69 @@ class TestBt:
 
     def test_point_values_come_from_symbol_config(self):
         assert (bt.POINT_VALUES["TMF00"], bt.POINT_VALUES["MTX00"], bt.POINT_VALUES["TX00"]) == (10, 50, 200)
+
+
+# ── bt.run feeds a single-timeframe strategy its own timeframe (PR #261 review) ──
+
+def _session_1m_bars(days=6):
+    """Day-session 1-min bars (08:45–13:44 TPE) with a slow wave, so a 30m SMA cross trades."""
+    import math
+    from datetime import timedelta
+    out, i = [], 0
+    day = datetime(2026, 10, 5)                     # a Monday
+    while len(out) < days * 300:
+        if day.weekday() < 5:
+            t = day.replace(hour=8, minute=45)
+            for _ in range(300):
+                px = 20000 + int(150 * math.sin(i / 70.0)) + (i % 7)
+                out.append(Bar(symbol="TMF00", dt=t, open=px, high=px + 3, low=px - 3,
+                               close=px + 1, volume=10, interval=60))
+                t += timedelta(minutes=1)
+                i += 1
+        day += timedelta(days=1)
+    return out
+
+
+def _sig(trades):
+    return [(t.side.value, t.entry_dt, t.exit_dt, t.entry_price, t.exit_price) for t in trades]
+
+
+class TestSingleTimeframeAggregation:
+    def _cls(self):
+        from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
+
+        class Sma30(M1SmaCrossStrategy):
+            kline_minute = 30
+        return Sma30
+
+    def test_single_tf_1m_input_matches_preaggregated(self):
+        from src.live.bar_aggregator import aggregate_bars
+        cls = self._cls()
+        bars = _session_1m_bars()
+        agg = bt.run(cls, aggregate_bars(bars, 1800), 10)
+        raw = bt.run(cls, bars, 10)
+        assert agg.trades, "fixture must produce trades on 30m bars"
+        assert _sig(raw.trades) == _sig(agg.trades)
+
+    def test_prepare_bars_only_aggregates_lower_interval_input(self):
+        cls = self._cls()
+        bars = _session_1m_bars(days=1)
+        assert len(bt.bars_for_strategy(cls(), bars)) == 10      # 300 min / 30
+        thirty = bt.bars_for_strategy(cls(), bars)
+        assert bt.bars_for_strategy(cls(), thirty) is thirty      # already at its timeframe
+
+    def test_mtf_strategy_keeps_1m_input(self):
+        cls = self._cls()
+
+        class Mtf(cls):
+            htf_intervals = [3600]
+        bars = _session_1m_bars(days=1)
+        assert bt.bars_for_strategy(Mtf(), bars) is bars           # engine aggregates MTF itself
+
+    def test_non_intraday_strategy_needs_its_own_bars(self):
+        cls = self._cls()
+
+        class Daily(cls):
+            kline_type = 4
+        with pytest.raises(ValueError, match="daily"):
+            bt.bars_for_strategy(Daily(), _session_1m_bars(days=1))

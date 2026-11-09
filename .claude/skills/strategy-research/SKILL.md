@@ -61,8 +61,13 @@ python -m scripts.research.bt bars.pkl cand/a.py cand/b.py --symbol TMF00 \
 fill_mode="next_open")` — what `_execute_backtest` in `run_backtest.py`
 does. **The engine's own default is `on_close`; never omit `fill_mode`.**
 Point value comes from `SYMBOL_CONFIG` (TMF00 = 10, MTX00 = 50, TX00 = 200).
-Feed 1-min bars; the engine aggregates to the strategy's `kline_minute`
-itself. `--cost` subtracts NT$ per round trip (≈70 for 1 TMF lot: fees + tax
+**Bar contract:** `BacktestEngine` aggregates 1-min input only for MTF
+strategies (`htf_intervals`); a single-timeframe strategy sees exactly the
+bars you pass, so 1-min bars into a raw engine run a 30m strategy on 1-min
+bars. `bt.run` handles this (`bars_for_strategy` aggregates finer intraday
+input to the strategy's `kline_minute`), so 1-min bars are safe input
+there. Daily/weekly/monthly strategies need bars of their own timeframe.
+If you call `BacktestEngine` yourself, do the same. `--cost` subtracts NT$ per round trip (≈70 for 1 TMF lot: fees + tax
 + ~2 pts slippage) — the simulator's `pnl` is gross.
 
 ## 3. The AI loop without the GUI
