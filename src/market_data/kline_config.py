@@ -48,16 +48,23 @@ LIVE_CHART_TIMEFRAMES = {
 
 
 # ── Symbol configuration ──
+#
+# "tv" is the TradingView TAIFEX continuous contract: TXF1! = 台指,
+# MXF1! = 小台, TMF1! = 微台 (IMF1! is an unrelated contract, never TAIEX).
+# "prefix" is only a local label (Bar.symbol for COM/TAIFEX bars, the
+# data/backfill/{prefix}/ folder). It is NOT the TradingView ticker, so
+# MTX00's prefix "TMF1" and TMF00's "IMF1" are kept as-is to keep existing
+# files and folders addressable.
 
 SYMBOL_CONFIG = {
     "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100,
              "taifex_id": "TX", "order_symbol": "TXFD0", "init_margin": 322000,
              "near_month": True},
-    "MTX00": {"prefix": "TMF1", "tv": "TMF1!", "pv": 50, "tick_divisor": 100,
+    "MTX00": {"prefix": "TMF1", "tv": "MXF1!", "pv": 50, "tick_divisor": 100,
               "taifex_id": "MTX", "order_symbol": "MTXFD0",
               "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 80500,
               "near_month": True},
-    "TMF00": {"prefix": "IMF1", "tv": "IMF1!", "pv": 10, "tick_divisor": 100,
+    "TMF00": {"prefix": "IMF1", "tv": "TMF1!", "pv": 10, "tick_divisor": 100,
               "taifex_id": "TMF", "order_symbol": "TM0000",
               "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 16100,
               "near_month": True},
