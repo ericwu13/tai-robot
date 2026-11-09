@@ -255,3 +255,70 @@ class TestSingleTimeframeAggregation:
             kline_type = 4
         with pytest.raises(ValueError, match="daily"):
             bt.bars_for_strategy(Daily(), _session_1m_bars(days=1))
+
+
+# ── bt.run(end=) cuts at the strategy timeframe, not on 1-min bars (PR #261 review 2) ──
+
+def _day_and_night_1m_bars(first=datetime(2026, 11, 2), last=datetime(2026, 11, 6)):
+    """Day (08:45–13:44) + night (15:00–04:59 next day) 1-min bars, Mon..Fri incl. Friday night."""
+    import math
+    from datetime import timedelta
+    out, i, day = [], 0, first
+
+    def add(t, n):
+        nonlocal i
+        for _ in range(n):
+            px = 20000 + int(300 * math.sin(i / 400.0)) + i // 50
+            out.append(Bar(symbol="TMF00", dt=t, open=px, high=px + 3, low=px - 3,
+                           close=px + 1, volume=1, interval=60))
+            t += timedelta(minutes=1)
+            i += 1
+    while day <= last:
+        add(day.replace(hour=8, minute=45), 300)
+        add(day.replace(hour=15, minute=0), 840)       # crosses midnight → Sat 04:59 on Friday
+        day += timedelta(days=1)
+    return out
+
+
+class TestEndCutAtStrategyTimeframe:
+    END = "2026-11-06"                                 # a Friday; its night runs into Saturday
+
+    def _cls(self, minutes):
+        from src.strategy.examples.m1_sma_cross import M1SmaCrossStrategy
+
+        class SmaN(M1SmaCrossStrategy):
+            kline_minute = minutes
+        return SmaN
+
+    def _reference(self, minutes):
+        """The workbench order: bars at kline_minute, then filter_bars_by_date."""
+        from src.live.bar_aggregator import aggregate_bars
+        from src.market_data.kline_config import filter_bars_by_date
+        bars = aggregate_bars(_day_and_night_1m_bars(), minutes * 60)
+        return filter_bars_by_date(bars, "20261102", self.END.replace("-", ""))
+
+    def test_4h_night_bucket_crossing_midnight_is_whole(self):
+        cls = self._cls(240)
+        got = bt.engine_bars(cls(), _day_and_night_1m_bars(), end=self.END)
+        ref = self._reference(240)
+        b23 = [b for b in got if b.dt == datetime(2026, 11, 6, 23, 0)]
+        r23 = [b for b in ref if b.dt == datetime(2026, 11, 6, 23, 0)]
+        assert r23 and b23 and (b23[0].close, b23[0].volume) == (r23[0].close, r23[0].volume)
+        assert [(b.dt, b.close, b.volume) for b in got] == [(b.dt, b.close, b.volume) for b in ref]
+
+    @pytest.mark.parametrize("minutes", [240, 120, 30])
+    def test_trades_match_aggregate_then_filter(self, minutes):
+        cls = self._cls(minutes)
+        got = bt.run(cls, _day_and_night_1m_bars(), 10, end=self.END)
+        ref = bt.run(cls, self._reference(minutes), 10)
+        assert ref.trades, "fixture must trade"
+        assert _sig(got.trades) == _sig(ref.trades)
+
+    def test_mtf_end_cut_keeps_whole_primary_bucket(self):
+        cls = self._cls(240)
+
+        class Mtf(cls):
+            htf_intervals = [86400]
+        got = bt.engine_bars(Mtf(), _day_and_night_1m_bars(), end=self.END)
+        assert got[0].interval == 60                     # engine still aggregates MTF input
+        assert got[-1].dt == datetime(2026, 11, 7, 2, 59)  # 23:00 bucket kept to its end (03:00)

@@ -58,15 +58,40 @@ def run(cls, bars, point_value: int, params: dict | None = None,
     """
     from src.backtest.engine import BacktestEngine
     from src.backtest.metrics import calculate_metrics
-    if end:
-        cutoff = datetime.fromisoformat(end + " 23:59")
-        bars = [b for b in bars if b.dt <= cutoff]
     strategy = cls(**(params or {}))
     engine = BacktestEngine(strategy, point_value=point_value, fill_mode="next_open")
-    result = engine.run(bars_for_strategy(strategy, bars))
+    result = engine.run(engine_bars(strategy, bars, end=end))
     result.metrics = calculate_metrics(result.trades, result.equity_curve,
                                        initial_balance=initial_balance)
     return result
+
+
+def engine_bars(strategy, bars, end: str | None = None):
+    """``bars`` as the engine should get them, cut at ``end`` (YYYY-MM-DD).
+
+    The workbench (``_execute_backtest``) applies ``filter_bars_by_date`` to
+    bars already at ``kline_minute``: a bar is kept when its OPEN is on or
+    before the end date. So the cut happens AFTER aggregation — cutting
+    1-min bars at 23:59 first would flush the 23:00 night bucket of a 2h/4h
+    strategy (which runs to 03:00) as a partial bar. For MTF strategies the
+    engine aggregates the 1-min input itself, so the 1-min series is cut at
+    the end of the last primary bucket that opens on or before ``end``.
+    """
+    from src.backtest.engine import strategy_primary_interval
+    from src.live.bar_aggregator import aggregate_bars
+    out = bars_for_strategy(strategy, bars)
+    if not end or not out:
+        return out
+    stop = datetime.fromisoformat(end) + timedelta(days=1)     # first excluded open
+    primary = strategy_primary_interval(strategy)
+    if out[0].interval >= primary or getattr(strategy, "kline_type", 0) != 0:
+        return [b for b in out if b.dt < stop]
+    # MTF: 1-min input stays 1-min; find where the first excluded bucket opens.
+    later = [b.dt for b in aggregate_bars(out, primary) if b.dt >= stop]
+    if not later:
+        return out
+    cutoff = later[0]
+    return [b for b in out if b.dt < cutoff]
 
 
 def bars_for_strategy(strategy, bars):
