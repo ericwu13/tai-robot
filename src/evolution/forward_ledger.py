@@ -103,12 +103,16 @@ class SourceResolver:
     copy of another bot's ``evolution_sources``). ``extra_sources`` are
     raw texts (e.g. ``source_code`` rows read from a StrategyPool db).
     A class-name index is kept as a last resort for rows that predate
-    ``candidate_source_hash``.
+    ``candidate_source_hash`` (changelog PASSes, or a missing hash file).
+    It fails closed: once two different bodies define the same class name
+    (every weekly incumbent version lands in ``evolution_sources/``),
+    ``by_class`` returns None and the row is reported as ambiguous instead
+    of being scored against whichever body sorts first.
     """
 
     def __init__(self, *, bot_dirs=(), extra_dirs=(), extra_sources=()):
         self._by_hash: dict[str, str] = {}
-        self._by_class: dict[str, str] = {}
+        self._by_class: dict[str, set[str]] = {}
         from .history import SOURCES_DIRNAME
         folders = [os.path.join(os.fspath(d), SOURCES_DIRNAME) for d in bot_dirs]
         folders += [os.fspath(d) for d in extra_dirs]
@@ -137,14 +141,22 @@ class SourceResolver:
             if stripped.startswith("class ") and "(" in stripped:
                 name = stripped[6:stripped.index("(")].strip()
                 if name:
-                    self._by_class.setdefault(name, text)
+                    self._by_class.setdefault(name, set()).add(digest)
         return digest
 
     def by_hash(self, digest: str) -> str | None:
         return self._by_hash.get(digest or "")
 
+    def class_body_count(self, name: str) -> int:
+        """How many distinct bodies define ``class name(``."""
+        return len(self._by_class.get(name or "", ()))
+
     def by_class(self, name: str) -> str | None:
-        return self._by_class.get(name or "")
+        """The one body defining ``name``; None when absent or ambiguous."""
+        digests = self._by_class.get(name or "", set())
+        if len(digests) != 1:
+            return None
+        return self._by_hash.get(next(iter(digests)))
 
 
 # ── entries ──────────────────────────────────────────────────────────
@@ -300,6 +312,9 @@ def _candidate_source(entry: LedgerEntry, resolver: SourceResolver,
         text = resolver.by_class(entry.candidate_class)
         if text is not None:
             return text, "by_class"
+        count = resolver.class_body_count(entry.candidate_class)
+        if count > 1:
+            return None, f"ambiguous ({count} bodies define {entry.candidate_class})"
     if entry.knobs and incumbent_source and entry.incumbent_class:
         try:
             from .knobs import rewrite_knob_source
@@ -333,8 +348,15 @@ def score_entry(entry: LedgerEntry, bars, resolver: SourceResolver, *,
     if last <= start + timedelta(days=max(0, int(min_forward_days))):
         out.status = "no_forward_bars"
         return out
-    inc_src = resolver.by_hash(entry.incumbent_hash) or resolver.by_class(
-        entry.incumbent_class)
+    inc_src = resolver.by_hash(entry.incumbent_hash)
+    if inc_src is None:
+        inc_src = resolver.by_class(entry.incumbent_class)
+        count = resolver.class_body_count(entry.incumbent_class)
+        if inc_src is None and count > 1:
+            out.status = "ambiguous_incumbent_source"
+            out.detail = (f"{count} bodies define {entry.incumbent_class}; "
+                          "no hash to pick the one live at ts")
+            return out
     if inc_src is None:
         out.status = "no_incumbent_source"
         return out
@@ -355,11 +377,12 @@ def score_entry(entry: LedgerEntry, bars, resolver: SourceResolver, *,
     out.inc_n = len(inc)
     out.inc_pnl = int(sum(int(getattr(t, "pnl", 0) or 0) for t in inc))
     cand_src, origin = _candidate_source(entry, resolver, inc_src)
-    out.candidate_origin = origin
     if cand_src is None:
-        # Incumbent-only row: a grid no-pick, a refused or failed codegen.
-        out.detail = "no candidate source"
+        # Incumbent-only row: a grid no-pick, a refused or failed codegen,
+        # or a class-name lookup that matched more than one body.
+        out.detail = ("candidate source " + origin) if origin else "no candidate source"
         return out
+    out.candidate_origin = origin
     try:
         cand = [t for t in _trades(cand_src) if _entry_after(t, start)]
     except Exception as exc:

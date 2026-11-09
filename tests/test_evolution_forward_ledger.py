@@ -395,3 +395,103 @@ def test_rows_without_an_offset_fall_back_to_the_cli_offset():
     s = score_entry(entry, _bars(), resolver, point_value=10,
                     backtest=backtest, load=load, ts_offset_hours=1)
     assert s.start == "2026-10-10 06:06"
+
+
+# ── Cursor review: 60-min strategy, session gaps, ambiguous class bodies ──
+
+_COUNTING_60M = '''
+from src.backtest.strategy import BacktestStrategy
+
+
+class Counting60(BacktestStrategy):
+    kline_type = 0
+    kline_minute = 60
+    seen = []
+
+    def __init__(self, **kwargs):
+        pass
+
+    def required_bars(self):
+        return 1
+
+    def on_bar(self, bar, data_store, broker):
+        type(self).seen.append((bar.dt, bar.interval))
+'''
+
+
+def _session_bars():
+    """1-min bars for a day session to 13:44 and a night session from 15:00."""
+    from src.market_data.models import Bar
+    out = []
+    day = datetime(2026, 10, 6)
+    spans = [(day.replace(hour=8, minute=45), 300),   # 08:45-13:44
+             (day.replace(hour=15, minute=0), 180)]   # 15:00-17:59
+    for start, n in spans:
+        for m in range(n):
+            dt = start + timedelta(minutes=m)
+            out.append(Bar(symbol="TMF00", dt=dt, open=20000, high=20001,
+                           low=19999, close=20000, volume=1, interval=60))
+    return out
+
+
+def test_60m_single_tf_strategy_is_not_called_once_per_1min_bar():
+    from src.ai.code_sandbox import load_strategy_from_source
+    from src.evolution.forward_ledger import backtest_trades
+    from src.live.bar_aggregator import aggregate_bars
+
+    cls = load_strategy_from_source(_COUNTING_60M)
+    cls.seen = []
+    bars = _session_bars()
+    backtest_trades(cls, bars, 10)
+    expected = aggregate_bars(bars, 3600)  # the live CSV-reload helper
+    assert len(cls.seen) == len(expected) < len(bars) // 30
+    assert {iv for _dt, iv in cls.seen} == {3600}
+    # Session gap stays split: no hourly bar opens inside the closed gap
+    # and the night session is aggregated on its own.
+    gap = (datetime(2026, 10, 6, 13, 45), datetime(2026, 10, 6, 15, 0))
+    assert not [dt for dt, _ in cls.seen if gap[0] <= dt < gap[1]]
+    night = aggregate_bars([b for b in bars if b.dt >= gap[1]], 3600)
+    assert [dt for dt, _ in cls.seen if dt >= gap[1]] == [b.dt for b in night]
+
+
+def test_class_name_fallback_fails_closed_on_two_bodies():
+    resolver = SourceResolver()
+    one = "class Dup(X):\n    A = 1\n"
+    two = "class Dup(X):\n    A = 2\n"
+    resolver.add(one)
+    assert resolver.by_class("Dup") == one
+    resolver.add(two)
+    assert resolver.by_class("Dup") is None
+    assert resolver.class_body_count("Dup") == 2
+    resolver.add(one)  # same body again does not change the count
+    assert resolver.class_body_count("Dup") == 2
+
+
+def test_ambiguous_class_rows_are_reported_not_scored():
+    resolver = SourceResolver()
+    resolver.add("class Inc(X):\n    A = 1\n")
+    resolver.add("class Inc(X):\n    A = 2\n")
+    cand = resolver.add("class IncEvo1(X):\n CAND\n")
+    load, backtest = _fake({"CAND": [_t("2026-10-12 09:00", 5)]})
+    # Changelog-style row: class names only, no hashes.
+    s = score_entry(_entry(candidate_class="IncEvo1"), _bars(), resolver,
+                    point_value=10, backtest=backtest, load=load)
+    assert s.status == "ambiguous_incumbent_source"
+    assert "2 bodies" in s.detail
+    # A known digest still resolves exactly.
+    inc = resolver.add("class Inc(X):\n    A = 3\n")
+    s = score_entry(_entry(incumbent_hash=inc, candidate_hash=cand), _bars(),
+                    resolver, point_value=10, backtest=backtest, load=load)
+    assert s.status == SCORED and s.candidate_origin == "stored"
+
+
+def test_ambiguous_candidate_class_leaves_an_incumbent_only_row():
+    resolver = SourceResolver()
+    inc = resolver.add("class Inc(X):\n INC\n")
+    resolver.add("class IncEvo1(X):\n    A = 1\n")
+    resolver.add("class IncEvo1(X):\n    A = 2\n")
+    load, backtest = _fake({"INC": [_t("2026-10-12 09:00", 5)]})
+    s = score_entry(_entry(incumbent_hash=inc, candidate_class="IncEvo1"),
+                    _bars(), resolver, point_value=10, backtest=backtest, load=load)
+    assert s.status == SCORED and s.delta is None
+    assert "ambiguous" in s.detail and "2 bodies" in s.detail
