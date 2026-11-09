@@ -166,6 +166,13 @@ python test_kline.py       # COM-based KLine history GUI
 - Report files namespaced: `{date}_{bot_name}.json` to avoid collision between concurrent bots
 - Daily report includes `per_strategy` breakdown and `regime_switching` section for Discord
 
+## Evolution history & forward ledger (docs/evo_redesign_plan.md)
+- `{bot_dir}/evolution_history.jsonl`: one line per Saturday attempt. `source_hash` (incumbent), `candidate_class`/`candidate_source_hash`, and `verdict_text` (the full block; Discord cuts it at 1,700 chars). Source texts live once in `{bot_dir}/evolution_sources/{sha256}.py` (write-once).
+- `{bot_dir}/evolution_weekly_slot.json` is the persisted ISO-week latch: `started` at launch, `done` with the attempt's history line (not for `pipeline_error`/`grid_failed`/`no_chat_client`). A restart skips a `done` week, and a `started` week only within `SLOT_STARTED_GUARD_S` (45 min).
+- A grid no-pick under the relative gate is an evaluated FAILED week for the #188 retire streak only when `GridOutcome.evaluated` (the grid scored its settings). Both exits run `src/evolution/retire_review.py`.
+- Weekly validation's fallback bars (`_fallback_bars`, bot 1-min CSVs) reach single-TF strategies unaggregated: the engine aggregates only `htf_intervals` strategies (D14 in the plan, not fixed yet).
+- `python -m scripts.evo_forward_ledger <bot_dir>... [--source-dir strategies] [--changelog data/changelog.json]` re-scores past verdicts on later bars and reports the PASS-vs-incumbent forward hit rate. It is read-only and report-only, and its default fill is `next_open`. The weekly validation itself still backtests `on_close` (engine default; D8 in the plan).
+
 ## AI Code Generation
 - Indicators return named tuples: `BollingerResult(upper, middle, lower)`, `MacdResult(macd_line, signal_line, histogram)`, `StochasticResult(k, d)` — both `bb.middle` and `upper, mid, lower = bb` work
 - **No `bb_std`/std attribute exists anywhere** (pure-Python indicators; no pandas_ta/talib in this repo). BB std-dev is not returned — recover it as `(bb.upper - bb.middle) / num_std` (population std, ddof=0, matches TradingView `ta.stdev`). `self.bb_std` in strategies is a self-defined constructor param (the σ multiplier): `self.bb_std = float(kwargs.get("bb_std", 2.0))`. Referencing it without that line → runtime AttributeError (the BbandMonthShortV5 crash).

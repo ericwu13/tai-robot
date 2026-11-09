@@ -698,7 +698,7 @@ def test_worker_writes_history_after_the_discord_verdict():
     assert 'assembled=assembled' in src
     assert src.index("evolution_verdict(verdict.passed, block)") < src.index(
         "assembled=assembled")
-    assert src.index("rec = assess_retirement") < src.index(
+    assert src.index(" _review = _retire_review(") < src.index(
         "evolution_verdict(verdict.passed, block)")
     assert src.index("block = format_weekend_verdict_block") < src.index(
         "evolution_verdict(verdict.passed, block)")
