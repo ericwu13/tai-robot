@@ -168,8 +168,9 @@ python test_kline.py       # COM-based KLine history GUI
 
 ## Evolution history & forward ledger (docs/evo_redesign_plan.md)
 - `{bot_dir}/evolution_history.jsonl`: one line per Saturday attempt. `source_hash` (incumbent), `candidate_class`/`candidate_source_hash`, and `verdict_text` (the full block; Discord cuts it at 1,700 chars). Source texts live once in `{bot_dir}/evolution_sources/{sha256}.py` (write-once).
-- `{bot_dir}/evolution_weekly_slot.json` is the persisted ISO-week latch, so a restart does not re-run the Saturday slot.
-- A grid no-pick under the relative gate is an evaluated FAILED week for the #188 retire streak. Both exits run `src/evolution/retire_review.py`.
+- `{bot_dir}/evolution_weekly_slot.json` is the persisted ISO-week latch: `started` at launch, `done` with the attempt's history line (not for `pipeline_error`/`grid_failed`/`no_chat_client`). A restart skips a `done` week, and a `started` week only within `SLOT_STARTED_GUARD_S` (45 min).
+- A grid no-pick under the relative gate is an evaluated FAILED week for the #188 retire streak only when `GridOutcome.evaluated` (the grid scored its settings). Both exits run `src/evolution/retire_review.py`.
+- Weekly validation's fallback bars (`_fallback_bars`, bot 1-min CSVs) reach single-TF strategies unaggregated: the engine aggregates only `htf_intervals` strategies (D14 in the plan, not fixed yet).
 - `python -m scripts.evo_forward_ledger <bot_dir>... [--source-dir strategies] [--changelog data/changelog.json]` re-scores past verdicts on later bars and reports the PASS-vs-incumbent forward hit rate. It is read-only and report-only, and its default fill is `next_open`. The weekly validation itself still backtests `on_close` (engine default; D8 in the plan).
 
 ## AI Code Generation

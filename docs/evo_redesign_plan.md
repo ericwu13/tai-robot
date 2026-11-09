@@ -69,6 +69,7 @@ and it is being paper-deployed now. Lessons from it that this plan builds in:
 | D11 | **A restart re-runs the Saturday slot.** The ISO-week latch was in memory only | `run_backtest.py:9943-9946`, init `:2568` | Steven 10-31 08:08–08:25: every bot re-ran, and one made a second AI-backed attempt. 11-07 06:14: all re-ran as skips. **Fixed in this PR** |
 | D12 | **Low-frequency bots never evolve.** `min_design_trades` = 30 counts live paper trades only | `run_backtest.py:6446-6460` | BB-ShortOnly (best paper bot, +35k since 09-01) is stuck at 14–18/30. A backtest of the same window gives 62 trades |
 | D13 | V3 knob `KeyError: 'atr_buffer_mult'` (#164), three Saturdays running | — | **Already fixed on master** by #165 (81b8529, closed 2026-10-22). V3 has not hit it since 10-24. No change in this PR |
+| D14 | **Fallback validation bars are 1-min for single-TF strategies.** The normal weekly path fetches API bars at the strategy's own timeframe (`run_backtest.py:8166`, `start_api_fetch(symbol, kt, km, …)`). When the quote session is down or the fetch fails, `_fallback_bars` (`:6963-6980`) passes the bot's 1-min CSVs. `BacktestEngine._prepare_bars` (`src/backtest/engine.py:138-165`) aggregates only for strategies with `htf_intervals`, so a 15m single-TF strategy is validated on 1-min bars there (the comments at `:6968` and `:7540` assume otherwise) | `run_backtest.py:6963-6980`, `:7540` | A fallback Saturday scores the wrong timeframe. The forward ledger already aggregates (`forward_ledger.bars_for_strategy`). Not fixed here: it changes verdicts on fallback days, so it ships with D8 and its replay |
 
 ## 3. Target architecture
 
@@ -203,28 +204,44 @@ changed by the Phase 1 PR; each row takes effect in the phase that implements it
 | N5 | **Cadence** | weekly plan + grid every Saturday; structural monthly | **Weekly:** ledger + family re-score (no LLM). **Monthly** (first Saturday): one brief-driven proposal per family slot. Knob grid only when ≥ 1 new non-overlapping fold exists since the last grid for that bot | Weeks overlap 8/9 folds. Four bots repeated the same ~1,805–1,819-char FAIL verdict weekly. ~9 Gemini calls / 69k tokens per week bought 2 PASSes that both lost forward |
 | N6 | **Absolute floor on the paper path** | dropped on relative (`paper_gate.py:966-980`) | Candidate **holdout P&L > 0 AND ≥ max(incumbent holdout P&L, 0)**, on top of the relative checks | "Less bad than a losing incumbent" is how a −22k strategy passes. Real money already requires the absolute floor |
 | N7 | **DSR trial window** | this Saturday's grid columns; structural N ≈ 1 | **Cumulative per bot** over all Saturdays whose selection folds overlap the current design window, all lanes counted | Overlapping weekly looks at the same data are repeated trials. The current N understates the multiple-testing penalty |
-| N8 | **Does a grid no-pick count as a failed week for the #188 retire streak?** (implemented in this PR) | it recorded no week | **Yes**, relative gate only (what Phase 1a does). A grid failure (timeout/crash) still counts as no week | Without it, a class on the knob grid can never reach "not improvable". The output is recommend-only text, and `retire.consecutive_weeks` (4) is unchanged. If the owner prefers the old rule, revert commit "run the retire check when the knob grid selects nothing" |
+| N8 | **Does a grid no-pick count as a failed week for the #188 retire streak?** (implemented in this PR) | it recorded no week | **Yes**, relative gate only, and only when the grid actually scored its settings (`GridOutcome.evaluated`). No bars, too few folds, a failed baseline backtest, unreadable knobs, or a grid timeout/crash count as no week | Without it, a class on the knob grid can never reach "not improvable". The output is recommend-only text, and `retire.consecutive_weeks` (4) is unchanged. If the owner prefers the old rule, revert commit "run the retire check when the knob grid selects nothing" |
 
 ## 5. Phase 1 details (this PR)
 
 - **(a)** `src/evolution/retire_review.py` holds the retire block, moved out
   of the Tk worker. The validation exit and the grid no-pick exit both call
-  it. A relative-gate no-pick writes the `EVO_RELATIVE_GATE` changelog marker,
-  stores `retire_week.evaluated = true, passed = false`, and appends any
-  RETIRE RECOMMENDATION to the chat/Discord message. Tests:
-  `tests/test_evolution_grid_no_pick_retire.py`.
+  it. A relative-gate no-pick from a grid that scored its settings
+  (`GridOutcome.evaluated`, set only by `select_grid` with ≥ 1 scored
+  point) writes the `EVO_RELATIVE_GATE` changelog marker, stores
+  `retire_week.evaluated = true, passed = false`, and appends any RETIRE
+  RECOMMENDATION to the chat/Discord message. Data exits (no bars, too few
+  folds, baseline backtest failed, knobs unreadable, off the grid) record no
+  week. Tests: `tests/test_evolution_grid_no_pick_retire.py`.
 - **(b)** `history.store_source` / `load_stored_source`. A line names a
   digest only after its text is stored. Tests:
   `tests/test_evolution_history_sources.py` (including a 7.8k-char block
   whose last line must survive).
-- **(c)** `notify.weekly_slot_key` / `weekly_slot_taken` / `mark_weekly_slot`
-  write `{bot_dir}/evolution_weekly_slot.json`. A failed write falls back to
-  the in-memory latch, so a disk error never silences a run. Trade-off: a
-  crash mid-run is not retried that Saturday, which matches the old in-memory
-  latch. Tests: `tests/test_evolution_weekly_slot.py`.
+- **(c)** `{bot_dir}/evolution_weekly_slot.json` has two states. `started`
+  is written at launch. `done` is written with the attempt's history line
+  (`_persist_evolution_history` → `notify.finish_weekly_slot_for`), for any
+  terminal status including skips, except the retryable infrastructure ends
+  `pipeline_error` (e.g. an exhausted Gemini 503), `grid_failed`, and
+  `no_chat_client`, which leave `started`. `weekly_slot_taken` is true for
+  `done`, or for `started` younger than `SLOT_STARTED_GUARD_S` = 45 min (the
+  20-min grid cap + API fetch + model calls with retries + validation;
+  observed runs are 1–4 min per bot). So a finished week is never re-run, a
+  dead run (crash, hang-kill, failed fetch) is retried after the window, and
+  a quick restart never stacks a second AI-backed attempt on a live one. A
+  failed write falls back to the in-memory latch, so a disk error never
+  silences a run. Tests: `tests/test_evolution_weekly_slot.py`.
 - **(d)** #164 was closed by #165 (81b8529). `tests/test_evolution_issue164.py`
   passes on this branch. No change.
-- **(e)** Forward ledger, above. Tests:
+- **(e)** Forward ledger, above. Bot-dir bars are 1-min, so
+  `bars_for_strategy` aggregates them to each single-TF strategy's primary
+  interval first (the engine only does that for `htf_intervals` strategies).
+  History rows now carry `ts_utc_offset_min`; older rows use
+  `--ts-offset-hours` (default 0 = TPE, correct for Steven, whose Saturday
+  rows read 05:05 local for a 05:05-TPE trigger). Tests:
   `tests/test_evolution_forward_ledger.py`. The end-to-end test uses the
   real engine on bars that fall before the proposal and rise after it, so a
   short candidate that "won" in-sample must lose forward.

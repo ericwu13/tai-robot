@@ -28,9 +28,14 @@ Fill model: ``next_open`` by default, the GUI and live-paper parity
 model. The weekly validation itself still runs ``on_close`` (the
 engine default); ``fill_mode`` lets a caller reproduce that.
 
-Timestamps: history ``ts`` is the bot machine's local wall clock.
-Steven runs on TPE, so the default offset is 0. Trades are TPE strings
-``YYYY-MM-DD HH:MM``. ``ts_offset_hours`` converts a non-TPE ``ts``.
+Timestamps: history ``ts`` is the bot machine's local wall clock;
+trades are TPE strings ``YYYY-MM-DD HH:MM``. Rows written from this
+change on carry ``ts_utc_offset_min`` and are converted with it. Older
+rows use ``ts_offset_hours`` (default 0). That default is right for
+Steven: its Saturday runs are triggered at >= 05:05 TPE and their
+``ts`` reads 05:05:25-05:09 (2026-10-31, 2026-11-07), so its clock is
+TPE. This PC's clock is UTC-7: pass ``--ts-offset-hours 15`` for old
+local rows.
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ class LedgerEntry:
     candidate_class: str = ""
     candidate_hash: str = ""
     knobs: dict | None = None
+    ts_utc_offset_min: int | None = None
 
 
 @dataclass
@@ -158,6 +164,9 @@ def entries_from_history(records) -> list[LedgerEntry]:
             continue
         directives = rec.get("directives") if isinstance(rec.get("directives"), dict) else {}
         knobs = directives.get("knobs") if isinstance(directives.get("knobs"), dict) else None
+        offset = rec.get("ts_utc_offset_min")
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            offset = None
         found.append(LedgerEntry(
             bot=str(rec.get("bot") or ""),
             ts=ts,
@@ -168,6 +177,7 @@ def entries_from_history(records) -> list[LedgerEntry]:
             candidate_class=str(rec.get("candidate_class") or ""),
             candidate_hash=str(rec.get("candidate_source_hash") or ""),
             knobs=knobs or None,
+            ts_utc_offset_min=offset,
         ))
     found.sort(key=lambda e: e.ts)
     return found
@@ -310,6 +320,8 @@ def score_entry(entry: LedgerEntry, bars, resolver: SourceResolver, *,
     run = backtest or backtest_trades
     loader = load or _load
     cache = {} if cache is None else cache
+    if entry.ts_utc_offset_min is not None:
+        ts_offset_hours = (480 - int(entry.ts_utc_offset_min)) / 60.0
     start = _parse_ts(entry.ts, ts_offset_hours)
     if start is None:
         return ForwardScore(entry, "bad_ts", entry.ts)

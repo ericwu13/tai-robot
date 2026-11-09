@@ -15,6 +15,9 @@ these names:
 
 * ``ts`` — ``YYYY-MM-DDTHH:MM:SS``, local time, the same form as a
   #188 ``WeekRecord.at``.
+* ``ts_utc_offset_min`` — the writing machine's UTC offset in minutes
+  (480 = TPE), so a reader can convert ``ts`` without assuming the host
+  clock's zone.
 * ``bot`` — strategy display name.
 * ``class`` — strategy class name.
 * ``source_hash`` — sha256 of the incumbent (baseline) strategy source.
@@ -490,6 +493,14 @@ def validation_gates(*, assembled, folds, baseline_res, candidate_res,
     }
 
 
+def _local_utc_offset_min() -> int | None:
+    try:
+        offset = datetime.now().astimezone().utcoffset()
+        return int(offset.total_seconds() // 60) if offset is not None else None
+    except Exception:
+        return None
+
+
 def build_evolution_record(
         *,
         ts: str | None = None,
@@ -526,6 +537,7 @@ def build_evolution_record(
     reason_text = str(reason or "")[:_REASON_CHARS]
     record = {
         "ts": str(stamp),
+        "ts_utc_offset_min": _local_utc_offset_min(),
         "bot": str(bot or "")[:200],
         "class": str(class_name or "")[:200],
         "source_hash": str(digest or ""),

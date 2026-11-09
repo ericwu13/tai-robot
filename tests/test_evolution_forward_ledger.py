@@ -356,3 +356,42 @@ def test_single_tf_15m_strategy_gets_the_same_trades_from_1min_or_15m_bars():
     from_1m = backtest_trades(cls, one_min, 10)
     assert from_15m, "fixture must trade"
     assert key(from_1m) == key(from_15m)
+
+
+# ── review nit: history ts carries its machine's UTC offset ──────────
+
+
+def test_new_history_rows_record_the_machine_utc_offset():
+    record = build_evolution_record(bot="B", final_status="skip")
+    expected = int(datetime.now().astimezone().utcoffset().total_seconds() // 60)
+    assert record["ts_utc_offset_min"] == expected
+
+
+def test_ledger_converts_a_non_tpe_ts_using_the_recorded_offset():
+    """A UTC-7 machine's 2026-10-10 14:06 is 2026-10-11 05:06 TPE."""
+    rows = [build_evolution_record(ts="2026-10-10T14:06:00", bot="B",
+                                   final_status="fail", reason_kind="validation")]
+    rows[0]["ts_utc_offset_min"] = -420
+    entry = entries_from_history(rows)[0]
+    resolver = SourceResolver()
+    entry.incumbent_hash = resolver.add("class Inc(X):\n INC\n")
+    load, backtest = _fake({"INC": [_t("2026-10-10 20:00", 111),
+                                    _t("2026-10-11 09:00", 7)]})
+    s = score_entry(entry, _bars(), resolver, point_value=10,
+                    backtest=backtest, load=load, ts_offset_hours=99)
+    assert s.start == "2026-10-11 05:06"
+    assert s.inc_pnl == 7  # the 10-10 20:00 TPE trade is before the proposal
+
+
+def test_rows_without_an_offset_fall_back_to_the_cli_offset():
+    rows = [build_evolution_record(ts="2026-10-10T05:06:00", bot="B",
+                                   final_status="fail")]
+    rows[0].pop("ts_utc_offset_min")
+    entry = entries_from_history(rows)[0]
+    assert entry.ts_utc_offset_min is None
+    resolver = SourceResolver()
+    entry.incumbent_hash = resolver.add("class Inc(X):\n INC\n")
+    load, backtest = _fake({"INC": []})
+    s = score_entry(entry, _bars(), resolver, point_value=10,
+                    backtest=backtest, load=load, ts_offset_hours=1)
+    assert s.start == "2026-10-10 06:06"
