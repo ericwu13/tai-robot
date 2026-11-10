@@ -76,9 +76,11 @@ as permission to code.
   to one bot dir — several dirs run the same strategy (#105 vs
   TMF00_0422). A digest carried a stale "no live bots" claim from a
   previous day's data — validate against NOW's evidence, never a cached
-  summary.
-- **Clock discipline**: this machine is UTC-7; TPE is +8. decisions.csv
-  col 0 is machine-local, `bar_dt` (col 1) is TPE. NTFS mtimes are
+  summary. Validate on the host that holds the evidence — the fleet is on
+  Steven; a claim derived from this PC's `data\live` or local n8n is
+  REFUTED as fleet evidence.
+- **Clock discipline**: this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there); TPE is +8. decisions.csv
+  col 0 is the BOT host's local clock, `bar_dt` (col 1) is TPE. NTFS mtimes are
   local. Name the clock before comparing timestamps.
 - **Absence is evidence too**: verify a hypothesis by the line it
   PREDICTS (clock skew predicts `[STALE TICK]` lines; none present =

@@ -15,10 +15,16 @@ these names:
 
 * ``ts`` — ``YYYY-MM-DDTHH:MM:SS``, local time, the same form as a
   #188 ``WeekRecord.at``.
+* ``ts_utc_offset_min`` — the writing machine's UTC offset in minutes
+  (480 = TPE), so a reader can convert ``ts`` without assuming the host
+  clock's zone.
 * ``bot`` — strategy display name.
 * ``class`` — strategy class name.
-* ``source_hash`` — sha256 of the strategy source. The source text is
-  not stored.
+* ``source_hash`` — sha256 of the incumbent (baseline) strategy source.
+  The text itself is kept once in the source store (below).
+* ``candidate_class`` / ``candidate_source_hash`` — the candidate's class
+  name and sha256, empty when the attempt never produced candidate code.
+  A FAIL keeps its code too, so the forward ledger can re-score it.
 * ``cut_idx`` — design-window cut, or null when the attempt ended
   before the cut existed.
 * ``watermark`` — ``{"trade_count", "at"}`` or null. Other keys on the
@@ -57,6 +63,13 @@ these names:
 * ``thresholds`` — the resolved paper/real/relative/retire config in
   force for the attempt (defaults included). Unknown keys on the raw
   settings mapping are not copied.
+* ``verdict_text`` — the full operator-visible block for this attempt
+  (the Discord verdict is cut at ~1,800 characters, ``reason`` at
+  4,000). Capped at ``_VERDICT_CHARS``.
+
+Source store: ``{bot_dir}/evolution_sources/{sha256}.py``. Content
+addressed and write-once, so a weekly incumbent costs one file, not
+one copy per line. A missing bot directory is not created.
 
 ``reason_kind`` values used by the pipeline:
 
@@ -108,8 +121,11 @@ from .paper_gate import (
 )
 
 HISTORY_FILENAME = "evolution_history.jsonl"
+SOURCES_DIRNAME = "evolution_sources"
 PLAN_EXCERPT_CHARS = 300
 _REASON_CHARS = 4000
+_VERDICT_CHARS = 64_000
+_HEX = frozenset("0123456789abcdef")
 _STATUSES = ("skip", "no_change", "refused", "fail", "pass")
 _GATE_KEYS = ("deep", "multifold", "month", "promotion_gate")
 
@@ -117,6 +133,56 @@ _GATE_KEYS = ("deep", "multifold", "month", "promotion_gate")
 def evolution_history_path(bot_dir) -> str:
     """``{bot_dir}/evolution_history.jsonl`` (live: under ``data/live/``)."""
     return os.path.join(os.fspath(bot_dir), HISTORY_FILENAME)
+
+
+def _sources_dir(bot_dir) -> str:
+    return os.path.join(os.fspath(bot_dir), SOURCES_DIRNAME)
+
+
+def _is_digest(value) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and set(value) <= _HEX)
+
+
+def store_source(bot_dir, source: str, *, log=None) -> str:
+    """Keep ``source`` under its sha256 in the bot's source store.
+
+    Returns the digest, or ``""`` for empty source, a missing bot
+    directory, or a write error (logged). An existing file is never
+    rewritten. Never raises.
+    """
+    if not source or not bot_dir:
+        return ""
+    try:
+        if not os.path.isdir(os.fspath(bot_dir)):
+            return ""
+        digest = _hash_source(source)
+        folder = _sources_dir(bot_dir)
+        path = os.path.join(folder, digest + ".py")
+        if os.path.isfile(path):
+            return digest
+        os.makedirs(folder, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as handle:
+            handle.write(source)
+        os.replace(tmp, path)
+        return digest
+    except Exception as exc:
+        _report(log, "evolution source store failed: "
+                     f"[{type(exc).__name__}] {exc}")
+        return ""
+
+
+def load_stored_source(bot_dir, digest) -> str | None:
+    """Source text for ``digest``, or None when absent or unreadable."""
+    if not bot_dir or not _is_digest(digest):
+        return None
+    path = os.path.join(_sources_dir(bot_dir), digest + ".py")
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except OSError:
+        return None
 
 
 def _report(log, message: str) -> None:
@@ -427,6 +493,14 @@ def validation_gates(*, assembled, folds, baseline_res, candidate_res,
     }
 
 
+def _local_utc_offset_min() -> int | None:
+    try:
+        offset = datetime.now().astimezone().utcoffset()
+        return int(offset.total_seconds() // 60) if offset is not None else None
+    except Exception:
+        return None
+
+
 def build_evolution_record(
         *,
         ts: str | None = None,
@@ -450,6 +524,9 @@ def build_evolution_record(
         retire_evaluated: bool = False,
         retire_passed: bool = False,
         thresholds=None,
+        candidate_class: str = "",
+        candidate_source_hash: str = "",
+        verdict_text: str = "",
 ) -> dict:
     """One history object. Does not touch the filesystem."""
     stamp = ts or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -460,6 +537,7 @@ def build_evolution_record(
     reason_text = str(reason or "")[:_REASON_CHARS]
     record = {
         "ts": str(stamp),
+        "ts_utc_offset_min": _local_utc_offset_min(),
         "bot": str(bot or "")[:200],
         "class": str(class_name or "")[:200],
         "source_hash": str(digest or ""),
@@ -482,6 +560,10 @@ def build_evolution_record(
             "passed": passed,
         },
         "thresholds": _json_ready(thresholds) if isinstance(thresholds, dict) else None,
+        "candidate_class": str(candidate_class or "")[:200],
+        "candidate_source_hash": (
+            candidate_source_hash if _is_digest(candidate_source_hash) else ""),
+        "verdict_text": str(verdict_text or "")[:_VERDICT_CHARS],
     }
     return record
 
@@ -615,6 +697,14 @@ def record_evolution_attempt(bot_dir, *, log=None, thresholds_raw=None,
                 candidate_name=candidate_name or "",
                 baseline_name=baseline_name or "",
             )
+        # Both sources go to the store before the line is written, so a
+        # line never names a digest whose text was not kept.
+        if source:
+            store_source(bot_dir, source, log=log)
+        candidate_digest = ""
+        if candidate_source:
+            candidate_digest = store_source(bot_dir, candidate_source, log=log)
+        fields.setdefault("candidate_class", candidate_name or "")
         if thresholds is None and thresholds_raw is not None:
             thresholds = thresholds_snapshot(thresholds_raw)
         elif thresholds is None and "thresholds" not in fields:
@@ -626,6 +716,7 @@ def record_evolution_attempt(bot_dir, *, log=None, thresholds_raw=None,
             params_after=params_after,
             params_reason=params_reason,
             thresholds=thresholds,
+            candidate_source_hash=candidate_digest,
             **fields,
         )
         return append_evolution_history(

@@ -165,6 +165,107 @@ pre.log .P3 { color: var(--muted); }
 .sc.bear { color: var(--down); background: var(--off-bg); }
 .sc.bear.strong { color: #fff; background: var(--down); }
 .sc.flat { color: var(--off); background: var(--off-bg); font-weight: 400; }
+/* 市場脈動 header of the 新聞訊號 view. */
+.n-alert { margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; background: var(--bad-bg);
+  color: var(--bad); font-weight: 700; }
+.pulse { padding: 14px; display: grid; gap: 12px; margin-bottom: 16px; }
+.pulse-top { display: grid; grid-template-columns: minmax(260px, 1.3fr) 1fr; gap: 14px 24px; align-items: start; }
+.gauge .num { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.gauge .state { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; margin: 4px 0 8px; font-size: 13px; }
+.gbar { position: relative; height: 14px; border-radius: 7px; background: var(--off-bg); overflow: hidden; }
+.gbar .fill { position: absolute; top: 0; bottom: 0; }
+.gbar .tick { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); opacity: .55; }
+.gbar .zero { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--muted); }
+.gbar .peak { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warn); }
+.gscale { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted);
+  font-variant-numeric: tabular-nums; margin-top: 2px; }
+.vstrip { display: grid; gap: 6px; }
+.vchip { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; font-size: 13px; }
+.vchip .dot { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.vchip .dot::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.vchip .ok { color: var(--ok); } .vchip .stale { color: var(--warn); }
+.vchip .bad { color: var(--bad); } .vchip .off { color: var(--off); }
+.pmeta { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 13px; color: var(--muted); }
+.pmeta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.events { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 13px; }
+.ev { display: inline-flex; gap: 6px; align-items: center; }
+.ev .sev { font-size: 11px; }
+.ev .sev.high { color: #fff; background: var(--bad); }
+.ev .sev.medium { color: var(--warn); background: var(--warn-bg); }
+.ev .sev.low { color: var(--off); background: var(--off-bg); }
+.news-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; margin-bottom: 16px; }
+.chart.news { height: 240px; }
+.drivers { padding: 10px 14px; display: grid; gap: 10px; }
+.drivers h4 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+.drv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; font-size: 13px; }
+.drv a { color: var(--text); font-weight: 600; text-decoration: none; }
+.drv a:hover { text-decoration: underline; color: var(--ok); }
+.drv .why { grid-column: 2; }
+.wbar { display: inline-block; width: 40px; height: 5px; border-radius: 3px; background: var(--off-bg);
+  vertical-align: middle; position: relative; overflow: hidden; }
+.wbar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--muted); }
+.reason { display: block; color: var(--text); opacity: .8; font-size: 12px; white-space: normal; }
+.new-badge { display: inline-block; margin-right: 6px; padding: 0 5px; border-radius: 4px; font-size: 11px;
+  font-weight: 700; color: #fff; background: var(--ok); vertical-align: 1px; }
+#news tr.faded td { opacity: .55; }
+@media (max-width: 760px) {
+  .pulse-top, .news-grid { grid-template-columns: 1fr; }
+  .chart.news { height: 200px; }
+  .gauge .num { font-size: 26px; }
+}
+/* W2 跨市場報價 strip + W4 籌碼 panel (新聞訊號 view). 紅漲綠跌. */
+.mk-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 16px; margin-bottom: 16px; }
+.mk-body { padding: 10px 14px 14px; display: grid; gap: 10px; }
+.tgrp { display: grid; gap: 4px; }
+.tgrp h4 { margin: 4px 0 2px; font-size: 13px; font-weight: 700; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.trow { display: grid; grid-template-columns: minmax(118px, 1.1fr) 64px minmax(90px, 2fr) 92px; gap: 4px 10px;
+  align-items: center; font-size: 13px; }
+.trow .sym { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trow .sym b { font-weight: 600; }
+.trow .pct { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+.trow .th { font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.trow.stale { opacity: .45; }
+.trow.stale .pct { font-weight: 400; }
+.brk { font-size: 11px; font-weight: 700; padding: 0 5px; border-radius: 4px; margin-left: 4px; }
+.brk.up { color: #fff; background: var(--up); } .brk.down { color: #fff; background: var(--down); }
+.pbar { position: relative; height: 10px; border-radius: 5px; background: var(--off-bg); overflow: hidden; }
+.pbar .fill { position: absolute; top: 0; bottom: 0; }
+.pbar .zero { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--muted); left: 50%; }
+.pbar .tick { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--text); opacity: .55; }
+.pbar .tick.vote { width: 0; border-left: 2px dotted var(--text); background: none; opacity: .4; }
+.qline { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--muted); }
+.qline b { color: var(--text); font-weight: 600; }
+.chips-head { display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: flex-end; }
+.chips-head .num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.spark { width: 100%; height: 56px; display: block; }
+.spark .line { fill: none; stroke: var(--ok); stroke-width: 1.6; }
+.spark .dot { fill: var(--ok); }
+.decision { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 13px; }
+table.mini th, table.mini td { padding: 5px 8px; font-size: 13px; }
+table.mini td.why { white-space: normal; min-width: 160px; }
+/* 工作流程 view */
+.wf-head { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 12px; }
+.hostb { display: inline-block; padding: 2px 10px; border-radius: 6px; font-size: 13px; font-weight: 700;
+  color: var(--warn); background: var(--warn-bg); }
+.hostb.same { color: var(--off); background: var(--off-bg); font-weight: 400; }
+#wf td.res { white-space: normal; min-width: 220px; max-width: 520px; }
+#wf td.res .err { color: var(--bad); font-weight: 700; display: block; }
+#wf .wid { font-weight: 700; margin-right: 6px; }
+@media (max-width: 760px) {
+  .mk-grid { grid-template-columns: 1fr; }
+  .trow { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .trow .pbar { grid-column: 1 / -1; order: 4; }
+  #wf thead, #chips-days thead { display: none; }
+  #wf, #wf tbody, #wf tr, #wf td, #chips-days, #chips-days tbody, #chips-days tr, #chips-days td { display: block; width: 100%; }
+  #wf tr, #chips-days tr { border-bottom: 1px solid var(--line); padding: 8px 4px; }
+  #wf td, #chips-days td { border: 0; padding: 3px 10px; white-space: normal; text-align: left;
+    display: flex; justify-content: space-between; gap: 12px; }
+  #wf td::before, #chips-days td::before { content: attr(data-label); color: var(--muted); font-size: 13px; flex: none; }
+  #wf td.first::before { content: none; }
+  #wf td.res, #chips-days td.why { display: block; min-width: 0; max-width: none; }
+  #wf td.res::before, #chips-days td.why::before { content: none; }
+  .chips-head .num { font-size: 22px; }
+}
 /* 損益走勢 charts. */
 details.pnl > summary { cursor: pointer; list-style: none; }
 details.pnl > summary::-webkit-details-marker { display: none; }
@@ -206,7 +307,7 @@ details.pnl[open] > summary::before { content: "▾"; }
 <header>
   <h1>機器人監控</h1>
   <span class="seg nav" id="nav">
-    <button data-view="" class="on">機器人</button><button data-view="news">新聞訊號</button>
+    <button data-view="" class="on">機器人</button><button data-view="news">新聞訊號</button><button data-view="workflows">工作流程</button>
   </span>
   <span class="host" id="host"></span>
   <span class="chip s-off" id="market">讀取中…</span>
@@ -241,6 +342,39 @@ details.pnl[open] > summary::before { content: "▾"; }
   </section>
 
   <section id="news-view" hidden>
+    <div class="n-alert" id="n-alert" hidden></div>
+    <div class="panel pulse" id="n-pulse">
+      <div class="pulse-top">
+        <div class="gauge" id="n-gauge"></div>
+        <div class="vstrip" id="n-votes"></div>
+      </div>
+      <div class="pmeta" id="n-meta"></div>
+      <div class="events" id="n-events"></div>
+    </div>
+    <div class="mk-grid">
+      <div class="panel">
+        <div class="section-title">W2 跨市場報價
+          <span class="legend" id="w2-note">漲跌幅對前收。實線＝警報門檻，點線＝投票門檻；灰色＝過舊或抓取失敗，不計入</span></div>
+        <div class="mk-body" id="w2-body"></div>
+      </div>
+      <div class="panel">
+        <div class="section-title">W4 籌碼・外資台指淨未平倉
+          <span class="legend">投票看的是單日變化（ΔOI），不是水位</span></div>
+        <div class="mk-body" id="w4-body"></div>
+      </div>
+    </div>
+    <div class="news-grid">
+      <div class="panel">
+        <div class="section-title">情緒走勢
+          <span class="legend">線＝盤別累計（每輪衰減後加總，只在評分時變動）；柱＝單輪淨值；虛線＝投票門檻</span></div>
+        <div class="chart news" id="n-chart"></div>
+      </div>
+      <div class="panel">
+        <div class="section-title">今晚主要推手
+          <span class="legend">每則 ±0.5 上限，每輪衰減一次（半衰期 2 小時）</span></div>
+        <div class="drivers" id="n-drivers"></div>
+      </div>
+    </div>
     <div class="tiles" id="n-tiles"></div>
     <div class="toolbar">
       <label>盤別 <select id="n-session"><option value="">全部</option></select></label>
@@ -253,7 +387,8 @@ details.pnl[open] > summary::before { content: "▾"; }
         <option value=":-0.7">強烈偏空（≤ −0.7）</option>
       </select></label>
       <label>來源 <select id="n-source"><option value="">全部</option></select></label>
-      <span class="legend">W3 RSS 新聞評分（Gemini）。分數＝方向 × 信心，紅＝偏多、綠＝偏空。盤別＝該則新聞投票的目標夜盤。</span>
+      <label><input type="checkbox" id="n-neutral"> 顯示中性</label>
+      <span class="legend">W3 RSS 新聞評分（Gemini）。分數＝方向 × 信心，紅＝偏多、綠＝偏空。依評分輪次分組；盤別＝該則新聞投票的目標夜盤。</span>
     </div>
     <div class="panel scroll-x">
       <table id="news">
@@ -263,6 +398,23 @@ details.pnl[open] > summary::before { content: "▾"; }
         <tbody></tbody>
       </table>
     </div>
+  </section>
+
+  <section id="wf-view" hidden>
+    <div class="n-alert" id="wf-alert" hidden></div>
+    <div class="wf-head" id="wf-head"></div>
+    <div class="panel scroll-x">
+      <table id="wf">
+        <thead><tr>
+          <th>狀態</th><th>工作流程</th><th>排程</th><th>最後執行</th><th>下次</th>
+          <th class="num" title="近 24 小時的執行次數（失敗次數）">24 小時</th><th>最後結果</th><th>主機</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="toolbar" style="margin-top:10px"><span class="legend">
+      資料來源：橋接目錄的 runs/&lt;W&gt;.jsonl（新版橋接每次執行都會記錄），沒有時改讀各橋接自己的狀態檔。
+      停滯＝錯過排程；W2 只在 08:00–05:00 執行。僅供顯示，不影響投票。</span></div>
   </section>
 
   <section id="detail-view" hidden>
@@ -290,7 +442,8 @@ details.pnl[open] > summary::before { content: "▾"; }
         <span>K 線</span>
         <span class="seg" id="d-iv">
           <button data-iv="60">1分</button><button data-iv="300">5分</button>
-          <button data-iv="900">15分</button><button data-iv="3600">60分</button>
+          <button data-iv="900">15分</button><button data-iv="1800">30分</button>
+          <button data-iv="3600">60分</button>
         </span>
         <span class="legend">▲ 進場　▼ 出場（時間為台北時間）　往左拖曳載入更早的 K 線</span>
         <span class="legend" id="d-band-legend" hidden>底部色帶＝盤勢：<span class="rg up">趨勢向上</span> <span class="rg down">趨勢向下</span> <span class="rg range">盤整</span> <span class="rg trans">轉換中</span></span>
@@ -613,11 +766,79 @@ function newsTitle(n) {
   const head = /^https?:\/\//i.test(n.link || "")
     ? el("a", { href: n.link, target: "_blank", rel: "noopener noreferrer" }, n.title)
     : el("span", { class: "name" }, n.title);
-  return el("div", null, head, n.summary ? el("span", { class: "sub", title: n.summary }, n.summary) : null);
+  return el("div", null, head,
+    n.summary ? el("span", { class: "sub", title: n.summary }, n.summary) : null,
+    n.reason && n.reason !== "(truncated)" ? el("span", { class: "reason" }, "Gemini：" + n.reason) : null);
 }
+const signedText = (v, digits = 2) => `${v > 0 ? "+" : ""}${Number(v || 0).toFixed(digits)}`;
+function signedSpan(v, digits = 2) {
+  return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, signedText(v, digits));
+}
+// Remembered per browser so "新" marks articles scored since the last visit.
+const NEWS_SEEN_KEY = "newsSeenScoredAt";
+function readSeen() { try { return localStorage.getItem(NEWS_SEEN_KEY) || ""; } catch (e) { return ""; } }
+function writeSeen(v) { try { localStorage.setItem(NEWS_SEEN_KEY, v); } catch (e) { /* private mode */ } }
+function readShowNeutral() { try { return localStorage.getItem("newsShowNeutral") === "1"; } catch (e) { return false; } }
+function writeShowNeutral(v) { try { localStorage.setItem("newsShowNeutral", v ? "1" : "0"); } catch (e) { /* ignore */ } }
+const W_LABEL = { W2: "W2 跨市場", W3: "W3 新聞", W4: "W4 籌碼" };
+const SEV_LABEL = { high: "高", medium: "中", low: "低" };
 function tpeShort(iso) { return iso ? iso.slice(5, 16).replace("T", " ") : "—"; }
 function isoAgo(iso) { const t = Date.parse(iso || ""); return Number.isNaN(t) ? null : (Date.now() - t) / 1000; }
 
+const WF_CLS = { ok: "s-ok", stale: "s-warn", bad: "s-bad", off: "s-off", unknown: "s-off", idle: "s-off" };
+function fmtSigned(v) { return v === null || v === undefined ? "—" : (v > 0 ? "+" : "") + fmtInt(Math.round(v)); }
+function signedInt(v) {
+  return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, fmtSigned(v));
+}
+function fmtUntil(iso) {
+  const t = Date.parse(iso || "");
+  if (Number.isNaN(t)) return "—";
+  const m = Math.round((t - Date.now()) / 60000);
+  const when = iso.slice(11, 16);
+  if (m <= 0) return when + "（即將）";
+  return when + (m < 60 ? `（${m} 分後）` : m < 1440 ? `（${Math.floor(m / 60)} 小時後）` : "（明天）");
+}
+// One horizontal bar per symbol: fill from 0 to the move, solid ticks at the
+// alert thresholds, dotted at the vote thresholds.
+function pctBar(r, css) {
+  const ths = [r.down, r.up, r.vote_down, r.vote_up].filter((v) => typeof v === "number").map(Math.abs);
+  const span = Math.max(3, ...ths.map((v) => v * 1.5), Math.abs(r.pct || 0) * 1.1);
+  const pos = (v) => Math.max(0, Math.min(100, 50 + (v / span) * 50));
+  const bar = el("div", { class: "pbar", title: `警報 ${r.down}% / +${r.up}%・投票 ${r.vote_down}% / +${r.vote_up}%` });
+  if (typeof r.pct === "number") {
+    const f = el("div", { class: "fill" });
+    f.style.left = (r.pct >= 0 ? 50 : pos(r.pct)) + "%";
+    f.style.right = (r.pct >= 0 ? 100 - pos(r.pct) : 50) + "%";
+    f.style.background = r.pct >= 0 ? css("--up") : css("--down");
+    bar.append(f);
+  }
+  bar.append(el("div", { class: "zero" }));
+  for (const [v, cls] of [[r.down, "tick"], [r.up, "tick"], [r.vote_down, "tick vote"], [r.vote_up, "tick vote"]]) {
+    if (typeof v !== "number") continue;
+    const t = el("div", { class: cls }); t.style.left = pos(v) + "%"; bar.append(t);
+  }
+  return bar;
+}
+function sparkline(points) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("class", "spark"); svg.setAttribute("viewBox", "0 0 300 56");
+  svg.setAttribute("preserveAspectRatio", "none");
+  const vals = points.map((p) => p.net_oi);
+  if (vals.length < 2) return svg;
+  const lo = Math.min(...vals), hi = Math.max(...vals), rng = hi - lo || 1;
+  const xy = vals.map((v, i) => [i * 300 / (vals.length - 1), 50 - ((v - lo) / rng) * 44]);
+  const line = document.createElementNS(NS, "polyline");
+  line.setAttribute("class", "line"); line.setAttribute("vector-effect", "non-scaling-stroke");
+  line.setAttribute("points", xy.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" "));
+  const dot = document.createElementNS(NS, "circle");
+  const [lx, ly] = xy[xy.length - 1];
+  dot.setAttribute("class", "dot"); dot.setAttribute("cx", lx); dot.setAttribute("cy", ly); dot.setAttribute("r", 3);
+  const title = document.createElementNS(NS, "title");
+  title.textContent = `${points[0].date} ${fmtInt(vals[0])} → ${points[points.length - 1].date} ${fmtInt(vals[vals.length - 1])}（最低 ${fmtInt(lo)}，最高 ${fmtInt(hi)}）`;
+  svg.append(title, line, dot);
+  return svg;
+}
 // 損益走勢: lightweight-charts business-day time ↔ "YYYY-MM-DD".
 function bdayKey(t) {
   if (!t) return null;
@@ -920,14 +1141,19 @@ const App = {
   async refreshNews() {
     if (!this.newsOpen) return;
     try {
-      const n = await this.getJson(this.newsQuery());
+      const [n, p] = await Promise.all([this.getJson(this.newsQuery()),
+        this.getJson("/api/news/pulse").catch(() => null)]);
       if (!this.newsOpen) return;
-      this.news = n; this.lastOk = Date.now();
+      this.news = n; this.pulse = p; this.lastOk = Date.now();
       $("banner").classList.remove("show");
-      this.renderNews();
     } catch (e) {
       $("banner").classList.add("show");
+      return;
     }
+    // Rendered independently: a pulse rendering bug must not take the news
+    // list down with it (or masquerade as the connection-lost banner).
+    try { this.renderPulse(); } catch (e) { console.error("renderPulse", e); }
+    this.renderNews();
   },
 
   // Keep the current choice even when a refresh no longer lists it.
@@ -946,17 +1172,12 @@ const App = {
     this.fillSelect($("n-source"), n.sources.map((s) => [s.name, `${s.name}（${s.count}）`]));
     const sm = n.summary || {};
     const latest = n.latest;
-    const signed = (v, digits) => el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" },
-      `${v > 0 ? "+" : ""}${Number(v || 0).toFixed(digits)}`);
     $("n-tiles").replaceChildren(
       tile("新聞則數", n.matched === n.total ? fmtInt(n.total) : `${fmtInt(n.matched)} / ${fmtInt(n.total)}`),
       tile("偏多 / 偏空 / 中性", el("span", null, el("span", { class: "up" }, fmtInt(sm.bullish || 0)), " / ",
         el("span", { class: "down" }, fmtInt(sm.bearish || 0)), " / ", el("span", { class: "muted" }, fmtInt(sm.neutral || 0)))),
-      tile("分數合計", signed(sm.net, 2)),
-      tile("W3 盤別累計", latest
-        ? el("div", null, signed(latest.session_net, 2),
-            el("div", { class: "sub" }, `${sessionKey(latest.session)}・達 ±1.5 才投票`))
-        : "—"),
+      tile("計票分數合計", el("div", null, signedSpan(sm.net_clipped),
+        el("div", { class: "sub", title: "原始分數加總 " + signedText(sm.net) }, "每則以 ±0.5 計（與投票相同），未含衰減"))),
       tile("最後評分", latest ? el("div", null, ago(isoAgo(latest.scored_at)),
         el("div", { class: "sub" }, tpeShort(latest.scored_at))) : "—"),
     );
@@ -964,14 +1185,324 @@ const App = {
     const empty = (text) => body.replaceChildren(el("tr", null, el("td", { colspan: "5", class: "empty" }, text)));
     if (!n.available) return empty("找不到新聞紀錄的位置：請確認 settings.yaml 的 news 區段，或以 --news-log 指定");
     if (!n.total) return empty("尚無新聞紀錄。W3 評分器更新到新版後，每次評分都會累積在這裡");
-    if (!n.items.length) return empty("沒有符合篩選條件的新聞");
-    body.replaceChildren(...n.items.map((x) => el("tr", null,
-      td("時間", el("span", { title: "評分於 " + tpeShort(x.scored_at) }, tpeShort(x.published_at))),
-      td("來源", el("span", { class: "trunc", title: x.source }, x.source)),
-      td("", newsTitle(x), "news"),
-      td("分數", scorePill(x), "num"),
-      td("盤別", sessionKey(x.session)),
+    const showNeutral = $("n-neutral").checked || $("n-score").value === "0:0";
+    const rows = n.items.filter((x) => showNeutral || x.direction !== "neutral");
+    if (!rows.length) return empty(n.items.length ? "只有中性新聞，勾選「顯示中性」查看" : "沒有符合篩選條件的新聞");
+    // One group per scoring run (all its rows share scored_at / run_net / session_net).
+    rows.sort((a, b) => (b.scored_at.localeCompare(a.scored_at)) || b.published_at.localeCompare(a.published_at));
+    const hidden = {};
+    for (const x of n.items) if (x.direction === "neutral") hidden[x.scored_at] = (hidden[x.scored_at] || 0) + 1;
+    const seen = this.newsSeen;
+    const out = [];
+    let group = null;
+    for (const x of rows) {
+      if (x.scored_at !== group) {
+        group = x.scored_at;
+        const extra = !showNeutral && hidden[group] ? `・另 ${hidden[group]} 則中性` : "";
+        out.push(el("tr", { class: "grp" }, el("td", { colspan: "5" },
+          `${tpeShort(group)} 評分・${sessionKey(x.session)}・本輪 ${signedText(x.run_net)} → 累計 ${signedText(x.session_net)}${extra}`)));
+      }
+      const fresh = seen && x.scored_at > seen;
+      out.push(el("tr", { class: Math.abs(x.score) < 0.3 ? "faded" : "" },
+        td("時間", el("span", { title: "評分於 " + tpeShort(x.scored_at) }, tpeShort(x.published_at))),
+        td("來源", el("span", { class: "trunc", title: x.source }, x.source)),
+        td("", el("div", null, fresh ? el("span", { class: "new-badge" }, "新") : null, newsTitle(x)), "news"),
+        td("分數", scorePill(x), "num"),
+        td("盤別", sessionKey(x.session)),
+      ));
+    }
+    body.replaceChildren(...out);
+    // Only what was on screen counts as seen; "新" = scored since you last looked.
+    if (latest && document.visibilityState === "visible" && latest.scored_at > (readSeen() || "")) {
+      writeSeen(latest.scored_at);
+    }
+  },
+
+  // 市場脈動: W3 gauge vs the vote threshold, tonight's votes, events, chart, drivers.
+  renderPulse() {
+    const p = this.pulse;
+    const alert = $("n-alert");
+    if (!p || !p.available) {
+      alert.hidden = true;
+      $("n-gauge").replaceChildren(el("div", { class: "sub" }, p ? "找不到 news 設定（settings.yaml 的 news 區段）" : "市場脈動無法讀取"));
+      for (const id of ["n-votes", "n-meta", "n-events", "n-drivers"]) $(id).replaceChildren();
+      return;
+    }
+    const w = p.w3 || {};
+    const T = p.threshold;
+    // Failing-but-alive is the case Discord used to announce; it must be loud here.
+    const w3vote = (p.votes || []).find((v) => v.source === "W3") || {};
+    if (w.failing) {
+      alert.hidden = false;
+      alert.textContent = `⚠ W3 新聞評分失敗（連續 ${w.error_streak} 輪）：${w.last_error}` +
+        `。最後成功 ${w.last_success_at ? tpeShort(w.last_success_at) : "—"}；投票已停止更新。`;
+    } else if (w3vote.stale) {
+      alert.hidden = false;
+      alert.textContent = `⚠ W3 新聞評分器已停滯（最後檢查 ${w3vote.last_check || "—"}）：排程可能沒有執行。`;
+    } else {
+      alert.hidden = true;
+    }
+
+    // Gauge: the decision is a threshold crossing, so show the margin to it.
+    const net = w.known ? w.session_net : 0;
+    const peak = w.known ? w.session_peak : 0;
+    const span = Math.max(T * 2, Math.abs(net) * 1.15, Math.abs(peak) * 1.15);
+    const pos = (v) => `${50 + (v / span) * 50}%`;
+    const fill = el("div", { class: "fill" });
+    fill.style.left = net >= 0 ? "50%" : pos(net);
+    fill.style.right = net >= 0 ? `${100 - (50 + (net / span) * 50)}%` : "50%";
+    fill.style.background = net > 0 ? this.css("--up") : this.css("--down");
+    const bar = el("div", { class: "gbar", title: `門檻 ±${T}` }, fill, el("div", { class: "zero" }));
+    bar.lastChild.style.left = "50%";
+    for (const v of [-T, T]) { const t = el("div", { class: "tick" }); t.style.left = pos(v); bar.append(t); }
+    if (peak) { const k = el("div", { class: "peak", title: "本盤峰值 " + signedText(peak) }); k.style.left = pos(peak); bar.append(k); }
+    let state;
+    if (!w.known) state = el("span", { class: "chip s-off" }, "W3 狀態檔不存在");
+    else if (p.weekend_pause) state = el("span", { class: "chip s-off" }, "週末暫停評分");
+    else if (w.direction) state = el("span", { class: "rg " + (w.direction === "trending-up" ? "up" : "down") },
+      w.direction === "trending-up" ? "已達門檻・偏多投票" : "已達門檻・偏空投票");
+    else state = el("span", { class: "muted" }, `中性・距門檻 ${Math.max(0, w.to_threshold).toFixed(2)}`);
+    $("n-gauge").replaceChildren(
+      el("div", { class: "sub" }, `W3 新聞情緒・${sessionKey(p.session)}` + (w.known && !w.current ? "（今晚尚未評分）" : "")),
+      el("div", { class: "num" }, signedSpan(net)),
+      el("div", { class: "state" }, state,
+        w.eroding ? el("span", { class: "pend" }, `回落：峰值 ${signedText(peak)}`) : null),
+      bar,
+      el("div", { class: "gscale" }, el("span", null, (-span).toFixed(1)), el("span", null, `−${T} ｜ 0 ｜ +${T}`),
+        el("span", null, "+" + span.toFixed(1))));
+
+    // Tonight's votes from every bridge, with liveness.
+    const votes = (p.votes || []).map((v) => {
+      const cls = !v.known ? "off" : v.failing ? "bad" : v.stale ? "stale" : "ok";
+      const health = !v.known ? "狀態不明" : v.failing ? "評分失敗" : v.stale ? "停滯" : "運作中";
+      const vote = v.vote ? el("span", { class: "rg " + (v.vote === "trending-up" ? "up" : "down") },
+        VOTE_DIR[v.vote][0]) : el("span", { class: "muted" }, v.vote_expired ? "過期" : "無投票");
+      return el("div", { class: "vchip" },
+        el("span", { class: "dot " + cls, title: health + (v.context ? "\n" + v.context : "") }, W_LABEL[v.source] || v.source),
+        el("span", { class: "sub trunc", title: v.context }, v.last_check ? "檢查 " + v.last_check.slice(5) : health),
+        vote);
+    });
+    $("n-votes").replaceChildren(
+      el("div", { class: "sub" }, p.tonight ? `外部投票（${sessionKey(p.tonight)} 分類使用）` : "外部投票"),
+      ...(votes.length ? votes : [el("div", { class: "sub" }, "找不到投票設定")]));
+
+    const meta = [];
+    if (w.known) {
+      if (w.recent_runs && w.recent_runs.length) {
+        meta.push(el("span", null, `近 ${w.recent_runs.length} 輪動能 `, el("b", null, signedSpan(w.momentum)),
+          w.momentum > 0.5 ? " ↑" : w.momentum < -0.5 ? " ↓" : " →"));
+      }
+      if (peak) meta.push(el("span", null, "本盤峰值 ", el("b", null, signedText(peak))));
+      meta.push(el("span", null, "最後檢查 ", el("b", null, w.last_check ? ago(isoAgo(w.last_check)) : "—")));
+      if (w.last_fetched !== null && w.last_fetched !== undefined) {
+        meta.push(el("span", null, `上輪 抓取 ${w.last_fetched}・新 ${w.last_new ?? "—"}・評分 ${w.last_scored ?? "—"}` +
+          (w.last_skipped ? `・略過 ${w.last_skipped}` : "")));
+      }
+    }
+    $("n-meta").replaceChildren(...meta);
+
+    const ev = p.events || {};
+    const evs = (ev.items || []).map((e) => el("span", { class: "ev" },
+      el("span", { class: "sev " + e.severity }, SEV_LABEL[e.severity] || e.severity),
+      `${e.date.slice(5)} ${(e.sessions || []).map((x) => SLOT[x] || x).join("/")} ${e.name}`));
+    $("n-events").replaceChildren(
+      el("span", { class: "sub" }, "行事曆"),
+      ...(evs.length ? evs : [el("span", { class: "muted" },
+        !ev.configured ? "未設定 news.events_path" : ev.error ? ev.error : "近期無事件")]));
+
+    this.renderStrip(p.w2 || {});
+    this.renderChips(p.w4 || {});
+    this.renderDrivers();
+    this.drawNewsChart();
+  },
+
+  renderStrip(w) {
+    const box = $("w2-body");
+    if (!w.configured) return box.replaceChildren(el("div", { class: "sub" }, "未設定 news.signal_path"));
+    if (!w.known) {
+      return box.replaceChildren(
+        el("div", { class: "sub" }, "W2 尚未寫出報價檔（crossmarket_quotes.json）：橋接主機上的程式更新後才會出現逐檔報價。"),
+        w.last_result ? el("div", { class: "qline" }, el("span", null, "最後一輪 ",
+          el("b", null, w.last_check ? ago(isoAgo(w.last_check)) : "—")), el("span", null, w.last_result)) : null);
+    }
+    const css = (n) => this.css(n);
+    const q = w.quorum || {};
+    const head = el("div", { class: "qline" },
+      el("span", { class: w.stale ? "chip s-warn" : w.idle ? "chip s-off" : "chip s-ok" },
+        w.stale ? "停滯" : w.idle ? "閒置（05:00–08:00）" : "運作中"),
+      el("span", null, "更新 ", el("b", null, w.age_s !== null ? ago(w.age_s) : "—")),
+      el("span", null, `票數（需 ${q.min_symbols} 檔同向）`,
+        el("b", null, el("span", { class: "up" }, `漲 ${(q.up || []).length}`), " / ",
+          el("span", { class: "down" }, `跌 ${(q.down || []).length}`)),
+        q.direction ? el("span", { class: "rg " + (q.direction === "trending-up" ? "up" : "down"), style: "margin-left:6px" },
+          q.direction === "trending-up" ? "達票數・偏多" : "達票數・偏空") : null),
+      el("span", null, "最後觸發 ", el("b", null, w.last_fired
+        ? `${tpeShort(w.last_fired.at)} ${w.last_fired.labels.join("、")}` : "—")),
+      w.fetch_failed ? el("span", { class: "alert" }, `抓取失敗 ${w.fetch_failed} 檔`) : null);
+    const groups = (w.groups || []).map((g) => el("div", { class: "tgrp" },
+      el("h4", null, g.label, el("span", { class: "legend" }, g.hint)),
+      ...(g.rows.length ? g.rows.map((r) => el("div", {
+          class: "trow" + (r.fresh ? "" : " stale"),
+          title: `${r.symbol}・${r.price !== null ? "價 " + r.price.toLocaleString("zh-TW", { maximumFractionDigits: 2 }) + " / 前收 " + r.prev_close.toLocaleString("zh-TW", { maximumFractionDigits: 2 }) : "無報價"}` +
+            (r.age_s !== null ? `・報價 ${ago(r.age_s)}` : "") + (r.stale_reason ? `\n${r.stale_label}：${r.stale_reason}` : "") },
+        el("span", { class: "sym" }, el("b", null, r.name), " ", el("span", { class: "sub" }, r.symbol),
+          r.breach ? el("span", { class: "brk " + r.breach }, r.breach === "up" ? "破上" : "破下") : null),
+        el("span", { class: "pct " + (r.fresh && r.pct > 0 ? "up" : r.fresh && r.pct < 0 ? "down" : "muted") },
+          r.pct === null ? "—" : (r.pct > 0 ? "+" : "") + r.pct.toFixed(2) + "%"),
+        pctBar(r, css),
+        el("span", { class: "th" }, r.fresh ? `±${Math.abs(r.up)}・票 ±${Math.abs(r.vote_up)}` : r.stale_label)))
+        : [el("div", { class: "sub" }, "—")])));
+    box.replaceChildren(head, ...groups);
+  },
+
+  renderChips(c) {
+    const box = $("w4-body");
+    if (!c.configured) return box.replaceChildren(el("div", { class: "sub" }, "未設定 news.regime_vote_path"));
+    if (!c.known) return box.replaceChildren(el("div", { class: "sub" }, "找不到 W4 狀態檔（.chips_state.json）"));
+    const L = c.latest || {};
+    const head = el("div", { class: "chips-head" },
+      el("div", null, el("div", { class: "sub" }, `淨未平倉（${L.date || "—"}）`),
+        el("div", { class: "num" }, L.net_oi !== undefined && L.net_oi !== null ? fmtInt(Math.round(L.net_oi)) : "—")),
+      el("div", null, el("div", { class: "sub" }, "單日變化 ΔOI"),
+        el("div", { class: "num" }, signedInt(L.delta_oi))),
+      el("div", { class: "sub" }, `口數・最後檢查 ${c.last_check ? ago(isoAgo(c.last_check)) : "—"}`));
+    const kids = [head, c.spark && c.spark.length > 1 ? sparkline(c.spark) : null];
+    const d = (c.days || [])[0];
+    if (d) {
+      kids.push(el("div", { class: "decision" },
+        el("span", { class: "sub" }, `W4 決策（${d.date} 資料 → ${sessionKey(d.session)}）`),
+        d.decision ? el("span", { class: "rg " + (d.decision === "trending-up" ? "up" : "down") }, d.decision_label)
+          : el("span", { class: "rg none" }, d.decision_label),
+        d.final ? null : el("span", { class: "pend" }, "待重試"),
+        el("span", null, d.reason_zh)));
+      const rows = c.days.map((x) => el("tr", null,
+        td("日期", x.date),
+        td("淨未平倉", x.net_oi === null ? "—" : fmtInt(Math.round(x.net_oi)), "num"),
+        td("ΔOI", signedInt(x.delta_oi), "num"),
+        td("外資現貨", x.equity_net === null ? "—" : signedText(x.equity_net / 1e8, 1) + " 億", "num"),
+        td("決策", x.decision ? el("span", { class: x.decision === "trending-up" ? "up" : "down" }, x.decision_label)
+          : el("span", { class: "muted" }, x.decision_label)),
+        td("", el("span", { class: "sub" }, x.reason_zh), "why")));
+      kids.push(el("div", { class: "scroll-x" }, el("table", { class: "mini", id: "chips-days" },
+        el("thead", null, el("tr", null, el("th", null, "日期"), el("th", { class: "num" }, "淨未平倉"),
+          el("th", { class: "num" }, "ΔOI"), el("th", { class: "num" }, "外資現貨"), el("th", null, "決策"), el("th", null, "原因"))),
+        el("tbody", null, ...rows))));
+    } else {
+      kids.push(el("div", { class: "sub" }, "逐日決策紀錄要等 W4 更新到新版才會出現。"),
+        c.last_result ? el("div", { class: "qline" }, el("span", null, c.last_result)) : null);
+    }
+    box.replaceChildren(...kids);
+  },
+
+  // ── 工作流程 ──
+  async refreshWorkflows() {
+    if (!this.wfOpen) return;
+    try {
+      const w = await this.getJson("/api/workflows");
+      if (!this.wfOpen) return;
+      this.wf = w; this.lastOk = Date.now();
+      $("banner").classList.remove("show");
+      this.renderWorkflows();
+    } catch (e) {
+      $("banner").classList.add("show");
+    }
+  },
+
+  renderWorkflows() {
+    const w = this.wf;
+    const body = $("wf").tBodies[0];
+    const alert = $("wf-alert");
+    if (!w.available) {
+      alert.hidden = true;
+      $("wf-head").replaceChildren();
+      return body.replaceChildren(el("tr", null, el("td", { colspan: "8", class: "empty" },
+        "找不到 news 設定（settings.yaml 的 news 區段），無法定位橋接目錄")));
+    }
+    const hosts = w.data_hosts || [];
+    $("wf-head").replaceChildren(
+      el("span", { class: "sub" }, "本機 " + (w.host || "—")),
+      hosts.length
+        ? el("span", { class: "hostb" + (w.foreign_host ? "" : " same"),
+            title: "寫入 runs/*.jsonl 的主機" },
+            w.foreign_host ? `資料主機：${hosts.join("、")}（不是本機）` : "資料主機＝本機")
+        : el("span", { class: "hostb same", title: "舊版橋接不記錄主機" }, "資料主機：未記錄"));
+    if (w.all_stale) {
+      alert.hidden = false;
+      alert.textContent = "⚠ 所有橋接資料都已停滯：這台主機的橋接目錄可能已凍結，排程在另一台主機執行。請改看橋接主機上的儀表板。";
+    } else {
+      alert.hidden = true;
+    }
+    body.replaceChildren(...w.rows.map((r) => el("tr", null,
+      td("", el("span", { class: "chip " + (WF_CLS[r.status] || "s-off") }, r.status_label), "first"),
+      td("工作流程", el("div", null, el("span", { class: "wid" }, r.id), r.name,
+        el("div", { class: "sub" }, r.desc))),
+      td("排程", r.schedule),
+      td("最後執行", r.last_run ? el("span", { title: r.last_run }, ago(r.age_s),
+        el("div", { class: "sub" }, tpeShort(r.last_run))) : "—"),
+      td("下次", r.next_due ? fmtUntil(r.next_due) : "—"),
+      td("24 小時", r.source === "runs" ? el("span", null, fmtInt(r.runs_24h),
+        r.fails_24h ? el("span", { class: "alert" }, `（失敗 ${r.fails_24h}）`) : null)
+        : el("span", { class: "muted", title: "舊版橋接不記錄每次執行" }, "—"), "num"),
+      td("", el("div", null, r.error ? el("span", { class: "err" }, r.error) : null,
+        r.result || (r.error || r.note ? "" : "—"),
+        r.note ? el("div", { class: "sub" }, r.note) : null), "res"),
+      td("主機", r.host || el("span", { class: "muted" }, "—")),
     )));
+  },
+
+  renderDrivers() {
+    const d = (this.pulse || {}).drivers || {};
+    const item = (x) => el("div", { class: "drv" },
+      el("span", null, signedSpan(x.contribution)),
+      el("span", null, /^https?:\/\//i.test(x.link || "")
+        ? el("a", { href: x.link, target: "_blank", rel: "noopener noreferrer" }, x.title) : x.title),
+      el("span", { class: "sub why" },
+        el("span", { class: "wbar", title: `剩餘權重 ${Math.round(x.weight * 100)}%` },
+          (() => { const i = el("i"); i.style.width = Math.round(x.weight * 100) + "%"; return i; })()),
+        ` ${x.source}・${tpeShort(x.scored_at)}・原始 ${signedText(x.score)}`),
+      x.reason ? el("span", { class: "reason why" }, x.reason) : null);
+    const up = d.up || [], down = d.down || [];
+    if (!up.length && !down.length) {
+      $("n-drivers").replaceChildren(el("div", { class: "empty" }, "今晚尚無偏多或偏空的新聞"));
+      return;
+    }
+    $("n-drivers").replaceChildren(
+      el("div", { class: "sub" }, `推手合計 ≈ ${signedText(d.total)}（${d.runs} 輪評分）`),
+      up.length ? el("h4", null, "撐多") : null, ...up.map(item),
+      down.length ? el("h4", null, "壓空") : null, ...down.map(item),
+      d.rest_count ? el("div", { class: "sub" }, `其餘 ${d.rest_count} 則合計 ${signedText(d.rest)}`) : null);
+  },
+
+  drawNewsChart() {
+    const runs = ((this.pulse || {}).runs) || [];
+    if (!window.LightweightCharts || !this.newsOpen) return;
+    const box = $("n-chart");
+    if (!this.newsChart) {
+      this.newsChart = LightweightCharts.createChart(box, {
+        layout: { background: { color: this.css("--panel") }, textColor: this.css("--muted"),
+          fontFamily: getComputedStyle(document.body).fontFamily },
+        grid: { vertLines: { visible: false }, horzLines: { color: this.css("--line") } },
+        rightPriceScale: { borderColor: this.css("--line") },
+        timeScale: { borderColor: this.css("--line"), timeVisible: true, secondsVisible: false },
+        localization: { locale: "zh-TW", priceFormatter: (v) => signedText(v) },
+        autoSize: true,
+      });
+      this.newsHist = this.newsChart.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false });
+      this.newsLine = this.newsChart.addLineSeries({ lineType: 1, lineWidth: 2, color: this.css("--ok"),
+        priceLineVisible: false });
+      this.newsLines = [];
+    }
+    const up = this.css("--up"), down = this.css("--down");
+    this.newsHist.setData(runs.map((r) => ({ time: r.t, value: r.run_net,
+      color: this.rgba(r.run_net >= 0 ? up : down, 0.45) })));
+    this.newsLine.setData(runs.map((r) => ({ time: r.t, value: r.session_net })));
+    for (const l of this.newsLines) this.newsLine.removePriceLine(l);
+    const T = this.pulse.threshold;
+    this.newsLines = [
+      this.newsLine.createPriceLine({ price: T, color: up, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏多門檻" }),
+      this.newsLine.createPriceLine({ price: -T, color: down, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏空門檻" }),
+    ];
+    if (!this.newsFitted && runs.length) { this.newsChart.timeScale().fitContent(); this.newsFitted = true; }
   },
 
   // ── detail ──
@@ -981,11 +1512,15 @@ const App = {
     const m = location.hash.match(/^#bot=(.+)$/);
     this.current = m ? decodeURIComponent(m[1]) : null;
     this.newsOpen = location.hash === "#news";
-    for (const b of $("nav").children) b.classList.toggle("on", (b.dataset.view === "news") === this.newsOpen);
-    $("fleet-view").hidden = !!this.current || this.newsOpen;
+    this.wfOpen = location.hash === "#workflows";
+    const view = this.newsOpen ? "news" : this.wfOpen ? "workflows" : "";
+    for (const b of $("nav").children) b.classList.toggle("on", b.dataset.view === view);
+    $("fleet-view").hidden = !!this.current || this.newsOpen || this.wfOpen;
     $("detail-view").hidden = !this.current;
     $("news-view").hidden = !this.newsOpen;
+    $("wf-view").hidden = !this.wfOpen;
     if (this.newsOpen) this.refreshNews();
+    else if (this.wfOpen) this.refreshWorkflows();
     else if (this.current) {
       this.fitNext = true; this.ivInit = true;
       this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
@@ -1092,7 +1627,8 @@ const App = {
       ...realTiles(b.real),
     );
     this.renderRegime(d.regime);
-    if (this.ivInit) { if ([60, 300, 900, 3600].includes(b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
+    // Open on the bot's own timeframe when the selector offers it.
+    if (this.ivInit) { if ([...$("d-iv").children].some((btn) => Number(btn.dataset.iv) === b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
     for (const btn of $("d-iv").children) btn.classList.toggle("on", Number(btn.dataset.iv) === this.iv);
     this.drawEquity();
 
@@ -1334,6 +1870,7 @@ const App = {
   onChartsReady() {
     if (this.detail) { this.drawCharts(); this.drawEquity(); this.drawPnl(); }
     this.drawFleetPnl();
+    if (this.pulse) this.drawNewsChart();
   },
 
   rgba(hex, a) {
@@ -1361,10 +1898,13 @@ const App = {
     const out = [];
     let cur = null;
     for (const b of bars) {
-      // Buckets start at the session open (08:45 day, 15:00 night), like BarAggregator.
+      // Buckets start at the session open, a port of src.market_data.sessions.session_align
+      // (what BarAggregator uses): 08:45 for [08:45, 13:45), 15:00 from 15:00, and the
+      // previous day's 15:00 for every other minute (after midnight and off-hours).
       const mod = ((b.time % 86400) + 86400) % 86400;
-      const nightEarly = mod < 5 * 3600;
-      const anchor = b.time - mod + (mod >= 15 * 3600 ? 15 * 3600 : nightEarly ? -9 * 3600 : 8 * 3600 + 45 * 60);
+      const dayOpen = 8 * 3600 + 45 * 60, dayClose = 13 * 3600 + 45 * 60, nightOpen = 15 * 3600;
+      const anchor = b.time - mod + (mod >= dayOpen && mod < dayClose ? dayOpen
+        : mod >= nightOpen ? nightOpen : nightOpen - 86400);
       const t = anchor + Math.floor((b.time - anchor) / iv) * iv;
       if (!cur || cur.time !== t) {
         if (cur) out.push(cur);
@@ -1407,7 +1947,7 @@ const App = {
 
   // Open on roughly the latest trading day; older ones are a drag away.
   showRecent(bars) {
-    const span = { 60: 300, 300: 200, 900: 96, 3600: 40 }[this.iv] || 100;
+    const span = { 60: 300, 300: 200, 900: 96, 1800: 60, 3600: 40 }[this.iv] || 100;
     const last = bars.length - 1;
     this.chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, last - span), to: last + 3 });
   },
@@ -1450,12 +1990,22 @@ const App = {
       location.hash = btn.dataset.view;
     });
     for (const id of ["n-session", "n-score", "n-source"]) $(id).addEventListener("change", () => this.refreshNews());
+    this.newsSeen = readSeen();
+    // Leaving the tab moves the "新" baseline to what was last shown, so a
+    // page left open overnight marks only the runs since you looked away.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") this.newsSeen = readSeen();
+      else if (this.news && this.newsOpen) this.renderNews();
+    });
+    $("n-neutral").checked = readShowNeutral();
+    $("n-neutral").addEventListener("change", () => { writeShowNeutral($("n-neutral").checked); if (this.news) this.renderNews(); });
     window.addEventListener("hashchange", () => this.route());
     this.refreshFleet().then(() => this.route());
     setInterval(() => this.refreshFleet(), 5000);
     setInterval(() => this.refreshDetail(), 10000);
     setInterval(() => { this.refreshPnl(); this.refreshFleetPnl(); }, 60000);
     setInterval(() => this.refreshNews(), 60000);
+    setInterval(() => this.refreshWorkflows(), 30000);
     setInterval(() => this.renderUpdated(), 1000);
   },
 };

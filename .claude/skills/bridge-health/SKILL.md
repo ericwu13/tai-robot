@@ -1,17 +1,41 @@
 ---
 name: bridge-health
-description: Check the news/vote bridge pipeline — are W2 cross-market, W3 RSS and W4 chips still alive, is a circuit-breaker signal reaching a bot, is the event calendar fresh. Use when a regime vote is missing, a news signal seems ignored, the bridge went quiet, or vote/signal files need auditing.
+description: Check the news/vote bridge pipeline — are W2 cross-market, W3 RSS and W4 chips still alive, is a circuit-breaker signal reaching a bot, is the event calendar fresh. Use when a regime vote is missing, a news signal seems ignored, the bridge went quiet, vote/signal files need auditing, "W1/W2/W3/W4 down", "news bridge", "市場脈動", or the Steven bridge tasks.
 ---
 
 # Bridge Health
+
+> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
+> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
+> run on **Steven**, not this PC. This PC's `data\live` holds only
+> retired/test bots and its n8n is stopped. Read live state from the
+> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
+> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
+> describes this PC only — never publish it as fleet health. Host map →
+> `start-here`. Run checkers from an up-to-date checkout
+> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
+> weeks behind.
 
 ```bash
 C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bridge.py [--settings PATH]
 ```
 
-Read-only over the paths in `settings.yaml` (`news.signal_path`,
-`news.regime_vote_path`, `news.events_path`, `news.rss_state_file`) —
-normally `C:\Users\eric8\n8n-bridge\`. Never consumes or deletes a vote.
+Read-only over the paths in the bridge host's `settings.yaml`
+(`news.signal_path`, `news.regime_vote_path`, `news.events_path`,
+`news.rss_state_file`). Never consumes or deletes a vote.
+
+**Since 2026-10-24 the bridges are Steven scheduled tasks**
+`\TaiRobot\Bridge-W1..W4` writing `C:\Users\Traderbot\n8n-bridge\` (W1/W2/W4
+from `tai-robot-src`, W3 from `tai-robot-dashboard`, all with the src venv
+and `tai-robot-src\settings.yaml`). Quick remote view: dashboard
+`/api/workflows` (per-W status, last run, next due) and `/api/news/pulse`.
+Full check on Steven: `<venv python> -s scripts\monitor\check_bridge.py
+--settings C:\Users\Traderbot\tai-robot-src\settings.yaml`. Per-task
+evidence: `task_<W>.last.log`, `runs\W*.jsonl`, `Get-ScheduledTaskInfo
+-TaskPath '\TaiRobot\'`. A local run reports every source stale (local files
+stop 2026-10-23). The unconsumed-signal P1 only means something on the host
+whose `data\live` holds the `--news` bot.
 
 ## Rule zero — absence is not failure
 
@@ -54,19 +78,21 @@ Signal reject reasons split cleanly:
   `--once` path, which doesn't log. Judging W3 by that file always looks
   dead — use `rss_scorer_state.json` (`last_check`, `session_net`).
 - **W4's real health signal is the trailing "no TAIFEX data" streak** in
-  `chips_monitor.log`, not the presence of a vote. TAIFEX's OpenAPI lags
-  the 16:15 publish by hours, which is why retry slots
-  (18:15/20:15/22:15/04:15) exist — if a week of log lines shows only
-  16:15, the deployed workflow predates those retries.
+  `chips_monitor.log`, not the presence of a vote. TAIFEX publishes the prior
+  day late morning TPE, so Steven's 16:15 slot is the one that advances
+  `.chips_state.json` `history`; 04:15 is usually a no-op. (The checker's
+  P2 text still names the old 18:15/20:15/22:15 retry ladder.)
 - A naive `issued_at` is rejected on purpose: n8n runs on its own host,
   and guessing the offset would turn an 8-hour-old signal into a fresh one.
 - An empty `news.regime_vote_path` in settings means votes are written but
   never consumed — see `deploy-check`.
-- Don't restart the n8n service casually while a night session is open
-  (15:00–05:00 TPE): it interrupts W2's 2-minute night-tier polling.
+- Don't trigger or restart Steven's W2 task casually during a night
+  session (15:00–05:00 TPE). Never restart the retired local n8n — W1–W4
+  would double-run.
 
 ## Next steps
 
-- a workflow actually failed / a cron never fired → the `n8n-debug` skill
-  (`status`, `execs --workflow W3 --errors`, `detail <id>`)
+- a bridge task failed / never fired → Steven Task Scheduler history +
+  `task_<W>.last.log` (via `tailscale-ssh`); `n8n-debug` only for
+  pre-2026-10-24 history
 - votes arriving but the regime not moving → `regime-health`

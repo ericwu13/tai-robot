@@ -183,7 +183,8 @@ def _bridge_one_liners(now, settings):
             resolve_news_path(setting(settings, "news.rss_state_file"), _REPO),
             sess.key if sess else "", now)
         for st in report.sources:
-            flag = "STALE" if st.stale else ("?" if not st.known else "ok")
+            flag = ("STALE" if st.stale else "FAILING" if st.failing
+                    else "?" if not st.known else "ok")
             out.append(f"• {st.source} [{flag}] {vote_chip(st)}")
     except Exception as exc:  # noqa: BLE001
         out.append(f"• bridge status unavailable ({type(exc).__name__})")

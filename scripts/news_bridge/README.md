@@ -9,7 +9,7 @@ instance) but runs fine from a plain shell too.  Full framework design:
 |---|--------|---------|--------|
 | W1 | `calendar_bridge.py` | daily | economic-calendar risk windows |
 | W2 | `crossmarket_monitor.py` | every 2 min (08:00–05:00 TPE) | `signal.json` circuit breaker + `regime_vote_w2.json` |
-| W3 | `rss_scorer.py` | every 30 min | `regime_vote_w3.json` (RSS + Gemini sentiment); every scored article appended to `news/news_log.jsonl` beside the state file (`--news-log` / `news.rss_news_log` override) — shown in the dashboard's 新聞訊號 view |
+| W3 | `rss_scorer.py` | every 30 min | `regime_vote_w3.json` (RSS + Gemini sentiment); every scored article appended to `news/news_log.jsonl` beside the state file (`--news-log` / `news.rss_news_log` override) — shown in the dashboard's 新聞訊號 view. Discord: `news.rss_discord` (default `errors`: only when Gemini scoring starts failing / recovers; `all` = legacy per-run embed). Failures persist as `error_streak`/`last_error` in the state file, which the dashboard, GUI regime tab and `check_bridge` read |
 | W4 | `chips_monitor.py` | daily 16:15 TPE | `regime_vote_w4.json` (institutional money flow) |
 | W5 | `n8n/W5_manual_tap.json` (webhook, no script) | on tap | `signal.json` via `crossmarket_monitor.py --force-fire` |
 
@@ -147,3 +147,17 @@ probe nodes (TAIFEX + TWSE, continue-on-fail — they exist so raw API
 responses are visible in the execution log) → Execute Command running
 `chips_monitor.py`.  The script does its own fetching and error
 handling, so probe failures never block the run.
+
+## Dashboard files (display-only)
+
+Written for the web dashboard (`scripts/dashboard/`); nothing reads them
+back into a vote or signal, and a failed write never fails a pass.
+
+| File (in the bridge dir) | Writer | Dashboard |
+|---|---|---|
+| `crossmarket_quotes.json` | W2, every pass | 新聞訊號 → W2 跨市場報價 strip |
+| `.chips_state.json` → `daily` | W4, decision passes | 新聞訊號 → W4 籌碼 panel |
+| `runs/W1.jsonl` … `runs/W5.jsonl` | every bridge entry point (`src/news/bridge_runs.py`; W5 = `crossmarket_monitor --force-fire`) | 工作流程 view (status, last run, host) |
+
+Bridges on an older checkout write none of these; the dashboard then
+falls back to each bridge's own `last_check` / `last_result` stamps.

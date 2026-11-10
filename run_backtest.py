@@ -110,6 +110,7 @@ from src.ai.code_sandbox import (
 )
 from src.ai.strategy_store import StrategyStore
 from src.ai.pine_exporter import export_to_pine
+from src.ai import review_payload
 
 # Code generation max output tokens.  Strategies are typically <300 lines,
 # so 16K output tokens is plenty.  Lower cap keeps the per-call price low
@@ -806,6 +807,18 @@ def _persist_evolution_history(bot_dir, **fields) -> None:
     except Exception as exc:
         try:
             _log("evolution history append failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+    # One history line per attempt = the attempt reached an end. Close the
+    # persisted Saturday slot unless that end is a retryable infrastructure
+    # failure (pipeline_error, grid_failed, no_chat_client).
+    try:
+        from src.evolution.notify import finish_weekly_slot_for
+        finish_weekly_slot_for(bot_dir, str(fields.get("reason_kind") or ""))
+    except Exception as exc:
+        try:
+            _log("evolution weekly slot close failed: "
                  f"[{type(exc).__name__}] {exc}")
         except Exception:
             pass
@@ -2565,7 +2578,7 @@ class BacktestApp:
         self._evo_fetch_cb = None  # Callable[[bool], None] | None
         # (ISO year, week) of the last weekly auto-evolution run — the 30s
         # poll fires the post-close pipeline exactly once per week.
-        self._weekly_evo_done: tuple | None = None
+        self._weekly_evo_done: str | None = None  # TPE ISO week key
 
         # Live trading state
         self._live_chart: LiveChart | None = None
@@ -5394,7 +5407,7 @@ class BacktestApp:
         for i, st in enumerate(report.sources, start=1):
             if not st.known:
                 dot_state = "off"
-            elif st.stale:
+            elif st.stale or st.failing:
                 dot_state = "err"
             else:
                 dot_state = "ok"
@@ -5787,38 +5800,8 @@ class BacktestApp:
     _REVIEW_CHUNK_BATCH_SIZE = 1500
 
     def _build_review_timeframe_line(self, strategy_cls) -> str:
-        """Return the Strategy Timeframe + Timezone note for AI Review prompts.
-
-        Explicit here so the AI does not mis-infer the bar interval from
-        session-aligned :45 timestamps (e.g. 09:45/10:45/13:45 for 60-min
-        AM bars can look like 15-min bars to a naive reader).
-        """
-        timeframe_line = ""
-        if strategy_cls is not None:
-            kt = getattr(strategy_cls, "kline_type", 0)
-            km = getattr(strategy_cls, "kline_minute", 0)
-            if kt == 0 and km:
-                if km % 60 == 0:
-                    label = f"{km // 60}-hour ({km}-minute)"
-                else:
-                    label = f"{km}-minute"
-                timeframe_line = (
-                    f"策略時框 Strategy Timeframe: {label} bars "
-                    f"(kline_type={kt}, kline_minute={km})\n"
-                )
-            elif kt == 4:
-                timeframe_line = f"策略時框 Strategy Timeframe: Daily bars (kline_type={kt})\n"
-            elif kt == 5:
-                timeframe_line = f"策略時框 Strategy Timeframe: Weekly bars (kline_type={kt})\n"
-            elif kt == 6:
-                timeframe_line = f"策略時框 Strategy Timeframe: Monthly bars (kline_type={kt})\n"
-        timeframe_line += (
-            "時區 Timezone: 所有 entry/exit 時間皆為台灣時間 (TWT/UTC+8)。\n"
-            "All entry/exit timestamps are Taiwan time (TWT/UTC+8). "
-            "Bars are TAIFEX session-aligned, so 60-minute AM bars may carry "
-            ":45 timestamps (08:45–13:45 session) — these are NOT 15-minute bars.\n"
-        )
-        return timeframe_line
+        """Strategy Timeframe + Timezone note (see ``review_payload``)."""
+        return review_payload.review_timeframe_line(strategy_cls)
 
     def _resolve_strategy_source(self, strategy_name: str, strategy_cls) -> str:
         """Resolve the strategy source code for the AI Review context."""
@@ -5865,64 +5848,14 @@ class BacktestApp:
         # Detect degradation vs previous review round
         cur_pf = result.metrics.profit_factor
         cur_dd = result.metrics.max_drawdown_pct
-        degradation_section = ""
-        if self._last_review_metrics is not None:
-            prev_pf = self._last_review_metrics["pf"]
-            prev_dd = self._last_review_metrics["dd_pct"]
-            pf_worse = cur_pf < prev_pf
-            dd_worse = cur_dd > prev_dd
-            if pf_worse or dd_worse:
-                degradation_section = (
-                    f"## ⚠ DEGRADATION DETECTED — REVERT FIRST ⚠\n"
-                    f"Previous review metrics: PF={prev_pf:.2f}, DD={prev_dd:.2f}%\n"
-                    f"Current metrics:         PF={cur_pf:.2f}, DD={cur_dd:.2f}%\n"
-                    f"{'  → Profit Factor DROPPED' if pf_worse else ''}"
-                    f"{'  → Max Drawdown INCREASED' if dd_worse else ''}\n\n"
-                    f"**MANDATORY**: The last change made things worse. Your ONLY "
-                    f"recommendation must be to REVERT the last change and return to "
-                    f"the previous version. Do NOT suggest new changes on top of a "
-                    f"degraded strategy. Do NOT try to fix the degradation by adding "
-                    f"more complexity. Say: \"上一次的修改使績效惡化，建議還原到修改前的版本。"
-                    f"The last change degraded performance — revert to the prior version "
-                    f"before attempting any new changes.\"\n"
-                    f"The ONLY exception is if you identify an obvious code BUG (e.g. "
-                    f"wrong operator, missing round()) that clearly caused the "
-                    f"degradation — in that case, suggest fixing that specific bug only.\n\n"
-                )
+        degradation_section = review_payload.degradation_section(
+            self._last_review_metrics, cur_pf, cur_dd)
 
         # Save current metrics for next review round comparison
         self._last_review_metrics = {"pf": cur_pf, "dd_pct": cur_dd}
 
-        preamble = (
-            f"以下是回測/實盤結果，請根據策略原始碼分析交易表現。\n"
-            f"Below are the backtest/live results. Analyze the trading performance.\n\n"
-            f"{degradation_section}"
-            f"## Analysis rules (MUST FOLLOW)\n"
-            f"1. **Identify what is WORKING first** — list 2-3 aspects that should NOT be changed.\n"
-            f"2. **Suggest at most ONE change** — never multiple simultaneous changes. "
-            f"Each change must be tested in isolation before adding the next.\n"
-            f"3. **Distinguish bugs from tuning** — a code bug (wrong comparison, missing round()) "
-            f"is a fix. Changing parameters or adding filters is tuning. Fix bugs first; "
-            f"tune ONE parameter at a time only.\n"
-            f"4. **MANDATORY: winner/loser impact count** — before suggesting ANY filter, "
-            f"condition, or parameter change, you MUST scan the trade list and estimate:\n"
-            f"   - How many LOSING trades would the change remove/avoid?\n"
-            f"   - How many WINNING trades would the change also remove/avoid?\n"
-            f"   - Present this as: \"Estimated impact: removes ~N losers, ~M winners\"\n"
-            f"   - If you cannot estimate (e.g. insufficient data), say so explicitly "
-            f"and do NOT recommend the change. A suggestion without impact analysis is "
-            f"not allowed.\n"
-            f"5. **Bias toward simplicity** — adding indicators, conditions, or parameters "
-            f"rarely improves robustness. If the strategy has >4 entry conditions, "
-            f"suggest REMOVING one before adding another.\n"
-            f"6. **No fabricated statistics** — do not invent expected win rates or "
-            f"improvements. Say \"建議回測驗證 / backtest to verify\" instead.\n"
-            f"7. **If metrics are acceptable** (PF > 1.3, DD < 25%, WR > 40%), "
-            f"say so and suggest NOT changing the strategy. Over-optimization is the "
-            f"#1 cause of strategy degradation.\n\n"
-            f"{report}\n\n"
-            f"{timeframe_line}\n"
-        )
+        preamble = review_payload.review_preamble(
+            report, timeframe_line, degradation_section)
 
         self._dispatch_trade_analysis(
             preamble, trade_lines, source_section, len(result.trades),
@@ -5947,27 +5880,9 @@ class BacktestApp:
         timeframe_line = self._build_review_timeframe_line(strategy_cls)
         strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
 
-        source_section = ""
-        if strategy_source:
-            source_section = (
-                f"\n\n策略原始碼 Strategy Source Code:\n"
-                f"```python\n{strategy_source}\n```"
-            )
-
-        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
-        # handle thousands of rows; chunked mode handles the rest.
-        trade_lines = []
-        for i, t in enumerate(result.trades, 1):
-            bars_held = t.exit_bar_index - t.entry_bar_index
-            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
-            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
-            src_mark = " [real]" if getattr(t, "source", "") == "real" else ""
-            trade_lines.append(
-                f"  {i}. {t.side.value} {t.tag}: "
-                f"entry={entry_dt} @{t.entry_price:,} → "
-                f"exit={exit_dt} @{t.exit_price:,} "
-                f"P&L={t.pnl:+,} ({bars_held} bars){src_mark}"
-            )
+        source_section = review_payload.source_section(strategy_source)
+        # ALL trade lines — no arbitrary cap; chunked mode handles size.
+        trade_lines = review_payload.trade_lines(result.trades)
         return result, report, timeframe_line, source_section, trade_lines
 
     def _dispatch_trade_analysis(self, preamble: str, trade_lines: list[str],
@@ -6006,12 +5921,8 @@ class BacktestApp:
                                      label: str = "AI Review: 請分析以下交易紀錄",
                                      call_site: str = "trade_review") -> None:
         """Send the full AI Review in a single API call."""
-        context = (
-            preamble
-            + f"交易明細 Trade Details ({total_trades} trades):\n"
-            + "\n".join(trade_lines)
-            + source_section
-        )
+        context = review_payload.single_shot_context(
+            preamble, trade_lines, source_section, total_trades)
 
         self._append_chat("user", label + "\n" + context)
         self.btn_send.config(state=tk.DISABLED)
@@ -6319,6 +6230,7 @@ class BacktestApp:
                         final_status=final_status,
                         reason_kind=reason_kind,
                         reason=reason,
+                        verdict_text=reason,
                         ai_calls=0,
                     )
                     fields.update(extra)
@@ -7010,17 +6922,12 @@ class BacktestApp:
                     eligible_for_validated_pool,
                     month_gate_config_from_mapping)
                 from src.evolution.paper_gate import (
-                    WeekRecord,
                     abs_pf_required,
                     assemble_promotion_verdict,
-                    assess_retirement,
-                    emit_retire_recommendation,
                     evolution_gate_config_from_mapping,
                     evolution_promotion_mode,
                     gate_provenance,
-                    relative_eval_summary,
                     resolve_promotion_gate,
-                    weeks_from_changelog,
                 )
                 bars = evo_data["bars"]
                 data_origin = evo_data["origin"]
@@ -7039,6 +6946,10 @@ class BacktestApp:
                 plan = ""
                 directives = None
                 history_written = False
+                # Candidate code and class, set once Phase 2 builds them.
+                # _remember stores the code (FAILs too) for forward re-scoring.
+                code = ""
+                candidate_cls = None
 
                 def _remember(final_status, reason_kind, reason="", **extra):
                     # One record per attempt. Building the gate blocks and
@@ -7075,6 +6986,13 @@ class BacktestApp:
                             pass
                     history_written = True
                     try:
+                        # The full operator-visible text (Discord cuts it).
+                        extra.setdefault("verdict_text", reason)
+                        if code and "candidate_source" not in extra:
+                            extra["candidate_source"] = code
+                        if candidate_cls is not None:
+                            extra.setdefault(
+                                "candidate_name", candidate_cls.__name__)
                         _persist_evolution_history(
                             bot_dir,
                             bot=display_name,
@@ -7114,6 +7032,61 @@ class BacktestApp:
                         _log("EVO structural proposal record failed: "
                              f"[{type(e).__name__}] {e}")
                         return ""
+
+                def _resolve_evo_gate():
+                    # Decision time, not a start-of-run snapshot. Running
+                    # runner: its trading_mode. Idle or missing: configured
+                    # mode only — unknown stays unknown (absolute gate).
+                    cfg = evolution_gate_config_from_mapping(evolution_gate_raw)
+                    runner = getattr(self, "_live_runner", None)
+                    runner_idle = (
+                        runner is None
+                        or getattr(runner, "state", None) == LiveState.IDLE)
+                    promotion_mode = evolution_promotion_mode(
+                        runner=runner,
+                        runner_idle=runner_idle,
+                        configured_mode=getattr(self, "_trading_mode", None),
+                    )
+                    gate = resolve_promotion_gate(
+                        promotion_mode,
+                        cfg.paper_gate,
+                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
+                    )
+                    return cfg, gate
+
+                def _incumbent_trades() -> list:
+                    # The incumbent's own trades on the validation bars
+                    # (one continuous run, as the multi-fold baseline).
+                    try:
+                        side = run_ab_backtest(
+                            baseline_cls, bars, point_value, "基準 baseline",
+                            capital_base=capital_base)
+                        res = getattr(side, "result", None)
+                        return list(res.trades) if res is not None else []
+                    except Exception as e:
+                        _log("EVO retire baseline backtest failed: "
+                             f"[{type(e).__name__}] {e}")
+                        return []
+
+                def _retire_review(gate_mode, verdict_passed, gate_cfg, trades):
+                    from src.evolution.retire_review import run_retire_review
+                    return run_retire_review(
+                        base_trades=trades,
+                        strategy_name=display_name,
+                        version=(baseline_cls.__name__ if baseline_cls
+                                 else "Strategy"),
+                        gate_mode=gate_mode,
+                        verdict_passed=verdict_passed,
+                        retire_config=gate_cfg.retire,
+                        structural_ledger=(structural_ledger or str(
+                            BacktestApp._structural_ledger_path(self))),
+                        # Unchanged rule: the lane's own run, or a ledger
+                        # file this run was pointed at that exists.
+                        run_followup=bool(structural_lane or (
+                            structural_ledger
+                            and os.path.exists(structural_ledger))),
+                        log=_log,
+                    )
 
                 try:
                     # ── Phase 1: grid search, or the evolution plan ──
@@ -7217,10 +7190,31 @@ class BacktestApp:
                                 "Nothing was consumed: the watermark did NOT "
                                 "advance.\n"
                                 + "\n".join(grid_outcome.reasons))
+                            # The grid scored its settings and none beat the
+                            # incumbent: under the relative gate that is a
+                            # failed Saturday for the #188 "not improvable"
+                            # streak, so the retire check runs here too (it
+                            # used to be skipped by this early return). A grid
+                            # that never got to score (no bars, too few folds,
+                            # baseline backtest failed, knobs unreadable) is a
+                            # data problem and records no week.
+                            _np_extra: dict = {}
+                            if grid_outcome.evaluated:
+                                _np_cfg, _np_gate = _resolve_evo_gate()
+                                _np_review = _retire_review(
+                                    _np_gate.mode, False, _np_cfg,
+                                    _incumbent_trades())
+                                if _np_review.report_lines:
+                                    msg += "\n" + "\n".join(
+                                        _np_review.report_lines)
+                                _np_extra = dict(
+                                    retire_evaluated=(_np_gate.mode == "relative"),
+                                    retire_passed=False,
+                                    ts=_np_review.evaluated_at)
                             ui(self._append_chat, "system", msg)
                             if auto_run:
                                 _notify_discord(msg)
-                            _remember("fail", "grid_no_pick", msg)
+                            _remember("fail", "grid_no_pick", msg, **_np_extra)
                             return
                         plan = grid_outcome.rationale
                         directives = {
@@ -7570,31 +7564,13 @@ class BacktestApp:
                         f"({len(bars)} × {feed_iv // 60}min bars "
                         f"≈ {native_est} native bars)")
 
-                    evo_gate_cfg = evolution_gate_config_from_mapping(
-                        evolution_gate_raw)
+                    evo_gate_cfg, evo_gate = _resolve_evo_gate()
                     for warning in evo_gate_cfg.warnings:
                         _log(f"EVO gate config: {warning}")
                     month_gate_cfg = month_gate_config_from_mapping(
                         evolution_gate_raw)
                     for warning in month_gate_cfg.warnings:
                         _log(f"EVO month gate config: {warning}")
-                    # Decision time, not a start-of-run snapshot. Running
-                    # runner: its trading_mode. Idle or missing: configured
-                    # mode only — unknown stays unknown (absolute gate).
-                    runner = getattr(self, "_live_runner", None)
-                    runner_idle = (
-                        runner is None
-                        or getattr(runner, "state", None) == LiveState.IDLE)
-                    promotion_mode = evolution_promotion_mode(
-                        runner=runner,
-                        runner_idle=runner_idle,
-                        configured_mode=getattr(self, "_trading_mode", None),
-                    )
-                    evo_gate = resolve_promotion_gate(
-                        promotion_mode,
-                        evo_gate_cfg.paper_gate,
-                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
-                    )
                     from src.evolution.paper_gate import gate_for_trial
                     # Walk-forward uses the fallback (absolute when this run
                     # has no grid trial). assemble_promotion_verdict applies
@@ -7964,87 +7940,13 @@ class BacktestApp:
                                   "and STRATEGIES was not updated.")
                     # Recommend-only. A failure here must not change the verdict
                     # or the pool promotion above, and must not touch live state.
-                    evaluated_at = None
-                    try:
-                        append_changelog = None
-                        prior_weeks = []
-                        try:
-                            from src.daily_report.changelog import (
-                                append_changelog as _append_changelog,
-                                load_changelog,
-                            )
-                            append_changelog = _append_changelog
-                            prior_weeks = weeks_from_changelog(
-                                load_changelog(), display_name)
-                        except Exception as hist_err:
-                            _log("EVO retire history unread: "
-                                 f"[{type(hist_err).__name__}] {hist_err}")
-                        evaluated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                        weeks = list(prior_weeks)
-                        if evo_gate.mode == "relative":
-                            weeks.append(WeekRecord(
-                                at=evaluated_at, evaluated=True,
-                                passed=bool(verdict.passed)))
-                            if append_changelog is not None:
-                                try:
-                                    append_changelog(
-                                        strategy_name=display_name,
-                                        version_before=base_cls_name,
-                                        version_after=base_cls_name,
-                                        change_summary=relative_eval_summary(
-                                            bool(verdict.passed), evaluated_at),
-                                        initiated_by="ai",
-                                    )
-                                except Exception as rec_err:
-                                    _log("EVO relative-gate record failed: "
-                                         f"[{type(rec_err).__name__}] {rec_err}")
-                        _grad_stamps: list[str] = []
-                        try:
-                            from src.evolution.structural_lane import (
-                                applied_graduation_stamps, load_ledger)
-                            _grad_stamps = applied_graduation_stamps(
-                                load_ledger(structural_ledger or str(
-                                    BacktestApp._structural_ledger_path(self))))
-                        except Exception as stamp_err:
-                            _log("EVO graduation stamps unread: "
-                                 f"[{type(stamp_err).__name__}] {stamp_err}")
-                            _grad_stamps = []
-                        rec = assess_retirement(
-                            base_trades,
-                            weeks=weeks,
-                            structural_graduations=_grad_stamps,
-                            now=datetime.now(),
-                            config=evo_gate_cfg.retire,
-                        )
-                        report_lines: list[str] = []
-                        emit_retire_recommendation(
-                            rec,
-                            log=_log,
-                            changelog=(append_changelog if rec.recommend else None),
-                            report=report_lines,
-                            strategy_name=display_name,
-                            version=base_cls_name,
-                        )
-                        if structural_lane or (
-                                structural_ledger and os.path.exists(
-                                    structural_ledger)):
-                            from src.evolution.structural_lane import (
-                                structural_saturday_followup)
-                            structural_saturday_followup(
-                                structural_ledger or str(
-                                    BacktestApp._structural_ledger_path(self)),
-                                observations=(),
-                                log=_log,
-                                changelog=append_changelog,
-                                report=report_lines,
-                                strategy_name=display_name,
-                                version=base_cls_name,
-                            )
-                        if report_lines:
-                            block += "\n" + "\n".join(report_lines)
-                    except Exception as retire_err:
-                        _log("EVO retire recommendation failed: "
-                             f"[{type(retire_err).__name__}] {retire_err}")
+                    # Shared with the grid no-pick exit (src/evolution/retire_review.py).
+                    _review = _retire_review(
+                        evo_gate.mode, bool(verdict.passed), evo_gate_cfg,
+                        base_trades)
+                    evaluated_at = _review.evaluated_at
+                    if _review.report_lines:
+                        block += "\n" + "\n".join(_review.report_lines)
                     ui(self._remove_last_system_line)
                     ui(self._append_chat, "system", block)
                     if _proposal_notice:
@@ -8099,6 +8001,7 @@ class BacktestApp:
                         candidate_source=code or "",
                         candidate_name=candidate_cls.__name__,
                         baseline_name=base_cls_name,
+                        verdict_text=block,
                     )
                     _evolution_history_sealed()
                 except Exception as e:
@@ -9927,7 +9830,12 @@ class BacktestApp:
         force-close and final daily report are done, the market is
         quiet, and the week's data is complete. Latched per ISO week so
         the 30s poll fires it exactly once; a bot deployed later on
-        Saturday still gets its run on the first post-deploy poll.
+        Saturday still gets its run on the first post-deploy poll. The
+        latch is also a file in the bot directory (``started`` → ``done``
+        when the attempt's history line is written), so restarting the bot
+        after a finished run does not run the pipeline a second time,
+        while a run that died (or ended on a retryable infrastructure
+        error) is retried once ``SLOT_STARTED_GUARD_S`` has passed.
         """
         if not self._settings.get("evolution_auto_pipeline", True):
             return
@@ -9935,15 +9843,28 @@ class BacktestApp:
             return
         if hasattr(self._live_runner, 'on_status_poll'):
             return
-        from src.evolution.notify import is_post_close_evolution_window
-        if not is_post_close_evolution_window():
+        from src.evolution import notify as _evo_notify
+        if not _evo_notify.is_post_close_evolution_window():
             return
         if is_market_open():
             return  # safety: never compete with a live session
-        week_key = _taipei_now().isocalendar()[:2]
+        now = _taipei_now()
+        week_key = _evo_notify.weekly_slot_key(now)
         if self._weekly_evo_done == week_key:
             return
+        bot_dir = getattr(self._live_runner, "bot_dir", None)
+        if _evo_notify.weekly_slot_taken(bot_dir, week_key, now=now):
+            # Not latched in memory: a "started" slot inside its guard
+            # window is retried by a later poll once the window passes.
+            if getattr(self, "_weekly_evo_skip_logged", None) != week_key:
+                self._weekly_evo_skip_logged = week_key
+                self._live_log_msg(
+                    f"🧬 本週自動演化已執行或正在執行（{week_key}），重啟後不重跑。"
+                    f"Weekly auto-evolution for {week_key} already finished "
+                    "or may still be running; not starting another.", "status")
+            return
         self._weekly_evo_done = week_key
+        _evo_notify.mark_weekly_slot(bot_dir, week_key, now=now)
         self._live_log_msg(
             "🧬 週末自動演化 Weekly auto-evolution (post-close) starting...",
             "status")
@@ -11236,6 +11157,18 @@ class BacktestApp:
                         new_close=report_nc, send_time=_taipei_now())
                     if action_type == "exit":
                         self._last_exit_order_seq = str(message).strip()
+                    # Persist the seq on the trade itself, so the record
+                    # proves a real order went out even when its fill
+                    # confirmation is later lost (source stays "paper"
+                    # then). Best-effort: must never break the order path.
+                    try:
+                        stamped = broker.note_real_order_sent(
+                            action_type, str(message), bar_idx)
+                        if not stamped:
+                            _log(f"REAL ORDER SEQ not stamped: {action_type} "
+                                 f"seq={str(message).strip()} bar={bar_idx}")
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"REAL ORDER SEQ stamp failed: {exc}")
                 self._position_log(
                     "register_order", str(message), action_type, buy_sell, 1,
                     order_symbol)

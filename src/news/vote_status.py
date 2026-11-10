@@ -9,7 +9,9 @@ bridges and the classifier use, WITHOUT consuming anything:
 - W2 liveness: ``monitor_state.json`` next to ``news.signal_path``
   (``last_check`` + ``last_result``, stamped every pass)
 - W3 liveness: the rss scorer state file (``news.rss_state_file``);
-  ``last_check`` + ``session_net``
+  ``last_check`` + ``session_net``, and ``error_streak``/``last_error``:
+  the scorer stamps ``last_check`` even when every Gemini call failed, so
+  a fresh ``last_check`` alone does NOT mean W3 is scoring
 - W4 liveness: ``.chips_state.json`` next to the vote base path
   (``last_check`` + ``last_result``; pre-upgrade files fall back to the
   newest OI history date)
@@ -60,6 +62,9 @@ class SourceStatus:
     stale: bool = False         # last_check older than the source threshold
     known: bool = True          # False when no liveness file was found
     context: str = ""           # one-line summary from the bridge state
+    failing: bool = False       # alive but its last scoring attempt failed (W3)
+    error: str = ""             # that failure, e.g. "HTTP 404: model not found"
+    error_streak: int = 0       # consecutive failed scoring runs
 
 
 @dataclass
@@ -167,6 +172,16 @@ def _w3_status(rss_state_file: str, now: datetime, read_json=_read_json) -> Sour
             peak = state.get("session_peak")
             if isinstance(peak, (int, float)) and peak != net:
                 st.context += f" (peak {peak:+.2f})"
+    streak = state.get("error_streak") if state else 0
+    if isinstance(streak, int) and not isinstance(streak, bool) and streak > 0:
+        st.failing = True
+        st.error_streak = streak
+        st.error = str(state.get("last_error") or "unknown error")[:200]
+        since = str(state.get("last_error_at") or "")[:16].replace("T", " ")
+        warn = f"⚠ 評分失敗 scoring failing ×{streak}: {st.error}"
+        if since:
+            warn += f" (last {since})"
+        st.context = f"{warn} — {st.context}" if st.context else warn
     return st
 
 

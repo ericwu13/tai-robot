@@ -5,9 +5,9 @@ filters to articles from the last 2 hours, scores each headline+summary
 via Gemini (see GEMINI_MODEL), aggregates a net sentiment score into an
 EMA (exponential moving average) with a 2-hour half-life, and when the
 EMA total exceeds SESSION_VOTE_THRESHOLD writes a ``regime_vote.json``
-for the regime state machine.  A Discord embed posts only when something
-changed: a run that scored new articles, or once on entering the weekend
-pause.
+for the regime state machine.  Discord posts only on state changes
+by default (``news.rss_discord``): scoring starts failing / recovers, or
+optionally a vote is written.  The per-run embed is ``rss_discord: all``.
 Scoring is skipped Sat 05:00 - Mon 05:00 TPE (any vote would target a
 night session that never happens).  From Mon 05:00 scoring resumes like
 any other weekday morning — the vote targets Monday night (opens 15:00).
@@ -27,7 +27,9 @@ Usage:
 
 Gemini API key is read from ``ai.google_api_key``.  Discord webhook is
 read from env var ``NEWS_DISCORD_WEBHOOK`` or the ``--discord-webhook``
-CLI flag (same as W2).
+CLI flag (same as W2).  What gets posted is ``news.rss_discord``
+(off | errors | changes | all, default errors — see DISCORD_MODES); the
+dashboard's 新聞訊號 view replaces the per-run embed.
 
 Settings block (in settings.yaml under ``news``)::
 
@@ -38,6 +40,7 @@ Settings block (in settings.yaml under ``news``)::
       rss_interval_minutes: 30
       rss_state_file: data/rss_scorer_state.json
       rss_news_log: ""   # per-article JSONL history; empty = <state dir>/news/news_log.jsonl
+      rss_discord: errors  # off | errors | changes | all
 
 Every article Gemini scores is appended to that history (``rss_news_log.py``)
 so the dashboard's 新聞訊號 view can show what drove the vote.
@@ -74,6 +77,12 @@ SESSION_VOTE_THRESHOLD: float = 1.5  # session EMA net required to fire a vote
 # 0.84 ≈ exp(-ln(2) * 0.5 / 2.0) = 2-hour half-life at 30-min polling cadence
 EMA_HALF_LIFE_HOURS: float = 2.0
 EMA_DECAY: float = math.exp(-math.log(2) * 0.5 / EMA_HALF_LIFE_HOURS)
+
+# Each article's signed score is clipped to ±ARTICLE_CLIP before summing.
+# The dashboard (scripts/dashboard/news_feed.py, news_pulse.py) imports
+# these so its numbers stay identical to the ones that fire the vote.
+ARTICLE_CLIP: float = 0.5
+EROSION_POINTS: float = 1.5   # session net this far back from its peak = "Eroding"
 
 ARTICLE_MAX_AGE_HOURS = 4
 GEMINI_MODEL = "gemini-3.6-flash"
@@ -145,7 +154,36 @@ def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
         "news_log_file": news.get("rss_news_log") or "",
         "gemini_api_key": ai.get("google_api_key", ""),
         "discord_webhook_url": discord_webhook or news.get("discord_webhook") or "",
+        "discord_mode": discord_mode(news.get("rss_discord")),
     }
+
+
+# What W3 posts to Discord.  The dashboard's 新聞訊號 view shows every run,
+# so the routine per-run embed is opt-in ("all").  The webhook itself is
+# shared with W2/W4 and stays configured either way.
+#   off      — never post
+#   errors   — Gemini scoring starts failing, and once when it recovers
+#   changes  — errors + a vote written (first time per session/direction)
+#   all      — legacy: an embed for every run that scored articles, plus
+#              the weekend-pause notice
+DISCORD_MODES = ("off", "errors", "changes", "all")
+DEFAULT_DISCORD_MODE = "errors"
+
+
+def discord_mode(value) -> str:
+    """``news.rss_discord`` → one of DISCORD_MODES (unknown → default).
+
+    YAML reads a bare ``off`` as boolean False, so False means "off".
+    """
+    if value is False:
+        return "off"
+    text = str(value or "").strip().lower()
+    if not text:
+        return DEFAULT_DISCORD_MODE
+    if text not in DISCORD_MODES:
+        print(f"  news.rss_discord={value!r} unknown — using {DEFAULT_DISCORD_MODE!r}")
+        return DEFAULT_DISCORD_MODE
+    return text
 
 
 # ── RSS fetching ─────────────────────────────────────────────────────────
@@ -344,7 +382,7 @@ def aggregate_scores(scored: list[dict]) -> float:
             raw = -confidence
         else:
             continue
-        total += max(-0.5, min(0.5, raw))
+        total += max(-ARTICLE_CLIP, min(ARTICLE_CLIP, raw))
     return total
 
 
@@ -378,8 +416,8 @@ def in_weekend_pause(now: datetime) -> bool:
     From Mon 05:00 the key targets Monday night (opens 15:00), a real
     session classified Tue ~04:58, making Monday morning identical to
     every other weekday morning (which are never paused).  Scoring (and
-    its Gemini cost) is skipped during the pause; the heartbeat embed
-    still posts once.
+    its Gemini cost) is skipped during the pause; with
+    ``rss_discord: all`` a notice embed still posts once.
     """
     wd = now.weekday()  # Mon=0 .. Sun=6
     if wd == 5:  # Saturday: Friday's night session ends 05:00
@@ -400,9 +438,11 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
                        scored: list[dict], session_net: float | None = None,
                        session_peak: float = 0.0, recent_runs: list[float] | None = None,
                        note: str | None = None,
-                       api_error: str | None = None, total_fetched: int = 0) -> None:
+                       api_error: str | None = None, total_fetched: int = 0) -> bool:
+    """Post one embed. True only when Discord accepted it, so callers can
+    re-try a transition notice (error / recovery) on the next run."""
     if not webhook:
-        return
+        return False
     if api_error:
         color = 0xFFA500
     elif direction == "trending-up":
@@ -440,12 +480,12 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
     else:
         fields.append({"name": "Articles Scored", "value": str(len(scored)), "inline": True})
 
-    if session_peak > 0 and session_net is not None and session_net < session_peak - 1.5:
+    if session_peak > 0 and session_net is not None and session_net < session_peak - EROSION_POINTS:
         erosion = session_net - session_peak
         fields.append({"name": "Drawdown",
                        "value": f"⚠️ Eroding: peak +{session_peak:.1f} → now +{session_net:.1f} ({erosion:.1f})",
                        "inline": False})
-    elif session_peak < 0 and session_net is not None and session_net > session_peak + 1.5:
+    elif session_peak < 0 and session_net is not None and session_net > session_peak + EROSION_POINTS:
         erosion = session_net - session_peak
         fields.append({"name": "Drawdown",
                        "value": f"⚠️ Eroding: peak {session_peak:.1f} → now {session_net:.1f} (+{erosion:.1f})",
@@ -481,8 +521,10 @@ def post_discord_embed(webhook: str | None, direction: str | None, net_score: fl
             headers={**_UA, "Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=15).read()
         print("  discord embed sent")
+        return True
     except Exception as e:  # noqa: BLE001
         print(f"  discord post failed: {type(e).__name__}: {e}")
+        return False
 
 
 # ── Liveness logging (matches W2 pattern) ────────────────────────────────
@@ -528,6 +570,63 @@ def _session_net(state: dict, session_key: str) -> float:
     return float(state.get("session_net", 0.0))
 
 
+def record_scoring_result(state: dict, now: datetime, api_error: str | None,
+                          skipped: int = 0) -> None:
+    """Persist the outcome of a scoring attempt in the state file.
+
+    ``last_check`` is stamped on every pass, including ones where Gemini
+    failed, so it alone cannot tell "alive and scoring" from "alive but
+    every call failing".  These fields can: ``error_streak`` > 0 means
+    the most recent scoring attempt failed (read by src.news.vote_status
+    for the dashboard, the GUI regime tab and the bridge monitor).
+    """
+    stamp = now.isoformat(timespec="seconds")
+    state["last_skipped"] = int(skipped)
+    if api_error:
+        state["last_error"] = str(api_error)[:300]
+        state["last_error_at"] = stamp
+        state["error_streak"] = int(state.get("error_streak") or 0) + 1
+    else:
+        state["error_streak"] = 0
+        state["last_success_at"] = stamp
+
+
+def unusable_scores_error(scored: list[dict], scored_guids: list[str]) -> str | None:
+    """A failure description when Gemini answered every call but no answer
+    was usable (all [SKIP]), else None.
+
+    That is not a GeminiAPIError (HTTP 200, the body just lacks a score —
+    a changed response shape, a safety block), so score_articles reports
+    no api_error; left alone it would reset error_streak and read healthy
+    while the vote silently stops.
+    """
+    if scored_guids and not scored:
+        return f"no usable score in {len(scored_guids)} Gemini response(s)"
+    return None
+
+
+def notify_transitions(state: dict, mode: str, post, *, api_error: str | None,
+                       vote_key: str = "") -> None:
+    """Discord for the non-``all`` modes: state changes only.
+
+    *post(note)* sends this run's embed and returns True when Discord
+    accepted it; a flag is only set on success, so a failed send is
+    retried on the next scoring run instead of being lost.
+    """
+    if api_error:
+        if not state.get("error_notified"):
+            streak = int(state.get("error_streak") or 1)
+            if post(f"Gemini scoring failing ({streak} run(s)) — "
+                    "one more message when it recovers"):
+                state["error_notified"] = True
+    elif state.get("error_notified"):
+        if post("✅ Gemini scoring recovered"):
+            state["error_notified"] = False
+    if mode == "changes" and vote_key and state.get("vote_notified") != vote_key:
+        if post("Vote written — first crossing this session"):
+            state["vote_notified"] = vote_key
+
+
 def check_once(cfg: dict, state: dict, vote_out: str,
                now: datetime | None = None) -> dict:
     """One RSS scoring pass.  Returns updated state.
@@ -539,12 +638,13 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     now = now or datetime.now(_TZ_TAIPEI)
     print(f"[{now:%Y-%m-%d %H:%M:%S}] RSS scorer checking {len(cfg['feeds'])} feeds")
 
+    mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
     if in_weekend_pause(now):
-        print("  weekend pause (Sat 05:00 - Mon 15:00 TPE) — scoring skipped")
-        if not state.get("weekend_pause_notified"):
+        print("  weekend pause (Sat 05:00 - Mon 05:00 TPE) — scoring skipped")
+        if mode == "all" and not state.get("weekend_pause_notified"):
             post_discord_embed(cfg["discord_webhook_url"], None, 0.0, [],
                                note="Weekend — scoring paused (no night session to vote on)")
-            state["weekend_pause_notified"] = True
+        state["weekend_pause_notified"] = True
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
     state["weekend_pause_notified"] = False
@@ -552,6 +652,8 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     articles = fetch_all_feeds(cfg["feeds"])
     new_articles = dedup_articles(articles, state)
     print(f"  {len(articles)} recent articles, {len(new_articles)} new")
+    state["last_fetched"] = len(articles)
+    state["last_new"] = len(new_articles)
 
     session_key = night_session_key(now)
 
@@ -561,6 +663,9 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     scored, scored_guids, api_error = score_articles(new_articles, cfg["gemini_api_key"])
     state = mark_seen(state, scored_guids)
+    api_error = api_error or unusable_scores_error(scored, scored_guids)
+    record_scoring_result(state, now, api_error,
+                          skipped=len(scored_guids) - len(scored))
 
     net = aggregate_scores(scored)
     cum = round(_session_net(state, session_key) * EMA_DECAY + net, 4)
@@ -592,22 +697,63 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     if api_error:
         print(f"  ⚠ Gemini API error: {api_error}")
 
+    vote_written = False
     if direction and vote_out:
         try:
             write_regime_vote = _get_write_regime_vote()
             write_regime_vote(vote_out, direction, session_key, source="W3")
+            vote_written = True
             print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
         except Exception as e:  # noqa: BLE001
             print(f"  vote write failed: {type(e).__name__}: {e}")
-    post_discord_embed(cfg["discord_webhook_url"], direction, net, scored,
-                       session_net=cum, session_peak=peak,
-                       recent_runs=state["recent_runs"],
-                       api_error=api_error, total_fetched=len(new_articles))
+
+    def post(note=None):
+        return post_discord_embed(cfg["discord_webhook_url"], direction, net, scored,
+                                  session_net=cum, session_peak=peak,
+                                  recent_runs=state["recent_runs"], note=note,
+                                  api_error=api_error, total_fetched=len(new_articles))
+
+    if mode == "all":
+        post()
+    elif mode != "off":
+        notify_transitions(state, mode, post, api_error=api_error,
+                           vote_key=f"{session_key}:{direction}" if vote_written else "")
 
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_net_score"] = net
     state["last_articles_scored"] = len(scored)
     return state
+
+
+class _NoRunLog:
+    """Stand-in when src/news/bridge_runs.py cannot be loaded."""
+    result = ""
+    exit_code = None
+
+    def fail(self, error):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _run_recorder(bridge_dir, workflow: str):
+    """``bridge_runs.run_recorder`` (runs/<W>.jsonl for the dashboard's
+    工作流程 view), loaded by file path like ``_get_write_regime_vote``.
+    Bookkeeping only — a load failure degrades to a no-op."""
+    try:
+        import importlib.util
+        mod_path = Path(__file__).resolve().parents[2] / "src" / "news" / "bridge_runs.py"
+        spec = importlib.util.spec_from_file_location("bridge_runs", mod_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.run_recorder(bridge_dir, workflow)
+    except Exception as e:  # noqa: BLE001
+        print(f"  run log unavailable: {type(e).__name__}: {e}")
+        return _NoRunLog()
 
 
 def main() -> int:
@@ -640,6 +786,9 @@ def main() -> int:
 
     if not cfg["gemini_api_key"] and not args.force_fire:
         print("ERROR: ai.google_api_key not set in settings.yaml")
+        with _run_recorder(Path(state_path).parent, "W3") as run:
+            run.exit_code = 1
+            run.fail("ai.google_api_key not set in settings.yaml")
         return 1
 
     if args.force_fire:
@@ -652,7 +801,8 @@ def main() -> int:
         else:
             print("ERROR: no --vote-out or news.regime_vote_path configured")
             return 1
-        post_discord_embed(cfg["discord_webhook_url"], direction, 99.0, [])
+        if cfg["discord_mode"] in ("changes", "all"):
+            post_discord_embed(cfg["discord_webhook_url"], direction, 99.0, [])
         return 0
 
     state = load_state(state_path)
@@ -662,18 +812,34 @@ def main() -> int:
         interval = cfg["interval_minutes"] * 60
         print(f"looping every {cfg['interval_minutes']}m")
         while True:
-            state = check_once(cfg, state, vote_out)
-            save_state(state_path, state)
+            state = _recorded_pass(cfg, state, vote_out, state_path)
             append_log(log_dir / LOG_NAME,
                        f"{datetime.now(_TZ_TAIPEI):%Y-%m-%d %H:%M:%S} TPE | "
                        f"scored {state.get('last_articles_scored', 0)} | "
                        f"net {state.get('last_net_score', 0):+.2f}")
             time.sleep(interval)
     else:
-        state = check_once(cfg, state, vote_out)
-        save_state(state_path, state)
+        state = _recorded_pass(cfg, state, vote_out, state_path)
 
     return 0
+
+
+def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str) -> dict:
+    """One scoring pass + state save, logged to runs/W3.jsonl.  A pass
+    whose Gemini scoring failed (error_streak went up) is a failed run
+    even though the process itself carries on."""
+    with _run_recorder(Path(state_path).parent, "W3") as run:
+        before = int(state.get("error_streak") or 0)
+        state = check_once(cfg, state, vote_out)
+        save_state(state_path, state)
+        run.exit_code = 0
+        run.result = (f"fetched {state.get('last_fetched', '-')} | "
+                      f"new {state.get('last_new', '-')} | "
+                      f"scored {state.get('last_articles_scored', 0)} | "
+                      f"net {float(state.get('session_net') or 0):+.2f}")
+        if int(state.get("error_streak") or 0) > before:
+            run.fail(str(state.get("last_error") or "scoring failed"))
+    return state
 
 
 if __name__ == "__main__":

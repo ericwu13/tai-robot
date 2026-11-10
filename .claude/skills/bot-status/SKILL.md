@@ -1,9 +1,21 @@
 ---
 name: bot-status
-description: Check whether a deployed tai-robot bot process is actually alive and still ticking — lock/PID liveness, debug-log freshness, saved session state. Use when the user asks "is the bot running?", a bot went quiet, Discord stopped reporting trades, or a deploy needs confirming.
+description: Check whether a deployed tai-robot bot process is actually alive and still ticking — lock/PID liveness, debug-log freshness, saved session state. Use when the user asks "is the bot running?", "are the bots up?", "fleet status", "is Steven OK?", a bot went quiet, the dashboard shows HUNG/NO_HEARTBEAT/CRASHED, Discord stopped reporting trades, or a deploy needs confirming. Covers local dirs (script) and the Steven fleet (dashboard /api/fleet).
 ---
 
 # Bot Status
+
+> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
+> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
+> run on **Steven**, not this PC. This PC's `data\live` holds only
+> retired/test bots and its n8n is stopped. Read live state from the
+> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
+> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
+> describes this PC only — never publish it as fleet health. Host map →
+> `start-here`. Run checkers from an up-to-date checkout
+> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
+> weeks behind.
 
 One read-only command answers "is it alive":
 
@@ -15,6 +27,16 @@ C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bo
 tai-monitor pins from the regime-health skill. Optional arg: a different
 `data/live` base directory.)
 
+## The Steven fleet
+
+`curl -s http://<Steven tailnet IP>:8765/api/fleet` → `bots[].state`. The
+dashboard and this script share `check_bots.classify_heartbeat`:
+RUNNING = alive; LAGGING = heartbeat stale; HUNG = main loop stopped or a
+COM call stuck; NO_HEARTBEAT = PID alive but no usable heartbeat (needs
+attention, never "running"); CRASHED = dead lock PID on a recently
+active bot; STOPPED = no lock. `mode` ≠ `paper` (page badge 實單) is a
+real-order bot — say so before suggesting any stop/restart.
+
 ## What it reads
 
 | Artefact | Fact it establishes |
@@ -23,13 +45,14 @@ tai-monitor pins from the regime-health skill. Optional arg: a different
 | Windows `OpenProcess`/`GetExitCodeProcess` | whether that PID is alive |
 | newest `debug_YYYYMMDD.log` | last TPE line = last sign of life |
 | `session.json` | strategy, trading_mode, cumulative P&L, open position |
-| `dist/tai_backtest/BUILD_INFO.json` | which version/commit the EXE is |
+| `heartbeat.json` | main-loop tick + in-flight COM call: age >45 s = STALE, >120 s or in-flight >60 s = HUNG (alive PID, frozen loop — issue #157) |
+| `dist/tai_backtest/BUILD_INFO.json` (local build; Steven: `<install>\BUILD_INFO.json`) | which version/commit the EXE is |
 
 ## Reading the verdict
 
 | Level | Meaning | Do |
 |---|---|---|
-| P1 | dead-PID lock on a recently active bot, or a log frozen >10 min mid-session | act now — the bot is down or hung |
+| P1 | dead-PID lock on a recently active bot, a HUNG heartbeat, or a log frozen >10 min mid-session | act now — the bot is down or hung |
 | P2 | unparsable lock, unreadable `session.json` | investigate today; a resume would start flat |
 | P3 | no lock (not running), abandoned stale lock, dirty build | informational |
 
@@ -59,8 +82,8 @@ Healthy vs unhealthy:
 - **Log silence in a closed gap is normal** — 13:46–14:59 and 05:01–08:44
   TPE, plus weekends and TAIFEX holidays. The helper only applies the
   10-minute freshness rule when `current_session(now)` is not None.
-- **The OS clock is UTC-7 while log stamps are TPE (+8).** Never compare a
-  log timestamp against a naive `datetime.now()`.
+- **Log stamps are TPE (+8); the OS clock is not** — this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there). Never
+  compare a log timestamp against a naive `datetime.now()`.
 - The check is strictly read-only: it re-implements PID liveness rather
   than calling `LiveRunner.check_lock`, which DELETES stale locks.
 
@@ -68,5 +91,5 @@ Healthy vs unhealthy:
 
 - bot alive but not trading → `regime-health` (idle leg? news gate?)
 - bot dead → read the tail of its newest `debug_*.log`, then `log-scan`
-- needs restarting headlessly (paper/auto) → `deploy`; semi_auto → `deploy-check` for the workbench recipe
-- needs restarting → `deploy-check` for the manual redeploy recipe
+- needs restarting (paper/auto) → `deploy` (on Steven, via `tailscale-ssh`); semi_auto → `deploy-check` workbench recipe
+- host map → `start-here`

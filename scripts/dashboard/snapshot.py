@@ -269,6 +269,7 @@ def _position(broker: dict, point_value: int, last_close: int | None) -> dict | 
 
 
 _stat_cache: dict[str, tuple[int, int, object]] = {}
+RUN_LOG_TAIL = 800
 
 
 def _read_if_changed(path: str, load, valid):
@@ -593,7 +594,9 @@ def _trade_row(t: dict, point_value: int | None = None) -> dict:
             "real_exit_price": _to_int(t.get("real_exit_price")),
             "real_exit_estimated": bool(t.get("real_exit_estimated", False)),
             "pnl": _to_int(t.get("pnl")), "exit_tag": str(t.get("exit_tag") or ""),
-            "source": str(t.get("source") or "")}
+            "source": str(t.get("source") or ""),
+            "entry_order_seq": str(t.get("entry_order_seq") or ""),
+            "exit_order_seq": str(t.get("exit_order_seq") or "")}
 
 
 def trade_markers(trades: list[dict], t0: int, t1: int) -> list[dict]:
@@ -812,6 +815,14 @@ def _read_json_dict(path: str):
     return _read_if_changed(path, fileio.read_json, lambda d: isinstance(d, dict))
 
 
+def _read_run_lines(path: str):
+    """Tail of a bridge run log (``runs/<W>.jsonl``), stat-gated like
+    ``_read_json_dict``: the log is appended every pass and trimmed with
+    an ``os.replace`` an open handle would break."""
+    return _read_if_changed(path, lambda p: fileio.tail_lines(p, RUN_LOG_TAIL),
+                            lambda d: isinstance(d, list))
+
+
 def _news_blocks_leg(sess: dict) -> bool:
     """Does the news breaker stop the ACTIVE leg right now? The runner's
     own rule (``BreakerState.gates_leg`` with the bot's suppress scope),
@@ -901,6 +912,7 @@ def vote_detail(now: datetime, bot_dir: str, sess: dict, state: dict,
                             "vote": st.vote, "vote_expired": st.vote_expired,
                             "vote_target": st.vote_target, "known": st.known,
                             "stale": st.stale, "last_check": st.last_check[:16].replace("T", " "),
+                            "failing": st.failing, "error": redact_line(st.error),
                             "context": redact_line(st.context)})
     feats = state.get("last_features") if isinstance(state.get("last_features"), dict) else {}
     news = sess.get("news") if isinstance(sess.get("news"), dict) else {}

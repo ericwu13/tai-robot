@@ -1243,6 +1243,19 @@ def test_bridge_stale_w3_sidecar_is_p2(tmp_path, bridge):
     assert any(m.startswith("W3 bridge stale") for m in messages(findings, "P2"))
 
 
+def test_bridge_w3_alive_but_scoring_failing_is_p2(tmp_path, bridge):
+    """Fresh last_check, but every scoring call failed (e.g. a retired
+    Gemini model) — with the per-run Discord embed gone this finding is
+    the alarm."""
+    write_json(bridge / "rss_scorer_state.json",
+               {"last_check": iso(NOW - timedelta(minutes=20)), "session_net": 0.0,
+                "error_streak": 4, "last_error": "HTTP 404: model not found",
+                "last_error_at": iso(NOW - timedelta(minutes=20))})
+    findings, _ = check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
+    p2 = messages(findings, "P2")
+    assert any(m.startswith("W3 alive but scoring failing for 4 run(s)") for m in p2), p2
+
+
 def test_bridge_naive_issued_at_is_p2(tmp_path, bridge):
     """A naive stamp is a WRITER bug — the reader rejects it outright."""
     write_json(bridge / "signal.json", {
