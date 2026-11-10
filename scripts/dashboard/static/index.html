@@ -423,7 +423,8 @@ table.mini td.why { white-space: normal; min-width: 160px; }
         <span>K 線</span>
         <span class="seg" id="d-iv">
           <button data-iv="60">1分</button><button data-iv="300">5分</button>
-          <button data-iv="900">15分</button><button data-iv="3600">60分</button>
+          <button data-iv="900">15分</button><button data-iv="1800">30分</button>
+          <button data-iv="3600">60分</button>
         </span>
         <span class="legend">▲ 進場　▼ 出場（時間為台北時間）　往左拖曳載入更早的 K 線</span>
         <span class="legend" id="d-band-legend" hidden>底部色帶＝盤勢：<span class="rg up">趨勢向上</span> <span class="rg down">趨勢向下</span> <span class="rg range">盤整</span> <span class="rg trans">轉換中</span></span>
@@ -1557,7 +1558,8 @@ const App = {
       ...realTiles(b.real),
     );
     this.renderRegime(d.regime);
-    if (this.ivInit) { if ([60, 300, 900, 3600].includes(b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
+    // Open on the bot's own timeframe when the selector offers it.
+    if (this.ivInit) { if ([...$("d-iv").children].some((btn) => Number(btn.dataset.iv) === b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
     for (const btn of $("d-iv").children) btn.classList.toggle("on", Number(btn.dataset.iv) === this.iv);
     this.drawEquity();
 
@@ -1701,10 +1703,13 @@ const App = {
     const out = [];
     let cur = null;
     for (const b of bars) {
-      // Buckets start at the session open (08:45 day, 15:00 night), like BarAggregator.
+      // Buckets start at the session open, a port of src.market_data.sessions.session_align
+      // (what BarAggregator uses): 08:45 for [08:45, 13:45), 15:00 from 15:00, and the
+      // previous day's 15:00 for every other minute (after midnight and off-hours).
       const mod = ((b.time % 86400) + 86400) % 86400;
-      const nightEarly = mod < 5 * 3600;
-      const anchor = b.time - mod + (mod >= 15 * 3600 ? 15 * 3600 : nightEarly ? -9 * 3600 : 8 * 3600 + 45 * 60);
+      const dayOpen = 8 * 3600 + 45 * 60, dayClose = 13 * 3600 + 45 * 60, nightOpen = 15 * 3600;
+      const anchor = b.time - mod + (mod >= dayOpen && mod < dayClose ? dayOpen
+        : mod >= nightOpen ? nightOpen : nightOpen - 86400);
       const t = anchor + Math.floor((b.time - anchor) / iv) * iv;
       if (!cur || cur.time !== t) {
         if (cur) out.push(cur);
@@ -1747,7 +1752,7 @@ const App = {
 
   // Open on roughly the latest trading day; older ones are a drag away.
   showRecent(bars) {
-    const span = { 60: 300, 300: 200, 900: 96, 3600: 40 }[this.iv] || 100;
+    const span = { 60: 300, 300: 200, 900: 96, 1800: 60, 3600: 40 }[this.iv] || 100;
     const last = bars.length - 1;
     this.chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, last - span), to: last + 3 });
   },

@@ -728,6 +728,142 @@ def test_bars_route_validates_input(live_server, query, code):
         assert exc.value.code == code
 
 
+# ── K-line intervals (client-side aggregation) ──────────────────────────
+
+def _interval_buttons(html):
+    seg = re.search(r'<span class="seg" id="d-iv">([\s\S]*?)</span>', html)
+    assert seg, "interval selector not found"
+    return [(int(s), label) for s, label in
+            re.findall(r'<button data-iv="(\d+)">([^<]+)</button>', seg.group(1))]
+
+
+def test_chart_offers_30m_interval():
+    """A 30-min bot (e.g. DonchianBreakoutStrategy, kline_minute=30) needs 30分."""
+    html = _index_html()
+    assert _interval_buttons(html) == [(60, "1分"), (300, "5分"), (900, "15分"),
+                                       (1800, "30分"), (3600, "60分")]
+    # The opening view has a span for every offered interval (none falls back).
+    span = re.search(r"const span = (\{[^}]*\})\[this\.iv\]", html)
+    assert span, "showRecent span table not found"
+    spans = {int(k) for k in re.findall(r"(\d+):", span.group(1))}
+    assert {iv for iv, _ in _interval_buttons(html)} <= spans
+
+
+def test_default_interval_follows_bot_timeframe_for_every_offered_interval():
+    """The bot's own timeframe picks the first view whenever the page offers it.
+
+    Executes the shipped default rule (no JS runner in this repo) with the
+    buttons from the shipped markup, so a hard-coded list that drifts from the
+    buttons — the way 30分 would have been ignored — fails here.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node unavailable — cannot execute the page's default rule")
+    html = _index_html()
+    rule = re.search(r"if \(this\.ivInit\) \{([\s\S]*?) this\.ivInit = false; \}", html)
+    assert rule, "default-interval rule not found"
+    ivs = [iv for iv, _ in _interval_buttons(html)]
+    assert 1800 in ivs, "30分 not offered"
+    prog = ("const ivs = JSON.parse(process.argv[1]);\n"
+            "const $ = () => ({ children: ivs.map((iv) => ({ dataset: { iv: String(iv) } })) });\n"
+            "const out = {};\n"
+            "for (const s of [...ivs, 120, 14400, 0]) {\n"
+            "  const self = { iv: 60 }; const b = { interval_s: s };\n"
+            f"  (function () {{ {rule.group(1)} }}).call(self);\n"
+            "  out[s] = self.iv;\n"
+            "}\n"
+            "console.log(JSON.stringify(out));\n")
+    run = subprocess.run([node, "-e", prog, json.dumps(ivs)],
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    got = {int(k): v for k, v in json.loads(run.stdout).items()}
+    assert got == {**{iv: iv for iv in ivs}, 120: 60, 14400: 60, 0: 60}
+
+
+def _page_aggregate(bars, iv):
+    """Run the page's own ``aggregate(bars, iv)`` under node."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node unavailable — cannot execute the page aggregator")
+    html = _index_html()
+    body = re.search(r"\n  aggregate\(bars, iv\) \{([\s\S]*?)\n  \},\n", html)
+    assert body, "aggregate() not found in index.html"
+    prog = (f"function aggregate(bars, iv) {{{body.group(1)}\n}}\n"
+            "const [bars, iv] = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+            "console.log(JSON.stringify(aggregate(bars, iv)));\n")
+    run = subprocess.run([node, "-e", prog], input=json.dumps([bars, iv]),
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def _minute_rows(start, minutes, seed):
+    """Deterministic 1-min OHLC rows (TPE naive datetimes) from ``start``."""
+    from datetime import timedelta
+    rows, price = [], 45000 + seed
+    for i in range(minutes):
+        dt = start + timedelta(minutes=i)
+        step = ((i * 37 + seed * 11) % 23) - 11
+        o, c = price, price + step
+        rows.append((dt, o, max(o, c) + (i % 5), min(o, c) - (i % 3), c))
+        price = c
+    return rows
+
+
+# A Thu day session tail, the night across midnight and its close, then Fri's
+# open. ``stray`` adds minutes outside both sessions (13:45, 14:30, 06:10),
+# where session_align uses the previous night's 15:00 as its epoch.
+_SESSION_SPANS = [((2026, 10, 22, 12, 31), 74), ((2026, 10, 22, 15, 0), 71),
+                  ((2026, 10, 22, 23, 17), 80), ((2026, 10, 23, 4, 2), 58),
+                  ((2026, 10, 23, 8, 45), 67)]
+_STRAY = [((2026, 10, 22, 13, 45), 1), ((2026, 10, 22, 14, 30), 2),
+          ((2026, 10, 23, 6, 10), 1)]
+
+
+@pytest.mark.parametrize("iv", [300, 900, 1800, 3600])
+@pytest.mark.parametrize("stray", [False, True], ids=["sessions", "stray-minutes"])
+def test_page_aggregation_matches_live_bar_aggregator(tmp_path, iv, stray):
+    """/api/bars → page ``aggregate`` == ``aggregate_bars`` (what the bot sees).
+
+    Candles are labelled by session-aligned OPEN time, and the day close /
+    night open and night close / day open gaps stay split.
+    """
+    from datetime import datetime as _dt
+
+    from src.live.bar_aggregator import aggregate_bars
+    from src.market_data.models import Bar
+
+    rows = []
+    for k, (start, n) in enumerate(_SESSION_SPANS + (_STRAY if stray else [])):
+        rows += _minute_rows(_dt(*start), n, seed=k)
+    rows.sort()
+    d = make_bot(tmp_path)
+    by_day = {}
+    for dt, o, h, lo, c in rows:
+        by_day.setdefault(dt.strftime("%Y%m%d"), []).append(
+            f"{dt:%Y/%m/%d %H:%M},{o},{h},{lo},{c},1\n")
+    for day, lines in by_day.items():
+        (d / f"bars_1m_{day}.csv").write_text(
+            "datetime,open,high,low,close,volume\n" + "".join(lines), encoding="utf-8")
+
+    served = snapshot.bars_window(str(d), before="20261024", days=3)["bars"]
+    assert len(served) == len(rows), "premise: every minute reaches the page"
+    page = _page_aggregate(served, iv)
+
+    live = aggregate_bars([Bar("TMF00", dt, o, h, lo, c, 1, 60)
+                           for dt, o, h, lo, c in rows], iv)
+    want = [{"time": snapshot.chart_time(b.dt.replace(tzinfo=TZ_TPE)),
+             "open": b.open, "high": b.high, "low": b.low, "close": b.close}
+            for b in live]
+    assert page == want
+    if iv == 1800 and not stray:
+        labels = [f"{b.dt:%d %H:%M}" for b in live]
+        # Day bars end on the 13:15 open; the night starts fresh at 15:00.
+        assert labels[labels.index("22 13:15") + 1] == "22 15:00"
+        # The night's last bar opens 04:30; the next day starts at 08:45.
+        assert labels[labels.index("23 04:30") + 1] == "23 08:45"
+
+
 # ── regime panel ────────────────────────────────────────────────────────
 
 REGIME_HEADER = ("date,session,adx,plus_di,minus_di,atr_ratio,ema_slope,close,raw_regime,"
