@@ -1765,6 +1765,7 @@ def test_issue_254_resumed_flat_exit_journals_the_saved_order(tmp_path, monkeypa
 
     monkeypatch.setattr(rb, "_com_available", True)
     monkeypatch.setattr(rb, "skO", object())
+    monkeypatch.setattr(rb, "_discord", None)
     app = rb.BacktestApp.__new__(rb.BacktestApp)
     app.live_log = SimpleNamespace(append=lambda *a, **k: None)
     app._alerts = []
