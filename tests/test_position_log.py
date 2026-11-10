@@ -1322,6 +1322,9 @@ def _v250_module():
             os.unlink(path)
         except OSError:
             pass
+        subprocess.run(
+            ["git", "update-ref", "-d", _V250_REF],
+            cwd=root, capture_output=True)
 
 
 def _v250_resume_position(path: str) -> int:
@@ -1503,6 +1506,87 @@ def test_issue_254_failed_append_keeps_memory_and_the_next_fill_converges(tmp_pa
     assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "FILL"] == ["s2"]
     again.recover()
     assert again.position == 0 and again._applied == {"s1", "s2"}
+
+
+def test_issue_254_replay_uses_fill_bot_position_after_without_the_companion(tmp_path):
+    """A durable FILL's integer bot_position_after is the restarted position.
+
+    The entry lines never land. The exit FILL does, with the cumulative
+    0. Recover must read that field. It must not depend on the companion
+    copy, and a restart with no durable line must still invent nothing.
+    """
+    led = _ledger(tmp_path)
+
+    def fail(_record):
+        return False
+
+    led._append_line = fail
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    led.record_fill("s1", 100, source="deal", oi_generation=4)
+    assert led.position == 1 and _events(tmp_path) == []
+    led._append_line = PositionLedger._append_line.__get__(led, PositionLedger)
+    led.register_order("s2", "exit", 1, 1, "TM0000")
+    landed = led.record_fill("s2", 90, source="deal", oi_generation=5)
+    assert led.position == 0 and landed["bot_position_after"] == 0
+    fills = [e for e in _events(tmp_path) if e.get("event") == "FILL"]
+    assert [e["order_seq"] for e in fills] == ["s2"]
+    # Drop the ORDER and the best-effort companion. Only the FILL remains.
+    path = tmp_path / POSITION_LOG_NAME
+    path.write_text(
+        "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in fills),
+        encoding="utf-8")
+    assert last_record(str(path))["bot_position_after"] == 0
+    fresh = _reopen(tmp_path)
+    fresh.recover()
+    assert fresh.position == 0
+    assert fresh._applied == {"s2"}
+
+    empty = tmp_path / "nothing"
+    missed = _ledger(empty)
+
+    def fail_all(_record):
+        return False
+
+    missed._append_line = fail_all
+    missed.register_order("s1", "entry", 0, 1, "TM0000")
+    missed.record_fill("s1", 100, source="deal", oi_generation=4)
+    assert missed.position == 1
+    restarted = _reopen(empty)
+    restarted.recover()
+    assert restarted.position == 0
+    assert restarted._orders == {} and restarted._applied == set()
+    assert _events(empty) == []
+
+
+def test_issue_254_fill_bot_position_after_wins_over_the_qty_sum(tmp_path):
+    """An integer bot_position_after replaces the signed increment.
+
+    A FILL with no such field still increments. A second FILL for a seq
+    already applied does not apply its field.
+    """
+    path = tmp_path / POSITION_LOG_NAME
+    first = {
+        "event": "FILL", "order_seq": "s1", "side": "BUY", "qty": 1,
+        "action": "ENTRY", "bot_position_after": 5, "net_status": "pending",
+        "net_position_after": None,
+    }
+    bare = {
+        "event": "FILL", "order_seq": "s2", "side": "BUY", "qty": 1,
+        "action": "ENTRY", "net_status": "pending", "net_position_after": None,
+    }
+    again = {
+        "event": "FILL", "order_seq": "s1", "side": "SELL", "qty": 1,
+        "action": "EXIT", "bot_position_after": 9, "net_status": "pending",
+        "net_position_after": None,
+    }
+    path.write_text(
+        json.dumps(first) + "\n" + json.dumps(bare) + "\n" + json.dumps(again) + "\n",
+        encoding="utf-8")
+    led = _reopen(tmp_path)
+    led.recover()
+    assert led.position == 6
+    assert led._applied == {"s1", "s2"}
+    assert len(led._pending) == 2
 
 
 def test_issue_254_failed_read_can_be_retried(tmp_path, monkeypatch):

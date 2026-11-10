@@ -48,9 +48,10 @@ Replay rules, applied only by explicit ``resume()`` (a new ledger is flat):
 * A plain deploy does not adopt the previous journal. Inspection goes
   through ``read_records``. The live ledger loads orders, pending nets,
   and position only when ``resume()`` runs.
-* New ``FILL`` events move position by their signed qty, once per seq.
-  ``ORDER`` never does. ``NET_UPDATE`` never does. A new ``RESUME`` line
-  does not either.
+* A new ``FILL`` with an integer ``bot_position_after`` sets position to
+  that cumulative value, once per seq. A ``FILL`` without that field
+  still moves position by its signed qty. ``ORDER`` never does.
+  ``NET_UPDATE`` never does. A new ``RESUME`` line does not either.
 * A pre-change line (no ``event``) does not move position by its qty.
   The last such line's ``bot_position_after`` is the baseline, which can
   disagree with the signed sum. Its seqs are remembered so a later deal
@@ -60,10 +61,11 @@ Replay rules, applied only by explicit ``resume()`` (a new ledger is flat):
   ``account_monitor`` restarts every process, so the stored number is
   not compared with the new process. The first completed snapshot here
   may answer it. The 120 s timeout clock also restarts with the process.
-* A failed append is logged and not treated as durable. In-memory
-  position moves only after that append succeeds, so a write error does
-  not leave a position the next restart cannot see. Nothing here raises
-  into the trading path.
+* A failed append is logged and is not an alert. The in-memory book
+  still advances. A restart sees that move only when a later durable
+  ``FILL`` carries the cumulative ``bot_position_after``, and sees
+  nothing when no later line landed. Nothing here raises into the
+  trading path.
 
 ``net_position_after`` describes the book after the fill. A pending fill
 takes the first snapshot whose query generation is newer than the one
@@ -308,7 +310,11 @@ class PositionLedger:
         qty = _int_or_none(rec.get("qty"))
         if qty is None or qty < 1:
             qty = 1
-        self.position += qty if side == "BUY" else -qty
+        stored = rec.get("bot_position_after")
+        if isinstance(stored, int) and not isinstance(stored, bool):
+            self.position = stored
+        else:
+            self.position += qty if side == "BUY" else -qty
         self._applied.add(ident)
         action = rec.get("action_type") or _TYPE_BY_ACTION.get(rec.get("action"), "")
         if seq and seq not in self._orders and action in _ACTIONS:
