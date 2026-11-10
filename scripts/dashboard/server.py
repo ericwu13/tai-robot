@@ -11,6 +11,9 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
                                  stitched 1-min candles + trade markers
     GET /api/news[?session=&source=&min=&max=&limit=]
                                  W3 RSS scorer per-article history (新聞訊號)
+    GET /pnl-history/<bot_id>    cumulative P&L per trading session (sim / real)
+    GET /pnl-history/fleet[?retired=1]
+                                 the same summed over the fleet
     GET /api/news/pulse          市場脈動: W3 gauge, votes, events, runs, drivers,
                                  W2 ticker strip, W4 籌碼 panel
     GET /api/workflows           工作流程: W1-W5 status, last run, next due
@@ -53,7 +56,8 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from scripts.dashboard import (  # noqa: E402
-    control, news_feed, news_pulse, position_log_view, snapshot, workflows)
+    control, news_feed, news_pulse, pnl_history, position_log_view, snapshot,
+    workflows)
 from scripts.news_bridge import rss_news_log  # noqa: E402
 from scripts.monitor.common import default_base_dir, now_tpe  # noqa: E402
 
@@ -286,6 +290,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
                 body = self.cache.get(f"bars:{bot_id}:{before}:{after}:{days}", lambda: _json(
                     snapshot.bars_window(bot_dir, before or None, days, after or None)))
+                self._send(200, body, "application/json; charset=utf-8")
+            elif url.path == "/pnl-history/fleet":
+                retired = (query.get("retired") or ["0"])[0] == "1"
+                body = self.cache.get(f"pnl:fleet:{retired}", lambda: _json(
+                    pnl_history.fleet_history(now_tpe(), self.base_dir,
+                                              include_retired=retired)))
+                self._send(200, body, "application/json; charset=utf-8")
+            elif url.path.startswith("/pnl-history/"):
+                bot_id = unquote(url.path[len("/pnl-history/"):])
+                bot_dir = snapshot.find_bot_dir(self.base_dir, bot_id) if bot_id else None
+                if not bot_dir:
+                    self._send(404, _json({"error": "no such bot"}),
+                               "application/json; charset=utf-8")
+                    return
+                body = self.cache.get(f"pnl:{bot_id}", lambda: _json(
+                    pnl_history.bot_history(now_tpe(), bot_dir)))
                 self._send(200, body, "application/json; charset=utf-8")
             elif url.path.startswith("/position-log/"):
                 bot_id = unquote(url.path[len("/position-log/"):])
