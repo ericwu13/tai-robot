@@ -115,6 +115,17 @@ def test_legacy_rows_without_seq_keys_keep_the_price_rule():
     assert not real_pnl.is_real_order(_row())
 
 
+def test_legacy_untracked_row_with_stamped_exit_seq_is_a_real_order():
+    """#259 review P3: a position restored from an older file stays
+    seq_tracked=False, but note_real_order_sent can still stamp the exit
+    seq. A lost fill (source != real, no confirmed price) must classify
+    that row as a real order, not paper."""
+    t = _row(entry_order_seq="", exit_order_seq=SEQ_X, seq_tracked=False,
+             source="paper", real_entry_price=0, real_exit_price=0)
+    assert real_pnl.is_real_order(t)
+    assert real_pnl.classify(t, PV)["status"] == "missing"
+
+
 def test_legacy_real_trade_survives_a_save_by_the_new_build():
     """#258 review P2: to_dict writes the seq keys ("") on every trade, so
     key presence must not switch a legacy row to the seq rule. A real order
