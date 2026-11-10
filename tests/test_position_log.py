@@ -639,7 +639,11 @@ def test_issue_252_dashboard_projects_logical_fills_not_the_account_net(tmp_path
 
 
 def test_issue_252_replay_skips_damaged_rows_and_a_failed_append_is_not_kept(tmp_path, caplog):
-    """A mixed/damaged journal keeps the valid rows. A failed append is not recovered."""
+    """A mixed/damaged journal keeps the valid rows.
+
+    A failed append is logged and still moves this process's book. A
+    restart with nothing durable does not invent that fill.
+    """
     path = tmp_path / POSITION_LOG_NAME
     good = dict(_LEGACY[0])
     path.write_text(
@@ -668,10 +672,12 @@ def test_issue_252_replay_skips_damaged_rows_and_a_failed_append_is_not_kept(tmp
     with caplog.at_level("WARNING"):
         broken = PositionLedger(str(blocker / "bot"), bot_id="x", account=lambda: ACCT)
         broken.register_order("a", "entry", 0, 1, "TM0000")
-        assert broken.record_fill("a", 100, source="deal", oi_generation=1) is None
-    assert broken.position == 0
+        missed = broken.record_fill("a", 100, source="deal", oi_generation=1)
+    assert missed is not None and missed["bot_position_after"] == 1
+    assert broken.position == 1 and "a" in broken._orders
+    assert "position log write failed" in caplog.text
     reopened = PositionLedger(str(blocker / "bot"), bot_id="x", account=lambda: ACCT)
-    assert reopened.position == 0
+    assert reopened.position == 0 and reopened._orders == {}
     assert not (blocker / "bot" / POSITION_LOG_NAME).exists()
     assert ACCT not in caplog.text
 
@@ -1298,15 +1304,24 @@ def _v250_module():
     blob = subprocess.check_output(
         ["git", "show", f"{_V250_SHA}:src/live/position_log.py"], cwd=root)
     fd, path = tempfile.mkstemp(suffix=".py")
-    os.write(fd, blob)
-    os.close(fd)
-    spec = importlib.util.spec_from_file_location("position_log_49268a0", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    source = inspect.getsource(module.PositionLedger.resume)
-    assert "last_record" in source and "bot_position_after" in source
-    _v250_module.module = module
-    return module
+    try:
+        os.write(fd, blob)
+        os.close(fd)
+        fd = None
+        spec = importlib.util.spec_from_file_location("position_log_49268a0", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = inspect.getsource(module.PositionLedger.resume)
+        assert "last_record" in source and "bot_position_after" in source
+        _v250_module.module = module
+        return module
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _v250_resume_position(path: str) -> int:
@@ -1381,8 +1396,7 @@ def test_issue_254_failed_anchor_keeps_the_order_for_the_same_process_fill(tmp_p
 
     led._append_line = fail_first
     led.register_order("gone", "exit", 1, 1, "TM0000")
-    assert "gone" not in led._orders
-    assert led._last_seq.get("exit", "") == ""
+    assert "gone" in led._orders and led._last_seq["exit"] == "gone"
     assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "ORDER"] == ["s1"]
 
     calls = {"n": 0}
@@ -1449,6 +1463,46 @@ def test_issue_254_failed_anchor_keeps_the_order_for_the_same_process_fill(tmp_p
     assert again._last_seq["exit"] == "s2"
     assert resumed["action"] == "RESUME" and resumed["bot_position_after"] == 0
     assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "FILL"] == ["s1", "s2"]
+
+
+def test_issue_254_failed_append_keeps_memory_and_the_next_fill_converges(tmp_path):
+    """A failed journal append does not freeze the in-memory book.
+
+    The order stays registered and the fill still moves position. The
+    next append that succeeds writes that cumulative own position. A
+    restart restores it once, and the fill whose line never landed is
+    not counted a second time.
+    """
+    led = _ledger(tmp_path)
+
+    def fail(_record):
+        return False
+
+    led._append_line = fail
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    assert "s1" in led._orders and led._last_seq["entry"] == "s1"
+    missed = led.record_fill("s1", 100, source="fill_poller", oi_generation=4)
+    assert missed is not None and missed["bot_position_after"] == 1
+    assert led.position == 1 and led._applied == {"s1"}
+    assert led.record_fill("s1", 105, source="deal", oi_generation=4) is None
+    assert led._pending[0]["fill_price"] == 105
+    assert led._pending[0]["price_source"] == "deal"
+    assert _events(tmp_path) == []
+
+    led._append_line = PositionLedger._append_line.__get__(led, PositionLedger)
+    led.register_order("s2", "exit", 1, 1, "TM0000")
+    landed = led.record_fill("s2", 90, source="deal", oi_generation=5)
+    assert landed["order_seq"] == "s2" and landed["bot_position_after"] == 0
+    assert led.position == 0
+    assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "FILL"] == ["s2"]
+
+    again = _reopen(tmp_path)
+    again.recover()
+    assert again.position == 0
+    assert again._applied == {"s1", "s2"}
+    assert [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "FILL"] == ["s2"]
+    again.recover()
+    assert again.position == 0 and again._applied == {"s1", "s2"}
 
 
 def test_issue_254_failed_read_can_be_retried(tmp_path, monkeypatch):
@@ -1671,6 +1725,92 @@ def test_issue_254_second_reconcile_does_not_replay(tmp_path):
     rb.BacktestApp._reconcile_resumed_guard(app, {}, "paper", "TX00")
     assert paper_led.position == 0 and paper_led._recovered is False
     assert [e for e in _events(tmp_path / "paper") if e.get("event") == "RESUME"] == []
+
+
+def test_issue_254_duplicate_fill_lines_replay_once(tmp_path):
+    """Two event:FILL lines for one seq move position once."""
+    path = tmp_path / POSITION_LOG_NAME
+    fill = {
+        "event": "FILL", "ts": "2026-11-05T20:00:00+08:00", "bot_id": "TMF00_alpha",
+        "account": ACCT, "product": "TM0000", "order_seq": "s1", "side": "BUY",
+        "qty": 1, "fill_price": 100, "price_source": "deal", "action": "ENTRY",
+        "net_position_after": None, "net_status": "pending", "bot_position_after": 1,
+        "oi_generation": 4,
+    }
+    path.write_text(
+        json.dumps(fill) + "\n" + json.dumps(fill) + "\n", encoding="utf-8")
+    led = _reopen(tmp_path)
+    led.recover()
+    assert led.position == 1
+    assert led._applied == {"s1"}
+    assert len(led._pending) == 1
+
+
+def test_issue_254_resumed_flat_exit_journals_the_saved_order(tmp_path, monkeypatch):
+    """An already-flat resumed exit confirms the saved order.
+
+    ``_position_log_resume`` runs before ``_arm_resumed_fill_poll``. The
+    poller confirms synchronously when the OI snapshot is flat, so the
+    registry has to be loaded first or the exit FILL is never written.
+    """
+    import run_backtest as rb
+    from src.live.fill_poller import FillPoller
+    from src.live.trading_guard import TradingGuard
+
+    led = _ledger(tmp_path)
+    led.register_order("s1", "entry", 0, 1, "TM0000")
+    led.record_fill("s1", 100, source="deal", oi_generation=4)
+    led.register_order("s2", "exit", 1, 1, "TM0000")
+    fresh = _reopen(tmp_path)
+
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", object())
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.live_log = SimpleNamespace(append=lambda *a, **k: None)
+    app._alerts = []
+    app._alert = lambda title, msg: app._alerts.append((title, msg))
+    guard = TradingGuard()
+    guard.reset()
+    app._trading_guard = guard
+    app._fill_poller = FillPoller(guard, timeout=10.0)
+    app._fill_poller.reset()
+    app._fill_poll_timer_id = None
+    app._futures_account = ACCT
+    app._position_ledger = fresh
+    app.root = SimpleNamespace(after=lambda *a, **k: None, after_cancel=lambda *a: None)
+    app._live_runner = SimpleNamespace(
+        symbol="TX00",
+        csv_logger=None,
+        strategy_display_name="probe",
+        broker=SimpleNamespace(
+            position_size=0,
+            position_side=None,
+            entry_bar_index=4,
+            trades=[SimpleNamespace(real_exit_price=90, exit_price=90)],
+            effective_entry_price=lambda: None,
+        ),
+    )
+    app._account_monitor = SimpleNamespace(
+        get_signed_position=lambda *a, **k: 0,
+        oi_snapshot_received=True,
+        oi_query_generation=6,
+        positions=[],
+    )
+    rb.BacktestApp._reconcile_resumed_guard(
+        app,
+        {"trading_guard": {
+            "fill_pending": True,
+            "fill_pending_type": "exit",
+            "deferred_close": None,
+        }},
+        "auto",
+        "TX00",
+    )
+    fills = [e["order_seq"] for e in _events(tmp_path) if e.get("event") == "FILL"]
+    assert fills == ["s1", "s2"]
+    assert fresh.position == 0 and fresh._applied == {"s1", "s2"}
+    exit_line = [e for e in _events(tmp_path) if e.get("event") == "FILL" and e["order_seq"] == "s2"]
+    assert len(exit_line) == 1 and exit_line[0]["bot_position_after"] == 0
 
 
 def test_issue_254_shared_opener_reads_the_bounded_tail(tmp_path):

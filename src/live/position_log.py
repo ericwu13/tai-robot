@@ -367,9 +367,9 @@ class PositionLedger:
                        oi_generation: int | None = None) -> None:
         """An order THIS bot sent was accepted (SendFutureOrderCLR code 0).
 
-        The ORDER line is appended before the registry is updated. A failed
-        append leaves the registry unchanged: a later restart must not
-        confirm an order that never became durable.
+        The registry is updated even when the append fails. The failure is
+        logged and is not an alert. A restart sees the order only if the
+        line was durable.
         """
         seq = str(seq or "").strip()
         if not seq or action_type not in _ACTIONS:
@@ -390,8 +390,7 @@ class PositionLedger:
             "qty": n,
             "oi_generation": generation,
         }
-        if not self._write(event):
-            return
+        self._write(event)
         self._orders[seq] = {
             "action": action_type, "side": side_code, "qty": n,
             "product": product, "oi_generation": generation,
@@ -405,10 +404,11 @@ class PositionLedger:
                     qty: int | None = None) -> dict | None:
         """Count one fill of our own order. Each seq counts once.
 
-        The fill line is appended before position moves. A deal row arriving
-        after the poller fallback already counted the seq only upgrades a
-        still-pending record's price, and only after that upgrade is itself
-        appended.
+        Position moves even when the append fails. The failure is logged
+        and is not an alert. A later fill that does land carries this
+        cumulative own position. A deal row arriving after the poller
+        fallback already counted the seq only upgrades a still-pending
+        record's price.
         """
         seq = str(seq or "").strip()
         order = self._orders.get(seq)
@@ -429,8 +429,7 @@ class PositionLedger:
             "bot_position_after": new_pos,
         }
         generation = _int_or_none(oi_generation)
-        if not self._write({**rec, "event": "FILL", "oi_generation": generation}):
-            return None
+        self._write({**rec, "event": "FILL", "oi_generation": generation})
         self.position = new_pos
         self._applied.add(seq)
         self._pending.append({**rec, "_gen": generation, "_at": self._mono()})
@@ -451,8 +450,7 @@ class PositionLedger:
                 "fill_price": price_i,
                 "price_source": "deal",
             }
-            if not self._write(event):
-                return
+            self._write(event)
             rec["fill_price"] = price_i
             rec["price_source"] = "deal"
             if self._legacy_anchor and self._legacy_anchor.get("order_seq") == seq:
