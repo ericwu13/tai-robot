@@ -1755,10 +1755,13 @@ const App = {
     $(chartId).hidden = points.length === 0;
     box.points = points; box.legendId = legendId;
     if (!points.length) { $(legendId).replaceChildren(); return; }
-    const anyReal = points.some((p) => p.real > 0);
+    // Solid line: both fill prices trusted (real > 0). The legend is wider —
+    // any real order, including estimated / unreliable / missing.
+    const hasRealLine = points.some((p) => p.real > 0);
+    const anyReal = points.some((p) => p.real + p.estimated + p.unreliable + p.missing > 0);
     box.anyReal = anyReal;
     box.sim.setData(points.map((p) => ({ time: p.session, value: p.sim_cumulative })));
-    box.real.setData(anyReal ? points.map((p) => ({ time: p.session, value: p.real_cumulative })) : []);
+    box.real.setData(hasRealLine ? points.map((p) => ({ time: p.session, value: p.real_cumulative })) : []);
     const marks = [];
     const cur = points.find((p) => p.is_current);
     // inBar: a marker above/below the line reserves margin, and on a short
@@ -1768,8 +1771,8 @@ const App = {
     if (selected && points.some((p) => p.session === selected)) marks.push({ time: selected,
       position: "inBar", shape: "square", size: 0.6, color: this.css("--warn"), text: "篩選中" });
     marks.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
-    (anyReal ? box.real : box.sim).setMarkers(marks);
-    (anyReal ? box.sim : box.real).setMarkers([]);
+    (hasRealLine ? box.real : box.sim).setMarkers(marks);
+    (hasRealLine ? box.sim : box.real).setMarkers([]);
     // A chart built inside a just-opened <details> has no width yet; fit on
     // the next frame, after layout.
     box.chart.timeScale().fitContent();
@@ -1784,6 +1787,7 @@ const App = {
     const excluded = pts.reduce((a, x) => a + x.estimated + x.unreliable + x.missing, 0);
     const kids = [
       el("span", { class: key ? "hover" : "" }, key ? `${p.session} 交易日` : `累計至 ${p.session}`),
+      el("span", { title: "自本次部署起：只含這次部署的 session.json，重新部署後從零開始" }, "自本次部署起"),
       el("span", null, el("span", { class: "sw sim" }), "模擬 ", signed(p.sim_cumulative),
         key ? el("span", null, "（該交易日 ", signed(p.sim_pnl), `，${p.trades} 筆）`) : null),
     ];
@@ -1796,7 +1800,7 @@ const App = {
       if (excluded) kids.push(el("span", { title: "估算、不可信、缺成交價的實單交易不畫在實單線上" },
         `未計入實單線：估算 ${pts.reduce((a, x) => a + x.estimated, 0)}・不可信 ${pts.reduce((a, x) => a + x.unreliable, 0)}・缺價 ${pts.reduce((a, x) => a + x.missing, 0)}`));
     } else {
-      kids.push(el("span", null, "無實單交易"));
+      kids.push(el("span", null, "無可確認成交價的實單"));
     }
     $(box.legendId).replaceChildren(...kids);
   },

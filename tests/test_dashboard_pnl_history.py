@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -207,3 +210,119 @@ def test_page_has_both_charts(pnl_server):
         page = r.read().decode("utf-8")
     assert 'id="f-pnl"' in page and 'id="d-pnl"' in page and "/pnl-history/" in page
     assert "今日" not in page
+
+
+def _method_body(name: str) -> str:
+    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+    m = re.search(rf"\n  {name}\(", html)
+    assert m, f"{name}() not found in index.html"
+    start = html.find("{", m.start())
+    depth = 0
+    for i in range(start, len(html)):
+        if html[i] == "{":
+            depth += 1
+        elif html[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start + 1:i]
+    raise AssertionError(f"{name}() body did not close")
+
+
+def _pnl_legend(points: list[dict]) -> dict:
+    """Run the shipped ``fillPnl`` + ``pnlHover`` under node and read the legend.
+
+    The chart library is stubbed. What comes back is the legend text and
+    whether the solid real series received points — the two decisions the
+    legend P3s are about.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node unavailable — cannot execute the page legend")
+    prog = (
+        "function el(tag, attrs, ...kids) {\n"
+        "  const titles = [];\n"
+        "  if (attrs && attrs.title) titles.push(attrs.title);\n"
+        "  const parts = [];\n"
+        "  for (const k of kids) {\n"
+        "    if (k == null || k === false) continue;\n"
+        "    if (typeof k === 'string' || typeof k === 'number') parts.push(String(k));\n"
+        "    else { parts.push(k.text || ''); if (k.titles) titles.push(...k.titles); }\n"
+        "  }\n"
+        "  return { text: parts.join(''), titles };\n"
+        "}\n"
+        "function signed(v) {\n"
+        "  const n = Math.round(Number(v) || 0);\n"
+        "  return { text: (n > 0 ? '+' : '') + String(n), titles: [] };\n"
+        "}\n"
+        "const nodes = {};\n"
+        "function $(id) {\n"
+        "  if (!nodes[id]) nodes[id] = { hidden: false, children: [],\n"
+        "    replaceChildren(...xs) { this.children = xs; } };\n"
+        "  return nodes[id];\n"
+        "}\n"
+        "const self = {\n"
+        "  css() { return '#888'; },\n"
+        f"  pnlHover(box, key) {{{_method_body('pnlHover')}\n}},\n"
+        f"  fillPnl(box, points, legendId, emptyId, chartId, selected) {{{_method_body('fillPnl')}\n}},\n"
+        "};\n"
+        "globalThis.requestAnimationFrame = () => 0;\n"
+        "const points = JSON.parse(process.argv[1]);\n"
+        "const series = () => ({ data: null, markers: null,\n"
+        "  setData(d) { this.data = d; }, setMarkers(m) { this.markers = m; } });\n"
+        "const box = { sim: series(), real: series(),\n"
+        "  chart: { timeScale() { return { fitContent() {} }; } } };\n"
+        "self.fillPnl(box, points, 'legend', 'empty', 'chart', null);\n"
+        "const kids = nodes.legend.children || [];\n"
+        "console.log(JSON.stringify({\n"
+        "  realPoints: (box.real.data || []).length,\n"
+        "  realMarkers: (box.real.markers || []).length,\n"
+        "  simMarkers: (box.sim.markers || []).length,\n"
+        "  text: kids.map((k) => k.text).join('\\n'),\n"
+        "  titles: kids.flatMap((k) => k.titles || []),\n"
+        "}));\n"
+    )
+    run = subprocess.run([node, "-e", prog, json.dumps(points)],
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def _legend_point(**over) -> dict:
+    point = {
+        "session": "2026-11-04", "sim_cumulative": 1000, "real_cumulative": 0,
+        "real_est_cumulative": 0, "sim_pnl": 1000, "real_pnl": 0, "real_est_pnl": 0,
+        "trades": 1, "real": 0, "estimated": 0, "unreliable": 0, "missing": 0,
+        "is_current": True,
+    }
+    point.update(over)
+    return point
+
+
+def test_pnl_legend_says_cumulative_is_since_this_deploy():
+    """The 累計 label is this deploy's session.json, not the bot's whole life."""
+    got = _pnl_legend([_legend_point(real=1, real_cumulative=1000, real_est_cumulative=1000)])
+    shown = got["text"] + " " + " ".join(got["titles"])
+    assert "自本次部署起" in shown
+
+
+@pytest.mark.parametrize("counts, solid_line, phrase", [
+    ({"real": 2, "real_cumulative": 400, "real_est_cumulative": 400}, True, "實單 "),
+    ({"estimated": 1, "real_est_cumulative": 80}, False, "含估算"),
+    ({"unreliable": 1}, False, "未計入實單線"),
+    ({"missing": 1}, False, "未計入實單線"),
+    ({}, False, "無可確認成交價的實單"),
+])
+def test_pnl_legend_keys_on_any_real_fill_not_only_trusted_prices(counts, solid_line, phrase):
+    """Estimated / unreliable / missing fills are real orders with no trusted price.
+
+    The solid line stays gated on ``real > 0``. The legend keys on
+    real + estimated + unreliable + missing, and a bot with none of those
+    says so as unconfirmable fills rather than 「無實單交易」.
+    """
+    got = _pnl_legend([_legend_point(**counts)])
+    assert (got["realPoints"] > 0) is solid_line
+    assert (got["realMarkers"] > 0) is solid_line
+    assert phrase in got["text"]
+    if not solid_line:
+        assert "無實單交易" not in got["text"]
