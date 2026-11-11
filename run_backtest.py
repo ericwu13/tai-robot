@@ -525,13 +525,7 @@ def loss_limit_for_gui_resume(session: dict | None, default: str) -> str:
 
 
 def _load_settings():
-    cfg = {
-        "user_id": "",
-        "password": "",
-        "authority_flag": 0,
-        # Code default only. Not read from settings.yaml.
-        "broker_mode": DEFAULT_BROKER_MODE,
-    }
+    cfg = {"user_id": "", "password": "", "authority_flag": 0}
     # Check user-writable project_root first, then parent dir (for dist/), then bundle
     search_paths = [
         os.path.join(project_root, "settings.yaml"),
@@ -1119,13 +1113,28 @@ def _live_com_call(name, fn, *args, **kwargs):
     return call_com(name, fn, *args, **kwargs)
 
 
+def _app_broker_credentials() -> tuple[str, str]:
+    """The app port does not log in. The link machine has its own port.
+
+    Raising means ``_broker.login()`` cannot send empty credentials.
+    Process-start login uses ``login_set_quote`` and never calls this.
+    """
+    raise RuntimeError(
+        "the app broker has no credentials; "
+        "process-start login uses login_set_quote")
+
+
 def _build_inprocess_broker() -> ComBrokerPort:
-    """The one in-process port. ``broker_mode`` other than inprocess raises."""
+    """The one in-process port. ``broker_mode`` other than inprocess raises.
+
+    The mode is the code constant. ``_load_settings`` does not store it,
+    and settings.yaml is not read for it.
+    """
     require_inprocess(DEFAULT_BROKER_MODE)
     return ComBrokerPort(
         call=_live_com_call,
         libs=_live_com_libs,
-        credentials=lambda: ("", ""),
+        credentials=_app_broker_credentials,
         on_subscribe=lambda: None,
         on_reconcile=lambda: None,
         on_release=lambda: None,

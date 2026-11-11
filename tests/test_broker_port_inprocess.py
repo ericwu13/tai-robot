@@ -165,7 +165,7 @@ def test_broker_mode_default_is_inprocess_and_other_modes_raise():
     text = (ROOT / "run_backtest.py").read_text(encoding="utf-8")
     assert 'get("broker_mode"' not in text
     assert ".get('broker_mode'" not in text
-    assert '"broker_mode": DEFAULT_BROKER_MODE' in text
+    assert "require_inprocess(DEFAULT_BROKER_MODE)" in text
 
 
 def test_app_login_methods_match_today_and_skip_reconnect_log():
@@ -446,6 +446,132 @@ def test_kline_data_stays_inline_and_complete_uses_root_after(monkeypatch):
     assert ident == threading.get_ident()
 
 
+def _name_list(node: ast.AST) -> list[str | None] | None:
+    """Names in a plain Name or a tuple/list of Names. None if not plain."""
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        names: list[str | None] = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Name):
+                names.append(elt.id)
+            else:
+                names.append(None)
+        return names
+    return None
+
+
+def _plain_bindings(tree: ast.AST) -> list[tuple[str, str, int]]:
+    """``(target, rhs, lineno)`` for plain name-to-name assignments."""
+    bindings: list[tuple[str, str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            rhs = _name_list(node.value)
+            if rhs is None:
+                continue
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                and len(rhs) > 1
+            ):
+                targets = _name_list(node.targets[0])
+                if targets is not None and len(targets) == len(rhs):
+                    for target, source in zip(targets, rhs):
+                        if target and source:
+                            bindings.append((target, source, node.lineno))
+                continue
+            if len(rhs) == 1 and rhs[0]:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bindings.append((target.id, rhs[0], node.lineno))
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Name)
+        ):
+            bindings.append((node.target.id, node.value.id, node.lineno))
+    return bindings
+
+
+def _alias_names(bindings: list[tuple[str, str, int]]) -> set[str]:
+    """Names bound, directly or through another alias, to skC/skQ/skR/skO."""
+    aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for target, source, _lineno in bindings:
+            if target in _SK_NAMES:
+                continue
+            if source in _SK_NAMES or source in aliases:
+                if target not in aliases:
+                    aliases.add(target)
+                    changed = True
+    return aliases
+
+
+class _CallComVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.stack: list[str] = []
+        self.calls: list[tuple[int, str | None]] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.stack.append(node.name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name) and node.func.id == "call_com":
+            owner = self.stack[-1] if self.stack else None
+            self.calls.append((node.lineno, owner))
+        self.generic_visit(node)
+
+
+def com_seam_offenders(source: str, relpath: str) -> list[str]:
+    """SKCOM seam violations in one source file.
+
+    Flags attribute access and getattr() on skC/skQ/skR/skO and on any
+    plain alias of those names, the alias assignment itself, and — in
+    run_backtest.py only — call_com() outside ``_live_com_call``.
+    """
+    offenders: list[str] = []
+    tree = ast.parse(source, filename=relpath)
+    bindings = _plain_bindings(tree)
+    aliases = _alias_names(bindings)
+    watched = _SK_NAMES | aliases
+    for target, source_name, lineno in bindings:
+        if source_name in _SK_NAMES or source_name in aliases:
+            offenders.append(
+                f"{relpath}:{lineno} alias {target} = {source_name}")
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in watched
+        ):
+            offenders.append(
+                f"{relpath}:{node.lineno} {node.value.id}.{node.attr}")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in watched
+        ):
+            offenders.append(
+                f"{relpath}:{node.lineno} getattr({node.args[0].id}, ...)")
+    if relpath.replace("\\", "/").endswith("run_backtest.py"):
+        visitor = _CallComVisitor()
+        visitor.visit(tree)
+        for lineno, owner in visitor.calls:
+            if owner != "_live_com_call":
+                offenders.append(
+                    f"{relpath}:{lineno} call_com() outside _live_com_call")
+    return offenders
+
+
 def test_no_sk_attribute_access_outside_the_adapter():
     """skC / skQ / skR / skO attribute access lives only in the COM adapter."""
     offenders = []
@@ -455,21 +581,63 @@ def test_no_sk_attribute_access_outside_the_adapter():
         rel = path.relative_to(ROOT).as_posix()
         if rel == _ADAPTER:
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in _SK_NAMES
-            ):
-                offenders.append(f"{rel}:{node.lineno} {node.value.id}.{node.attr}")
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "getattr"
-                and node.args
-                and isinstance(node.args[0], ast.Name)
-                and node.args[0].id in _SK_NAMES
-            ):
-                offenders.append(f"{rel}:{node.lineno} getattr({node.args[0].id}, ...)")
+        offenders.extend(com_seam_offenders(path.read_text(encoding="utf-8"), rel))
     assert offenders == []
+
+
+def test_lint_rejects_alias_and_call_com_outside_the_wrapper():
+    """An alias of skQ plus call_com() outside _live_com_call must fail the lint.
+
+    The planted source is only this string. It is not written into the repo.
+    """
+    planted = (
+        "def sneak():\n"
+        "    _q = skQ\n"
+        "    return call_com('IsConnected', _q.SKQuoteLib_IsConnected)\n"
+    )
+    offenders = com_seam_offenders(planted, "run_backtest.py")
+    text = "\n".join(offenders)
+    assert "_q" in text
+    assert "call_com" in text
+    wrapper = (
+        "def _live_com_call(name, fn, *args, **kwargs):\n"
+        "    return call_com(name, fn, *args, **kwargs)\n"
+    )
+    assert com_seam_offenders(wrapper, "run_backtest.py") == []
+
+
+def test_app_broker_login_cannot_send_empty_credentials(monkeypatch):
+    """_broker.login() must not send ('', '') and must not reach call_com."""
+    sent = []
+
+    class _Center:
+        def SKCenterLib_LoginSetQuote(self, user, password, flag):
+            sent.append((user, password, flag))
+            return 0
+
+    monkeypatch.setattr(rb, "skC", _Center())
+    with pytest.raises(RuntimeError, match="credentials"):
+        rb._broker.login()
+    assert sent == []
+    assert rb._broker.login_set_quote("user", "pw", "Y") == 0
+    assert sent == [("user", "pw", "Y")]
+
+
+def test_load_settings_does_not_store_an_unread_broker_mode():
+    text = (ROOT / "run_backtest.py").read_text(encoding="utf-8")
+    start = text.find("def _load_settings(")
+    end = text.find("\ndef ", start + 1)
+    assert start != -1 and end != -1
+    assert "broker_mode" not in text[start:end]
+    assert "require_inprocess(DEFAULT_BROKER_MODE)" in text
+
+
+def test_port_docstring_says_queue_puts_run_on_event_callbacks():
+    doc = ast.get_docstring(ast.parse(
+        (ROOT / "src/live/com_broker_port.py").read_text(encoding="utf-8")))
+    assert doc is not None
+    assert "enqueue_ui" in doc
+    assert "enqueue_tick" in doc
+    lowered = doc.lower()
+    assert "callback" in lowered
+    assert "not only" in lowered or "not all" in lowered

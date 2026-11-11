@@ -1,8 +1,14 @@
 """COM ``BrokerPort`` for the live link machine and the in-process app.
 
-Runs on the thread that owns the COM objects (Tk main / headless STA).
-The machine calls the reconnect methods from ``tick`` only. Event
+Reconnect methods run on the thread that owns the COM objects (Tk main /
+headless STA). The machine calls them from ``tick`` only. Event
 handlers must not call those.
+
+``enqueue_ui`` and ``enqueue_tick`` are not only for that thread. They
+are the ``put_nowait`` calls the COM event callbacks already made, and
+those callbacks are not all on the owning thread: tick callbacks and
+``OnConnection`` run on a COM thread. ``schedule_on_main`` is
+``root.after`` from the K-line callback, on the thread that received it.
 
 ``leave_monitor`` is user shutdown only (§4-4-1). ``logout`` and
 ``restart_process`` raise. The reconnect path must not call them, and
