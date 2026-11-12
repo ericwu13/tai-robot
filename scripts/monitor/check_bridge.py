@@ -75,7 +75,12 @@ def _check_votes(now, paths, tonight_key, lines, findings):
         lines.append(
             f"  {st.source}: {vote_chip(st)} | last_check "
             f"{st.last_check or '-'} | {st.context or '-'}")
-        if st.stale:
+        if st.source == "W3" and st.fetch_failing:
+            findings.append(Finding(
+                "P2", "bridge",
+                f"W3 every feed failed ×{st.fetch_error_streak}: {st.error}",
+                paths["rss_state_file"]))
+        elif st.stale:
             findings.append(Finding(
                 "P2", "bridge",
                 f"{st.source} bridge stale (last_check {st.last_check or '?'}, "
@@ -89,6 +94,12 @@ def _check_votes(now, paths, tonight_key, lines, findings):
                 f"{st.source} alive but scoring failing for {st.error_streak} "
                 f"run(s): {st.error}",
                 paths["rss_state_file"]))   # only W3 reports failing
+        elif st.source == "W3" and st.degraded:
+            total = st.feeds_ok + st.feeds_failed
+            findings.append(Finding(
+                "P3", "bridge",
+                f"W3 degraded {st.feeds_failed}/{total} feeds failing ({st.hosts})",
+                paths["rss_state_file"]))
         elif not st.known:
             findings.append(Finding(
                 "P3", "bridge",

@@ -158,8 +158,25 @@ def test_no_log_path_writes_nothing(mock_score, mock_feeds, tmp_path, monkeypatc
 def test_fetch_feed_keeps_link_and_publisher():
     entry = {"id": "g1", "title": "T", "summary": "S", "link": "https://pub.example/1",
              "source": {"title": "Reuters"}, "published_parsed": (2026, 8, 4, 11, 0, 0, 0, 0, 0)}
-    fake = SimpleNamespace(entries=[entry], feed={"title": "Google News"})
-    with patch.dict(sys.modules, {"feedparser": SimpleNamespace(parse=lambda *a, **k: fake)}):
+    fake = SimpleNamespace(entries=[entry], feed={"title": "Google News"}, bozo=0)
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b"<rss/>"
+
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    with patch.dict(sys.modules, {"feedparser": SimpleNamespace(parse=lambda *a, **k: fake)}), \
+         patch.object(rss_scorer.urllib.request, "urlopen", return_value=_Resp()):
         [art] = rss_scorer.fetch_feed("https://news.google.com/rss")
     assert art["link"] == "https://pub.example/1" and art["source"] == "Reuters"
 

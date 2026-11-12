@@ -32,6 +32,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -65,6 +66,12 @@ class SourceStatus:
     failing: bool = False       # alive but its last scoring attempt failed (W3)
     error: str = ""             # that failure, e.g. "HTTP 404: model not found"
     error_streak: int = 0       # consecutive failed scoring runs
+    fetch_failing: bool = False # every W3 feed failed, or W4's fetch failed
+    degraded: bool = False      # W3 scored, but at least one feed failed
+    fetch_error_streak: int = 0
+    feeds_ok: int = 0
+    feeds_failed: int = 0
+    hosts: str = ""             # hosts of the feeds that failed (W3 degraded)
 
 
 @dataclass
@@ -182,7 +189,51 @@ def _w3_status(rss_state_file: str, now: datetime, read_json=_read_json) -> Sour
         if since:
             warn += f" (last {since})"
         st.context = f"{warn} — {st.context}" if st.context else warn
+    if state:
+        _apply_w3_fetch(st, state)
     return st
+
+
+def _feed_hosts(errors) -> str:
+    hosts = []
+    for item in errors or []:
+        if not isinstance(item, dict):
+            continue
+        host = urlparse(str(item.get("url") or "")).hostname or ""
+        if host and host not in hosts:
+            hosts.append(host)
+    return ", ".join(hosts)
+
+
+def _apply_w3_fetch(st: SourceStatus, state: dict) -> None:
+    """Surface a total or partial RSS fetch failure. Gemini's error_streak
+    is a different counter and is not read here."""
+    status = str(state.get("fetch_status") or "")
+    errors = state.get("last_feed_errors") if isinstance(state.get("last_feed_errors"), list) else []
+    if status == "failed":
+        streak = state.get("fetch_error_streak")
+        if not isinstance(streak, int) or isinstance(streak, bool) or streak < 1:
+            streak = 1
+        message = "fetch failed"
+        if errors and isinstance(errors[0], dict):
+            message = str(errors[0].get("message") or errors[0].get("kind") or message)[:200]
+        st.fetch_failing = True
+        st.fetch_error_streak = streak
+        st.error = message
+        warn = f"⚠ 來源全失敗 every feed failed ×{streak}: {message}"
+        st.context = f"{warn} — {st.context}" if st.context else warn
+        return
+    if status != "degraded":
+        return
+    ok = state.get("feeds_ok")
+    failed = state.get("feeds_failed")
+    st.feeds_ok = ok if isinstance(ok, int) and not isinstance(ok, bool) else 0
+    st.feeds_failed = failed if isinstance(failed, int) and not isinstance(failed, bool) else 0
+    st.hosts = _feed_hosts(errors)
+    st.degraded = True
+    total = st.feeds_ok + st.feeds_failed
+    warn = f"⚠ 部分來源 degraded {st.feeds_failed}/{total} feeds failing ({st.hosts})"
+    st.context = f"{warn} — {st.context}" if st.context else warn
 
 
 def _w4_status(regime_vote_path: str, now: datetime, read_json=_read_json) -> SourceStatus:

@@ -1,7 +1,7 @@
 """W3 RSS+Gemini news scorer — sentiment-weighted regime votes.
 
 Standalone bridge script (no n8n dependency).  Fetches public RSS feeds,
-filters to articles from the last 2 hours, scores each headline+summary
+filters to articles from the last 4 hours, scores each headline+summary
 via Gemini (see GEMINI_MODEL), aggregates a net sentiment score into an
 EMA (exponential moving average) with a 2-hour half-life, and when the
 EMA total exceeds SESSION_VOTE_THRESHOLD writes a ``regime_vote.json``
@@ -34,9 +34,7 @@ dashboard's 新聞訊號 view replaces the per-run embed.
 Settings block (in settings.yaml under ``news``)::
 
     news:
-      rss_feeds:
-        - https://technews.tw/feed/
-        - ...
+      rss_feeds:                 # empty = DEFAULT_FEEDS
       rss_interval_minutes: 30
       rss_state_file: data/rss_scorer_state.json
       rss_news_log: ""   # per-article JSONL history; empty = <state dir>/news/news_log.jsonl
@@ -99,10 +97,12 @@ DEFAULT_FEEDS = [
     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
     "https://feeds.bloomberg.com/markets/news.rss",
     "https://feeds.marketwatch.com/marketwatch/topstories",
-    "https://finance.yahoo.com/news/rssindex",
     "https://www.investing.com/rss/news.rss",
     # ── Taiwan / Asia ───────────────────────────────────────────────────
-    "https://technews.tw/feed/",
+    # Yahoo US rssindex 404s and TechNews is dead. MoneyDJ stays out.
+    "https://tw.stock.yahoo.com/rss?category=tw-market",
+    "https://news.cnyes.com/rss/v1/news/category/tw_stock",
+    "https://www.taifex.com.tw/cht/11/RSS1",
     "https://news.google.com/rss/topics/CAAqJQgKIh9DQkFTRVFvSUwyMHZNRFptTXpJU0JYcG9MVlJYS0FBUAE?hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
     "https://news.google.com/rss/search?q=TSMC+OR+%E5%8F%B0%E7%A9%8D%E9%9B%BB&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
     "https://news.google.com/rss/search?q=%E5%8F%B0%E8%82%A1+OR+TAIEX+OR+%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
@@ -132,6 +132,33 @@ Rules:
 Headline: {headline}
 Summary: {summary}
 """
+
+# Appended only for items tagged as the TAIFEX exchange feed. The base
+# prompt above is what every other source sees; do not fold this into it.
+TAIFEX_ADMIN_RULE = (
+    "\nAdditional rule for this item only (its source is the TAIFEX exchange feed): "
+    "exchange administrative notices (settlement prices, calendars, routine circulars) "
+    "score neutral at low confidence. Market-wide margin hikes or trading halts are "
+    "scored by their market impact.\n"
+)
+FEED_TIMEOUT_S = 20
+
+
+def scoring_prompt(headline: str, summary: str, source: str = "") -> str:
+    """Prompt for one article. The TAIFEX rule is added only for that feed."""
+    prompt = SCORING_PROMPT.format(headline=headline, summary=(summary or "")[:500])
+    if str(source or "").strip().lower() == "taifex":
+        return prompt + TAIFEX_ADMIN_RULE
+    return prompt
+
+
+class FeedFetchError(Exception):
+    """One feed could not be fetched or parsed. ``kind`` is network, timeout, http, or bozo."""
+
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        self.message = message
+        super().__init__(f"{kind}: {message}")
 
 
 # ── Settings loading ─────────────────────────────────────────────────────
@@ -188,46 +215,158 @@ def discord_mode(value) -> str:
 
 # ── RSS fetching ─────────────────────────────────────────────────────────
 
-def fetch_feed(url: str) -> list[dict]:
-    """Fetch and parse one RSS feed.  Returns list of article dicts.
+def _feed_tag(url: str) -> str:
+    """Source marker for prompt rules. Only the TAIFEX feed is tagged."""
+    return "taifex" if "taifex.com" in str(url).lower() else ""
 
-    Each dict has keys: guid, title, summary, published_dt (datetime, UTC),
-    link, source (publisher name for the news history).
+
+def _entry_guid(entry) -> str:
+    """GUID for dedup. An entry with no id uses ``link|title``.
+
+    TAIFEX RSS1 has no ``<guid>`` and several notices share a link, so a
+    link-only id drops every later settlement or margin notice as already
+    seen. Investing.com is also id-less and is re-scored once.
     """
+    raw = entry.get("id")
+    if isinstance(raw, str):
+        raw = raw.strip()
+    else:
+        raw = ""
+    if raw:
+        return raw
+    link = str(entry.get("link") or "").strip()
+    title = str(entry.get("title") or "").strip()
+    if link or title:
+        return f"{link}|{title}"
+    return ""
+
+
+def _is_timeout(exc: BaseException | None) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timed out" in str(exc or "").lower()
+
+
+def _download_feed(url: str) -> bytes:
+    """GET one feed. Raises FeedFetchError on transport errors and HTTP >= 400."""
+    req = urllib.request.Request(url, headers=_UA)
+    try:
+        with urllib.request.urlopen(req, timeout=FEED_TIMEOUT_S) as resp:
+            status = getattr(resp, "status", None)
+            if status is None:
+                status = resp.getcode()
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise FeedFetchError("http", f"HTTP {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        kind = "timeout" if _is_timeout(reason) else "network"
+        text = str(reason if reason is not None else exc)
+        raise FeedFetchError(kind, text) from exc
+    except TimeoutError as exc:
+        raise FeedFetchError("timeout", str(exc)) from exc
+    except OSError as exc:
+        kind = "timeout" if _is_timeout(exc) else "network"
+        raise FeedFetchError(kind, str(exc)) from exc
+    if isinstance(status, int) and status >= 400:
+        raise FeedFetchError("http", f"HTTP {status}")
+    if isinstance(body, str):
+        body = body.encode("utf-8", errors="replace")
+    return body or b""
+
+
+def _parse_feed_bytes(url: str, body: bytes) -> list[dict]:
+    """Parse feed bytes. Bozo with zero entries is a failure; a quiet feed is not."""
     import feedparser
-    feed = feedparser.parse(url, request_headers=_UA)
+    feed = feedparser.parse(body)
+    entries = list(getattr(feed, "entries", None) or [])
+    if getattr(feed, "bozo", 0) and not entries:
+        exc = getattr(feed, "bozo_exception", None)
+        raise FeedFetchError("bozo", str(exc) if exc else "unparseable feed")
     feed_title = (getattr(feed, "feed", None) or {}).get("title", "")
+    tag = _feed_tag(url)
     articles = []
-    for entry in feed.entries:
+    for entry in entries:
         pub = entry.get("published_parsed") or entry.get("updated_parsed")
         if pub is None:
             continue
         import calendar
         pub_dt = datetime.fromtimestamp(calendar.timegm(pub), tz=timezone.utc)
-        guid = entry.get("id") or entry.get("link") or entry.get("title", "")
         articles.append({
-            "guid": guid,
+            "guid": _entry_guid(entry),
             "title": entry.get("title", ""),
             "summary": entry.get("summary", ""),
             "published_dt": pub_dt,
             "link": entry.get("link", ""),
             "source": rss_news_log.source_name(entry.get("source"), feed_title, url),
+            "feed_tag": tag,
         })
     return articles
 
 
-def fetch_all_feeds(feed_urls: list[str], max_age_hours: float = ARTICLE_MAX_AGE_HOURS) -> list[dict]:
-    """Fetch all feeds, filter to recent articles, return combined list."""
+def fetch_feed(url: str) -> list[dict]:
+    """Fetch and parse one RSS feed.  Returns list of article dicts.
+
+    Each dict has keys: guid, title, summary, published_dt (datetime, UTC),
+    link, source (publisher name for the news history), feed_tag
+    (``"taifex"`` only for the TAIFEX feed).
+
+    Raises FeedFetchError on DNS, connection, timeout, HTTP >= 400, or a
+    bozo parse with zero entries. A 2xx body that parses to nothing is an
+    empty list, not an error.
+    """
+    return _parse_feed_bytes(url, _download_feed(url))
+
+
+def _fetch_status_name(ok: int, failed: int) -> str:
+    if failed and ok == 0:
+        return "failed"
+    if failed:
+        return "degraded"
+    return "ok"
+
+
+def fetch_all_feeds(feed_urls: list[str], max_age_hours: float = ARTICLE_MAX_AGE_HOURS,
+                    stats: dict | None = None) -> list[dict]:
+    """Fetch all feeds, filter to recent articles, return combined list.
+
+    Signature and return value are unchanged so callers that patch this
+    function keep working. Pass ``stats`` to receive ``feeds_ok``,
+    ``feeds_failed``, ``errors`` (at most 5) and ``status``
+    (``ok`` / ``degraded`` / ``failed``). A 2xx feed with nothing recent
+    counts as ok.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     all_articles = []
+    ok = failed = 0
+    errors: list[dict] = []
     for url in feed_urls:
         try:
             articles = fetch_feed(url)
-            recent = [a for a in articles if a["published_dt"] >= cutoff]
-            print(f"  [{url[:60]}...] {len(recent)}/{len(articles)} recent")
-            all_articles.extend(recent)
-        except Exception as e:  # noqa: BLE001
-            print(f"  [{url[:60]}...] fetch failed: {type(e).__name__}: {e}")
+        except FeedFetchError as exc:
+            failed += 1
+            if len(errors) < 5:
+                errors.append({"url": url, "kind": exc.kind, "message": str(exc.message)[:200]})
+            print(f"  [{url[:60]}...] fetch failed: {exc.kind}: {exc.message}")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            if len(errors) < 5:
+                errors.append({
+                    "url": url, "kind": "error",
+                    "message": f"{type(exc).__name__}: {exc}"[:200],
+                })
+            print(f"  [{url[:60]}...] fetch failed: {type(exc).__name__}: {exc}")
+            continue
+        recent = [a for a in articles if a["published_dt"] >= cutoff]
+        ok += 1
+        print(f"  [{url[:60]}...] {len(recent)}/{len(articles)} recent")
+        all_articles.extend(recent)
+    if isinstance(stats, dict):
+        stats["feeds_ok"] = ok
+        stats["feeds_failed"] = failed
+        stats["errors"] = errors
+        stats["status"] = _fetch_status_name(ok, failed)
     return all_articles
 
 
@@ -291,9 +430,15 @@ class GeminiAPIError(Exception):
         super().__init__(f"HTTP {status}: {message}" if status else message)
 
 
-def score_article(headline: str, summary: str, api_key: str) -> dict | None:
-    """Call Gemini to score one article.  Returns parsed JSON or None."""
-    prompt = SCORING_PROMPT.format(headline=headline, summary=summary[:500])
+def score_article(headline: str, summary: str, api_key: str,
+                  source: str = "") -> dict | None:
+    """Call Gemini to score one article.  Returns parsed JSON or None.
+
+    ``source`` is the feed tag (``"taifex"`` or ``""``). Only a TAIFEX item
+    gets the administrative-notice rule; every other source uses
+    SCORING_PROMPT unchanged.
+    """
+    prompt = scoring_prompt(headline, summary, source)
     url = GEMINI_API_URL.format(model=GEMINI_MODEL, key=api_key)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
@@ -344,8 +489,15 @@ def score_articles(articles: list[dict], api_key: str) -> tuple[list[dict], list
     scored_guids = []
     api_error = None
     for art in articles:
+        title = art.get("title") or ""
+        summary = art.get("summary") or ""
+        # TAIFEX repeats the title as the description. An empty summary
+        # keeps the model on the headline instead of scoring the echo.
+        if summary.strip() == title.strip():
+            summary = ""
         try:
-            score = score_article(art["title"], art["summary"], api_key)
+            score = score_article(title, summary, api_key,
+                                  source=str(art.get("feed_tag") or ""))
         except GeminiAPIError as exc:
             api_error = str(exc)
             print(f"    [API ERROR] {exc} — aborting remaining articles")
@@ -627,6 +779,53 @@ def notify_transitions(state: dict, mode: str, post, *, api_error: str | None,
             state["vote_notified"] = vote_key
 
 
+def _apply_fetch_stats(state: dict, stats: dict, now: datetime) -> None:
+    """Persist the fetch outcome. Does not touch the Gemini error_streak."""
+    status = stats.get("status")
+    if status not in ("ok", "degraded", "failed"):
+        return
+    state["fetch_status"] = status
+    state["feeds_ok"] = int(stats.get("feeds_ok") or 0)
+    state["feeds_failed"] = int(stats.get("feeds_failed") or 0)
+    state["last_feed_errors"] = list(stats.get("errors") or [])[:5]
+    if status == "failed":
+        state["fetch_error_streak"] = int(state.get("fetch_error_streak") or 0) + 1
+    else:
+        state["fetch_error_streak"] = 0
+        state["last_fetch_ok_at"] = now.isoformat(timespec="seconds")
+
+
+def _feed_error_brief(errors) -> str:
+    parts = []
+    for item in errors or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind") or "error"
+        message = item.get("message") or ""
+        parts.append(f"{kind}: {message}" if message else str(kind))
+    return "; ".join(parts)
+
+
+def _notify_fetch_failure(cfg: dict, state: dict, stats: dict) -> None:
+    """Discord errors/changes/all: one notice, worded as a fetch failure."""
+    mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
+    if mode == "off" or state.get("fetch_fail_notified"):
+        return
+    n_fail = int(stats.get("feeds_failed") or 0)
+    note = f"Fetch failed — all {n_fail} feeds failed: {_feed_error_brief(stats.get('errors'))}"
+    if post_discord_embed(cfg.get("discord_webhook_url") or "", None, 0.0, [], note=note):
+        state["fetch_fail_notified"] = True
+
+
+def _notify_fetch_recovery(cfg: dict, state: dict) -> None:
+    mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
+    if mode == "off" or not state.get("fetch_fail_notified"):
+        return
+    if post_discord_embed(cfg.get("discord_webhook_url") or "", None, 0.0, [],
+                          note="✅ RSS fetch recovered"):
+        state["fetch_fail_notified"] = False
+
+
 def check_once(cfg: dict, state: dict, vote_out: str,
                now: datetime | None = None) -> dict:
     """One RSS scoring pass.  Returns updated state.
@@ -649,7 +848,22 @@ def check_once(cfg: dict, state: dict, vote_out: str,
         return state
     state["weekend_pause_notified"] = False
 
-    articles = fetch_all_feeds(cfg["feeds"])
+    fetch_stats: dict = {}
+    articles = fetch_all_feeds(cfg["feeds"], stats=fetch_stats)
+    if fetch_stats.get("status"):
+        _apply_fetch_stats(state, fetch_stats, now)
+    if fetch_stats.get("status") == "failed":
+        # Nothing was fetched. Leave the session EMA, peak, seen list and
+        # any standing vote exactly as they were. Gemini's error_streak
+        # is not a fetch counter and is left alone.
+        state["last_check"] = now.isoformat(timespec="seconds")
+        _notify_fetch_failure(cfg, state, fetch_stats)
+        print(f"  all {fetch_stats.get('feeds_failed', 0)} feeds failed "
+              f"— session and vote left unchanged")
+        return state
+    if fetch_stats.get("status") in ("ok", "degraded"):
+        _notify_fetch_recovery(cfg, state)
+
     new_articles = dedup_articles(articles, state)
     print(f"  {len(articles)} recent articles, {len(new_articles)} new")
     state["last_fetched"] = len(articles)
@@ -837,7 +1051,11 @@ def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str) -> di
                       f"new {state.get('last_new', '-')} | "
                       f"scored {state.get('last_articles_scored', 0)} | "
                       f"net {float(state.get('session_net') or 0):+.2f}")
-        if int(state.get("error_streak") or 0) > before:
+        if state.get("fetch_status") == "failed":
+            n_fail = int(state.get("feeds_failed") or 0)
+            brief = _feed_error_brief(state.get("last_feed_errors"))
+            run.fail(f"all {n_fail} feeds failed: {brief}".rstrip(": "))
+        elif int(state.get("error_streak") or 0) > before:
             run.fail(str(state.get("last_error") or "scoring failed"))
     return state
 
