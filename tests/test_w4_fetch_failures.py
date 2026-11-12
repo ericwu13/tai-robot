@@ -414,6 +414,44 @@ def test_non_json_200_is_a_fetch_failure(tmp_path, monkeypatch):
     assert "no taifex data" not in log.lower()
 
 
+@pytest.mark.parametrize("body", [b"", b" \n\t"])
+def test_empty_200_on_taifex_keeps_vote_and_exits_nonzero(tmp_path, monkeypatch, body):
+    """A zero-byte or whitespace-only 200 is a fetch failure, not no-data."""
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Body(body))
+    assert chips.run_once(base, None, _AT_0415) != 0
+    assert vote.read_bytes() == before
+    assert not chips.load_state(chips.state_path_for(base)).get("last_decided_date")
+    log = _log(base)
+    assert "fetch failed" in log.lower()
+    assert "no taifex data" not in log.lower()
+
+
+@pytest.mark.parametrize("body", [b"", b" \n\t"])
+def test_empty_200_on_twse_keeps_vote_and_exits_nonzero(tmp_path, monkeypatch, body):
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    chips.save_state(chips.state_path_for(base), {"history": {"20260813": 0.0}})
+    row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "8,123"}
+
+    def fake(req, timeout=None, context=None):
+        if "twse.com.tw" in req.full_url:
+            return _Body(body)
+        return _Body(json.dumps([row]).encode())
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, "20260814", _FRIDAY) != 0
+    assert vote.read_bytes() == before
+    assert chips.load_state(chips.state_path_for(base)).get("last_decided_date") != "20260814"
+    log = _log(base)
+    assert "fetch failed" in log.lower()
+    assert "no taifex data" not in log.lower()
+
+
 def test_empty_json_200_is_still_no_data(tmp_path, monkeypatch):
     """A 200 with empty JSON, and a TWSE 200 whose stat is not OK, stay no-data."""
     base = str(tmp_path / "regime_vote.json")

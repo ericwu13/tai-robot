@@ -183,11 +183,13 @@ def _http_json(url: str) -> object | None:
     """GET *url*, parse JSON.
 
     Raises ChipsFetchError on DNS, connection, timeout, any HTTP error
-    (4xx and 5xx), a truncated read, or a 200 body that is not JSON
-    (an HTML block page).  A 4xx is not an empty dataset: TAIFEX takes
-    no date, and a TWSE holiday is a 200 whose ``stat`` is not OK.
-    Returns None for an empty body or JSON that simply has no rows.
+    (4xx and 5xx), a truncated read, a 200 whose body is empty or
+    whitespace, or a 200 body that is not JSON (an HTML block page).
+    A blank 200 is what a WAF or proxy can return; it is not an empty
+    dataset.  Returns None for JSON that simply has no rows (``[]``,
+    ``null``) — a TWSE holiday is a 200 whose ``stat`` is not OK.
     Tests that mock this to return None still mean "no data".
+    Any other exception still returns None (no-data).
     """
     try:
         req = urllib.request.Request(url, headers=_UA)
@@ -217,13 +219,8 @@ def _http_json(url: str) -> object | None:
         return None
     if isinstance(status, int) and status >= 400:
         raise ChipsFetchError("http", f"HTTP {status}")
-    if raw is None:
-        return None
-    if isinstance(raw, bytes):
-        if not raw.strip():
-            return None
-    elif isinstance(raw, str) and not raw.strip():
-        return None
+    if raw is None or (isinstance(raw, (bytes, str)) and not raw.strip()):
+        raise ChipsFetchError("http", "empty body")
     try:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         return json.loads(text)
