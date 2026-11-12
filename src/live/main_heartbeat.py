@@ -1109,12 +1109,18 @@ def set_com_return_logger(fn) -> None:
     _com_return_logger = fn
 
 
-def _emit_com_return(name: str, elapsed_ms: float, *, failed: bool) -> None:
+def _emit_com_return(
+    name: str, elapsed_ms: float, *, failed: bool, code=None,
+) -> None:
     fn = _com_return_logger
     if fn is None:
         return
     try:
-        fn(name, elapsed_ms, failed)
+        try:
+            fn(name, elapsed_ms, failed, code)
+        except TypeError:
+            # A 3-argument logger installed before the code was passed.
+            fn(name, elapsed_ms, failed)
     except Exception:
         logger.debug("COM return log failed for %s", name, exc_info=True)
 
@@ -1174,7 +1180,10 @@ def _call_com_body(name, fn, args, kwargs):
                 "heartbeat end stamp failed for "
                 f"{name}; the broker result is unchanged: "
                 f"[{type(exc).__name__}] {exc}")
-    _emit_com_return(name, elapsed_ms, failed=error is not None)
+    _emit_com_return(
+        name, elapsed_ms, failed=error is not None,
+        code=None if error is not None else outcome,
+    )
     if error is not None:
         raise error
     return outcome

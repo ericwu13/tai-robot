@@ -212,6 +212,10 @@ class LinkStateMachine:
     _saw_reply_disconnect: bool = False
     _reply_down_at: datetime | None = None
     _quote_down_at: datetime | None = None
+    # Host-supplied instant. While ``now`` is earlier, a quote-down
+    # does not call EnterMonitor and does not run the stuck timer.
+    # This machine has no session clock; the host passes the instant.
+    _quote_enter_not_before: datetime | None = None
     _quote_connect_started_at: datetime | None = None
     _reply_connect_started_at: datetime | None = None
     _pending_3003: bool = False
@@ -252,6 +256,40 @@ class LinkStateMachine:
     def on_complete(self, now: datetime) -> None:
         """Queue OnComplete (§4-3-c). Orders stay paused until ``tick``."""
         self._inbox.append(_Queued("complete", now))
+
+    def note_quote_not_ready(
+        self,
+        now: datetime,
+        *,
+        enter_not_before: datetime | None = None,
+    ) -> None:
+        """A 3002 was not followed by 3003. The quote is not ready.
+
+        Flags only. No broker call, so this is not a LeaveMonitor, a
+        login, or a process restart, and it does not pause orders.
+        Exits stay ungated. New entries block because the quote is no
+        longer READY (``entries_blocked`` stays set until both links
+        are up again).
+
+        The next ``tick`` runs the existing quote-down path: wait out
+        ``quote_settle_s``, then EnterMonitorLONG only when
+        IsConnected()==0. ``enter_not_before`` is the host's next
+        session open. Until that instant the stuck timer does not run,
+        so a closed gap cannot reach DEGRADED. Passing None means the
+        session is open and the settle starts from this mark, unless a
+        quote-down is already in progress (its settle anchor is kept).
+        """
+        already = (
+            self.quote == LinkPhase.DOWN and self._quote_down_at is not None
+        )
+        self.quote = LinkPhase.DOWN
+        self._pending_3003 = False
+        self._quote_stuck_since = None
+        self._quote_connect_started_at = None
+        if not already:
+            self._quote_down_at = now
+        self._quote_enter_not_before = enter_not_before
+        self.entries_blocked = True
 
     def start(self, now: datetime) -> None:
         """Process start. One LoginSetQuote. No link calls."""
@@ -548,6 +586,7 @@ class LinkStateMachine:
             self._saw_3033 = True
             self.quote = LinkPhase.DOWN
             self._quote_down_at = at
+            self._quote_enter_not_before = None
             self._pending_3003 = False
             self._quote_stuck_since = None
             self.orders_paused = True
@@ -573,6 +612,7 @@ class LinkStateMachine:
         if kind == KIND_CONN_ERROR:
             self.quote = LinkPhase.DOWN
             self._quote_down_at = at
+            self._quote_enter_not_before = None
             self._pending_3003 = False
             self._quote_stuck_since = None
             # A new quote drop is a new observation. An earlier
@@ -842,6 +882,17 @@ class LinkStateMachine:
             return
         if self.reply == LinkPhase.DOWN and self.rules.one_link_at_a_time:
             return
+        # The host can hold EnterMonitor until a later instant (the
+        # next session open). Do not read IsConnected and do not start
+        # the stuck timer before it: stuck_limit across a closed gap
+        # would DEGRADE and then wait for a manual Reconnect.
+        # EnterMonitor in the minute before that instant is the #157 fault.
+        hold = self._quote_enter_not_before
+        if hold is not None and now < hold:
+            self._quote_stuck_since = None
+            return
+        if hold is not None:
+            self._quote_enter_not_before = None
         if self.quote == LinkPhase.DOWN and self._quote_down_at is not None:
             # OUR timing choice, not a vendor requirement. The vendor
             # timer is the reply settle (§4-3-h). Quote waits out its
@@ -864,6 +915,7 @@ class LinkStateMachine:
         self.quote = LinkPhase.CONNECTING
         self._quote_connect_started_at = now
         self._pending_3003 = False
+        self._quote_enter_not_before = None
 
     def _service_quote(self, now: datetime) -> None:
         if not self.rules.enter_once_while_connecting:
@@ -881,6 +933,7 @@ class LinkStateMachine:
             self.quote = LinkPhase.READY
             self._quote_stuck_since = None
             self._quote_connect_started_at = None
+            self._quote_enter_not_before = None
             self._maybe_finish_solace_episode()
             return
         elapsed = (now - self._quote_connect_started_at).total_seconds()
