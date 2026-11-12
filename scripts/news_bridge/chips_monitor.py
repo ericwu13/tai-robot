@@ -77,6 +77,7 @@ unread and its dedup entry would silence Monday's real vote.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -181,7 +182,8 @@ def _is_timeout_error(exc) -> bool:
 def _http_json(url: str) -> object | None:
     """GET *url*, parse JSON.
 
-    Raises ChipsFetchError on DNS, connection, timeout, or HTTP 5xx so the
+    Raises ChipsFetchError on DNS, connection, timeout, HTTP 5xx, or a
+    truncated read (``IncompleteRead`` / other ``HTTPException``) so the
     caller can keep yesterday's vote and retry.  Returns None for an empty
     body, HTTP 4xx, or a body that is not JSON — a genuine "no data"
     answer, which is what tests simulate by mocking this to return None.
@@ -208,6 +210,10 @@ def _http_json(url: str) -> object | None:
     except OSError as exc:
         kind = "timeout" if _is_timeout_error(exc) else "network"
         raise ChipsFetchError(kind, str(exc)) from exc
+    except http.client.HTTPException as exc:
+        # IncompleteRead / BadStatusLine are not OSError. A cut-off body
+        # is a transport failure, not an empty dataset.
+        raise ChipsFetchError("network", str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         print(f"  fetch rejected [{url[:70]}...]: {type(exc).__name__}: {exc}")
         return None
@@ -608,6 +614,12 @@ def _is_closed_day(date_key: str | None) -> bool:
         return False
     if day.weekday() >= 5:
         return True
+    # Launched as ``python scripts/news_bridge/chips_monitor.py``, sys.path[0]
+    # is that directory, not the repo root. The weekend check above does not
+    # need this import; a weekday holiday does.
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
     try:
         from src.market_data.holidays import is_taifex_holiday
     except Exception:  # noqa: BLE001 — weekend-only fallback

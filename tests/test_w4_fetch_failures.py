@@ -204,6 +204,59 @@ def test_holiday_calendar_import_falls_back_to_weekend_only(tmp_path, monkeypatc
     assert "holiday" not in weekday.lower()
 
 
+def test_weekday_holiday_label_without_repo_on_syspath(monkeypatch):
+    """chips_monitor.py is launched as a script, so sys.path[0] is
+    scripts/news_bridge. A weekday holiday must still say TAIFEX holiday
+    after the repo root is removed and the cached src package is dropped.
+    pytest itself puts the root on sys.path, which hides the miss."""
+    import sys
+    root = Path(chips.__file__).resolve().parents[2]
+    kept = []
+    for entry in sys.path:
+        try:
+            if entry and Path(entry).resolve() == root:
+                continue
+        except OSError:
+            pass
+        kept.append(entry)
+    monkeypatch.setattr(sys, "path", kept)
+    for name in ("src.market_data.holidays", "src.market_data", "src"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    text = chips.no_data_message("20260101")
+    assert "TAIFEX holiday" in text
+    assert "API lag" not in text
+
+
+def test_incomplete_read_keeps_vote_and_exits_nonzero(tmp_path, monkeypatch):
+    """A truncated body is a transport failure, not an empty dataset."""
+    import http.client
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+
+    class _Truncated:
+        status = 200
+
+        def read(self):
+            raise http.client.IncompleteRead(b"{\"partial\"")
+
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Truncated())
+    assert chips.run_once(base, "20260814", _FRIDAY) != 0
+    assert vote.read_bytes() == before
+    log = _log(base)
+    assert "fetch failed" in log.lower()
+    assert "no taifex data" not in log.lower()
+
+
 def test_http_404_is_no_data_not_a_transport_failure(tmp_path, monkeypatch):
     base = str(tmp_path / "regime_vote.json")
     vote = _seed_vote(base)
