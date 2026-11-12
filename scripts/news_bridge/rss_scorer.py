@@ -276,13 +276,20 @@ def _download_feed(url: str) -> bytes:
 
 
 def _parse_feed_bytes(url: str, body: bytes) -> list[dict]:
-    """Parse feed bytes. Bozo with zero entries is a failure; a quiet feed is not."""
+    """Parse feed bytes.
+
+    Unrecognised input is a failure: feedparser left ``version`` empty
+    (an HTML page), or set bozo and produced no entries.  A recognised
+    feed with zero entries, or entries that are all too old, is quiet.
+    """
     import feedparser
     feed = feedparser.parse(body)
     entries = list(getattr(feed, "entries", None) or [])
-    if getattr(feed, "bozo", 0) and not entries:
+    version = str(getattr(feed, "version", "") or "")
+    if not entries and (not version or getattr(feed, "bozo", 0)):
         exc = getattr(feed, "bozo_exception", None)
-        raise FeedFetchError("bozo", str(exc) if exc else "unparseable feed")
+        detail = str(exc) if exc else ("unrecognised feed" if not version else "unparseable feed")
+        raise FeedFetchError("bozo", detail)
     feed_title = (getattr(feed, "feed", None) or {}).get("title", "")
     tag = _feed_tag(url)
     articles = []
@@ -311,9 +318,10 @@ def fetch_feed(url: str) -> list[dict]:
     link, source (publisher name for the news history), feed_tag
     (``"taifex"`` only for the TAIFEX feed).
 
-    Raises FeedFetchError on DNS, connection, timeout, HTTP >= 400, or a
-    bozo parse with zero entries. A 2xx body that parses to nothing is an
-    empty list, not an error.
+    Raises FeedFetchError on DNS, connection, timeout, HTTP >= 400, a
+    bozo parse with zero entries, or a body feedparser does not recognise
+    (empty ``version`` and no entries — an HTML page). A recognised feed
+    with zero entries is an empty list, not an error.
     """
     return _parse_feed_bytes(url, _download_feed(url))
 

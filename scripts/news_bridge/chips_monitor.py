@@ -186,10 +186,11 @@ def _http_json(url: str) -> object | None:
     (4xx and 5xx), a truncated read, a 200 whose body is empty or
     whitespace, or a 200 body that is not JSON (an HTML block page).
     A blank 200 is what a WAF or proxy can return; it is not an empty
-    dataset.  Returns None for JSON that simply has no rows (``[]``,
-    ``null``) — a TWSE holiday is a 200 whose ``stat`` is not OK.
-    Tests that mock this to return None still mean "no data".
-    Any other exception still returns None (no-data).
+    dataset.      Returns a parsed JSON value.  JSON ``null`` is a fetch failure.
+    Callers treat TAIFEX ``[]`` and a TWSE object whose ``stat`` is not
+    OK as no-data.  Tests that mock this to return None still mean
+    "no data".  Any other exception is a fetch failure; the message
+    names the exception type.
     """
     try:
         req = urllib.request.Request(url, headers=_UA)
@@ -215,17 +216,21 @@ def _http_json(url: str) -> object | None:
         # is a transport failure, not an empty dataset.
         raise ChipsFetchError("network", str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        print(f"  fetch rejected [{url[:70]}...]: {type(exc).__name__}: {exc}")
-        return None
+        # ValueError, UnicodeError, KeyError, and anything else that is
+        # not a classified transport error. Name the type in the log.
+        raise ChipsFetchError("error", f"{type(exc).__name__}: {exc}") from exc
     if isinstance(status, int) and status >= 400:
         raise ChipsFetchError("http", f"HTTP {status}")
     if raw is None or (isinstance(raw, (bytes, str)) and not raw.strip()):
         raise ChipsFetchError("http", "empty body")
     try:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-        return json.loads(text)
+        parsed = json.loads(text)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-        raise ChipsFetchError("http", f"non-JSON body: {exc}") from exc
+        raise ChipsFetchError("http", f"non-JSON body: {type(exc).__name__}: {exc}") from exc
+    if parsed is None:
+        raise ChipsFetchError("http", "JSON null")
+    return parsed
 
 
 def _num(value) -> float | None:
@@ -264,13 +269,23 @@ def fetch_taifex_tx_foreign_oi() -> tuple[str, float] | None:
     calendar by more than a day.  So the caller reads the date OFF the
     data instead of pre-picking one; see ``run_once``'s walk-back.
 
-    Returns None when the API is unreachable or has no TX/外資 rows.  The
-    dataset has one row per 商品 × 身份別 covering ALL delivery months
-    combined; rows are summed defensively but normally exactly one
+    Returns None only for a genuine empty list (``[]``).  A non-list
+    (an error object, JSON null) or a non-empty list with no 臺股期貨/外資
+    rows is a fetch failure: the published dataset includes that contract,
+    so a list that never mentions it is the wrong document, not a holiday.
+    A list that does contain those rows, for another trade date, is still
+    None from ``fetch_taifex_foreign_net_oi`` (no data for the requested
+    date).  The dataset has one row per 商品 × 身份別 covering ALL delivery
+    months combined; rows are summed defensively but normally exactly one
     matches.
     """
     data = _http_json(TAIFEX_URL)
+    if data is None:
+        return None
     if not isinstance(data, list):
+        raise ChipsFetchError("http", f"TAIFEX JSON shape {type(data).__name__}")
+    if not data:
+        print("  TAIFEX response was an empty list")
         return None
 
     dataset_date, total, matched = "", 0.0, 0
@@ -298,8 +313,9 @@ def fetch_taifex_tx_foreign_oi() -> tuple[str, float] | None:
         matched += 1
 
     if matched == 0 or not dataset_date:
-        print(f"  TAIFEX response had no {TX_PRODUCT_NAME}/{FOREIGN_PREFIX} rows")
-        return None
+        raise ChipsFetchError(
+            "http",
+            f"TAIFEX JSON had no {TX_PRODUCT_NAME}/{FOREIGN_PREFIX} rows")
     print(f"  TAIFEX 外資 {TX_PRODUCT_NAME} net OI: {total:+,.0f} contracts "
           f"({matched} row(s), all delivery months combined, data {dataset_date})")
     return dataset_date, total
@@ -327,12 +343,18 @@ def fetch_twse_foreign_net_buy(date_key: str) -> float | None:
 
     Sums the 買賣差額 of every row whose 單位名稱 starts with 外資
     (外資及陸資(不含外資自營商) + 外資自營商).  None when the date is a
-    holiday (stat != OK) or the response is malformed.
+    holiday (a dict whose ``stat`` is not OK).  A non-dict, or a dict
+    with no ``stat`` (an error envelope), is a fetch failure.
     """
     data = _http_json(TWSE_BFI82U_URL.format(date=date_key))
-    if not isinstance(data, dict) or data.get("stat") != "OK":
+    if data is None:
+        return None
+    if not isinstance(data, dict) or "stat" not in data:
+        raise ChipsFetchError(
+            "http", f"TWSE JSON shape {type(data).__name__}")
+    if data.get("stat") != "OK":
         print(f"  TWSE BFI82U: no data for {date_key} "
-              f"(stat={data.get('stat') if isinstance(data, dict) else 'n/a'!r})")
+              f"(stat={data.get('stat')!r})")
         return None
 
     fields = data.get("fields") or []

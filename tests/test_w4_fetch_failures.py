@@ -452,6 +452,70 @@ def test_empty_200_on_twse_keeps_vote_and_exits_nonzero(tmp_path, monkeypatch, b
     assert "no taifex data" not in log.lower()
 
 
+@pytest.mark.parametrize("body", [
+    b'{"message":"Too many requests"}',
+    b"null",
+    b'[{"ContractCode":"\xe8\x87\xba\xe6\x8c\x87\xe9\x81\xb8\xe6\x93\x87\xe6\xac\x8a","Item":"\xe5\xa4\x96\xe8\xb3\x87\xe5\x8f\x8a\xe9\x99\xb8\xe8\xb3\x87","OpenInterest(Net)":"1","Date":"20260814"}]',
+])
+def test_taifex_wrong_json_shape_keeps_vote(tmp_path, monkeypatch, body):
+    """An error dict, JSON null, or a list with no TX rows is not no-data.
+
+    ``[]`` stays no-data. A non-empty list that never mentions 臺股期貨 is
+    treated as the wrong document: the published dataset always includes
+    that contract, so keep the vote and retry.
+    """
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Body(body))
+    assert chips.run_once(base, None, _AT_0415) != 0
+    assert vote.read_bytes() == before
+    assert not chips.load_state(chips.state_path_for(base)).get("last_decided_date")
+    log = _log(base)
+    assert "fetch failed" in log.lower()
+    assert "no taifex data" not in log.lower()
+
+
+def test_twse_error_dict_keeps_vote(tmp_path, monkeypatch):
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    chips.save_state(chips.state_path_for(base), {"history": {"20260813": 0.0}})
+    row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "8,123"}
+
+    def fake(req, timeout=None, context=None):
+        if "twse.com.tw" in req.full_url:
+            return _Body(b'{"message":"Too many requests"}')
+        return _Body(json.dumps([row]).encode())
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, "20260814", _FRIDAY) != 0
+    assert vote.read_bytes() == before
+    assert chips.load_state(chips.state_path_for(base)).get("last_decided_date") != "20260814"
+    log = _log(base)
+    assert "fetch failed" in log.lower()
+    assert "no taifex data" not in log.lower()
+
+
+@pytest.mark.parametrize("exc", [KeyError("fields"), ValueError("bad cell")])
+def test_unexpected_fetch_exception_keeps_vote_and_names_the_type(tmp_path, monkeypatch, exc):
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+
+    def fake(req, timeout=None, context=None):
+        raise exc
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, None, _AT_0415) != 0
+    assert vote.read_bytes() == before
+    assert not chips.load_state(chips.state_path_for(base)).get("last_decided_date")
+    log = _log(base)
+    assert type(exc).__name__ in log
+    assert "no taifex data" not in log.lower()
+
+
 def test_empty_json_200_is_still_no_data(tmp_path, monkeypatch):
     """A 200 with empty JSON, and a TWSE 200 whose stat is not OK, stay no-data."""
     base = str(tmp_path / "regime_vote.json")

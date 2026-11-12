@@ -252,6 +252,23 @@ def test_partial_failure_still_scores(tmp_path, monkeypatch):
 
 # ── 4. a 200 with nothing to score is a quiet feed ───────────────────────
 
+def test_html_200_fails_the_feed_and_leaves_the_session(tmp_path, monkeypatch):
+    """An HTML 200 is not a quiet feed. feedparser leaves version empty
+    and reports no entries, so every such feed is fetch_status=failed."""
+    cfg, state_path = _cfg(tmp_path, ["https://a.example/rss", "https://b.example/rss"])
+    html = b"<html><body>Access denied</body></html>"
+    monkeypatch.setattr(rss_scorer.urllib.request, "urlopen", lambda *_a, **_k: _Body(html))
+    seeded = {"seen_guids": ["keep"], "session_net": 1.25, "session_peak": 2.5,
+              "error_streak": 2}
+    state = rss_scorer._recorded_pass(cfg, dict(seeded), "", state_path)
+    assert state["fetch_status"] == "failed"
+    assert state["session_net"] == 1.25
+    assert state["session_peak"] == 2.5
+    assert state["seen_guids"] == ["keep"]
+    assert state["error_streak"] == 2
+    assert _runs(state_path)[-1]["ok"] is False
+
+
 def test_all_200_empty_is_quiet(tmp_path, monkeypatch):
     cfg, state_path = _cfg(tmp_path, ["https://a.example/rss", "https://b.example/rss"])
     monkeypatch.setattr(rss_scorer.urllib.request, "urlopen",
