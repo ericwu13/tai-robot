@@ -276,20 +276,37 @@ class LinkStateMachine:
         IsConnected()==0. ``enter_not_before`` is the host's next
         session open. Until that instant the stuck timer does not run,
         so a closed gap cannot reach DEGRADED. Passing None means the
-        session is open and the settle starts from this mark, unless a
-        quote-down is already in progress (its settle anchor is kept).
+        session is open and the settle starts from this mark.
+
+        Refuses unless the quote is READY. A CONNECTING or DOWN quote
+        is a #178 attempt already in progress (or one already marked
+        down). This does not clear ``_pending_3003`` or
+        ``_quote_connect_started_at``: a late 3003 must still be
+        honored, and an in-progress attempt keeps its own clock.
         """
-        already = (
-            self.quote == LinkPhase.DOWN and self._quote_down_at is not None
-        )
+        if self.quote != LinkPhase.READY:
+            return
         self.quote = LinkPhase.DOWN
-        self._pending_3003 = False
         self._quote_stuck_since = None
-        self._quote_connect_started_at = None
-        if not already:
-            self._quote_down_at = now
+        self._quote_down_at = now
         self._quote_enter_not_before = enter_not_before
         self.entries_blocked = True
+
+    def hold_quote_enter_until(self, when: datetime) -> None:
+        """Pause EnterMonitor and the stuck timer until ``when``.
+
+        Only while the quote is DOWN. A CONNECTING attempt keeps its
+        own 3003 wait. Does not clear ``_pending_3003`` or the
+        connect-start clock. A hold that is already at least ``when``
+        is left alone, including its stuck clock.
+        """
+        if self._shut_down or self.quote != LinkPhase.DOWN:
+            return
+        current = self._quote_enter_not_before
+        if current is not None and current >= when:
+            return
+        self._quote_enter_not_before = when
+        self._quote_stuck_since = None
 
     def start(self, now: datetime) -> None:
         """Process start. One LoginSetQuote. No link calls."""
@@ -535,6 +552,12 @@ class LinkStateMachine:
         if self.reply == LinkPhase.CONNECTING and self.rules.one_link_at_a_time:
             self._service_reply(now)
             return
+        # A 3003 is READY even if the quote was marked DOWN, or the
+        # pending flag was the only thing left. Do this before another
+        # EnterMonitorLONG, which would clear the flag.
+        if self._pending_3003:
+            self._finish_quote_ready()
+            return
         if self.quote == LinkPhase.CONNECTING and self.rules.one_link_at_a_time:
             self._service_quote(now)
             return
@@ -621,6 +644,7 @@ class LinkStateMachine:
                 self._down_without_reply_event_since = at
             return
         if kind == KIND_READY and code == 0:
+            # Honored on the next tick from any phase, not only CONNECTING.
             self._pending_3003 = True
             return
         if kind == KIND_QUOTE and code == 0:
@@ -917,6 +941,21 @@ class LinkStateMachine:
         self._pending_3003 = False
         self._quote_enter_not_before = None
 
+    def _finish_quote_ready(self) -> None:
+        """STOCKS_READY (3003). Subscribe and mark the quote READY.
+
+        Runs from any phase. A late 3003 after the quote was marked
+        DOWN, or after ``_pending_3003`` was the only record of it,
+        still resubscribes. This does not call EnterMonitorLONG.
+        """
+        self._pending_3003 = False
+        self.port.subscribe_quotes()
+        self.quote = LinkPhase.READY
+        self._quote_stuck_since = None
+        self._quote_connect_started_at = None
+        self._quote_enter_not_before = None
+        self._maybe_finish_solace_episode()
+
     def _service_quote(self, now: datetime) -> None:
         if not self.rules.enter_once_while_connecting:
             # Mutant: call EnterMonitorLONG again while waiting for 3003.
@@ -928,13 +967,7 @@ class LinkStateMachine:
             return
         if self._pending_3003:
             # §4-4-2: subscribe only now, from the main loop, after 3003.
-            self._pending_3003 = False
-            self.port.subscribe_quotes()
-            self.quote = LinkPhase.READY
-            self._quote_stuck_since = None
-            self._quote_connect_started_at = None
-            self._quote_enter_not_before = None
-            self._maybe_finish_solace_episode()
+            self._finish_quote_ready()
             return
         elapsed = (now - self._quote_connect_started_at).total_seconds()
         state = self.port.is_connected()

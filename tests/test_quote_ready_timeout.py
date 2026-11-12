@@ -190,6 +190,272 @@ def _no_forbidden(fake, base: int) -> None:
         assert name not in fresh, name
 
 
+def _recover_enter(app, fake, clock, drop):
+    """One #178 EnterMonitorLONG while the session is open.
+
+    Returns ``(entered_at, enter_count)``. IsConnected stays 0 until
+    the call, which is what lets EnterMonitorLONG through the gate.
+    """
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    entered = fired + timedelta(seconds=5)
+    _tick(app, fake, clock, entered)
+    assert app._link_host.machine.quote == LinkPhase.CONNECTING
+    return entered, fake.calls.count("EnterMonitorLONG")
+
+
+def _deliver_3002(app):
+    rb.SKQuoteLibEvents().OnConnection(3002, 0)
+    app._process_ui_queue()
+
+
+def _deliver_3003(app, fake, clock, when):
+    clock["now"] = when
+    fake.set_now(when)
+    fake.note_3003()
+    rb.SKQuoteLibEvents().OnConnection(3003, 0)
+    app._process_ui_queue()
+    _tick(app, fake, clock, when)
+
+
+def test_handshake_3002_then_late_3003_stays_one_enter(monkeypatch):
+    """EnterMonitor, the handshake 3002, then 3003 about 3 min later.
+
+    That 3002 is the #178 attempt talking, not a new outage. The 15s
+    timer must not mark it down, and the late 3003 must reach READY
+    with no second EnterMonitorLONG.
+    """
+    drop = tpe(2026, 11, 12, 8, 48)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    entered, enters = _recover_enter(app, fake, clock, drop)
+    # Half-up after EnterMonitorLONG, the way the handshake reports.
+    fake.force_quote_state = None
+    assert fake.is_connected() == 2
+    started = app._link_host.machine._quote_connect_started_at
+    _deliver_3002(app)
+    # Production fires the 15s timer if one was armed. A handshake
+    # must not have armed one; if it did, the replay lets it run.
+    step = entered
+    deadline = entered + timedelta(minutes=3)
+    while step < deadline:
+        step += timedelta(seconds=5)
+        _tick(app, fake, clock, step)
+        if app._quote_ready_timer_id is not None and step >= entered + timedelta(seconds=15):
+            _fire_timeout(app, fake, clock, step)
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.CONNECTING
+    assert machine._pending_3003 is False
+    assert machine._quote_connect_started_at == started
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    subs = fake.calls.count("SubscribeQuotes")
+    _deliver_3003(app, fake, clock, deadline)
+    assert machine.quote == LinkPhase.READY
+    assert machine._pending_3003 is False
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert fake.calls.count("SubscribeQuotes") == subs + 1
+    assert "LeaveMonitor" not in fake.calls
+    assert "RestartProcess" not in fake.calls
+
+
+def test_mid_session_timeout_then_late_3003_becomes_ready(monkeypatch):
+    """Unexpected 3002 while READY, IsConnected stays 2, then a late 3003.
+
+    The timeout may mark the quote down. The 3003 must still be
+    honored: READY and a resubscribe, not a stuck DOWN with the
+    pending flag ignored.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    enters = fake.calls.count("EnterMonitorLONG")
+    subs = fake.calls.count("SubscribeQuotes")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 2
+    _deliver_3002(app)
+    assert app._quote_ready_timer_id is not None
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    late = drop + timedelta(seconds=45)
+    _deliver_3003(app, fake, clock, late)
+    assert machine.quote == LinkPhase.READY
+    assert machine._pending_3003 is False
+    assert fake.calls.count("SubscribeQuotes") == subs + 1
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert machine.degraded is False
+
+
+def test_repeated_3002_does_not_rearm_the_timer(monkeypatch):
+    """One armed timer per unexpected 3002. Later 3002s do not reset it.
+
+    A handshake 3002 while CONNECTING does not arm a timer at all, so
+    a burst cannot start the timeout/EnterMonitor loop.
+    """
+    drop = tpe(2026, 11, 12, 9, 30)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _replay_drop(app, fake, clock, drop)
+    _deliver_3002(app)
+    token = app._quote_ready_timer_id
+    seen = app._quote_intermediate_seen_at
+    assert token is not None
+    _deliver_3002(app)
+    _deliver_3002(app)
+    assert app._quote_ready_timer_id == token
+    assert app._quote_intermediate_seen_at == seen
+    assert list(app.root.pending) == [token]
+    entered, _enters = _recover_enter(app, fake, clock, drop + timedelta(minutes=30))
+    del entered
+    fake.force_quote_state = None
+    _deliver_3002(app)
+    _deliver_3002(app)
+    assert app._quote_ready_timer_id is None
+
+
+def _arm_q4(monkeypatch, app):
+    app._live_runner = _Runner()
+    app._live_tick_com_symbol = "TX00"
+    app._live_tick_active = True
+    app._tick_watchdog = _Watch("session_resubscribe")
+
+    def call_com(name, fn, *args, **kwargs):
+        if name == "RequestTicks":
+            return 0
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(rb, "call_com", call_com)
+    monkeypatch.setattr(
+        rb, "skQ",
+        type("Q", (), {"SKQuoteLib_RequestTicks": staticmethod(lambda *a: 0)})(),
+    )
+
+
+def test_q4_while_connecting_does_not_enter_again(monkeypatch):
+    """Deferred 08:45:00 EnterMonitor, then Q4 at 08:45:20.
+
+    The quote is CONNECTING, still inside its wait for 3003. Q4 must
+    not reset that attempt to DOWN. Exactly one EnterMonitorLONG.
+    """
+    drop = tpe(2026, 11, 12, 7, 30)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=30))
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    opened = tpe(2026, 11, 12, 8, 45)
+    _tick(app, fake, clock, opened)
+    enters = fake.calls.count("EnterMonitorLONG")
+    assert app._link_host.machine.quote == LinkPhase.CONNECTING
+    assert enters == fake.calls.count("EnterMonitorLONG")
+    q4_at = opened + timedelta(seconds=20)
+    clock["now"] = q4_at
+    fake.set_now(q4_at)
+    _arm_q4(monkeypatch, app)
+    app._check_tick_watchdog()
+    _tick(app, fake, clock, opened + timedelta(seconds=26))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert app._link_host.machine.quote == LinkPhase.CONNECTING
+    assert "LeaveMonitor" not in fake.calls
+
+
+def test_3003_one_second_after_timeout_becomes_ready(monkeypatch):
+    """Open session, IsConnected stays 1, 3003 arrives one second late.
+
+    The timeout may mark the quote down. The 3003 must still resubscribe
+    and reach READY. It must not sit DOWN until DEGRADED stuck at +320s.
+    """
+    drop = tpe(2026, 11, 12, 10, 15)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    subs = fake.calls.count("SubscribeQuotes")
+    _deliver_3002(app)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    entry, _ = app._trading_guard.decide("auto", "ENTRY_FILL", "LONG")
+    assert entry == TradingGuard.BLOCK_LINK
+    _deliver_3003(app, fake, clock, fired + timedelta(seconds=1))
+    assert machine.quote == LinkPhase.READY
+    assert machine._pending_3003 is False
+    assert fake.calls.count("SubscribeQuotes") == subs + 1
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    opened, _ = app._trading_guard.decide("auto", "ENTRY_FILL", "LONG")
+    assert opened != TradingGuard.BLOCK_LINK
+    _tick(app, fake, clock, fired + timedelta(seconds=320))
+    assert machine.degraded is False
+    assert machine.degraded_reason == ""
+    assert machine.quote == LinkPhase.READY
+
+
+def test_stuck_countdown_does_not_degrade_across_the_close(monkeypatch):
+    """Quote-down at 13:44:45, IsConnected 2. The close is 13:45.
+
+    stuck_limit must not reach DEGRADED at 13:50:45, inside the gap,
+    just because the countdown started while the session was still open.
+    """
+    drop = tpe(2026, 11, 12, 13, 44, 30)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 2
+    fired = drop + timedelta(seconds=15)
+    assert fired == tpe(2026, 11, 12, 13, 44, 45)
+    _fire_timeout(app, fake, clock, fired)
+    assert app._link_host.machine.degraded is False
+    _tick(app, fake, clock, tpe(2026, 11, 12, 13, 44, 50))
+    assert app._link_host.machine.degraded is False
+    _tick(app, fake, clock, tpe(2026, 11, 12, 13, 50, 45))
+    machine = app._link_host.machine
+    assert machine.degraded is False
+    assert machine.quote == LinkPhase.DOWN
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, tpe(2026, 11, 12, 14, 59))
+    assert machine.degraded is False
+    assert machine.quote != LinkPhase.READY
+
+
+def test_disconnect_after_timeout_still_cleans_up(monkeypatch):
+    """3021 after the timeout cleared ``_quote_connected`` still pauses.
+
+    The flag is already false, so the old early return skipped the
+    tick-feed pause, the status line, and the connection monitor.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    app._live_runner = _Runner()
+    app._live_tick_active = True
+
+    class _Mon:
+        def __init__(self):
+            self.downs = 0
+
+        def on_disconnected(self):
+            self.downs += 1
+
+        def schedule_next(self, **_kwargs):
+            return type("A", (), {
+                "type": "give_up", "message": "paused", "delay_seconds": 0,
+            })()
+
+    app._conn_monitor = _Mon()
+    _replay_drop(app, fake, clock, drop)
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._quote_connected is False
+    assert app._live_tick_active is True
+    rb.SKQuoteLibEvents().OnConnection(3021, 0)
+    app._process_ui_queue()
+    assert app._live_tick_active is False
+    assert app._conn_monitor.downs == 1
+    assert any("Disconnected" in msg for msg, _level in app._statuses)
+    rb.SKQuoteLibEvents().OnConnection(3033, 0)
+    app._process_ui_queue()
+    assert app._conn_monitor.downs == 1
+
+
 def test_0730_missing_3003_logs_clears_flag_and_starts_quote_down(monkeypatch):
     """The 07:30 sequence. Stale ``_quote_connected`` is not a 3003."""
     drop = tpe(2026, 11, 12, 7, 30)
@@ -444,6 +710,38 @@ def test_heartbeat_quote_is_not_ready_after_timeout(monkeypatch, tmp_path):
     assert data["link"]["quote"] != "ready"
     assert data["link"]["quote"] == LinkPhase.DOWN.value
     assert data["link"]["degraded"] is False
+
+
+def test_logger_typeerror_is_not_retried():
+    """A TypeError inside the logger is not a 3-argument mismatch."""
+    calls = []
+
+    def logger(name, elapsed_ms, failed, code=None):
+        del name, elapsed_ms, failed
+        calls.append(code)
+        raise TypeError("boom inside the logger")
+
+    hb.set_com_return_logger(logger)
+    try:
+        hb._emit_com_return("EnterMonitorLONG", 1.0, failed=False, code=7)
+    finally:
+        hb.set_com_return_logger(rb._log_com_return)
+    assert calls == [7]
+
+
+def test_three_arg_com_logger_is_still_called_once():
+    calls = []
+
+    def logger(name, elapsed_ms, failed):
+        del elapsed_ms, failed
+        calls.append(name)
+
+    hb.set_com_return_logger(logger)
+    try:
+        hb._emit_com_return("EnterMonitorLONG", 1.0, failed=False, code=4)
+    finally:
+        hb.set_com_return_logger(rb._log_com_return)
+    assert calls == ["EnterMonitorLONG"]
 
 
 def test_enter_monitor_return_code_is_logged(monkeypatch):

@@ -1687,6 +1687,7 @@ class BacktestApp:
                         # watchdog since Ready arrived.
                         self._cancel_quote_ready_timer("ready_received")
                         self._set_quote_connected(True, "OnConnection(Ready)")
+                        self._disconnect_cleanup_done = False
                         self.btn_api.config(state=tk.NORMAL)
                         self.btn_deploy.config(state=tk.NORMAL)
                         self.btn_login.config(state=tk.DISABLED)
@@ -1697,12 +1698,12 @@ class BacktestApp:
                         # Resubscribe is the machine's subscribe_quotes,
                         # which runs on the following tick after 3003.
                     elif data == "quote":
-                        # Quote (3002) is intermediate, NOT fully connected.
-                        # A stale _quote_connected from an earlier 3003 is
-                        # not this event's Ready. Arm the 15s timer. Only
-                        # Ready (3003) cancels it — reply-up and OnComplete
-                        # do not. If 3003 never comes, mark the quote down
-                        # and start the #178 path (no re-login).
+                        # Quote (3002) is intermediate. Arm the 15s timer
+                        # only when the machine still says READY: an
+                        # unexpected 3002 on a link we believed was up.
+                        # A handshake 3002 after EnterMonitorLONG (quote
+                        # CONNECTING or DOWN) must not arm it. Only Ready
+                        # (3003) cancels an armed timer.
                         self._set_conn_dot("warn")
                         self._on_quote_intermediate()
                     elif data == "disconnected":
@@ -1944,33 +1945,62 @@ class BacktestApp:
                 f"[STATE] _quote_connected: {old!r} -> {value!r} (caller={caller})")
         self._quote_connected = value
 
+    def _quote_machine_phase(self):
+        """Link-machine quote phase, or None before adopt."""
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        if machine is None:
+            return None
+        return machine.quote
+
     def _on_quote_intermediate(self) -> None:
         """Handle Quote (3002). It is not Ready (3003).
 
-        Arm a 15s timer. OnSolaceReplyConnection and OnComplete do not
-        cancel it. Only Ready (3003) does. ``_quote_connected`` left True
-        by an earlier 3003 is not proof that this 3002 was followed by
-        3003. If the timer fires, the quote is marked down and the #178
-        path runs: 5s settle, then EnterMonitorLONG only when
+        Arm the 15s timer only when the machine's quote is READY: this
+        3002 is unexpected on a link we believed was up. A handshake
+        3002 while the quote is CONNECTING or DOWN is the #178 attempt
+        already in progress; that attempt keeps its own wait and
+        ``stuck_limit``. A second 3002 does not re-arm or reset the
+        timer. OnSolaceReplyConnection and OnComplete do not cancel
+        it. Only Ready (3003) does.
+
+        ``_quote_connected`` left True by an earlier 3003 is not proof
+        that this 3002 was followed by 3003. If the timer fires while
+        the quote is still READY, the quote is marked down and the
+        #178 path runs: 5s settle, then EnterMonitorLONG only when
         IsConnected()==0. No LeaveMonitor, no re-login, no process restart.
         """
+        phase = self._quote_machine_phase()
+        if phase != LinkPhase.READY:
+            _log_debug(
+                "[CONN] Quote (3002) while quote is "
+                f"{getattr(phase, 'value', phase)} — not arming the Ready "
+                "timer; a #178 attempt keeps its own wait")
+            return
+        if self._quote_ready_timer_id:
+            _log_debug(
+                "[CONN] Quote (3002) while the Ready timer is already "
+                "armed — not re-arming")
+            return
         self._quote_intermediate_seen_at = time.time()
         _log_debug(
-            "[CONN] Quote (3002) acknowledged — waiting up to 15s for "
+            "[CONN] Quote (3002) on a READY link — waiting up to 15s for "
             "Ready (3003); a stale _quote_connected is not Ready")
-        self._cancel_quote_ready_timer("quote_intermediate_arm")
         self._quote_ready_timer_id = self.root.after(
             15000, self._on_quote_ready_timeout)
 
     def _on_quote_ready_timeout(self) -> None:
-        """15s after 3002 with no 3003.
+        """15s after an unexpected 3002 with no 3003.
 
-        Always log. Clear ``_quote_connected`` — a True left over from
-        an earlier 3003 is not this 3002's Ready. Then start the #178
-        quote-down path (see ``_mark_quote_down_for_recovery``): the
-        link machine marks the quote down, waits out the 5s settle, and
-        calls EnterMonitorLONG only when IsConnected()==0. No
-        LeaveMonitor, no re-login, no process restart.
+        Act only if the quote is still READY. A #178 attempt that
+        moved the quote to CONNECTING or DOWN keeps its own wait and
+        ``stuck_limit``; this timeout does not mark it down and does
+        not clear ``_pending_3003`` or the connect-start clock.
+
+        When it does act: log, clear ``_quote_connected``, and start
+        the #178 quote-down path (see ``_mark_quote_down_for_recovery``).
+        EnterMonitorLONG only when IsConnected()==0. No LeaveMonitor,
+        no re-login, no process restart.
 
         During a closed session the quote is not ready immediately
         (heartbeat, new entries blocked) but EnterMonitorLONG waits
@@ -1980,6 +2010,12 @@ class BacktestApp:
         """
         self._quote_ready_timer_id = None
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
+        if self._quote_machine_phase() != LinkPhase.READY:
+            _log_debug(
+                f"[CONN] Ready (3003) timeout after {waited:.1f}s — "
+                "quote is no longer READY; leaving the #178 attempt alone"
+            )
+            return
         _log(
             "報價未就緒 Quote (3002) seen but Ready (3003) did not arrive "
             f"after {waited:.0f}s — quote marked down "
@@ -1996,7 +2032,9 @@ class BacktestApp:
 
         Does not call LeaveMonitor, Login, or restart the process.
         Orders are not paused: exits stay ungated. New entries block
-        because the quote is no longer READY.
+        because the quote is no longer READY. Refuses while the quote
+        is CONNECTING or DOWN: that is a #178 attempt already in
+        progress, and this path must not clear its 3003 wait.
 
         Closed session: EnterMonitorLONG is held until
         ``_next_session_open`` (08:45 or 15:00, skipping a holiday).
@@ -2004,6 +2042,11 @@ class BacktestApp:
         closed gap cannot reach DEGRADED. Open session: the machine's
         5s settle applies, then EnterMonitorLONG only if IsConnected()==0.
         """
+        if self._quote_machine_phase() != LinkPhase.READY:
+            _log_debug(
+                f"[CONN] quote-down ({reason}) skipped — quote is not READY; "
+                "not clearing the in-progress 3003 wait")
+            return
         self._set_quote_connected(False, reason)
         host = getattr(self, "_link_host", None)
         if host is None:
@@ -2054,6 +2097,12 @@ class BacktestApp:
             return
         if state != 0:
             return
+        if host.machine.quote != LinkPhase.READY:
+            _log_debug(
+                "[WATCHDOG] session resubscribe RequestTicks=0 and "
+                f"IsConnected()={state} — quote is {host.machine.quote.value}; "
+                "not restarting an in-progress attempt")
+            return
         _log(
             "[WATCHDOG] session resubscribe RequestTicks=0 and "
             "IsConnected()=0 — starting quote-down now "
@@ -2078,14 +2127,21 @@ class BacktestApp:
         ``from_event`` is an OnConnection 3021/3033 that was already queued.
         The watchdog path is not, so it flags a quote-down for the machine.
         Neither path calls LeaveMonitor or LoginSetQuote.
+
+        A 3002 timeout clears ``_quote_connected`` without this cleanup.
+        A later 3021/3033 must still pause the tick feed, update status,
+        and tell the connection monitor. The latch, not the flag, is
+        what suppresses a second pass.
         """
-        if not self._quote_connected:
-            _log_debug(
-                "[STATE] _on_disconnected called but _quote_connected already False — "
-                "skipping (already handling disconnect)")
-            return  # already handling disconnect
+        already_down = not self._quote_connected
         self._cancel_quote_ready_timer("disconnected")
         self._set_quote_connected(False, "_on_disconnected")
+        if already_down and getattr(self, "_disconnect_cleanup_done", False):
+            _log_debug(
+                "[STATE] _on_disconnected called but cleanup already ran — "
+                "skipping (already handling disconnect)")
+            return
+        self._disconnect_cleanup_done = True
         self.set_status("斷線 Disconnected", "error")
         self._set_conn_dot("err")
         self.login_status_var.set("斷線 Disconnected")
@@ -2257,11 +2313,31 @@ class BacktestApp:
         elif name == "complete":
             host.note_complete(now)
 
+    def _hold_quote_down_across_close(self, now) -> None:
+        """Do not let a quote-down stuck countdown DEGRADE across a close.
+
+        The timeout arms this hold only when it fires during a closed
+        session. A quote-down that starts while the session is still
+        open (for example 13:44) would otherwise keep the stuck timer
+        running through the close and DEGRADE inside the gap. Arm the
+        same hold as soon as the session is closed.
+        """
+        if is_market_open(now):
+            return
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        nxt = _next_session_open(now)
+        if nxt is None:
+            return
+        host.machine.hold_quote_enter_until(nxt)
+
     def _link_host_tick(self, *, force: bool = False) -> None:
         host = getattr(self, "_link_host", None)
         if host is None:
             return
         now = _taipei_now()
+        self._hold_quote_down_across_close(now)
         try:
             alerts = host.tick(now) if force else host.maybe_tick(now)
         except Exception as e:

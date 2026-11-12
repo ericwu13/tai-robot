@@ -21,6 +21,7 @@ rollup; that rollup never replaces a bot's P1.
 from __future__ import annotations
 
 import faulthandler
+import inspect
 import json
 import logging
 import os
@@ -1109,6 +1110,31 @@ def set_com_return_logger(fn) -> None:
     _com_return_logger = fn
 
 
+def _logger_takes_return_code(fn) -> bool:
+    """Whether ``fn`` can accept the COM return code as a fourth argument.
+
+    A TypeError raised inside the logger must not be treated as "this
+    callable is the old 3-argument shape" — that retry logged twice.
+    """
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return True
+    for param in params:
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if param.name == "code":
+            return True
+    positional = [
+        param for param in params
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    return len(positional) >= 4
+
+
 def _emit_com_return(
     name: str, elapsed_ms: float, *, failed: bool, code=None,
 ) -> None:
@@ -1116,10 +1142,9 @@ def _emit_com_return(
     if fn is None:
         return
     try:
-        try:
+        if _logger_takes_return_code(fn):
             fn(name, elapsed_ms, failed, code)
-        except TypeError:
-            # A 3-argument logger installed before the code was passed.
+        else:
             fn(name, elapsed_ms, failed)
     except Exception:
         logger.debug("COM return log failed for %s", name, exc_info=True)
