@@ -182,11 +182,12 @@ def _is_timeout_error(exc) -> bool:
 def _http_json(url: str) -> object | None:
     """GET *url*, parse JSON.
 
-    Raises ChipsFetchError on DNS, connection, timeout, HTTP 5xx, or a
-    truncated read (``IncompleteRead`` / other ``HTTPException``) so the
-    caller can keep yesterday's vote and retry.  Returns None for an empty
-    body, HTTP 4xx, or a body that is not JSON — a genuine "no data"
-    answer, which is what tests simulate by mocking this to return None.
+    Raises ChipsFetchError on DNS, connection, timeout, any HTTP error
+    (4xx and 5xx), a truncated read, or a 200 body that is not JSON
+    (an HTML block page).  A 4xx is not an empty dataset: TAIFEX takes
+    no date, and a TWSE holiday is a 200 whose ``stat`` is not OK.
+    Returns None for an empty body or JSON that simply has no rows.
+    Tests that mock this to return None still mean "no data".
     """
     try:
         req = urllib.request.Request(url, headers=_UA)
@@ -196,10 +197,7 @@ def _http_json(url: str) -> object | None:
                 status = resp.getcode()
             raw = resp.read()
     except urllib.error.HTTPError as exc:
-        if exc.code >= 500:
-            raise ChipsFetchError("http", f"HTTP {exc.code}: {exc.reason}") from exc
-        print(f"  fetch rejected [{url[:70]}...]: HTTP {exc.code}: {exc.reason}")
-        return None
+        raise ChipsFetchError("http", f"HTTP {exc.code}: {exc.reason}") from exc
     except urllib.error.URLError as exc:
         reason = exc.reason
         text = str(reason if reason is not None else exc)
@@ -217,19 +215,20 @@ def _http_json(url: str) -> object | None:
     except Exception as exc:  # noqa: BLE001
         print(f"  fetch rejected [{url[:70]}...]: {type(exc).__name__}: {exc}")
         return None
-    if isinstance(status, int) and status >= 500:
-        raise ChipsFetchError("http", f"HTTP {status}")
     if isinstance(status, int) and status >= 400:
-        print(f"  fetch rejected [{url[:70]}...]: HTTP {status}")
+        raise ChipsFetchError("http", f"HTTP {status}")
+    if raw is None:
         return None
-    if raw is None or (isinstance(raw, (bytes, str)) and not str(raw).strip()):
+    if isinstance(raw, bytes):
+        if not raw.strip():
+            return None
+    elif isinstance(raw, str) and not raw.strip():
         return None
     try:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         return json.loads(text)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-        print(f"  fetch rejected [{url[:70]}...]: {type(exc).__name__}: {exc}")
-        return None
+        raise ChipsFetchError("http", f"non-JSON body: {exc}") from exc
 
 
 def _num(value) -> float | None:

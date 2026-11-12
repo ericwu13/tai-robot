@@ -845,6 +845,13 @@ def check_once(cfg: dict, state: dict, vote_out: str,
                                note="Weekend — scoring paused (no night session to vote on)")
         state["weekend_pause_notified"] = True
         state["last_check"] = now.isoformat(timespec="seconds")
+        # A pause does not fetch. Leaving Friday's all-feeds-failed state
+        # in place would keep the P2 up until Monday's first real pass.
+        if state.get("fetch_status") in ("failed", "degraded"):
+            state["fetch_status"] = "ok"
+            state["fetch_error_streak"] = 0
+            state["feeds_failed"] = 0
+            state["last_feed_errors"] = []
         return state
     state["weekend_pause_notified"] = False
 

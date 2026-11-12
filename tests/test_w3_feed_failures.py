@@ -411,6 +411,36 @@ def test_parser_fixtures_taifex_yahoo_cnyes(monkeypatch):
 
 # ── 9. urllib timeout and the existing User-Agent ────────────────────────
 
+def test_weekend_pause_does_not_carry_a_failed_fetch(tmp_path):
+    """Saturday does not fetch. Friday's all-feeds-failed state must not
+    keep the P2 up until Monday."""
+    saturday = datetime(2026, 11, 14, 12, 0, tzinfo=_TPE)
+    assert saturday.weekday() == 5
+    cfg, state_path = _cfg(tmp_path, ["https://a.example/rss"])
+    seeded = {
+        "seen_guids": ["keep-me"],
+        "session_net": 1.25,
+        "session_peak": 2.5,
+        "fetch_status": "failed",
+        "fetch_error_streak": 4,
+        "feeds_failed": 13,
+        "feeds_ok": 0,
+        "last_feed_errors": [{"url": "https://a.example/rss", "kind": "network",
+                              "message": "getaddrinfo failed"}],
+        "error_streak": 2,
+    }
+    state = rss_scorer.check_once(cfg, dict(seeded), "", now=saturday)
+    assert state["session_net"] == 1.25
+    assert state["seen_guids"] == ["keep-me"]
+    assert state["error_streak"] == 2
+    assert state["fetch_status"] != "failed"
+    assert state.get("fetch_error_streak") == 0
+    rss_scorer.save_state(state_path, state)
+    from src.news.vote_status import _w3_status
+    w3 = _w3_status(state_path, saturday)
+    assert w3.fetch_failing is False
+
+
 def test_urlopen_called_with_timeout_and_existing_ua(monkeypatch):
     seen = {}
 
