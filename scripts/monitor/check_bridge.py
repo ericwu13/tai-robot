@@ -75,7 +75,15 @@ def _check_votes(now, paths, tonight_key, lines, findings):
         lines.append(
             f"  {st.source}: {vote_chip(st)} | last_check "
             f"{st.last_check or '-'} | {st.context or '-'}")
-        if st.source == "W4" and st.fetch_failing:
+        if st.stale:
+            # A task that died after a failed fetch is stale, not a live
+            # fetch failure. The fetch fields stay on the state file.
+            findings.append(Finding(
+                "P2", "bridge",
+                f"{st.source} bridge stale (last_check {st.last_check or '?'}, "
+                f"threshold {STALE_AFTER_H.get(st.source, 24.0):g}h)",
+                paths["regime_vote_path"]))
+        elif st.source == "W4" and st.fetch_failing:
             findings.append(Finding(
                 "P2", "bridge",
                 f"W4 fetch failed ×{st.fetch_error_streak}: {st.error}",
@@ -85,12 +93,6 @@ def _check_votes(now, paths, tonight_key, lines, findings):
                 "P2", "bridge",
                 f"W3 every feed failed ×{st.fetch_error_streak}: {st.error}",
                 paths["rss_state_file"]))
-        elif st.stale:
-            findings.append(Finding(
-                "P2", "bridge",
-                f"{st.source} bridge stale (last_check {st.last_check or '?'}, "
-                f"threshold {STALE_AFTER_H.get(st.source, 24.0):g}h)",
-                paths["regime_vote_path"]))
         elif st.failing:
             # Alive (last_check fresh) but every recent scoring call failed:
             # the vote silently stops.  Discord no longer posts each run.

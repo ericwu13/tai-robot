@@ -9,10 +9,12 @@ No test hits the network.
 from __future__ import annotations
 
 import json
+import os
 import socket
+import subprocess
 import sys
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -204,6 +206,45 @@ def test_holiday_calendar_import_falls_back_to_weekend_only(tmp_path, monkeypatc
     assert "holiday" not in weekday.lower()
 
 
+def test_weekday_holiday_from_a_clean_script_launch(tmp_path):
+    """The scheduled task runs ``python scripts/news_bridge/chips_monitor.py``.
+
+    That puts ``scripts/news_bridge`` on sys.path, not the repo root, and
+    pytest's rootdir is not there. A clean interpreter, cwd outside the
+    repo, and an empty PYTHONPATH must still call 2026-10-09 a holiday
+    (also 2026-01-01 and 2026-02-16). Before the repo-root insert those
+    three weekdays printed API lag; a Saturday did not, because it never
+    imports.
+    """
+    script = Path(chips.__file__).resolve()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    code = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('chips_clean', sys.argv[1])\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "for key in ('20260101', '20260216', '20261009'):\n"
+        "    print(key, mod.no_data_message(key))\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = ""
+    env.pop("PYTHONSAFEPATH", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(script)],
+        cwd=str(outside),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = dict(line.split(" ", 1) for line in proc.stdout.splitlines() if line[:8].isdigit())
+    for key in ("20260101", "20260216", "20261009"):
+        assert "holiday" in lines[key], (key, lines[key], proc.stderr)
+        assert "API lag" not in lines[key]
+
+
 def test_weekday_holiday_label_without_repo_on_syspath(monkeypatch):
     """chips_monitor.py is launched as a script, so sys.path[0] is
     scripts/news_bridge. A weekday holiday must still say TAIFEX holiday
@@ -227,34 +268,72 @@ def test_weekday_holiday_label_without_repo_on_syspath(monkeypatch):
     assert "API lag" not in text
 
 
-def test_incomplete_read_keeps_vote_and_exits_nonzero(tmp_path, monkeypatch):
-    """A truncated body is a transport failure, not an empty dataset."""
+class _Truncated:
+    def __init__(self, exc):
+        self._exc = exc
+        self.status = 200
+
+    def read(self):
+        raise self._exc
+
+    def getcode(self):
+        return 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _assert_transport_keeps_vote(base, vote, before):
+    state = chips.load_state(chips.state_path_for(base))
+    log = _log(base)
+    assert vote.read_bytes() == before
+    assert state.get("last_decided_date") != "20260814"
+    assert "fetch failed" in log.lower()
+    assert "no taifex data" not in log.lower()
+
+
+@pytest.mark.parametrize("exc_type", ["IncompleteRead", "BadStatusLine", "RemoteDisconnected"])
+def test_http_exception_on_taifex_keeps_vote_and_exits_nonzero(tmp_path, monkeypatch, exc_type):
+    """A cut-off body is a transport failure on the TAIFEX path.
+
+    IncompleteRead and BadStatusLine are HTTPException, not OSError, so
+    the generic handler used to treat them as empty data. RemoteDisconnected
+    is also an OSError, so it was already a transport failure.
+    """
     import http.client
     base = str(tmp_path / "regime_vote.json")
     vote = _seed_vote(base)
     before = vote.read_bytes()
-
-    class _Truncated:
-        status = 200
-
-        def read(self):
-            raise http.client.IncompleteRead(b"{\"partial\"")
-
-        def getcode(self):
-            return 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_a):
-            return False
-
-    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Truncated())
+    exc = getattr(http.client, exc_type)("cut off")
+    monkeypatch.setattr(
+        chips.urllib.request, "urlopen", lambda *_a, **_k: _Truncated(exc))
     assert chips.run_once(base, "20260814", _FRIDAY) != 0
-    assert vote.read_bytes() == before
-    log = _log(base)
-    assert "fetch failed" in log.lower()
-    assert "no taifex data" not in log.lower()
+    _assert_transport_keeps_vote(base, vote, before)
+
+
+@pytest.mark.parametrize("exc_type", ["IncompleteRead", "BadStatusLine", "RemoteDisconnected"])
+def test_http_exception_on_twse_keeps_vote_and_exits_nonzero(tmp_path, monkeypatch, exc_type):
+    """Same cut-off, after TAIFEX answered, on the TWSE path."""
+    import http.client
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    chips.save_state(chips.state_path_for(base), {"history": {"20260813": 0.0}})
+    row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "8,123"}
+    exc = getattr(http.client, exc_type)("cut off")
+
+    def fake(req, timeout=None, context=None):
+        if "twse.com.tw" in req.full_url:
+            return _Truncated(exc)
+        return _Body(json.dumps([row]).encode())
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, "20260814", _FRIDAY) != 0
+    _assert_transport_keeps_vote(base, vote, before)
 
 
 def test_http_404_is_no_data_not_a_transport_failure(tmp_path, monkeypatch):
@@ -314,3 +393,51 @@ def test_w4_fetch_failure_is_p2(tmp_path):
     p2 = [f.message for f in findings if f.level == "P2"]
     assert any(m.startswith("W4 fetch failed ×2:") and "getaddrinfo failed" in m for m in p2), p2
     assert not any("no TAIFEX data" in m for m in p2)
+
+
+def test_stale_fetch_failure_reports_stale_not_the_live_fetch(tmp_path):
+    """A task that died after a failed fetch is stale. The fetch finding
+    is for a bridge that is still checking in."""
+    d = tmp_path / "bridge"
+    d.mkdir()
+    now = datetime(2026, 8, 25, 6, 0, tzinfo=TPE)
+    old = (now - timedelta(days=5)).isoformat(timespec="seconds")
+    fresh_w2 = (now - timedelta(minutes=10)).isoformat(timespec="seconds")
+    message = "TAIFEX fetch failed (network: getaddrinfo failed) — vote kept, no decision"
+    (d / ".chips_state.json").write_text(json.dumps({
+        "last_check": old, "last_result": message, "last_fetch_error": message,
+        "fetch_error_streak": 3,
+    }), encoding="utf-8")
+    (d / "rss_scorer_state.json").write_text(json.dumps({
+        "last_check": (now - timedelta(hours=5)).isoformat(timespec="seconds"),
+        "session_net": 0.0, "error_streak": 0,
+        "fetch_status": "failed", "fetch_error_streak": 4, "feeds_failed": 13,
+        "feeds_ok": 0,
+        "last_feed_errors": [{"url": "https://feeds.bloomberg.com/markets/news.rss",
+                              "kind": "network", "message": "getaddrinfo failed"}],
+    }), encoding="utf-8")
+    (d / "monitor_state.json").write_text(json.dumps({
+        "last_check": fresh_w2, "last_result": "fresh",
+    }), encoding="utf-8")
+    (d / "events.json").write_text(json.dumps({
+        "version": 1, "updated_at": fresh_w2, "events": [],
+    }), encoding="utf-8")
+    (d / "monitor.log").write_text(
+        f"{(now - timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')} TPE | fresh\n",
+        encoding="utf-8")
+    (d / "chips_monitor.log").write_text(
+        "2026-08-24 16:15:04 TPE | vote trending-up\n"
+        "2026-08-24 18:15:04 TPE | no vote\n",
+        encoding="utf-8")
+    settings = {"news": {
+        "signal_path": str(d / "signal.json"),
+        "regime_vote_path": str(d / "regime_vote.json"),
+        "events_path": str(d / "events.json"),
+        "rss_state_file": str(d / "rss_scorer_state.json"),
+    }}
+    findings, _lines = check_bridge(now, settings, str(tmp_path / "live"))
+    p2 = [f.message for f in findings if f.level == "P2"]
+    assert any(m.startswith("W4 bridge stale") for m in p2), p2
+    assert any(m.startswith("W3 bridge stale") for m in p2), p2
+    assert not any(m.startswith("W4 fetch failed") for m in p2), p2
+    assert not any(m.startswith("W3 every feed failed") for m in p2), p2
