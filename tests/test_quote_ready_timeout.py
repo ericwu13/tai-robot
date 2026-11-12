@@ -338,7 +338,7 @@ def test_q4_while_connecting_does_not_enter_again(monkeypatch):
     not reset that attempt to DOWN. Exactly one EnterMonitorLONG.
     """
     drop = tpe(2026, 11, 12, 7, 30)
-    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=30))
+    app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=30))
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 0
     _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
@@ -351,7 +351,9 @@ def test_q4_while_connecting_does_not_enter_again(monkeypatch):
     clock["now"] = q4_at
     fake.set_now(q4_at)
     _arm_q4(monkeypatch, app)
+    before = len(logged)
     app._check_tick_watchdog()
+    assert "starting quote-down now" not in "\n".join(logged[before:])
     _tick(app, fake, clock, opened + timedelta(seconds=26))
     assert fake.calls.count("EnterMonitorLONG") == enters
     assert app._link_host.machine.quote == LinkPhase.CONNECTING
@@ -454,6 +456,139 @@ def test_disconnect_after_timeout_still_cleans_up(monkeypatch):
     rb.SKQuoteLibEvents().OnConnection(3033, 0)
     app._process_ui_queue()
     assert app._conn_monitor.downs == 1
+
+
+def _give_up_monitor():
+    class _Mon:
+        def __init__(self):
+            self.downs = 0
+
+        def on_disconnected(self):
+            self.downs += 1
+
+        def on_manual_reconnect(self):
+            return type("A", (), {"message": "manual"})()
+
+        def schedule_next(self, **_kwargs):
+            return type("A", (), {
+                "type": "give_up", "message": "paused", "delay_seconds": 0,
+            })()
+
+    return _Mon()
+
+
+def test_3021_in_the_gap_reconnects_after_settle_not_at_the_open(monkeypatch):
+    """A plain 3021 at 06:00 reconnects about 6s later, not at 08:45.
+
+    The closed-session hold is only for the 15s 3002 timeout.
+    """
+    at = tpe(2026, 11, 12, 6, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, at)
+    app._conn_monitor = _give_up_monitor()
+    clock["now"] = at
+    fake.set_now(at)
+    enters = fake.calls.count("EnterMonitorLONG")
+    fake.note_quote_down(at)
+    rb.SKQuoteLibEvents().OnConnection(3021, 0)
+    app._process_ui_queue()
+    _tick(app, fake, clock, at + timedelta(seconds=4))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, at + timedelta(seconds=6))
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert app._link_host.machine.quote == LinkPhase.CONNECTING
+    assert app._link_host.machine._quote_timeout_hold is False
+    assert app._link_host.machine._quote_enter_not_before is None
+
+
+def test_manual_reconnect_in_the_gap_is_not_held_until_the_open(monkeypatch):
+    """Timeout hold until 08:45. Manual Reconnect at 07:40 enters now."""
+    drop = tpe(2026, 11, 12, 7, 30)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    app._conn_monitor = _give_up_monitor()
+    app._reconnect_timer_id = None
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert machine._quote_enter_not_before == tpe(2026, 11, 12, 8, 45)
+    enters = fake.calls.count("EnterMonitorLONG")
+    press = tpe(2026, 11, 12, 7, 40)
+    clock["now"] = press
+    fake.set_now(press)
+    app._manual_reconnect()
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert machine.quote == LinkPhase.CONNECTING
+    assert machine._quote_timeout_hold is False
+    assert machine._quote_enter_not_before is None
+
+
+def test_timeout_after_leaving_ready_does_not_reset_the_attempt(monkeypatch):
+    """The 15s callback fires after the quote has already left READY.
+
+    Removing the phase guard, the mark guard, or note_quote_not_ready's
+    READY check would mark this attempt down.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _replay_drop(app, fake, clock, drop)
+    _deliver_3002(app)
+    assert app._quote_ready_timer_id is not None
+    machine = app._link_host.machine
+    started = drop + timedelta(seconds=1)
+    machine.quote = LinkPhase.CONNECTING
+    machine._quote_connect_started_at = started
+    machine._pending_3003 = False
+    app._quote_connected = True
+    before = len(logged)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    text = "\n".join(logged[before:])
+    assert "quote marked down" not in text
+    assert machine.quote == LinkPhase.CONNECTING
+    assert machine._quote_connect_started_at == started
+    assert machine._quote_enter_not_before is None
+    app._mark_quote_down_for_recovery(reason="probe")
+    assert app._quote_connected is True
+    assert machine.quote == LinkPhase.CONNECTING
+    machine.note_quote_not_ready(drop + timedelta(seconds=16))
+    assert machine.quote == LinkPhase.CONNECTING
+    assert machine._quote_connect_started_at == started
+    assert machine._pending_3003 is False
+
+
+def test_3003_clears_the_disconnect_cleanup_latch(monkeypatch):
+    """Ready (3003) clears the cleanup latch so a later 3021 still pauses.
+
+    The timeout clears ``_quote_connected`` without running cleanup.
+    After a 3021 the latch is set. A 3003 must clear it, or the next
+    timeout-then-3021 skips the tick-feed pause.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    app._live_runner = _Runner()
+    app._live_tick_active = True
+    app._conn_monitor = _give_up_monitor()
+    _replay_drop(app, fake, clock, drop)
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    rb.SKQuoteLibEvents().OnConnection(3021, 0)
+    app._process_ui_queue()
+    assert app._conn_monitor.downs == 1
+    assert app._disconnect_cleanup_done is True
+    assert app._live_tick_active is False
+    ready_at = drop + timedelta(seconds=20)
+    _deliver_3003(app, fake, clock, ready_at)
+    assert app._quote_connected is True
+    assert app._disconnect_cleanup_done is False
+    assert app._link_host.machine.quote == LinkPhase.READY
+    app._live_tick_active = True
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, ready_at + timedelta(seconds=15))
+    assert app._quote_connected is False
+    rb.SKQuoteLibEvents().OnConnection(3021, 0)
+    app._process_ui_queue()
+    assert app._conn_monitor.downs == 2
+    assert app._live_tick_active is False
 
 
 def test_0730_missing_3003_logs_clears_flag_and_starts_quote_down(monkeypatch):

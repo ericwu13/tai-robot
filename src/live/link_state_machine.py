@@ -216,6 +216,10 @@ class LinkStateMachine:
     # does not call EnterMonitor and does not run the stuck timer.
     # This machine has no session clock; the host passes the instant.
     _quote_enter_not_before: datetime | None = None
+    # Set only by note_quote_not_ready (the 15s 3002 timeout). Other
+    # downs (3021, 3033, watchdog) and manual Reconnect clear it so
+    # they keep the in-gap #178 behavior.
+    _quote_timeout_hold: bool = False
     _quote_connect_started_at: datetime | None = None
     _reply_connect_started_at: datetime | None = None
     _pending_3003: bool = False
@@ -290,16 +294,20 @@ class LinkStateMachine:
         self._quote_stuck_since = None
         self._quote_down_at = now
         self._quote_enter_not_before = enter_not_before
+        self._quote_timeout_hold = True
         self.entries_blocked = True
 
     def hold_quote_enter_until(self, when: datetime) -> None:
         """Pause EnterMonitor and the stuck timer until ``when``.
 
-        Only while the quote is DOWN. A CONNECTING attempt keeps its
-        own 3003 wait. Does not clear ``_pending_3003`` or the
-        connect-start clock. A hold that is already at least ``when``
-        is left alone, including its stuck clock.
+        Only a quote-down marked by ``note_quote_not_ready``. A 3021,
+        3033, or manual Reconnect does not take this hold. A CONNECTING
+        attempt keeps its own 3003 wait. Does not clear ``_pending_3003``
+        or the connect-start clock. A hold that is already at least
+        ``when`` is left alone, including its stuck clock.
         """
+        if not self._quote_timeout_hold:
+            return
         if self._shut_down or self.quote != LinkPhase.DOWN:
             return
         current = self._quote_enter_not_before
@@ -436,6 +444,11 @@ class LinkStateMachine:
         ``_unreconciled_since``. The press restarts that window from
         now. It does not clear it.
         """
+        # A timeout hold must not swallow this press. Clear it even
+        # when the machine is not DEGRADED: the host still ticks, and
+        # that tick is what reconnects. Other down paths never set it.
+        self._quote_timeout_hold = False
+        self._quote_enter_not_before = None
         if not self.degraded:
             return
         self.degraded = False
@@ -610,6 +623,7 @@ class LinkStateMachine:
             self.quote = LinkPhase.DOWN
             self._quote_down_at = at
             self._quote_enter_not_before = None
+            self._quote_timeout_hold = False
             self._pending_3003 = False
             self._quote_stuck_since = None
             self.orders_paused = True
@@ -636,6 +650,7 @@ class LinkStateMachine:
             self.quote = LinkPhase.DOWN
             self._quote_down_at = at
             self._quote_enter_not_before = None
+            self._quote_timeout_hold = False
             self._pending_3003 = False
             self._quote_stuck_since = None
             # A new quote drop is a new observation. An earlier
@@ -954,6 +969,7 @@ class LinkStateMachine:
         self._quote_stuck_since = None
         self._quote_connect_started_at = None
         self._quote_enter_not_before = None
+        self._quote_timeout_hold = False
         self._maybe_finish_solace_episode()
 
     def _service_quote(self, now: datetime) -> None:

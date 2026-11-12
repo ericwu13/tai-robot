@@ -2314,13 +2314,13 @@ class BacktestApp:
             host.note_complete(now)
 
     def _hold_quote_down_across_close(self, now) -> None:
-        """Do not let a quote-down stuck countdown DEGRADE across a close.
+        """Do not let a *timeout* quote-down DEGRADE across a close.
 
-        The timeout arms this hold only when it fires during a closed
-        session. A quote-down that starts while the session is still
-        open (for example 13:44) would otherwise keep the stuck timer
-        running through the close and DEGRADE inside the gap. Arm the
-        same hold as soon as the session is closed.
+        Only ``note_quote_not_ready`` sets the hold flag. A 3021, 3033,
+        watchdog drop, or manual Reconnect clears it and reconnects
+        in the gap. A timeout that starts while the session is still
+        open keeps the stuck timer until the close, then this hold
+        pauses it until the next open.
         """
         if is_market_open(now):
             return
