@@ -1,0 +1,263 @@
+"""W4 transport failures must keep the vote and exit non-zero.
+
+These fail on master (dc8b72b): a DNS/HTTP error is swallowed into
+"no TAIFEX data", the vote file is deleted, and the process exits 0.
+A genuine empty dataset still deletes the vote and exits 0.
+
+No test hits the network.
+"""
+from __future__ import annotations
+
+import json
+import socket
+import sys
+import urllib.error
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from scripts.monitor.check_bridge import check_bridge
+from src.news.vote_status import _w4_status
+from tests.test_chips_monitor import TPE, chips
+
+_AT_0415 = datetime(2026, 11, 12, 4, 15, tzinfo=TPE)  # Thursday catch-up slot
+_FRIDAY = datetime(2026, 8, 14, 16, 15, tzinfo=TPE)
+_SATURDAY = datetime(2026, 8, 15, 16, 15, tzinfo=TPE)
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    def blocked(*_a, **_k):
+        raise socket.gaierror(11001, "getaddrinfo failed")
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+
+
+class _Body:
+    def __init__(self, payload: bytes, status: int = 200):
+        self._payload = payload
+        self.status = status
+
+    def read(self):
+        return self._payload
+
+    def getcode(self):
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def _gaierror():
+    return urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed"))
+
+
+def _seed_vote(base: str, payload: bytes = b'{"direction":"trending-up","source":"W4"}\n') -> Path:
+    vote = chips.w4_vote_path(base)
+    vote.parent.mkdir(parents=True, exist_ok=True)
+    vote.write_bytes(payload)
+    return vote
+
+
+def _log(base: str) -> str:
+    path = Path(base).parent / chips.LOG_NAME
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def _patch_empty(monkeypatch):
+    monkeypatch.setattr(chips, "fetch_taifex_foreign_net_oi", lambda _d: None)
+    monkeypatch.setattr(chips, "fetch_twse_foreign_net_buy", lambda _d: None)
+
+
+# ── 6. DNS at the 04:15 slot keeps the vote; TWSE transport does too ────
+
+def test_getaddrinfo_at_0415_keeps_vote_file(tmp_path, monkeypatch):
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    monkeypatch.setattr(chips.urllib.request, "urlopen",
+                        lambda *_a, **_k: (_ for _ in ()).throw(_gaierror()))
+    code = chips.run_once(base, None, _AT_0415)
+    state = chips.load_state(chips.state_path_for(base))
+    log = _log(base)
+    assert code != 0
+    assert vote.read_bytes() == before
+    assert not state.get("last_decided_date")
+    assert state.get("fetch_error_streak", 0) >= 1
+    assert "fetch failed" in log.lower()
+    assert "fetch failed" in (state.get("last_result") or "").lower()
+    assert "no taifex data" not in log.lower()
+    assert "no taifex data" not in (state.get("last_result") or "").lower()
+
+
+def test_twse_transport_error_keeps_vote_and_does_not_decide(tmp_path, monkeypatch):
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    chips.save_state(chips.state_path_for(base), {"history": {"20260813": 0.0}})
+    row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "8,123"}
+
+    def fake(req, timeout=None, context=None):
+        if "twse.com.tw" in req.full_url:
+            raise _gaierror()
+        return _Body(json.dumps([row]).encode())
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    code = chips.run_once(base, "20260814", _FRIDAY)
+    state = chips.load_state(chips.state_path_for(base))
+    log = _log(base)
+    assert code != 0
+    assert vote.read_bytes() == before
+    assert state.get("last_decided_date") != "20260814"
+    assert "fetch failed" in log.lower()
+    assert "no taifex data" not in log.lower()
+
+
+def test_http_500_keeps_the_vote_and_exits_nonzero(tmp_path, monkeypatch):
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+
+    def fake(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(req.full_url, 500, "Server Error", hdrs=None, fp=None)
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, "20260814", _FRIDAY) != 0
+    assert vote.read_bytes() == before
+    assert "no taifex data" not in _log(base).lower()
+
+
+def test_network_failure_marks_the_run_and_exits_nonzero(tmp_path, monkeypatch):
+    base = tmp_path / "regime_vote.json"
+    vote = _seed_vote(str(base))
+    before = vote.read_bytes()
+    monkeypatch.setattr(chips.urllib.request, "urlopen",
+                        lambda *_a, **_k: (_ for _ in ()).throw(_gaierror()))
+    monkeypatch.setattr(sys, "argv", ["chips_monitor.py", "--base-path", str(base),
+                                      "--date", "20260814"])
+    assert chips.main() != 0
+    assert vote.read_bytes() == before
+    path = tmp_path / "runs" / "W4.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    assert rows[-1]["ok"] is False
+    assert rows[-1]["exit_code"] not in (None, 0)
+    assert "fetch failed" in (rows[-1].get("error") or "").lower()
+    assert "no taifex data" not in (rows[-1].get("error") or "").lower()
+    assert "no taifex data" not in _log(str(base)).lower()
+
+
+# ── 7. a real empty day still deletes the vote and exits 0 ──────────────
+
+def test_real_holiday_still_no_vote(tmp_path, monkeypatch):
+    """Weekend and a confirmed weekday holiday say holiday and exit 0.
+    An open weekday with an empty payload says API lag, not holiday.
+    The existing no-data deletion (test_run_once_no_data_deletes_stale_vote) stays."""
+    base = str(tmp_path / "regime_vote.json")
+    _patch_empty(monkeypatch)
+
+    vote = _seed_vote(base)
+    code = chips.run_once(base, "20260815", _SATURDAY)
+    state = chips.load_state(chips.state_path_for(base))
+    assert code == 0
+    assert not vote.exists()
+    assert "TAIFEX holiday" in state["last_result"]
+    assert "no TAIFEX data" in state["last_result"]
+
+    vote = _seed_vote(base)
+    code = chips.run_once(base, "20260814", _FRIDAY)
+    state = chips.load_state(chips.state_path_for(base))
+    assert code == 0
+    assert not vote.exists()
+    assert "no data yet (API lag)" in state["last_result"]
+    assert "holiday" not in state["last_result"].lower()
+
+    code = chips.run_once(base, "20260101", datetime(2026, 1, 1, 16, 15, tzinfo=TPE))
+    state = chips.load_state(chips.state_path_for(base))
+    assert code == 0
+    assert "TAIFEX holiday" in state["last_result"]
+
+
+def test_holiday_calendar_import_falls_back_to_weekend_only(tmp_path, monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "src.market_data.holidays":
+            raise ImportError("calendar unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    _patch_empty(monkeypatch)
+    base = str(tmp_path / "regime_vote.json")
+
+    assert chips.run_once(base, "20260815", _SATURDAY) == 0
+    weekend = chips.load_state(chips.state_path_for(base))["last_result"]
+    assert "TAIFEX holiday" in weekend
+
+    assert chips.run_once(base, "20260101", datetime(2026, 1, 1, 16, 15, tzinfo=TPE)) == 0
+    weekday = chips.load_state(chips.state_path_for(base))["last_result"]
+    assert "no data yet (API lag)" in weekday
+    assert "holiday" not in weekday.lower()
+
+
+def test_http_404_is_no_data_not_a_transport_failure(tmp_path, monkeypatch):
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+
+    def fake(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", hdrs=None, fp=None)
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, "20260814", _FRIDAY) == 0
+    assert not vote.exists()
+    state = chips.load_state(chips.state_path_for(base))
+    assert "no data yet (API lag)" in state["last_result"]
+    assert "fetch failed" not in _log(base).lower()
+
+
+# ── surfacing: check_bridge P2 ───────────────────────────────────────────
+
+def test_w4_fetch_failure_is_p2(tmp_path):
+    d = tmp_path / "bridge"
+    d.mkdir()
+    now = datetime(2026, 8, 25, 6, 0, tzinfo=TPE)
+    fresh = "2026-08-25T05:40:00+08:00"
+    message = ("TAIFEX fetch failed (network: getaddrinfo failed) "
+               "— vote kept, no decision")
+    (d / ".chips_state.json").write_text(json.dumps({
+        "last_check": fresh,
+        "last_result": message,
+        "last_fetch_error": message,
+        "fetch_error_streak": 2,
+    }), encoding="utf-8")
+    (d / "monitor_state.json").write_text(json.dumps({
+        "last_check": fresh, "last_result": "fresh",
+    }), encoding="utf-8")
+    (d / "rss_scorer_state.json").write_text(json.dumps({
+        "last_check": fresh, "session_net": 0.0, "error_streak": 0,
+    }), encoding="utf-8")
+    (d / "events.json").write_text(json.dumps({
+        "version": 1, "updated_at": fresh, "events": [],
+    }), encoding="utf-8")
+    (d / "monitor.log").write_text("2026-08-25 05:50:00 TPE | fresh\n", encoding="utf-8")
+    (d / "chips_monitor.log").write_text(
+        "2026-08-24 16:15:04 TPE | vote trending-up\n"
+        "2026-08-24 18:15:04 TPE | no vote\n",
+        encoding="utf-8")
+    w4 = _w4_status(str(d / "regime_vote.json"), now)
+    assert getattr(w4, "fetch_failing", False) is True
+    assert w4.fetch_error_streak == 2
+    settings = {"news": {
+        "signal_path": str(d / "signal.json"),
+        "regime_vote_path": str(d / "regime_vote.json"),
+        "events_path": str(d / "events.json"),
+        "rss_state_file": str(d / "rss_scorer_state.json"),
+    }}
+    findings, _lines = check_bridge(now, settings, str(tmp_path / "live"))
+    p2 = [f.message for f in findings if f.level == "P2"]
+    assert any(m.startswith("W4 fetch failed ×2:") and "getaddrinfo failed" in m for m in p2), p2
+    assert not any("no TAIFEX data" in m for m in p2)

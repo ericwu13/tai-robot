@@ -75,7 +75,12 @@ def _check_votes(now, paths, tonight_key, lines, findings):
         lines.append(
             f"  {st.source}: {vote_chip(st)} | last_check "
             f"{st.last_check or '-'} | {st.context or '-'}")
-        if st.source == "W3" and st.fetch_failing:
+        if st.source == "W4" and st.fetch_failing:
+            findings.append(Finding(
+                "P2", "bridge",
+                f"W4 fetch failed ×{st.fetch_error_streak}: {st.error}",
+                paths["regime_vote_path"]))
+        elif st.source == "W3" and st.fetch_failing:
             findings.append(Finding(
                 "P2", "bridge",
                 f"W3 every feed failed ×{st.fetch_error_streak}: {st.error}",

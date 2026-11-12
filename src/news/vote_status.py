@@ -236,6 +236,20 @@ def _apply_w3_fetch(st: SourceStatus, state: dict) -> None:
     st.context = f"{warn} — {st.context}" if st.context else warn
 
 
+def _apply_w4_fetch(st: SourceStatus, state: dict) -> None:
+    """A transport-error streak is a P2, distinct from a holiday no-vote."""
+    streak = state.get("fetch_error_streak")
+    if not isinstance(streak, int) or isinstance(streak, bool) or streak < 1:
+        return
+    message = str(state.get("last_fetch_error") or state.get("last_result")
+                  or "fetch failed")[:200]
+    st.fetch_failing = True
+    st.fetch_error_streak = streak
+    st.error = message
+    warn = f"⚠ 抓取失敗 fetch failed ×{streak}: {message}"
+    st.context = f"{warn} — {st.context}" if st.context else warn
+
+
 def _w4_status(regime_vote_path: str, now: datetime, read_json=_read_json) -> SourceStatus:
     st = SourceStatus("W4", label=SOURCE_LABELS["W4"])
     state = None
@@ -254,6 +268,8 @@ def _w4_status(regime_vote_path: str, now: datetime, read_json=_read_json) -> So
     _liveness(st, state, now)
     if state and not st.context:
         st.context = str(state.get("last_result") or "")
+    if state:
+        _apply_w4_fetch(st, state)
     return st
 
 
