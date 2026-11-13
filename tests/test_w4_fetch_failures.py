@@ -636,7 +636,12 @@ def test_empty_list_after_decided_vote_keeps_the_vote(tmp_path, monkeypatch):
     assert vote.read_bytes() == before
     state = chips.load_state(chips.state_path_for(base))
     assert state["last_decided_date"] == decided
-    assert "no taifex data" in _log(base).lower()
+    log = _log(base).lower()
+    assert "no-data" in log
+    assert f"decided vote for {friday} left unchanged" in log
+    # The streak phrase would count a kept vote as voteless.
+    assert "no taifex data" not in log
+    assert "decided vote for 20260831" not in log
 
 
 def test_twse_zero_rows_is_no_data_and_keeps_vote(tmp_path, monkeypatch):

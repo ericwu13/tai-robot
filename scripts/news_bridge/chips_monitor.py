@@ -728,6 +728,25 @@ def _abort_fetch(state: dict, now: datetime, spath, base_path: str,
     return 1
 
 
+def _kept_vote_no_data_message(no_data: str, decided: str) -> str:
+    """No-data line for a vote that stays on disk.
+
+    Names *decided*, the dataset the vote came from. On a scheduled
+    ``[]`` the pass's trade date has already replaced ``date_key``, so
+    naming that date would point at today instead of the dataset.
+    The ``no TAIFEX data`` prefix is dropped: that phrase is what the
+    voteless streak counts, and this pass still has a vote.
+    """
+    prefix = "no TAIFEX data"
+    detail = str(no_data or "").strip()
+    if detail.lower().startswith(prefix.lower()):
+        detail = detail[len(prefix):].strip(" \t—-")
+    body = f"decided vote for {decided} left unchanged"
+    if detail:
+        return f"no-data — {detail}; {body}"
+    return f"no-data — {body}"
+
+
 def _no_data_keep_vote(state: dict, now: datetime, spath, base_path: str,
                        dry_run: bool, message: str) -> int:
     """Log *message* and leave the vote file bytes alone. Exit 0.
@@ -844,7 +863,7 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
         if empty_result and (same_explicit_day or same_session):
             return _no_data_keep_vote(
                 state, now, spath, base_path, dry_run,
-                f"{no_data} — decided vote for {date_key} left unchanged")
+                _kept_vote_no_data_message(no_data, decided))
         print(f"  {no_data}")
         if not dry_run:
             delete_stale_vote(base_path)
