@@ -78,11 +78,13 @@ and the single operator action. Daily report files exist only where
 "Did the slot fire" (stage 1) is not "is evolution working". Every week
 also answer, from primary evidence only. Fleet files (`data/ai_usage.csv`, `data/live/<bot>/session.json`, debug logs) need an ssh read permitted per `start-here` §7; without it, use this PC's copies, labelled 'this PC only, not the fleet verdict'.
 
-1. **Attempt history** — the data host's `data/ai_usage.csv` (UTC; TPE =
-   +8): per past Saturday, plan rows (`bot_evolution`) vs candidate rows
-   (`evolution_codegen_*`). A Saturday with a plan but no codegen row =
-   plan said `no_change`; no rows at all = skip or app closed (check the
-   start line). Report the streak of Saturdays with no candidate.
+1. **Attempt history** — read `data/ai_usage.csv` at the ledger path the
+   brief names (UTC; TPE = +8): per past Saturday, plan rows
+   (`bot_evolution`) vs candidate rows (`evolution_codegen_*`). A Saturday
+   with a plan but no codegen row = plan said `no_change`. A missing,
+   empty, or out-of-week ledger (no rows dated inside the review week) is
+   UNGRADED, never a 'no candidate' streak. Report that streak only from
+   in-week rows.
 2. **Verdict outcome** — the verdict block is NOT persisted anywhere
    local (the Tk chat auto-save only fires at window close, and the bot
    token cannot read Discord history: HTTP 403). The only on-disk trace is
