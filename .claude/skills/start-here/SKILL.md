@@ -38,7 +38,7 @@ git rev-list --count HEAD..origin/master   # >0 = this tree is stale
 | Thing | Where | How to reach |
 |---|---|---|
 | all live bots (12, headless `tai_backtest.exe deploy … --resume`) | **Steven** (2nd Windows PC) | `tailscale-ssh` skill |
-| bot data dirs (`session.json`, `bars_1m_*.csv`, `debug_*.log`, `.lock`) | Steven `E:\tai_robot_v<version>\tai_backtest\data\live\<SYMBOL>_<bot>` | dashboard API (below), or ssh |
+| bot data dirs (`session.json`, `bars_1m_*.csv`, `debug_*.log`, `.lock`) | Steven `E:\tai_robot_v<version>\tai_backtest\data\live\<SYMBOL>_<bot>` | dashboard API (§3). An ssh read needs permission per §7 |
 | bot dashboard (read-only + opt-in controls) | Steven, port 8765, bound to loopback + Steven's tailnet IP | `http://<steven tailnet ip>:8765/` |
 | news bridges W1–W4 | Steven scheduled tasks `\TaiRobot\Bridge-W*` | `bridge-health` skill |
 | local n8n | stopped (Manual) since 2026-10-24 | only for history |
@@ -112,15 +112,20 @@ in your report — do not stall the task waiting for Fable.
 | weekly evolution never improves anything | `evo-debug` |
 | GitHub issue → root cause → PR | `issue-triage` → `validate-findings` → `fix-pr` |
 | daily / weekly health digest | `daily-review`, `weekly-review` |
-| shell on Steven | `tailscale-ssh` |
+| shell on Steven | `tailscale-ssh` (not by default; §7) |
 
 ## 7. Data host
 
 Host map is §2. Data host = the host `/api/fleet` reports as running the
-bot (today: Steven). Read live state from
-`http://<Steven tailnet IP>:8765/api/fleet` (address in `hosts.local.yaml`).
-The output must name the host the data came from. A run on this PC
-describes this PC only — never publish it as fleet health.
+bot (today: Steven). The output must name the host the data came from.
+A run on this PC describes this PC only — never publish it as fleet health.
 
-HTTP reads (`/api/fleet`, `/api/bot`) are read-only; running any script
-on that host needs explicit permission in the brief (`tailscale-ssh`).
+The fleet path is read-only HTTP (`/api/fleet`, `/api/bot`; address in
+`hosts.local.yaml`). No script runs on Steven by default.
+
+`daily_review.py` and `check_logs.py` on Steven are not supported until
+those scripts take a base-dir flag (tracked follow-up). Both always read
+`REPO_ROOT/data/live` (`scripts/monitor/common.py:426-427`). `daily_review.py`
+writes `data/monitor/*.md` unless `--no-report-file`
+(`scripts/monitor/daily_review.py:269-291`) and would write that on a live
+host. Do not run either there under any permission.
