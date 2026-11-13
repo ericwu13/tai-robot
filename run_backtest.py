@@ -11451,16 +11451,18 @@ class BacktestApp:
         # Get the actual fill price.
         # ENTRY: OnNewData deal row if already arrived, else OpenInterest
         # avg_cost (identical for a 1-lot position).
-        # EXIT: OnNewData deal row recorded on trades[-1].real_exit_price
-        # (issue #92). If that row never arrives, a retry chain polls
-        # GetFulfillReport(1) (per-fill detail, issue #218) for about 90s.
+        # EXIT: the real price on the record that owns this exit seq
+        # (the parked exit, or trades[-1]). If that price hasn't
+        # arrived, a retry chain polls GetFulfillReport(1) (per-fill
+        # detail, issue #218) for about 90s.
         # Exhaustion keeps the sim price, marks the trade estimated, and
         # a late OnNewData/poll sends a Discord correction.
         fill_price = ""
         _exit_fill_deferred = False
         pos = self._fill_poller.pos_current
         if poller_action_type == "exit" and self._live_runner:
-            real_px = self._real_exit_price_from_broker()
+            real_px = self._real_exit_price_from_broker(
+                getattr(self, "_last_exit_order_seq", ""))
             if real_px:
                 fill_price = str(real_px)
             else:
@@ -11562,17 +11564,25 @@ class BacktestApp:
             else:
                 _log(f"FILL CONFIRM DONE: no deferred close to replay")
 
-    def _real_exit_price_from_broker(self) -> int:
-        """The OnNewData-recorded real exit price of the latest trade.
+    def _real_exit_price_from_broker(self, seq: str | None = None) -> int:
+        """Real exit price on the record that owns ``seq``.
 
-        0 when the deal report hasn't arrived yet (or paper mode).
+        A parked seq is owned by ``pending_real_exit_price``. Otherwise
+        the owner is ``trades[-1]``, and a price there counts only when
+        that trade's exit seq is empty or equal to ``seq``. 0 when that
+        record has no price yet. ``seq`` defaults to the last exit order.
         """
         if not self._live_runner:
             return 0
         broker = self._live_runner.broker
-        if not broker.trades:
-            return 0
-        return getattr(broker.trades[-1], "real_exit_price", 0)
+        if seq is None:
+            seq = getattr(self, "_last_exit_order_seq", "")
+        reader = getattr(broker, "exit_price_for_seq", None)
+        if reader is None:
+            if not getattr(broker, "trades", None):
+                return 0
+            return int(getattr(broker.trades[-1], "real_exit_price", 0) or 0)
+        return int(reader(seq) or 0)
 
     # ── Exit fill price retry (issue #92, layout fixed in #218) ──
     #
@@ -11590,7 +11600,8 @@ class BacktestApp:
             return True
         if not self._last_exit_order_seq:
             return False
-        return self._real_exit_price_from_broker() == 0
+        return self._real_exit_price_from_broker(
+            getattr(self, "_last_exit_order_seq", "")) == 0
 
     def _cancel_exit_fill_retry(self) -> None:
         """Drop a pending exit-fill poll so a stop cannot save later.
@@ -11655,12 +11666,18 @@ class BacktestApp:
         elapsed_ms = int((time.monotonic() - ctx["started"]) * 1000)
         seq = self._last_exit_order_seq
 
-        real_px = self._real_exit_price_from_broker()
+        real_px = self._real_exit_price_from_broker(seq)
         source = "OnNewData"
         rate_limited = False
         if not real_px:
-            real_px, rate_limited = self._poll_exit_fill_via_report(seq)
-            source = "GetFulfillReport(1)"
+            _reported, rate_limited = self._poll_exit_fill_via_report(seq)
+            # Resolved only when the record that owns this seq now holds
+            # a price. A match that landed on a different record, or a
+            # report price that was not stored, does not count. A price
+            # written by an earlier path does.
+            real_px = self._real_exit_price_from_broker(seq)
+            if real_px:
+                source = "GetFulfillReport(1)"
 
         _log(f"EXIT FILL RETRY: real_px={real_px} source={source} "
              f"seq={seq} attempt={ctx['attempt']} elapsed_ms={elapsed_ms} "
@@ -11713,8 +11730,12 @@ class BacktestApp:
     def _poll_exit_fill_via_report(self, target_seq: str) -> tuple[int, bool]:
         """Poll GetFulfillReport(1). ``(price, rate_limited)``.
 
-        Price is 0 when nothing was assigned. ``rate_limited`` is True
-        on M999 — the caller backs off and does not consume an attempt.
+        The matched row is written onto the record that owns
+        ``target_seq``: the parked exit when that seq is parked, and
+        ``trades[-1]`` otherwise. A record that already holds a price
+        for this seq is left as it is (a duplicate fill is idempotent).
+        The returned price is the row that matched. ``rate_limited`` is
+        True on M999 — the caller backs off and does not consume an attempt.
         """
         if not target_seq or not _com_available or skO is None:
             return 0, False
@@ -11765,18 +11786,18 @@ class BacktestApp:
 
         broker = self._live_runner.broker if self._live_runner else None
         accepted = False
-        if broker:
+        if broker and not broker.exit_price_for_seq(target_seq):
             last = broker.trades[-1] if broker.trades else None
-            if last and last.real_exit_price == 0:
-                fill_dt = _taipei_now().replace(tzinfo=None
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                accepted = broker.try_set_real_exit_price(
-                    match.price,
-                    exit_bar_index=getattr(last, "exit_bar_index", -1),
-                    fill_dt=fill_dt,
-                    seq=target_seq)
-                _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
-                     f"via {match.reason} accepted={accepted}")
+            fill_dt = _taipei_now().replace(tzinfo=None
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            accepted = broker.try_set_real_exit_price(
+                match.price,
+                exit_bar_index=(getattr(last, "exit_bar_index", -1)
+                                if last else -1),
+                fill_dt=fill_dt,
+                seq=target_seq)
+            _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
+                 f"via {match.reason} accepted={accepted}")
         if accepted:
             self._fill_tracker.note_credited(match.row_key)
         return match.price, False

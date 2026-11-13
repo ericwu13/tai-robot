@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class OrderSide(Enum):
@@ -307,6 +310,8 @@ class SimulatedBroker:
         self.pending_exit_order_seq: str = ""
         self.pending_real_exit_price: int | None = None
         self.pending_real_exit_dt: str = ""
+        # Seqs already logged as an unattributed exit fill. One warning each.
+        self._unattributed_exit_warned: set[str] = set()
 
         # Last exit metadata — read by live_runner to determine real order type
         self.last_exit_type: str = ""  # "limit", "stop", "close", "force_close"
@@ -639,11 +644,13 @@ class SimulatedBroker:
         open) is stored on that parked record and copied onto its Trade
         at close. A seq that matches ``trades[-1].exit_order_seq`` is
         that closed trade's own late fill and is written there even
-        while another exit is parked. ``seq`` None, and any other seq
-        while an exit is parked, does not price ``trades[-1]``. With
-        nothing parked, a seq that matches neither record still uses
-        the bar match so a report poll can price a trade that has no
-        exit seq.
+        while another exit is parked.
+
+        The bar-match fallback runs only when nothing is parked and
+        ``trades[-1].exit_order_seq`` is empty or equal to this fill's
+        seq. A seq that matches neither record, with nothing parked, is
+        not written. That refusal is logged once at WARNING with the
+        seq and the price.
 
         Other rejections: ``price <= 0``, no trade to update, or a
         price already stored for that leg (the first fill wins).
@@ -668,14 +675,21 @@ class SimulatedBroker:
             last.real_exit_dt = fill_dt
             last.real_exit_estimated = False
             return True
-        # Unattributable, or a seq that belongs to neither record.
         # A parked exit must not be priced onto the previous trade.
-        # With nothing parked, a bar match is the pre-seq write.
         if self.pending_exit_order_seq:
             return False
         if not self.trades:
             return False
         last = self.trades[-1]
+        owned = str(last.exit_order_seq or "")
+        # Bar match only when this trade has no exit seq, or the fill
+        # is that seq. Anything else is unattributed: log once, write nothing.
+        if owned and owned != seq_s:
+            if seq_s and seq_s not in self._unattributed_exit_warned:
+                self._unattributed_exit_warned.add(seq_s)
+                logger.warning(
+                    "unattributed exit fill seq=%s price=%s", seq_s, int(price))
+            return False
         if last.real_exit_price != 0:
             return False
         if last.exit_bar_index != exit_bar_index:
@@ -684,6 +698,25 @@ class SimulatedBroker:
         last.real_exit_dt = fill_dt
         last.real_exit_estimated = False
         return True
+
+    def exit_price_for_seq(self, seq: str | None) -> int:
+        """Real exit price on the record that owns ``seq``.
+
+        A parked seq is owned by ``pending_real_exit_price``. Any other
+        seq is owned by ``trades[-1]``, and a price there counts only
+        when that trade's exit seq is empty or equal to ``seq``. A price
+        that sits only on the other record is 0.
+        """
+        seq_s = str(seq).strip() if seq is not None else ""
+        if seq_s and seq_s == self.pending_exit_order_seq:
+            return int(self.pending_real_exit_price or 0)
+        if not self.trades:
+            return 0
+        last = self.trades[-1]
+        owned = str(last.exit_order_seq or "")
+        if seq_s and owned and owned != seq_s:
+            return 0
+        return int(last.real_exit_price or 0)
 
     def note_real_order_sent(self, action_type: str, seq: str, bar_index: int,
                              open_position: bool = False) -> bool:
