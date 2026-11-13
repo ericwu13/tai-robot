@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import run_backtest as rb
-from src.backtest.broker import OrderSide
+from src.backtest.broker import OrderSide, Trade
 from src.live.fill_poller import FillPoller
 from src.live.live_runner import LiveRunner
 from src.live.session_store import load_session
@@ -386,3 +386,47 @@ def test_abort_popup_comes_after_teardown(tmp_path, monkeypatch):
     app._quote_connected = False
     app._start_live_tick_subscription()
     assert seen == [(None, rb.LiveState.STOPPED, 1)]
+
+
+def test_abort_does_not_latch_the_daily_report(tmp_path, monkeypatch):
+    """A keep-position abort must not burn this session's report.
+
+    The debounce key is persisted. Emitting while the position stays
+    open makes the later exit (session end, or a real stop after
+    ``--resume``) a no-op.
+    """
+    import src.daily_report.report_generator as rg
+    monkeypatch.setattr(rg, "_REPORTS_DIR", tmp_path / "reports")
+
+    runner = _runner(tmp_path, "auto")
+    runner.broker.trades.append(Trade(
+        tag="Long", side=OrderSide.LONG, qty=1,
+        entry_price=22000, exit_price=22100,
+        entry_bar_index=1, exit_bar_index=2,
+        pnl=20000, exit_tag="TP",
+        entry_dt="2026-11-13 15:10", exit_dt="2026-11-13 16:00",
+    ))
+    emitted = []
+    runner.on("on_daily_report", emitted.append)
+    app, _discord = _app(monkeypatch, runner, "auto")
+    app._quote_connected = False
+
+    app._start_live_tick_subscription()
+
+    assert runner.broker.position_size == 1
+    assert emitted == []
+    assert not runner._last_report_key
+    saved = load_session(runner.session_path)
+    assert not saved.get("last_report_key")
+    assert saved["broker"]["position_size"] == 1
+
+    resumed = LiveRunner(
+        SilentStrategy(), "TX00", point_value=200,
+        log_dir=str(tmp_path), bot_name="abortbot",
+    )
+    later = []
+    resumed.on("on_daily_report", later.append)
+    resumed.restore_session(saved)
+    resumed._generate_daily_report()
+    assert len(later) == 1
+    assert resumed._last_report_key

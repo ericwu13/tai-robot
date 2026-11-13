@@ -1969,8 +1969,10 @@ class LiveRunner:
     def stop(self, *, keep_position: bool = False) -> dict:
         """Stop live runner: flush aggregator, force-close position, return summary.
 
-        ``keep_position`` (deploy abort): skip the force-close so the
-        open position is saved in session.json for ``--resume``.
+        ``keep_position`` (deploy abort): skip the force-close and the
+        daily report. The open position is saved for ``--resume``, and
+        ``last_report_key`` stays unset so the session-end report still
+        fires after the position is closed.
         """
         if self.state == LiveState.STOPPED:
             return self._summary()
@@ -1985,7 +1987,10 @@ class LiveRunner:
             self.force_close_position("stop", "live runner stopped")
 
         self._auto_save_session()
-        self._generate_daily_report()
+        # A kept position is still this session. Emitting now would latch
+        # last_report_key and the later exit would never be reported.
+        if not keep_position:
+            self._generate_daily_report()
         self.csv_logger.close()
         self.release_lock()
         self.state = LiveState.STOPPED
