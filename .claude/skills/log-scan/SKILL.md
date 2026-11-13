@@ -49,6 +49,7 @@ message body:
 | P2 | `Discarded pending recommendation` |
 | P3 | `Dropped out-of-order aggregated bar` |
 | P3 | `Discarded recommendation` |
+| history | `n8n.workflow.failed` — retired local n8n; if check_logs.py prints it, ignore (not live) |
 
 Findings are deduped per (pattern, file) and capped at 5 example lines,
 each redacted before it is printed.
