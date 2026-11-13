@@ -85,3 +85,63 @@ def test_headless_override_does_not_call_through():
     src = inspect.getsource(HeadlessBotApp._render_report_view)
     assert "super()" not in src and "_render_report_view_now" not in src
     assert "_flush_report_render" in inspect.getsource(rb.BacktestApp._render_report_view)
+
+
+@_tk_skip
+def test_headless_reconnect_history_transition_builds_no_report_widgets(headless, monkeypatch, tmp_path):
+    """#285 follow-up: after 3003 Ready the resubscribe replays history ticks;
+    the first fresh tick fires the history→live transition, which refreshed
+    the Report tab. Headless must not rebuild it there either."""
+    from datetime import datetime, timedelta
+    import run_backtest as rb
+    from src.backtest.strategy import BacktestStrategy
+    from src.live.live_runner import LiveRunner, LiveState
+    from src.market_data.bar_builder import BarBuilder
+
+    class _Q(BacktestStrategy):
+        kline_type = 0
+        kline_minute = 5
+
+        def on_bar(self, bar, ds, broker):
+            return None
+
+        def required_bars(self):
+            return 1
+
+    now = datetime(2026, 11, 13, 8, 48, 30)
+    monkeypatch.setattr(rb, "_taipei_now", lambda: now.replace(tzinfo=rb._TZ_TAIPEI))
+
+    class _B:
+        def request_ticks(self, *_a):
+            return 0
+
+        def request_stock_list(self, *_a):
+            return 0
+
+    monkeypatch.setattr(rb, "_broker", _B())
+    calls = []
+    monkeypatch.setattr(rb.BacktestApp, "_render_report_view_now",
+                        lambda self, *a, **k: calls.append(1))
+    app = headless
+    runner = LiveRunner(_Q(), "TMF00", log_dir=str(tmp_path / "logs"))
+    runner.state = LiveState.RUNNING
+    app._live_runner = runner
+    app._live_bar_builder = BarBuilder("TMF00", interval=60)
+    app._live_tick_symbol = "TMF00"
+    app._live_tick_com_symbol = "TX00"
+    app._live_tick_active = False  # keep _drain_tick_queue from rescheduling
+    app._resubscribe_ticks()
+    app._live_tick_active = False
+
+    def sk(dt):
+        return (dt.year * 10000 + dt.month * 100 + dt.day,
+                dt.hour * 10000 + dt.minute * 100 + dt.second, 0)
+
+    t = datetime(2026, 11, 13, 8, 45)
+    while t < now - timedelta(seconds=150):  # stale history replay
+        app._on_com_tick(*sk(t), 2300000, 2300100, 2300000, 1, 0, True)
+        t += timedelta(seconds=5)
+    assert app._live_history_done is False
+    app._on_com_tick(*sk(now - timedelta(seconds=1)), 2300000, 2300100, 2300000, 1, 0, False)
+    assert app._live_history_done is True  # transition fired
+    assert calls == []
