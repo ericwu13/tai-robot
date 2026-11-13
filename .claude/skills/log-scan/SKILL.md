@@ -61,7 +61,7 @@ each redacted before it is printed.
   log reaches ~9 MB. The helper tails them (2 MB) rather than reading
   whole files — do the same if you go in manually.
 - Log lines carry two clocks: `[<TPE> / <local>]`. The **first**
-  timestamp is TPE. The second is the host's local clock (this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there))
+  timestamp is TPE. The second is the host's local clock (clocks → `start-here` §4)
   and must never be used for reasoning about sessions.
 - `swap_strategy refused` is often legitimate (one of the 5 safety gates:
   not flat, veto, in replay, timeframe mismatch, insufficient bars) —

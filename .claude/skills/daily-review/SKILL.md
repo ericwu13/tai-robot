@@ -96,8 +96,8 @@ comment it on the issue per that skill.
 ## Timing
 
 Sweet spot **05:10–05:30 TPE**: night closed, classification + P&L
-recorded, DAY not yet open. 05:10 TPE = 14:10 local PDT / **13:10 local PST**
-the PREVIOUS day (this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there)). A local-time cron drifts one hour at each DST change.
+recorded, DAY not yet open. clocks → `start-here` §4. A local-time cron
+drifts one hour at each DST change.
 
 ## Gotchas
 

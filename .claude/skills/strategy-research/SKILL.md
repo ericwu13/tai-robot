@@ -35,6 +35,7 @@ Gotchas:
   browser zone (US-Pacific for the owner), and `load_bars_from_csv` does
   NOT detect that — such a file loads shifted by 15–16 h. Only the
   tvDatafeed path (`tv_dataframe_to_bars`) detects the zone.
+  Hand-export zone → `start-here` §4.
 - **TradingView vs live bars differ slightly** (session boundaries, volume).
   Stitching TV history to live 1-min bars is fine for a long design window;
   keep the holdout on one source.
