@@ -78,6 +78,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Open threads from earlier Claude reviews, so this run can say which
+      # ones the new head fixes. The script is read from the base branch.
+      - name: Collect open Claude threads
+        if: steps.gate.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          git show origin/${{ github.event.pull_request.base.ref }}:.github/scripts/claude_review_post.py > "$RUNNER_TEMP/claude_review_post.py"
+          python3 "$RUNNER_TEMP/claude_review_post.py" collect "$GITHUB_WORKSPACE/.claude-review/open_threads.json"
+
       - name: Run Claude review
         if: steps.gate.outputs.eligible == 'true'
         id: claude
@@ -91,7 +102,7 @@ jobs:
             --effort high
             --max-turns 60
             --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
-            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","BLOCK"]},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"},"summary":{"type":"string"},"inline_comments":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"start_line":{"type":"integer"},"body":{"type":"string"}},"required":["path","line","body"]}}},"required":["verdict","p1","p2","p3","summary","inline_comments"]}'
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","BLOCK"]},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"},"summary":{"type":"string"},"inline_comments":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"start_line":{"type":"integer"},"body":{"type":"string"}},"required":["path","line","body"]}},"resolved_threads":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id","reason"]}}},"required":["verdict","p1","p2","p3","summary","inline_comments","resolved_threads"]}'
           prompt: |
             Review pull request ${{ github.repository }}#${{ github.event.pull_request.number }}
             ("${{ github.event.pull_request.title }}") for correctness bugs.
@@ -137,11 +148,22 @@ jobs:
                otherwise describe the fix in words. Never suggest a change you are not
                sure is correct. A finding on an unchanged line or file goes in the
                summary table only (GitHub rejects inline comments outside the diff).
+               If an OPEN thread (see below) already covers a finding that still
+               stands, do NOT post it again inline; mention it in the summary as
+               "still open" with the thread's url.
             2. verdict is BLOCK if p1 + p2 > 0, else PASS.
             3. `summary` is GitHub markdown posted as the PR comment. It must contain: the reviewed head SHA, the
                verdict, a table of ALL findings including P3 (severity, file:line,
                one-line summary with the failure scenario), and what you checked.
                Start it with "## Claude review @ <short sha>".
+            4. `resolved_threads`: `.claude-review/open_threads.json` lists the
+               unresolved threads earlier Claude reviews opened on this PR (id, path,
+               line, body). For each one, check the CURRENT head. List it (id + a
+               one-line reason naming the code that fixes it) only when the
+               described failure can no longer happen. Do not list a thread because
+               the line moved, the file was reformatted, or you are unsure; leave
+               it open. Return [] when none are fixed or the file is empty. The
+               workflow only resolves threads from that file.
 
       - name: Post inline threads and summary
         if: always() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output != ''
@@ -154,7 +176,7 @@ jobs:
         # workflow matches master; the checkout is the PR, so read it from git).
         run: |
           git show origin/${{ github.event.pull_request.base.ref }}:.github/scripts/claude_review_post.py > "$RUNNER_TEMP/claude_review_post.py"
-          python3 "$RUNNER_TEMP/claude_review_post.py"
+          python3 "$RUNNER_TEMP/claude_review_post.py" post
 
       - name: Verdict gate
         if: always()
