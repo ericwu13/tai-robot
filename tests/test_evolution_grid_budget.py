@@ -399,3 +399,133 @@ def test_failed_rename_leaves_the_slot_busy(tmp_path, monkeypatch):
     assert owned is False
     assert kind == "queue_timeout"
     assert path.read_text(encoding="ascii") == before
+
+
+def test_restore_keeps_a_new_owner_when_link_fails(tmp_path, monkeypatch):
+    """os.link fails and a new owner is already at the path. Do not replace it."""
+    from src.evolution.grid_process import _restore_slot, acquire_grid_slot
+
+    slot = tmp_path / "evo_grid.slot"
+    copy = tmp_path / "evo_grid.slot.9.abcd"
+    owner = f"{os.getpid()}\n{time.time():.6f}\n".encode("ascii")
+    slot.write_bytes(owner)
+    copy.write_bytes(b"1\n1.000000\n")
+    real_exists = os.path.exists
+
+    def _exists(target):
+        if os.path.abspath(target) == os.path.abspath(slot):
+            return False
+        return real_exists(target)
+
+    def _no_link(*_args, **_kwargs):
+        raise OSError("link unavailable")
+
+    monkeypatch.setattr(os.path, "exists", _exists)
+    monkeypatch.setattr(os, "link", _no_link)
+    _restore_slot(str(copy), str(slot))
+    assert slot.read_bytes() == owner
+    assert copy.is_file()
+    owned, kind, _queue = acquire_grid_slot(
+        str(slot), wait_s=0.25, stale_s=10**9, poll_s=0.05)
+    assert owned is False
+    assert kind == "queue_timeout"
+    assert slot.read_bytes() == owner
+
+
+def test_reap_drops_old_dead_copies_and_keeps_the_rest(tmp_path):
+    """Only an old copy whose pids are all dead is removed."""
+    from src.evolution.grid_process import acquire_grid_slot
+
+    slot = tmp_path / "evo_grid.slot"
+    old_dead = tmp_path / "evo_grid.slot.1.dead"
+    young = tmp_path / "evo_grid.slot.2.young"
+    live = tmp_path / "evo_grid.slot.3.live"
+    dead = _dead_pid()
+    _plant(old_dead, dead, time.time() - 100000)
+    _plant(young, dead, time.time())
+    _plant(live, os.getpid(), time.time() - 100000)
+    owned, kind, _queue = acquire_grid_slot(
+        str(slot), wait_s=0.25, stale_s=30, poll_s=0.05)
+    assert not old_dead.exists()
+    assert young.is_file()
+    assert live.is_file()
+    assert owned is False
+    assert kind == "queue_timeout"
+    assert not slot.exists()
+
+
+def test_crash_after_rename_of_a_live_slot_stays_busy(tmp_path):
+    """A non-stale copy left after rename, before delete, blocks a second grid."""
+    from src.evolution.grid_process import acquire_grid_slot
+
+    slot = tmp_path / "evo_grid.slot"
+    _plant(slot, os.getpid(), time.time())
+    renamed = tmp_path / f"evo_grid.slot.{os.getpid()}.crash"
+    os.replace(slot, renamed)
+    assert not slot.exists()
+    owned, kind, _queue = acquire_grid_slot(
+        str(slot), wait_s=0.25, stale_s=10**9, poll_s=0.05)
+    assert owned is False
+    assert kind == "queue_timeout"
+    assert not slot.exists()
+    assert renamed.is_file()
+
+
+def test_slot_busy_for_a_live_child_and_the_age_cap(tmp_path):
+    """Either pid holds the slot inside the cap. Past the cap it is stealable."""
+    from src.evolution.grid_process import acquire_grid_slot
+    from tests.test_evolution_grid_process import _job
+
+    slot = tmp_path / "either.slot"
+    child_alive = (
+        f"{_dead_pid()}\n{time.time():.6f}\n{os.getpid()}\n".encode("ascii")
+    )
+    slot.write_bytes(child_alive)
+    owned, kind, _queue = acquire_grid_slot(
+        str(slot), wait_s=0.25, stale_s=10**9, poll_s=0.05)
+    assert owned is False, "live child must keep the slot busy"
+    assert kind == "queue_timeout"
+    assert slot.read_bytes() == child_alive
+
+    both_dead = tmp_path / "both-dead.slot"
+    _plant_pids(both_dead, _dead_pid(), _dead_pid(), time.time())
+    owned, kind, _queue = acquire_grid_slot(
+        str(both_dead), wait_s=1, stale_s=10**9, poll_s=0.05)
+    assert owned is True and kind == "", "both dead pids are stealable"
+    release_ok = both_dead.read_text(encoding="ascii").split()[0] == str(os.getpid())
+    assert release_ok
+
+    aged = tmp_path / "aged.slot"
+    _plant_pids(aged, os.getpid(), os.getpid(), time.time() - 100000)
+    owned, kind, _queue = acquire_grid_slot(
+        str(aged), wait_s=1, stale_s=30, poll_s=0.05)
+    assert owned is True and kind == "", "age past the cap is stealable"
+
+    from src.evolution.grid_process import burn_child_entry, run_grid_isolated
+
+    recorded = {}
+
+    def _started(pid):
+        recorded["pid"] = pid
+        recorded["text"] = (tmp_path / "live.slot").read_text(encoding="ascii")
+
+    run_grid_isolated(
+        _job(mode="sleep", burn_seconds=0.2),
+        timeout_s=15,
+        stall_s=30,
+        entry=burn_child_entry,
+        poll_s=0.05,
+        slot_path=str(tmp_path / "live.slot"),
+        on_start=_started,
+    )
+    assert recorded["pid"]
+    assert str(recorded["pid"]) in recorded["text"]
+    assert recorded["text"].split()[0] == str(os.getpid())
+
+
+def _plant_pids(path, parent: int, child: int, stamp: float) -> None:
+    path.write_text(
+        f"{int(parent)}\n{float(stamp):.6f}\n{int(child)}\n",
+        encoding="ascii",
+    )
+    os.utime(path, (stamp, stamp))

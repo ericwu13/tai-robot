@@ -35,10 +35,13 @@ is returned.
 One grid runs per install folder. The slot is
 ``project_root()/data/evo_grid.slot`` (or ``TAI_EVO_GRID_SLOT``).
 Two installs side by side do not share it. It is not a machine-wide
-path and it is not under ``%PROGRAMDATA%``. The parent acquires that
-file before the clocks start, queues on this thread (never on Tk),
-and releases the slot when the run ends. The child does not start a
-worker pool.
+path and it is not under ``%PROGRAMDATA%``. The file records the
+parent pid and, once the child has spawned, the child pid. It stays
+busy while either pid is alive, until it is older than
+``SLOT_STARTED_GUARD_S`` (12300 s). The parent acquires that file
+before the clocks start, queues on this thread (never on Tk), and
+releases the slot when the run ends. The child does not start a
+worker pool. There is no Job Object.
 
 ``in_process=True`` is the test seam. It runs the same function on the
 calling thread and holds the GIL. Production leaves it false. A timeout
@@ -618,60 +621,106 @@ def default_slot_path() -> str:
 
 
 def _read_slot(path: str):
-    """``(pid or None, timestamp or None)``. The timestamp is the older
-    of the embedded clock and the file mtime.
+    """``(pids, stamp)``.
+
+    ``pids`` is the parent pid, then the child pid when one was
+    recorded. ``stamp`` is the older of the embedded clock and the
+    mtime. A missing file is ``((), None)``. An unreadable pid is
+    omitted.
     """
     try:
         st = os.stat(path)
     except OSError:
-        return None, None
+        return (), None
     mtime = float(st.st_mtime)
     try:
         with open(path, "r", encoding="utf-8") as handle:
             text = handle.read(256)
     except OSError:
-        return None, mtime
+        return (), mtime
     parts = text.split()
-    pid = None
+    pids: list[int] = []
     stamp = mtime
     if parts:
         try:
-            pid = int(parts[0])
+            pids.append(int(parts[0]))
         except ValueError:
-            pid = None
+            pids = []
     if len(parts) >= 2:
         try:
             stamp = float(parts[1])
         except ValueError:
             stamp = mtime
+    if len(parts) >= 3 and pids:
+        try:
+            child = int(parts[2])
+        except ValueError:
+            child = 0
+        if child > 0:
+            pids.append(child)
     if mtime < stamp:
         stamp = mtime
-    return pid, stamp
+    return tuple(pids), stamp
 
 
-def _slot_is_stale(pid, stamp, stale_s: float, now: float | None = None) -> bool:
-    """True when the slot may be taken over.
-
-    A readable dead pid is stale at any age. A live pid is stale only
-    once it is older than ``stale_s`` (the cap plus 10 min). An empty
-    or half-written file has no pid: a young one is busy (the holder
-    is between create and write), and only a file older than that same
-    guard is stale. No separate age constant.
-    """
+def _slot_age(stamp, now: float | None = None):
+    if stamp is None:
+        return None
     current = time.time() if now is None else float(now)
     try:
-        age = None if stamp is None else current - float(stamp)
+        return current - float(stamp)
     except (TypeError, ValueError):
-        age = None
-    if pid is None:
-        if age is None:
-            return False
-        return age > float(stale_s)
-    if not _pid_alive(pid):
+        return None
+
+
+def _slot_is_stale(pids, stamp, stale_s: float, now: float | None = None) -> bool:
+    """True when the slot may be taken over.
+
+    Older than ``stale_s`` is stale even if a pid is alive, so a reused
+    pid cannot hold the file forever. Production passes
+    ``SLOT_STARTED_GUARD_S`` (12300 s). Inside that cap the slot is
+    busy while the parent or the child is alive, and stealable when
+    every recorded pid is dead. An empty or half-written file has no
+    pid: a young one is busy, and only one older than the same cap is
+    stale.
+    """
+    age = _slot_age(stamp, now)
+    if age is not None and age > float(stale_s):
         return True
-    if age is None:
-        return True
-    return age > float(stale_s)
+    if not pids:
+        return False
+    if any(_pid_alive(pid) for pid in pids):
+        return False
+    return True
+
+
+def _record_child_pid(path: str, child_pid: int) -> None:
+    """Add the grid child pid to a slot this process still owns.
+
+    The original timestamp is kept, so the age cap does not restart
+    when the child appears. The write truncates the file we own. It
+    does not replace the path with another name.
+    """
+    if not child_pid:
+        return
+    pids, stamp = _read_slot(path)
+    if not pids or pids[0] != os.getpid():
+        return
+    when = time.time() if stamp is None else float(stamp)
+    payload = f"{pids[0]}\n{when:.6f}\n{int(child_pid)}\n".encode("ascii")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+    except OSError:
+        return
+    try:
+        os.write(fd, payload)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _try_create_slot(path: str) -> bool:
@@ -703,54 +752,126 @@ def _try_create_slot(path: str) -> bool:
 
 
 def _restore_slot(renamed: str, path: str) -> None:
-    """Put a non-stale slot back without clobbering a new holder.
+    """Put a non-stale slot back without replacing whatever is at ``path``.
 
-    Restoring is safer than deleting: the file we moved aside may be
-    a live holder's slot. ``os.link`` fails when ``path`` already
-    exists, so a slot created after the rename is left alone. If the
-    link is not available and ``path`` is empty, ``os.replace`` moves
-    it back. A path that reappeared is left busy, and the renamed copy
-    of the non-stale slot is kept rather than deleted.
+    ``os.link`` is enough when it works. Otherwise the bytes are written
+    through ``O_CREAT|O_EXCL``. There is no ``os.replace`` onto the slot
+    path. If the path already exists, or the exclusive create fails, the
+    renamed copy is kept and the slot stays busy.
     """
     try:
         os.link(renamed, path)
     except FileExistsError:
         return
     except OSError:
-        if os.path.exists(path):
+        if not _exclusive_restore(renamed, path):
             return
-        try:
-            os.replace(renamed, path)
-        except OSError:
-            return
-        return
     try:
         os.remove(renamed)
     except OSError:
         pass
 
 
+def _exclusive_restore(renamed: str, path: str) -> bool:
+    """Write ``renamed`` onto ``path`` only if ``path`` does not exist."""
+    try:
+        with open(renamed, "rb") as handle:
+            payload = handle.read()
+    except OSError:
+        return False
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError:
+        return False
+    try:
+        os.write(fd, payload)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return True
+
+
+def _slot_copies(path: str) -> list[str]:
+    """Files named ``<path>.*`` left by a rename that was not deleted."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    prefix = os.path.basename(path) + "."
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return [
+        os.path.join(directory, name)
+        for name in names
+        if name.startswith(prefix)
+    ]
+
+
+def _copy_is_reapable(copy: str, stale_s: float) -> bool:
+    """Old, and every recorded pid is dead. A live pid is never reaped."""
+    pids, stamp = _read_slot(copy)
+    age = _slot_age(stamp)
+    if age is None or age <= float(stale_s):
+        return False
+    return not any(_pid_alive(pid) for pid in pids)
+
+
+def _reap_slot_copies(path: str, stale_s: float) -> None:
+    for copy in _slot_copies(path):
+        if not _copy_is_reapable(copy, stale_s):
+            continue
+        try:
+            os.remove(copy)
+        except OSError:
+            pass
+
+
+def _copy_holds_slot(path: str, stale_s: float) -> bool:
+    """A live or non-stale ``<path>.*`` copy still holds the slot.
+
+    A crash after the rename and before the delete leaves that copy.
+    Acquire must not start a second grid while it is there.
+    """
+    for copy in _slot_copies(path):
+        if not _copy_is_reapable(copy, stale_s):
+            return True
+    return False
+
+
 def _steal_stale_slot(path: str, stale_s: float) -> None:
     """Take over ``path`` only when the renamed copy is still stale.
 
     The file is renamed to ``<path>.<pid>.<random>`` before any delete.
-    The pid and stamp are read again from that copy. Only then is the
+    The pids and stamp are read again from that copy. Only then is the
     copy removed. A fresh slot that landed at ``path`` is never the
-    file we delete. If the copy is no longer stale, it is restored
-    when ``path`` is empty. A rename that fails (a Windows open handle)
-    leaves ``path`` in place and does not delete it.
+    file we delete. If the copy is no longer stale, it is restored by
+    an exclusive create. A rename that fails (a Windows open handle)
+    leaves ``path`` in place and does not delete it. If this process
+    dies between the rename and the delete, the copy keeps the slot
+    busy until it is old and every pid in it is dead.
     """
-    pid, stamp = _read_slot(path)
-    if not _slot_is_stale(pid, stamp, stale_s):
+    pids, stamp = _read_slot(path)
+    if not _slot_is_stale(pids, stamp, stale_s):
         return
-    holder = str(pid) if isinstance(pid, int) else "na"
+    holder = str(pids[0]) if pids else "na"
     renamed = f"{path}.{holder}.{os.urandom(4).hex()}"
     try:
         os.replace(path, renamed)
     except OSError:
         return
-    pid2, stamp2 = _read_slot(renamed)
-    if not _slot_is_stale(pid2, stamp2, stale_s):
+    pids2, stamp2 = _read_slot(renamed)
+    if not _slot_is_stale(pids2, stamp2, stale_s):
         _restore_slot(renamed, path)
         return
     try:
@@ -773,8 +894,12 @@ def acquire_grid_slot(
     ``stopped`` or ``queue_timeout``. A free slot is taken even when
     stop is already set, so the caller can spawn and then honour STOP
     the way a grid with no queue does. Stop is noticed while waiting
-    on a busy slot. A dead pid, or a file older than ``stale_s``, is
-    taken over.
+    on a busy slot. The slot is busy while the parent or the child pid
+    is alive and the file is not older than ``stale_s``. Production
+    passes ``SLOT_STARTED_GUARD_S`` (12300 s). Both pids dead, or a
+    file older than that cap, is taken over. A ``<path>.*`` copy left
+    by a crash is the same: old and all-dead copies are reaped, and a
+    live or younger copy holds the slot so a second grid does not start.
     """
     pause = time.sleep if sleep is None else sleep
     start = time.monotonic()
@@ -787,15 +912,18 @@ def acquire_grid_slot(
         except OSError:
             pass
     while True:
-        if _try_create_slot(path):
+        _reap_slot_copies(path, stale_s)
+        held_by_copy = _copy_holds_slot(path, stale_s)
+        if not held_by_copy and _try_create_slot(path):
             return True, "", time.monotonic() - start
         if stop_check is not None and stop_check():
             return False, "stopped", time.monotonic() - start
-        pid, stamp = _read_slot(path)
-        if _slot_is_stale(pid, stamp, stale_s):
-            _steal_stale_slot(path, stale_s)
-            if _try_create_slot(path):
-                return True, "", time.monotonic() - start
+        if not held_by_copy:
+            pids, stamp = _read_slot(path)
+            if _slot_is_stale(pids, stamp, stale_s):
+                _steal_stale_slot(path, stale_s)
+                if not _copy_holds_slot(path, stale_s) and _try_create_slot(path):
+                    return True, "", time.monotonic() - start
         now = time.monotonic()
         if now >= deadline:
             return False, "queue_timeout", now - start
@@ -816,8 +944,8 @@ def release_grid_slot(path: str, pid: int | None = None) -> None:
     delay = 0.05
     last_exc: BaseException | None = None
     while True:
-        current, _stamp = _read_slot(path)
-        if current != owner:
+        pids, _stamp = _read_slot(path)
+        if not pids or pids[0] != owner:
             return
         try:
             os.remove(path)
@@ -899,8 +1027,11 @@ def run_grid_isolated(
     path = default_slot_path() if slot_path is None else str(slot_path)
     wait_s = float(grid_queue_wait_s() if queue_timeout_s is None
                    else queue_timeout_s)
-    stale_s = float(grid_slot_stale_s() if slot_stale_s is None
-                    else slot_stale_s)
+    if slot_stale_s is None:
+        from src.evolution.notify import SLOT_STARTED_GUARD_S
+        stale_s = float(SLOT_STARTED_GUARD_S)
+    else:
+        stale_s = float(slot_stale_s)
     owned, qkind, queue_s = acquire_grid_slot(
         path,
         stop_check=stop_check,
@@ -936,6 +1067,7 @@ def run_grid_isolated(
             queue_s=queue_s,
             run_started=run_started,
             ctx=ctx,
+            slot_path=path,
         )
     finally:
         release_grid_slot(path, os.getpid())
@@ -954,7 +1086,8 @@ def _run_grid_held(
         on_progress,
         queue_s: float,
         run_started: float,
-        ctx):
+        ctx,
+        slot_path: str):
     """The sweep after this process holds the slot. Clocks already run."""
     done = 0
     total = 0
@@ -1031,6 +1164,8 @@ def _run_grid_held(
                 "crash",
                 f"could not start grid child: {type(exc).__name__}: {exc}",
                 proc.pid))
+        if proc.pid:
+            _record_child_pid(slot_path, proc.pid)
         if on_start is not None:
             on_start(proc.pid)
         try:
