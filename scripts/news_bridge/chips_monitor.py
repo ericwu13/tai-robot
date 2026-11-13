@@ -342,13 +342,17 @@ def fetch_taifex_foreign_net_oi(date_key: str) -> float | None:
     """外資 net OI (contracts) in TX for trade date *date_key*, exact match.
 
     Manual-backfill semantics (``--date``): a dataset for any other date
-    is "no data for this date", never a substitute.
+    is "no data for this date", never a substitute. That other date is
+    left on ``fetch_taifex_foreign_net_oi.served_other`` so the log can
+    name it. Callers that replace this function are unchanged.
     """
+    fetch_taifex_foreign_net_oi.served_other = None
     found = fetch_taifex_tx_foreign_oi()
     if found is None:
         return None
     dataset_date, total = found
     if dataset_date != date_key:
+        fetch_taifex_foreign_net_oi.served_other = dataset_date
         print(f"  TAIFEX rows are for {dataset_date or '?'} but trade date is "
               f"{date_key} — no data for this date (weekend/holiday?)")
         return None
@@ -741,6 +745,29 @@ def _abort_fetch(state: dict, now: datetime, spath, base_path: str,
     return 1
 
 
+def _explicit_empty_message(date_key: str, base_path: str, on_disk: str,
+                            served_other: str | None) -> str:
+    """Log text for an explicit ``--date`` pass that does not delete.
+
+    ``kept (same session)`` only when a vote file is on disk and its
+    ``data_date`` is *date_key*. No file means nothing was kept. A
+    dataset for another date is named; the vote file is not touched.
+    """
+    vote_date = _vote_data_date(base_path)
+    has_vote = w4_vote_path(base_path).is_file()
+    if has_vote and vote_date == date_key and on_disk:
+        message = _kept_vote_no_data_message("", date_key, on_disk)
+    elif not has_vote:
+        message = f"no-data — no vote on disk for {date_key}; nothing kept"
+    else:
+        named = vote_date or "unknown"
+        message = (f"no-data — vote on disk is for {named}, not {date_key}; "
+                   f"nothing kept")
+    if served_other and served_other != date_key:
+        message += f"; TAIFEX served {served_other}"
+    return message
+
+
 def _kept_vote_no_data_message(_no_data: str, decided: str, session: str) -> str:
     """No-data line for a TAIFEX ``[]`` that keeps this session's vote.
 
@@ -855,9 +882,12 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
     # None until a genuine empty dataset. Specific "wrong date" messages
     # replace it; a transport error never reaches this string.
     no_data = None
-    # True only when the fetch itself returned no rows ([] / None), not
-    # when a dated dataset was discarded for being ahead or too old.
+    # True when the fetch itself returned no rows ([] / None). On an
+    # explicit --date, a dataset for another trade date is also None
+    # (exact-match rule) and is recorded in served_other for the log.
+    # Ahead-of-date and walk-back discards clear this flag.
     empty_result = False
+    served_other = None
 
     # Retry-slot dedup: a decision for a dataset is final (the API data
     # won't change), so later slots for it are no-ops — no re-fetch, no
@@ -869,8 +899,10 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
             if not dry_run and not force and decided == date_key:
                 print(f"  already decided for {date_key} — skipping (--force to redo)")
                 return 0
+            fetch_taifex_foreign_net_oi.served_other = None
             net_oi = fetch_taifex_foreign_net_oi(date_key)
             empty_result = net_oi is None
+            served_other = getattr(fetch_taifex_foreign_net_oi, "served_other", None) or None
         else:
             newest = default_trade_date(now)
             window = walk_back_dates(now)
@@ -919,11 +951,16 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
         on_disk = _vote_session(base_path)
         same_explicit_day = (not scheduled) and bool(decided) and str(date_key or "") == decided
         same_session = scheduled and bool(decided) and on_disk == night_session_key(now)
-        if empty_result and (same_explicit_day or same_session):
+        if empty_result and same_session:
             return _no_data_keep_vote(
                 state, now, spath, base_path, dry_run,
-                _kept_vote_no_data_message(
-                    no_data, decided, on_disk or night_session_key(now)))
+                _kept_vote_no_data_message(no_data, decided, on_disk))
+        if empty_result and same_explicit_day:
+            # Log only. A missing vote file is not deleted or rewritten.
+            return _no_data_keep_vote(
+                state, now, spath, base_path, dry_run,
+                _explicit_empty_message(
+                    str(date_key), base_path, on_disk, served_other))
         print(f"  {no_data}")
         if not dry_run:
             delete_stale_vote(base_path)

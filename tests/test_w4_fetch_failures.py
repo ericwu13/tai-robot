@@ -833,6 +833,32 @@ def test_later_same_day_success_overwrites_the_nonfinal_row(tmp_path, monkeypatc
     assert row["equity_net"] == 6_000_000_000.0
 
 
+def test_force_date_with_no_vote_does_not_log_kept(tmp_path, monkeypatch):
+    """``--date 20260828 --force`` with no vote file must not say kept.
+
+    TAIFEX serving another date is named. The vote file is not created
+    and ``last_decided_date`` is not rewritten.
+    """
+    base = str(tmp_path / "regime_vote.json")
+    chips.save_state(chips.state_path_for(base), {"last_decided_date": "20260828"})
+    row = {"Date": "20260831", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "-75,655"}
+    monkeypatch.setattr(chips.urllib.request, "urlopen",
+                        lambda *_a, **_k: _Body(json.dumps([row]).encode()))
+    now = datetime(2026, 8, 31, 16, 15, tzinfo=TPE)
+    assert chips.run_once(base, "20260828", now, force=True) == 0
+    log = _log(base).lower()
+    state = chips.load_state(chips.state_path_for(base))
+    assert "kept (same session)" not in log
+    assert "decided vote" not in log
+    assert "no vote on disk for 20260828; nothing kept" in log
+    assert "taifex served 20260831" in log
+    assert "no vote on disk for 20260828; nothing kept" in (state.get("last_result") or "").lower()
+    assert "kept (same session)" not in (state.get("last_result") or "").lower()
+    assert not chips.w4_vote_path(base).exists()
+    assert state.get("last_decided_date") == "20260828"
+
+
 def test_same_dataset_keep_adds_no_daily_row(tmp_path, monkeypatch):
     """Keeping this dataset's vote must not write a second, contradicting row."""
     base = str(tmp_path / "regime_vote.json")
