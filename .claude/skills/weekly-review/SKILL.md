@@ -17,6 +17,12 @@ description: Orchestrate the weekly tai-robot review — did the Saturday evolut
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
 
+Data host = the host `/api/fleet` reports as running the bot (today:
+Steven). Read live state from `http://<Steven tailnet IP>:8765/api/fleet`
+(address in `hosts.local.yaml`) or run the checker on that host via
+`tailscale-ssh`. The output must name the host the data came from. A run
+on this PC describes this PC only — never publish it as fleet health.
+
 Same shape as `daily-review` (which stays daily and does NOT cover
 evolution): fetch → review → validate → publish, each stage delegated to
 its skill. Keep it light — a healthy week costs one script run and zero
@@ -25,13 +31,18 @@ read-only, no merges, redact everything).
 
 ## Stage 1 — fetch (no subagents)
 
+On the data host via `tailscale-ssh`. `check_evolution.py` and
+`data\monitor\daily_review_*.md` are there, not on this PC:
+
 ```bash
 C:/Python313/python.exe -s scripts/monitor/check_evolution.py
 ```
 
-Plus a cheap week rollup: list `data\monitor\daily_review_*.md` for the
-last 7 TPE days and extract each file's `**verdict: ...**` line (one
-Grep). Note any day with no file (review didn't run).
+Plus a cheap week rollup: list that host's `data\monitor\daily_review_*.md`
+for the last 7 TPE days and extract each file's `**verdict: ...**` line
+(one Grep). Note any day with no file (review didn't run).
+
+Fallback, this PC only: the same command against this PC's `data\monitor\`.
 
 **Plus the GitHub issue sweep (MANDATORY every run):**
 
@@ -71,22 +82,24 @@ the checks.
 ## Stage 2b — evolution EFFICACY audit (every week, cheap; 2 agents when triggered)
 
 "Did the slot fire" (stage 1) is not "is evolution working". Every week
-also answer, from primary evidence only:
+also answer, from primary evidence only. `data/ai_usage.csv` and
+`data/live/<bot>/session.json` are on the data host, not this PC. A read
+of this PC's copies is this PC only.
 
-1. **Attempt history** — `data/ai_usage.csv` (UTC; TPE = +8): per past
-   Saturday, plan rows (`bot_evolution`) vs candidate rows
+1. **Attempt history** — the data host's `data/ai_usage.csv` (UTC; TPE =
+   +8): per past Saturday, plan rows (`bot_evolution`) vs candidate rows
    (`evolution_codegen_*`). A Saturday with a plan but no codegen row =
    plan said `no_change`; no rows at all = skip or app closed (check the
    start line). Report the streak of Saturdays with no candidate.
 2. **Verdict outcome** — the verdict block is NOT persisted anywhere
    local (the Tk chat auto-save only fires at window close, and the bot
-   token cannot read Discord history: HTTP 403). The only local trace is
-   the Discord send in the bot's debug log ~60-90s after the start line
-   with `msg_len` ≈ 1000-1500 (FAIL/PASS verdict); 112-130 = no_change,
+   token cannot read Discord history: HTTP 403). The only on-disk trace is
+   the Discord send in the data host's bot debug log ~60-90s after the
+   start line with `msg_len` ≈ 1000-1500 (FAIL/PASS verdict); 112-130 = no_change,
    ~200-300 = holdout / young-session skip. A PASS would also create
    `data/changelog.json` and an `...EvoN` entry in the strategy store.
 3. **P&L vs evolution** — weekly realized P&L (by exit date) of every
-   running non-regime bot for the last 8 weeks from
+   running non-regime bot for the last 8 weeks from the data host's
    `data/live/<bot>/session.json` broker.trades. Losing streak + zero
    candidates = the evolution loop is not doing its job, whatever the
    reason.

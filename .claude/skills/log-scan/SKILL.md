@@ -17,12 +17,29 @@ description: Scan tai-robot bot debug logs and the news-bridge logs for known er
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
 
+Data host = the host `/api/fleet` reports as running the bot (today:
+Steven). Read live state from `http://<Steven tailnet IP>:8765/api/fleet`
+(address in `hosts.local.yaml`) or run the checker on that host via
+`tailscale-ssh`. The output must name the host the data came from. A run
+on this PC describes this PC only — never publish it as fleet health.
+
+Default is that host's bot debug logs (ssh, or the API log tail), not
+this PC's `data/live`.
+
+```bash
+curl -s "http://<Steven tailnet IP>:8765/api/bot?id=<SYMBOL>_<bot>"
+```
+
+Address in `hosts.local.yaml`. On that host, `check_logs.py` scans, per
+bot directory, the newest two `debug_YYYYMMDD.log` files from the **last
+7 days** (older logs are archaeology from retired test bots).
+
+Fallback, this PC only:
+
 ```bash
 C:/Python313/python.exe -s scripts/monitor/check_logs.py
 ```
 
-Scans, per bot directory, the newest two `debug_YYYYMMDD.log` files from
-the **last 7 days** (older logs are archaeology from retired test bots).
 `n8n-service.log` and `~/.n8n/n8nEventLog.log` are history-only (retired
 local n8n, stopped 2026-10-24). Do not treat them as live bridge health —
 live W1–W4 are `bridge-health`.
@@ -76,8 +93,7 @@ each redacted before it is printed.
 
 ## Next steps
 
-- traceback in a live bot → the repo's `debug` skill (root-cause → fix →
-  review → release)
+- traceback in a live bot → the repo's `debug` skill (root-cause → fix → review); release → `CLAUDE.md` § Release Process
 - historical `n8n.workflow.failed` on the retired local n8n → `n8n-debug`
   only (history only — do not run). A live bridge silence or missing vote
   → `bridge-health`

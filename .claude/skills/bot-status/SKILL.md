@@ -17,7 +17,31 @@ description: Check whether a deployed tai-robot bot process is actually alive an
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
 
-One read-only command answers "is it alive":
+Data host = the host `/api/fleet` reports as running the bot (today:
+Steven). Read live state from `http://<Steven tailnet IP>:8765/api/fleet`
+(address in `hosts.local.yaml`) or run the checker on that host via
+`tailscale-ssh`. The output must name the host the data came from. A run
+on this PC describes this PC only — never publish it as fleet health.
+
+## The Steven fleet
+
+First command for "is the fleet alive?":
+
+```bash
+curl -s http://<Steven tailnet IP>:8765/api/fleet
+```
+
+Address in `hosts.local.yaml`. Read `bots[].state`. The dashboard and
+`check_bots.classify_heartbeat` share:
+RUNNING = alive; LAGGING = heartbeat stale; HUNG = main loop stopped or a
+COM call stuck; NO_HEARTBEAT = PID alive but no usable heartbeat (needs
+attention, never "running"); CRASHED = dead lock PID on a recently
+active bot; STOPPED = no lock. `mode` ≠ `paper` (page badge 實單) is a
+real-order bot — say so before suggesting any stop/restart.
+
+## Fallback, this PC only
+
+For this PC's dirs, not the fleet:
 
 ```bash
 C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bots.py
@@ -26,16 +50,6 @@ C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bo
 (`-s` ignores user-site packages, so this interpreter sees the
 tai-monitor pins from the regime-health skill. Optional arg: a different
 `data/live` base directory.)
-
-## The Steven fleet
-
-`curl -s http://<Steven tailnet IP>:8765/api/fleet` → `bots[].state`. The
-dashboard and this script share `check_bots.classify_heartbeat`:
-RUNNING = alive; LAGGING = heartbeat stale; HUNG = main loop stopped or a
-COM call stuck; NO_HEARTBEAT = PID alive but no usable heartbeat (needs
-attention, never "running"); CRASHED = dead lock PID on a recently
-active bot; STOPPED = no lock. `mode` ≠ `paper` (page badge 實單) is a
-real-order bot — say so before suggesting any stop/restart.
 
 ## What it reads
 
