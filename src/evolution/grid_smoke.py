@@ -6,7 +6,9 @@
 ``run_grid_on_bars`` path. ``--hang`` sleeps in the spawn child so a
 STOP file or a short ``--timeout-s`` can be checked. ``--timeout-s``
 is this process only. It is not a settings key and it does not change
-the live 20-minute bound. ``--payload-bytes N`` has the child build
+the live grid budget. ``--full-settings`` drops the 4-setting smoke
+cap so a Steven-scale run can use the real pre-registered grid.
+``--payload-bytes N`` has the child build
 and send an N-byte blob through the real pipe. The blob is not put in
 the pickled job. A result that is not a ``GridOutcome`` exits
 non-zero, including that blob.
@@ -103,13 +105,15 @@ def sample_bars(n: int) -> tuple:
 
 def _smoke_job(
         *, bars: int, hang: bool, timeout_s: float, payload_bytes: int = 0,
+        full_settings: bool = False,
 ) -> GridJob:
     evo = {
         "search": "grid_batch",
         "holdout_days": 14,
         "relative": {"fold_days": 14},
-        "trial_penalty": {"max_settings": _SMOKE_MAX_SETTINGS},
     }
+    if not full_settings:
+        evo["trial_penalty"] = {"max_settings": _SMOKE_MAX_SETTINGS}
     if payload_bytes:
         # The child builds the blob. A large bytes object in this dict
         # would be pickled into the spawn bootstrap pipe and can deadlock
@@ -142,7 +146,8 @@ def _one_line(text: str) -> str:
 
 def _summarize(result) -> tuple[str, str]:
     if isinstance(result, GridProcessFailure):
-        kind = result.kind if result.kind in ("timeout", "stopped", "crash") else "crash"
+        known = ("timeout", "stopped", "crash", "stalled", "queue_timeout")
+        kind = result.kind if result.kind in known else "crash"
         return kind, _one_line(result.detail)
     try:
         from src.evolution.grid_search import GridOutcome
@@ -163,10 +168,12 @@ def run_grid_smoke(
         timeout_s: float = _DEFAULT_TIMEOUT_S,
         hang: bool = False,
         payload_bytes: int = 0,
+        full_settings: bool = False,
         in_process: bool = False,
         stop_dir: str | None = None,
         poll_s: float = 0.2,
-        echo=None) -> SmokeReport:
+        echo=None,
+        on_progress=None) -> SmokeReport:
     """Run one smoke. ``in_process=True`` is for tests. The CLI leaves it false.
 
     ``echo``, when set, is called with the child-pid line as soon as the
@@ -188,7 +195,7 @@ def run_grid_smoke(
 
     job = _smoke_job(
         bars=bars, hang=hang, timeout_s=timeout_s,
-        payload_bytes=payload_bytes)
+        payload_bytes=payload_bytes, full_settings=full_settings)
     if payload_bytes:
         entry = payload_child_entry
     elif hang:
@@ -204,6 +211,7 @@ def run_grid_smoke(
         poll_s=poll_s,
         entry=entry,
         on_start=_started,
+        on_progress=on_progress,
     )
     elapsed = time.monotonic() - started
     outcome, detail = _summarize(result)
@@ -241,7 +249,14 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         help=(
             "seconds this smoke process waits "
             f"(default {_DEFAULT_TIMEOUT_S:g}). Not a settings key. "
-            "Does not change the live 20-minute grid timeout."
+            "Does not change the live grid budget."
+        ),
+    )
+    parser.add_argument(
+        "--full-settings", action="store_true",
+        help=(
+            "use the live pre-registered grid instead of the "
+            f"{_SMOKE_MAX_SETTINGS}-setting smoke cap. Not a settings key."
         ),
     )
     parser.add_argument(
@@ -304,14 +319,19 @@ def main(argv: list[str] | None = None) -> int:
     def _echo(line: str) -> None:
         print(line, flush=True)
 
+    def _progress(i, n) -> None:
+        print(f"grid-smoke: progress {int(i)}/{int(n)}", flush=True)
+
     report = run_grid_smoke(
         bars=args.bars,
         timeout_s=args.timeout_s,
         hang=args.hang,
         payload_bytes=int(args.payload_bytes),
+        full_settings=bool(args.full_settings),
         in_process=False,
         stop_dir=stop_dir,
         echo=_echo,
+        on_progress=None if (args.hang or args.payload_bytes) else _progress,
     )
     print(f"grid-smoke: elapsed_s={report.elapsed_s:.3f}", flush=True)
     print(f"grid-smoke: result_bytes={report.result_bytes}", flush=True)

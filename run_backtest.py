@@ -7129,14 +7129,19 @@ class BacktestApp:
                     # grid. The model does not pick the setting. llm_one and
                     # classes that are not on the knob grid keep the plan.
                     from src.evolution.grid_process import (
-                        DEFAULT_GRID_TIMEOUT_S,
+                        DEFAULT_GRID_STALL_S,
                         GridJob,
                         GridProcessFailure,
+                        default_slot_path,
                         grid_failure_message,
+                        grid_timeout_budget_s,
                         run_grid_isolated,
                     )
                     from src.evolution.grid_search import (
-                        explanation_prompt, grid_search_applies)
+                        count_scheduled_runs,
+                        explanation_prompt,
+                        grid_search_applies,
+                    )
                     grid_trial = None
                     _knob_apply = None
                     grid_outcome = None
@@ -7173,15 +7178,27 @@ class BacktestApp:
                             except Exception:
                                 return False
 
-                        _timeout = getattr(self, "_grid_timeout_s", None)
-                        if _timeout is None:
-                            _timeout = DEFAULT_GRID_TIMEOUT_S
                         _gate_raw = (dict(evolution_gate_raw)
                                      if isinstance(evolution_gate_raw, dict)
                                      else {})
+                        _n_runs = 1
+                        try:
+                            _n_runs = count_scheduled_runs(
+                                baseline_cls, strategy_source or "", _gate_raw)
+                        except Exception:
+                            _n_runs = 1
+                        _timeout = getattr(self, "_grid_timeout_s", None)
+                        if _timeout is None:
+                            _timeout = grid_timeout_budget_s(_n_runs)
+                        _stall = getattr(self, "_grid_stall_s", None)
+                        if _stall is None:
+                            _stall = DEFAULT_GRID_STALL_S
                         # Default is a spawn child. `_grid_in_process` runs
                         # the same job on this thread. A parent patch of
                         # run_grid_on_bars does not apply inside the child.
+                        # The slot wait, the stall clock, and the timeout
+                        # all run on this worker thread. They do not run
+                        # on Tk.
                         grid_result = run_grid_isolated(
                             GridJob(
                                 source=strategy_source or "",
@@ -7195,24 +7212,45 @@ class BacktestApp:
                                 fold_days=int(_grid_fold_days),
                             ),
                             timeout_s=float(_timeout),
+                            stall_s=float(_stall),
                             stop_check=_grid_stop_requested,
                             in_process=bool(
                                 getattr(self, "_grid_in_process", False)),
+                            slot_path=default_slot_path(),
                         )
                         if isinstance(grid_result, GridProcessFailure):
                             # No trial evidence. Same exit as a grid that
                             # selected nothing: no model pick, watermark
                             # stays, one history line. The finally below
-                            # releases the evolution guard.
+                            # releases the evolution guard. reason_kind
+                            # stays grid_failed so a retryable week is
+                            # retried. Partial results are not kept.
+                            _progress = grid_result.progress or "0/0"
+                            try:
+                                _elapsed = float(grid_result.elapsed_s)
+                            except (TypeError, ValueError):
+                                _elapsed = 0.0
+                            try:
+                                _queue = float(grid_result.queue_s)
+                            except (TypeError, ValueError):
+                                _queue = 0.0
                             _log(
                                 "EVO grid subprocess "
                                 f"{grid_result.kind} pid={grid_result.pid}: "
-                                f"{grid_result.detail}")
+                                f"{grid_result.detail} "
+                                f"(completed {_progress} settings in "
+                                f"{_elapsed:.0f} s, queue {_queue:.0f} s)")
                             msg = grid_failure_message(grid_result)
                             ui(self._append_chat, "system", msg)
                             if auto_run:
                                 _notify_discord(msg)
-                            _remember("fail", "grid_failed", msg)
+                            _remember(
+                                "fail", "grid_failed", msg,
+                                grid_failure_kind=grid_result.kind,
+                                grid_progress=_progress,
+                                grid_elapsed_s=_elapsed,
+                                grid_queue_s=_queue,
+                            )
                             return
                         grid_outcome = grid_result
                         for line in grid_outcome.reasons:

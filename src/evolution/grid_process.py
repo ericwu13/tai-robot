@@ -25,6 +25,18 @@ only after the child exits deadlocks: ``send`` blocks once the payload
 fills the OS pipe (8 KB on Windows, 64 KB on Linux) and the child never
 reaches exit.
 
+The child sends ``("progress", i, n)`` after the baseline and after
+each setting, then ``("ok", outcome)``. Progress is liveness only.
+``stall_s`` without a progress message fails as ``stalled``.
+``timeout_s`` is the overall cap and does not move when progress
+arrives. Partial trial results are discarded: only a finished ``ok``
+is returned.
+
+One grid runs per host. The parent acquires ``data/evo_grid.slot``
+before the clocks start, queues on this thread (never on Tk), and
+releases the slot when the run ends. The child does not start a
+worker pool.
+
 ``in_process=True`` is the test seam. It runs the same function on the
 calling thread and holds the GIL. Production leaves it false. A timeout
 cannot interrupt the in-process path; the subprocess path kills the
@@ -39,11 +51,44 @@ import time
 import traceback
 from dataclasses import dataclass
 
-# A full pre-registered sweep (at most 48 pure-Python backtests) on a
-# long 1-min history can take minutes. The bound exists so a stuck
-# child cannot hold the evolution guard open. The Tk loop is not
-# blocked while the worker waits.
+# Floor for one backtest. A larger pre-registered sweep scales at
+# 90 s per run (baseline + settings) and never exceeds the 3 h cap.
+# A silent child still dies at the stall bound, which sits in front
+# of that cap. The Tk loop is not blocked while the worker waits.
 DEFAULT_GRID_TIMEOUT_S = 20 * 60
+GRID_TIMEOUT_PER_RUN_S = 90
+GRID_TIMEOUT_CAP_S = 3 * 60 * 60
+DEFAULT_GRID_STALL_S = 10 * 60
+GRID_SLOT_POLL_S = 5.0
+GRID_SLOT_STALE_SLACK_S = 10 * 60
+GRID_QUEUE_FACTOR = 3
+GRID_SLOT_FILENAME = "evo_grid.slot"
+
+
+def grid_timeout_budget_s(n_runs: int) -> int:
+    """Overall cap: ``max(20 min, 90 s × runs)``, never above 3 h.
+
+    ``n_runs`` is the baseline plus the pre-registered settings. A
+    count below 1 still gets the floor.
+    """
+    try:
+        runs = int(n_runs)
+    except (TypeError, ValueError):
+        runs = 1
+    if runs < 1:
+        runs = 1
+    scaled = GRID_TIMEOUT_PER_RUN_S * runs
+    return min(GRID_TIMEOUT_CAP_S, max(DEFAULT_GRID_TIMEOUT_S, scaled))
+
+
+def grid_queue_wait_s() -> int:
+    """How long a bot waits for the host slot before ``queue_timeout``."""
+    return GRID_QUEUE_FACTOR * GRID_TIMEOUT_CAP_S
+
+
+def grid_slot_stale_s() -> int:
+    """A slot older than the cap plus 10 min is taken over."""
+    return GRID_TIMEOUT_CAP_S + GRID_SLOT_STALE_SLACK_S
 
 
 @dataclass(frozen=True)
@@ -64,23 +109,52 @@ class GridJob:
 class GridProcessFailure:
     """The sweep produced no trial evidence.
 
-    ``kind`` is ``timeout``, ``crash``, or ``stopped``. The worker
-    treats every kind as a grid that selected nothing: no model pick,
-    watermark unchanged, one history line, guard released.
+    ``kind`` is ``timeout``, ``stalled``, ``crash``, ``stopped``, or
+    ``queue_timeout``. The worker treats every kind as a grid that
+    selected nothing: no model pick, watermark unchanged, one history
+    line, guard released. ``progress`` is ``k/n`` completed runs.
+    Partial trial results are not kept.
     """
 
     kind: str
     detail: str
     pid: int | None = None
+    progress: str = ""
+    elapsed_s: float = 0.0
+    queue_s: float = 0.0
+
+
+def _is_progress(message) -> bool:
+    """True for a ``("progress", i, n)`` liveness message."""
+    return (
+        isinstance(message, tuple)
+        and len(message) == 3
+        and message[0] == "progress"
+    )
 
 
 class _Capture:
     """Stand-in for the child end of the pipe. In-process tests only."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_progress=None) -> None:
         self.item = None
+        self.on_progress = on_progress
+        self.progress = "0/0"
 
     def send(self, item) -> None:
+        if _is_progress(item):
+            try:
+                done = int(item[1])
+                total = int(item[2])
+            except (TypeError, ValueError):
+                return
+            self.progress = f"{done}/{total}"
+            if self.on_progress is not None:
+                try:
+                    self.on_progress(done, total)
+                except Exception:
+                    pass
+            return
         if self.item is None:
             self.item = item
 
@@ -128,7 +202,7 @@ def _load_strategy_class(source: str, class_name: str):
         f"(found {names})")
 
 
-def _execute_grid_job(job: GridJob):
+def _execute_grid_job(job: GridJob, progress=None):
     """Run ``run_grid_on_bars`` on a class rebuilt from ``job``."""
     from src.evolution.grid_search import run_grid_on_bars
 
@@ -143,13 +217,40 @@ def _execute_grid_job(job: GridJob):
         evo=evo,
         fold_days=int(job.fold_days),
         max_folds=int(job.max_folds),
+        progress=progress,
     )
 
 
-def grid_child_entry(job: GridJob, conn) -> None:
-    """Spawn target. Sends ``("ok", outcome)`` or ``("error", traceback)``."""
+def _set_below_normal_priority() -> None:
+    """Ask Windows for ``BELOW_NORMAL``. No-op elsewhere. Never raises.
+
+    The ctypes import stays inside this function and behind the
+    ``os.name != "nt"`` guard so a Linux child does not load it.
+    """
+    if os.name != "nt":
+        return
     try:
-        conn.send(("ok", _execute_grid_job(job)))
+        import ctypes
+        below_normal = 0x00004000
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel.GetCurrentProcess()
+        kernel.SetPriorityClass(handle, below_normal)
+    except Exception:
+        return
+
+
+def grid_child_entry(job: GridJob, conn) -> None:
+    """Spawn target. Sends progress, then ``("ok", outcome)`` or an error.
+
+    One backtest at a time. This process does not start a worker pool.
+    """
+    _set_below_normal_priority()
+
+    def progress(i, n) -> None:
+        conn.send(("progress", int(i), int(n)))
+
+    try:
+        conn.send(("ok", _execute_grid_job(job, progress=progress)))
     except Exception:
         conn.send(("error", traceback.format_exc()))
     finally:
@@ -303,10 +404,22 @@ def grid_failure_message(failure: GridProcessFailure) -> str:
     elif kind == "stopped":
         what_zh = "已要求停止，網格子行程已終止"
         what_en = "Stop requested — the grid subprocess was terminated"
+    elif kind == "stalled":
+        what_zh = "網格子行程停滯"
+        what_en = "Grid subprocess stalled"
+    elif kind == "queue_timeout":
+        what_zh = "網格排隊逾時"
+        what_en = "Grid queue timed out"
     else:
         what_zh = "網格子行程崩潰"
         what_en = "Grid subprocess crashed"
     brief = _brief(failure.detail)
+    progress = failure.progress or "0/0"
+    try:
+        elapsed = float(failure.elapsed_s)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    done_line = f"completed {progress} settings in {elapsed:.0f} s"
     return (
         f"🧬 EVO: {what_zh}，沒有試驗證據。沒有選出設定，"
         f"本次未消耗任何交易資料（watermark 未前進），模型不挑選設定。"
@@ -315,7 +428,8 @@ def grid_failure_message(failure: GridProcessFailure) -> str:
         f"Nothing was consumed: the watermark did NOT advance. "
         f"The model is not asked to pick. Missing evidence is not a "
         f"relative pass."
-        f"{brief}"
+        f"{brief}\n"
+        f"{done_line}"
     )
 
 
@@ -337,19 +451,25 @@ def _terminate(proc) -> None:
         proc.join(2.0)
 
 
-def _run_in_process(fn, job):
-    cap = _Capture()
+def _run_in_process(fn, job, on_progress=None):
+    cap = _Capture(on_progress)
     try:
         fn(job, cap)
     except Exception:
-        return GridProcessFailure("crash", traceback.format_exc())
+        return GridProcessFailure(
+            "crash", traceback.format_exc(), progress=cap.progress)
     if cap.item is None:
-        return GridProcessFailure("crash", "grid child returned no result")
-    status, payload = cap.item
+        return GridProcessFailure(
+            "crash", "grid child returned no result", progress=cap.progress)
+    try:
+        status, payload = cap.item
+    except (TypeError, ValueError):
+        return GridProcessFailure(
+            "crash", f"grid child sent {cap.item!r}", progress=cap.progress)
     if status == "ok":
         return payload
     text = payload if isinstance(payload, str) else repr(payload)
-    return GridProcessFailure("crash", text)
+    return GridProcessFailure("crash", text, progress=cap.progress)
 
 
 def _join_after_receipt(proc) -> None:
@@ -429,6 +549,217 @@ def _decode_message(proc, message):
     return GridProcessFailure("crash", text, pid)
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when ``pid`` is still a process. Never raises.
+
+    ``os.kill(pid, 0)`` is not an existence check on Windows (signal 0
+    is ``CTRL_C_EVENT``), so that platform uses ``OpenProcess``. A pid
+    we cannot verify stays alive so a live holder is not stolen.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _pid_alive_win(pid)
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pid_alive_win(pid: int) -> bool:
+    try:
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        access = 0x1000  # PROCESS_QUERY_LIMITED_INFORMATION
+        still_active = 259
+        handle = kernel.OpenProcess(access, False, pid)
+        if not handle:
+            # Access denied: the pid exists and is not ours.
+            if ctypes.get_last_error() == 5:
+                return True
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = kernel.GetExitCodeProcess(handle, ctypes.byref(code))
+            if not ok:
+                return True
+            return int(code.value) == still_active
+        finally:
+            kernel.CloseHandle(handle)
+    except Exception:
+        return True
+
+
+def default_slot_path() -> str:
+    """Host slot. ``TAI_EVO_GRID_SLOT`` redirects tests off ``data/``."""
+    override = os.environ.get("TAI_EVO_GRID_SLOT", "").strip()
+    if override:
+        return override
+    from src.paths import project_root
+    return os.path.join(project_root(), "data", GRID_SLOT_FILENAME)
+
+
+def _read_slot(path: str):
+    """``(pid or None, timestamp or None)``. The timestamp is the older
+    of the embedded clock and the file mtime.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, None
+    mtime = float(st.st_mtime)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read(256)
+    except OSError:
+        return None, mtime
+    parts = text.split()
+    pid = None
+    stamp = mtime
+    if parts:
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            pid = None
+    if len(parts) >= 2:
+        try:
+            stamp = float(parts[1])
+        except ValueError:
+            stamp = mtime
+    if mtime < stamp:
+        stamp = mtime
+    return pid, stamp
+
+
+def _slot_is_stale(pid, stamp, stale_s: float, now: float | None = None) -> bool:
+    if pid is None or not _pid_alive(pid):
+        return True
+    if stamp is None:
+        return True
+    current = time.time() if now is None else float(now)
+    return (current - float(stamp)) > float(stale_s)
+
+
+def _try_create_slot(path: str) -> bool:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(path, flags, 0o644)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    try:
+        payload = f"{os.getpid()}\n{time.time():.6f}\n".encode("ascii")
+        os.write(fd, payload)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return True
+
+
+def _steal_stale_slot(path: str, stale_s: float) -> None:
+    """Remove ``path`` only when it is still the same stale slot."""
+    pid, stamp = _read_slot(path)
+    if not _slot_is_stale(pid, stamp, stale_s):
+        return
+    pid2, stamp2 = _read_slot(path)
+    if pid2 != pid or stamp2 != stamp:
+        return
+    if not _slot_is_stale(pid2, stamp2, stale_s):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def acquire_grid_slot(
+        path: str,
+        *,
+        stop_check=None,
+        poll_s: float = GRID_SLOT_POLL_S,
+        wait_s: float,
+        stale_s: float,
+        sleep=None):
+    """Take the host slot. ``(owned, kind, queue_s)``.
+
+    ``kind`` is ``""`` when this process holds the file, otherwise
+    ``stopped`` or ``queue_timeout``. A free slot is taken even when
+    stop is already set, so the caller can spawn and then honour STOP
+    the way a grid with no queue does. Stop is noticed while waiting
+    on a busy slot. A dead pid, or a file older than ``stale_s``, is
+    taken over.
+    """
+    pause = time.sleep if sleep is None else sleep
+    start = time.monotonic()
+    deadline = start + max(0.0, float(wait_s))
+    poll = 0.05 if poll_s is None or poll_s <= 0 else float(poll_s)
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            pass
+    while True:
+        if _try_create_slot(path):
+            return True, "", time.monotonic() - start
+        if stop_check is not None and stop_check():
+            return False, "stopped", time.monotonic() - start
+        pid, stamp = _read_slot(path)
+        if _slot_is_stale(pid, stamp, stale_s):
+            _steal_stale_slot(path, stale_s)
+            if _try_create_slot(path):
+                return True, "", time.monotonic() - start
+        now = time.monotonic()
+        if now >= deadline:
+            return False, "queue_timeout", now - start
+        pause(min(poll, max(0.0, deadline - now)))
+
+
+def release_grid_slot(path: str, pid: int | None = None) -> None:
+    """Remove the slot only when it still names ``pid``."""
+    owner = os.getpid() if pid is None else int(pid)
+    current, _stamp = _read_slot(path)
+    if current != owner:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _stamp_failure(result, *, progress: str, elapsed_s: float, queue_s: float):
+    if not isinstance(result, GridProcessFailure):
+        return result
+    shown = result.progress or progress
+    return GridProcessFailure(
+        result.kind,
+        result.detail,
+        result.pid,
+        progress=shown,
+        elapsed_s=float(elapsed_s),
+        queue_s=float(queue_s),
+    )
+
+
 def run_grid_isolated(
         job: GridJob,
         *,
@@ -437,18 +768,33 @@ def run_grid_isolated(
         in_process: bool = False,
         poll_s: float = 0.2,
         entry=None,
-        on_start=None):
+        on_start=None,
+        stall_s: float = DEFAULT_GRID_STALL_S,
+        on_progress=None,
+        slot_path: str | None = None,
+        slot_poll_s: float = GRID_SLOT_POLL_S,
+        queue_timeout_s: float | None = None,
+        slot_stale_s: float | None = None):
     """Run the grid and return a ``GridOutcome`` or ``GridProcessFailure``.
 
     The default waits on a spawn child. Each pass checks ``stop_check``,
     polls the result pipe for a short slice, then checks the deadline
-    and whether the child is still alive. The result is received as soon as
-    it is readable, which drains the pipe so a payload larger than the
-    OS buffer cannot stick the child in ``send``. The child is joined
-    after that receipt. ``stop_check`` true, or a still-running child
-    with an empty pipe at ``timeout_s``, terminates the child. A child
-    that exits without a message is a crash with no trial evidence.
-    The Tk thread is not this thread.
+    and whether the child is still alive. A ``("progress", i, n)``
+    message is liveness: it records ``i/n`` and does not finish the
+    run. The result is received as soon as it is readable, which drains
+    the pipe so a payload larger than the OS buffer cannot stick the
+    child in ``send``. Messages already buffered behind a progress
+    line are drained too, including the final non-blocking read after
+    the child has exited. The child is joined after that receipt.
+    ``stop_check`` true, or a still-running child with an empty pipe at
+    ``timeout_s``, terminates the child. No progress for ``stall_s``
+    fails as ``stalled`` even when the overall cap is still in the
+    future. A child that exits without a message is a crash with no
+    trial evidence. Partial results are not kept.
+
+    The timeout and stall clocks start when the host slot is acquired.
+    Waiting for that slot is capped at ``queue_timeout_s`` (default
+    three times the 3 h cap). The Tk thread is not this thread.
 
     ``in_process=True`` runs ``entry`` on the calling thread. The live
     worker leaves it false. That path still rebuilds the strategy
@@ -458,26 +804,141 @@ def run_grid_isolated(
     after spawn, or with None on the in-process path.
     """
     fn = grid_child_entry if entry is None else entry
+    path = default_slot_path() if slot_path is None else str(slot_path)
+    wait_s = float(grid_queue_wait_s() if queue_timeout_s is None
+                   else queue_timeout_s)
+    stale_s = float(grid_slot_stale_s() if slot_stale_s is None
+                    else slot_stale_s)
+    owned, qkind, queue_s = acquire_grid_slot(
+        path,
+        stop_check=stop_check,
+        poll_s=slot_poll_s,
+        wait_s=wait_s,
+        stale_s=stale_s,
+    )
+    if not owned:
+        detail = ("stop requested" if qkind == "stopped"
+                  else f"grid queue exceeded {wait_s:g}s; progress 0/0")
+        return GridProcessFailure(
+            qkind or "queue_timeout",
+            detail,
+            None,
+            progress="0/0",
+            elapsed_s=0.0,
+            queue_s=queue_s,
+        )
+    run_started = time.monotonic()
+    # Spawn, not fork: the parent already owns Tk and COM.
+    ctx = multiprocessing.get_context("spawn")
+    try:
+        return _run_grid_held(
+            job,
+            fn=fn,
+            timeout_s=float(timeout_s),
+            stall_s=float(stall_s),
+            stop_check=stop_check,
+            in_process=in_process,
+            poll_s=poll_s,
+            on_start=on_start,
+            on_progress=on_progress,
+            queue_s=queue_s,
+            run_started=run_started,
+            ctx=ctx,
+        )
+    finally:
+        release_grid_slot(path, os.getpid())
+
+
+def _run_grid_held(
+        job,
+        *,
+        fn,
+        timeout_s: float,
+        stall_s: float,
+        stop_check,
+        in_process: bool,
+        poll_s: float,
+        on_start,
+        on_progress,
+        queue_s: float,
+        run_started: float,
+        ctx):
+    """The sweep after this process holds the slot. Clocks already run."""
+    done = 0
+    total = 0
+    last_progress_at = run_started
+
+    def _progress() -> str:
+        return f"{done}/{total}"
+
+    def _elapsed() -> float:
+        return max(0.0, time.monotonic() - run_started)
+
+    def _stamp(result):
+        return _stamp_failure(
+            result,
+            progress=_progress(),
+            elapsed_s=_elapsed(),
+            queue_s=queue_s,
+        )
+
+    def _note(message) -> None:
+        nonlocal done, total, last_progress_at
+        try:
+            done_i = int(message[1])
+            total_i = int(message[2])
+        except (TypeError, ValueError, IndexError):
+            return
+        done = done_i
+        total = total_i
+        last_progress_at = time.monotonic()
+        if on_progress is not None:
+            try:
+                on_progress(done, total)
+            except Exception:
+                pass
+
     if in_process:
         if stop_check is not None and stop_check():
-            return GridProcessFailure("stopped", "stop requested")
+            return _stamp(GridProcessFailure("stopped", "stop requested"))
         if on_start is not None:
             on_start(None)
-        return _run_in_process(fn, job)
+        result = _run_in_process(fn, job, on_progress)
+        return _stamp(result)
 
-    ctx = multiprocessing.get_context("spawn")
     recv_conn, send_conn = ctx.Pipe(duplex=False)
     proc = ctx.Process(
         target=fn, args=(job, send_conn), daemon=True, name="evo-grid")
     send_closed = False
+
+    def _drain_buffered():
+        """Return a finished payload already in the pipe, or None.
+
+        Progress lines are consumed and do not hide a following ``ok``.
+        A progress flood cannot extend the deadline: after a bounded
+        number of progress messages the caller times out and discards
+        whatever is not a finished result.
+        """
+        for _ in range(10000):
+            kind, message = _poll_message(recv_conn, 0.0)
+            if kind == "msg":
+                if _is_progress(message):
+                    _note(message)
+                    continue
+                return _decode_message(proc, message)
+            if kind == "err":
+                return _pipe_failed(proc, message)
+            return None
+        return None
+
     try:
         try:
             proc.start()
         except Exception as exc:
-            return GridProcessFailure(
+            return _stamp(GridProcessFailure(
                 "crash",
                 f"could not start grid child: {type(exc).__name__}: {exc}",
-                proc.pid)
+                proc.pid))
         if on_start is not None:
             on_start(proc.pid)
         try:
@@ -485,39 +946,78 @@ def run_grid_isolated(
             send_closed = True
         except Exception:
             pass
-        deadline = time.monotonic() + float(timeout_s)
+        # Clocks started at acquire, before spawn, so a slow start
+        # counts against the stall and the overall cap.
+        deadline = run_started + float(timeout_s)
         poll = 0.05 if not poll_s or poll_s <= 0 else float(poll_s)
         while True:
             # STOP wins over a payload that has not been read yet, same
             # as killing a child that has not exited.
             if stop_check is not None and stop_check():
                 _terminate(proc)
-                return GridProcessFailure(
-                    "stopped", "stop requested", proc.pid)
-            remaining = deadline - time.monotonic()
-            slice_s = 0.0 if remaining <= 0 else min(poll, remaining)
+                return _stamp(GridProcessFailure(
+                    "stopped", "stop requested", proc.pid))
+            now = time.monotonic()
+            if now >= deadline:
+                # A finished ok that is already buffered still counts.
+                # Progress does not extend the cap. Anything not yet a
+                # full result is discarded.
+                found = _drain_buffered()
+                if found is not None:
+                    return _stamp(found)
+                _terminate(proc)
+                return _stamp(GridProcessFailure(
+                    "timeout",
+                    f"grid child exceeded {float(timeout_s):g}s; "
+                    f"progress {_progress()}",
+                    proc.pid,
+                    progress=_progress()))
+            if stall_s > 0 and (now - last_progress_at) >= float(stall_s):
+                kind, message = _poll_message(recv_conn, 0.0)
+                if kind == "msg":
+                    if _is_progress(message):
+                        _note(message)
+                        continue
+                    return _stamp(_decode_message(proc, message))
+                if kind == "err":
+                    return _stamp(_pipe_failed(proc, message))
+                if kind == "eof" or not _alive(proc):
+                    found = _drain_buffered()
+                    if found is not None:
+                        return _stamp(found)
+                    return _stamp(_no_result(proc))
+                _terminate(proc)
+                return _stamp(GridProcessFailure(
+                    "stalled",
+                    f"grid child stalled for {float(stall_s):g}s "
+                    f"without progress; progress {_progress()}",
+                    proc.pid,
+                    progress=_progress()))
+            remaining = deadline - now
+            until_stall = (
+                float(stall_s) - (now - last_progress_at)
+                if stall_s > 0 else remaining)
+            slice_s = min(poll, remaining, max(0.0, until_stall))
             kind, message = _poll_message(recv_conn, slice_s)
             if kind == "msg":
-                return _decode_message(proc, message)
+                if _is_progress(message):
+                    _note(message)
+                    continue
+                return _stamp(_decode_message(proc, message))
             if kind == "err":
-                return _pipe_failed(proc, message)
+                return _stamp(_pipe_failed(proc, message))
             if kind == "eof" or not _alive(proc):
                 # The write end may have closed between the empty poll
-                # and the liveness check. One more non-blocking read
-                # before calling the pipe empty.
+                # and the liveness check. Drain what is already buffered
+                # before calling the pipe empty. Progress lines in that
+                # buffer must not hide the ok that follows them.
                 if kind != "eof":
-                    kind, message = _poll_message(recv_conn, 0.0)
-                    if kind == "msg":
-                        return _decode_message(proc, message)
-                    if kind == "err":
-                        return _pipe_failed(proc, message)
-                return _no_result(proc)
-            if remaining <= 0:
-                _terminate(proc)
-                return GridProcessFailure(
-                    "timeout",
-                    f"grid child exceeded {float(timeout_s):g}s",
-                    proc.pid)
+                    found = _drain_buffered()
+                    if isinstance(found, GridProcessFailure):
+                        return _stamp(found)
+                    if found is not None:
+                        return _stamp(found)
+                return _stamp(_no_result(proc))
     finally:
         if not send_closed:
             try:
