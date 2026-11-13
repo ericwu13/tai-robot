@@ -32,9 +32,12 @@ each setting, then ``("ok", outcome)``. Progress is liveness only.
 arrives. Partial trial results are discarded: only a finished ``ok``
 is returned.
 
-One grid runs per host. The parent acquires ``data/evo_grid.slot``
-before the clocks start, queues on this thread (never on Tk), and
-releases the slot when the run ends. The child does not start a
+One grid runs per install folder. The slot is
+``project_root()/data/evo_grid.slot`` (or ``TAI_EVO_GRID_SLOT``).
+Two installs side by side do not share it. It is not a machine-wide
+path and it is not under ``%PROGRAMDATA%``. The parent acquires that
+file before the clocks start, queues on this thread (never on Tk),
+and releases the slot when the run ends. The child does not start a
 worker pool.
 
 ``in_process=True`` is the test seam. It runs the same function on the
@@ -598,7 +601,15 @@ def _pid_alive_win(pid: int) -> bool:
 
 
 def default_slot_path() -> str:
-    """Host slot. ``TAI_EVO_GRID_SLOT`` redirects tests off ``data/``."""
+    """This install's grid slot. Not shared with another install folder.
+
+    ``project_root()/data/evo_grid.slot`` is the writable install
+    directory (the EXE folder when frozen, the repo root from source).
+    Two folders running at once — source tree and EXE, or old and new
+    install — each have their own slot. That is intentional. Do not
+    move the file to ``%PROGRAMDATA%`` or any other machine-wide path.
+    ``TAI_EVO_GRID_SLOT`` redirects tests off ``data/``.
+    """
     override = os.environ.get("TAI_EVO_GRID_SLOT", "").strip()
     if override:
         return override
@@ -639,12 +650,28 @@ def _read_slot(path: str):
 
 
 def _slot_is_stale(pid, stamp, stale_s: float, now: float | None = None) -> bool:
-    if pid is None or not _pid_alive(pid):
-        return True
-    if stamp is None:
-        return True
+    """True when the slot may be taken over.
+
+    A readable dead pid is stale at any age. A live pid is stale only
+    once it is older than ``stale_s`` (the cap plus 10 min). An empty
+    or half-written file has no pid: a young one is busy (the holder
+    is between create and write), and only a file older than that same
+    guard is stale. No separate age constant.
+    """
     current = time.time() if now is None else float(now)
-    return (current - float(stamp)) > float(stale_s)
+    try:
+        age = None if stamp is None else current - float(stamp)
+    except (TypeError, ValueError):
+        age = None
+    if pid is None:
+        if age is None:
+            return False
+        return age > float(stale_s)
+    if not _pid_alive(pid):
+        return True
+    if age is None:
+        return True
+    return age > float(stale_s)
 
 
 def _try_create_slot(path: str) -> bool:
@@ -675,18 +702,59 @@ def _try_create_slot(path: str) -> bool:
     return True
 
 
+def _restore_slot(renamed: str, path: str) -> None:
+    """Put a non-stale slot back without clobbering a new holder.
+
+    Restoring is safer than deleting: the file we moved aside may be
+    a live holder's slot. ``os.link`` fails when ``path`` already
+    exists, so a slot created after the rename is left alone. If the
+    link is not available and ``path`` is empty, ``os.replace`` moves
+    it back. A path that reappeared is left busy, and the renamed copy
+    of the non-stale slot is kept rather than deleted.
+    """
+    try:
+        os.link(renamed, path)
+    except FileExistsError:
+        return
+    except OSError:
+        if os.path.exists(path):
+            return
+        try:
+            os.replace(renamed, path)
+        except OSError:
+            return
+        return
+    try:
+        os.remove(renamed)
+    except OSError:
+        pass
+
+
 def _steal_stale_slot(path: str, stale_s: float) -> None:
-    """Remove ``path`` only when it is still the same stale slot."""
+    """Take over ``path`` only when the renamed copy is still stale.
+
+    The file is renamed to ``<path>.<pid>.<random>`` before any delete.
+    The pid and stamp are read again from that copy. Only then is the
+    copy removed. A fresh slot that landed at ``path`` is never the
+    file we delete. If the copy is no longer stale, it is restored
+    when ``path`` is empty. A rename that fails (a Windows open handle)
+    leaves ``path`` in place and does not delete it.
+    """
     pid, stamp = _read_slot(path)
     if not _slot_is_stale(pid, stamp, stale_s):
         return
-    pid2, stamp2 = _read_slot(path)
-    if pid2 != pid or stamp2 != stamp:
+    holder = str(pid) if isinstance(pid, int) else "na"
+    renamed = f"{path}.{holder}.{os.urandom(4).hex()}"
+    try:
+        os.replace(path, renamed)
+    except OSError:
         return
+    pid2, stamp2 = _read_slot(renamed)
     if not _slot_is_stale(pid2, stamp2, stale_s):
+        _restore_slot(renamed, path)
         return
     try:
-        os.remove(path)
+        os.remove(renamed)
     except OSError:
         pass
 
@@ -735,15 +803,39 @@ def acquire_grid_slot(
 
 
 def release_grid_slot(path: str, pid: int | None = None) -> None:
-    """Remove the slot only when it still names ``pid``."""
+    """Remove the slot only when it still names ``pid``.
+
+    Windows can refuse the delete while a waiter has the file open.
+    Retry for about 2 s, re-checking the pid before each attempt. A
+    remove that still fails is logged. It is not ignored.
+    """
+    import logging
+
     owner = os.getpid() if pid is None else int(pid)
-    current, _stamp = _read_slot(path)
-    if current != owner:
-        return
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    deadline = time.monotonic() + 2.0
+    delay = 0.05
+    last_exc: BaseException | None = None
+    while True:
+        current, _stamp = _read_slot(path)
+        if current != owner:
+            return
+        try:
+            os.remove(path)
+            return
+        except OSError as exc:
+            last_exc = exc
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        time.sleep(min(delay, max(0.0, deadline - now)))
+        delay = min(delay * 2, 0.5)
+    logging.getLogger(__name__).warning(
+        "grid slot release failed path=%s pid=%s [%s] %s",
+        path,
+        owner,
+        type(last_exc).__name__ if last_exc is not None else "OSError",
+        last_exc,
+    )
 
 
 def _stamp_failure(result, *, progress: str, elapsed_s: float, queue_s: float):

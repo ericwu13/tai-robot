@@ -13,8 +13,9 @@ and send an N-byte blob through the real pipe. The blob is not put in
 the pickled job. A result that is not a ``GridOutcome`` exits
 non-zero, including that blob.
 
-The only write is a STOP file path under a fresh temp directory.
-Nothing reads ``settings.yaml`` and nothing is written under ``data/``.
+The smoke takes this install's grid slot and waits only a few seconds
+for it. The other write is a STOP file under a fresh temp directory.
+Nothing reads ``settings.yaml``.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ from src.market_data.models import Bar
 _SMOKE_MAX_SETTINGS = 4
 _DEFAULT_BARS = 120
 _DEFAULT_TIMEOUT_S = 120.0
+# The live queue wait is 3 x the 3 h cap. A smoke must not sit there.
+_SMOKE_QUEUE_TIMEOUT_S = 5.0
 _STOP_NAME = "STOP"
 
 _SMOKE_SOURCE = """
@@ -212,6 +215,7 @@ def run_grid_smoke(
         entry=entry,
         on_start=_started,
         on_progress=on_progress,
+        queue_timeout_s=_SMOKE_QUEUE_TIMEOUT_S,
     )
     elapsed = time.monotonic() - started
     outcome, detail = _summarize(result)
@@ -237,7 +241,9 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         prog="tai_backtest --grid-subprocess-smoke",
         description=(
             "Run the grid spawn child with synthetic bars. "
-            "No chat API key, no broker login, no Tk window."
+            "No chat API key, no broker login, no Tk window. "
+            "Uses this install's grid slot and waits at most "
+            f"{_SMOKE_QUEUE_TIMEOUT_S:g} s for it."
         ),
     )
     parser.add_argument(

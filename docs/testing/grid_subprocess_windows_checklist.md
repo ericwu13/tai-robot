@@ -164,8 +164,10 @@ memory and calls `run_grid_isolated` (spawn).
   it. Pass for a STOP file is `outcome=stopped` and exit code 3. Pass for
   a short wait is `outcome=timeout` and exit code 2.
 - `--timeout-s S` is the wait for this process only. It is not a
-  `settings.yaml` key and it does not change the live bot's 20-minute
-  grid timeout. The smoke default when the flag is omitted is 120 seconds.
+  `settings.yaml` key and it does not change the live grid budget
+  (`grid_timeout_budget_s`: 1200 s floor, 90 s per run, 3 h cap). The
+  smoke default when the flag is omitted is 120 seconds. The smoke
+  also takes this install's grid slot and waits at most 5 s for it.
 - `--payload-bytes N` makes the child build and send an N-byte blob
   through the real spawn pipe. The blob is not in the pickled job.
   That result is not a `GridOutcome`, so the process exits **1**
@@ -358,8 +360,8 @@ Do not write `data\live\...\STOP` and do not run `run_bot_cli.py stop`.
 ## (e) Child is gone after a short smoke timeout
 
 `--timeout-s` is smoke-only. There is still no settings key and no
-environment variable that shortens the live bot's 20-minute grid timeout.
-Do not edit `DEFAULT_GRID_TIMEOUT_S`.
+environment variable that shortens the live grid budget
+(`grid_timeout_budget_s`). Do not edit that helper.
 
 Start a new hang with an 8-second wait. Do not write a STOP file.
 
@@ -377,12 +379,12 @@ Pass:
 - The process exits with code 2.
 - The output contains `grid-smoke: outcome=timeout` and
   `grid-smoke: note=timeout is this process only; not a settings key`.
-- `elapsed_s` is about 8 seconds, not 20 minutes.
+- `elapsed_s` is about 8 seconds, not the live grid budget.
 - The `--multiprocessing-fork` PID is gone.
 - `settings.yaml` was not required and was not a live copy.
 
 Fail: the child is still alive after about 15 seconds, the outcome is
-not `timeout`, or the run waited the live 20-minute bound.
+not `timeout`, or the run waited out the live grid budget.
 
 ## (f) Payload larger than the 8 KB Windows pipe
 

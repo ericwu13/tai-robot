@@ -278,3 +278,124 @@ def test_three_children_serialize_on_the_slot(tmp_path, capsys):
     for index in range(3):
         assert f"grid-slot: child {index} start " in captured
     assert not (tmp_path / "evo_grid.slot").exists()
+
+
+def _dead_pid() -> int:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=10)
+    return int(proc.pid)
+
+
+def test_release_retries_then_removes_the_slot(tmp_path, monkeypatch):
+    """A Windows-style PermissionError on the first removes still clears the slot."""
+    from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
+
+    path = tmp_path / "evo_grid.slot"
+    owned, kind, _queue = acquire_grid_slot(
+        str(path), wait_s=2, stale_s=10**9, poll_s=0.05)
+    assert owned and kind == ""
+    calls = {"n": 0}
+    real_remove = os.remove
+
+    def _flaky(target):
+        calls["n"] += 1
+        if os.path.abspath(target) == os.path.abspath(path) and calls["n"] < 3:
+            raise PermissionError(13, "sharing violation")
+        return real_remove(target)
+
+    monkeypatch.setattr(os, "remove", _flaky)
+    release_grid_slot(str(path))
+    assert not path.exists()
+    assert calls["n"] >= 3
+
+
+def test_release_warns_when_remove_never_succeeds(tmp_path, monkeypatch, caplog):
+    """A remove that keeps failing is a warning, not a silent leftover."""
+    import logging
+
+    from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
+
+    path = tmp_path / "evo_grid.slot"
+    owned, kind, _queue = acquire_grid_slot(
+        str(path), wait_s=2, stale_s=10**9, poll_s=0.05)
+    assert owned and kind == ""
+    now = {"t": 1000.0}
+
+    def _mono():
+        return now["t"]
+
+    def _snooze(seconds):
+        now["t"] += float(seconds)
+
+    def _always(_target):
+        raise PermissionError(13, "sharing violation")
+
+    monkeypatch.setattr(time, "monotonic", _mono)
+    monkeypatch.setattr(time, "sleep", _snooze)
+    monkeypatch.setattr(os, "remove", _always)
+    with caplog.at_level(logging.WARNING, logger="src.evolution.grid_process"):
+        release_grid_slot(str(path))
+    assert path.exists()
+    assert now["t"] >= 1002.0 - 0.05
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, caplog.records
+    text = " ".join(r.getMessage() for r in warnings)
+    assert str(path) in text
+    assert str(os.getpid()) in text
+
+
+def test_young_empty_slot_is_busy(tmp_path):
+    """An empty or half-written young file is held, not stolen."""
+    from src.evolution.grid_process import acquire_grid_slot
+
+    path = tmp_path / "evo_grid.slot"
+    for text in ("", "not-a-pid\n"):
+        path.write_text(text, encoding="ascii")
+        os.utime(path, None)
+        owned, kind, _queue = acquire_grid_slot(
+            str(path), wait_s=0.25, stale_s=10**9, poll_s=0.05)
+        assert owned is False, text
+        assert kind == "queue_timeout", (text, kind)
+        assert path.read_text(encoding="ascii") == text
+
+
+def test_steal_does_not_delete_a_fresh_slot_after_rename(tmp_path, monkeypatch):
+    """B renames what it thought was stale and must put A's fresh slot back."""
+    from src.evolution.grid_process import _steal_stale_slot
+
+    path = tmp_path / "evo_grid.slot"
+    _plant(path, _dead_pid(), time.time() - 100000)
+    real_replace = os.replace
+
+    def _race(src, dst):
+        if os.path.abspath(src) == os.path.abspath(path):
+            _plant(path, os.getpid(), time.time())
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _race)
+    _steal_stale_slot(str(path), 30)
+    assert path.is_file(), "fresh slot was deleted"
+    assert path.read_text(encoding="ascii").split()[0] == str(os.getpid())
+
+
+def test_failed_rename_leaves_the_slot_busy(tmp_path, monkeypatch):
+    """A sharing violation on rename does not delete the slot."""
+    from src.evolution.grid_process import _steal_stale_slot
+
+    path = tmp_path / "evo_grid.slot"
+    _plant(path, _dead_pid(), time.time() - 100000)
+    before = path.read_text(encoding="ascii")
+
+    def _boom(_src, _dst):
+        raise PermissionError(13, "sharing violation")
+
+    monkeypatch.setattr(os, "replace", _boom)
+    _steal_stale_slot(str(path), 30)
+    assert path.read_text(encoding="ascii") == before
+    from src.evolution.grid_process import acquire_grid_slot
+
+    owned, kind, _queue = acquire_grid_slot(
+        str(path), wait_s=0.25, stale_s=30, poll_s=0.05)
+    assert owned is False
+    assert kind == "queue_timeout"
+    assert path.read_text(encoding="ascii") == before
