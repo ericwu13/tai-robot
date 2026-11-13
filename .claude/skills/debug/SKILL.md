@@ -1,6 +1,6 @@
 ---
 name: debug
-description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then (only after Eric's explicit yes via Selina) follow `tai-robot-release` for tag/notes/Discord. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
+description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then (only after Eric's explicit yes via Selina) ship a versioned release per CLAUDE.md § Release Process. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
 ---
 
 # tai-robot Debug Workflow
@@ -52,11 +52,10 @@ jump to code assumptions before you have read them.
 3. Do **not** assume — follow the actual call chain. When adding a new branch,
    check what state it inherits. Trace ALL mutation points before concluding.
 4. If the logs lack the detail needed, **add logging to the bot** first.
-   Redeploy only via the `deploy` skill, with its gates and the owner's yes
-   in this conversation. Do not deploy from this PC unless the owner asked
-   for a local bot. Never touch the live main tree. Gather more data before
-   proposing a fix. Diagnosing on insufficient data is how surface-level
-   patches happen.
+   Redeploy only via the `deploy` skill, with its gates and Eric's yes via
+   Selina. Do not deploy from this PC unless Eric asked for a local bot.
+   Never touch the live main tree. Gather more data before proposing a fix.
+   Diagnosing on insufficient data is how surface-level patches happen.
 5. Output of this phase (all three, logged in the diagnosis before handing off to Opus):
    - **Root-cause statement** — what, where, why. Not a fix yet.
    - **Fix confidence rating (0–100%)** — state the confidence level in the proposed
@@ -117,11 +116,12 @@ vars, event log, SQLite) → `n8n-debug`.
 Goal: a versioned release with a Discord notification.
 
 Phase 4 runs only after Eric's explicit yes via Selina. Never merge the fix
-branch yourself. The PR stays a draft until Eric merges.
+branch yourself; Eric decides the merge.
 
-Tag, bilingual notes, `build_release.py`, GitHub release, and Discord follow
-the library `tai-robot-release` skill. Do not tag, publish, Discord-notify, or
-redeploy live bots without that yes. Redeploy of live bots is a separate yes.
+Then follow CLAUDE.md § Release Process (Grok Bot agents: library skill
+`tai-robot-release`): bump `version.py`, bilingual notes, `build_release.py`,
+GitHub release with assets, Discord. Do not tag, publish, or Discord-notify
+without that yes. Redeploying live bots needs its own yes, via the `deploy` skill.
 
 The Discord notification reads from the GitHub release body (no local file
 lookup), so the release body must be complete before notifying.
