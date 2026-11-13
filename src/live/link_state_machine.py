@@ -277,6 +277,7 @@ class LinkStateMachine:
         now: datetime,
         *,
         enter_not_before: datetime | None = None,
+        release_at: datetime | None = None,
     ) -> None:
         """A 3002 was not followed by 3003. The quote is not ready.
 
@@ -293,6 +294,12 @@ class LinkStateMachine:
         so a closed gap cannot reach DEGRADED. Passing None means the
         session is open and the settle starts from this mark.
 
+        ``release_at`` is set only for an open-session mark-down. A
+        fresh tick at or after that instant restores READY. A closed
+        gap leaves it None: IsConnected()==0 still takes #178, and a
+        tick during the gap cannot restore. IsConnected() is not read
+        here.
+
         Refuses unless the quote is READY. A CONNECTING or DOWN quote
         is a #178 attempt already in progress (or one already marked
         down). This does not clear ``_pending_3003`` or
@@ -305,7 +312,10 @@ class LinkStateMachine:
         self._quote_stuck_since = None
         self._quote_down_at = now
         self._quote_enter_not_before = enter_not_before
-        self._quote_hold_open_at = enter_not_before
+        # Open session passes release_at=now and no enter_not_before,
+        # so the next fresh tick can restore. A closed gap passes the
+        # next open, or None when IsConnected()==0.
+        self._quote_hold_open_at = enter_not_before or release_at
         self._quote_timeout_hold = True
         self._logged_duplicate_3003 = False
         self.entries_blocked = True
@@ -1048,12 +1058,13 @@ class LinkStateMachine:
         self._quote_stuck_since = None
 
     def _restore_if_feed_healthy(self, now: datetime) -> bool:
-        """Return to READY when a fresh tick arrived after the hold's open.
+        """Return to READY when a fresh tick arrived after the release.
 
-        Only a timeout hold that was waiting for a session open. The
-        tick is the liveness signal. IsConnected() is not. No subscribe
-        and no EnterMonitor. EnterMonitorLONG forgets a tick from
-        before that call, so it cannot restore READY later.
+        That release is the next session open, or the open-session
+        mark-down itself. The tick is the only liveness signal.
+        IsConnected() is not. No subscribe and no EnterMonitor.
+        EnterMonitorLONG forgets a tick from before that call, so it
+        cannot restore READY later.
         """
         release = self._quote_hold_open_at
         if release is None or now < release:

@@ -201,9 +201,12 @@ def _no_forbidden(fake, base: int) -> None:
 def _recover_enter(app, fake, clock, drop):
     """One #178 EnterMonitorLONG while the session is open.
 
+    A subscribed runner is required. An idle GUI does not mark down.
+
     Returns ``(entered_at, enter_count)``. IsConnected stays 0 until
     the call, which is what lets EnterMonitorLONG through the gate.
     """
+    _running(app)
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 0
     fired = drop + timedelta(seconds=15)
@@ -276,6 +279,7 @@ def test_mid_session_timeout_then_late_3003_becomes_ready(monkeypatch):
     """
     drop = tpe(2026, 11, 12, 10, 0)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
     enters = fake.calls.count("EnterMonitorLONG")
     subs = fake.calls.count("SubscribeQuotes")
     _replay_drop(app, fake, clock, drop)
@@ -409,6 +413,7 @@ def test_stuck_countdown_does_not_degrade_across_the_close(monkeypatch):
     """
     drop = tpe(2026, 11, 12, 13, 44, 30)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
     enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 2
@@ -709,6 +714,7 @@ def test_open_session_timeout_enters_after_five_second_settle(monkeypatch):
     """Market open: #178 is 5s settle, then EnterMonitorLONG iff IsConnected()==0."""
     drop = tpe(2026, 11, 12, 9, 0)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
     enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 0
@@ -730,6 +736,7 @@ def test_open_half_up_still_reaches_stuck_limit(monkeypatch):
     """An open half-up quote still degrades at stuck_limit. The gap hold is not on."""
     drop = tpe(2026, 11, 12, 9, 10)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
     enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 2
@@ -750,6 +757,7 @@ class _Runner:
     symbol = "TX00"
     suppress_strategy = False
     _is_reloading = False
+    state = LiveState.RUNNING
 
     def reset_bar_monotonicity(self, bar_was_truncated=False):
         self.bar_was_truncated = bar_was_truncated
@@ -1121,52 +1129,62 @@ def test_duplicate_3003_while_ready_does_not_reconnect(monkeypatch):
 
 
 def test_no_runner_is_connected_1_without_a_tick_marks_down(monkeypatch):
-    """No runner and IsConnected()==1 still marks down when no tick is fresh.
+    """An idle open session does not mark down, even when IsConnected is 1.
 
-    IsConnected is not liveness. DEGRADED after the stuck clock is the
-    accepted end state.
+    Nothing is subscribed, so a missing tick is not liveness. Five
+    minutes later the quote is still connected and not DEGRADED, and
+    no SKCOM call was made.
     """
     drop = tpe(2026, 11, 12, 10, 0)
     app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=5))
     assert app._live_runner is None
-    enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 1
     before = len(logged)
+    calls = len(fake.calls)
     _deliver_3002(app)
-    assert not getattr(app, "_last_fresh_tick_at", 0.0)
     _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    seen = app._quote_intermediate_seen_at
     text = "\n".join(logged[before:])
-    assert "quote marked down" in text
-    assert "ticks are flowing" not in text
-    machine = app._link_host.machine
-    assert machine.quote == LinkPhase.DOWN
-    assert app._quote_connected is False
-    assert fake.calls.count("EnterMonitorLONG") == enters
-    fired = drop + timedelta(seconds=15)
-    _tick(app, fake, clock, fired + timedelta(seconds=5))
-    _tick(app, fake, clock, fired + timedelta(seconds=5 + 300))
-    assert machine.degraded is True
-    assert machine.degraded_reason == "stuck"
+    assert "no subscribed runner" in text
+    assert "quote marked down" not in text
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._link_host.machine.degraded is False
+    assert seen > 0
+    assert "IsConnected" not in fake.calls[calls:]
+    assert "EnterMonitorLONG" not in fake.calls[calls:]
+    _tick(app, fake, clock, drop + timedelta(seconds=15 + 320))
+    assert app._link_host.machine.degraded is False
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._quote_intermediate_seen_at == seen
+    assert "IsConnected" not in fake.calls[calls:]
+    assert "EnterMonitorLONG" not in fake.calls[calls:]
 
 
 def test_no_runner_is_connected_0_still_marks_down(monkeypatch):
-    """(B) GUI idle and IsConnected()==0 still marks the quote down."""
+    """An idle open session does not mark down when IsConnected()==0 either.
+
+    Open-session liveness is not an IsConnected read. The closed gap
+    is the path that still takes #178.
+    """
     drop = tpe(2026, 11, 12, 10, 0)
     app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=5))
     assert app._live_runner is None
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 0
     before = len(logged)
+    calls = len(fake.calls)
     _deliver_3002(app)
     _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
     text = "\n".join(logged[before:])
-    assert "quote marked down" in text
-    assert "staying READY" not in text
-    machine = app._link_host.machine
-    assert machine.quote == LinkPhase.DOWN
-    assert app._quote_connected is False
-    assert machine._quote_timeout_hold is True
+    assert "no subscribed runner" in text
+    assert "quote marked down" not in text
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert "IsConnected" not in fake.calls[calls:]
+    assert "EnterMonitorLONG" not in fake.calls[calls:]
 
 
 def test_tick_without_runner_records_fresh_tick_clock(monkeypatch):
@@ -1340,10 +1358,11 @@ def test_warmup_timeout_defers_then_marks_down_without_a_tick(monkeypatch):
     assert app.root.pending[app._quote_ready_timer_id][0] == 5000
     runner.state = LiveState.RUNNING
     app._live_warmup_mode = False
+    seen = app._quote_intermediate_seen_at
     _arm_subscribe(monkeypatch, app)
     app._start_live_tick_subscription()
     assert stopped == []
-    assert _fire_pending(app, fake, clock, drop + timedelta(seconds=20)) == 5000
+    assert app._quote_intermediate_seen_at == seen
     assert app.root.pending[app._quote_ready_timer_id][0] == 15000
     app._last_fresh_tick_at = 0.0
     _fire_pending(app, fake, clock, drop + timedelta(seconds=36))
@@ -1500,6 +1519,7 @@ def test_tick_before_the_3002_does_not_count_as_fresh(monkeypatch):
     app, fake, clock, logged = _ready(monkeypatch, drop)
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 1
+    _running(app)
     _deliver_3002(app)
     seen = app._quote_intermediate_seen_at
     app._last_fresh_tick_at = seen - 10
@@ -1551,6 +1571,7 @@ def test_fresh_tick_window_boundary(monkeypatch, age, ready):
     app, fake, clock, _logged = _ready(monkeypatch, drop)
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 1
+    _running(app)
     _deliver_3002(app)
     # Freeze the wall clock so 30.0s is not nudged over the limit.
     frozen = time.time()
@@ -1590,6 +1611,7 @@ def test_open_session_tick_60s_ago_marks_down(monkeypatch):
     """No fresh tick for 60s marks the quote down. IsConnected stays 1."""
     drop = tpe(2026, 11, 12, 10, 0)
     app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 1
     before = len(logged)
@@ -1648,3 +1670,217 @@ def test_0730_is_connected_1_waits_for_the_open_then_stuck(monkeypatch):
     assert app._link_host.machine.degraded_reason == "stuck"
     assert "LeaveMonitor" not in fake.calls
     assert "RestartProcess" not in fake.calls
+
+
+_QUOTE_WAITING = "報價未就緒 Quote not ready — waiting for ticks"
+_QUOTE_UNVERIFIED = "Quote unverified — waiting for ticks"
+
+
+def _last_status(app) -> str:
+    assert app._statuses
+    return app._statuses[-1][0]
+
+
+def _last_dot(app) -> str:
+    assert app._dots
+    return app._dots[-1]
+
+
+def _subscribe_runner(monkeypatch, app):
+    """A RUNNING runner whose tick subscribe succeeds."""
+    app._live_runner = _SubRunner(LiveState.RUNNING)
+    app._live_warmup_mode = False
+    app._deploy_pending = False
+    _arm_subscribe(monkeypatch, app)
+    app._start_live_tick_subscription()
+
+
+def test_open_session_tick_after_markdown_restores_ready(monkeypatch):
+    """A fresh tick after an open-session mark-down restores READY.
+
+    It must not wait for the ~300s DEGRADED point, and it must not
+    read IsConnected to decide.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    enters = fake.calls.count("EnterMonitorLONG")
+    _deliver_3002(app)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert machine._quote_hold_open_at == fired
+    assert machine._quote_enter_not_before is None
+    later = fired + timedelta(seconds=20)
+    clock["now"] = later
+    fake.set_now(later)
+    calls = len(fake.calls)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, later)
+    assert machine.quote == LinkPhase.READY
+    assert machine.degraded is False
+    assert app._quote_connected is True
+    assert machine._quote_timeout_hold is False
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert "IsConnected" not in fake.calls[calls:]
+
+
+def test_open_session_markdown_without_ticks_still_degrades(monkeypatch):
+    """No tick after an open-session mark-down still reaches DEGRADED."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    enters = fake.calls.count("EnterMonitorLONG")
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert app._link_host.machine.degraded is False
+    _tick(app, fake, clock, fired + timedelta(seconds=5 + 300))
+    assert app._link_host.machine.degraded is True
+    assert app._link_host.machine.degraded_reason == "stuck"
+    assert app._link_host.machine.quote != LinkPhase.READY
+    assert fake.calls.count("EnterMonitorLONG") == enters
+
+
+def test_quote_timeout_status_is_waiting_for_ticks_then_connected(monkeypatch):
+    """Mark-down is not 'entries blocked until reply reconcile'."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    assert _last_status(app) == _QUOTE_WAITING
+    assert "Entries blocked" not in _last_status(app)
+    assert _last_dot(app) == "warn"
+    later = fired + timedelta(seconds=20)
+    clock["now"] = later
+    fake.set_now(later)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, later)
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert "已連線 Connected" in _last_status(app)
+    assert "Entries blocked" not in _last_status(app)
+    assert _last_dot(app) == "ok"
+
+
+def test_quote_restore_keeps_a_real_entry_block(monkeypatch):
+    """A reply that is still unreconciled stays blocked after the tick."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    app._link_host.machine.reply_reconciled = False
+    later = fired + timedelta(seconds=20)
+    clock["now"] = later
+    fake.set_now(later)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, later)
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert "Entries blocked" in _last_status(app)
+    assert _last_dot(app) == "warn"
+
+
+def test_idle_status_is_not_entries_blocked(monkeypatch):
+    """While the idle 3002 is held, the label is not an entry block."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _replay_drop(app, fake, clock, drop)
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    text = _last_status(app)
+    assert "Entries blocked" not in text
+    assert text in ("已連線 Connected", _QUOTE_UNVERIFIED)
+    assert app._quote_connected is True
+    assert _last_dot(app) == "ok"
+
+
+def test_suppressed_3002_is_judged_from_subscription(monkeypatch):
+    """An idle 3002 stays pending and the next subscribe gets 15s.
+
+    No fresh tick after the 3002 in that window marks the quote down.
+    A tick from before the 3002 does not count.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    seen = app._quote_intermediate_seen_at
+    assert seen > 0
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    _subscribe_runner(monkeypatch, app)
+    assert app._quote_intermediate_seen_at == seen
+    assert app.root.pending[app._quote_ready_timer_id][0] == 15000
+    app._last_fresh_tick_at = seen - 10
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=40))
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    assert app._quote_connected is False
+    assert _last_status(app) == _QUOTE_WAITING
+    assert "Entries blocked" not in _last_status(app)
+
+
+def test_pending_3002_window_restarts_at_subscription(monkeypatch):
+    """A 3002 whose 15s timer is still armed restarts at subscribe."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    token = app._quote_ready_timer_id
+    seen = app._quote_intermediate_seen_at
+    assert token is not None
+    _subscribe_runner(monkeypatch, app)
+    assert app._quote_ready_timer_id != token
+    assert app._quote_intermediate_seen_at == seen
+    assert app.root.pending[app._quote_ready_timer_id][0] == 15000
+    app._last_fresh_tick_at = 0.0
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=20))
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    assert app._quote_connected is False
+
+
+def test_subscription_window_stays_ready_on_a_fresh_tick(monkeypatch):
+    """A tick after the 3002 inside the subscribe window stays READY."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _replay_drop(app, fake, clock, drop)
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._quote_connected is True
+    _subscribe_runner(monkeypatch, app)
+    app._last_fresh_tick_at = time.time()
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=40))
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._quote_connected is True
+    assert app._quote_intermediate_seen_at == 0.0
+    assert app._quote_ready_timer_id is None
+
+
+def test_closed_gap_no_runner_is_connected_0_takes_178(monkeypatch):
+    """07:30, no runner, IsConnected 0: settle, then EnterMonitorLONG."""
+    drop = tpe(2026, 11, 12, 7, 30)
+    app, fake, clock, _logged, enters, _open_at = _closed_gap_down(monkeypatch)
+    assert app._live_runner is None
+    fired = drop + timedelta(seconds=15)
+    assert app._link_host.machine._quote_enter_not_before is None
+    assert app._quote_connected is False
+    _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert app._link_host.machine.quote == LinkPhase.CONNECTING
+    assert app._link_host.machine.degraded is False

@@ -2054,11 +2054,17 @@ class BacktestApp:
         the gap. The stuck timer does not run until the next open, so
         the link does not go DEGRADED while the session is closed.
 
-        An open session stays READY when a fresh tick arrived in the
-        last 30s. IsConnected() is not that signal. The timer is
-        cleared so a later 3002 can arm it again. No fresh tick marks
-        the quote down. DEGRADED after stuck_limit is the end state
-        for that case.
+        An open session with a subscribed runner stays READY when a
+        fresh tick arrived in the last 30s. IsConnected() is not that
+        signal. The timer is cleared so a later 3002 can arm it again.
+        No fresh tick marks the quote down, and a later tick restores
+        READY before stuck_limit. DEGRADED after stuck_limit, with
+        still no tick, is the end state for that case.
+
+        An open session with nothing subscribed cannot produce a tick,
+        so this timeout does not mark the quote down. The 3002 stays
+        pending until Ready (3003), a fresh tick, or the next
+        subscription's 15s window. A closed gap is not that case.
         """
         self._quote_ready_timer_id = None
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
@@ -2071,11 +2077,13 @@ class BacktestApp:
         if self._quote_timeout_defer_for_deploy():
             return
         if self._quote_timeout_ticks_are_fresh():
-            self._quote_intermediate_seen_at = 0.0
+            self._resolve_unresolved_3002()
             _log(
                 "報價仍跳動 Quote (3002) without Ready (3003) "
                 f"after {waited:.0f}s, but ticks are flowing — staying READY"
             )
+            return
+        if self._quote_timeout_idle_open_session():
             return
         _log(
             "報價未就緒 Quote (3002) seen but Ready (3003) did not arrive "
@@ -2101,16 +2109,7 @@ class BacktestApp:
         use the ordinary fresh-tick rule. No IsConnected read and no
         SKCOM call.
         """
-        runner = getattr(self, "_live_runner", None)
-        in_flight = (
-            bool(getattr(self, "_deploy_pending", False))
-            or bool(getattr(self, "_live_warmup_mode", False))
-            or (
-                runner is not None
-                and getattr(runner, "state", None) in (
-                    LiveState.IDLE, LiveState.WARMING_UP)
-            )
-        )
+        in_flight = self._quote_timeout_deploy_in_flight()
         first = float(getattr(self, "_quote_timeout_deferred_since", 0.0) or 0.0)
         if in_flight:
             now = time.time()
@@ -2129,11 +2128,89 @@ class BacktestApp:
             return False
         if first:
             self._quote_timeout_deferred_since = 0.0
-            self._quote_intermediate_seen_at = time.time()
+            # The 3002 timestamp stays. The 15s window starts now, and
+            # a tick counts only when it is after that 3002.
             self._quote_ready_timer_id = self.root.after(
                 15000, self._on_quote_ready_timeout)
             return True
         return False
+
+    def _quote_timeout_deploy_in_flight(self) -> bool:
+        """True while a deploy has not finished subscribing ticks."""
+        runner = getattr(self, "_live_runner", None)
+        return (
+            bool(getattr(self, "_deploy_pending", False))
+            or bool(getattr(self, "_live_warmup_mode", False))
+            or (
+                runner is not None
+                and getattr(runner, "state", None) in (
+                    LiveState.IDLE, LiveState.WARMING_UP)
+            )
+        )
+
+    def _quote_timeout_idle_open_session(self) -> bool:
+        """Leave an open-session 3002 pending when nothing is subscribed.
+
+        No RequestTicks means a missing tick proves nothing. Do not
+        clear ``_quote_connected`` and do not read IsConnected(). The
+        3002 timestamp stays until Ready (3003), a fresh tick, or the
+        15s window armed at the next subscription. A deploy still in
+        flight is the round-6 deferral, not this path. A closed gap
+        is not this path.
+        """
+        if not is_market_open(_taipei_now()):
+            return False
+        if self._quote_timeout_deploy_in_flight():
+            return False
+        runner = getattr(self, "_live_runner", None)
+        if runner is not None and getattr(runner, "state", None) == LiveState.RUNNING:
+            return False
+        _log(
+            "報價待確認 Quote (3002) without Ready (3003), no subscribed "
+            "runner — leaving the quote connected until the next "
+            "subscription's 15s window"
+        )
+        self.set_status("Quote unverified — waiting for ticks", "ok")
+        self._set_conn_dot("ok")
+        return True
+
+    def _resolve_unresolved_3002(self) -> None:
+        """A 3003 or a fresh tick has answered the pending 3002."""
+        self._quote_intermediate_seen_at = 0.0
+        self._quote_timeout_deferred_since = 0.0
+        token = getattr(self, "_quote_ready_timer_id", None)
+        if not token:
+            return
+        try:
+            self.root.after_cancel(token)
+        except Exception:
+            pass
+        self._quote_ready_timer_id = None
+
+    def _arm_quote_window_from_subscription(self) -> None:
+        """Give an unresolved 3002 a full 15s window from this subscribe.
+
+        The 3002 timestamp is kept, so a tick from before it still does
+        not count. No IsConnected read and no other SKCOM call.
+        """
+        seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
+        if seen <= 0.0:
+            return
+        if self._quote_machine_phase() != LinkPhase.READY:
+            return
+        token = self._quote_ready_timer_id
+        if token:
+            try:
+                self.root.after_cancel(token)
+            except Exception:
+                pass
+            self._quote_ready_timer_id = None
+        self._quote_timeout_deferred_since = 0.0
+        self._quote_ready_timer_id = self.root.after(
+            15000, self._on_quote_ready_timeout)
+        _log_debug(
+            "[CONN] unresolved 3002: 15s fresh-tick window from "
+            "tick subscription")
 
     def _mark_quote_down_for_recovery(self, *, reason: str) -> None:
         """Arm the existing #178 quote-down path. Flags, then one tick.
@@ -2170,11 +2247,16 @@ class BacktestApp:
         now = _taipei_now()
         hold = None
         stuck_until = None
-        if not is_market_open(now):
+        open_session = is_market_open(now)
+        if not open_session:
             nxt = _next_session_open(now)
             stuck_until = nxt
             hold = self._closed_gap_enter_hold(now, nxt)
-        host.machine.note_quote_not_ready(now, enter_not_before=hold)
+        host.machine.note_quote_not_ready(
+            now,
+            enter_not_before=hold,
+            release_at=now if open_session else None,
+        )
         if stuck_until is not None:
             host.machine.pause_stuck_clock_until(stuck_until)
         if hold is not None:
@@ -2189,9 +2271,11 @@ class BacktestApp:
                 f"settle {host.machine.config.quote_settle_s:.0f}s then "
                 "EnterMonitorLONG only if IsConnected()==0"
             )
-        self.set_status("報價未就緒 Quote not ready", "warn")
-        self._set_conn_dot("warn")
         self._link_host_tick(force=True)
+        # After the gate. A quote-timeout block is not "waiting for
+        # reply reconcile".
+        self.set_status("報價未就緒 Quote not ready — waiting for ticks", "warn")
+        self._set_conn_dot("warn")
 
     def _note_fresh_quote_tick(self) -> None:
         """Wall clock of the latest fresh tick. The 3002 timeout reads it.
@@ -2205,6 +2289,15 @@ class BacktestApp:
         note = getattr(machine, "note_fresh_tick", None)
         if note is not None:
             note(_taipei_now())
+        # A tick after the 3002, while the quote is still READY, answers
+        # that 3002. A tick after the quote was marked down is the
+        # restore signal instead, and must not clear the machine hold.
+        if (
+            self._quote_machine_phase() == LinkPhase.READY
+            and float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0) > 0.0
+            and self._quote_timeout_ticks_are_fresh()
+        ):
+            self._resolve_unresolved_3002()
 
     # A tick newer than this is the only open-session proof the quote
     # is alive. Same wall clock the tick watchdog stores in
@@ -2550,6 +2643,8 @@ class BacktestApp:
                 # still pause the feed. The latch, not the flag, is
                 # what suppresses that cleanup.
                 self._disconnect_cleanup_done = False
+                self._resolve_unresolved_3002()
+                self._repaint_after_quote_restore()
                 _log(f"[RECONNECT] {text}")
                 continue
             if text.startswith("3003 ignored"):
@@ -2619,8 +2714,25 @@ class BacktestApp:
         self._set_quote_connected(True, "_clear_quote_stuck_if_ticks_resumed")
         self._disconnect_cleanup_done = False
         _log(f"[RECONNECT] {alert}")
-        self._apply_link_gate()
+        self._repaint_after_quote_restore()
         self._publish_link_heartbeat()
+
+    def _repaint_after_quote_restore(self) -> None:
+        """Paint Connected, unless the gate still has a real block.
+
+        The quote-timeout latch is dropped first so a reply-reconcile
+        or equity hold can speak for itself. A quote that is merely
+        waiting for ticks is not that reason.
+        """
+        self._link_gate_latched = False
+        self._apply_link_gate()
+        if getattr(self, "_link_gate_latched", False):
+            return
+        host = getattr(self, "_link_host", None)
+        if host is not None and host.machine.degraded:
+            return
+        self.set_status("已連線 Connected", "ok")
+        self._set_conn_dot("ok")
 
     def _apply_link_gate(self) -> None:
         host = getattr(self, "_link_host", None)
@@ -9968,6 +10080,7 @@ class BacktestApp:
             self._tick_watchdog.order_symbol = resolve_order_symbol(symbol)
             self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
             _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
+            self._arm_quote_window_from_subscription()
         except Exception as e:
             _log(f"報價訂閱錯誤 Tick subscribe error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._live_log_msg(f"訂閱錯誤 Subscribe error: {e}", "status")
