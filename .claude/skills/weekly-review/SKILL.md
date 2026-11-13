@@ -81,10 +81,10 @@ also answer, from primary evidence only. Fleet files (`data/ai_usage.csv`, `data
 1. **Attempt history** — read `data/ai_usage.csv` at the ledger path the
    brief names (UTC; TPE = +8): per past Saturday, plan rows
    (`bot_evolution`) vs candidate rows (`evolution_codegen_*`). A Saturday
-   with a plan but no codegen row = plan said `no_change`. A missing,
-   empty, or out-of-week ledger (no rows dated inside the review week) is
-   UNGRADED, never a 'no candidate' streak. Report that streak only from
-   in-week rows.
+   with a plan but no codegen row = plan said `no_change`. A ledger that
+   is missing, empty, or has no row in the review week is UNGRADED, never
+   a 'no candidate' streak. Count the streak only over Saturdays the
+   ledger covers (on or after its first row).
 2. **Verdict outcome** — the verdict block is NOT persisted anywhere
    local (the Tk chat auto-save only fires at window close, and the bot
    token cannot read Discord history: HTTP 403). The only on-disk trace is
