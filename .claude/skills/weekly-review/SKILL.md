@@ -76,13 +76,9 @@ and the single operator action. Daily report files exist only where
 ## Stage 2b — evolution EFFICACY audit (every week, cheap; 2 agents when triggered)
 
 "Did the slot fire" (stage 1) is not "is evolution working". Every week
-also answer, from primary evidence only. The fleet evo check
-(`data/ai_usage.csv` and the pool) is unavailable until
-`check_evolution.py` gets per-path flags (tracked follow-up). A read of
-this PC's copies is this PC only, not the fleet verdict.
+also answer, from primary evidence only. Fleet files (`data/ai_usage.csv`, `data/live/<bot>/session.json`, debug logs) need an ssh read permitted per `start-here` §7; without it, use this PC's copies, labelled 'this PC only, not the fleet verdict'.
 
-1. **Attempt history** — this PC's `data/ai_usage.csv` only, labelled
-   'this PC only, not the fleet verdict' (UTC; TPE =
+1. **Attempt history** — the data host's `data/ai_usage.csv` (UTC; TPE =
    +8): per past Saturday, plan rows (`bot_evolution`) vs candidate rows
    (`evolution_codegen_*`). A Saturday with a plan but no codegen row =
    plan said `no_change`; no rows at all = skip or app closed (check the
