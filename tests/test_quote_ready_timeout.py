@@ -681,6 +681,7 @@ def test_timeout_body_does_not_return_on_stale_quote_connected():
 def test_closed_gap_defers_enter_monitor_until_open(monkeypatch, drop, open_at):
     """stuck_limit_s=300 must not DEGRADE across the gap. Not 08:44 / 14:59."""
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    _running(app)
     enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     # Half-up (3002). Entering now would fault; the stuck clock would
@@ -1018,11 +1019,15 @@ def _closed_gap_down(monkeypatch, state=0):
 
     ``state`` 0 does not defer EnterMonitor (the timeout tick is still
     inside the 5s settle). Any other state holds EnterMonitor until
-    08:45 and makes no further SKCOM call during the gap.
+    08:45 and makes no further SKCOM call during the gap. That hold is
+    the subscribed-runner case. An idle GUI with IsConnected not 0
+    stays pending and is covered separately.
     """
     drop = tpe(2026, 11, 12, 7, 30)
     open_at = tpe(2026, 11, 12, 8, 45)
     app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=30))
+    if state != 0:
+        _running(app)
     enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = state
@@ -1884,3 +1889,117 @@ def test_closed_gap_no_runner_is_connected_0_takes_178(monkeypatch):
     assert fake.calls.count("EnterMonitorLONG") == enters + 1
     assert app._link_host.machine.quote == LinkPhase.CONNECTING
     assert app._link_host.machine.degraded is False
+
+
+def test_idle_closed_gap_is_connected_1_stays_pending(monkeypatch):
+    """07:30, no runner, IsConnected 1: no mark-down and no DEGRADED.
+
+    The quote stays connected through 08:50. The label says the quote
+    is unverified. IsConnected()==0 is the case that still enters.
+    """
+    drop = tpe(2026, 11, 12, 7, 30)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    assert app._live_runner is None
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._link_host.machine.degraded is False
+    assert app._quote_intermediate_seen_at > 0
+    assert "Quote unverified" in _last_status(app)
+    assert "Entries blocked" not in _last_status(app)
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, tpe(2026, 11, 12, 8, 50))
+    assert app._link_host.machine.degraded is False
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._quote_connected is True
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert "LeaveMonitor" not in fake.calls
+
+
+def test_idle_closed_gap_subscription_window_marks_down(monkeypatch):
+    """The next subscribe still judges the pending 07:30 3002.
+
+    No tick in that 15s window marks the quote down.
+    """
+    drop = tpe(2026, 11, 12, 7, 30)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    seen = app._quote_intermediate_seen_at
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    _subscribe_runner(monkeypatch, app)
+    assert app._quote_intermediate_seen_at == seen
+    assert app.root.pending[app._quote_ready_timer_id][0] == 15000
+    app._last_fresh_tick_at = 0.0
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=40))
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    assert app._quote_connected is False
+
+
+def _idle_open_3002(monkeypatch):
+    """Open session, no runner. The 3002 stays pending and has no timer."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _replay_drop(app, fake, clock, drop)
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._quote_connected is True
+    assert app._quote_ready_timer_id is None
+    assert app._quote_intermediate_seen_at > 0
+    assert app._link_host.machine.quote == LinkPhase.READY
+    app._quote_timeout_deferred_since = 12.0
+    return app, fake, clock, logged, drop
+
+
+def _assert_closed_gap_deploy_does_not_enter(monkeypatch, app, fake, clock):
+    """A cleared 3002 must not mark down on the next closed-gap subscribe."""
+    assert app._quote_intermediate_seen_at == 0.0
+    assert app._quote_timeout_deferred_since == 0.0
+    closed = tpe(2026, 11, 13, 7, 30)
+    clock["now"] = closed
+    fake.set_now(closed)
+    fake.force_quote_state = 0
+    enters = fake.calls.count("EnterMonitorLONG")
+    _subscribe_runner(monkeypatch, app)
+    assert app._quote_ready_timer_id is None
+    _tick(app, fake, clock, closed + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._quote_connected is True
+
+
+def test_idle_3002_then_3003_does_not_mark_down_on_a_later_deploy(monkeypatch):
+    """3003 clears an idle 3002 even though no timer is armed."""
+    app, fake, clock, _logged, drop = _idle_open_3002(monkeypatch)
+    _deliver_3003(app, fake, clock, drop + timedelta(seconds=20))
+    _assert_closed_gap_deploy_does_not_enter(monkeypatch, app, fake, clock)
+
+
+def test_idle_3002_then_3021_does_not_mark_down_on_a_later_deploy(monkeypatch):
+    """3021 clears an idle 3002 even though no timer is armed."""
+    app, fake, clock, _logged, drop = _idle_open_3002(monkeypatch)
+    app._conn_monitor = _give_up_monitor()
+    app._reconnect_timer_id = None
+    rb.SKQuoteLibEvents().OnConnection(3021, 0)
+    app._process_ui_queue()
+    assert app._quote_intermediate_seen_at == 0.0
+    assert app._quote_timeout_deferred_since == 0.0
+    _deliver_3003(app, fake, clock, drop + timedelta(seconds=30))
+    _assert_closed_gap_deploy_does_not_enter(monkeypatch, app, fake, clock)
+
+
+def test_idle_3002_then_reconnect_does_not_mark_down_on_a_later_deploy(monkeypatch):
+    """Manual Reconnect clears an idle 3002 even though no timer is armed."""
+    app, fake, clock, _logged, _drop = _idle_open_3002(monkeypatch)
+    app._conn_monitor = _give_up_monitor()
+    app._reconnect_timer_id = None
+    app._manual_reconnect()
+    _assert_closed_gap_deploy_does_not_enter(monkeypatch, app, fake, clock)

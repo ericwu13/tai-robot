@@ -2062,9 +2062,12 @@ class BacktestApp:
         still no tick, is the end state for that case.
 
         An open session with nothing subscribed cannot produce a tick,
-        so this timeout does not mark the quote down. The 3002 stays
-        pending until Ready (3003), a fresh tick, or the next
-        subscription's 15s window. A closed gap is not that case.
+        so this timeout does not mark the quote down. The same hold
+        covers a closed gap when nothing is subscribed and
+        IsConnected() is not 0: no mark-down and no further SKCOM call.
+        IsConnected()==0 in that gap still takes #178. The 3002 stays
+        pending until Ready (3003), a disconnect, manual Reconnect, a
+        fresh tick, or the next subscription's 15s window.
         """
         self._quote_ready_timer_id = None
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
@@ -2083,7 +2086,7 @@ class BacktestApp:
                 f"after {waited:.0f}s, but ticks are flowing — staying READY"
             )
             return
-        if self._quote_timeout_idle_open_session():
+        if self._quote_timeout_idle_unsubscribed():
             return
         _log(
             "報價未就緒 Quote (3002) seen but Ready (3003) did not arrive "
@@ -2148,22 +2151,24 @@ class BacktestApp:
             )
         )
 
-    def _quote_timeout_idle_open_session(self) -> bool:
-        """Leave an open-session 3002 pending when nothing is subscribed.
+    def _quote_timeout_idle_unsubscribed(self) -> bool:
+        """Leave a 3002 pending when nothing is subscribed.
 
         No RequestTicks means a missing tick proves nothing. Do not
-        clear ``_quote_connected`` and do not read IsConnected(). The
-        3002 timestamp stays until Ready (3003), a fresh tick, or the
-        15s window armed at the next subscription. A deploy still in
-        flight is the round-6 deferral, not this path. A closed gap
-        is not this path.
+        clear ``_quote_connected``. An open session does not read
+        IsConnected(). A closed gap reads it once: 0 still takes #178,
+        and any other reading stays pending with no further SKCOM call.
+        The 3002 timestamp stays until Ready (3003), a disconnect,
+        manual Reconnect, a fresh tick, or the 15s window armed at the
+        next subscription. A deploy still in flight is the round-6
+        deferral, not this path. A subscribed runner is not this path.
         """
-        if not is_market_open(_taipei_now()):
-            return False
         if self._quote_timeout_deploy_in_flight():
             return False
         runner = getattr(self, "_live_runner", None)
         if runner is not None and getattr(runner, "state", None) == LiveState.RUNNING:
+            return False
+        if not is_market_open(_taipei_now()) and self._closed_gap_quote_is_down():
             return False
         _log(
             "報價待確認 Quote (3002) without Ready (3003), no subscribed "
@@ -2173,6 +2178,27 @@ class BacktestApp:
         self.set_status("Quote unverified — waiting for ticks", "ok")
         self._set_conn_dot("ok")
         return True
+
+    def _closed_gap_quote_is_down(self) -> bool:
+        """True only when a closed-gap IsConnected() read is 0.
+
+        One broker-port read. A probe error is not 0, so the idle hold
+        stands and this gap makes no further SKCOM call. Not used in
+        an open session.
+        """
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        port = getattr(machine, "port", None) if machine is not None else None
+        if port is None:
+            return False
+        try:
+            return int(port.is_connected()) == 0
+        except Exception as exc:
+            _log_debug(
+                "[CONN] IsConnected probe on an idle closed-gap 3002 failed: "
+                f"[{type(exc).__name__}] {exc}"
+            )
+            return False
 
     def _resolve_unresolved_3002(self) -> None:
         """A 3003 or a fresh tick has answered the pending 3002."""
@@ -2388,7 +2414,12 @@ class BacktestApp:
         self._mark_quote_down_for_recovery(reason="session_resubscribe")
 
     def _cancel_quote_ready_timer(self, reason: str) -> None:
-        """Cancel the Quote→Ready watchdog timer if armed."""
+        """Drop a pending 3002, and cancel its timer when one is armed.
+
+        Ready (3003), a disconnect (3021/3033), and manual Reconnect
+        all answer the 3002. An idle hold has no timer, so the stamps
+        are cleared even when ``_quote_ready_timer_id`` is None.
+        """
         if self._quote_ready_timer_id:
             try:
                 self.root.after_cancel(self._quote_ready_timer_id)
@@ -2396,8 +2427,8 @@ class BacktestApp:
                 pass
             _log_debug(f"[CONN] Quote→Ready timer cancelled (reason={reason})")
             self._quote_ready_timer_id = None
-            self._quote_intermediate_seen_at = 0.0
-            self._quote_timeout_deferred_since = 0.0
+        self._quote_intermediate_seen_at = 0.0
+        self._quote_timeout_deferred_since = 0.0
 
     def _on_disconnected(self, *, from_event: bool = False):
         """Handle connection loss: pause the feed. The link machine reconnects.
