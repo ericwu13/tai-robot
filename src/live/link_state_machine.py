@@ -996,6 +996,11 @@ class LinkStateMachine:
         self._quote_connect_started_at = now
         self._pending_3003 = False
         self._quote_enter_not_before = None
+        # A new EnterMonitor owns the quote. A tick or hold from the
+        # previous episode must not restore READY on a later tick.
+        self._quote_hold_open_at = None
+        self._quote_timeout_hold = False
+        self._fresh_tick_at = None
 
     def _finish_quote_ready(self) -> None:
         """STOCKS_READY (3003). Subscribe and mark the quote READY.
@@ -1025,7 +1030,9 @@ class LinkStateMachine:
         Only a timeout hold that was waiting for a session open. A tick
         must have arrived at or after that open, and the broker port's
         ``IsConnected()`` must be 1. No subscribe and no EnterMonitor.
-        Any other case, including a probe error, leaves the stuck path
+        EnterMonitorLONG clears the hold and the fresh-tick time, so a
+        tick from before that call cannot restore READY later. Any
+        other case, including a probe error, leaves the stuck path
         to run.
         """
         release = self._quote_hold_open_at

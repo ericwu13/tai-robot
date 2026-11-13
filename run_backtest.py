@@ -2049,10 +2049,13 @@ class BacktestApp:
         08:44. The stuck timer does not run across that gap, so the
         link does not go DEGRADED while the session is closed.
 
-        An open-session blip that still has a fresh tick since this
-        3002 and ``IsConnected()==1`` is logged once and left READY.
-        That does not mark the quote down and does not set the
-        timeout hold. Any other case keeps the mark-down below.
+        An open-session blip is logged once and left READY when the
+        quote is still up. A RUNNING runner needs a fresh tick since
+        this 3002 and ``IsConnected()==1``. With no RUNNING runner
+        (GUI idle, or headless warmup) ``IsConnected()==1`` alone is
+        enough. ``IsConnected()==0`` marks the quote down. Either
+        skip leaves the timeout hold unset. Any other case keeps the
+        mark-down below.
         """
         self._quote_ready_timer_id = None
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
@@ -2063,10 +2066,13 @@ class BacktestApp:
             )
             return
         if self._quote_timeout_still_alive():
+            if self._live_runner_is_running():
+                why = "a tick arrived and IsConnected()=1"
+            else:
+                why = "no running runner and IsConnected()=1"
             _log(
                 "報價仍就緒 Quote (3002) without Ready (3003) "
-                f"after {waited:.0f}s, but a tick arrived and "
-                "IsConnected()=1 — staying READY"
+                f"after {waited:.0f}s, but {why} — staying READY"
             )
             return
         _log(
@@ -2141,19 +2147,35 @@ class BacktestApp:
         if note is not None:
             note(_taipei_now())
 
-    def _quote_timeout_still_alive(self) -> bool:
-        """True when this 3002 still has a live quote. Do not mark it down.
+    def _live_runner_is_running(self) -> bool:
+        """True only while a live runner is in RUNNING.
 
-        A fresh tick must have arrived at or after
-        ``_quote_intermediate_seen_at``, and the broker port's
-        ``IsConnected()`` must be 1. A missing tick, any other
-        connection value, or a probe error keeps the mark-down.
-        This reads the port, not raw COM.
+        GUI idle has no runner. Headless warmup has a runner that is
+        not RUNNING yet. Both decide the 15s timeout on IsConnected
+        alone.
         """
-        seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
-        tick_at = float(getattr(self, "_last_fresh_tick_at", 0.0) or 0.0)
-        if seen <= 0.0 or tick_at < seen:
-            return False
+        runner = getattr(self, "_live_runner", None)
+        return (
+            runner is not None
+            and getattr(runner, "state", None) == LiveState.RUNNING
+        )
+
+    def _quote_timeout_still_alive(self) -> bool:
+        """True when this 3002 should stay READY. Do not mark it down.
+
+        A RUNNING runner keeps the tick rule: a fresh tick at or after
+        ``_quote_intermediate_seen_at`` and the broker port's
+        ``IsConnected()==1``. With no RUNNING runner,
+        ``IsConnected()==1`` alone is enough. ``IsConnected()==0``,
+        any other value, a missing tick on a RUNNING runner, or a
+        probe error keeps the mark-down. This reads the port, not raw
+        COM.
+        """
+        if self._live_runner_is_running():
+            seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
+            tick_at = float(getattr(self, "_last_fresh_tick_at", 0.0) or 0.0)
+            if seen <= 0.0 or tick_at < seen:
+                return False
         host = getattr(self, "_link_host", None)
         machine = getattr(host, "machine", None) if host is not None else None
         port = getattr(machine, "port", None) if machine is not None else None
@@ -10320,17 +10342,15 @@ class BacktestApp:
 
         Converts raw COM tick data to Tick, feeds to BarBuilder.
         When a 1-min bar completes, routes to LiveRunner.
+
+        A fresh tick records ``_last_fresh_tick_at`` before the runner
+        check. GUI idle and headless warmup have no RUNNING runner, and
+        the 15s timeout still needs that clock. The bar builder and the
+        strategy feed still require a RUNNING runner.
         """
-        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
-            return
-        if not self._live_bar_builder:
-            return
-
-        self._live_tick_count += 1
-
-        # Convert SK date/time integers to datetime FIRST — the timestamp
-        # drives both the watchdog freshness gate below and the staleness
-        # classification further down (issues #50 / #105).
+        # The timestamp drives the freshness gate and the staleness
+        # classification (issues #50 / #105). Record it before refusing
+        # a tick that arrived with no RUNNING runner.
         try:
             dt_aware = combine_sk_datetime(date, time_hms, time_millismicros)
             dt = dt_aware.replace(tzinfo=None) if dt_aware.tzinfo else dt_aware
@@ -10338,6 +10358,14 @@ class BacktestApp:
             return
         now_naive = _taipei_now().replace(tzinfo=None)
         tick_age = (now_naive - dt).total_seconds()
+        if tick_age <= HISTORY_STALENESS_SECONDS:
+            self._note_fresh_quote_tick()
+        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        if not self._live_bar_builder:
+            return
+
+        self._live_tick_count += 1
 
         if (not is_history or not self._live_history_done
                 or tick_age <= HISTORY_STALENESS_SECONDS):
@@ -10355,7 +10383,8 @@ class BacktestApp:
             # worked. Stale replay restarts the watchdog clock and must
             # not clear DEGRADED.
             if tick_age <= HISTORY_STALENESS_SECONDS:
-                self._note_fresh_quote_tick()
+                # ``_last_fresh_tick_at`` was recorded above, before the
+                # runner check. This call only clears a stuck DEGRADED.
                 self._clear_quote_stuck_if_ticks_resumed()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
