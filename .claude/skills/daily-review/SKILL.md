@@ -96,7 +96,7 @@ comment it on the issue per that skill.
 ## Timing
 
 Sweet spot **05:10–05:30 TPE**: night closed, classification + P&L
-recorded, DAY not yet open. clocks → `start-here` §4. A local-time cron
+recorded, DAY not yet open. Clocks → `start-here` §4; a TPE morning is the previous local day. A local-time cron
 drifts one hour at each DST change.
 
 ## Gotchas
