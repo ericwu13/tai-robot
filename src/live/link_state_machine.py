@@ -492,6 +492,7 @@ class LinkStateMachine:
         logout, or ConnectByID. Other degrade reasons stay. A quote that
         was abandoned while ``IsConnected`` was still 1 or 2 is marked
         READY so the next tick does not start another stuck window.
+        The 3002 timeout hold and its defer-until timestamp are cleared.
         Entries open only when the reply is already reconciled.
         """
         if not self.degraded or self.degraded_reason != "stuck":
@@ -499,6 +500,11 @@ class LinkStateMachine:
         self.degraded = False
         self.degraded_reason = ""
         self._quote_stuck_since = None
+        # A timeout hold must not survive this recovery. A later
+        # non-timeout drop in a closed gap would otherwise wait until
+        # the next open.
+        self._quote_timeout_hold = False
+        self._quote_enter_not_before = None
         if self.quote != LinkPhase.READY:
             self.quote = LinkPhase.READY
             self._pending_3003 = False
@@ -887,6 +893,10 @@ class LinkStateMachine:
         self._unreconciled_since = None
         self._reconcile_pending_noted = False
         self._poller_owns_connect = False
+        # A 3003 can finish the quote while this reply is still down.
+        # That call cannot clear the 3033 episode. Clear it now that
+        # the reply is READY, including when the quote finished first.
+        self._maybe_finish_solace_episode()
 
     def _complete_is_actionable(self) -> bool:
         """OnComplete still belongs to this episode.

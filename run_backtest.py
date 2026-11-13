@@ -2048,6 +2048,11 @@ class BacktestApp:
         until the next open, 08:45 or 15:00 TPE. It does not run at
         08:44. The stuck timer does not run across that gap, so the
         link does not go DEGRADED while the session is closed.
+
+        An open-session blip that still has a fresh tick since this
+        3002 and ``IsConnected()==1`` is logged once and left READY.
+        That does not mark the quote down and does not set the
+        timeout hold. Any other case keeps the mark-down below.
         """
         self._quote_ready_timer_id = None
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
@@ -2055,6 +2060,13 @@ class BacktestApp:
             _log_debug(
                 f"[CONN] Ready (3003) timeout after {waited:.1f}s — "
                 "quote is no longer READY; leaving the #178 attempt alone"
+            )
+            return
+        if self._quote_timeout_still_alive():
+            _log(
+                "報價仍就緒 Quote (3002) without Ready (3003) "
+                f"after {waited:.0f}s, but a tick arrived and "
+                "IsConnected()=1 — staying READY"
             )
             return
         _log(
@@ -2115,6 +2127,38 @@ class BacktestApp:
         self.set_status("報價未就緒 Quote not ready", "warn")
         self._set_conn_dot("warn")
         self._link_host_tick(force=True)
+
+    def _note_fresh_quote_tick(self) -> None:
+        """Wall clock of the latest fresh tick. The 3002 timeout reads it."""
+        self._last_fresh_tick_at = time.time()
+
+    def _quote_timeout_still_alive(self) -> bool:
+        """True when this 3002 still has a live quote. Do not mark it down.
+
+        A fresh tick must have arrived at or after
+        ``_quote_intermediate_seen_at``, and the broker port's
+        ``IsConnected()`` must be 1. A missing tick, any other
+        connection value, or a probe error keeps the mark-down.
+        This reads the port, not raw COM.
+        """
+        seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
+        tick_at = float(getattr(self, "_last_fresh_tick_at", 0.0) or 0.0)
+        if seen <= 0.0 or tick_at < seen:
+            return False
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        port = getattr(machine, "port", None) if machine is not None else None
+        if port is None:
+            return False
+        try:
+            state = int(port.is_connected())
+        except Exception as exc:
+            _log_debug(
+                "[CONN] IsConnected probe on Ready (3003) timeout failed: "
+                f"[{type(exc).__name__}] {exc}"
+            )
+            return False
+        return state == 1
 
     def _quote_down_if_resubscribe_disconnected(self, code) -> None:
         """Q4: RequestTicks==0 and IsConnected()==0 starts #178 now.
@@ -2440,6 +2484,9 @@ class BacktestApp:
         if not alert:
             _log("[QUOTE-STUCK] ticks resumed; DEGRADED already clear")
             return
+        # Tick recovery has no 3003. The timeout cleared this flag, and
+        # a later deploy in this process treats False as not connected.
+        self._set_quote_connected(True, "_clear_quote_stuck_if_ticks_resumed")
         _log(f"[RECONNECT] {alert}")
         self._apply_link_gate()
         self._publish_link_heartbeat()
@@ -2809,6 +2856,10 @@ class BacktestApp:
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
         self._quote_ready_timer_id = None
         self._quote_intermediate_seen_at: float = 0.0
+        # Wall clock of the latest fresh tick. The 15s 3002 timeout
+        # stays READY when this is at or after the 3002 and IsConnected
+        # is 1. Stale replay does not update it.
+        self._last_fresh_tick_at: float = 0.0
         # Bug C: consecutive IsConnected()!=1 readings from the watchdog "warn"
         # path. Two in a row (30s apart) before we force a disconnect — one
         # transient bad read shouldn't bypass the resubscribe → reconnect ladder.
@@ -10287,6 +10338,7 @@ class BacktestApp:
             # worked. Stale replay restarts the watchdog clock and must
             # not clear DEGRADED.
             if tick_age <= HISTORY_STALENESS_SECONDS:
+                self._note_fresh_quote_tick()
                 self._clear_quote_stuck_if_ticks_resumed()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch

@@ -879,6 +879,93 @@ def test_three_arg_com_logger_is_still_called_once():
     assert calls == ["EnterMonitorLONG"]
 
 
+def test_open_session_3002_blip_with_tick_stays_ready(monkeypatch):
+    """Open session, a tick since the 3002, IsConnected stays 1.
+
+    The 15s timeout must not mark the quote down, must not set the
+    timeout hold, and must not reach DEGRADED. A second blip in the
+    same session stays READY too: the one-shot resubscribe key is
+    never spent.
+    """
+    from src.live.quote_stuck_recovery import QuoteStuckRecovery
+
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    app._quote_stuck = QuoteStuckRecovery()
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+
+    def _blip(at, label):
+        clock["now"] = at
+        fake.set_now(at)
+        before = len(logged)
+        _deliver_3002(app)
+        # Wall clock of a fresh tick after this 3002. _on_com_tick writes
+        # the same field through _note_fresh_quote_tick. _fire_timeout
+        # then places the 3002 15s earlier, so the tick is since the 3002.
+        app._last_fresh_tick_at = time.time()
+        _fire_timeout(app, fake, clock, at + timedelta(seconds=15))
+        text = "\n".join(logged[before:])
+        assert "staying READY" in text, label
+        assert "quote marked down" not in text, label
+        machine = app._link_host.machine
+        assert machine.quote == LinkPhase.READY, label
+        assert machine._quote_timeout_hold is False, label
+        assert machine._quote_enter_not_before is None, label
+        assert machine.degraded is False, label
+        assert machine.orders_paused is False, label
+        assert app._quote_connected is True, label
+        assert fake.calls.count("EnterMonitorLONG") == enters, label
+        entry, _ = app._trading_guard.decide("auto", "ENTRY_FILL", "LONG")
+        assert entry != TradingGuard.BLOCK_LINK, label
+        return at + timedelta(seconds=15)
+
+    first = _blip(drop, "first blip")
+    # Past stuck_limit. A mark-down with IsConnected 1 would be DEGRADED.
+    _tick(app, fake, clock, first + timedelta(seconds=320))
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.READY
+    assert machine.degraded is False
+    assert machine.degraded_reason == ""
+    assert app._quote_stuck.attempted_key is None
+    second = drop + timedelta(minutes=30)
+    fired = _blip(second, "second blip")
+    _tick(app, fake, clock, fired + timedelta(seconds=320))
+    assert machine.quote == LinkPhase.READY
+    assert machine.degraded is False
+    assert app._quote_stuck.attempted_key is None
+    assert "LeaveMonitor" not in fake.calls
+    assert "RestartProcess" not in fake.calls
+    tick_src = inspect.getsource(rb.BacktestApp._on_com_tick)
+    assert "_note_fresh_quote_tick" in tick_src
+    alive_src = inspect.getsource(rb.BacktestApp._quote_timeout_still_alive)
+    assert "port.is_connected" in alive_src
+    assert "SKQuoteLib_IsConnected" not in alive_src
+
+
+def test_tick_with_is_connected_0_still_marks_down(monkeypatch):
+    """A fresh tick does not keep the quote up when IsConnected()==0."""
+    drop = tpe(2026, 11, 12, 9, 0)
+    app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    before = len(logged)
+    _deliver_3002(app)
+    app._last_fresh_tick_at = time.time()
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    text = "\n".join(logged[before:])
+    assert "quote marked down" in text
+    assert "staying READY" not in text
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert machine._quote_timeout_hold is True
+    assert machine._quote_enter_not_before is None
+    assert app._quote_connected is False
+    assert machine.degraded is False
+
+
 def test_enter_monitor_return_code_is_logged(monkeypatch):
     """P3: the #178 port path logs EnterMonitorLONG's code, not only duration."""
     logs: list[str] = []
