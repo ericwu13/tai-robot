@@ -224,7 +224,10 @@ def _http_json(url: str) -> object | None:
     if raw is None or (isinstance(raw, (bytes, str)) and not raw.strip()):
         raise ChipsFetchError("http", "empty body")
     try:
-        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        # utf-8-sig drops a leading BOM. json.load() on the raw bytes
+        # accepted one; a strict utf-8 decode leaves U+FEFF and json.loads
+        # then rejects the body.
+        text = raw.decode("utf-8-sig") if isinstance(raw, bytes) else raw
         parsed = json.loads(text)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise ChipsFetchError("http", f"non-JSON body: {type(exc).__name__}: {exc}") from exc

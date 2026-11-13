@@ -515,3 +515,26 @@ def test_taifex_admin_rule_applies_only_to_taifex_items(monkeypatch):
         {"guid": "o", "title": "TSMC", "summary": "TSMC beats", "feed_tag": ""},
     ], "k")
     assert seen == [("", "taifex"), ("TSMC beats", "")]
+
+
+def test_legacy_bare_link_produces_no_new_article():
+    """A pre-change seen list stored the bare link for an id-less entry."""
+    link = "https://www.investing.com/news/123"
+    title = "Some headline"
+    article = {"guid": f"{link}|{title}", "link": link, "title": title}
+    state = {"seen_guids": [link]}
+    assert rss_scorer.dedup_articles([article], state) == []
+
+
+def test_shared_link_with_a_new_title_is_not_the_legacy_key():
+    """TAIFEX notices share a link. Only the old bare-link key is legacy."""
+    link = "https://www.taifex.com.tw/cht/11/newsDetail?idx=1"
+    newer = {"guid": f"{link}|Margin hike", "link": link, "title": "Margin hike"}
+    state = {"seen_guids": [f"{link}|Settlement prices"]}
+    assert rss_scorer.dedup_articles([newer], state) == [newer]
+
+
+def test_real_id_is_not_suppressed_by_a_stored_link():
+    link = "https://example.com/story"
+    article = {"guid": "urn:real-id", "link": link, "title": "Story"}
+    assert rss_scorer.dedup_articles([article], {"seen_guids": [link]}) == [article]

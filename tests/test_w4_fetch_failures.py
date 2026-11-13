@@ -399,6 +399,15 @@ def test_twse_http_4xx_keeps_vote(tmp_path, monkeypatch, code):
     assert "no taifex data" not in log.lower()
 
 
+def test_utf8_bom_200_is_parsed_as_data(monkeypatch):
+    """A leading EF BB BF used to pass through json.load. utf-8-sig keeps that."""
+    row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "8,123"}
+    body = b"\xef\xbb\xbf" + json.dumps([row]).encode("utf-8")
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Body(body))
+    assert chips.fetch_taifex_tx_foreign_oi() == ("20260814", 8123.0)
+
+
 def test_non_json_200_is_a_fetch_failure(tmp_path, monkeypatch):
     """A 200 block page is not an empty dataset."""
     base = str(tmp_path / "regime_vote.json")

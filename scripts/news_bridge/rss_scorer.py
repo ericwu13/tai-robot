@@ -225,7 +225,9 @@ def _entry_guid(entry) -> str:
 
     TAIFEX RSS1 has no ``<guid>`` and several notices share a link, so a
     link-only id drops every later settlement or margin notice as already
-    seen. Investing.com is also id-less and is re-scored once.
+    seen. Investing.com is also id-less. ``dedup_articles`` still treats a
+    stored bare link as seen, so those items are not scored a second time
+    on the first pass after this key change.
     """
     raw = entry.get("id")
     if isinstance(raw, str):
@@ -397,10 +399,36 @@ def save_state(path: str, state: dict) -> None:
     os.replace(tmp, out)
 
 
+def _legacy_link_key(article: dict) -> str:
+    """Bare link, only when ``guid`` is the id-less ``link|title`` form.
+
+    State written before that form stored the bare link. A guid that came
+    from ``<id>`` is not a legacy key, and a later notice that only shares
+    the link (TAIFEX) is not already seen.
+    """
+    link = str(article.get("link") or "").strip()
+    title = str(article.get("title") or "").strip()
+    guid = str(article.get("guid") or "")
+    if link and guid == f"{link}|{title}":
+        return link
+    return ""
+
+
 def dedup_articles(articles: list[dict], state: dict) -> list[dict]:
-    """Return only articles whose GUID hasn't been seen before."""
+    """Return articles whose GUID has not been seen.
+
+    An id-less article whose bare link is already in ``seen_guids`` is
+    also skipped. That is the key this scorer used to store.
+    """
     seen = set(state.get("seen_guids", []))
-    new = [a for a in articles if a["guid"] not in seen]
+    new = []
+    for article in articles:
+        if article.get("guid") in seen:
+            continue
+        legacy = _legacy_link_key(article)
+        if legacy and legacy in seen:
+            continue
+        new.append(article)
     return new
 
 
