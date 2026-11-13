@@ -144,8 +144,12 @@ class TestBugB_NoTeardownOnReconnect:
         )
         assert match, "could not locate _do_login"
         body = match.group(0)
-        assert "SKCenterLib_LoginSetQuote" in body
+        assert "login_set_quote(" in body
         assert "_adopt_link_machine" in body
+        port_path = os.path.join(PROJECT_ROOT, "src", "live", "com_broker_port.py")
+        with open(port_path, encoding="utf-8") as f:
+            port = f.read()
+        assert "SKCenterLib_LoginSetQuote" in port
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +196,7 @@ class TestBugC_WarnLadderRespected:
         # Each call must be preceded by the counter check on the same path.
         # Simplest pin: between the IsConnected() call and the _on_disconnected
         # call, the counter check must appear.
-        ic_idx = warn.find("skQ.SKQuoteLib_IsConnected")
+        ic_idx = warn.find("is_quote_connected")
         disc_idx = warn.find("self._on_disconnected()")
         assert ic_idx != -1, "IsConnected() probe missing from warn branch"
         assert disc_idx != -1, "_on_disconnected() call missing from warn branch"
@@ -343,13 +347,17 @@ class TestKeptReconnectDiagnostics:
         assert "call_com(" not in body
         assert "SKReplyLib_" not in body
         assert "reply-link IsConnectedByID=" in body
-        assert rb_source.count("SKReplyLib_IsConnectedByID") == 1
+        assert rb_source.count("SKReplyLib_IsConnectedByID") == 0
         probe = re.search(
             r"def _read_is_connected_by_id\(self.*?(?=\n    def )",
             rb_source,
             re.DOTALL,
         )
-        assert probe and "SKReplyLib_IsConnectedByID" in probe.group(0)
+        assert probe and "read_is_connected_by_id(" in probe.group(0)
+        port_path = os.path.join(PROJECT_ROOT, "src", "live", "com_broker_port.py")
+        with open(port_path, encoding="utf-8") as f:
+            port = f.read()
+        assert port.count("SKReplyLib_IsConnectedByID") == 2
         reconnect = re.search(
             r"def _attempt_reconnect\(self\):(.*?)\n    def ",
             rb_source,

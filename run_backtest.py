@@ -130,6 +130,7 @@ from src.live.account_monitor import (
     open_interest_query_rejected,
 )
 from src.live.connection_monitor import ConnectionMonitor
+from src.live.broker_port import DEFAULT_BROKER_MODE, require_inprocess
 from src.live.com_broker_port import ComBrokerPort
 from src.live.link_host import adopt_after_process_login
 from src.live.link_state_machine import KIND_CONN_ERROR, KIND_READY, LinkPhase
@@ -1102,6 +1103,49 @@ _tick_queue: queue.Queue = queue.Queue()
 _ui_queue: queue.Queue = queue.Queue()
 
 
+def _live_com_libs():
+    """COM objects, read on each call so a test can replace the globals."""
+    return skC, skQ, skR, skO
+
+
+def _live_com_call(name, fn, *args, **kwargs):
+    """Late-bind ``call_com`` so a monkeypatch of this module is seen."""
+    return call_com(name, fn, *args, **kwargs)
+
+
+def _app_broker_credentials() -> tuple[str, str]:
+    """The app port does not log in. The link machine has its own port.
+
+    Raising means ``_broker.login()`` cannot send empty credentials.
+    Process-start login uses ``login_set_quote`` and never calls this.
+    """
+    raise RuntimeError(
+        "the app broker has no credentials; "
+        "process-start login uses login_set_quote")
+
+
+def _build_inprocess_broker() -> ComBrokerPort:
+    """The one in-process port. ``broker_mode`` other than inprocess raises.
+
+    The mode is the code constant. ``_load_settings`` does not store it,
+    and settings.yaml is not read for it.
+    """
+    require_inprocess(DEFAULT_BROKER_MODE)
+    return ComBrokerPort(
+        call=_live_com_call,
+        libs=_live_com_libs,
+        credentials=_app_broker_credentials,
+        on_subscribe=lambda: None,
+        on_reconcile=lambda: None,
+        on_release=lambda: None,
+        ui_queue=lambda: _ui_queue,
+        tick_queue=lambda: _tick_queue,
+    )
+
+
+_broker = _build_inprocess_broker()
+
+
 
 
 
@@ -1273,16 +1317,10 @@ def _notify_reply_silent(message: str) -> None:
 def _stamped_return_lookup(code):
     """Vendor text for an unknown code. Stamped, and only when asked.
 
-    Known codes never reach this. The attribute is resolved here so the
-    call site is ``call_com``, not a raw main-thread COM call.
+    Known codes never reach this. The port resolves the attribute and
+    stamps ``GetReturnCodeMessage``. A missing center does not call SKCOM.
     """
-    center = skC
-    if center is None:
-        return None
-    fn = getattr(center, "SKCenterLib_GetReturnCodeMessage", None)
-    if not callable(fn):
-        return None
-    return call_com("GetReturnCodeMessage", fn, code)
+    return _broker.return_code_message(code)
 
 
 def _return_code_text(code) -> str:
@@ -1342,7 +1380,7 @@ def _route_to_log_widget(line: str, level: str = "info") -> None:
 def _safe_event_put(item) -> None:
     """Queue one COM event. A full queue must not raise into the sink."""
     try:
-        _ui_queue.put_nowait(item)
+        _broker.enqueue_ui(item)
     except Exception as exc:
         _log_reply_error(
             f"[CONN] event queue failed: [{type(exc).__name__}] {exc}")
@@ -1419,15 +1457,18 @@ class SKQuoteLibEvents:
                 return
             if _app._live_warmup_mode:
                 _log(f"暖機完成 Warmup KLine complete: {len(_app._live_warmup_data)} bars, code={nCode}")
-                _app.root.after(100, _app._on_live_warmup_complete)
+                _broker.schedule_on_main(
+                    _app.root, 100, _app._on_live_warmup_complete)
             elif _app._live_polling:
                 _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
-                _app.root.after(100, _app._on_live_poll_complete)
+                _broker.schedule_on_main(
+                    _app.root, 100, _app._on_live_poll_complete)
             else:
                 chunk_n = _app._fetcher.chunk_bar_count
                 total_n = _app._fetcher.total_bar_count
                 _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
-                _app.root.after(100, _app._on_chunk_complete)
+                _broker.schedule_on_main(
+                    _app.root, 100, _app._on_chunk_complete)
         except Exception as exc:
             _log_event_failure("OnKLineComplete", exc)
 
@@ -1440,8 +1481,8 @@ class SKQuoteLibEvents:
         # Minimal work on COM thread — just enqueue raw data.
         # Accessing Python objects (like _app) from COM thread crashes GIL in 3.13.
         try:
-            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                    nBid, nAsk, nClose, nQty, nSimulate, True))
+            _broker.enqueue_tick((lDate, lTimehms, lTimemillismicros,
+                                  nBid, nAsk, nClose, nQty, nSimulate, True))
         except Exception as exc:
             _log_event_failure("OnNotifyHistoryTicksLONG", exc)
 
@@ -1449,8 +1490,8 @@ class SKQuoteLibEvents:
                           lDate, lTimehms, lTimemillismicros,
                           nBid, nAsk, nClose, nQty, nSimulate, *_extra):
         try:
-            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                    nBid, nAsk, nClose, nQty, nSimulate, False))
+            _broker.enqueue_tick((lDate, lTimehms, lTimemillismicros,
+                                  nBid, nAsk, nClose, nQty, nSimulate, False))
         except Exception as exc:
             _log_event_failure("OnNotifyTicksLONG", exc)
 
@@ -2333,8 +2374,7 @@ class BacktestApp:
             # A new query, same as the account refresh. The generation
             # moves forward so this reply cannot complete a later deploy.
             self._account_monitor.begin_oi_query()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, account, 1)
+            _broker.get_open_interest(user_id, account, 1)
         except Exception as e:
             _log(f"[RECONNECT] reconcile raised: [{type(e).__name__}] {e}")
 
@@ -2459,8 +2499,7 @@ class BacktestApp:
             if _com_available and skQ:
                 try:
                     for mkt in (2, 7, 9):
-                        call_com("RequestStockList",
-                                 skQ.SKQuoteLib_RequestStockList, mkt)
+                        _broker.request_stock_list(mkt)
                 except Exception as e:
                     _log(f"商品資料重載失敗 Commodity reload failed: {e}")
             self._resubscribe_ticks()
@@ -2503,7 +2542,7 @@ class BacktestApp:
         self._first_tick_after_request_logged = False
 
         try:
-            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, com_symbol)
+            result = _broker.request_ticks(0, com_symbol)
             code = result[0] if isinstance(result, (list, tuple)) else result
             _log_debug(
                 f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
@@ -4344,8 +4383,7 @@ class BacktestApp:
         return int(self._read_is_connected_by_id(user_id))
 
     def _read_is_connected_by_id(self, user_id: str):
-        return call_com(
-            "IsConnectedByID", skR.SKReplyLib_IsConnectedByID, user_id)
+        return _broker.read_is_connected_by_id(user_id)
 
     def _connect_reply_for_poll(self, user_id: str):
         """One ConnectByID from the poller, through the machine port.
@@ -4499,17 +4537,16 @@ class BacktestApp:
 
             log_dir = os.path.join(project_root, "CapitalLog_Backtest")
             os.makedirs(log_dir, exist_ok=True)
-            skC.SKCenterLib_SetLogPath(log_dir)
+            _broker.set_log_path(log_dir)
 
             if authority_flag:
-                skC.SKCenterLib_SetAuthority(authority_flag)
+                _broker.set_authority(authority_flag)
 
             _log(f"登入中 Logging in as {_redact_acct(user_id)}...")
             self.set_status("登入中 Logging in...")
             self.login_status_var.set("登入中...")
 
-            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
-                            user_id, password, "Y")
+            code = _broker.login_set_quote(user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
                 msg = _return_code_text(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
@@ -4526,20 +4563,19 @@ class BacktestApp:
             _log(f"登入成功 LOGIN OK (code={code})")
             self.login_status_var.set("登入成功 Logged in")
 
-            reply_code = call_com(
-                "ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            reply_code = _broker.connect_by_id(user_id)
             _log_connect_by_id_result(reply_code)
             # Timers only. A failure here must not abort the rest of login.
             self._arm_reply_channel_watch(user_id)
-            code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
+            code = _broker.enter_monitor_long()
             _log(f"進入報價監控 EnterMonitorLONG: code={code}")
 
             # Initialize order service for real trading
             if skO is not None:
                 try:
-                    call_com("SKOrderLib_Initialize", skO.SKOrderLib_Initialize)
-                    call_com("ReadCertByID", skO.ReadCertByID, user_id)
-                    call_com("GetUserAccount", skO.GetUserAccount)
+                    _broker.initialize_order()
+                    _broker.read_cert(user_id)
+                    _broker.get_user_account()
                     _log("委託服務初始化 Order service initialized (cert verified)")
                 except Exception as e:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
@@ -4559,7 +4595,7 @@ class BacktestApp:
 
     def _check_connection(self):
         try:
-            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+            ic = _broker.is_quote_connected()
             if ic == 1:
                 self._set_quote_connected(True, "_check_connection(IsConnected==1)")
                 self.btn_api.config(state=tk.NORMAL)
@@ -4638,8 +4674,7 @@ class BacktestApp:
              f"{chunk.start_date}~{chunk.end_date} min={chunk.minute_num}")
 
         try:
-            code = call_com(
-                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
+            code = _broker.request_kline(
                 chunk.kline_symbol, chunk.kline_type, chunk.session,
                 chunk.trade_session, chunk.start_date, chunk.end_date,
                 chunk.minute_num)
@@ -8655,15 +8690,24 @@ class BacktestApp:
                             f"({real_reason}) — NOT re-arming. "
                             "Manual review required.",
                             "status")
-        self._arm_resumed_fill_poll(
-            outcome, real_ok=real_ok, real_reason=real_reason)
+        # Restore the ledger before the poller can confirm. A synchronous
+        # already-flat exit otherwise runs confirm_latest on an empty registry.
+        # Paper does not resume the ledger: a fresh deploy stays flat.
         if trading_mode in ("semi_auto", "auto"):
             self._position_log_resume(symbol)
+        self._arm_resumed_fill_poll(
+            outcome, real_ok=real_ok, real_reason=real_reason)
 
     def _position_log_resume(self, symbol: str) -> None:
-        """RESUME record for a clean restart. Never raises."""
+        """Load the journal, then append one RESUME line if the inputs exist.
+
+        Replay runs before the price, symbol, and net reads. A failure
+        there is logged and skips the display line only. The restored
+        orders and fills stay. Called for semi_auto and auto, not paper.
+        """
         if getattr(self, "_position_ledger", None) is None:
             return
+        self._position_log("recover")
         try:
             broker = self._live_runner.broker
             net = (self._position_log_net()
@@ -9020,8 +9064,8 @@ class BacktestApp:
                 # New generation. clear_positions() must not be what drops
                 # the previous answer; only this query can complete it.
                 self._account_monitor.begin_oi_query()
-                code = call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                                user_id, self._futures_account, 1)
+                code = _broker.get_open_interest(
+                    user_id, self._futures_account, 1)
                 _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
                 if open_interest_query_rejected(code):
                     self._predeploy_oi_failed = True
@@ -9228,7 +9272,7 @@ class BacktestApp:
                 # Query multiple market types to find TMF order codes
                 # 2=期貨T盤, 7=期貨全盤, 9=客製化期貨
                 for mkt in (2, 7, 9):
-                    rc = call_com("RequestStockList", skQ.SKQuoteLib_RequestStockList, mkt)
+                    rc = _broker.request_stock_list(mkt)
                     if isinstance(rc, int) and rc != 0:
                         _log(f"商品列表查詢 RequestStockList({mkt}) code={rc}")
             except Exception as e:
@@ -9386,8 +9430,7 @@ class BacktestApp:
              f"min={kline_minute} {start_str}~{end_str}")
 
         try:
-            code = call_com(
-                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
+            code = _broker.request_kline(
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0:
                 msg = _return_code_text(code)
@@ -9548,7 +9591,7 @@ class BacktestApp:
         sym_note = f" (via {tick_sym})" if tick_sym != symbol else ""
         self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}{sym_note}...", "status")
         try:
-            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, tick_sym)
+            result = _broker.request_ticks(0, tick_sym)
             # COM may return (code, stockIdx) tuple or just an int
             if isinstance(result, (list, tuple)):
                 code = result[0]
@@ -9967,7 +10010,7 @@ class BacktestApp:
             # is treated as noise and the ladder is allowed to continue.
             if _com_available:
                 try:
-                    ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+                    ic = _broker.is_quote_connected()
                 except Exception as e:
                     ic = None
                     _log_debug(
@@ -10431,7 +10474,11 @@ class BacktestApp:
             try:
                 if name == "GetOpenInterestGW":
                     monitor.begin_oi_query()
-                code = call_com(name, getattr(skO, name), user_id, self._futures_account, 1)
+                    code = _broker.get_open_interest(
+                        user_id, self._futures_account, 1)
+                else:
+                    code = _broker.get_future_rights(
+                        user_id, self._futures_account, 1)
             except Exception as e:
                 _log(f"[MODE REQUEST] {name} failed: [{type(e).__name__}] {e}")
                 self._finish_mode_request(
@@ -11125,9 +11172,7 @@ class BacktestApp:
                  f"price={oOrder.bstrPrice}({price_label}) qty=1 newclose={nc}({nc_label}) reserved=0")
 
             # Synchronous send — returns immediately for IOC market orders
-            message, code = call_com(
-                "SendFutureOrderCLR", skO.SendFutureOrderCLR,
-                user_id, False, oOrder)
+            message, code = _broker.place_order(user_id, oOrder, False)
             _log(f"REAL ORDER RESULT: code={code} message={message}")
 
             if code == 0:
@@ -11171,7 +11216,10 @@ class BacktestApp:
                         _log(f"REAL ORDER SEQ stamp failed: {exc}")
                 self._position_log(
                     "register_order", str(message), action_type, buy_sell, 1,
-                    order_symbol)
+                    order_symbol,
+                    oi_generation=getattr(
+                        getattr(self, "_account_monitor", None),
+                        "oi_query_generation", None))
                 if _discord and _discord.enabled:
                     _discord.order_sent(side_str, order_symbol, price_label,
                                         sim_price, str(message),
@@ -11351,8 +11399,8 @@ class BacktestApp:
         # confirm, or the 10s timeout downgrades the bot.
         try:
             user_id = self.login_user_var.get().strip()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, self._futures_account, 1)
+            _broker.get_open_interest(
+                user_id, self._futures_account, 1)
         except Exception as e:
             _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
@@ -11649,8 +11697,7 @@ class BacktestApp:
             return 0, False
         try:
             user_id = self.login_user_var.get().strip()
-            fills_raw = call_com(
-                "GetFulfillReport", skO.GetFulfillReport,
+            fills_raw = _broker.get_fulfill_report(
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
@@ -12038,8 +12085,7 @@ class BacktestApp:
         self._equity_refresh_sent = True
         user_id = self.login_user_var.get().strip()
         try:
-            code = call_com(
-                "GetFutureRights", skO.GetFutureRights,
+            code = _broker.get_future_rights(
                 user_id, self._futures_account, 1)
         except Exception as exc:
             self._note_equity_refresh_failed(
@@ -12111,10 +12157,10 @@ class BacktestApp:
             # Latest query only. clear_positions() does not drop an
             # answer that already landed for the current generation.
             self._account_monitor.begin_oi_query()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, self._futures_account, 1)
-            call_com("GetFutureRights", skO.GetFutureRights,
-                     user_id, self._futures_account, 1)  # 1=TWD
+            _broker.get_open_interest(
+                user_id, self._futures_account, 1)
+            _broker.get_future_rights(
+                user_id, self._futures_account, 1)  # 1=TWD
         except Exception as e:
             _log(f"帳戶查詢失敗 Account query error: {e}")
 
@@ -12571,18 +12617,11 @@ def register_com_events() -> None:
         return
     import comtypes.client
     quote_event = SKQuoteLibEvents()
-    _com_event_handlers.append(quote_event)
-    _com_event_handlers.append(
-        _bind_event_sink("quote", skQ, quote_event, comtypes.client.GetEvents))
     reply_event = SKReplyLibEvent()
-    _com_event_handlers.append(reply_event)
-    _com_event_handlers.append(
-        _bind_event_sink("reply", skR, reply_event, comtypes.client.GetEvents))
-    if skO is not None:
-        order_event = SKOrderLibEvents()
-        _com_event_handlers.append(order_event)
-        _com_event_handlers.append(
-            _bind_event_sink("order", skO, order_event, comtypes.client.GetEvents))
+    order_event = SKOrderLibEvents() if skO is not None else None
+    _broker.attach_events(
+        _com_event_handlers, quote_event, reply_event, order_event,
+        _bind_event_sink, comtypes.client.GetEvents)
 
 
 def main():

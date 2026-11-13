@@ -689,7 +689,7 @@ def test_connect_by_id_call_sites_are_login_and_the_machine_port():
             Path("run_backtest.py").read_text(encoding="utf-8").splitlines(), 1):
         if "SKReplyLib_ConnectByID" in line and not line.strip().startswith("#"):
             app_lines.append((lineno, line.strip()))
-    assert len(app_lines) == 1
+    assert app_lines == []
     src_hits = []
     for path in Path("src").rglob("*.py"):
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -699,7 +699,8 @@ def test_connect_by_id_call_sites_are_login_and_the_machine_port():
                 continue
             src_hits.append((path.as_posix(), lineno, line.strip()))
     port_hits = [hit for hit in src_hits if hit[0].endswith("com_broker_port.py")]
-    assert len(port_hits) == 1
+    # Machine connect_reply and process-start connect_by_id. No third site.
+    assert len(port_hits) == 2
     other = [hit for hit in src_hits if not hit[0].endswith("com_broker_port.py")]
     assert other == [] or all(
         hit[0].endswith("broker_port.py") for hit in other
