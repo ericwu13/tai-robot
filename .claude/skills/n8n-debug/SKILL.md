@@ -79,7 +79,7 @@ C:/Python313/python.exe .claude/skills/n8n-debug/scripts/n8n_query.py status
 | Every executeCommand fails in ~7 ms, empty stderr | n8n's child-process spawning died → do not restart the service |
 | `Unrecognized node type: n8n-nodes-base.executeCommand` | `NODES_EXCLUDE="[]"` env lost |
 | Cron fires at wrong TPE hour | `GENERIC_TIMEZONE` + `TZ` = Asia/Taipei missing |
-| `port 5678 is already in use` loop in n8n-service.log | orphan n8n process → do not kill it, do not restart service |
+| `port 5678 is already in use` loop in n8n-service.log | a local n8n is running (historical cause: orphan process). It can double-run W1–W4 with Steven's tasks: stop work and report it to Eric via Selina (see `bridge-health`); do not start or restart n8n |
 | `No encryption key found ... .n8n\.n8n\config` | `N8N_USER_FOLDER` must be `C:\Users\eric8` (parent), not `...\.n8n` |
 | Fresh empty DB / login rejects known account | same `.n8n\.n8n` folder bug |
 
@@ -91,7 +91,7 @@ prove nothing about the deployment env. Therefore, after ANY change to
 `scripts/news_bridge/*`:
 
 ```bash
-C:/Python313/python.exe -s <script> --dry-run   # or --once
+C:/Python313/python.exe -s <script> --dry-run   # or --once (do not run: executes a real cycle)
 ```
 
 `-s` on `C:/Python313/python.exe` replicates LocalSystem's package
