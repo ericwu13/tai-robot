@@ -53,8 +53,8 @@ jobs:
           claude_args: |
             --model claude-opus-5-5
             --max-turns 60
-            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
-            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","BLOCK"]},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"}},"required":["verdict","p1","p2","p3"]}'
+            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),mcp__github_inline_comment__create_inline_comment"
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","BLOCK"]},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"},"summary":{"type":"string"}},"required":["verdict","p1","p2","p3","summary"]}'
           prompt: |
             Review pull request ${{ github.repository }}#${{ github.event.pull_request.number }}
             ("${{ github.event.pull_request.title }}") for correctness bugs.
@@ -90,11 +90,29 @@ jobs:
             Output:
             1. One inline comment per P1/P2 finding on the exact line, via
                mcp__github_inline_comment__create_inline_comment.
-            2. One summary via `gh pr comment ${{ github.event.pull_request.number }} --body-file -`
-               (or --body): reviewed head SHA, verdict, a table of findings
-               (severity, file:line, one-line summary), and what you checked.
-               Start the summary with "## Claude review @ <short sha>".
-            3. Return the structured result: verdict BLOCK if p1 + p2 > 0, else PASS.
+            2. Return the structured result. verdict is BLOCK if p1 + p2 > 0, else PASS.
+               `summary` is GitHub markdown that the workflow posts as the PR comment
+               (do not post it yourself). It must contain: the reviewed head SHA, the
+               verdict, a table of ALL findings including P3 (severity, file:line,
+               one-line summary with the failure scenario), and what you checked.
+               Start it with "## Claude review @ <short sha>".
+
+      - name: Post summary comment
+        if: always() && steps.claude.outputs.structured_output != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.claude.outputs.structured_output }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          printf '%s' "$RESULT" | python3 -c '
+          import json, sys
+          r = json.load(sys.stdin)
+          body = (r.get("summary") or "").strip() or "## Claude review\n\n(no summary returned)"
+          body += "\n\n<sub>Verdict: **%s** | P1 %s | P2 %s | P3 %s | model claude-opus-5-5</sub>" % (
+              r.get("verdict"), r.get("p1"), r.get("p2"), r.get("p3"))
+          open("summary.md", "w", encoding="utf-8").write(body)
+          '
+          gh pr comment "$PR" --body-file summary.md
 
       - name: Verdict gate
         if: always() && steps.claude.conclusion != 'skipped'
