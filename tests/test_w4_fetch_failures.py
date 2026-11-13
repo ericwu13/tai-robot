@@ -644,38 +644,108 @@ def test_empty_list_after_decided_vote_keeps_the_vote(tmp_path, monkeypatch):
     assert "decided vote for 20260831" not in log
 
 
-def test_twse_zero_rows_is_no_data_and_keeps_vote(tmp_path, monkeypatch):
-    """A TWSE 200 with ``stat`` OK and zero data rows is no-data.
+def _twse_zero_rows(monkeypatch, taifex_rows, twse_body):
+    def fake(req, timeout=None, context=None):
+        url = getattr(req, "full_url", "")
+        if "twse.com.tw" in url:
+            return _Body(json.dumps(twse_body).encode())
+        return _Body(json.dumps(taifex_rows).encode())
 
-    The vote file is not deleted or rewritten, and the log says no-data.
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+
+
+def test_twse_zero_rows_deletes_a_vote_from_another_dataset(tmp_path, monkeypatch):
+    """A TWSE 200 with ``stat`` OK and zero rows is no-data.
+
+    A vote that is not from this dataset is deleted. The day stays
+    retryable and the process exits 0. The log names that dataset.
     """
     base = str(tmp_path / "regime_vote.json")
-    vote = _seed_vote(base)
-    before = vote.read_bytes()
+    vote = _seed_vote(base, json.dumps({
+        "direction": "trending-up", "source": "W4", "data_date": "20260813",
+    }).encode())
     chips.save_state(chips.state_path_for(base), {
         "history": {"20260813": 0.0},
         "last_decided_date": "20260813",
     })
     row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
            "OpenInterest(Net)": "8,123"}
-    twse = {
+    _twse_zero_rows(monkeypatch, [row], {
         "stat": "OK",
         "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
         "data": [],
-    }
-
-    def fake(req, timeout=None, context=None):
-        url = getattr(req, "full_url", "")
-        if "twse.com.tw" in url:
-            return _Body(json.dumps(twse).encode())
-        return _Body(json.dumps([row]).encode())
-
-    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    })
     assert chips.run_once(base, "20260814", _FRIDAY) == 0
-    assert vote.read_bytes() == before
+    assert not vote.exists()
     state = chips.load_state(chips.state_path_for(base))
     assert state.get("last_decided_date") == "20260813"
-    assert "no-data" in _log(base).lower()
+    log = _log(base).lower()
+    assert "no-data" in log
+    assert "decided vote 20260813 deleted" in log
+
+
+@pytest.mark.parametrize("twse_data", [[], None], ids=["empty-list", "no-data-key"])
+def test_twse_zero_rows_deletes_fridays_vote_on_monday(tmp_path, monkeypatch, twse_data):
+    """Friday's vote must not survive Monday's dataset when TWSE has no rows.
+
+    ``data: []`` and a body with no ``data`` key are the same no-data.
+    """
+    base = str(tmp_path / "regime_vote.json")
+    monday = datetime(2026, 8, 31, 16, 15, tzinfo=TPE)
+    vote = _seed_vote(base, json.dumps({
+        "direction": "trending-up",
+        "source": "W4",
+        "data_date": "20260828",
+        "expires_after_session": "2026-08-31|NIGHT",
+    }).encode())
+    before_decided = "20260828"
+    chips.save_state(chips.state_path_for(base), {
+        "history": {"20260828": -83_655.0},
+        "last_decided_date": before_decided,
+    })
+    row = {"Date": "20260831", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "-75,655"}
+    twse = {
+        "stat": "OK",
+        "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+    }
+    if twse_data is not None:
+        twse["data"] = twse_data
+    _twse_zero_rows(monkeypatch, [row], twse)
+    assert chips.run_once(base, None, monday) == 0
+    assert not vote.exists()
+    state = chips.load_state(chips.state_path_for(base))
+    assert state.get("last_decided_date") == before_decided
+    log = _log(base).lower()
+    assert "no-data" in log
+    assert "decided vote 20260828 deleted" in log
+
+
+def test_twse_zero_rows_keeps_a_same_dataset_vote(tmp_path, monkeypatch):
+    """Zero TWSE rows keep a vote whose ``data_date`` is this dataset."""
+    base = str(tmp_path / "regime_vote.json")
+    payload = json.dumps({
+        "direction": "trending-up",
+        "source": "W4",
+        "data_date": "20260814",
+        "expires_after_session": "2026-08-14|NIGHT",
+    }).encode()
+    vote = _seed_vote(base, payload)
+    chips.save_state(chips.state_path_for(base), {"history": {"20260813": 0.0}})
+    row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "8,123"}
+    _twse_zero_rows(monkeypatch, [row], {
+        "stat": "OK",
+        "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+        "data": [],
+    })
+    assert chips.run_once(base, "20260814", _FRIDAY) == 0
+    assert vote.read_bytes() == payload
+    state = chips.load_state(chips.state_path_for(base))
+    assert not state.get("last_decided_date")
+    log = _log(base).lower()
+    assert "no-data" in log
+    assert "decided vote 20260814 kept (same dataset)" in log
 
 
 def test_stale_fetch_failure_reports_stale_not_the_live_fetch(tmp_path):

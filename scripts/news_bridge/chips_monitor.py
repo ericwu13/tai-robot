@@ -44,8 +44,11 @@ There is no neutral vote — when uncertain the W4 vote file is DELETED so
 a stale vote can never linger (votes are also consumed by the classifier
 after every pass, so persisting a vote means re-writing it every run).
 An empty TAIFEX result after a vote for the current session was already
-decided, and a TWSE body with zero rows, are no-data: the vote file is
-left as it is.
+decided is no-data and that vote stays. A TWSE body with zero rows, or
+with no ``data`` key, is also no-data and exits 0 without marking the
+day decided: the on-disk vote is deleted unless its ``data_date`` is
+this dataset, so a vote built on an older dataset cannot carry into
+tonight. A vote from the same dataset is kept.
 
 Usage:
     # normal run (n8n Execute Command node, several slots per weekday)
@@ -370,8 +373,9 @@ def fetch_twse_foreign_net_buy(date_key: str) -> float | None | _TwseNoData:
     holiday (a dict whose ``stat`` is not OK).  A non-dict, or a dict
     with no ``stat`` (an error envelope), is a fetch failure.
     ``stat`` OK with no data rows (missing or ``[]``) is no-data
-    (``_TWSE_NO_DATA``): the caller logs that and does not delete or
-    overwrite the vote.
+    (``_TWSE_NO_DATA``). The caller logs that, leaves the day
+    retryable, and deletes the on-disk vote unless its ``data_date``
+    is this dataset.
     """
     data = _http_json(TWSE_BFI82U_URL.format(date=date_key))
     if data is None:
@@ -386,8 +390,9 @@ def fetch_twse_foreign_net_buy(date_key: str) -> float | None | _TwseNoData:
 
     rows = data.get("data")
     if rows is None or rows == []:
-        # Zero rows is an empty dataset, not "equity flow unavailable".
-        # The caller logs no-data and leaves any vote file alone.
+        # Zero rows (or a missing data key) is an empty dataset, not
+        # "equity flow unavailable". The caller logs no-data and deletes
+        # the vote unless it was built from this same dataset.
         print(f"  no-data — TWSE BFI82U zero rows for {date_key}")
         return _TWSE_NO_DATA
 
@@ -543,16 +548,24 @@ def _get_write_regime_vote():
     return mod.write_regime_vote
 
 
-def _vote_session(base_path: str) -> str:
-    """``expires_after_session`` of the W4 vote on disk, or ``""``."""
+def _vote_payload(base_path: str) -> dict:
+    """Parsed W4 vote on disk, or ``{}`` when it is missing or not a dict."""
     try:
         with open(w4_vote_path(base_path), encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    return str(data.get("expires_after_session") or "")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _vote_session(base_path: str) -> str:
+    """``expires_after_session`` of the W4 vote on disk, or ``""``."""
+    return str(_vote_payload(base_path).get("expires_after_session") or "")
+
+
+def _vote_data_date(base_path: str) -> str:
+    """``data_date`` of the W4 vote on disk, or ``""``."""
+    return str(_vote_payload(base_path).get("data_date") or "")
 
 
 def delete_stale_vote(base_path: str) -> None:
@@ -749,13 +762,51 @@ def _kept_vote_no_data_message(no_data: str, decided: str, session: str) -> str:
     return f"no-data — {body}"
 
 
+def _twse_zero_row_message(date_key: str, vote_date: str, kept: bool) -> str:
+    """No-data line for a TWSE zero-row body.
+
+    Names the on-disk vote's dataset: the one kept when it is this
+    dataset, or the one deleted when it is older or has no ``data_date``.
+    """
+    named = vote_date if vote_date else "none"
+    action = "kept (same dataset)" if kept else "deleted"
+    return (f"no-data — TWSE BFI82U zero rows for {date_key}; "
+            f"decided vote {named} {action}")
+
+
+def _finish_twse_no_data(state: dict, now: datetime, spath, base_path: str,
+                         dry_run: bool, date_key: str) -> int:
+    """TWSE ``stat`` OK with zero rows: no-data, day stays retryable, exit 0.
+
+    Delete the on-disk vote unless its ``data_date`` is *date_key*. A
+    vote built on an older dataset must not carry into tonight. Do not
+    set ``last_decided_date``.
+    """
+    vote_date = _vote_data_date(base_path)
+    kept = bool(vote_date) and vote_date == date_key
+    message = _twse_zero_row_message(date_key, vote_date, kept)
+    if not kept and not dry_run:
+        delete_stale_vote(base_path)
+    if kept:
+        return _no_data_keep_vote(
+            state, now, spath, base_path, dry_run, message)
+    print(f"  {message}")
+    if not dry_run:
+        _clear_fetch_streak(state)
+        save_state(spath, stamp_liveness(state, now, message))
+        append_log(Path(base_path).parent / LOG_NAME,
+                   f"{now:%Y-%m-%d %H:%M:%S} TPE | {message}")
+    return 0
+
+
 def _no_data_keep_vote(state: dict, now: datetime, spath, base_path: str,
                        dry_run: bool, message: str) -> int:
     """Log *message* and leave the vote file bytes alone. Exit 0.
 
     A genuine TAIFEX ``[]`` after a vote for this session was already
-    decided, and a TWSE zero-row body, both come through here. Neither
-    deletes nor rewrites the vote, and neither marks the day decided.
+    decided comes through here, as does a TWSE zero-row body whose
+    on-disk vote was built from this same dataset. Neither rewrites the
+    vote, and neither marks the day decided.
     """
     print(f"  {message}")
     if not dry_run:
@@ -779,7 +830,9 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
     still ``night_session_key(now)``, or an explicit ``--date`` repeats
     ``last_decided_date`` — is no-data and leaves the vote untouched.
     A later day's empty result still deletes.  A TWSE response with
-    zero rows is no-data too: the vote is not deleted or overwritten.
+    zero rows (or no ``data`` key) is no-data too and exits 0 without
+    marking the day decided: the vote is deleted unless its
+    ``data_date`` equals the dataset being decided.
 
     *date_key* explicit (``--date``) = manual backfill: that trade date
     is requested and anything else is "no data".  *date_key* None = the
@@ -941,10 +994,8 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
             )
             return _abort_fetch(state, now, spath, base_path, dry_run, "TWSE", exc)
         if equity_net is _TWSE_NO_DATA:
-            return _no_data_keep_vote(
-                state, now, spath, base_path, dry_run,
-                f"no-data — TWSE BFI82U zero rows for {date_key}; "
-                f"vote left unchanged")
+            return _finish_twse_no_data(
+                state, now, spath, base_path, dry_run, str(date_key))
         if equity_net is None:
             # Contradiction check can't run — conservative: no vote at all.
             direction, reason = None, "TWSE equity flow unavailable — cannot rule out hedging, no vote"
