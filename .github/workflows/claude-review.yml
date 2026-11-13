@@ -4,46 +4,81 @@ name: Claude Review
 # (CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`), not on API credits or
 # org extra usage. It never edits, commits or pushes.
 #
-# When it runs (deliberately NOT on every push, to save subscription usage):
+# When it runs:
 #   - a non-draft PR is opened / reopened, or a draft is marked ready
-#   - the `claude-review` label is added (works on drafts; remove and re-add
-#     the label to review again after new pushes)
+#     (the workflow then adds the `claude-review` label itself)
+#   - the `claude-review` label is added (works on drafts)
+#   - a push to a PR that carries the `claude-review` label (every push gets
+#     a fresh verdict, because master requires this check per commit)
+# Unlabeled drafts never run, so they cost nothing. Rapid pushes cancel the
+# in-flight review (concurrency below), so only the latest commit is reviewed.
 #
 # The `verdict` step fails when Claude reports a P1/P2 finding or returns no
 # verdict, so this check can be made required in branch protection.
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, labeled]
+    types: [opened, reopened, ready_for_review, labeled, synchronize]
 
+# Runs for unrelated label events get their own group so they never cancel
+# an in-flight review.
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
+  group: claude-review-${{ github.event.pull_request.number }}-${{ (github.event.action != 'labeled' || github.event.label.name == 'claude-review') && 'r' || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   review:
-    # Same-repo PRs only (fork PRs get no secrets), and only the events above.
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      (
-        (github.event.action != 'labeled' && !github.event.pull_request.draft) ||
-        (github.event.action == 'labeled' && github.event.label.name == 'claude-review')
-      )
+    # "review" is a REQUIRED check on master, and GitHub counts a SKIPPED check
+    # as passing. So this job never skips for a relevant event: it either
+    # reviews or fails closed. Events that are not about this review (another
+    # label added) run under a different check name and are skipped, so they
+    # cannot overwrite the "review" result on the commit.
+    name: ${{ (github.event.action != 'labeled' || github.event.label.name == 'claude-review') && 'review' || 'review-ignored-label' }}
+    if: github.event.action != 'labeled' || github.event.label.name == 'claude-review'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
-      issues: read
+      issues: write
       id-token: write
 
     steps:
+      - name: Decide whether to review
+        id: gate
+        env:
+          ACTION: ${{ github.event.action }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'claude-review') }}
+        run: |
+          eligible=false
+          if [ "$SAME_REPO" = "true" ]; then
+            case "$ACTION" in
+              opened|reopened|ready_for_review) [ "$DRAFT" = "false" ] && eligible=true ;;
+              labeled) eligible=true ;;
+              synchronize) [ "$HAS_LABEL" = "true" ] && eligible=true ;;
+            esac
+          fi
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION draft=$DRAFT same_repo=$SAME_REPO has_label=$HAS_LABEL -> eligible=$eligible"
+
+      # Label auto-reviewed PRs so later pushes re-review. Labels added with
+      # the job token do not trigger another workflow run.
+      - name: Label for re-review on push
+        if: steps.gate.outputs.eligible == 'true' && github.event.action != 'labeled' && github.event.action != 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr edit ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --add-label claude-review
+
       - name: Checkout PR head
+        if: steps.gate.outputs.eligible == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Run Claude review
+        if: steps.gate.outputs.eligible == 'true'
         id: claude
         uses: anthropics/claude-code-action@v1
         env:
@@ -108,7 +143,7 @@ jobs:
                Start it with "## Claude review @ <short sha>".
 
       - name: Post inline threads and summary
-        if: always() && steps.claude.outputs.structured_output != ''
+        if: always() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output != ''
         env:
           GH_TOKEN: ${{ github.token }}
           RESULT: ${{ steps.claude.outputs.structured_output }}
@@ -121,10 +156,15 @@ jobs:
           python3 "$RUNNER_TEMP/claude_review_post.py"
 
       - name: Verdict gate
-        if: always() && steps.claude.conclusion != 'skipped'
+        if: always()
         env:
+          ELIGIBLE: ${{ steps.gate.outputs.eligible }}
           RESULT: ${{ steps.claude.outputs.structured_output }}
         run: |
+          if [ "$ELIGIBLE" != "true" ]; then
+            echo "::error::Not reviewed. Add the 'claude-review' label (drafts, pushes to unlabeled PRs) or mark the PR ready for review. Fork PRs are not reviewed."
+            exit 1
+          fi
           echo "structured_output: ${RESULT:-<empty>}"
           if [ -z "$RESULT" ]; then
             echo "::error::Claude returned no verdict; treating as BLOCK (fail closed)."
