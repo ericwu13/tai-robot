@@ -46,7 +46,7 @@ For each trade T in session.json:
 2026-10-12 23:01, but the order was "skipped (timeout 10s)" and no `REAL ORDER` line was written,
 so that trade is paper. Price fields are not proof either (case 1 above).
 
-### Validation (2.11BbandSmaShortV3, v21916 dir)
+### Validation (2.11BbandSmaShortV3)
 - Known REAL: SHORT 2026-10-16 01:01:10. `REAL ORDER: SELL … sim_price=47174` 01:01:11, then
   `OK: 2315618285807`, then `REAL FILL (entry) price=47152 accepted=True`. Exit: BUY 04:01:06,
   `OK: 2315618298422`, `REAL FILL (exit) price=47365`. session: source=real, 47152/47365. ✔ REAL
@@ -59,7 +59,7 @@ so that trade is paper. Price fields are not proof either (case 1 above).
 
 ## Hunt procedure (fixed steps; one run per bot dir; READ-ONLY)
 Tools: `scripts/real_order_audit/` — `extract.ps1` (remote read-only scan), `fetch.sh` (needs `REAL_AUDIT_SSH`), `match.py`, `patch.py`.
-1. `fetch.sh <bot_dir> <out.txt>` runs `extract.ps1` on Steven over SSH. It opens the files with
+1. `fetch.sh <bot_dir> <out.txt>` runs `extract.ps1` on the trading PC over SSH. It opens the files with
    ReadWrite sharing, so the running bot is never blocked. It emits:
    E = evidence lines (REAL ORDER / REAL FILL / ENTRY_FILL / TRADE_CLOSE / skipped / deploy) from
    every `debug_*.log` and `cli_stdout.log*`; H = every clock hour with any log line;
@@ -70,7 +70,7 @@ Tools: `scripts/real_order_audit/` — `extract.ps1` (remote read-only scan), `f
    a mode switch. Write a one-line explanation.
 4. Report: counts per verdict, then every trade whose verdict ≠ what the dashboard shows now
    (MISMATCH), with seqs as evidence, then orphans. No writes.
-Scope: the v21916 bot dirs (the dashboard's `--base-dir`). The older installs (v21910, v2199) hold
+Scope: the bot dirs of the CURRENT install (the dashboard's `--base-dir`). Older installs on the same PC hold
 the same debug-log files, with identical REAL ORDER OK counts per file, so they are a subset and
 are not scanned again.
 
@@ -101,7 +101,7 @@ Caveat: `REAL ORDER OK` means the broker ACCEPTED the order. An IOC market order
 accepted but never filled would still count as REAL here. The dashboard then shows it as
 `missing` (no fill price), not as paper.
 
-## First run (2026-11-08, Steven v21916, 12 bots)
+## First run (2026-11-08, trading PC, 12 bots)
 | bot | trades | REAL | PAPER | edits |
 |---|---|---|---|---|
 | 2.10.0DynamicExitPullbackV3 | 179 | 33 | 146 | 27 source→real, 10 planted prices cleared, 5 source ""→paper |

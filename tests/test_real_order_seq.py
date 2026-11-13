@@ -1,6 +1,6 @@
 """The real-order seq stamped on each trade (entry_order_seq / exit_order_seq).
 
-Incident shape (Steven audit, 2026-11): the broker relabels a trade "paper"
+Incident shape (fleet audit, 2026-11): the broker relabels a trade "paper"
 whenever its real entry fill was never confirmed, so a real order whose
 confirmation was lost left no proof on the trade; and pre-#92 paper trades
 carry a planted day-average exit price that made the dashboard call them
@@ -98,13 +98,14 @@ def _row(**kw):
 
 def test_order_sent_with_lost_confirm_is_a_real_order_not_paper():
     # source downgraded to "paper", no price recorded, but the seq is there.
-    t = _row(entry_order_seq=SEQ_E, exit_order_seq=SEQ_X)
+    t = _row(entry_order_seq=SEQ_E, exit_order_seq=SEQ_X, seq_tracked=True)
     assert real_pnl.is_real_order(t)
     assert real_pnl.classify(t, PV)["status"] == "missing"
 
 
 def test_planted_price_on_a_stamped_paper_row_is_not_proof():
-    t = _row(real_exit_price=44794, entry_order_seq="", exit_order_seq="")
+    t = _row(real_exit_price=44794, entry_order_seq="", exit_order_seq="",
+             seq_tracked=True)
     assert not real_pnl.is_real_order(t)
     assert real_pnl.classify(t, PV)["status"] == ""
 
@@ -112,3 +113,81 @@ def test_planted_price_on_a_stamped_paper_row_is_not_proof():
 def test_legacy_rows_without_seq_keys_keep_the_price_rule():
     assert real_pnl.is_real_order(_row(real_exit_price=44921))
     assert not real_pnl.is_real_order(_row())
+
+
+def test_legacy_untracked_row_with_stamped_exit_seq_is_a_real_order():
+    """#259 review P3: a position restored from an older file stays
+    seq_tracked=False, but note_real_order_sent can still stamp the exit
+    seq. A lost fill (source != real, no confirmed price) must classify
+    that row as a real order, not paper."""
+    t = _row(entry_order_seq="", exit_order_seq=SEQ_X, seq_tracked=False,
+             source="paper", real_entry_price=0, real_exit_price=0)
+    assert real_pnl.is_real_order(t)
+    assert real_pnl.classify(t, PV)["status"] == "missing"
+
+
+def test_legacy_real_trade_survives_a_save_by_the_new_build():
+    """#258 review P2: to_dict writes the seq keys ("") on every trade, so
+    key presence must not switch a legacy row to the seq rule. A real order
+    whose entry confirm was lost (source "paper", real exit recorded) must
+    still be a real order after from_dict -> to_dict."""
+    legacy = {"point_value": PV, "trades": [{
+        "tag": "S", "side": "SHORT", "qty": 1, "entry_price": 45000,
+        "exit_price": 44900, "entry_bar_index": 1, "exit_bar_index": 4,
+        "pnl": 1000, "entry_dt": "2026-08-20 09:46:00",
+        "exit_dt": "2026-08-20 10:46:00", "real_exit_price": 44910,
+        "real_exit_dt": "2026-08-20 10:46:02", "source": "paper"}]}
+    assert real_pnl.is_real_order(legacy["trades"][0])
+    saved = SimulatedBroker.from_dict(legacy).to_dict()["trades"][0]
+    assert saved["entry_order_seq"] == "" and saved["seq_tracked"] is False
+    assert real_pnl.is_real_order(saved)
+    assert real_pnl.classify(saved, PV)["status"] == "estimated"
+
+
+def test_new_build_trades_are_seq_tracked_and_round_trip():
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    b.force_close(9, 44900)
+    r = SimulatedBroker.from_dict(b.to_dict())
+    assert r.trades[0].seq_tracked is True
+
+
+def test_position_restored_from_an_old_file_closes_untracked():
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    d = b.to_dict()
+    d.pop("entry_seq_tracked")            # written by an older build
+    r = SimulatedBroker.from_dict(d)
+    r.force_close(9, 44900)
+    assert r.trades[-1].seq_tracked is False
+
+
+def test_stop_close_exit_never_lands_on_the_previous_paper_trade():
+    """#258 review P2-1: _stop_live sends the real EXIT while the sim
+    position is still open, with bar_idx read from trades[-1] (the previous
+    trade). That seq belongs to the OPEN position."""
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    b.force_close(9, 44900)               # trade 1: paper, no orders
+    _open(b, bar=12)
+    assert b.note_real_order_sent("entry", SEQ_E, 12)
+    caller_bar_idx = b.trades[-1].exit_bar_index      # what run_backtest passes
+    assert b.note_real_order_sent("exit", SEQ_X, caller_bar_idx, open_position=True)
+    assert b.trades[0].exit_order_seq == ""
+    assert not real_pnl.is_real_order(b.to_dict()["trades"][0])
+    b.force_close(15, 44800)              # the stop's sim force-close
+    t2 = b.trades[-1]
+    assert (t2.entry_order_seq, t2.exit_order_seq) == (SEQ_E, SEQ_X)
+    assert not b.note_real_order_sent("exit", "2315600000009", 15)  # first wins
+
+
+def test_pending_exit_seq_survives_a_save_before_the_sim_close():
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    b.note_real_order_sent("exit", SEQ_X, -1, open_position=True)
+    r = SimulatedBroker.from_dict(b.to_dict())
+    r.force_close(9, 44900)
+    assert r.trades[-1].exit_order_seq == SEQ_X
+    _open(r, bar=12)
+    r.force_close(15, 44800)
+    assert r.trades[-1].exit_order_seq == ""        # never inherited

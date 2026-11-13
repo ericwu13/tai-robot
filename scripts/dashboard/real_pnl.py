@@ -27,7 +27,7 @@ Per trade:
 
 Pre-#92 prices on a confirmed real order are replaced, not excluded: the
 June-July 2026 real trades made most of the account's gains, and their
-simulated P&L tracks the account balance within ~2k NTD a month (Steven
+simulated P&L tracks the account balance within ~2k NTD a month (2026-11
 audit, docs/real_order_signature.md), while the recorded day averages do
 not. Rows that are not ``source == "real"`` keep the exclusion: an
 unaudited legacy row with only a planted price may be a paper trade.
@@ -97,19 +97,26 @@ def is_real_order(trade: dict) -> bool:
     but its confirmation was lost (a dropped race, an OpenInterest error,
     a missed deal row).
 
-    Builds that stamp ``entry_order_seq`` / ``exit_order_seq`` (the
-    SendFutureOrderCLR seq, written when the order is accepted) carry the
-    proof on the trade itself, so for those rows the seq decides and a
-    stray price is not proof. Older rows lack the keys; for them a recorded
-    real price is the only evidence an order went out. Pre-#92 paper rows
-    can also carry a day-average exit price planted from GetFulfillReport;
+    A non-empty ``entry_order_seq`` or ``exit_order_seq`` (the
+    SendFutureOrderCLR seq, written when the order is accepted) is proof
+    on any row. That includes a position restored from an older file:
+    ``seq_tracked`` stays False, but ``note_real_order_sent`` can still
+    stamp the exit seq, and a lost fill leaves ``source != "real"`` with
+    no price. ``seq_tracked`` decides only an empty seq. True means the
+    position was opened by seq-stamping code, so a stray price is not
+    proof. Older trades keep the marker False and the seqs empty (a save
+    by the new build writes the seq keys as ""), so for them a recorded
+    real price is still the evidence. Pre-#92 paper rows can also carry a
+    day-average exit price planted from GetFulfillReport;
     ``docs/real_order_signature.md`` is the log audit that clears those.
     """
     if str(trade.get("source") or "") == "real":
         return True
-    if "entry_order_seq" in trade or "exit_order_seq" in trade:
-        return bool(str(trade.get("entry_order_seq") or "").strip()
-                    or str(trade.get("exit_order_seq") or "").strip())
+    if (str(trade.get("entry_order_seq") or "").strip()
+            or str(trade.get("exit_order_seq") or "").strip()):
+        return True
+    if trade.get("seq_tracked") is True:
+        return False
     return bool(_int(trade.get("real_entry_price")) or _int(trade.get("real_exit_price")))
 
 
