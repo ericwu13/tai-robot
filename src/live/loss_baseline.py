@@ -5,6 +5,12 @@ not Capital's full account net. Capital itself rebases the next morning
 (~05:20–05:38 TPE). This module detects that batch and holds the gated
 figure through the all-zero and f22-first interim reads.
 
+A night and the next calendar day's session share that budget. When the
+day session is more than one calendar day later (a weekend, or a gap
+with no session — plain date arithmetic, no holiday calendar), that day
+gets its own budget from the last settled read in 08:30–08:45. Field
+f37 (expiry settlement) is not read.
+
 No Tk, no COM. The app calls :meth:`DailyLossBaseline.observe` with the
 parsed rights dict and ``_taipei_now()``.
 """
@@ -38,6 +44,9 @@ _CAND_HI = 15 * 60
 _MORNING_LO = 5 * 60
 _MORNING_HI = 8 * 60 + 30
 _SETTLE_AT = 8 * 60 + 30
+_DAY_LO = 8 * 60 + 30
+_DAY_HI = 8 * 60 + 45
+_NIGHT_OPEN = 15 * 60
 
 
 def _as_tpe(now: datetime) -> datetime:
@@ -94,6 +103,11 @@ def _at_or_after_0830(now: datetime) -> bool:
     return _minutes(now) >= _SETTLE_AT
 
 
+def _in_day_open_window(now: datetime) -> bool:
+    minute = _minutes(now)
+    return _DAY_LO <= minute < _DAY_HI
+
+
 @dataclass(frozen=True)
 class _Snap:
     date: str
@@ -125,6 +139,8 @@ class LossView:
     basis: str
     held: bool
     settled_after_reset: bool
+    day_budget_opened: bool = False
+    day_failsafe_recheck: bool = False
 
 
 def _components(rights):
@@ -150,13 +166,19 @@ def _components(rights):
 
 
 class DailyLossBaseline:
-    """Per-bot snapshot of the account net at the trading-day roll."""
+    """Per-bot snapshot of the account net at the trading-day roll.
+
+    Two REAL bots on one account would each gate on this same
+    account-wide figure. That case is deferred until a second REAL bot
+    exists; the fix would be one file per account. No logic for it here.
+    """
 
     def __init__(self, path: str, account: str):
         self.path = path
         self._account_hash = hashlib.sha256(
             str(account or "").encode("utf-8")).hexdigest()[:12]
         self.day_key = ""
+        self.night_date = ""
         self.basis = ""
         self.b_r = 0
         self.b_c = 0
@@ -173,13 +195,14 @@ class DailyLossBaseline:
         self._pending_notice: str | None = None
         self._failsafe_logged_key = ""
         self._last_candidate_mono = -1e9
+        self._clear_day_budget()
 
     def observe(self, rights: dict, now_tpe: datetime) -> LossView:
         """One valid rights read. Invalid input does not move state."""
         parsed = _components(rights)
         if parsed is None or now_tpe is None:
             shown = self.last_l if self.last_l is not None else 0
-            return self._view(shown, self._account_net, False, False)
+            return self._view(shown, self._account_net, False, False, False, False)
         now = _as_tpe(now_tpe)
         realized, floating, fee, equity = parsed
         account = realized + floating
@@ -218,16 +241,30 @@ class DailyLossBaseline:
             dirty = True
             force = True
 
-        loss = account - self.b_r - self.b_c
         held = False
         just_settled = False
-        if self._reset_open():
-            if self._can_settle(now, fee):
-                self.capital_reset["settled"] = True
-                just_settled = True
-                dirty = True
-                force = True
-            else:
+        if self._reset_open() and self._can_settle(now, fee):
+            self.capital_reset["settled"] = True
+            just_settled = True
+            dirty = True
+            force = True
+
+        before_day = (
+            self._has_day_baseline, self.day_b_r, self.day_b_c,
+            self.day_budget, self.day_failsafe)
+        opened, recheck = self._consider_day_budget(
+            now, realized, floating, fee, equity)
+        if (opened or recheck or before_day != (
+                self._has_day_baseline, self.day_b_r, self.day_b_c,
+                self.day_budget, self.day_failsafe)):
+            dirty = True
+            force = True
+
+        if self.day_budget:
+            loss = account - self.day_b_r - self.day_b_c
+        else:
+            loss = account - self.b_r - self.b_c
+            if self._reset_open():
                 held_loss = self.capital_reset.get("l_pre")
                 if held_loss is not None:
                     held = True
@@ -238,7 +275,7 @@ class DailyLossBaseline:
         self.last_l = loss
         if dirty:
             self._persist(candidate_only=dirty and not force)
-        return self._view(loss, account, held, just_settled)
+        return self._view(loss, account, held, just_settled, opened, recheck)
 
     def load(self, now_tpe: datetime) -> None:
         """Restore today's baseline. A bad file becomes B=0 and does not raise."""
@@ -283,14 +320,24 @@ class DailyLossBaseline:
 
     def _roll(self, key: str, now: datetime, fee: int, equity: str) -> None:
         if self.day_key and _is_weekend(key):
-            self.day_key = key
-            if self.basis not in ("failsafe", "capital_reset"):
-                self.basis = "carried"
+            self._carry(key)
+            return
+        # A read before the night open, more than a day after the night
+        # this baseline belongs to: a skipped session (weekend already
+        # carried, or a holiday by date arithmetic). Keep the night.
+        if (self.day_key and _minutes(now) < _NIGHT_OPEN
+                and self._needs_day_budget(now)):
+            self._carry(key)
             return
         if self.candidate is not None and self.candidate.date == key:
             self._commit(self.candidate, key)
             return
         self._enter_failsafe(key, fee, equity, now)
+
+    def _carry(self, key: str) -> None:
+        self.day_key = key
+        if self.basis not in ("failsafe", "capital_reset", "day_open"):
+            self.basis = "carried"
 
     def _commit(self, snap: _Snap, key: str) -> None:
         self.day_key = key
@@ -304,6 +351,8 @@ class DailyLossBaseline:
         self.capital_reset = None
         self._detected_at = None
         self.last_l = None
+        self.night_date = key
+        self._clear_day_budget()
 
     def _enter_failsafe(self, key: str, fee: int, equity: str, now: datetime) -> None:
         self.day_key = key
@@ -317,7 +366,59 @@ class DailyLossBaseline:
         self.capital_reset = None
         self._detected_at = None
         self.last_l = None
+        self.night_date = key
+        self._clear_day_budget()
         self._announce_failsafe(key)
+
+    def _needs_day_budget(self, now: datetime) -> bool:
+        """Day session is more than one calendar day after the night."""
+        if not self.night_date:
+            return False
+        try:
+            night = datetime.fromisoformat(self.night_date).date()
+        except ValueError:
+            return False
+        return (now.date() - night).days > 1
+
+    def _consider_day_budget(self, now, realized, floating, fee, equity):
+        """Return (opened_now, failsafe_recheck_now)."""
+        if not self._needs_day_budget(now) or self.day_budget or self.day_failsafe:
+            return False, False
+        if _in_day_open_window(now):
+            if self._reset_open():
+                return False, False
+            self.day_b_r = realized
+            self.day_b_c = max(0, floating)
+            self.day_fees = fee
+            self.day_f22 = equity
+            self.day_taken_at = _iso(now)
+            self._has_day_baseline = True
+            return False, False
+        if _minutes(now) >= _DAY_HI:
+            if self._has_day_baseline:
+                self.day_budget = True
+                self.basis = "day_open"
+                return True, False
+            self.day_failsafe = True
+            self._announce_day_failsafe(now.date().isoformat())
+            return False, True
+        return False, False
+
+    def _clear_day_budget(self) -> None:
+        self._has_day_baseline = False
+        self.day_b_r = 0
+        self.day_b_c = 0
+        self.day_fees = 0
+        self.day_f22 = ""
+        self.day_taken_at = ""
+        self.day_budget = False
+        self.day_failsafe = False
+
+    def _announce_day_failsafe(self, day: str) -> None:
+        message = (
+            f"[LOSS] no 08:30 baseline for {day}; gating on the night budget")
+        logger.warning(message)
+        self._pending_notice = message
 
     def _reset_open(self) -> bool:
         return isinstance(self.capital_reset, dict) and not self.capital_reset.get("settled")
@@ -366,6 +467,7 @@ class DailyLossBaseline:
             "[LOSS] ignoring loss_baseline.json (%s); gating on full account net",
             reason)
         self.day_key = ""
+        self.night_date = ""
         self.basis = ""
         self.b_r = 0
         self.b_c = 0
@@ -378,6 +480,7 @@ class DailyLossBaseline:
         self.capital_reset = None
         self._detected_at = None
         self.pause_failsafe = False
+        self._clear_day_budget()
 
     # ── persistence ───────────────────────────────────────────────────
 
@@ -408,6 +511,7 @@ class DailyLossBaseline:
         if None in (b_r, b_c, fees):
             return False
         self.day_key = str(data.get("day_key") or "")
+        self.night_date = str(data.get("night_date") or self.day_key or "")
         self.basis = str(data.get("basis") or "")
         self.b_r = b_r
         self.b_c = b_c
@@ -438,6 +542,20 @@ class DailyLossBaseline:
                 self.capital_reset["settled"] = True
         if self.basis == "failsafe":
             self._failsafe_logged_key = self.day_key
+        self._clear_day_budget()
+        raw_day = data.get("day_baseline")
+        if isinstance(raw_day, dict):
+            day_r = _as_int(raw_day.get("B_r"))
+            day_c = _as_int(raw_day.get("B_c"))
+            if day_r is not None and day_c is not None:
+                self._has_day_baseline = True
+                self.day_b_r = day_r
+                self.day_b_c = day_c
+                self.day_fees = _as_int(raw_day.get("fees")) or 0
+                self.day_f22 = str(raw_day.get("f22") or "")
+                self.day_taken_at = str(raw_day.get("taken_at") or "")
+        self.day_budget = bool(data.get("day_budget"))
+        self.day_failsafe = bool(data.get("day_failsafe"))
         return True
 
     def _payload(self) -> dict:
@@ -453,6 +571,7 @@ class DailyLossBaseline:
             "version": _VERSION,
             "account": self._account_hash,
             "day_key": self.day_key,
+            "night_date": self.night_date,
             "basis": self.basis,
             "baseline": {
                 "B_r": self.b_r,
@@ -466,6 +585,15 @@ class DailyLossBaseline:
             "last_l": self.last_l,
             "capital_reset": reset,
             "pause_failsafe": self.pause_failsafe,
+            "day_baseline": None if not self._has_day_baseline else {
+                "B_r": self.day_b_r,
+                "B_c": self.day_b_c,
+                "fees": self.day_fees,
+                "f22": self.day_f22,
+                "taken_at": self.day_taken_at,
+            },
+            "day_budget": self.day_budget,
+            "day_failsafe": self.day_failsafe,
         }
 
     def _persist(self, *, candidate_only: bool) -> None:
@@ -482,7 +610,8 @@ class DailyLossBaseline:
         except Exception:
             logger.warning("[LOSS] loss_baseline.json write failed", exc_info=True)
 
-    def _view(self, loss: int, account: int, held: bool, settled: bool) -> LossView:
+    def _view(self, loss: int, account: int, held: bool, settled: bool,
+              opened: bool, recheck: bool) -> LossView:
         return LossView(
             account_net=int(account),
             loss_today=int(loss),
@@ -490,6 +619,8 @@ class DailyLossBaseline:
             basis=self.basis or "",
             held=held,
             settled_after_reset=settled,
+            day_budget_opened=opened,
+            day_failsafe_recheck=recheck,
         )
 
 

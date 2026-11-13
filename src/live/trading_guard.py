@@ -305,6 +305,19 @@ class TradingGuard:
         self._pause_day_key = ""
         return self.update_pnl(int(loss), day_key=day_key)
 
+    def release_for_day_budget(self, loss: int, day_key: str) -> bool:
+        """Drop a pause that belongs to the night budget and re-check.
+
+        A weekend or holiday gap gives the day session its own budget.
+        The trading-day key does not change at 08:45, so :meth:`roll_day`
+        will not release. Returns True when the new budget itself trips.
+        """
+        if self.paused:
+            self.paused = False
+            self._pause_day_key = ""
+            self._pause_failsafe = False
+        return self.update_pnl(int(loss), day_key=day_key)
+
     def update_pnl(self, net_pnl: int, day_key: str = "", *,
                    failsafe: bool = False) -> bool:
         """Update daily P&L and check loss limit.

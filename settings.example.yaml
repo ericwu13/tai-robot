@@ -35,10 +35,14 @@ trading:
   # dialog and `run_bot_cli deploy --loss-limit`. The gate itself is
   # per bot; this value is only the pre-fill. The counted loss is the
   # change in account net since a snapshot taken in the 13:50–15:00 TPE
-  # window and committed at the 15:00 roll. Friday night and Monday day
-  # share one budget (one TAIFEX trading day). A bot started at night
-  # with no snapshot counts the full account net until Capital's next
-  # morning batch. NOT the same as risk.max_daily_loss below, which
+  # window and committed at the 15:00 roll. A night and the next
+  # calendar day's session share that budget. When the day session is
+  # more than one calendar day later (a weekend, or a gap with no
+  # session), that day gets its own budget from the last settled read
+  # in 08:30–08:45. A missing read keeps the night budget, which is
+  # the stricter figure. A bot started at night with no 15:00 snapshot
+  # counts the full account net until Capital's next morning batch.
+  # NOT the same as risk.max_daily_loss below, which
   # gates the backtest ExecutionEngine and never places a real order.
   daily_loss_limit_ntd: 20000
 

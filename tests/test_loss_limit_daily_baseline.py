@@ -384,7 +384,9 @@ def test_t5_failsafe_pause_rechecks_once_after_the_morning_batch(tmp_path, monke
 def test_t6_monday_batch_holds_friday_night_loss_then_adds_the_day(tmp_path, monkeypatch):
     """11/16 05:22 zeros and 05:36 reload both stay at -5,308. B_r becomes 0.
 
-    Settled at 08:30. A Monday day trade of -3,000 moves the gate to -8,308.
+    Settled at 08:30, still Friday night's figure. Per Eric (Q1) Monday's
+    day session is its own budget, so the -3,000 day trade is -3,000, not
+    -8,308.
     """
     app, clock, tracker = _app_at(
         monkeypatch, datetime(2026, 11, 13, 14, 59, 59), limit=20000,
@@ -404,9 +406,10 @@ def test_t6_monday_batch_holds_friday_night_loss_then_adds_the_day(tmp_path, mon
     if tracker is None:
         pytest.fail("master did not persist B_r = 0 after the batch")
     assert _load_file(tmp_path / "loss_baseline.json")["baseline"]["B_r"] == 0
-    # -3,000 on top of the rebased night: f11 -8260, fees still 48 → R -8308.
+    # -3,000 on top of the rebased night. Monday's own budget counts only
+    # that -3,000 (B_day is the 08:30 net of -5,308).
     _drive(app, clock, datetime(2026, 11, 16, 9, 10), _raw(-8260, 30, 18, f22=F22_NEW))
-    assert app._trading_guard._last_net_pnl == -8308
+    assert app._trading_guard._last_net_pnl == -3000
     _assert_each_reset_signal(tmp_path)
 
 
@@ -814,3 +817,140 @@ def test_t17_gated_loss_is_never_looser_than_mark_to_market(tmp_path):
             tr.load(datetime(2026, 11, 12, 8, 30))
             emit(datetime(2026, 11, 12, 9, 0), n_since, float_now, rebased_fees,
                  new_f22, n_since, float_now)
+
+
+# ── Q1: a gap longer than one calendar day gets its own day budget ────
+# Per Eric via Selina/TY. Friday night and Monday day are separate
+# 20,000 budgets. The same split applies to a holiday gap by date
+# arithmetic (no holiday calendar). A normal next calendar day stays
+# one budget.
+
+def _pnl(realized: int, fee: int, f1: int = 0, f22: str = "AAA") -> dict:
+    """Rights whose realized net (f11 - f2 - f3) is ``realized``."""
+    return _raw(realized + fee, fee, 0, f1=f1, f22=f22)
+
+
+def _friday_into_monday(app, clock, *, with_day_open: bool):
+    """Friday night loss of -15,000, then Capital's Monday batch.
+
+    Baseline realized -5,000. Night realized -20,000. After the rebase
+    the account shows -15,000, which is Friday night.
+    """
+    base = _pnl(-5000, 10, f22="AAA")
+    night = _pnl(-20000, 30, f22="AAA")
+    reload = _pnl(-15000, 20, f22="BBB")
+    _drive(app, clock, datetime(2026, 11, 13, 14, 59), base)
+    _drive(app, clock, datetime(2026, 11, 13, 15, 0, 5), base)
+    _drive(app, clock, datetime(2026, 11, 14, 2, 0), night)
+    _drive(app, clock, datetime(2026, 11, 16, 5, 22), _pnl(0, 0, f22="AAA"))
+    _drive(app, clock, datetime(2026, 11, 16, 5, 36), reload)
+    if with_day_open:
+        _drive(app, clock, datetime(2026, 11, 16, 8, 35), reload)
+    return reload
+
+
+def test_q1a_monday_day_gets_a_fresh_20000_after_friday_night(tmp_path, monkeypatch):
+    """Friday night -15,000. Monday's day session starts with a full 20,000."""
+    app, clock, _tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 13, 14, 59), limit=10000,
+        path=tmp_path / "loss_baseline.json")
+    reload = _friday_into_monday(app, clock, with_day_open=True)
+    guard = app._trading_guard
+    assert guard._last_net_pnl == -15000, guard._last_net_pnl
+    assert guard.paused is True
+    _drive(app, clock, datetime(2026, 11, 16, 9, 0), reload)
+    assert guard._last_net_pnl == 0, guard._last_net_pnl
+    assert guard.paused is False
+    assert 20000 + guard._last_net_pnl == 20000
+
+
+def test_q1b_monday_restart_at_1000_does_not_rebaseline(tmp_path, monkeypatch):
+    app, clock, tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 13, 14, 59), limit=20000,
+        path=tmp_path / "loss_baseline.json")
+    reload = _friday_into_monday(app, clock, with_day_open=True)
+    _drive(app, clock, datetime(2026, 11, 16, 9, 0), reload)
+    if tracker is None:
+        pytest.fail("no day baseline to restore")
+    DailyLossBaseline = _baseline_cls()
+    restarted = DailyLossBaseline(str(tmp_path / "loss_baseline.json"), "ACCT")
+    restarted.load(datetime(2026, 11, 16, 10, 0))
+    # Another -4,000. Measured from the 08:35 baseline, not from this read.
+    view = restarted.observe(
+        _pnl(-19000, 25, f22="BBB"), datetime(2026, 11, 16, 10, 0))
+    assert view.loss_today == -4000, view.loss_today
+    saved = _load_file(tmp_path / "loss_baseline.json")
+    assert saved["day_baseline"]["B_r"] == -15000
+
+
+def test_q1c_missing_monday_baseline_keeps_the_night_and_rechecks_once(tmp_path, monkeypatch):
+    """No 08:30–08:45 read. Keep Friday night's figure, and recheck once."""
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    path = tmp_path / "loss_baseline.json"
+    app, clock, tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 13, 14, 59), limit=20000, path=path)
+    monkeypatch.setattr(rb, "_discord", discord)
+    reload = _friday_into_monday(app, clock, with_day_open=False)
+    if tracker is None:
+        pytest.fail("master has no day-open baseline")
+    # Fresh guard: the pause is caused by using the night figure, not by
+    # a pause already latched on Friday.
+    fresh, fresh_clock, _bound = _app_at(
+        monkeypatch, datetime(2026, 11, 16, 10, 0), limit=10000, path=None)
+    monkeypatch.setattr(rb, "_discord", discord)
+    DailyLossBaseline = _baseline_cls()
+    restored = DailyLossBaseline(str(path), "ACCT")
+    restored.load(datetime(2026, 11, 16, 10, 0))
+    fresh._loss_baseline = restored
+    discord.notes.clear()
+    _drive(fresh, fresh_clock, datetime(2026, 11, 16, 10, 0), reload)
+    guard = fresh._trading_guard
+    assert guard._last_net_pnl == -15000, guard._last_net_pnl
+    assert guard.paused is True
+    assert guard._pause_failsafe is False  # the one recheck already ran
+    text = fresh.live_log.text()
+    assert fresh.live_log.text().count("no 08:30 baseline") == 1
+    assert len(discord.notes) == 1
+    assert discord.notes[0][1] is False
+    # A later read still uses the night budget (-16,000), not Monday-only
+    # (-1,000), and does not get a second recheck.
+    _drive(fresh, fresh_clock, datetime(2026, 11, 16, 11, 0), _pnl(-16000, 25, f22="BBB"))
+    assert guard._last_net_pnl == -16000, guard._last_net_pnl
+    assert guard.paused is True
+    assert fresh.live_log.text().count("no 08:30 baseline") == 1
+    assert len(discord.notes) == 1
+
+
+def test_q1d_holiday_gap_gets_its_own_day_budget(tmp_path, monkeypatch):
+    """Wednesday night, no Thursday, Friday day. Plain date arithmetic."""
+    app, clock, _tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 11, 14, 59), limit=20000,
+        path=tmp_path / "loss_baseline.json")
+    base = _pnl(-5000, 10, f22="AAA")
+    _drive(app, clock, datetime(2026, 11, 11, 14, 59), base)
+    _drive(app, clock, datetime(2026, 11, 11, 15, 0, 5), base)
+    _drive(app, clock, datetime(2026, 11, 12, 2, 0), _pnl(-12000, 30, f22="AAA"))
+    reload = _pnl(-7000, 20, f22="BBB")
+    _drive(app, clock, datetime(2026, 11, 13, 5, 30), _pnl(0, 0, f22="AAA"))
+    _drive(app, clock, datetime(2026, 11, 13, 8, 35), reload)
+    assert app._trading_guard._last_net_pnl == -7000
+    _drive(app, clock, datetime(2026, 11, 13, 9, 0), reload)
+    assert app._trading_guard._last_net_pnl == 0, app._trading_guard._last_net_pnl
+    _drive(app, clock, datetime(2026, 11, 13, 10, 0), _pnl(-9000, 25, f22="BBB"))
+    assert app._trading_guard._last_net_pnl == -2000, app._trading_guard._last_net_pnl
+
+
+def test_q1e_the_next_calendar_day_stays_one_budget(tmp_path, monkeypatch):
+    """Tuesday night into Wednesday day is one budget. Gap is one day."""
+    app, clock, _tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 10, 14, 59), limit=20000,
+        path=tmp_path / "loss_baseline.json")
+    base = _pnl(-5000, 10, f22="AAA")
+    _drive(app, clock, datetime(2026, 11, 10, 14, 59), base)
+    _drive(app, clock, datetime(2026, 11, 10, 15, 0, 5), base)
+    _drive(app, clock, datetime(2026, 11, 11, 2, 0), _pnl(-9000, 30, f22="AAA"))
+    assert app._trading_guard._last_net_pnl == -4000
+    _drive(app, clock, datetime(2026, 11, 11, 8, 35), _pnl(-9000, 30, f22="AAA"))
+    _drive(app, clock, datetime(2026, 11, 11, 9, 10), _pnl(-10000, 35, f22="AAA"))
+    assert app._trading_guard._last_net_pnl == -5000, app._trading_guard._last_net_pnl

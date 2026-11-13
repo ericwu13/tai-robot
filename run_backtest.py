@@ -10550,6 +10550,9 @@ class BacktestApp:
             return
         now = _taipei_now()
         view = self._observe_loss_baseline(now)
+        if view is not None and view.day_budget_opened:
+            self._trading_guard.release_for_day_budget(
+                view.loss_today, view.day_key)
         net = view.loss_today if view is not None else display.net_pnl_int
         if net < -req.loss_limit:
             if view is None:
@@ -12300,12 +12303,17 @@ class BacktestApp:
                             f"{net:+,} / -{guard.daily_loss_limit:,}")
                 else:
                     self.real_loss_limit_var.set("--")
-                if view is not None and view.basis == "failsafe":
+                day_recheck = bool(
+                    view is not None and view.day_failsafe_recheck)
+                if view is not None and (view.basis == "failsafe" or day_recheck):
                     triggered = guard.update_pnl(
                         net, day_key=day_key, failsafe=True)
                 else:
                     triggered = guard.update_pnl(net, day_key=day_key)
-                if view is not None and view.settled_after_reset:
+                if view is not None and view.day_budget_opened:
+                    if guard.release_for_day_budget(net, day_key):
+                        triggered = True
+                elif view is not None and (view.settled_after_reset or day_recheck):
                     if guard.recheck_failsafe_pause(net, day_key):
                         triggered = True
                 self._sync_loss_pause_flag()
