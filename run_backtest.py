@@ -2043,19 +2043,19 @@ class BacktestApp:
         EnterMonitorLONG only when IsConnected()==0. No LeaveMonitor,
         no re-login, no process restart.
 
-        During a closed session the quote is not ready immediately
-        (heartbeat, new entries blocked) but EnterMonitorLONG waits
-        until the next open, 08:45 or 15:00 TPE. It does not run at
-        08:44. The stuck timer does not run across that gap, so the
-        link does not go DEGRADED while the session is closed.
+        During a closed session the quote is marked down. When
+        IsConnected()==0 the normal #178 path runs: 5s settle, then
+        EnterMonitorLONG, including well before the next open. It does
+        not run in the minute before that open (#157). When
+        IsConnected() is anything else, no SKCOM call is made during
+        the gap. The stuck timer does not run until the next open, so
+        the link does not go DEGRADED while the session is closed.
 
-        An open-session blip is logged once and left READY when the
-        quote is still up. A RUNNING runner needs a fresh tick since
-        this 3002 and ``IsConnected()==1``. With no RUNNING runner
-        (GUI idle, or headless warmup) ``IsConnected()==1`` alone is
-        enough. ``IsConnected()==0`` marks the quote down. Either
-        skip leaves the timeout hold unset. Any other case keeps the
-        mark-down below.
+        An open session stays READY when a fresh tick arrived in the
+        last 30s. IsConnected() is not that signal. The timer is
+        cleared so a later 3002 can arm it again. No fresh tick marks
+        the quote down. DEGRADED after stuck_limit is the end state
+        for that case.
         """
         self._quote_ready_timer_id = None
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
@@ -2065,14 +2065,11 @@ class BacktestApp:
                 "quote is no longer READY; leaving the #178 attempt alone"
             )
             return
-        if self._quote_timeout_still_alive():
-            if self._live_runner_is_running():
-                why = "a tick arrived and IsConnected()=1"
-            else:
-                why = "no running runner and IsConnected()=1"
+        if self._quote_timeout_ticks_are_fresh():
+            self._quote_intermediate_seen_at = 0.0
             _log(
-                "報價仍就緒 Quote (3002) without Ready (3003) "
-                f"after {waited:.0f}s, but {why} — staying READY"
+                "報價仍跳動 Quote (3002) without Ready (3003) "
+                f"after {waited:.0f}s, but ticks are flowing — staying READY"
             )
             return
         _log(
@@ -2095,11 +2092,13 @@ class BacktestApp:
         is CONNECTING or DOWN: that is a #178 attempt already in
         progress, and this path must not clear its 3003 wait.
 
-        Closed session: EnterMonitorLONG is held until
-        ``_next_session_open`` (08:45 or 15:00, skipping a holiday).
-        The stuck_limit timer does not run before that instant, so a
-        closed gap cannot reach DEGRADED. Open session: the machine's
-        5s settle applies, then EnterMonitorLONG only if IsConnected()==0.
+        Closed session, IsConnected()==0: the machine's 5s settle,
+        then EnterMonitorLONG. No ``enter_not_before``. The stuck
+        clock still waits until the next open. Closed session,
+        IsConnected() anything else, or the minute before the open:
+        EnterMonitorLONG waits until that open, and the gap makes no
+        further SKCOM call. Open session: the same 5s settle, then
+        EnterMonitorLONG only if IsConnected()==0.
         """
         if self._quote_machine_phase() != LinkPhase.READY:
             _log_debug(
@@ -2115,9 +2114,14 @@ class BacktestApp:
             return
         now = _taipei_now()
         hold = None
+        stuck_until = None
         if not is_market_open(now):
-            hold = _next_session_open(now)
+            nxt = _next_session_open(now)
+            stuck_until = nxt
+            hold = self._closed_gap_enter_hold(now, nxt)
         host.machine.note_quote_not_ready(now, enter_not_before=hold)
+        if stuck_until is not None:
+            host.machine.pause_stuck_clock_until(stuck_until)
         if hold is not None:
             _log(
                 "報價未就緒 Quote not ready during a closed session — "
@@ -2147,49 +2151,53 @@ class BacktestApp:
         if note is not None:
             note(_taipei_now())
 
-    def _live_runner_is_running(self) -> bool:
-        """True only while a live runner is in RUNNING.
+    # A tick newer than this is the only open-session proof the quote
+    # is alive. Same wall clock the tick watchdog stores in
+    # ``last_tick_time``; only a fresh tick writes it.
+    FRESH_TICK_LIVENESS_S = 30.0
 
-        GUI idle has no runner. Headless warmup has a runner that is
-        not RUNNING yet. Both decide the 15s timeout on IsConnected
-        alone.
+    def _quote_timeout_ticks_are_fresh(self) -> bool:
+        """True when an open session has had a fresh tick in the last 30s.
+
+        ``_last_fresh_tick_at`` is that tick's wall clock. IsConnected()
+        is not a liveness signal: it can read 1 while the quote is dead.
+        A closed session never counts, because no live tick can arrive.
         """
-        runner = getattr(self, "_live_runner", None)
-        return (
-            runner is not None
-            and getattr(runner, "state", None) == LiveState.RUNNING
-        )
+        if not is_market_open(_taipei_now()):
+            return False
+        tick_at = float(getattr(self, "_last_fresh_tick_at", 0.0) or 0.0)
+        if tick_at <= 0.0:
+            return False
+        return (time.time() - tick_at) <= self.FRESH_TICK_LIVENESS_S
 
-    def _quote_timeout_still_alive(self) -> bool:
-        """True when this 3002 should stay READY. Do not mark it down.
+    def _closed_gap_enter_hold(self, now, nxt):
+        """When EnterMonitorLONG must wait for the next open.
 
-        A RUNNING runner keeps the tick rule: a fresh tick at or after
-        ``_quote_intermediate_seen_at`` and the broker port's
-        ``IsConnected()==1``. With no RUNNING runner,
-        ``IsConnected()==1`` alone is enough. ``IsConnected()==0``,
-        any other value, a missing tick on a RUNNING runner, or a
-        probe error keeps the mark-down. This reads the port, not raw
-        COM.
+        IsConnected()==0 reconnects during the gap, so this returns
+        None. The minute before the open still waits (#157). Any other
+        reading, including a probe error, waits for the open and the
+        gap makes no further SKCOM call. The read is the broker port.
         """
-        if self._live_runner_is_running():
-            seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
-            tick_at = float(getattr(self, "_last_fresh_tick_at", 0.0) or 0.0)
-            if seen <= 0.0 or tick_at < seen:
-                return False
+        if nxt is None:
+            return None
+        if (nxt - now) <= timedelta(minutes=1):
+            return nxt
         host = getattr(self, "_link_host", None)
         machine = getattr(host, "machine", None) if host is not None else None
         port = getattr(machine, "port", None) if machine is not None else None
         if port is None:
-            return False
+            return nxt
         try:
             state = int(port.is_connected())
         except Exception as exc:
             _log_debug(
-                "[CONN] IsConnected probe on Ready (3003) timeout failed: "
+                "[CONN] IsConnected probe on closed-gap quote-down failed: "
                 f"[{type(exc).__name__}] {exc}"
             )
-            return False
-        return state == 1
+            return nxt
+        if state == 0:
+            return None
+        return nxt
 
     def _quote_down_if_resubscribe_disconnected(self, code) -> None:
         """Q4: RequestTicks==0 and IsConnected()==0 starts #178 now.
@@ -2439,19 +2447,26 @@ class BacktestApp:
 
         Only ``note_quote_not_ready`` sets the hold flag. A 3021, 3033,
         watchdog drop, or manual Reconnect clears it and reconnects
-        in the gap. A timeout that starts while the session is still
-        open keeps the stuck timer until the close, then this hold
-        pauses it until the next open.
+        in the gap. The stuck clock stays paused until the next open.
+        EnterMonitorLONG is held only for a deferral already chosen
+        (IsConnected() was not 0) and for the minute before the open.
         """
         if is_market_open(now):
             return
         host = getattr(self, "_link_host", None)
         if host is None:
             return
+        machine = host.machine
+        if not machine._quote_timeout_hold:
+            return
         nxt = _next_session_open(now)
         if nxt is None:
             return
-        host.machine.hold_quote_enter_until(nxt)
+        machine.pause_stuck_clock_until(nxt)
+        if (nxt - now) <= timedelta(minutes=1) or (
+            machine._quote_enter_not_before is not None
+        ):
+            machine.hold_quote_enter_until(nxt)
 
     def _link_host_tick(self, *, force: bool = False) -> None:
         host = getattr(self, "_link_host", None)
