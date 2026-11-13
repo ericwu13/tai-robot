@@ -1063,7 +1063,7 @@ class RegimeSwitchingRunner(LiveRunner):
 
     # ── Stop (override) ──
 
-    def stop(self):
+    def stop(self, *, keep_position: bool = False):
         """Record the in-progress session result on teardown.
 
         Runs AFTER ``super().stop()`` so the force-close trade it may
@@ -1075,7 +1075,8 @@ class RegimeSwitchingRunner(LiveRunner):
         """
         now = datetime.now(_TZ_TAIPEI)
         sess = current_session(now)
-        summary = super().stop()
+        summary = (super().stop(keep_position=True) if keep_position
+                   else super().stop())
         if sess is not None:
             try:
                 self._recorded_sessions.add((sess.open_date, sess.slot))
