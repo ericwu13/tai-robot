@@ -102,7 +102,8 @@ in your report — do not stall the task waiting for Fable.
 | is a bot alive? | `bot-status` (local dirs) — or `/api/fleet` for the Steven fleet |
 | deploy / restart / stop a bot | `deploy`, then `deploy-check` |
 | regime didn't switch / bot idle | `regime-health` |
-| votes / news bridge silent | `bridge-health`, `n8n-debug` (history) |
+| votes / news bridge silent | `bridge-health` |
+| pre-2026-10-24 local n8n history | `n8n-debug` (history only — do not run) |
 | scary logs, crash | `log-scan`, then `debug` |
 | weekly evolution never improves anything | `evo-debug` |
 | GitHub issue → root cause → PR | `issue-triage` → `validate-findings` → `fix-pr` |
