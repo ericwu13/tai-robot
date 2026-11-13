@@ -10,32 +10,30 @@ description: Scan tai-robot bot debug logs and the news-bridge logs for known er
 > run on **Steven**, not this PC. This PC's `data\live` holds only
 > retired/test bots and its n8n is stopped. Read live state from the
 > dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). No script
-> runs on Steven by default (`start-here` §7). A run of a
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). Data host,
+> host naming and the no-scripts rule → `start-here` §7. A run of a
 > checker on this PC describes this PC only — never publish it as fleet
 > health. Host map → `start-here`. Run checkers from an up-to-date checkout
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
 
-Data host → `start-here` §7; name the host in the output.
-
 Quick look, not a full scan: `/api/bot` is the last 150 lines of the
-newest debug log (`scripts/dashboard/snapshot.py:44`, tail at :999).
+newest debug log (`scripts/dashboard/snapshot.py` `MAX_LOG_LINES`).
 
 ```bash
 curl -s "http://<Steven tailnet IP>:8765/api/bot?id=<SYMBOL>_<bot>"
 ```
 
-Address in `hosts.local.yaml`. A full scan is a read-only ssh read, with
-permission per `start-here` §7. No scripts on the host. `<install_dir>`
+Address in `hosts.local.yaml`. A full scan is a read-only ssh read,
+permission per start-here. No scripts on the host. `<install_dir>`
 is `steven.install_dir` in `hosts.local.yaml`:
 
 ```powershell
-Get-Content <install_dir>\data\live\*\debug_*.log
+Get-ChildItem <install_dir>\data\live\*\debug_*.log | Where-Object LastWriteTime -gt (Get-Date).AddDays(-7) | Select-String -Pattern '<pattern>'
 ```
 
-or `Select-String` on that same path. `check_logs.py` on Steven is not
-supported (`scripts/monitor/check_logs.py:174` takes no base-dir).
+`check_logs.py` on Steven is not supported (`scripts/monitor/check_logs.py`
+`main` takes no base-dir).
 
 Fallback, this PC only:
 

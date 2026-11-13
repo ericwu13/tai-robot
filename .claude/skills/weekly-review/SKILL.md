@@ -10,14 +10,12 @@ description: Orchestrate the weekly tai-robot review — did the Saturday evolut
 > run on **Steven**, not this PC. This PC's `data\live` holds only
 > retired/test bots and its n8n is stopped. Read live state from the
 > dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). No script
-> runs on Steven by default (`start-here` §7). A run of a
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). Data host,
+> host naming and the no-scripts rule → `start-here` §7. A run of a
 > checker on this PC describes this PC only — never publish it as fleet
 > health. Host map → `start-here`. Run checkers from an up-to-date checkout
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
-
-Data host → `start-here` §7; name the host in the output.
 
 Same shape as `daily-review` (which stays daily and does NOT cover
 evolution): fetch → review → validate → publish, each stage delegated to
@@ -27,8 +25,8 @@ read-only, no merges, redact everything).
 
 ## Stage 1 — fetch (no subagents)
 
-`check_evolution.py` writes nothing (`scripts/monitor/check_evolution.py:40-41`;
-pool open is `mode=ro` at :341; `main()` only prints, :627-634). With
+`check_evolution.py` writes nothing (`scripts/monitor/check_evolution.py`;
+pool open is `mode=ro`; `main()` only prints). With
 explicit permission in the brief, read-only, on the data host, using that
 host's own interpreter (not a path from this PC):
 
@@ -37,12 +35,9 @@ python -s scripts/monitor/check_evolution.py <install_dir>\data\live <install_di
 ```
 
 `<install_dir>` is `steven.install_dir` in `hosts.local.yaml`. `argv[1]`
-is base_dir and `argv[2]` is repo_root (`check_evolution.py:630-631`).
+is base_dir and `argv[2]` is repo_root (`check_evolution.py` `main`).
 
-Daily reports are written only by `daily_review.py`, to
-`<repo>/data/monitor/daily_review_<date>.md`, and only when that script
-runs without `--no-report-file` (`scripts/monitor/daily_review.py:269-270`,
-`:285-289`). The repo does not put those files on the data host.
+Week rollup of daily verdicts is not available from the data host (reports are written only where `daily_review.py` runs); say so in the report.
 
 Fallback, this PC only:
 

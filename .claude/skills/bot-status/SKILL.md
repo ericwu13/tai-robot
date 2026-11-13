@@ -10,14 +10,12 @@ description: Check whether a deployed tai-robot bot process is actually alive an
 > run on **Steven**, not this PC. This PC's `data\live` holds only
 > retired/test bots and its n8n is stopped. Read live state from the
 > dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). No script
-> runs on Steven by default (`start-here` §7). A run of a
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). Data host,
+> host naming and the no-scripts rule → `start-here` §7. A run of a
 > checker on this PC describes this PC only — never publish it as fleet
 > health. Host map → `start-here`. Run checkers from an up-to-date checkout
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
-
-Data host → `start-here` §7; name the host in the output.
 
 ## The Steven fleet
 

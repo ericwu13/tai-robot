@@ -125,7 +125,7 @@ The fleet path is read-only HTTP (`/api/fleet`, `/api/bot`; address in
 
 `daily_review.py` and `check_logs.py` on Steven are not supported until
 those scripts take a base-dir flag (tracked follow-up). Both always read
-`REPO_ROOT/data/live` (`scripts/monitor/common.py:426-427`). `daily_review.py`
-writes `data/monitor/*.md` unless `--no-report-file`
-(`scripts/monitor/daily_review.py:269-291`) and would write that on a live
-host. Do not run either there under any permission.
+`REPO_ROOT/data/live` (`scripts/monitor/common.py` `default_base_dir`).
+`daily_review.py` writes `data/monitor/*.md` unless `--no-report-file`
+(`scripts/monitor/daily_review.py`) and would write that on a live host.
+Do not run either there under any permission.
