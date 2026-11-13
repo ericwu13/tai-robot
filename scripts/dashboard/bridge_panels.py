@@ -207,6 +207,8 @@ def reason_zh(reason: str) -> str:
         return "缺少前一交易日未平倉，僅記錄今日水位"
     if "TWSE equity flow unavailable" in r:
         return "證交所現貨資料暫時取不到，無法排除避險，不投票（稍後重試）"
+    if "TWSE BFI82U zero rows" in r:
+        return "證交所現貨資料尚無內容，不投票（稍後重試）"
     return r
 
 

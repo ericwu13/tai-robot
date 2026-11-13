@@ -268,8 +268,13 @@ def _check_chips_log(now, bridge_dir, lines, findings):
 
     streak = 0
     for line in reversed(body):
-        if "no taifex data" in line.lower():
+        # A transport-failure line is transparent: it neither adds to
+        # the voteless streak nor ends it. Anything else still ends it.
+        low = line.lower()
+        if "no taifex data" in low:
             streak += 1
+        elif "fetch failed" in low:
+            continue
         else:
             break
     if streak >= CHIPS_VOTELESS_STREAK:
