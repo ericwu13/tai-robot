@@ -1,6 +1,6 @@
 ---
 name: debug
-description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then (only after Eric's explicit yes via Selina) ship a versioned release per CLAUDE.md § Release Process. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
+description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then, only after an explicit release yes from Eric (relayed via Selina for agents), ship a versioned release per CLAUDE.md § Release Process. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
 ---
 
 # tai-robot Debug Workflow
@@ -115,7 +115,7 @@ vars, event log, SQLite) → `n8n-debug`.
 ## Phase 4 — Ship
 Goal: a versioned release with a Discord notification.
 
-Phase 4 runs only after Eric's explicit yes via Selina. Never merge the fix
+Phase 4 runs only after Eric has merged the fix to master and there is an explicit release yes from Eric (relayed via Selina for agents). Never merge the fix
 branch yourself; Eric decides the merge.
 
 Then follow CLAUDE.md § Release Process (Grok Bot agents: library skill
