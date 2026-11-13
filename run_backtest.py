@@ -2318,6 +2318,11 @@ class BacktestApp:
             alerts = []
         self._apply_link_gate()
         for alert in alerts:
+            # A duplicate 3003 while READY is logged on the tick path
+            # and is not an operator alert. Do not warn or Discord it.
+            if str(alert).startswith("3003 ignored"):
+                _log(str(alert))
+                continue
             self._on_link_alert(alert)
         self._publish_link_heartbeat()
         self.btn_reconnect.config(state=tk.NORMAL)
@@ -2465,6 +2470,10 @@ class BacktestApp:
             text = str(alert)
             if text.startswith("READY:"):
                 self._set_quote_connected(True, "hold_release")
+                # Same as the UI Ready (3003) path: a later 3021 must
+                # still pause the feed. The latch, not the flag, is
+                # what suppresses that cleanup.
+                self._disconnect_cleanup_done = False
                 _log(f"[RECONNECT] {text}")
                 continue
             if text.startswith("3003 ignored"):
@@ -2510,7 +2519,11 @@ class BacktestApp:
         _log("[QUOTE-STUCK] RequestTicks sent; waiting for ticks")
 
     def _clear_quote_stuck_if_ticks_resumed(self) -> None:
-        """A live tick after the one-shot. Clears stuck DEGRADED only."""
+        """A live tick after the one-shot. Clears stuck DEGRADED only.
+
+        Also clears ``_disconnect_cleanup_done``, matching Ready (3003)
+        and hold-release recovery, so a later 3021 still cleans up.
+        """
         recovery = getattr(self, "_quote_stuck", None)
         if recovery is None or not recovery.on_live_tick():
             return
@@ -2525,7 +2538,10 @@ class BacktestApp:
             return
         # Tick recovery has no 3003. The timeout cleared this flag, and
         # a later deploy in this process treats False as not connected.
+        # Clear the disconnect latch too, the same way Ready (3003) does,
+        # so a later 3021 still pauses the feed.
         self._set_quote_connected(True, "_clear_quote_stuck_if_ticks_resumed")
+        self._disconnect_cleanup_done = False
         _log(f"[RECONNECT] {alert}")
         self._apply_link_gate()
         self._publish_link_heartbeat()

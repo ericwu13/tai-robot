@@ -326,3 +326,20 @@ def test_stuck_recovery_clears_timeout_hold_and_quote_connected():
     assert machine._quote_enter_not_before is None
     assert app._quote_connected is True
     assert fake.calls == before
+
+
+def test_stuck_tick_recovery_clears_disconnect_latch():
+    """Stuck-tick recovery clears the latch the way Ready (3003) does."""
+    from run_backtest import BacktestApp
+
+    machine, _fake, _t0 = _stuck_quote()
+    app = BacktestApp.__new__(BacktestApp)
+    app._quote_connected = False
+    app._disconnect_cleanup_done = True
+    app._quote_stuck = QuoteStuckRecovery()
+    app._link_gate_latched = False
+    app._link_host = LinkHost(machine)
+    assert _consider(app._quote_stuck, _t(2026, 10, 27, 10), quote_state=2) == "resubscribe"
+    app._clear_quote_stuck_if_ticks_resumed()
+    assert app._quote_connected is True
+    assert app._disconnect_cleanup_done is False

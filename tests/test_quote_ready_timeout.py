@@ -1181,3 +1181,66 @@ def test_stale_tick_before_enter_monitor_does_not_restore_ready(monkeypatch):
     assert machine._fresh_tick_at is None
     assert machine._quote_timeout_hold is False
     assert machine._quote_hold_open_at is None
+
+
+def test_hold_release_then_3021_still_cleans_up(monkeypatch):
+    """Hold release clears the disconnect latch, so a later 3021 pauses.
+
+    A previous cleanup left the latch set. The closed-gap hold is still
+    in place (no 3021 was delivered to the machine). After the open
+    restores READY, another timeout marks the quote down without
+    cleanup. The following 3021 must pause the tick feed.
+    """
+    app, fake, clock, _logged, _enters, open_at = _closed_gap_down(monkeypatch)
+    app._live_runner = _Runner()
+    app._live_tick_active = True
+    app._conn_monitor = _give_up_monitor()
+    app._disconnect_cleanup_done = True
+    fake.force_quote_state = 1
+    clock["now"] = open_at
+    fake.set_now(open_at)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, open_at)
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    app._live_tick_active = True
+    fake.force_quote_state = 0
+    again = open_at + timedelta(minutes=30)
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, again)
+    assert app._quote_connected is False
+    rb.SKQuoteLibEvents().OnConnection(3021, 0)
+    app._process_ui_queue()
+    assert app._live_tick_active is False
+    assert app._conn_monitor.downs == 1
+    assert any("Disconnected" in msg for msg, _level in app._statuses)
+
+
+def test_manual_reconnect_drops_duplicate_3003_alert(monkeypatch):
+    """A queued duplicate 3003 on Manual Reconnect is not an alert."""
+    at = tpe(2026, 11, 12, 10, 0)
+    app, _fake, _clock, logged = _ready(monkeypatch, at)
+    app._conn_monitor = _give_up_monitor()
+    app._reconnect_timer_id = None
+    app._statuses.clear()
+
+    class _Discord:
+        enabled = True
+
+        def __init__(self):
+            self.notes = []
+
+        def notify(self, msg, priority=False):
+            self.notes.append((msg, priority))
+
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    from src.live.link_state_machine import KIND_READY
+    app._link_host.note_connection(KIND_READY, 0, at)
+    before = len(logged)
+    app._manual_reconnect()
+    ignored = [msg for msg, _level in app._statuses if "3003 ignored" in msg]
+    assert ignored == []
+    assert discord.notes == []
+    assert "3003 ignored: quote already READY" in "\n".join(logged[before:])
+    assert app._link_host.machine.quote == LinkPhase.READY
