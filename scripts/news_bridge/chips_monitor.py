@@ -766,12 +766,18 @@ def _twse_zero_row_message(date_key: str, vote_date: str, kept: bool) -> str:
 
 
 def _finish_twse_no_data(state: dict, now: datetime, spath, base_path: str,
-                         dry_run: bool, date_key: str) -> int:
+                         dry_run: bool, date_key: str, *,
+                         net_oi: float, delta: float | None, prev_date: str | None,
+                         session: str) -> int:
     """TWSE ``stat`` OK with zero rows: no-data, day stays retryable, exit 0.
 
     Delete the on-disk vote unless its ``data_date`` is *date_key*. A
     vote built on an older dataset must not carry into tonight. Do not
-    set ``last_decided_date``.
+    set ``last_decided_date``. When the vote is deleted, upsert a
+    non-final ``daily`` row for *date_key* (no decision, no equity, the
+    no-data reason) so the chips panel does not keep showing the older
+    decision. A later real result for the same dataset overwrites it.
+    The same-dataset keep writes no row.
     """
     vote_date = _vote_data_date(base_path)
     kept = bool(vote_date) and vote_date == date_key
@@ -783,6 +789,12 @@ def _finish_twse_no_data(state: dict, now: datetime, spath, base_path: str,
             state, now, spath, base_path, dry_run, message)
     print(f"  {message}")
     if not dry_run:
+        record_daily(state, date_key, {
+            "net_oi": net_oi, "delta_oi": delta, "prev_date": prev_date,
+            "equity_net": None, "decision": None, "reason": message,
+            "final": False, "session": session,
+            "at": now.isoformat(timespec="seconds"),
+        })
         _clear_fetch_streak(state)
         save_state(spath, stamp_liveness(state, now, message))
         append_log(Path(base_path).parent / LOG_NAME,
@@ -986,7 +998,9 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
             return _abort_fetch(state, now, spath, base_path, dry_run, "TWSE", exc)
         if equity_net is _TWSE_NO_DATA:
             return _finish_twse_no_data(
-                state, now, spath, base_path, dry_run, str(date_key))
+                state, now, spath, base_path, dry_run, str(date_key),
+                net_oi=net_oi, delta=delta, prev_date=prev_date,
+                session=session_key)
         if equity_net is None:
             # Contradiction check can't run — conservative: no vote at all.
             direction, reason = None, "TWSE equity flow unavailable — cannot rule out hedging, no vote"

@@ -750,6 +750,118 @@ def test_twse_zero_rows_keeps_a_same_dataset_vote(tmp_path, monkeypatch):
     assert "decided vote 20260814 kept (same dataset)" in log
 
 
+def _friday_daily_row():
+    return {
+        "net_oi": -83_655.0, "delta_oi": 8_000.0, "prev_date": "20260827",
+        "equity_net": 6e9, "decision": "trending-up",
+        "reason": "strong: |ΔOI| >= 5,000", "final": True,
+        "session": "2026-08-31|NIGHT", "at": "2026-08-31T16:15:00+08:00",
+    }
+
+
+def _monday_zero_row_setup(tmp_path, monkeypatch):
+    """Friday's decided daily row and vote, then Monday's dataset is served."""
+    base = str(tmp_path / "regime_vote.json")
+    monday = datetime(2026, 8, 31, 16, 15, tzinfo=TPE)
+    vote = _seed_vote(base, json.dumps({
+        "direction": "trending-up", "source": "W4", "data_date": "20260828",
+        "expires_after_session": "2026-08-31|NIGHT",
+    }).encode())
+    chips.save_state(chips.state_path_for(base), {
+        "history": {"20260828": -83_655.0},
+        "last_decided_date": "20260828",
+        "daily": {"20260828": _friday_daily_row()},
+    })
+    taifex = [{"Date": "20260831", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+               "OpenInterest(Net)": "-75,655"}]
+    twse = {
+        "stat": "OK",
+        "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+        "data": [],
+    }
+    return base, monday, vote, taifex, twse
+
+
+def test_twse_zero_rows_writes_mondays_nonfinal_daily_row(tmp_path, monkeypatch):
+    """Deleting Friday's vote must still record Monday as a non-final 不投票 row."""
+    from scripts.dashboard.bridge_panels import chips as panel
+
+    base, monday, vote, taifex, twse = _monday_zero_row_setup(tmp_path, monkeypatch)
+    _twse_zero_rows(monkeypatch, taifex, twse)
+    assert chips.run_once(base, None, monday) == 0
+    assert not vote.exists()
+    state = chips.load_state(chips.state_path_for(base))
+    assert max(state["daily"]) == "20260831"
+    row = state["daily"]["20260831"]
+    assert row["decision"] is None
+    assert row["equity_net"] is None
+    assert row["final"] is False
+    assert "no-data" in row["reason"]
+    assert state["daily"]["20260828"]["decision"] == "trending-up"
+    shown = panel(monday, {"regime_vote_path": base},
+                  lambda path: json.loads(Path(path).read_text(encoding="utf-8")))
+    assert shown["days"][0]["date"] == "2026-08-31"
+    assert shown["days"][0]["decision_label"] == "不投票"
+    assert shown["days"][0]["final"] is False
+
+
+def test_later_same_day_success_overwrites_the_nonfinal_row(tmp_path, monkeypatch):
+    """A real TWSE answer later the same day replaces the non-final Monday row."""
+    base, monday, _vote, taifex, twse = _monday_zero_row_setup(tmp_path, monkeypatch)
+    bodies = {"twse": twse}
+
+    def fake(req, timeout=None, context=None):
+        url = getattr(req, "full_url", "")
+        if "twse.com.tw" in url:
+            return _Body(json.dumps(bodies["twse"]).encode())
+        return _Body(json.dumps(taifex).encode())
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, None, monday) == 0
+    assert chips.load_state(chips.state_path_for(base))["daily"]["20260831"]["final"] is False
+
+    bodies["twse"] = {
+        "stat": "OK",
+        "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+        "data": [["外資及陸資", "1", "2", "6000000000"]],
+    }
+    later = datetime(2026, 8, 31, 20, 15, tzinfo=TPE)
+    assert chips.run_once(base, None, later) == 0
+    row = chips.load_state(chips.state_path_for(base))["daily"]["20260831"]
+    assert row["final"] is True
+    assert row["decision"] == "trending-up"
+    assert row["equity_net"] == 6_000_000_000.0
+
+
+def test_same_dataset_keep_adds_no_daily_row(tmp_path, monkeypatch):
+    """Keeping this dataset's vote must not write a second, contradicting row."""
+    base = str(tmp_path / "regime_vote.json")
+    decided_row = {
+        "net_oi": 8_000.0, "delta_oi": 8_000.0, "prev_date": "20260813",
+        "equity_net": 6e9, "decision": "trending-up",
+        "reason": "strong: |ΔOI| >= 5,000", "final": True,
+        "session": "2026-08-14|NIGHT", "at": "2026-08-14T16:15:00+08:00",
+    }
+    chips.save_state(chips.state_path_for(base), {
+        "history": {"20260813": 0.0},
+        "daily": {"20260814": decided_row},
+    })
+    _seed_vote(base, json.dumps({
+        "direction": "trending-up", "source": "W4", "data_date": "20260814",
+        "expires_after_session": "2026-08-14|NIGHT",
+    }).encode())
+    _twse_zero_rows(monkeypatch, [{
+        "Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+        "OpenInterest(Net)": "8,123",
+    }], {
+        "stat": "OK",
+        "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+        "data": [],
+    })
+    assert chips.run_once(base, "20260814", _FRIDAY) == 0
+    assert chips.load_state(chips.state_path_for(base))["daily"] == {"20260814": decided_row}
+
+
 def test_stale_fetch_failure_reports_stale_not_the_live_fetch(tmp_path):
     """A task that died after a failed fetch is stale. The fetch finding
     is for a bridge that is still checking in."""
