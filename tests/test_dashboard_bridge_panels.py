@@ -170,8 +170,36 @@ def test_chips_panel_drops_delta_across_a_long_gap(bridge):
     assert bp.chips(NOW, paths_for(bridge), reader)["latest"]["delta_oi"] is None
 
 
+def test_chips_table_translates_twse_zero_rows(bridge):
+    """A non-final zero-row day is 不投票 in Chinese, not the English reason."""
+    put(bridge / ".chips_state.json", {
+        "history": {"20260828": -83_655.0, "20260831": -75_655.0},
+        "daily": {
+            "20260828": {"net_oi": -83_655.0, "delta_oi": 8_000.0,
+                         "decision": "trending-up", "final": True,
+                         "reason": "strong: |ΔOI| >= 5,000",
+                         "session": "2026-08-31|NIGHT"},
+            "20260831": {
+                "net_oi": -75_655.0, "delta_oi": 8_000.0, "prev_date": "20260828",
+                "equity_net": None, "decision": None, "final": False,
+                "reason": ("no-data — TWSE BFI82U zero rows for 20260831; "
+                           "decided vote 20260828 deleted"),
+                "session": "2026-08-31|NIGHT",
+            },
+        },
+        "last_check": iso(NOW), "last_result": "no-data",
+    })
+    day = bp.chips(NOW, paths_for(bridge), reader)["days"][0]
+    assert day["date"] == "2026-08-31"
+    assert day["decision_label"] == "不投票"
+    assert day["final"] is False
+    assert day["reason_zh"] == "證交所現貨資料尚無內容，不投票（稍後重試）"
+
+
 @pytest.mark.parametrize("reason,needle", [
     ("|ΔOI| 500 < 1,000 hysteresis band — too weak", "未達 1,000"),
+    ("no-data — TWSE BFI82U zero rows for 20260831; decided vote 20260828 deleted",
+     "尚無內容"),
     ("futures vs equity contradiction (likely institutional hedging) — no vote", "避險"),
     ("weak ΔOI but equity flow agrees", "同向確認"),
     ("no recent OI history for ΔOI (need previous trading day) — recording only", "僅記錄"),
