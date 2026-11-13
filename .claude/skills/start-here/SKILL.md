@@ -113,3 +113,14 @@ in your report — do not stall the task waiting for Fable.
 | GitHub issue → root cause → PR | `issue-triage` → `validate-findings` → `fix-pr` |
 | daily / weekly health digest | `daily-review`, `weekly-review` |
 | shell on Steven | `tailscale-ssh` |
+
+## 7. Data host
+
+Host map is §2. Data host = the host `/api/fleet` reports as running the
+bot (today: Steven). Read live state from
+`http://<Steven tailnet IP>:8765/api/fleet` (address in `hosts.local.yaml`).
+The output must name the host the data came from. A run on this PC
+describes this PC only — never publish it as fleet health.
+
+HTTP reads (`/api/fleet`, `/api/bot`) are read-only; running any script
+on that host needs explicit permission in the brief (`tailscale-ssh`).

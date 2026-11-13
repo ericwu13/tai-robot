@@ -10,18 +10,14 @@ description: Orchestrate the weekly tai-robot review — did the Saturday evolut
 > run on **Steven**, not this PC. This PC's `data\live` holds only
 > retired/test bots and its n8n is stopped. Read live state from the
 > dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
-> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
-> describes this PC only — never publish it as fleet health. Host map →
-> `start-here`. Run checkers from an up-to-date checkout
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). A script
+> on that host needs the permission in `start-here` §7. A run of a
+> checker on this PC describes this PC only — never publish it as fleet
+> health. Host map → `start-here`. Run checkers from an up-to-date checkout
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
 
-Data host = the host `/api/fleet` reports as running the bot (today:
-Steven). Read live state from `http://<Steven tailnet IP>:8765/api/fleet`
-(address in `hosts.local.yaml`) or run the checker on that host via
-`tailscale-ssh`. The output must name the host the data came from. A run
-on this PC describes this PC only — never publish it as fleet health.
+Data host → `start-here` §7; name the host in the output.
 
 Same shape as `daily-review` (which stays daily and does NOT cover
 evolution): fetch → review → validate → publish, each stage delegated to
@@ -31,7 +27,7 @@ read-only, no merges, redact everything).
 
 ## Stage 1 — fetch (no subagents)
 
-On the data host via `tailscale-ssh`. `check_evolution.py` and
+With that permission, on the data host: `check_evolution.py` and
 `data\monitor\daily_review_*.md` are there, not on this PC:
 
 ```bash
