@@ -5,6 +5,18 @@ description: Orchestrate the weekly tai-robot review — did the Saturday evolut
 
 # Weekly Review — the orchestrator
 
+> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
+> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
+> run on **Steven**, not this PC. This PC's `data\live` holds only
+> retired/test bots and its n8n is stopped. Read live state from the
+> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
+> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
+> describes this PC only — never publish it as fleet health. Host map →
+> `start-here`. Run checkers from an up-to-date checkout
+> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
+> weeks behind.
+
 Same shape as `daily-review` (which stays daily and does NOT cover
 evolution): fetch → review → validate → publish, each stage delegated to
 its skill. Keep it light — a healthy week costs one script run and zero
@@ -90,7 +102,7 @@ also answer, from primary evidence only:
 no candidate; ≥8 weeks with candidates but zero PASS; a running bot is
 net-negative over the last 4 weeks while evolution stays silent; the
 owner asks "is the EVO algorithm correct". When triggered, launch TWO
-independent agents in parallel (model fable, read-only, scripts in the
+independent agents in parallel (model fable — fall back to opus on a usage-credit error and say so; read-only, scripts in the
 scratchpad only):
 
 - **Pipeline-correctness reviewer** (Explore): `parse_plan_directives`

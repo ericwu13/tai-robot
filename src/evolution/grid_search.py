@@ -103,6 +103,13 @@ class GridOutcome:
     pre-registered list (built before evaluation). ``evidence`` is the
     chosen point's trial penalty when a point was chosen, else None.
     ``rationale`` is the text used when the model does not explain.
+    ``evaluated`` is True only when ``select_grid`` scored at least one
+    pre-registered setting against the baseline. Exits before that (no
+    bars, baseline backtest failed, knobs unreadable, class not on the
+    grid, too few folds outside the holdout, every setting failed to
+    backtest) leave it False: they say nothing about whether the
+    incumbent can be improved, so they never count toward the #188
+    retire streak.
     """
 
     selected: dict | None
@@ -113,6 +120,7 @@ class GridOutcome:
     # The chosen point's holdout window. None when nothing was selected.
     # This window is not an input to DSR, PBO, or the plateau.
     holdout: "HoldoutObservation | None" = None
+    evaluated: bool = False
 
 
 @dataclass(frozen=True)
@@ -529,7 +537,7 @@ def select_grid(
             "(centre is not the maximum, and there is no LLM pick)")
         return GridOutcome(
             None, tuple(reasons), tuple(preregistered), None,
-            "Grid selected nothing. No plateau.")
+            "Grid selected nothing. No plateau.", evaluated=bool(points))
     centre_dsr = dsrs[points.index(centre)]
     dsr_ok = (
         centre_dsr is not None
@@ -548,7 +556,8 @@ def select_grid(
             "nothing selected, no fallback to the maximum")
         return GridOutcome(
             None, tuple(reasons), tuple(preregistered), None,
-            "Grid selected nothing. Plateau centre missed DSR or PBO.")
+            "Grid selected nothing. Plateau centre missed DSR or PBO.",
+            evaluated=bool(points))
     selected = _point_knobs(centre)
     evidence = TrialEvidence(
         dsr=centre_dsr,
@@ -567,7 +576,8 @@ def select_grid(
         f"DSR={centre_dsr:.4f} PBO={pbo:.4f} N={n_trials} N_eff={n_eff:.4f}."
     )
     return GridOutcome(
-        selected, tuple(reasons), tuple(preregistered), evidence, rationale)
+        selected, tuple(reasons), tuple(preregistered), evidence, rationale,
+        evaluated=True)
 
 
 def structural_selection_pnls(
@@ -870,5 +880,6 @@ def run_grid_on_bars(
         outcome = GridOutcome(
             outcome.selected, reasons, outcome.settings,
             outcome.evidence, outcome.rationale, holdout,
+            evaluated=outcome.evaluated,
         )
     return outcome

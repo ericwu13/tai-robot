@@ -740,14 +740,17 @@ class TestRetireRecommendation:
     def test_worker_emits_retirement_after_pool_promotion(self):
         src = inspect.getsource(rb.BacktestApp._start_evolution_pipeline)
         assert src.index("eligible_for_validated_pool(verdict)") < src.index(
-            "rec = assess_retirement")
-        assert src.index("rec = assess_retirement") < src.index(
+            " _review = _retire_review(")
+        assert src.index(" _review = _retire_review(") < src.index(
             "evolution_verdict(verdict.passed, block)")
         assert "verdict.passed =" not in src
-        # Retire still runs on an absolute gate: the call sits after the
-        # relative-only record block, not inside it.
-        assert src.index('if evo_gate.mode == "relative"') < src.index(
-            "rec = assess_retirement")
+        # Retire still runs on an absolute gate: in the shared helper the
+        # assess call sits after the relative-only record block, not inside it.
+        review_src = Path("src/evolution/retire_review.py").read_text(encoding="utf-8")
+        assert review_src.index('if gate_mode == "relative"') < review_src.index(
+            "rec = assess_retirement(")
+        assert "StrategyPool" not in review_src
+        assert "settings.yaml" not in review_src
         gate_src = Path("src/evolution/paper_gate.py").read_text(encoding="utf-8")
         assert "StrategyPool" not in gate_src
         assert "settings.yaml" not in gate_src

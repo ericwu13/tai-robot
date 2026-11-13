@@ -33,7 +33,10 @@ class TestResolveTvSymbol:
         assert resolve_tv_symbol("TX00") == "TXF1!"
 
     def test_mtx00(self):
-        assert resolve_tv_symbol("MTX00") == "TMF1!"
+        assert resolve_tv_symbol("MTX00") == "MXF1!"
+
+    def test_tmf00(self):
+        assert resolve_tv_symbol("TMF00") == "TMF1!"
 
     def test_unknown_returns_itself(self):
         assert resolve_tv_symbol("UNKNOWN") == "UNKNOWN"
