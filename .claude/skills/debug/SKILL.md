@@ -54,7 +54,7 @@ jump to code assumptions before you have read them.
 4. If the logs lack the detail needed, **add logging to the bot** first.
    Redeploy only via the `deploy` skill, with its gates and Eric's yes via
    Selina. Do not deploy from this PC unless Eric asked for a local bot.
-   Never touch the live main tree. Gather more data before proposing a fix.
+   Never edit the live main tree (deploying from it through `deploy` is fine). Gather more data before proposing a fix.
    Diagnosing on insufficient data is how surface-level patches happen.
 5. Output of this phase (all three, logged in the diagnosis before handing off to Opus):
    - **Root-cause statement** — what, where, why. Not a fix yet.
