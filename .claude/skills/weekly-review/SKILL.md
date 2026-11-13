@@ -10,10 +10,10 @@ description: Orchestrate the weekly tai-robot review — did the Saturday evolut
 > run on **Steven**, not this PC. This PC's `data\live` holds only
 > retired/test bots and its n8n is stopped. Read live state from the
 > dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
-> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
-> describes this PC only — never publish it as fleet health. Host map →
-> `start-here`. Run checkers from an up-to-date checkout
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). Data host,
+> host naming and the no-scripts rule → `start-here` §7. A run of a
+> checker on this PC describes this PC only — never publish it as fleet
+> health. Host map → `start-here`. Run checkers from an up-to-date checkout
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
 
@@ -25,13 +25,16 @@ read-only, no merges, redact everything).
 
 ## Stage 1 — fetch (no subagents)
 
+The fleet evo check is unavailable until `check_evolution.py` gets
+per-path flags (tracked follow-up). Do not run it on Steven.
+
+Week rollup of daily verdicts is not available from the data host (reports are written only where `daily_review.py` runs); say so in the report.
+
+Fallback, this PC only, not the fleet verdict:
+
 ```bash
 C:/Python313/python.exe -s scripts/monitor/check_evolution.py
 ```
-
-Plus a cheap week rollup: list `data\monitor\daily_review_*.md` for the
-last 7 TPE days and extract each file's `**verdict: ...**` line (one
-Grep). Note any day with no file (review didn't run).
 
 **Plus the GitHub issue sweep (MANDATORY every run):**
 
@@ -55,8 +58,10 @@ line in the digest (bot count, phase reached per bot, whether it changes
 this week's finding) and feeds stage 2b. Non-EVO issues are the daily
 review's job — list them in one line, don't triage.
 
-**No P1/P2 from the evolution check and no RED day in the rollup → skip
-to stage 3's inline validation, publish a one-line green digest.**
+**Do not publish a green digest** unless both a real daily rollup and a
+real evo check ran on the fleet. Neither is available, so the fleet week
+is UNGRADED, including a post from an unattended routine. Do not skip
+ahead on "no RED day".
 
 ## Stage 2 — review (0–1 subagent)
 
@@ -64,29 +69,31 @@ For evolution findings, one read-only Explore agent (model sonnet)
 follows `.claude/skills/evo-debug/SKILL.md` — pass it the findings and
 the evidence map; it answers which gate blocked the Saturday run (or
 which phase the run died in), whether that is by-design or an outage,
-and the single operator action. RED days in the rollup are already
-explained inside their daily report file — read that file, don't re-run
-the checks.
+and the single operator action. Daily report files exist only where
+`daily_review.py` ran (this PC). A 🟢/🟡/🔴 day in those files is
+'this PC only, not the fleet verdict'. Don't re-run the checks.
 
 ## Stage 2b — evolution EFFICACY audit (every week, cheap; 2 agents when triggered)
 
 "Did the slot fire" (stage 1) is not "is evolution working". Every week
-also answer, from primary evidence only:
+also answer, from primary evidence only. Fleet files (`data/ai_usage.csv`, `data/live/<bot>/session.json`, debug logs) need an ssh read permitted per `start-here` §7; without it, use this PC's copies, labelled 'this PC only, not the fleet verdict'.
 
-1. **Attempt history** — `data/ai_usage.csv` (UTC; TPE = +8): per past
-   Saturday, plan rows (`bot_evolution`) vs candidate rows
-   (`evolution_codegen_*`). A Saturday with a plan but no codegen row =
-   plan said `no_change`; no rows at all = skip or app closed (check the
-   start line). Report the streak of Saturdays with no candidate.
+1. **Attempt history** — read `data/ai_usage.csv` at the ledger path the
+   brief names (UTC; TPE = +8): per past Saturday, plan rows
+   (`bot_evolution`) vs candidate rows (`evolution_codegen_*`). A Saturday
+   with a plan but no codegen row = plan said `no_change`. A ledger that
+   is missing, empty, or has no row in the review week is UNGRADED, never
+   a 'no candidate' streak. Count the streak only over Saturdays the
+   ledger covers (on or after its first row).
 2. **Verdict outcome** — the verdict block is NOT persisted anywhere
    local (the Tk chat auto-save only fires at window close, and the bot
-   token cannot read Discord history: HTTP 403). The only local trace is
-   the Discord send in the bot's debug log ~60-90s after the start line
-   with `msg_len` ≈ 1000-1500 (FAIL/PASS verdict); 112-130 = no_change,
+   token cannot read Discord history: HTTP 403). The only on-disk trace is
+   the Discord send in the data host's bot debug log ~60-90s after the
+   start line with `msg_len` ≈ 1000-1500 (FAIL/PASS verdict); 112-130 = no_change,
    ~200-300 = holdout / young-session skip. A PASS would also create
    `data/changelog.json` and an `...EvoN` entry in the strategy store.
 3. **P&L vs evolution** — weekly realized P&L (by exit date) of every
-   running non-regime bot for the last 8 weeks from
+   running non-regime bot for the last 8 weeks from the data host's
    `data/live/<bot>/session.json` broker.trades. Losing streak + zero
    candidates = the evolution loop is not doing its job, whatever the
    reason.
@@ -135,10 +142,11 @@ is by design.
 ## Stage 4 — publish
 
 Digest ≤1900 chars: `🧬 tai-robot weekly review — week of <TPE Saturday
-date> (Claude)`, then: whether Saturday's evolution ran and the phase it
-reached (plan / codegen / verdict, PASS or FAIL), per-bot watermark
+date> (Claude)`, then: the fleet evolution phase is UNGRADED until a
+real evo check ran on the fleet (do not fill PASS/FAIL from this PC), per-bot watermark
 movement, next-Saturday eligibility (any non-regime bot running?), the
-week's daily verdicts as a compact line (e.g. `Mon 🟢 Tue 🟡 …`), the
+week's fleet days as UNGRADED (not `Mon 🟢 Tue 🟡`). Any local this-PC
+🟢/🟡 day is labelled 'this PC only, not the fleet verdict'. Then the
 stage-2b efficacy line (candidate streak, PASS count, P&L trend, deep-audit
 verdict when it ran), and one recommended action if any. Delivery identical to `daily-review` stage 4
 (monitor channel via bot token when configured, else the news webhook;
@@ -153,5 +161,5 @@ evolve" are product decisions — present evidence, ask the user.
 ## Timing
 
 Evolution finishes by ~05:10 TPE Saturday. Run this **Saturday
-05:30–06:00 TPE = Friday ~14:30–15:00 local**. The scheduled task uses
-local time.
+05:30–06:00 TPE**; convert with `start-here` §4 (check `date +%z` / `Get-Date -Format K`).
+The scheduled task uses local time.

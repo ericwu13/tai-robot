@@ -1,13 +1,15 @@
 ---
 name: n8n-debug
-description: HISTORY ONLY (local n8n stopped since 2026-10-24; current W1-W4 are Steven scheduled tasks — use bridge-health) — self-serve diagnosis of the retired local n8n news-bridge instance (W1-W5 workflows) — find why a workflow failed, never fired, or isn't imported/active, without the user in the loop. Use when a bridge script errors, a vote/signal file is missing, a Discord alert didn't arrive, or an n8n workflow/execution needs inspecting.
+description: HISTORY ONLY (local n8n stopped since 2026-10-24; current W1-W4 are Steven scheduled tasks — use bridge-health). Archived diagnosis of the retired local n8n news-bridge (W1-W5): why a historical workflow failed, never fired, or was not imported. A live bridge-script error, a missing vote or signal file, or a Discord alert that did not arrive is bridge-health, not this skill.
 ---
 
 # n8n News-Bridge Debugging
 
-Everything here works **without the n8n UI, without the REST API key, and
+**History only — do not run.** Local n8n is retired; restarting it can double-run W1–W4 (see `bridge-health`). Current bridges are Steven scheduled tasks. The notes below are a record of that retired instance. Read-only DB and event-log queries may stay, and they are history-only.
+
+These notes describe the retired instance **without the n8n UI, without the REST API key, and
 without asking the user** — via the n8n SQLite DB (read-only), the event
-log, and the Windows service state. Start with the helper script; fall
+log, and the Windows service state, as it was. Historical reads start with the helper script; fall
 back to raw paths only if it can't answer.
 
 ## Rule zero — evidence before code
@@ -33,7 +35,7 @@ permanently saturates a threshold (外資 net OI −80k vs a 5k "strong"
 band) means the threshold was calibrated for a different quantity
 (delta vs level), not that the signal is strong.
 
-## The helper (tested — prefer it over ad-hoc queries)
+## The helper (history-only reads of the retired DB and event log)
 
 ```bash
 C:/Python313/python.exe .claude/skills/n8n-debug/scripts/n8n_query.py status
@@ -47,7 +49,7 @@ C:/Python313/python.exe .claude/skills/n8n-debug/scripts/n8n_query.py status
 | `detail <exec_id> --grep stdout` / `--all` | stdout or full dump of a (successful) run |
 | `events --pattern failed` | did the cron fire at all, in TPE timestamps |
 
-## Symptom → where to look
+## Symptom → where to look (history-only; a live bridge silence or missing vote → `bridge-health`)
 
 1. **"Workflow X failed" / Discord went quiet** →
    `status` → `execs --workflow X --errors` → `detail <newest id>`.
@@ -64,24 +66,20 @@ C:/Python313/python.exe .claude/skills/n8n-debug/scripts/n8n_query.py status
    HOUR = `GENERIC_TIMEZONE`/`TZ` envs lost from the service (memory:
    the OS clock is US Pacific, n8n needs Asia/Taipei pinned).
 4. **"Workflow not in the list at all"** → `status` shows every
-   `workflow_entity` row including ARCHIVED. Not there = never imported:
-   `n8n import:workflow --input=<repo>/scripts/news_bridge/n8n/<file>.json`
-   imports it **inactive**; activation is UI "Publish" (hot-reloads the
-   trigger, needs user login) — CLI/DB activation does NOT register the
-   trigger until a service restart.
+   `workflow_entity` row including ARCHIVED. Not there = never imported (historical fix: `n8n import:workflow --input=<repo>/scripts/news_bridge/n8n/<file>.json`; do not run).
 5. **Service dead / everything failing instantly** → `status` (PAUSED =
-   NSSM crash-loop throttle), then `C:\Users\eric8\n8n-bridge\n8n-service.log`.
+   NSSM crash-loop throttle), then `C:\Users\eric8\n8n-bridge\n8n-service.log` (do not restart).
 
 ## Known failure signatures (all previously seen live)
 
-| Evidence in `detail` / logs | Root cause → fix |
+| Evidence in `detail` / logs | Root cause → historical fix (do not run) |
 |---|---|
 | `ModuleNotFoundError: No module named 'yaml'/'feedparser'/'tzdata'` | Do not install into system site-packages. The monitor venv recipe is in `.claude/skills/regime-health/SKILL.md`: `C:\Users\eric8\.venvs\tai-monitor\Scripts\python.exe -m pip install holidays==0.105 python-dateutil PyYAML==6.0.3 six`. Checkers that import `src.market_data.holidays` run as `C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s`. `feedparser` and `tzdata` are not in that venv. n8n W4/W5 executeCommand nodes stay on `C:\Python313\python.exe` (LocalSystem, no `-s`). |
 | `'python' is not recognized` | executeCommand has no user PATH → absolute `C:\Python313\python.exe` in the workflow command |
-| Every executeCommand fails in ~7 ms, empty stderr | n8n's child-process spawning died → restart the service |
+| Every executeCommand fails in ~7 ms, empty stderr | n8n's child-process spawning died → do not restart the service |
 | `Unrecognized node type: n8n-nodes-base.executeCommand` | `NODES_EXCLUDE="[]"` env lost |
 | Cron fires at wrong TPE hour | `GENERIC_TIMEZONE` + `TZ` = Asia/Taipei missing |
-| `port 5678 is already in use` loop in n8n-service.log | orphan n8n process → kill it, restart service |
+| `port 5678 is already in use` loop in n8n-service.log | a local n8n is running (historical cause: orphan process). It can double-run W1–W4 with Steven's tasks: stop work and report it to Eric via Selina (see `bridge-health`); do not start or restart n8n |
 | `No encryption key found ... .n8n\.n8n\config` | `N8N_USER_FOLDER` must be `C:\Users\eric8` (parent), not `...\.n8n` |
 | Fresh empty DB / login rejects known account | same `.n8n\.n8n` folder bug |
 
@@ -93,7 +91,7 @@ prove nothing about the deployment env. Therefore, after ANY change to
 `scripts/news_bridge/*`:
 
 ```bash
-C:/Python313/python.exe -s <script> --dry-run   # or --once
+C:/Python313/python.exe -s <script> --dry-run   # or --once (do not run: executes a real cycle)
 ```
 
 `-s` on `C:/Python313/python.exe` replicates LocalSystem's package
@@ -102,7 +100,7 @@ visibility for news-bridge scripts. Those scripts do not import
 tai-monitor venv (regime-health). W4/W5 executeCommand nodes stay on
 `C:\Python313\python.exe`.
 
-## Paths & facts
+## Paths & facts (history-only)
 
 - DB: `C:\Users\eric8\.n8n\database.sqlite` — **read-only URI only**
   (`file:...?mode=ro`); never write while the service runs. Execution
@@ -114,10 +112,7 @@ tai-monitor venv (regime-health). W4/W5 executeCommand nodes stay on
 - `execution_data.data` is n8n's flattened JSON. Windows paths inside it
   contain literal `\n` sequences (`\news_bridge`, `\n8n-bridge`) — never
   "unescape" them; the helper already handles this.
-- Service control needs admin: `sudo` is Force-New-Window mode → wrap
-  with `sudo cmd /c "... > log 2>&1"` and read the log.
 - REST API exists but the `X-N8N-API-KEY` is not stored anywhere Claude
   can read — do not plan around it. UI actions (Publish, Archive) need
   the user logged in; everything diagnostic works without.
-- Restarting the service interrupts W2's 2-min night-tier polling — avoid
-  casual restarts while a night session is open (15:00–05:00 TPE).
+- Current W2 is a Steven scheduled task (`bridge-health`).

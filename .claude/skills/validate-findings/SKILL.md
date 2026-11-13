@@ -79,7 +79,7 @@ as permission to code.
   summary. Validate on the host that holds the evidence — the fleet is on
   Steven; a claim derived from this PC's `data\live` or local n8n is
   REFUTED as fleet evidence.
-- **Clock discipline**: this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there); TPE is +8. decisions.csv
+- **Clock discipline**: clocks → `start-here` §4. decisions.csv
   col 0 is the BOT host's local clock, `bar_dt` (col 1) is TPE. NTFS mtimes are
   local. Name the clock before comparing timestamps.
 - **Absence is evidence too**: verify a hypothesis by the line it

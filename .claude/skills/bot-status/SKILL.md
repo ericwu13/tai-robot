@@ -10,14 +10,32 @@ description: Check whether a deployed tai-robot bot process is actually alive an
 > run on **Steven**, not this PC. This PC's `data\live` holds only
 > retired/test bots and its n8n is stopped. Read live state from the
 > dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
-> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
-> describes this PC only — never publish it as fleet health. Host map →
-> `start-here`. Run checkers from an up-to-date checkout
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). Data host,
+> host naming and the no-scripts rule → `start-here` §7. A run of a
+> checker on this PC describes this PC only — never publish it as fleet
+> health. Host map → `start-here`. Run checkers from an up-to-date checkout
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
 
-One read-only command answers "is it alive":
+## The Steven fleet
+
+First command for "is the fleet alive?":
+
+```bash
+curl -s http://<Steven tailnet IP>:8765/api/fleet
+```
+
+Read `bots[].state`. The dashboard and
+`check_bots.classify_heartbeat` share:
+RUNNING = alive; LAGGING = heartbeat stale; HUNG = main loop stopped or a
+COM call stuck; NO_HEARTBEAT = PID alive but no usable heartbeat (needs
+attention, never "running"); CRASHED = dead lock PID on a recently
+active bot; STOPPED = no lock. `mode` ≠ `paper` (page badge 實單) is a
+real-order bot — say so before suggesting any stop/restart.
+
+## Fallback, this PC only
+
+For this PC's dirs, not the fleet:
 
 ```bash
 C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bots.py
@@ -26,16 +44,6 @@ C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bo
 (`-s` ignores user-site packages, so this interpreter sees the
 tai-monitor pins from the regime-health skill. Optional arg: a different
 `data/live` base directory.)
-
-## The Steven fleet
-
-`curl -s http://<Steven tailnet IP>:8765/api/fleet` → `bots[].state`. The
-dashboard and this script share `check_bots.classify_heartbeat`:
-RUNNING = alive; LAGGING = heartbeat stale; HUNG = main loop stopped or a
-COM call stuck; NO_HEARTBEAT = PID alive but no usable heartbeat (needs
-attention, never "running"); CRASHED = dead lock PID on a recently
-active bot; STOPPED = no lock. `mode` ≠ `paper` (page badge 實單) is a
-real-order bot — say so before suggesting any stop/restart.
 
 ## What it reads
 
@@ -82,7 +90,7 @@ Healthy vs unhealthy:
 - **Log silence in a closed gap is normal** — 13:46–14:59 and 05:01–08:44
   TPE, plus weekends and TAIFEX holidays. The helper only applies the
   10-minute freshness rule when `current_session(now)` is not None.
-- **Log stamps are TPE (+8); the OS clock is not** — this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there). Never
+- **Log stamps are TPE (+8); the OS clock is not** — clocks → `start-here` §4. Never
   compare a log timestamp against a naive `datetime.now()`.
 - The check is strictly read-only: it re-implements PID liveness rather
   than calling `LiveRunner.check_lock`, which DELETES stale locks.
@@ -91,5 +99,5 @@ Healthy vs unhealthy:
 
 - bot alive but not trading → `regime-health` (idle leg? news gate?)
 - bot dead → read the tail of its newest `debug_*.log`, then `log-scan`
-- needs restarting (paper/auto) → `deploy` (on Steven, via `tailscale-ssh`); semi_auto → `deploy-check` workbench recipe
+- needs restarting (paper/auto) → `deploy`; semi_auto → `deploy-check` workbench recipe
 - host map → `start-here`
