@@ -45,7 +45,14 @@ class TestSymbolConfig:
         assert SYMBOL_CONFIG["MTX00"]["pv"] == 50
 
     def test_tv_symbols(self):
+        # TradingView TAIFEX continuous contracts (checked 2026-11-08):
+        # TXF1! = 台指, MXF1! = 小台, TMF1! = 微台. IMF1! is an unrelated
+        # contract (close ~122, day session only) and must never be used.
         assert SYMBOL_CONFIG["TX00"]["tv"] == "TXF1!"
-        assert SYMBOL_CONFIG["MTX00"]["tv"] == "TMF1!"
+        assert SYMBOL_CONFIG["MTX00"]["tv"] == "MXF1!"
+        assert SYMBOL_CONFIG["TMF00"]["tv"] == "TMF1!"
+
+    def test_no_symbol_maps_to_imf1(self):
+        assert all(cfg["tv"] != "IMF1!" for cfg in SYMBOL_CONFIG.values())
 
 

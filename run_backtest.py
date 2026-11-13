@@ -110,6 +110,7 @@ from src.ai.code_sandbox import (
 )
 from src.ai.strategy_store import StrategyStore
 from src.ai.pine_exporter import export_to_pine
+from src.ai import review_payload
 
 # Code generation max output tokens.  Strategies are typically <300 lines,
 # so 16K output tokens is plenty.  Lower cap keeps the per-call price low
@@ -129,6 +130,7 @@ from src.live.account_monitor import (
     open_interest_query_rejected,
 )
 from src.live.connection_monitor import ConnectionMonitor
+from src.live.broker_port import DEFAULT_BROKER_MODE, require_inprocess
 from src.live.com_broker_port import ComBrokerPort
 from src.live.link_host import adopt_after_process_login
 from src.live.link_state_machine import KIND_CONN_ERROR, KIND_READY, LinkPhase
@@ -809,6 +811,18 @@ def _persist_evolution_history(bot_dir, **fields) -> None:
                  f"[{type(exc).__name__}] {exc}")
         except Exception:
             pass
+    # One history line per attempt = the attempt reached an end. Close the
+    # persisted Saturday slot unless that end is a retryable infrastructure
+    # failure (pipeline_error, grid_failed, no_chat_client).
+    try:
+        from src.evolution.notify import finish_weekly_slot_for
+        finish_weekly_slot_for(bot_dir, str(fields.get("reason_kind") or ""))
+    except Exception as exc:
+        try:
+            _log("evolution weekly slot close failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
 
 
 def _evolution_bot_dir(app) -> str | None:
@@ -1089,6 +1103,49 @@ _tick_queue: queue.Queue = queue.Queue()
 _ui_queue: queue.Queue = queue.Queue()
 
 
+def _live_com_libs():
+    """COM objects, read on each call so a test can replace the globals."""
+    return skC, skQ, skR, skO
+
+
+def _live_com_call(name, fn, *args, **kwargs):
+    """Late-bind ``call_com`` so a monkeypatch of this module is seen."""
+    return call_com(name, fn, *args, **kwargs)
+
+
+def _app_broker_credentials() -> tuple[str, str]:
+    """The app port does not log in. The link machine has its own port.
+
+    Raising means ``_broker.login()`` cannot send empty credentials.
+    Process-start login uses ``login_set_quote`` and never calls this.
+    """
+    raise RuntimeError(
+        "the app broker has no credentials; "
+        "process-start login uses login_set_quote")
+
+
+def _build_inprocess_broker() -> ComBrokerPort:
+    """The one in-process port. ``broker_mode`` other than inprocess raises.
+
+    The mode is the code constant. ``_load_settings`` does not store it,
+    and settings.yaml is not read for it.
+    """
+    require_inprocess(DEFAULT_BROKER_MODE)
+    return ComBrokerPort(
+        call=_live_com_call,
+        libs=_live_com_libs,
+        credentials=_app_broker_credentials,
+        on_subscribe=lambda: None,
+        on_reconcile=lambda: None,
+        on_release=lambda: None,
+        ui_queue=lambda: _ui_queue,
+        tick_queue=lambda: _tick_queue,
+    )
+
+
+_broker = _build_inprocess_broker()
+
+
 
 
 
@@ -1260,16 +1317,10 @@ def _notify_reply_silent(message: str) -> None:
 def _stamped_return_lookup(code):
     """Vendor text for an unknown code. Stamped, and only when asked.
 
-    Known codes never reach this. The attribute is resolved here so the
-    call site is ``call_com``, not a raw main-thread COM call.
+    Known codes never reach this. The port resolves the attribute and
+    stamps ``GetReturnCodeMessage``. A missing center does not call SKCOM.
     """
-    center = skC
-    if center is None:
-        return None
-    fn = getattr(center, "SKCenterLib_GetReturnCodeMessage", None)
-    if not callable(fn):
-        return None
-    return call_com("GetReturnCodeMessage", fn, code)
+    return _broker.return_code_message(code)
 
 
 def _return_code_text(code) -> str:
@@ -1329,7 +1380,7 @@ def _route_to_log_widget(line: str, level: str = "info") -> None:
 def _safe_event_put(item) -> None:
     """Queue one COM event. A full queue must not raise into the sink."""
     try:
-        _ui_queue.put_nowait(item)
+        _broker.enqueue_ui(item)
     except Exception as exc:
         _log_reply_error(
             f"[CONN] event queue failed: [{type(exc).__name__}] {exc}")
@@ -1406,15 +1457,18 @@ class SKQuoteLibEvents:
                 return
             if _app._live_warmup_mode:
                 _log(f"暖機完成 Warmup KLine complete: {len(_app._live_warmup_data)} bars, code={nCode}")
-                _app.root.after(100, _app._on_live_warmup_complete)
+                _broker.schedule_on_main(
+                    _app.root, 100, _app._on_live_warmup_complete)
             elif _app._live_polling:
                 _log(f"即時輪詢完成 Live poll complete: {len(_app._live_poll_data)} bars, code={nCode}")
-                _app.root.after(100, _app._on_live_poll_complete)
+                _broker.schedule_on_main(
+                    _app.root, 100, _app._on_live_poll_complete)
             else:
                 chunk_n = _app._fetcher.chunk_bar_count
                 total_n = _app._fetcher.total_bar_count
                 _log(f"K線完成 KLine complete: chunk={chunk_n} bars, total={total_n}, code={nCode}")
-                _app.root.after(100, _app._on_chunk_complete)
+                _broker.schedule_on_main(
+                    _app.root, 100, _app._on_chunk_complete)
         except Exception as exc:
             _log_event_failure("OnKLineComplete", exc)
 
@@ -1427,8 +1481,8 @@ class SKQuoteLibEvents:
         # Minimal work on COM thread — just enqueue raw data.
         # Accessing Python objects (like _app) from COM thread crashes GIL in 3.13.
         try:
-            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                    nBid, nAsk, nClose, nQty, nSimulate, True))
+            _broker.enqueue_tick((lDate, lTimehms, lTimemillismicros,
+                                  nBid, nAsk, nClose, nQty, nSimulate, True))
         except Exception as exc:
             _log_event_failure("OnNotifyHistoryTicksLONG", exc)
 
@@ -1436,8 +1490,8 @@ class SKQuoteLibEvents:
                           lDate, lTimehms, lTimemillismicros,
                           nBid, nAsk, nClose, nQty, nSimulate, *_extra):
         try:
-            _tick_queue.put_nowait((lDate, lTimehms, lTimemillismicros,
-                                    nBid, nAsk, nClose, nQty, nSimulate, False))
+            _broker.enqueue_tick((lDate, lTimehms, lTimemillismicros,
+                                  nBid, nAsk, nClose, nQty, nSimulate, False))
         except Exception as exc:
             _log_event_failure("OnNotifyTicksLONG", exc)
 
@@ -2320,8 +2374,7 @@ class BacktestApp:
             # A new query, same as the account refresh. The generation
             # moves forward so this reply cannot complete a later deploy.
             self._account_monitor.begin_oi_query()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, account, 1)
+            _broker.get_open_interest(user_id, account, 1)
         except Exception as e:
             _log(f"[RECONNECT] reconcile raised: [{type(e).__name__}] {e}")
 
@@ -2446,8 +2499,7 @@ class BacktestApp:
             if _com_available and skQ:
                 try:
                     for mkt in (2, 7, 9):
-                        call_com("RequestStockList",
-                                 skQ.SKQuoteLib_RequestStockList, mkt)
+                        _broker.request_stock_list(mkt)
                 except Exception as e:
                     _log(f"商品資料重載失敗 Commodity reload failed: {e}")
             self._resubscribe_ticks()
@@ -2490,7 +2542,7 @@ class BacktestApp:
         self._first_tick_after_request_logged = False
 
         try:
-            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, com_symbol)
+            result = _broker.request_ticks(0, com_symbol)
             code = result[0] if isinstance(result, (list, tuple)) else result
             _log_debug(
                 f"[TICKS] RequestTicks({com_symbol}) returned {code} — "
@@ -2565,7 +2617,7 @@ class BacktestApp:
         self._evo_fetch_cb = None  # Callable[[bool], None] | None
         # (ISO year, week) of the last weekly auto-evolution run — the 30s
         # poll fires the post-close pipeline exactly once per week.
-        self._weekly_evo_done: tuple | None = None
+        self._weekly_evo_done: str | None = None  # TPE ISO week key
 
         # Live trading state
         self._live_chart: LiveChart | None = None
@@ -4331,8 +4383,7 @@ class BacktestApp:
         return int(self._read_is_connected_by_id(user_id))
 
     def _read_is_connected_by_id(self, user_id: str):
-        return call_com(
-            "IsConnectedByID", skR.SKReplyLib_IsConnectedByID, user_id)
+        return _broker.read_is_connected_by_id(user_id)
 
     def _connect_reply_for_poll(self, user_id: str):
         """One ConnectByID from the poller, through the machine port.
@@ -4486,17 +4537,16 @@ class BacktestApp:
 
             log_dir = os.path.join(project_root, "CapitalLog_Backtest")
             os.makedirs(log_dir, exist_ok=True)
-            skC.SKCenterLib_SetLogPath(log_dir)
+            _broker.set_log_path(log_dir)
 
             if authority_flag:
-                skC.SKCenterLib_SetAuthority(authority_flag)
+                _broker.set_authority(authority_flag)
 
             _log(f"登入中 Logging in as {_redact_acct(user_id)}...")
             self.set_status("登入中 Logging in...")
             self.login_status_var.set("登入中...")
 
-            code = call_com("LoginSetQuote", skC.SKCenterLib_LoginSetQuote,
-                            user_id, password, "Y")
+            code = _broker.login_set_quote(user_id, password, "Y")
             if code != 0 and not (2000 <= code < 3000):
                 msg = _return_code_text(code)
                 _log(f"登入失敗 LOGIN FAILED: code={code} {msg}")
@@ -4513,20 +4563,19 @@ class BacktestApp:
             _log(f"登入成功 LOGIN OK (code={code})")
             self.login_status_var.set("登入成功 Logged in")
 
-            reply_code = call_com(
-                "ConnectByID", skR.SKReplyLib_ConnectByID, user_id)
+            reply_code = _broker.connect_by_id(user_id)
             _log_connect_by_id_result(reply_code)
             # Timers only. A failure here must not abort the rest of login.
             self._arm_reply_channel_watch(user_id)
-            code = call_com("EnterMonitorLONG", skQ.SKQuoteLib_EnterMonitorLONG)
+            code = _broker.enter_monitor_long()
             _log(f"進入報價監控 EnterMonitorLONG: code={code}")
 
             # Initialize order service for real trading
             if skO is not None:
                 try:
-                    call_com("SKOrderLib_Initialize", skO.SKOrderLib_Initialize)
-                    call_com("ReadCertByID", skO.ReadCertByID, user_id)
-                    call_com("GetUserAccount", skO.GetUserAccount)
+                    _broker.initialize_order()
+                    _broker.read_cert(user_id)
+                    _broker.get_user_account()
                     _log("委託服務初始化 Order service initialized (cert verified)")
                 except Exception as e:
                     _log(f"委託服務初始化失敗 Order service init failed: {e}")
@@ -4546,7 +4595,7 @@ class BacktestApp:
 
     def _check_connection(self):
         try:
-            ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+            ic = _broker.is_quote_connected()
             if ic == 1:
                 self._set_quote_connected(True, "_check_connection(IsConnected==1)")
                 self.btn_api.config(state=tk.NORMAL)
@@ -4625,8 +4674,7 @@ class BacktestApp:
              f"{chunk.start_date}~{chunk.end_date} min={chunk.minute_num}")
 
         try:
-            code = call_com(
-                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
+            code = _broker.request_kline(
                 chunk.kline_symbol, chunk.kline_type, chunk.session,
                 chunk.trade_session, chunk.start_date, chunk.end_date,
                 chunk.minute_num)
@@ -5787,38 +5835,8 @@ class BacktestApp:
     _REVIEW_CHUNK_BATCH_SIZE = 1500
 
     def _build_review_timeframe_line(self, strategy_cls) -> str:
-        """Return the Strategy Timeframe + Timezone note for AI Review prompts.
-
-        Explicit here so the AI does not mis-infer the bar interval from
-        session-aligned :45 timestamps (e.g. 09:45/10:45/13:45 for 60-min
-        AM bars can look like 15-min bars to a naive reader).
-        """
-        timeframe_line = ""
-        if strategy_cls is not None:
-            kt = getattr(strategy_cls, "kline_type", 0)
-            km = getattr(strategy_cls, "kline_minute", 0)
-            if kt == 0 and km:
-                if km % 60 == 0:
-                    label = f"{km // 60}-hour ({km}-minute)"
-                else:
-                    label = f"{km}-minute"
-                timeframe_line = (
-                    f"策略時框 Strategy Timeframe: {label} bars "
-                    f"(kline_type={kt}, kline_minute={km})\n"
-                )
-            elif kt == 4:
-                timeframe_line = f"策略時框 Strategy Timeframe: Daily bars (kline_type={kt})\n"
-            elif kt == 5:
-                timeframe_line = f"策略時框 Strategy Timeframe: Weekly bars (kline_type={kt})\n"
-            elif kt == 6:
-                timeframe_line = f"策略時框 Strategy Timeframe: Monthly bars (kline_type={kt})\n"
-        timeframe_line += (
-            "時區 Timezone: 所有 entry/exit 時間皆為台灣時間 (TWT/UTC+8)。\n"
-            "All entry/exit timestamps are Taiwan time (TWT/UTC+8). "
-            "Bars are TAIFEX session-aligned, so 60-minute AM bars may carry "
-            ":45 timestamps (08:45–13:45 session) — these are NOT 15-minute bars.\n"
-        )
-        return timeframe_line
+        """Strategy Timeframe + Timezone note (see ``review_payload``)."""
+        return review_payload.review_timeframe_line(strategy_cls)
 
     def _resolve_strategy_source(self, strategy_name: str, strategy_cls) -> str:
         """Resolve the strategy source code for the AI Review context."""
@@ -5865,64 +5883,14 @@ class BacktestApp:
         # Detect degradation vs previous review round
         cur_pf = result.metrics.profit_factor
         cur_dd = result.metrics.max_drawdown_pct
-        degradation_section = ""
-        if self._last_review_metrics is not None:
-            prev_pf = self._last_review_metrics["pf"]
-            prev_dd = self._last_review_metrics["dd_pct"]
-            pf_worse = cur_pf < prev_pf
-            dd_worse = cur_dd > prev_dd
-            if pf_worse or dd_worse:
-                degradation_section = (
-                    f"## ⚠ DEGRADATION DETECTED — REVERT FIRST ⚠\n"
-                    f"Previous review metrics: PF={prev_pf:.2f}, DD={prev_dd:.2f}%\n"
-                    f"Current metrics:         PF={cur_pf:.2f}, DD={cur_dd:.2f}%\n"
-                    f"{'  → Profit Factor DROPPED' if pf_worse else ''}"
-                    f"{'  → Max Drawdown INCREASED' if dd_worse else ''}\n\n"
-                    f"**MANDATORY**: The last change made things worse. Your ONLY "
-                    f"recommendation must be to REVERT the last change and return to "
-                    f"the previous version. Do NOT suggest new changes on top of a "
-                    f"degraded strategy. Do NOT try to fix the degradation by adding "
-                    f"more complexity. Say: \"上一次的修改使績效惡化，建議還原到修改前的版本。"
-                    f"The last change degraded performance — revert to the prior version "
-                    f"before attempting any new changes.\"\n"
-                    f"The ONLY exception is if you identify an obvious code BUG (e.g. "
-                    f"wrong operator, missing round()) that clearly caused the "
-                    f"degradation — in that case, suggest fixing that specific bug only.\n\n"
-                )
+        degradation_section = review_payload.degradation_section(
+            self._last_review_metrics, cur_pf, cur_dd)
 
         # Save current metrics for next review round comparison
         self._last_review_metrics = {"pf": cur_pf, "dd_pct": cur_dd}
 
-        preamble = (
-            f"以下是回測/實盤結果，請根據策略原始碼分析交易表現。\n"
-            f"Below are the backtest/live results. Analyze the trading performance.\n\n"
-            f"{degradation_section}"
-            f"## Analysis rules (MUST FOLLOW)\n"
-            f"1. **Identify what is WORKING first** — list 2-3 aspects that should NOT be changed.\n"
-            f"2. **Suggest at most ONE change** — never multiple simultaneous changes. "
-            f"Each change must be tested in isolation before adding the next.\n"
-            f"3. **Distinguish bugs from tuning** — a code bug (wrong comparison, missing round()) "
-            f"is a fix. Changing parameters or adding filters is tuning. Fix bugs first; "
-            f"tune ONE parameter at a time only.\n"
-            f"4. **MANDATORY: winner/loser impact count** — before suggesting ANY filter, "
-            f"condition, or parameter change, you MUST scan the trade list and estimate:\n"
-            f"   - How many LOSING trades would the change remove/avoid?\n"
-            f"   - How many WINNING trades would the change also remove/avoid?\n"
-            f"   - Present this as: \"Estimated impact: removes ~N losers, ~M winners\"\n"
-            f"   - If you cannot estimate (e.g. insufficient data), say so explicitly "
-            f"and do NOT recommend the change. A suggestion without impact analysis is "
-            f"not allowed.\n"
-            f"5. **Bias toward simplicity** — adding indicators, conditions, or parameters "
-            f"rarely improves robustness. If the strategy has >4 entry conditions, "
-            f"suggest REMOVING one before adding another.\n"
-            f"6. **No fabricated statistics** — do not invent expected win rates or "
-            f"improvements. Say \"建議回測驗證 / backtest to verify\" instead.\n"
-            f"7. **If metrics are acceptable** (PF > 1.3, DD < 25%, WR > 40%), "
-            f"say so and suggest NOT changing the strategy. Over-optimization is the "
-            f"#1 cause of strategy degradation.\n\n"
-            f"{report}\n\n"
-            f"{timeframe_line}\n"
-        )
+        preamble = review_payload.review_preamble(
+            report, timeframe_line, degradation_section)
 
         self._dispatch_trade_analysis(
             preamble, trade_lines, source_section, len(result.trades),
@@ -5947,27 +5915,9 @@ class BacktestApp:
         timeframe_line = self._build_review_timeframe_line(strategy_cls)
         strategy_source = self._resolve_strategy_source(strategy_name, strategy_cls)
 
-        source_section = ""
-        if strategy_source:
-            source_section = (
-                f"\n\n策略原始碼 Strategy Source Code:\n"
-                f"```python\n{strategy_source}\n```"
-            )
-
-        # Build ALL trade lines — no arbitrary cap. Modern LLMs with 1M context
-        # handle thousands of rows; chunked mode handles the rest.
-        trade_lines = []
-        for i, t in enumerate(result.trades, 1):
-            bars_held = t.exit_bar_index - t.entry_bar_index
-            entry_dt = t.entry_dt or f"bar#{t.entry_bar_index}"
-            exit_dt = t.exit_dt or f"bar#{t.exit_bar_index}"
-            src_mark = " [real]" if getattr(t, "source", "") == "real" else ""
-            trade_lines.append(
-                f"  {i}. {t.side.value} {t.tag}: "
-                f"entry={entry_dt} @{t.entry_price:,} → "
-                f"exit={exit_dt} @{t.exit_price:,} "
-                f"P&L={t.pnl:+,} ({bars_held} bars){src_mark}"
-            )
+        source_section = review_payload.source_section(strategy_source)
+        # ALL trade lines — no arbitrary cap; chunked mode handles size.
+        trade_lines = review_payload.trade_lines(result.trades)
         return result, report, timeframe_line, source_section, trade_lines
 
     def _dispatch_trade_analysis(self, preamble: str, trade_lines: list[str],
@@ -6006,12 +5956,8 @@ class BacktestApp:
                                      label: str = "AI Review: 請分析以下交易紀錄",
                                      call_site: str = "trade_review") -> None:
         """Send the full AI Review in a single API call."""
-        context = (
-            preamble
-            + f"交易明細 Trade Details ({total_trades} trades):\n"
-            + "\n".join(trade_lines)
-            + source_section
-        )
+        context = review_payload.single_shot_context(
+            preamble, trade_lines, source_section, total_trades)
 
         self._append_chat("user", label + "\n" + context)
         self.btn_send.config(state=tk.DISABLED)
@@ -6319,6 +6265,7 @@ class BacktestApp:
                         final_status=final_status,
                         reason_kind=reason_kind,
                         reason=reason,
+                        verdict_text=reason,
                         ai_calls=0,
                     )
                     fields.update(extra)
@@ -7010,17 +6957,12 @@ class BacktestApp:
                     eligible_for_validated_pool,
                     month_gate_config_from_mapping)
                 from src.evolution.paper_gate import (
-                    WeekRecord,
                     abs_pf_required,
                     assemble_promotion_verdict,
-                    assess_retirement,
-                    emit_retire_recommendation,
                     evolution_gate_config_from_mapping,
                     evolution_promotion_mode,
                     gate_provenance,
-                    relative_eval_summary,
                     resolve_promotion_gate,
-                    weeks_from_changelog,
                 )
                 bars = evo_data["bars"]
                 data_origin = evo_data["origin"]
@@ -7039,6 +6981,10 @@ class BacktestApp:
                 plan = ""
                 directives = None
                 history_written = False
+                # Candidate code and class, set once Phase 2 builds them.
+                # _remember stores the code (FAILs too) for forward re-scoring.
+                code = ""
+                candidate_cls = None
 
                 def _remember(final_status, reason_kind, reason="", **extra):
                     # One record per attempt. Building the gate blocks and
@@ -7075,6 +7021,13 @@ class BacktestApp:
                             pass
                     history_written = True
                     try:
+                        # The full operator-visible text (Discord cuts it).
+                        extra.setdefault("verdict_text", reason)
+                        if code and "candidate_source" not in extra:
+                            extra["candidate_source"] = code
+                        if candidate_cls is not None:
+                            extra.setdefault(
+                                "candidate_name", candidate_cls.__name__)
                         _persist_evolution_history(
                             bot_dir,
                             bot=display_name,
@@ -7114,6 +7067,61 @@ class BacktestApp:
                         _log("EVO structural proposal record failed: "
                              f"[{type(e).__name__}] {e}")
                         return ""
+
+                def _resolve_evo_gate():
+                    # Decision time, not a start-of-run snapshot. Running
+                    # runner: its trading_mode. Idle or missing: configured
+                    # mode only — unknown stays unknown (absolute gate).
+                    cfg = evolution_gate_config_from_mapping(evolution_gate_raw)
+                    runner = getattr(self, "_live_runner", None)
+                    runner_idle = (
+                        runner is None
+                        or getattr(runner, "state", None) == LiveState.IDLE)
+                    promotion_mode = evolution_promotion_mode(
+                        runner=runner,
+                        runner_idle=runner_idle,
+                        configured_mode=getattr(self, "_trading_mode", None),
+                    )
+                    gate = resolve_promotion_gate(
+                        promotion_mode,
+                        cfg.paper_gate,
+                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
+                    )
+                    return cfg, gate
+
+                def _incumbent_trades() -> list:
+                    # The incumbent's own trades on the validation bars
+                    # (one continuous run, as the multi-fold baseline).
+                    try:
+                        side = run_ab_backtest(
+                            baseline_cls, bars, point_value, "基準 baseline",
+                            capital_base=capital_base)
+                        res = getattr(side, "result", None)
+                        return list(res.trades) if res is not None else []
+                    except Exception as e:
+                        _log("EVO retire baseline backtest failed: "
+                             f"[{type(e).__name__}] {e}")
+                        return []
+
+                def _retire_review(gate_mode, verdict_passed, gate_cfg, trades):
+                    from src.evolution.retire_review import run_retire_review
+                    return run_retire_review(
+                        base_trades=trades,
+                        strategy_name=display_name,
+                        version=(baseline_cls.__name__ if baseline_cls
+                                 else "Strategy"),
+                        gate_mode=gate_mode,
+                        verdict_passed=verdict_passed,
+                        retire_config=gate_cfg.retire,
+                        structural_ledger=(structural_ledger or str(
+                            BacktestApp._structural_ledger_path(self))),
+                        # Unchanged rule: the lane's own run, or a ledger
+                        # file this run was pointed at that exists.
+                        run_followup=bool(structural_lane or (
+                            structural_ledger
+                            and os.path.exists(structural_ledger))),
+                        log=_log,
+                    )
 
                 try:
                     # ── Phase 1: grid search, or the evolution plan ──
@@ -7217,10 +7225,31 @@ class BacktestApp:
                                 "Nothing was consumed: the watermark did NOT "
                                 "advance.\n"
                                 + "\n".join(grid_outcome.reasons))
+                            # The grid scored its settings and none beat the
+                            # incumbent: under the relative gate that is a
+                            # failed Saturday for the #188 "not improvable"
+                            # streak, so the retire check runs here too (it
+                            # used to be skipped by this early return). A grid
+                            # that never got to score (no bars, too few folds,
+                            # baseline backtest failed, knobs unreadable) is a
+                            # data problem and records no week.
+                            _np_extra: dict = {}
+                            if grid_outcome.evaluated:
+                                _np_cfg, _np_gate = _resolve_evo_gate()
+                                _np_review = _retire_review(
+                                    _np_gate.mode, False, _np_cfg,
+                                    _incumbent_trades())
+                                if _np_review.report_lines:
+                                    msg += "\n" + "\n".join(
+                                        _np_review.report_lines)
+                                _np_extra = dict(
+                                    retire_evaluated=(_np_gate.mode == "relative"),
+                                    retire_passed=False,
+                                    ts=_np_review.evaluated_at)
                             ui(self._append_chat, "system", msg)
                             if auto_run:
                                 _notify_discord(msg)
-                            _remember("fail", "grid_no_pick", msg)
+                            _remember("fail", "grid_no_pick", msg, **_np_extra)
                             return
                         plan = grid_outcome.rationale
                         directives = {
@@ -7570,31 +7599,13 @@ class BacktestApp:
                         f"({len(bars)} × {feed_iv // 60}min bars "
                         f"≈ {native_est} native bars)")
 
-                    evo_gate_cfg = evolution_gate_config_from_mapping(
-                        evolution_gate_raw)
+                    evo_gate_cfg, evo_gate = _resolve_evo_gate()
                     for warning in evo_gate_cfg.warnings:
                         _log(f"EVO gate config: {warning}")
                     month_gate_cfg = month_gate_config_from_mapping(
                         evolution_gate_raw)
                     for warning in month_gate_cfg.warnings:
                         _log(f"EVO month gate config: {warning}")
-                    # Decision time, not a start-of-run snapshot. Running
-                    # runner: its trading_mode. Idle or missing: configured
-                    # mode only — unknown stays unknown (absolute gate).
-                    runner = getattr(self, "_live_runner", None)
-                    runner_idle = (
-                        runner is None
-                        or getattr(runner, "state", None) == LiveState.IDLE)
-                    promotion_mode = evolution_promotion_mode(
-                        runner=runner,
-                        runner_idle=runner_idle,
-                        configured_mode=getattr(self, "_trading_mode", None),
-                    )
-                    evo_gate = resolve_promotion_gate(
-                        promotion_mode,
-                        evo_gate_cfg.paper_gate,
-                        str((evolution_gate_raw or {}).get("real_gate") or "absolute"),
-                    )
                     from src.evolution.paper_gate import gate_for_trial
                     # Walk-forward uses the fallback (absolute when this run
                     # has no grid trial). assemble_promotion_verdict applies
@@ -7964,87 +7975,13 @@ class BacktestApp:
                                   "and STRATEGIES was not updated.")
                     # Recommend-only. A failure here must not change the verdict
                     # or the pool promotion above, and must not touch live state.
-                    evaluated_at = None
-                    try:
-                        append_changelog = None
-                        prior_weeks = []
-                        try:
-                            from src.daily_report.changelog import (
-                                append_changelog as _append_changelog,
-                                load_changelog,
-                            )
-                            append_changelog = _append_changelog
-                            prior_weeks = weeks_from_changelog(
-                                load_changelog(), display_name)
-                        except Exception as hist_err:
-                            _log("EVO retire history unread: "
-                                 f"[{type(hist_err).__name__}] {hist_err}")
-                        evaluated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                        weeks = list(prior_weeks)
-                        if evo_gate.mode == "relative":
-                            weeks.append(WeekRecord(
-                                at=evaluated_at, evaluated=True,
-                                passed=bool(verdict.passed)))
-                            if append_changelog is not None:
-                                try:
-                                    append_changelog(
-                                        strategy_name=display_name,
-                                        version_before=base_cls_name,
-                                        version_after=base_cls_name,
-                                        change_summary=relative_eval_summary(
-                                            bool(verdict.passed), evaluated_at),
-                                        initiated_by="ai",
-                                    )
-                                except Exception as rec_err:
-                                    _log("EVO relative-gate record failed: "
-                                         f"[{type(rec_err).__name__}] {rec_err}")
-                        _grad_stamps: list[str] = []
-                        try:
-                            from src.evolution.structural_lane import (
-                                applied_graduation_stamps, load_ledger)
-                            _grad_stamps = applied_graduation_stamps(
-                                load_ledger(structural_ledger or str(
-                                    BacktestApp._structural_ledger_path(self))))
-                        except Exception as stamp_err:
-                            _log("EVO graduation stamps unread: "
-                                 f"[{type(stamp_err).__name__}] {stamp_err}")
-                            _grad_stamps = []
-                        rec = assess_retirement(
-                            base_trades,
-                            weeks=weeks,
-                            structural_graduations=_grad_stamps,
-                            now=datetime.now(),
-                            config=evo_gate_cfg.retire,
-                        )
-                        report_lines: list[str] = []
-                        emit_retire_recommendation(
-                            rec,
-                            log=_log,
-                            changelog=(append_changelog if rec.recommend else None),
-                            report=report_lines,
-                            strategy_name=display_name,
-                            version=base_cls_name,
-                        )
-                        if structural_lane or (
-                                structural_ledger and os.path.exists(
-                                    structural_ledger)):
-                            from src.evolution.structural_lane import (
-                                structural_saturday_followup)
-                            structural_saturday_followup(
-                                structural_ledger or str(
-                                    BacktestApp._structural_ledger_path(self)),
-                                observations=(),
-                                log=_log,
-                                changelog=append_changelog,
-                                report=report_lines,
-                                strategy_name=display_name,
-                                version=base_cls_name,
-                            )
-                        if report_lines:
-                            block += "\n" + "\n".join(report_lines)
-                    except Exception as retire_err:
-                        _log("EVO retire recommendation failed: "
-                             f"[{type(retire_err).__name__}] {retire_err}")
+                    # Shared with the grid no-pick exit (src/evolution/retire_review.py).
+                    _review = _retire_review(
+                        evo_gate.mode, bool(verdict.passed), evo_gate_cfg,
+                        base_trades)
+                    evaluated_at = _review.evaluated_at
+                    if _review.report_lines:
+                        block += "\n" + "\n".join(_review.report_lines)
                     ui(self._remove_last_system_line)
                     ui(self._append_chat, "system", block)
                     if _proposal_notice:
@@ -8099,6 +8036,7 @@ class BacktestApp:
                         candidate_source=code or "",
                         candidate_name=candidate_cls.__name__,
                         baseline_name=base_cls_name,
+                        verdict_text=block,
                     )
                     _evolution_history_sealed()
                 except Exception as e:
@@ -8752,15 +8690,24 @@ class BacktestApp:
                             f"({real_reason}) — NOT re-arming. "
                             "Manual review required.",
                             "status")
-        self._arm_resumed_fill_poll(
-            outcome, real_ok=real_ok, real_reason=real_reason)
+        # Restore the ledger before the poller can confirm. A synchronous
+        # already-flat exit otherwise runs confirm_latest on an empty registry.
+        # Paper does not resume the ledger: a fresh deploy stays flat.
         if trading_mode in ("semi_auto", "auto"):
             self._position_log_resume(symbol)
+        self._arm_resumed_fill_poll(
+            outcome, real_ok=real_ok, real_reason=real_reason)
 
     def _position_log_resume(self, symbol: str) -> None:
-        """RESUME record for a clean restart. Never raises."""
+        """Load the journal, then append one RESUME line if the inputs exist.
+
+        Replay runs before the price, symbol, and net reads. A failure
+        there is logged and skips the display line only. The restored
+        orders and fills stay. Called for semi_auto and auto, not paper.
+        """
         if getattr(self, "_position_ledger", None) is None:
             return
+        self._position_log("recover")
         try:
             broker = self._live_runner.broker
             net = (self._position_log_net()
@@ -9117,8 +9064,8 @@ class BacktestApp:
                 # New generation. clear_positions() must not be what drops
                 # the previous answer; only this query can complete it.
                 self._account_monitor.begin_oi_query()
-                code = call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                                user_id, self._futures_account, 1)
+                code = _broker.get_open_interest(
+                    user_id, self._futures_account, 1)
                 _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
                 if open_interest_query_rejected(code):
                     self._predeploy_oi_failed = True
@@ -9325,7 +9272,7 @@ class BacktestApp:
                 # Query multiple market types to find TMF order codes
                 # 2=期貨T盤, 7=期貨全盤, 9=客製化期貨
                 for mkt in (2, 7, 9):
-                    rc = call_com("RequestStockList", skQ.SKQuoteLib_RequestStockList, mkt)
+                    rc = _broker.request_stock_list(mkt)
                     if isinstance(rc, int) and rc != 0:
                         _log(f"商品列表查詢 RequestStockList({mkt}) code={rc}")
             except Exception as e:
@@ -9483,8 +9430,7 @@ class BacktestApp:
              f"min={kline_minute} {start_str}~{end_str}")
 
         try:
-            code = call_com(
-                "RequestKLineAMByDate", skQ.SKQuoteLib_RequestKLineAMByDate,
+            code = _broker.request_kline(
                 kline_sym, kline_type, 1, 0, start_str, end_str, kline_minute)
             if code != 0:
                 msg = _return_code_text(code)
@@ -9645,7 +9591,7 @@ class BacktestApp:
         sym_note = f" (via {tick_sym})" if tick_sym != symbol else ""
         self._live_log_msg(f"訂閱即時報價 Subscribing to ticks: {symbol}{sym_note}...", "status")
         try:
-            result = call_com("RequestTicks", skQ.SKQuoteLib_RequestTicks, 0, tick_sym)
+            result = _broker.request_ticks(0, tick_sym)
             # COM may return (code, stockIdx) tuple or just an int
             if isinstance(result, (list, tuple)):
                 code = result[0]
@@ -9927,7 +9873,12 @@ class BacktestApp:
         force-close and final daily report are done, the market is
         quiet, and the week's data is complete. Latched per ISO week so
         the 30s poll fires it exactly once; a bot deployed later on
-        Saturday still gets its run on the first post-deploy poll.
+        Saturday still gets its run on the first post-deploy poll. The
+        latch is also a file in the bot directory (``started`` → ``done``
+        when the attempt's history line is written), so restarting the bot
+        after a finished run does not run the pipeline a second time,
+        while a run that died (or ended on a retryable infrastructure
+        error) is retried once ``SLOT_STARTED_GUARD_S`` has passed.
         """
         if not self._settings.get("evolution_auto_pipeline", True):
             return
@@ -9935,15 +9886,28 @@ class BacktestApp:
             return
         if hasattr(self._live_runner, 'on_status_poll'):
             return
-        from src.evolution.notify import is_post_close_evolution_window
-        if not is_post_close_evolution_window():
+        from src.evolution import notify as _evo_notify
+        if not _evo_notify.is_post_close_evolution_window():
             return
         if is_market_open():
             return  # safety: never compete with a live session
-        week_key = _taipei_now().isocalendar()[:2]
+        now = _taipei_now()
+        week_key = _evo_notify.weekly_slot_key(now)
         if self._weekly_evo_done == week_key:
             return
+        bot_dir = getattr(self._live_runner, "bot_dir", None)
+        if _evo_notify.weekly_slot_taken(bot_dir, week_key, now=now):
+            # Not latched in memory: a "started" slot inside its guard
+            # window is retried by a later poll once the window passes.
+            if getattr(self, "_weekly_evo_skip_logged", None) != week_key:
+                self._weekly_evo_skip_logged = week_key
+                self._live_log_msg(
+                    f"🧬 本週自動演化已執行或正在執行（{week_key}），重啟後不重跑。"
+                    f"Weekly auto-evolution for {week_key} already finished "
+                    "or may still be running; not starting another.", "status")
+            return
         self._weekly_evo_done = week_key
+        _evo_notify.mark_weekly_slot(bot_dir, week_key, now=now)
         self._live_log_msg(
             "🧬 週末自動演化 Weekly auto-evolution (post-close) starting...",
             "status")
@@ -10046,7 +10010,7 @@ class BacktestApp:
             # is treated as noise and the ladder is allowed to continue.
             if _com_available:
                 try:
-                    ic = call_com("IsConnected", skQ.SKQuoteLib_IsConnected)
+                    ic = _broker.is_quote_connected()
                 except Exception as e:
                     ic = None
                     _log_debug(
@@ -10510,7 +10474,11 @@ class BacktestApp:
             try:
                 if name == "GetOpenInterestGW":
                     monitor.begin_oi_query()
-                code = call_com(name, getattr(skO, name), user_id, self._futures_account, 1)
+                    code = _broker.get_open_interest(
+                        user_id, self._futures_account, 1)
+                else:
+                    code = _broker.get_future_rights(
+                        user_id, self._futures_account, 1)
             except Exception as e:
                 _log(f"[MODE REQUEST] {name} failed: [{type(e).__name__}] {e}")
                 self._finish_mode_request(
@@ -11204,9 +11172,7 @@ class BacktestApp:
                  f"price={oOrder.bstrPrice}({price_label}) qty=1 newclose={nc}({nc_label}) reserved=0")
 
             # Synchronous send — returns immediately for IOC market orders
-            message, code = call_com(
-                "SendFutureOrderCLR", skO.SendFutureOrderCLR,
-                user_id, False, oOrder)
+            message, code = _broker.place_order(user_id, oOrder, False)
             _log(f"REAL ORDER RESULT: code={code} message={message}")
 
             if code == 0:
@@ -11250,7 +11216,10 @@ class BacktestApp:
                         _log(f"REAL ORDER SEQ stamp failed: {exc}")
                 self._position_log(
                     "register_order", str(message), action_type, buy_sell, 1,
-                    order_symbol)
+                    order_symbol,
+                    oi_generation=getattr(
+                        getattr(self, "_account_monitor", None),
+                        "oi_query_generation", None))
                 if _discord and _discord.enabled:
                     _discord.order_sent(side_str, order_symbol, price_label,
                                         sim_price, str(message),
@@ -11430,8 +11399,8 @@ class BacktestApp:
         # confirm, or the 10s timeout downgrades the bot.
         try:
             user_id = self.login_user_var.get().strip()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, self._futures_account, 1)
+            _broker.get_open_interest(
+                user_id, self._futures_account, 1)
         except Exception as e:
             _log(f"FILL POLL: GetOpenInterestGW error: {e}")
 
@@ -11728,8 +11697,7 @@ class BacktestApp:
             return 0, False
         try:
             user_id = self.login_user_var.get().strip()
-            fills_raw = call_com(
-                "GetFulfillReport", skO.GetFulfillReport,
+            fills_raw = _broker.get_fulfill_report(
                 user_id, self._futures_account, 1)
         except Exception as exc:
             _log(f"EXIT FILL POLL: GetFulfillReport(1) error: {exc}")
@@ -12117,8 +12085,7 @@ class BacktestApp:
         self._equity_refresh_sent = True
         user_id = self.login_user_var.get().strip()
         try:
-            code = call_com(
-                "GetFutureRights", skO.GetFutureRights,
+            code = _broker.get_future_rights(
                 user_id, self._futures_account, 1)
         except Exception as exc:
             self._note_equity_refresh_failed(
@@ -12190,10 +12157,10 @@ class BacktestApp:
             # Latest query only. clear_positions() does not drop an
             # answer that already landed for the current generation.
             self._account_monitor.begin_oi_query()
-            call_com("GetOpenInterestGW", skO.GetOpenInterestGW,
-                     user_id, self._futures_account, 1)
-            call_com("GetFutureRights", skO.GetFutureRights,
-                     user_id, self._futures_account, 1)  # 1=TWD
+            _broker.get_open_interest(
+                user_id, self._futures_account, 1)
+            _broker.get_future_rights(
+                user_id, self._futures_account, 1)  # 1=TWD
         except Exception as e:
             _log(f"帳戶查詢失敗 Account query error: {e}")
 
@@ -12650,18 +12617,11 @@ def register_com_events() -> None:
         return
     import comtypes.client
     quote_event = SKQuoteLibEvents()
-    _com_event_handlers.append(quote_event)
-    _com_event_handlers.append(
-        _bind_event_sink("quote", skQ, quote_event, comtypes.client.GetEvents))
     reply_event = SKReplyLibEvent()
-    _com_event_handlers.append(reply_event)
-    _com_event_handlers.append(
-        _bind_event_sink("reply", skR, reply_event, comtypes.client.GetEvents))
-    if skO is not None:
-        order_event = SKOrderLibEvents()
-        _com_event_handlers.append(order_event)
-        _com_event_handlers.append(
-            _bind_event_sink("order", skO, order_event, comtypes.client.GetEvents))
+    order_event = SKOrderLibEvents() if skO is not None else None
+    _broker.attach_events(
+        _com_event_handlers, quote_event, reply_event, order_event,
+        _bind_event_sink, comtypes.client.GetEvents)
 
 
 def main():

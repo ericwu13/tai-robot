@@ -1,17 +1,20 @@
 """``GET /position-log/<bot_id>`` — the bot's own position log, read-only.
 
-Reads ``<bot_dir>/position_log.jsonl`` (written by
-``src/live/position_log.py``) through ``fileio`` so the bot's appends are
-never blocked. The account number is masked to its last 4 digits, as the
-dashboard does everywhere else; nothing else is altered.
+Reads at most ``_TAIL_BYTES`` from the end of
+``<bot_dir>/position_log.jsonl`` via :func:`read_records`. Every event in
+that window is projected to a logical #250 record, and ``limit`` then
+keeps the last that many logical rows. Trailing ORDER lines do not hide
+an earlier fill that is still inside the window. ``bot_position`` is
+``bot_position_after`` from those fills, never the account net. The
+account number is masked to its last 4 digits, as the dashboard does
+everywhere else.
 """
 from __future__ import annotations
 
-import json
 import os
 
 from scripts.dashboard import fileio
-from src.live.position_log import POSITION_LOG_NAME, is_mismatch
+from src.live.position_log import POSITION_LOG_NAME, is_mismatch, read_records
 
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 2000
@@ -32,19 +35,13 @@ def mask_account(account) -> str:
 def position_log(bot_dir: str, bot_id: str, limit: int = DEFAULT_LIMIT) -> dict:
     path = os.path.join(bot_dir, POSITION_LOG_NAME)
     records = []
-    for line in fileio.tail_lines(path, clamp_limit(limit), _TAIL_BYTES):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(rec, dict):
-            continue
-        rec["account"] = mask_account(rec.get("account"))
-        rec["mismatch"] = is_mismatch(rec)
-        records.append(rec)
+    for rec in read_records(
+            path, clamp_limit(limit), max_bytes=_TAIL_BYTES,
+            opener=fileio.open_shared):
+        view = dict(rec)
+        view["account"] = mask_account(view.get("account"))
+        view["mismatch"] = is_mismatch(view)
+        records.append(view)
     last = records[-1] if records else None
     mismatches = [r for r in records if r["mismatch"]]
     return {

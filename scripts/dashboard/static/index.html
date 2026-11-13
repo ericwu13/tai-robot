@@ -104,6 +104,7 @@ button:hover, select:hover { border-color: var(--muted); }
 .detail-head h2 { margin: 0; font-size: 20px; }
 .chart { height: 380px; }
 .chart.small { height: 160px; }
+.chart.pnl-chart { height: 220px; }
 .section-title { font-weight: 700; padding: 10px 14px; border-bottom: 1px solid var(--line);
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .grid2 { display: grid; gap: 16px; margin-top: 16px; }
@@ -265,6 +266,18 @@ table.mini td.why { white-space: normal; min-width: 160px; }
   #wf td.res::before, #chips-days td.why::before { content: none; }
   .chips-head .num { font-size: 22px; }
 }
+/* 損益走勢 charts. */
+details.pnl > summary { cursor: pointer; list-style: none; }
+details.pnl > summary::-webkit-details-marker { display: none; }
+details.pnl > summary::before { content: "▸"; color: var(--muted); }
+details.pnl[open] > summary::before { content: "▾"; }
+.pnl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; font-size: 12px; color: var(--muted); font-weight: 400; }
+.pnl-legend .sw { display: inline-block; width: 18px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+.pnl-legend .sw.sim { border-top-style: dashed; border-color: var(--muted); }
+.pnl-legend .sw.real { border-image: linear-gradient(90deg, var(--up) 50%, var(--down) 50%) 1; }
+.pnl-legend .hover { color: var(--text); }
+.filter-chip { display: inline-flex; gap: 6px; align-items: center; padding: 1px 8px; border-radius: 6px;
+  background: var(--ok-bg); color: var(--ok); font-size: 12px; font-weight: 700; cursor: pointer; }
 [hidden] { display: none !important; }
 
 /* Phone: the fleet table becomes one card per bot, no sideways scroll. */
@@ -306,6 +319,12 @@ table.mini td.why { white-space: normal; min-width: 160px; }
 
   <section id="fleet-view">
     <div class="tiles" id="tiles"></div>
+    <details class="panel pnl" id="f-pnl-box" style="margin-bottom:16px">
+      <summary class="section-title"><span>全隊損益走勢（每交易日累計）</span>
+        <span class="pnl-legend" id="f-pnl-legend"></span></summary>
+      <div class="chart pnl-chart" id="f-pnl"></div>
+      <div class="empty" id="f-pnl-empty" hidden>尚無已平倉交易</div>
+    </details>
     <div class="toolbar">
       <label><input type="checkbox" id="show-retired"> 顯示已停用的機器人</label>
       <span class="legend">點選任一列查看圖表、交易與日誌。損益顏色：紅＝獲利、綠＝虧損。</span>
@@ -423,7 +442,8 @@ table.mini td.why { white-space: normal; min-width: 160px; }
         <span>K 線</span>
         <span class="seg" id="d-iv">
           <button data-iv="60">1分</button><button data-iv="300">5分</button>
-          <button data-iv="900">15分</button><button data-iv="3600">60分</button>
+          <button data-iv="900">15分</button><button data-iv="1800">30分</button>
+          <button data-iv="3600">60分</button>
         </span>
         <span class="legend">▲ 進場　▼ 出場（時間為台北時間）　往左拖曳載入更早的 K 線</span>
         <span class="legend" id="d-band-legend" hidden>底部色帶＝盤勢：<span class="rg up">趨勢向上</span> <span class="rg down">趨勢向下</span> <span class="rg range">盤整</span> <span class="rg trans">轉換中</span></span>
@@ -431,6 +451,13 @@ table.mini td.why { white-space: normal; min-width: 160px; }
       </div>
       <div class="chart" id="d-chart"></div>
       <div class="empty" id="d-chart-empty" hidden>沒有 K 線資料</div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <div class="section-title"><span>損益走勢（每交易日累計）</span>
+        <span class="pnl-legend" id="d-pnl-legend"></span>
+        <span class="legend">點選任一點只看該交易日的交易</span></div>
+      <div class="chart pnl-chart" id="d-pnl"></div>
+      <div class="empty" id="d-pnl-empty" hidden>尚無已平倉交易</div>
     </div>
     <div class="grid2">
       <div class="panel">
@@ -812,6 +839,17 @@ function sparkline(points) {
   svg.append(title, line, dot);
   return svg;
 }
+// 損益走勢: lightweight-charts business-day time ↔ "YYYY-MM-DD".
+function bdayKey(t) {
+  if (!t) return null;
+  if (typeof t === "string") return t;
+  if (typeof t === "object" && t.year) {
+    const z = (n) => String(n).padStart(2, "0");
+    return `${t.year}-${z(t.month)}-${z(t.day)}`;
+  }
+  return null;
+}
+function signed(v) { return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, (v > 0 ? "+" : "") + fmtInt(v || 0)); }
 
 function tile(k, v) { return el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)); }
 function td(label, content, cls) { return el("td", { class: cls || "", data: { label } }, content); }
@@ -820,7 +858,7 @@ const App = {
   fleet: null, lastOk: 0, current: null, detail: null, chart: null, candles: null,
   equityChart: null, equity: null, band: null, iv: 60, fitNext: true,
   bars: [], markers: [], oldestDay: null, newestDay: null, hasMore: false,
-  loadingOlder: false, barsLoaded: false, newsOpen: false, news: null,
+  loadingOlder: false, barsLoaded: false, pnl: null, fleetPnl: null, tradeSession: null, newsOpen: false, news: null,
 
   // Controls: a confirm dialog, then one POST; the bot applies it from its
   // own STOP / mode_override.json polling, and the pending chip shows the
@@ -950,6 +988,47 @@ const App = {
   // Trades are newest-first, so everything closed this trading day sits at the
   // top: one 本交易日 header above them carrying the real-only subtotal, one 先前
   // header below. Both are dropped when the split would leave a side empty.
+  // The trade table: one trading day when the 損益走勢 chart selected it,
+  // else the 本交易日 / 先前 grouping.
+  tradeListRows(d) {
+    if (this.tradeSession) {
+      const sel = this.tradeSession;
+      const rows = d.trades.filter((t) => t.session === sel);
+      const clear = el("span", { class: "filter-chip", onclick: () => this.setTradeSession(null) },
+        `${sel} 交易日（${rows.length} 筆）✕`);
+      return [el("tr", { class: "grp" }, el("td", { colspan: "9" }, "篩選：", clear)),
+        ...(rows.length ? this.tradeRowsPlain(rows)
+          : [el("tr", null, el("td", { colspan: "9", class: "empty" }, "此交易日的交易不在最近的清單內"))])];
+    }
+    return this.tradeRows(d);
+  },
+
+  setTradeSession(session) {
+    this.tradeSession = session;
+    if (session) {
+      for (const b of $("d-tabs").children) b.classList.toggle("on", b.dataset.tab === "trades");
+      for (const p of document.querySelectorAll("[data-pane]")) p.hidden = p.dataset.pane !== "trades";
+    }
+    if (this.detail) $("d-trades").tBodies[0].replaceChildren(...this.tradeListRows(this.detail));
+    this.drawPnl();
+  },
+
+  tradeRowsPlain(trades) { return trades.map((t) => this.tradeRow(t)); },
+
+  tradeRow(t) {
+    return el("tr", null,
+      el("td", { class: t.side === "LONG" ? "up" : "down" }, SIDE[t.side] || t.side),
+      el("td", null, t.entry_dt.slice(0, 16)),
+      el("td", { class: "num" }, priceCell(t.entry_price, t.real_entry_price)),
+      el("td", null, t.exit_dt.slice(0, 16)),
+      el("td", { class: "num" }, t.exit_price ? priceCell(t.exit_price, t.real_exit_price) : "—"),
+      el("td", { class: "num" }, money(t.pnl)),
+      el("td", { class: "num" }, tradeRealCell(t)),
+      el("td", null, EXIT_TAG[t.exit_tag] || t.exit_tag || "—"),
+      el("td", null, SOURCE[t.source] || t.source || "—"),
+    );
+  },
+
   tradeRows(d) {
     const trades = d.trades;
     if (!trades.length) {
@@ -968,17 +1047,7 @@ const App = {
     const r = (d.bot && d.bot.real) || null;
     const head = (label, ...extra) => el("tr", { class: "grp" },
       el("td", { colspan: "9" }, label, ...extra));
-    const row = (t) => el("tr", null,
-      el("td", { class: t.side === "LONG" ? "up" : "down" }, SIDE[t.side] || t.side),
-      el("td", null, t.entry_dt.slice(0, 16)),
-      el("td", { class: "num" }, priceCell(t.entry_price, t.real_entry_price)),
-      el("td", null, t.exit_dt.slice(0, 16)),
-      el("td", { class: "num" }, t.exit_price ? priceCell(t.exit_price, t.real_exit_price) : "—"),
-      el("td", { class: "num" }, money(t.pnl)),
-      el("td", { class: "num" }, tradeRealCell(t)),
-      el("td", null, EXIT_TAG[t.exit_tag] || t.exit_tag || "—"),
-      el("td", null, SOURCE[t.source] || t.source || "—"),
-    );
+    const row = (t) => this.tradeRow(t);
     if (!n || !older.length) return trades.map(row);
     const sub = r && r.trades_today_real
       ? el("span", { class: "sub" }, "　實單 ", money(r.pnl_today_real),
@@ -1456,10 +1525,11 @@ const App = {
       this.fitNext = true; this.ivInit = true;
       this.bars = []; this.markers = []; this.oldestDay = null; this.newestDay = null;
       this.hasMore = false; this.barsLoaded = false; this.equityFitted = false;
-      this.detail = null;
+      this.detail = null; this.pnl = null; this.tradeSession = null;
       this.refreshDetail().then(() => this.loadBars("initial"));
+      this.refreshPnl();
     }
-    else if (this.fleet) this.renderFleet();
+    else if (this.fleet) { this.renderFleet(); this.refreshFleetPnl(); }
     window.scrollTo(0, 0);
   },
 
@@ -1557,11 +1627,12 @@ const App = {
       ...realTiles(b.real),
     );
     this.renderRegime(d.regime);
-    if (this.ivInit) { if ([60, 300, 900, 3600].includes(b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
+    // Open on the bot's own timeframe when the selector offers it.
+    if (this.ivInit) { if ([...$("d-iv").children].some((btn) => Number(btn.dataset.iv) === b.interval_s)) this.iv = b.interval_s; this.ivInit = false; }
     for (const btn of $("d-iv").children) btn.classList.toggle("on", Number(btn.dataset.iv) === this.iv);
     this.drawEquity();
 
-    $("d-trades").tBodies[0].replaceChildren(...this.tradeRows(d));
+    $("d-trades").tBodies[0].replaceChildren(...this.tradeListRows(d));
 
     $("d-decisions").tBodies[0].replaceChildren(...(d.decisions.length ? d.decisions.map((r) => el("tr", null,
       el("td", null, r.bar_dt),
@@ -1637,6 +1708,135 @@ const App = {
 
   css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); },
 
+  // 損益走勢: one chart object per container. Real = solid baseline, red
+  // above 0 / green below (紅漲綠跌). Sim = dashed, the same colours muted.
+  makePnlChart(container, onClick) {
+    if (!window.LightweightCharts) return null;
+    const chart = LightweightCharts.createChart(container, {
+      layout: { background: { color: this.css("--panel") }, textColor: this.css("--muted"),
+        fontFamily: getComputedStyle(document.body).fontFamily },
+      grid: { vertLines: { visible: false }, horzLines: { color: this.css("--line") } },
+      rightPriceScale: { borderColor: this.css("--line"), scaleMargins: { top: 0.12, bottom: 0.12 } },
+      // minBarSpacing lets fitContent show every session on a phone; drag
+      // (not the wheel, which must keep scrolling the page) pans.
+      timeScale: { borderColor: this.css("--line"), minBarSpacing: 0.5 },
+      localization: { locale: "zh-TW", priceFormatter: (p) => fmtInt(Math.round(p)) },
+      handleScroll: { mouseWheel: false, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+      handleScale: false, autoSize: true,
+    });
+    const up = this.css("--up"), down = this.css("--down");
+    const base = { baseValue: { type: "price", price: 0 },
+      topFillColor1: "transparent", topFillColor2: "transparent",
+      bottomFillColor1: "transparent", bottomFillColor2: "transparent",
+      priceLineVisible: false, lastValueVisible: false };
+    const sim = chart.addBaselineSeries({ ...base, lineWidth: 1, lineStyle: 2,
+      topLineColor: this.rgba(up, 0.45), bottomLineColor: this.rgba(down, 0.45) });
+    const real = chart.addBaselineSeries({ ...base, lineWidth: 2,
+      topLineColor: up, bottomLineColor: down, lastValueVisible: true });
+    const box = { chart, sim, real, points: [] };
+    // The container's final width arrives after first paint (a just-opened
+    // <details>, a phone layout). Re-fit to it so every session stays in view.
+    // Next frame: the chart's own autoSize observer applies the new width
+    // after this callback, so fitting here would use the old one.
+    if (window.ResizeObserver) new ResizeObserver(() => requestAnimationFrame(() => {
+      if (box.points.length) chart.timeScale().fitContent();
+    })).observe(container);
+    chart.subscribeCrosshairMove((param) => this.pnlHover(box, bdayKey(param && param.time)));
+    if (onClick) chart.subscribeClick((param) => {
+      const key = bdayKey(param && param.time);
+      if (key) onClick(key);
+    });
+    return box;
+  },
+
+  // Fill one chart; ``legendId`` gets the totals, hover replaces them.
+  fillPnl(box, points, legendId, emptyId, chartId, selected) {
+    $(emptyId).hidden = points.length > 0;
+    $(chartId).hidden = points.length === 0;
+    box.points = points; box.legendId = legendId;
+    if (!points.length) { $(legendId).replaceChildren(); return; }
+    // Solid line: both fill prices trusted (real > 0). The legend is wider —
+    // any real order, including estimated / unreliable / missing.
+    const hasRealLine = points.some((p) => p.real > 0);
+    const anyReal = points.some((p) => p.real + p.estimated + p.unreliable + p.missing > 0);
+    box.anyReal = anyReal;
+    box.sim.setData(points.map((p) => ({ time: p.session, value: p.sim_cumulative })));
+    box.real.setData(hasRealLine ? points.map((p) => ({ time: p.session, value: p.real_cumulative })) : []);
+    const marks = [];
+    const cur = points.find((p) => p.is_current);
+    // inBar: a marker above/below the line reserves margin, and on a short
+    // chart that margin can exceed the plot height and flip the scale.
+    if (cur) marks.push({ time: cur.session, position: "inBar", shape: "circle", size: 0.6,
+      color: this.css("--ok"), text: "本交易日" });
+    if (selected && points.some((p) => p.session === selected)) marks.push({ time: selected,
+      position: "inBar", shape: "square", size: 0.6, color: this.css("--warn"), text: "篩選中" });
+    marks.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+    (hasRealLine ? box.real : box.sim).setMarkers(marks);
+    (hasRealLine ? box.sim : box.real).setMarkers([]);
+    // A chart built inside a just-opened <details> has no width yet; fit on
+    // the next frame, after layout.
+    box.chart.timeScale().fitContent();
+    requestAnimationFrame(() => box.chart.timeScale().fitContent());
+    this.pnlHover(box, null);
+  },
+
+  pnlHover(box, key) {
+    const pts = box.points || [];
+    if (!box.legendId || !pts.length) return;
+    const p = (key && pts.find((x) => x.session === key)) || pts[pts.length - 1];
+    const excluded = pts.reduce((a, x) => a + x.estimated + x.unreliable + x.missing, 0);
+    const kids = [
+      el("span", { class: key ? "hover" : "" }, key ? `${p.session} 交易日` : `累計至 ${p.session}`),
+      el("span", { title: "自本次部署起：只含這次部署的 session.json，重新部署後從零開始" }, "自本次部署起"),
+      el("span", null, el("span", { class: "sw sim" }), "模擬 ", signed(p.sim_cumulative),
+        key ? el("span", null, "（該交易日 ", signed(p.sim_pnl), `，${p.trades} 筆）`) : null),
+    ];
+    if (box.anyReal) {
+      kids.push(el("span", { title: "只計入進出場皆有實際成交價的交易（real）" },
+        el("span", { class: "sw real" }), "實單 ", signed(p.real_cumulative),
+        key ? el("span", null, "（該交易日 ", signed(p.real_pnl), `，${p.real} 筆）`) : null));
+      kids.push(el("span", { title: "含估算＝缺一邊成交價時以模擬價代替（實單累計磚的算法）" },
+        "含估算 ", signed(p.real_est_cumulative)));
+      if (excluded) kids.push(el("span", { title: "估算、不可信、缺成交價的實單交易不畫在實單線上" },
+        `未計入實單線：估算 ${pts.reduce((a, x) => a + x.estimated, 0)}・不可信 ${pts.reduce((a, x) => a + x.unreliable, 0)}・缺價 ${pts.reduce((a, x) => a + x.missing, 0)}`));
+    } else {
+      kids.push(el("span", null, "無可確認成交價的實單"));
+    }
+    $(box.legendId).replaceChildren(...kids);
+  },
+
+  async refreshPnl() {
+    const id = this.current;
+    if (!id) return;
+    try {
+      const pts = await this.getJson("/pnl-history/" + encodeURIComponent(id));
+      if (id !== this.current) return;
+      this.pnl = pts;
+      this.drawPnl();
+    } catch (e) { /* the banner is driven by /api/bot */ }
+  },
+
+  drawPnl() {
+    if (!this.pnl || !window.LightweightCharts) return;
+    if (!this.pnlChart) this.pnlChart = this.makePnlChart($("d-pnl"), (key) =>
+      this.setTradeSession(this.tradeSession === key ? null : key));
+    if (this.pnlChart) this.fillPnl(this.pnlChart, this.pnl, "d-pnl-legend", "d-pnl-empty", "d-pnl", this.tradeSession);
+  },
+
+  async refreshFleetPnl() {
+    if (!$("f-pnl-box").open || this.current) return;
+    try {
+      this.fleetPnl = await this.getJson("/pnl-history/fleet" + ($("show-retired").checked ? "?retired=1" : ""));
+      this.drawFleetPnl();
+    } catch (e) { /* the banner is driven by /api/fleet */ }
+  },
+
+  drawFleetPnl() {
+    if (!this.fleetPnl || !window.LightweightCharts || !$("f-pnl-box").open) return;
+    if (!this.fleetPnlChart) this.fleetPnlChart = this.makePnlChart($("f-pnl"), null);
+    if (this.fleetPnlChart) this.fillPnl(this.fleetPnlChart, this.fleetPnl, "f-pnl-legend", "f-pnl-empty", "f-pnl", null);
+  },
+
   ensureCharts() {
     if (this.chart || !window.LightweightCharts) return !!this.chart;
     const base = () => ({
@@ -1672,7 +1872,8 @@ const App = {
   },
 
   onChartsReady() {
-    if (this.detail) { this.drawCharts(); this.drawEquity(); }
+    if (this.detail) { this.drawCharts(); this.drawEquity(); this.drawPnl(); }
+    this.drawFleetPnl();
     if (this.pulse) this.drawNewsChart();
   },
 
@@ -1701,10 +1902,13 @@ const App = {
     const out = [];
     let cur = null;
     for (const b of bars) {
-      // Buckets start at the session open (08:45 day, 15:00 night), like BarAggregator.
+      // Buckets start at the session open, a port of src.market_data.sessions.session_align
+      // (what BarAggregator uses): 08:45 for [08:45, 13:45), 15:00 from 15:00, and the
+      // previous day's 15:00 for every other minute (after midnight and off-hours).
       const mod = ((b.time % 86400) + 86400) % 86400;
-      const nightEarly = mod < 5 * 3600;
-      const anchor = b.time - mod + (mod >= 15 * 3600 ? 15 * 3600 : nightEarly ? -9 * 3600 : 8 * 3600 + 45 * 60);
+      const dayOpen = 8 * 3600 + 45 * 60, dayClose = 13 * 3600 + 45 * 60, nightOpen = 15 * 3600;
+      const anchor = b.time - mod + (mod >= dayOpen && mod < dayClose ? dayOpen
+        : mod >= nightOpen ? nightOpen : nightOpen - 86400);
       const t = anchor + Math.floor((b.time - anchor) / iv) * iv;
       if (!cur || cur.time !== t) {
         if (cur) out.push(cur);
@@ -1747,7 +1951,7 @@ const App = {
 
   // Open on roughly the latest trading day; older ones are a drag away.
   showRecent(bars) {
-    const span = { 60: 300, 300: 200, 900: 96, 3600: 40 }[this.iv] || 100;
+    const span = { 60: 300, 300: 200, 900: 96, 1800: 60, 3600: 40 }[this.iv] || 100;
     const last = bars.length - 1;
     this.chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, last - span), to: last + 3 });
   },
@@ -1766,6 +1970,12 @@ const App = {
     $("show-retired").addEventListener("change", (e) => {
       try { localStorage.setItem("showRetired", e.target.checked ? "1" : "0"); } catch (err) {}
       this.renderFleet();
+      this.refreshFleetPnl();
+    });
+    try { $("f-pnl-box").open = localStorage.getItem("fleetPnlOpen") === "1"; } catch (e) {}
+    $("f-pnl-box").addEventListener("toggle", () => {
+      try { localStorage.setItem("fleetPnlOpen", $("f-pnl-box").open ? "1" : "0"); } catch (e) {}
+      this.refreshFleetPnl();
     });
     $("back").addEventListener("click", () => { location.hash = ""; });
     $("btn-stop").addEventListener("click", () => this.confirmControl("stop"));
@@ -1797,6 +2007,7 @@ const App = {
     this.refreshFleet().then(() => this.route());
     setInterval(() => this.refreshFleet(), 5000);
     setInterval(() => this.refreshDetail(), 10000);
+    setInterval(() => { this.refreshPnl(); this.refreshFleetPnl(); }, 60000);
     setInterval(() => this.refreshNews(), 60000);
     setInterval(() => this.refreshWorkflows(), 30000);
     setInterval(() => this.renderUpdated(), 1000);

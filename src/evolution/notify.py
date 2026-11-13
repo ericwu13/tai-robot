@@ -170,6 +170,141 @@ def is_post_close_evolution_window(now: datetime | None = None) -> bool:
     return now.weekday() == 5 and (now.hour, now.minute) >= (5, 5)
 
 
+# ── Weekly slot latch ──
+# The 30 s poll fires the Saturday pipeline once per ISO week. An
+# in-memory latch alone let every bot restart later that Saturday run
+# the pipeline again (Steven, 2026-10-31 08:08 and 2026-11-07 06:14), so
+# the latch is also kept on disk next to the watermark. One small file
+# per bot; separate from evolution.json for the same reason as the
+# watermark (save_baseline rewrites that file wholesale).
+#
+# Two states:
+#   started — written when the pipeline begins. A run that dies before
+#             its history line (crash, hang-kill, failed API fetch) leaves
+#             it, and a restart retries once SLOT_STARTED_GUARD_S passed.
+#   done    — written with the attempt's history line (any terminal
+#             status, skips included), unless the attempt ended on a
+#             RETRYABLE_REASON_KINDS infrastructure error.
+WEEKLY_SLOT_FILENAME = "evolution_weekly_slot.json"
+SLOT_STARTED = "started"
+SLOT_DONE = "done"
+# One run's worst case: the grid child's hard cap (grid_process
+# DEFAULT_GRID_TIMEOUT_S = 20 min) + the Capital API fetch (~33 chunks)
+# + plan / codegen calls with their transient retries + validation
+# backtests. Observed runs take 1-4 min per bot (Steven 2026-11-07
+# 05:05:25-05:09:17). Inside this window a "started" slot is treated as
+# a run that may still be live, so a quick restart never starts a second
+# AI-backed attempt on top of it; after it, the dead run is retried.
+SLOT_STARTED_GUARD_S = 45 * 60
+# History reason kinds that mean "the pipeline never got to judge":
+# an exhausted Gemini 503 / any exception (pipeline_error), a grid child
+# that timed out or crashed (grid_failed), no chat client. They keep the
+# slot open so a restart retries the week.
+RETRYABLE_REASON_KINDS = frozenset({"pipeline_error", "grid_failed", "no_chat_client"})
+_SLOT_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _tpe(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(_TZ_TAIPEI)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=_TZ_TAIPEI)
+    return now.astimezone(_TZ_TAIPEI)
+
+
+def weekly_slot_key(now: datetime | None = None) -> str:
+    """``YYYY-Www`` of the TPE ISO week. Naive ``now`` is TPE wall-clock."""
+    year, week, _ = _tpe(now).isocalendar()
+    return f"{year:04d}-W{week:02d}"
+
+
+def weekly_slot_path(bot_dir: str | os.PathLike) -> str:
+    return os.path.join(os.fspath(bot_dir), WEEKLY_SLOT_FILENAME)
+
+
+def _read_slot(bot_dir) -> dict | None:
+    if not bot_dir:
+        return None
+    try:
+        with open(weekly_slot_path(bot_dir), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_slot(bot_dir, data: dict) -> bool:
+    if not bot_dir:
+        return False
+    try:
+        if not os.path.isdir(os.fspath(bot_dir)):
+            return False
+        path = weekly_slot_path(bot_dir)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        logger.warning("evolution weekly slot write failed: [%s] %s",
+                       type(exc).__name__, exc)
+        return False
+
+
+def weekly_slot_taken(bot_dir, key: str, now: datetime | None = None,
+                      guard_s: int = SLOT_STARTED_GUARD_S) -> bool:
+    """True when this bot must not start week ``key`` now.
+
+    ``done`` for ``key`` → True. ``started`` for ``key`` younger than
+    ``guard_s`` → True (a run may still be live). Anything else —
+    missing / unreadable file, another week, a stale ``started``, an
+    unparseable stamp — → False (run).
+    """
+    data = _read_slot(bot_dir)
+    if not data or str(data.get("week", "")) != key:
+        return False
+    state = str(data.get("state", ""))
+    if state == SLOT_DONE:
+        return True
+    if state != SLOT_STARTED:
+        return False
+    try:
+        began = datetime.strptime(str(data.get("at", "")), _SLOT_AT_FORMAT)
+    except ValueError:
+        return False
+    age = (_tpe(now) - began.replace(tzinfo=_TZ_TAIPEI)).total_seconds()
+    return 0 <= age < guard_s
+
+
+def mark_weekly_slot(bot_dir, key: str, now: datetime | None = None) -> bool:
+    """Record that ``key`` has STARTED for this bot. Never raises.
+
+    The bot directory is not created. False on any failure; the caller
+    keeps its in-memory latch, so a disk error never silences a run.
+    """
+    return _write_slot(bot_dir, {
+        "week": key, "state": SLOT_STARTED,
+        "at": _tpe(now).strftime(_SLOT_AT_FORMAT)})
+
+
+def complete_weekly_slot(bot_dir, now: datetime | None = None) -> bool:
+    """Flip a ``started`` slot to ``done``. No file or not started → no-op."""
+    data = _read_slot(bot_dir)
+    if not data or data.get("state") != SLOT_STARTED:
+        return False
+    return _write_slot(bot_dir, {
+        "week": str(data.get("week", "")), "state": SLOT_DONE,
+        "started_at": str(data.get("at", "")),
+        "at": _tpe(now).strftime(_SLOT_AT_FORMAT)})
+
+
+def finish_weekly_slot_for(bot_dir, reason_kind: str) -> bool:
+    """History-line hook: close the slot unless the failure is retryable."""
+    if not bot_dir or (reason_kind or "") in RETRYABLE_REASON_KINDS:
+        return False
+    return complete_weekly_slot(bot_dir)
+
+
 @dataclass
 class Baseline:
     """The "best composite so far" record persisted per bot.

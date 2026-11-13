@@ -1,9 +1,21 @@
 ---
 name: debug
-description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom (Fable), implement a fix on a fix/ branch (Opus), review the diff (Fable), then ship a versioned GitHub release with Discord notification. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
+description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then ship a versioned GitHub release with Discord notification. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
 ---
 
 # tai-robot Debug Workflow
+
+> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
+> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
+> run on **Steven**, not this PC. This PC's `data\live` holds only
+> retired/test bots and its n8n is stopped. Read live state from the
+> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
+> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
+> describes this PC only — never publish it as fleet health. Host map →
+> `start-here`. Run checkers from an up-to-date checkout
+> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
+> weeks behind.
 
 A repo-specific, four-phase workflow for taking a live-bot symptom to a shipped fix.
 Each phase names the model to use. Do not skip phases — the review phase catches
@@ -16,7 +28,7 @@ non-regime bot regressions, and shipping without the full test suite is not allo
 
 ---
 
-## Phase 1 — Investigate (model: `claude-fable-5`)
+## Phase 1 — Investigate (model: `claude-fable-5` (if a Fable subagent fails with a usage-credit error, re-run it on Opus and say so in the report))
 Goal: trace the symptom to a **root cause**, not a plausible guess.
 
 **ALWAYS START WITH THE LOGS — before reading any code.** The log evidence, not a
@@ -26,7 +38,9 @@ fills, `decisions.csv`, the prior `session.json`), and follow where that evidenc
 points. The logs often reveal the root cause faster than reading source — do not
 jump to code assumptions before you have read them.
 
-1. Read the bot's debug log FIRST:
+1. Read the bot's debug log FIRST — on the host that runs it (the fleet is on
+   Steven: `<install>\data\live\<SYMBOL>_<bot>\` via `tailscale-ssh`; quick tail
+   and decisions via dashboard `/api/bot?id=`):
    `data/live/<symbol>_<bot-name>/debug_YYYYMMDD.log`
    (e.g. `data/live/TMF00_07-27-空單/debug_20260727.log`). Then read the history in
    the same directory: `decisions.csv`, the current and prior `session.json`, and
@@ -65,7 +79,8 @@ missing, loop back to Phase 1 rather than guessing. Implement the fix so it sati
 that test plan, then execute the plan and capture its evidence (screenshot, log line,
 or assertion) as proof the fix works — not just a green suite.
 
-1. Branch: `git checkout -b fix/<issue-slug>` off `master`.
+1. Branch in a worktree cut from the remote, never in the main tree:
+   `git fetch origin && git worktree add -b fix/<issue-slug> <path> origin/master`.
 2. Fix the fundamental problem identified in Phase 1 — no surface patches. Remove
    any dead code you touch; match surrounding style.
 3. Add/adjust tests that would fail against the known-bad code.
@@ -73,9 +88,9 @@ or assertion) as proof the fix works — not just a green suite.
    ```bash
    python -m pytest tests/ -x -q
    ```
-   All 1600+ tests must pass. A failing or skipped test is a blocker, not a footnote.
+   The full suite must pass. A failing or skipped test is a blocker, not a footnote.
 
-## Phase 3 — Review (model: `claude-fable-5`)
+## Phase 3 — Review (model: `claude-fable-5` (if a Fable subagent fails with a usage-credit error, re-run it on Opus and say so in the report))
 Goal: an independent read of the diff before it merges.
 
 Review `git diff master...fix/<issue-slug>` for:
@@ -89,37 +104,11 @@ Review `git diff master...fix/<issue-slug>` for:
 
 If the review surfaces problems, loop back to Phase 2.
 
-## n8n Workflow Debugging (news-framework)
+## News bridge debugging
 
-The news-bridge n8n instance runs locally at `http://localhost:5678`. When workflows
-break after a restart, check these first:
-
-**Startup env vars (all three REQUIRED on every launch):**
-```
-NODES_EXCLUDE="[]"  GENERIC_TIMEZONE="Asia/Taipei"  TZ="Asia/Taipei"
-```
-- `NODES_EXCLUDE="[]"`: n8n v2 disables `executeCommand` by default for security.
-  Without this, W1/W2/W3 fail with "Unrecognized node type: n8n-nodes-base.executeCommand".
-  The default exclude list lives in `@n8n/config/dist/configs/nodes.config.js`.
-- `GENERIC_TIMEZONE` + `TZ`: schedule-trigger cron evaluates in the wrong timezone
-  without these (the OS clock is UTC-7, not Asia/Taipei).
-
-**Where n8n reads `.env`:** `dotenv` loads from CWD (where `n8n start` was run), NOT
-from `~/.n8n/.env`. Setting env vars in `~/.n8n/.env` has no effect. Use the command
-line or the Task Scheduler task.
-
-**Task Scheduler:** "n8n Server" task runs `C:\Users\eric8\n8n-bridge\start-n8n.cmd`
-at logon. The script sets all three env vars. If the task exists but n8n isn't running,
-check Task Scheduler history for the failure reason.
-
-**Key debug resources:**
-- Event logs: `~/.n8n/n8nEventLog-*.log` (JSON, one event per line — workflow
-  start/success/failure, node start/finish). Grep for `workflow.failed` or `error`.
-- Database: `~/.n8n/database.sqlite` — `workflow_entity` table has all workflow
-  definitions; query with `python -c "import sqlite3; ..."` (read-only with `?mode=ro`).
-- Startup log: `~/n8n-bridge/n8n_server_new.log` (stdout/stderr redirect).
-- executeCommand nodes use absolute paths (`C:\Python313\python.exe`, not `python`)
-  because n8n child processes do NOT inherit the user's PATH.
+Since 2026-10-24 W1–W4 run as Steven scheduled tasks, not local n8n → use
+`bridge-health` (Steven section). Pre-2026-10-24 n8n history (startup env
+vars, event log, SQLite) → `n8n-debug`.
 
 ## Phase 4 — Ship
 Goal: a versioned release with a Discord notification.
