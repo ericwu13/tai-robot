@@ -587,11 +587,18 @@ class DiscordNotifier:
             priority=True,
         )
 
-    def daily_loss_limit(self, net_pnl: int, limit: int) -> None:
+    def daily_loss_limit(self, net_pnl: int, limit: int, account_net=None) -> None:
+        if account_net is None:
+            figures = f"淨損益: {net_pnl:+,} | 上限: -{limit:,}"
+        else:
+            figures = (
+                f"今日損益: {net_pnl:+,} | 帳戶淨損益: {account_net:+,} | "
+                f"上限: -{limit:,}"
+            )
         self._send(
             f"{self._header()}\n"
             f"🚫 **每日虧損上限 Daily Loss Limit**\n"
-            f"淨損益: {net_pnl:+,} | 上限: -{limit:,}",
+            f"{figures}",
             priority=True,
         )
 

@@ -33,10 +33,13 @@ trading:
   mode_switch_max_loss_ntd: {}
   # Default real-order daily loss limit (NT$) offered by the deploy
   # dialog and `run_bot_cli deploy --loss-limit`. The gate itself is
-  # per bot and lives in that bot's session.json; this is only the
-  # pre-fill. It resets at the 15:00 TPE trading-day boundary.
-  # NOT the same as risk.max_daily_loss below, which gates the
-  # backtest ExecutionEngine and never places a real order.
+  # per bot; this value is only the pre-fill. The counted loss is the
+  # change in account net since a snapshot taken in the 13:50–15:00 TPE
+  # window and committed at the 15:00 roll. Friday night and Monday day
+  # share one budget (one TAIFEX trading day). A bot started at night
+  # with no snapshot counts the full account net until Capital's next
+  # morning batch. NOT the same as risk.max_daily_loss below, which
+  # gates the backtest ExecutionEngine and never places a real order.
   daily_loss_limit_ntd: 20000
 
 strategy:

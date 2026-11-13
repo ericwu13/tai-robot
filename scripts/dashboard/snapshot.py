@@ -164,16 +164,23 @@ def loss_status(heartbeat) -> dict | None:
     net = _loss_int(heartbeat.get("loss_net")) if "loss_net" in heartbeat else None
     limit = (_loss_int(heartbeat.get("loss_limit"))
              if "loss_limit" in heartbeat else None)
+    account = (_loss_int(heartbeat.get("loss_account_net"))
+               if "loss_account_net" in heartbeat else None)
     parts = []
-    if net is not None:
+    if net is not None and account is not None:
+        parts.append(f"today {net:,} (acct {account:,})")
+    elif net is not None:
         parts.append(f"net {net:,}")
     if limit is not None:
         parts.append("limit off" if limit == 0 else f"limit {limit:,}")
+    text = " / ".join(parts)
+    if heartbeat.get("loss_basis") == "failsafe" and text:
+        text = f"{text} / no 15:00 baseline"
     return {
         "paused": paused,
         "badge": "PAUSED" if paused else "",
         "title": "Daily loss limit reached" if paused else "",
-        "text": " / ".join(parts),
+        "text": text,
     }
 
 

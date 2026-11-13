@@ -49,6 +49,10 @@ class TradingGuard:
         # blocking entries on 11-05 12:46 on a bot that had been up
         # since 08-28. Cleared when the 15:00 TPE boundary is crossed.
         self._pause_day_key: str = ""
+        # Set when the pause was tripped on the B=0 fallback (no 15:00
+        # snapshot). One post-batch recheck may release it. Every other
+        # pause still waits for the trading-day key change.
+        self._pause_failsafe: bool = False
 
         # Fill confirmation gate (auto mode only)
         self.fill_pending: bool = False
@@ -117,6 +121,7 @@ class TradingGuard:
         self.real_entry_confirmed = False
         self.paused = False
         self._pause_day_key = ""
+        self._pause_failsafe = False
         self._last_net_pnl = 0
         self.fill_pending = False
         self.fill_pending_type = ""
@@ -281,10 +286,27 @@ class TradingGuard:
         if day_key and self.paused and self._pause_day_key                 and day_key != self._pause_day_key:
             self.paused = False
             self._pause_day_key = ""
+            self._pause_failsafe = False
             return True
         return False
 
-    def update_pnl(self, net_pnl: int, day_key: str = "") -> bool:
+    def recheck_failsafe_pause(self, loss: int, day_key: str) -> bool:
+        """Release one pause that was set on the missing-snapshot fallback.
+
+        Runs once, on the read that settles Capital's morning batch, then
+        :meth:`update_pnl` on that same figure. A snapshot pause is left
+        latched until the trading-day key changes. Returns True when this
+        call itself trips the limit again.
+        """
+        if not (self.paused and self._pause_failsafe):
+            return False
+        self._pause_failsafe = False
+        self.paused = False
+        self._pause_day_key = ""
+        return self.update_pnl(int(loss), day_key=day_key)
+
+    def update_pnl(self, net_pnl: int, day_key: str = "", *,
+                   failsafe: bool = False) -> bool:
         """Update daily P&L and check loss limit.
 
         ``day_key`` is the caller's ``trading_day_key(now)``. A pause from
@@ -305,6 +327,7 @@ class TradingGuard:
                 and not self.paused):
             self.paused = True
             self._pause_day_key = day_key
+            self._pause_failsafe = bool(failsafe)
             return True  # just triggered
         return False
 
