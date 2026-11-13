@@ -153,5 +153,5 @@ evolve" are product decisions — present evidence, ask the user.
 ## Timing
 
 Evolution finishes by ~05:10 TPE Saturday. Run this **Saturday
-05:30–06:00 TPE = Friday ~14:30–15:00 local**. The scheduled task uses
-local time.
+05:30–06:00 TPE**; convert with `start-here` §4 (check `date +%z` / `Get-Date -Format K`).
+The scheduled task uses local time.

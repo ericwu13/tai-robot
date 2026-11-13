@@ -201,8 +201,7 @@ pattern (`--resume`); read its mode first (gate 1).
   not wrap it in a LocalSystem service or a scheduled task set to "run
   whether user is logged on or not".
 - Stdout timestamps are TPE (with local time appended when they differ);
-  the host's OS clock is not TPE (this PC is US Pacific with DST — check
-  `date +%z`). `[AI] ultra_mode=…` on the first line is normal.
+  clocks → `start-here` §4. `[AI] ultra_mode=…` on the first line is normal.
 - Never print credentials, channel IDs, or the account number — the CLI
   redacts them; keep it that way in reports.
 - Releases do not touch a running CLI bot; after merging a change the bot

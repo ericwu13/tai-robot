@@ -80,6 +80,10 @@ without the owner's explicit say-so.
 
 - Every bot timestamp (`bar_dt`, trades, logs) is **TPE (UTC+8)**. This PC's
   OS clock is not TPE. Never compare a TPE stamp to naive `datetime.now()`.
+- Before converting TPE to local, check `date +%z` (or on Windows
+  `Get-Date -Format K`). TPE stamps are UTC+8. This PC is US Pacific
+  with DST; Steven's zone is separate (`tzutil /g` there). Do not
+  hard-code a Pacific clock time.
 - `decisions.csv` column 0 is the bot machine's local clock — use `bar_dt`.
 - TradingView CSV exports downloaded by hand are stamped in the
   exporter's browser zone (US-Pacific for the owner's exports).
@@ -102,7 +106,8 @@ in your report — do not stall the task waiting for Fable.
 | is a bot alive? | `bot-status` (local dirs) — or `/api/fleet` for the Steven fleet |
 | deploy / restart / stop a bot | `deploy`, then `deploy-check` |
 | regime didn't switch / bot idle | `regime-health` |
-| votes / news bridge silent | `bridge-health`, `n8n-debug` (history) |
+| votes / news bridge silent | `bridge-health` |
+| pre-2026-10-24 local n8n history | `n8n-debug` (history only — do not run) |
 | scary logs, crash | `log-scan`, then `debug` |
 | weekly evolution never improves anything | `evo-debug` |
 | GitHub issue → root cause → PR | `issue-triage` → `validate-findings` → `fix-pr` |

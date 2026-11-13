@@ -1,6 +1,6 @@
 ---
 name: log-scan
-description: Scan tai-robot bot debug logs and the news-bridge logs for known error signatures — tracebacks, corrupted state, failed Discord sends, refused swaps, n8n workflow failures. Use when something broke and the cause is unknown, after a crash, or when asking "is there anything scary in the logs?".
+description: Scan tai-robot bot debug logs and the news-bridge logs for known error signatures — tracebacks, corrupted state, failed Discord sends, refused swaps. Use when something broke and the cause is unknown, after a crash, or when asking "is there anything scary in the logs?". Retired local n8n logs are history-only (`n8n-debug`); live W1–W4 failures are `bridge-health`.
 ---
 
 # Log Scan
@@ -22,8 +22,10 @@ C:/Python313/python.exe -s scripts/monitor/check_logs.py
 ```
 
 Scans, per bot directory, the newest two `debug_YYYYMMDD.log` files from
-the **last 7 days** (older logs are archaeology from retired test bots),
-plus `n8n-service.log` and `~/.n8n/n8nEventLog.log`.
+the **last 7 days** (older logs are archaeology from retired test bots).
+`n8n-service.log` and `~/.n8n/n8nEventLog.log` are history-only (retired
+local n8n, stopped 2026-10-24). Do not treat them as live bridge health —
+live W1–W4 are `bridge-health`.
 
 ## Pattern → severity
 
@@ -47,7 +49,7 @@ message body:
 | P2 | `Discarded pending recommendation` |
 | P3 | `Dropped out-of-order aggregated bar` |
 | P3 | `Discarded recommendation` |
-| P2 | any `n8n.workflow.failed` event in the last 24h |
+| history | `n8n.workflow.failed` — retired local n8n; if check_logs.py prints it, ignore (not live) |
 
 Findings are deduped per (pattern, file) and capped at 5 example lines,
 each redacted before it is printed.
@@ -60,7 +62,7 @@ each redacted before it is printed.
   log reaches ~9 MB. The helper tails them (2 MB) rather than reading
   whole files — do the same if you go in manually.
 - Log lines carry two clocks: `[<TPE> / <local>]`. The **first**
-  timestamp is TPE. The second is the host's local clock (this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there))
+  timestamp is TPE. The second is the host's local clock (clocks → `start-here` §4)
   and must never be used for reasoning about sessions.
 - `swap_strategy refused` is often legitimate (one of the 5 safety gates:
   not flat, veto, in replay, timeframe mismatch, insufficient bars) —
@@ -68,12 +70,16 @@ each redacted before it is printed.
 - A `Traceback` in a log from months ago is a retired test bot, not an
   incident; the 7-day window exists for exactly that reason. If you widen
   it manually, check the bot is one that still runs.
+- `n8n.workflow.failed` in the retired local n8n event log is history-only,
+  not a live P2. See `n8n-debug` (history only — do not run). A live bridge
+  failure or a missing vote → `bridge-health`.
 
 ## Next steps
 
 - traceback in a live bot → the repo's `debug` skill (root-cause → fix →
   review → release)
-- `n8n.workflow.failed` hits → the `n8n-debug` skill for the actual
-  execution record (`execs --errors`, then `detail <id>`)
+- historical `n8n.workflow.failed` on the retired local n8n → `n8n-debug`
+  only (history only — do not run). A live bridge silence or missing vote
+  → `bridge-health`
 - `Discord send failed` → confirm `notifications.*` wiring with
   `deploy-check`

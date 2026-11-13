@@ -82,7 +82,7 @@ Healthy vs unhealthy:
 - **Log silence in a closed gap is normal** — 13:46–14:59 and 05:01–08:44
   TPE, plus weekends and TAIFEX holidays. The helper only applies the
   10-minute freshness rule when `current_session(now)` is not None.
-- **Log stamps are TPE (+8); the OS clock is not** — this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there). Never
+- **Log stamps are TPE (+8); the OS clock is not** — clocks → `start-here` §4. Never
   compare a log timestamp against a naive `datetime.now()`.
 - The check is strictly read-only: it re-implements PID liveness rather
   than calling `LiveRunner.check_lock`, which DELETES stale locks.

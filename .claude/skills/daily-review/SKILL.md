@@ -55,7 +55,6 @@ findings + exact paths:
 | bridge | `.claude/skills/bridge-health/SKILL.md` |
 | logs | `.claude/skills/log-scan/SKILL.md` (escalate: `debug`) |
 | deploy | `.claude/skills/deploy-check/SKILL.md` |
-| n8n | `.claude/skills/n8n-debug/SKILL.md` |
 | fresh GitHub issue | `.claude/skills/issue-triage/SKILL.md` |
 
 Each agent answers: live or not, **new vs chronic** (full history, not
@@ -97,8 +96,8 @@ comment it on the issue per that skill.
 ## Timing
 
 Sweet spot **05:10–05:30 TPE**: night closed, classification + P&L
-recorded, DAY not yet open. 05:10 TPE = 14:10 local PDT / **13:10 local PST**
-the PREVIOUS day (this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there)). A local-time cron drifts one hour at each DST change.
+recorded, DAY not yet open. Clocks → `start-here` §4; a TPE morning is the previous local day. A local-time cron
+drifts one hour at each DST change.
 
 ## Gotchas
 
