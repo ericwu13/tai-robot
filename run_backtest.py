@@ -2024,6 +2024,9 @@ class BacktestApp:
                 "armed — not re-arming")
             return
         self._quote_intermediate_seen_at = time.time()
+        # A new 3002 starts a new deferral window. A stamp left by an
+        # earlier episode must not shorten this one.
+        self._quote_timeout_deferred_since = 0.0
         _log_debug(
             "[CONN] Quote (3002) on a READY link — waiting up to 15s for "
             "Ready (3003); a stale _quote_connected is not Ready")
@@ -2065,6 +2068,8 @@ class BacktestApp:
                 "quote is no longer READY; leaving the #178 attempt alone"
             )
             return
+        if self._quote_timeout_defer_for_deploy():
+            return
         if self._quote_timeout_ticks_are_fresh():
             self._quote_intermediate_seen_at = 0.0
             _log(
@@ -2082,6 +2087,53 @@ class BacktestApp:
             "stale _quote_connected is not a 3003; starting quote-down"
         )
         self._mark_quote_down_for_recovery(reason="_on_quote_ready_timeout")
+
+    QUOTE_TIMEOUT_DEPLOY_DEFER_S = 5.0
+    QUOTE_TIMEOUT_DEPLOY_DEFER_MAX_S = 60.0
+
+    def _quote_timeout_defer_for_deploy(self) -> bool:
+        """Hold the 15s timeout while a deploy has not subscribed ticks.
+
+        Warmup and an IDLE or WARMING_UP runner cannot produce a fresh
+        tick, so judging now would clear ``_quote_connected`` and abort
+        the deploy. Re-check every 5s. The cap is 60s from the 3002.
+        When the runner is RUNNING, arm one full 15s window and then
+        use the ordinary fresh-tick rule. No IsConnected read and no
+        SKCOM call.
+        """
+        runner = getattr(self, "_live_runner", None)
+        in_flight = (
+            bool(getattr(self, "_deploy_pending", False))
+            or bool(getattr(self, "_live_warmup_mode", False))
+            or (
+                runner is not None
+                and getattr(runner, "state", None) in (
+                    LiveState.IDLE, LiveState.WARMING_UP)
+            )
+        )
+        first = float(getattr(self, "_quote_timeout_deferred_since", 0.0) or 0.0)
+        if in_flight:
+            now = time.time()
+            if not first:
+                first = float(self._quote_intermediate_seen_at or now)
+                self._quote_timeout_deferred_since = first
+            if now - first < self.QUOTE_TIMEOUT_DEPLOY_DEFER_MAX_S:
+                _log_debug(
+                    "[CONN] Ready (3003) timeout deferred: deploy in "
+                    "progress, ticks not subscribed yet")
+                self._quote_ready_timer_id = self.root.after(
+                    int(self.QUOTE_TIMEOUT_DEPLOY_DEFER_S * 1000),
+                    self._on_quote_ready_timeout)
+                return True
+            self._quote_timeout_deferred_since = 0.0
+            return False
+        if first:
+            self._quote_timeout_deferred_since = 0.0
+            self._quote_intermediate_seen_at = time.time()
+            self._quote_ready_timer_id = self.root.after(
+                15000, self._on_quote_ready_timeout)
+            return True
+        return False
 
     def _mark_quote_down_for_recovery(self, *, reason: str) -> None:
         """Arm the existing #178 quote-down path. Flags, then one tick.
@@ -2105,6 +2157,9 @@ class BacktestApp:
                 f"[CONN] quote-down ({reason}) skipped — quote is not READY; "
                 "not clearing the in-progress 3003 wait")
             return
+        # #178 is about to run (_start_quote on the next tick). The
+        # deploy deferral for this 3002 is over.
+        self._quote_timeout_deferred_since = 0.0
         self._set_quote_connected(False, reason)
         host = getattr(self, "_link_host", None)
         if host is None:
@@ -2167,6 +2222,11 @@ class BacktestApp:
             return False
         tick_at = float(getattr(self, "_last_fresh_tick_at", 0.0) or 0.0)
         if tick_at <= 0.0:
+            return False
+        # A tick from before this 3002 is not evidence the quote
+        # survived the missing 3003. A tick at the 3002 instant counts.
+        seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
+        if seen and tick_at < seen:
             return False
         return (time.time() - tick_at) <= self.FRESH_TICK_LIVENESS_S
 
@@ -2244,6 +2304,7 @@ class BacktestApp:
             _log_debug(f"[CONN] Quote→Ready timer cancelled (reason={reason})")
             self._quote_ready_timer_id = None
             self._quote_intermediate_seen_at = 0.0
+            self._quote_timeout_deferred_since = 0.0
 
     def _on_disconnected(self, *, from_event: bool = False):
         """Handle connection loss: pause the feed. The link machine reconnects.
@@ -2926,6 +2987,7 @@ class BacktestApp:
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
         self._quote_ready_timer_id = None
         self._quote_intermediate_seen_at: float = 0.0
+        self._quote_timeout_deferred_since: float = 0.0
         # Wall clock of the latest fresh tick. The 15s 3002 timeout
         # stays READY when this is at or after the 3002 and IsConnected
         # is 1. Stale replay does not update it.

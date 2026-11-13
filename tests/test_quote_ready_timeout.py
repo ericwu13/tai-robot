@@ -476,6 +476,9 @@ def _give_up_monitor():
         def on_disconnected(self):
             self.downs += 1
 
+        def reset(self):
+            return None
+
         def on_manual_reconnect(self):
             return type("A", (), {"message": "manual"})()
 
@@ -1266,6 +1269,301 @@ def test_manual_reconnect_drops_duplicate_3003_alert(monkeypatch):
     assert discord.notes == []
     assert "3003 ignored: quote already READY" in "\n".join(logged[before:])
     assert app._link_host.machine.quote == LinkPhase.READY
+
+
+def _fire_pending(app, fake, clock, when):
+    """Run the armed Quote→Ready callback without rewriting its clock."""
+    clock["now"] = when
+    fake.set_now(when)
+    token = app._quote_ready_timer_id
+    assert token is not None
+    ms, fn, args = app.root.pending.pop(token)
+    fn(*args)
+    return ms
+
+
+class _SubRunner:
+    """Enough of a live runner for tick subscribe and a stop-close."""
+
+    def __init__(self, state):
+        self.state = state
+        self.symbol = "TX00"
+        self.suppress_strategy = False
+        self.csv_logger = None
+        self._aggregated_bars = []
+        self._1m_bars = []
+        self.broker = type("B", (), {
+            "position_size": 1,
+            "position_side": type("S", (), {"value": "LONG"})(),
+        })()
+
+    def reload_1m_bars(self, progress_cb=None):
+        return 0
+
+    def stop(self):
+        return {"trades": 0, "pnl": 0, "bars_1m": 0, "bars_agg": 0}
+
+    def log_blocked_signal(self, *args, **kwargs):
+        return None
+
+
+def _arm_subscribe(monkeypatch, app):
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb._broker, "request_ticks", lambda *a, **k: 0)
+    app._drain_tick_queue = lambda: None
+    app._schedule_status_update = lambda: None
+    app._tick_watchdog = rb.TickWatchdog()
+    app._real_account_poll_id = None
+    app._live_poll_id = None
+    app._fill_poll_timer_id = None
+    app._live_tick_count = 0
+    app._live_history_done = False
+    app._live_chart = None
+    app._conn_monitor = _give_up_monitor()
+
+
+def test_warmup_timeout_defers_then_marks_down_without_a_tick(monkeypatch):
+    """Deploy warmup must not clear the quote. After subscribe, no tick marks down."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    runner = _SubRunner(LiveState.IDLE)
+    app._live_runner = runner
+    app._live_warmup_mode = True
+    app._quote_connected = True
+    stopped = []
+    app._stop_live = lambda: stopped.append("stop")
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app.root.pending[app._quote_ready_timer_id][0] == 5000
+    runner.state = LiveState.RUNNING
+    app._live_warmup_mode = False
+    _arm_subscribe(monkeypatch, app)
+    app._start_live_tick_subscription()
+    assert stopped == []
+    assert _fire_pending(app, fake, clock, drop + timedelta(seconds=20)) == 5000
+    assert app.root.pending[app._quote_ready_timer_id][0] == 15000
+    app._last_fresh_tick_at = 0.0
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=36))
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    assert app._quote_connected is False
+
+
+def test_warmup_timeout_stays_ready_when_a_tick_follows_the_rearm(monkeypatch):
+    """After the deploy window, a fresh tick keeps the quote READY."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    runner = _SubRunner(LiveState.IDLE)
+    app._live_runner = runner
+    app._live_warmup_mode = True
+    app._quote_connected = True
+    app._stop_live = lambda: None
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._quote_ready_timer_id is not None
+    assert app.root.pending[app._quote_ready_timer_id][0] == 5000
+    runner.state = LiveState.RUNNING
+    app._live_warmup_mode = False
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=20))
+    assert app.root.pending[app._quote_ready_timer_id][0] == 15000
+    app._last_fresh_tick_at = time.time()
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=36))
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._quote_connected is True
+    assert app._quote_ready_timer_id is None
+
+
+def test_deploy_deferral_is_capped_at_60s(monkeypatch):
+    """A deploy still in flight defers, then marks down once 60s have passed."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    app._live_runner = _SubRunner(LiveState.WARMING_UP)
+    app._live_warmup_mode = True
+    app._quote_connected = True
+    _deliver_3002(app)
+    app._quote_intermediate_seen_at = time.time() - 20
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app.root.pending[app._quote_ready_timer_id][0] == 5000
+    app._quote_intermediate_seen_at = time.time() - 61
+    app._quote_timeout_deferred_since = time.time() - 61
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=21))
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    assert app._quote_connected is False
+
+
+def test_deploy_pending_without_a_runner_defers(monkeypatch):
+    """_deploy_pending alone is enough to hold the timeout."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    app._live_runner = None
+    app._deploy_pending = True
+    app._live_warmup_mode = False
+    app._quote_connected = True
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._quote_connected is True
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app.root.pending[app._quote_ready_timer_id][0] == 5000
+
+
+def test_closed_gap_after_deploy_keeps_the_open_rules(monkeypatch):
+    """Once subscribe is up, a 07:30 timeout uses the closed-gap rules."""
+    drop = tpe(2026, 11, 12, 7, 30)
+
+    def _finish_deploy(state):
+        app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+        _replay_drop(app, fake, clock, drop)
+        runner = _SubRunner(LiveState.IDLE)
+        app._live_runner = runner
+        app._live_warmup_mode = True
+        app._quote_connected = True
+        fake.force_quote_state = state
+        _deliver_3002(app)
+        _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+        assert app._quote_ready_timer_id is not None
+        assert app.root.pending[app._quote_ready_timer_id][0] == 5000
+        runner.state = LiveState.RUNNING
+        app._live_warmup_mode = False
+        _fire_pending(app, fake, clock, drop + timedelta(seconds=20))
+        assert app.root.pending[app._quote_ready_timer_id][0] == 15000
+        app._last_fresh_tick_at = 0.0
+        return app, fake, clock
+
+    app, fake, clock = _finish_deploy(2)
+    enters = fake.calls.count("EnterMonitorLONG")
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=36))
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert machine._quote_enter_not_before == tpe(2026, 11, 12, 8, 45)
+    _tick(app, fake, clock, tpe(2026, 11, 12, 8, 44))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert machine.degraded is False
+
+    app, fake, clock = _finish_deploy(0)
+    enters = fake.calls.count("EnterMonitorLONG")
+    fired = drop + timedelta(seconds=36)
+    _fire_pending(app, fake, clock, fired)
+    assert app._link_host.machine._quote_enter_not_before is None
+    _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert app._link_host.machine.degraded is False
+
+
+def test_warmup_timeout_does_not_stop_close_a_resumed_position(monkeypatch):
+    """A confirmed auto position is not closed by a 3002 during warmup."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    app._trading_mode = "auto"
+    app._trading_guard.real_entry_confirmed = True
+    app._live_runner = _SubRunner(LiveState.WARMING_UP)
+    app._live_warmup_mode = True
+    app._quote_connected = True
+    sent = []
+    app._send_real_order = lambda *a, **k: sent.append("SendFutureOrderCLR")
+    app._warmup_timeout_id = None
+    app._position_log = lambda *a, **k: None
+    app._update_live_results = lambda: None
+    app._update_live_status = lambda: None
+    app._stop_main_heartbeat = lambda: None
+    app.btn_manual_buy = _Btn()
+    app.btn_manual_sell = _Btn()
+    app.btn_manual_close = _Btn()
+    app.chart_tf_combo = _Btn()
+    app.chart_tf_var = _Var("Native")
+    app.btn_tv = _Btn()
+    app.btn_update = _Btn()
+    app.symbol_combo = _Btn()
+    app.strategy_combo = _Btn()
+    app.bot_name_var = _Var("")
+    app.trading_mode_var = _Var("")
+    app.mode_combo = _Btn()
+    _deliver_3002(app)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    _arm_subscribe(monkeypatch, app)
+    app._live_runner.state = LiveState.RUNNING
+    app._live_warmup_mode = False
+    app._start_live_tick_subscription()
+    assert sent == []
+
+
+def test_tick_before_the_3002_does_not_count_as_fresh(monkeypatch):
+    """A tick 10s before the 3002, and none after, marks the quote down."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    seen = app._quote_intermediate_seen_at
+    app._last_fresh_tick_at = seen - 10
+    before = len(logged)
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=15))
+    assert "quote marked down" in "\n".join(logged[before:])
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    assert app._quote_connected is False
+
+
+def test_tick_one_second_after_the_3002_stays_ready(monkeypatch):
+    """A tick 1s after the 3002 is fresh even when IsConnected()==0."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    _deliver_3002(app)
+    seen = app._quote_intermediate_seen_at
+    app._last_fresh_tick_at = seen + 1
+    before = len(logged)
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=15))
+    assert "ticks are flowing" in "\n".join(logged[before:])
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._quote_connected is True
+
+
+def test_tick_exactly_at_the_3002_counts_as_fresh(monkeypatch):
+    """tick_at == _quote_intermediate_seen_at is fresh."""
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    _deliver_3002(app)
+    seen = app._quote_intermediate_seen_at
+    app._last_fresh_tick_at = seen
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=15))
+    assert app._link_host.machine.quote == LinkPhase.READY
+    assert app._quote_connected is True
+
+
+@pytest.mark.parametrize("age,ready", [(29.9, True), (30.0, True), (30.1, False)])
+def test_fresh_tick_window_boundary(monkeypatch, age, ready):
+    """29.9s and 30.0s stay READY. 30.1s marks down.
+
+    The 3002 is 40s before the tick, so the tick is after seen_at and
+    the pre-3002 rule does not decide the case.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    # Freeze the wall clock so 30.0s is not nudged over the limit.
+    frozen = time.time()
+    monkeypatch.setattr(rb.time, "time", lambda: frozen)
+    app._quote_intermediate_seen_at = frozen - 40
+    app._last_fresh_tick_at = frozen - age
+    _fire_pending(app, fake, clock, drop + timedelta(seconds=15))
+    if ready:
+        assert app._link_host.machine.quote == LinkPhase.READY
+        assert app._quote_connected is True
+    else:
+        assert app._link_host.machine.quote == LinkPhase.DOWN
+        assert app._quote_connected is False
 
 
 def test_open_session_tick_10s_ago_stays_ready(monkeypatch):
