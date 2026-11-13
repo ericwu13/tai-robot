@@ -10946,8 +10946,14 @@ class BacktestApp:
             self._show_order_confirm_dialog(
                 buy_sell, order_symbol, order_desc, price, action_type, new_close=new_close)
 
-    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source="", new_close=2):
-        """Show a non-blocking 10-second confirmation dialog for a real order."""
+    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source="", new_close=2, manual_flatten=False):
+        """Show a non-blocking 10-second confirmation dialog for a real order.
+
+        ``manual_flatten`` is set only by the CLOSE button. Confirm then
+        always sends with ``exit_open_position=True``, including when the
+        sim is already flat (that stamp is rejected and does not land on
+        the previous trade). A strategy-exit confirm leaves it false.
+        """
         # Dismiss any existing dialog
         self._dismiss_order_dialog("replaced")
 
@@ -11002,7 +11008,16 @@ class BacktestApp:
 
         def on_confirm():
             self._dismiss_order_dialog("confirmed")
-            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=new_close)
+            # The flag follows the caller, not position_size. A strategy
+            # exit confirmed after the sim close (including a same-bar
+            # re-entry) must keep matching trades[-1] by exit bar.
+            if manual_flatten:
+                self._send_real_order(
+                    buy_sell, order_symbol, action_type, price,
+                    new_close=new_close, exit_open_position=True)
+            else:
+                self._send_real_order(
+                    buy_sell, order_symbol, action_type, price, new_close=new_close)
 
         def on_skip():
             self._dismiss_order_dialog("skipped")
@@ -11074,9 +11089,12 @@ class BacktestApp:
         new_close: 0=new position, 1=close position, 2=auto (exchange decides).
         exit_type: "limit" (TP), "stop" (SL), "close", "force_close", or "".
         exit_limit: strategy's original limit price for take-profit exits.
-        exit_open_position: True only for the stop-close path, which sends
-        the EXIT while the sim position is still open. Every other caller
-        leaves this False so the seq matches the closed trade by bar.
+        exit_open_position: True only when the EXIT belongs to the still-open
+        sim position. The two callers are ``_stop_live`` (stop-close) and
+        the manual-flatten confirm from ``_manual_close``. Every other
+        caller leaves this False so the seq matches the closed trade by
+        bar. A flat book with the flag set is rejected and does not stamp
+        ``trades[-1]``.
 
         Returns True if order was accepted (code==0), False otherwise.
         """
@@ -11967,7 +11985,8 @@ class BacktestApp:
         price, price_src = self._get_latest_price()
         self._show_order_confirm_dialog(
             buy_sell, order_symbol, order_desc, price,
-            action_type="exit", price_source=price_src, new_close=1)
+            action_type="exit", price_source=price_src,
+            manual_flatten=True, new_close=1)
 
     def _update_manual_order_buttons(self):
         """Enable/disable manual order buttons based on live state."""

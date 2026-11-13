@@ -638,6 +638,12 @@ class SimulatedBroker:
         """
         if price <= 0:
             return False
+        # A manual flatten or stop-close parked its seq on the open
+        # position. The bar registered for that order is trades[-1]'s
+        # exit bar, so accepting the fill here would price the previous
+        # trade. The price belongs to the trade that receives the seq.
+        if self.pending_exit_order_seq:
+            return False
         if not self.trades:
             return False
         last = self.trades[-1]

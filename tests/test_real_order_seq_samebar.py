@@ -180,10 +180,10 @@ def _send_real_order_calls(tree):
 
 
 def test_only_stop_live_passes_exit_open_position(monkeypatch):
-    """Mock every exit caller. Only ``_stop_live`` sets the flag True.
+    """Stop-close and the manual-flatten confirm are the True call sites.
 
-    The source walk covers call sites the mocks do not reach (a new
-    ``_send_real_order`` added later still has to leave the flag off).
+    A strategy-exit confirm through the same dialog leaves the flag off.
+    The source walk covers call sites this runtime mock does not reach.
     """
     import ast
     from pathlib import Path
@@ -195,13 +195,14 @@ def test_only_stop_live_passes_exit_open_position(monkeypatch):
     tree = ast.parse(Path(rb.__file__).read_text(encoding="utf-8"))
     calls = _send_real_order_calls(tree)
     flagged = [c for c in calls if c[2] is True]
-    assert flagged == [("_stop_live", "exit", True)]
+    assert ("_stop_live", "exit", True) in flagged
+    assert ("on_confirm", None, True) in flagged
+    assert len(flagged) == 2
     for fn, action, flag in calls:
-        if (fn, action) == ("_stop_live", "exit"):
-            continue
-        assert flag in (None, False), (fn, action, flag)
-        if action == "exit":
-            assert flag is not True
+        if flag is True:
+            assert (fn, action) in {("_stop_live", "exit"), ("on_confirm", None)}
+        elif action == "exit":
+            assert flag in (None, False)
 
     recorded = []
 
@@ -363,3 +364,231 @@ def test_only_stop_live_passes_exit_open_position(monkeypatch):
     exits = [c for c in recorded if c["action_type"] == "exit"]
     assert len(exits) == 5
     assert [c["exit_open_position"] for c in exits] == [False, False, False, False, True]
+
+
+def _install_fake_confirm_dialog(monkeypatch):
+    """Replace the Tk confirm dialog with a button that records on_confirm."""
+    import run_backtest as rb
+
+    confirmed = []
+
+    class _Dlg:
+        def title(self, *a, **k):
+            return None
+
+        def attributes(self, *a, **k):
+            return None
+
+        def resizable(self, *a, **k):
+            return None
+
+        def protocol(self, *a, **k):
+            return None
+
+        def after(self, *a, **k):
+            return 1
+
+        def after_cancel(self, *a, **k):
+            return None
+
+        def winfo_exists(self):
+            return True
+
+        def destroy(self):
+            return None
+
+    class _Node:
+        def __init__(self, *a, **k):
+            self.command = k.get("command")
+
+        def pack(self, *a, **k):
+            return self
+
+        def grid(self, *a, **k):
+            return self
+
+        def config(self, *a, **k):
+            return None
+
+        def configure(self, *a, **k):
+            return None
+
+    def _button(*a, **k):
+        node = _Node(*a, **k)
+        if "Confirm" in str(k.get("text", "")):
+            confirmed.append(k.get("command"))
+        return node
+
+    monkeypatch.setattr(rb.tk, "Toplevel", lambda *a, **k: _Dlg())
+    monkeypatch.setattr(rb.ttk, "Frame", _Node)
+    monkeypatch.setattr(rb.ttk, "Label", _Node)
+    monkeypatch.setattr(rb.ttk, "Progressbar", _Node)
+    monkeypatch.setattr(rb.ttk, "Button", _button)
+    monkeypatch.setattr(rb, "apply_window_theme", lambda *a, **k: None)
+    monkeypatch.setattr(rb, "place_dialog", lambda *a, **k: None)
+    monkeypatch.setattr(rb, "_discord", None)
+    return confirmed
+
+
+def _com_order_app(broker, monkeypatch, *, seq):
+    """App whose real ``_send_real_order`` accepts one mocked COM order."""
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    import run_backtest as rb
+    from src.live.account_monitor import AccountMonitor
+
+    def send(*_a, **_k):
+        return (seq, 0)
+
+    sk_mod = types.ModuleType("comtypes.gen.SKCOMLib")
+
+    class _Order:
+        pass
+
+    sk_mod.FUTUREORDER = _Order
+    gen = types.ModuleType("comtypes.gen")
+    comtypes_mod = types.ModuleType("comtypes")
+    comtypes_mod.gen = gen
+    monkeypatch.setitem(sys.modules, "comtypes", comtypes_mod)
+    monkeypatch.setitem(sys.modules, "comtypes.gen", gen)
+    monkeypatch.setitem(sys.modules, "comtypes.gen.SKCOMLib", sk_mod)
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "skO", SimpleNamespace(SendFutureOrderCLR=send))
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app.root = SimpleNamespace(after=lambda *a, **k: 1, after_cancel=lambda *a, **k: None)
+    app._futures_account = "ACCT"
+    app.login_user_var = SimpleNamespace(get=lambda: "user")
+    app._trading_mode = "semi_auto"
+    app._trading_guard = SimpleNamespace(
+        on_entry_sent=lambda: None,
+        on_exit_sent=lambda: None,
+        on_fill_pending=lambda *_a: None,
+    )
+    app._fill_tracker = SimpleNamespace(register_order=lambda *_a, **_k: None)
+    app._live_log_msg = lambda *a, **k: None
+    app._order_confirm_timer_id = None
+    app._order_confirm_dlg = None
+    app._reply_poller = None
+    app._position_ledger = None
+    app._last_real_order_side = None
+    app._get_latest_price = lambda: (44800, "tick")
+    app._live_runner = SimpleNamespace(
+        symbol="TMF00",
+        broker=broker,
+        csv_logger=None,
+        strategy_display_name="Probe",
+    )
+    app._account_monitor = AccountMonitor()
+    return app
+
+
+def _confirm_manual_flatten(broker, monkeypatch, *, seq):
+    import run_backtest as rb
+
+    confirmed = _install_fake_confirm_dialog(monkeypatch)
+    app = _com_order_app(broker, monkeypatch, seq=seq)
+    rb.BacktestApp._manual_close(app)
+    assert confirmed and confirmed[0] is not None
+    confirmed[0]()
+    return app
+
+
+def test_manual_flatten_while_open_parks_seq_on_the_open_position(monkeypatch):
+    """The CLOSE button sends while the sim position is still open.
+
+    The seq parks on that position. The previous trade stays paper, and
+    the fill price registered against its exit bar does not land on it.
+    """
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    b.force_close(9, 44900)
+    _open(b, bar=12)
+    prev = b.trades[-1].exit_bar_index
+    _confirm_manual_flatten(b, monkeypatch, seq=SEQ_X1)
+    assert b.pending_exit_order_seq == SEQ_X1
+    row = _rows(b)[0]
+    assert row["exit_order_seq"] == ""
+    assert not real_pnl.is_real_order(row)
+    assert real_pnl.classify(row, PV)["status"] != "missing"
+    assert b.try_set_real_exit_price(44700, exit_bar_index=prev) is False
+    assert b.trades[-1].real_exit_price == 0
+    assert b.trades[-1].exit_order_seq == ""
+
+
+def test_manual_flatten_while_flat_stamps_nothing(monkeypatch):
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    b.force_close(9, 44900)
+    app = _com_order_app(b, monkeypatch, seq=SEQ_X1)
+    app._last_real_order_side = 0          # book unknown: still offers a close
+    confirmed = _install_fake_confirm_dialog(monkeypatch)
+    import run_backtest as rb
+    rb.BacktestApp._manual_close(app)
+    assert confirmed and confirmed[0] is not None
+    confirmed[0]()
+    assert b.pending_exit_order_seq == ""
+    assert b.trades[-1].exit_order_seq == ""
+    assert not real_pnl.is_real_order(_rows(b)[0])
+
+
+def test_strategy_exit_confirm_after_same_bar_reentry_stamps_closed_trade(monkeypatch):
+    """A strategy-exit confirm is not a manual flatten. The sim has already
+    closed, even if a same-bar re-entry is open, so the seq stays on the
+    closed trade."""
+    import run_backtest as rb
+
+    b = _same_bar_stop_then_reentry()
+    confirmed = _install_fake_confirm_dialog(monkeypatch)
+    app = _com_order_app(b, monkeypatch, seq=SEQ_X1)
+    rb.BacktestApp._show_order_confirm_dialog(
+        app, 1, "TMFL5", "平倉賣 CLOSE SELL", 44880, "exit", new_close=1)
+    assert confirmed and confirmed[0] is not None
+    confirmed[0]()
+    assert b.trades[-1].exit_order_seq == SEQ_X1
+    assert b.pending_exit_order_seq == ""
+
+
+def test_only_stop_live_and_manual_flatten_pass_exit_open_position(monkeypatch):
+    """The flag is where the order came from. Only stop-close and the
+    manual-flatten confirm pass it."""
+    import ast
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import run_backtest as rb
+
+    tree = ast.parse(Path(rb.__file__).read_text(encoding="utf-8"))
+    calls = _send_real_order_calls(tree)
+    flagged = [c for c in calls if c[2] is True]
+    assert ("_stop_live", "exit", True) in flagged
+    assert ("on_confirm", None, True) in flagged
+    assert len(flagged) == 2
+    for fn, action, flag in calls:
+        if flag is True:
+            assert (fn, action) in {("_stop_live", "exit"), ("on_confirm", None)}
+
+    recorded = []
+
+    def _record(buy_sell, order_symbol, action_type, sim_price,
+                new_close=2, exit_type="", exit_limit=None,
+                exit_open_position=False):
+        recorded.append(exit_open_position)
+        return True
+
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    confirmed = _install_fake_confirm_dialog(monkeypatch)
+    app = _com_order_app(b, monkeypatch, seq=SEQ_X1)
+    app._send_real_order = _record
+    rb.BacktestApp._manual_close(app)
+    assert confirmed and confirmed[0] is not None
+    confirmed[0]()
+    # A strategy-exit confirm through the same dialog leaves the flag off.
+    confirmed.clear()
+    rb.BacktestApp._show_order_confirm_dialog(
+        app, 1, "TMFL5", "平倉", 45000, "exit", new_close=1)
+    confirmed[0]()
+    assert recorded == [True, False]
