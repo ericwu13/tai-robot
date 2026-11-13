@@ -77,6 +77,7 @@ unread and its dedup entry would silence Monday's real vote.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -87,6 +88,7 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import ssl
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -162,15 +164,76 @@ _SSL_CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT
 
 # ── HTTP / parsing helpers ───────────────────────────────────────────────
 
+class ChipsFetchError(Exception):
+    """TAIFEX or TWSE could not be reached (DNS, connection, timeout, HTTP 5xx)."""
+
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        self.message = message
+        super().__init__(f"{kind}: {message}")
+
+
+def _is_timeout_error(exc) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timed out" in str(exc or "").lower()
+
+
 def _http_json(url: str) -> object | None:
-    """GET *url*, parse JSON.  None on any failure (network, HTTP, parse)."""
+    """GET *url*, parse JSON.
+
+    Raises ChipsFetchError on DNS, connection, timeout, any HTTP error
+    (4xx and 5xx), a truncated read, a 200 whose body is empty or
+    whitespace, or a 200 body that is not JSON (an HTML block page).
+    A blank 200 is what a WAF or proxy can return; it is not an empty
+    dataset.      Returns a parsed JSON value.  JSON ``null`` is a fetch failure.
+    Callers treat TAIFEX ``[]`` and a TWSE object whose ``stat`` is not
+    OK as no-data.  Tests that mock this to return None still mean
+    "no data".  Any other exception is a fetch failure; the message
+    names the exception type.
+    """
     try:
         req = urllib.request.Request(url, headers=_UA)
         with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as resp:
-            return json.load(resp)
-    except Exception as e:  # noqa: BLE001
-        print(f"  fetch failed [{url[:70]}...]: {type(e).__name__}: {e}")
-        return None
+            status = getattr(resp, "status", None)
+            if status is None:
+                status = resp.getcode()
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise ChipsFetchError("http", f"HTTP {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        text = str(reason if reason is not None else exc)
+        kind = "timeout" if _is_timeout_error(reason) else "network"
+        raise ChipsFetchError(kind, text) from exc
+    except TimeoutError as exc:
+        raise ChipsFetchError("timeout", str(exc)) from exc
+    except OSError as exc:
+        kind = "timeout" if _is_timeout_error(exc) else "network"
+        raise ChipsFetchError(kind, str(exc)) from exc
+    except http.client.HTTPException as exc:
+        # IncompleteRead / BadStatusLine are not OSError. A cut-off body
+        # is a transport failure, not an empty dataset.
+        raise ChipsFetchError("network", str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        # ValueError, UnicodeError, KeyError, and anything else that is
+        # not a classified transport error. Name the type in the log.
+        raise ChipsFetchError("error", f"{type(exc).__name__}: {exc}") from exc
+    if isinstance(status, int) and status >= 400:
+        raise ChipsFetchError("http", f"HTTP {status}")
+    if raw is None or (isinstance(raw, (bytes, str)) and not raw.strip()):
+        raise ChipsFetchError("http", "empty body")
+    try:
+        # utf-8-sig drops a leading BOM. json.load() on the raw bytes
+        # accepted one; a strict utf-8 decode leaves U+FEFF and json.loads
+        # then rejects the body.
+        text = raw.decode("utf-8-sig") if isinstance(raw, bytes) else raw
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise ChipsFetchError("http", f"non-JSON body: {type(exc).__name__}: {exc}") from exc
+    if parsed is None:
+        raise ChipsFetchError("http", "JSON null")
+    return parsed
 
 
 def _num(value) -> float | None:
@@ -209,13 +272,23 @@ def fetch_taifex_tx_foreign_oi() -> tuple[str, float] | None:
     calendar by more than a day.  So the caller reads the date OFF the
     data instead of pre-picking one; see ``run_once``'s walk-back.
 
-    Returns None when the API is unreachable or has no TX/外資 rows.  The
-    dataset has one row per 商品 × 身份別 covering ALL delivery months
-    combined; rows are summed defensively but normally exactly one
+    Returns None only for a genuine empty list (``[]``).  A non-list
+    (an error object, JSON null) or a non-empty list with no 臺股期貨/外資
+    rows is a fetch failure: the published dataset includes that contract,
+    so a list that never mentions it is the wrong document, not a holiday.
+    A list that does contain those rows, for another trade date, is still
+    None from ``fetch_taifex_foreign_net_oi`` (no data for the requested
+    date).  The dataset has one row per 商品 × 身份別 covering ALL delivery
+    months combined; rows are summed defensively but normally exactly one
     matches.
     """
     data = _http_json(TAIFEX_URL)
+    if data is None:
+        return None
     if not isinstance(data, list):
+        raise ChipsFetchError("http", f"TAIFEX JSON shape {type(data).__name__}")
+    if not data:
+        print("  TAIFEX response was an empty list")
         return None
 
     dataset_date, total, matched = "", 0.0, 0
@@ -243,8 +316,9 @@ def fetch_taifex_tx_foreign_oi() -> tuple[str, float] | None:
         matched += 1
 
     if matched == 0 or not dataset_date:
-        print(f"  TAIFEX response had no {TX_PRODUCT_NAME}/{FOREIGN_PREFIX} rows")
-        return None
+        raise ChipsFetchError(
+            "http",
+            f"TAIFEX JSON had no {TX_PRODUCT_NAME}/{FOREIGN_PREFIX} rows")
     print(f"  TAIFEX 外資 {TX_PRODUCT_NAME} net OI: {total:+,.0f} contracts "
           f"({matched} row(s), all delivery months combined, data {dataset_date})")
     return dataset_date, total
@@ -272,12 +346,18 @@ def fetch_twse_foreign_net_buy(date_key: str) -> float | None:
 
     Sums the 買賣差額 of every row whose 單位名稱 starts with 外資
     (外資及陸資(不含外資自營商) + 外資自營商).  None when the date is a
-    holiday (stat != OK) or the response is malformed.
+    holiday (a dict whose ``stat`` is not OK).  A non-dict, or a dict
+    with no ``stat`` (an error envelope), is a fetch failure.
     """
     data = _http_json(TWSE_BFI82U_URL.format(date=date_key))
-    if not isinstance(data, dict) or data.get("stat") != "OK":
+    if data is None:
+        return None
+    if not isinstance(data, dict) or "stat" not in data:
+        raise ChipsFetchError(
+            "http", f"TWSE JSON shape {type(data).__name__}")
+    if data.get("stat") != "OK":
         print(f"  TWSE BFI82U: no data for {date_key} "
-              f"(stat={data.get('stat') if isinstance(data, dict) else 'n/a'!r})")
+              f"(stat={data.get('stat')!r})")
         return None
 
     fields = data.get("fields") or []
@@ -544,11 +624,75 @@ def append_log(path: str | os.PathLike, line: str) -> None:
 
 # ── Main logic ───────────────────────────────────────────────────────────
 
+def _is_closed_day(date_key: str | None) -> bool:
+    """Weekend, or a weekday ``is_taifex_holiday`` confirms.
+
+    If the holiday calendar cannot be imported, only weekends count.
+    """
+    try:
+        day = datetime.strptime(str(date_key), "%Y%m%d").date()
+    except (TypeError, ValueError):
+        return False
+    if day.weekday() >= 5:
+        return True
+    # Launched as ``python scripts/news_bridge/chips_monitor.py``, sys.path[0]
+    # is that directory, not the repo root. The weekend check above does not
+    # need this import; a weekday holiday does.
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from src.market_data.holidays import is_taifex_holiday
+    except Exception:  # noqa: BLE001 — weekend-only fallback
+        return False
+    try:
+        return bool(is_taifex_holiday(day))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def no_data_message(date_key: str | None) -> str:
+    """Wording for a genuine empty dataset. Keeps the ``no TAIFEX data``
+    prefix the voteless-streak check and the existing no-data tests use.
+    ``holiday`` appears only when the day is actually closed."""
+    if _is_closed_day(date_key):
+        return "no TAIFEX data — TAIFEX holiday — no vote"
+    return "no TAIFEX data — no data yet (API lag) — no vote"
+
+
+def _clear_fetch_streak(state: dict) -> None:
+    state["fetch_error_streak"] = 0
+
+
+def _abort_fetch(state: dict, now: datetime, spath, base_path: str,
+                 dry_run: bool, source: str, exc: ChipsFetchError) -> int:
+    """Transport failure: keep the vote, do not mark the day decided.
+
+    The log line must not contain ``no TAIFEX data`` — that phrase is what
+    check_bridge counts as a voteless streak.  Exit 1 so the scheduled
+    task shows failed; a later slot retries because last_decided_date is
+    left unset.
+    """
+    msg = (f"{source} fetch failed ({exc.kind}: {exc.message}) "
+           "— vote kept, no decision")
+    print(f"  {msg}")
+    if not dry_run:
+        state["fetch_error_streak"] = int(state.get("fetch_error_streak") or 0) + 1
+        state["last_fetch_error"] = msg[:300]
+        save_state(spath, stamp_liveness(state, now, msg))
+        append_log(Path(base_path).parent / LOG_NAME,
+                   f"{now:%Y-%m-%d %H:%M:%S} TPE | {msg}")
+    return 1
+
+
 def run_once(base_path: str, date_key: str | None, now: datetime,
              dry_run: bool = False, discord_webhook: str | None = None,
              force: bool = False) -> int:
-    """One W4 pass.  Always exits 0 — a data outage is a no-op, not a
-    failure (the retry slots cover it).
+    """One W4 pass.  A transport failure (DNS, connection, timeout, HTTP
+    5xx) on the TAIFEX or TWSE path exits 1 so the scheduled task shows
+    failed; the vote file is kept and the trade date is not marked
+    decided, so the retry slots keep probing.  A genuine no-data day or
+    holiday still exits 0 and deletes a stale vote, as before.
 
     *date_key* explicit (``--date``) = manual backfill: that trade date
     is requested and anything else is "no data".  *date_key* None = the
@@ -565,50 +709,60 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
     spath = state_path_for(base_path)
     state = load_state(spath)
     decided = str(state.get("last_decided_date") or "")
-    no_data = "no TAIFEX data — no vote (weekend/holiday/outage)"
+    # None until a genuine empty dataset. Specific "wrong date" messages
+    # replace it; a transport error never reaches this string.
+    no_data = None
 
     # Retry-slot dedup: a decision for a dataset is final (the API data
     # won't change), so later slots for it are no-ops — no re-fetch, no
     # duplicate Discord post.  No-DATA passes never set this, so retries
-    # keep probing until the OpenAPI catches up.
-    if date_key:
-        if not dry_run and not force and decided == date_key:
-            print(f"  already decided for {date_key} — skipping (--force to redo)")
-            return 0
-        net_oi = fetch_taifex_foreign_net_oi(date_key)
-    else:
-        newest = default_trade_date(now)
-        window = walk_back_dates(now)
-        found = fetch_taifex_tx_foreign_oi()
-        date_key, net_oi = (newest, None) if found is None else found
-        if net_oi is not None and date_key > newest:
-            no_data = (f"no TAIFEX data — dataset {date_key} is ahead of trade "
-                       f"date {newest}, ignoring")
-            net_oi = None
-        elif net_oi is not None and not dry_run and not force \
-                and decided and date_key <= decided:
-            # Liveness still gets stamped: a deduped pass is a HEALTHY
-            # pass, and without the stamp a long weekend + API lag pushes
-            # last_check past the monitor's 72h threshold (false "W4
-            # bridge stale").  The log line also keeps every cron slot
-            # visible to check_bridge's slot heuristic.
-            msg = (f"nothing new — dataset {date_key} already decided "
-                   f"(last decided {decided})")
-            print(f"  {msg}")
-            save_state(spath, stamp_liveness(state, now, msg))
-            append_log(Path(base_path).parent / LOG_NAME,
-                       f"{now:%Y-%m-%d %H:%M:%S} TPE | {msg}")
-            return 0
-        elif net_oi is not None and date_key not in window:
-            no_data = (f"no TAIFEX data — dataset {date_key} is older than the "
-                       f"{WALK_BACK_TRADING_DAYS}-trading-day walk-back window "
-                       f"({window[-1]}..{window[0]})")
-            net_oi = None
+    # keep probing until the OpenAPI catches up.  A transport error also
+    # leaves last_decided_date unset, so those slots keep trying.
+    try:
+        if date_key:
+            if not dry_run and not force and decided == date_key:
+                print(f"  already decided for {date_key} — skipping (--force to redo)")
+                return 0
+            net_oi = fetch_taifex_foreign_net_oi(date_key)
+        else:
+            newest = default_trade_date(now)
+            window = walk_back_dates(now)
+            found = fetch_taifex_tx_foreign_oi()
+            date_key, net_oi = (newest, None) if found is None else found
+            if net_oi is not None and date_key > newest:
+                no_data = (f"no TAIFEX data — dataset {date_key} is ahead of trade "
+                           f"date {newest}, ignoring")
+                net_oi = None
+            elif net_oi is not None and not dry_run and not force \
+                    and decided and date_key <= decided:
+                # Liveness still gets stamped: a deduped pass is a HEALTHY
+                # pass, and without the stamp a long weekend + API lag pushes
+                # last_check past the monitor's 72h threshold (false "W4
+                # bridge stale").  The log line also keeps every cron slot
+                # visible to check_bridge's slot heuristic.
+                msg = (f"nothing new — dataset {date_key} already decided "
+                       f"(last decided {decided})")
+                print(f"  {msg}")
+                _clear_fetch_streak(state)
+                save_state(spath, stamp_liveness(state, now, msg))
+                append_log(Path(base_path).parent / LOG_NAME,
+                           f"{now:%Y-%m-%d %H:%M:%S} TPE | {msg}")
+                return 0
+            elif net_oi is not None and date_key not in window:
+                no_data = (f"no TAIFEX data — dataset {date_key} is older than the "
+                           f"{WALK_BACK_TRADING_DAYS}-trading-day walk-back window "
+                           f"({window[-1]}..{window[0]})")
+                net_oi = None
+    except ChipsFetchError as exc:
+        return _abort_fetch(state, now, spath, base_path, dry_run, "TAIFEX", exc)
 
     if net_oi is None:
+        if not no_data:
+            no_data = no_data_message(date_key)
         print(f"  {no_data}")
         if not dry_run:
             delete_stale_vote(base_path)
+            _clear_fetch_streak(state)
             save_state(spath, stamp_liveness(state, now, no_data))
             append_log(Path(base_path).parent / LOG_NAME,
                        f"{now:%Y-%m-%d %H:%M:%S} TPE | {no_data}")
@@ -625,6 +779,7 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
                f"trading day")
         print(f"  {msg}")
         if not dry_run:
+            _clear_fetch_streak(state)
             save_state(spath, stamp_liveness(state, now, msg))
             append_log(Path(base_path).parent / LOG_NAME,
                        f"{now:%Y-%m-%d %H:%M:%S} TPE | {msg}")
@@ -659,7 +814,10 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
                                    "trading day) — recording only")
     else:
         delta = net_oi - prev_oi
-        equity_net = fetch_twse_foreign_net_buy(date_key)
+        try:
+            equity_net = fetch_twse_foreign_net_buy(date_key)
+        except ChipsFetchError as exc:
+            return _abort_fetch(state, now, spath, base_path, dry_run, "TWSE", exc)
         if equity_net is None:
             # Contradiction check can't run — conservative: no vote at all.
             direction, reason = None, "TWSE equity flow unavailable — cannot rule out hedging, no vote"
@@ -713,6 +871,7 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
         "final": equity_net is not None, "session": session_key,
         "at": now.isoformat(timespec="seconds"),
     })
+    _clear_fetch_streak(state)
     save_state(spath, stamp_liveness(state, now, summary))
     append_log(Path(base_path).parent / LOG_NAME,
                f"{now:%Y-%m-%d %H:%M:%S} TPE | {summary}")
@@ -797,10 +956,13 @@ def main() -> int:
         return run_once(base_path, date_key, now, dry_run=True,
                         discord_webhook=discord_webhook, force=args.force)
     with _run_recorder(Path(base_path).parent, "W4") as run:
-        run.exit_code = run_once(base_path, date_key, now,
-                                 discord_webhook=discord_webhook, force=args.force)
+        code = run_once(base_path, date_key, now,
+                        discord_webhook=discord_webhook, force=args.force)
+        run.exit_code = code
         run.result = str(load_state(state_path_for(base_path)).get("last_result") or "")
-        return run.exit_code
+        if code:
+            run.fail(run.result or "fetch failed")
+        return code
 
 
 if __name__ == "__main__":
