@@ -172,7 +172,7 @@ jobs:
       # show_full_output stays off (public repo logs); print only the result
       # record so an API/usage-limit failure is visible instead of silent.
       - name: Show why the review returned no verdict
-        if: always() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output == ''
+        if: ${{ !cancelled() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output == '' }}
         env:
           EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
         run: |
@@ -184,7 +184,7 @@ jobs:
           sleep 30
 
       - name: Retry Claude review once
-        if: always() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output == ''
+        if: ${{ !cancelled() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output == '' }}
         id: claude_retry
         uses: anthropics/claude-code-action@v1
         env:
