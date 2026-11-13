@@ -741,25 +741,16 @@ def _abort_fetch(state: dict, now: datetime, spath, base_path: str,
     return 1
 
 
-def _kept_vote_no_data_message(no_data: str, decided: str, session: str) -> str:
-    """No-data line for a vote that stays on disk.
+def _kept_vote_no_data_message(_no_data: str, decided: str, session: str) -> str:
+    """No-data line for a TAIFEX ``[]`` that keeps this session's vote.
 
     Names *decided* (the dataset the vote came from) and *session*
-    (``expires_after_session`` on the vote file). On a scheduled ``[]``
-    the pass's trade date has already replaced ``date_key``, so naming
-    that date would point at today instead of the dataset.
-    The ``no TAIFEX data`` prefix is dropped: that phrase is what the
-    voteless streak counts, and this pass still has a vote. The walker
-    then stops on this line instead of adding to the streak.
+    (``expires_after_session`` on the vote file). Does not repeat the
+    ``no TAIFEX data`` / ``no vote`` wording from *_no_data*: that phrase
+    is what the voteless streak counts, and "no vote" would contradict
+    a vote that stayed. The walker stops on this line.
     """
-    prefix = "no TAIFEX data"
-    detail = str(no_data or "").strip()
-    if detail.lower().startswith(prefix.lower()):
-        detail = detail[len(prefix):].strip(" \t—-")
-    body = f"decided vote for {decided} ({session}) left unchanged"
-    if detail:
-        return f"no-data — {detail}; {body}"
-    return f"no-data — {body}"
+    return f"no-data — decided vote {decided} ({session}) kept (same session)"
 
 
 def _twse_zero_row_message(date_key: str, vote_date: str, kept: bool) -> str:
