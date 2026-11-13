@@ -216,6 +216,14 @@ class LinkStateMachine:
     # does not call EnterMonitor and does not run the stuck timer.
     # This machine has no session clock; the host passes the instant.
     _quote_enter_not_before: datetime | None = None
+    # The session open a timeout hold was waiting for. Survives the
+    # moment ``_quote_enter_not_before`` is cleared so a later tick can
+    # still tell a fresh tick from one that arrived during the gap.
+    _quote_hold_open_at: datetime | None = None
+    # Market time of the latest fresh tick, supplied by the host.
+    _fresh_tick_at: datetime | None = None
+    # One log per READY episode for a repeated 3003.
+    _logged_duplicate_3003: bool = False
     # Set only by note_quote_not_ready (the 15s 3002 timeout). Other
     # downs (3021, 3033, watchdog) and manual Reconnect clear it so
     # they keep the in-gap #178 behavior.
@@ -294,7 +302,9 @@ class LinkStateMachine:
         self._quote_stuck_since = None
         self._quote_down_at = now
         self._quote_enter_not_before = enter_not_before
+        self._quote_hold_open_at = enter_not_before
         self._quote_timeout_hold = True
+        self._logged_duplicate_3003 = False
         self.entries_blocked = True
 
     def hold_quote_enter_until(self, when: datetime) -> None:
@@ -314,6 +324,7 @@ class LinkStateMachine:
         if current is not None and current >= when:
             return
         self._quote_enter_not_before = when
+        self._quote_hold_open_at = when
         self._quote_stuck_since = None
 
     def start(self, now: datetime) -> None:
@@ -449,6 +460,7 @@ class LinkStateMachine:
         # that tick is what reconnects. Other down paths never set it.
         self._quote_timeout_hold = False
         self._quote_enter_not_before = None
+        self._quote_hold_open_at = None
         if not self.degraded:
             return
         self.degraded = False
@@ -505,6 +517,7 @@ class LinkStateMachine:
         # the next open.
         self._quote_timeout_hold = False
         self._quote_enter_not_before = None
+        self._quote_hold_open_at = None
         if self.quote != LinkPhase.READY:
             self.quote = LinkPhase.READY
             self._pending_3003 = False
@@ -630,8 +643,10 @@ class LinkStateMachine:
             self._quote_down_at = at
             self._quote_enter_not_before = None
             self._quote_timeout_hold = False
+            self._quote_hold_open_at = None
             self._pending_3003 = False
             self._quote_stuck_since = None
+            self._logged_duplicate_3003 = False
             self.orders_paused = True
             # 3033 is the shared Solace session. Both links go down.
             # Reply reconnects first, and only after a fresh
@@ -657,14 +672,24 @@ class LinkStateMachine:
             self._quote_down_at = at
             self._quote_enter_not_before = None
             self._quote_timeout_hold = False
+            self._quote_hold_open_at = None
             self._pending_3003 = False
             self._quote_stuck_since = None
+            self._logged_duplicate_3003 = False
             # A new quote drop is a new observation. An earlier
             # login-recovery clock must not already be expired.
             if self._down_without_reply_event_since is not None:
                 self._down_without_reply_event_since = at
             return
         if kind == KIND_READY and code == 0:
+            # A second 3003 on a link that is already READY must not
+            # subscribe again. That reruns the host resubscribe and
+            # opens another history-replay window.
+            if self.quote == LinkPhase.READY:
+                if not self._logged_duplicate_3003:
+                    self._logged_duplicate_3003 = True
+                    self.alerts.append("3003 ignored: quote already READY")
+                return
             # Honored on the next tick from any phase, not only CONNECTING.
             self._pending_3003 = True
             return
@@ -940,6 +965,12 @@ class LinkStateMachine:
         if hold is not None and now < hold:
             self._quote_stuck_since = None
             return
+        # At the open, and on later ticks while this timeout is still
+        # held or the stuck clock is running: a fresh tick since the
+        # open plus IsConnected()==1 goes back to READY. Anything else
+        # keeps the stuck path below.
+        if self._restore_if_feed_healthy(now):
+            return
         if hold is not None:
             self._quote_enter_not_before = None
         if self.quote == LinkPhase.DOWN and self._quote_down_at is not None:
@@ -980,7 +1011,60 @@ class LinkStateMachine:
         self._quote_connect_started_at = None
         self._quote_enter_not_before = None
         self._quote_timeout_hold = False
+        self._quote_hold_open_at = None
+        self._logged_duplicate_3003 = False
         self._maybe_finish_solace_episode()
+
+    def note_fresh_tick(self, when: datetime) -> None:
+        """Market time of a fresh tick. The hold-release check reads it."""
+        self._fresh_tick_at = when
+
+    def _restore_if_feed_healthy(self, now: datetime) -> bool:
+        """Return to READY when the open's feed is already healthy.
+
+        Only a timeout hold that was waiting for a session open. A tick
+        must have arrived at or after that open, and the broker port's
+        ``IsConnected()`` must be 1. No subscribe and no EnterMonitor.
+        Any other case, including a probe error, leaves the stuck path
+        to run.
+        """
+        release = self._quote_hold_open_at
+        if release is None or now < release:
+            return False
+        pending = (
+            self._quote_timeout_hold
+            or self._quote_stuck_since is not None
+            or self._quote_enter_not_before is not None
+        )
+        if not pending or self.degraded:
+            return False
+        tick_at = self._fresh_tick_at
+        if tick_at is None or tick_at < release:
+            return False
+        try:
+            state = int(self.port.is_connected())
+        except Exception:
+            return False
+        if state != 1:
+            return False
+        self.quote = LinkPhase.READY
+        self._quote_stuck_since = None
+        self._quote_timeout_hold = False
+        self._quote_enter_not_before = None
+        self._quote_hold_open_at = None
+        self._pending_3003 = False
+        self._quote_connect_started_at = None
+        self._logged_duplicate_3003 = False
+        if (
+            self.reply == LinkPhase.READY
+            and self.reply_reconciled
+            and not self.degraded
+        ):
+            self.entries_blocked = False
+        self.alerts.append(
+            "READY: quote hold released, tick after the open, IsConnected()=1"
+        )
+        return True
 
     def _service_quote(self, now: datetime) -> None:
         if not self.rules.enter_once_while_connecting:

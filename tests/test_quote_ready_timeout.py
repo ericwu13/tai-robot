@@ -978,3 +978,107 @@ def test_enter_monitor_return_code_is_logged(monkeypatch):
     text = "\n".join(logs)
     assert "EnterMonitorLONG returned" in text
     assert "code=7" in text
+
+
+def _closed_gap_down(monkeypatch):
+    """07:30 3002 with no following tick. Hold until 08:45."""
+    drop = tpe(2026, 11, 12, 7, 30)
+    open_at = tpe(2026, 11, 12, 8, 45)
+    app, fake, clock, logged = _ready(monkeypatch, drop - timedelta(minutes=30))
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert machine._quote_enter_not_before == open_at
+    assert app._quote_connected is False
+    return app, fake, clock, logged, enters, open_at
+
+
+def test_closed_gap_healthy_tick_at_open_restores_ready(monkeypatch):
+    """07:30 holds until 08:45. A tick then, with IsConnected 1, is READY.
+
+    The first post-release tick restores. No DEGRADED, and an opening
+    entry is not blocked.
+    """
+    app, fake, clock, _logged, enters, open_at = _closed_gap_down(monkeypatch)
+    fake.force_quote_state = 1
+    clock["now"] = open_at
+    fake.set_now(open_at)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, open_at)
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.READY
+    assert machine.degraded is False
+    assert machine._quote_timeout_hold is False
+    assert machine._quote_enter_not_before is None
+    assert machine._quote_stuck_since is None
+    assert app._quote_connected is True
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    entry, _ = app._trading_guard.decide("auto", "ENTRY_FILL", "LONG")
+    assert entry != TradingGuard.BLOCK_LINK
+    _tick(app, fake, clock, open_at + timedelta(seconds=320))
+    assert machine.quote == LinkPhase.READY
+    assert machine.degraded is False
+    assert machine.degraded_reason == ""
+    assert "LeaveMonitor" not in fake.calls
+    restore_src = inspect.getsource(machine._restore_if_feed_healthy)
+    assert "port.is_connected" in restore_src
+    assert "SKQuoteLib_IsConnected" not in restore_src
+
+
+def test_closed_gap_without_ticks_after_open_still_reaches_stuck(monkeypatch):
+    """No tick after 08:45 keeps the stuck clock. IsConnected stays 1."""
+    app, fake, clock, _logged, enters, open_at = _closed_gap_down(monkeypatch)
+    fake.force_quote_state = 1
+    _tick(app, fake, clock, open_at)
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert machine.degraded is False
+    assert app._quote_connected is False
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, open_at + timedelta(seconds=300))
+    assert machine.degraded is True
+    assert machine.degraded_reason == "stuck"
+    assert machine.quote != LinkPhase.READY
+    assert fake.calls.count("EnterMonitorLONG") == enters
+
+
+def test_tick_after_open_with_is_connected_0_does_not_restore(monkeypatch):
+    """A tick at the open does not restore when IsConnected()==0."""
+    app, fake, clock, _logged, enters, open_at = _closed_gap_down(monkeypatch)
+    fake.force_quote_state = 0
+    clock["now"] = open_at
+    fake.set_now(open_at)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, open_at)
+    machine = app._link_host.machine
+    assert machine.quote != LinkPhase.READY
+    assert machine.quote == LinkPhase.CONNECTING
+    assert app._quote_connected is False
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert machine.degraded is False
+
+
+def test_duplicate_3003_while_ready_does_not_reconnect(monkeypatch):
+    """A second 3003 on a READY quote does not resubscribe."""
+    at = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, logged = _ready(monkeypatch, at)
+    seen: list[str] = []
+
+    def _on_reconnected():
+        seen.append("reconnected")
+
+    def subscribe_quotes():
+        seen.append("subscribe")
+        app._on_reconnected()
+
+    app._on_reconnected = _on_reconnected
+    fake.subscribe_quotes = subscribe_quotes
+    before = len(logged)
+    _deliver_3003(app, fake, clock, at)
+    _deliver_3003(app, fake, clock, at + timedelta(seconds=1))
+    assert seen == []
+    text = "\n".join(logged[before:])
+    assert text.count("3003 ignored: quote already READY") == 1
+    assert app._link_host.machine.quote == LinkPhase.READY

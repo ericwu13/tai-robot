@@ -2129,8 +2129,17 @@ class BacktestApp:
         self._link_host_tick(force=True)
 
     def _note_fresh_quote_tick(self) -> None:
-        """Wall clock of the latest fresh tick. The 3002 timeout reads it."""
+        """Wall clock of the latest fresh tick. The 3002 timeout reads it.
+
+        Also tells the link machine the market time, so a closed-gap
+        hold can tell a tick after the open from one during the gap.
+        """
         self._last_fresh_tick_at = time.time()
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        note = getattr(machine, "note_fresh_tick", None)
+        if note is not None:
+            note(_taipei_now())
 
     def _quote_timeout_still_alive(self) -> bool:
         """True when this 3002 still has a live quote. Do not mark it down.
@@ -2431,6 +2440,14 @@ class BacktestApp:
             return
         self._apply_link_gate()
         for alert in alerts:
+            text = str(alert)
+            if text.startswith("READY:"):
+                self._set_quote_connected(True, "hold_release")
+                _log(f"[RECONNECT] {text}")
+                continue
+            if text.startswith("3003 ignored"):
+                _log(text)
+                continue
             self._on_link_alert(alert)
         if alerts or force:
             self._publish_link_heartbeat()
