@@ -118,7 +118,7 @@ from src.ai import review_payload
 _CODE_GEN_MAX_TOKENS = 16384
 
 # Live trading modules
-from src.live.live_runner import LiveRunner, LiveState, arm_headless_file_guard, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _taipei_now, _TZ_TAIPEI
+from src.live.live_runner import LiveRunner, LiveState, arm_headless_file_guard, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _next_session_open, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.position_log import PositionLedger
 from src.live.tick_watchdog import TickWatchdog
@@ -1238,15 +1238,20 @@ def _log_debug(msg):
     _route_to_log_widget(line, "debug")
 
 
-def _log_com_return(name: str, elapsed_ms: float, failed: bool) -> None:
-    """P0: how long the SKCOM call took, written as it returns.
+def _log_com_return(name: str, elapsed_ms: float, failed: bool, code=None) -> None:
+    """P0 duration, plus the EnterMonitorLONG code on the #178 path.
 
     Logging only. The caller already invoked the COM method; this does
-    not make another one and does not branch on the elapsed time.
+    not make another one and does not branch on the elapsed time or the
+    code. ``code`` is omitted when the call raised, and for every name
+    other than EnterMonitorLONG.
     """
     status = "raised" if failed else "returned"
+    detail = ""
+    if name == "EnterMonitorLONG" and code is not None and not failed:
+        detail = f" code={code}"
     _log_debug(
-        f"[COM] {name} {status} in {elapsed_ms:.0f} ms "
+        f"[COM] {name} {status} in {elapsed_ms:.0f} ms{detail} "
         f"tid={threading.get_ident()}")
 
 
@@ -1723,6 +1728,7 @@ class BacktestApp:
                         # watchdog since Ready arrived.
                         self._cancel_quote_ready_timer("ready_received")
                         self._set_quote_connected(True, "OnConnection(Ready)")
+                        self._disconnect_cleanup_done = False
                         self.btn_api.config(state=tk.NORMAL)
                         self.btn_deploy.config(state=tk.NORMAL)
                         self.btn_login.config(state=tk.DISABLED)
@@ -1733,11 +1739,12 @@ class BacktestApp:
                         # Resubscribe is the machine's subscribe_quotes,
                         # which runs on the following tick after 3003.
                     elif data == "quote":
-                        # Bug A: Quote (3002) is intermediate, NOT fully
-                        # connected. RequestTicks may return OK on a session
-                        # that only reached Quote, but no ticks ever arrive
-                        # (zombie subscription). Wait for Ready (3003); if
-                        # it never comes, trigger a fresh reconnect attempt.
+                        # Quote (3002) is intermediate. Arm the 15s timer
+                        # only when the machine still says READY: an
+                        # unexpected 3002 on a link we believed was up.
+                        # A handshake 3002 after EnterMonitorLONG (quote
+                        # CONNECTING or DOWN) must not arm it. Only Ready
+                        # (3003) cancels an armed timer.
                         self._set_conn_dot("warn")
                         self._on_quote_intermediate()
                     elif data == "disconnected":
@@ -1979,45 +1986,440 @@ class BacktestApp:
                 f"[STATE] _quote_connected: {old!r} -> {value!r} (caller={caller})")
         self._quote_connected = value
 
-    def _on_quote_intermediate(self) -> None:
-        """Handle Quote (3002) — the intermediate state, not full ready.
+    def _quote_machine_phase(self):
+        """Link-machine quote phase, or None before adopt."""
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        if machine is None:
+            return None
+        return machine.quote
 
-        Bug A: Quote alone is NOT enough to call ``_on_reconnected`` —
-        per CLAUDE.md the proper sequence is Reply(3001) → Quote(3002) →
-        Ready(3003). If we resubscribe ticks after only Quote, RequestTicks
-        returns OK but ticks never arrive (zombie subscription). Start a
-        15s timer; if Ready (3003) doesn't follow, treat it as a failed
-        attempt and trigger another reconnect cycle.
+    def _on_quote_intermediate(self) -> None:
+        """Handle Quote (3002). It is not Ready (3003).
+
+        Arm the 15s timer only when the machine's quote is READY: this
+        3002 is unexpected on a link we believed was up. A handshake
+        3002 while the quote is CONNECTING or DOWN is the #178 attempt
+        already in progress; that attempt keeps its own wait and
+        ``stuck_limit``. A second 3002 does not re-arm or reset the
+        timer. OnSolaceReplyConnection and OnComplete do not cancel
+        it. Only Ready (3003) does.
+
+        ``_quote_connected`` left True by an earlier 3003 is not proof
+        that this 3002 was followed by 3003. If the timer fires while
+        the quote is still READY, the quote is marked down and the
+        #178 path runs: 5s settle, then EnterMonitorLONG only when
+        IsConnected()==0. No LeaveMonitor, no re-login, no process restart.
         """
+        phase = self._quote_machine_phase()
+        if phase != LinkPhase.READY:
+            _log_debug(
+                "[CONN] Quote (3002) while quote is "
+                f"{getattr(phase, 'value', phase)} — not arming the Ready "
+                "timer; a #178 attempt keeps its own wait")
+            return
+        if self._quote_ready_timer_id:
+            _log_debug(
+                "[CONN] Quote (3002) while the Ready timer is already "
+                "armed — not re-arming")
+            return
         self._quote_intermediate_seen_at = time.time()
+        # A new 3002 starts a new deferral window. A stamp left by an
+        # earlier episode must not shorten this one.
+        self._quote_timeout_deferred_since = 0.0
         _log_debug(
-            "[CONN] Quote (3002) acknowledged — waiting up to 15s for "
-            "Ready (3003) before resubscribing ticks")
-        self._cancel_quote_ready_timer("quote_intermediate_arm")
+            "[CONN] Quote (3002) on a READY link — waiting up to 15s for "
+            "Ready (3003); a stale _quote_connected is not Ready")
         self._quote_ready_timer_id = self.root.after(
             15000, self._on_quote_ready_timeout)
 
     def _on_quote_ready_timeout(self) -> None:
-        """Fired 15s after Quote (3002) if Ready (3003) never arrived.
+        """15s after an unexpected 3002 with no 3003.
 
-        Bug A escalation path: warn loudly so the session log shows what
-        happened, then trigger a fresh reconnect attempt rather than
-        sitting on a half-connected session that silently produces no
-        ticks.
+        Act only if the quote is still READY. A #178 attempt that
+        moved the quote to CONNECTING or DOWN keeps its own wait and
+        ``stuck_limit``; this timeout does not mark it down and does
+        not clear ``_pending_3003`` or the connect-start clock.
+
+        When it does act: log, clear ``_quote_connected``, and start
+        the #178 quote-down path (see ``_mark_quote_down_for_recovery``).
+        EnterMonitorLONG only when IsConnected()==0. No LeaveMonitor,
+        no re-login, no process restart.
+
+        During a closed session the quote is marked down. When
+        IsConnected()==0 the normal #178 path runs: 5s settle, then
+        EnterMonitorLONG, including well before the next open. It does
+        not run in the minute before that open (#157). When
+        IsConnected() is anything else, no SKCOM call is made during
+        the gap. The stuck timer does not run until the next open, so
+        the link does not go DEGRADED while the session is closed.
+
+        An open session with a subscribed runner stays READY when a
+        fresh tick arrived in the last 30s. IsConnected() is not that
+        signal. The timer is cleared so a later 3002 can arm it again.
+        No fresh tick marks the quote down, and a later tick restores
+        READY before stuck_limit. DEGRADED after stuck_limit, with
+        still no tick, is the end state for that case.
+
+        An open session with nothing subscribed cannot produce a tick,
+        so this timeout does not mark the quote down. The same hold
+        covers a closed gap when nothing is subscribed and
+        IsConnected() is not 0: no mark-down and no further SKCOM call.
+        IsConnected()==0 in that gap still takes #178. The 3002 stays
+        pending until Ready (3003), a disconnect, manual Reconnect, a
+        fresh tick, or the next subscription's 15s window.
         """
         self._quote_ready_timer_id = None
-        if self._quote_connected:
-            return  # Ready arrived between fire and now — nothing to do
         waited = time.time() - (self._quote_intermediate_seen_at or time.time())
+        if self._quote_machine_phase() != LinkPhase.READY:
+            _log_debug(
+                f"[CONN] Ready (3003) timeout after {waited:.1f}s — "
+                "quote is no longer READY; leaving the #178 attempt alone"
+            )
+            return
+        if self._quote_timeout_defer_for_deploy():
+            return
+        if self._quote_timeout_ticks_are_fresh():
+            self._resolve_unresolved_3002()
+            _log(
+                "報價仍跳動 Quote (3002) without Ready (3003) "
+                f"after {waited:.0f}s, but ticks are flowing — staying READY"
+            )
+            return
+        if self._quote_timeout_idle_unsubscribed():
+            return
         _log(
             "報價未就緒 Quote (3002) seen but Ready (3003) did not arrive "
-            f"after {waited:.0f}s — link machine keeps waiting (no re-login)")
+            f"after {waited:.0f}s — quote marked down "
+            "(no re-login, no LeaveMonitor)"
+        )
         _log_debug(
             f"[CONN] Ready (3003) timeout after {waited:.1f}s — "
-            "machine owns the wait; no LeaveMonitor")
+            "stale _quote_connected is not a 3003; starting quote-down"
+        )
+        self._mark_quote_down_for_recovery(reason="_on_quote_ready_timeout")
+
+    QUOTE_TIMEOUT_DEPLOY_DEFER_S = 5.0
+    QUOTE_TIMEOUT_DEPLOY_DEFER_MAX_S = 60.0
+
+    def _quote_timeout_defer_for_deploy(self) -> bool:
+        """Hold the 15s timeout while a deploy has not subscribed ticks.
+
+        Warmup and an IDLE or WARMING_UP runner cannot produce a fresh
+        tick, so judging now would clear ``_quote_connected`` and abort
+        the deploy. Re-check every 5s. The cap is 60s from the 3002.
+        When the runner is RUNNING, arm one full 15s window and then
+        use the ordinary fresh-tick rule. No IsConnected read and no
+        SKCOM call.
+        """
+        in_flight = self._quote_timeout_deploy_in_flight()
+        first = float(getattr(self, "_quote_timeout_deferred_since", 0.0) or 0.0)
+        if in_flight:
+            now = time.time()
+            if not first:
+                first = float(self._quote_intermediate_seen_at or now)
+                self._quote_timeout_deferred_since = first
+            if now - first < self.QUOTE_TIMEOUT_DEPLOY_DEFER_MAX_S:
+                _log_debug(
+                    "[CONN] Ready (3003) timeout deferred: deploy in "
+                    "progress, ticks not subscribed yet")
+                self._quote_ready_timer_id = self.root.after(
+                    int(self.QUOTE_TIMEOUT_DEPLOY_DEFER_S * 1000),
+                    self._on_quote_ready_timeout)
+                return True
+            self._quote_timeout_deferred_since = 0.0
+            return False
+        if first:
+            self._quote_timeout_deferred_since = 0.0
+            # The 3002 timestamp stays. The 15s window starts now, and
+            # a tick counts only when it is after that 3002.
+            self._quote_ready_timer_id = self.root.after(
+                15000, self._on_quote_ready_timeout)
+            return True
+        return False
+
+    def _quote_timeout_deploy_in_flight(self) -> bool:
+        """True while a deploy has not finished subscribing ticks."""
+        runner = getattr(self, "_live_runner", None)
+        return (
+            bool(getattr(self, "_deploy_pending", False))
+            or bool(getattr(self, "_live_warmup_mode", False))
+            or (
+                runner is not None
+                and getattr(runner, "state", None) in (
+                    LiveState.IDLE, LiveState.WARMING_UP)
+            )
+        )
+
+    def _quote_timeout_idle_unsubscribed(self) -> bool:
+        """Leave a 3002 pending when nothing is subscribed.
+
+        No RequestTicks means a missing tick proves nothing. Do not
+        clear ``_quote_connected``. An open session does not read
+        IsConnected(). A closed gap reads it once: 0 still takes #178,
+        and any other reading stays pending with no further SKCOM call.
+        The 3002 timestamp stays until Ready (3003), a disconnect,
+        manual Reconnect, a fresh tick, or the 15s window armed at the
+        next subscription. A deploy still in flight is the round-6
+        deferral, not this path. A subscribed runner is not this path.
+        """
+        if self._quote_timeout_deploy_in_flight():
+            return False
+        runner = getattr(self, "_live_runner", None)
+        if runner is not None and getattr(runner, "state", None) == LiveState.RUNNING:
+            return False
+        if not is_market_open(_taipei_now()) and self._closed_gap_quote_is_down():
+            return False
+        _log(
+            "報價待確認 Quote (3002) without Ready (3003), no subscribed "
+            "runner — leaving the quote connected until the next "
+            "subscription's 15s window"
+        )
+        self.set_status("Quote unverified — waiting for ticks", "ok")
+        self._set_conn_dot("ok")
+        return True
+
+    def _closed_gap_quote_is_down(self) -> bool:
+        """True only when a closed-gap IsConnected() read is 0.
+
+        One broker-port read. A probe error is not 0, so the idle hold
+        stands and this gap makes no further SKCOM call. Not used in
+        an open session.
+        """
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        port = getattr(machine, "port", None) if machine is not None else None
+        if port is None:
+            return False
+        try:
+            return int(port.is_connected()) == 0
+        except Exception as exc:
+            _log_debug(
+                "[CONN] IsConnected probe on an idle closed-gap 3002 failed: "
+                f"[{type(exc).__name__}] {exc}"
+            )
+            return False
+
+    def _resolve_unresolved_3002(self) -> None:
+        """A 3003 or a fresh tick has answered the pending 3002."""
+        self._quote_intermediate_seen_at = 0.0
+        self._quote_timeout_deferred_since = 0.0
+        token = getattr(self, "_quote_ready_timer_id", None)
+        if not token:
+            return
+        try:
+            self.root.after_cancel(token)
+        except Exception:
+            pass
+        self._quote_ready_timer_id = None
+
+    def _arm_quote_window_from_subscription(self) -> None:
+        """Give an unresolved 3002 a full 15s window from this subscribe.
+
+        The 3002 timestamp is kept, so a tick from before it still does
+        not count. No IsConnected read and no other SKCOM call.
+        """
+        seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
+        if seen <= 0.0:
+            return
+        if self._quote_machine_phase() != LinkPhase.READY:
+            return
+        token = self._quote_ready_timer_id
+        if token:
+            try:
+                self.root.after_cancel(token)
+            except Exception:
+                pass
+            self._quote_ready_timer_id = None
+        self._quote_timeout_deferred_since = 0.0
+        self._quote_ready_timer_id = self.root.after(
+            15000, self._on_quote_ready_timeout)
+        _log_debug(
+            "[CONN] unresolved 3002: 15s fresh-tick window from "
+            "tick subscription")
+
+    def _mark_quote_down_for_recovery(self, *, reason: str) -> None:
+        """Arm the existing #178 quote-down path. Flags, then one tick.
+
+        Does not call LeaveMonitor, Login, or restart the process.
+        Orders are not paused: exits stay ungated. New entries block
+        because the quote is no longer READY. Refuses while the quote
+        is CONNECTING or DOWN: that is a #178 attempt already in
+        progress, and this path must not clear its 3003 wait.
+
+        Closed session, IsConnected()==0: the machine's 5s settle,
+        then EnterMonitorLONG. No ``enter_not_before``. The stuck
+        clock still waits until the next open. Closed session,
+        IsConnected() anything else, or the minute before the open:
+        EnterMonitorLONG waits until that open, and the gap makes no
+        further SKCOM call. Open session: the same 5s settle, then
+        EnterMonitorLONG only if IsConnected()==0.
+        """
+        if self._quote_machine_phase() != LinkPhase.READY:
+            _log_debug(
+                f"[CONN] quote-down ({reason}) skipped — quote is not READY; "
+                "not clearing the in-progress 3003 wait")
+            return
+        # #178 is about to run (_start_quote on the next tick). The
+        # deploy deferral for this 3002 is over.
+        self._quote_timeout_deferred_since = 0.0
+        self._set_quote_connected(False, reason)
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            _log_debug(
+                f"[CONN] quote-down ({reason}) not started — "
+                "link machine not adopted")
+            return
+        now = _taipei_now()
+        hold = None
+        stuck_until = None
+        open_session = is_market_open(now)
+        if not open_session:
+            nxt = _next_session_open(now)
+            stuck_until = nxt
+            hold = self._closed_gap_enter_hold(now, nxt)
+        host.machine.note_quote_not_ready(
+            now,
+            enter_not_before=hold,
+            release_at=now if open_session else None,
+        )
+        if stuck_until is not None:
+            host.machine.pause_stuck_clock_until(stuck_until)
+        if hold is not None:
+            _log(
+                "報價未就緒 Quote not ready during a closed session — "
+                "EnterMonitorLONG deferred until "
+                f"{hold.strftime('%Y-%m-%d %H:%M')} TPE"
+            )
+        else:
+            _log_debug(
+                f"[CONN] quote-down ({reason}) — "
+                f"settle {host.machine.config.quote_settle_s:.0f}s then "
+                "EnterMonitorLONG only if IsConnected()==0"
+            )
+        self._link_host_tick(force=True)
+        # After the gate. A quote-timeout block is not "waiting for
+        # reply reconcile".
+        self.set_status("報價未就緒 Quote not ready — waiting for ticks", "warn")
+        self._set_conn_dot("warn")
+
+    def _note_fresh_quote_tick(self) -> None:
+        """Wall clock of the latest fresh tick. The 3002 timeout reads it.
+
+        Also tells the link machine the market time, so a closed-gap
+        hold can tell a tick after the open from one during the gap.
+        """
+        self._last_fresh_tick_at = time.time()
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        note = getattr(machine, "note_fresh_tick", None)
+        if note is not None:
+            note(_taipei_now())
+        # A tick after the 3002, while the quote is still READY, answers
+        # that 3002. A tick after the quote was marked down is the
+        # restore signal instead, and must not clear the machine hold.
+        if (
+            self._quote_machine_phase() == LinkPhase.READY
+            and float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0) > 0.0
+            and self._quote_timeout_ticks_are_fresh()
+        ):
+            self._resolve_unresolved_3002()
+
+    # A tick newer than this is the only open-session proof the quote
+    # is alive. Same wall clock the tick watchdog stores in
+    # ``last_tick_time``; only a fresh tick writes it.
+    FRESH_TICK_LIVENESS_S = 30.0
+
+    def _quote_timeout_ticks_are_fresh(self) -> bool:
+        """True when an open session has had a fresh tick in the last 30s.
+
+        ``_last_fresh_tick_at`` is that tick's wall clock. IsConnected()
+        is not a liveness signal: it can read 1 while the quote is dead.
+        A closed session never counts, because no live tick can arrive.
+        """
+        if not is_market_open(_taipei_now()):
+            return False
+        tick_at = float(getattr(self, "_last_fresh_tick_at", 0.0) or 0.0)
+        if tick_at <= 0.0:
+            return False
+        # A tick from before this 3002 is not evidence the quote
+        # survived the missing 3003. A tick at the 3002 instant counts.
+        seen = float(getattr(self, "_quote_intermediate_seen_at", 0.0) or 0.0)
+        if seen and tick_at < seen:
+            return False
+        return (time.time() - tick_at) <= self.FRESH_TICK_LIVENESS_S
+
+    def _closed_gap_enter_hold(self, now, nxt):
+        """When EnterMonitorLONG must wait for the next open.
+
+        IsConnected()==0 reconnects during the gap, so this returns
+        None. The minute before the open still waits (#157). Any other
+        reading, including a probe error, waits for the open and the
+        gap makes no further SKCOM call. The read is the broker port.
+        """
+        if nxt is None:
+            return None
+        if (nxt - now) <= timedelta(minutes=1):
+            return nxt
+        host = getattr(self, "_link_host", None)
+        machine = getattr(host, "machine", None) if host is not None else None
+        port = getattr(machine, "port", None) if machine is not None else None
+        if port is None:
+            return nxt
+        try:
+            state = int(port.is_connected())
+        except Exception as exc:
+            _log_debug(
+                "[CONN] IsConnected probe on closed-gap quote-down failed: "
+                f"[{type(exc).__name__}] {exc}"
+            )
+            return nxt
+        if state == 0:
+            return None
+        return nxt
+
+    def _quote_down_if_resubscribe_disconnected(self, code) -> None:
+        """Q4: RequestTicks==0 and IsConnected()==0 starts #178 now.
+
+        The warn ladder would wait about 120s and then a second bad
+        read (~150s) before treating the quote as down. A quote that is
+        already disconnected at the session open does not need that
+        wait. Any other IsConnected value keeps the ladder.
+        """
+        if code != 0:
+            return
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        try:
+            state = int(host.machine.port.is_connected())
+        except Exception as exc:
+            _log_debug(
+                "[WATCHDOG] IsConnected probe after session resubscribe "
+                f"failed: [{type(exc).__name__}] {exc}")
+            return
+        if state != 0:
+            return
+        if host.machine.quote != LinkPhase.READY:
+            _log_debug(
+                "[WATCHDOG] session resubscribe RequestTicks=0 and "
+                f"IsConnected()={state} — quote is {host.machine.quote.value}; "
+                "not restarting an in-progress attempt")
+            return
+        _log(
+            "[WATCHDOG] session resubscribe RequestTicks=0 and "
+            "IsConnected()=0 — starting quote-down now "
+            "(not waiting for the 120s warn)"
+        )
+        self._mark_quote_down_for_recovery(reason="session_resubscribe")
 
     def _cancel_quote_ready_timer(self, reason: str) -> None:
-        """Cancel the Quote→Ready watchdog timer if armed."""
+        """Drop a pending 3002, and cancel its timer when one is armed.
+
+        Ready (3003), a disconnect (3021/3033), and manual Reconnect
+        all answer the 3002. An idle hold has no timer, so the stamps
+        are cleared even when ``_quote_ready_timer_id`` is None.
+        """
         if self._quote_ready_timer_id:
             try:
                 self.root.after_cancel(self._quote_ready_timer_id)
@@ -2025,7 +2427,8 @@ class BacktestApp:
                 pass
             _log_debug(f"[CONN] Quote→Ready timer cancelled (reason={reason})")
             self._quote_ready_timer_id = None
-            self._quote_intermediate_seen_at = 0.0
+        self._quote_intermediate_seen_at = 0.0
+        self._quote_timeout_deferred_since = 0.0
 
     def _on_disconnected(self, *, from_event: bool = False):
         """Handle connection loss: pause the feed. The link machine reconnects.
@@ -2033,14 +2436,21 @@ class BacktestApp:
         ``from_event`` is an OnConnection 3021/3033 that was already queued.
         The watchdog path is not, so it flags a quote-down for the machine.
         Neither path calls LeaveMonitor or LoginSetQuote.
+
+        A 3002 timeout clears ``_quote_connected`` without this cleanup.
+        A later 3021/3033 must still pause the tick feed, update status,
+        and tell the connection monitor. The latch, not the flag, is
+        what suppresses a second pass.
         """
-        if not self._quote_connected:
-            _log_debug(
-                "[STATE] _on_disconnected called but _quote_connected already False — "
-                "skipping (already handling disconnect)")
-            return  # already handling disconnect
+        already_down = not self._quote_connected
         self._cancel_quote_ready_timer("disconnected")
         self._set_quote_connected(False, "_on_disconnected")
+        if already_down and getattr(self, "_disconnect_cleanup_done", False):
+            _log_debug(
+                "[STATE] _on_disconnected called but cleanup already ran — "
+                "skipping (already handling disconnect)")
+            return
+        self._disconnect_cleanup_done = True
         self.set_status("斷線 Disconnected", "error")
         self._set_conn_dot("err")
         self.login_status_var.set("斷線 Disconnected")
@@ -2101,6 +2511,11 @@ class BacktestApp:
             alerts = []
         self._apply_link_gate()
         for alert in alerts:
+            # A duplicate 3003 while READY is logged on the tick path
+            # and is not an operator alert. Do not warn or Discord it.
+            if str(alert).startswith("3003 ignored"):
+                _log(str(alert))
+                continue
             self._on_link_alert(alert)
         self._publish_link_heartbeat()
         self.btn_reconnect.config(state=tk.NORMAL)
@@ -2212,11 +2627,38 @@ class BacktestApp:
         elif name == "complete":
             host.note_complete(now)
 
+    def _hold_quote_down_across_close(self, now) -> None:
+        """Do not let a *timeout* quote-down DEGRADE across a close.
+
+        Only ``note_quote_not_ready`` sets the hold flag. A 3021, 3033,
+        watchdog drop, or manual Reconnect clears it and reconnects
+        in the gap. The stuck clock stays paused until the next open.
+        EnterMonitorLONG is held only for a deferral already chosen
+        (IsConnected() was not 0) and for the minute before the open.
+        """
+        if is_market_open(now):
+            return
+        host = getattr(self, "_link_host", None)
+        if host is None:
+            return
+        machine = host.machine
+        if not machine._quote_timeout_hold:
+            return
+        nxt = _next_session_open(now)
+        if nxt is None:
+            return
+        machine.pause_stuck_clock_until(nxt)
+        if (nxt - now) <= timedelta(minutes=1) or (
+            machine._quote_enter_not_before is not None
+        ):
+            machine.hold_quote_enter_until(nxt)
+
     def _link_host_tick(self, *, force: bool = False) -> None:
         host = getattr(self, "_link_host", None)
         if host is None:
             return
         now = _taipei_now()
+        self._hold_quote_down_across_close(now)
         try:
             alerts = host.tick(now) if force else host.maybe_tick(now)
         except Exception as e:
@@ -2225,6 +2667,20 @@ class BacktestApp:
             return
         self._apply_link_gate()
         for alert in alerts:
+            text = str(alert)
+            if text.startswith("READY:"):
+                self._set_quote_connected(True, "hold_release")
+                # Same as the UI Ready (3003) path: a later 3021 must
+                # still pause the feed. The latch, not the flag, is
+                # what suppresses that cleanup.
+                self._disconnect_cleanup_done = False
+                self._resolve_unresolved_3002()
+                self._repaint_after_quote_restore()
+                _log(f"[RECONNECT] {text}")
+                continue
+            if text.startswith("3003 ignored"):
+                _log(text)
+                continue
             self._on_link_alert(alert)
         if alerts or force:
             self._publish_link_heartbeat()
@@ -2265,7 +2721,11 @@ class BacktestApp:
         _log("[QUOTE-STUCK] RequestTicks sent; waiting for ticks")
 
     def _clear_quote_stuck_if_ticks_resumed(self) -> None:
-        """A live tick after the one-shot. Clears stuck DEGRADED only."""
+        """A live tick after the one-shot. Clears stuck DEGRADED only.
+
+        Also clears ``_disconnect_cleanup_done``, matching Ready (3003)
+        and hold-release recovery, so a later 3021 still cleans up.
+        """
         recovery = getattr(self, "_quote_stuck", None)
         if recovery is None or not recovery.on_live_tick():
             return
@@ -2278,9 +2738,32 @@ class BacktestApp:
         if not alert:
             _log("[QUOTE-STUCK] ticks resumed; DEGRADED already clear")
             return
+        # Tick recovery has no 3003. The timeout cleared this flag, and
+        # a later deploy in this process treats False as not connected.
+        # Clear the disconnect latch too, the same way Ready (3003) does,
+        # so a later 3021 still pauses the feed.
+        self._set_quote_connected(True, "_clear_quote_stuck_if_ticks_resumed")
+        self._disconnect_cleanup_done = False
         _log(f"[RECONNECT] {alert}")
-        self._apply_link_gate()
+        self._repaint_after_quote_restore()
         self._publish_link_heartbeat()
+
+    def _repaint_after_quote_restore(self) -> None:
+        """Paint Connected, unless the gate still has a real block.
+
+        The quote-timeout latch is dropped first so a reply-reconcile
+        or equity hold can speak for itself. A quote that is merely
+        waiting for ticks is not that reason.
+        """
+        self._link_gate_latched = False
+        self._apply_link_gate()
+        if getattr(self, "_link_gate_latched", False):
+            return
+        host = getattr(self, "_link_host", None)
+        if host is not None and host.machine.degraded:
+            return
+        self.set_status("已連線 Connected", "ok")
+        self._set_conn_dot("ok")
 
     def _apply_link_gate(self) -> None:
         host = getattr(self, "_link_host", None)
@@ -2505,9 +2988,15 @@ class BacktestApp:
             self._resubscribe_ticks()
 
     def _resubscribe_ticks(self, _retry: int = 0):
-        """Re-subscribe to tick feed after reconnection."""
+        """Re-subscribe to tick feed after reconnection.
+
+        Returns the RequestTicks code, or None when the call was not
+        made. Callers that only need the subscription ignore it. The
+        session-open watchdog uses 0 plus IsConnected()==0 to start
+        the #178 quote-down path immediately.
+        """
         if not self._live_runner:
-            return
+            return None
         # Use the stored COM tick symbol (e.g. TX00 for MTX00/TMF00)
         com_symbol = getattr(self, '_live_tick_com_symbol', self._live_runner.symbol)
 
@@ -2558,7 +3047,7 @@ class BacktestApp:
                     next_retry = _retry + 1
                     self.root.after(retry_action.delay_seconds * 1000,
                                    lambda r=next_retry: self._resubscribe_ticks(r))
-                return
+                return code
 
             self._live_tick_active = True
             # Record the resubscribe attempt (not a real tick). on_tick()
@@ -2574,10 +3063,12 @@ class BacktestApp:
             self._live_log_msg(f"已重新訂閱 Tick resubscription active for {label}", "status")
             # Restart tick drain if not already running
             self._drain_tick_queue()
+            return code
         except Exception as e:
             self._live_log_msg(f"重新訂閱異常 Resubscribe error: {e}", "status")
             _log_debug(
                 f"[TICKS] RequestTicks raised: [{type(e).__name__}] {e}")
+            return None
 
     # ══════════════════════════════════════════════════════════════
     #  UI BUILD
@@ -2639,6 +3130,11 @@ class BacktestApp:
         # Bug A: timer that fires if Ready (3003) doesn't arrive after Quote (3002)
         self._quote_ready_timer_id = None
         self._quote_intermediate_seen_at: float = 0.0
+        self._quote_timeout_deferred_since: float = 0.0
+        # Wall clock of the latest fresh tick. The 15s 3002 timeout
+        # stays READY when this is at or after the 3002 and IsConnected
+        # is 1. Stale replay does not update it.
+        self._last_fresh_tick_at: float = 0.0
         # Bug C: consecutive IsConnected()!=1 readings from the watchdog "warn"
         # path. Two in a row (30s apart) before we force a disconnect — one
         # transient bad read shouldn't bypass the resubscribe → reconnect ladder.
@@ -4305,7 +4801,12 @@ class BacktestApp:
                 f"[{type(exc).__name__}] {exc}")
 
     def _note_reply_channel(self, kind: str) -> None:
-        """Main-thread cancel after a queued OnConnect or OnComplete."""
+        """Main-thread cancel of the reply-silent watch after a reply event.
+
+        OnConnect and OnComplete end that watch. This does not cancel
+        the Quote→Ready timer: OnSolaceReplyConnection and OnComplete
+        are not a 3003. Only Ready cancels that timer.
+        """
         label = str(kind) if kind is not None else ""
         watch = getattr(self, "_reply_watch", None)
         if watch is not None:
@@ -9610,6 +10111,7 @@ class BacktestApp:
             self._tick_watchdog.order_symbol = resolve_order_symbol(symbol)
             self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
             _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
+            self._arm_quote_window_from_subscription()
         except Exception as e:
             _log(f"報價訂閱錯誤 Tick subscribe error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._live_log_msg(f"訂閱錯誤 Subscribe error: {e}", "status")
@@ -9960,12 +10462,15 @@ class BacktestApp:
             _log("Tick watchdog: session transition — resubscribing for new session")
             self._live_log_msg(
                 "新盤重新訂閱 New session — re-subscribing ticks", "status")
-            self._resubscribe_ticks()
+            code = self._resubscribe_ticks()
             # Advance last_tick_time so the trigger condition clears.
             # Without this, every 30s check re-fires session_resubscribe
             # forever because last_tick_time still corresponds to the
             # prior closed-market period (issue #66).
             self._tick_watchdog.on_session_resubscribe()
+            # RequestTicks==0 with IsConnected()==0 is already down.
+            # Start #178 now instead of the ~150s warn ladder.
+            self._quote_down_if_resubscribe_disconnected(code)
 
         elif action == "reconnect":
             # Fast ladder and the stood-down slow retry both return this
@@ -10074,17 +10579,15 @@ class BacktestApp:
 
         Converts raw COM tick data to Tick, feeds to BarBuilder.
         When a 1-min bar completes, routes to LiveRunner.
+
+        A fresh tick records ``_last_fresh_tick_at`` before the runner
+        check. GUI idle and headless warmup have no RUNNING runner, and
+        the 15s timeout still needs that clock. The bar builder and the
+        strategy feed still require a RUNNING runner.
         """
-        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
-            return
-        if not self._live_bar_builder:
-            return
-
-        self._live_tick_count += 1
-
-        # Convert SK date/time integers to datetime FIRST — the timestamp
-        # drives both the watchdog freshness gate below and the staleness
-        # classification further down (issues #50 / #105).
+        # The timestamp drives the freshness gate and the staleness
+        # classification (issues #50 / #105). Record it before refusing
+        # a tick that arrived with no RUNNING runner.
         try:
             dt_aware = combine_sk_datetime(date, time_hms, time_millismicros)
             dt = dt_aware.replace(tzinfo=None) if dt_aware.tzinfo else dt_aware
@@ -10092,6 +10595,14 @@ class BacktestApp:
             return
         now_naive = _taipei_now().replace(tzinfo=None)
         tick_age = (now_naive - dt).total_seconds()
+        if tick_age <= HISTORY_STALENESS_SECONDS:
+            self._note_fresh_quote_tick()
+        if not self._live_runner or self._live_runner.state != LiveState.RUNNING:
+            return
+        if not self._live_bar_builder:
+            return
+
+        self._live_tick_count += 1
 
         if (not is_history or not self._live_history_done
                 or tick_age <= HISTORY_STALENESS_SECONDS):
@@ -10109,6 +10620,8 @@ class BacktestApp:
             # worked. Stale replay restarts the watchdog clock and must
             # not clear DEGRADED.
             if tick_age <= HISTORY_STALENESS_SECONDS:
+                # ``_last_fresh_tick_at`` was recorded above, before the
+                # runner check. This call only clears a stuck DEGRADED.
                 self._clear_quote_stuck_if_ticks_resumed()
             # A real tick means the COM session is alive — clear Bug C's
             # warn-shortcut counter so a transient IsConnected glitch
