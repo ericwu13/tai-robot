@@ -593,6 +593,86 @@ def test_w4_fetch_failure_is_p2(tmp_path):
     assert not any("no TAIFEX data" in m for m in p2)
 
 
+def test_empty_list_after_decided_vote_keeps_the_vote(tmp_path, monkeypatch):
+    """TAIFEX ``[]`` after this session's vote was decided is no-data.
+
+    Monday's pass can decide Friday's dataset for Monday night. A later
+    ``[]`` the same night must not delete that vote or ``last_decided_date``.
+    """
+    base = str(tmp_path / "regime_vote.json")
+    friday = "20260828"
+    monday_1615 = datetime(2026, 8, 31, 16, 15, tzinfo=TPE)
+    monday_2015 = datetime(2026, 8, 31, 20, 15, tzinfo=TPE)
+    chips.save_state(chips.state_path_for(base), {"history": {"20260827": -83_655.0}})
+    row = {
+        "Date": friday,
+        "ContractCode": "臺股期貨",
+        "Item": "外資及陸資",
+        "OpenInterest(Net)": "-75,655",
+    }
+    bodies = {"taifex": json.dumps([row]).encode()}
+    twse = json.dumps({
+        "stat": "OK",
+        "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+        "data": [["外資及陸資", "1", "2", "6000000000"]],
+    }).encode()
+
+    def fake(req, timeout=None, context=None):
+        url = getattr(req, "full_url", "")
+        if "twse.com.tw" in url:
+            return _Body(twse)
+        return _Body(bodies["taifex"])
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, None, monday_1615) == 0
+    vote = chips.w4_vote_path(base)
+    before = vote.read_bytes()
+    decided = chips.load_state(chips.state_path_for(base))["last_decided_date"]
+    assert decided == friday
+    assert json.loads(before)["expires_after_session"] == "2026-08-31|NIGHT"
+
+    bodies["taifex"] = b"[]"
+    assert chips.run_once(base, None, monday_2015) == 0
+    assert vote.read_bytes() == before
+    state = chips.load_state(chips.state_path_for(base))
+    assert state["last_decided_date"] == decided
+    assert "no taifex data" in _log(base).lower()
+
+
+def test_twse_zero_rows_is_no_data_and_keeps_vote(tmp_path, monkeypatch):
+    """A TWSE 200 with ``stat`` OK and zero data rows is no-data.
+
+    The vote file is not deleted or rewritten, and the log says no-data.
+    """
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    chips.save_state(chips.state_path_for(base), {
+        "history": {"20260813": 0.0},
+        "last_decided_date": "20260813",
+    })
+    row = {"Date": "20260814", "ContractCode": "臺股期貨", "Item": "外資及陸資",
+           "OpenInterest(Net)": "8,123"}
+    twse = {
+        "stat": "OK",
+        "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+        "data": [],
+    }
+
+    def fake(req, timeout=None, context=None):
+        url = getattr(req, "full_url", "")
+        if "twse.com.tw" in url:
+            return _Body(json.dumps(twse).encode())
+        return _Body(json.dumps([row]).encode())
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", fake)
+    assert chips.run_once(base, "20260814", _FRIDAY) == 0
+    assert vote.read_bytes() == before
+    state = chips.load_state(chips.state_path_for(base))
+    assert state.get("last_decided_date") == "20260813"
+    assert "no-data" in _log(base).lower()
+
+
 def test_stale_fetch_failure_reports_stale_not_the_live_fetch(tmp_path):
     """A task that died after a failed fetch is stale. The fetch finding
     is for a bridge that is still checking in."""

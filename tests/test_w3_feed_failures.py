@@ -538,3 +538,67 @@ def test_real_id_is_not_suppressed_by_a_stored_link():
     link = "https://example.com/story"
     article = {"guid": "urn:real-id", "link": link, "title": "Story"}
     assert rss_scorer.dedup_articles([article], {"seen_guids": [link]}) == [article]
+
+
+def test_guid_v2_at_cutoff_skips_legacy_and_stamps_once(monkeypatch, tmp_path):
+    """A pre-cutoff item seen under the bare link is not re-scored.
+
+    A post-cutoff item that only shares that link is scored. ``guid_v2_at``
+    is stamped into the scorer state on the first v2 pass and left as-is
+    on the next one, including a ``save_state`` / ``load_state`` round trip.
+    """
+    link = "https://www.investing.com/news/123"
+    old_title = "Old headline"
+    new_title = "New headline"
+    pre = {
+        "guid": f"{link}|{old_title}",
+        "link": link,
+        "title": old_title,
+        "summary": "already scored under the bare link",
+        "published_dt": _NOW - timedelta(hours=2),
+        "source": "Investing.com",
+        "feed_tag": "",
+    }
+    post = {
+        "guid": f"{link}|{new_title}",
+        "link": link,
+        "title": new_title,
+        "summary": "published after the v2 cutoff",
+        "published_dt": _NOW + timedelta(minutes=30),
+        "source": "Investing.com",
+        "feed_tag": "",
+    }
+    scored: list[str] = []
+
+    def fake_score(headline, summary, api_key, source=""):
+        scored.append(headline)
+        return {"direction": "neutral", "confidence": 0.2, "reason": "ok"}
+
+    monkeypatch.setattr(rss_scorer, "fetch_all_feeds", lambda *_a, **_k: [pre, post])
+    monkeypatch.setattr(rss_scorer, "score_article", fake_score)
+    cfg = {
+        "feeds": ["https://www.investing.com/rss/news_301.rss"],
+        "gemini_api_key": "fake-key",
+        "discord_webhook_url": "",
+        "discord_mode": "off",
+    }
+    state = rss_scorer.check_once(cfg, {"seen_guids": [link]}, "", now=_NOW)
+    assert scored == [new_title]
+    stamped = state["guid_v2_at"]
+    assert stamped == _NOW.isoformat(timespec="seconds")
+    assert link in state["seen_guids"]
+
+    path = tmp_path / "rss_scorer_state.json"
+    rss_scorer.save_state(str(path), state)
+    loaded = rss_scorer.load_state(str(path))
+    assert loaded["guid_v2_at"] == stamped
+    assert link in loaded["seen_guids"]
+
+    scored.clear()
+    loaded = rss_scorer.check_once(cfg, loaded, "", now=_NOW + timedelta(days=1))
+    assert loaded["guid_v2_at"] == stamped
+    assert scored == []
+    rss_scorer.save_state(str(path), loaded)
+    again = rss_scorer.load_state(str(path))
+    assert again["guid_v2_at"] == stamped
+    assert link in again["seen_guids"]
