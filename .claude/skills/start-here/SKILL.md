@@ -123,6 +123,8 @@ A run on this PC describes this PC only — never publish it as fleet health.
 The fleet path is read-only HTTP (`/api/fleet`, `/api/bot`; address in
 `hosts.local.yaml`). No script runs on Steven by default.
 
+ssh reads are read-only and only when the brief explicitly permits them and names the host and paths; no writes, no scripts.
+
 `daily_review.py` and `check_logs.py` on Steven are not supported until
 those scripts take a base-dir flag (tracked follow-up). Both always read
 `REPO_ROOT/data/live` (`scripts/monitor/common.py` `default_base_dir`).

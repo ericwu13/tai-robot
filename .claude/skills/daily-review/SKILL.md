@@ -18,8 +18,7 @@ description: Orchestrate the full tai-robot health pipeline — fetch (monitor s
 > weeks behind.
 
 This skill sequences the pipeline; the knowledge lives in the stage
-skills. Keep every stage light: a GREEN day with no fresh issues costs
-one script run, one `gh` call, and zero subagents. The scheduled task
+skills. Keep every stage light. The scheduled task
 runs this exact skill — do not fork its logic elsewhere.
 
 Hard rules that override everything: the main working tree is READ-ONLY
@@ -88,7 +87,11 @@ disqualifies stage 5.
 
 ## Stage 4 — publish
 
-Digest ≤1900 chars: `<verdict emoji> tai-robot daily review — <TPE date>
+Fleet headline, no verdict emoji: `UNGRADED (fleet, API only): not fetched: regime, logs, bridges`.
+Name whichever of regime, logs, and bridges were not actually fetched
+from the fleet. Do not publish a GREEN fleet digest.
+
+Digest ≤1900 chars: that headline, then `tai-robot daily review — <TPE date>
 (Claude)`, one healthy-summary line, each P1/P2 theme with the VALIDATED
 interpretation + one action, fresh issues as `#N title (root-caused?
 PR?)`, stage-5 PR link if any. Delivery: settings.yaml →

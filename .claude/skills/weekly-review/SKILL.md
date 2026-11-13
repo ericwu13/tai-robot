@@ -25,21 +25,12 @@ read-only, no merges, redact everything).
 
 ## Stage 1 — fetch (no subagents)
 
-`check_evolution.py` writes nothing (`scripts/monitor/check_evolution.py`;
-pool open is `mode=ro`; `main()` only prints). With
-explicit permission in the brief, read-only, on the data host, using that
-host's own interpreter (not a path from this PC):
-
-```bash
-python -s scripts/monitor/check_evolution.py <install_dir>\data\live <install_dir>
-```
-
-`<install_dir>` is `steven.install_dir` in `hosts.local.yaml`. `argv[1]`
-is base_dir and `argv[2]` is repo_root (`check_evolution.py` `main`).
+The fleet evo check is unavailable until `check_evolution.py` gets
+per-path flags (tracked follow-up). Do not run it on Steven.
 
 Week rollup of daily verdicts is not available from the data host (reports are written only where `daily_review.py` runs); say so in the report.
 
-Fallback, this PC only:
+Fallback, this PC only, not the fleet verdict:
 
 ```bash
 C:/Python313/python.exe -s scripts/monitor/check_evolution.py
@@ -67,8 +58,10 @@ line in the digest (bot count, phase reached per bot, whether it changes
 this week's finding) and feeds stage 2b. Non-EVO issues are the daily
 review's job — list them in one line, don't triage.
 
-**No P1/P2 from the evolution check and no RED day in the rollup → skip
-to stage 3's inline validation, publish a one-line green digest.**
+**Do not publish a green digest** unless both a real daily rollup and a
+real evo check ran on the fleet. Neither is available, so the fleet week
+is UNGRADED, including a post from an unattended routine. Do not skip
+ahead on "no RED day".
 
 ## Stage 2 — review (0–1 subagent)
 
@@ -76,18 +69,20 @@ For evolution findings, one read-only Explore agent (model sonnet)
 follows `.claude/skills/evo-debug/SKILL.md` — pass it the findings and
 the evidence map; it answers which gate blocked the Saturday run (or
 which phase the run died in), whether that is by-design or an outage,
-and the single operator action. RED days in the rollup are already
-explained inside their daily report file — read that file, don't re-run
-the checks.
+and the single operator action. Daily report files exist only where
+`daily_review.py` ran (this PC). A 🟢/🟡/🔴 day in those files is
+'this PC only, not the fleet verdict'. Don't re-run the checks.
 
 ## Stage 2b — evolution EFFICACY audit (every week, cheap; 2 agents when triggered)
 
 "Did the slot fire" (stage 1) is not "is evolution working". Every week
-also answer, from primary evidence only. `data/ai_usage.csv` and
-`data/live/<bot>/session.json` are on the data host, not this PC. A read
-of this PC's copies is this PC only.
+also answer, from primary evidence only. The fleet evo check
+(`data/ai_usage.csv` and the pool) is unavailable until
+`check_evolution.py` gets per-path flags (tracked follow-up). A read of
+this PC's copies is this PC only, not the fleet verdict.
 
-1. **Attempt history** — the data host's `data/ai_usage.csv` (UTC; TPE =
+1. **Attempt history** — this PC's `data/ai_usage.csv` only, labelled
+   'this PC only, not the fleet verdict' (UTC; TPE =
    +8): per past Saturday, plan rows (`bot_evolution`) vs candidate rows
    (`evolution_codegen_*`). A Saturday with a plan but no codegen row =
    plan said `no_change`; no rows at all = skip or app closed (check the
@@ -149,10 +144,11 @@ is by design.
 ## Stage 4 — publish
 
 Digest ≤1900 chars: `🧬 tai-robot weekly review — week of <TPE Saturday
-date> (Claude)`, then: whether Saturday's evolution ran and the phase it
-reached (plan / codegen / verdict, PASS or FAIL), per-bot watermark
+date> (Claude)`, then: the fleet evolution phase is UNGRADED until a
+real evo check ran on the fleet (do not fill PASS/FAIL from this PC), per-bot watermark
 movement, next-Saturday eligibility (any non-regime bot running?), the
-week's daily verdicts as a compact line (e.g. `Mon 🟢 Tue 🟡 …`), the
+week's fleet days as UNGRADED (not `Mon 🟢 Tue 🟡`). Any local this-PC
+🟢/🟡 day is labelled 'this PC only, not the fleet verdict'. Then the
 stage-2b efficacy line (candidate streak, PASS count, P&L trend, deep-audit
 verdict when it ran), and one recommended action if any. Delivery identical to `daily-review` stage 4
 (monitor channel via bot token when configured, else the news webhook;
