@@ -818,6 +818,10 @@ def test_leave_monitor_is_stamped_via_call_com():
     body = app[match_start:match_end]
     assert "LeaveMonitor" not in body
     assert "LoginSetQuote" not in body
-    send_at = app.find("skO.SendFutureOrderCLR")
+    send_at = app.find("_broker.place_order(")
     assert send_at != -1
-    assert "call_com(" in app[max(0, send_at - 120):send_at]
+    register_at = app.find("self._fill_tracker.register_order(", send_at)
+    assert register_at != -1
+    clr = port.find("SendFutureOrderCLR")
+    assert clr != -1
+    assert "_direct(" in port[max(0, clr - 200):clr]

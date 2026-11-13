@@ -8,8 +8,9 @@ name: Claude Review
 #   - a non-draft PR is opened / reopened, or a draft is marked ready
 #     (the workflow then adds the `claude-review` label itself)
 #   - the `claude-review` label is added (works on drafts)
-#   - a push to a PR that carries the `claude-review` label (every push gets
-#     a fresh verdict, because master requires this check per commit)
+#   - a push to a non-draft PR, or to a draft that carries the `claude-review`
+#     label (every push gets a fresh verdict, because master requires this
+#     check per commit; an unlabeled non-draft PR is labeled on that push)
 # Unlabeled drafts never run, so they cost nothing. Rapid pushes cancel the
 # in-flight review (concurrency below), so only the latest commit is reviewed.
 #
@@ -57,7 +58,7 @@ jobs:
             case "$ACTION" in
               opened|reopened|ready_for_review) [ "$DRAFT" = "false" ] && eligible=true ;;
               labeled) eligible=true ;;
-              synchronize) [ "$HAS_LABEL" = "true" ] && eligible=true ;;
+              synchronize) { [ "$HAS_LABEL" = "true" ] || [ "$DRAFT" = "false" ]; } && eligible=true ;;
             esac
           fi
           echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
@@ -66,7 +67,7 @@ jobs:
       # Label auto-reviewed PRs so later pushes re-review. Labels added with
       # the job token do not trigger another workflow run.
       - name: Label for re-review on push
-        if: steps.gate.outputs.eligible == 'true' && github.event.action != 'labeled' && github.event.action != 'synchronize'
+        if: steps.gate.outputs.eligible == 'true' && github.event.action != 'labeled' && !contains(github.event.pull_request.labels.*.name, 'claude-review')
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr edit ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --add-label claude-review
