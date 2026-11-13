@@ -1310,6 +1310,31 @@ def test_bridge_fresh_signal_in_a_ledger_is_not_p1(tmp_path, bridge):
     assert any("TMF00_bot" in ln for ln in lines)
 
 
+def test_bridge_kept_vote_lines_are_not_voteless(tmp_path, bridge):
+    """Three keep-vote lines after a decision are not a W4 voteless streak.
+
+    The line names the dataset and the on-disk session and does not
+    contain ``no TAIFEX data``, so the walker stops instead of counting.
+    """
+    from tests.test_chips_monitor import chips
+    keep = chips._kept_vote_no_data_message(
+        "no TAIFEX data — no data yet (API lag) — no vote",
+        "20260828",
+        "2026-08-31|NIGHT",
+    )
+    assert "no taifex data" not in keep.lower()
+    (bridge / "chips_monitor.log").write_text(
+        "2026-08-31 16:15:04 TPE | ΔOI +8,000 | vote: trending-up | "
+        "strong (data 20260828)\n"
+        "2026-08-31 18:15:04 TPE | " + keep + "\n"
+        "2026-08-31 20:15:04 TPE | " + keep + "\n"
+        "2026-08-31 22:15:04 TPE | " + keep + "\n",
+        encoding="utf-8")
+    findings, lines = check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
+    assert not any("W4 voteless" in m for m in messages(findings, "P2")), messages(findings, "P2")
+    assert any("voteless streak: 0" in ln for ln in lines)
+
+
 def test_bridge_chips_voteless_streak_is_p2(tmp_path, bridge):
     (bridge / "chips_monitor.log").write_text(
         "2026-08-20 16:15:04 TPE | vote trending-up\n"

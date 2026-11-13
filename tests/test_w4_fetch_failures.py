@@ -638,7 +638,7 @@ def test_empty_list_after_decided_vote_keeps_the_vote(tmp_path, monkeypatch):
     assert state["last_decided_date"] == decided
     log = _log(base).lower()
     assert "no-data" in log
-    assert f"decided vote for {friday} left unchanged" in log
+    assert f"decided vote for {friday} (2026-08-31|night) left unchanged" in log
     # The streak phrase would count a kept vote as voteless.
     assert "no taifex data" not in log
     assert "decided vote for 20260831" not in log

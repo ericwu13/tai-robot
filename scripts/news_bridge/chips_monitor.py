@@ -728,20 +728,22 @@ def _abort_fetch(state: dict, now: datetime, spath, base_path: str,
     return 1
 
 
-def _kept_vote_no_data_message(no_data: str, decided: str) -> str:
+def _kept_vote_no_data_message(no_data: str, decided: str, session: str) -> str:
     """No-data line for a vote that stays on disk.
 
-    Names *decided*, the dataset the vote came from. On a scheduled
-    ``[]`` the pass's trade date has already replaced ``date_key``, so
-    naming that date would point at today instead of the dataset.
+    Names *decided* (the dataset the vote came from) and *session*
+    (``expires_after_session`` on the vote file). On a scheduled ``[]``
+    the pass's trade date has already replaced ``date_key``, so naming
+    that date would point at today instead of the dataset.
     The ``no TAIFEX data`` prefix is dropped: that phrase is what the
-    voteless streak counts, and this pass still has a vote.
+    voteless streak counts, and this pass still has a vote. The walker
+    then stops on this line instead of adding to the streak.
     """
     prefix = "no TAIFEX data"
     detail = str(no_data or "").strip()
     if detail.lower().startswith(prefix.lower()):
         detail = detail[len(prefix):].strip(" \t—-")
-    body = f"decided vote for {decided} left unchanged"
+    body = f"decided vote for {decided} ({session}) left unchanged"
     if detail:
         return f"no-data — {detail}; {body}"
     return f"no-data — {body}"
@@ -858,12 +860,14 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
         # though last_decided_date is not today's calendar date. An
         # explicit --date keeps it only when that date was the one
         # decided, so the next day's empty result still deletes.
+        on_disk = _vote_session(base_path)
         same_explicit_day = (not scheduled) and bool(decided) and str(date_key or "") == decided
-        same_session = scheduled and bool(decided) and _vote_session(base_path) == night_session_key(now)
+        same_session = scheduled and bool(decided) and on_disk == night_session_key(now)
         if empty_result and (same_explicit_day or same_session):
             return _no_data_keep_vote(
                 state, now, spath, base_path, dry_run,
-                _kept_vote_no_data_message(no_data, decided))
+                _kept_vote_no_data_message(
+                    no_data, decided, on_disk or night_session_key(now)))
         print(f"  {no_data}")
         if not dry_run:
             delete_stale_vote(base_path)
