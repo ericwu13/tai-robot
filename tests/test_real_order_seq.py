@@ -172,7 +172,7 @@ def test_stop_close_exit_never_lands_on_the_previous_paper_trade():
     _open(b, bar=12)
     assert b.note_real_order_sent("entry", SEQ_E, 12)
     caller_bar_idx = b.trades[-1].exit_bar_index      # what run_backtest passes
-    assert b.note_real_order_sent("exit", SEQ_X, caller_bar_idx)
+    assert b.note_real_order_sent("exit", SEQ_X, caller_bar_idx, open_position=True)
     assert b.trades[0].exit_order_seq == ""
     assert not real_pnl.is_real_order(b.to_dict()["trades"][0])
     b.force_close(15, 44800)              # the stop's sim force-close
@@ -184,7 +184,7 @@ def test_stop_close_exit_never_lands_on_the_previous_paper_trade():
 def test_pending_exit_seq_survives_a_save_before_the_sim_close():
     b = SimulatedBroker(point_value=PV)
     _open(b, bar=5)
-    b.note_real_order_sent("exit", SEQ_X, -1)
+    b.note_real_order_sent("exit", SEQ_X, -1, open_position=True)
     r = SimulatedBroker.from_dict(b.to_dict())
     r.force_close(9, 44900)
     assert r.trades[-1].exit_order_seq == SEQ_X

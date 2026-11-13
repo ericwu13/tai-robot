@@ -298,9 +298,10 @@ class SimulatedBroker:
         # Whether the open position was opened by this (seq-stamping) code;
         # False for a position restored from an older session file.
         self.entry_seq_tracked: bool = False
-        # Seq of a real EXIT order sent while the sim position was still
-        # open (stop-close sends the order before the sim force-close).
-        # Attached to that position's Trade when it closes.
+        # Seq of a real EXIT the stop-close path sent for the still-open
+        # position, before the sim force-close. note_real_order_sent parks
+        # it here only when open_position=True. Attached to that position's
+        # Trade when it closes. A same-bar re-entry does not use this slot.
         self.pending_exit_order_seq: str = ""
 
         # Last exit metadata — read by live_runner to determine real order type
@@ -649,7 +650,8 @@ class SimulatedBroker:
         last.real_exit_estimated = False
         return True
 
-    def note_real_order_sent(self, action_type: str, seq: str, bar_index: int) -> bool:
+    def note_real_order_sent(self, action_type: str, seq: str, bar_index: int,
+                             open_position: bool = False) -> bool:
         """Stamp the seq no of a real order the broker accepted.
 
         ``bar_index`` is the snapshot the caller took when the order went
@@ -658,10 +660,13 @@ class SimulatedBroker:
         longer matches: flat / no trade, a different bar index, or a seq
         already stamped for that leg (a retry keeps the first order's seq).
 
-        An EXIT sent while the sim position is still open (the stop-close
-        path sends the order before the sim force-close) belongs to that
-        open position, not to the last closed trade: it is held in
-        ``pending_exit_order_seq`` and lands on the Trade at close.
+        With ``open_position=False`` (every exit except stop-close) the seq
+        is written on ``trades[-1]`` when ``exit_bar_index`` matches, and
+        the first seq wins. ``open_position=True`` parks the seq in
+        ``pending_exit_order_seq`` only when a position is open and nothing
+        is parked yet; otherwise it returns False. The parked seq lands on
+        that position's Trade at close. A same-bar re-entry must not use
+        this flag: the closed trade is identified by its exit bar.
         """
         seq = str(seq or "").strip()
         if not seq:
@@ -672,8 +677,8 @@ class SimulatedBroker:
                 return False
             self.entry_order_seq = seq
             return True
-        if self.position_size > 0:
-            if self.pending_exit_order_seq:
+        if open_position:
+            if self.position_size == 0 or self.pending_exit_order_seq:
                 return False
             self.pending_exit_order_seq = seq
             return True

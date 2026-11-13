@@ -11099,12 +11099,16 @@ class BacktestApp:
     _FORCE_CLOSE_RETRY_DELAYS = [5000, 10000, 15000]  # ms
 
     def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price,
-                         new_close=2, exit_type="", exit_limit=None):
+                         new_close=2, exit_type="", exit_limit=None,
+                         exit_open_position=False):
         """Build FUTUREORDER and send via COM SKOrderLib.
 
         new_close: 0=new position, 1=close position, 2=auto (exchange decides).
         exit_type: "limit" (TP), "stop" (SL), "close", "force_close", or "".
         exit_limit: strategy's original limit price for take-profit exits.
+        exit_open_position: True only for the stop-close path, which sends
+        the EXIT while the sim position is still open. Every other caller
+        leaves this False so the seq matches the closed trade by bar.
 
         Returns True if order was accepted (code==0), False otherwise.
         """
@@ -11242,7 +11246,8 @@ class BacktestApp:
                     # then). Best-effort: must never break the order path.
                     try:
                         stamped = broker.note_real_order_sent(
-                            action_type, str(message), bar_idx)
+                            action_type, str(message), bar_idx,
+                            open_position=exit_open_position)
                         if not stamped:
                             _log(f"REAL ORDER SEQ not stamped: {action_type} "
                                  f"seq={str(message).strip()} bar={bar_idx}")
@@ -12538,7 +12543,8 @@ class BacktestApp:
                 # Force semi-auto path for stop-close (no fill gating — bot is stopping)
                 saved_mode = self._trading_mode
                 self._trading_mode = "semi_auto"
-                self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
+                self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1,
+                                      exit_open_position=True)
                 self._trading_mode = saved_mode
             elif (self._trading_mode in ("semi_auto", "auto")
                     and not self._trading_guard.real_entry_confirmed
