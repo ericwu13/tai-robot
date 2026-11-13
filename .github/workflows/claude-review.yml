@@ -92,10 +92,13 @@ jobs:
       - name: Run Claude review
         if: steps.gate.outputs.eligible == 'true'
         id: claude
+        # A failed attempt is retried once below; the Verdict gate still fails
+        # closed if neither attempt returns a verdict.
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         env:
           GH_TOKEN: ${{ github.token }}
-        with:
+        with: &claude_review_with
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: cursor
           claude_args: |
@@ -166,11 +169,33 @@ jobs:
                it open. Return [] when none are fixed or the file is empty. The
                workflow only resolves threads from that file.
 
-      - name: Post inline threads and summary
-        if: always() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output != ''
+      # show_full_output stays off (public repo logs); print only the result
+      # record so an API/usage-limit failure is visible instead of silent.
+      - name: Show why the review returned no verdict
+        if: always() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output == ''
+        env:
+          EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
+            jq -c '[.[] | select(.type == "result") | {subtype, is_error, num_turns, duration_ms, result, api_error_status, error}]' "$EXEC_FILE" || true
+          else
+            echo "No execution file (the action stopped before running Claude; see the step log above)."
+          fi
+          sleep 30
+
+      - name: Retry Claude review once
+        if: always() && steps.gate.outputs.eligible == 'true' && steps.claude.outputs.structured_output == ''
+        id: claude_retry
+        uses: anthropics/claude-code-action@v1
         env:
           GH_TOKEN: ${{ github.token }}
-          RESULT: ${{ steps.claude.outputs.structured_output }}
+        with: *claude_review_with
+
+      - name: Post inline threads and summary
+        if: always() && steps.gate.outputs.eligible == 'true' && (steps.claude.outputs.structured_output != '' || steps.claude_retry.outputs.structured_output != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.claude.outputs.structured_output || steps.claude_retry.outputs.structured_output }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         # The script comes from master (the action refuses to run unless this
@@ -183,7 +208,7 @@ jobs:
         if: always()
         env:
           ELIGIBLE: ${{ steps.gate.outputs.eligible }}
-          RESULT: ${{ steps.claude.outputs.structured_output }}
+          RESULT: ${{ steps.claude.outputs.structured_output || steps.claude_retry.outputs.structured_output }}
         run: |
           if [ "$ELIGIBLE" != "true" ]; then
             echo "::error::Not reviewed. Add the 'claude-review' label (drafts, pushes to unlabeled PRs) or mark the PR ready for review. Fork PRs are not reviewed."
