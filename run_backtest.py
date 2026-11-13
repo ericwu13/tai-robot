@@ -9412,7 +9412,7 @@ class BacktestApp:
             self._live_warmup_via_tv(kt, km)
         else:
             self._live_log_msg("無資料來源 No data source for warmup", "status")
-            self._stop_live()
+            self._abort_deploy("no data source for warmup")
 
     def _live_warmup_via_com(self, kline_type, kline_minute, days):
         """Fetch warmup data via COM API."""
@@ -9438,12 +9438,12 @@ class BacktestApp:
                 self._live_log_msg(
                     f"暖機查詢失敗 Warmup failed: code={code} {msg}", "status")
                 self._live_warmup_mode = False
-                self._stop_live()
+                self._abort_deploy(f"warmup fetch failed: code={code} {msg}")
                 return
         except Exception as e:
             _log(f"暖機錯誤 Warmup error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._live_warmup_mode = False
-            self._stop_live()
+            self._abort_deploy(f"warmup error: {type(e).__name__}: {e}")
             return
 
         # Safety timeout — if OnKLineComplete never fires, stop gracefully
@@ -9457,7 +9457,7 @@ class BacktestApp:
             _log("暖機逾時 Warmup timeout — no data received in 30s")
             self._live_log_msg("暖機逾時 Warmup timeout (30s)", "status")
             self._live_warmup_mode = False
-            self._stop_live()
+            self._abort_deploy("warmup timeout (30s, no data)")
 
     def _live_warmup_via_tv(self, kline_type, kline_minute):
         """Fetch warmup data via TradingView (in thread)."""
@@ -9465,7 +9465,7 @@ class BacktestApp:
         tv_interval_name = TV_INTERVALS.get((kline_type, kline_minute))
         if not tv_interval_name:
             self._live_log_msg(f"TV不支援此週期 Unsupported interval for TV", "status")
-            self._stop_live()
+            self._abort_deploy("TV warmup: unsupported interval")
             return
 
         tv_symbol = resolve_tv_symbol(runner.symbol)
@@ -9478,7 +9478,8 @@ class BacktestApp:
                 if err:
                     self.root.after(0, lambda: self._live_log_msg(
                         f"TV暖機失敗 {err.message}", "status"))
-                    self.root.after(0, self._stop_live)
+                    self.root.after(0, self._abort_deploy,
+                                    f"TV warmup failed: {err.message}")
                     return
 
                 kline_strings = tv_dataframe_to_kline_strings(df)
@@ -9496,7 +9497,8 @@ class BacktestApp:
             except Exception as e:
                 _log(f"TV暖機錯誤: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
                 self.root.after(0, lambda err=e: self._live_log_msg(f"TV暖機錯誤: {err}", "status"))
-                self.root.after(0, self._stop_live)
+                self.root.after(0, self._abort_deploy,
+                                f"TV warmup error: {type(e).__name__}: {e}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -9582,7 +9584,7 @@ class BacktestApp:
 
         if not _com_available or not self._quote_connected:
             self._live_log_msg("未連線 Not connected, cannot subscribe to ticks", "status")
-            self._stop_live()
+            self._abort_deploy("Not connected, cannot subscribe to ticks")
             return
 
         # Suppress strategy during history tick catchup — no trades on old data
@@ -9600,7 +9602,7 @@ class BacktestApp:
             if code != 0 and code >= 3000:
                 msg = _return_code_text(code)
                 self._live_log_msg(f"訂閱失敗 Tick subscribe failed: {msg}", "status")
-                self._stop_live()
+                self._abort_deploy(f"tick subscribe failed: code={code} {msg}")
                 return
             self._live_tick_active = True
             self._tick_watchdog.on_tick()
@@ -9613,7 +9615,7 @@ class BacktestApp:
         except Exception as e:
             _log(f"報價訂閱錯誤 Tick subscribe error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
             self._live_log_msg(f"訂閱錯誤 Subscribe error: {e}", "status")
-            self._stop_live()
+            self._abort_deploy(f"tick subscribe error: {type(e).__name__}: {e}")
 
         # Start draining tick queue on main thread
         self._drain_tick_queue()
@@ -12421,8 +12423,75 @@ class BacktestApp:
         except Exception as e:
             _log(f"[HEARTBEAT] stop failed: [{type(e).__name__}] {e}")
 
-    def _stop_live(self):
-        """Stop the live bot and restore UI."""
+    def _abort_deploy(self, reason: str) -> None:
+        """Stop a deploy/resume that failed before it reached live ticks.
+
+        Owner decision (2026-11-13): stop the bot, leave the position
+        alone and send an alert. No stop-close is sent, the sim position
+        is not force-closed, and the session is saved open so
+        ``--resume`` picks the position up again. Paper is treated the
+        same way. The user's own stop still goes through ``_stop_live()``.
+        """
+        self._stop_live(abort_reason=str(reason or "deploy aborted"))
+
+    def _alert_deploy_abort_keeps_position(self, reason: str) -> str:
+        """Log + priority Discord for a deploy abort; returns the text.
+
+        Names the symbol, side, quantity and reason. Best-effort: an
+        alert failure must not stop the teardown. The caller shows the
+        ``_alert`` popup after teardown so a modal dialog cannot run
+        nested Tk callbacks against a half-stopped bot.
+        """
+        try:
+            runner = self._live_runner
+            symbol = runner.symbol if runner else "?"
+            broker = runner.broker if runner else None
+            qty = int(getattr(broker, "position_size", 0) or 0) if broker else 0
+            side_obj = getattr(broker, "position_side", None) if broker else None
+            side = (side_obj.value if side_obj is not None and qty > 0 else "FLAT")
+            mode = self._trading_mode
+            real = (mode in ("semi_auto", "auto")
+                    and self._trading_guard.real_entry_confirmed)
+            book = "real" if real else ("paper" if mode == "paper" else "sim")
+            if qty > 0:
+                pos = (f"{book} position {side} x{qty} {symbol} "
+                       f"NOT closed — manage it manually or --resume")
+            else:
+                pos = f"{symbol} FLAT x0 (sim); no order sent"
+            msg = (f"部署中止 Deploy aborted [{mode}]: {reason}. "
+                   f"Bot stopped, no order sent. {pos}.")
+        except Exception as e:  # noqa: BLE001
+            msg = (f"部署中止 Deploy aborted: {reason}. Bot stopped, no order "
+                   f"sent. Position NOT closed (details unavailable: "
+                   f"{type(e).__name__}).")
+        try:
+            _log(f"[DEPLOY ABORT] {msg}")
+        except Exception:  # noqa: BLE001 — alert must not break teardown
+            pass
+        try:
+            self._live_log_msg(msg, "exit")
+        except Exception:
+            pass
+        discord = _discord
+        if discord is not None and getattr(discord, "enabled", False):
+            try:
+                discord.notify(f"\U0001F6A8 {msg}", priority=True)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _log(f"[DEPLOY ABORT] Discord notify failed: "
+                         f"[{type(e).__name__}] {e}")
+                except Exception:  # noqa: BLE001
+                    pass
+        return msg
+
+    def _stop_live(self, abort_reason: str | None = None):
+        """Stop the live bot and restore UI.
+
+        ``abort_reason`` is set only by ``_abort_deploy``: a deploy or
+        resume that failed. Then no stop-close is sent and the position
+        is kept (sim and session). A plain call is the user's stop and
+        still flattens.
+        """
         # The grid sweep runs in another process. The worker polls this
         # flag and terminates that child so a GUI stop does not wait
         # out the sweep. The headless STOP file is polled the same way.
@@ -12480,10 +12549,14 @@ class BacktestApp:
             self._live_chart.close()
         self._live_chart = None
 
+        abort_msg = ""
         if self._live_runner:
+            if abort_reason is not None:
+                # Deploy abort: no stop-close, keep the position, alert.
+                abort_msg = self._alert_deploy_abort_keeps_position(abort_reason)
             # Close real position before stopping if semi-auto has one open.
             # Must happen BEFORE runner.stop() which resets state asynchronously.
-            if (self._trading_mode in ("semi_auto", "auto")
+            elif (self._trading_mode in ("semi_auto", "auto")
                     and self._trading_guard.real_entry_confirmed
                     and self._live_runner.broker.position_size > 0):
                 runner = self._live_runner
@@ -12531,7 +12604,10 @@ class BacktestApp:
             # stop() flushes the aggregator's partial bar and runs _process_aggregated_bar,
             # which would execute the strategy and potentially generate new entries.
             self._live_runner.suppress_strategy = True
-            summary = self._live_runner.stop()
+            if abort_reason is not None:
+                summary = self._live_runner.stop(keep_position=True)
+            else:
+                summary = self._live_runner.stop()
             real_part = (
                 f" (實單 real: {summary['real_trades']} trades, "
                 f"P&L={summary['real_pnl']:+,})"
@@ -12593,6 +12669,11 @@ class BacktestApp:
         self.trading_mode_var.set("--")
         self.mode_combo.config(state=tk.DISABLED)
         self.set_status("就緒 Ready")
+        if abort_msg:
+            try:
+                self._alert("部署中止 Deploy Aborted", abort_msg)
+            except Exception as e:  # noqa: BLE001
+                _log(f"[DEPLOY ABORT] alert failed: [{type(e).__name__}] {e}")
 
 
 # Event sinks + comtypes connections must outlive the event loop; keep them

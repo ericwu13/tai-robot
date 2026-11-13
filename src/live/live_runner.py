@@ -1966,8 +1966,12 @@ class LiveRunner:
         )
         return exit_price
 
-    def stop(self) -> dict:
-        """Stop live runner: flush aggregator, force-close position, return summary."""
+    def stop(self, *, keep_position: bool = False) -> dict:
+        """Stop live runner: flush aggregator, force-close position, return summary.
+
+        ``keep_position`` (deploy abort): skip the force-close so the
+        open position is saved in session.json for ``--resume``.
+        """
         if self.state == LiveState.STOPPED:
             return self._summary()
 
@@ -1977,7 +1981,8 @@ class LiveRunner:
             self._process_aggregated_bar(partial)
 
         # Force close open position
-        self.force_close_position("stop", "live runner stopped")
+        if not keep_position:
+            self.force_close_position("stop", "live runner stopped")
 
         self._auto_save_session()
         self._generate_daily_report()
