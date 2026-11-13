@@ -55,7 +55,6 @@ findings + exact paths:
 | bridge | `.claude/skills/bridge-health/SKILL.md` |
 | logs | `.claude/skills/log-scan/SKILL.md` (escalate: `debug`) |
 | deploy | `.claude/skills/deploy-check/SKILL.md` |
-| n8n | `.claude/skills/n8n-debug/SKILL.md` |
 | fresh GitHub issue | `.claude/skills/issue-triage/SKILL.md` |
 
 Each agent answers: live or not, **new vs chronic** (full history, not
