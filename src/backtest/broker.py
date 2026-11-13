@@ -298,11 +298,15 @@ class SimulatedBroker:
         # Whether the open position was opened by this (seq-stamping) code;
         # False for a position restored from an older session file.
         self.entry_seq_tracked: bool = False
-        # Seq of a real EXIT the stop-close path sent for the still-open
-        # position, before the sim force-close. note_real_order_sent parks
-        # it here only when open_position=True. Attached to that position's
-        # Trade when it closes. A same-bar re-entry does not use this slot.
+        # Seq of a real EXIT the stop-close or manual-flatten path sent
+        # for the still-open position, before the sim force-close.
+        # note_real_order_sent parks it here only when open_position=True.
+        # A fill for this seq is held in pending_real_exit_price (None
+        # until one arrives) and both are copied onto the Trade at close.
+        # A same-bar re-entry does not use this slot.
         self.pending_exit_order_seq: str = ""
+        self.pending_real_exit_price: int | None = None
+        self.pending_real_exit_dt: str = ""
 
         # Last exit metadata — read by live_runner to determine real order type
         self.last_exit_type: str = ""  # "limit", "stop", "close", "force_close"
@@ -534,6 +538,12 @@ class SimulatedBroker:
             # 0/"" and the Trades tab will render them as "--".
             real_entry_price=self.real_entry_price,
             real_entry_dt=self.real_entry_dt,
+            real_exit_price=int(self.pending_real_exit_price or 0),
+            real_exit_dt=(self.pending_real_exit_dt
+                          if self.pending_real_exit_price else ""),
+            # A price stored for the parked seq is the broker fill, not
+            # an estimate. No price yet stays unestimated.
+            real_exit_estimated=False,
             source=source,
             strategy=self.entry_strategy,
             entry_order_seq=self.entry_order_seq,
@@ -557,6 +567,8 @@ class SimulatedBroker:
         self.entry_order_seq = ""
         self.entry_seq_tracked = False
         self.pending_exit_order_seq = ""
+        self.pending_real_exit_price = None
+        self.pending_real_exit_dt = ""
         self._pending_exits.clear()
         self._exit_bar_index = bar_index
 
@@ -618,30 +630,47 @@ class SimulatedBroker:
         price: int,
         exit_bar_index: int,
         fill_dt: str = "",
+        seq: str | None = None,
     ) -> bool:
         """Guarded write of the real (broker-confirmed) exit fill price.
 
-        Mirror of ``try_set_real_entry_price`` but for exits.  Updates
-        the most recent trade's ``real_exit_price`` and ``real_exit_dt``
-        in-place after the simulated exit has already created the Trade
-        record.  Race guards reject the write when:
+        ``seq`` is the SendFutureOrderCLR seq of the fill. A seq that
+        matches the parked exit (stop-close or manual flatten, still
+        open) is stored on that parked record and copied onto its Trade
+        at close. A seq that matches ``trades[-1].exit_order_seq`` is
+        that closed trade's own late fill and is written there even
+        while another exit is parked. ``seq`` None, and any other seq
+        while an exit is parked, does not price ``trades[-1]``. With
+        nothing parked, a seq that matches neither record still uses
+        the bar match so a report poll can price a trade that has no
+        exit seq.
 
-        - ``price <= 0`` (bad parse upstream)
-        - no trades exist yet (no Trade record to update)
-        - the latest trade already has ``real_exit_price`` set
-          (double-confirmation / replay)
-        - the latest trade's ``exit_bar_index`` does not match
-          (late callback for a previous trade whose exit has already
-          been confirmed; or off-by-one slip)
+        Other rejections: ``price <= 0``, no trade to update, or a
+        price already stored for that leg (the first fill wins).
 
         Returns True if the write was accepted, False otherwise.
         """
         if price <= 0:
             return False
-        # A manual flatten or stop-close parked its seq on the open
-        # position. The bar registered for that order is trades[-1]'s
-        # exit bar, so accepting the fill here would price the previous
-        # trade. The price belongs to the trade that receives the seq.
+        seq_s = str(seq).strip() if seq is not None else ""
+        if seq_s and seq_s == self.pending_exit_order_seq:
+            if self.pending_real_exit_price is not None:
+                return False
+            self.pending_real_exit_price = int(price)
+            self.pending_real_exit_dt = fill_dt
+            return True
+        if (seq_s and self.trades
+                and self.trades[-1].exit_order_seq == seq_s):
+            last = self.trades[-1]
+            if last.real_exit_price != 0:
+                return False
+            last.real_exit_price = int(price)
+            last.real_exit_dt = fill_dt
+            last.real_exit_estimated = False
+            return True
+        # Unattributable, or a seq that belongs to neither record.
+        # A parked exit must not be priced onto the previous trade.
+        # With nothing parked, a bar match is the pre-seq write.
         if self.pending_exit_order_seq:
             return False
         if not self.trades:
@@ -687,6 +716,8 @@ class SimulatedBroker:
             if self.position_size == 0 or self.pending_exit_order_seq:
                 return False
             self.pending_exit_order_seq = seq
+            self.pending_real_exit_price = None
+            self.pending_real_exit_dt = ""
             return True
         if not self.trades:
             return False
@@ -702,7 +733,12 @@ class SimulatedBroker:
         Keeps the simulated exit price and leaves ``real_exit_price``
         at 0. A later confirmed fill still writes through
         ``try_set_real_exit_price`` and clears the flag.
+
+        A parked exit belongs to the still-open position, not to
+        ``trades[-1]``. That previous trade is left alone.
         """
+        if self.pending_exit_order_seq:
+            return False
         if not self.trades:
             return False
         last = self.trades[-1]
@@ -741,6 +777,8 @@ class SimulatedBroker:
             "entry_order_seq": self.entry_order_seq,
             "entry_seq_tracked": self.entry_seq_tracked,
             "pending_exit_order_seq": self.pending_exit_order_seq,
+            "pending_real_exit_price": self.pending_real_exit_price,
+            "pending_real_exit_dt": self.pending_real_exit_dt,
             "trades": [
                 {
                     "tag": t.tag, "side": t.side.value, "qty": t.qty,
@@ -806,6 +844,19 @@ class SimulatedBroker:
         broker.entry_order_seq = str(data.get("entry_order_seq", "") or "")
         broker.entry_seq_tracked = bool(data.get("entry_seq_tracked", False))
         broker.pending_exit_order_seq = str(data.get("pending_exit_order_seq", "") or "")
+        # Older files have no parked price. 0 / "" are the same as unset.
+        raw_px = data.get("pending_real_exit_price", None)
+        if not broker.pending_exit_order_seq or raw_px in (None, "", 0):
+            broker.pending_real_exit_price = None
+            broker.pending_real_exit_dt = ""
+        else:
+            try:
+                broker.pending_real_exit_price = int(raw_px)
+            except (TypeError, ValueError):
+                broker.pending_real_exit_price = None
+            broker.pending_real_exit_dt = (
+                str(data.get("pending_real_exit_dt", "") or "")
+                if broker.pending_real_exit_price else "")
         broker.trades = [
             Trade(
                 tag=t["tag"], side=OrderSide(t["side"]), qty=t["qty"],

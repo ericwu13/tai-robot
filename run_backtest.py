@@ -11773,7 +11773,8 @@ class BacktestApp:
                 accepted = broker.try_set_real_exit_price(
                     match.price,
                     exit_bar_index=getattr(last, "exit_bar_index", -1),
-                    fill_dt=fill_dt)
+                    fill_dt=fill_dt,
+                    seq=target_seq)
                 _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
                      f"via {match.reason} accepted={accepted}")
         if accepted:
@@ -11816,7 +11817,8 @@ class BacktestApp:
             fill_dt = _taipei_now().replace(tzinfo=None
                 ).strftime("%Y-%m-%d %H:%M:%S")
             accepted = broker.try_set_real_exit_price(
-                fill.price, exit_bar_index=fill.bar_index, fill_dt=fill_dt)
+                fill.price, exit_bar_index=fill.bar_index, fill_dt=fill_dt,
+                seq=fill.seq_no)
             _log(f"REAL FILL (exit): seq={fill.seq_no} price={fill.price} "
                  f"qty={fill.qty} sim={fill.sim_price} accepted={accepted}")
             if not accepted:

@@ -592,3 +592,87 @@ def test_only_stop_live_and_manual_flatten_pass_exit_open_position(monkeypatch):
         app, 1, "TMFL5", "平倉", 45000, "exit", new_close=1)
     confirmed[0]()
     assert recorded == [True, False]
+
+
+def _parked_open(seq=SEQ_X2):
+    """Paper trade closed on bar 9, a new position open, exit seq parked."""
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    b.force_close(9, 44900)
+    _open(b, bar=12)
+    assert b.note_real_order_sent("exit", seq, b.trades[-1].exit_bar_index,
+                                  open_position=True)
+    return b
+
+
+def _set_exit_price(b, price, bar, seq):
+    """Pass ``seq`` once try_set_real_exit_price accepts it.
+
+    On the pre-fix broker the keyword is absent, so the call is the
+    bar-only write those tests have to fail.
+    """
+    if "seq" in inspect.signature(b.try_set_real_exit_price).parameters:
+        return b.try_set_real_exit_price(
+            price, exit_bar_index=bar, seq=seq)
+    return b.try_set_real_exit_price(price, exit_bar_index=bar)
+
+
+def test_parked_seq_fill_then_close_is_a_real_price():
+    """Reed: the stop/manual-flatten fill arrives before the sim close."""
+    b = _parked_open(SEQ_X1)
+    assert _set_exit_price(b, 44700, b.trades[-1].exit_bar_index, SEQ_X1)
+    b.force_close(15, 44800)
+    closed = b.trades[-1]
+    assert closed.exit_order_seq == SEQ_X1
+    assert closed.real_exit_price == 44700
+    assert closed.real_exit_estimated is False
+
+
+def test_parked_seq_close_then_fill_is_a_real_price():
+    """The same fill, arriving after the sim force-close, is still real."""
+    b = _parked_open(SEQ_X1)
+    send_bar = b.trades[-1].exit_bar_index
+    b.force_close(15, 44800)
+    assert _set_exit_price(b, 44700, send_bar, SEQ_X1)
+    closed = b.trades[-1]
+    assert closed.exit_order_seq == SEQ_X1
+    assert closed.real_exit_price == 44700
+    assert closed.real_exit_estimated is False
+
+
+def test_late_fill_for_the_closed_trade_during_a_parked_exit():
+    """X's own exit seq still prices trades[-1] while a newer exit is parked."""
+    b = SimulatedBroker(point_value=PV)
+    _open(b, bar=5)
+    b.force_close(9, 44900)
+    assert b.note_real_order_sent("exit", SEQ_X1, 9)
+    _open(b, bar=12)
+    assert b.note_real_order_sent("exit", SEQ_X2, 9, open_position=True)
+    assert _set_exit_price(b, 44700, 9, SEQ_X1)
+    assert b.trades[-1].real_exit_price == 44700
+    assert b.trades[-1].exit_order_seq == SEQ_X1
+    assert b.pending_exit_order_seq == SEQ_X2
+    assert getattr(b, "pending_real_exit_price", None) is None
+
+
+def test_mark_estimated_does_not_touch_the_previous_trade_while_parked():
+    b = _parked_open()
+    assert b.mark_real_exit_estimated() is False
+    assert b.trades[-1].real_exit_estimated is False
+
+
+def test_parked_exit_price_round_trips_and_old_files_default_none():
+    b = _parked_open(SEQ_X1)
+    assert _set_exit_price(b, 44700, 9, SEQ_X1)
+    restored = SimulatedBroker.from_dict(b.to_dict())
+    assert restored.pending_exit_order_seq == SEQ_X1
+    assert restored.pending_real_exit_price == 44700
+    restored.force_close(15, 44800)
+    assert restored.trades[-1].real_exit_price == 44700
+    assert restored.trades[-1].real_exit_estimated is False
+    old = b.to_dict()
+    old.pop("pending_real_exit_price", None)
+    old.pop("pending_real_exit_dt", None)
+    legacy = SimulatedBroker.from_dict(old)
+    assert legacy.pending_exit_order_seq == SEQ_X1
+    assert legacy.pending_real_exit_price is None
