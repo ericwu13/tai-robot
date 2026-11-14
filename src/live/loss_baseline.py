@@ -9,8 +9,8 @@ A night and the next calendar day's session share that budget. When
 every calendar day strictly between that night and the day session is a
 known TAIFEX closure (weekend or holiday), that day gets its own budget
 from the last settled read in 08:30–08:45. A skipped trading day, or a
-day whose calendar is unknown, does not. The gate is then the stricter
-of the held figure and the account net. A fresh deploy without
+day whose calendar is unknown, does not. The gate is then the account net.
+A fresh deploy without
 loss_baseline.json gets no separate gap budget until the next 15:00
 snapshot. Field f37 (expiry settlement) is not read.
 
