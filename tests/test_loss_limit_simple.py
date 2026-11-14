@@ -38,7 +38,7 @@ def test_started_2300_no_file_night_loss_uses_master(tmp_path):
 
 
 def test_same_key_file_restart_reuses_snapshot(tmp_path):
-    """A restart that loads this session's file keeps the snapshot it already took."""
+    """A 06:00 restart never saw a pre-05:00 read, so it uses the account."""
     path = tmp_path / "reuse.json"
     tr = _tracker(path)
     tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 14, 59))
@@ -49,8 +49,8 @@ def test_same_key_file_restart_reuses_snapshot(tmp_path):
     fresh = _tracker(path)
     fresh.load(datetime(2026, 11, 14, 6, 0))
     view = fresh.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 6, 0))
-    assert view.basis == "snapshot"
-    assert view.loss_today == -5308
+    assert view.basis == "master"
+    assert view.loss_today == view.account_net == -12306
 
 
 def test_winning_day_after_the_reset_is_the_night_loss_and_not_paused(tmp_path):
@@ -118,6 +118,7 @@ def test_no_reset_by_0830_is_the_account(tmp_path):
 
 
 def test_same_key_restart_reuses_the_snapshot_and_can_still_anchor(tmp_path):
+    """A 07:00 restart did not see 04:59, so it does not hold or anchor."""
     path = tmp_path / "restart.json"
     tr = _tracker(path)
     _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(-6998, "AAA"))
@@ -126,9 +127,12 @@ def test_same_key_restart_reuses_the_snapshot_and_can_still_anchor(tmp_path):
     fresh = _tracker(path)
     fresh.load(datetime(2026, 11, 11, 7, 0))
     held = fresh.observe(_rights(-12306, "AAA"), datetime(2026, 11, 11, 7, 0))
-    assert held.loss_today == -5308
-    anchored = fresh.observe(_rights(-5308, "BBB"), datetime(2026, 11, 11, 8, 30))
-    assert anchored.loss_today == -5308
+    assert held.basis == "master"
+    assert held.loss_today == held.account_net == -12306
+    opened = fresh.observe(_rights(-5308, "BBB"), datetime(2026, 11, 11, 8, 30))
+    assert opened.basis == "master"
+    assert fresh.anchored is False
+    assert opened.loss_today == opened.account_net == -5308
 
 
 def test_no_file_and_a_stale_file_are_the_account(tmp_path):
@@ -310,7 +314,43 @@ def test_monday_replay_0910_is_8308(tmp_path):
     assert opened.basis == "snapshot"
 
 
+def test_reed_restart_in_the_window_pauses_on_the_account(tmp_path):
+    """Reed's probe, limit 20,000. The file was saved at the 15:00 roll.
+
+    This process comes back at 06:00 and never saw a pre-05:00 read, so
+    the night loss is the account net and it pauses. The same reads with
+    the process left up still anchor and pause at 09:10.
+    """
+    path = tmp_path / "reed.json"
+    first = _tracker(path)
+    _roll(first, datetime(2026, 11, 10, 15, 0), _rights(-6998, "AAA"))
+    first.save()
+    fresh = _tracker(path)
+    fresh.load(datetime(2026, 11, 11, 6, 0))
+    at_six = fresh.observe(_rights(-26998, "AAA"), datetime(2026, 11, 11, 6, 0))
+    assert at_six.basis == "master"
+    assert at_six.loss_today == at_six.account_net == -26998
+    assert _guard(at_six.loss_today, at_six.day_key, limit=20000) is True
+    at_open = fresh.observe(_rights(-20000, "BBB"), datetime(2026, 11, 11, 8, 30))
+    assert at_open.basis == "master"
+    assert fresh.anchored is False
+    trade = fresh.observe(_rights(-35000, "BBB"), datetime(2026, 11, 11, 9, 10))
+    assert trade.loss_today == -35000
+    assert _guard(trade.loss_today, trade.day_key, limit=20000) is True
+
+    stayed = _tracker(tmp_path / "up.json")
+    _roll(stayed, datetime(2026, 11, 10, 15, 0), _rights(-6998, "AAA"))
+    stayed.observe(_rights(-26998, "AAA"), datetime(2026, 11, 11, 4, 59))
+    stayed.observe(_rights(-26998, "AAA"), datetime(2026, 11, 11, 6, 0))
+    stayed.observe(_rights(-20000, "BBB"), datetime(2026, 11, 11, 8, 30))
+    later = stayed.observe(_rights(-35000, "BBB"), datetime(2026, 11, 11, 9, 10))
+    assert later.loss_today == -35000
+    assert later.basis == "snapshot"
+    assert _guard(later.loss_today, later.day_key, limit=20000) is True
+
+
 def test_restart_inside_the_window_uses_file_last_l(tmp_path):
+    """The file's last_L is not a hold when this process missed 04:59."""
     path = tmp_path / "hold.json"
     tr = _tracker(path)
     _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(-6998, "71649"))
@@ -319,6 +359,6 @@ def test_restart_inside_the_window_uses_file_last_l(tmp_path):
     fresh = _tracker(path)
     fresh.load(datetime(2026, 11, 11, 6, 0))
     held = fresh.observe(_zero("71649"), datetime(2026, 11, 11, 6, 0))
-    assert held.loss_today == -5308
+    assert held.basis == "master"
+    assert held.loss_today == held.account_net == 0
     assert fresh.anchored is False
-    assert fresh.snap_net == -6998

@@ -21,9 +21,12 @@ window. On a trading morning, the first read at or after 08:30 looks
 at the latest non-zero read since 05:00 (not a row with net,
 realized_pnl and realized_cost all zero). If that read's f22 differs
 from the snapshot, ``snap_net`` becomes that net minus the held ``L``.
-Otherwise the rest of the key uses the account net. A restart inside
-the window keeps the held ``L`` from the file. Capital still showing
-zeros at 08:30 uses the account net.
+Otherwise the rest of the key uses the account net. That hold is
+valid only when this process saw a read before 05:00 on the same key.
+A restart inside the window did not, so the rest of the key uses the
+account net: no held value from the file and no 08:30 anchor. A
+restart from 08:30 onward that restores an already-anchored snapshot
+is unchanged. Capital still showing zeros at 08:30 uses the account net.
 """
 
 from __future__ import annotations
@@ -139,11 +142,13 @@ class DailyLossBaseline:
         self._account_net = 0
         # Previous successful read in this process. Not stored in the file.
         self._prev_read: datetime | None = None
-        # Closed-window memory for this key. Not stored; a restart holds last_L.
+        # Closed-window memory for this key. Not stored.
         self._master_rest = False
         self._decided = False
         self._nz_net: int | None = None
         self._nz_f22 = ""
+        # True only after this process reads before 05:00 on this key.
+        self._saw_pre_hold = False
 
     def observe(self, rights: dict, now_tpe: datetime) -> LossView:
         """One valid rights read. Invalid input does not move state."""
@@ -163,6 +168,13 @@ class DailyLossBaseline:
             self.anchored = False
         self._prev_read = now
         minute = _minutes(now)
+        if minute < _HOLD_FROM:
+            self._saw_pre_hold = True
+        elif (self.snap_net is not None and not self.anchored
+              and not self._saw_pre_hold and minute < _ROLL):
+            # No pre-05:00 read in this process. The file's last_L is not a hold.
+            self._master_rest = True
+            self._decided = True
         if self._in_hold(minute):
             if not _is_zero_row(rights, net):
                 self._nz_net = net
@@ -288,6 +300,7 @@ class DailyLossBaseline:
         self._decided = False
         self._nz_net = None
         self._nz_f22 = ""
+        self._saw_pre_hold = False
 
     def _persist(self) -> None:
         if not self.path:
