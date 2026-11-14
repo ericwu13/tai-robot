@@ -7199,6 +7199,59 @@ class BacktestApp:
                         # The slot wait, the stall clock, and the timeout
                         # all run on this worker thread. They do not run
                         # on Tk.
+                        from src.evolution.grid_process import (
+                            grid_progress_should_log,
+                        )
+                        _grid_timing = {"queue": 0.0}
+                        _grid_prog = {
+                            "i": 0,
+                            "n": int(_n_runs) if int(_n_runs) > 0 else 1,
+                            "last_i": 0,
+                            "last_t": time.monotonic(),
+                        }
+                        _queue_notice = getattr(
+                            self, "_grid_queue_notice_s", 600)
+
+                        def _on_grid_queue(kind, **fields):
+                            if kind == "wait":
+                                _log("EVO grid waiting for host slot")
+                                return
+                            if kind == "waiting":
+                                waited = float(fields.get("waited_s") or 0)
+                                holder = fields.get("holder")
+                                if holder:
+                                    _log(
+                                        "EVO grid still waiting for host slot "
+                                        f"holder pid={holder} "
+                                        f"waited {waited:.0f} s")
+                                else:
+                                    _log(
+                                        "EVO grid still waiting for host slot "
+                                        f"waited {waited:.0f} s")
+                                return
+                            if kind == "acquired":
+                                _grid_timing["queue"] = float(
+                                    fields.get("queue_s") or 0)
+                                _log(
+                                    "EVO grid acquired host slot "
+                                    f"queue {_grid_timing['queue']:.0f} s")
+
+                        def _on_grid_progress(i, n):
+                            now = time.monotonic()
+                            _grid_prog["i"] = int(i)
+                            _grid_prog["n"] = int(n)
+                            if grid_progress_should_log(
+                                    _grid_prog["last_i"],
+                                    _grid_prog["last_t"],
+                                    int(i), now):
+                                _log(f"EVO grid progress {int(i)}/{int(n)}")
+                                _grid_prog["last_i"] = int(i)
+                                _grid_prog["last_t"] = now
+
+                        def _on_grid_release_warning(message):
+                            _log(f"EVO {message}")
+
+                        _grid_started = time.monotonic()
                         grid_result = run_grid_isolated(
                             GridJob(
                                 source=strategy_source or "",
@@ -7217,6 +7270,12 @@ class BacktestApp:
                             in_process=bool(
                                 getattr(self, "_grid_in_process", False)),
                             slot_path=default_slot_path(),
+                            on_progress=_on_grid_progress,
+                            on_queue=_on_grid_queue,
+                            queue_notice_s=float(_queue_notice or 600),
+                            on_release_warning=_on_grid_release_warning,
+                            slot_poll_s=float(
+                                getattr(self, "_grid_slot_poll_s", 5) or 5),
                         )
                         if isinstance(grid_result, GridProcessFailure):
                             # No trial evidence. Same exit as a grid that
@@ -7253,6 +7312,20 @@ class BacktestApp:
                             )
                             return
                         grid_outcome = grid_result
+                        _grid_n = int(_grid_prog["n"] or 0)
+                        if _grid_n < 1:
+                            _grid_n = int(_n_runs) if int(_n_runs) > 0 else 1
+                        _grid_elapsed = max(
+                            0.0,
+                            time.monotonic() - _grid_started
+                            - float(_grid_timing["queue"]))
+                        _grid_mean = _grid_elapsed / float(_grid_n)
+                        _log(
+                            "EVO grid finished "
+                            f"queue {float(_grid_timing['queue']):.0f} s "
+                            f"elapsed {_grid_elapsed:.0f} s "
+                            f"n={_grid_n} "
+                            f"mean {_grid_mean:.1f} s/backtest")
                         for line in grid_outcome.reasons:
                             _log(line)
                         if grid_outcome.selected is None:

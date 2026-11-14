@@ -529,3 +529,151 @@ def _plant_pids(path, parent: int, child: int, stamp: float) -> None:
         encoding="ascii",
     )
     os.utime(path, (stamp, stamp))
+
+
+def _progress_then_ok(job, conn) -> None:
+    """25 progress lines, then a finished grid. In-process only."""
+    from src.evolution.grid_search import GridOutcome
+
+    for i in range(1, 26):
+        conn.send(("progress", i, 25))
+    conn.send(("ok", GridOutcome(
+        None, (), (), None, "done", evaluated=False)))
+
+
+def test_grid_progress_throttle_is_10_backtests_or_60s():
+    """Whichever bound comes first. Missing on faecbc90."""
+    from src.evolution.grid_process import grid_progress_should_log
+
+    assert not grid_progress_should_log(0, 0.0, 9, 5.0)
+    assert grid_progress_should_log(0, 0.0, 10, 5.0)
+    assert not grid_progress_should_log(10, 5.0, 19, 20.0)
+    assert grid_progress_should_log(10, 5.0, 11, 70.0)
+
+
+def test_success_grid_logs_queue_progress_and_mean(tmp_path, monkeypatch):
+    """The bot log shows the queue, throttled progress, and the success line."""
+    from unittest.mock import MagicMock
+
+    import run_backtest as rb
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_history import _validation_app
+    from tests.test_evolution_min_design_trades import _InlineThread
+
+    logs: list[str] = []
+    # Patching rb.threading.Thread replaces the class on the shared
+    # threading module. The releaser has to stay a real thread, or it
+    # runs inline and drops the slot before the pipeline starts waiting.
+    real_thread = threading.Thread
+    monkeypatch.setattr(rb, "_log", lambda message: logs.append(str(message)))
+    monkeypatch.setattr(gp, "grid_child_entry", _progress_then_ok)
+    monkeypatch.setattr(gp, "grid_queue_wait_s", lambda: 8.0)
+    monkeypatch.setattr(
+        "src.evolution.grid_search.grid_search_applies",
+        lambda *args, **kwargs: True)
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(
+        "src.evolution.notify.maybe_advance_watermark",
+        lambda *args, **kwargs: None)
+    chat = MagicMock()
+    chat.max_tokens = 1024
+    chat.conversation = []
+    chat.send_message.return_value = "plan"
+    chat.one_shot.return_value = ""
+    rb._evolution_guard_clear()
+    app = _validation_app(tmp_path, chat, paper_gate="relative")
+    app._grid_in_process = True
+    app._grid_queue_notice_s = 0.05
+    app._grid_slot_poll_s = 0.05
+    slot = os.environ["TAI_EVO_GRID_SLOT"]
+    from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
+
+    held, _kind, _queue = acquire_grid_slot(
+        slot, wait_s=2, stale_s=10**9, poll_s=0.05)
+    assert held
+
+    def _drop():
+        deadline = time.time() + 8
+        while time.time() < deadline and not any(
+                line == "EVO grid waiting for host slot" for line in logs):
+            time.sleep(0.02)
+        # Long enough for one periodic notice (queue_notice is 0.05 s)
+        # and for the logged wait to round above 0 s.
+        time.sleep(1.2)
+        release_grid_slot(slot)
+
+    real_thread(target=_drop, daemon=True).start()
+    try:
+        rb.BacktestApp._start_evolution_pipeline(
+            app, "preamble", ["design trade"], "", app._result,
+            auto_run=False, holdout_days=14, bot_dir=str(tmp_path),
+            design_cut_idx=1)
+    finally:
+        rb._evolution_guard_clear()
+        release_grid_slot(slot)
+    text = "\n".join(logs)
+    assert "EVO grid waiting for host slot" in text
+    assert f"holder pid={os.getpid()}" in text
+    assert "EVO grid still waiting for host slot" in text
+    assert "EVO grid acquired host slot queue" in text
+    assert "EVO grid progress 10/25" in text
+    assert "EVO grid progress 20/25" in text
+    assert "EVO grid progress 1/25" not in text
+    assert "EVO grid progress 9/25" not in text
+    assert "EVO grid progress 11/25" not in text
+    finished = [line for line in logs if line.startswith("EVO grid finished ")]
+    assert len(finished) == 1, logs
+    summary = finished[0]
+    assert "queue " in summary and "elapsed " in summary
+    assert "n=25" in summary
+    assert "mean " in summary and "s/backtest" in summary
+
+
+def test_slot_release_warning_reaches_the_bot_log(tmp_path, monkeypatch):
+    """A failed remove is on the bot log, not only the Python logger."""
+    from unittest.mock import MagicMock
+
+    import run_backtest as rb
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_history import _validation_app
+    from tests.test_evolution_min_design_trades import _InlineThread
+
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", lambda message: logs.append(str(message)))
+    monkeypatch.setattr(gp, "grid_child_entry", _progress_then_ok)
+    monkeypatch.setattr(
+        "src.evolution.grid_search.grid_search_applies",
+        lambda *args, **kwargs: True)
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(
+        "src.evolution.notify.maybe_advance_watermark",
+        lambda *args, **kwargs: None)
+    real_remove = os.remove
+
+    def _stuck(target):
+        if str(target).endswith(f"{os.sep}evo_grid.slot"):
+            raise PermissionError(13, "sharing violation")
+        return real_remove(target)
+
+    monkeypatch.setattr(os, "remove", _stuck)
+    chat = MagicMock()
+    chat.max_tokens = 1024
+    chat.conversation = []
+    chat.send_message.return_value = "plan"
+    chat.one_shot.return_value = ""
+    rb._evolution_guard_clear()
+    app = _validation_app(tmp_path, chat, paper_gate="relative")
+    app._grid_in_process = True
+    app._grid_queue_notice_s = 600
+    app._grid_slot_poll_s = 0.05
+    try:
+        rb.BacktestApp._start_evolution_pipeline(
+            app, "preamble", ["design trade"], "", app._result,
+            auto_run=False, holdout_days=14, bot_dir=str(tmp_path),
+            design_cut_idx=1)
+    finally:
+        rb._evolution_guard_clear()
+    text = "\n".join(logs)
+    assert "EVO grid slot release failed path=" in text
+    assert f"pid={os.getpid()}" in text
+    assert "PermissionError" in text

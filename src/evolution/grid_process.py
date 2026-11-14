@@ -880,6 +880,55 @@ def _steal_stale_slot(path: str, stale_s: float) -> None:
         pass
 
 
+def grid_progress_should_log(
+        last_i: int,
+        last_t: float,
+        i: int,
+        now: float,
+        *,
+        every_n: int = 10,
+        every_s: float = 60.0) -> bool:
+    """True when a progress line is due.
+
+    Log every ``every_n`` backtests or every ``every_s`` seconds,
+    whichever comes first. ``i`` must have moved forward.
+    """
+    try:
+        done = int(i)
+        prev = int(last_i)
+    except (TypeError, ValueError):
+        return False
+    if done <= prev:
+        return False
+    if (done - prev) >= int(every_n):
+        return True
+    try:
+        return (float(now) - float(last_t)) >= float(every_s)
+    except (TypeError, ValueError):
+        return False
+
+
+def _holder_pid(path: str):
+    """Parent pid of the slot, or of a leftover copy that still holds it."""
+    pids, _stamp = _read_slot(path)
+    if pids:
+        return pids[0]
+    for copy in _slot_copies(path):
+        copied, _stamp = _read_slot(copy)
+        if copied:
+            return copied[0]
+    return None
+
+
+def _emit_queue(on_queue, kind: str, **fields) -> None:
+    if on_queue is None:
+        return
+    try:
+        on_queue(kind, **fields)
+    except Exception:
+        pass
+
+
 def acquire_grid_slot(
         path: str,
         *,
@@ -887,7 +936,9 @@ def acquire_grid_slot(
         poll_s: float = GRID_SLOT_POLL_S,
         wait_s: float,
         stale_s: float,
-        sleep=None):
+        sleep=None,
+        on_queue=None,
+        notice_s: float = 600.0):
     """Take the host slot. ``(owned, kind, queue_s)``.
 
     ``kind`` is ``""`` when this process holds the file, otherwise
@@ -905,17 +956,23 @@ def acquire_grid_slot(
     start = time.monotonic()
     deadline = start + max(0.0, float(wait_s))
     poll = 0.05 if poll_s is None or poll_s <= 0 else float(poll_s)
+    notice = 600.0 if notice_s is None or notice_s <= 0 else float(notice_s)
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         try:
             os.makedirs(directory, exist_ok=True)
         except OSError:
             pass
+    _emit_queue(on_queue, "wait", holder=_holder_pid(path))
+    last_notice = time.monotonic()
     while True:
         _reap_slot_copies(path, stale_s)
         held_by_copy = _copy_holds_slot(path, stale_s)
         if not held_by_copy and _try_create_slot(path):
-            return True, "", time.monotonic() - start
+            queue_s = time.monotonic() - start
+            _emit_queue(
+                on_queue, "acquired", queue_s=queue_s, holder=_holder_pid(path))
+            return True, "", queue_s
         if stop_check is not None and stop_check():
             return False, "stopped", time.monotonic() - start
         if not held_by_copy:
@@ -923,14 +980,24 @@ def acquire_grid_slot(
             if _slot_is_stale(pids, stamp, stale_s):
                 _steal_stale_slot(path, stale_s)
                 if not _copy_holds_slot(path, stale_s) and _try_create_slot(path):
-                    return True, "", time.monotonic() - start
+                    queue_s = time.monotonic() - start
+                    _emit_queue(
+                        on_queue, "acquired",
+                        queue_s=queue_s, holder=_holder_pid(path))
+                    return True, "", queue_s
         now = time.monotonic()
+        if now - last_notice >= notice:
+            _emit_queue(
+                on_queue, "waiting",
+                holder=_holder_pid(path), waited_s=now - start)
+            last_notice = now
         if now >= deadline:
             return False, "queue_timeout", now - start
         pause(min(poll, max(0.0, deadline - now)))
 
 
-def release_grid_slot(path: str, pid: int | None = None) -> None:
+def release_grid_slot(
+        path: str, pid: int | None = None, *, on_warning=None) -> None:
     """Remove the slot only when it still names ``pid``.
 
     Windows can refuse the delete while a waiter has the file open.
@@ -957,13 +1024,17 @@ def release_grid_slot(path: str, pid: int | None = None) -> None:
             break
         time.sleep(min(delay, max(0.0, deadline - now)))
         delay = min(delay * 2, 0.5)
-    logging.getLogger(__name__).warning(
-        "grid slot release failed path=%s pid=%s [%s] %s",
-        path,
-        owner,
-        type(last_exc).__name__ if last_exc is not None else "OSError",
-        last_exc,
+    message = (
+        f"grid slot release failed path={path} pid={owner} "
+        f"[{type(last_exc).__name__ if last_exc is not None else 'OSError'}] "
+        f"{last_exc}"
     )
+    logging.getLogger(__name__).warning("%s", message)
+    if on_warning is not None:
+        try:
+            on_warning(message)
+        except Exception:
+            pass
 
 
 def _stamp_failure(result, *, progress: str, elapsed_s: float, queue_s: float):
@@ -994,7 +1065,10 @@ def run_grid_isolated(
         slot_path: str | None = None,
         slot_poll_s: float = GRID_SLOT_POLL_S,
         queue_timeout_s: float | None = None,
-        slot_stale_s: float | None = None):
+        slot_stale_s: float | None = None,
+        on_queue=None,
+        queue_notice_s: float = 600.0,
+        on_release_warning=None):
     """Run the grid and return a ``GridOutcome`` or ``GridProcessFailure``.
 
     The default waits on a spawn child. Each pass checks ``stop_check``,
@@ -1038,6 +1112,8 @@ def run_grid_isolated(
         poll_s=slot_poll_s,
         wait_s=wait_s,
         stale_s=stale_s,
+        on_queue=on_queue,
+        notice_s=queue_notice_s,
     )
     if not owned:
         detail = ("stop requested" if qkind == "stopped"
@@ -1070,7 +1146,7 @@ def run_grid_isolated(
             slot_path=path,
         )
     finally:
-        release_grid_slot(path, os.getpid())
+        release_grid_slot(path, os.getpid(), on_warning=on_release_warning)
 
 
 def _run_grid_held(
