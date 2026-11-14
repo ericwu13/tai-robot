@@ -108,6 +108,23 @@ def _in_day_open_window(now: datetime) -> bool:
     return _DAY_LO <= minute < _DAY_HI
 
 
+def _is_taifex_trading_day(now: datetime) -> bool:
+    """Weekday that TAIFEX is open. Weekends never qualify.
+
+    Uses :func:`src.market_data.holidays.is_taifex_holiday`. If that lookup
+    raises, fall back to the weekday check so a Sunday read still cannot
+    open Monday's budget.
+    """
+    day = _as_tpe(now).date()
+    if day.weekday() >= 5:
+        return False
+    try:
+        from ..market_data.holidays import is_taifex_holiday
+        return not is_taifex_holiday(day)
+    except Exception:
+        return True
+
+
 @dataclass(frozen=True)
 class _Snap:
     date: str
@@ -230,7 +247,9 @@ class DailyLossBaseline:
             dirty = True
             force = True
 
-        if not self._reset_open():
+        # Sticky for this key. A settled reset must not fire again on the
+        # next poll just because f22 still differs from the pre-batch value.
+        if not isinstance(self.capital_reset, dict):
             if self._reset_detected(fee, equity):
                 self._begin_reset(now, fee)
                 dirty = True
@@ -297,7 +316,7 @@ class DailyLossBaseline:
         if data.get("account") != self._account_hash:
             self._ignore("account mismatch")
             return
-        if not self._restore(data, trading_day_key(now)):
+        if not self._restore(data, trading_day_key(now), now):
             self._ignore("corrupt")
 
     def save(self) -> None:
@@ -384,17 +403,29 @@ class DailyLossBaseline:
         """Return (opened_now, failsafe_recheck_now)."""
         if not self._needs_day_budget(now) or self.day_budget or self.day_failsafe:
             return False, False
+        # Weekend and holiday polls run every 30 s. They must not take
+        # B_day, open the day budget, or emit the missing-baseline note.
+        if not _is_taifex_trading_day(now):
+            return False, False
+        waiting_on_window_reset = bool(
+            isinstance(self.capital_reset, dict)
+            and self.capital_reset.get("in_day_window")
+            and self._reset_open())
         if _in_day_open_window(now):
-            if self._reset_open():
+            if waiting_on_window_reset:
                 return False, False
-            self.day_b_r = realized
-            self.day_b_c = max(0, floating)
-            self.day_fees = fee
-            self.day_f22 = equity
-            self.day_taken_at = _iso(now)
-            self._has_day_baseline = True
+            self._take_day_baseline(now, realized, floating, fee, equity)
             return False, False
         if _minutes(now) >= _DAY_HI:
+            # The +2 min settle of a batch that started inside the window
+            # can land just after 08:45. That settled read is B_day.
+            if waiting_on_window_reset:
+                return False, False
+            if (not self._has_day_baseline
+                    and isinstance(self.capital_reset, dict)
+                    and self.capital_reset.get("in_day_window")
+                    and not self._reset_open()):
+                self._take_day_baseline(now, realized, floating, fee, equity)
             if self._has_day_baseline:
                 self.day_budget = True
                 self.basis = "day_open"
@@ -403,6 +434,14 @@ class DailyLossBaseline:
             self._announce_day_failsafe(now.date().isoformat())
             return False, True
         return False, False
+
+    def _take_day_baseline(self, now, realized, floating, fee, equity) -> None:
+        self.day_b_r = realized
+        self.day_b_c = max(0, floating)
+        self.day_fees = fee
+        self.day_f22 = equity
+        self.day_taken_at = _iso(now)
+        self._has_day_baseline = True
 
     def _clear_day_budget(self) -> None:
         self._has_day_baseline = False
@@ -432,15 +471,20 @@ class DailyLossBaseline:
 
     def _begin_reset(self, now: datetime, fee: int) -> None:
         expect = self.max_fees_seen - self.baseline_fees
+        in_window = _in_day_open_window(now)
         self.capital_reset = {
             "detected_at": _iso(now),
             "l_pre": self.last_l,
             "expect_fees": expect,
             "settled": False,
+            "in_day_window": in_window,
         }
         self._detected_at = now
         self.b_r = 0
         self.basis = "capital_reset"
+        # A pre-batch read already inside 08:30–08:45 is not B_day.
+        if in_window:
+            self._has_day_baseline = False
 
     def _can_settle(self, now: datetime, fee: int) -> bool:
         reset = self.capital_reset or {}
@@ -484,7 +528,7 @@ class DailyLossBaseline:
 
     # ── persistence ───────────────────────────────────────────────────
 
-    def _restore(self, data: dict, key: str) -> bool:
+    def _restore(self, data: dict, key: str, now: datetime) -> bool:
         candidate = _snap_from(data.get("candidate"), with_date=True)
         file_key = str(data.get("day_key") or "")
         if file_key and file_key == key:
@@ -494,12 +538,37 @@ class DailyLossBaseline:
             self._commit(candidate, key)
             self._persist(candidate_only=False)
             return True
+        # Friday's file, loaded Monday before 15:00: the key differs
+        # (Sunday) but the night budget is still the one to carry.
+        if self._should_restore_gap(data, now):
+            if not self._restore_state(data, candidate):
+                return False
+            night = self.night_date
+            if key and key != self.day_key:
+                self._carry(key)
+                self.night_date = night
+            self._persist(candidate_only=False)
+            return True
         # Stale file. Keep a candidate that might still commit at the roll.
         self.candidate = candidate
         self.day_key = ""
+        self.night_date = ""
         self.b_r = 0
         self.b_c = 0
         return True
+
+    def _should_restore_gap(self, data: dict, now: datetime) -> bool:
+        """File is the last night before a weekend or holiday gap."""
+        if data.get("day_budget") or data.get("day_failsafe"):
+            return False
+        if _minutes(now) >= _NIGHT_OPEN:
+            return False
+        night = str(data.get("night_date") or data.get("day_key") or "")
+        try:
+            night_d = datetime.fromisoformat(night).date()
+        except ValueError:
+            return False
+        return (now.date() - night_d).days > 1
 
     def _restore_state(self, data: dict, candidate: _Snap | None) -> bool:
         baseline = data.get("baseline")
@@ -536,6 +605,7 @@ class DailyLossBaseline:
                 "l_pre": None if l_pre is None else _as_int(l_pre),
                 "expect_fees": 0 if expect is None else expect,
                 "settled": bool(reset.get("settled")),
+                "in_day_window": bool(reset.get("in_day_window")),
             }
             self._detected_at = detected
             if detected is None and not self.capital_reset["settled"]:
@@ -566,6 +636,7 @@ class DailyLossBaseline:
                 "l_pre": self.capital_reset.get("l_pre"),
                 "expect_fees": self.capital_reset.get("expect_fees"),
                 "settled": bool(self.capital_reset.get("settled")),
+                "in_day_window": bool(self.capital_reset.get("in_day_window")),
             }
         return {
             "version": _VERSION,

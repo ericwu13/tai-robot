@@ -954,3 +954,235 @@ def test_q1e_the_next_calendar_day_stays_one_budget(tmp_path, monkeypatch):
     _drive(app, clock, datetime(2026, 11, 11, 8, 35), _pnl(-9000, 30, f22="AAA"))
     _drive(app, clock, datetime(2026, 11, 11, 9, 10), _pnl(-10000, 35, f22="AAA"))
     assert app._trading_guard._last_net_pnl == -5000, app._trading_guard._last_net_pnl
+
+
+# ── Weekend polls, Monday holiday, sticky reset, restart (post-3c9bbda) ──
+
+def _tracker(path):
+    return _baseline_cls()(str(path), "ACCT")
+
+
+def _every_30s(tr, start, end, raw):
+    """The live bot polls FutureRights every 30 s, including when closed."""
+    cursor = start
+    while cursor <= end:
+        tr.observe(raw, cursor)
+        cursor += timedelta(seconds=30)
+
+
+def _weekend_window(tr, day, raw):
+    """30 s polls through 08:30–08:46, plus the exact 08:46 read."""
+    _every_30s(
+        tr,
+        datetime(day.year, day.month, day.day, 8, 0),
+        datetime(day.year, day.month, day.day, 9, 0),
+        raw,
+    )
+    tr.observe(raw, datetime(day.year, day.month, day.day, 8, 46))
+
+
+def test_p1_weekend_polls_do_not_open_mondays_budget(tmp_path):
+    """Sat/Sun 08:30–08:46 must not set B_day. Mon 09:10 stays -3,000.
+
+    Covers a losing Friday (T6 numbers) and a profitable Friday day.
+    """
+    from datetime import date as _date
+    DailyLoss = _baseline_cls()
+
+    def _run(base_r, night_r, monday_r, expect_0910):
+        tr = DailyLoss(str(tmp_path / f"p1-{base_r}.json"), "ACCT")
+        base = _pnl(base_r, 10, f22=F22)
+        night = _pnl(night_r, 30, f22=F22)
+        tr.observe(base, datetime(2026, 11, 13, 14, 59))
+        tr.consume_failsafe_notice()
+        tr.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+        tr.observe(night, datetime(2026, 11, 14, 2, 0))
+        for day in (_date(2026, 11, 14), _date(2026, 11, 15)):
+            tr.observe(night, datetime(day.year, day.month, day.day, 0, 30))
+            tr.observe(night, datetime(day.year, day.month, day.day, 12, 0))
+            tr.observe(night, datetime(day.year, day.month, day.day, 15, 1))
+            _weekend_window(tr, day, night)
+            assert tr.consume_failsafe_notice() is None
+            assert tr.day_budget is False
+            assert tr._has_day_baseline is False
+        # Monday batch, then the day trade.
+        post = _pnl(night_r - base_r, 20, f22=F22_NEW)
+        tr.observe(_pnl(0, 0, f22=F22), datetime(2026, 11, 16, 5, 22))
+        tr.observe(post, datetime(2026, 11, 16, 5, 36))
+        tr.observe(post, datetime(2026, 11, 16, 8, 35))
+        view = tr.observe(_pnl(monday_r, 20, f22=F22_NEW), datetime(2026, 11, 16, 9, 10))
+        assert view.loss_today == expect_0910, (base_r, view.loss_today)
+        return tr
+
+    # Losing Friday: baseline -6,998, night -12,306, day trade -8,308 → -3,000.
+    losing = _run(-6998, -12306, -8308, -3000)
+    # Real Monday loss of -23,000 from B_day must pause at a 20,000 limit.
+    deep = losing.observe(_pnl(-5308 - 23000, 20, f22=F22_NEW), datetime(2026, 11, 16, 9, 30))
+    # B_day is the post-reset night (-5,308). -23,000 more is -23,000, not -16,002.
+    assert deep.loss_today == -23000, deep.loss_today
+    # Profitable Friday day: baseline +4,000, night +1,000, post-reset -3,000.
+    # Monday with no new trade is 0, not the Sunday-stolen baseline.
+    tr = DailyLoss(str(tmp_path / "p1-win.json"), "ACCT")
+    base = _pnl(4000, 10, f22=F22)
+    night = _pnl(1000, 30, f22=F22)
+    tr.observe(base, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(night, datetime(2026, 11, 14, 2, 0))
+    for day in (_date(2026, 11, 14), _date(2026, 11, 15)):
+        _weekend_window(tr, day, night)
+        assert tr.consume_failsafe_notice() is None
+    post = _pnl(-3000, 20, f22=F22_NEW)
+    tr.observe(_pnl(0, 0, f22=F22), datetime(2026, 11, 16, 5, 22))
+    tr.observe(post, datetime(2026, 11, 16, 5, 36))
+    tr.observe(post, datetime(2026, 11, 16, 8, 40))
+    opened = tr.observe(post, datetime(2026, 11, 16, 9, 0))
+    assert opened.loss_today == 0, opened.loss_today
+
+
+def test_p1_monday_holiday_defers_the_budget_to_tuesday(tmp_path):
+    """2026-10-26 is a TAIFEX Monday holiday. Tuesday opens the day budget."""
+    from datetime import date as _date
+    tr = _tracker(tmp_path / "hol.json")
+    base = _pnl(-5000, 10, f22="AAA")
+    night = _pnl(-20000, 30, f22="AAA")
+    tr.observe(base, datetime(2026, 10, 23, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 10, 23, 15, 0, 5))
+    tr.observe(night, datetime(2026, 10, 24, 1, 0))
+    for day in (_date(2026, 10, 24), _date(2026, 10, 25), _date(2026, 10, 26)):
+        _weekend_window(tr, day, night)
+        assert tr.consume_failsafe_notice() is None
+        assert tr.day_budget is False
+    # Monday holiday afternoon is still the night budget.
+    assert tr.observe(night, datetime(2026, 10, 26, 10, 0)).loss_today == -15000
+    post = _pnl(-15000, 20, f22="BBB")
+    tr.observe(_pnl(0, 0, f22="AAA"), datetime(2026, 10, 27, 5, 22))
+    tr.observe(post, datetime(2026, 10, 27, 5, 36))
+    tr.observe(post, datetime(2026, 10, 27, 8, 35))
+    opened = tr.observe(post, datetime(2026, 10, 27, 9, 0))
+    assert opened.loss_today == 0, opened.loss_today
+    assert tr.day_budget is True
+
+
+def test_p2_monday_0700_restart_keeps_friday_and_opens_the_day(tmp_path, monkeypatch):
+    """A Friday-key file loaded Monday 07:00 is carried, not wiped."""
+    path = tmp_path / "fri.json"
+    app, clock, tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 13, 14, 59), limit=10000, path=path)
+    if tracker is None:
+        pytest.fail("no baseline")
+    reload = _friday_into_monday(app, clock, with_day_open=False)
+    # Stop on Friday night's key: copy the file before any Monday read.
+    # _friday_into_monday already ran the Monday 05:36 batch. Rebuild a
+    # file that is still Friday's key by saving before that batch.
+    early = _tracker(tmp_path / "early.json")
+    base = _pnl(-5000, 10, f22="AAA")
+    night = _pnl(-20000, 30, f22="AAA")
+    early.observe(base, datetime(2026, 11, 13, 14, 59))
+    early.consume_failsafe_notice()
+    early.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    early.observe(night, datetime(2026, 11, 14, 2, 0))
+    early.pause_failsafe = True
+    early.save()
+    restarted = _tracker(tmp_path / "early.json")
+    restarted.load(datetime(2026, 11, 16, 7, 0))
+    assert restarted.night_date == "2026-11-13", restarted.night_date
+    assert restarted.basis != "failsafe"
+    fresh, fresh_clock, _none = _app_at(
+        monkeypatch, datetime(2026, 11, 16, 7, 0), limit=10000, path=None)
+    fresh._loss_baseline = restarted
+    fresh._trading_guard.paused = False
+    post = _pnl(-15000, 20, f22="BBB")
+    # 07:00 is after the batch; the bot was down through it.
+    _drive(fresh, fresh_clock, datetime(2026, 11, 16, 7, 0), post)
+    assert fresh._trading_guard._pause_failsafe is True
+    _drive(fresh, fresh_clock, datetime(2026, 11, 16, 8, 35), post)
+    _drive(fresh, fresh_clock, datetime(2026, 11, 16, 9, 0), post)
+    assert fresh._trading_guard._last_net_pnl == 0, fresh._trading_guard._last_net_pnl
+    assert fresh._trading_guard.paused is False
+    assert fresh._trading_guard._pause_failsafe is False
+
+
+def test_f3_reset_detection_is_sticky_after_settle(tmp_path, monkeypatch):
+    import src.live.loss_baseline as lb
+    writes = {"n": 0}
+    real = lb.atomic_write_json
+
+    def _count(path, payload, **kw):
+        writes["n"] += 1
+        return real(path, payload, **kw)
+
+    monkeypatch.setattr(lb, "atomic_write_json", _count)
+    tr = _tracker(tmp_path / "sticky.json")
+    base = _pnl(-5000, 10, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 10, 14, 59))
+    tr.observe(base, datetime(2026, 11, 10, 15, 0, 5))
+    tr.observe(_pnl(-9000, 30, f22="AAA"), datetime(2026, 11, 11, 2, 0))
+    tr.observe(_pnl(0, 0, f22="AAA"), datetime(2026, 11, 11, 5, 22))
+    settled = tr.observe(_pnl(-4000, 20, f22="BBB"), datetime(2026, 11, 11, 8, 30))
+    assert settled.settled_after_reset is True
+    assert settled.basis == "capital_reset"
+    writes["n"] = 0
+    flags = []
+    for minute in (31, 32, 33, 34, 35):
+        view = tr.observe(
+            _pnl(-4000, 20, f22="BBB"), datetime(2026, 11, 11, 8, minute))
+        flags.append(view.settled_after_reset)
+        assert view.basis == "capital_reset"
+        assert view.loss_today == -4000
+    assert flags == [False, False, False, False, False]
+    assert writes["n"] == 0
+
+
+def test_f4_batch_inside_the_day_window_uses_the_post_reset_read(tmp_path):
+    """08:40 is still pre-batch. 08:44 is the reload. B_day is the reload."""
+    tr = _tracker(tmp_path / "mid.json")
+    base = _pnl(-5000, 10, f22="AAA")
+    pre = _pnl(-20000, 30, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(pre, datetime(2026, 11, 14, 2, 0))
+    # Monday, batch held until 08:44 (inside the day-open window).
+    tr.observe(pre, datetime(2026, 11, 16, 8, 40))
+    post = _pnl(-15000, 20, f22="BBB")
+    tr.observe(post, datetime(2026, 11, 16, 8, 44))
+    opened = tr.observe(post, datetime(2026, 11, 16, 8, 46))
+    assert opened.loss_today == 0, opened.loss_today
+    assert tr.day_b_r == -15000
+
+
+def test_f6_restart_restores_pause_failsafe_and_the_recheck_releases(tmp_path, monkeypatch):
+    path = tmp_path / "ff.json"
+    tr = _tracker(path)
+    # Missing 15:00 snapshot: first read is the night, full net -15,000.
+    tr.observe(_pnl(-15000, 10, f22="AAA"), datetime(2026, 11, 13, 20, 0))
+    tr.observe(_pnl(0, 0, f22="AAA"), datetime(2026, 11, 14, 5, 22))
+    tr.pause_failsafe = True
+    tr.save()
+    app, clock, _none = _app_at(
+        monkeypatch, datetime(2026, 11, 14, 8, 30), limit=10000, path=None)
+    restored = _tracker(path)
+    restored.load(datetime(2026, 11, 14, 8, 30))
+    app._loss_baseline = restored
+    app._loss_view = object()
+    adopt = getattr(app, "_adopt_persisted_pause_failsafe", None)
+    if adopt is None:
+        pytest.fail("restart does not restore pause_failsafe onto the guard")
+    adopt()
+    assert app._trading_guard._pause_failsafe is True
+    assert app._trading_guard.paused is True
+    _drive(app, clock, datetime(2026, 11, 14, 8, 30), _pnl(-500, 20, f22="BBB"))
+    guard = app._trading_guard
+    assert guard.paused is False
+    assert guard._pause_failsafe is False
+    assert guard._last_net_pnl == -500
+
+
+def test_f9_none_observe_clears_the_loss_view():
+    app = _app("auto")
+    app._loss_view = object()
+    app._loss_baseline = None
+    assert app._observe_loss_baseline(datetime(2026, 11, 16, 10, 0)) is None
+    assert app._loss_view is None
