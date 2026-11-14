@@ -1635,3 +1635,168 @@ def test_u12_paper_poll_writes_the_failsafe_flag_back(tmp_path, monkeypatch):
     assert guard.paused is False
     assert guard._pause_failsafe is False
     assert tracker.pause_failsafe is False
+
+
+# ── Killer tests from TY's b2939a28 validation (k1–k10, k2b) ──────────
+
+def _thu_snapshot_fri_skipped(path, b_r):
+    tr = _tracker(path)
+    base = _pnl(b_r, 10, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 12, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 12, 15, 0, 5))
+    tr.observe(_pnl(b_r - 1000, 20, f22="AAA"), datetime(2026, 11, 13, 2, 0))
+    return tr
+
+
+def test_k1_reset_first_seen_after_0845_reanchors_b_day(tmp_path):
+    """WKqG: Mon batch late (08:50 zeros, 08:52 reload). Mon trade -3,000 -> L -3,000."""
+    tr = _tracker(tmp_path / "k1.json")
+    snap = _raw(-6950, 30, 18, f22="71649")
+    pre = _raw(-12210, 60, 36, f22="71649")
+    rel = _raw(-5260, 30, 18, f22="64651")
+    tr.observe(snap, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(snap, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(pre, datetime(2026, 11, 14, 5, 0))
+    tr.observe(pre, datetime(2026, 11, 16, 8, 31))
+    assert tr.observe(pre, datetime(2026, 11, 16, 8, 46)).loss_today == 0
+    assert tr.observe(_raw(0, 0, 0, f22="71649"), datetime(2026, 11, 16, 8, 50)).loss_today <= 0
+    assert tr.observe(rel, datetime(2026, 11, 16, 8, 52)).loss_today <= 0
+    v = tr.observe(_raw(-8260, 30, 18, f22="64651"), datetime(2026, 11, 16, 9, 10))
+    assert v.loss_today == -3000, v.loss_today
+
+
+def test_k2_skipped_trading_day_nonzero_b_r_is_the_account(tmp_path):
+    """F5 with B_r -5,000: Thu snapshot, Fri skipped, Mon. Every Mon read == account."""
+    tr = _thu_snapshot_fri_skipped(tmp_path / "k2.json", -5000)
+    for when, r in ((datetime(2026, 11, 16, 5, 40), -7000), (datetime(2026, 11, 16, 8, 35), -7000),
+                    (datetime(2026, 11, 16, 9, 10), -8000), (datetime(2026, 11, 16, 14, 0), -8000)):
+        v = tr.observe(_pnl(r, 10, f22="CCC"), when)
+        assert v.loss_today == v.account_net == r, (when, v.loss_today)
+
+
+def test_k2b_skipped_day_first_read_in_session(tmp_path):
+    """Reed: link down Fri -> first read Mon 09:10, R -8,000. Gate -8,000 (master), not -3,000."""
+    tr = _thu_snapshot_fri_skipped(tmp_path / "k2b.json", -5000)
+    v = tr.observe(_pnl(-8000, 10, f22="CCC"), datetime(2026, 11, 16, 9, 10))
+    assert v.loss_today == -8000, v.loss_today
+
+
+def test_k3_unknown_calendar_nonzero_b_r_is_the_account(tmp_path, monkeypatch):
+    """S6 with B_r -5,000: calendar breaks after Thu's snapshot; Fri skipped; Mon == account."""
+    import src.market_data.holidays as hol
+    tr = _thu_snapshot_fri_skipped(tmp_path / "k3.json", -5000)
+    monkeypatch.setattr(hol, "_tw_public_holidays", lambda year: frozenset())
+    monkeypatch.setattr(hol, "holiday_calendar_health", lambda year=None: (False, "empty"))
+    for when, r in ((datetime(2026, 11, 16, 5, 40), -7000), (datetime(2026, 11, 16, 9, 10), -8000)):
+        v = tr.observe(_pnl(r, 10, f22="CCC"), when)
+        assert v.loss_today == r, (when, v.loss_today)
+
+
+def test_k4_restart_after_batch_with_pre_batch_file_is_not_looser(tmp_path):
+    """Wed B_r -8,000; night L -2,000; restart Thu 09:00 after the batch; float -9,000 -> L <= account."""
+    path = tmp_path / "k4.json"
+    tr = _tracker(path)
+    base = _pnl(-8000, 10, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 11, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 11, 15, 0, 5))
+    tr.observe(_pnl(-10000, 20, f22="AAA"), datetime(2026, 11, 12, 2, 0))
+    tr.save()
+    fresh = _tracker(path)
+    fresh.load(datetime(2026, 11, 12, 9, 0))
+    fresh.observe(_pnl(-2000, 10, f22="CCC"), datetime(2026, 11, 12, 9, 0))
+    v = fresh.observe(_pnl(-2000, 10, f1=-9000, f22="CCC"), datetime(2026, 11, 12, 9, 30))
+    assert v.loss_today <= v.account_net == -11000, v.loss_today
+
+
+def test_k5_winning_snapshot_reload_is_not_a_false_pause(tmp_path, monkeypatch):
+    """Tue R +12,000 at 15:00, Tue night -9,000. Wed zeros/reload must not show -21,000 or pause at 20k."""
+    app, clock, tr = _app_at(monkeypatch, datetime(2026, 11, 10, 14, 59), limit=20000, path=tmp_path / "k5.json")
+    g = app._trading_guard
+    s = _pnl(12000, 10, f22="AAA")
+    _drive(app, clock, datetime(2026, 11, 10, 14, 59), s)
+    _drive(app, clock, datetime(2026, 11, 10, 15, 0, 5), s)
+    _drive(app, clock, datetime(2026, 11, 11, 2, 0), _pnl(3000, 20, f22="AAA"))
+    for when, raw in ((datetime(2026, 11, 11, 5, 22), _raw(0, 0, 0, f22="AAA")),
+                      (datetime(2026, 11, 11, 5, 36), _pnl(-9000, 10, f22="WWW")),
+                      (datetime(2026, 11, 11, 9, 0), _pnl(-9000, 10, f22="WWW"))):
+        _drive(app, clock, when, raw)
+        assert g._last_net_pnl >= -9100, (when, g._last_net_pnl)
+        assert g.paused is False, when
+
+
+def test_k6_friday_file_restart_0840_counts_the_first_trade(tmp_path):
+    """Fri file, restart Mon 08:40 after the batch: Mon 09:10 trade -3,000 -> L -3,000 (not 0)."""
+    path = tmp_path / "k6.json"
+    tr = _tracker(path)
+    base = _pnl(-5000, 10, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(_pnl(-20000, 30, f22="AAA"), datetime(2026, 11, 14, 2, 0))
+    tr.save()
+    fresh = _tracker(path)
+    fresh.load(datetime(2026, 11, 16, 8, 40))
+    rel = _pnl(-15000, 20, f22="BBB")
+    for m in (40, 41, 42, 43, 47):
+        fresh.observe(rel, datetime(2026, 11, 16, 8, m, 5))
+    v = fresh.observe(_pnl(-18000, 25, f22="BBB"), datetime(2026, 11, 16, 9, 10))
+    assert v.loss_today == -3000, v.loss_today
+
+
+def test_k7_reed_wkqg_reset_seen_on_the_0846_opening_read(tmp_path):
+    """Reed WKqG: Mon 08:40 still pre-batch (B_day -12,306); 08:46 is the reload; 09:10 trade -3,000."""
+    tr = _tracker(tmp_path / "k7.json")
+    snap = _raw(-6950, 30, 18, f22="71649")
+    pre = _raw(-12210, 60, 36, f22="71649")
+    rel = _raw(-5260, 30, 18, f22="64651")
+    tr.observe(snap, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(snap, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(pre, datetime(2026, 11, 14, 5, 0))
+    tr.observe(pre, datetime(2026, 11, 16, 8, 40))
+    assert tr.observe(rel, datetime(2026, 11, 16, 8, 46)).loss_today <= 0
+    v = tr.observe(_raw(-8260, 30, 18, f22="64651"), datetime(2026, 11, 16, 9, 10))
+    assert v.loss_today == -3000, v.loss_today
+
+
+def _flat_night_app(tmp_path, monkeypatch, snap, name):
+    app, clock, tr = _app_at(monkeypatch, datetime(2026, 11, 10, 14, 59), limit=20000, path=tmp_path / name)
+    _drive(app, clock, datetime(2026, 11, 10, 14, 59), snap)
+    _drive(app, clock, datetime(2026, 11, 10, 15, 0, 5), snap)
+    _drive(app, clock, datetime(2026, 11, 11, 2, 0), snap)
+    return app, clock
+
+
+def test_k8_positive_b_r_flat_night_zero_row_no_pause(tmp_path, monkeypatch):
+    """Claude WXRx / Reed WZVV: Tue B_r +24,900, flat night; Wed zeros/reload/09:00 must stay unpaused."""
+    app, clock = _flat_night_app(tmp_path, monkeypatch, _pnl(24900, 100, f22="AAA"), "k8.json")
+    g = app._trading_guard
+    for when, raw in ((datetime(2026, 11, 11, 5, 22), _raw(0, 0, 0, f22="AAA")),
+                      (datetime(2026, 11, 11, 5, 36), _pnl(0, 0, f22="WWW")),
+                      (datetime(2026, 11, 11, 8, 31), _pnl(0, 0, f22="WWW")),
+                      (datetime(2026, 11, 11, 9, 0), _pnl(0, 0, f22="WWW"))):
+        _drive(app, clock, when, raw)
+        assert g.paused is False, (when, g._last_net_pnl)
+
+
+def test_k9_positive_b_c_zero_row_is_not_a_loss(tmp_path):
+    """Reed WZVV variant: open profit +8,000 at 15:00 (B_c), B_r ~0; Wed 05:22 zero row must not read -8,000."""
+    for fee in (50, 0):
+        tr = _tracker(tmp_path / f"k9-{fee}.json")
+        s = _raw(fee, fee, 0, f1=8000, f22="AAA")
+        tr.observe(s, datetime(2026, 11, 10, 14, 59))
+        tr.consume_failsafe_notice()
+        tr.observe(s, datetime(2026, 11, 10, 15, 0, 5))
+        tr.observe(s, datetime(2026, 11, 11, 2, 0))
+        v = tr.observe(_raw(0, 0, 0, f22="AAA"), datetime(2026, 11, 11, 5, 22))
+        assert v.loss_today >= -100, (fee, v.loss_today)
+
+
+def test_k10_reed_wzvw_skipped_day_process_up(tmp_path):
+    """Reed WZVW: Thu B_r -18,000, no Fri 15:00 poll, Mon 09:00 account -25,000 -> gate -25,000 (master)."""
+    tr = _thu_snapshot_fri_skipped(tmp_path / "k10.json", -18000)
+    v = tr.observe(_pnl(-25000, 10, f22="CCC"), datetime(2026, 11, 16, 9, 0))
+    assert v.loss_today == -25000, v.loss_today

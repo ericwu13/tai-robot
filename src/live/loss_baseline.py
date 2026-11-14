@@ -294,11 +294,13 @@ class DailyLossBaseline:
         if _day_status(now.date()) == _Cal.UNKNOWN:
             self._note_unknown(now.date().isoformat())
         if key != self.day_key:
-            if _day_status_of_key(key) == _Cal.UNKNOWN:
-                # Same roll as master: the guard's key changes at 15:00
-                # and the figure is the account net. No carried minimum,
-                # and no separate budget. The warning uses this real key.
-                self._note_unknown(key)
+            today_status = _day_status(now.date())
+            key_status = _day_status_of_key(key)
+            if today_status == _Cal.UNKNOWN or key_status == _Cal.UNKNOWN:
+                # Unknown calendar rolls onto master's key with B_r = 0.
+                # A weekend key would otherwise carry Thursday's baseline.
+                if key:
+                    self._note_unknown(key)
                 self._adopt_master_day(key)
                 dirty = True
                 force = True
@@ -322,6 +324,17 @@ class DailyLossBaseline:
 
         held = False
         just_settled = False
+        confirmed = self._reset_open() and self._rebase_confirmed(realized, equity)
+        interim = realized == 0 and floating == 0 and fee == 0
+        # Unknown today is master's account net via _adopt_master_day
+        # zeroing B_r. Do not also zero here: that would hide a mutant
+        # that leaves B_r set.
+        if (confirmed and not self.day_budget
+                and _day_status(now.date()) != _Cal.UNKNOWN):
+            # The reload is already visible. Stop subtracting B_r from
+            # a figure that no longer contains the pre-15:00 part. The
+            # hold itself still waits until 08:30.
+            self.b_r = 0
         if self._reset_open() and self._can_settle(now, realized, fee, equity):
             self.b_r = 0
             self.capital_reset["settled"] = True
@@ -340,21 +353,56 @@ class DailyLossBaseline:
             dirty = True
             force = True
 
+        today_unknown = _day_status(now.date()) == _Cal.UNKNOWN
         if self.day_budget:
+            reset = self.capital_reset if isinstance(self.capital_reset, dict) else None
+            if reset is not None and not (
+                    self.day_taken_at
+                    and self.day_taken_at < str(reset.get("detected_at") or "")):
+                # B_day was taken after this reload. Nothing to shift.
+                reset = None
+            if reset is not None and confirmed:
+                # One shift: drop the pre-batch part out of B_day.
+                self.day_b_r -= int(reset.get("pre_r") or 0) - realized
+                reset["settled"] = True
+                just_settled = True
+                dirty = True
+                force = True
+                reset = None
             loss = account - self.day_b_r - self.day_b_c
+            if (reset is not None and not reset.get("settled")
+                    and reset.get("l_pre") is not None):
+                held = True
+                loss = int(reset["l_pre"]) if interim else min(loss, int(reset["l_pre"]))
         else:
             loss = account - self.b_r - self.b_c
+            if (interim and not isinstance(self.capital_reset, dict)
+                    and self.last_l is not None):
+                # All-zero row that tripped no detector. Not a loss of B_c.
+                loss = int(self.last_l)
+                held = True
             if self._reset_open():
                 held_loss = self.capital_reset.get("l_pre")
                 if held_loss is not None:
                     held = True
-                    # Off-session used to freeze l_pre even when the
-                    # formula had already worsened. Keep the stricter of
-                    # the two. Do not substitute the raw account: an
-                    # f22-first read still carries the pre-batch net.
-                    loss = min(loss, int(held_loss))
+                    if interim and not confirmed:
+                        loss = int(held_loss)
+                    else:
+                        loss = min(loss, int(held_loss))
+                if not confirmed and not _off_session(now):
+                    # In session, never looser than the account net of B_c.
+                    loss = min(loss, account - self.b_c)
+            if today_unknown:
+                # Equals the account only because adopt zeroed B_r and B_c.
+                loss = account - self.b_r - self.b_c
+                held = False
+            elif self._span(now) in ("trading", "unknown"):
+                # Skipped trading day: the account net, with no hold.
+                loss = account
+                held = False
         if (not self.day_budget
                 and not self._reset_open()
+                and not today_unknown
                 and self._span(now) == "closed"
                 and self.last_l is not None
                 and _day_status(now.date()) != _Cal.UNKNOWN):
@@ -778,6 +826,7 @@ class DailyLossBaseline:
                 self.day_taken_at = str(raw_day.get("taken_at") or "")
         self.day_budget = bool(data.get("day_budget"))
         self.day_failsafe = bool(data.get("day_failsafe"))
+        self._last_realized = _as_int(data.get("last_realized"))
         return True
 
     def _payload(self) -> dict:
@@ -820,6 +869,7 @@ class DailyLossBaseline:
             },
             "day_budget": self.day_budget,
             "day_failsafe": self.day_failsafe,
+            "last_realized": self._last_realized,
         }
 
     def _persist(self, *, candidate_only: bool) -> None:
