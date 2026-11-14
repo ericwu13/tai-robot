@@ -694,61 +694,219 @@ def _slot_is_stale(pids, stamp, stale_s: float, now: float | None = None) -> boo
     return True
 
 
-def _record_child_pid(path: str, child_pid: int) -> None:
-    """Add the grid child pid to a slot this process still owns.
+def _inode_pair(st):
+    """``(st_dev, st_ino)`` when the inode is a real one, else None.
 
-    The original timestamp is kept, so the age cap does not restart
-    when the child appears. The write truncates the file we own. It
-    does not replace the path with another name.
+    ``st_ino`` 0 is not an identity. FAT and some Windows network
+    shares report that, and a missing stat result is the same.
     """
-    if not child_pid:
-        return
-    pids, stamp = _read_slot(path)
-    if not pids or pids[0] != os.getpid():
-        return
-    when = time.time() if stamp is None else float(stamp)
-    payload = f"{pids[0]}\n{when:.6f}\n{int(child_pid)}\n".encode("ascii")
+    if st is None:
+        return None
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
-    except OSError:
-        return
+        ino = int(st.st_ino)
+        dev = int(st.st_dev)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if ino <= 0:
+        return None
+    return (dev, ino)
+
+
+def _payload_tokens(payload: bytes):
+    parts = payload.split()
+    if len(parts) < 2:
+        return None
     try:
-        os.write(fd, payload)
+        return (parts[0].decode("ascii"), parts[1].decode("ascii"))
+    except (UnicodeError, AttributeError):
+        return None
+
+
+def _slot_text_tokens(path: str):
+    """Pid and stamp text at ``path``, ``()`` if readable but short, None if not."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
     except OSError:
-        pass
+        return None
+    try:
+        data = os.read(fd, 256)
+    except OSError:
+        return None
     finally:
         try:
             os.close(fd)
         except OSError:
             pass
+    parts = data.split()
+    if len(parts) < 2:
+        return ()
+    try:
+        return (parts[0].decode("ascii"), parts[1].decode("ascii"))
+    except UnicodeError:
+        return ()
+
+
+def _path_is_fd(path: str, fd: int) -> bool:
+    """True only when ``path`` still names the inode behind ``fd``."""
+    try:
+        mine = _inode_pair(os.fstat(fd))
+        there = _inode_pair(os.stat(path))
+    except OSError:
+        return False
+    if mine is None or there is None:
+        return False
+    return mine == there
+
+
+def _created_slot_is_ours(fd: int, path: str, payload: bytes) -> bool:
+    """True when ``path`` is still the inode we just wrote.
+
+    A real ``(st_dev, st_ino)`` pair is enough. ``st_ino`` 0, or no
+    inode at all, falls back to the pid and stamp in ``payload``.
+    A missing path, a mismatch, or neither check, is not ownership.
+    The caller treats that as busy.
+    """
+    try:
+        mine = os.fstat(fd)
+    except OSError:
+        mine = None
+    try:
+        there = os.stat(path)
+    except OSError:
+        return False
+    mine_id = _inode_pair(mine)
+    there_id = _inode_pair(there)
+    if mine_id is not None and there_id is not None:
+        return mine_id == there_id
+    expected = _payload_tokens(payload)
+    found = _slot_text_tokens(path)
+    if expected is None or found is None:
+        return False
+    return found == expected
+
+
+def _path_identity(path: str):
+    """Inode of ``path``, or its pid and stamp when the inode is unusable."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    pair = _inode_pair(st)
+    if pair is not None:
+        return ("ino", pair)
+    pids, stamp = _read_slot(path)
+    if stamp is None and not pids:
+        return None
+    return ("text", (tuple(pids), stamp))
+
+
+def _identity_matches(path: str, ident) -> bool:
+    if ident is None:
+        return False
+    return _path_identity(path) == ident
+
+
+def _warn_slot(message: str, on_warning) -> None:
+    import logging
+
+    logging.getLogger(__name__).warning("%s", message)
+    if on_warning is None:
+        return
+    try:
+        on_warning(message)
+    except Exception:
+        pass
+
+
+def _record_child_pid(path: str, child_pid: int, *, on_warning=None) -> bool:
+    """Add the grid child pid to a slot this process still owns.
+
+    The original timestamp is kept, so the age cap does not restart
+    when the child appears. The new bytes are one ``os.write``. The
+    file is not truncated first and the path is not replaced. A failed
+    write is restored to the previous bytes, logged, and left busy.
+    """
+    if not child_pid:
+        return False
+    pids, stamp = _read_slot(path)
+    if not pids or pids[0] != os.getpid():
+        return False
+    when = time.time() if stamp is None else float(stamp)
+    payload = f"{pids[0]}\n{when:.6f}\n{int(child_pid)}\n".encode("ascii")
+
+    def _failed(exc: BaseException) -> bool:
+        _warn_slot(
+            f"grid slot child pid write failed path={path} pid={os.getpid()} "
+            f"[{type(exc).__name__}] {exc}",
+            on_warning,
+        )
+        return False
+
+    try:
+        src = os.open(path, os.O_RDONLY)
+    except OSError as exc:
+        return _failed(exc)
+    try:
+        try:
+            original = os.read(src, 4096)
+        except OSError as exc:
+            return _failed(exc)
+    finally:
+        try:
+            os.close(src)
+        except OSError:
+            pass
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as exc:
+        return _failed(exc)
+    try:
+        try:
+            written = os.write(fd, payload)
+            if written != len(payload):
+                raise OSError(f"short write {written}")
+            os.ftruncate(fd, len(payload))
+        except OSError as exc:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, original)
+                os.ftruncate(fd, len(original))
+            except OSError:
+                pass
+            return _failed(exc)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return True
 
 
 def _try_create_slot(path: str) -> bool:
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
         fd = os.open(path, flags, 0o644)
-    except FileExistsError:
-        return False
     except OSError:
         return False
     try:
         payload = f"{os.getpid()}\n{time.time():.6f}\n".encode("ascii")
-        os.write(fd, payload)
-    except OSError:
+        try:
+            written = os.write(fd, payload)
+            if written != len(payload):
+                raise OSError(f"short write {written}")
+        except OSError:
+            if _path_is_fd(path, fd):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return False
+        return _created_slot_is_ours(fd, path, payload)
+    finally:
         try:
             os.close(fd)
         except OSError:
             pass
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return False
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-    return True
 
 
 def _restore_slot(renamed: str, path: str) -> None:
@@ -864,8 +1022,13 @@ def _steal_stale_slot(path: str, stale_s: float) -> None:
     pids, stamp = _read_slot(path)
     if not _slot_is_stale(pids, stamp, stale_s):
         return
+    ident = _path_identity(path)
     holder = str(pids[0]) if pids else "na"
     renamed = f"{path}.{holder}.{os.urandom(4).hex()}"
+    # Re-check the judged inode (or pid and stamp) immediately before
+    # the replace. A new file at this path is not the stale slot.
+    if not _identity_matches(path, ident):
+        return
     try:
         os.replace(path, renamed)
     except OSError:
@@ -1144,6 +1307,7 @@ def run_grid_isolated(
             run_started=run_started,
             ctx=ctx,
             slot_path=path,
+            on_warning=on_release_warning,
         )
     finally:
         release_grid_slot(path, os.getpid(), on_warning=on_release_warning)
@@ -1163,7 +1327,8 @@ def _run_grid_held(
         queue_s: float,
         run_started: float,
         ctx,
-        slot_path: str):
+        slot_path: str,
+        on_warning=None):
     """The sweep after this process holds the slot. Clocks already run."""
     done = 0
     total = 0
@@ -1241,7 +1406,8 @@ def _run_grid_held(
                 f"could not start grid child: {type(exc).__name__}: {exc}",
                 proc.pid))
         if proc.pid:
-            _record_child_pid(slot_path, proc.pid)
+            _record_child_pid(
+                slot_path, proc.pid, on_warning=on_warning)
         if on_start is not None:
             on_start(proc.pid)
         try:
