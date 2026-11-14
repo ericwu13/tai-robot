@@ -15,10 +15,15 @@ has happened. No file, a stale key, a non-trading or unknown day, a
 missed 08:30 re-anchor, and a restart after 08:30 that never anchored are
 that same fact: the snapshot is not valid.
 
-The one extra is Capital's morning rebase. Issue-107 ``GetFutureRights``
-logs show that batch at about 05:20–05:38 TPE, and it moves f22. The
-first such read sets ``snap_net = net_now - last_L`` so ``L`` does not
-jump.
+From 05:00 to 08:30 TPE the market is closed and ``L`` stays at the
+last value read before 05:00. Nothing in the snapshot moves in that
+window. On a trading morning, the first read at or after 08:30 looks
+at the latest non-zero read since 05:00 (not a row with net,
+realized_pnl and realized_cost all zero). If that read's f22 differs
+from the snapshot, ``snap_net`` becomes that net minus the held ``L``.
+Otherwise the rest of the key uses the account net. A restart inside
+the window keeps the held ``L`` from the file. Capital still showing
+zeros at 08:30 uses the account net.
 """
 
 from __future__ import annotations
@@ -38,8 +43,8 @@ logger = logging.getLogger(__name__)
 
 _TPE = timezone(timedelta(hours=8))
 _VERSION = 2
-_ANCHOR_FROM = 5 * 60 + 20
-_ANCHOR_BY = 8 * 60 + 30
+_HOLD_FROM = 5 * 60
+_DECIDE_AT = 8 * 60 + 30
 _ROLL = 15 * 60
 
 
@@ -74,6 +79,16 @@ def _known_trading_day(day: date) -> bool:
         return not is_taifex_holiday(day)
     except Exception:
         return False
+
+
+def _is_zero_row(rights, net: int) -> bool:
+    """Capital's all-zero batch row: net, realized P&L and fees are all 0."""
+    try:
+        realized = int(float(rights.get("realized_pnl", "0") or 0))
+        cost = int(float(rights.get("realized_cost", "0") or 0))
+    except (TypeError, ValueError):
+        return False
+    return net == 0 and realized == 0 and cost == 0
 
 
 def _net_and_f22(rights):
@@ -124,6 +139,11 @@ class DailyLossBaseline:
         self._account_net = 0
         # Previous successful read in this process. Not stored in the file.
         self._prev_read: datetime | None = None
+        # Closed-window memory for this key. Not stored; a restart holds last_L.
+        self._master_rest = False
+        self._decided = False
+        self._nz_net: int | None = None
+        self._nz_f22 = ""
 
     def observe(self, rights: dict, now_tpe: datetime) -> LossView:
         """One valid rights read. Invalid input does not move state."""
@@ -142,9 +162,16 @@ class DailyLossBaseline:
             self.snap_f22 = f22
             self.anchored = False
         self._prev_read = now
-        if self._anchor_due(now, f22):
-            self.snap_net = net - int(self.last_L or 0)
-            self.anchored = True
+        minute = _minutes(now)
+        if self._in_hold(minute):
+            if not _is_zero_row(rights, net):
+                self._nz_net = net
+                self._nz_f22 = f22
+            held = net if self.last_L is None else self.last_L
+            self._account_net = net
+            basis = "snapshot" if self._snapshot_valid(now) else "master"
+            return self._view(held, net, basis)
+        self._decide(rights, now, net, f22, minute)
         if self._snapshot_valid(now):
             loss = net - int(self.snap_net)
             basis = "snapshot"
@@ -182,6 +209,11 @@ class DailyLossBaseline:
         self.anchored = bool(data.get("anchored"))
         self.last_L = _as_int(data.get("last_L"))
         self.pause_failsafe = bool(data.get("pause_failsafe"))
+        minute = _minutes(now)
+        if (not self.anchored and _DECIDE_AT <= minute < _ROLL):
+            # The window was not watched. Do not invent an anchor.
+            self._master_rest = True
+            self._decided = True
 
     def save(self) -> None:
         self._persist()
@@ -207,16 +239,36 @@ class DailyLossBaseline:
                 and _minutes(prev) < _ROLL
                 and _minutes(now) >= _ROLL)
 
-    def _anchor_due(self, now: datetime, f22: str) -> bool:
-        if self.snap_net is None or self.anchored:
-            return False
-        if not f22 or not self.snap_f22 or f22 == self.snap_f22:
-            return False
-        minute = _minutes(now)
-        return _ANCHOR_FROM <= minute <= _ANCHOR_BY
+    def _in_hold(self, minute: int) -> bool:
+        """05:00–08:30, and only while this key still has a snapshot to hold."""
+        return (self.snap_net is not None and not self._master_rest
+                and _HOLD_FROM <= minute < _DECIDE_AT)
+
+    def _decide(self, rights, now: datetime, net: int, f22: str, minute: int) -> None:
+        """Once, on a trading morning: anchor from the closed window, or master."""
+        if self._decided or self._master_rest or self.snap_net is None:
+            return
+        if minute < _DECIDE_AT or minute >= _ROLL:
+            return
+        if not _known_trading_day(now.date()):
+            return
+        self._decided = True
+        if not _is_zero_row(rights, net):
+            self._nz_net = net
+            self._nz_f22 = f22
+        held = 0 if self.last_L is None else int(self.last_L)
+        if (_is_zero_row(rights, net) or self._nz_net is None
+                or not self._nz_f22 or not self.snap_f22
+                or self._nz_f22 == self.snap_f22):
+            self._master_rest = True
+            return
+        self.snap_net = int(self._nz_net) - held
+        self.anchored = True
 
     def _snapshot_valid(self, now: datetime) -> bool:
         """False means gate on the account net."""
+        if self._master_rest:
+            return False
         if self.snap_net is None or self.key != trading_day_key(now):
             return False
         try:
@@ -225,9 +277,6 @@ class DailyLossBaseline:
             return False
         if not _known_trading_day(day):
             return False
-        minute = _minutes(now)
-        if minute < _ROLL and minute >= _ANCHOR_BY and not self.anchored:
-            return False
         return True
 
     def _clear_snap(self) -> None:
@@ -235,6 +284,10 @@ class DailyLossBaseline:
         self.snap_f22 = ""
         self.anchored = False
         self.last_L = None
+        self._master_rest = False
+        self._decided = False
+        self._nz_net = None
+        self._nz_f22 = ""
 
     def _persist(self) -> None:
         if not self.path:
