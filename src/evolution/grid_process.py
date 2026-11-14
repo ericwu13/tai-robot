@@ -93,6 +93,23 @@ def grid_queue_wait_s() -> int:
     return GRID_QUEUE_FACTOR * GRID_TIMEOUT_CAP_S
 
 
+def pre_slot_event_deadline_s(queue_timeout_s: float) -> float:
+    """How long a silent spawn may run before its first slot event.
+
+    ``max(120 s, queue wait + 60 s)``. A slow Windows EXE spawn or
+    import fits under the floor. The clock starts at ``proc.start``
+    and the first slot message clears it. A child that dies with no
+    slot event is still an eof/crash.
+    """
+    try:
+        wait = float(queue_timeout_s)
+    except (TypeError, ValueError):
+        wait = 0.0
+    if wait < 0:
+        wait = 0.0
+    return max(120.0, wait + 60.0)
+
+
 def child_run_limit_s(timeout_s: float) -> float:
     """How long the child may hold the lock: the run budget plus slack.
 
@@ -616,8 +633,10 @@ def grid_progress_should_log(
 def _pid_alive(pid: int) -> bool:
     """True when ``pid`` is a live process.
 
-    Windows ``os.kill(pid, 0)`` delivers CTRL_C_EVENT, so that platform
-    asks OpenProcess. A permission error counts as alive.
+    Windows ``os.kill(pid, 0)`` delivers CTRL_C_EVENT. A non-null
+    ``OpenProcess`` handle is not enough: the process may already have
+    exited. ``GetExitCodeProcess`` must still report ``STILL_ACTIVE``.
+    A permission error on POSIX counts as alive.
     """
     try:
         target = int(pid)
@@ -627,12 +646,19 @@ def _pid_alive(pid: int) -> bool:
         return False
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         # PROCESS_QUERY_LIMITED_INFORMATION
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, target)
+        handle = kernel32.OpenProcess(0x1000, False, target)
         if not handle:
             return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(target, 0)
     except ProcessLookupError:
@@ -645,7 +671,27 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _parent_gone(parent_pid: int) -> bool:
-    """True when this process was reparented or the parent pid is gone."""
+    """True when the process that spawned this child has exited.
+
+    ``parent_process().is_alive()`` waits on the spawn sentinel. That
+    is the check that works on Windows, where ``getppid`` does not
+    change and ``OpenProcess`` can still succeed while the sentinel
+    handle is open. When this is not a spawn child, POSIX falls back
+    to a ppid change or a gone pid.
+    """
+    parent = None
+    try:
+        parent = multiprocessing.parent_process()
+    except Exception:
+        parent = None
+    if parent is not None:
+        try:
+            return not bool(parent.is_alive())
+        except Exception:
+            pass
+    if os.name == "nt":
+        # No spawn sentinel. Do not treat a bare OpenProcess handle as alive.
+        return not _pid_alive(parent_pid)
     try:
         if os.getppid() != int(parent_pid):
             return True
@@ -942,16 +988,21 @@ def release_grid_slot(
         )
 
 
-def _child_hold_watch(slot_path, deadline, on_warning) -> None:
+def _child_hold_watch(slot_path, deadline, on_warning, conn) -> None:
     """Drop the lock if this backtest does not return by ``deadline``.
 
     The parent normally kills the child at ``timeout_s``. This thread
     covers a hung backtest whose parent is gone, so the OS lock does
-    not stay held. ``os._exit`` skips the main thread's finally; the
-    release above has already closed the fd.
+    not stay held. The ``self_timeout`` message makes the parent record
+    ``timeout`` instead of a crash. ``os._exit`` skips the main
+    thread's finally; the release above has already closed the fd.
     """
     while time.monotonic() < deadline:
         time.sleep(0.05)
+    try:
+        conn.send(("self_timeout",))
+    except Exception:
+        pass
     release_grid_slot(slot_path, on_warning=on_warning)
     os._exit(0)
 
@@ -960,14 +1011,6 @@ def _locked_grid_child(
         fn, job, conn, slot_path, wait_s, poll_s, notice_s, parent_pid,
         run_limit_s):
     """Child target. This process, not the parent, holds the host lock."""
-    # Test-only. A spawn child does not see a parent monkeypatch, so the
-    # queue-clock test delays the first lock try through the environment.
-    delay = os.environ.get("TAI_EVO_LOCK_DELAY_S")
-    if delay:
-        try:
-            time.sleep(float(delay))
-        except (TypeError, ValueError):
-            pass
 
     def _on_queue(kind, **fields):
         try:
@@ -1007,7 +1050,9 @@ def _locked_grid_child(
         limit = child_run_limit_s(DEFAULT_GRID_TIMEOUT_S)
     threading.Thread(
         target=_child_hold_watch,
-        args=(slot_path, time.monotonic() + max(0.0, limit), _on_warning),
+        args=(
+            slot_path, time.monotonic() + max(0.0, limit), _on_warning, conn,
+        ),
         daemon=True,
         name="evo-grid-hold",
     ).start()
@@ -1267,7 +1312,8 @@ def _run_grid_held(
         return None
 
     def _arm_queue() -> None:
-        nonlocal queue_deadline
+        nonlocal queue_deadline, pre_event_deadline
+        pre_event_deadline = None
         if queue_deadline is None:
             queue_deadline = time.monotonic() + float(wait_s)
 
@@ -1280,6 +1326,13 @@ def _run_grid_held(
         if not isinstance(message, tuple) or not message:
             return "result"
         tag = message[0]
+        if tag == "self_timeout":
+            return GridProcessFailure(
+                "timeout",
+                f"grid child exceeded its own limit; progress {_progress()}",
+                proc.pid,
+                progress=_progress(),
+            )
         if tag == "slot_warn":
             if on_warning is not None and len(message) > 1:
                 try:
@@ -1340,9 +1393,12 @@ def _run_grid_held(
         # Stall and the grid cap start when the child takes the lock.
         # The queue cap starts at the child's first slot event, not at
         # proc.start(), so a slow spawn does not consume the wait.
-        # Until that event there is no queue deadline; a dead child is
-        # still an eof/crash.
+        # A separate pre-event cap, max(120 s, queue wait + 60 s),
+        # starts at spawn and is cleared by that first event. A dead
+        # child with no slot event is still an eof/crash.
         queue_deadline = None
+        pre_event_limit = float(pre_slot_event_deadline_s(wait_s))
+        pre_event_deadline = time.monotonic() + pre_event_limit
         poll = 0.05 if not poll_s or poll_s <= 0 else float(poll_s)
         while True:
             # STOP wins over a payload that has not been read yet, same
@@ -1352,6 +1408,21 @@ def _run_grid_held(
                 return _stamp(GridProcessFailure(
                     "stopped", "stop requested", proc.pid))
             now = time.monotonic()
+            if (not acquired and pre_event_deadline is not None
+                    and now >= pre_event_deadline):
+                found = _drain_buffered()
+                if found is not None:
+                    return _stamp(found)
+                if not _alive(proc):
+                    return _stamp(_no_result(proc))
+                _terminate(proc)
+                return _stamp(GridProcessFailure(
+                    "timeout",
+                    f"grid child sent no slot event within "
+                    f"{pre_event_limit:g}s",
+                    proc.pid,
+                    progress="0/0",
+                ))
             if acquired:
                 deadline = run_started + float(timeout_s)
             elif queue_deadline is not None:

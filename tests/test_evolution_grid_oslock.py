@@ -372,8 +372,15 @@ def _orphan_entry(job, conn):
 def test_queued_orphan_exits_without_running(tmp_path):
     """A queued child exits when its parent dies, and does not take the lock."""
     import subprocess
+    import sys
     import textwrap
+    from pathlib import Path
 
+    if sys.platform != "linux":
+        pytest.skip(
+            "queued-orphan parent kill looks up the child with ps --ppid; "
+            "psutil is not a project dependency")
+    repo = Path(__file__).resolve().parents[1]
     slot = str(tmp_path / "evo_grid.slot")
     marker = str(tmp_path / "ran.txt")
     owned, _kind, _q = acquire_grid_slot(
@@ -389,7 +396,7 @@ def test_queued_orphan_exits_without_running(tmp_path):
             queue_timeout_s=15)
     """)
     proc = subprocess.Popen(
-        [__import__("sys").executable, "-c", script], cwd="/agent/repos/tai-robot")
+        [sys.executable, "-c", script], cwd=str(repo))
     deadline = time.time() + 15
     child = None
     while time.time() < deadline:
@@ -506,12 +513,115 @@ def test_sidecar_is_removed_before_the_lock_drops(tmp_path, monkeypatch):
     assert order.index("remove") < order.index("unlock"), order
 
 
+def test_dead_parent_process_does_not_take_the_lock(tmp_path, monkeypatch):
+    """A dead multiprocessing parent does not let a queued acquire take the lock."""
+    import multiprocessing
+
+    import src.evolution.grid_process as gp
+
+    class _Dead:
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(multiprocessing, "parent_process", lambda: _Dead())
+    path = str(tmp_path / "evo_grid.slot")
+    owned, kind, _queue = gp.acquire_grid_slot(
+        path, wait_s=1, poll_s=0.05, parent_pid=os.getppid())
+    assert owned is False, (owned, kind)
+    again, again_kind, queue_s = gp.acquire_grid_slot(
+        path, wait_s=1, poll_s=0.05)
+    assert again and again_kind == "" and queue_s < 0.5, (again, again_kind, queue_s)
+    gp.release_grid_slot(path)
+
+
+def _slow_locked_child(delay, forwarded):
+    """Test spawn wrapper. Sleeps before the real child tries the lock.
+
+    Spawn reimports production modules, so a parent monkeypatch of the
+    child function is invisible. The delay is an argument of this
+    wrapper, which lives in the test module.
+    """
+    time.sleep(float(delay))
+    from src.evolution.grid_process import _locked_grid_child
+    return _locked_grid_child(*forwarded)
+
+
+def _delay_spawn(monkeypatch, delay):
+    """Make ``run_grid_isolated``'s spawn child sleep before the lock try."""
+    import multiprocessing
+
+    import src.evolution.grid_process as gp
+
+    real_get = multiprocessing.get_context
+
+    class _Ctx:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def Pipe(self, duplex=False):
+            return self._inner.Pipe(duplex)
+
+        def Process(self, target=None, args=(), **kwargs):
+            if getattr(target, "__name__", "") == "_locked_grid_child":
+                args = (float(delay), tuple(args))
+                target = _slow_locked_child
+            return self._inner.Process(target=target, args=args, **kwargs)
+
+    def _get(method):
+        return _Ctx(real_get(method))
+
+    monkeypatch.setattr(gp.multiprocessing, "get_context", _get)
+
+
+def test_silent_spawn_hits_the_pre_slot_deadline(tmp_path, monkeypatch):
+    """A child that never sends a slot event is a timeout, not a hang."""
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_grid_process import _job
+
+    monkeypatch.setattr(gp, "pre_slot_event_deadline_s", lambda wait_s: 0.35)
+    _delay_spawn(monkeypatch, 5)
+    slot = str(tmp_path / "evo_grid.slot")
+    result = gp.run_grid_isolated(
+        _job(mode="sleep", burn_seconds=0.1),
+        timeout_s=20,
+        stall_s=20,
+        entry=gp.burn_child_entry,
+        slot_path=slot,
+        poll_s=0.05,
+        slot_poll_s=0.05,
+        queue_timeout_s=20,
+    )
+    assert isinstance(result, gp.GridProcessFailure), result
+    assert result.kind == "timeout", result
+
+
+def test_child_self_timeout_is_a_timeout(tmp_path, monkeypatch):
+    """The child's own limit is a timeout, not a crash."""
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_grid_process import _job
+
+    monkeypatch.setattr(gp, "child_run_limit_s", lambda timeout_s: 0.5)
+    slot = str(tmp_path / "evo_grid.slot")
+    result = gp.run_grid_isolated(
+        _job(mode="sleep", burn_seconds=30),
+        timeout_s=30,
+        stall_s=30,
+        entry=gp.burn_child_entry,
+        slot_path=slot,
+        poll_s=0.05,
+        slot_poll_s=0.05,
+        queue_timeout_s=5,
+    )
+    assert isinstance(result, gp.GridProcessFailure), result
+    assert result.kind == "timeout", result
+
+
 def test_queue_clock_starts_at_the_childs_first_lock_event(tmp_path, monkeypatch):
     """Spawn time before the first lock try does not consume the queue budget."""
     import src.evolution.grid_process as gp
     from tests.test_evolution_grid_process import _job
 
-    monkeypatch.setenv("TAI_EVO_LOCK_DELAY_S", "1.5")
+    _delay_spawn(monkeypatch, 1.5)
     slot = str(tmp_path / "evo_grid.slot")
     result = gp.run_grid_isolated(
         _job(mode="sleep", burn_seconds=0.1),
