@@ -180,7 +180,7 @@ def test_invalid_read_does_not_become_the_snapshot(tmp_path):
     tr.observe(_rights(-1000, "AAA"), datetime(2026, 11, 13, 14, 59))
     skipped = tr.observe({"valid": False}, datetime(2026, 11, 13, 15, 0))
     assert skipped.basis == "master"
-    later = tr.observe(_rights(-1000, "AAA"), datetime(2026, 11, 13, 16, 0))
+    later = tr.observe(_rights(-1000, "AAA"), datetime(2026, 11, 13, 15, 5))
     assert later.basis == "snapshot"
     assert later.loss_today == 0
 
@@ -314,6 +314,28 @@ def test_monday_replay_0910_is_8308(tmp_path):
     opened = tr.observe(_rights(-8308, "64651"), datetime(2026, 11, 11, 9, 10))
     assert opened.loss_today == -8308
     assert opened.basis == "snapshot"
+
+
+def test_roll_at_1600_without_a_1450_read_is_the_account(tmp_path):
+    """A 16:00 read is not the roll. The previous read is 14:40, before 14:50."""
+    tr = _tracker(tmp_path / "late-roll.json")
+    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 10, 14, 40))
+    view = tr.observe(_rights(-12000, "AAA"), datetime(2026, 11, 10, 16, 0))
+    assert view.basis == "master"
+    assert view.loss_today == view.account_net == -12000
+    assert tr.snap_net is None
+
+
+def test_invalid_read_returns_the_account_not_last_l(tmp_path):
+    """observe rejects valid=False and must return the account net, not last_L."""
+    tr = _tracker(tmp_path / "invalid-net.json")
+    _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(-6998, "AAA"))
+    night = tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 11, 2, 0))
+    assert night.loss_today == -5308
+    assert night.account_net == -12306
+    skipped = tr.observe({"valid": False}, datetime(2026, 11, 11, 2, 30))
+    assert skipped.basis == "master"
+    assert skipped.loss_today == skipped.account_net == -12306
 
 
 def test_reed_restart_after_anchor_keeps_the_snap_and_pauses(tmp_path):

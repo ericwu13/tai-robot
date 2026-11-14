@@ -36,7 +36,7 @@ trading:
   # per bot; this value is only the pre-fill. The counted loss is
   # net_now minus the 15:00 snapshot, and only when this process saw
   # that roll. From 05:00 to 08:30 that loss is held, and the 08:30
-  # anchor runs, only when this process saw a pre-05:00 read on the
+  # anchor runs, only when this process saw a read in 04:50-05:00 on the
   # same key. Otherwise the gate uses the account net, as on master.
   # NOT the same as risk.max_daily_loss below, which
   # gates the backtest ExecutionEngine and never places a real order.

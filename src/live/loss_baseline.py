@@ -1,32 +1,8 @@
 """One daily-loss rule for a REAL bot.
 
-A valid 15:00 TPE snapshot for this trading-day key gives
-``L = net_now - snap_net``. Otherwise ``L`` is the account net, which is
-what master gates on.
-
-A snapshot is taken only when this process saw the roll: its previous
-read was before 15:00 TPE on that calendar day, and this read is at or
-after 15:00. A process that starts at or after 15:00 with no file for
-this key does not snapshot until the next roll. The snapshot is valid
-only when the file key is this session, that roll read was a real
-account net on a known trading day, and — once the clock
-is past 08:30 in the morning half of that session — the morning re-anchor
-has happened. No file, a stale key, a non-trading or unknown day, a
-missed 08:30 re-anchor, and a restart after 08:30 that never anchored are
-that same fact: the snapshot is not valid.
-
-From 05:00 to 08:30 TPE the market is closed and ``L`` stays at the
-last value read before 05:00. Nothing in the snapshot moves in that
-window. On a trading morning, the first read at or after 08:30 looks
-at the latest non-zero read since 05:00 (not a row with net,
-realized_pnl and realized_cost all zero). If that read's f22 differs
-from the snapshot, ``snap_net`` becomes that net minus the held ``L``.
-Otherwise the rest of the key uses the account net. The hold and the
-08:30 anchor both require a read in 04:50–05:00 on this key in this
-process. A read before 04:50 does not. Once anchored, ``snap_net`` is
-stored and a restart restores it with the decision already made, so
-it is not rewritten. Capital still showing zeros at 08:30 uses the
-account net.
+1. A 15:00 TPE snapshot is valid for the key only if this process saw the roll (a read in 14:50-15:00 AND the roll read before 15:10, on a known trading day), or a same-key file already holds it.
+2. If this process also saw the close (a read in 04:50-05:00), hold L through 05:00-08:30. At 08:30, if f22 moved, re-anchor snap_net = latest non-zero net - held L once, and persist it as decided. A decided file is never re-anchored.
+3. Otherwise L = full account net (master) for the rest of the key.
 """
 
 from __future__ import annotations
@@ -49,7 +25,9 @@ _VERSION = 2
 _CLOSE_FROM = 4 * 60 + 50
 _HOLD_FROM = 5 * 60
 _DECIDE_AT = 8 * 60 + 30
+_PRE_FROM = 14 * 60 + 50
 _ROLL = 15 * 60
+_ROLL_UNTIL = 15 * 60 + 10
 
 
 def _as_tpe(now: datetime) -> datetime:
@@ -155,15 +133,14 @@ class DailyLossBaseline:
         """One valid rights read. Invalid input does not move state."""
         parsed = _net_and_f22(rights)
         if parsed is None or now_tpe is None:
-            shown = 0 if self.last_L is None else self.last_L
-            return self._view(shown, self._account_net, "master")
+            return self._view(self._account_net, self._account_net, "master")
         net, f22 = parsed
         now = _as_tpe(now_tpe)
         key = trading_day_key(now)
         if key != self.key:
             self._clear_snap()
             self.key = key
-        if self.snap_net is None and self._saw_roll(now) and _known_trading_day(now.date()):
+        if self.snap_net is None and self._saw_roll(now):
             self.snap_net = net
             self.snap_f22 = f22
             self.anchored = False
@@ -171,11 +148,7 @@ class DailyLossBaseline:
         minute = _minutes(now)
         if _CLOSE_FROM <= minute < _HOLD_FROM:
             self._saw_close = True
-        elif (self.snap_net is not None and not self.anchored
-              and not self._saw_close and _HOLD_FROM <= minute < _ROLL):
-            # This process did not see 04:50–05:00. No hold and no anchor.
-            self._master_rest = True
-            self._decided = True
+        self._master_for_rest(minute)
         if self._in_hold(minute):
             if not _is_zero_row(rights, net):
                 self._nz_net = net
@@ -222,13 +195,11 @@ class DailyLossBaseline:
         self.anchored = bool(data.get("anchored"))
         self.last_L = _as_int(data.get("last_L"))
         self.pause_failsafe = bool(data.get("pause_failsafe"))
-        minute = _minutes(now)
         if self.anchored:
             # The file already decided. Do not run _decide again.
             self._decided = True
-        elif _DECIDE_AT <= minute < _ROLL:
-            self._master_rest = True
-            self._decided = True
+        else:
+            self._master_for_rest(_minutes(now))
 
     def save(self) -> None:
         self._persist()
@@ -245,14 +216,30 @@ class DailyLossBaseline:
             self._persist()
 
     def _saw_roll(self, now: datetime) -> bool:
-        """True when this process's previous read was before 15:00 today."""
+        """Previous read in 14:50–15:00, this read in 15:00–15:10, trading day."""
         prev = self._prev_read
         if prev is None:
             return False
         prev = _as_tpe(prev)
+        prev_m = _minutes(prev)
+        now_m = _minutes(now)
         return (prev.date() == now.date()
-                and _minutes(prev) < _ROLL
-                and _minutes(now) >= _ROLL)
+                and _PRE_FROM <= prev_m < _ROLL
+                and _ROLL <= now_m < _ROLL_UNTIL
+                and _known_trading_day(now.date()))
+
+    def _master_for_rest(self, minute: int) -> bool:
+        """Not valid, so the account net for the rest of the key."""
+        if self._master_rest:
+            return True
+        if self.anchored or self._decided:
+            return False
+        if (self.snap_net is not None and not self._saw_close
+                and _HOLD_FROM <= minute < _ROLL):
+            self._master_rest = True
+            self._decided = True
+            return True
+        return False
 
     def _in_hold(self, minute: int) -> bool:
         """05:00–08:30, and only while this key still has a snapshot to hold."""
