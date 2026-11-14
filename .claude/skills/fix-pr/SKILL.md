@@ -26,6 +26,16 @@ release); this one ends at a draft PR and a comment on the issue.
    search; `validate-findings` did not block assign; if any
    `LIKELY COVERED` / `OWNER JUDGMENT NEEDED` existed, the owner
    explicitly chose continue. No silent duplicate of #79/#113-class work.
+5. Reasonably safe, one simple rule. State the fix as one rule (e.g.
+   "use X when valid, otherwise existing behavior"). Add a special-case
+   branch only for an edge case that real logs, data, or an incident
+   show has happened, and cite that evidence. Name any remaining gap in
+   the PR body under "Known gaps" with how the rule covers it (usually
+   by falling back to existing behavior). In later review rounds, check
+   each new edge-case finding against the rule before adding a branch;
+   one without real-data evidence goes to a follow-up, unless it shows
+   the rule itself is less safe than existing behavior; fix that in
+   this PR.
 
 ## Execution
 
@@ -45,7 +55,7 @@ release); this one ends at a draft PR and a comment on the issue.
   `fix/issue-<N>` (conventional message, ending with
   the `Co-Authored-By:` line the session's attribution instructions give —
   it names the model that actually wrote the commit); push;
-  `gh pr create --draft` with Root cause / The fix / Tests / "Fixes #N"
+  `gh pr create --draft` with Root cause / The fix / Tests / Known gaps / "Fixes #N"
   and the footer `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 - After it returns: verify with `gh pr view`, review the diff YOURSELF
   (`git fetch origin fix/issue-<N>; git diff master...origin/fix/issue-<N>`)
