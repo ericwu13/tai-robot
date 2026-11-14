@@ -1137,6 +1137,7 @@ def test_precheck_acts_on_a_settled_recheck(harness, monkeypatch):
         "in_day_window": False,
         "pre_max_fees": 100,
         "pre_f22": "AAA",
+        "pre_r": -5000,
     }
     tr._detected_at = datetime(2026, 11, 12, 16, 0, tzinfo=timezone(timedelta(hours=8)))
     h.app._loss_baseline = tr

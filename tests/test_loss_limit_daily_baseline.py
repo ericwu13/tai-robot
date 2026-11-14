@@ -1371,9 +1371,11 @@ def test_empty_or_raising_calendar_is_not_looser_than_the_account(tmp_path, monk
         if profit:
             _afternoon(tr, _date(2026, 10, 26), up)
             held = tr.observe(up, datetime(2026, 10, 27, 9, 0))
-            assert held.loss_today <= held.account_net, (label, held.loss_today)
+            # Unknown Monday rolls the trading-day key like master and
+            # gates on the account. It does not open a day budget.
+            assert held.day_key == "2026-10-26", (label, held.day_key)
+            assert held.loss_today == held.account_net, (label, held.loss_today)
             assert tr.day_budget is False
-            assert tr.night_date == "2026-10-23"
             return
         tr.observe(down, datetime(2026, 10, 26, 8, 35))
         view = tr.observe(down, datetime(2026, 10, 26, 8, 46))
@@ -1429,21 +1431,37 @@ def test_outage_across_a_trading_day_stays_at_master(tmp_path):
     _finish(mon)
 
 
-def test_settle_without_a_rebase_keeps_the_held_loss(tmp_path):
-    """A 2-minute fee blip is not a Capital rebase. The gate stays at the held 0."""
-    tr = _tracker(tmp_path / "blip.json")
+def test_settle_without_a_rebase_keeps_the_held_loss(tmp_path, monkeypatch):
+    """Fees can stay at 0 well past 2 minutes. That is not a rebase.
+
+    11-12 15:00 R=+15,000, fees=100, f22=AAA, L=0. Fees drop to 0 at
+    16:00 and are still 0 at 16:02 and 16:10. L stays 0. A later real
+    loss of 11,000 against a 10,000 limit pauses.
+    """
+    path = tmp_path / "blip.json"
+    app, clock, tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 12, 14, 59), limit=10000, path=path)
+    if tracker is None:
+        pytest.fail("no baseline")
     base = _pnl(15000, 100, f22="AAA")
-    tr.observe(base, datetime(2026, 11, 12, 14, 59))
-    tr.consume_failsafe_notice()
-    tr.observe(base, datetime(2026, 11, 12, 15, 0, 5))
-    # Same session, fees drop to 0, R is still the pre-batch +15,000.
-    blip = _pnl(15000, 0, f22="AAA")
-    held = tr.observe(blip, datetime(2026, 11, 12, 16, 0))
-    assert held.loss_today == 0, held.loss_today
-    recovered = tr.observe(base, datetime(2026, 11, 12, 16, 2))
-    assert recovered.loss_today == 0, recovered.loss_today
-    assert recovered.loss_today <= recovered.account_net
-    assert tr._reset_open()
+    _drive(app, clock, datetime(2026, 11, 12, 14, 59), base)
+    _drive(app, clock, datetime(2026, 11, 12, 15, 0, 5), base)
+    guard = app._trading_guard
+    assert guard._last_net_pnl == 0
+    dipped = _pnl(15000, 0, f22="AAA")
+    for when in (
+        datetime(2026, 11, 12, 16, 0),
+        datetime(2026, 11, 12, 16, 2),
+        datetime(2026, 11, 12, 16, 10),
+    ):
+        _drive(app, clock, when, dipped)
+        assert guard._last_net_pnl == 0, (when, guard._last_net_pnl)
+        assert tracker._reset_open()
+        assert guard.paused is False
+    # 11,000 off the +15,000 snapshot. The account is still +4,000.
+    _drive(app, clock, datetime(2026, 11, 12, 16, 20), _pnl(4000, 0, f22="AAA"))
+    assert guard._last_net_pnl == -11000, guard._last_net_pnl
+    assert guard.paused is True
 
 
 def test_gap_carry_clears_the_reset_so_the_next_batch_is_detected(tmp_path):
@@ -1466,4 +1484,154 @@ def test_gap_carry_clears_the_reset_so_the_next_batch_is_detected(tmp_path):
     post = _pnl(-15000, 20, f22="BBB")
     view = tr.observe(post, datetime(2026, 11, 16, 5, 36))
     assert view.basis == "capital_reset", view.basis
+    # B_r stays until the reload is confirmed. 08:30 is that read.
+    confirmed = tr.observe(post, datetime(2026, 11, 16, 8, 30))
+    assert confirmed.settled_after_reset is True
     assert tr.b_r == 0
+
+
+def test_f22_first_unrebased_r_does_not_settle_at_0830(tmp_path):
+    """New f22 with the pre-batch R and the old fees is not a reload."""
+    tr = _tracker(tmp_path / "f22.json")
+    base = _pnl(-6998, 48, f22="AAA")
+    night = _pnl(-12306, 96, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 12, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 12, 15, 0, 5))
+    tr.observe(night, datetime(2026, 11, 13, 2, 0))
+    early = _pnl(-12306, 96, f22="BBB")
+    tr.observe(early, datetime(2026, 11, 13, 5, 35))
+    view = tr.observe(early, datetime(2026, 11, 13, 8, 30))
+    assert tr._reset_open(), view
+    assert view.settled_after_reset is False
+    assert view.loss_today == -5308, view.loss_today
+    assert view.loss_today != view.account_net
+
+
+def test_real_batch_signature_settles(tmp_path):
+    """f22 changed and R left the pre-batch value: the morning reload."""
+    tr = _tracker(tmp_path / "real.json")
+    base = _pnl(-6998, 48, f22=F22)
+    night = _pnl(-12306, 96, f22=F22)
+    tr.observe(base, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(night, datetime(2026, 11, 14, 2, 0))
+    tr.observe(_pnl(0, 0, f22=F22), datetime(2026, 11, 16, 5, 22))
+    post = _pnl(-5308, 48, f22=F22_NEW)
+    tr.observe(post, datetime(2026, 11, 16, 5, 36))
+    view = tr.observe(post, datetime(2026, 11, 16, 8, 30))
+    assert view.settled_after_reset is True
+    assert tr._reset_open() is False
+    assert view.loss_today == -5308, view.loss_today
+    assert tr.b_r == 0
+
+
+def test_unconfirmed_reset_follows_the_stricter_account(tmp_path):
+    """Off-session hold must not freeze a smaller loss than the account."""
+    def _run(held, worse):
+        tr = _tracker(tmp_path / f"s3-{held}.json")
+        base = _pnl(0, 10, f22="AAA")
+        tr.observe(base, datetime(2026, 11, 12, 14, 59))
+        tr.consume_failsafe_notice()
+        tr.observe(base, datetime(2026, 11, 12, 15, 0, 5))
+        tr.observe(_pnl(held, 10, f22="AAA"), datetime(2026, 11, 13, 2, 0))
+        # Fee drop, R and f22 unchanged: detected, not confirmed.
+        tr.observe(_pnl(held, 0, f22="AAA"), datetime(2026, 11, 13, 5, 10))
+        view = tr.observe(_pnl(worse, 0, f22="AAA"), datetime(2026, 11, 13, 5, 40))
+        assert tr._reset_open()
+        assert view.loss_today == worse, (held, view.loss_today)
+        return view
+
+    _run(-1000, -10000)
+    _run(-5000, -20000)
+
+
+def test_wednesday_restart_of_a_friday_file_follows_the_account(tmp_path):
+    """Fri -15,000 file loaded Wed 10:00. The account is -2,000, and so is the gate."""
+    path = tmp_path / "fri.json"
+    tr = _tracker(path)
+    base = _pnl(-5000, 10, f22="AAA")
+    night = _pnl(-20000, 30, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 6, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 6, 15, 0, 5))
+    tr.observe(night, datetime(2026, 11, 7, 2, 0))
+    assert tr.last_l == -15000
+    tr.save()
+    fresh = _tracker(path)
+    fresh.load(datetime(2026, 11, 11, 10, 0))
+    view = fresh.observe(_pnl(-2000, 30, f22="AAA"), datetime(2026, 11, 11, 10, 0))
+    assert view.loss_today == -2000, view.loss_today
+    assert view.loss_today == view.account_net
+
+
+def test_unknown_calendar_releases_the_pause_on_masters_schedule(tmp_path, monkeypatch):
+    """A broken calendar for a whole week still rolls the trading-day key."""
+    import src.market_data.holidays as hol
+    monkeypatch.setattr(hol, "_tw_public_holidays", lambda year: frozenset())
+    monkeypatch.setattr(hol, "holiday_calendar_health", lambda year=None: (False, "empty"))
+    app, clock, tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 10, 20, 0), limit=20000,
+        path=tmp_path / "unk.json")
+    if tracker is None:
+        pytest.fail("no baseline")
+    deep = _pnl(-25000, 10, f22="AAA")
+    _drive(app, clock, datetime(2026, 11, 10, 20, 0), deep)
+    guard = app._trading_guard
+    assert guard.paused is True
+    assert guard._pause_day_key == "2026-11-10"
+    assert guard._pause_day_key != ""
+    _drive(app, clock, datetime(2026, 11, 11, 10, 0), _pnl(-26020, 10, f22="AAA"))
+    assert guard.paused is True
+    assert guard._pause_day_key == "2026-11-10"
+    # Thursday 15:00, back inside the limit. Master releases and stays released.
+    _drive(app, clock, datetime(2026, 11, 12, 15, 0), _pnl(-1000, 10, f22="AAA"))
+    assert guard.paused is False, guard._pause_day_key
+    assert guard._pause_day_key == ""
+    assert tracker.day_key == "2026-11-12"
+    assert tracker.day_budget is False
+
+
+def test_u4_last_l_floor_on_a_carried_gap(tmp_path):
+    """A valid weekend carry keeps the stricter held loss.
+
+    Dropping ``min(loss, last_l)`` lets Sunday's recovered account
+    print +3,000.
+    """
+    path = tmp_path / "floor.json"
+    tr = _tracker(path)
+    base = _pnl(-5000, 10, f22="AAA")
+    night = _pnl(-20000, 30, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(night, datetime(2026, 11, 14, 2, 0))
+    assert tr.last_l == -15000
+    tr.save()
+    fresh = _tracker(path)
+    fresh.load(datetime(2026, 11, 15, 16, 0))
+    view = fresh.observe(_pnl(-2000, 30, f22="AAA"), datetime(2026, 11, 15, 16, 0))
+    assert view.loss_today == -15000, view.loss_today
+
+
+def test_u12_paper_poll_writes_the_failsafe_flag_back(tmp_path, monkeypatch):
+    """Dropping the paper ``_sync_loss_pause_flag`` leaves the file paused.
+
+    Saturday 15:00 rolls the guard off Friday's key and clears the flag.
+    The paper poll has to write that back.
+    """
+    app, clock, tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 14, 15, 0), mode="paper", limit=20000,
+        path=tmp_path / "paper.json")
+    if tracker is None:
+        pytest.fail("no baseline")
+    tracker.pause_failsafe = True
+    guard = app._trading_guard
+    guard.paused = True
+    guard._pause_failsafe = True
+    guard._pause_day_key = "2026-11-13"
+    _drive(app, clock, datetime(2026, 11, 14, 15, 0), _pnl(-100, 10, f22="AAA"))
+    assert guard.paused is False
+    assert guard._pause_failsafe is False
+    assert tracker.pause_failsafe is False

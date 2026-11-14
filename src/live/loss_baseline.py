@@ -10,8 +10,9 @@ every calendar day strictly between that night and the day session is a
 known TAIFEX closure (weekend or holiday), that day gets its own budget
 from the last settled read in 08:30–08:45. A skipped trading day, or a
 day whose calendar is unknown, does not. The gate is then the stricter
-of the held figure and the account net. Field f37 (expiry settlement)
-is not read.
+of the held figure and the account net. A fresh deploy without
+loss_baseline.json gets no separate gap budget until the next 15:00
+snapshot. Field f37 (expiry settlement) is not read.
 
 No Tk, no COM. The app calls :meth:`DailyLossBaseline.observe` with the
 parsed rights dict and ``_taipei_now()``.
@@ -258,6 +259,7 @@ class DailyLossBaseline:
         self._pending_notice: str | None = None
         self._failsafe_logged_key = ""
         self._unknown_noted: set[str] = set()
+        self._last_realized: int | None = None
         self._last_candidate_mono = -1e9
         self._clear_day_budget()
 
@@ -293,7 +295,13 @@ class DailyLossBaseline:
             self._note_unknown(now.date().isoformat())
         if key != self.day_key:
             if _day_status_of_key(key) == _Cal.UNKNOWN:
+                # Same roll as master: the guard's key changes at 15:00
+                # and the figure is the account net. No carried minimum,
+                # and no separate budget. The warning uses this real key.
                 self._note_unknown(key)
+                self._adopt_master_day(key)
+                dirty = True
+                force = True
             else:
                 self._roll(key, now, fee, equity)
                 dirty = True
@@ -303,7 +311,7 @@ class DailyLossBaseline:
         # next poll just because f22 still differs from the pre-batch value.
         if not isinstance(self.capital_reset, dict):
             if self._reset_detected(fee, equity):
-                self._begin_reset(now, fee)
+                self._begin_reset(now, fee, realized)
                 dirty = True
                 force = True
 
@@ -314,7 +322,8 @@ class DailyLossBaseline:
 
         held = False
         just_settled = False
-        if self._reset_open() and self._can_settle(now, fee, equity):
+        if self._reset_open() and self._can_settle(now, realized, fee, equity):
+            self.b_r = 0
             self.capital_reset["settled"] = True
             just_settled = True
             dirty = True
@@ -339,14 +348,20 @@ class DailyLossBaseline:
                 held_loss = self.capital_reset.get("l_pre")
                 if held_loss is not None:
                     held = True
-                    if _off_session(now):
-                        loss = int(held_loss)
-                    else:
-                        loss = min(loss, int(held_loss))
-        if self._uncertain(now):
-            loss = min(loss, account)
-            if self.last_l is not None:
-                loss = min(loss, int(self.last_l))
+                    # Off-session used to freeze l_pre even when the
+                    # formula had already worsened. Keep the stricter of
+                    # the two. Do not substitute the raw account: an
+                    # f22-first read still carries the pre-batch net.
+                    loss = min(loss, int(held_loss))
+        if (not self.day_budget
+                and not self._reset_open()
+                and self._span(now) == "closed"
+                and self.last_l is not None
+                and _day_status(now.date()) != _Cal.UNKNOWN):
+            # A carried closure keeps the stricter held loss. A skipped
+            # trading day and an unknown calendar do not.
+            loss = min(loss, int(self.last_l))
+        self._last_realized = realized
         self.last_l = loss
         if dirty:
             self._persist(candidate_only=dirty and not force)
@@ -416,6 +431,17 @@ class DailyLossBaseline:
             self._commit(self.candidate, key)
             return
         self._enter_failsafe(key, fee, equity, now)
+
+    def _adopt_master_day(self, key: str) -> None:
+        """Unknown calendar: gate on the account, on master's day key."""
+        self.day_key = key
+        self.b_r = 0
+        self.b_c = 0
+        self.basis = "failsafe"
+        self.capital_reset = None
+        self._detected_at = None
+        self.last_l = None
+        self._clear_day_budget()
 
     def _carry(self, key: str) -> None:
         self.day_key = key
@@ -557,9 +583,12 @@ class DailyLossBaseline:
         equity_moved = equity != self.baseline_f22
         return fee_below_max or fee_below_baseline or equity_moved
 
-    def _begin_reset(self, now: datetime, fee: int) -> None:
+    def _begin_reset(self, now: datetime, fee: int, realized: int) -> None:
         expect = self.max_fees_seen - self.baseline_fees
         in_window = _in_day_open_window(now)
+        # The pre-batch R is the previous read. B_r stays until a read
+        # shows the full reload, so a fee blip cannot become the account net.
+        pre_r = self._last_realized if self._last_realized is not None else realized
         self.capital_reset = {
             "detected_at": _iso(now),
             "l_pre": self.last_l,
@@ -568,30 +597,33 @@ class DailyLossBaseline:
             "in_day_window": in_window,
             "pre_max_fees": self.max_fees_seen,
             "pre_f22": self.baseline_f22,
+            "pre_r": pre_r,
         }
         self._detected_at = now
-        self.b_r = 0
         self.basis = "capital_reset"
         # A pre-batch read already inside 08:30–08:45 is not B_day.
         if in_window:
             self._has_day_baseline = False
 
-    def _rebase_confirmed(self, fee: int, equity: str) -> bool:
-        """f22 moved, or the fee total dropped and is still down."""
+    def _rebase_confirmed(self, realized: int, equity: str) -> bool:
+        """Completed morning reload: f22 moved and R left the pre-batch value.
+
+        A fee drop alone is the zero interim or a blip. f22 alone is the
+        f22-first read, which still carries the old realized. Neither is
+        the reload.
+        """
         reset = self.capital_reset or {}
         pre_f22 = str(reset.get("pre_f22") or "")
-        if equity and pre_f22 and equity != pre_f22:
-            return True
-        pre_max = reset.get("pre_max_fees")
-        if pre_max is None:
+        pre_r = reset.get("pre_r")
+        if pre_r is None or not equity or not pre_f22 or equity == pre_f22:
             return False
-        return fee < int(pre_max)
+        return int(realized) != int(pre_r)
 
-    def _can_settle(self, now: datetime, fee: int, equity: str) -> bool:
+    def _can_settle(self, now: datetime, realized: int, fee: int, equity: str) -> bool:
         reset = self.capital_reset or {}
         if fee < int(reset.get("expect_fees") or 0):
             return False
-        if not self._rebase_confirmed(fee, equity):
+        if not self._rebase_confirmed(realized, equity):
             return False
         detected = self._detected_at
         if detected is None:
@@ -683,7 +715,9 @@ class DailyLossBaseline:
             return True
         if _minutes(now) >= _NIGHT_OPEN:
             return False
-        return (today - night_d).days > 1
+        # Only a real closure gap. A Wednesday load of Friday's file is
+        # not one: Monday and Tuesday were trading days.
+        return _gap_between(night_d, today) == "closed"
 
     def _restore_state(self, data: dict, candidate: _Snap | None) -> bool:
         baseline = data.get("baseline")
@@ -723,6 +757,7 @@ class DailyLossBaseline:
                 "in_day_window": bool(reset.get("in_day_window")),
                 "pre_max_fees": _as_int(reset.get("pre_max_fees")),
                 "pre_f22": str(reset.get("pre_f22") or ""),
+                "pre_r": _as_int(reset.get("pre_r")),
             }
             self._detected_at = detected
             if detected is None and not self.capital_reset["settled"]:
@@ -756,6 +791,7 @@ class DailyLossBaseline:
                 "in_day_window": bool(self.capital_reset.get("in_day_window")),
                 "pre_max_fees": self.capital_reset.get("pre_max_fees"),
                 "pre_f22": self.capital_reset.get("pre_f22"),
+                "pre_r": self.capital_reset.get("pre_r"),
             }
         return {
             "version": _VERSION,
