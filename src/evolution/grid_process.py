@@ -65,9 +65,11 @@ GRID_TIMEOUT_PER_RUN_S = 90
 GRID_TIMEOUT_CAP_S = 3 * 60 * 60
 DEFAULT_GRID_STALL_S = 10 * 60
 GRID_SLOT_POLL_S = 5.0
-GRID_SLOT_STALE_SLACK_S = 10 * 60
 GRID_QUEUE_FACTOR = 3
 GRID_SLOT_FILENAME = "evo_grid.slot"
+# The child frees the lock if its own backtest does not return. The
+# parent still enforces timeout_s. Slack covers a kill that is in flight.
+GRID_CHILD_TIMEOUT_SLACK_S = 60.0
 
 
 def grid_timeout_budget_s(n_runs: int) -> int:
@@ -91,9 +93,20 @@ def grid_queue_wait_s() -> int:
     return GRID_QUEUE_FACTOR * GRID_TIMEOUT_CAP_S
 
 
-def grid_slot_stale_s() -> int:
-    """A slot older than the cap plus 10 min is taken over."""
-    return GRID_TIMEOUT_CAP_S + GRID_SLOT_STALE_SLACK_S
+def child_run_limit_s(timeout_s: float) -> float:
+    """How long the child may hold the lock: the run budget plus slack.
+
+    ``timeout_s`` is the parent budget (``max(1200, 90 s × n)``, capped
+    at 3 h). The child uses this so a hung backtest still drops the
+    lock when the parent is not around to kill it.
+    """
+    try:
+        budget = float(timeout_s)
+    except (TypeError, ValueError):
+        budget = float(DEFAULT_GRID_TIMEOUT_S)
+    if budget < 0:
+        budget = 0.0
+    return budget + GRID_CHILD_TIMEOUT_SLACK_S
 
 
 @dataclass(frozen=True)
@@ -600,6 +613,47 @@ def grid_progress_should_log(
 
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when ``pid`` is a live process.
+
+    Windows ``os.kill(pid, 0)`` delivers CTRL_C_EVENT, so that platform
+    asks OpenProcess. A permission error counts as alive.
+    """
+    try:
+        target = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if target <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, target)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(target, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _parent_gone(parent_pid: int) -> bool:
+    """True when this process was reparented or the parent pid is gone."""
+    try:
+        if os.getppid() != int(parent_pid):
+            return True
+    except (OSError, TypeError, ValueError):
+        return True
+    return not _pid_alive(parent_pid)
+
+
 def _sidecar_path(path: str) -> str:
     """Diagnostic file next to the lock. Never decides who owns the slot."""
     return path + ".holder.json"
@@ -627,6 +681,27 @@ def _read_holder_pid(path: str):
         if pid > 0:
             return pid
     return None
+
+
+def _sidecar_child_pid(path: str):
+    """Holder pid written in the sidecar, or None. The parent pid is not a holder."""
+    try:
+        with open(_sidecar_path(path), "r", encoding="utf-8") as handle:
+            text = handle.read(512)
+    except OSError:
+        return None
+    try:
+        import json
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        pid = int(data.get("child_pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
 
 
 def _write_sidecar(path: str, parent_pid: int, on_warning=None) -> None:
@@ -744,7 +819,6 @@ def acquire_grid_slot(
         stop_check=None,
         poll_s: float = GRID_SLOT_POLL_S,
         wait_s: float,
-        stale_s: float | None = None,
         sleep=None,
         on_queue=None,
         notice_s: float = 600.0,
@@ -754,16 +828,18 @@ def acquire_grid_slot(
 
     The lock is ``fcntl.flock`` on POSIX and ``msvcrt.locking`` on
     Windows. The operating system releases it when this process dies.
-    There is no stale file and no steal. ``stale_s`` is accepted and
-    ignored so older callers keep working.
+    There is no stale file and no steal.
 
     A free lock is taken on the first try and does not emit ``wait``.
     ``wait`` is emitted only after that try fails. While waiting, a
     ``waiting`` line is emitted every ``notice_s`` (10 min in
     production) with the sidecar's holder pid when one was written.
     The sidecar is diagnostic only.
+
+    When ``parent_pid`` is set, each poll also checks that the parent
+    is still alive. A reparent or a gone parent returns not owned and
+    does not take the lock. In-process callers leave it unset.
     """
-    del stale_s  # ownership is the OS lock, not the file's age
     pause = time.sleep if sleep is None else sleep
     start = time.monotonic()
     deadline = start + max(0.0, float(wait_s))
@@ -776,6 +852,12 @@ def acquire_grid_slot(
     last_notice = start
     try:
         while True:
+            if parent_pid and _parent_gone(int(parent_pid)):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return False, "stopped", time.monotonic() - start
             if _lock_nb(fd):
                 _HELD_LOCKS[key] = fd
                 _write_sidecar(
@@ -827,6 +909,21 @@ def release_grid_slot(
     fd = _HELD_LOCKS.pop(key, None)
     if fd is None:
         return
+    # Remove the sidecar before the unlock, and only when it still
+    # names this process. A waiter can take the lock the moment we
+    # unlock and write its own sidecar.
+    sidecar = _sidecar_path(path)
+    if _sidecar_child_pid(path) == os.getpid():
+        try:
+            os.remove(sidecar)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _warn_slot(
+                f"grid slot sidecar cleanup failed path={sidecar} "
+                f"pid={os.getpid()} [{type(exc).__name__}] {exc}",
+                on_warning,
+            )
     try:
         _unlock_fd(fd)
     except OSError as exc:
@@ -843,22 +940,34 @@ def release_grid_slot(
             f"[{type(exc).__name__}] {exc}",
             on_warning,
         )
-    sidecar = _sidecar_path(path)
-    try:
-        os.remove(sidecar)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        _warn_slot(
-            f"grid slot sidecar cleanup failed path={sidecar} "
-            f"pid={os.getpid()} [{type(exc).__name__}] {exc}",
-            on_warning,
-        )
+
+
+def _child_hold_watch(slot_path, deadline, on_warning) -> None:
+    """Drop the lock if this backtest does not return by ``deadline``.
+
+    The parent normally kills the child at ``timeout_s``. This thread
+    covers a hung backtest whose parent is gone, so the OS lock does
+    not stay held. ``os._exit`` skips the main thread's finally; the
+    release above has already closed the fd.
+    """
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+    release_grid_slot(slot_path, on_warning=on_warning)
+    os._exit(0)
 
 
 def _locked_grid_child(
-        fn, job, conn, slot_path, wait_s, poll_s, notice_s, parent_pid):
+        fn, job, conn, slot_path, wait_s, poll_s, notice_s, parent_pid,
+        run_limit_s):
     """Child target. This process, not the parent, holds the host lock."""
+    # Test-only. A spawn child does not see a parent monkeypatch, so the
+    # queue-clock test delays the first lock try through the environment.
+    delay = os.environ.get("TAI_EVO_LOCK_DELAY_S")
+    if delay:
+        try:
+            time.sleep(float(delay))
+        except (TypeError, ValueError):
+            pass
 
     def _on_queue(kind, **fields):
         try:
@@ -891,6 +1000,17 @@ def _locked_grid_child(
         except Exception:
             pass
         return
+    import threading
+    try:
+        limit = float(run_limit_s)
+    except (TypeError, ValueError):
+        limit = child_run_limit_s(DEFAULT_GRID_TIMEOUT_S)
+    threading.Thread(
+        target=_child_hold_watch,
+        args=(slot_path, time.monotonic() + max(0.0, limit), _on_warning),
+        daemon=True,
+        name="evo-grid-hold",
+    ).start()
     try:
         fn(job, conn)
     finally:
@@ -924,7 +1044,6 @@ def run_grid_isolated(
         slot_path: str | None = None,
         slot_poll_s: float = GRID_SLOT_POLL_S,
         queue_timeout_s: float | None = None,
-        slot_stale_s: float | None = None,
         on_queue=None,
         queue_notice_s: float = 600.0,
         on_release_warning=None):
@@ -956,7 +1075,6 @@ def run_grid_isolated(
     patching this function. ``on_start`` is called with the child pid
     after spawn, or with None on the in-process path.
     """
-    del slot_stale_s  # the OS lock has no stale takeover
     fn = grid_child_entry if entry is None else entry
     path = default_slot_path() if slot_path is None else str(slot_path)
     wait_s = float(grid_queue_wait_s() if queue_timeout_s is None
@@ -1066,6 +1184,18 @@ def _run_grid_held(
         return max(0.0, time.monotonic() - run_started)
 
     def _stamp(result):
+        # Before the lock is taken, the wait belongs in queue_s. After
+        # it is taken, elapsed_s is the run and queue_s is the wait
+        # recorded on the acquired message.
+        if not acquired and isinstance(result, GridProcessFailure):
+            waited = _elapsed()
+            kept = float(result.queue_s or 0.0)
+            return _stamp_failure(
+                result,
+                progress=_progress(),
+                elapsed_s=0.0,
+                queue_s=kept if kept > 0.0 else waited,
+            )
         return _stamp_failure(
             result,
             progress=_progress(),
@@ -1104,6 +1234,7 @@ def _run_grid_held(
             args=(
                 fn, job, send_conn, slot_path, float(wait_s),
                 float(slot_poll_s), float(notice_s), os.getpid(),
+                float(child_run_limit_s(timeout_s)),
             ),
             daemon=True,
             name="evo-grid",
@@ -1135,6 +1266,11 @@ def _run_grid_held(
             return None
         return None
 
+    def _arm_queue() -> None:
+        nonlocal queue_deadline
+        if queue_deadline is None:
+            queue_deadline = time.monotonic() + float(wait_s)
+
     def _apply(message):
         """Consume progress and slot messages. ``result`` means finish."""
         nonlocal queue_s, run_started, last_progress_at, acquired
@@ -1152,6 +1288,7 @@ def _run_grid_held(
                     pass
             return "continue"
         if tag == "slot_done":
+            _arm_queue()
             qkind = message[1] if len(message) > 1 else "queue_timeout"
             try:
                 q_s = float(message[2]) if len(message) > 2 else 0.0
@@ -1165,6 +1302,7 @@ def _run_grid_held(
                 qkind or "queue_timeout", detail, proc.pid,
                 progress="0/0", elapsed_s=0.0, queue_s=q_s)
         if tag == "slot":
+            _arm_queue()
             kind_name = message[1] if len(message) > 1 else ""
             fields = message[2] if len(message) > 2 and isinstance(
                 message[2], dict) else {}
@@ -1200,8 +1338,11 @@ def _run_grid_held(
         except Exception:
             pass
         # Stall and the grid cap start when the child takes the lock.
-        # Until then the only cap is the queue wait.
-        queue_deadline = time.monotonic() + float(wait_s)
+        # The queue cap starts at the child's first slot event, not at
+        # proc.start(), so a slow spawn does not consume the wait.
+        # Until that event there is no queue deadline; a dead child is
+        # still an eof/crash.
+        queue_deadline = None
         poll = 0.05 if not poll_s or poll_s <= 0 else float(poll_s)
         while True:
             # STOP wins over a payload that has not been read yet, same
@@ -1213,9 +1354,11 @@ def _run_grid_held(
             now = time.monotonic()
             if acquired:
                 deadline = run_started + float(timeout_s)
-            else:
+            elif queue_deadline is not None:
                 deadline = queue_deadline
-            if now >= deadline:
+            else:
+                deadline = None
+            if deadline is not None and now >= deadline:
                 # A finished ok that is already buffered still counts.
                 # Progress does not extend the cap. Anything not yet a
                 # full result is discarded.
@@ -1262,7 +1405,10 @@ def _run_grid_held(
                     f"without progress; progress {_progress()}",
                     proc.pid,
                     progress=_progress()))
-            remaining = deadline - now
+            if deadline is None:
+                remaining = poll
+            else:
+                remaining = deadline - now
             if acquired and stall_s > 0:
                 until_stall = float(stall_s) - (now - last_progress_at)
             else:

@@ -44,17 +44,16 @@ def test_slot_waits_steals_stale_and_honours_stop_and_queue_bound(tmp_path):
 
     slot = tmp_path / "evo_grid.slot"
     path = str(slot)
-    fresh = 10**9
 
     owned, kind, _queue = acquire_grid_slot(
-        path, wait_s=2, stale_s=fresh, poll_s=0.05)
+        path, wait_s=2, poll_s=0.05)
     assert owned and kind == "", (owned, kind)
     waited = {}
 
     def _second():
         started = time.monotonic()
         got, got_kind, _q = acquire_grid_slot(
-            path, wait_s=5, stale_s=fresh, poll_s=0.05)
+            path, wait_s=5, poll_s=0.05)
         waited["dt"] = time.monotonic() - started
         waited["owned"] = got
         waited["kind"] = got_kind
@@ -77,26 +76,26 @@ def test_slot_waits_steals_stale_and_honours_stop_and_queue_bound(tmp_path):
     assert dead.returncode == 0
     _plant(slot, dead.pid, time.time())
     owned, kind, _queue = acquire_grid_slot(
-        path, wait_s=2, stale_s=fresh, poll_s=0.05)
+        path, wait_s=2, poll_s=0.05)
     assert owned and kind == "", (owned, kind, dead.pid)
     release_grid_slot(path)
 
     old = time.time() - 100
     _plant(slot, os.getpid(), old)
     owned, kind, _queue = acquire_grid_slot(
-        path, wait_s=2, stale_s=30, poll_s=0.05)
+        path, wait_s=2, poll_s=0.05)
     assert owned and kind == "", (owned, kind)
     # Put the live hold back for the queue and STOP cases.
     release_grid_slot(path)
     owned, kind, _queue = acquire_grid_slot(
-        path, wait_s=2, stale_s=fresh, poll_s=0.05)
+        path, wait_s=2, poll_s=0.05)
     assert owned and kind == ""
 
     queued = {}
 
     def _queue():
         queued["result"] = acquire_grid_slot(
-            path, wait_s=0.35, stale_s=fresh, poll_s=0.05)
+            path, wait_s=0.35, poll_s=0.05)
 
     qthread = threading.Thread(target=_queue)
     qthread.start()
@@ -108,7 +107,7 @@ def test_slot_waits_steals_stale_and_honours_stop_and_queue_bound(tmp_path):
     assert q_wait >= 0.3, queued
     # The original holder still owns the lock. The file bytes are not the lock.
     still, still_kind, _still_q = acquire_grid_slot(
-        path, wait_s=0.2, stale_s=fresh, poll_s=0.05)
+        path, wait_s=0.2, poll_s=0.05)
     assert still is False and still_kind == "queue_timeout"
 
     state = {"stop": False}
@@ -119,7 +118,7 @@ def test_slot_waits_steals_stale_and_honours_stop_and_queue_bound(tmp_path):
 
     def _waiter():
         stopped["result"] = acquire_grid_slot(
-            path, stop_check=_stop, wait_s=5, stale_s=fresh, poll_s=0.05)
+            path, stop_check=_stop, wait_s=5, poll_s=0.05)
 
     wthread = threading.Thread(target=_waiter)
     wthread.start()
@@ -133,7 +132,7 @@ def test_slot_waits_steals_stale_and_honours_stop_and_queue_bound(tmp_path):
     assert s_kind == "stopped", stopped
     release_grid_slot(path)
     again, again_kind, again_q = acquire_grid_slot(
-        path, wait_s=1, stale_s=fresh, poll_s=0.05)
+        path, wait_s=1, poll_s=0.05)
     assert again and again_kind == ""
     assert again_q < 0.5
     release_grid_slot(path)
@@ -283,7 +282,7 @@ def test_three_children_serialize_on_the_slot(tmp_path, capsys):
     # The lock file may remain. It does not block the next grid.
     from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
     owned, kind, queue_s = acquire_grid_slot(
-        slot, wait_s=1, stale_s=10**9, poll_s=0.05)
+        slot, wait_s=1, poll_s=0.05)
     assert owned and kind == "" and queue_s < 0.5
     release_grid_slot(slot)
 
@@ -295,16 +294,20 @@ def _dead_pid() -> int:
 
 
 def test_release_drops_the_os_lock(tmp_path):
-    """Releasing the OS lock lets the next acquire succeed promptly."""
+    """Releasing the OS lock lets the next acquire succeed promptly.
+
+    Not a fail-first test of the OS lock. A correct file-slot release
+    would pass this too.
+    """
     from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
 
     path = str(tmp_path / "evo_grid.slot")
     owned, kind, _queue = acquire_grid_slot(
-        path, wait_s=2, stale_s=10**9, poll_s=0.05)
+        path, wait_s=2, poll_s=0.05)
     assert owned and kind == ""
     release_grid_slot(path)
     again, again_kind, again_q = acquire_grid_slot(
-        path, wait_s=1, stale_s=10**9, poll_s=0.05)
+        path, wait_s=1, poll_s=0.05)
     assert again and again_kind == ""
     assert again_q < 0.5
     release_grid_slot(path)
@@ -318,7 +321,7 @@ def test_release_warns_when_unlock_fails(tmp_path, monkeypatch, caplog):
 
     path = str(tmp_path / "evo_grid.slot")
     owned, kind, _queue = gp.acquire_grid_slot(
-        path, wait_s=2, stale_s=10**9, poll_s=0.05)
+        path, wait_s=2, poll_s=0.05)
     assert owned and kind == ""
 
     def _boom(_fd):
@@ -343,7 +346,7 @@ def test_leftover_file_does_not_block(tmp_path):
     for text in ("", "not-a-pid\n", f"{_dead_pid()}\n1.000000\n"):
         path.write_text(text, encoding="ascii")
         owned, kind, queue_s = acquire_grid_slot(
-            str(path), wait_s=1, stale_s=10**9, poll_s=0.05)
+            str(path), wait_s=1, poll_s=0.05)
         assert owned and kind == "", text
         assert queue_s < 0.5
         release_grid_slot(str(path))
@@ -407,7 +410,7 @@ def test_success_grid_logs_queue_progress_and_mean(tmp_path, monkeypatch):
     from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
 
     held, _kind, _queue = acquire_grid_slot(
-        slot, wait_s=2, stale_s=10**9, poll_s=0.05)
+        slot, wait_s=2, poll_s=0.05)
     assert held
 
     def _drop():

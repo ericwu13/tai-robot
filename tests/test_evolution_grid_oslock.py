@@ -63,7 +63,7 @@ def _thread_storm(path: str, waiters: int, rounds: int) -> int:
 
         def _run():
             owned, _kind, _queue = acquire_grid_slot(
-                path, wait_s=3, stale_s=12300, poll_s=0.001)
+                path, wait_s=3, poll_s=0.001)
             if not owned:
                 return
             with gate:
@@ -89,7 +89,7 @@ def _storm_worker(path, rounds, log_path, start_bar, done_bar):
     for _ in range(int(rounds)):
         start_bar.wait()
         owned, kind, _queue = acquire_grid_slot(
-            path, wait_s=30, stale_s=12300, poll_s=0.005)
+            path, wait_s=30, poll_s=0.005)
         if not owned:
             fd = os.open(log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
             try:
@@ -149,7 +149,7 @@ def test_multiprocess_storm_one_holder_no_overlap(tmp_path):
     assert not any(line.startswith("NOLOCK") for line in lines), lines[:8]
     assert hits == 0, (hits, lines[:12])
     owned, kind, queue_s = acquire_grid_slot(
-        path, wait_s=1, stale_s=10**9, poll_s=0.05)
+        path, wait_s=1, poll_s=0.05)
     assert owned and kind == "", (owned, kind, queue_s)
     assert queue_s < 0.5, queue_s
     release_grid_slot(path)
@@ -162,7 +162,7 @@ def test_unhooked_waiter_storm_has_no_double_owner(tmp_path, waiters):
     doubles = _thread_storm(path, waiters, 200)
     assert doubles == 0, (waiters, doubles)
     owned, kind, queue_s = acquire_grid_slot(
-        path, wait_s=1, stale_s=10**9, poll_s=0.05)
+        path, wait_s=1, poll_s=0.05)
     assert owned and kind == "", (owned, kind, queue_s)
     assert queue_s < 0.5, queue_s
     release_grid_slot(path)
@@ -170,7 +170,7 @@ def test_unhooked_waiter_storm_has_no_double_owner(tmp_path, waiters):
 
 def _one_holder(path, hold_s, result_path):
     owned, kind, _queue = acquire_grid_slot(
-        path, wait_s=10, stale_s=10**9, poll_s=0.02)
+        path, wait_s=10, poll_s=0.02)
     with open(result_path, "a", encoding="ascii") as handle:
         handle.write(f"{os.getpid()} {int(bool(owned))} {kind}\n")
     if not owned:
@@ -215,7 +215,7 @@ def test_killed_holder_child_frees_the_lock(tmp_path):
     assert child, "child never wrote the sidecar"
     os.kill(child, 9)
     owned, kind, queue_s = acquire_grid_slot(
-        slot, wait_s=2, stale_s=10**9, poll_s=0.05)
+        slot, wait_s=2, poll_s=0.05)
     assert owned and kind == "", (owned, kind, queue_s)
     assert queue_s < 1.5, queue_s
     release_grid_slot(slot)
@@ -261,11 +261,11 @@ def test_killed_parent_live_child_keeps_the_lock(tmp_path):
     proc.join(5)
     os.kill(child, 0)  # child still alive
     blocked, blocked_kind, _q = acquire_grid_slot(
-        slot, wait_s=0.4, stale_s=10**9, poll_s=0.05)
+        slot, wait_s=0.4, poll_s=0.05)
     assert blocked is False and blocked_kind == "queue_timeout"
     os.kill(child, 9)
     owned, kind, queue_s = acquire_grid_slot(
-        slot, wait_s=2, stale_s=10**9, poll_s=0.05)
+        slot, wait_s=2, poll_s=0.05)
     assert owned and kind == ""
     assert queue_s < 1.5
     release_grid_slot(slot)
@@ -297,7 +297,230 @@ def test_three_waiters_one_owner_then_prompt_reacquire(tmp_path):
     assert len(text) == 3, text
     assert all(line.split()[1] == "1" for line in text), text
     owned, kind, queue_s = acquire_grid_slot(
-        path, wait_s=1, stale_s=10**9, poll_s=0.05)
+        path, wait_s=1, poll_s=0.05)
     assert owned and kind == ""
     assert queue_s < 0.5, queue_s
     release_grid_slot(path)
+
+
+def test_parent_deadline_and_stop_keep_queue_s(tmp_path):
+    """Queue deadline and STOP keep the wait in queue_s, not elapsed_s."""
+    from src.evolution.grid_process import burn_child_entry, run_grid_isolated
+    from tests.test_evolution_grid_process import _job
+
+    slot = str(tmp_path / "held.slot")
+    owned, _kind, _q = acquire_grid_slot(
+        slot, wait_s=2, poll_s=0.05)
+    assert owned
+    try:
+        failure = run_grid_isolated(
+            _job(mode="sleep", burn_seconds=0.1),
+            timeout_s=10,
+            stall_s=10,
+            entry=burn_child_entry,
+            slot_path=slot,
+            poll_s=0.05,
+            slot_poll_s=0.05,
+            queue_timeout_s=0.6,
+        )
+        assert failure.kind == "queue_timeout", failure
+        assert failure.queue_s >= 0.4, failure.queue_s
+        assert failure.elapsed_s < 0.2, failure.elapsed_s
+    finally:
+        release_grid_slot(slot)
+
+    slot2 = str(tmp_path / "stop.slot")
+    owned, _kind, _q = acquire_grid_slot(
+        slot2, wait_s=2, poll_s=0.05)
+    assert owned
+    state = {"stop": False}
+
+    def _stop():
+        return state["stop"]
+
+    def _later():
+        time.sleep(0.4)
+        state["stop"] = True
+
+    threading.Thread(target=_later, daemon=True).start()
+    try:
+        failure = run_grid_isolated(
+            _job(mode="sleep", burn_seconds=0.1),
+            timeout_s=10,
+            stall_s=10,
+            entry=burn_child_entry,
+            slot_path=slot2,
+            poll_s=0.05,
+            slot_poll_s=0.05,
+            queue_timeout_s=10,
+            stop_check=_stop,
+        )
+        assert failure.kind == "stopped", failure
+        assert failure.queue_s >= 0.3, failure.queue_s
+        assert failure.elapsed_s < 0.2, failure.elapsed_s
+    finally:
+        release_grid_slot(slot2)
+
+
+def _orphan_entry(job, conn):
+    """Writes a marker if the grid body runs. Module-level so spawn can pickle it."""
+    open(job.evo["ran"], "w", encoding="ascii").write("ran\n")
+    from src.evolution.grid_process import burn_child_entry
+    burn_child_entry(job, conn)
+
+
+def test_queued_orphan_exits_without_running(tmp_path):
+    """A queued child exits when its parent dies, and does not take the lock."""
+    import subprocess
+    import textwrap
+
+    slot = str(tmp_path / "evo_grid.slot")
+    marker = str(tmp_path / "ran.txt")
+    owned, _kind, _q = acquire_grid_slot(
+        slot, wait_s=2, poll_s=0.05)
+    assert owned
+    script = textwrap.dedent(f"""
+        from src.evolution.grid_process import GridJob, run_grid_isolated
+        from tests.test_evolution_grid_oslock import _orphan_entry
+        job = GridJob("", "", (), 1, 1, {{"mode": "sleep", "burn_seconds": 0.2,
+            "ran": {marker!r}}}, 14)
+        run_grid_isolated(job, timeout_s=20, stall_s=20, entry=_orphan_entry,
+            slot_path={slot!r}, poll_s=0.05, slot_poll_s=0.05,
+            queue_timeout_s=15)
+    """)
+    proc = subprocess.Popen(
+        [__import__("sys").executable, "-c", script], cwd="/agent/repos/tai-robot")
+    deadline = time.time() + 15
+    child = None
+    while time.time() < deadline:
+        try:
+            out = subprocess.check_output(
+                ["ps", "-o", "pid=,args=", "--ppid", str(proc.pid)], text=True)
+        except subprocess.CalledProcessError:
+            out = ""
+        pids = []
+        for line in out.splitlines():
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            # The resource tracker outlives the script and is not the grid child.
+            if len(parts) > 1 and "resource_tracker" in parts[1]:
+                continue
+            pids.append(int(parts[0]))
+        alive = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                continue
+            alive.append(pid)
+        if alive:
+            time.sleep(0.3)
+            try:
+                os.kill(alive[0], 0)
+            except OSError:
+                continue
+            child = alive[0]
+            break
+        time.sleep(0.05)
+    assert child, "queued child did not start"
+    os.kill(proc.pid, 9)
+    proc.wait(timeout=5)
+    gone = time.time() + 2
+    while time.time() < gone:
+        try:
+            os.kill(child, 0)
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(child, 9)
+        release_grid_slot(slot)
+        raise AssertionError("queued child kept running after the parent died")
+    assert not os.path.exists(marker)
+    release_grid_slot(slot)
+    again, kind, queue_s = acquire_grid_slot(
+        slot, wait_s=1, poll_s=0.05)
+    assert again and kind == "" and queue_s < 0.5
+    release_grid_slot(slot)
+
+
+def test_child_self_timeout_frees_the_lock(tmp_path, monkeypatch):
+    """A hung backtest hits the child's own limit and drops the lock."""
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_grid_process import _job
+
+    monkeypatch.setattr(gp, "child_run_limit_s", lambda timeout_s: 0.6)
+    slot = str(tmp_path / "evo_grid.slot")
+    holder = {}
+
+    def _run():
+        holder["result"] = gp.run_grid_isolated(
+            _job(mode="sleep", burn_seconds=30),
+            timeout_s=30,
+            stall_s=30,
+            entry=gp.burn_child_entry,
+            slot_path=slot,
+            poll_s=0.05,
+            slot_poll_s=0.05,
+            queue_timeout_s=5,
+        )
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join(4)
+    if thread.is_alive():
+        thread.join(1)
+        raise AssertionError("child did not self-timeout")
+    owned, kind, queue_s = acquire_grid_slot(
+        slot, wait_s=1, poll_s=0.05)
+    assert owned and kind == "" and queue_s < 0.5, (owned, kind, queue_s)
+    release_grid_slot(slot)
+
+
+def test_sidecar_is_removed_before_the_lock_drops(tmp_path, monkeypatch):
+    """The sidecar is removed while this process still holds the lock."""
+    import src.evolution.grid_process as gp
+
+    path = str(tmp_path / "evo_grid.slot")
+    owned, _kind, _q = acquire_grid_slot(
+        path, wait_s=2, poll_s=0.05)
+    assert owned
+    order = []
+    real_unlock = gp._unlock_fd
+    real_remove = os.remove
+
+    def _unlock(fd):
+        order.append("unlock")
+        return real_unlock(fd)
+
+    def _remove(target):
+        if str(target).endswith(".holder.json"):
+            order.append("remove")
+        return real_remove(target)
+
+    monkeypatch.setattr(gp, "_unlock_fd", _unlock)
+    monkeypatch.setattr(os, "remove", _remove)
+    gp.release_grid_slot(path)
+    assert "remove" in order and "unlock" in order, order
+    assert order.index("remove") < order.index("unlock"), order
+
+
+def test_queue_clock_starts_at_the_childs_first_lock_event(tmp_path, monkeypatch):
+    """Spawn time before the first lock try does not consume the queue budget."""
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_grid_process import _job
+
+    monkeypatch.setenv("TAI_EVO_LOCK_DELAY_S", "1.5")
+    slot = str(tmp_path / "evo_grid.slot")
+    result = gp.run_grid_isolated(
+        _job(mode="sleep", burn_seconds=0.1),
+        timeout_s=10,
+        stall_s=10,
+        entry=gp.burn_child_entry,
+        slot_path=slot,
+        poll_s=0.05,
+        slot_poll_s=0.05,
+        queue_timeout_s=0.8,
+    )
+    assert not isinstance(result, gp.GridProcessFailure), result

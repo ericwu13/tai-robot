@@ -168,6 +168,7 @@ memory and calls `run_grid_isolated` (spawn).
   (`grid_timeout_budget_s`: 1200 s floor, 90 s per run, 3 h cap). The
   smoke default when the flag is omitted is 120 seconds. The smoke
   also takes this install's grid slot and waits at most 5 s for it.
+  Verify OS-lock release after a killed grid child on the next Windows smoke.
 - `--payload-bytes N` makes the child build and send an N-byte blob
   through the real spawn pipe. The blob is not in the pickled job.
   That result is not a `GridOutcome`, so the process exits **1**
