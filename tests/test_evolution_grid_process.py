@@ -88,6 +88,67 @@ def _job(**evo) -> GridJob:
     )
 
 
+def progress_then_ok_entry(job, conn) -> None:
+    """Three progress messages, then a GridOutcome. Spawn target."""
+    from src.evolution.grid_search import GridOutcome
+
+    for i in (1, 2, 3):
+        conn.send(("progress", i, 4))
+    try:
+        conn.send(("ok", GridOutcome(
+            None, ("piped",), (), None, "done")))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def progress_after_go_entry(job, conn) -> None:
+    """Wait for ``go_file``, then send progress and an outcome."""
+    evo = job.evo if isinstance(job.evo, dict) else {}
+    path = str(evo.get("go_file") or "")
+    deadline = time.monotonic() + float(evo.get("go_timeout_s", 8))
+    while time.monotonic() < deadline:
+        if path and os.path.isfile(path):
+            break
+        time.sleep(0.01)
+    else:
+        return
+    progress_then_ok_entry(job, conn)
+
+
+def progress_ticker_entry(job, conn) -> None:
+    """Progress every 0.1 s until the parent kills this process."""
+    evo = job.evo if isinstance(job.evo, dict) else {}
+    total = int(evo.get("ticker_n", 1000))
+    i = 0
+    while True:
+        i += 1
+        try:
+            conn.send(("progress", i, total))
+        except Exception:
+            return
+        time.sleep(0.1)
+
+
+def one_progress_then_sleep_entry(job, conn) -> None:
+    """One progress message, then sleep past the stall bound."""
+    evo = job.evo if isinstance(job.evo, dict) else {}
+    total = int(evo.get("ticker_n", 9))
+    seconds = float(evo.get("burn_seconds", 30))
+    try:
+        conn.send(("progress", 1, total))
+    except Exception:
+        return
+    time.sleep(max(0.0, seconds))
+    try:
+        conn.send(("ok", "late"))
+        conn.close()
+    except Exception:
+        return
+
+
 def _assert_dead(pid: int) -> None:
     assert pid and pid > 0
     deadline = time.time() + 3
@@ -358,7 +419,8 @@ def test_stop_terminates_the_child():
     _assert_dead(failure.pid)
 
 
-def _worker_grid_failure(monkeypatch, tmp_path, *, mode, timeout_s, arm_stop):
+def _worker_grid_failure(monkeypatch, tmp_path, *, mode, timeout_s, arm_stop,
+                         stall_s=None):
     """Drive the live worker until the sweep child fails."""
     from unittest.mock import MagicMock
 
@@ -372,6 +434,8 @@ def _worker_grid_failure(monkeypatch, tmp_path, *, mode, timeout_s, arm_stop):
     from tests.test_evolution_min_design_trades import _InlineThread
 
     real = gp.run_grid_isolated
+    while getattr(real, "_grid_original", None) is not None:
+        real = real._grid_original
     seen = []
 
     def _wrapped(job, **kwargs):
@@ -392,10 +456,13 @@ def _worker_grid_failure(monkeypatch, tmp_path, *, mode, timeout_s, arm_stop):
         kwargs["timeout_s"] = timeout_s
         kwargs["in_process"] = False
         kwargs["poll_s"] = 0.05
+        if stall_s is not None:
+            kwargs["stall_s"] = stall_s
         result = real(job, **kwargs)
         seen.append(result)
         return result
 
+    _wrapped._grid_original = real
     monkeypatch.setattr(gp, "run_grid_isolated", _wrapped)
     monkeypatch.setattr(
         "src.evolution.grid_search.grid_search_applies",
@@ -550,7 +617,9 @@ def test_final_drain_reads_a_payload_sent_after_the_empty_poll(
         poll_s=0.05,
     )
     assert result == b"Q" * 64, result
-    assert reads == [0.0], reads
+    # The child sends the lock-acquired notice and then the payload.
+    # Both are drained with the non-blocking read.
+    assert reads and all(item == 0.0 for item in reads), reads
 
 
 def test_gui_stop_sets_evolution_cancel():
@@ -661,3 +730,155 @@ def test_gui_stop_flag_terminates_the_sweep(tmp_path, monkeypatch):
         rb._evolution_end(key)
     finally:
         rb._evolution_guard_clear()
+
+
+def test_progress_then_ok_returns_the_outcome(tmp_path, monkeypatch):
+    """Progress messages are liveness. The following ok is the result.
+
+    The final non-blocking drain must return that ok when it is sitting
+    behind the progress messages and the child has already exited.
+    """
+    import src.evolution.grid_process as gp
+    from src.evolution.grid_search import GridOutcome
+
+    result = run_grid_isolated(
+        _job(),
+        timeout_s=20,
+        entry=progress_then_ok_entry,
+        poll_s=0.05,
+    )
+    assert isinstance(result, GridOutcome), result
+    assert result.rationale == "done"
+    assert result.reasons == ("piped",)
+
+    go = tmp_path / "GO"
+    real_poll = gp._poll_message
+    holder: dict = {}
+    reads: list[float] = []
+
+    def _poll(recv_conn, timeout):
+        if "first" not in holder:
+            holder["first"] = True
+            go.write_text("go\n", encoding="utf-8")
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                proc = holder.get("proc")
+                if proc is not None and proc.pid and not proc.is_alive():
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError(
+                    "child was still alive when the empty poll returned")
+            return "empty", None
+        kind, message = real_poll(recv_conn, timeout)
+        if kind == "msg":
+            reads.append(float(timeout))
+        return kind, message
+
+    real_get_context = gp.multiprocessing.get_context
+
+    def _get_context(method=None):
+        ctx = real_get_context(method)
+        real_process = ctx.Process
+
+        def _process(*args, **kwargs):
+            proc = real_process(*args, **kwargs)
+            holder["proc"] = proc
+            return proc
+
+        ctx.Process = _process
+        return ctx
+
+    monkeypatch.setattr(gp, "_poll_message", _poll)
+    monkeypatch.setattr(gp.multiprocessing, "get_context", _get_context)
+    drained = run_grid_isolated(
+        _job(go_file=str(go), go_timeout_s=8),
+        timeout_s=20,
+        entry=progress_after_go_entry,
+        poll_s=0.05,
+    )
+    assert isinstance(drained, GridOutcome), drained
+    assert drained.rationale == "done", drained
+    assert reads, reads
+    assert reads[0] == 0.0
+
+
+def test_progress_past_the_deadline_is_still_a_timeout():
+    """Progress keeps the child alive for the stall bound, not the cap."""
+    import re
+
+    started = time.monotonic()
+    failure = run_grid_isolated(
+        _job(ticker_n=1000),
+        timeout_s=2.5,
+        entry=progress_ticker_entry,
+        poll_s=0.05,
+    )
+    elapsed = time.monotonic() - started
+    assert isinstance(failure, GridProcessFailure), failure
+    assert failure.kind == "timeout", failure
+    assert re.search(r"\d+/\d+", failure.detail), failure.detail
+    assert re.fullmatch(r"\d+/\d+", failure.progress), failure.progress
+    done, total = failure.progress.split("/")
+    assert int(done) >= 1, failure
+    assert int(total) == 1000
+    assert elapsed < 8, elapsed
+    _assert_dead(failure.pid)
+
+
+def test_silence_after_progress_is_a_stall(tmp_path):
+    """One progress line, then silence, dies at stall_s before timeout_s."""
+    started = time.monotonic()
+    failure = run_grid_isolated(
+        _job(ticker_n=9, burn_seconds=30),
+        timeout_s=15,
+        stall_s=4,
+        entry=one_progress_then_sleep_entry,
+        poll_s=0.05,
+        slot_path=str(tmp_path / "evo_grid.slot"),
+    )
+    elapsed = time.monotonic() - started
+    assert isinstance(failure, GridProcessFailure), failure
+    assert failure.kind == "stalled", failure
+    assert "1/9" in failure.detail, failure.detail
+    assert failure.progress == "1/9", failure.progress
+    assert elapsed < 15, elapsed
+    _assert_dead(failure.pid)
+
+
+def test_ctypes_priority_import_is_local_and_win32_only():
+    """SetPriorityClass is a local win32 import. The audit child stays clean."""
+    source = (ROOT / "src/evolution/grid_process.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    top = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top.add(node.module.split(".")[0])
+    assert "ctypes" not in top
+    helper = ast.get_source_segment(
+        source,
+        next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_set_below_normal_priority"
+        ),
+    )
+    assert helper is not None
+    assert 'os.name != "nt"' in helper
+    assert helper.index('os.name != "nt"') < helper.index("import ctypes")
+    assert "SetPriorityClass" in helper
+    assert "0x00004000" in helper
+    child = ast.get_source_segment(
+        source,
+        next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "grid_child_entry"
+        ),
+    )
+    assert child is not None
+    assert "_set_below_normal_priority()" in child
+    test_child_import_chain_does_not_pull_tk_com_or_the_bot()

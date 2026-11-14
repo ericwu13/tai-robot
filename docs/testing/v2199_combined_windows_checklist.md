@@ -236,7 +236,7 @@ not, do not write it. Create that file only.
 Pass: `outcome=stopped`, exit code 3, and the `--multiprocessing-fork`
 PID is gone.
 
-### (e) Short wait is not the live 20-minute bound
+### (e) Short wait is not the live grid budget
 
 ```powershell
 .\tai_backtest.exe --grid-subprocess-smoke --hang --timeout-s 8
@@ -244,8 +244,8 @@ echo "exit=$LASTEXITCODE"
 ```
 
 Pass: exit code 2, `outcome=timeout`, `elapsed_s` about 8 seconds, child
-PID gone. Do not edit `DEFAULT_GRID_TIMEOUT_S`. There is no settings key
-for this.
+PID gone. Do not edit `grid_timeout_budget_s`. There is no settings key
+for this. The smoke wait is not the live grid budget.
 
 ### (f) Payload larger than the 8 KB Windows pipe
 

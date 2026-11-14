@@ -12,10 +12,16 @@ if str(project_root) not in sys.path:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_ai_usage_log(tmp_path, monkeypatch):
-    """Redirect the AI usage CSV writer to a per-test tmp path so tests don't
-    pollute the user's real data/ai_usage.csv."""
+def _isolate_ai_usage_log(tmp_path, tmp_path_factory, monkeypatch):
+    """Redirect writers that would otherwise touch the repo ``data/`` tree.
+
+    The AI usage CSV and the host grid slot (``data/evo_grid.slot``)
+    both land in a per-test temp directory. Tests that pass their own
+    slot path still do, because that argument wins over the env var.
+    """
     monkeypatch.setenv("TAI_AI_USAGE_LOG", str(tmp_path / "ai_usage.csv"))
+    slot_dir = tmp_path_factory.mktemp("evo_grid_slot")
+    monkeypatch.setenv("TAI_EVO_GRID_SLOT", str(slot_dir / "evo_grid.slot"))
     # Reset the one-time stderr notice so each test starts from a clean state.
     from src.ai import chat_client as _cc
     monkeypatch.setattr(_cc, "_usage_log_notified", False)

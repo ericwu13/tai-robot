@@ -84,8 +84,13 @@ one copy per line. A missing bot directory is not created.
   ``pipeline_error``
   → ``fail`` or, for a clean validation pass, ``pass``.
   ``grid_failed`` is a sweep that produced no trial evidence because
-  the subprocess timed out, crashed, or was stopped. Same exit as
-  ``grid_no_pick``: watermark unchanged, model not asked to pick.
+  the subprocess timed out, stalled, crashed, was stopped, or gave up
+  waiting for the host slot. Same exit as ``grid_no_pick``: watermark
+  unchanged, model not asked to pick. Those rows also carry
+  ``grid_failure_kind`` (``timeout``, ``stalled``, ``crash``,
+  ``stopped``, ``queue_timeout``), ``grid_progress`` (``k/n``),
+  ``grid_elapsed_s``, and ``grid_queue_s``. ``reason_kind`` stays
+  ``grid_failed``.
 
 A write error is logged and swallowed. Each record is one
 ``write()`` of a complete line in binary append mode, then ``flush``.
@@ -527,6 +532,10 @@ def build_evolution_record(
         candidate_class: str = "",
         candidate_source_hash: str = "",
         verdict_text: str = "",
+        grid_failure_kind: str | None = None,
+        grid_progress: str | None = None,
+        grid_elapsed_s: float | None = None,
+        grid_queue_s: float | None = None,
 ) -> dict:
     """One history object. Does not touch the filesystem."""
     stamp = ts or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -565,6 +574,20 @@ def build_evolution_record(
             candidate_source_hash if _is_digest(candidate_source_hash) else ""),
         "verdict_text": str(verdict_text or "")[:_VERDICT_CHARS],
     }
+    if grid_failure_kind is not None:
+        record["grid_failure_kind"] = str(grid_failure_kind)[:40]
+    if grid_progress is not None:
+        record["grid_progress"] = str(grid_progress)[:40]
+    if grid_elapsed_s is not None:
+        try:
+            record["grid_elapsed_s"] = round(float(grid_elapsed_s), 3)
+        except (TypeError, ValueError):
+            record["grid_elapsed_s"] = None
+    if grid_queue_s is not None:
+        try:
+            record["grid_queue_s"] = round(float(grid_queue_s), 3)
+        except (TypeError, ValueError):
+            record["grid_queue_s"] = None
     return record
 
 
