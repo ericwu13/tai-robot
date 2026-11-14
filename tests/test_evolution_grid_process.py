@@ -617,7 +617,9 @@ def test_final_drain_reads_a_payload_sent_after_the_empty_poll(
         poll_s=0.05,
     )
     assert result == b"Q" * 64, result
-    assert reads == [0.0], reads
+    # The child sends the lock-acquired notice and then the payload.
+    # Both are drained with the non-blocking read.
+    assert reads and all(item == 0.0 for item in reads), reads
 
 
 def test_gui_stop_sets_evolution_cancel():

@@ -106,9 +106,10 @@ def test_slot_waits_steals_stale_and_honours_stop_and_queue_bound(tmp_path):
     assert q_owned is False, queued
     assert q_kind == "queue_timeout", queued
     assert q_wait >= 0.3, queued
-    # The original holder still owns the file.
-    current = slot.read_text(encoding="ascii").split()[0]
-    assert int(current) == os.getpid()
+    # The original holder still owns the lock. The file bytes are not the lock.
+    still, still_kind, _still_q = acquire_grid_slot(
+        path, wait_s=0.2, stale_s=fresh, poll_s=0.05)
+    assert still is False and still_kind == "queue_timeout"
 
     state = {"stop": False}
     stopped = {}
@@ -130,10 +131,12 @@ def test_slot_waits_steals_stale_and_honours_stop_and_queue_bound(tmp_path):
     s_owned, s_kind, _s_wait = stopped["result"]
     assert s_owned is False, stopped
     assert s_kind == "stopped", stopped
-    current = slot.read_text(encoding="ascii").split()[0]
-    assert int(current) == os.getpid()
     release_grid_slot(path)
-    assert not slot.exists()
+    again, again_kind, again_q = acquire_grid_slot(
+        path, wait_s=1, stale_s=fresh, poll_s=0.05)
+    assert again and again_kind == ""
+    assert again_q < 0.5
+    release_grid_slot(path)
 
 
 def test_history_records_grid_failure_kind_and_progress(tmp_path, monkeypatch):
@@ -277,7 +280,12 @@ def test_three_children_serialize_on_the_slot(tmp_path, capsys):
     captured = capsys.readouterr().out
     for index in range(3):
         assert f"grid-slot: child {index} start " in captured
-    assert not (tmp_path / "evo_grid.slot").exists()
+    # The lock file may remain. It does not block the next grid.
+    from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
+    owned, kind, queue_s = acquire_grid_slot(
+        slot, wait_s=1, stale_s=10**9, poll_s=0.05)
+    assert owned and kind == "" and queue_s < 0.5
+    release_grid_slot(slot)
 
 
 def _dead_pid() -> int:
@@ -286,249 +294,59 @@ def _dead_pid() -> int:
     return int(proc.pid)
 
 
-def test_release_retries_then_removes_the_slot(tmp_path, monkeypatch):
-    """A Windows-style PermissionError on the first removes still clears the slot."""
+def test_release_drops_the_os_lock(tmp_path):
+    """Releasing the OS lock lets the next acquire succeed promptly."""
     from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
 
-    path = tmp_path / "evo_grid.slot"
+    path = str(tmp_path / "evo_grid.slot")
     owned, kind, _queue = acquire_grid_slot(
-        str(path), wait_s=2, stale_s=10**9, poll_s=0.05)
+        path, wait_s=2, stale_s=10**9, poll_s=0.05)
     assert owned and kind == ""
-    calls = {"n": 0}
-    real_remove = os.remove
-
-    def _flaky(target):
-        calls["n"] += 1
-        if os.path.abspath(target) == os.path.abspath(path) and calls["n"] < 3:
-            raise PermissionError(13, "sharing violation")
-        return real_remove(target)
-
-    monkeypatch.setattr(os, "remove", _flaky)
-    release_grid_slot(str(path))
-    assert not path.exists()
-    assert calls["n"] >= 3
+    release_grid_slot(path)
+    again, again_kind, again_q = acquire_grid_slot(
+        path, wait_s=1, stale_s=10**9, poll_s=0.05)
+    assert again and again_kind == ""
+    assert again_q < 0.5
+    release_grid_slot(path)
 
 
-def test_release_warns_when_remove_never_succeeds(tmp_path, monkeypatch, caplog):
-    """A remove that keeps failing is a warning, not a silent leftover."""
+def test_release_warns_when_unlock_fails(tmp_path, monkeypatch, caplog):
+    """A failed unlock is a warning. The bytes of the file are not the lock."""
     import logging
 
-    from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
+    import src.evolution.grid_process as gp
 
-    path = tmp_path / "evo_grid.slot"
-    owned, kind, _queue = acquire_grid_slot(
-        str(path), wait_s=2, stale_s=10**9, poll_s=0.05)
+    path = str(tmp_path / "evo_grid.slot")
+    owned, kind, _queue = gp.acquire_grid_slot(
+        path, wait_s=2, stale_s=10**9, poll_s=0.05)
     assert owned and kind == ""
-    now = {"t": 1000.0}
 
-    def _mono():
-        return now["t"]
-
-    def _snooze(seconds):
-        now["t"] += float(seconds)
-
-    def _always(_target):
+    def _boom(_fd):
         raise PermissionError(13, "sharing violation")
 
-    monkeypatch.setattr(time, "monotonic", _mono)
-    monkeypatch.setattr(time, "sleep", _snooze)
-    monkeypatch.setattr(os, "remove", _always)
+    monkeypatch.setattr(gp, "_unlock_fd", _boom)
     with caplog.at_level(logging.WARNING, logger="src.evolution.grid_process"):
-        release_grid_slot(str(path))
-    assert path.exists()
-    assert now["t"] >= 1002.0 - 0.05
+        gp.release_grid_slot(path)
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings, caplog.records
     text = " ".join(r.getMessage() for r in warnings)
-    assert str(path) in text
+    assert path in text
     assert str(os.getpid()) in text
+    assert "PermissionError" in text
 
 
-def test_young_empty_slot_is_busy(tmp_path):
-    """An empty or half-written young file is held, not stolen."""
-    from src.evolution.grid_process import acquire_grid_slot
+def test_leftover_file_does_not_block(tmp_path):
+    """An empty or stale pid file is not a holder. The OS lock is."""
+    from src.evolution.grid_process import acquire_grid_slot, release_grid_slot
 
     path = tmp_path / "evo_grid.slot"
-    for text in ("", "not-a-pid\n"):
+    for text in ("", "not-a-pid\n", f"{_dead_pid()}\n1.000000\n"):
         path.write_text(text, encoding="ascii")
-        os.utime(path, None)
-        owned, kind, _queue = acquire_grid_slot(
-            str(path), wait_s=0.25, stale_s=10**9, poll_s=0.05)
-        assert owned is False, text
-        assert kind == "queue_timeout", (text, kind)
-        assert path.read_text(encoding="ascii") == text
-
-
-def test_steal_does_not_delete_a_fresh_slot_after_rename(tmp_path, monkeypatch):
-    """B renames what it thought was stale and must put A's fresh slot back."""
-    from src.evolution.grid_process import _steal_stale_slot
-
-    path = tmp_path / "evo_grid.slot"
-    _plant(path, _dead_pid(), time.time() - 100000)
-    real_replace = os.replace
-
-    def _race(src, dst):
-        if os.path.abspath(src) == os.path.abspath(path):
-            _plant(path, os.getpid(), time.time())
-        return real_replace(src, dst)
-
-    monkeypatch.setattr(os, "replace", _race)
-    _steal_stale_slot(str(path), 30)
-    assert path.is_file(), "fresh slot was deleted"
-    assert path.read_text(encoding="ascii").split()[0] == str(os.getpid())
-
-
-def test_failed_rename_leaves_the_slot_busy(tmp_path, monkeypatch):
-    """A sharing violation on rename does not delete the slot."""
-    from src.evolution.grid_process import _steal_stale_slot
-
-    path = tmp_path / "evo_grid.slot"
-    _plant(path, _dead_pid(), time.time() - 100000)
-    before = path.read_text(encoding="ascii")
-
-    def _boom(_src, _dst):
-        raise PermissionError(13, "sharing violation")
-
-    monkeypatch.setattr(os, "replace", _boom)
-    _steal_stale_slot(str(path), 30)
-    assert path.read_text(encoding="ascii") == before
-    from src.evolution.grid_process import acquire_grid_slot
-
-    owned, kind, _queue = acquire_grid_slot(
-        str(path), wait_s=0.25, stale_s=30, poll_s=0.05)
-    assert owned is False
-    assert kind == "queue_timeout"
-    assert path.read_text(encoding="ascii") == before
-
-
-def test_restore_keeps_a_new_owner_when_link_fails(tmp_path, monkeypatch):
-    """os.link fails and a new owner is already at the path. Do not replace it."""
-    from src.evolution.grid_process import _restore_slot, acquire_grid_slot
-
-    slot = tmp_path / "evo_grid.slot"
-    copy = tmp_path / "evo_grid.slot.9.abcd"
-    owner = f"{os.getpid()}\n{time.time():.6f}\n".encode("ascii")
-    slot.write_bytes(owner)
-    copy.write_bytes(b"1\n1.000000\n")
-    real_exists = os.path.exists
-
-    def _exists(target):
-        if os.path.abspath(target) == os.path.abspath(slot):
-            return False
-        return real_exists(target)
-
-    def _no_link(*_args, **_kwargs):
-        raise OSError("link unavailable")
-
-    monkeypatch.setattr(os.path, "exists", _exists)
-    monkeypatch.setattr(os, "link", _no_link)
-    _restore_slot(str(copy), str(slot))
-    assert slot.read_bytes() == owner
-    assert copy.is_file()
-    owned, kind, _queue = acquire_grid_slot(
-        str(slot), wait_s=0.25, stale_s=10**9, poll_s=0.05)
-    assert owned is False
-    assert kind == "queue_timeout"
-    assert slot.read_bytes() == owner
-
-
-def test_reap_drops_old_dead_copies_and_keeps_the_rest(tmp_path):
-    """Only an old copy whose pids are all dead is removed."""
-    from src.evolution.grid_process import acquire_grid_slot
-
-    slot = tmp_path / "evo_grid.slot"
-    old_dead = tmp_path / "evo_grid.slot.1.dead"
-    young = tmp_path / "evo_grid.slot.2.young"
-    live = tmp_path / "evo_grid.slot.3.live"
-    dead = _dead_pid()
-    _plant(old_dead, dead, time.time() - 100000)
-    _plant(young, dead, time.time())
-    _plant(live, os.getpid(), time.time() - 100000)
-    owned, kind, _queue = acquire_grid_slot(
-        str(slot), wait_s=0.25, stale_s=30, poll_s=0.05)
-    assert not old_dead.exists()
-    assert young.is_file()
-    assert live.is_file()
-    assert owned is False
-    assert kind == "queue_timeout"
-    assert not slot.exists()
-
-
-def test_crash_after_rename_of_a_live_slot_stays_busy(tmp_path):
-    """A non-stale copy left after rename, before delete, blocks a second grid."""
-    from src.evolution.grid_process import acquire_grid_slot
-
-    slot = tmp_path / "evo_grid.slot"
-    _plant(slot, os.getpid(), time.time())
-    renamed = tmp_path / f"evo_grid.slot.{os.getpid()}.crash"
-    os.replace(slot, renamed)
-    assert not slot.exists()
-    owned, kind, _queue = acquire_grid_slot(
-        str(slot), wait_s=0.25, stale_s=10**9, poll_s=0.05)
-    assert owned is False
-    assert kind == "queue_timeout"
-    assert not slot.exists()
-    assert renamed.is_file()
-
-
-def test_slot_busy_for_a_live_child_and_the_age_cap(tmp_path):
-    """Either pid holds the slot inside the cap. Past the cap it is stealable."""
-    from src.evolution.grid_process import acquire_grid_slot
-    from tests.test_evolution_grid_process import _job
-
-    slot = tmp_path / "either.slot"
-    child_alive = (
-        f"{_dead_pid()}\n{time.time():.6f}\n{os.getpid()}\n".encode("ascii")
-    )
-    slot.write_bytes(child_alive)
-    owned, kind, _queue = acquire_grid_slot(
-        str(slot), wait_s=0.25, stale_s=10**9, poll_s=0.05)
-    assert owned is False, "live child must keep the slot busy"
-    assert kind == "queue_timeout"
-    assert slot.read_bytes() == child_alive
-
-    both_dead = tmp_path / "both-dead.slot"
-    _plant_pids(both_dead, _dead_pid(), _dead_pid(), time.time())
-    owned, kind, _queue = acquire_grid_slot(
-        str(both_dead), wait_s=1, stale_s=10**9, poll_s=0.05)
-    assert owned is True and kind == "", "both dead pids are stealable"
-    release_ok = both_dead.read_text(encoding="ascii").split()[0] == str(os.getpid())
-    assert release_ok
-
-    aged = tmp_path / "aged.slot"
-    _plant_pids(aged, os.getpid(), os.getpid(), time.time() - 100000)
-    owned, kind, _queue = acquire_grid_slot(
-        str(aged), wait_s=1, stale_s=30, poll_s=0.05)
-    assert owned is True and kind == "", "age past the cap is stealable"
-
-    from src.evolution.grid_process import burn_child_entry, run_grid_isolated
-
-    recorded = {}
-
-    def _started(pid):
-        recorded["pid"] = pid
-        recorded["text"] = (tmp_path / "live.slot").read_text(encoding="ascii")
-
-    run_grid_isolated(
-        _job(mode="sleep", burn_seconds=0.2),
-        timeout_s=15,
-        stall_s=30,
-        entry=burn_child_entry,
-        poll_s=0.05,
-        slot_path=str(tmp_path / "live.slot"),
-        on_start=_started,
-    )
-    assert recorded["pid"]
-    assert str(recorded["pid"]) in recorded["text"]
-    assert recorded["text"].split()[0] == str(os.getpid())
-
-
-def _plant_pids(path, parent: int, child: int, stamp: float) -> None:
-    path.write_text(
-        f"{int(parent)}\n{float(stamp):.6f}\n{int(child)}\n",
-        encoding="ascii",
-    )
-    os.utime(path, (stamp, stamp))
+        owned, kind, queue_s = acquire_grid_slot(
+            str(path), wait_s=1, stale_s=10**9, poll_s=0.05)
+        assert owned and kind == "", text
+        assert queue_s < 0.5
+        release_grid_slot(str(path))
 
 
 def _progress_then_ok(job, conn) -> None:
@@ -640,207 +458,8 @@ def _zero_ino(st):
     return _stat_ino(st, 0)
 
 
-def test_widened_three_waiter_window_has_one_owner(tmp_path, monkeypatch):
-    """A creates, B's replace moves that inode, C creates. One owner.
-
-    The interleaving is injected inside the steal replace. No sleeps.
-    On 8610ce6 A and C both return owned.
-    """
-    from src.evolution.grid_process import _steal_stale_slot, _try_create_slot
-
-    slot = tmp_path / "evo_grid.slot"
-    _plant(slot, _dead_pid(), time.time() - 100000)
-    real_open = os.open
-    real_write = os.write
-    real_replace = os.replace
-    state = {
-        "phase": "b_steal",
-        "a_fd": None,
-        "a_owned": None,
-        "c_owned": None,
-    }
-
-    def _open(path, flags, mode=0o777):
-        fd = real_open(path, flags, mode)
-        if (
-            os.path.abspath(path) == os.path.abspath(slot)
-            and flags & os.O_CREAT
-            and flags & os.O_EXCL
-            and state["phase"] == "a_create"
-            and state["a_fd"] is None
-        ):
-            state["a_fd"] = fd
-        return fd
-
-    def _write(fd, data):
-        n = real_write(fd, data)
-        if (
-            fd == state["a_fd"]
-            and state["phase"] == "a_create"
-            and isinstance(data, (bytes, bytearray))
-            and data.count(b"\n") == 2
-        ):
-            state["phase"] = "widened"
-            real_replace(str(slot), str(slot) + ".waiterB")
-            state["c_owned"] = _try_create_slot(str(slot))
-        return n
-
-    def _replace(src, dst):
-        if (
-            state["phase"] == "b_steal"
-            and os.path.abspath(src) == os.path.abspath(slot)
-        ):
-            state["phase"] = "a_create"
-            stale = src + ".astale"
-            real_replace(src, stale)
-            os.remove(stale)
-            state["a_owned"] = _try_create_slot(src)
-            return
-        return real_replace(src, dst)
-
-    monkeypatch.setattr(os, "open", _open)
-    monkeypatch.setattr(os, "write", _write)
-    monkeypatch.setattr(os, "replace", _replace)
-    _steal_stale_slot(str(slot), 30)
-    b_owned = _try_create_slot(str(slot))
-    owners = [state["a_owned"], b_owned, state["c_owned"]]
-    assert owners.count(True) == 1, owners
-
-
-def test_ino_zero_uses_pid_stamp_and_unverifiable_stays_busy(
-        tmp_path, monkeypatch):
-    """st_ino 0 forces the pid/stamp check. No check at all stays busy."""
-    from src.evolution.grid_process import _try_create_slot, acquire_grid_slot
-
-    slot = tmp_path / "evo_grid.slot"
-    real_stat = os.stat
-    real_fstat = os.fstat
-    real_open = os.open
-    real_write = os.write
-    real_time = time.time
-    ticks = {"n": 0}
-
-    def _clock():
-        ticks["n"] += 1
-        return real_time() + ticks["n"]
-
-    def _stat(path, *args, **kwargs):
-        return _zero_ino(real_stat(path, *args, **kwargs))
-
-    def _fstat(fd):
-        return _zero_ino(real_fstat(fd))
-
-    monkeypatch.setattr(time, "time", _clock)
-    monkeypatch.setattr(os, "stat", _stat)
-    monkeypatch.setattr(os, "fstat", _fstat)
-
-    other = tmp_path / "unverifiable.slot"
-    state = {"wrote": False}
-
-    def _open(path, flags, mode=0o777):
-        if (
-            state["wrote"]
-            and os.path.abspath(path) == os.path.abspath(other)
-            and (flags & os.O_ACCMODE) == os.O_RDONLY
-            and not (flags & os.O_CREAT)
-        ):
-            raise OSError("unreadable")
-        return real_open(path, flags, mode)
-
-    def _write(fd, data):
-        n = real_write(fd, data)
-        state["wrote"] = True
-        return n
-
-    monkeypatch.setattr(os, "open", _open)
-    monkeypatch.setattr(os, "write", _write)
-    owned = _try_create_slot(str(other))
-    assert owned is False
-    body = other.read_bytes()
-    assert body
-    assert b"\n" in body
-    again, kind, _queue = acquire_grid_slot(
-        str(other), wait_s=0.2, stale_s=10**9, poll_s=0.05)
-    assert again is False
-    assert kind == "queue_timeout"
-    assert other.read_bytes() == body
-    # Same widened window, with st_ino 0 forcing the pid and stamp check.
-    probe = tmp_path / "probe"
-    probe.mkdir()
-    test_widened_three_waiter_window_has_one_owner(probe, monkeypatch)
-
-
-def test_steal_refuses_when_identity_changes_before_replace(
-        tmp_path, monkeypatch):
-    """The inode (or pid and stamp) is re-checked immediately before replace."""
-    from src.evolution.grid_process import _steal_stale_slot
-
-    slot = tmp_path / "evo_grid.slot"
-    _plant(slot, _dead_pid(), time.time() - 100000)
-    original = slot.read_bytes()
-    real_stat = os.stat
-    seen = {"n": 0}
-
-    def _stat(path, *args, **kwargs):
-        st = real_stat(path, *args, **kwargs)
-        if os.path.abspath(path) == os.path.abspath(slot):
-            seen["n"] += 1
-            if seen["n"] >= 3:
-                return _stat_ino(st, int(st.st_ino) + 1)
-        return st
-
-    monkeypatch.setattr(os, "stat", _stat)
-    _steal_stale_slot(str(slot), 30)
-    assert slot.is_file()
-    assert slot.read_bytes() == original
-
-
-def test_child_pid_write_failure_reaches_the_bot_log(tmp_path, monkeypatch):
-    """A failed child-pid write is on the bot log and does not empty the slot."""
-    import inspect
-
-    import run_backtest as rb
-    import src.evolution.grid_process as gp
-
-    logs: list[str] = []
-    monkeypatch.setattr(rb, "_log", lambda message: logs.append(str(message)))
-    slot = tmp_path / "evo_grid.slot"
-    assert gp._try_create_slot(str(slot))
-    original = slot.read_bytes()
-    real_write = os.write
-
-    def _warn(message):
-        rb._log(f"EVO {message}")
-
-    def _boom(fd, data):
-        if (
-            isinstance(data, (bytes, bytearray))
-            and data.count(b"\n") >= 3
-        ):
-            real_write(fd, data[:3])
-            raise OSError(28, "no space")
-        return real_write(fd, data)
-
-    monkeypatch.setattr(os, "write", _boom)
-    fn = gp._record_child_pid
-    if "on_warning" in inspect.signature(fn).parameters:
-        fn(str(slot), 4242, on_warning=_warn)
-    else:
-        fn(str(slot), 4242)
-    assert slot.read_bytes() == original
-    text = "\n".join(logs)
-    assert "EVO grid slot child pid write failed path=" in text
-    assert f"pid={os.getpid()}" in text
-    assert "OSError" in text
-    owned, kind, _queue = gp.acquire_grid_slot(
-        str(slot), wait_s=0.2, stale_s=10**9, poll_s=0.05)
-    assert owned is False
-    assert kind == "queue_timeout"
-    assert slot.read_bytes() == original
-
-
-def test_slot_release_warning_reaches_the_bot_log(tmp_path, monkeypatch):
-    """A failed remove is on the bot log, not only the Python logger."""
+def test_free_lock_logs_acquired_without_waiting(tmp_path, monkeypatch):
+    """A free lock logs acquired and the finish line, and not 'waiting'."""
     from unittest.mock import MagicMock
 
     import run_backtest as rb
@@ -858,14 +477,56 @@ def test_slot_release_warning_reaches_the_bot_log(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "src.evolution.notify.maybe_advance_watermark",
         lambda *args, **kwargs: None)
-    real_remove = os.remove
+    chat = MagicMock()
+    chat.max_tokens = 1024
+    chat.conversation = []
+    chat.send_message.return_value = "plan"
+    chat.one_shot.return_value = ""
+    rb._evolution_guard_clear()
+    app = _validation_app(tmp_path, chat, paper_gate="relative")
+    app._grid_in_process = True
+    app._grid_queue_notice_s = 0.05
+    app._grid_slot_poll_s = 0.05
+    try:
+        rb.BacktestApp._start_evolution_pipeline(
+            app, "preamble", ["design trade"], "", app._result,
+            auto_run=False, holdout_days=14, bot_dir=str(tmp_path),
+            design_cut_idx=1)
+    finally:
+        rb._evolution_guard_clear()
+    text = "\n".join(logs)
+    assert "EVO grid waiting for host slot" not in text
+    assert "EVO grid still waiting" not in text
+    assert "EVO grid acquired host slot queue 0 s" in text
+    finished = [line for line in logs if line.startswith("EVO grid finished ")]
+    assert len(finished) == 1, logs
+    assert "queue 0 s" in finished[0]
+    assert "n=" in finished[0] and "mean " in finished[0]
 
-    def _stuck(target):
-        if str(target).endswith(f"{os.sep}evo_grid.slot"):
-            raise PermissionError(13, "sharing violation")
-        return real_remove(target)
 
-    monkeypatch.setattr(os, "remove", _stuck)
+def test_slot_release_warning_reaches_the_bot_log(tmp_path, monkeypatch):
+    """A failed unlock is on the bot log, not only the Python logger."""
+    from unittest.mock import MagicMock
+
+    import run_backtest as rb
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_history import _validation_app
+    from tests.test_evolution_min_design_trades import _InlineThread
+
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", lambda message: logs.append(str(message)))
+    monkeypatch.setattr(gp, "grid_child_entry", _progress_then_ok)
+    monkeypatch.setattr(
+        "src.evolution.grid_search.grid_search_applies",
+        lambda *args, **kwargs: True)
+    monkeypatch.setattr(rb.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(
+        "src.evolution.notify.maybe_advance_watermark",
+        lambda *args, **kwargs: None)
+    def _stuck(_fd):
+        raise PermissionError(13, "sharing violation")
+
+    monkeypatch.setattr(gp, "_unlock_fd", _stuck)
     chat = MagicMock()
     chat.max_tokens = 1024
     chat.conversation = []

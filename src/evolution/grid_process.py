@@ -32,16 +32,15 @@ each setting, then ``("ok", outcome)``. Progress is liveness only.
 arrives. Partial trial results are discarded: only a finished ``ok``
 is returned.
 
-One grid runs per install folder. The slot is
+One grid runs per install folder. The lock file is
 ``project_root()/data/evo_grid.slot`` (or ``TAI_EVO_GRID_SLOT``).
 Two installs side by side do not share it. It is not a machine-wide
-path and it is not under ``%PROGRAMDATA%``. The file records the
-parent pid and, once the child has spawned, the child pid. It stays
-busy while either pid is alive, until it is older than
-``SLOT_STARTED_GUARD_S`` (12300 s). The parent acquires that file
-before the clocks start, queues on this thread (never on Tk), and
-releases the slot when the run ends. The child does not start a
-worker pool. There is no Job Object.
+path and it is not under ``%PROGRAMDATA%``. The grid child takes an
+OS lock on that file (``fcntl.flock`` or ``msvcrt.locking``) and holds
+it until it exits. The operating system drops the lock when the child
+dies, so there is no stale file and no steal. A JSON sidecar next to
+the lock names the holder for log lines only. The child does not start
+a worker pool. There is no Job Object.
 
 ``in_process=True`` is the test seam. It runs the same function on the
 calling thread and holds the GIL. Production leaves it false. A timeout
@@ -555,54 +554,6 @@ def _decode_message(proc, message):
     return GridProcessFailure("crash", text, pid)
 
 
-def _pid_alive(pid: int) -> bool:
-    """True when ``pid`` is still a process. Never raises.
-
-    ``os.kill(pid, 0)`` is not an existence check on Windows (signal 0
-    is ``CTRL_C_EVENT``), so that platform uses ``OpenProcess``. A pid
-    we cannot verify stays alive so a live holder is not stolen.
-    """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        return _pid_alive_win(pid)
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def _pid_alive_win(pid: int) -> bool:
-    try:
-        import ctypes
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        access = 0x1000  # PROCESS_QUERY_LIMITED_INFORMATION
-        still_active = 259
-        handle = kernel.OpenProcess(access, False, pid)
-        if not handle:
-            # Access denied: the pid exists and is not ours.
-            if ctypes.get_last_error() == 5:
-                return True
-            return False
-        try:
-            code = ctypes.c_ulong()
-            ok = kernel.GetExitCodeProcess(handle, ctypes.byref(code))
-            if not ok:
-                return True
-            return int(code.value) == still_active
-        finally:
-            kernel.CloseHandle(handle)
-    except Exception:
-        return True
-
-
 def default_slot_path() -> str:
     """This install's grid slot. Not shared with another install folder.
 
@@ -618,429 +569,6 @@ def default_slot_path() -> str:
         return override
     from src.paths import project_root
     return os.path.join(project_root(), "data", GRID_SLOT_FILENAME)
-
-
-def _read_slot(path: str):
-    """``(pids, stamp)``.
-
-    ``pids`` is the parent pid, then the child pid when one was
-    recorded. ``stamp`` is the older of the embedded clock and the
-    mtime. A missing file is ``((), None)``. An unreadable pid is
-    omitted.
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return (), None
-    mtime = float(st.st_mtime)
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read(256)
-    except OSError:
-        return (), mtime
-    parts = text.split()
-    pids: list[int] = []
-    stamp = mtime
-    if parts:
-        try:
-            pids.append(int(parts[0]))
-        except ValueError:
-            pids = []
-    if len(parts) >= 2:
-        try:
-            stamp = float(parts[1])
-        except ValueError:
-            stamp = mtime
-    if len(parts) >= 3 and pids:
-        try:
-            child = int(parts[2])
-        except ValueError:
-            child = 0
-        if child > 0:
-            pids.append(child)
-    if mtime < stamp:
-        stamp = mtime
-    return tuple(pids), stamp
-
-
-def _slot_age(stamp, now: float | None = None):
-    if stamp is None:
-        return None
-    current = time.time() if now is None else float(now)
-    try:
-        return current - float(stamp)
-    except (TypeError, ValueError):
-        return None
-
-
-def _slot_is_stale(pids, stamp, stale_s: float, now: float | None = None) -> bool:
-    """True when the slot may be taken over.
-
-    Older than ``stale_s`` is stale even if a pid is alive, so a reused
-    pid cannot hold the file forever. Production passes
-    ``SLOT_STARTED_GUARD_S`` (12300 s). Inside that cap the slot is
-    busy while the parent or the child is alive, and stealable when
-    every recorded pid is dead. An empty or half-written file has no
-    pid: a young one is busy, and only one older than the same cap is
-    stale.
-    """
-    age = _slot_age(stamp, now)
-    if age is not None and age > float(stale_s):
-        return True
-    if not pids:
-        return False
-    if any(_pid_alive(pid) for pid in pids):
-        return False
-    return True
-
-
-def _inode_pair(st):
-    """``(st_dev, st_ino)`` when the inode is a real one, else None.
-
-    ``st_ino`` 0 is not an identity. FAT and some Windows network
-    shares report that, and a missing stat result is the same.
-    """
-    if st is None:
-        return None
-    try:
-        ino = int(st.st_ino)
-        dev = int(st.st_dev)
-    except (TypeError, ValueError, AttributeError):
-        return None
-    if ino <= 0:
-        return None
-    return (dev, ino)
-
-
-def _payload_tokens(payload: bytes):
-    parts = payload.split()
-    if len(parts) < 2:
-        return None
-    try:
-        return (parts[0].decode("ascii"), parts[1].decode("ascii"))
-    except (UnicodeError, AttributeError):
-        return None
-
-
-def _slot_text_tokens(path: str):
-    """Pid and stamp text at ``path``, ``()`` if readable but short, None if not."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return None
-    try:
-        data = os.read(fd, 256)
-    except OSError:
-        return None
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    parts = data.split()
-    if len(parts) < 2:
-        return ()
-    try:
-        return (parts[0].decode("ascii"), parts[1].decode("ascii"))
-    except UnicodeError:
-        return ()
-
-
-def _path_is_fd(path: str, fd: int) -> bool:
-    """True only when ``path`` still names the inode behind ``fd``."""
-    try:
-        mine = _inode_pair(os.fstat(fd))
-        there = _inode_pair(os.stat(path))
-    except OSError:
-        return False
-    if mine is None or there is None:
-        return False
-    return mine == there
-
-
-def _created_slot_is_ours(fd: int, path: str, payload: bytes) -> bool:
-    """True when ``path`` is still the inode we just wrote.
-
-    A real ``(st_dev, st_ino)`` pair is enough. ``st_ino`` 0, or no
-    inode at all, falls back to the pid and stamp in ``payload``.
-    A missing path, a mismatch, or neither check, is not ownership.
-    The caller treats that as busy.
-    """
-    try:
-        mine = os.fstat(fd)
-    except OSError:
-        mine = None
-    try:
-        there = os.stat(path)
-    except OSError:
-        return False
-    mine_id = _inode_pair(mine)
-    there_id = _inode_pair(there)
-    if mine_id is not None and there_id is not None:
-        return mine_id == there_id
-    expected = _payload_tokens(payload)
-    found = _slot_text_tokens(path)
-    if expected is None or found is None:
-        return False
-    return found == expected
-
-
-def _path_identity(path: str):
-    """Inode of ``path``, or its pid and stamp when the inode is unusable."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    pair = _inode_pair(st)
-    if pair is not None:
-        return ("ino", pair)
-    pids, stamp = _read_slot(path)
-    if stamp is None and not pids:
-        return None
-    return ("text", (tuple(pids), stamp))
-
-
-def _identity_matches(path: str, ident) -> bool:
-    if ident is None:
-        return False
-    return _path_identity(path) == ident
-
-
-def _warn_slot(message: str, on_warning) -> None:
-    import logging
-
-    logging.getLogger(__name__).warning("%s", message)
-    if on_warning is None:
-        return
-    try:
-        on_warning(message)
-    except Exception:
-        pass
-
-
-def _record_child_pid(path: str, child_pid: int, *, on_warning=None) -> bool:
-    """Add the grid child pid to a slot this process still owns.
-
-    The original timestamp is kept, so the age cap does not restart
-    when the child appears. The new bytes are one ``os.write``. The
-    file is not truncated first and the path is not replaced. A failed
-    write is restored to the previous bytes, logged, and left busy.
-    """
-    if not child_pid:
-        return False
-    pids, stamp = _read_slot(path)
-    if not pids or pids[0] != os.getpid():
-        return False
-    when = time.time() if stamp is None else float(stamp)
-    payload = f"{pids[0]}\n{when:.6f}\n{int(child_pid)}\n".encode("ascii")
-
-    def _failed(exc: BaseException) -> bool:
-        _warn_slot(
-            f"grid slot child pid write failed path={path} pid={os.getpid()} "
-            f"[{type(exc).__name__}] {exc}",
-            on_warning,
-        )
-        return False
-
-    try:
-        src = os.open(path, os.O_RDONLY)
-    except OSError as exc:
-        return _failed(exc)
-    try:
-        try:
-            original = os.read(src, 4096)
-        except OSError as exc:
-            return _failed(exc)
-    finally:
-        try:
-            os.close(src)
-        except OSError:
-            pass
-    try:
-        fd = os.open(path, os.O_RDWR)
-    except OSError as exc:
-        return _failed(exc)
-    try:
-        try:
-            written = os.write(fd, payload)
-            if written != len(payload):
-                raise OSError(f"short write {written}")
-            os.ftruncate(fd, len(payload))
-        except OSError as exc:
-            try:
-                os.lseek(fd, 0, os.SEEK_SET)
-                os.write(fd, original)
-                os.ftruncate(fd, len(original))
-            except OSError:
-                pass
-            return _failed(exc)
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    return True
-
-
-def _try_create_slot(path: str) -> bool:
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    try:
-        fd = os.open(path, flags, 0o644)
-    except OSError:
-        return False
-    try:
-        payload = f"{os.getpid()}\n{time.time():.6f}\n".encode("ascii")
-        try:
-            written = os.write(fd, payload)
-            if written != len(payload):
-                raise OSError(f"short write {written}")
-        except OSError:
-            if _path_is_fd(path, fd):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            return False
-        return _created_slot_is_ours(fd, path, payload)
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
-def _restore_slot(renamed: str, path: str) -> None:
-    """Put a non-stale slot back without replacing whatever is at ``path``.
-
-    ``os.link`` is enough when it works. Otherwise the bytes are written
-    through ``O_CREAT|O_EXCL``. There is no ``os.replace`` onto the slot
-    path. If the path already exists, or the exclusive create fails, the
-    renamed copy is kept and the slot stays busy.
-    """
-    try:
-        os.link(renamed, path)
-    except FileExistsError:
-        return
-    except OSError:
-        if not _exclusive_restore(renamed, path):
-            return
-    try:
-        os.remove(renamed)
-    except OSError:
-        pass
-
-
-def _exclusive_restore(renamed: str, path: str) -> bool:
-    """Write ``renamed`` onto ``path`` only if ``path`` does not exist."""
-    try:
-        with open(renamed, "rb") as handle:
-            payload = handle.read()
-    except OSError:
-        return False
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    try:
-        fd = os.open(path, flags, 0o644)
-    except OSError:
-        return False
-    try:
-        os.write(fd, payload)
-    except OSError:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return False
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-    return True
-
-
-def _slot_copies(path: str) -> list[str]:
-    """Files named ``<path>.*`` left by a rename that was not deleted."""
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    prefix = os.path.basename(path) + "."
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return []
-    return [
-        os.path.join(directory, name)
-        for name in names
-        if name.startswith(prefix)
-    ]
-
-
-def _copy_is_reapable(copy: str, stale_s: float) -> bool:
-    """Old, and every recorded pid is dead. A live pid is never reaped."""
-    pids, stamp = _read_slot(copy)
-    age = _slot_age(stamp)
-    if age is None or age <= float(stale_s):
-        return False
-    return not any(_pid_alive(pid) for pid in pids)
-
-
-def _reap_slot_copies(path: str, stale_s: float) -> None:
-    for copy in _slot_copies(path):
-        if not _copy_is_reapable(copy, stale_s):
-            continue
-        try:
-            os.remove(copy)
-        except OSError:
-            pass
-
-
-def _copy_holds_slot(path: str, stale_s: float) -> bool:
-    """A live or non-stale ``<path>.*`` copy still holds the slot.
-
-    A crash after the rename and before the delete leaves that copy.
-    Acquire must not start a second grid while it is there.
-    """
-    for copy in _slot_copies(path):
-        if not _copy_is_reapable(copy, stale_s):
-            return True
-    return False
-
-
-def _steal_stale_slot(path: str, stale_s: float) -> None:
-    """Take over ``path`` only when the renamed copy is still stale.
-
-    The file is renamed to ``<path>.<pid>.<random>`` before any delete.
-    The pids and stamp are read again from that copy. Only then is the
-    copy removed. A fresh slot that landed at ``path`` is never the
-    file we delete. If the copy is no longer stale, it is restored by
-    an exclusive create. A rename that fails (a Windows open handle)
-    leaves ``path`` in place and does not delete it. If this process
-    dies between the rename and the delete, the copy keeps the slot
-    busy until it is old and every pid in it is dead.
-    """
-    pids, stamp = _read_slot(path)
-    if not _slot_is_stale(pids, stamp, stale_s):
-        return
-    ident = _path_identity(path)
-    holder = str(pids[0]) if pids else "na"
-    renamed = f"{path}.{holder}.{os.urandom(4).hex()}"
-    # Re-check the judged inode (or pid and stamp) immediately before
-    # the replace. A new file at this path is not the stale slot.
-    if not _identity_matches(path, ident):
-        return
-    try:
-        os.replace(path, renamed)
-    except OSError:
-        return
-    pids2, stamp2 = _read_slot(renamed)
-    if not _slot_is_stale(pids2, stamp2, stale_s):
-        _restore_slot(renamed, path)
-        return
-    try:
-        os.remove(renamed)
-    except OSError:
-        pass
 
 
 def grid_progress_should_log(
@@ -1071,16 +599,134 @@ def grid_progress_should_log(
         return False
 
 
-def _holder_pid(path: str):
-    """Parent pid of the slot, or of a leftover copy that still holds it."""
-    pids, _stamp = _read_slot(path)
-    if pids:
-        return pids[0]
-    for copy in _slot_copies(path):
-        copied, _stamp = _read_slot(copy)
-        if copied:
-            return copied[0]
+
+def _sidecar_path(path: str) -> str:
+    """Diagnostic file next to the lock. Never decides who owns the slot."""
+    return path + ".holder.json"
+
+
+def _read_holder_pid(path: str):
+    """Child pid from the sidecar, for a log line only."""
+    try:
+        with open(_sidecar_path(path), "r", encoding="utf-8") as handle:
+            text = handle.read(512)
+    except OSError:
+        return None
+    try:
+        import json
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("child_pid", "pid"):
+        try:
+            pid = int(data.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            return pid
     return None
+
+
+def _write_sidecar(path: str, parent_pid: int, on_warning=None) -> None:
+    import json
+
+    payload = {
+        "pid": int(parent_pid) if parent_pid else os.getpid(),
+        "child_pid": os.getpid(),
+        "started": time.time(),
+    }
+    target = _sidecar_path(path)
+    try:
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except OSError as exc:
+        _warn_slot(
+            f"grid slot sidecar write failed path={target} "
+            f"pid={os.getpid()} [{type(exc).__name__}] {exc}",
+            on_warning,
+        )
+
+
+def _warn_slot(message: str, on_warning) -> None:
+    import logging
+
+    logging.getLogger(__name__).warning("%s", message)
+    if on_warning is None:
+        return
+    try:
+        on_warning(message)
+    except Exception:
+        pass
+
+
+def _open_lock_fd(path: str) -> int:
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            pass
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags, 0o644)
+    try:
+        os.set_inheritable(fd, False)
+    except OSError:
+        pass
+    try:
+        if os.fstat(fd).st_size < 1:
+            os.write(fd, b"\0")
+    except OSError:
+        pass
+    return fd
+
+
+def _lock_busy(exc: OSError) -> bool:
+    import errno
+    err = getattr(exc, "errno", None)
+    return err in (
+        errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK,
+    )
+
+
+def _lock_nb(fd: int) -> bool:
+    """Non-blocking exclusive lock. False when another holder has it."""
+    if os.name == "nt":
+        import msvcrt
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if _lock_busy(exc):
+                return False
+            raise
+    import fcntl
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if _lock_busy(exc):
+            return False
+        raise
+
+
+def _unlock_fd(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+# path -> fd this process holds. The OS drops the lock when we close it
+# or when this process dies. Nothing else inherits the fd.
+_HELD_LOCKS: dict[str, int] = {}
 
 
 def _emit_queue(on_queue, kind: str, **fields) -> None:
@@ -1098,107 +744,157 @@ def acquire_grid_slot(
         stop_check=None,
         poll_s: float = GRID_SLOT_POLL_S,
         wait_s: float,
-        stale_s: float,
+        stale_s: float | None = None,
         sleep=None,
         on_queue=None,
-        notice_s: float = 600.0):
-    """Take the host slot. ``(owned, kind, queue_s)``.
+        notice_s: float = 600.0,
+        on_warning=None,
+        parent_pid: int | None = None):
+    """Take the host lock. ``(owned, kind, queue_s)``.
 
-    ``kind`` is ``""`` when this process holds the file, otherwise
-    ``stopped`` or ``queue_timeout``. A free slot is taken even when
-    stop is already set, so the caller can spawn and then honour STOP
-    the way a grid with no queue does. Stop is noticed while waiting
-    on a busy slot. The slot is busy while the parent or the child pid
-    is alive and the file is not older than ``stale_s``. Production
-    passes ``SLOT_STARTED_GUARD_S`` (12300 s). Both pids dead, or a
-    file older than that cap, is taken over. A ``<path>.*`` copy left
-    by a crash is the same: old and all-dead copies are reaped, and a
-    live or younger copy holds the slot so a second grid does not start.
+    The lock is ``fcntl.flock`` on POSIX and ``msvcrt.locking`` on
+    Windows. The operating system releases it when this process dies.
+    There is no stale file and no steal. ``stale_s`` is accepted and
+    ignored so older callers keep working.
+
+    A free lock is taken on the first try and does not emit ``wait``.
+    ``wait`` is emitted only after that try fails. While waiting, a
+    ``waiting`` line is emitted every ``notice_s`` (10 min in
+    production) with the sidecar's holder pid when one was written.
+    The sidecar is diagnostic only.
     """
+    del stale_s  # ownership is the OS lock, not the file's age
     pause = time.sleep if sleep is None else sleep
     start = time.monotonic()
     deadline = start + max(0.0, float(wait_s))
-    poll = 0.05 if poll_s is None or poll_s <= 0 else float(poll_s)
-    notice = 600.0 if notice_s is None or notice_s <= 0 else float(notice_s)
-    directory = os.path.dirname(os.path.abspath(path))
-    if directory:
-        try:
-            os.makedirs(directory, exist_ok=True)
-        except OSError:
-            pass
-    _emit_queue(on_queue, "wait", holder=_holder_pid(path))
-    last_notice = time.monotonic()
-    while True:
-        _reap_slot_copies(path, stale_s)
-        held_by_copy = _copy_holds_slot(path, stale_s)
-        if not held_by_copy and _try_create_slot(path):
-            queue_s = time.monotonic() - start
-            _emit_queue(
-                on_queue, "acquired", queue_s=queue_s, holder=_holder_pid(path))
-            return True, "", queue_s
-        if stop_check is not None and stop_check():
-            return False, "stopped", time.monotonic() - start
-        if not held_by_copy:
-            pids, stamp = _read_slot(path)
-            if _slot_is_stale(pids, stamp, stale_s):
-                _steal_stale_slot(path, stale_s)
-                if not _copy_holds_slot(path, stale_s) and _try_create_slot(path):
-                    queue_s = time.monotonic() - start
-                    _emit_queue(
-                        on_queue, "acquired",
-                        queue_s=queue_s, holder=_holder_pid(path))
-                    return True, "", queue_s
-        now = time.monotonic()
-        if now - last_notice >= notice:
-            _emit_queue(
-                on_queue, "waiting",
-                holder=_holder_pid(path), waited_s=now - start)
-            last_notice = now
-        if now >= deadline:
-            return False, "queue_timeout", now - start
-        pause(min(poll, max(0.0, deadline - now)))
+    # Production polls every 5 s. Tests pass a shorter poll.
+    poll = 5.0 if poll_s is None or float(poll_s) <= 0 else float(poll_s)
+    notice = 600.0 if notice_s is None or float(notice_s) <= 0 else float(notice_s)
+    key = os.path.abspath(path)
+    fd = _open_lock_fd(path)
+    announced = False
+    last_notice = start
+    try:
+        while True:
+            if _lock_nb(fd):
+                _HELD_LOCKS[key] = fd
+                _write_sidecar(
+                    path,
+                    os.getpid() if parent_pid is None else int(parent_pid),
+                    on_warning,
+                )
+                queue_s = time.monotonic() - start
+                _emit_queue(
+                    on_queue, "acquired",
+                    queue_s=queue_s, holder=os.getpid())
+                return True, "", queue_s
+            now = time.monotonic()
+            if not announced:
+                announced = True
+                _emit_queue(
+                    on_queue, "wait", holder=_read_holder_pid(path))
+                last_notice = now
+            if stop_check is not None and stop_check():
+                os.close(fd)
+                return False, "stopped", now - start
+            if now - last_notice >= notice:
+                _emit_queue(
+                    on_queue, "waiting",
+                    holder=_read_holder_pid(path), waited_s=now - start)
+                last_notice = now
+            if now >= deadline:
+                os.close(fd)
+                return False, "queue_timeout", now - start
+            pause(min(poll, max(0.0, deadline - now)))
+    except BaseException:
+        if key not in _HELD_LOCKS:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
 
 
 def release_grid_slot(
         path: str, pid: int | None = None, *, on_warning=None) -> None:
-    """Remove the slot only when it still names ``pid``.
+    """Drop the OS lock this process holds. A missing hold is a no-op.
 
-    Windows can refuse the delete while a waiter has the file open.
-    Retry for about 2 s, re-checking the pid before each attempt. A
-    remove that still fails is logged. It is not ignored.
+    ``pid`` is ignored: the lock is this process's fd, not a pid written
+    into the file. A failed unlock or a leftover sidecar is logged.
     """
-    import logging
+    del pid
+    key = os.path.abspath(path)
+    fd = _HELD_LOCKS.pop(key, None)
+    if fd is None:
+        return
+    try:
+        _unlock_fd(fd)
+    except OSError as exc:
+        _warn_slot(
+            f"grid slot release failed path={path} pid={os.getpid()} "
+            f"[{type(exc).__name__}] {exc}",
+            on_warning,
+        )
+    try:
+        os.close(fd)
+    except OSError as exc:
+        _warn_slot(
+            f"grid slot release failed path={path} pid={os.getpid()} "
+            f"[{type(exc).__name__}] {exc}",
+            on_warning,
+        )
+    sidecar = _sidecar_path(path)
+    try:
+        os.remove(sidecar)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _warn_slot(
+            f"grid slot sidecar cleanup failed path={sidecar} "
+            f"pid={os.getpid()} [{type(exc).__name__}] {exc}",
+            on_warning,
+        )
 
-    owner = os.getpid() if pid is None else int(pid)
-    deadline = time.monotonic() + 2.0
-    delay = 0.05
-    last_exc: BaseException | None = None
-    while True:
-        pids, _stamp = _read_slot(path)
-        if not pids or pids[0] != owner:
-            return
+
+def _locked_grid_child(
+        fn, job, conn, slot_path, wait_s, poll_s, notice_s, parent_pid):
+    """Child target. This process, not the parent, holds the host lock."""
+
+    def _on_queue(kind, **fields):
         try:
-            os.remove(path)
-            return
-        except OSError as exc:
-            last_exc = exc
-        now = time.monotonic()
-        if now >= deadline:
-            break
-        time.sleep(min(delay, max(0.0, deadline - now)))
-        delay = min(delay * 2, 0.5)
-    message = (
-        f"grid slot release failed path={path} pid={owner} "
-        f"[{type(last_exc).__name__ if last_exc is not None else 'OSError'}] "
-        f"{last_exc}"
-    )
-    logging.getLogger(__name__).warning("%s", message)
-    if on_warning is not None:
-        try:
-            on_warning(message)
+            conn.send(("slot", kind, dict(fields)))
         except Exception:
             pass
 
+    def _on_warning(message):
+        try:
+            conn.send(("slot_warn", str(message)))
+        except Exception:
+            pass
+
+    owned, qkind, queue_s = acquire_grid_slot(
+        slot_path,
+        wait_s=float(wait_s),
+        poll_s=float(poll_s),
+        notice_s=float(notice_s),
+        on_queue=_on_queue,
+        on_warning=_on_warning,
+        parent_pid=int(parent_pid) if parent_pid else None,
+    )
+    if not owned:
+        try:
+            conn.send((
+                "slot_done",
+                qkind or "queue_timeout",
+                float(queue_s),
+            ))
+        except Exception:
+            pass
+        return
+    try:
+        fn(job, conn)
+    finally:
+        release_grid_slot(slot_path, on_warning=_on_warning)
 
 def _stamp_failure(result, *, progress: str, elapsed_s: float, queue_s: float):
     if not isinstance(result, GridProcessFailure):
@@ -1260,57 +956,80 @@ def run_grid_isolated(
     patching this function. ``on_start`` is called with the child pid
     after spawn, or with None on the in-process path.
     """
+    del slot_stale_s  # the OS lock has no stale takeover
     fn = grid_child_entry if entry is None else entry
     path = default_slot_path() if slot_path is None else str(slot_path)
     wait_s = float(grid_queue_wait_s() if queue_timeout_s is None
                    else queue_timeout_s)
-    if slot_stale_s is None:
-        from src.evolution.notify import SLOT_STARTED_GUARD_S
-        stale_s = float(SLOT_STARTED_GUARD_S)
-    else:
-        stale_s = float(slot_stale_s)
-    owned, qkind, queue_s = acquire_grid_slot(
-        path,
-        stop_check=stop_check,
-        poll_s=slot_poll_s,
-        wait_s=wait_s,
-        stale_s=stale_s,
-        on_queue=on_queue,
-        notice_s=queue_notice_s,
-    )
-    if not owned:
-        detail = ("stop requested" if qkind == "stopped"
-                  else f"grid queue exceeded {wait_s:g}s; progress 0/0")
-        return GridProcessFailure(
-            qkind or "queue_timeout",
-            detail,
-            None,
-            progress="0/0",
-            elapsed_s=0.0,
-            queue_s=queue_s,
-        )
-    run_started = time.monotonic()
     # Spawn, not fork: the parent already owns Tk and COM.
     ctx = multiprocessing.get_context("spawn")
-    try:
-        return _run_grid_held(
-            job,
-            fn=fn,
-            timeout_s=float(timeout_s),
-            stall_s=float(stall_s),
+    if in_process:
+        # No child exists on this seam, so the caller holds the lock.
+        owned, qkind, queue_s = acquire_grid_slot(
+            path,
             stop_check=stop_check,
-            in_process=in_process,
-            poll_s=poll_s,
-            on_start=on_start,
-            on_progress=on_progress,
-            queue_s=queue_s,
-            run_started=run_started,
-            ctx=ctx,
-            slot_path=path,
+            poll_s=slot_poll_s,
+            wait_s=wait_s,
+            on_queue=on_queue,
+            notice_s=queue_notice_s,
             on_warning=on_release_warning,
         )
-    finally:
-        release_grid_slot(path, os.getpid(), on_warning=on_release_warning)
+        if not owned:
+            detail = ("stop requested" if qkind == "stopped"
+                      else f"grid queue exceeded {wait_s:g}s; progress 0/0")
+            return GridProcessFailure(
+                qkind or "queue_timeout",
+                detail,
+                None,
+                progress="0/0",
+                elapsed_s=0.0,
+                queue_s=queue_s,
+            )
+        try:
+            return _run_grid_held(
+                job,
+                fn=fn,
+                timeout_s=float(timeout_s),
+                stall_s=float(stall_s),
+                stop_check=stop_check,
+                in_process=True,
+                poll_s=poll_s,
+                on_start=on_start,
+                on_progress=on_progress,
+                queue_s=queue_s,
+                run_started=time.monotonic(),
+                ctx=ctx,
+                slot_path=path,
+                on_warning=on_release_warning,
+                on_queue=on_queue,
+                child_locks=False,
+                wait_s=wait_s,
+                slot_poll_s=slot_poll_s,
+                notice_s=queue_notice_s,
+            )
+        finally:
+            release_grid_slot(path, on_warning=on_release_warning)
+    return _run_grid_held(
+        job,
+        fn=fn,
+        timeout_s=float(timeout_s),
+        stall_s=float(stall_s),
+        stop_check=stop_check,
+        in_process=False,
+        poll_s=poll_s,
+        on_start=on_start,
+        on_progress=on_progress,
+        queue_s=0.0,
+        run_started=time.monotonic(),
+        ctx=ctx,
+        slot_path=path,
+        on_warning=on_release_warning,
+        on_queue=on_queue,
+        child_locks=True,
+        wait_s=wait_s,
+        slot_poll_s=slot_poll_s,
+        notice_s=queue_notice_s,
+    )
 
 
 def _run_grid_held(
@@ -1328,10 +1047,16 @@ def _run_grid_held(
         run_started: float,
         ctx,
         slot_path: str,
-        on_warning=None):
-    """The sweep after this process holds the slot. Clocks already run."""
+        on_warning=None,
+        on_queue=None,
+        child_locks: bool = False,
+        wait_s: float = 0.0,
+        slot_poll_s: float = GRID_SLOT_POLL_S,
+        notice_s: float = 600.0):
+    """Run the sweep. The child holds the OS lock unless in-process."""
     done = 0
     total = 0
+    acquired = not child_locks
     last_progress_at = run_started
 
     def _progress() -> str:
@@ -1373,8 +1098,19 @@ def _run_grid_held(
         return _stamp(result)
 
     recv_conn, send_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(
-        target=fn, args=(job, send_conn), daemon=True, name="evo-grid")
+    if child_locks:
+        proc = ctx.Process(
+            target=_locked_grid_child,
+            args=(
+                fn, job, send_conn, slot_path, float(wait_s),
+                float(slot_poll_s), float(notice_s), os.getpid(),
+            ),
+            daemon=True,
+            name="evo-grid",
+        )
+    else:
+        proc = ctx.Process(
+            target=fn, args=(job, send_conn), daemon=True, name="evo-grid")
     send_closed = False
 
     def _drain_buffered():
@@ -1388,14 +1124,67 @@ def _run_grid_held(
         for _ in range(10000):
             kind, message = _poll_message(recv_conn, 0.0)
             if kind == "msg":
-                if _is_progress(message):
-                    _note(message)
+                action = _apply(message)
+                if action == "continue":
                     continue
+                if isinstance(action, GridProcessFailure):
+                    return action
                 return _decode_message(proc, message)
             if kind == "err":
                 return _pipe_failed(proc, message)
             return None
         return None
+
+    def _apply(message):
+        """Consume progress and slot messages. ``result`` means finish."""
+        nonlocal queue_s, run_started, last_progress_at, acquired
+        if _is_progress(message):
+            _note(message)
+            return "continue"
+        if not isinstance(message, tuple) or not message:
+            return "result"
+        tag = message[0]
+        if tag == "slot_warn":
+            if on_warning is not None and len(message) > 1:
+                try:
+                    on_warning(message[1])
+                except Exception:
+                    pass
+            return "continue"
+        if tag == "slot_done":
+            qkind = message[1] if len(message) > 1 else "queue_timeout"
+            try:
+                q_s = float(message[2]) if len(message) > 2 else 0.0
+            except (TypeError, ValueError):
+                q_s = 0.0
+            queue_s = q_s
+            detail = ("stop requested" if qkind == "stopped"
+                      else f"grid queue exceeded {float(wait_s):g}s; "
+                           "progress 0/0")
+            return GridProcessFailure(
+                qkind or "queue_timeout", detail, proc.pid,
+                progress="0/0", elapsed_s=0.0, queue_s=q_s)
+        if tag == "slot":
+            kind_name = message[1] if len(message) > 1 else ""
+            fields = message[2] if len(message) > 2 and isinstance(
+                message[2], dict) else {}
+            if on_queue is not None:
+                try:
+                    on_queue(kind_name, **fields)
+                except Exception:
+                    pass
+            if kind_name == "acquired" and not acquired:
+                acquired = True
+                try:
+                    queue_s = float(fields.get("queue_s") or 0.0)
+                except (TypeError, ValueError):
+                    queue_s = 0.0
+                run_started = time.monotonic()
+                last_progress_at = run_started
+                if on_start is not None:
+                    on_start(proc.pid)
+            return "continue"
+        return "result"
 
     try:
         try:
@@ -1405,19 +1194,14 @@ def _run_grid_held(
                 "crash",
                 f"could not start grid child: {type(exc).__name__}: {exc}",
                 proc.pid))
-        if proc.pid:
-            _record_child_pid(
-                slot_path, proc.pid, on_warning=on_warning)
-        if on_start is not None:
-            on_start(proc.pid)
         try:
             send_conn.close()
             send_closed = True
         except Exception:
             pass
-        # Clocks started at acquire, before spawn, so a slow start
-        # counts against the stall and the overall cap.
-        deadline = run_started + float(timeout_s)
+        # Stall and the grid cap start when the child takes the lock.
+        # Until then the only cap is the queue wait.
+        queue_deadline = time.monotonic() + float(wait_s)
         poll = 0.05 if not poll_s or poll_s <= 0 else float(poll_s)
         while True:
             # STOP wins over a payload that has not been read yet, same
@@ -1427,6 +1211,10 @@ def _run_grid_held(
                 return _stamp(GridProcessFailure(
                     "stopped", "stop requested", proc.pid))
             now = time.monotonic()
+            if acquired:
+                deadline = run_started + float(timeout_s)
+            else:
+                deadline = queue_deadline
             if now >= deadline:
                 # A finished ok that is already buffered still counts.
                 # Progress does not extend the cap. Anything not yet a
@@ -1435,18 +1223,30 @@ def _run_grid_held(
                 if found is not None:
                     return _stamp(found)
                 _terminate(proc)
+                if not acquired:
+                    return _stamp(GridProcessFailure(
+                        "queue_timeout",
+                        f"grid queue exceeded {float(wait_s):g}s; "
+                        "progress 0/0",
+                        proc.pid,
+                        progress="0/0",
+                        queue_s=max(0.0, now - (queue_deadline - float(wait_s))),
+                    ))
                 return _stamp(GridProcessFailure(
                     "timeout",
                     f"grid child exceeded {float(timeout_s):g}s; "
                     f"progress {_progress()}",
                     proc.pid,
                     progress=_progress()))
-            if stall_s > 0 and (now - last_progress_at) >= float(stall_s):
+            if (acquired and stall_s > 0
+                    and (now - last_progress_at) >= float(stall_s)):
                 kind, message = _poll_message(recv_conn, 0.0)
                 if kind == "msg":
-                    if _is_progress(message):
-                        _note(message)
+                    action = _apply(message)
+                    if action == "continue":
                         continue
+                    if isinstance(action, GridProcessFailure):
+                        return _stamp(action)
                     return _stamp(_decode_message(proc, message))
                 if kind == "err":
                     return _stamp(_pipe_failed(proc, message))
@@ -1463,15 +1263,18 @@ def _run_grid_held(
                     proc.pid,
                     progress=_progress()))
             remaining = deadline - now
-            until_stall = (
-                float(stall_s) - (now - last_progress_at)
-                if stall_s > 0 else remaining)
+            if acquired and stall_s > 0:
+                until_stall = float(stall_s) - (now - last_progress_at)
+            else:
+                until_stall = remaining
             slice_s = min(poll, remaining, max(0.0, until_stall))
             kind, message = _poll_message(recv_conn, slice_s)
             if kind == "msg":
-                if _is_progress(message):
-                    _note(message)
+                action = _apply(message)
+                if action == "continue":
                     continue
+                if isinstance(action, GridProcessFailure):
+                    return _stamp(action)
                 return _stamp(_decode_message(proc, message))
             if kind == "err":
                 return _stamp(_pipe_failed(proc, message))
