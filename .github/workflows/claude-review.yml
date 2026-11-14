@@ -131,6 +131,16 @@ jobs:
             Also check: tests would fail against the old code (not vacuous),
             no hardcoded Discord channel/role IDs or credentials, no real user IDs in tests.
 
+            Flag designs that keep adding special cases, fallbacks, or
+            per-scenario branches, especially when a PR grows these over
+            review rounds. Suggest a simpler single rule that covers them
+            (for example, use X when valid, otherwise the existing safe
+            behavior). P2 when that complexity creates untested interactions,
+            otherwise P3. Handle an edge case with its own branch only when
+            real logs, data, or an incident show it has occurred. A
+            hypothetical edge case with no real-data evidence is a follow-up,
+            not P2.
+
             Severity:
             - P1: can lose money, send a wrong/duplicate order, or crash/hang a live bot
             - P2: wrong behaviour or state with a realistic trigger
