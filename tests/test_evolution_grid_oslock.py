@@ -595,6 +595,67 @@ def test_silent_spawn_hits_the_pre_slot_deadline(tmp_path, monkeypatch):
     assert result.kind == "timeout", result
 
 
+def test_silent_longer_than_stall_is_timeout(tmp_path, monkeypatch):
+    """A spawn that stays silent past stall_s is a timeout.
+
+    The 120 s floor is lowered to 0 so a small stall_s is the bound.
+    Production still uses max(120 s, stall_s).
+    """
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_grid_process import _job
+
+    if hasattr(gp, "PRE_SLOT_EVENT_FLOOR_S"):
+        monkeypatch.setattr(gp, "PRE_SLOT_EVENT_FLOOR_S", 0.0)
+    _delay_spawn(monkeypatch, 1.5)
+    slot = str(tmp_path / "evo_grid.slot")
+    result = gp.run_grid_isolated(
+        _job(mode="sleep", burn_seconds=0.1),
+        timeout_s=10,
+        stall_s=0.4,
+        entry=gp.burn_child_entry,
+        slot_path=slot,
+        poll_s=0.05,
+        slot_poll_s=0.05,
+        queue_timeout_s=30,
+    )
+    assert isinstance(result, gp.GridProcessFailure), result
+    assert result.kind == "timeout", result
+
+
+def test_queued_past_stall_is_not_cut_by_the_pre_slot_deadline(
+        tmp_path, monkeypatch):
+    """After the first slot event, stall_s does not end the queue wait."""
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_grid_process import _job
+
+    if hasattr(gp, "PRE_SLOT_EVENT_FLOOR_S"):
+        monkeypatch.setattr(gp, "PRE_SLOT_EVENT_FLOOR_S", 0.0)
+    slot = str(tmp_path / "evo_grid.slot")
+    owned, _kind, _q = gp.acquire_grid_slot(slot, wait_s=2, poll_s=0.05)
+    assert owned
+    holder = {}
+
+    def _release():
+        time.sleep(1.2)
+        gp.release_grid_slot(slot)
+
+    threading.Thread(target=_release, daemon=True).start()
+    try:
+        holder["result"] = gp.run_grid_isolated(
+            _job(mode="sleep", burn_seconds=0.1),
+            timeout_s=10,
+            stall_s=0.4,
+            entry=gp.burn_child_entry,
+            slot_path=slot,
+            poll_s=0.05,
+            slot_poll_s=0.05,
+            queue_timeout_s=5,
+        )
+    finally:
+        gp.release_grid_slot(slot)
+    assert not isinstance(holder["result"], gp.GridProcessFailure), holder["result"]
+
+
 def test_child_self_timeout_is_a_timeout(tmp_path, monkeypatch):
     """The child's own limit is a timeout, not a crash."""
     import src.evolution.grid_process as gp

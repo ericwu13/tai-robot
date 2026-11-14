@@ -93,21 +93,27 @@ def grid_queue_wait_s() -> int:
     return GRID_QUEUE_FACTOR * GRID_TIMEOUT_CAP_S
 
 
-def pre_slot_event_deadline_s(queue_timeout_s: float) -> float:
+# Spawn plus import only. The queue clock is a separate clock that
+# starts at the first slot event. Default stall_s is 600, so the
+# production bound is 600 s.
+PRE_SLOT_EVENT_FLOOR_S = 120.0
+
+
+def pre_slot_event_deadline_s(stall_s: float) -> float:
     """How long a silent spawn may run before its first slot event.
 
-    ``max(120 s, queue wait + 60 s)``. A slow Windows EXE spawn or
-    import fits under the floor. The clock starts at ``proc.start``
-    and the first slot message clears it. A child that dies with no
-    slot event is still an eof/crash.
+    ``max(120 s, stall_s)``. This covers spawn plus import only. The
+    queue clock starts at the first slot event and is not this bound.
+    The clock starts at ``proc.start`` and the first slot message
+    clears it. A child that dies with no slot event is still an eof/crash.
     """
     try:
-        wait = float(queue_timeout_s)
+        stall = float(stall_s)
     except (TypeError, ValueError):
-        wait = 0.0
-    if wait < 0:
-        wait = 0.0
-    return max(120.0, wait + 60.0)
+        stall = float(DEFAULT_GRID_STALL_S)
+    if stall < 0:
+        stall = 0.0
+    return max(PRE_SLOT_EVENT_FLOOR_S, stall)
 
 
 def child_run_limit_s(timeout_s: float) -> float:
@@ -1393,11 +1399,12 @@ def _run_grid_held(
         # Stall and the grid cap start when the child takes the lock.
         # The queue cap starts at the child's first slot event, not at
         # proc.start(), so a slow spawn does not consume the wait.
-        # A separate pre-event cap, max(120 s, queue wait + 60 s),
-        # starts at spawn and is cleared by that first event. A dead
-        # child with no slot event is still an eof/crash.
+        # A separate pre-event cap, max(120 s, stall_s), starts at
+        # spawn and is cleared by that first event. It covers spawn
+        # plus import only. A dead child with no slot event is still
+        # an eof/crash.
         queue_deadline = None
-        pre_event_limit = float(pre_slot_event_deadline_s(wait_s))
+        pre_event_limit = float(pre_slot_event_deadline_s(stall_s))
         pre_event_deadline = time.monotonic() + pre_event_limit
         poll = 0.05 if not poll_s or poll_s <= 0 else float(poll_s)
         while True:
