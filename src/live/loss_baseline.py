@@ -5,11 +5,13 @@ not Capital's full account net. Capital itself rebases the next morning
 (~05:20–05:38 TPE). This module detects that batch and holds the gated
 figure through the all-zero and f22-first interim reads.
 
-A night and the next calendar day's session share that budget. When the
-day session is more than one calendar day later (a weekend, or a gap
-with no session — plain date arithmetic, no holiday calendar), that day
-gets its own budget from the last settled read in 08:30–08:45. Field
-f37 (expiry settlement) is not read.
+A night and the next calendar day's session share that budget. When
+every calendar day strictly between that night and the day session is a
+known TAIFEX closure (weekend or holiday), that day gets its own budget
+from the last settled read in 08:30–08:45. A skipped trading day, or a
+day whose calendar is unknown, does not. The gate is then the stricter
+of the held figure and the account net. Field f37 (expiry settlement)
+is not read.
 
 No Tk, no COM. The app calls :meth:`DailyLossBaseline.observe` with the
 parsed rights dict and ``_taipei_now()``.
@@ -17,12 +19,13 @@ parsed rights dict and ``_taipei_now()``.
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from src.live.main_heartbeat import atomic_write_json
 from src.live.trading_guard import trading_day_key
@@ -108,21 +111,64 @@ def _in_day_open_window(now: datetime) -> bool:
     return _DAY_LO <= minute < _DAY_HI
 
 
-def _is_taifex_trading_day(now: datetime) -> bool:
-    """Weekday that TAIFEX is open. Weekends never qualify.
+class _Cal(enum.Enum):
+    TRADING = "trading"
+    CLOSED = "closed"
+    UNKNOWN = "unknown"
 
-    Uses :func:`src.market_data.holidays.is_taifex_holiday`. If that lookup
-    raises, fall back to the weekday check so a Sunday read still cannot
-    open Monday's budget.
+
+def _day_status(day: date) -> _Cal:
+    """Trading, known closure, or unknown.
+
+    Weekends are closed without the calendar. A weekday is unknown when
+    the holiday lookup raises, the year's holiday set is empty, or
+    ``holiday_calendar_health`` is false. Unknown is not closed and not
+    open: no commit, no roll, and no separate budget.
     """
-    day = _as_tpe(now).date()
     if day.weekday() >= 5:
-        return False
+        return _Cal.CLOSED
     try:
-        from ..market_data.holidays import is_taifex_holiday
-        return not is_taifex_holiday(day)
+        from ..market_data.holidays import (
+            _tw_public_holidays,
+            holiday_calendar_health,
+            is_taifex_holiday,
+        )
+        ok, _detail = holiday_calendar_health(day.year)
+        days = _tw_public_holidays(day.year)
+        if (not ok) or not days:
+            return _Cal.UNKNOWN
+        return _Cal.CLOSED if is_taifex_holiday(day) else _Cal.TRADING
     except Exception:
-        return True
+        return _Cal.UNKNOWN
+
+
+def _day_status_of_key(key: str) -> _Cal:
+    try:
+        return _day_status(datetime.fromisoformat(key).date())
+    except (TypeError, ValueError):
+        return _Cal.UNKNOWN
+
+
+def _gap_between(night: date, today: date) -> str:
+    """How the days strictly between two dates look.
+
+    ``none`` when the span is not a gap. ``closed`` when every day in
+    between is a known TAIFEX closure. ``trading`` when any of them is a
+    known session. ``unknown`` when none of them is a known session but
+    at least one calendar is unknown.
+    """
+    if not (today - night).days > 1:
+        return "none"
+    saw_unknown = False
+    day = night + timedelta(days=1)
+    while day < today:
+        status = _day_status(day)
+        if status == _Cal.TRADING:
+            return "trading"
+        if status == _Cal.UNKNOWN:
+            saw_unknown = True
+        day += timedelta(days=1)
+    return "unknown" if saw_unknown else "closed"
 
 
 @dataclass(frozen=True)
@@ -211,6 +257,7 @@ class DailyLossBaseline:
         self._account_net = 0
         self._pending_notice: str | None = None
         self._failsafe_logged_key = ""
+        self._unknown_noted: set[str] = set()
         self._last_candidate_mono = -1e9
         self._clear_day_budget()
 
@@ -242,10 +289,15 @@ class DailyLossBaseline:
             if previous != snap.material():
                 dirty = True
 
+        if _day_status(now.date()) == _Cal.UNKNOWN:
+            self._note_unknown(now.date().isoformat())
         if key != self.day_key:
-            self._roll(key, now, fee, equity)
-            dirty = True
-            force = True
+            if _day_status_of_key(key) == _Cal.UNKNOWN:
+                self._note_unknown(key)
+            else:
+                self._roll(key, now, fee, equity)
+                dirty = True
+                force = True
 
         # Sticky for this key. A settled reset must not fire again on the
         # next poll just because f22 still differs from the pre-batch value.
@@ -262,7 +314,7 @@ class DailyLossBaseline:
 
         held = False
         just_settled = False
-        if self._reset_open() and self._can_settle(now, fee):
+        if self._reset_open() and self._can_settle(now, fee, equity):
             self.capital_reset["settled"] = True
             just_settled = True
             dirty = True
@@ -291,6 +343,10 @@ class DailyLossBaseline:
                         loss = int(held_loss)
                     else:
                         loss = min(loss, int(held_loss))
+        if self._uncertain(now):
+            loss = min(loss, account)
+            if self.last_l is not None:
+                loss = min(loss, int(self.last_l))
         self.last_l = loss
         if dirty:
             self._persist(candidate_only=dirty and not force)
@@ -338,14 +394,22 @@ class DailyLossBaseline:
     # ── roll / reset ──────────────────────────────────────────────────
 
     def _roll(self, key: str, now: datetime, fee: int, equity: str) -> None:
-        if self.day_key and _is_weekend(key):
+        status = _day_status_of_key(key)
+        # A non-trading key (weekend or weekday holiday) carries the last
+        # trading night. No commit and no failsafe, and night_date stays.
+        if self.day_key and status == _Cal.CLOSED:
             self._carry(key)
             return
-        # A read before the night open, more than a day after the night
-        # this baseline belongs to: a skipped session (weekend already
-        # carried, or a holiday by date arithmetic). Keep the night.
+        # Before the night open, a real closure gap keeps the night so the
+        # day budget can still open on the next trading morning.
         if (self.day_key and _minutes(now) < _NIGHT_OPEN
                 and self._needs_day_budget(now)):
+            self._carry(key)
+            return
+        # A skipped trading day, or an unknown day in the span, is not a
+        # fresh night and not a failsafe. Keep the baseline.
+        if (self.day_key and _minutes(now) < _NIGHT_OPEN
+                and self._span(now) in ("trading", "unknown")):
             self._carry(key)
             return
         if self.candidate is not None and self.candidate.date == key:
@@ -355,7 +419,11 @@ class DailyLossBaseline:
 
     def _carry(self, key: str) -> None:
         self.day_key = key
-        if self.basis not in ("failsafe", "capital_reset", "day_open"):
+        # The next session's Capital batch has to be visible. A reset
+        # record carried over the gap would swallow it.
+        self.capital_reset = None
+        self._detected_at = None
+        if self.basis not in ("failsafe", "day_open"):
             self.basis = "carried"
 
     def _commit(self, snap: _Snap, key: str) -> None:
@@ -389,23 +457,43 @@ class DailyLossBaseline:
         self._clear_day_budget()
         self._announce_failsafe(key)
 
-    def _needs_day_budget(self, now: datetime) -> bool:
-        """Day session is more than one calendar day after the night."""
-        if not self.night_date:
-            return False
+    def _night(self) -> date | None:
         try:
-            night = datetime.fromisoformat(self.night_date).date()
-        except ValueError:
-            return False
-        return (now.date() - night).days > 1
+            return datetime.fromisoformat(self.night_date).date()
+        except (TypeError, ValueError):
+            return None
+
+    def _span(self, now: datetime) -> str:
+        night = self._night()
+        if night is None:
+            return "none"
+        return _gap_between(night, _as_tpe(now).date())
+
+    def _uncertain(self, now: datetime) -> bool:
+        """Missing calendar, or a trading day was skipped inside the span."""
+        if _day_status(_as_tpe(now).date()) == _Cal.UNKNOWN:
+            return True
+        return self._span(now) in ("trading", "unknown")
+
+    def _note_unknown(self, key: str) -> None:
+        if not key or key in self._unknown_noted:
+            return
+        self._unknown_noted.add(key)
+        logger.warning(
+            "[LOSS] holiday calendar unknown for %s; no separate budget",
+            key)
+
+    def _needs_day_budget(self, now: datetime) -> bool:
+        """A gap whose every intervening day is a known TAIFEX closure."""
+        return self._span(now) == "closed"
 
     def _consider_day_budget(self, now, realized, floating, fee, equity):
         """Return (opened_now, failsafe_recheck_now)."""
         if not self._needs_day_budget(now) or self.day_budget or self.day_failsafe:
             return False, False
-        # Weekend and holiday polls run every 30 s. They must not take
-        # B_day, open the day budget, or emit the missing-baseline note.
-        if not _is_taifex_trading_day(now):
+        # Weekend and holiday polls run every 30 s. An unknown weekday
+        # is not a session either: no B_day, no open, no missing-baseline note.
+        if _day_status(_as_tpe(now).date()) != _Cal.TRADING:
             return False, False
         waiting_on_window_reset = bool(
             isinstance(self.capital_reset, dict)
@@ -478,6 +566,8 @@ class DailyLossBaseline:
             "expect_fees": expect,
             "settled": False,
             "in_day_window": in_window,
+            "pre_max_fees": self.max_fees_seen,
+            "pre_f22": self.baseline_f22,
         }
         self._detected_at = now
         self.b_r = 0
@@ -486,9 +576,22 @@ class DailyLossBaseline:
         if in_window:
             self._has_day_baseline = False
 
-    def _can_settle(self, now: datetime, fee: int) -> bool:
+    def _rebase_confirmed(self, fee: int, equity: str) -> bool:
+        """f22 moved, or the fee total dropped and is still down."""
+        reset = self.capital_reset or {}
+        pre_f22 = str(reset.get("pre_f22") or "")
+        if equity and pre_f22 and equity != pre_f22:
+            return True
+        pre_max = reset.get("pre_max_fees")
+        if pre_max is None:
+            return False
+        return fee < int(pre_max)
+
+    def _can_settle(self, now: datetime, fee: int, equity: str) -> bool:
         reset = self.capital_reset or {}
         if fee < int(reset.get("expect_fees") or 0):
+            return False
+        if not self._rebase_confirmed(fee, equity):
             return False
         detected = self._detected_at
         if detected is None:
@@ -544,7 +647,10 @@ class DailyLossBaseline:
             if not self._restore_state(data, candidate):
                 return False
             night = self.night_date
-            if key and key != self.day_key:
+            # An unknown day is not rolled onto. A closure, including a
+            # weekend at or after 15:00, carries the way the live loop does.
+            if (_day_status(_as_tpe(now).date()) != _Cal.UNKNOWN
+                    and key and key != self.day_key):
                 self._carry(key)
                 self.night_date = night
             self._persist(candidate_only=False)
@@ -558,17 +664,26 @@ class DailyLossBaseline:
         return True
 
     def _should_restore_gap(self, data: dict, now: datetime) -> bool:
-        """File is the last night before a weekend or holiday gap."""
+        """Keep a saved night across a closure, including at or after 15:00.
+
+        A known trading day still restores before 15:00 when the file is
+        from an earlier night, so a Monday 07:00 restart can open the day
+        budget. At or after 15:00 on a trading day the file is stale.
+        """
         if data.get("day_budget") or data.get("day_failsafe"):
-            return False
-        if _minutes(now) >= _NIGHT_OPEN:
             return False
         night = str(data.get("night_date") or data.get("day_key") or "")
         try:
             night_d = datetime.fromisoformat(night).date()
         except ValueError:
             return False
-        return (now.date() - night_d).days > 1
+        today = _as_tpe(now).date()
+        status = _day_status(today)
+        if status in (_Cal.CLOSED, _Cal.UNKNOWN):
+            return True
+        if _minutes(now) >= _NIGHT_OPEN:
+            return False
+        return (today - night_d).days > 1
 
     def _restore_state(self, data: dict, candidate: _Snap | None) -> bool:
         baseline = data.get("baseline")
@@ -606,6 +721,8 @@ class DailyLossBaseline:
                 "expect_fees": 0 if expect is None else expect,
                 "settled": bool(reset.get("settled")),
                 "in_day_window": bool(reset.get("in_day_window")),
+                "pre_max_fees": _as_int(reset.get("pre_max_fees")),
+                "pre_f22": str(reset.get("pre_f22") or ""),
             }
             self._detected_at = detected
             if detected is None and not self.capital_reset["settled"]:
@@ -637,6 +754,8 @@ class DailyLossBaseline:
                 "expect_fees": self.capital_reset.get("expect_fees"),
                 "settled": bool(self.capital_reset.get("settled")),
                 "in_day_window": bool(self.capital_reset.get("in_day_window")),
+                "pre_max_fees": self.capital_reset.get("pre_max_fees"),
+                "pre_f22": self.capital_reset.get("pre_f22"),
             }
         return {
             "version": _VERSION,
@@ -693,13 +812,6 @@ class DailyLossBaseline:
             day_budget_opened=opened,
             day_failsafe_recheck=recheck,
         )
-
-
-def _is_weekend(key: str) -> bool:
-    try:
-        return datetime.fromisoformat(key).weekday() >= 5
-    except (TypeError, ValueError):
-        return False
 
 
 def _snap_from(raw, *, with_date: bool) -> _Snap | None:

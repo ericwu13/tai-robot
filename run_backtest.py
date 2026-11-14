@@ -12388,6 +12388,9 @@ class BacktestApp:
                     self._handle_loss_edges(
                         view, view.loss_today, view.day_key)
                 guard.roll_day(_tg.trading_day_key(now))
+                # roll_day and a settle recheck clear the guard flag.
+                # Write that back, or a restart re-pauses with no edge left.
+                self._sync_loss_pause_flag()
                 self.real_loss_limit_var.set("--")
         else:
             self.real_fees_var.set(d.fees)

@@ -821,9 +821,8 @@ def test_t17_gated_loss_is_never_looser_than_mark_to_market(tmp_path):
 
 # ── Q1: a gap longer than one calendar day gets its own day budget ────
 # Per Eric via Selina/TY. Friday night and Monday day are separate
-# 20,000 budgets. The same split applies to a holiday gap by date
-# arithmetic (no holiday calendar). A normal next calendar day stays
-# one budget.
+# 20,000 budgets. A gap budget opens only when every day in between is
+# a known TAIFEX closure. A normal next calendar day stays one budget.
 
 def _pnl(realized: int, fee: int, f1: int = 0, f22: str = "AAA") -> dict:
     """Rights whose realized net (f11 - f2 - f3) is ``realized``."""
@@ -923,21 +922,30 @@ def test_q1c_missing_monday_baseline_keeps_the_night_and_rechecks_once(tmp_path,
 
 
 def test_q1d_holiday_gap_gets_its_own_day_budget(tmp_path, monkeypatch):
-    """Wednesday night, no Thursday, Friday day. Plain date arithmetic."""
+    """Lunar New Year 2027. The closure days' 14:59 and 15:00 reads carry.
+
+    A skipped trading day does not get this budget; that case is the
+    outage test. These dates are real TAIFEX closures.
+    """
+    from datetime import date as _date
     app, clock, _tracker = _app_at(
-        monkeypatch, datetime(2026, 11, 11, 14, 59), limit=20000,
+        monkeypatch, datetime(2027, 2, 3, 14, 59), limit=20000,
         path=tmp_path / "loss_baseline.json")
     base = _pnl(-5000, 10, f22="AAA")
-    _drive(app, clock, datetime(2026, 11, 11, 14, 59), base)
-    _drive(app, clock, datetime(2026, 11, 11, 15, 0, 5), base)
-    _drive(app, clock, datetime(2026, 11, 12, 2, 0), _pnl(-12000, 30, f22="AAA"))
+    night = _pnl(-12000, 30, f22="AAA")
+    _drive(app, clock, datetime(2027, 2, 3, 14, 59), base)
+    _drive(app, clock, datetime(2027, 2, 3, 15, 0, 5), base)
+    _drive(app, clock, datetime(2027, 2, 4, 2, 0), night)
+    for day in (_date(2027, 2, d) for d in range(4, 11)):
+        _drive(app, clock, datetime(day.year, day.month, day.day, 14, 59), night)
+        _drive(app, clock, datetime(day.year, day.month, day.day, 15, 0, 5), night)
     reload = _pnl(-7000, 20, f22="BBB")
-    _drive(app, clock, datetime(2026, 11, 13, 5, 30), _pnl(0, 0, f22="AAA"))
-    _drive(app, clock, datetime(2026, 11, 13, 8, 35), reload)
+    _drive(app, clock, datetime(2027, 2, 11, 5, 30), _pnl(0, 0, f22="AAA"))
+    _drive(app, clock, datetime(2027, 2, 11, 8, 35), reload)
     assert app._trading_guard._last_net_pnl == -7000
-    _drive(app, clock, datetime(2026, 11, 13, 9, 0), reload)
+    _drive(app, clock, datetime(2027, 2, 11, 9, 0), reload)
     assert app._trading_guard._last_net_pnl == 0, app._trading_guard._last_net_pnl
-    _drive(app, clock, datetime(2026, 11, 13, 10, 0), _pnl(-9000, 25, f22="BBB"))
+    _drive(app, clock, datetime(2027, 2, 11, 10, 0), _pnl(-9000, 25, f22="BBB"))
     assert app._trading_guard._last_net_pnl == -2000, app._trading_guard._last_net_pnl
 
 
@@ -1186,3 +1194,276 @@ def test_f9_none_observe_clears_the_loss_view():
     app._loss_baseline = None
     assert app._observe_loss_baseline(datetime(2026, 11, 16, 10, 0)) is None
     assert app._loss_view is None
+
+
+# ── Holiday rolls, restarts, calendar, outage, rebase (post-1ccc6cb) ──
+
+def _afternoon(tr, day, raw):
+    """The live 30 s poll's 14:59 candidate and the 15:00 read."""
+    tr.observe(raw, datetime(day.year, day.month, day.day, 14, 59))
+    return tr.observe(raw, datetime(day.year, day.month, day.day, 15, 0, 5))
+
+
+def _q1a_night_then_holiday_afternoons(tr, commit_day, holiday_days, night):
+    base = _pnl(-5000, 10, f22="AAA")
+    tr.observe(base, datetime(commit_day.year, commit_day.month, commit_day.day, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(commit_day.year, commit_day.month, commit_day.day, 15, 0, 5))
+    nxt = commit_day + timedelta(days=1)
+    tr.observe(night, datetime(nxt.year, nxt.month, nxt.day, 2, 0))
+    for day in holiday_days:
+        _afternoon(tr, day, night)
+
+
+def test_weekday_holiday_1500_does_not_commit_a_profitable_night(tmp_path):
+    """Mon 2026-10-26 14:59 and 15:00 must not become the night.
+
+    Friday night +10,000. Tuesday 09:00 is 0, not +10,000.
+    """
+    from datetime import date as _date
+    tr = _tracker(tmp_path / "h26.json")
+    base = _pnl(0, 10, f22="AAA")
+    night = _pnl(10000, 30, f22="AAA")
+    tr.observe(base, datetime(2026, 10, 23, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 10, 23, 15, 0, 5))
+    tr.observe(night, datetime(2026, 10, 24, 2, 0))
+    _afternoon(tr, _date(2026, 10, 26), night)
+    assert tr.night_date == "2026-10-23", tr.night_date
+    post = _pnl(10000, 20, f22="BBB")
+    tr.observe(_pnl(0, 0, f22="AAA"), datetime(2026, 10, 27, 5, 22))
+    tr.observe(post, datetime(2026, 10, 27, 5, 36))
+    tr.observe(post, datetime(2026, 10, 27, 8, 35))
+    view = tr.observe(post, datetime(2026, 10, 27, 9, 0))
+    assert view.loss_today == 0, view.loss_today
+    assert view.loss_today <= view.account_net
+    assert tr.day_budget is True
+
+
+def test_2027_0301_holiday_then_tuesday_is_minus_3000(tmp_path):
+    """Peace Memorial Day observed. Tue 09:10 is -3,000, not -18,000."""
+    from datetime import date as _date
+    tr = _tracker(tmp_path / "0301.json")
+    night = _pnl(-20000, 30, f22="AAA")
+    _q1a_night_then_holiday_afternoons(
+        tr, _date(2027, 2, 26), [_date(2027, 3, 1)], night)
+    post = _pnl(-15000, 20, f22="BBB")
+    tr.observe(_pnl(0, 0, f22="AAA"), datetime(2027, 3, 2, 5, 22))
+    tr.observe(post, datetime(2027, 3, 2, 5, 36))
+    tr.observe(post, datetime(2027, 3, 2, 8, 35))
+    view = tr.observe(_pnl(-18000, 25, f22="BBB"), datetime(2027, 3, 2, 9, 10))
+    assert view.loss_today == -3000, view.loss_today
+    assert tr.day_budget is True
+
+
+def test_lunar_new_year_2027_opens_the_gap_budget(tmp_path):
+    """Thu 2027-02-11 is the first session after the new-year closure.
+
+    09:10 is -3,000. A multi-day holiday does get its own day budget.
+    """
+    from datetime import date as _date
+    tr = _tracker(tmp_path / "lny.json")
+    night = _pnl(-20000, 30, f22="AAA")
+    holidays = [_date(2027, 2, d) for d in range(4, 11)]
+    _q1a_night_then_holiday_afternoons(tr, _date(2027, 2, 3), holidays, night)
+    assert tr.night_date == "2027-02-03", tr.night_date
+    post = _pnl(-15000, 20, f22="BBB")
+    tr.observe(_pnl(0, 0, f22="AAA"), datetime(2027, 2, 11, 5, 22))
+    tr.observe(post, datetime(2027, 2, 11, 5, 36))
+    tr.observe(post, datetime(2027, 2, 11, 8, 35))
+    view = tr.observe(_pnl(-18000, 25, f22="BBB"), datetime(2027, 2, 11, 9, 10))
+    assert view.loss_today == -3000, view.loss_today
+    assert tr.day_budget is True
+
+
+def test_weekend_restart_after_1500_keeps_the_pause(tmp_path, monkeypatch):
+    """Friday B_r +10,000, night account -5,000. Sat 16:00 and Sun 16:00 stay paused."""
+    path = tmp_path / "fri-pause.json"
+    app, clock, tracker = _app_at(
+        monkeypatch, datetime(2026, 11, 13, 14, 59), limit=10000, path=path)
+    if tracker is None:
+        pytest.fail("no baseline")
+    base = _pnl(10000, 10, f22="AAA")
+    night = _pnl(-5000, 30, f22="AAA")
+    _drive(app, clock, datetime(2026, 11, 13, 14, 59), base)
+    _drive(app, clock, datetime(2026, 11, 13, 15, 0, 5), base)
+    _drive(app, clock, datetime(2026, 11, 14, 2, 0), night)
+    assert app._trading_guard._last_net_pnl == -15000
+    assert app._trading_guard.paused is True
+    tracker.save()
+
+    def _restart(when):
+        fresh, fresh_clock, _none = _app_at(
+            monkeypatch, when, limit=10000, path=None)
+        restored = _tracker(path)
+        restored.load(when)
+        fresh._loss_baseline = restored
+        _drive(fresh, fresh_clock, when, night)
+        return fresh._trading_guard
+
+    for when in (datetime(2026, 11, 14, 16, 0), datetime(2026, 11, 15, 16, 0)):
+        guard = _restart(when)
+        assert guard._last_net_pnl == -15000, (when, guard._last_net_pnl)
+        assert guard.paused is True
+
+
+def _monday_after_sunday_load(path, monkeypatch, load_at):
+    """Load Friday's Q1a file at ``load_at`` and run Monday through 09:10."""
+    fresh, clock, _none = _app_at(
+        monkeypatch, load_at, limit=20000, path=None)
+    restored = _tracker(path)
+    restored.load(load_at)
+    fresh._loss_baseline = restored
+    night = _pnl(-20000, 30, f22="AAA")
+    _drive(fresh, clock, load_at, night)
+    post = _pnl(-15000, 20, f22="BBB")
+    _drive(fresh, clock, datetime(2026, 11, 16, 5, 22), _pnl(0, 0, f22="AAA"))
+    _drive(fresh, clock, datetime(2026, 11, 16, 5, 36), post)
+    _drive(fresh, clock, datetime(2026, 11, 16, 8, 35), post)
+    _drive(fresh, clock, datetime(2026, 11, 16, 9, 10), _pnl(-18000, 25, f22="BBB"))
+    return fresh._trading_guard._last_net_pnl
+
+
+def test_sunday_1600_restart_and_deploy_open_mondays_budget(tmp_path, monkeypatch):
+    """A Sunday 16:00 load of Friday's file. Mon 09:10 is -3,000, not -18,000."""
+    path = tmp_path / "sun.json"
+    early = _tracker(path)
+    base = _pnl(-5000, 10, f22="AAA")
+    night = _pnl(-20000, 30, f22="AAA")
+    early.observe(base, datetime(2026, 11, 13, 14, 59))
+    early.consume_failsafe_notice()
+    early.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    early.observe(night, datetime(2026, 11, 14, 2, 0))
+    early.pause_failsafe = True
+    early.save()
+    sunday = datetime(2026, 11, 15, 16, 0)
+    assert _monday_after_sunday_load(path, monkeypatch, sunday) == -3000
+    # A second process is a fresh deploy of the same Friday file.
+    assert _monday_after_sunday_load(path, monkeypatch, sunday) == -3000
+
+
+def test_empty_or_raising_calendar_is_not_looser_than_the_account(tmp_path, monkeypatch, caplog):
+    """Unknown weekdays open no budget. A loss must not print as 0."""
+    import logging
+    from datetime import date as _date
+    import src.market_data.holidays as hol
+
+    def _friday(path, night_row):
+        tr = _tracker(path)
+        base = _pnl(0, 10, f22="AAA")
+        tr.observe(base, datetime(2026, 10, 23, 14, 59))
+        tr.consume_failsafe_notice()
+        tr.observe(base, datetime(2026, 10, 23, 15, 0, 5))
+        tr.observe(night_row, datetime(2026, 10, 24, 2, 0))
+        return tr
+
+    down = _pnl(-20000, 30, f22="AAA")
+    up = _pnl(10000, 30, f22="AAA")
+    # Friday is seeded on a working calendar. The break applies only after.
+    seeded = {
+        "empty": _friday(tmp_path / "empty.json", down),
+        "empty-up": _friday(tmp_path / "empty-up.json", up),
+        "raises": _friday(tmp_path / "raises.json", down),
+        "raises-up": _friday(tmp_path / "raises-up.json", up),
+    }
+
+    def _check(label, tr, profit):
+        if profit:
+            _afternoon(tr, _date(2026, 10, 26), up)
+            held = tr.observe(up, datetime(2026, 10, 27, 9, 0))
+            assert held.loss_today <= held.account_net, (label, held.loss_today)
+            assert tr.day_budget is False
+            assert tr.night_date == "2026-10-23"
+            return
+        tr.observe(down, datetime(2026, 10, 26, 8, 35))
+        view = tr.observe(down, datetime(2026, 10, 26, 8, 46))
+        assert tr.day_budget is False
+        assert view.loss_today <= view.account_net
+        assert view.loss_today == -20000, (label, view.loss_today)
+
+    monkeypatch.setattr(hol, "_tw_public_holidays", lambda year: frozenset())
+    monkeypatch.setattr(hol, "holiday_calendar_health", lambda year=None: (False, "empty"))
+    with caplog.at_level(logging.WARNING):
+        _check("empty", seeded["empty"], False)
+        _check("empty-up", seeded["empty-up"], True)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("calendar down")
+
+    monkeypatch.setattr(hol, "is_taifex_holiday", _boom)
+    monkeypatch.setattr(hol, "holiday_calendar_health", _boom)
+    monkeypatch.setattr(hol, "_tw_public_holidays", _boom)
+    with caplog.at_level(logging.WARNING):
+        _check("raises", seeded["raises"], False)
+        _check("raises-up", seeded["raises-up"], True)
+    unknown = [rec for rec in caplog.records if "calendar unknown" in rec.message]
+    assert unknown, "no calendar-unknown warning"
+
+
+def test_outage_across_a_trading_day_stays_at_master(tmp_path):
+    """Thu file, down Fri 11:00, back Sat 15:30 or Mon 07:00. Mon 09:00 is -8,000."""
+    def _finish(tr):
+        row = _pnl(-8000, 10, f22="AAA")
+        tr.observe(row, datetime(2026, 11, 16, 8, 35))
+        view = tr.observe(row, datetime(2026, 11, 16, 9, 0))
+        assert view.loss_today == -8000, view.loss_today
+        assert view.account_net == -8000
+        assert tr.day_budget is False
+
+    base = _pnl(0, 10, f22="AAA")
+    lost = _pnl(-8000, 10, f22="AAA")
+    sat = _tracker(tmp_path / "sat.json")
+    sat.observe(base, datetime(2026, 11, 12, 14, 59))
+    sat.consume_failsafe_notice()
+    sat.observe(base, datetime(2026, 11, 12, 15, 0, 5))
+    sat.observe(lost, datetime(2026, 11, 13, 11, 0))
+    sat.observe(lost, datetime(2026, 11, 14, 15, 30))
+    _finish(sat)
+
+    mon = _tracker(tmp_path / "mon.json")
+    mon.observe(base, datetime(2026, 11, 12, 14, 59))
+    mon.consume_failsafe_notice()
+    mon.observe(base, datetime(2026, 11, 12, 15, 0, 5))
+    mon.observe(lost, datetime(2026, 11, 13, 11, 0))
+    mon.observe(lost, datetime(2026, 11, 16, 7, 0))
+    _finish(mon)
+
+
+def test_settle_without_a_rebase_keeps_the_held_loss(tmp_path):
+    """A 2-minute fee blip is not a Capital rebase. The gate stays at the held 0."""
+    tr = _tracker(tmp_path / "blip.json")
+    base = _pnl(15000, 100, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 12, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 12, 15, 0, 5))
+    # Same session, fees drop to 0, R is still the pre-batch +15,000.
+    blip = _pnl(15000, 0, f22="AAA")
+    held = tr.observe(blip, datetime(2026, 11, 12, 16, 0))
+    assert held.loss_today == 0, held.loss_today
+    recovered = tr.observe(base, datetime(2026, 11, 12, 16, 2))
+    assert recovered.loss_today == 0, recovered.loss_today
+    assert recovered.loss_today <= recovered.account_net
+    assert tr._reset_open()
+
+
+def test_gap_carry_clears_the_reset_so_the_next_batch_is_detected(tmp_path):
+    tr = _tracker(tmp_path / "carry-reset.json")
+    base = _pnl(-5000, 10, f22="AAA")
+    night = _pnl(-20000, 30, f22="AAA")
+    tr.observe(base, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(base, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(night, datetime(2026, 11, 14, 2, 0))
+    tr.capital_reset = {
+        "detected_at": "2026-11-13T05:22:00+08:00",
+        "l_pre": -15000,
+        "expect_fees": 10,
+        "settled": True,
+        "in_day_window": False,
+    }
+    tr.observe(night, datetime(2026, 11, 14, 15, 1))
+    assert tr.capital_reset is None
+    post = _pnl(-15000, 20, f22="BBB")
+    view = tr.observe(post, datetime(2026, 11, 16, 5, 36))
+    assert view.basis == "capital_reset", view.basis
+    assert tr.b_r == 0
