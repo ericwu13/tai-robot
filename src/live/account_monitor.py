@@ -101,6 +101,7 @@ def parse_future_rights(bstr: str) -> dict | None:
             "equity": vals[6].strip(),          # 權益數
             "excess_margin": vals[7].strip(),   # 超額保證金
             "realized_pnl": vals[11].strip(),   # 期貨平倉損益
+            "start_equity": vals[22].strip(),   # f22, equity at the window open
             "unrealized": vals[12].strip(),     # 盤中未實現
             "orig_margin": vals[13].strip(),    # 原始保證金
             "maint_margin": vals[14].strip(),   # 維持保證金

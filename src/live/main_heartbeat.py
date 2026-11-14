@@ -311,8 +311,11 @@ def _copy_heartbeat(payload: dict) -> dict:
     if isinstance(link, dict):
         copied["link"] = dict(link)
     # Same loss-guard fields as the file. The link snapshot is untouched.
-    for key in ("loss_paused", "loss_net", "loss_limit"):
+    for key in ("loss_paused", "loss_net", "loss_limit", "loss_account_net"):
         if key in payload:
+            copied[key] = payload[key]
+    for key in ("loss_day", "loss_basis"):
+        if isinstance(payload.get(key), str):
             copied[key] = payload[key]
     return copied
 
@@ -391,6 +394,13 @@ class HeartbeatWriter:
             payload["loss_paused"] = bool(loss.get("loss_paused"))
             payload["loss_net"] = _loss_number(loss.get("loss_net"))
             payload["loss_limit"] = _loss_number(loss.get("loss_limit"))
+            if "loss_account_net" in loss:
+                payload["loss_account_net"] = _loss_number(
+                    loss.get("loss_account_net"))
+            if isinstance(loss.get("loss_day"), str):
+                payload["loss_day"] = loss["loss_day"]
+            if isinstance(loss.get("loss_basis"), str):
+                payload["loss_basis"] = loss["loss_basis"]
         atomic_write_json(self.path, payload)
         _publish_snapshot(self.path, payload)
 
@@ -1053,8 +1063,10 @@ def set_loss_state(state: dict | None) -> None:
     """Publish the loss-guard snapshot on the next heartbeat write.
 
     ``loss_paused``, ``loss_net`` and ``loss_limit`` are top-level keys.
-    They are not link-machine fields. ``None`` leaves them off the file,
-    which is the pre-#234 payload. The watchdog ignores them.
+    When the caller has a daily baseline, ``loss_net`` is today's gated
+    loss and ``loss_account_net`` / ``loss_day`` / ``loss_basis`` ride
+    along. They are not link-machine fields. ``None`` leaves them off
+    the file, which is the pre-#234 payload. The watchdog ignores them.
     """
     writer = _writer
     if writer is None:
@@ -1062,11 +1074,18 @@ def set_loss_state(state: dict | None) -> None:
     if state is None:
         writer.loss_state = None
         return
-    writer.loss_state = {
+    stored = {
         "loss_paused": bool(state.get("loss_paused")),
         "loss_net": _loss_number(state.get("loss_net")),
         "loss_limit": _loss_number(state.get("loss_limit")),
     }
+    if "loss_account_net" in state:
+        stored["loss_account_net"] = _loss_number(state.get("loss_account_net"))
+    if isinstance(state.get("loss_day"), str):
+        stored["loss_day"] = state["loss_day"]
+    if isinstance(state.get("loss_basis"), str):
+        stored["loss_basis"] = state["loss_basis"]
+    writer.loss_state = stored
 
 
 def tick() -> None:
