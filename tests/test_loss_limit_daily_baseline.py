@@ -1847,8 +1847,8 @@ def test_k11b_process_up_through_1500_stays_flat_after_the_reload(tmp_path, monk
         assert g.paused is False, when
 
 
-def test_k12_unknown_today_is_account_minus_b_c(tmp_path, monkeypatch):
-    """Unknown today subtracts B_c and not B_r, even when adopt did not run."""
+def test_k12_unknown_today_is_the_account(tmp_path, monkeypatch):
+    """Unknown today is master's account net (no B_r, no B_c), even when adopt did not run."""
     tr = _tracker(tmp_path / "k12.json")
     tr.day_key = "2026-11-10"
     tr.night_date = "2026-11-10"
@@ -1859,11 +1859,11 @@ def test_k12_unknown_today_is_account_minus_b_c(tmp_path, monkeypatch):
     v = tr.observe(
         _raw(5010, 10, 0, f1=4000, f22="AAA"), datetime(2026, 11, 11, 10, 0))
     assert tr.b_r == 5000
-    assert v.loss_today == v.account_net - 3000 == 6000, v.loss_today
+    assert v.loss_today == v.account_net == 9000, v.loss_today
 
 
 def test_k13_calendar_turns_unknown_mid_key(tmp_path, monkeypatch):
-    """B_r stays set when the calendar breaks without a key change. Gate is account - B_c."""
+    """B_r stays set when the calendar breaks without a key change. Gate is the account."""
     tr = _tracker(tmp_path / "k13.json")
     s = _raw(8010, 10, 0, f1=3000, f22="AAA")
     tr.observe(s, datetime(2026, 11, 10, 14, 59))
@@ -1873,7 +1873,7 @@ def test_k13_calendar_turns_unknown_mid_key(tmp_path, monkeypatch):
     _break_calendar(monkeypatch)
     v = tr.observe(s, datetime(2026, 11, 11, 10, 0))
     assert tr.b_r == 8000
-    assert v.loss_today == v.account_net - tr.b_c == 8000, v.loss_today
+    assert v.loss_today == v.account_net == 11000, v.loss_today
 
 
 def test_k3b_known_again_carries_no_leaked_b_r(tmp_path, monkeypatch):

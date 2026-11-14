@@ -326,9 +326,8 @@ class DailyLossBaseline:
         just_settled = False
         confirmed = self._reset_open() and self._rebase_confirmed(realized, equity)
         interim = realized == 0 and floating == 0 and fee == 0
-        # Unknown today is master's account net via _adopt_master_day
-        # zeroing B_r. Do not also zero here: that would hide a mutant
-        # that leaves B_r set.
+        # Unknown today gates on the account below. B_r is not zeroed
+        # here so k3b still sees whether _adopt_master_day zeroed it.
         if (confirmed and not self.day_budget
                 and _day_status(now.date()) != _Cal.UNKNOWN):
             # The reload is already visible. Stop subtracting B_r from
@@ -353,6 +352,15 @@ class DailyLossBaseline:
             dirty = True
             force = True
 
+        peak = self.capital_reset.get("pre_max_fees") if self._reset_open() else None
+        reloaded = confirmed and (peak is None or fee < int(peak))
+        if self._reset_open() and not reloaded and not interim:
+            # Last R before the completed reload, including a fill that
+            # landed in the f22-first gap.
+            if self.capital_reset.get("gap_r") != realized:
+                self.capital_reset["gap_r"] = realized
+                dirty = True
+                force = True
         today_unknown = _day_status(now.date()) == _Cal.UNKNOWN
         if self.day_budget:
             reset = self.capital_reset if isinstance(self.capital_reset, dict) else None
@@ -361,9 +369,14 @@ class DailyLossBaseline:
                     and self.day_taken_at < str(reset.get("detected_at") or "")):
                 # B_day was taken after this reload. Nothing to shift.
                 reset = None
-            if reset is not None and confirmed:
-                # One shift: drop the pre-batch part out of B_day.
-                self.day_b_r -= int(reset.get("pre_r") or 0) - realized
+            if reset is not None and reloaded:
+                # The completed reload drops fees below the pre-batch peak.
+                # A fill in the f22-first gap raises them, so it is not this.
+                # Shift by the last unconfirmed R so that fill stays today.
+                prev = reset.get("gap_r")
+                if prev is None:
+                    prev = int(reset.get("pre_r") or 0)
+                self.day_b_r -= prev - realized
                 reset["settled"] = True
                 just_settled = True
                 dirty = True
@@ -389,16 +402,13 @@ class DailyLossBaseline:
                         loss = int(held_loss)
                     else:
                         loss = min(loss, int(held_loss))
-                if not confirmed and not _off_session(now):
-                    # In session, never looser than the account net of B_c.
-                    loss = min(loss, account - self.b_c)
             if self._span(now) in ("trading", "unknown"):
                 # Skipped trading day: the account net, with no hold.
                 loss = account
                 held = False
         if today_unknown:
-            # Mid-key or after adopt: B_r is not part of the figure.
-            loss = account - self.b_c
+            # Master's figure, mid-key or after adopt.
+            loss = account
             held = False
         if (not self.day_budget
                 and not self._reset_open()
@@ -409,6 +419,10 @@ class DailyLossBaseline:
             # A carried closure keeps the stricter held loss. A skipped
             # trading day and an unknown calendar do not.
             loss = min(loss, int(self.last_l))
+        if interim:
+            # Capital's all-zero row reads 0. A held profit must not
+            # come out looser than that.
+            loss = min(loss, 0)
         self._last_realized = realized
         self.last_l = loss
         if dirty:
@@ -669,15 +683,17 @@ class DailyLossBaseline:
 
     def _can_settle(self, now: datetime, realized: int, fee: int, equity: str) -> bool:
         reset = self.capital_reset or {}
-        if fee < int(reset.get("expect_fees") or 0):
-            return False
         if not self._rebase_confirmed(realized, equity):
             return False
         detected = self._detected_at
         if detected is None:
             return False
         if _detected_in_morning(detected):
+            # By 08:30 a confirmed reload is complete. expect_fees can be
+            # too high after a fee dip and must not hold the figure all day.
             return _at_or_after_0830(now)
+        if fee < int(reset.get("expect_fees") or 0):
+            return False
         return now >= detected + timedelta(minutes=2)
 
     def _announce_failsafe(self, key: str) -> None:
@@ -719,14 +735,11 @@ class DailyLossBaseline:
         if candidate is not None and candidate.date == key:
             self.candidate = candidate
             self._commit(candidate, key)
-            # _commit drops the pre-batch R. The next reset would then
-            # take pre_r from the post-batch read and never confirm.
-            self._last_realized = _as_int(data.get("last_realized"))
-            last = data.get("last_l")
-            self.last_l = None if last is None else _as_int(last)
-            seen = _as_int(data.get("max_fees_seen"))
-            if seen is not None:
-                self.max_fees_seen = seen
+            # Same as the live roll: keep the last read's R so the next
+            # reset can confirm. last_l and max_fees_seen belong to the
+            # old key; _commit already cleared them.
+            last = _as_int(data.get("last_realized"))
+            self._last_realized = candidate.b_r if last is None else last
             self._persist(candidate_only=False)
             return True
         # Friday's file, loaded Monday before 15:00: the key differs
@@ -814,6 +827,7 @@ class DailyLossBaseline:
                 "pre_max_fees": _as_int(reset.get("pre_max_fees")),
                 "pre_f22": str(reset.get("pre_f22") or ""),
                 "pre_r": _as_int(reset.get("pre_r")),
+                "gap_r": _as_int(reset.get("gap_r")),
             }
             self._detected_at = detected
             if detected is None and not self.capital_reset["settled"]:
@@ -834,7 +848,10 @@ class DailyLossBaseline:
                 self.day_taken_at = str(raw_day.get("taken_at") or "")
         self.day_budget = bool(data.get("day_budget"))
         self.day_failsafe = bool(data.get("day_failsafe"))
-        self._last_realized = _as_int(data.get("last_realized"))
+        last = _as_int(data.get("last_realized"))
+        # A file from before last_realized was stored falls back to B_r.
+        # The first read may already be the reloaded R.
+        self._last_realized = b_r if last is None else last
         return True
 
     def _payload(self) -> dict:
@@ -849,6 +866,7 @@ class DailyLossBaseline:
                 "pre_max_fees": self.capital_reset.get("pre_max_fees"),
                 "pre_f22": self.capital_reset.get("pre_f22"),
                 "pre_r": self.capital_reset.get("pre_r"),
+                "gap_r": self.capital_reset.get("gap_r"),
             }
         return {
             "version": _VERSION,
