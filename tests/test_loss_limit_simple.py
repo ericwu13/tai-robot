@@ -20,10 +20,42 @@ def _tracker(path):
     return DailyLossBaseline(str(path), "ACCT")
 
 
+def _roll(tr, when, rights):
+    """Feed the read before 15:00, then the roll, in this same process."""
+    tr.observe(rights, when.replace(hour=14, minute=59, second=0, microsecond=0))
+    return tr.observe(rights, when)
+
+
+def test_started_2300_no_file_night_loss_uses_master(tmp_path):
+    """A process that starts at 23:00 with no file never snapshots that night."""
+    tr = _tracker(tmp_path / "late-start.json")
+    view = tr.observe(_rights(-4000, "AAA"), datetime(2026, 11, 13, 23, 0))
+    assert view.basis == "master"
+    assert view.loss_today == view.account_net == -4000
+    later = tr.observe(_rights(-9000, "AAA"), datetime(2026, 11, 14, 2, 0))
+    assert later.basis == "master"
+    assert later.loss_today == later.account_net == -9000
+
+
+def test_same_key_file_restart_reuses_snapshot(tmp_path):
+    """A restart that loads this session's file keeps the snapshot it already took."""
+    path = tmp_path / "reuse.json"
+    tr = _tracker(path)
+    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 14, 59))
+    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0, 29))
+    tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 5, 0))
+    tr.save()
+    fresh = _tracker(path)
+    fresh.load(datetime(2026, 11, 14, 6, 0))
+    view = fresh.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 6, 0))
+    assert view.basis == "snapshot"
+    assert view.loss_today == -5308
+
+
 def test_winning_day_after_the_reset_is_the_night_loss_and_not_paused(tmp_path):
     """Tue +12,000, night -9,000. Wednesday's reset still reads -9,000."""
     tr = _tracker(tmp_path / "win.json")
-    tr.observe(_rights(12000, "AAA"), datetime(2026, 11, 10, 15, 0))
+    _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(12000, "AAA"))
     night = tr.observe(_rights(3000, "AAA"), datetime(2026, 11, 11, 2, 0))
     assert night.loss_today == -9000
     reset = tr.observe(_rights(-9000, "BBB"), datetime(2026, 11, 11, 5, 36))
@@ -36,7 +68,7 @@ def test_winning_day_after_the_reset_is_the_night_loss_and_not_paused(tmp_path):
 
 def test_losing_day_is_the_drop_from_the_snapshot(tmp_path):
     tr = _tracker(tmp_path / "lose.json")
-    tr.observe(_rights(2000, "AAA"), datetime(2026, 11, 10, 15, 0))
+    _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(2000, "AAA"))
     view = tr.observe(_rights(-4000, "AAA"), datetime(2026, 11, 11, 2, 0))
     assert view.basis == "snapshot"
     assert view.loss_today == -6000
@@ -59,7 +91,7 @@ def test_replay_friday_night_is_exactly_5308(tmp_path):
 
 def test_morning_reset_reanchors_and_the_next_trade_continues(tmp_path):
     tr = _tracker(tmp_path / "anchor.json")
-    tr.observe(_rights(12000, "AAA"), datetime(2026, 11, 10, 15, 0))
+    _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(12000, "AAA"))
     tr.observe(_rights(3000, "AAA"), datetime(2026, 11, 11, 2, 0))
     reset = tr.observe(_rights(-9000, "BBB"), datetime(2026, 11, 11, 5, 36))
     assert reset.loss_today == -9000
@@ -71,7 +103,7 @@ def test_morning_reset_reanchors_and_the_next_trade_continues(tmp_path):
 
 def test_no_reset_by_0830_is_the_account(tmp_path):
     tr = _tracker(tmp_path / "miss.json")
-    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0))
+    _roll(tr, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
     tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 5, 0))
     view = tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 8, 30))
     assert view.basis == "master"
@@ -81,7 +113,7 @@ def test_no_reset_by_0830_is_the_account(tmp_path):
 def test_same_key_restart_reuses_the_snapshot_and_can_still_anchor(tmp_path):
     path = tmp_path / "restart.json"
     tr = _tracker(path)
-    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0))
+    _roll(tr, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
     tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 5, 0))
     tr.save()
     fresh = _tracker(path)
@@ -99,7 +131,7 @@ def test_no_file_and_a_stale_file_are_the_account(tmp_path):
     assert view.loss_today == view.account_net == -8000
     path = tmp_path / "stale.json"
     tr = _tracker(path)
-    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0))
+    _roll(tr, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
     tr.save()
     fresh = _tracker(path)
     fresh.load(datetime(2026, 11, 16, 10, 0))
@@ -112,7 +144,7 @@ def test_no_file_and_a_stale_file_are_the_account(tmp_path):
 def test_restart_after_0830_without_an_anchor_is_the_account(tmp_path):
     path = tmp_path / "late.json"
     tr = _tracker(path)
-    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0))
+    _roll(tr, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
     tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 2, 0))
     tr.save()
     fresh = _tracker(path)
@@ -132,6 +164,7 @@ def test_holiday_roll_is_the_account(tmp_path):
 
 def test_invalid_read_does_not_become_the_snapshot(tmp_path):
     tr = _tracker(tmp_path / "bad.json")
+    tr.observe(_rights(-1000, "AAA"), datetime(2026, 11, 13, 14, 59))
     skipped = tr.observe({"valid": False}, datetime(2026, 11, 13, 15, 0))
     assert skipped.basis == "master"
     later = tr.observe(_rights(-1000, "AAA"), datetime(2026, 11, 13, 16, 0))
@@ -150,7 +183,7 @@ def test_not_valid_snapshot_is_always_the_account(tmp_path, monkeypatch):
 
     path = tmp_path / "stale.json"
     old = _tracker(path)
-    old.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0))
+    _roll(old, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
     old.save()
     fresh = _tracker(path)
     fresh.load(datetime(2026, 11, 16, 10, 0))
@@ -164,13 +197,13 @@ def test_not_valid_snapshot_is_always_the_account(tmp_path, monkeypatch):
     cases.append(unknown.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0)))
     monkeypatch.undo()
 
-    missed = _tracker(tmp_path / "miss.json")
-    missed.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0))
+    missed = _tracker(tmp_path / "missed.json")
+    _roll(missed, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
     cases.append(missed.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 8, 30)))
 
     late_path = tmp_path / "late.json"
     late = _tracker(late_path)
-    late.observe(_rights(-6998, "AAA"), datetime(2026, 11, 13, 15, 0))
+    _roll(late, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
     late.save()
     restarted = _tracker(late_path)
     restarted.load(datetime(2026, 11, 14, 9, 0))

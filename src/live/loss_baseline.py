@@ -4,8 +4,12 @@ A valid 15:00 TPE snapshot for this trading-day key gives
 ``L = net_now - snap_net``. Otherwise ``L`` is the account net, which is
 what master gates on.
 
-The snapshot is valid only when the file key is this session, the 15:00
-read was a real account net on a known trading day, and — once the clock
+A snapshot is taken only when this process saw the roll: its previous
+read was before 15:00 TPE on that calendar day, and this read is at or
+after 15:00. A process that starts at or after 15:00 with no file for
+this key does not snapshot until the next roll. The snapshot is valid
+only when the file key is this session, that roll read was a real
+account net on a known trading day, and — once the clock
 is past 08:30 in the morning half of that session — the morning re-anchor
 has happened. No file, a stale key, a non-trading or unknown day, a
 missed 08:30 re-anchor, and a restart after 08:30 that never anchored are
@@ -118,6 +122,8 @@ class DailyLossBaseline:
         self.last_L: int | None = None
         self.pause_failsafe = False
         self._account_net = 0
+        # Previous successful read in this process. Not stored in the file.
+        self._prev_read: datetime | None = None
 
     def observe(self, rights: dict, now_tpe: datetime) -> LossView:
         """One valid rights read. Invalid input does not move state."""
@@ -131,11 +137,11 @@ class DailyLossBaseline:
         if key != self.key:
             self._clear_snap()
             self.key = key
-        if (self.snap_net is None and _minutes(now) >= _ROLL
-                and _known_trading_day(now.date())):
+        if self.snap_net is None and self._saw_roll(now) and _known_trading_day(now.date()):
             self.snap_net = net
             self.snap_f22 = f22
             self.anchored = False
+        self._prev_read = now
         if self._anchor_due(now, f22):
             self.snap_net = net - int(self.last_L or 0)
             self.anchored = True
@@ -190,6 +196,16 @@ class DailyLossBaseline:
         self.pause_failsafe = flagged
         if self.key:
             self._persist()
+
+    def _saw_roll(self, now: datetime) -> bool:
+        """True when this process's previous read was before 15:00 today."""
+        prev = self._prev_read
+        if prev is None:
+            return False
+        prev = _as_tpe(prev)
+        return (prev.date() == now.date()
+                and _minutes(prev) < _ROLL
+                and _minutes(now) >= _ROLL)
 
     def _anchor_due(self, now: datetime, f22: str) -> bool:
         if self.snap_net is None or self.anchored:
