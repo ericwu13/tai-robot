@@ -59,6 +59,7 @@ def test_winning_day_after_the_reset_is_the_night_loss_and_not_paused(tmp_path):
     _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(12000, "AAA"))
     night = tr.observe(_rights(3000, "AAA"), datetime(2026, 11, 11, 2, 0))
     assert night.loss_today == -9000
+    tr.observe(_rights(3000, "AAA"), datetime(2026, 11, 11, 4, 59))
     reset = tr.observe(_rights(-9000, "BBB"), datetime(2026, 11, 11, 5, 36))
     assert reset.loss_today == -9000
     guard = TradingGuard()
@@ -96,6 +97,7 @@ def test_morning_reset_reanchors_and_the_next_trade_continues(tmp_path):
     tr = _tracker(tmp_path / "anchor.json")
     _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(12000, "AAA"))
     tr.observe(_rights(3000, "AAA"), datetime(2026, 11, 11, 2, 0))
+    tr.observe(_rights(3000, "AAA"), datetime(2026, 11, 11, 4, 59))
     reset = tr.observe(_rights(-9000, "BBB"), datetime(2026, 11, 11, 5, 36))
     assert reset.loss_today == -9000
     assert tr.anchored is False
@@ -312,6 +314,46 @@ def test_monday_replay_0910_is_8308(tmp_path):
     opened = tr.observe(_rights(-8308, "64651"), datetime(2026, 11, 11, 9, 10))
     assert opened.loss_today == -8308
     assert opened.basis == "snapshot"
+
+
+def test_reed_restart_after_anchor_keeps_the_snap_and_pauses(tmp_path):
+    """Reed's probe. Limit 20,000. 04:59 is inside 04:50–05:00.
+
+    08:30 anchors with snap_net 0. 09:10 is −8,000. A 13:00 restart on
+    account −27,000 must stay paused and leave snap_net alone. On
+    91cf709 the restart gates at −8,000 and does not pause.
+    """
+    path = tmp_path / "anch.json"
+    tr = _tracker(path)
+    _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(0, "AAA"))
+    tr.observe(_rights(-8000, "AAA"), datetime(2026, 11, 11, 4, 59))
+    anchored = tr.observe(_rights(-8000, "BBB"), datetime(2026, 11, 11, 8, 30))
+    assert tr.anchored is True
+    assert tr.snap_net == 0
+    assert anchored.loss_today == -8000
+    day = tr.observe(_rights(-8000, "BBB"), datetime(2026, 11, 11, 9, 10))
+    assert day.loss_today == -8000
+    tr.save()
+    fresh = _tracker(path)
+    fresh.load(datetime(2026, 11, 11, 13, 0))
+    later = fresh.observe(_rights(-27000, "BBB"), datetime(2026, 11, 11, 13, 0))
+    assert fresh.snap_net == 0
+    assert later.loss_today == -27000
+    assert _guard(later.loss_today, later.day_key, limit=20000) is True
+
+
+def test_stall_at_0300_then_0830_is_master(tmp_path):
+    """A 03:00 read is not the close. 06:00 does not hold and 08:30 does not anchor."""
+    tr = _tracker(tmp_path / "stall.json")
+    _roll(tr, datetime(2026, 11, 10, 15, 0), _rights(-6998, "AAA"))
+    tr.observe(_rights(-20000, "AAA"), datetime(2026, 11, 11, 3, 0))
+    held = tr.observe(_rights(-20000, "AAA"), datetime(2026, 11, 11, 6, 0))
+    assert held.basis == "master"
+    assert held.loss_today == held.account_net == -20000
+    opened = tr.observe(_rights(-16000, "BBB"), datetime(2026, 11, 11, 8, 30))
+    assert opened.basis == "master"
+    assert tr.anchored is False
+    assert opened.loss_today == opened.account_net == -16000
 
 
 def test_reed_restart_in_the_window_pauses_on_the_account(tmp_path):

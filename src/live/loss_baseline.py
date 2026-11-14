@@ -21,12 +21,12 @@ window. On a trading morning, the first read at or after 08:30 looks
 at the latest non-zero read since 05:00 (not a row with net,
 realized_pnl and realized_cost all zero). If that read's f22 differs
 from the snapshot, ``snap_net`` becomes that net minus the held ``L``.
-Otherwise the rest of the key uses the account net. That hold is
-valid only when this process saw a read before 05:00 on the same key.
-A restart inside the window did not, so the rest of the key uses the
-account net: no held value from the file and no 08:30 anchor. A
-restart from 08:30 onward that restores an already-anchored snapshot
-is unchanged. Capital still showing zeros at 08:30 uses the account net.
+Otherwise the rest of the key uses the account net. The hold and the
+08:30 anchor both require a read in 04:50–05:00 on this key in this
+process. A read before 04:50 does not. Once anchored, ``snap_net`` is
+stored and a restart restores it with the decision already made, so
+it is not rewritten. Capital still showing zeros at 08:30 uses the
+account net.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 _TPE = timezone(timedelta(hours=8))
 _VERSION = 2
+_CLOSE_FROM = 4 * 60 + 50
 _HOLD_FROM = 5 * 60
 _DECIDE_AT = 8 * 60 + 30
 _ROLL = 15 * 60
@@ -147,8 +148,8 @@ class DailyLossBaseline:
         self._decided = False
         self._nz_net: int | None = None
         self._nz_f22 = ""
-        # True only after this process reads before 05:00 on this key.
-        self._saw_pre_hold = False
+        # True after a read in [04:50, 05:00) on this key, in this process.
+        self._saw_close = False
 
     def observe(self, rights: dict, now_tpe: datetime) -> LossView:
         """One valid rights read. Invalid input does not move state."""
@@ -168,11 +169,11 @@ class DailyLossBaseline:
             self.anchored = False
         self._prev_read = now
         minute = _minutes(now)
-        if minute < _HOLD_FROM:
-            self._saw_pre_hold = True
+        if _CLOSE_FROM <= minute < _HOLD_FROM:
+            self._saw_close = True
         elif (self.snap_net is not None and not self.anchored
-              and not self._saw_pre_hold and minute < _ROLL):
-            # No pre-05:00 read in this process. The file's last_L is not a hold.
+              and not self._saw_close and _HOLD_FROM <= minute < _ROLL):
+            # This process did not see 04:50–05:00. No hold and no anchor.
             self._master_rest = True
             self._decided = True
         if self._in_hold(minute):
@@ -222,8 +223,10 @@ class DailyLossBaseline:
         self.last_L = _as_int(data.get("last_L"))
         self.pause_failsafe = bool(data.get("pause_failsafe"))
         minute = _minutes(now)
-        if (not self.anchored and _DECIDE_AT <= minute < _ROLL):
-            # The window was not watched. Do not invent an anchor.
+        if self.anchored:
+            # The file already decided. Do not run _decide again.
+            self._decided = True
+        elif _DECIDE_AT <= minute < _ROLL:
             self._master_rest = True
             self._decided = True
 
@@ -300,7 +303,7 @@ class DailyLossBaseline:
         self._decided = False
         self._nz_net = None
         self._nz_f22 = ""
-        self._saw_pre_hold = False
+        self._saw_close = False
 
     def _persist(self) -> None:
         if not self.path:
