@@ -49,7 +49,7 @@ message body:
 | P2 | `Discarded pending recommendation` |
 | P3 | `Dropped out-of-order aggregated bar` |
 | P3 | `Discarded recommendation` |
-| history | `n8n.workflow.failed` — retired local n8n; if check_logs.py prints it, ignore (not live) |
+| P2 | `n8n.workflow.failed` — check_logs.py reports only the last 24 h, so a hit means the retired local n8n ran again (W1–W4 double-run risk); report it, don't ignore it |
 
 Findings are deduped per (pattern, file) and capped at 5 example lines,
 each redacted before it is printed.
