@@ -1800,3 +1800,97 @@ def test_k10_reed_wzvw_skipped_day_process_up(tmp_path):
     tr = _thu_snapshot_fri_skipped(tmp_path / "k10.json", -18000)
     v = tr.observe(_pnl(-25000, 10, f22="CCC"), datetime(2026, 11, 16, 9, 0))
     assert v.loss_today == -25000, v.loss_today
+
+
+def _break_calendar(monkeypatch):
+    import src.market_data.holidays as hol
+    monkeypatch.setattr(hol, "_tw_public_holidays", lambda year: frozenset())
+    monkeypatch.setattr(hol, "holiday_calendar_health", lambda year=None: (False, "empty"))
+
+
+def test_k11_redeploy_commits_saved_candidate_and_confirms_the_reload(tmp_path, monkeypatch):
+    """Tue candidate saved, stop before 15:00. Wed 08:00 first read is flat R=0, new f22. L=0, no pause."""
+    path = tmp_path / "k11.json"
+    app, clock, tr = _app_at(
+        monkeypatch, datetime(2026, 11, 10, 13, 50), limit=20000, path=path)
+    row = _pnl(24900, 100, f22="AAA")
+    _drive(app, clock, datetime(2026, 11, 10, 13, 50), row)
+    _drive(app, clock, datetime(2026, 11, 10, 14, 30), row)
+    tr.save()
+    app2, clock2, tr2 = _app_at(
+        monkeypatch, datetime(2026, 11, 11, 8, 0), limit=20000, path=path)
+    tr2.load(datetime(2026, 11, 11, 8, 0))
+    post = _pnl(0, 0, f22="WWW")
+    g = app2._trading_guard
+    for when in (datetime(2026, 11, 11, 8, 0), datetime(2026, 11, 11, 9, 0),
+                 datetime(2026, 11, 11, 13, 0)):
+        _drive(app2, clock2, when, post)
+        assert g._last_net_pnl == 0, (when, g._last_net_pnl)
+        assert g.paused is False, when
+
+
+def test_k11b_process_up_through_1500_stays_flat_after_the_reload(tmp_path, monkeypatch):
+    """Control: the same Tuesday stays up through 15:00. Wednesday is still L=0."""
+    app, clock, _tr = _app_at(
+        monkeypatch, datetime(2026, 11, 10, 13, 50), limit=20000,
+        path=tmp_path / "k11b.json")
+    row = _pnl(24900, 100, f22="AAA")
+    _drive(app, clock, datetime(2026, 11, 10, 13, 50), row)
+    _drive(app, clock, datetime(2026, 11, 10, 14, 30), row)
+    _drive(app, clock, datetime(2026, 11, 10, 15, 0, 5), row)
+    g = app._trading_guard
+    post = _pnl(0, 0, f22="WWW")
+    for when in (datetime(2026, 11, 11, 8, 0), datetime(2026, 11, 11, 9, 0),
+                 datetime(2026, 11, 11, 13, 0)):
+        _drive(app, clock, when, post)
+        assert g._last_net_pnl == 0, (when, g._last_net_pnl)
+        assert g.paused is False, when
+
+
+def test_k12_unknown_today_is_account_minus_b_c(tmp_path, monkeypatch):
+    """Unknown today subtracts B_c and not B_r, even when adopt did not run."""
+    tr = _tracker(tmp_path / "k12.json")
+    tr.day_key = "2026-11-10"
+    tr.night_date = "2026-11-10"
+    tr.b_r = 5000
+    tr.b_c = 3000
+    tr.basis = "snapshot"
+    _break_calendar(monkeypatch)
+    v = tr.observe(
+        _raw(5010, 10, 0, f1=4000, f22="AAA"), datetime(2026, 11, 11, 10, 0))
+    assert tr.b_r == 5000
+    assert v.loss_today == v.account_net - 3000 == 6000, v.loss_today
+
+
+def test_k13_calendar_turns_unknown_mid_key(tmp_path, monkeypatch):
+    """B_r stays set when the calendar breaks without a key change. Gate is account - B_c."""
+    tr = _tracker(tmp_path / "k13.json")
+    s = _raw(8010, 10, 0, f1=3000, f22="AAA")
+    tr.observe(s, datetime(2026, 11, 10, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(s, datetime(2026, 11, 10, 15, 0, 5))
+    assert tr.b_r == 8000 and tr.b_c == 3000
+    _break_calendar(monkeypatch)
+    v = tr.observe(s, datetime(2026, 11, 11, 10, 0))
+    assert tr.b_r == 8000
+    assert v.loss_today == v.account_net - tr.b_c == 8000, v.loss_today
+
+
+def test_k3b_known_again_carries_no_leaked_b_r(tmp_path, monkeypatch):
+    """Unknown Monday with a nonzero B_r, then the calendar works again. No leaked B_r."""
+    import src.market_data.holidays as hol
+    holidays, health = hol._tw_public_holidays, hol.holiday_calendar_health
+    tr = _tracker(tmp_path / "k3b.json")
+    row = _pnl(12000, 10, f22="AAA")
+    tr.observe(row, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(row, datetime(2026, 11, 13, 15, 0, 5))
+    assert tr.b_r == 12000
+    _break_calendar(monkeypatch)
+    tr.observe(row, datetime(2026, 11, 16, 5, 30))
+    monkeypatch.setattr(hol, "_tw_public_holidays", holidays)
+    monkeypatch.setattr(hol, "holiday_calendar_health", health)
+    off = tr.observe(row, datetime(2026, 11, 16, 6, 0))
+    inn = tr.observe(row, datetime(2026, 11, 16, 9, 10))
+    assert off.loss_today == 12000, off.loss_today
+    assert inn.loss_today == 12000, inn.loss_today

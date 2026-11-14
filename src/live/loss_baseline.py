@@ -392,14 +392,14 @@ class DailyLossBaseline:
                 if not confirmed and not _off_session(now):
                     # In session, never looser than the account net of B_c.
                     loss = min(loss, account - self.b_c)
-            if today_unknown:
-                # Equals the account only because adopt zeroed B_r and B_c.
-                loss = account - self.b_r - self.b_c
-                held = False
-            elif self._span(now) in ("trading", "unknown"):
+            if self._span(now) in ("trading", "unknown"):
                 # Skipped trading day: the account net, with no hold.
                 loss = account
                 held = False
+        if today_unknown:
+            # Mid-key or after adopt: B_r is not part of the figure.
+            loss = account - self.b_c
+            held = False
         if (not self.day_budget
                 and not self._reset_open()
                 and not today_unknown
@@ -719,6 +719,14 @@ class DailyLossBaseline:
         if candidate is not None and candidate.date == key:
             self.candidate = candidate
             self._commit(candidate, key)
+            # _commit drops the pre-batch R. The next reset would then
+            # take pre_r from the post-batch read and never confirm.
+            self._last_realized = _as_int(data.get("last_realized"))
+            last = data.get("last_l")
+            self.last_l = None if last is None else _as_int(last)
+            seen = _as_int(data.get("max_fees_seen"))
+            if seen is not None:
+                self.max_fees_seen = seen
             self._persist(candidate_only=False)
             return True
         # Friday's file, loaded Monday before 15:00: the key differs
