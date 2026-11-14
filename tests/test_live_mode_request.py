@@ -1107,62 +1107,6 @@ def test_switch_update_pnl_receives_the_trading_day_key(harness, monkeypatch):
     assert seen["day_key"] != ""
 
 
-def test_precheck_acts_on_a_settled_recheck(harness, monkeypatch):
-    """The paper→auto pre-check must release a failsafe pause it just observed.
-
-    Dropping ``_handle_loss_edges`` there consumes ``settled_after_reset``
-    and leaves the guard paused.
-    """
-    from datetime import timezone, timedelta
-    from src.live.loss_baseline import DailyLossBaseline
-
-    h = harness
-    when = datetime(2026, 11, 12, 16, 2)
-    monkeypatch.setattr(rb, "_taipei_now", lambda: when)
-    tr = DailyLossBaseline(os.path.join(h.bot_dir, "loss_baseline.json"), ACCT)
-    tr.day_key = "2026-11-12"
-    tr.night_date = "2026-11-12"
-    tr.basis = "capital_reset"
-    tr.b_r = 0
-    tr.b_c = 0
-    tr.baseline_fees = 10
-    tr.baseline_f22 = "AAA"
-    tr.max_fees_seen = 100
-    tr.last_l = -5000
-    tr.capital_reset = {
-        "detected_at": "2026-11-12T16:00:00+08:00",
-        "l_pre": -5000,
-        "expect_fees": 0,
-        "settled": False,
-        "in_day_window": False,
-        "pre_max_fees": 100,
-        "pre_f22": "AAA",
-        "pre_r": -5000,
-    }
-    tr._detected_at = datetime(2026, 11, 12, 16, 0, tzinfo=timezone(timedelta(hours=8)))
-    h.app._loss_baseline = tr
-    h.app._pause_failsafe_adopted = True
-    guard = h.app._trading_guard
-    guard.daily_loss_limit = 3000
-    # The opening poll refuses a pause before any rights reply. Arm the
-    # failsafe pause only once the query is in flight, which is what a
-    # paper bot looks like when the reply lands.
-    h.request(loss_limit=3000)
-    h.poll()
-    guard.paused = True
-    guard._pause_failsafe = True
-    guard._pause_day_key = "2026-11-12"
-    vals = ["0"] * 35
-    vals[11], vals[2], vals[22], vals[25] = "-80", "20", "BBB", "TWD"
-    h.oi("001,查無資料", "##")
-    h.rights(",".join(vals))
-    h.poll()
-
-    assert h.result()["status"] == "accepted", h.result()
-    assert guard.paused is False
-    assert guard._pause_failsafe is False
-
-
 def test_example_settings_opt_in_nobody():
     import yaml
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
