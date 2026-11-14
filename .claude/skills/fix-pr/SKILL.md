@@ -33,7 +33,9 @@ release); this one ends at a draft PR and a comment on the issue.
    the PR body under "Known gaps" with how the rule covers it (usually
    by falling back to existing behavior). In later review rounds, check
    each new edge-case finding against the rule before adding a branch;
-   one without real-data evidence goes to a follow-up.
+   one without real-data evidence goes to a follow-up, unless it shows
+   the rule itself is less safe than existing behavior; fix that in
+   this PR.
 
 ## Execution
 
