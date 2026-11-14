@@ -1,6 +1,6 @@
 """One daily-loss rule for a REAL bot.
 
-1. A 15:00 TPE snapshot is valid for the key only if this process saw the roll (a read in 14:50-15:00 AND the roll read before 15:10, on a known trading day), or a same-key file already holds it.
+1. A 15:00 TPE snapshot is valid for the key only if this process saw the roll (a read in 14:50-15:00 AND the roll read before 15:10, on a known trading day), or a same-key file already holds it. snapshot = the last read before 15:00
 2. If this process also saw the close (a read in 04:50-05:00), hold L through 05:00-08:30. At 08:30, if f22 moved, re-anchor snap_net = latest non-zero net - held L once, and persist it as decided. A decided file is never re-anchored.
 3. Otherwise L = full account net (master) for the rest of the key.
 """
@@ -128,6 +128,9 @@ class DailyLossBaseline:
         self._nz_f22 = ""
         # True after a read in [04:50, 05:00) on this key, in this process.
         self._saw_close = False
+        # Last read in 14:50-15:00. The snapshot uses this, not the roll read.
+        self._pre_net: int | None = None
+        self._pre_f22 = ""
 
     def observe(self, rights: dict, now_tpe: datetime) -> LossView:
         """One valid rights read. Invalid input does not move state."""
@@ -137,15 +140,22 @@ class DailyLossBaseline:
         net, f22 = parsed
         now = _as_tpe(now_tpe)
         key = trading_day_key(now)
+        minute = _minutes(now)
+        rolling = self._saw_roll(now)
         if key != self.key:
+            pre_net, pre_f22 = self._pre_net, self._pre_f22
             self._clear_snap()
             self.key = key
-        if self.snap_net is None and self._saw_roll(now):
-            self.snap_net = net
-            self.snap_f22 = f22
+            if rolling:
+                self._pre_net, self._pre_f22 = pre_net, pre_f22
+        if _PRE_FROM <= minute < _ROLL:
+            self._pre_net = net
+            self._pre_f22 = f22
+        if rolling and self.snap_net is None and self._pre_net is not None:
+            self.snap_net = self._pre_net
+            self.snap_f22 = self._pre_f22
             self.anchored = False
         self._prev_read = now
-        minute = _minutes(now)
         if _CLOSE_FROM <= minute < _HOLD_FROM:
             self._saw_close = True
         self._master_for_rest(minute)
@@ -253,6 +263,8 @@ class DailyLossBaseline:
         if minute < _DECIDE_AT or minute >= _ROLL:
             return
         if not _known_trading_day(now.date()):
+            self._master_rest = True
+            self._decided = True
             return
         self._decided = True
         if not _is_zero_row(rights, net):
@@ -291,6 +303,8 @@ class DailyLossBaseline:
         self._nz_net = None
         self._nz_f22 = ""
         self._saw_close = False
+        self._pre_net = None
+        self._pre_f22 = ""
 
     def _persist(self) -> None:
         if not self.path:

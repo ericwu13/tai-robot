@@ -34,8 +34,8 @@ trading:
   # Default real-order daily loss limit (NT$) offered by the deploy
   # dialog and `run_bot_cli deploy --loss-limit`. The gate itself is
   # per bot; this value is only the pre-fill. The counted loss is
-  # net_now minus the 15:00 snapshot, and only when this process saw
-  # that roll. From 05:00 to 08:30 that loss is held, and the 08:30
+  # net_now minus the snapshot (the last read before 15:00), and only
+  # when this process saw that roll. From 05:00 to 08:30 that loss is held, and the 08:30
   # anchor runs, only when this process saw a read in 04:50-05:00 on the
   # same key. Otherwise the gate uses the account net, as on master.
   # NOT the same as risk.max_daily_loss below, which

@@ -26,6 +26,85 @@ def _roll(tr, when, rights):
     return tr.observe(rights, when)
 
 
+def test_opening_gap_counts_in_the_new_day(tmp_path):
+    """The 15:00 gap belongs to the new day. The snapshot is the 14:55 read."""
+    tr = _tracker(tmp_path / "gap.json")
+    tr.observe(_rights(10000, "AAA"), datetime(2026, 11, 10, 14, 55))
+    rolled = tr.observe(_rights(7000, "AAA"), datetime(2026, 11, 10, 15, 2))
+    assert tr.snap_net == 10000
+    assert tr.snap_f22 == "AAA"
+    assert rolled.basis == "snapshot"
+    assert rolled.loss_today == -3000
+
+
+def test_oi_cached_rights_do_not_move_the_baseline(tmp_path, monkeypatch):
+    """An OpenInterest row re-reads cached rights. That must not observe."""
+    import queue
+    from types import SimpleNamespace
+
+    import run_backtest as rb
+    from src.live.account_monitor import AccountMonitor
+
+    monitor = AccountMonitor()
+    monitor.update_rights(_rights(-1000, "AAA"))
+    monitor.begin_oi_query()
+    tr = _tracker(tmp_path / "oi.json")
+    stamp = datetime(2026, 11, 10, 14, 40)
+    monkeypatch.setattr(rb, "_taipei_now", lambda: stamp)
+    tr.observe(monitor.rights, stamp)
+
+    class _Var:
+        def set(self, value):
+            self.value = value
+
+    app = SimpleNamespace(
+        _account_monitor=monitor,
+        _loss_baseline=tr,
+        _trading_mode="paper",
+        _trading_guard=SimpleNamespace(
+            daily_loss_limit=0, paused=False, fill_pending=False,
+            roll_day=lambda key: None),
+        _loss_view=None,
+        real_pos_var=_Var(), real_equity_var=_Var(), real_available_var=_Var(),
+        real_pnl_var=_Var(), real_realized_var=_Var(), real_fees_var=_Var(),
+        real_net_var=_Var(), real_maint_var=_Var(), real_loss_limit_var=_Var(),
+    )
+    app._observe_loss_baseline = (
+        lambda now: rb.BacktestApp._observe_loss_baseline(app, now))
+    app._update_real_account_display = (
+        lambda: rb.BacktestApp._update_real_account_display(app))
+    app._adopt_persisted_pause_failsafe = lambda: None
+    app._handle_loss_edges = lambda *args: False
+    app._sync_loss_pause_flag = lambda: None
+    previous = rb._app
+    rb._app = app
+    try:
+        while True:
+            try:
+                rb._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+        monkeypatch.setattr(
+            rb, "_taipei_now", lambda: datetime(2026, 11, 10, 14, 55))
+        rb.SKOrderLibEvents().OnOpenInterest(
+            "TF,ACCT,TM0000,B,1,0,44774.0,15,2,ID")
+        rb.BacktestApp._process_ui_queue(app)
+    finally:
+        rb._app = previous
+    assert tr._prev_read.replace(tzinfo=None) == stamp
+    assert tr.snap_net is None
+
+
+def test_non_trading_morning_is_master(tmp_path):
+    """Saturday 08:30 is not a trading morning. The rest of the key is master."""
+    tr = _tracker(tmp_path / "sat.json")
+    _roll(tr, datetime(2026, 11, 13, 15, 0), _rights(-6998, "AAA"))
+    tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 4, 59))
+    view = tr.observe(_rights(-12306, "AAA"), datetime(2026, 11, 14, 8, 30))
+    assert view.basis == "master"
+    assert view.loss_today == view.account_net == -12306
+
+
 def test_started_2300_no_file_night_loss_uses_master(tmp_path):
     """A process that starts at 23:00 with no file never snapshots that night."""
     tr = _tracker(tmp_path / "late-start.json")
@@ -321,6 +400,26 @@ def test_roll_at_1600_without_a_1450_read_is_the_account(tmp_path):
     tr = _tracker(tmp_path / "late-roll.json")
     tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 10, 14, 40))
     view = tr.observe(_rights(-12000, "AAA"), datetime(2026, 11, 10, 16, 0))
+    assert view.basis == "master"
+    assert view.loss_today == view.account_net == -12000
+    assert tr.snap_net is None
+
+
+def test_reed_1459_then_1600_is_the_account(tmp_path):
+    """14:59 then 16:00 missed the 15:10 bound. The key uses the account net."""
+    tr = _tracker(tmp_path / "reed-1600.json")
+    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 10, 14, 59))
+    view = tr.observe(_rights(-12000, "AAA"), datetime(2026, 11, 10, 16, 0))
+    assert view.basis == "master"
+    assert view.loss_today == view.account_net == -12000
+    assert tr.snap_net is None
+
+
+def test_reed_1440_then_1505_is_the_account(tmp_path):
+    """14:40 is before 14:50, so 15:05 does not confirm a roll."""
+    tr = _tracker(tmp_path / "reed-1440.json")
+    tr.observe(_rights(-6998, "AAA"), datetime(2026, 11, 10, 14, 40))
+    view = tr.observe(_rights(-12000, "AAA"), datetime(2026, 11, 10, 15, 5))
     assert view.basis == "master"
     assert view.loss_today == view.account_net == -12000
     assert tr.snap_net is None

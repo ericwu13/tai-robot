@@ -1771,7 +1771,11 @@ class BacktestApp:
                         raw, generation=oi_generation)
                     parsed = _parse_open_interest(raw) if outcome == "position" else None
                     if outcome == "position":
-                        self._update_real_account_display()
+                        # Position text only. Rights here are the cached
+                        # reply; a fresh FutureRights observe is the baseline.
+                        shown = self._account_monitor.compute_display()
+                        if shown.position_text:
+                            self.real_pos_var.set(shown.position_text)
                     elif outcome == "flat":
                         self.real_pos_var.set("Flat (無持倉)")
                     _log(f"未平倉 OpenInterest: {_redact_open_interest(raw)}")
