@@ -48,6 +48,7 @@ _CAND_HI = 15 * 60
 _MORNING_LO = 5 * 60
 _MORNING_HI = 8 * 60 + 30
 _SETTLE_AT = 8 * 60 + 30
+_BATCH_FROM = 5 * 60 + 20
 _DAY_LO = 8 * 60 + 30
 _DAY_HI = 8 * 60 + 45
 _NIGHT_OPEN = 15 * 60
@@ -324,6 +325,11 @@ class DailyLossBaseline:
 
         held = False
         just_settled = False
+        if (self._reset_open() and not self.capital_reset.get("r_rebased")
+                and self._exact_reload(realized, floating, fee)):
+            self.capital_reset["r_rebased"] = True
+            dirty = True
+            force = True
         confirmed = self._reset_open() and self._rebase_confirmed(realized, equity)
         interim = realized == 0 and floating == 0 and fee == 0
         # Unknown today gates on the account below. B_r is not zeroed
@@ -383,6 +389,12 @@ class DailyLossBaseline:
                 force = True
                 reset = None
             loss = account - self.day_b_r - self.day_b_c
+            if opened and reset is not None and not reset.get("settled"):
+                # The open read's figure is the day budget. The reset's
+                # hold was the night, and it must not re-pause Monday.
+                reset["l_pre"] = loss
+                dirty = True
+                force = True
             if (reset is not None and not reset.get("settled")
                     and reset.get("l_pre") is not None):
                 held = True
@@ -402,6 +414,15 @@ class DailyLossBaseline:
                         loss = int(held_loss)
                     else:
                         loss = min(loss, int(held_loss))
+            if (self._reset_open() and not confirmed and not interim
+                    and equity == str(self.capital_reset.get("pre_f22") or "")
+                    and _BATCH_FROM <= _minutes(now) < _NIGHT_OPEN
+                    and _day_status(now.date()) == _Cal.TRADING):
+                # f22 has not moved and the reload is not confirmed.
+                # Use the account, and keep the pre-batch hold if it
+                # is stricter. This window is not the evening dip.
+                held_loss = self.capital_reset.get("l_pre")
+                loss = account if held_loss is None else min(account, int(held_loss))
             if self._span(now) in ("trading", "unknown"):
                 # Skipped trading day: the account net, with no hold.
                 loss = account
@@ -668,18 +689,39 @@ class DailyLossBaseline:
             self._has_day_baseline = False
 
     def _rebase_confirmed(self, realized: int, equity: str) -> bool:
-        """Completed morning reload: f22 moved and R left the pre-batch value.
+        """Completed morning reload.
 
-        A fee drop alone is the zero interim or a blip. f22 alone is the
-        f22-first read, which still carries the old realized. Neither is
-        the reload.
+        The usual signature is f22 moved and R left the pre-batch value.
+        A fee drop alone is the zero interim or a blip. f22 alone still
+        carries the old realized. An exact R and fee match, stored as
+        ``r_rebased``, also confirms when f22 did not move.
         """
         reset = self.capital_reset or {}
+        if reset.get("r_rebased"):
+            return True
         pre_f22 = str(reset.get("pre_f22") or "")
         pre_r = reset.get("pre_r")
         if pre_r is None or not equity or not pre_f22 or equity == pre_f22:
             return False
         return int(realized) != int(pre_r)
+
+    def _exact_reload(self, realized: int, floating: int, fee: int) -> bool:
+        """f22 can stay put. The market is shut, so the reload is exact.
+
+        R is the last pre-reload R minus B_r. Fees are the peak minus the
+        15:00 fees. A blip leaves R alone, and a fill moves both, so
+        neither one matches.
+        """
+        reset = self.capital_reset or {}
+        last_r = reset.get("gap_r")
+        if last_r is None:
+            last_r = reset.get("pre_r")
+        if last_r is None or not self.b_r:
+            return False
+        if realized == 0 and floating == 0 and fee == 0:
+            return False
+        return (int(realized) == int(last_r) - int(self.b_r)
+                and int(fee) == int(self.max_fees_seen) - int(self.baseline_fees))
 
     def _can_settle(self, now: datetime, realized: int, fee: int, equity: str) -> bool:
         reset = self.capital_reset or {}
@@ -740,6 +782,9 @@ class DailyLossBaseline:
             # old key; _commit already cleared them.
             last = _as_int(data.get("last_realized"))
             self._last_realized = candidate.b_r if last is None else last
+            # Against the candidate just committed, the figure is 0.
+            # The 05:22 zero row then holds 0.
+            self.last_l = 0
             self._persist(candidate_only=False)
             return True
         # Friday's file, loaded Monday before 15:00: the key differs
@@ -828,6 +873,7 @@ class DailyLossBaseline:
                 "pre_f22": str(reset.get("pre_f22") or ""),
                 "pre_r": _as_int(reset.get("pre_r")),
                 "gap_r": _as_int(reset.get("gap_r")),
+                "r_rebased": bool(reset.get("r_rebased")),
             }
             self._detected_at = detected
             if detected is None and not self.capital_reset["settled"]:
@@ -867,6 +913,7 @@ class DailyLossBaseline:
                 "pre_f22": self.capital_reset.get("pre_f22"),
                 "pre_r": self.capital_reset.get("pre_r"),
                 "gap_r": self.capital_reset.get("gap_r"),
+                "r_rebased": bool(self.capital_reset.get("r_rebased")),
             }
         return {
             "version": _VERSION,

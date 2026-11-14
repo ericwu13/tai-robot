@@ -4,7 +4,8 @@ from datetime import datetime
 import pytest
 
 import src.market_data.holidays as hol
-from tests.test_loss_limit_daily_baseline import _pnl, _raw, _tracker, _thu_snapshot_fri_skipped
+from tests.test_loss_limit_daily_baseline import (
+    _app_at, _drive, _pnl, _raw, _tracker, _thu_snapshot_fri_skipped)
 
 
 def _break_calendar(monkeypatch):
@@ -290,3 +291,133 @@ def test_n10_zero_row_inside_the_day_budget_is_not_a_profit(tmp_path):
     # would otherwise print that baseline back as a profit.
     v = tr.observe(_raw(0, 0, 0, f22="64651"), datetime(2026, 11, 16, 9, 0))
     assert v.loss_today <= 0, v.loss_today
+
+
+def test_xj8b_candidate_load_on_the_zero_row_is_not_a_loss_of_b_r(tmp_path, monkeypatch):
+    """Xj8b / XrdE: stop before 15:00, first read is the 05:22 zero row. Not a loss of B_r."""
+    path = tmp_path / "lb.json"
+    app, clock, tr = _app_at(monkeypatch, datetime(2026, 11, 10, 13, 50), limit=20000, path=path)
+    for w in (datetime(2026, 11, 10, 13, 50), datetime(2026, 11, 10, 14, 30)):
+        _drive(app, clock, w, _raw(24960, 60, 0, f22="A"))
+    app, clock, tr = _app_at(monkeypatch, datetime(2026, 11, 11, 5, 25), limit=20000, path=path)
+    tr.load(datetime(2026, 11, 11, 5, 25))
+    _drive(app, clock, datetime(2026, 11, 11, 5, 25), _raw(0, 0, 0, f22="A"))
+    assert app._trading_guard._last_net_pnl >= -100
+    assert not app._trading_guard.paused
+    _drive(app, clock, datetime(2026, 11, 11, 5, 36), _raw(10, 10, 0, f22="B"))
+    _drive(app, clock, datetime(2026, 11, 11, 9, 0), _raw(10, 10, 0, f22="B"))
+    assert not app._trading_guard.paused
+
+
+def _snap_night(tr, b_r_row, night_row, fri=False):
+    d = (13, 14) if fri else (10, 11)
+    tr.observe(b_r_row, datetime(2026, 11, d[0], 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(b_r_row, datetime(2026, 11, d[0], 15, 0, 5))
+    tr.observe(night_row, datetime(2026, 11, d[1], 5, 0))
+
+
+def test_k22_reed_e9e1_reload_without_f22_is_not_looser_than_master(tmp_path):
+    """Reed: Tue R -6,998; Wed 05:22 reload R -5,308, f22 unchanged. 09:30 is the account."""
+    tr = _tracker(tmp_path / "k22.json")
+    _snap_night(tr, _raw(-6950, 30, 18, f22="71649"), _raw(-12210, 60, 36, f22="71649"))
+    v = tr.observe(_raw(-5260, 30, 18, f22="71649"), datetime(2026, 11, 11, 5, 22))
+    assert v.loss_today == -5308, v.loss_today
+    v = tr.observe(_raw(-20260, 50, 18, f22="71649"), datetime(2026, 11, 11, 9, 30))
+    assert v.loss_today == v.account_net == -20328, (v.loss_today, v.account_net)
+
+
+def test_k22b_restart_after_an_unseen_f22_unchanged_reload_is_not_looser(tmp_path):
+    """Down from 16:30 to Wed 07:00. The unseen reload must not read looser than the account."""
+    path = tmp_path / "k22b.json"
+    tr = _tracker(path)
+    s = _raw(-11940, 60, 0, f22="A")
+    tr.observe(s, datetime(2026, 11, 10, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(s, datetime(2026, 11, 10, 15, 0, 5))
+    tr.observe(s, datetime(2026, 11, 10, 16, 30))
+    tr = _tracker(path)
+    tr.load(datetime(2026, 11, 11, 7, 0))
+    for when, row in ((datetime(2026, 11, 11, 7, 0), _raw(-2980, 20, 0, f22="A")),
+                      (datetime(2026, 11, 11, 10, 0), _raw(-4970, 30, 0, f22="A"))):
+        v = tr.observe(row, when)
+        assert v.loss_today <= v.account_net, (when, v.loss_today, v.account_net)
+
+
+def test_k22c_positive_b_r_reload_without_f22_is_not_a_false_loss(tmp_path):
+    """B_r +12,000 and an f22-unchanged reload is the night figure, not R minus 12,000."""
+    tr = _tracker(tmp_path / "k22c.json")
+    _snap_night(tr, _raw(12060, 60, 0, f22="A"), _raw(9080, 80, 0, f22="A"))
+    v = tr.observe(_raw(-2980, 20, 0, f22="A"), datetime(2026, 11, 11, 5, 36))
+    assert v.loss_today == -3000, v.loss_today
+    v = tr.observe(_raw(-4970, 30, 0, f22="A"), datetime(2026, 11, 11, 9, 10))
+    assert v.loss_today == -5000, v.loss_today
+
+
+def test_k22d_evening_fee_dip_then_f22_unchanged_reload(tmp_path):
+    """A 16:01 dip opens the reset. The later reload still matches the last night R."""
+    tr = _tracker(tmp_path / "k22d.json")
+    s = _raw(-11940, 60, 0, f22="A")
+    tr.observe(s, datetime(2026, 11, 10, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(s, datetime(2026, 11, 10, 15, 0, 5))
+    tr.observe(_raw(-11970, 30, 0, f22="A"), datetime(2026, 11, 10, 16, 1))
+    tr.observe(s, datetime(2026, 11, 10, 18, 30))
+    tr.observe(_raw(-14920, 80, 0, f22="A"), datetime(2026, 11, 10, 22, 0))
+    v = tr.observe(_raw(-2980, 20, 0, f22="A"), datetime(2026, 11, 11, 5, 36))
+    assert v.loss_today == -3000, v.loss_today
+    assert tr.capital_reset.get("r_rebased") is True
+    v = tr.observe(_raw(-4970, 30, 0, f22="A"), datetime(2026, 11, 11, 9, 10))
+    assert v.loss_today == v.account_net == -5000, (v.loss_today, v.account_net)
+
+
+def test_k22e_fill_landing_on_pre_r_minus_b_r_is_not_a_reload(tmp_path):
+    """A fill that lands on gap_r - B_r is not a reload when the fees do not match."""
+    tr = _tracker(tmp_path / "k22e.json")
+    s = _raw(-440, 60, 0, f22="A")
+    tr.observe(s, datetime(2026, 11, 10, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(s, datetime(2026, 11, 10, 15, 0, 5))
+    tr.observe(_raw(-470, 30, 0, f22="A"), datetime(2026, 11, 10, 16, 1))
+    tr.observe(_raw(-500, 0, 0, f22="A"), datetime(2026, 11, 10, 16, 30))
+    tr.observe(_raw(90, 90, 0, f22="A"), datetime(2026, 11, 10, 17, 0))
+    assert not tr.capital_reset.get("r_rebased")
+    v = tr.observe(_raw(-900, 100, 0, f22="A"), datetime(2026, 11, 10, 18, 0))
+    assert v.loss_today == -500, v.loss_today
+
+
+def test_k23_reed_xrdl_day_open_on_f22_first_does_not_repause_on_the_night(tmp_path, monkeypatch):
+    """Limit 10,000. Monday's f22-first open reads 0, and 09:10 is -3,000 and not paused."""
+    app, clock, _tr = _app_at(
+        monkeypatch, datetime(2026, 11, 13, 14, 59), limit=10000, path=tmp_path / "k23.json")
+    snap = _raw(-6950, 30, 18, f22="71649")
+    night = _raw(-21902, 60, 36, f22="71649")
+    for when, row in ((datetime(2026, 11, 13, 14, 59), snap), (datetime(2026, 11, 13, 15, 0, 5), snap),
+                      (datetime(2026, 11, 14, 5, 0), night), (datetime(2026, 11, 16, 8, 40), night)):
+        _drive(app, clock, when, row)
+    assert app._trading_guard.paused
+    _drive(app, clock, datetime(2026, 11, 16, 8, 46), _raw(-21902, 60, 36, f22="64651"))
+    assert app._trading_guard._last_net_pnl == 0, app._trading_guard._last_net_pnl
+    _drive(app, clock, datetime(2026, 11, 16, 8, 52), _raw(-14952, 30, 18, f22="64651"))
+    _drive(app, clock, datetime(2026, 11, 16, 9, 10), _raw(-17952, 30, 18, f22="64651"))
+    assert app._trading_guard._last_net_pnl == -3000
+    assert not app._trading_guard.paused
+
+
+def test_n10b_late_batch_zero_row_in_day_budget_with_positive_b_day(tmp_path):
+    """Winning Friday and night: B_day is +12,000. The 08:50 zero row holds about 0."""
+    tr = _tracker(tmp_path / "n10b.json")
+    snap = _raw(5030, 30, 0, f22="A")
+    pre = _raw(12060, 60, 0, f22="A")
+    tr.observe(snap, datetime(2026, 11, 13, 14, 59))
+    tr.consume_failsafe_notice()
+    tr.observe(snap, datetime(2026, 11, 13, 15, 0, 5))
+    tr.observe(pre, datetime(2026, 11, 14, 5, 0))
+    tr.observe(pre, datetime(2026, 11, 16, 8, 31))
+    tr.observe(pre, datetime(2026, 11, 16, 8, 46))
+    v = tr.observe(_raw(0, 0, 0, f22="A"), datetime(2026, 11, 16, 8, 50))
+    assert v.loss_today >= -100, v.loss_today
+    v = tr.observe(_raw(7030, 30, 0, f22="B"), datetime(2026, 11, 16, 8, 52))
+    assert v.loss_today >= -100, v.loss_today
+    v = tr.observe(_raw(4030, 30, 0, f22="B"), datetime(2026, 11, 16, 9, 10))
+    assert v.loss_today == -3000, v.loss_today
