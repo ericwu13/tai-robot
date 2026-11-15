@@ -10946,8 +10946,14 @@ class BacktestApp:
             self._show_order_confirm_dialog(
                 buy_sell, order_symbol, order_desc, price, action_type, new_close=new_close)
 
-    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source="", new_close=2):
-        """Show a non-blocking 10-second confirmation dialog for a real order."""
+    def _show_order_confirm_dialog(self, buy_sell, order_symbol, order_desc, price, action_type, price_source="", new_close=2, manual_flatten=False):
+        """Show a non-blocking 10-second confirmation dialog for a real order.
+
+        ``manual_flatten`` is set only by the CLOSE button. Confirm then
+        always sends with ``exit_open_position=True``, including when the
+        sim is already flat (that stamp is rejected and does not land on
+        the previous trade). A strategy-exit confirm leaves it false.
+        """
         # Dismiss any existing dialog
         self._dismiss_order_dialog("replaced")
 
@@ -11002,7 +11008,16 @@ class BacktestApp:
 
         def on_confirm():
             self._dismiss_order_dialog("confirmed")
-            self._send_real_order(buy_sell, order_symbol, action_type, price, new_close=new_close)
+            # The flag follows the caller, not position_size. A strategy
+            # exit confirmed after the sim close (including a same-bar
+            # re-entry) must keep matching trades[-1] by exit bar.
+            if manual_flatten:
+                self._send_real_order(
+                    buy_sell, order_symbol, action_type, price,
+                    new_close=new_close, exit_open_position=True)
+            else:
+                self._send_real_order(
+                    buy_sell, order_symbol, action_type, price, new_close=new_close)
 
         def on_skip():
             self._dismiss_order_dialog("skipped")
@@ -11067,12 +11082,19 @@ class BacktestApp:
     _FORCE_CLOSE_RETRY_DELAYS = [5000, 10000, 15000]  # ms
 
     def _send_real_order(self, buy_sell, order_symbol, action_type, sim_price,
-                         new_close=2, exit_type="", exit_limit=None):
+                         new_close=2, exit_type="", exit_limit=None,
+                         exit_open_position=False):
         """Build FUTUREORDER and send via COM SKOrderLib.
 
         new_close: 0=new position, 1=close position, 2=auto (exchange decides).
         exit_type: "limit" (TP), "stop" (SL), "close", "force_close", or "".
         exit_limit: strategy's original limit price for take-profit exits.
+        exit_open_position: True only when the EXIT belongs to the still-open
+        sim position. The two callers are ``_stop_live`` (stop-close) and
+        the manual-flatten confirm from ``_manual_close``. Every other
+        caller leaves this False so the seq matches the closed trade by
+        bar. A flat book with the flag set is rejected and does not stamp
+        ``trades[-1]``.
 
         Returns True if order was accepted (code==0), False otherwise.
         """
@@ -11208,7 +11230,8 @@ class BacktestApp:
                     # then). Best-effort: must never break the order path.
                     try:
                         stamped = broker.note_real_order_sent(
-                            action_type, str(message), bar_idx)
+                            action_type, str(message), bar_idx,
+                            open_position=exit_open_position)
                         if not stamped:
                             _log(f"REAL ORDER SEQ not stamped: {action_type} "
                                  f"seq={str(message).strip()} bar={bar_idx}")
@@ -11428,16 +11451,18 @@ class BacktestApp:
         # Get the actual fill price.
         # ENTRY: OnNewData deal row if already arrived, else OpenInterest
         # avg_cost (identical for a 1-lot position).
-        # EXIT: OnNewData deal row recorded on trades[-1].real_exit_price
-        # (issue #92). If that row never arrives, a retry chain polls
-        # GetFulfillReport(1) (per-fill detail, issue #218) for about 90s.
+        # EXIT: the real price on the record that owns this exit seq
+        # (the parked exit, or trades[-1]). If that price hasn't
+        # arrived, a retry chain polls GetFulfillReport(1) (per-fill
+        # detail, issue #218) for about 90s.
         # Exhaustion keeps the sim price, marks the trade estimated, and
         # a late OnNewData/poll sends a Discord correction.
         fill_price = ""
         _exit_fill_deferred = False
         pos = self._fill_poller.pos_current
         if poller_action_type == "exit" and self._live_runner:
-            real_px = self._real_exit_price_from_broker()
+            real_px = self._real_exit_price_from_broker(
+                getattr(self, "_last_exit_order_seq", ""))
             if real_px:
                 fill_price = str(real_px)
             else:
@@ -11539,17 +11564,25 @@ class BacktestApp:
             else:
                 _log(f"FILL CONFIRM DONE: no deferred close to replay")
 
-    def _real_exit_price_from_broker(self) -> int:
-        """The OnNewData-recorded real exit price of the latest trade.
+    def _real_exit_price_from_broker(self, seq: str | None = None) -> int:
+        """Real exit price on the record that owns ``seq``.
 
-        0 when the deal report hasn't arrived yet (or paper mode).
+        A parked seq is owned by ``pending_real_exit_price``. Otherwise
+        the owner is ``trades[-1]``, and a price there counts only when
+        that trade's exit seq is empty or equal to ``seq``. 0 when that
+        record has no price yet. ``seq`` defaults to the last exit order.
         """
         if not self._live_runner:
             return 0
         broker = self._live_runner.broker
-        if not broker.trades:
-            return 0
-        return getattr(broker.trades[-1], "real_exit_price", 0)
+        if seq is None:
+            seq = getattr(self, "_last_exit_order_seq", "")
+        reader = getattr(broker, "exit_price_for_seq", None)
+        if reader is None:
+            if not getattr(broker, "trades", None):
+                return 0
+            return int(getattr(broker.trades[-1], "real_exit_price", 0) or 0)
+        return int(reader(seq) or 0)
 
     # ── Exit fill price retry (issue #92, layout fixed in #218) ──
     #
@@ -11567,7 +11600,8 @@ class BacktestApp:
             return True
         if not self._last_exit_order_seq:
             return False
-        return self._real_exit_price_from_broker() == 0
+        return self._real_exit_price_from_broker(
+            getattr(self, "_last_exit_order_seq", "")) == 0
 
     def _cancel_exit_fill_retry(self) -> None:
         """Drop a pending exit-fill poll so a stop cannot save later.
@@ -11632,12 +11666,18 @@ class BacktestApp:
         elapsed_ms = int((time.monotonic() - ctx["started"]) * 1000)
         seq = self._last_exit_order_seq
 
-        real_px = self._real_exit_price_from_broker()
+        real_px = self._real_exit_price_from_broker(seq)
         source = "OnNewData"
         rate_limited = False
         if not real_px:
-            real_px, rate_limited = self._poll_exit_fill_via_report(seq)
-            source = "GetFulfillReport(1)"
+            _reported, rate_limited = self._poll_exit_fill_via_report(seq)
+            # Resolved only when the record that owns this seq now holds
+            # a price. A match that landed on a different record, or a
+            # report price that was not stored, does not count. A price
+            # written by an earlier path does.
+            real_px = self._real_exit_price_from_broker(seq)
+            if real_px:
+                source = "GetFulfillReport(1)"
 
         _log(f"EXIT FILL RETRY: real_px={real_px} source={source} "
              f"seq={seq} attempt={ctx['attempt']} elapsed_ms={elapsed_ms} "
@@ -11690,8 +11730,12 @@ class BacktestApp:
     def _poll_exit_fill_via_report(self, target_seq: str) -> tuple[int, bool]:
         """Poll GetFulfillReport(1). ``(price, rate_limited)``.
 
-        Price is 0 when nothing was assigned. ``rate_limited`` is True
-        on M999 — the caller backs off and does not consume an attempt.
+        The matched row is written onto the record that owns
+        ``target_seq``: the parked exit when that seq is parked, and
+        ``trades[-1]`` otherwise. A record that already holds a price
+        for this seq is left as it is (a duplicate fill is idempotent).
+        The returned price is the row that matched. ``rate_limited`` is
+        True on M999 — the caller backs off and does not consume an attempt.
         """
         if not target_seq or not _com_available or skO is None:
             return 0, False
@@ -11742,17 +11786,18 @@ class BacktestApp:
 
         broker = self._live_runner.broker if self._live_runner else None
         accepted = False
-        if broker:
+        if broker and not broker.exit_price_for_seq(target_seq):
             last = broker.trades[-1] if broker.trades else None
-            if last and last.real_exit_price == 0:
-                fill_dt = _taipei_now().replace(tzinfo=None
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                accepted = broker.try_set_real_exit_price(
-                    match.price,
-                    exit_bar_index=getattr(last, "exit_bar_index", -1),
-                    fill_dt=fill_dt)
-                _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
-                     f"via {match.reason} accepted={accepted}")
+            fill_dt = _taipei_now().replace(tzinfo=None
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            accepted = broker.try_set_real_exit_price(
+                match.price,
+                exit_bar_index=(getattr(last, "exit_bar_index", -1)
+                                if last else -1),
+                fill_dt=fill_dt,
+                seq=target_seq)
+            _log(f"EXIT FILL POLL: wrote real_exit_price={match.price} "
+                 f"via {match.reason} accepted={accepted}")
         if accepted:
             self._fill_tracker.note_credited(match.row_key)
         return match.price, False
@@ -11793,7 +11838,8 @@ class BacktestApp:
             fill_dt = _taipei_now().replace(tzinfo=None
                 ).strftime("%Y-%m-%d %H:%M:%S")
             accepted = broker.try_set_real_exit_price(
-                fill.price, exit_bar_index=fill.bar_index, fill_dt=fill_dt)
+                fill.price, exit_bar_index=fill.bar_index, fill_dt=fill_dt,
+                seq=fill.seq_no)
             _log(f"REAL FILL (exit): seq={fill.seq_no} price={fill.price} "
                  f"qty={fill.qty} sim={fill.sim_price} accepted={accepted}")
             if not accepted:
@@ -11962,7 +12008,8 @@ class BacktestApp:
         price, price_src = self._get_latest_price()
         self._show_order_confirm_dialog(
             buy_sell, order_symbol, order_desc, price,
-            action_type="exit", price_source=price_src, new_close=1)
+            action_type="exit", price_source=price_src,
+            manual_flatten=True, new_close=1)
 
     def _update_manual_order_buttons(self):
         """Enable/disable manual order buttons based on live state."""
@@ -12505,7 +12552,8 @@ class BacktestApp:
                 # Force semi-auto path for stop-close (no fill gating — bot is stopping)
                 saved_mode = self._trading_mode
                 self._trading_mode = "semi_auto"
-                self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1)
+                self._send_real_order(buy_sell, order_symbol, "exit", price, new_close=1,
+                                      exit_open_position=True)
                 self._trading_mode = saved_mode
             elif (self._trading_mode in ("semi_auto", "auto")
                     and not self._trading_guard.real_entry_confirmed
