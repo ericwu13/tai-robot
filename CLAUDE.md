@@ -18,6 +18,7 @@ Two API approaches: DLL-based (ctypes via SKDLLPython.py) and COM-based (comtype
 - All tests must pass before merging or shipping a release.
 
 ## Release Process
+Release steps (version bump, tag, notes, exe build, GitHub release, Discord) run only after Eric has merged the PRs and there is an explicit release yes from Eric (relayed via Selina for agents). Agents never merge, tag, publish, or post to Discord on their own.
 - Bump `version.py`, write bilingual release notes (繁體中文 + English), build the exe via `build_release.py`, create the GitHub release, upload assets, and send the Discord notification.
 - The Discord notification reads from the GitHub release body — no local file lookup.
 
