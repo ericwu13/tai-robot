@@ -141,6 +141,8 @@ jobs:
             hypothetical edge case with no real-data evidence is a follow-up,
             not P2.
 
+            Review against one goal: set reasonable rules, don't foolproof everything (我們不可能一直防呆，而是要訂好合理的規則). Report only findings that can occur in the current headless, no-GUI workflow. Report a special case only when real logs, data, or an incident show it has happened, unless it makes the change less safe than master. Flag piled-up special cases or fallbacks as P3 and suggest one simpler rule.
+
             Severity:
             - P1: can lose money, send a wrong/duplicate order, or crash/hang a live bot
             - P2: wrong behaviour or state with a realistic trigger
