@@ -2003,3 +2003,72 @@ def test_idle_3002_then_reconnect_does_not_mark_down_on_a_later_deploy(monkeypat
     app._reconnect_timer_id = None
     app._manual_reconnect()
     _assert_closed_gap_deploy_does_not_enter(monkeypatch, app, fake, clock)
+
+
+def test_reconnect_before_degraded_keeps_the_tick_restore_anchor(monkeypatch):
+    """A press before DEGRADED keeps the open-session restore anchor.
+
+    A fresh tick after the press restores READY. IsConnected stays 1,
+    so the press does not call EnterMonitorLONG.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    app._conn_monitor = _give_up_monitor()
+    app._reconnect_timer_id = None
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    anchor = machine._quote_hold_open_at
+    assert anchor == fired
+    press = fired + timedelta(seconds=20)
+    clock["now"] = press
+    fake.set_now(press)
+    enters = fake.calls.count("EnterMonitorLONG")
+    app._manual_reconnect()
+    assert machine.degraded is False
+    assert machine._quote_hold_open_at == anchor
+    assert machine.quote == LinkPhase.DOWN
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    later = press + timedelta(seconds=20)
+    clock["now"] = later
+    fake.set_now(later)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, later)
+    assert machine.quote == LinkPhase.READY
+    assert machine.degraded is False
+    assert app._quote_connected is True
+    assert machine._quote_hold_open_at is None
+
+
+def test_tick_restore_follows_the_anchor_alone(monkeypatch):
+    """The other 3002 flags cannot veto a due restore anchor.
+
+    Clearing the enter-hold, the stuck pause, and the timeout flag
+    while the anchor is still set must still restore on a fresh tick.
+    """
+    drop = tpe(2026, 11, 12, 10, 0)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 1
+    _deliver_3002(app)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    machine = app._link_host.machine
+    assert machine._quote_hold_open_at == fired
+    machine._quote_timeout_hold = False
+    machine._quote_enter_not_before = None
+    machine._quote_stuck_not_before = None
+    later = fired + timedelta(seconds=20)
+    clock["now"] = later
+    fake.set_now(later)
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, later)
+    assert machine.quote == LinkPhase.READY
+    assert machine.degraded is False
+    assert app._quote_connected is True

@@ -315,6 +315,9 @@ class LinkStateMachine:
         # Open session passes release_at=now and no enter_not_before,
         # so the next fresh tick can restore. A closed gap passes the
         # next open, or None when IsConnected()==0.
+        # The anchor is the restore state. The other three fields are
+        # the enter-hold and the stuck pause; clearing them must not
+        # clear a due anchor, and a full end clears all four together.
         self._quote_hold_open_at = enter_not_before or release_at
         self._quote_timeout_hold = True
         self._logged_duplicate_3003 = False
@@ -468,13 +471,11 @@ class LinkStateMachine:
         ``_unreconciled_since``. The press restarts that window from
         now. It does not clear it.
         """
-        # A timeout hold must not swallow this press. Clear it even
-        # when the machine is not DEGRADED: the host still ticks, and
-        # that tick is what reconnects. Other down paths never set it.
-        self._quote_timeout_hold = False
-        self._quote_enter_not_before = None
-        self._quote_hold_open_at = None
-        self._quote_stuck_not_before = None
+        # Lift the enter-hold so this press is not swallowed, including
+        # before DEGRADED. A tick-restore anchor that is already due
+        # stays; a future one is the enter-hold and goes with it.
+        # DEGRADED ends the whole timeout episode.
+        self._lift_quote_enter_hold(now)
         if not self.degraded:
             return
         self.degraded = False
@@ -529,10 +530,7 @@ class LinkStateMachine:
         # A timeout hold must not survive this recovery. A later
         # non-timeout drop in a closed gap would otherwise wait until
         # the next open.
-        self._quote_timeout_hold = False
-        self._quote_enter_not_before = None
-        self._quote_hold_open_at = None
-        self._quote_stuck_not_before = None
+        self._end_quote_timeout()
         if self.quote != LinkPhase.READY:
             self.quote = LinkPhase.READY
             self._pending_3003 = False
@@ -656,10 +654,7 @@ class LinkStateMachine:
             self._saw_3033 = True
             self.quote = LinkPhase.DOWN
             self._quote_down_at = at
-            self._quote_enter_not_before = None
-            self._quote_timeout_hold = False
-            self._quote_hold_open_at = None
-            self._quote_stuck_not_before = None
+            self._end_quote_timeout()
             self._pending_3003 = False
             self._quote_stuck_since = None
             self._logged_duplicate_3003 = False
@@ -686,10 +681,7 @@ class LinkStateMachine:
         if kind == KIND_CONN_ERROR:
             self.quote = LinkPhase.DOWN
             self._quote_down_at = at
-            self._quote_enter_not_before = None
-            self._quote_timeout_hold = False
-            self._quote_hold_open_at = None
-            self._quote_stuck_not_before = None
+            self._end_quote_timeout()
             self._pending_3003 = False
             self._quote_stuck_since = None
             self._logged_duplicate_3003 = False
@@ -1019,9 +1011,7 @@ class LinkStateMachine:
         self._fresh_tick_at = None
         pause = self._quote_stuck_not_before
         if pause is None or now >= pause:
-            self._quote_hold_open_at = None
-            self._quote_timeout_hold = False
-            self._quote_stuck_not_before = None
+            self._end_quote_timeout()
 
     def _finish_quote_ready(self) -> None:
         """STOCKS_READY (3003). Subscribe and mark the quote READY.
@@ -1035,10 +1025,7 @@ class LinkStateMachine:
         self.quote = LinkPhase.READY
         self._quote_stuck_since = None
         self._quote_connect_started_at = None
-        self._quote_enter_not_before = None
-        self._quote_timeout_hold = False
-        self._quote_hold_open_at = None
-        self._quote_stuck_not_before = None
+        self._end_quote_timeout()
         self._logged_duplicate_3003 = False
         self._maybe_finish_solace_episode()
 
@@ -1057,34 +1044,50 @@ class LinkStateMachine:
         self._quote_stuck_not_before = when
         self._quote_stuck_since = None
 
-    def _restore_if_feed_healthy(self, now: datetime) -> bool:
-        """Return to READY when a fresh tick arrived after the release.
+    def _end_quote_timeout(self) -> None:
+        """End the 3002 episode. The four fields clear together."""
+        self._quote_timeout_hold = False
+        self._quote_enter_not_before = None
+        self._quote_hold_open_at = None
+        self._quote_stuck_not_before = None
 
-        That release is the next session open, or the open-session
-        mark-down itself. The tick is the only liveness signal.
-        IsConnected() is not. No subscribe and no EnterMonitor.
-        EnterMonitorLONG forgets a tick from before that call, so it
-        cannot restore READY later.
+    def _lift_quote_enter_hold(self, now: datetime) -> None:
+        """Drop the enter-hold and the stuck pause.
+
+        A reconnect before DEGRADED keeps a tick-restore anchor that
+        is already due. A future anchor is the closed-gap enter-hold
+        and is lifted with it. DEGRADED ends the episode.
         """
+        if self.degraded:
+            self._end_quote_timeout()
+            return
+        anchor = self._quote_hold_open_at
+        self._quote_timeout_hold = False
+        self._quote_enter_not_before = None
+        self._quote_stuck_not_before = None
+        self._quote_hold_open_at = anchor if anchor is not None and now >= anchor else None
+
+    def _restore_if_feed_healthy(self, now: datetime) -> bool:
+        """Return to READY when a fresh tick arrived after the anchor.
+
+        The anchor is the restore state. The enter-hold and the stuck
+        pause are not a second vote. The release is the next session
+        open, or the open-session mark-down itself. The tick is the
+        only liveness signal. IsConnected() is not. No subscribe and
+        no EnterMonitor. EnterMonitorLONG forgets a tick from before
+        that call, so it cannot restore READY later.
+        """
+        # The anchor is the only restore state. The enter-hold and the
+        # stuck pause cannot veto a tick that landed at or after it.
         release = self._quote_hold_open_at
-        if release is None or now < release:
-            return False
-        pending = (
-            self._quote_timeout_hold
-            or self._quote_stuck_since is not None
-            or self._quote_enter_not_before is not None
-        )
-        if not pending or self.degraded:
+        if release is None or now < release or self.degraded:
             return False
         tick_at = self._fresh_tick_at
         if tick_at is None or tick_at < release:
             return False
         self.quote = LinkPhase.READY
         self._quote_stuck_since = None
-        self._quote_timeout_hold = False
-        self._quote_enter_not_before = None
-        self._quote_hold_open_at = None
-        self._quote_stuck_not_before = None
+        self._end_quote_timeout()
         self._pending_3003 = False
         self._quote_connect_started_at = None
         self._logged_duplicate_3003 = False
