@@ -164,7 +164,7 @@ def test_all_feeds_network_error_keeps_vote_and_records_failed(tmp_path, monkeyp
     monkeypatch.setattr(rss_scorer, "post_discord_embed", post)
     monkeypatch.setattr(rss_scorer.urllib.request, "urlopen", boom)
     state = rss_scorer._recorded_pass(cfg, dict(seeded), str(tmp_path / "bridge" / "regime_vote.json"),
-                                       state_path)
+                                       state_path, now=_NOW)
     saved = json.loads(Path(state_path).read_text(encoding="utf-8"))
 
     assert saved["session_net"] == 1.25
@@ -186,7 +186,7 @@ def test_all_feeds_network_error_keeps_vote_and_records_failed(tmp_path, monkeyp
     assert notes and "fetch failed" in notes[0].lower()
     assert "gemini" not in notes[0].lower()
 
-    rss_scorer._recorded_pass(cfg, state, str(tmp_path / "bridge" / "regime_vote.json"), state_path)
+    rss_scorer._recorded_pass(cfg, state, str(tmp_path / "bridge" / "regime_vote.json"), state_path, now=_NOW)
     assert notes == [notes[0]]  # errors mode fires once
     assert json.loads(Path(state_path).read_text(encoding="utf-8"))["fetch_error_streak"] == 2
 
@@ -202,7 +202,7 @@ def test_transport_http_and_bozo_count_as_failed(tmp_path, monkeypatch):
     for kind, fake in cases.items():
         cfg, state_path = _cfg(tmp_path / kind, ["https://feed.example/rss"])
         monkeypatch.setattr(rss_scorer.urllib.request, "urlopen", fake)
-        state = rss_scorer._recorded_pass(cfg, {"session_net": 0.5, "error_streak": 1}, "", state_path)
+        state = rss_scorer._recorded_pass(cfg, {"session_net": 0.5, "error_streak": 1}, "", state_path, now=_NOW)
         assert state["fetch_status"] == "failed", kind
         assert state["session_net"] == 0.5, kind
         assert state["error_streak"] == 1, kind
@@ -240,7 +240,7 @@ def test_partial_failure_still_scores(tmp_path, monkeypatch):
                         lambda *_a, **_k: {"direction": "bullish", "confidence": 0.9, "reason": "beat"})
     seeded = {"seen_guids": [], "session_net": 0.4, "session_peak": 0.4,
               "session_key": "2026-11-11|NIGHT", "error_streak": 0}
-    state = rss_scorer._recorded_pass(cfg, dict(seeded), "", state_path)
+    state = rss_scorer._recorded_pass(cfg, dict(seeded), "", state_path, now=_NOW)
     assert state["fetch_status"] == "degraded"
     assert state["feeds_ok"] == 2 and state["feeds_failed"] == 1
     assert state["fetch_error_streak"] == 0
@@ -260,7 +260,7 @@ def test_html_200_fails_the_feed_and_leaves_the_session(tmp_path, monkeypatch):
     monkeypatch.setattr(rss_scorer.urllib.request, "urlopen", lambda *_a, **_k: _Body(html))
     seeded = {"seen_guids": ["keep"], "session_net": 1.25, "session_peak": 2.5,
               "error_streak": 2}
-    state = rss_scorer._recorded_pass(cfg, dict(seeded), "", state_path)
+    state = rss_scorer._recorded_pass(cfg, dict(seeded), "", state_path, now=_NOW)
     assert state["fetch_status"] == "failed"
     assert state["session_net"] == 1.25
     assert state["session_peak"] == 2.5
@@ -274,7 +274,7 @@ def test_all_200_empty_is_quiet(tmp_path, monkeypatch):
     monkeypatch.setattr(rss_scorer.urllib.request, "urlopen",
                         lambda *_a, **_k: _Body(_empty_rss()))
     state = rss_scorer._recorded_pass(
-        cfg, {"session_net": 0.8, "session_peak": 0.8, "error_streak": 0}, "", state_path)
+        cfg, {"session_net": 0.8, "session_peak": 0.8, "error_streak": 0}, "", state_path, now=_NOW)
     assert state["fetch_status"] == "ok"
     assert state["feeds_ok"] == 2 and state["feeds_failed"] == 0
     assert state["session_net"] == 0.8

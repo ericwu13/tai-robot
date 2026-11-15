@@ -1,16 +1,16 @@
 #!/bin/bash
-# usage: fetch.sh <bot_dir_name> <out_file> [install]      (READ-ONLY on the host)
+# usage: fetch.sh <bot_dir_name> <out_file>      (READ-ONLY on the host)
 # Runs extract.ps1 on the trading PC over SSH and saves its evidence bundle.
-# REAL_AUDIT_SSH must hold the ssh target + options, e.g.
-#   export REAL_AUDIT_SSH="-F /dev/null -i ~/.ssh/<key> <user>@<tailscale-ip>"
+# Runs under Git Bash on Windows (needs cygpath, iconv, base64, ssh).
+# Both settings come from the environment; neither has a default:
+#   export REAL_AUDIT_SSH="-F /dev/null -i ~/.ssh/<key> <user>@<host>"
+#   export REAL_AUDIT_ROOT='<drive>:\<install>\tai_backtest\data\live'   # the dashboard's --base-dir
 # (see the tailscale-ssh skill's hosts.local.yaml; never commit the values).
-# install defaults to tai_robot_v21916; bots live in E:\<install>\tai_backtest\data\live
 set -e
 : "${REAL_AUDIT_SSH:?set REAL_AUDIT_SSH (see header)}"
-INST="${3:-tai_robot_v21916}"
+: "${REAL_AUDIT_ROOT:?set REAL_AUDIT_ROOT (see header)}"
 H="$(cd "$(dirname "$0")" && pwd)"
-ROOT='E:\'"$INST"'\tai_backtest\data\live'
-python - "$(cygpath -w "$H/extract.ps1")" "$(cygpath -w "$2.ps1")" "$1" "$ROOT" <<'PY'
+python - "$(cygpath -w "$H/extract.ps1")" "$(cygpath -w "$2.ps1")" "$1" "$REAL_AUDIT_ROOT" <<'PY'
 import sys
 src, dst, bot, root = sys.argv[1:5]
 t = open(src, encoding="utf-8").read().replace("__BOT__", bot).replace("__ROOT__", root)
