@@ -1,0 +1,41 @@
+name: Needs-owner ping
+
+# Discord ping when a person or Cursor adds the `needs-owner` label to a PR
+# or issue. When the Claude review adds it (third BLOCK), the job token adds
+# the label, which starts no workflow, so claude-review.yml pings directly.
+#
+# Secrets (optional; without the webhook nothing is sent):
+#   DISCORD_REVIEW_WEBHOOK  channel webhook URL
+#   DISCORD_OWNER_MENTION   e.g. "<@user id>" so the owner is pinged
+#
+# pull_request_target runs the base-branch copy of this file and script and
+# never checks out PR code; the PR title only goes into the message text.
+
+on:
+  pull_request_target:
+    types: [labeled]
+  issues:
+    types: [labeled]
+
+jobs:
+  ping:
+    if: github.event.label.name == 'needs-owner'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+      - name: Ping the owner on Discord
+        env:
+          DISCORD_REVIEW_WEBHOOK: ${{ secrets.DISCORD_REVIEW_WEBHOOK }}
+          DISCORD_OWNER_MENTION: ${{ secrets.DISCORD_OWNER_MENTION }}
+          KIND: ${{ github.event.pull_request && 'PR' || 'issue' }}
+          NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          TITLE: ${{ github.event.pull_request.title || github.event.issue.title }}
+          URL: ${{ github.event.pull_request.html_url || github.event.issue.html_url }}
+          ACTOR: ${{ github.actor }}
+        run: python3 .github/scripts/claude_review_post.py ping

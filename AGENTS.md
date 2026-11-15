@@ -34,7 +34,8 @@ foolproofing. One clear rule beats a branch per scenario.
    evidence. Otherwise keep the one rule and name the gap.
 4. **Stop rule.** If the PR has the `needs-owner` label (Claude blocked it
    three times), stop pushing. Post ONE question to the owner with the
-   options and your recommendation, then wait for the answer.
+   options and your recommendation, then wait for the answer. Adding the
+   label yourself (for a `Needs owner` reply) pings the owner on Discord.
 5. **Don't push only to refresh.** Merge master only to resolve a conflict
    or pick up a change you need. A no-op merge doesn't change the verdict.
 6. **Docs that describe new behaviour ship in the same PR as the code**,
