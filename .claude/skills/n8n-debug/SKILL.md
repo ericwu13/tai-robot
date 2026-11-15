@@ -88,12 +88,10 @@ C:/Python313/python.exe .claude/skills/n8n-debug/scripts/n8n_query.py status
 pytest and your shell run as `eric8` **with** user site-packages; the
 service runs as LocalSystem **without** them. Code reading + green tests
 prove nothing about the deployment env. Therefore, after ANY change to
-`scripts/news_bridge/*`, run the `--dry-run` check only:
+`scripts/news_bridge/*`:
 
 ```bash
-C:/Python313/python.exe -s <script> --dry-run   # only chips_monitor.py;
-# --once runs a real cycle (it can fetch and write a vote) and must not
-# be run from this skill
+# `--once` runs a real cycle (writes vote/signal, posts Discord) — do not run it from this skill.
 ```
 
 `-s` on `C:/Python313/python.exe` replicates LocalSystem's package
