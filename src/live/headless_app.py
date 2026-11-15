@@ -99,6 +99,19 @@ class HeadlessBotApp(rb.BacktestApp):
     def _check_for_updates_bg(self):
         return  # no update banner without a window
 
+    # ── display-only work nobody can see (#285) ──
+
+    def _render_report_view(self, title, metrics, trades, regime_info,
+                            header_lines, message=None,
+                            real_panel=True) -> None:
+        # The root is withdrawn for the life of the process, so the Report
+        # tab is never on screen. Rebuilding it destroys and recreates ~70
+        # ttk widgets on the thread that drains COM ticks and runs tick
+        # exits, and it was the sampled frame in 3 of 4 #285 hang dumps.
+        # The trade tree and every runner/broker path are unchanged; only
+        # the invisible card rebuild is skipped.
+        return
+
     # ── console mirror of the Live tab ──
 
     def _live_log_msg(self, msg, tag="status"):

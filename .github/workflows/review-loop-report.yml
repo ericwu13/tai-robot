@@ -1,0 +1,36 @@
+name: Review loop report
+
+# Weekly health report of the Claude review loop: Opus reviews, carry-overs,
+# verdict flips per PR, PRs waiting on the owner, unresolved Claude threads.
+# Written to the run's job summary; a short version goes to Discord when the
+# DISCORD_REVIEW_WEBHOOK secret is set. Read-only.
+
+on:
+  schedule:
+    - cron: "0 1 * * 1"   # Monday 09:00 Taipei
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Days to look back"
+        default: "7"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Build the report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAYS: ${{ inputs.days || '7' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DISCORD_REVIEW_WEBHOOK: ${{ secrets.DISCORD_REVIEW_WEBHOOK }}
+        run: python3 .github/scripts/review_loop_report.py

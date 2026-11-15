@@ -1,6 +1,6 @@
 ---
 name: log-scan
-description: Scan tai-robot bot debug logs and the news-bridge logs for known error signatures — tracebacks, corrupted state, failed Discord sends, refused swaps, n8n workflow failures. Use when something broke and the cause is unknown, after a crash, or when asking "is there anything scary in the logs?".
+description: Scan tai-robot bot debug logs and the news-bridge logs for known error signatures — tracebacks, corrupted state, failed Discord sends, refused swaps. Use when something broke and the cause is unknown, after a crash, or when asking "is there anything scary in the logs?". Retired local n8n logs are history-only (`n8n-debug`); live W1–W4 failures are `bridge-health`.
 ---
 
 # Log Scan
@@ -22,8 +22,10 @@ C:/Python313/python.exe -s scripts/monitor/check_logs.py
 ```
 
 Scans, per bot directory, the newest two `debug_YYYYMMDD.log` files from
-the **last 7 days** (older logs are archaeology from retired test bots),
-plus `n8n-service.log` and `~/.n8n/n8nEventLog.log`.
+the **last 7 days** (older logs are archaeology from retired test bots).
+`n8n-service.log` and `~/.n8n/n8nEventLog.log` are history-only (retired
+local n8n, stopped 2026-10-24). Do not treat them as live bridge health —
+live W1–W4 are `bridge-health`.
 
 ## Pattern → severity
 
@@ -47,7 +49,7 @@ message body:
 | P2 | `Discarded pending recommendation` |
 | P3 | `Dropped out-of-order aggregated bar` |
 | P3 | `Discarded recommendation` |
-| P2 | any `n8n.workflow.failed` event in the last 24h |
+| P2 | `n8n.workflow.failed` — check_logs.py reports only the last 24 h, so a hit means the retired local n8n ran again (W1–W4 double-run risk); report it, don't ignore it |
 
 Findings are deduped per (pattern, file) and capped at 5 example lines,
 each redacted before it is printed.
@@ -68,12 +70,17 @@ each redacted before it is printed.
 - A `Traceback` in a log from months ago is a retired test bot, not an
   incident; the 7-day window exists for exactly that reason. If you widen
   it manually, check the bot is one that still runs.
+- A `n8n.workflow.failed` hit from `check_logs.py` is a P2 (row above):
+  the script reports only the last 24 h and local n8n is retired, so a
+  hit means it ran again. Report it; `n8n-debug` is history only, do not
+  run it. A live bridge failure or a missing vote → `bridge-health`.
 
 ## Next steps
 
 - traceback in a live bot → the repo's `debug` skill (root-cause → fix →
   review → release)
-- `n8n.workflow.failed` hits → the `n8n-debug` skill for the actual
-  execution record (`execs --errors`, then `detail <id>`)
+- `n8n.workflow.failed` from check_logs.py → report it as a P2 (local n8n
+  ran again, W1–W4 double-run risk); `n8n-debug` is history only, do not
+  run it. A live bridge silence or missing vote → `bridge-health`
 - `Discord send failed` → confirm `notifications.*` wiring with
   `deploy-check`
