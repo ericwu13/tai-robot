@@ -9190,12 +9190,10 @@ class BacktestApp:
         try:
             from src.live.loss_baseline import DailyLossBaseline
             self._loss_view = None
-            self._pause_failsafe_adopted = False
             self._loss_baseline = DailyLossBaseline(
                 os.path.join(self._live_runner.bot_dir, "loss_baseline.json"),
                 getattr(self, "_futures_account", "") or "")
             self._loss_baseline.load(_taipei_now())
-            self._adopt_persisted_pause_failsafe()
         except Exception as exc:
             self._loss_baseline = None
             _log(f"[LOSS] baseline load failed: [{type(exc).__name__}] {exc}")
@@ -10559,11 +10557,6 @@ class BacktestApp:
         view = self._observe_loss_baseline(now)
         net = view.loss_today if view is not None else display.net_pnl_int
         day_key = view.day_key if view is not None else _tg.trading_day_key(now)
-        # Same one-shot handling as the account poll. Observing here
-        # consumes settled_after_reset / day_failsafe_recheck; dropping
-        # them would skip the Q3 recheck.
-        self._adopt_persisted_pause_failsafe()
-        self._handle_loss_edges(view, net, day_key)
         if net < -req.loss_limit:
             if view is None:
                 _refuse(f"帳戶淨損益 {net:+,} 已超過每日虧損上限 -{req.loss_limit:,}，拒絕切換至全自動")
@@ -10585,17 +10578,13 @@ class BacktestApp:
         # by the trading-day boundary — the bot would silently fall back
         # to the old latch until its next deploy.
         saved = (guard.daily_loss_limit, runner.daily_loss_limit,
-                 guard._last_net_pnl, guard.paused, guard._pause_day_key,
-                 getattr(guard, "_pause_failsafe", False))
+                 guard._last_net_pnl, guard.paused, guard._pause_day_key)
         guard.arm_for_live_switch(req.loss_limit)
         # Same clock as the account-display poll. A pause recorded on
         # this attempt has to carry today's key, or the 15:00 boundary
         # can never release it. The strict pre-check above makes a new
         # pause unreachable today; the key is what keeps that fragile.
-        if view is not None and view.basis == "failsafe":
-            guard.update_pnl(net, day_key=day_key, failsafe=True)
-        else:
-            guard.update_pnl(net, day_key=day_key)
+        guard.update_pnl(net, day_key=day_key)
         runner.daily_loss_limit = req.loss_limit
         if not self._apply_requested_mode(bot_dir, req):
             # The switch was refused. Do not leave this attempt's account
@@ -10604,7 +10593,6 @@ class BacktestApp:
             guard._last_net_pnl = saved[2]
             guard.paused = saved[3]
             guard._pause_day_key = saved[4]
-            guard._pause_failsafe = saved[5]
 
     def _apply_requested_mode(self, bot_dir: str, req) -> bool:
         """Apply through ``LiveRunner._apply_mode_switch``; True on success."""
@@ -12289,66 +12277,7 @@ class BacktestApp:
             _log(f"[LOSS] baseline observe failed: [{type(exc).__name__}] {exc}")
             return None
         self._loss_view = view
-        notice = tracker.consume_failsafe_notice()
-        if notice:
-            _log(notice)
-            try:
-                self._live_log_msg(notice, "status")
-            except Exception:
-                pass
-            discord = _discord
-            if discord is not None and getattr(discord, "enabled", False):
-                notify = getattr(discord, "notify", None)
-                if callable(notify):
-                    try:
-                        notify(notice)
-                    except Exception as exc:
-                        _log(
-                            "[LOSS] baseline note failed: "
-                            f"[{type(exc).__name__}] {exc}")
         return view
-
-    def _adopt_persisted_pause_failsafe(self) -> None:
-        """Put a restarted failsafe pause back on the guard, once.
-
-        ``loss_baseline.json`` keeps the flag. ``reset()`` on deploy
-        clears the guard, so without this the Q3 recheck never runs.
-        """
-        if getattr(self, "_pause_failsafe_adopted", False):
-            return
-        self._pause_failsafe_adopted = True
-        tracker = getattr(self, "_loss_baseline", None)
-        guard = getattr(self, "_trading_guard", None)
-        if tracker is None or guard is None:
-            return
-        if not getattr(tracker, "pause_failsafe", False):
-            return
-        guard._pause_failsafe = True
-        guard.paused = True
-        key = getattr(tracker, "day_key", "") or ""
-        if key and not getattr(guard, "_pause_day_key", ""):
-            guard._pause_day_key = key
-
-    def _handle_loss_edges(self, view, net, day_key) -> bool:
-        """Act on one-shot baseline transitions. True if a pause just tripped."""
-        if view is None:
-            return False
-        guard = self._trading_guard
-        if view.day_budget_opened:
-            return bool(guard.release_for_day_budget(net, day_key))
-        if view.settled_after_reset or view.day_failsafe_recheck:
-            return bool(guard.recheck_failsafe_pause(net, day_key))
-        return False
-
-    def _sync_loss_pause_flag(self) -> None:
-        tracker = getattr(self, "_loss_baseline", None)
-        guard = getattr(self, "_trading_guard", None)
-        if tracker is None or guard is None:
-            return
-        try:
-            tracker.set_pause_failsafe(bool(getattr(guard, "_pause_failsafe", False)))
-        except Exception as exc:
-            _log(f"[LOSS] pause flag save failed: [{type(exc).__name__}] {exc}")
 
     def _update_real_account_display(self) -> bool:
         """Update the real account UI labels from AccountMonitor computed data.
@@ -12375,7 +12304,6 @@ class BacktestApp:
             guard = self._trading_guard
             now = _taipei_now()
             view = self._observe_loss_baseline(now)
-            self._adopt_persisted_pause_failsafe()
             if self._trading_mode in ("semi_auto", "auto"):
                 if view is not None:
                     net = view.loss_today
@@ -12394,16 +12322,7 @@ class BacktestApp:
                             f"{net:+,} / -{guard.daily_loss_limit:,}")
                 else:
                     self.real_loss_limit_var.set("--")
-                day_recheck = bool(
-                    view is not None and view.day_failsafe_recheck)
-                if view is not None and (view.basis == "failsafe" or day_recheck):
-                    triggered = guard.update_pnl(
-                        net, day_key=day_key, failsafe=True)
-                else:
-                    triggered = guard.update_pnl(net, day_key=day_key)
-                if self._handle_loss_edges(view, net, day_key):
-                    triggered = True
-                self._sync_loss_pause_flag()
+                triggered = guard.update_pnl(net, day_key=day_key)
                 # Not a hold release. An open-interest refresh also
                 # lands here while the equity hold is still owed, so
                 # this must not clear _equity_refresh_held_alerted.
@@ -12431,17 +12350,11 @@ class BacktestApp:
                                 "[CONN] daily loss limit notify failed: "
                                 f"[{type(exc).__name__}] {exc}")
             else:
-                # Paper observes so a later switch has a warm baseline.
-                # It does not start a new pause. One-shot transitions
-                # (settle, missing day baseline, day-budget open) still
-                # run, or the pre-check would see them already consumed.
-                if view is not None:
-                    self._handle_loss_edges(
-                        view, view.loss_today, view.day_key)
+                # Paper observes so a later switch has this night's
+                # snapshot. It does not start a new pause. A pause
+                # carried in from a real mode still ends at the
+                # trading-day boundary.
                 guard.roll_day(_tg.trading_day_key(now))
-                # roll_day and a settle recheck clear the guard flag.
-                # Write that back, or a restart re-pauses with no edge left.
-                self._sync_loss_pause_flag()
                 self.real_loss_limit_var.set("--")
         else:
             self.real_fees_var.set(d.fees)
@@ -12626,7 +12539,6 @@ class BacktestApp:
     def _stop_live(self):
         """Stop the live bot and restore UI."""
         self._loss_view = None
-        self._pause_failsafe_adopted = False
         # The grid sweep runs in another process. The worker polls this
         # flag and terminates that child so a GUI stop does not wait
         # out the sweep. The headless STOP file is polled the same way.

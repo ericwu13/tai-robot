@@ -33,11 +33,12 @@ trading:
   mode_switch_max_loss_ntd: {}
   # Default real-order daily loss limit (NT$) offered by the deploy
   # dialog and `run_bot_cli deploy --loss-limit`. The gate itself is
-  # per bot; this value is only the pre-fill. The counted loss is
-  # net_now minus the snapshot (the last read before 15:00), and only
-  # when this process saw that roll. From 05:00 to 08:30 that loss is held, and the 08:30
-  # anchor runs, only when this process saw a read in 04:50-05:00 on the
-  # same key. Otherwise the gate uses the account net, as on master.
+  # per bot; this value is only the pre-fill. During the night session
+  # (15:00 to 05:00 TPE), a valid snapshot makes the counted loss
+  # net_now minus that snapshot. Otherwise, and at all other times, it
+  # is the full account net. The snapshot is the last read in 13:45 to
+  # 15:00 TPE of that trading day, seen by this process or restored
+  # from a same-key file that records that read time.
   # NOT the same as risk.max_daily_loss below, which
   # gates the backtest ExecutionEngine and never places a real order.
   daily_loss_limit_ntd: 20000

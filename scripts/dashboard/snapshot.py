@@ -174,8 +174,6 @@ def loss_status(heartbeat) -> dict | None:
     if limit is not None:
         parts.append("limit off" if limit == 0 else f"limit {limit:,}")
     text = " / ".join(parts)
-    if heartbeat.get("loss_basis") == "failsafe" and text:
-        text = f"{text} / no 15:00 baseline"
     return {
         "paused": paused,
         "badge": "PAUSED" if paused else "",
