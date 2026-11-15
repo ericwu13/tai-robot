@@ -97,7 +97,7 @@ def w3(tmp_path, monkeypatch):
 
 
 def test_w3_records_a_scoring_pass(w3, monkeypatch):
-    def ok(cfg, state, vote_out):
+    def ok(cfg, state, vote_out, now=None):
         state.update(last_check="2026-11-07T16:00:00+08:00", error_streak=0,
                      last_fetched=40, last_new=3, last_articles_scored=3,
                      session_net=0.7)
@@ -109,7 +109,7 @@ def test_w3_records_a_scoring_pass(w3, monkeypatch):
 
 
 def test_w3_new_scoring_error_marks_the_run_failed(w3, monkeypatch):
-    def failing(cfg, state, vote_out):
+    def failing(cfg, state, vote_out, now=None):
         state.update(error_streak=int(state.get("error_streak") or 0) + 1,
                      last_error="HTTP 429 quota")
         return state
