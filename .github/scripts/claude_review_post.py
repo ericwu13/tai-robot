@@ -5,16 +5,22 @@
         (first comment by the job token's bot) to OUT_JSON, so Claude can
         decide which ones the new head fixes.
 
-    python claude_review_post.py post
+    python claude_review_post.py post OPEN_JSON
         Read the action's structured_output JSON from $RESULT and:
-        1. resolve every `resolved_threads` entry that is still an open thread
-           opened by this workflow (anything else is ignored: Claude can never
-           resolve a human's or Cursor's thread), replying "Fixed in <sha>";
-        2. post every `inline_comments` entry as a line comment, all in one PR
-           review (one resolvable thread each). If GitHub rejects the batch
-           (422: a line not in the diff), each comment is retried alone and
-           the rejected ones are listed in the summary instead;
-        3. post `summary` (plus a footer) as a PR comment.
+        1. resolve every thread listed in OPEN_JSON (what Claude was shown)
+           that is still open and was opened by this workflow, EXCEPT the ids
+           in `still_open_threads`. One rule: the current review is the source
+           of truth, so a thread it does not re-confirm as P1/P2 is closed
+           (fixed, superseded, or not worth blocking on). Never touches a
+           human's or Cursor's thread. If OPEN_JSON is missing, nothing is
+           resolved;
+        2. post every `inline_comments` entry (P1/P2) as a line comment, all
+           in one PR review. If GitHub rejects the batch (422: a line not in
+           the diff), each comment is retried alone and the rejected ones are
+           listed in the summary instead;
+        3. write `summary` (plus a footer) into the PR's previous Claude
+           summary comment, or create one if there is none, so the PR keeps a
+           single current summary instead of one per push.
 
 Env: PR, HEAD_SHA, GITHUB_REPOSITORY, GH_TOKEN (+ RESULT for post). Uses gh.
 """
@@ -79,29 +85,54 @@ def open_bot_threads(repo, pr):
         after = conn["pageInfo"]["endCursor"]
 
 
-def resolve_threads(repo, pr, head_sha, requested):
-    """Resolve requested threads, but only open ones this workflow opened."""
-    if not requested:
-        return 0
-    allowed = {t["id"] for t in open_bot_threads(repo, pr)}
+def threads_to_resolve(shown_ids, open_ids, still_open):
+    """Threads Claude was shown that are still open and bot-opened, minus
+    the ones it re-confirmed. Pure function."""
+    keep = {str(i) for i in still_open}
+    return [t for t in shown_ids if t in open_ids and t not in keep]
+
+
+def resolve_threads(repo, pr, head_sha, shown_ids, still_open):
+    """Resolve every shown bot thread the current review did not re-confirm."""
+    if not shown_ids:
+        return 0, 0
+    open_ids = {t["id"] for t in open_bot_threads(repo, pr)}
+    todo = threads_to_resolve(shown_ids, open_ids, still_open)
     done = 0
-    for item in requested:
-        tid = str(item.get("id") or "")
-        if tid not in allowed:
-            print(f"skip resolve {tid!r}: not an open thread opened by this workflow")
-            continue
-        reason = str(item.get("reason") or "").strip() or "the finding no longer applies"
+    for tid in todo:
         try:
             graphql("mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply("
                     "input:{pullRequestReviewThreadId:$t, body:$b}){comment{id}}}",
-                    {"t": tid, "b": f"Fixed in `{head_sha[:7]}`: {reason}"})
+                    {"t": tid, "b": f"Not raised by the review at `{head_sha[:7]}` "
+                                    "(fixed, superseded, or not a P1/P2). Resolving."})
             graphql("mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}",
                     {"t": tid})
             done += 1
         except RuntimeError as exc:
             print(f"could not resolve {tid}: {exc}")
-    print(f"resolved {done}/{len(requested)} thread(s)")
-    return done
+    print(f"resolved {done}/{len(todo)} thread(s); kept {len(shown_ids) - len(todo)}")
+    return done, len(todo)
+
+
+SUMMARY_JQ = ('.[] | select((.user.login == "github-actions[bot]") and '
+              '(.body | startswith("## Claude review"))) | .id')
+
+
+def upsert_summary(repo, pr, body_path):
+    """Edit the previous Claude summary comment, or create one."""
+    proc = subprocess.run(
+        ["gh", "api", "--paginate", f"repos/{repo}/issues/{pr}/comments", "--jq", SUMMARY_JQ],
+        capture_output=True, text=True, encoding="utf-8")
+    ids = [x for x in (proc.stdout or "").split() if x.isdigit()] if proc.returncode == 0 else []
+    if ids:
+        rc = subprocess.run(["gh", "api", "--method", "PATCH",
+                             f"repos/{repo}/issues/comments/{ids[-1]}",
+                             "-F", f"body=@{body_path}"]).returncode
+        if rc == 0:
+            print(f"updated summary comment {ids[-1]}")
+            return 0
+        print("could not update the previous summary; posting a new one")
+    return subprocess.run(["gh", "pr", "comment", pr, "--body-file", body_path]).returncode
 
 
 def to_review_comment(c):
@@ -149,16 +180,22 @@ def collect(out_path):
     print(f"{len(threads)} open Claude thread(s) -> {out_path}")
 
 
-def post():
+def post(open_json):
     r = json.loads(os.environ["RESULT"])
     repo, pr, head = os.environ["GITHUB_REPOSITORY"], os.environ["PR"], os.environ["HEAD_SHA"]
 
-    requested = [t for t in (r.get("resolved_threads") or []) if isinstance(t, dict)]
     try:
-        resolved = resolve_threads(repo, pr, head, requested)
+        with open(open_json, encoding="utf-8") as f:
+            shown_ids = [str(t["id"]) for t in json.load(f) if t.get("id")]
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"no shown-threads file ({exc}); resolving nothing")
+        shown_ids = []
+    still_open = [str(i) for i in (r.get("still_open_threads") or [])]
+    try:
+        resolved, to_resolve = resolve_threads(repo, pr, head, shown_ids, still_open)
     except RuntimeError as exc:
         print(f"could not resolve threads: {exc}")
-        resolved = 0
+        resolved, to_resolve = 0, 0
 
     comments = [c for c in (r.get("inline_comments") or [])
                 if c.get("path") and c.get("line") and c.get("body")]
@@ -170,12 +207,13 @@ def post():
         for c in failed:
             body += f"\n**`{c['path']}:{c['line']}`**\n\n{c['body']}\n"
     body += ("\n\n<sub>Verdict: **%s** | P1 %s | P2 %s | P3 %s | inline %d/%d | "
-             "resolved %d/%d | model claude-opus-5-5</sub>"
+             "threads resolved %d/%d, kept %d | model claude-opus-5-5</sub>"
              % (r.get("verdict"), r.get("p1"), r.get("p2"), r.get("p3"),
-                len(comments) - len(failed), len(comments), resolved, len(requested)))
+                len(comments) - len(failed), len(comments), resolved, to_resolve,
+                len(shown_ids) - to_resolve))
     with open("summary.md", "w", encoding="utf-8") as f:
         f.write(body)
-    sys.exit(subprocess.run(["gh", "pr", "comment", pr, "--body-file", "summary.md"]).returncode)
+    sys.exit(upsert_summary(repo, pr, "summary.md"))
 
 
 if __name__ == "__main__":
@@ -183,4 +221,4 @@ if __name__ == "__main__":
     if mode == "collect":
         collect(sys.argv[2])
     else:
-        post()
+        post(sys.argv[2] if len(sys.argv) > 2 else "")
