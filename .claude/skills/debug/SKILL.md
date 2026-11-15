@@ -1,6 +1,6 @@
 ---
 name: debug
-description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then ship a versioned GitHub release with Discord notification. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
+description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then, only after an explicit release yes from Eric (relayed via Selina for agents), ship a versioned release per CLAUDE.md § Release Process. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
 ---
 
 # tai-robot Debug Workflow
@@ -51,9 +51,11 @@ jump to code assumptions before you have read them.
    evidence — not an assumption — decide which code path to inspect next.
 3. Do **not** assume — follow the actual call chain. When adding a new branch,
    check what state it inherits. Trace ALL mutation points before concluding.
-4. If the logs lack the detail needed, **add logging to the bot** first, redeploy/
-   re-run, and gather more data before proposing a fix. Diagnosing on insufficient
-   data is how surface-level patches happen.
+4. If the logs lack the detail needed, **add logging to the bot** first.
+   Redeploy only via the `deploy` skill, with its gates and Eric's yes via
+   Selina. Do not deploy from this PC unless Eric asked for a local bot.
+   Never edit the live main tree (deploying from it through `deploy` is fine). Gather more data before proposing a fix.
+   Diagnosing on insufficient data is how surface-level patches happen.
 5. Output of this phase (all three, logged in the diagnosis before handing off to Opus):
    - **Root-cause statement** — what, where, why. Not a fix yet.
    - **Fix confidence rating (0–100%)** — state the confidence level in the proposed
@@ -113,10 +115,13 @@ vars, event log, SQLite) → `n8n-debug`.
 ## Phase 4 — Ship
 Goal: a versioned release with a Discord notification.
 
-1. Merge `fix/<issue-slug>` to `master`.
-2. Bump `version.py`.
-3. Build the exe via `build_release.py`.
-4. Write bilingual release notes (繁體中文 + English).
-5. Create the GitHub release and upload assets.
-6. Send the Discord notification — it reads from the GitHub release body (no local
-   file lookup), so the release body must be complete before notifying.
+Phase 4 runs only after Eric has merged the fix to master and there is an explicit release yes from Eric (relayed via Selina for agents). Never merge the fix
+branch yourself; Eric decides the merge.
+
+Then follow CLAUDE.md § Release Process (Grok Bot agents: library skill
+`tai-robot-release`): bump `version.py`, bilingual notes, `build_release.py`,
+GitHub release with assets, Discord. Do not tag, publish, or Discord-notify
+without that yes. Redeploying live bots needs its own yes, via the `deploy` skill.
+
+The Discord notification reads from the GitHub release body (no local file
+lookup), so the release body must be complete before notifying.
