@@ -91,7 +91,7 @@ prove nothing about the deployment env. Therefore, after ANY change to
 `scripts/news_bridge/*`:
 
 ```bash
-# `--once` runs a real cycle (writes vote/signal, posts Discord) — do not run it from this skill.
+C:/Python313/python.exe -s <script> --dry-run   # `--once` runs a real cycle (writes vote/signal, posts Discord) — do not run it from this skill.
 ```
 
 `-s` on `C:/Python313/python.exe` replicates LocalSystem's package
