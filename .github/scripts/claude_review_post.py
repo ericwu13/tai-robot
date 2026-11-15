@@ -268,13 +268,19 @@ def reuse():
         patch_comment(repo, cid, new_body)
 
 
+MENTION_RE = re.compile(r"<@(&?)!?(\d+)>")
+
+
 def discord_payload(text, mention=""):
     """Webhook body: optional owner mention first, cut to Discord's limit.
-    Only the mention may ping anyone (no @everyone from a PR title). Pure."""
+    Only the ids in `mention` may ping: a `<@id>` or @everyone in a PR title
+    stays plain text. Pure."""
     content = f"{mention} {text}".strip() if mention else text
     if len(content) > DISCORD_LIMIT:
         content = content[:DISCORD_LIMIT - 1] + "…"
-    allowed = {"parse": ["users", "roles"]} if mention else {"parse": []}
+    allowed = {"parse": [], "users": [], "roles": []}
+    for role, ident in MENTION_RE.findall(mention or ""):
+        allowed["roles" if role else "users"].append(ident)
     return {"content": content, "allowed_mentions": allowed}
 
 

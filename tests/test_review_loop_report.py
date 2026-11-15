@@ -173,14 +173,20 @@ def test_renderers_name_busy_prs_and_owner_queue():
 # ---- Discord ---------------------------------------------------------------
 
 def test_payload_without_mention_pings_nobody():
-    p = post.discord_payload("PR title with @everyone")
-    assert p["allowed_mentions"] == {"parse": []}
+    p = post.discord_payload("PR title with @everyone and <@222>")
+    assert p["allowed_mentions"] == {"parse": [], "users": [], "roles": []}
 
 
 def test_payload_with_mention_and_length_cap():
-    p = post.discord_payload("x" * 5000, mention="<@1>")
-    assert p["content"].startswith("<@1> ") and len(p["content"]) == post.DISCORD_LIMIT
-    assert p["allowed_mentions"] == {"parse": ["users", "roles"]}
+    p = post.discord_payload("x" * 5000, mention="<@111>")
+    assert p["content"].startswith("<@111> ") and len(p["content"]) == post.DISCORD_LIMIT
+
+
+def test_only_the_configured_mention_can_ping():
+    # A user or role id in the PR title must not be notified.
+    text = post.owner_ping_text("PR", 1, "ping <@222> and <@&333>", "u", "why")
+    p = post.discord_payload(text, mention="<@!111> <@&444>")
+    assert p["allowed_mentions"] == {"parse": [], "users": ["111"], "roles": ["444"]}
 
 
 def test_notify_without_webhook_sends_nothing(monkeypatch):
