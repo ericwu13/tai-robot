@@ -5,12 +5,25 @@ description: Adversarially validate claims before they are published or acted on
 
 # Validate Findings
 
+Design goal: 我們不可能一直防呆，而是要訂好合理的規則. We can't foolproof everything; set reasonable rules. Design from a whole-system view so each change is simple, efficient, and above all safe.
+
 A claim that hasn't been re-derived from primary evidence is a draft,
 not a finding. This skill is the gate between "the review said X" and
 "we told the user / started coding X".
 
 ## Protocol
 
+0. Check it against how we actually run. Trace the finding through the
+   current operating workflow: headless live bots, no GUI, and the real
+   control paths (deploy, STOP, restart, broker callbacks). If it needs
+   a step we don't take, such as a manual GUI CLOSE or flatten, close it
+   as out of scope. If it can only change a recorded value (a logged
+   exit price, a dashboard figure) and never orders or positions, it's
+   at most P3 and goes to follow-ups. Before splitting related findings
+   into separate fixes, check whether one simple rule covers them all
+   ('use X when valid, otherwise master'). Safety first: a finding that
+   makes the change less safe than master is always fixed, with or
+   without an incident.
 1. **List the claims** — every factual statement the output will make:
    counts, liveness, "new vs chronic", correlations, root causes,
    fix-status assertions — **and every SEVERITY grade (a P1/P2 is a

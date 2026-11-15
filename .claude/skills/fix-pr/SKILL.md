@@ -5,6 +5,8 @@ description: Implement a validated bug fix in an isolated git worktree and ship 
 
 # Fix → Draft PR
 
+Design goal: 我們不可能一直防呆，而是要訂好合理的規則. We can't foolproof everything; set reasonable rules. Design from a whole-system view so each change is simple, efficient, and above all safe.
+
 Turns a CONFIRMED root cause into a reviewable draft PR. This is the
 autonomous sibling of the interactive `debug` skill (which ends in a
 release); this one ends at a draft PR and a comment on the issue.
