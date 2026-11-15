@@ -246,6 +246,9 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           DIFF_HASH: ${{ steps.reuse.outputs.diff_hash }}
+          # Owner ping when this review adds `needs-owner` (optional secrets).
+          DISCORD_REVIEW_WEBHOOK: ${{ secrets.DISCORD_REVIEW_WEBHOOK }}
+          DISCORD_OWNER_MENTION: ${{ secrets.DISCORD_OWNER_MENTION }}
         # The script comes from master (the action refuses to run unless this
         # workflow matches master; the checkout is the PR, so read it from git).
         run: |
