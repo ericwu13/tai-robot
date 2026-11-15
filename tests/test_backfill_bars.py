@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -36,6 +37,30 @@ def _snapshot(root: Path) -> dict[str, bytes]:
         if path.is_file():
             found[path.relative_to(root).as_posix()] = path.read_bytes()
     return found
+
+
+def _link_dir(link: Path, target: Path) -> None:
+    """Make ``link`` point at the directory ``target``.
+
+    A symlink needs admin or Developer Mode on Windows (WinError 1314).
+    A directory junction does not, and ``Path.resolve`` follows it the
+    same way, so the escape guard is still exercised on a normal account.
+    Skip only when neither link can be made.
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        symlink_error = exc
+    if sys.platform == "win32":
+        import _winapi
+        try:
+            _winapi.CreateJunction(str(target), str(link))
+            return
+        except OSError as exc:
+            pytest.skip(f"cannot create a symlink ({symlink_error}) "
+                        f"or a junction ({exc})")
+    pytest.skip(f"cannot create a directory symlink: {symlink_error}")
 
 
 def _plant_live_tree(root: Path) -> None:
@@ -273,7 +298,7 @@ def test_refuses_target_outside_backfill(tmp_path):
     link_parent.mkdir()
     (link_parent / "sentinel").write_bytes(b"sentinel")
     backfill = tmp_path / "data" / "backfill"
-    backfill.symlink_to(link_parent, target_is_directory=True)
+    _link_dir(backfill, link_parent)
     before_link = _snapshot(tmp_path)
     with pytest.raises(BackfillPathError):
         run_backfill(

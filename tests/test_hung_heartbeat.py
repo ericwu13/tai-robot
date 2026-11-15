@@ -749,36 +749,70 @@ def test_call_com_logs_every_stamp_write_failure(tmp_path, monkeypatch, caplog):
     assert caplog.records == []
 
 
+def _no_temp_files(directory) -> bool:
+    return not [p for p in os.listdir(directory) if p.startswith(".hb-")]
+
+
 @pytest.mark.skipif(
     sys.platform != "win32",
-    reason="Windows sharing-violation stress test")
-def test_windows_reader_writer_stress(tmp_path):
-    """Tight reader plus 500 replaces. Both sides retry; no exception escapes."""
+    reason="needs Windows sharing semantics (an open handle blocks os.replace)")
+def test_windows_replace_retries_past_an_open_reader(tmp_path):
+    """A plain-open reader makes os.replace raise a real sharing violation.
+
+    The writer backs off and the next attempt lands once the reader has
+    closed. The reader closes from inside the writer's own backoff hook,
+    so the result does not depend on thread scheduling or machine speed.
+    """
     path = str(tmp_path / "heartbeat.json")
     hb.atomic_write_json(path, {"ts": 0, "pid": os.getpid(), "inflight_com_call": None})
-    stop = threading.Event()
-    errors = []
+    reader = open(path, encoding="utf-8")
+    sleeps = []
 
-    def reader():
-        while not stop.is_set():
-            try:
-                hb.read_heartbeat(path)
-            except Exception as exc:  # noqa: BLE001 — the test's contract
-                errors.append(exc)
-                return
+    def backoff(delay):
+        sleeps.append(delay)
+        reader.close()
 
-    thread = threading.Thread(target=reader, name="hb-stress-reader")
-    thread.start()
     try:
-        for i in range(500):
-            hb.atomic_write_json(
-                path, {"ts": i, "pid": os.getpid(), "inflight_com_call": None})
+        hb.atomic_write_json(
+            path, {"ts": 1, "pid": os.getpid(), "inflight_com_call": None},
+            sleep=backoff)
     finally:
-        stop.set()
-        thread.join(timeout=5)
-    assert errors == []
-    assert thread.is_alive() is False
-    assert hb.read_heartbeat(path)["ts"] == 499
+        reader.close()
+    assert sleeps == [hb._REPLACE_BACKOFF_S[0]]
+    assert hb.read_heartbeat(path)["ts"] == 1
+    assert _no_temp_files(tmp_path)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="needs Windows sharing semantics (an open handle blocks os.replace)")
+def test_windows_replace_gives_up_after_budget_while_reader_holds(tmp_path):
+    """A reader that never lets go exhausts the 4-attempt budget.
+
+    The final PermissionError is re-raised, marked ``hb_logged`` so the
+    Tk tick does not log it twice, logged once, and the temp file is
+    removed. The old heartbeat stays readable once the reader closes.
+    """
+    path = str(tmp_path / "heartbeat.json")
+    hb.atomic_write_json(path, {"ts": 0, "pid": os.getpid(), "inflight_com_call": None})
+    hb.reset_replace_failure_log()
+    lines = []
+    hb.set_replace_failure_logger(lines.append)
+    sleeps = []
+    try:
+        with open(path, encoding="utf-8"):
+            with pytest.raises(PermissionError) as info:
+                hb.atomic_write_json(
+                    path, {"ts": 1, "pid": os.getpid(), "inflight_com_call": None},
+                    sleep=sleeps.append, monotonic=lambda: 0.0)
+    finally:
+        hb.set_replace_failure_logger(None)
+        hb.reset_replace_failure_log()
+    assert sleeps == list(hb._REPLACE_BACKOFF_S)
+    assert getattr(info.value, "hb_logged", False) is True
+    assert len(lines) == 1 and "os.replace failed" in lines[0]
+    assert _no_temp_files(tmp_path)
+    assert hb.read_heartbeat(path)["ts"] == 0
 
 
 def test_delete_retries_permission_error_then_removes(tmp_path, monkeypatch):
