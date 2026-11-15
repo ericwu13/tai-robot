@@ -7,13 +7,15 @@
 
     python claude_review_post.py post OPEN_JSON
         Read the action's structured_output JSON from $RESULT and:
-        1. resolve every thread listed in OPEN_JSON (what Claude was shown)
-           that is still open and was opened by this workflow, EXCEPT the ids
-           in `still_open_threads`. One rule: the current review is the source
-           of truth, so a thread it does not re-confirm as P1/P2 is closed
-           (fixed, superseded, or not worth blocking on). Never touches a
-           human's or Cursor's thread. If OPEN_JSON is missing, nothing is
-           resolved;
+        1. pick every thread listed in OPEN_JSON (what Claude was shown) that
+           is still open and was opened by this workflow, EXCEPT the ids in
+           `still_open_threads`, and write them as `resolve_ids` to
+           $GITHUB_OUTPUT. One rule: the current review is the source of
+           truth, so a thread it does not re-confirm as P1/P2 is closed
+           (fixed, superseded, or not worth blocking on). Never a human's or
+           Cursor's thread. If OPEN_JSON is missing, nothing is picked.
+           The `resolve-threads` job resolves them (it holds the token that
+           may resolve threads);
         2. post every `inline_comments` entry (P1/P2) as a line comment, all
            in one PR review. If GitHub rejects the batch (422: a line not in
            the diff), each comment is retried alone and the rejected ones are
@@ -22,7 +24,14 @@
            summary comment, or create one if there is none, so the PR keeps a
            single current summary instead of one per push.
 
-Env: PR, HEAD_SHA, GITHUB_REPOSITORY, GH_TOKEN (+ RESULT for post). Uses gh.
+    python claude_review_post.py resolve
+        Resolve the thread ids in $IDS (JSON list), re-checking that each is
+        still an open thread opened by this workflow. Reply "Not raised by
+        the review at <sha>" ONLY after the resolve succeeded, so a token
+        without the right permission adds no comments.
+
+Env: PR, HEAD_SHA, GITHUB_REPOSITORY, GH_TOKEN (+ RESULT for post, IDS for
+resolve). Uses gh.
 """
 import json
 import os
@@ -92,26 +101,31 @@ def threads_to_resolve(shown_ids, open_ids, still_open):
     return [t for t in shown_ids if t in open_ids and t not in keep]
 
 
-def resolve_threads(repo, pr, head_sha, shown_ids, still_open):
-    """Resolve every shown bot thread the current review did not re-confirm."""
-    if not shown_ids:
-        return 0, 0
+def resolve_ids(repo, pr, head_sha, ids):
+    """Resolve, then reply. Returns (resolved, failed)."""
     open_ids = {t["id"] for t in open_bot_threads(repo, pr)}
-    todo = threads_to_resolve(shown_ids, open_ids, still_open)
-    done = 0
-    for tid in todo:
+    done = failed = 0
+    for tid in ids:
+        if tid not in open_ids:
+            print(f"skip {tid}: not an open thread opened by this workflow")
+            continue
+        try:
+            graphql("mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}",
+                    {"t": tid})
+        except RuntimeError as exc:
+            failed += 1
+            print(f"::warning::could not resolve {tid}: {exc}")
+            continue
+        done += 1
         try:
             graphql("mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply("
                     "input:{pullRequestReviewThreadId:$t, body:$b}){comment{id}}}",
                     {"t": tid, "b": f"Not raised by the review at `{head_sha[:7]}` "
-                                    "(fixed, superseded, or not a P1/P2). Resolving."})
-            graphql("mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}",
-                    {"t": tid})
-            done += 1
+                                    "(fixed, superseded, or not a P1/P2). Resolved."})
         except RuntimeError as exc:
-            print(f"could not resolve {tid}: {exc}")
-    print(f"resolved {done}/{len(todo)} thread(s); kept {len(shown_ids) - len(todo)}")
-    return done, len(todo)
+            print(f"resolved {tid} but could not reply: {exc}")
+    print(f"resolved {done}/{len(ids)} thread(s), {failed} failed")
+    return done, failed
 
 
 SUMMARY_JQ = ('.[] | select((.user.login == "github-actions[bot]") and '
@@ -192,10 +206,16 @@ def post(open_json):
         shown_ids = []
     still_open = [str(i) for i in (r.get("still_open_threads") or [])]
     try:
-        resolved, to_resolve = resolve_threads(repo, pr, head, shown_ids, still_open)
+        open_ids = {t["id"] for t in open_bot_threads(repo, pr)} if shown_ids else set()
     except RuntimeError as exc:
-        print(f"could not resolve threads: {exc}")
-        resolved, to_resolve = 0, 0
+        print(f"could not list review threads: {exc}")
+        open_ids = set()
+    todo = threads_to_resolve(shown_ids, open_ids, still_open)
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(f"resolve_ids={json.dumps(todo)}\n")
+    print(f"{len(todo)} thread(s) to resolve, {len(shown_ids) - len(todo)} kept")
 
     comments = [c for c in (r.get("inline_comments") or [])
                 if c.get("path") and c.get("line") and c.get("body")]
@@ -207,10 +227,10 @@ def post(open_json):
         for c in failed:
             body += f"\n**`{c['path']}:{c['line']}`**\n\n{c['body']}\n"
     body += ("\n\n<sub>Verdict: **%s** | P1 %s | P2 %s | P3 %s | inline %d/%d | "
-             "threads resolved %d/%d, kept %d | model claude-opus-5-5</sub>"
+             "old threads closing %d, kept %d | model claude-opus-5-5</sub>"
              % (r.get("verdict"), r.get("p1"), r.get("p2"), r.get("p3"),
-                len(comments) - len(failed), len(comments), resolved, to_resolve,
-                len(shown_ids) - to_resolve))
+                len(comments) - len(failed), len(comments), len(todo),
+                len(shown_ids) - len(todo)))
     with open("summary.md", "w", encoding="utf-8") as f:
         f.write(body)
     sys.exit(upsert_summary(repo, pr, "summary.md"))
@@ -220,5 +240,9 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "post"
     if mode == "collect":
         collect(sys.argv[2])
+    elif mode == "resolve":
+        ids = [str(i) for i in json.loads(os.environ.get("IDS") or "[]")]
+        resolve_ids(os.environ["GITHUB_REPOSITORY"], os.environ["PR"],
+                    os.environ["HEAD_SHA"], ids)
     else:
         post(sys.argv[2] if len(sys.argv) > 2 else "")
