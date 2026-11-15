@@ -100,18 +100,6 @@ def _assert_dead(pid: int) -> None:
     raise AssertionError(f"grid child pid {pid} is still alive")
 
 
-def _count_beats(seconds: float) -> int:
-    """Main-thread work that needs the GIL. Sleep would not show a stall."""
-    end = time.perf_counter() + seconds
-    n = 0
-    while time.perf_counter() < end:
-        acc = 0
-        for i in range(4000):
-            acc += i
-        n += 1
-    return n
-
-
 def test_isolated_runner_defaults_to_spawn_subprocess():
     sig = inspect.signature(run_grid_isolated)
     assert sig.parameters["in_process"].default is False
@@ -219,18 +207,21 @@ def test_child_import_chain_does_not_pull_tk_com_or_the_bot():
 
 
 def test_main_thread_keeps_ticking_during_a_heavy_sweep():
-    """A GIL-bound in-process sweep starves this counter. Spawn does not.
+    """The sweep's CPU must run outside the bot's process.
 
-    The counter runs on the calling thread. The sweep runs on a worker
-    thread, which is where the live bot runs it. Sleep is not the
-    counter: sleep releases the GIL and would pass either way.
+    In-process, the sweep burns on the calling worker thread (where the live
+    bot runs it) and holds the GIL, which starves the bot's main thread.
+    Spawned, that thread only polls the child. Measured as the worker
+    thread's CPU time, which does not depend on how busy the machine is
+    (counting main-thread beats did, and flaked on loaded CI runners).
     """
-    job = _job(mode="burn", burn_seconds=1.6)
+    job = _job(mode="burn", burn_seconds=1.0)
 
-    def _beats_while(*, in_process: bool) -> int:
+    def _worker_cpu(*, in_process: bool) -> float:
         holder = {}
 
         def _runner():
+            t0 = time.thread_time()
             holder["result"] = run_grid_isolated(
                 job,
                 in_process=in_process,
@@ -238,21 +229,22 @@ def test_main_thread_keeps_ticking_during_a_heavy_sweep():
                 entry=burn_child_entry,
                 poll_s=0.05,
             )
+            holder["cpu"] = time.thread_time() - t0
 
         thread = threading.Thread(target=_runner)
         thread.start()
-        time.sleep(0.2)
-        beats = _count_beats(0.45)
         thread.join(15)
         assert not thread.is_alive()
         assert "result" in holder
-        return beats
+        return holder["cpu"]
 
-    solo = _count_beats(0.45)
-    spawned = _beats_while(in_process=False)
-    in_proc = _beats_while(in_process=True)
-    assert spawned > solo * 0.55, (spawned, solo, in_proc)
-    assert spawned > in_proc * 1.3, (spawned, in_proc, solo)
+    spawned = _worker_cpu(in_process=False)
+    in_proc = _worker_cpu(in_process=True)
+    # In-process the worker burns up to ~1 s of CPU (less on a busy machine,
+    # since the burn is wall-clock bounded); spawned it only polls. Measured:
+    # idle 0.98 vs 0.06, 2x CPU-oversubscribed 0.19 vs 0.00.
+    assert in_proc > 0.1, (in_proc, spawned)
+    assert spawned < in_proc * 0.3, (spawned, in_proc)
 
 
 def test_timeout_kills_the_child():
