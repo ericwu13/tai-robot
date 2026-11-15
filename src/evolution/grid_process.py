@@ -1422,6 +1422,10 @@ def _run_grid_held(
                     return _stamp(found)
                 if not _alive(proc):
                     return _stamp(_no_result(proc))
+                # A slot message in that drain already counted. Do not
+                # record "no slot event" and kill the child after it.
+                if acquired or pre_event_deadline is None:
+                    continue
                 _terminate(proc)
                 return _stamp(GridProcessFailure(
                     "timeout",

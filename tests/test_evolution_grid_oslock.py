@@ -656,6 +656,41 @@ def test_queued_past_stall_is_not_cut_by_the_pre_slot_deadline(
     assert not isinstance(holder["result"], gp.GridProcessFailure), holder["result"]
 
 
+def test_drained_slot_at_pre_slot_deadline_is_not_a_timeout(
+        tmp_path, monkeypatch):
+    """A slot message already buffered at the pre-slot deadline is kept.
+
+    The deadline drain must not record "no slot event" and kill the
+    child after that message has been applied.
+    """
+    import src.evolution.grid_process as gp
+    from tests.test_evolution_grid_process import _job
+
+    monkeypatch.setattr(gp, "PRE_SLOT_EVENT_FLOOR_S", 0.0)
+    real_poll = gp._poll_message
+    handed = {"slot": False}
+
+    def _poll(conn, timeout):
+        if timeout == 0.0 and not handed["slot"]:
+            handed["slot"] = True
+            return "msg", ("slot", "acquired", {"queue_s": 0.0})
+        return real_poll(conn, timeout)
+
+    monkeypatch.setattr(gp, "_poll_message", _poll)
+    slot = str(tmp_path / "evo_grid.slot")
+    result = gp.run_grid_isolated(
+        _job(mode="sleep", burn_seconds=0.1),
+        timeout_s=10,
+        stall_s=0.0,
+        entry=gp.burn_child_entry,
+        slot_path=slot,
+        poll_s=0.05,
+        slot_poll_s=0.05,
+        queue_timeout_s=5,
+    )
+    assert not isinstance(result, gp.GridProcessFailure), result
+
+
 def test_child_self_timeout_is_a_timeout(tmp_path, monkeypatch):
     """The child's own limit is a timeout, not a crash."""
     import src.evolution.grid_process as gp
