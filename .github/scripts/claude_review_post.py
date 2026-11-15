@@ -68,7 +68,7 @@ query($owner:String!, $name:String!, $pr:Int!, $after:String) {
         nodes {
           id isResolved path line
           comments(first:1) { nodes { author { login } body url } }
-          replies: comments(last:3) { totalCount nodes { author { login } body } }
+          replies: comments(last:10) { totalCount nodes { author { login } body } }
         }
       }
     }
@@ -107,17 +107,25 @@ def open_bot_threads(repo, pr):
             first = (t["comments"]["nodes"] or [{}])[0]
             login = ((first.get("author") or {}).get("login") or "")
             if not t["isResolved"] and login in BOT_LOGINS:
-                rep_nodes = (t.get("replies") or {}).get("nodes") or []
-                if (t.get("replies") or {}).get("totalCount", 0) <= len(rep_nodes):
-                    rep_nodes = rep_nodes[1:]  # the first node is the finding itself
-                replies = [{"author": (n.get("author") or {}).get("login", ""),
-                            "body": (n.get("body") or "")[:1500]} for n in rep_nodes]
+                replies = author_replies((t.get("replies") or {}).get("nodes") or [])
                 threads.append({"id": t["id"], "path": t["path"], "line": t["line"],
                                 "body": first.get("body", ""), "url": first.get("url", ""),
                                 "replies": replies})
         if not conn["pageInfo"]["hasNextPage"]:
             return threads
         after = conn["pageInfo"]["endCursor"]
+
+
+def author_replies(nodes, keep=3):
+    """The newest `keep` replies NOT written by this workflow (oldest first).
+
+    Bot comments ("Fixed in" / "Not raised") can pile up after the author's
+    answer, so take the last 10 comments and drop the bot's own; the finding
+    itself is a bot comment, so it is dropped too. Pure function."""
+    mine = [{"author": (n.get("author") or {}).get("login", ""),
+             "body": (n.get("body") or "")[:1500]}
+            for n in nodes if ((n.get("author") or {}).get("login") or "") not in BOT_LOGINS]
+    return mine[-keep:]
 
 
 def threads_to_resolve(shown_ids, open_ids, still_open):
