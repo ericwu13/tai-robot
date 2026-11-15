@@ -91,7 +91,7 @@ prove nothing about the deployment env. Therefore, after ANY change to
 `scripts/news_bridge/*`:
 
 ```bash
-C:/Python313/python.exe -s <script> --dry-run   # or --once (do not run: executes a real cycle)
+C:/Python313/python.exe -s <script> --dry-run   # or --once (when the script has no --dry-run: single check then exit, runs check_once)
 ```
 
 `-s` on `C:/Python313/python.exe` replicates LocalSystem's package
