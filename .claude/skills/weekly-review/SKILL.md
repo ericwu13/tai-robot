@@ -80,8 +80,13 @@ also answer, from primary evidence only. Fleet files (`data/ai_usage.csv`, `data
 
 1. **Attempt history** — read `data/ai_usage.csv` at the ledger path the
    brief names (UTC; TPE = +8): per past Saturday, plan rows
-   (`bot_evolution`) vs candidate rows (`evolution_codegen_*`). A Saturday
-   with a plan but no codegen row = plan said `no_change`. A ledger that
+   (`bot_evolution`) vs candidate rows (`evolution_codegen_*`). A
+   `bot_evolution` row with no `evolution_codegen_*` row is not
+   `no_change` by itself. Count a Saturday toward the no-candidate
+   streak only when item 2's debug-log send is the no_change length
+   (~112-130) or the history row says the plan stopped
+   (`evolution_history.jsonl` `final_status` `no_change`); otherwise
+   leave it out of the streak and mark the phase UNGRADED. A ledger that
    is missing, empty, or has no row in the review week is UNGRADED, never
    a 'no candidate' streak. Count the streak only over Saturdays the
    ledger covers (on or after its first row).
