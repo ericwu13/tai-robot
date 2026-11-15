@@ -224,10 +224,14 @@ def _entry_guid(entry) -> str:
     """GUID for dedup. An entry with no id uses ``link|title``.
 
     TAIFEX RSS1 has no ``<guid>`` and several notices share a link, so a
-    link-only id drops every later settlement or margin notice as already
-    seen. Investing.com is also id-less. ``dedup_articles`` still treats a
-    stored bare link as seen, so those items are not scored a second time
-    on the first pass after this key change.
+    link-only id would collapse every later settlement or margin notice
+    into one key. Investing.com is also id-less. The previous scorer
+    stored the bare link. That legacy key suppresses a second score only
+    when the article's ``published_dt`` is before the one-time
+    ``guid_v2_at`` stamp (see ``dedup_articles``). A notice published at
+    or after the stamp is a new item even if it shares the link, so the
+    key change does not score an already-seen Investing.com item twice
+    and does not hide a later notice forever.
     """
     raw = entry.get("id")
     if isinstance(raw, str):
@@ -400,11 +404,12 @@ def save_state(path: str, state: dict) -> None:
 
 
 def _legacy_link_key(article: dict) -> str:
-    """Bare link, only when ``guid`` is the id-less ``link|title`` form.
+    """Bare link the pre-v2 scorer stored, or ``""``.
 
-    State written before that form stored the bare link. A guid that came
-    from ``<id>`` is not a legacy key, and a later notice that only shares
-    the link (TAIFEX) is not already seen.
+    Only an id-less ``link|title`` guid has that legacy key. A guid that
+    came from ``<id>`` does not. This does not decide whether the key
+    still suppresses the article; ``dedup_articles`` applies it only
+    before ``guid_v2_at``.
     """
     link = str(article.get("link") or "").strip()
     title = str(article.get("title") or "").strip()
@@ -414,19 +419,80 @@ def _legacy_link_key(article: dict) -> str:
     return ""
 
 
-def dedup_articles(articles: list[dict], state: dict) -> list[dict]:
+def _parse_guid_v2_at(value) -> datetime | None:
+    """Parse a stored ``guid_v2_at`` stamp. ``None`` when it is not a time."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _published_before_guid_v2(article: dict, cutoff_raw) -> bool:
+    """True when the legacy bare-link key must still suppress *article*.
+
+    Missing or unparseable ``published_dt`` counts as before the cutoff
+    so an already-seen Investing.com item is not scored again. A time
+    at or after ``guid_v2_at`` does not.
+    """
+    pub = article.get("published_dt")
+    if isinstance(pub, str):
+        try:
+            pub = datetime.fromisoformat(pub.strip())
+        except ValueError:
+            pub = None
+    if not isinstance(pub, datetime):
+        return True
+    if pub.tzinfo is None:
+        pub = pub.replace(tzinfo=timezone.utc)
+    cutoff = _parse_guid_v2_at(cutoff_raw)
+    if cutoff is None:
+        return True
+    return pub < cutoff
+
+
+def stamp_guid_v2_at(state: dict, now: datetime | None = None) -> str:
+    """Record ``guid_v2_at`` the first time the v2 scheme runs.
+
+    The value lives in the scorer state dict (the same object
+    ``save_state`` writes) next to ``seen_guids``. A non-empty stamp
+    already stored is returned unchanged.
+    """
+    existing = state.get("guid_v2_at")
+    if isinstance(existing, str) and existing.strip():
+        return existing
+    moment = now if now is not None else datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    state["guid_v2_at"] = moment.isoformat(timespec="seconds")
+    return state["guid_v2_at"]
+
+
+def dedup_articles(articles: list[dict], state: dict,
+                   now: datetime | None = None) -> list[dict]:
     """Return articles whose GUID has not been seen.
 
-    An id-less article whose bare link is already in ``seen_guids`` is
-    also skipped. That is the key this scorer used to store.
+    Stamps ``guid_v2_at`` once on *state* and never overwrites it. An
+    id-less article whose bare link is already in ``seen_guids`` is
+    skipped only when ``published_dt`` is missing or strictly before
+    that stamp — the key this scorer used to store, so an Investing.com
+    item from before the v2 cutoff is not scored a second time. A later
+    notice that only shares the link and was published at or after the
+    stamp is not skipped.
     """
+    stamp_guid_v2_at(state, now)
     seen = set(state.get("seen_guids", []))
+    cutoff = state.get("guid_v2_at")
     new = []
     for article in articles:
         if article.get("guid") in seen:
             continue
         legacy = _legacy_link_key(article)
-        if legacy and legacy in seen:
+        if legacy and legacy in seen and _published_before_guid_v2(article, cutoff):
             continue
         new.append(article)
     return new
@@ -907,7 +973,7 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     if fetch_stats.get("status") in ("ok", "degraded"):
         _notify_fetch_recovery(cfg, state)
 
-    new_articles = dedup_articles(articles, state)
+    new_articles = dedup_articles(articles, state, now=now)
     print(f"  {len(articles)} recent articles, {len(new_articles)} new")
     state["last_fetched"] = len(articles)
     state["last_new"] = len(new_articles)

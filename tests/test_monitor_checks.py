@@ -1310,6 +1310,31 @@ def test_bridge_fresh_signal_in_a_ledger_is_not_p1(tmp_path, bridge):
     assert any("TMF00_bot" in ln for ln in lines)
 
 
+def test_bridge_kept_vote_lines_are_not_voteless(tmp_path, bridge):
+    """Three keep-vote lines after a decision are not a W4 voteless streak.
+
+    The line names the dataset and the on-disk session and does not
+    contain ``no TAIFEX data``, so the walker stops instead of counting.
+    """
+    from tests.test_chips_monitor import chips
+    keep = chips._kept_vote_no_data_message(
+        "no TAIFEX data — no data yet (API lag) — no vote",
+        "20260828",
+        "2026-08-31|NIGHT",
+    )
+    assert "no taifex data" not in keep.lower()
+    (bridge / "chips_monitor.log").write_text(
+        "2026-08-31 16:15:04 TPE | ΔOI +8,000 | vote: trending-up | "
+        "strong (data 20260828)\n"
+        "2026-08-31 18:15:04 TPE | " + keep + "\n"
+        "2026-08-31 20:15:04 TPE | " + keep + "\n"
+        "2026-08-31 22:15:04 TPE | " + keep + "\n",
+        encoding="utf-8")
+    findings, lines = check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
+    assert not any("W4 voteless" in m for m in messages(findings, "P2")), messages(findings, "P2")
+    assert any("voteless streak: 0" in ln for ln in lines)
+
+
 def test_bridge_chips_voteless_streak_is_p2(tmp_path, bridge):
     (bridge / "chips_monitor.log").write_text(
         "2026-08-20 16:15:04 TPE | vote trending-up\n"
@@ -1319,6 +1344,50 @@ def test_bridge_chips_voteless_streak_is_p2(tmp_path, bridge):
         encoding="utf-8")
     findings, _ = check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
     assert any("voteless for 3" in m for m in messages(findings, "P2"))
+
+
+def test_bridge_voteless_streak_fetch_failed_is_transparent(tmp_path, bridge):
+    """``fetch failed`` neither increments the voteless streak nor ends it.
+
+    ND, ND, FF, ND, ND is five voteless passes and streak >= 3 (P2).
+    A log ending FF, FF is streak 0. ND, a decided line, ND is streak 1.
+    """
+    nd = "no TAIFEX data — no data yet (API lag) — no vote"
+    ff = "TAIFEX fetch failed (timeout: timed out) — vote kept, no decision"
+    decided = ("ΔOI +8,000 | equity 6,000,000,000 | vote: trending-up | "
+               "strong (data 20260824)")
+
+    def run(text):
+        (bridge / "chips_monitor.log").write_text(text, encoding="utf-8")
+        return check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
+
+    findings, _lines = run(
+        "2026-08-20 16:15:04 TPE | " + nd + "\n"
+        "2026-08-21 16:15:04 TPE | " + nd + "\n"
+        "2026-08-21 18:15:04 TPE | " + ff + "\n"
+        "2026-08-22 16:15:04 TPE | " + nd + "\n"
+        "2026-08-24 16:15:04 TPE | " + nd + "\n"
+    )
+    voteless = [m for m in messages(findings, "P2") if "W4 voteless" in m]
+    assert voteless, messages(findings, "P2")
+    count = int(voteless[0].split("voteless for ", 1)[1].split(" ", 1)[0])
+    assert count >= 3
+
+    findings, lines = run(
+        "2026-08-24 16:15:04 TPE | " + decided + "\n"
+        "2026-08-24 18:15:04 TPE | " + ff + "\n"
+        "2026-08-24 22:15:04 TPE | " + ff + "\n"
+    )
+    assert not any("W4 voteless" in m for m in messages(findings, "P2"))
+    assert any("voteless streak: 0" in ln for ln in lines)
+
+    findings, lines = run(
+        "2026-08-21 16:15:04 TPE | " + nd + "\n"
+        "2026-08-22 16:15:04 TPE | " + decided + "\n"
+        "2026-08-24 16:15:04 TPE | " + nd + "\n"
+    )
+    assert not any("W4 voteless" in m for m in messages(findings, "P2"))
+    assert any("voteless streak: 1" in ln for ln in lines)
 
 
 def test_bridge_chips_only_primary_slot_flags_missing_retries(tmp_path, bridge):
