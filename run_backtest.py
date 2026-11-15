@@ -1771,7 +1771,11 @@ class BacktestApp:
                         raw, generation=oi_generation)
                     parsed = _parse_open_interest(raw) if outcome == "position" else None
                     if outcome == "position":
-                        self._update_real_account_display()
+                        # Position text only. Rights here are the cached
+                        # reply; a fresh FutureRights observe is the baseline.
+                        shown = self._account_monitor.compute_display()
+                        if shown.position_text:
+                            self.real_pos_var.set(shown.position_text)
                     elif outcome == "flat":
                         self.real_pos_var.set("Flat (無持倉)")
                     _log(f"未平倉 OpenInterest: {_redact_open_interest(raw)}")
@@ -2401,11 +2405,21 @@ class BacktestApp:
             limit = int(getattr(guard, "daily_loss_limit", 0))
         except (TypeError, ValueError):
             limit = 0
-        set_loss_state({
+        state = {
             "loss_paused": bool(getattr(guard, "paused", False)),
             "loss_net": net,
             "loss_limit": limit,
-        })
+        }
+        view = getattr(self, "_loss_view", None)
+        if view is not None:
+            try:
+                state["loss_net"] = int(view.loss_today)
+                state["loss_account_net"] = int(view.account_net)
+            except (TypeError, ValueError):
+                pass
+            state["loss_day"] = str(getattr(view, "day_key", "") or "")
+            state["loss_basis"] = str(getattr(view, "basis", "") or "")
+        set_loss_state(state)
 
     def _publish_link_heartbeat(self) -> None:
         try:
@@ -9170,6 +9184,19 @@ class BacktestApp:
         _set_guard = getattr(self._live_runner, "set_guard_state_provider", None)
         if callable(_set_guard):
             _set_guard(self._trading_guard.to_dict)
+        # Per-bot 15:00 baseline. Independent of session.json, so a fresh
+        # deploy and --resume both keep it. Do not rebind
+        # self._trading_guard — the fill poller holds that object.
+        try:
+            from src.live.loss_baseline import DailyLossBaseline
+            self._loss_view = None
+            self._loss_baseline = DailyLossBaseline(
+                os.path.join(self._live_runner.bot_dir, "loss_baseline.json"),
+                getattr(self, "_futures_account", "") or "")
+            self._loss_baseline.load(_taipei_now())
+        except Exception as exc:
+            self._loss_baseline = None
+            _log(f"[LOSS] baseline load failed: [{type(exc).__name__}] {exc}")
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
         _opt_in = self._settings.get("dashboard_auto_opt_in") or frozenset()
         self._live_runner._dashboard_auto_opt_in = bot_name in _opt_in
@@ -10526,9 +10553,17 @@ class BacktestApp:
         if not display.valid:
             _refuse("帳戶權益數未知（無法解析帳戶淨損益）")
             return
-        net = display.net_pnl_int
+        now = _taipei_now()
+        view = self._observe_loss_baseline(now)
+        net = view.loss_today if view is not None else display.net_pnl_int
+        day_key = view.day_key if view is not None else _tg.trading_day_key(now)
         if net < -req.loss_limit:
-            _refuse(f"帳戶淨損益 {net:+,} 已超過每日虧損上限 -{req.loss_limit:,}，拒絕切換至全自動")
+            if view is None:
+                _refuse(f"帳戶淨損益 {net:+,} 已超過每日虧損上限 -{req.loss_limit:,}，拒絕切換至全自動")
+            else:
+                _refuse(
+                    f"今日損益 {view.loss_today:+,}（帳戶 {view.account_net:+,}）"
+                    f"已超過每日虧損上限 -{req.loss_limit:,}，拒絕切換至全自動")
             return
         # The book was flat when the reply landed. Re-check everything else:
         # a sim entry, a fill or a replay may have started while we waited.
@@ -10549,7 +10584,7 @@ class BacktestApp:
         # this attempt has to carry today's key, or the 15:00 boundary
         # can never release it. The strict pre-check above makes a new
         # pause unreachable today; the key is what keeps that fragile.
-        guard.update_pnl(net, day_key=_tg.trading_day_key(_taipei_now()))
+        guard.update_pnl(net, day_key=day_key)
         runner.daily_loss_limit = req.loss_limit
         if not self._apply_requested_mode(bot_dir, req):
             # The switch was refused. Do not leave this attempt's account
@@ -12224,6 +12259,26 @@ class BacktestApp:
             self.root.after_cancel(self._real_account_poll_id)
             self._real_account_poll_id = None
 
+    def _observe_loss_baseline(self, now):
+        """Feed one valid rights read to the daily baseline, if one is bound.
+
+        Paper and real bots both observe. Returns None when there is no
+        tracker, so the caller keeps today's full-account behaviour.
+        """
+        tracker = getattr(self, "_loss_baseline", None)
+        rights = getattr(getattr(self, "_account_monitor", None), "rights", None)
+        if tracker is None or not isinstance(rights, dict):
+            self._loss_view = None
+            return None
+        try:
+            view = tracker.observe(rights, now)
+        except Exception as exc:
+            self._loss_view = None
+            _log(f"[LOSS] baseline observe failed: [{type(exc).__name__}] {exc}")
+            return None
+        self._loss_view = view
+        return view
+
     def _update_real_account_display(self) -> bool:
         """Update the real account UI labels from AccountMonitor computed data.
 
@@ -12247,8 +12302,17 @@ class BacktestApp:
             # records the net (update_pnl does not pause) so a real
             # bot is not held forever when the limit is off.
             guard = self._trading_guard
+            now = _taipei_now()
+            view = self._observe_loss_baseline(now)
             if self._trading_mode in ("semi_auto", "auto"):
-                net = d.net_pnl_int
+                if view is not None:
+                    net = view.loss_today
+                    day_key = view.day_key
+                    account_net = view.account_net
+                else:
+                    net = d.net_pnl_int
+                    day_key = _tg.trading_day_key(now)
+                    account_net = None
                 if guard.daily_loss_limit > 0:
                     if guard.paused:
                         self.real_loss_limit_var.set(
@@ -12258,8 +12322,7 @@ class BacktestApp:
                             f"{net:+,} / -{guard.daily_loss_limit:,}")
                 else:
                     self.real_loss_limit_var.set("--")
-                triggered = guard.update_pnl(
-                    net, day_key=_tg.trading_day_key(_taipei_now()))
+                triggered = guard.update_pnl(net, day_key=day_key)
                 # Not a hold release. An open-interest refresh also
                 # lands here while the equity hold is still owed, so
                 # this must not clear _equity_refresh_held_alerted.
@@ -12273,7 +12336,13 @@ class BacktestApp:
                         "exit")
                     if _discord and _discord.enabled:
                         try:
-                            _discord.daily_loss_limit(net, guard.daily_loss_limit)
+                            if account_net is None:
+                                _discord.daily_loss_limit(
+                                    net, guard.daily_loss_limit)
+                            else:
+                                _discord.daily_loss_limit(
+                                    net, guard.daily_loss_limit,
+                                    account_net=account_net)
                         except Exception as exc:
                             # update_pnl already ran. A notify failure must
                             # not skip the return that releases the startup hold.
@@ -12281,12 +12350,11 @@ class BacktestApp:
                                 "[CONN] daily loss limit notify failed: "
                                 f"[{type(exc).__name__}] {exc}")
             else:
-                # Paper does not run update_pnl and does not clear the
-                # entries-held latch. The paper branch of the link gate
-                # releases the hold. A pause carried in from a real mode
-                # still ends at the trading-day boundary, or the switch
-                # back to auto would be refused until a redeploy.
-                guard.roll_day(_tg.trading_day_key(_taipei_now()))
+                # Paper observes so a later switch has this night's
+                # snapshot. It does not start a new pause. A pause
+                # carried in from a real mode still ends at the
+                # trading-day boundary.
+                guard.roll_day(_tg.trading_day_key(now))
                 self.real_loss_limit_var.set("--")
         else:
             self.real_fees_var.set(d.fees)
@@ -12470,6 +12538,7 @@ class BacktestApp:
 
     def _stop_live(self):
         """Stop the live bot and restore UI."""
+        self._loss_view = None
         # The grid sweep runs in another process. The worker polls this
         # flag and terminates that child so a GUI stop does not wait
         # out the sweep. The headless STOP file is polled the same way.

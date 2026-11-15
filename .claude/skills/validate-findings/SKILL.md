@@ -11,6 +11,14 @@ not a finding. This skill is the gate between "the review said X" and
 
 ## Protocol
 
+0. **PR/issue findings — check against how we actually run.** Trace the
+   finding through the real control paths and grade it by CLAUDE.md
+   "Change & review contract". A finding that needs a GUI-only step (a
+   manual CLOSE/flatten) is a P3 follow-up unless it can send or skip a
+   real order; one that only changes a recorded value (logged price,
+   dashboard figure) is at most P3. Before splitting related findings
+   into separate fixes, check whether one rule covers them all. A finding
+   that makes the change less safe than master is always fixed.
 1. **List the claims** — every factual statement the output will make:
    counts, liveness, "new vs chronic", correlations, root causes,
    fix-status assertions — **and every SEVERITY grade (a P1/P2 is a
@@ -18,11 +26,13 @@ not a finding. This skill is the gate between "the review said X" and
    claim)**. One line each, with where its primary evidence lives (file
    path, command). Whenever the output would lead to `fix-pr`, also list
    the mandatory claim **"This still needs a new code fix on current
-   master"** (see below).
-2. **Spawn one skeptical read-only subagent** (Explore, model sonnet)
-   whose instructions are: do NOT trust the claims; re-derive each from
-   the named evidence (re-count the rows, re-check the PID, re-read the
-   log); for a "needs a new code fix" claim, re-search related closed
+   master"** — its evidence is `issue-triage` step 4 (related-work
+   search + inventing path still on master). No search, or related
+   shipped work with no owner call → REFUTED.
+2. **Spawn one skeptical read-only subagent** (Explore, model opus —
+   never Sonnet for review) whose instructions are: do NOT trust the
+   claims; re-derive each from the named evidence (re-count the rows,
+   re-check the PID, re-read the log); for a "needs a new code fix" claim, re-search related closed
    issues/PRs/CHANGELOG and re-check the inventing path on current
    master; return CONFIRMED or REFUTED per claim with one evidence line,
    then a final "SAFE TO PUBLISH: yes/no" — and separately whether
@@ -57,19 +67,6 @@ say it is intended, and never attach unsolicited "fix" recommendations
 ("switch to auto") to designed behavior. Only the user promotes a
 designed behavior back to alert-worthy.
 
-## "Still needs a new code fix on current master"
-
-Mandatory whenever the output would assign `fix-pr`. Primary evidence
-must include all three: (a) closed issues, merged PRs, and
-CHANGELOG/release notes searched for the same *user-visible symptom
-class*; (b) whether the inventing code path still exists on current
-master after those merges; (c) the owner has not already marked the
-symptom covered. If related shipped work addresses the same symptom
-class and owner judgment is unknown → **REFUTE** "needs a new fix now".
-SAFE TO PUBLISH may be **yes** for the root-cause facts but **not** for
-"assign `fix-pr`" — say so explicitly. Do not treat CONFIRMED mechanism
-as permission to code.
-
 ## Rules that catch real failure modes (all happened here)
 
 - **Correlation discipline**: an issue naming a strategy does NOT pin it
@@ -89,10 +86,3 @@ as permission to code.
   may all be right, but each must be re-derived before use.
 - **"Absent file" ≠ broken**: vote files are consumed/deleted by design;
   reports only exist after trades; logs are quiet in closed sessions.
-- **Related-fix discipline**: checking related closed issues *after*
-  owner pushback is too late. #107 (ghost sim 持倉 after restart) was
-  assigned a fix-pr; the owner later treated it as covered by resume OI
-  reconcile in #79/#113 (shipped). Search related work before assign.
-  A remaining inventing path (e.g. timeout skip unwind) is not an
-  automatic close — and related resume/OI safety already shipped for
-  the same symptom is not an automatic assign.

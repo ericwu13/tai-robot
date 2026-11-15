@@ -70,10 +70,10 @@ each redacted before it is printed.
 - A `Traceback` in a log from months ago is a retired test bot, not an
   incident; the 7-day window exists for exactly that reason. If you widen
   it manually, check the bot is one that still runs.
-- A `n8n.workflow.failed` hit from `check_logs.py` is a P2 (row above): the
-  script reports only the last 24 h and local n8n is retired, so a hit means
-  it ran again. Report it; `n8n-debug` is history only, do not run it. A live
-  bridge failure or a missing vote → `bridge-health`.
+- A `n8n.workflow.failed` hit from `check_logs.py` is a P2 (row above):
+  the script reports only the last 24 h and local n8n is retired, so a
+  hit means it ran again. Report it; `n8n-debug` is history only, do not
+  run it. A live bridge failure or a missing vote → `bridge-health`.
 
 ## Next steps
 
