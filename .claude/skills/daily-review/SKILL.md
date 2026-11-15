@@ -32,11 +32,12 @@ redact()`).
 Fleet path is read-only HTTP. `/api/fleet` gives host and liveness only
 (`scripts/dashboard/snapshot.py` `fleet`). It cannot produce a
 GREEN/YELLOW/RED grade. Report `UNGRADED (fleet, API only)`. Do not
-report GREEN. Do not skip to stage 4. A non-RUNNING `bots[].state` is a
-bots finding when it is CRASHED, or HUNG with an open position
-(`bots[].position`) or an open session (`market.session`): those go to
-stage 2 and the digest. LAGGING stays P3, not lumped in with CRASHED.
-Name `trading_mode` when it is not `paper`.
+report GREEN. Do not skip to stage 4. A CRASHED or HUNG `bots[].state`
+is a bots finding (P1 per `bot-status`): it goes to stage 2 and the
+digest, saying whether a position (`bots[].position`) or session
+(`market.session`) is open. NO_HEARTBEAT is listed as needs attention;
+LAGGING stays P3, not lumped in with CRASHED. Name `trading_mode` when
+it is not `paper`.
 
 ```bash
 curl -s http://<Steven tailnet IP>:8765/api/fleet
