@@ -5,17 +5,8 @@ description: Structured 4-phase debug workflow for tai-robot — investigate a l
 
 # tai-robot Debug Workflow
 
-> **Where the data is (since 2026-10-24/25):** the live fleet (12 headless
-> `tai_backtest.exe` bots), the bot dashboard and the W1–W4 bridge tasks
-> run on **Steven**, not this PC. This PC's `data\live` holds only
-> retired/test bots and its n8n is stopped. Read live state from the
-> dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
-> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
-> describes this PC only — never publish it as fleet health. Host map →
-> `start-here`. Run checkers from an up-to-date checkout
-> (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
-> weeks behind.
+> Live bots, dashboard and bridges run on **Steven**, not this PC — host map,
+> dashboard API and checkout rules → `start-here`.
 
 A repo-specific, four-phase workflow for taking a live-bot symptom to a shipped fix.
 Each phase names the model to use. Do not skip phases — the review phase catches
@@ -97,7 +88,8 @@ Goal: an independent read of the diff before it merges.
 
 Review `git diff master...fix/<issue-slug>` for:
 - **Correctness** — does it actually fix the Phase 1 root cause?
-- **Edge cases** — session boundaries, gaps/weekends/holidays, fill races, restarts.
+- **Contract** — apply the CLAUDE.md change & review contract: one rule, at least
+  as safe as master; report only evidenced triggers.
 - **Regressions** — does it break any existing code path or timeframe?
 - **Non-regime bot safety** — verify plain `LiveRunner` / paper bots are unaffected,
   not just `RegimeSwitchingRunner`. Changes to shared broker/aggregator/live glue
