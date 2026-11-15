@@ -43,6 +43,8 @@ def _in_window(now: datetime) -> bool:
     return _WINDOW_START <= clock <= _WINDOW_END
 
 
+# Known, accepted (Eric, 2026-11-15): from 05:00 until the broker's ~05:22-05:36 reset, L is the full account net,
+# so a pause latched then carries into the next day session. This matches master; tracked in #306.
 def _in_night(now: datetime) -> bool:
     """Night session [15:00, 05:00). 05:00 itself is the full account net."""
     clock = _clock(now)
