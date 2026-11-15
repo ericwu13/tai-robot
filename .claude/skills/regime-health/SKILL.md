@@ -120,4 +120,6 @@ Healthy vs unhealthy:
 - votes look wrong or absent → `bridge-health`
 - classification missed but the bot was alive → `log-scan`, then the
   repo's `debug` skill to root-cause end to end
-- n8n side of the vote pipeline → the `n8n-debug` skill
+- live votes (missing, stale, or wrong) → `bridge-health`. The local n8n
+  side of the vote pipeline is history only (pre-2026-10-24) → `n8n-debug`;
+  do not run its fixes.
