@@ -42,8 +42,18 @@
         the review at <sha>" ONLY after the resolve succeeded, so a token
         without the right permission adds no comments.
 
+    python claude_review_post.py ping
+        Post "owner decision needed" to Discord for a PR or issue that just
+        got the `needs-owner` label from a person or Cursor (the
+        needs-owner-ping workflow; env KIND, NUMBER, TITLE, URL, ACTOR).
+        A label the review job adds itself uses the job token, which starts
+        no workflow, so `post` sends that ping directly.
+
 Env: PR, HEAD_SHA, GITHUB_REPOSITORY, GH_TOKEN (+ BASE for reuse, RESULT
 and DIFF_HASH for post, IDS for resolve). Uses gh and git.
+Discord (optional, both repo secrets): DISCORD_REVIEW_WEBHOOK, and
+DISCORD_OWNER_MENTION (e.g. "<@user id>") to ping the owner. Without the
+webhook nothing is sent. A Discord failure never fails the job.
 """
 import hashlib
 import json
@@ -51,6 +61,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 
 NEEDS_OWNER_LABEL = "needs-owner"
 BLOCKS_BEFORE_OWNER = 3
@@ -58,6 +69,7 @@ MARKER_RE = re.compile(r"<!-- claude-review-state: (\{.*?\}) -->")
 CARRY_RE = re.compile(r"\n?<sub>Carried over to [^<]*</sub>")
 
 BOT_LOGINS = {"github-actions", "github-actions[bot]"}
+DISCORD_LIMIT = 2000
 
 THREADS_QUERY = """
 query($owner:String!, $name:String!, $pr:Int!, $after:String) {
@@ -256,7 +268,52 @@ def reuse():
         patch_comment(repo, cid, new_body)
 
 
+def discord_payload(text, mention=""):
+    """Webhook body: optional owner mention first, cut to Discord's limit.
+    Only the mention may ping anyone (no @everyone from a PR title). Pure."""
+    content = f"{mention} {text}".strip() if mention else text
+    if len(content) > DISCORD_LIMIT:
+        content = content[:DISCORD_LIMIT - 1] + "…"
+    allowed = {"parse": ["users", "roles"]} if mention else {"parse": []}
+    return {"content": content, "allowed_mentions": allowed}
+
+
+def discord_notify(text, mention=None):
+    """Post to DISCORD_REVIEW_WEBHOOK. Never raises: returns True if sent."""
+    url = os.environ.get("DISCORD_REVIEW_WEBHOOK", "").strip()
+    if not url:
+        print("DISCORD_REVIEW_WEBHOOK not set; nothing sent to Discord")
+        return False
+    if mention is None:
+        mention = os.environ.get("DISCORD_OWNER_MENTION", "").strip()
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(discord_payload(text, mention)).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     # Discord's edge rejects the default Python-urllib agent.
+                     "User-Agent": "DiscordBot (https://github.com, 1.0) tai-robot-ci"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"Discord: HTTP {resp.status}")
+        return True
+    except Exception as exc:  # noqa: BLE001 - a ping must never fail the job
+        print(f"Discord post failed: {exc}")
+        return False
+
+
+def owner_ping_text(kind, number, title, url, why):
+    """One-line owner ping. Pure."""
+    return f"🙋 Owner decision needed: {kind} #{number} “{title}” ({why}) {url}"
+
+
 def ensure_needs_owner(repo, pr):
+    """Add the label; ping Discord only the first time (later BLOCKs on a
+    PR that already waits for the owner stay quiet)."""
+    try:
+        had = NEEDS_OWNER_LABEL in subprocess.run(
+            ["gh", "pr", "view", pr, "--repo", repo, "--json", "labels",
+             "--jq", ".labels[].name"], capture_output=True, text=True).stdout.split()
+    except OSError:
+        had = False
     subprocess.run(["gh", "label", "create", NEEDS_OWNER_LABEL, "--repo", repo,
                     "--color", "B60205", "--description",
                     "Claude BLOCKed 3 times: owner decision before more pushes"],
@@ -264,6 +321,24 @@ def ensure_needs_owner(repo, pr):
     rc = subprocess.run(["gh", "pr", "edit", pr, "--repo", repo,
                          "--add-label", NEEDS_OWNER_LABEL]).returncode
     print(f"needs-owner label {'added' if rc == 0 else 'NOT added'}")
+    if rc == 0 and not had:
+        info = subprocess.run(["gh", "pr", "view", pr, "--repo", repo, "--json",
+                               "title,url"], capture_output=True, text=True).stdout
+        try:
+            info = json.loads(info)
+        except ValueError:
+            info = {}
+        discord_notify(owner_ping_text(
+            "PR", pr, info.get("title", ""), info.get("url", ""),
+            f"Claude BLOCKed it {BLOCKS_BEFORE_OWNER} times"))
+
+
+def ping():
+    """needs-owner added by a person or Cursor (see the docstring)."""
+    e = os.environ
+    discord_notify(owner_ping_text(e.get("KIND", "PR"), e.get("NUMBER", "?"),
+                                   e.get("TITLE", ""), e.get("URL", ""),
+                                   f"labeled by {e.get('ACTOR', '?')}"))
 
 
 def to_review_comment(c):
@@ -375,6 +450,8 @@ if __name__ == "__main__":
         reuse()
     elif mode == "collect":
         collect(sys.argv[2])
+    elif mode == "ping":
+        ping()
     elif mode == "resolve":
         ids = [str(i) for i in json.loads(os.environ.get("IDS") or "[]")]
         resolve_ids(os.environ["GITHUB_REPOSITORY"], os.environ["PR"],
