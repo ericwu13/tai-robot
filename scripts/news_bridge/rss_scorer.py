@@ -1081,13 +1081,17 @@ def main() -> int:
     return 0
 
 
-def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str) -> dict:
+def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str,
+                   now: datetime | None = None) -> dict:
     """One scoring pass + state save, logged to runs/W3.jsonl.  A pass
     whose Gemini scoring failed (error_streak went up) is a failed run
-    even though the process itself carries on."""
+    even though the process itself carries on.
+
+    ``now`` is passed to ``check_once`` (tests pin the clock; the weekend
+    pause would otherwise skip the pass on Sat/Sun)."""
     with _run_recorder(Path(state_path).parent, "W3") as run:
         before = int(state.get("error_streak") or 0)
-        state = check_once(cfg, state, vote_out)
+        state = check_once(cfg, state, vote_out, now=now)
         save_state(state_path, state)
         run.exit_code = 0
         run.result = (f"fetched {state.get('last_fetched', '-')} | "
