@@ -220,8 +220,8 @@ class LinkStateMachine:
     # moment ``_quote_enter_not_before`` is cleared so a later tick can
     # still tell a fresh tick from one that arrived during the gap.
     _quote_hold_open_at: datetime | None = None
-    # While ``now`` is earlier, a timeout hold does not run the stuck
-    # clock. EnterMonitorLONG is not blocked by this field.
+    # While ``now`` is earlier, the stuck clock does not run.
+    # EnterMonitorLONG is not blocked by this field.
     _quote_stuck_not_before: datetime | None = None
     # Market time of the latest fresh tick, supplied by the host.
     _fresh_tick_at: datetime | None = None
@@ -472,9 +472,10 @@ class LinkStateMachine:
         now. It does not clear it.
         """
         # Lift the enter-hold so this press is not swallowed, including
-        # before DEGRADED. A tick-restore anchor that is already due
-        # stays; a future one is the enter-hold and goes with it.
-        # DEGRADED ends the whole timeout episode.
+        # before DEGRADED. DEGRADED ends the whole timeout episode. A
+        # tick-restore anchor that is already due stays. While the quote
+        # is DOWN and not DEGRADED, a future anchor stays too, and the
+        # stuck-clock pause stays with it.
         self._lift_quote_enter_hold(now)
         if not self.degraded:
             return
@@ -1052,11 +1053,13 @@ class LinkStateMachine:
         self._quote_stuck_not_before = None
 
     def _lift_quote_enter_hold(self, now: datetime) -> None:
-        """Drop the enter-hold and the stuck pause.
+        """Drop the enter-hold and clear the timeout flag.
 
         A reconnect before DEGRADED keeps a tick-restore anchor that
-        is already due. A future anchor is the closed-gap enter-hold
-        and is lifted with it. DEGRADED ends the episode.
+        is already due. While the quote is DOWN and that anchor is
+        not yet due, the anchor and the stuck-clock pause stay. Any
+        other future anchor is lifted, and the stuck-clock pause
+        with it. DEGRADED ends the episode.
         """
         if self.degraded:
             self._end_quote_timeout()
@@ -1064,8 +1067,18 @@ class LinkStateMachine:
         anchor = self._quote_hold_open_at
         self._quote_timeout_hold = False
         self._quote_enter_not_before = None
+        # DOWN and the anchor is still ahead. Keep the anchor and the
+        # stuck-clock pause. The enter-hold is already cleared.
+        if (
+            self.quote == LinkPhase.DOWN
+            and anchor is not None
+            and now < anchor
+        ):
+            return
         self._quote_stuck_not_before = None
-        self._quote_hold_open_at = anchor if anchor is not None and now >= anchor else None
+        self._quote_hold_open_at = (
+            anchor if anchor is not None and now >= anchor else None
+        )
 
     def _restore_if_feed_healthy(self, now: datetime) -> bool:
         """Return to READY when a fresh tick arrived after the anchor.
@@ -1147,11 +1160,7 @@ class LinkStateMachine:
 
     def _track_quote_stuck(self, now: datetime, state: int) -> None:
         pause = self._quote_stuck_not_before
-        if (
-            self._quote_timeout_hold
-            and pause is not None
-            and now < pause
-        ):
+        if pause is not None and now < pause:
             self._quote_stuck_since = None
             return
         if state not in (1, 2):

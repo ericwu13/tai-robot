@@ -2045,6 +2045,35 @@ def test_reconnect_before_degraded_keeps_the_tick_restore_anchor(monkeypatch):
     assert machine._quote_hold_open_at is None
 
 
+def test_closed_gap_reconnect_keeps_the_future_anchor(monkeypatch):
+    """DOWN in the gap, Reconnect at 07:40, IsConnected stays 1.
+
+    The future anchor and the stuck-clock pause stay. 07:45 and 08:44
+    are not DEGRADED. A fresh tick at the open restores READY and that
+    restore does not call EnterMonitorLONG.
+    """
+    app, fake, clock, _logged, _enters, open_at = _closed_gap_down(
+        monkeypatch, state=1)
+    app._conn_monitor = _give_up_monitor()
+    app._reconnect_timer_id = None
+    press = tpe(2026, 11, 12, 7, 40)
+    clock["now"] = press
+    fake.set_now(press)
+    app._manual_reconnect()
+    machine = app._link_host.machine
+    for when in (tpe(2026, 11, 12, 7, 45), tpe(2026, 11, 12, 8, 44)):
+        _tick(app, fake, clock, when)
+        assert machine.degraded is False, when.strftime("%H:%M")
+    clock["now"] = open_at
+    fake.set_now(open_at)
+    before = fake.calls.count("EnterMonitorLONG")
+    app._note_fresh_quote_tick()
+    _tick(app, fake, clock, open_at)
+    after = fake.calls.count("EnterMonitorLONG")
+    assert machine.quote == LinkPhase.READY
+    assert after == before, (before, after)
+
+
 def test_tick_restore_follows_the_anchor_alone(monkeypatch):
     """The other 3002 flags cannot veto a due restore anchor.
 
