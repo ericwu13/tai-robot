@@ -34,7 +34,7 @@ Skills in `.claude/skills/` and agents in `.claude/agents/` load automatically; 
 | shell on Steven | `tailscale-ssh` (only when a person's own message allows it) |
 | cold start, which checkout or host | `start-here` |
 
-Never deploy, restart or stop a bot (or write a `STOP` file) unless the user explicitly ran `/deploy` for it; otherwise say what you found and suggest `/deploy`.
+Claude Code only: never deploy, restart or stop a bot (or write a `STOP` file) unless the user explicitly ran `/deploy` for it; otherwise say what you found and suggest `/deploy`. Other agents (Grok bots, Selina, Cursor) keep following their own instructions and can still read `.claude/skills/deploy/SKILL.md` directly.
 
 Real-order modes, merges, tags, releases (and their Discord notice) and dashboard control actions need Eric's explicit yes (relayed via Selina for agents), not just the session user's. `.claude/settings.json` makes Claude ask before the matching commands (push to master, tag, merge, release, `/api/control`, `deploy --mode auto`). Those prompts are a reminder, not a security boundary: a command written another way won't match, so the rule above still applies.
 
