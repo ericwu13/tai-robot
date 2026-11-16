@@ -53,7 +53,7 @@ def test_duration_log_does_not_replace_a_raised_call(monkeypatch):
 
     seen = {}
 
-    def logger(name, elapsed_ms, failed):
+    def logger(name, elapsed_ms, failed, code=None):
         seen["name"] = name
         seen["failed"] = failed
         seen["ms"] = elapsed_ms

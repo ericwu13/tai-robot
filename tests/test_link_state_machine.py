@@ -657,6 +657,47 @@ class TestReplays:
 
 
 class TestReedReview:
+    def test_3033_then_3003_then_reply_clears_solace_latches(self):
+        """3003 while the reply is still down, then reply recovery.
+
+        ``_finish_quote_ready`` cannot clear the 3033 episode because
+        the reply is not READY yet. ``_finish_reply`` must clear
+        ``_saw_3033``, ``_solace_down_at`` and ``_saw_reply_disconnect``
+        once the reply comes back.
+        """
+        machine, fake, t0 = boot_ready()
+        t = t0 + timedelta(minutes=30)
+        inject_connection(machine, fake, KIND_SOLACE_DOWN, t)
+        at(machine, fake, t)
+        assert machine._saw_3033 is True
+        assert machine.quote == LinkPhase.DOWN
+        assert machine.reply == LinkPhase.DOWN
+        ready = t + timedelta(seconds=1)
+        # 3003 on a quote the 3033 had dropped. note_3003 only arms
+        # subscribe when the quote was half-up.
+        fake.quote_state = 2
+        inject_connection(machine, fake, KIND_READY, ready)
+        at(machine, fake, ready)
+        assert machine.quote == LinkPhase.READY
+        assert machine.reply == LinkPhase.DOWN
+        assert machine._saw_3033 is True
+        assert machine._solace_down_at == t
+        disc = ready + timedelta(seconds=1)
+        inject_reply_disconnect(machine, fake, disc)
+        at(machine, fake, disc)
+        assert machine._saw_reply_disconnect is True
+        now = pump(machine, fake, disc, 15)
+        assert machine.reply == LinkPhase.CONNECTING
+        inject_complete(machine, fake, now)
+        at(machine, fake, now)
+        assert machine.reply == LinkPhase.READY
+        assert machine.quote == LinkPhase.READY
+        assert machine.reply_reconciled is True
+        assert machine.orders_paused is False
+        assert machine._saw_3033 is False
+        assert machine._solace_down_at is None
+        assert machine._saw_reply_disconnect is False
+
     def test_A_second_3033_without_reply_event_no_connect_by_id(self):
         """A finished 3033 must not authorize the next one."""
         machine, fake, t0 = boot_ready()
