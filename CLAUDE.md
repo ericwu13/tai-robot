@@ -26,13 +26,15 @@ Skills in `.claude/skills/` and agents in `.claude/agents/` load automatically; 
 | crash, traceback, "anything scary in the logs?" | `log-scan`, then `debug` |
 | live bug the owner wants root-caused and fixed now | `debug` |
 | a GitHub issue / bug_report zip | `issue-triage` → `validate-findings` (`skeptic` agent) → `fix-pr` (`fixer` agent) |
-| deploy / restart / stop a bot | `deploy`, then `deploy-check` |
+| deploy / restart / stop a bot | only when the user types `/deploy` (never picked automatically), then `deploy-check` |
 | wiring looks wrong, Discord silent, votes never read | `deploy-check` |
 | weekly evolution silent or never PASSes | `evo-debug` |
 | new strategy, backtest, historical bars | `strategy-research` |
 | daily / weekly health digest | `daily-review`, `weekly-review` |
 | shell on Steven | `tailscale-ssh` (only when a person's own message allows it) |
 | cold start, which checkout or host | `start-here` |
+
+Never deploy, restart or stop a bot (or write a `STOP` file) unless the user explicitly ran `/deploy` for it; otherwise say what you found and suggest `/deploy`.
 
 Real-order modes, merges, tags, releases (and their Discord notice) and dashboard control actions need Eric's explicit yes (relayed via Selina for agents), not just the session user's. `.claude/settings.json` makes Claude ask before the matching commands (push to master, tag, merge, release, `/api/control`, `deploy --mode auto`). Those prompts are a reminder, not a security boundary: a command written another way won't match, so the rule above still applies.
 

@@ -1,6 +1,7 @@
 ---
 name: deploy
 description: Deploy, restart or stop a tai-robot live bot headlessly (run_bot_cli.py from source, tai_backtest.exe from a packaged install) — resolve the strategy name, gate real-order modes on the owner's explicit yes, launch detached and confirm tick subscription. Use for "deploy/start/restart/stop <bot>", "restart the bots on Steven", "redeploy after the release/upgrade", "move bots to the new install", "bring <bot> back" after a crash, or running a bot without the Tk workbench. Afterwards check wiring with deploy-check. The live fleet runs on Steven.
+disable-model-invocation: true
 ---
 
 # Deploy (headless)
