@@ -1,6 +1,6 @@
 ---
 name: fix-pr
-description: Implement a validated bug fix in an isolated git worktree and ship it as a draft PR — gated on a confirmed root cause, with failing-first tests, never touching the main working tree (live bots run from it) and never merging. Use after issue-triage + validate-findings confirm a bounded fix, or when asked to turn a root cause into a PR.
+description: Implement a validated bug fix in an isolated git worktree (via the fixer agent) and ship it as a draft PR — gated on a confirmed root cause, with failing-first tests, never touching the owner's main working tree and never merging. Use after issue-triage + validate-findings confirm a bounded fix, or when asked to turn a confirmed root cause into a PR.
 ---
 
 # Fix → Draft PR
@@ -30,10 +30,14 @@ Severity, evidence bar, finding replies and the PR body follow CLAUDE.md
 
 ## Execution
 
-- Spawn ONE implementation agent, **model opus** (CLAUDE.md model
-  preference), **isolation: worktree** — the main working tree is
-  off-limits: it is the owner's tree, usually behind origin/master, and a
-  checkout there churns their files. The agent's first steps: `git fetch
+- Spawn ONE `fixer` agent (`.claude/agents/fixer.md`: **model opus**,
+  **isolation: worktree** pinned in its definition). If that agent is not
+  available, spawn a general-purpose agent with model opus and
+  isolation worktree, and include the mandate below in its brief. The
+  main working tree is off-limits: it is the owner's tree, usually behind
+  origin/master, and a checkout there churns their files. The brief gives
+  the CONFIRMED root cause, the test plan, branch `fix/issue-<N>`, and
+  "push and open a draft PR". The agent's first steps: `git fetch
   origin`, branch from `origin/master` (`git switch -c fix/issue-<N>
   origin/master`), confirm `git rev-list --count HEAD..origin/master` = 0.
   Never branch from the main tree's HEAD.
@@ -54,7 +58,8 @@ Severity, evidence bar, finding replies and the PR body follow CLAUDE.md
   Rollout / "Fixes #N"
   and the footer `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 - After it returns: verify with `gh pr view`, review the diff YOURSELF
-  (`git fetch origin fix/issue-<N>; git diff master...origin/fix/issue-<N>`)
+  (`git fetch origin master fix/issue-<N>; git diff origin/master...origin/fix/issue-<N>`
+  — local `master` can be weeks behind and would pull unrelated commits into the diff)
   — scrutinize any deviation from the spec, especially glue-code changes
   (`run_backtest.py` — the repo's bugs live in glue) — and check it is
   one rule, at least as safe as master, with every special case backed by

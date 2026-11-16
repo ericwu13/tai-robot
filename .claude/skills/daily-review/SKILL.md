@@ -21,11 +21,10 @@ This skill sequences the pipeline; the knowledge lives in the stage
 skills. Keep every stage light. The scheduled task
 runs this exact skill — do not fork its logic elsewhere.
 
-Hard rules that override everything: the main working tree is READ-ONLY
-(live bots run python out of it — code changes only in a `fix-pr`
-worktree); never delete locks/votes/state; never write the n8n DB; never
-merge a PR; never let secrets reach output (`scripts/monitor/common.py
-redact()`).
+Hard rules that override everything: the owner's main working tree is
+READ-ONLY (code changes only in a `fix-pr` worktree); never delete
+locks/votes/state; never write the n8n DB; never merge a PR; never let
+secrets reach output (`scripts/monitor/common.py redact()`).
 
 ## Stage 1 — fetch (no subagents)
 
@@ -56,7 +55,7 @@ Fallback, this PC only. Its grade is not the fleet verdict and does not
 skip to stage 4:
 
 ```bash
-C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/daily_review.py
+~/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/daily_review.py
 ```
 
 ## Stage 2 — review (≤3 targeted subagents, grouped by THEME)

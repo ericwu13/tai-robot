@@ -1,6 +1,6 @@
 ---
 name: debug
-description: Structured 4-phase debug workflow for tai-robot — investigate a live-bot symptom, implement a fix on a fix/ branch, review the diff, then, only after an explicit release yes from Eric (relayed via Selina for agents), ship a versioned release per CLAUDE.md § Release Process. Use when a deployed bot misbehaves or a bug needs root-causing end to end.
+description: Interactive end-to-end fix of a live-bot bug with the owner — investigate from the logs first, fix on a fix/ branch, review the diff, then ship a release only after an explicit release yes from Eric (relayed via Selina for agents). Use when a deployed bot misbehaves and the owner wants it root-caused and fixed, or log-scan found an error to chase. A GitHub issue to investigate → issue-triage.
 ---
 
 # tai-robot Debug Workflow
@@ -74,6 +74,10 @@ or assertion) as proof the fix works — not just a green suite.
 
 1. Branch in a worktree cut from the remote, never in the main tree:
    `git fetch origin && git worktree add -b fix/<issue-slug> <path> origin/master`.
+   Or delegate this phase to the `fixer` agent (Opus, its own worktree):
+   its brief is the three Phase 1 outputs plus the branch name
+   `fix/<issue-slug>`. It returns without pushing unless the brief asks
+   for a draft PR; Phase 3 still reviews its diff.
 2. Fix the fundamental problem identified in Phase 1 — no surface patches. Remove
    any dead code you touch; match surrounding style.
 3. Add/adjust tests that would fail against the known-bad code.
@@ -86,10 +90,13 @@ or assertion) as proof the fix works — not just a green suite.
 ## Phase 3 — Review (model: `claude-fable-5` (if a Fable subagent fails with a usage-credit error, re-run it on Opus and say so in the report))
 Goal: an independent read of the diff before it merges.
 
-Review `git diff master...fix/<issue-slug>` for:
+Review `git fetch origin && git diff origin/master...fix/<issue-slug>` (not
+local `master`, which can be weeks behind) for:
 - **Correctness** — does it actually fix the Phase 1 root cause?
 - **Contract** — apply the CLAUDE.md change & review contract: one rule, at least
-  as safe as master; report only evidenced triggers.
+  as safe as master; grade each finding P1/P2/P3 by its definitions there;
+  report only evidenced triggers (seen in logs/data/an incident, or traced
+  through the real control paths).
 - **Regressions** — does it break any existing code path or timeframe?
 - **Non-regime bot safety** — verify plain `LiveRunner` / paper bots are unaffected,
   not just `RegimeSwitchingRunner`. Changes to shared broker/aggregator/live glue

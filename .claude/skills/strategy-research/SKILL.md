@@ -77,7 +77,7 @@ as the workbench (the AI Review text comes from `src/ai/review_payload.py`,
 which the GUI also calls; a test pins the codegen wording to `run_backtest.py`):
 
 ```bash
-python -m scripts.research.chat say    s1 msg1.txt   --settings C:\Users\eric8\gitRepos\tai-robot\settings.yaml
+python -m scripts.research.chat say    s1 msg1.txt   --settings <main tree>\settings.yaml
 python -m scripts.research.chat gen    s1 cand/a.py  --settings …
 python -m scripts.research.chat review s1 cand/a.py  --settings … --bars bars.pkl --design 2026-03-17:2026-09-15
 ```

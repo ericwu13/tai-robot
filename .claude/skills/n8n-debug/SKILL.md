@@ -1,11 +1,12 @@
 ---
 name: n8n-debug
-description: HISTORY ONLY (local n8n stopped since 2026-10-24; current W1-W4 are Steven scheduled tasks — use bridge-health). Archived diagnosis of the retired local n8n news-bridge (W1-W5): why a historical workflow failed, never fired, or was not imported. A live bridge-script error, a missing vote or signal file, or a Discord alert that did not arrive is bridge-health, not this skill.
+description: "HISTORY ONLY (local n8n stopped since 2026-10-24; current W1-W4 are Steven scheduled tasks — use bridge-health). Archived diagnosis of the retired local n8n news-bridge (W1-W5): why a historical workflow failed, never fired, or was not imported. A live bridge-script error, a missing vote or signal file, or a Discord alert that did not arrive is bridge-health, not this skill."
+disable-model-invocation: true
 ---
 
 # n8n News-Bridge Debugging
 
-**History only — do not run.** Local n8n is retired; restarting it can double-run W1–W4 (see `bridge-health`). Current bridges are Steven scheduled tasks. The notes below are a record of that retired instance. Read-only DB and event-log queries may stay, and they are history-only.
+**History only — do not run.** Local n8n is retired; restarting it can double-run W1–W4 (see `bridge-health`). Current bridges are Steven scheduled tasks. The notes below are a record of that retired instance. Read-only DB and event-log queries may stay, and they are history-only. Every path below (`C:\Users\eric8\…`) is on the owner's PC; on any other machine there is nothing to read. Claude does not pick this skill automatically — invoke it as `/n8n-debug`.
 
 These notes describe the retired instance **without the n8n UI, without the REST API key, and
 without asking the user** — via the n8n SQLite DB (read-only), the event

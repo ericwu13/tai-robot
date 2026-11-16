@@ -1,6 +1,6 @@
 ---
 name: issue-triage
-description: Root-cause a tai-robot GitHub issue from its report and debug bundle — reproduce the mechanism from logs, name the file/function, and produce a falsifiable root-cause statement ready for validate-findings and fix-pr. Use when a new/updated issue needs investigating, a user attached a bug_report zip, or the daily review surfaced a fresh bug.
+description: Root-cause a tai-robot GitHub issue ("#123", a bug report, an attached bug_report zip) — reproduce the mechanism from logs, name the file/function, and produce a falsifiable root-cause statement ready for validate-findings and fix-pr. Use when a new or updated issue needs investigating or the daily review surfaced a fresh bug. A live bot misbehaving right now with no issue filed → debug.
 ---
 
 # Issue Triage
