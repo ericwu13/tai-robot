@@ -5,13 +5,13 @@
 - **#282**（squash `b7a7abfb`）部署／恢復中止時停止 bot 但不平倉（Eric 2026-11-13 決定）：
   - 部署或 `--resume` 在開始接收即時報價前失敗（暖機無資料來源、COM 暖機查詢失敗或錯誤、30 秒暖機逾時、TV 不支援週期、TV 暖機失敗或錯誤、未連線、Tick 訂閱失敗或錯誤，共 10 處）時，改走 `_abort_deploy(reason)`：**不送單、不強制平倉**，`session.json` 保留持倉與出場價位，可手動平倉或 `--resume`。
   - 通知：debug log `[DEPLOY ABORT]`、即時頁訊息、GUI 彈窗（headless 只記 log），Discord 啟用時發送優先警報「🚨 部署中止 Deploy aborted [模式]: 原因…」，列出商品、方向、口數。
-  - v2.19.19 及更早版本：同樣的中止在實單已確認持倉時會送出停止平倉單。Paper 與 regime-switching bot 同樣處理；headless 以 exit code 5（bot stopped）結束，heartbeat 檔如一般停止般移除。
+  - v2.19.19 及更早版本：同樣的中止在實單已確認持倉時會送出停止平倉單。Paper 與 regime-switching bot 同樣處理；headless 若在暖機設定階段中止（無資料來源、COM 暖機查詢失敗或錯誤、TV 不支援週期）以 exit code 4（deploy refused）結束，之後的中止（暖機逾時、TV 暖機錯誤、Tick 訂閱）以 exit code 5（bot stopped）結束；兩者都會記 `[DEPLOY ABORT]` 並發 Discord 警報，heartbeat 檔如一般停止般移除。
   - 不變：「停止機器人」按鈕、headless STOP／Ctrl+C、儀表板停止仍會平倉。中止時不產生每日報告，之後平倉的報告仍會送出。
 
   **#282** (squash `b7a7abfb`) a deploy/resume abort stops the bot without flattening (Eric's 2026-11-13 decision):
   - A deploy or `--resume` that fails before live ticks (no warmup source, COM warmup fetch failure or error, 30 s warmup timeout, TV unsupported interval, TV warmup failure or error, not connected, tick-subscribe failure or error — 10 sites) now goes through `_abort_deploy(reason)`: **no order is sent and the position is not force-closed**; `session.json` keeps the position and exit levels, so the operator can close by hand or `--resume`.
   - Signals: debug log `[DEPLOY ABORT]`, a Live-tab line, a GUI popup (headless logs it only), and, when Discord is enabled, a priority alert "🚨 部署中止 Deploy aborted [mode]: reason…" naming symbol, side and quantity.
-  - On v2.19.19 and earlier the same abort sent a stop-close order when a confirmed real position was open. Paper and regime-switching bots are handled the same way; headless exits with code 5 (bot stopped) and the heartbeat file is removed as on a normal stop.
+  - On v2.19.19 and earlier the same abort sent a stop-close order when a confirmed real position was open. Paper and regime-switching bots are handled the same way; headless exits with code 4 (deploy refused) when the abort happens during warmup setup (no source, COM fetch failure or error, TV unsupported interval) and with code 5 (bot stopped) for later aborts (warmup timeout, TV warmup error, tick subscribe); both log `[DEPLOY ABORT]` and send the Discord alert, and the heartbeat file is removed as on a normal stop.
   - Unchanged: the Stop Bot button, headless STOP / Ctrl+C and the dashboard stop still flatten. The abort skips the daily report, so the later exit is still reported.
 
 - **#292**（squash `d06d5cff`）週六演化網格（knob grid）：進度心跳、依規模調整時限、每個安裝資料夾一次一個網格：
@@ -32,9 +32,9 @@
 
 ## 操作注意 Operator caveats
 
-- **#282 中止後持倉無人管理**：中止的 bot 已停止，持倉仍在券商端，沒有策略或出場管理，直到操作員處理。看到 🚨 部署中止、headless exit 5 或 bot 從機隊消失時，請先確認該商品券商持倉，再修正原因後 `--resume` 或手動平倉。watchdog 不會回報 HUNG（heartbeat 已移除）。 / **#282 an aborted bot leaves the position unmanaged**: the bot is stopped while the position stays at the broker with no strategy or exit management until an operator acts. On a 🚨 Deploy aborted alert, a headless exit 5, or a bot missing from the fleet, check the broker position for that symbol, then fix the cause and `--resume`, or close by hand. The watchdog will not report HUNG (the heartbeat is removed).
-- **#282 換版**：以 `--resume` 重啟的 bot 若中止，會停止並保留持倉；換版時請逐一確認重啟的 bot 確實在執行（無 exit 5、無 `[DEPLOY ABORT]`、無 🚨）。 / **#282 swaps**: a bot relaunched with `--resume` that aborts stops and keeps its position; during a swap, confirm each relaunched bot is actually running (no exit 5, no `[DEPLOY ABORT]`, no 🚨) before moving on.
-- **#292 週六網格改為依序執行**：共用同一 EXE 資料夾的 bot 會逐一執行網格，排在後面的 bot 可能晚數小時完成，或等滿 9 小時以 `queue_timeout`（可重試）失敗。執行中請勿刪除 `data/evo_grid.slot`；殘留的檔案會依 pid／時間自動判定過期。 / **#292 Saturday grids now run one at a time**: bots sharing one EXE folder run their grids in turn, so later bots may finish hours later or fail with `queue_timeout` (retryable) after 9 h. Do not delete `data/evo_grid.slot` while a grid runs; a leftover file is judged stale by its pid and age.
+- **#282 中止後持倉無人管理**：中止的 bot 已停止，持倉仍在券商端，沒有策略或出場管理，直到操作員處理。看到 🚨 部署中止、headless exit 4 或 5、或 bot 從機隊消失時，請先確認該商品券商持倉，再修正原因後 `--resume` 或手動平倉。watchdog 不會回報 HUNG（heartbeat 已移除）。 / **#282 an aborted bot leaves the position unmanaged**: the bot is stopped while the position stays at the broker with no strategy or exit management until an operator acts. On a 🚨 Deploy aborted alert, a headless exit 4 or 5, or a bot missing from the fleet, check the broker position for that symbol, then fix the cause and `--resume`, or close by hand. The watchdog will not report HUNG (the heartbeat is removed).
+- **#282 換版**：以 `--resume` 重啟的 bot 若中止，會停止並保留持倉；換版時請逐一確認重啟的 bot 確實在執行（無 exit 4／5、無 `[DEPLOY ABORT]`、無 🚨）。 / **#282 swaps**: a bot relaunched with `--resume` that aborts stops and keeps its position; during a swap, confirm each relaunched bot is actually running (no exit 4 or 5, no `[DEPLOY ABORT]`, no 🚨) before moving on.
+- **#292 週六網格改為依序執行**：共用同一 EXE 資料夾的 bot 會逐一執行網格，排在後面的 bot 可能晚數小時完成，或等滿 9 小時以 `queue_timeout`（可重試）失敗。`data/evo_grid.slot` 是作業系統檔案鎖，持有的行程結束即自動釋放；殘留的檔案本身不會擋住下一個網格，執行中請勿刪除。 / **#292 Saturday grids now run one at a time**: bots sharing one EXE folder run their grids in turn, so later bots may finish hours later or fail with `queue_timeout` (retryable) after 9 h. `data/evo_grid.slot` is an OS file lock that is released when the holding process exits; a leftover file does not block the next grid by itself. Do not delete it while a grid runs.
 
 ## 升級注意 Upgrade / redeploy notes
 
