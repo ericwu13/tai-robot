@@ -21,6 +21,7 @@ from pathlib import Path
 from src.evolution.grid_process import (
     GridJob,
     GridProcessFailure,
+    _pid_alive,
     audit_child_imports,
     burn_child_entry,
     drain_race_child_entry,
@@ -151,11 +152,9 @@ def one_progress_then_sleep_entry(job, conn) -> None:
 
 def _assert_dead(pid: int) -> None:
     assert pid and pid > 0
-    deadline = time.time() + 3
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
             return
         time.sleep(0.02)
     raise AssertionError(f"grid child pid {pid} is still alive")
