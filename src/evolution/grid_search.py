@@ -288,6 +288,30 @@ def build_search_settings(
     return _reserve_pair_slots(full, cap)
 
 
+def count_scheduled_runs(strategy_cls, source: str, evo) -> int:
+    """Baseline plus pre-registered settings. 1 when the grid will not run.
+
+    The parent sizes the subprocess budget from this count before
+    spawn. Same builders as ``run_grid_on_bars``. No backtest.
+    """
+    if strategy_cls is None:
+        return 1
+    name = getattr(strategy_cls, "__name__", "") or ""
+    master = knob_grid_for(name) or {}
+    effective, reason = class_knob_eligibility(
+        strategy_cls, master, source or "")
+    if reason or len(effective) < 2:
+        return 1
+    try:
+        baseline = read_strategy_knobs(strategy_cls, effective)
+    except Exception:
+        return 1
+    cfg = evolution_gate_config_from_mapping(
+        evo if isinstance(evo, dict) else {})
+    settings = build_search_settings(baseline, effective, cfg.trial)
+    return max(1, len(settings) + 1)
+
+
 def _axes(baseline: dict, eligibility_grid: dict) -> tuple[list[str], list[tuple]]:
     keys = [key for key in eligibility_grid if key in baseline]
     axes = []
@@ -733,8 +757,14 @@ def run_grid_on_bars(
         capital_base: int,
         evo,
         fold_days: int = 14,
-        max_folds: int = 10) -> GridOutcome:
+        max_folds: int = 10,
+        progress=None) -> GridOutcome:
     """Backtest the pre-registered grid on ``bars`` and select.
+
+    ``progress(i, n)``, when passed, is called after the baseline and
+    after each setting. ``i`` is how many of those runs have finished
+    and ``n`` is settings + 1. The default is a no-op. The callback is
+    not an input to selection.
 
     The setting list is fixed before the first candidate backtest.
     A setting that fails to load is logged and is not a trial. Fold
@@ -773,9 +803,17 @@ def run_grid_on_bars(
         return GridOutcome(
             None, reasons_head + ("no validation bars — nothing selected",),
             tuple(settings), None, "Grid selected nothing. No bars.")
+    n_runs = len(settings) + 1
+
+    def _report(done: int) -> None:
+        if progress is None:
+            return
+        progress(int(done), int(n_runs))
+
     base_ab = run_ab_backtest(
         strategy_cls, bars, point_value, "基準 baseline",
         capital_base=capital_base)
+    _report(1)
     if base_ab.error or base_ab.result is None:
         text = f"baseline backtest failed: {base_ab.error or 'no result'}"
         return GridOutcome(
@@ -795,8 +833,11 @@ def run_grid_on_bars(
                 f"holdout and is excluded from selection; nothing selected",),
             tuple(settings), None,
             "Grid selected nothing. Not enough folds outside the holdout.")
-    # Backtests first. The holdout end is extended only after every
-    # trade list exists, and only the selection folds are scored.
+    # Backtests first, one setting at a time. A worker pool here would
+    # only oversubscribe the host. The holdout end is extended only
+    # after every trade list exists, and only the selection folds are
+    # scored. Progress is reported after the attempt, including a
+    # setting that failed to load, and is not an input to selection.
     loaded: list[tuple[dict, list]] = []
     skipped: list[str] = []
     for i, knobs in enumerate(settings):
@@ -810,12 +851,13 @@ def run_grid_on_bars(
                 skipped.append(
                     f"setting {_fmt_knobs(knobs)} not evaluated: "
                     f"{ab.error or 'no result'}")
-                continue
-            loaded.append((knobs, list(ab.result.trades or [])))
+            else:
+                loaded.append((knobs, list(ab.result.trades or [])))
         except Exception as exc:
             skipped.append(
                 f"setting {_fmt_knobs(knobs)} not evaluated: "
                 f"{type(exc).__name__}: {exc}")
+        _report(i + 2)
     bounds = _cover_trades_after_baseline(
         raw_bounds, [base_trades] + [trades for _knobs, trades in loaded])
     selection_bounds, holdout_bound = _split_holdout(bounds)

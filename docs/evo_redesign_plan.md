@@ -227,9 +227,9 @@ changed by the Phase 1 PR; each row takes effect in the phase that implements it
   terminal status including skips, except the retryable infrastructure ends
   `pipeline_error` (e.g. an exhausted Gemini 503), `grid_failed`, and
   `no_chat_client`, which leave `started`. `weekly_slot_taken` is true for
-  `done`, or for `started` younger than `SLOT_STARTED_GUARD_S` = 45 min (the
-  20-min grid cap + API fetch + model calls with retries + validation;
-  observed runs are 1–4 min per bot). So a finished week is never re-run, a
+  `done`, or for `started` younger than `SLOT_STARTED_GUARD_S` = 12300 s (the
+  3 h grid cap + 25 min for the API fetch, model calls with retries, and
+  validation). So a finished week is never re-run, a
   dead run (crash, hang-kill, failed fetch) is retried after the window, and
   a quick restart never stacks a second AI-backed attempt on a live one. A
   failed write falls back to the in-memory latch, so a disk error never

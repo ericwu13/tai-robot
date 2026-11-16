@@ -188,14 +188,15 @@ def is_post_close_evolution_window(now: datetime | None = None) -> bool:
 WEEKLY_SLOT_FILENAME = "evolution_weekly_slot.json"
 SLOT_STARTED = "started"
 SLOT_DONE = "done"
-# One run's worst case: the grid child's hard cap (grid_process
-# DEFAULT_GRID_TIMEOUT_S = 20 min) + the Capital API fetch (~33 chunks)
-# + plan / codegen calls with their transient retries + validation
-# backtests. Observed runs take 1-4 min per bot (Steven 2026-11-07
-# 05:05:25-05:09:17). Inside this window a "started" slot is treated as
-# a run that may still be live, so a quick restart never starts a second
-# AI-backed attempt on top of it; after it, the dead run is retried.
-SLOT_STARTED_GUARD_S = 45 * 60
+# One run's worst case: the grid cap (grid_process.GRID_TIMEOUT_CAP_S,
+# 3 h) plus 25 min for the Capital API fetch, plan / codegen retries,
+# and validation backtests. The per-run budget is max(20 min, 90 s ×
+# runs) and never exceeds that cap; a silent child dies at the 10 min
+# stall bound instead. Inside this window a "started" slot is treated
+# as a run that may still be live, so a quick restart never starts a
+# second AI-backed attempt on top of it; after it, the dead run is
+# retried. 10800 + 25 min.
+SLOT_STARTED_GUARD_S = 10800 + 25 * 60
 # History reason kinds that mean "the pipeline never got to judge":
 # an exhausted Gemini 503 / any exception (pipeline_error), a grid child
 # that timed out or crashed (grid_failed), no chat client. They keep the

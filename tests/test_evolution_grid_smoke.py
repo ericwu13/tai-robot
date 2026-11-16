@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from src.evolution.grid_smoke import main, run_grid_smoke
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -258,6 +260,35 @@ def test_smoke_cli_payload_bytes_flag(tmp_path, monkeypatch, capsys):
     assert "grid-smoke: payload_bytes=9000" in out
     assert "grid-smoke: outcome=ok" not in out
     assert "result_bytes=" in out
+
+
+def test_smoke_uses_the_short_host_slot_queue(tmp_path, monkeypatch, capsys):
+    """The smoke waits seconds for this install's slot, not the 9 h queue."""
+    import src.evolution.grid_smoke as smoke
+    from src.evolution.grid_process import GridProcessFailure
+
+    seen = {}
+
+    def _fake(job, **kwargs):
+        seen.update(kwargs)
+        on_start = kwargs.get("on_start")
+        if on_start is not None:
+            on_start(None)
+        return GridProcessFailure(
+            "queue_timeout", "grid queue exceeded", progress="0/0")
+
+    monkeypatch.setattr(smoke, "run_grid_isolated", _fake)
+    report = smoke.run_grid_smoke(
+        bars=4, timeout_s=10, in_process=True,
+        stop_dir=str(tmp_path), poll_s=0.05)
+    assert seen["queue_timeout_s"] == smoke._SMOKE_QUEUE_TIMEOUT_S
+    assert seen["queue_timeout_s"] <= 30
+    assert report.outcome == "queue_timeout"
+    with pytest.raises(SystemExit) as exc:
+        smoke._parse(["--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out.lower()
+    assert "grid slot" in help_text
 
 
 def test_smoke_cli_rejects_hang_with_payload(capsys):
