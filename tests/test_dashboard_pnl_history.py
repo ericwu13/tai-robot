@@ -282,8 +282,11 @@ def _pnl_legend(points: list[dict]) -> dict:
         "  titles: kids.flatMap((k) => k.titles || []),\n"
         "}));\n"
     )
+    # node always writes UTF-8; without encoding= Windows decodes with the
+    # locale code page (cp950 on zh-TW) and stdout comes back None.
     run = subprocess.run([node, "-e", prog, json.dumps(points)],
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, encoding="utf-8",
+                         timeout=30)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
 

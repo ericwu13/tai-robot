@@ -598,7 +598,8 @@ def _sorted_ids_under_node(bots):
             "const bots = JSON.parse(process.argv[1]);\n"
             "console.log(JSON.stringify(bots.sort(cmp).map((b) => b.id)));\n")
     run = subprocess.run([node, "-e", prog, json.dumps(bots)],
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, encoding="utf-8",
+                         timeout=30)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
 
@@ -775,7 +776,8 @@ def test_default_interval_follows_bot_timeframe_for_every_offered_interval():
             "}\n"
             "console.log(JSON.stringify(out));\n")
     run = subprocess.run([node, "-e", prog, json.dumps(ivs)],
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, encoding="utf-8",
+                         timeout=30)
     assert run.returncode == 0, run.stderr
     got = {int(k): v for k, v in json.loads(run.stdout).items()}
     assert got == {**{iv: iv for iv in ivs}, 120: 60, 14400: 60, 0: 60}
@@ -793,7 +795,8 @@ def _page_aggregate(bars, iv):
             "const [bars, iv] = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
             "console.log(JSON.stringify(aggregate(bars, iv)));\n")
     run = subprocess.run([node, "-e", prog], input=json.dumps([bars, iv]),
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, encoding="utf-8",
+                         timeout=30)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
 

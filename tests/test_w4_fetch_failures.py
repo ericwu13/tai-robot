@@ -236,6 +236,9 @@ def test_weekday_holiday_from_a_clean_script_launch(tmp_path):
         env=env,
         capture_output=True,
         text=True,
+        # chips_monitor reconfigures its stdout to UTF-8; the parent's
+        # default decoder is the locale code page (cp950 on zh-TW Windows).
+        encoding="utf-8",
         timeout=60,
     )
     assert proc.returncode == 0, proc.stderr

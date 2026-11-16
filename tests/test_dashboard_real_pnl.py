@@ -309,7 +309,8 @@ def _group_trades_under_node(day_start, exit_dts):
             " older: older.map(t => t.exit_dt)}));\n")
     run = subprocess.run([node, "-e", prog,
                           json.dumps([{"exit_dt": d} for d in exit_dts])],
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, encoding="utf-8",
+                         timeout=30)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
 
