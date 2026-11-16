@@ -13,6 +13,7 @@ import time
 import pytest
 
 from src.evolution.grid_process import (
+    _pid_alive,
     acquire_grid_slot,
     release_grid_slot,
 )
@@ -179,29 +180,31 @@ def _one_holder(path, hold_s, result_path):
     release_grid_slot(path)
 
 
+def _run_grid_parent(slot):
+    """Module-level so spawn can pickle it."""
+    from src.evolution.grid_process import burn_child_entry, run_grid_isolated
+    from tests.test_evolution_grid_process import _job
+
+    run_grid_isolated(
+        _job(mode="sleep", burn_seconds=30),
+        timeout_s=40,
+        stall_s=40,
+        entry=burn_child_entry,
+        slot_path=slot,
+        poll_s=0.05,
+        slot_poll_s=0.05,
+        queue_timeout_s=5,
+    )
+
+
 def test_killed_holder_child_frees_the_lock(tmp_path):
     """SIGKILL of the grid child drops the OS lock promptly."""
     import json
 
-    from src.evolution.grid_process import burn_child_entry, run_grid_isolated
-    from tests.test_evolution_grid_process import _job
-
     slot = str(tmp_path / "evo_grid.slot")
     ctx = _ctx()
 
-    def _parent():
-        run_grid_isolated(
-            _job(mode="sleep", burn_seconds=30),
-            timeout_s=40,
-            stall_s=40,
-            entry=burn_child_entry,
-            slot_path=slot,
-            poll_s=0.05,
-            slot_poll_s=0.05,
-            queue_timeout_s=5,
-        )
-
-    proc = ctx.Process(target=_parent)
+    proc = ctx.Process(target=_run_grid_parent, args=(slot,))
     proc.start()
     sidecar = slot + ".holder.json"
     child = None
@@ -227,25 +230,10 @@ def test_killed_parent_live_child_keeps_the_lock(tmp_path):
     """A dead parent does not free the lock while its grid child lives."""
     import json
 
-    from src.evolution.grid_process import burn_child_entry, run_grid_isolated
-    from tests.test_evolution_grid_process import _job
-
     slot = str(tmp_path / "evo_grid.slot")
     ctx = _ctx()
 
-    def _parent():
-        run_grid_isolated(
-            _job(mode="sleep", burn_seconds=30),
-            timeout_s=40,
-            stall_s=40,
-            entry=burn_child_entry,
-            slot_path=slot,
-            poll_s=0.05,
-            slot_poll_s=0.05,
-            queue_timeout_s=5,
-        )
-
-    proc = ctx.Process(target=_parent)
+    proc = ctx.Process(target=_run_grid_parent, args=(slot,))
     proc.start()
     sidecar = slot + ".holder.json"
     child = None
@@ -259,7 +247,7 @@ def test_killed_parent_live_child_keeps_the_lock(tmp_path):
     assert child
     os.kill(proc.pid, 9)
     proc.join(5)
-    os.kill(child, 0)  # child still alive
+    assert _pid_alive(child)
     blocked, blocked_kind, _q = acquire_grid_slot(
         slot, wait_s=0.4, poll_s=0.05)
     assert blocked is False and blocked_kind == "queue_timeout"
@@ -416,16 +404,12 @@ def test_queued_orphan_exits_without_running(tmp_path):
             pids.append(int(parts[0]))
         alive = []
         for pid in pids:
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not _pid_alive(pid):
                 continue
             alive.append(pid)
         if alive:
             time.sleep(0.3)
-            try:
-                os.kill(alive[0], 0)
-            except OSError:
+            if not _pid_alive(alive[0]):
                 continue
             child = alive[0]
             break
@@ -435,9 +419,7 @@ def test_queued_orphan_exits_without_running(tmp_path):
     proc.wait(timeout=5)
     gone = time.time() + 2
     while time.time() < gone:
-        try:
-            os.kill(child, 0)
-        except OSError:
+        if not _pid_alive(child):
             break
         time.sleep(0.05)
     else:
