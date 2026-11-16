@@ -10,12 +10,32 @@ description: Scan tai-robot bot debug logs and the news-bridge logs for known er
 > run on **Steven**, not this PC. This PC's `data\live` holds only
 > retired/test bots and its n8n is stopped. Read live state from the
 > dashboard API (`http://<Steven tailnet IP>:8765/api/fleet`,
-> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`) or run the
-> checker on Steven via `tailscale-ssh`. A run of a checker on this PC
-> describes this PC only — never publish it as fleet health. Host map →
-> `start-here`. Run checkers from an up-to-date checkout
+> `/api/bot?id=<SYMBOL>_<bot>`; address in `hosts.local.yaml`). Data host,
+> host naming and the no-scripts rule → `start-here` §7. A run of a
+> checker on this PC describes this PC only — never publish it as fleet
+> health. Host map → `start-here`. Run checkers from an up-to-date checkout
 > (`git rev-list --count HEAD..origin/master` = 0); the main tree may be
 > weeks behind.
+
+Quick look, not a full scan: `/api/bot` is the last 150 lines of the
+newest debug log (`scripts/dashboard/snapshot.py` `MAX_LOG_LINES`).
+
+```bash
+curl -s "http://<Steven tailnet IP>:8765/api/bot?id=<SYMBOL>_<bot>"
+```
+
+Address in `hosts.local.yaml`. A full scan is a read-only ssh read,
+permission per start-here. No scripts on the host. `<install_dir>`
+is `steven.install_dir` in `hosts.local.yaml`:
+
+```powershell
+Get-ChildItem <install_dir>\data\live\*\debug_*.log | Where-Object LastWriteTime -gt (Get-Date).AddDays(-7) | Select-String -Pattern '<pattern>'
+```
+
+`check_logs.py` on Steven is not supported (`scripts/monitor/check_logs.py`
+`main` takes no base-dir).
+
+Fallback, this PC only:
 
 ```bash
 C:/Python313/python.exe -s scripts/monitor/check_logs.py
@@ -62,7 +82,7 @@ each redacted before it is printed.
   log reaches ~9 MB. The helper tails them (2 MB) rather than reading
   whole files — do the same if you go in manually.
 - Log lines carry two clocks: `[<TPE> / <local>]`. The **first**
-  timestamp is TPE. The second is the host's local clock (this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there))
+  timestamp is TPE. The second is the host's local clock (clocks → `start-here` §4)
   and must never be used for reasoning about sessions.
 - `swap_strategy refused` is often legitimate (one of the 5 safety gates:
   not flat, veto, in replay, timeframe mismatch, insufficient bars) —
@@ -77,8 +97,7 @@ each redacted before it is printed.
 
 ## Next steps
 
-- traceback in a live bot → the repo's `debug` skill (root-cause → fix →
-  review → release)
+- traceback in a live bot → the repo's `debug` skill (root-cause → fix → review); release → `CLAUDE.md` § Release Process
 - `n8n.workflow.failed` from check_logs.py → report it as a P2 (local n8n
   ran again, W1–W4 double-run risk); `n8n-debug` is history only, do not
   run it. A live bridge silence or missing vote → `bridge-health`

@@ -128,8 +128,7 @@ to other users' bundles attached to GitHub issues.
 ## Cadence math (this machine)
 
 The slot is Sat 05:05 TPE on the host that runs the bot (Steven for the
-fleet). On this PC this PC's OS clock is US Pacific with DST (UTC−7 in summer, UTC−8 from early November; TPE = local +15 h / +16 h — check `date +%z`); Steven's zone is separate (`tzutil /g` there): Saturday 05:05 TPE = Friday 14:05 local
-PDT / 13:05 local PST. `ai_usage.csv`
+fleet). clocks → `start-here` §4. `ai_usage.csv`
 timestamps are UTC (TPE − 8): a healthy Saturday run shows ~`Fri
 21:05 UTC` rows.
 
