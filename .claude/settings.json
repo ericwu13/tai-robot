@@ -5,6 +5,7 @@
       "Bash(git push origin master *)",
       "Bash(git push origin HEAD:master *)",
       "Bash(git push * --tags *)",
+      "Bash(git push * --tags)",
       "Bash(git push origin v*)",
       "Bash(git tag v*)",
       "Bash(git tag -a *)",

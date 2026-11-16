@@ -19,7 +19,7 @@ non-regime bot regressions, and shipping without the full test suite is not allo
 
 ---
 
-## Phase 1 — Investigate (model: `claude-fable-5` (if a Fable subagent fails with a usage-credit error, re-run it on Opus and say so in the report))
+## Phase 1 — Investigate (model: `fable` (if a Fable subagent fails with a usage-credit error, re-run it on Opus and say so in the report))
 Goal: trace the symptom to a **root cause**, not a plausible guess.
 
 **ALWAYS START WITH THE LOGS — before reading any code.** The log evidence, not a
@@ -62,7 +62,7 @@ jump to code assumptions before you have read them.
      smoke-test EXE fed synthetic bars, with a screenshot showing candles rendering.
      Aim for that level of concreteness.)
 
-## Phase 2 — Implement fix (model: `claude-opus-4-8`)
+## Phase 2 — Implement fix (model: `opus`)
 Goal: fix the root cause cleanly, with the full test suite green.
 
 **Handoff criteria — do not start implementing until Phase 1 delivered all three:**
@@ -87,7 +87,7 @@ or assertion) as proof the fix works — not just a green suite.
    ```
    The full suite must pass. A failing or skipped test is a blocker, not a footnote.
 
-## Phase 3 — Review (model: `claude-fable-5` (if a Fable subagent fails with a usage-credit error, re-run it on Opus and say so in the report))
+## Phase 3 — Review (model: `fable` (if a Fable subagent fails with a usage-credit error, re-run it on Opus and say so in the report))
 Goal: an independent read of the diff before it merges.
 
 Review `git fetch origin && git diff origin/master...fix/<issue-slug>` (not

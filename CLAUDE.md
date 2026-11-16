@@ -9,11 +9,11 @@ Two API approaches: DLL-based (ctypes via SKDLLPython.py) and COM-based (comtype
 - Never push channel IDs, role IDs, or any Discord credentials to git.
 
 ## Model Preferences
-- **Debugging / investigation / root-cause tasks**: Fable (subagent `model: fable`; currently `claude-fable-5-2`)
-- **Implementation / code writing / bug fixes**: Opus (subagent `model: opus`; currently `claude-opus-5-5`)
+- **Debugging / investigation / root-cause tasks**: Fable (subagent `model: fable`)
+- **Implementation / code writing / bug fixes**: Opus (subagent `model: opus`)
 - When a task involves both, use Fable to diagnose first, then hand off to Opus to implement.
 - If a Fable subagent fails with a usage-credit error, re-run it with `model: opus` and say so in the report.
-- Use the aliases in agent and skill files so they don't go stale. CI workflows pin their own model IDs.
+- Agent and skill files name models only by alias (`fable`, `opus`), never by version, so a model upgrade needs no edits: each alias follows the version Claude Code currently maps it to. To hold a specific version instead, add `"env": {"ANTHROPIC_DEFAULT_FABLE_MODEL": "<model id>"}` (or `ANTHROPIC_DEFAULT_OPUS_MODEL`) to `.claude/settings.json`. CI workflows pin their own model IDs.
 
 ## Which skill / agent (interactive sessions)
 Skills in `.claude/skills/` and agents in `.claude/agents/` load automatically; you don't need to name them. Pick by symptom. CI workflows (`claude-review`, `autofix`) follow their own prompts, not this table.
