@@ -188,6 +188,27 @@ QUOTES_VERSION = 1
 REPLACE_RETRIES = 3
 REPLACE_RETRY_SEC = 0.2
 
+# Reference-close cross-check (see ``verify_prev_close``).  Yahoo's
+# ``chartPreviousClose`` is trusted blindly otherwise; on 2026-11-17 it
+# served FRIDAY's ^TWII close on a Tuesday (Monday 11/16 missing), so a
+# ~-2.5% day printed as -8.39%.  Only quotes moving at least
+# PREV_CHECK_MIN_PCT are checked (below every alert/vote threshold), so
+# a quiet pass makes no extra request.
+PREV_CHECK_MIN_PCT = 1.0
+# chartPreviousClose vs the daily chart's last prior close: above this
+# the daily close wins (the 1-min chart's reference is the stale one).
+PREV_CHECK_TOL_PCT = 0.5
+# Exchange calendar per symbol (``holidays`` financial calendars) so a
+# real exchange holiday is not read as a missing session.  A symbol not
+# listed here (NQ=F trades through most holidays), or a host without the
+# ``holidays`` package, is never rejected for a gap: master behaviour.
+PREV_CHECK_CALENDAR = {
+    "SOXX": "XNYS", "TSM": "XNYS", "QQQ": "XNYS",
+    "ASML.AS": "XECB", "^STOXX50E": "XECB",
+    "^N225": "XJPX", "^KS11": "XKRX", "^HSI": "XHKG",
+    "^TWII": "XTAI", "000001.SS": "XSHG",
+}
+
 _UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)", "Connection": "close"}
 
 
@@ -215,6 +236,16 @@ def _session_fields(result: dict) -> dict:
         return {"period_start": None, "period_end": None, "last_bar_time": None}
 
 
+def _gmtoffset(meta: dict) -> int:
+    """Exchange UTC offset in seconds (0 when Yahoo omits it)."""
+    off = _int_or_none(meta.get("gmtoffset"))
+    if off is None:
+        regular = ((meta.get("currentTradingPeriod") or {}).get("regular")
+                   or {})
+        off = _int_or_none(regular.get("gmtoffset"))
+    return off or 0
+
+
 def parse_chart_quote(result: dict) -> dict:
     """Turn one Yahoo v8 ``chart.result[]`` item into a quote dict.
 
@@ -231,6 +262,7 @@ def parse_chart_quote(result: dict) -> dict:
         "prev_close": prev,
         "pct": (price - prev) / prev * 100.0,
         "quote_time": qtime,
+        "gmtoffset": _gmtoffset(meta),
     }
     quote.update(_session_fields(result))
     return quote
@@ -297,18 +329,127 @@ def session_stale_reason(quote: dict,
     return None
 
 
+def _local_date(ts: float, gmtoffset: int):
+    return datetime.fromtimestamp(float(ts) + gmtoffset, timezone.utc).date()
+
+
+def parse_daily_closes(result: dict) -> list[tuple]:
+    """``[(exchange-local date, close), ...]`` from a 1d-interval chart."""
+    off = _gmtoffset(result.get("meta") or {})
+    stamps = result.get("timestamp") or []
+    try:
+        closes = result["indicators"]["quote"][0].get("close") or []
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return []
+    out = []
+    for ts, close in zip(stamps, closes):
+        if ts is None or close is None:
+            continue
+        out.append((_local_date(ts, off), float(close)))
+    return sorted(out)
+
+
+def fetch_daily_closes(symbol: str) -> list[tuple] | None:
+    """Daily closes for the last ~2 weeks, or None on any failure."""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+           f"?interval=1d&range=10d")
+    try:
+        req = urllib.request.Request(url, headers=_UA)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        return parse_daily_closes(data["chart"]["result"][0])
+    except Exception as e:                                    # noqa: BLE001
+        print(f"  [{symbol}] daily-close check unavailable: "
+              f"{type(e).__name__}: {e}")
+        return None
+
+
+def _weekdays_between(earlier, later) -> list:
+    """Mon-Fri dates strictly between two dates."""
+    out, day = [], earlier + timedelta(days=1)
+    while day < later:
+        if day.weekday() < 5:
+            out.append(day)
+        day += timedelta(days=1)
+    return out
+
+
+def exchange_holidays(symbol: str, years) -> set | None:
+    """Holidays of *symbol*'s exchange, or None when it has no calendar."""
+    market = PREV_CHECK_CALENDAR.get(symbol)
+    if not market:
+        return None
+    try:
+        import holidays as _hol                                # noqa: PLC0415
+        return set(_hol.financial_holidays(market, years=sorted(set(years))))
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def verify_prev_close(quote: dict, daily: list[tuple] | None,
+                      symbol: str = "") -> dict:
+    """Cross-check ``quote["prev_close"]`` against the daily chart.
+
+    - daily chart unavailable / no prior bar: quote unchanged (fail-open,
+      today's behaviour), ``prev_note`` says it was not verified.
+    - a weekday between the last prior daily close and today that is
+      not a holiday on the symbol's exchange (``PREV_CHECK_CALENDAR``):
+      a session is missing from Yahoo's series, so neither close can be
+      trusted -> ``prev_reject`` (the caller drops the symbol from every
+      decision, like a stale stamp).  A symbol with no calendar is never
+      rejected for a gap (fail-open, master behaviour); an unlisted
+      closure (typhoon day) still rejects, but only on a move of at
+      least PREV_CHECK_MIN_PCT.
+    - otherwise, when the two closes differ by > PREV_CHECK_TOL_PCT the
+      daily close replaces ``prev_close`` and ``pct`` is recomputed.
+    """
+    if not daily:
+        quote["prev_note"] = "prev close unverified"
+        return quote
+    session = _local_date(quote["quote_time"], quote.get("gmtoffset") or 0)
+    prior = [(d, c) for d, c in daily if d < session and c]
+    if not prior:
+        quote["prev_note"] = "prev close unverified"
+        return quote
+    prev_date, daily_prev = prior[-1]
+    gap = _weekdays_between(prev_date, session)
+    if gap:
+        closed = exchange_holidays(symbol, {d.year for d in gap})
+        missing = [] if closed is None else [d for d in gap if d not in closed]
+        if missing:
+            quote["prev_reject"] = (
+                f"SUSPECT prev close — last daily close is {prev_date} "
+                f"({len(missing)} trading day(s) missing before {session}: "
+                f"{', '.join(str(d) for d in missing)})")
+            return quote
+    chart_prev = quote["prev_close"]
+    if abs(daily_prev / chart_prev - 1.0) * 100.0 > PREV_CHECK_TOL_PCT:
+        quote["prev_note"] = (f"prev close {chart_prev:.2f} -> daily "
+                              f"{daily_prev:.2f} ({prev_date})")
+        quote["prev_close"] = daily_prev
+        quote["pct"] = (quote["price"] - daily_prev) / daily_prev * 100.0
+    return quote
+
+
 def fetch_quote(symbol: str) -> dict | None:
-    """Return {price, prev_close, pct, quote_time, session fields} or None."""
+    """Return {price, prev_close, pct, quote_time, session fields} or None.
+
+    A quote moving >= PREV_CHECK_MIN_PCT has its reference close
+    cross-checked against the daily chart (``verify_prev_close``).
+    """
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
            f"?interval=1m&range=1d")
     try:
         req = urllib.request.Request(url, headers=_UA)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
-        return parse_chart_quote(data["chart"]["result"][0])
+        q = parse_chart_quote(data["chart"]["result"][0])
     except Exception as e:                                    # noqa: BLE001
         print(f"  [{symbol}] fetch failed: {type(e).__name__}: {e}")
         return None
+    if abs(q["pct"]) >= PREV_CHECK_MIN_PCT:
+        q = verify_prev_close(q, fetch_daily_closes(symbol), symbol)
+    return q
 
 
 def write_signal(path: str, action: str, reason: str, source: str,
@@ -444,7 +585,9 @@ def _collect_quotes(args, records: dict | None = None) -> tuple[
     session_rejects)`` where *breaches* maps ``"<tier>_<direction>"`` to
     the human-readable breach lines, *fetch_failures* counts symbols
     whose fetch returned nothing, and *session_rejects* lists symbols
-    the period/tape guard dropped (so ``monitor.log`` can show them).
+    the period/tape guard dropped (so ``monitor.log`` can show them) —
+    including a quote whose reference close ``verify_prev_close``
+    rejected (``SUSPECT prev close`` in its stale reason).
 
     *records*, when given, is filled with one display row per symbol —
     stale and failed ones included — for the ``crossmarket_quotes.json``
@@ -477,7 +620,9 @@ def _collect_quotes(args, records: dict | None = None) -> tuple[
         now = time.time()
         age = now - q["quote_time"]
         max_age = cfg.get("max_age", QUOTE_MAX_AGE_SEC)
-        session_reason = (
+        # A reference close that failed verify_prev_close is rejected
+        # even under --ignore-freshness: it is not a freshness question.
+        session_reason = q.get("prev_reject") or (
             None if args.ignore_freshness
             else session_stale_reason(q, now=now, max_age=max_age))
         age_stale = age > max_age and not args.ignore_freshness
@@ -494,6 +639,8 @@ def _collect_quotes(args, records: dict | None = None) -> tuple[
             extra = f", {fallback}"
         else:
             extra = ""
+        if q.get("prev_note"):
+            extra += f", {q['prev_note']}"
         print(f"  [{sym}] {q['pct']:+.2f}% (px {q['price']:.2f} vs pc "
               f"{q['prev_close']:.2f}, quote age {age:.0f}s{extra})")
         row.update(price=q["price"], prev_close=q["prev_close"], pct=q["pct"],
