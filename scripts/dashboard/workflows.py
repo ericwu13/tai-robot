@@ -9,6 +9,12 @@ row, in order:
 2. The bridge's own liveness stamp (events.json ``updated_at``,
    monitor_state / rss state / .chips_state ``last_check``).
 
+Fetch health comes from the bridges' own state, read with the same rules
+as the 市場脈動 vote strip and ``check_bridge`` (``src.news.vote_status``):
+W3 every-feed-failed or a W4 fetch-error streak is 失敗; W3 with some
+feeds failing (``degraded``) or W2 with some quotes unfetched is 部分異常.
+A run that exits 0 is not proof the bridge is healthy.
+
 The run log carries the writing host, so a dashboard serving another
 machine's — or a frozen — bridge directory says so instead of looking
 healthy-but-old.  Read-only; files arrive through the caller's
@@ -21,7 +27,9 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from scripts.dashboard.bridge_panels import (
-    CHIPS_STATE_NAME, W2_STATE_NAME, _beside, _str, _ts, w2_stale, w2_window_start)
+    CHIPS_STATE_NAME, QUOTES_NAME, W2_STATE_NAME, _beside, _str, _ts, w2_stale,
+    w2_window_start)
+from src.news.vote_status import SourceStatus, _apply_w3_fetch, _apply_w4_fetch
 
 _TZ_TPE = timezone(timedelta(hours=8))
 
@@ -49,8 +57,8 @@ def scrub_paths(text: str) -> str:
     return _PATH.sub(lambda m: "…" + re.split(r"[\\/]", m.group(0).rstrip("\\/"))[-1], text)
 
 
-STATUS_LABELS = {"ok": "正常", "stale": "停滯", "bad": "失敗", "off": "未部署",
-                 "unknown": "狀態不明", "idle": "閒置時段"}
+STATUS_LABELS = {"ok": "正常", "warn": "部分異常", "stale": "停滯", "bad": "失敗",
+                 "off": "未部署", "unknown": "狀態不明", "idle": "閒置時段"}
 
 
 def _floor_to(now: datetime, minutes: int) -> datetime:
@@ -129,12 +137,15 @@ def _files(paths: dict) -> dict:
             "W5": os.path.dirname(signal) if signal else ""}
     return {"dirs": dirs, "events": events, "events_guess": events_guess,
             "w2_state": _beside(signal, W2_STATE_NAME), "w3_state": rss,
+            "w2_quotes": _beside(signal, QUOTES_NAME),
             "w4_state": _beside(vote, CHIPS_STATE_NAME)}
 
 
 def _stamp(workflow: str, files: dict, read_json) -> dict:
-    """Liveness from the bridge's own files: ``{last, result, error, failing}``."""
-    out = {"last": None, "result": "", "error": "", "failing": False, "found": False}
+    """Liveness and fetch health from the bridge's own files:
+    ``{last, result, error, failing, warning}``."""
+    out = {"last": None, "result": "", "error": "", "failing": False,
+           "warning": "", "found": False}
     if workflow == "W1" and files["events"]:
         data = read_json(files["events"])
         if isinstance(data, dict):
@@ -149,6 +160,10 @@ def _stamp(workflow: str, files: dict, read_json) -> dict:
             out["found"] = True
             out["last"] = _ts(data.get("last_check"))
             out["result"] = _str(data.get("last_result"))
+            if workflow == "W4":
+                _w4_fetch_health(out, data)
+        if workflow == "W2" and files["w2_quotes"]:
+            _w2_fetch_health(out, read_json(files["w2_quotes"]))
     elif workflow == "W3" and files["w3_state"]:
         data = read_json(files["w3_state"])
         if isinstance(data, dict):
@@ -166,7 +181,49 @@ def _stamp(workflow: str, files: dict, read_json) -> dict:
             if isinstance(net, (int, float)) and not isinstance(net, bool):
                 bits.append(f"盤別累計 {net:+.2f}")
             out["result"] = "・".join(bits)
+            _w3_fetch_health(out, data)
     return out
+
+
+def _fail(out: dict, message: str) -> None:
+    out["failing"] = True
+    out["error"] = f"{out['error']}；{message}" if out["error"] else message
+
+
+def _w3_fetch_health(out: dict, state: dict) -> None:
+    st = SourceStatus("W3")
+    _apply_w3_fetch(st, state)
+    if st.fetch_failing:
+        _fail(out, f"所有新聞來源抓取失敗（連續 {st.fetch_error_streak} 輪）：{_str(st.error, 200)}")
+    elif st.degraded:
+        total = st.feeds_ok + st.feeds_failed
+        hosts = f"：{st.hosts}" if st.hosts else ""
+        out["warning"] = f"{st.feeds_failed}/{total} 個新聞來源抓取失敗{hosts}"
+
+
+def _w4_fetch_health(out: dict, state: dict) -> None:
+    st = SourceStatus("W4")
+    _apply_w4_fetch(st, state)
+    if st.fetch_failing:
+        _fail(out, f"TAIFEX／TWSE 抓取失敗（連續 {st.fetch_error_streak} 次）：{_str(st.error, 200)}")
+
+
+def _w2_fetch_health(out: dict, data) -> None:
+    """``crossmarket_quotes.json`` ``fetch_failed``: symbols the last pass
+    could not fetch at all (a closed market is not a fetch failure)."""
+    if not isinstance(data, dict):
+        return
+    failed = [s for s in data.get("fetch_failed") or [] if isinstance(s, str)]
+    if not failed:
+        return
+    quotes = data.get("quotes") if isinstance(data.get("quotes"), dict) else {}
+    total = len(set(quotes) | set(failed))
+    names = "、".join(failed[:6]) + ("…" if len(failed) > 6 else "")
+    text = f"{len(failed)}/{total} 個報價抓取失敗：{names}"
+    if len(failed) >= total:
+        _fail(out, text)
+    else:
+        out["warning"] = text
 
 
 def _runs(workflow: str, files: dict, read_runs) -> list[dict]:
@@ -196,7 +253,7 @@ def _row(workflow: str, name: str, schedule: str, desc: str, now: datetime,
         "next_due": "", "result": "", "error": "", "host": "",
         "runs_24h": len(recent), "fails_24h": sum(1 for r in recent if not r.get("ok")),
         "source": "runs" if runs else "state" if stamp["found"] else "none",
-        "note": "",
+        "note": "", "warning": "",
     }
     due = next_due(workflow, now)
     row["next_due"] = due.isoformat(timespec="seconds") if due else ""
@@ -211,6 +268,8 @@ def _row(workflow: str, name: str, schedule: str, desc: str, now: datetime,
         row["result"] = redact(stamp["result"])
     if stamp["failing"]:
         row["error"] = redact(stamp["error"])
+    if stamp["warning"]:
+        row["warning"] = redact(stamp["warning"])
     if workflow == "W1" and files["events_guess"] and stamp["found"]:
         row["note"] = "未設定 news.events_path，讀取橋接目錄的 events.json"
 
@@ -228,6 +287,8 @@ def _row(workflow: str, name: str, schedule: str, desc: str, now: datetime,
             row["status"] = "stale"
         elif idle:
             row["status"] = "idle"
+        elif row["warning"]:
+            row["status"] = "warn"
         else:
             row["status"] = "ok"
     row["status_label"] = STATUS_LABELS[row["status"]]
