@@ -602,3 +602,64 @@ def test_guid_v2_at_cutoff_skips_legacy_and_stamps_once(monkeypatch, tmp_path):
     again = rss_scorer.load_state(str(path))
     assert again["guid_v2_at"] == stamped
     assert link in again["seen_guids"]
+
+
+# ── 9. a settings override that predates the current defaults ───────────
+
+# Steven 2026-11-17: settings.yaml still carried the pre-#266 list, so the
+# 13 new defaults never applied and W3 scored US/global news only.
+_PRE_266 = [
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+    "https://feeds.bloomberg.com/markets/news.rss",
+    "https://feeds.marketwatch.com/marketwatch/topstories",
+    "https://finance.yahoo.com/news/rssindex",
+    "https://www.investing.com/rss/news.rss",
+]
+
+
+def test_override_gap_names_the_missing_defaults():
+    from rss_feeds import missing_defaults, override_gap
+    missing = missing_defaults(_PRE_266)
+    assert len(missing) == len(rss_scorer.DEFAULT_FEEDS) - 4
+    gap = override_gap(_PRE_266)
+    assert f"leaves out {len(missing)} of {len(rss_scorer.DEFAULT_FEEDS)}" in gap
+    for host in ("tw.stock.yahoo.com", "news.cnyes.com", "taifex.com.tw",
+                 "news.google.com", "scmp.com"):
+        assert host in gap
+    assert gap.count("news.google.com") == 1
+
+
+@pytest.mark.parametrize("configured", [None, [], "", "not a list"])
+def test_no_override_means_nothing_missing(configured):
+    from rss_feeds import override_gap
+    assert override_gap(configured) == ""
+
+
+def test_override_with_every_default_plus_extras_is_fine():
+    from rss_feeds import override_gap
+    extra = ["https://example.com/rss"]
+    assert override_gap(extra + [u.upper() + "/" for u in rss_scorer.DEFAULT_FEEDS]) == ""
+
+
+def test_check_bridge_reports_a_stale_override(tmp_path):
+    now, settings, _rss = _bridge(tmp_path, {"fetch_status": "ok", "feeds_ok": 4,
+                                              "feeds_failed": 0})
+    findings, lines = check_bridge(now, settings, str(tmp_path / "live"))
+    assert not any("rss_feeds" in f.message for f in findings)
+
+    settings["news"]["rss_feeds"] = _PRE_266
+    findings, lines = check_bridge(now, settings, str(tmp_path / "live"))
+    hit = [f for f in findings if "rss_feeds overrides the defaults" in f.message]
+    assert len(hit) == 1 and hit[0].level == "P3"
+    assert any(line.startswith("W3 feeds: settings news.rss_feeds") for line in lines)
+
+
+def test_scorer_logs_the_stale_override(tmp_path, monkeypatch, capsys):
+    settings = tmp_path / "settings.yaml"
+    settings.write_text(yaml.safe_dump({"news": {"rss_feeds": _PRE_266,
+                                                 "rss_state_file": str(tmp_path / "s.json")},
+                                        "ai": {"google_api_key": ""}}), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["rss_scorer.py", "--settings", str(settings), "--once"])
+    assert rss_scorer.main() == 1                      # stops at the missing API key
+    out = capsys.readouterr().out
+    assert "WARNING: settings news.rss_feeds overrides the defaults" in out
