@@ -1,10 +1,10 @@
 """One headless restart per open session when the quote link is a zombie.
 
-A bot is restarted only while its session is open, outside the last
-``TickWatchdog.NEAR_CLOSE_SUPPRESS`` minutes, ``DEGRADED``, and with no
-fresh quote tick for ``restart_after_s`` (default 300s). The fresh-tick
-clock is ``BacktestApp._last_fresh_tick_at`` (wall clock), never the
-watchdog's ``last_tick_time``. A fill in flight defers the restart and
+A bot is restarted only while its session is open, with more than
+``MIN_MINUTES_LEFT_FOR_RESTART`` minutes left before the close, ``DEGRADED``,
+and with no fresh quote tick for ``restart_after_s`` (default 300s). The
+fresh-tick clock is ``BacktestApp._last_fresh_tick_at`` (wall clock), never
+the watchdog's ``last_tick_time``. A fill in flight defers the restart and
 does not consume the once-per-session budget. ``semi_auto`` alerts once
 and is not restarted.
 
@@ -14,6 +14,7 @@ an OS file lock under the deploy root so a crash cannot leave a holder.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -34,6 +35,15 @@ DEFAULT_RESTART_AFTER_S = 300.0
 # One login slot for the whole fleet: 13 bots, 45s each.
 DEFAULT_RELOGIN_WAIT_S = 13 * 45
 PID_WAIT_S = 60.0
+# Session-end flatten is 2 minutes, 5 on settlement day. The handoff
+# (pid wait + relogin slot + login) has to finish before that window.
+_SESSION_END_CLOSE_MAX_MIN = 5
+_DEFAULT_LOGIN_TIMEOUT_S = 90.0
+MIN_MINUTES_LEFT_FOR_RESTART = max(
+    TickWatchdog.NEAR_CLOSE_SUPPRESS,
+    _SESSION_END_CLOSE_MAX_MIN
+    + math.ceil((PID_WAIT_S + DEFAULT_RELOGIN_WAIT_S + _DEFAULT_LOGIN_TIMEOUT_S) / 60.0),
+)
 
 # path -> fd this process holds. The OS drops it when the fd closes.
 _HELD_SLOTS: dict[str, int] = {}
@@ -256,8 +266,8 @@ class DegradedRestartPolicy:
             mins_left = self._minutes_left(order_symbol)
         except TypeError:
             mins_left = self._minutes_left()
-        near = TickWatchdog.NEAR_CLOSE_SUPPRESS
-        if session_key is None or mins_left is None or mins_left <= near:
+        if (session_key is None or mins_left is None
+                or mins_left <= MIN_MINUTES_LEFT_FOR_RESTART):
             self.degraded_open_since = None
             return Noop("closed_or_near_close")
         fresh = _fresh_tick_at(app)

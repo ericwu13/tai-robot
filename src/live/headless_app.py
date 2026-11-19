@@ -684,6 +684,24 @@ def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "") -> Non
                 f"[{type(exc).__name__}] {exc}")
 
 
+def _fail_pending_replacement(bot_dir: str, bot_name: str, reason: str,
+                             detail: str) -> None:
+    """Alert when a ``--wait-for-pid`` child never reached live ticks.
+
+    ``pending_notify`` stays true only until tick subscription. Clearing
+    it here keeps the session budget consumed and stops a later manual
+    ``--resume`` from posting a false recovery message. A record that is
+    already clear is left alone, so a bot that did recover and later
+    stops does not get a failure alert.
+    """
+    from src.live.degraded_restart import clear_pending_notify, load_auto_restart
+    data = load_auto_restart(bot_dir)
+    if not isinstance(data, dict) or data.get("pending_notify") is not True:
+        return
+    _emit_restart_failed(reason, detail=detail, bot=bot_name)
+    clear_pending_notify(bot_dir)
+
+
 def _spawn_pending_restart(driver, code: int) -> int:
     """Spawn the replacement only after ``_teardown`` has returned."""
     cmd = getattr(driver, "_pending_restart_cmd", None) if driver is not None else None
@@ -701,6 +719,9 @@ def _spawn_pending_restart(driver, code: int) -> int:
             detail=f"{type(exc).__name__}: {exc}",
             bot=os.path.basename(bot_dir),
         )
+        if bot_dir:
+            from src.live.degraded_restart import clear_pending_notify
+            clear_pending_notify(bot_dir)
         return EXIT_BOT_STOPPED
     return code
 
@@ -708,7 +729,7 @@ def _spawn_pending_restart(driver, code: int) -> int:
 def run_deploy(args) -> int:
     from src.live.degraded_restart import (
         DEFAULT_RELOGIN_WAIT_S, PID_WAIT_S, acquire_relogin_slot,
-        release_relogin_slot, wait_for_old_pid,
+        clear_pending_notify, release_relogin_slot, wait_for_old_pid,
     )
 
     bot_dir = _deploy_bot_dir(args)
@@ -721,6 +742,7 @@ def run_deploy(args) -> int:
                 detail=f"pid {old_pid} still alive after {int(PID_WAIT_S)}s",
                 bot=bot_name,
             )
+            clear_pending_notify(bot_dir)
             return EXIT_TIMEOUT
     stagger = bool(getattr(args, "relogin_stagger", False))
     held_slot = False
@@ -732,6 +754,7 @@ def run_deploy(args) -> int:
                         f"{int(DEFAULT_RELOGIN_WAIT_S)}s"),
                 bot=bot_name,
             )
+            clear_pending_notify(bot_dir)
             return EXIT_TIMEOUT
         held_slot = True
     app = None
@@ -739,18 +762,26 @@ def run_deploy(args) -> int:
     code = EXIT_BOT_STOPPED
     try:
         app, code = _boot(policy_from_args(args), need_com=True)
-        if app is None:
-            return code
-        if stagger:
-            app._release_relogin_slot = lambda: release_relogin_slot(bot_dir)
-        driver = DeployDriver(app, args)
-        code = _drive_until_exit(driver, app)
+        if app is not None:
+            if stagger:
+                app._release_relogin_slot = lambda: release_relogin_slot(bot_dir)
+            driver = DeployDriver(app, args)
+            code = _drive_until_exit(driver, app)
+    except Exception as exc:
+        if old_pid > 0:
+            _fail_pending_replacement(
+                bot_dir, bot_name, "replacement deploy failed",
+                f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         # LeaveMonitor and root.destroy finish here, before any spawn.
         if app is not None:
             _teardown(app)
         if held_slot:
             release_relogin_slot(bot_dir)
+    if old_pid > 0 and code != EXIT_OK:
+        _fail_pending_replacement(
+            bot_dir, bot_name, "replacement deploy failed", f"exit {code}")
     return _spawn_pending_restart(driver, code)
 
 

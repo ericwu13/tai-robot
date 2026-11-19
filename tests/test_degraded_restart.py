@@ -20,6 +20,10 @@ import run_backtest as rb
 from src.live import degraded_restart as dr
 from src.live import headless
 from src.live.headless import (
+    EXIT_BOT_STOPPED,
+    EXIT_DEPLOY_REFUSED,
+    EXIT_LOGIN,
+    EXIT_NO_COM,
     EXIT_OK,
     build_parser,
     restart_command,
@@ -147,7 +151,8 @@ def test_closed_or_near_close_resets_the_clock_and_does_not_fire(tmp_path):
 
     policy.degraded_open_since = NOW - 500
     clock.session = SESSION
-    for mins in (10, 9, 0, TickWatchdog.NEAR_CLOSE_SUPPRESS):
+    for mins in (10, 11, 15, 9, 0, TickWatchdog.NEAR_CLOSE_SUPPRESS,
+                 dr.MIN_MINUTES_LEFT_FOR_RESTART):
         clock.mins = mins
         policy.degraded_open_since = NOW - 500
         out = policy.observe_app(app, bot_dir=bot)
@@ -155,7 +160,29 @@ def test_closed_or_near_close_resets_the_clock_and_does_not_fire(tmp_path):
         assert not isinstance(out, dr.RestartDecision)
         assert policy.degraded_open_since is None
 
-    clock.mins = TickWatchdog.NEAR_CLOSE_SUPPRESS + 1
+    clock.mins = dr.MIN_MINUTES_LEFT_FOR_RESTART + 1
+    out = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(out, dr.Noop)
+    assert policy.degraded_open_since == NOW
+
+
+def test_restart_buffer_covers_the_handoff_before_session_end_close(tmp_path):
+    """11–18 minutes left is still inside the restart handoff. Do not fire."""
+    assert dr.MIN_MINUTES_LEFT_FOR_RESTART == 18
+    assert dr.MIN_MINUTES_LEFT_FOR_RESTART > (
+        5 + (dr.PID_WAIT_S + dr.DEFAULT_RELOGIN_WAIT_S) / 60
+    )
+    clock = _Clock()
+    policy = clock.policy()
+    app = _app_view()
+    bot = str(tmp_path)
+    for mins in (10, 11, 15, dr.MIN_MINUTES_LEFT_FOR_RESTART):
+        clock.mins = mins
+        policy.degraded_open_since = NOW - 500
+        out = policy.observe_app(app, bot_dir=bot)
+        assert isinstance(out, dr.Noop), mins
+        assert policy.degraded_open_since is None
+    clock.mins = dr.MIN_MINUTES_LEFT_FOR_RESTART + 1
     out = policy.observe_app(app, bot_dir=bot)
     assert isinstance(out, dr.Noop)
     assert policy.degraded_open_since == NOW
@@ -928,6 +955,190 @@ def test_discord_methods_priority_and_wording():
     assert "semi_auto" in sent[2][0] and SESSION in sent[2][0]
     assert sent[3][1] is True
     assert "spawn failed" in sent[3][0] and "OSError" in sent[3][0]
+
+
+def _plant_pending(bot_dir: str) -> None:
+    os.makedirs(bot_dir, exist_ok=True)
+    dr.save_auto_restart(bot_dir, SESSION, old_pid=77, pending_notify=True)
+
+
+def _pending(bot_dir: str) -> dict:
+    return load_session(dr.auto_restart_path(bot_dir))
+
+
+def test_boot_failure_alerts_and_clears_pending_notify(tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=41)
+    _plant_pending(bot_dir)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (None, EXIT_NO_COM))
+    code = run_deploy(args)
+    assert code == EXIT_NO_COM
+    assert discord.failed[0][0] == "replacement deploy failed"
+    assert discord.failed[0][1]["detail"] == f"exit {EXIT_NO_COM}"
+    assert discord.failed[0][1]["bot"] == "night1"
+    saved = _pending(bot_dir)
+    assert saved["pending_notify"] is False
+    assert saved["session_key"] == SESSION
+
+
+@pytest.mark.parametrize("exit_code", [EXIT_LOGIN, EXIT_DEPLOY_REFUSED])
+def test_child_deploy_failure_alerts_and_clears_pending_notify(
+        tmp_path, monkeypatch, exit_code):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=42)
+    _plant_pending(bot_dir)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: False))
+    app = SimpleNamespace(root=SimpleNamespace(), _release_relogin_slot=None)
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (app, EXIT_OK))
+    monkeypatch.setattr(ha, "_drive_until_exit", lambda *_a, **_k: exit_code)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
+    code = run_deploy(args)
+    assert code == exit_code
+    assert discord.failed[0][0] == "replacement deploy failed"
+    assert discord.failed[0][1]["detail"] == f"exit {exit_code}"
+    saved = _pending(bot_dir)
+    assert saved["pending_notify"] is False
+    assert saved["session_key"] == SESSION
+
+
+@pytest.mark.parametrize("where", ["boot", "drive"])
+def test_uncaught_replacement_error_alerts_clears_and_releases_the_slot(
+        tmp_path, monkeypatch, where):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=43, relogin_stagger=True)
+    _plant_pending(bot_dir)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: False))
+    app = SimpleNamespace(root=SimpleNamespace(), _release_relogin_slot=None)
+
+    def _boot(*_a, **_k):
+        if where == "boot":
+            raise RuntimeError("boot blew up")
+        return app, EXIT_OK
+
+    def _drive(*_a, **_k):
+        raise RuntimeError("drive blew up")
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
+    with pytest.raises(RuntimeError, match="blew up"):
+        run_deploy(args)
+    assert discord.failed[0][0] == "replacement deploy failed"
+    assert "RuntimeError" in discord.failed[0][1]["detail"]
+    saved = _pending(bot_dir)
+    assert saved["pending_notify"] is False
+    assert saved["session_key"] == SESSION
+    assert dr.acquire_relogin_slot(bot_dir, wait_s=0.5, poll_s=0.01) is True
+    dr.release_relogin_slot(bot_dir)
+
+
+def test_recovered_replacement_that_later_stops_does_not_alert(
+        tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=44)
+    _plant_pending(bot_dir)
+    dr.clear_pending_notify(bot_dir)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: False))
+    app = SimpleNamespace(root=SimpleNamespace(), _release_relogin_slot=None)
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (app, EXIT_OK))
+    monkeypatch.setattr(ha, "_drive_until_exit", lambda *_a, **_k: EXIT_BOT_STOPPED)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
+    code = run_deploy(args)
+    assert code == EXIT_BOT_STOPPED
+    assert discord.failed == []
+    saved = _pending(bot_dir)
+    assert saved["pending_notify"] is False
+    assert saved["session_key"] == SESSION
+
+
+def test_normal_deploy_does_not_emit_a_replacement_failure(tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path)
+    _plant_pending(bot_dir)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (None, EXIT_LOGIN))
+    code = run_deploy(args)
+    assert code == EXIT_LOGIN
+    assert discord.failed == []
+    assert _pending(bot_dir)["pending_notify"] is True
+
+
+def test_early_handoff_failures_clear_pending_notify(tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    clock = {"t": 0.0}
+
+    def _mono():
+        clock["t"] += dr.DEFAULT_RELOGIN_WAIT_S
+        return clock["t"]
+
+    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(dr.time, "monotonic", _mono)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
+
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=55)
+    _plant_pending(bot_dir)
+    code = run_deploy(args)
+    assert code != EXIT_OK
+    assert discord.failed[0][0] == "old process still alive"
+    assert _pending(bot_dir)["pending_notify"] is False
+    assert _pending(bot_dir)["session_key"] == SESSION
+
+    discord.failed.clear()
+    clock["t"] = 0.0
+    args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
+    _plant_pending(bot_dir)
+    assert dr.acquire_relogin_slot(bot_dir, wait_s=1, poll_s=0.01)
+    try:
+        code = run_deploy(args)
+    finally:
+        dr.release_relogin_slot(bot_dir)
+    assert code != EXIT_OK
+    assert discord.failed[-1][0] == "relogin stagger timed out"
+    assert _pending(bot_dir)["pending_notify"] is False
+
+    discord.failed.clear()
+    args, bot_dir = _deploy_args(tmp_path)
+    _plant_pending(bot_dir)
+    app = SimpleNamespace(root=SimpleNamespace())
+
+    def _drive(driver, _app):
+        driver.bot_dir = bot_dir
+        driver._pending_restart_cmd = ["tai", "deploy", "--resume"]
+        return EXIT_OK
+
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (app, EXIT_OK))
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
+    monkeypatch.setattr(ha, "spawn_detached", lambda *_a, **_k: (_ for _ in ()).throw(OSError("spawn failed")))
+    code = run_deploy(args)
+    assert code != EXIT_OK
+    assert discord.failed[-1][0] == "spawn failed"
+    assert _pending(bot_dir)["pending_notify"] is False
+    assert _pending(bot_dir)["session_key"] == SESSION
 
 
 def test_src_live_does_not_import_src_evolution():
