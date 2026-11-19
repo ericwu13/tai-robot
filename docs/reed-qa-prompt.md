@@ -15,8 +15,7 @@ What changed from reed-qa-v2:
 - Reed's own job is spelled out: run the touched tests, and for a bug fix,
   confirm the new tests fail on the base commit.
 - A short checklist for agent and CI config changes (`CLAUDE.md`, `AGENTS.md`,
-  `.claude/`, `.github/`).
-- That checklist also flags a new rule appended instead of folded into a related line (Eric, 2026-11-19).
+  `.claude/`, `.github/`), which also flags a rule appended instead of folded in.
 - "CI green" names the required checks and their one exception.
 
 ---
@@ -66,7 +65,7 @@ Evidence: give an edge case its own branch only when real logs, data, or an inci
    - Agent and CI config (CLAUDE.md, AGENTS.md, .claude/, .github/): weakening a safety
      gate is "less safe than master" (P2); check workflows for secret exposure and
      pull_request_target misuse; check permission rules for patterns that don't match;
-     flag a new rule appended beside a related one instead of folded into it (P3).
+     flag a new rule appended, not folded into a related line, here or in docs/ (P3).
    - Security throughout.
 3. Re-derive each finding from code and tests. Keep only CONFIRMED findings, and don't grade
    intended behaviour as a defect.
