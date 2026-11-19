@@ -44,6 +44,11 @@ class FillTimeoutResult:
     timeout_seconds: float
     message: str
     new_trading_mode: str = "semi_auto"
+    # Seq of the order this poll was watching. ``restorable`` is True only
+    # for a live (not resumed) timeout that actually has one: that exact
+    # deal row may lift the downgrade. A resumed book must not.
+    order_seq: str = ""
+    restorable: bool = False
 
 
 class FillPoller:
@@ -81,6 +86,10 @@ class FillPoller:
         # a resumed entry filled unless this sign was actually seen.
         self._expected_sign: int | None = None
         self._resumed: bool = False
+        # Seq returned by SendFutureOrderCLR for this poll. Empty when
+        # the caller has none (a resumed book, or a poll started
+        # without one). timeout() copies it onto the result.
+        self._order_seq: str = ""
 
     def reset(self) -> None:
         """Clear all state."""
@@ -92,6 +101,7 @@ class FillPoller:
         self._entry_bar_index = 0
         self._expected_sign = None
         self._resumed = False
+        self._order_seq = ""
 
     @property
     def active(self) -> bool:
@@ -124,7 +134,8 @@ class FillPoller:
               com_available: bool = True,
               entry_bar_index: int = 0,
               expected_sign: int | None = None,
-              resumed: bool = False) -> FillPollAction:
+              resumed: bool = False,
+              order_seq: str = "") -> FillPollAction:
         """Begin monitoring for a fill.
 
         Args:
@@ -140,11 +151,14 @@ class FillPoller:
             resumed: True when this poll continues an order from the
                 previous process. ``timeout()`` will not assume that
                 entry filled unless ``expected_sign`` was seen.
+            order_seq: SendFutureOrderCLR seq for this order. A live
+                timeout with a non-empty seq is restorable (issue #319).
 
         Returns FillPollAction telling the caller what to do next.
         """
         self._expected_sign = expected_sign
         self._resumed = resumed
+        self._order_seq = str(order_seq).strip()
         if not com_available:
             # Auto-confirm immediately when COM unavailable
             self._guard.on_fill_confirmed()
@@ -348,6 +362,8 @@ class FillPoller:
                          f"entry NOT confirmed. 降級為半自動 downgraded to "
                          f"semi-auto. 請人工核對持倉 Manual review required."),
                 new_trading_mode="semi_auto",
+                order_seq=self._order_seq,
+                restorable=False,
             )
 
         # Clear fill pending state — do NOT halt.
@@ -384,4 +400,6 @@ class FillPoller:
                      f"策略仍可出場 Strategy exits still active, "
                      f"新進場需手動確認 new entries require confirmation."),
             new_trading_mode="semi_auto",
+            order_seq=self._order_seq,
+            restorable=bool((not self._resumed) and self._order_seq),
         )

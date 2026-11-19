@@ -466,6 +466,21 @@ class DiscordNotifier:
             priority=True,
         )
 
+    def fill_timeout_restored(self, action_type: str, order_seq: str) -> None:
+        """The timed-out order's own deal row arrived; auto is back.
+
+        Sibling of :meth:`fill_timeout_downgrade`. Not :meth:`mode_switched`:
+        that notice is an operator hot-swap, and this one names the order.
+        """
+        self._send(
+            f"{self._header()}\n"
+            f"✅ **成交超時已恢復 Fill Timeout Restored** "
+            f"({action_type}, seq `{order_seq}`)\n"
+            f"該筆成交回報已到，已恢復全自動 "
+            f"That order's fill arrived; restored to auto",
+            priority=True,
+        )
+
     def bot_deployed(self, strategy: str, mode: str,
                      version: str = "") -> None:
         ver = f" v{version}" if version else ""
