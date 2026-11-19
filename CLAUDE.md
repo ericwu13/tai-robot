@@ -44,7 +44,7 @@ Real-order modes, merges, tags, releases (and their Discord notice) and dashboar
 
 ## Change & review contract
 One set of rules for authors, reviewers and agent skills. Goal: 我們不可能一直防呆，而是要訂好合理的規則 — reasonable rules, not foolproofing.
-- A change must be at least as safe as master. One clear rule ("use X when valid, otherwise the existing safe behaviour") beats a branch per scenario.
+- A change must be at least as safe as master. One clear rule ("use X when valid, otherwise the existing safe behaviour") beats a branch per scenario. Docs, skills and prompts follow the same rule: fold a new rule into the existing line it refines (merge, generalize, trim) instead of appending a new one, and state the net line change in the PR body.
 - Severity: **P1** = can lose money, send a wrong/duplicate order, or crash/hang a live bot. **P2** = wrong behaviour/state with a realistic trigger, or less safe than master. **P3** = minor, cosmetic, test gaps — no commit required; list under "Known gaps".
 - Evidence bar: a finding needs a trigger seen in logs/data/an incident, or a traced path through the real control paths (deploy, STOP, CONTROL reconnect/set-mode, restart, broker callbacks; GUI and semi_auto still ship to EXE users). No "unsure / may be by design" findings.
 - Reply to each finding with `Fixed in <sha>`, `Won't fix: <rule or evidence>`, or `Needs owner`. A policy choice (what the bot should do when X) goes to the owner as ONE question with options, before coding.
