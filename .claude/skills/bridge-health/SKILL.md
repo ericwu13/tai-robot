@@ -74,10 +74,6 @@ Signal reject reasons split cleanly:
 
 ## Gotchas
 
-- **W3 scoring only US/global news?** Check for a stale `news.rss_feeds`
-  override in the bridge host's `tai-robot-src\settings.yaml`: a
-  non-empty list replaces the defaults. `check_bridge` flags it (P3) and
-  the scorer prints `WARNING: settings news.rss_feeds overrides…` each run.
 - **`rss_scorer.log` is never written in production.** W3 runs the
   `--once` path, which doesn't log. Judging W3 by that file always looks
   dead — use `rss_scorer_state.json` (`last_check`, `session_net`).
