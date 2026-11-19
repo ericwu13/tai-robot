@@ -44,11 +44,11 @@ Real-order modes, merges, tags, releases (and their Discord notice) and dashboar
 
 ## Change & review contract
 One set of rules for authors, reviewers and agent skills. Goal: 我們不可能一直防呆，而是要訂好合理的規則 — reasonable rules, not foolproofing.
-- A change must be at least as safe as master. One clear rule ("use X when valid, otherwise the existing safe behaviour") beats a branch per scenario.
+- A change must be at least as safe as master. One clear rule ("use X when valid, otherwise the existing safe behaviour") beats a branch per scenario. Docs, skills and prompts follow the same rule: fold a new rule into the existing line it refines (merge, generalize, trim) instead of appending a new one.
 - Severity: **P1** = can lose money, send a wrong/duplicate order, or crash/hang a live bot. **P2** = wrong behaviour/state with a realistic trigger, or less safe than master. **P3** = minor, cosmetic, test gaps — no commit required; list under "Known gaps".
-- Evidence bar: a finding needs a trigger seen in logs/data/an incident, or a traced path through the real control paths (deploy, STOP, CONTROL reconnect/set-mode, restart, broker callbacks; GUI and semi_auto still ship to EXE users). No "unsure / may be by design" findings.
+- Evidence bar: a finding needs a trigger seen in logs/data/an incident, or a traced path through the real control paths (deploy, STOP, CONTROL reconnect/set-mode, restart, broker callbacks; headless live bots only: a trigger that needs a GUI step we don't do, such as a manual GUI CLOSE or flatten, is out of scope, not fixed). No "unsure / may be by design" findings.
 - Reply to each finding with `Fixed in <sha>`, `Won't fix: <rule or evidence>`, or `Needs owner`. A policy choice (what the bot should do when X) goes to the owner as ONE question with options, before coding.
-- Every PR body: Root cause / The fix / Tests / Known gaps / Rollout (settings keys that override a new default, persisted state crossing the upgrade, restart needed — or "none").
+- Every PR body: Root cause / The fix / Tests / Known gaps / Rollout (settings keys that override a new default, persisted state crossing the upgrade, restart needed — or "none"). A docs, skills or prompts PR also states its net line change.
 - Tests that reach a wall-clock gate (weekend pause, holiday, session window) pass a fixed `now`. A test that also fails on origin/master is fixed first in its own PR, never footnoted.
 
 ## Release Process

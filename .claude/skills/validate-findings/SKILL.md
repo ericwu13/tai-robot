@@ -13,12 +13,12 @@ not a finding. This skill is the gate between "the review said X" and
 
 0. **PR/issue findings — check against how we actually run.** Trace the
    finding through the real control paths and grade it by CLAUDE.md
-   "Change & review contract". A finding that needs a GUI-only step (a
-   manual CLOSE/flatten) is a P3 follow-up unless it can send or skip a
-   real order; one that only changes a recorded value (logged price,
-   dashboard figure) is at most P3. Before splitting related findings
-   into separate fixes, check whether one rule covers them all. A finding
-   that makes the change less safe than master is always fixed.
+   "Change & review contract". A finding that needs a GUI step we don't
+   do (a manual CLOSE/flatten) is out of scope, not fixed; one that only
+   changes a recorded value (logged price, dashboard figure) is at most
+   P3. Before splitting related findings into separate fixes, check
+   whether one rule covers them all. A finding that makes the change
+   less safe than master is always fixed.
 1. **List the claims** — every factual statement the output will make:
    counts, liveness, "new vs chronic", correlations, root causes,
    fix-status assertions — **and every SEVERITY grade (a P1/P2 is a
