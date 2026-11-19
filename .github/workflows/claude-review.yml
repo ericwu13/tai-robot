@@ -164,10 +164,10 @@ jobs:
             Review goal: set reasonable rules, don't foolproof everything
             (我們不可能一直防呆，而是要訂好合理的規則). Judge the change against master:
             is it at least as safe, and is it one clear rule?
-            - Report only what can happen in the real control paths: deploy,
-              STOP, CONTROL reconnect / set-mode, restart, broker callbacks. The
-              GUI and semi_auto still ship in the EXE: a GUI-only trigger is P3
-              unless it can send or skip a real order.
+            - Report only what can happen in the real control paths of headless
+              live bots: deploy, STOP, CONTROL reconnect / set-mode, restart,
+              broker callbacks. A trigger that needs a GUI step we don't do (such
+              as a manual GUI CLOSE or flatten) is out of scope; don't report it.
             - If you are not confident the trigger really happens, do not
               report it. No "unsure", "may be by design" or "not sure Capital
               sends this" findings. Something that only changes a logged or
@@ -176,7 +176,8 @@ jobs:
               an incident. When a PR keeps adding per-scenario branches, report
               that ONCE as the finding and propose one simpler rule (use X when
               valid, otherwise the existing safe behaviour) instead of listing
-              each new edge case.
+              each new edge case; in docs, skills and prompts, flag a new rule
+              appended beside a related one instead of folded into it (P3).
             - Re-review = `.claude-review/previous_summary.md` exists. Then report
               P1/P2 only (no P3), and focus on what changed since that summary; do
               not hunt for new edge cases in code earlier rounds accepted.
