@@ -68,10 +68,12 @@ must be one of `long` / `short` / `idle`.
   A headless bot refuses `auto`, `real`, and any other live/real-money
   mode from that file (`allow_live_override` does not bypass it); `paper`
   still applies. `deploy --mode auto` is unchanged.
-- **Empty `news.regime_vote_path` is the historical miswiring**: with `""`
-  the runner's `_read_regime_vote` is inert, so every W2/W3/W4 vote file
-  expires unread and the regime brain silently runs vote-free. It looks
-  identical to "the bridges produced no votes" — check the setting first.
+- **A `settings.yaml` news value can silently miswire the bridge; check it first.**
+  Empty `news.regime_vote_path` (also the `settings.example.yaml` default):
+  every W2/W3/W4 vote expires unread (looks like "no votes produced").
+  A non-empty `news.rss_feeds` replaces the shipped defaults, so an old
+  copied list survives upgrades (`check_bridge` P3); after an upgrade,
+  diff that list against `settings.example.yaml`.
 - Relative news paths resolve against the project root, not the EXE's
   cwd. Absolute paths are what the Steven bridge tasks write (`C:\Users\Traderbot\n8n-bridge\`).
 - `session.json` is the deploy dialog's pre-fill source; if it is corrupt
