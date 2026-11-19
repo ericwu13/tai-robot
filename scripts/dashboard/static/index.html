@@ -193,8 +193,11 @@ pre.log .P3 { color: var(--muted); }
 .ev .sev.high { color: #fff; background: var(--bad); }
 .ev .sev.medium { color: var(--warn); background: var(--warn-bg); }
 .ev .sev.low { color: var(--off); background: var(--off-bg); }
-.news-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; margin-bottom: 16px; }
-.chart.news { height: 240px; }
+.news-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; margin-bottom: 16px; }
+.trend-panel { margin-bottom: 16px; }
+.trend-sym { font-size: 12px; font-weight: 400; margin-left: 8px; }
+#n-trend-note { padding: 4px 14px 8px; font-size: 12px; }
+.chart.news { height: 360px; }
 .drivers { padding: 10px 14px; display: grid; gap: 10px; }
 .drivers h4 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
 .drv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; font-size: 13px; }
@@ -210,7 +213,7 @@ pre.log .P3 { color: var(--muted); }
 #news tr.faded td { opacity: .55; }
 @media (max-width: 760px) {
   .pulse-top, .news-grid { grid-template-columns: 1fr; }
-  .chart.news { height: 200px; }
+  .chart.news { height: 280px; }
   .gauge .num { font-size: 26px; }
 }
 /* W2 跨市場報價 strip + W4 籌碼 panel (新聞訊號 view). 紅漲綠跌. */
@@ -364,12 +367,14 @@ details.pnl[open] > summary::before { content: "▾"; }
         <div class="mk-body" id="w4-body"></div>
       </div>
     </div>
+    <div class="panel trend-panel">
+      <div class="section-title">情緒走勢 vs 價格
+        <label class="trend-sym">價格 <select id="n-sym"></select></label>
+        <span class="legend">K 線＝30 分鐘價格（右軸，紅漲綠跌）；線＝盤別累計情緒（左軸，每輪衰減後加總，只在評分時變動）；底部柱＝單輪淨值；虛線＝投票門檻。往左拖曳看更早的紀錄。</span></div>
+      <div class="chart news" id="n-chart"></div>
+      <div class="sub muted" id="n-trend-note"></div>
+    </div>
     <div class="news-grid">
-      <div class="panel">
-        <div class="section-title">情緒走勢
-          <span class="legend">線＝盤別累計（每輪衰減後加總，只在評分時變動）；柱＝單輪淨值；虛線＝投票門檻</span></div>
-        <div class="chart news" id="n-chart"></div>
-      </div>
       <div class="panel">
         <div class="section-title">今晚主要推手
           <span class="legend">每則 ±0.5 上限，每輪衰減一次（半衰期 2 小時）</span></div>
@@ -1314,7 +1319,7 @@ const App = {
     this.renderStrip(p.w2 || {});
     this.renderChips(p.w4 || {});
     this.renderDrivers();
-    this.drawNewsChart();
+    this.refreshTrend(false);
   },
 
   renderStrip(w) {
@@ -1475,26 +1480,69 @@ const App = {
       d.rest_count ? el("div", { class: "sub" }, `其餘 ${d.rest_count} 則合計 ${signedText(d.rest)}`) : null);
   },
 
+  // 情緒走勢 vs 價格: the whole W3 run history plus 30-min price candles.
+  // First load takes everything; later refreshes ask only for the tail.
+  async refreshTrend(full) {
+    const sym = $("n-sym").value;
+    if (full || sym !== (this.trendSym || "")) { this.trend = null; this.newsFitted = false; }
+    const t = this.trend;
+    const ends = t ? [t.runs.length ? t.runs[t.runs.length - 1].t : null,
+      t.candles.length ? t.candles[t.candles.length - 1].time : null].filter((x) => x != null) : [];
+    const after = ends.length ? Math.min(...ends) : null;
+    const q = new URLSearchParams();
+    if (sym) q.set("symbol", sym);
+    if (after != null) q.set("after", String(after));
+    const seq = (this.trendSeq = (this.trendSeq || 0) + 1);
+    let got;
+    try { got = await this.getJson("/api/news/trend" + (q.toString() ? "?" + q : "")); }
+    catch (e) { return; }
+    if (!this.newsOpen || seq !== this.trendSeq) return;      // a newer request owns the chart
+    if (after != null && got.symbol !== t.symbol) return this.refreshTrend(true);
+    if (after != null) {
+      const firstBar = got.candles.length ? got.candles[0].time : Infinity;
+      this.trend = { ...got, runs: t.runs.filter((r) => r.t < after).concat(got.runs),
+        candles: t.candles.filter((c) => c.time < firstBar).concat(got.candles) };
+    } else {
+      this.trend = got;
+    }
+    this.trendSym = got.symbol || "";
+    const sel = $("n-sym"), syms = got.symbols || [];
+    if (sel.options.length !== syms.length || [...sel.options].some((o, i) => o.value !== syms[i])) {
+      sel.replaceChildren(...syms.map((s) => el("option", { value: s }, s)));
+    }
+    sel.value = this.trendSym;
+    this.drawNewsChart();
+  },
+
   drawNewsChart() {
-    const runs = ((this.pulse || {}).runs) || [];
-    if (!window.LightweightCharts || !this.newsOpen) return;
+    const tr = this.trend || { runs: [], candles: [] };
+    const runs = tr.runs || [], bars = tr.candles || [];
+    if (!window.LightweightCharts || !this.newsOpen || !this.pulse) return;
     const box = $("n-chart");
+    const up = this.css("--up"), down = this.css("--down");
     if (!this.newsChart) {
       this.newsChart = LightweightCharts.createChart(box, {
         layout: { background: { color: this.css("--panel") }, textColor: this.css("--muted"),
           fontFamily: getComputedStyle(document.body).fontFamily },
         grid: { vertLines: { visible: false }, horzLines: { color: this.css("--line") } },
-        rightPriceScale: { borderColor: this.css("--line") },
+        rightPriceScale: { borderColor: this.css("--line"), scaleMargins: { top: 0.05, bottom: 0.3 } },
+        leftPriceScale: { visible: true, borderColor: this.css("--line"), scaleMargins: { top: 0.05, bottom: 0.3 } },
         timeScale: { borderColor: this.css("--line"), timeVisible: true, secondsVisible: false },
-        localization: { locale: "zh-TW", priceFormatter: (v) => signedText(v) },
+        localization: { locale: "zh-TW" },
         autoSize: true,
       });
-      this.newsHist = this.newsChart.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false });
-      this.newsLine = this.newsChart.addLineSeries({ lineType: 1, lineWidth: 2, color: this.css("--ok"),
-        priceLineVisible: false });
+      const senti = { type: "custom", formatter: (v) => signedText(v), minMove: 0.01 };
+      this.newsCandles = this.newsChart.addCandlestickSeries({ upColor: up, downColor: down,
+        wickUpColor: up, wickDownColor: down, borderVisible: false, priceScaleId: "right",
+        priceFormat: { type: "price", precision: 0, minMove: 1 } });
+      this.newsHist = this.newsChart.addHistogramSeries({ priceScaleId: "run", priceLineVisible: false,
+        lastValueVisible: false, priceFormat: senti });
+      this.newsChart.priceScale("run").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 }, visible: false });
+      this.newsLine = this.newsChart.addLineSeries({ priceScaleId: "left", lineType: 1, lineWidth: 2,
+        color: this.css("--ok"), priceLineVisible: false, priceFormat: senti });
       this.newsLines = [];
     }
-    const up = this.css("--up"), down = this.css("--down");
+    this.newsCandles.setData(bars);
     this.newsHist.setData(runs.map((r) => ({ time: r.t, value: r.run_net,
       color: this.rgba(r.run_net >= 0 ? up : down, 0.45) })));
     this.newsLine.setData(runs.map((r) => ({ time: r.t, value: r.session_net })));
@@ -1504,7 +1552,17 @@ const App = {
       this.newsLine.createPriceLine({ price: T, color: up, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏多門檻" }),
       this.newsLine.createPriceLine({ price: -T, color: down, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏空門檻" }),
     ];
-    if (!this.newsFitted && runs.length) { this.newsChart.timeScale().fitContent(); this.newsFitted = true; }
+    const first = Math.min(runs.length ? runs[0].t : Infinity, bars.length ? bars[0].time : Infinity);
+    const last = Math.max(runs.length ? runs[runs.length - 1].t : -Infinity, bars.length ? bars[bars.length - 1].time : -Infinity);
+    if (!this.newsFitted && Number.isFinite(last)) {
+      // Open on the last few days; the rest of the history is a drag away.
+      this.newsChart.timeScale().setVisibleRange({ from: Math.max(first, last - 5 * 86400), to: last });
+      this.newsFitted = true;
+    }
+    const day = (t) => new Date(t * 1000).toISOString().slice(0, 10);
+    $("n-trend-note").textContent = Number.isFinite(first)
+      ? `${runs.length} 輪評分・${bars.length} 根 K 線（${tr.symbol || "無價格資料"}）・${day(first)} 起`
+      : "尚無評分紀錄";
   },
 
   // ── detail ──
@@ -1876,7 +1934,7 @@ const App = {
   onChartsReady() {
     if (this.detail) { this.drawCharts(); this.drawEquity(); this.drawPnl(); }
     this.drawFleetPnl();
-    if (this.pulse) this.drawNewsChart();
+    if (this.pulse && this.newsOpen) this.drawNewsChart();
   },
 
   rgba(hex, a) {
@@ -1996,6 +2054,7 @@ const App = {
       location.hash = btn.dataset.view;
     });
     for (const id of ["n-session", "n-score", "n-source"]) $(id).addEventListener("change", () => this.refreshNews());
+    $("n-sym").addEventListener("change", () => this.refreshTrend(true));
     this.newsSeen = readSeen();
     // Leaving the tab moves the "新" baseline to what was last shown, so a
     // page left open overnight marks only the runs since you looked away.
