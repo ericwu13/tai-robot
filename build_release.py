@@ -6,12 +6,20 @@ Usage:
     python build_release.py --allow-dirty # permit uncommitted source
     python build_release.py --allow-missing-broker-sdk
         # CI / Linux: build without Capital API broker DLLs (warns).
+    python build_release.py --notes-file notes.md
+        # build, package, and create the GitHub release. notes.md is a
+        # local untracked file. Required unless --skip-release or
+        # --notify-only. Discord reads the published GitHub release body.
     python build_release.py --skip-release
         # build + zip only. Does not pip-install (the default).
+        # --notes-file is not required.
     python build_release.py --skip-release --install-build-deps
         # also pip-install -e . and requirements-build.txt into the
         # target interpreter (prefers .venv-build), then run PyInstaller
         # with that same interpreter.
+    python build_release.py --notify-only
+        # Discord notification only, from the published GitHub release.
+        # Does not require --notes-file.
 
 The default never runs pip. ``--no-install`` is accepted and changes
 nothing. ``--install-build-deps`` is the opt-in. It installs this
@@ -757,9 +765,9 @@ def _strip_title(body: str) -> str:
 def _load_release_notes() -> str:
     """Fetch release notes from the published GitHub release.
 
-    GitHub is the single source of truth — the local
-    ``release_notes_v{VERSION}.md`` file is only used when *creating* the
-    release (``gh release create --notes-file``), never for notification.
+    GitHub is the single source of truth for Discord notifications
+    (``gh release view``). A local notes file is passed to
+    ``gh release create --notes-file`` only when creating the release.
     """
     try:
         result = subprocess.run(
@@ -802,26 +810,38 @@ def verify_head_pushed() -> None:
     print(f"  HEAD {local[:10]} confirmed on remote")
 
 
-def _release_notes_path() -> str:
-    project = os.path.dirname(os.path.abspath(__file__)) or "."
-    return os.path.join(project, f"release_notes_v{VERSION}.md")
+def verify_release_notes(notes_file: str | None) -> str:
+    """Return the local notes path, or abort if it is missing or too short.
 
-
-def verify_release_notes() -> str:
-    """Return the release notes path, or abort if missing/empty."""
-    path = _release_notes_path()
-    if not os.path.isfile(path):
-        print(f"ERROR: release notes file not found: {os.path.basename(path)}")
-        print(f"       Create it before running the release build.")
+    ``notes_file`` is the ``--notes-file`` path. It is required when
+    creating a GitHub release.
+    """
+    if not notes_file or not str(notes_file).strip():
+        print(
+            "ERROR: --notes-file <path> is required when creating a "
+            "GitHub release."
+        )
+        print(
+            "       Write bilingual notes to a local untracked file, "
+            "or pass --skip-release."
+        )
         sys.exit(1)
-    with open(path, encoding="utf-8") as f:
-        content = f.read().strip()
+    path = os.path.abspath(os.path.expanduser(notes_file))
+    if not os.path.isfile(path):
+        print(f"ERROR: release notes file not found: {path}")
+        sys.exit(1)
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"ERROR: cannot read release notes file {path}: {exc}")
+        sys.exit(1)
     if len(content) < 20:
         print(f"ERROR: {os.path.basename(path)} is empty or too short "
               f"({len(content)} chars).")
         print("       Write proper bilingual release notes before releasing.")
         sys.exit(1)
-    print(f"  Release notes OK ({os.path.basename(path)}, {len(content)} chars)")
+    print(f"  Release notes OK ({path}, {len(content)} chars)")
     return path
 
 
@@ -936,7 +956,7 @@ def notify_release(sha: str, *, force: bool = False) -> None:
         print(f"  WARNING: Discord API returned {resp.status_code}: {resp.text}")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Build and package tai_backtest release")
     parser.add_argument("--skip-build", action="store_true", help="Skip PyInstaller build, just zip")
     parser.add_argument("--allow-dirty", action="store_true",
@@ -946,6 +966,12 @@ def main():
                              "missing (CI / Linux). Prints a warning. Same "
                              "as TAI_ALLOW_MISSING_CAPITAL_SDK=1. The spec "
                              "sees that env var and warns too.")
+    parser.add_argument(
+        "--notes-file",
+        metavar="PATH",
+        help="local untracked release notes file; required unless "
+             "--skip-release or --notify-only",
+    )
     parser.add_argument("--skip-release", action="store_true",
                         help="Skip GitHub release creation (build + package only)")
     parser.add_argument("--install-build-deps", action="store_true",
@@ -963,7 +989,7 @@ def main():
                         help="Skip build/package, just send Discord notification")
     parser.add_argument("--force-notify", action="store_true",
                         help="Resend Discord notification even if already sent for this version")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     sha, dirty = git_commit_info()
 
@@ -983,7 +1009,7 @@ def main():
         sys.exit(1)
 
     if not args.skip_release:
-        notes_file = verify_release_notes()
+        notes_file = verify_release_notes(args.notes_file)
 
     if not args.skip_build:
         build(
@@ -1005,7 +1031,7 @@ def main():
     if args.skip_release:
         print(f"\n=== Done (--skip-release) ===")
         print(f"To create the GitHub release later:")
-        notes_hint = _release_notes_path()
+        notes_hint = args.notes_file or "<path-to-notes.md>"
         print(f"  gh release create v{VERSION} {zip_path} {sha_path} "
               f"--title \"v{VERSION}\" --target {sha} "
               f"--notes-file {notes_hint}")
