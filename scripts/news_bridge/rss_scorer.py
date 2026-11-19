@@ -65,6 +65,7 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import rss_news_log  # noqa: E402
+from rss_feeds import DEFAULT_FEEDS, override_gap  # noqa: E402,F401
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -92,24 +93,6 @@ LOG_KEEP_LINES = 2000
 
 _UA = {"User-Agent": "Mozilla/5.0 (tai-robot news bridge)", "Connection": "close"}
 
-DEFAULT_FEEDS = [
-    # ── Global ──────────────────────────────────────────────────────────
-    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
-    "https://feeds.bloomberg.com/markets/news.rss",
-    "https://feeds.marketwatch.com/marketwatch/topstories",
-    "https://www.investing.com/rss/news.rss",
-    # ── Taiwan / Asia ───────────────────────────────────────────────────
-    # Yahoo US rssindex 404s and TechNews is dead. MoneyDJ stays out.
-    "https://tw.stock.yahoo.com/rss?category=tw-market",
-    "https://news.cnyes.com/rss/v1/news/category/tw_stock",
-    "https://www.taifex.com.tw/cht/11/RSS1",
-    "https://news.google.com/rss/topics/CAAqJQgKIh9DQkFTRVFvSUwyMHZNRFptTXpJU0JYcG9MVlJYS0FBUAE?hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://news.google.com/rss/search?q=TSMC+OR+%E5%8F%B0%E7%A9%8D%E9%9B%BB&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://news.google.com/rss/search?q=%E5%8F%B0%E8%82%A1+OR+TAIEX+OR+%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://news.google.com/rss/search?q=%E5%A4%A9%E4%B8%8B%E9%9B%9C%E8%AA%8C+%E5%8F%B0%E7%81%A3%E7%B6%93%E6%BF%9F&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://news.google.com/rss/search?q=%E5%95%86%E6%A5%AD%E9%80%B1%E5%88%8A+%E5%8F%B0%E8%82%A1&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    "https://www.scmp.com/rss/5/feed",
-]
 
 SCORING_PROMPT = """\
 You are a financial sentiment analyst.  Given the headline and summary of a
@@ -1101,6 +1084,9 @@ def main() -> int:
 
     settings = load_settings(args.settings)
     cfg = get_news_config(settings, discord_webhook=args.discord_webhook)
+    gap = override_gap((settings.get("news") or {}).get("rss_feeds"))
+    if gap:
+        print(f"WARNING: {gap}")
 
     vote_out = args.vote_out or settings.get("news", {}).get("regime_vote_path", "")
     state_path = args.state or cfg["state_file"]

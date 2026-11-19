@@ -21,6 +21,7 @@ if _REPO not in sys.path:
 
 from datetime import datetime, timedelta  # noqa: E402
 
+from scripts.news_bridge.rss_feeds import override_gap  # noqa: E402
 from scripts.monitor.common import (  # noqa: E402
     Finding, default_base_dir, discover_bot_dirs, first_ts_in_line,
     guard_stdout, load_settings, print_report, read_json, resolve_news_path,
@@ -312,6 +313,17 @@ def _check_chips_log(now, bridge_dir, lines, findings):
                 path))
 
 
+def _check_feed_override(settings, paths, lines, findings):
+    """A non-empty ``news.rss_feeds`` replaces W3's defaults wholesale, so a
+    release that changes the defaults never reaches that install."""
+    news = (settings or {}).get("news") or {}
+    gap = override_gap(news.get("rss_feeds"))
+    if gap:
+        lines.append(f"W3 feeds: {gap}")
+        findings.append(Finding("P3", "bridge", f"W3 {gap}",
+                                paths.get("rss_state_file") or ""))
+
+
 def check_bridge(now: datetime, settings: dict, base_dir: str | None = None):
     """``(findings, report_lines)`` for the news/vote bridge."""
     findings = []
@@ -326,6 +338,7 @@ def check_bridge(now: datetime, settings: dict, base_dir: str | None = None):
     lines.append("")
 
     _check_votes(now, paths, tonight_key, lines, findings)
+    _check_feed_override(settings, paths, lines, findings)
     lines.append("")
     _check_signal(now, paths, base_dir, lines, findings)
     _check_events(now, paths, lines, findings)
