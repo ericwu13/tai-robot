@@ -547,6 +547,48 @@ def test_workflow_renamed_out_is_still_excluded(monkeypatch):
     assert world.merge_calls() == [_disable()]
 
 
+def test_ci_script_is_excluded_and_disarms_auto_merge(monkeypatch):
+    pr = make_pr(auto_merge={"enabled_by": {"login": "ericwu13"}})
+    rc, world = _gate(
+        monkeypatch,
+        pr=pr,
+        files=[{"filename": "scripts/ci/auto_merge_gate.py"}],
+        reviews=[review("APPROVED", REED)],
+    )
+    assert rc == 0
+    st = _status(world)
+    assert st["state"] == "success" and st["description"] == "Reed approved"
+    assert world.merge_calls() == [_disable()]
+    _assert_no_admin(world)
+
+
+def test_ci_script_renamed_out_is_still_excluded(monkeypatch):
+    pr = make_pr(auto_merge={"enabled_by": {"login": "ericwu13"}})
+    files = [{"filename": "scripts/foo.py", "previous_filename": "scripts/ci/auto_merge_gate.py"}]
+    rc, world = _gate(monkeypatch, pr=pr, files=files, reviews=[review("APPROVED", REED)])
+    assert rc == 0
+    assert _status(world)["state"] == "success"
+    assert world.merge_calls() == [_disable()]
+
+
+def test_status_error_disarms_auto_merge_first(monkeypatch):
+    """An unapproved PR must drop auto-merge before the status post can fail."""
+    pr = make_pr(auto_merge={"enabled_by": {"login": "ericwu13"}})
+    world = World(pr=pr, files=[{"filename": "src/a.py"}], reviews=[])
+    _env(monkeypatch, world)
+    seen = {}
+
+    def boom(*_args, **_kwargs):
+        seen["merges"] = list(world.merge_calls())
+        raise RuntimeError("status post failed")
+
+    monkeypatch.setattr(mod, "post_status", boom)
+    rc = mod.gate()
+    assert rc != 0
+    assert seen["merges"] == [_disable()]
+    assert world.merge_calls() == [_disable()]
+
+
 def test_needs_owner_blocks_auto_merge(monkeypatch):
     pr = make_pr(
         labels=[{"name": "needs-owner"}],

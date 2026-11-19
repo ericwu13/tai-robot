@@ -12,7 +12,7 @@
         unresolved threads opened by an automation that is approved at that
         head, post the ``approval-gate`` commit status, and enable squash
         auto-merge when the PR is eligible. A release (``version.py``), a
-        workflow edit, a draft, or the ``needs-owner`` label is not eligible.
+        workflow or CI script edit, a draft, or the ``needs-owner`` label is not eligible.
 
 Env: GH_TOKEN (read by gh), GITHUB_REPOSITORY, PR.
 trigger-sage also: SAGE_REVIEW_WEBHOOK_URL, SAGE_REVIEW_WEBHOOK_KEY.
@@ -193,7 +193,8 @@ def is_release(paths):
 
 
 def is_workflow(paths):
-    return any(p.startswith(".github/workflows/") for p in paths)
+    """Workflow files and the CI script this job executes from master."""
+    return any(p.startswith((".github/workflows/", "scripts/ci/")) for p in paths)
 
 
 def label_names(pr):
@@ -405,17 +406,22 @@ def _gate():
     all_approved = reed_ok and (sage_ok or not need_sage)
     resolve_approved_threads(repo, number, approved)
     state, description = status_for(need_sage, reed_ok, sage_ok)
-    post_status(repo, head_sha, state, description, os.environ.get("RUN_URL", "").strip())
     eligible = (
         not pr.get("draft")
         and "needs-owner" not in label_names(pr)
         and not is_release(paths)
         and not is_workflow(paths)
     )
+    # Drop an armed auto-merge before the status write. A failed status on an
+    # unapproved or ineligible PR must not leave the merge queued.
+    disarm_rc = None
+    if not (all_approved and eligible) and pr.get("auto_merge"):
+        disarm_rc = disable_auto_merge(repo, number)
+    post_status(repo, head_sha, state, description, os.environ.get("RUN_URL", "").strip())
     if all_approved and eligible:
         return enable_auto_merge(repo, number, head_sha)
-    if pr.get("auto_merge"):
-        return disable_auto_merge(repo, number)
+    if disarm_rc is not None:
+        return disarm_rc
     return 0
 
 
