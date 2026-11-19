@@ -1,6 +1,6 @@
 ---
 name: bot-status
-description: Check whether a deployed tai-robot bot process is actually alive and still ticking — lock/PID liveness, debug-log freshness, saved session state. Use when the user asks "is the bot running?", "are the bots up?", "fleet status", "is Steven OK?", a bot went quiet, the dashboard shows HUNG/NO_HEARTBEAT/CRASHED, Discord stopped reporting trades, or a deploy needs confirming. Covers local dirs (script) and the Steven fleet (dashboard /api/fleet).
+description: Is a tai-robot bot process alive and still ticking? Use when a bot "stopped trading", went quiet or vanished, "is the bot running?", "are the bots up?", "fleet status", "is Steven OK?", the dashboard shows HUNG/NO_HEARTBEAT/CRASHED, Discord stopped reporting trades, or a deploy needs confirming. Checks lock/PID liveness, debug-log freshness and saved session state (Steven fleet via dashboard /api/fleet; local dirs via script). Alive but flat or idle → regime-health. Crash or traceback → log-scan.
 ---
 
 # Bot Status
@@ -38,7 +38,7 @@ real-order bot — say so before suggesting any stop/restart.
 For this PC's dirs, not the fleet:
 
 ```bash
-C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bots.py
+~/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bots.py
 ```
 
 (`-s` ignores user-site packages, so this interpreter sees the

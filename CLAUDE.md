@@ -9,9 +9,34 @@ Two API approaches: DLL-based (ctypes via SKDLLPython.py) and COM-based (comtype
 - Never push channel IDs, role IDs, or any Discord credentials to git.
 
 ## Model Preferences
-- **Debugging / investigation / root-cause tasks**: use `claude-fable-5`
-- **Implementation / code writing / bug fixes**: use `claude-opus-4-8`
+- **Debugging / investigation / root-cause tasks**: Fable (subagent `model: fable`)
+- **Implementation / code writing / bug fixes**: Opus (subagent `model: opus`)
 - When a task involves both, use Fable to diagnose first, then hand off to Opus to implement.
+- If a Fable subagent fails with a usage-credit error, re-run it with `model: opus` and say so in the report.
+- Agent and skill files name models only by alias (`fable`, `opus`), never by version, so a model upgrade needs no edits: each alias follows the version Claude Code currently maps it to. To hold a specific version instead, add `"env": {"ANTHROPIC_DEFAULT_FABLE_MODEL": "<model id>"}` (or `ANTHROPIC_DEFAULT_OPUS_MODEL`) to `.claude/settings.json`. CI workflows pin their own model IDs.
+
+## Which skill / agent (interactive sessions)
+Skills in `.claude/skills/` and agents in `.claude/agents/` load automatically; you don't need to name them. Pick by symptom. CI workflows (`claude-review`) follow their own prompts, not this table.
+
+| Symptom or ask | Use |
+|---|---|
+| bot stopped trading / went quiet / "is it running?" / HUNG, CRASHED | `bot-status` |
+| bot alive but idle or flat, regime or strategy swap didn't happen | `regime-health` |
+| vote or news signal missing at the source, W1–W4 silent | `bridge-health` |
+| crash, traceback, "anything scary in the logs?" | `log-scan`, then `debug` |
+| live bug the owner wants root-caused and fixed now | `debug` |
+| a GitHub issue / bug_report zip | `issue-triage` → `validate-findings` (`skeptic` agent) → `fix-pr` (`fixer` agent) |
+| deploy / restart / stop a bot | only when the user types `/deploy` (never picked automatically), then `deploy-check` |
+| wiring looks wrong, Discord silent, votes never read | `deploy-check` |
+| weekly evolution silent or never PASSes | `evo-debug` |
+| new strategy, backtest, historical bars | `strategy-research` |
+| daily / weekly health digest | `daily-review`, `weekly-review` |
+| shell on Steven | `tailscale-ssh` (only when a person's own message allows it) |
+| cold start, which checkout or host | `start-here` |
+
+Claude Code only: never deploy, restart or stop a bot (or write a `STOP` file) unless the user explicitly ran `/deploy` for it; otherwise say what you found and suggest `/deploy`. Other agents (Grok bots, Selina, Cursor) keep following their own instructions and can still read `.claude/skills/deploy/SKILL.md` directly.
+
+Real-order modes, merges, tags, releases (and their Discord notice) and dashboard control actions need Eric's explicit yes (relayed via Selina for agents), not just the session user's. `.claude/settings.json` makes Claude ask before the matching commands (push to master, tag, merge, release, `/api/control`, `deploy --mode auto`). Those prompts are a reminder, not a security boundary: a command written another way won't match, so the rule above still applies.
 
 ## Testing
 - Run tests with: `python -m pytest tests/ -x -q`

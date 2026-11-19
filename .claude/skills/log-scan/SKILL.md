@@ -1,6 +1,6 @@
 ---
 name: log-scan
-description: Scan tai-robot bot debug logs and the news-bridge logs for known error signatures — tracebacks, corrupted state, failed Discord sends, refused swaps. Use when something broke and the cause is unknown, after a crash, or when asking "is there anything scary in the logs?". Retired local n8n logs are history-only (`n8n-debug`); live W1–W4 failures are `bridge-health`.
+description: Something broke and the cause is unknown — scan tai-robot bot debug logs and news-bridge logs for known error signatures (tracebacks, corrupted state, failed Discord sends, refused swaps). Use after a crash, for "is there anything scary in the logs?", or as the first look before debug. Retired local n8n logs are history only (n8n-debug); live W1–W4 failures are bridge-health.
 ---
 
 # Log Scan

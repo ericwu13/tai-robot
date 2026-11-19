@@ -1,6 +1,6 @@
 ---
 name: regime-health
-description: Verify the regime-switching brain — did it classify last night, did the recommendation actually apply, is a flip pause or news suppression freezing it. Covers the Steven regime bots via the dashboard (/api/bot regime block). Use when the regime didn't change, a strategy swap never happened, the bot sits idle, or a regime classification/vote needs auditing.
+description: A regime-switching bot is alive but not trading as expected — sits idle or flat, "no trades tonight", the regime did not change, a long/short strategy swap never happened, or a classification or vote needs auditing. Checks whether last night was classified, whether the recommendation applied, and whether a flip pause or news suppression is freezing it (Steven regime bots via dashboard /api/bot). If the bot may be down, run bot-status first.
 ---
 
 # Regime Health
@@ -18,7 +18,7 @@ description: Verify the regime-switching brain — did it classify last night, d
 > weeks behind.
 
 ```bash
-C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_regime.py
+~/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_regime.py
 ```
 
 The monitor runs from the `tai-monitor` venv, not a system-site install.
@@ -28,8 +28,8 @@ Verified on oreopie: that venv is Python 3.13.7 and contains exactly
 system interpreter, then install that pin list:
 
 ```bat
-C:\Python313\python.exe -m venv C:\Users\eric8\.venvs\tai-monitor
-C:\Users\eric8\.venvs\tai-monitor\Scripts\python.exe -m pip install holidays==0.105 python-dateutil PyYAML==6.0.3 six
+C:\Python313\python.exe -m venv %USERPROFILE%\.venvs\tai-monitor
+%USERPROFILE%\.venvs\tai-monitor\Scripts\python.exe -m pip install holidays==0.105 python-dateutil PyYAML==6.0.3 six
 ```
 
 `check_regime` imports `holidays`, which imports `python-dateutil`, which
@@ -44,7 +44,7 @@ Executed chain (a `check_regime(now, base_dir)` call):
 → `dateutil` → `six`. `src.live.live_runner` is imported only by
 settlement-day helpers in `holidays.py`, which this checker does not call.
 
-`C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s -c "import holidays"`
+`~/.venvs/tai-monitor/Scripts/python.exe -s -c "import holidays"`
 is the env gate for this path. A missing `holidays` install makes the
 checker report a degraded calendar instead of a missed night.
 

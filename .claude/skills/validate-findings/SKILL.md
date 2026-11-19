@@ -1,6 +1,6 @@
 ---
 name: validate-findings
-description: Adversarially validate claims before they are published or acted on — a skeptic re-derives each claim from primary evidence and returns CONFIRMED/REFUTED. Use before posting a monitoring digest, before kicking off a fix from a root-cause claim, or whenever a conclusion is about to leave the session.
+description: Adversarially validate claims before they are published or acted on — the skeptic agent re-derives each claim from primary evidence and returns CONFIRMED/REFUTED. Use before posting a monitoring digest, before kicking off a fix from a root-cause claim, or whenever a conclusion is about to leave the session.
 ---
 
 # Validate Findings
@@ -29,8 +29,12 @@ not a finding. This skill is the gate between "the review said X" and
    master"** — its evidence is `issue-triage` step 4 (related-work
    search + inventing path still on master). No search, or related
    shipped work with no owner call → REFUTED.
-2. **Spawn one skeptical read-only subagent** (Explore, model opus —
-   never Sonnet for review) whose instructions are: do NOT trust the
+2. **Spawn the `skeptic` agent** (`.claude/agents/skeptic.md`: read-only,
+   model opus pinned — never Sonnet for review). If that agent is not
+   available, spawn one read-only Explore subagent with model opus and
+   the same brief. Its brief is the claim list from step 1 with where
+   each claim's evidence lives, plus any ssh permission a person gave in
+   this conversation. Its instructions are: do NOT trust the
    claims; re-derive each from the named evidence (re-count the rows,
    re-check the PID, re-read the log); for a "needs a new code fix" claim, re-search related closed
    issues/PRs/CHANGELOG and re-check the inventing path on current

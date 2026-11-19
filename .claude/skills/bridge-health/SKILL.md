@@ -1,6 +1,6 @@
 ---
 name: bridge-health
-description: Check the news/vote bridge pipeline — are W2 cross-market, W3 RSS and W4 chips still alive, is a circuit-breaker signal reaching a bot, is the event calendar fresh. Use when a regime vote is missing, a news signal seems ignored, the bridge went quiet, vote/signal files need auditing, "W1/W2/W3/W4 down", "news bridge", "市場脈動", or the Steven bridge tasks.
+description: Check the news/vote bridge pipeline on Steven — are W1–W4 (W2 cross-market, W3 RSS, W4 chips) still running and writing, is a circuit-breaker signal reaching a bot, is the event calendar fresh. Use when a regime vote is missing at the source, a news signal seems ignored, the bridge went quiet, vote/signal files need auditing, "W1/W2/W3/W4 down", "news bridge", "市場脈動", or the Steven bridge tasks. Votes produced but never read by the bot → deploy-check.
 ---
 
 # Bridge Health
@@ -18,7 +18,7 @@ description: Check the news/vote bridge pipeline — are W2 cross-market, W3 RSS
 > weeks behind.
 
 ```bash
-C:/Users/eric8/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bridge.py [--settings PATH]
+~/.venvs/tai-monitor/Scripts/python.exe -s scripts/monitor/check_bridge.py [--settings PATH]
 ```
 
 Read-only over the paths in the bridge host's `settings.yaml`

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "ask": [
+      "Bash(git push origin master *)",
+      "Bash(git push origin HEAD:master *)",
+      "Bash(git push * --tags *)",
+      "Bash(git push * --tags)",
+      "Bash(git push origin v*)",
+      "Bash(git tag v*)",
+      "Bash(git tag -a *)",
+      "Bash(gh pr merge *)",
+      "Bash(gh release create *)",
+      "Bash(gh release upload *)",
+      "Bash(gh release edit *)",
+      "Bash(python build_release.py *)",
+      "Bash(py build_release.py *)",
+      "Bash(curl *api/control*)",
+      "PowerShell(*api/control*)",
+      "Bash(* deploy *--mode auto*)",
+      "Bash(* deploy *--mode=auto*)",
+      "PowerShell(* deploy *--mode auto*)",
+      "PowerShell(* deploy *--mode=auto*)"
+    ]
+  }
+}
