@@ -3,8 +3,8 @@
 Replaces what the W3 per-run Discord embed used to say (session net vs the
 vote threshold, peak / erosion, recent-run momentum, scoring errors) and
 adds what Discord never showed in one place: tonight's W2/W3/W4 votes and
-bridge liveness, the next calendar events, the run-by-run sentiment
-series for the chart, and which articles are holding the net up.
+bridge liveness, the next calendar events, and which articles are holding
+the net up. The run-by-run chart series is ``news_trend`` (whole history).
 
 Read-only and filter-independent (one cache entry for every open tab).
 Bridge files go through the caller's ``read_json`` — the dashboard passes
@@ -24,7 +24,6 @@ _TZ_TPE = timezone(timedelta(hours=8))
 _FALLBACK_THRESHOLD = 1.5
 _FALLBACK_DECAY = 0.8409
 _FALLBACK_EROSION = 1.5       # rss_scorer.EROSION_POINTS (the embed's "Eroding" rule)
-RUN_HISTORY_DAYS = 3          # chart window
 DRIVERS_PER_SIDE = 3
 EVENTS_SHOWN = 4
 
@@ -40,44 +39,8 @@ def _scorer():
 clip = news_feed.clip          # the scorer's per-article clip (rss_scorer.ARTICLE_CLIP)
 
 
-def _ts(value: str) -> datetime | None:
-    try:
-        dt = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=_TZ_TPE)
-
-
-def _chart_time(dt: datetime) -> int:
-    """TPE wall clock encoded as UTC — the page's lightweight-charts convention."""
-    return int(dt.astimezone(_TZ_TPE).replace(tzinfo=timezone.utc).timestamp())
-
-
 def _num(value, default=0.0) -> float:
     return news_feed._num(value, default)
-
-
-# ── runs: one point per scoring pass ─────────────────────────────────────
-
-def build_runs(items: list[dict], now: datetime, days: int = RUN_HISTORY_DAYS) -> list[dict]:
-    """Oldest-first scoring runs from news rows (all rows of a run share
-    ``scored_at``, ``run_net`` and ``session_net``)."""
-    cutoff = now - timedelta(days=days)
-    runs: dict[tuple, dict] = {}
-    for r in items:
-        dt = _ts(r["scored_at"])
-        if dt is None or dt < cutoff:
-            continue
-        key = (r["session"], r["scored_at"])
-        run = runs.get(key)
-        if run is None:
-            run = runs[key] = {"t": _chart_time(dt), "scored_at": r["scored_at"],
-                               "session": r["session"], "run_net": r["run_net"],
-                               "session_net": r["session_net"], "n": 0,
-                               "bullish": 0, "bearish": 0, "neutral": 0}
-        run["n"] += 1
-        run[r["direction"]] += 1
-    return sorted(runs.values(), key=lambda x: x["scored_at"])
 
 
 # ── drivers: what is holding tonight's net up ────────────────────────────
@@ -231,7 +194,6 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
         "tonight": tonight,
         "votes": votes,
         "events": _events(now, paths.get("events_path", ""), read_json),
-        "runs": build_runs(items, now),
         "drivers": build_drivers(items, session, decay),
         "w2": bridge_panels.crossmarket(now, paths, read_json),
         "w4": bridge_panels.chips(now, paths, read_json),

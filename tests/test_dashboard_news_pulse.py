@@ -1,5 +1,5 @@
 """市場脈動 (GET /api/news/pulse): what the W3 Discord embed used to say,
-plus votes, events, the run series and the drivers of tonight's net.
+plus votes, events and the drivers of tonight's net.
 
 The drivers must reproduce the scorer's own arithmetic (per-article ±0.5
 clip, one EMA decay per scoring run) — a page that disagrees with the
@@ -54,21 +54,6 @@ def _items(tmp_path, rows):
 
 RUN1 = "2026-08-04T20:00:00+08:00"
 RUN2 = "2026-08-04T20:30:00+08:00"
-
-
-def test_runs_group_rows_by_scoring_pass(tmp_path):
-    items, _ = _items(tmp_path, [
-        _row("a", 0.9, RUN1, run_net=0.8, session_net=0.8),
-        _row("b", -0.3, RUN1, run_net=0.8, session_net=0.8),
-        _row("c", 0.0, RUN2, run_net=0.0, session_net=0.673),
-        _row("old", 0.5, "2026-07-01T20:00:00+08:00", session="2026-07-01|NIGHT"),
-    ])
-    runs = news_pulse.build_runs(items, NOW)
-    assert [r["scored_at"] for r in runs] == [RUN1, RUN2]           # oldest first, old run cut
-    assert runs[0]["n"] == 2 and runs[0]["bullish"] == 1 and runs[0]["bearish"] == 1
-    assert runs[1]["session_net"] == 0.673
-    # chart time = TPE wall clock encoded as UTC
-    assert runs[0]["t"] == int(datetime(2026, 8, 4, 20, 0, tzinfo=timezone.utc).timestamp())
 
 
 def test_drivers_match_the_scorers_ema(tmp_path):
@@ -194,14 +179,14 @@ def test_pulse_payload(tmp_path):
     assert w3["vote"] == "trending-down"
     assert {v["source"] for v in out["votes"]} == {"W2", "W3", "W4"}
     assert [e["name"] for e in out["events"]["items"]] == ["FOMC minutes", "CPI"]
-    assert len(out["runs"]) == 1 and out["drivers"]["down"][0]["title"] == "a"
+    assert "runs" not in out and out["drivers"]["down"][0]["title"] == "a"
     assert str(bridge) not in json.dumps(out)              # paths never reach a client
 
 
 def test_pulse_without_settings_or_log():
     out = news_pulse.pulse(NOW, None, None, _reader)
     assert out["available"] is False
-    assert out["w3"] == {"known": False} and out["votes"] == [] and out["runs"] == []
+    assert out["w3"] == {"known": False} and out["votes"] == []
     assert out["events"] == {"configured": False, "items": [], "error": ""}
 
 
@@ -231,4 +216,4 @@ def test_pulse_endpoint(pulse_server):
         assert r.headers.get("Content-Type").startswith("application/json")
         body = json.loads(r.read())
     assert body["threshold"] == rss_scorer.SESSION_VOTE_THRESHOLD
-    assert {"w3", "votes", "events", "runs", "drivers"} <= set(body)
+    assert {"w3", "votes", "events", "drivers"} <= set(body)

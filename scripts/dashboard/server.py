@@ -14,8 +14,11 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
     GET /pnl-history/<bot_id>    cumulative P&L per trading session (sim / real)
     GET /pnl-history/fleet[?retired=1]
                                  the same summed over the fleet
-    GET /api/news/pulse          市場脈動: W3 gauge, votes, events, runs, drivers,
+    GET /api/news/pulse          市場脈動: W3 gauge, votes, events, drivers,
                                  W2 ticker strip, W4 籌碼 panel
+    GET /api/news/trend[?symbol=&after=]
+                                 情緒走勢: every W3 scoring pass + 30-min index
+                                 futures candles on one time axis
     GET /api/workflows           工作流程: W1-W5 status, last run, next due
     GET /position-log/<bot_id>[?limit=N]
                                  the bot's own fill-by-fill position vs the
@@ -43,6 +46,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -56,8 +60,8 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from scripts.dashboard import (  # noqa: E402
-    control, news_feed, news_pulse, pnl_history, position_log_view, snapshot,
-    workflows)
+    control, news_feed, news_pulse, news_trend, pnl_history, position_log_view,
+    snapshot, workflows)
 from scripts.news_bridge import rss_news_log  # noqa: E402
 from scripts.monitor.common import default_base_dir, now_tpe  # noqa: E402
 
@@ -142,6 +146,10 @@ def host_allowed(host_header: str | None, bound: set[str], machine: str) -> bool
     if host in {"localhost", "127.0.0.1", "::1", machine} | bound:
         return True
     return host.startswith(machine + ".") and host.endswith(".ts.net")
+
+
+_TREND_SYMBOL_RE = re.compile(r"[A-Za-z0-9]{0,16}")
+_TREND_AFTER_RE = re.compile(r"[0-9]{0,12}")
 
 
 def _json(payload) -> bytes:
@@ -338,6 +346,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 body = self.cache.get("news-pulse", lambda: _json(news_pulse.pulse(
                     now_tpe(), self.news_log_path, self.news_paths,
                     snapshot._read_json_dict)))
+                self._send(200, body, "application/json; charset=utf-8")
+            elif url.path == "/api/news/trend":
+                symbol = (query.get("symbol") or [""])[0]
+                after = (query.get("after") or [""])[0]
+                if not _TREND_SYMBOL_RE.fullmatch(symbol) or not _TREND_AFTER_RE.fullmatch(after):
+                    self._send(400, _json({"error": "bad symbol or after"}),
+                               "application/json; charset=utf-8")
+                    return
+                body = self.cache.get(f"news-trend:{symbol}:{after}", lambda: _json(
+                    news_trend.trend(self.news_log_path, self.base_dir, symbol,
+                                     int(after) if after else None)))
                 self._send(200, body, "application/json; charset=utf-8")
             elif url.path == "/api/workflows":
                 body = self.cache.get("workflows", lambda: _json(workflows.workflows(
