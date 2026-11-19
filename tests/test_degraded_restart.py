@@ -1,0 +1,950 @@
+"""Headless self-restart once per open session on a quote-zombie DEGRADED.
+
+Issues #322 and #279. A headless bot that stays DEGRADED, with no fresh
+tick, for five continuous minutes of an open session stops while keeping
+its position and spawns one ``--resume`` replacement. The same session
+does not restart again. ``semi_auto`` alerts only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import threading
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+import run_backtest as rb
+from src.live import degraded_restart as dr
+from src.live import headless
+from src.live.headless import (
+    EXIT_OK,
+    build_parser,
+    restart_command,
+)
+from src.live.headless_app import run_deploy
+from src.live.live_runner import LiveRunner
+from src.live.session_store import load_session
+from src.live.tick_watchdog import TickWatchdog
+from tests.test_deploy_abort_keeps_position import _app, _runner
+
+TPE = timezone(timedelta(hours=8))
+DAY = datetime(2026, 11, 19, 10, 0, tzinfo=TPE)
+NOW = 1_700_000_000.0
+SESSION = "2026-11-19|DAY"
+NEXT_SESSION = "2026-11-19|NIGHT"
+
+
+class _Clock:
+    def __init__(self):
+        self.now = NOW
+        self.session = SESSION
+        self.mins = 100
+
+    def policy(self, **kwargs):
+        return dr.DegradedRestartPolicy(
+            now=lambda: self.now,
+            now_dt=lambda: DAY,
+            session_for_fn=lambda _dt: self.session,
+            minutes_left_fn=lambda _symbol=None: self.mins,
+            **kwargs,
+        )
+
+
+def _app_view(*, degraded=True, fresh=0.0, mode="paper", fill_pending=False,
+              poller_active=False, retry=None, confirmed=False, size=0,
+              side="LONG"):
+    side_obj = SimpleNamespace(value=side) if size else None
+    return SimpleNamespace(
+        _link_host=SimpleNamespace(snapshot=lambda: {"degraded": degraded}),
+        _last_fresh_tick_at=fresh,
+        _trading_mode=mode,
+        _trading_guard=SimpleNamespace(
+            fill_pending=fill_pending,
+            real_entry_confirmed=confirmed,
+        ),
+        _fill_poller=SimpleNamespace(active=poller_active),
+        _exit_fill_retry_ctx=retry,
+        _live_runner=SimpleNamespace(
+            symbol="TMF00",
+            bot_name="night1",
+            strategy=SimpleNamespace(name="BollingerBreakout"),
+            broker=SimpleNamespace(position_size=size, position_side=side_obj),
+        ),
+    )
+
+
+def _arm(policy, age_s=300.0):
+    """Clock already past the restart threshold, no fresh tick since."""
+    policy.degraded_open_since = NOW - age_s
+
+
+class _Discord:
+    enabled = True
+
+    def __init__(self):
+        self.started = []
+        self.recovered = []
+        self.skipped = []
+        self.failed = []
+        self.notes = []
+        self.stopped = []
+
+    def degraded_restart_starting(self, **kwargs):
+        self.started.append(kwargs)
+
+    def degraded_restart_recovered(self, **kwargs):
+        self.recovered.append(kwargs)
+
+    def degraded_restart_skipped(self, **kwargs):
+        self.skipped.append(kwargs)
+
+    def degraded_restart_failed(self, reason, **kwargs):
+        self.failed.append((reason, kwargs))
+
+    def notify(self, message, *, priority=False):
+        self.notes.append((message, priority))
+
+    def bot_stopped(self, trades, pnl):
+        self.stopped.append((trades, pnl))
+
+
+def _deploy_args(tmp_path, **extra):
+    bot_dir = tmp_path / "data" / "live" / "TMF00_night1"
+    args = SimpleNamespace(
+        symbol="TMF00",
+        bot="night1",
+        detach=False,
+        wait_for_pid=0,
+        relogin_stagger=False,
+        login_timeout=1,
+        heartbeat_min=0,
+        _raw_argv=["deploy", "--symbol", "TMF00", "--bot", "night1",
+                   "--mode", "paper"],
+    )
+    for key, value in extra.items():
+        setattr(args, key, value)
+    return args, str(bot_dir)
+
+
+# ── pure policy + clock ──────────────────────────────────────────────
+
+
+def test_closed_or_near_close_resets_the_clock_and_does_not_fire(tmp_path):
+    clock = _Clock()
+    policy = clock.policy()
+    app = _app_view()
+    bot = str(tmp_path)
+    policy.degraded_open_since = NOW - 500
+
+    clock.session = None
+    clock.mins = None
+    out = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(out, dr.Noop)
+    assert policy.degraded_open_since is None
+
+    policy.degraded_open_since = NOW - 500
+    clock.session = SESSION
+    for mins in (10, 9, 0, TickWatchdog.NEAR_CLOSE_SUPPRESS):
+        clock.mins = mins
+        policy.degraded_open_since = NOW - 500
+        out = policy.observe_app(app, bot_dir=bot)
+        assert isinstance(out, dr.Noop), mins
+        assert not isinstance(out, dr.RestartDecision)
+        assert policy.degraded_open_since is None
+
+    clock.mins = TickWatchdog.NEAR_CLOSE_SUPPRESS + 1
+    out = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(out, dr.Noop)
+    assert policy.degraded_open_since == NOW
+
+
+def test_fresh_tick_resets_the_clock_while_degraded_stays_true(tmp_path):
+    """A tick newer than the degraded clock restarts the wait.
+
+    Covers reply-only DEGRADED while quotes still flow, and a bot that
+    was DEGRADED overnight: the first tick at the open must not restart
+    immediately.
+    """
+    clock = _Clock()
+    policy = clock.policy()
+    policy.degraded_open_since = NOW - 10_000
+    app = _app_view(degraded=True, fresh=NOW - 9_000)
+    out = policy.observe_app(app, bot_dir=str(tmp_path))
+    assert isinstance(out, dr.Noop)
+    assert not isinstance(out, dr.RestartDecision)
+    assert policy.degraded_open_since is None
+
+    clock.now = NOW + 1
+    out = policy.observe_app(app, bot_dir=str(tmp_path))
+    assert isinstance(out, dr.Noop)
+    assert policy.degraded_open_since == NOW + 1
+
+
+def test_open_session_degraded_fires_once_per_session_key(tmp_path):
+    clock = _Clock()
+    policy = clock.policy()
+    app = _app_view(fresh=NOW - 10_000)
+    bot = str(tmp_path)
+
+    policy.degraded_open_since = None
+    assert isinstance(policy.observe_app(app, bot_dir=bot), dr.Noop)
+    assert policy.degraded_open_since == NOW
+
+    _arm(policy, 299.0)
+    assert isinstance(policy.observe_app(app, bot_dir=bot), dr.Noop)
+
+    _arm(policy, 300.0)
+    decision = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(decision, dr.RestartDecision)
+    assert decision.session_key == SESSION
+    assert not os.path.exists(dr.auto_restart_path(bot))
+
+    dr.save_auto_restart(bot, SESSION, old_pid=42)
+    saved = load_session(dr.auto_restart_path(bot))
+    assert saved["session_key"] == SESSION
+    assert saved["pending_notify"] is True
+    assert saved["old_pid"] == 42
+    assert saved["at"]
+
+    again = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(again, dr.AlertOnly)
+    assert again.reason == "already_restarted"
+    assert again.session_key == SESSION
+    third = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(third, dr.Noop)
+
+    clock.session = NEXT_SESSION
+    policy.degraded_open_since = NOW - 300
+    nxt = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(nxt, dr.RestartDecision)
+    assert nxt.session_key == NEXT_SESSION
+
+
+def test_pending_notify_false_still_blocks_the_same_session(tmp_path):
+    clock = _Clock()
+    policy = clock.policy()
+    _arm(policy)
+    app = _app_view(fresh=0.0)
+    bot = str(tmp_path)
+    dr.save_auto_restart(bot, SESSION, pending_notify=False)
+    out = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(out, dr.AlertOnly)
+    assert out.reason == "already_restarted"
+
+
+@pytest.mark.parametrize("flag", ["guard", "poller", "retry"])
+def test_each_fill_gate_defers_without_consuming_the_budget(tmp_path, flag):
+    clock = _Clock()
+    policy = clock.policy()
+    _arm(policy)
+    kwargs = {"fresh": 0.0}
+    if flag == "guard":
+        kwargs["fill_pending"] = True
+    elif flag == "poller":
+        kwargs["poller_active"] = True
+    else:
+        kwargs["retry"] = {"action": "exit"}
+    app = _app_view(**kwargs)
+    bot = str(tmp_path)
+
+    deferred = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(deferred, dr.Defer)
+    assert deferred.reason == "fill_pending"
+    assert policy.degraded_open_since == NOW - 300
+    assert not os.path.exists(dr.auto_restart_path(bot))
+
+    if flag == "guard":
+        app._trading_guard.fill_pending = False
+    elif flag == "poller":
+        app._fill_poller.active = False
+    else:
+        app._exit_fill_retry_ctx = None
+    fired = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(fired, dr.RestartDecision)
+    assert fired.session_key == SESSION
+    assert not os.path.exists(dr.auto_restart_path(bot))
+
+
+def test_semi_auto_alerts_once_and_never_restarts(tmp_path):
+    clock = _Clock()
+    policy = clock.policy()
+    _arm(policy)
+    app = _app_view(mode="semi_auto", fresh=0.0, confirmed=True, size=1)
+    bot = str(tmp_path)
+    first = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(first, dr.AlertOnly)
+    assert first.reason == "semi_auto"
+    assert first.session_key == SESSION
+    assert not isinstance(first, dr.RestartDecision)
+    assert not os.path.exists(dr.auto_restart_path(bot))
+    assert isinstance(policy.observe_app(app, bot_dir=bot), dr.Noop)
+    clock.session = NEXT_SESSION
+    policy.degraded_open_since = NOW - 300
+    nxt = policy.observe_app(app, bot_dir=bot)
+    assert isinstance(nxt, dr.AlertOnly)
+    assert nxt.session_key == NEXT_SESSION
+
+
+def test_restart_after_default_is_five_minutes():
+    assert dr.DEFAULT_RESTART_AFTER_S == 300.0
+    assert TickWatchdog.NEAR_CLOSE_SUPPRESS == 10
+
+
+# ── command builder ──────────────────────────────────────────────────
+
+
+def _argv():
+    return [
+        "deploy", "--symbol", "TMF00", "--bot", "night1",
+        "--mode", "paper", "--new", "--detach", "--wait-ready", "30",
+        "--wait-ready=5", "--wait-for-pid", "999", "--wait-for-pid=888",
+        "--relogin-stagger", "--strategy", "Bollinger",
+    ]
+
+
+def test_restart_command_uses_child_command_for_source_and_frozen(monkeypatch):
+    seen = []
+    real = headless.child_command
+
+    def _wrapped(raw, *, frozen, executable, script):
+        seen.append(frozen)
+        return real(raw, frozen=frozen, executable=executable, script=script)
+
+    monkeypatch.setattr(headless, "child_command", _wrapped)
+    source = restart_command(
+        _argv(), frozen=False, executable="/usr/bin/python",
+        script="/opt/run_bot_cli.py", trading_mode="auto", old_pid=42,
+        keep_confirmed_real_position=False,
+    )
+    frozen = restart_command(
+        _argv(), frozen=True, executable="/opt/tai_backtest.exe",
+        script="/opt/run_bot_cli.py", trading_mode="paper", old_pid=7,
+        keep_confirmed_real_position=False,
+    )
+    assert seen == [False, True]
+    assert source[:3] == ["/usr/bin/python", "/opt/run_bot_cli.py", "deploy"]
+    assert frozen[0] == "/opt/tai_backtest.exe"
+    assert frozen[1] == "deploy"
+    assert "/opt/run_bot_cli.py" not in frozen
+    assert not any(part.endswith(".py") for part in frozen)
+
+
+@pytest.mark.parametrize("mode_tokens", [
+    ["--mode", "paper"],
+    ["--mode=paper"],
+    [],
+])
+@pytest.mark.parametrize("trading_mode,keep", [
+    ("auto", True),
+    ("auto", False),
+    ("paper", True),
+    ("paper", False),
+])
+def test_restart_command_rewrites_flags(mode_tokens, trading_mode, keep):
+    raw = [
+        "deploy", "--symbol", "TMF00", "--bot", "night1", *mode_tokens,
+        "--new", "--resume", "--detach", "--wait-ready", "12",
+        "--wait-for-pid=5", "--relogin-stagger",
+    ]
+    if keep and trading_mode == "paper":
+        raw.append("--allow-existing-position")
+    cmd = restart_command(
+        raw, frozen=True, executable="tai.exe", script="ignored.py",
+        trading_mode=trading_mode, old_pid=4242,
+        keep_confirmed_real_position=keep and trading_mode == "auto",
+    )
+    assert "--new" not in cmd
+    assert cmd.count("--resume") == 1
+    assert "--detach" not in cmd
+    assert "--wait-ready" not in cmd
+    assert not any(part.startswith("--wait-ready=") for part in cmd)
+    assert cmd.count("--relogin-stagger") == 1
+    assert cmd.count("--wait-for-pid") == 1
+    pid_at = cmd.index("--wait-for-pid")
+    assert cmd[pid_at + 1] == "4242"
+    assert "5" not in cmd
+    assert "999" not in cmd
+    if "--mode" in cmd:
+        assert cmd[cmd.index("--mode") + 1] == trading_mode
+    else:
+        assert f"--mode={trading_mode}" in cmd
+    assert cmd.count("--mode") + sum(
+        part.startswith("--mode=") for part in cmd) == 1
+    wants_allow = keep and trading_mode == "auto"
+    assert ("--allow-existing-position" in cmd) is (
+        wants_allow or "--allow-existing-position" in raw)
+    if wants_allow:
+        assert cmd.count("--allow-existing-position") == 1
+    assert "--allow-unknown-position" not in cmd
+
+
+def test_restart_command_does_not_duplicate_resume_or_existing_position():
+    raw = ["deploy", "--symbol", "T", "--bot", "b", "--mode=auto",
+           "--resume", "--allow-existing-position"]
+    cmd = restart_command(
+        raw, frozen=False, executable="python", script="run_bot_cli.py",
+        trading_mode="auto", old_pid=3,
+        keep_confirmed_real_position=True,
+    )
+    assert cmd.count("--resume") == 1
+    assert cmd.count("--allow-existing-position") == 1
+    assert "--allow-unknown-position" not in cmd
+
+
+def test_hidden_restart_flags_parse_and_stay_out_of_help():
+    parser = build_parser()
+    deploy = parser._subparsers._group_actions[0].choices["deploy"]
+    by_dest = {action.dest: action for action in deploy._actions}
+    assert by_dest["wait_for_pid"].help is argparse.SUPPRESS
+    assert by_dest["wait_for_pid"].type is int
+    assert by_dest["wait_for_pid"].default == 0
+    assert by_dest["relogin_stagger"].help is argparse.SUPPRESS
+    args = parser.parse_args([
+        "deploy", "--symbol", "TMF00", "--bot", "b",
+        "--wait-for-pid", "15", "--relogin-stagger",
+    ])
+    assert args.wait_for_pid == 15
+    assert args.relogin_stagger is True
+    plain = parser.parse_args(["deploy", "--symbol", "TMF00", "--bot", "b"])
+    assert plain.wait_for_pid == 0
+    assert plain.relogin_stagger is False
+    help_text = deploy.format_help()
+    assert "--wait-for-pid" not in help_text
+    assert "--relogin-stagger" not in help_text
+
+
+# ── keep-position stop vs unchanged abort ────────────────────────────
+
+
+def test_keep_position_stop_skips_flatten_and_abort_alert(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "auto")
+    app, discord = _app(monkeypatch, runner, "auto")
+    app._stop_live(keep_position=True)
+    assert app.orders == []
+    assert runner.broker.position_size == 1
+    saved = load_session(runner.session_path)
+    assert saved["broker"]["position_size"] == 1
+    assert discord.stopped == []
+    assert not any("部署中止" in message or "Deploy aborted" in message
+                   for message, _prio in discord.notes)
+    assert app.alerts == []
+
+
+def test_paper_keep_position_stop_does_not_flatten_sim(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "paper")
+    app, discord = _app(monkeypatch, runner, "paper", confirmed=False)
+    app._stop_live(keep_position=True)
+    assert app.orders == []
+    assert runner.broker.position_size == 1
+    assert load_session(runner.session_path)["broker"]["position_size"] == 1
+    assert discord.stopped == []
+
+
+def test_abort_deploy_still_alerts_and_keeps_the_position(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "auto")
+    app, discord = _app(monkeypatch, runner, "auto")
+    app._abort_deploy("tick subscribe failed")
+    assert app.orders == []
+    assert runner.broker.position_size == 1
+    assert any("部署中止" in message and "Deploy aborted" in message
+               for message, prio in discord.notes if prio)
+    assert discord.stopped
+    assert app.alerts
+
+
+def test_plain_stop_still_flattens_a_confirmed_auto_position(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "auto")
+    app, discord = _app(monkeypatch, runner, "auto")
+    app._stop_live()
+    assert len(app.orders) == 1
+    assert runner.broker.position_size == 0
+    assert discord.stopped
+
+
+# ── driver handoff ───────────────────────────────────────────────────
+
+
+def _poll_driver(tmp_path, app, monkeypatch, *, mode="paper", raw=None,
+                 size=0, confirmed=False):
+    from src.live.headless_app import DeployDriver
+
+    bot = str(tmp_path / "TMF00_night1")
+    os.makedirs(bot)
+    app._trading_mode = mode
+    app._trading_guard.real_entry_confirmed = confirmed
+    app._live_runner.broker.position_size = size
+    app._link_host = SimpleNamespace(snapshot=lambda: {"degraded": True})
+    app._last_fresh_tick_at = 0.0
+    app._exit_fill_retry_ctx = None
+    app._service_mode_request = lambda _bot: None
+    order = []
+    real_stop = app._stop_live
+
+    def _stop(*args, **kwargs):
+        order.append("stop")
+        saved = load_session(dr.auto_restart_path(bot))
+        order.append(("marker", None if saved is None else dict(saved)))
+        return real_stop(*args, **kwargs)
+
+    app._stop_live = _stop
+    discord = _Discord()
+
+    def _starting(**kwargs):
+        order.append("discord")
+        discord.started.append(kwargs)
+
+    discord.degraded_restart_starting = _starting
+    monkeypatch.setattr(rb, "_discord", discord)
+    driver = DeployDriver.__new__(DeployDriver)
+    driver.app = app
+    driver.root = app.root
+    driver.bot_dir = bot
+    driver.exit_code = None
+    driver._stop_flag = False
+    driver._stop_via_us = False
+    driver._pending_restart_cmd = None
+    driver.args = SimpleNamespace(
+        heartbeat_min=0,
+        symbol="TMF00",
+        bot="night1",
+        _raw_argv=raw or ["deploy", "--symbol", "TMF00", "--bot", "night1",
+                          "--mode", "paper", "--new"],
+    )
+    driver.finish = lambda code, message="": (
+        order.append(("finish", code, message)) or setattr(driver, "exit_code", code))
+    clock = _Clock()
+    policy = clock.policy()
+    _arm(policy)
+    driver._restart_policy = policy
+    driver._order = order
+    driver._discord = discord
+    return driver
+
+
+def test_restart_decision_notifies_before_keep_position_stop(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "auto")
+    app, _discord = _app(monkeypatch, runner, "auto")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="auto",
+                          confirmed=True, size=1)
+    serviced = []
+    app._service_mode_request = lambda _bot: serviced.append("mode")
+    driver._poll_once()
+    assert driver._order[0] == "discord"
+    assert driver._order[1] == "stop"
+    assert serviced == []
+    assert driver.exit_code == EXIT_OK
+    assert driver._order[-1][0] == "finish"
+    assert "degraded auto-restart" in driver._order[-1][2]
+    marker = load_session(dr.auto_restart_path(driver.bot_dir))
+    assert marker["pending_notify"] is True
+    assert marker["session_key"] == SESSION
+    assert marker["old_pid"] == os.getpid()
+    cmd = driver._pending_restart_cmd
+    assert "--resume" in cmd and "--new" not in cmd
+    assert "--allow-existing-position" in cmd
+    assert "--allow-unknown-position" not in cmd
+    assert "--relogin-stagger" in cmd
+    assert str(os.getpid()) in cmd
+    note = driver._discord.started[0]
+    assert note["session_key"] == SESSION
+    assert note["mode"] == "auto"
+    assert note["old_pid"] == os.getpid()
+    assert "kept" in note["position_kept"].lower() or "x1" in note["position_kept"]
+
+
+@pytest.mark.parametrize("mode,confirmed,size,allow", [
+    ("paper", True, 1, False),
+    ("auto", False, 1, False),
+    ("auto", True, 0, False),
+    ("auto", True, 1, True),
+])
+def test_allow_existing_position_only_for_confirmed_real(
+        tmp_path, monkeypatch, mode, confirmed, size, allow):
+    runner = _runner(tmp_path, "auto" if mode == "auto" else "paper")
+    app, _discord = _app(monkeypatch, runner, mode, confirmed=confirmed)
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode=mode,
+                          confirmed=confirmed, size=size)
+    driver._poll_once()
+    cmd = driver._pending_restart_cmd
+    assert ("--allow-existing-position" in cmd) is allow
+    assert "--allow-unknown-position" not in cmd
+    assert f"--mode" in cmd or any(part.startswith("--mode=") for part in cmd)
+
+
+def test_alert_only_sends_one_discord_and_does_not_stop(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "auto")
+    app, _discord = _app(monkeypatch, runner, "semi_auto", confirmed=False)
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="semi_auto")
+    driver._poll_once()
+    driver._poll_once()
+    assert driver._discord.skipped
+    assert len(driver._discord.skipped) == 1
+    assert driver._discord.skipped[0]["reason"] == "semi_auto"
+    assert driver._discord.skipped[0]["mode"] == "semi_auto"
+    assert "stop" not in driver._order
+    assert driver._pending_restart_cmd is None
+    assert driver.exit_code is None
+    assert not os.path.exists(dr.auto_restart_path(driver.bot_dir))
+
+    dr.save_auto_restart(driver.bot_dir, SESSION)
+    app._trading_mode = "paper"
+    driver._restart_policy._alerted.clear()
+    driver._poll_once()
+    driver._poll_once()
+    reasons = [note["reason"] for note in driver._discord.skipped]
+    assert reasons.count("already_restarted") == 1
+    assert driver._pending_restart_cmd is None
+
+
+# ── run_deploy lifecycle ─────────────────────────────────────────────
+
+
+def _patch_project(monkeypatch, tmp_path):
+    monkeypatch.setattr(rb, "project_root", str(tmp_path))
+
+
+def test_spawn_runs_only_after_teardown_returns(tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    order = []
+    args, bot_dir = _deploy_args(tmp_path)
+    app = SimpleNamespace(
+        _release_relogin_slot=None, root=SimpleNamespace())
+
+    def _boot(*_a, **_k):
+        order.append("boot")
+        return app, EXIT_OK
+
+    def _drive(driver, _app):
+        order.append("drive")
+        driver.bot_dir = bot_dir
+        driver._pending_restart_cmd = ["tai", "deploy", "--resume"]
+        return EXIT_OK
+
+    def _teardown(_app):
+        order.append("teardown")
+        order.append("teardown-return")
+
+    def _spawn(cmd, stdout_path, cwd=None):
+        order.append("spawn")
+        assert order[-2] == "teardown-return"
+        spawned["cmd"] = cmd
+        spawned["stdout"] = stdout_path
+        spawned["cwd"] = cwd
+        return SimpleNamespace(pid=99)
+
+    spawned = {}
+    monkeypatch.setattr(ha, "_boot", _boot)
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    monkeypatch.setattr(ha, "_teardown", _teardown)
+    monkeypatch.setattr(ha, "spawn_detached", _spawn)
+    code = run_deploy(args)
+    assert code == EXIT_OK
+    assert order.index("teardown-return") < order.index("spawn")
+    assert spawned["cmd"] == ["tai", "deploy", "--resume"]
+    assert spawned["stdout"].endswith(os.path.join("TMF00_night1", "cli_stdout.log"))
+    from src.paths import project_root
+    assert spawned["cwd"] == project_root()
+
+
+def test_spawn_oserror_alerts_and_returns_nonzero(tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+
+    def _boot(*_a, **_k):
+        return SimpleNamespace(root=SimpleNamespace()), EXIT_OK
+
+    def _drive(driver, _app):
+        driver.bot_dir = bot_dir
+        driver._pending_restart_cmd = ["tai", "deploy", "--resume"]
+        return EXIT_OK
+
+    def _spawn(*_a, **_k):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    monkeypatch.setattr(ha, "_teardown", lambda _app: None)
+    monkeypatch.setattr(ha, "spawn_detached", _spawn)
+    code = run_deploy(args)
+    assert code not in (0, None)
+    assert discord.failed
+    assert discord.failed[0][1].get("detail") or discord.failed[0][0]
+
+
+def test_wait_for_pid_polls_alive_and_times_out_at_60s(monkeypatch):
+    clock = {"t": 0.0}
+    pids = []
+
+    def _alive(pid):
+        pids.append(pid)
+        return True
+
+    def _mono():
+        return clock["t"]
+
+    def _sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(_alive))
+    ok = dr.wait_for_old_pid(
+        321, timeout_s=dr.PID_WAIT_S, poll_s=1.0, sleep=_sleep, monotonic=_mono)
+    assert ok is False
+    assert dr.PID_WAIT_S == 60.0
+    assert pids and set(pids) == {321}
+    assert clock["t"] >= 60.0
+
+
+def test_wait_for_pid_returns_when_the_process_exits(monkeypatch):
+    state = {"alive": True}
+
+    def _alive(_pid):
+        return state["alive"]
+
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(_alive))
+    state["alive"] = False
+    assert dr.wait_for_old_pid(8, timeout_s=60, poll_s=5, sleep=lambda _s: None)
+
+
+def test_run_deploy_aborts_before_login_when_old_pid_stays_alive(
+        tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, _bot = _deploy_args(tmp_path, wait_for_pid=555)
+    booted = []
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    clock = {"t": 0.0}
+
+    def _mono():
+        clock["t"] += 30.0
+        return clock["t"]
+
+    monkeypatch.setattr(dr.time, "monotonic", _mono)
+    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: booted.append("boot"))
+    code = run_deploy(args)
+    assert code not in (0, None)
+    assert booted == []
+    assert discord.failed
+
+
+def test_relogin_slot_serializes_and_times_out(tmp_path):
+    bot = str(tmp_path / "TMF00_a")
+    os.makedirs(bot)
+    assert dr.DEFAULT_RELOGIN_WAIT_S == 13 * 45
+    slot = dr.relogin_slot_path(bot)
+    assert slot == os.path.join(os.path.dirname(os.path.abspath(bot)),
+                                ".relogin.slot")
+    held = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def _holder():
+        try:
+            assert dr.acquire_relogin_slot(bot, wait_s=2, poll_s=0.01)
+            held.set()
+            assert release.wait(2)
+            dr.release_relogin_slot(bot)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=_holder)
+    thread.start()
+    assert held.wait(2)
+    assert dr.acquire_relogin_slot(bot, wait_s=0.05, poll_s=0.01) is False
+    release.set()
+    thread.join(2)
+    assert not errors, errors
+    assert dr.acquire_relogin_slot(bot, wait_s=1, poll_s=0.01) is True
+    dr.release_relogin_slot(bot)
+    dr.release_relogin_slot(bot)
+
+
+def test_relogin_stagger_is_held_across_login_and_released(
+        tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True)
+    os.makedirs(bot_dir)
+    seen = []
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+
+    def _boot(*_a, **_k):
+        seen.append("boot")
+        assert dr.acquire_relogin_slot(bot_dir, wait_s=0.05, poll_s=0.01) is False
+        return SimpleNamespace(
+            _release_relogin_slot=None, root=SimpleNamespace()), EXIT_OK
+
+    def _drive(driver, app):
+        seen.append("drive")
+        assert callable(app._release_relogin_slot)
+        app._release_relogin_slot()
+        assert dr.acquire_relogin_slot(bot_dir, wait_s=0.5, poll_s=0.01) is True
+        dr.release_relogin_slot(bot_dir)
+        driver.bot_dir = bot_dir
+        driver._pending_restart_cmd = None
+        return EXIT_OK
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    monkeypatch.setattr(ha, "_teardown", lambda _app: seen.append("teardown"))
+    code = run_deploy(args)
+    assert code == EXIT_OK
+    assert seen == ["boot", "drive", "teardown"]
+    assert dr.acquire_relogin_slot(bot_dir, wait_s=0.5, poll_s=0.01) is True
+    dr.release_relogin_slot(bot_dir)
+
+
+def test_relogin_timeout_alerts_and_does_not_log_in(tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True)
+    os.makedirs(bot_dir)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    booted = []
+    assert dr.acquire_relogin_slot(bot_dir, wait_s=1, poll_s=0.01)
+    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
+    clock = {"t": 0.0}
+
+    def _mono():
+        clock["t"] += dr.DEFAULT_RELOGIN_WAIT_S
+        return clock["t"]
+
+    monkeypatch.setattr(dr.time, "monotonic", _mono)
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: booted.append(1))
+    try:
+        code = run_deploy(args)
+    finally:
+        dr.release_relogin_slot(bot_dir)
+    assert code not in (0, None)
+    assert booted == []
+    assert discord.failed
+
+
+def test_plain_deploy_does_not_touch_the_relogin_slot(tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    args, bot_dir = _deploy_args(tmp_path)
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (None, 3))
+    code = run_deploy(args)
+    assert code == 3
+    slot = dr.relogin_slot_path(bot_dir)
+    assert slot is not None
+    assert not os.path.exists(slot)
+
+
+def test_tick_subscription_notifies_once_and_keeps_the_session_key(
+        tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "auto")
+    app, discord = _app(monkeypatch, runner, "auto")
+    discord.recovered = []
+
+    def _recovered(**kwargs):
+        discord.recovered.append(kwargs)
+
+    discord.degraded_restart_recovered = _recovered
+    released = []
+    app._release_relogin_slot = lambda: released.append("slot")
+    dr.save_auto_restart(runner.bot_dir, SESSION, old_pid=9, pending_notify=True)
+    monkeypatch.setattr(rb, "_com_available", True)
+    monkeypatch.setattr(rb, "_broker", SimpleNamespace(request_ticks=lambda *_a: 0))
+    app._quote_connected = True
+    app._quote_intermediate_seen_at = 0.0
+    app._drain_tick_queue = lambda: None
+    app._schedule_status_update = lambda: None
+
+    app._start_live_tick_subscription()
+
+    assert released == ["slot"]
+    assert len(discord.recovered) == 1
+    note = discord.recovered[0]
+    assert note["session_key"] == SESSION
+    assert note["mode"] == "auto"
+    assert note["strategy"]
+    saved = load_session(dr.auto_restart_path(runner.bot_dir))
+    assert saved["pending_notify"] is False
+    assert saved["session_key"] == SESSION
+    assert saved["old_pid"] == 9
+
+    app._release_relogin_slot = lambda: released.append("again")
+    app._notify_degraded_restart_recovered(runner.symbol)
+    assert len(discord.recovered) == 1
+    assert load_session(dr.auto_restart_path(runner.bot_dir))["session_key"] == SESSION
+    assert released == ["slot"]
+
+    clock = _Clock()
+    policy = clock.policy()
+    _arm(policy)
+    view = _app_view(fresh=0.0)
+    blocked = policy.observe_app(view, bot_dir=runner.bot_dir)
+    assert isinstance(blocked, dr.AlertOnly)
+    assert blocked.reason == "already_restarted"
+
+
+def test_discord_methods_priority_and_wording():
+    from src.live.discord_notify import DiscordNotifier
+
+    sent = []
+
+    def _send(content, channel_id="", *, priority=False):
+        sent.append((content, priority))
+
+    note = DiscordNotifier("token", "123", bot_name="night1", symbol="TMF00")
+    note._send = _send
+    note.degraded_restart_starting(
+        bot="night1", session_key=SESSION, mode="auto",
+        position_kept="SHORT x1 kept", old_pid=77, strategy="ShortOnly",
+    )
+    note.degraded_restart_recovered(
+        strategy="ShortOnly", position="SHORT x1", mode="auto",
+        session_key=SESSION,
+    )
+    note.degraded_restart_skipped(
+        bot="night1", session_key=SESSION, mode="semi_auto", reason="semi_auto",
+    )
+    note.degraded_restart_failed("spawn failed", detail="OSError", bot="night1")
+    assert sent[0][1] is True
+    assert SESSION in sent[0][0] and "auto" in sent[0][0]
+    assert "77" in sent[0][0] and "SHORT x1" in sent[0][0]
+    assert sent[1][1] is False
+    assert "ShortOnly" in sent[1][0] and "SHORT x1" in sent[1][0]
+    assert SESSION in sent[1][0] and "auto" in sent[1][0]
+    assert "semi_auto" in sent[2][0] and SESSION in sent[2][0]
+    assert sent[3][1] is True
+    assert "spawn failed" in sent[3][0] and "OSError" in sent[3][0]
+
+
+def test_src_live_does_not_import_src_evolution():
+    import ast
+
+    root = os.path.join(os.path.dirname(__file__), "..", "src", "live")
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, name)
+            tree = ast.parse(open(path, encoding="utf-8").read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    modules = [node.module or ""]
+                else:
+                    continue
+                assert not any("evolution" in module for module in modules), path

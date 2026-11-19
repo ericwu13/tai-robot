@@ -548,6 +548,64 @@ class DiscordNotifier:
             f"交易: {trades} 筆 | P&L: {pnl:+,}"
         )
 
+    def degraded_restart_starting(self, *, bot: str, session_key: str,
+                                  mode: str, position_kept: str, old_pid: int,
+                                  strategy: str = "") -> None:
+        """Headless quote-zombie restart is about to stop this process."""
+        strat = f"\n策略 Strategy: `{strategy}`" if strategy else ""
+        self._send(
+            f"{self._header()}\n"
+            f"🔁 **報價僵死，準備重啟 Quote zombie — restarting**\n"
+            f"機器人 Bot: `{bot}` | 時段 Session: `{session_key}` | "
+            f"模式 Mode: {mode}\n"
+            f"持倉 Position kept: {position_kept} | 舊行程 old pid: {old_pid}"
+            f"{strat}",
+            priority=True,
+        )
+
+    def degraded_restart_recovered(self, *, strategy: str, position: str,
+                                   mode: str, session_key: str) -> None:
+        """The replacement process reached tick subscription."""
+        self._send(
+            f"{self._header()}\n"
+            f"✅ **報價已恢復 Quote restarted**\n"
+            f"策略 Strategy: `{strategy}` | 持倉 Position: {position}\n"
+            f"模式 Mode: {mode} | 時段 Session: `{session_key}`",
+        )
+
+    def degraded_restart_skipped(self, *, bot: str, session_key: str,
+                                 mode: str, reason: str) -> None:
+        """DEGRADED long enough, but this session will not restart again."""
+        if reason == "semi_auto":
+            why = ("半自動不自動重啟，模式維持 semi_auto。請停止後 "
+                   "--resume 重新部署。semi_auto does not auto-restart.")
+        elif reason == "already_restarted":
+            why = ("本時段已自動重啟過，只通知不再重啟。Already restarted "
+                   "this session — alert only.")
+        else:
+            why = ("此模式不自動重啟。This mode is not auto-restarted; "
+                   "stop and redeploy --resume.")
+        self._send(
+            f"{self._header()}\n"
+            f"⚠️ **報價僵死，不重啟 Quote zombie — not restarting**\n"
+            f"機器人 Bot: `{bot}` | 時段 Session: `{session_key}` | "
+            f"模式 Mode: {mode}\n"
+            f"{why}",
+            priority=True,
+        )
+
+    def degraded_restart_failed(self, reason: str, *, detail: str = "",
+                                bot: str = "") -> None:
+        """The replacement was not started (spawn, pid wait, or stagger)."""
+        extra = f"\n{detail}" if detail else ""
+        who = f"機器人 Bot: `{bot}`\n" if bot else ""
+        self._send(
+            f"{self._header()}\n"
+            f"🚨 **自動重啟失敗 Auto-restart failed**\n"
+            f"{who}{reason}{extra}",
+            priority=True,
+        )
+
     def mode_switched(self, old_mode: str, new_mode: str) -> None:
         """Notify a live hot-swap of the trading mode.
 

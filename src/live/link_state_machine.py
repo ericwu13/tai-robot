@@ -1208,7 +1208,9 @@ class LinkStateMachine:
         self.alerts.append(
             f"DEGRADED {reason}: entries blocked; "
             f"probe IsConnected every {int(self.config.probe_interval_s)}s; "
-            "waiting for manual Reconnect"
+            "manual Reconnect cannot recover stuck IsConnected!=0; "
+            "headless auto-restarts once per open session, otherwise "
+            "stop and redeploy --resume"
         )
         # This episode failed. A later 3033 has to see a new
         # OnSolaceReplyDisconnect and run the settle path again.
