@@ -257,6 +257,77 @@ def test_w3_failing_is_bad(bridge):
     assert row["status"] == "bad" and "連續 3 輪" in row["error"]
 
 
+
+def _w3_state(**extra):
+    return {"last_check": iso(NOW - timedelta(minutes=5)), "error_streak": 0,
+            "last_articles_scored": 12, "session_net": -3.87, **extra}
+
+
+def test_w3_degraded_feeds_is_warn_even_when_the_run_exited_ok(bridge):
+    # Steven 2026-11-17: runs/W3.jsonl ok, but 1/5 feeds 404 on every pass.
+    bridge_runs.record_run(bridge, "W3", ok=True, result="fetched 26 | new 12",
+                           finished_at=NOW - timedelta(minutes=5), host="Steven")
+    put(bridge / "rss_scorer_state.json", _w3_state(
+        fetch_status="degraded", feeds_ok=4, feeds_failed=1,
+        last_feed_errors=[{"url": "https://finance.yahoo.com/news/rssindex",
+                           "kind": "http", "message": "HTTP 404: Not Found"}]))
+    row = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))["W3"]
+    assert row["status"] == "warn" and row["status_label"] == "部分異常"
+    assert row["warning"] == "1/5 個新聞來源抓取失敗：finance.yahoo.com"
+    assert row["error"] == "" and row["result"].startswith("fetched 26")
+
+
+def test_w3_every_feed_failed_is_bad_from_state_alone(bridge):
+    put(bridge / "rss_scorer_state.json", _w3_state(
+        fetch_status="failed", fetch_error_streak=2, feeds_ok=0, feeds_failed=13,
+        last_feed_errors=[{"url": "https://a.example/rss", "kind": "network",
+                           "message": "DNS failure"}]))
+    row = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))["W3"]
+    assert row["status"] == "bad"
+    assert "所有新聞來源抓取失敗（連續 2 輪）" in row["error"] and "DNS failure" in row["error"]
+
+
+def test_w3_feeds_recovered_is_ok(bridge):
+    put(bridge / "rss_scorer_state.json", _w3_state(fetch_status="ok", feeds_ok=13,
+                                                    feeds_failed=0, last_feed_errors=[]))
+    row = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))["W3"]
+    assert row["status"] == "ok" and row["warning"] == ""
+
+
+def test_w4_fetch_error_streak_is_bad(bridge):
+    put(bridge / ".chips_state.json", {"last_check": iso(NOW - timedelta(minutes=15)),
+                                       "last_result": "fetch failed", "fetch_error_streak": 3,
+                                       "last_fetch_error": "TAIFEX HTTP 503"})
+    row = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))["W4"]
+    assert row["status"] == "bad" and "連續 3 次" in row["error"] and "HTTP 503" in row["error"]
+
+
+def _w2_quotes(failed, n_ok=3):
+    return {"asof": iso(NOW - timedelta(minutes=1)), "fetch_failed": failed,
+            "quotes": {f"S{i}": {"tier": "alert", "fresh": True} for i in range(n_ok)}}
+
+
+def test_w2_some_quotes_unfetched_is_warn(bridge):
+    put(bridge / "monitor_state.json", {"last_check": iso(NOW - timedelta(minutes=1))})
+    put(bridge / "crossmarket_quotes.json", _w2_quotes(["^STOXX50E"]))
+    row = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))["W2"]
+    assert row["status"] == "warn" and row["warning"] == "1/4 個報價抓取失敗：^STOXX50E"
+
+
+def test_w2_every_quote_unfetched_is_bad(bridge):
+    put(bridge / "monitor_state.json", {"last_check": iso(NOW - timedelta(minutes=1))})
+    put(bridge / "crossmarket_quotes.json", _w2_quotes(["A", "B"], n_ok=0))
+    row = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))["W2"]
+    assert row["status"] == "bad" and "2/2 個報價抓取失敗" in row["error"]
+
+
+def test_stale_outranks_a_partial_warning(bridge):
+    put(bridge / "rss_scorer_state.json", {
+        **_w3_state(fetch_status="degraded", feeds_ok=4, feeds_failed=1),
+        "last_check": iso(NOW - timedelta(hours=3))})
+    row = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))["W3"]
+    assert row["status"] == "stale" and row["warning"]
+
 def test_w4_missed_slot_is_stale(bridge):
     put(bridge / ".chips_state.json", {"last_check": iso(datetime(2026, 11, 6, 18, 15, tzinfo=TPE))})
     at = datetime(2026, 11, 6, 20, 40, tzinfo=TPE)          # 20:15 slot missed

@@ -244,6 +244,7 @@ pre.log .P3 { color: var(--muted); }
 table.mini th, table.mini td { padding: 5px 8px; font-size: 13px; }
 table.mini td.why { white-space: normal; min-width: 160px; }
 /* 工作流程 view */
+.warnline { color: var(--warn); }
 .wf-head { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 12px; }
 .hostb { display: inline-block; padding: 2px 10px; border-radius: 6px; font-size: 13px; font-weight: 700;
   color: var(--warn); background: var(--warn-bg); }
@@ -785,7 +786,7 @@ const SEV_LABEL = { high: "高", medium: "中", low: "低" };
 function tpeShort(iso) { return iso ? iso.slice(5, 16).replace("T", " ") : "—"; }
 function isoAgo(iso) { const t = Date.parse(iso || ""); return Number.isNaN(t) ? null : (Date.now() - t) / 1000; }
 
-const WF_CLS = { ok: "s-ok", stale: "s-warn", bad: "s-bad", off: "s-off", unknown: "s-off", idle: "s-off" };
+const WF_CLS = { ok: "s-ok", warn: "s-warn", stale: "s-warn", bad: "s-bad", off: "s-off", unknown: "s-off", idle: "s-off" };
 function fmtSigned(v) { return v === null || v === undefined ? "—" : (v > 0 ? "+" : "") + fmtInt(Math.round(v)); }
 function signedInt(v) {
   return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, fmtSigned(v));
@@ -1444,7 +1445,8 @@ const App = {
         r.fails_24h ? el("span", { class: "alert" }, `（失敗 ${r.fails_24h}）`) : null)
         : el("span", { class: "muted", title: "舊版橋接不記錄每次執行" }, "—"), "num"),
       td("", el("div", null, r.error ? el("span", { class: "err" }, r.error) : null,
-        r.result || (r.error || r.note ? "" : "—"),
+        r.warning ? el("div", { class: "warnline" }, "⚠ " + r.warning) : null,
+        r.result || (r.error || r.warning || r.note ? "" : "—"),
         r.note ? el("div", { class: "sub" }, r.note) : null), "res"),
       td("主機", r.host || el("span", { class: "muted" }, "—")),
     )));
