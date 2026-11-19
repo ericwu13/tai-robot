@@ -597,6 +597,84 @@ def child_command(raw_argv: list[str], *, frozen: bool,
     return [executable, script, *stripped]
 
 
+def _rewrite_restart_argv(raw_argv: list[str], *, trading_mode: str,
+                          old_pid: int,
+                          keep_confirmed_real_position: bool) -> list[str]:
+    """Deploy argv for the replacement process. See ``restart_command``."""
+    out: list[str] = []
+    saw_resume = False
+    saw_mode = False
+    saw_allow = False
+    args = list(raw_argv)
+    i = 0
+    n = len(args)
+    while i < n:
+        arg = args[i]
+        if arg in ("--new", "--detach", "--relogin-stagger"):
+            i += 1
+            continue
+        if arg == "--wait-ready" or arg.startswith("--wait-ready="):
+            i += 2 if arg == "--wait-ready" and i + 1 < n else 1
+            continue
+        if arg == "--wait-for-pid" or arg.startswith("--wait-for-pid="):
+            i += 2 if arg == "--wait-for-pid" and i + 1 < n else 1
+            continue
+        if arg == "--resume":
+            saw_resume = True
+            out.append(arg)
+            i += 1
+            continue
+        if arg == "--mode" or arg.startswith("--mode="):
+            if arg.startswith("--mode="):
+                out.append(f"--mode={trading_mode}")
+                i += 1
+            else:
+                out.extend(["--mode", trading_mode])
+                i += 2 if i + 1 < n else 1
+            saw_mode = True
+            continue
+        if arg == "--allow-existing-position":
+            saw_allow = True
+            out.append(arg)
+            i += 1
+            continue
+        out.append(arg)
+        i += 1
+    if not saw_resume:
+        out.append("--resume")
+    if not saw_mode:
+        out.extend(["--mode", trading_mode])
+    if keep_confirmed_real_position and not saw_allow:
+        out.append("--allow-existing-position")
+    out.extend(["--wait-for-pid", str(int(old_pid)), "--relogin-stagger"])
+    return out
+
+
+def restart_command(raw_argv: list[str], *, frozen: bool, executable: str,
+                    script: str, trading_mode: str, old_pid: int,
+                    keep_confirmed_real_position: bool) -> list[str]:
+    """Argv for the one ``--resume`` replacement of a degraded headless bot.
+
+    Built on :func:`child_command` (source Python or a frozen EXE).
+    ``--new`` is removed and ``--resume`` is present once. A previous
+    ``--wait-for-pid`` / ``--relogin-stagger`` / ``--detach`` /
+    ``--wait-ready`` is stripped, then this process's pid and a fresh
+    stagger flag are appended. ``--mode`` becomes ``trading_mode``.
+    ``--allow-existing-position`` is added only when the caller is
+    keeping a confirmed real position. ``--allow-unknown-position`` is
+    never added.
+    """
+    rewritten = _rewrite_restart_argv(
+        list(raw_argv),
+        trading_mode=str(trading_mode),
+        old_pid=int(old_pid),
+        keep_confirmed_real_position=bool(keep_confirmed_real_position),
+    )
+    return child_command(
+        rewritten, frozen=bool(frozen), executable=executable, script=script,
+    )
+
+
 def spawn_detached(cmd: list[str], stdout_path: str, cwd: str | None = None):
     """Start ``cmd`` so it survives this process; stdout+stderr append to a file.
 
@@ -876,6 +954,9 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--wait-ready", type=int, default=180, metavar="SECONDS",
                    help="with --detach: wait up to N seconds for the bot to reach "
                         "tick subscription before returning (0 = return at once)")
+    # Replacement-process handoff. Hidden: an operator deploy does not pass them.
+    d.add_argument("--wait-for-pid", type=int, default=0, help=argparse.SUPPRESS)
+    d.add_argument("--relogin-stagger", action="store_true", help=argparse.SUPPRESS)
 
     s = sub.add_parser("stop", help="ask a CLI-deployed bot to stop (STOP file)")
     s.add_argument("--symbol", required=True)

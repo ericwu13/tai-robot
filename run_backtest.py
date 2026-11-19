@@ -10201,6 +10201,78 @@ class BacktestApp:
 
     # ── Tick-based live data feed ──
 
+    def _on_tick_subscription_active(self, symbol: str) -> None:
+        """Release the relogin slot and announce a resumed restart.
+
+        Runs the moment ticks are live. A failure here must not look
+        like a failed ``RequestTicks`` (this sits in that try).
+        """
+        release = getattr(self, "_release_relogin_slot", None)
+        if callable(release):
+            try:
+                release()
+            except Exception as exc:
+                _log(f"[RESTART] relogin slot release failed: "
+                     f"[{type(exc).__name__}] {exc}")
+            self._release_relogin_slot = None
+        try:
+            self._notify_degraded_restart_recovered(symbol)
+        except Exception as exc:
+            _log(f"[RESTART] recovered notify failed: "
+                 f"[{type(exc).__name__}] {exc}")
+
+    def _notify_degraded_restart_recovered(self, symbol: str) -> None:
+        """One Discord line when ``auto_restart.json`` still has pending_notify.
+
+        The write keeps ``session_key`` and sets ``pending_notify`` false,
+        so a second call does not send again and does not re-open the
+        once-per-session restart.
+        """
+        runner = getattr(self, "_live_runner", None)
+        if runner is None:
+            return
+        bot_dir = getattr(runner, "bot_dir", "") or ""
+        if not bot_dir:
+            return
+        from src.live.degraded_restart import (
+            clear_pending_notify, load_auto_restart,
+        )
+        data = load_auto_restart(bot_dir)
+        if not isinstance(data, dict) or data.get("pending_notify") is not True:
+            return
+        _log(f"[RESTART] resumed after degraded restart: {symbol} "
+             f"session={data.get('session_key')}")
+        session_key = str(data.get("session_key") or "")
+        strategy = ""
+        strat = getattr(runner, "strategy", None)
+        if strat is not None:
+            strategy = str(getattr(strat, "name", "") or strat.__class__.__name__)
+        broker = getattr(runner, "broker", None)
+        try:
+            size = int(getattr(broker, "position_size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size > 0:
+            side = getattr(broker, "position_side", None)
+            side_s = getattr(side, "value", "") if side is not None else ""
+            position = f"{side_s} x{size}".strip()
+        else:
+            position = "FLAT"
+        mode = str(getattr(self, "_trading_mode", "") or "")
+        discord = _discord
+        if discord is not None and getattr(discord, "enabled", False):
+            method = getattr(discord, "degraded_restart_recovered", None)
+            if callable(method):
+                method(strategy=strategy, position=position, mode=mode,
+                       session_key=session_key)
+            else:
+                discord.notify(
+                    f"報價已恢復 Quote restarted: {strategy} {position} "
+                    f"{mode} {session_key}")
+        # Flip only after the send so a failed send can be retried.
+        # session_key stays; only pending_notify changes.
+        clear_pending_notify(bot_dir)
+
     def _start_live_tick_subscription(self):
         """Subscribe to real-time ticks via COM and build 1-min bars."""
         if not self._live_runner:
@@ -10256,6 +10328,7 @@ class BacktestApp:
             self._tick_watchdog.order_symbol = resolve_order_symbol(symbol)
             self._live_log_msg(f"已訂閱 Tick subscription active for {symbol}", "status")
             _log(f"即時報價訂閱成功 Tick subscription OK: {symbol}, result={result}")
+            self._on_tick_subscription_active(symbol)
             self._arm_quote_window_from_subscription()
         except Exception as e:
             _log(f"報價訂閱錯誤 Tick subscribe error: [{type(e).__name__}] {e}\n{traceback.format_exc()}")
@@ -13302,15 +13375,22 @@ class BacktestApp:
                     pass
         return msg
 
-    def _stop_live(self, abort_reason: str | None = None):
+    def _stop_live(self, abort_reason: str | None = None, *,
+                   keep_position: bool = False):
         """Stop the live bot and restore UI.
 
         ``abort_reason`` is set only by ``_abort_deploy``: a deploy or
         resume that failed. Then no stop-close is sent and the position
         is kept (sim and session). A plain call is the user's stop and
         still flattens.
+
+        ``keep_position`` (headless degraded restart, and only when
+        ``abort_reason`` is None) also skips the IOC stop-close and the
+        plain ``bot_stopped`` alert. The before-restart Discord message
+        already went out. The session is saved with the position open.
         """
         self._fill_timeout_restore_marker = None
+        keep = bool(keep_position) and abort_reason is None
         self._loss_view = None
         # The grid sweep runs in another process. The worker polls this
         # flag and terminates that child so a GUI stop does not wait
@@ -13374,6 +13454,10 @@ class BacktestApp:
             if abort_reason is not None:
                 # Deploy abort: no stop-close, keep the position, alert.
                 abort_msg = self._alert_deploy_abort_keeps_position(abort_reason)
+            elif keep:
+                # Degraded auto-restart: keep the position. No IOC flatten
+                # and no "Deploy aborted" alert.
+                pass
             # Close real position before stopping if semi-auto has one open.
             # Must happen BEFORE runner.stop() which resets state asynchronously.
             elif (self._trading_mode in ("semi_auto", "auto")
@@ -13425,7 +13509,7 @@ class BacktestApp:
             # stop() flushes the aggregator's partial bar and runs _process_aggregated_bar,
             # which would execute the strategy and potentially generate new entries.
             self._live_runner.suppress_strategy = True
-            if abort_reason is not None:
+            if abort_reason is not None or keep:
                 summary = self._live_runner.stop(keep_position=True)
             else:
                 summary = self._live_runner.stop()
@@ -13441,7 +13525,7 @@ class BacktestApp:
                 "status",
             )
             _log(f"即時機器人已停止 Live bot stopped: {summary}")
-            if _discord and _discord.enabled:
+            if _discord and _discord.enabled and not keep:
                 _discord.bot_stopped(summary['trades'], summary['pnl'])
 
             # Run the evolution check NOW, while _live_runner is still set.

@@ -86,6 +86,7 @@ class DiscordNotifier:
         self._priority_backlog: deque = deque()
         self._state_lock = threading.Lock()
         self._work_ready = threading.Condition(self._state_lock)
+        self._idle_ready = threading.Condition(self._state_lock)
         self._worker: threading.Thread | None = None
         self._worker_lock = threading.Lock()
         self._in_flight = False
@@ -176,6 +177,23 @@ class DiscordNotifier:
             self._worker = worker
             worker.start()
 
+    def flush(self, timeout_s: float = 5.0) -> bool:
+        """Wait until the worker is idle, or until ``timeout_s`` elapses.
+
+        Normal sends stay non-blocking. A process that is about to exit
+        calls this so a priority alert is posted before the daemon worker
+        is killed. True means nothing is queued and nothing is in flight.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._state_lock:
+            while (self._in_flight or self._priority_backlog
+                   or not self._queue.empty()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._idle_ready.wait(timeout=remaining)
+            return True
+
     def _enqueue_priority(self, item) -> None:
         """Park one priority message. Wake the worker; do not touch the queue."""
         content, target, priority, tries, _waited = item
@@ -224,8 +242,6 @@ class DiscordNotifier:
             sent_ok = False
             try:
                 item, from_backlog, queued = self._next_item()
-                with self._state_lock:
-                    self._in_flight = True
                 content, target = item[0], item[1]
                 ok = self._deliver(content, target)
                 sent_ok = True
@@ -248,6 +264,8 @@ class DiscordNotifier:
             finally:
                 with self._state_lock:
                     self._in_flight = False
+                    if not self._priority_backlog and self._queue.empty():
+                        self._idle_ready.notify_all()
                 if queued:
                     self._queue.task_done()
 
@@ -286,8 +304,12 @@ class DiscordNotifier:
             while not self._priority_backlog and self._queue.empty():
                 self._work_ready.wait()
             if self._priority_backlog:
-                return self._priority_backlog.popleft(), True, False
-            return self._queue.get_nowait(), False, True
+                item = self._priority_backlog.popleft()
+                self._in_flight = True
+                return item, True, False
+            item = self._queue.get_nowait()
+            self._in_flight = True
+            return item, False, True
 
     def _post_stall_summary(self) -> None:
         """One catch-up line after a successful send, once the backlog is empty.
@@ -561,6 +583,64 @@ class DiscordNotifier:
             f"{self._header()}\n"
             f"🛑 **機器人停止 Bot Stopped**\n"
             f"交易: {trades} 筆 | P&L: {pnl:+,}"
+        )
+
+    def degraded_restart_starting(self, *, bot: str, session_key: str,
+                                  mode: str, position_kept: str, old_pid: int,
+                                  strategy: str = "") -> None:
+        """Headless quote-zombie restart is about to stop this process."""
+        strat = f"\n策略 Strategy: `{strategy}`" if strategy else ""
+        self._send(
+            f"{self._header()}\n"
+            f"🔁 **報價僵死，準備重啟 Quote zombie — restarting**\n"
+            f"機器人 Bot: `{bot}` | 時段 Session: `{session_key}` | "
+            f"模式 Mode: {mode}\n"
+            f"持倉 Position kept: {position_kept} | 舊行程 old pid: {old_pid}"
+            f"{strat}",
+            priority=True,
+        )
+
+    def degraded_restart_recovered(self, *, strategy: str, position: str,
+                                   mode: str, session_key: str) -> None:
+        """The replacement process reached tick subscription."""
+        self._send(
+            f"{self._header()}\n"
+            f"✅ **報價已恢復 Quote restarted**\n"
+            f"策略 Strategy: `{strategy}` | 持倉 Position: {position}\n"
+            f"模式 Mode: {mode} | 時段 Session: `{session_key}`",
+        )
+
+    def degraded_restart_skipped(self, *, bot: str, session_key: str,
+                                 mode: str, reason: str) -> None:
+        """DEGRADED long enough, but this session will not restart again."""
+        if reason == "semi_auto":
+            why = ("半自動不自動重啟，模式維持 semi_auto。請停止後 "
+                   "--resume 重新部署。semi_auto does not auto-restart.")
+        elif reason == "already_restarted":
+            why = ("本時段已自動重啟過，只通知不再重啟。Already restarted "
+                   "this session — alert only.")
+        else:
+            why = ("此模式不自動重啟。This mode is not auto-restarted; "
+                   "stop and redeploy --resume.")
+        self._send(
+            f"{self._header()}\n"
+            f"⚠️ **報價僵死，不重啟 Quote zombie — not restarting**\n"
+            f"機器人 Bot: `{bot}` | 時段 Session: `{session_key}` | "
+            f"模式 Mode: {mode}\n"
+            f"{why}",
+            priority=True,
+        )
+
+    def degraded_restart_failed(self, reason: str, *, detail: str = "",
+                                bot: str = "") -> None:
+        """The replacement was not started (spawn, pid wait, or stagger)."""
+        extra = f"\n{detail}" if detail else ""
+        who = f"機器人 Bot: `{bot}`\n" if bot else ""
+        self._send(
+            f"{self._header()}\n"
+            f"🚨 **自動重啟失敗 Auto-restart failed**\n"
+            f"{who}{reason}{extra}",
+            priority=True,
         )
 
     def mode_switched(self, old_mode: str, new_mode: str) -> None:

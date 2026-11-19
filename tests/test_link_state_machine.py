@@ -796,7 +796,8 @@ class TestReedReview:
     def test_F_quote_drop_then_1108_does_not_wedge_silently(self):
         """3021 → EnterMonitorLONG 1108 → login OK degrades, it does not wedge.
 
-        Alert, block entries, probe IsConnected, wait for manual Reconnect.
+        Alert, block entries, probe IsConnected. Manual Reconnect cannot
+        recover a stuck IsConnected!=0 quote; the message says so.
         """
         machine, fake, t0 = boot_ready()
         t = t0 + timedelta(hours=1)
@@ -815,7 +816,17 @@ class TestReedReview:
         assert machine.quote == LinkPhase.DOWN
         assert machine.reply == LinkPhase.DOWN
         assert machine.alerts
-        assert "manual Reconnect" in machine.alerts[-1]
+        alert = machine.alerts[-1]
+        assert alert.startswith(
+            "DEGRADED stuck: entries blocked; "
+            f"probe IsConnected every {int(machine.config.probe_interval_s)}s; "
+        )
+        assert "waiting for manual Reconnect" not in alert
+        assert (
+            "manual Reconnect cannot recover stuck IsConnected!=0; "
+            "headless auto-restarts once per open session, otherwise "
+            "stop and redeploy --resume"
+        ) in alert
         assert fake.calls.count("ConnectByID") == connects + 1
         assert fake.calls.count("EnterMonitorLONG") == enters + 1
         assert fake.calls.count("IsConnected") >= reads + 2

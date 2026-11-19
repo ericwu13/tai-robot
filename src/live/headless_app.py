@@ -34,14 +34,17 @@ from datetime import datetime
 import run_backtest as rb
 from src.backtest.report import export_trades_csv, format_report
 from src.live.deploy_request import DeployRequest
+from src.live.degraded_restart import (
+    AlertOnly, DegradedRestartPolicy, RestartDecision, save_auto_restart,
+)
 from src.live.headless import (
     EXIT_BACKTEST_FAILED, EXIT_BOT_STOPPED, EXIT_DEPLOY_REFUSED, EXIT_LOGIN,
     EXIT_NO_COM, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE,
     HeadlessConfigError, HeadlessPolicy, apply_control_command,
-    build_deploy_request, clear_stop_file, consume_control_file,
+    build_deploy_request, clear_stop_file, cli_stdout_path, consume_control_file,
     control_fingerprint, policy_from_args, quarantine_stale_control,
     remove_headless_marker_if_ours, request_stop, resolve_strategy_name,
-    stop_requested, write_headless_marker,
+    restart_command, spawn_detached, stop_requested, write_headless_marker,
 )
 from src.live.live_runner import LiveRunner, arm_headless_file_guard
 from src.live import mode_request as mreq
@@ -217,6 +220,8 @@ class DeployDriver(_Driver):
         self._stop_via_us = False
         self._ignored_control: tuple | None = None
         self._ignored_control_logged = False
+        self._pending_restart_cmd: list[str] | None = None
+        self._restart_policy = DegradedRestartPolicy()
 
     def start(self) -> None:
         app, args = self.app, self.args
@@ -369,6 +374,13 @@ class DeployDriver(_Driver):
             self.finish(EXIT_BOT_STOPPED, "bot stopped on its own — see the debug log")
             return
         try:
+            self._maybe_degraded_restart()
+        except Exception as e:
+            rb._log(f"[HEADLESS] degraded-restart check failed: "
+                    f"[{type(e).__name__}] {e}")
+        if self.exit_code is not None:
+            return
+        try:
             app._service_mode_request(self.bot_dir)
         except Exception as e:
             rb._log(f"[HEADLESS] mode request failed: [{type(e).__name__}] {e}")
@@ -413,6 +425,122 @@ class DeployDriver(_Driver):
                         f"{link}")
             except Exception as e:
                 rb._log(f"[HEADLESS] heartbeat failed: {e}")
+
+    def _restart_policy_or_new(self) -> DegradedRestartPolicy:
+        policy = getattr(self, "_restart_policy", None)
+        if policy is None:
+            policy = DegradedRestartPolicy()
+            self._restart_policy = policy
+        return policy
+
+    def _maybe_degraded_restart(self) -> None:
+        """One keep-position restart per open session, or one alert."""
+        if self.exit_code is not None:
+            return
+        app = self.app
+        if getattr(app, "_live_runner", None) is None:
+            return
+        outcome = self._restart_policy_or_new().observe_app(
+            app, bot_dir=self.bot_dir)
+        if isinstance(outcome, RestartDecision):
+            self._begin_degraded_restart(outcome)
+        elif isinstance(outcome, AlertOnly):
+            self._alert_restart_skipped(outcome)
+
+    def _begin_degraded_restart(self, decision: RestartDecision) -> None:
+        app = self.app
+        runner = app._live_runner
+        mode = str(getattr(app, "_trading_mode", "") or "")
+        keep = (
+            mode == "auto"
+            and bool(getattr(app._trading_guard, "real_entry_confirmed", False))
+            and int(getattr(runner.broker, "position_size", 0) or 0) > 0
+        )
+        raw = list(getattr(self.args, "_raw_argv", None) or [])
+        if not raw:
+            raw = ["deploy", "--symbol", self.args.symbol, "--bot", self.args.bot,
+                   "--mode", mode]
+        from src.paths import project_root
+        cmd = restart_command(
+            raw,
+            frozen=bool(getattr(sys, "frozen", False)),
+            executable=sys.executable,
+            script=os.path.join(project_root(), "run_bot_cli.py"),
+            trading_mode=mode,
+            old_pid=os.getpid(),
+            keep_confirmed_real_position=keep,
+        )
+        save_auto_restart(self.bot_dir, decision.session_key, old_pid=os.getpid())
+        self._notify_restart_starting(decision, keep)
+        app._stop_live(keep_position=True)
+        self._pending_restart_cmd = cmd
+        self.finish(EXIT_OK, "degraded auto-restart")
+
+    def _position_kept_text(self, keep: bool) -> str:
+        runner = self.app._live_runner
+        broker = getattr(runner, "broker", None)
+        try:
+            size = int(getattr(broker, "position_size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        side = getattr(broker, "position_side", None) if broker is not None else None
+        side_s = getattr(side, "value", "") if side is not None else ""
+        if size <= 0:
+            return "flat"
+        if keep:
+            return f"real {side_s} x{size} kept".strip()
+        return f"sim {side_s} x{size} kept".strip()
+
+    def _strategy_label(self) -> str:
+        strat = getattr(self.app._live_runner, "strategy", None)
+        if strat is None:
+            return ""
+        named = getattr(strat, "name", "") or ""
+        return str(named or strat.__class__.__name__)
+
+    def _notify_restart_starting(self, decision: RestartDecision, keep: bool) -> None:
+        app = self.app
+        runner = app._live_runner
+        bot = str(getattr(runner, "bot_name", "") or getattr(self.args, "bot", ""))
+        mode = str(getattr(app, "_trading_mode", "") or "")
+        rb._log(f"[HEADLESS] degraded auto-restart session={decision.session_key} "
+                f"mode={mode} keep_real={keep} pid={os.getpid()}")
+        discord = getattr(rb, "_discord", None)
+        if discord is None or not getattr(discord, "enabled", False):
+            return
+        try:
+            discord.degraded_restart_starting(
+                bot=bot,
+                session_key=decision.session_key,
+                mode=mode,
+                position_kept=self._position_kept_text(keep),
+                old_pid=os.getpid(),
+                strategy=self._strategy_label(),
+            )
+        except Exception as exc:
+            rb._log(f"[HEADLESS] restart-starting alert failed: "
+                    f"[{type(exc).__name__}] {exc}")
+
+    def _alert_restart_skipped(self, outcome: AlertOnly) -> None:
+        app = self.app
+        runner = getattr(app, "_live_runner", None)
+        bot = str(getattr(runner, "bot_name", "") or getattr(self.args, "bot", ""))
+        mode = str(getattr(app, "_trading_mode", "") or "")
+        rb._log(f"[HEADLESS] degraded auto-restart skipped ({outcome.reason}) "
+                f"session={outcome.session_key} mode={mode}")
+        discord = getattr(rb, "_discord", None)
+        if discord is None or not getattr(discord, "enabled", False):
+            return
+        try:
+            discord.degraded_restart_skipped(
+                bot=bot,
+                session_key=outcome.session_key,
+                mode=mode,
+                reason=outcome.reason,
+            )
+        except Exception as exc:
+            rb._log(f"[HEADLESS] restart-skipped alert failed: "
+                    f"[{type(exc).__name__}] {exc}")
 
     def _poll_control(self) -> None:
         """Apply ``CONTROL`` once. ``auto`` and ``real`` are rejected."""
@@ -531,15 +659,182 @@ def _boot(policy: HeadlessPolicy, need_com: bool) -> tuple[HeadlessBotApp | None
     return app, EXIT_OK
 
 
-def run_deploy(args) -> int:
-    app, code = _boot(policy_from_args(args), need_com=True)
-    if app is None:
-        return code
-    driver = DeployDriver(app, args)
+def _deploy_bot_dir(args) -> str:
+    base = os.path.join(rb.project_root, "data", "live")
+    return LiveRunner.bot_dir_for(base, args.symbol, args.bot)
+
+
+def _resolve_discord(bot: str = "", symbol: str = ""):
+    """The live notifier, or one built from settings when deploy never reached it.
+
+    A replacement that dies at pid-wait, relogin, login, or the pre-deploy
+    position prompt has not run ``_deploy_live_continue``, so ``rb._discord``
+    is still None. An already installed notifier is returned as-is.
+    """
+    current = getattr(rb, "_discord", None)
+    if current is not None:
+        return current
+    load = getattr(rb, "_load_settings", None)
+    if not callable(load):
+        return None
     try:
-        return _drive_until_exit(driver, app)
+        cfg = load() or {}
+    except Exception as exc:
+        rb._log(f"[HEADLESS] discord settings unreadable: "
+                f"[{type(exc).__name__}] {exc}")
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    token = str(cfg.get("discord_bot_token") or "").strip()
+    channel = str(cfg.get("discord_channel_id") or "").strip()
+    if not token or not channel:
+        return None
+    from src.live.discord_notify import DiscordNotifier
+    return DiscordNotifier(token, channel, bot_name=bot, symbol=symbol)
+
+
+def _flush_discord(discord) -> None:
+    if discord is None or not getattr(discord, "enabled", False):
+        return
+    flush = getattr(discord, "flush", None)
+    if not callable(flush):
+        return
+    try:
+        flush(timeout_s=5.0)
+    except Exception as exc:
+        rb._log(f"[HEADLESS] discord flush failed: [{type(exc).__name__}] {exc}")
+
+
+def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
+                         symbol: str = "") -> None:
+    rb._log("[HEADLESS] degraded auto-restart failed: "
+            + reason + (f" — {detail}" if detail else ""))
+    discord = _resolve_discord(bot=bot, symbol=symbol)
+    if discord is None or not getattr(discord, "enabled", False):
+        return
+    try:
+        method = getattr(discord, "degraded_restart_failed", None)
+        if callable(method):
+            method(reason, detail=detail, bot=bot)
+        else:
+            discord.notify(
+                f"自動重啟失敗 Auto-restart failed: {reason} {detail}",
+                priority=True,
+            )
+        flush = getattr(discord, "flush", None)
+        if callable(flush):
+            flush(timeout_s=5.0)
+    except Exception as exc:
+        rb._log(f"[HEADLESS] restart-failed alert failed: "
+                f"[{type(exc).__name__}] {exc}")
+
+
+def _fail_pending_replacement(bot_dir: str, bot_name: str, reason: str,
+                             detail: str, symbol: str = "") -> None:
+    """Alert when a ``--wait-for-pid`` child never reached live ticks.
+
+    ``pending_notify`` stays true only until tick subscription. Clearing
+    it here keeps the session budget consumed and stops a later manual
+    ``--resume`` from posting a false recovery message. A record that is
+    already clear is left alone, so a bot that did recover and later
+    stops does not get a failure alert.
+    """
+    from src.live.degraded_restart import clear_pending_notify, load_auto_restart
+    data = load_auto_restart(bot_dir)
+    if not isinstance(data, dict) or data.get("pending_notify") is not True:
+        return
+    _emit_restart_failed(reason, detail=detail, bot=bot_name, symbol=symbol)
+    clear_pending_notify(bot_dir)
+
+
+def _spawn_pending_restart(driver, code: int) -> int:
+    """Spawn the replacement only after ``_teardown`` has returned."""
+    cmd = getattr(driver, "_pending_restart_cmd", None) if driver is not None else None
+    if not cmd:
+        return code
+    bot_dir = getattr(driver, "bot_dir", "") or ""
+    stdout_path = (cli_stdout_path(bot_dir) if bot_dir
+                   else os.path.join(os.getcwd(), "cli_stdout.log"))
+    try:
+        from src.paths import project_root
+        spawn_detached(cmd, stdout_path, cwd=project_root())
+    except OSError as exc:
+        symbol = str(getattr(getattr(driver, "args", None), "symbol", "") or "")
+        _emit_restart_failed(
+            "spawn failed",
+            detail=f"{type(exc).__name__}: {exc}",
+            bot=os.path.basename(bot_dir),
+            symbol=symbol,
+        )
+        if bot_dir:
+            from src.live.degraded_restart import clear_pending_notify
+            clear_pending_notify(bot_dir)
+        return EXIT_BOT_STOPPED
+    _flush_discord(getattr(rb, "_discord", None))
+    return code
+
+
+def run_deploy(args) -> int:
+    from src.live.degraded_restart import (
+        DEFAULT_RELOGIN_WAIT_S, PID_WAIT_S, acquire_relogin_slot,
+        clear_pending_notify, release_relogin_slot, wait_for_old_pid,
+    )
+
+    bot_dir = _deploy_bot_dir(args)
+    bot_name = str(getattr(args, "bot", "") or "")
+    symbol = str(getattr(args, "symbol", "") or "")
+    old_pid = int(getattr(args, "wait_for_pid", 0) or 0)
+    if old_pid > 0:
+        if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
+            _emit_restart_failed(
+                "old process still alive",
+                detail=f"pid {old_pid} still alive after {int(PID_WAIT_S)}s",
+                bot=bot_name,
+                symbol=symbol,
+            )
+            clear_pending_notify(bot_dir)
+            return EXIT_TIMEOUT
+    stagger = bool(getattr(args, "relogin_stagger", False))
+    held_slot = False
+    if stagger:
+        if not acquire_relogin_slot(bot_dir, wait_s=DEFAULT_RELOGIN_WAIT_S):
+            _emit_restart_failed(
+                "relogin stagger timed out",
+                detail=(f"could not lock .relogin.slot within "
+                        f"{int(DEFAULT_RELOGIN_WAIT_S)}s"),
+                bot=bot_name,
+                symbol=symbol,
+            )
+            clear_pending_notify(bot_dir)
+            return EXIT_TIMEOUT
+        held_slot = True
+    app = None
+    driver = None
+    code = EXIT_BOT_STOPPED
+    try:
+        app, code = _boot(policy_from_args(args), need_com=True)
+        if app is not None:
+            if stagger:
+                app._release_relogin_slot = lambda: release_relogin_slot(bot_dir)
+            driver = DeployDriver(app, args)
+            code = _drive_until_exit(driver, app)
+    except Exception as exc:
+        if old_pid > 0:
+            _fail_pending_replacement(
+                bot_dir, bot_name, "replacement deploy failed",
+                f"{type(exc).__name__}: {exc}", symbol)
+        raise
     finally:
-        _teardown(app)
+        # LeaveMonitor and root.destroy finish here, before any spawn.
+        if app is not None:
+            _teardown(app)
+        if held_slot:
+            release_relogin_slot(bot_dir)
+    if old_pid > 0 and code != EXIT_OK:
+        _fail_pending_replacement(
+            bot_dir, bot_name, "replacement deploy failed", f"exit {code}",
+            symbol)
+    return _spawn_pending_restart(driver, code)
 
 
 def _drive_until_exit(driver, app) -> int:
