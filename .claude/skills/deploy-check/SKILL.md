@@ -1,6 +1,6 @@
 ---
 name: deploy-check
-description: Verify a tai-robot deployment is wired correctly (news/vote paths, Discord notifications, regime leg strategies) and explain how to redeploy or restart a bot. Use when a bot needs restarting, a deploy looks misconfigured, votes or news signals never reach the bot, or the user asks how to redeploy.
+description: Audit a bot's deployment wiring without starting or stopping anything — news/vote paths in settings.yaml, Discord notification settings, regime leg strategies in session.json — plus the workbench redeploy recipe for semi_auto bots. Use after a deploy, when a deploy looks misconfigured, when Discord trade messages never arrive, or when votes exist but the bot never reads them. Starting, restarting or stopping a bot → deploy. Votes not being produced → bridge-health.
 ---
 
 # Deploy Check

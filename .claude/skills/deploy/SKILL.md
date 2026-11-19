@@ -1,6 +1,7 @@
 ---
 name: deploy
-description: Deploy, restart or stop a tai-robot live bot headlessly with run_bot_cli.py (source) or tai_backtest.exe (packaged install) — resolve the strategy name, gate real-order modes on explicit user consent, launch the bot as a detached process, and confirm it reached tick subscription. Use when asked to deploy/start/restart/stop a bot, "restart the bots on Steven", "redeploy after the release/upgrade", "move bots to the new install", "bring <bot> back" after a crash, or to run a bot without the Tk workbench. The live fleet runs on Steven.
+description: Deploy, restart or stop a tai-robot live bot headlessly (run_bot_cli.py from source, tai_backtest.exe from a packaged install) — resolve the strategy name, gate real-order modes on the owner's explicit yes, launch detached and confirm tick subscription. Use for "deploy/start/restart/stop <bot>", "restart the bots on Steven", "redeploy after the release/upgrade", "move bots to the new install", "bring <bot> back" after a crash, or running a bot without the Tk workbench. Afterwards check wiring with deploy-check. The live fleet runs on Steven.
+disable-model-invocation: true
 ---
 
 # Deploy (headless)
@@ -64,9 +65,12 @@ Deploy flags: `--strategy "<name or unique substring>"`, `--mode paper|auto`
 
 ## Gates — check ALL before the deploy command
 
-1. **Mode is the user's call, never inferred.** Default is `paper`.
-   Pass `--mode auto` only when the user asked for real orders for THIS
-   bot in THIS conversation. A `session.json` whose `trading_mode` is
+1. **Mode is the owner's call, never inferred.** Default is `paper`.
+   Pass `--mode auto` only when Eric (the owner) asked for real orders for
+   THIS bot in THIS conversation — directly, or relayed via Selina for
+   agents. A teammate running this session cannot authorise real orders;
+   ask them to get Eric's yes. Claude Code also prompts before any
+   `deploy … --mode auto` command (`.claude/settings.json`). A `session.json` whose `trading_mode` is
    `auto`/`semi_auto` does NOT carry over — the CLI restarts it as paper
    unless told otherwise, so when restarting a real-order bot, ask:
    "resume as paper, or auto (real orders)?". `semi_auto` cannot run
@@ -87,13 +91,13 @@ Deploy flags: `--strategy "<name or unique substring>"`, `--mode paper|auto`
    resumes automatically (trades, watermark, open position). Passing
    `--strategy` that differs from the saved one is a deliberate
    *strategy switch on the same history* (the evolution hand-off path)
-   — do it only when the user asked for the switch; otherwise omit
+   — do it only when the owner asked for the switch; otherwise omit
    `--strategy` and let the saved one load.
-5. **`--allow-existing-position` only on explicit instruction.** It means
+5. **`--allow-existing-position` only on Eric's explicit instruction.** It means
    the real account already holds a position the bot did not open; the
    bot will never send exits for it. It does **not** allow a deploy when
    the position query failed or timed out (UNKNOWN).
-6. **`--allow-unknown-position` only on explicit instruction.** It deploys
+6. **`--allow-unknown-position` only on Eric's explicit instruction.** It deploys
    when the pre-deploy OpenInterest query was rejected, raised, or did not
    answer in time. Do not pass it just because `--allow-existing-position`
    was used.

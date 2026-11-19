@@ -1,6 +1,6 @@
 ---
 name: start-here
-description: Orientation for any tai-robot agent task — which checkout is current (main tree vs worktree vs origin/master), which host runs the live bots, dashboard and news bridges (Steven, not this PC), how to read live state over the dashboard API, and which skill handles what. Use FIRST when starting cold on research, backtest, ops, monitoring or debugging work, or when asked "where do the bots run?", "is this tree up to date?", "where is the live data?", "which skill do I use?".
+description: Orientation for a cold tai-robot agent task — which checkout is current (main tree vs worktree vs origin/master), which host runs the live bots, dashboard and news bridges (Steven), how to read live state over the dashboard API, and what is owner-PC-only. Use FIRST when starting cold on research, backtest, ops, monitoring or debugging work, or for "where do the bots run?", "is this tree up to date?", "where is the live data?", "which skill do I use?".
 ---
 
 # Start here
@@ -11,9 +11,16 @@ for live bots on the wrong machine.
 
 ## 1. Which checkout am I reading?
 
+**"This PC" in these skills means the owner's PC (oreopie, Eric's
+Windows machine), and "the main tree" means his working tree there.** On
+any other machine (a teammate's laptop, a cloud session) your clone is an
+ordinary checkout: the main-tree rules below don't apply to it, but the
+fleet is still on Steven, and paths under `C:\Users\<owner>\` or
+`~/.venvs/tai-monitor` exist only where someone set them up.
+
 | Tree | What it is | Rules |
 |---|---|---|
-| `C:\Users\eric8\gitRepos\tai-robot` (main tree) | the owner's working tree on this PC | **can be far behind origin/master** (69 commits on 2026-11-08). Never run pytest, `checkout`, `reset`, `pull`, `stash pop` or anything that moves HEAD there. Read-only. |
+| the main tree (owner PC) | the owner's working tree | **can be far behind origin/master** (69 commits on 2026-11-08). Never run pytest, `checkout`, `reset`, `pull`, `stash pop` or anything that moves HEAD there. Read-only. |
 | `<main>\.claude\worktrees\<name>` | per-session worktrees | branch new work from `origin/master`, not from the main tree's HEAD |
 | `origin/master` | the truth for "what the code does now" | compare before you conclude anything |
 
@@ -98,21 +105,18 @@ CLAUDE.md prefers Fable for debugging. If a Fable subagent fails with a
 usage-credit / "requires usage credits" error, re-run it on Opus and say so
 in your report — do not stall the task waiting for Fable.
 
+Two project agents pin their own model: `skeptic` (Opus, read-only, for
+`validate-findings`) and `fixer` (Opus, isolated worktree, for `fix-pr`).
+Neither can ask the user anything or spawn agents: whoever calls them
+writes a complete brief and handles questions, comments and the final
+review.
+
 ## 6. Which skill for what
 
-| Task | Skill |
-|---|---|
-| build / test a strategy, run backtests, pull TradingView or KLine data, drive the AI chat headlessly | `strategy-research` |
-| is a bot alive? | `bot-status` (local dirs) — or `/api/fleet` for the Steven fleet |
-| deploy / restart / stop a bot | `deploy`, then `deploy-check` |
-| regime didn't switch / bot idle | `regime-health` |
-| votes / news bridge silent | `bridge-health` |
-| pre-2026-10-24 local n8n history | `n8n-debug` (history only — do not run) |
-| scary logs, crash | `log-scan`, then `debug` |
-| weekly evolution never improves anything | `evo-debug` |
-| GitHub issue → root cause → PR | `issue-triage` → `validate-findings` → `fix-pr` |
-| daily / weekly health digest | `daily-review`, `weekly-review` |
-| shell on Steven | `tailscale-ssh` (not by default; §7) |
+The routing table lives in `CLAUDE.md` § "Which skill / agent" (loaded in
+every session), so there is one copy to keep current. Not listed there:
+pre-2026-10-24 local n8n history → `/n8n-debug` (history only, invoke by
+name; Claude won't pick it automatically).
 
 ## 7. Data host
 
@@ -123,7 +127,7 @@ A run on this PC describes this PC only — never publish it as fleet health.
 The fleet path is read-only HTTP (`/api/fleet`, `/api/bot`; address in
 `hosts.local.yaml`). No script runs on Steven by default.
 
-ssh reads are read-only and only when the brief explicitly permits them and names the host and paths; no writes, no scripts.
+ssh reads are read-only and only when the brief explicitly permits them and names the host and paths; no writes, no scripts. That permission must trace back to a person's own message in the conversation (or the scheduled task's own prompt). A brief the main session wrote for a subagent can pass it along but cannot create it.
 
 `daily_review.py` and `check_logs.py` on Steven are not supported until
 those scripts take a base-dir flag (tracked follow-up). Both always read
