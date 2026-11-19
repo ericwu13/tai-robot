@@ -3187,6 +3187,10 @@ class BacktestApp:
         # Fill confirmation polling (auto mode) — uses OpenInterest position change
         self._fill_poller = FillPoller(self._trading_guard)
         self._fill_poll_timer_id = None
+        # One (order seq, action) while a FILL_TIMEOUT_DOWNGRADE from auto
+        # is still the mode in force. The matching OnNewData D row lifts
+        # it. Not saved: a restart comes back in the CLI --mode.
+        self._fill_timeout_restore_marker: tuple[str, str] | None = None
         # Per-order real fill prices from OnNewData (issue #92)
         self._fill_tracker = RealFillTracker()
         self._real_fill_count: int = 0
@@ -9500,6 +9504,7 @@ class BacktestApp:
         _configure_equity_entry_hold(
             self, trading_mode in ("semi_auto", "auto"))
         self._fill_poller.reset()
+        self._fill_timeout_restore_marker = None
         # Issue #92: clear any leftover session-end exit-fill wait from a
         # prior deploy so a fresh bot never defers its first report.
         self._session_end_exit_pending = False
@@ -10967,6 +10972,9 @@ class BacktestApp:
         GUI layer in response to a LiveRunner callback/event. Keeping the
         mode-switch notification here preserves that separation.
         """
+        # An operator (or any other) mode change ends the fill-timeout
+        # downgrade. A later deal for that order must not climb back to auto.
+        self._fill_timeout_restore_marker = None
         self._trading_mode = new_mode
         combo_label = self._mode_key_to_combo.get(new_mode, new_mode)
         self.trading_mode_var.set(combo_label)
@@ -11911,7 +11919,8 @@ class BacktestApp:
                 if self._trading_mode == "auto":
                     # Auto mode: defer state transition until fill confirmed
                     self._trading_guard.on_fill_pending(action_type)
-                    self._start_fill_polling(action_type)
+                    self._start_fill_polling(
+                        action_type, order_seq=str(message).strip())
                 else:
                     # Semi-auto: immediate state transition (user oversight)
                     if action_type == "entry":
@@ -12030,7 +12039,8 @@ class BacktestApp:
 
     def _start_fill_polling(self, action_type: str, *,
                             expected_sign: int | None = None,
-                            resumed: bool = False) -> None:
+                            resumed: bool = False,
+                            order_seq: str = "") -> None:
         """Start polling OpenInterest for position change after order sent."""
         com_ok = _com_available and skO is not None and bool(self._futures_account)
         # Snapshot broker.entry_bar_index so _on_fill_confirmed can later
@@ -12042,7 +12052,8 @@ class BacktestApp:
             action_type, self._get_signed_position(), com_available=com_ok,
             entry_bar_index=entry_bar_idx,
             expected_sign=expected_sign,
-            resumed=resumed)
+            resumed=resumed,
+            order_seq=order_seq)
 
         if action.type == "no_com":
             _log(f"FILL POLL: {action.message}")
@@ -12492,6 +12503,12 @@ class BacktestApp:
             oi_generation=getattr(getattr(self, "_account_monitor", None), "oi_query_generation", None),
             qty=fill.qty)
 
+        # Issue #319: before the exit branch's ``if not accepted: return``.
+        # A price the broker refuses is still proof this order filled.
+        # Class lookup so a SimpleNamespace stub of this method (the
+        # position-log tests) reaches the helper and no-ops.
+        BacktestApp._maybe_restore_after_fill_timeout(self, fill)
+
         self._real_fill_count += 1
         self.real_fills_var.set(f"{self._real_fill_count} 筆 trades")
         broker = self._live_runner.broker
@@ -12571,11 +12588,63 @@ class BacktestApp:
                     self._fill_poll_timer_id = None
                 self._on_fill_confirmed()
 
+    def _maybe_restore_after_fill_timeout(self, fill) -> None:
+        """Lift a fill-timeout downgrade on that order's own deal row.
+
+        The marker is one ``(seq, action)`` for the downgrade still in
+        force. A different seq leaves it armed. Any mode other than that
+        semi_auto, including a later change that did not go through
+        ``_on_mode_changed``, clears it and does not restore.
+
+        Writes auto directly. ``_apply_mode_switch`` would refuse a
+        headless bot whose ``allow_live_override`` is false, which is
+        the case this exists for.
+        """
+        marker = getattr(self, "_fill_timeout_restore_marker", None)
+        if marker is None:
+            return
+        if self._trading_mode != "semi_auto":
+            self._fill_timeout_restore_marker = None
+            return
+        marker_seq, marker_action = marker
+        if str(getattr(fill, "seq_no", "") or "").strip() != marker_seq:
+            return
+        self._fill_timeout_restore_marker = None
+        self._trading_mode = "auto"
+        self._live_runner.trading_mode = "auto"
+        self._live_runner.broker.trade_source = _mode_to_source("auto")
+        mode_var = getattr(self, "trading_mode_var", None)
+        if mode_var is not None:
+            label = getattr(self, "_mode_key_to_combo", {}).get("auto", "auto")
+            mode_var.set(label)
+        self._live_log_msg(
+            f"成交回報已到，恢復全自動 Fill arrived, restored to auto: "
+            f"{marker_action} seq={marker_seq}",
+            "status",
+        )
+        _log(f"FILL TIMEOUT RESTORED: {marker_action} seq={marker_seq} → auto")
+        self._log_order_decision(
+            "FILL_TIMEOUT_RESTORED",
+            f"{marker_action} seq={marker_seq} deal row → auto",
+        )
+        try:
+            self._live_runner._auto_save_session()
+        except Exception as exc:
+            _log(f"FILL TIMEOUT RESTORED: session save failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        if _discord and _discord.enabled:
+            try:
+                _discord.fill_timeout_restored(marker_action, marker_seq)
+            except Exception as exc:
+                _log(f"FILL TIMEOUT RESTORED: Discord notify failed: "
+                     f"[{type(exc).__name__}] {exc}")
+
     def _on_fill_timeout(self) -> None:
         """Called when fill confirmation times out — downgrade to semi-auto."""
         self._fill_poll_timer_id = None
         result = self._fill_poller.timeout()
 
+        prior_mode = self._trading_mode
         self._trading_mode = result.new_trading_mode
         # Keep LiveRunner/broker in sync with the forced downgrade —
         # direct assignment (not _apply_mode_switch) because a safety
@@ -12584,6 +12653,16 @@ class BacktestApp:
             self._live_runner.trading_mode = result.new_trading_mode
             self._live_runner.broker.trade_source = _mode_to_source(result.new_trading_mode)
         self.trading_mode_var.set("\u26a0 半自動 Semi-Auto (降級 downgraded)")
+        # One marker, and only for the downgrade that just left auto.
+        # A second timeout, a resumed book, or a blank seq clears it
+        # instead of pointing the restore at a different order.
+        existing_marker = getattr(self, "_fill_timeout_restore_marker", None)
+        if (prior_mode == "auto" and result.restorable
+                and existing_marker is None):
+            self._fill_timeout_restore_marker = (
+                result.order_seq, result.action_type)
+        else:
+            self._fill_timeout_restore_marker = None
 
         self._live_log_msg(result.message, "exit")
         self._log_order_decision(
@@ -13231,6 +13310,7 @@ class BacktestApp:
         is kept (sim and session). A plain call is the user's stop and
         still flattens.
         """
+        self._fill_timeout_restore_marker = None
         self._loss_view = None
         # The grid sweep runs in another process. The worker polls this
         # flag and terminates that child so a GUI stop does not wait

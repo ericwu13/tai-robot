@@ -567,3 +567,60 @@ class TestDealConfirmedIssue103:
         guard = TradingGuard()
         fp = FillPoller(guard)
         assert fp.FILL_POLL_TIMEOUT == 10.0
+
+
+# ── Issue #319: exact-order seq on a restorable timeout ──
+
+class TestOrderSeqRestorableIssue319:
+    """A live timeout with its own seq can be lifted later. A resumed
+    timeout, or a timeout with no seq, cannot.
+    """
+
+    def test_order_seq_stored_on_start_and_cleared_on_reset(self):
+        fp, _g = _make_poller()
+        fp.start("exit", 1, order_seq="  2315623892999  ")
+        assert fp._order_seq == "2315623892999"
+        fp.reset()
+        assert fp._order_seq == ""
+
+    def test_normal_timeout_with_seq_is_restorable(self):
+        fp, g = _make_poller()
+        g.on_fill_pending("exit")
+        fp.start("exit", 1, order_seq="2315623892999")
+        result = fp.timeout()
+        assert result.order_seq == "2315623892999"
+        assert result.restorable is True
+        assert result.new_trading_mode == "semi_auto"
+        assert fp.FILL_POLL_TIMEOUT == 10.0
+
+    @pytest.mark.parametrize("seq", ["", "   ", "\t"])
+    def test_blank_seq_is_not_restorable(self, seq):
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 0, order_seq=seq)
+        result = fp.timeout()
+        assert result.order_seq == ""
+        assert result.restorable is False
+
+    def test_resumed_mismatch_is_not_restorable(self):
+        """Early return: the book never showed the expected sign."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", -1, expected_sign=1, resumed=True,
+                 order_seq="2315623892999")
+        result = fp.timeout()
+        assert result.order_seq == "2315623892999"
+        assert result.restorable is False
+        assert g.fill_pending is True
+
+    def test_resumed_matching_sign_is_not_restorable(self):
+        """Fallthrough with resumed=True still must not arm a restore."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 1, expected_sign=1, resumed=True,
+                 order_seq="2315623892999")
+        result = fp.timeout()
+        assert result.order_seq == "2315623892999"
+        assert result.restorable is False
+        assert g.real_entry_confirmed is True
+        assert g.fill_pending is False
