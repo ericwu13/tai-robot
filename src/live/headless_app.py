@@ -664,14 +664,56 @@ def _deploy_bot_dir(args) -> str:
     return LiveRunner.bot_dir_for(base, args.symbol, args.bot)
 
 
-def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "") -> None:
-    rb._log("[HEADLESS] degraded auto-restart failed: "
-            + reason + (f" — {detail}" if detail else ""))
-    discord = getattr(rb, "_discord", None)
+def _resolve_discord(bot: str = "", symbol: str = ""):
+    """The live notifier, or one built from settings when deploy never reached it.
+
+    A replacement that dies at pid-wait, relogin, login, or the pre-deploy
+    position prompt has not run ``_deploy_live_continue``, so ``rb._discord``
+    is still None. An already installed notifier is returned as-is.
+    """
+    current = getattr(rb, "_discord", None)
+    if current is not None:
+        return current
+    load = getattr(rb, "_load_settings", None)
+    if not callable(load):
+        return None
+    try:
+        cfg = load() or {}
+    except Exception as exc:
+        rb._log(f"[HEADLESS] discord settings unreadable: "
+                f"[{type(exc).__name__}] {exc}")
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    token = str(cfg.get("discord_bot_token") or "").strip()
+    channel = str(cfg.get("discord_channel_id") or "").strip()
+    if not token or not channel:
+        return None
+    from src.live.discord_notify import DiscordNotifier
+    return DiscordNotifier(token, channel, bot_name=bot, symbol=symbol)
+
+
+def _flush_discord(discord) -> None:
     if discord is None or not getattr(discord, "enabled", False):
         return
-    method = getattr(discord, "degraded_restart_failed", None)
+    flush = getattr(discord, "flush", None)
+    if not callable(flush):
+        return
     try:
+        flush(timeout_s=5.0)
+    except Exception as exc:
+        rb._log(f"[HEADLESS] discord flush failed: [{type(exc).__name__}] {exc}")
+
+
+def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
+                         symbol: str = "") -> None:
+    rb._log("[HEADLESS] degraded auto-restart failed: "
+            + reason + (f" — {detail}" if detail else ""))
+    discord = _resolve_discord(bot=bot, symbol=symbol)
+    if discord is None or not getattr(discord, "enabled", False):
+        return
+    try:
+        method = getattr(discord, "degraded_restart_failed", None)
         if callable(method):
             method(reason, detail=detail, bot=bot)
         else:
@@ -679,13 +721,16 @@ def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "") -> Non
                 f"自動重啟失敗 Auto-restart failed: {reason} {detail}",
                 priority=True,
             )
+        flush = getattr(discord, "flush", None)
+        if callable(flush):
+            flush(timeout_s=5.0)
     except Exception as exc:
         rb._log(f"[HEADLESS] restart-failed alert failed: "
                 f"[{type(exc).__name__}] {exc}")
 
 
 def _fail_pending_replacement(bot_dir: str, bot_name: str, reason: str,
-                             detail: str) -> None:
+                             detail: str, symbol: str = "") -> None:
     """Alert when a ``--wait-for-pid`` child never reached live ticks.
 
     ``pending_notify`` stays true only until tick subscription. Clearing
@@ -698,7 +743,7 @@ def _fail_pending_replacement(bot_dir: str, bot_name: str, reason: str,
     data = load_auto_restart(bot_dir)
     if not isinstance(data, dict) or data.get("pending_notify") is not True:
         return
-    _emit_restart_failed(reason, detail=detail, bot=bot_name)
+    _emit_restart_failed(reason, detail=detail, bot=bot_name, symbol=symbol)
     clear_pending_notify(bot_dir)
 
 
@@ -714,15 +759,18 @@ def _spawn_pending_restart(driver, code: int) -> int:
         from src.paths import project_root
         spawn_detached(cmd, stdout_path, cwd=project_root())
     except OSError as exc:
+        symbol = str(getattr(getattr(driver, "args", None), "symbol", "") or "")
         _emit_restart_failed(
             "spawn failed",
             detail=f"{type(exc).__name__}: {exc}",
             bot=os.path.basename(bot_dir),
+            symbol=symbol,
         )
         if bot_dir:
             from src.live.degraded_restart import clear_pending_notify
             clear_pending_notify(bot_dir)
         return EXIT_BOT_STOPPED
+    _flush_discord(getattr(rb, "_discord", None))
     return code
 
 
@@ -734,6 +782,7 @@ def run_deploy(args) -> int:
 
     bot_dir = _deploy_bot_dir(args)
     bot_name = str(getattr(args, "bot", "") or "")
+    symbol = str(getattr(args, "symbol", "") or "")
     old_pid = int(getattr(args, "wait_for_pid", 0) or 0)
     if old_pid > 0:
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
@@ -741,6 +790,7 @@ def run_deploy(args) -> int:
                 "old process still alive",
                 detail=f"pid {old_pid} still alive after {int(PID_WAIT_S)}s",
                 bot=bot_name,
+                symbol=symbol,
             )
             clear_pending_notify(bot_dir)
             return EXIT_TIMEOUT
@@ -753,6 +803,7 @@ def run_deploy(args) -> int:
                 detail=(f"could not lock .relogin.slot within "
                         f"{int(DEFAULT_RELOGIN_WAIT_S)}s"),
                 bot=bot_name,
+                symbol=symbol,
             )
             clear_pending_notify(bot_dir)
             return EXIT_TIMEOUT
@@ -771,7 +822,7 @@ def run_deploy(args) -> int:
         if old_pid > 0:
             _fail_pending_replacement(
                 bot_dir, bot_name, "replacement deploy failed",
-                f"{type(exc).__name__}: {exc}")
+                f"{type(exc).__name__}: {exc}", symbol)
         raise
     finally:
         # LeaveMonitor and root.destroy finish here, before any spawn.
@@ -781,7 +832,8 @@ def run_deploy(args) -> int:
             release_relogin_slot(bot_dir)
     if old_pid > 0 and code != EXIT_OK:
         _fail_pending_replacement(
-            bot_dir, bot_name, "replacement deploy failed", f"exit {code}")
+            bot_dir, bot_name, "replacement deploy failed", f"exit {code}",
+            symbol)
     return _spawn_pending_restart(driver, code)
 
 

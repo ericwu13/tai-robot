@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
+import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -1159,3 +1162,178 @@ def test_src_live_does_not_import_src_evolution():
                 else:
                     continue
                 assert not any("evolution" in module for module in modules), path
+
+
+def _settings_with_discord():
+    return {"discord_bot_token": "tok", "discord_channel_id": "999"}
+
+
+def _slow_deliver(box, delay_s=0.08):
+    def _deliver(self, content, target):
+        time.sleep(delay_s)
+        box.append((time.monotonic(), content))
+        return True
+    return _deliver
+
+
+def test_missing_discord_still_delivers_before_run_deploy_returns(
+        tmp_path, monkeypatch):
+    """rb._discord is None until deploy. The alert must still leave the process."""
+    import src.live.headless_app as ha
+    from src.live.discord_notify import DiscordNotifier
+
+    _patch_project(monkeypatch, tmp_path)
+    sent = []
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", _settings_with_discord)
+    monkeypatch.setattr(DiscordNotifier, "_deliver", _slow_deliver(sent))
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: False))
+    app = SimpleNamespace(root=SimpleNamespace(), _release_relogin_slot=None)
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (app, EXIT_OK))
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
+
+    def _run(exit_code):
+        sent.clear()
+        args, bot_dir = _deploy_args(tmp_path, wait_for_pid=81)
+        _plant_pending(bot_dir)
+        monkeypatch.setattr(
+            ha, "_drive_until_exit", lambda *_a, **_k: exit_code)
+        code = run_deploy(args)
+        finished = time.monotonic()
+        assert code == exit_code
+        assert sent, "alert was not delivered before run_deploy returned"
+        assert sent[0][0] <= finished
+        assert "replacement deploy failed" in sent[0][1]
+        assert _pending(bot_dir)["pending_notify"] is False
+        assert _pending(bot_dir)["session_key"] == SESSION
+
+    _run(EXIT_DEPLOY_REFUSED)
+    _run(EXIT_LOGIN)
+
+
+def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
+        tmp_path, monkeypatch):
+    import src.live.headless_app as ha
+    from src.live.discord_notify import DiscordNotifier
+
+    _patch_project(monkeypatch, tmp_path)
+    sent = []
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", _settings_with_discord)
+    monkeypatch.setattr(DiscordNotifier, "_deliver", _slow_deliver(sent))
+    clock = {"t": 0.0}
+
+    def _mono():
+        clock["t"] += dr.DEFAULT_RELOGIN_WAIT_S
+        return clock["t"]
+
+    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(dr.time, "monotonic", _mono)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
+
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=82)
+    _plant_pending(bot_dir)
+    code = run_deploy(args)
+    finished = time.monotonic()
+    assert code != EXIT_OK
+    assert sent and sent[-1][0] <= finished
+    assert "old process still alive" in sent[-1][1]
+    assert _pending(bot_dir)["pending_notify"] is False
+
+    sent.clear()
+    clock["t"] = 0.0
+    args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
+    _plant_pending(bot_dir)
+    assert dr.acquire_relogin_slot(bot_dir, wait_s=1, poll_s=0.01)
+    try:
+        code = run_deploy(args)
+    finally:
+        dr.release_relogin_slot(bot_dir)
+    finished = time.monotonic()
+    assert code != EXIT_OK
+    assert sent and sent[-1][0] <= finished
+    assert "relogin stagger timed out" in sent[-1][1]
+    assert _pending(bot_dir)["pending_notify"] is False
+    assert _pending(bot_dir)["session_key"] == SESSION
+
+
+def test_empty_discord_settings_log_and_still_clear_pending(tmp_path, monkeypatch, capsys):
+    import src.live.headless_app as ha
+    from src.live.discord_notify import DiscordNotifier
+
+    def _boom(self, content, target):
+        raise AssertionError("empty settings must not send")
+
+    _patch_project(monkeypatch, tmp_path)
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", lambda: {
+        "discord_bot_token": "", "discord_channel_id": "",
+    })
+    monkeypatch.setattr(DiscordNotifier, "_deliver", _boom)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: False))
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (None, EXIT_DEPLOY_REFUSED))
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=83)
+    _plant_pending(bot_dir)
+    code = run_deploy(args)
+    assert code == EXIT_DEPLOY_REFUSED
+    assert _pending(bot_dir)["pending_notify"] is False
+    assert _pending(bot_dir)["session_key"] == SESSION
+    assert "replacement deploy failed" in capsys.readouterr().out
+
+
+def test_flush_waits_for_a_priority_send_and_times_out_when_it_blocks():
+    from src.live.discord_notify import DiscordNotifier
+
+    delivered = threading.Event()
+
+    def _deliver(content, target):
+        time.sleep(0.12)
+        delivered.set()
+        return True
+
+    note = DiscordNotifier("tok", "999", bot_name="night1", symbol="TMF00")
+    note._deliver = _deliver
+    note.degraded_restart_failed("replacement deploy failed", detail="exit 4", bot="night1")
+    assert note.flush(timeout_s=2.0) is True
+    assert delivered.is_set()
+
+    def _block(content, target):
+        time.sleep(2.0)
+        return True
+
+    stuck = DiscordNotifier("tok", "999")
+    stuck._deliver = _block
+    stuck.degraded_restart_failed("stuck", detail="x", bot="b")
+    started = time.monotonic()
+    assert stuck.flush(timeout_s=0.15) is False
+    assert time.monotonic() - started < 1.0
+
+
+def test_emit_restart_failed_finishes_the_send_before_the_process_exits(tmp_path):
+    marker = tmp_path / "delivered"
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    script = (
+        "import time\n"
+        "import run_backtest as rb\n"
+        "from src.live.discord_notify import DiscordNotifier\n"
+        "import src.live.headless_app as ha\n"
+        "def _deliver(self, content, target):\n"
+        f"    time.sleep(0.15)\n"
+        f"    open({str(marker)!r}, 'w', encoding='utf-8').write('ok')\n"
+        "    return True\n"
+        "DiscordNotifier._deliver = _deliver\n"
+        "rb._discord = None\n"
+        "rb._load_settings = lambda: "
+        "{'discord_bot_token': 't', 'discord_channel_id': '1'}\n"
+        "ha._emit_restart_failed('replacement deploy failed', "
+        "detail='exit 4', bot='night1', symbol='TMF00')\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo, env=env, timeout=20, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert marker.is_file(), proc.stderr
+

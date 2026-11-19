@@ -86,6 +86,7 @@ class DiscordNotifier:
         self._priority_backlog: deque = deque()
         self._state_lock = threading.Lock()
         self._work_ready = threading.Condition(self._state_lock)
+        self._idle_ready = threading.Condition(self._state_lock)
         self._worker: threading.Thread | None = None
         self._worker_lock = threading.Lock()
         self._in_flight = False
@@ -176,6 +177,23 @@ class DiscordNotifier:
             self._worker = worker
             worker.start()
 
+    def flush(self, timeout_s: float = 5.0) -> bool:
+        """Wait until the worker is idle, or until ``timeout_s`` elapses.
+
+        Normal sends stay non-blocking. A process that is about to exit
+        calls this so a priority alert is posted before the daemon worker
+        is killed. True means nothing is queued and nothing is in flight.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._state_lock:
+            while (self._in_flight or self._priority_backlog
+                   or not self._queue.empty()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._idle_ready.wait(timeout=remaining)
+            return True
+
     def _enqueue_priority(self, item) -> None:
         """Park one priority message. Wake the worker; do not touch the queue."""
         content, target, priority, tries, _waited = item
@@ -224,8 +242,6 @@ class DiscordNotifier:
             sent_ok = False
             try:
                 item, from_backlog, queued = self._next_item()
-                with self._state_lock:
-                    self._in_flight = True
                 content, target = item[0], item[1]
                 ok = self._deliver(content, target)
                 sent_ok = True
@@ -248,6 +264,8 @@ class DiscordNotifier:
             finally:
                 with self._state_lock:
                     self._in_flight = False
+                    if not self._priority_backlog and self._queue.empty():
+                        self._idle_ready.notify_all()
                 if queued:
                     self._queue.task_done()
 
@@ -286,8 +304,12 @@ class DiscordNotifier:
             while not self._priority_backlog and self._queue.empty():
                 self._work_ready.wait()
             if self._priority_backlog:
-                return self._priority_backlog.popleft(), True, False
-            return self._queue.get_nowait(), False, True
+                item = self._priority_backlog.popleft()
+                self._in_flight = True
+                return item, True, False
+            item = self._queue.get_nowait()
+            self._in_flight = True
+            return item, False, True
 
     def _post_stall_summary(self) -> None:
         """One catch-up line after a successful send, once the backlog is empty.
