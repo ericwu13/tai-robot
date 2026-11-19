@@ -7,7 +7,7 @@ name: Auto-merge gate
 #   - re-reads the live pull request in scripts/ci/auto_merge_gate.py and
 #     stops unless it is open, same-repo, and targeting master
 # trigger-sage is read-only and is the only job that receives the Sage
-# webhook secrets. approval-gate can write the status, resolve a bot thread,
+# webhook secrets. eval-approval-gate can write the status, resolve a bot thread,
 # and enable auto-merge, and it does not receive those secrets.
 
 on:
@@ -49,7 +49,7 @@ jobs:
           SAGE_REVIEW_WEBHOOK_KEY: ${{ secrets.SAGE_REVIEW_WEBHOOK_KEY }}
         run: python3 scripts/ci/auto_merge_gate.py trigger-sage
 
-  approval-gate:
+  eval-approval-gate:
     if: >-
       github.event.pull_request.state == 'open' &&
       github.event.pull_request.head.repo.full_name == github.repository &&

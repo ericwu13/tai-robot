@@ -955,8 +955,8 @@ def test_workflow_yaml_is_least_privilege():
     doc = yaml.safe_load(text)
     assert doc["name"] == "Auto-merge gate"
     jobs = doc["jobs"]
-    assert set(jobs) == {"trigger-sage", "approval-gate"}
-    trig, gate = jobs["trigger-sage"], jobs["approval-gate"]
+    assert set(jobs) == {"trigger-sage", "eval-approval-gate"}
+    trig, gate = jobs["trigger-sage"], jobs["eval-approval-gate"]
     assert trig["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert gate["permissions"] == {
         "contents": "write",
@@ -994,3 +994,12 @@ def test_workflow_yaml_is_least_privilege():
                   "converted_to_draft", "labeled", "unlabeled", "submitted", "dismissed"):
         assert token in text
     assert "pull_request.head.sha" not in text
+
+
+def test_workflow_job_names_do_not_collide_with_status_context():
+    """The Actions check name must not be the commit-status context."""
+    text = (ROOT / ".github/workflows/auto-merge.yml").read_text(encoding="utf-8")
+    doc = yaml.safe_load(text)
+    for job_key, job_cfg in doc["jobs"].items():
+        assert job_key != mod.STATUS_CONTEXT
+        assert (job_cfg or {}).get("name") != mod.STATUS_CONTEXT
