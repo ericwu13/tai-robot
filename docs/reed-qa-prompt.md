@@ -11,9 +11,7 @@ What changed from reed-qa-v2:
 - Reed's role and severity come from `AGENTS.md` and `CLAUDE.md` instead of
   being restated. v2 disagreed with them on who owns severity and on P3
   threads.
-- Eric's approved scope, complexity and evidence rules (live in the automation
-  since 2026-11-14) are kept word for word in section 2a. Review is
-  headless-only: GUI scenarios are out of scope and closed as won't-fix.
+- Eric's approved scope, complexity and evidence rules are kept word for word in section 2a.
 - Reed's own job is spelled out: run the touched tests, and for a bug fix,
   confirm the new tests fail on the base commit.
 - A short checklist for agent and CI config changes (`CLAUDE.md`, `AGENTS.md`,
