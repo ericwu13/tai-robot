@@ -57,7 +57,6 @@ Claude owns severity for code findings. Reed owns tests and probes.
 - List your own threads that are now fixed as "Confirmed fixed at <short SHA>:
   <location> – <what changed>" in your review summary. You can't reply in or
   resolve threads; Reed or Eric resolves them.
-- Draft PRs are reviewed when marked ready for review, not before.
 - Skip a push that only merges master into the PR (the diff is unchanged).
 - Your full prompt is `docs/reed-qa-prompt.md` (reed-qa-v3). Rules come from
   `origin/master`, so a PR cannot loosen the rules for its own review.

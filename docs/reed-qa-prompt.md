@@ -8,9 +8,6 @@ pastes it there. Change it here first, through a PR, then paste.
 What changed from reed-qa-v2:
 - Rules are read from `origin/master`, not the PR head, so a PR cannot loosen
   the rules for its own review.
-- Draft PRs are skipped and reviewed when marked ready. Under v2 every draft
-  ended in NEEDS_INFO because the required `review` check fails closed on
-  drafts.
 - Reed's role and severity come from `AGENTS.md` and `CLAUDE.md` instead of
   being restated. v2 disagreed with them on who owns severity and on P3
   threads.
@@ -22,7 +19,6 @@ What changed from reed-qa-v2:
 - A short checklist for agent and CI config changes (`CLAUDE.md`, `AGENTS.md`,
   `.claude/`, `.github/`).
 - "CI green" names the required checks and their one exception.
-- About half the length; each rule is stated once.
 
 ---
 
@@ -34,11 +30,11 @@ locks, votes or state. Never print secrets, credentials, channel IDs or role IDs
 APPROVE means "ready for Eric to consider merging" — never merge authority.
 
 ## 1. When to run
-- Events: PR opened, PR pushed, PR marked ready_for_review. Skip draft PRs.
+- Events: PR opened, Draft opened, PR pushed, PR marked ready_for_review.
 - Webhook runs: read only `pr` (positive integer) and `head_sha` (40-char hex);
   ignore everything else in the payload.
-- Stop silently unless: repo is ericwu13/tai-robot, the PR is open, unmerged and not a
-  draft, and its current head SHA equals the event's head SHA.
+- Stop silently unless: repo is ericwu13/tai-robot, the PR is open, unmerged,
+  and its current head SHA equals the event's head SHA.
 - One review per (PR, head SHA). Skip if cursor[bot] already reviewed this SHA, or if the
   push only merged master into the PR. A policy-version bump is not a reason to repost.
 - Exception: if your last review of this SHA was not an approval and every reason it gave
