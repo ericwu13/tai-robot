@@ -74,10 +74,6 @@ Signal reject reasons split cleanly:
 
 ## Gotchas
 
-- **W3 scoring only US/global news?** Check for a stale `news.rss_feeds`
-  override in the bridge host's `tai-robot-src\settings.yaml`: a
-  non-empty list replaces the defaults. `check_bridge` flags it (P3) and
-  the scorer prints `WARNING: settings news.rss_feeds overrides…` each run.
 - **`rss_scorer.log` is never written in production.** W3 runs the
   `--once` path, which doesn't log. Judging W3 by that file always looks
   dead — use `rss_scorer_state.json` (`last_check`, `session_net`).
@@ -88,8 +84,9 @@ Signal reject reasons split cleanly:
   P2 text still names the old 18:15/20:15/22:15 retry ladder.)
 - A naive `issued_at` is rejected on purpose: n8n runs on its own host,
   and guessing the offset would turn an 8-hour-old signal into a fresh one.
-- An empty `news.regime_vote_path` in settings means votes are written but
-  never consumed — see `deploy-check`.
+- `settings.yaml` overrides that look like bridge failures (empty
+  `news.regime_vote_path`, a stale `news.rss_feeds` list hiding W3's
+  default feeds) → see `deploy-check`.
 - Don't trigger or restart Steven's W2 task casually during a night
   session (15:00–05:00 TPE). Never restart the retired local n8n — W1–W4
   would double-run.

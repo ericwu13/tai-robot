@@ -68,18 +68,12 @@ must be one of `long` / `short` / `idle`.
   A headless bot refuses `auto`, `real`, and any other live/real-money
   mode from that file (`allow_live_override` does not bypass it); `paper`
   still applies. `deploy --mode auto` is unchanged.
-- **Empty `news.regime_vote_path` is the historical miswiring**: with `""`
-  the runner's `_read_regime_vote` is inert, so every W2/W3/W4 vote file
-  expires unread and the regime brain silently runs vote-free. It looks
-  identical to "the bridges produced no votes" — check the setting first.
-- **A non-empty `news.rss_feeds` replaces W3's default feeds wholesale.**
-  After a release that changes the defaults, an install that copied the
-  old list keeps scoring the old feeds (Steven ran the 5 pre-#266 feeds,
-  one dead, for days after 13 shipped). `check_bridge` reports it as P3
-  "W3 settings news.rss_feeds overrides the defaults…"; the fix is to
-  empty the list (`rss_feeds: []`) unless the override is deliberate.
-  After any upgrade, diff the install's `settings.yaml` against
-  `settings.example.yaml` for keys whose defaults moved.
+- **A stale `settings.yaml` value silently beats the code; check it first.**
+  Empty `news.regime_vote_path`: every W2/W3/W4 vote expires unread (looks
+  like "no votes produced"). A non-empty list such as `news.rss_feeds`
+  replaces the shipped defaults, so an old copied list survives upgrades
+  (`check_bridge` P3). After any upgrade, diff it against
+  `settings.example.yaml`.
 - Relative news paths resolve against the project root, not the EXE's
   cwd. Absolute paths are what the Steven bridge tasks write (`C:\Users\Traderbot\n8n-bridge\`).
 - `session.json` is the deploy dialog's pre-fill source; if it is corrupt
