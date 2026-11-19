@@ -753,14 +753,8 @@ def test_run_deploy_aborts_before_login_when_old_pid_stays_alive(
     booted = []
     discord = _Discord()
     monkeypatch.setattr(rb, "_discord", discord)
-    clock = {"t": 0.0}
-
-    def _mono():
-        clock["t"] += 30.0
-        return clock["t"]
-
-    monkeypatch.setattr(dr.time, "monotonic", _mono)
-    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
+    monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
     monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
     monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: booted.append("boot"))
     code = run_deploy(args)
@@ -848,14 +842,8 @@ def test_relogin_timeout_alerts_and_does_not_log_in(tmp_path, monkeypatch):
     monkeypatch.setattr(rb, "_discord", discord)
     booted = []
     assert dr.acquire_relogin_slot(bot_dir, wait_s=1, poll_s=0.01)
-    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
-    clock = {"t": 0.0}
-
-    def _mono():
-        clock["t"] += dr.DEFAULT_RELOGIN_WAIT_S
-        return clock["t"]
-
-    monkeypatch.setattr(dr.time, "monotonic", _mono)
+    monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
+    monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
     monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: booted.append(1))
     try:
         code = run_deploy(args)
@@ -1092,14 +1080,8 @@ def test_early_handoff_failures_clear_pending_notify(tmp_path, monkeypatch):
     _patch_project(monkeypatch, tmp_path)
     discord = _Discord()
     monkeypatch.setattr(rb, "_discord", discord)
-    clock = {"t": 0.0}
-
-    def _mono():
-        clock["t"] += dr.DEFAULT_RELOGIN_WAIT_S
-        return clock["t"]
-
-    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(dr.time, "monotonic", _mono)
+    monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
+    monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
     monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
 
     args, bot_dir = _deploy_args(tmp_path, wait_for_pid=55)
@@ -1111,7 +1093,6 @@ def test_early_handoff_failures_clear_pending_notify(tmp_path, monkeypatch):
     assert _pending(bot_dir)["session_key"] == SESSION
 
     discord.failed.clear()
-    clock["t"] = 0.0
     args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
     _plant_pending(bot_dir)
     assert dr.acquire_relogin_slot(bot_dir, wait_s=1, poll_s=0.01)
@@ -1221,14 +1202,8 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     monkeypatch.setattr(rb, "_discord", None)
     monkeypatch.setattr(rb, "_load_settings", _settings_with_discord)
     monkeypatch.setattr(DiscordNotifier, "_deliver", _slow_deliver(sent))
-    clock = {"t": 0.0}
-
-    def _mono():
-        clock["t"] += dr.DEFAULT_RELOGIN_WAIT_S
-        return clock["t"]
-
-    monkeypatch.setattr(dr.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(dr.time, "monotonic", _mono)
+    monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
+    monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
     monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
 
     args, bot_dir = _deploy_args(tmp_path, wait_for_pid=82)
@@ -1241,7 +1216,6 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     assert _pending(bot_dir)["pending_notify"] is False
 
     sent.clear()
-    clock["t"] = 0.0
     args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
     _plant_pending(bot_dir)
     assert dr.acquire_relogin_slot(bot_dir, wait_s=1, poll_s=0.01)
