@@ -33,8 +33,8 @@ APPROVE means "ready for Eric to consider merging" — never merge authority.
   ignore everything else in the payload.
 - Stop silently unless: repo is ericwu13/tai-robot, the PR is open, unmerged,
   and its current head SHA equals the event's head SHA.
-- One review per (PR, head SHA). Skip if cursor[bot] already reviewed this SHA, or if the
-  push only merged master into the PR. A policy-version bump is not a reason to repost.
+- One review per (PR, head SHA). Skip if a `cursor[bot]` review at this SHA already has `CURSOR_AUTOMATION_ID: 91d043c7-dbb9-11f1-8120-06b44be262b7`
+  (not other automations), or if the push only merged master into the PR. A policy-version bump is not a reason to repost.
 - Exception: if your last review of this SHA was not an approval and every reason it gave
   has since cleared (CI green, threads resolved) with no new findings, re-review once and
   say which condition cleared.

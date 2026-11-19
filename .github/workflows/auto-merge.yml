@@ -1,0 +1,91 @@
+name: Auto-merge gate
+
+# Public-repo workflow. pull_request_target runs the copy of this file that
+# is already on master and can see secrets, so every job:
+#   - checks out master only (sparse scripts/ci), never the PR head
+#   - passes the PR number and other inputs through env, never inside run:
+#   - re-reads the live pull request in scripts/ci/auto_merge_gate.py and
+#     stops unless it is open, same-repo, and targeting master
+# trigger-sage is read-only and is the only job that receives the Sage
+# webhook secrets. eval-approval-gate can write the status, resolve a bot thread,
+# and enable auto-merge, and it does not receive those secrets.
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+jobs:
+  trigger-sage:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'ready_for_review') &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'master'
+    concurrency:
+      group: trigger-sage-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Trigger Sage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SAGE_REVIEW_WEBHOOK_URL: ${{ secrets.SAGE_REVIEW_WEBHOOK_URL }}
+          SAGE_REVIEW_WEBHOOK_KEY: ${{ secrets.SAGE_REVIEW_WEBHOOK_KEY }}
+        run: python3 scripts/ci/auto_merge_gate.py trigger-sage
+
+  eval-approval-gate:
+    if: >-
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'master' &&
+      (
+        (
+          github.event_name == 'pull_request_target' &&
+          (
+            (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+            github.event.label.name == 'needs-owner'
+          )
+        ) ||
+        (
+          github.event_name == 'pull_request_review' &&
+          github.event.review.user.login == 'cursor[bot]'
+        )
+      )
+    concurrency:
+      group: auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Run approval gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 scripts/ci/auto_merge_gate.py gate
