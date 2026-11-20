@@ -140,6 +140,41 @@ TAIFEX_ADMIN_RULE = (
     "score neutral at low confidence. Market-wide margin hikes or trading halts are "
     "scored by their market impact.\n"
 )
+# Shadow score (``news.rss_shadow_score``, default off): a second Gemini
+# call per article that sees WHEN the article was published and what the
+# markets already did, and is told to score only news that is not priced
+# in yet. It is logged beside the live score (news_log) and kept as its own
+# session EMA in the state file — it never votes and never posts to
+# Discord. It exists to test, on live data, whether the live score's
+# tracking of price is reaction (headlines describing a move that already
+# happened) rather than prediction.
+SHADOW_PROMPT = """\
+You are a financial news analyst.  Judge whether this article carries NEW
+information that Taiwan equity futures (TAIEX / 台股加權指數) have NOT yet
+priced in, and its likely impact over the next 1-4 hours.
+
+Articles may be in English or Traditional Chinese (繁體中文) — analyse both equally.
+
+Respond with ONLY a JSON object — no markdown, no explanation:
+{{"direction": "bullish"|"bearish"|"neutral", "confidence": <float 0.0-1.0>, "reason": "<one sentence>"}}
+
+Rules:
+- An article that mainly REPORTS a market move that already happened (an index or stock up/down N points or %, closing or intraday market wraps, "stocks fell/rallied", 大漲/重挫/收盤/盤中/跌點) is neutral with confidence 0.1, unless it also reveals a new cause that markets have not reacted to yet.
+- Use the publication time and the market moves below: if the information is older than those moves or is already reflected in them, it is priced in → neutral, low confidence.
+- Score only genuinely new information: surprise policy or rate decisions, unexpected earnings/guidance (TSMC 台積電 ~30% of TAIEX), geopolitical events, large 外資 flow surprises, cross-strait developments.
+- "confidence" reflects how strongly the NEW information should move TAIEX futures, not how sure you are.
+- If unsure, default to neutral with confidence 0.2.
+
+Now (Taipei): {now}
+Published: {published} ({age})
+Market moves so far (change vs previous close, latest quote):
+{market}
+
+Headline: {headline}
+Summary: {summary}
+"""
+
+
 FEED_TIMEOUT_S = 20
 
 
@@ -181,6 +216,8 @@ def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
         "gemini_api_key": ai.get("google_api_key", ""),
         "discord_webhook_url": discord_webhook or news.get("discord_webhook") or "",
         "discord_mode": discord_mode(news.get("rss_discord")),
+        "shadow_score": news.get("rss_shadow_score") is True,
+        "signal_path": news.get("signal_path") or "",
     }
 
 
@@ -621,7 +658,12 @@ def score_article(headline: str, summary: str, api_key: str,
     gets the administrative-notice rule; every other source uses
     SCORING_PROMPT unchanged.
     """
-    prompt = scoring_prompt(headline, summary, source)
+    return _gemini_json(scoring_prompt(headline, summary, source), api_key)
+
+
+def _gemini_json(prompt: str, api_key: str) -> dict | None:
+    """One Gemini call → parsed JSON (None if unparseable). Raises
+    GeminiAPIError on HTTP/connection failure."""
     url = GEMINI_API_URL.format(model=GEMINI_MODEL, key=api_key)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
@@ -695,6 +737,116 @@ def score_articles(articles: list[dict], api_key: str) -> tuple[list[dict], list
         else:
             print(f"    [SKIP] {art['title'][:70]}")
     return results, scored_guids, api_error
+
+
+# ── Shadow score (logged only, never votes) ─────────────────────────────
+
+QUOTES_NAME = "crossmarket_quotes.json"   # W2's display-only sidecar beside signal.json
+MARKET_LINES_MAX = 12
+
+
+def market_context(signal_path: str, now: datetime) -> str:
+    """Lines for SHADOW_PROMPT from W2's quotes sidecar. Advisory: any
+    problem gives a placeholder line, never an exception."""
+    if not signal_path:
+        return "(no market data configured)"
+    try:
+        with open(Path(signal_path).parent / QUOTES_NAME, encoding="utf-8") as f:
+            data = json.load(f)
+        quotes = data.get("quotes") if isinstance(data, dict) else None
+        lines = []
+        for sym, q in (quotes or {}).items():
+            if not isinstance(q, dict) or q.get("pct") is None:
+                continue
+            when = ""
+            if q.get("quote_time"):
+                when = datetime.fromtimestamp(float(q["quote_time"]), _TZ_TAIPEI).strftime("%m-%d %H:%M")
+            state = "" if q.get("fresh") else " (market closed / stale)"
+            lines.append(f"- {sym}: {float(q['pct']):+.2f}% at {when}{state}")
+        return "\n".join(lines[:MARKET_LINES_MAX]) or "(no quotes available)"
+    except (OSError, ValueError, TypeError) as exc:
+        return f"(market data unavailable: {type(exc).__name__})"
+
+
+def shadow_prompt(article: dict, now: datetime, market: str) -> str:
+    pub = article.get("published_dt")
+    if isinstance(pub, datetime):
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        published = pub.astimezone(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+        age = f"{max(0, int((now - pub).total_seconds() // 60))} min ago"
+    else:
+        published, age = "unknown", "age unknown"
+    title = article.get("title") or ""
+    summary = article.get("summary") or ""
+    if summary.strip() == title.strip():
+        summary = ""
+    return SHADOW_PROMPT.format(now=now.astimezone(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
+                                published=published, age=age, market=market,
+                                headline=title, summary=summary[:500])
+
+
+def score_shadow(scored: list[dict], cfg: dict, now: datetime) -> str | None:
+    """Add ``item["shadow"]`` (a score dict, or None) to each scored item.
+
+    Runs after the live scoring and never changes it: a failure here only
+    leaves shadows empty. Returns an error string, or None.
+    """
+    market = market_context(cfg.get("signal_path") or "", now)
+    for i, item in enumerate(scored):
+        try:
+            sc = _gemini_json(shadow_prompt(item["article"], now, market), cfg["gemini_api_key"])
+        except GeminiAPIError as exc:
+            for rest in scored[i:]:
+                rest["shadow"] = None
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001 — the shadow must never cost the vote
+            sc = None
+            print(f"    shadow scoring failed: {type(exc).__name__}: {exc}")
+        if isinstance(sc, dict) and "direction" in sc and "confidence" in sc:
+            sc["direction"] = str(sc["direction"]).lower()
+            item["shadow"] = sc
+        else:
+            item["shadow"] = None
+    return None
+
+
+def _shadow_session_net(state: dict, session_key: str) -> float:
+    if state.get("shadow_session_key") != session_key:
+        return 0.0
+    return float(state.get("shadow_session_net", 0.0))
+
+
+# ── W3 vote withdrawal ───────────────────────────────────────────────────
+
+def withdraw_w3_vote(vote_out: str, session_key: str) -> bool:
+    """Remove the scorer's own W3 vote for *session_key* once that
+    session's score is back under the threshold. A vote for another
+    night, or a manual vote (``W3-manual``), is left alone. Never
+    raises; True = removed.
+    """
+    if not vote_out or not session_key:
+        return False
+    stem, ext = os.path.splitext(vote_out)
+    path = f"{stem}_w3{ext}"
+    try:
+        with open(path, encoding="utf-8") as f:
+            vote = json.load(f)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return False
+    if (not isinstance(vote, dict) or vote.get("source") != "W3"
+            or vote.get("expires_after_session") != session_key):
+        return False
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f"  vote withdraw failed (will retry next run): {exc}")
+        return False
+    return True
 
 
 # ── Aggregation ──────────────────────────────────────────────────────────
@@ -1113,12 +1265,26 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
 
+    shadow_net = shadow_cum = None
+    if cfg.get("shadow_score") and scored:
+        shadow_error = score_shadow(scored, cfg, now)
+        # Same volume scaling as the live score (#334), over the same run size.
+        shadow_net = _clipped_sum([{"score": item["shadow"]} for item in scored
+                                   if item.get("shadow")]) * run_scale(len(scored))
+        shadow_cum = round(_shadow_session_net(state, session_key) * EMA_DECAY + shadow_net, 4)
+        state["shadow_session_key"] = session_key
+        state["shadow_session_net"] = shadow_cum
+        state["shadow_error"] = shadow_error or ""
+        print(f"  shadow run net: {shadow_net:+.2f}, shadow session net: {shadow_cum:+.2f}"
+              + (f" (shadow error: {shadow_error})" if shadow_error else ""))
+
     log_path = cfg.get("news_log_path")
     if log_path and scored:
         records = [rss_news_log.build_record(
             item["article"], item["score"], scored_at=now, session=session_key,
-            run_net=net, session_net=cum, run_scale=run_scale(len(scored)))
-            for item in scored]
+            run_net=net, session_net=cum, run_scale=run_scale(len(scored)),
+            shadow=item.get("shadow") if shadow_net is not None else rss_news_log.NO_SHADOW,
+            shadow_run_net=shadow_net, shadow_session_net=shadow_cum) for item in scored]
         if not rss_news_log.append(log_path, records):
             print(f"  news history append failed: {log_path}")
 
@@ -1135,6 +1301,9 @@ def check_once(cfg: dict, state: dict, vote_out: str,
             print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
         except Exception as e:  # noqa: BLE001
             print(f"  vote write failed: {type(e).__name__}: {e}")
+    elif not direction and not api_error and withdraw_w3_vote(vote_out, session_key):
+        print(f"  VOTE WITHDRAWN: session net {cum:+.2f} back under "
+              f"±{SESSION_VOTE_THRESHOLD} -> removed W3 vote")
 
     def post(note=None):
         return post_discord_embed(cfg["discord_webhook_url"], direction, net, scored,

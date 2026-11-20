@@ -13,6 +13,14 @@ instance) but runs fine from a plain shell too.  Full framework design:
 | W4 | `chips_monitor.py` | daily 16:15 TPE | `regime_vote_w4.json` (institutional money flow) |
 | W5 | `n8n/W5_manual_tap.json` (webhook, no script) | on tap | `signal.json` via `crossmarket_monitor.py --force-fire` |
 
+W3 vote and shadow score: `regime_vote_w3.json` stands while that
+session's score is past ±1.5. A run whose scoring succeeded and ends
+back under it removes the vote for the session just scored (a
+`W3-manual` vote, or a vote for another session, is left alone).
+`news.rss_shadow_score: true` adds a research-only shadow score (publish
+time + W2 market moves, "not yet priced in"), logged beside the live score;
+it never votes.
+
 (W5 is the human-confirmation tap: a Discord link opens the n8n webhook,
 which fires a *signal*, not a vote.  It was historically numbered "W4" —
 if your n8n instance still shows a workflow named "W4 Manual tap", rename

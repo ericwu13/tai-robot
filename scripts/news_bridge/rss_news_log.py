@@ -113,15 +113,20 @@ def _iso(dt) -> str:
     return dt.astimezone(_TZ_TAIPEI).isoformat(timespec="seconds")
 
 
+NO_SHADOW = object()   # build_record(shadow=...) default: shadow scoring is off
+
+
 def build_record(article: dict, score: dict, *, scored_at: datetime,
                  session: str, run_net: float, session_net: float,
-                 run_scale: float = 1.0) -> dict:
+                 run_scale: float = 1.0,
+                 shadow=NO_SHADOW, shadow_run_net: float | None = None,
+                 shadow_session_net: float | None = None) -> dict:
     direction = str(score.get("direction", "neutral")).lower()
     try:
         confidence = round(max(0.0, min(1.0, float(score.get("confidence", 0)))), 3)
     except (TypeError, ValueError):
         confidence = 0.0
-    return {
+    record = {
         "v": SCHEMA_VERSION,
         "scored_at": _iso(scored_at),
         "published_at": _iso(article.get("published_dt")),
@@ -139,6 +144,24 @@ def build_record(article: dict, score: dict, *, scored_at: datetime,
         # Weight of this article in run_net (rss_scorer.run_scale).
         "run_scale": round(float(run_scale), 4),
     }
+    if shadow is not NO_SHADOW:
+        # The shadow ("not yet priced in") score; None = that call failed.
+        rec = {}
+        if isinstance(shadow, dict):
+            sd = str(shadow.get("direction", "neutral")).lower()
+            try:
+                sc = round(max(0.0, min(1.0, float(shadow.get("confidence", 0)))), 3)
+            except (TypeError, ValueError):
+                sc = 0.0
+            rec = {"shadow_score": signed_score(sd, sc),
+                   "shadow_reason": clean_text(str(shadow.get("reason", "")), 300)}
+        else:
+            rec = {"shadow_score": None, "shadow_reason": ""}
+        rec["shadow_run_net"] = None if shadow_run_net is None else round(float(shadow_run_net), 4)
+        rec["shadow_session_net"] = (None if shadow_session_net is None
+                                     else round(float(shadow_session_net), 4))
+        record.update(rec)
+    return record
 
 
 def month_path(path: str, month: str) -> str:
