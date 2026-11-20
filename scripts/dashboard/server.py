@@ -19,6 +19,9 @@ Serves one page plus two JSON endpoints built from ``snapshot``:
     GET /api/news/trend[?symbol=&after=]
                                  情緒走勢: every W3 scoring pass + 30-min index
                                  futures candles on one time axis
+    GET /api/chips/trend[?symbol=]
+                                 籌碼走勢: W4 foreign ΔOI / equity flow history
+                                 + day-session index futures candles
     GET /api/workflows           工作流程: W1-W5 status, last run, next due
     GET /position-log/<bot_id>[?limit=N]
                                  the bot's own fill-by-fill position vs the
@@ -60,7 +63,7 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from scripts.dashboard import (  # noqa: E402
-    control, news_feed, news_pulse, news_trend, pnl_history, position_log_view,
+    chips_trend, control, news_feed, news_pulse, news_trend, pnl_history, position_log_view,
     snapshot, workflows)
 from scripts.news_bridge import rss_news_log  # noqa: E402
 from scripts.monitor.common import default_base_dir, now_tpe  # noqa: E402
@@ -357,6 +360,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 body = self.cache.get(f"news-trend:{symbol}:{after}", lambda: _json(
                     news_trend.trend(self.news_log_path, self.base_dir, symbol,
                                      int(after) if after else None)))
+                self._send(200, body, "application/json; charset=utf-8")
+            elif url.path == "/api/chips/trend":
+                symbol = (query.get("symbol") or [""])[0]
+                if not _TREND_SYMBOL_RE.fullmatch(symbol):
+                    self._send(400, _json({"error": "bad symbol"}),
+                               "application/json; charset=utf-8")
+                    return
+                body = self.cache.get(f"chips-trend:{symbol}", lambda: _json(
+                    chips_trend.trend(self.news_paths, snapshot._read_json_dict,
+                                      self.base_dir, symbol)))
                 self._send(200, body, "application/json; charset=utf-8")
             elif url.path == "/api/workflows":
                 body = self.cache.get("workflows", lambda: _json(workflows.workflows(
