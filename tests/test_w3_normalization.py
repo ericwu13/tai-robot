@@ -61,6 +61,16 @@ def test_same_story_same_key(a, b):
     assert rss_scorer.story_key(a) and rss_scorer.story_key(a) == rss_scorer.story_key(b)
 
 
+def test_numeric_suffix_is_part_of_the_headline():
+    # Review P3 on #334: only a publisher-like suffix is stripped.
+    up = rss_scorer.story_key("鴻海10月營收創同期新高 - 年增20%")
+    down = rss_scorer.story_key("鴻海10月營收創同期新高 - 年減5%")
+    assert up and down and up != down
+    assert rss_scorer.story_key("鴻海10月營收創同期新高 - 經濟日報") == \
+        rss_scorer.story_key("鴻海10月營收創同期新高")
+    assert rss_scorer.story_key("Fed cuts rates - 25bp") != rss_scorer.story_key("Fed cuts rates - 50bp")
+
+
 def test_templated_headlines_stay_separate():
     # Recorded feeds: TAIFEX settlement notices and FactSet updates share a
     # long template but are different items.

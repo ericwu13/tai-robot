@@ -497,7 +497,9 @@ def dedup_articles(articles: list[dict], state: dict,
     return new
 
 
-_GN_PUBLISHER_RE = re.compile(r"\s+[-–—|]\s+[^-–—|]{1,40}$")
+# A trailing " - Publisher" (Google News). A suffix with a digit or % is
+# part of the headline ("營收創新高 - 年增20%"), never a publisher name.
+_GN_PUBLISHER_RE = re.compile(r"\s+[-–—|]\s+[^-–—|\d%％]{1,40}$")
 
 
 def story_key(title: str) -> str:
