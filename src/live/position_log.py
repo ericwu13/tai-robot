@@ -692,6 +692,52 @@ def last_record(path: str) -> dict | None:
     return recs[-1] if recs else None
 
 
+def replay_position(bot_dir: str, *,
+                    opener: Callable | None = None) -> tuple[int, str, str] | None:
+    """A bot's own position from its journal, read without touching it.
+
+    Same replay as :meth:`PositionLedger.recover`, on a throwaway ledger
+    that never writes. Returns ``(position, product, account)``: the
+    newest order's product and the newest line's account, ``""`` when the
+    journal names none. No journal → ``(0, "", "")`` (a bot that never
+    sent a real order). A journal that exists but cannot be read, a line
+    that does not parse (e.g. a write in progress), or a row the replay
+    rejects → ``None``: unknown, never 0.
+    """
+    path = os.path.join(bot_dir, POSITION_LOG_NAME)
+    if not os.path.exists(path):
+        return 0, "", ""
+    try:
+        with (opener or (lambda p: open(p, "rb")))(path) as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    rows = []
+    for line in blob.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(rec, dict):
+            return None
+        rows.append(rec)
+    ledger = PositionLedger(bot_dir, bot_id=os.path.basename(bot_dir))
+    account = ""
+    for row in rows:
+        try:
+            ledger._replay_one(row)
+        except Exception:  # noqa: BLE001
+            return None
+        account = str(row.get("account") or "") or account
+    product = ""
+    for order in ledger._orders.values():
+        product = str(order.get("product") or "") or product
+    return int(ledger.position), product, account
+
+
 def _is_legacy_line(rec: dict) -> bool:
     """A finalized pre-#252 record: no event type, action ENTRY/EXIT/RESUME."""
     if not isinstance(rec, dict) or rec.get("event") not in (None, ""):

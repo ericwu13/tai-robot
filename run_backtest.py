@@ -121,6 +121,8 @@ _CODE_GEN_MAX_TOKENS = 16384
 from src.live.live_runner import LiveRunner, LiveState, arm_headless_file_guard, is_market_open, seconds_until_market_open, minutes_until_session_close, should_defer_session_end_report, select_freshest_price, _next_session_open, _taipei_now, _TZ_TAIPEI
 from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.position_log import PositionLedger
+from src.live import shared_book as _shared_book
+from src.utils import fileio as _fileio
 from src.live.tick_watchdog import TickWatchdog
 from src.live.main_heartbeat import call_com, set_com_return_logger
 from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
@@ -1630,6 +1632,20 @@ def _split_open_interest_event(data) -> tuple[str, int | None]:
     if isinstance(data, str):
         return data, None
     return ("" if data is None else str(data)), None
+
+
+def _bot_process_alive(bot_dir: str) -> bool:
+    """The pid in ``<bot_dir>/.lock`` is running. Read-only.
+
+    Not ``LiveRunner.check_lock``: that deletes a stale lock, and this is
+    a read of another bot's directory.
+    """
+    text = _fileio.read_text(os.path.join(bot_dir, ".lock"))
+    try:
+        pid = int((text or "").strip())
+    except ValueError:
+        return False
+    return LiveRunner._pid_alive(pid)
 
 
 class BacktestApp:
@@ -9212,6 +9228,31 @@ class BacktestApp:
         """
         self._alert("恢復後沒有停損 No Stop After Restore", message)
 
+    def _resume_book_check(self, symbol: str, prefix: str, side: str) -> tuple[bool, str]:
+        """``resume_real_position_ok`` against the right book.
+
+        A bot alone on its product: the account net, as master. An
+        opted-in bot (``trading.shared_book_opt_in``): its own logged
+        position, and only while every lot on the account is accounted for
+        by the bots' own logs; anything else is ``unknown`` (no confirm,
+        manual review), because the net may be another bot's lot.
+        """
+        monitor = self._account_monitor
+        runner = self._live_runner
+        if runner is None or getattr(runner, "_shared_book_opt_in", False) is not True:
+            return resume_real_position_ok(
+                monitor.get_signed_position(prefix), side,
+                monitor.oi_snapshot_received)
+        if not monitor.oi_snapshot_received:
+            return False, "unknown"
+        att = self._shared_book_attribution(
+            runner.bot_dir, symbol, own_may_hold=True)
+        _log(f"[RESUME] shared book: {'accounted' if att.ok else 'not accounted'} "
+             f"({att.reason})")
+        if not att.ok:
+            return False, "unknown"
+        return resume_real_position_ok(att.own, side, True)
+
     def _reconcile_resumed_guard(self, resume_session, trading_mode, symbol) -> None:
         """Restore the fill gate and restart its poller (issues #79, #168).
 
@@ -9254,11 +9295,8 @@ class BacktestApp:
                 prefix = order_sym[:2] if order_sym else ""
                 sim_side = (self._live_runner.broker.position_side.value
                             if self._live_runner.broker.position_side else "")
-                real_ok, real_reason = resume_real_position_ok(
-                    self._account_monitor.get_signed_position(prefix),
-                    sim_side,
-                    self._account_monitor.oi_snapshot_received,
-                )
+                real_ok, real_reason = self._resume_book_check(
+                    symbol, prefix, sim_side)
             outcome = apply_resume_guard(
                 self._trading_guard,
                 position_open=True,
@@ -9313,11 +9351,8 @@ class BacktestApp:
                     order_sym = SYMBOL_CONFIG.get(symbol, {}).get(
                         "order_symbol", "")
                     prefix = order_sym[:2] if order_sym else ""
-                    real_ok, real_reason = resume_real_position_ok(
-                        self._account_monitor.get_signed_position(prefix),
-                        close_side,
-                        self._account_monitor.oi_snapshot_received,
-                    )
+                    real_ok, real_reason = self._resume_book_check(
+                        symbol, prefix, close_side)
                     if not real_ok:
                         self._live_log_msg(
                             "[RESUME] Flat sim, deferred close "
@@ -9664,7 +9699,20 @@ class BacktestApp:
                         "warn")
                     return False
             if trading_mode in ("semi_auto", "auto") and self._futures_account:
-                if self._account_monitor.has_open_positions():
+                shared_ok = False
+                # Class lookups: deploy-path test doubles are not BacktestApp.
+                if (self._account_monitor.has_open_positions()
+                        and BacktestApp._is_shared_book_bot(self, bot_name)):
+                    # Opted-in bot: lots that every bot's own log accounts
+                    # for are other bots' (or, on resume, this bot's own),
+                    # not an orphan. Anything else keeps the prompt.
+                    att = BacktestApp._shared_book_attribution(
+                        self, bot_dir, symbol, own_may_hold=bool(resume_session))
+                    shared_ok = att.ok
+                    _log(f"[SHARED BOOK] pre-deploy: "
+                         f"{'accounted' if att.ok else 'not accounted'} "
+                         f"({att.reason})")
+                if self._account_monitor.has_open_positions() and not shared_ok:
                     pos_parts = []
                     for p in self._account_monitor.positions:
                         if p.get("qty", 0) == 0:
@@ -11242,6 +11290,16 @@ class BacktestApp:
         monitor = self._account_monitor
         oi_done = monitor.oi_snapshot_received
         holding = oi_done and monitor.has_open_positions()
+        shared_note = ""
+        runner = self._live_runner
+        if (holding and runner is not None
+                and getattr(runner, "_shared_book_opt_in", False) is True):
+            # Opted-in bot: other bots' accounted lots do not block it; its
+            # own log must be flat (this paper process manages no lot).
+            att = self._shared_book_attribution(
+                runner.bot_dir, runner.symbol, own_may_hold=False)
+            holding = not att.ok
+            shared_note = f"（共用帳戶：{att.reason}）"
         rights_done = monitor.rights_seq > tracker.rights_seq_at_start
         step = tracker.poll(holding or (oi_done and rights_done))
         if step in (tracker.WAITING, tracker.IDLE):
@@ -11258,7 +11316,7 @@ class BacktestApp:
             return
         if holding:
             _refuse("帳戶已有未平倉部位，拒絕切換至全自動："
-                    + _mreq.format_positions(monitor.positions))
+                    + _mreq.format_positions(monitor.positions) + shared_note)
             return
         # A paper bot never checked the account's day P&L against a limit.
         # Check it against the new one now, or a real entry could go out
@@ -12116,6 +12174,35 @@ class BacktestApp:
                 if self._fill_poll_timer_id:
                     self.root.after_cancel(self._fill_poll_timer_id)
                 self._on_fill_confirmed()
+
+    def _is_shared_book_bot(self, bot_name: str) -> bool:
+        """``trading.shared_book_opt_in`` names this bot (boolean true)."""
+        settings = getattr(self, "_settings", None) or {}
+        return bot_name in (settings.get("shared_book_opt_in") or frozenset())
+
+    def _shared_book_attribution(self, bot_dir: str, symbol: str, *,
+                                 own_may_hold: bool) -> "_shared_book.Attribution":
+        """Are all of the account's lots on this product in bots' own logs?
+
+        Reads every sibling bot dir's ``position_log.jsonl`` (share-delete
+        handles, never writes) and the current OpenInterest rows. Any
+        failure answers "not accounted", so callers keep master's path.
+        """
+        try:
+            order_sym = SYMBOL_CONFIG.get(symbol, {}).get("order_symbol", "")
+            prefix = order_sym[:2] if order_sym else ""
+            bot_dir = os.path.normpath(bot_dir)
+            positions = _shared_book.fleet_positions(
+                os.path.dirname(bot_dir), prefix,
+                own_name=os.path.basename(bot_dir),
+                account=str(getattr(self, "_futures_account", "") or ""),
+                alive=_bot_process_alive, opener=_fileio.open_shared)
+            return _shared_book.attribute(
+                list(self._account_monitor.positions), prefix, FUTURES_OI_MARKET,
+                positions, os.path.basename(bot_dir), own_may_hold=own_may_hold)
+        except Exception as exc:  # noqa: BLE001
+            return _shared_book.Attribution(
+                False, f"check failed: [{type(exc).__name__}] {exc}")
 
     def _shared_book_reason(self) -> str:
         """Why the account net cannot confirm this bot's order, or "".
