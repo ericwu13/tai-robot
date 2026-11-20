@@ -581,6 +581,11 @@ def _load_settings():
                 trading.get("dashboard_auto_opt_in"))
             cfg["mode_switch_max_loss_ntd"] = _mreq.parse_mode_switch_loss_caps(
                 trading.get("mode_switch_max_loss_ntd"))
+            # Per-bot: other real bots trade this product on this account,
+            # so the account net never confirms this bot's fills. Same
+            # rule as the opt-in above: only boolean true counts.
+            cfg["shared_book_opt_in"] = _mreq.parse_dashboard_auto_opt_in(
+                trading.get("shared_book_opt_in"))
             # Pre-fill for the deploy dialog / CLI. The real-order gate
             # is per deploy (persisted in session.json); this is only the
             # default offered. Distinct from risk.max_daily_loss, which
@@ -9817,6 +9822,8 @@ class BacktestApp:
         self._live_runner._allow_live_override = self._settings.get("allow_live_override", False)
         _opt_in = self._settings.get("dashboard_auto_opt_in") or frozenset()
         self._live_runner._dashboard_auto_opt_in = bot_name in _opt_in
+        _shared = self._settings.get("shared_book_opt_in") or frozenset()
+        self._live_runner._shared_book_opt_in = bot_name in _shared
         _caps = self._settings.get("mode_switch_max_loss_ntd") or {}
         self._live_runner._mode_switch_loss_cap = _mreq.effective_loss_cap(
             _caps.get(bot_name))
@@ -12110,6 +12117,37 @@ class BacktestApp:
                     self.root.after_cancel(self._fill_poll_timer_id)
                 self._on_fill_confirmed()
 
+    def _shared_book_reason(self) -> str:
+        """Why the account net cannot confirm this bot's order, or "".
+
+        The OpenInterest book has one net row per product. It proves this
+        bot's fill only while the bot holds that whole row. It does not
+        when the bot is opted in to ``trading.shared_book_opt_in`` (other
+        real bots trade this product), or when the last answered net
+        differs from the bot's own position in ``PositionLedger`` (another
+        bot or a manual order holds a lot). While the net is unknown, or
+        own fills are still waiting for a snapshot, there is no evidence
+        of another position and the master behaviour stays. Never raises.
+        """
+        runner = self._live_runner
+        if runner is not None and getattr(runner, "_shared_book_opt_in", False) is True:
+            return "trading.shared_book_opt_in"
+        ledger = getattr(self, "_position_ledger", None)
+        monitor = getattr(self, "_account_monitor", None)
+        if ledger is None or monitor is None:
+            return ""
+        try:
+            if not monitor.oi_snapshot_received or ledger.pending_count:
+                return ""
+            own = int(ledger.position)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"FILL POLL: shared-book check failed: [{type(exc).__name__}] {exc}")
+            return ""
+        net = self._position_log_net()
+        if net is None or net == own:
+            return ""
+        return f"account net {net:+d} != own position {own:+d}"
+
     def _start_fill_polling(self, action_type: str, *,
                             expected_sign: int | None = None,
                             resumed: bool = False,
@@ -12121,12 +12159,14 @@ class BacktestApp:
         # CURRENT trade and not a previously closed one (issue #45 race).
         entry_bar_idx = (self._live_runner.broker.entry_bar_index
                          if self._live_runner else 0)
+        shared_reason = self._shared_book_reason()
         action = self._fill_poller.start(
             action_type, self._get_signed_position(), com_available=com_ok,
             entry_bar_index=entry_bar_idx,
             expected_sign=expected_sign,
             resumed=resumed,
-            order_seq=order_seq)
+            order_seq=order_seq,
+            shared_book=bool(shared_reason))
 
         if action.type == "no_com":
             _log(f"FILL POLL: {action.message}")
@@ -12135,6 +12175,12 @@ class BacktestApp:
         self._live_log_msg(action.message, "status")
         _log(f"FILL POLL START: type={action_type} "
              f"position_before={self._fill_poller.pos_before}")
+        if shared_reason:
+            _log(f"FILL POLL: shared book ({shared_reason}) — only this "
+                 f"order's own deal row confirms; a timeout halts real orders")
+            self._log_order_decision(
+                "FILL_POLL_SHARED_BOOK",
+                f"{action_type} seq={order_seq or '?'} {shared_reason}")
 
         if action.type == "already_confirmed":
             _log("FILL POLL: exit already flat — confirming immediately")
@@ -12738,12 +12784,23 @@ class BacktestApp:
             self._fill_timeout_restore_marker = None
 
         self._live_log_msg(result.message, "exit")
-        self._log_order_decision(
-            "FILL_TIMEOUT_DOWNGRADE",
-            f"{result.action_type} timeout {result.timeout_seconds:.0f}s → {result.new_trading_mode}")
-        _log(f"FILL POLL DOWNGRADE: {result.message}")
-        if _discord and _discord.enabled:
-            _discord.fill_timeout_downgrade(result.action_type, result.timeout_seconds)
+        if result.position_unknown:
+            # Shared book: nothing was assumed, the guard is halted.
+            self._log_order_decision(
+                "FILL_TIMEOUT_POSITION_UNKNOWN",
+                f"{result.action_type} seq={result.order_seq or '?'} timeout "
+                f"{result.timeout_seconds:.0f}s → halted, {result.new_trading_mode}")
+            _log(f"FILL POLL HALT: {result.message}")
+            if _discord and _discord.enabled:
+                _discord.fill_timeout_position_unknown(
+                    result.action_type, result.timeout_seconds, result.order_seq)
+        else:
+            self._log_order_decision(
+                "FILL_TIMEOUT_DOWNGRADE",
+                f"{result.action_type} timeout {result.timeout_seconds:.0f}s → {result.new_trading_mode}")
+            _log(f"FILL POLL DOWNGRADE: {result.message}")
+            if _discord and _discord.enabled:
+                _discord.fill_timeout_downgrade(result.action_type, result.timeout_seconds)
 
         try:
             import winsound

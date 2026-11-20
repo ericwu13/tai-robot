@@ -60,6 +60,9 @@ class TradingConfig:
     # Bot name -> max loss limit (NT$) for that switch. May only lower
     # MAX_MODE_SWITCH_LOSS_LIMIT_NTD. A higher number is ignored.
     mode_switch_max_loss_ntd: dict = field(default_factory=dict)
+    # Bot name -> true when other real bots trade the same product on
+    # this account: only the bot's own deal rows confirm its fills.
+    shared_book_opt_in: dict = field(default_factory=dict)
 
 
 @dataclass

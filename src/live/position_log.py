@@ -1,6 +1,8 @@
 """Per-bot position log — data foundation for several real bots per account.
 
-Data collection only: nothing here feeds a trading decision.
+The ledger never sends or blocks an order itself. One trading decision
+reads it: ``BacktestApp._shared_book_reason`` compares ``position`` with
+the account net to tell whether that net is this bot's alone.
 
 The account's OpenInterest book is one NET row per product, so a bot
 cannot see its own position in it once another bot (or a manual order)
@@ -146,6 +148,15 @@ class PositionLedger:
         self._recovered = False
         self._resume_written = False
         self._legacy_anchor: dict | None = None
+
+    @property
+    def pending_count(self) -> int:
+        """Own fills that no later OpenInterest snapshot has answered yet.
+
+        While this is non-zero the last account net may not include them,
+        so net minus ``position`` is not a measure of anyone else's lot.
+        """
+        return len(self._pending)
 
     # ── helpers ──
 
