@@ -1189,7 +1189,7 @@ const App = {
       tile("偏多 / 偏空 / 中性", el("span", null, el("span", { class: "up" }, fmtInt(sm.bullish || 0)), " / ",
         el("span", { class: "down" }, fmtInt(sm.bearish || 0)), " / ", el("span", { class: "muted" }, fmtInt(sm.neutral || 0)))),
       tile("計票分數合計", el("div", null, signedSpan(sm.net_clipped),
-        el("div", { class: "sub", title: "原始分數加總 " + signedText(sm.net) }, "每則以 ±0.5 計（與投票相同），未含衰減"))),
+        el("div", { class: "sub", title: "原始分數加總 " + signedText(sm.net) }, "每則先限縮至 ±0.5，再乘該輪 run_scale（與投票相同），未含衰減"))),
       tile("最後評分", latest ? el("div", null, ago(isoAgo(latest.scored_at)),
         el("div", { class: "sub" }, tpeShort(latest.scored_at))) : "—"),
     );

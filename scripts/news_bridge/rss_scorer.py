@@ -614,6 +614,18 @@ def mark_seen(state: dict, guids: list[str]) -> dict:
     return state
 
 
+def _mark_seen_scored_duplicates(state: dict, dup_stories: list[dict],
+                                 now: datetime) -> None:
+    """Mark a duplicate GUID seen only after a copy of that story has a usable score.
+
+    The others stay unseen, so the next pass can score them. A kept copy
+    is marked by ``mark_seen(scored_guids)`` whether or not its score was usable.
+    """
+    usable = set(_live_stories(state, now))
+    mark_seen(state, [art["guid"] for art in dup_stories
+                      if art.get("guid") and story_key(art.get("title", "")) in usable])
+
+
 # ── Gemini scoring ───────────────────────────────────────────────────────
 
 _DIR_RE = re.compile(r'"direction"\s*:\s*"(bullish|bearish|neutral)"')
@@ -1210,9 +1222,6 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     new_articles = dedup_articles(articles, state, now=now)
     new_articles, dup_stories = dedup_stories(new_articles, state, now)
-    if dup_stories:
-        # Same story as one already scored: never send it to Gemini.
-        mark_seen(state, [a["guid"] for a in dup_stories if a.get("guid")])
     print(f"  {len(articles)} recent articles, {len(new_articles)} new"
           f" ({len(dup_stories)} duplicate stories skipped)")
     state["last_fetched"] = len(articles)
@@ -1222,6 +1231,7 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     session_key = night_session_key(now)
 
     if not new_articles:
+        _mark_seen_scored_duplicates(state, dup_stories, now)
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
 
@@ -1232,6 +1242,7 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     # another outlet's copy.
     remember_stories(state, new_articles,
                      [item["article"]["guid"] for item in scored], now)
+    _mark_seen_scored_duplicates(state, dup_stories, now)
     api_error = api_error or unusable_scores_error(scored, scored_guids)
     record_scoring_result(state, now, api_error,
                           skipped=len(scored_guids) - len(scored))

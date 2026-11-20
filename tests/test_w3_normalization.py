@@ -171,6 +171,66 @@ def test_skipped_copy_is_not_remembered_so_the_other_outlet_is_scored(score, fee
     assert rss_scorer.story_key(title) in state["recent_stories"]
 
 
+@patch("rss_scorer.fetch_all_feeds")
+@patch("rss_scorer.score_article")
+def test_same_run_skip_leaves_the_other_copy_for_the_next_pass(score, feeds, tmp_path):
+    """Both copies arrive together. A [SKIP] on the kept copy must not
+    consume the other outlet's GUID.
+
+    Direct feeds are listed before Google News, so the kept copy is the
+    one that just failed. The echo stays unseen and is scored next pass.
+    """
+    title = "台股暴挫2200點 綠燈一片 鴻海跌幅逆勢"
+    feeds.return_value = [_art("g1", title), _art("y1", f"{title} - Yahoo股市")]
+
+    def _answer(headline, summary, api_key, source=""):
+        if headline == title:
+            return None
+        return {"direction": "bearish", "confidence": 1.0, "reason": "r"}
+
+    score.side_effect = _answer
+    vote = str(tmp_path / "regime_vote.json")
+    cfg = _cfg(tmp_path)
+    state = rss_scorer.check_once(cfg, {"seen_guids": []}, vote, now=NOW)
+
+    assert score.call_count == 1
+    assert score.call_args.args[0] == title
+    assert state["seen_guids"] == ["g1"]
+    key = rss_scorer.story_key(title)
+    assert key not in (state.get("recent_stories") or {})
+
+    score.reset_mock()
+    state = rss_scorer.check_once(cfg, state, vote, now=NOW + timedelta(minutes=30))
+
+    assert score.call_count == 1
+    assert score.call_args.args[0] == f"{title} - Yahoo股市"
+    assert state["session_net"] == pytest.approx(-0.5)
+    assert key in state["recent_stories"]
+    assert "y1" in state["seen_guids"]
+
+
+@patch("rss_scorer.fetch_all_feeds")
+@patch("rss_scorer.score_article")
+def test_scored_kept_copy_marks_the_same_run_duplicate_seen(score, feeds, tmp_path):
+    """When the kept copy scores, the other outlet is seen and the next
+    pass does not send it to Gemini."""
+    title = "台股暴挫2200點 綠燈一片 鴻海跌幅逆勢"
+    feeds.return_value = [_art("g1", title), _art("y1", f"{title} - Yahoo股市")]
+    score.return_value = {"direction": "bearish", "confidence": 1.0, "reason": "r"}
+    vote = str(tmp_path / "regime_vote.json")
+    cfg = _cfg(tmp_path)
+    state = rss_scorer.check_once(cfg, {"seen_guids": []}, vote, now=NOW)
+
+    assert score.call_count == 1
+    assert "y1" in state["seen_guids"]
+    assert rss_scorer.story_key(title) in state["recent_stories"]
+
+    score.reset_mock()
+    state = rss_scorer.check_once(cfg, state, vote, now=NOW + timedelta(minutes=30))
+    assert score.call_count == 0
+    assert state["last_dup_stories"] == 0
+
+
 # ── dashboard numbers follow run_scale ───────────────────────────────────
 
 def test_drivers_weight_by_run_scale():
@@ -252,6 +312,37 @@ def test_dry_run_writes_nothing_and_apply_keeps_a_backup(tmp_path):
     st = json.loads(state.read_text(encoding="utf-8"))
     assert st["session_net"] == pytest.approx(-0.2) and st["seen_guids"] == ["x"]
     assert st["recent_runs"] == [pytest.approx(-0.2)]
+
+
+def test_rescale_processes_the_base_file_and_the_monthly_file(tmp_path):
+    text = "".join(_history())
+    base = tmp_path / "news_log.jsonl"
+    month = tmp_path / "news_log_202611.jsonl"
+    base.write_text(text, encoding="utf-8")
+    month.write_text(text, encoding="utf-8")
+    state = tmp_path / "rss_scorer_state.json"
+    state.write_text(json.dumps({"session_key": "2026-11-20|NIGHT", "session_net": -76.8,
+                                 "session_peak": -77.0, "seen_guids": ["x"]}), encoding="utf-8")
+
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state)]) == 0
+    assert base.read_text(encoding="utf-8") == text
+    assert month.read_text(encoding="utf-8") == text
+    assert json.loads(state.read_text(encoding="utf-8"))["session_net"] == -76.8
+    assert list(tmp_path.glob("*.bak-*")) == []
+
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
+    expected = "".join(rescale_news_log.rescale(_history())[0])
+    assert base.read_text(encoding="utf-8") == expected
+    assert month.read_text(encoding="utf-8") == expected
+    assert expected != text
+    assert len(list(tmp_path.glob("news_log.jsonl.bak-*"))) == 1
+    assert len(list(tmp_path.glob("news_log_202611.jsonl.bak-*"))) == 1
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["session_net"] == pytest.approx(-0.2) and st["seen_guids"] == ["x"]
+
+    assert rescale_news_log.main(["--log", str(base), "--apply"]) == 0
+    assert base.read_text(encoding="utf-8") == expected
+    assert month.read_text(encoding="utf-8") == expected
 
 
 def test_state_for_another_session_is_left_alone(tmp_path):
