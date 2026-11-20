@@ -713,9 +713,13 @@ def test_approval_on_second_review_page_counts(monkeypatch):
 
 # ---- merge fallback --------------------------------------------------------
 
-def test_clean_status_falls_back_to_direct_squash(monkeypatch):
+@pytest.mark.parametrize("detail", [
+    "GraphQL: Pull request is in clean status\n",
+    "GraphQL: Pull request is in unstable status (enablePullRequestAutoMerge)\n",
+], ids=["clean", "unstable"])
+def test_clean_status_falls_back_to_direct_squash(monkeypatch, detail):
     merges = [
-        (1, "", "GraphQL: Pull request is in clean status\n"),
+        (1, "", detail),
         (0, "merged\n", ""),
     ]
     rc, world = _gate(
@@ -755,23 +759,31 @@ def test_already_merged_on_fallback_is_success(monkeypatch):
     assert world.merge_calls() == [_auto(), _direct()]
 
 
-def test_non_clean_error_does_not_merge_directly(monkeypatch, capsys):
+@pytest.mark.parametrize("detail", [
+    "merge conflict on src/a.py",
+    "GraphQL: random failure (enablePullRequestAutoMerge)",
+], ids=["conflict", "graphql"])
+def test_non_clean_error_does_not_merge_directly(monkeypatch, capsys, detail):
     rc, world = _gate(
         monkeypatch,
         files=[{"filename": "src/a.py"}],
         reviews=[review("APPROVED", REED)],
-        merges=[(1, "", "merge conflict on src/a.py")],
+        merges=[(1, "", detail)],
     )
     assert rc == 1
     assert world.merge_calls() == [_auto()]
     err = capsys.readouterr().err
-    assert "merge conflict" in err
+    assert detail.strip() in err
     _assert_no_admin(world)
 
 
-def test_fallback_error_does_not_retry_again(monkeypatch):
+@pytest.mark.parametrize("detail", [
+    "Pull request is in clean status",
+    "Pull request is in unstable status",
+], ids=["clean", "unstable"])
+def test_fallback_error_does_not_retry_again(monkeypatch, detail):
     merges = [
-        (1, "", "Pull request is in clean status"),
+        (1, "", detail),
         (2, "", "required status check missing"),
     ]
     rc, world = _gate(
