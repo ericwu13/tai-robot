@@ -37,7 +37,7 @@ Settings block (in settings.yaml under ``news``)::
       rss_feeds:                 # empty = DEFAULT_FEEDS
       rss_interval_minutes: 30
       rss_state_file: data/rss_scorer_state.json
-      rss_news_log: ""   # per-article JSONL history; empty = <state dir>/news/news_log.jsonl
+      rss_news_log: ""   # per-article JSONL history base name; empty = <state dir>/news/news_log.jsonl (written as news_log_YYYYMM.jsonl)
       rss_discord: errors  # off | errors | changes | all
 
 Every article Gemini scores is appended to that history (``rss_news_log.py``)

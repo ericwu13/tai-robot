@@ -6,6 +6,13 @@ articles moved the vote. This file is that record: every article Gemini
 scored is appended once (the scorer's GUID dedup guarantees once), with
 the run/session context the vote was computed from.
 
+Files: one per calendar month (TPE) of ``scored_at``, beside the configured
+path — ``news_log.jsonl`` -> ``news_log_202611.jsonl``. Append-only, never
+trimmed or rewritten, so history keeps growing (~5-20 MB a month) and a
+finished month never changes again (readers cache it). A ``news_log.jsonl``
+left from before the split is still read as the oldest history, never
+written. ``log_files()`` is the one place that knows the layout.
+
 Stdlib only, no side effects on import: the dashboard imports it too.
 
 Record (all strings TPE ISO-8601 unless noted)::
@@ -33,10 +40,7 @@ SCHEMA_VERSION = 1
 LOG_DIRNAME = "news"
 LOG_FILENAME = "news_log.jsonl"
 SUMMARY_MAX_CHARS = 300
-# ~600 B/record, a few hundred records a day: ~20 MB is weeks of history.
-# Past it, the oldest lines are dropped (same self-trimming as the run log).
-MAX_BYTES = 20_000_000
-KEEP_LINES = 30_000
+_MONTH_RE = re.compile(r"_(\d{6})$")
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -137,26 +141,51 @@ def build_record(article: dict, score: dict, *, scored_at: datetime,
     }
 
 
+def month_path(path: str, month: str) -> str:
+    """``.../news_log.jsonl`` + ``202611`` -> ``.../news_log_202611.jsonl``."""
+    p = Path(path)
+    return str(p.with_name(f"{p.stem}_{month}{p.suffix}"))
+
+
+def log_files(path: str) -> list[str]:
+    """Existing history files for ``path``, oldest first: the pre-split
+    single file (if any), then the monthly files in month order."""
+    p = Path(path)
+    out = [str(p)] if p.is_file() else []
+    try:
+        months = []
+        for f in p.parent.iterdir():
+            m = _MONTH_RE.search(f.stem) if f.suffix == p.suffix else None
+            if m and f.stem == f"{p.stem}_{m.group(1)}" and f.is_file():
+                months.append((m.group(1), str(f)))
+    except OSError:
+        months = []
+    return out + [f for _, f in sorted(months)]
+
+
+def _month(record: dict) -> str:
+    stamp = str(record.get("scored_at") or "")
+    if len(stamp) >= 7 and stamp[4] == "-":
+        return stamp[:4] + stamp[5:7]
+    return datetime.now(_TZ_TAIPEI).strftime("%Y%m")
+
+
 def append(path: str, records: list[dict]) -> bool:
-    """Append records; trim to the newest KEEP_LINES past MAX_BYTES.
+    """Append records to their month's file (no trimming, no rewrite).
 
     Never raises — losing a history line must not cost the vote.
     """
     if not records:
         return True
     try:
-        out = Path(path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "a", encoding="utf-8", newline="\n") as f:
-            for rec in records:
-                f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-        if out.stat().st_size > MAX_BYTES:
-            with open(out, encoding="utf-8") as f:
-                kept = f.readlines()[-KEEP_LINES:]
-            tmp = str(out) + ".tmp"
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                f.writelines(kept)
-            os.replace(tmp, out)
+        by_month: dict[str, list[dict]] = {}
+        for rec in records:
+            by_month.setdefault(_month(rec), []).append(rec)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        for month, recs in by_month.items():
+            with open(month_path(path, month), "a", encoding="utf-8", newline="\n") as f:
+                for rec in recs:
+                    f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
         return True
     except Exception:  # noqa: BLE001
         return False

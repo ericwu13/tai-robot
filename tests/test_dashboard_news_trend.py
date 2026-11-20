@@ -162,3 +162,58 @@ def test_trend_endpoint_rejects_bad_queries(trend_server, query):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(trend_server + "/api/news/trend?" + query, timeout=10)
     assert exc.value.code == 400
+
+
+# ── momentum comparison line ─────────────────────────────────────────────
+
+def _run(t, session, net):
+    return {"t": t, "session": session, "session_net": net}
+
+
+def _candle(t, close):
+    return {"time": t, "open": close, "high": close, "low": close, "close": close}
+
+
+def test_ghost_uses_the_scorers_ema():
+    from scripts.news_bridge import rss_scorer
+    assert news_trend.ema_decay() == rss_scorer.EMA_DECAY
+
+
+def test_ghost_follows_price_through_the_ema_and_resets_per_session():
+    d = news_trend.ema_decay()
+    c = [_candle(_ct(2026, 8, 4, 15, 0), 100), _candle(_ct(2026, 8, 4, 15, 30), 110),
+         _candle(_ct(2026, 8, 4, 16, 0), 105), _candle(_ct(2026, 8, 5, 8, 45), 90)]
+    runs = [_run(_ct(2026, 8, 4, 15, 0), "A", 0.0),     # no candle has ended yet -> None
+            _run(_ct(2026, 8, 4, 15, 30), "A", 1.0),    # px 100 (15:00 candle ended)
+            _run(_ct(2026, 8, 4, 16, 0), "A", 2.0),     # px 110: +10
+            _run(_ct(2026, 8, 4, 16, 30), "A", 3.0),    # px 105: -5
+            _run(_ct(2026, 8, 5, 9, 30), "B", -1.0)]    # px 90, new session: reset to the move
+    g = news_trend.momentum_ghost(runs, c)
+    assert g[0] is None
+    raw = [0.0, 10.0, 10.0 * d - 5, -15.0]
+    k = news_trend._median_abs([1.0, 2.0, 3.0, -1.0]) / news_trend._median_abs(raw)
+    assert g[1:] == [round(x * k, 3) for x in raw]
+
+
+def test_ghost_scale_is_robust_to_one_huge_day():
+    c = [_candle(_ct(2026, 8, 4, 15, 0) + i * 1800, 100 + (i % 2) * 10) for i in range(9)]
+    runs = [_run(_ct(2026, 8, 4, 15, 30) + i * 1800, "A", 2.0) for i in range(8)]
+    calm = news_trend.momentum_ghost(runs, c)
+    runs[-1]["session_net"] = -500.0                       # one crash reading
+    assert news_trend.momentum_ghost(runs, c) == calm
+
+
+def test_ghost_never_reads_a_candle_that_had_not_closed():
+    c = [_candle(_ct(2026, 8, 4, 15, 0), 100), _candle(_ct(2026, 8, 4, 15, 30), 999)]
+    runs = [_run(_ct(2026, 8, 4, 15, 30), "A", 1.0), _run(_ct(2026, 8, 4, 15, 59), "A", 2.0)]
+    g = news_trend.momentum_ghost(runs, c)
+    assert g == [0.0, 0.0]          # both runs still see 100; 999 closes at 16:00
+
+
+def test_trend_runs_carry_the_ghost(tmp_path):
+    log = _log(tmp_path, [_row("2026-08-04T20:00:00+08:00", 0.5, run_net=0.5, session_net=0.5),
+                          _row("2026-08-04T21:00:00+08:00", 0.5, run_net=0.5, session_net=1.0)])
+    _bot(tmp_path / "live", "TX00_a", {"20260804": [("2026/08/04 19:00", 100, 101, 99, 100),
+                                                    ("2026/08/04 20:10", 120, 121, 119, 120)]})
+    out = news_trend.trend(log, str(tmp_path / "live"))
+    assert [r["ghost"] for r in out["runs"]][0] == 0.0 and out["runs"][1]["ghost"] is not None

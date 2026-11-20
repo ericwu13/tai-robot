@@ -89,15 +89,28 @@ def test_source_name_prefers_the_publisher():
     assert rss_news_log.source_name(None, "", "https://feeds.example.com/rss") == "feeds.example.com"
 
 
-def test_append_trims_oldest_past_the_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(rss_news_log, "MAX_BYTES", 2000)
-    monkeypatch.setattr(rss_news_log, "KEEP_LINES", 5)
+def test_append_goes_to_the_records_month_and_never_trims(tmp_path):
     path = tmp_path / "news" / "news_log.jsonl"
-    for i in range(30):
-        assert rss_news_log.append(str(path), [{"i": i, "pad": "x" * 100}])
-    lines = path.read_text(encoding="utf-8").splitlines()
-    assert [json.loads(x)["i"] for x in lines][-1] == 29
-    assert len(lines) <= 5 + 15                    # trimmed at least once
+    for i in range(300):
+        assert rss_news_log.append(str(path), [{"i": i, "scored_at": "2026-11-30T23:30:00+08:00",
+                                                "pad": "x" * 100}])
+    assert rss_news_log.append(str(path), [{"i": 300, "scored_at": "2026-12-01T00:00:00+08:00"}])
+    nov = tmp_path / "news" / "news_log_202611.jsonl"
+    dec = tmp_path / "news" / "news_log_202612.jsonl"
+    assert [json.loads(x)["i"] for x in nov.read_text(encoding="utf-8").splitlines()] == list(range(300))
+    assert [json.loads(x)["i"] for x in dec.read_text(encoding="utf-8").splitlines()] == [300]
+    assert not path.exists()                         # the base name itself is never written
+
+
+def test_log_files_lists_the_legacy_file_then_months_in_order(tmp_path):
+    d = tmp_path / "news"
+    d.mkdir()
+    for name in ("news_log_202612.jsonl", "news_log_202611.jsonl", "news_log.jsonl",
+                 "news_log_2026.jsonl", "other_202611.jsonl", "news_log_202611.jsonl.tmp"):
+        (d / name).write_text("{}\n", encoding="utf-8")
+    assert rss_news_log.log_files(str(d / "news_log.jsonl")) == [
+        str(d / "news_log.jsonl"), str(d / "news_log_202611.jsonl"), str(d / "news_log_202612.jsonl")]
+    assert rss_news_log.log_files(str(tmp_path / "missing" / "news_log.jsonl")) == []
 
 
 def test_append_never_raises(tmp_path):
@@ -118,6 +131,7 @@ def _cfg(log_path):
 @patch("rss_scorer.score_article")
 def test_every_scored_article_is_logged_once(mock_score, mock_feeds, tmp_path):
     log = tmp_path / "news" / "news_log.jsonl"
+    month = tmp_path / "news" / "news_log_202608.jsonl"
     mock_feeds.return_value = [_article("g1", "TSMC beats"), _article("g2", "Fed holds",
                                                                      link="javascript:alert(1)")]
     mock_score.side_effect = [
@@ -126,7 +140,7 @@ def test_every_scored_article_is_logged_once(mock_score, mock_feeds, tmp_path):
     ]
     state = rss_scorer.check_once(_cfg(str(log)), {"seen_guids": []}, "", now=_EVE)
 
-    rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    rows = [json.loads(x) for x in month.read_text(encoding="utf-8").splitlines()]
     assert [r["title"] for r in rows] == ["TSMC beats", "Fed holds"]
     first = rows[0]
     assert first["session"] == "2026-08-04|NIGHT"
@@ -141,7 +155,8 @@ def test_every_scored_article_is_logged_once(mock_score, mock_feeds, tmp_path):
     # Next run: same GUIDs are deduped by the scorer, so nothing is re-logged.
     mock_score.side_effect = None
     rss_scorer.check_once(_cfg(str(log)), state, "", now=_EVE + timedelta(minutes=30))
-    assert len(log.read_text(encoding="utf-8").splitlines()) == 2
+    assert len(month.read_text(encoding="utf-8").splitlines()) == 2
+    assert not log.exists()
 
 
 @patch("rss_scorer.fetch_all_feeds")
