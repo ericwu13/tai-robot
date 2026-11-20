@@ -1268,14 +1268,31 @@ def test_cancelled_inverted_timestamps_do_not_change_the_pick(monkeypatch):
     assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
 
 
-@pytest.mark.parametrize("winner,loser,test_id,review_id", [
-    ("Claude Review", "Tests", 10, 20),
-    ("Tests", "Claude Review", 30, 10),
-])
+@pytest.mark.parametrize(
+    "winner,loser,test_id,review_id,test_done,review_done",
+    [
+        ("Claude Review", "Tests", 101, 100, "2026-11-19T10:03:00Z", "2026-11-19T10:13:00Z"),
+        ("Claude Review", "Tests", 10, 20, "2026-11-19T03:00:00Z", "2026-11-19T03:00:00Z"),
+        ("Tests", "Claude Review", 30, 10, "2026-11-19T03:00:00Z", "2026-11-19T03:00:00Z"),
+        ("Claude Review", "Tests", 10, 20, "2026-11-19T03:00:00Z", "2026-11-19T04:00:00Z"),
+        ("Tests", "Claude Review", 30, 10, "2026-11-19T04:00:00Z", "2026-11-19T03:00:00Z"),
+    ],
+    ids=[
+        "review-finishes-last",
+        "tie-review-id",
+        "tie-test-id",
+        "higher-review-finishes-last",
+        "higher-test-finishes-last",
+    ],
+)
 def test_retrigger_reed_only_the_newer_check_posts(
-    monkeypatch, winner, loser, test_id, review_id,
+    monkeypatch, winner, loser, test_id, review_id, test_done, review_done,
 ):
-    checks = [check_run("test", rid=test_id), check_run("review", rid=review_id)]
+    """The check that finished last posts. A tied completed_at goes to the higher id."""
+    checks = [
+        check_run("test", rid=test_id, completed=test_done),
+        check_run("review", rid=review_id, completed=review_done),
+    ]
     reviews = [review("COMMENTED", REED, body=wait_body())]
     prs = [make_pr(number=7)]
     rc, _, skipped = _run_reed(

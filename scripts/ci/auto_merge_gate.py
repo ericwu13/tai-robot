@@ -20,9 +20,10 @@
         each open, non-draft, same-repo master PR whose only Reed review at
         that SHA is COMMENTED with verdict WAIT (``**WAIT**`` or
         ``Verdict: WAIT``; a later CHANGES NEEDED line does not count, and
-        APPROVED does not). ``workflow_run`` posts only for the check with
-        the higher id. ``pull_request_review`` uses the live PR head and
-        skips that ordering rule. Missing webhook secrets skip with exit 0.
+        APPROVED does not). ``workflow_run`` posts only for the check that
+        finished last (``completed_at``, then id). ``pull_request_review``
+        uses the live PR head and skips that ordering rule. Missing webhook
+        secrets skip with exit 0.
 
     python auto_merge_gate.py notify-selina
         POST a Selina webhook for a cursor[bot] Reed or Sage review, a CI
@@ -624,8 +625,12 @@ def reed_verdict(body):
     return None
 
 
-def _this_check_is_newer(runs, workflow_name):
-    """True when this workflow's latest check has the higher of the two ids."""
+def _this_check_finished_last(runs, workflow_name):
+    """True when this workflow's latest check finished after the other.
+
+    Compared only between the two latest runs. A tied ``completed_at``
+    goes to the higher id.
+    """
     ours_name = _CHECK_FOR_WORKFLOW.get((workflow_name or "").strip())
     if ours_name is None:
         return False
@@ -634,7 +639,11 @@ def _this_check_is_newer(runs, workflow_name):
     other = _latest_check(runs, other_name)
     if ours is None or other is None:
         return False
-    return int(ours.get("id") or 0) > int(other.get("id") or 0)
+
+    def _key(r):
+        return (r.get("completed_at") or "", int(r.get("id") or 0))
+
+    return _key(ours) > _key(other)
 
 
 def retrigger_reed():
@@ -685,10 +694,10 @@ def _retrigger_reed():
     if not _checks_green(runs):
         print("retrigger-reed: skip (checks not green)")
         return 0
-    if enforce_order and not _this_check_is_newer(
+    if enforce_order and not _this_check_finished_last(
         runs, os.environ.get("WORKFLOW_NAME", "")
     ):
-        print("retrigger-reed: skip (other check is newer)")
+        print("retrigger-reed: skip (other check finished last)")
         return 0
     rc = 0
     for pr in matched:

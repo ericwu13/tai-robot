@@ -1,8 +1,8 @@
 name: Auto-merge gate
 
-# Public-repo workflow. pull_request_target, pull_request_review, and
-# workflow_run run the copy of this file that is already on master and can
-# see secrets, so every job:
+# Public-repo workflow. pull_request_target and workflow_run run this file
+# from master and can see secrets. pull_request_review runs the PR merge
+# ref, so every job:
 #   - checks out master only (sparse scripts/ci), never the PR head
 #   - passes inputs through env, never inside run:
 #   - re-reads the live pull request in scripts/ci/auto_merge_gate.py and
