@@ -17,8 +17,10 @@ the vote files or ``.chips_state.json``:
   days, so ``decision`` stays empty; what W4's rules would have said is
   kept as ``hindcast_decision`` / ``hindcast_reason`` for analysis.
 
-A date already in the history file (any source) or in ``daily`` is never
-written again; the trend reader also ranks live > log > backfill.
+A date already in the history file or in ``daily`` is never written again,
+except a backfilled day whose TWSE fetch failed (``final: false``, no
+equity): a re-run retries it and appends a newer line, which the trend
+reader prefers (live > log > backfill, later line within a source).
 
 Run it on the bridge host, between W4 slots (not at :15), dry run first::
 
@@ -143,7 +145,7 @@ def build_backfill(levels: dict[str, float], equity: dict[str, float | None],
         out[key] = {
             "net_oi": levels[key], "delta_oi": delta, "prev_date": prev,
             "equity_net": eq, "decision": None, "reason": BACKFILL_REASON,
-            "final": True, "session": f"{key[:4]}-{key[4:6]}-{key[6:]}|NIGHT", "at": "",
+            "final": eq is not None,                 # W4's rule: retry without equity "session": f"{key[:4]}-{key[4:6]}-{key[6:]}|NIGHT", "at": "",
             "hindcast_decision": hindcast, "hindcast_reason": why,
         }
     return out
@@ -152,7 +154,9 @@ def build_backfill(levels: dict[str, float], equity: dict[str, float | None],
 # ── existing coverage / writing ──────────────────────────────────────────
 
 def covered_dates(bridge: Path) -> set[str]:
-    have: set[str] = set()
+    """Dates not to write again: every history date (last line per date)
+    except a backfilled day still missing its TWSE equity, plus ``daily``."""
+    last: dict[str, dict] = {}
     path = bridge / cm.HISTORY_NAME
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -161,7 +165,9 @@ def covered_dates(bridge: Path) -> set[str]:
             except ValueError:
                 continue
             if isinstance(row, dict) and len(str(row.get("date", ""))) == 8:
-                have.add(str(row["date"]))
+                last[str(row["date"])] = row
+    have = {d for d, row in last.items()
+            if not (row.get("src") == "backfill" and row.get("final") is False)}
     daily = cm.load_state(bridge / cm.STATE_NAME).get("daily")
     if isinstance(daily, dict):
         have.update(str(d) for d in daily)

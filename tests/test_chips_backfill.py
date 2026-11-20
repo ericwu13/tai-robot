@@ -144,3 +144,22 @@ def test_rerun_is_a_no_op(tmp_path, monkeypatch):
 def test_trend_reads_backfilled_rows_without_markers(tmp_path, monkeypatch):
     from scripts.dashboard import bridge_panels
     assert bridge_panels.reason_zh(bf.BACKFILL_REASON).startswith("回補資料")
+
+
+def test_twse_failure_is_not_final_and_a_rerun_retries_it(tmp_path, monkeypatch):
+    d = _bridge(tmp_path)
+    monkeypatch.setattr(bf, "fetch_taifex_levels",
+                        lambda a, b: bf.parse_taifex_csv(FIXTURE.read_bytes().decode("cp950")))
+    args = ["--base-path", str(d / "regime_vote.json"), "--no-log", "--remote",
+            "--since", "20261112", "--until", "20261118", "--sleep", "0", "--apply"]
+    monkeypatch.setattr(bf, "_twse_equity", lambda k: None if k == "20261117" else 1e9)
+    bf.main(args)
+    rows = {x["date"]: x for x in _lines(d)}
+    assert rows["20261117"]["final"] is False and rows["20261116"]["final"] is True
+
+    calls = []
+    monkeypatch.setattr(bf, "_twse_equity", lambda k: calls.append(k) or 6e9)
+    bf.main(args)
+    assert calls == ["20261117"]
+    last = [x for x in _lines(d) if x["date"] == "20261117"][-1]
+    assert last["final"] is True and last["equity_net"] == 6e9
