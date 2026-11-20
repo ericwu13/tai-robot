@@ -17,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "news_bridge"))
 import rescale_news_log  # noqa: E402
+import rss_news_log  # noqa: E402
 import rss_scorer  # noqa: E402
 
 _TPE = timezone(timedelta(hours=8))
@@ -132,9 +133,42 @@ def test_duplicates_never_reach_gemini_and_busy_run_is_scaled(score, feeds, tmp_
     assert state["last_dup_stories"] == 6
     assert {f"d{i}" for i in range(6)} <= set(state["seen_guids"])
     assert state["session_net"] == pytest.approx(-6.0)          # was -12 (24 x -0.5)
-    recs = [json.loads(x) for x in open(tmp_path / "news_log.jsonl", encoding="utf-8")]
+    # #340 writes the month file (news_log_YYYYMM.jsonl); the base name is
+    # the pre-split file and is no longer created.
+    files = rss_news_log.log_files(str(tmp_path / "news_log.jsonl"))
+    assert files == [rss_news_log.month_path(str(tmp_path / "news_log.jsonl"),
+                                             NOW.strftime("%Y%m"))]
+    recs = [json.loads(x) for x in open(files[0], encoding="utf-8")]
     assert len(recs) == 24 and all(r["run_scale"] == 0.5 for r in recs)
     assert all(r["run_net"] == pytest.approx(-6.0) for r in recs)
+
+
+@patch("rss_scorer.fetch_all_feeds")
+@patch("rss_scorer.score_article")
+def test_skipped_copy_is_not_remembered_so_the_other_outlet_is_scored(score, feeds, tmp_path):
+    """A [SKIP] answer is marked seen; its story key is not kept.
+
+    The other outlet's copy on the next pass is still sent to Gemini.
+    """
+    title = "台股暴挫2200點 綠燈一片 鴻海跌幅逆勢"
+    feeds.return_value = [_art("y1", title)]
+    score.return_value = None
+    vote = str(tmp_path / "regime_vote.json")
+    cfg = _cfg(tmp_path)
+    state = rss_scorer.check_once(cfg, {"seen_guids": []}, vote, now=NOW)
+
+    assert state["seen_guids"] == ["y1"]
+    assert rss_scorer.story_key(title) not in (state.get("recent_stories") or {})
+
+    feeds.return_value = [_art("g1", f"{title} - Yahoo股市")]
+    score.return_value = {"direction": "bearish", "confidence": 1.0, "reason": "r"}
+    score.reset_mock()
+    state = rss_scorer.check_once(cfg, state, vote, now=NOW + timedelta(minutes=30))
+
+    assert score.call_count == 1
+    assert state["last_dup_stories"] == 0
+    assert "g1" in state["seen_guids"]
+    assert rss_scorer.story_key(title) in state["recent_stories"]
 
 
 # ── dashboard numbers follow run_scale ───────────────────────────────────

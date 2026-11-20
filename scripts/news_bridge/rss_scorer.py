@@ -1075,7 +1075,11 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     scored, scored_guids, api_error = score_articles(new_articles, cfg["gemini_api_key"])
     state = mark_seen(state, scored_guids)
-    remember_stories(state, new_articles, scored_guids, now)
+    # Only a usable score is a story. A [SKIP] GUID stays in scored_guids
+    # (mark_seen, so that article is not fetched again) but must not block
+    # another outlet's copy.
+    remember_stories(state, new_articles,
+                     [item["article"]["guid"] for item in scored], now)
     api_error = api_error or unusable_scores_error(scored, scored_guids)
     record_scoring_result(state, now, api_error,
                           skipped=len(scored_guids) - len(scored))
