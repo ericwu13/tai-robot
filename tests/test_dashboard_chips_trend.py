@@ -66,10 +66,14 @@ def test_rolling_flow_restarts_on_missing_delta_and_long_gaps():
     rows["20261120"] = _row("20261120", 0, 8)        # 9-day gap > MAX_PREV_GAP_DAYS
     days = {d["date"]: d for d in chips_trend.build_days(rows)}
     assert days["2026-11-06"]["flow"] == 15 and days["2026-11-06"]["flow_full"]
+    assert days["2026-11-06"]["flow_avg"] == 3
     assert days["2026-11-09"]["flow"] == 2 + 3 + 4 + 5 + 6
     assert days["2026-11-09"]["equity_flow"] == pytest.approx(5e9)
-    assert days["2026-11-10"]["flow"] is None
+    assert days["2026-11-09"]["equity_avg"] == pytest.approx(1e9)
+    assert days["2026-11-10"]["flow"] is None and days["2026-11-10"]["flow_avg"] is None
+    assert days["2026-11-10"]["verdict"] == ""
     assert days["2026-11-11"]["flow"] == 7 and days["2026-11-11"]["flow_days"] == 1
+    assert days["2026-11-11"]["flow_avg"] == 7 and days["2026-11-11"]["equity_avg"] is None
     assert days["2026-11-20"]["flow"] == 8
     assert days["2026-11-02"]["time"] == _ct(2026, 11, 2)
 
@@ -92,6 +96,39 @@ def test_kinds_settlement_and_labels():
     assert days["2026-11-18"]["settlement"] and not days["2026-11-17"]["settlement"]
 
 
+@pytest.mark.parametrize("flow_avg, equity_avg, want", [
+    (1500, 6e9, "agree_in"), (-1500, -6e9, "agree_out"),
+    (1500, -6e9, "diverge"), (-1000, 5.1e9, "diverge"),
+    (1000, 5e9, "fut_in"), (-1500, 0, "fut_out"),          # equity must EXCEED 50 億 (decide)
+    (999, 6e9, "eq_in"), (0, -6e9, "eq_out"),               # |ΔOI| 999 < 1,000: too weak
+    (999, 5e9, "quiet"), (None, 6e9, ""), (1500, None, ""),
+])
+def test_flow_verdict_applies_w4_daily_thresholds_to_the_average(flow_avg, equity_avg, want):
+    assert chips_trend.flow_verdict(flow_avg, equity_avg) == want
+
+
+def test_verdict_boundaries_match_chips_monitor_decide():
+    """On a window whose every day equals its average, "diverge" is exactly
+    decide()'s contradiction and agree_* exactly a vote the cash side
+    confirmed, at W4's own boundaries (|ΔOI| >= 1,000, |equity| > 50 億)."""
+    for delta, equity in [(999, 6e9), (1000, 6e9), (1000, 5e9), (1000, -5e9), (1000, -5.1e9),
+                          (-4999, -6e9), (-1000, 5.1e9), (6000, 0), (-6000, 5e9)]:
+        direction, reason = chips_monitor.decide(delta, equity)
+        verdict = chips_trend.flow_verdict(delta, equity)
+        assert (verdict == "diverge") == ("contradiction" in reason), (delta, equity)
+        confirmed = direction is not None and abs(equity) > chips_monitor.EQUITY_FLOW_THRESHOLD_NTD
+        assert verdict.startswith("agree_") == confirmed, (delta, equity)
+
+
+def test_page_has_words_for_every_verdict():
+    html = open(os.path.join(os.path.dirname(server.__file__), "static", "index.html"),
+                encoding="utf-8").read()
+    table = html[html.index("const CHIPS_VERDICT = {"):]
+    table = table[:table.index("};")]
+    for key in ("agree_in", "agree_out", "diverge", "fut_in", "fut_out", "eq_in", "eq_out", "quiet"):
+        assert f"{key}: [" in table, key
+
+
 def test_price_is_one_day_session_candle_per_date(tmp_path):
     base = tmp_path / "live"
     _bot(base, "TX00_a", {"20261117": [
@@ -111,7 +148,8 @@ def test_trend_payload_and_summary(tmp_path):
     body = chips_trend.trend(paths, snapshot._read_json_dict, str(tmp_path / "live"))
     assert body["available"] and len(body["days"]) == 5 and body["symbol"] == "TX00"
     assert body["summary"] == {"date": "2026-11-06", "flow": 7000, "equity_flow": pytest.approx(11e9),
-                               "flow_days": 5, "agree": True}
+                               "flow_days": 5, "flow_avg": 1400, "equity_avg": pytest.approx(2.2e9),
+                               "agree": True, "verdict": "fut_in"}
     assert body["sources"] == {"live": 5} and len(body["price"]) == 1
     assert body["thresholds"]["strong"] == 5000
 
