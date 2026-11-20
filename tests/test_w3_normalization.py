@@ -421,8 +421,63 @@ def test_story_duplicate_across_files_is_weighted_zero(tmp_path):
     dup = _recs(monthly)[-1]
     assert dup.get("story_dup") is True
     assert dup["run_scale"] == 0.0 and dup["run_net"] == 0.0
+    # The live scorer returns before decaying when the pass has nothing new.
     prev = _recs(base)[-1]["session_net"]
-    assert dup["session_net"] == pytest.approx(round(prev * rss_scorer.EMA_DECAY, 4))
+    assert dup["session_net"] == pytest.approx(prev)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["session_net"] == pytest.approx(prev)
+    assert st["recent_runs"] == [pytest.approx(prev)]
+
+
+def test_next_counted_run_continues_from_the_undecayed_value():
+    """An all-duplicate run is not a scorer pass: the next real run decays once."""
+    session = "2026-11-20|NIGHT"
+    title = "台股暴挫2200點 綠燈一片 鴻海跌幅逆勢"
+    start = datetime(2026, 11, 20, 15, 0, tzinfo=_TPE)
+    dup_at = start + timedelta(hours=rss_scorer.STORY_TTL_HOURS / 2)
+    nxt = dup_at + timedelta(minutes=30)
+    lines = [
+        _line(start.isoformat(timespec="seconds"), session, title, -0.5),
+        _line(dup_at.isoformat(timespec="seconds"), session, f"{title} - Yahoo股市", -0.5),
+        _line(nxt.isoformat(timespec="seconds"), session, "電子權值股同步走弱拖累期貨", -0.4),
+    ]
+    out, summary = rescale_news_log.rescale(lines)
+    recs = [json.loads(x) for x in out]
+    prev = recs[0]["session_net"]
+    assert recs[1].get("story_dup") is True and recs[1]["run_net"] == 0.0
+    assert recs[1]["session_net"] == pytest.approx(prev)
+    expected = round(prev * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    decayed = round(round(prev * rss_scorer.EMA_DECAY, 4) * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    assert recs[2]["session_net"] == pytest.approx(expected)
+    assert recs[2]["session_net"] != pytest.approx(decayed)
+    info = summary["sessions"][session]
+    assert info["runs"] == 2
+    assert info["recent_runs"] == [pytest.approx(_net(-0.5)), pytest.approx(_net(-0.4))]
+    assert info["new_final"] == pytest.approx(expected)
+    again, _ = rescale_news_log.rescale(out)
+    assert again == out
+
+
+def test_missing_newline_does_not_glue_files_and_keeps_unparsable_bytes(tmp_path):
+    session = "2026-11-20|NIGHT"
+    base = tmp_path / "news_log.jsonl"
+    month = tmp_path / "news_log_202611.jsonl"
+    junk = tmp_path / "news_log_202610.jsonl"
+    base.write_text(_line("2026-11-20T15:00:00+08:00", session,
+                          "夜盤開盤外資大賣台指期貨", -0.5).rstrip("\n"), encoding="utf-8")
+    month.write_text(_line("2026-11-20T15:30:00+08:00", session,
+                           "電子權值股同步走弱拖累期貨", -0.4), encoding="utf-8")
+    junk.write_text("not json\n", encoding="utf-8")
+    state = tmp_path / "rss_scorer_state.json"
+    state.write_text(json.dumps({"session_key": session, "session_net": 1.0}), encoding="utf-8")
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
+    assert [json.loads(x)["title"] for x in base.read_text(encoding="utf-8").splitlines()] == \
+        ["夜盤開盤外資大賣台指期貨"]
+    assert [json.loads(x)["title"] for x in month.read_text(encoding="utf-8").splitlines()] == \
+        ["電子權值股同步走弱拖累期貨"]
+    assert junk.read_text(encoding="utf-8") == "not json\n"
+    expected = round(_recs(base)[-1]["session_net"] * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    assert _recs(month)[-1]["session_net"] == pytest.approx(expected)
 
 
 def test_new_session_key_in_the_next_file_still_resets(tmp_path):

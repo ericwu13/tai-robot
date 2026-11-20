@@ -13,7 +13,8 @@ EMA, dedup window and session summary across files, with the scorer's own functi
   and ``story_dup: true`` — still listed, no longer counted;
 * ``run_net`` = clipped sum of the remaining stories x ``run_scale``;
 * ``session_net`` = the per-session EMA chain (reset when the session key
-  changes, decay ``EMA_DECAY`` per logged run), exactly like the scorer.
+  changes, decay ``EMA_DECAY`` per run that still has a counted story; a
+  run of only duplicates leaves it unchanged), exactly like the scorer.
 
 Approximation: a run whose articles were all skipped by Gemini decayed
 the live EMA but logged nothing, so the replay cannot see it.
@@ -60,58 +61,42 @@ def _num(value) -> float:
         return 0.0
 
 
-class _Carry:
-    """Session EMA, story-dedup window and session summary for one replay."""
-
-    def __init__(self) -> None:
-        self.recent: dict[str, datetime] = {}
-        self.sessions: dict[str, dict] = {}
-        self.cum = 0.0
-        self.session: str | None = None
-        self.peak = 0.0
-        self.run_nets: list[float] = []
-        self.last_session = ""
-
-
-def _prepare(lines: list[str]):
-    """``(entries, runs, earliest scored_at)``. Unparsable lines stay put."""
+def rescale(lines: list[str]) -> tuple[list[str], dict]:
+    """Rewritten lines plus a summary; unparsable lines pass through."""
     entries = []                      # (raw_line, record or None)
-    runs: list[list[dict]] = []
-    earliest: datetime | None = None
     for line in lines:
         try:
             rec = json.loads(line)
         except ValueError:
             rec = None
-        parsed = rec if isinstance(rec, dict) and rec.get("scored_at") else None
-        entries.append((line, parsed))
-        if parsed is None:
+        entries.append((line, rec if isinstance(rec, dict) and rec.get("scored_at") else None))
+
+    # Runs = consecutive records with the same scored_at (one scorer pass).
+    runs: list[list[dict]] = []
+    for _line, rec in entries:
+        if rec is None:
             continue
-        # Runs = consecutive records with the same scored_at (one scorer pass).
-        if runs and runs[-1][0]["scored_at"] == parsed["scored_at"]:
-            runs[-1].append(parsed)
+        if runs and runs[-1][0]["scored_at"] == rec["scored_at"]:
+            runs[-1].append(rec)
         else:
-            runs.append([parsed])
-            at = _when(parsed["scored_at"])
-            if at is not None and (earliest is None or at < earliest):
-                earliest = at
-    return entries, runs, earliest
+            runs.append([rec])
 
-
-def _replay(runs: list[list[dict]], carry: _Carry) -> tuple[int, dict[str, int]]:
-    """Replay ``runs`` into ``carry``. Returns (duplicates, per-session run counts)."""
     clip = rss_scorer.ARTICLE_CLIP
-    dups = 0
-    touched: dict[str, int] = {}
+    recent: dict[str, datetime] = {}
+    sessions: dict[str, dict] = {}
+    cum, session, peak = 0.0, None, 0.0
+    run_nets: list[float] = []
+    dups = counted_runs = 0
+    last_key = ""
     for run in runs:
         at = _when(run[0]["scored_at"])
         if at is not None:
             cutoff = at - timedelta(hours=rss_scorer.STORY_TTL_HOURS)
-            carry.recent = {k: t for k, t in carry.recent.items() if t >= cutoff}
+            recent = {k: t for k, t in recent.items() if t >= cutoff}
         batch, counted = set(), []
         for rec in run:
             key = rss_scorer.story_key(rec.get("title", ""))
-            if key and (key in carry.recent or key in batch):
+            if key and (key in recent or key in batch):
                 rec["story_dup"] = True
                 rec["run_scale"] = 0.0
                 dups += 1
@@ -122,101 +107,76 @@ def _replay(runs: list[list[dict]], carry: _Carry) -> tuple[int, dict[str, int]]
             counted.append(rec)
         if at is not None:
             for key in batch:
-                carry.recent[key] = at
+                recent[key] = at
+        # Nothing new: the scorer returns before the EMA, the peak and recent_runs.
+        if not counted:
+            for rec in run:
+                rec["run_net"] = 0.0
+                rec["session_net"] = cum
+            continue
         scale = rss_scorer.run_scale(len(counted))
         net = sum(max(-clip, min(clip, _num(r.get("score")))) for r in counted) * scale
         key = str(run[0].get("session", ""))
-        if key != carry.session:
-            carry.session, carry.cum, carry.peak = key, 0.0, 0.0
-            carry.run_nets = []
-        carry.cum = round(carry.cum * rss_scorer.EMA_DECAY + net, 4)
-        if (carry.cum > 0 and carry.cum > carry.peak) or (carry.cum < 0 and carry.cum < carry.peak):
-            carry.peak = carry.cum
-        carry.run_nets.append(round(net, 4))
-        info = carry.sessions.setdefault(key, {"old_final": None, "runs": 0})
+        if key != session:
+            session, cum, peak = key, 0.0, 0.0
+            run_nets = []
+        cum = round(cum * rss_scorer.EMA_DECAY + net, 4)
+        if (cum > 0 and cum > peak) or (cum < 0 and cum < peak):
+            peak = cum
+        run_nets.append(round(net, 4))
+        counted_runs += 1
+        last_key = run[0].get("session", "")
+        info = sessions.setdefault(key, {"old_final": None, "runs": 0})
         info["old_final"] = _num(run[-1].get("session_net"))
         info["runs"] += 1
-        info["new_final"] = carry.cum
-        info["new_peak"] = carry.peak
-        info["recent_runs"] = carry.run_nets[-3:]
-        touched[key] = touched.get(key, 0) + 1
+        info["new_final"] = cum
+        info["new_peak"] = peak
+        info["recent_runs"] = run_nets[-3:]
         for rec in run:
             if not rec.get("story_dup"):
                 rec["run_scale"] = round(scale, 4)
             rec["run_net"] = round(net, 4)
-            rec["session_net"] = carry.cum
-        carry.last_session = run[0].get("session", "")
-    return dups, touched
+            rec["session_net"] = cum
 
-
-def _render(entries) -> list[str]:
     out = []
     for line, rec in entries:
         if rec is None:
             out.append(line if line.endswith("\n") else line + "\n")
         else:
             out.append(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-    return out
+    recent_out = {k: t.isoformat(timespec="seconds") for k, t in recent.items()}
+    return out, {"runs": counted_runs, "records": sum(len(r) for r in runs),
+                 "duplicates": dups, "sessions": sessions,
+                 "last_session": last_key, "recent_stories": recent_out}
 
 
-def _file_order(earliest: datetime | None, index: int):
-    """Earliest run first; a file with no parseable time goes last.
+def rescale_files(files: list[tuple[str, list[str]]]) -> tuple[list[tuple[str, list[str]]], dict]:
+    """One ``rescale``, files ordered by earliest ``scored_at`` (ties keep input order).
 
-    ``log_files`` is the pre-split base file, then monthly names. That is
-    scored_at order only when the base file is older than every monthly
-    run, so the replay orders the files itself. Ties keep the input order.
+    A file with no parsable run sorts last. Each file keeps only its own lines.
     """
-    if earliest is None:
-        return (1, index)
-    return (0, earliest, index)
-
-
-def _file_summary(carry: _Carry, runs, dups: int, touched: dict[str, int]) -> dict:
-    """This file's counts. Session nets are the chain after this file."""
-    sessions = {}
-    for key, n_runs in touched.items():
-        info = carry.sessions[key]
-        sessions[key] = {"old_final": info["old_final"], "runs": n_runs,
-                         "new_final": info["new_final"], "new_peak": info["new_peak"],
-                         "recent_runs": list(info["recent_runs"])}
-    return {"runs": len(runs), "records": sum(len(r) for r in runs), "duplicates": dups,
-            "sessions": sessions, "last_session": carry.last_session,
-            "recent_stories": {k: t.isoformat(timespec="seconds") for k, t in carry.recent.items()}}
-
-
-def rescale_files(files: list[tuple[str, list[str]]]) -> tuple[list[tuple[str, list[str], dict]], dict]:
-    """Replay ``files`` as one chronological stream.
-
-    Returns ``(per_file, summary)``. ``per_file`` is ``(path, lines, summary)``
-    in replay order; each file is rewritten with only its own lines.
-    ``summary`` is the combined chain (the last session overall).
-    """
+    sentinel = datetime.min.replace(tzinfo=rss_scorer._TZ_TAIPEI)
     prepared = []
     for index, (path, lines) in enumerate(files):
-        entries, runs, earliest = _prepare(lines)
-        prepared.append((earliest, index, path, entries, runs))
-    prepared.sort(key=lambda item: _file_order(item[0], item[1]))
-
-    carry = _Carry()
-    per_file = []
-    total_runs = total_records = total_dups = 0
-    for _earliest, _index, path, entries, runs in prepared:
-        dups, touched = _replay(runs, carry)
-        per_file.append((path, _render(entries), _file_summary(carry, runs, dups, touched)))
-        total_runs += len(runs)
-        total_records += sum(len(r) for r in runs)
-        total_dups += dups
-    summary = {"runs": total_runs, "records": total_records, "duplicates": total_dups,
-               "sessions": carry.sessions, "last_session": carry.last_session,
-               "recent_stories": {k: t.isoformat(timespec="seconds")
-                                  for k, t in carry.recent.items()}}
+        # Match rescale's newline so a bare last line cannot glue onto the next file.
+        norm = [line if line.endswith("\n") else line + "\n" for line in lines]
+        earliest = None
+        for line in norm:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            at = _when(rec["scored_at"]) if isinstance(rec, dict) and rec.get("scored_at") else None
+            if at is not None and (earliest is None or at < earliest):
+                earliest = at
+        prepared.append((earliest, index, path, norm))
+    prepared.sort(key=lambda item: (item[0] is None, item[0] or sentinel, item[1]))
+    out, summary = rescale([line for _, _, _, norm in prepared for line in norm])
+    per_file, offset = [], 0
+    for _, _, path, norm in prepared:
+        per_file.append((path, out[offset:offset + len(norm)]))
+        offset += len(norm)
     return per_file, summary
-
-
-def rescale(lines: list[str]) -> tuple[list[str], dict]:
-    """Rewritten lines plus a summary; unparsable lines pass through."""
-    per_file, summary = rescale_files([("", lines)])
-    return per_file[0][1], summary
 
 
 def _replace(tmp: str, path: str) -> None:
@@ -274,12 +234,13 @@ def main(argv: list[str] | None = None) -> int:
         with open(path, encoding="utf-8") as f:
             loaded.append((path, f.readlines()))
     planned, summary = rescale_files(loaded)
-    for path, _out, file_summary in planned:
-        print(f"{path}: {file_summary['records']} records in {file_summary['runs']} runs; "
-              f"{file_summary['duplicates']} duplicate stories now weighted 0")
-        for key, info in list(file_summary["sessions"].items())[-10:]:
-            print(f"  {key or '(no session)'}: session net {info['old_final']:+.2f} -> "
-                  f"{info['new_final']:+.2f} over {info['runs']} run(s)")
+    for path, _out in planned:
+        print(path)
+    print(f"{summary['records']} records in {summary['runs']} runs; "
+          f"{summary['duplicates']} duplicate stories now weighted 0")
+    for key, info in list(summary["sessions"].items())[-10:]:
+        print(f"  {key or '(no session)'}: session net {info['old_final']:+.2f} -> "
+              f"{info['new_final']:+.2f} over {info['runs']} run(s)")
 
     state = None
     if args.state:
@@ -295,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         print("DRY RUN - nothing written. Re-run with --apply.")
         return 0
-    for path, out, _summary in planned:
+    for path, out in planned:
         backup = _write(path, "".join(out))
         print(f"log rewritten; backup {backup}")
     if state is not None:
