@@ -33,7 +33,9 @@
 
 Env: GH_TOKEN (read by gh), GITHUB_REPOSITORY, PR.
 trigger-sage also: SAGE_REVIEW_WEBHOOK_URL, SAGE_REVIEW_WEBHOOK_KEY.
-gate also: RUN_URL (optional link on the status).
+gate also: RUN_URL (optional link on the status). MERGE_GH_TOKEN is optional;
+when set and non-empty, only the ``gh pr merge`` subprocess uses it as
+GH_TOKEN. Status writes and reads keep GH_TOKEN.
 retrigger-reed also: HEAD_SHA, EVENT_NAME, PR, WORKFLOW_NAME,
 REED_QA_WEBHOOK_URL, REED_QA_WEBHOOK_KEY.
 notify-selina also: EVENT_NAME, REVIEW_ID, HEAD_SHA, WORKFLOW_NAME,
@@ -86,15 +88,21 @@ mutation($id:ID!) {
 """
 
 
-def run(args, *, input_text=None):
-    """Run gh. ``args`` is everything after the ``gh`` binary."""
-    return subprocess.run(
-        ["gh", *args],
-        input=input_text,
-        text=True,
-        capture_output=True,
-        encoding="utf-8",
-    )
+def run(args, *, input_text=None, env=None):
+    """Run gh. ``args`` is everything after the ``gh`` binary.
+
+    ``env`` replaces the subprocess environment when given. Omit it to
+    inherit the current environment, including GH_TOKEN.
+    """
+    kwargs = {
+        "input": input_text,
+        "text": True,
+        "capture_output": True,
+        "encoding": "utf-8",
+    }
+    if env is not None:
+        kwargs["env"] = env
+    return subprocess.run(["gh", *args], **kwargs)
 
 
 def _fail(proc, fallback):
@@ -373,7 +381,13 @@ def _log_proc(proc):
 
 
 def _pr_merge(repo, number, *flags):
-    return run(["pr", "merge", str(number), "--repo", repo, *flags])
+    """``gh pr merge``. MERGE_GH_TOKEN overrides GH_TOKEN when it is non-empty."""
+    token = os.environ.get("MERGE_GH_TOKEN", "").strip()
+    env = None
+    if token:
+        env = os.environ.copy()
+        env["GH_TOKEN"] = token
+    return run(["pr", "merge", str(number), "--repo", repo, *flags], env=env)
 
 
 def enable_auto_merge(repo, number, head_sha):
