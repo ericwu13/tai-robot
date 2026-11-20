@@ -370,7 +370,8 @@ details.pnl[open] > summary::before { content: "▾"; }
     <div class="panel trend-panel">
       <div class="section-title">情緒走勢 vs 價格
         <label class="trend-sym">價格 <select id="n-sym"></select></label>
-        <span class="legend">K 線＝30 分鐘價格（右軸，紅漲綠跌）；線＝盤別累計情緒（左軸，每輪衰減後加總，只在評分時變動）；底部柱＝單輪淨值；虛線＝投票門檻。往左拖曳看更早的紀錄。</span></div>
+        <label class="trend-sym"><input type="checkbox" id="n-logscale" checked> 壓縮刻度</label>
+        <span class="legend">K 線＝30 分鐘價格（右軸，紅漲綠跌）；線＝盤別累計情緒（左軸，每輪衰減後加總，只在評分時變動）；灰虛線＝價格動能對照（同一衰減公式套在價格變動上，等比例縮放：情緒線貼著它走＝只是在描述已發生的漲跌）；底部柱＝單輪淨值；虛線＝投票門檻；「壓縮刻度」把左軸改為對數比例（大數值被壓縮，刻度與數值仍是原始分數）。往左拖曳看更早的紀錄。</span></div>
       <div class="chart news" id="n-chart"></div>
       <div class="sub muted" id="n-trend-note"></div>
     </div>
@@ -777,6 +778,11 @@ function newsTitle(n) {
     n.reason && n.reason !== "(truncated)" ? el("span", { class: "reason" }, "Gemini：" + n.reason) : null);
 }
 const signedText = (v, digits = 2) => `${v > 0 ? "+" : ""}${Number(v || 0).toFixed(digits)}`;
+// 情緒走勢 axis compression: signed log1p, so one -90 crash run does not flatten
+// every ordinary day into a line at zero. Axis labels and tooltips run the
+// inverse, so they still read the scorer's real value (and ±1.5 stays ±1.5).
+const sentiFwd = (v, on) => (on ? Math.sign(v) * Math.log1p(Math.abs(v)) : v);
+const sentiInv = (y, on) => (on ? Math.sign(y) * Math.expm1(Math.abs(y)) : y);
 function signedSpan(v, digits = 2) {
   return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, signedText(v, digits));
 }
@@ -1531,26 +1537,33 @@ const App = {
         localization: { locale: "zh-TW" },
         autoSize: true,
       });
-      const senti = { type: "custom", formatter: (v) => signedText(v), minMove: 0.01 };
+      const senti = { type: "custom", formatter: (v) => signedText(sentiInv(v, this.sentiLog)), minMove: 0.01 };
       this.newsCandles = this.newsChart.addCandlestickSeries({ upColor: up, downColor: down,
         wickUpColor: up, wickDownColor: down, borderVisible: false, priceScaleId: "right",
         priceFormat: { type: "price", precision: 0, minMove: 1 } });
       this.newsHist = this.newsChart.addHistogramSeries({ priceScaleId: "run", priceLineVisible: false,
         lastValueVisible: false, priceFormat: senti });
       this.newsChart.priceScale("run").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 }, visible: false });
+      // Momentum comparison: price change through the same EMA, same scale.
+      this.newsGhost = this.newsChart.addLineSeries({ priceScaleId: "left", lineType: 1, lineWidth: 1,
+        lineStyle: 2, color: this.css("--muted"), priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false, priceFormat: senti });
       this.newsLine = this.newsChart.addLineSeries({ priceScaleId: "left", lineType: 1, lineWidth: 2,
         color: this.css("--ok"), priceLineVisible: false, priceFormat: senti });
       this.newsLines = [];
     }
+    const on = this.sentiLog = $("n-logscale").checked;
+    const f = (v) => sentiFwd(v, on);
     this.newsCandles.setData(bars);
-    this.newsHist.setData(runs.map((r) => ({ time: r.t, value: r.run_net,
+    this.newsHist.setData(runs.map((r) => ({ time: r.t, value: f(r.run_net),
       color: this.rgba(r.run_net >= 0 ? up : down, 0.45) })));
-    this.newsLine.setData(runs.map((r) => ({ time: r.t, value: r.session_net })));
+    this.newsLine.setData(runs.map((r) => ({ time: r.t, value: f(r.session_net) })));
+    this.newsGhost.setData(runs.filter((r) => r.ghost != null).map((r) => ({ time: r.t, value: f(r.ghost) })));
     for (const l of this.newsLines) this.newsLine.removePriceLine(l);
     const T = this.pulse.threshold;
     this.newsLines = [
-      this.newsLine.createPriceLine({ price: T, color: up, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏多門檻" }),
-      this.newsLine.createPriceLine({ price: -T, color: down, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏空門檻" }),
+      this.newsLine.createPriceLine({ price: f(T), color: up, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏多門檻" }),
+      this.newsLine.createPriceLine({ price: f(-T), color: down, lineStyle: 2, lineWidth: 1, axisLabelVisible: true, title: "偏空門檻" }),
     ];
     const first = Math.min(runs.length ? runs[0].t : Infinity, bars.length ? bars[0].time : Infinity);
     const last = Math.max(runs.length ? runs[runs.length - 1].t : -Infinity, bars.length ? bars[bars.length - 1].time : -Infinity);
@@ -2055,6 +2068,7 @@ const App = {
     });
     for (const id of ["n-session", "n-score", "n-source"]) $(id).addEventListener("change", () => this.refreshNews());
     $("n-sym").addEventListener("change", () => this.refreshTrend(true));
+    $("n-logscale").addEventListener("change", () => this.drawNewsChart());
     this.newsSeen = readSeen();
     // Leaving the tab moves the "新" baseline to what was last shown, so a
     // page left open overnight marks only the runs since you looked away.
