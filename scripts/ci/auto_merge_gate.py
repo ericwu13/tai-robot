@@ -15,12 +15,15 @@
         workflow or CI script edit, a draft, or the ``needs-owner`` label is not eligible.
 
     python auto_merge_gate.py retrigger-reed
-        When the latest ``test`` and ``review`` check runs at HEAD_SHA are
+        When the latest ``test`` and ``review`` checks (highest run id) are
         both completed and successful, POST ``{"pr", "head_sha"}`` once for
         each open, non-draft, same-repo master PR whose only Reed review at
-        that SHA is COMMENTED and contains ``**WAIT**`` (not
-        ``**CHANGES NEEDED**``, and not APPROVED). Missing webhook secrets
-        skip with exit 0.
+        that SHA is COMMENTED with verdict WAIT (``**WAIT**`` or
+        ``Verdict: WAIT``; a later CHANGES NEEDED line does not count, and
+        APPROVED does not). ``workflow_run`` posts only for the check that
+        finished last (``completed_at``, then id). ``pull_request_review``
+        uses the live PR head and skips that ordering rule. Missing webhook
+        secrets skip with exit 0.
 
     python auto_merge_gate.py notify-selina
         POST a Selina webhook for a cursor[bot] Reed or Sage review, a CI
@@ -31,11 +34,13 @@
 Env: GH_TOKEN (read by gh), GITHUB_REPOSITORY, PR.
 trigger-sage also: SAGE_REVIEW_WEBHOOK_URL, SAGE_REVIEW_WEBHOOK_KEY.
 gate also: RUN_URL (optional link on the status).
-retrigger-reed also: HEAD_SHA, REED_QA_WEBHOOK_URL, REED_QA_WEBHOOK_KEY.
+retrigger-reed also: HEAD_SHA, EVENT_NAME, PR, WORKFLOW_NAME,
+REED_QA_WEBHOOK_URL, REED_QA_WEBHOOK_KEY.
 notify-selina also: EVENT_NAME, REVIEW_ID, HEAD_SHA, WORKFLOW_NAME,
 WORKFLOW_CONCLUSION, SELINA_QA_WEBHOOK_URL, SELINA_QA_WEBHOOK_KEY.
 The live pull request, review, and check runs are re-read here; a fork is
-ignored. trigger-sage and gate also ignore a closed or non-master PR.
+ignored. trigger-sage, retrigger-reed, and gate also ignore a closed or
+non-master PR.
 
 Stdlib and the gh CLI only.
 """
@@ -553,13 +558,11 @@ def _same_repo(pr, repo):
 
 
 def _latest_check(runs, name):
+    """The run with the highest integer id."""
     matched = [r for r in runs if isinstance(r, dict) and r.get("name") == name]
     if not matched:
         return None
-    matched.sort(key=lambda r: (
-        r.get("completed_at") or r.get("started_at") or "",
-        int(r.get("id") or 0),
-    ))
+    matched.sort(key=lambda r: int(r.get("id") or 0))
     return matched[-1]
 
 
@@ -593,6 +596,56 @@ def _fetch_check_runs(repo, head_sha):
     return found
 
 
+_VERDICT_LABEL = re.compile(r"(?i)^verdict:\s*")
+_CHECK_FOR_WORKFLOW = {"Tests": "test", "Claude Review": "review"}
+
+
+def reed_verdict(body):
+    """WAIT or CHANGES NEEDED from the first non-empty line after the marker.
+
+    ``**WAIT**`` and ``Verdict: WAIT...`` both return ``WAIT``. The same two
+    shapes apply to CHANGES NEEDED. Later lines are ignored.
+    """
+    text = body if isinstance(body, str) else ""
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
+    found = ""
+    for line in text.split("\n")[1:]:
+        if line.strip():
+            found = line
+            break
+    if not found:
+        return None
+    cleaned = _VERDICT_LABEL.sub("", found.replace("**", "")).strip()
+    for kind in ("CHANGES NEEDED", "WAIT"):
+        if cleaned == kind or (
+            cleaned.startswith(kind) and not cleaned[len(kind)].isalnum()
+        ):
+            return kind
+    return None
+
+
+def _this_check_finished_last(runs, workflow_name):
+    """True when this workflow's latest check finished after the other.
+
+    Compared only between the two latest runs. A tied ``completed_at``
+    goes to the higher id.
+    """
+    ours_name = _CHECK_FOR_WORKFLOW.get((workflow_name or "").strip())
+    if ours_name is None:
+        return False
+    ours = _latest_check(runs, ours_name)
+    other_name = "review" if ours_name == "test" else "test"
+    other = _latest_check(runs, other_name)
+    if ours is None or other is None:
+        return False
+
+    def _key(r):
+        return (r.get("completed_at") or "", int(r.get("id") or 0))
+
+    return _key(ours) > _key(other)
+
+
 def retrigger_reed():
     try:
         return _retrigger_reed()
@@ -605,26 +658,46 @@ def _retrigger_reed():
     repo = require_repo()
     if repo is None:
         return 1
-    head_sha = _require_sha()
-    if head_sha is None:
-        return 1
     url = os.environ.get("REED_QA_WEBHOOK_URL", "").strip()
     key = os.environ.get("REED_QA_WEBHOOK_KEY", "").strip()
     if not url or not key:
         print("retrigger-reed: skip (webhook not configured)")
         return 0
-    matched = []
-    for pr in paginate_list(f"repos/{repo}/pulls?state=open"):
+    event = os.environ.get("EVENT_NAME", "").strip()
+    if event == "pull_request_review":
+        number = require_pr()
+        if number is None:
+            return 1
+        pr = gh_get(f"repos/{repo}/pulls/{number}")
         if not pr_is_guarded(pr, repo) or pr.get("draft"):
-            continue
-        if head_sha_of(pr) != head_sha:
-            continue
-        matched.append(pr)
-    if not matched:
-        print("retrigger-reed: skip (no matching PR)")
-        return 0
-    if not _checks_green(_fetch_check_runs(repo, head_sha)):
+            print("retrigger-reed: skip (no matching PR)")
+            return 0
+        head_sha = head_sha_of(pr)
+        matched = [pr]
+        enforce_order = False
+    else:
+        head_sha = _require_sha()
+        if head_sha is None:
+            return 1
+        matched = []
+        for pr in paginate_list(f"repos/{repo}/pulls?state=open"):
+            if not pr_is_guarded(pr, repo) or pr.get("draft"):
+                continue
+            if head_sha_of(pr) != head_sha:
+                continue
+            matched.append(pr)
+        if not matched:
+            print("retrigger-reed: skip (no matching PR)")
+            return 0
+        enforce_order = True
+    runs = _fetch_check_runs(repo, head_sha)
+    if not _checks_green(runs):
         print("retrigger-reed: skip (checks not green)")
+        return 0
+    if enforce_order and not _this_check_finished_last(
+        runs, os.environ.get("WORKFLOW_NAME", "")
+    ):
+        print("retrigger-reed: skip (other check finished last)")
         return 0
     rc = 0
     for pr in matched:
@@ -639,11 +712,7 @@ def _retrigger_reed():
             continue
         rev = reed_reviews[0]
         body = rev.get("body") if isinstance(rev.get("body"), str) else ""
-        if (
-            rev.get("state") != "COMMENTED"
-            or "**WAIT**" not in body
-            or "**CHANGES NEEDED**" in body
-        ):
+        if rev.get("state") != "COMMENTED" or reed_verdict(body) != "WAIT":
             print(f"retrigger-reed: skip #{number} (not a WAIT review)")
             continue
         one = _post_webhook(

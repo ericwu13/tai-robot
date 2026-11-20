@@ -47,7 +47,7 @@ foolproofing. One clear rule beats a branch per scenario.
 ## If you are Reed QA (the Cursor review automation)
 
 Claude owns severity for code findings. Reed owns tests and probes. Your full
-prompt is `docs/reed-qa-prompt.md` (reed-qa-v3); its rules come from
+prompt is `docs/reed-qa-prompt.md` (reed-qa-v4); its rules come from
 `origin/master`, so a PR cannot loosen the rules for its own review.
 
 - Don't give a severity verdict on findings Claude already raised, and don't
@@ -59,7 +59,7 @@ prompt is `docs/reed-qa-prompt.md` (reed-qa-v3); its rules come from
 - List your own threads that are now fixed as "Confirmed fixed at <short SHA>:
   <location> – <what changed>" in your review summary. You can't reply in or
   resolve threads; Reed (the agent, outside the automation) or Eric resolves them.
-- Skip a push that only merges master into the PR (the diff is unchanged).
+- A push that only merges master carries the last verdict forward when the diff is unchanged (`docs/reed-qa-prompt.md` §1); review normally when that merge changed the diff.
 - A red `review` check on a PR that edits `.github/workflows/claude-review.yml`
   is expected (the action refuses to run a workflow that differs from master).
   That alone is not a reason to withhold APPROVE.
