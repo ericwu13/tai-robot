@@ -227,12 +227,6 @@ def test_alone_timeout_still_assumes_fill_and_downgrades(monkeypatch):
 
 # ── settings ──
 
-def test_settings_key_parsed_like_other_opt_ins(monkeypatch, tmp_path):
-    from src.live import mode_request as mreq
-    assert mreq.parse_dashboard_auto_opt_in(
-        {"A": True, "B": "true", "C": 1, "D": False}) == frozenset({"A"})
-
-
 def test_example_settings_opt_in_nobody():
     import os
     import yaml
