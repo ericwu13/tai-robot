@@ -858,3 +858,116 @@ class TestDiscordModes:
                                       now=_WEEKDAY_EVE)
         assert state["last_skipped"] == 1
         assert state["last_articles_scored"] == 1
+
+
+# ── W3 vote withdrawal + shadow score ────────────────────────────────────
+
+def _logged_rows(news_dir):
+    """Every history row, whatever the file layout (single or monthly)."""
+    return [json.loads(x) for f in sorted(Path(news_dir).glob("news_log*.jsonl"))
+            for x in f.read_text(encoding="utf-8").splitlines()]
+
+
+class TestVoteWithdrawAndShadow:
+    def _cfg(self, **extra):
+        cfg = {"feeds": ["https://example.com/rss"], "interval_minutes": 30,
+               "state_file": "data/state.json", "gemini_api_key": "fake-key",
+               "discord_webhook_url": ""}
+        cfg.update(extra)
+        return cfg
+
+    def _bull(self, n, tag):
+        return [_make_article(f"{tag}{i}", f"{tag} rally {i}") for i in range(n)]
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_vote_is_withdrawn_when_the_session_score_fades(self, mock_score, mock_feeds, tmp_vote):
+        cfg, state = self._cfg(), {"seen_guids": []}
+        mock_score.return_value = {"direction": "bullish", "confidence": 1.0, "reason": "up"}
+        mock_feeds.return_value = self._bull(4, "a")                    # +2.0 -> vote up
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE)
+        assert os.path.exists(_w3_path(tmp_vote))
+        mock_score.return_value = {"direction": "bearish", "confidence": 0.2, "reason": "meh"}
+        mock_feeds.return_value = self._bull(3, "b")                    # 2.0*decay - 0.6 < 1.5
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE + timedelta(minutes=30))
+        assert abs(state["session_net"]) < rss_scorer.SESSION_VOTE_THRESHOLD
+        assert not os.path.exists(_w3_path(tmp_vote))
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_a_manual_w3_vote_is_never_withdrawn(self, mock_score, mock_feeds, tmp_vote):
+        path = _w3_path(tmp_vote)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "direction": "trending-up", "source": "W3-manual",
+                       "expires_after_session": "2026-08-04|NIGHT"}, f)
+        mock_score.return_value = {"direction": "neutral", "confidence": 0.2, "reason": "x"}
+        mock_feeds.return_value = self._bull(1, "c")
+        rss_scorer.check_once(self._cfg(), {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        assert os.path.exists(path)
+
+    def test_withdraw_never_raises(self, tmp_path):
+        assert rss_scorer.withdraw_w3_vote("") is False
+        assert rss_scorer.withdraw_w3_vote(str(tmp_path / "nope" / "regime_vote.json")) is False
+        bad = tmp_path / "regime_vote_w3.json"
+        bad.write_text("{not json", encoding="utf-8")
+        assert rss_scorer.withdraw_w3_vote(str(tmp_path / "regime_vote.json")) is False
+        assert bad.exists()
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    @patch("rss_scorer._gemini_json")
+    def test_shadow_is_off_by_default(self, mock_gem, mock_score, mock_feeds, tmp_vote, tmp_path):
+        mock_score.return_value = {"direction": "bullish", "confidence": 0.5, "reason": "x"}
+        mock_feeds.return_value = self._bull(2, "d")
+        log = tmp_path / "news" / "news_log.jsonl"
+        state = rss_scorer.check_once(self._cfg(news_log_path=str(log)), {"seen_guids": []},
+                                      tmp_vote, now=_WEEKDAY_EVE)
+        mock_gem.assert_not_called()
+        assert "shadow_session_net" not in state
+        rows = _logged_rows(tmp_path / "news")
+        assert rows and all("shadow_score" not in r for r in rows)
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    @patch("rss_scorer._gemini_json")
+    def test_shadow_is_logged_and_never_votes(self, mock_gem, mock_score, mock_feeds, tmp_vote, tmp_path):
+        signal = tmp_path / "bridge" / "signal.json"
+        signal.parent.mkdir()
+        (signal.parent / "crossmarket_quotes.json").write_text(json.dumps({"quotes": {
+            "^TWII": {"pct": -3.2, "quote_time": 1785830400, "fresh": True},
+            "^SOX": {"pct": None}}}), encoding="utf-8")
+        mock_score.return_value = {"direction": "bearish", "confidence": 0.9, "reason": "crash report"}
+        mock_gem.return_value = {"direction": "neutral", "confidence": 0.1, "reason": "already priced"}
+        mock_feeds.return_value = self._bull(4, "e")
+        log = tmp_path / "news" / "news_log.jsonl"
+        cfg = self._cfg(news_log_path=str(log), shadow_score=True, signal_path=str(signal))
+        state = rss_scorer.check_once(cfg, {"seen_guids": []}, tmp_vote, now=_WEEKDAY_EVE)
+        # Live path unchanged: -2.0 votes down. Shadow is 0 and does not vote.
+        assert state["session_net"] == pytest.approx(-2.0)
+        assert json.load(open(_w3_path(tmp_vote)))["direction"] == "trending-down"
+        assert state["shadow_session_net"] == 0.0 and state["shadow_error"] == ""
+        prompt = mock_gem.call_args[0][0]
+        assert "^TWII: -3.20%" in prompt and "^SOX" not in prompt and "min ago" in prompt
+        rows = _logged_rows(tmp_path / "news")
+        assert {r["shadow_score"] for r in rows} == {0.0}
+        assert rows[0]["shadow_session_net"] == 0.0 and rows[0]["score"] == -0.9
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    @patch("rss_scorer._gemini_json")
+    def test_shadow_api_failure_never_touches_the_live_score(self, mock_gem, mock_score, mock_feeds,
+                                                            tmp_vote):
+        mock_score.return_value = {"direction": "bullish", "confidence": 1.0, "reason": "up"}
+        mock_gem.side_effect = rss_scorer.GeminiAPIError(429, "rate limited")
+        mock_feeds.return_value = self._bull(4, "f")
+        state = rss_scorer.check_once(self._cfg(shadow_score=True), {"seen_guids": []}, tmp_vote,
+                                      now=_WEEKDAY_EVE)
+        assert state["session_net"] == pytest.approx(2.0)
+        assert os.path.exists(_w3_path(tmp_vote))
+        assert "429" in state["shadow_error"] and state["shadow_session_net"] == 0.0
+
+    def test_shadow_setting_must_be_literal_true(self):
+        on = rss_scorer.get_news_config({"news": {"rss_shadow_score": True}})
+        assert on["shadow_score"] is True
+        for value in ("true", 1, "yes", None):
+            assert rss_scorer.get_news_config({"news": {"rss_shadow_score": value}})["shadow_score"] is False
