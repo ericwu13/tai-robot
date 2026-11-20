@@ -1,8 +1,8 @@
 """新聞訊號 view: the W3 scorer's per-article history, read-only.
 
-Reads the JSONL written by ``scripts/news_bridge/rss_news_log.py`` (newest
-lines only, through ``fileio`` so the scorer's append/trim is never
-blocked) and answers ``GET /api/news``. Filtering happens here so the page
+Reads the JSONL written by ``scripts/news_bridge/rss_news_log.py`` (the
+newest lines across its monthly files, through ``fileio`` so the scorer's
+appends are never blocked) and answers ``GET /api/news``. Filtering happens here so the page
 and the tests share one implementation; the facets (sessions, sources)
 come from the unfiltered window so the filter menus never empty out.
 """
@@ -120,35 +120,58 @@ def parse_query(query: dict) -> dict:
 
 
 # /api/news and /api/news/pulse both need the same parsed window on every
-# refresh; parse it once per (path, mtime, size) instead of once per call.
+# refresh; parse it once per (files, mtimes, sizes) instead of once per call.
 _items_cache: dict = {}
 _items_lock = threading.Lock()
 
 
+def _files_key(path: str) -> tuple[list[str], tuple | None]:
+    files = rss_news_log.log_files(path)
+    key = []
+    for f in files:
+        try:
+            st = os.stat(f)
+        except OSError:
+            return files, None
+        key.append((f, st.st_mtime_ns, st.st_size))
+    return files, tuple(key)
+
+
 def read_items(path: str) -> list[dict]:
-    """Newest-first rows from the newest WINDOW_LINES of the log.
+    """Newest-first rows from the newest WINDOW_LINES of the history
+    (the newest monthly files first, older ones only to fill the window).
 
     Callers must not mutate the returned rows (they are shared).
     """
-    try:
-        st = os.stat(path)
-        key = (path, st.st_mtime_ns, st.st_size)
-    except OSError:
-        key = None
+    files, key = _files_key(path)
     with _items_lock:
         hit = _items_cache.get("v")
         if key is not None and hit and hit[0] == key:
             return list(hit[1])
-    rows = _parse_items(path)
+    rows = _parse_items(files)
     if key is not None:
         with _items_lock:
             _items_cache["v"] = (key, rows)
     return list(rows)
 
 
-def _parse_items(path: str) -> list[dict]:
+def _window_lines(files: list[str]) -> list[str]:
+    lines: list[str] = []
+    for f in reversed(files):
+        got = fileio.tail_lines(f, WINDOW_LINES - len(lines), WINDOW_BYTES)
+        lines = got + lines
+        try:
+            cut = os.path.getsize(f) > WINDOW_BYTES   # its older lines were not read
+        except OSError:
+            cut = True
+        if len(lines) >= WINDOW_LINES or cut:
+            break
+    return lines
+
+
+def _parse_items(files: list[str]) -> list[dict]:
     rows = []
-    for line in fileio.tail_lines(path, WINDOW_LINES, WINDOW_BYTES):
+    for line in _window_lines(files):
         line = line.strip()
         if not line:
             continue

@@ -1,21 +1,25 @@
 name: Auto-merge gate
 
-# Public-repo workflow. pull_request_target runs the copy of this file that
-# is already on master and can see secrets, so every job:
+# Public-repo workflow. pull_request_target and workflow_run run the copy of
+# this file that is already on master and can see secrets, so every job:
 #   - checks out master only (sparse scripts/ci), never the PR head
-#   - passes the PR number and other inputs through env, never inside run:
+#   - passes inputs through env, never inside run:
 #   - re-reads the live pull request in scripts/ci/auto_merge_gate.py and
-#     stops unless it is open, same-repo, and targeting master
-# trigger-sage is read-only and is the only job that receives the Sage
-# webhook secrets. eval-approval-gate can write the status, resolve a bot thread,
-# and enable auto-merge, and it does not receive those secrets.
+#     ignores a fork. trigger-sage, retrigger-reed, and eval-approval-gate
+#     also require an open PR into master.
+# trigger-sage, retrigger-reed, and notify-selina are read-only and each
+# receives only its own webhook secrets. eval-approval-gate can write the
+# status, resolve a bot thread, and enable auto-merge, and it receives none.
 
 on:
   pull_request_target:
     branches: [master]
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, closed]
   pull_request_review:
     types: [submitted, dismissed]
+  workflow_run:
+    workflows: ["Tests", "Claude Review"]
+    types: [completed]
 
 jobs:
   trigger-sage:
@@ -89,3 +93,91 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 scripts/ci/auto_merge_gate.py gate
+
+  retrigger-reed:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    concurrency:
+      group: retrigger-reed-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Retrigger Reed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REED_QA_WEBHOOK_URL: ${{ secrets.REED_QA_WEBHOOK_URL }}
+          REED_QA_WEBHOOK_KEY: ${{ secrets.REED_QA_WEBHOOK_KEY }}
+        run: python3 scripts/ci/auto_merge_gate.py retrigger-reed
+
+  notify-selina:
+    if: >-
+      (
+        github.event_name == 'pull_request_review' &&
+        github.event.action == 'submitted' &&
+        github.event.review.user.login == 'cursor[bot]' &&
+        github.event.pull_request.state == 'open' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      ) ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (
+          github.event.workflow_run.conclusion == 'failure' ||
+          (
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.name == 'Claude Review'
+          )
+        )
+      ) ||
+      (
+        github.event_name == 'pull_request_target' &&
+        github.event.action == 'closed' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    concurrency:
+      group: notify-selina-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Notify Selina
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          MERGED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          SELINA_QA_WEBHOOK_URL: ${{ secrets.SELINA_QA_WEBHOOK_URL }}
+          SELINA_QA_WEBHOOK_KEY: ${{ secrets.SELINA_QA_WEBHOOK_KEY }}
+        run: python3 scripts/ci/auto_merge_gate.py notify-selina

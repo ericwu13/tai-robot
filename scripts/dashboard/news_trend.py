@@ -3,16 +3,25 @@ time axis (``GET /api/news/trend[?symbol=&after=]``).
 
 Two series, both TPE wall clock encoded as UTC (the page's chart convention):
 
-* ``runs`` — one point per W3 scoring pass, from the WHOLE news log (the
-  /api/news table only reads the newest lines). History therefore reaches
-  as far back as the log does; the bridge trims it at
-  ``rss_news_log.MAX_BYTES`` / ``KEEP_LINES``, not this page.
+* ``runs`` — one point per W3 scoring pass, from EVERY history file
+  (``rss_news_log.log_files``: the monthly files plus any pre-split
+  ``news_log.jsonl``; the /api/news table only reads the newest lines).
+  Each file is parsed once per stat change, so a finished month is parsed
+  once per dashboard process and only the current month is re-read.
 * ``candles`` — 30-min OHLC of one index-futures symbol, session-aligned
   like the bots' own bars (``session_align``), built from every bot's
   ``bars_1m_*.csv`` for that symbol. Bots on the same symbol hold the same
   1-min bars, so their buckets are merged (union), which also fills a day
   one bot missed. Only files from the day before the oldest run onward are
   read.
+
+* ``ghost`` on each run — the momentum comparison line: TMF's own price
+  change between consecutive runs pushed through the scorer's exact EMA
+  (``rss_scorer.EMA_DECAY`` per run, reset when the session key changes),
+  then scaled so its typical size (median |value|) matches ``session_net``'s
+  — a median, so one crash day does not set the scale for every other day. Where the W3 line sits
+  on top of it, the score is saying what price already did. Prices are the
+  close of the last candle that had ENDED by the run (no look-ahead).
 
 ``after`` (chart seconds) returns only points at or after it, so the page
 loads the full history once and then asks for the tail each refresh. The
@@ -29,12 +38,15 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from scripts.dashboard import fileio, news_feed, snapshot
+from scripts.news_bridge import rss_news_log
 
 TREND_INTERVAL_S = 1800                    # matches the scorer's 30-min cadence
 # Index futures, most liquid first: the tie-break when two symbols cover
 # the same number of days. Any other symbol can still be asked for.
 PREFERRED_SYMBOLS = ("TX00", "MTX00", "TMF00")
 _INDEX_PREFIXES = ("TX", "MTX", "TMF")
+
+_FALLBACK_DECAY = 0.8409      # rss_scorer.EMA_DECAY (2 h half-life, one step per 30-min run)
 
 _lock = threading.Lock()
 _runs_cache: dict = {}
@@ -60,11 +72,11 @@ def _stat_key(path: str):
 
 # ── runs: every scoring pass in the log ──────────────────────────────────
 
-def _parse_runs(path: str) -> list[dict]:
+def _parse_runs(path: str) -> dict[int, dict]:
     text = fileio.read_text(path)
-    if not text:
-        return []
     by_t: dict[int, dict] = {}
+    if not text:
+        return by_t
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -90,13 +102,10 @@ def _parse_runs(path: str) -> list[dict]:
                              "n": 0, "bullish": 0, "bearish": 0, "neutral": 0}
         run["n"] += 1
         run[r["direction"]] += 1
-    return [by_t[t] for t in sorted(by_t)]
+    return by_t
 
 
-def read_runs(path: str | None) -> list[dict]:
-    """Oldest-first scoring passes from the whole log (shared; don't mutate)."""
-    if not path:
-        return []
+def _file_runs(path: str) -> dict[int, dict]:
     key = _stat_key(path)
     with _lock:
         hit = _runs_cache.get(path)
@@ -105,9 +114,23 @@ def read_runs(path: str | None) -> list[dict]:
     runs = _parse_runs(path)
     if key is not None:
         with _lock:
-            _runs_cache.clear()
             _runs_cache[path] = (key, runs)
     return runs
+
+
+def read_runs(path: str | None) -> list[dict]:
+    """Oldest-first scoring passes from every history file (shared; don't
+    mutate). Files are oldest first, so a later file wins a shared second."""
+    if not path:
+        return []
+    files = rss_news_log.log_files(path)
+    with _lock:                 # forget files that no longer exist
+        for stale in set(_runs_cache) - set(files):
+            del _runs_cache[stale]
+    by_t: dict[int, dict] = {}
+    for f in files:
+        by_t.update(_file_runs(f))
+    return [by_t[t] for t in sorted(by_t)]
 
 
 # ── candles: 30-min buckets per bar file, merged across bots ─────────────
@@ -195,6 +218,53 @@ def build_candles(file_list: list[tuple[str, str]], since_day: str = "") -> list
             for b, v in sorted(merged.items())]
 
 
+# ── momentum comparison line ─────────────────────────────────────────────
+
+def ema_decay() -> float:
+    try:
+        from scripts.news_bridge import rss_scorer
+        return float(rss_scorer.EMA_DECAY)
+    except Exception:  # noqa: BLE001 — advisory
+        return _FALLBACK_DECAY
+
+
+def _median_abs(xs: list[float]) -> float:
+    a = sorted(abs(x) for x in xs)
+    if not a:
+        return 0.0
+    mid = len(a) // 2
+    return a[mid] if len(a) % 2 else (a[mid - 1] + a[mid]) / 2
+
+
+def momentum_ghost(runs: list[dict], candles: list[dict],
+                   interval: int = TREND_INTERVAL_S) -> list[float | None]:
+    """One value per run (None before the first known price).
+
+    raw_t = raw_prev * decay + (price_t - price_prev), reset to the move
+    alone when ``session`` changes, then scaled by median|session_net| /
+    median|raw| over the runs that have a value.
+    """
+    decay = ema_decay()
+    ends = [c["time"] + interval for c in candles]
+    raw: list[float | None] = []
+    i, prev_px, prev_sess, acc = -1, None, None, 0.0
+    for r in runs:
+        while i + 1 < len(ends) and ends[i + 1] <= r["t"]:
+            i += 1
+        px = candles[i]["close"] if i >= 0 else None
+        if px is None:
+            raw.append(None)
+            continue
+        move = 0.0 if prev_px is None else px - prev_px
+        acc = move if r["session"] != prev_sess else acc * decay + move
+        prev_px, prev_sess = px, r["session"]
+        raw.append(acc)
+    have = [(g, r["session_net"]) for g, r in zip(raw, runs) if g is not None]
+    sg, sn = _median_abs([g for g, _ in have]), _median_abs([n for _, n in have])
+    k = sn / sg if sg > 0 else 0.0
+    return [None if g is None else round(g * k, 3) for g in raw]
+
+
 # ── payload ──────────────────────────────────────────────────────────────
 
 def trend(news_log_path: str | None, base_dir: str, symbol: str = "",
@@ -206,6 +276,8 @@ def trend(news_log_path: str | None, base_dir: str, symbol: str = "",
     if runs:
         since_day = (_wall(runs[0]["t"]) - timedelta(days=1)).strftime("%Y%m%d")
     candles = build_candles(files.get(sym, []), since_day) if sym else []
+    ghost = momentum_ghost(runs, candles)
+    runs = [dict(r, ghost=g) for r, g in zip(runs, ghost)]
     if after is not None:
         runs = [r for r in runs if r["t"] >= after]
         # The newest bucket may still be forming: always send it again.
@@ -214,5 +286,5 @@ def trend(news_log_path: str | None, base_dir: str, symbol: str = "",
     symbols = sorted(files, key=lambda s: (not _is_index(s), s))
     return {"symbol": sym, "symbols": symbols, "interval": TREND_INTERVAL_S,
             "runs": [{"t": r["t"], "run_net": r["run_net"], "session_net": r["session_net"],
-                      "session": r["session"], "n": r["n"]} for r in runs],
+                      "session": r["session"], "n": r["n"], "ghost": r["ghost"]} for r in runs],
             "candles": candles}
