@@ -1188,16 +1188,31 @@ def test_retrigger_reed_earlier_failed_review_then_success(monkeypatch):
 _REAL_WAIT = (
     "Verdict: WAIT. Head `198c18dd975189cc8ddb710385ec481039c99981`. No P1/P2."
 )
+# Review 5988850983 on #347. reed-qa-v4 wrote this platform line a second time.
+_V4_MARKER = (
+    "<!-- CURSOR_AUTOMATION_ID: 91d043c7-dbb9-11f1-8120-06b44be262b7"
+    " | RUN_ID: bc-53529c63-0ed4-4d63-a3d1-fdccebc44d07 -->"
+)
 
 
-@pytest.mark.parametrize("rest", [
-    "\n\n**WAIT**\n",
-    "\n" + _REAL_WAIT + "\n",
-    "\nverdict: WAIT. Head `abc`.\n",
-    "\n\n**WAIT**\n\nbody mentions **CHANGES NEEDED** later\n",
-])
-def test_retrigger_reed_wait_verdicts_post(monkeypatch, rest):
-    body = marker(REED, rest)
+def _v4_review(verdict, markers):
+    return "\n".join([_V4_MARKER] * markers + [f"**{verdict}**"]) + "\n"
+
+
+@pytest.mark.parametrize("verdict", ["WAIT", "CHANGES NEEDED"])
+def test_reed_verdict_skips_a_second_automation_marker(verdict):
+    assert mod.reed_verdict(_v4_review(verdict, 2)) == verdict
+
+
+@pytest.mark.parametrize("body", [
+    marker(REED, "\n\n**WAIT**\n"),
+    marker(REED, "\n" + _REAL_WAIT + "\n"),
+    marker(REED, "\nverdict: WAIT. Head `abc`.\n"),
+    marker(REED, "\n\n**WAIT**\n\nbody mentions **CHANGES NEEDED** later\n"),
+    _v4_review("WAIT", 1),
+    _v4_review("WAIT", 2),
+], ids=["bold", "sentence", "lowercase", "later-line", "single-marker", "double-marker"])
+def test_retrigger_reed_wait_verdicts_post(monkeypatch, body):
     assert mod.reed_verdict(body) == "WAIT"
     rc, _, posts = _run_reed(
         monkeypatch, [make_pr(number=7)],
@@ -1208,17 +1223,23 @@ def test_retrigger_reed_wait_verdicts_post(monkeypatch, rest):
     assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
 
 
-@pytest.mark.parametrize("rest", [
-    "\n\n**CHANGES NEEDED**\n",
-    "\nVerdict: CHANGES NEEDED. Head `198c18dd975189cc8ddb710385ec481039c99981`.\n",
-    "\nverdict: CHANGES NEEDED\n",
-    "\n\nno verdict\n",
-    "\nVerdict: LGTM\n",
-    "\n\n",
+@pytest.mark.parametrize("body,verdict", [
+    (marker(REED, "\n\n**CHANGES NEEDED**\n"), "CHANGES NEEDED"),
+    (marker(
+        REED,
+        "\nVerdict: CHANGES NEEDED. Head `198c18dd975189cc8ddb710385ec481039c99981`.\n",
+    ), "CHANGES NEEDED"),
+    (marker(REED, "\nverdict: CHANGES NEEDED\n"), "CHANGES NEEDED"),
+    (_v4_review("CHANGES NEEDED", 1), "CHANGES NEEDED"),
+    (marker(REED, "\n\nno verdict\n"), None),
+    (marker(REED, "\nVerdict: LGTM\n"), None),
+    (marker(REED, "\n\n"), None),
+], ids=[
+    "bold", "sentence", "lowercase", "single-marker",
+    "no-verdict", "lgtm", "blank",
 ])
-def test_retrigger_reed_non_wait_verdicts_skip(monkeypatch, rest):
-    body = marker(REED, rest)
-    assert mod.reed_verdict(body) != "WAIT"
+def test_retrigger_reed_non_wait_verdicts_skip(monkeypatch, body, verdict):
+    assert mod.reed_verdict(body) == verdict
     rc, world, posts = _run_reed(
         monkeypatch, [make_pr(number=7)],
         reviews=[review("COMMENTED", REED, body=body)],

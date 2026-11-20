@@ -603,15 +603,17 @@ _CHECK_FOR_WORKFLOW = {"Tests": "test", "Claude Review": "review"}
 def reed_verdict(body):
     """WAIT or CHANGES NEEDED from the first non-empty line after the marker.
 
-    ``**WAIT**`` and ``Verdict: WAIT...`` both return ``WAIT``. The same two
-    shapes apply to CHANGES NEEDED. Later lines are ignored.
+    Lines whose stripped text starts with ``<!--`` are skipped, so one or two
+    automation markers both leave the verdict. ``**WAIT**`` and
+    ``Verdict: WAIT...`` both return ``WAIT``. The same two shapes apply to
+    CHANGES NEEDED. Later lines are ignored.
     """
     text = body if isinstance(body, str) else ""
     if text.startswith("\ufeff"):
         text = text.lstrip("\ufeff")
     found = ""
     for line in text.split("\n")[1:]:
-        if line.strip():
+        if line.strip() and not line.strip().startswith("<!--"):
             found = line
             break
     if not found:
