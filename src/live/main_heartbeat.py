@@ -677,32 +677,21 @@ class HangWatchdog:
                     self._running = False
 
     def _poll(self) -> None:
-        """One watchdog wake. A huge gap is this thread sleeping, not a hang."""
+        """One watchdog wake. A late wake still counts a stalled heartbeat."""
         now_mono = time.monotonic()
         prev = self._last_loop_mono
         self._last_loop_mono = now_mono
         gap = 0.0 if prev is None else now_mono - prev
-        # Much larger than the poll (5×, at least 1s): OS sleep or a stalled
-        # wake. Skip the decision and adopt the file as the new baseline.
-        # Do not clear the latch — a hang that started before the sleep is
-        # still the same episode.
+        # Much larger than the poll (5×, at least 1s): this thread woke
+        # late (the process was frozen, or the OS slept). Log the gap and
+        # still judge the heartbeat. A ts that did not advance is a stall.
+        # Do not reset the stall clock. A P1 after a real sleep is right:
+        # the bot did not run.
         if gap > max(self.poll_s * 5.0, 1.0):
             logger.warning(
-                "hang watchdog wake-gap rebase gap=%.3fs poll_s=%.3fs",
+                "hang watchdog wake-gap gap=%.3fs poll_s=%.3fs",
                 gap, self.poll_s)
-            self._rebase(now_mono)
-            return
         self._check_once(now_mono)
-
-    def _rebase(self, now_mono: float) -> None:
-        """Treat the current file as just observed. Leave ``_latched`` alone."""
-        self._seen_mono = now_mono
-        self._seen_inflight_mono = now_mono
-        hb = _load_heartbeat(self.bot_dir)
-        if not isinstance(hb, dict):
-            return
-        self._seen_ts = _hb_ts(hb)
-        self._seen_inflight_key = _inflight_key(hb)
 
     def _check_once(self, now_mono: float | None = None) -> None:
         if now_mono is None:
@@ -741,9 +730,10 @@ class HangWatchdog:
                          and inflight_stall > self.inflight_hung_s)
         if not hung_heartbeat and not hung_inflight:
             # Re-arm only when a new timestamp is actually fresh. A missing
-            # file, an unreadable file, or a wake-gap rebase of the same
-            # ts must not clear the latch (that would send a second P1).
-            # A heartbeat that never went HUNG does not alert.
+            # file or an unreadable file must not clear the latch (that
+            # would send a second P1). A late wake does not reset the stall
+            # clock, so the same ts across that gap is a stall above, not
+            # a recovery. A heartbeat that never went HUNG does not alert.
             if (self._latched and ts is not None and ts != self._latched_ts
                     and hb_stall is not None and hb_stall <= self.hung_s):
                 self._on_recovered(now_mono)

@@ -284,7 +284,8 @@ def test_default_thresholds_and_strict_boundaries(tmp_path):
     assert "LeaveMonitor" in _p1(alerts)[0]
 
 
-def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_path, monkeypatch):
+def test_wall_jump_no_false_alarm_stalled_wake_is_hung_backward_jump_still_hung(
+        tmp_path, monkeypatch):
     alerts = []
     writer = HeartbeatWriter(str(tmp_path))
     writer.write()
@@ -309,14 +310,24 @@ def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_pat
     writer.write()
     watchdog = HangWatchdog(
         str(sleep_dir), hung_s=90.0, poll_s=2.0, alert_fn=alerts.append)
-    # Unlatched. A resume whose wake gap is ~600s must rebase, not P1.
+    # Unlatched. A ~600s wake gap with an unchanged heartbeat ts is one P1.
     assert watchdog._latched is False
     watchdog._poll()
+    dumps = {"n": 0}
+    real_dump = hb.dump_thread_stacks
+
+    def counting(path):
+        dumps["n"] += 1
+        return real_dump(path)
+
+    monkeypatch.setattr(hb, "dump_thread_stacks", counting)
     watchdog._seen_mono = time.monotonic() - 600.0
     watchdog._last_loop_mono = time.monotonic() - 600.0
     watchdog._poll()
-    assert alerts == [], "resume from sleep must not false-P1"
-    assert watchdog._latched is False
+    assert len(_p1(alerts)) == 1
+    assert watchdog._latched is True
+    assert dumps["n"] == 1
+    alerts.clear()
     # An episode that was already latched stays latched across that wake.
     watchdog._latched = True
     watchdog._latched_ts = hb.read_heartbeat(writer.path)["ts"]
@@ -327,13 +338,67 @@ def test_wall_jump_and_sleep_do_not_false_alarm_backward_jump_still_hung(tmp_pat
     assert watchdog._latched is True
     watchdog._poll()
     assert alerts == []
-    assert watchdog._latched is True, "wake rebase must not re-arm the latch"
+    assert watchdog._latched is True, "a late wake must not re-arm the latch"
+    assert dumps["n"] == 1, "a latched wake must not dump stacks again"
     # A modest wake (2× poll) is not a sleep. A real stall still alerts.
     watchdog._latched = False
     watchdog._seen_mono = time.monotonic() - 91.0
     watchdog._last_loop_mono = time.monotonic() - (watchdog.poll_s * 2)
     watchdog._poll()
     assert len(_p1(alerts)) == 1
+
+
+def test_stalled_heartbeat_across_wake_gap_latches_one_p1(tmp_path):
+    """A heartbeat that did not advance across a late wake is one P1."""
+    alerts = []
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write()
+    watchdog = HangWatchdog(
+        str(tmp_path), hung_s=90.0, poll_s=2.0, alert_fn=alerts.append)
+    watchdog._poll()
+    assert _p1(alerts) == []
+    assert watchdog._latched is False
+    watchdog._seen_mono = time.monotonic() - 200.0
+    watchdog._last_loop_mono = time.monotonic() - 200.0
+    watchdog._poll()
+    assert len(_p1(alerts)) == 1
+    assert watchdog._latched is True
+    alerts.clear()
+    watchdog._last_loop_mono = time.monotonic() - 200.0
+    watchdog._poll()
+    assert _p1(alerts) == []
+    assert watchdog._latched is True
+
+
+def test_fresh_heartbeat_across_wake_gap_gives_no_p1(tmp_path):
+    """A heartbeat that advanced across a late wake is not a P1.
+
+    An episode that was already latched clears on that fresh ts and
+    still does not send a P1.
+    """
+    alerts = []
+    writer = HeartbeatWriter(str(tmp_path))
+    writer.write(now=1_000.0)
+    watchdog = HangWatchdog(
+        str(tmp_path), hung_s=90.0, poll_s=2.0, alert_fn=alerts.append)
+    watchdog._poll()
+    writer.write(now=1_600.0)
+    watchdog._seen_mono = time.monotonic() - 600.0
+    watchdog._last_loop_mono = time.monotonic() - 600.0
+    watchdog._poll()
+    assert _p1(alerts) == []
+    assert watchdog._latched is False
+    assert watchdog._seen_ts == 1_600.0
+    assert not (tmp_path / "hang.json").exists()
+
+    watchdog._latched = True
+    watchdog._latched_ts = 1_600.0
+    watchdog._last_alert_mono = time.monotonic()
+    writer.write(now=1_700.0)
+    watchdog._last_loop_mono = time.monotonic() - 600.0
+    watchdog._poll()
+    assert _p1(alerts) == []
+    assert watchdog._latched is False
 
 
 def test_alert_goes_out_when_dump_fails_and_missing_file_does_not_rearm(tmp_path, monkeypatch):
