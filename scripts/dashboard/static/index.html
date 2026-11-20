@@ -370,7 +370,7 @@ details.pnl[open] > summary::before { content: "▾"; }
     <div class="panel trend-panel">
       <div class="section-title">情緒走勢 vs 價格
         <label class="trend-sym">價格 <select id="n-sym"></select></label>
-        <span class="legend">K 線＝30 分鐘價格（右軸，紅漲綠跌）；線＝盤別累計情緒（左軸，每輪衰減後加總，只在評分時變動）；底部柱＝單輪淨值；虛線＝投票門檻。往左拖曳看更早的紀錄。</span></div>
+        <span class="legend">K 線＝30 分鐘價格（右軸，紅漲綠跌）；線＝盤別累計情緒（左軸，每輪衰減後加總，只在評分時變動）；灰虛線＝價格動能對照（同一衰減公式套在價格變動上，等比例縮放：情緒線貼著它走＝只是在描述已發生的漲跌）；底部柱＝單輪淨值；虛線＝投票門檻。往左拖曳看更早的紀錄。</span></div>
       <div class="chart news" id="n-chart"></div>
       <div class="sub muted" id="n-trend-note"></div>
     </div>
@@ -1538,6 +1538,10 @@ const App = {
       this.newsHist = this.newsChart.addHistogramSeries({ priceScaleId: "run", priceLineVisible: false,
         lastValueVisible: false, priceFormat: senti });
       this.newsChart.priceScale("run").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 }, visible: false });
+      // Momentum comparison: price change through the same EMA, same scale.
+      this.newsGhost = this.newsChart.addLineSeries({ priceScaleId: "left", lineType: 1, lineWidth: 1,
+        lineStyle: 2, color: this.css("--muted"), priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false, priceFormat: senti });
       this.newsLine = this.newsChart.addLineSeries({ priceScaleId: "left", lineType: 1, lineWidth: 2,
         color: this.css("--ok"), priceLineVisible: false, priceFormat: senti });
       this.newsLines = [];
@@ -1546,6 +1550,7 @@ const App = {
     this.newsHist.setData(runs.map((r) => ({ time: r.t, value: r.run_net,
       color: this.rgba(r.run_net >= 0 ? up : down, 0.45) })));
     this.newsLine.setData(runs.map((r) => ({ time: r.t, value: r.session_net })));
+    this.newsGhost.setData(runs.filter((r) => r.ghost != null).map((r) => ({ time: r.t, value: r.ghost })));
     for (const l of this.newsLines) this.newsLine.removePriceLine(l);
     const T = this.pulse.threshold;
     this.newsLines = [
