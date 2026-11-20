@@ -3,10 +3,11 @@
 For a bot in ``trading.shared_book_opt_in``, lots on the account that the
 bots' own ``position_log.jsonl`` files account for are not orphans:
 
-* account lots on the product == sum of every bot dir's own logged position
-  → the pre-deploy "Existing Position" prompt is skipped, resume checks the
-  bot's OWN logged lot against the restored sim, and the dashboard switch
-  to auto is not refused for other bots' lots;
+* the account's open rows equal the logged positions — one row by signed
+  sum (a netted book still matches opposite logs), more than one row by
+  long qty and short qty — → the pre-deploy "Existing Position" prompt is
+  skipped, resume checks the bot's OWN logged lot against the restored sim,
+  and the dashboard switch to auto is not refused for other bots' lots;
 * anything else (another product or options row, an unreadable log, a
   mismatch, own lot on a new deploy / paper→auto) keeps master's path.
 
@@ -164,6 +165,30 @@ def test_attribute(rows, positions, own_may_hold, ok):
                        own_may_hold=own_may_hold)
     assert att.ok is ok
     assert att.reason
+
+
+def test_offsetting_open_rows_with_empty_logs_are_not_accounted():
+    """Long 1 + short 1 with empty logs is not a flat book."""
+    att = sb.attribute(
+        [_row("B", 1), _row("S", 1)], "TM", FUTURES_OI_MARKET,
+        {}, "me", own_may_hold=False)
+    assert att.ok is False
+
+
+def test_split_rows_net_matching_one_log_are_not_accounted():
+    """Long 2 + short 1 against a log of +1 leaves the short unexplained."""
+    att = sb.attribute(
+        [_row("B", 2), _row("S", 1)], "TM", FUTURES_OI_MARKET,
+        {"me": 1}, "me", own_may_hold=True)
+    assert att.ok is False
+
+
+def test_split_rows_match_when_logged_long_and_short_match():
+    """Long 1 + short 1 with logged +1 and -1 is the multi-row match."""
+    att = sb.attribute(
+        [_row("B", 1), _row("S", 1)], "TM", FUTURES_OI_MARKET,
+        {"me": 1, "other": -1}, "me", own_may_hold=True)
+    assert att.ok is True
 
 
 # ── path 1: pre-deploy "Existing Position" prompt ──
