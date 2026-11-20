@@ -207,7 +207,7 @@ class _HoldingMonitor(AccountMonitor):
 
 
 def _deploy(monkeypatch, tmp_path, *, rows, opted_in, journals, mode="auto",
-            dead=()):
+            dead=(), resume_session=None):
     import tests.test_issue_202_predeploy_position as t202
     live = tmp_path / "data" / "live"
     live.mkdir(parents=True)
@@ -221,7 +221,8 @@ def _deploy(monkeypatch, tmp_path, *, rows, opted_in, journals, mode="auto",
     monkeypatch.setattr(rb, "_bot_process_alive",
                         lambda d: os.path.basename(d) not in dead)
     return t202._run_gate(monkeypatch, mode=mode, policy=hl.HeadlessPolicy(),
-                          code=0, answer_snapshot=True)
+                          code=0, answer_snapshot=True,
+                          resume_session=resume_session)
 
 
 B_LONG_ROW = "TF,ACCT,TMFL6,B,1,0,22500.0,15,2,ID"
@@ -250,6 +251,53 @@ def test_deploy_still_prompts_for_an_unlogged_lot(monkeypatch, tmp_path):
     assert [t for t, _d in gate.confirms] == [hl.TITLE_EXISTING_POSITION]
     assert gate.continued == []
     assert gate.exit_code == hl.EXIT_DEPLOY_REFUSED
+
+
+def _resume_session(position_size):
+    """A saved session whose broker size is what ``to_dict`` stores."""
+    broker = {} if position_size is None else {"position_size": position_size}
+    return {
+        "strategy": next(iter(rb.STRATEGIES)),
+        "broker": broker,
+    }
+
+
+def test_flat_resume_over_own_logged_lot_keeps_the_prompt(monkeypatch, tmp_path):
+    """A resume whose saved broker is flat still prompts.
+
+    ``session.json`` carries the sim size at ``broker.position_size``.
+    A STOP whose IOC close never filled leaves that at 0 while this
+    bot's journal and the account still show the lot. This process
+    comes up flat, so the lot is an orphan and the prompt stays.
+    """
+    gate = _deploy(
+        monkeypatch, tmp_path, rows=[B_LONG_ROW], opted_in=True,
+        journals={"TMF00_issue202": ["BUY"]},
+        resume_session=_resume_session(0))
+    assert [t for t, _d in gate.confirms] == [hl.TITLE_EXISTING_POSITION]
+    assert gate.continued == []
+
+
+@pytest.mark.parametrize("position_size", [None, "1", "nope"])
+def test_resume_with_unknown_position_size_keeps_the_prompt(
+        monkeypatch, tmp_path, position_size):
+    """A missing or non-numeric ``broker.position_size`` is not a hold."""
+    gate = _deploy(
+        monkeypatch, tmp_path, rows=[B_LONG_ROW], opted_in=True,
+        journals={"TMF00_issue202": ["BUY"]},
+        resume_session=_resume_session(position_size))
+    assert [t for t, _d in gate.confirms] == [hl.TITLE_EXISTING_POSITION]
+    assert gate.continued == []
+
+
+def test_resume_holding_its_logged_lot_skips_the_prompt(monkeypatch, tmp_path):
+    """The restored broker really holds the lot, so the prompt is skipped."""
+    gate = _deploy(
+        monkeypatch, tmp_path, rows=[B_LONG_ROW], opted_in=True,
+        journals={"TMF00_issue202": ["BUY"]},
+        resume_session=_resume_session(1))
+    assert hl.TITLE_EXISTING_POSITION not in [t for t, _d in gate.confirms]
+    assert gate.continued
 
 
 def test_new_deploy_over_own_logged_lot_still_prompts(monkeypatch, tmp_path):

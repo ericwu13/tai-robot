@@ -185,7 +185,7 @@ class _Gate:
 
 def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
               answer_snapshot=False, bare_hash=False, use_driver=True,
-              gui_answer=None):
+              gui_answer=None, resume_session=None):
     """Drive ``_deploy_live_from`` up to the position gate.
 
     ``gui_answer`` uses the real GUI ``_confirm`` (messagebox is patched
@@ -273,7 +273,9 @@ def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
     monkeypatch.setattr(
         rb.LiveRunner, "check_lock", lambda bot_dir: (False, 0))
 
-    req = DeployRequest(bot_name="issue202", trading_mode=mode, loss_limit="1000")
+    req = DeployRequest(
+        bot_name="issue202", trading_mode=mode, loss_limit="1000",
+        resume_session=resume_session)
     app._deploy_live_from = lambda request: rb.BacktestApp._deploy_live_from(app, request)
     gate.app = app
 

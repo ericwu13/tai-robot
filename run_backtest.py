@@ -1648,6 +1648,26 @@ def _bot_process_alive(bot_dir: str) -> bool:
     return LiveRunner._pid_alive(pid)
 
 
+def _resumed_broker_open(resume_session) -> bool:
+    """True when a resume restores a positive ``broker.position_size``.
+
+    ``SimulatedBroker.to_dict`` writes that size into ``session.json``.
+    The pre-deploy shared-book check may count this bot's own journal
+    only then. A missing broker, a missing size, or a non-numeric size
+    is flat: this process would not manage that lot, so the orphan
+    prompt stays.
+    """
+    if not isinstance(resume_session, dict):
+        return False
+    broker = resume_session.get("broker")
+    if not isinstance(broker, dict):
+        return False
+    size = broker.get("position_size", 0)
+    if isinstance(size, bool) or not isinstance(size, (int, float)):
+        return False
+    return size > 0
+
+
 class BacktestApp:
     def __init__(self, root: tk.Tk):
         global _app
@@ -9706,11 +9726,14 @@ class BacktestApp:
                 # Class lookups: deploy-path test doubles are not BacktestApp.
                 if (self._account_monitor.has_open_positions()
                         and BacktestApp._is_shared_book_bot(self, bot_name)):
-                    # Opted-in bot: lots that every bot's own log accounts
-                    # for are other bots' (or, on resume, this bot's own),
-                    # not an orphan. Anything else keeps the prompt.
+                    # Opted-in bot: another bot's logged lot is not an orphan.
+                    # This bot's own journal counts only when the saved
+                    # broker position_size is positive. A flat resume
+                    # (a STOP whose close never filled) still prompts.
+                    # A missing or non-numeric size is flat.
                     att = BacktestApp._shared_book_attribution(
-                        self, bot_dir, symbol, own_may_hold=bool(resume_session))
+                        self, bot_dir, symbol,
+                        own_may_hold=_resumed_broker_open(resume_session))
                     shared_ok = att.ok
                     _log(f"[SHARED BOOK] pre-deploy: "
                          f"{'accounted' if att.ok else 'not accounted'} "
