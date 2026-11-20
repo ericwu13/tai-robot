@@ -78,6 +78,11 @@ def test_build_backfill_matches_w4_and_keeps_hindcast_separate():
     assert r17["delta_oi"] == -1109.0 and "contradiction" in r17["hindcast_reason"]
     r18 = rows["20261118"]                                      # -1,542, flat equity
     assert r18["delta_oi"] == -1542.0 and r18["hindcast_reason"].startswith("weak")
+    # Same keys W4's daily row writes: night session of the data date, and
+    # ``at`` empty because this day was never observed live.
+    for key, row in rows.items():
+        assert row.get("session") == f"{key[:4]}-{key[4:6]}-{key[6:]}|NIGHT"
+        assert row.get("at") == ""
 
 
 def test_gap_longer_than_w4_allows_has_no_delta():
@@ -128,6 +133,19 @@ def test_apply_fills_only_uncovered_dates_and_never_touches_state(tmp_path, monk
     # 11/13 and 11/16 come from the real log; only 11/12 needs TAIFEX + TWSE.
     assert by_date["20261113"] == ["log"] and by_date["20261116"] == ["log"]
     assert by_date["20261112"] == ["backfill"] and calls == ["20261112"]
+    # Every row this apply appends carries session + at. Log rows keep the
+    # timestamp W4 logged; a remote backfill has no observation time.
+    expect = {
+        "20261112": ("backfill", "2026-11-12|NIGHT", ""),
+        "20261113": ("log", "2026-11-13|NIGHT", "2026-11-13T16:15:01+08:00"),
+        "20261116": ("log", "2026-11-16|NIGHT", "2026-11-16T18:15:01+08:00"),
+    }
+    written = {x["date"]: x for x in _lines(d) if x["src"] != "live"}
+    assert set(written) == set(expect)
+    for date, (src, session, at) in expect.items():
+        row = written[date]
+        assert row["src"] == src
+        assert row.get("session") == session and row.get("at") == at
     assert (d / cm.STATE_NAME).read_bytes() == state_before
     assert not cm.w4_vote_path(str(d / "regime_vote.json")).exists()
 

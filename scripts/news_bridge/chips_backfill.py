@@ -145,7 +145,8 @@ def build_backfill(levels: dict[str, float], equity: dict[str, float | None],
         out[key] = {
             "net_oi": levels[key], "delta_oi": delta, "prev_date": prev,
             "equity_net": eq, "decision": None, "reason": BACKFILL_REASON,
-            "final": eq is not None,                 # W4's rule: retry without equity "session": f"{key[:4]}-{key[4:6]}-{key[6:]}|NIGHT", "at": "",
+            "final": eq is not None,  # W4's rule: retry without equity
+            "session": f"{key[:4]}-{key[4:6]}-{key[6:]}|NIGHT", "at": "",
             "hindcast_decision": hindcast, "hindcast_reason": why,
         }
     return out
