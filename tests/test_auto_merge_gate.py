@@ -1306,6 +1306,33 @@ def test_retrigger_reed_only_the_newer_check_posts(
     assert _bodies(posted) == [{"pr": 7, "head_sha": SHA}]
 
 
+def test_retrigger_reed_review_event_with_pr_head_does_not_fail(monkeypatch, capsys):
+    """HEAD_SHA set to the PR head must not fail the review path."""
+    pr = make_pr(number=7)
+    rc, world, posts = _run_reed(
+        monkeypatch,
+        [make_pr(number=99, head={"sha": OTHER_SHA})],
+        pr=pr,
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=green_checks(),
+        event="pull_request_review",
+        head_sha=SHA,
+        workflow_name="",
+    )
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "not a 40-char hex sha" not in err
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+    gets = _gets(world)
+    assert f"repos/{REPO}/pulls/7" in gets
+    assert not any("state=open" in g for g in gets)
+
+
+def test_require_sha_accepts_pr_head(monkeypatch):
+    monkeypatch.setenv("HEAD_SHA", SHA)
+    assert mod._require_sha() == SHA
+
+
 def test_retrigger_reed_review_event_posts_once_when_green(monkeypatch):
     pr = make_pr(number=7)
     rc, world, posts = _run_reed(
@@ -1855,6 +1882,15 @@ def test_usage_includes_read_only_commands(capsys):
 
 # ---- workflow --------------------------------------------------------------
 
+_HEAD_SHA_FALLBACK = (
+    "${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}"
+)
+
+
+def _if_accepts_pull_request_review(job):
+    return "github.event_name == 'pull_request_review'" in (job.get("if") or "")
+
+
 def _workflow_on(doc):
     if "on" in doc:
         return doc["on"]
@@ -1866,7 +1902,7 @@ def test_workflow_yaml_is_least_privilege():
     py = (ROOT / "scripts/ci/auto_merge_gate.py").read_text(encoding="utf-8")
     assert "--admin" not in text and "sage-approved" not in text
     assert "--admin" not in py and "sage-approved" not in py
-    assert "pull_request.head.sha" not in text
+    assert "pull_request.head.sha" not in text.replace(_HEAD_SHA_FALLBACK, "")
     doc = yaml.safe_load(text)
     assert doc["name"] == "Auto-merge gate"
     jobs = doc["jobs"]
@@ -1901,7 +1937,8 @@ def test_workflow_yaml_is_least_privilege():
         runs = [s for s in job["steps"] if "run" in s]
         assert len(runs) == 1
         assert "${{" not in (runs[0].get("run") or "")
-        assert "pull_request.head.sha" not in yaml.dump(job)
+        dumped = yaml.dump(job, width=4096).replace(_HEAD_SHA_FALLBACK, "")
+        assert "pull_request.head.sha" not in dumped
     assert trig["concurrency"]["group"].startswith("trigger-sage-")
     assert gate["concurrency"]["group"].startswith("auto-merge-")
     assert reed["concurrency"]["group"] == (
@@ -1970,11 +2007,11 @@ def test_workflow_yaml_is_least_privilege():
     assert reed_run["env"]["GITHUB_REPOSITORY"] == "${{ github.repository }}"
     assert reed_run["env"]["EVENT_NAME"] == "${{ github.event_name }}"
     assert reed_run["env"]["PR"] == "${{ github.event.pull_request.number }}"
-    assert reed_run["env"]["HEAD_SHA"] == "${{ github.event.workflow_run.head_sha }}"
+    assert reed_run["env"]["HEAD_SHA"] == _HEAD_SHA_FALLBACK
     assert reed_run["env"]["WORKFLOW_NAME"] == "${{ github.event.workflow_run.name }}"
     assert sel_run["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert sel_run["env"]["GITHUB_REPOSITORY"] == "${{ github.repository }}"
-    assert sel_run["env"]["HEAD_SHA"] == "${{ github.event.workflow_run.head_sha }}"
+    assert sel_run["env"]["HEAD_SHA"] == _HEAD_SHA_FALLBACK
     assert sel_run["env"]["EVENT_NAME"] == "${{ github.event_name }}"
     assert sel_run["env"]["PR"] == "${{ github.event.pull_request.number }}"
     assert sel_run["env"]["REVIEW_ID"] == "${{ github.event.review.id }}"
@@ -2026,4 +2063,25 @@ def test_workflow_job_names_do_not_collide_with_status_context():
         assert job_key != "approval-gate"
         assert (job_cfg or {}).get("name") != mod.STATUS_CONTEXT
         assert (job_cfg or {}).get("name") != "approval-gate"
-    assert "pull_request.head.sha" not in text
+    assert "pull_request.head.sha" not in text.replace(_HEAD_SHA_FALLBACK, "")
+
+
+def test_review_event_jobs_fall_back_head_sha():
+    """A review run has no workflow_run.head_sha. Jobs that pass HEAD_SHA must
+    fall back to the PR head, or the master script's _require_sha() fails the job.
+    """
+    text = (ROOT / ".github/workflows/auto-merge.yml").read_text(encoding="utf-8")
+    doc = yaml.safe_load(text)
+    matched = []
+    for name, job in doc["jobs"].items():
+        if not _if_accepts_pull_request_review(job):
+            continue
+        for step in job.get("steps") or []:
+            env = step.get("env") or {}
+            if "HEAD_SHA" not in env:
+                continue
+            matched.append(name)
+            assert env["HEAD_SHA"] == _HEAD_SHA_FALLBACK
+            assert "${{" not in (step.get("run") or "")
+    assert set(matched) == {"retrigger-reed", "notify-selina"}
+    assert "pull_request.head.sha" not in text.replace(_HEAD_SHA_FALLBACK, "")

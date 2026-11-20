@@ -133,7 +133,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
           REED_QA_WEBHOOK_URL: ${{ secrets.REED_QA_WEBHOOK_URL }}
           REED_QA_WEBHOOK_KEY: ${{ secrets.REED_QA_WEBHOOK_KEY }}
@@ -189,7 +189,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REVIEW_ID: ${{ github.event.review.id }}
           REVIEW_STATE: ${{ github.event.review.state }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
           WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           MERGED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
