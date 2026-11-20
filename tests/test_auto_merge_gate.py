@@ -1033,12 +1033,16 @@ def wait_body():
 
 
 def _run_reed(monkeypatch, prs, reviews=None, checks=None, head_sha=SHA,
-              url=REED_URL, key=REED_KEY, opener=None, repo=REPO):
-    world = World(open_prs=prs, reviews=reviews, check_runs=checks)
+              url=REED_URL, key=REED_KEY, opener=None, repo=REPO,
+              event="", workflow_name="Claude Review", pr=None, pr_number="7"):
+    world = World(pr=pr, open_prs=prs, reviews=reviews, check_runs=checks)
     monkeypatch.setattr(mod.subprocess, "run", world.run)
     monkeypatch.setenv("GH_TOKEN", "test-token-not-on-argv")
     _set_or_del(monkeypatch, "GITHUB_REPOSITORY", repo)
+    _set_or_del(monkeypatch, "EVENT_NAME", event)
+    _set_or_del(monkeypatch, "PR", pr_number)
     _set_or_del(monkeypatch, "HEAD_SHA", head_sha)
+    _set_or_del(monkeypatch, "WORKFLOW_NAME", workflow_name)
     _clear_hooks(monkeypatch)
     _set_or_del(monkeypatch, "REED_QA_WEBHOOK_URL", url)
     _set_or_del(monkeypatch, "REED_QA_WEBHOOK_KEY", key)
@@ -1181,6 +1185,170 @@ def test_retrigger_reed_earlier_failed_review_then_success(monkeypatch):
     assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
 
 
+_REAL_WAIT = (
+    "Verdict: WAIT. Head `198c18dd975189cc8ddb710385ec481039c99981`. No P1/P2."
+)
+
+
+@pytest.mark.parametrize("rest", [
+    "\n\n**WAIT**\n",
+    "\n" + _REAL_WAIT + "\n",
+    "\nverdict: WAIT. Head `abc`.\n",
+    "\n\n**WAIT**\n\nbody mentions **CHANGES NEEDED** later\n",
+])
+def test_retrigger_reed_wait_verdicts_post(monkeypatch, rest):
+    body = marker(REED, rest)
+    assert mod.reed_verdict(body) == "WAIT"
+    rc, _, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=body)],
+        checks=green_checks(),
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+
+
+@pytest.mark.parametrize("rest", [
+    "\n\n**CHANGES NEEDED**\n",
+    "\nVerdict: CHANGES NEEDED. Head `198c18dd975189cc8ddb710385ec481039c99981`.\n",
+    "\nverdict: CHANGES NEEDED\n",
+    "\n\nno verdict\n",
+    "\nVerdict: LGTM\n",
+    "\n\n",
+])
+def test_retrigger_reed_non_wait_verdicts_skip(monkeypatch, rest):
+    body = marker(REED, rest)
+    assert mod.reed_verdict(body) != "WAIT"
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=body)],
+        checks=green_checks(),
+    )
+    assert rc == 0 and posts == []
+    assert any("/reviews?" in g for g in _gets(world))
+
+
+def test_queued_rerun_higher_id_is_not_green(monkeypatch):
+    """A queued rerun has no timestamps. The higher id is the latest run."""
+    queued = check_run(
+        "test", rid=9, status="queued", conclusion=None, completed=None, started=None,
+    )
+    success = check_run("test", rid=1, conclusion="success")
+    review_ok = check_run("review", rid=2)
+    assert mod._latest_check([success, queued, review_ok], "test")["id"] == 9
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=[success, queued, review_ok],
+    )
+    assert rc == 0 and posts == []
+    assert any("check-runs" in g for g in _gets(world))
+    assert not any("/reviews?" in g for g in _gets(world))
+
+
+def test_cancelled_inverted_timestamps_do_not_change_the_pick(monkeypatch):
+    """completed_at < started_at must not steal the pick from the higher id."""
+    cancelled = check_run(
+        "test", rid=3, conclusion="cancelled",
+        completed="2026-11-19T05:00:00Z", started="2026-11-19T06:00:00Z",
+    )
+    success = check_run(
+        "test", rid=8, conclusion="success",
+        completed="2026-11-19T03:00:00Z", started="2026-11-19T02:00:00Z",
+    )
+    review_ok = check_run("review", rid=4)
+    assert mod._latest_check([cancelled, success], "test")["id"] == 8
+    rc, _, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=[cancelled, success, review_ok],
+        workflow_name="Tests",
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+
+
+@pytest.mark.parametrize("winner,loser,test_id,review_id", [
+    ("Claude Review", "Tests", 10, 20),
+    ("Tests", "Claude Review", 30, 10),
+])
+def test_retrigger_reed_only_the_newer_check_posts(
+    monkeypatch, winner, loser, test_id, review_id,
+):
+    checks = [check_run("test", rid=test_id), check_run("review", rid=review_id)]
+    reviews = [review("COMMENTED", REED, body=wait_body())]
+    prs = [make_pr(number=7)]
+    rc, _, skipped = _run_reed(
+        monkeypatch, prs, reviews=reviews, checks=checks, workflow_name=loser,
+    )
+    assert rc == 0 and skipped == []
+    rc, _, posted = _run_reed(
+        monkeypatch, prs, reviews=reviews, checks=checks, workflow_name=winner,
+    )
+    assert rc == 0
+    assert _bodies(posted) == [{"pr": 7, "head_sha": SHA}]
+
+
+def test_retrigger_reed_review_event_posts_once_when_green(monkeypatch):
+    pr = make_pr(number=7)
+    rc, world, posts = _run_reed(
+        monkeypatch,
+        [make_pr(number=99, head={"sha": OTHER_SHA})],
+        pr=pr,
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=green_checks(),
+        event="pull_request_review",
+        head_sha="",
+        workflow_name="Tests",
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+    gets = _gets(world)
+    assert f"repos/{REPO}/pulls/7" in gets
+    assert f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=1" in gets
+    assert not any("state=open" in g or f"commits/{OTHER_SHA}" in g for g in gets)
+
+
+def test_retrigger_reed_review_event_skips_when_checks_pending(monkeypatch):
+    pr = make_pr(number=7)
+    checks = [
+        check_run("test", rid=1, status="queued", conclusion=None, completed=None, started=None),
+        check_run("review", rid=2),
+    ]
+    rc, world, posts = _run_reed(
+        monkeypatch, [], pr=pr,
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=checks,
+        event="pull_request_review",
+        head_sha="",
+    )
+    assert rc == 0 and posts == []
+    assert any("check-runs" in g for g in _gets(world))
+    assert not any("/reviews?" in g for g in _gets(world))
+
+
+@pytest.mark.parametrize("over", [
+    {"draft": True},
+    {"head": {"repo": {"full_name": "other/tai-robot"}}},
+    {"base": {"ref": "develop"}},
+    {"state": "closed"},
+    {"head": {"sha": "abc"}},
+], ids=["draft", "fork", "non-master", "closed", "bad-sha"])
+def test_retrigger_reed_review_event_skips_unguarded(monkeypatch, over):
+    pr = make_pr(number=7, **over)
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)], pr=pr,
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=green_checks(),
+        event="pull_request_review",
+        head_sha="",
+    )
+    assert rc == 0 and posts == []
+    gets = _gets(world)
+    assert f"repos/{REPO}/pulls/7" in gets
+    assert not any("check-runs" in g or "state=open" in g for g in gets)
+
+
 _NOT_ONE_WAIT = [
     [],
     [review("COMMENTED", REED, sha=OTHER_SHA, body=wait_body())],
@@ -1192,7 +1360,7 @@ _NOT_ONE_WAIT = [
         review("COMMENTED", REED, rid=3, body=wait_body()),
     ],
     [review("APPROVED", REED, body=wait_body())],
-    [review("COMMENTED", REED, body=marker(REED, "\n\n**WAIT**\n**CHANGES NEEDED**\n"))],
+    [review("COMMENTED", REED, body=marker(REED, "\n\n**CHANGES NEEDED**\n"))],
     [review("COMMENTED", REED, body=marker(REED, "\n\nno verdict\n"))],
 ]
 
@@ -1233,15 +1401,15 @@ def test_retrigger_reed_skips_unguarded_prs(monkeypatch, over):
     [check_run("test", rid=1)],
     [
         check_run("test", rid=1),
-        check_run("review", rid=2, status="in_progress", conclusion=None,
-                  completed=None, started="2026-11-19T04:00:00Z"),
-        check_run("review", rid=3, conclusion="success", completed="2026-11-19T00:00:00Z"),
+        check_run("review", rid=2, conclusion="success", completed="2026-11-19T04:00:00Z"),
+        check_run("review", rid=3, status="in_progress", conclusion=None,
+                  completed=None, started="2026-11-19T00:00:00Z"),
     ],
     [
         check_run("review", rid=1),
-        check_run("test", rid=2, status="in_progress", conclusion=None,
-                  completed=None, started="2026-11-19T04:00:00Z"),
-        check_run("test", rid=3, conclusion="success", completed="2026-11-19T00:00:00Z"),
+        check_run("test", rid=2, conclusion="success", completed="2026-11-19T04:00:00Z"),
+        check_run("test", rid=3, status="in_progress", conclusion=None,
+                  completed=None, started="2026-11-19T00:00:00Z"),
     ],
     [
         check_run("test", rid=1, conclusion="success", completed="2026-11-19T00:00:00Z"),
@@ -1720,11 +1888,11 @@ def test_workflow_yaml_is_least_privilege():
     assert trig["concurrency"]["group"].startswith("trigger-sage-")
     assert gate["concurrency"]["group"].startswith("auto-merge-")
     assert reed["concurrency"]["group"] == (
-        "retrigger-reed-${{ github.event.workflow_run.head_sha }}"
+        "retrigger-reed-${{ github.event.workflow_run.head_sha || github.event.pull_request.number }}"
     )
     assert selina["concurrency"]["group"] == (
         "notify-selina-${{ github.event_name }}-"
-        "${{ github.event.pull_request.number || github.event.workflow_run.head_sha }}"
+        "${{ github.event.review.id || github.event.pull_request.number || github.event.workflow_run.head_sha }}"
     )
     for job in (trig, gate):
         cond = job["if"]
@@ -1743,6 +1911,11 @@ def test_workflow_yaml_is_least_privilege():
     assert "github.event.workflow_run.conclusion == 'success'" in reed_if
     assert "github.event.workflow_run.event == 'pull_request'" in reed_if
     assert "github.event.workflow_run.head_repository.full_name == github.repository" in reed_if
+    assert "github.event_name == 'pull_request_review'" in reed_if
+    assert "github.event.action == 'submitted'" in reed_if
+    assert "github.event.review.user.login == 'cursor[bot]'" in reed_if
+    assert "github.event.pull_request.state == 'open'" in reed_if
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in reed_if
     sel_if = selina["if"]
     assert "github.event_name == 'pull_request_review'" in sel_if
     assert "github.event.action == 'submitted'" in sel_if
@@ -1768,8 +1941,8 @@ def test_workflow_yaml_is_least_privilege():
     assert reed_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py retrigger-reed"
     assert sel_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py notify-selina"
     assert set(reed_run["env"]) == {
-        "GH_TOKEN", "GITHUB_REPOSITORY", "HEAD_SHA",
-        "REED_QA_WEBHOOK_URL", "REED_QA_WEBHOOK_KEY",
+        "GH_TOKEN", "GITHUB_REPOSITORY", "EVENT_NAME", "PR", "HEAD_SHA",
+        "WORKFLOW_NAME", "REED_QA_WEBHOOK_URL", "REED_QA_WEBHOOK_KEY",
     }
     assert set(sel_run["env"]) == {
         "GH_TOKEN", "GITHUB_REPOSITORY", "EVENT_NAME", "PR", "REVIEW_ID",
@@ -1778,7 +1951,10 @@ def test_workflow_yaml_is_least_privilege():
     }
     assert reed_run["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert reed_run["env"]["GITHUB_REPOSITORY"] == "${{ github.repository }}"
+    assert reed_run["env"]["EVENT_NAME"] == "${{ github.event_name }}"
+    assert reed_run["env"]["PR"] == "${{ github.event.pull_request.number }}"
     assert reed_run["env"]["HEAD_SHA"] == "${{ github.event.workflow_run.head_sha }}"
+    assert reed_run["env"]["WORKFLOW_NAME"] == "${{ github.event.workflow_run.name }}"
     assert sel_run["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert sel_run["env"]["GITHUB_REPOSITORY"] == "${{ github.repository }}"
     assert sel_run["env"]["HEAD_SHA"] == "${{ github.event.workflow_run.head_sha }}"
