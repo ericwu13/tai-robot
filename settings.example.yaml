@@ -36,7 +36,9 @@ trading:
   # confirms this bot's fills; only its own seq-matched deal row does,
   # and a missing one halts real orders instead of assuming a fill.
   # A bot also does this on its own whenever the account net differs
-  # from its own position. Only a boolean true opts in.
+  # from its own position. Opted-in bots also deploy, resume and switch
+  # to auto past lots that running bots' own position logs account for.
+  # Only a boolean true opts in.
   shared_book_opt_in: {}
   # Default real-order daily loss limit (NT$) offered by the deploy
   # dialog and `run_bot_cli deploy --loss-limit`. The gate itself is
