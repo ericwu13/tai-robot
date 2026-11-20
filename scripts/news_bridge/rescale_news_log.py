@@ -4,14 +4,17 @@
 the scorer computed at the time.  Runs logged before volume normalisation
 (``rss_scorer.REF_STORIES_PER_RUN``) and story dedup (``story_key``) are
 plain sums, so the 新聞趨勢 chart and the drivers list mix two scales.
-This replays each ``log_files`` file in file order with the scorer's own functions:
+This replays every ``log_files`` file as one stream, ordered by each file's
+earliest ``scored_at`` (ties keep ``log_files`` order), carrying the session
+EMA, dedup window and session summary across files, with the scorer's own functions:
 
 * a headline whose ``story_key`` was scored in the previous
   ``STORY_TTL_HOURS`` (or earlier in the same run) gets ``run_scale: 0``
   and ``story_dup: true`` — still listed, no longer counted;
 * ``run_net`` = clipped sum of the remaining stories x ``run_scale``;
 * ``session_net`` = the per-session EMA chain (reset when the session key
-  changes, decay ``EMA_DECAY`` per logged run), exactly like the scorer.
+  changes, decay ``EMA_DECAY`` per run that still has a counted story; a
+  run of only duplicates leaves it unchanged), exactly like the scorer.
 
 Approximation: a run whose articles were all skipped by Gemini decayed
 the live EMA but logged nothing, so the replay cannot see it.
@@ -83,7 +86,8 @@ def rescale(lines: list[str]) -> tuple[list[str], dict]:
     sessions: dict[str, dict] = {}
     cum, session, peak = 0.0, None, 0.0
     run_nets: list[float] = []
-    dups = 0
+    dups = counted_runs = 0
+    last_key = ""
     for run in runs:
         at = _when(run[0]["scored_at"])
         if at is not None:
@@ -104,6 +108,12 @@ def rescale(lines: list[str]) -> tuple[list[str], dict]:
         if at is not None:
             for key in batch:
                 recent[key] = at
+        # Nothing new: the scorer returns before the EMA, the peak and recent_runs.
+        if not counted:
+            for rec in run:
+                rec["run_net"] = 0.0
+                rec["session_net"] = cum
+            continue
         scale = rss_scorer.run_scale(len(counted))
         net = sum(max(-clip, min(clip, _num(r.get("score")))) for r in counted) * scale
         key = str(run[0].get("session", ""))
@@ -114,6 +124,8 @@ def rescale(lines: list[str]) -> tuple[list[str], dict]:
         if (cum > 0 and cum > peak) or (cum < 0 and cum < peak):
             peak = cum
         run_nets.append(round(net, 4))
+        counted_runs += 1
+        last_key = run[0].get("session", "")
         info = sessions.setdefault(key, {"old_final": None, "runs": 0})
         info["old_final"] = _num(run[-1].get("session_net"))
         info["runs"] += 1
@@ -132,11 +144,39 @@ def rescale(lines: list[str]) -> tuple[list[str], dict]:
             out.append(line if line.endswith("\n") else line + "\n")
         else:
             out.append(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-    last_key = runs[-1][0].get("session", "") if runs else ""
     recent_out = {k: t.isoformat(timespec="seconds") for k, t in recent.items()}
-    return out, {"runs": len(runs), "records": sum(len(r) for r in runs),
+    return out, {"runs": counted_runs, "records": sum(len(r) for r in runs),
                  "duplicates": dups, "sessions": sessions,
                  "last_session": last_key, "recent_stories": recent_out}
+
+
+def rescale_files(files: list[tuple[str, list[str]]]) -> tuple[list[tuple[str, list[str]]], dict]:
+    """One ``rescale``, files ordered by earliest ``scored_at`` (ties keep input order).
+
+    A file with no parsable run sorts last. Each file keeps only its own lines.
+    """
+    sentinel = datetime.min.replace(tzinfo=rss_scorer._TZ_TAIPEI)
+    prepared = []
+    for index, (path, lines) in enumerate(files):
+        # Match rescale's newline so a bare last line cannot glue onto the next file.
+        norm = [line if line.endswith("\n") else line + "\n" for line in lines]
+        earliest = None
+        for line in norm:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            at = _when(rec["scored_at"]) if isinstance(rec, dict) and rec.get("scored_at") else None
+            if at is not None and (earliest is None or at < earliest):
+                earliest = at
+        prepared.append((earliest, index, path, norm))
+    prepared.sort(key=lambda item: (item[0] is None, item[0] or sentinel, item[1]))
+    out, summary = rescale([line for _, _, _, norm in prepared for line in norm])
+    per_file, offset = [], 0
+    for _, _, path, norm in prepared:
+        per_file.append((path, out[offset:offset + len(norm)]))
+        offset += len(norm)
+    return per_file, summary
 
 
 def _replace(tmp: str, path: str) -> None:
@@ -189,26 +229,26 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.log, encoding="utf-8") as f:
             f.read(0)
 
-    planned = []
+    loaded = []
     for path in files:
         with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
-        out, summary = rescale(lines)
-        planned.append((path, out, summary))
-        print(f"{path}: {summary['records']} records in {summary['runs']} runs; "
-              f"{summary['duplicates']} duplicate stories now weighted 0")
-        for key, info in list(summary["sessions"].items())[-10:]:
-            print(f"  {key or '(no session)'}: session net {info['old_final']:+.2f} -> "
-                  f"{info['new_final']:+.2f} over {info['runs']} run(s)")
+            loaded.append((path, f.readlines()))
+    planned, summary = rescale_files(loaded)
+    for path, _out in planned:
+        print(path)
+    print(f"{summary['records']} records in {summary['runs']} runs; "
+          f"{summary['duplicates']} duplicate stories now weighted 0")
+    for key, info in list(summary["sessions"].items())[-10:]:
+        print(f"  {key or '(no session)'}: session net {info['old_final']:+.2f} -> "
+              f"{info['new_final']:+.2f} over {info['runs']} run(s)")
 
     state = None
     if args.state:
         with open(args.state, encoding="utf-8") as f:
             state = json.load(f)
-        last = next((item[2] for item in reversed(planned) if item[2]["runs"]), None)
-        if last and update_state(state, last):
+        if summary["runs"] and update_state(state, summary):
             print(f"  state: session_net -> {state['session_net']:+.2f} "
-                  f"({last['last_session']})")
+                  f"({summary['last_session']})")
         else:
             print("  state: session_key is not the last logged session; left alone")
             state = None
@@ -216,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         print("DRY RUN - nothing written. Re-run with --apply.")
         return 0
-    for path, out, _summary in planned:
+    for path, out in planned:
         backup = _write(path, "".join(out))
         print(f"log rewritten; backup {backup}")
     if state is not None:

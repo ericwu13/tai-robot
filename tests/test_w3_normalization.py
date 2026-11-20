@@ -315,37 +315,202 @@ def test_dry_run_writes_nothing_and_apply_keeps_a_backup(tmp_path):
 
 
 def test_rescale_processes_the_base_file_and_the_monthly_file(tmp_path):
+    # A later session, outside the dedup window, so each file's own rescale
+    # is the chained result. The split-session case is tested below.
     text = "".join(_history())
+    later = _line("2026-12-01T09:30:00+08:00", "2026-12-01|NIGHT",
+                  "十二月新會期的第一則新聞標題", -0.3, -0.3, -0.3)
     base = tmp_path / "news_log.jsonl"
-    month = tmp_path / "news_log_202611.jsonl"
+    month = tmp_path / "news_log_202612.jsonl"
     base.write_text(text, encoding="utf-8")
-    month.write_text(text, encoding="utf-8")
+    month.write_text(later, encoding="utf-8")
     state = tmp_path / "rss_scorer_state.json"
-    state.write_text(json.dumps({"session_key": "2026-11-20|NIGHT", "session_net": -76.8,
+    state.write_text(json.dumps({"session_key": "2026-12-01|NIGHT", "session_net": -76.8,
                                  "session_peak": -77.0, "seen_guids": ["x"]}), encoding="utf-8")
 
     assert rescale_news_log.main(["--log", str(base), "--state", str(state)]) == 0
     assert base.read_text(encoding="utf-8") == text
-    assert month.read_text(encoding="utf-8") == text
+    assert month.read_text(encoding="utf-8") == later
     assert json.loads(state.read_text(encoding="utf-8"))["session_net"] == -76.8
     assert list(tmp_path.glob("*.bak-*")) == []
 
     assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
-    expected = "".join(rescale_news_log.rescale(_history())[0])
-    assert base.read_text(encoding="utf-8") == expected
-    assert month.read_text(encoding="utf-8") == expected
-    assert expected != text
+    base_expected = "".join(rescale_news_log.rescale(_history())[0])
+    month_expected = "".join(rescale_news_log.rescale([later])[0])
+    assert base.read_text(encoding="utf-8") == base_expected
+    assert month.read_text(encoding="utf-8") == month_expected
+    assert base_expected != text and month_expected != later
     assert len(list(tmp_path.glob("news_log.jsonl.bak-*"))) == 1
-    assert len(list(tmp_path.glob("news_log_202611.jsonl.bak-*"))) == 1
+    assert len(list(tmp_path.glob("news_log_202612.jsonl.bak-*"))) == 1
     st = json.loads(state.read_text(encoding="utf-8"))
-    assert st["session_net"] == pytest.approx(-0.2) and st["seen_guids"] == ["x"]
+    assert st["session_net"] == pytest.approx(-0.3) and st["seen_guids"] == ["x"]
 
     assert rescale_news_log.main(["--log", str(base), "--apply"]) == 0
-    assert base.read_text(encoding="utf-8") == expected
-    assert month.read_text(encoding="utf-8") == expected
+    assert base.read_text(encoding="utf-8") == base_expected
+    assert month.read_text(encoding="utf-8") == month_expected
 
 
 def test_state_for_another_session_is_left_alone(tmp_path):
     _, summary = rescale_news_log.rescale(_history())
     st = {"session_key": "2026-11-21|NIGHT", "session_net": 3.0}
     assert rescale_news_log.update_state(st, summary) is False and st["session_net"] == 3.0
+
+
+def _pair(tmp_path, base_lines, month_lines, session_key, month="202611"):
+    base = tmp_path / "news_log.jsonl"
+    monthly = tmp_path / f"news_log_{month}.jsonl"
+    base.write_text("".join(base_lines), encoding="utf-8")
+    monthly.write_text("".join(month_lines), encoding="utf-8")
+    state = tmp_path / "rss_scorer_state.json"
+    state.write_text(json.dumps({"session_key": session_key, "session_net": -94.98,
+                                 "session_peak": -94.98, "seen_guids": ["keep"]}),
+                     encoding="utf-8")
+    return base, monthly, state
+
+
+def _net(score, n=1):
+    clip = rss_scorer.ARTICLE_CLIP
+    return max(-clip, min(clip, score)) * rss_scorer.run_scale(n)
+
+
+def _recs(path):
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def test_session_split_across_files_continues_the_ema(tmp_path):
+    """One night split across the base file and the monthly file is one EMA.
+
+    The 2026-11-20 dry run replayed that night's last run in
+    news_log_202611.jsonl as a fresh session.
+    """
+    session = "2026-11-20|NIGHT"
+    first = "夜盤開盤外資大賣台指期貨"
+    second = "電子權值股同步走弱拖累期貨"
+    assert rss_scorer.story_key(first) and rss_scorer.story_key(first) != rss_scorer.story_key(second)
+    base, monthly, state = _pair(
+        tmp_path,
+        [_line("2026-11-20T15:00:00+08:00", session, first, -0.5, -0.5, -94.98)],
+        [_line("2026-11-20T15:30:00+08:00", session, second, -0.4, -0.4, -2.79)],
+        session)
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
+
+    prev = _recs(base)[-1]["session_net"]
+    expected = round(prev * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    assert _recs(monthly)[-1]["session_net"] == pytest.approx(expected)
+    # main() writes session_net only through update_state, from the combined summary.
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["session_net"] == pytest.approx(expected)
+    assert st["session_peak"] == pytest.approx(expected)
+    assert st["recent_runs"] == [pytest.approx(_net(-0.5)), pytest.approx(_net(-0.4))]
+    assert st["seen_guids"] == ["keep"]
+
+
+def test_story_duplicate_across_files_is_weighted_zero(tmp_path):
+    session = "2026-11-20|NIGHT"
+    title = "台股暴挫2200點 綠燈一片 鴻海跌幅逆勢"
+    echo = f"{title} - Yahoo股市"
+    assert rss_scorer.story_key(title) == rss_scorer.story_key(echo)
+    start = datetime(2026, 11, 20, 15, 0, tzinfo=_TPE)
+    later = start + timedelta(hours=rss_scorer.STORY_TTL_HOURS / 2)
+    base, monthly, state = _pair(
+        tmp_path,
+        [_line(start.isoformat(timespec="seconds"), session, title, -0.5)],
+        [_line(later.isoformat(timespec="seconds"), session, echo, -0.5)],
+        session)
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
+    dup = _recs(monthly)[-1]
+    assert dup.get("story_dup") is True
+    assert dup["run_scale"] == 0.0 and dup["run_net"] == 0.0
+    # The live scorer returns before decaying when the pass has nothing new.
+    prev = _recs(base)[-1]["session_net"]
+    assert dup["session_net"] == pytest.approx(prev)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["session_net"] == pytest.approx(prev)
+    assert st["recent_runs"] == [pytest.approx(prev)]
+
+
+def test_next_counted_run_continues_from_the_undecayed_value():
+    """An all-duplicate run is not a scorer pass: the next real run decays once."""
+    session = "2026-11-20|NIGHT"
+    title = "台股暴挫2200點 綠燈一片 鴻海跌幅逆勢"
+    start = datetime(2026, 11, 20, 15, 0, tzinfo=_TPE)
+    dup_at = start + timedelta(hours=rss_scorer.STORY_TTL_HOURS / 2)
+    nxt = dup_at + timedelta(minutes=30)
+    lines = [
+        _line(start.isoformat(timespec="seconds"), session, title, -0.5),
+        _line(dup_at.isoformat(timespec="seconds"), session, f"{title} - Yahoo股市", -0.5),
+        _line(nxt.isoformat(timespec="seconds"), session, "電子權值股同步走弱拖累期貨", -0.4),
+    ]
+    out, summary = rescale_news_log.rescale(lines)
+    recs = [json.loads(x) for x in out]
+    prev = recs[0]["session_net"]
+    assert recs[1].get("story_dup") is True and recs[1]["run_net"] == 0.0
+    assert recs[1]["session_net"] == pytest.approx(prev)
+    expected = round(prev * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    decayed = round(round(prev * rss_scorer.EMA_DECAY, 4) * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    assert recs[2]["session_net"] == pytest.approx(expected)
+    assert recs[2]["session_net"] != pytest.approx(decayed)
+    info = summary["sessions"][session]
+    assert info["runs"] == 2
+    assert info["recent_runs"] == [pytest.approx(_net(-0.5)), pytest.approx(_net(-0.4))]
+    assert info["new_final"] == pytest.approx(expected)
+    again, _ = rescale_news_log.rescale(out)
+    assert again == out
+
+
+def test_missing_newline_does_not_glue_files_and_keeps_unparsable_bytes(tmp_path):
+    session = "2026-11-20|NIGHT"
+    base = tmp_path / "news_log.jsonl"
+    month = tmp_path / "news_log_202611.jsonl"
+    junk = tmp_path / "news_log_202610.jsonl"
+    base.write_text(_line("2026-11-20T15:00:00+08:00", session,
+                          "夜盤開盤外資大賣台指期貨", -0.5).rstrip("\n"), encoding="utf-8")
+    month.write_text(_line("2026-11-20T15:30:00+08:00", session,
+                           "電子權值股同步走弱拖累期貨", -0.4), encoding="utf-8")
+    junk.write_text("not json\n", encoding="utf-8")
+    state = tmp_path / "rss_scorer_state.json"
+    state.write_text(json.dumps({"session_key": session, "session_net": 1.0}), encoding="utf-8")
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
+    assert [json.loads(x)["title"] for x in base.read_text(encoding="utf-8").splitlines()] == \
+        ["夜盤開盤外資大賣台指期貨"]
+    assert [json.loads(x)["title"] for x in month.read_text(encoding="utf-8").splitlines()] == \
+        ["電子權值股同步走弱拖累期貨"]
+    assert junk.read_text(encoding="utf-8") == "not json\n"
+    expected = round(_recs(base)[-1]["session_net"] * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    assert _recs(month)[-1]["session_net"] == pytest.approx(expected)
+
+
+def test_new_session_key_in_the_next_file_still_resets(tmp_path):
+    first, second = "2026-11-20|NIGHT", "2026-11-21|NIGHT"
+    base, monthly, state = _pair(
+        tmp_path,
+        [_line("2026-11-20T15:00:00+08:00", first, "夜盤開盤外資大賣台指期貨", -0.5)],
+        [_line("2026-11-21T15:00:00+08:00", second, "新交易日電子股開高走高", -0.2)],
+        second)
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
+    reset = _recs(monthly)[-1]["session_net"]
+    continued = round(_recs(base)[-1]["session_net"] * rss_scorer.EMA_DECAY + _net(-0.2), 4)
+    assert reset == pytest.approx(_net(-0.2)) and reset != pytest.approx(continued)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["session_net"] == pytest.approx(_net(-0.2))
+    assert st["recent_runs"] == [pytest.approx(_net(-0.2))]
+
+
+def test_files_replay_in_scored_at_order_not_list_order(tmp_path):
+    """log_files lists the base file first. An earlier run that lives in the
+    monthly file is replayed before the base file's later run."""
+    session = "2026-11-20|NIGHT"
+    early = "夜盤開盤外資大賣台指期貨"
+    late = "電子權值股同步走弱拖累期貨"
+    base, monthly, state = _pair(
+        tmp_path,
+        [_line("2026-11-20T15:30:00+08:00", session, late, -0.4, -0.4, -0.4)],
+        [_line("2026-11-20T15:00:00+08:00", session, early, -0.5, -0.5, -0.5)],
+        session)
+    assert rss_news_log.log_files(str(base)) == [str(base), str(monthly)]
+    assert rescale_news_log.main(["--log", str(base), "--state", str(state), "--apply"]) == 0
+    prev = _recs(monthly)[-1]["session_net"]
+    expected = round(prev * rss_scorer.EMA_DECAY + _net(-0.4), 4)
+    assert _recs(base)[-1]["session_net"] == pytest.approx(expected)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["session_net"] == pytest.approx(expected)
