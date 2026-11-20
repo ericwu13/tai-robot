@@ -38,7 +38,9 @@ The previous OI comes from the ``.chips_state.json`` sidecar, which
 records every fetched dataset — vote or not.  The same file keeps a
 display-only ``daily`` map (trade date → net OI, ΔOI, equity flow,
 decision, reason; last 60) written on decision passes only, for the
-dashboard 籌碼 panel; ``history`` stays the ΔOI baseline.
+dashboard 籌碼 panel; ``history`` stays the ΔOI baseline.  Every ``daily``
+row is also appended to ``chips_history.jsonl`` beside it, kept forever,
+for the 籌碼走勢 trend (the last line for a date wins).
 
 There is no neutral vote — when uncertain the W4 vote file is DELETED so
 a stale vote can never linger (votes are also consumed by the classifier
@@ -149,6 +151,14 @@ STATE_KEEP_DAYS = 10
 # panel (ΔOI, equity flow, decision, reason).  Separate from ``history``,
 # the ΔOI baseline, which it never touches.  Nothing reads it back.
 DAILY_KEEP_DAYS = 60
+# Append-only copy of every ``daily`` row: {"v", "date", "src", **row}.
+# "src" is "live" here; a backfill writes "log"/"backfill". Readers take
+# the last line per date and ignore fields they don't know, so later
+# versions can add 投信/自營商 fields without a migration. About 100 KB a
+# year, so it is never trimmed. Bookkeeping only: a failed write never
+# changes the vote or the exit code.
+HISTORY_NAME = "chips_history.jsonl"
+HISTORY_VERSION = 1
 LOG_NAME = "chips_monitor.log"
 LOG_MAX_BYTES = 1_000_000
 LOG_KEEP_LINES = 2000
@@ -652,6 +662,18 @@ def record_daily(state: dict, date_key: str, row: dict) -> dict:
     return state
 
 
+def append_history(state_path, date_key: str, row: dict) -> bool:
+    """Append one ``daily`` row to ``chips_history.jsonl`` (never raises)."""
+    try:
+        out = Path(state_path).parent / HISTORY_NAME
+        line = {"v": HISTORY_VERSION, "date": date_key, "src": "live", **row}
+        with open(out, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def stamp_liveness(state: dict, now: datetime, summary: str) -> dict:
     """Stamp last_check/last_result (the W2/W3 liveness contract).
 
@@ -816,14 +838,16 @@ def _finish_twse_no_data(state: dict, now: datetime, spath, base_path: str,
             state, now, spath, base_path, dry_run, message)
     print(f"  {message}")
     if not dry_run:
-        record_daily(state, date_key, {
+        row = {
             "net_oi": net_oi, "delta_oi": delta, "prev_date": prev_date,
             "equity_net": None, "decision": None, "reason": message,
             "final": False, "session": session,
             "at": now.isoformat(timespec="seconds"),
-        })
+        }
+        record_daily(state, date_key, row)
         _clear_fetch_streak(state)
         save_state(spath, stamp_liveness(state, now, message))
+        append_history(spath, date_key, row)
         append_log(Path(base_path).parent / LOG_NAME,
                    f"{now:%Y-%m-%d %H:%M:%S} TPE | {message}")
     return 0
@@ -1085,14 +1109,16 @@ def run_once(base_path: str, date_key: str | None, now: datetime,
         # outage no-vote stays retryable — a later slot may still turn
         # today's OI into a vote once the contradiction check can run.
         state["last_decided_date"] = date_key
-    record_daily(state, date_key, {
+    row = {
         "net_oi": net_oi, "delta_oi": delta, "prev_date": prev_date,
         "equity_net": equity_net, "decision": direction, "reason": reason,
         "final": equity_net is not None, "session": session_key,
         "at": now.isoformat(timespec="seconds"),
-    })
+    }
+    record_daily(state, date_key, row)
     _clear_fetch_streak(state)
     save_state(spath, stamp_liveness(state, now, summary))
+    append_history(spath, date_key, row)
     append_log(Path(base_path).parent / LOG_NAME,
                f"{now:%Y-%m-%d %H:%M:%S} TPE | {summary}")
     return 0
