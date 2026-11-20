@@ -14,12 +14,30 @@
         auto-merge when the PR is eligible. A release (``version.py``), a
         workflow or CI script edit, a draft, or the ``needs-owner`` label is not eligible.
 
+    python auto_merge_gate.py retrigger-reed
+        When the latest ``test`` and ``review`` check runs at HEAD_SHA are
+        both completed and successful, POST ``{"pr", "head_sha"}`` once for
+        each open, non-draft, same-repo master PR whose only Reed review at
+        that SHA is COMMENTED and contains ``**WAIT**`` (not
+        ``**CHANGES NEEDED**``, and not APPROVED). Missing webhook secrets
+        skip with exit 0.
+
+    python auto_merge_gate.py notify-selina
+        POST a Selina webhook for a cursor[bot] Reed or Sage review, a CI
+        failure, a Claude Review success on a master draft, or a merged PR
+        that still has open same-repo PRs stacked on its head ref. Missing
+        webhook secrets skip with exit 0. URLs and keys are never printed.
+
 Env: GH_TOKEN (read by gh), GITHUB_REPOSITORY, PR.
 trigger-sage also: SAGE_REVIEW_WEBHOOK_URL, SAGE_REVIEW_WEBHOOK_KEY.
 gate also: RUN_URL (optional link on the status).
+retrigger-reed also: HEAD_SHA, REED_QA_WEBHOOK_URL, REED_QA_WEBHOOK_KEY.
+notify-selina also: EVENT_NAME, REVIEW_ID, HEAD_SHA, WORKFLOW_NAME,
+WORKFLOW_CONCLUSION, SELINA_QA_WEBHOOK_URL, SELINA_QA_WEBHOOK_KEY.
+The live pull request, review, and check runs are re-read here; a fork is
+ignored. trigger-sage and gate also ignore a closed or non-master PR.
 
-Stdlib and the gh CLI only. The live pull request is re-read here; a
-closed, forked, or non-master PR is ignored.
+Stdlib and the gh CLI only.
 """
 from __future__ import annotations
 
@@ -102,8 +120,9 @@ def paginate_list(path):
     """GET ``path`` page by page. Keep going while a page is full (100)."""
     page = 1
     items = []
+    sep = "&" if "?" in path else "?"
     while True:
-        batch = gh_get(f"{path}?per_page=100&page={page}")
+        batch = gh_get(f"{path}{sep}per_page=100&page={page}")
         if not isinstance(batch, list):
             raise RuntimeError(f"expected a list from {path}")
         items.extend(batch)
@@ -128,12 +147,16 @@ def require_repo():
     return repo
 
 
-def require_pr():
-    raw = os.environ.get("PR", "").strip()
+def require_positive_int(name):
+    raw = os.environ.get(name, "").strip()
     if not raw.isdigit() or int(raw) < 1:
-        print("PR is not a positive integer", file=sys.stderr)
+        print(f"{name} is not a positive integer", file=sys.stderr)
         return None
     return int(raw)
+
+
+def require_pr():
+    return require_positive_int("PR")
 
 
 def first_line(body):
@@ -429,36 +452,53 @@ def sage_already_reviewed(reviews, head_sha):
     return bool(_matching_reviews(reviews, head_sha, SAGE_AUTOMATION_ID))
 
 
-def post_sage_webhook(url, key, pr_number, head_sha):
-    """POST the trigger. Failures report a status code or exception class only."""
+def _post_webhook(label, url, key, payload, *, skip_if_unset=False):
+    """POST ``payload`` as JSON. Failures report a status code or exception class only."""
+    url = (url or "").strip()
+    key = (key or "").strip()
     if not url or not key:
-        print("sage webhook is not configured", file=sys.stderr)
+        if skip_if_unset:
+            print(f"{label} webhook: skip (not configured)")
+            return 0
+        print(f"{label} webhook is not configured", file=sys.stderr)
         return 1
-    body = json.dumps({"pr": int(pr_number), "head_sha": head_sha}).encode("utf-8")
+    auth = key if key.lower().startswith("bearer ") else f"Bearer {key}"
+    body = json.dumps(payload).encode("utf-8")
     try:
         req = urllib.request.Request(
             url,
             data=body,
             headers={
-                "Authorization": "Bearer " + key,
+                "Authorization": auth,
                 "Content-Type": "application/json",
             },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=_WEBHOOK_TIMEOUT_S) as resp:
             code = getattr(resp, "status", None) or resp.getcode()
-            print(f"sage webhook: HTTP {code}")
+            print(f"{label} webhook: HTTP {code}")
             return 0
     except urllib.error.HTTPError as exc:
-        print(f"sage webhook failed: HTTP {exc.code}", file=sys.stderr)
+        print(f"{label} webhook failed: HTTP {exc.code}", file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
         kind = type(exc.reason).__name__ if exc.reason is not None else "URLError"
-        print(f"sage webhook failed: {kind}", file=sys.stderr)
+        print(f"{label} webhook failed: {kind}", file=sys.stderr)
         return 1
     except Exception as exc:
-        print(f"sage webhook failed: {type(exc).__name__}", file=sys.stderr)
+        print(f"{label} webhook failed: {type(exc).__name__}", file=sys.stderr)
         return 1
+
+
+def post_sage_webhook(url, key, pr_number, head_sha):
+    """POST the trigger. Failures report a status code or exception class only."""
+    return _post_webhook(
+        "sage",
+        url,
+        key,
+        {"pr": int(pr_number), "head_sha": head_sha},
+        skip_if_unset=False,
+    )
 
 
 def trigger_sage():
@@ -497,6 +537,291 @@ def _trigger_sage():
     )
 
 
+def _require_sha(name="HEAD_SHA"):
+    sha = os.environ.get(name, "").strip()
+    if not _SHA.fullmatch(sha):
+        print(f"{name} is not a 40-char hex sha", file=sys.stderr)
+        return None
+    return sha
+
+
+def _same_repo(pr, repo):
+    if not isinstance(pr, dict):
+        return False
+    head = pr.get("head") or {}
+    return ((head.get("repo") or {}).get("full_name")) == repo
+
+
+def _latest_check(runs, name):
+    matched = [r for r in runs if isinstance(r, dict) and r.get("name") == name]
+    if not matched:
+        return None
+    matched.sort(key=lambda r: (
+        r.get("completed_at") or r.get("started_at") or "",
+        int(r.get("id") or 0),
+    ))
+    return matched[-1]
+
+
+def _checks_green(runs):
+    for name in ("test", "review"):
+        latest = _latest_check(runs, name)
+        if latest is None:
+            return False
+        if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+            return False
+    return True
+
+
+def _fetch_check_runs(repo, head_sha):
+    """GET check runs page by page. Keep going while a page is full (100)."""
+    page = 1
+    found = []
+    while True:
+        batch = gh_get(
+            f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"
+        )
+        if not isinstance(batch, dict):
+            raise RuntimeError("expected check-runs object")
+        runs = batch.get("check_runs") or []
+        if not isinstance(runs, list):
+            raise RuntimeError("expected check_runs list")
+        found.extend(runs)
+        if len(runs) != 100:
+            break
+        page += 1
+    return found
+
+
+def retrigger_reed():
+    try:
+        return _retrigger_reed()
+    except RuntimeError as exc:
+        print(f"retrigger-reed: {exc}", file=sys.stderr)
+        return 1
+
+
+def _retrigger_reed():
+    repo = require_repo()
+    if repo is None:
+        return 1
+    head_sha = _require_sha()
+    if head_sha is None:
+        return 1
+    url = os.environ.get("REED_QA_WEBHOOK_URL", "").strip()
+    key = os.environ.get("REED_QA_WEBHOOK_KEY", "").strip()
+    if not url or not key:
+        print("retrigger-reed: skip (webhook not configured)")
+        return 0
+    matched = []
+    for pr in paginate_list(f"repos/{repo}/pulls?state=open"):
+        if not pr_is_guarded(pr, repo) or pr.get("draft"):
+            continue
+        if head_sha_of(pr) != head_sha:
+            continue
+        matched.append(pr)
+    if not matched:
+        print("retrigger-reed: skip (no matching PR)")
+        return 0
+    if not _checks_green(_fetch_check_runs(repo, head_sha)):
+        print("retrigger-reed: skip (checks not green)")
+        return 0
+    rc = 0
+    for pr in matched:
+        number = int(pr["number"])
+        reviews = paginate_list(f"repos/{repo}/pulls/{number}/reviews")
+        reed_reviews = _matching_reviews(reviews, head_sha, REED_AUTOMATION_ID)
+        if any(rev.get("state") == "APPROVED" for rev in reed_reviews):
+            print(f"retrigger-reed: skip #{number} (already approved)")
+            continue
+        if len(reed_reviews) != 1:
+            print(f"retrigger-reed: skip #{number} (review count {len(reed_reviews)})")
+            continue
+        rev = reed_reviews[0]
+        body = rev.get("body") if isinstance(rev.get("body"), str) else ""
+        if (
+            rev.get("state") != "COMMENTED"
+            or "**WAIT**" not in body
+            or "**CHANGES NEEDED**" in body
+        ):
+            print(f"retrigger-reed: skip #{number} (not a WAIT review)")
+            continue
+        one = _post_webhook(
+            "reed",
+            url,
+            key,
+            {"pr": number, "head_sha": head_sha},
+            skip_if_unset=True,
+        )
+        if one != 0:
+            rc = one
+    return rc
+
+
+def notify_selina():
+    try:
+        return _notify_selina()
+    except RuntimeError as exc:
+        print(f"notify-selina: {exc}", file=sys.stderr)
+        return 1
+
+
+def _notify_selina():
+    repo = require_repo()
+    if repo is None:
+        return 1
+    url = os.environ.get("SELINA_QA_WEBHOOK_URL", "").strip()
+    key = os.environ.get("SELINA_QA_WEBHOOK_KEY", "").strip()
+    if not url or not key:
+        print("notify-selina: skip (webhook not configured)")
+        return 0
+    event = os.environ.get("EVENT_NAME", "").strip()
+    if event == "pull_request_review":
+        return _notify_selina_review(repo, url, key)
+    if event == "workflow_run":
+        return _notify_selina_workflow(repo, url, key)
+    if event == "pull_request_target":
+        return _notify_selina_merged(repo, url, key)
+    print("notify-selina: skip (event)")
+    return 0
+
+
+def _open_same_repo(pr, repo):
+    return isinstance(pr, dict) and pr.get("state") == "open" and _same_repo(pr, repo)
+
+
+def _has_reed_or_sage(body):
+    return (
+        body_has_automation(body, REED_AUTOMATION_ID)
+        or body_has_automation(body, SAGE_AUTOMATION_ID)
+    )
+
+
+def _notify_selina_review(repo, url, key):
+    number = require_pr()
+    review_id = require_positive_int("REVIEW_ID")
+    if number is None or review_id is None:
+        return 1
+    pr = gh_get(f"repos/{repo}/pulls/{number}")
+    if not isinstance(pr, dict) or pr.get("state") != "open" or not _same_repo(pr, repo):
+        print("notify-selina: skip (pr not open same-repo)")
+        return 0
+    head_sha = head_sha_of(pr)
+    if not _SHA.fullmatch(head_sha):
+        print("notify-selina: skip (bad head sha)")
+        return 0
+    review = gh_get(f"repos/{repo}/pulls/{number}/reviews/{review_id}")
+    if not isinstance(review, dict):
+        print("notify-selina: skip (review)")
+        return 0
+    login = ((review.get("user") or {}).get("login")) or ""
+    if login != "cursor[bot]" or not _has_reed_or_sage(review.get("body")):
+        print("notify-selina: skip (not a reed/sage review)")
+        return 0
+    review_state = review.get("state") or ""
+    review_sha = review.get("commit_id") or ""
+    if review_sha != head_sha:
+        print("notify-selina: skip (stale review)")
+        return 0
+    base_ref = (pr.get("base") or {}).get("ref")
+    if review_state == "APPROVED" and not pr.get("draft") and base_ref == "master":
+        print("notify-selina: skip (ready master approval)")
+        return 0
+    return _post_webhook(
+        "selina",
+        url,
+        key,
+        {
+            "event": "cursor_review",
+            "pr": number,
+            "head_sha": head_sha,
+            "review_id": review_id,
+            "review_state": review_state,
+        },
+        skip_if_unset=True,
+    )
+
+
+def _notify_selina_workflow(repo, url, key):
+    head_sha = _require_sha()
+    if head_sha is None:
+        return 1
+    workflow_name = os.environ.get("WORKFLOW_NAME", "").strip()
+    conclusion = os.environ.get("WORKFLOW_CONCLUSION", "").strip()
+    rc = 0
+    for pr in paginate_list(f"repos/{repo}/pulls?state=open"):
+        if not _open_same_repo(pr, repo) or head_sha_of(pr) != head_sha:
+            continue
+        number = int(pr["number"])
+        if conclusion == "failure":
+            unlabeled_draft = (
+                workflow_name == "Claude Review"
+                and pr.get("draft")
+                and "claude-review" not in label_names(pr)
+            )
+            if unlabeled_draft:
+                print(f"notify-selina: skip #{number} (unlabeled draft claude failure)")
+                continue
+            payload = {
+                "event": "ci_failed",
+                "workflow": workflow_name,
+                "pr": number,
+                "head_sha": head_sha,
+            }
+        elif (
+            conclusion == "success"
+            and workflow_name == "Claude Review"
+            and pr.get("draft")
+            and (pr.get("base") or {}).get("ref") == "master"
+        ):
+            payload = {
+                "event": "claude_passed_draft",
+                "pr": number,
+                "head_sha": head_sha,
+            }
+        else:
+            continue
+        one = _post_webhook("selina", url, key, payload, skip_if_unset=True)
+        if one != 0:
+            rc = one
+    return rc
+
+
+def _notify_selina_merged(repo, url, key):
+    number = require_pr()
+    if number is None:
+        return 1
+    pr = gh_get(f"repos/{repo}/pulls/{number}")
+    if not isinstance(pr, dict) or not _same_repo(pr, repo) or pr.get("merged") is not True:
+        print("notify-selina: skip (not a merged same-repo PR)")
+        return 0
+    merged_head_ref = ((pr.get("head") or {}).get("ref") or "").strip()
+    if not merged_head_ref:
+        print("notify-selina: skip (empty head ref)")
+        return 0
+    stacked = sorted(
+        int(item["number"])
+        for item in paginate_list(f"repos/{repo}/pulls?state=open")
+        if _open_same_repo(item, repo)
+        and (item.get("base") or {}).get("ref") == merged_head_ref
+    )
+    if not stacked:
+        print("notify-selina: skip (no stacked PRs)")
+        return 0
+    return _post_webhook(
+        "selina",
+        url,
+        key,
+        {
+            "event": "base_pr_merged",
+            "merged_pr": number,
+            "merged_head_ref": merged_head_ref,
+            "stacked_prs": stacked,
+        },
+        skip_if_unset=True,
+    )
+
+
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
     cmd = argv[1] if len(argv) > 1 else ""
@@ -504,7 +829,14 @@ def main(argv=None):
         return trigger_sage()
     if cmd == "gate":
         return gate()
-    print("usage: auto_merge_gate.py trigger-sage|gate", file=sys.stderr)
+    if cmd == "retrigger-reed":
+        return retrigger_reed()
+    if cmd == "notify-selina":
+        return notify_selina()
+    print(
+        "usage: auto_merge_gate.py trigger-sage|gate|retrigger-reed|notify-selina",
+        file=sys.stderr,
+    )
     return 2
 
 
