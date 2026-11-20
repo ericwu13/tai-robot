@@ -162,4 +162,3 @@ def test_trend_endpoint_rejects_bad_queries(trend_server, query):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(trend_server + "/api/news/trend?" + query, timeout=10)
     assert exc.value.code == 400
-
