@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "news_bridge"))
 import rss_scorer
+from src.regime.switch_logic import classification_due
 
 
 @pytest.fixture
@@ -895,6 +896,68 @@ class TestVoteWithdrawAndShadow:
 
     @patch("rss_scorer.fetch_all_feeds")
     @patch("rss_scorer.score_article")
+    def test_standing_vote_survives_api_error(self, mock_score, mock_feeds, tmp_vote):
+        """A Gemini outage decays the EMA but must not delete the vote."""
+        cfg, state = self._cfg(), {"seen_guids": []}
+        mock_score.return_value = {"direction": "bullish", "confidence": 1.0, "reason": "up"}
+        mock_feeds.return_value = self._bull(4, "p")
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE)
+        assert state["session_net"] == pytest.approx(2.0)
+        assert os.path.exists(_w3_path(tmp_vote))
+
+        mock_score.side_effect = rss_scorer.GeminiAPIError(429, "credits depleted")
+        mock_feeds.return_value = self._bull(3, "q")
+        later = _WEEKDAY_EVE + timedelta(minutes=30)
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=later)
+        state = rss_scorer.check_once(cfg, state, tmp_vote,
+                                      now=later + timedelta(minutes=30))
+        assert state["error_streak"] == 2
+        assert os.path.exists(_w3_path(tmp_vote))
+        vote = json.load(open(_w3_path(tmp_vote), encoding="utf-8"))
+        assert vote["source"] == "W3"
+        assert vote["expires_after_session"] == "2026-08-04|NIGHT"
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_previous_night_vote_survives_the_morning_rollover(self, mock_score, mock_feeds, tmp_vote):
+        """05:15 scores tonight. Last night's file stays until classify."""
+        cfg, state = self._cfg(), {"seen_guids": []}
+        mock_score.return_value = {"direction": "bullish", "confidence": 1.0, "reason": "up"}
+        mock_feeds.return_value = self._bull(4, "n")
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=_WEEKDAY_EVE)
+        assert state["session_net"] == pytest.approx(2.0)
+        assert json.load(open(_w3_path(tmp_vote), encoding="utf-8"))["expires_after_session"] == \
+            "2026-08-04|NIGHT"
+
+        morning = datetime(2026, 8, 5, 5, 15, tzinfo=_TPE)
+        mock_score.return_value = {"direction": "neutral", "confidence": 0.2, "reason": "flat"}
+        mock_feeds.return_value = self._bull(1, "m")
+        rss_scorer.check_once(cfg, state, tmp_vote, now=morning)
+        assert os.path.exists(_w3_path(tmp_vote))
+        due = classification_due(morning, "")
+        assert due is not None and due.key == "2026-08-04|NIGHT"
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    def test_friday_vote_survives_monday_morning(self, mock_score, mock_feeds, tmp_vote):
+        friday = datetime(2026, 8, 14, 20, 0, tzinfo=_TPE)
+        cfg, state = self._cfg(), {"seen_guids": []}
+        mock_score.return_value = {"direction": "bullish", "confidence": 1.0, "reason": "up"}
+        mock_feeds.return_value = self._bull(4, "f")
+        state = rss_scorer.check_once(cfg, state, tmp_vote, now=friday)
+        assert json.load(open(_w3_path(tmp_vote), encoding="utf-8"))["expires_after_session"] == \
+            "2026-08-14|NIGHT"
+
+        monday = datetime(2026, 8, 17, 8, 0, tzinfo=_TPE)
+        mock_score.return_value = {"direction": "neutral", "confidence": 0.2, "reason": "flat"}
+        mock_feeds.return_value = self._bull(1, "g")
+        rss_scorer.check_once(cfg, state, tmp_vote, now=monday)
+        assert os.path.exists(_w3_path(tmp_vote))
+        assert json.load(open(_w3_path(tmp_vote), encoding="utf-8"))["expires_after_session"] == \
+            "2026-08-14|NIGHT"
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
     def test_a_manual_w3_vote_is_never_withdrawn(self, mock_score, mock_feeds, tmp_vote):
         path = _w3_path(tmp_vote)
         with open(path, "w", encoding="utf-8") as f:
@@ -906,11 +969,13 @@ class TestVoteWithdrawAndShadow:
         assert os.path.exists(path)
 
     def test_withdraw_never_raises(self, tmp_path):
-        assert rss_scorer.withdraw_w3_vote("") is False
-        assert rss_scorer.withdraw_w3_vote(str(tmp_path / "nope" / "regime_vote.json")) is False
+        assert rss_scorer.withdraw_w3_vote("", "2026-08-04|NIGHT") is False
+        assert rss_scorer.withdraw_w3_vote(
+            str(tmp_path / "nope" / "regime_vote.json"), "2026-08-04|NIGHT") is False
         bad = tmp_path / "regime_vote_w3.json"
         bad.write_text("{not json", encoding="utf-8")
-        assert rss_scorer.withdraw_w3_vote(str(tmp_path / "regime_vote.json")) is False
+        assert rss_scorer.withdraw_w3_vote(
+            str(tmp_path / "regime_vote.json"), "2026-08-04|NIGHT") is False
         assert bad.exists()
 
     @patch("rss_scorer.fetch_all_feeds")

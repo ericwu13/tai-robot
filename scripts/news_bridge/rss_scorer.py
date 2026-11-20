@@ -807,13 +807,13 @@ def _shadow_session_net(state: dict, session_key: str) -> float:
 
 # ── W3 vote withdrawal ───────────────────────────────────────────────────
 
-def withdraw_w3_vote(vote_out: str) -> bool:
-    """Remove the scorer's own W3 vote file (``source == "W3"``) once the
-    session score is back under the threshold, so the nightly classify only
-    sees a W3 vote while the score still stands. A manual vote
-    (``W3-manual``, same file) is left alone. Never raises; True = removed.
+def withdraw_w3_vote(vote_out: str, session_key: str) -> bool:
+    """Remove the scorer's own W3 vote for *session_key* once that
+    session's score is back under the threshold. A vote for another
+    night, or a manual vote (``W3-manual``), is left alone. Never
+    raises; True = removed.
     """
-    if not vote_out:
+    if not vote_out or not session_key:
         return False
     stem, ext = os.path.splitext(vote_out)
     path = f"{stem}_w3{ext}"
@@ -824,7 +824,8 @@ def withdraw_w3_vote(vote_out: str) -> bool:
         return False
     except (OSError, ValueError):
         return False
-    if not isinstance(vote, dict) or vote.get("source") != "W3":
+    if (not isinstance(vote, dict) or vote.get("source") != "W3"
+            or vote.get("expires_after_session") != session_key):
         return False
     try:
         os.remove(path)
@@ -1289,7 +1290,7 @@ def check_once(cfg: dict, state: dict, vote_out: str,
             print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
         except Exception as e:  # noqa: BLE001
             print(f"  vote write failed: {type(e).__name__}: {e}")
-    elif not direction and withdraw_w3_vote(vote_out):
+    elif not direction and not api_error and withdraw_w3_vote(vote_out, session_key):
         print(f"  VOTE WITHDRAWN: session net {cum:+.2f} back under "
               f"±{SESSION_VOTE_THRESHOLD} -> removed W3 vote")
 
