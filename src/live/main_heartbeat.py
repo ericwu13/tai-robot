@@ -545,10 +545,8 @@ class HangWatchdog:
         # cannot fake or hide a hang.
         self._seen_ts: float | None = None
         self._seen_mono = 0.0
-        self._seen_wall: float | None = None
         self._seen_inflight_key = None
         self._seen_inflight_mono = 0.0
-        self._seen_inflight_wall: float | None = None
         self._last_loop_mono: float | None = None
         self._latched_ts: float | None = None
         # Set when this episode latches. Recovery measures stall from the
@@ -624,10 +622,8 @@ class HangWatchdog:
         self._last_alert_mono = None
         self._seen_ts = None
         self._seen_mono = 0.0
-        self._seen_wall = None
         self._seen_inflight_key = None
         self._seen_inflight_mono = 0.0
-        self._seen_inflight_wall = None
         self._last_loop_mono = None
         self._latched_ts = None
         self._episode_origin_mono = None
@@ -721,13 +717,11 @@ class HangWatchdog:
             if ts != self._seen_ts:
                 self._seen_ts = ts
                 self._seen_mono = now_mono
-                self._seen_wall = time.time()
             hb_stall = now_mono - self._seen_mono
         inflight_key = _inflight_key(hb)
         if inflight_key != self._seen_inflight_key:
             self._seen_inflight_key = inflight_key
             self._seen_inflight_mono = now_mono
-            self._seen_inflight_wall = time.time()
         inflight_stall = (
             now_mono - self._seen_inflight_mono
             if inflight_key is not None else None)
@@ -785,7 +779,7 @@ class HangWatchdog:
             atomic_write_json(os.path.join(self.bot_dir, HANG_FILENAME), hang)
         except Exception:
             logger.exception("hang watchdog hang.json write failed")
-        self._publish_host_hung(hb, reason, now_mono)
+        self._publish_host_hung(hb, reason)
 
     def _send_hung_alert(self, hb: dict, reason: str, age, inflight) -> None:
         """One P1. Names mode, the entry gate, and whether a position is open.
@@ -870,16 +864,8 @@ class HangWatchdog:
         except Exception:
             logger.exception("hang watchdog recovery write failed")
 
-    def _publish_host_hung(self, hb: dict, reason: str, now_mono: float) -> None:
-        """Tell the shared marker this bot is HUNG. Never skips the P1 above.
-
-        ``now`` is the wall time the episode started. ``now_mono`` is this
-        check's monotonic sample (``time.monotonic()`` when the watchdog
-        polled). When that sample and the wall clock moved together, the
-        start is ``time.time() - (now_mono - origin)``. When they did not
-        (a frozen wall clock), keep ``time.time()`` so the host-stall
-        stale window does not shift. No origin yet uses ``time.time()``.
-        """
+    def _publish_host_hung(self, hb: dict, reason: str) -> None:
+        """Tell the shared marker this bot is HUNG. Never skips the P1 above."""
         try:
             from src.live.host_stall import record_hung
             link = hb.get("link") if isinstance(hb.get("link"), dict) else {}
@@ -889,34 +875,12 @@ class HangWatchdog:
                 self.bot_dir,
                 reason=reason,
                 real=real,
-                now=self._episode_start_wall(reason, now_mono),
+                now=time.time(),
                 pid=os.getpid(),
                 alert_fn=self.alert_fn,
             )
         except Exception:
             logger.exception("host stall record failed")
-
-    def _episode_start_wall(self, reason: str, now_mono: float) -> float:
-        """Wall time the frozen heartbeat was first seen, or ``time.time()``."""
-        wall_now = time.time()
-        origin = self._episode_origin_mono
-        if origin is None:
-            return wall_now
-        if reason == "inflight_com_call":
-            wall_at_origin = self._seen_inflight_wall
-        else:
-            wall_at_origin = self._seen_wall
-        if wall_at_origin is None:
-            return wall_now
-        mono_delta = now_mono - origin
-        wall_delta = wall_now - wall_at_origin
-        # Clocks that did not move together: an injected monotonic sample
-        # against a frozen wall clock. Subtracting that sample would move
-        # hung_at off the caller's clock and pull a stale host-stall episode
-        # back inside the 1800 s window.
-        if abs(wall_delta - mono_delta) > 1.0:
-            return wall_now
-        return wall_now - mono_delta
 
     def _publish_host_recovered(self, stall_s: float, recovered_at: float) -> None:
         try:

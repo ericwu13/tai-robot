@@ -401,41 +401,6 @@ def test_fresh_heartbeat_across_wake_gap_gives_no_p1(tmp_path):
     assert watchdog._latched is False
 
 
-def test_record_hung_now_is_the_episode_origin_wall_time(tmp_path, monkeypatch):
-    """The hung_at passed to record_hung is the stall start, not the call."""
-    import src.live.host_stall as host_stall
-
-    clock = {"wall": 1_800_000_000.0, "mono": 80_000.0}
-    monkeypatch.setattr(hb.time, "time", lambda: clock["wall"])
-    monkeypatch.setattr(hb.time, "monotonic", lambda: clock["mono"])
-    bot = tmp_path / "TXF_Origin"
-    bot.mkdir()
-    writer = HeartbeatWriter(str(bot))
-    writer.write()
-    seen = {}
-    real_record = host_stall.record_hung
-
-    def wrapped(bot_dir, *, reason, real, now, pid, alert_fn=None):
-        seen["now"] = now
-        return real_record(
-            bot_dir, reason=reason, real=real, now=now, pid=pid,
-            alert_fn=alert_fn)
-
-    monkeypatch.setattr(host_stall, "record_hung", wrapped)
-    watchdog = HangWatchdog(
-        str(bot), hung_s=90.0, poll_s=2.0, alert_fn=lambda _msg: None)
-    watchdog._poll()
-    assert "now" not in seen
-    origin_wall = clock["wall"]
-    clock["mono"] += 120.0
-    clock["wall"] += 120.0
-    call_wall = clock["wall"]
-    assert call_wall - origin_wall >= 30.0
-    watchdog._poll()
-    assert abs(seen["now"] - origin_wall) <= 1.0
-    assert abs(seen["now"] - call_wall) > 1.0
-
-
 def test_alert_goes_out_when_dump_fails_and_missing_file_does_not_rearm(tmp_path, monkeypatch):
     alerts = []
     writer = HeartbeatWriter(str(tmp_path))
