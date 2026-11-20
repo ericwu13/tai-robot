@@ -49,6 +49,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -81,6 +82,21 @@ EMA_DECAY: float = math.exp(-math.log(2) * 0.5 / EMA_HALF_LIFE_HOURS)
 # The dashboard (scripts/dashboard/news_feed.py, news_pulse.py) imports
 # these so its numbers stay identical to the ones that fire the vote.
 ARTICLE_CLIP: float = 0.5
+
+# Volume normalisation.  The 4-feed setup scored ~12 articles per run, and
+# SESSION_VOTE_THRESHOLD was tuned on that scale.  The 13 default feeds
+# bring 40-80 per run, which made the plain sum a count of headlines (a
+# session net of -77 against +/-1.5 on 2026-11-20).  A run with more than
+# REF_STORIES_PER_RUN scored stories is scaled down to that many stories'
+# worth (net = mean x REF); a quieter run is summed exactly as before.
+REF_STORIES_PER_RUN: int = 12
+# Headlines that normalise to the same text are one story (Yahoo TW + its
+# Google News copy, UDN + 經濟日報 ...). Whole-headline match on purpose:
+# a prefix match merged different TAIFEX settlement notices and FactSet
+# updates that share a template. Only the first copy is scored; keys are
+# remembered for STORY_TTL_HOURS so a later copy is not scored again.
+STORY_KEY_MAX_CHARS: int = 160
+STORY_TTL_HOURS: float = 8.0
 EROSION_POINTS: float = 1.5   # session net this far back from its peak = "Eroding"
 
 ARTICLE_MAX_AGE_HOURS = 4
@@ -124,6 +140,41 @@ TAIFEX_ADMIN_RULE = (
     "score neutral at low confidence. Market-wide margin hikes or trading halts are "
     "scored by their market impact.\n"
 )
+# Shadow score (``news.rss_shadow_score``, default off): a second Gemini
+# call per article that sees WHEN the article was published and what the
+# markets already did, and is told to score only news that is not priced
+# in yet. It is logged beside the live score (news_log) and kept as its own
+# session EMA in the state file — it never votes and never posts to
+# Discord. It exists to test, on live data, whether the live score's
+# tracking of price is reaction (headlines describing a move that already
+# happened) rather than prediction.
+SHADOW_PROMPT = """\
+You are a financial news analyst.  Judge whether this article carries NEW
+information that Taiwan equity futures (TAIEX / 台股加權指數) have NOT yet
+priced in, and its likely impact over the next 1-4 hours.
+
+Articles may be in English or Traditional Chinese (繁體中文) — analyse both equally.
+
+Respond with ONLY a JSON object — no markdown, no explanation:
+{{"direction": "bullish"|"bearish"|"neutral", "confidence": <float 0.0-1.0>, "reason": "<one sentence>"}}
+
+Rules:
+- An article that mainly REPORTS a market move that already happened (an index or stock up/down N points or %, closing or intraday market wraps, "stocks fell/rallied", 大漲/重挫/收盤/盤中/跌點) is neutral with confidence 0.1, unless it also reveals a new cause that markets have not reacted to yet.
+- Use the publication time and the market moves below: if the information is older than those moves or is already reflected in them, it is priced in → neutral, low confidence.
+- Score only genuinely new information: surprise policy or rate decisions, unexpected earnings/guidance (TSMC 台積電 ~30% of TAIEX), geopolitical events, large 外資 flow surprises, cross-strait developments.
+- "confidence" reflects how strongly the NEW information should move TAIEX futures, not how sure you are.
+- If unsure, default to neutral with confidence 0.2.
+
+Now (Taipei): {now}
+Published: {published} ({age})
+Market moves so far (change vs previous close, latest quote):
+{market}
+
+Headline: {headline}
+Summary: {summary}
+"""
+
+
 FEED_TIMEOUT_S = 20
 
 
@@ -165,6 +216,8 @@ def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
         "gemini_api_key": ai.get("google_api_key", ""),
         "discord_webhook_url": discord_webhook or news.get("discord_webhook") or "",
         "discord_mode": discord_mode(news.get("rss_discord")),
+        "shadow_score": news.get("rss_shadow_score") is True,
+        "signal_path": news.get("signal_path") or "",
     }
 
 
@@ -481,6 +534,78 @@ def dedup_articles(articles: list[dict], state: dict,
     return new
 
 
+# A trailing " - Publisher" (Google News). A suffix with a digit or % is
+# part of the headline ("營收創新高 - 年增20%"), never a publisher name.
+_GN_PUBLISHER_RE = re.compile(r"\s+[-–—|]\s+[^-–—|\d%％]{1,40}$")
+
+
+def story_key(title: str) -> str:
+    """Normalised headline used to spot the same story from two feeds.
+
+    Drops a trailing `` - Publisher`` (Google News appends one) and a
+    trailing ellipsis, then everything that is not a letter or digit,
+    case-folded.  ``""`` when too little is left to compare safely.
+    """
+    import unicodedata                                     # noqa: PLC0415
+    text = unicodedata.normalize("NFKC", str(title or "")).strip()
+    text = _GN_PUBLISHER_RE.sub("", text).rstrip(".… ")
+    key = "".join(ch for ch in text.casefold() if ch.isalnum())
+    return key[:STORY_KEY_MAX_CHARS] if len(key) >= 8 else ""
+
+
+def dedup_stories(articles: list[dict], state: dict,
+                  now: datetime) -> tuple[list[dict], list[dict]]:
+    """Split *articles* into (first copy of each story, duplicates).
+
+    A duplicate is a headline whose ``story_key`` was already scored in
+    the last STORY_TTL_HOURS (``state["recent_stories"]``) or appears
+    earlier in this batch.  Feed order decides which copy is kept, so a
+    direct feed wins over its Google News echo.
+    """
+    recent = _live_stories(state, now)
+    keep, dups, batch = [], [], set()
+    for art in articles:
+        key = story_key(art.get("title", ""))
+        if key and (key in recent or key in batch):
+            dups.append(art)
+            continue
+        if key:
+            batch.add(key)
+        keep.append(art)
+    return keep, dups
+
+
+def _live_stories(state: dict, now: datetime) -> dict:
+    raw = state.get("recent_stories")
+    if not isinstance(raw, dict):
+        return {}
+    cutoff = now - timedelta(hours=STORY_TTL_HOURS)
+    live = {}
+    for key, at in raw.items():
+        try:
+            when = datetime.fromisoformat(str(at))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_TZ_TAIPEI)
+        if when >= cutoff:
+            live[key] = at
+    return live
+
+
+def remember_stories(state: dict, articles: list[dict], guids: list[str],
+                     now: datetime) -> None:
+    """Record the story keys of the articles that were actually scored."""
+    done = set(guids)
+    live = _live_stories(state, now)
+    stamp = now.isoformat(timespec="seconds")
+    for art in articles:
+        key = story_key(art.get("title", ""))
+        if key and art.get("guid") in done:
+            live[key] = stamp
+    state["recent_stories"] = live
+
+
 def mark_seen(state: dict, guids: list[str]) -> dict:
     """Add GUIDs to the seen set.  Keep last 5000 to bound state size."""
     seen = list(state.get("seen_guids", []))
@@ -489,9 +614,19 @@ def mark_seen(state: dict, guids: list[str]) -> dict:
     return state
 
 
-# ── Gemini scoring ───────────────────────────────────────────────────────
+def _mark_seen_scored_duplicates(state: dict, dup_stories: list[dict],
+                                 now: datetime) -> None:
+    """Mark a duplicate GUID seen only after a copy of that story has a usable score.
 
-import re
+    The others stay unseen, so the next pass can score them. A kept copy
+    is marked by ``mark_seen(scored_guids)`` whether or not its score was usable.
+    """
+    usable = set(_live_stories(state, now))
+    mark_seen(state, [art["guid"] for art in dup_stories
+                      if art.get("guid") and story_key(art.get("title", "")) in usable])
+
+
+# ── Gemini scoring ───────────────────────────────────────────────────────
 
 _DIR_RE = re.compile(r'"direction"\s*:\s*"(bullish|bearish|neutral)"')
 _CONF_RE = re.compile(r'"confidence"\s*:\s*([\d.]+)')
@@ -523,7 +658,12 @@ def score_article(headline: str, summary: str, api_key: str,
     gets the administrative-notice rule; every other source uses
     SCORING_PROMPT unchanged.
     """
-    prompt = scoring_prompt(headline, summary, source)
+    return _gemini_json(scoring_prompt(headline, summary, source), api_key)
+
+
+def _gemini_json(prompt: str, api_key: str) -> dict | None:
+    """One Gemini call → parsed JSON (None if unparseable). Raises
+    GeminiAPIError on HTTP/connection failure."""
     url = GEMINI_API_URL.format(model=GEMINI_MODEL, key=api_key)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
@@ -599,15 +739,139 @@ def score_articles(articles: list[dict], api_key: str) -> tuple[list[dict], list
     return results, scored_guids, api_error
 
 
+# ── Shadow score (logged only, never votes) ─────────────────────────────
+
+QUOTES_NAME = "crossmarket_quotes.json"   # W2's display-only sidecar beside signal.json
+MARKET_LINES_MAX = 12
+
+
+def market_context(signal_path: str, now: datetime) -> str:
+    """Lines for SHADOW_PROMPT from W2's quotes sidecar. Advisory: any
+    problem gives a placeholder line, never an exception."""
+    if not signal_path:
+        return "(no market data configured)"
+    try:
+        with open(Path(signal_path).parent / QUOTES_NAME, encoding="utf-8") as f:
+            data = json.load(f)
+        quotes = data.get("quotes") if isinstance(data, dict) else None
+        lines = []
+        for sym, q in (quotes or {}).items():
+            if not isinstance(q, dict) or q.get("pct") is None:
+                continue
+            when = ""
+            if q.get("quote_time"):
+                when = datetime.fromtimestamp(float(q["quote_time"]), _TZ_TAIPEI).strftime("%m-%d %H:%M")
+            state = "" if q.get("fresh") else " (market closed / stale)"
+            lines.append(f"- {sym}: {float(q['pct']):+.2f}% at {when}{state}")
+        return "\n".join(lines[:MARKET_LINES_MAX]) or "(no quotes available)"
+    except (OSError, ValueError, TypeError) as exc:
+        return f"(market data unavailable: {type(exc).__name__})"
+
+
+def shadow_prompt(article: dict, now: datetime, market: str) -> str:
+    pub = article.get("published_dt")
+    if isinstance(pub, datetime):
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        published = pub.astimezone(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+        age = f"{max(0, int((now - pub).total_seconds() // 60))} min ago"
+    else:
+        published, age = "unknown", "age unknown"
+    title = article.get("title") or ""
+    summary = article.get("summary") or ""
+    if summary.strip() == title.strip():
+        summary = ""
+    return SHADOW_PROMPT.format(now=now.astimezone(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M"),
+                                published=published, age=age, market=market,
+                                headline=title, summary=summary[:500])
+
+
+def score_shadow(scored: list[dict], cfg: dict, now: datetime) -> str | None:
+    """Add ``item["shadow"]`` (a score dict, or None) to each scored item.
+
+    Runs after the live scoring and never changes it: a failure here only
+    leaves shadows empty. Returns an error string, or None.
+    """
+    market = market_context(cfg.get("signal_path") or "", now)
+    for i, item in enumerate(scored):
+        try:
+            sc = _gemini_json(shadow_prompt(item["article"], now, market), cfg["gemini_api_key"])
+        except GeminiAPIError as exc:
+            for rest in scored[i:]:
+                rest["shadow"] = None
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001 — the shadow must never cost the vote
+            sc = None
+            print(f"    shadow scoring failed: {type(exc).__name__}: {exc}")
+        if isinstance(sc, dict) and "direction" in sc and "confidence" in sc:
+            sc["direction"] = str(sc["direction"]).lower()
+            item["shadow"] = sc
+        else:
+            item["shadow"] = None
+    return None
+
+
+def _shadow_session_net(state: dict, session_key: str) -> float:
+    if state.get("shadow_session_key") != session_key:
+        return 0.0
+    return float(state.get("shadow_session_net", 0.0))
+
+
+# ── W3 vote withdrawal ───────────────────────────────────────────────────
+
+def withdraw_w3_vote(vote_out: str, session_key: str) -> bool:
+    """Remove the scorer's own W3 vote for *session_key* once that
+    session's score is back under the threshold. A vote for another
+    night, or a manual vote (``W3-manual``), is left alone. Never
+    raises; True = removed.
+    """
+    if not vote_out or not session_key:
+        return False
+    stem, ext = os.path.splitext(vote_out)
+    path = f"{stem}_w3{ext}"
+    try:
+        with open(path, encoding="utf-8") as f:
+            vote = json.load(f)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return False
+    if (not isinstance(vote, dict) or vote.get("source") != "W3"
+            or vote.get("expires_after_session") != session_key):
+        return False
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f"  vote withdraw failed (will retry next run): {exc}")
+        return False
+    return True
+
+
 # ── Aggregation ──────────────────────────────────────────────────────────
 
+def run_scale(n_scored: int) -> float:
+    """Weight of each article in a run of *n_scored* scored stories."""
+    if n_scored <= REF_STORIES_PER_RUN:
+        return 1.0
+    return REF_STORIES_PER_RUN / n_scored
+
+
 def aggregate_scores(scored: list[dict]) -> float:
-    """Net score: sum of clipped (confidence × direction_sign).
+    """Run net: sum of clipped (confidence × direction_sign) × run_scale.
 
     Each article's signed score is clipped to ±0.5 to prevent a single
     high-confidence article from dominating the EMA.
-    bullish = +1, bearish = -1, neutral = 0.
+    bullish = +1, bearish = -1, neutral = 0 (a neutral story still
+    counts toward the run size).  Up to REF_STORIES_PER_RUN stories this
+    is the plain sum; past it, the mean × REF_STORIES_PER_RUN.
     """
+    total = _clipped_sum(scored)
+    return total * run_scale(len(scored))
+
+
+def _clipped_sum(scored: list[dict]) -> float:
     total = 0.0
     for item in scored:
         s = item["score"]
@@ -957,18 +1221,28 @@ def check_once(cfg: dict, state: dict, vote_out: str,
         _notify_fetch_recovery(cfg, state)
 
     new_articles = dedup_articles(articles, state, now=now)
-    print(f"  {len(articles)} recent articles, {len(new_articles)} new")
+    new_articles, dup_stories = dedup_stories(new_articles, state, now)
+    print(f"  {len(articles)} recent articles, {len(new_articles)} new"
+          f" ({len(dup_stories)} duplicate stories skipped)")
     state["last_fetched"] = len(articles)
     state["last_new"] = len(new_articles)
+    state["last_dup_stories"] = len(dup_stories)
 
     session_key = night_session_key(now)
 
     if not new_articles:
+        _mark_seen_scored_duplicates(state, dup_stories, now)
         state["last_check"] = now.isoformat(timespec="seconds")
         return state
 
     scored, scored_guids, api_error = score_articles(new_articles, cfg["gemini_api_key"])
     state = mark_seen(state, scored_guids)
+    # Only a usable score is a story. A [SKIP] GUID stays in scored_guids
+    # (mark_seen, so that article is not fetched again) but must not block
+    # another outlet's copy.
+    remember_stories(state, new_articles,
+                     [item["article"]["guid"] for item in scored], now)
+    _mark_seen_scored_duplicates(state, dup_stories, now)
     api_error = api_error or unusable_scores_error(scored, scored_guids)
     record_scoring_result(state, now, api_error,
                           skipped=len(scored_guids) - len(scored))
@@ -991,11 +1265,26 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     direction = net_score_to_vote(cum, SESSION_VOTE_THRESHOLD)
 
+    shadow_net = shadow_cum = None
+    if cfg.get("shadow_score") and scored:
+        shadow_error = score_shadow(scored, cfg, now)
+        # Same volume scaling as the live score (#334), over the same run size.
+        shadow_net = _clipped_sum([{"score": item["shadow"]} for item in scored
+                                   if item.get("shadow")]) * run_scale(len(scored))
+        shadow_cum = round(_shadow_session_net(state, session_key) * EMA_DECAY + shadow_net, 4)
+        state["shadow_session_key"] = session_key
+        state["shadow_session_net"] = shadow_cum
+        state["shadow_error"] = shadow_error or ""
+        print(f"  shadow run net: {shadow_net:+.2f}, shadow session net: {shadow_cum:+.2f}"
+              + (f" (shadow error: {shadow_error})" if shadow_error else ""))
+
     log_path = cfg.get("news_log_path")
     if log_path and scored:
         records = [rss_news_log.build_record(
             item["article"], item["score"], scored_at=now, session=session_key,
-            run_net=net, session_net=cum) for item in scored]
+            run_net=net, session_net=cum, run_scale=run_scale(len(scored)),
+            shadow=item.get("shadow") if shadow_net is not None else rss_news_log.NO_SHADOW,
+            shadow_run_net=shadow_net, shadow_session_net=shadow_cum) for item in scored]
         if not rss_news_log.append(log_path, records):
             print(f"  news history append failed: {log_path}")
 
@@ -1012,6 +1301,9 @@ def check_once(cfg: dict, state: dict, vote_out: str,
             print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
         except Exception as e:  # noqa: BLE001
             print(f"  vote write failed: {type(e).__name__}: {e}")
+    elif not direction and not api_error and withdraw_w3_vote(vote_out, session_key):
+        print(f"  VOTE WITHDRAWN: session net {cum:+.2f} back under "
+              f"±{SESSION_VOTE_THRESHOLD} -> removed W3 vote")
 
     def post(note=None):
         return post_discord_embed(cfg["discord_webhook_url"], direction, net, scored,

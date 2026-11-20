@@ -1,15 +1,18 @@
 name: Auto-merge gate
 
-# Public-repo workflow. pull_request_target and workflow_run run the copy of
-# this file that is already on master and can see secrets, so every job:
+# Public-repo workflow. pull_request_target and workflow_run run this file
+# from master and can see secrets. pull_request_review runs the PR merge
+# ref, so every job:
 #   - checks out master only (sparse scripts/ci), never the PR head
 #   - passes inputs through env, never inside run:
 #   - re-reads the live pull request in scripts/ci/auto_merge_gate.py and
 #     ignores a fork. trigger-sage, retrigger-reed, and eval-approval-gate
 #     also require an open PR into master.
 # trigger-sage, retrigger-reed, and notify-selina are read-only and each
-# receives only its own webhook secrets. eval-approval-gate can write the
-# status, resolve a bot thread, and enable auto-merge, and it receives none.
+# receives only its own webhook secrets. retrigger-reed posts once: the
+# later of Tests and Claude Review, or a cursor[bot] WAIT after CI is
+# green. eval-approval-gate can write the status, resolve a bot thread,
+# and enable auto-merge, and it receives none.
 
 on:
   pull_request_target:
@@ -96,12 +99,21 @@ jobs:
 
   retrigger-reed:
     if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      ) ||
+      (
+        github.event_name == 'pull_request_review' &&
+        github.event.action == 'submitted' &&
+        github.event.review.user.login == 'cursor[bot]' &&
+        github.event.pull_request.state == 'open' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
     concurrency:
-      group: retrigger-reed-${{ github.event.workflow_run.head_sha }}
+      group: retrigger-reed-${{ github.event.workflow_run.head_sha || github.event.pull_request.number }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -119,7 +131,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
           REED_QA_WEBHOOK_URL: ${{ secrets.REED_QA_WEBHOOK_URL }}
           REED_QA_WEBHOOK_KEY: ${{ secrets.REED_QA_WEBHOOK_KEY }}
         run: python3 scripts/ci/auto_merge_gate.py retrigger-reed
@@ -152,7 +167,7 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository
       )
     concurrency:
-      group: notify-selina-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.head_sha }}
+      group: notify-selina-${{ github.event_name }}-${{ github.event.review.id || github.event.pull_request.number || github.event.workflow_run.head_sha }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -174,7 +189,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REVIEW_ID: ${{ github.event.review.id }}
           REVIEW_STATE: ${{ github.event.review.state }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
           WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           MERGED_HEAD_REF: ${{ github.event.pull_request.head.ref }}

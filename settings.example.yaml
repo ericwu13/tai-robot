@@ -413,6 +413,10 @@ news:
                                   #   新聞訊號 view replaces the per-run embed:
                                   #   off | errors (Gemini failing / recovered) |
                                   #   changes (errors + vote written) | all (legacy per-run)
+  rss_shadow_score: false         # true = a second Gemini call per article that sees the publish
+                                  #   time and W2's market moves and scores only news not yet priced
+                                  #   in; logged beside the live score (news log + state), never votes.
+                                  #   Doubles Gemini calls. Research only.
   discord_webhook: ""             # Discord webhook URL for W2/W3 bridge alerts
 
 # ── Regime switching ───────────────────────────────────────────────────
