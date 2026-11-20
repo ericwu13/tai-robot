@@ -9322,8 +9322,11 @@ class BacktestApp:
                     "review required.", "status")
             else:
                 self._live_log_msg(
-                    "[RESUME] Real account flat but sim has position — NOT "
-                    "confirming entry. Manual review required.", "status")
+                    "[RESUME] Sim has a position but the lot checked for this "
+                    "bot is flat (account flat, or this bot's own log is flat "
+                    "while the account net holds another bot's accounted "
+                    "position) — NOT confirming entry. Manual review required.",
+                    "status")
             if outcome["kept_inflight"]:
                 self._live_log_msg(
                     "[RESUME] Kept in-flight fill_pending — "
