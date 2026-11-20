@@ -545,8 +545,10 @@ class HangWatchdog:
         # cannot fake or hide a hang.
         self._seen_ts: float | None = None
         self._seen_mono = 0.0
+        self._seen_wall: float | None = None
         self._seen_inflight_key = None
         self._seen_inflight_mono = 0.0
+        self._seen_inflight_wall: float | None = None
         self._last_loop_mono: float | None = None
         self._latched_ts: float | None = None
         # Set when this episode latches. Recovery measures stall from the
@@ -622,8 +624,10 @@ class HangWatchdog:
         self._last_alert_mono = None
         self._seen_ts = None
         self._seen_mono = 0.0
+        self._seen_wall = None
         self._seen_inflight_key = None
         self._seen_inflight_mono = 0.0
+        self._seen_inflight_wall = None
         self._last_loop_mono = None
         self._latched_ts = None
         self._episode_origin_mono = None
@@ -677,32 +681,21 @@ class HangWatchdog:
                     self._running = False
 
     def _poll(self) -> None:
-        """One watchdog wake. A huge gap is this thread sleeping, not a hang."""
+        """One watchdog wake. A late wake still counts a stalled heartbeat."""
         now_mono = time.monotonic()
         prev = self._last_loop_mono
         self._last_loop_mono = now_mono
         gap = 0.0 if prev is None else now_mono - prev
-        # Much larger than the poll (5×, at least 1s): OS sleep or a stalled
-        # wake. Skip the decision and adopt the file as the new baseline.
-        # Do not clear the latch — a hang that started before the sleep is
-        # still the same episode.
+        # Much larger than the poll (5×, at least 1s): this thread woke
+        # late (the process was frozen, or the OS slept). Log the gap and
+        # still judge the heartbeat. A ts that did not advance is a stall.
+        # Do not reset the stall clock. A P1 after a real sleep is right:
+        # the bot did not run.
         if gap > max(self.poll_s * 5.0, 1.0):
             logger.warning(
-                "hang watchdog wake-gap rebase gap=%.3fs poll_s=%.3fs",
+                "hang watchdog wake-gap gap=%.3fs poll_s=%.3fs",
                 gap, self.poll_s)
-            self._rebase(now_mono)
-            return
         self._check_once(now_mono)
-
-    def _rebase(self, now_mono: float) -> None:
-        """Treat the current file as just observed. Leave ``_latched`` alone."""
-        self._seen_mono = now_mono
-        self._seen_inflight_mono = now_mono
-        hb = _load_heartbeat(self.bot_dir)
-        if not isinstance(hb, dict):
-            return
-        self._seen_ts = _hb_ts(hb)
-        self._seen_inflight_key = _inflight_key(hb)
 
     def _check_once(self, now_mono: float | None = None) -> None:
         if now_mono is None:
@@ -728,11 +721,13 @@ class HangWatchdog:
             if ts != self._seen_ts:
                 self._seen_ts = ts
                 self._seen_mono = now_mono
+                self._seen_wall = time.time()
             hb_stall = now_mono - self._seen_mono
         inflight_key = _inflight_key(hb)
         if inflight_key != self._seen_inflight_key:
             self._seen_inflight_key = inflight_key
             self._seen_inflight_mono = now_mono
+            self._seen_inflight_wall = time.time()
         inflight_stall = (
             now_mono - self._seen_inflight_mono
             if inflight_key is not None else None)
@@ -741,9 +736,10 @@ class HangWatchdog:
                          and inflight_stall > self.inflight_hung_s)
         if not hung_heartbeat and not hung_inflight:
             # Re-arm only when a new timestamp is actually fresh. A missing
-            # file, an unreadable file, or a wake-gap rebase of the same
-            # ts must not clear the latch (that would send a second P1).
-            # A heartbeat that never went HUNG does not alert.
+            # file or an unreadable file must not clear the latch (that
+            # would send a second P1). A late wake does not reset the stall
+            # clock, so the same ts across that gap is a stall above, not
+            # a recovery. A heartbeat that never went HUNG does not alert.
             if (self._latched and ts is not None and ts != self._latched_ts
                     and hb_stall is not None and hb_stall <= self.hung_s):
                 self._on_recovered(now_mono)
@@ -789,7 +785,7 @@ class HangWatchdog:
             atomic_write_json(os.path.join(self.bot_dir, HANG_FILENAME), hang)
         except Exception:
             logger.exception("hang watchdog hang.json write failed")
-        self._publish_host_hung(hb, reason)
+        self._publish_host_hung(hb, reason, now_mono)
 
     def _send_hung_alert(self, hb: dict, reason: str, age, inflight) -> None:
         """One P1. Names mode, the entry gate, and whether a position is open.
@@ -874,8 +870,16 @@ class HangWatchdog:
         except Exception:
             logger.exception("hang watchdog recovery write failed")
 
-    def _publish_host_hung(self, hb: dict, reason: str) -> None:
-        """Tell the shared marker this bot is HUNG. Never skips the P1 above."""
+    def _publish_host_hung(self, hb: dict, reason: str, now_mono: float) -> None:
+        """Tell the shared marker this bot is HUNG. Never skips the P1 above.
+
+        ``now`` is the wall time the episode started. ``now_mono`` is this
+        check's monotonic sample (``time.monotonic()`` when the watchdog
+        polled). When that sample and the wall clock moved together, the
+        start is ``time.time() - (now_mono - origin)``. When they did not
+        (a frozen wall clock), keep ``time.time()`` so the host-stall
+        stale window does not shift. No origin yet uses ``time.time()``.
+        """
         try:
             from src.live.host_stall import record_hung
             link = hb.get("link") if isinstance(hb.get("link"), dict) else {}
@@ -885,12 +889,34 @@ class HangWatchdog:
                 self.bot_dir,
                 reason=reason,
                 real=real,
-                now=time.time(),
+                now=self._episode_start_wall(reason, now_mono),
                 pid=os.getpid(),
                 alert_fn=self.alert_fn,
             )
         except Exception:
             logger.exception("host stall record failed")
+
+    def _episode_start_wall(self, reason: str, now_mono: float) -> float:
+        """Wall time the frozen heartbeat was first seen, or ``time.time()``."""
+        wall_now = time.time()
+        origin = self._episode_origin_mono
+        if origin is None:
+            return wall_now
+        if reason == "inflight_com_call":
+            wall_at_origin = self._seen_inflight_wall
+        else:
+            wall_at_origin = self._seen_wall
+        if wall_at_origin is None:
+            return wall_now
+        mono_delta = now_mono - origin
+        wall_delta = wall_now - wall_at_origin
+        # Clocks that did not move together: an injected monotonic sample
+        # against a frozen wall clock. Subtracting that sample would move
+        # hung_at off the caller's clock and pull a stale host-stall episode
+        # back inside the 1800 s window.
+        if abs(wall_delta - mono_delta) > 1.0:
+            return wall_now
+        return wall_now - mono_delta
 
     def _publish_host_recovered(self, stall_s: float, recovered_at: float) -> None:
         try:

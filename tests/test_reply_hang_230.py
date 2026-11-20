@@ -592,7 +592,7 @@ def test_stamp_depth_stays_on_the_calling_thread():
     assert hb._stamp_depth_value() == 0
 
 
-def test_wake_gap_rebase_logs_the_gap(tmp_path, caplog):
+def test_wake_gap_logs_the_gap(tmp_path, caplog):
     writer = hb.HeartbeatWriter(str(tmp_path))
     writer.write()
     watchdog = hb.HangWatchdog(
@@ -600,9 +600,10 @@ def test_wake_gap_rebase_logs_the_gap(tmp_path, caplog):
     watchdog._last_loop_mono = time.monotonic() - 5.0
     with caplog.at_level(logging.WARNING, logger="src.live.main_heartbeat"):
         watchdog._poll()
-    matched = [rec.message for rec in caplog.records if "wake-gap rebase" in rec.message]
+    matched = [rec.message for rec in caplog.records if "wake-gap" in rec.message]
     assert matched
     assert "gap=" in matched[0]
+    assert "rebase" not in matched[0]
     assert "5." in matched[0] or "4." in matched[0]
 
 
