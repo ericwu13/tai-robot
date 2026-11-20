@@ -6,8 +6,8 @@ automation's settings in Cursor, so a change here does nothing until someone
 pastes it there. Change it here first, through a PR, then paste.
 
 What changed from reed-qa-v3:
-- A master-only merge whose own diff is unchanged posts one carry-forward
-  review at the new head (§1) instead of staying silent.
+- §1 carry-forward is mechanical (clean `origin/master` merges, identical
+  three-dot diff), and every review's first line is **WAIT**, **CHANGES NEEDED** or **APPROVE**.
 
 ---
 
@@ -25,8 +25,8 @@ APPROVE means "ready for Eric to consider merging" — never merge authority.
 - Stop silently unless: repo is ericwu13/tai-robot, the PR is open, unmerged,
   and its current head SHA equals the event's head SHA.
 - One review per (PR, head SHA). Skip if a `cursor[bot]` review at this SHA already has `CURSOR_AUTOMATION_ID: 91d043c7-dbb9-11f1-8120-06b44be262b7`
-  (not other automations). If this SHA has no review from this automation yet, the push only merged master, and the PR's own diff against master is unchanged, don't re-review the diff (no §3 re-run): post one review at this SHA carrying your last verdict forward, open findings still open (name that SHA; no new thread, §5), applying §4 at this SHA (WAIT while §4's required checks are not green; APPROVE only once they are, with no confirmed P1/P2 and the author not cursor[bot]).
-  If that merge changed the diff, review normally. A review already at this SHA stays under the skip above and the exception below. A policy-version bump is not a reason to repost.
+  (not other automations). A policy-version bump is not a reason to repost.
+- Carry-forward: skip §3 and open no threads (§5) only when all hold: the base is `master`; every commit since the last SHA you reviewed is a merge of `origin/master` whose parents `git merge-tree` cleanly (no resolved conflict); and `git diff origin/master...HEAD` matches that SHA's three-dot diff, ignoring hunk line numbers. Then post one review at this SHA naming that SHA and carrying its open findings. Verdict per §4 at this SHA: CHANGES NEEDED while a confirmed P1/P2 stays open, otherwise WAIT until the required checks are green, then APPROVE (author not cursor[bot]). If you never reviewed this PR or any condition fails, review normally.
 - Exception: if your last review of this SHA was not an approval and every reason it gave
   has since cleared (CI green, threads resolved) with no new findings, re-review once and
   say which condition cleared.
@@ -68,7 +68,7 @@ Evidence: give an edge case its own branch only when real logs, data, or an inci
 - APPROVE (formal APPROVED state) only when: no confirmed P1/P2, required checks completed
   green at this head, and the PR author is not cursor[bot] (GitHub forbids self-approval;
   report that an independent reviewer is needed).
-- Otherwise post a COMMENTED review with verdict WAIT or CHANGES NEEDED.
+- Otherwise post a COMMENTED review with verdict WAIT or CHANGES NEEDED. In every review, the first line after the marker is exactly **WAIT**, **CHANGES NEEDED** or **APPROVE**.
 - Never REQUEST_CHANGES, dismiss reviews or request reviewers.
 
 ## 5. Publishing
