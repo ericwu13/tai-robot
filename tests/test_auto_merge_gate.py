@@ -17,6 +17,10 @@ OTHER_AUTO = "11111111-1111-1111-1111-111111111111"
 RUN_URL = "https://github.com/ericwu13/tai-robot/actions/runs/1"
 WEBHOOK_URL = "https://hooks.example/secret-path-XYZ"
 WEBHOOK_KEY = "super-secret-key-ABC"
+REED_URL = "https://hooks.example/reed-secret-path-XYZ"
+REED_KEY = "reed-secret-key-ABC"
+SELINA_URL = "https://hooks.example/selina-secret-path-XYZ"
+SELINA_KEY = "selina-secret-key-ABC"
 
 
 def _load():
@@ -89,13 +93,17 @@ def pages_of(items, size=100):
 class World:
     """Routes gh subprocess calls. Merge results are a script of (rc, out, err)."""
 
-    def __init__(self, pr=None, files=None, reviews=None, threads=None, merges=None):
+    def __init__(self, pr=None, files=None, reviews=None, threads=None, merges=None,
+                 open_prs=None, check_runs=None, review_obj=None):
         self.pr = make_pr() if pr is None else pr
         self.file_pages = files if files and isinstance(files[0], list) else pages_of(files or [])
         self.review_pages = (reviews if reviews and isinstance(reviews[0], list)
                              else pages_of(reviews or []))
         self.thread_pages = threads if threads is not None else [[]]
         self.merge_script = list(merges or [(0, "ok\n", "")])
+        self.open_pr_pages = pages_of(open_prs or [])
+        self.check_pages = pages_of(check_runs or [])
+        self.review_obj = review_obj
         self.calls = []
         self.statuses = []
         self.resolves = []
@@ -128,6 +136,14 @@ class World:
             return self._page(self.file_pages, page)
         if base.endswith("/reviews"):
             return self._page(self.review_pages, page)
+        if "/reviews/" in base:
+            if self.review_obj is None:
+                raise AssertionError(path)
+            return self.review_obj
+        if base.endswith("/pulls"):
+            return self._page(self.open_pr_pages, page)
+        if base.endswith("/check-runs"):
+            return {"check_runs": self._page(self.check_pages, page)}
         if "/pulls/" in base:
             return self.pr
         raise AssertionError(path)
@@ -945,61 +961,876 @@ def test_trigger_sage_missing_secret_does_not_call(monkeypatch, capsys):
     assert WEBHOOK_URL not in err
 
 
+# ---- retrigger-reed / notify-selina ---------------------------------------
+
+class _HookResp:
+    status = 204
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def getcode(self):
+        return 204
+
+
+def _gets(world):
+    return [args[1] for args, _ in world.calls if args[:1] == ["api"] and len(args) == 2]
+
+
+def _bodies(posts):
+    return [json.loads(req.data.decode()) for req, _timeout in posts]
+
+
+def _capture_open(posts):
+    def opener(req, timeout=30):
+        posts.append((req, timeout))
+        return _HookResp()
+    return opener
+
+
+def _set_or_del(monkeypatch, name, value):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+
+def _clear_hooks(monkeypatch):
+    for name in (
+        "SAGE_REVIEW_WEBHOOK_URL", "SAGE_REVIEW_WEBHOOK_KEY",
+        "REED_QA_WEBHOOK_URL", "REED_QA_WEBHOOK_KEY",
+        "SELINA_QA_WEBHOOK_URL", "SELINA_QA_WEBHOOK_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def check_run(name, status="completed", conclusion="success", rid=1,
+              completed="2026-11-19T03:00:00Z", started="2026-11-19T02:00:00Z"):
+    return {
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "id": rid,
+        "completed_at": completed,
+        "started_at": started,
+    }
+
+
+def green_checks():
+    """test + review green. A later failing lint run must not count."""
+    return [
+        check_run("test", rid=11),
+        check_run("review", rid=12),
+        check_run("lint", conclusion="failure", rid=13, completed="2026-11-19T05:00:00Z"),
+    ]
+
+
+def wait_body():
+    return marker(REED, "\n\n**WAIT**\n")
+
+
+def _run_reed(monkeypatch, prs, reviews=None, checks=None, head_sha=SHA,
+              url=REED_URL, key=REED_KEY, opener=None, repo=REPO):
+    world = World(open_prs=prs, reviews=reviews, check_runs=checks)
+    monkeypatch.setattr(mod.subprocess, "run", world.run)
+    monkeypatch.setenv("GH_TOKEN", "test-token-not-on-argv")
+    _set_or_del(monkeypatch, "GITHUB_REPOSITORY", repo)
+    _set_or_del(monkeypatch, "HEAD_SHA", head_sha)
+    _clear_hooks(monkeypatch)
+    _set_or_del(monkeypatch, "REED_QA_WEBHOOK_URL", url)
+    _set_or_del(monkeypatch, "REED_QA_WEBHOOK_KEY", key)
+    posts = []
+    monkeypatch.setattr(mod.urllib.request, "urlopen", opener or _capture_open(posts))
+    rc = mod.main(["auto_merge_gate.py", "retrigger-reed"])
+    return rc, world, posts
+
+
+def _run_selina(monkeypatch, event, pr=None, review_obj=None, open_prs=None,
+                url=SELINA_URL, key=SELINA_KEY, opener=None, repo=REPO, **env):
+    world = World(pr=pr, open_prs=open_prs, review_obj=review_obj)
+    monkeypatch.setattr(mod.subprocess, "run", world.run)
+    monkeypatch.setenv("GH_TOKEN", "test-token-not-on-argv")
+    _set_or_del(monkeypatch, "GITHUB_REPOSITORY", repo)
+    _clear_hooks(monkeypatch)
+    _set_or_del(monkeypatch, "SELINA_QA_WEBHOOK_URL", url)
+    _set_or_del(monkeypatch, "SELINA_QA_WEBHOOK_KEY", key)
+    _set_or_del(monkeypatch, "EVENT_NAME", event)
+    _set_or_del(monkeypatch, "PR", env.get("pr_number", "7"))
+    _set_or_del(monkeypatch, "REVIEW_ID", env.get("review_id", "42"))
+    _set_or_del(monkeypatch, "REVIEW_STATE", env.get("review_state", "SPOOFED"))
+    _set_or_del(monkeypatch, "HEAD_SHA", env.get("head_sha", "f" * 40))
+    _set_or_del(monkeypatch, "WORKFLOW_NAME", env.get("workflow_name", "SPOOFED"))
+    _set_or_del(monkeypatch, "WORKFLOW_CONCLUSION", env.get("conclusion", "SPOOFED"))
+    _set_or_del(monkeypatch, "MERGED_HEAD_REF", env.get("merged_head_ref", "spoofed-ref"))
+    posts = []
+    monkeypatch.setattr(mod.urllib.request, "urlopen", opener or _capture_open(posts))
+    rc = mod.main(["auto_merge_gate.py", "notify-selina"])
+    return rc, world, posts
+
+
+def _assert_hook(posts, secret):
+    req, timeout = posts[0]
+    assert req.get_header("Authorization") == "Bearer " + secret
+    assert req.get_header("Content-type") == "application/json"
+    assert timeout == 30
+    blob = req.data.decode() + (req.get_header("Authorization") or "")
+    assert "test-token-not-on-argv" not in blob
+    assert secret in req.get_header("Authorization")
+
+
+def test_retrigger_reed_posts_once_for_single_wait(monkeypatch):
+    prs = [
+        make_pr(number=7),
+        make_pr(number=8, draft=True),
+        make_pr(number=9, base={"ref": "feature"}),
+        make_pr(number=10, head={"repo": {"full_name": "other/tai-robot"}}),
+        make_pr(number=11, head={"sha": OTHER_SHA}),
+    ]
+    reviews = [review("COMMENTED", REED, rid=5, body=wait_body())]
+    rc, world, posts = _run_reed(monkeypatch, prs, reviews=reviews, checks=green_checks())
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+    _assert_hook(posts, REED_KEY)
+    assert REED_URL not in posts[0][0].data.decode()
+    assert world.write_calls() == []
+    _assert_no_admin(world)
+    gets = _gets(world)
+    assert f"repos/{REPO}/pulls?state=open&per_page=100&page=1" in gets
+    assert f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=1" in gets
+    assert any("/pulls/7/reviews?per_page=100&page=1" in g for g in gets)
+    assert not any("/pulls/8/reviews" in g or "/pulls/9/reviews" in g for g in gets)
+
+
+def test_retrigger_reed_counts_only_reviews_at_head(monkeypatch):
+    reviews = [
+        review("APPROVED", REED, sha=OTHER_SHA, rid=1),
+        review("COMMENTED", REED, sha=OTHER_SHA, rid=2, body=wait_body()),
+        review("COMMENTED", REED, rid=3, body=wait_body()),
+    ]
+    rc, _, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)], reviews=reviews, checks=green_checks(),
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+
+
+def test_retrigger_reed_finds_wait_on_second_review_page(monkeypatch):
+    reviews = [
+        review("COMMENTED", REED, sha=OTHER_SHA, rid=i, body=wait_body())
+        for i in range(1, 101)
+    ]
+    reviews.append(review("COMMENTED", REED, rid=101, body=wait_body()))
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)], reviews=reviews, checks=green_checks(),
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+    assert any("page=2" in g and "/reviews?" in g for g in _gets(world))
+
+
+def test_retrigger_reed_finds_pr_on_second_page(monkeypatch):
+    prs = [make_pr(number=i, head={"sha": OTHER_SHA}) for i in range(1, 101)]
+    prs.append(make_pr(number=101))
+    rc, world, posts = _run_reed(
+        monkeypatch, prs,
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=green_checks(),
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 101, "head_sha": SHA}]
+    assert f"repos/{REPO}/pulls?state=open&per_page=100&page=2" in _gets(world)
+
+
+def test_retrigger_reed_reads_check_runs_past_first_page(monkeypatch):
+    old = []
+    for i in range(100):
+        name = "test" if i % 2 == 0 else "review"
+        old.append(check_run(
+            name, conclusion="failure", rid=i + 1, completed="2026-11-18T00:00:00Z",
+        ))
+    checks = old + [
+        check_run("test", conclusion="success", rid=201, completed="2026-11-19T04:00:00Z"),
+        check_run("review", conclusion="success", rid=202, completed="2026-11-19T04:00:00Z"),
+    ]
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=checks,
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+    assert f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=2" in _gets(world)
+
+
+def test_retrigger_reed_earlier_failed_review_then_success(monkeypatch):
+    """An earlier review check can fail; the later success is the one that counts."""
+    checks = [
+        check_run("test", rid=1, conclusion="success"),
+        check_run("review", rid=2, conclusion="failure", completed="2026-11-19T00:00:00Z"),
+        check_run("review", rid=3, conclusion="success", completed="2026-11-19T04:00:00Z"),
+    ]
+    rc, _, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=checks,
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{"pr": 7, "head_sha": SHA}]
+
+
+_NOT_ONE_WAIT = [
+    [],
+    [review("COMMENTED", REED, sha=OTHER_SHA, body=wait_body())],
+    [review("COMMENTED", SAGE, body=marker(SAGE, "\n\n**WAIT**\n"))],
+    [review("COMMENTED", REED, user="eric", body=wait_body())],
+    [
+        review("COMMENTED", REED, rid=1, body=wait_body()),
+        review("COMMENTED", REED, rid=2, body=wait_body()),
+        review("COMMENTED", REED, rid=3, body=wait_body()),
+    ],
+    [review("APPROVED", REED, body=wait_body())],
+    [review("COMMENTED", REED, body=marker(REED, "\n\n**WAIT**\n**CHANGES NEEDED**\n"))],
+    [review("COMMENTED", REED, body=marker(REED, "\n\nno verdict\n"))],
+]
+
+
+@pytest.mark.parametrize("reviews", _NOT_ONE_WAIT, ids=[
+    "none", "stale", "sage", "human", "three", "approved", "changes-needed", "no-wait",
+])
+def test_retrigger_reed_skips_unless_exactly_one_wait(monkeypatch, reviews):
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)], reviews=reviews, checks=green_checks(),
+    )
+    assert rc == 0 and posts == []
+    assert any("/reviews?" in g for g in _gets(world))
+
+
+@pytest.mark.parametrize("over", [
+    {"draft": True},
+    {"base": {"ref": "develop"}},
+    {"head": {"repo": {"full_name": "other/tai-robot"}}},
+    {"head": {"sha": OTHER_SHA}},
+    {"state": "closed"},
+], ids=["draft", "non-master", "fork", "other-sha", "closed"])
+def test_retrigger_reed_skips_unguarded_prs(monkeypatch, over):
+    rc, world, posts = _run_reed(
+        monkeypatch,
+        [make_pr(number=7, **over)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=green_checks(),
+    )
+    assert rc == 0 and posts == []
+    gets = _gets(world)
+    assert any("pulls?state=open" in g for g in gets)
+    assert not any("check-runs" in g for g in gets)
+
+
+@pytest.mark.parametrize("checks", [
+    [check_run("review", rid=1)],
+    [check_run("test", rid=1)],
+    [
+        check_run("test", rid=1),
+        check_run("review", rid=2, status="in_progress", conclusion=None,
+                  completed=None, started="2026-11-19T04:00:00Z"),
+        check_run("review", rid=3, conclusion="success", completed="2026-11-19T00:00:00Z"),
+    ],
+    [
+        check_run("review", rid=1),
+        check_run("test", rid=2, status="in_progress", conclusion=None,
+                  completed=None, started="2026-11-19T04:00:00Z"),
+        check_run("test", rid=3, conclusion="success", completed="2026-11-19T00:00:00Z"),
+    ],
+    [
+        check_run("test", rid=1, conclusion="success", completed="2026-11-19T00:00:00Z"),
+        check_run("test", rid=2, conclusion="failure", completed="2026-11-19T04:00:00Z"),
+        check_run("review", rid=3),
+    ],
+    [
+        check_run("test", rid=1, conclusion="success", completed="2026-11-19T01:00:00Z"),
+        check_run("test", rid=2, conclusion="failure", completed="2026-11-19T01:00:00Z"),
+        check_run("review", rid=3),
+    ],
+], ids=["missing-test", "missing-review", "review-in-progress", "test-in-progress",
+        "later-failure", "tie-id-failure"])
+def test_retrigger_reed_skips_unless_latest_checks_are_green(monkeypatch, checks):
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=checks,
+    )
+    assert rc == 0 and posts == []
+    assert any("check-runs" in g for g in _gets(world))
+    assert not any("/reviews?" in g for g in _gets(world))
+
+
+@pytest.mark.parametrize("url,key", [
+    (None, None),
+    ("", ""),
+    (REED_URL, ""),
+    ("", REED_KEY),
+    ("  ", "  "),
+])
+def test_retrigger_reed_unset_secrets_skip(monkeypatch, capsys, url, key):
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=green_checks(), url=url, key=key,
+    )
+    text = capsys.readouterr()
+    flat = text.out + text.err
+    assert rc == 0 and posts == [] and world.calls == []
+    assert "skip" in flat.lower()
+    assert REED_URL not in flat and REED_KEY not in flat
+
+
+@pytest.mark.parametrize("repo,sha", [
+    ("nope", SHA),
+    ("", SHA),
+    (REPO, "abc"),
+    (REPO, "g" * 40),
+    (REPO, "a" * 39),
+    (REPO, ""),
+])
+def test_retrigger_reed_rejects_bad_repo_or_sha(monkeypatch, repo, sha):
+    rc, world, posts = _run_reed(
+        monkeypatch, [make_pr(number=7)],
+        reviews=[review("COMMENTED", REED, body=wait_body())],
+        checks=green_checks(), repo=repo, head_sha=sha,
+    )
+    assert rc == 1 and posts == [] and world.calls == []
+
+
+@pytest.mark.parametrize("over,rev,expect", [
+    ({}, review("COMMENTED", REED, rid=99), "COMMENTED"),
+    ({}, review("COMMENTED", SAGE, rid=99), "COMMENTED"),
+    ({"draft": True}, review("COMMENTED", REED, rid=99), "COMMENTED"),
+    ({"draft": True}, review("APPROVED", REED, rid=99), "APPROVED"),
+    ({"base": {"ref": "feature-a"}}, review("APPROVED", SAGE, rid=99), "APPROVED"),
+    ({}, review("APPROVED", REED, rid=99), None),
+    ({}, review("COMMENTED", REED, rid=99, user="eric"), None),
+    ({}, review("COMMENTED", None, rid=99), None),
+    ({}, review("COMMENTED", REED, rid=99, sha=OTHER_SHA), None),
+    ({}, review("COMMENTED", REED, rid=99, body="hello\n" + marker(REED)), None),
+    ({"state": "closed"}, review("COMMENTED", REED, rid=99), None),
+    ({"head": {"repo": {"full_name": "other/tai-robot"}}},
+     review("COMMENTED", REED, rid=99), None),
+], ids=["reed-commented", "sage-commented", "draft-commented", "draft-approved",
+        "stacked-approved", "ready-approved", "human", "no-marker", "stale",
+        "marker-line-2", "closed", "fork"])
+def test_notify_selina_cursor_review(monkeypatch, over, rev, expect):
+    pr = make_pr(number=7, **over)
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_review", pr=pr, review_obj=rev,
+    )
+    assert rc == 0
+    gets = _gets(world)
+    assert f"repos/{REPO}/pulls/7" in gets
+    head = over.get("head") or {}
+    rejected = over.get("state") not in (None, "open") or bool(head.get("repo"))
+    if rejected:
+        assert not any("/reviews/" in g for g in gets)
+    else:
+        assert any("/reviews/42" in g for g in gets)
+    if expect is None:
+        assert posts == []
+        return
+    assert _bodies(posts) == [{
+        "event": "cursor_review",
+        "pr": 7,
+        "head_sha": SHA,
+        "review_id": 42,
+        "review_state": expect,
+    }]
+    _assert_hook(posts, SELINA_KEY)
+    assert world.write_calls() == []
+    _assert_no_admin(world)
+
+
+def test_notify_selina_review_skips_bad_head_sha(monkeypatch):
+    pr = make_pr(number=7, head={"sha": "abc"})
+    rc, _, posts = _run_selina(
+        monkeypatch, "pull_request_review", pr=pr,
+        review_obj=review("COMMENTED", REED, sha="abc", rid=42),
+    )
+    assert rc == 0 and posts == []
+
+
+@pytest.mark.parametrize("pr_number,review_id", [
+    ("", "42"), ("0", "42"), ("-1", "42"), ("7", ""), ("7", "0"), ("x", "1"),
+])
+def test_notify_selina_review_requires_positive_ids(monkeypatch, pr_number, review_id):
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_review",
+        pr=make_pr(number=7),
+        review_obj=review("COMMENTED", REED, rid=42),
+        pr_number=pr_number, review_id=review_id,
+    )
+    assert rc == 1 and posts == [] and world.calls == []
+
+
+@pytest.mark.parametrize("over", [
+    {},
+    {"draft": True},
+    {"draft": True, "base": {"ref": "feature-stack"}},
+], ids=["ready", "draft", "stacked-draft"])
+def test_notify_selina_tests_failure(monkeypatch, over):
+    pr = make_pr(number=7, **over)
+    open_prs = [
+        make_pr(number=4, head={"sha": OTHER_SHA}),
+        pr,
+        make_pr(number=8, head={"repo": {"full_name": "other/tai-robot"}}),
+    ]
+    rc, world, posts = _run_selina(
+        monkeypatch, "workflow_run", open_prs=open_prs, pr_number="999",
+        head_sha=SHA, workflow_name="Tests", conclusion="failure",
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{
+        "event": "ci_failed", "workflow": "Tests", "pr": 7, "head_sha": SHA,
+    }]
+    assert world.write_calls() == []
+    _assert_no_admin(world)
+
+
+def test_notify_selina_claude_review_failure(monkeypatch):
+    open_prs = [
+        make_pr(number=2, head={"sha": OTHER_SHA}),
+        make_pr(number=3, head={"repo": {"full_name": "other/tai-robot"}}),
+        make_pr(number=6, draft=True, labels=[{"name": "needs-owner"}]),
+        make_pr(number=7, draft=True),
+        make_pr(number=8),
+        make_pr(number=9, draft=True, labels=[{"name": "claude-review"}]),
+        make_pr(number=10, base={"ref": "feature-stack"}),
+    ]
+    rc, world, posts = _run_selina(
+        monkeypatch, "workflow_run", open_prs=open_prs, pr_number="999",
+        head_sha=SHA, workflow_name="Claude Review", conclusion="failure",
+    )
+    assert rc == 0
+    got = sorted(_bodies(posts), key=lambda b: b["pr"])
+    assert got == [
+        {"event": "ci_failed", "workflow": "Claude Review", "pr": n, "head_sha": SHA}
+        for n in (8, 9, 10)
+    ]
+    assert world.write_calls() == []
+
+
+def test_notify_selina_claude_passed_draft(monkeypatch):
+    rc, world, posts = _run_selina(
+        monkeypatch, "workflow_run",
+        open_prs=[make_pr(number=7, draft=True)],
+        pr_number="999", head_sha=SHA,
+        workflow_name="Claude Review", conclusion="success",
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{
+        "event": "claude_passed_draft", "pr": 7, "head_sha": SHA,
+    }]
+    _assert_hook(posts, SELINA_KEY)
+    assert world.write_calls() == []
+
+
+@pytest.mark.parametrize("over,workflow,conclusion", [
+    ({}, "Claude Review", "success"),
+    ({"draft": True, "base": {"ref": "feature"}}, "Claude Review", "success"),
+    ({"draft": True}, "Tests", "success"),
+    ({"draft": True}, "Claude Review", "cancelled"),
+], ids=["ready", "stacked-draft", "tests-success", "cancelled"])
+def test_notify_selina_skips_claude_passed_draft(monkeypatch, over, workflow, conclusion):
+    rc, _, posts = _run_selina(
+        monkeypatch, "workflow_run",
+        open_prs=[make_pr(number=7, **over)],
+        head_sha=SHA, workflow_name=workflow, conclusion=conclusion,
+    )
+    assert rc == 0 and posts == []
+
+
+def test_notify_selina_workflow_rejects_fork(monkeypatch):
+    pr = make_pr(number=7, head={"repo": {"full_name": "other/tai-robot"}})
+    rc, world, posts = _run_selina(
+        monkeypatch, "workflow_run", open_prs=[pr],
+        head_sha=SHA, workflow_name="Tests", conclusion="failure",
+    )
+    assert rc == 0 and posts == []
+    assert any("state=open" in g for g in _gets(world))
+
+
+def test_notify_selina_base_pr_merged(monkeypatch):
+    merged = make_pr(
+        number=7, state="closed", merged=True, head={"ref": "  feature-a  "},
+    )
+    open_prs = [
+        make_pr(number=20, base={"ref": "feature-a"}),
+        make_pr(number=3, base={"ref": "feature-a"}, draft=True),
+        make_pr(number=11, base={"ref": "spoofed-ref"}),
+        make_pr(number=4, base={"ref": "feature-a"},
+                head={"repo": {"full_name": "fork/tai-robot"}}),
+        make_pr(number=15, state="closed", base={"ref": "feature-a"}),
+    ]
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_target", pr=merged, open_prs=open_prs,
+        merged_head_ref="spoofed-ref",
+    )
+    assert rc == 0
+    assert _bodies(posts) == [{
+        "event": "base_pr_merged",
+        "merged_pr": 7,
+        "merged_head_ref": "feature-a",
+        "stacked_prs": [3, 20],
+    }]
+    _assert_hook(posts, SELINA_KEY)
+    assert world.write_calls() == []
+    _assert_no_admin(world)
+
+
+def test_notify_selina_merged_without_stacked_prs(monkeypatch):
+    merged = make_pr(number=7, state="closed", merged=True, head={"ref": "feature-a"})
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_target", pr=merged,
+        open_prs=[make_pr(number=8, base={"ref": "master"})],
+    )
+    assert rc == 0 and posts == []
+    assert any("state=open" in g for g in _gets(world))
+
+
+@pytest.mark.parametrize("merged", [False, None])
+def test_notify_selina_skips_when_not_merged(monkeypatch, merged):
+    pr = make_pr(number=7, state="closed", merged=merged, head={"ref": "feature-a"})
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_target", pr=pr,
+        open_prs=[make_pr(number=8, base={"ref": "feature-a"})],
+    )
+    assert rc == 0 and posts == []
+    assert not any("state=open" in g for g in _gets(world))
+
+
+def test_notify_selina_merged_rejects_fork(monkeypatch):
+    pr = make_pr(
+        number=7, state="closed", merged=True,
+        head={"ref": "feature-a", "repo": {"full_name": "other/tai-robot"}},
+    )
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_target", pr=pr,
+        open_prs=[make_pr(number=8, base={"ref": "feature-a"})],
+    )
+    assert rc == 0 and posts == []
+    assert not any("state=open" in g for g in _gets(world))
+
+
+def test_notify_selina_merged_skips_blank_head_ref(monkeypatch):
+    pr = make_pr(number=7, state="closed", merged=True, head={"ref": "  "})
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_target", pr=pr,
+        open_prs=[make_pr(number=8, base={"ref": "feature-a"})],
+    )
+    assert rc == 0 and posts == []
+    assert not any("state=open" in g for g in _gets(world))
+
+
+@pytest.mark.parametrize("url,key", [
+    (None, None), ("", ""), (SELINA_URL, ""), ("", SELINA_KEY), ("  ", "  "),
+])
+def test_notify_selina_unset_secrets_skip(monkeypatch, capsys, url, key):
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_review",
+        pr=make_pr(number=7),
+        review_obj=review("COMMENTED", REED, rid=42),
+        url=url, key=key,
+    )
+    text = capsys.readouterr()
+    flat = text.out + text.err
+    assert rc == 0 and posts == [] and world.calls == []
+    assert "skip" in flat.lower()
+    assert SELINA_URL not in flat and SELINA_KEY not in flat
+
+
+@pytest.mark.parametrize("sha", ["", "abc", "g" * 40])
+def test_notify_selina_workflow_rejects_bad_sha(monkeypatch, sha):
+    rc, world, posts = _run_selina(
+        monkeypatch, "workflow_run",
+        open_prs=[make_pr(number=7)],
+        head_sha=sha, workflow_name="Tests", conclusion="failure",
+    )
+    assert rc == 1 and posts == [] and world.calls == []
+
+
+def test_notify_selina_rejects_bad_repo(monkeypatch):
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_review", repo="nope",
+        pr=make_pr(number=7), review_obj=review("COMMENTED", REED),
+    )
+    assert rc == 1 and posts == [] and world.calls == []
+
+
+def test_notify_selina_merged_requires_pr(monkeypatch):
+    rc, world, posts = _run_selina(
+        monkeypatch, "pull_request_target", pr_number="0",
+        pr=make_pr(number=7, state="closed", merged=True, head={"ref": "feature-a"}),
+    )
+    assert rc == 1 and posts == [] and world.calls == []
+
+
+def test_notify_selina_unknown_event_skips(monkeypatch):
+    rc, world, posts = _run_selina(monkeypatch, "push")
+    assert rc == 0 and posts == [] and world.calls == []
+
+
+@pytest.mark.parametrize("key,expected", [
+    ("raw-secret", "Bearer raw-secret"),
+    ("Bearer x", "Bearer x"),
+    ("bearer x", "bearer x"),
+    ("  Bearer x  ", "Bearer x"),
+])
+def test_post_webhook_bearer_normalization(monkeypatch, key, expected):
+    seen = {}
+
+    def opener(req, timeout=30):
+        seen["auth"] = req.get_header("Authorization")
+        seen["timeout"] = timeout
+        seen["type"] = req.get_header("Content-type")
+        return _HookResp()
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", opener)
+    rc = mod._post_webhook("reed", "  " + REED_URL + "  ", key, {"pr": 7, "head_sha": SHA})
+    assert rc == 0
+    assert seen["auth"] == expected
+    assert "Bearer Bearer" not in seen["auth"]
+    assert seen["timeout"] == 30
+    assert seen["type"] == "application/json"
+
+
+def test_post_webhook_unset_skip_or_fail(monkeypatch, capsys):
+    def boom(*_a, **_k):
+        raise AssertionError("urlopen should not be called")
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
+    assert mod._post_webhook("reed", "", "", {"pr": 1}, skip_if_unset=True) == 0
+    out, err = capsys.readouterr()
+    assert "skip" in out.lower() and err == ""
+    assert mod._post_webhook("sage", "", "key", {"pr": 1}, skip_if_unset=False) == 1
+    out, err = capsys.readouterr()
+    assert err.strip() == "sage webhook is not configured"
+    assert "key" not in err
+
+
+@pytest.mark.parametrize("which,kind", [
+    ("reed", "http"), ("reed", "url"), ("selina", "http"), ("selina", "url"),
+])
+def test_reed_and_selina_webhook_errors_do_not_leak(monkeypatch, capsys, which, kind):
+    url = REED_URL if which == "reed" else SELINA_URL
+    key = REED_KEY if which == "reed" else SELINA_KEY
+
+    def boom(req, timeout=30):
+        if kind == "http":
+            raise urllib.error.HTTPError(url, 503, "nope " + key, hdrs=None, fp=None)
+
+        class SecretReason(OSError):
+            def __str__(self):
+                return url + " " + key
+
+        raise urllib.error.URLError(SecretReason())
+
+    try:
+        if which == "reed":
+            rc, _world, _posts = _run_reed(
+                monkeypatch, [make_pr(number=7)],
+                reviews=[review("COMMENTED", REED, body=wait_body())],
+                checks=green_checks(), opener=boom, url=url, key=key,
+            )
+        else:
+            rc, _world, _posts = _run_selina(
+                monkeypatch, "pull_request_review",
+                pr=make_pr(number=7),
+                review_obj=review("COMMENTED", REED, rid=42),
+                opener=boom, url=url, key=key,
+            )
+    except Exception as exc:
+        assert url not in str(exc) and key not in str(exc)
+        raise
+    text = capsys.readouterr()
+    flat = text.out + text.err
+    assert rc == 1
+    assert f"{which} webhook failed:" in flat
+    if kind == "http":
+        assert "503" in flat
+    else:
+        assert "SecretReason" in flat
+    assert url not in flat and key not in flat
+
+
+def test_usage_includes_read_only_commands(capsys):
+    assert mod.main(["auto_merge_gate.py"]) == 2
+    err = capsys.readouterr().err
+    assert "trigger-sage" in err and "gate" in err
+    assert "retrigger-reed" in err and "notify-selina" in err
+
+
 # ---- workflow --------------------------------------------------------------
+
+def _workflow_on(doc):
+    if "on" in doc:
+        return doc["on"]
+    return doc[True]
+
 
 def test_workflow_yaml_is_least_privilege():
     text = (ROOT / ".github/workflows/auto-merge.yml").read_text(encoding="utf-8")
     py = (ROOT / "scripts/ci/auto_merge_gate.py").read_text(encoding="utf-8")
     assert "--admin" not in text and "sage-approved" not in text
     assert "--admin" not in py and "sage-approved" not in py
+    assert "pull_request.head.sha" not in text
     doc = yaml.safe_load(text)
     assert doc["name"] == "Auto-merge gate"
     jobs = doc["jobs"]
-    assert set(jobs) == {"trigger-sage", "eval-approval-gate"}
+    assert set(jobs) == {
+        "trigger-sage", "eval-approval-gate", "retrigger-reed", "notify-selina",
+    }
     trig, gate = jobs["trigger-sage"], jobs["eval-approval-gate"]
+    reed, selina = jobs["retrigger-reed"], jobs["notify-selina"]
     assert trig["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert gate["permissions"] == {
         "contents": "write",
         "pull-requests": "write",
         "statuses": "write",
     }
-    assert "write" not in trig["permissions"].values()
-    for job, group in ((trig, "trigger-sage-"), (gate, "auto-merge-")):
+    read_checks = {"contents": "read", "pull-requests": "read", "checks": "read"}
+    assert reed["permissions"] == read_checks
+    assert selina["permissions"] == read_checks
+    for job in (trig, reed, selina):
+        assert "write" not in job["permissions"].values()
+    for job in jobs.values():
+        assert job["runs-on"] == "ubuntu-latest"
+        assert job["timeout-minutes"] == 5
         assert job["concurrency"]["cancel-in-progress"] is False
-        assert group in job["concurrency"]["group"]
+        assert len(job["steps"]) == 2
+        checkout = next(
+            s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@")
+        )
+        assert checkout["uses"] == "actions/checkout@v4"
+        assert checkout["with"]["ref"] == "master"
+        assert checkout["with"]["sparse-checkout"] == "scripts/ci"
+        assert checkout["with"]["persist-credentials"] is False
+        runs = [s for s in job["steps"] if "run" in s]
+        assert len(runs) == 1
+        assert "${{" not in (runs[0].get("run") or "")
+        assert "pull_request.head.sha" not in yaml.dump(job)
+    assert trig["concurrency"]["group"].startswith("trigger-sage-")
+    assert gate["concurrency"]["group"].startswith("auto-merge-")
+    assert reed["concurrency"]["group"] == (
+        "retrigger-reed-${{ github.event.workflow_run.head_sha }}"
+    )
+    assert selina["concurrency"]["group"] == (
+        "notify-selina-${{ github.event_name }}-"
+        "${{ github.event.pull_request.number || github.event.workflow_run.head_sha }}"
+    )
+    for job in (trig, gate):
         cond = job["if"]
         assert "github.event.pull_request.head.repo.full_name == github.repository" in cond
         assert "github.event.pull_request.base.ref == 'master'" in cond
         assert "github.event.pull_request.state == 'open'" in cond
-        checkout = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
-        assert checkout["with"]["ref"] == "master"
-        assert checkout["with"]["sparse-checkout"] == "scripts/ci"
-        for step in job["steps"]:
-            assert "${{" not in (step.get("run") or "")
-    trig_run = next(s for s in trig["steps"] if "run" in s)
-    assert trig_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py trigger-sage"
-    assert "secrets.SAGE_REVIEW_WEBHOOK_URL" in trig_run["env"]["SAGE_REVIEW_WEBHOOK_URL"]
-    assert "secrets.SAGE_REVIEW_WEBHOOK_KEY" in trig_run["env"]["SAGE_REVIEW_WEBHOOK_KEY"]
-    gate_run = next(s for s in gate["steps"] if "run" in s)
-    assert gate_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py gate"
-    assert "SAGE_REVIEW_WEBHOOK" not in yaml.dump(gate)
-    assert "needs-owner" in gate["if"]
-    assert "cursor[bot]" in gate["if"]
     assert "github.event_name == 'pull_request_target'" in trig["if"]
     assert "ready_for_review" in trig["if"]
     assert "!github.event.pull_request.draft" in trig["if"]
+    assert "closed" not in trig["if"]
+    assert "needs-owner" in gate["if"]
+    assert "cursor[bot]" in gate["if"]
+    assert "github.event.pull_request.state == 'open'" in gate["if"]
+    reed_if = reed["if"]
+    assert "github.event_name == 'workflow_run'" in reed_if
+    assert "github.event.workflow_run.conclusion == 'success'" in reed_if
+    assert "github.event.workflow_run.event == 'pull_request'" in reed_if
+    assert "github.event.workflow_run.head_repository.full_name == github.repository" in reed_if
+    sel_if = selina["if"]
+    assert "github.event_name == 'pull_request_review'" in sel_if
+    assert "github.event.action == 'submitted'" in sel_if
+    assert "github.event.review.user.login == 'cursor[bot]'" in sel_if
+    assert "github.event.pull_request.state == 'open'" in sel_if
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in sel_if
+    assert "github.event.workflow_run.event == 'pull_request'" in sel_if
+    assert "github.event.workflow_run.head_repository.full_name == github.repository" in sel_if
+    assert "github.event.workflow_run.conclusion == 'failure'" in sel_if
+    assert "github.event.workflow_run.conclusion == 'success'" in sel_if
+    assert "github.event.workflow_run.name == 'Claude Review'" in sel_if
+    assert "github.event_name == 'pull_request_target'" in sel_if
+    assert "github.event.action == 'closed'" in sel_if
+    assert "github.event.pull_request.merged == true" in sel_if
+    assert "draft" not in sel_if
+    assert "base.ref" not in sel_if
+    trig_run = next(s for s in trig["steps"] if "run" in s)
+    gate_run = next(s for s in gate["steps"] if "run" in s)
+    reed_run = next(s for s in reed["steps"] if "run" in s)
+    sel_run = next(s for s in selina["steps"] if "run" in s)
+    assert trig_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py trigger-sage"
+    assert gate_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py gate"
+    assert reed_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py retrigger-reed"
+    assert sel_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py notify-selina"
+    assert set(reed_run["env"]) == {
+        "GH_TOKEN", "GITHUB_REPOSITORY", "HEAD_SHA",
+        "REED_QA_WEBHOOK_URL", "REED_QA_WEBHOOK_KEY",
+    }
+    assert set(sel_run["env"]) == {
+        "GH_TOKEN", "GITHUB_REPOSITORY", "EVENT_NAME", "PR", "REVIEW_ID",
+        "REVIEW_STATE", "HEAD_SHA", "WORKFLOW_NAME", "WORKFLOW_CONCLUSION",
+        "MERGED_HEAD_REF", "SELINA_QA_WEBHOOK_URL", "SELINA_QA_WEBHOOK_KEY",
+    }
+    assert reed_run["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert reed_run["env"]["GITHUB_REPOSITORY"] == "${{ github.repository }}"
+    assert reed_run["env"]["HEAD_SHA"] == "${{ github.event.workflow_run.head_sha }}"
+    assert sel_run["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert sel_run["env"]["GITHUB_REPOSITORY"] == "${{ github.repository }}"
+    assert sel_run["env"]["HEAD_SHA"] == "${{ github.event.workflow_run.head_sha }}"
+    assert sel_run["env"]["EVENT_NAME"] == "${{ github.event_name }}"
+    assert sel_run["env"]["PR"] == "${{ github.event.pull_request.number }}"
+    assert sel_run["env"]["REVIEW_ID"] == "${{ github.event.review.id }}"
+    assert sel_run["env"]["REVIEW_STATE"] == "${{ github.event.review.state }}"
+    assert sel_run["env"]["WORKFLOW_NAME"] == "${{ github.event.workflow_run.name }}"
+    assert sel_run["env"]["WORKFLOW_CONCLUSION"] == "${{ github.event.workflow_run.conclusion }}"
+    assert sel_run["env"]["MERGED_HEAD_REF"] == "${{ github.event.pull_request.head.ref }}"
+    assert "secrets.SAGE_REVIEW_WEBHOOK_URL" in trig_run["env"]["SAGE_REVIEW_WEBHOOK_URL"]
+    assert "secrets.SAGE_REVIEW_WEBHOOK_KEY" in trig_run["env"]["SAGE_REVIEW_WEBHOOK_KEY"]
+    assert "secrets.REED_QA_WEBHOOK_URL" in reed_run["env"]["REED_QA_WEBHOOK_URL"]
+    assert "secrets.REED_QA_WEBHOOK_KEY" in reed_run["env"]["REED_QA_WEBHOOK_KEY"]
+    assert "secrets.SELINA_QA_WEBHOOK_URL" in sel_run["env"]["SELINA_QA_WEBHOOK_URL"]
+    assert "secrets.SELINA_QA_WEBHOOK_KEY" in sel_run["env"]["SELINA_QA_WEBHOOK_KEY"]
+    trig_dump, gate_dump = yaml.dump(trig), yaml.dump(gate)
+    reed_dump, sel_dump = yaml.dump(reed), yaml.dump(selina)
+    assert "SAGE_REVIEW_WEBHOOK" in trig_dump
+    assert "REED_QA" not in trig_dump and "SELINA_QA" not in trig_dump
+    assert "REED_QA_WEBHOOK" in reed_dump
+    assert "SAGE_REVIEW" not in reed_dump and "SELINA_QA" not in reed_dump
+    assert "SELINA_QA_WEBHOOK" in sel_dump
+    assert "SAGE_REVIEW" not in sel_dump and "REED_QA" not in sel_dump
+    assert "WEBHOOK" not in gate_dump
+    on = _workflow_on(doc)
+    assert on["pull_request_target"]["types"] == [
+        "opened", "synchronize", "reopened", "ready_for_review",
+        "converted_to_draft", "labeled", "unlabeled", "closed",
+    ]
+    assert on["pull_request_review"]["types"] == ["submitted", "dismissed"]
+    assert on["workflow_run"]["workflows"] == ["Tests", "Claude Review"]
+    assert on["workflow_run"]["types"] == ["completed"]
     assert "pull_request_target:" in text
     assert "pull_request_review:" in text
+    assert "workflow_run:" in text
     for token in ("opened", "synchronize", "reopened", "ready_for_review",
-                  "converted_to_draft", "labeled", "unlabeled", "submitted", "dismissed"):
+                  "converted_to_draft", "labeled", "unlabeled", "closed",
+                  "submitted", "dismissed"):
         assert token in text
-    assert "pull_request.head.sha" not in text
 
 
 def test_workflow_job_names_do_not_collide_with_status_context():
     """The Actions check name must not be the commit-status context."""
     text = (ROOT / ".github/workflows/auto-merge.yml").read_text(encoding="utf-8")
     doc = yaml.safe_load(text)
+    assert set(doc["jobs"]) == {
+        "trigger-sage", "eval-approval-gate", "retrigger-reed", "notify-selina",
+    }
     for job_key, job_cfg in doc["jobs"].items():
         assert job_key != mod.STATUS_CONTEXT
+        assert job_key != "approval-gate"
         assert (job_cfg or {}).get("name") != mod.STATUS_CONTEXT
+        assert (job_cfg or {}).get("name") != "approval-gate"
+    assert "pull_request.head.sha" not in text
