@@ -10,7 +10,10 @@ later line wins (a TWSE retry, a forced re-run).
 
 Per day: net OI level, ΔOI (what W4 votes on), the foreign cash-equity
 net buy, W4's decision and why, and two rolling sums over the last
-FLOW_WINDOW rows of an unbroken run: ``flow`` (ΔOI) and ``equity_flow``.
+FLOW_WINDOW rows of an unbroken run: ``flow`` (ΔOI) and ``equity_flow``,
+their daily averages (``flow_avg`` / ``equity_avg``, the page's 5-day
+lines) and ``verdict`` (``flow_verdict``: W4's daily thresholds applied to
+those averages — the page's one-line summary).
 A missing ΔOI or a gap of more than MAX_PREV_GAP_DAYS calendar days
 between rows restarts both, the same rule W4 uses to refuse a stale
 baseline. Settlement days are flagged: expiring contracts drop out of OI
@@ -147,11 +150,15 @@ def build_days(rows: dict[str, dict]) -> list[dict]:
         flow = sum(x for x, _ in run) if run else None
         eq = [e for _, e in run if e is not None]
         decision = row.get("decision") if row.get("decision") in DECISION_LABELS else ""
+        equity_flow = sum(eq) if eq else None
+        flow_avg = flow / len(run) if run else None
+        equity_avg = equity_flow / len(eq) if eq else None
         out.append({
             "time": _chart_day(d), "date": d.isoformat(),
             "net_oi": _num(row.get("net_oi")), "delta_oi": delta, "equity_net": equity,
-            "flow": flow, "equity_flow": sum(eq) if eq else None, "flow_days": len(run),
-            "flow_full": full, "decision": decision,
+            "flow": flow, "equity_flow": equity_flow, "flow_days": len(run),
+            "flow_avg": flow_avg, "equity_avg": equity_avg,
+            "flow_full": full, "verdict": flow_verdict(flow_avg, equity_avg), "decision": decision,
             "decision_label": DECISION_LABELS.get(decision, "不投票"),
             "kind": kind_of(row), "final": row.get("final") is not False,
             "settlement": _is_settlement(d),
@@ -192,6 +199,29 @@ def _sign(x) -> int:
     return 0 if not x else (1 if x > 0 else -1)
 
 
+def flow_verdict(flow_avg, equity_avg) -> str:
+    """One word for the rolling window: who moved, and did they agree.
+
+    A side counts as moving when its DAILY AVERAGE over the window clears
+    W4's own daily threshold, with ``chips_monitor.decide``'s boundaries
+    (|ΔOI| >= HYSTERESIS_CONTRACTS, |equity| > EQUITY_FLOW_THRESHOLD_NTD), so
+    a few hundred contracts of drift never reads as "inflow" and the page's
+    average line leaving the grey band means the same as this word.
+    ``""`` = not enough data.
+    """
+    if flow_avg is None or equity_avg is None:
+        return ""
+    fut = 0 if abs(flow_avg) < HYSTERESIS_CONTRACTS else _sign(flow_avg)
+    eq = _sign(equity_avg) if abs(equity_avg) > EQUITY_FLOW_THRESHOLD_NTD else 0
+    if fut and eq:
+        return "diverge" if fut != eq else ("agree_in" if fut > 0 else "agree_out")
+    if fut:
+        return "fut_in" if fut > 0 else "fut_out"
+    if eq:
+        return "eq_in" if eq > 0 else "eq_out"
+    return "quiet"
+
+
 def trend(paths: dict | None, read_json, base_dir: str, symbol: str = "") -> dict:
     base = (paths or {}).get("regime_vote_path") or ""
     if not base:
@@ -211,8 +241,10 @@ def trend(paths: dict | None, read_json, base_dir: str, symbol: str = "") -> dic
     if last:
         summary = {"date": last["date"], "flow": last["flow"],
                    "equity_flow": last["equity_flow"], "flow_days": last["flow_days"],
-                   "agree": (_sign(last["flow"]) == _sign(last["equity_flow"]) != 0)
-                   if last["flow"] is not None and last["equity_flow"] is not None else None}
+                   "flow_avg": last["flow_avg"], "equity_avg": last["equity_avg"],
+                   "agree":(_sign(last["flow"]) == _sign(last["equity_flow"]) != 0)
+                   if last["flow"] is not None and last["equity_flow"] is not None else None,
+                   "verdict": last["verdict"]}
     sources: dict[str, int] = {}
     for d in days:
         sources[d["src"]] = sources.get(d["src"], 0) + 1

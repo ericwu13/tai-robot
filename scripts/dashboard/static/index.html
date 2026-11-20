@@ -198,9 +198,35 @@ pre.log .P3 { color: var(--muted); }
 .trend-sym { font-size: 12px; font-weight: 400; margin-left: 8px; }
 #n-trend-note, #c-trend-note { padding: 4px 14px 8px; font-size: 12px; }
 .chart.news { height: 360px; }
-.chart.chips { height: 460px; }
-.chips-sum { display: flex; flex-wrap: wrap; gap: 4px 20px; padding: 8px 14px 0; font-size: 13px; }
-.chips-sum b { font-variant-numeric: tabular-nums; }
+/* 外資籌碼走勢: a one-line verdict, then one titled chart per question. */
+.cv { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 10px 14px 2px; font-size: 15px; }
+.cv .k { color: var(--muted); font-size: 13px; }
+.cv b { font-weight: 700; }
+.cv .arrow { color: var(--muted); }
+.tag { display: inline-block; padding: 1px 8px; border-radius: 6px; font-size: 13px; font-weight: 700; white-space: nowrap; }
+.tag.up { color: #fff; background: var(--up); } .tag.down { color: #fff; background: var(--down); }
+.tag.warn { color: var(--warn); background: var(--warn-bg); } .tag.none { color: var(--off); background: var(--off-bg); }
+.cm { padding: 10px 14px 0; }
+.cm + .cm { border-top: 1px solid var(--line); margin-top: 6px; }
+.cm-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+.cm-head h4 { margin: 0; font-size: 14px; font-weight: 700; }
+.cm-head .unit { color: var(--muted); font-size: 12px; }
+.cm-head .val { margin-left: auto; font-size: 13px; font-variant-numeric: tabular-nums; display: flex; gap: 2px 10px; flex-wrap: wrap; justify-content: flex-end; }
+.cm-key { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 2px; font-size: 12px; color: var(--muted); }
+.cm-key span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.cm-key .g { font-style: normal; font-size: 11px; line-height: 1; }
+.cm-key .sw { display: inline-block; width: 16px; height: 9px; border-radius: 2px; }
+.cm-key .ln { display: inline-block; width: 16px; height: 0; border-top: 2px solid; }
+.cm-key .ln.dash { border-top-style: dashed; border-top-width: 1px; }
+.cm-chart { height: 220px; position: relative; }
+.cm-chart.short { height: 150px; }
+.cm-chart.axis { height: 176px; }
+.cday { display: flex; flex-wrap: wrap; gap: 2px 10px; padding: 8px 14px 0; font-size: 13px; min-height: 28px; }
+.cday b { font-variant-numeric: tabular-nums; }
+.ctable { padding: 6px 14px 0; font-size: 13px; }
+.ctable summary { cursor: pointer; color: var(--muted); }
+.ctable table { margin-top: 4px; }
+.ctable td.why { white-space: normal; min-width: 200px; }
 .drivers { padding: 10px 14px; display: grid; gap: 10px; }
 .drivers h4 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
 .drv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; font-size: 13px; }
@@ -217,7 +243,9 @@ pre.log .P3 { color: var(--muted); }
 @media (max-width: 760px) {
   .pulse-top, .news-grid { grid-template-columns: 1fr; }
   .chart.news { height: 280px; }
-  .chart.chips { height: 340px; }
+  .cm-chart { height: 180px; } .cm-chart.short { height: 120px; } .cm-chart.axis { height: 150px; }
+  .cm-head .val { margin-left: 0; justify-content: flex-start; width: 100%; }
+  .cv { font-size: 14px; }
   .gauge .num { font-size: 26px; }
 }
 /* W2 跨市場報價 strip + W4 籌碼 panel (新聞訊號 view). 紅漲綠跌. */
@@ -371,13 +399,15 @@ details.pnl[open] > summary::before { content: "▾"; }
         <div class="mk-body" id="w4-body"></div>
       </div>
     </div>
-    <div class="panel trend-panel">
-      <div class="section-title">籌碼走勢 vs 台指
+    <div class="panel trend-panel" id="c-panel">
+      <div class="section-title">外資籌碼走勢 vs 台指
         <label class="trend-sym">價格 <select id="c-sym"></select></label>
-        <span class="legend">上：日盤 K 線（右軸）＋外資淨未平倉水位（淡藍線，左軸；外資長期避險空單，看斜率不看正負）。中：每日 ΔOI 柱（紅＝流入、綠＝流出）＋近 5 日合計線，虛線＝±1,000／±5,000 口。下：外資現貨買賣超（億），虛線＝±50 億。價格與 ΔOI 之間的標記列：▲▼＝W4 投票，●避險＝期現背離不投票，結＝結算日（ΔOI 會機械性跳動，柱色變淡）。滑鼠移到某一天看當日數字。</span></div>
-      <div class="chips-sum" id="c-summary"></div>
-      <div class="chart chips" id="c-chart"></div>
-      <div class="chips-sum sub" id="c-hover"></div>
+        <span class="legend">紅＝流入／買超，綠＝流出／賣超。滑鼠移到（手機點一下）某一天看當日數字，往左拖曳看更早。</span></div>
+      <div class="cv" id="c-verdict"></div>
+      <div id="c-body"></div>
+      <div class="cday" id="c-day"></div>
+      <details class="ctable"><summary>逐日數字（表格）</summary>
+        <div class="scroll-x"><table class="mini" id="c-table"></table></div></details>
       <div class="sub muted" id="c-trend-note"></div>
     </div>
     <div class="panel trend-panel">
@@ -812,6 +842,52 @@ function isoAgo(iso) { const t = Date.parse(iso || ""); return Number.isNaN(t) ?
 
 const WF_CLS = { ok: "s-ok", warn: "s-warn", stale: "s-warn", bad: "s-bad", off: "s-off", unknown: "s-off", idle: "s-off" };
 function fmtSigned(v) { return v === null || v === undefined ? "—" : (v > 0 ? "+" : "") + fmtInt(Math.round(v)); }
+// 外資籌碼走勢 verdict words (chips_trend.flow_verdict): [tag, tail, tag class].
+const CHIPS_VERDICT = {
+  agree_in: ["期現同向流入", "偏多", "up"], agree_out: ["期現同向流出", "偏空", "down"],
+  diverge: ["期現背離", "多半是避險", "warn"],
+  fut_in: ["只有期貨流入", "現貨沒跟", "none"], fut_out: ["只有期貨流出", "現貨沒跟", "none"],
+  eq_in: ["只有現貨買超", "期貨沒跟", "none"], eq_out: ["只有現貨賣超", "期貨沒跟", "none"],
+  quiet: ["沒有明顯進出", "", "none"],
+};
+// NT$ → signed 億 (one decimal under 100 億).
+function yiText(ntd) {
+  const y = ntd / 1e8;
+  return (y > 0 ? "+" : "") + y.toLocaleString("zh-TW", { maximumFractionDigits: Math.abs(y) >= 100 ? 0 : 1 });
+}
+// "流入 +7,000 口" / "賣超 -120 億" for a window total; 持平 when its daily
+// average stays inside W4's own threshold (chips_trend.flow_verdict).
+function chipsAmount(sum, avg, threshold, kind) {
+  if (sum === null || sum === undefined) return el("b", { class: "muted" }, "—");
+  const num = kind === "fut" ? `${fmtSigned(sum)} 口` : `${yiText(sum)} 億`;
+  if (avg === null || avg === undefined || Math.abs(avg) < threshold) return el("span", { class: "muted" }, `持平（${num}）`);
+  const word = kind === "fut" ? (sum > 0 ? "流入" : "流出") : (sum > 0 ? "買超" : "賣超");
+  return el("b", { class: sum > 0 ? "up" : "down" }, `${word} ${num}`);
+}
+function chipsDate(t) { return new Date(t * 1000).toISOString().slice(5, 10).replace("-", "/"); }
+// A shaded horizontal band between two prices (W4's "too weak to count"
+// zone), drawn under the series as a lightweight-charts primitive.
+class ChipsBand {
+  constructor(color) {
+    this.color = color; this.lo = null; this.hi = null; this.series = null; this.req = null;
+    this.view = { zOrder: () => "bottom", renderer: () => ({ draw: (target) => this.draw(target) }) };
+  }
+  attached(p) { this.series = p.series; this.req = p.requestUpdate; }
+  detached() { this.series = null; }
+  set(lo, hi) { this.lo = lo; this.hi = hi; if (this.req) this.req(); }
+  updateAllViews() {}
+  paneViews() { return [this.view]; }
+  draw(target) {
+    if (!this.series || !Number.isFinite(this.lo) || !Number.isFinite(this.hi)) return;
+    const a = this.series.priceToCoordinate(this.hi), b = this.series.priceToCoordinate(this.lo);
+    if (a === null || b === null) return;
+    target.useBitmapCoordinateSpace((s) => {
+      s.context.fillStyle = this.color;
+      s.context.fillRect(0, Math.round(Math.min(a, b) * s.verticalPixelRatio), s.bitmapSize.width,
+        Math.max(1, Math.round(Math.abs(b - a) * s.verticalPixelRatio)));
+    });
+  }
+}
 function signedInt(v) {
   return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, fmtSigned(v));
 }
@@ -1592,7 +1668,7 @@ const App = {
       : "尚無評分紀錄";
   },
 
-  // 籌碼走勢 vs 台指: W4's daily foreign flow history (small: one row per
+  // 外資籌碼走勢 vs 台指: W4's daily foreign flow history (small: one row per
   // trading day), sent whole on every refresh.
   async refreshChipsTrend(full) {
     const sym = $("c-sym").value;
@@ -1608,139 +1684,271 @@ const App = {
       sel.replaceChildren(...syms.map((s) => el("option", { value: s }, s)));
     }
     sel.value = got.symbol || "";
-    this.renderChipsSummary();
+    this.renderChipsVerdict();
     this.drawChipsChart();
   },
 
-  renderChipsSummary() {
+  // One plain-language line for the rolling window, from the payload's
+  // ``verdict`` (a side "moved" when its daily average clears W4's daily
+  // threshold — the same test as the 5-day line leaving the grey band).
+  renderChipsVerdict() {
     const c = this.chips || {};
-    const box = $("c-summary");
+    const box = $("c-verdict");
     if (!c.available) return box.replaceChildren(el("span", { class: "sub" }, "未設定 news.regime_vote_path"));
     const s = c.summary;
     if (!s) return box.replaceChildren(el("span", { class: "sub" }, "尚無 W4 逐日紀錄"));
-    const yi = (v) => v === null || v === undefined ? "—" : signedText(v / 1e8, 1) + " 億";
-    const dir = (v) => !v ? "持平" : v > 0 ? "流入" : "流出";
-    const span = s.flow_days < c.thresholds.window ? `近 ${s.flow_days} 日` : `近 ${c.thresholds.window} 日`;
+    const T = c.thresholds || {};
+    const [label, tail, cls] = CHIPS_VERDICT[s.verdict] || ["資料不足", "", "none"];
     box.replaceChildren(...[
-      el("span", null, el("span", { class: "sub" }, `${span}外資台指 ΔOI `),
-        el("b", { class: s.flow > 0 ? "up" : s.flow < 0 ? "down" : "muted" },
-          s.flow === null ? "—" : `${fmtSigned(s.flow)} 口（${dir(s.flow)}）`)),
-      el("span", null, el("span", { class: "sub" }, `${span}外資現貨 `),
-        el("b", { class: s.equity_flow > 0 ? "up" : s.equity_flow < 0 ? "down" : "muted" }, yi(s.equity_flow))),
-      s.agree === null ? null : el("span", { class: s.agree ? "" : "warnline" },
-        s.agree ? "期現同向" : "期現背離（可能是避險）"),
-      el("span", { class: "sub" }, `資料到 ${s.date}`)].filter(Boolean));
+      el("span", { class: "k" }, `近 ${s.flow_days} 日累計（到 ${s.date.slice(5).replace("-", "/")}）`),
+      el("span", null, "外資期貨 ", chipsAmount(s.flow, s.flow_avg, T.hysteresis, "fut")),
+      el("span", null, "現貨 ", chipsAmount(s.equity_flow, s.equity_avg, T.equity_ntd, "eq")),
+      el("span", { class: "arrow" }, "→"),
+      el("span", { class: "tag " + cls }, label),
+      tail ? el("span", null, tail) : null].filter(Boolean));
   },
 
   drawChipsChart() {
     const c = this.chips || {};
-    if (!window.LightweightCharts || !this.newsOpen || !c.available) return;
-    const days = c.days || [], price = c.price || [];
-    const up = this.css("--up"), down = this.css("--down"), blue = this.css("--ok"), muted = this.css("--muted");
-    if (!this.chipsChart) {
-      this.chipsChart = LightweightCharts.createChart($("c-chart"), {
-        layout: { background: { color: this.css("--panel") }, textColor: muted,
-          fontFamily: getComputedStyle(document.body).fontFamily },
-        grid: { vertLines: { visible: false }, horzLines: { color: this.css("--line") } },
-        rightPriceScale: { borderColor: this.css("--line"), scaleMargins: { top: 0.03, bottom: 0.6 } },
-        leftPriceScale: { visible: true, borderColor: this.css("--line"), scaleMargins: { top: 0.03, bottom: 0.6 } },
-        timeScale: { borderColor: this.css("--line"), timeVisible: false },
-        localization: { locale: "zh-TW" },
-        autoSize: true,
-      });
-      const ch = this.chipsChart;
-      const ints = { type: "custom", formatter: (v) => fmtSigned(v), minMove: 1 };
-      this.cCandles = ch.addCandlestickSeries({ upColor: up, downColor: down, wickUpColor: up,
-        wickDownColor: down, borderVisible: false, priceScaleId: "right",
-        priceFormat: { type: "price", precision: 0, minMove: 1 } });
-      this.cLevel = ch.addLineSeries({ priceScaleId: "left", color: this.rgba(blue, 0.55), lineWidth: 1,
-        priceLineVisible: false, lastValueVisible: false, priceFormat: ints });
-      this.cDelta = ch.addHistogramSeries({ priceScaleId: "oi", priceLineVisible: false,
-        lastValueVisible: false, priceFormat: ints });
-      this.cFlow = ch.addLineSeries({ priceScaleId: "oi", color: blue, lineWidth: 2,
-        priceLineVisible: false, lastValueVisible: true, priceFormat: ints });
-      ch.priceScale("oi").applyOptions({ scaleMargins: { top: 0.52, bottom: 0.22 }, visible: false });
-      // Marker lane: an invisible flat line between the price and ΔOI bands
-      // carries the markers, so their padding never squeezes the ΔOI bars.
-      this.cMarks = ch.addLineSeries({ priceScaleId: "mk", color: "rgba(0,0,0,0)", lineWidth: 1,
-        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-      ch.priceScale("mk").applyOptions({ scaleMargins: { top: 0.43, bottom: 0.5 }, visible: false });
-      this.cEquity = ch.addHistogramSeries({ priceScaleId: "eq", priceLineVisible: false,
-        lastValueVisible: false, priceFormat: { type: "custom", formatter: (v) => signedText(v, 1) + " 億", minMove: 0.1 } });
-      ch.priceScale("eq").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 }, visible: false });
-      this.cLines = [];
-      ch.subscribeCrosshairMove((param) => this.renderChipsHover(param && param.time));
-    }
-    this.cCandles.setData(price);
-    this.cLevel.setData(days.filter((d) => d.net_oi !== null).map((d) => ({ time: d.time, value: d.net_oi })));
-    this.cDelta.setData(days.filter((d) => d.delta_oi !== null).map((d) => ({ time: d.time, value: d.delta_oi,
-      color: this.rgba(d.delta_oi >= 0 ? up : down, d.settlement ? 0.3 : 0.75) })));
-    this.cFlow.setData(days.filter((d) => d.flow !== null).map((d) => ({ time: d.time, value: d.flow })));
-    this.cEquity.setData(days.filter((d) => d.equity_net !== null).map((d) => ({ time: d.time,
-      value: d.equity_net / 1e8, color: this.rgba(d.equity_net >= 0 ? up : down, 0.6) })));
-    const marks = [];
-    this.cMarks.setData(days.map((d) => ({ time: d.time, value: 0 })));
-    for (const d of days) {
-      if (d.kind === "vote") marks.push({ time: d.time, position: "inBar",
-        shape: d.decision === "trending-up" ? "arrowUp" : "arrowDown", color: d.decision === "trending-up" ? up : down,
-        text: d.decision === "trending-up" ? "多" : "空" });
-      else if (d.kind === "hedge") marks.push({ time: d.time, position: "inBar", shape: "circle",
-        color: this.css("--warn"), text: "避險" });
-      else if (d.kind === "pending") marks.push({ time: d.time, position: "inBar", shape: "circle",
-        color: muted, text: "待重試" });
-      if (d.settlement && d.kind !== "vote" && d.kind !== "hedge" && d.kind !== "pending") {
-        marks.push({ time: d.time, position: "inBar", shape: "square", color: muted, text: "結" });
-      }
-    }
-    marks.sort((a, b) => a.time - b.time);
-    this.cMarks.setMarkers(marks);
-    for (const [series, line] of this.cLines) series.removePriceLine(line);
-    const T = c.thresholds || {}, dash = { lineStyle: 2, lineWidth: 1, axisLabelVisible: false };
-    this.cLines = [
-      ...[T.hysteresis, -T.hysteresis].map((v) => [this.cDelta, this.cDelta.createPriceLine({ ...dash, price: v,
-        color: this.rgba(muted, 0.6) })]),
-      ...[T.strong, -T.strong].map((v) => [this.cDelta, this.cDelta.createPriceLine({ ...dash, price: v,
-        color: v > 0 ? up : down })]),
-      ...[T.equity_ntd / 1e8, -T.equity_ntd / 1e8].map((v) => [this.cEquity, this.cEquity.createPriceLine({ ...dash,
-        price: v, color: v > 0 ? up : down })]),
-    ];
+    if (!this.newsOpen || !c.available) return;
+    const ix = (this.chipsIx = this.chipsIndex(c));
+    if (window.LightweightCharts) this.drawChipsCharts(c, ix);
+    this.renderChipsTable(c, ix);
     this.renderChipsHover(null);
-    if (!this.chipsFitted && days.length) {
-      // A phone opens on the last 15 trading days; the rest is a drag away.
-      const n = Math.max(days.length, price.length);
-      if ($("c-chart").clientWidth < 600 && n > 15) {
-        this.chipsChart.timeScale().setVisibleLogicalRange({ from: n - 15.5, to: n - 0.5 });
-      } else {
-        this.chipsChart.timeScale().fitContent();
-      }
-      this.chipsFitted = true;
-    }
+    const days = c.days || [], price = c.price || [];
     const src = Object.entries(c.sources || {}).map(([k, n]) => `${{ live: "即時", state: "狀態檔", log: "日誌回補", backfill: "官網回補" }[k] || k} ${n}`).join("、");
     $("c-trend-note").textContent = days.length
       ? `${days.length} 個交易日（${src}）・${price.length} 根日 K（${c.symbol || "無價格資料"}）・${days[0].date} 起`
       : "尚無 W4 逐日紀錄";
   },
 
-  // One line with the hovered day's numbers (the ΔOI / equity bands have no
-  // visible axis); the newest day when the cursor is off the chart.
-  renderChipsHover(time) {
-    const days = (this.chips && this.chips.days) || [];
-    const d = (time && days.find((x) => x.time === time)) || days[days.length - 1];
-    if (!d) return $("c-hover").replaceChildren();
-    const yi = (v) => v === null ? "—" : signedText(v / 1e8, 1) + " 億";
+  // A titled block: question, unit, a readout of the hovered day, an
+  // optional key, then the chart.
+  chipsPanel(id, title, unit, keyId, cls) {
+    return el("div", { class: "cm" },
+      el("div", { class: "cm-head" }, el("h4", null, title), el("span", { class: "unit" }, unit),
+        el("span", { class: "val", id: id + "-val" })),
+      keyId ? el("div", { class: "cm-key", id: keyId }) : null,
+      el("div", { class: "cm-chart " + (cls || ""), id }));
+  },
+
+  chipsMakeChart(id, axis) {
+    const muted = this.css("--muted"), line = this.css("--line");
+    return LightweightCharts.createChart($(id), {
+      layout: { background: { color: this.css("--panel") }, textColor: muted, fontSize: 11,
+        fontFamily: getComputedStyle(document.body).fontFamily },
+      grid: { vertLines: { visible: false }, horzLines: { color: line } },
+      rightPriceScale: { borderVisible: false, minimumWidth: 72, scaleMargins: { top: 0.12, bottom: 0.08 } },
+      leftPriceScale: { visible: false },
+      timeScale: { visible: axis, borderColor: line, timeVisible: false, rightOffset: 1 },
+      crosshair: { horzLine: { visible: false, labelVisible: false },
+        vertLine: { color: muted, style: 0, width: 1, labelVisible: axis } },
+      localization: { locale: "zh-TW", dateFormat: "yyyy-MM-dd" },
+      handleScroll: { vertTouchDrag: false },
+      autoSize: true,
+    });
+  },
+
+  // Small multiples share one day axis: every chart holds every date (blank
+  // where it has no value), so logical ranges line up and one drag or hover
+  // moves them all.
+  chipsSync(list) {
+    let busy = false;
+    for (const a of list) {
+      a.chart.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+        if (busy || !r) return;
+        busy = true;
+        for (const b of list) if (b !== a) b.chart.timeScale().setVisibleLogicalRange(r);
+        busy = false;
+      });
+      a.chart.subscribeCrosshairMove((p) => {
+        if (busy || (p.point && !p.sourceEvent)) return;
+        busy = true;
+        const t = p.point ? p.time : null;
+        for (const b of list) if (b !== a) {
+          if (t) b.chart.setCrosshairPosition(0, t, b.series); else b.chart.clearCrosshairPosition();
+        }
+        busy = false;
+        this.renderChipsHover(t);
+      });
+    }
+  },
+
+  chipsIndex(c) {
+    const days = c.days || [], price = c.price || [];
+    const times = [...new Set([...days.map((d) => d.time), ...price.map((p) => p.time)])].sort((a, b) => a - b);
+    return { times, day: new Map(days.map((d) => [d.time, d])), px: new Map(price.map((p) => [p.time, p])) };
+  },
+
+  chipsFit(charts, n) {
+    if (this.chipsFitted || !n) return;
+    // Open on the last 60 trading days (20 on a phone); the rest is a drag away.
+    const span = $("c-body").clientWidth < 600 ? 20 : 60;
+    for (const ch of charts) {
+      if (n > span) ch.timeScale().setVisibleLogicalRange({ from: n - span - 0.5, to: n + 0.5 });
+      else ch.timeScale().fitContent();
+    }
+    this.chipsFitted = true;
+  },
+
+  chipsKey(id, items) {
+    $(id).replaceChildren(...items.filter(Boolean).map(([mark, text]) => el("span", null, mark, text)));
+  },
+
+  // Three titled charts, one question each, on one shared day axis.
+  drawChipsCharts(c, ix) {
+    const T = c.thresholds || {};
+    const up = this.css("--up"), down = this.css("--down"), muted = this.css("--muted");
+    const ink = this.css("--text"), warn = this.css("--warn");
+    if (!this.cCharts) {
+      $("c-body").replaceChildren(
+        this.chipsPanel("c-px", "台指：漲還是跌？", "日盤 K 線・點", null, "short"),
+        this.chipsPanel("c-fut", "外資期貨：進場還是出場？", "每日未平倉變化（ΔOI）・口", "c-fut-key"),
+        this.chipsPanel("c-eq", "外資現貨：買超還是賣超？", "每日買賣超・億元", "c-eq-key", "axis"));
+      const px = this.chipsMakeChart("c-px", false), fut = this.chipsMakeChart("c-fut", false),
+        eq = this.chipsMakeChart("c-eq", true);
+      const ints = { type: "custom", formatter: (v) => fmtSigned(v), minMove: 1 };
+      // Keep the threshold lines in view, and give markers a fixed 18 px
+      // (lightweight-charts would reserve room by bar spacing, which on a
+      // wide screen shrinks the bars to a third of the pane).
+      const pad = (get) => (orig) => {
+        const r = orig(), m = get();
+        if (!r && !m) return r;
+        const out = r || { priceRange: { minValue: -m, maxValue: m } };
+        out.priceRange.minValue = Math.min(out.priceRange.minValue, -m);
+        out.priceRange.maxValue = Math.max(out.priceRange.maxValue, m);
+        out.margins = { above: 18, below: 18 };
+        return out;
+      };
+      const th = () => (this.chips && this.chips.thresholds) || {};
+      const candles = px.addCandlestickSeries({ upColor: up, downColor: down, wickUpColor: up,
+        wickDownColor: down, borderVisible: false, priceLineVisible: false,
+        priceFormat: { type: "custom", formatter: (v) => fmtInt(Math.round(v)), minMove: 1 } });
+      const futBars = fut.addHistogramSeries({ priceFormat: ints, priceLineVisible: false,
+        lastValueVisible: false, autoscaleInfoProvider: pad(() => (th().strong || 0) * 1.15) });
+      const futFlow = fut.addLineSeries({ color: ink, lineWidth: 2, priceFormat: ints, priceLineVisible: false,
+        lastValueVisible: true, title: "5日均", crosshairMarkerVisible: false });
+      const eqBars = eq.addHistogramSeries({ priceFormat: ints, priceLineVisible: false,
+        lastValueVisible: false, autoscaleInfoProvider: pad(() => (th().equity_ntd || 0) / 1e8 * 2) });
+      const eqFlow = eq.addLineSeries({ color: ink, lineWidth: 2, priceFormat: ints, priceLineVisible: false,
+        lastValueVisible: true, title: "5日均", crosshairMarkerVisible: false });
+      const futBand = new ChipsBand(this.rgba(muted, 0.16)), eqBand = new ChipsBand(this.rgba(muted, 0.16));
+      futBars.attachPrimitive(futBand);
+      eqBars.attachPrimitive(eqBand);
+      this.cCharts = { charts: [px, fut, eq], candles, futBars, futFlow, eqBars, eqFlow, futBand, eqBand, lines: [] };
+      this.chipsSync([{ chart: px, series: candles }, { chart: fut, series: futBars }, { chart: eq, series: eqBars }]);
+    }
+    const A = this.cCharts;
+    const val = (t, f) => { const d = ix.day.get(t); const v = d ? f(d) : null; return v === null || v === undefined ? { time: t } : { time: t, value: v }; };
+    A.candles.setData(ix.times.map((t) => ix.px.get(t) || { time: t }));
+    A.futBars.setData(ix.times.map((t) => {
+      const d = ix.day.get(t);
+      if (!d || d.delta_oi === null) return { time: t };
+      return { time: t, value: d.delta_oi, color: this.rgba(d.delta_oi >= 0 ? up : down, d.settlement ? 0.35 : 0.85) };
+    }));
+    A.futFlow.setData(ix.times.map((t) => val(t, (d) => d.flow_avg)));
+    A.eqBars.setData(ix.times.map((t) => {
+      const d = ix.day.get(t);
+      if (!d || d.equity_net === null) return { time: t };
+      return { time: t, value: d.equity_net / 1e8, color: this.rgba(d.equity_net >= 0 ? up : down, 0.85) };
+    }));
+    A.eqFlow.setData(ix.times.map((t) => val(t, (d) => d.equity_avg === null ? null : d.equity_avg / 1e8)));
+    A.futBand.set(-T.hysteresis, T.hysteresis);
+    A.eqBand.set(-T.equity_ntd / 1e8, T.equity_ntd / 1e8);
+    for (const [s, l] of A.lines) s.removePriceLine(l);
+    const dash = { lineStyle: 2, lineWidth: 1, axisLabelVisible: false, color: muted };
+    A.lines = [T.strong, -T.strong].map((v) => [A.futBars, A.futBars.createPriceLine({ ...dash, price: v })]);
+    const kinds = new Set();
+    const marks = [];
+    for (const d of c.days || []) {
+      const pos = (d.delta_oi || 0) >= 0 ? "aboveBar" : "belowBar";
+      if (d.kind === "vote") {
+        const isUp = d.decision === "trending-up";
+        kinds.add(isUp ? "up" : "down");
+        marks.push({ time: d.time, position: isUp ? "aboveBar" : "belowBar", shape: isUp ? "arrowUp" : "arrowDown",
+          color: isUp ? up : down, size: 0.7 });
+      } else if (d.kind === "hedge") {
+        kinds.add("hedge");
+        marks.push({ time: d.time, position: pos, shape: "circle", color: warn, size: 0.7 });
+      } else if (d.kind === "pending") {
+        kinds.add("pending");
+        marks.push({ time: d.time, position: pos, shape: "circle", color: muted, size: 0.6 });
+      } else if (d.settlement) {
+        kinds.add("settle");
+        marks.push({ time: d.time, position: pos, shape: "square", color: muted, size: 0.6 });
+      }
+    }
+    A.futBars.setMarkers(marks);
+    const g = (ch, color) => el("i", { class: "g", style: `color:${color}` }, ch);
+    const sw = (color) => el("i", { class: "sw", style: `background:${color}` });
+    const ln = (color, d) => el("i", { class: "ln" + (d ? " dash" : ""), style: `border-color:${color}` });
+    this.chipsKey("c-fut-key", [
+      (kinds.has("up") || kinds.has("down")) && [el("span", null, g("▲", up), g("▼", down)), "W4 投多／空"],
+      kinds.has("hedge") && [g("●", warn), "避險（期現背離，不投）"],
+      kinds.has("settle") && [g("■", muted), "結算日"],
+      kinds.has("pending") && [g("●", muted), "待重試"],
+      [sw(this.rgba(muted, 0.25)), `灰帶＝±${fmtInt(T.hysteresis)} 口內，太弱不投票`],
+      [ln(muted, true), `虛線＝±${fmtInt(T.strong)} 口，強訊號`],
+      [ln(ink), "實線＝近 5 日平均"]]);
+    this.chipsKey("c-eq-key", [
+      [sw(this.rgba(muted, 0.25)), `灰帶＝±${fmtInt(T.equity_ntd / 1e8)} 億內，不算確認`],
+      [ln(ink), "實線＝近 5 日平均"]]);
+    this.chipsFit(A.charts, ix.times.length);
+  },
+
+  // The charts' table twin: every value without hovering, newest first.
+  renderChipsTable(c, ix) {
     const cls = (v) => v > 0 ? "up" : v < 0 ? "down" : "muted";
-    const bar = (this.chips.price || []).find((x) => x.time === d.time);
-    $("c-hover").replaceChildren(...[
-      el("b", null, d.date),
-      el("span", null, "淨未平倉 ", el("b", null, d.net_oi === null ? "—" : fmtInt(Math.round(d.net_oi)))),
-      el("span", null, "ΔOI ", el("b", { class: cls(d.delta_oi) }, fmtSigned(d.delta_oi))),
-      el("span", null, `近 ${d.flow_days} 日 `, el("b", { class: cls(d.flow) }, fmtSigned(d.flow))),
-      el("span", null, "外資現貨 ", el("b", { class: cls(d.equity_net) }, yi(d.equity_net))),
-      bar ? el("span", null, "收 ", el("b", null, fmtInt(Math.round(bar.close)))) : null,
-      el("span", { class: d.decision ? (d.decision === "trending-up" ? "up" : "down") : "muted" },
-        d.decision_label + (d.final ? "" : "（待重試）")),
-      d.settlement ? el("span", { class: "warnline" }, "結算日") : null,
-      el("span", null, d.reason_zh)].filter(Boolean));
+    const num = (v, f) => v === null || v === undefined ? el("span", { class: "muted" }, "—") : el("span", { class: cls(v) }, f(v));
+    const oi = (v) => num(v, (x) => fmtSigned(x));
+    const yi = (v) => num(v, yiText);
+    const rows = ix.times.slice().reverse().map((t) => {
+      const d = ix.day.get(t), p = ix.px.get(t);
+      return el("tr", null,
+        td("日期", d ? d.date : chipsDate(t)),
+        td("台指收", p ? fmtInt(Math.round(p.close)) : "—", "num"),
+        td("ΔOI（口）", d ? oi(d.delta_oi) : "—", "num"),
+        td("5日均（口）", d ? oi(d.flow_avg) : "—", "num"),
+        td("現貨（億）", d ? yi(d.equity_net) : "—", "num"),
+        td("5日均（億）", d ? yi(d.equity_avg) : "—", "num"),
+        td("W4", d ? (d.kind === "hedge" ? "避險・不投票" : d.final ? d.decision_label : "待重試") + (d.settlement ? "（結算日）" : "") : "—"),
+        td("原因", d ? el("span", { class: "sub" }, d.reason_zh) : "", "why"));
+    });
+    $("c-table").replaceChildren(
+      el("thead", null, el("tr", null, ...["日期", "台指收", "ΔOI（口）", "5日均（口）", "現貨（億）", "5日均（億）", "W4", "原因"]
+        .map((h, i) => el("th", { class: i >= 1 && i <= 5 ? "num" : "" }, h)))),
+      el("tbody", null, ...rows));
+  },
+
+  // The hovered day (the newest when the pointer is off the charts): a
+  // readout beside each chart's title, W4's decision for that day below.
+  renderChipsHover(time) {
+    const c = this.chips || {};
+    const ix = this.chipsIx || this.chipsIndex(c);
+    const t = time || (ix.times.length ? ix.times[ix.times.length - 1] : null);
+    const set = (id, kids) => { const n = $(id); if (n) n.replaceChildren(...kids.filter(Boolean)); };
+    if (t === null) return set("c-day", []);
+    const d = ix.day.get(t), p = ix.px.get(t);
+    const cls = (v) => v > 0 ? "up" : v < 0 ? "down" : "muted";
+    const date = chipsDate(t);
+    const price = (c.price || []), i = price.findIndex((x) => x.time === t);
+    const chg = p && i > 0 ? p.close - price[i - 1].close : null;
+    set("c-px-val", [el("span", { class: "sub" }, date),
+      p ? el("span", null, "收 ", el("b", null, fmtInt(Math.round(p.close)))) : el("span", { class: "muted" }, "無價格"),
+      chg !== null ? el("b", { class: cls(chg) }, fmtSigned(chg)) : null]);
+    const n = (v, unit) => v === null || v === undefined ? el("b", { class: "muted" }, "—")
+      : el("b", { class: cls(v) }, unit === "億" ? `${yiText(v)} 億` : `${fmtSigned(v)} 口`);
+    set("c-fut-val", d ? [el("span", { class: "sub" }, date),
+      el("span", null, "ΔOI ", n(d.delta_oi, "口")), el("span", null, "5日均 ", n(d.flow_avg, "口"))] : []);
+    set("c-eq-val", d ? [el("span", { class: "sub" }, date),
+      el("span", null, "當日 ", n(d.equity_net, "億")), el("span", null, "5日均 ", n(d.equity_avg, "億"))] : []);
+    if (!d) return set("c-day", [el("b", null, date), el("span", { class: "muted" }, "這天沒有 W4 紀錄")]);
+    const tag = d.kind === "vote" ? el("span", { class: "tag " + (d.decision === "trending-up" ? "up" : "down") }, d.decision_label)
+      : d.kind === "hedge" ? el("span", { class: "tag warn" }, "避險・不投票")
+        : el("span", { class: "tag none" }, d.final ? d.decision_label : "待重試");
+    set("c-day", [el("b", null, `${d.date}（${"日一二三四五六"[new Date(t * 1000).getUTCDay()]}）`),
+      el("span", null, "W4 ", tag), el("span", null, d.reason_zh),
+      d.settlement ? el("span", { class: "warnline" }, "結算日：到期契約退出，ΔOI 會機械性跳動") : null]);
   },
 
   // ── detail ──
@@ -2113,6 +2321,7 @@ const App = {
     if (this.detail) { this.drawCharts(); this.drawEquity(); this.drawPnl(); }
     this.drawFleetPnl();
     if (this.pulse && this.newsOpen) this.drawNewsChart();
+    if (this.chips && this.newsOpen) this.drawChipsChart();
   },
 
   rgba(hex, a) {
