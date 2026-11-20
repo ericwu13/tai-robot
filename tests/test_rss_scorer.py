@@ -971,3 +971,16 @@ class TestVoteWithdrawAndShadow:
         assert on["shadow_score"] is True
         for value in ("true", 1, "yes", None):
             assert rss_scorer.get_news_config({"news": {"rss_shadow_score": value}})["shadow_score"] is False
+
+    @patch("rss_scorer.fetch_all_feeds")
+    @patch("rss_scorer.score_article")
+    @patch("rss_scorer._gemini_json")
+    def test_shadow_uses_the_same_volume_scaling(self, mock_gem, mock_score, mock_feeds, tmp_vote):
+        n = 2 * rss_scorer.REF_STORIES_PER_RUN                    # busy run: scale 0.5
+        mock_feeds.return_value = [_make_article(f"v{i}", f"distinct story number {i}") for i in range(n)]
+        mock_score.return_value = {"direction": "bearish", "confidence": 1.0, "reason": "x"}
+        mock_gem.return_value = {"direction": "bearish", "confidence": 1.0, "reason": "x"}
+        state = rss_scorer.check_once(self._cfg(shadow_score=True), {"seen_guids": []}, tmp_vote,
+                                      now=_WEEKDAY_EVE)
+        assert state["shadow_session_net"] == pytest.approx(state["session_net"])
+        assert state["session_net"] == pytest.approx(-0.5 * rss_scorer.REF_STORIES_PER_RUN)

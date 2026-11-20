@@ -89,6 +89,8 @@ def normalize(raw) -> dict | None:
         "reason": _str(raw.get("reason"), 400),
         "run_net": round(_num(raw.get("run_net")), 3),
         "session_net": round(_num(raw.get("session_net")), 3),
+        # Lines written before run_scale existed were plain sums.
+        "run_scale": round(_num(raw.get("run_scale"), 1.0), 4),
     }
 
 
@@ -209,9 +211,11 @@ def news_feed(path: str | None, filters: dict | None = None) -> dict:
             "bearish": sum(1 for r in matched if r["direction"] == "bearish"),
             "neutral": sum(1 for r in matched if r["direction"] == "neutral"),
             "net": round(sum(r["score"] for r in matched), 3),
-            # What the vote actually sums: each article clipped to ±0.5
-            # (rss_scorer.aggregate_scores), before the per-run EMA decay.
-            "net_clipped": round(sum(clip(r["score"]) for r in matched), 3),
+            # What the vote actually sums: each article clipped to ±0.5 and
+            # weighted by its run's volume scale (rss_scorer.aggregate_scores),
+            # before the per-run EMA decay.
+            "net_clipped": round(sum(clip(r["score"]) * r["run_scale"]
+                                     for r in matched), 3),
         },
         "latest": latest,
     }

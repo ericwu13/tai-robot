@@ -49,6 +49,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -81,6 +82,21 @@ EMA_DECAY: float = math.exp(-math.log(2) * 0.5 / EMA_HALF_LIFE_HOURS)
 # The dashboard (scripts/dashboard/news_feed.py, news_pulse.py) imports
 # these so its numbers stay identical to the ones that fire the vote.
 ARTICLE_CLIP: float = 0.5
+
+# Volume normalisation.  The 4-feed setup scored ~12 articles per run, and
+# SESSION_VOTE_THRESHOLD was tuned on that scale.  The 13 default feeds
+# bring 40-80 per run, which made the plain sum a count of headlines (a
+# session net of -77 against +/-1.5 on 2026-11-20).  A run with more than
+# REF_STORIES_PER_RUN scored stories is scaled down to that many stories'
+# worth (net = mean x REF); a quieter run is summed exactly as before.
+REF_STORIES_PER_RUN: int = 12
+# Headlines that normalise to the same text are one story (Yahoo TW + its
+# Google News copy, UDN + 經濟日報 ...). Whole-headline match on purpose:
+# a prefix match merged different TAIFEX settlement notices and FactSet
+# updates that share a template. Only the first copy is scored; keys are
+# remembered for STORY_TTL_HOURS so a later copy is not scored again.
+STORY_KEY_MAX_CHARS: int = 160
+STORY_TTL_HOURS: float = 8.0
 EROSION_POINTS: float = 1.5   # session net this far back from its peak = "Eroding"
 
 ARTICLE_MAX_AGE_HOURS = 4
@@ -518,6 +534,78 @@ def dedup_articles(articles: list[dict], state: dict,
     return new
 
 
+# A trailing " - Publisher" (Google News). A suffix with a digit or % is
+# part of the headline ("營收創新高 - 年增20%"), never a publisher name.
+_GN_PUBLISHER_RE = re.compile(r"\s+[-–—|]\s+[^-–—|\d%％]{1,40}$")
+
+
+def story_key(title: str) -> str:
+    """Normalised headline used to spot the same story from two feeds.
+
+    Drops a trailing `` - Publisher`` (Google News appends one) and a
+    trailing ellipsis, then everything that is not a letter or digit,
+    case-folded.  ``""`` when too little is left to compare safely.
+    """
+    import unicodedata                                     # noqa: PLC0415
+    text = unicodedata.normalize("NFKC", str(title or "")).strip()
+    text = _GN_PUBLISHER_RE.sub("", text).rstrip(".… ")
+    key = "".join(ch for ch in text.casefold() if ch.isalnum())
+    return key[:STORY_KEY_MAX_CHARS] if len(key) >= 8 else ""
+
+
+def dedup_stories(articles: list[dict], state: dict,
+                  now: datetime) -> tuple[list[dict], list[dict]]:
+    """Split *articles* into (first copy of each story, duplicates).
+
+    A duplicate is a headline whose ``story_key`` was already scored in
+    the last STORY_TTL_HOURS (``state["recent_stories"]``) or appears
+    earlier in this batch.  Feed order decides which copy is kept, so a
+    direct feed wins over its Google News echo.
+    """
+    recent = _live_stories(state, now)
+    keep, dups, batch = [], [], set()
+    for art in articles:
+        key = story_key(art.get("title", ""))
+        if key and (key in recent or key in batch):
+            dups.append(art)
+            continue
+        if key:
+            batch.add(key)
+        keep.append(art)
+    return keep, dups
+
+
+def _live_stories(state: dict, now: datetime) -> dict:
+    raw = state.get("recent_stories")
+    if not isinstance(raw, dict):
+        return {}
+    cutoff = now - timedelta(hours=STORY_TTL_HOURS)
+    live = {}
+    for key, at in raw.items():
+        try:
+            when = datetime.fromisoformat(str(at))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_TZ_TAIPEI)
+        if when >= cutoff:
+            live[key] = at
+    return live
+
+
+def remember_stories(state: dict, articles: list[dict], guids: list[str],
+                     now: datetime) -> None:
+    """Record the story keys of the articles that were actually scored."""
+    done = set(guids)
+    live = _live_stories(state, now)
+    stamp = now.isoformat(timespec="seconds")
+    for art in articles:
+        key = story_key(art.get("title", ""))
+        if key and art.get("guid") in done:
+            live[key] = stamp
+    state["recent_stories"] = live
+
+
 def mark_seen(state: dict, guids: list[str]) -> dict:
     """Add GUIDs to the seen set.  Keep last 5000 to bound state size."""
     seen = list(state.get("seen_guids", []))
@@ -527,8 +615,6 @@ def mark_seen(state: dict, guids: list[str]) -> dict:
 
 
 # ── Gemini scoring ───────────────────────────────────────────────────────
-
-import re
 
 _DIR_RE = re.compile(r'"direction"\s*:\s*"(bullish|bearish|neutral)"')
 _CONF_RE = re.compile(r'"confidence"\s*:\s*([\d.]+)')
@@ -752,13 +838,27 @@ def withdraw_w3_vote(vote_out: str) -> bool:
 
 # ── Aggregation ──────────────────────────────────────────────────────────
 
+def run_scale(n_scored: int) -> float:
+    """Weight of each article in a run of *n_scored* scored stories."""
+    if n_scored <= REF_STORIES_PER_RUN:
+        return 1.0
+    return REF_STORIES_PER_RUN / n_scored
+
+
 def aggregate_scores(scored: list[dict]) -> float:
-    """Net score: sum of clipped (confidence × direction_sign).
+    """Run net: sum of clipped (confidence × direction_sign) × run_scale.
 
     Each article's signed score is clipped to ±0.5 to prevent a single
     high-confidence article from dominating the EMA.
-    bullish = +1, bearish = -1, neutral = 0.
+    bullish = +1, bearish = -1, neutral = 0 (a neutral story still
+    counts toward the run size).  Up to REF_STORIES_PER_RUN stories this
+    is the plain sum; past it, the mean × REF_STORIES_PER_RUN.
     """
+    total = _clipped_sum(scored)
+    return total * run_scale(len(scored))
+
+
+def _clipped_sum(scored: list[dict]) -> float:
     total = 0.0
     for item in scored:
         s = item["score"]
@@ -1108,9 +1208,15 @@ def check_once(cfg: dict, state: dict, vote_out: str,
         _notify_fetch_recovery(cfg, state)
 
     new_articles = dedup_articles(articles, state, now=now)
-    print(f"  {len(articles)} recent articles, {len(new_articles)} new")
+    new_articles, dup_stories = dedup_stories(new_articles, state, now)
+    if dup_stories:
+        # Same story as one already scored: never send it to Gemini.
+        mark_seen(state, [a["guid"] for a in dup_stories if a.get("guid")])
+    print(f"  {len(articles)} recent articles, {len(new_articles)} new"
+          f" ({len(dup_stories)} duplicate stories skipped)")
     state["last_fetched"] = len(articles)
     state["last_new"] = len(new_articles)
+    state["last_dup_stories"] = len(dup_stories)
 
     session_key = night_session_key(now)
 
@@ -1120,6 +1226,7 @@ def check_once(cfg: dict, state: dict, vote_out: str,
 
     scored, scored_guids, api_error = score_articles(new_articles, cfg["gemini_api_key"])
     state = mark_seen(state, scored_guids)
+    remember_stories(state, new_articles, scored_guids, now)
     api_error = api_error or unusable_scores_error(scored, scored_guids)
     record_scoring_result(state, now, api_error,
                           skipped=len(scored_guids) - len(scored))
@@ -1145,8 +1252,9 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     shadow_net = shadow_cum = None
     if cfg.get("shadow_score") and scored:
         shadow_error = score_shadow(scored, cfg, now)
-        shadow_net = aggregate_scores([{"score": item["shadow"]} for item in scored
-                                       if item.get("shadow")])
+        # Same volume scaling as the live score (#334), over the same run size.
+        shadow_net = _clipped_sum([{"score": item["shadow"]} for item in scored
+                                   if item.get("shadow")]) * run_scale(len(scored))
         shadow_cum = round(_shadow_session_net(state, session_key) * EMA_DECAY + shadow_net, 4)
         state["shadow_session_key"] = session_key
         state["shadow_session_net"] = shadow_cum
@@ -1158,7 +1266,7 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     if log_path and scored:
         records = [rss_news_log.build_record(
             item["article"], item["score"], scored_at=now, session=session_key,
-            run_net=net, session_net=cum,
+            run_net=net, session_net=cum, run_scale=run_scale(len(scored)),
             shadow=item.get("shadow") if shadow_net is not None else rss_news_log.NO_SHADOW,
             shadow_run_net=shadow_net, shadow_session_net=shadow_cum) for item in scored]
         if not rss_news_log.append(log_path, records):

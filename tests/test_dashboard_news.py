@@ -293,7 +293,7 @@ def test_endpoint_returns_the_feed(news_server):
     assert [r["title"] for r in body["items"]] == ["bull", "bear"]
     assert set(body["items"][0]) == {"published_at", "scored_at", "session", "source", "title",
                                       "link", "summary", "direction", "confidence", "score",
-                                      "reason", "run_net", "session_net"}
+                                      "reason", "run_net", "session_net", "run_scale"}
 
 
 def test_endpoint_filters(news_server):
