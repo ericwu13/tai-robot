@@ -48,9 +48,9 @@ def _num(value, default=0.0) -> float:
 def build_drivers(items: list[dict], session: str, decay: float) -> dict:
     """Each article's share of the session EMA today.
 
-    The scorer does ``net = prev * decay + Σ clip(article)`` once per
-    scoring run, so an article scored k runs ago now contributes
-    ``clip(score) * decay**k``.  Runs that logged nothing (all Gemini
+    The scorer does ``net = prev * decay + Σ clip(article) * run_scale``
+    once per scoring run, so an article scored k runs ago now contributes
+    ``clip(score) * run_scale * decay**k``.  Runs that logged nothing (all Gemini
     calls failed) still decayed the EMA, so the sum is approximate.
     """
     rows = [r for r in items if r["session"] == session and r["direction"] != "neutral"]
@@ -62,7 +62,8 @@ def build_drivers(items: list[dict], session: str, decay: float) -> dict:
         out.append({"title": r["title"], "link": r["link"], "source": r["source"],
                     "scored_at": r["scored_at"], "score": r["score"],
                     "reason": r["reason"], "weight": round(weight, 3),
-                    "contribution": round(clip(r["score"]) * weight, 3)})
+                    "contribution": round(clip(r["score"]) * r.get("run_scale", 1.0)
+                                          * weight, 3)})
     up = sorted((d for d in out if d["contribution"] > 0),
                 key=lambda d: -d["contribution"])
     down = sorted((d for d in out if d["contribution"] < 0),

@@ -16,7 +16,8 @@ Record (all strings TPE ISO-8601 unless noted)::
      "summary": "plain text, <= 300 chars",
      "direction": "bullish|bearish|neutral", "confidence": 0.7,
      "score": 0.7,                             # signed: +bull / -bear / 0
-     "reason": "...", "run_net": 1.2, "session_net": 1.6}
+     "reason": "...", "run_net": 1.2, "session_net": 1.6,
+     "run_scale": 1.0}                         # this article's weight in run_net
 """
 from __future__ import annotations
 
@@ -109,7 +110,8 @@ def _iso(dt) -> str:
 
 
 def build_record(article: dict, score: dict, *, scored_at: datetime,
-                 session: str, run_net: float, session_net: float) -> dict:
+                 session: str, run_net: float, session_net: float,
+                 run_scale: float = 1.0) -> dict:
     direction = str(score.get("direction", "neutral")).lower()
     try:
         confidence = round(max(0.0, min(1.0, float(score.get("confidence", 0)))), 3)
@@ -130,6 +132,8 @@ def build_record(article: dict, score: dict, *, scored_at: datetime,
         "reason": clean_text(str(score.get("reason", "")), 300),
         "run_net": round(float(run_net), 4),
         "session_net": round(float(session_net), 4),
+        # Weight of this article in run_net (rss_scorer.run_scale).
+        "run_scale": round(float(run_scale), 4),
     }
 
 
