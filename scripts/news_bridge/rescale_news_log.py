@@ -4,7 +4,7 @@
 the scorer computed at the time.  Runs logged before volume normalisation
 (``rss_scorer.REF_STORIES_PER_RUN``) and story dedup (``story_key``) are
 plain sums, so the 新聞趨勢 chart and the drivers list mix two scales.
-This replays the log in file order with the scorer's own functions:
+This replays each ``log_files`` file in file order with the scorer's own functions:
 
 * a headline whose ``story_key`` was scored in the previous
   ``STORY_TTL_HOURS`` (or earlier in the same run) gets ``run_scale: 0``
@@ -18,7 +18,7 @@ the live EMA but logged nothing, so the replay cannot see it.
 
 Usage (on the bridge host, between two W3 passes, e.g. at :10 or :40)::
 
-    python rescale_news_log.py --log <state dir>/news/news_log.jsonl            # dry run
+    python rescale_news_log.py --log <state dir>/news/news_log.jsonl            # dry run (base + monthly files)
     python rescale_news_log.py --log ... --apply                                # rewrite (backup kept)
     python rescale_news_log.py --log ... --state rss_scorer_state.json --apply  # + live session net
 
@@ -39,6 +39,7 @@ from pathlib import Path
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+import rss_news_log  # noqa: E402
 import rss_scorer  # noqa: E402
 
 
@@ -178,27 +179,36 @@ def update_state(state: dict, summary: dict) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--log", required=True, help="news_log.jsonl path")
+    ap.add_argument("--log", required=True, help="news_log.jsonl base path (every log_files file)")
     ap.add_argument("--state", help="rss_scorer_state.json to bring in line too")
     ap.add_argument("--apply", action="store_true", help="write (default: dry run)")
     args = ap.parse_args(argv)
 
-    with open(args.log, encoding="utf-8") as f:
-        lines = f.readlines()
-    out, summary = rescale(lines)
-    print(f"{summary['records']} records in {summary['runs']} runs; "
-          f"{summary['duplicates']} duplicate stories now weighted 0")
-    for key, info in list(summary["sessions"].items())[-10:]:
-        print(f"  {key or '(no session)'}: session net {info['old_final']:+.2f} -> "
-              f"{info['new_final']:+.2f} over {info['runs']} run(s)")
+    files = rss_news_log.log_files(args.log)
+    if not files:
+        with open(args.log, encoding="utf-8") as f:
+            f.read(0)
+
+    planned = []
+    for path in files:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        out, summary = rescale(lines)
+        planned.append((path, out, summary))
+        print(f"{path}: {summary['records']} records in {summary['runs']} runs; "
+              f"{summary['duplicates']} duplicate stories now weighted 0")
+        for key, info in list(summary["sessions"].items())[-10:]:
+            print(f"  {key or '(no session)'}: session net {info['old_final']:+.2f} -> "
+                  f"{info['new_final']:+.2f} over {info['runs']} run(s)")
 
     state = None
     if args.state:
         with open(args.state, encoding="utf-8") as f:
             state = json.load(f)
-        if update_state(state, summary):
+        last = next((item[2] for item in reversed(planned) if item[2]["runs"]), None)
+        if last and update_state(state, last):
             print(f"  state: session_net -> {state['session_net']:+.2f} "
-                  f"({summary['last_session']})")
+                  f"({last['last_session']})")
         else:
             print("  state: session_key is not the last logged session; left alone")
             state = None
@@ -206,8 +216,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         print("DRY RUN - nothing written. Re-run with --apply.")
         return 0
-    backup = _write(args.log, "".join(out))
-    print(f"log rewritten; backup {backup}")
+    for path, out, _summary in planned:
+        backup = _write(path, "".join(out))
+        print(f"log rewritten; backup {backup}")
     if state is not None:
         backup = _write(args.state, json.dumps(state, ensure_ascii=False, indent=2))
         print(f"state rewritten; backup {backup}")
