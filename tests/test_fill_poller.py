@@ -624,3 +624,111 @@ class TestOrderSeqRestorableIssue319:
         assert result.restorable is False
         assert g.real_entry_confirmed is True
         assert g.fill_pending is False
+
+
+# ── Shared book: the account net is not this bot's alone ──
+
+class TestSharedBook:
+    """Another bot (or a manual order) holds this product on the account.
+
+    The OI net then proves nothing about THIS order, so only the order's
+    own deal row confirms and a timeout assumes nothing. Without the flag
+    every master behaviour above is unchanged.
+    """
+
+    SEQ = "2315600000001"
+
+    def test_flag_stored_and_reset(self):
+        fp, _g = _make_poller()
+        fp.start("entry", 0, shared_book=True, order_seq=self.SEQ)
+        assert fp.shared_book is True
+        fp.reset()
+        assert fp.shared_book is False
+
+    def test_foreign_position_does_not_confirm_entry(self):
+        """Bot B is long 1; this bot's IOC entry did not fill. Pre-fix the
+        +1 net confirmed it and a later exit offset B's lot."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 1, shared_book=True, order_seq=self.SEQ)
+        assert fp.on_position_update(1) is None
+        assert fp.on_position_update(2) is None
+        assert fp.pos_current == 2
+        assert g.fill_pending is True
+        assert g.real_entry_confirmed is False
+
+    def test_flat_net_is_not_exit_already_flat(self):
+        """This bot long, bot B short → net 0 before the exit fills."""
+        fp, _g = _make_poller()
+        action = fp.start("exit", 0, shared_book=True, order_seq=self.SEQ)
+        assert action.type == "start_polling"
+        assert fp.on_position_update(0) is None
+
+    def test_own_deal_row_still_confirms(self):
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 1, shared_book=True, order_seq=self.SEQ)
+        result = fp.on_deal_confirmed("entry")
+        assert result is not None and result.type == "confirmed"
+        fp.confirm()
+        assert g.real_entry_confirmed is True
+        assert g.fill_pending is False
+
+    def test_entry_timeout_assumes_nothing_and_halts(self):
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 1, shared_book=True, order_seq=self.SEQ)
+        result = fp.timeout()
+        assert result.position_unknown is True
+        assert result.restorable is False
+        assert result.order_seq == self.SEQ
+        assert result.new_trading_mode == "semi_auto"
+        assert "UNKNOWN" in result.message and "持倉未知" in result.message
+        assert not fp.active
+        assert g.real_entry_confirmed is False
+        assert g.halted is True
+        assert g.fill_pending is False
+        # Nothing goes out: entries and strategy exits are halted, and a
+        # FORCE_CLOSE (which bypasses halted) has no confirmed entry.
+        assert g.decide("auto", "ENTRY_FILL", "LONG")[0] == g.BLOCK_HALTED
+        assert g.decide("semi_auto", "TRADE_CLOSE", "LONG")[0] == g.BLOCK_HALTED
+        assert g.decide("semi_auto", "FORCE_CLOSE", "LONG")[0] == g.SKIP_EXIT
+
+    def test_exit_timeout_does_not_assume_closed_either(self):
+        fp, g = _make_poller()
+        g.on_entry_sent()
+        g.on_fill_pending("exit")
+        fp.start("exit", 1, shared_book=True, order_seq=self.SEQ)
+        result = fp.timeout()
+        assert result.position_unknown is True
+        assert g.halted is True
+        assert g.real_entry_confirmed is False
+        assert g.decide("semi_auto", "FORCE_CLOSE", "LONG")[0] == g.SKIP_EXIT
+
+    def test_timeout_drops_deferred_close(self):
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        g.defer_close({"action": "TRADE_CLOSE", "side": "LONG"})
+        fp.start("entry", 1, shared_book=True, order_seq=self.SEQ)
+        fp.timeout()
+        assert g.pop_deferred_close() is None
+
+    def test_resumed_entry_on_shared_book_halts(self):
+        """The shared rule wins over the resumed-entry sign check."""
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 1, expected_sign=1, resumed=True,
+                 shared_book=True, order_seq=self.SEQ)
+        assert fp.on_position_update(1) is None
+        result = fp.timeout()
+        assert result.position_unknown is True
+        assert g.real_entry_confirmed is False
+
+    def test_default_timeout_is_not_position_unknown(self):
+        fp, g = _make_poller()
+        g.on_fill_pending("entry")
+        fp.start("entry", 0, order_seq=self.SEQ)
+        result = fp.timeout()
+        assert result.position_unknown is False
+        assert g.halted is False
+        assert g.real_entry_confirmed is True

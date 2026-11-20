@@ -49,6 +49,9 @@ class FillTimeoutResult:
     # deal row may lift the downgrade. A resumed book must not.
     order_seq: str = ""
     restorable: bool = False
+    # Shared book: the order was neither proven filled nor proven
+    # unfilled. The guard is halted and no fill was assumed.
+    position_unknown: bool = False
 
 
 class FillPoller:
@@ -90,6 +93,11 @@ class FillPoller:
         # the caller has none (a resumed book, or a poll started
         # without one). timeout() copies it onto the result.
         self._order_seq: str = ""
+        # Shared book: another position (another bot, a manual order) is
+        # on this product, so the account's one net row cannot tell this
+        # order's fill from someone else's. Only this order's own deal
+        # row confirms, and a timeout assumes nothing.
+        self._shared_book: bool = False
 
     def reset(self) -> None:
         """Clear all state."""
@@ -102,10 +110,15 @@ class FillPoller:
         self._expected_sign = None
         self._resumed = False
         self._order_seq = ""
+        self._shared_book = False
 
     @property
     def active(self) -> bool:
         return self._active
+
+    @property
+    def shared_book(self) -> bool:
+        return self._shared_book
 
     @property
     def action_type(self) -> str:
@@ -135,7 +148,8 @@ class FillPoller:
               entry_bar_index: int = 0,
               expected_sign: int | None = None,
               resumed: bool = False,
-              order_seq: str = "") -> FillPollAction:
+              order_seq: str = "",
+              shared_book: bool = False) -> FillPollAction:
         """Begin monitoring for a fill.
 
         Args:
@@ -153,12 +167,17 @@ class FillPoller:
                 entry filled unless ``expected_sign`` was seen.
             order_seq: SendFutureOrderCLR seq for this order. A live
                 timeout with a non-empty seq is restorable (issue #319).
+            shared_book: True when the account net is not this bot's
+                alone. OpenInterest then never confirms (not even
+                "exit already flat"); only :meth:`on_deal_confirmed`
+                does, and :meth:`timeout` assumes nothing.
 
         Returns FillPollAction telling the caller what to do next.
         """
         self._expected_sign = expected_sign
         self._resumed = resumed
         self._order_seq = str(order_seq).strip()
+        self._shared_book = bool(shared_book)
         if not com_available:
             # Auto-confirm immediately when COM unavailable
             self._guard.on_fill_confirmed()
@@ -179,8 +198,10 @@ class FillPoller:
         self._start_time = time.monotonic()
         self._entry_bar_index = entry_bar_index
 
-        # Exit already flat — IOC filled before we could even read position
-        if action_type == "exit" and current_position == 0:
+        # Exit already flat — IOC filled before we could even read position.
+        # On a shared book a flat net can be two bots on opposite sides.
+        if (action_type == "exit" and current_position == 0
+                and not self._shared_book):
             return FillPollAction(
                 type="already_confirmed",
                 action_type=action_type,
@@ -207,12 +228,17 @@ class FillPoller:
             resumed long)
           - exit:  position == 0 (we're flat now)
 
+        On a shared book the net may be another bot's position, so it is
+        recorded for the log and never confirms.
+
         Returns FillPollAction("confirmed") if fill detected, else None.
         """
         if not self._active:
             return None
 
         self._pos_current = signed_position
+        if self._shared_book:
+            return None
 
         confirmed = False
         if self._action_type == "entry":
@@ -347,8 +373,35 @@ class FillPoller:
 
         A resumed entry whose side was not seen is not assumed filled.
         The gate stays up so the deferred close cannot be replayed.
+
+        On a shared book nothing is assumed either way: an assumed entry
+        lets a later exit offset another bot's position, and an assumed
+        exit can leave this bot's own lot open. The guard is halted with
+        the position unknown, and a person checks the account.
         """
         action_type = self._action_type
+
+        if self._shared_book:
+            self._active = False
+            timeout_s = self.FILL_POLL_TIMEOUT
+            self._guard.on_position_unknown(
+                f"shared book: {action_type} seq={self._order_seq or '?'} "
+                f"has no own fill row after {timeout_s:.0f}s")
+            return FillTimeoutResult(
+                action_type=action_type,
+                timeout_seconds=timeout_s,
+                message=(f"成交超時 Fill timeout: {action_type} seq="
+                         f"{self._order_seq or '?'} 無本機器人成交回報 no own "
+                         f"fill row after {timeout_s:.0f}s. 帳戶有其他部位 "
+                         f"Another position is on this product, so the "
+                         f"account net cannot confirm it. 持倉未知，實單已停止 "
+                         f"Position UNKNOWN, real orders halted. 請人工核對 "
+                         f"Check the account by hand."),
+                new_trading_mode="semi_auto",
+                order_seq=self._order_seq,
+                restorable=False,
+                position_unknown=True,
+            )
 
         if (action_type == "entry" and self._resumed
                 and not self._resumed_entry_may_confirm()):

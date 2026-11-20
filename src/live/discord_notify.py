@@ -488,6 +488,23 @@ class DiscordNotifier:
             priority=True,
         )
 
+    def fill_timeout_position_unknown(self, action_type: str, timeout_s: float,
+                                      order_seq: str) -> None:
+        """Shared book: no own fill row, so nothing was assumed.
+
+        Sibling of :meth:`fill_timeout_downgrade`. Real orders stay halted
+        until a person checks the account and redeploys.
+        """
+        self._send(
+            f"{self._header()}\n"
+            f"🛑 **持倉未知 Position Unknown** ({action_type}, "
+            f"{timeout_s:.0f}s, seq `{order_seq or '?'}`)\n"
+            f"帳戶有其他部位，無本機器人成交回報，實單已停止 "
+            f"Another position is on this product and this order has no "
+            f"own fill row. Real orders halted — check the account.",
+            priority=True,
+        )
+
     def fill_timeout_restored(self, action_type: str, order_seq: str) -> None:
         """The timed-out order's own deal row arrived; auto is back.
 

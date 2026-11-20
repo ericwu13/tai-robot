@@ -205,6 +205,22 @@ class TradingGuard:
         self.fill_pending_type = ""
         self._deferred_close = None  # discard — system is halting
 
+    def on_position_unknown(self, reason: str) -> None:
+        """Shared book: this bot's own fill was not proven either way.
+
+        Blocks every real order. ``real_entry_confirmed`` is cleared, so
+        not even a FORCE_CLOSE (which bypasses ``halted``) can send a
+        close that might offset another bot's position. Cleared only by
+        a new deploy (``reset()``) or :meth:`clear_halt` after a person
+        has checked the account.
+        """
+        self.halted = True
+        self.halt_reason = reason
+        self.real_entry_confirmed = False
+        self.fill_pending = False
+        self.fill_pending_type = ""
+        self._deferred_close = None
+
     # ── Deferred close (issue #50) ──
 
     def defer_close(self, decision: dict) -> None:
