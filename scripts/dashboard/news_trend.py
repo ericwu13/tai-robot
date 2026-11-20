@@ -3,10 +3,11 @@ time axis (``GET /api/news/trend[?symbol=&after=]``).
 
 Two series, both TPE wall clock encoded as UTC (the page's chart convention):
 
-* ``runs`` — one point per W3 scoring pass, from the WHOLE news log (the
-  /api/news table only reads the newest lines). History therefore reaches
-  as far back as the log does; the bridge trims it at
-  ``rss_news_log.MAX_BYTES`` / ``KEEP_LINES``, not this page.
+* ``runs`` — one point per W3 scoring pass, from EVERY history file
+  (``rss_news_log.log_files``: the monthly files plus any pre-split
+  ``news_log.jsonl``; the /api/news table only reads the newest lines).
+  Each file is parsed once per stat change, so a finished month is parsed
+  once per dashboard process and only the current month is re-read.
 * ``candles`` — 30-min OHLC of one index-futures symbol, session-aligned
   like the bots' own bars (``session_align``), built from every bot's
   ``bars_1m_*.csv`` for that symbol. Bots on the same symbol hold the same
@@ -37,6 +38,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from scripts.dashboard import fileio, news_feed, snapshot
+from scripts.news_bridge import rss_news_log
 
 TREND_INTERVAL_S = 1800                    # matches the scorer's 30-min cadence
 # Index futures, most liquid first: the tie-break when two symbols cover
@@ -70,11 +72,11 @@ def _stat_key(path: str):
 
 # ── runs: every scoring pass in the log ──────────────────────────────────
 
-def _parse_runs(path: str) -> list[dict]:
+def _parse_runs(path: str) -> dict[int, dict]:
     text = fileio.read_text(path)
-    if not text:
-        return []
     by_t: dict[int, dict] = {}
+    if not text:
+        return by_t
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -100,13 +102,10 @@ def _parse_runs(path: str) -> list[dict]:
                              "n": 0, "bullish": 0, "bearish": 0, "neutral": 0}
         run["n"] += 1
         run[r["direction"]] += 1
-    return [by_t[t] for t in sorted(by_t)]
+    return by_t
 
 
-def read_runs(path: str | None) -> list[dict]:
-    """Oldest-first scoring passes from the whole log (shared; don't mutate)."""
-    if not path:
-        return []
+def _file_runs(path: str) -> dict[int, dict]:
     key = _stat_key(path)
     with _lock:
         hit = _runs_cache.get(path)
@@ -115,9 +114,23 @@ def read_runs(path: str | None) -> list[dict]:
     runs = _parse_runs(path)
     if key is not None:
         with _lock:
-            _runs_cache.clear()
             _runs_cache[path] = (key, runs)
     return runs
+
+
+def read_runs(path: str | None) -> list[dict]:
+    """Oldest-first scoring passes from every history file (shared; don't
+    mutate). Files are oldest first, so a later file wins a shared second."""
+    if not path:
+        return []
+    files = rss_news_log.log_files(path)
+    with _lock:                 # forget files that no longer exist
+        for stale in set(_runs_cache) - set(files):
+            del _runs_cache[stale]
+    by_t: dict[int, dict] = {}
+    for f in files:
+        by_t.update(_file_runs(f))
+    return [by_t[t] for t in sorted(by_t)]
 
 
 # ── candles: 30-min buckets per bar file, merged across bots ─────────────
