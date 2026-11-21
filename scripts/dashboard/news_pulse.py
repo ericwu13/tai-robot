@@ -78,6 +78,14 @@ def build_drivers(items: list[dict], session: str, decay: float) -> dict:
 
 # ── W3 state (what the Discord embed showed) ─────────────────────────────
 
+def _v2_thresholds(state: dict) -> tuple[float, float]:
+    stats = state.get("pipeline_v2_last_stats")
+    stats = stats if isinstance(stats, dict) else {}
+    bear = _num(stats.get("bearish_vote_threshold"), 0.85) or 0.85
+    bull = _num(stats.get("bullish_vote_threshold"), 1.0) or 1.0
+    return bear, bull
+
+
 def w3_state(state: dict | None, now: datetime, tonight_session: str,
              threshold: float, erosion: float = _FALLBACK_EROSION) -> dict:
     if not isinstance(state, dict):
@@ -92,8 +100,22 @@ def w3_state(state: dict | None, now: datetime, tonight_session: str,
                or (peak < 0 and net > peak + erosion))
     streak = state.get("error_streak")
     streak = streak if isinstance(streak, int) and not isinstance(streak, bool) else 0
-    direction = ("trending-up" if net >= threshold
-                 else "trending-down" if net <= -threshold else "")
+    if state.get("pipeline_v2_mode") == "live":
+        bear_th, bull_th = _v2_thresholds(state)
+        active_vote = news_feed._str(state.get("v2_active_vote"), 20) if current else ""
+        if active_vote in ("trending-up", "trending-down"):
+            direction = active_vote
+        elif net >= bull_th:
+            direction = "trending-up"
+        elif net <= -bear_th:
+            direction = "trending-down"
+        else:
+            direction = ""
+        eff_threshold = bear_th if net < 0 else bull_th
+    else:
+        direction = ("trending-up" if net >= threshold
+                     else "trending-down" if net <= -threshold else "")
+        eff_threshold = threshold
 
     def stamp(name):
         # Keep the +08:00 offset: the page computes ages with Date.parse,
@@ -110,7 +132,7 @@ def w3_state(state: dict | None, now: datetime, tonight_session: str,
         "current": current,
         "session_net": round(net, 3),
         "session_peak": round(peak, 3),
-        "to_threshold": round(threshold - abs(net), 3),
+        "to_threshold": round(eff_threshold - abs(net), 3),
         "direction": direction,
         "eroding": eroding,
         "recent_runs": [round(x, 3) for x in recent],
@@ -184,6 +206,10 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
     items = news_feed.read_items(news_log_path) if news_log_path else []
     state = read_json(paths["rss_state_file"]) if paths.get("rss_state_file") else None
     tonight, votes = _votes(now, paths, read_json) if paths else ("", [])
+    w3 = w3_state(state, now, session, threshold, erosion)
+    if isinstance(state, dict) and state.get("pipeline_v2_mode") == "live":
+        bear_th, bull_th = _v2_thresholds(state)
+        threshold = bear_th if w3.get("session_net", 0.0) < 0 else bull_th
     return {
         "available": bool(news_paths) or bool(news_log_path),
         "now": now.isoformat(timespec="seconds"),
@@ -191,7 +217,7 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
         "article_clip": news_feed.article_clip(),
         "session": session,
         "weekend_pause": bool(scorer and scorer.in_weekend_pause(now)),
-        "w3": w3_state(state, now, session, threshold, erosion),
+        "w3": w3,
         "tonight": tonight,
         "votes": votes,
         "events": _events(now, paths.get("events_path", ""), read_json),

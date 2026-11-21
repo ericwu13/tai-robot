@@ -120,7 +120,8 @@ def build_record(article: dict, score: dict, *, scored_at: datetime,
                  session: str, run_net: float, session_net: float,
                  run_scale: float = 1.0,
                  shadow=NO_SHADOW, shadow_run_net: float | None = None,
-                 shadow_session_net: float | None = None) -> dict:
+                 shadow_session_net: float | None = None,
+                 v2: dict | None = None) -> dict:
     direction = str(score.get("direction", "neutral")).lower()
     try:
         confidence = round(max(0.0, min(1.0, float(score.get("confidence", 0)))), 3)
@@ -161,6 +162,8 @@ def build_record(article: dict, score: dict, *, scored_at: datetime,
         rec["shadow_session_net"] = (None if shadow_session_net is None
                                      else round(float(shadow_session_net), 4))
         record.update(rec)
+    if isinstance(v2, dict) and v2:
+        record["v2"] = v2
     return record
 
 

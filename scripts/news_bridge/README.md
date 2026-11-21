@@ -13,13 +13,49 @@ instance) but runs fine from a plain shell too.  Full framework design:
 | W4 | `chips_monitor.py` | daily 16:15 TPE | `regime_vote_w4.json` (institutional money flow) |
 | W5 | `n8n/W5_manual_tap.json` (webhook, no script) | on tap | `signal.json` via `crossmarket_monitor.py --force-fire` |
 
-W3 vote and shadow score: `regime_vote_w3.json` stands while that
+W3 vote and shadow score (v1): `regime_vote_w3.json` stands while that
 session's score is past ±1.5. A run whose scoring succeeded and ends
 back under it removes the vote for the session just scored (a
 `W3-manual` vote, or a vote for another session, is left alone).
 `news.rss_shadow_score: true` adds a research-only shadow score (publish
 time + W2 market moves, "not yet priced in"), logged beside the live score;
 it never votes.
+
+### W3 Pipeline v2 (4-layer funnel, Feature Flag `news.rss_pipeline_v2`)
+
+`news.rss_pipeline_v2` defaults to `"off"` (100% legacy v1 behavior) and
+supports `"shadow"` (parallel evaluation logged in `news_log_YYYYMM.jsonl`
+under the additive `v2` key without touching votes/signals) and `"live"`
+(4-layer funnel drives `regime_vote_w3.json`):
+
+- **Layer 1 (`src/news/pipeline/prefilter.py`)** — URL canonicalization,
+  multi-pass media prefix/suffix stripping, source tiering (Tier 1/2/3), and
+  hard regex rules in `config/news_filter.yaml` dropping blocked forums,
+  Investing.com microcap templates, TAIFEX admin notices, pure price recaps
+  (unless protected by causal catalyst keywords), and off-topic items.
+- **Layer 2 (`src/news/pipeline/dedup.py`)** — 3-stage incremental
+  deduplication (URL / title key / 64-bit SimHash → 1–4h sliding-window
+  O(k) centroid clustering via Gemini `batchEmbedContents` with automatic
+  pure-Python lexical fallback → 4–48h cross-day archive for fact-delta
+  context). Cluster state is stored in a sibling sidecar
+  `rss_pipeline_v2_state.json` next to `rss_state_file` so
+  `rss_scorer_state.json` stays lean for dashboard/monitor polling.
+- **Layer 3 (`src/news/pipeline/classifier.py`)** — Calls Gemini only on new
+  event representatives (plus unrouted Tier 3 clusters upgraded to Tier 1/2),
+  enforcing a strict fail-closed 12-field JSON schema over 4 whitelisted
+  catalyst categories (`MACRO_RATES`, `AI_SUPPLY_CHAIN`,
+  `GOVERNANCE_REGULATORY`, `CREDIT_FLOWS`, else `DROP`).
+- **Layer 4 (`src/news/pipeline/router.py`)** — Enforces the 5-condition
+  release gate, source-tier authority (Tier 3 alone cannot trigger votes),
+  asymmetric directional gates (BEARISH `materiality >= 4`, threshold `-0.85`;
+  BULLISH `materiality == 5` + fresh W2/SKCOM confirmation with regional
+  contradiction checks, threshold `+1.0`), and 10h EMA + `0.45` withdrawal
+  hysteresis (including decay/withdrawal on 0-article runs). Opt-in
+  `news.rss_emit_risk_off: true` allows Tier 1/2 M4+ market-confirmed bearish
+  shocks to write `signal.json` (`severity: "high"`).
+- **Offline replay benchmark**:
+  `python scripts/news_bridge/replay_news_pipeline.py --log <news_log.jsonl>`
+  or `--xml tests/fixtures/news/*.xml`.
 
 (W5 is the human-confirmation tap: a Discord link opens the n8n webhook,
 which fires a *signal*, not a vote.  It was historically numbered "W4" —

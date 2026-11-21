@@ -1,0 +1,217 @@
+# Centralized configuration for the tai-robot W3 news signal 4-layer funnel
+# (Filter -> Deduplicate -> Classify -> Route).
+#
+# All thresholds, regex rules, event whitelists, and source weights live here
+# so rules can be tuned without changing Python business logic.
+# Evidence basis: calibrated against 8,088 production W3 articles from Steven
+# (2026-11-06..2026-11-21) and tests/fixtures/news/*.xml.
+
+version: 1
+
+prefilter:
+  require_core_relevance: true
+  min_cleaned_title_chars: 4
+
+  # Query parameters stripped during URL canonicalization.
+  tracking_query_params:
+    - utm_source
+    - utm_medium
+    - utm_campaign
+    - utm_term
+    - utm_content
+    - fbclid
+    - gclid
+    - ref
+    - guccounter
+    - guce_referrer
+    - guce_referrer_sig
+    - oc
+    - ncid
+    - sr_share
+    - cmpid
+    - sref
+
+  # Leading media prefixes stripped iteratively before fingerprinting/clustering.
+  media_prefixes:
+    - '^〈[^〉]{1,24}〉\s*'
+    - '^【[^】]{1,24}】\s*'
+    - '^\[[^\]]{1,24}\]\s*'
+    - '^(?:快訊|最新|焦點股|盤中速報|鉅亨速報|營收速報|今日台股|盤勢分析|台股開盤|台股盤後|台股早盤|美股盤後|美股開盤|美股早盤|即時新聞|今日精選)\s*[／/：:》\-–—|]\s*'
+    - '^(?:EXCLUSIVE|BREAKING|UPDATE\s*\d*|CORRECTED|REPEAT|WRAPUP\s*\d*|ANALYSIS|EXPLAINER|FACTBOX)\s*[-–—:]\s*'
+
+  # Trailing publisher / section / columnist suffixes stripped iteratively.
+  # Handles multi-pipe tails such as "| 蕭宥宸 | 新聞 - 風傳媒" or "關鍵- 日報 - 工商時報".
+  media_suffixes:
+    - '\s*[-–—]\s+(?:日報|財經|國際|要聞|焦點|股市|證券)\s*$'
+    - '\s+[-–—]\s+[^-–—\d%％]{1,40}$'
+    - '\s*\|\s*[^|\d%％]{1,30}$'
+    - '\s*-\s*(?:股市爆料同學會|CMoney投資網誌|CMoney|Yahoo奇摩股市|Yahoo股市|Yahoo新聞|Anue鉅亨|鉅亨網|經濟日報|工商時報|自由財經|自由時報|UDN|聯合新聞網|ETtoday財經雲|ETtoday新聞雲|風傳媒|中央社\s*CNA|BigGo\s*財經|知新聞|三立新聞|非凡新聞台|理財周刊|口袋證券|DIGITIMES|Rti\s*中央廣播電臺|遠見雜誌)\s*$'
+
+  # Retail forums / social media sources observed polluting Google News feeds.
+  blocked_sources:
+    - '^Facebook$'
+    - '股市爆料同學會'
+    - '^墨新聞'
+
+  # Named low-value / zero-alpha templates dropped before Layer 2 & LLM.
+  noise_blacklist:
+    investing_transcript: '^Earnings call transcript:'
+    investing_slides: '\bQ[1-4]\s+20\d{2}\s+slides:'
+    investing_insider_form4: '\b(?:CEO|CFO|COO|CTO|EVP|SVP|VP|director|officer|president|insider|10% owner)\b.{0,45}\b(?:sells|buys|sold|bought)\s+\$[\d.,]+'
+    investing_microcap_eps: '\bearnings\s+(?:missed|beat)\s+by\s+\$[\d.]+'
+    investing_may_move: '\bshares\s+may\s+move\s+[\d.]+%\s+on\s+earnings'
+    investing_why_moving: '^Why\s+is\s+.+\s+(?:stock|shares)\s+(?:surging|tumbling|falling|rising|dropping|jumping|sliding|soaring|sinking|down|up)\s+today\?'
+    investing_conference: '\bat\s+.+\s+(?:Conference|Summit|Forum)\s+20\d{2}:'
+    analyst_pt_rating: '\b(?:price target|initiates coverage|reiterates|maintains\s+(?:buy|hold|sell|neutral|outperform|overweight|underweight|equal)|upgraded to|downgraded to|cuts PT|raises PT)\b|Factset\s*最新調查'
+    # TAIFEX routine admin notices — preserve market-wide TXF/MTX/TMF margin hikes & trading halts.
+    taifex_admin: '(?:最後結算價|交易獎勵活動.*得獎名單|開\(休\)市日期|投保中心即日起受理|善意投資人委任求償|公告調整本公司(?!臺股期貨|小型臺股期貨|微型臺指期貨).+期貨.+保證金)'
+    clickbait_gossip_promo: '(?:命理師|兒童台|慈善基金會|高齡保險|零股交易|配息率|最後買進日|他捶心肝|網哀號|網友曝|贏麻了|小資偏愛|股市爆料同學會|星座|風水|投顧|神操作)'
+    zh_routine_list: '(?:盤中速報|營收速報\s*-|台股中小型公司\d+月營收一覽|Follow法人|三大法人買賣超|外資(?:買超|賣超|重砍|大買|大賣).{0,25}(?:張|億)|官股(?:買不停|護盤掃貨|掃貨).{0,25}(?:億|張))'
+
+  # Pure price/index recap templates (dropped unless rescued by causal_protection_whitelist).
+  price_recap_blacklist:
+    - '(?:台股開盤|台股盤後|台股早盤|美股盤後|美股開盤|美股早盤|美股收盤|台指夜盤|今日台股|盤勢分析|Yahoo早盤)'
+    - '台積電\s*ADR\s*\d*日?(?:下跌|上漲|跌|漲)'
+    - '(?:台股|加權指數|大盤|台積電|台指期).{0,22}(?:重挫|大跌|大漲|收跌|收漲|收黑|收紅|跌逾|漲逾|暴跌|狂瀉|再瀉|血崩|震盪逾|殺低|挫|翻黑|翻紅|跌破)\s*[\d,.]+(?:點|元|千元|%|萬)'
+    - '(?:台股|加權指數|大盤|台指期).{0,16}(?:月跌|周跌|週跌|狂飆|崩跌逾?)\s*[\d,.]+點'
+    - '(?:保衛戰|史上(?:盤中)?第\d+大跌點|市值(?:秒)?蒸發)'
+    - 'U\.S\.\s+stocks?\s+(?:lower|higher)\s+at\s+close'
+    - 'Asia\s+stocks?\s+to\s+(?:drop|fall|rise|open|slide)'
+    - 'Stocks?\s+making\s+the\s+biggest\s+moves\s+(?:premarket|midday|after\s+hours)'
+    - 'U\.S\.\s+stock\s+futures\s+(?:rise|fall|slip|edge|tick|flat|climb|drop)'
+    - '\b(?:Dow|S&P\s*500|Nasdaq|Wall\s+Street|Stocks?)\s+(?:fall|falls|fell|drop|drops|dropped|slide|slides|slid|rise|rises|rose|rally|rallies|rallied|close|closes|closed|slip|slips|plunge|plunges|plunged|tumble|tumbles|tumbled)\b'
+
+  # Explicit causal catalyst keywords that rescue a headline from price_recap_blacklist.
+  # Deliberately excludes bare company/index names and bare "IPO" (8/8 IPO rescues on
+  # Steven were pure price recaps like "Stocks rise after Anthropic IPO").
+  causal_protection_whitelist:
+    # MACRO_RATES
+    - '\bFOMC\b|\bFed\b|Federal Reserve|Warsh|華許|聯準會|升息|降息|利率決議|點陣圖|台灣央行|\bBOJ\b|rate\s+(?:hike|cut)s?'
+    - '\bCPI\b|\bPCE\b|nonfarm|payrolls?|jobs\s+report|unemployment|非農|公債殖利率|10-year|10年期|treasury yield|inflation'
+    - 'Iran|伊朗|Aramco|Hormuz|原油|Brent|WTI|oil\s+(?:shock|surge|spike|embargo)'
+    # AI_SUPPLY_CHAIN
+    - 'CoWoS|2nm|2奈米|16奈米|Vera Rubin|NVL72|HBM4?|CapEx|資本支出|RPO|ARR'
+    - '財報|財測|毛利率|砍單|轉單|法說會|月營收|\bearnings\b|\bguidance\b|gross margin|backlog'
+    # GOVERNANCE_REGULATORY
+    - '\bSEC\b|會計審查|accounting\s+(?:probe|review|issue|investigation)|10-Q|subpoena|傳票'
+    - '\bBIS\b|商務部|出口管制|晶片管制|晶片禁令|禁令|制裁|export\s+(?:control|ban|curb|rule)|remote\s+AI\s+chip|chip\s+(?:export|curb|ban|access)|tariff|關稅'
+    - 'moratorium|暫停令|ERCOT|TCEQ|電網許可|電網審查'
+    - '限空令|禁空令|金管會|國安基金|熔斷|halts?\s+trade|trading\s+halt|違約交割'
+    - '黃仁勳.{0,12}(?:辭|下台|撤換|作證|傳票)|(?:resign|resignation|ousted|step\s+down|testify|CEO\s+(?:search|successor|replacement))'
+    # CREDIT_FLOWS
+    - 'CoreWeave|\bCRWV\b|\bCDS\b|credit\s+spread|unsecured\s+bond|停買庫藏股|ATM\s+equity|增資|發債|greenshoe'
+    - 'BofA|FMS|fund manager survey|SOXX|SMH|SOXL'
+
+  # High-value domain / core-entity relevance filter (drops unrelated small-caps).
+  core_relevance_whitelist:
+    # Macro, rates, FX, energy, tariffs
+    - '\bFOMC\b|\bFed\b|Federal Reserve|Warsh|華許|聯準會|升息|降息|利率決議|點陣圖|台灣央行|\bBOJ\b|rate\s+(?:hike|cut)s?|\bCPI\b|\bPCE\b|nonfarm|payrolls?|jobs\s+report|unemployment|inflation|非農|10-year|10年期|公債殖利率|Treasur(?:y|ies)|原油|Brent|WTI|Iran|伊朗|Aramco|Hormuz|tariff|關稅|台幣|新台幣|Taiwan''s\s+Currency|\bVIX\b'
+    # Taiwan core & AI semiconductor supply chain
+    - 'TSMC|\bTSM\b|台積電|2330|CoWoS|2nm|2奈米|16奈米|聯發科|MediaTek|2454|鴻海|廣達|台達電|日月光|TAIEX|TXF|台指期|臺股期貨|小型臺股期貨|微型臺指期貨|加權指數|semiconductor|半導體'
+    - 'Nvidia|\bNVDA\b|輝達|黃仁勳|Jensen|Broadcom|\bAVGO\b|博通|TPU|ASIC|Micron|\bMU\b|美光|Hynix|海力士|Samsung.*HBM|HBM4?|Vera Rubin|NVL72|\bAMD\b|超微|ASML|Dell|戴爾'
+    # Hyperscalers, AI models, neoclouds, and power/cooling bottlenecks
+    - 'Microsoft|\bMSFT\b|微軟|Alphabet|Google|\bGOOGL\b|Amazon|\bAMZN\b|AWS|Meta|\bMETA\b|Oracle|\bORCL\b|甲骨文|CapEx|資本支出|\bRPO\b|\bARR\b'
+    - 'Anthropic|OpenAI|Palantir|\bPLTR\b|neocloud|GE Vernova|\bGEV\b|Vertiv|\bVRT\b|Eaton|\bETN\b|Quanta Services|data center|資料中心|液冷|電網'
+    # Governance, regulatory, export controls, Taiwan market safeguards
+    - '\bSEC\b|10-Q|subpoena|傳票|\bBIS\b|商務部|出口管制|晶片管制|晶片禁令|remote\s+AI\s+chip|chip\s+(?:export|curb|ban|access)|moratorium|暫停令|ERCOT|TCEQ|限空令|禁空令|金管會|國安基金|熔斷|KOSPI|halts?\s+trade|trading\s+halt|違約交割'
+    # Credit stress & institutional flows
+    - 'CoreWeave|\bCRWV\b|\bCDS\b|unsecured\s+bond|停買庫藏股|buyback|ATM\s+equity|增資|發債|BofA|\bFMS\b|\bSOXX\b|\bSMH\b|\bSOXL\b|\bQQQ\b|DRAM\s+ETF'
+
+source_tiers:
+  default_tier: 3
+  tier_weights:
+    1: 1.0
+    2: 0.85
+    3: 0.35
+  # Ordered regex lists matched against publisher name and/or article URL host.
+  tier_1:
+    - 'Reuters|路透'
+    - 'Bloomberg'
+    - 'TAIFEX|臺灣期貨交易所|taifex\.com\.tw'
+    - '\bSEC\b|sec\.gov|Federal Reserve|federalreserve\.gov|BIS|commerce\.gov|金管會'
+    - '中央社|CNA'
+    - 'DIGITIMES'
+  tier_2:
+    - 'CNBC|US Top News and Analysis|cnbc\.com'
+    - 'MarketWatch|marketwatch\.com'
+    - 'Financial Times|WSJ|Wall Street Journal|Barron''s|The Information'
+    - '經濟日報|工商時報|Anue鉅亨|鉅亨網|cnyes\.com|UDN|自由財經|非凡新聞台'
+    - 'Yahoo股市|Yahoo新聞|tw\.stock\.yahoo\.com'
+    - 'Investing\.com|All News|investing\.com'
+    - 'South China Morning Post|SCMP|scmp\.com'
+  tier_3:
+    - 'ETtoday|三立|BigGo|CMoney|風傳媒|理財周刊|知新聞|FTNN|Newtalk|NOWnews|自由時報|Rti|遠見|天下雜誌|商業週刊|口袋證券'
+
+dedup:
+  simhash_bits: 64
+  simhash_max_hamming: 6
+  cluster_window_hours: 4.0
+  cosine_threshold: 0.82
+  lexical_cosine_threshold: 0.58
+  followup_window_hours: 48.0
+  followup_cosine_threshold: 0.72
+  lexical_followup_cosine_threshold: 0.45
+  max_active_clusters: 400
+  max_archived_clusters: 600
+  embedding_provider: 'gemini'        # gemini | lexical | none
+  embedding_model: 'gemini-embedding-001'
+  embedding_output_dim: 256
+  embedding_batch_size: 64
+  embedding_timeout_s: 20
+
+classifier:
+  model: 'gemini-3.6-flash'
+  max_output_tokens: 1024
+  timeout_s: 30
+  retry_attempts: 3
+  retry_base_delay_s: 1.0
+  summary_max_chars: 500
+  min_materiality_pass: 4
+  allowed_categories:
+    - MACRO_RATES
+    - AI_SUPPLY_CHAIN
+    - GOVERNANCE_REGULATORY
+    - CREDIT_FLOWS
+    - DROP
+  allowed_directions:
+    - BULLISH
+    - BEARISH
+    - NEUTRAL
+  allowed_horizons:
+    - INTRADAY
+    - MULTI_DAY
+    - STRUCTURAL
+
+router:
+  min_materiality_bearish: 4
+  min_materiality_bullish: 5
+  bullish_requires_price_vol_confirm: true
+  bullish_confirm_min_pct: 0.3
+  bullish_confirm_symbols:
+    - TSM
+    - SOXX
+    - QQQ
+    - 'NQ=F'
+    - '^TWII'
+  # Regional proxies checked for sharp downside contradiction after ^TWII closes (14:00 TPE).
+  bullish_contra_symbols:
+    - '^N225'
+    - '^KS11'
+    - '^HSI'
+    - 'ASML.AS'
+  bullish_contra_max_drop_pct: -1.5
+  market_snapshot_max_age_s: 1800
+  tier3_can_trigger_vote: false
+  bearish_vote_threshold: 0.85
+  bullish_vote_threshold: 1.0
+  # Hysteresis withdrawal band: v2 deduplicated catalysts fire ONCE per 4-48h and
+  # RegimeSwitchingRunner only reads regime_vote_w3.json at ~04:58 TPE. A 10h
+  # half-life + 0.45 withdrawal threshold lets a single T1/T2 M4-M5 shock survive
+  # across the US/EU night session (~9-15h) unless counter-catalysts offset it.
+  vote_withdraw_threshold: 0.45
+  ema_half_life_hours: 10.0
+  emit_risk_off_min_materiality: 4
+  emit_risk_off_max_tier: 2
+  emit_risk_off_requires_market_confirm: true
+  bearish_confirm_max_pct: 0.5
+  discord_alert_min_materiality: 4
