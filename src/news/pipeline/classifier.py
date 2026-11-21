@@ -162,6 +162,17 @@ def _strip_code_fences(text: str) -> str:
     return cleaned
 
 
+def _should_retry_classification(text: str, err: str, finish_reason: str) -> bool:
+    """Retry truncated JSON once. A valid JSON schema or enum miss is final."""
+    if not err:
+        return False
+    try:
+        json.loads(_strip_code_fences(text))
+    except ValueError:
+        return err.startswith("json_decode_error") or finish_reason.upper() == "MAX_TOKENS"
+    return False
+
+
 def _require_bool(raw: dict[str, Any], key: str) -> tuple[bool | None, str]:
     val = raw.get(key)
     if isinstance(val, bool):
@@ -317,9 +328,12 @@ class GeminiEventClassifier:
         # Injectable transport(prompt: str) -> str for deterministic unit tests
         self._transport = transport
 
-    def _call_gemini(self, prompt: str) -> str:
+    def _call_gemini(self, prompt: str) -> tuple[str, str]:
         if self._transport is not None:
-            return self._transport(prompt)
+            raw = self._transport(prompt)
+            if isinstance(raw, tuple):
+                return str(raw[0]), str(raw[1] if len(raw) > 1 else "")
+            return str(raw), ""
         if not self.api_key:
             raise ClassifierAPIError(0, "missing Gemini API key")
 
@@ -327,8 +341,10 @@ class GeminiEventClassifier:
         payload = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
+                "temperature": 0,
                 "maxOutputTokens": self._cfg.max_output_tokens,
                 "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingLevel": "minimal"},
             },
         }).encode("utf-8")
 
@@ -339,12 +355,13 @@ class GeminiEventClassifier:
                 )
                 with urllib.request.urlopen(req, timeout=self._cfg.timeout_s) as resp:
                     data = json.load(resp)
-                parts = data["candidates"][0]["content"]["parts"]
+                candidate = data["candidates"][0]
+                finish = str(candidate.get("finishReason") or "")
                 text = ""
-                for part in parts:
+                for part in candidate["content"]["parts"]:
                     if "thought" not in part and "text" in part:
                         text = part["text"]
-                return text
+                return text, finish
             except urllib.error.HTTPError as exc:
                 status = exc.code
                 if status in _TRANSIENT_HTTP and attempt + 1 < self._cfg.retry_attempts:
@@ -364,7 +381,7 @@ class GeminiEventClassifier:
                 raise ClassifierAPIError(0, f"connection error: {exc}") from exc
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 # Response body shape problem — fail-closed (not a transport outage)
-                return f"__invalid_response__:{type(exc).__name__}:{exc}"
+                return f"__invalid_response__:{type(exc).__name__}:{exc}", ""
 
         raise ClassifierAPIError(0, "retry limit exhausted")
 
@@ -382,12 +399,17 @@ class GeminiEventClassifier:
         prompt = build_classification_prompt(
             decision, cfg=self._cfg, market_context_text=market_context_text
         )
-        raw_text = self._call_gemini(prompt)
-        return parse_classified_event(
-            raw_text,
-            event_id=decision.cluster_id,
-            source_tier=decision.source_tier,
-            mention_count=decision.mention_count,
-            layer2_is_duplicate=decision.is_duplicate,
-            cfg=self._cfg,
-        )
+        event, err = None, ""
+        for attempt in range(2):
+            raw_text, finish = self._call_gemini(prompt)
+            event, err = parse_classified_event(
+                raw_text,
+                event_id=decision.cluster_id,
+                source_tier=decision.source_tier,
+                mention_count=decision.mention_count,
+                layer2_is_duplicate=decision.is_duplicate,
+                cfg=self._cfg,
+            )
+            if event is not None or attempt or not _should_retry_classification(raw_text, err, finish):
+                break
+        return event, err
