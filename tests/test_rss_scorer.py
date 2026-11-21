@@ -157,6 +157,7 @@ class TestCheckOnce:
             "state_file": "data/state.json",
             "gemini_api_key": "fake-key",
             "discord_webhook_url": webhook,
+            "pipeline_v2": "off",
         }
 
     @patch("rss_scorer.fetch_all_feeds")
@@ -361,6 +362,7 @@ class TestEmbedGating:
             "gemini_api_key": "fake-key",
             "discord_webhook_url": "https://discord.example/webhook",
             "discord_mode": "all",
+            "pipeline_v2": "off",
         }
 
     @patch("rss_scorer.post_discord_embed")
@@ -546,6 +548,7 @@ class TestGeminiAPIError:
             "state_file": "data/state.json",
             "gemini_api_key": "fake-key",
             "discord_webhook_url": webhook,
+            "pipeline_v2": "off",
         }
 
     def test_score_article_raises_on_http_429(self):
@@ -709,6 +712,7 @@ class TestDiscordModes:
             "gemini_api_key": "fake-key",
             "discord_webhook_url": "https://discord.example/webhook",
             "discord_mode": mode,
+            "pipeline_v2": "off",
         }
 
     @patch("rss_scorer.post_discord_embed", return_value=True)
@@ -873,7 +877,7 @@ class TestVoteWithdrawAndShadow:
     def _cfg(self, **extra):
         cfg = {"feeds": ["https://example.com/rss"], "interval_minutes": 30,
                "state_file": "data/state.json", "gemini_api_key": "fake-key",
-               "discord_webhook_url": ""}
+               "discord_webhook_url": "", "pipeline_v2": "off"}
         cfg.update(extra)
         return cfg
 

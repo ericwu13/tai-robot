@@ -204,6 +204,31 @@ def load_settings(path: str) -> dict:
         return yaml.safe_load(f) or {}
 
 
+PIPELINE_V2_MODES = ("off", "shadow", "live")
+DEFAULT_PIPELINE_V2_MODE = "live"
+
+
+def pipeline_v2_mode(value) -> str:
+    """``news.rss_pipeline_v2`` → one of PIPELINE_V2_MODES (unknown → default).
+
+    YAML reads bare ``off``/``false`` as False and ``on``/``true`` as True.
+    An omitted/empty key uses ``DEFAULT_PIPELINE_V2_MODE`` (``"live"``).
+    """
+    if value is True:
+        return "live"
+    if value is False:
+        return "off"
+    if value is None:
+        return DEFAULT_PIPELINE_V2_MODE
+    text = str(value).strip().lower()
+    if not text:
+        return DEFAULT_PIPELINE_V2_MODE
+    if text not in PIPELINE_V2_MODES:
+        print(f"  news.rss_pipeline_v2={value!r} unknown — using {DEFAULT_PIPELINE_V2_MODE!r}")
+        return DEFAULT_PIPELINE_V2_MODE
+    return text
+
+
 def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
     """Extract the news config block with defaults."""
     news = settings.get("news", {}) or {}
@@ -218,6 +243,11 @@ def get_news_config(settings: dict, discord_webhook: str | None = None) -> dict:
         "discord_mode": discord_mode(news.get("rss_discord")),
         "shadow_score": news.get("rss_shadow_score") is True,
         "signal_path": news.get("signal_path") or "",
+        "pipeline_v2": pipeline_v2_mode(news.get("rss_pipeline_v2")),
+        "filter_config": str(news.get("rss_filter_config") or ""),
+        "emit_risk_off": news.get("rss_emit_risk_off") is True,
+        "embedding_provider": str(news.get("rss_embedding_provider") or ""),
+        "rss_model": str(news.get("rss_model") or ""),
     }
 
 
@@ -1067,6 +1097,7 @@ def _session_net(state: dict, session_key: str) -> float:
     if state.get("session_key") != session_key:
         state["session_peak"] = 0.0
         state["recent_runs"] = []
+        state["v2_active_vote"] = ""
         return 0.0
     return float(state.get("session_net", 0.0))
 
@@ -1220,15 +1251,21 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     if fetch_stats.get("status") in ("ok", "degraded"):
         _notify_fetch_recovery(cfg, state)
 
-    new_articles = dedup_articles(articles, state, now=now)
-    new_articles, dup_stories = dedup_stories(new_articles, state, now)
+    guid_new = dedup_articles(articles, state, now=now)
+    session_key = night_session_key(now)
+
+    v2_mode = cfg.get("pipeline_v2", DEFAULT_PIPELINE_V2_MODE)
+    if v2_mode == "live":
+        return _run_v2_live(cfg, state, articles, guid_new, vote_out, session_key, now)
+    if v2_mode != "off" or "pipeline_v2_mode" in state:
+        state["pipeline_v2_mode"] = v2_mode
+
+    new_articles, dup_stories = dedup_stories(guid_new, state, now)
     print(f"  {len(articles)} recent articles, {len(new_articles)} new"
           f" ({len(dup_stories)} duplicate stories skipped)")
     state["last_fetched"] = len(articles)
     state["last_new"] = len(new_articles)
     state["last_dup_stories"] = len(dup_stories)
-
-    session_key = night_session_key(now)
 
     if not new_articles:
         _mark_seen_scored_duplicates(state, dup_stories, now)
@@ -1278,13 +1315,18 @@ def check_once(cfg: dict, state: dict, vote_out: str,
         print(f"  shadow run net: {shadow_net:+.2f}, shadow session net: {shadow_cum:+.2f}"
               + (f" (shadow error: {shadow_error})" if shadow_error else ""))
 
+    v2_by_guid: dict[str, dict] = {}
+    if v2_mode == "shadow" and guid_new:
+        v2_by_guid = _run_v2_shadow(cfg, state, guid_new, session_key, now)
+
     log_path = cfg.get("news_log_path")
     if log_path and scored:
         records = [rss_news_log.build_record(
             item["article"], item["score"], scored_at=now, session=session_key,
             run_net=net, session_net=cum, run_scale=run_scale(len(scored)),
             shadow=item.get("shadow") if shadow_net is not None else rss_news_log.NO_SHADOW,
-            shadow_run_net=shadow_net, shadow_session_net=shadow_cum) for item in scored]
+            shadow_run_net=shadow_net, shadow_session_net=shadow_cum,
+            v2=v2_by_guid.get(str(item["article"].get("guid") or ""))) for item in scored]
         if not rss_news_log.append(log_path, records):
             print(f"  news history append failed: {log_path}")
 
@@ -1320,6 +1362,406 @@ def check_once(cfg: dict, state: dict, vote_out: str,
     state["last_check"] = now.isoformat(timespec="seconds")
     state["last_net_score"] = net
     state["last_articles_scored"] = len(scored)
+    return state
+
+
+# ── Pipeline v2 adapter (Feature Flag: news.rss_pipeline_v2) ─────────────
+
+PIPELINE_V2_STATE_FILENAME = "rss_pipeline_v2_state.json"
+
+
+def _ensure_repo_on_path() -> None:
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+
+def _v2_cluster_state_path(cfg: dict) -> str:
+    """Path to the sibling sidecar holding Layer-2 clusters/centroids.
+
+    Keeping centroid vectors out of ``rss_scorer_state.json`` prevents the main
+    bridge state file (polled by dashboard / monitor / GUI) from growing to
+    multiple megabytes.
+    """
+    explicit = str(cfg.get("v2_state_file") or "").strip()
+    if explicit:
+        return explicit
+    state_file = str(cfg.get("state_file") or "").strip()
+    if not state_file:
+        return ""
+    return str(Path(state_file).parent / PIPELINE_V2_STATE_FILENAME)
+
+
+def _load_v2_clusters(path: str, fallback_state: dict) -> dict | None:
+    """Load Layer-2 cluster state from sidecar, migrating any legacy inline key."""
+    legacy = fallback_state.pop("pipeline_v2_clusters", None)
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            print(f"  [v2] sidecar state load failed ({path}): {exc}")
+    return legacy if isinstance(legacy, dict) else None
+
+
+def _save_v2_clusters(path: str, data: dict) -> bool:
+    """Persist Layer-2 cluster state atomically as compact JSON."""
+    if not path:
+        return False
+    try:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(out) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, out)
+        return True
+    except OSError as exc:
+        print(f"  [v2] sidecar state save failed ({path}): {exc}")
+        return False
+
+
+def _build_v2_pipeline(cfg: dict, state: dict):
+    """Instantiate ``NewsSignalPipeline`` from config and restore cluster window."""
+    _ensure_repo_on_path()
+    from src.news.pipeline import (  # noqa: PLC0415
+        GeminiEventClassifier,
+        NewsSignalPipeline,
+        load_pipeline_config,
+    )
+
+    p_cfg = load_pipeline_config(cfg.get("filter_config") or None)
+    classifier = GeminiEventClassifier(
+        p_cfg,
+        api_key=cfg.get("gemini_api_key", ""),
+        model_override=cfg.get("rss_model") or "",
+    )
+    pipe = NewsSignalPipeline(
+        p_cfg,
+        api_key=cfg.get("gemini_api_key", ""),
+        embedder_provider_override=cfg.get("embedding_provider") or "",
+        classifier=classifier,
+    )
+    pipe.load_state(_load_v2_clusters(_v2_cluster_state_path(cfg), state))
+    return pipe
+
+
+def _v2_legacy_score_dict(ev, rsig) -> dict:
+    """Map a v2 ClassifiedEvent + RoutedSignal to schema-v1 score fields for Dashboard."""
+    direction = ev.direction.lower()
+    if direction not in ("bullish", "bearish"):
+        direction = "neutral"
+    conf = round(ev.materiality / 5.0, 3) if rsig.passed else 0.0
+    if not rsig.passed:
+        direction = "neutral"
+    return {
+        "direction": direction,
+        "confidence": conf,
+        "reason": f"[{ev.category} M{ev.materiality} T{ev.source_tier}] {ev.summary_one_line}",
+    }
+
+
+def _v2_record_payload(ev, rsig) -> dict:
+    payload = ev.to_dict()
+    payload["action"] = rsig.action
+    payload["reject_reason"] = rsig.reject_reason
+    payload["weighted_score"] = rsig.weighted_score
+    payload["passed"] = rsig.passed
+    return payload
+
+
+def _v2_shadow_session(state: dict, session_key: str) -> tuple[float, str]:
+    if state.get("v2_session_key") != session_key:
+        return 0.0, ""
+    return (
+        float(state.get("v2_session_net", 0.0)),
+        str(state.get("v2_active_vote_shadow") or ""),
+    )
+
+
+def _run_v2_shadow(
+    cfg: dict, state: dict, guid_new: list[dict], session_key: str, now: datetime
+) -> dict[str, dict]:
+    """Run 4-layer pipeline v2 in shadow mode (read-only on votes/signals).
+
+    Never raises — a shadow error must never cost the live v1 vote.
+    Returns ``{guid: v2_payload}`` for attaching onto matching news_log entries.
+    """
+    try:
+        _ensure_repo_on_path()
+        from src.news.pipeline import load_market_snapshot  # noqa: PLC0415
+
+        pipe = _build_v2_pipeline(cfg, state)
+        market = load_market_snapshot(
+            cfg.get("signal_path") or "",
+            now=now,
+            max_file_age_s=pipe.config.router.market_snapshot_max_age_s,
+        )
+        prev_v2, prev_v2_vote = _v2_shadow_session(state, session_key)
+        report = pipe.run(
+            guid_new,
+            now=now,
+            prev_session_net=prev_v2,
+            active_vote_direction=prev_v2_vote,
+            market=market,
+            emit_risk_off_enabled=False,
+            interval_minutes=float(cfg.get("interval_minutes", 30)),
+        )
+        _save_v2_clusters(_v2_cluster_state_path(cfg), pipe.dump_state())
+        state.pop("pipeline_v2_clusters", None)
+        state["v2_session_key"] = session_key
+        state["v2_session_net"] = report.routing.session_net
+        if not report.api_error or report.routing.vote_direction:
+            state["v2_active_vote_shadow"] = report.routing.vote_direction or ""
+        state["pipeline_v2_last_stats"] = report.stats_dict()
+        shadow_err = report.api_error or report.embedder_fallback_reason or ""
+        state["pipeline_v2_shadow_error"] = str(shadow_err)[:200]
+        extra = ""
+        if report.embedder_fallback_reason:
+            extra += f" fb={report.embedder_fallback_reason[:60]}"
+        if report.l3_schema_failures:
+            extra += f" schema_fail={report.l3_schema_failures}"
+        if report.api_error:
+            extra += f" err={report.api_error[:80]}"
+        print(
+            f"  [v2 shadow] in={report.input_count} -> L1={report.l1_kept_count} "
+            f"-> L2={report.l2_unique_count} -> L4_pass={report.passed_count} "
+            f"| v2_net={report.routing.session_net:+.2f} "
+            f"vote={report.routing.vote_direction or 'none'} "
+            f"| emb={report.embedder_used}{extra} "
+            f"({report.elapsed_ms:.0f}ms)"
+        )
+        out: dict[str, dict] = {}
+        for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals):
+            g = str(dec.article.get("guid") or "")
+            if g:
+                out[g] = _v2_record_payload(ev, rsig)
+        return out
+    except Exception as exc:  # noqa: BLE001 — shadow must never impact v1
+        state["pipeline_v2_shadow_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        print(f"  [v2 shadow] failed (v1 unaffected): {type(exc).__name__}: {exc}")
+        return {}
+
+
+def _run_v2_live(
+    cfg: dict,
+    state: dict,
+    all_articles: list[dict],
+    guid_new: list[dict],
+    vote_out: str,
+    session_key: str,
+    now: datetime,
+) -> dict:
+    """Run 4-layer pipeline v2 as the primary W3 scorer (``rss_pipeline_v2: live``)."""
+    _ensure_repo_on_path()
+    from src.news.pipeline import (  # noqa: PLC0415
+        SignalRouter,
+        load_market_snapshot,
+        load_pipeline_config,
+        write_risk_off_signal,
+    )
+
+    mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
+    # v1's session EMA (±1.5, 2h) and v2's (+1.0/-0.85, 10h, 0.45 hysteresis)
+    # are different scales. Read the previous mode before this pass stamps
+    # it: only an already-live pass keeps session_net.
+    was_live = state.get("pipeline_v2_mode") == "live"
+    state["pipeline_v2_mode"] = "live"
+    state["last_fetched"] = len(all_articles)
+    state["last_new"] = len(guid_new)
+
+    if was_live:
+        prev_net = _session_net(state, session_key)
+    else:
+        prev_net = 0.0
+        state["session_net"] = 0.0
+        state["session_peak"] = 0.0
+        state["v2_active_vote"] = ""
+    active_vote = str(state.get("v2_active_vote") or "")
+
+    if not guid_new:
+        state["last_dup_stories"] = 0
+        if prev_net != 0.0 or active_vote:
+            p_cfg = load_pipeline_config(cfg.get("filter_config") or None)
+            router = SignalRouter(p_cfg)
+            routing = router.route_batch(
+                [],
+                prev_session_net=prev_net,
+                active_vote_direction=active_vote,
+                interval_minutes=float(cfg.get("interval_minutes", 30)),
+            )
+            state["session_key"] = session_key
+            state["session_net"] = routing.session_net
+            state["v2_active_vote"] = routing.vote_direction or ""
+            if not routing.vote_direction and withdraw_w3_vote(vote_out, session_key):
+                print(
+                    f"  VOTE WITHDRAWN: session net {routing.session_net:+.2f} "
+                    f"decayed below withdraw threshold -> removed W3 vote"
+                )
+        state["last_check"] = now.isoformat(timespec="seconds")
+        return state
+
+    pipe = _build_v2_pipeline(cfg, state)
+    market = load_market_snapshot(
+        cfg.get("signal_path") or "",
+        now=now,
+        max_file_age_s=pipe.config.router.market_snapshot_max_age_s,
+    )
+
+    report = pipe.run(
+        guid_new,
+        now=now,
+        prev_session_net=prev_net,
+        active_vote_direction=active_vote,
+        market=market,
+        emit_risk_off_enabled=bool(cfg.get("emit_risk_off")),
+        interval_minutes=float(cfg.get("interval_minutes", 30)),
+    )
+
+    _save_v2_clusters(_v2_cluster_state_path(cfg), pipe.dump_state())
+    state.pop("pipeline_v2_clusters", None)
+    state["pipeline_v2_last_stats"] = report.stats_dict()
+    state["last_dup_stories"] = report.l2_duplicate_count
+    state = mark_seen(state, report.safe_seen_guids)
+
+    api_error = report.api_error
+    if not api_error and report.l3_attempted > 0 and report.l3_succeeded == 0:
+        api_error = f"no usable v2 classification in {report.l3_attempted} Gemini response(s)"
+    if report.l3_attempted > 0:
+        record_scoring_result(state, now, api_error, skipped=report.l3_schema_failures)
+
+    net = report.routing.run_net
+    cum = report.routing.session_net
+    state["session_key"] = session_key
+    state["session_net"] = cum
+
+    peak = float(state.get("session_peak", 0.0))
+    if cum > 0 and cum > peak:
+        peak = cum
+    elif cum < 0 and cum < peak:
+        peak = cum
+    state["session_peak"] = peak
+
+    recent = list(state.get("recent_runs", []))
+    recent.append(net)
+    state["recent_runs"] = recent[-3:]
+
+    direction = report.routing.vote_direction
+    if not api_error or direction:
+        state["v2_active_vote"] = direction or ""
+
+    scored_compat = [
+        {"article": dec.article, "score": _v2_legacy_score_dict(ev, rsig)}
+        for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals)
+    ]
+
+    log_path = cfg.get("news_log_path")
+    if log_path and report.classified_items:
+        records = [
+            rss_news_log.build_record(
+                dec.article,
+                _v2_legacy_score_dict(ev, rsig),
+                scored_at=now,
+                session=session_key,
+                run_net=net,
+                session_net=cum,
+                run_scale=1.0,
+                v2=_v2_record_payload(ev, rsig),
+            )
+            for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals)
+        ]
+        if not rss_news_log.append(log_path, records):
+            print(f"  news history append failed: {log_path}")
+
+    if log_path and report.raw_outcomes:
+        raw_path = rss_news_log.default_raw_path(log_path)
+        raw_records = [
+            rss_news_log.build_raw_record(
+                item["article"],
+                scored_at=now,
+                session=session_key,
+                pipeline_stage=item["pipeline_stage"],
+                source_tier=item.get("source_tier", 3),
+                drop_reason=item.get("drop_reason", ""),
+                cluster_id=item.get("cluster_id", ""),
+                dup_method=item.get("dup_method", ""),
+                v2_action=item.get("v2_action", ""),
+                v2_category=item.get("v2_category", ""),
+                v2_direction=item.get("v2_direction", ""),
+                v2_materiality=item.get("v2_materiality", 0),
+            )
+            for item in report.raw_outcomes
+        ]
+        if not rss_news_log.append(raw_path, raw_records):
+            print(f"  raw news archive append failed: {raw_path}")
+
+    emb_note = f"emb={report.embedder_used}"
+    if report.embedder_fallback_reason:
+        emb_note += f" fb={report.embedder_fallback_reason[:60]}"
+    print(
+        f"  [v2 live] in={report.input_count} -> L1={report.l1_kept_count} "
+        f"-> L2={report.l2_unique_count} ({report.l2_duplicate_count} dups) "
+        f"-> L3={report.l3_succeeded}/{report.l3_attempted} -> L4_pass={report.passed_count} "
+        f"| run={net:+.2f}, session={cum:+.2f} -> vote: {direction or 'none'} "
+        f"| {emb_note} ({report.elapsed_ms:.0f}ms)"
+    )
+    if api_error:
+        print(f"  ⚠ Gemini API error: {api_error}")
+
+    vote_written = False
+    if direction and vote_out:
+        try:
+            write_regime_vote = _get_write_regime_vote()
+            write_regime_vote(vote_out, direction, session_key, source="W3")
+            vote_written = True
+            print(f"  VOTE WRITTEN: {direction} for {session_key} -> {vote_out}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  vote write failed: {type(e).__name__}: {e}")
+    elif not direction and not api_error and withdraw_w3_vote(vote_out, session_key):
+        print(f"  VOTE WITHDRAWN: session net {cum:+.2f} back under threshold -> removed W3 vote")
+
+    if (
+        cfg.get("emit_risk_off") is True
+        and cfg.get("signal_path")
+        and report.routing.risk_off_event is not None
+    ):
+        try:
+            payload = write_risk_off_signal(
+                cfg["signal_path"], report.routing.risk_off_event, now=now
+            )
+            print(f"  RISK_OFF WRITTEN: {payload['reason']} -> {cfg['signal_path']}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  risk_off write failed: {type(e).__name__}: {e}")
+
+    alert_note = None
+    if report.routing.discord_alerts:
+        top = report.routing.discord_alerts[0].event
+        alert_note = f"[{top.category} M{top.materiality} T{top.source_tier}] {top.summary_one_line}"
+
+    def post(note=None):
+        final_note = note or alert_note
+        return post_discord_embed(
+            cfg["discord_webhook_url"], direction, net, scored_compat,
+            session_net=cum, session_peak=peak,
+            recent_runs=state["recent_runs"], note=final_note,
+            api_error=api_error, total_fetched=len(guid_new),
+        )
+
+    if mode == "all":
+        post()
+    elif mode != "off":
+        notify_transitions(
+            state, mode, post, api_error=api_error,
+            vote_key=f"{session_key}:{direction}" if vote_written else "",
+        )
+
+    state["last_check"] = now.isoformat(timespec="seconds")
+    state["last_net_score"] = net
+    state["last_articles_scored"] = len(report.classified_items)
     return state
 
 
@@ -1382,6 +1824,7 @@ def main() -> int:
 
     vote_out = args.vote_out or settings.get("news", {}).get("regime_vote_path", "")
     state_path = args.state or cfg["state_file"]
+    cfg["state_file"] = state_path
     cfg["news_log_path"] = (args.news_log or cfg["news_log_file"]
                             or rss_news_log.default_path(state_path))
 
@@ -1435,7 +1878,8 @@ def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str,
     pause would otherwise skip the pass on Sat/Sun)."""
     with _run_recorder(Path(state_path).parent, "W3") as run:
         before = int(state.get("error_streak") or 0)
-        state = check_once(cfg, state, vote_out, now=now)
+        run_cfg = dict(cfg, state_file=state_path)
+        state = check_once(run_cfg, state, vote_out, now=now)
         save_state(state_path, state)
         run.exit_code = 0
         run.result = (f"fetched {state.get('last_fetched', '-')} | "

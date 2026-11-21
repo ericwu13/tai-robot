@@ -39,6 +39,8 @@ from urllib.parse import urlparse
 SCHEMA_VERSION = 1
 LOG_DIRNAME = "news"
 LOG_FILENAME = "news_log.jsonl"
+RAW_DIRNAME = "raw"
+RAW_FILENAME = "raw_news.jsonl"
 SUMMARY_MAX_CHARS = 300
 _MONTH_RE = re.compile(r"_(\d{6})$")
 
@@ -56,6 +58,18 @@ def default_path(state_file: str) -> str:
     """
     return os.path.join(os.path.dirname(os.path.abspath(state_file)),
                         LOG_DIRNAME, LOG_FILENAME)
+
+
+def default_raw_path(news_log_path: str) -> str:
+    """``<folder of news_log.jsonl>/raw/raw_news.jsonl``.
+
+    Keeps the complete append-only raw RSS archive (including Layer-1 dropped
+    and Layer-2 deduplicated articles) in a separate ``raw/`` subdirectory so
+    future re-backfills/audits never lose raw data while the Dashboard's
+    ``log_files(news_log_path)`` reads only clean v2 output.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(news_log_path)),
+                        RAW_DIRNAME, RAW_FILENAME)
 
 
 def clean_text(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
@@ -120,7 +134,8 @@ def build_record(article: dict, score: dict, *, scored_at: datetime,
                  session: str, run_net: float, session_net: float,
                  run_scale: float = 1.0,
                  shadow=NO_SHADOW, shadow_run_net: float | None = None,
-                 shadow_session_net: float | None = None) -> dict:
+                 shadow_session_net: float | None = None,
+                 v2: dict | None = None) -> dict:
     direction = str(score.get("direction", "neutral")).lower()
     try:
         confidence = round(max(0.0, min(1.0, float(score.get("confidence", 0)))), 3)
@@ -161,7 +176,64 @@ def build_record(article: dict, score: dict, *, scored_at: datetime,
         rec["shadow_session_net"] = (None if shadow_session_net is None
                                      else round(float(shadow_session_net), 4))
         record.update(rec)
+    if isinstance(v2, dict) and v2:
+        record["v2"] = v2
     return record
+
+
+def build_raw_record(
+    article: dict,
+    *,
+    scored_at: datetime,
+    session: str,
+    pipeline_stage: str,
+    source_tier: int = 3,
+    drop_reason: str = "",
+    cluster_id: str = "",
+    dup_method: str = "",
+    v2_action: str = "",
+    v2_category: str = "",
+    v2_direction: str = "",
+    v2_materiality: int = 0,
+) -> dict:
+    """Build one append-only raw RSS archive line (replay/backfill compatible).
+
+    Carries the standard ``scored_at`` / ``published_at`` / ``title`` / ``link``
+    / ``source`` / ``summary`` fields so ``replay_news_pipeline.py`` and
+    ``backfill_news_v2.py`` can ingest ``raw/raw_news.jsonl`` directly without
+    any format conversion.
+    """
+    rec: dict = {
+        "v": SCHEMA_VERSION,
+        "scored_at": _iso(scored_at),
+        "published_at": _iso(article.get("published_dt")),
+        "session": session,
+        "guid": str(article.get("guid") or "")[:240],
+        "source": article.get("source") or "",
+        "title": clean_text(article.get("title", ""), 300),
+        "link": safe_link(article.get("link", "")),
+        "summary": clean_text(article.get("summary", "")),
+        "source_tier": int(source_tier),
+        "pipeline_stage": str(pipeline_stage),
+    }
+    if drop_reason:
+        rec["drop_reason"] = str(drop_reason)[:120]
+    if cluster_id:
+        rec["cluster_id"] = str(cluster_id)[:80]
+    if dup_method:
+        rec["dup_method"] = str(dup_method)[:32]
+    if v2_action:
+        rec["v2_action"] = str(v2_action)
+    if v2_category:
+        rec["v2_category"] = str(v2_category)
+    if v2_direction:
+        rec["v2_direction"] = str(v2_direction)
+    if v2_materiality:
+        rec["v2_materiality"] = int(v2_materiality)
+    if "_v1_direction" in article:
+        rec["v1_direction"] = str(article.get("_v1_direction") or "neutral")
+        rec["v1_score"] = round(float(article.get("_v1_score") or 0.0), 3)
+    return rec
 
 
 def month_path(path: str, month: str) -> str:

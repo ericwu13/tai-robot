@@ -419,6 +419,17 @@ news:
                                   #   time and W2's market moves and scores only news not yet priced
                                   #   in; logged beside the live score (news log + state), never votes.
                                   #   Doubles Gemini calls. Research only.
+  # 4-layer news signal funnel (Filter -> Deduplicate -> Classify -> Route):
+  #   live   (default) — v2 owns W3 scoring, regime_vote_w3.json, and news_log records
+  #   shadow — runs v2 beside v1 without changing v1's vote/signal; logs v2
+  #            structured fields + stats to news_log / rss_scorer_state.json
+  #   off    — emergency 1-line rollback to legacy v1 scorer
+  rss_pipeline_v2: "live"
+  rss_filter_config: ""           # empty = bundled config/news_filter.yaml
+  rss_embedding_provider: ""      # empty = YAML default ("gemini"); or "lexical" | "none"
+  rss_emit_risk_off: false        # opt-in (strict boolean true): allow v2 live BEARISH
+                                  #   materiality >= 4 (Tier 1/2 + market confirm) to write
+                                  #   signal.json (risk_off, severity: high). Default false = vote-only.
   discord_webhook: ""             # Discord webhook URL for W2/W3 bridge alerts
 
 # ── Regime switching ───────────────────────────────────────────────────

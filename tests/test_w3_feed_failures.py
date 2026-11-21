@@ -99,6 +99,7 @@ def _cfg(tmp_path, feeds, **extra):
         "discord_mode": "off",
         "news_log_path": "",
         "state_file": str(state),
+        "pipeline_v2": "off",
     }
     cfg.update(extra)
     return cfg, str(state)
@@ -581,6 +582,7 @@ def test_guid_v2_at_cutoff_skips_legacy_and_stamps_once(monkeypatch, tmp_path):
         "gemini_api_key": "fake-key",
         "discord_webhook_url": "",
         "discord_mode": "off",
+        "pipeline_v2": "off",
     }
     state = rss_scorer.check_once(cfg, {"seen_guids": [link]}, "", now=_NOW)
     assert scored == [new_title]
