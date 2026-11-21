@@ -714,6 +714,17 @@ class TestRssScorerV2Integration:
         drivers = news_pulse.build_drivers(feed_out["items"], session_key, rss_scorer.EMA_DECAY)
         assert len(drivers["down"]) == 1
 
+        # Raw RSS archive preserves ALL 3 fetched articles (L1 drop + L2 dup + L3 classified)
+        raw_path = Path(rss_news_log.default_raw_path(str(log_path)))
+        raw_files = rss_news_log.log_files(str(raw_path))
+        assert len(raw_files) == 1
+        raw_rows = [json.loads(line) for line in Path(raw_files[0]).read_text(encoding="utf-8").splitlines()]
+        assert len(raw_rows) == 3
+        assert {r["pipeline_stage"] for r in raw_rows} == {"l1_dropped", "l2_duplicate", "l3_classified"}
+        # Directly replayable by replay_news_pipeline / backfill_news_v2
+        replayed = replay_news_pipeline.load_jsonl_batches(str(raw_path))
+        assert sum(len(a) for _, a in replayed) == 3
+
     def test_v2_live_zero_new_articles_still_decays_and_withdraws_vote(self, tmp_path):
         vote_base = tmp_path / "regime_vote.json"
         session_key = rss_scorer.night_session_key(_FIXED_NOW)
@@ -972,6 +983,14 @@ class TestRssScorerV2Integration:
             now=t2,
         )
         assert out["backup_dir"] and (Path(out["backup_dir"]) / "news_log_202611.jsonl").exists()
+        assert len(out["raw_files"]) == 1
+        raw_backfill_rows = [
+            json.loads(line)
+            for line in Path(out["raw_files"][0]).read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(raw_backfill_rows) == 4  # ALL 4 raw articles preserved with L1/L2/L3 fate + v1 scores
+        assert {r["pipeline_stage"] for r in raw_backfill_rows} == {"l1_dropped", "l2_duplicate", "l3_classified"}
+        assert all("v1_direction" in r and "v1_score" in r for r in raw_backfill_rows)
         assert out["state_updated"] is True
         assert Path(out["sidecar_path"]).exists()
 
@@ -981,7 +1000,9 @@ class TestRssScorerV2Integration:
         assert saved_state["v2_active_vote"] == "trending-down"
         assert "pipeline_v2_clusters" not in saved_state
 
-        # Dashboard pulse + feed + trend all read the backfilled v2 data cleanly!
+        # Dashboard pulse + feed + trend all read ONLY the clean backfilled v2 data (not raw/)
+        feed_after = news_feed.news_feed(str(log_base))
+        assert feed_after["total"] == 2
         pulse = news_pulse.pulse(
             t2,
             str(log_base),

@@ -106,15 +106,15 @@ RSS Fetch (13 default feeds)
 
 ### Steven 上線與 Dashboard 歷史資料回補步驟
 
-1. **直接啟用 Live**：部署後無需改動 Steven 現有 `settings.yaml`（`rss_pipeline_v2` 預設 `"live"`，既有 `rss_feeds: []` 與其他鍵均無覆蓋衝突）；下一輪排程起即以四層漏斗寫票並建立旁車檔 `rss_pipeline_v2_state.json`。
+1. **直接啟用 Live（完整保留原始新聞）**：部署後無需改動 Steven 現有 `settings.yaml`（`rss_pipeline_v2` 預設 `"live"`，既有 `rss_feeds: []` 與其他鍵均無覆蓋衝突）；下一輪排程起即以四層漏斗寫票、建立旁車檔 `rss_pipeline_v2_state.json`，並同步將 **100% 原始抓取文章**（含 Layer 1 攔截與 Layer 2 去重稿件及稽核原因）永久追加至 `<news_dir>/raw/raw_news_YYYYMM.jsonl`，不污染儀表板且隨時可供未來重播／回補。
 2. **歷史資料回補（讓 Dashboard 完整呈現 v2 歷史曲線與事件表）**：
    - 先免費預覽需要呼叫幾次 Gemini（不花額度、不改檔）：
      ```bash
      python scripts/news_bridge/backfill_news_v2.py --settings settings.yaml --dry-run
      ```
-   - 執行正式回補並同步更新 Dashboard 與 W3 狀態（自動先將舊 v1 日誌備份至 `backup_v1_<timestamp>/`，且內建 JSONL 快取支援中斷續跑）：
+   - 執行正式回補並同步更新 Dashboard 與 W3 狀態（自動將未修改的舊 v1 原檔移至 `backup_v1_<timestamp>/` 永久保留、並寫入統一原始歸檔 `raw/raw_news_YYYYMM.jsonl`，且內建 JSONL 快取支援中斷續跑）：
      ```bash
      python scripts/news_bridge/backfill_news_v2.py --settings settings.yaml --bots-dir data/live --in-place --update-state
      ```
 3. **一鍵回退（Rollback）**：
-   - 任何時候於 `settings.yaml` 設定 `news.rss_pipeline_v2: "off"` 即可立即切回 v1；`rss_scorer.py` 會自動更新 `pipeline_v2_mode: "off"` 並還原 Dashboard `±1.5` 顯示，歷史 v1 備份亦完整保留於 `backup_v1_*` 目錄。
+   - 任何時候於 `settings.yaml` 設定 `news.rss_pipeline_v2: "off"` 即可立即切回 v1；`rss_scorer.py` 會自動更新 `pipeline_v2_mode: "off"` 並還原 Dashboard `±1.5` 顯示，歷史 v1 備份與 `raw/` 原始歸檔皆完整保留。

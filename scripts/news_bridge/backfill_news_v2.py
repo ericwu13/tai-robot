@@ -276,6 +276,7 @@ class BackfillResult:
     api_errors: list[str] = field(default_factory=list)
     elapsed_s: float = 0.0
     records_by_month: dict[str, list[dict]] = field(default_factory=dict)
+    raw_records_by_month: dict[str, list[dict]] = field(default_factory=dict)
     final_session_state: dict[str, Any] = field(default_factory=dict)
     final_cluster_state: dict[str, Any] = field(default_factory=dict)
     sample_representatives: list[str] = field(default_factory=list)
@@ -404,8 +405,8 @@ def backfill_batches(
         last_run_net = run_net
         last_scored_count = len(report.classified_items)
 
+        month_key = batch_dt.astimezone(_TZ_TAIPEI).strftime("%Y%m")
         if report.classified_items:
-            month_key = batch_dt.astimezone(_TZ_TAIPEI).strftime("%Y%m")
             bucket = res.records_by_month.setdefault(month_key, [])
             for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals):
                 bucket.append(
@@ -418,6 +419,25 @@ def backfill_batches(
                         session_net=session_net,
                         run_scale=1.0,
                         v2=rss_scorer._v2_record_payload(ev, rsig),  # noqa: SLF001
+                    )
+                )
+        if report.raw_outcomes:
+            raw_bucket = res.raw_records_by_month.setdefault(month_key, [])
+            for item in report.raw_outcomes:
+                raw_bucket.append(
+                    rss_news_log.build_raw_record(
+                        item["article"],
+                        scored_at=batch_dt,
+                        session=session_key,
+                        pipeline_stage=item["pipeline_stage"],
+                        source_tier=item.get("source_tier", 3),
+                        drop_reason=item.get("drop_reason", ""),
+                        cluster_id=item.get("cluster_id", ""),
+                        dup_method=item.get("dup_method", ""),
+                        v2_action=item.get("v2_action", ""),
+                        v2_category=item.get("v2_category", ""),
+                        v2_direction=item.get("v2_direction", ""),
+                        v2_materiality=item.get("v2_materiality", 0),
                     )
                 )
 
@@ -460,15 +480,20 @@ def write_backfill_outputs(
     out_dir: str = "",
     state_file: str = "",
     update_state: bool = False,
+    write_raw_archive: bool = True,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Write backfilled monthly JSONL logs (with automatic v1 backup on in-place)
-    and optionally update ``rss_scorer_state.json`` + ``rss_pipeline_v2_state.json``.
+    """Write backfilled monthly JSONL logs (with automatic v1 backup on in-place),
+    seed the unified raw archive ``raw/raw_news_YYYYMM.jsonl`` (never overwriting
+    an existing raw archive), and optionally update ``rss_scorer_state.json`` +
+    ``rss_pipeline_v2_state.json``.
     """
     base_path = Path(target_log_base)
     dest_dir = base_path.parent if in_place else Path(out_dir or (str(base_path.parent) + "_v2_backfill"))
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem = base_path.stem or "news_log"
+    if stem == Path(rss_news_log.RAW_FILENAME).stem:
+        stem = Path(rss_news_log.LOG_FILENAME).stem
     suffix = base_path.suffix or ".jsonl"
 
     # 1. Write to staging files first so an error never leaves partial logs
@@ -497,6 +522,25 @@ def write_backfill_outputs(
         os.replace(tmp_p, final_p)
         written_files.append(str(final_p))
 
+    # 2. Seed unified raw archive (<dest_dir>/raw/raw_news_YYYYMM.jsonl) if not already
+    # reading directly from raw/ and not overwriting an existing raw file.
+    raw_files: list[str] = []
+    raw_dir = dest_dir / rss_news_log.RAW_DIRNAME
+    reading_from_raw = base_path.resolve().parent == raw_dir.resolve()
+    if write_raw_archive and result.raw_records_by_month and not reading_from_raw:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_stem = Path(rss_news_log.RAW_FILENAME).stem
+        for month in sorted(result.raw_records_by_month):
+            raw_final = raw_dir / f"{raw_stem}_{month}.jsonl"
+            if raw_final.exists():
+                continue  # never overwrite an existing raw archive
+            raw_tmp = raw_dir / f".{raw_stem}_{month}.jsonl.backfill.tmp"
+            with open(raw_tmp, "w", encoding="utf-8", newline="\n") as f:
+                for rec in result.raw_records_by_month[month]:
+                    f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+            os.replace(raw_tmp, raw_final)
+            raw_files.append(str(raw_final))
+
     state_updated = False
     sidecar_path = ""
     if update_state and state_file and result.final_session_state:
@@ -510,6 +554,7 @@ def write_backfill_outputs(
 
     return {
         "written_files": written_files,
+        "raw_files": raw_files,
         "backup_dir": backup_dir,
         "state_updated": state_updated,
         "sidecar_path": sidecar_path,
@@ -646,6 +691,8 @@ def main() -> int:
             update_state=args.update_state,
         )
         print(f"Written files ({len(out_info['written_files'])}): {', '.join(out_info['written_files'])}")
+        if out_info.get("raw_files"):
+            print(f"Preserved raw archive ({len(out_info['raw_files'])}): {', '.join(out_info['raw_files'])}")
         if out_info["backup_dir"]:
             print(f"Backed up v1 logs to: {out_info['backup_dir']}")
         if out_info["state_updated"]:

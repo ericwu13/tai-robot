@@ -53,12 +53,17 @@ affecting votes/signals:
   hysteresis (including decay/withdrawal on 0-article runs). Opt-in
   `news.rss_emit_risk_off: true` allows Tier 1/2 M4+ market-confirmed bearish
   shocks to write `signal.json` (`severity: "high"`).
+- **Raw RSS archive (always kept)**: live v2 passes append 100% of finalized
+  raw articles (including Layer-1 dropped and Layer-2 deduplicated items with
+  their audit stage/reason) to `<news_dir>/raw/raw_news_YYYYMM.jsonl` (never
+  mixed into Dashboard `news_log_YYYYMM.jsonl`, directly readable by
+  `replay_news_pipeline.py` and `backfill_news_v2.py`).
 - **Offline replay benchmark**:
   `python scripts/news_bridge/replay_news_pipeline.py --log <news_log.jsonl>`
   or `--xml tests/fixtures/news/*.xml`.
-- **Historical Dashboard backfill** (auto-backs up v1 logs into
-  `backup_v1_<ts>/`, resumable JSONL cache, optional `--bots-dir data/live`
-  for zero-look-ahead TXF/TMF confirmation):
+- **Historical Dashboard backfill** (preserves untouched v1 logs in
+  `backup_v1_<ts>/` and seeds `raw/raw_news_YYYYMM.jsonl`, resumable JSONL
+  cache, optional `--bots-dir data/live` for zero-look-ahead TXF/TMF confirm):
   `python scripts/news_bridge/backfill_news_v2.py --settings settings.yaml --dry-run`
   and `--bots-dir data/live --in-place --update-state`.
 

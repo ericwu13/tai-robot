@@ -96,6 +96,7 @@ class PipelineRunReport:
     l3_failure_reasons: list[str] = field(default_factory=list)
     attempted_guids: list[str] = field(default_factory=list)
     safe_seen_guids: list[str] = field(default_factory=list)
+    raw_outcomes: list[dict[str, Any]] = field(default_factory=list)
     bearish_vote_threshold: float = 0.85
     bullish_vote_threshold: float = 1.0
     vote_withdraw_threshold: float = 0.45
@@ -212,6 +213,7 @@ class NewsSignalPipeline:
 
         # Layer 3: Strict JSON classification (representatives only)
         classified_items: list[tuple[DedupDecision, ClassifiedEvent]] = []
+        l3_failed_items: list[tuple[DedupDecision, str]] = []
         l3_attempted = 0
         l3_schema_failures = 0
         l3_failure_reasons: list[str] = []
@@ -233,6 +235,7 @@ class NewsSignalPipeline:
                 attempted_guids.append(guid)
             if ev is None:
                 l3_schema_failures += 1
+                l3_failed_items.append((dec, err))
                 if len(l3_failure_reasons) < 10:
                     l3_failure_reasons.append(f"{dec.cluster_id}: {err}")
                 continue
@@ -268,18 +271,60 @@ class NewsSignalPipeline:
                 routed=rsig.passed,
             )
 
-        # GUIDs safe to mark seen: Layer 1 drops + Layer 2 non-LLM dups (excluding
-        # any cluster whose representative was aborted by an API error) + responded items.
+        # GUIDs safe to mark seen + per-article raw audit records (excludes any
+        # API-aborted articles that will be retried on the next pass).
         safe_seen_guids: list[str] = []
-        for art, _ in l1_dropped:
+        raw_outcomes: list[dict[str, Any]] = []
+        for art, pf in l1_dropped:
             g = str(art.get("guid") or "")
             if g:
                 safe_seen_guids.append(g)
+            raw_outcomes.append(
+                {
+                    "article": art,
+                    "pipeline_stage": "l1_dropped",
+                    "source_tier": pf.source_tier,
+                    "drop_reason": pf.drop_reason,
+                }
+            )
         for d in l2_dups:
             if not d.needs_llm and d.cluster_id not in unreached_cluster_ids:
                 g = str(d.article.get("guid") or "")
                 if g:
                     safe_seen_guids.append(g)
+                raw_outcomes.append(
+                    {
+                        "article": d.article,
+                        "pipeline_stage": "l2_duplicate",
+                        "source_tier": d.source_tier,
+                        "cluster_id": d.cluster_id,
+                        "dup_method": d.dup_method,
+                    }
+                )
+        for dec, err in l3_failed_items:
+            raw_outcomes.append(
+                {
+                    "article": dec.article,
+                    "pipeline_stage": "l3_schema_failed",
+                    "source_tier": dec.source_tier,
+                    "cluster_id": dec.cluster_id,
+                    "drop_reason": err,
+                }
+            )
+        for (dec, ev), rsig in zip(classified_items, routing.routed_signals):
+            raw_outcomes.append(
+                {
+                    "article": dec.article,
+                    "pipeline_stage": "l3_classified",
+                    "source_tier": ev.source_tier,
+                    "cluster_id": dec.cluster_id,
+                    "drop_reason": rsig.reject_reason,
+                    "v2_action": rsig.action,
+                    "v2_category": ev.category,
+                    "v2_direction": ev.direction,
+                    "v2_materiality": ev.materiality,
+                }
+            )
         safe_seen_guids.extend(attempted_guids)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -309,6 +354,7 @@ class NewsSignalPipeline:
             l3_failure_reasons=l3_failure_reasons,
             attempted_guids=attempted_guids,
             safe_seen_guids=safe_seen_guids,
+            raw_outcomes=raw_outcomes,
             bearish_vote_threshold=self.config.router.bearish_vote_threshold,
             bullish_vote_threshold=self.config.router.bullish_vote_threshold,
             vote_withdraw_threshold=self.config.router.vote_withdraw_threshold,

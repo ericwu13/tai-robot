@@ -1667,6 +1667,28 @@ def _run_v2_live(
         if not rss_news_log.append(log_path, records):
             print(f"  news history append failed: {log_path}")
 
+    if log_path and report.raw_outcomes:
+        raw_path = rss_news_log.default_raw_path(log_path)
+        raw_records = [
+            rss_news_log.build_raw_record(
+                item["article"],
+                scored_at=now,
+                session=session_key,
+                pipeline_stage=item["pipeline_stage"],
+                source_tier=item.get("source_tier", 3),
+                drop_reason=item.get("drop_reason", ""),
+                cluster_id=item.get("cluster_id", ""),
+                dup_method=item.get("dup_method", ""),
+                v2_action=item.get("v2_action", ""),
+                v2_category=item.get("v2_category", ""),
+                v2_direction=item.get("v2_direction", ""),
+                v2_materiality=item.get("v2_materiality", 0),
+            )
+            for item in report.raw_outcomes
+        ]
+        if not rss_news_log.append(raw_path, raw_records):
+            print(f"  raw news archive append failed: {raw_path}")
+
     emb_note = f"emb={report.embedder_used}"
     if report.embedder_fallback_reason:
         emb_note += f" fb={report.embedder_fallback_reason[:60]}"
