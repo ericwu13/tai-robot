@@ -1566,11 +1566,21 @@ def _run_v2_live(
     )
 
     mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
+    # v1's session EMA (±1.5, 2h) and v2's (+1.0/-0.85, 10h, 0.45 hysteresis)
+    # are different scales. Read the previous mode before this pass stamps
+    # it: only an already-live pass keeps session_net.
+    was_live = state.get("pipeline_v2_mode") == "live"
     state["pipeline_v2_mode"] = "live"
     state["last_fetched"] = len(all_articles)
     state["last_new"] = len(guid_new)
 
-    prev_net = _session_net(state, session_key)
+    if was_live:
+        prev_net = _session_net(state, session_key)
+    else:
+        prev_net = 0.0
+        state["session_net"] = 0.0
+        state["session_peak"] = 0.0
+        state["v2_active_vote"] = ""
     active_vote = str(state.get("v2_active_vote") or "")
 
     if not guid_new:

@@ -48,6 +48,7 @@ from src.news.pipeline import (  # noqa: E402
     ACTION_VOTE_BULLISH,
     ClassifiedEvent,
     ClassifierAPIError,
+    ema_decay_for,
     Embedder,
     GeminiEmbedder,
     GeminiEventClassifier,
@@ -629,6 +630,45 @@ class TestLayer4Router:
 
 # ── Phase 4/5 Integration: rss_scorer Feature Flag & Dashboard Parity ────
 
+# 1.2 sits under v1's ±1.5 vote line and over v2's +1.0 line. Carrying that
+# v1 EMA into the first live pass emits trending-up; 0.45 hysteresis can
+# then hold the unconfirmed vote through the 04:58 classify.
+_V1_CARRY_NET = 1.2
+
+
+def _v2_live_cfg(tmp_path) -> dict:
+    return {
+        "feeds": ["https://example.com/rss"],
+        "interval_minutes": 30,
+        "state_file": str(tmp_path / "state.json"),
+        "news_log_path": "",
+        "gemini_api_key": "fake-key",
+        "discord_webhook_url": "",
+        "discord_mode": "off",
+        "shadow_score": False,
+        "signal_path": "",
+        "pipeline_v2": "live",
+        "filter_config": "",
+        "emit_risk_off": False,
+        "embedding_provider": "lexical",
+        "rss_model": "",
+    }
+
+
+def _v1_carry_state(session_key: str, prior_mode: str | None) -> dict:
+    """Same-session v1 EMA left in the state file before the first v2 live pass."""
+    state = {
+        "seen_guids": [],
+        "session_key": session_key,
+        "session_net": _V1_CARRY_NET,
+        "session_peak": 1.5,
+        "v2_active_vote": "trending-up",
+    }
+    if prior_mode is not None:
+        state["pipeline_v2_mode"] = prior_mode
+    return state
+
+
 class TestRssScorerV2Integration:
     def test_pipeline_v2_mode_parser_defaults_live(self):
         assert rss_scorer.DEFAULT_PIPELINE_V2_MODE == "live"
@@ -769,6 +809,86 @@ class TestRssScorerV2Integration:
                 )
         assert abs(state["session_net"]) < 0.45
         assert state["v2_active_vote"] == ""
+        assert not (tmp_path / "regime_vote_w3.json").exists()
+
+    @pytest.mark.parametrize(
+        "prior_mode",
+        ["off", None, "shadow"],
+        ids=["off", "absent", "shadow"],
+    )
+    def test_first_v2_live_pass_ignores_v1_session_net_when_quiet(self, tmp_path, prior_mode):
+        vote_base = tmp_path / "regime_vote.json"
+        session_key = rss_scorer.night_session_key(_FIXED_NOW)
+        state = _v1_carry_state(session_key, prior_mode)
+        with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
+            state = rss_scorer.check_once(
+                _v2_live_cfg(tmp_path), state, str(vote_base), now=_FIXED_NOW,
+            )
+        assert state["pipeline_v2_mode"] == "live"
+        assert state["session_net"] == pytest.approx(0.0)
+        assert state["session_peak"] == pytest.approx(0.0)
+        assert state["v2_active_vote"] == ""
+        assert not (tmp_path / "regime_vote_w3.json").exists()
+
+    @pytest.mark.parametrize(
+        "prior_mode",
+        ["off", None],
+        ids=["off", "absent"],
+    )
+    def test_first_v2_live_pass_starts_ema_from_zero(self, tmp_path, prior_mode):
+        vote_base = tmp_path / "regime_vote.json"
+        session_key = rss_scorer.night_session_key(_FIXED_NOW)
+        art = _art(
+            "Exclusive-Nvidia's accounting is a focus of US SEC investigation",
+            source="Reuters",
+            guid="g_sec_handoff",
+        )
+        p_cfg = load_pipeline_config()
+        fake_clf = GeminiEventClassifier(
+            p_cfg, api_key="fake", transport=lambda _p: _valid_event_json(),
+        )
+        fake_pipe = NewsSignalPipeline(
+            p_cfg, embedder=LexicalFallbackEmbedder(64), classifier=fake_clf,
+        )
+        state = _v1_carry_state(session_key, prior_mode)
+        cfg = _v2_live_cfg(tmp_path)
+        with (
+            mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[art]),
+            mock.patch.object(rss_scorer, "_build_v2_pipeline", return_value=fake_pipe),
+        ):
+            state = rss_scorer.check_once(cfg, state, str(vote_base), now=_FIXED_NOW)
+
+        decay = ema_decay_for(p_cfg.router.ema_half_life_hours, cfg["interval_minutes"])
+        carried = round(_V1_CARRY_NET * decay + state["last_net_score"], 4)
+        assert state["last_net_score"] < 0
+        assert state["session_net"] == pytest.approx(state["last_net_score"])
+        assert state["session_net"] != pytest.approx(carried)
+        assert state["v2_active_vote"] == "trending-down"
+        vote = read_regime_vote(tmp_path / "regime_vote_w3.json", session_key)
+        assert vote is not None and vote.direction == "trending-down"
+
+    def test_v2_live_inherits_session_net_when_already_live(self, tmp_path):
+        vote_base = tmp_path / "regime_vote.json"
+        session_key = rss_scorer.night_session_key(_FIXED_NOW)
+        cfg = _v2_live_cfg(tmp_path)
+        state = {
+            "seen_guids": [],
+            "session_key": session_key,
+            "session_net": _V1_CARRY_NET,
+            "session_peak": 1.5,
+            "pipeline_v2_mode": "live",
+        }
+        with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
+            state = rss_scorer.check_once(cfg, state, str(vote_base), now=_FIXED_NOW)
+
+        router_cfg = load_pipeline_config().router
+        decay = ema_decay_for(router_cfg.ema_half_life_hours, cfg["interval_minutes"])
+        expected = round(_V1_CARRY_NET * decay, 4)
+        assert expected >= router_cfg.bullish_vote_threshold
+        assert state["session_net"] == pytest.approx(expected)
+        assert state["session_peak"] == pytest.approx(1.5)
+        assert state["v2_active_vote"] == "trending-up"
+        # A quiet pass updates the held direction; it does not write the vote file.
         assert not (tmp_path / "regime_vote_w3.json").exists()
 
     def test_dashboard_news_pulse_uses_v2_live_thresholds_and_hysteresis(self):
