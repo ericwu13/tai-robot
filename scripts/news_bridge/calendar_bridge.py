@@ -195,18 +195,19 @@ def publish(
     _ensure_repo_on_path()
     from src.news.calendar_fetchers import (  # noqa: PLC0415
         build_calendar_events,
-        default_http_get,
         load_calendar_config,
     )
 
     cfg = load_calendar_config(config_path)
     prev_state = _load_state(state_path)
+    # None keeps each source's default: urllib for FOMC/BLS/BEA, curl_cffi
+    # for Nasdaq. An injected http_get still covers every source.
     fetch_res = build_calendar_events(
         cfg,
         now=moment_tpe,
         manual_events=manual_events,
         prev_cached_by_source=prev_state.get("cached_by_source"),
-        http_get=http_get or default_http_get,
+        http_get=http_get,
     )
 
     upcoming_n, upcoming_high_n = _count_upcoming(fetch_res.events, today_iso)
@@ -261,7 +262,15 @@ def publish(
 
     status_note = ""
     if fetch_res.status == "degraded":
-        status_note = f" [degraded: failed={','.join(fetch_res.sources_failed)}]"
+        failed = ",".join(fetch_res.sources_failed)
+        # err_brief is the per-source detail (HTTP status included). The
+        # all-failed branch above already prints it; degraded used to name
+        # only the source.
+        status_note = (
+            f" [degraded: failed={failed}; {err_brief}]"
+            if err_brief
+            else f" [degraded: failed={failed}]"
+        )
     result = (
         f"wrote {len(fetch_res.events)} event(s) "
         f"({upcoming_n} upcoming, {upcoming_high_n} high){status_note}"
