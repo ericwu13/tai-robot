@@ -21,12 +21,12 @@ back under it removes the vote for the session just scored (a
 time + W2 market moves, "not yet priced in"), logged beside the live score;
 it never votes.
 
-### W3 Pipeline v2 (4-layer funnel, Feature Flag `news.rss_pipeline_v2`)
+### W3 Pipeline v2 (4-layer funnel, default `live`)
 
-`news.rss_pipeline_v2` defaults to `"off"` (100% legacy v1 behavior) and
-supports `"shadow"` (parallel evaluation logged in `news_log_YYYYMM.jsonl`
-under the additive `v2` key without touching votes/signals) and `"live"`
-(4-layer funnel drives `regime_vote_w3.json`):
+`news.rss_pipeline_v2` defaults to `"live"` (4-layer funnel owns W3 scoring,
+`regime_vote_w3.json`, and `news_log_YYYYMM.jsonl`). Setting `"off"` gives an
+instant 1-line rollback to legacy v1, and `"shadow"` runs v2 beside v1 without
+affecting votes/signals:
 
 - **Layer 1 (`src/news/pipeline/prefilter.py`)** — URL canonicalization,
   multi-pass media prefix/suffix stripping, source tiering (Tier 1/2/3), and
@@ -56,6 +56,11 @@ under the additive `v2` key without touching votes/signals) and `"live"`
 - **Offline replay benchmark**:
   `python scripts/news_bridge/replay_news_pipeline.py --log <news_log.jsonl>`
   or `--xml tests/fixtures/news/*.xml`.
+- **Historical Dashboard backfill** (auto-backs up v1 logs into
+  `backup_v1_<ts>/`, resumable JSONL cache, optional `--bots-dir data/live`
+  for zero-look-ahead TXF/TMF confirmation):
+  `python scripts/news_bridge/backfill_news_v2.py --settings settings.yaml --dry-run`
+  and `--bots-dir data/live --in-place --update-state`.
 
 (W5 is the human-confirmation tap: a Discord link opens the n8n webhook,
 which fires a *signal*, not a vote.  It was historically numbered "W4" —

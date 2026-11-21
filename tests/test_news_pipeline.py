@@ -34,6 +34,7 @@ _BRIDGE_DIR = str(Path(__file__).resolve().parents[1] / "scripts" / "news_bridge
 if _BRIDGE_DIR not in sys.path:
     sys.path.insert(0, _BRIDGE_DIR)
 
+import backfill_news_v2  # noqa: E402
 import replay_news_pipeline  # noqa: E402
 import rss_news_log  # noqa: E402
 import rss_scorer  # noqa: E402
@@ -629,12 +630,16 @@ class TestLayer4Router:
 # ── Phase 4/5 Integration: rss_scorer Feature Flag & Dashboard Parity ────
 
 class TestRssScorerV2Integration:
-    def test_pipeline_v2_mode_parser_defaults_off(self):
-        assert rss_scorer.pipeline_v2_mode(None) == "off"
-        assert rss_scorer.pipeline_v2_mode(False) == "off"
+    def test_pipeline_v2_mode_parser_defaults_live(self):
+        assert rss_scorer.DEFAULT_PIPELINE_V2_MODE == "live"
+        assert rss_scorer.pipeline_v2_mode(None) == "live"
+        assert rss_scorer.pipeline_v2_mode("") == "live"
+        assert rss_scorer.pipeline_v2_mode("bogus") == "live"
         assert rss_scorer.pipeline_v2_mode(True) == "live"
         assert rss_scorer.pipeline_v2_mode("shadow") == "shadow"
-        assert rss_scorer.pipeline_v2_mode("bogus") == "off"
+        assert rss_scorer.pipeline_v2_mode(False) == "off"
+        assert rss_scorer.pipeline_v2_mode("off") == "off"
+        assert rss_scorer.get_news_config({})["pipeline_v2"] == "live"
 
     def test_live_mode_end_to_end_vote_log_and_dashboard_compat(self, tmp_path):
         vote_base = tmp_path / "regime_vote.json"
@@ -868,3 +873,146 @@ class TestRssScorerV2Integration:
         assert summary["llm_savings_rate_pct"] >= 65.0
         text = replay_news_pipeline.format_report(summary)
         assert "Offline Replay Report" in text
+
+    def test_backfill_end_to_end_in_place_backup_cache_state_and_dashboard_parity(self, tmp_path):
+        bridge_dir = tmp_path / "bridge"
+        news_dir = bridge_dir / "news"
+        news_dir.mkdir(parents=True)
+        log_base = news_dir / "news_log.jsonl"
+        old_month = news_dir / "news_log_202611.jsonl"
+        state_file = bridge_dir / "rss_scorer_state.json"
+        state_file.write_text(
+            json.dumps({"seen_guids": ["existing_guid"], "fetch_status": "ok"}),
+            encoding="utf-8",
+        )
+
+        t1 = datetime(2026, 11, 20, 18, 0, 0, tzinfo=_TZ_TPE)
+        t2 = datetime(2026, 11, 20, 19, 30, 0, tzinfo=_TZ_TPE)  # +90 min same session
+        session_key = rss_scorer.night_session_key(t1)
+        old_rows = [
+            rss_news_log.build_record(
+                _art("【台股開盤】跌76.69點", source="Yahoo股市 - 最新新聞", link="https://ex.com/recap", published_dt=t1),
+                {"direction": "bearish", "confidence": 0.9, "reason": "v1 noise"},
+                scored_at=t1, session=session_key, run_net=-0.5, session_net=-0.5,
+            ),
+            rss_news_log.build_record(
+                _art("Exclusive-Nvidia's accounting is a focus of US SEC investigation", source="Reuters", link="https://reuters.com/nvda-sec", published_dt=t1),
+                {"direction": "bearish", "confidence": 0.9, "reason": "v1"},
+                scored_at=t1, session=session_key, run_net=-1.0, session_net=-1.0,
+            ),
+            rss_news_log.build_record(
+                _art("Exclusive-Nvidia's accounting is a focus of US SEC investigation", source="Bloomberg Markets", link="https://bloomberg.com/nvda-sec", published_dt=t1),
+                {"direction": "bearish", "confidence": 0.9, "reason": "v1 dup"},
+                scored_at=t1, session=session_key, run_net=-1.5, session_net=-1.5,
+            ),
+            rss_news_log.build_record(
+                _art("TSMC raises 2nm CoWoS capacity guidance for 2027", source="Bloomberg Markets", link="https://bloomberg.com/tsmc-2nm", published_dt=t2),
+                {"direction": "bullish", "confidence": 0.8, "reason": "v1"},
+                scored_at=t2, session=session_key, run_net=0.4, session_net=-0.8,
+            ),
+        ]
+        old_month.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in old_rows) + "\n",
+            encoding="utf-8",
+        )
+
+        p_cfg = load_pipeline_config()
+        calls = {"n": 0}
+
+        def fake_transport(prompt: str) -> str:
+            calls["n"] += 1
+            if "2nm CoWoS" in prompt:
+                return _valid_event_json(
+                    category="AI_SUPPLY_CHAIN",
+                    direction="BULLISH",
+                    materiality=4,
+                    summary_one_line="TSMC raises 2nm CoWoS capacity guidance.",
+                )
+            return _valid_event_json()
+
+        cache_path = tmp_path / "backfill_cache.jsonl"
+        batches = replay_news_pipeline.load_jsonl_batches(str(log_base))
+        assert len(batches) == 2
+
+        clf1 = backfill_news_v2.CachedClassifier(
+            GeminiEventClassifier(p_cfg, api_key="fake", transport=fake_transport),
+            backfill_news_v2.ClassificationCache(cache_path),
+            pace_s=0.0,
+        )
+        pipe1 = NewsSignalPipeline(p_cfg, embedder=LexicalFallbackEmbedder(64), classifier=clf1)
+        res1 = backfill_news_v2.backfill_batches(batches, pipeline=pipe1, progress_every=0)
+
+        # L1 drops recap, L2 dedups duplicate SEC headline -> only 2 LLM calls for 4 rows!
+        assert res1.input_articles == 4
+        assert res1.l1_dropped == 1
+        assert res1.l2_duplicates == 1
+        assert res1.api_calls == 2
+        assert calls["n"] == 2
+        assert res1.l4_passed == 1  # SEC bearish M5 passed; TSMC bullish M4 rejected by asymmetric gate
+        assert res1.votes_down == 2  # held by 10h EMA + hysteresis across +90m!
+
+        # Re-run with same cache -> 0 new Gemini calls!
+        clf2 = backfill_news_v2.CachedClassifier(
+            GeminiEventClassifier(p_cfg, api_key="fake", transport=fake_transport),
+            backfill_news_v2.ClassificationCache(cache_path),
+            pace_s=0.0,
+        )
+        pipe2 = NewsSignalPipeline(p_cfg, embedder=LexicalFallbackEmbedder(64), classifier=clf2)
+        res2 = backfill_news_v2.backfill_batches(batches, pipeline=pipe2, progress_every=0)
+        assert res2.api_calls == 0
+        assert res2.cache_hits == 2
+
+        # Write in-place with v1 backup + state/sidecar sync
+        out = backfill_news_v2.write_backfill_outputs(
+            res1,
+            target_log_base=str(log_base),
+            in_place=True,
+            state_file=str(state_file),
+            update_state=True,
+            now=t2,
+        )
+        assert out["backup_dir"] and (Path(out["backup_dir"]) / "news_log_202611.jsonl").exists()
+        assert out["state_updated"] is True
+        assert Path(out["sidecar_path"]).exists()
+
+        saved_state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert "existing_guid" in saved_state["seen_guids"]  # preserved!
+        assert saved_state["pipeline_v2_mode"] == "live"
+        assert saved_state["v2_active_vote"] == "trending-down"
+        assert "pipeline_v2_clusters" not in saved_state
+
+        # Dashboard pulse + feed + trend all read the backfilled v2 data cleanly!
+        pulse = news_pulse.pulse(
+            t2,
+            str(log_base),
+            {"rss_state_file": str(state_file)},
+            lambda p: json.loads(Path(p).read_text(encoding="utf-8")) if Path(p).is_file() else None,
+        )
+        assert pulse["threshold"] == pytest.approx(0.85)
+        assert pulse["w3"]["direction"] == "trending-down"
+        assert len(pulse["drivers"]["down"]) == 1
+        # Unclipped v2 driver contribution (materiality 5 -> score -1.0, decayed 1 run at 10h half-life)
+        assert pulse["drivers"]["down"][0]["contribution"] < -0.90
+        runs = news_trend.read_runs(str(log_base))
+        assert len(runs) == 2
+
+    def test_backfill_historical_market_provider_zero_lookahead(self):
+        # Two 30-min candles: 18:00-18:30 (+1.0%) and 18:30-19:00 (-5.0% crash)
+        t_c1 = int(datetime(2026, 11, 20, 18, 0, tzinfo=timezone.utc).timestamp())
+        t_c2 = int(datetime(2026, 11, 20, 18, 30, tzinfo=timezone.utc).timestamp())
+        provider = backfill_news_v2.HistoricalMarketProvider(
+            candles=[
+                {"time": t_c1, "open": 20000.0, "high": 20250.0, "low": 20000.0, "close": 20200.0},
+                {"time": t_c2, "open": 20200.0, "high": 20200.0, "low": 19000.0, "close": 19000.0},
+            ],
+            symbol="TX00",
+            interval_s=1800,
+        )
+        # At 18:45 TPE, candle 2 (ending 19:00) is NOT completed yet -> must use candle 1 only!
+        snap = provider.snapshot_at(datetime(2026, 11, 20, 18, 45, tzinfo=_TZ_TPE))
+        assert snap is not None
+        assert snap.skcom_bar_pct == pytest.approx(1.0)
+        # At 19:00 TPE, candle 2 IS completed -> sees the -5.0% drop
+        snap2 = provider.snapshot_at(datetime(2026, 11, 20, 19, 0, tzinfo=_TZ_TPE))
+        assert snap2 is not None
+        assert snap2.skcom_bar_pct == pytest.approx(-5.0)

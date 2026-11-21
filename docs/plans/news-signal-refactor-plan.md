@@ -93,26 +93,28 @@ RSS Fetch (13 default feeds)
 
 ---
 
-## 5. 上線步驟、設定與一鍵回退（Rollout）
+## 5. 上線步驟、歷史回補與一鍵回退（Rollout）
 
 ### 新增設定鍵（均位於 `settings.yaml` 的 `news:` 區塊）
 
 | 設定鍵 | 預設值 | 說明 |
 |---|---|---|
-| `news.rss_pipeline_v2` | `"off"` | `"off"`（完全沿用 v1）/ `"shadow"`（平行紀錄不改寫投票）/ `"live"`（正式啟用四層漏斗） |
+| `news.rss_pipeline_v2` | `"live"` | `"live"`（預設，直接啟用四層漏斗）/ `"shadow"`（平行紀錄不改寫投票）/ `"off"`（緊急一鍵退回 v1） |
 | `news.rss_filter_config` | `""` | 覆寫過濾設定檔路徑；留空則載入 repo 內 `config/news_filter.yaml` |
 | `news.rss_embedding_provider` | `""` | 覆寫 Layer 2 向量來源（`gemini` / `lexical` / `none`）；留空依 YAML 預設 `gemini`（自動降級 `lexical`） |
-| `news.rss_emit_risk_off` | `false` | 明確 opt-in 才允許高衝擊利空（Tier 1/2 M4+ 且通過市場確認）寫入 `signal.json`；預設維持投票制 |
+| `news.rss_emit_risk_off` | `false` | 明確 opt-in 才允許高衝擊利空（Tier 1/2 M4+ 且通過市場確認）寫入 `signal.json`（`severity: "high"`）；預設維持投票制 |
 
-### 分階段上線檢查表（Steven 主機）
+### Steven 上線與 Dashboard 歷史資料回補步驟
 
-1. **預設部署（`off`）**：部署程式碼後不修改 `settings.yaml`，W3 維持 100% 既有 v1 行為；現有 `rss_feeds: []` 與其他設定鍵均不覆蓋新預設。
-2. **階段一 — Shadow 觀察（建議 3–5 個交易日）**：
-   - 於 `settings.yaml` 設定 `news.rss_pipeline_v2: "shadow"`（不啟用 `rss_emit_risk_off`）。
-   - 觀察 `task_W3-rss.last.log` 的 `[v2 shadow]` 指標（確認 `emb=gemini:gemini-embedding-001` 無持續 fallback、無 API 錯誤、單次總耗時遠低於排程 25 分鐘上限）。
-   - 核對 `news_log_YYYYMM.jsonl` 新增的 `v2` 欄位，比對 v1 與 v2 在重大事件日的投票準確率與雜訊削減量。
-3. **階段二 — Live 切換**：
-   - 確認 shadow 表現達標後，改為 `news.rss_pipeline_v2: "live"`。
-   - 確認 Dashboard 新聞訊號頁自動切換至 v2 門檻（`-0.85` / `+1.00`）且橋接目錄產生 `rss_pipeline_v2_state.json`。
-4. **一鍵回退（Rollback）**：
-   - 任何時候改回 `news.rss_pipeline_v2: "off"` 即可立即切回 v1；`rss_scorer.py` 會自動更新 `pipeline_v2_mode: "off"` 並還原 Dashboard `±1.5` 顯示，無需刪除任何歷史日誌或狀態檔。
+1. **直接啟用 Live**：部署後無需改動 Steven 現有 `settings.yaml`（`rss_pipeline_v2` 預設 `"live"`，既有 `rss_feeds: []` 與其他鍵均無覆蓋衝突）；下一輪排程起即以四層漏斗寫票並建立旁車檔 `rss_pipeline_v2_state.json`。
+2. **歷史資料回補（讓 Dashboard 完整呈現 v2 歷史曲線與事件表）**：
+   - 先免費預覽需要呼叫幾次 Gemini（不花額度、不改檔）：
+     ```bash
+     python scripts/news_bridge/backfill_news_v2.py --settings settings.yaml --dry-run
+     ```
+   - 執行正式回補並同步更新 Dashboard 與 W3 狀態（自動先將舊 v1 日誌備份至 `backup_v1_<timestamp>/`，且內建 JSONL 快取支援中斷續跑）：
+     ```bash
+     python scripts/news_bridge/backfill_news_v2.py --settings settings.yaml --bots-dir data/live --in-place --update-state
+     ```
+3. **一鍵回退（Rollback）**：
+   - 任何時候於 `settings.yaml` 設定 `news.rss_pipeline_v2: "off"` 即可立即切回 v1；`rss_scorer.py` 會自動更新 `pipeline_v2_mode: "off"` 並還原 Dashboard `±1.5` 顯示，歷史 v1 備份亦完整保留於 `backup_v1_*` 目錄。

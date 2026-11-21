@@ -40,4 +40,4 @@
 
 - **外部化設定**：所有門檻、Regex 規則、白名單、實體表與來源權重一律集中於 [config/news_filter.yaml](config/news_filter.yaml)，禁止寫死於業務邏輯。
 - **零重型依賴**：管線維持純 Python stdlib + `pyyaml`，相容 Steven CPU 短命 `--once` 排程與既有儀表板（`scripts/dashboard/news_*.py`）與監控腳本（`scripts/monitor/check_bridge.py`）。
-- **向後相容與一鍵回退**：透過 `settings.yaml` 的 `news.rss_pipeline_v2: "off" | "shadow" | "live"`（預設 `"off"`）控制切換，隨時可一鍵退回 v1。詳見 [docs/plans/news-signal-refactor-plan.md](docs/plans/news-signal-refactor-plan.md)。
+- **預設啟用與一鍵回退**：`settings.yaml` 的 `news.rss_pipeline_v2` 預設為 `"live"`（正式啟用四層漏斗），保留 `"off"`（緊急一鍵退回 v1）與 `"shadow"` 模式；既有歷史日誌可透過 [backfill_news_v2.py](scripts/news_bridge/backfill_news_v2.py) 重建以對齊儀表板顯示。詳見 [docs/plans/news-signal-refactor-plan.md](docs/plans/news-signal-refactor-plan.md)。

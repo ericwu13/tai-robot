@@ -99,6 +99,7 @@ class PipelineRunReport:
     bearish_vote_threshold: float = 0.85
     bullish_vote_threshold: float = 1.0
     vote_withdraw_threshold: float = 0.45
+    ema_half_life_hours: float = 10.0
 
     @property
     def passed_count(self) -> int:
@@ -131,6 +132,7 @@ class PipelineRunReport:
             "bearish_vote_threshold": self.bearish_vote_threshold,
             "bullish_vote_threshold": self.bullish_vote_threshold,
             "vote_withdraw_threshold": self.vote_withdraw_threshold,
+            "ema_half_life_hours": self.ema_half_life_hours,
         }
 
 
@@ -310,6 +312,7 @@ class NewsSignalPipeline:
             bearish_vote_threshold=self.config.router.bearish_vote_threshold,
             bullish_vote_threshold=self.config.router.bullish_vote_threshold,
             vote_withdraw_threshold=self.config.router.vote_withdraw_threshold,
+            ema_half_life_hours=self.config.router.ema_half_life_hours,
         )
 
 

@@ -45,13 +45,15 @@ def _num(value, default=0.0) -> float:
 
 # ── drivers: what is holding tonight's net up ────────────────────────────
 
-def build_drivers(items: list[dict], session: str, decay: float) -> dict:
+def build_drivers(items: list[dict], session: str, decay: float,
+                  *, clip_scores: bool = True) -> dict:
     """Each article's share of the session EMA today.
 
     The scorer does ``net = prev * decay + Σ clip(article) * run_scale``
     once per scoring run, so an article scored k runs ago now contributes
-    ``clip(score) * run_scale * decay**k``.  Runs that logged nothing (all Gemini
-    calls failed) still decayed the EMA, so the sum is approximate.
+    ``clip(score) * run_scale * decay**k`` (or unclipped ``score * decay**k``
+    for Pipeline v2 live rows).  Runs that logged nothing still decayed the
+    EMA, so the sum is approximate.
     """
     rows = [r for r in items if r["session"] == session and r["direction"] != "neutral"]
     order = sorted({r["scored_at"] for r in items if r["session"] == session})
@@ -59,11 +61,11 @@ def build_drivers(items: list[dict], session: str, decay: float) -> dict:
     out = []
     for r in rows:
         weight = decay ** later.get(r["scored_at"], 0)
+        base = clip(r["score"]) * r.get("run_scale", 1.0) if clip_scores else float(r["score"])
         out.append({"title": r["title"], "link": r["link"], "source": r["source"],
                     "scored_at": r["scored_at"], "score": r["score"],
                     "reason": r["reason"], "weight": round(weight, 3),
-                    "contribution": round(clip(r["score"]) * r.get("run_scale", 1.0)
-                                          * weight, 3)})
+                    "contribution": round(base * weight, 3)})
     up = sorted((d for d in out if d["contribution"] > 0),
                 key=lambda d: -d["contribution"])
     down = sorted((d for d in out if d["contribution"] < 0),
@@ -84,6 +86,14 @@ def _v2_thresholds(state: dict) -> tuple[float, float]:
     bear = _num(stats.get("bearish_vote_threshold"), 0.85) or 0.85
     bull = _num(stats.get("bullish_vote_threshold"), 1.0) or 1.0
     return bear, bull
+
+
+def _v2_decay(state: dict) -> float:
+    import math
+    stats = state.get("pipeline_v2_last_stats")
+    stats = stats if isinstance(stats, dict) else {}
+    hl = _num(stats.get("ema_half_life_hours"), 10.0) or 10.0
+    return math.exp(-math.log(2) * 0.5 / max(0.25, hl))
 
 
 def w3_state(state: dict | None, now: datetime, tonight_session: str,
@@ -207,9 +217,11 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
     state = read_json(paths["rss_state_file"]) if paths.get("rss_state_file") else None
     tonight, votes = _votes(now, paths, read_json) if paths else ("", [])
     w3 = w3_state(state, now, session, threshold, erosion)
-    if isinstance(state, dict) and state.get("pipeline_v2_mode") == "live":
+    v2_live = isinstance(state, dict) and state.get("pipeline_v2_mode") == "live"
+    if v2_live:
         bear_th, bull_th = _v2_thresholds(state)
         threshold = bear_th if w3.get("session_net", 0.0) < 0 else bull_th
+        decay = _v2_decay(state)
     return {
         "available": bool(news_paths) or bool(news_log_path),
         "now": now.isoformat(timespec="seconds"),
@@ -221,7 +233,7 @@ def pulse(now: datetime, news_log_path: str | None, news_paths: dict | None,
         "tonight": tonight,
         "votes": votes,
         "events": _events(now, paths.get("events_path", ""), read_json),
-        "drivers": build_drivers(items, session, decay),
+        "drivers": build_drivers(items, session, decay, clip_scores=not v2_live),
         "w2": bridge_panels.crossmarket(now, paths, read_json),
         "w4": bridge_panels.chips(now, paths, read_json),
     }

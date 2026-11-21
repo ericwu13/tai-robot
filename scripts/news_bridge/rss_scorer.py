@@ -205,18 +205,21 @@ def load_settings(path: str) -> dict:
 
 
 PIPELINE_V2_MODES = ("off", "shadow", "live")
-DEFAULT_PIPELINE_V2_MODE = "off"
+DEFAULT_PIPELINE_V2_MODE = "live"
 
 
 def pipeline_v2_mode(value) -> str:
     """``news.rss_pipeline_v2`` → one of PIPELINE_V2_MODES (unknown → default).
 
     YAML reads bare ``off``/``false`` as False and ``on``/``true`` as True.
+    An omitted/empty key uses ``DEFAULT_PIPELINE_V2_MODE`` (``"live"``).
     """
     if value is True:
         return "live"
-    if value is False or value is None:
+    if value is False:
         return "off"
+    if value is None:
+        return DEFAULT_PIPELINE_V2_MODE
     text = str(value).strip().lower()
     if not text:
         return DEFAULT_PIPELINE_V2_MODE

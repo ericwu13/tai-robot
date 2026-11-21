@@ -124,7 +124,8 @@ def test_append_never_raises(tmp_path):
 def _cfg(log_path):
     return {"feeds": ["https://example.com/rss"], "interval_minutes": 30,
             "state_file": "data/state.json", "gemini_api_key": "k",
-            "discord_webhook_url": "", "news_log_path": log_path}
+            "discord_webhook_url": "", "news_log_path": log_path,
+            "pipeline_v2": "off"}
 
 
 @patch("rss_scorer.fetch_all_feeds")

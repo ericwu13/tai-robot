@@ -116,7 +116,8 @@ def test_story_remembered_only_once_scored_and_for_ttl():
 def _cfg(tmp_path):
     return {"feeds": ["https://example.com/rss"], "interval_minutes": 30,
             "state_file": str(tmp_path / "state.json"), "gemini_api_key": "k",
-            "discord_webhook_url": "", "news_log_path": str(tmp_path / "news_log.jsonl")}
+            "discord_webhook_url": "", "news_log_path": str(tmp_path / "news_log.jsonl"),
+            "pipeline_v2": "off"}
 
 
 @patch("rss_scorer.fetch_all_feeds")
