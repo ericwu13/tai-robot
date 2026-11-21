@@ -29,6 +29,34 @@ sys.path.insert(0, SPECPATH)
 from build_release import prepare_capital_sdk_binaries, strategies_datas
 _strategies_datas = strategies_datas(SPECPATH)
 
+def _curl_cffi_native_libs():
+    """Bundle delvewheel's sibling ``curl_cffi.libs`` (libcurl-impersonate).
+
+    pyinstaller-hooks-contrib has no curl_cffi hook. ``collect_dynamic_libs``
+    only searches inside the package, and the Windows wheel's DLL lives in
+    ``curl_cffi.libs`` next to it. Linux wheels have no such directory; the
+    extension module is collected via the ``curl_cffi`` hiddenimport.
+    """
+    try:
+        import curl_cffi
+    except ImportError as exc:
+        raise SystemExit(
+            "curl_cffi is required to build tai_backtest (pip install -e .)"
+        ) from exc
+    libs_dir = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(curl_cffi.__file__)),
+        os.pardir,
+        "curl_cffi.libs",
+    ))
+    if not os.path.isdir(libs_dir):
+        return []
+    return [
+        (os.path.join(libs_dir, name), "curl_cffi.libs")
+        for name in sorted(os.listdir(libs_dir))
+        if name.lower().endswith((".dll", ".so", ".dylib"))
+    ]
+
+
 # Broker DLLs. Missing or empty SKCOM.dll / CTSecuritiesATL.dll fails
 # the build (exit 1) instead of shipping an empty _internal/libs.
 # project_root=SPECPATH resolves a relative TAI_CAPITAL_SDK_DIR against
@@ -37,6 +65,7 @@ _strategies_datas = strategies_datas(SPECPATH)
 # relative libs path, so a present SDK bundles the same *.dll files.
 # Opt out only with TAI_ALLOW_MISSING_CAPITAL_SDK=1.
 dll_binaries = prepare_capital_sdk_binaries(project_root=SPECPATH)
+dll_binaries += _curl_cffi_native_libs()
 
 a = Analysis(
     ['run_backtest.py'],
@@ -53,6 +82,9 @@ a = Analysis(
         # GUI / core
         'lightweight_charts', 'pandas', 'yaml', 'tkinter',
         'httpx', 'httpcore', 'h11', 'certifi', 'anyio', 'sniffio',
+        # Nasdaq calendar fetch. Lazy import, so analysis will not see it.
+        # The Windows libcurl DLL is added to dll_binaries above.
+        'curl_cffi',
         # TAIFEX settlement-day detection (3rd Wed early close)
         # Must include ALL submodules — see note above about dynamic import.
         *_holidays_submodules,

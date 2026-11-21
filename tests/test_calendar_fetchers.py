@@ -5,9 +5,12 @@ All tests run 100% offline with fixed ``now`` (no network calls, no wall-clock f
 from __future__ import annotations
 
 import json
+import logging
+import sys
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -18,8 +21,10 @@ from src.news.calendar_fetchers import (
     BLS_NFP_HTML_URL,
     BEA_JSON_URL,
     FOMC_URL,
+    CalendarConfig,
     TickerRule,
     build_calendar_events,
+    fetch_nasdaq_earnings,
     generate_txf_settlement_events,
     load_calendar_config,
     map_us_release_to_taifex_sessions,
@@ -282,3 +287,227 @@ class TestBuildAndPublishBridge:
         assert state["fetch_status"] == "ok"
         assert state["error_streak"] == 0
         assert state["upcoming_count"] >= 5
+
+
+class _CurlResp:
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+
+def _mock_curl(monkeypatch, responses: dict[str, _CurlResp]):
+    """Install a fake ``curl_cffi.requests.get``. No real package or network."""
+    calls: list[dict] = []
+
+    def _get(url, headers=None, timeout=None, impersonate=None, **kwargs):
+        calls.append({
+            "url": url,
+            "headers": dict(headers or {}),
+            "timeout": timeout,
+            "impersonate": impersonate,
+        })
+        for sym, resp in responses.items():
+            if f"/{sym}/" in url:
+                return resp
+        return _CurlResp(404, "missing")
+
+    package = ModuleType("curl_cffi")
+    requests_mod = ModuleType("curl_cffi.requests")
+    requests_mod.get = _get
+    package.requests = requests_mod
+    monkeypatch.setitem(sys.modules, "curl_cffi", package)
+    monkeypatch.setitem(sys.modules, "curl_cffi.requests", requests_mod)
+    return calls
+
+
+def _block_urllib(monkeypatch):
+    def _no(*_a, **_k):
+        raise AssertionError("urllib must not be used for Nasdaq")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _no)
+
+
+def _nasdaq_only(*symbols: str) -> CalendarConfig:
+    return CalendarConfig(
+        fomc_enabled=False,
+        bls_enabled=False,
+        bea_enabled=False,
+        nasdaq_enabled=True,
+        include_estimated_earnings=True,
+        txf_settlement_enabled=False,
+        tickers=tuple(TickerRule(sym, sym, "high", "amc") for sym in symbols),
+    )
+
+
+_PARTIAL_YAML = """\
+version: 1
+window:
+  lookahead_days: 45
+  lookback_days: 2
+sources:
+  fomc:
+    enabled: false
+  bls:
+    enabled: false
+  bea:
+    enabled: false
+  nasdaq_earnings:
+    enabled: true
+    include_estimated: true
+    tickers:
+      AVGO:
+        label: AVGO
+        severity: high
+        default_timing: amc
+      MU:
+        label: MU
+        severity: medium
+        default_timing: amc
+  txf_settlement:
+    enabled: false
+"""
+
+
+class TestNasdaqCurlFetch:
+    def test_chrome_impersonation_200_parses_events(self, monkeypatch):
+        calls = _mock_curl(monkeypatch, {
+            "AVGO": _CurlResp(200, json.dumps(_SAMPLE_NASDAQ_CONFIRMED)),
+        })
+        _block_urllib(monkeypatch)
+        events = fetch_nasdaq_earnings(_nasdaq_only("AVGO"))
+        assert len(events) == 1
+        assert events[0]["source"] == "nasdaq_earnings"
+        assert events[0]["category"] == "earnings_avgo"
+        assert calls[0]["impersonate"] == "chrome"
+        assert "User-Agent" not in calls[0]["headers"]
+        assert calls[0]["headers"]["Accept"].startswith("application/json")
+        assert calls[0]["headers"]["Origin"] == "https://www.nasdaq.com"
+        assert calls[0]["headers"]["Referer"] == "https://www.nasdaq.com/"
+
+    def test_chrome_impersonation_403_is_recorded(self, monkeypatch, caplog, tmp_path):
+        _mock_curl(monkeypatch, {"AVGO": _CurlResp(403, "Access Denied")})
+        _block_urllib(monkeypatch)
+        caplog.set_level(logging.WARNING, logger="src.news.calendar_fetchers")
+        res = build_calendar_events(_nasdaq_only("AVGO"), now=_FIXED_NOW)
+        assert res.status == "failed"
+        assert res.sources_failed == ["nasdaq_earnings"]
+        assert "403" in res.errors["nasdaq_earnings"]
+        assert any("403" in rec.message and "AVGO" in rec.message for rec in caplog.records)
+
+        cfg_path = tmp_path / "calendar_sources.yaml"
+        only_avgo = _PARTIAL_YAML.replace(
+            "      MU:\n        label: MU\n        severity: medium\n        default_timing: amc\n",
+            "",
+        )
+        cfg_path.write_text(only_avgo, encoding="utf-8")
+        source = tmp_path / "manual.json"
+        source.write_text("[]", encoding="utf-8")
+        out = tmp_path / "events.json"
+        old_stamp = (_FIXED_NOW - timedelta(days=5)).isoformat(timespec="seconds")
+        out.write_text(
+            json.dumps({"version": 1, "updated_at": old_stamp, "events": []}),
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            out=str(out), source=str(source), config=str(cfg_path),
+            fetch=True, offline=False, dry_run=False,
+        )
+        code, msg = calendar_bridge.publish(args, now=_FIXED_NOW)
+        assert code == 1
+        assert "403" in msg
+        assert json.loads(out.read_text(encoding="utf-8"))["updated_at"] == old_stamp
+
+    def test_partial_403_degrades_and_bridge_carries_detail(self, monkeypatch, caplog, capsys, tmp_path):
+        _mock_curl(monkeypatch, {
+            "AVGO": _CurlResp(200, json.dumps(_SAMPLE_NASDAQ_CONFIRMED)),
+            "MU": _CurlResp(403, "Access Denied"),
+        })
+        _block_urllib(monkeypatch)
+        caplog.set_level(logging.WARNING, logger="src.news.calendar_fetchers")
+        res = build_calendar_events(_nasdaq_only("AVGO", "MU"), now=_FIXED_NOW)
+        assert res.status == "degraded"
+        assert res.sources_failed == ["nasdaq_earnings"]
+        assert res.sources_ok == []
+        assert "403" in res.errors["nasdaq_earnings"]
+        assert "MU" in res.errors["nasdaq_earnings"]
+        assert any(e.get("category") == "earnings_avgo" for e in res.events)
+        assert any("403" in rec.message and "MU" in rec.message for rec in caplog.records)
+
+        cfg_path = tmp_path / "calendar_sources.yaml"
+        cfg_path.write_text(_PARTIAL_YAML, encoding="utf-8")
+        source = tmp_path / "manual.json"
+        source.write_text("[]", encoding="utf-8")
+        out = tmp_path / "events.json"
+        args = SimpleNamespace(
+            out=str(out), source=str(source), config=str(cfg_path),
+            fetch=True, offline=False, dry_run=False,
+        )
+        code, result = calendar_bridge.publish(args, now=_FIXED_NOW)
+        printed = capsys.readouterr().out
+        assert code == 0
+        assert "degraded" in result
+        assert "403" in result
+        assert "nasdaq_earnings" in result
+        assert "degraded" in printed and "403" in printed
+        saved = json.loads(out.read_text(encoding="utf-8"))
+        assert any(e.get("category") == "earnings_avgo" for e in saved["events"])
+
+    def test_missing_curl_cffi_fails_nasdaq_only(self, monkeypatch):
+        from src.news import calendar_fetchers as cf
+
+        monkeypatch.setitem(sys.modules, "curl_cffi", None)
+        _block_urllib(monkeypatch)
+
+        def std(url, _headers, _timeout):
+            if url == FOMC_URL:
+                return _SAMPLE_FOMC_HTML
+            raise OSError(url)
+
+        monkeypatch.setattr(cf, "default_http_get", std)
+        cfg = CalendarConfig(
+            fomc_enabled=True,
+            bls_enabled=False,
+            bea_enabled=False,
+            nasdaq_enabled=True,
+            txf_settlement_enabled=False,
+            tickers=(TickerRule("AVGO", "AVGO", "high", "amc"),),
+        )
+        res = build_calendar_events(cfg, now=_FIXED_NOW)
+        assert res.status == "degraded"
+        assert res.sources_ok == ["fed_fomc"]
+        assert res.sources_failed == ["nasdaq_earnings"]
+        assert "curl_cffi" in res.errors["nasdaq_earnings"]
+        assert any("FOMC" in e["name"] for e in res.events)
+
+    def test_default_path_keeps_fomc_on_urllib_and_nasdaq_on_curl(self, monkeypatch):
+        from src.news import calendar_fetchers as cf
+
+        seen = {"urllib": [], "nasdaq": []}
+
+        def std(url, _headers, _timeout):
+            seen["urllib"].append(url)
+            if url == FOMC_URL:
+                return _SAMPLE_FOMC_HTML
+            raise OSError(url)
+
+        def nq(url, headers, _timeout):
+            seen["nasdaq"].append(url)
+            assert "User-Agent" not in headers
+            return json.dumps(_SAMPLE_NASDAQ_CONFIRMED)
+
+        monkeypatch.setattr(cf, "default_http_get", std)
+        monkeypatch.setattr(cf, "default_nasdaq_http_get", nq)
+        _block_urllib(monkeypatch)
+        cfg = CalendarConfig(
+            fomc_enabled=True,
+            bls_enabled=False,
+            bea_enabled=False,
+            nasdaq_enabled=True,
+            txf_settlement_enabled=False,
+            tickers=(TickerRule("AVGO", "AVGO", "high", "amc"),),
+        )
+        res = build_calendar_events(cfg, now=_FIXED_NOW)
+        assert res.status == "ok"
+        assert seen["urllib"] == [FOMC_URL]
+        assert seen["nasdaq"] and "/AVGO/" in seen["nasdaq"][0]
+        assert "fed_fomc" in res.sources_ok and "nasdaq_earnings" in res.sources_ok

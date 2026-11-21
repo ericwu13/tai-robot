@@ -1,4 +1,4 @@
-"""Zero-API-key, pure-stdlib fetchers & TAIFEX session mapper for W1 (events.json).
+"""Zero-API-key fetchers (stdlib urllib; Nasdaq via curl_cffi) & TAIFEX session mapper for W1 (events.json).
 
 Official public sources (no scraping of paywalled/WAF sites, no paid keys):
 - **Federal Reserve** (``fomccalendars.htm``): FOMC rate decisions & SEP/dot-plot (`*`)
@@ -13,6 +13,7 @@ All parsers are pure functions so tests run 100% offline with fixed ``now``.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import urllib.error
 import urllib.request
@@ -23,6 +24,8 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CALENDAR_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "calendar_sources.yaml"
 
@@ -40,8 +43,10 @@ _DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (tai-robot calendar)",
     "Connection": "close",
 }
+# No User-Agent: curl_cffi impersonate="chrome" sends the Chrome UA and
+# sec-ch-ua. The old UA (AppleWebKit, no Chrome token) overrode that and
+# contradicted the fingerprint. Accept/Origin/Referer match the site's XHR.
 _NASDAQ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json, text/plain, */*",
     "Origin": "https://www.nasdaq.com",
     "Referer": "https://www.nasdaq.com/",
@@ -72,6 +77,31 @@ def default_http_get(url: str, headers: dict[str, str], timeout_s: int) -> str:
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def default_nasdaq_http_get(url: str, headers: dict[str, str], timeout_s: int) -> str:
+    """GET one Nasdaq URL with Chrome's TLS/HTTP fingerprint.
+
+    Akamai 403s urllib. Import is lazy so a missing curl_cffi fails this
+    source only — FOMC, BLS, and BEA never import it. Any non-200 raises,
+    with the status code in the message (curl_cffi does not raise on 403).
+    """
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError(
+            "curl_cffi is not installed; Nasdaq earnings fetch needs Chrome impersonation"
+        ) from exc
+    resp = curl_requests.get(
+        url,
+        headers=headers,
+        timeout=timeout_s,
+        impersonate="chrome",
+    )
+    status = resp.status_code
+    if status != 200:
+        raise RuntimeError(f"HTTP {status}")
+    return resp.text
 
 
 # ── Configuration ────────────────────────────────────────────────────────
@@ -566,7 +596,23 @@ def fetch_bea_events(cfg: CalendarConfig, http_get: HttpGet = default_http_get) 
     return events
 
 
-def fetch_nasdaq_earnings(cfg: CalendarConfig, http_get: HttpGet = default_http_get) -> list[dict[str, Any]]:
+class NasdaqPartialFailure(Exception):
+    """Some Nasdaq tickers failed and some returned events.
+
+    ``events`` are the successes. The message lists every ticker failure,
+    including the HTTP status. The orchestrator keeps ``events`` and still
+    marks the source failed so the run is degraded.
+    """
+
+    def __init__(self, detail: str, events: list[dict[str, Any]]):
+        super().__init__(detail)
+        self.events = events
+
+
+def fetch_nasdaq_earnings(
+    cfg: CalendarConfig,
+    http_get: HttpGet = default_nasdaq_http_get,
+) -> list[dict[str, Any]]:
     if not cfg.tickers:
         return []
     events: list[dict[str, Any]] = []
@@ -583,10 +629,15 @@ def fetch_nasdaq_earnings(cfg: CalendarConfig, http_get: HttpGet = default_http_
             )
             events.extend(parsed)
         except Exception as exc:  # noqa: BLE001 — one ticker failure shouldn't drop all others
-            failures.append(f"{rule.symbol}: {type(exc).__name__}")
+            detail = f"{rule.symbol}: {type(exc).__name__}: {exc}"
+            failures.append(detail)
+            logger.warning("Nasdaq earnings fetch failed: %s", detail)
+    if not failures:
+        return events
+    summary = "; ".join(failures)
     if len(failures) == len(cfg.tickers):
-        raise RuntimeError(f"all {len(failures)} Nasdaq earnings queries failed ({'; '.join(failures[:3])})")
-    return events
+        raise RuntimeError(f"all {len(failures)} Nasdaq earnings queries failed ({summary})")
+    raise NasdaqPartialFailure(summary, events)
 
 
 # ── Orchestrator: merge, deduplicate, cache fallback, window filter ──────
@@ -672,14 +723,19 @@ def build_calendar_events(
     now: datetime,
     manual_events: list[dict[str, Any]] | None = None,
     prev_cached_by_source: dict[str, list[dict[str, Any]]] | None = None,
-    http_get: HttpGet = default_http_get,
+    http_get: HttpGet | None = None,
 ) -> CalendarFetchResult:
     """Fetch all enabled official sources, retain per-source cache on partial
     outages, merge manual overrides, and prune to the configured date window.
+
+    ``http_get`` overrides every source, including Nasdaq (offline tests).
+    When it is omitted, FOMC/BLS/BEA use urllib and Nasdaq uses curl_cffi.
     """
     today = now.astimezone(_TZ_TAIPEI).date()
     start_date = today - timedelta(days=cfg.lookback_days)
     end_date = today + timedelta(days=cfg.lookahead_days)
+    std_get = default_http_get if http_get is None else http_get
+    nq_get = default_nasdaq_http_get if http_get is None else http_get
 
     prev_cache = prev_cached_by_source if isinstance(prev_cached_by_source, dict) else {}
     new_cache: dict[str, list[dict[str, Any]]] = {}
@@ -687,28 +743,30 @@ def build_calendar_events(
     sources_failed: list[str] = []
     errors: dict[str, str] = {}
     auto_events: list[dict[str, Any]] = []
+    saw_partial = False
 
     remote_fetchers: list[tuple[str, Callable[[], list[dict[str, Any]]]]] = []
     if cfg.fomc_enabled:
-        remote_fetchers.append(("fed_fomc", lambda: fetch_fomc_events(cfg, http_get)))
+        remote_fetchers.append(("fed_fomc", lambda: fetch_fomc_events(cfg, std_get)))
     if cfg.bls_enabled:
-        remote_fetchers.append(("bls", lambda: fetch_bls_events(cfg, http_get)))
+        remote_fetchers.append(("bls", lambda: fetch_bls_events(cfg, std_get)))
     if cfg.bea_enabled:
-        remote_fetchers.append(("bea", lambda: fetch_bea_events(cfg, http_get)))
+        remote_fetchers.append(("bea", lambda: fetch_bea_events(cfg, std_get)))
     if cfg.nasdaq_enabled and cfg.tickers:
-        remote_fetchers.append(("nasdaq_earnings", lambda: fetch_nasdaq_earnings(cfg, http_get)))
+        remote_fetchers.append(("nasdaq_earnings", lambda: fetch_nasdaq_earnings(cfg, nq_get)))
 
+    hi = (end_date + timedelta(days=30)).isoformat()
+    lo = start_date.isoformat()
     for name, fn in remote_fetchers:
         try:
             fetched = fn()
-            sources_ok.append(name)
-            # Keep a bounded window in cache so calendar_state.json stays small
-            windowed = [
-                e for e in fetched
-                if start_date.isoformat() <= str(e.get("date") or "") <= (end_date + timedelta(days=30)).isoformat()
-            ]
-            new_cache[name] = windowed
-            auto_events.extend(fetched)
+            partial = False
+        except NasdaqPartialFailure as exc:
+            sources_failed.append(name)
+            errors[name] = f"{type(exc).__name__}: {exc}"[:200]
+            fetched = list(exc.events)
+            partial = True
+            saw_partial = True
         except Exception as exc:  # noqa: BLE001 — isolate source failure
             sources_failed.append(name)
             errors[name] = f"{type(exc).__name__}: {exc}"[:200]
@@ -716,13 +774,25 @@ def build_calendar_events(
             if isinstance(cached, list):
                 new_cache[name] = cached
                 auto_events.extend(cached)
+            continue
+        if not partial:
+            sources_ok.append(name)
+        # Keep a bounded window in cache so calendar_state.json stays small.
+        # A partial Nasdaq failure caches the fresh successes, not the old file.
+        windowed = [
+            e for e in fetched
+            if lo <= str(e.get("date") or "") <= hi
+        ]
+        new_cache[name] = windowed
+        auto_events.extend(fetched)
 
     if cfg.txf_settlement_enabled:
         auto_events.extend(
             generate_txf_settlement_events(start_date, end_date, severity=cfg.txf_settlement_severity)
         )
 
-    if remote_fetchers and not sources_ok:
+    # A partial source still produced events, so this is degraded, not failed.
+    if remote_fetchers and not sources_ok and not saw_partial:
         status = "failed"
     elif sources_failed:
         status = "degraded"
