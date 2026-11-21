@@ -48,6 +48,7 @@ from src.news.pipeline import (  # noqa: E402
     ACTION_VOTE_BULLISH,
     ClassifiedEvent,
     ClassifierAPIError,
+    DedupDecision,
     ema_decay_for,
     Embedder,
     GeminiEmbedder,
@@ -57,6 +58,8 @@ from src.news.pipeline import (  # noqa: E402
     MarketSnapshot,
     NewsPreFilter,
     NewsSignalPipeline,
+    PreFilterResult,
+    PriorEventContext,
     SignalRouter,
     build_classification_prompt,
     clean_title,
@@ -1157,3 +1160,155 @@ class TestRssScorerV2Integration:
         snap2 = provider.snapshot_at(datetime(2026, 11, 20, 19, 0, tzinfo=_TZ_TPE))
         assert snap2 is not None
         assert snap2.skcom_bar_pct == pytest.approx(-5.0)
+
+
+def _backfill_decision(prior_cluster_id: str | None) -> DedupDecision:
+    """DedupDecision whose optional prior is a real PriorEventContext."""
+    prior = None
+    if prior_cluster_id is not None:
+        prior = PriorEventContext(
+            prior_cluster_id=prior_cluster_id,
+            prior_first_seen_at="2026-11-20T03:30:00+08:00",
+            prior_title="Nvidia SEC accounting probe",
+            prior_summary="SEC opens accounting review of Nvidia.",
+            prior_category="GOVERNANCE_REGULATORY",
+            prior_direction="BEARISH",
+            similarity=0.91,
+        )
+    return DedupDecision(
+        article={"guid": "followup", "title": "Nvidia responds to SEC accounting review", "source": "Bloomberg Markets"},
+        prefilter=PreFilterResult(
+            passed=True,
+            drop_reason="",
+            cleaned_title="Nvidia responds to SEC accounting review",
+            cleaned_summary="Nvidia said it will file its 10-Q next week.",
+            canonical_url="https://news.example.com/nvda-sec-followup",
+            source_tier=1,
+        ),
+        cluster_id="cluster_followup",
+        is_duplicate=False,
+        dup_method="",
+        similarity=0.91,
+        mention_count=1,
+        source_tier=1,
+        prior_event=prior,
+    )
+
+
+class TestBackfillPriorEventCache:
+    """CachedClassifier cache keys read PriorEventContext.prior_cluster_id."""
+
+    def test_cache_key_differs_by_prior_cluster_id(self):
+        first = _backfill_decision("cluster_aaa")
+        same = _backfill_decision("cluster_aaa")
+        other = _backfill_decision("cluster_bbb")
+
+        key_first = backfill_news_v2._cache_key(first)
+        key_same = backfill_news_v2._cache_key(same)
+        key_other = backfill_news_v2._cache_key(other)
+
+        assert key_first == key_same
+        assert key_first != key_other
+        assert len(key_first) == 24
+
+        # No prior_event still hashes (empty prior id). A real prior changes the key.
+        bare = _backfill_decision(None)
+        assert backfill_news_v2._cache_key(bare) == backfill_news_v2._cache_key(_backfill_decision(None))
+        assert backfill_news_v2._cache_key(bare) != key_first
+
+    def test_non_dry_run_batch_classifies_prior_event_and_writes_cache(self, tmp_path):
+        cfg = load_pipeline_config()
+        pf = NewsPreFilter(cfg)
+        day1 = _FIXED_NOW
+        seed = IncrementalEventClusterer(cfg, embedder=_FakeCrossLingualEmbedder())
+        kept1, _, _ = pf.filter_batch([
+            _art(
+                "Nvidia's accounting is a focus of US SEC investigation",
+                source="Reuters",
+                guid="d1",
+                published_dt=day1,
+            )
+        ])
+        dec1 = seed.process_batch(kept1, now=day1)
+        assert dec1 and dec1[0].prior_event is None
+        seed.record_classification(
+            dec1[0].cluster_id,
+            summary="SEC opens accounting review of Nvidia.",
+            category="GOVERNANCE_REGULATORY",
+            direction="BEARISH",
+            materiality=5,
+            routed=True,
+        )
+        saved = seed.to_dict()
+
+        day2 = day1 + timedelta(hours=18)
+        follow = _art(
+            "Nvidia responds to SEC accounting review, promises 10-Q next week",
+            source="Bloomberg Markets",
+            guid="d2",
+            published_dt=day2,
+        )
+        # Same archived state the backfill batch will load: the follow-up carries a prior.
+        preview = IncrementalEventClusterer(cfg, embedder=_FakeCrossLingualEmbedder())
+        preview.load_dict(saved)
+        kept2, dropped2, _ = pf.filter_batch([follow])
+        assert dropped2 == []
+        preview_dec = preview.process_batch(kept2, now=day2)
+        assert len(preview_dec) == 1
+        assert preview_dec[0].needs_llm is True
+        assert preview_dec[0].prior_event is not None
+        assert preview_dec[0].prior_event.prior_cluster_id == dec1[0].cluster_id
+
+        seen: list[DedupDecision] = []
+
+        class _StubClassifier:
+            def classify(self, decision, *, market_context_text=""):
+                assert market_context_text == ""
+                seen.append(decision)
+                return ClassifiedEvent(
+                    event_id=decision.cluster_id,
+                    is_duplicate=False,
+                    is_price_recap_only=False,
+                    has_new_fact_delta=True,
+                    category="GOVERNANCE_REGULATORY",
+                    entities=("NVDA", "TSM", "TXF"),
+                    direction="BEARISH",
+                    materiality=5,
+                    horizon="MULTI_DAY",
+                    source_tier=decision.source_tier,
+                    mention_count=decision.mention_count,
+                    summary_one_line="Nvidia follow-up on the SEC accounting review.",
+                ), ""
+
+        cache_path = tmp_path / "backfill_cache.jsonl"
+        clf = backfill_news_v2.CachedClassifier(
+            _StubClassifier(),
+            backfill_news_v2.ClassificationCache(cache_path),
+            pace_s=0.0,
+        )
+        pipe = NewsSignalPipeline(cfg, embedder=_FakeCrossLingualEmbedder(), classifier=clf)
+        pipe.load_state(saved)
+
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+            res = backfill_news_v2.backfill_batches(
+                [(day2, [follow])],
+                pipeline=pipe,
+                dry_run=False,
+                progress_every=0,
+            )
+
+        assert len(seen) == 1
+        assert seen[0].prior_event is not None
+        assert seen[0].prior_event.prior_cluster_id == dec1[0].cluster_id
+        assert res.batches_processed == 1
+        assert res.l3_succeeded == 1
+        assert res.api_calls == 1
+        assert cache_path.is_file()
+        rows = [
+            json.loads(line)
+            for line in cache_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["k"] == backfill_news_v2._cache_key(seen[0])
+        assert rows[0]["event"]["summary_one_line"] == "Nvidia follow-up on the SEC accounting review."

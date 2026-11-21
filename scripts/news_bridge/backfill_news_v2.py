@@ -147,7 +147,7 @@ class HistoricalMarketProvider:
 # ── Resumable JSONL classification cache ─────────────────────────────────
 
 def _cache_key(decision: DedupDecision) -> str:
-    prior_id = decision.prior_event.cluster_id if decision.prior_event else ""
+    prior_id = decision.prior_event.prior_cluster_id if decision.prior_event else ""
     raw = "|".join(
         [
             decision.prefilter.cleaned_title,
