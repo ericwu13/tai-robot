@@ -1,6 +1,7 @@
 """Approval-gate auto-merge. Pure mocks: no network, no live gh."""
 import importlib.util
 import json
+import os
 import urllib.error
 from pathlib import Path
 
@@ -21,6 +22,8 @@ REED_URL = "https://hooks.example/reed-secret-path-XYZ"
 REED_KEY = "reed-secret-key-ABC"
 SELINA_URL = "https://hooks.example/selina-secret-path-XYZ"
 SELINA_KEY = "selina-secret-key-ABC"
+ORIG_TOKEN = "test-token-not-on-argv"
+MERGE_TOKEN = "merge-app-token-not-on-argv"
 
 
 def _load():
@@ -108,11 +111,18 @@ class World:
         self.statuses = []
         self.resolves = []
         self.cursors = []
+        self.call_tokens = []
 
-    def run(self, cmd, input=None, **_kw):
+    def run(self, cmd, input=None, **kwargs):
         assert cmd[0] == "gh"
         args = cmd[1:]
         self.calls.append((args, input))
+        env = kwargs.get("env")
+        if env is None:
+            seen = os.environ.get("GH_TOKEN")
+        else:
+            seen = env.get("GH_TOKEN")
+        self.call_tokens.append(seen)
         if args[:2] == ["pr", "merge"]:
             rc, out, err = (self.merge_script.pop(0) if self.merge_script else (1, "", "unexpected merge"))
             return Proc(rc, out, err)
@@ -1894,6 +1904,85 @@ def test_reed_and_selina_webhook_errors_do_not_leak(monkeypatch, capsys, which, 
     assert url not in flat and key not in flat
 
 
+def _assert_merge_token(world, merge_token):
+    """Merge subprocesses see ``merge_token``. Reads and status posts keep ORIG_TOKEN."""
+    merges = []
+    others = []
+    saw_read = False
+    saw_status = False
+    for (args, blob), token in zip(world.calls, world.call_tokens, strict=True):
+        flat = " ".join(args) + (blob or "")
+        assert ORIG_TOKEN not in flat
+        assert MERGE_TOKEN not in flat
+        if args[:2] == ["pr", "merge"]:
+            merges.append(token)
+        else:
+            others.append(token)
+            if args[0] == "api" and len(args) == 2:
+                saw_read = True
+            if args[:3] == ["api", "--method", "POST"] and "/statuses/" in args[3]:
+                saw_status = True
+    assert merges
+    assert others
+    assert saw_read and saw_status
+    assert merges == [merge_token] * len(merges)
+    assert others == [ORIG_TOKEN] * len(others)
+    assert os.environ.get("GH_TOKEN") == ORIG_TOKEN
+
+
+def test_merge_token_overrides_auto_and_direct_only(monkeypatch, capsys):
+    monkeypatch.setenv("MERGE_GH_TOKEN", MERGE_TOKEN)
+    merges = [
+        (1, "", "GraphQL: Pull request is in clean status\n"),
+        (0, "merged\n", ""),
+    ]
+    rc, world = _gate(
+        monkeypatch,
+        files=[{"filename": "src/a.py"}],
+        reviews=[review("APPROVED", REED)],
+        merges=merges,
+    )
+    assert rc == 0
+    assert world.merge_calls() == [_auto(), _direct()]
+    _assert_merge_token(world, MERGE_TOKEN)
+    text = capsys.readouterr()
+    flat = text.out + text.err
+    assert MERGE_TOKEN not in flat
+    assert ORIG_TOKEN not in flat
+
+
+def test_merge_token_overrides_disable_only(monkeypatch, capsys):
+    monkeypatch.setenv("MERGE_GH_TOKEN", MERGE_TOKEN)
+    pr = make_pr(auto_merge={"enabled_by": {"login": "ericwu13"}})
+    rc, world = _gate(
+        monkeypatch,
+        pr=pr,
+        files=[{"filename": "version.py"}],
+        reviews=[review("APPROVED", REED)],
+    )
+    assert rc == 0
+    assert world.merge_calls() == [_disable()]
+    _assert_merge_token(world, MERGE_TOKEN)
+    text = capsys.readouterr()
+    assert MERGE_TOKEN not in (text.out + text.err)
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_unset_or_empty_merge_token_keeps_original(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MERGE_GH_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("MERGE_GH_TOKEN", value)
+    rc, world = _gate(
+        monkeypatch,
+        files=[{"filename": "src/a.py"}],
+        reviews=[review("APPROVED", REED)],
+    )
+    assert rc == 0
+    assert world.merge_calls() == [_auto()]
+    _assert_merge_token(world, ORIG_TOKEN)
+
+
 def test_usage_includes_read_only_commands(capsys):
     assert mod.main(["auto_merge_gate.py"]) == 2
     err = capsys.readouterr().err
@@ -1943,11 +2032,12 @@ def test_workflow_yaml_is_least_privilege():
     assert selina["permissions"] == read_checks
     for job in (trig, reed, selina):
         assert "write" not in job["permissions"].values()
-    for job in jobs.values():
+    for name, job in jobs.items():
         assert job["runs-on"] == "ubuntu-latest"
         assert job["timeout-minutes"] == 5
         assert job["concurrency"]["cancel-in-progress"] is False
-        assert len(job["steps"]) == 2
+        # eval-approval-gate mints the App token and proves it. Other jobs stay checkout + one run.
+        assert len(job["steps"]) == (4 if name == "eval-approval-gate" else 2)
         checkout = next(
             s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@")
         )
@@ -1956,8 +2046,9 @@ def test_workflow_yaml_is_least_privilege():
         assert checkout["with"]["sparse-checkout"] == "scripts/ci"
         assert checkout["with"]["persist-credentials"] is False
         runs = [s for s in job["steps"] if "run" in s]
-        assert len(runs) == 1
-        assert "${{" not in (runs[0].get("run") or "")
+        assert len(runs) == (2 if name == "eval-approval-gate" else 1)
+        for step in runs:
+            assert "${{" not in (step.get("run") or "")
         dumped = yaml.dump(job, width=4096).replace(_HEAD_SHA_FALLBACK, "")
         assert "pull_request.head.sha" not in dumped
     assert trig["concurrency"]["group"].startswith("trigger-sage-")
@@ -2008,11 +2099,15 @@ def test_workflow_yaml_is_least_privilege():
     assert "draft" not in sel_if
     assert "base.ref" not in sel_if
     trig_run = next(s for s in trig["steps"] if "run" in s)
-    gate_run = next(s for s in gate["steps"] if "run" in s)
+    gate_run = next(
+        s for s in gate["steps"] if "auto_merge_gate.py gate" in str(s.get("run") or "")
+    )
     reed_run = next(s for s in reed["steps"] if "run" in s)
     sel_run = next(s for s in selina["steps"] if "run" in s)
     assert trig_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py trigger-sage"
-    assert gate_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py gate"
+    assert gate_run["run"].strip().endswith("python3 scripts/ci/auto_merge_gate.py gate")
+    assert 'echo "merge token: $MERGE_TOKEN_KIND"' in gate_run["run"]
+    assert "${{" not in gate_run["run"]
     assert reed_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py retrigger-reed"
     assert sel_run["run"].strip() == "python3 scripts/ci/auto_merge_gate.py notify-selina"
     assert set(reed_run["env"]) == {
@@ -2106,3 +2201,76 @@ def test_review_event_jobs_fall_back_head_sha():
             assert "${{" not in (step.get("run") or "")
     assert set(matched) == {"retrigger-reed", "notify-selina"}
     assert "pull_request.head.sha" not in text.replace(_HEAD_SHA_FALLBACK, "")
+
+
+def test_eval_approval_gate_mints_app_token_for_merge():
+    """The merge token is a repo-scoped App token, and only the merge uses it."""
+    text = (ROOT / ".github/workflows/auto-merge.yml").read_text(encoding="utf-8")
+    doc = yaml.safe_load(text)
+    jobs = doc["jobs"]
+    gate = jobs["eval-approval-gate"]
+    steps = gate["steps"]
+    token_steps = [
+        s for s in steps
+        if "create-github-app-token@" in str(s.get("uses") or "")
+    ]
+    assert len(token_steps) == 1
+    token_step = token_steps[0]
+    cond = str(token_step.get("if") or "")
+    assert "env.AUTOMERGE_APP_ID" in cond
+    assert "secrets." not in cond
+    env_maps = []
+    if isinstance(gate.get("env"), dict):
+        env_maps.append(gate["env"])
+    if isinstance(token_step.get("env"), dict):
+        env_maps.append(token_step["env"])
+    assert any(
+        "secrets.AUTOMERGE_APP_ID" in str(mapping.get("AUTOMERGE_APP_ID") or "")
+        for mapping in env_maps
+    )
+    with_ = token_step.get("with") or {}
+    assert "secrets.AUTOMERGE_APP_ID" in str(with_.get("app-id") or "")
+    assert "secrets.AUTOMERGE_APP_PRIVATE_KEY" in str(with_.get("private-key") or "")
+    scope = " ".join(str(with_.get(key) or "") for key in ("owner", "repositories"))
+    assert "github.repository" in scope or "github.event.repository.name" in scope
+    gate_run = next(
+        s for s in steps if "auto_merge_gate.py gate" in str(s.get("run") or "")
+    )
+    prove = next(s for s in steps if s.get("name") == "Prove auto-merge token")
+    assert steps.index(token_step) < steps.index(prove) < steps.index(gate_run)
+    prove_if = str(prove.get("if") or "")
+    assert "steps.automerge-token.outcome == 'success'" in prove_if
+    assert "steps.automerge-token.outputs.token" in prove_if
+    assert "secrets." not in prove_if
+    prove_run = prove.get("run") or ""
+    assert "${{" not in prove_run
+    assert "/installation/repositories" in prove_run
+    assert ".repositories[].full_name" in prove_run
+    assert "merge token: app" in prove_run
+    assert "merge token: github.token" in prove_run
+    assert "GH_TOKEN" not in prove_run
+    assert "printenv" not in prove_run
+    assert "set -x" not in prove_run
+    assert prove["env"]["GH_TOKEN"] == "${{ steps.automerge-token.outputs.token }}"
+    assert prove["env"]["REPO"] == "${{ github.repository }}"
+    assert prove.get("continue-on-error") is True
+    assert token_step.get("continue-on-error") is True
+    assert gate_run["env"]["GH_TOKEN"] == "${{ github.token }}"
+    merge_tok = gate_run["env"]["MERGE_GH_TOKEN"]
+    step_id = token_step.get("id")
+    assert step_id
+    assert f"steps.{step_id}.outputs.token" in merge_tok
+    assert "steps.prove-automerge-token.outcome == 'success'" in merge_tok
+    assert "github.token" in merge_tok
+    assert gate_run["env"]["MERGE_TOKEN_KIND"] == (
+        "${{ steps.prove-automerge-token.outcome == 'success' && 'app' || 'github.token' }}"
+    )
+    for job_key, job_cfg in jobs.items():
+        assert job_key != "approval-gate"
+        assert (job_cfg or {}).get("name") != "approval-gate"
+    assert mod.is_workflow([".github/workflows/auto-merge.yml"])
+    assert mod.is_workflow(["scripts/ci/auto_merge_gate.py"])
+    assert mod.is_workflow(["src/a.py"]) is False
+    src = (ROOT / "scripts" / "ci" / "auto_merge_gate.py").read_text(encoding="utf-8")
+    assert '".github/workflows/"' in src
+    assert '"scripts/ci/"' in src
